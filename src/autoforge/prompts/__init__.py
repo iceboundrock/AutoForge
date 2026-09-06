@@ -21,7 +21,6 @@ TEMPLATE_FILES = (
     "analyze_execute.md",
     "review.md",
     "fix.md",
-    "merge.md",
     "update_epic.md",
     "correction.md",
 )

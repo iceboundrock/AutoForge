@@ -2,7 +2,7 @@
 
 import pytest
 
-from autoforge.errors import ControlResultValidationError, StateTransitionError
+from autoforge.errors import StateTransitionError
 from autoforge.transitions import Phase, decide_next_phase, is_legal, validate_transition
 
 
@@ -61,19 +61,12 @@ def test_decide_review_routing():
     assert decide_next_phase(Phase.REVIEW, {"needs_fix_round": False}) == Phase.READY_FOR_MERGE
 
 
-def test_decide_merge_actions():
-    assert decide_next_phase(Phase.MERGE, {"next_action": "NEXT_ISSUE"}) == Phase.ANALYZE_EXECUTE
-    assert decide_next_phase(Phase.MERGE, {"next_action": "UPDATE_EPIC"}) == Phase.UPDATE_EPIC
-    assert decide_next_phase(Phase.MERGE, {"next_action": "DONE"}) == Phase.DONE
-    # stale HEAD after clean review -> back to REVIEW
-    assert (
-        decide_next_phase(
-            Phase.MERGE, {"next_action": "NEXT_ISSUE", "head_changed_after_review": True}
-        )
-        == Phase.REVIEW
-    )
-    with pytest.raises(ControlResultValidationError, match="next_action"):
-        decide_next_phase(Phase.MERGE, {"next_action": "YOLO"})
+def test_decide_merge_is_controller_owned():
+    # No agent decides anything in MERGE: a verified controller merge routes to
+    # UPDATE_EPIC; a stale HEAD after the clean review goes back to REVIEW.
+    assert decide_next_phase(Phase.MERGE, {}) == Phase.UPDATE_EPIC
+    assert decide_next_phase(Phase.MERGE, {"next_action": "DONE"}) == Phase.UPDATE_EPIC
+    assert decide_next_phase(Phase.MERGE, {"head_changed_after_review": True}) == Phase.REVIEW
 
 
 def test_decide_update_epic():

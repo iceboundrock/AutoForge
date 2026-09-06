@@ -9,10 +9,10 @@ Legal transitions::
     FIX              -> REVIEW
     READY_FOR_MERGE  -> MERGE             (only behind the merge safety gate)
     READY_FOR_MERGE  -> REVIEW            (PR HEAD moved after the clean review)
-    MERGE            -> ANALYZE_EXECUTE   (next_action=NEXT_ISSUE)
-    MERGE            -> UPDATE_EPIC       (next_action=UPDATE_EPIC)
-    MERGE            -> DONE              (next_action=DONE)
+    MERGE            -> UPDATE_EPIC       (controller merged; GitHub confirms MERGED)
     MERGE            -> REVIEW            (PR HEAD changed after last clean review)
+    MERGE            -> ANALYZE_EXECUTE   (reserved: controller-owned batching, #13)
+    MERGE            -> DONE              (reserved: controller-owned batching, #13)
     UPDATE_EPIC      -> ANALYZE_EXECUTE   (next_issue_url != null)
     UPDATE_EPIC      -> DONE              (next_issue_url == null)
 
@@ -49,10 +49,9 @@ TERMINAL_PHASES = frozenset({Phase.DONE, Phase.BLOCKED, Phase.FAILED})
 # holding state in this milestone: automatic merge is disabled by default.
 STOP_PHASES = TERMINAL_PHASES | frozenset({Phase.READY_FOR_MERGE})
 
-# Phases whose step invokes an agent through a provider.
-AGENT_PHASES = frozenset(
-    {Phase.ANALYZE_EXECUTE, Phase.REVIEW, Phase.FIX, Phase.MERGE, Phase.UPDATE_EPIC}
-)
+# Phases whose step invokes an agent through a provider. MERGE is NOT one of
+# them: the controller runs `gh pr merge` itself (agents never merge).
+AGENT_PHASES = frozenset({Phase.ANALYZE_EXECUTE, Phase.REVIEW, Phase.FIX, Phase.UPDATE_EPIC})
 
 # Static topology: every edge that can ever be legal (conditions on the
 # CONTROL_RESULT payload are checked in decide_next_phase).
@@ -114,21 +113,12 @@ def decide_next_phase(current: Phase, result: dict) -> Phase:
             return Phase.REVIEW
         return Phase.MERGE
     if current == Phase.MERGE:
-        # Stale-review escape hatch: PR HEAD moved after the last clean
-        # review, so the merge must not proceed — go back to REVIEW.
+        # MERGE is controller-executed (no agent CONTROL_RESULT). ``result``
+        # here is the controller's own observation: HEAD moved -> REVIEW,
+        # otherwise the verified merge routes to UPDATE_EPIC.
         if result.get("head_changed_after_review") is True:
             return Phase.REVIEW
-        action = need("next_action")
-        mapping = {
-            "NEXT_ISSUE": Phase.ANALYZE_EXECUTE,
-            "UPDATE_EPIC": Phase.UPDATE_EPIC,
-            "DONE": Phase.DONE,
-        }
-        if action not in mapping:
-            raise ControlResultValidationError(
-                f"unknown MERGE next_action: {action!r} (expected NEXT_ISSUE | UPDATE_EPIC | DONE)"
-            )
-        return mapping[action]
+        return Phase.UPDATE_EPIC
     if current == Phase.UPDATE_EPIC:
         nxt = result.get("next_issue_url")
         return Phase.ANALYZE_EXECUTE if nxt else Phase.DONE

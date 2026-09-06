@@ -33,10 +33,14 @@ def profile_for_phase(cfg: AutoForgeConfig, phase: Phase, review_round: int = 0)
         # review_round stores completed rounds; the upcoming execution is +1.
         upcoming = review_round + 1
         return cfg.profile(review_profile_name(upcoming))
+    if phase == Phase.MERGE:
+        raise ConfigurationError(
+            "phase MERGE has no execution profile: the controller performs the merge "
+            "itself (gh pr merge via GitHubClient); agents never merge"
+        )
     mapping = {
         Phase.ANALYZE_EXECUTE: "analyze_execute",
         Phase.FIX: "fix",
-        Phase.MERGE: "merge",
         Phase.UPDATE_EPIC: "update_epic",
     }
     if phase not in mapping:

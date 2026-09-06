@@ -97,6 +97,7 @@ Key design points:
 | `REVIEW` | OpenCode (round 1 `openai/gpt-5.6-luna` high, rounds 2–5 `openai/gpt-5.6-terra` high, 6+ `openai/gpt-5.6-sol` medium) | round number, reviewed SHA == bound HEAD, exactly one review comment on this PR with the `# AI Code Review — Round N` heading and the `ai-review-result` marker matching round/SHA/flag, findings invariant |
 | `FIX` | Claude Code (`fable`, effort high) | `previous_head_sha` == current HEAD, every open finding ID resolved (`fixed` / `follow_up_created` / `no_change_with_rationale`), follow-up issues exist in this repo and are OPEN, actual PR HEAD == `new_head_sha`, a `fixed` resolution moved HEAD |
 | `READY_FOR_MERGE` | nobody | holding state; `step` refuses to continue unless the merge gate is open |
+| `MERGE` (gated) | controller, never an agent | last review clean and PR HEAD == reviewed HEAD, then `gh pr merge --<method> --match-head-commit <reviewed HEAD>`; counted only once GitHub reports `MERGED`, else `BLOCKED` (or back to `REVIEW` on HEAD drift) |
 
 Recovery rules: if a step crashes after the agent created a PR, `resume`
 re-enters `ANALYZE_EXECUTE`, finds the open PR (linked issue or
@@ -190,6 +191,13 @@ State records `current_pr_url`, `current_branch`, `current_head_sha`,
   reachable only from `READY_FOR_MERGE` and only when **both**
   `safety.allow_merge: true` is set in config **and** `--allow-merge` is
   passed on the CLI. Default off; `run` normally stops at `READY_FOR_MERGE`.
+- **Agents never merge.** When the gate is open, the *controller* performs the
+  merge itself: `gh pr merge --<merge.method> --match-head-commit <reviewed HEAD>`
+  through `GitHubClient`, with no prompt and no agent invocation. The merge is
+  counted only after GitHub reports the PR as `MERGED`; any other outcome
+  (conflict, branch protection, merge queue, HEAD drift) leaves the run
+  `BLOCKED` or sends it back to `REVIEW`. Every agent prompt carries the
+  unconditional rule "never merge a pull request".
 - Logs and CLI output pass through baseline secret redaction (`GITHUB_TOKEN`,
   `GH_TOKEN`, `*_API_KEY`, `Authorization: Bearer`, `ghp_*`, `sk-*`, …). No
   environment dump is ever written. Baseline only — no claim of completeness.
@@ -207,7 +215,8 @@ cp autoforge.example.yaml autoforge.yaml
 ```
 
 Logical profile names (`analyze_execute`, `fix`, `review_round_1`,
-`review_round_2_5`, `review_round_6_plus`, `merge`, `update_epic`) are stable;
+`review_round_2_5`, `review_round_6_plus`, `update_epic`) are stable (there is
+no `merge` profile: the controller merges, see `merge:` in the example file);
 edit the file to change model identifiers, effort, timeouts and provider
 options without touching controller source. Provider-specific flags are built
 by the adapters in `providers.py`; the engine never hard-codes CLI syntax.
@@ -235,7 +244,8 @@ Claude Code remediation of finding IDs → repeated review with SHA binding →
 `READY_FOR_MERGE`; recovery of an already-created PR; bounded correction
 retry for malformed results; `doctor`; redacted per-invocation logs.
 
-**Explicitly not yet:** automatic merge (gated off), EPIC autonomous
-continuation (`MERGE` → next issue / `UPDATE_EPIC` code paths exist but are
-unreachable without opening the gate and are not exercised against real
-services), unattended production operation, CI checks as a review input.
+**Explicitly not yet:** automatic merge (gated off; when opened, the
+controller-owned `MERGE` step and `UPDATE_EPIC` are exercised only against the
+in-memory fake, never against real services), pre-merge mergeability / CI
+checks (#3), controller-owned EPIC batching (#13), unattended production
+operation, CI checks as a review input.

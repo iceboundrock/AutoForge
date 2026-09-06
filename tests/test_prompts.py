@@ -29,18 +29,40 @@ def test_special_characters_and_urls_survive():
     assert out == f"U={tricky}"
 
 
+AGENT_TEMPLATES = [
+    (Phase.ANALYZE_EXECUTE, "analyze_execute.md"),
+    (Phase.REVIEW, "review.md"),
+    (Phase.FIX, "fix.md"),
+    (Phase.UPDATE_EPIC, "update_epic.md"),
+]
+
+
 def test_all_templates_render_for_all_agent_phases(engine):
-    for phase, template in [
-        (Phase.ANALYZE_EXECUTE, "analyze_execute.md"),
-        (Phase.REVIEW, "review.md"),
-        (Phase.FIX, "fix.md"),
-        (Phase.MERGE, "merge.md"),
-        (Phase.UPDATE_EPIC, "update_epic.md"),
-    ]:
+    for phase, template in AGENT_TEMPLATES:
         engine.state.phase = phase
         text = engine.render_prompt_for(phase)
         assert "{{" not in text, f"unresolved placeholder in {template}"
         assert "<<<CONTROL_RESULT>>>" in text
+
+
+def test_merge_is_never_delegated_to_an_agent(engine):
+    """Issue #8: common.md forbids merging; no prompt may instruct `gh pr merge`."""
+    from autoforge.errors import StateTransitionError
+    from autoforge.transitions import AGENT_PHASES
+
+    assert "merge.md" not in prompts.TEMPLATE_FILES
+    assert not (prompts.prompts_dir() / "merge.md").exists()
+    assert Phase.MERGE not in AGENT_PHASES
+    common = prompts.load_template("common.md")
+    assert "Never merge a pull request" in common
+    for phase, _template in AGENT_TEMPLATES:
+        engine.state.phase = phase
+        text = engine.render_prompt_for(phase)
+        assert "Never merge a pull request" in text
+        assert "gh pr merge" not in text.replace("no `gh pr merge`", "")
+    engine.state.phase = Phase.MERGE
+    with pytest.raises(StateTransitionError, match="no agent prompt"):
+        engine.render_prompt_for(Phase.MERGE)
 
 
 def test_common_template_has_trust_boundary():

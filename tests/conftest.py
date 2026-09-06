@@ -96,6 +96,10 @@ class FakeGitHub:
         self.prs: dict[str, PRInfo] = {}
         self.comments: dict[str, list[CommentInfo]] = {}
         self.calls: list[tuple] = []
+        # Controller-owned merge simulation (see merge_pr).
+        self.merges: list[tuple[str, str, str, bool]] = []
+        self.merge_error: str = ""  # non-empty -> merge_pr raises GitHubError
+        self.merge_leaves_open: bool = False  # gh exits 0 but PR stays OPEN (merge queue)
         self.add_issue(EPIC, "EPIC")
         self.add_issue(ISSUE, "Feature")
 
@@ -226,6 +230,29 @@ class FakeGitHub:
                 if c.url == url:
                     return c
         raise GitHubError(f"comment not found: {url}")
+
+    def merge_pr(
+        self,
+        url: str,
+        method: str = "squash",
+        match_head_sha: str = "",
+        delete_branch: bool = False,
+    ) -> None:
+        """Mimic `gh pr merge --<method> --match-head-commit <sha>` on the fake."""
+        from autoforge.validation import parse_pr_url
+
+        canonical = parse_pr_url(url).canonical
+        self.calls.append(("merge_pr", canonical, method, match_head_sha, delete_branch))
+        self.merges.append((canonical, method, match_head_sha, delete_branch))
+        if self.merge_error:
+            raise GitHubError(self.merge_error)
+        pr = self.get_pr(canonical)
+        if not pr.is_open:
+            raise GitHubError(f"`gh pr merge` failed: PR is {pr.state}")
+        if match_head_sha and pr.head_sha != match_head_sha:
+            raise GitHubError("`gh pr merge` failed: head commit does not match")
+        if not self.merge_leaves_open:
+            pr.state = "MERGED"
 
 
 def scripted_config():

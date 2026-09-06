@@ -214,7 +214,9 @@ ANALYZE_EXECUTE -> Claude Code + Fable + high
 FIX             -> Claude Code + Fable + high
 ```
 
-Later merge / EPIC maintenance profiles are expected to use the configured OpenCode profile for Muse Spark 1.3 Free.
+Later EPIC maintenance profiles are expected to use the configured OpenCode profile for Muse Spark 1.3 Free.
+
+`MERGE` has no agent profile. The controller performs the merge itself (`gh pr merge` via `GitHubClient`, bound to the reviewed HEAD) behind the merge safety gate; agents are never asked to merge, and `common.md` rule "never merge a pull request" is unconditional.
 
 These are **logical profiles**. Real provider model identifiers and CLI flags belong in configuration/provider mapping, not in state-machine logic.
 

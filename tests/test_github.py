@@ -176,3 +176,50 @@ def test_current_repo_uses_repo_view():
 
     assert _client(handler).current_repo().name_with_owner == "o/r"
     assert seen[0][:3] == ["gh", "repo", "view"]
+
+
+def test_build_merge_argv_and_merge_pr():
+    from autoforge.errors import ConfigurationError
+    from autoforge.github import build_merge_argv
+
+    url = "https://github.com/o/r/pull/42"
+    sha = "a" * 40
+    assert build_merge_argv(url, "squash", sha) == [
+        "pr",
+        "merge",
+        url,
+        "--squash",
+        "--match-head-commit",
+        sha,
+    ]
+    assert build_merge_argv(url, "rebase", sha, delete_branch=True) == [
+        "pr",
+        "merge",
+        url,
+        "--rebase",
+        "--match-head-commit",
+        sha,
+        "--delete-branch",
+    ]
+    with pytest.raises(ConfigurationError, match="merge.method"):
+        build_merge_argv(url, "fast-forward", sha)
+    # The merge is always bound to a full reviewed HEAD SHA — never unbound.
+    for bad in ("", "abc123", "g" * 40):
+        with pytest.raises(ConfigurationError, match="match-head-commit"):
+            build_merge_argv(url, "squash", bad)
+
+    seen = []
+
+    def runner(req):
+        seen.append(req.command)
+        return _res({}, exit_code=0)
+
+    gh = _client(runner)
+    gh.merge_pr(url, method="merge", match_head_sha=sha)
+    assert seen == [["gh", "pr", "merge", url, "--merge", "--match-head-commit", sha]]
+
+
+def test_merge_pr_failure_raises_github_error():
+    gh = _client(lambda req: _res({}, exit_code=1, stderr="Pull request is not mergeable"))
+    with pytest.raises(GitHubError, match="not mergeable"):
+        gh.merge_pr("https://github.com/o/r/pull/42", match_head_sha="a" * 40)

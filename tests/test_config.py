@@ -17,12 +17,32 @@ def test_defaults_have_all_logical_profiles():
         "review_round_1",
         "review_round_2_5",
         "review_round_6_plus",
-        "merge",
         "update_epic",
     ):
         p = cfg.profile(name)
         assert p.provider in ("claude", "opencode")
         assert p.model  # real CLI model identifier present
+    # MERGE is performed by the controller: no agent profile, but a merge section.
+    assert "merge" not in cfg.profiles
+    assert cfg.merge.method == "squash" and cfg.merge.delete_branch is False
+
+
+def test_merge_section_parsing(tmp_path):
+    p = tmp_path / "cfg.json"
+    p.write_text(
+        '{"version": 1, "merge": {"method": "rebase", "delete_branch": true}}', encoding="utf-8"
+    )
+    cfg = load_config_file(p)
+    assert cfg.merge.method == "rebase" and cfg.merge.delete_branch is True
+    for body in (
+        '{"version": 1, "merge": {"method": "fast-forward"}}',
+        '{"version": 1, "merge": {"method": 1}}',
+        '{"version": 1, "merge": {"delete_branch": "true"}}',
+        '{"version": 1, "merge": "squash"}',
+    ):
+        p.write_text(body, encoding="utf-8")
+        with pytest.raises(ConfigurationError, match="merge"):
+            load_config_file(p)
 
 
 def test_unknown_profile_raises():
@@ -68,13 +88,13 @@ def test_json_config_overrides_model(tmp_path):
         json.dumps(
             {
                 "version": 1,
-                "profiles": {"merge": {"provider": "opencode", "model": "custom/m"}},
+                "profiles": {"update_epic": {"provider": "opencode", "model": "custom/m"}},
             }
         ),
         encoding="utf-8",
     )
     cfg = load_config_file(p)
-    assert cfg.profile("merge").model == "custom/m"
+    assert cfg.profile("update_epic").model == "custom/m"
     assert cfg.profile("fix").model == "fable"  # untouched default
 
 

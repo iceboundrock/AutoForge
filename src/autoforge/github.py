@@ -1,9 +1,12 @@
-"""GitHub abstraction over the `gh` CLI (read-only / verification).
+"""GitHub abstraction over the `gh` CLI (verification + controller-owned merge).
 
 Business logic must use these typed objects, never parse raw `gh` JSON
-inline. Write operations (comment/merge/edit) are intentionally NOT provided:
-agents perform them under controller prompts, and the controller only
-*verifies* what the agents claim through this client.
+inline. Agents perform content writes (branches, PRs, comments, issues)
+under controller prompts, and the controller only *verifies* what they
+claim through this client. The single exception is :meth:`GitHubClient.merge_pr`:
+merging is owned by the controller (never by an agent), sits behind the
+merge safety gate in the engine, and is always bound to the reviewed HEAD
+via ``--match-head-commit``.
 """
 
 from __future__ import annotations
@@ -14,7 +17,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from .errors import GitHubError
+from .errors import ConfigurationError, GitHubError
 from .executor import ExecutionRequest, ExecutionResult, execute
 from .validation import (
     GitHubCommentRef,
@@ -116,6 +119,37 @@ def _repo_of(url: str) -> str:
         return parse_github_url(url).repository
     except Exception:
         return ""
+
+
+MERGE_METHODS = ("squash", "merge", "rebase")
+_SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def build_merge_argv(
+    pr_url: str,
+    method: str = "squash",
+    match_head_sha: str = "",
+    delete_branch: bool = False,
+) -> list[str]:
+    """Pure argv builder for ``gh pr merge`` (no ``gh`` prefix, no execution).
+
+    Shared by :meth:`GitHubClient.merge_pr` and the engine's dry-run plan so
+    the command shown in dry-run is exactly the one that would run.
+    ``match_head_sha`` must be the full 40-hex reviewed HEAD; GitHub then
+    refuses the merge server-side if the PR HEAD moved.
+    """
+    if method not in MERGE_METHODS:
+        raise ConfigurationError(f"merge.method must be one of {MERGE_METHODS}, got {method!r}")
+    if not match_head_sha or not _SHA40_RE.match(match_head_sha.lower()):
+        raise ConfigurationError(
+            "merge requires the full 40-hex reviewed HEAD SHA for --match-head-commit, "
+            f"got {match_head_sha!r}"
+        )
+    ref = parse_pr_url(pr_url)
+    argv = ["pr", "merge", ref.canonical, f"--{method}", "--match-head-commit", match_head_sha]
+    if delete_branch:
+        argv.append("--delete-branch")
+    return argv
 
 
 class GitHubClient:
@@ -339,6 +373,24 @@ class GitHubClient:
                 out.append(pr)
         return out
 
+    # -- merge (the only write; controller-owned, engine-gated) ------------------
+    def merge_pr(
+        self,
+        url: str,
+        method: str = "squash",
+        match_head_sha: str = "",
+        delete_branch: bool = False,
+    ) -> None:
+        """Run ``gh pr merge`` bound to ``match_head_sha``.
+
+        Raises GitHubError when ``gh`` fails (conflict, branch protection,
+        HEAD moved, permissions, ...). A normal return only means ``gh``
+        exited 0: callers must re-read the PR and confirm ``state == MERGED``
+        before treating the merge as done (merge queues / auto-merge may
+        leave the PR open).
+        """
+        self._run_gh(build_merge_argv(url, method, match_head_sha, delete_branch))
+
     # -- comments -----------------------------------------------------------
     def get_pr_comments(self, url: str) -> list[CommentInfo]:
         ref = parse_pr_url(url)
@@ -390,6 +442,7 @@ class GitHubClient:
 
 
 __all__ = [
+    "MERGE_METHODS",
     "CheckInfo",
     "CommentInfo",
     "GitHubClient",
@@ -398,4 +451,5 @@ __all__ = [
     "IssueInfo",
     "PRInfo",
     "RepoInfo",
+    "build_merge_argv",
 ]

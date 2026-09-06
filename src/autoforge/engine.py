@@ -13,6 +13,10 @@ agent claim against GitHub** before acting on it:
   the review to detect drift.
 - FIX: previous/new HEAD match reality, every open finding has exactly one
   resolution, follow-up issues really exist in this repository.
+- MERGE: **the controller merges, never an agent.** It runs ``gh pr merge``
+  bound to the reviewed HEAD (``--match-head-commit``) and counts the merge
+  only after GitHub reports the PR as ``MERGED``. No prompt is rendered and
+  no provider is invoked in this phase.
 
 Safety rules:
 - dry-run is fully side-effect-free: no agent subprocess, no gh call, no
@@ -36,6 +40,7 @@ from pathlib import Path
 from . import __prompt_version__
 from .config import AutoForgeConfig, validate_required_profiles
 from .errors import (
+    ConfigurationError,
     ControlResultError,
     ControlResultValidationError,
     ExecutionError,
@@ -45,7 +50,7 @@ from .errors import (
     StateTransitionError,
     VerificationError,
 )
-from .github import GitHubClient, PRInfo
+from .github import GitHubClient, PRInfo, build_merge_argv
 from .locking import ControllerLock
 from .profiles import profile_for_phase
 from .prompts import TEMPLATE_FILES, load_template, render, render_phase
@@ -53,7 +58,6 @@ from .providers import AgentExecutionResult, AgentRequest, ProviderRegistry
 from .result_parser import (
     AnalyzeExecuteResult,
     FixResult,
-    MergeResult,
     ReviewResult,
     UpdateEpicResult,
     parse_control_result,
@@ -102,7 +106,7 @@ PHASE_TEMPLATE: dict[Phase, str | None] = {
     Phase.REVIEW: "review.md",
     Phase.FIX: "fix.md",
     Phase.READY_FOR_MERGE: None,  # holding state, no agent call
-    Phase.MERGE: "merge.md",
+    Phase.MERGE: None,  # controller runs `gh pr merge` itself; agents never merge
     Phase.UPDATE_EPIC: "update_epic.md",
     Phase.DONE: None,
     Phase.BLOCKED: None,
@@ -287,6 +291,19 @@ class ControllerEngine:
                 "(holds unless merge gate is opened)",
                 notes=[MERGE_GATE_MESSAGE],
             )
+        if s.phase == Phase.MERGE:
+            return self._deterministic_plan(
+                s,
+                "MERGE (controller runs `gh pr merge` itself; no agent, no prompt)",
+                "UPDATE_EPIC (only after gh reports the PR as MERGED)",
+                notes=[
+                    MERGE_GATE_MESSAGE,
+                    "would verify: PR open, PR HEAD == reviewed HEAD, last review clean",
+                    "would run the command below (bound to the reviewed HEAD via "
+                    "--match-head-commit), then re-read the PR and require state MERGED",
+                ],
+                command=self._merge_plan_command(),
+            )
         profile = profile_for_phase(self.config, s.phase, s.review_round)
         variables = self._prompt_variables()
         prompt = self.render_prompt_for(s.phase)
@@ -296,8 +313,6 @@ class ControllerEngine:
             notes.append("would first check for an existing open PR (recovery -> REVIEW)")
         if s.phase == Phase.REVIEW:
             notes.append("REVIEWED_HEAD_SHA is fetched from gh immediately before the review")
-        if s.phase == Phase.MERGE:
-            notes.append(MERGE_GATE_MESSAGE)
         return StepPlan(
             phase=s.phase.value,
             profile_name=profile.name,
@@ -319,9 +334,33 @@ class ControllerEngine:
             notes=notes,
         )
 
+    def _merge_argv(self) -> list[str]:
+        """Exact ``gh`` argv the controller would run to merge the current PR."""
+        s = self._require_state()
+        return [
+            self.config.github.command,
+            *build_merge_argv(
+                s.current_pr_url,
+                method=self.config.merge.method,
+                match_head_sha=(s.reviewed_head_sha or "").lower(),
+                delete_branch=self.config.merge.delete_branch,
+            ),
+        ]
+
+    def _merge_plan_command(self) -> list[str]:
+        """Dry-run helper: the merge argv, or [] when state cannot yet produce one."""
+        try:
+            return self._merge_argv()
+        except ConfigurationError:
+            return []
+
     @staticmethod
     def _deterministic_plan(
-        state: AutoForgeState, routing: str, expected: str, notes: list[str]
+        state: AutoForgeState,
+        routing: str,
+        expected: str,
+        notes: list[str],
+        command: list[str] | None = None,
     ) -> StepPlan:
         return StepPlan(
             phase=state.phase.value,
@@ -329,7 +368,7 @@ class ControllerEngine:
             provider="(none)",
             model="(none)",
             effort="(none)",
-            command=[],
+            command=list(command or []),
             timeout_seconds=0,
             prompt_length=0,
             prompt_preview="(no agent prompt)",
@@ -348,7 +387,7 @@ class ControllerEngine:
             Phase.ANALYZE_EXECUTE: "REVIEW (after PR verification via gh)",
             Phase.REVIEW: "FIX if any finding, READY_FOR_MERGE if clean, REVIEW if HEAD moved",
             Phase.FIX: "REVIEW (after new HEAD verification via gh)",
-            Phase.MERGE: "ANALYZE_EXECUTE | UPDATE_EPIC | DONE",
+            Phase.MERGE: "UPDATE_EPIC (controller merge verified as MERGED via gh) | REVIEW",
             Phase.UPDATE_EPIC: "ANALYZE_EXECUTE | DONE",
         }.get(phase, "")
 
@@ -441,7 +480,7 @@ class ControllerEngine:
         if previous == Phase.READY_FOR_MERGE:
             return self._ready_for_merge_step(plan, allow_merge)
         if previous == Phase.MERGE:
-            self._check_merge_gate(allow_merge)
+            return self._merge_step(plan, allow_merge)
         if previous == Phase.ANALYZE_EXECUTE:
             recovered = self._try_recover_pr()
             if recovered is not None:
@@ -599,6 +638,145 @@ class ControllerEngine:
         if not (self.config.merge_allowed_by_config and allow_merge):
             raise VerificationError(MERGE_GATE_MESSAGE)
 
+    def _block(self, previous: Phase, plan: StepPlan | None, reason: str) -> StepOutcome:
+        """Enter BLOCKED with a human-readable reason (never guess)."""
+        state = self._require_state()
+        state.phase = Phase.BLOCKED
+        state.block_reason = reason
+        self._save()
+        return self._outcome(previous, plan=plan, message=reason)
+
+    # -- MERGE: controller-owned, no agent ------------------------------------------
+    def _merge_step(self, plan: StepPlan, allow_merge: bool) -> StepOutcome:
+        """Merge the current PR with ``gh pr merge`` — the controller, never an agent.
+
+        Order of checks (all before any write):
+        1. merge gate (config AND CLI flag)
+        2. state carries a clean review bound to a HEAD
+        3. PR belongs to this repository; already MERGED -> crash recovery
+        4. PR is OPEN and its HEAD equals the reviewed HEAD (else -> REVIEW)
+        Then ``gh pr merge --<method> --match-head-commit <reviewed>``; the PR
+        is re-read and the merge is counted only when GitHub says MERGED.
+        Any other outcome is BLOCKED (merge failures are never blindly retried).
+        """
+        state = self._require_state()
+        self._check_merge_gate(allow_merge)
+        if not state.current_pr_url:
+            raise StateError("phase MERGE requires current_pr_url in state")
+        url = state.current_pr_url
+        reviewed = (state.reviewed_head_sha or "").lower()
+        if state.last_review_result != "clean" or not reviewed:
+            raise VerificationError(
+                "MERGE requires a clean review bound to a HEAD in state "
+                f"(last_review_result={state.last_review_result!r}, "
+                f"reviewed_head_sha={state.reviewed_head_sha!r}); refusing to merge"
+            )
+        pr = self.github.get_pr(url)
+        if parse_pr_url(pr.url or url).repository.lower() != state.repository.lower():
+            raise VerificationError(f"PR {url} is not in {state.repository}")
+        if pr.state == "MERGED":
+            # Crash recovery: the merge happened but state was not persisted.
+            if pr.head_sha != reviewed:
+                return self._block(
+                    Phase.MERGE,
+                    plan,
+                    f"PR {url} is already MERGED at HEAD {pr.head_sha} but the last clean "
+                    f"review covered {reviewed}; the controller never reviewed the merged "
+                    "code. Inspect manually.",
+                )
+            return self._complete_merge(pr, plan, recovered=True)
+        if not pr.is_open:
+            return self._block(
+                Phase.MERGE, plan, f"PR {url} is {pr.state}; only an OPEN PR can be merged"
+            )
+        if not pr.head_sha:
+            raise VerificationError(f"PR {url} has no readable head SHA")
+        if pr.head_sha != reviewed:
+            state.current_head_sha = pr.head_sha
+            state.last_review_result = "stale"
+            state.open_findings = []
+            validate_transition(Phase.MERGE, Phase.REVIEW)
+            state.phase = Phase.REVIEW
+            self._save()
+            return self._outcome(
+                Phase.MERGE,
+                plan=plan,
+                message="PR HEAD moved after the clean review; MERGE -> REVIEW (not merged)",
+            )
+
+        merge_error = ""
+        try:
+            self.github.merge_pr(
+                url,
+                method=self.config.merge.method,
+                match_head_sha=reviewed,
+                delete_branch=self.config.merge.delete_branch,
+            )
+        except GitHubError as exc:
+            merge_error = str(exc)
+
+        # GitHub is the source of truth: `gh` exit status is only a hint.
+        try:
+            after = self.github.get_pr(url)
+        except GitHubError as exc:
+            hint = f"gh pr merge failed ({merge_error}) and" if merge_error else "after gh pr merge"
+            return self._block(
+                Phase.MERGE,
+                plan,
+                f"{hint} the PR could not be re-read: {exc}. Nothing was counted; "
+                "inspect the PR on GitHub, then resume.",
+            )
+        if after.state != "MERGED":
+            if merge_error:
+                reason = f"gh pr merge failed: {merge_error}"
+            else:
+                reason = (
+                    f"gh pr merge exited 0 but GitHub reports PR {url} as {after.state} "
+                    "(merge queue / auto-merge pending?)"
+                )
+            return self._block(
+                Phase.MERGE, plan, f"{reason}. Nothing was counted; resolve on GitHub, then resume."
+            )
+        if after.head_sha != reviewed:
+            return self._block(
+                Phase.MERGE,
+                plan,
+                f"PR {url} is MERGED at HEAD {after.head_sha}, not the reviewed HEAD "
+                f"{reviewed}; refusing to count an unreviewed merge. Inspect manually.",
+            )
+        return self._complete_merge(after, plan, recovered=False)
+
+    def _complete_merge(self, pr: PRInfo, plan: StepPlan, recovered: bool) -> StepOutcome:
+        state = self._require_state()
+        url = parse_pr_url(pr.url or state.current_pr_url).canonical
+        newly = state.record_merge(url)  # idempotent across crash/resume
+        state.current_head_sha = pr.head_sha
+        nxt = self._after_merge_phase()
+        validate_transition(Phase.MERGE, nxt)
+        state.phase = nxt
+        state.attempt = 0
+        self._save()
+        how = "already MERGED on GitHub (recovered)" if recovered else "merged by the controller"
+        counted = "counted" if newly else "already counted"
+        return self._outcome(
+            Phase.MERGE,
+            plan=plan,
+            message=(
+                f"PR {url} {how} at reviewed HEAD {pr.head_sha[:12]}; {counted} "
+                f"({state.merged_since_epic_update} since last EPIC update); MERGE -> {nxt.value}"
+            ),
+        )
+
+    @staticmethod
+    def _after_merge_phase() -> Phase:
+        """Deterministic post-merge routing owned by the controller.
+
+        Always UPDATE_EPIC for now: the UPDATE_EPIC agent posts progress and
+        selects the next issue (or null -> DONE). Batching several merges per
+        EPIC update (MERGE -> ANALYZE_EXECUTE) is tracked separately (#13).
+        """
+        return Phase.UPDATE_EPIC
+
     # -- pre-invocation preparation --------------------------------------------
     def _require_open_pr(self) -> PRInfo:
         state = self._require_state()
@@ -729,8 +907,6 @@ class ControllerEngine:
             return self._apply_review(ReviewResult.from_payload(payload))
         if phase == Phase.FIX:
             return self._apply_fix(FixResult.from_payload(payload))
-        if phase == Phase.MERGE:
-            return self._apply_merge(MergeResult.from_payload(payload))
         if phase == Phase.UPDATE_EPIC:
             return self._apply_update_epic(UpdateEpicResult.from_payload(payload))
         raise StateTransitionError(f"phase {phase.value} does not accept agent results")
@@ -927,19 +1103,6 @@ class ControllerEngine:
             f"FIX verified: HEAD {expected_prev[:12]} -> {pr.head_sha[:12]}, "
             f"{len(res.resolutions)} resolution(s); FIX -> REVIEW (round {state.review_round + 1})"
         )
-
-    def _apply_merge(self, res: MergeResult) -> tuple[Phase, str]:
-        state = self._require_state()
-        if res.head_changed_after_review:
-            return Phase.REVIEW, "HEAD changed after review; MERGE -> REVIEW"
-        if res.merged and state.current_pr_url:
-            state.record_merge(state.current_pr_url)
-        if res.next_action == "NEXT_ISSUE" and res.next_issue_url:
-            state.reset_for_new_issue(parse_issue_url(res.next_issue_url).canonical)
-            return Phase.ANALYZE_EXECUTE, "MERGE -> ANALYZE_EXECUTE (next issue)"
-        if res.next_action == "UPDATE_EPIC":
-            return Phase.UPDATE_EPIC, "MERGE -> UPDATE_EPIC"
-        return Phase.DONE, "MERGE -> DONE"
 
     def _apply_update_epic(self, res: UpdateEpicResult) -> tuple[Phase, str]:
         state = self._require_state()

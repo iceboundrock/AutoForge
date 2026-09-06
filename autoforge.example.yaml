@@ -32,6 +32,13 @@ safety:
   # invoked with --allow-merge. Automatic merge is disabled in this milestone.
   allow_merge: false
 
+merge:
+  # How the CONTROLLER merges once the gate above is open. Agents never merge:
+  # the engine itself runs `gh pr merge --<method> --match-head-commit <reviewed HEAD>`
+  # and counts the merge only after GitHub reports the PR as MERGED.
+  method: squash          # squash | merge | rebase
+  delete_branch: false    # add --delete-branch
+
 profiles:
   analyze_execute:
     provider: claude
@@ -83,14 +90,9 @@ profiles:
       output_format: default
       auto_approve: false
 
-  # Future milestones (gated; never executed unless safety.allow_merge + --allow-merge).
-  merge:
-    provider: opencode
-    model: openai/gpt-5.6-sol
-    effort: high
-    command: opencode
-    timeout_seconds: 1200
-
+  # Future milestone (reachable only after a controller-performed merge, which
+  # is gated by safety.allow_merge + --allow-merge). There is no `merge` agent
+  # profile: MERGE is executed by the controller, see `merge:` above.
   update_epic:
     provider: opencode
     model: openai/gpt-5.6-sol
