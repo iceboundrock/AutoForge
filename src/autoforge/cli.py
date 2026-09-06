@@ -26,7 +26,6 @@ from .errors import (
     StateError,
     StateTransitionError,
 )
-from .locking import ControllerLock
 from .redaction import redact, redact_argv
 from .state import (
     AutoForgeState,
@@ -203,11 +202,14 @@ def cmd_run(args) -> int:
             print_plan(o.plan, full_prompt=args.full_prompt)
         return 0
 
-    # Inspect, decide, quarantine and write the first state under one lock:
-    # a verdict taken before the lock could go stale (another controller may
-    # have repaired, replaced or created state.json in the meantime) and
-    # would then quarantine or overwrite a perfectly valid run.
-    with ControllerLock(paths.lock_file):
+    # Inspect, decide, quarantine, write the first state AND execute under
+    # one continuous lock: a verdict taken before the lock could go stale
+    # (another controller may have repaired, replaced or created state.json
+    # in the meantime) and would then quarantine or overwrite a perfectly
+    # valid run; releasing the lock between the first save and the execution
+    # would let a second controller take over the repository and both would
+    # then run agents and persist state over each other.
+    with engine.locked():
         corrupt = False
         # lexists, not exists: a dangling state.json symlink is still an
         # entry that a fresh save would silently replace.
@@ -243,24 +245,56 @@ def cmd_run(args) -> int:
             moved = quarantine_state_file(paths.state_file)
             print(f"autoforge: moved unreadable state file aside: {moved}", file=sys.stderr)
         save_state(engine.state, paths.state_file)
-    outcomes = engine.run(max_steps=args.max_steps, dry_run=False, allow_merge=args.allow_merge)
+        outcomes = engine.run(max_steps=args.max_steps, dry_run=False, allow_merge=args.allow_merge)
     return _finish(engine, outcomes, args.allow_merge)
 
 
 def cmd_step(args) -> int:
     engine = _engine_for(args)
-    engine.load()
-    outcome = engine.step(dry_run=args.dry_run, allow_merge=args.allow_merge)
-    if args.dry_run and outcome.plan is not None:
-        print_plan(outcome.plan, full_prompt=args.full_prompt)
+    if args.dry_run:
+        # Read-only: no lock, nothing written.
+        engine.load()
+        outcome = engine.step(dry_run=True, allow_merge=args.allow_merge)
+        if outcome.plan is not None:
+            print_plan(outcome.plan, full_prompt=args.full_prompt)
         return 0
+    # Load and execute under one lock: a snapshot loaded before the lock
+    # could already have been replaced by another controller.
+    with engine.locked():
+        engine.load()
+        outcome = engine.step(dry_run=False, allow_merge=args.allow_merge)
     return _finish(engine, [outcome], args.allow_merge)
 
 
 def cmd_resume(args) -> int:
     engine = _engine_for(args)
-    state = engine.load()
-    if state.phase == Phase.READY_FOR_MERGE and not engine.merge_gate_open(args.allow_merge):
+    if args.dry_run:
+        # Read-only: no lock, nothing written.
+        state = engine.load()
+        rc = _resume_holding_state(engine, state, args.allow_merge)
+        if rc is not None:
+            return rc
+        outcomes = engine.run(max_steps=args.max_steps, dry_run=True, allow_merge=args.allow_merge)
+        for o in outcomes:
+            assert o.plan is not None
+            print_plan(o.plan, full_prompt=args.full_prompt)
+        return 0
+    # Load, decide and execute under one lock: a snapshot loaded before the
+    # lock could already have been replaced by another controller.
+    with engine.locked():
+        state = engine.load()
+        rc = _resume_holding_state(engine, state, args.allow_merge)
+        if rc is not None:
+            return rc
+        outcomes = engine.run(max_steps=args.max_steps, dry_run=False, allow_merge=args.allow_merge)
+    return _finish(engine, outcomes, args.allow_merge)
+
+
+def _resume_holding_state(
+    engine: ControllerEngine, state: AutoForgeState, allow_merge: bool
+) -> int | None:
+    """Exit code when ``resume`` has nothing to execute; None when it does."""
+    if state.phase == Phase.READY_FOR_MERGE and not engine.merge_gate_open(allow_merge):
         # Holding state: nothing runs unless the merge gate is open. With the
         # gate open, engine.run() performs the controller-side pre-merge
         # verification instead (bounded re-checks of inconclusive GitHub data
@@ -276,14 +310,7 @@ def cmd_resume(args) -> int:
             f"{state.block_reason or '-'} — inspect .autoforge/logs/ and start a new run"
         )
         return 1
-    if args.dry_run:
-        outcomes = engine.run(max_steps=args.max_steps, dry_run=True, allow_merge=args.allow_merge)
-        for o in outcomes:
-            assert o.plan is not None
-            print_plan(o.plan, full_prompt=args.full_prompt)
-        return 0
-    outcomes = engine.run(max_steps=args.max_steps, dry_run=False, allow_merge=args.allow_merge)
-    return _finish(engine, outcomes, args.allow_merge)
+    return None
 
 
 def cmd_status(args) -> int:

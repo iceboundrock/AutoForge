@@ -17,7 +17,12 @@ from .errors import LockError
 
 
 class ControllerLock:
-    """Non-reentrant exclusive lock held for the engine's lifetime."""
+    """Non-reentrant exclusive lock.
+
+    Held for a whole CLI command via ``ControllerEngine.locked()`` (from the
+    state load / creation through the last persisted step); ``engine.step()``
+    / ``engine.run()`` acquire it per call only when used outside that block.
+    """
 
     def __init__(self, lock_path: str | Path) -> None:
         self.lock_path = Path(lock_path)

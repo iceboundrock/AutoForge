@@ -11,9 +11,12 @@ raises StateError with a meaningful message and is never silently overwritten
 with a fresh state: ``run`` refuses (exit 2) unless ``--force`` is given, and
 even then the unreadable entry is moved aside as
 ``state.json.corrupt-<timestamp>`` by :func:`quarantine_state_file` rather
-than deleted.  ``run`` inspects, decides, quarantines and writes the first
-state under the controller lock, so the verdict on an existing entry is
-never taken from a view another controller may have changed since.
+than deleted.  ``run`` inspects, decides, quarantines, writes the first
+state and executes it under one continuous controller lock (``step`` and
+``resume`` load and execute under it likewise), so the verdict on an
+existing entry is never taken from a view another controller may have
+changed since, and no second controller can take over between the first
+save and the execution.
 """
 
 from __future__ import annotations

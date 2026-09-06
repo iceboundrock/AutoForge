@@ -7,8 +7,10 @@ import pytest
 
 from autoforge import cli
 from autoforge.engine import ControllerEngine
+from autoforge.errors import LockError
 from autoforge.executor import ExecutionResult
 from autoforge.github import CheckInfo
+from autoforge.locking import ControllerLock
 from autoforge.providers import ProviderRegistry, ScriptedProvider
 from autoforge.state import AutoForgeState, load_state, quarantine_state_file, save_state
 from autoforge.transitions import Phase
@@ -694,13 +696,16 @@ def test_run_force_moves_dangling_symlink_state_aside(tmp_path, capsys, monkeypa
     assert json.loads(capsys.readouterr().out)["phase"] == "ANALYZE_EXECUTE"
 
 
-def _other_controller_state(run_id: str) -> AutoForgeState:
+def _other_controller_state(
+    run_id: str, phase: Phase = Phase.ANALYZE_EXECUTE, block_reason: str = ""
+) -> AutoForgeState:
     return AutoForgeState(
         run_id=run_id,
         repository="owner/repo",
         epic_url=EPIC,
         current_issue_url=ISSUE,
-        phase=Phase.ANALYZE_EXECUTE,
+        phase=phase,
+        block_reason=block_reason,
         created_at="2026-09-06T00:00:00+00:00",
         updated_at="2026-09-06T00:00:00+00:00",
     )
@@ -712,7 +717,7 @@ def _interleave_before_first_lock(monkeypatch, action):
     Simulates another controller finishing its work in the window between
     the caller's pre-lock view of the state directory and its lock acquisition.
     """
-    real_acquire = cli.ControllerLock.acquire
+    real_acquire = ControllerLock.acquire
     fired = []
 
     def racing_acquire(self):
@@ -722,8 +727,31 @@ def _interleave_before_first_lock(monkeypatch, action):
             action()
         return lock
 
-    monkeypatch.setattr(cli.ControllerLock, "acquire", racing_acquire)
+    monkeypatch.setattr(ControllerLock, "acquire", racing_acquire)
     return fired
+
+
+def _second_controller_can_lock(lock_file) -> bool:
+    """Whether a second controller could take the repository lock right now."""
+    try:
+        ControllerLock(lock_file).acquire().release()
+    except LockError:
+        return False
+    return True
+
+
+def _count_lock_acquisitions(monkeypatch) -> list:
+    """Record every *successful* lock acquisition from now on."""
+    real_acquire = ControllerLock.acquire
+    acquired = []
+
+    def counting_acquire(self):
+        lock = real_acquire(self)
+        acquired.append(self.lock_path)
+        return lock
+
+    monkeypatch.setattr(ControllerLock, "acquire", counting_acquire)
+    return acquired
 
 
 def test_run_force_never_quarantines_state_saved_by_a_concurrent_controller(
@@ -791,3 +819,118 @@ def test_run_refuses_state_created_by_a_concurrent_controller_before_lock(
     assert "af-other" in err and "--force" in err
     assert load_state(sf).run_id == "af-other"
     assert sorted(p.name for p in sd.iterdir()) == ["controller.lock", "state.json"]
+
+
+# -- R5-F1: one continuous lock per command ----------------------------------
+def _analyze_ok(gh) -> str:
+    gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2])
+    return block(
+        {
+            "phase": "ANALYZE_EXECUTE",
+            "status": "success",
+            "issue_url": ISSUE,
+            "pr_url": PR,
+            "head_sha": SHA_A,
+            "branch": BRANCH,
+        }
+    )
+
+
+@pytest.mark.parametrize("command", ["run", "step", "resume"])
+def test_command_holds_one_lock_from_state_load_through_agent_execution(
+    tmp_path, capsys, monkeypatch, fakes, command
+):
+    """R5-F1: no lock gap between reading/creating state.json and executing it.
+
+    A second controller must be unable to take the repository lock while the
+    agent runs, and the command takes the lock exactly once (no release and
+    re-acquire between the first save / load and the engine loop).
+    """
+    monkeypatch.chdir(tmp_path)
+    sd = tmp_path / ".autoforge"
+    lock_file = sd / "controller.lock"
+    if command != "run":
+        sd.mkdir()
+        save_state(_other_controller_state("af-live"), sd / "state.json")
+    seen: list[bool] = []
+
+    def agent(req):
+        seen.append(_second_controller_can_lock(lock_file))
+        return _analyze_ok(fakes["gh"])
+
+    fakes["handler"] = agent
+    acquired = _count_lock_acquisitions(monkeypatch)
+    argv = ["--state-dir", str(sd), command]
+    if command == "run":
+        argv += ["--epic", EPIC, "--issue", ISSUE, "--max-steps", "2"]
+    elif command == "resume":
+        argv += ["--max-steps", "1"]
+    assert cli.main(argv) == 0
+    assert seen == [False], "a second controller took the lock while the agent ran"
+    assert acquired == [lock_file]
+    assert _second_controller_can_lock(lock_file), "lock must be released afterwards"
+    assert load_state(sd / "state.json").phase == Phase.REVIEW
+
+
+def test_step_executes_the_state_seen_under_the_lock_not_a_pre_lock_snapshot(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """R5-F1: `step` loads state.json under the lock, never before it.
+
+    Another controller finishes the run (DONE) right before this `step` gets
+    the lock. The stale ANALYZE_EXECUTE snapshot must not be executed: no
+    agent runs and the other controller's state is left as it is.
+    """
+    monkeypatch.chdir(tmp_path)
+    sd = tmp_path / ".autoforge"
+    sd.mkdir()
+    sf = sd / "state.json"
+    save_state(_other_controller_state("af-stale"), sf)
+    fakes["handler"] = lambda req: _analyze_ok(fakes["gh"])
+    fired = _interleave_before_first_lock(
+        monkeypatch, lambda: save_state(_other_controller_state("af-other", Phase.DONE), sf)
+    )
+    rc = cli.main(["--state-dir", str(sd), "step"])
+    out = capsys.readouterr().out
+    assert rc == 0 and fired
+    assert "af-other" in out and "already DONE" in out
+    assert fakes["provider"].calls == []
+    on_disk = load_state(sf)
+    assert on_disk.run_id == "af-other" and on_disk.phase == Phase.DONE
+
+
+def test_resume_executes_the_state_seen_under_the_lock_not_a_pre_lock_snapshot(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """R5-F1: `resume` loads and decides under the lock, never on a pre-lock snapshot."""
+    monkeypatch.chdir(tmp_path)
+    sd = tmp_path / ".autoforge"
+    sd.mkdir()
+    sf = sd / "state.json"
+    save_state(_other_controller_state("af-stale"), sf)
+    fakes["handler"] = lambda req: _analyze_ok(fakes["gh"])
+    fired = _interleave_before_first_lock(
+        monkeypatch,
+        lambda: save_state(_other_controller_state("af-other", Phase.BLOCKED, "human needed"), sf),
+    )
+    rc = cli.main(["--state-dir", str(sd), "resume", "--max-steps", "5"])
+    out = capsys.readouterr().out
+    assert rc == 1 and fired
+    assert "af-other" in out and "BLOCKED" in out and "human needed" in out
+    assert fakes["provider"].calls == []
+    on_disk = load_state(sf)
+    assert on_disk.run_id == "af-other" and on_disk.phase == Phase.BLOCKED
+
+
+def test_step_and_resume_dry_run_take_no_lock(tmp_path, capsys, monkeypatch, fakes):
+    """Dry-run stays read-only: it must work while another controller holds the lock."""
+    monkeypatch.chdir(tmp_path)
+    sd = tmp_path / ".autoforge"
+    sd.mkdir()
+    save_state(_other_controller_state("af-live"), sd / "state.json")
+    with ControllerLock(sd / "controller.lock"):
+        assert cli.main(["--state-dir", str(sd), "step", "--dry-run"]) == 0
+        assert cli.main(["--state-dir", str(sd), "resume", "--dry-run"]) == 0
+    assert "analyze_execute.md" in capsys.readouterr().out
+    assert fakes["provider"].calls == []
+    assert load_state(sd / "state.json").step_count == 0

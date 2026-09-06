@@ -109,9 +109,10 @@ Key design points:
   (bad JSON, unknown phase, invalid UTF-8, dangling symlink), and
   `run --force` moves the entry aside as `state.json.corrupt-<timestamp>`
   instead of deleting it (a symlink is archived as a link; its target is
-  never touched). `run` inspects, decides, quarantines and writes the first
-  state under the controller lock, so a concurrent controller can never be
-  quarantined or overwritten on a stale verdict.
+  never touched). `run` inspects, decides, quarantines, writes the first
+  state **and executes it** under one continuous controller lock, so a
+  concurrent controller can never be quarantined or overwritten on a stale
+  verdict, nor slip in between the first save and the engine loop.
 - **The REVIEW/FIX loop is bounded by the controller.** `workflow.max_review_rounds`
   (default 6) caps completed review rounds per PR; a round at the cap that
   still has findings goes to `BLOCKED` instead of starting a FIX that could
@@ -239,6 +240,10 @@ and `block_reason`.
 ## Security model
 
 - One controller per repository (flock); a second instance exits with `LockError`.
+  `run`, `step` and `resume` take the lock **before** `state.json` is read or
+  created and keep it until their last step has been persisted, so a state
+  snapshot loaded before the lock is never executed and no second controller
+  can take over the repository mid-command. Dry-run takes no lock.
 - **Automatic merge is off by default and opt-in only.** The `MERGE` phase is
   reachable only from `READY_FOR_MERGE` and only when **both**
   `safety.allow_merge: true` is set in config **and** `--allow-merge` is

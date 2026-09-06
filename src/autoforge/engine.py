@@ -62,6 +62,8 @@ from __future__ import annotations
 import json
 import re
 import secrets
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -77,6 +79,7 @@ from .errors import (
     GitHubError,
     GitHubNotFoundError,
     GitHubUnavailableError,
+    LockError,
     StateError,
     StateTransitionError,
     VerificationError,
@@ -224,6 +227,11 @@ class ControllerEngine:
             timeout_seconds=config.github.timeout_seconds,
         )
         self.state: AutoForgeState | None = None
+        # Set by locked(): the controller lock held for a whole command.
+        self._lock: ControllerLock | None = None
+        # True while self.state is a snapshot of state.json taken by load();
+        # such a snapshot is re-read under a self-acquired execution lock.
+        self._state_from_disk = False
 
     # -- state handling --------------------------------------------------
     def new_run(self, epic_url: str, issue_url: str) -> AutoForgeState:
@@ -239,10 +247,12 @@ class ControllerEngine:
             updated_at=now,
             prompt_version=self.config.prompt_version or __prompt_version__,
         )
+        self._state_from_disk = False
         return self.state
 
     def load(self) -> AutoForgeState:
         self.state = load_state(self.paths.state_file)
+        self._state_from_disk = True
         return self.state
 
     def _require_state(self) -> AutoForgeState:
@@ -480,10 +490,58 @@ class ControllerEngine:
         return f"{state.phase.value} -> profile {profile_name}"
 
     # -- public entry points (locking) --------------------------------------
+    @property
+    def lock_held(self) -> bool:
+        """True while this engine holds the controller lock via :meth:`locked`."""
+        return self._lock is not None
+
+    @contextmanager
+    def locked(self) -> Iterator[ControllerEngine]:
+        """Hold the controller lock for a whole command lifecycle.
+
+        A CLI command loads (or creates and saves) state and executes it
+        inside one ``with engine.locked():`` block, so no other controller can
+        replace ``state.json`` between the load and the execution. Inside the
+        block :meth:`step` / :meth:`run` reuse the held lock instead of
+        acquiring a second one (flock(2) is not reentrant across file
+        descriptors; a nested acquisition would fail with LockError).
+        The lock is released when the block exits, also on error.
+        """
+        if self._lock is not None:
+            raise LockError(
+                f"controller lock {self.paths.lock_file} is already held by this engine"
+            )
+        lock = ControllerLock(self.paths.lock_file).acquire()
+        self._lock = lock
+        try:
+            yield self
+        finally:
+            self._lock = None
+            lock.release()
+
+    @contextmanager
+    def _execution_lock(self) -> Iterator[None]:
+        """Lock for a non-dry-run execution.
+
+        Inside :meth:`locked` the already-held lock covers the execution.
+        Otherwise the lock is acquired for this call only and, when the
+        current state is a snapshot taken by :meth:`load`, the snapshot is
+        discarded and ``state.json`` is re-read under the lock: a snapshot
+        loaded before the lock may already have been replaced by another
+        controller and must never be executed.
+        """
+        if self._lock is not None:
+            yield
+            return
+        with ControllerLock(self.paths.lock_file):
+            if self._state_from_disk:
+                self.load()
+            yield
+
     def step(self, dry_run: bool = False, allow_merge: bool = False) -> StepOutcome:
         if dry_run:
             return self._step_once(dry_run=True, allow_merge=allow_merge)
-        with ControllerLock(self.paths.lock_file):
+        with self._execution_lock():
             return self._step_once(dry_run=False, allow_merge=allow_merge)
 
     def run(
@@ -515,7 +573,7 @@ class ControllerEngine:
                     self.state.phase = saved_phase
             return outcomes
         all_outcomes: list[StepOutcome] = []
-        with ControllerLock(self.paths.lock_file):
+        with self._execution_lock():
             for _ in range(max_steps):
                 assert self.state is not None
                 if self.state.phase in stop_phases:
