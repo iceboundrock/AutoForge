@@ -27,7 +27,13 @@ from .errors import (
 )
 from .locking import ControllerLock
 from .redaction import redact, redact_argv
-from .state import AutoForgeState, StatePaths, load_state, save_state
+from .state import (
+    AutoForgeState,
+    StatePaths,
+    load_state,
+    quarantine_state_file,
+    save_state,
+)
 from .transitions import TERMINAL_PHASES, Phase
 
 
@@ -56,7 +62,14 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--epic", required=True, help="EPIC issue URL")
     r.add_argument("--issue", required=True, help="first issue URL")
     r.add_argument("--dry-run", action="store_true", help="plan only; no side effects")
-    r.add_argument("--force", action="store_true", help="overwrite existing non-DONE state")
+    r.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "discard an existing non-terminal run; an unreadable state file is moved "
+            "aside as state.json.corrupt-<timestamp> instead of being deleted"
+        ),
+    )
     r.add_argument("--max-steps", type=int, default=50)
     r.add_argument(
         "--allow-merge",
@@ -188,22 +201,38 @@ def cmd_run(args) -> int:
             print_plan(o.plan, full_prompt=args.full_prompt)
         return 0
 
+    corrupt = False
     if paths.state_file.exists():
         try:
             existing = load_state(paths.state_file)
-        except StateError:
-            existing = None
-        if existing is not None and existing.phase not in TERMINAL_PHASES and not args.force:
-            print(
-                f"autoforge: error: existing run {existing.run_id} "
-                f"in phase {existing.phase.value} — use 'resume' to continue "
-                "or 'run --force' to discard it",
-                file=sys.stderr,
-            )
-            return 2
+        except StateError as exc:
+            # Unreadable / foreign-protocol state is fatal: a fresh run must
+            # never silently replace it (merge counters etc. would be lost).
+            if not args.force:
+                print(
+                    f"autoforge: error: {exc}\n"
+                    "autoforge: error: refusing to start a new run over an unreadable "
+                    "state file — repair it, or use 'run --force' to move it aside as "
+                    f"{paths.state_file.name}.corrupt-<timestamp> and start over",
+                    file=sys.stderr,
+                )
+                return 2
+            corrupt = True
+        else:
+            if existing.phase not in TERMINAL_PHASES and not args.force:
+                print(
+                    f"autoforge: error: existing run {existing.run_id} "
+                    f"in phase {existing.phase.value} — use 'resume' to continue "
+                    "or 'run --force' to discard it",
+                    file=sys.stderr,
+                )
+                return 2
     engine.new_run(args.epic, args.issue)
     assert engine.state is not None
     with ControllerLock(paths.lock_file):
+        if corrupt:
+            moved = quarantine_state_file(paths.state_file)
+            print(f"autoforge: moved unreadable state file aside: {moved}", file=sys.stderr)
         save_state(engine.state, paths.state_file)
     outcomes = engine.run(max_steps=args.max_steps, dry_run=False, allow_merge=args.allow_merge)
     return _finish(engine, outcomes, args.allow_merge)

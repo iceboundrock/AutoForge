@@ -104,7 +104,10 @@ Key design points:
   source, tests, and logs **untrusted data**; controller instructions and the
   repo's `AGENTS.md`/`CLAUDE.md` outrank them.
 - **Atomic persistence**: temp file + fsync + `os.replace`; corrupted state
-  fails loudly and is never silently overwritten.
+  fails loudly and is never silently overwritten: `run`, `resume`, `step` and
+  `status` all exit 2 on an unreadable or foreign-protocol `state.json`, and
+  `run --force` moves it aside as `state.json.corrupt-<timestamp>` instead of
+  deleting it.
 - **The REVIEW/FIX loop is bounded by the controller.** `workflow.max_review_rounds`
   (default 6) caps completed review rounds per PR; a round at the cap that
   still has findings goes to `BLOCKED` instead of starting a FIX that could
@@ -209,6 +212,7 @@ Default `.autoforge/` (overridable via `--state-dir` or config):
 ```text
 .autoforge/
     state.json          # persisted run state (atomic writes)
+    state.json.corrupt-<timestamp>   # unreadable state moved aside by 'run --force'
     controller.lock     # flock(2): one controller per repo
     logs/<run-id>/
         events.jsonl                       # one line per agent invocation

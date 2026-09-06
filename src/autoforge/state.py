@@ -7,7 +7,10 @@ Lock file:   ``<state_dir>/controller.lock``
 Saves are atomic (temp file in the same directory + fsync + os.replace) so
 a crash mid-write never leaves a half-written JSON file.  A corrupted state
 file raises StateError with a meaningful message and is never silently
-overwritten with a fresh state.
+overwritten with a fresh state: ``run`` refuses (exit 2) unless ``--force`` is
+given, and even then the unreadable file is moved aside as
+``state.json.corrupt-<timestamp>`` by :func:`quarantine_state_file` rather
+than deleted.
 """
 
 from __future__ import annotations
@@ -252,3 +255,29 @@ def load_state(path: str | Path) -> AutoForgeState:
             "refusing to overwrite — restore from backup or re-run"
         ) from exc
     return AutoForgeState.from_dict(data)
+
+
+CORRUPT_SUFFIX = ".corrupt-"
+
+
+def quarantine_state_file(path: str | Path) -> Path:
+    """Move an unreadable state file aside instead of deleting it.
+
+    Renames ``<path>`` to ``<path>.corrupt-<UTC timestamp>`` (a numeric
+    suffix is appended if that name is already taken) and returns the new
+    path.  Never overwrites an existing file.  Raises StateError when the
+    rename fails; the original file is left untouched in that case.
+    """
+    src = Path(path)
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    base = src.with_name(f"{src.name}{CORRUPT_SUFFIX}{stamp}")
+    candidate = base
+    n = 1
+    while candidate.exists():
+        candidate = base.with_name(f"{base.name}.{n}")
+        n += 1
+    try:
+        os.rename(src, candidate)
+    except OSError as exc:
+        raise StateError(f"cannot move corrupted state file {src} aside: {exc}") from exc
+    return candidate

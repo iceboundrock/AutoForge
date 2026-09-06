@@ -157,3 +157,36 @@ def test_reset_for_new_issue_clears_review_history_but_keeps_step_budget():
     s.reset_for_new_issue("https://github.com/owner/repo/issues/3")
     assert s.review_history == [] and s.review_round == 0
     assert s.step_count == 9  # cumulative budget survives the switch
+
+
+def test_quarantine_state_file_renames_without_overwriting(tmp_path, monkeypatch):
+    from datetime import datetime
+
+    from autoforge import state as state_mod
+    from autoforge.state import quarantine_state_file
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 9, 6, 12, 0, 0, tzinfo=tz)
+
+    monkeypatch.setattr(state_mod, "datetime", FrozenDatetime)
+    p = tmp_path / "state.json"
+    p.write_text("garbage-1", encoding="utf-8")
+    first = quarantine_state_file(p)
+    assert first == tmp_path / "state.json.corrupt-20260906T120000Z"
+    assert not p.exists() and first.read_text(encoding="utf-8") == "garbage-1"
+
+    # same timestamp again: the earlier quarantined file is never overwritten
+    p.write_text("garbage-2", encoding="utf-8")
+    second = quarantine_state_file(p)
+    assert second == tmp_path / "state.json.corrupt-20260906T120000Z.1"
+    assert first.read_text(encoding="utf-8") == "garbage-1"
+    assert second.read_text(encoding="utf-8") == "garbage-2"
+
+
+def test_quarantine_missing_state_file_raises(tmp_path):
+    from autoforge.state import quarantine_state_file
+
+    with pytest.raises(StateError, match="cannot move"):
+        quarantine_state_file(tmp_path / "state.json")
