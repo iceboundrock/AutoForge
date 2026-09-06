@@ -7,8 +7,11 @@
 > **Early development (Phase 2).** The first real AI development loop is
 > wired end to end — GitHub issue → Claude Code implementation → PR
 > verification → OpenCode review → Claude Code remediation → repeated review
-> → `READY_FOR_MERGE`. **AutoForge does not merge pull requests in this
-> milestone.** Nothing here is production ready yet.
+> → `READY_FOR_MERGE`. **Merging is opt-in and controller-owned:** by default
+> the loop stops at `READY_FOR_MERGE` for a human; with the merge safety gate
+> open (`safety.allow_merge: true` in config **and** `--allow-merge` on the
+> CLI) the controller itself verifies the PR on GitHub and merges it — agents
+> never merge. Nothing here is production ready yet.
 
 ## What AutoForge is (and is not)
 
@@ -20,7 +23,11 @@ against GitHub:
 ```text
 Issue → ANALYZE_EXECUTE (Claude Code) → PR → REVIEW (OpenCode)
       → needs_fix_round? ── YES ──▶ FIX (Claude Code) → REVIEW …
-                          └─ NO ───▶ READY_FOR_MERGE  (stops here; human merges)
+                          └─ NO ───▶ READY_FOR_MERGE
+                                       ├─ merge gate closed (default): stops here; human merges
+                                       └─ gate open: controller verifies on GitHub
+                                          → MERGE (gh pr merge by the controller, no agent)
+                                          → UPDATE_EPIC
 ```
 
 AutoForge itself never writes business code. It:
@@ -29,11 +36,17 @@ AutoForge itself never writes business code. It:
 - selects the execution profile (which provider/model/effort for which round),
 - renders strictly-validated prompts from file templates,
 - invokes `claude` / `opencode` through provider adapters and `gh` through a
-  typed read-only client (argv lists only, never a shell),
+  typed `GitHubClient` (argv lists only, never a shell) — read-only except for
+  the gated, controller-owned merge (`gh pr merge --match-head-commit`) and
+  the disarming of any auto-merge that call left behind,
 - parses the machine-readable `CONTROL_RESULT` protocol from agent stdout,
 - **verifies every claim** (PR exists / is OPEN / HEAD SHA / branch, review
   comment exists on the right PR for the right round and SHA, follow-up issue
   exists, fix actually moved HEAD) before advancing state atomically,
+- **merges only itself, only when told to, and only what was reviewed**: with
+  the safety gate open it re-verifies the PR on GitHub (open, at the reviewed
+  HEAD, checks green, mergeable, no auto-merge / merge queue), merges bound to
+  that exact HEAD, and counts the merge only after GitHub reports `MERGED`,
 - logs every invocation (redacted) under `.autoforge/logs/<run-id>/`.
 
 ## Architecture
@@ -52,7 +65,8 @@ src/autoforge/
     executor.py       subprocess abstraction: argv, timeout, process-tree kill
     result_parser.py  <<<CONTROL_RESULT>>> extraction + typed per-phase results
     validation.py     typed GitHub URL refs (issue / PR / comment), remote parsing
-    github.py         typed read-only GitHubClient over `gh` (PRs, issues, comments)
+    github.py         typed GitHubClient over `gh`: reads (PRs, issues, comments,
+                      checks, merge queue) + the controller-owned merge / disarm writes
     doctor.py         read-only environment checks
     locking.py        flock(2) repository lock (.autoforge/controller.lock)
     runlog.py         per-run logs (.autoforge/logs/<run-id>/), redacted
@@ -162,10 +176,12 @@ uv run autoforge resume            # continue until a stop phase / --max-steps
 uv run autoforge resume --allow-merge
 ```
 
-When the loop reaches `READY_FOR_MERGE` the CLI prints a banner with the
-issue, PR, review round and reviewed HEAD, and states that automatic merge is
-disabled. A human merges the PR. `resume` without the gate open re-prints the
-banner and runs nothing.
+When the loop reaches `READY_FOR_MERGE` with the merge gate closed (the
+default) the CLI prints a banner with the issue, PR, review round and reviewed
+HEAD, and states that automatic merge is disabled: a human merges the PR.
+`resume` without the gate open re-prints the banner and runs nothing. With the
+gate open (`resume --allow-merge` / `step --allow-merge`) the controller
+continues through its own pre-merge verification, `MERGE` and `UPDATE_EPIC`.
 
 URLs must be HTTPS GitHub issue URLs, and EPIC + issue must be in the **same
 repository** as the current working directory (cross-repo runs are rejected).
@@ -196,10 +212,11 @@ State records `current_pr_url`, `current_branch`, `current_head_sha`,
 ## Security model
 
 - One controller per repository (flock); a second instance exits with `LockError`.
-- **Automatic merge is disabled in this milestone.** The `MERGE` phase is
+- **Automatic merge is off by default and opt-in only.** The `MERGE` phase is
   reachable only from `READY_FOR_MERGE` and only when **both**
   `safety.allow_merge: true` is set in config **and** `--allow-merge` is
-  passed on the CLI. Default off; `run` normally stops at `READY_FOR_MERGE`.
+  passed on the CLI. With the gate closed `run`/`resume` stop at
+  `READY_FOR_MERGE` and a human merges.
 - **Agents never merge.** When the gate is open, the *controller* performs the
   merge itself: `gh pr merge --<merge.method> --match-head-commit <reviewed HEAD>`
   through `GitHubClient`, with no prompt and no agent invocation. Every agent
@@ -221,9 +238,12 @@ State records `current_pr_url`, `current_branch`, `current_head_sha`,
   HEAD drift -> `REVIEW`.
 - **Post-merge is reconciled from GitHub.** The merge is counted only after
   GitHub reports `MERGED` at the reviewed HEAD (idempotently, across crashes).
-  If `gh pr merge` returns but the PR is still open, the run is `BLOCKED` and
-  any auto-merge that call armed is disabled again (`gh pr merge
-  --disable-auto`). If the post-merge re-read fails, the outcome is treated as
+  If `gh pr merge` returns but the PR is still open, any auto-merge that call
+  armed is disabled again (`gh pr merge --disable-auto`) and the run is
+  `BLOCKED` — unless the PR is open at a *different* HEAD (pushed between the
+  verification and the write, so `--match-head-commit` refused it) and no
+  asynchronous merge is pending: then nothing unreviewed merged, the clean
+  review is stale and the run goes back to `REVIEW`. If the post-merge re-read fails, the outcome is treated as
   unknown: the run stays in `MERGE` and `resume --allow-merge` re-inspects GitHub (an
   already-merged PR is recovered and counted once; an open one is re-verified),
   bounded by the same `merge.max_verification_attempts`, then `BLOCKED`.

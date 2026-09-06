@@ -678,6 +678,90 @@ def test_merge_head_moved_after_clean_review_goes_back_to_review(tmp_state_dir, 
     assert eng.state.counted_merged_prs == []
 
 
+def test_merge_head_moved_between_verification_and_write_goes_back_to_review(
+    tmp_state_dir, fake_github
+):
+    """R2-F1: a push after the pre-merge checks makes `--match-head-commit` refuse the write;
+    the post-write read finds the PR OPEN at the new HEAD -> stale review -> REVIEW, not BLOCKED."""
+    fake_github.add_pr(head_sha=SHA_A)
+    eng = _in_merge(tmp_state_dir, fake_github, reviewed=SHA_A)
+    orig_merge = fake_github.merge_pr
+
+    def push_then_merge(*a, **kw):
+        fake_github.set_head(SHA_B)  # someone pushes right before gh pr merge runs
+        orig_merge(*a, **kw)  # -> "head commit does not match"
+
+    fake_github.merge_pr = push_then_merge
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "REVIEW" and "not merged" in out.message
+    assert "head commit does not match" in out.message
+    assert len(fake_github.merges) == 1 and fake_github.prs[PR].state == "OPEN"
+    assert eng.state.phase == Phase.REVIEW and eng.state.block_reason == ""
+    assert eng.state.current_head_sha == SHA_B and eng.state.reviewed_head_sha == SHA_A
+    assert eng.state.last_review_result == "stale" and eng.state.open_findings == []
+    assert eng.state.counted_merged_prs == [] and eng.state.merged_since_epic_update == 0
+    persisted = load_state(eng.paths.state_file)
+    assert persisted.phase == Phase.REVIEW and persisted.current_head_sha == SHA_B
+    # the next step is a review of the new HEAD (round 3 on SHA_B), not another merge attempt
+    plan = eng.step(dry_run=True).plan
+    assert plan.phase == "REVIEW" and plan.review_round == 3
+    assert plan.variables["HEAD_SHA"] == SHA_B
+
+
+def test_merge_head_moved_after_write_with_auto_merge_armed_disarms_then_reviews(
+    tmp_state_dir, fake_github
+):
+    """HEAD drift after the write is only routed to REVIEW once no async merge is pending."""
+    fake_github.add_pr(head_sha=SHA_A)
+    fake_github.merge_leaves_open = True
+    fake_github.merge_arms_auto = True
+    eng = _in_merge(tmp_state_dir, fake_github, reviewed=SHA_A)
+    orig_merge = fake_github.merge_pr
+
+    def merge_then_push(*a, **kw):
+        orig_merge(*a, **kw)
+        fake_github.set_head(SHA_B)
+
+    fake_github.merge_pr = merge_then_push
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "REVIEW" and "disabled again" in out.message
+    assert fake_github.disabled_auto == [PR] and eng.state.last_review_result == "stale"
+    assert eng.state.counted_merged_prs == []
+
+
+@pytest.mark.parametrize(
+    "arrange, needle",
+    [
+        (lambda gh: setattr(gh, "disable_auto_error", "403"), "could not be disabled"),
+        (
+            lambda gh: gh.merge_queue.update({PR: MergeQueueStatus(enabled=True, in_queue=True)}),
+            "in the merge queue",
+        ),
+        (lambda gh: setattr(gh, "merge_queue_error", "boom"), "could not be read"),
+    ],
+)
+def test_merge_head_moved_after_write_with_pending_async_merge_blocks(
+    tmp_state_dir, fake_github, arrange, needle
+):
+    """Drift after the write must not re-enter REVIEW while GitHub could still merge the new
+    HEAD on its own (auto-merge stuck armed, PR queued, queue status unreadable)."""
+    fake_github.add_pr(head_sha=SHA_A)
+    fake_github.merge_leaves_open = True
+    fake_github.merge_arms_auto = True
+    eng = _in_merge(tmp_state_dir, fake_github, reviewed=SHA_A)
+    orig_merge = fake_github.merge_pr
+
+    def merge_then_push(*a, **kw):
+        orig_merge(*a, **kw)
+        fake_github.set_head(SHA_B)
+        arrange(fake_github)  # the async-merge condition appears after the write
+
+    fake_github.merge_pr = merge_then_push
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "BLOCKED" and needle in eng.state.block_reason
+    assert eng.state.counted_merged_prs == [] and eng.state.last_review_result == "clean"
+
+
 def test_merge_refuses_without_clean_review(tmp_state_dir, fake_github):
     fake_github.add_pr(head_sha=SHA_A)
     eng = _in_merge(tmp_state_dir, fake_github, clean=False)
@@ -827,8 +911,10 @@ def test_merge_unknown_mergeability_stays_in_merge_for_resume(tmp_state_dir, fak
     """Inconclusive GitHub data: fail closed but do NOT terminalise the run."""
     fake_github.add_pr().mergeable = "UNKNOWN"
     eng = _in_merge(tmp_state_dir, fake_github)
-    with pytest.raises(VerificationError, match="not determined mergeability"):
+    with pytest.raises(VerificationError, match="not determined mergeability") as info:
         eng.step(allow_merge=True)
+    # R2-F2: a plain `resume` is a no-op with the gate closed; guidance names the real command.
+    assert "'resume --allow-merge' to re-check" in str(info.value)
     assert eng.state.phase == Phase.MERGE and fake_github.merges == []
     # once GitHub has computed it, resume merges normally
     fake_github.prs[PR].mergeable = "MERGEABLE"

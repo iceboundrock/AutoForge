@@ -714,7 +714,7 @@ class ControllerEngine:
         self._save()
         raise VerificationError(
             f"{reason}. Not merging; the run stays in {phase.value} (verification attempt "
-            f"{state.attempt}/{limit}) — 'resume' to re-check."
+            f"{state.attempt}/{limit}) — 'resume --allow-merge' to re-check."
         ) from cause
 
     def _verify_pr_for_merge(
@@ -784,20 +784,7 @@ class ControllerEngine:
         if not pr.head_sha:
             raise VerificationError(f"PR {url} has no readable head SHA")
         if pr.head_sha != reviewed:
-            state.current_head_sha = pr.head_sha
-            state.last_review_result = "stale"
-            state.open_findings = []
-            validate_transition(phase, Phase.REVIEW)
-            state.phase = Phase.REVIEW
-            state.attempt = 0
-            self._save()
-            return self._outcome(
-                phase,
-                plan=plan,
-                message=(
-                    f"PR HEAD moved after the clean review; {phase.value} -> REVIEW (not merged)"
-                ),
-            )
+            return self._head_drift_to_review(phase, plan, pr)
         try:
             not_ready = self._merge_readiness_problem(pr)
         except VerificationError as exc:
@@ -805,6 +792,31 @@ class ControllerEngine:
         if not_ready:
             return self._block(phase, plan, f"{not_ready}. Nothing was merged or counted.")
         return pr
+
+    def _head_drift_to_review(
+        self, phase: Phase, plan: StepPlan, pr: PRInfo, detail: str = ""
+    ) -> StepOutcome:
+        """The OPEN PR's HEAD is no longer the reviewed one: the clean review is stale.
+
+        Persists the new HEAD, marks the review stale and routes back to
+        REVIEW (``phase -> REVIEW``). Nothing has been merged or counted.
+        """
+        state = self._require_state()
+        state.current_head_sha = pr.head_sha
+        state.last_review_result = "stale"
+        state.open_findings = []
+        validate_transition(phase, Phase.REVIEW)
+        state.phase = Phase.REVIEW
+        state.attempt = 0
+        self._save()
+        return self._outcome(
+            phase,
+            plan=plan,
+            message=(
+                f"PR HEAD moved after the clean review{detail}; {phase.value} -> REVIEW "
+                "(not merged)"
+            ),
+        )
 
     # -- MERGE: controller-owned, no agent ------------------------------------------
     def _merge_step(self, plan: StepPlan, allow_merge: bool) -> StepOutcome:
@@ -822,7 +834,7 @@ class ControllerEngine:
            otherwise arm auto-merge / enqueue instead of merging).
            Conclusive negatives -> BLOCKED. Inconclusive data (mergeability
            UNKNOWN, checks still running) raises VerificationError and leaves
-           the run in MERGE so ``resume`` re-checks later, at most
+           the run in MERGE so ``resume --allow-merge`` re-checks later, at most
            ``merge.max_verification_attempts`` times, then BLOCKED. Never
            guessed.
         Steps 1-5 are :meth:`_verify_pr_for_merge`, shared with READY_FOR_MERGE.
@@ -831,9 +843,14 @@ class ControllerEngine:
         If the re-read itself fails the outcome is *uncertain*: the run stays
         in MERGE (not BLOCKED, until the same bound is reached) and ``resume``
         reconciles from real GitHub state (already MERGED -> recovered and
-        counted once; still OPEN -> re-verified and re-attempted). Any
-        conclusive non-merge is BLOCKED; merge failures are never blindly
-        retried.
+        counted once; still OPEN -> re-verified and re-attempted). If the
+        re-read finds the PR still OPEN at a *different* HEAD (pushed between
+        the verification and the write; ``--match-head-commit`` refused it),
+        nothing unreviewed was merged and the HEAD-drift rule applies:
+        MERGE -> REVIEW, unless that call left an asynchronous merge pending
+        (auto-merge / merge queue) that could still land the new HEAD, in
+        which case BLOCKED. Any other conclusive non-merge is BLOCKED; merge
+        failures are never blindly retried.
         """
         state = self._require_state()
         verified = self._verify_pr_for_merge(Phase.MERGE, plan, allow_merge)
@@ -876,9 +893,24 @@ class ControllerEngine:
                     f"gh pr merge exited 0 but GitHub reports PR {url} as {after.state} "
                     "(auto-merge armed or merge queue?)"
                 )
-            reason += self._disarm_async_merge(url, after)
+            note, pending = self._disarm_async_merge(url, after)
+            if after.is_open and after.head_sha and after.head_sha != reviewed and not pending:
+                # Post-verification race: the HEAD moved between the controller's
+                # verification and the write, so `--match-head-commit <reviewed>`
+                # refused it. Nothing unreviewed merged; the clean review is
+                # stale -> REVIEW (same rule as pre-write HEAD drift).
+                return self._head_drift_to_review(
+                    Phase.MERGE,
+                    plan,
+                    after,
+                    detail=(
+                        f" (HEAD {after.head_sha[:12]} != reviewed {reviewed[:12]}; {reason}{note})"
+                    ),
+                )
             return self._block(
-                Phase.MERGE, plan, f"{reason}. Nothing was counted; resolve on GitHub manually."
+                Phase.MERGE,
+                plan,
+                f"{reason}{note}. Nothing was counted; resolve on GitHub manually.",
             )
         if after.head_sha != reviewed:
             return self._block(
@@ -947,19 +979,23 @@ class ControllerEngine:
             )
         return ""
 
-    def _disarm_async_merge(self, url: str, after: PRInfo) -> str:
+    def _disarm_async_merge(self, url: str, after: PRInfo) -> tuple[str, bool]:
         """After a merge call that left the PR OPEN, undo any auto-merge it armed.
 
-        Returns extra text for the block reason. The controller must never
-        leave a GitHub-side merge pending that could land a later, unreviewed
-        HEAD on its own.
+        Returns ``(note, pending)``: extra text for the outcome message and
+        whether a GitHub-side merge may still be pending (auto-merge that
+        could not be disabled, PR in the merge queue, or queue status
+        unreadable). The controller must never leave such a merge pending
+        that could land a later, unreviewed HEAD on its own.
         """
         note = ""
+        pending = False
         if after.auto_merge_enabled:
             try:
                 self.github.disable_auto_merge(url)
-                note += "; auto-merge was armed by that call and has been disabled again"
+                note += "; auto-merge was armed on the PR and has been disabled again"
             except GitHubError as exc:
+                pending = True
                 note += (
                     f"; WARNING: auto-merge is armed on the PR and could not be disabled ({exc}) "
                     "— disable it on GitHub immediately"
@@ -967,10 +1003,12 @@ class ControllerEngine:
         try:
             queue = self.github.get_pr_merge_queue_status(url)
         except GitHubError as exc:
-            return note + f"; merge-queue status could not be read ({exc}) — check on GitHub"
+            note += f"; merge-queue status could not be read ({exc}) — check on GitHub"
+            return note, True
         if queue.in_queue:
+            pending = True
             note += "; WARNING: the PR is in the merge queue — remove it on GitHub immediately"
-        return note
+        return note, pending
 
     def _complete_merge(self, pr: PRInfo, plan: StepPlan, recovered: bool) -> StepOutcome:
         state = self._require_state()
