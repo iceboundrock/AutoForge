@@ -116,6 +116,28 @@ def test_implementation_prompt_contract():
     assert "create pr" in text.lower() and "do not merge" in text.lower()
 
 
+def test_update_epic_prompt_contract():
+    text = prompts.load_template("update_epic.md")
+    for phrase in (
+        "next_issue_url",
+        "state OPEN",
+        "never another repository",
+        "neither the EPIC",
+        "{{NEXT_ISSUE_REJECTION}}",
+        "do not repeat",
+    ):
+        assert phrase in text, phrase
+
+
+def test_engine_prompt_carries_last_next_issue_rejection(engine):
+    engine.state.phase = Phase.UPDATE_EPIC
+    assert "rejected by the controller: (none)" in engine.render_prompt_for(Phase.UPDATE_EPIC)
+    engine.state.next_issue_rejections = ["first reason", "next issue X is CLOSED"]
+    text = engine.render_prompt_for(Phase.UPDATE_EPIC)
+    assert "rejected by the controller: next issue X is CLOSED" in text
+    assert "first reason" not in text
+
+
 def test_correction_prompt_exact_text():
     text = prompts.load_template("correction.md")
     assert "Your previous execution did not return a valid CONTROL_RESULT." in text

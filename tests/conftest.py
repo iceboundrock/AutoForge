@@ -116,6 +116,7 @@ class FakeGitHub:
         self.disabled_auto: list[str] = []  # PRs on which disable_auto_merge ran
         self.get_pr_failures: int = 0  # next N get_pr calls raise GitHubUnavailableError
         self.get_pr_error: GitHubError | None = None  # every get_pr call raises this
+        self.get_issue_error: GitHubError | None = None  # every get_issue call raises this
         self.add_issue(EPIC, "EPIC")
         self.add_issue(ISSUE, "Feature")
 
@@ -177,6 +178,8 @@ class FakeGitHub:
 
     def get_issue(self, url: str) -> IssueInfo:
         self.calls.append(("get_issue", url))
+        if self.get_issue_error is not None:
+            raise self.get_issue_error
         ref = parse_issue_url(url)
         try:
             return self.issues[ref.canonical]

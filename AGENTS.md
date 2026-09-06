@@ -355,6 +355,19 @@ Verify:
 - current PR HEAD matches the returned new HEAD
 - claimed follow-up issues exist
 
+### After UPDATE_EPIC
+
+Verify `next_issue_url` exactly like the first issue in `INITIALIZING`
+before switching issues:
+
+- it parses as an issue URL of the configured repository
+- it is neither the EPIC nor the issue just finished
+- the issue exists and is `OPEN`
+
+A rejected selection is retried once (with the controller's reason in the
+prompt); a second rejection enters `BLOCKED`. Never switch to an unverified
+issue.
+
 ### Before MERGE
 
 Verify:

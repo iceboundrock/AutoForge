@@ -67,6 +67,10 @@ class AutoForgeState:
 
     merged_since_epic_update: int = 0
     counted_merged_prs: list[str] = field(default_factory=list)
+    # Reasons the controller rejected the UPDATE_EPIC agent's next_issue_url
+    # (bounded; the last one is rendered into the retry prompt). Cleared once
+    # a next issue verified or the EPIC completed.
+    next_issue_rejections: list[str] = field(default_factory=list)
 
     # Agent invocations attempted for the current phase (reset on transition).
     attempt: int = 0
@@ -117,6 +121,8 @@ class AutoForgeState:
             raise StateError("state field 'open_findings' must be a list")
         if not isinstance(state.last_fix_resolutions, list):
             raise StateError("state field 'last_fix_resolutions' must be a list")
+        if not isinstance(state.next_issue_rejections, list):
+            raise StateError("state field 'next_issue_rejections' must be a list")
         if state.last_review_needs_fix is not None and not isinstance(
             state.last_review_needs_fix, bool
         ):
@@ -161,6 +167,7 @@ class AutoForgeState:
         self.last_review_comment_url = ""
         self.open_findings = []
         self.last_fix_resolutions = []
+        self.next_issue_rejections = []
         self.attempt = 0
 
     @property
