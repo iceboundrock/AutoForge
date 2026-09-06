@@ -284,3 +284,43 @@ def test_quarantine_unlink_failure_leaves_original_and_drops_reservation(tmp_pat
         quarantine_state_file(p)
     assert p.read_text(encoding="utf-8") == "garbage"
     assert [q.name for q in tmp_path.iterdir()] == ["state.json"]
+
+
+def test_load_dangling_symlink_is_corrupt_state(tmp_path):
+    """R4-F2: a dangling state.json symlink is an existing (unreadable) entry, not 'no state'."""
+    import os
+
+    p = tmp_path / "state.json"
+    p.symlink_to("missing-target.json")
+    with pytest.raises(StateError, match="dangling symbolic link"):
+        load_state(p)
+    assert p.is_symlink() and os.readlink(p) == "missing-target.json"
+
+
+def test_quarantine_moves_dangling_symlink_entry_itself(tmp_path):
+    import os
+
+    from autoforge.state import quarantine_state_file
+
+    p = tmp_path / "state.json"
+    p.symlink_to("missing-target.json")
+    moved = quarantine_state_file(p)
+    assert not os.path.lexists(p)
+    assert moved.is_symlink() and os.readlink(moved) == "missing-target.json"
+
+
+def test_quarantine_moves_symlink_without_following_it(tmp_path):
+    """The link is archived as a link; the file it points to is never touched."""
+    import os
+
+    from autoforge.state import quarantine_state_file
+
+    target = tmp_path / "elsewhere.json"
+    target.write_text("{not json", encoding="utf-8")
+    p = tmp_path / "state.json"
+    p.symlink_to(target.name)
+    moved = quarantine_state_file(p)
+    assert not os.path.lexists(p)
+    assert moved.is_symlink() and os.readlink(moved) == target.name
+    assert not target.is_symlink() and target.read_text(encoding="utf-8") == "{not json"
+    assert sorted(x.name for x in tmp_path.iterdir()) == ["elsewhere.json", moved.name]

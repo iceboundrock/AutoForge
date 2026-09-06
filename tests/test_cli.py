@@ -1,6 +1,7 @@
 """CLI: --help, doctor, run/step/resume/status with injected fakes (no real gh/agents)."""
 
 import json
+import os
 
 import pytest
 
@@ -9,6 +10,8 @@ from autoforge.engine import ControllerEngine
 from autoforge.executor import ExecutionResult
 from autoforge.github import CheckInfo
 from autoforge.providers import ProviderRegistry, ScriptedProvider
+from autoforge.state import AutoForgeState, load_state, quarantine_state_file, save_state
+from autoforge.transitions import Phase
 from tests.conftest import (
     BRANCH,
     EPIC,
@@ -547,7 +550,7 @@ def test_run_refuses_corrupt_state_without_force(tmp_path, capsys, monkeypatch, 
     assert rc == 2
     assert "corrupt" in err.lower() and "--force" in err
     assert (sd / "state.json").read_text(encoding="utf-8") == raw
-    assert sorted(p.name for p in sd.iterdir()) == ["state.json"]
+    assert sorted(p.name for p in sd.iterdir()) == ["controller.lock", "state.json"]
 
 
 def test_run_refuses_invalid_utf8_state_without_force(tmp_path, capsys, monkeypatch, fakes):
@@ -564,7 +567,7 @@ def test_run_refuses_invalid_utf8_state_without_force(tmp_path, capsys, monkeypa
     assert rc == 2
     assert "corrupt" in err.lower() and "utf-8" in err.lower() and "--force" in err
     assert (sd / "state.json").read_bytes() == raw
-    assert sorted(p.name for p in sd.iterdir()) == ["state.json"]
+    assert sorted(p.name for p in sd.iterdir()) == ["controller.lock", "state.json"]
 
 
 def test_run_refuses_foreign_protocol_state_without_force(tmp_path, capsys, monkeypatch, fakes):
@@ -579,7 +582,7 @@ def test_run_refuses_foreign_protocol_state_without_force(tmp_path, capsys, monk
     err = capsys.readouterr().err
     assert rc == 2 and "unknown phase" in err.lower() and "--force" in err
     assert (sd / "state.json").read_text(encoding="utf-8") == raw
-    assert sorted(p.name for p in sd.iterdir()) == ["state.json"]
+    assert sorted(p.name for p in sd.iterdir()) == ["controller.lock", "state.json"]
 
 
 def test_run_force_moves_corrupt_state_aside(tmp_path, capsys, monkeypatch, fakes):
@@ -641,3 +644,150 @@ def test_run_force_moves_invalid_utf8_state_aside(tmp_path, capsys, monkeypatch,
     assert str(quarantined[0]) in err
     assert cli.main(["--state-dir", str(sd), "status", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["phase"] == "ANALYZE_EXECUTE"
+
+
+def test_run_refuses_dangling_symlink_state_without_force(tmp_path, capsys, monkeypatch, fakes):
+    """R4-F2: a dangling state.json symlink is an existing entry: exit 2, link untouched."""
+    monkeypatch.chdir(tmp_path)
+    sd = tmp_path / ".autoforge"
+    sd.mkdir()
+    (sd / "state.json").symlink_to("missing-state.json")
+    rc = cli.main(
+        ["--state-dir", str(sd), "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"]
+    )
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "symbolic link" in err.lower() and "--force" in err
+    assert (sd / "state.json").is_symlink()
+    assert os.readlink(sd / "state.json") == "missing-state.json"
+    assert sorted(p.name for p in sd.iterdir()) == ["controller.lock", "state.json"]
+
+
+def test_run_force_moves_dangling_symlink_state_aside(tmp_path, capsys, monkeypatch, fakes):
+    """R4-F2: run --force archives the link itself (not its target) and starts a regular file."""
+    monkeypatch.chdir(tmp_path)
+    sd = tmp_path / ".autoforge"
+    sd.mkdir()
+    (sd / "state.json").symlink_to("missing-state.json")
+    rc = cli.main(
+        [
+            "--state-dir",
+            str(sd),
+            "run",
+            "--epic",
+            EPIC,
+            "--issue",
+            ISSUE,
+            "--max-steps",
+            "1",
+            "--force",
+        ]
+    )
+    assert rc == 0
+    err = capsys.readouterr().err
+    quarantined = [p for p in sd.iterdir() if p.name.startswith("state.json.corrupt-")]
+    assert len(quarantined) == 1
+    assert quarantined[0].is_symlink() and os.readlink(quarantined[0]) == "missing-state.json"
+    assert str(quarantined[0]) in err
+    assert not (sd / "state.json").is_symlink()
+    assert cli.main(["--state-dir", str(sd), "status", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["phase"] == "ANALYZE_EXECUTE"
+
+
+def _other_controller_state(run_id: str) -> AutoForgeState:
+    return AutoForgeState(
+        run_id=run_id,
+        repository="owner/repo",
+        epic_url=EPIC,
+        current_issue_url=ISSUE,
+        phase=Phase.ANALYZE_EXECUTE,
+        created_at="2026-09-06T00:00:00+00:00",
+        updated_at="2026-09-06T00:00:00+00:00",
+    )
+
+
+def _interleave_before_first_lock(monkeypatch, action):
+    """Run ``action()`` once, right when the CLI first takes the controller lock.
+
+    Simulates another controller finishing its work in the window between
+    the caller's pre-lock view of the state directory and its lock acquisition.
+    """
+    real_acquire = cli.ControllerLock.acquire
+    fired = []
+
+    def racing_acquire(self):
+        lock = real_acquire(self)
+        if not fired:
+            fired.append(True)
+            action()
+        return lock
+
+    monkeypatch.setattr(cli.ControllerLock, "acquire", racing_acquire)
+    return fired
+
+
+def test_run_force_never_quarantines_state_saved_by_a_concurrent_controller(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """R4-F1: the 'corrupt' verdict is taken under the lock, never from a stale pre-lock view.
+
+    Two 'run --force' see the same corrupt file. The first quarantines it and
+    saves a fresh run before the second gets the lock. The second must not
+    quarantine that fresh, valid state as though it were the corrupt file it
+    saw earlier; it only discards it as a normal --force over a live run.
+    """
+    monkeypatch.chdir(tmp_path)
+    sd = tmp_path / ".autoforge"
+    sd.mkdir()
+    sf = sd / "state.json"
+    raw = '{"phase": "REVIEW", "run_id": '
+    sf.write_text(raw, encoding="utf-8")
+
+    def first_controller_finishes():
+        quarantine_state_file(sf)
+        save_state(_other_controller_state("af-other"), sf)
+
+    fired = _interleave_before_first_lock(monkeypatch, first_controller_finishes)
+    rc = cli.main(
+        [
+            "--state-dir",
+            str(sd),
+            "run",
+            "--epic",
+            EPIC,
+            "--issue",
+            ISSUE,
+            "--max-steps",
+            "1",
+            "--force",
+        ]
+    )
+    assert rc == 0 and fired
+    quarantined = [p for p in sd.iterdir() if p.name.startswith("state.json.corrupt-")]
+    assert len(quarantined) == 1, "the fresh valid state must not be quarantined"
+    assert quarantined[0].read_text(encoding="utf-8") == raw
+    assert "moved unreadable state file aside" not in capsys.readouterr().err
+    assert cli.main(["--state-dir", str(sd), "status", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["run_id"] != "af-other"
+
+
+def test_run_refuses_state_created_by_a_concurrent_controller_before_lock(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """R4-F1: a state entry appearing after the pre-lock check is seen under the lock."""
+    monkeypatch.chdir(tmp_path)
+    sd = tmp_path / ".autoforge"
+    sd.mkdir()
+    sf = sd / "state.json"
+
+    fired = _interleave_before_first_lock(
+        monkeypatch, lambda: save_state(_other_controller_state("af-other"), sf)
+    )
+    rc = cli.main(
+        ["--state-dir", str(sd), "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"]
+    )
+    err = capsys.readouterr().err
+    assert rc == 2 and fired
+    assert "af-other" in err and "--force" in err
+    assert load_state(sf).run_id == "af-other"
+    assert sorted(p.name for p in sd.iterdir()) == ["controller.lock", "state.json"]

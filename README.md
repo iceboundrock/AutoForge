@@ -105,9 +105,13 @@ Key design points:
   repo's `AGENTS.md`/`CLAUDE.md` outrank them.
 - **Atomic persistence**: temp file + fsync + `os.replace`; corrupted state
   fails loudly and is never silently overwritten: `run`, `resume`, `step` and
-  `status` all exit 2 on an unreadable or foreign-protocol `state.json`, and
-  `run --force` moves it aside as `state.json.corrupt-<timestamp>` instead of
-  deleting it.
+  `status` all exit 2 on an unreadable or foreign-protocol `state.json`
+  (bad JSON, unknown phase, invalid UTF-8, dangling symlink), and
+  `run --force` moves the entry aside as `state.json.corrupt-<timestamp>`
+  instead of deleting it (a symlink is archived as a link; its target is
+  never touched). `run` inspects, decides, quarantines and writes the first
+  state under the controller lock, so a concurrent controller can never be
+  quarantined or overwritten on a stale verdict.
 - **The REVIEW/FIX loop is bounded by the controller.** `workflow.max_review_rounds`
   (default 6) caps completed review rounds per PR; a round at the cap that
   still has findings goes to `BLOCKED` instead of starting a FIX that could

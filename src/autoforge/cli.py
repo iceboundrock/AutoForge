@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 
 from . import __version__
@@ -66,8 +67,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help=(
-            "discard an existing non-terminal run; an unreadable state file is moved "
-            "aside as state.json.corrupt-<timestamp> instead of being deleted"
+            "discard an existing non-terminal run; an unreadable state entry (bad JSON, "
+            "foreign protocol, invalid UTF-8, dangling symlink) is moved aside as "
+            "state.json.corrupt-<timestamp> instead of being deleted"
         ),
     )
     r.add_argument("--max-steps", type=int, default=50)
@@ -201,35 +203,42 @@ def cmd_run(args) -> int:
             print_plan(o.plan, full_prompt=args.full_prompt)
         return 0
 
-    corrupt = False
-    if paths.state_file.exists():
-        try:
-            existing = load_state(paths.state_file)
-        except StateError as exc:
-            # Unreadable / foreign-protocol state is fatal: a fresh run must
-            # never silently replace it (merge counters etc. would be lost).
-            if not args.force:
-                print(
-                    f"autoforge: error: {exc}\n"
-                    "autoforge: error: refusing to start a new run over an unreadable "
-                    "state file — repair it, or use 'run --force' to move it aside as "
-                    f"{paths.state_file.name}.corrupt-<timestamp> and start over",
-                    file=sys.stderr,
-                )
-                return 2
-            corrupt = True
-        else:
-            if existing.phase not in TERMINAL_PHASES and not args.force:
-                print(
-                    f"autoforge: error: existing run {existing.run_id} "
-                    f"in phase {existing.phase.value} — use 'resume' to continue "
-                    "or 'run --force' to discard it",
-                    file=sys.stderr,
-                )
-                return 2
-    engine.new_run(args.epic, args.issue)
-    assert engine.state is not None
+    # Inspect, decide, quarantine and write the first state under one lock:
+    # a verdict taken before the lock could go stale (another controller may
+    # have repaired, replaced or created state.json in the meantime) and
+    # would then quarantine or overwrite a perfectly valid run.
     with ControllerLock(paths.lock_file):
+        corrupt = False
+        # lexists, not exists: a dangling state.json symlink is still an
+        # entry that a fresh save would silently replace.
+        if os.path.lexists(paths.state_file):
+            try:
+                existing = load_state(paths.state_file)
+            except StateError as exc:
+                # Unreadable / foreign-protocol state is fatal: a fresh run
+                # must never silently replace it (merge counters etc. would
+                # be lost).
+                if not args.force:
+                    print(
+                        f"autoforge: error: {exc}\n"
+                        "autoforge: error: refusing to start a new run over an unreadable "
+                        "state file — repair it, or use 'run --force' to move it aside as "
+                        f"{paths.state_file.name}.corrupt-<timestamp> and start over",
+                        file=sys.stderr,
+                    )
+                    return 2
+                corrupt = True
+            else:
+                if existing.phase not in TERMINAL_PHASES and not args.force:
+                    print(
+                        f"autoforge: error: existing run {existing.run_id} "
+                        f"in phase {existing.phase.value} — use 'resume' to continue "
+                        "or 'run --force' to discard it",
+                        file=sys.stderr,
+                    )
+                    return 2
+        engine.new_run(args.epic, args.issue)
+        assert engine.state is not None
         if corrupt:
             moved = quarantine_state_file(paths.state_file)
             print(f"autoforge: moved unreadable state file aside: {moved}", file=sys.stderr)

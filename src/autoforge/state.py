@@ -6,11 +6,14 @@ Lock file:   ``<state_dir>/controller.lock``
 
 Saves are atomic (temp file in the same directory + fsync + os.replace) so
 a crash mid-write never leaves a half-written JSON file.  A corrupted state
-file raises StateError with a meaningful message and is never silently
-overwritten with a fresh state: ``run`` refuses (exit 2) unless ``--force`` is
-given, and even then the unreadable file is moved aside as
+file (unparseable, wrong protocol, invalid UTF-8, or a dangling symlink)
+raises StateError with a meaningful message and is never silently overwritten
+with a fresh state: ``run`` refuses (exit 2) unless ``--force`` is given, and
+even then the unreadable entry is moved aside as
 ``state.json.corrupt-<timestamp>`` by :func:`quarantine_state_file` rather
-than deleted.
+than deleted.  ``run`` inspects, decides, quarantines and writes the first
+state under the controller lock, so the verdict on an existing entry is
+never taken from a view another controller may have changed since.
 """
 
 from __future__ import annotations
@@ -238,10 +241,18 @@ def save_state(state: AutoForgeState, path: str | Path) -> None:
 def load_state(path: str | Path) -> AutoForgeState:
     """Load state; raises StateError (never silently re-inits) on problems."""
     p = Path(path)
-    if not p.exists():
+    # lexists: a dangling symlink is still a state-directory entry (Path.exists
+    # follows the link and would report it as absent, which lets a fresh run
+    # replace it silently).
+    if not os.path.lexists(p):
         raise StateError(
             f"no state file at {p} — run 'autoforge run --epic ... --issue ...' first; "
             "'resume' never creates a new run silently"
+        )
+    if p.is_symlink() and not p.exists():
+        raise StateError(
+            f"corrupted state file {p}: dangling symbolic link to {os.readlink(p)!r}; "
+            "refusing to overwrite — restore from backup or re-run"
         )
     try:
         raw = p.read_text(encoding="utf-8")
@@ -277,8 +288,10 @@ def quarantine_state_file(path: str | Path) -> Path:
     with :func:`os.link`, which fails atomically with ``EEXIST`` when the
     name is already taken (a plain ``rename`` would silently replace a file
     created between the existence check and the move).  On a collision the
-    next numeric suffix is tried.  Raises StateError when the move fails;
-    the original file is left untouched in that case.
+    next numeric suffix is tried.  The directory entry itself is moved: a
+    symbolic link (dangling or not) is archived as a link and the file it
+    points to is never followed, modified or removed.  Raises StateError
+    when the move fails; the original entry is left untouched in that case.
     """
     src = Path(path)
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -288,7 +301,9 @@ def quarantine_state_file(path: str | Path) -> Path:
         try:
             # Atomic no-replace reservation: link() never clobbers a
             # destination that appeared after we picked the candidate.
-            os.link(src, candidate)
+            # follow_symlinks=False links the entry itself, so a (dangling)
+            # symlink is preserved as such instead of failing on its target.
+            os.link(src, candidate, follow_symlinks=False)
         except FileExistsError:
             candidate = base.with_name(f"{base.name}.{n}")
             continue
