@@ -34,6 +34,19 @@ agent claim against GitHub** before acting on it:
   second rejection enters BLOCKED. Only a verified issue reaches
   ANALYZE_EXECUTE.
 
+Loop bounds (``workflow:`` config, enforced from persisted state so
+``resume`` never resets them; see ``loop_guard.py``):
+- ``max_review_rounds``: a review round at the cap that still has findings
+  is BLOCKED instead of starting a FIX whose result could never be
+  reviewed; review round cap+1 never starts (checked before REVIEW binds a
+  HEAD or invokes an agent, whatever path led there).
+- stagnation: consecutive rounds with findings whose required resolutions
+  are identical (``stagnation_identical_rounds``) or whose finding count
+  never changed (``stagnation_unchanged_count_rounds``) -> BLOCKED.
+- ``max_total_steps``: the run's cumulative ``step_count`` (all issues, all
+  phases, across ``resume``) -> BLOCKED before another step executes.
+Failed invocations never consume a round or a history entry.
+
 Safety rules:
 - dry-run is fully side-effect-free: no agent subprocess, no gh call, no
   state/log writes, no lock.
@@ -70,6 +83,16 @@ from .errors import (
 )
 from .github import GitHubClient, IssueInfo, PRInfo, build_merge_argv
 from .locking import ControllerLock
+from .loop_guard import (
+    RESULT_CLEAN,
+    RESULT_NEEDS_FIX,
+    RESULT_STALE,
+    next_round_cap_reason,
+    review_record,
+    round_cap_reason,
+    stagnation_reason,
+    step_budget_reason,
+)
 from .profiles import profile_for_phase
 from .prompts import TEMPLATE_FILES, load_template, render, render_phase
 from .providers import AgentExecutionResult, AgentRequest, ProviderRegistry
@@ -354,9 +377,19 @@ class ControllerEngine:
         prompt = self.render_prompt_for(s.phase)
         command = self.providers.get(profile).build_command_for(profile, prompt)
         notes: list[str] = []
+        budget = step_budget_reason(s.step_count, self.config.workflow.max_total_steps)
+        if budget:
+            notes.append(f"would enter BLOCKED without executing: {budget}")
         if s.phase == Phase.ANALYZE_EXECUTE:
             notes.append("would first check for an existing open PR (recovery -> REVIEW)")
         if s.phase == Phase.REVIEW:
+            cap = next_round_cap_reason(s.review_round, self.config.workflow.max_review_rounds)
+            if cap:
+                notes.append(f"would enter BLOCKED without invoking the reviewer: {cap}")
+            notes.append(
+                f"review round {s.review_round + 1} of at most "
+                f"{self.config.workflow.max_review_rounds} (workflow.max_review_rounds)"
+            )
             notes.append("REVIEWED_HEAD_SHA is fetched from gh immediately before the review")
         return StepPlan(
             phase=s.phase.value,
@@ -526,6 +559,19 @@ class ControllerEngine:
                 plan=plan,
                 message=f"[dry-run] would execute {previous.value} via profile {plan.profile_name}",
             )
+
+        # Cumulative step budget: measured on persisted state, so `resume`
+        # continues the same budget. Checked before anything executes.
+        budget = step_budget_reason(state.step_count, self.config.workflow.max_total_steps)
+        if budget:
+            return self._block(previous, plan, self._budget_block_reason(budget))
+        if previous == Phase.REVIEW:
+            # Review-round cap, whatever path led here (FIX, stale re-review,
+            # HEAD drift from READY_FOR_MERGE/MERGE, resume): round cap+1 never
+            # starts, no HEAD is bound and no reviewer is invoked.
+            cap = next_round_cap_reason(state.review_round, self.config.workflow.max_review_rounds)
+            if cap:
+                return self._block(previous, plan, self._loop_block_reason(cap))
 
         state.step_count += 1
         if previous == Phase.INITIALIZING:
@@ -754,6 +800,23 @@ class ControllerEngine:
         state.block_reason = reason
         self._save()
         return self._outcome(previous, plan=plan, message=reason)
+
+    def _loop_block_reason(self, reason: str) -> str:
+        """BLOCKED text for a REVIEW/FIX loop bound (cap or stagnation)."""
+        state = self._require_state()
+        return (
+            f"{reason}. The run stays on PR {state.current_pr_url or '(none)'} "
+            f"(issue {state.current_issue_url}); nothing was merged. A human must inspect the "
+            "open findings and the PR (or raise the 'workflow:' bounds in the config)."
+        )
+
+    @staticmethod
+    def _budget_block_reason(reason: str) -> str:
+        return (
+            f"{reason}. This budget is cumulative for the run and is not reset by 'resume'; "
+            "nothing was merged. Raise 'workflow.max_total_steps' in the config or start a "
+            "new run."
+        )
 
     def _inconclusive(
         self,
@@ -1314,6 +1377,7 @@ class ControllerEngine:
         state.current_branch = pr.head_ref or res.branch
         state.review_round = 0
         state.open_findings = []
+        state.review_history = []
         state.last_review_result = ""
         state.reviewed_head_sha = ""
         return Phase.REVIEW, (
@@ -1400,6 +1464,7 @@ class ControllerEngine:
             state.current_head_sha = latest.head_sha
             state.last_review_result = "stale"
             state.open_findings = []
+            self._record_review(res.round, expected_head, RESULT_STALE, findings)
             return Phase.REVIEW, (
                 f"review round {res.round} completed for {expected_head[:12]} but PR HEAD moved "
                 f"to {latest.head_sha[:12]} during the review; re-reviewing the latest HEAD"
@@ -1407,14 +1472,43 @@ class ControllerEngine:
         if res.needs_fix_round:
             state.last_review_result = "needs_fix"
             state.open_findings = findings
+            self._record_review(res.round, expected_head, RESULT_NEEDS_FIX, findings)
+            stop = self._review_loop_stop_reason(res.round)
+            if stop:
+                # Findings stay persisted for the human; no FIX is started.
+                return Phase.BLOCKED, self._loop_block_reason(
+                    f"review round {res.round}: {len(findings)} finding(s), but {stop}"
+                )
             return Phase.FIX, (
                 f"review round {res.round}: {len(findings)} finding(s); REVIEW -> FIX"
             )
         state.last_review_result = "clean"
         state.open_findings = []
+        self._record_review(res.round, expected_head, RESULT_CLEAN, findings)
         return Phase.READY_FOR_MERGE, (
             f"review round {res.round} clean for HEAD {expected_head[:12]}; "
             "REVIEW -> READY_FOR_MERGE"
+        )
+
+    def _record_review(self, round: int, head: str, result: str, findings: list[dict]) -> None:
+        """Append the completed round to ``review_history`` (bounded per PR)."""
+        state = self._require_state()
+        # A completed round replaces any stale entry with the same number
+        # (never expected: rounds are strictly increasing per PR).
+        state.review_history = [r for r in state.review_history if r.get("round") != round]
+        state.review_history.append(review_record(round, head, result, findings))
+
+    def _review_loop_stop_reason(self, completed_round: int) -> str:
+        """Cap / stagnation verdict for a round that ended with findings."""
+        wf = self.config.workflow
+        state = self._require_state()
+        reason = round_cap_reason(completed_round, wf.max_review_rounds, has_findings=True)
+        if reason:
+            return reason
+        return stagnation_reason(
+            state.review_history,
+            wf.stagnation_identical_rounds,
+            wf.stagnation_unchanged_count_rounds,
         )
 
     def _apply_fix(self, res: FixResult) -> tuple[Phase, str]:

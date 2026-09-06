@@ -64,6 +64,11 @@ class AutoForgeState:
     open_findings: list[dict] = field(default_factory=list)
     # Resolutions reported by the last FIX round (verified by the controller).
     last_fix_resolutions: list[dict] = field(default_factory=list)
+    # One entry per completed review round of the current PR (see
+    # loop_guard.review_record): round, reviewed_head_sha, result
+    # (needs_fix | clean | stale), finding_count, fingerprint. Drives the
+    # review-round cap and stagnation detection; cleared per PR.
+    review_history: list[dict] = field(default_factory=list)
 
     merged_since_epic_update: int = 0
     counted_merged_prs: list[str] = field(default_factory=list)
@@ -123,6 +128,12 @@ class AutoForgeState:
             raise StateError("state field 'last_fix_resolutions' must be a list")
         if not isinstance(state.next_issue_rejections, list):
             raise StateError("state field 'next_issue_rejections' must be a list")
+        if not isinstance(state.review_history, list):
+            raise StateError("state field 'review_history' must be a list")
+        if not isinstance(state.step_count, int) or isinstance(state.step_count, bool):
+            raise StateError("state field 'step_count' must be an integer")
+        if not isinstance(state.review_round, int) or isinstance(state.review_round, bool):
+            raise StateError("state field 'review_round' must be an integer")
         if state.last_review_needs_fix is not None and not isinstance(
             state.last_review_needs_fix, bool
         ):
@@ -155,7 +166,11 @@ class AutoForgeState:
 
     # -- per-issue bookkeeping ------------------------------------------
     def reset_for_new_issue(self, issue_url: str) -> None:
-        """Clear all PR/review bookkeeping when moving to another issue."""
+        """Clear all PR/review bookkeeping when moving to another issue.
+
+        ``step_count`` is deliberately kept: it is the run's cumulative step
+        budget and must survive issue switches and ``resume`` alike.
+        """
         self.current_issue_url = issue_url
         self.current_pr_url = ""
         self.current_branch = ""
@@ -167,6 +182,7 @@ class AutoForgeState:
         self.last_review_comment_url = ""
         self.open_findings = []
         self.last_fix_resolutions = []
+        self.review_history = []
         self.next_issue_rejections = []
         self.attempt = 0
 

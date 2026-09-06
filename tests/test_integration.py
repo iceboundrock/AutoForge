@@ -219,3 +219,86 @@ def test_gate_open_loop_merges_via_controller_then_update_epic_to_done(tmp_state
     s = load_state(eng.paths.state_file)
     assert s.counted_merged_prs == [PR] and s.merged_since_epic_update == 0  # reset by UPDATE_EPIC
     assert s.phase == Phase.DONE
+
+
+def test_runaway_review_fix_loop_is_bounded(tmp_state_dir):
+    """Issue #9 evidence: reviewer always returns one finding, fixer always pushes.
+
+    Before the loop bounds, ``run(max_steps=50)`` executed 50 steps (25 review
+    rounds) and a second ``run`` continued. Now the run ends BLOCKED with an
+    explicit reason, the findings stay persisted, and nothing is merged.
+    """
+    gh = FakeGitHub()
+    phases_seen = []
+    rounds = {"n": 0}
+
+    def agent(req):
+        phases_seen.append(req.phase)
+        if req.phase == "ANALYZE_EXECUTE":
+            gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2])
+            return block(
+                {
+                    "phase": "ANALYZE_EXECUTE",
+                    "status": "success",
+                    "issue_url": ISSUE,
+                    "pr_url": PR,
+                    "head_sha": SHA_A,
+                    "branch": BRANCH,
+                }
+            )
+        if req.phase == "REVIEW":
+            rounds["n"] += 1
+            rnd = rounds["n"]
+            sha = gh.prs[PR].head_sha
+            gh.add_comment(PR, 100 + rnd, review_comment_body(rnd, sha, True, [f"R{rnd}-F1"]))
+            return block(
+                {
+                    "phase": "REVIEW",
+                    "status": "success",
+                    "round": rnd,
+                    "reviewed_head_sha": sha,
+                    "review_comment_url": comment_url(PR, 100 + rnd),
+                    "needs_fix_round": True,
+                    "findings": [
+                        {
+                            "id": f"R{rnd}-F1",
+                            "classification": "nit",
+                            "title": "prefer the other refactor",
+                            "location": "src/x.py:1",
+                            "required_resolution": "Undo the refactor and apply the other one",
+                        }
+                    ],
+                }
+            )
+        if req.phase == "FIX":
+            prev = gh.prs[PR].head_sha
+            new = f"{rounds['n']:040x}"
+            gh.set_head(new)
+            return block(
+                {
+                    "phase": "FIX",
+                    "status": "success",
+                    "previous_head_sha": prev,
+                    "new_head_sha": new,
+                    "resolutions": [
+                        {"finding_id": f"R{rounds['n']}-F1", "resolution": "fixed"},
+                    ],
+                }
+            )
+        raise AssertionError(f"unexpected call {req.phase}")
+
+    eng = make_engine(tmp_state_dir, agent, github=gh)
+    eng._save()
+    outcomes = eng.run(max_steps=50)
+    assert outcomes[-1].next_phase == "BLOCKED"
+    assert len(outcomes) < 50
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.BLOCKED
+    assert s.review_round == 2  # identical resolutions in rounds 1 and 2 -> stagnant
+    assert "identical resolutions" in s.block_reason and "nothing was merged" in s.block_reason
+    assert s.open_findings[0]["id"] == "R2-F1"
+    assert phases_seen == ["ANALYZE_EXECUTE", "REVIEW", "FIX", "REVIEW"]
+    # a second run does not continue the loop: BLOCKED is terminal
+    assert eng.run(max_steps=50) == []
+    assert load_state(eng.paths.state_file).step_count == s.step_count
+    assert gh.merges == [] and gh.prs[PR].state == "OPEN"

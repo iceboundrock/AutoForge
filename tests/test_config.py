@@ -238,3 +238,56 @@ def test_real_scalars_still_accepted(tmp_path):
     assert cfg.execution.max_correction_attempts == 0
     assert cfg.github.timeout_seconds == 7
     assert cfg.profile("fix").timeout_seconds == 9
+
+
+def test_workflow_defaults_and_parsing(tmp_path):
+    cfg = default_config()
+    assert cfg.workflow.max_review_rounds == 6
+    assert cfg.workflow.stagnation_identical_rounds == 2
+    assert cfg.workflow.stagnation_unchanged_count_rounds == 3
+    assert cfg.workflow.max_total_steps == 300
+    p = tmp_path / "cfg.json"
+    p.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "workflow": {
+                    "max_review_rounds": 3,
+                    "stagnation_identical_rounds": 0,
+                    "stagnation_unchanged_count_rounds": 0,
+                    "max_total_steps": 12,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    wf = load_config_file(p).workflow
+    assert (wf.max_review_rounds, wf.max_total_steps) == (3, 12)
+    assert (wf.stagnation_identical_rounds, wf.stagnation_unchanged_count_rounds) == (0, 0)
+    y = tmp_path / "cfg.yaml"
+    y.write_text("version: 1\nworkflow:\n  max_review_rounds: 4\n", encoding="utf-8")
+    assert load_config_file(y).workflow.max_review_rounds == 4
+
+
+@pytest.mark.parametrize(
+    "body,key",
+    [
+        ('{"version": 1, "workflow": {"max_review_rounds": 0}}', "max_review_rounds.*>= 1"),
+        ('{"version": 1, "workflow": {"max_total_steps": 0}}', "max_total_steps.*>= 1"),
+        (
+            '{"version": 1, "workflow": {"stagnation_identical_rounds": -1}}',
+            "stagnation_identical_rounds.*>= 0",
+        ),
+        (
+            '{"version": 1, "workflow": {"stagnation_unchanged_count_rounds": "3"}}',
+            "stagnation_unchanged_count_rounds.*must be an integer",
+        ),
+        ('{"version": 1, "workflow": {"max_review_rounds": true}}', "must be an integer"),
+        ('{"version": 1, "workflow": 6}', "'workflow' must be a mapping"),
+    ],
+)
+def test_workflow_section_rejects_invalid_values(tmp_path, body, key):
+    p = tmp_path / "cfg.json"
+    p.write_text(body, encoding="utf-8")
+    with pytest.raises(ConfigurationError, match=key):
+        load_config_file(p)

@@ -444,3 +444,90 @@ def test_doctor_with_fake_runner(tmp_path, capsys, monkeypatch):
     assert cli.main(["--state-dir", str(tmp_path / ".autoforge"), "doctor", "--json"]) == 1
     data = json.loads(capsys.readouterr().out)
     assert any(c["name"] == "GitHub remote" and c["ok"] for c in data["checks"])
+
+
+def test_resume_never_resets_the_step_budget(tmp_path, capsys, monkeypatch, fakes):
+    """workflow.max_total_steps is enforced on the persisted step_count across resume."""
+    monkeypatch.chdir(tmp_path)
+    gh = fakes["gh"]
+    rounds = {"n": 0}
+
+    def agent(req):
+        if req.phase == "ANALYZE_EXECUTE":
+            gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2])
+            return block(
+                {
+                    "phase": "ANALYZE_EXECUTE",
+                    "status": "success",
+                    "issue_url": ISSUE,
+                    "pr_url": PR,
+                    "head_sha": SHA_A,
+                    "branch": BRANCH,
+                }
+            )
+        if req.phase == "REVIEW":
+            rounds["n"] += 1
+            rnd = rounds["n"]
+            sha = gh.prs[PR].head_sha
+            gh.add_comment(PR, 100 + rnd, review_comment_body(rnd, sha, True, [f"R{rnd}-F1"]))
+            return block(
+                {
+                    "phase": "REVIEW",
+                    "status": "success",
+                    "round": rnd,
+                    "reviewed_head_sha": sha,
+                    "review_comment_url": comment_url(PR, 100 + rnd),
+                    "needs_fix_round": True,
+                    "findings": [
+                        {
+                            "id": f"R{rnd}-F1",
+                            "classification": "nit",
+                            "title": "t",
+                            "location": "src/x.py:1",
+                            "required_resolution": f"different text {rnd}",
+                        }
+                    ],
+                }
+            )
+        prev = gh.prs[PR].head_sha
+        new = f"{rounds['n']:040x}"
+        gh.set_head(new)
+        return block(
+            {
+                "phase": "FIX",
+                "status": "success",
+                "previous_head_sha": prev,
+                "new_head_sha": new,
+                "resolutions": [{"finding_id": f"R{rounds['n']}-F1", "resolution": "fixed"}],
+            }
+        )
+
+    fakes["handler"] = agent
+    cfg = tmp_path / "autoforge.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "workflow": {
+                    "max_total_steps": 4,
+                    "stagnation_identical_rounds": 0,
+                    "stagnation_unchanged_count_rounds": 0,
+                }
+            }
+        )
+    )
+    sd = str(tmp_path / ".autoforge")
+    base = ["--config", str(cfg), "--state-dir", sd]
+    rc = cli.main([*base, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "3"])
+    assert rc == 0
+    capsys.readouterr()
+    assert cli.main([*base, "status", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["step_count"] == 3
+    # resume with a fresh --max-steps 50 gets exactly the one remaining step, then BLOCKED
+    rc = cli.main([*base, "resume", "--max-steps", "50"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "is BLOCKED" in out and "workflow.max_total_steps=4" in out
+    assert cli.main([*base, "status", "--json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["phase"] == "BLOCKED" and data["step_count"] == 4
+    assert len(fakes["provider"].calls) == 3  # ANALYZE_EXECUTE, REVIEW, FIX

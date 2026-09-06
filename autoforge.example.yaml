@@ -48,6 +48,26 @@ merge:
   # times per phase; then the run is BLOCKED instead of retrying forever.
   max_verification_attempts: 5
 
+workflow:
+  # Loop bounds enforced by the controller (never by a prompt). Each one ends
+  # the run in BLOCKED with the reason in `block_reason` / `status`; the open
+  # findings and the PR are kept for a human, nothing is merged.
+  # Hard cap on completed review rounds per PR. A round at the cap that still
+  # has findings blocks instead of starting a FIX whose result could never be
+  # reviewed; a clean round at the cap proceeds to READY_FOR_MERGE.
+  max_review_rounds: 6
+  # Stagnation: this many consecutive rounds with findings whose
+  # `required_resolution` texts are identical (ids/locations ignored,
+  # whitespace/case-normalised) -> BLOCKED. 0 disables the rule.
+  stagnation_identical_rounds: 2
+  # Stagnation: this many consecutive rounds with findings whose finding
+  # count did not change -> BLOCKED. 0 disables the rule.
+  stagnation_unchanged_count_rounds: 3
+  # Cumulative step budget of the whole run (all phases, all issues). It is
+  # measured on the persisted `step_count`, so `resume` continues the same
+  # budget; `--max-steps` only bounds a single invocation.
+  max_total_steps: 300
+
 profiles:
   analyze_execute:
     provider: claude
