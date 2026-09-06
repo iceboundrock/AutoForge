@@ -16,6 +16,7 @@ from autoforge.errors import (
 )
 from autoforge.executor import ExecutionResult
 from autoforge.github import CheckInfo, GitHubClient, MergeQueueStatus
+from autoforge.loop_guard import RESULT_NEEDS_FIX, review_record
 from autoforge.providers import AgentExecutionResult, ScriptedProvider
 from autoforge.state import load_state
 from autoforge.transitions import Phase
@@ -1862,3 +1863,266 @@ def test_update_epic_conclusive_github_failure_blocks_without_reinvoking_agent(
     assert s.merged_since_epic_update == 1  # the EPIC batch is not closed
     with pytest.raises(StateTransitionError):
         eng.step()  # BLOCKED is terminal for `step`; nothing else runs
+
+
+# -- loop bounds: review-round cap, stagnation, step budget (#9) ------------------------------
+def _sha(n: int) -> str:
+    return f"{n:040x}"
+
+
+def _loop_agent(gh: FakeGitHub, findings_for_round, seen: list[str] | None = None):
+    """Scripted ANALYZE_EXECUTE / REVIEW / FIX loop over FakeGitHub.
+
+    ``findings_for_round(n)`` returns the findings review round ``n`` reports
+    (``[]`` == clean). Every FIX pushes a new distinct HEAD and resolves every
+    open finding as ``fixed`` — the runaway loop from the issue's evidence.
+    """
+    rounds = {"n": 0}
+    seen = seen if seen is not None else []
+
+    def agent(req):
+        seen.append(req.phase)
+        if req.phase == "ANALYZE_EXECUTE":
+            gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2])
+            return block(ANALYZE_OK)
+        if req.phase == "REVIEW":
+            rounds["n"] += 1
+            rnd = rounds["n"]
+            sha = gh.prs[PR].head_sha
+            findings = findings_for_round(rnd)
+            ids = [f["id"] for f in findings]
+            gh.add_comment(PR, 100 + rnd, review_comment_body(rnd, sha, bool(findings), ids))
+            return block(review_payload(rnd, sha, findings, cid=100 + rnd))
+        if req.phase == "FIX":
+            prev = gh.prs[PR].head_sha
+            ids = re.findall(r"\*\*(R\d+-F\d+)\*\*", req.prompt)
+            new = _sha(rounds["n"])
+            gh.set_head(new)
+            return block(
+                fix_payload(prev, new, [{"finding_id": i, "resolution": "fixed"} for i in ids])
+            )
+        raise AssertionError(f"unexpected call {req.phase}")
+
+    return agent
+
+
+def _one_finding_per_round(rnd: int, text: str | None = None) -> list[dict]:
+    f = _finding(rnd)
+    f["required_resolution"] = text if text is not None else f"resolution for round {rnd}"
+    return [f]
+
+
+def _no_stagnation(cfg) -> None:
+    cfg.workflow.stagnation_identical_rounds = 0
+    cfg.workflow.stagnation_unchanged_count_rounds = 0
+
+
+def test_review_round_cap_blocks_with_findings_and_never_starts_the_last_fix(tmp_state_dir):
+    """Round N == cap still has findings -> BLOCKED; no FIX whose result could never be reviewed."""
+    gh = FakeGitHub()
+    seen: list[str] = []
+    eng = make_engine(tmp_state_dir, _loop_agent(gh, _one_finding_per_round, seen), github=gh)
+    eng.config.workflow.max_review_rounds = 3
+    _no_stagnation(eng.config)
+    eng._save()
+    outcomes = eng.run(max_steps=50)
+    phases = [o.next_phase for o in outcomes]
+    assert phases == ["ANALYZE_EXECUTE", "REVIEW", "FIX", "REVIEW", "FIX", "REVIEW", "BLOCKED"]
+    assert seen == ["ANALYZE_EXECUTE", "REVIEW", "FIX", "REVIEW", "FIX", "REVIEW"]
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.BLOCKED and s.review_round == 3
+    assert "workflow.max_review_rounds=3" in s.block_reason and "3 finding" not in s.block_reason
+    assert "round 3: 1 finding(s)" in s.block_reason
+    assert s.open_findings[0]["id"] == "R3-F1"  # kept for the human
+    assert s.last_review_result == "needs_fix" and s.reviewed_head_sha == _sha(2)
+    assert [r["result"] for r in s.review_history] == ["needs_fix"] * 3
+    assert gh.prs[PR].state == "OPEN" and gh.merges == []
+
+
+def test_review_round_cap_does_not_block_a_clean_last_round(tmp_state_dir):
+    gh = FakeGitHub()
+    eng = make_engine(
+        tmp_state_dir,
+        _loop_agent(gh, lambda rnd: _one_finding_per_round(rnd) if rnd < 2 else []),
+        github=gh,
+    )
+    eng.config.workflow.max_review_rounds = 2
+    eng._save()
+    outcomes = eng.run(max_steps=50)
+    assert [o.next_phase for o in outcomes] == [
+        "ANALYZE_EXECUTE",
+        "REVIEW",
+        "FIX",
+        "REVIEW",
+        "READY_FOR_MERGE",
+    ]
+    s = load_state(eng.paths.state_file)
+    assert s.review_round == 2 and s.last_review_result == "clean"
+    assert [r["result"] for r in s.review_history] == ["needs_fix", "clean"]
+
+
+def test_review_entry_at_cap_blocks_without_binding_head_or_invoking_reviewer(tmp_state_dir):
+    """Whatever led to REVIEW with review_round == cap (stale re-review, HEAD drift, resume)."""
+    gh = FakeGitHub()
+    eng = _in_review(tmp_state_dir, gh, [block(review_payload(3, SHA_A, []))], round_done=2)
+    eng.config.workflow.max_review_rounds = 2
+    eng.state.last_review_result = "stale"
+    eng._save()
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert "review round 3 is not started" in out.message
+    assert eng.provider.calls == []
+    assert ("get_pr", PR) not in gh.calls  # no HEAD binding either
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.BLOCKED and s.review_round == 2 and s.step_count == 0
+    assert "workflow.max_review_rounds=2" in s.block_reason
+
+
+def test_review_stagnation_identical_resolutions_blocks(tmp_state_dir):
+    """Two consecutive rounds requesting the same resolution (ids differ) -> BLOCKED."""
+    gh = FakeGitHub()
+    seen: list[str] = []
+    agent = _loop_agent(gh, lambda rnd: _one_finding_per_round(rnd, "Add a regression test"), seen)
+    eng = make_engine(tmp_state_dir, agent, github=gh)
+    eng._save()  # defaults: identical=2, unchanged_count=3, cap=6
+    outcomes = eng.run(max_steps=50)
+    assert [o.next_phase for o in outcomes] == [
+        "ANALYZE_EXECUTE",
+        "REVIEW",
+        "FIX",
+        "REVIEW",
+        "BLOCKED",
+    ]
+    assert seen == ["ANALYZE_EXECUTE", "REVIEW", "FIX", "REVIEW"]
+    s = load_state(eng.paths.state_file)
+    assert s.review_round == 2 and "identical resolutions" in s.block_reason
+    assert "stagnation_identical_rounds=2" in s.block_reason
+    assert s.review_history[0]["fingerprint"] == s.review_history[1]["fingerprint"]
+    assert s.open_findings[0]["id"] == "R2-F1"
+
+
+def test_review_stagnation_unchanged_count_blocks(tmp_state_dir):
+    """The issue's ping-pong: every round has one (different) finding -> BLOCKED after 3."""
+    gh = FakeGitHub()
+    eng = make_engine(tmp_state_dir, _loop_agent(gh, _one_finding_per_round), github=gh)
+    eng._save()
+    outcomes = eng.run(max_steps=50)
+    assert [o.next_phase for o in outcomes][-3:] == ["FIX", "REVIEW", "BLOCKED"]
+    s = load_state(eng.paths.state_file)
+    assert s.review_round == 3 and "finding count has not changed" in s.block_reason
+    assert "rounds 1, 2, 3" in s.block_reason
+    assert len({r["fingerprint"] for r in s.review_history}) == 3  # texts differed
+
+
+def test_review_progress_is_not_stagnation(tmp_state_dir):
+    """Decreasing finding counts with different texts run to the clean round."""
+    gh = FakeGitHub()
+    per_round = {1: 3, 2: 2, 3: 1, 4: 0}
+
+    def findings(rnd):
+        return [
+            dict(_finding(rnd, n), required_resolution=f"r{rnd} fix {n}")
+            for n in range(1, per_round[rnd] + 1)
+        ]
+
+    eng = make_engine(tmp_state_dir, _loop_agent(gh, findings), github=gh)
+    eng._save()
+    outcomes = eng.run(max_steps=50)
+    assert outcomes[-1].next_phase == "READY_FOR_MERGE"
+    s = load_state(eng.paths.state_file)
+    assert s.review_round == 4
+    assert [r["finding_count"] for r in s.review_history] == [3, 2, 1, 0]
+
+
+def test_review_stale_round_is_recorded_and_breaks_the_stagnation_streak(tmp_state_dir):
+    gh = FakeGitHub()
+    gh.add_comment(PR, 100, review_comment_body(2, SHA_A, True, ["R2-F1"]))
+    same = _one_finding_per_round(2, "same text")
+
+    def on_call(req):
+        gh.set_head(SHA_B)  # someone pushed while the reviewer was working
+        return block(review_payload(2, SHA_A, same))
+
+    eng = _in_review(tmp_state_dir, gh, on_call, round_done=1)
+    eng.state.review_history = [
+        review_record(1, SHA_A, RESULT_NEEDS_FIX, _one_finding_per_round(1, "same text"))
+    ]
+    out = eng.step()
+    assert out.next_phase == "REVIEW" and "moved" in out.message  # not BLOCKED
+    s = load_state(eng.paths.state_file)
+    assert [r["result"] for r in s.review_history] == ["needs_fix", "stale"]
+    assert s.review_history[1]["reviewed_head_sha"] == SHA_A and s.open_findings == []
+
+
+def test_failed_review_invocation_consumes_neither_round_nor_history(tmp_state_dir):
+    gh = FakeGitHub()
+    eng = _in_review(tmp_state_dir, gh, [block(review_payload(1, SHA_A, [_finding(1)]))])
+    with pytest.raises(VerificationError, match="not found on PR"):  # no review comment
+        eng.step()
+    s = load_state(eng.paths.state_file)
+    assert s.review_round == 0 and s.review_history == [] and s.phase == Phase.REVIEW
+
+
+def test_new_pr_resets_review_history(tmp_state_dir, fake_github):
+    def on_call(req):
+        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH)
+        return block(ANALYZE_OK)
+
+    eng = make_engine(tmp_state_dir, on_call, github=fake_github)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    eng.state.review_history = [review_record(1, SHA_B, RESULT_NEEDS_FIX, [_finding(1)])]
+    eng.state.review_round = 1
+    assert eng.step().next_phase == "REVIEW"
+    assert eng.state.review_history == [] and eng.state.review_round == 0
+
+
+def test_step_budget_is_cumulative_and_survives_resume(tmp_state_dir):
+    """`resume` continues the persisted step_count; it never restarts the budget."""
+    gh = FakeGitHub()
+    seen: list[str] = []
+    agent = _loop_agent(gh, _one_finding_per_round, seen)
+    eng = make_engine(tmp_state_dir, agent, github=gh)
+    eng.config.workflow.max_total_steps = 4
+    _no_stagnation(eng.config)
+    eng._save()
+    first = eng.run(max_steps=2)
+    assert [o.next_phase for o in first] == ["ANALYZE_EXECUTE", "REVIEW"]
+    assert load_state(eng.paths.state_file).step_count == 2
+
+    # a fresh engine, as `resume` builds it: state (and the budget) come from disk
+    resumed = make_engine(tmp_state_dir, agent, github=gh, cfg=eng.config)
+    resumed.load()
+    second = resumed.run(max_steps=50)
+    assert [o.next_phase for o in second] == ["FIX", "REVIEW", "BLOCKED"]
+    s = load_state(resumed.paths.state_file)
+    assert s.phase == Phase.BLOCKED and s.step_count == 4  # the blocked step did not count
+    assert "workflow.max_total_steps=4" in s.block_reason
+    assert "not reset by 'resume'" in s.block_reason
+    assert seen == ["ANALYZE_EXECUTE", "REVIEW", "FIX"]  # blocked before invoking round 2
+    # the run is terminal: another resume executes nothing more
+    with pytest.raises(StateTransitionError):
+        resumed.step()
+
+
+def test_step_budget_applies_to_deterministic_steps_too(tmp_state_dir, fake_github):
+    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    eng.config.workflow.max_total_steps = 1
+    eng.state.step_count = 1
+    out = eng.step()  # INITIALIZING would be step 2
+    assert out.next_phase == "BLOCKED" and fake_github.calls == []
+    assert eng.state.step_count == 1
+
+
+def test_dry_run_plan_reports_loop_bounds(tmp_state_dir, fake_github):
+    gh = fake_github
+    eng = _in_review(tmp_state_dir, gh, [], round_done=2)
+    eng.config.workflow.max_review_rounds = 2
+    eng.config.workflow.max_total_steps = 10
+    eng.state.step_count = 10
+    plan = eng.step(dry_run=True).plan
+    assert plan is not None
+    notes = "\n".join(plan.notes)
+    assert "would enter BLOCKED without invoking the reviewer" in notes
+    assert "would enter BLOCKED without executing" in notes and "max_total_steps=10" in notes
+    assert "review round 3 of at most 2" in notes
+    assert eng.state.phase == Phase.REVIEW and not eng.paths.state_file.exists()

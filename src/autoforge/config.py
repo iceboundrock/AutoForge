@@ -107,6 +107,33 @@ class MergeConfig:
 
 
 @dataclass
+class WorkflowConfig:
+    """Controller-owned bounds on the workflow loop (see ``loop_guard.py``).
+
+    Every bound is enforced from persisted state, so ``resume`` continues
+    the same budget instead of starting a fresh one. Reaching a bound enters
+    BLOCKED with an explicit reason; nothing is merged, pushed or retried.
+    """
+
+    # Review rounds a single PR may consume. Round N with findings, where
+    # N == max_review_rounds, is BLOCKED instead of starting another FIX
+    # (a FIX whose result could never be reviewed is never invoked); a
+    # clean round N still reaches READY_FOR_MERGE. Round N+1 never starts.
+    max_review_rounds: int = 6
+    # Consecutive review rounds with findings whose required resolutions are
+    # identical (normalised text) before the loop is declared stagnant.
+    # 0 disables this rule (the hard cap above still applies).
+    stagnation_identical_rounds: int = 2
+    # Consecutive review rounds with findings whose finding *count* never
+    # changed before the loop is declared stagnant. 0 disables this rule.
+    stagnation_unchanged_count_rounds: int = 3
+    # Cumulative executed steps for the whole run (all issues, all phases,
+    # across `resume`). Persisted as ``step_count``; the CLI's ``--max-steps``
+    # is only a per-invocation slice of this budget.
+    max_total_steps: int = 300
+
+
+@dataclass
 class AutoForgeConfig:
     version: int = CONFIG_VERSION
     state_dir: str = ".autoforge"
@@ -115,6 +142,7 @@ class AutoForgeConfig:
     safety: SafetyConfig = field(default_factory=SafetyConfig)
     github: GitHubConfig = field(default_factory=GitHubConfig)
     merge: MergeConfig = field(default_factory=MergeConfig)
+    workflow: WorkflowConfig = field(default_factory=WorkflowConfig)
     profiles: dict[str, ProfileConfig] = field(default_factory=dict)
 
     def profile(self, name: str) -> ProfileConfig:
@@ -320,6 +348,22 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
                 f"{source}: 'merge.max_verification_attempts' must be >= 1, got {attempts}"
             )
         base.merge.max_verification_attempts = attempts
+    workflow = data.get("workflow", {}) or {}
+    if not isinstance(workflow, dict):
+        raise ConfigurationError(f"{source}: 'workflow' must be a mapping")
+    for key, minimum in (
+        ("max_review_rounds", 1),
+        ("stagnation_identical_rounds", 0),
+        ("stagnation_unchanged_count_rounds", 0),
+        ("max_total_steps", 1),
+    ):
+        if key in workflow:
+            value = _as_int(workflow[key], source, f"workflow.{key}")
+            if value < minimum:
+                raise ConfigurationError(
+                    f"{source}: 'workflow.{key}' must be >= {minimum}, got {value}"
+                )
+            setattr(base.workflow, key, value)
     profiles = data.get("profiles", {}) or {}
     if not isinstance(profiles, dict):
         raise ConfigurationError(f"{source}: 'profiles' must be a mapping")

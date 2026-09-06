@@ -124,3 +124,36 @@ def test_record_merge_idempotent():
     s.record_epic_update()
     assert s.merged_since_epic_update == 0
     assert len(s.counted_merged_prs) == 2
+
+
+def test_review_history_roundtrip_and_validation(tmp_path):
+    hist = [
+        {
+            "round": 1,
+            "reviewed_head_sha": "a" * 40,
+            "result": "needs_fix",
+            "finding_count": 1,
+            "fingerprint": "abc",
+        }
+    ]
+    s = make_state(review_history=hist, step_count=7)
+    back = AutoForgeState.from_dict(json.loads(json.dumps(s.to_dict())))
+    assert back.review_history == hist and back.step_count == 7
+    p = tmp_path / "state.json"
+    d = make_state().to_dict()
+    del d["review_history"]  # state written before this field existed
+    p.write_text(json.dumps(d), encoding="utf-8")
+    assert load_state(p).review_history == []
+    for field, bad in (("review_history", "oops"), ("step_count", "3"), ("review_round", True)):
+        d = make_state().to_dict()
+        d[field] = bad
+        p.write_text(json.dumps(d), encoding="utf-8")
+        with pytest.raises(StateError, match=field):
+            load_state(p)
+
+
+def test_reset_for_new_issue_clears_review_history_but_keeps_step_budget():
+    s = make_state(review_history=[{"round": 1}], review_round=1, step_count=9)
+    s.reset_for_new_issue("https://github.com/owner/repo/issues/3")
+    assert s.review_history == [] and s.review_round == 0
+    assert s.step_count == 9  # cumulative budget survives the switch

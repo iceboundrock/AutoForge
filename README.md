@@ -105,6 +105,18 @@ Key design points:
   repo's `AGENTS.md`/`CLAUDE.md` outrank them.
 - **Atomic persistence**: temp file + fsync + `os.replace`; corrupted state
   fails loudly and is never silently overwritten.
+- **The REVIEW/FIX loop is bounded by the controller.** `workflow.max_review_rounds`
+  (default 6) caps completed review rounds per PR; a round at the cap that
+  still has findings goes to `BLOCKED` instead of starting a FIX that could
+  never be reviewed. Stagnation detection blocks earlier: consecutive rounds
+  whose `required_resolution` texts are identical
+  (`workflow.stagnation_identical_rounds`, default 2) or whose finding count
+  does not change (`workflow.stagnation_unchanged_count_rounds`, default 3).
+  `workflow.max_total_steps` (default 300) is a cumulative budget for the whole
+  run measured on the persisted `step_count`, so `resume` continues it rather
+  than resetting it (`--max-steps` bounds one invocation only). Failed agent
+  invocations consume neither a review round nor the history. Every bound
+  ends in `BLOCKED` with the reason; findings and the PR stay for a human.
 
 ## Workflow details
 
@@ -112,7 +124,7 @@ Key design points:
 |---|---|---|
 | `INITIALIZING` | controller | cwd repo == issue repo, issue is in this repo, is not the EPIC, exists and is OPEN |
 | `ANALYZE_EXECUTE` | Claude Code (`fable`, effort high) | existing open PR for the issue is recovered without re-running the agent; otherwise PR exists in this repo, is OPEN, HEAD SHA and branch match the claim |
-| `REVIEW` | OpenCode (round 1 `openai/gpt-5.6-luna` high, rounds 2–5 `openai/gpt-5.6-terra` high, 6+ `openai/gpt-5.6-sol` medium) | round number, reviewed SHA == bound HEAD, exactly one review comment on this PR with the `# AI Code Review — Round N` heading and the `ai-review-result` marker matching round/SHA/flag, findings invariant |
+| `REVIEW` | OpenCode (round 1 `openai/gpt-5.6-luna` high, rounds 2–5 `openai/gpt-5.6-terra` high, 6+ `openai/gpt-5.6-sol` medium) | round number, reviewed SHA == bound HEAD, exactly one review comment on this PR with the `# AI Code Review — Round N` heading and the `ai-review-result` marker matching round/SHA/flag, findings invariant; then the loop bounds: round == `workflow.max_review_rounds` with findings, or stagnation across the recorded `review_history` -> `BLOCKED` (no further FIX). Entering `REVIEW` past the cap (stale re-review, HEAD drift, resume) is refused before the reviewer runs |
 | `FIX` | Claude Code (`fable`, effort high) | `previous_head_sha` == current HEAD, every open finding ID resolved (`fixed` / `follow_up_created` / `no_change_with_rationale`), follow-up issues exist in this repo and are OPEN, actual PR HEAD == `new_head_sha`, a `fixed` resolution moved HEAD |
 | `READY_FOR_MERGE` | nobody | holding state; `step`/`resume` refuse to continue unless the merge gate is open (`resume` only re-prints the banner). With the gate open (`step --allow-merge` / `resume --allow-merge`) it runs the full pre-merge verification below against GitHub *before* entering `MERGE`: closed / conflicting / failing / draft / queued PRs go to `BLOCKED` without ever reaching `MERGE`, HEAD drift -> `REVIEW`, an already-merged PR -> `MERGE` to reconcile; inconclusive data (checks running, mergeability unknown, GitHub unreachable / transient read failure) keeps the phase for `resume --allow-merge`, at most `merge.max_verification_attempts` times, then `BLOCKED`; a read that fails conclusively (bad credentials, permissions, unresolvable PR) -> `BLOCKED` at once |
 | `MERGE` (gated) | controller, never an agent | last review clean and PR HEAD == reviewed HEAD; GitHub says PR is OPEN, not draft, every check succeeded, `mergeable=MERGEABLE`, `mergeStateStatus` `CLEAN`/`HAS_HOOKS`, no auto-merge armed, base branch has no merge queue; then `gh pr merge --<method> --match-head-commit <reviewed HEAD>`; counted only once GitHub reports `MERGED` at that HEAD. Conclusive negatives and conclusive read failures (bad credentials, permissions) -> `BLOCKED`; inconclusive data (checks running, mergeability unknown, transient read failure, post-merge re-read failed) stays in `MERGE` for `resume --allow-merge`, at most `merge.max_verification_attempts` times, then `BLOCKED`; HEAD drift -> `REVIEW` |
@@ -171,6 +183,8 @@ uv run autoforge step              # exactly one phase step
 uv run autoforge step --dry-run    # preview the next step
 
 uv run autoforge resume            # continue until a stop phase / --max-steps
+# --max-steps bounds one invocation; workflow.max_total_steps (config) bounds
+# the whole run and is not reset by resume
 
 # only with safety.allow_merge: true in config — the controller verifies on
 # GitHub and merges itself (agents never merge); re-run to re-check
@@ -209,7 +223,10 @@ Default `.autoforge/` (overridable via `--state-dir` or config):
 State records `current_pr_url`, `current_branch`, `current_head_sha`,
 `reviewed_head_sha`, `review_round`, `last_review_comment_url`,
 `last_review_needs_fix`, `open_findings`, `last_fix_resolutions`,
-`step_count`, `attempt` and `block_reason`.
+`review_history` (one entry per completed review round of the current PR:
+round, reviewed SHA, result, finding count, fingerprint of the requested
+resolutions), `step_count` (cumulative for the run, never reset), `attempt`
+and `block_reason`.
 
 ## Security model
 
@@ -258,6 +275,10 @@ State records `current_pr_url`, `current_branch`, `current_head_sha`,
 - No `os.system` / `shell=True` anywhere; prompts travel as a single argv
   element so shell metacharacters in issue text cannot be interpreted.
   Agents run in a new session and the whole process group is killed on timeout.
+- **Runs cannot loop forever.** The review-round cap, stagnation detection
+  and the cumulative step budget (`workflow:` in the config) are controller
+  invariants checked before an agent is invoked; hitting one is `BLOCKED`, a
+  terminal phase that `resume` does not re-enter.
 - `doctor` is read-only apart from a temp file it creates and removes in the
   state directory.
 - Runtime state, logs, locks, and local config overrides are git-ignored.
