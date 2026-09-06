@@ -35,7 +35,10 @@ safety:
 merge:
   # How the CONTROLLER merges once the gate above is open. Agents never merge:
   # the engine itself runs `gh pr merge --<method> --match-head-commit <reviewed HEAD>`
-  # and counts the merge only after GitHub reports the PR as MERGED.
+  # and counts the merge only after GitHub reports the PR as MERGED. Before
+  # writing it verifies on GitHub (fail closed): not a draft, all checks
+  # succeeded, mergeable, mergeStateStatus CLEAN/HAS_HOOKS, no auto-merge
+  # armed, no merge queue on the base branch.
   method: squash          # squash | merge | rebase
   delete_branch: false    # add --delete-branch
 
