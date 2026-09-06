@@ -55,6 +55,7 @@ from .errors import (
     ExecutionError,
     ExecutionTimeoutError,
     GitHubError,
+    GitHubUnavailableError,
     StateError,
     StateTransitionError,
     VerificationError,
@@ -717,6 +718,28 @@ class ControllerEngine:
             f"{state.attempt}/{limit}) — 'resume --allow-merge' to re-check."
         ) from cause
 
+    def _github_read_failed(
+        self, phase: Phase, plan: StepPlan | None, what: str, exc: GitHubError
+    ) -> StepOutcome:
+        """A GitHub read the pre-merge verification depends on failed: classify, never guess.
+
+        Transient failures (:class:`GitHubUnavailableError`: timeouts, connection
+        errors, 5xx, rate limiting) leave the facts *inconclusive* and take the
+        same bounded re-check path as unknown mergeability. Anything else
+        (authentication, permissions, a PR that no longer resolves, malformed
+        data) is conclusive: re-running would not change it, so the run is
+        BLOCKED for a human. Nothing is merged or counted on either path.
+        """
+        if isinstance(exc, GitHubUnavailableError):
+            return self._inconclusive(phase, plan, f"{what} (GitHub unavailable: {exc})", cause=exc)
+        return self._block(
+            phase,
+            plan,
+            f"{what}: {exc}. This is not a transient GitHub failure (authentication, "
+            "permissions, or the PR itself), so re-checking would not help; nothing was "
+            "merged or counted. Fix the cause and inspect the PR on GitHub manually.",
+        )
+
     def _verify_pr_for_merge(
         self, phase: Phase, plan: StepPlan, allow_merge: bool
     ) -> PRInfo | StepOutcome:
@@ -735,8 +758,11 @@ class ControllerEngine:
         - PR CLOSED, draft, conflicting, failing check, branch protection,
           auto-merge armed, merge queue -> BLOCKED (conclusive; no retry)
         - PR HEAD != reviewed HEAD -> REVIEW (clean review is stale)
-        - inconclusive (mergeability UNKNOWN, checks running) -> raises and
-          keeps the phase, bounded by ``merge.max_verification_attempts``
+        - inconclusive (mergeability UNKNOWN, checks running, GitHub read
+          failed transiently) -> raises and keeps the phase, bounded by
+          ``merge.max_verification_attempts``
+        - GitHub read failed conclusively (auth, permissions, unresolvable
+          PR) -> BLOCKED
         """
         state = self._require_state()
         self._check_merge_gate(allow_merge)
@@ -750,7 +776,10 @@ class ControllerEngine:
                 f"(last_review_result={state.last_review_result!r}, "
                 f"reviewed_head_sha={state.reviewed_head_sha!r}); refusing to merge"
             )
-        pr = self.github.get_pr(url)
+        try:
+            pr = self.github.get_pr(url)
+        except GitHubError as exc:
+            return self._github_read_failed(phase, plan, f"PR {url} could not be read", exc)
         if parse_pr_url(pr.url or url).repository.lower() != state.repository.lower():
             raise VerificationError(f"PR {url} is not in {state.repository}")
         if pr.state == "MERGED":
@@ -789,6 +818,10 @@ class ControllerEngine:
             not_ready = self._merge_readiness_problem(pr)
         except VerificationError as exc:
             return self._inconclusive(phase, plan, str(exc), cause=exc)
+        except GitHubError as exc:
+            return self._github_read_failed(
+                phase, plan, f"merge-queue status of PR {url} could not be read", exc
+            )
         if not_ready:
             return self._block(phase, plan, f"{not_ready}. Nothing was merged or counted.")
         return pr
@@ -833,10 +866,12 @@ class ControllerEngine:
            base branch does not use a merge queue (``gh pr merge`` would
            otherwise arm auto-merge / enqueue instead of merging).
            Conclusive negatives -> BLOCKED. Inconclusive data (mergeability
-           UNKNOWN, checks still running) raises VerificationError and leaves
-           the run in MERGE so ``resume --allow-merge`` re-checks later, at most
-           ``merge.max_verification_attempts`` times, then BLOCKED. Never
-           guessed.
+           UNKNOWN, checks still running, a PR / merge-queue read that failed
+           transiently) raises VerificationError and leaves the run in MERGE
+           so ``resume --allow-merge`` re-checks later, at most
+           ``merge.max_verification_attempts`` times, then BLOCKED. A read
+           that failed conclusively (auth, permissions, unresolvable PR) is
+           BLOCKED at once. Never guessed.
         Steps 1-5 are :meth:`_verify_pr_for_merge`, shared with READY_FOR_MERGE.
         Then ``gh pr merge --<method> --match-head-commit <reviewed>``; the PR
         is re-read and the merge is counted only when GitHub says MERGED.
@@ -926,7 +961,9 @@ class ControllerEngine:
 
         Returns a non-empty reason when the PR must NOT be merged (-> BLOCKED).
         Raises VerificationError when GitHub's data is inconclusive (the
-        caller keeps the phase and bounds the re-checks). Returns "" only when
+        caller keeps the phase and bounds the re-checks) and lets GitHubError
+        from the merge-queue read propagate (the caller classifies it:
+        transient -> same bounded path, conclusive -> BLOCKED). Returns "" only when
         every fact the controller can read says a synchronous merge of this
         exact HEAD is acceptable right now.
         """

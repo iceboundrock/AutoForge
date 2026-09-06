@@ -18,7 +18,7 @@ if str(SRC) not in sys.path:
 
 from autoforge.config import default_config  # noqa: E402
 from autoforge.engine import ControllerEngine  # noqa: E402
-from autoforge.errors import GitHubError  # noqa: E402
+from autoforge.errors import GitHubError, GitHubUnavailableError  # noqa: E402
 from autoforge.executor import ExecutionResult  # noqa: E402
 from autoforge.github import (  # noqa: E402
     CommentInfo,
@@ -108,10 +108,14 @@ class FakeGitHub:
         self.merge_leaves_open: bool = False  # gh exits 0 but PR stays OPEN (merge queue)
         self.merge_arms_auto: bool = False  # ... and that call armed auto-merge on the PR
         self.merge_queue: dict[str, MergeQueueStatus] = {}  # per PR; default: no queue
-        self.merge_queue_error: str = ""  # non-empty -> get_pr_merge_queue_status raises
+        # non-empty -> get_pr_merge_queue_status raises: a str is a *conclusive*
+        # GitHubError, an exception instance is raised as-is (GitHubUnavailableError
+        # for a transient failure).
+        self.merge_queue_error: str | GitHubError = ""
         self.disable_auto_error: str = ""  # non-empty -> disable_auto_merge raises
         self.disabled_auto: list[str] = []  # PRs on which disable_auto_merge ran
-        self.get_pr_failures: int = 0  # next N get_pr calls raise GitHubError
+        self.get_pr_failures: int = 0  # next N get_pr calls raise GitHubUnavailableError
+        self.get_pr_error: GitHubError | None = None  # every get_pr call raises this
         self.add_issue(EPIC, "EPIC")
         self.add_issue(ISSUE, "Feature")
 
@@ -193,9 +197,11 @@ class FakeGitHub:
         from autoforge.validation import parse_pr_url
 
         self.calls.append(("get_pr", url))
+        if self.get_pr_error is not None:
+            raise self.get_pr_error
         if self.get_pr_failures > 0:
             self.get_pr_failures -= 1
-            raise GitHubError("`gh pr view` failed (exit 1): connection reset")
+            raise GitHubUnavailableError("`gh pr view` failed (exit 1): connection reset")
         ref = parse_pr_url(url)
         try:
             return self.prs[ref.canonical]
@@ -219,6 +225,8 @@ class FakeGitHub:
 
         canonical = parse_pr_url(url).canonical
         self.calls.append(("get_pr_merge_queue_status", canonical))
+        if isinstance(self.merge_queue_error, GitHubError):
+            raise self.merge_queue_error
         if self.merge_queue_error:
             raise GitHubError(self.merge_queue_error)
         return self.merge_queue.get(canonical, MergeQueueStatus(enabled=False, in_queue=False))

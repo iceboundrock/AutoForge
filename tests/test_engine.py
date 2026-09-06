@@ -9,6 +9,7 @@ from autoforge.errors import (
     ExecutionError,
     ExecutionTimeoutError,
     GitHubError,
+    GitHubUnavailableError,
     StateTransitionError,
     VerificationError,
 )
@@ -1027,13 +1028,17 @@ def test_merge_blocks_when_pr_already_in_merge_queue(tmp_state_dir, fake_github)
     assert fake_github.merges == []
 
 
-def test_merge_queue_status_read_failure_stays_in_merge(tmp_state_dir, fake_github):
+def test_merge_queue_status_transient_read_failure_stays_in_merge(tmp_state_dir, fake_github):
+    """A 502 on the merge-queue read is inconclusive: bounded re-check, not a raw GitHubError."""
     fake_github.add_pr()
-    fake_github.merge_queue_error = "`gh api graphql` failed (exit 1): 502"
+    fake_github.merge_queue_error = GitHubUnavailableError("`gh api graphql` failed (exit 1): 502")
     eng = _in_merge(tmp_state_dir, fake_github)
-    with pytest.raises(GitHubError, match="502"):
+    with pytest.raises(VerificationError, match="502.*attempt 1/") as info:
         eng.step(allow_merge=True)
-    assert eng.state.phase == Phase.MERGE and fake_github.merges == []
+    assert isinstance(info.value.__cause__, GitHubUnavailableError)
+    assert eng.state.phase == Phase.MERGE and eng.state.attempt == 1
+    assert load_state(eng.paths.state_file).attempt == 1
+    assert fake_github.merges == []
 
 
 def test_merge_exit_zero_leaving_pr_open_disarms_auto_merge(tmp_state_dir, fake_github):
@@ -1342,6 +1347,128 @@ def test_merge_post_write_read_failure_is_bounded(tmp_state_dir, fake_github):
     assert out.next_phase == "BLOCKED" and "could not be re-read" in eng.state.block_reason
     assert "inspect the PR on GitHub manually" in eng.state.block_reason
     assert eng.state.counted_merged_prs == [] and eng.state.merged_since_epic_update == 0
+
+
+# -- GitHub read failures during pre-merge verification (R3-F1) ----------------------
+# Every fact the verification needs comes from two reads: the PR itself and the
+# merge-queue status. A failure of either must never escape as a raw GitHubError
+# (which `resume --allow-merge` could retry forever): transient failures take the
+# bounded inconclusive path, conclusive ones are BLOCKED. Nothing is ever merged.
+
+_UNAVAILABLE = GitHubUnavailableError("`gh pr view` failed (exit 1): 503 Service Unavailable")
+_UNAUTHORIZED = GitHubError("`gh pr view` failed (exit 1): HTTP 401: Bad credentials")
+
+
+def _break_pr_read(gh, exc):
+    gh.get_pr_error = exc
+
+
+def _break_queue_read(gh, exc):
+    gh.merge_queue_error = exc
+
+
+_READ_FAILURES = [
+    pytest.param(_break_pr_read, "could not be read", id="pr-read"),
+    pytest.param(_break_queue_read, "merge-queue status", id="queue-read"),
+]
+
+
+@pytest.mark.parametrize("phase", [Phase.READY_FOR_MERGE, Phase.MERGE])
+@pytest.mark.parametrize(("breaker", "expected"), _READ_FAILURES)
+def test_transient_read_failure_is_bounded_then_blocked(
+    tmp_state_dir, fake_github, phase, breaker, expected
+):
+    """Unavailable GitHub: one attempt per invocation, BLOCKED at the bound, never merged."""
+    fake_github.add_pr(head_sha=SHA_A)
+    breaker(fake_github, _UNAVAILABLE)
+    eng = _in_merge(tmp_state_dir, fake_github, phase=phase)
+    eng.config.merge.max_verification_attempts = 3
+    for n in (1, 2):
+        with pytest.raises(VerificationError, match=f"{expected}.*503.*attempt {n}/3"):
+            eng.step(allow_merge=True)
+        assert eng.state.phase == phase
+        assert load_state(eng.paths.state_file).attempt == n
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "BLOCKED"
+    assert expected in eng.state.block_reason
+    assert "inconclusive for 3 verification attempt(s)" in eng.state.block_reason
+    assert "resume" not in out.message
+    assert load_state(eng.paths.state_file).phase == Phase.BLOCKED
+    assert fake_github.merges == [] and eng.state.counted_merged_prs == []
+
+
+@pytest.mark.parametrize("phase", [Phase.READY_FOR_MERGE, Phase.MERGE])
+@pytest.mark.parametrize(("breaker", "expected"), _READ_FAILURES)
+def test_conclusive_read_failure_blocks_immediately(
+    tmp_state_dir, fake_github, phase, breaker, expected
+):
+    """Bad credentials / permissions: re-checking would not help -> BLOCKED at once."""
+    fake_github.add_pr(head_sha=SHA_A)
+    breaker(fake_github, _UNAUTHORIZED)
+    eng = _in_merge(tmp_state_dir, fake_github, phase=phase)
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "BLOCKED"
+    assert expected in eng.state.block_reason and "401" in eng.state.block_reason
+    assert "not a transient GitHub failure" in eng.state.block_reason
+    assert eng.state.attempt == 0  # no verification attempt was consumed
+    assert load_state(eng.paths.state_file).phase == Phase.BLOCKED
+    assert fake_github.merges == [] and eng.state.counted_merged_prs == []
+    # BLOCKED is terminal for step(): a later resume cannot retry its way into a merge.
+    with pytest.raises(StateTransitionError):
+        eng.step(allow_merge=True)
+    assert fake_github.merges == []
+
+
+@pytest.mark.parametrize("phase", [Phase.READY_FOR_MERGE, Phase.MERGE])
+def test_conclusive_read_failure_via_resume_blocks_without_retry(tmp_state_dir, fake_github, phase):
+    fake_github.add_pr(head_sha=SHA_A)
+    fake_github.get_pr_error = _UNAUTHORIZED
+    eng = _in_merge(tmp_state_dir, fake_github, phase=phase)
+    outcomes = eng.run(max_steps=50, allow_merge=True)
+    assert [o.next_phase for o in outcomes] == ["BLOCKED"]
+    assert fake_github.calls.count(("get_pr", PR)) == 1
+    assert fake_github.merges == []
+
+
+@pytest.mark.parametrize("phase", [Phase.READY_FOR_MERGE, Phase.MERGE])
+def test_transient_read_failure_via_resume_consumes_one_attempt_each(
+    tmp_state_dir, fake_github, phase
+):
+    """`resume --allow-merge` against an unavailable GitHub is bounded, then BLOCKED."""
+    fake_github.add_pr(head_sha=SHA_A)
+    fake_github.merge_queue_error = _UNAVAILABLE
+    eng = _in_merge(tmp_state_dir, fake_github, phase=phase)
+    eng.config.merge.max_verification_attempts = 2
+    with pytest.raises(VerificationError, match=f"{phase.value}.*attempt 1/2"):
+        eng.run(max_steps=50, allow_merge=True)
+    assert load_state(eng.paths.state_file).attempt == 1
+    outcomes = eng.run(max_steps=50, allow_merge=True)
+    assert [o.next_phase for o in outcomes] == ["BLOCKED"]
+    assert fake_github.merges == [] and eng.state.counted_merged_prs == []
+
+
+def test_transient_read_failure_then_recovery_proceeds(tmp_state_dir, fake_github):
+    """Once GitHub answers again the run continues normally and the attempt counter resets."""
+    fake_github.add_pr(head_sha=SHA_A)
+    fake_github.get_pr_failures = 1
+    eng = _in_ready(tmp_state_dir, fake_github)
+    with pytest.raises(VerificationError, match="could not be read.*attempt 1/"):
+        eng.step(allow_merge=True)
+    assert eng.state.phase == Phase.READY_FOR_MERGE and eng.state.attempt == 1
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "MERGE" and eng.state.attempt == 0
+    assert fake_github.merges == []  # READY_FOR_MERGE never writes
+
+
+def test_merge_transient_read_failure_never_reaches_the_write(tmp_state_dir, fake_github):
+    """Even at the bound, a failed pre-write read never falls through to `gh pr merge`."""
+    fake_github.add_pr(head_sha=SHA_A)
+    fake_github.get_pr_error = _UNAVAILABLE
+    eng = _in_merge(tmp_state_dir, fake_github)
+    eng.config.merge.max_verification_attempts = 1
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "BLOCKED" and "could not be read" in eng.state.block_reason
+    assert fake_github.merges == [] and eng.state.counted_merged_prs == []
 
 
 def test_merge_counts_only_after_github_confirms_merged(tmp_state_dir, fake_github):

@@ -1,10 +1,11 @@
 """GitHub client with injected fake `gh` runner (no network)."""
 
 import json
+from dataclasses import replace
 
 import pytest
 
-from autoforge.errors import GitHubError
+from autoforge.errors import GitHubError, GitHubUnavailableError
 from autoforge.executor import ExecutionResult
 from autoforge.github import GitHubClient
 
@@ -165,6 +166,64 @@ def test_transient_error_retried_once():
     gh = GitHubClient(runner=handler, retry_delay_seconds=0)
     assert gh.get_issue("https://github.com/o/r/issues/2").number == 2
     assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "error connecting to api.github.com: timeout",
+        "read: connection reset by peer",
+        "HTTP 502: Bad Gateway",
+        "HTTP 503: Service Unavailable",
+        "API rate limit exceeded for user",
+        "HTTP 429: Too Many Requests",
+    ],
+)
+def test_transient_failure_raises_github_unavailable_error(stderr):
+    """Transient `gh` failures are typed so the engine can bound re-checks instead of guessing."""
+    calls = []
+
+    def handler(req):
+        calls.append(1)
+        return _res({}, exit_code=1, stderr=stderr)
+
+    gh = GitHubClient(runner=handler, retry_delay_seconds=0)
+    with pytest.raises(GitHubUnavailableError, match="failed"):
+        gh.get_pr("https://github.com/o/r/pull/42")
+    assert len(calls) == 2  # retried once, then classified as unavailable
+
+
+def test_timeout_raises_github_unavailable_error():
+    def handler(req):
+        res = _res({}, exit_code=-9)
+        return replace(res, timed_out=True)
+
+    gh = GitHubClient(runner=handler, retry_delay_seconds=0)
+    with pytest.raises(GitHubUnavailableError, match="timed out"):
+        gh.get_pr("https://github.com/o/r/pull/42")
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "HTTP 401: Bad credentials (https://api.github.com/graphql)",
+        "HTTP 403: Resource not accessible by integration",
+        "HTTP 404: Not Found",
+        "could not find pull request",
+    ],
+)
+def test_conclusive_failure_is_plain_github_error(stderr):
+    calls = []
+
+    def handler(req):
+        calls.append(1)
+        return _res({}, exit_code=1, stderr=stderr)
+
+    gh = GitHubClient(runner=handler, retry_delay_seconds=0)
+    with pytest.raises(GitHubError) as info:
+        gh.get_pr_merge_queue_status("https://github.com/o/r/pull/42")
+    assert not isinstance(info.value, GitHubUnavailableError)
+    assert len(calls) == 1  # never retried
 
 
 def test_current_repo_uses_repo_view():

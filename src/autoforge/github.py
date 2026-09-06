@@ -19,7 +19,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from .errors import ConfigurationError, GitHubError
+from .errors import ConfigurationError, GitHubError, GitHubUnavailableError
 from .executor import ExecutionRequest, ExecutionResult, execute
 from .validation import (
     GitHubCommentRef,
@@ -42,6 +42,8 @@ _TRANSIENT_MARKERS = (
     "504",
     "tls handshake",
     "no such host",
+    "rate limit",
+    "429",
 )
 
 
@@ -225,6 +227,7 @@ class GitHubClient:
     def _run_gh(self, args: list[str], allow_fail: bool = False) -> ExecutionResult:
         attempts = self.transient_retries + 1
         last_error = ""
+        transient = False
         for i in range(attempts):
             res = self._runner(
                 ExecutionRequest(
@@ -246,6 +249,8 @@ class GitHubClient:
             if not transient or i == attempts - 1:
                 break
             time.sleep(self.retry_delay_seconds)
+        if transient:
+            raise GitHubUnavailableError(last_error)
         raise GitHubError(last_error)
 
     def _json(self, args: list[str]) -> object:
