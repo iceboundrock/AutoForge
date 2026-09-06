@@ -1,9 +1,14 @@
-"""GitHub abstraction over the `gh` CLI (read-only / verification).
+"""GitHub abstraction over the `gh` CLI (verification + controller-owned merge).
 
 Business logic must use these typed objects, never parse raw `gh` JSON
-inline. Write operations (comment/merge/edit) are intentionally NOT provided:
-agents perform them under controller prompts, and the controller only
-*verifies* what the agents claim through this client.
+inline. Agents perform content writes (branches, PRs, comments, issues)
+under controller prompts, and the controller only *verifies* what they
+claim through this client. The exceptions are :meth:`GitHubClient.merge_pr`
+and :meth:`GitHubClient.disable_auto_merge`: merging is owned by the
+controller (never by an agent), sits behind the merge safety gate in the
+engine, and is always bound to the reviewed HEAD via ``--match-head-commit``;
+disabling auto-merge only undoes an auto-merge the controller's own merge
+call left armed.
 """
 
 from __future__ import annotations
@@ -14,7 +19,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from .errors import GitHubError
+from .errors import ConfigurationError, GitHubError
 from .executor import ExecutionRequest, ExecutionResult, execute
 from .validation import (
     GitHubCommentRef,
@@ -60,11 +65,39 @@ class IssueInfo:
         return self.state == "OPEN"
 
 
+_CHECK_OK_CONCLUSIONS = frozenset({"SUCCESS", "NEUTRAL", "SKIPPED"})
+_CHECK_PENDING_STATES = frozenset(
+    {"QUEUED", "IN_PROGRESS", "PENDING", "WAITING", "REQUESTED", "EXPECTED"}
+)
+
+
 @dataclass
 class CheckInfo:
     name: str
-    state: str  # COMPLETED | IN_PROGRESS | ...
-    conclusion: str = ""  # SUCCESS | FAILURE | ...
+    state: str  # CheckRun: COMPLETED | IN_PROGRESS | ... ; StatusContext: SUCCESS | PENDING | ...
+    conclusion: str = ""  # CheckRun only: SUCCESS | FAILURE | ...
+
+    @property
+    def outcome(self) -> str:
+        """``success`` | ``pending`` | ``failure`` | ``unknown`` (fail closed).
+
+        Covers both GitHub check runs (``status``/``conclusion``) and legacy
+        commit statuses (``state`` only). Anything unrecognised is ``unknown``
+        and callers must treat it as not passing.
+        """
+        state = (self.state or "").upper()
+        conclusion = (self.conclusion or "").upper()
+        if state == "COMPLETED":
+            if conclusion in _CHECK_OK_CONCLUSIONS:
+                return "success"
+            return "failure" if conclusion else "unknown"
+        if state in _CHECK_PENDING_STATES:
+            return "pending"
+        if state == "SUCCESS" and not conclusion:
+            return "success"
+        if state in ("FAILURE", "ERROR") and not conclusion:
+            return "failure"
+        return "unknown"
 
 
 @dataclass
@@ -87,6 +120,9 @@ class PRInfo:
     base_ref: str = ""
     head_ref: str = ""
     mergeable: str = ""  # MERGEABLE | CONFLICTING | UNKNOWN
+    # CLEAN | HAS_HOOKS | UNSTABLE | BLOCKED | BEHIND | DIRTY | DRAFT | UNKNOWN
+    merge_state_status: str = ""
+    auto_merge_enabled: bool = False  # GitHub auto-merge is armed on this PR
     is_draft: bool = False
     body: str = ""
     repository: str = ""
@@ -99,11 +135,25 @@ class PRInfo:
         return self.state == "OPEN"
 
 
+@dataclass(frozen=True)
+class MergeQueueStatus:
+    """Merge-queue facts for a PR (GraphQL only; not exposed by ``gh pr view``)."""
+
+    enabled: bool  # the base branch requires a merge queue
+    in_queue: bool  # the PR is currently enqueued
+
+
 Runner = Callable[[ExecutionRequest], ExecutionResult]
 
 _PR_FIELDS = (
-    "url,number,title,state,headRefOid,baseRefName,headRefName,mergeable,isDraft,body,"
-    "headRepository,headRepositoryOwner,closingIssuesReferences,statusCheckRollup"
+    "url,number,title,state,headRefOid,baseRefName,headRefName,mergeable,mergeStateStatus,"
+    "autoMergeRequest,isDraft,body,headRepository,headRepositoryOwner,"
+    "closingIssuesReferences,statusCheckRollup"
+)
+_MERGE_QUEUE_QUERY = (
+    "query($owner: String!, $name: String!, $number: Int!) {"
+    " repository(owner: $owner, name: $name) {"
+    " pullRequest(number: $number) { isMergeQueueEnabled isInMergeQueue } } }"
 )
 _PR_LIST_FIELDS = (
     "url,number,title,state,headRefOid,baseRefName,headRefName,isDraft,body,"
@@ -116,6 +166,42 @@ def _repo_of(url: str) -> str:
         return parse_github_url(url).repository
     except Exception:
         return ""
+
+
+MERGE_METHODS = ("squash", "merge", "rebase")
+_SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def build_merge_argv(
+    pr_url: str,
+    method: str = "squash",
+    match_head_sha: str = "",
+    delete_branch: bool = False,
+) -> list[str]:
+    """Pure argv builder for ``gh pr merge`` (no ``gh`` prefix, no execution).
+
+    Shared by :meth:`GitHubClient.merge_pr` and the engine's dry-run plan so
+    the command shown in dry-run is exactly the one that would run.
+    ``match_head_sha`` must be the full 40-hex reviewed HEAD; GitHub then
+    refuses the merge server-side if the PR HEAD moved.
+    """
+    if method not in MERGE_METHODS:
+        raise ConfigurationError(f"merge.method must be one of {MERGE_METHODS}, got {method!r}")
+    if not match_head_sha or not _SHA40_RE.match(match_head_sha.lower()):
+        raise ConfigurationError(
+            "merge requires the full 40-hex reviewed HEAD SHA for --match-head-commit, "
+            f"got {match_head_sha!r}"
+        )
+    ref = parse_pr_url(pr_url)
+    argv = ["pr", "merge", ref.canonical, f"--{method}", "--match-head-commit", match_head_sha]
+    if delete_branch:
+        argv.append("--delete-branch")
+    return argv
+
+
+def build_disable_auto_merge_argv(pr_url: str) -> list[str]:
+    """``gh pr merge <pr> --disable-auto``: disarm GitHub auto-merge on a PR."""
+    return ["pr", "merge", parse_pr_url(pr_url).canonical, "--disable-auto"]
 
 
 class GitHubClient:
@@ -274,7 +360,9 @@ class GitHubClient:
             head_sha=(data.get("headRefOid", "") or "").lower(),
             base_ref=data.get("baseRefName", "") or "",
             head_ref=data.get("headRefName", "") or "",
-            mergeable=str(data.get("mergeable", "")).upper(),
+            mergeable=str(data.get("mergeable", "") or "").upper(),
+            merge_state_status=str(data.get("mergeStateStatus", "") or "").upper(),
+            auto_merge_enabled=data.get("autoMergeRequest") is not None,
             is_draft=bool(data.get("isDraft", False)),
             body=data.get("body", "") or "",
             repository=_repo_of(url),
@@ -299,6 +387,38 @@ class GitHubClient:
 
     def get_pr_checks(self, url: str) -> list[CheckInfo]:
         return self.get_pr(url).checks
+
+    def get_pr_merge_queue_status(self, url: str) -> MergeQueueStatus:
+        """Whether the PR's base branch requires a merge queue / the PR is enqueued.
+
+        ``gh pr merge`` silently switches to auto-merge or queue insertion on
+        such branches, so the engine must know this *before* writing. Missing
+        or non-boolean data raises GitHubError (fail closed).
+        """
+        ref = parse_pr_url(url)
+        owner, _, name = ref.repository.partition("/")
+        data = self._api_json(
+            [
+                "api",
+                "graphql",
+                "-f",
+                f"query={_MERGE_QUEUE_QUERY}",
+                "-F",
+                f"owner={owner}",
+                "-F",
+                f"name={name}",
+                "-F",
+                f"number={ref.number}",
+            ]
+        )
+        pr = ((data.get("data") or {}).get("repository") or {}).get("pullRequest")
+        if not isinstance(pr, dict):
+            raise GitHubError(f"merge-queue status for {ref.canonical} unavailable: {data}")
+        enabled = pr.get("isMergeQueueEnabled")
+        in_queue = pr.get("isInMergeQueue")
+        if not isinstance(enabled, bool) or not isinstance(in_queue, bool):
+            raise GitHubError(f"merge-queue status for {ref.canonical} is not boolean: {pr}")
+        return MergeQueueStatus(enabled=enabled, in_queue=in_queue)
 
     def pr_exists(self, url: str) -> bool:
         try:
@@ -338,6 +458,32 @@ class GitHubClient:
             if issue.number in pr.linked_issue_numbers or prefix.match(pr.head_ref or ""):
                 out.append(pr)
         return out
+
+    # -- merge (the only write; controller-owned, engine-gated) ------------------
+    def merge_pr(
+        self,
+        url: str,
+        method: str = "squash",
+        match_head_sha: str = "",
+        delete_branch: bool = False,
+    ) -> None:
+        """Run ``gh pr merge`` bound to ``match_head_sha``.
+
+        Raises GitHubError when ``gh`` fails (conflict, branch protection,
+        HEAD moved, permissions, ...). A normal return only means ``gh``
+        exited 0: callers must re-read the PR and confirm ``state == MERGED``
+        before treating the merge as done (merge queues / auto-merge may
+        leave the PR open).
+        """
+        self._run_gh(build_merge_argv(url, method, match_head_sha, delete_branch))
+
+    def disable_auto_merge(self, url: str) -> None:
+        """Disarm GitHub auto-merge on ``url`` (``gh pr merge --disable-auto``).
+
+        Used only to undo an auto-merge that a controller ``merge_pr`` call
+        left armed, so no unreviewed HEAD can merge later on its own.
+        """
+        self._run_gh(build_disable_auto_merge_argv(url))
 
     # -- comments -----------------------------------------------------------
     def get_pr_comments(self, url: str) -> list[CommentInfo]:
@@ -390,12 +536,16 @@ class GitHubClient:
 
 
 __all__ = [
+    "MERGE_METHODS",
     "CheckInfo",
     "CommentInfo",
     "GitHubClient",
     "GitHubIssueRef",
     "GitHubPullRequestRef",
     "IssueInfo",
+    "MergeQueueStatus",
     "PRInfo",
     "RepoInfo",
+    "build_disable_auto_merge_argv",
+    "build_merge_argv",
 ]

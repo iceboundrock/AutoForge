@@ -125,11 +125,10 @@ def test_per_phase_schemas():
     with pytest.raises(ControlResultValidationError, match="pr_url"):
         parse_control_result(BEGIN + json.dumps(dict(ae, pr_url="p")) + END, Phase.ANALYZE_EXECUTE)
 
+    # MERGE is controller-executed: an agent "merged" claim is never accepted.
     merge = {"phase": "MERGE", "status": "success", "merged": True, "next_action": "UPDATE_EPIC"}
-    assert parse_control_result(BEGIN + json.dumps(merge) + END, Phase.MERGE) == merge
-    bad_merge = dict(merge, next_action="NEXT_ISSUE")  # URL required
-    with pytest.raises(ControlResultValidationError, match="next_issue_url"):
-        parse_control_result(BEGIN + json.dumps(bad_merge) + END, Phase.MERGE)
+    with pytest.raises(ControlResultValidationError, match="executed by the controller"):
+        parse_control_result(BEGIN + json.dumps(merge) + END, Phase.MERGE)
 
     epic = {"phase": "UPDATE_EPIC", "status": "success", "next_issue_url": None}
     assert parse_control_result(BEGIN + json.dumps(epic) + END, Phase.UPDATE_EPIC) == epic

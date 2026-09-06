@@ -32,8 +32,10 @@ def test_phase_profile_mapping():
     cfg = default_config()
     assert profile_for_phase(cfg, Phase.ANALYZE_EXECUTE).name == "analyze_execute"
     assert profile_for_phase(cfg, Phase.FIX).name == "fix"
-    assert profile_for_phase(cfg, Phase.MERGE).name == "merge"
     assert profile_for_phase(cfg, Phase.UPDATE_EPIC).name == "update_epic"
+    # MERGE is executed by the controller (gh pr merge); no agent profile exists.
+    with pytest.raises(ConfigurationError, match="controller performs the merge"):
+        profile_for_phase(cfg, Phase.MERGE)
     # REVIEW uses completed-rounds + 1 as the upcoming round
     assert profile_for_phase(cfg, Phase.REVIEW, 0).name == "review_round_1"
     assert profile_for_phase(cfg, Phase.REVIEW, 1).name == "review_round_2_5"

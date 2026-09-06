@@ -176,3 +176,188 @@ def test_current_repo_uses_repo_view():
 
     assert _client(handler).current_repo().name_with_owner == "o/r"
     assert seen[0][:3] == ["gh", "repo", "view"]
+
+
+def test_build_merge_argv_and_merge_pr():
+    from autoforge.errors import ConfigurationError
+    from autoforge.github import build_merge_argv
+
+    url = "https://github.com/o/r/pull/42"
+    sha = "a" * 40
+    assert build_merge_argv(url, "squash", sha) == [
+        "pr",
+        "merge",
+        url,
+        "--squash",
+        "--match-head-commit",
+        sha,
+    ]
+    assert build_merge_argv(url, "rebase", sha, delete_branch=True) == [
+        "pr",
+        "merge",
+        url,
+        "--rebase",
+        "--match-head-commit",
+        sha,
+        "--delete-branch",
+    ]
+    with pytest.raises(ConfigurationError, match="merge.method"):
+        build_merge_argv(url, "fast-forward", sha)
+    # The merge is always bound to a full reviewed HEAD SHA — never unbound.
+    for bad in ("", "abc123", "g" * 40):
+        with pytest.raises(ConfigurationError, match="match-head-commit"):
+            build_merge_argv(url, "squash", bad)
+
+    seen = []
+
+    def runner(req):
+        seen.append(req.command)
+        return _res({}, exit_code=0)
+
+    gh = _client(runner)
+    gh.merge_pr(url, method="merge", match_head_sha=sha)
+    assert seen == [["gh", "pr", "merge", url, "--merge", "--match-head-commit", sha]]
+
+
+def test_merge_pr_failure_raises_github_error():
+    gh = _client(lambda req: _res({}, exit_code=1, stderr="Pull request is not mergeable"))
+    with pytest.raises(GitHubError, match="not mergeable"):
+        gh.merge_pr("https://github.com/o/r/pull/42", match_head_sha="a" * 40)
+
+
+# -- merge readiness reads (PR #24 review R1-F1 / R1-F2) -----------------------------------
+def test_get_pr_parses_merge_state_and_auto_merge():
+    seen = []
+
+    def runner(req):
+        seen.append(req.command)
+        return _res(
+            {
+                "url": "https://github.com/o/r/pull/42",
+                "number": 42,
+                "state": "OPEN",
+                "headRefOid": "A" * 40,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "clean",
+                "autoMergeRequest": {"enabledBy": {"login": "someone"}, "mergeMethod": "SQUASH"},
+                "isDraft": False,
+            }
+        )
+
+    pr = _client(runner).get_pr("https://github.com/o/r/pull/42")
+    assert pr.merge_state_status == "CLEAN" and pr.auto_merge_enabled is True
+    assert "mergeStateStatus" in seen[0][-1] and "autoMergeRequest" in seen[0][-1]
+
+    pr2 = _client(lambda req: _res({"url": "https://github.com/o/r/pull/42", "state": "OPEN"}))
+    info = pr2.get_pr("https://github.com/o/r/pull/42")
+    assert info.merge_state_status == "" and info.mergeable == ""
+    assert info.auto_merge_enabled is False  # null / missing -> not armed
+
+
+@pytest.mark.parametrize(
+    "state, conclusion, outcome",
+    [
+        ("COMPLETED", "SUCCESS", "success"),
+        ("COMPLETED", "NEUTRAL", "success"),
+        ("COMPLETED", "SKIPPED", "success"),
+        ("COMPLETED", "FAILURE", "failure"),
+        ("COMPLETED", "CANCELLED", "failure"),
+        ("COMPLETED", "TIMED_OUT", "failure"),
+        ("COMPLETED", "ACTION_REQUIRED", "failure"),
+        ("COMPLETED", "", "unknown"),
+        ("IN_PROGRESS", "", "pending"),
+        ("QUEUED", "", "pending"),
+        ("SUCCESS", "", "success"),  # legacy StatusContext
+        ("PENDING", "", "pending"),
+        ("EXPECTED", "", "pending"),
+        ("FAILURE", "", "failure"),
+        ("ERROR", "", "failure"),
+        ("", "", "unknown"),
+        ("SOMETHING_NEW", "", "unknown"),
+    ],
+)
+def test_check_outcome_classification(state, conclusion, outcome):
+    from autoforge.github import CheckInfo
+
+    assert CheckInfo(name="ci", state=state, conclusion=conclusion).outcome == outcome
+
+
+def test_get_pr_checks_parses_check_runs_and_status_contexts():
+    gh = _client(
+        lambda req: _res(
+            {
+                "url": "https://github.com/o/r/pull/42",
+                "state": "OPEN",
+                "statusCheckRollup": [
+                    {
+                        "__typename": "CheckRun",
+                        "name": "ci",
+                        "status": "COMPLETED",
+                        "conclusion": "SUCCESS",
+                    },
+                    {"__typename": "StatusContext", "context": "legacy", "state": "PENDING"},
+                ],
+            }
+        )
+    )
+    checks = gh.get_pr_checks("https://github.com/o/r/pull/42")
+    assert [(c.name, c.outcome) for c in checks] == [("ci", "success"), ("legacy", "pending")]
+
+
+def test_get_pr_merge_queue_status_uses_graphql_and_fails_closed():
+    seen = []
+
+    def ok(req):
+        seen.append(req.command)
+        return _res(
+            {
+                "data": {
+                    "repository": {
+                        "pullRequest": {"isMergeQueueEnabled": True, "isInMergeQueue": False}
+                    }
+                }
+            }
+        )
+
+    q = _client(ok).get_pr_merge_queue_status("https://github.com/o/r/pull/42")
+    assert q.enabled is True and q.in_queue is False
+    cmd = seen[0]
+    assert cmd[:3] == ["gh", "api", "graphql"]
+    assert "owner=o" in cmd and "name=r" in cmd and "number=42" in cmd
+    assert any("isMergeQueueEnabled" in part and "isInMergeQueue" in part for part in cmd)
+
+    # missing PR node -> GitHubError
+    with pytest.raises(GitHubError, match="unavailable"):
+        _client(
+            lambda req: _res({"data": {"repository": {"pullRequest": None}}})
+        ).get_pr_merge_queue_status("https://github.com/o/r/pull/42")
+    # non-boolean -> GitHubError (never coerced)
+    bad = {
+        "data": {
+            "repository": {"pullRequest": {"isMergeQueueEnabled": "yes", "isInMergeQueue": None}}
+        }
+    }
+    with pytest.raises(GitHubError, match="not boolean"):
+        _client(lambda req: _res(bad)).get_pr_merge_queue_status("https://github.com/o/r/pull/42")
+    # gh failure -> GitHubError
+    with pytest.raises(GitHubError, match="failed"):
+        _client(lambda req: _res({}, exit_code=1, stderr="boom")).get_pr_merge_queue_status(
+            "https://github.com/o/r/pull/42"
+        )
+
+
+def test_disable_auto_merge_argv():
+    from autoforge.github import build_disable_auto_merge_argv
+
+    url = "https://github.com/o/r/pull/42"
+    assert build_disable_auto_merge_argv(url) == ["pr", "merge", url, "--disable-auto"]
+    seen = []
+
+    def runner(req):
+        seen.append(req.command)
+        return _res({}, exit_code=0)
+
+    _client(runner).disable_auto_merge(url)
+    assert seen == [["gh", "pr", "merge", url, "--disable-auto"]]
+    with pytest.raises(GitHubError, match="denied"):
+        _client(lambda req: _res({}, exit_code=1, stderr="denied")).disable_auto_merge(url)

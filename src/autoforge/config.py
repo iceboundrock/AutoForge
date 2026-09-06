@@ -11,7 +11,10 @@ Logical execution profiles (routing semantics are fixed in ``profiles.py``)::
     review_round_1       OpenCode     / GPT 5.6 Luna     / high
     review_round_2_5     OpenCode     / GPT 5.6 Terra    / high
     review_round_6_plus  OpenCode     / GPT 5.6 Sol      / medium
-    merge, update_epic   (future milestones; gated)
+    update_epic          (future milestone; gated)
+
+MERGE has no agent profile: the controller itself runs ``gh pr merge``
+(see ``merge:`` below and ``GitHubClient.merge_pr``), behind the merge gate.
 
 The *real* model identifiers below were checked against the locally
 installed CLIs (``claude --help``, ``opencode models``); change them in the
@@ -88,6 +91,17 @@ class GitHubConfig:
     timeout_seconds: int = 120
 
 
+MERGE_METHODS = ("squash", "merge", "rebase")
+
+
+@dataclass
+class MergeConfig:
+    """How the *controller* merges once the gate is open (never an agent)."""
+
+    method: str = "squash"  # squash | merge | rebase  -> gh pr merge --<method>
+    delete_branch: bool = False  # gh pr merge --delete-branch
+
+
 @dataclass
 class AutoForgeConfig:
     version: int = CONFIG_VERSION
@@ -96,6 +110,7 @@ class AutoForgeConfig:
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
     github: GitHubConfig = field(default_factory=GitHubConfig)
+    merge: MergeConfig = field(default_factory=MergeConfig)
     profiles: dict[str, ProfileConfig] = field(default_factory=dict)
 
     def profile(self, name: str) -> ProfileConfig:
@@ -144,7 +159,6 @@ def default_config() -> AutoForgeConfig:
         "review_round_6_plus": _opencode_profile(
             "review_round_6_plus", "openai/gpt-5.6-sol", "medium", timeout=1200
         ),
-        "merge": _opencode_profile("merge", "openai/gpt-5.6-sol", "high", timeout=1200),
         "update_epic": _opencode_profile("update_epic", "openai/gpt-5.6-sol", "high", timeout=1200),
     }
     return AutoForgeConfig(profiles=profiles)
@@ -281,6 +295,18 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
         base.github.timeout_seconds = _as_int(
             gh["timeout_seconds"], source, "github.timeout_seconds"
         )
+    merge = data.get("merge", {}) or {}
+    if not isinstance(merge, dict):
+        raise ConfigurationError(f"{source}: 'merge' must be a mapping")
+    if "method" in merge:
+        method = merge["method"]
+        if not isinstance(method, str) or method not in MERGE_METHODS:
+            raise ConfigurationError(
+                f"{source}: 'merge.method' must be one of {MERGE_METHODS}, got {method!r}"
+            )
+        base.merge.method = method
+    if "delete_branch" in merge:
+        base.merge.delete_branch = _as_bool(merge["delete_branch"], source, "merge.delete_branch")
     profiles = data.get("profiles", {}) or {}
     if not isinstance(profiles, dict):
         raise ConfigurationError(f"{source}: 'profiles' must be a mapping")

@@ -329,47 +329,19 @@ class FixResult:
         )
 
 
-MERGE_ACTIONS = ("NEXT_ISSUE", "UPDATE_EPIC", "DONE")
-
-
-@dataclass
-class MergeResult:
-    merged: bool
-    next_action: str
-    head_changed_after_review: bool = False
-    next_issue_url: str | None = None
-
-    @classmethod
-    def from_payload(cls, p: dict) -> MergeResult:
-        merged = _req(p, "merged", "MERGE")
-        action = _req(p, "next_action", "MERGE")
-        if not isinstance(merged, bool):
-            raise ControlResultValidationError("'merged' must be a boolean")
-        if action not in MERGE_ACTIONS:
-            raise ControlResultValidationError(
-                f"'next_action' must be one of {MERGE_ACTIONS}, got {action!r}"
-            )
-        changed = p.get("head_changed_after_review", False)
-        if not isinstance(changed, bool):
-            raise ControlResultValidationError("'head_changed_after_review' must be a boolean")
-        nxt = p.get("next_issue_url")
-        if nxt is not None:
-            if not isinstance(nxt, str) or not nxt:
-                raise ControlResultValidationError(
-                    "'next_issue_url' must be a non-empty string or null"
-                )
-            if action != "NEXT_ISSUE":
-                raise ControlResultValidationError(
-                    "'next_issue_url' is only meaningful with next_action=NEXT_ISSUE"
-                )
-        if action == "NEXT_ISSUE" and not nxt:
-            raise ControlResultValidationError(
-                "'next_action' is NEXT_ISSUE but 'next_issue_url' is missing; "
-                "provide the next issue URL or use next_action=UPDATE_EPIC"
-            )
-        return cls(
-            merged=merged, next_action=action, head_changed_after_review=changed, next_issue_url=nxt
-        )
+# Phases that never produce a CONTROL_RESULT: INITIALIZING and
+# READY_FOR_MERGE are deterministic, and MERGE is executed by the controller
+# itself (gh pr merge), never by an agent.
+NON_AGENT_PHASES = frozenset(
+    {
+        Phase.INITIALIZING,
+        Phase.READY_FOR_MERGE,
+        Phase.MERGE,
+        Phase.DONE,
+        Phase.BLOCKED,
+        Phase.FAILED,
+    }
+)
 
 
 @dataclass
@@ -399,8 +371,10 @@ def validate_for_phase(phase: Phase, payload: dict) -> None:
         ReviewResult.from_payload(payload)
     elif phase == Phase.FIX:
         FixResult.from_payload(payload)
-    elif phase == Phase.MERGE:
-        MergeResult.from_payload(payload)
     elif phase == Phase.UPDATE_EPIC:
         UpdateEpicResult.from_payload(payload)
-    # INITIALIZING / READY_FOR_MERGE / terminal phases never produce CONTROL_RESULTs.
+    elif phase in NON_AGENT_PHASES:
+        raise ControlResultValidationError(
+            f"phase {phase.value} is executed by the controller and never accepts an "
+            "agent CONTROL_RESULT"
+        )

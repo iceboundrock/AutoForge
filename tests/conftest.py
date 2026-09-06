@@ -20,7 +20,13 @@ from autoforge.config import default_config  # noqa: E402
 from autoforge.engine import ControllerEngine  # noqa: E402
 from autoforge.errors import GitHubError  # noqa: E402
 from autoforge.executor import ExecutionResult  # noqa: E402
-from autoforge.github import CommentInfo, IssueInfo, PRInfo, RepoInfo  # noqa: E402
+from autoforge.github import (  # noqa: E402
+    CommentInfo,
+    IssueInfo,
+    MergeQueueStatus,
+    PRInfo,
+    RepoInfo,
+)
 from autoforge.providers import ProviderRegistry, ScriptedProvider  # noqa: E402
 from autoforge.result_parser import BEGIN, END  # noqa: E402
 from autoforge.validation import parse_issue_url  # noqa: E402
@@ -96,6 +102,16 @@ class FakeGitHub:
         self.prs: dict[str, PRInfo] = {}
         self.comments: dict[str, list[CommentInfo]] = {}
         self.calls: list[tuple] = []
+        # Controller-owned merge simulation (see merge_pr).
+        self.merges: list[tuple[str, str, str, bool]] = []
+        self.merge_error: str = ""  # non-empty -> merge_pr raises GitHubError
+        self.merge_leaves_open: bool = False  # gh exits 0 but PR stays OPEN (merge queue)
+        self.merge_arms_auto: bool = False  # ... and that call armed auto-merge on the PR
+        self.merge_queue: dict[str, MergeQueueStatus] = {}  # per PR; default: no queue
+        self.merge_queue_error: str = ""  # non-empty -> get_pr_merge_queue_status raises
+        self.disable_auto_error: str = ""  # non-empty -> disable_auto_merge raises
+        self.disabled_auto: list[str] = []  # PRs on which disable_auto_merge ran
+        self.get_pr_failures: int = 0  # next N get_pr calls raise GitHubError
         self.add_issue(EPIC, "EPIC")
         self.add_issue(ISSUE, "Feature")
 
@@ -131,6 +147,8 @@ class FakeGitHub:
             head_sha=head_sha,
             base_ref="main",
             head_ref=branch,
+            mergeable="MERGEABLE",
+            merge_state_status="CLEAN",
             repository=ref.repository,
             linked_issue_numbers=list(linked or []),
         )
@@ -175,6 +193,9 @@ class FakeGitHub:
         from autoforge.validation import parse_pr_url
 
         self.calls.append(("get_pr", url))
+        if self.get_pr_failures > 0:
+            self.get_pr_failures -= 1
+            raise GitHubError("`gh pr view` failed (exit 1): connection reset")
         ref = parse_pr_url(url)
         try:
             return self.prs[ref.canonical]
@@ -192,6 +213,15 @@ class FakeGitHub:
 
     def get_pr_checks(self, url: str):
         return self.get_pr(url).checks
+
+    def get_pr_merge_queue_status(self, url: str) -> MergeQueueStatus:
+        from autoforge.validation import parse_pr_url
+
+        canonical = parse_pr_url(url).canonical
+        self.calls.append(("get_pr_merge_queue_status", canonical))
+        if self.merge_queue_error:
+            raise GitHubError(self.merge_queue_error)
+        return self.merge_queue.get(canonical, MergeQueueStatus(enabled=False, in_queue=False))
 
     def pr_exists(self, url: str) -> bool:
         try:
@@ -226,6 +256,42 @@ class FakeGitHub:
                 if c.url == url:
                     return c
         raise GitHubError(f"comment not found: {url}")
+
+    def merge_pr(
+        self,
+        url: str,
+        method: str = "squash",
+        match_head_sha: str = "",
+        delete_branch: bool = False,
+    ) -> None:
+        """Mimic `gh pr merge --<method> --match-head-commit <sha>` on the fake."""
+        from autoforge.validation import parse_pr_url
+
+        canonical = parse_pr_url(url).canonical
+        self.calls.append(("merge_pr", canonical, method, match_head_sha, delete_branch))
+        self.merges.append((canonical, method, match_head_sha, delete_branch))
+        if self.merge_error:
+            raise GitHubError(self.merge_error)
+        pr = self.get_pr(canonical)
+        if not pr.is_open:
+            raise GitHubError(f"`gh pr merge` failed: PR is {pr.state}")
+        if match_head_sha and pr.head_sha != match_head_sha:
+            raise GitHubError("`gh pr merge` failed: head commit does not match")
+        if not self.merge_leaves_open:
+            pr.state = "MERGED"
+        elif self.merge_arms_auto:
+            pr.auto_merge_enabled = True
+
+    def disable_auto_merge(self, url: str) -> None:
+        """Mimic `gh pr merge <pr> --disable-auto`."""
+        from autoforge.validation import parse_pr_url
+
+        canonical = parse_pr_url(url).canonical
+        self.calls.append(("disable_auto_merge", canonical))
+        self.disabled_auto.append(canonical)
+        if self.disable_auto_error:
+            raise GitHubError(self.disable_auto_error)
+        self.get_pr(canonical).auto_merge_enabled = False
 
 
 def scripted_config():

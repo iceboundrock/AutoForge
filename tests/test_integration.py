@@ -153,3 +153,66 @@ def test_run_loops_until_ready_for_merge(tmp_state_dir):
     outcomes = eng.run(max_steps=50)
     assert [o.next_phase for o in outcomes] == ["ANALYZE_EXECUTE", "REVIEW", "READY_FOR_MERGE"]
     assert eng.state.phase == Phase.READY_FOR_MERGE
+
+
+def test_gate_open_loop_merges_via_controller_then_update_epic_to_done(tmp_state_dir):
+    """READY_FOR_MERGE -> MERGE (controller merges) -> UPDATE_EPIC (agent) -> DONE.
+
+    No agent is invoked for MERGE; the fake records the exact `gh pr merge`
+    binding and flips the PR to MERGED, which the controller re-reads before
+    counting the merge.
+    """
+    gh = FakeGitHub()
+    phases_seen = []
+
+    def agent(req):
+        phases_seen.append(req.phase)
+        if req.phase == "ANALYZE_EXECUTE":
+            gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2])
+            return block(
+                {
+                    "phase": "ANALYZE_EXECUTE",
+                    "status": "success",
+                    "issue_url": ISSUE,
+                    "pr_url": PR,
+                    "head_sha": SHA_A,
+                    "branch": BRANCH,
+                }
+            )
+        if req.phase == "REVIEW":
+            gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
+            return block(
+                {
+                    "phase": "REVIEW",
+                    "status": "success",
+                    "round": 1,
+                    "reviewed_head_sha": SHA_A,
+                    "review_comment_url": comment_url(PR, 100),
+                    "needs_fix_round": False,
+                    "findings": [],
+                }
+            )
+        if req.phase == "UPDATE_EPIC":
+            assert "Never merge a pull request" in req.prompt
+            assert "gh pr merge" not in req.prompt.replace("no `gh pr merge`", "")
+            return block({"phase": "UPDATE_EPIC", "status": "success", "next_issue_url": None})
+        raise AssertionError(f"unexpected call {req.phase}")
+
+    eng = make_engine(tmp_state_dir, agent, github=gh)
+    eng.config.safety.allow_merge = True
+    eng._save()
+    outcomes = eng.run(max_steps=50, allow_merge=True)
+    assert [o.next_phase for o in outcomes] == ["ANALYZE_EXECUTE", "REVIEW", "READY_FOR_MERGE"]
+    assert gh.merges == []  # run() holds at READY_FOR_MERGE even with the gate open
+
+    for expected in ("MERGE", "UPDATE_EPIC", "DONE"):
+        out = eng.step(allow_merge=True)
+        assert out.next_phase == expected, out.message
+        assert load_state(eng.paths.state_file).phase.value == expected
+
+    assert gh.merges == [(PR, "squash", SHA_A, False)]
+    assert gh.prs[PR].state == "MERGED"
+    assert phases_seen == ["ANALYZE_EXECUTE", "REVIEW", "UPDATE_EPIC"]  # no MERGE agent call
+    s = load_state(eng.paths.state_file)
+    assert s.counted_merged_prs == [PR] and s.merged_since_epic_update == 0  # reset by UPDATE_EPIC
+    assert s.phase == Phase.DONE
