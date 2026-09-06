@@ -37,6 +37,21 @@ from .state import (
 from .transitions import TERMINAL_PHASES, Phase
 
 
+def _positive_int(text: str) -> int:
+    """argparse type for ``--max-steps``: an integer >= 1.
+
+    Rejecting the value at parse time keeps ``run --max-steps 0`` from
+    writing a fresh state file and then crashing in ``engine.run()``.
+    """
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1, got {value}")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="autoforge",
@@ -67,11 +82,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "discard an existing non-terminal run; an unreadable state entry (bad JSON, "
-            "foreign protocol, invalid UTF-8, dangling symlink) is moved aside as "
-            "state.json.corrupt-<timestamp> instead of being deleted"
+            "foreign protocol, invalid UTF-8, dangling symlink, FIFO/socket/device) is "
+            "moved aside as state.json.corrupt-<timestamp> instead of being deleted "
+            "(a directory is refused and must be moved by hand)"
         ),
     )
-    r.add_argument("--max-steps", type=int, default=50)
+    r.add_argument(
+        "--max-steps", type=_positive_int, default=50, help="steps for this invocation (>= 1)"
+    )
     r.add_argument(
         "--allow-merge",
         action="store_true",
@@ -88,7 +106,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     re_ = sub.add_parser("resume", help="continue a persisted run")
     re_.add_argument("--dry-run", action="store_true")
-    re_.add_argument("--max-steps", type=int, default=50)
+    re_.add_argument(
+        "--max-steps", type=_positive_int, default=50, help="steps for this invocation (>= 1)"
+    )
     re_.add_argument("--allow-merge", action="store_true")
     re_.add_argument("--full-prompt", action="store_true")
 

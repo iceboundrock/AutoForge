@@ -934,3 +934,143 @@ def test_step_and_resume_dry_run_take_no_lock(tmp_path, capsys, monkeypatch, fak
     assert "analyze_execute.md" in capsys.readouterr().out
     assert fakes["provider"].calls == []
     assert load_state(sd / "state.json").step_count == 0
+
+
+# -- non-regular state entries (R6-F2) -----------------------------------------
+def _run_with_timeout(fn, seconds: float = 10.0):
+    """Run a CLI call in a daemon thread; fail instead of hanging on a FIFO."""
+    import threading
+
+    box: dict = {}
+
+    def target():
+        try:
+            box["value"] = fn()
+        except BaseException as exc:  # noqa: BLE001 - re-raised in the test thread
+            box["error"] = exc
+
+    t = threading.Thread(target=target, daemon=True)
+    t.start()
+    t.join(seconds)
+    assert not t.is_alive(), f"CLI call blocked for more than {seconds}s"
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
+
+
+def test_run_refuses_fifo_state_entry_without_force_and_does_not_hang(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """R6-F2: a FIFO state.json with no writer: exit 2 promptly, entry untouched."""
+    import stat
+
+    monkeypatch.chdir(tmp_path)
+    sd = tmp_path / ".autoforge"
+    sd.mkdir()
+    os.mkfifo(sd / "state.json")
+    rc = _run_with_timeout(
+        lambda: cli.main(
+            ["--state-dir", str(sd), "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"]
+        )
+    )
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "a fifo, not a regular file" in err.lower() and "--force" in err
+    assert stat.S_ISFIFO(os.lstat(sd / "state.json").st_mode)
+    assert sorted(p.name for p in sd.iterdir()) == ["controller.lock", "state.json"]
+
+
+def test_run_force_moves_fifo_state_entry_aside(tmp_path, capsys, monkeypatch, fakes):
+    """R6-F2: run --force archives the FIFO entry itself (never opened) and starts a run."""
+    import stat
+
+    monkeypatch.chdir(tmp_path)
+    sd = tmp_path / ".autoforge"
+    sd.mkdir()
+    os.mkfifo(sd / "state.json")
+    rc = _run_with_timeout(
+        lambda: cli.main(
+            [
+                "--state-dir",
+                str(sd),
+                "run",
+                "--epic",
+                EPIC,
+                "--issue",
+                ISSUE,
+                "--max-steps",
+                "1",
+                "--force",
+            ]
+        )
+    )
+    assert rc == 0
+    err = capsys.readouterr().err
+    quarantined = [p for p in sd.iterdir() if p.name.startswith("state.json.corrupt-")]
+    assert len(quarantined) == 1
+    assert stat.S_ISFIFO(os.lstat(quarantined[0]).st_mode)
+    assert str(quarantined[0]) in err
+    assert stat.S_ISREG(os.lstat(sd / "state.json").st_mode)
+    assert cli.main(["--state-dir", str(sd), "status", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["phase"] == "ANALYZE_EXECUTE"
+
+
+def test_run_force_refuses_directory_state_entry_and_writes_nothing(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """A directory cannot be archived: even --force fails closed, nothing is written."""
+    monkeypatch.chdir(tmp_path)
+    sd = tmp_path / ".autoforge"
+    sd.mkdir()
+    (sd / "state.json").mkdir()
+    (sd / "state.json" / "keep").write_text("x", encoding="utf-8")
+    argv = ["--state-dir", str(sd), "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"]
+    assert cli.main(argv) == 2
+    err = capsys.readouterr().err
+    assert "a directory, not a regular file" in err and "by hand" in err
+    assert cli.main([*argv, "--force"]) == 2
+    err = capsys.readouterr().err
+    assert "it is a directory" in err and "by hand" in err
+    assert (sd / "state.json").is_dir()
+    assert (sd / "state.json" / "keep").read_text(encoding="utf-8") == "x"
+    assert sorted(p.name for p in sd.iterdir()) == ["controller.lock", "state.json"]
+    assert fakes["provider"].calls == []
+
+
+# -- --max-steps validation (R6-F3) --------------------------------------------
+@pytest.mark.parametrize("value", ["0", "-1", "abc"])
+def test_run_rejects_non_positive_max_steps_before_writing_state(
+    tmp_path, capsys, monkeypatch, fakes, value
+):
+    """R6-F3: 'run --max-steps 0' is a usage error (exit 2), no traceback, no state file."""
+    monkeypatch.chdir(tmp_path)
+    sd = tmp_path / ".autoforge"
+    with pytest.raises(SystemExit) as info:
+        cli.main(
+            ["--state-dir", str(sd), "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", value]
+        )
+    assert info.value.code == 2
+    err = capsys.readouterr().err
+    assert "--max-steps" in err and "Traceback" not in err
+    assert not sd.exists()
+    assert fakes["provider"].calls == []
+
+
+@pytest.mark.parametrize("command", ["run", "resume"])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_max_steps_zero_is_rejected_for_run_and_resume_including_dry_run(
+    tmp_path, capsys, monkeypatch, fakes, command, dry_run
+):
+    monkeypatch.chdir(tmp_path)
+    sd = tmp_path / ".autoforge"
+    argv = ["--state-dir", str(sd), command]
+    if command == "run":
+        argv += ["--epic", EPIC, "--issue", ISSUE]
+    argv += ["--max-steps", "0"]
+    if dry_run:
+        argv.append("--dry-run")
+    with pytest.raises(SystemExit) as info:
+        cli.main(argv)
+    assert info.value.code == 2
+    assert "must be >= 1" in capsys.readouterr().err
+    assert not sd.exists()

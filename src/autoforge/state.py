@@ -6,12 +6,16 @@ Lock file:   ``<state_dir>/controller.lock``
 
 Saves are atomic (temp file in the same directory + fsync + os.replace) so
 a crash mid-write never leaves a half-written JSON file.  A corrupted state
-file (unparseable, wrong protocol, invalid UTF-8, or a dangling symlink)
-raises StateError with a meaningful message and is never silently overwritten
-with a fresh state: ``run`` refuses (exit 2) unless ``--force`` is given, and
+file (unparseable, wrong protocol, invalid UTF-8, a dangling symlink, or a
+non-regular entry such as a FIFO, socket, device or directory) raises
+StateError with a meaningful message and is never silently overwritten with
+a fresh state: ``run`` refuses (exit 2) unless ``--force`` is given, and
 even then the unreadable entry is moved aside as
 ``state.json.corrupt-<timestamp>`` by :func:`quarantine_state_file` rather
-than deleted.  ``run`` inspects, decides, quarantines, writes the first
+than deleted (a directory entry cannot be archived automatically and stays
+put with an error).  The entry is inspected with ``lstat``/``fstat`` and
+opened non-blocking before it is read, so a FIFO without a writer fails
+loudly instead of hanging the command.  ``run`` inspects, decides, quarantines, writes the first
 state and executes it under one continuous controller lock (``step`` and
 ``resume`` load and execute under it likewise), so the verdict on an
 existing entry is never taken from a view another controller may have
@@ -23,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import tempfile
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -241,6 +246,66 @@ def save_state(state: AutoForgeState, path: str | Path) -> None:
         raise
 
 
+def _entry_kind(mode: int) -> str | None:
+    """Human name of a non-regular entry kind, or None for a regular file."""
+    if stat.S_ISREG(mode):
+        return None
+    if stat.S_ISDIR(mode):
+        return "directory"
+    if stat.S_ISFIFO(mode):
+        return "FIFO"
+    if stat.S_ISSOCK(mode):
+        return "socket"
+    if stat.S_ISCHR(mode):
+        return "character device"
+    if stat.S_ISBLK(mode):
+        return "block device"
+    return "special file"
+
+
+def _not_regular(p: Path, kind: str, is_link: bool) -> StateError:
+    what = f"symbolic link to a {kind}" if is_link else f"a {kind}, not a regular file"
+    # A directory cannot be archived by quarantine_state_file (no hard links
+    # to directories), so 'run --force' is no way out of it.
+    hint = (
+        "move it out of the way by hand"
+        if kind == "directory" and not is_link
+        else ("move it aside or use 'run --force'")
+    )
+    return StateError(f"corrupted state file {p}: {what}; refusing to overwrite — {hint}")
+
+
+def _read_regular_file(p: Path) -> bytes:
+    """Read ``p`` only if it is a regular file (or a symlink to one).
+
+    A FIFO, socket, device or directory is refused before it is opened: a
+    plain ``open()`` on a FIFO without a writer blocks forever, so ``run``
+    could never reach the fail-loud / quarantine path.  The check is
+    repeated on the open descriptor (``O_NONBLOCK`` keeps a FIFO open from
+    blocking), so an entry swapped between the two inspections is still
+    caught.  Raises StateError for a non-regular entry, OSError otherwise.
+    """
+    st = os.lstat(p)
+    is_link = stat.S_ISLNK(st.st_mode)
+    if is_link:
+        st = os.stat(p)  # follows the link; dangling links were rejected earlier
+    kind = _entry_kind(st.st_mode)
+    if kind is not None:
+        raise _not_regular(p, kind, is_link)
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOCTTY", 0)
+    fd = os.open(p, flags)
+    try:
+        kind = _entry_kind(os.fstat(fd).st_mode)
+        if kind is not None:
+            raise _not_regular(p, kind, is_link)
+        with os.fdopen(fd, "rb") as fh:
+            fd = -1
+            return fh.read()
+    finally:
+        if fd != -1:
+            os.close(fd)
+
+
 def load_state(path: str | Path) -> AutoForgeState:
     """Load state; raises StateError (never silently re-inits) on problems."""
     p = Path(path)
@@ -258,9 +323,11 @@ def load_state(path: str | Path) -> AutoForgeState:
             "refusing to overwrite — restore from backup or re-run"
         )
     try:
-        raw = p.read_text(encoding="utf-8")
+        raw_bytes = _read_regular_file(p)
     except OSError as exc:
         raise StateError(f"cannot read state file {p}: {exc}") from exc
+    try:
+        raw = raw_bytes.decode("utf-8")
     except UnicodeDecodeError as exc:
         # Invalid UTF-8 is a corrupt file, not a read failure: it must take
         # the same fail-loud / quarantine path as unparseable JSON.
@@ -293,10 +360,22 @@ def quarantine_state_file(path: str | Path) -> Path:
     created between the existence check and the move).  On a collision the
     next numeric suffix is tried.  The directory entry itself is moved: a
     symbolic link (dangling or not) is archived as a link and the file it
-    points to is never followed, modified or removed.  Raises StateError
-    when the move fails; the original entry is left untouched in that case.
+    points to is never followed, modified or removed; a FIFO, socket or
+    device entry is archived as that entry without being opened.  A
+    directory cannot be hard-linked and is refused: it stays untouched and
+    must be moved aside by hand.  Raises StateError when the move fails; the
+    original entry is left untouched in that case.
     """
     src = Path(path)
+    try:
+        src_mode = os.lstat(src).st_mode
+    except OSError as exc:
+        raise StateError(f"cannot move corrupted state file {src} aside: {exc}") from exc
+    if stat.S_ISDIR(src_mode):
+        raise StateError(
+            f"cannot move corrupted state file {src} aside: it is a directory; "
+            "move it out of the way by hand and re-run"
+        )
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     base = src.with_name(f"{src.name}{CORRUPT_SUFFIX}{stamp}")
     candidate = base

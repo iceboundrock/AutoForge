@@ -106,10 +106,13 @@ Key design points:
 - **Atomic persistence**: temp file + fsync + `os.replace`; corrupted state
   fails loudly and is never silently overwritten: `run`, `resume`, `step` and
   `status` all exit 2 on an unreadable or foreign-protocol `state.json`
-  (bad JSON, unknown phase, invalid UTF-8, dangling symlink), and
-  `run --force` moves the entry aside as `state.json.corrupt-<timestamp>`
+  (bad JSON, unknown phase, invalid UTF-8, dangling symlink, or a
+  non-regular entry such as a FIFO, socket, device or directory — the entry
+  is inspected and opened non-blocking, so a FIFO never hangs the command),
+  and `run --force` moves the entry aside as `state.json.corrupt-<timestamp>`
   instead of deleting it (a symlink is archived as a link; its target is
-  never touched). `run` inspects, decides, quarantines, writes the first
+  never touched; a directory cannot be archived and is refused).
+  `run` inspects, decides, quarantines, writes the first
   state **and executes it** under one continuous controller lock, so a
   concurrent controller can never be quarantined or overwritten on a stale
   verdict, nor slip in between the first save and the engine loop.
