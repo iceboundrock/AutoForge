@@ -138,3 +138,77 @@ def test_url_validation():
         parse_github_url("https://github.com/o/r/issues/abc")
     with pytest.raises(ConfigurationError, match="expected a GitHub pr"):
         parse_github_url("https://github.com/o/r/issues/1", expect="pr")
+
+
+# -- R1-F3: strict scalar coercion ------------------------------------------
+@pytest.mark.parametrize(
+    "body",
+    [
+        '{"version": 1, "safety": {"allow_merge": "false"}}',
+        '{"version": 1, "safety": {"allow_merge": 1}}',
+        '{"version": 1, "execution": {"allow_merge": "true"}}',
+    ],
+)
+def test_allow_merge_rejects_non_boolean(tmp_path, body):
+    """A quoted "false" must never open the merge gate via bool("false")."""
+    p = tmp_path / "cfg.json"
+    p.write_text(body, encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="allow_merge.*must be a boolean"):
+        load_config_file(p)
+
+
+@pytest.mark.parametrize(
+    "body, key",
+    [
+        (
+            '{"version": 1, "execution": {"default_timeout_seconds": "not-a-number"}}',
+            "execution.default_timeout_seconds",
+        ),
+        (
+            '{"version": 1, "execution": {"max_correction_attempts": 1.5}}',
+            "execution.max_correction_attempts",
+        ),
+        (
+            '{"version": 1, "execution": {"default_timeout_seconds": true}}',
+            "execution.default_timeout_seconds",
+        ),
+        ('{"version": 1, "github": {"timeout_seconds": "12"}}', "github.timeout_seconds"),
+        (
+            '{"version": 1, "profiles": {"fix": {"timeout_seconds": "60"}}}',
+            "profiles.fix.timeout_seconds",
+        ),
+        (
+            '{"version": 1, "profiles": {"custom": {"model": "m", "timeout_seconds": "60"}}}',
+            "profiles.custom.timeout_seconds",
+        ),
+    ],
+)
+def test_integer_fields_reject_non_integers(tmp_path, body, key):
+    p = tmp_path / "cfg.json"
+    p.write_text(body, encoding="utf-8")
+    with pytest.raises(ConfigurationError, match=f"{key}.*must be an integer"):
+        load_config_file(p)
+
+
+def test_quoted_false_in_yaml_subset_is_rejected(tmp_path):
+    """The built-in YAML subset parser keeps quoted scalars as strings."""
+    p = tmp_path / "cfg.yaml"
+    p.write_text('version: 1\nsafety:\n  allow_merge: "false"\n', encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="safety.allow_merge"):
+        load_config_file(p)
+
+
+def test_real_scalars_still_accepted(tmp_path):
+    p = tmp_path / "cfg.json"
+    p.write_text(
+        '{"version": 1, "safety": {"allow_merge": true}, '
+        '"execution": {"default_timeout_seconds": 42, "max_correction_attempts": 0}, '
+        '"github": {"timeout_seconds": 7}, "profiles": {"fix": {"timeout_seconds": 9}}}',
+        encoding="utf-8",
+    )
+    cfg = load_config_file(p)
+    assert cfg.safety.allow_merge is True
+    assert cfg.execution.default_timeout_seconds == 42
+    assert cfg.execution.max_correction_attempts == 0
+    assert cfg.github.timeout_seconds == 7
+    assert cfg.profile("fix").timeout_seconds == 9

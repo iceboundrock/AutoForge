@@ -3,7 +3,6 @@
 Legal transitions::
 
     INITIALIZING     -> ANALYZE_EXECUTE
-    INITIALIZING     -> REVIEW            (recovered an existing open PR)
     ANALYZE_EXECUTE  -> REVIEW
     REVIEW           -> FIX               (needs_fix_round=true)
     REVIEW           -> READY_FOR_MERGE   (needs_fix_round=false, HEAD unchanged)

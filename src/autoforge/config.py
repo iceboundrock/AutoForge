@@ -230,6 +230,20 @@ def _as_options(raw: object, source: str, name: str) -> dict[str, str]:
     return out
 
 
+def _as_bool(raw: object, source: str, key: str) -> bool:
+    """Accept only a real boolean — never coerce strings like "false" to True."""
+    if isinstance(raw, bool):
+        return raw
+    raise ConfigurationError(f"{source}: {key!r} must be a boolean (true/false), got {raw!r}")
+
+
+def _as_int(raw: object, source: str, key: str) -> int:
+    """Accept only a real integer (bool excluded); raise ConfigurationError otherwise."""
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        return raw
+    raise ConfigurationError(f"{source}: {key!r} must be an integer, got {raw!r}")
+
+
 def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeConfig:
     version = data.get("version", CONFIG_VERSION)
     if version != CONFIG_VERSION:
@@ -244,23 +258,29 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
     if not isinstance(exe, dict):
         raise ConfigurationError(f"{source}: 'execution' must be a mapping")
     if "default_timeout_seconds" in exe:
-        base.execution.default_timeout_seconds = int(exe["default_timeout_seconds"])
+        base.execution.default_timeout_seconds = _as_int(
+            exe["default_timeout_seconds"], source, "execution.default_timeout_seconds"
+        )
     if "max_correction_attempts" in exe:
-        base.execution.max_correction_attempts = int(exe["max_correction_attempts"])
+        base.execution.max_correction_attempts = _as_int(
+            exe["max_correction_attempts"], source, "execution.max_correction_attempts"
+        )
     if "allow_merge" in exe:
-        base.execution.allow_merge = bool(exe["allow_merge"])
+        base.execution.allow_merge = _as_bool(exe["allow_merge"], source, "execution.allow_merge")
     safety = data.get("safety", {}) or {}
     if not isinstance(safety, dict):
         raise ConfigurationError(f"{source}: 'safety' must be a mapping")
     if "allow_merge" in safety:
-        base.safety.allow_merge = bool(safety["allow_merge"])
+        base.safety.allow_merge = _as_bool(safety["allow_merge"], source, "safety.allow_merge")
     gh = data.get("github", {}) or {}
     if not isinstance(gh, dict):
         raise ConfigurationError(f"{source}: 'github' must be a mapping")
     if "command" in gh:
         base.github.command = str(gh["command"])
     if "timeout_seconds" in gh:
-        base.github.timeout_seconds = int(gh["timeout_seconds"])
+        base.github.timeout_seconds = _as_int(
+            gh["timeout_seconds"], source, "github.timeout_seconds"
+        )
     profiles = data.get("profiles", {}) or {}
     if not isinstance(profiles, dict):
         raise ConfigurationError(f"{source}: 'profiles' must be a mapping")
@@ -280,7 +300,9 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
             if "extra_args" in p:
                 cur.extra_args = [str(a) for a in (p["extra_args"] or [])]
             if "timeout_seconds" in p:
-                cur.timeout_seconds = int(p["timeout_seconds"])
+                cur.timeout_seconds = _as_int(
+                    p["timeout_seconds"], source, f"profiles.{name}.timeout_seconds"
+                )
             if "options" in p:
                 cur.options.update(_as_options(p["options"], source, name))
         else:
@@ -291,8 +313,10 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
                 effort=str(p.get("effort", "high")),
                 command=str(p.get("command", "")),
                 extra_args=[str(a) for a in (p.get("extra_args") or [])],
-                timeout_seconds=int(
-                    p.get("timeout_seconds", base.execution.default_timeout_seconds)
+                timeout_seconds=_as_int(
+                    p.get("timeout_seconds", base.execution.default_timeout_seconds),
+                    source,
+                    f"profiles.{name}.timeout_seconds",
                 ),
                 options=_as_options(p.get("options"), source, name),
             )
