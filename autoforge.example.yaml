@@ -43,7 +43,8 @@ merge:
   method: squash          # squash | merge | rebase
   delete_branch: false    # add --delete-branch
   # Inconclusive GitHub data (mergeable UNKNOWN, checks still running, the
-  # post-merge re-read failed) is re-checked on `resume` at most this many
+  # post-merge re-read failed) is re-checked on `resume --allow-merge` (or
+  # `step --allow-merge`), one attempt per invocation, at most this many
   # times per phase; then the run is BLOCKED instead of retrying forever.
   max_verification_attempts: 5
 

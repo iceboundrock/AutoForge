@@ -1176,6 +1176,55 @@ def test_inconclusive_verification_is_bounded_then_blocked(tmp_state_dir, fake_g
     assert fake_github.merges == [] and eng.state.counted_merged_prs == []
 
 
+def test_run_with_gate_open_executes_ready_for_merge_verification(tmp_state_dir, fake_github):
+    """run()/resume no longer treat READY_FOR_MERGE as a stop phase once the gate is open."""
+    fake_github.add_pr(head_sha=SHA_A)
+    eng = _in_ready(tmp_state_dir, fake_github)
+    assert eng.run(max_steps=1) == []  # flag missing: config alone keeps the hold
+    assert eng.state.phase == Phase.READY_FOR_MERGE and ("get_pr", PR) not in fake_github.calls
+    outcomes = eng.run(max_steps=1, allow_merge=True)
+    assert [o.next_phase for o in outcomes] == ["MERGE"]
+    assert fake_github.merges == []  # budget of one step: verification only, no write yet
+    assert load_state(eng.paths.state_file).phase == Phase.MERGE
+
+
+def test_run_with_gate_closed_in_config_holds_despite_flag(tmp_state_dir, fake_github):
+    fake_github.add_pr(head_sha=SHA_A)
+    eng = _in_ready(tmp_state_dir, fake_github)
+    eng.config.safety.allow_merge = False
+    assert eng.run(max_steps=5, allow_merge=True) == []
+    assert eng.state.phase == Phase.READY_FOR_MERGE and fake_github.calls == []
+
+
+def test_run_with_gate_open_bounds_inconclusive_ready_for_merge_rechecks(
+    tmp_state_dir, fake_github
+):
+    """Each resume --allow-merge consumes exactly one verification attempt, then BLOCKED."""
+    fake_github.add_pr(head_sha=SHA_A).mergeable = "UNKNOWN"
+    eng = _in_ready(tmp_state_dir, fake_github)
+    eng.config.merge.max_verification_attempts = 3
+    for n in (1, 2):
+        with pytest.raises(VerificationError, match=f"READY_FOR_MERGE.*attempt {n}/3"):
+            eng.run(max_steps=50, allow_merge=True)
+        assert eng.state.phase == Phase.READY_FOR_MERGE
+        assert load_state(eng.paths.state_file).attempt == n
+    outcomes = eng.run(max_steps=50, allow_merge=True)
+    assert [o.next_phase for o in outcomes] == ["BLOCKED"]
+    assert "inconclusive for 3 verification attempt(s)" in eng.state.block_reason
+    assert fake_github.merges == [] and eng.state.counted_merged_prs == []
+
+
+def test_run_with_gate_open_proceeds_once_checks_finish(tmp_state_dir, fake_github):
+    fake_github.add_pr(head_sha=SHA_A).checks = [CheckInfo(name="ci", state="IN_PROGRESS")]
+    eng = _in_ready(tmp_state_dir, fake_github)
+    with pytest.raises(VerificationError, match="still running: ci"):
+        eng.run(max_steps=50, allow_merge=True)
+    assert eng.state.phase == Phase.READY_FOR_MERGE and eng.state.attempt == 1
+    fake_github.prs[PR].checks = [CheckInfo(name="ci", state="COMPLETED", conclusion="SUCCESS")]
+    outcomes = eng.run(max_steps=1, allow_merge=True)
+    assert [o.next_phase for o in outcomes] == ["MERGE"] and eng.state.attempt == 0
+
+
 def test_inconclusive_bound_of_one_blocks_immediately(tmp_state_dir, fake_github):
     fake_github.add_pr(head_sha=SHA_A).checks = [CheckInfo(name="ci", state="QUEUED")]
     eng = _in_merge(tmp_state_dir, fake_github)

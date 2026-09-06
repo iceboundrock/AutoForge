@@ -45,8 +45,10 @@ class Phase(Enum):
 
 TERMINAL_PHASES = frozenset({Phase.DONE, Phase.BLOCKED, Phase.FAILED})
 
-# Phases at which ``run``/``resume`` stop looping. READY_FOR_MERGE is a safe
-# holding state in this milestone: automatic merge is disabled by default.
+# Phases at which ``run``/``resume`` stop looping while the merge gate is
+# closed. READY_FOR_MERGE is a safe holding state in this milestone: automatic
+# merge is disabled by default. With the gate open (config AND --allow-merge)
+# the loop only stops at TERMINAL_PHASES.
 STOP_PHASES = TERMINAL_PHASES | frozenset({Phase.READY_FOR_MERGE})
 
 # Phases whose step invokes an agent through a provider. MERGE is NOT one of

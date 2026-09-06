@@ -66,7 +66,10 @@ Key design points:
 
 - **Transition logic lives only in `transitions.py`** — never in CLI handlers.
 - **`step()` is the core primitive**; `run()`/`resume` just loop it until a
-  stop phase (`READY_FOR_MERGE`, `DONE`, `BLOCKED`, `FAILED`).
+  stop phase (`READY_FOR_MERGE`, `DONE`, `BLOCKED`, `FAILED`). With the merge
+  gate open (`safety.allow_merge: true` **and** `--allow-merge`)
+  `READY_FOR_MERGE` is no longer a stop phase: the loop continues through the
+  controller-side verification, `MERGE` and `UPDATE_EPIC`.
 - **Never trust the agent.** A `CONTROL_RESULT` is a *claim*. The controller
   re-reads GitHub through `gh` and raises `VerificationError` (phase
   unchanged) on any mismatch. Agent claims that cannot be verified never
@@ -96,8 +99,8 @@ Key design points:
 | `ANALYZE_EXECUTE` | Claude Code (`fable`, effort high) | existing open PR for the issue is recovered without re-running the agent; otherwise PR exists in this repo, is OPEN, HEAD SHA and branch match the claim |
 | `REVIEW` | OpenCode (round 1 `openai/gpt-5.6-luna` high, rounds 2–5 `openai/gpt-5.6-terra` high, 6+ `openai/gpt-5.6-sol` medium) | round number, reviewed SHA == bound HEAD, exactly one review comment on this PR with the `# AI Code Review — Round N` heading and the `ai-review-result` marker matching round/SHA/flag, findings invariant |
 | `FIX` | Claude Code (`fable`, effort high) | `previous_head_sha` == current HEAD, every open finding ID resolved (`fixed` / `follow_up_created` / `no_change_with_rationale`), follow-up issues exist in this repo and are OPEN, actual PR HEAD == `new_head_sha`, a `fixed` resolution moved HEAD |
-| `READY_FOR_MERGE` | nobody | holding state; `step` refuses to continue unless the merge gate is open. With the gate open it runs the full pre-merge verification below against GitHub *before* entering `MERGE`: closed / conflicting / failing / draft / queued PRs go to `BLOCKED` without ever reaching `MERGE`, HEAD drift -> `REVIEW`, an already-merged PR -> `MERGE` to reconcile |
-| `MERGE` (gated) | controller, never an agent | last review clean and PR HEAD == reviewed HEAD; GitHub says PR is OPEN, not draft, every check succeeded, `mergeable=MERGEABLE`, `mergeStateStatus` `CLEAN`/`HAS_HOOKS`, no auto-merge armed, base branch has no merge queue; then `gh pr merge --<method> --match-head-commit <reviewed HEAD>`; counted only once GitHub reports `MERGED` at that HEAD. Conclusive negatives -> `BLOCKED`; inconclusive data (checks running, mergeability unknown, post-merge re-read failed) stays in `MERGE` for `resume`, at most `merge.max_verification_attempts` times, then `BLOCKED`; HEAD drift -> `REVIEW` |
+| `READY_FOR_MERGE` | nobody | holding state; `step`/`resume` refuse to continue unless the merge gate is open (`resume` only re-prints the banner). With the gate open (`step --allow-merge` / `resume --allow-merge`) it runs the full pre-merge verification below against GitHub *before* entering `MERGE`: closed / conflicting / failing / draft / queued PRs go to `BLOCKED` without ever reaching `MERGE`, HEAD drift -> `REVIEW`, an already-merged PR -> `MERGE` to reconcile; inconclusive data (checks running, mergeability unknown) keeps the phase for `resume --allow-merge`, at most `merge.max_verification_attempts` times, then `BLOCKED` |
+| `MERGE` (gated) | controller, never an agent | last review clean and PR HEAD == reviewed HEAD; GitHub says PR is OPEN, not draft, every check succeeded, `mergeable=MERGEABLE`, `mergeStateStatus` `CLEAN`/`HAS_HOOKS`, no auto-merge armed, base branch has no merge queue; then `gh pr merge --<method> --match-head-commit <reviewed HEAD>`; counted only once GitHub reports `MERGED` at that HEAD. Conclusive negatives -> `BLOCKED`; inconclusive data (checks running, mergeability unknown, post-merge re-read failed) stays in `MERGE` for `resume --allow-merge`, at most `merge.max_verification_attempts` times, then `BLOCKED`; HEAD drift -> `REVIEW` |
 
 Recovery rules: if a step crashes after the agent created a PR, `resume`
 re-enters `ANALYZE_EXECUTE`, finds the open PR (linked issue or
@@ -152,11 +155,17 @@ uv run autoforge step              # exactly one phase step
 uv run autoforge step --dry-run    # preview the next step
 
 uv run autoforge resume            # continue until a stop phase / --max-steps
+
+# only with safety.allow_merge: true in config — the controller verifies on
+# GitHub and merges itself (agents never merge); re-run to re-check
+# inconclusive GitHub data (bounded by merge.max_verification_attempts)
+uv run autoforge resume --allow-merge
 ```
 
 When the loop reaches `READY_FOR_MERGE` the CLI prints a banner with the
 issue, PR, review round and reviewed HEAD, and states that automatic merge is
-disabled. A human merges the PR.
+disabled. A human merges the PR. `resume` without the gate open re-prints the
+banner and runs nothing.
 
 URLs must be HTTPS GitHub issue URLs, and EPIC + issue must be in the **same
 repository** as the current working directory (cross-repo runs are rejected).
@@ -206,7 +215,8 @@ State records `current_pr_url`, `current_branch`, `current_head_sha`,
   asynchronous merge the controller does not own). Conclusive negatives
   (closed PR, conflict, failing check, branch protection, queue) -> `BLOCKED`;
   inconclusive data (checks still running, `mergeable = UNKNOWN`) raises and
-  keeps the phase so `resume` re-checks, at most
+  keeps the phase so `resume --allow-merge` (or `step --allow-merge`)
+  re-checks, one attempt per invocation, at most
   `merge.max_verification_attempts` times (default 5), then `BLOCKED`.
   HEAD drift -> `REVIEW`.
 - **Post-merge is reconciled from GitHub.** The merge is counted only after
@@ -214,7 +224,7 @@ State records `current_pr_url`, `current_branch`, `current_head_sha`,
   If `gh pr merge` returns but the PR is still open, the run is `BLOCKED` and
   any auto-merge that call armed is disabled again (`gh pr merge
   --disable-auto`). If the post-merge re-read fails, the outcome is treated as
-  unknown: the run stays in `MERGE` and `resume` re-inspects GitHub (an
+  unknown: the run stays in `MERGE` and `resume --allow-merge` re-inspects GitHub (an
   already-merged PR is recovered and counted once; an open one is re-verified),
   bounded by the same `merge.max_verification_attempts`, then `BLOCKED`.
 - Logs and CLI output pass through baseline secret redaction (`GITHUB_TOKEN`,

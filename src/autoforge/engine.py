@@ -441,9 +441,17 @@ class ControllerEngine:
         dry_run: bool = False,
         allow_merge: bool = False,
     ) -> list[StepOutcome]:
-        """Loop ``step()`` until a STOP phase or ``max_steps``."""
+        """Loop ``step()`` until a stop phase or ``max_steps``.
+
+        READY_FOR_MERGE is a stop phase only while the merge gate is closed.
+        With the gate open (config AND ``allow_merge``) the loop continues
+        through the controller-side pre-merge verification, MERGE and
+        UPDATE_EPIC, so ``resume --allow-merge`` re-checks inconclusive
+        GitHub data (bounded by ``merge.max_verification_attempts``).
+        """
         if max_steps < 1:
             raise ValueError("max_steps must be >= 1")
+        stop_phases = TERMINAL_PHASES if self.merge_gate_open(allow_merge) else STOP_PHASES
         if dry_run:
             outcomes = [self._step_once(dry_run=True, allow_merge=allow_merge)]
             assert self.state is not None
@@ -459,7 +467,7 @@ class ControllerEngine:
         with ControllerLock(self.paths.lock_file):
             for _ in range(max_steps):
                 assert self.state is not None
-                if self.state.phase in STOP_PHASES:
+                if self.state.phase in stop_phases:
                     break
                 all_outcomes.append(self._step_once(dry_run=False, allow_merge=allow_merge))
         return all_outcomes
@@ -663,8 +671,12 @@ class ControllerEngine:
             ),
         )
 
+    def merge_gate_open(self, allow_merge: bool) -> bool:
+        """The merge safety gate: config ``safety.allow_merge`` AND the CLI flag."""
+        return bool(self.config.merge_allowed_by_config and allow_merge)
+
     def _check_merge_gate(self, allow_merge: bool) -> None:
-        if not (self.config.merge_allowed_by_config and allow_merge):
+        if not self.merge_gate_open(allow_merge):
             raise VerificationError(MERGE_GATE_MESSAGE)
 
     def _block(self, previous: Phase, plan: StepPlan | None, reason: str) -> StepOutcome:
