@@ -33,21 +33,42 @@ from .validation import (
 
 # Transient `gh` failures: the same read may well succeed later, so the engine
 # treats them as *inconclusive* (bounded re-checks) instead of conclusive.
-# Phrase markers cover network-level errors and the reason phrases GitHub
-# attaches to server-side / throttling statuses; the HTTP status itself is
-# matched as a whole class (every 5xx, plus 429) rather than an enumerated
-# list, so e.g. ``HTTP 500`` is not silently conclusive. `gh` prints the
-# status as ``HTTP 502: Bad Gateway`` (GraphQL) or ``gh: Bad Gateway (HTTP
-# 502)`` (REST); both shapes are matched, bare numbers elsewhere in the
-# message (PR numbers, SHAs) are not.
+# Phrase markers cover network-level errors (as the Go runtime behind `gh`
+# reports them: ``dial tcp ...: connect: network is unreachable``, ``lookup
+# api.github.com: temporary failure in name resolution``, ...) and the reason
+# phrases GitHub attaches to server-side / throttling statuses; the HTTP
+# status itself is matched as a whole class (every 5xx, plus 429) rather than
+# an enumerated list, so e.g. ``HTTP 500`` is not silently conclusive. `gh`
+# prints the status as ``HTTP 502: Bad Gateway`` (GraphQL) or ``gh: Bad
+# Gateway (HTTP 502)`` (REST); both shapes are matched, bare numbers elsewhere
+# in the message (PR numbers, SHAs) are not.
 _TRANSIENT_MARKERS = (
+    # -- connection / socket level (OS errno strings as surfaced by Go's net package)
     "timeout",
     "timed out",
     "connection reset",
     "connection refused",
+    "connection aborted",
+    "broken pipe",
+    "unexpected eof",
+    "network is unreachable",
+    "network is down",
+    "no route to host",
+    "host is down",
+    # Every `dial tcp ...` error is a failure to *open* the connection, never an
+    # answer from GitHub, so the whole family is transient even when the
+    # trailing errno phrase is one not listed here.
+    "dial tcp",
     "temporarily unavailable",
     "tls handshake",
+    # -- name resolution (Go resolver / glibc phrases)
     "no such host",
+    "temporary failure in name resolution",
+    "server misbehaving",
+    # `gh` wraps any connection-level error (whatever host is configured) as
+    # ``error connecting to <host>\ncheck your internet connection or ...``.
+    "error connecting to",
+    # -- GitHub-side throttling / server errors
     "rate limit",
     "too many requests",
     "internal server error",

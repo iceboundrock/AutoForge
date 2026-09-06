@@ -183,6 +183,22 @@ def test_transient_error_retried_once():
         "API rate limit exceeded for user",
         "HTTP 429: Too Many Requests",
         "gh: Too Many Requests (HTTP 429)",
+        # R5-F1: OS / DNS connectivity failures as Go's net package (behind `gh`) reports them
+        'Post "https://api.github.com/graphql": dial tcp 140.82.112.6:443: connect: '
+        "network is unreachable",
+        'Post "https://api.github.com/graphql": dial tcp: lookup api.github.com: '
+        "Temporary failure in name resolution",
+        "error connecting to api.github.com\ncheck your internet connection or "
+        "https://githubstatus.com\ndial tcp: lookup api.github.com on 127.0.0.53:53: "
+        "server misbehaving",
+        "dial tcp 140.82.112.6:443: connect: no route to host",
+        "dial tcp 140.82.112.6:443: connect: network is down",
+        "dial tcp 140.82.112.6:443: i/o timeout",
+        "read tcp 10.0.0.2:51234->140.82.112.6:443: read: connection aborted",
+        "write tcp 10.0.0.2:51234->140.82.112.6:443: write: broken pipe",
+        'Post "https://api.github.com/graphql": unexpected EOF',
+        "dial tcp 140.82.112.6:443: connect: host is down",
+        "lookup api.github.com: no such host",
     ],
 )
 def test_transient_failure_raises_github_unavailable_error(stderr):
@@ -220,6 +236,10 @@ def test_timeout_raises_github_unavailable_error():
         # Bare numbers that merely *look* like a status are not a transient status.
         "GraphQL: Could not resolve to a PullRequest with the number of 5021.",
         "HTTP 422: No commit found for SHA: 503f4e1 (https://api.github.com/graphql)",
+        # Not connectivity: gh reached GitHub (or never tried) and the answer is final.
+        "To get started with GitHub CLI, please run:  gh auth login",
+        "x509: certificate signed by unknown authority",
+        "GraphQL: Resource protected by organization SAML enforcement.",
     ],
 )
 def test_conclusive_failure_is_plain_github_error(stderr):

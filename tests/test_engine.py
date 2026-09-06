@@ -1,6 +1,7 @@
 """Engine: verification of agent claims, SHA binding, routing, recovery, gate."""
 
 import json
+import re
 
 import pytest
 
@@ -1374,8 +1375,35 @@ _READ_FAILURES = [
 ]
 
 
-def test_http_500_from_gh_is_retried_then_bounded_verification(tmp_state_dir):
-    """R4-F1: an HTTP 500 is a transient GitHub failure end to end, not a conclusive BLOCKED.
+# Real `gh` stderr shapes that must be *transient* end to end (R4-F1: server-side
+# status class; R5-F1: OS / DNS connectivity failures as Go's net package reports them).
+_TRANSIENT_GH_STDERR = [
+    pytest.param(
+        "HTTP 500: Internal Server Error (https://api.github.com/graphql)",
+        "HTTP 500",
+        id="http-500",
+    ),
+    pytest.param(
+        'Post "https://api.github.com/graphql": dial tcp 140.82.112.6:443: connect: '
+        "network is unreachable",
+        "network is unreachable",
+        id="network-unreachable",
+    ),
+    pytest.param(
+        'Post "https://api.github.com/graphql": dial tcp: lookup api.github.com: '
+        "Temporary failure in name resolution",
+        "Temporary failure in name resolution",
+        id="dns-temporary-failure",
+    ),
+]
+
+
+@pytest.mark.parametrize("phase", [Phase.READY_FOR_MERGE, Phase.MERGE])
+@pytest.mark.parametrize(("stderr", "marker"), _TRANSIENT_GH_STDERR)
+def test_transient_gh_stderr_is_retried_then_bounded_verification(
+    tmp_state_dir, phase, stderr, marker
+):
+    """R4-F1 / R5-F1: transient `gh` failures never become a conclusive BLOCKED.
 
     Drives the real GitHubClient (scripted `gh` runner, no network) through the
     engine: the failed read is retried by the client, then classified as
@@ -1391,18 +1419,20 @@ def test_http_500_from_gh_is_retried_then_bounded_verification(tmp_state_dir):
             cwd=None,
             exit_code=1,
             stdout="",
-            stderr="HTTP 500: Internal Server Error (https://api.github.com/graphql)",
+            stderr=stderr,
             started_at="",
             finished_at="",
         )
 
     gh = GitHubClient(runner=gh_runner, retry_delay_seconds=0, transient_retries=1)
-    eng = _in_merge(tmp_state_dir, gh, phase=Phase.READY_FOR_MERGE)  # type: ignore[arg-type]
+    eng = _in_merge(tmp_state_dir, gh, phase=phase)  # type: ignore[arg-type]
     eng.config.merge.max_verification_attempts = 3
     for n in (1, 2):
-        with pytest.raises(VerificationError, match=f"could not be read.*HTTP 500.*attempt {n}/3"):
+        with pytest.raises(
+            VerificationError, match=f"could not be read.*{re.escape(marker)}.*attempt {n}/3"
+        ):
             eng.step(allow_merge=True)
-        assert load_state(eng.paths.state_file).phase == Phase.READY_FOR_MERGE
+        assert load_state(eng.paths.state_file).phase == phase
         assert load_state(eng.paths.state_file).attempt == n
         # transient_retries=1 -> the client retried the read once per verification attempt
         assert len(calls) == 2 * n
@@ -1411,6 +1441,7 @@ def test_http_500_from_gh_is_retried_then_bounded_verification(tmp_state_dir):
     assert out.next_phase == "BLOCKED"
     assert "inconclusive for 3 verification attempt(s)" in eng.state.block_reason
     assert "not a transient GitHub failure" not in eng.state.block_reason
+    assert load_state(eng.paths.state_file).phase == Phase.BLOCKED
     assert not any("merge" in cmd for cmd in calls)  # gh pr merge was never run
 
 
