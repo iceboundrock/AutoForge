@@ -595,11 +595,11 @@ def test_dry_run_review_shows_round_and_model(tmp_state_dir):
 
 
 # -- MERGE: controller-owned, gated (issue #8) -----------------------------------------------------
-def _in_merge(tmp_state_dir, gh, script=None, reviewed=SHA_A, clean=True):
+def _in_merge(tmp_state_dir, gh, script=None, reviewed=SHA_A, clean=True, phase=Phase.MERGE):
     """Engine parked in MERGE with the gate open and a clean review bound to ``reviewed``."""
     eng = make_engine(tmp_state_dir, script or [], github=gh)
     eng.config.safety.allow_merge = True
-    eng.state.phase = Phase.MERGE
+    eng.state.phase = phase
     eng.state.current_pr_url = PR
     eng.state.current_head_sha = reviewed
     eng.state.reviewed_head_sha = reviewed
@@ -762,12 +762,11 @@ def test_merge_dry_run_plan_has_no_agent_and_no_side_effects(tmp_state_dir, fake
 
 def test_ready_for_merge_head_moved_goes_back_to_review(tmp_state_dir, fake_github):
     fake_github.add_pr(head_sha=SHA_B)
-    eng = make_engine(tmp_state_dir, [], github=fake_github)
-    eng.config.safety.allow_merge = True
-    eng.state.phase = Phase.READY_FOR_MERGE
-    eng.state.current_pr_url = PR
-    eng.state.reviewed_head_sha = SHA_A
-    assert eng.step(allow_merge=True).next_phase == "REVIEW"
+    eng = _in_ready(tmp_state_dir, fake_github, reviewed=SHA_A)
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "REVIEW" and "not merged" in out.message
+    assert eng.state.last_review_result == "stale" and eng.state.current_head_sha == SHA_B
+    assert fake_github.merges == []
 
 
 def test_step_terminal_done_reports_cleanly(tmp_state_dir, fake_github):
@@ -1038,3 +1037,185 @@ def test_merge_failed_and_read_failed_stays_in_merge(tmp_state_dir, fake_github)
     fake_github.merge_pr = orig_merge
     out = eng.step(allow_merge=True)
     assert out.next_phase == "UPDATE_EPIC" and eng.state.counted_merged_prs == [PR]
+
+
+# -- READY_FOR_MERGE / MERGE: controller-side GitHub verification (issue #3) -----------------
+def _in_ready(tmp_state_dir, gh, reviewed=SHA_A, clean=True):
+    """Engine parked in READY_FOR_MERGE with the gate open and a clean review on ``reviewed``."""
+    return _in_merge(tmp_state_dir, gh, reviewed=reviewed, clean=clean, phase=Phase.READY_FOR_MERGE)
+
+
+def test_ready_for_merge_verifies_on_github_before_entering_merge(tmp_state_dir, fake_github):
+    fake_github.add_pr(head_sha=SHA_A)
+    eng = _in_ready(tmp_state_dir, fake_github)
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "MERGE" and "GitHub confirms" in out.message
+    assert ("get_pr", PR) in fake_github.calls
+    assert ("get_pr_merge_queue_status", PR) in fake_github.calls
+    assert fake_github.merges == []  # READY_FOR_MERGE never writes
+    assert load_state(eng.paths.state_file).phase == Phase.MERGE
+
+
+def test_ready_for_merge_gate_closed_reads_nothing(tmp_state_dir, fake_github):
+    fake_github.add_pr(head_sha=SHA_A)
+    eng = _in_ready(tmp_state_dir, fake_github)
+    before = list(fake_github.calls)
+    with pytest.raises(VerificationError, match="merge is disabled"):
+        eng.step(allow_merge=False)
+    assert fake_github.calls == before and eng.state.phase == Phase.READY_FOR_MERGE
+
+
+def test_ready_for_merge_requires_clean_review_in_state(tmp_state_dir, fake_github):
+    fake_github.add_pr(head_sha=SHA_A)
+    eng = _in_ready(tmp_state_dir, fake_github, clean=False)
+    with pytest.raises(VerificationError, match="clean review"):
+        eng.step(allow_merge=True)
+    assert eng.state.phase == Phase.READY_FOR_MERGE
+
+
+def test_ready_for_merge_closed_pr_blocks(tmp_state_dir, fake_github):
+    fake_github.add_pr(head_sha=SHA_A, state="CLOSED")
+    eng = _in_ready(tmp_state_dir, fake_github)
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "BLOCKED" and "CLOSED" in eng.state.block_reason
+    assert fake_github.merges == []
+
+
+def test_ready_for_merge_already_merged_pr_routes_to_merge_for_reconciliation(
+    tmp_state_dir, fake_github
+):
+    """Someone merged the PR while the run was holding: MERGE reconciles and counts once."""
+    fake_github.add_pr(head_sha=SHA_A, state="MERGED")
+    eng = _in_ready(tmp_state_dir, fake_github)
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "MERGE" and "already MERGED" in out.message
+    assert eng.state.counted_merged_prs == []  # counting belongs to MERGE
+    out2 = eng.step(allow_merge=True)
+    assert out2.next_phase == "UPDATE_EPIC" and "recovered" in out2.message
+    assert fake_github.merges == [] and eng.state.counted_merged_prs == [PR]
+
+
+def test_ready_for_merge_conflicting_pr_blocks_and_never_enters_merge(tmp_state_dir, fake_github):
+    pr = fake_github.add_pr(head_sha=SHA_A)
+    pr.mergeable = "CONFLICTING"
+    pr.checks = [CheckInfo(name="ci", state="COMPLETED", conclusion="FAILURE")]
+    eng = _in_ready(tmp_state_dir, fake_github)
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "BLOCKED"
+    assert "ci" in eng.state.block_reason  # checks are reported first
+    assert fake_github.merges == [] and eng.state.counted_merged_prs == []
+    assert load_state(eng.paths.state_file).phase == Phase.BLOCKED
+
+
+@pytest.mark.parametrize(
+    "mutate, needle",
+    [
+        (lambda pr: setattr(pr, "mergeable", "CONFLICTING"), "CONFLICTING"),
+        (lambda pr: setattr(pr, "is_draft", True), "draft"),
+        (lambda pr: setattr(pr, "merge_state_status", "BLOCKED"), "mergeStateStatus=BLOCKED"),
+        (lambda pr: setattr(pr, "auto_merge_enabled", True), "auto-merge armed"),
+        (
+            lambda pr: setattr(
+                pr, "checks", [CheckInfo(name="ci", state="COMPLETED", conclusion="FAILURE")]
+            ),
+            "failing or inconclusive checks: ci",
+        ),
+    ],
+)
+def test_ready_for_merge_conclusive_negatives_block(tmp_state_dir, fake_github, mutate, needle):
+    mutate(fake_github.add_pr(head_sha=SHA_A))
+    eng = _in_ready(tmp_state_dir, fake_github)
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "BLOCKED" and needle in eng.state.block_reason
+    assert fake_github.merges == []
+
+
+def test_ready_for_merge_merge_queue_blocks(tmp_state_dir, fake_github):
+    fake_github.add_pr(head_sha=SHA_A)
+    fake_github.merge_queue[PR] = MergeQueueStatus(enabled=True, in_queue=False)
+    eng = _in_ready(tmp_state_dir, fake_github)
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "BLOCKED" and "merge queue" in eng.state.block_reason
+
+
+def test_ready_for_merge_pending_checks_hold_then_proceed(tmp_state_dir, fake_github):
+    fake_github.add_pr(head_sha=SHA_A).checks = [CheckInfo(name="ci", state="IN_PROGRESS")]
+    eng = _in_ready(tmp_state_dir, fake_github)
+    with pytest.raises(VerificationError, match="still running: ci.*READY_FOR_MERGE"):
+        eng.step(allow_merge=True)
+    assert eng.state.phase == Phase.READY_FOR_MERGE and eng.state.attempt == 1
+    assert load_state(eng.paths.state_file).attempt == 1  # persisted across resume
+    fake_github.prs[PR].checks = [CheckInfo(name="ci", state="COMPLETED", conclusion="SUCCESS")]
+    assert eng.step(allow_merge=True).next_phase == "MERGE"
+    assert eng.state.attempt == 0  # reset on transition
+
+
+def test_ready_for_merge_unknown_mergeability_holds(tmp_state_dir, fake_github):
+    fake_github.add_pr(head_sha=SHA_A).mergeable = "UNKNOWN"
+    eng = _in_ready(tmp_state_dir, fake_github)
+    with pytest.raises(VerificationError, match="not determined mergeability"):
+        eng.step(allow_merge=True)
+    assert eng.state.phase == Phase.READY_FOR_MERGE and fake_github.merges == []
+
+
+@pytest.mark.parametrize("phase", [Phase.READY_FOR_MERGE, Phase.MERGE])
+def test_inconclusive_verification_is_bounded_then_blocked(tmp_state_dir, fake_github, phase):
+    """UNKNOWN mergeability: bounded re-checks via resume, then BLOCKED (never merged)."""
+    fake_github.add_pr(head_sha=SHA_A).mergeable = "UNKNOWN"
+    eng = _in_merge(tmp_state_dir, fake_github, phase=phase)
+    eng.config.merge.max_verification_attempts = 3
+    for n in (1, 2):
+        with pytest.raises(VerificationError, match=f"attempt {n}/3"):
+            eng.step(allow_merge=True)
+        assert eng.state.phase == phase and eng.state.attempt == n
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "BLOCKED"
+    assert "inconclusive for 3 verification attempt(s)" in eng.state.block_reason
+    assert "max_verification_attempts=3" in eng.state.block_reason
+    assert "resume" not in out.message
+    assert fake_github.merges == [] and eng.state.counted_merged_prs == []
+
+
+def test_inconclusive_bound_of_one_blocks_immediately(tmp_state_dir, fake_github):
+    fake_github.add_pr(head_sha=SHA_A).checks = [CheckInfo(name="ci", state="QUEUED")]
+    eng = _in_merge(tmp_state_dir, fake_github)
+    eng.config.merge.max_verification_attempts = 1
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "BLOCKED" and "still running: ci" in eng.state.block_reason
+    assert fake_github.merges == []
+
+
+def test_merge_post_write_read_failure_is_bounded(tmp_state_dir, fake_github):
+    """Repeated re-read failures after `gh pr merge` end in BLOCKED, never a guessed count."""
+    fake_github.add_pr(head_sha=SHA_A)
+    fake_github.merge_leaves_open = True  # gh exits 0, GitHub has not merged (yet)
+    eng = _in_merge(tmp_state_dir, fake_github)
+    eng.config.merge.max_verification_attempts = 2
+    orig_merge = fake_github.merge_pr
+
+    def merge_then_break(*a, **kw):
+        orig_merge(*a, **kw)
+        fake_github.get_pr_failures = 1  # only the post-write re-read fails
+
+    fake_github.merge_pr = merge_then_break
+    with pytest.raises(VerificationError, match="outcome unknown.*attempt 1/2"):
+        eng.step(allow_merge=True)
+    assert eng.state.phase == Phase.MERGE and eng.state.attempt == 1
+    # resume: pre-checks pass (PR still OPEN), re-attempted, re-read fails again -> bound
+    # reached -> BLOCKED with nothing counted.
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "BLOCKED" and "could not be re-read" in eng.state.block_reason
+    assert "inspect the PR on GitHub manually" in eng.state.block_reason
+    assert eng.state.counted_merged_prs == [] and eng.state.merged_since_epic_update == 0
+
+
+def test_merge_counts_only_after_github_confirms_merged(tmp_state_dir, fake_github):
+    """The controller re-reads the PR after the write; the gh exit status alone never counts."""
+    fake_github.add_pr(head_sha=SHA_A)
+    eng = _in_merge(tmp_state_dir, fake_github)
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "UPDATE_EPIC"
+    calls = fake_github.calls
+    merge_idx = next(i for i, c in enumerate(calls) if c[0] == "merge_pr")
+    assert any(c == ("get_pr", PR) for c in calls[:merge_idx])  # verified before writing
+    assert any(c == ("get_pr", PR) for c in calls[merge_idx + 1 :])  # re-read after writing
