@@ -52,6 +52,18 @@ class GitHubRef:
         other_repo = other if isinstance(other, str) else other.repository
         return self.repository.lower() == other_repo.strip().lower()
 
+    def same_target(self, other: GitHubRef) -> bool:
+        """Whether both refs name the same issue / PR.
+
+        GitHub owner and repository names are case-insensitive, so
+        ``.../Owner/Repo/issues/23`` and ``.../owner/repo/issues/23`` are the
+        same issue although their canonical URLs differ. Identity checks must
+        use this, never a string comparison of URLs.
+        """
+        return (
+            self.kind == other.kind and self.same_repository(other) and self.number == other.number
+        )
+
 
 @dataclass(frozen=True)
 class GitHubIssueRef(GitHubRef):

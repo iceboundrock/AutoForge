@@ -19,7 +19,12 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from .errors import ConfigurationError, GitHubError, GitHubUnavailableError
+from .errors import (
+    ConfigurationError,
+    GitHubError,
+    GitHubNotFoundError,
+    GitHubUnavailableError,
+)
 from .executor import ExecutionRequest, ExecutionResult, execute
 from .validation import (
     GitHubCommentRef,
@@ -84,6 +89,23 @@ def is_transient_gh_failure(stderr: str) -> bool:
     """Whether a failed `gh` invocation's stderr describes a transient failure."""
     text = stderr.lower()
     return any(m in text for m in _TRANSIENT_MARKERS) or bool(_TRANSIENT_HTTP_STATUS.search(text))
+
+
+# Conclusive "does not exist" answers. GraphQL (`gh issue view`, `gh pr view`)
+# says ``Could not resolve to an Issue with the number of 999.``; REST says
+# ``HTTP 404: Not Found``; `gh pr` commands say ``could not find pull request``.
+# A private object the token cannot see is reported the same way by GitHub.
+_NOT_FOUND_MARKERS = (
+    "could not resolve to a",
+    "could not find",
+)
+_NOT_FOUND_HTTP_STATUS = re.compile(r"\bhttp\s+404\b")
+
+
+def is_not_found_gh_failure(stderr: str) -> bool:
+    """Whether a failed `gh` invocation's stderr says the object does not exist."""
+    text = stderr.lower()
+    return any(m in text for m in _NOT_FOUND_MARKERS) or bool(_NOT_FOUND_HTTP_STATUS.search(text))
 
 
 @dataclass
@@ -290,6 +312,8 @@ class GitHubClient:
             time.sleep(self.retry_delay_seconds)
         if transient:
             raise GitHubUnavailableError(last_error)
+        if is_not_found_gh_failure(last_error):
+            raise GitHubNotFoundError(last_error)
         raise GitHubError(last_error)
 
     def _json(self, args: list[str]) -> object:

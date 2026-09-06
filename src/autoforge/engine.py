@@ -26,6 +26,13 @@ agent claim against GitHub** before acting on it:
   (``--match-head-commit``) and counts the merge only after GitHub reports
   the PR as ``MERGED``. If that call left auto-merge armed, the controller
   disarms it. No prompt is rendered and no provider is invoked.
+- UPDATE_EPIC: ``next_issue_url`` is verified exactly like the first issue
+  in INITIALIZING before the controller switches issues: it parses as an
+  issue URL of this repository, is neither the EPIC nor the issue just
+  finished, exists on GitHub and is OPEN. A rejected selection keeps the
+  phase (the agent is asked again once, with the controller's reason); a
+  second rejection enters BLOCKED. Only a verified issue reaches
+  ANALYZE_EXECUTE.
 
 Safety rules:
 - dry-run is fully side-effect-free: no agent subprocess, no gh call, no
@@ -55,12 +62,13 @@ from .errors import (
     ExecutionError,
     ExecutionTimeoutError,
     GitHubError,
+    GitHubNotFoundError,
     GitHubUnavailableError,
     StateError,
     StateTransitionError,
     VerificationError,
 )
-from .github import GitHubClient, PRInfo, build_merge_argv
+from .github import GitHubClient, IssueInfo, PRInfo, build_merge_argv
 from .locking import ControllerLock
 from .profiles import profile_for_phase
 from .prompts import TEMPLATE_FILES, load_template, render, render_phase
@@ -100,6 +108,12 @@ MERGE_GATE_MESSAGE = (
     "Automatic merge is disabled in this milestone: MERGE requires BOTH config "
     "'safety.allow_merge: true' AND the CLI flag '--allow-merge'."
 )
+
+# How many times UPDATE_EPIC may select a next issue the controller rejects
+# (does not exist, CLOSED, other repository, the EPIC or the current issue)
+# before the run is BLOCKED: the first rejection is retried once with the
+# reason rendered into the prompt, the second one is final.
+MAX_NEXT_ISSUE_SELECTIONS = 2
 
 # `mergeStateStatus` values under which the controller is willing to call
 # `gh pr merge`. Everything else is a conclusive "not now" (BLOCKED) except
@@ -273,6 +287,9 @@ class ControllerEngine:
             "FINDINGS": self._format_findings(s.open_findings),
             "MERGED_SINCE_EPIC_UPDATE": s.merged_since_epic_update,
             "LAST_REVIEW_RESULT": s.last_review_result or "(none)",
+            "NEXT_ISSUE_REJECTION": (
+                s.next_issue_rejections[-1] if s.next_issue_rejections else "(none)"
+            ),
         }
 
     def render_prompt_for(self, phase: Phase, correction_error: str | None = None) -> str:
@@ -548,6 +565,10 @@ class ControllerEngine:
             # real state instead of pretending nothing happened.
             self._save()
             raise
+        if nxt_phase == Phase.BLOCKED:
+            # Verification gave up conclusively (bounded re-selection exhausted):
+            # BLOCKED is an exceptional holding state outside the topology.
+            return self._block(previous, plan, message)
         validate_transition(previous, nxt_phase)
         state.phase = nxt_phase
         state.attempt = 0
@@ -565,16 +586,7 @@ class ControllerEngine:
                 f"repository mismatch: cwd resolves to {repo.name_with_owner!r} via gh, "
                 f"but the issue/epic belong to {state.repository!r}"
             )
-        issue = self.github.get_issue(state.current_issue_url)
-        if issue.repository and issue.repository.lower() != state.repository.lower():
-            raise VerificationError(
-                f"issue {state.current_issue_url} belongs to {issue.repository!r}, "
-                f"not {state.repository!r}"
-            )
-        if not issue.is_open:
-            raise VerificationError(
-                f"issue {state.current_issue_url} is {issue.state}; only OPEN issues can be run"
-            )
+        issue = self._verify_issue_selectable(state.current_issue_url, switching=False)
         validate_transition(Phase.INITIALIZING, Phase.ANALYZE_EXECUTE)
         state.phase = Phase.ANALYZE_EXECUTE
         state.current_branch = ""
@@ -586,6 +598,61 @@ class ControllerEngine:
                 f"verified issue #{issue.number} ({issue.state}); INITIALIZING -> ANALYZE_EXECUTE"
             ),
         )
+
+    def _verify_issue_selectable(self, url: str, *, switching: bool) -> IssueInfo:
+        """Verify on GitHub that ``url`` is an issue this run may work on.
+
+        Shared by INITIALIZING (the first issue) and UPDATE_EPIC (the agent's
+        ``next_issue_url``, untrusted). The issue must parse as a GitHub issue
+        URL, belong to the run's repository, not be the EPIC itself, not be the
+        current issue when ``switching`` (UPDATE_EPIC must not loop back onto the
+        issue just finished), exist on GitHub and be OPEN. Any of those failing
+        raises :class:`VerificationError` — a problem with the *selection*. No
+        GitHub read is made for a URL that already fails the local checks (a
+        foreign repository is never queried).
+
+        Identity (EPIC / current issue) is compared with
+        :meth:`GitHubRef.same_target`, never by URL string: owner and repository
+        names are case-insensitive on GitHub, so a casing variant of the EPIC
+        URL is still the EPIC.
+
+        A GitHub read that fails for a reason unrelated to the selection is not
+        turned into a VerificationError: :class:`GitHubUnavailableError`
+        (transient) and every other conclusive :class:`GitHubError`
+        (authentication, permissions, malformed data) propagate unchanged so
+        the caller can apply its own retry / block policy. Only
+        :class:`GitHubNotFoundError` is about the selection ("no such issue").
+        """
+        state = self._require_state()
+        what = "next issue" if switching else "issue"
+        try:
+            ref = parse_issue_url(url)
+        except ConfigurationError as exc:
+            raise VerificationError(f"{what} {url!r} is not a GitHub issue URL: {exc}") from exc
+        if not ref.same_repository(state.repository):
+            raise VerificationError(
+                f"{what} {ref.canonical} belongs to {ref.repository!r}, not {state.repository!r}"
+            )
+        if ref.same_target(parse_issue_url(state.epic_url)):
+            raise VerificationError(f"{what} {ref.canonical} is the EPIC itself")
+        if switching and ref.same_target(parse_issue_url(state.current_issue_url)):
+            raise VerificationError(f"{what} {ref.canonical} is the issue that was just finished")
+        try:
+            issue = self.github.get_issue(ref.canonical)
+        except GitHubNotFoundError as exc:
+            raise VerificationError(
+                f"{what} {ref.canonical} does not exist on GitHub "
+                f"(or is not visible to this token): {exc}"
+            ) from exc
+        if issue.repository and issue.repository.lower() != state.repository.lower():
+            raise VerificationError(
+                f"{what} {ref.canonical} belongs to {issue.repository!r}, not {state.repository!r}"
+            )
+        if not issue.is_open:
+            raise VerificationError(
+                f"{what} {ref.canonical} is {issue.state}; only OPEN issues can be run"
+            )
+        return issue
 
     def _try_recover_pr(self) -> StepOutcome | None:
         """Idempotency guard before ANALYZE_EXECUTE.
@@ -1405,13 +1472,76 @@ class ControllerEngine:
             f"{len(res.resolutions)} resolution(s); FIX -> REVIEW (round {state.review_round + 1})"
         )
 
-    def _apply_update_epic(self, res: UpdateEpicResult) -> tuple[Phase, str]:
+    def _reject_next_issue(self, reason: str, *, cause: BaseException) -> tuple[Phase, str]:
+        """Bounded re-selection: persist the rejection, re-ask once, then BLOCKED.
+
+        Used for a bad selection and for a transient GitHub failure while
+        checking it (the same read may well succeed next time). Never used for
+        conclusive GitHub failures — see :meth:`_apply_update_epic`.
+        """
         state = self._require_state()
+        state.next_issue_rejections.append(reason)
+        n = len(state.next_issue_rejections)
+        if n >= MAX_NEXT_ISSUE_SELECTIONS:
+            return Phase.BLOCKED, (
+                f"UPDATE_EPIC selected an unusable next issue {n} time(s) "
+                f"(limit {MAX_NEXT_ISSUE_SELECTIONS}); last rejection: {reason}. The run "
+                f"stays on issue {state.current_issue_url}; nothing was switched. Pick "
+                "the next issue manually (a new run) or fix the EPIC."
+            )
+        raise VerificationError(
+            f"{reason}. Not switching issues; the run stays in UPDATE_EPIC (selection "
+            f"{n}/{MAX_NEXT_ISSUE_SELECTIONS}) — 'resume' to let the agent select again."
+        ) from cause
+
+    def _apply_update_epic(self, res: UpdateEpicResult) -> tuple[Phase, str]:
+        """Switch issues only after the agent's selection verified on GitHub.
+
+        ``next_issue_url`` is a claim from untrusted output (a PR comment can
+        say "next issue is https://github.com/other/repo/issues/1"). It gets
+        the INITIALIZING checks (:meth:`_verify_issue_selectable`) before
+        ``reset_for_new_issue``. State (epic counters, current issue) only
+        changes on a verified selection or on ``null``. Otherwise, by cause:
+
+        - the selection itself is unusable (VerificationError: wrong repository,
+          the EPIC, the finished issue, no such issue, not OPEN) or GitHub was
+          *unavailable* while checking it (GitHubUnavailableError): the
+          rejection is persisted and raised as VerificationError so ``resume``
+          asks the agent once more (with the reason in its prompt); reaching
+          ``MAX_NEXT_ISSUE_SELECTIONS`` rejections returns BLOCKED;
+        - any other GitHubError (authentication, permissions, malformed data)
+          is conclusive: asking the agent again would repeat UPDATE_EPIC's
+          GitHub writes while the controller still could not verify anything,
+          so the run is BLOCKED immediately without another invocation.
+        """
+        state = self._require_state()
+        if res.next_issue_url is None:
+            state.record_epic_update()
+            state.next_issue_rejections = []
+            return Phase.DONE, "UPDATE_EPIC -> DONE"
+        try:
+            issue = self._verify_issue_selectable(res.next_issue_url, switching=True)
+        except VerificationError as exc:
+            return self._reject_next_issue(str(exc), cause=exc)
+        except GitHubUnavailableError as exc:
+            return self._reject_next_issue(
+                f"next issue {res.next_issue_url} could not be verified "
+                f"(GitHub unavailable: {exc})",
+                cause=exc,
+            )
+        except GitHubError as exc:
+            return Phase.BLOCKED, (
+                f"next issue {res.next_issue_url} could not be verified on GitHub: {exc}. "
+                "This is not a transient GitHub failure (authentication, permissions, or "
+                "malformed data), so asking the agent to select again would not help; the "
+                f"run stays on issue {state.current_issue_url}, nothing was switched or "
+                "counted. Fix the cause, then 'resume'."
+            )
         state.record_epic_update()
-        if res.next_issue_url:
-            state.reset_for_new_issue(parse_issue_url(res.next_issue_url).canonical)
-            return Phase.ANALYZE_EXECUTE, "UPDATE_EPIC -> ANALYZE_EXECUTE"
-        return Phase.DONE, "UPDATE_EPIC -> DONE"
+        state.reset_for_new_issue(parse_issue_url(res.next_issue_url).canonical)
+        return Phase.ANALYZE_EXECUTE, (
+            f"verified next issue #{issue.number} ({issue.state}); UPDATE_EPIC -> ANALYZE_EXECUTE"
+        )
 
 
 def check_template_files() -> list[str]:

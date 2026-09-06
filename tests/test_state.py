@@ -24,7 +24,10 @@ def make_state(**kw):
 
 def test_roundtrip_serialize_deserialize():
     s = make_state(
-        phase=Phase.REVIEW, review_round=3, current_pr_url="https://github.com/owner/repo/pull/42"
+        phase=Phase.REVIEW,
+        review_round=3,
+        current_pr_url="https://github.com/owner/repo/pull/42",
+        next_issue_rejections=["next issue .../issues/999 could not be verified"],
     )
     d = s.to_dict()
     assert d["phase"] == "REVIEW"
@@ -77,6 +80,29 @@ def test_load_missing_required_field_raises(tmp_path):
     p.write_text(json.dumps({"phase": "REVIEW"}), encoding="utf-8")
     with pytest.raises(StateError, match="run_id"):
         load_state(p)
+
+
+def test_load_rejects_non_list_next_issue_rejections(tmp_path):
+    p = tmp_path / "state.json"
+    d = make_state().to_dict()
+    d["next_issue_rejections"] = "oops"
+    p.write_text(json.dumps(d), encoding="utf-8")
+    with pytest.raises(StateError, match="next_issue_rejections"):
+        load_state(p)
+
+
+def test_state_without_next_issue_rejections_loads_with_empty_list(tmp_path):
+    p = tmp_path / "state.json"
+    d = make_state().to_dict()
+    del d["next_issue_rejections"]
+    p.write_text(json.dumps(d), encoding="utf-8")
+    assert load_state(p).next_issue_rejections == []
+
+
+def test_reset_for_new_issue_clears_next_issue_rejections():
+    s = make_state(next_issue_rejections=["rejected"])
+    s.reset_for_new_issue("https://github.com/owner/repo/issues/3")
+    assert s.next_issue_rejections == []
 
 
 def test_timestamps_touch_on_save(tmp_path):

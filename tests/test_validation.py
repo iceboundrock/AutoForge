@@ -14,6 +14,19 @@ from autoforge.validation import (
 )
 
 
+def test_same_target_ignores_owner_and_repo_casing():
+    """Owner/repo names are case-insensitive on GitHub; the number is the identity."""
+    a = parse_issue_url("https://github.com/owner/repo/issues/23")
+    assert a.same_target(parse_issue_url("https://github.com/OWNER/Repo/issues/23"))
+    assert a.same_target(parse_issue_url("https://github.com/owner/repo/issues/23/"))
+    assert not a.same_target(parse_issue_url("https://github.com/owner/repo/issues/24"))
+    assert not a.same_target(parse_issue_url("https://github.com/other/repo/issues/23"))
+    # An issue and a PR with the same number are different objects.
+    assert not a.same_target(parse_pr_url("https://github.com/owner/repo/pull/23"))
+    # Canonical URLs of casing variants differ, which is why identity never uses them.
+    assert a.canonical != parse_issue_url("https://github.com/OWNER/Repo/issues/23").canonical
+
+
 def test_issue_and_pr_refs():
     i = parse_issue_url("https://github.com/Owner/Repo/issues/12")
     assert isinstance(i, GitHubIssueRef)

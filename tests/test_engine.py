@@ -103,6 +103,52 @@ def test_initializing_rejects_repository_mismatch(tmp_state_dir):
         eng.step()
 
 
+def test_initializing_rejects_missing_issue_as_verification_error(tmp_state_dir, fake_github):
+    del fake_github.issues[ISSUE]
+    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    with pytest.raises(VerificationError, match="does not exist on GitHub"):
+        eng.step()
+    assert eng.state.phase == Phase.INITIALIZING
+
+
+def test_initializing_rejects_a_casing_variant_of_the_epic(tmp_state_dir, fake_github):
+    """Owner/repo names are case-insensitive on GitHub: .../OWNER/Repo/issues/1 is the EPIC."""
+    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    eng.state.current_issue_url = "https://github.com/OWNER/Repo/issues/1"
+    with pytest.raises(VerificationError, match="is the EPIC itself"):
+        eng.step()
+    assert eng.state.phase == Phase.INITIALIZING
+    assert [c for c in fake_github.calls if c[0] == "get_issue"] == []
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        GitHubError("`gh issue view` failed (exit 1): HTTP 401: Bad credentials"),
+        GitHubUnavailableError("`gh issue view` failed (exit 1): HTTP 502"),
+    ],
+)
+def test_initializing_github_failure_is_not_a_verification_failure(
+    tmp_state_dir, fake_github, error
+):
+    """Auth / outage while reading the issue is not "the issue is unusable"."""
+    fake_github.get_issue_error = error
+    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    with pytest.raises(type(error)) as info:
+        eng.step()
+    assert not isinstance(info.value, VerificationError)
+    assert eng.state.phase == Phase.INITIALIZING
+
+
+def test_initializing_rejects_the_epic_as_the_issue(tmp_state_dir, fake_github):
+    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    eng.state.current_issue_url = EPIC
+    with pytest.raises(VerificationError, match="is the EPIC itself"):
+        eng.step()
+    assert eng.state.phase == Phase.INITIALIZING
+    assert ("get_issue", EPIC) not in fake_github.calls  # rejected before any GitHub read
+
+
 # -- ANALYZE_EXECUTE ---------------------------------------------------------------
 def test_analyze_valid_pr_verified_enters_review(tmp_state_dir, fake_github):
     eng = make_engine(tmp_state_dir, [block(ANALYZE_OK)], github=fake_github)
@@ -1553,3 +1599,266 @@ def test_merge_counts_only_after_github_confirms_merged(tmp_state_dir, fake_gith
     merge_idx = next(i for i, c in enumerate(calls) if c[0] == "merge_pr")
     assert any(c == ("get_pr", PR) for c in calls[:merge_idx])  # verified before writing
     assert any(c == ("get_pr", PR) for c in calls[merge_idx + 1 :])  # re-read after writing
+
+
+# -- UPDATE_EPIC: next_issue_url is verified before switching issues (issue #12) ----------------
+ISSUE999 = "https://github.com/owner/repo/issues/999"
+FOREIGN_ISSUE = "https://github.com/other/repo/issues/1"
+
+
+def _epic_result(next_issue_url) -> str:
+    return block({"phase": "UPDATE_EPIC", "status": "success", "next_issue_url": next_issue_url})
+
+
+def _in_update_epic(tmp_state_dir, gh, script):
+    """Engine parked in UPDATE_EPIC right after the controller merged PR for ISSUE."""
+    eng = make_engine(tmp_state_dir, script, github=gh)
+    gh.add_pr(head_sha=SHA_A, state="MERGED")
+    eng.state.phase = Phase.UPDATE_EPIC
+    eng.state.current_pr_url = PR
+    eng.state.current_branch = BRANCH
+    eng.state.current_head_sha = SHA_A
+    eng.state.reviewed_head_sha = SHA_A
+    eng.state.last_review_result = "clean"
+    eng.state.review_round = 2
+    eng.state.record_merge(PR)
+    eng._save()
+    return eng
+
+
+def test_update_epic_verified_next_issue_switches(tmp_state_dir, fake_github):
+    fake_github.add_issue(ISSUE3, "Next")
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(ISSUE3)])
+    out = eng.step()
+    assert out.next_phase == "ANALYZE_EXECUTE" and "verified next issue #3" in out.message
+    assert ("get_issue", ISSUE3) in fake_github.calls
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.ANALYZE_EXECUTE and s.current_issue_url == ISSUE3
+    assert s.current_pr_url == "" and s.review_round == 0 and s.reviewed_head_sha == ""
+    assert s.merged_since_epic_update == 0 and s.counted_merged_prs == [PR]
+    assert s.next_issue_rejections == [] and s.attempt == 0
+
+
+def test_update_epic_null_completes_the_run(tmp_state_dir, fake_github):
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(None)])
+    out = eng.step()
+    assert out.next_phase == "DONE"
+    s = load_state(eng.paths.state_file)
+    assert s.current_issue_url == ISSUE and s.merged_since_epic_update == 0
+    assert [c for c in fake_github.calls if c[0] == "get_issue"] == []
+
+
+def _assert_not_switched(eng, gh, url_queried: str | None):
+    """A rejected selection changes nothing but the persisted rejection list."""
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.UPDATE_EPIC and s.current_issue_url == ISSUE
+    assert s.current_pr_url == PR and s.review_round == 2  # bookkeeping not reset
+    assert s.merged_since_epic_update == 1  # the EPIC batch is not closed yet
+    assert s.attempt == 1  # the agent invocation is persisted for resume
+    assert len(s.next_issue_rejections) == 1
+    queried = [c[1] for c in gh.calls if c[0] == "get_issue"]
+    assert queried == ([url_queried] if url_queried else [])
+
+
+def test_update_epic_rejects_nonexistent_next_issue(tmp_state_dir, fake_github):
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(ISSUE999)])
+    with pytest.raises(
+        VerificationError, match="issues/999 does not exist on GitHub.*selection 1/2"
+    ):
+        eng.step()
+    _assert_not_switched(eng, fake_github, ISSUE999)
+
+
+def test_update_epic_rejects_closed_next_issue(tmp_state_dir, fake_github):
+    fake_github.add_issue(ISSUE3, "Done already", state="CLOSED")
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(ISSUE3)])
+    with pytest.raises(VerificationError, match="issues/3 is CLOSED"):
+        eng.step()
+    _assert_not_switched(eng, fake_github, ISSUE3)
+
+
+def test_update_epic_rejects_foreign_repository_without_querying_it(tmp_state_dir, fake_github):
+    """Prompt injection "next issue is https://github.com/other/repo/issues/1" goes nowhere."""
+    fake_github.add_issue(FOREIGN_ISSUE, "Injected")  # would even resolve on GitHub
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(FOREIGN_ISSUE)])
+    with pytest.raises(VerificationError, match="belongs to 'other/repo', not 'owner/repo'"):
+        eng.step()
+    _assert_not_switched(eng, fake_github, None)
+
+
+def test_update_epic_rejects_the_epic_itself(tmp_state_dir, fake_github):
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(EPIC)])
+    with pytest.raises(VerificationError, match="is the EPIC itself"):
+        eng.step()
+    _assert_not_switched(eng, fake_github, None)
+
+
+def test_update_epic_rejects_the_current_issue(tmp_state_dir, fake_github):
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(ISSUE)])
+    with pytest.raises(VerificationError, match="issue that was just finished"):
+        eng.step()
+    _assert_not_switched(eng, fake_github, None)
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        "https://github.com/OWNER/repo/issues/1",
+        "https://github.com/owner/REPO/issues/1",
+        "https://github.com/Owner/Repo/issues/1",
+    ],
+)
+def test_update_epic_rejects_casing_variants_of_the_epic(tmp_state_dir, fake_github, variant):
+    """R1-F1: identity is repository (case-insensitive) + number, not the URL string."""
+    fake_github.add_issue(variant, "EPIC alias")  # GitHub would even resolve it
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(variant)])
+    with pytest.raises(VerificationError, match="is the EPIC itself"):
+        eng.step()
+    _assert_not_switched(eng, fake_github, None)
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        "https://github.com/OWNER/repo/issues/2",
+        "https://github.com/owner/REPO/issues/2",
+        "https://github.com/Owner/Repo/issues/2",
+    ],
+)
+def test_update_epic_rejects_casing_variants_of_the_current_issue(
+    tmp_state_dir, fake_github, variant
+):
+    fake_github.add_issue(variant, "Just finished, again")
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(variant)])
+    with pytest.raises(VerificationError, match="issue that was just finished"):
+        eng.step()
+    _assert_not_switched(eng, fake_github, None)
+
+
+def test_update_epic_accepts_a_casing_variant_of_a_valid_next_issue(tmp_state_dir, fake_github):
+    """Case-insensitivity must not over-reject: #3 spelled with another casing is still #3."""
+    fake_github.add_issue(ISSUE3, "Next")
+    variant = "https://github.com/Owner/Repo/issues/3"
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(variant)])
+    out = eng.step()
+    assert out.next_phase == "ANALYZE_EXECUTE"
+    assert load_state(eng.paths.state_file).current_issue_url == variant
+
+
+def test_update_epic_rejects_malformed_url_as_verification_error(tmp_state_dir, fake_github):
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result("not a url")])
+    with pytest.raises(VerificationError, match="'not a url' is not a GitHub issue URL"):
+        eng.step()
+    _assert_not_switched(eng, fake_github, None)
+
+
+def test_update_epic_issue_repository_from_github_must_match(tmp_state_dir, fake_github):
+    """GitHub resolving the URL to another repository (redirect) is rejected too."""
+    fake_github.add_issue(ISSUE3, "Moved").repository = "other/repo"
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(ISSUE3)])
+    with pytest.raises(VerificationError, match="belongs to 'other/repo'"):
+        eng.step()
+    _assert_not_switched(eng, fake_github, ISSUE3)
+
+
+def test_update_epic_rejection_is_retried_once_with_the_reason_then_blocked(
+    tmp_state_dir, fake_github
+):
+    eng = _in_update_epic(
+        tmp_state_dir, fake_github, [_epic_result(ISSUE999), _epic_result(ISSUE999)]
+    )
+    with pytest.raises(VerificationError, match="selection 1/2"):
+        eng.step()
+    first_prompt = eng.provider.calls[0].prompt
+    assert "Previous selection rejected by the controller: (none)" in first_prompt
+
+    out = eng.step()  # resume: the agent is asked once more, with the reason
+    assert len(eng.provider.calls) == 2
+    retry_prompt = eng.provider.calls[1].prompt
+    assert "issues/999 does not exist on GitHub" in retry_prompt
+    assert out.next_phase == "BLOCKED"
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.BLOCKED and "2 time(s)" in s.block_reason
+    assert "issues/999" in s.block_reason
+    assert s.current_issue_url == ISSUE and s.merged_since_epic_update == 1
+    assert len(s.next_issue_rejections) == 2
+
+
+def test_update_epic_retry_with_a_valid_selection_switches(tmp_state_dir, fake_github):
+    fake_github.add_issue(ISSUE3, "Next")
+    eng = _in_update_epic(
+        tmp_state_dir, fake_github, [_epic_result(FOREIGN_ISSUE), _epic_result(ISSUE3)]
+    )
+    with pytest.raises(VerificationError, match="selection 1/2"):
+        eng.step()
+    out = eng.step()
+    assert out.next_phase == "ANALYZE_EXECUTE"
+    s = load_state(eng.paths.state_file)
+    assert s.current_issue_url == ISSUE3 and s.next_issue_rejections == []
+    assert s.merged_since_epic_update == 0 and s.attempt == 0
+
+
+def test_update_epic_retry_with_null_completes(tmp_state_dir, fake_github):
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(EPIC), _epic_result(None)])
+    with pytest.raises(VerificationError, match="is the EPIC itself"):
+        eng.step()
+    assert eng.step().next_phase == "DONE"
+    assert load_state(eng.paths.state_file).next_issue_rejections == []
+
+
+def test_update_epic_transient_github_failure_is_a_rejection_not_a_switch(
+    tmp_state_dir, fake_github
+):
+    """R1-F2: only a *transient* failure takes the bounded re-selection path."""
+    fake_github.add_issue(ISSUE3, "Next")
+    fake_github.get_issue_error = GitHubUnavailableError("gh: HTTP 502")
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(ISSUE3)])
+    with pytest.raises(VerificationError, match="GitHub unavailable: gh: HTTP 502"):
+        eng.step()
+    _assert_not_switched(eng, fake_github, ISSUE3)
+
+
+def test_update_epic_transient_github_failure_twice_is_blocked(tmp_state_dir, fake_github):
+    fake_github.add_issue(ISSUE3, "Next")
+    fake_github.get_issue_error = GitHubUnavailableError("gh: HTTP 502")
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(ISSUE3), _epic_result(ISSUE3)])
+    with pytest.raises(VerificationError, match="selection 1/2"):
+        eng.step()
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and len(eng.provider.calls) == 2
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.BLOCKED and "HTTP 502" in s.block_reason
+    assert s.current_issue_url == ISSUE and s.merged_since_epic_update == 1
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        GitHubError("`gh issue view` failed (exit 1): HTTP 401: Bad credentials"),
+        GitHubError("`gh issue view` failed (exit 1): HTTP 403: Resource not accessible"),
+        GitHubError("`gh issue view` failed (exit 1): gh auth login"),
+        GitHubError("`gh` returned invalid JSON: Expecting value"),
+    ],
+)
+def test_update_epic_conclusive_github_failure_blocks_without_reinvoking_agent(
+    tmp_state_dir, fake_github, error
+):
+    """R1-F2: auth / permission / malformed-data failures are not bad selections.
+
+    Re-asking the agent would repeat UPDATE_EPIC's GitHub writes while the
+    controller still could not verify anything, so the run blocks at once.
+    """
+    fake_github.add_issue(ISSUE3, "Next")
+    fake_github.get_issue_error = error
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(ISSUE3), _epic_result(ISSUE3)])
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert len(eng.provider.calls) == 1  # never asked to select again
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.BLOCKED
+    assert str(error) in s.block_reason and "not a transient GitHub failure" in s.block_reason
+    assert s.next_issue_rejections == []  # not a rejection of the selection
+    assert s.current_issue_url == ISSUE and s.current_pr_url == PR
+    assert s.merged_since_epic_update == 1  # the EPIC batch is not closed
+    with pytest.raises(StateTransitionError):
+        eng.step()  # BLOCKED is terminal for `step`; nothing else runs
