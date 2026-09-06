@@ -19,7 +19,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from .errors import ConfigurationError, GitHubError
+from .errors import ConfigurationError, GitHubError, GitHubUnavailableError
 from .executor import ExecutionRequest, ExecutionResult, execute
 from .validation import (
     GitHubCommentRef,
@@ -31,18 +31,59 @@ from .validation import (
     parse_pr_url,
 )
 
+# Transient `gh` failures: the same read may well succeed later, so the engine
+# treats them as *inconclusive* (bounded re-checks) instead of conclusive.
+# Phrase markers cover network-level errors (as the Go runtime behind `gh`
+# reports them: ``dial tcp ...: connect: network is unreachable``, ``lookup
+# api.github.com: temporary failure in name resolution``, ...) and the reason
+# phrases GitHub attaches to server-side / throttling statuses; the HTTP
+# status itself is matched as a whole class (every 5xx, plus 429) rather than
+# an enumerated list, so e.g. ``HTTP 500`` is not silently conclusive. `gh`
+# prints the status as ``HTTP 502: Bad Gateway`` (GraphQL) or ``gh: Bad
+# Gateway (HTTP 502)`` (REST); both shapes are matched, bare numbers elsewhere
+# in the message (PR numbers, SHAs) are not.
 _TRANSIENT_MARKERS = (
+    # -- connection / socket level (OS errno strings as surfaced by Go's net package)
     "timeout",
     "timed out",
     "connection reset",
     "connection refused",
+    "connection aborted",
+    "broken pipe",
+    "unexpected eof",
+    "network is unreachable",
+    "network is down",
+    "no route to host",
+    "host is down",
+    # Every `dial tcp ...` error is a failure to *open* the connection, never an
+    # answer from GitHub, so the whole family is transient even when the
+    # trailing errno phrase is one not listed here.
+    "dial tcp",
     "temporarily unavailable",
-    "502",
-    "503",
-    "504",
     "tls handshake",
+    # -- name resolution (Go resolver / glibc phrases)
     "no such host",
+    "temporary failure in name resolution",
+    "server misbehaving",
+    # `gh` wraps any connection-level error (whatever host is configured) as
+    # ``error connecting to <host>\ncheck your internet connection or ...``.
+    "error connecting to",
+    # -- GitHub-side throttling / server errors
+    "rate limit",
+    "too many requests",
+    "internal server error",
+    "bad gateway",
+    "service unavailable",
+    "gateway timeout",
+    "gateway time-out",
 )
+_TRANSIENT_HTTP_STATUS = re.compile(r"\bhttp\s+(?:5\d\d|429)\b")
+
+
+def is_transient_gh_failure(stderr: str) -> bool:
+    """Whether a failed `gh` invocation's stderr describes a transient failure."""
+    text = stderr.lower()
+    return any(m in text for m in _TRANSIENT_MARKERS) or bool(_TRANSIENT_HTTP_STATUS.search(text))
 
 
 @dataclass
@@ -225,6 +266,7 @@ class GitHubClient:
     def _run_gh(self, args: list[str], allow_fail: bool = False) -> ExecutionResult:
         attempts = self.transient_retries + 1
         last_error = ""
+        transient = False
         for i in range(attempts):
             res = self._runner(
                 ExecutionRequest(
@@ -238,7 +280,7 @@ class GitHubClient:
             elif res.exit_code != 0:
                 tail = res.stderr.strip()[-1000:]
                 last_error = f"`gh {' '.join(args)}` failed (exit {res.exit_code}): {tail}"
-                transient = any(m in tail.lower() for m in _TRANSIENT_MARKERS)
+                transient = is_transient_gh_failure(tail)
             else:
                 return res
             if allow_fail and not transient:
@@ -246,6 +288,8 @@ class GitHubClient:
             if not transient or i == attempts - 1:
                 break
             time.sleep(self.retry_delay_seconds)
+        if transient:
+            raise GitHubUnavailableError(last_error)
         raise GitHubError(last_error)
 
     def _json(self, args: list[str]) -> object:

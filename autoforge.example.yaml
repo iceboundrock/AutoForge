@@ -39,8 +39,14 @@ merge:
   # writing it verifies on GitHub (fail closed): not a draft, all checks
   # succeeded, mergeable, mergeStateStatus CLEAN/HAS_HOOKS, no auto-merge
   # armed, no merge queue on the base branch.
+  # The same verification runs in READY_FOR_MERGE before MERGE is entered.
   method: squash          # squash | merge | rebase
   delete_branch: false    # add --delete-branch
+  # Inconclusive GitHub data (mergeable UNKNOWN, checks still running, the
+  # post-merge re-read failed) is re-checked on `resume --allow-merge` (or
+  # `step --allow-merge`), one attempt per invocation, at most this many
+  # times per phase; then the run is BLOCKED instead of retrying forever.
+  max_verification_attempts: 5
 
 profiles:
   analyze_execute:

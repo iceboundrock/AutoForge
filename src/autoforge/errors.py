@@ -48,7 +48,21 @@ class ControlResultValidationError(ControlResultError):
 
 
 class GitHubError(AutoForgeError):
-    """`gh` CLI invocation or GitHub state problem."""
+    """`gh` CLI invocation or GitHub state problem.
+
+    Raised as-is for *conclusive* failures (authentication, permissions,
+    a missing PR, malformed data); see :class:`GitHubUnavailableError` for
+    the transient kind. Callers that must not guess distinguish the two.
+    """
+
+
+class GitHubUnavailableError(GitHubError):
+    """GitHub could not be reached or answered with a transient error.
+
+    Timeouts, connection resets, 5xx / rate limiting: the same read may well
+    succeed later, so the controller treats the data as *inconclusive*
+    (bounded re-checks) rather than as a conclusive verification failure.
+    """
 
 
 class VerificationError(AutoForgeError):

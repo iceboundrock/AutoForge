@@ -100,6 +100,10 @@ class MergeConfig:
 
     method: str = "squash"  # squash | merge | rebase  -> gh pr merge --<method>
     delete_branch: bool = False  # gh pr merge --delete-branch
+    # Inconclusive GitHub data (mergeability UNKNOWN, checks still running,
+    # post-merge re-read failed) is re-checked on `resume` at most this many
+    # times per phase; then the run is BLOCKED instead of retrying forever.
+    max_verification_attempts: int = 5
 
 
 @dataclass
@@ -307,6 +311,15 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
         base.merge.method = method
     if "delete_branch" in merge:
         base.merge.delete_branch = _as_bool(merge["delete_branch"], source, "merge.delete_branch")
+    if "max_verification_attempts" in merge:
+        attempts = _as_int(
+            merge["max_verification_attempts"], source, "merge.max_verification_attempts"
+        )
+        if attempts < 1:
+            raise ConfigurationError(
+                f"{source}: 'merge.max_verification_attempts' must be >= 1, got {attempts}"
+            )
+        base.merge.max_verification_attempts = attempts
     profiles = data.get("profiles", {}) or {}
     if not isinstance(profiles, dict):
         raise ConfigurationError(f"{source}: 'profiles' must be a mapping")

@@ -7,6 +7,7 @@ import pytest
 from autoforge import cli
 from autoforge.engine import ControllerEngine
 from autoforge.executor import ExecutionResult
+from autoforge.github import CheckInfo
 from autoforge.providers import ProviderRegistry, ScriptedProvider
 from tests.conftest import (
     BRANCH,
@@ -200,6 +201,163 @@ def test_full_run_prints_ready_banner(tmp_path, capsys, monkeypatch, fakes):
     assert cli.main(["--state-dir", sd, "step", "--allow-merge"]) == 1
     assert cli.main(["--state-dir", sd, "status", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["phase"] == "READY_FOR_MERGE"
+
+
+def _drive_to_ready(fakes):
+    """Agent script: ANALYZE_EXECUTE creates the PR, REVIEW is clean, UPDATE_EPIC ends."""
+    gh = fakes["gh"]
+
+    def agent(req):
+        if req.phase == "ANALYZE_EXECUTE":
+            gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2])
+            return block(
+                {
+                    "phase": "ANALYZE_EXECUTE",
+                    "status": "success",
+                    "issue_url": ISSUE,
+                    "pr_url": PR,
+                    "head_sha": SHA_A,
+                    "branch": BRANCH,
+                }
+            )
+        if req.phase == "UPDATE_EPIC":
+            return block({"phase": "UPDATE_EPIC", "status": "success", "next_issue_url": None})
+        gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
+        return block(
+            {
+                "phase": "REVIEW",
+                "status": "success",
+                "round": 1,
+                "reviewed_head_sha": SHA_A,
+                "review_comment_url": comment_url(PR, 100),
+                "needs_fix_round": False,
+                "findings": [],
+            }
+        )
+
+    fakes["handler"] = agent
+
+
+def _gate_open_config(tmp_path, attempts: int = 5) -> str:
+    cfg = tmp_path / "autoforge.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "safety": {"allow_merge": True},
+                "merge": {"max_verification_attempts": attempts},
+            }
+        )
+    )
+    return str(cfg)
+
+
+def test_resume_with_gate_open_rechecks_inconclusive_ready_for_merge_then_blocks(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """R1-F1: the bounded READY_FOR_MERGE re-check is reachable through `resume`."""
+    monkeypatch.chdir(tmp_path)
+    _drive_to_ready(fakes)
+    gh = fakes["gh"]
+    cfg = _gate_open_config(tmp_path, attempts=3)
+    sd = str(tmp_path / ".autoforge")
+    assert (
+        cli.main(["--config", cfg, "--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE]) == 0
+    )
+    assert "Automatic merge is disabled" in capsys.readouterr().out  # no --allow-merge: holds
+    gh.prs[PR].mergeable = "UNKNOWN"
+
+    # gate closed (flag missing): resume is a no-op banner, GitHub is not read
+    n_reads = gh.calls.count(("get_pr", PR))
+    assert cli.main(["--config", cfg, "--state-dir", sd, "resume"]) == 0
+    assert "A human must review and merge the PR." in capsys.readouterr().out
+    assert gh.calls.count(("get_pr", PR)) == n_reads
+
+    # gate open: each resume performs one verification attempt and keeps the phase
+    for n in (1, 2):
+        assert cli.main(["--config", cfg, "--state-dir", sd, "resume", "--allow-merge"]) == 1
+        err = capsys.readouterr().err
+        assert "not determined mergeability" in err and f"attempt {n}/3" in err
+        assert cli.main(["--state-dir", sd, "status", "--json"]) == 0
+        status = json.loads(capsys.readouterr().out)
+        assert status["phase"] == "READY_FOR_MERGE" and status["attempt"] == n
+    assert gh.calls.count(("get_pr", PR)) == n_reads + 2
+
+    # bound reached: BLOCKED, nothing merged
+    assert cli.main(["--config", cfg, "--state-dir", sd, "resume", "--allow-merge"]) == 1
+    out = capsys.readouterr().out
+    assert "BLOCKED" in out and "max_verification_attempts=3" in out
+    assert gh.merges == []
+    n_calls = len(fakes["provider"].calls)
+    assert cli.main(["--config", cfg, "--state-dir", sd, "resume", "--allow-merge"]) == 1
+    assert len(fakes["provider"].calls) == n_calls  # terminal: nothing re-run
+
+
+def test_resume_with_gate_open_merges_via_controller_to_done(tmp_path, capsys, monkeypatch, fakes):
+    monkeypatch.chdir(tmp_path)
+    _drive_to_ready(fakes)
+    gh = fakes["gh"]
+    cfg = _gate_open_config(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    assert (
+        cli.main(["--config", cfg, "--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE]) == 0
+    )
+    capsys.readouterr()
+    gh.prs[PR].checks = [CheckInfo(name="ci", state="IN_PROGRESS")]
+    assert cli.main(["--config", cfg, "--state-dir", sd, "resume", "--allow-merge"]) == 1
+    assert "still running: ci" in capsys.readouterr().err
+    gh.prs[PR].checks = [CheckInfo(name="ci", state="COMPLETED", conclusion="SUCCESS")]
+
+    # --max-steps 1 exhausts the budget in MERGE: banner is not the "disabled" one
+    assert (
+        cli.main(
+            ["--config", cfg, "--state-dir", sd, "resume", "--allow-merge", "--max-steps", "1"]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "READY_FOR_MERGE -> MERGE" in out or "MERGE" in out
+    assert "Automatic merge is disabled" not in out
+    assert gh.merges == []
+
+    assert cli.main(["--config", cfg, "--state-dir", sd, "resume", "--allow-merge"]) == 0
+    out = capsys.readouterr().out
+    assert gh.merges == [(PR, "squash", SHA_A, False)]
+    assert [c.phase for c in fakes["provider"].calls] == [
+        "ANALYZE_EXECUTE",
+        "REVIEW",
+        "UPDATE_EPIC",
+    ]
+    assert cli.main(["--state-dir", sd, "status", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["phase"] == "DONE"
+
+
+def test_ready_banner_with_gate_open_and_exhausted_budget(tmp_path, capsys, monkeypatch, fakes):
+    monkeypatch.chdir(tmp_path)
+    _drive_to_ready(fakes)
+    cfg = _gate_open_config(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    # budget ends exactly at READY_FOR_MERGE with the gate open
+    rc = cli.main(
+        [
+            "--config",
+            cfg,
+            "--state-dir",
+            sd,
+            "run",
+            "--allow-merge",
+            "--max-steps",
+            "3",
+            "--epic",
+            EPIC,
+            "--issue",
+            ISSUE,
+        ]
+    )
+    out = capsys.readouterr().out
+    assert rc == 0 and "AutoForge workflow reached READY_FOR_MERGE." in out
+    assert "step budget (--max-steps) ran out before MERGE" in out
+    assert "Automatic merge is disabled" not in out
+    assert fakes["gh"].merges == []
 
 
 def test_blocked_run_returns_1(tmp_path, capsys, monkeypatch, fakes):

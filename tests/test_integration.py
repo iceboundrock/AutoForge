@@ -201,14 +201,17 @@ def test_gate_open_loop_merges_via_controller_then_update_epic_to_done(tmp_state
     eng = make_engine(tmp_state_dir, agent, github=gh)
     eng.config.safety.allow_merge = True
     eng._save()
-    outcomes = eng.run(max_steps=50, allow_merge=True)
+    # CLI flag alone does not open the gate: run() holds at READY_FOR_MERGE
+    outcomes = eng.run(max_steps=50)
     assert [o.next_phase for o in outcomes] == ["ANALYZE_EXECUTE", "REVIEW", "READY_FOR_MERGE"]
-    assert gh.merges == []  # run() holds at READY_FOR_MERGE even with the gate open
+    assert gh.merges == []
+    assert eng.run(max_steps=50) == []  # still holding: config alone is not enough
 
-    for expected in ("MERGE", "UPDATE_EPIC", "DONE"):
-        out = eng.step(allow_merge=True)
-        assert out.next_phase == expected, out.message
-        assert load_state(eng.paths.state_file).phase.value == expected
+    # Gate open (config AND flag): run() continues through the controller-side
+    # verification, MERGE and UPDATE_EPIC to DONE without a separate `step` each.
+    outcomes = eng.run(max_steps=50, allow_merge=True)
+    assert [o.next_phase for o in outcomes] == ["MERGE", "UPDATE_EPIC", "DONE"]
+    assert load_state(eng.paths.state_file).phase == Phase.DONE
 
     assert gh.merges == [(PR, "squash", SHA_A, False)]
     assert gh.prs[PR].state == "MERGED"

@@ -28,7 +28,7 @@ from .errors import (
 from .locking import ControllerLock
 from .redaction import redact, redact_argv
 from .state import AutoForgeState, StatePaths, load_state, save_state
-from .transitions import STOP_PHASES, TERMINAL_PHASES, Phase
+from .transitions import TERMINAL_PHASES, Phase
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -159,13 +159,13 @@ def cmd_doctor(args) -> int:
     return 0
 
 
-def _finish(engine: ControllerEngine, outcomes: list[StepOutcome]) -> int:
+def _finish(engine: ControllerEngine, outcomes: list[StepOutcome], allow_merge: bool) -> int:
     for o in outcomes:
         print_step_outcome(o)
     state = engine.state
     assert state is not None
     if state.phase == Phase.READY_FOR_MERGE:
-        print_ready_banner(state)
+        print_ready_banner(state, gate_open=engine.merge_gate_open(allow_merge))
         return 0
     if state.phase in (Phase.BLOCKED, Phase.FAILED):
         print(f"\nrun {state.run_id} is {state.phase.value}: {state.block_reason or '-'}")
@@ -206,7 +206,7 @@ def cmd_run(args) -> int:
     with ControllerLock(paths.lock_file):
         save_state(engine.state, paths.state_file)
     outcomes = engine.run(max_steps=args.max_steps, dry_run=False, allow_merge=args.allow_merge)
-    return _finish(engine, outcomes)
+    return _finish(engine, outcomes, args.allow_merge)
 
 
 def cmd_step(args) -> int:
@@ -216,18 +216,22 @@ def cmd_step(args) -> int:
     if args.dry_run and outcome.plan is not None:
         print_plan(outcome.plan, full_prompt=args.full_prompt)
         return 0
-    return _finish(engine, [outcome])
+    return _finish(engine, [outcome], args.allow_merge)
 
 
 def cmd_resume(args) -> int:
     engine = _engine_for(args)
     state = engine.load()
-    if state.phase in STOP_PHASES:
+    if state.phase == Phase.READY_FOR_MERGE and not engine.merge_gate_open(args.allow_merge):
+        # Holding state: nothing runs unless the merge gate is open. With the
+        # gate open, engine.run() performs the controller-side pre-merge
+        # verification instead (bounded re-checks of inconclusive GitHub data
+        # happen there, one attempt per resume).
+        print_ready_banner(state)
+        return 0
+    if state.phase in TERMINAL_PHASES:
         if state.phase == Phase.DONE:
             print(f"workflow already DONE (run {state.run_id}) — nothing to do")
-            return 0
-        if state.phase == Phase.READY_FOR_MERGE:
-            print_ready_banner(state)
             return 0
         print(
             f"run {state.run_id} is in terminal phase {state.phase.value}: "
@@ -241,7 +245,7 @@ def cmd_resume(args) -> int:
             print_plan(o.plan, full_prompt=args.full_prompt)
         return 0
     outcomes = engine.run(max_steps=args.max_steps, dry_run=False, allow_merge=args.allow_merge)
-    return _finish(engine, outcomes)
+    return _finish(engine, outcomes, args.allow_merge)
 
 
 def cmd_status(args) -> int:
@@ -283,7 +287,7 @@ def cmd_status(args) -> int:
 
 
 # -- pretty printing ----------------------------------------------------------
-def print_ready_banner(state: AutoForgeState) -> None:
+def print_ready_banner(state: AutoForgeState, gate_open: bool = False) -> None:
     print()
     print("=" * 72)
     print("AutoForge workflow reached READY_FOR_MERGE.")
@@ -292,8 +296,12 @@ def print_ready_banner(state: AutoForgeState) -> None:
     print(f"  Review round:  {state.review_round}")
     print(f"  Reviewed HEAD: {state.reviewed_head_sha}")
     print(f"  Review:        {state.last_review_comment_url or '-'}")
-    print("Automatic merge is disabled in this milestone.")
-    print("A human must review and merge the PR.")
+    if gate_open:
+        print("Merge gate is open but the step budget (--max-steps) ran out before MERGE.")
+        print("'resume --allow-merge' continues with the controller-side pre-merge verification.")
+    else:
+        print("Automatic merge is disabled in this milestone.")
+        print("A human must review and merge the PR.")
     print("=" * 72)
 
 

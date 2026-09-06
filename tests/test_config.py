@@ -25,6 +25,7 @@ def test_defaults_have_all_logical_profiles():
     # MERGE is performed by the controller: no agent profile, but a merge section.
     assert "merge" not in cfg.profiles
     assert cfg.merge.method == "squash" and cfg.merge.delete_branch is False
+    assert cfg.merge.max_verification_attempts == 5
 
 
 def test_merge_section_parsing(tmp_path):
@@ -34,10 +35,15 @@ def test_merge_section_parsing(tmp_path):
     )
     cfg = load_config_file(p)
     assert cfg.merge.method == "rebase" and cfg.merge.delete_branch is True
+    p.write_text('{"version": 1, "merge": {"max_verification_attempts": 2}}', encoding="utf-8")
+    assert load_config_file(p).merge.max_verification_attempts == 2
     for body in (
         '{"version": 1, "merge": {"method": "fast-forward"}}',
         '{"version": 1, "merge": {"method": 1}}',
         '{"version": 1, "merge": {"delete_branch": "true"}}',
+        '{"version": 1, "merge": {"max_verification_attempts": 0}}',
+        '{"version": 1, "merge": {"max_verification_attempts": "3"}}',
+        '{"version": 1, "merge": {"max_verification_attempts": true}}',
         '{"version": 1, "merge": "squash"}',
     ):
         p.write_text(body, encoding="utf-8")

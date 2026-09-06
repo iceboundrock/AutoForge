@@ -1,10 +1,11 @@
 """GitHub client with injected fake `gh` runner (no network)."""
 
 import json
+from dataclasses import replace
 
 import pytest
 
-from autoforge.errors import GitHubError
+from autoforge.errors import GitHubError, GitHubUnavailableError
 from autoforge.executor import ExecutionResult
 from autoforge.github import GitHubClient
 
@@ -165,6 +166,94 @@ def test_transient_error_retried_once():
     gh = GitHubClient(runner=handler, retry_delay_seconds=0)
     assert gh.get_issue("https://github.com/o/r/issues/2").number == 2
     assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "error connecting to api.github.com: timeout",
+        "read: connection reset by peer",
+        "HTTP 500: Internal Server Error",  # R4-F1: whole 5xx class, not an enumerated list
+        "HTTP 502: Bad Gateway",
+        "HTTP 503: Service Unavailable",
+        "HTTP 504: Gateway Timeout",
+        "HTTP 599: Network Connect Timeout Error",
+        "gh: Internal Server Error (HTTP 500)",  # REST (`gh api`) shape
+        "gh: Bad Gateway (HTTP 502)",
+        "API rate limit exceeded for user",
+        "HTTP 429: Too Many Requests",
+        "gh: Too Many Requests (HTTP 429)",
+        # R5-F1: OS / DNS connectivity failures as Go's net package (behind `gh`) reports them
+        'Post "https://api.github.com/graphql": dial tcp 140.82.112.6:443: connect: '
+        "network is unreachable",
+        'Post "https://api.github.com/graphql": dial tcp: lookup api.github.com: '
+        "Temporary failure in name resolution",
+        "error connecting to api.github.com\ncheck your internet connection or "
+        "https://githubstatus.com\ndial tcp: lookup api.github.com on 127.0.0.53:53: "
+        "server misbehaving",
+        "dial tcp 140.82.112.6:443: connect: no route to host",
+        "dial tcp 140.82.112.6:443: connect: network is down",
+        "dial tcp 140.82.112.6:443: i/o timeout",
+        "read tcp 10.0.0.2:51234->140.82.112.6:443: read: connection aborted",
+        "write tcp 10.0.0.2:51234->140.82.112.6:443: write: broken pipe",
+        'Post "https://api.github.com/graphql": unexpected EOF',
+        "dial tcp 140.82.112.6:443: connect: host is down",
+        "lookup api.github.com: no such host",
+    ],
+)
+def test_transient_failure_raises_github_unavailable_error(stderr):
+    """Transient `gh` failures are typed so the engine can bound re-checks instead of guessing."""
+    calls = []
+
+    def handler(req):
+        calls.append(1)
+        return _res({}, exit_code=1, stderr=stderr)
+
+    gh = GitHubClient(runner=handler, retry_delay_seconds=0)
+    with pytest.raises(GitHubUnavailableError, match="failed"):
+        gh.get_pr("https://github.com/o/r/pull/42")
+    assert len(calls) == 2  # retried once, then classified as unavailable
+
+
+def test_timeout_raises_github_unavailable_error():
+    def handler(req):
+        res = _res({}, exit_code=-9)
+        return replace(res, timed_out=True)
+
+    gh = GitHubClient(runner=handler, retry_delay_seconds=0)
+    with pytest.raises(GitHubUnavailableError, match="timed out"):
+        gh.get_pr("https://github.com/o/r/pull/42")
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "HTTP 401: Bad credentials (https://api.github.com/graphql)",
+        "HTTP 403: Resource not accessible by integration",
+        "HTTP 404: Not Found",
+        "gh: Not Found (HTTP 404)",
+        "could not find pull request",
+        # Bare numbers that merely *look* like a status are not a transient status.
+        "GraphQL: Could not resolve to a PullRequest with the number of 5021.",
+        "HTTP 422: No commit found for SHA: 503f4e1 (https://api.github.com/graphql)",
+        # Not connectivity: gh reached GitHub (or never tried) and the answer is final.
+        "To get started with GitHub CLI, please run:  gh auth login",
+        "x509: certificate signed by unknown authority",
+        "GraphQL: Resource protected by organization SAML enforcement.",
+    ],
+)
+def test_conclusive_failure_is_plain_github_error(stderr):
+    calls = []
+
+    def handler(req):
+        calls.append(1)
+        return _res({}, exit_code=1, stderr=stderr)
+
+    gh = GitHubClient(runner=handler, retry_delay_seconds=0)
+    with pytest.raises(GitHubError) as info:
+        gh.get_pr_merge_queue_status("https://github.com/o/r/pull/42")
+    assert not isinstance(info.value, GitHubUnavailableError)
+    assert len(calls) == 1  # never retried
 
 
 def test_current_repo_uses_repo_view():
