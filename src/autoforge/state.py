@@ -265,6 +265,7 @@ def load_state(path: str | Path) -> AutoForgeState:
 
 
 CORRUPT_SUFFIX = ".corrupt-"
+_QUARANTINE_MAX_ATTEMPTS = 1000
 
 
 def quarantine_state_file(path: str | Path) -> Path:
@@ -272,19 +273,38 @@ def quarantine_state_file(path: str | Path) -> Path:
 
     Renames ``<path>`` to ``<path>.corrupt-<UTC timestamp>`` (a numeric
     suffix is appended if that name is already taken) and returns the new
-    path.  Never overwrites an existing file.  Raises StateError when the
-    rename fails; the original file is left untouched in that case.
+    path.  Never overwrites an existing file: the destination is reserved
+    with :func:`os.link`, which fails atomically with ``EEXIST`` when the
+    name is already taken (a plain ``rename`` would silently replace a file
+    created between the existence check and the move).  On a collision the
+    next numeric suffix is tried.  Raises StateError when the move fails;
+    the original file is left untouched in that case.
     """
     src = Path(path)
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     base = src.with_name(f"{src.name}{CORRUPT_SUFFIX}{stamp}")
     candidate = base
-    n = 1
-    while candidate.exists():
-        candidate = base.with_name(f"{base.name}.{n}")
-        n += 1
-    try:
-        os.rename(src, candidate)
-    except OSError as exc:
-        raise StateError(f"cannot move corrupted state file {src} aside: {exc}") from exc
-    return candidate
+    for n in range(1, _QUARANTINE_MAX_ATTEMPTS + 1):
+        try:
+            # Atomic no-replace reservation: link() never clobbers a
+            # destination that appeared after we picked the candidate.
+            os.link(src, candidate)
+        except FileExistsError:
+            candidate = base.with_name(f"{base.name}.{n}")
+            continue
+        except OSError as exc:
+            raise StateError(f"cannot move corrupted state file {src} aside: {exc}") from exc
+        try:
+            os.unlink(src)
+        except OSError as exc:
+            # Drop the reservation so the original is the only copy again.
+            try:
+                os.unlink(candidate)
+            except OSError:
+                pass
+            raise StateError(f"cannot move corrupted state file {src} aside: {exc}") from exc
+        return candidate
+    raise StateError(
+        f"cannot move corrupted state file {src} aside: "
+        f"no free name after {_QUARANTINE_MAX_ATTEMPTS} attempts (last tried {candidate})"
+    )

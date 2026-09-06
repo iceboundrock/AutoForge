@@ -200,3 +200,87 @@ def test_quarantine_missing_state_file_raises(tmp_path):
 
     with pytest.raises(StateError, match="cannot move"):
         quarantine_state_file(tmp_path / "state.json")
+
+
+def test_quarantine_preserves_archive_created_after_candidate_selection(tmp_path, monkeypatch):
+    """R2-F1: a destination that appears between candidate selection and the move is
+    never overwritten; the move retries with the next numeric suffix."""
+    import os
+    from datetime import datetime
+
+    from autoforge import state as state_mod
+    from autoforge.state import quarantine_state_file
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 9, 6, 12, 0, 0, tzinfo=tz)
+
+    monkeypatch.setattr(state_mod, "datetime", FrozenDatetime)
+    p = tmp_path / "state.json"
+    p.write_text("garbage-new", encoding="utf-8")
+    expected_first = tmp_path / "state.json.corrupt-20260906T120000Z"
+    assert not expected_first.exists()  # candidate selection would pick this name
+
+    real_link = os.link
+    attempts: list[str] = []
+
+    def racing_link(src, dst, *args, **kwargs):
+        attempts.append(os.fspath(dst))
+        if len(attempts) == 1:
+            # Another process wins the race for the selected name right before our move.
+            assert os.fspath(dst) == str(expected_first)
+            expected_first.write_text("preexisting-archive", encoding="utf-8")
+        return real_link(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "link", racing_link)
+    moved = quarantine_state_file(p)
+
+    assert attempts == [
+        str(expected_first),
+        str(tmp_path / "state.json.corrupt-20260906T120000Z.1"),
+    ]
+    assert moved == tmp_path / "state.json.corrupt-20260906T120000Z.1"
+    assert expected_first.read_text(encoding="utf-8") == "preexisting-archive"
+    assert moved.read_text(encoding="utf-8") == "garbage-new"
+    assert not p.exists()
+
+
+def test_quarantine_gives_up_after_bounded_attempts(tmp_path, monkeypatch):
+    import os
+
+    from autoforge import state as state_mod
+    from autoforge.state import quarantine_state_file
+
+    monkeypatch.setattr(state_mod, "_QUARANTINE_MAX_ATTEMPTS", 3)
+    p = tmp_path / "state.json"
+    p.write_text("garbage", encoding="utf-8")
+
+    def always_taken(src, dst, *args, **kwargs):
+        raise FileExistsError(17, "File exists", os.fspath(dst))
+
+    monkeypatch.setattr(os, "link", always_taken)
+    with pytest.raises(StateError, match="no free name after 3 attempts"):
+        quarantine_state_file(p)
+    assert p.read_text(encoding="utf-8") == "garbage"  # original untouched
+
+
+def test_quarantine_unlink_failure_leaves_original_and_drops_reservation(tmp_path, monkeypatch):
+    import os
+
+    from autoforge.state import quarantine_state_file
+
+    p = tmp_path / "state.json"
+    p.write_text("garbage", encoding="utf-8")
+    real_unlink = os.unlink
+
+    def failing_unlink(path, *args, **kwargs):
+        if os.fspath(path) == str(p):
+            raise PermissionError(13, "Permission denied", os.fspath(path))
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", failing_unlink)
+    with pytest.raises(StateError, match="cannot move"):
+        quarantine_state_file(p)
+    assert p.read_text(encoding="utf-8") == "garbage"
+    assert [q.name for q in tmp_path.iterdir()] == ["state.json"]
