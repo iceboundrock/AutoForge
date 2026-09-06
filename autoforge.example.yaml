@@ -1,0 +1,104 @@
+# AutoForge example configuration (v1).
+#
+# Copy to autoforge.yaml (or .toml/.json) and adjust. Logical profile names
+# (analyze_execute, fix, review_round_1, ...) are stable; the actual CLI
+# command / model identifiers live here so controller source never changes
+# when vendors rename flags or models.
+#
+# CLI facts these defaults were checked against (2026-09):
+#   claude   2.1.x   -> claude -p --output-format text --model <alias> --effort <e>
+#                       --permission-mode <mode> --no-session-persistence -- <prompt>
+#   opencode 1.18.x  -> opencode run -m <provider/model> --variant <effort>
+#                       --format default [--auto] <prompt>
+#   gh       2.x     -> gh pr view --json ..., gh issue view --json ..., gh api ...
+# Real model ids (from `opencode models` and `claude --help`):
+#   claude:   fable            (alias resolved by the CLI to claude-fable-5-1)
+#   opencode: openai/gpt-5.6-luna, openai/gpt-5.6-terra, openai/gpt-5.6-sol
+
+version: 1
+
+state_dir: .autoforge
+
+prompt_version: v1
+
+execution:
+  default_timeout_seconds: 1800
+  # A malformed CONTROL_RESULT with exit code 0 triggers at most this many
+  # correction prompts before the step fails (0 disables correction).
+  max_correction_attempts: 1
+
+safety:
+  # Controller invariant: no real merge unless this is true AND the CLI is
+  # invoked with --allow-merge. Automatic merge is disabled in this milestone.
+  allow_merge: false
+
+profiles:
+  analyze_execute:
+    provider: claude
+    model: fable            # `claude --model`
+    effort: high            # `claude --effort` (low|medium|high|xhigh|max)
+    command: claude
+    timeout_seconds: 1800
+    options:
+      permission_mode: bypassPermissions   # non-interactive; sandbox the working tree
+      output_format: text
+
+  fix:
+    provider: claude
+    model: fable
+    effort: high
+    command: claude
+    timeout_seconds: 1800
+    options:
+      permission_mode: bypassPermissions
+      output_format: text
+
+  review_round_1:
+    provider: opencode
+    model: openai/gpt-5.6-luna     # `opencode run -m` (provider/model)
+    effort: high                   # `opencode run --variant`
+    command: opencode
+    timeout_seconds: 1800
+    options:
+      output_format: default       # final text on stdout (CONTROL_RESULT verbatim)
+      auto_approve: false          # add `--auto` only if your OpenCode permissions need it
+
+  review_round_2_5:
+    provider: opencode
+    model: openai/gpt-5.6-terra
+    effort: high
+    command: opencode
+    timeout_seconds: 1800
+    options:
+      output_format: default
+      auto_approve: false
+
+  review_round_6_plus:
+    provider: opencode
+    model: openai/gpt-5.6-sol
+    effort: medium
+    command: opencode
+    timeout_seconds: 1200
+    options:
+      output_format: default
+      auto_approve: false
+
+  # Future milestones (gated; never executed unless safety.allow_merge + --allow-merge).
+  merge:
+    provider: opencode
+    model: openai/gpt-5.6-sol
+    effort: high
+    command: opencode
+    timeout_seconds: 1200
+
+  update_epic:
+    provider: opencode
+    model: openai/gpt-5.6-sol
+    effort: high
+    command: opencode
+    timeout_seconds: 1200
+
+github:
+  # `gh` binary name / path. All GitHub reads/verification go through `gh`.
+  command: gh
+  timeout_seconds: 120

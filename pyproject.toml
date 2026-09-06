@@ -1,0 +1,42 @@
+[project]
+name = "autoforge"
+version = "0.1.0"
+description = "Autonomous orchestration for AI-driven software development (deterministic controller over Claude Code / OpenCode / gh)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+# Full YAML config support (without it, the built-in subset parser is used).
+yaml = ["pyyaml>=6"]
+
+[project.scripts]
+autoforge = "autoforge.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.4", "mypy>=1.10"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = false
+ignore_missing_imports = true
+show_error_codes = true
