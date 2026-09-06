@@ -31,20 +31,38 @@ from .validation import (
     parse_pr_url,
 )
 
+# Transient `gh` failures: the same read may well succeed later, so the engine
+# treats them as *inconclusive* (bounded re-checks) instead of conclusive.
+# Phrase markers cover network-level errors and the reason phrases GitHub
+# attaches to server-side / throttling statuses; the HTTP status itself is
+# matched as a whole class (every 5xx, plus 429) rather than an enumerated
+# list, so e.g. ``HTTP 500`` is not silently conclusive. `gh` prints the
+# status as ``HTTP 502: Bad Gateway`` (GraphQL) or ``gh: Bad Gateway (HTTP
+# 502)`` (REST); both shapes are matched, bare numbers elsewhere in the
+# message (PR numbers, SHAs) are not.
 _TRANSIENT_MARKERS = (
     "timeout",
     "timed out",
     "connection reset",
     "connection refused",
     "temporarily unavailable",
-    "502",
-    "503",
-    "504",
     "tls handshake",
     "no such host",
     "rate limit",
-    "429",
+    "too many requests",
+    "internal server error",
+    "bad gateway",
+    "service unavailable",
+    "gateway timeout",
+    "gateway time-out",
 )
+_TRANSIENT_HTTP_STATUS = re.compile(r"\bhttp\s+(?:5\d\d|429)\b")
+
+
+def is_transient_gh_failure(stderr: str) -> bool:
+    """Whether a failed `gh` invocation's stderr describes a transient failure."""
+    text = stderr.lower()
+    return any(m in text for m in _TRANSIENT_MARKERS) or bool(_TRANSIENT_HTTP_STATUS.search(text))
 
 
 @dataclass
@@ -241,7 +259,7 @@ class GitHubClient:
             elif res.exit_code != 0:
                 tail = res.stderr.strip()[-1000:]
                 last_error = f"`gh {' '.join(args)}` failed (exit {res.exit_code}): {tail}"
-                transient = any(m in tail.lower() for m in _TRANSIENT_MARKERS)
+                transient = is_transient_gh_failure(tail)
             else:
                 return res
             if allow_fail and not transient:

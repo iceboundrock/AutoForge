@@ -173,10 +173,16 @@ def test_transient_error_retried_once():
     [
         "error connecting to api.github.com: timeout",
         "read: connection reset by peer",
+        "HTTP 500: Internal Server Error",  # R4-F1: whole 5xx class, not an enumerated list
         "HTTP 502: Bad Gateway",
         "HTTP 503: Service Unavailable",
+        "HTTP 504: Gateway Timeout",
+        "HTTP 599: Network Connect Timeout Error",
+        "gh: Internal Server Error (HTTP 500)",  # REST (`gh api`) shape
+        "gh: Bad Gateway (HTTP 502)",
         "API rate limit exceeded for user",
         "HTTP 429: Too Many Requests",
+        "gh: Too Many Requests (HTTP 429)",
     ],
 )
 def test_transient_failure_raises_github_unavailable_error(stderr):
@@ -209,7 +215,11 @@ def test_timeout_raises_github_unavailable_error():
         "HTTP 401: Bad credentials (https://api.github.com/graphql)",
         "HTTP 403: Resource not accessible by integration",
         "HTTP 404: Not Found",
+        "gh: Not Found (HTTP 404)",
         "could not find pull request",
+        # Bare numbers that merely *look* like a status are not a transient status.
+        "GraphQL: Could not resolve to a PullRequest with the number of 5021.",
+        "HTTP 422: No commit found for SHA: 503f4e1 (https://api.github.com/graphql)",
     ],
 )
 def test_conclusive_failure_is_plain_github_error(stderr):

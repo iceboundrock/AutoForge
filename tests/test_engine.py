@@ -13,7 +13,8 @@ from autoforge.errors import (
     StateTransitionError,
     VerificationError,
 )
-from autoforge.github import CheckInfo, MergeQueueStatus
+from autoforge.executor import ExecutionResult
+from autoforge.github import CheckInfo, GitHubClient, MergeQueueStatus
 from autoforge.providers import AgentExecutionResult, ScriptedProvider
 from autoforge.state import load_state
 from autoforge.transitions import Phase
@@ -1371,6 +1372,46 @@ _READ_FAILURES = [
     pytest.param(_break_pr_read, "could not be read", id="pr-read"),
     pytest.param(_break_queue_read, "merge-queue status", id="queue-read"),
 ]
+
+
+def test_http_500_from_gh_is_retried_then_bounded_verification(tmp_state_dir):
+    """R4-F1: an HTTP 500 is a transient GitHub failure end to end, not a conclusive BLOCKED.
+
+    Drives the real GitHubClient (scripted `gh` runner, no network) through the
+    engine: the failed read is retried by the client, then classified as
+    unavailable so the engine takes the bounded re-check path and blocks only
+    once the bound is reached. Nothing is merged.
+    """
+    calls: list[list[str]] = []
+
+    def gh_runner(req):
+        calls.append(req.command)
+        return ExecutionResult(
+            command=req.command,
+            cwd=None,
+            exit_code=1,
+            stdout="",
+            stderr="HTTP 500: Internal Server Error (https://api.github.com/graphql)",
+            started_at="",
+            finished_at="",
+        )
+
+    gh = GitHubClient(runner=gh_runner, retry_delay_seconds=0, transient_retries=1)
+    eng = _in_merge(tmp_state_dir, gh, phase=Phase.READY_FOR_MERGE)  # type: ignore[arg-type]
+    eng.config.merge.max_verification_attempts = 3
+    for n in (1, 2):
+        with pytest.raises(VerificationError, match=f"could not be read.*HTTP 500.*attempt {n}/3"):
+            eng.step(allow_merge=True)
+        assert load_state(eng.paths.state_file).phase == Phase.READY_FOR_MERGE
+        assert load_state(eng.paths.state_file).attempt == n
+        # transient_retries=1 -> the client retried the read once per verification attempt
+        assert len(calls) == 2 * n
+        assert all(cmd[1:3] == ["pr", "view"] for cmd in calls)
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "BLOCKED"
+    assert "inconclusive for 3 verification attempt(s)" in eng.state.block_reason
+    assert "not a transient GitHub failure" not in eng.state.block_reason
+    assert not any("merge" in cmd for cmd in calls)  # gh pr merge was never run
 
 
 @pytest.mark.parametrize("phase", [Phase.READY_FOR_MERGE, Phase.MERGE])
