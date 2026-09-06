@@ -68,6 +68,16 @@ def test_load_corrupted_json_raises_and_does_not_clobber(tmp_path):
     assert p.read_text(encoding="utf-8") == '{"phase": "REVIEW", "run_id": '
 
 
+def test_load_invalid_utf8_raises_state_error_and_does_not_clobber(tmp_path):
+    """Invalid UTF-8 is corruption, not a read error: it must surface as StateError."""
+    p = tmp_path / "state.json"
+    raw = b'\xff\xfe{"phase": "REVIEW"}'
+    p.write_bytes(raw)
+    with pytest.raises(StateError, match="[Cc]orrupt.*UTF-8"):
+        load_state(p)
+    assert p.read_bytes() == raw
+
+
 def test_load_unknown_phase_raises(tmp_path):
     p = tmp_path / "state.json"
     p.write_text(json.dumps({"phase": "TELEPORT", "run_id": "x"}), encoding="utf-8")

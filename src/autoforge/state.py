@@ -247,6 +247,13 @@ def load_state(path: str | Path) -> AutoForgeState:
         raw = p.read_text(encoding="utf-8")
     except OSError as exc:
         raise StateError(f"cannot read state file {p}: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        # Invalid UTF-8 is a corrupt file, not a read failure: it must take
+        # the same fail-loud / quarantine path as unparseable JSON.
+        raise StateError(
+            f"corrupted state file {p}: not valid UTF-8 ({exc}); "
+            "refusing to overwrite — restore from backup or re-run"
+        ) from exc
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:

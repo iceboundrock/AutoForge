@@ -550,6 +550,23 @@ def test_run_refuses_corrupt_state_without_force(tmp_path, capsys, monkeypatch, 
     assert sorted(p.name for p in sd.iterdir()) == ["state.json"]
 
 
+def test_run_refuses_invalid_utf8_state_without_force(tmp_path, capsys, monkeypatch, fakes):
+    """A state.json holding invalid UTF-8 is corrupt: exit 2, bytes untouched (R1-F1)."""
+    monkeypatch.chdir(tmp_path)
+    sd = tmp_path / ".autoforge"
+    sd.mkdir()
+    raw = b'\xff\xfe{"phase": "REVIEW", "run_id": "x"}'
+    (sd / "state.json").write_bytes(raw)
+    rc = cli.main(
+        ["--state-dir", str(sd), "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"]
+    )
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "corrupt" in err.lower() and "utf-8" in err.lower() and "--force" in err
+    assert (sd / "state.json").read_bytes() == raw
+    assert sorted(p.name for p in sd.iterdir()) == ["state.json"]
+
+
 def test_run_refuses_foreign_protocol_state_without_force(tmp_path, capsys, monkeypatch, fakes):
     monkeypatch.chdir(tmp_path)
     sd = tmp_path / ".autoforge"
@@ -590,6 +607,37 @@ def test_run_force_moves_corrupt_state_aside(tmp_path, capsys, monkeypatch, fake
     quarantined = [p for p in sd.iterdir() if p.name.startswith("state.json.corrupt-")]
     assert len(quarantined) == 1
     assert quarantined[0].read_text(encoding="utf-8") == raw
+    assert str(quarantined[0]) in err
+    assert cli.main(["--state-dir", str(sd), "status", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["phase"] == "ANALYZE_EXECUTE"
+
+
+def test_run_force_moves_invalid_utf8_state_aside(tmp_path, capsys, monkeypatch, fakes):
+    """run --force quarantines an invalid-UTF-8 state.json and keeps the original bytes (R1-F1)."""
+    monkeypatch.chdir(tmp_path)
+    sd = tmp_path / ".autoforge"
+    sd.mkdir()
+    raw = b'\xff\xfe{"phase": "REVIEW", "run_id": "x"}'
+    (sd / "state.json").write_bytes(raw)
+    rc = cli.main(
+        [
+            "--state-dir",
+            str(sd),
+            "run",
+            "--epic",
+            EPIC,
+            "--issue",
+            ISSUE,
+            "--max-steps",
+            "1",
+            "--force",
+        ]
+    )
+    assert rc == 0
+    err = capsys.readouterr().err
+    quarantined = [p for p in sd.iterdir() if p.name.startswith("state.json.corrupt-")]
+    assert len(quarantined) == 1
+    assert quarantined[0].read_bytes() == raw
     assert str(quarantined[0]) in err
     assert cli.main(["--state-dir", str(sd), "status", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["phase"] == "ANALYZE_EXECUTE"
