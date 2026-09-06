@@ -1,0 +1,275 @@
+"""Shared fixtures/helpers for AutoForge tests.
+
+No test ever invokes a real Claude Code / OpenCode / GitHub write API:
+agents are ``ScriptedProvider`` instances, GitHub is ``FakeGitHub``.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+import pytest
+
+SRC = Path(__file__).resolve().parents[1] / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from autoforge.config import default_config  # noqa: E402
+from autoforge.engine import ControllerEngine  # noqa: E402
+from autoforge.errors import GitHubError  # noqa: E402
+from autoforge.executor import ExecutionResult  # noqa: E402
+from autoforge.github import CommentInfo, IssueInfo, PRInfo, RepoInfo  # noqa: E402
+from autoforge.providers import ProviderRegistry, ScriptedProvider  # noqa: E402
+from autoforge.result_parser import BEGIN, END  # noqa: E402
+from autoforge.validation import parse_issue_url  # noqa: E402
+
+EPIC = "https://github.com/owner/repo/issues/1"
+ISSUE = "https://github.com/owner/repo/issues/2"
+ISSUE3 = "https://github.com/owner/repo/issues/3"
+PR = "https://github.com/owner/repo/pull/42"
+SHA_A = "a" * 40
+SHA_B = "b" * 40
+SHA_C = "c" * 40
+BRANCH = "autoforge/2-feature"
+
+
+def block(payload: str | dict) -> str:
+    if isinstance(payload, dict):
+        payload = json.dumps(payload)
+    return f"some logs...\n{BEGIN}\n{payload}\n{END}\n"
+
+
+def comment_url(pr_url: str, cid: int) -> str:
+    return f"{pr_url}#issuecomment-{cid}"
+
+
+def review_comment_body(
+    round: int, sha: str, needs_fix: bool, finding_ids: list[str] | None = None
+) -> str:
+    marker = json.dumps(
+        {
+            "round": round,
+            "reviewed_head_sha": sha,
+            "needs_fix_round": needs_fix,
+            "finding_ids": finding_ids or [],
+        }
+    )
+    return (
+        f"# AI Code Review — Round {round}\n\nReviewed HEAD: `{sha}`\n\n"
+        "## Findings\n...\n## Spec\n...\n## Standards\n...\n## Assessment\n...\n"
+        "## Observations\n...\n## Verification\n...\n## Summary\n"
+        f"Needs another fix round: {'YES' if needs_fix else 'NO'}\n"
+        f"<!-- ai-review-result: {marker} -->\n"
+    )
+
+
+class FakeAgent:
+    """Queued fake *runner* (ExecutionRequest -> ExecutionResult)."""
+
+    def __init__(self, stdout_queue: list[str], exit_code: int = 0):
+        self.queue = list(stdout_queue)
+        self.exit_code = exit_code
+        self.calls: list = []
+
+    def __call__(self, req):
+        self.calls.append(req)
+        stdout = self.queue.pop(0) if self.queue else ""
+        return ExecutionResult(
+            command=list(req.command),
+            cwd=req.cwd,
+            exit_code=self.exit_code,
+            stdout=stdout,
+            stderr="",
+            started_at="2026-01-01T00:00:00+00:00",
+            finished_at="2026-01-01T00:00:01+00:00",
+        )
+
+
+class FakeGitHub:
+    """In-memory GitHub read model. Tests mutate it to simulate agent actions."""
+
+    def __init__(self, repo: str = "owner/repo"):
+        self.repo = repo
+        self.issues: dict[str, IssueInfo] = {}
+        self.prs: dict[str, PRInfo] = {}
+        self.comments: dict[str, list[CommentInfo]] = {}
+        self.calls: list[tuple] = []
+        self.add_issue(EPIC, "EPIC")
+        self.add_issue(ISSUE, "Feature")
+
+    # -- test helpers ---------------------------------------------------------
+    def add_issue(self, url: str, title: str = "t", state: str = "OPEN") -> IssueInfo:
+        ref = parse_issue_url(url)
+        info = IssueInfo(
+            url=ref.canonical,
+            number=ref.number,
+            title=title,
+            state=state,
+            repository=ref.repository,
+        )
+        self.issues[ref.canonical] = info
+        return info
+
+    def add_pr(
+        self,
+        url: str = PR,
+        head_sha: str = SHA_A,
+        branch: str = BRANCH,
+        state: str = "OPEN",
+        linked: list[int] | None = None,
+    ) -> PRInfo:
+        from autoforge.validation import parse_pr_url
+
+        ref = parse_pr_url(url)
+        info = PRInfo(
+            url=ref.canonical,
+            number=ref.number,
+            title="PR",
+            state=state,
+            head_sha=head_sha,
+            base_ref="main",
+            head_ref=branch,
+            repository=ref.repository,
+            linked_issue_numbers=list(linked or []),
+        )
+        self.prs[ref.canonical] = info
+        return info
+
+    def add_comment(self, pr_url: str, cid: int, body: str) -> CommentInfo:
+        c = CommentInfo(id=cid, url=comment_url(pr_url, cid), body=body, parent_url=pr_url)
+        self.comments.setdefault(pr_url, []).append(c)
+        return c
+
+    def set_head(self, sha: str, pr_url: str = PR) -> None:
+        self.prs[pr_url].head_sha = sha
+
+    # -- client API --------------------------------------------------------------
+    def current_repo(self) -> RepoInfo:
+        self.calls.append(("current_repo",))
+        return RepoInfo(name_with_owner=self.repo, default_branch="main")
+
+    def get_repo(self, repo: str) -> RepoInfo:
+        return RepoInfo(name_with_owner=repo, default_branch="main")
+
+    def get_issue(self, url: str) -> IssueInfo:
+        self.calls.append(("get_issue", url))
+        ref = parse_issue_url(url)
+        try:
+            return self.issues[ref.canonical]
+        except KeyError:
+            raise GitHubError(f"issue not found: {url}") from None
+
+    def get_issue_state(self, url: str) -> str:
+        return self.get_issue(url).state
+
+    def issue_exists(self, url: str) -> bool:
+        try:
+            self.get_issue(url)
+            return True
+        except GitHubError:
+            return False
+
+    def get_pr(self, url: str) -> PRInfo:
+        from autoforge.validation import parse_pr_url
+
+        self.calls.append(("get_pr", url))
+        ref = parse_pr_url(url)
+        try:
+            return self.prs[ref.canonical]
+        except KeyError:
+            raise GitHubError(f"pr not found: {url}") from None
+
+    def get_pr_head_sha(self, url: str) -> str:
+        return self.get_pr(url).head_sha
+
+    def get_pr_state(self, url: str) -> str:
+        return self.get_pr(url).state
+
+    def get_pr_branch(self, url: str) -> str:
+        return self.get_pr(url).head_ref
+
+    def get_pr_checks(self, url: str):
+        return self.get_pr(url).checks
+
+    def pr_exists(self, url: str) -> bool:
+        try:
+            self.get_pr(url)
+            return True
+        except GitHubError:
+            return False
+
+    def list_open_prs(self, repo: str, limit: int = 100) -> list[PRInfo]:
+        return [p for p in self.prs.values() if p.is_open and p.repository == repo]
+
+    def find_open_prs_for_issue(self, issue) -> list[PRInfo]:
+        self.calls.append(("find_open_prs_for_issue", issue.number))
+        out = []
+        for pr in self.list_open_prs(issue.repository):
+            if (
+                issue.number in pr.linked_issue_numbers
+                or pr.head_ref.startswith(f"autoforge/{issue.number}-")
+                or pr.head_ref == f"autoforge/{issue.number}"
+            ):
+                out.append(pr)
+        return out
+
+    def get_pr_comments(self, url: str) -> list[CommentInfo]:
+        self.calls.append(("get_pr_comments", url))
+        self.get_pr(url)
+        return list(self.comments.get(url, []))
+
+    def get_comment(self, url: str) -> CommentInfo:
+        for cs in self.comments.values():
+            for c in cs:
+                if c.url == url:
+                    return c
+        raise GitHubError(f"comment not found: {url}")
+
+
+def scripted_config():
+    """Default config with every profile routed to the scripted provider.
+
+    Model/effort routing is preserved so tests can assert on it.
+    """
+    cfg = default_config()
+    for p in cfg.profiles.values():
+        p.provider = "scripted"
+    return cfg
+
+
+def make_engine(
+    state_dir,
+    script=None,
+    github: FakeGitHub | None = None,
+    cfg=None,
+    exit_code: int = 0,
+    workdir=".",
+):
+    """Engine wired to a ScriptedProvider (agents) and FakeGitHub (verification)."""
+    cfg = cfg or default_config()
+    provider = ScriptedProvider(script, exit_code=exit_code)
+    registry = ProviderRegistry(overrides={"claude": provider, "opencode": provider})
+    gh = github or FakeGitHub()
+    eng = ControllerEngine(
+        config=cfg, state_dir=state_dir, workdir=workdir, github=gh, providers=registry
+    )
+    eng.new_run(EPIC, ISSUE)
+    eng.provider = provider  # type: ignore[attr-defined]
+    return eng
+
+
+@pytest.fixture
+def tmp_state_dir(tmp_path):
+    return tmp_path / ".autoforge"
+
+
+@pytest.fixture
+def fake_github():
+    return FakeGitHub()
+
+
+@pytest.fixture
+def engine(tmp_state_dir, fake_github):
+    return make_engine(tmp_state_dir, [], github=fake_github)

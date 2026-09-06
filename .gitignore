@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# AutoForge runtime (never commit live controller state)
+.autoforge/state.json
+.autoforge/controller.lock
+.autoforge/logs/
+.autoforge/*.tmp
+.autoforge/*.tmp.*
+
+# Local config overrides with possible credentials
+autoforge.local.yaml
+autoforge.local.yml
+autoforge.local.toml
+autoforge.local.json
+.env
