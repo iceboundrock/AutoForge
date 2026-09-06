@@ -18,7 +18,11 @@ if str(SRC) not in sys.path:
 
 from autoforge.config import default_config  # noqa: E402
 from autoforge.engine import ControllerEngine  # noqa: E402
-from autoforge.errors import GitHubError, GitHubUnavailableError  # noqa: E402
+from autoforge.errors import (  # noqa: E402
+    GitHubError,
+    GitHubNotFoundError,
+    GitHubUnavailableError,
+)
 from autoforge.executor import ExecutionResult  # noqa: E402
 from autoforge.github import (  # noqa: E402
     CommentInfo,
@@ -181,10 +185,11 @@ class FakeGitHub:
         if self.get_issue_error is not None:
             raise self.get_issue_error
         ref = parse_issue_url(url)
-        try:
-            return self.issues[ref.canonical]
-        except KeyError:
-            raise GitHubError(f"issue not found: {url}") from None
+        # Like GitHub, resolve owner/repo case-insensitively (identity = repo + number).
+        for known, info in self.issues.items():
+            if parse_issue_url(known).same_target(ref):
+                return info
+        raise GitHubNotFoundError(f"issue not found: {url}")
 
     def get_issue_state(self, url: str) -> str:
         return self.get_issue(url).state

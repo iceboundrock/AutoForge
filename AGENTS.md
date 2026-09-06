@@ -364,9 +364,16 @@ before switching issues:
 - it is neither the EPIC nor the issue just finished
 - the issue exists and is `OPEN`
 
+Identity checks (EPIC, just-finished issue) compare repository
+case-insensitively plus issue number, never URL strings: GitHub owner and
+repository names are case-insensitive.
+
 A rejected selection is retried once (with the controller's reason in the
-prompt); a second rejection enters `BLOCKED`. Never switch to an unverified
-issue.
+prompt); a second rejection enters `BLOCKED`. A transient GitHub failure
+while checking the selection takes the same bounded retry. Any other GitHub
+failure (authentication, permissions, malformed data) is conclusive and
+enters `BLOCKED` immediately without invoking the agent again. Never switch
+to an unverified issue.
 
 ### Before MERGE
 

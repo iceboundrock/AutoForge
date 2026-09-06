@@ -5,7 +5,7 @@ from dataclasses import replace
 
 import pytest
 
-from autoforge.errors import GitHubError, GitHubUnavailableError
+from autoforge.errors import GitHubError, GitHubNotFoundError, GitHubUnavailableError
 from autoforge.executor import ExecutionResult
 from autoforge.github import GitHubClient
 
@@ -254,6 +254,43 @@ def test_conclusive_failure_is_plain_github_error(stderr):
         gh.get_pr_merge_queue_status("https://github.com/o/r/pull/42")
     assert not isinstance(info.value, GitHubUnavailableError)
     assert len(calls) == 1  # never retried
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "GraphQL: Could not resolve to an Issue with the number of 999. (repository.issue)",
+        "GraphQL: Could not resolve to a PullRequest with the number of 5021.",
+        "HTTP 404: Not Found (https://api.github.com/repos/o/r/issues/999)",
+        "gh: Not Found (HTTP 404)",
+        "could not find pull request",
+    ],
+)
+def test_not_found_is_typed_conclusive_error(stderr):
+    """ "No such issue" is conclusive *and* about the object, so it gets its own type."""
+    gh = GitHubClient(
+        runner=lambda req: _res({}, exit_code=1, stderr=stderr), retry_delay_seconds=0
+    )
+    with pytest.raises(GitHubNotFoundError):
+        gh.get_issue("https://github.com/o/r/issues/999")
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "HTTP 401: Bad credentials (https://api.github.com/graphql)",
+        "HTTP 403: Resource not accessible by integration",
+        "To get started with GitHub CLI, please run:  gh auth login",
+        "HTTP 422: No commit found for SHA: 404abc1 (https://api.github.com/graphql)",
+    ],
+)
+def test_auth_and_permission_failures_are_not_not_found(stderr):
+    gh = GitHubClient(
+        runner=lambda req: _res({}, exit_code=1, stderr=stderr), retry_delay_seconds=0
+    )
+    with pytest.raises(GitHubError) as info:
+        gh.get_issue("https://github.com/o/r/issues/999")
+    assert not isinstance(info.value, (GitHubNotFoundError, GitHubUnavailableError))
 
 
 def test_current_repo_uses_repo_view():

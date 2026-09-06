@@ -65,6 +65,17 @@ class GitHubUnavailableError(GitHubError):
     """
 
 
+class GitHubNotFoundError(GitHubError):
+    """The referenced issue / PR does not resolve on GitHub (conclusive).
+
+    ``gh`` answered, and the answer is that the object is not there (or is
+    not visible to the authenticated token, which GitHub reports the same
+    way). Callers that verify an *untrusted selection* treat this as a bad
+    selection; every other conclusive :class:`GitHubError` (authentication,
+    permissions, malformed data) is not about the selection at all.
+    """
+
+
 class VerificationError(AutoForgeError):
     """Post-execution verification failed (HEAD mismatch, PR state, guards).
 
