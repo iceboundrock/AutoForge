@@ -125,7 +125,10 @@ class WorkflowConfig:
     # 0 disables this rule (the hard cap above still applies).
     stagnation_identical_rounds: int = 2
     # Consecutive review rounds with findings whose finding *count* never
-    # changed before the loop is declared stagnant. 0 disables this rule.
+    # changed, while at least one required resolution recurs within those
+    # rounds (A/B/A ping-pong), before the loop is declared stagnant. Rounds
+    # of entirely new findings are progress and only meet the cap above.
+    # 0 disables this rule.
     stagnation_unchanged_count_rounds: int = 3
     # Cumulative executed steps for the whole run (all issues, all phases,
     # across `resume`). Persisted as ``step_count``; the CLI's ``--max-steps``

@@ -9,6 +9,7 @@ from autoforge.loop_guard import (
     findings_fingerprint,
     next_round_cap_reason,
     normalize_resolution,
+    resolution_digests,
     review_record,
     round_cap_reason,
     stagnation_reason,
@@ -47,7 +48,13 @@ def test_review_record_shape_and_result_validation():
         "result": "needs_fix",
         "finding_count": 2,
         "fingerprint": findings_fingerprint([_f("x"), _f("y")]),
+        "resolutions": resolution_digests([_f("x"), _f("y")]),
     }
+    assert len(rec["resolutions"]) == 2 and rec["resolutions"] == sorted(rec["resolutions"])
+    # per-finding digests ignore ids/locations/whitespace/case and de-duplicate
+    assert resolution_digests([_f(" X ", "R9-F9", "z.py"), _f("x")]) == resolution_digests(
+        [_f("x")]
+    )
     with pytest.raises(ValueError, match="unknown review result"):
         review_record(1, SHA_A, "merged", [])
 
@@ -79,20 +86,50 @@ def test_stagnation_identical_resolutions():
     assert stagnation_reason(other, 2, 0) == ""
 
 
-def test_stagnation_unchanged_count():
+def test_stagnation_unchanged_count_needs_a_recurring_resolution():
+    # A/B/A ping-pong: the count never changes and "a" comes back in round 3.
+    hist = _hist(
+        (RESULT_NEEDS_FIX, [_f("a")]),
+        (RESULT_NEEDS_FIX, [_f("b")]),
+        (RESULT_NEEDS_FIX, [_f("A")]),
+    )
+    reason = stagnation_reason(hist, 0, 3)
+    assert reason.startswith("review rounds 1, 2, 3 each ended with 1")
+    assert "1 required resolution(s) recur" in reason
+    assert stagnation_reason(hist, 0, 4) == ""
+    # Three genuinely new findings (each earlier one resolved) are progress.
+    fresh = _hist(
+        (RESULT_NEEDS_FIX, [_f("a")]),
+        (RESULT_NEEDS_FIX, [_f("b")]),
+        (RESULT_NEEDS_FIX, [_f("c")]),
+    )
+    assert stagnation_reason(fresh, 0, 3) == ""
+    # A recurring demand among otherwise new findings still counts.
+    mixed = _hist(
+        (RESULT_NEEDS_FIX, [_f("a"), _f("b", "R1-F2")]),
+        (RESULT_NEEDS_FIX, [_f("c"), _f("d", "R2-F2")]),
+        (RESULT_NEEDS_FIX, [_f("e"), _f("b", "R3-F2")]),
+    )
+    assert "recur" in stagnation_reason(mixed, 0, 3)
+    # A changing count is never stagnation, recurring text or not.
+    progress = _hist(
+        (RESULT_NEEDS_FIX, [_f("a"), _f("a2", "R1-F2")]),
+        (RESULT_NEEDS_FIX, [_f("a")]),
+        (RESULT_NEEDS_FIX, [_f("a")]),
+    )
+    assert stagnation_reason(progress, 0, 3) == ""
+
+
+def test_stagnation_unchanged_count_keeps_count_only_rule_for_legacy_history():
+    """Entries persisted before per-finding digests existed cannot prove recurrence."""
     hist = _hist(
         (RESULT_NEEDS_FIX, [_f("a")]),
         (RESULT_NEEDS_FIX, [_f("b")]),
         (RESULT_NEEDS_FIX, [_f("c")]),
     )
-    assert stagnation_reason(hist, 0, 3).startswith("review rounds 1, 2, 3 each ended with 1")
-    assert stagnation_reason(hist, 0, 4) == ""
-    progress = _hist(
-        (RESULT_NEEDS_FIX, [_f("a"), _f("a2", "R1-F2")]),
-        (RESULT_NEEDS_FIX, [_f("b")]),
-        (RESULT_NEEDS_FIX, [_f("c")]),
-    )
-    assert stagnation_reason(progress, 0, 3) == ""
+    del hist[0]["resolutions"]
+    reason = stagnation_reason(hist, 0, 3)
+    assert "finding count has not changed" in reason and "older controller" in reason
 
 
 def test_stagnation_only_counts_trailing_needs_fix_rounds():

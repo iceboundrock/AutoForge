@@ -61,7 +61,9 @@ workflow:
   # whitespace/case-normalised) -> BLOCKED. 0 disables the rule.
   stagnation_identical_rounds: 2
   # Stagnation: this many consecutive rounds with findings whose finding
-  # count did not change -> BLOCKED. 0 disables the rule.
+  # count did not change AND in which some `required_resolution` recurs
+  # (A/B/A ping-pong) -> BLOCKED. Rounds of entirely new findings are
+  # progress and only meet max_review_rounds. 0 disables the rule.
   stagnation_unchanged_count_rounds: 3
   # Cumulative step budget of the whole run (all phases, all issues). It is
   # measured on the persisted `step_count`, so `resume` continues the same

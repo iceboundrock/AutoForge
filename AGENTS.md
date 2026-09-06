@@ -232,12 +232,12 @@ The REVIEW/FIX cycle must be bounded by the controller, never by prompt wording:
 workflow:
   max_review_rounds: 6                  # completed review rounds per PR
   stagnation_identical_rounds: 2        # identical required_resolution texts
-  stagnation_unchanged_count_rounds: 3  # unchanged finding count
+  stagnation_unchanged_count_rounds: 3  # unchanged count + a recurring resolution
   max_total_steps: 300                  # cumulative steps of the run
 ```
 
 - A review round at the cap that still has findings enters `BLOCKED` with a clear `block_reason`; no further FIX round is started because its result could never be reviewed. A clean round at the cap proceeds normally. Entering `REVIEW` beyond the cap (stale re-review, HEAD drift, resume) is refused before the reviewer runs.
-- Stagnation is judged on the persisted per-PR `review_history` (round, reviewed SHA, result, finding count, fingerprint of the normalised `required_resolution` texts). Only trailing consecutive rounds that ended with findings count; a clean or stale round breaks the streak. A value of 0 disables a rule.
+- Stagnation is judged on the persisted per-PR `review_history` (round, reviewed SHA, result, finding count, fingerprint of the normalised `required_resolution` texts, per-finding digests of those texts). Only trailing consecutive rounds that ended with findings count; a clean or stale round breaks the streak. The unchanged-count rule additionally requires a `required_resolution` that recurs within the window (A/B/A ping-pong): rounds of entirely new findings, each earlier one resolved, are progress bounded by the round cap only. A value of 0 disables a rule.
 - The step budget is measured on the persisted cumulative `step_count`, which is never reset by `resume` or by switching issues. CLI `--max-steps` bounds a single invocation only.
 - Failed invocations consume neither a review round nor a `review_history` entry.
 - Hitting any bound is `BLOCKED` (terminal). The open findings and the PR stay for a human; nothing is merged.

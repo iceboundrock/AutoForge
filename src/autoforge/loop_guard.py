@@ -8,8 +8,12 @@ functions whether the loop must stop:
 - :func:`stagnation_reason` — consecutive rounds with findings that show no
   progress: identical required resolutions (normalised text) for
   ``workflow.stagnation_identical_rounds`` rounds, or an unchanged finding
-  count for ``workflow.stagnation_unchanged_count_rounds`` rounds. A clean
-  or stale round breaks the streak.
+  count for ``workflow.stagnation_unchanged_count_rounds`` rounds *while at
+  least one required resolution recurs inside that window* (the same demand
+  keeps coming back, e.g. an A/B/A ping-pong). Rounds whose findings are all
+  new are progress, not stagnation, however many of them there are: a picky
+  reviewer that raises one fresh finding per round is bounded by the hard
+  cap only. A clean or stale round breaks the streak.
 - :func:`step_budget_reason` — the cumulative ``workflow.max_total_steps``
   budget, measured on the persisted ``step_count`` so ``resume`` continues
   the same budget instead of starting a new one.
@@ -47,6 +51,22 @@ def findings_fingerprint(findings: list[dict]) -> str:
     return digest[:16]
 
 
+def resolution_digests(findings: list[dict]) -> list[str]:
+    """Sorted per-finding digests of the normalised required resolutions.
+
+    Unlike :func:`findings_fingerprint` (one digest per round) this keeps one
+    digest per finding, so a later round can be checked for *recurring*
+    demands without persisting the review text itself.
+    """
+    digests = {
+        hashlib.sha256(
+            normalize_resolution(f.get("required_resolution")).encode("utf-8")
+        ).hexdigest()[:16]
+        for f in findings
+    }
+    return sorted(digests)
+
+
 def review_record(round: int, reviewed_head_sha: str, result: str, findings: list[dict]) -> dict:
     """One ``review_history`` entry (plain dict: it is persisted as JSON)."""
     if result not in (RESULT_NEEDS_FIX, RESULT_CLEAN, RESULT_STALE):
@@ -57,6 +77,7 @@ def review_record(round: int, reviewed_head_sha: str, result: str, findings: lis
         "result": result,
         "finding_count": len(findings),
         "fingerprint": findings_fingerprint(findings),
+        "resolutions": resolution_digests(findings),
     }
 
 
@@ -98,6 +119,23 @@ def _trailing_needs_fix(history: list[dict], window: int) -> list[dict]:
     return tail
 
 
+def _recurring_resolutions(tail: list[dict]) -> set[str] | None:
+    """Resolution digests requested by more than one round of ``tail``.
+
+    ``None`` when some entry predates the per-finding ``resolutions`` field
+    (a run persisted by an older controller): recurrence is then unknown.
+    """
+    if any(not isinstance(r.get("resolutions"), list) for r in tail):
+        return None
+    seen: set[str] = set()
+    recurring: set[str] = set()
+    for r in tail:
+        digests = {str(d) for d in r["resolutions"]}
+        recurring |= seen & digests
+        seen |= digests
+    return recurring
+
+
 def stagnation_reason(
     history: list[dict], identical_rounds: int, unchanged_count_rounds: int
 ) -> str:
@@ -106,6 +144,14 @@ def stagnation_reason(
     ``identical_rounds`` / ``unchanged_count_rounds`` of 0 disable the
     respective rule. Only *consecutive* rounds that ended with findings are
     considered: a clean or stale round in between resets both rules.
+
+    The unchanged-count rule needs, on top of the constant count, at least
+    one required resolution that was requested by two different rounds of
+    the window: the count alone cannot tell an A/B/A ping-pong from a
+    reviewer that raises one genuinely new finding per round (every earlier
+    finding was resolved), and the latter is progress bounded by
+    ``workflow.max_review_rounds``. History entries written before the
+    per-finding digests were recorded keep the count-only behaviour.
     """
     tail = _trailing_needs_fix(history, identical_rounds)
     if tail and len({r.get("fingerprint") for r in tail}) == 1:
@@ -118,12 +164,19 @@ def stagnation_reason(
         )
     tail = _trailing_needs_fix(history, unchanged_count_rounds)
     if tail and len({r.get("finding_count") for r in tail}) == 1:
-        rounds = ", ".join(str(r.get("round")) for r in tail)
-        return (
-            f"review rounds {rounds} each ended with {tail[-1].get('finding_count')} "
-            f"finding(s); the finding count has not changed "
-            f"(workflow.stagnation_unchanged_count_rounds={unchanged_count_rounds})"
-        )
+        recurring = _recurring_resolutions(tail)
+        if recurring is None or recurring:
+            rounds = ", ".join(str(r.get("round")) for r in tail)
+            detail = (
+                f"{len(recurring)} required resolution(s) recur across them"
+                if recurring
+                else "recurrence unknown for history written by an older controller"
+            )
+            return (
+                f"review rounds {rounds} each ended with {tail[-1].get('finding_count')} "
+                f"finding(s); the finding count has not changed and {detail} "
+                f"(workflow.stagnation_unchanged_count_rounds={unchanged_count_rounds})"
+            )
     return ""
 
 

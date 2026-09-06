@@ -41,8 +41,10 @@ Loop bounds (``workflow:`` config, enforced from persisted state so
   reviewed; review round cap+1 never starts (checked before REVIEW binds a
   HEAD or invokes an agent, whatever path led there).
 - stagnation: consecutive rounds with findings whose required resolutions
-  are identical (``stagnation_identical_rounds``) or whose finding count
-  never changed (``stagnation_unchanged_count_rounds``) -> BLOCKED.
+  are identical (``stagnation_identical_rounds``), or whose finding count
+  never changed while some required resolution recurs
+  (``stagnation_unchanged_count_rounds``) -> BLOCKED. Rounds of all-new
+  findings are progress and only meet the cap.
 - ``max_total_steps``: the run's cumulative ``step_count`` (all issues, all
   phases, across ``resume``) -> BLOCKED before another step executes.
 Failed invocations never consume a round or a history entry.

@@ -111,7 +111,10 @@ Key design points:
   never be reviewed. Stagnation detection blocks earlier: consecutive rounds
   whose `required_resolution` texts are identical
   (`workflow.stagnation_identical_rounds`, default 2) or whose finding count
-  does not change (`workflow.stagnation_unchanged_count_rounds`, default 3).
+  does not change while some `required_resolution` recurs across them, an
+  A/B/A ping-pong (`workflow.stagnation_unchanged_count_rounds`, default 3).
+  A reviewer that raises a genuinely new finding every round is progress and
+  only meets the round cap.
   `workflow.max_total_steps` (default 300) is a cumulative budget for the whole
   run measured on the persisted `step_count`, so `resume` continues it rather
   than resetting it (`--max-steps` bounds one invocation only). Failed agent
