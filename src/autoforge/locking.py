@@ -4,12 +4,22 @@ Implemented with POSIX flock(2) on ``<state_dir>/controller.lock`` (LOCK_EX |
 LOCK_NB). A second instance fails fast with LockError instead of operating
 concurrently on the same repo.
 
-The lock entry is opened with ``O_NOFOLLOW`` and must be a regular file: a
-``controller.lock`` that is a symbolic link, FIFO, socket, device or
-directory is refused with LockError before anything is written, so a
-tampered or damaged entry can neither redirect the PID write to an unrelated
-file nor turn the refusal into an unhandled traceback. Every open / flock /
-write failure is a LockError and the descriptor is closed on the way out.
+The lock entry is opened with ``O_NOFOLLOW`` and must be a regular file
+with exactly one name (``st_nlink == 1``): a ``controller.lock`` that is a
+symbolic link, FIFO, socket, device or directory, or a hard link sharing its
+inode with another file, is refused with LockError before anything is
+written, so a tampered or damaged entry can neither redirect the PID write to
+an unrelated file nor turn the refusal into an unhandled traceback. Every
+open / flock / write failure is a LockError and the descriptor is closed on
+the way out.
+
+Tampering model: these checks validate the entry *as found* (damaged or
+tampered at rest). They are taken on the open descriptor, but a writer with
+write access to the state directory who races between the ``fstat`` and the
+PID write (for example by adding a hard link in that window) can still be
+affected by the write. Such a writer has the controller's own privileges and
+is outside the trust boundary the lock defends; the state directory is
+assumed to be writable only by the operating user.
 """
 
 from __future__ import annotations
@@ -62,13 +72,23 @@ class ControllerLock:
                 raise self._refuse("it is a directory, not a regular file") from exc
             raise self._refuse(f"cannot open it: {exc}") from exc
         try:
-            kind = entry_kind(os.fstat(fd).st_mode)
+            st = os.fstat(fd)
         except OSError as exc:
             os.close(fd)
             raise self._refuse(f"cannot stat it: {exc}") from exc
+        kind = entry_kind(st.st_mode)
         if kind is not None:
             os.close(fd)
             raise self._refuse(f"it is a {kind}, not a regular file")
+        if st.st_nlink != 1:
+            # A hard link passes O_NOFOLLOW and S_ISREG but shares its inode
+            # with another name: truncating / writing the PID would modify
+            # that other file. Refuse; nothing has been written.
+            os.close(fd)
+            raise self._refuse(
+                f"it has {st.st_nlink} hard links, so it shares its inode with "
+                "another file; remove it and re-run (the other file has not been touched)"
+            )
         return fd
 
     def acquire(self) -> ControllerLock:

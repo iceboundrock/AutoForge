@@ -63,6 +63,26 @@ def test_symlink_lock_entry_is_refused_and_target_untouched(tmp_path):
     assert path.is_symlink() and os.readlink(path) == str(target)
 
 
+def test_hard_linked_lock_entry_is_refused_and_target_untouched(tmp_path):
+    """PFR-F2: a hard link passes O_NOFOLLOW + S_ISREG but shares its inode."""
+    target = tmp_path / "unrelated.txt"
+    target.write_text("preserve\n", encoding="utf-8")
+    path = tmp_path / "controller.lock"
+    os.link(target, path)
+    assert os.lstat(path).st_nlink == 2
+    lock = ControllerLock(path)
+    with pytest.raises(LockError, match="2 hard links"):
+        lock.acquire()
+    assert not lock.held
+    assert target.read_text(encoding="utf-8") == "preserve\n"
+    assert path.read_text(encoding="utf-8") == "preserve\n"
+    assert os.lstat(path).st_ino == os.lstat(target).st_ino  # entry left in place
+    # Nothing else held the flock: a fresh, single-name lock file works.
+    os.unlink(path)
+    with ControllerLock(path):
+        assert target.read_text(encoding="utf-8") == "preserve\n"
+
+
 def test_dangling_symlink_lock_entry_is_refused_and_creates_nothing(tmp_path):
     path = tmp_path / "controller.lock"
     path.symlink_to(tmp_path / "missing")

@@ -1099,6 +1099,28 @@ def test_run_refuses_symlink_lock_entry_and_leaves_target_untouched(
     assert fakes["provider"].calls == []
 
 
+def test_run_refuses_hard_linked_lock_entry_and_leaves_target_untouched(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """PFR-F2: a hard-linked controller.lock is refused (exit 2); the other name keeps its bytes."""
+    monkeypatch.chdir(tmp_path)
+    sd = tmp_path / ".autoforge"
+    sd.mkdir()
+    target = tmp_path / "unrelated.txt"
+    target.write_text("preserve\n", encoding="utf-8")
+    os.link(target, sd / "controller.lock")
+    rc = cli.main(
+        ["--state-dir", str(sd), "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"]
+    )
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "autoforge: error:" in err and "hard links" in err
+    assert target.read_text(encoding="utf-8") == "preserve\n"
+    assert os.lstat(sd / "controller.lock").st_nlink == 2
+    assert sorted(p.name for p in sd.iterdir()) == ["controller.lock"]  # no state.json
+    assert fakes["provider"].calls == []
+
+
 def test_run_refuses_fifo_lock_entry_without_traceback_or_hang(
     tmp_path, capsys, monkeypatch, fakes
 ):

@@ -247,11 +247,16 @@ and `block_reason`.
   created and keep it until their last step has been persisted, so a state
   snapshot loaded before the lock is never executed and no second controller
   can take over the repository mid-command. Dry-run takes no lock. The lock
-  entry itself must be a regular file: `controller.lock` is opened with
-  `O_NOFOLLOW`, so a symlink, FIFO, socket, device or directory in its place is
-  refused with `LockError` (exit 2) before anything is written — a tampered
-  entry can neither redirect the PID write to another file nor produce a
-  traceback.
+  entry itself must be a regular file with a single name: `controller.lock` is
+  opened with `O_NOFOLLOW` and `fstat`-checked, so a symlink, FIFO, socket,
+  device or directory in its place, or a hard link that shares its inode with
+  another file, is refused with `LockError` (exit 2) before anything is
+  written — a tampered entry can neither redirect the PID write to another
+  file nor produce a traceback. These checks cover an entry that is damaged or
+  tampered *at rest*; a writer with write access to the state directory who
+  races the check-then-write window has the controller's own privileges and
+  is outside the trust boundary (the state directory is assumed to be
+  writable only by the operating user).
 - **Automatic merge is off by default and opt-in only.** The `MERGE` phase is
   reachable only from `READY_FOR_MERGE` and only when **both**
   `safety.allow_merge: true` is set in config **and** `--allow-merge` is
