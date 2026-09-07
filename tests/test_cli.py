@@ -1158,6 +1158,31 @@ def test_run_refuses_fifo_lock_entry_without_traceback_or_hang(
     assert fakes["provider"].calls == []
 
 
+def test_run_refuses_symlinked_lock_directory_and_leaves_target_untouched(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """R8-F1: <git dir>/autoforge as a symlink is refused (exit 2); nothing lands in its target."""
+    monkeypatch.chdir(tmp_path)
+    sd = tmp_path / ".autoforge"
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "note.txt").write_text("keep\n", encoding="utf-8")
+    lock_dir = repository_lock_path(tmp_path).parent
+    assert not lock_dir.exists()
+    lock_dir.symlink_to(elsewhere)
+    rc = cli.main(
+        ["--state-dir", str(sd), "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"]
+    )
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "autoforge: error:" in err and "is a symbolic link" in err
+    assert lock_dir.is_symlink() and os.readlink(lock_dir) == str(elsewhere)
+    assert sorted(p.name for p in elsewhere.iterdir()) == ["note.txt"]
+    assert (elsewhere / "note.txt").read_text(encoding="utf-8") == "keep\n"
+    assert not sd.exists()  # no state.json
+    assert fakes["provider"].calls == []
+
+
 # -- repository-scoped lock (R6-F1) --------------------------------------------
 def _run_argv(state_dir=None, *extra) -> list[str]:
     argv = ["--state-dir", str(state_dir)] if state_dir is not None else []

@@ -264,14 +264,21 @@ and `block_reason`.
   created and keep it until their last step has been persisted, so a state
   snapshot loaded before the lock is never executed and no second controller
   can take over the repository mid-command. Dry-run takes no lock and runs no
-  `git`. The lock entry itself must be a regular file with a single name:
-  `controller.lock` is opened with `O_NOFOLLOW` and `fstat`-checked, so a
-  symlink, FIFO, socket, device or directory in its place, or a hard link that
-  shares its inode with another file, is refused with `LockError` (exit 2)
-  before anything is written — a tampered entry can neither redirect the PID
-  write to another file nor produce a traceback. These checks cover an entry
-  that is damaged or tampered *at rest*; a writer with write access to the git
-  directory who races the check-then-write window has the controller's own
+  `git`. Below the git common dir no path component is followed through a
+  symlink: the `autoforge` directory is created with `mkdir` and opened
+  relative to the git directory's descriptor with `O_DIRECTORY | O_NOFOLLOW`,
+  so a symlink or a file in its place is refused (exit 2) and its target is
+  never touched; `controller.lock` is then opened relative to that validated
+  directory descriptor. The lock entry itself must be a regular file with a
+  single name: `controller.lock` is opened with `O_NOFOLLOW` and
+  `fstat`-checked, so a symlink, FIFO, socket, device or directory in its
+  place, or a hard link that shares its inode with another file, is refused
+  with `LockError` (exit 2) before anything is written — a tampered path or
+  entry can neither redirect the PID write to another file nor produce a
+  traceback. These checks cover entries that are damaged or tampered *at
+  rest*; a writer with write access to the git directory who races the
+  check-then-write window, or swaps the `autoforge` directory for another
+  directory between two controller invocations, has the controller's own
   privileges and is outside the trust boundary (the git directory is assumed
   to be writable only by the operating user).
 - **Automatic merge is off by default and opt-in only.** The `MERGE` phase is

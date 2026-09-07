@@ -150,6 +150,101 @@ def test_pid_write_failure_closes_descriptor_and_is_a_lock_error(tmp_path, monke
         pass
 
 
+# -- lock directory validation (R8-F1) -----------------------------------------
+def _lock_layout(tmp_path):
+    """``<base>/autoforge/controller.lock`` with ``<base>`` standing in for the git dir."""
+    base = tmp_path / "gitdir"
+    base.mkdir()
+    return base, base / "autoforge", base / "autoforge" / "controller.lock"
+
+
+def test_lock_directory_is_created_below_the_base_when_absent(tmp_path):
+    base, lock_dir, path = _lock_layout(tmp_path)
+    with ControllerLock(path):
+        assert lock_dir.is_dir() and not lock_dir.is_symlink()
+        assert path.read_text(encoding="utf-8") == f"{os.getpid()}\n"
+
+
+def test_symlinked_lock_directory_is_refused_and_target_untouched(tmp_path):
+    """R8-F1: a symlink at <git dir>/autoforge must not redirect the lock elsewhere."""
+    base, lock_dir, path = _lock_layout(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "note.txt").write_text("keep\n", encoding="utf-8")
+    lock_dir.symlink_to(elsewhere)
+    lock = ControllerLock(path)
+    with pytest.raises(LockError, match="is a symbolic link"):
+        lock.acquire()
+    assert not lock.held
+    assert lock_dir.is_symlink() and os.readlink(lock_dir) == str(elsewhere)
+    assert sorted(p.name for p in elsewhere.iterdir()) == ["note.txt"]  # no controller.lock
+    assert (elsewhere / "note.txt").read_text(encoding="utf-8") == "keep\n"
+    assert sorted(p.name for p in base.iterdir()) == ["autoforge"]
+
+
+def test_dangling_symlinked_lock_directory_is_refused_and_creates_nothing(tmp_path):
+    base, lock_dir, path = _lock_layout(tmp_path)
+    lock_dir.symlink_to(tmp_path / "missing")
+    with pytest.raises(LockError, match="is a symbolic link"):
+        ControllerLock(path).acquire()
+    assert lock_dir.is_symlink() and not (tmp_path / "missing").exists()
+    assert sorted(p.name for p in base.iterdir()) == ["autoforge"]
+
+
+def test_lock_directory_that_is_a_regular_file_is_refused(tmp_path):
+    base, lock_dir, path = _lock_layout(tmp_path)
+    lock_dir.write_text("not a directory\n", encoding="utf-8")
+    with pytest.raises(LockError, match="a regular file, not a directory"):
+        ControllerLock(path).acquire()
+    assert lock_dir.read_text(encoding="utf-8") == "not a directory\n"
+
+
+def test_missing_base_directory_is_a_lock_error(tmp_path):
+    path = tmp_path / "no-such-gitdir" / "autoforge" / "controller.lock"
+    with pytest.raises(LockError, match="repository directory"):
+        ControllerLock(path).acquire()
+    assert not (tmp_path / "no-such-gitdir").exists()
+
+
+def test_lock_directory_swapped_for_a_symlink_after_mkdir_is_refused(tmp_path, monkeypatch):
+    """Race: the directory is replaced by a symlink between mkdir and open."""
+    base, lock_dir, path = _lock_layout(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    real_mkdir = os.mkdir
+
+    def mkdir_then_swap(name, mode=0o777, *, dir_fd=None):
+        real_mkdir(name, mode, dir_fd=dir_fd)
+        os.rmdir(lock_dir)
+        lock_dir.symlink_to(elsewhere)
+
+    monkeypatch.setattr(os, "mkdir", mkdir_then_swap)
+    with pytest.raises(LockError, match="is a symbolic link"):
+        ControllerLock(path).acquire()
+    assert list(elsewhere.iterdir()) == []
+
+
+def test_lock_is_opened_relative_to_the_validated_directory(tmp_path, monkeypatch):
+    """Race: the directory is swapped after its validation; the lock stays in the original."""
+    base, lock_dir, path = _lock_layout(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    moved = tmp_path / "moved-away"
+    real_open_dir = ControllerLock._open_dir
+
+    def open_dir_then_swap(self):
+        fd = real_open_dir(self)
+        os.rename(lock_dir, moved)
+        lock_dir.symlink_to(elsewhere)
+        return fd
+
+    monkeypatch.setattr(ControllerLock, "_open_dir", open_dir_then_swap)
+    with ControllerLock(path) as lock:
+        assert lock.held
+        assert list(elsewhere.iterdir()) == []  # the symlink target got nothing
+        assert (moved / "controller.lock").read_text(encoding="utf-8") == f"{os.getpid()}\n"
+
+
 # -- repository_lock_path (R6-F1) ----------------------------------------------
 def _git(*argv, cwd):
     import subprocess
