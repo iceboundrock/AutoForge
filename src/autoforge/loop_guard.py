@@ -47,17 +47,40 @@ def findings_fingerprint(findings: list[dict]) -> str:
     return digest[:16]
 
 
-def review_record(round: int, reviewed_head_sha: str, result: str, findings: list[dict]) -> dict:
+def review_record(
+    round: int,
+    reviewed_head_sha: str,
+    result: str,
+    findings: list[dict],
+    review_comment_url: str = "",
+    timestamp: str = "",
+) -> dict:
     """One ``review_history`` entry (plain dict: it is persisted as JSON)."""
     if result not in (RESULT_NEEDS_FIX, RESULT_CLEAN, RESULT_STALE):
         raise ValueError(f"unknown review result {result!r}")
-    return {
+    record = {
         "round": int(round),
         "reviewed_head_sha": reviewed_head_sha,
         "result": result,
         "finding_count": len(findings),
         "fingerprint": findings_fingerprint(findings),
     }
+    # Preserve structured actionable evidence, not unbounded comment bodies.
+    # GitHub remains authoritative for the latter.
+    if findings:
+        record["findings"] = [
+            {
+                "id": str(f.get("id", "")),
+                "classification": str(f.get("classification", "")),
+                "required_resolution": str(f.get("required_resolution", "")),
+            }
+            for f in findings
+        ]
+    if review_comment_url:
+        record["review_comment_url"] = review_comment_url
+    if timestamp:
+        record["timestamp"] = timestamp
+    return record
 
 
 def round_cap_reason(review_round: int, max_review_rounds: int, *, has_findings: bool) -> str:

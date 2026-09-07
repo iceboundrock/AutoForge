@@ -119,6 +119,7 @@ class FakeGitHub:
         self.merge_queue_error: str | GitHubError = ""
         self.disable_auto_error: str = ""  # non-empty -> disable_auto_merge raises
         self.disabled_auto: list[str] = []  # PRs on which disable_auto_merge ran
+        self.closed_prs: list[tuple[str, str]] = []
         self.get_pr_failures: int = 0  # next N get_pr calls raise GitHubUnavailableError
         self.get_pr_error: GitHubError | None = None  # every get_pr call raises this
         self.get_issue_error: GitHubError | None = None  # every get_issue call raises this
@@ -309,6 +310,17 @@ class FakeGitHub:
         if self.disable_auto_error:
             raise GitHubError(self.disable_auto_error)
         self.get_pr(canonical).auto_merge_enabled = False
+
+    def close_pr(self, url: str, comment: str) -> None:
+        from autoforge.validation import parse_pr_url
+
+        canonical = parse_pr_url(url).canonical
+        self.calls.append(("close_pr", canonical, comment))
+        self.closed_prs.append((canonical, comment))
+        pr = self.get_pr(canonical)
+        if not pr.is_open:
+            raise GitHubError(f"cannot close PR {canonical}: it is {pr.state}")
+        pr.state = "CLOSED"
 
 
 def scripted_config():

@@ -355,11 +355,21 @@ def cmd_status(args) -> int:
     print()
     print(f"Phase:      {state.phase.value}")
     print(f"Review rounds completed: {state.review_round}")
+    print(f"Execution attempt: {state.execution_attempt}")
+    print(f"Replan count: {state.escalation_count}")
     print(f"Current HEAD:  {state.current_head_sha or '-'}")
     print(f"Reviewed HEAD: {state.reviewed_head_sha or '-'}")
     print(f"Last review:   {state.last_review_result or '-'}")
     print(f"Review comment: {state.last_review_comment_url or '-'}")
     print(f"Open findings: {len(state.open_findings)}")
+    if state.superseded_prs:
+        print("Superseded PRs:")
+        for item in state.superseded_prs:
+            print(f"  {item.get('pr_url', '-')} -> {item.get('replacement_pr_url', '-')}")
+    if state.replan_progress:
+        print(f"Replan progress: {state.replan_progress.get('stage', 'pending')}")
+        escalation = json.dumps(state.replan_progress.get("escalation", {}), sort_keys=True)
+        print(f"Escalation: {escalation}")
     if state.block_reason:
         print(f"Reason:     {state.block_reason}")
     print()

@@ -99,9 +99,11 @@ from .loop_guard import (
 from .profiles import profile_for_phase
 from .prompts import TEMPLATE_FILES, load_template, render, render_phase
 from .providers import AgentExecutionResult, AgentRequest, ProviderRegistry
+from .replan import HistoricalReviewCollector, evaluate_replan_policy
 from .result_parser import (
     AnalyzeExecuteResult,
     FixResult,
+    ReplanReexecuteResult,
     ReviewResult,
     UpdateEpicResult,
     parse_control_result,
@@ -128,6 +130,7 @@ REQUIRED_PROFILES = [
     "review_round_1",
     "review_round_2_5",
     "review_round_6_plus",
+    "replan_reexecute",
 ]
 
 MERGE_GATE_MESSAGE = (
@@ -167,6 +170,7 @@ PHASE_TEMPLATE: dict[Phase, str | None] = {
     Phase.ANALYZE_EXECUTE: "analyze_execute.md",
     Phase.REVIEW: "review.md",
     Phase.FIX: "fix.md",
+    Phase.REPLAN_REEXECUTE: "replan_reexecute.md",
     Phase.READY_FOR_MERGE: None,  # holding state, no agent call
     Phase.MERGE: None,  # controller runs `gh pr merge` itself; agents never merge
     Phase.UPDATE_EPIC: "update_epic.md",
@@ -304,7 +308,7 @@ class ControllerEngine:
         s = self._require_state()
         upcoming_round = s.review_round + 1
         issue_number = parse_issue_url(s.current_issue_url).number if s.current_issue_url else 0
-        return {
+        variables: dict[str, str | int | None] = {
             "PROMPT_VERSION": s.prompt_version,
             "REPOSITORY": s.repository,
             "EPIC_URL": s.epic_url,
@@ -327,6 +331,31 @@ class ControllerEngine:
                 s.next_issue_rejections[-1] if s.next_issue_rejections else "(none)"
             ),
         }
+        if s.phase == Phase.REPLAN_REEXECUTE:
+            progress = s.replan_progress
+            variables.update(
+                {
+                    "PREVIOUS_PR_URL": str(progress.get("previous_pr_url", s.current_pr_url)),
+                    "PREVIOUS_BRANCH": str(progress.get("previous_branch", s.current_branch)),
+                    "PREVIOUS_HEAD_SHA": str(progress.get("previous_head_sha", s.current_head_sha)),
+                    "DEFAULT_BRANCH": str(
+                        progress.get("default_branch", "(verified at execution)")
+                    ),
+                    "ESCALATION_REASON": json.dumps(progress.get("escalation", {}), sort_keys=True),
+                    "HISTORICAL_FINDINGS": str(
+                        progress.get("historical_findings", "(collected at execution from GitHub)")
+                    ),
+                    "HISTORICAL_OBSERVATIONS": str(
+                        progress.get(
+                            "historical_observations", "(collected at execution from GitHub)"
+                        )
+                    ),
+                    "HISTORICAL_VERIFICATION_FAILURES": str(
+                        progress.get("historical_verification_failures", "(collected at execution)")
+                    ),
+                }
+            )
+        return variables
 
     def render_prompt_for(self, phase: Phase, correction_error: str | None = None) -> str:
         template = PHASE_TEMPLATE.get(phase)
@@ -404,6 +433,16 @@ class ControllerEngine:
                 f"{self.config.workflow.max_review_rounds} (workflow.max_review_rounds)"
             )
             notes.append("REVIEWED_HEAD_SHA is fetched from gh immediately before the review")
+        if s.phase == Phase.REPLAN_REEXECUTE:
+            notes.append(
+                "would create and verify a new replacement PR from the verified default branch"
+            )
+            notes.append(
+                "would close the old PR without merging it only after replacement verification"
+            )
+            escalation = s.replan_progress.get("escalation", {})
+            if escalation:
+                notes.append(f"replan policy: {json.dumps(escalation, sort_keys=True)}")
         return StepPlan(
             phase=s.phase.value,
             profile_name=profile.name,
@@ -478,6 +517,7 @@ class ControllerEngine:
             Phase.ANALYZE_EXECUTE: "REVIEW (after PR verification via gh)",
             Phase.REVIEW: "FIX if any finding, READY_FOR_MERGE if clean, REVIEW if HEAD moved",
             Phase.FIX: "REVIEW (after new HEAD verification via gh)",
+            Phase.REPLAN_REEXECUTE: "REVIEW (replacement PR; fresh review round 1)",
             Phase.MERGE: "UPDATE_EPIC (controller merge verified as MERGED via gh) | REVIEW",
             Phase.UPDATE_EPIC: "ANALYZE_EXECUTE | DONE",
         }.get(phase, "")
@@ -661,6 +701,11 @@ class ControllerEngine:
             self._bind_review_head()
         if previous == Phase.FIX:
             self._prepare_fix()
+        if previous == Phase.REPLAN_REEXECUTE:
+            recovered = self._recover_replan()
+            if recovered is not None:
+                return recovered
+            self._prepare_replan()
 
         payload = self._invoke_phase(previous)
         status = payload.get("status")
@@ -678,10 +723,13 @@ class ControllerEngine:
 
         try:
             nxt_phase, message = self._verify_and_apply(previous, payload)
-        except (VerificationError, ControlResultValidationError):
+        except (VerificationError, ControlResultValidationError) as exc:
             # The agent ran (and may have changed GitHub) but its claims did not
             # verify. Persist the attempt so `resume` re-enters this phase from
             # real state instead of pretending nothing happened.
+            if isinstance(exc, VerificationError) and previous in (Phase.REVIEW, Phase.FIX):
+                state.verification_failures.append(f"{previous.value}: {exc}")
+                state.verification_failures = state.verification_failures[-20:]
             self._save()
             raise
         if nxt_phase == Phase.BLOCKED:
@@ -1315,6 +1363,180 @@ class ControllerEngine:
         state.current_head_sha = pr.head_sha
         self._save()
 
+    def _prepare_replan(self) -> None:
+        """Checkpoint all evidence before an agent can create a replacement PR."""
+        state = self._require_state()
+        if state.replan_progress.get("stage"):
+            return
+        escalation = state.replan_progress.get("escalation", {})
+        previous = self._require_open_pr()
+        repo = self.github.get_repo(state.repository)
+        if not repo.default_branch:
+            raise VerificationError(f"repository {state.repository} has no readable default branch")
+        collector = HistoricalReviewCollector(self.github)
+        history = collector.collect(
+            state.current_pr_url, state.review_history, state.verification_failures
+        )
+        state.replan_progress = {
+            "stage": "prepared",
+            "previous_pr_url": state.current_pr_url,
+            "previous_branch": state.current_branch or previous.head_ref,
+            "previous_head_sha": state.current_head_sha or previous.head_sha,
+            "previous_review_round": state.review_round,
+            "default_branch": repo.default_branch,
+            "escalation": escalation,
+            "historical_finding_count": history.recorded_finding_count,
+            "historical_findings": history.render_findings(),
+            "historical_observations": history.render_observations(),
+            "historical_verification_failures": history.render_verification_failures(),
+        }
+        self._save()
+
+    def _verify_replacement_pr(self, pr: PRInfo, progress: dict, expected_head: str = "") -> None:
+        """Verify objective fresh-implementation facts independently of agent output."""
+        state = self._require_state()
+        previous_url = str(progress["previous_pr_url"])
+        previous_branch = str(progress["previous_branch"])
+        ref = parse_pr_url(pr.url)
+        if ref.canonical == parse_pr_url(previous_url).canonical:
+            raise VerificationError("replacement PR must differ from the superseded PR")
+        if ref.repository.lower() != state.repository.lower() or (
+            pr.repository and pr.repository.lower() != state.repository.lower()
+        ):
+            raise VerificationError(f"replacement PR {ref.canonical} is not in {state.repository}")
+        if not pr.is_open:
+            raise VerificationError(f"replacement PR {ref.canonical} is {pr.state}, expected OPEN")
+        if not pr.head_sha:
+            raise VerificationError(f"replacement PR {ref.canonical} has no readable head SHA")
+        if expected_head and pr.head_sha != expected_head:
+            raise VerificationError(
+                f"replacement PR HEAD mismatch: GitHub reports {pr.head_sha}, "
+                f"agent claimed {expected_head}"
+            )
+        if not pr.head_ref or pr.head_ref == previous_branch:
+            raise VerificationError(
+                "replacement branch must be present and differ from previous branch"
+            )
+        if pr.base_ref != progress["default_branch"]:
+            raise VerificationError(
+                f"replacement PR base {pr.base_ref!r} != verified default branch "
+                f"{progress['default_branch']!r}"
+            )
+        issue_number = parse_issue_url(state.current_issue_url).number
+        if issue_number not in pr.linked_issue_numbers:
+            raise VerificationError(
+                f"replacement PR {ref.canonical} is not linked to current issue #{issue_number}"
+            )
+
+    def _recover_replan(self) -> StepOutcome | None:
+        """Reconcile a replacement created before state could be persisted.
+
+        The journal is written before invocation. A known replacement is never
+        re-invoked; when no URL was checkpointed, exactly one open issue PR
+        other than the old PR is accepted. Ambiguity fails closed.
+        """
+        state = self._require_state()
+        progress = state.replan_progress
+        if not progress or not progress.get("stage"):
+            return None
+        if progress.get("stage") in ("replacement_verified", "old_pr_superseded"):
+            return self._finish_replan()
+        issue = parse_issue_url(state.current_issue_url)
+        old_url = str(progress.get("previous_pr_url", ""))
+        candidates = [
+            pr
+            for pr in self.github.find_open_prs_for_issue(issue)
+            if parse_pr_url(pr.url).canonical != parse_pr_url(old_url).canonical
+        ]
+        if not candidates:
+            return None
+        if len(candidates) != 1:
+            raise VerificationError(
+                "cannot safely recover REPLAN_REEXECUTE: multiple replacement PR candidates exist"
+            )
+        replacement = candidates[0]
+        self._verify_replacement_pr(replacement, progress)
+        progress.update(
+            {
+                "stage": "replacement_verified",
+                "replacement_pr_url": parse_pr_url(replacement.url).canonical,
+                "replacement_branch": replacement.head_ref,
+                "replacement_head_sha": replacement.head_sha,
+            }
+        )
+        self._save()
+        return self._finish_replan(recovered=True)
+
+    def _finish_replan(self, recovered: bool = False) -> StepOutcome:
+        """Close the old PR, then atomically activate the verified replacement."""
+        state = self._require_state()
+        progress = state.replan_progress
+        old_url = str(progress["previous_pr_url"])
+        replacement_url = str(progress["replacement_pr_url"])
+        try:
+            old = self.github.get_pr(old_url)
+        except GitHubError as exc:
+            raise VerificationError(f"cannot verify superseded PR {old_url}: {exc}") from exc
+        if old.state == "MERGED":
+            raise VerificationError(
+                f"superseded PR {old_url} is already MERGED; refusing replacement"
+            )
+        if old.is_open:
+            comment = (
+                "Superseded by "
+                f"{replacement_url} after controller-detected review/fix non-convergence. "
+                "This PR was closed without merge; the replacement starts from the current "
+                "default branch."
+            )
+            self.github.close_pr(old_url, comment)
+            # The close call can have succeeded before a crash or an error. Its
+            # state is reconciled on resume before this function is retried.
+            old = self.github.get_pr(old_url)
+        if old.state != "CLOSED":
+            raise VerificationError(f"superseded PR {old_url} is {old.state}, expected CLOSED")
+        progress["stage"] = "old_pr_superseded"
+        self._save()
+        if not any(item.get("pr_url") == old_url for item in state.superseded_prs):
+            state.superseded_prs.append(
+                {
+                    "pr_url": old_url,
+                    "branch": progress["previous_branch"],
+                    "head_sha": progress["previous_head_sha"],
+                    "review_round": progress["previous_review_round"],
+                    "replacement_pr_url": replacement_url,
+                    "reason": progress.get("escalation", {}).get("trigger", "replan"),
+                    "superseded_at": utcnow_iso(),
+                }
+            )
+        state.current_pr_url = replacement_url
+        state.current_branch = str(progress["replacement_branch"])
+        state.current_head_sha = str(progress["replacement_head_sha"])
+        state.reviewed_head_sha = ""
+        # review_round counts completed rounds; 0 means the next replacement
+        # review is the required fresh round 1.
+        state.review_round = 0
+        state.review_history = []
+        state.open_findings = []
+        state.last_fix_resolutions = []
+        state.last_review_comment_url = ""
+        state.last_review_result = ""
+        state.last_review_needs_fix = None
+        state.execution_attempt += 1
+        state.escalation_count += 1
+        state.replan_progress = {}
+        validate_transition(Phase.REPLAN_REEXECUTE, Phase.REVIEW)
+        state.phase = Phase.REVIEW
+        state.attempt = 0
+        self._save()
+        verb = "recovered" if recovered else "verified"
+        return self._outcome(
+            Phase.REPLAN_REEXECUTE,
+            message=(
+                f"replacement PR {replacement_url} {verb}; old PR {old_url} closed without merge; "
+                "REPLAN_REEXECUTE -> REVIEW (fresh round 1)"
+            ),
+        )
+
     # -- agent invocation + correction retry ---------------------------------------
     def _invoke_phase(self, phase: Phase) -> dict:
         state = self._require_state()
@@ -1355,6 +1577,19 @@ class ControllerEngine:
                 command=provider.build_command_for(profile, prompt),
                 cwd=self.workdir,
                 timeout_seconds=timeout,
+                metadata=(
+                    {
+                        "execution_attempt": state.execution_attempt,
+                        "escalation_count": state.escalation_count,
+                        "trigger": state.replan_progress.get("escalation", {}).get("trigger", ""),
+                        "recent_finding_counts": state.replan_progress.get("escalation", {}).get(
+                            "recent_finding_counts", []
+                        ),
+                        "previous_pr_url": state.replan_progress.get("previous_pr_url", ""),
+                    }
+                    if phase == Phase.REPLAN_REEXECUTE
+                    else {}
+                ),
             )
             result: AgentExecutionResult | None = None
             try:
@@ -1411,6 +1646,8 @@ class ControllerEngine:
             return self._apply_review(ReviewResult.from_payload(payload))
         if phase == Phase.FIX:
             return self._apply_fix(FixResult.from_payload(payload))
+        if phase == Phase.REPLAN_REEXECUTE:
+            return self._apply_replan(ReplanReexecuteResult.from_payload(payload))
         if phase == Phase.UPDATE_EPIC:
             return self._apply_update_epic(UpdateEpicResult.from_payload(payload))
         raise StateTransitionError(f"phase {phase.value} does not accept agent results")
@@ -1546,6 +1783,26 @@ class ControllerEngine:
             state.last_review_result = "needs_fix"
             state.open_findings = findings
             self._record_review(res.round, expected_head, RESULT_NEEDS_FIX, findings)
+            decision = evaluate_replan_policy(
+                has_actionable_findings=True,
+                current_review_round=res.round,
+                review_history=state.review_history,
+                escalation_count=state.escalation_count,
+                config=self.config.review.replan,
+            )
+            if decision.action == "block_for_human":
+                return Phase.BLOCKED, self._loop_block_reason(
+                    "Automatic reimplementation limit reached (replan_limit_exceeded). "
+                    "Human intervention is required"
+                )
+            if decision.action == "replan":
+                state.replan_progress = {
+                    "escalation": decision.metadata or {"trigger": decision.reason}
+                }
+                return Phase.REPLAN_REEXECUTE, (
+                    f"review round {res.round}: {len(findings)} finding(s); controller policy "
+                    f"triggered REPLAN_REEXECUTE ({decision.reason})"
+                )
             stop = self._review_loop_stop_reason(res.round)
             if stop:
                 # Findings stay persisted for the human; no FIX is started.
@@ -1569,7 +1826,16 @@ class ControllerEngine:
         # A completed round replaces any stale entry with the same number
         # (never expected: rounds are strictly increasing per PR).
         state.review_history = [r for r in state.review_history if r.get("round") != round]
-        state.review_history.append(review_record(round, head, result, findings))
+        state.review_history.append(
+            review_record(
+                round,
+                head,
+                result,
+                findings,
+                state.last_review_comment_url,
+                utcnow_iso(),
+            )
+        )
 
     def _review_loop_stop_reason(self, completed_round: int) -> str:
         """Cap / stagnation verdict for a round that ended with findings."""
@@ -1638,6 +1904,60 @@ class ControllerEngine:
             f"FIX verified: HEAD {expected_prev[:12]} -> {pr.head_sha[:12]}, "
             f"{len(res.resolutions)} resolution(s); FIX -> REVIEW (round {state.review_round + 1})"
         )
+
+    def _apply_replan(self, res: ReplanReexecuteResult) -> tuple[Phase, str]:
+        """Verify a new PR, checkpoint it, then supersede the old PR safely."""
+        state = self._require_state()
+        progress = state.replan_progress
+        if not progress or progress.get("stage") != "prepared":
+            raise VerificationError("REPLAN_REEXECUTE has no prepared recovery checkpoint")
+        if parse_issue_url(res.issue_url).canonical != state.current_issue_url:
+            raise VerificationError(
+                "REPLAN_REEXECUTE result issue_url does not match current issue"
+            )
+        if parse_pr_url(res.previous_pr_url).canonical != progress["previous_pr_url"]:
+            raise VerificationError("REPLAN_REEXECUTE previous_pr_url does not match checkpoint")
+        if res.previous_branch != progress["previous_branch"]:
+            raise VerificationError("REPLAN_REEXECUTE previous_branch does not match checkpoint")
+        if res.previous_head_sha != progress["previous_head_sha"]:
+            raise VerificationError("REPLAN_REEXECUTE previous_head_sha does not match checkpoint")
+        if res.execution_attempt != state.execution_attempt + 1:
+            raise VerificationError(
+                f"REPLAN_REEXECUTE execution_attempt must be {state.execution_attempt + 1}, "
+                f"got {res.execution_attempt}"
+            )
+        if res.historical_findings_considered < int(progress["historical_finding_count"]):
+            raise VerificationError(
+                "REPLAN_REEXECUTE did not claim to consider every controller-recorded "
+                "historical finding"
+            )
+        replacement_ref = parse_pr_url(res.replacement_pr_url)
+        try:
+            replacement = self.github.get_pr(replacement_ref.canonical)
+        except GitHubError as exc:
+            raise VerificationError(
+                f"replacement PR {replacement_ref.canonical} could not be verified: {exc}"
+            ) from exc
+        self._verify_replacement_pr(replacement, progress, res.replacement_head_sha)
+        if replacement.head_ref != res.replacement_branch:
+            raise VerificationError(
+                f"replacement branch mismatch: GitHub reports {replacement.head_ref!r}, "
+                f"agent claimed {res.replacement_branch!r}"
+            )
+        progress.update(
+            {
+                "stage": "replacement_verified",
+                "replacement_pr_url": replacement_ref.canonical,
+                "replacement_branch": replacement.head_ref,
+                "replacement_head_sha": replacement.head_sha,
+            }
+        )
+        # Durable checkpoint before the controller's GitHub write. If the
+        # process dies after this point, resume will finish disposition rather
+        # than invoke the agent again.
+        self._save()
+        outcome = self._finish_replan()
+        return Phase.REVIEW, outcome.message
 
     def _reject_next_issue(self, reason: str, *, cause: BaseException) -> tuple[Phase, str]:
         """Bounded re-selection: persist the rejection, re-ask once, then BLOCKED.

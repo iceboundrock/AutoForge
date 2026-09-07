@@ -55,7 +55,7 @@ workflow:
   # Hard cap on completed review rounds per PR. A round at the cap that still
   # has findings blocks instead of starting a FIX whose result could never be
   # reviewed; a clean round at the cap proceeds to READY_FOR_MERGE.
-  max_review_rounds: 6
+  max_review_rounds: 20
   # Stagnation: this many consecutive rounds with findings whose
   # `required_resolution` texts are identical (ids/locations ignored,
   # whitespace/case-normalised) -> BLOCKED. 0 disables the rule.
@@ -67,6 +67,19 @@ workflow:
   # measured on the persisted `step_count`, so `resume` continues the same
   # budget; `--max-steps` only bounds a single invocation.
   max_total_steps: 300
+
+review:
+  # After a review with findings, the controller (never an agent) may abandon
+  # the patch-accumulated PR and create a fresh implementation attempt.
+  replan:
+    enabled: true
+    soft_threshold: 12
+    hard_threshold: 20
+    stagnation_window: 3
+    max_findings_per_round: 2
+    # Fresh reimplementations after the initial attempt. Reaching this limit
+    # blocks for a human rather than endlessly recreating PRs.
+    max_replans_per_issue: 2
 
 profiles:
   analyze_execute:
@@ -115,6 +128,19 @@ profiles:
     effort: medium
     command: opencode
     timeout_seconds: 1200
+    options:
+      output_format: default
+      auto_approve: false
+
+  # An independent logical role: it must not inherit the round-6 reviewer
+  # profile. This high-capability model replans and reimplements from latest
+  # default branch while retaining historical findings as constraints.
+  replan_reexecute:
+    provider: opencode
+    model: openai/gpt-5.6-terra
+    effort: high
+    command: opencode
+    timeout_seconds: 3600
     options:
       output_format: default
       auto_approve: false

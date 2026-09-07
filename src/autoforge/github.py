@@ -3,12 +3,11 @@
 Business logic must use these typed objects, never parse raw `gh` JSON
 inline. Agents perform content writes (branches, PRs, comments, issues)
 under controller prompts, and the controller only *verifies* what they
-claim through this client. The exceptions are :meth:`GitHubClient.merge_pr`
-and :meth:`GitHubClient.disable_auto_merge`: merging is owned by the
-controller (never by an agent), sits behind the merge safety gate in the
-engine, and is always bound to the reviewed HEAD via ``--match-head-commit``;
-disabling auto-merge only undoes an auto-merge the controller's own merge
-call left armed.
+claim through this client. Controller-owned exceptions are
+:meth:`GitHubClient.merge_pr`, :meth:`GitHubClient.disable_auto_merge`, and
+:meth:`GitHubClient.close_pr` for a verified replacement lifecycle. Merging
+is always behind the safety gate and bound to the reviewed HEAD via
+``--match-head-commit``; closing a superseded PR never deletes its branch.
 """
 
 from __future__ import annotations
@@ -552,6 +551,11 @@ class GitHubClient:
         left armed, so no unreviewed HEAD can merge later on its own.
         """
         self._run_gh(build_disable_auto_merge_argv(url))
+
+    def close_pr(self, url: str, comment: str) -> None:
+        """Close an obsolete PR without merging or deleting any branch."""
+        ref = parse_pr_url(url)
+        self._run_gh(["pr", "close", ref.canonical, "--comment", comment])
 
     # -- comments -----------------------------------------------------------
     def get_pr_comments(self, url: str) -> list[CommentInfo]:

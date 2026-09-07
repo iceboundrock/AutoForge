@@ -10,12 +10,14 @@ def test_all_spec_legal_edges():
     assert is_legal(Phase.INITIALIZING, Phase.ANALYZE_EXECUTE)
     assert is_legal(Phase.ANALYZE_EXECUTE, Phase.REVIEW)
     assert is_legal(Phase.REVIEW, Phase.FIX)
+    assert is_legal(Phase.REVIEW, Phase.REPLAN_REEXECUTE)
     assert is_legal(Phase.REVIEW, Phase.READY_FOR_MERGE)
     assert is_legal(Phase.REVIEW, Phase.REVIEW)  # stale review (HEAD moved) re-reviews
     assert is_legal(Phase.READY_FOR_MERGE, Phase.MERGE)
     assert is_legal(Phase.READY_FOR_MERGE, Phase.REVIEW)
     assert not is_legal(Phase.REVIEW, Phase.MERGE)  # no direct path: READY_FOR_MERGE gate
     assert is_legal(Phase.FIX, Phase.REVIEW)
+    assert is_legal(Phase.REPLAN_REEXECUTE, Phase.REVIEW)
     assert is_legal(Phase.MERGE, Phase.ANALYZE_EXECUTE)
     assert is_legal(Phase.MERGE, Phase.UPDATE_EPIC)
     assert is_legal(Phase.MERGE, Phase.DONE)

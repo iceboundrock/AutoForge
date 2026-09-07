@@ -41,13 +41,15 @@ def test_fingerprint_ignores_ids_locations_and_order():
 
 def test_review_record_shape_and_result_validation():
     rec = review_record(3, SHA_A, RESULT_NEEDS_FIX, [_f("x"), _f("y", "R3-F2")])
-    assert rec == {
-        "round": 3,
-        "reviewed_head_sha": SHA_A,
-        "result": "needs_fix",
-        "finding_count": 2,
-        "fingerprint": findings_fingerprint([_f("x"), _f("y")]),
-    }
+    assert rec["round"] == 3
+    assert rec["reviewed_head_sha"] == SHA_A
+    assert rec["result"] == "needs_fix"
+    assert rec["finding_count"] == 2
+    assert rec["fingerprint"] == findings_fingerprint([_f("x"), _f("y")])
+    assert rec["findings"] == [
+        {"id": "R1-F1", "classification": "nit", "required_resolution": "x"},
+        {"id": "R3-F2", "classification": "nit", "required_resolution": "y"},
+    ]
     with pytest.raises(ValueError, match="unknown review result"):
         review_record(1, SHA_A, "merged", [])
 

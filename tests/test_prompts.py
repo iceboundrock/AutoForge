@@ -33,6 +33,7 @@ AGENT_TEMPLATES = [
     (Phase.ANALYZE_EXECUTE, "analyze_execute.md"),
     (Phase.REVIEW, "review.md"),
     (Phase.FIX, "fix.md"),
+    (Phase.REPLAN_REEXECUTE, "replan_reexecute.md"),
     (Phase.UPDATE_EPIC, "update_epic.md"),
 ]
 
@@ -105,6 +106,21 @@ def test_fix_prompt_contract():
         "fixed",
         "previous_head_sha",
         "new_head_sha",
+    ):
+        assert phrase in text, phrase
+
+
+def test_replan_prompt_contract():
+    text = prompts.load_template("replan_reexecute.md")
+    for phrase in (
+        "fresh implementation",
+        "latest default branch",
+        "Previous PR",
+        "Historical review findings",
+        "do not inherit the previous PR's solution",
+        "replacement PR",
+        "CONTROL_RESULT",
+        "fresh_review_round",
     ):
         assert phrase in text, phrase
 

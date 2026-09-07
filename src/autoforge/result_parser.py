@@ -329,6 +329,91 @@ class FixResult:
         )
 
 
+@dataclass
+class ReplanReexecuteResult:
+    issue_url: str
+    previous_pr_url: str
+    replacement_pr_url: str
+    previous_branch: str
+    replacement_branch: str
+    previous_head_sha: str
+    replacement_head_sha: str
+    execution_attempt: int
+    historical_findings_considered: int
+    unique_failure_constraints: int
+    fresh_review_round: int
+    tests_run: list[str]
+    tests_passed: bool
+
+    @classmethod
+    def from_payload(cls, p: dict) -> ReplanReexecuteResult:
+        ph = "REPLAN_REEXECUTE"
+        previous_pr = _req_url(p, "previous_pr_url", ph, "pr")
+        replacement_pr = _req_url(p, "replacement_pr_url", ph, "pr")
+        if parse_pr_url(previous_pr).canonical == parse_pr_url(replacement_pr).canonical:
+            raise ControlResultValidationError(
+                "REPLAN_REEXECUTE: replacement_pr_url must differ from previous_pr_url"
+            )
+        previous_branch = _req_str(p, "previous_branch", ph)
+        replacement_branch = _req_str(p, "replacement_branch", ph)
+        if previous_branch == replacement_branch:
+            raise ControlResultValidationError(
+                "REPLAN_REEXECUTE: replacement_branch must differ from previous_branch"
+            )
+        ints: dict[str, int] = {}
+        for key in (
+            "execution_attempt",
+            "historical_findings_considered",
+            "unique_failure_constraints",
+            "fresh_review_round",
+        ):
+            value = _req(p, key, ph)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ControlResultValidationError(f"{ph}: field {key!r} must be an integer >= 0")
+            ints[key] = value
+        if ints["execution_attempt"] < 1:
+            raise ControlResultValidationError("REPLAN_REEXECUTE: execution_attempt must be >= 1")
+        if ints["fresh_review_round"] != 1:
+            raise ControlResultValidationError("REPLAN_REEXECUTE: fresh_review_round must equal 1")
+        if ints["unique_failure_constraints"] > ints["historical_findings_considered"]:
+            raise ControlResultValidationError(
+                "REPLAN_REEXECUTE: unique_failure_constraints cannot exceed "
+                "historical_findings_considered"
+            )
+        if _req_str(p, "previous_pr_disposition", ph) != "superseded":
+            raise ControlResultValidationError(
+                "REPLAN_REEXECUTE: previous_pr_disposition must be 'superseded'"
+            )
+        verification = _req(p, "verification", ph)
+        if not isinstance(verification, dict):
+            raise ControlResultValidationError("REPLAN_REEXECUTE: verification must be an object")
+        tests_run = verification.get("tests_run")
+        tests_passed = verification.get("tests_passed")
+        if not isinstance(tests_run, list) or not all(isinstance(test, str) for test in tests_run):
+            raise ControlResultValidationError(
+                "REPLAN_REEXECUTE: verification.tests_run must be a list"
+            )
+        if not isinstance(tests_passed, bool):
+            raise ControlResultValidationError(
+                "REPLAN_REEXECUTE: verification.tests_passed must be a boolean"
+            )
+        return cls(
+            issue_url=_req_url(p, "issue_url", ph, "issue"),
+            previous_pr_url=previous_pr,
+            replacement_pr_url=replacement_pr,
+            previous_branch=previous_branch,
+            replacement_branch=replacement_branch,
+            previous_head_sha=_req_sha(p, "previous_head_sha", ph),
+            replacement_head_sha=_req_sha(p, "replacement_head_sha", ph),
+            execution_attempt=ints["execution_attempt"],
+            historical_findings_considered=ints["historical_findings_considered"],
+            unique_failure_constraints=ints["unique_failure_constraints"],
+            fresh_review_round=1,
+            tests_run=tests_run,
+            tests_passed=tests_passed,
+        )
+
+
 # Phases that never produce a CONTROL_RESULT: INITIALIZING and
 # READY_FOR_MERGE are deterministic, and MERGE is executed by the controller
 # itself (gh pr merge), never by an agent.
@@ -371,6 +456,8 @@ def validate_for_phase(phase: Phase, payload: dict) -> None:
         ReviewResult.from_payload(payload)
     elif phase == Phase.FIX:
         FixResult.from_payload(payload)
+    elif phase == Phase.REPLAN_REEXECUTE:
+        ReplanReexecuteResult.from_payload(payload)
     elif phase == Phase.UPDATE_EPIC:
         UpdateEpicResult.from_payload(payload)
     elif phase in NON_AGENT_PHASES:
