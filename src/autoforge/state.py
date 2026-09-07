@@ -2,7 +2,8 @@
 
 State file:  ``<state_dir>/state.json``      (default ``.autoforge/state.json``)
 Run logs:    ``<state_dir>/logs/<run-id>/``
-Lock file:   ``<state_dir>/controller.lock``
+Lock file:   ``<git common dir>/autoforge/controller.lock`` -- keyed by the
+             repository, not by ``state_dir``; see :mod:`autoforge.locking`
 
 Saves are atomic (temp file in the same directory + fsync + os.replace) so
 a crash mid-write never leaves a half-written JSON file.  A corrupted state
