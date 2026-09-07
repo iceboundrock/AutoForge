@@ -7,6 +7,7 @@ agents are ``ScriptedProvider`` instances, GitHub is ``FakeGitHub``.
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -321,16 +322,36 @@ def scripted_config():
     return cfg
 
 
+def git_repo(path) -> Path:
+    """Make ``path`` a git repository (``git init``) unless it already is one.
+
+    The controller lock is keyed by the repository containing the engine's
+    working directory, so every engine / CLI test that may take the lock
+    needs a real (empty) repository; ``git init`` costs a few milliseconds.
+    """
+    root = Path(path)
+    root.mkdir(parents=True, exist_ok=True)
+    if not (root / ".git").exists():
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+    return root
+
+
 def make_engine(
     state_dir,
     script=None,
     github: FakeGitHub | None = None,
     cfg=None,
     exit_code: int = 0,
-    workdir=".",
+    workdir=None,
 ):
-    """Engine wired to a ScriptedProvider (agents) and FakeGitHub (verification)."""
+    """Engine wired to a ScriptedProvider (agents) and FakeGitHub (verification).
+
+    ``workdir`` defaults to the parent of ``state_dir`` (the test's tmp_path),
+    made a git repository so the engine can derive its repository lock.
+    """
     cfg = cfg or default_config()
+    if workdir is None:
+        workdir = git_repo(Path(state_dir).parent)
     provider = ScriptedProvider(script, exit_code=exit_code)
     registry = ProviderRegistry(overrides={"claude": provider, "opencode": provider})
     gh = github or FakeGitHub()
@@ -345,6 +366,12 @@ def make_engine(
 @pytest.fixture
 def tmp_state_dir(tmp_path):
     return tmp_path / ".autoforge"
+
+
+@pytest.fixture
+def repo(tmp_path) -> Path:
+    """``tmp_path`` as a git repository (the checkout the controller locks)."""
+    return git_repo(tmp_path)
 
 
 @pytest.fixture

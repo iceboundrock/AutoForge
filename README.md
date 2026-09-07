@@ -69,7 +69,8 @@ src/autoforge/
     github.py         typed GitHubClient over `gh`: reads (PRs, issues, comments,
                       checks, merge queue) + the controller-owned merge / disarm writes
     doctor.py         read-only environment checks
-    locking.py        flock(2) repository lock (.autoforge/controller.lock)
+    locking.py        flock(2) repository lock, keyed by the git common dir
+                      (<repo>/.git/autoforge/controller.lock), never by state_dir
     runlog.py         per-run logs (.autoforge/logs/<run-id>/), redacted
     redaction.py      baseline secret masking for logs / CLI output
     errors.py         Configuration/State/Transition/Lock/Execution/
@@ -104,7 +105,18 @@ Key design points:
   source, tests, and logs **untrusted data**; controller instructions and the
   repo's `AGENTS.md`/`CLAUDE.md` outrank them.
 - **Atomic persistence**: temp file + fsync + `os.replace`; corrupted state
-  fails loudly and is never silently overwritten.
+  fails loudly and is never silently overwritten: `run`, `resume`, `step` and
+  `status` all exit 2 on an unreadable or foreign-protocol `state.json`
+  (bad JSON, unknown phase, invalid UTF-8, dangling symlink, or a
+  non-regular entry such as a FIFO, socket, device or directory — the entry
+  is inspected and opened non-blocking, so a FIFO never hangs the command),
+  and `run --force` moves the entry aside as `state.json.corrupt-<timestamp>`
+  instead of deleting it (a symlink is archived as a link; its target is
+  never touched; a directory cannot be archived and is refused).
+  `run` inspects, decides, quarantines, writes the first
+  state **and executes it** under one continuous controller lock, so a
+  concurrent controller can never be quarantined or overwritten on a stale
+  verdict, nor slip in between the first save and the engine loop.
 - **The REVIEW/FIX loop is bounded by the controller.** `workflow.max_review_rounds`
   (default 6) caps completed review rounds per PR; a round at the cap that
   still has findings goes to `BLOCKED` instead of starting a FIX that could
@@ -209,7 +221,7 @@ Default `.autoforge/` (overridable via `--state-dir` or config):
 ```text
 .autoforge/
     state.json          # persisted run state (atomic writes)
-    controller.lock     # flock(2): one controller per repo
+    state.json.corrupt-<timestamp>   # unreadable state moved aside by 'run --force'
     logs/<run-id>/
         events.jsonl                       # one line per agent invocation
         <seq>-<phase>-<attempt>/
@@ -219,6 +231,14 @@ Default `.autoforge/` (overridable via `--state-dir` or config):
             stdout.log / stderr.log        # redacted
             control-result.json            # parsed CONTROL_RESULT (when valid)
 ```
+
+The controller lock is deliberately **not** in the state directory. It lives
+in the repository's git directory, `<repo>/.git/autoforge/controller.lock`
+(resolved with `git rev-parse --git-common-dir` from the controller's working
+directory), so it is the same file for every `--state-dir`, every
+subdirectory and every linked `git worktree` of one checkout. `run`, `step`
+and `resume` therefore require the working directory to be inside a git
+repository (dry-run does not).
 
 State records `current_pr_url`, `current_branch`, `current_head_sha`,
 `reviewed_head_sha`, `review_round`, `last_review_comment_url`,
@@ -231,6 +251,36 @@ and `block_reason`.
 ## Security model
 
 - One controller per repository (flock); a second instance exits with `LockError`.
+  The lock is keyed by the **repository identity**, not by a caller-selectable
+  path: it is `<git common dir>/autoforge/controller.lock`, resolved with
+  `git rev-parse --git-common-dir` from the controller's working directory, so
+  two controllers cannot escape each other by passing different `--state-dir`
+  values, by starting from different subdirectories with the default relative
+  `.autoforge`, or by using a linked `git worktree` of the same checkout. A
+  working directory outside a git repository has no lock to take and is
+  refused (exit 2, nothing written). Two independent *clones* of one GitHub
+  repository are two repositories to this lock and are not coordinated.
+  `run`, `step` and `resume` take the lock **before** `state.json` is read or
+  created and keep it until their last step has been persisted, so a state
+  snapshot loaded before the lock is never executed and no second controller
+  can take over the repository mid-command. Dry-run takes no lock and runs no
+  `git`. Below the git common dir no path component is followed through a
+  symlink: the `autoforge` directory is created with `mkdir` and opened
+  relative to the git directory's descriptor with `O_DIRECTORY | O_NOFOLLOW`,
+  so a symlink or a file in its place is refused (exit 2) and its target is
+  never touched; `controller.lock` is then opened relative to that validated
+  directory descriptor. The lock entry itself must be a regular file with a
+  single name: `controller.lock` is opened with `O_NOFOLLOW` and
+  `fstat`-checked, so a symlink, FIFO, socket, device or directory in its
+  place, or a hard link that shares its inode with another file, is refused
+  with `LockError` (exit 2) before anything is written — a tampered path or
+  entry can neither redirect the PID write to another file nor produce a
+  traceback. These checks cover entries that are damaged or tampered *at
+  rest*; a writer with write access to the git directory who races the
+  check-then-write window, or swaps the `autoforge` directory for another
+  directory between two controller invocations, has the controller's own
+  privileges and is outside the trust boundary (the git directory is assumed
+  to be writable only by the operating user).
 - **Automatic merge is off by default and opt-in only.** The `MERGE` phase is
   reachable only from `READY_FOR_MERGE` and only when **both**
   `safety.allow_merge: true` is set in config **and** `--allow-merge` is

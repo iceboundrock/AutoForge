@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 
 from . import __version__
@@ -25,10 +26,30 @@ from .errors import (
     StateError,
     StateTransitionError,
 )
-from .locking import ControllerLock
 from .redaction import redact, redact_argv
-from .state import AutoForgeState, StatePaths, load_state, save_state
+from .state import (
+    AutoForgeState,
+    StatePaths,
+    load_state,
+    quarantine_state_file,
+    save_state,
+)
 from .transitions import TERMINAL_PHASES, Phase
+
+
+def _positive_int(text: str) -> int:
+    """argparse type for ``--max-steps``: an integer >= 1.
+
+    Rejecting the value at parse time keeps ``run --max-steps 0`` from
+    writing a fresh state file and then crashing in ``engine.run()``.
+    """
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1, got {value}")
+    return value
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -56,8 +77,19 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--epic", required=True, help="EPIC issue URL")
     r.add_argument("--issue", required=True, help="first issue URL")
     r.add_argument("--dry-run", action="store_true", help="plan only; no side effects")
-    r.add_argument("--force", action="store_true", help="overwrite existing non-DONE state")
-    r.add_argument("--max-steps", type=int, default=50)
+    r.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "discard an existing non-terminal run; an unreadable state entry (bad JSON, "
+            "foreign protocol, invalid UTF-8, dangling symlink, FIFO/socket/device) is "
+            "moved aside as state.json.corrupt-<timestamp> instead of being deleted "
+            "(a directory is refused and must be moved by hand)"
+        ),
+    )
+    r.add_argument(
+        "--max-steps", type=_positive_int, default=50, help="steps for this invocation (>= 1)"
+    )
     r.add_argument(
         "--allow-merge",
         action="store_true",
@@ -74,7 +106,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     re_ = sub.add_parser("resume", help="continue a persisted run")
     re_.add_argument("--dry-run", action="store_true")
-    re_.add_argument("--max-steps", type=int, default=50)
+    re_.add_argument(
+        "--max-steps", type=_positive_int, default=50, help="steps for this invocation (>= 1)"
+    )
     re_.add_argument("--allow-merge", action="store_true")
     re_.add_argument("--full-prompt", action="store_true")
 
@@ -188,41 +222,99 @@ def cmd_run(args) -> int:
             print_plan(o.plan, full_prompt=args.full_prompt)
         return 0
 
-    if paths.state_file.exists():
-        try:
-            existing = load_state(paths.state_file)
-        except StateError:
-            existing = None
-        if existing is not None and existing.phase not in TERMINAL_PHASES and not args.force:
-            print(
-                f"autoforge: error: existing run {existing.run_id} "
-                f"in phase {existing.phase.value} — use 'resume' to continue "
-                "or 'run --force' to discard it",
-                file=sys.stderr,
-            )
-            return 2
-    engine.new_run(args.epic, args.issue)
-    assert engine.state is not None
-    with ControllerLock(paths.lock_file):
+    # Inspect, decide, quarantine, write the first state AND execute under
+    # one continuous lock: a verdict taken before the lock could go stale
+    # (another controller may have repaired, replaced or created state.json
+    # in the meantime) and would then quarantine or overwrite a perfectly
+    # valid run; releasing the lock between the first save and the execution
+    # would let a second controller take over the repository and both would
+    # then run agents and persist state over each other.
+    with engine.locked():
+        corrupt = False
+        # lexists, not exists: a dangling state.json symlink is still an
+        # entry that a fresh save would silently replace.
+        if os.path.lexists(paths.state_file):
+            try:
+                existing = load_state(paths.state_file)
+            except StateError as exc:
+                # Unreadable / foreign-protocol state is fatal: a fresh run
+                # must never silently replace it (merge counters etc. would
+                # be lost).
+                if not args.force:
+                    print(
+                        f"autoforge: error: {exc}\n"
+                        "autoforge: error: refusing to start a new run over an unreadable "
+                        "state file — repair it, or use 'run --force' to move it aside as "
+                        f"{paths.state_file.name}.corrupt-<timestamp> and start over",
+                        file=sys.stderr,
+                    )
+                    return 2
+                corrupt = True
+            else:
+                if existing.phase not in TERMINAL_PHASES and not args.force:
+                    print(
+                        f"autoforge: error: existing run {existing.run_id} "
+                        f"in phase {existing.phase.value} — use 'resume' to continue "
+                        "or 'run --force' to discard it",
+                        file=sys.stderr,
+                    )
+                    return 2
+        engine.new_run(args.epic, args.issue)
+        assert engine.state is not None
+        if corrupt:
+            moved = quarantine_state_file(paths.state_file)
+            print(f"autoforge: moved unreadable state file aside: {moved}", file=sys.stderr)
         save_state(engine.state, paths.state_file)
-    outcomes = engine.run(max_steps=args.max_steps, dry_run=False, allow_merge=args.allow_merge)
+        outcomes = engine.run(max_steps=args.max_steps, dry_run=False, allow_merge=args.allow_merge)
     return _finish(engine, outcomes, args.allow_merge)
 
 
 def cmd_step(args) -> int:
     engine = _engine_for(args)
-    engine.load()
-    outcome = engine.step(dry_run=args.dry_run, allow_merge=args.allow_merge)
-    if args.dry_run and outcome.plan is not None:
-        print_plan(outcome.plan, full_prompt=args.full_prompt)
+    if args.dry_run:
+        # Read-only: no lock, nothing written.
+        engine.load()
+        outcome = engine.step(dry_run=True, allow_merge=args.allow_merge)
+        if outcome.plan is not None:
+            print_plan(outcome.plan, full_prompt=args.full_prompt)
         return 0
+    # Load and execute under one lock: a snapshot loaded before the lock
+    # could already have been replaced by another controller.
+    with engine.locked():
+        engine.load()
+        outcome = engine.step(dry_run=False, allow_merge=args.allow_merge)
     return _finish(engine, [outcome], args.allow_merge)
 
 
 def cmd_resume(args) -> int:
     engine = _engine_for(args)
-    state = engine.load()
-    if state.phase == Phase.READY_FOR_MERGE and not engine.merge_gate_open(args.allow_merge):
+    if args.dry_run:
+        # Read-only: no lock, nothing written.
+        state = engine.load()
+        rc = _resume_holding_state(engine, state, args.allow_merge)
+        if rc is not None:
+            return rc
+        outcomes = engine.run(max_steps=args.max_steps, dry_run=True, allow_merge=args.allow_merge)
+        for o in outcomes:
+            assert o.plan is not None
+            print_plan(o.plan, full_prompt=args.full_prompt)
+        return 0
+    # Load, decide and execute under one lock: a snapshot loaded before the
+    # lock could already have been replaced by another controller.
+    with engine.locked():
+        state = engine.load()
+        rc = _resume_holding_state(engine, state, args.allow_merge)
+        if rc is not None:
+            return rc
+        outcomes = engine.run(max_steps=args.max_steps, dry_run=False, allow_merge=args.allow_merge)
+    return _finish(engine, outcomes, args.allow_merge)
+
+
+def _resume_holding_state(
+    engine: ControllerEngine, state: AutoForgeState, allow_merge: bool
+) -> int | None:
+    """Exit code when ``resume`` has nothing to execute; None when it does."""
+    if state.phase == Phase.READY_FOR_MERGE and not engine.merge_gate_open(allow_merge):
         # Holding state: nothing runs unless the merge gate is open. With the
         # gate open, engine.run() performs the controller-side pre-merge
         # verification instead (bounded re-checks of inconclusive GitHub data
@@ -238,14 +330,7 @@ def cmd_resume(args) -> int:
             f"{state.block_reason or '-'} — inspect .autoforge/logs/ and start a new run"
         )
         return 1
-    if args.dry_run:
-        outcomes = engine.run(max_steps=args.max_steps, dry_run=True, allow_merge=args.allow_merge)
-        for o in outcomes:
-            assert o.plan is not None
-            print_plan(o.plan, full_prompt=args.full_prompt)
-        return 0
-    outcomes = engine.run(max_steps=args.max_steps, dry_run=False, allow_merge=args.allow_merge)
-    return _finish(engine, outcomes, args.allow_merge)
+    return None
 
 
 def cmd_status(args) -> int:

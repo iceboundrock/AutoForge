@@ -474,7 +474,7 @@ Merge counters must be idempotent. Track which PRs have already contributed to t
 
 Only one AutoForge controller instance may operate on a repository at a time.
 
-Use a repository-scoped lock such as `.autoforge/controller.lock` backed by reliable OS-level locking.
+Use a repository-scoped lock backed by reliable OS-level locking, keyed by the repository identity (the git common dir, e.g. `<repo>/.git/autoforge/controller.lock`) rather than by a caller-selectable path such as the state directory: different `--state-dir` values, invocation directories or linked worktrees of one checkout must all contend for the same lock.
 
 A second controller must fail clearly rather than run concurrently.
 

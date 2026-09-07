@@ -2,18 +2,33 @@
 
 State file:  ``<state_dir>/state.json``      (default ``.autoforge/state.json``)
 Run logs:    ``<state_dir>/logs/<run-id>/``
-Lock file:   ``<state_dir>/controller.lock``
+Lock file:   ``<git common dir>/autoforge/controller.lock`` -- keyed by the
+             repository, not by ``state_dir``; see :mod:`autoforge.locking`
 
 Saves are atomic (temp file in the same directory + fsync + os.replace) so
 a crash mid-write never leaves a half-written JSON file.  A corrupted state
-file raises StateError with a meaningful message and is never silently
-overwritten with a fresh state.
+file (unparseable, wrong protocol, invalid UTF-8, a dangling symlink, or a
+non-regular entry such as a FIFO, socket, device or directory) raises
+StateError with a meaningful message and is never silently overwritten with
+a fresh state: ``run`` refuses (exit 2) unless ``--force`` is given, and
+even then the unreadable entry is moved aside as
+``state.json.corrupt-<timestamp>`` by :func:`quarantine_state_file` rather
+than deleted (a directory entry cannot be archived automatically and stays
+put with an error).  The entry is inspected with ``lstat``/``fstat`` and
+opened non-blocking before it is read, so a FIFO without a writer fails
+loudly instead of hanging the command.  ``run`` inspects, decides, quarantines, writes the first
+state and executes it under one continuous controller lock (``step`` and
+``resume`` load and execute under it likewise), so the verdict on an
+existing entry is never taken from a view another controller may have
+changed since, and no second controller can take over between the first
+save and the execution.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import stat
 import tempfile
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -24,7 +39,6 @@ from .errors import StateError
 from .transitions import Phase
 
 STATE_FILENAME = "state.json"
-LOCK_FILENAME = "controller.lock"
 LOGS_DIRNAME = "logs"
 
 
@@ -194,9 +208,15 @@ class AutoForgeState:
 # -- paths ---------------------------------------------------------------
 @dataclass(frozen=True)
 class StatePaths:
+    """Where a run's state and logs live.
+
+    The controller lock is *not* here: it is keyed by the repository
+    identity, not by the caller-selectable state directory (see
+    :func:`autoforge.locking.repository_lock_path`).
+    """
+
     state_dir: Path
     state_file: Path
-    lock_file: Path
     logs_dir: Path
 
     @classmethod
@@ -205,7 +225,6 @@ class StatePaths:
         return cls(
             state_dir=d,
             state_file=d / STATE_FILENAME,
-            lock_file=d / LOCK_FILENAME,
             logs_dir=d / LOGS_DIRNAME,
         )
 
@@ -232,18 +251,95 @@ def save_state(state: AutoForgeState, path: str | Path) -> None:
         raise
 
 
+def entry_kind(mode: int) -> str | None:
+    """Human name of a non-regular entry kind, or None for a regular file."""
+    if stat.S_ISREG(mode):
+        return None
+    if stat.S_ISDIR(mode):
+        return "directory"
+    if stat.S_ISFIFO(mode):
+        return "FIFO"
+    if stat.S_ISSOCK(mode):
+        return "socket"
+    if stat.S_ISCHR(mode):
+        return "character device"
+    if stat.S_ISBLK(mode):
+        return "block device"
+    return "special file"
+
+
+def _not_regular(p: Path, kind: str, is_link: bool) -> StateError:
+    what = f"symbolic link to a {kind}" if is_link else f"a {kind}, not a regular file"
+    # A directory cannot be archived by quarantine_state_file (no hard links
+    # to directories), so 'run --force' is no way out of it.
+    hint = (
+        "move it out of the way by hand"
+        if kind == "directory" and not is_link
+        else ("move it aside or use 'run --force'")
+    )
+    return StateError(f"corrupted state file {p}: {what}; refusing to overwrite — {hint}")
+
+
+def _read_regular_file(p: Path) -> bytes:
+    """Read ``p`` only if it is a regular file (or a symlink to one).
+
+    A FIFO, socket, device or directory is refused before it is opened: a
+    plain ``open()`` on a FIFO without a writer blocks forever, so ``run``
+    could never reach the fail-loud / quarantine path.  The check is
+    repeated on the open descriptor (``O_NONBLOCK`` keeps a FIFO open from
+    blocking), so an entry swapped between the two inspections is still
+    caught.  Raises StateError for a non-regular entry, OSError otherwise.
+    """
+    st = os.lstat(p)
+    is_link = stat.S_ISLNK(st.st_mode)
+    if is_link:
+        st = os.stat(p)  # follows the link; dangling links were rejected earlier
+    kind = entry_kind(st.st_mode)
+    if kind is not None:
+        raise _not_regular(p, kind, is_link)
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOCTTY", 0)
+    fd = os.open(p, flags)
+    try:
+        kind = entry_kind(os.fstat(fd).st_mode)
+        if kind is not None:
+            raise _not_regular(p, kind, is_link)
+        with os.fdopen(fd, "rb") as fh:
+            fd = -1
+            return fh.read()
+    finally:
+        if fd != -1:
+            os.close(fd)
+
+
 def load_state(path: str | Path) -> AutoForgeState:
     """Load state; raises StateError (never silently re-inits) on problems."""
     p = Path(path)
-    if not p.exists():
+    # lexists: a dangling symlink is still a state-directory entry (Path.exists
+    # follows the link and would report it as absent, which lets a fresh run
+    # replace it silently).
+    if not os.path.lexists(p):
         raise StateError(
             f"no state file at {p} — run 'autoforge run --epic ... --issue ...' first; "
             "'resume' never creates a new run silently"
         )
+    if p.is_symlink() and not p.exists():
+        raise StateError(
+            f"corrupted state file {p}: dangling symbolic link to {os.readlink(p)!r}; "
+            "refusing to overwrite — restore from backup or re-run"
+        )
     try:
-        raw = p.read_text(encoding="utf-8")
+        raw_bytes = _read_regular_file(p)
     except OSError as exc:
         raise StateError(f"cannot read state file {p}: {exc}") from exc
+    try:
+        raw = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        # Invalid UTF-8 is a corrupt file, not a read failure: it must take
+        # the same fail-loud / quarantine path as unparseable JSON.
+        raise StateError(
+            f"corrupted state file {p}: not valid UTF-8 ({exc}); "
+            "refusing to overwrite — restore from backup or re-run"
+        ) from exc
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -252,3 +348,69 @@ def load_state(path: str | Path) -> AutoForgeState:
             "refusing to overwrite — restore from backup or re-run"
         ) from exc
     return AutoForgeState.from_dict(data)
+
+
+CORRUPT_SUFFIX = ".corrupt-"
+_QUARANTINE_MAX_ATTEMPTS = 1000
+
+
+def quarantine_state_file(path: str | Path) -> Path:
+    """Move an unreadable state file aside instead of deleting it.
+
+    Renames ``<path>`` to ``<path>.corrupt-<UTC timestamp>`` (a numeric
+    suffix is appended if that name is already taken) and returns the new
+    path.  Never overwrites an existing file: the destination is reserved
+    with :func:`os.link`, which fails atomically with ``EEXIST`` when the
+    name is already taken (a plain ``rename`` would silently replace a file
+    created between the existence check and the move).  On a collision the
+    next numeric suffix is tried.  The directory entry itself is moved: a
+    symbolic link (dangling or not) is archived as a link and the file it
+    points to is never followed, modified or removed; a FIFO, socket or
+    device entry is archived as that entry without being opened.  A
+    directory cannot be hard-linked and is refused: it stays untouched and
+    must be moved aside by hand.  Raises StateError when the move fails; the
+    original entry is left untouched in that case.
+
+    The caller must hold the controller lock (the CLI does, via
+    ``ControllerEngine.locked()``): link and unlink are two syscalls, and a
+    writer replacing ``path`` in between would see the replacement removed.
+    """
+    src = Path(path)
+    try:
+        src_mode = os.lstat(src).st_mode
+    except OSError as exc:
+        raise StateError(f"cannot move corrupted state file {src} aside: {exc}") from exc
+    if stat.S_ISDIR(src_mode):
+        raise StateError(
+            f"cannot move corrupted state file {src} aside: it is a directory; "
+            "move it out of the way by hand and re-run"
+        )
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    base = src.with_name(f"{src.name}{CORRUPT_SUFFIX}{stamp}")
+    candidate = base
+    for n in range(1, _QUARANTINE_MAX_ATTEMPTS + 1):
+        try:
+            # Atomic no-replace reservation: link() never clobbers a
+            # destination that appeared after we picked the candidate.
+            # follow_symlinks=False links the entry itself, so a (dangling)
+            # symlink is preserved as such instead of failing on its target.
+            os.link(src, candidate, follow_symlinks=False)
+        except FileExistsError:
+            candidate = base.with_name(f"{base.name}.{n}")
+            continue
+        except OSError as exc:
+            raise StateError(f"cannot move corrupted state file {src} aside: {exc}") from exc
+        try:
+            os.unlink(src)
+        except OSError as exc:
+            # Drop the reservation so the original is the only copy again.
+            try:
+                os.unlink(candidate)
+            except OSError:
+                pass
+            raise StateError(f"cannot move corrupted state file {src} aside: {exc}") from exc
+        return candidate
+    raise StateError(
+        f"cannot move corrupted state file {src} aside: "
+        f"no free name after {_QUARANTINE_MAX_ATTEMPTS} attempts (last tried {candidate})"
+    )
