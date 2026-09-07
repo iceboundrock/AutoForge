@@ -1,8 +1,20 @@
-"""Repository-level locking: at most one controller per working repo.
+"""Repository-level locking: at most one controller per repository.
 
-Implemented with POSIX flock(2) on ``<state_dir>/controller.lock`` (LOCK_EX |
-LOCK_NB). A second instance fails fast with LockError instead of operating
-concurrently on the same repo.
+Implemented with POSIX flock(2) on ``<git common dir>/autoforge/controller.lock``
+(LOCK_EX | LOCK_NB). A second instance fails fast with LockError instead of
+operating concurrently on the same repository.
+
+The lock is keyed by the *repository identity*, not by a caller-selectable
+path: :func:`repository_lock_path` asks ``git rev-parse --git-common-dir``
+for the git directory shared by every working tree of the repository that
+contains the controller's working directory. The main checkout, a linked
+``git worktree``, any subdirectory, and any ``--state-dir`` therefore all
+resolve to the same lock file, so two controllers cannot pick independent
+locks for one repository by choosing different state directories or by
+being started from different directories. A working directory outside a git
+repository cannot be locked and is refused with LockError (nothing is
+written). Two *independent clones* of one GitHub repository are two
+repositories to this lock; they are not coordinated.
 
 The lock entry is opened with ``O_NOFOLLOW`` and must be a regular file
 with exactly one name (``st_nlink == 1``): a ``controller.lock`` that is a
@@ -15,11 +27,11 @@ the way out.
 
 Tampering model: these checks validate the entry *as found* (damaged or
 tampered at rest). They are taken on the open descriptor, but a writer with
-write access to the state directory who races between the ``fstat`` and the
+write access to the git directory who races between the ``fstat`` and the
 PID write (for example by adding a hard link in that window) can still be
 affected by the write. Such a writer has the controller's own privileges and
-is outside the trust boundary the lock defends; the state directory is
-assumed to be writable only by the operating user.
+is outside the trust boundary the lock defends; the git directory is assumed
+to be writable only by the operating user.
 """
 
 from __future__ import annotations
@@ -27,13 +39,67 @@ from __future__ import annotations
 import errno
 import fcntl
 import os
+from collections.abc import Callable
 from pathlib import Path
 from types import TracebackType
 
-from .errors import LockError
+from .errors import ExecutionError, LockError
+from .executor import ExecutionRequest, ExecutionResult, execute
 from .state import entry_kind
 
+LOCK_DIRNAME = "autoforge"  # inside the git common dir
+LOCK_FILENAME = "controller.lock"
+
+_GIT_COMMON_DIR_ARGV = ["git", "rev-parse", "--git-common-dir"]
+_GIT_TIMEOUT_SECONDS = 30
+
+Runner = Callable[[ExecutionRequest], ExecutionResult]
+
 _OPEN_FLAGS = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+
+
+def repository_lock_path(workdir: str | Path, runner: Runner = execute) -> Path:
+    """Canonical lock path of the repository that contains ``workdir``.
+
+    ``git rev-parse --git-common-dir`` names the git directory shared by all
+    working trees of one repository (for a linked worktree it is the main
+    repository's ``.git``, not ``.git/worktrees/<name>``), so the result is
+    the same for every subdirectory, every worktree and every state
+    directory of that repository. Relative output is resolved against
+    ``workdir``; symlinks are resolved so two spellings of one checkout
+    agree. Raises LockError when ``workdir`` is not inside a git repository
+    or ``git`` cannot be run: without a repository identity there is nothing
+    to lock, and the controller must not fall back to a weaker lock.
+    """
+    base = Path(workdir)
+    shown = base.resolve()  # messages only: "." tells the operator nothing
+    try:
+        res = runner(
+            ExecutionRequest(
+                command=list(_GIT_COMMON_DIR_ARGV),
+                cwd=str(base),
+                timeout_seconds=_GIT_TIMEOUT_SECONDS,
+            )
+        )
+    except ExecutionError as exc:
+        raise LockError(
+            f"cannot derive the controller lock for {shown}: git could not be run ({exc})"
+        ) from exc
+    if res.timed_out:
+        raise LockError(f"cannot derive the controller lock for {shown}: git rev-parse timed out")
+    if res.exit_code != 0:
+        detail = (res.stderr or res.stdout).strip().splitlines()
+        raise LockError(
+            f"cannot derive the controller lock: {shown} is not inside a git repository "
+            f"({detail[0] if detail else f'git rev-parse exited {res.exit_code}'})"
+        )
+    common = res.stdout.strip()
+    if not common:
+        raise LockError(
+            f"cannot derive the controller lock for {shown}: git rev-parse returned no git dir"
+        )
+    git_dir = (base / common).resolve()
+    return git_dir / LOCK_DIRNAME / LOCK_FILENAME
 
 
 class ControllerLock:

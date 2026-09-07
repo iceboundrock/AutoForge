@@ -69,7 +69,8 @@ src/autoforge/
     github.py         typed GitHubClient over `gh`: reads (PRs, issues, comments,
                       checks, merge queue) + the controller-owned merge / disarm writes
     doctor.py         read-only environment checks
-    locking.py        flock(2) repository lock (.autoforge/controller.lock)
+    locking.py        flock(2) repository lock, keyed by the git common dir
+                      (<repo>/.git/autoforge/controller.lock), never by state_dir
     runlog.py         per-run logs (.autoforge/logs/<run-id>/), redacted
     redaction.py      baseline secret masking for logs / CLI output
     errors.py         Configuration/State/Transition/Lock/Execution/
@@ -221,7 +222,6 @@ Default `.autoforge/` (overridable via `--state-dir` or config):
 .autoforge/
     state.json          # persisted run state (atomic writes)
     state.json.corrupt-<timestamp>   # unreadable state moved aside by 'run --force'
-    controller.lock     # flock(2): one controller per repo
     logs/<run-id>/
         events.jsonl                       # one line per agent invocation
         <seq>-<phase>-<attempt>/
@@ -231,6 +231,14 @@ Default `.autoforge/` (overridable via `--state-dir` or config):
             stdout.log / stderr.log        # redacted
             control-result.json            # parsed CONTROL_RESULT (when valid)
 ```
+
+The controller lock is deliberately **not** in the state directory. It lives
+in the repository's git directory, `<repo>/.git/autoforge/controller.lock`
+(resolved with `git rev-parse --git-common-dir` from the controller's working
+directory), so it is the same file for every `--state-dir`, every
+subdirectory and every linked `git worktree` of one checkout. `run`, `step`
+and `resume` therefore require the working directory to be inside a git
+repository (dry-run does not).
 
 State records `current_pr_url`, `current_branch`, `current_head_sha`,
 `reviewed_head_sha`, `review_round`, `last_review_comment_url`,
@@ -243,20 +251,29 @@ and `block_reason`.
 ## Security model
 
 - One controller per repository (flock); a second instance exits with `LockError`.
+  The lock is keyed by the **repository identity**, not by a caller-selectable
+  path: it is `<git common dir>/autoforge/controller.lock`, resolved with
+  `git rev-parse --git-common-dir` from the controller's working directory, so
+  two controllers cannot escape each other by passing different `--state-dir`
+  values, by starting from different subdirectories with the default relative
+  `.autoforge`, or by using a linked `git worktree` of the same checkout. A
+  working directory outside a git repository has no lock to take and is
+  refused (exit 2, nothing written). Two independent *clones* of one GitHub
+  repository are two repositories to this lock and are not coordinated.
   `run`, `step` and `resume` take the lock **before** `state.json` is read or
   created and keep it until their last step has been persisted, so a state
   snapshot loaded before the lock is never executed and no second controller
-  can take over the repository mid-command. Dry-run takes no lock. The lock
-  entry itself must be a regular file with a single name: `controller.lock` is
-  opened with `O_NOFOLLOW` and `fstat`-checked, so a symlink, FIFO, socket,
-  device or directory in its place, or a hard link that shares its inode with
-  another file, is refused with `LockError` (exit 2) before anything is
-  written — a tampered entry can neither redirect the PID write to another
-  file nor produce a traceback. These checks cover an entry that is damaged or
-  tampered *at rest*; a writer with write access to the state directory who
-  races the check-then-write window has the controller's own privileges and
-  is outside the trust boundary (the state directory is assumed to be
-  writable only by the operating user).
+  can take over the repository mid-command. Dry-run takes no lock and runs no
+  `git`. The lock entry itself must be a regular file with a single name:
+  `controller.lock` is opened with `O_NOFOLLOW` and `fstat`-checked, so a
+  symlink, FIFO, socket, device or directory in its place, or a hard link that
+  shares its inode with another file, is refused with `LockError` (exit 2)
+  before anything is written — a tampered entry can neither redirect the PID
+  write to another file nor produce a traceback. These checks cover an entry
+  that is damaged or tampered *at rest*; a writer with write access to the git
+  directory who races the check-then-write window has the controller's own
+  privileges and is outside the trust boundary (the git directory is assumed
+  to be writable only by the operating user).
 - **Automatic merge is off by default and opt-in only.** The `MERGE` phase is
   reachable only from `READY_FOR_MERGE` and only when **both**
   `safety.allow_merge: true` is set in config **and** `--allow-merge` is

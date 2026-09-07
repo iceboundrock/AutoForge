@@ -38,7 +38,6 @@ from .errors import StateError
 from .transitions import Phase
 
 STATE_FILENAME = "state.json"
-LOCK_FILENAME = "controller.lock"
 LOGS_DIRNAME = "logs"
 
 
@@ -208,9 +207,15 @@ class AutoForgeState:
 # -- paths ---------------------------------------------------------------
 @dataclass(frozen=True)
 class StatePaths:
+    """Where a run's state and logs live.
+
+    The controller lock is *not* here: it is keyed by the repository
+    identity, not by the caller-selectable state directory (see
+    :func:`autoforge.locking.repository_lock_path`).
+    """
+
     state_dir: Path
     state_file: Path
-    lock_file: Path
     logs_dir: Path
 
     @classmethod
@@ -219,7 +224,6 @@ class StatePaths:
         return cls(
             state_dir=d,
             state_file=d / STATE_FILENAME,
-            lock_file=d / LOCK_FILENAME,
             logs_dir=d / LOGS_DIRNAME,
         )
 

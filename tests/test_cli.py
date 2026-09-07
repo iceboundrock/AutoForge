@@ -10,7 +10,7 @@ from autoforge.engine import ControllerEngine
 from autoforge.errors import LockError
 from autoforge.executor import ExecutionResult
 from autoforge.github import CheckInfo
-from autoforge.locking import ControllerLock
+from autoforge.locking import ControllerLock, repository_lock_path
 from autoforge.providers import ProviderRegistry, ScriptedProvider
 from autoforge.state import AutoForgeState, load_state, quarantine_state_file, save_state
 from autoforge.transitions import Phase
@@ -23,8 +23,15 @@ from tests.conftest import (
     FakeGitHub,
     block,
     comment_url,
+    git_repo,
     review_comment_body,
 )
+
+
+@pytest.fixture(autouse=True)
+def _tmp_path_is_a_repository(tmp_path):
+    """The CLI locks the repository containing its cwd; tests chdir into tmp_path."""
+    git_repo(tmp_path)
 
 
 @pytest.fixture
@@ -552,7 +559,7 @@ def test_run_refuses_corrupt_state_without_force(tmp_path, capsys, monkeypatch, 
     assert rc == 2
     assert "corrupt" in err.lower() and "--force" in err
     assert (sd / "state.json").read_text(encoding="utf-8") == raw
-    assert sorted(p.name for p in sd.iterdir()) == ["controller.lock", "state.json"]
+    assert sorted(p.name for p in sd.iterdir()) == ["state.json"]
 
 
 def test_run_refuses_invalid_utf8_state_without_force(tmp_path, capsys, monkeypatch, fakes):
@@ -569,7 +576,7 @@ def test_run_refuses_invalid_utf8_state_without_force(tmp_path, capsys, monkeypa
     assert rc == 2
     assert "corrupt" in err.lower() and "utf-8" in err.lower() and "--force" in err
     assert (sd / "state.json").read_bytes() == raw
-    assert sorted(p.name for p in sd.iterdir()) == ["controller.lock", "state.json"]
+    assert sorted(p.name for p in sd.iterdir()) == ["state.json"]
 
 
 def test_run_refuses_foreign_protocol_state_without_force(tmp_path, capsys, monkeypatch, fakes):
@@ -584,7 +591,7 @@ def test_run_refuses_foreign_protocol_state_without_force(tmp_path, capsys, monk
     err = capsys.readouterr().err
     assert rc == 2 and "unknown phase" in err.lower() and "--force" in err
     assert (sd / "state.json").read_text(encoding="utf-8") == raw
-    assert sorted(p.name for p in sd.iterdir()) == ["controller.lock", "state.json"]
+    assert sorted(p.name for p in sd.iterdir()) == ["state.json"]
 
 
 def test_run_force_moves_corrupt_state_aside(tmp_path, capsys, monkeypatch, fakes):
@@ -662,7 +669,7 @@ def test_run_refuses_dangling_symlink_state_without_force(tmp_path, capsys, monk
     assert "symbolic link" in err.lower() and "--force" in err
     assert (sd / "state.json").is_symlink()
     assert os.readlink(sd / "state.json") == "missing-state.json"
-    assert sorted(p.name for p in sd.iterdir()) == ["controller.lock", "state.json"]
+    assert sorted(p.name for p in sd.iterdir()) == ["state.json"]
 
 
 def test_run_force_moves_dangling_symlink_state_aside(tmp_path, capsys, monkeypatch, fakes):
@@ -818,7 +825,7 @@ def test_run_refuses_state_created_by_a_concurrent_controller_before_lock(
     assert rc == 2 and fired
     assert "af-other" in err and "--force" in err
     assert load_state(sf).run_id == "af-other"
-    assert sorted(p.name for p in sd.iterdir()) == ["controller.lock", "state.json"]
+    assert sorted(p.name for p in sd.iterdir()) == ["state.json"]
 
 
 # -- R5-F1: one continuous lock per command ----------------------------------
@@ -848,7 +855,7 @@ def test_command_holds_one_lock_from_state_load_through_agent_execution(
     """
     monkeypatch.chdir(tmp_path)
     sd = tmp_path / ".autoforge"
-    lock_file = sd / "controller.lock"
+    lock_file = repository_lock_path(tmp_path)
     if command != "run":
         sd.mkdir()
         save_state(_other_controller_state("af-live"), sd / "state.json")
@@ -928,7 +935,7 @@ def test_step_and_resume_dry_run_take_no_lock(tmp_path, capsys, monkeypatch, fak
     sd = tmp_path / ".autoforge"
     sd.mkdir()
     save_state(_other_controller_state("af-live"), sd / "state.json")
-    with ControllerLock(sd / "controller.lock"):
+    with ControllerLock(repository_lock_path(tmp_path)):
         assert cli.main(["--state-dir", str(sd), "step", "--dry-run"]) == 0
         assert cli.main(["--state-dir", str(sd), "resume", "--dry-run"]) == 0
     assert "analyze_execute.md" in capsys.readouterr().out
@@ -977,7 +984,7 @@ def test_run_refuses_fifo_state_entry_without_force_and_does_not_hang(
     assert rc == 2
     assert "a fifo, not a regular file" in err.lower() and "--force" in err
     assert stat.S_ISFIFO(os.lstat(sd / "state.json").st_mode)
-    assert sorted(p.name for p in sd.iterdir()) == ["controller.lock", "state.json"]
+    assert sorted(p.name for p in sd.iterdir()) == ["state.json"]
 
 
 def test_run_force_moves_fifo_state_entry_aside(tmp_path, capsys, monkeypatch, fakes):
@@ -1033,7 +1040,7 @@ def test_run_force_refuses_directory_state_entry_and_writes_nothing(
     assert "it is a directory" in err and "by hand" in err
     assert (sd / "state.json").is_dir()
     assert (sd / "state.json" / "keep").read_text(encoding="utf-8") == "x"
-    assert sorted(p.name for p in sd.iterdir()) == ["controller.lock", "state.json"]
+    assert sorted(p.name for p in sd.iterdir()) == ["state.json"]
     assert fakes["provider"].calls == []
 
 
@@ -1077,16 +1084,23 @@ def test_max_steps_zero_is_rejected_for_run_and_resume_including_dry_run(
 
 
 # -- lock entry validation (PFR-F1) -------------------------------------------
+def _lock_entry(tmp_path):
+    """Path of the repository lock entry, its directory created, entry absent."""
+    path = repository_lock_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def test_run_refuses_symlink_lock_entry_and_leaves_target_untouched(
     tmp_path, capsys, monkeypatch, fakes
 ):
     """A controller.lock symlink is refused with exit 2; its target keeps its bytes."""
     monkeypatch.chdir(tmp_path)
     sd = tmp_path / ".autoforge"
-    sd.mkdir()
     target = tmp_path / "unrelated.txt"
     target.write_text("keep\n", encoding="utf-8")
-    (sd / "controller.lock").symlink_to(target)
+    entry = _lock_entry(tmp_path)
+    entry.symlink_to(target)
     rc = cli.main(
         ["--state-dir", str(sd), "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"]
     )
@@ -1094,8 +1108,8 @@ def test_run_refuses_symlink_lock_entry_and_leaves_target_untouched(
     assert rc == 2
     assert "autoforge: error:" in err and "symbolic link" in err
     assert target.read_text(encoding="utf-8") == "keep\n"
-    assert (sd / "controller.lock").is_symlink()
-    assert sorted(p.name for p in sd.iterdir()) == ["controller.lock"]  # no state.json
+    assert entry.is_symlink()
+    assert not sd.exists()  # no state.json
     assert fakes["provider"].calls == []
 
 
@@ -1105,10 +1119,10 @@ def test_run_refuses_hard_linked_lock_entry_and_leaves_target_untouched(
     """PFR-F2: a hard-linked controller.lock is refused (exit 2); the other name keeps its bytes."""
     monkeypatch.chdir(tmp_path)
     sd = tmp_path / ".autoforge"
-    sd.mkdir()
     target = tmp_path / "unrelated.txt"
     target.write_text("preserve\n", encoding="utf-8")
-    os.link(target, sd / "controller.lock")
+    entry = _lock_entry(tmp_path)
+    os.link(target, entry)
     rc = cli.main(
         ["--state-dir", str(sd), "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"]
     )
@@ -1116,8 +1130,8 @@ def test_run_refuses_hard_linked_lock_entry_and_leaves_target_untouched(
     assert rc == 2
     assert "autoforge: error:" in err and "hard links" in err
     assert target.read_text(encoding="utf-8") == "preserve\n"
-    assert os.lstat(sd / "controller.lock").st_nlink == 2
-    assert sorted(p.name for p in sd.iterdir()) == ["controller.lock"]  # no state.json
+    assert os.lstat(entry).st_nlink == 2
+    assert not sd.exists()  # no state.json
     assert fakes["provider"].calls == []
 
 
@@ -1129,8 +1143,8 @@ def test_run_refuses_fifo_lock_entry_without_traceback_or_hang(
 
     monkeypatch.chdir(tmp_path)
     sd = tmp_path / ".autoforge"
-    sd.mkdir()
-    os.mkfifo(sd / "controller.lock")
+    entry = _lock_entry(tmp_path)
+    os.mkfifo(entry)
     rc = _run_with_timeout(
         lambda: cli.main(
             ["--state-dir", str(sd), "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"]
@@ -1139,6 +1153,174 @@ def test_run_refuses_fifo_lock_entry_without_traceback_or_hang(
     err = capsys.readouterr().err
     assert rc == 2
     assert "autoforge: error:" in err and "a fifo, not a regular file" in err.lower()
-    assert stat.S_ISFIFO(os.lstat(sd / "controller.lock").st_mode)
-    assert sorted(p.name for p in sd.iterdir()) == ["controller.lock"]
+    assert stat.S_ISFIFO(os.lstat(entry).st_mode)
+    assert not sd.exists()
+    assert fakes["provider"].calls == []
+
+
+# -- repository-scoped lock (R6-F1) --------------------------------------------
+def _run_argv(state_dir=None, *extra) -> list[str]:
+    argv = ["--state-dir", str(state_dir)] if state_dir is not None else []
+    # Two steps: INITIALIZING, then ANALYZE_EXECUTE (the agent call).
+    return [*argv, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "2", *extra]
+
+
+def test_lock_lives_in_the_git_dir_not_in_the_state_dir(tmp_path, capsys, monkeypatch, fakes):
+    monkeypatch.chdir(tmp_path)
+    sd = tmp_path / "elsewhere" / "state"
+    fakes["handler"] = lambda req: _analyze_ok(fakes["gh"])
+    assert cli.main(_run_argv(sd)) == 0
+    lock = repository_lock_path(tmp_path)
+    assert lock == (tmp_path / ".git" / "autoforge" / "controller.lock").resolve()
+    assert lock.is_file() and lock.read_text(encoding="utf-8") == f"{os.getpid()}\n"
+    assert sorted(p.name for p in sd.iterdir()) == ["logs", "state.json"]  # no controller.lock
+
+
+def test_second_controller_with_another_state_dir_is_refused_while_the_first_runs(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """R6-F1: distinct --state-dir values on one checkout contend for one lock.
+
+    While the first controller's agent is running, a second `run` against the
+    same repository with a different state directory must exit 2 with
+    LockError: no agent, no state.json, nothing written for the second run.
+    """
+    monkeypatch.chdir(tmp_path)
+    first_sd = tmp_path / "state-a"
+    second_sd = tmp_path / "state-b"
+    outcome: dict = {}
+
+    def agent(req):
+        outcome["rc"] = cli.main(_run_argv(second_sd))
+        outcome["calls"] = len(fakes["provider"].calls)
+        return _analyze_ok(fakes["gh"])
+
+    fakes["handler"] = agent
+    assert cli.main(_run_argv(first_sd)) == 0
+    err = capsys.readouterr().err
+    assert outcome["rc"] == 2
+    assert "another AutoForge controller holds" in err and "same repository" in err
+    assert outcome["calls"] == 1, "the second controller must not invoke an agent"
+    assert not second_sd.exists()
+    assert load_state(first_sd / "state.json").phase == Phase.REVIEW
+
+
+def test_second_controller_from_a_subdirectory_with_default_state_dir_is_refused(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """R6-F1: the default relative `.autoforge` from a subdirectory selects the same lock."""
+    monkeypatch.chdir(tmp_path)
+    sub = tmp_path / "pkg" / "deep"
+    sub.mkdir(parents=True)
+    outcome: dict = {}
+
+    def agent(req):
+        monkeypatch.chdir(sub)
+        try:
+            outcome["rc"] = cli.main(_run_argv())  # no --state-dir: relative .autoforge
+        finally:
+            monkeypatch.chdir(tmp_path)
+        return _analyze_ok(fakes["gh"])
+
+    fakes["handler"] = agent
+    assert cli.main(_run_argv()) == 0
+    err = capsys.readouterr().err
+    assert outcome["rc"] == 2
+    assert "another AutoForge controller holds" in err
+    assert not (sub / ".autoforge").exists()
+    assert len(fakes["provider"].calls) == 1
+    assert load_state(tmp_path / ".autoforge" / "state.json").phase == Phase.REVIEW
+
+
+def test_second_controller_in_a_linked_worktree_is_refused(tmp_path, capsys, monkeypatch, fakes):
+    """R6-F1: a linked `git worktree` shares the repository lock of the main checkout."""
+    import subprocess
+
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
+        check=True,
+    )
+    worktree = tmp_path.parent / f"{tmp_path.name}-wt"
+    subprocess.run(["git", "-C", str(tmp_path), "worktree", "add", "-q", str(worktree)], check=True)
+    assert repository_lock_path(worktree) == repository_lock_path(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    outcome: dict = {}
+
+    def agent(req):
+        monkeypatch.chdir(worktree)
+        try:
+            outcome["rc"] = cli.main(_run_argv())
+        finally:
+            monkeypatch.chdir(tmp_path)
+        return _analyze_ok(fakes["gh"])
+
+    fakes["handler"] = agent
+    assert cli.main(_run_argv()) == 0
+    assert outcome["rc"] == 2
+    assert "another AutoForge controller holds" in capsys.readouterr().err
+    assert not (worktree / ".autoforge").exists()
+    assert len(fakes["provider"].calls) == 1
+
+
+@pytest.mark.parametrize("command", ["run", "step", "resume"])
+def test_commands_refuse_to_run_outside_a_git_repository(
+    tmp_path, capsys, monkeypatch, fakes, command
+):
+    """No repository identity -> no lock -> exit 2 before any state is written or agent runs."""
+    outside = tmp_path.parent / f"{tmp_path.name}-not-a-repo"
+    outside.mkdir()
+    monkeypatch.chdir(outside)
+    sd = outside / ".autoforge"
+    if command != "run":
+        sd.mkdir()
+        save_state(_other_controller_state("af-live"), sd / "state.json")
+    argv = ["--state-dir", str(sd), command]
+    if command == "run":
+        argv += ["--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"]
+    rc = cli.main(argv)
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "autoforge: error:" in err and "not inside a git repository" in err
+    assert "Traceback" not in err
+    assert fakes["provider"].calls == []
+    if command == "run":
+        assert not sd.exists()
+    else:
+        assert load_state(sd / "state.json").step_count == 0
+        assert sorted(p.name for p in sd.iterdir()) == ["state.json"]
+
+
+def test_dry_run_needs_no_repository_and_spawns_no_git(tmp_path, capsys, monkeypatch, fakes):
+    """Dry-run takes no lock, so it neither resolves the repository nor runs git."""
+    import autoforge.engine as engine_mod
+
+    outside = tmp_path.parent / f"{tmp_path.name}-not-a-repo"
+    outside.mkdir()
+    monkeypatch.chdir(outside)
+
+    def never(*a, **k):
+        raise AssertionError("dry-run must not resolve the repository lock")
+
+    monkeypatch.setattr(engine_mod, "repository_lock_path", never)
+    sd = outside / ".autoforge"
+    assert cli.main(_run_argv(sd, "--dry-run")) == 0
+    assert "analyze_execute.md" in capsys.readouterr().out
+    assert not sd.exists()
+    sd.mkdir()
+    save_state(_other_controller_state("af-live"), sd / "state.json")
+    assert cli.main(["--state-dir", str(sd), "step", "--dry-run"]) == 0
+    assert cli.main(["--state-dir", str(sd), "resume", "--dry-run"]) == 0
     assert fakes["provider"].calls == []

@@ -85,7 +85,7 @@ from .errors import (
     VerificationError,
 )
 from .github import GitHubClient, IssueInfo, PRInfo, build_merge_argv
-from .locking import ControllerLock
+from .locking import ControllerLock, repository_lock_path
 from .loop_guard import (
     RESULT_CLEAN,
     RESULT_NEEDS_FIX,
@@ -229,6 +229,9 @@ class ControllerEngine:
         self.state: AutoForgeState | None = None
         # Set by locked(): the controller lock held for a whole command.
         self._lock: ControllerLock | None = None
+        # Resolved by lock_path() on first use (never for a dry run): the lock
+        # is keyed by the repository that contains workdir, not by state_dir.
+        self._lock_path: Path | None = None
         # True while self.state is a snapshot of state.json taken by load();
         # such a snapshot is re-read under a self-acquired execution lock.
         self._state_from_disk = False
@@ -495,6 +498,18 @@ class ControllerEngine:
         """True while this engine holds the controller lock via :meth:`locked`."""
         return self._lock is not None
 
+    def lock_path(self) -> Path:
+        """The controller lock of the repository containing ``workdir``.
+
+        Derived once from ``git rev-parse --git-common-dir`` (LockError when
+        ``workdir`` is not inside a git repository) and cached, so every
+        state directory, subdirectory and linked worktree of one repository
+        contends for the same lock. Dry runs never call this.
+        """
+        if self._lock_path is None:
+            self._lock_path = repository_lock_path(self.workdir)
+        return self._lock_path
+
     @contextmanager
     def locked(self) -> Iterator[ControllerEngine]:
         """Hold the controller lock for a whole command lifecycle.
@@ -509,9 +524,9 @@ class ControllerEngine:
         """
         if self._lock is not None:
             raise LockError(
-                f"controller lock {self.paths.lock_file} is already held by this engine"
+                f"controller lock {self._lock.lock_path} is already held by this engine"
             )
-        lock = ControllerLock(self.paths.lock_file).acquire()
+        lock = ControllerLock(self.lock_path()).acquire()
         self._lock = lock
         try:
             yield self
@@ -533,7 +548,7 @@ class ControllerEngine:
         if self._lock is not None:
             yield
             return
-        with ControllerLock(self.paths.lock_file):
+        with ControllerLock(self.lock_path()):
             if self._state_from_disk:
                 self.load()
             yield
