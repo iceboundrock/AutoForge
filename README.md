@@ -246,7 +246,12 @@ and `block_reason`.
   `run`, `step` and `resume` take the lock **before** `state.json` is read or
   created and keep it until their last step has been persisted, so a state
   snapshot loaded before the lock is never executed and no second controller
-  can take over the repository mid-command. Dry-run takes no lock.
+  can take over the repository mid-command. Dry-run takes no lock. The lock
+  entry itself must be a regular file: `controller.lock` is opened with
+  `O_NOFOLLOW`, so a symlink, FIFO, socket, device or directory in its place is
+  refused with `LockError` (exit 2) before anything is written — a tampered
+  entry can neither redirect the PID write to another file nor produce a
+  traceback.
 - **Automatic merge is off by default and opt-in only.** The `MERGE` phase is
   reachable only from `READY_FOR_MERGE` and only when **both**
   `safety.allow_merge: true` is set in config **and** `--allow-merge` is

@@ -1074,3 +1074,49 @@ def test_max_steps_zero_is_rejected_for_run_and_resume_including_dry_run(
     assert info.value.code == 2
     assert "must be >= 1" in capsys.readouterr().err
     assert not sd.exists()
+
+
+# -- lock entry validation (PFR-F1) -------------------------------------------
+def test_run_refuses_symlink_lock_entry_and_leaves_target_untouched(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """A controller.lock symlink is refused with exit 2; its target keeps its bytes."""
+    monkeypatch.chdir(tmp_path)
+    sd = tmp_path / ".autoforge"
+    sd.mkdir()
+    target = tmp_path / "unrelated.txt"
+    target.write_text("keep\n", encoding="utf-8")
+    (sd / "controller.lock").symlink_to(target)
+    rc = cli.main(
+        ["--state-dir", str(sd), "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"]
+    )
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "autoforge: error:" in err and "symbolic link" in err
+    assert target.read_text(encoding="utf-8") == "keep\n"
+    assert (sd / "controller.lock").is_symlink()
+    assert sorted(p.name for p in sd.iterdir()) == ["controller.lock"]  # no state.json
+    assert fakes["provider"].calls == []
+
+
+def test_run_refuses_fifo_lock_entry_without_traceback_or_hang(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """A FIFO controller.lock: clean exit 2 (LockError), never io.UnsupportedOperation."""
+    import stat
+
+    monkeypatch.chdir(tmp_path)
+    sd = tmp_path / ".autoforge"
+    sd.mkdir()
+    os.mkfifo(sd / "controller.lock")
+    rc = _run_with_timeout(
+        lambda: cli.main(
+            ["--state-dir", str(sd), "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"]
+        )
+    )
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "autoforge: error:" in err and "a fifo, not a regular file" in err.lower()
+    assert stat.S_ISFIFO(os.lstat(sd / "controller.lock").st_mode)
+    assert sorted(p.name for p in sd.iterdir()) == ["controller.lock"]
+    assert fakes["provider"].calls == []

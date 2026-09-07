@@ -246,7 +246,7 @@ def save_state(state: AutoForgeState, path: str | Path) -> None:
         raise
 
 
-def _entry_kind(mode: int) -> str | None:
+def entry_kind(mode: int) -> str | None:
     """Human name of a non-regular entry kind, or None for a regular file."""
     if stat.S_ISREG(mode):
         return None
@@ -289,13 +289,13 @@ def _read_regular_file(p: Path) -> bytes:
     is_link = stat.S_ISLNK(st.st_mode)
     if is_link:
         st = os.stat(p)  # follows the link; dangling links were rejected earlier
-    kind = _entry_kind(st.st_mode)
+    kind = entry_kind(st.st_mode)
     if kind is not None:
         raise _not_regular(p, kind, is_link)
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOCTTY", 0)
     fd = os.open(p, flags)
     try:
-        kind = _entry_kind(os.fstat(fd).st_mode)
+        kind = entry_kind(os.fstat(fd).st_mode)
         if kind is not None:
             raise _not_regular(p, kind, is_link)
         with os.fdopen(fd, "rb") as fh:
@@ -365,6 +365,10 @@ def quarantine_state_file(path: str | Path) -> Path:
     directory cannot be hard-linked and is refused: it stays untouched and
     must be moved aside by hand.  Raises StateError when the move fails; the
     original entry is left untouched in that case.
+
+    The caller must hold the controller lock (the CLI does, via
+    ``ControllerEngine.locked()``): link and unlink are two syscalls, and a
+    writer replacing ``path`` in between would see the replacement removed.
     """
     src = Path(path)
     try:

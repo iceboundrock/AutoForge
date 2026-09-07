@@ -3,17 +3,27 @@
 Implemented with POSIX flock(2) on ``<state_dir>/controller.lock`` (LOCK_EX |
 LOCK_NB). A second instance fails fast with LockError instead of operating
 concurrently on the same repo.
+
+The lock entry is opened with ``O_NOFOLLOW`` and must be a regular file: a
+``controller.lock`` that is a symbolic link, FIFO, socket, device or
+directory is refused with LockError before anything is written, so a
+tampered or damaged entry can neither redirect the PID write to an unrelated
+file nor turn the refusal into an unhandled traceback. Every open / flock /
+write failure is a LockError and the descriptor is closed on the way out.
 """
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import os
 from pathlib import Path
 from types import TracebackType
-from typing import IO, Any
 
 from .errors import LockError
+from .state import entry_kind
+
+_OPEN_FLAGS = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
 
 
 class ControllerLock:
@@ -26,35 +36,76 @@ class ControllerLock:
 
     def __init__(self, lock_path: str | Path) -> None:
         self.lock_path = Path(lock_path)
-        self._fh: IO[Any] | None = None
+        self._fd: int | None = None
+
+    def _refuse(self, reason: str) -> LockError:
+        return LockError(f"cannot use {self.lock_path} as the controller lock: {reason}")
+
+    def _open(self) -> int:
+        """Open the lock entry itself, never through a symlink, as a regular file."""
+        try:
+            self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise self._refuse(f"cannot create its directory: {exc}") from exc
+        try:
+            # O_NOFOLLOW: a symlink named controller.lock fails with ELOOP
+            # instead of being followed (also with O_CREAT, dangling or not).
+            # O_NONBLOCK: a FIFO cannot stall the open; it is refused below.
+            fd = os.open(self.lock_path, _OPEN_FLAGS, 0o644)
+        except OSError as exc:
+            if exc.errno in (errno.ELOOP, errno.EMLINK):
+                raise self._refuse(
+                    "it is a symbolic link; remove it and re-run "
+                    "(the link target has not been touched)"
+                ) from exc
+            if exc.errno == errno.EISDIR:
+                raise self._refuse("it is a directory, not a regular file") from exc
+            raise self._refuse(f"cannot open it: {exc}") from exc
+        try:
+            kind = entry_kind(os.fstat(fd).st_mode)
+        except OSError as exc:
+            os.close(fd)
+            raise self._refuse(f"cannot stat it: {exc}") from exc
+        if kind is not None:
+            os.close(fd)
+            raise self._refuse(f"it is a {kind}, not a regular file")
+        return fd
 
     def acquire(self) -> ControllerLock:
-        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-        fh = open(self.lock_path, "a+")
+        fd = self._open()
         try:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as exc:
-            fh.close()
-            raise LockError(
-                f"another AutoForge controller holds {self.lock_path} — "
-                "refusing to run concurrently on the same repository"
-            ) from exc
-        fh.write(f"{os.getpid()}\n")
-        fh.flush()
-        self._fh = fh
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise LockError(
+                    f"another AutoForge controller holds {self.lock_path} — "
+                    "refusing to run concurrently on the same repository"
+                ) from exc
+            except OSError as exc:
+                raise self._refuse(f"flock failed: {exc}") from exc
+            try:
+                # Replace, do not append: the file holds exactly the current PID.
+                os.ftruncate(fd, 0)
+                os.write(fd, f"{os.getpid()}\n".encode("ascii"))
+            except OSError as exc:
+                raise self._refuse(f"cannot record the holder PID: {exc}") from exc
+        except BaseException:
+            os.close(fd)  # also drops the flock if it was taken
+            raise
+        self._fd = fd
         return self
 
     def release(self) -> None:
-        if self._fh is not None:
+        if self._fd is not None:
+            fd, self._fd = self._fd, None
             try:
-                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+                fcntl.flock(fd, fcntl.LOCK_UN)
             finally:
-                self._fh.close()
-                self._fh = None
+                os.close(fd)
 
     @property
     def held(self) -> bool:
-        return self._fh is not None
+        return self._fd is not None
 
     def __enter__(self) -> ControllerLock:
         return self.acquire()
