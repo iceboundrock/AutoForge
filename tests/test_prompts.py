@@ -121,6 +121,10 @@ def test_replan_prompt_contract():
         "replacement PR",
         "CONTROL_RESULT",
         "fresh_review_round",
+        "{{EXECUTION_ATTEMPT}}",
+        "{{HISTORICAL_FINDING_COUNT}}",
+        "Do not run `gh pr close`",
+        "~~~~untrusted",
     ):
         assert phrase in text, phrase
 

@@ -230,14 +230,14 @@ The REVIEW/FIX cycle must be bounded by the controller, never by prompt wording:
 
 ```yaml
 workflow:
-  max_review_rounds: 6                  # completed review rounds per PR
+  max_review_rounds: 20                 # completed review rounds per PR
   stagnation_identical_rounds: 2        # identical required_resolution texts
   stagnation_unchanged_count_rounds: 3  # unchanged finding count
   max_total_steps: 300                  # cumulative steps of the run
 ```
 
-- A review round at the cap that still has findings enters `BLOCKED` with a clear `block_reason`; no further FIX round is started because its result could never be reviewed. A clean round at the cap proceeds normally. Entering `REVIEW` beyond the cap (stale re-review, HEAD drift, resume) is refused before the reviewer runs.
-- Stagnation is judged on the persisted per-PR `review_history` (round, reviewed SHA, result, finding count, fingerprint of the normalised `required_resolution` texts). Only trailing consecutive rounds that ended with findings count; a clean or stale round breaks the streak. A value of 0 disables a rule.
+- After a review with findings, the controller evaluates replan policy before blocking for the per-PR cap or stagnation. An eligible replan, including one caused by workflow stagnation or the cap, enters `REPLAN_REEXECUTE`; an exhausted replan limit enters `BLOCKED`. Otherwise a review round at the cap enters `BLOCKED` with a clear `block_reason`; no further FIX round is started because its result could never be reviewed. A clean round at the cap proceeds normally. Entering `REVIEW` beyond the cap (stale re-review, HEAD drift, resume) is refused before the reviewer runs.
+- Stagnation is judged on the persisted per-PR `review_history` (round, reviewed SHA, result, finding count, fingerprint of the normalised `required_resolution` texts). Only trailing consecutive rounds that ended with findings count; a clean or stale round breaks the streak. A value of 0 disables a rule. A detected stagnation is an eligible replan trigger only from `review.replan.soft_threshold` onwards; below that round it is an immediate block, because a short identical-resolution streak is usually one FIX round that missed a finding and is not worth discarding the PR for. `_apply_replan` is authoritative over `_recover_replan`, and `review.replan.soft_threshold` is authoritative over `workflow.stagnation_*`: recovery must never re-derive acceptance for a replacement that verification refused.
 - The step budget is measured on the persisted cumulative `step_count`, which is never reset by `resume` or by switching issues. CLI `--max-steps` bounds a single invocation only.
 - Failed invocations consume neither a review round nor a `review_history` entry.
 - Hitting any bound is `BLOCKED` (terminal). The open findings and the PR stay for a human; nothing is merged.

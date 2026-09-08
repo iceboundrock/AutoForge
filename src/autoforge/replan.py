@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from .config import ReplanConfig
 from .github import GitHubClient
 from .loop_guard import RESULT_NEEDS_FIX
+
+# Any run of three or more tildes can close (or open) a tilde code fence, so
+# the escape must break *runs*, not the literal fence string: replacing only
+# "~~~~" is non-overlapping and left-to-right, which lets "~~~~~~~" re-form a
+# closing fence out of the untouched tail.
+_TILDE_RUN_RE = re.compile(r"~{3,}")
 
 
 @dataclass(frozen=True)
@@ -23,11 +30,22 @@ def evaluate_replan_policy(
     review_history: list[dict],
     escalation_count: int,
     config: ReplanConfig,
+    workflow_stagnation_reason: str = "",
 ) -> ReplanDecision:
     """Choose the post-review route without inspecting agent prose.
 
     A clean review always wins. ``max_replans_per_issue`` counts completed
     fresh reimplementations, not the original implementation attempt.
+
+    ``soft_threshold`` is the review round from which the controller may
+    *replace* an implementation instead of continuing to patch it. Every
+    stagnation trigger is gated behind it, including the ``workflow.stagnation_*``
+    verdict passed in as ``workflow_stagnation_reason``: an early streak of
+    identical resolutions is usually a single FIX round that missed a finding,
+    and discarding the whole PR over that is far more destructive than the
+    documented BLOCKED. Below the threshold this returns ``continue_fix`` and
+    the caller's ordinary loop bounds (cap / stagnation -> BLOCKED) apply
+    unchanged; at or above it, sustained non-convergence escalates to a replan.
     """
     if not has_actionable_findings or not config.enabled:
         return ReplanDecision("continue_fix")
@@ -38,7 +56,10 @@ def evaluate_replan_policy(
         "soft_threshold": config.soft_threshold,
         "hard_threshold": config.hard_threshold,
     }
-    if current_review_round >= config.hard_threshold:
+    if workflow_stagnation_reason and current_review_round >= config.soft_threshold:
+        trigger = "workflow_stagnation"
+        metadata["workflow_stagnation_reason"] = workflow_stagnation_reason
+    elif current_review_round >= config.hard_threshold:
         trigger = "hard_review_round_threshold"
     elif current_review_round >= config.soft_threshold:
         window = config.stagnation_window
@@ -75,12 +96,26 @@ class HistoricalReviewData:
     findings: list[dict]
     observations: list[str]
     verification_failures: list[str]
+    # Number of findings actually rendered into the prompt. The controller
+    # requires the agent to account for exactly these; counting rounds'
+    # untruncated ``finding_count`` instead would demand it account for
+    # findings it was never shown (loop_guard truncates at
+    # MAX_PERSISTED_FINDINGS_PER_ROUND).
     recorded_finding_count: int = 0
+
+    @staticmethod
+    def _render_untrusted(text: str) -> str:
+        """Prevent collected text from terminating the prompt's outer fence.
+
+        Every run of 3+ tildes is broken apart, so no residual run of any
+        length (indented or not) can act as a fence delimiter.
+        """
+        return _TILDE_RUN_RE.sub(lambda m: " ".join(m.group(0)), text)
 
     def render_findings(self) -> str:
         if not self.findings:
             return "(none)"
-        return "\n".join(
+        return self._render_untrusted("\n".join(
             "- {id} (round {round}, {classification}): {required_resolution}".format(
                 id=f.get("id", "(unknown)"),
                 round=f.get("round", "?"),
@@ -88,13 +123,17 @@ class HistoricalReviewData:
                 required_resolution=f.get("required_resolution", ""),
             )
             for f in self.findings
-        )
+        ))
 
     def render_observations(self) -> str:
-        return "\n\n".join(self.observations) if self.observations else "(none)"
+        if not self.observations:
+            return "(none)"
+        return self._render_untrusted("\n\n".join(self.observations))
 
     def render_verification_failures(self) -> str:
-        return "\n".join(self.verification_failures) if self.verification_failures else "(none)"
+        if not self.verification_failures:
+            return "(none)"
+        return self._render_untrusted("\n".join(self.verification_failures))
 
 
 class HistoricalReviewCollector:
@@ -117,15 +156,11 @@ class HistoricalReviewCollector:
     ) -> HistoricalReviewData:
         findings: list[dict] = []
         observations: list[str] = []
-        recorded_finding_count = 0
         comments = {c.url: c for c in self.github.get_pr_comments(previous_pr_url)}
         remaining = self.max_comment_chars
         for record in review_history:
             if record.get("result") != RESULT_NEEDS_FIX:
                 continue
-            count = record.get("finding_count")
-            if isinstance(count, int) and count >= 0:
-                recorded_finding_count += count
             round_number = record.get("round")
             for finding in record.get("findings", []):
                 if isinstance(finding, dict):
@@ -142,5 +177,5 @@ class HistoricalReviewCollector:
             findings,
             observations,
             list(verification_failures),
-            recorded_finding_count,
+            len(findings),
         )

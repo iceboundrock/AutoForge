@@ -260,6 +260,7 @@ def test_workflow_defaults_and_parsing(tmp_path):
                     "stagnation_unchanged_count_rounds": 0,
                     "max_total_steps": 12,
                 },
+                "review": {"replan": {"soft_threshold": 2, "hard_threshold": 3}},
             }
         ),
         encoding="utf-8",
@@ -268,7 +269,11 @@ def test_workflow_defaults_and_parsing(tmp_path):
     assert (wf.max_review_rounds, wf.max_total_steps) == (3, 12)
     assert (wf.stagnation_identical_rounds, wf.stagnation_unchanged_count_rounds) == (0, 0)
     y = tmp_path / "cfg.yaml"
-    y.write_text("version: 1\nworkflow:\n  max_review_rounds: 4\n", encoding="utf-8")
+    y.write_text(
+        "version: 1\nworkflow:\n  max_review_rounds: 4\nreview:\n  replan:\n"
+        "    soft_threshold: 4\n    hard_threshold: 4\n",
+        encoding="utf-8",
+    )
     assert load_config_file(y).workflow.max_review_rounds == 4
 
 
@@ -311,6 +316,10 @@ def test_workflow_section_rejects_invalid_values(tmp_path, body, key):
         ('{"version": 1, "review": {"replan": {"max_findings_per_round": -1}}}', "max_findings"),
         ('{"version": 1, "review": {"replan": {"max_replans_per_issue": -1}}}', "max_replans"),
         ('{"version": 1, "review": {"replan": {"enabled": "false"}}}', "enabled.*boolean"),
+        (
+            '{"version": 1, "workflow": {"max_review_rounds": 19}}',
+            "hard_threshold.*max_review_rounds",
+        ),
     ],
 )
 def test_replan_config_validation(tmp_path, body, needle):

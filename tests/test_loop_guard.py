@@ -54,6 +54,14 @@ def test_review_record_shape_and_result_validation():
         review_record(1, SHA_A, "merged", [])
 
 
+def test_review_record_bounds_retained_finding_evidence():
+    findings = [_f("x" * 2500, f"R1-F{i}") for i in range(101)]
+    record = review_record(1, SHA_A, RESULT_NEEDS_FIX, findings)
+    assert record["finding_count"] == 101
+    assert len(record["findings"]) == 100
+    assert len(record["findings"][0]["required_resolution"]) == 2000
+
+
 # -- review-round cap ---------------------------------------------------------------
 def test_round_cap_blocks_findings_at_cap_but_not_clean():
     assert round_cap_reason(5, 6, has_findings=True) == ""

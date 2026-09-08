@@ -288,7 +288,6 @@ def test_runaway_review_fix_loop_is_bounded(tmp_state_dir):
         raise AssertionError(f"unexpected call {req.phase}")
 
     eng = make_engine(tmp_state_dir, agent, github=gh)
-    eng._save()
     outcomes = eng.run(max_steps=50)
     assert outcomes[-1].next_phase == "BLOCKED"
     assert len(outcomes) < 50

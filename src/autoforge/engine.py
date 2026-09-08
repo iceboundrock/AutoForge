@@ -67,6 +67,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import NoReturn
 
 from . import __prompt_version__
 from .config import AutoForgeConfig, validate_required_profiles
@@ -342,6 +343,8 @@ class ControllerEngine:
                         progress.get("default_branch", "(verified at execution)")
                     ),
                     "ESCALATION_REASON": json.dumps(progress.get("escalation", {}), sort_keys=True),
+                    "EXECUTION_ATTEMPT": s.execution_attempt + 1,
+                    "HISTORICAL_FINDING_COUNT": int(progress.get("historical_finding_count", 0)),
                     "HISTORICAL_FINDINGS": str(
                         progress.get("historical_findings", "(collected at execution from GitHub)")
                     ),
@@ -1441,21 +1444,43 @@ class ControllerEngine:
             return None
         if progress.get("stage") in ("replacement_verified", "old_pr_superseded"):
             return self._finish_replan()
+        if progress.get("stage") == "replacement_rejected":
+            # `_apply_replan` refused this replacement. The GitHub facts below
+            # cannot see that refusal, so accepting here would silently
+            # override verification. Fail closed instead.
+            return self._block_replan_recovery(
+                "cannot safely recover REPLAN_REEXECUTE: the replacement "
+                f"{progress.get('rejected_replacement_pr_url', '(unknown)')} was rejected by "
+                f"controller verification: {progress.get('rejection_reason', 'unspecified')}"
+            )
         issue = parse_issue_url(state.current_issue_url)
         old_url = str(progress.get("previous_pr_url", ""))
-        candidates = [
-            pr
-            for pr in self.github.find_open_prs_for_issue(issue)
-            if parse_pr_url(pr.url).canonical != parse_pr_url(old_url).canonical
-        ]
+        try:
+            candidates = [
+                pr
+                for pr in self.github.find_open_prs_for_issue(issue)
+                if parse_pr_url(pr.url).canonical != parse_pr_url(old_url).canonical
+            ]
+        except GitHubUnavailableError:
+            # Transient (timeout, connection, 5xx, rate limit): the candidate
+            # set is unknown, not ambiguous. Propagate so the run can resume
+            # instead of permanently blocking a healthy replan.
+            raise
+        except GitHubError as exc:
+            return self._block_replan_recovery(f"cannot list replacement PR candidates: {exc}")
         if not candidates:
             return None
         if len(candidates) != 1:
-            raise VerificationError(
+            return self._block_replan_recovery(
                 "cannot safely recover REPLAN_REEXECUTE: multiple replacement PR candidates exist"
             )
         replacement = candidates[0]
-        self._verify_replacement_pr(replacement, progress)
+        try:
+            self._verify_replacement_pr(replacement, progress)
+        except VerificationError as exc:
+            return self._block_replan_recovery(
+                f"cannot safely recover REPLAN_REEXECUTE replacement {replacement.url}: {exc}"
+            )
         progress.update(
             {
                 "stage": "replacement_verified",
@@ -1466,6 +1491,14 @@ class ControllerEngine:
         )
         self._save()
         return self._finish_replan(recovered=True)
+
+    def _block_replan_recovery(self, reason: str) -> StepOutcome:
+        """Persist an ambiguous or invalid replan recovery as terminal state."""
+        state = self._require_state()
+        state.phase = Phase.BLOCKED
+        state.block_reason = reason
+        self._save()
+        return self._outcome(Phase.REPLAN_REEXECUTE, message=reason)
 
     def _finish_replan(self, recovered: bool = False) -> StepOutcome:
         """Close the old PR, then atomically activate the verified replacement."""
@@ -1505,6 +1538,10 @@ class ControllerEngine:
                     "review_round": progress["previous_review_round"],
                     "replacement_pr_url": replacement_url,
                     "reason": progress.get("escalation", {}).get("trigger", "replan"),
+                    "historical_findings_considered": progress.get(
+                        "historical_findings_considered", 0
+                    ),
+                    "unique_failure_constraints": progress.get("unique_failure_constraints", 0),
                     "superseded_at": utcnow_iso(),
                 }
             )
@@ -1783,12 +1820,18 @@ class ControllerEngine:
             state.last_review_result = "needs_fix"
             state.open_findings = findings
             self._record_review(res.round, expected_head, RESULT_NEEDS_FIX, findings)
+            workflow_stagnation = stagnation_reason(
+                state.review_history,
+                self.config.workflow.stagnation_identical_rounds,
+                self.config.workflow.stagnation_unchanged_count_rounds,
+            )
             decision = evaluate_replan_policy(
                 has_actionable_findings=True,
                 current_review_round=res.round,
                 review_history=state.review_history,
                 escalation_count=state.escalation_count,
                 config=self.config.review.replan,
+                workflow_stagnation_reason=workflow_stagnation,
             )
             if decision.action == "block_for_human":
                 return Phase.BLOCKED, self._loop_block_reason(
@@ -1905,44 +1948,88 @@ class ControllerEngine:
             f"{len(res.resolutions)} resolution(s); FIX -> REVIEW (round {state.review_round + 1})"
         )
 
+    def _reject_replan(self, reason: str, replacement_url: str = "") -> NoReturn:
+        """Persist a REPLAN_REEXECUTE rejection, then raise it.
+
+        :meth:`_apply_replan` is authoritative over :meth:`_recover_replan`:
+        recovery re-derives acceptance from objective GitHub facts alone, and
+        none of those facts encode a rejection (a replacement whose own
+        CONTROL_RESULT reported failing tests still looks like a perfectly
+        valid open, issue-linked PR). Without this marker, one ``resume``
+        would launder every check below and close the previous PR anyway.
+        """
+        state = self._require_state()
+        progress = state.replan_progress
+        progress["stage"] = "replacement_rejected"
+        progress["rejection_reason"] = reason
+        if replacement_url:
+            progress["rejected_replacement_pr_url"] = replacement_url
+        self._save()
+        raise VerificationError(reason)
+
     def _apply_replan(self, res: ReplanReexecuteResult) -> tuple[Phase, str]:
         """Verify a new PR, checkpoint it, then supersede the old PR safely."""
         state = self._require_state()
         progress = state.replan_progress
         if not progress or progress.get("stage") != "prepared":
             raise VerificationError("REPLAN_REEXECUTE has no prepared recovery checkpoint")
+        # Everything below is a rejection of *this* replacement attempt and is
+        # persisted before it is raised (see :meth:`_reject_replan`).
+        claimed_url = parse_pr_url(res.replacement_pr_url).canonical
         if parse_issue_url(res.issue_url).canonical != state.current_issue_url:
-            raise VerificationError(
-                "REPLAN_REEXECUTE result issue_url does not match current issue"
+            self._reject_replan(
+                "REPLAN_REEXECUTE result issue_url does not match current issue", claimed_url
             )
         if parse_pr_url(res.previous_pr_url).canonical != progress["previous_pr_url"]:
-            raise VerificationError("REPLAN_REEXECUTE previous_pr_url does not match checkpoint")
+            self._reject_replan(
+                "REPLAN_REEXECUTE previous_pr_url does not match checkpoint", claimed_url
+            )
         if res.previous_branch != progress["previous_branch"]:
-            raise VerificationError("REPLAN_REEXECUTE previous_branch does not match checkpoint")
+            self._reject_replan(
+                "REPLAN_REEXECUTE previous_branch does not match checkpoint", claimed_url
+            )
         if res.previous_head_sha != progress["previous_head_sha"]:
-            raise VerificationError("REPLAN_REEXECUTE previous_head_sha does not match checkpoint")
+            self._reject_replan(
+                "REPLAN_REEXECUTE previous_head_sha does not match checkpoint", claimed_url
+            )
         if res.execution_attempt != state.execution_attempt + 1:
-            raise VerificationError(
+            self._reject_replan(
                 f"REPLAN_REEXECUTE execution_attempt must be {state.execution_attempt + 1}, "
-                f"got {res.execution_attempt}"
+                f"got {res.execution_attempt}",
+                claimed_url,
+            )
+        if not res.tests_passed:
+            self._reject_replan(
+                "REPLAN_REEXECUTE replacement verification reports tests_passed=false",
+                claimed_url,
             )
         if res.historical_findings_considered < int(progress["historical_finding_count"]):
-            raise VerificationError(
+            self._reject_replan(
                 "REPLAN_REEXECUTE did not claim to consider every controller-recorded "
-                "historical finding"
+                "historical finding",
+                claimed_url,
             )
         replacement_ref = parse_pr_url(res.replacement_pr_url)
         try:
             replacement = self.github.get_pr(replacement_ref.canonical)
+        except GitHubUnavailableError:
+            # Transient: the claim is unverified, not refused. Leave the
+            # checkpoint 'prepared' so a resume can re-check it.
+            raise
         except GitHubError as exc:
-            raise VerificationError(
-                f"replacement PR {replacement_ref.canonical} could not be verified: {exc}"
-            ) from exc
-        self._verify_replacement_pr(replacement, progress, res.replacement_head_sha)
+            self._reject_replan(
+                f"replacement PR {replacement_ref.canonical} could not be verified: {exc}",
+                replacement_ref.canonical,
+            )
+        try:
+            self._verify_replacement_pr(replacement, progress, res.replacement_head_sha)
+        except VerificationError as exc:
+            self._reject_replan(str(exc), replacement_ref.canonical)
         if replacement.head_ref != res.replacement_branch:
-            raise VerificationError(
+            self._reject_replan(
                 f"replacement branch mismatch: GitHub reports {replacement.head_ref!r}, "
-                f"agent claimed {res.replacement_branch!r}"
+                f"agent claimed {res.replacement_branch!r}",
+                replacement_ref.canonical,
             )
         progress.update(
             {
@@ -1950,6 +2037,8 @@ class ControllerEngine:
                 "replacement_pr_url": replacement_ref.canonical,
                 "replacement_branch": replacement.head_ref,
                 "replacement_head_sha": replacement.head_sha,
+                "unique_failure_constraints": res.unique_failure_constraints,
+                "historical_findings_considered": res.historical_findings_considered,
             }
         )
         # Durable checkpoint before the controller's GitHub write. If the

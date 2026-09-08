@@ -24,6 +24,8 @@ import hashlib
 import re
 
 _WS_RE = re.compile(r"\s+")
+MAX_PERSISTED_FINDINGS_PER_ROUND = 100
+MAX_REQUIRED_RESOLUTION_CHARS = 2000
 
 # ``result`` values recorded per review round.
 RESULT_NEEDS_FIX = "needs_fix"
@@ -65,16 +67,18 @@ def review_record(
         "finding_count": len(findings),
         "fingerprint": findings_fingerprint(findings),
     }
-    # Preserve structured actionable evidence, not unbounded comment bodies.
-    # GitHub remains authoritative for the latter.
+    # Keep compact, bounded evidence. GitHub remains authoritative for comment
+    # bodies and the full finding list if this history is truncated.
     if findings:
         record["findings"] = [
             {
                 "id": str(f.get("id", "")),
                 "classification": str(f.get("classification", "")),
-                "required_resolution": str(f.get("required_resolution", "")),
+                "required_resolution": str(f.get("required_resolution", ""))[
+                    :MAX_REQUIRED_RESOLUTION_CHARS
+                ],
             }
-            for f in findings
+            for f in findings[:MAX_PERSISTED_FINDINGS_PER_ROUND]
         ]
     if review_comment_url:
         record["review_comment_url"] = review_comment_url

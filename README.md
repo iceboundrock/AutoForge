@@ -121,26 +121,33 @@ Key design points:
   concurrent controller can never be quarantined or overwritten on a stale
   verdict, nor slip in between the first save and the engine loop.
 - **The REVIEW/FIX loop is bounded by the controller.** `workflow.max_review_rounds`
-  (default 6) caps completed review rounds per PR; a round at the cap that
-  still has findings goes to `BLOCKED` instead of starting a FIX that could
-  never be reviewed. Stagnation detection blocks earlier: consecutive rounds
+  (default 20) caps completed review rounds per PR; a round at the cap that
+  still has findings triggers an eligible replan, or goes to `BLOCKED` instead
+  of starting a FIX that could never be reviewed. Stagnation detection: consecutive rounds
   whose `required_resolution` texts are identical
   (`workflow.stagnation_identical_rounds`, default 2) or whose finding count
-  does not change (`workflow.stagnation_unchanged_count_rounds`, default 3).
+  does not change (`workflow.stagnation_unchanged_count_rounds`, default 3)
+  go to `BLOCKED`, unless the loop has already reached
+  `review.replan.soft_threshold` (default round 12), in which case they
+  trigger an eligible replan instead.
   `workflow.max_total_steps` (default 300) is a cumulative budget for the whole
   run measured on the persisted `step_count`, so `resume` continues it rather
   than resetting it (`--max-steps` bounds one invocation only). Failed agent
   invocations consume neither a review round nor the history. Every bound
-   ends in `BLOCKED` with the reason; findings and the PR stay for a human.
+  ends in `BLOCKED` with the reason; findings and the PR stay for a human.
 - **Replanning is controller policy, not reviewer advice.** After a verified
   review with findings, `review.replan` defaults to a hard trigger at round 20,
-  or round 12 with three trailing review rounds each containing at most two
-  actionable findings. It preserves compact finding metadata and selected
+  or from round 12 (`soft_threshold`) either three trailing review rounds each
+  containing at most two actionable findings, or a `workflow.stagnation_*`
+  verdict. `soft_threshold` gates *every* stagnation trigger: before it, a
+  stagnant loop is `BLOCKED` for a human as documented above, because one
+  ineffective FIX round is too weak a signal to discard a whole PR. It
+  preserves compact finding metadata and selected
   review comments, then asks the separate `replan_reexecute` high-effort
   profile to independently rebuild from the latest verified default branch.
   The controller verifies a distinct, open, issue-linked replacement PR on a
   new branch and the correct base before closing the old PR without merging it.
- At most two replans per issue are allowed; a further eligible trigger blocks
+  At most two replans per issue are allowed; a further eligible trigger blocks
   for human intervention. This retains failure knowledge while intentionally
   discarding implementation anchoring; it does not guarantee convergence.
   AutoForge deliberately performs no local branch or worktree cleanup during
@@ -153,7 +160,7 @@ Key design points:
 |---|---|---|
 | `INITIALIZING` | controller | cwd repo == issue repo, issue is in this repo, is not the EPIC, exists and is OPEN |
 | `ANALYZE_EXECUTE` | Claude Code (`fable`, effort high) | existing open PR for the issue is recovered without re-running the agent; otherwise PR exists in this repo, is OPEN, HEAD SHA and branch match the claim |
-| `REVIEW` | OpenCode (round 1 `openai/gpt-5.6-luna` high, rounds 2–5 `openai/gpt-5.6-terra` high, 6+ `openai/gpt-5.6-sol` medium) | round number, reviewed SHA == bound HEAD, exactly one review comment on this PR with the `# AI Code Review — Round N` heading and the `ai-review-result` marker matching round/SHA/flag, findings invariant; then the loop bounds: round == `workflow.max_review_rounds` with findings, or stagnation across the recorded `review_history` -> `BLOCKED` (no further FIX). Entering `REVIEW` past the cap (stale re-review, HEAD drift, resume) is refused before the reviewer runs |
+| `REVIEW` | OpenCode (round 1 `openai/gpt-5.6-luna` high, rounds 2–5 `openai/gpt-5.6-terra` high, 6+ `openai/gpt-5.6-sol` medium, intentionally retained through the 20-round cap) | round number, reviewed SHA == bound HEAD, exactly one review comment on this PR with the `# AI Code Review — Round N` heading and the `ai-review-result` marker matching round/SHA/flag, findings invariant; then controller policy: an eligible replan (including workflow stagnation or the cap) enters `REPLAN_REEXECUTE`; an exhausted replan limit or no eligible replan blocks. Entering `REVIEW` past the cap (stale re-review, HEAD drift, resume) is refused before the reviewer runs |
 | `FIX` | Claude Code (`fable`, effort high) | `previous_head_sha` == current HEAD, every open finding ID resolved (`fixed` / `follow_up_created` / `no_change_with_rationale`), follow-up issues exist in this repo and are OPEN, actual PR HEAD == `new_head_sha`, a `fixed` resolution moved HEAD |
 | `REPLAN_REEXECUTE` | OpenCode (`replan_reexecute`, default `openai/gpt-5.6-terra`, effort high) | Before invocation, durable state captures historical findings and the verified default branch. The replacement must be a distinct OPEN issue-linked PR, on a distinct branch, based on that default branch and at its claimed HEAD. Only then does the controller close the old PR without merge and reset the replacement lifecycle so its next review is round 1. |
 | `READY_FOR_MERGE` | nobody | holding state; `step`/`resume` refuse to continue unless the merge gate is open (`resume` only re-prints the banner). With the gate open (`step --allow-merge` / `resume --allow-merge`) it runs the full pre-merge verification below against GitHub *before* entering `MERGE`: closed / conflicting / failing / draft / queued PRs go to `BLOCKED` without ever reaching `MERGE`, HEAD drift -> `REVIEW`, an already-merged PR -> `MERGE` to reconcile; inconclusive data (checks running, mergeability unknown, GitHub unreachable / transient read failure) keeps the phase for `resume --allow-merge`, at most `merge.max_verification_attempts` times, then `BLOCKED`; a read that fails conclusively (bad credentials, permissions, unresolvable PR) -> `BLOCKED` at once |

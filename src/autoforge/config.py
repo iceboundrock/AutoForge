@@ -111,7 +111,13 @@ class ReplanConfig:
     """Controller policy for abandoning a non-converging implementation."""
 
     enabled: bool = True
+    # First review round from which the controller may *replace* an
+    # implementation instead of continuing to patch it. Every stagnation
+    # trigger is gated behind it, including `workflow.stagnation_*`: below
+    # this round a stagnant loop still ends in BLOCKED for a human, which is
+    # far less destructive than discarding a PR after one ineffective FIX.
     soft_threshold: int = 12
+    # Review round at which findings trigger a replan unconditionally.
     hard_threshold: int = 20
     stagnation_window: int = 3
     max_findings_per_round: int = 2
@@ -415,6 +421,11 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
                     f"{source}: 'workflow.{key}' must be >= {minimum}, got {value}"
                 )
             setattr(base.workflow, key, value)
+    if base.review.replan.hard_threshold > base.workflow.max_review_rounds:
+        raise ConfigurationError(
+            f"{source}: 'review.replan.hard_threshold' must be <= "
+            "'workflow.max_review_rounds'"
+        )
     profiles = data.get("profiles", {}) or {}
     if not isinstance(profiles, dict):
         raise ConfigurationError(f"{source}: 'profiles' must be a mapping")

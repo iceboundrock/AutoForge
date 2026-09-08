@@ -50,18 +50,20 @@ merge:
 
 workflow:
   # Loop bounds enforced by the controller (never by a prompt). Each one ends
-  # the run in BLOCKED with the reason in `block_reason` / `status`; the open
-  # findings and the PR are kept for a human, nothing is merged.
-  # Hard cap on completed review rounds per PR. A round at the cap that still
-  # has findings blocks instead of starting a FIX whose result could never be
-  # reviewed; a clean round at the cap proceeds to READY_FOR_MERGE.
+  # the run in BLOCKED with the reason in `block_reason` / `status`, unless an
+  # eligible replan below replaces the non-converging PR.
+  # Hard cap on completed review rounds per PR. A round at the cap with
+  # findings first evaluates replan policy; otherwise it blocks rather than
+  # starting a FIX whose result could never be reviewed.
   max_review_rounds: 20
   # Stagnation: this many consecutive rounds with findings whose
   # `required_resolution` texts are identical (ids/locations ignored,
-  # whitespace/case-normalised) -> BLOCKED. 0 disables the rule.
+  # whitespace/case-normalised). -> BLOCKED, unless the round has reached
+  # `review.replan.soft_threshold`, which turns it into a replan trigger.
+  # 0 disables the rule.
   stagnation_identical_rounds: 2
   # Stagnation: this many consecutive rounds with findings whose finding
-  # count did not change -> BLOCKED. 0 disables the rule.
+  # count did not change. Same routing as above. 0 disables the rule.
   stagnation_unchanged_count_rounds: 3
   # Cumulative step budget of the whole run (all phases, all issues). It is
   # measured on the persisted `step_count`, so `resume` continues the same
@@ -73,7 +75,12 @@ review:
   # the patch-accumulated PR and create a fresh implementation attempt.
   replan:
     enabled: true
+    # First round from which the controller may replace (rather than keep
+    # patching) an implementation. Gates every stagnation trigger, including
+    # the workflow.stagnation_* rules above: earlier stagnation -> BLOCKED.
     soft_threshold: 12
+    # Findings at or beyond this round always trigger a replan.
+    # Must not exceed workflow.max_review_rounds.
     hard_threshold: 20
     stagnation_window: 3
     max_findings_per_round: 2

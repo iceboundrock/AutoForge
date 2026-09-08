@@ -79,15 +79,21 @@ Escalation reason:
 
 Historical review findings:
 
-`{{HISTORICAL_FINDINGS}}`
+~~~~untrusted
+{{HISTORICAL_FINDINGS}}
+~~~~
 
 Historical observations:
 
-`{{HISTORICAL_OBSERVATIONS}}`
+~~~~untrusted
+{{HISTORICAL_OBSERVATIONS}}
+~~~~
 
 Historical verification failures:
 
-`{{HISTORICAL_VERIFICATION_FAILURES}}`
+~~~~untrusted
+{{HISTORICAL_VERIFICATION_FAILURES}}
+~~~~
 
 ---
 
@@ -714,11 +720,9 @@ Adapt to repository conventions.
 
 Once the replacement PR exists:
 
-ensure the previous PR is clearly marked as superseded.
-
-If repository policy allows closing it:
-
-close it without merging.
+the controller, not you, closes the previous PR without merging it and posts
+the supersession link. Do not run `gh pr close` or otherwise close the previous
+PR.
 
 Link:
 
@@ -799,36 +803,9 @@ A repeated escalation should eventually require stronger intervention or human r
 
 # 25. Escalation loop protection
 
-If this issue has already undergone a fresh reimplementation before:
-
-take that history seriously.
-
-Do not assume repeated resets are harmless.
-
-If:
-
-```text
-escalation_count >= configured maximum
-```
-
-or the issue repeatedly fails to converge after fresh implementations:
-
-do not endlessly restart.
-
-Return a blocked/escalated status such as:
-
-```text
-HUMAN_INTERVENTION_REQUIRED
-```
-
-with:
-
-* failure history
-* competing interpretations
-* architectural uncertainty
-* recommended human decision
-
-Never create an infinite autonomous reset loop.
+The controller owns and enforces the replan limit. Do not attempt to infer or
+enforce that limit yourself. If a trustworthy fresh implementation cannot be
+produced, return the blocked result below rather than fabricating success.
 
 ---
 
@@ -848,9 +825,9 @@ After successfully creating and verifying the replacement PR, stdout must end wi
   "replacement_branch": "...",
   "previous_head_sha": "{{PREVIOUS_HEAD_SHA}}",
   "replacement_head_sha": "...",
-  "execution_attempt": 2,
-  "historical_findings_considered": 0,
-  "unique_failure_constraints": 0,
+  "execution_attempt": {{EXECUTION_ATTEMPT}},
+  "historical_findings_considered": {{HISTORICAL_FINDING_COUNT}},
+  "unique_failure_constraints": 2,
   "previous_pr_disposition": "superseded",
   "fresh_review_round": 1,
   "verification": {
@@ -865,7 +842,9 @@ Use actual values.
 
 `historical_findings_considered` means the number of historical actionable findings actually analyzed.
 
-`unique_failure_constraints` means the number after deduplicating/normalizing them into root constraints.
+`unique_failure_constraints` means the number after deduplicating/normalizing them into root constraints. It is
+recorded by the controller alongside the superseded PR; report the real number (the `2` above is only an example)
+and never a value greater than `historical_findings_considered`.
 
 ---
 
