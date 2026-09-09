@@ -120,6 +120,10 @@ class FakeGitHub:
         self.disable_auto_error: str = ""  # non-empty -> disable_auto_merge raises
         self.disabled_auto: list[str] = []  # PRs on which disable_auto_merge ran
         self.closed_prs: list[tuple[str, str]] = []
+        # non-empty -> close_pr raises; an exception instance is raised as-is
+        # (GitHubUnavailableError for a transient failure), a str is conclusive.
+        self.close_error: str | GitHubError = ""
+        self.close_leaves_open: bool = False  # gh exits 0 but the PR stays OPEN
         self.get_pr_failures: int = 0  # next N get_pr calls raise GitHubUnavailableError
         self.get_pr_error: GitHubError | None = None  # every get_pr call raises this
         self.get_issue_error: GitHubError | None = None  # every get_issue call raises this
@@ -146,6 +150,8 @@ class FakeGitHub:
         branch: str = BRANCH,
         state: str = "OPEN",
         linked: list[int] | None = None,
+        body: str = "",
+        base_ref: str = "main",
     ) -> PRInfo:
         from autoforge.validation import parse_pr_url
 
@@ -156,12 +162,13 @@ class FakeGitHub:
             title="PR",
             state=state,
             head_sha=head_sha,
-            base_ref="main",
+            base_ref=base_ref,
             head_ref=branch,
             mergeable="MERGEABLE",
             merge_state_status="CLEAN",
             repository=ref.repository,
             linked_issue_numbers=list(linked or []),
+            body=body,
         )
         self.prs[ref.canonical] = info
         return info
@@ -317,10 +324,15 @@ class FakeGitHub:
         canonical = parse_pr_url(url).canonical
         self.calls.append(("close_pr", canonical, comment))
         self.closed_prs.append((canonical, comment))
+        if isinstance(self.close_error, GitHubError):
+            raise self.close_error
+        if self.close_error:
+            raise GitHubError(self.close_error)
         pr = self.get_pr(canonical)
         if not pr.is_open:
             raise GitHubError(f"cannot close PR {canonical}: it is {pr.state}")
-        pr.state = "CLOSED"
+        if not self.close_leaves_open:
+            pr.state = "CLOSED"
 
 
 def scripted_config():

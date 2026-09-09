@@ -73,6 +73,22 @@ workflow:
 review:
   # After a review with findings, the controller (never an agent) may abandon
   # the patch-accumulated PR and create a fresh implementation attempt.
+  #
+  # Closing the superseded PR is the controller's only destructive write on
+  # agent-produced work, so REPLAN_REEXECUTE runs as one durable transaction
+  # persisted in `.autoforge/state.json` as `replan_transaction`. There is
+  # nothing to configure about it, but it is worth knowing what it enforces:
+  #   * the replacement is identified ONLY by the controller-generated
+  #     transaction id it publishes in an `autoforge-replan-transaction`
+  #     marker in its PR body -- never by branch shape, PR count or the
+  #     agent's own report, and never a PR that already existed;
+  #   * the old PR is closed only while both it and the replacement still
+  #     match the checkpoint taken before the agent ran;
+  #   * the intent to close is persisted before the close, so a crash can
+  #     tell the controller's own close from a human's;
+  #   * a refusal is durable (the run stays BLOCKED across `resume`), while a
+  #     transient GitHub failure stays resumable.
+  # `autoforge status` prints the transaction id, stage and both PRs.
   replan:
     enabled: true
     # First round from which the controller may replace (rather than keep

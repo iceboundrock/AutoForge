@@ -3,59 +3,77 @@
 import pytest
 
 from autoforge.errors import StateTransitionError
-from autoforge.transitions import Phase, decide_next_phase, is_legal, validate_transition
-
-
-def test_all_spec_legal_edges():
-    assert is_legal(Phase.INITIALIZING, Phase.ANALYZE_EXECUTE)
-    assert is_legal(Phase.ANALYZE_EXECUTE, Phase.REVIEW)
-    assert is_legal(Phase.REVIEW, Phase.FIX)
-    assert is_legal(Phase.REVIEW, Phase.REPLAN_REEXECUTE)
-    assert is_legal(Phase.REVIEW, Phase.READY_FOR_MERGE)
-    assert is_legal(Phase.REVIEW, Phase.REVIEW)  # stale review (HEAD moved) re-reviews
-    assert is_legal(Phase.READY_FOR_MERGE, Phase.MERGE)
-    assert is_legal(Phase.READY_FOR_MERGE, Phase.REVIEW)
-    assert not is_legal(Phase.REVIEW, Phase.MERGE)  # no direct path: READY_FOR_MERGE gate
-    assert is_legal(Phase.FIX, Phase.REVIEW)
-    assert is_legal(Phase.REPLAN_REEXECUTE, Phase.REVIEW)
-    assert is_legal(Phase.MERGE, Phase.ANALYZE_EXECUTE)
-    assert is_legal(Phase.MERGE, Phase.UPDATE_EPIC)
-    assert is_legal(Phase.MERGE, Phase.DONE)
-    assert is_legal(Phase.MERGE, Phase.REVIEW)
-    assert is_legal(Phase.UPDATE_EPIC, Phase.ANALYZE_EXECUTE)
-    assert is_legal(Phase.UPDATE_EPIC, Phase.DONE)
-
-
-@pytest.mark.parametrize(
-    "frm,to",
-    [
-        (Phase.INITIALIZING, Phase.REVIEW),
-        (Phase.INITIALIZING, Phase.DONE),
-        (Phase.ANALYZE_EXECUTE, Phase.FIX),
-        (Phase.ANALYZE_EXECUTE, Phase.MERGE),
-        (Phase.ANALYZE_EXECUTE, Phase.DONE),
-        (Phase.REVIEW, Phase.DONE),
-        (Phase.REVIEW, Phase.MERGE),
-        (Phase.READY_FOR_MERGE, Phase.DONE),
-        (Phase.READY_FOR_MERGE, Phase.FIX),
-        (Phase.ANALYZE_EXECUTE, Phase.READY_FOR_MERGE),
-        (Phase.REVIEW, Phase.ANALYZE_EXECUTE),
-        (Phase.REVIEW, Phase.UPDATE_EPIC),
-        (Phase.FIX, Phase.MERGE),
-        (Phase.FIX, Phase.DONE),
-        (Phase.MERGE, Phase.FIX),
-        (Phase.MERGE, Phase.BLOCKED),
-        (Phase.UPDATE_EPIC, Phase.MERGE),
-        (Phase.UPDATE_EPIC, Phase.FIX),
-        (Phase.DONE, Phase.ANALYZE_EXECUTE),
-        (Phase.BLOCKED, Phase.REVIEW),
-        (Phase.FAILED, Phase.INITIALIZING),
-    ],
+from autoforge.transitions import (
+    LEGAL_EDGES,
+    TERMINAL_PHASES,
+    Phase,
+    decide_next_phase,
+    is_legal,
+    validate_transition,
 )
-def test_illegal_edges_raise(frm, to):
-    assert not is_legal(frm, to)
-    with pytest.raises(StateTransitionError, match="illegal transition"):
-        validate_transition(frm, to)
+
+# The topology, written out independently of ``LEGAL_EDGES`` so that a change
+# to the implementation cannot silently redefine what "legal" means. Every
+# other pair in ``Phase x Phase`` must be illegal, which the matrix below
+# asserts exhaustively -- that is what keeps a new escape hatch out of
+# REPLAN_REEXECUTE (or any other phase) from being added without a decision.
+EXPECTED_LEGAL_EDGES = {
+    (Phase.INITIALIZING, Phase.ANALYZE_EXECUTE),
+    (Phase.ANALYZE_EXECUTE, Phase.REVIEW),
+    (Phase.REVIEW, Phase.FIX),
+    (Phase.REVIEW, Phase.REPLAN_REEXECUTE),
+    (Phase.REVIEW, Phase.READY_FOR_MERGE),
+    (Phase.REVIEW, Phase.REVIEW),  # stale review (HEAD moved) re-reviews
+    (Phase.FIX, Phase.REVIEW),
+    (Phase.REPLAN_REEXECUTE, Phase.REVIEW),
+    (Phase.READY_FOR_MERGE, Phase.MERGE),
+    (Phase.READY_FOR_MERGE, Phase.REVIEW),
+    (Phase.MERGE, Phase.ANALYZE_EXECUTE),
+    (Phase.MERGE, Phase.UPDATE_EPIC),
+    (Phase.MERGE, Phase.DONE),
+    (Phase.MERGE, Phase.REVIEW),
+    (Phase.UPDATE_EPIC, Phase.ANALYZE_EXECUTE),
+    (Phase.UPDATE_EPIC, Phase.DONE),
+}
+
+
+@pytest.mark.parametrize("frm", list(Phase), ids=lambda p: p.value)
+@pytest.mark.parametrize("to", list(Phase), ids=lambda p: p.value)
+def test_every_phase_pair_matches_the_declared_topology(frm, to):
+    """The full Phase x Phase matrix: legal iff the spec above says so."""
+    expected = (frm, to) in EXPECTED_LEGAL_EDGES
+    assert is_legal(frm, to) is expected
+    if expected:
+        validate_transition(frm, to)  # must not raise
+    else:
+        with pytest.raises(StateTransitionError, match="illegal transition"):
+            validate_transition(frm, to)
+
+
+def test_replan_reexecute_has_exactly_one_exit_and_one_entry():
+    """REPLAN_REEXECUTE is a funnel: REVIEW in, a fresh REVIEW out.
+
+    It is the only phase in which the controller closes an open PR, so any
+    additional edge would be a second way in or out of that destructive step.
+    """
+    outgoing = {to for frm, to in EXPECTED_LEGAL_EDGES if frm is Phase.REPLAN_REEXECUTE}
+    incoming = {frm for frm, to in EXPECTED_LEGAL_EDGES if to is Phase.REPLAN_REEXECUTE}
+    assert outgoing == {Phase.REVIEW}
+    assert incoming == {Phase.REVIEW}
+    # BLOCKED/FAILED are reached by the controller's holding-state path, not by
+    # a topology edge, so REPLAN_REEXECUTE cannot "transition" into them.
+    assert not is_legal(Phase.REPLAN_REEXECUTE, Phase.BLOCKED)
+    assert not is_legal(Phase.REPLAN_REEXECUTE, Phase.FAILED)
+
+
+def test_terminal_phases_have_no_outgoing_edges():
+    for phase in TERMINAL_PHASES:
+        assert LEGAL_EDGES[phase] == frozenset()
+
+
+def test_every_phase_appears_in_the_topology():
+    """A new phase must be given edges deliberately, not inherit an empty set."""
+    assert set(LEGAL_EDGES) == set(Phase)
 
 
 def test_decide_review_routing():

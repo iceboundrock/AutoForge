@@ -78,6 +78,8 @@ src/autoforge/
     errors.py         Configuration/State/Transition/Lock/Execution/
                       ControlResult/GitHub/Verification taxonomy
     replan.py         deterministic replan trigger + bounded historical evidence collector
+    replan_txn.py     the REPLAN_REEXECUTE transaction: durable stages, the causal
+                      provenance marker, and every acceptance predicate (pure)
     prompts/          common.md (trust boundary) + phase templates + correction.md
 ```
 
@@ -145,10 +147,22 @@ Key design points:
   preserves compact finding metadata and selected
   review comments, then asks the separate `replan_reexecute` high-effort
   profile to independently rebuild from the latest verified default branch.
-  The controller verifies a distinct, open, issue-linked replacement PR on a
-  new branch and the correct base, and re-reads it at its checkpointed HEAD
-  immediately before closing the old PR without merging it; drift in that
-  window blocks and leaves the old PR open. A replan is refused outright while
+  Closing the superseded PR is the controller's only destructive write on
+  agent-produced work, so the whole phase runs as **one durable transaction**
+  (`replan_txn.py`) with an explicit monotonic lifecycle — `PENDING`,
+  `PREPARED`, `VERIFIED`, `SUPERSEDE_INTENT`, `SUPERSEDED`, or the terminal
+  `REJECTED`. Before the agent is invoked, `PREPARED` checkpoints the source PR
+  and its exact HEAD, the verified default branch, the complete review
+  evidence, the identities of the PRs that already existed, and a random
+  controller-generated transaction id. That id is the **only** accepted proof
+  of causality: the replacement must publish it in an
+  `<!-- autoforge-replan-transaction: {...} -->` marker in its PR body, which
+  the controller reads back from GitHub. Shape is never proof — an unmarked PR
+  is ignored, a PR that already existed is refused even if it carries a copied
+  marker, and two claimants block. The old PR is closed only under a two-sided
+  compare-and-swap (both source and replacement still exactly as checkpointed),
+  with `SUPERSEDE_INTENT` persisted *before* the write so a crash can tell the
+  controller's own close from a human's. A replan is refused outright while
   any recorded round's findings had to be truncated to stay within the state
   bounds, because closing the PR would be the moment those findings are lost.
   At most two replans per issue are allowed; a further eligible trigger blocks
@@ -166,7 +180,7 @@ Key design points:
 | `ANALYZE_EXECUTE` | Claude Code (`fable`, effort high) | existing open PR for the issue is recovered without re-running the agent; otherwise PR exists in this repo, is OPEN, HEAD SHA and branch match the claim |
 | `REVIEW` | OpenCode (round 1 `openai/gpt-5.6-luna` high, rounds 2–5 `openai/gpt-5.6-terra` high, 6+ `openai/gpt-5.6-sol` medium, intentionally retained through the 20-round cap) | round number, reviewed SHA == bound HEAD, exactly one review comment on this PR with the `# AI Code Review — Round N` heading and the `ai-review-result` marker matching round/SHA/flag, findings invariant; then controller policy: an eligible replan (including workflow stagnation or the cap) enters `REPLAN_REEXECUTE`; an exhausted replan limit or no eligible replan blocks. Entering `REVIEW` past the cap (stale re-review, HEAD drift, resume) is refused before the reviewer runs |
 | `FIX` | Claude Code (`fable`, effort high) | `previous_head_sha` == current HEAD, every open finding ID resolved (`fixed` / `follow_up_created` / `no_change_with_rationale`), follow-up issues exist in this repo and are OPEN, actual PR HEAD == `new_head_sha`, a `fixed` resolution moved HEAD |
-| `REPLAN_REEXECUTE` | OpenCode (`replan_reexecute`, default `openai/gpt-5.6-terra`, effort high) | Before invocation, durable state captures historical findings and the verified default branch; a round whose findings could not be persisted in full refuses the replan and keeps the old PR. The replacement must be a distinct OPEN issue-linked PR, on a distinct branch, based on that default branch and at its claimed HEAD, and must still be exactly that PR when it is re-read immediately before the old PR is closed. Only then does the controller close the old PR without merge and reset the replacement lifecycle so its next review is round 1. |
+| `REPLAN_REEXECUTE` | OpenCode (`replan_reexecute`, default `openai/gpt-5.6-terra`, effort high) | One durable transaction. `PREPARED` (written before the agent runs) checkpoints the source PR at its exact HEAD, the verified default branch, the complete historical findings, the identities of the already-open PRs, and a random transaction id; a round whose findings could not be persisted in full refuses the replan here and keeps the old PR. The replacement is found **only** by the transaction marker in its PR body — never by shape, never from the CONTROL_RESULT, and never among the pre-existing PRs; several claimants, a copied marker or an unusable one all block. It must additionally be a distinct OPEN PR of this repository, linked to the issue, on a distinct branch based on the verified default branch, and its marker must attest this transaction id, this execution attempt, passing tests and at least the preserved historical finding count. `VERIFIED` records its HEAD; immediately before the destructive write both sides are re-read and must still match the checkpoint exactly. `SUPERSEDE_INTENT` is persisted *before* `gh pr close`, which is what proves afterwards that the close was the controller's; the close outcome is re-read from GitHub rather than inferred from the exit status. Only then does the controller close the old PR without merge and reset the replacement lifecycle so its next review is round 1. Every refusal is persisted as `REJECTED` and replayed by `resume`; a transient GitHub failure is left resumable instead. |
 | `READY_FOR_MERGE` | nobody | holding state; `step`/`resume` refuse to continue unless the merge gate is open (`resume` only re-prints the banner). With the gate open (`step --allow-merge` / `resume --allow-merge`) it runs the full pre-merge verification below against GitHub *before* entering `MERGE`: closed / conflicting / failing / draft / queued PRs go to `BLOCKED` without ever reaching `MERGE`, HEAD drift -> `REVIEW`, an already-merged PR -> `MERGE` to reconcile; inconclusive data (checks running, mergeability unknown, GitHub unreachable / transient read failure) keeps the phase for `resume --allow-merge`, at most `merge.max_verification_attempts` times, then `BLOCKED`; a read that fails conclusively (bad credentials, permissions, unresolvable PR) -> `BLOCKED` at once |
 | `MERGE` (gated) | controller, never an agent | last review clean and PR HEAD == reviewed HEAD; GitHub says PR is OPEN, not draft, every check succeeded, `mergeable=MERGEABLE`, `mergeStateStatus` `CLEAN`/`HAS_HOOKS`, no auto-merge armed, base branch has no merge queue; then `gh pr merge --<method> --match-head-commit <reviewed HEAD>`; counted only once GitHub reports `MERGED` at that HEAD. Conclusive negatives and conclusive read failures (bad credentials, permissions) -> `BLOCKED`; inconclusive data (checks running, mergeability unknown, transient read failure, post-merge re-read failed) stays in `MERGE` for `resume --allow-merge`, at most `merge.max_verification_attempts` times, then `BLOCKED`; HEAD drift -> `REVIEW` |
 | `UPDATE_EPIC` | OpenCode (`update_epic` profile) | `next_issue_url` gets the `INITIALIZING` checks before the controller switches issues: parses as an issue URL of this repo (a foreign URL is never even queried), is neither the EPIC nor the just-finished issue (compared case-insensitively by repository + number, never by URL string), exists on GitHub and is OPEN. A rejected selection, or a transient GitHub failure while checking it, keeps the phase and `resume` asks the agent once more with the reason in its prompt; a second rejection -> `BLOCKED`. A conclusive GitHub failure (authentication, permissions, malformed data) -> `BLOCKED` immediately, without invoking the agent again. Only a verified issue reaches `ANALYZE_EXECUTE`; `null` -> `DONE` |
@@ -175,6 +189,13 @@ Recovery rules: if a step crashes after the agent created a PR, `resume`
 re-enters `ANALYZE_EXECUTE`, finds the open PR (linked issue or
 `autoforge/<n>` branch) and moves to `REVIEW` without running the agent. Two
 or more candidate PRs → `BLOCKED` (the controller never guesses).
+`REPLAN_REEXECUTE` has no separate recovery path at all: a fresh step and a
+`resume` both call the same reducer over the persisted transaction, so the
+normal and crash paths cannot drift apart about what is acceptable. Because
+the transaction id is generated and persisted *before* the agent is invoked,
+"crashed before invoking" and "crashed while the agent ran" are one state —
+either a PR carrying that id exists, or none does — and a crash after the
+replacement was created never causes a second implementation attempt.
 
 Correction retry: when an agent exits 0 but its `CONTROL_RESULT` is missing or
 invalid, the controller re-invokes it **once** with a correction prompt that
@@ -276,8 +297,10 @@ State records `current_pr_url`, `current_branch`, `current_head_sha`,
 round, reviewed SHA, result, finding count, fingerprint of the requested
 resolutions), `step_count` (cumulative for the run, never reset), `attempt`
 and `block_reason`. It also records `execution_attempt` (initial implementation
-is 1), `escalation_count` (completed replans), `superseded_prs`, and a durable
-`replan_progress` checkpoint. State keeps compact finding summaries and review
+is 1), `escalation_count` (completed replans), `superseded_prs` (each entry
+naming the transaction that superseded it), and the durable
+`replan_transaction` record described above — the controller's intent journal,
+which `resume` replays rather than re-deriving a decision from GitHub facts. State keeps compact finding summaries and review
 comment URLs, rather than copying unbounded PR discussion bodies. Those
 summaries are bounded (100 findings per round, 2000 characters per required
 resolution); a round that hits either bound is marked `evidence_truncated`, and

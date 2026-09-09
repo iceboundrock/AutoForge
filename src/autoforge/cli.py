@@ -27,6 +27,7 @@ from .errors import (
     StateTransitionError,
 )
 from .redaction import redact, redact_argv
+from .replan_txn import ReplanTransaction
 from .state import (
     AutoForgeState,
     StatePaths,
@@ -366,10 +367,15 @@ def cmd_status(args) -> int:
         print("Superseded PRs:")
         for item in state.superseded_prs:
             print(f"  {item.get('pr_url', '-')} -> {item.get('replacement_pr_url', '-')}")
-    if state.replan_progress:
-        print(f"Replan progress: {state.replan_progress.get('stage', 'pending')}")
-        escalation = json.dumps(state.replan_progress.get("escalation", {}), sort_keys=True)
-        print(f"Escalation: {escalation}")
+    if state.replan_transaction:
+        txn = ReplanTransaction.from_dict(state.replan_transaction)
+        print(f"Replan transaction: {txn.transaction_id or '(not yet created)'}")
+        print(f"  stage:       {txn.stage.value}")
+        print(f"  source PR:   {txn.source_pr_url or '-'}")
+        print(f"  replacement: {txn.replacement_pr_url or '-'}")
+        print(f"  escalation:  {json.dumps(txn.escalation, sort_keys=True)}")
+        if txn.rejection_reason:
+            print(f"  rejected:    {txn.rejection_reason}")
     if state.block_reason:
         print(f"Reason:     {state.block_reason}")
     print()

@@ -175,17 +175,19 @@ def test_replan_state_defaults_and_reset_are_backward_compatible(tmp_path):
         execution_attempt=2,
         escalation_count=1,
         superseded_prs=[{"pr_url": "https://github.com/owner/repo/pull/42"}],
-        replan_progress={"stage": "prepared"},
+        replan_transaction={"stage": "prepared", "transaction_id": "a" * 32},
     )
+    # An in-flight transaction belongs to the issue it was opened for: moving
+    # to a new issue must not leave one behind for REPLAN_REEXECUTE to replay.
     s.reset_for_new_issue("https://github.com/owner/repo/issues/3")
     assert s.execution_attempt == 1 and s.escalation_count == 0
-    assert s.superseded_prs == [] and s.replan_progress == {}
+    assert s.superseded_prs == [] and s.replan_transaction == {}
     data = make_state().to_dict()
     for field in (
         "execution_attempt",
         "escalation_count",
         "superseded_prs",
-        "replan_progress",
+        "replan_transaction",
         "verification_failures",
     ):
         del data[field]
@@ -193,6 +195,7 @@ def test_replan_state_defaults_and_reset_are_backward_compatible(tmp_path):
     path.write_text(json.dumps(data), encoding="utf-8")
     loaded = load_state(path)
     assert (loaded.execution_attempt, loaded.escalation_count, loaded.superseded_prs) == (1, 0, [])
+    assert loaded.replan_transaction == {}
 
 
 def test_quarantine_state_file_renames_without_overwriting(tmp_path, monkeypatch):

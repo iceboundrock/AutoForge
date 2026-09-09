@@ -67,7 +67,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import NoReturn
 
 from . import __prompt_version__
 from .config import AutoForgeConfig, validate_required_profiles
@@ -102,6 +101,16 @@ from .profiles import profile_for_phase
 from .prompts import TEMPLATE_FILES, load_template, render, render_phase
 from .providers import AgentExecutionResult, AgentRequest, ProviderRegistry
 from .replan import HistoricalReviewCollector, ReplanDecision, evaluate_replan_policy
+from .replan_txn import (
+    Disposition,
+    ReplanStage,
+    ReplanTransaction,
+    new_transaction_id,
+    select_bound_candidate,
+    verify_attestation,
+    verify_source_checkpoint,
+    verify_target_pr,
+)
 from .result_parser import (
     AnalyzeExecuteResult,
     FixResult,
@@ -334,28 +343,27 @@ class ControllerEngine:
             ),
         }
         if s.phase == Phase.REPLAN_REEXECUTE:
-            progress = s.replan_progress
+            # Before `_prepare_replan` has run (plan/dry-run rendering) the
+            # checkpoint does not exist yet, so every field falls back to a
+            # visible placeholder rather than to a plausible-looking guess.
+            txn = ReplanTransaction.from_dict(s.replan_transaction)
+            pending = "(checkpointed at execution)"
             variables.update(
                 {
-                    "PREVIOUS_PR_URL": str(progress.get("previous_pr_url", s.current_pr_url)),
-                    "PREVIOUS_BRANCH": str(progress.get("previous_branch", s.current_branch)),
-                    "PREVIOUS_HEAD_SHA": str(progress.get("previous_head_sha", s.current_head_sha)),
-                    "DEFAULT_BRANCH": str(
-                        progress.get("default_branch", "(verified at execution)")
-                    ),
-                    "ESCALATION_REASON": json.dumps(progress.get("escalation", {}), sort_keys=True),
-                    "EXECUTION_ATTEMPT": s.execution_attempt + 1,
-                    "HISTORICAL_FINDING_COUNT": int(progress.get("historical_finding_count", 0)),
-                    "HISTORICAL_FINDINGS": str(
-                        progress.get("historical_findings", "(collected at execution from GitHub)")
-                    ),
-                    "HISTORICAL_OBSERVATIONS": str(
-                        progress.get(
-                            "historical_observations", "(collected at execution from GitHub)"
-                        )
-                    ),
-                    "HISTORICAL_VERIFICATION_FAILURES": str(
-                        progress.get("historical_verification_failures", "(collected at execution)")
+                    "PREVIOUS_PR_URL": txn.source_pr_url or s.current_pr_url,
+                    "PREVIOUS_BRANCH": txn.source_branch or s.current_branch,
+                    "PREVIOUS_HEAD_SHA": txn.source_head_sha or s.current_head_sha,
+                    "DEFAULT_BRANCH": txn.base_branch or "(verified at execution)",
+                    "ESCALATION_REASON": json.dumps(txn.escalation, sort_keys=True),
+                    "EXECUTION_ATTEMPT": txn.expected_execution_attempt or s.execution_attempt + 1,
+                    "HISTORICAL_FINDING_COUNT": txn.evidence_finding_count,
+                    "HISTORICAL_FINDINGS": txn.rendered_findings or pending,
+                    "HISTORICAL_OBSERVATIONS": txn.rendered_observations or pending,
+                    "HISTORICAL_VERIFICATION_FAILURES": txn.rendered_verification_failures
+                    or pending,
+                    "REPLAN_TRANSACTION_ID": txn.transaction_id or "(generated at execution)",
+                    "REPLAN_MARKER": (
+                        txn.marker_example() if txn.transaction_id else "(generated at execution)"
                     ),
                 }
             )
@@ -444,9 +452,16 @@ class ControllerEngine:
             notes.append(
                 "would close the old PR without merging it only after replacement verification"
             )
-            escalation = s.replan_progress.get("escalation", {})
-            if escalation:
-                notes.append(f"replan policy: {json.dumps(escalation, sort_keys=True)}")
+            notes.append(
+                "would close the old PR only after the replacement carries this transaction's "
+                "marker and both checkpoints still hold"
+            )
+            replan_txn = ReplanTransaction.from_dict(s.replan_transaction)
+            if replan_txn.escalation:
+                notes.append(
+                    f"replan policy: {json.dumps(replan_txn.escalation, sort_keys=True)}"
+                )
+            notes.append(f"replan transaction stage: {replan_txn.stage.value}")
         return StepPlan(
             phase=s.phase.value,
             profile_name=profile.name,
@@ -706,12 +721,12 @@ class ControllerEngine:
         if previous == Phase.FIX:
             self._prepare_fix()
         if previous == Phase.REPLAN_REEXECUTE:
-            recovered = self._recover_replan()
-            if recovered is not None:
-                return recovered
-            prepared = self._prepare_replan()
-            if prepared is not None:
-                return prepared
+            # One reducer for the fresh step and for `resume`: it either
+            # resolves the transaction (activated or refused) or falls through
+            # to invoke the replacement agent.
+            driven = self._drive_replan()
+            if driven is not None:
+                return driven
 
         payload = self._invoke_phase(previous)
         status = payload.get("status")
@@ -1369,247 +1384,372 @@ class ControllerEngine:
         state.current_head_sha = pr.head_sha
         self._save()
 
-    def _prepare_replan(self) -> StepOutcome | None:
-        """Checkpoint all evidence before an agent can create a replacement PR.
+    # ======================================================================
+    # REPLAN_REEXECUTE
+    #
+    # One transaction, one owner per operation. ``autoforge.replan_txn`` owns
+    # the lifecycle and every acceptance predicate; the methods below are the
+    # GitHub I/O and persistence around them, so the normal path and the
+    # crash-recovery path cannot disagree about what is acceptable.
+    #
+    #   policy decision        REVIEW      ``evaluate_replan_policy``
+    #   transaction creation   controller  ``_prepare_replan``
+    #   agent invocation       controller  ``_invoke_phase``
+    #   replacement PR         agent       (the only agent-owned write here)
+    #   candidate discovery    controller  ``_bind_replacement``
+    #   verification           shared      ``replan_txn`` predicates
+    #   supersede / close      controller  ``_supersede_source`` (the only
+    #                                      caller of ``close_pr`` in this phase)
+    #   activation             controller  ``_activate_replacement``
+    #   recovery               controller  ``_drive_replan`` (replays intent)
+    #   rejection/escalation   controller  ``_reject_replan`` (persisted)
+    #
+    # The agent never closes, merges or adopts a PR; the controller never
+    # writes code.
+    # ======================================================================
 
-        Returns a BLOCKED outcome instead of a checkpoint when the persisted
-        review evidence is incomplete. ``evaluate_replan_policy`` already
-        refuses that case, but this phase is also reachable by ``resume``, and
-        the checkpoint is the last point before an agent may open a
-        replacement: the guard is repeated where the loss would become
-        irreversible.
+    def _replan_log_metadata(self) -> dict:
+        """Run-log metadata for a REPLAN_REEXECUTE invocation."""
+        txn = ReplanTransaction.from_dict(self._require_state().replan_transaction)
+        return {
+            "transaction_id": txn.transaction_id,
+            "stage": txn.stage.value,
+            "execution_attempt": txn.expected_execution_attempt,
+            "escalation_count": self._require_state().escalation_count,
+            "trigger": txn.escalation.get("trigger", ""),
+            "recent_finding_counts": txn.escalation.get("recent_finding_counts", []),
+            "previous_pr_url": txn.source_pr_url,
+            "historical_finding_count": txn.evidence_finding_count,
+            "preexisting_pr_urls": txn.preexisting_pr_urls,
+        }
+
+    def _save_replan_txn(self, txn: ReplanTransaction) -> None:
+        self._require_state().replan_transaction = txn.to_dict()
+        self._save()
+
+    def _replan_block_text(self, txn: ReplanTransaction, reason: str) -> str:
+        """BLOCKED text that always says what happened to the source PR."""
+        if txn.stage in (ReplanStage.SUPERSEDE_INTENT, ReplanStage.SUPERSEDED) or txn.superseded_at:
+            tail = (
+                f"This transaction had already begun closing the source PR {txn.source_pr_url}, "
+                f"and the replacement {txn.replacement_pr_url or '(none)'} was not activated"
+            )
+        else:
+            tail = (
+                f"PR {txn.source_pr_url or '(none)'} stays open with its findings; "
+                "nothing was closed or merged"
+            )
+        return f"cannot safely REPLAN_REEXECUTE: {reason}. {tail}. A human must decide next."
+
+    def _reject_replan(self, txn: ReplanTransaction, reason: str, pr_url: str = "") -> StepOutcome:
+        """Persist a conclusive refusal, then enter BLOCKED.
+
+        Rejection is monotonic and durable: it is written into the transaction
+        *before* the phase is blocked, so a later ``resume`` replays this
+        decision instead of re-deriving one from GitHub facts that cannot
+        encode it (a replacement whose tests failed still looks like a
+        perfectly ordinary open, issue-linked PR). Ambiguity is refused the
+        same way — the controller must never guess which candidate is the
+        replacement.
+        """
+        text = self._replan_block_text(txn, reason)
+        txn.stage = ReplanStage.REJECTED
+        txn.rejection_reason = reason
+        if pr_url:
+            txn.rejected_pr_url = pr_url
+        self._require_state().replan_transaction = txn.to_dict()
+        return self._block(Phase.REPLAN_REEXECUTE, None, text)
+
+    def _drive_replan(self) -> StepOutcome | None:
+        """Advance the replan transaction as far as it goes without an agent.
+
+        Single entry point for both a fresh REPLAN_REEXECUTE step and a
+        ``resume`` after a crash: there is no separate recovery policy to drift
+        from the normal one. Returns an outcome once the phase is resolved (the
+        replacement became active, or the transaction was refused), or ``None``
+        when the replacement agent still has to be invoked.
         """
         state = self._require_state()
-        if state.replan_progress.get("stage"):
-            return None
+        if not state.replan_transaction:
+            raise StateError("REPLAN_REEXECUTE entered without a replan transaction in state")
+        try:
+            txn = ReplanTransaction.from_dict(state.replan_transaction)
+        except ValueError as exc:
+            return self._block(
+                Phase.REPLAN_REEXECUTE, None, f"persisted replan transaction is unusable: {exc}"
+            )
+        if txn.stage is ReplanStage.REJECTED:
+            # Replay, never launder: the decision was already made and saved.
+            return self._block(
+                Phase.REPLAN_REEXECUTE,
+                None,
+                self._replan_block_text(txn, txn.rejection_reason or "refused by verification"),
+            )
+        if txn.stage is ReplanStage.PENDING:
+            prepared = self._prepare_replan(txn)
+            if prepared is not None:
+                return prepared
+        if txn.stage is ReplanStage.PREPARED:
+            # A PR bound to this transaction can only exist if the agent ran:
+            # the id is random, controller-generated and persisted before the
+            # invocation. So "crashed before invoking" and "crashed while the
+            # agent ran" are one recoverable state, resolved by looking.
+            refused = self._bind_replacement(txn)
+            if refused is not None:
+                return refused
+            if not txn.is_bound:
+                return None  # nothing exists yet -> invoke the replan agent
+        return self._supersede_source(txn)
+
+    def _prepare_replan(self, txn: ReplanTransaction) -> StepOutcome | None:
+        """Checkpoint every fact the replan decision rests on, before invoking.
+
+        This is the last point at which a replan costs nothing to refuse, and
+        the first at which the controller commits. It fixes the source PR and
+        its exact HEAD, the independently verified base branch, the complete
+        review evidence the replacement must answer for, the set of PRs that
+        already exist (which therefore can never *be* the replacement), and the
+        random transaction id that is the only accepted proof of causality.
+        """
+        state = self._require_state()
         truncated = truncated_evidence_rounds(state.review_history)
         if truncated:
-            return self._block_replan_recovery(
-                "cannot safely REPLAN_REEXECUTE: the persisted findings of review round(s) "
-                f"{', '.join(str(r) for r in truncated)} are an incomplete copy of the review, "
-                "so the replacement could not be required to consider every actionable "
-                f"finding. PR {state.current_pr_url or '(none)'} stays open with its findings "
-                "for a human."
+            # ``evaluate_replan_policy`` refuses this too, but REPLAN_REEXECUTE
+            # is also reachable by ``resume``, and this is the last checkpoint
+            # before an agent may open a replacement PR.
+            return self._reject_replan(
+                txn,
+                "the persisted findings of review round(s) "
+                f"{', '.join(str(r) for r in truncated)} are an incomplete copy of the review, so "
+                "the replacement could not be required to consider every actionable finding",
             )
-        escalation = state.replan_progress.get("escalation", {})
-        previous = self._require_open_pr()
-        repo = self.github.get_repo(state.repository)
+        if not state.current_pr_url:
+            raise StateError("REPLAN_REEXECUTE requires current_pr_url in state")
+        issue = parse_issue_url(state.current_issue_url)
+        try:
+            source = self.github.get_pr(state.current_pr_url)
+            repo = self.github.get_repo(state.repository)
+            preexisting = self.github.find_open_prs_for_issue(issue)
+        except GitHubUnavailableError:
+            raise  # unknown, not refused: `resume` re-reads
+        except GitHubError as exc:
+            return self._reject_replan(txn, f"cannot checkpoint the replan source: {exc}")
+        source_ref = parse_pr_url(source.url or state.current_pr_url)
+        if source_ref.repository.lower() != state.repository.lower():
+            return self._reject_replan(
+                txn, f"PR {source_ref.canonical} is not in {state.repository}"
+            )
+        if not source.is_open or not source.head_sha:
+            return self._reject_replan(
+                txn,
+                f"PR {source_ref.canonical} is {source.state or '(unknown)'} with HEAD "
+                f"{source.head_sha or '(unreadable)'}; only an OPEN PR at a readable HEAD can be "
+                "superseded",
+            )
         if not repo.default_branch:
-            raise VerificationError(f"repository {state.repository} has no readable default branch")
-        collector = HistoricalReviewCollector(self.github)
-        history = collector.collect(
+            return self._reject_replan(
+                txn, f"repository {state.repository} has no readable default branch"
+            )
+        history = HistoricalReviewCollector(self.github).collect(
             state.current_pr_url, state.review_history, state.verification_failures
         )
-        state.replan_progress = {
-            "stage": "prepared",
-            "previous_pr_url": state.current_pr_url,
-            "previous_branch": state.current_branch or previous.head_ref,
-            "previous_head_sha": state.current_head_sha or previous.head_sha,
-            "previous_review_round": state.review_round,
-            "default_branch": repo.default_branch,
-            "escalation": escalation,
-            "historical_finding_count": history.recorded_finding_count,
-            "historical_findings": history.render_findings(),
-            "historical_observations": history.render_observations(),
-            "historical_verification_failures": history.render_verification_failures(),
-        }
-        self._save()
+        txn.transaction_id = new_transaction_id()
+        txn.stage = ReplanStage.PREPARED
+        txn.issue_url = state.current_issue_url
+        txn.source_pr_url = source_ref.canonical
+        txn.source_branch = state.current_branch or source.head_ref
+        txn.source_head_sha = source.head_sha
+        txn.source_review_round = state.review_round
+        txn.base_branch = repo.default_branch
+        txn.evidence_finding_count = history.recorded_finding_count
+        txn.rendered_findings = history.render_findings()
+        txn.rendered_observations = history.render_observations()
+        txn.rendered_verification_failures = history.render_verification_failures()
+        txn.preexisting_pr_urls = sorted(
+            {parse_pr_url(pr.url).canonical for pr in preexisting if pr.url}
+        )
+        txn.expected_execution_attempt = state.execution_attempt + 1
+        self._save_replan_txn(txn)
         return None
 
-    def _verify_replacement_pr(self, pr: PRInfo, progress: dict, expected_head: str = "") -> None:
-        """Verify objective fresh-implementation facts independently of agent output."""
-        state = self._require_state()
-        previous_url = str(progress["previous_pr_url"])
-        previous_branch = str(progress["previous_branch"])
-        ref = parse_pr_url(pr.url)
-        if ref.canonical == parse_pr_url(previous_url).canonical:
-            raise VerificationError("replacement PR must differ from the superseded PR")
-        if ref.repository.lower() != state.repository.lower() or (
-            pr.repository and pr.repository.lower() != state.repository.lower()
-        ):
-            raise VerificationError(f"replacement PR {ref.canonical} is not in {state.repository}")
-        if not pr.is_open:
-            raise VerificationError(f"replacement PR {ref.canonical} is {pr.state}, expected OPEN")
-        if not pr.head_sha:
-            raise VerificationError(f"replacement PR {ref.canonical} has no readable head SHA")
-        if expected_head and pr.head_sha != expected_head:
-            raise VerificationError(
-                f"replacement PR HEAD mismatch: GitHub reports {pr.head_sha}, "
-                f"agent claimed {expected_head}"
-            )
-        if not pr.head_ref or pr.head_ref == previous_branch:
-            raise VerificationError(
-                "replacement branch must be present and differ from previous branch"
-            )
-        if pr.base_ref != progress["default_branch"]:
-            raise VerificationError(
-                f"replacement PR base {pr.base_ref!r} != verified default branch "
-                f"{progress['default_branch']!r}"
-            )
-        issue_number = parse_issue_url(state.current_issue_url).number
-        if issue_number not in pr.linked_issue_numbers:
-            raise VerificationError(
-                f"replacement PR {ref.canonical} is not linked to current issue #{issue_number}"
-            )
+    def _bind_replacement(
+        self, txn: ReplanTransaction, claimed_url: str = ""
+    ) -> StepOutcome | None:
+        """Find, verify and checkpoint the PR causally bound to ``txn``.
 
-    def _recover_replan(self) -> StepOutcome | None:
-        """Reconcile a replacement created before state could be persisted.
-
-        The journal is written before invocation. A known replacement is never
-        re-invoked; when no URL was checkpointed, exactly one open issue PR
-        other than the old PR is accepted. Ambiguity fails closed.
+        Returns a BLOCKED outcome when the candidate set is conclusively
+        unusable; otherwise ``None``, with ``txn.is_bound`` telling the caller
+        whether a replacement was found. ``claimed_url`` is the agent's
+        CONTROL_RESULT claim: it never *selects* the candidate, it is only
+        checked against the one GitHub proves.
         """
         state = self._require_state()
-        progress = state.replan_progress
-        if not progress or not progress.get("stage"):
-            return None
-        if progress.get("stage") in ("replacement_verified", "old_pr_superseded"):
-            return self._finish_replan()
-        if progress.get("stage") == "replacement_rejected":
-            # `_apply_replan` refused this replacement. The GitHub facts below
-            # cannot see that refusal, so accepting here would silently
-            # override verification. Fail closed instead.
-            return self._block_replan_recovery(
-                "cannot safely recover REPLAN_REEXECUTE: the replacement "
-                f"{progress.get('rejected_replacement_pr_url', '(unknown)')} was rejected by "
-                f"controller verification: {progress.get('rejection_reason', 'unspecified')}"
-            )
-        issue = parse_issue_url(state.current_issue_url)
-        old_url = str(progress.get("previous_pr_url", ""))
+        issue = parse_issue_url(txn.issue_url)
         try:
-            candidates = [
-                pr
-                for pr in self.github.find_open_prs_for_issue(issue)
-                if parse_pr_url(pr.url).canonical != parse_pr_url(old_url).canonical
-            ]
+            open_prs = self.github.find_open_prs_for_issue(issue)
         except GitHubUnavailableError:
-            # Transient (timeout, connection, 5xx, rate limit): the candidate
-            # set is unknown, not ambiguous. Propagate so the run can resume
-            # instead of permanently blocking a healthy replan.
-            raise
+            raise  # the candidate set is unknown, not ambiguous: stay resumable
         except GitHubError as exc:
-            return self._block_replan_recovery(f"cannot list replacement PR candidates: {exc}")
-        if not candidates:
-            return None
-        if len(candidates) != 1:
-            return self._block_replan_recovery(
-                "cannot safely recover REPLAN_REEXECUTE: multiple replacement PR candidates exist"
-            )
-        replacement = candidates[0]
-        try:
-            self._verify_replacement_pr(replacement, progress)
-        except VerificationError as exc:
-            return self._block_replan_recovery(
-                f"cannot safely recover REPLAN_REEXECUTE replacement {replacement.url}: {exc}"
-            )
-        progress.update(
-            {
-                "stage": "replacement_verified",
-                "replacement_pr_url": parse_pr_url(replacement.url).canonical,
-                "replacement_branch": replacement.head_ref,
-                "replacement_head_sha": replacement.head_sha,
-            }
-        )
-        self._save()
-        return self._finish_replan(recovered=True)
-
-    def _block_replan_recovery(self, reason: str) -> StepOutcome:
-        """Persist an ambiguous or invalid replan recovery as terminal state."""
-        state = self._require_state()
-        state.phase = Phase.BLOCKED
-        state.block_reason = reason
-        self._save()
-        return self._outcome(Phase.REPLAN_REEXECUTE, message=reason)
-
-    def _revalidate_replacement(self, progress: dict) -> str:
-        """Re-read the checkpointed replacement; a reason means "do not supersede".
-
-        The checkpoint that authorises closing the old PR can be minutes (a
-        crash and a ``resume``) older than the close itself. GitHub is the
-        source of truth, so the replacement is read again here — immediately
-        before the irreversible write — and must still be the exact PR that was
-        verified: open, in this repository, linked to the issue, based on the
-        verified default branch, on the checkpointed branch, and at the
-        checkpointed HEAD SHA. A transient GitHub failure is raised, not
-        returned: the answer is unknown, so the run resumes rather than blocks.
-        """
-        url = str(progress["replacement_pr_url"])
-        try:
-            replacement = self.github.get_pr(url)
-        except GitHubUnavailableError:
-            raise
-        except GitHubError as exc:
-            return f"replacement PR {url} could not be re-read: {exc}"
-        try:
-            self._verify_replacement_pr(
-                replacement, progress, str(progress.get("replacement_head_sha", ""))
-            )
-        except VerificationError as exc:
-            return f"replacement PR {url} no longer matches its verified checkpoint: {exc}"
-        expected_branch = str(progress.get("replacement_branch", ""))
-        if replacement.head_ref != expected_branch:
-            return (
-                f"replacement PR {url} moved from the checkpointed branch "
-                f"{expected_branch!r} to {replacement.head_ref!r}"
-            )
-        return ""
-
-    def _finish_replan(self, recovered: bool = False) -> StepOutcome:
-        """Close the old PR, then atomically activate the verified replacement."""
-        state = self._require_state()
-        progress = state.replan_progress
-        old_url = str(progress["previous_pr_url"])
-        replacement_url = str(progress["replacement_pr_url"])
-        if progress.get("stage") != "old_pr_superseded":
-            # The old PR is still open, so the superseding write is still ahead.
-            drift = self._revalidate_replacement(progress)
-            if drift:
-                return self._block_replan_recovery(
-                    f"refusing to supersede {old_url}: {drift}. The old PR stays open with "
-                    "its findings; nothing was closed or merged."
+            return self._reject_replan(txn, f"cannot list replacement PR candidates: {exc}")
+        selection = select_bound_candidate(open_prs, txn)
+        if selection.disposition is Disposition.NONE:
+            if claimed_url:
+                return self._reject_replan(
+                    txn,
+                    f"the agent reports replacement PR {claimed_url}, but no open PR for issue "
+                    f"#{issue.number} carries the marker for replan transaction "
+                    f"{txn.transaction_id}",
+                    claimed_url,
                 )
+            return None
+        if selection.disposition is not Disposition.OK:
+            return self._reject_replan(txn, selection.reason)
+        pr, attestation = selection.pr, selection.attestation
+        assert pr is not None and attestation is not None  # Disposition.OK invariant
+        canonical = parse_pr_url(pr.url).canonical
+        if claimed_url and claimed_url != canonical:
+            return self._reject_replan(
+                txn,
+                f"the agent reports replacement PR {claimed_url}, but the PR bound to replan "
+                f"transaction {txn.transaction_id} is {canonical}",
+                claimed_url,
+            )
+        drift = verify_target_pr(
+            pr, txn, state.repository, require_checkpoint_head=False
+        ) or verify_attestation(attestation, txn)
+        if drift:
+            return self._reject_replan(txn, drift, canonical)
+        txn.replacement_pr_url = canonical
+        txn.replacement_branch = pr.head_ref
+        txn.replacement_head_sha = pr.head_sha
+        txn.attested_findings_considered = attestation.findings_considered
+        txn.attested_unique_constraints = attestation.unique_constraints
+        txn.stage = ReplanStage.VERIFIED
+        # Durable checkpoint before the controller's destructive write: from
+        # here a crash resumes into disposition, never into a second agent run.
+        self._save_replan_txn(txn)
+        return None
+
+    def _supersede_source(self, txn: ReplanTransaction) -> StepOutcome:
+        """Close the source PR under a two-sided compare-and-swap, then activate.
+
+        Closing is irreversible for the review evidence the source carries, so
+        it happens only while *both* checkpoints still hold: the source is
+        exactly the implementation the controller decided to replace, and the
+        target is exactly the replacement it verified. Either side having
+        drifted means the decision rests on facts that no longer exist.
+
+        ``SUPERSEDE_INTENT`` is persisted before ``close_pr`` is called. That
+        record is the only proof of ownership afterwards: a CLOSED source PR is
+        otherwise indistinguishable from one a human closed, and adopting
+        someone else's close would supersede work this transaction never
+        verified.
+        """
+        state = self._require_state()
+        if txn.stage is ReplanStage.SUPERSEDED:
+            return self._activate_replacement(txn)
+        if txn.stage not in (ReplanStage.VERIFIED, ReplanStage.SUPERSEDE_INTENT):
+            return self._reject_replan(
+                txn, f"replan transaction reached the supersede step at stage {txn.stage.value!r}"
+            )
         try:
-            old = self.github.get_pr(old_url)
+            source = self.github.get_pr(txn.source_pr_url)
+        except GitHubUnavailableError:
+            raise
         except GitHubError as exc:
-            raise VerificationError(f"cannot verify superseded PR {old_url}: {exc}") from exc
-        if old.state == "MERGED":
-            raise VerificationError(
-                f"superseded PR {old_url} is already MERGED; refusing replacement"
+            return self._reject_replan(txn, f"cannot read source PR {txn.source_pr_url}: {exc}")
+        if txn.stage is ReplanStage.SUPERSEDE_INTENT and not source.is_open:
+            # Intent recorded before the write is what makes this close ours.
+            if source.state != "CLOSED":
+                return self._reject_replan(
+                    txn,
+                    f"source PR {txn.source_pr_url} is {source.state or '(unknown)'} after this "
+                    "transaction's close attempt; expected CLOSED",
+                )
+            return self._record_supersede(txn)
+        # The destructive write is still ahead: revalidate both sides now.
+        try:
+            target = self.github.get_pr(txn.replacement_pr_url)
+        except GitHubUnavailableError:
+            raise
+        except GitHubError as exc:
+            return self._reject_replan(
+                txn,
+                f"replacement PR {txn.replacement_pr_url} could not be re-read: {exc}",
+                txn.replacement_pr_url,
             )
-        if old.is_open:
-            comment = (
-                "Superseded by "
-                f"{replacement_url} after controller-detected review/fix non-convergence. "
-                "This PR was closed without merge; the replacement starts from the current "
-                "default branch."
+        drift = verify_target_pr(target, txn, state.repository, require_checkpoint_head=True)
+        if drift:
+            return self._reject_replan(txn, drift, txn.replacement_pr_url)
+        drift = verify_source_checkpoint(source, txn)
+        if drift:
+            return self._reject_replan(txn, drift)
+        txn.stage = ReplanStage.SUPERSEDE_INTENT
+        txn.close_intent_at = utcnow_iso()
+        self._save_replan_txn(txn)
+        close_error: GitHubError | None = None
+        try:
+            self.github.close_pr(
+                txn.source_pr_url,
+                f"Superseded by {txn.replacement_pr_url} after controller-detected review/fix "
+                "non-convergence. This PR was closed without merge; the replacement starts from "
+                f"the {txn.base_branch} branch. Replan transaction {txn.transaction_id}.",
             )
-            self.github.close_pr(old_url, comment)
-            # The close call can have succeeded before a crash or an error. Its
-            # state is reconciled on resume before this function is retried.
-            old = self.github.get_pr(old_url)
-        if old.state != "CLOSED":
-            raise VerificationError(f"superseded PR {old_url} is {old.state}, expected CLOSED")
-        progress["stage"] = "old_pr_superseded"
-        self._save()
-        if not any(item.get("pr_url") == old_url for item in state.superseded_prs):
+        except GitHubUnavailableError:
+            # The close may or may not have landed. SUPERSEDE_INTENT is already
+            # persisted, so `resume` reads GitHub and resolves it either way.
+            raise
+        except GitHubError as exc:
+            close_error = exc
+        try:
+            source = self.github.get_pr(txn.source_pr_url)
+        except GitHubUnavailableError:
+            raise
+        except GitHubError as exc:
+            return self._reject_replan(
+                txn,
+                f"source PR {txn.source_pr_url} could not be re-read after the close attempt "
+                f"({exc}); the close may or may not have landed",
+            )
+        if source.state == "CLOSED":
+            return self._record_supersede(txn)
+        if close_error is not None:
+            return self._reject_replan(
+                txn, f"closing source PR {txn.source_pr_url} failed: {close_error}"
+            )
+        return self._reject_replan(
+            txn,
+            f"source PR {txn.source_pr_url} is {source.state or '(unknown)'} after the close "
+            "attempt; expected CLOSED",
+        )
+
+    def _record_supersede(self, txn: ReplanTransaction) -> StepOutcome:
+        txn.stage = ReplanStage.SUPERSEDED
+        txn.superseded_at = utcnow_iso()
+        self._save_replan_txn(txn)
+        return self._activate_replacement(txn)
+
+    def _activate_replacement(self, txn: ReplanTransaction) -> StepOutcome:
+        """Make the verified replacement the current implementation (idempotent)."""
+        state = self._require_state()
+        if not any(item.get("pr_url") == txn.source_pr_url for item in state.superseded_prs):
             state.superseded_prs.append(
                 {
-                    "pr_url": old_url,
-                    "branch": progress["previous_branch"],
-                    "head_sha": progress["previous_head_sha"],
-                    "review_round": progress["previous_review_round"],
-                    "replacement_pr_url": replacement_url,
-                    "reason": progress.get("escalation", {}).get("trigger", "replan"),
-                    "historical_findings_considered": progress.get(
-                        "historical_findings_considered", 0
-                    ),
-                    "unique_failure_constraints": progress.get("unique_failure_constraints", 0),
-                    "superseded_at": utcnow_iso(),
+                    "pr_url": txn.source_pr_url,
+                    "branch": txn.source_branch,
+                    "head_sha": txn.source_head_sha,
+                    "review_round": txn.source_review_round,
+                    "replacement_pr_url": txn.replacement_pr_url,
+                    "reason": txn.escalation.get("trigger", "replan"),
+                    "transaction_id": txn.transaction_id,
+                    "historical_findings_considered": txn.attested_findings_considered,
+                    "unique_failure_constraints": txn.attested_unique_constraints,
+                    "superseded_at": txn.superseded_at or utcnow_iso(),
                 }
             )
-        state.current_pr_url = replacement_url
-        state.current_branch = str(progress["replacement_branch"])
-        state.current_head_sha = str(progress["replacement_head_sha"])
+        state.current_pr_url = txn.replacement_pr_url
+        state.current_branch = txn.replacement_branch
+        state.current_head_sha = txn.replacement_head_sha
         state.reviewed_head_sha = ""
         # review_round counts completed rounds; 0 means the next replacement
         # review is the required fresh round 1.
@@ -1622,16 +1762,16 @@ class ControllerEngine:
         state.last_review_needs_fix = None
         state.execution_attempt += 1
         state.escalation_count += 1
-        state.replan_progress = {}
+        state.replan_transaction = {}
         validate_transition(Phase.REPLAN_REEXECUTE, Phase.REVIEW)
         state.phase = Phase.REVIEW
         state.attempt = 0
         self._save()
-        verb = "recovered" if recovered else "verified"
         return self._outcome(
             Phase.REPLAN_REEXECUTE,
             message=(
-                f"replacement PR {replacement_url} {verb}; old PR {old_url} closed without merge; "
+                f"replacement PR {txn.replacement_pr_url} verified (replan transaction "
+                f"{txn.transaction_id}); source PR {txn.source_pr_url} closed without merge; "
                 "REPLAN_REEXECUTE -> REVIEW (fresh round 1)"
             ),
         )
@@ -1677,17 +1817,7 @@ class ControllerEngine:
                 cwd=self.workdir,
                 timeout_seconds=timeout,
                 metadata=(
-                    {
-                        "execution_attempt": state.execution_attempt,
-                        "escalation_count": state.escalation_count,
-                        "trigger": state.replan_progress.get("escalation", {}).get("trigger", ""),
-                        "recent_finding_counts": state.replan_progress.get("escalation", {}).get(
-                            "recent_finding_counts", []
-                        ),
-                        "previous_pr_url": state.replan_progress.get("previous_pr_url", ""),
-                    }
-                    if phase == Phase.REPLAN_REEXECUTE
-                    else {}
+                    self._replan_log_metadata() if phase == Phase.REPLAN_REEXECUTE else {}
                 ),
             )
             result: AgentExecutionResult | None = None
@@ -1900,9 +2030,13 @@ class ControllerEngine:
                     self._replan_refusal(decision) + ". Human intervention is required"
                 )
             if decision.action == "replan":
-                state.replan_progress = {
-                    "escalation": decision.metadata or {"trigger": decision.reason}
-                }
+                # Only the decision is recorded here. The checkpoint and the
+                # transaction id are created by `_prepare_replan`, inside the
+                # REPLAN_REEXECUTE step that owns them.
+                state.replan_transaction = ReplanTransaction(
+                    stage=ReplanStage.PENDING,
+                    escalation=decision.metadata or {"trigger": decision.reason},
+                ).to_dict()
                 return Phase.REPLAN_REEXECUTE, (
                     f"review round {res.round}: {len(findings)} finding(s); controller policy "
                     f"triggered REPLAN_REEXECUTE ({decision.reason})"
@@ -2024,109 +2158,95 @@ class ControllerEngine:
             f"{len(res.resolutions)} resolution(s); FIX -> REVIEW (round {state.review_round + 1})"
         )
 
-    def _reject_replan(self, reason: str, replacement_url: str = "") -> NoReturn:
-        """Persist a REPLAN_REEXECUTE rejection, then raise it.
+    def _apply_replan(self, res: ReplanReexecuteResult) -> tuple[Phase, str]:
+        """Cross-check the agent's claims, then bind, supersede and activate.
 
-        :meth:`_apply_replan` is authoritative over :meth:`_recover_replan`:
-        recovery re-derives acceptance from objective GitHub facts alone, and
-        none of those facts encode a rejection (a replacement whose own
-        CONTROL_RESULT reported failing tests still looks like a perfectly
-        valid open, issue-linked PR). Without this marker, one ``resume``
-        would launder every check below and close the previous PR anyway.
+        The CONTROL_RESULT is a claim, never the authority. Every field below
+        is compared against the checkpoint the controller wrote *before* the
+        agent ran, or against GitHub; a mismatch means the agent is describing
+        a different world than the one the replan decision was made in, and
+        this attempt is rejected.
+
+        Acceptance itself is delegated to the same helpers ``_drive_replan``
+        uses on ``resume`` — the marker on the replacement PR, not this
+        payload, is what proves causality and carries the attestation. That is
+        why a crash between the agent's write and this method cannot lower the
+        bar: there is nothing here that recovery does not also check.
         """
         state = self._require_state()
-        progress = state.replan_progress
-        progress["stage"] = "replacement_rejected"
-        progress["rejection_reason"] = reason
-        if replacement_url:
-            progress["rejected_replacement_pr_url"] = replacement_url
-        self._save()
-        raise VerificationError(reason)
-
-    def _apply_replan(self, res: ReplanReexecuteResult) -> tuple[Phase, str]:
-        """Verify a new PR, checkpoint it, then supersede the old PR safely."""
-        state = self._require_state()
-        progress = state.replan_progress
-        if not progress or progress.get("stage") != "prepared":
-            raise VerificationError("REPLAN_REEXECUTE has no prepared recovery checkpoint")
-        # Everything below is a rejection of *this* replacement attempt and is
-        # persisted before it is raised (see :meth:`_reject_replan`).
+        if not state.replan_transaction:
+            raise StateError("REPLAN_REEXECUTE has no prepared transaction")
+        txn = ReplanTransaction.from_dict(state.replan_transaction)
+        if txn.stage is not ReplanStage.PREPARED:
+            return self._blocked_replan(
+                self._reject_replan(
+                    txn,
+                    "a REPLAN_REEXECUTE result arrived while the transaction was at stage "
+                    f"{txn.stage.value!r}, which cannot accept one",
+                )
+            )
         claimed_url = parse_pr_url(res.replacement_pr_url).canonical
-        if parse_issue_url(res.issue_url).canonical != state.current_issue_url:
-            self._reject_replan(
-                "REPLAN_REEXECUTE result issue_url does not match current issue", claimed_url
+        mismatch = ""
+        if parse_issue_url(res.issue_url).canonical != txn.issue_url:
+            mismatch = f"issue_url {res.issue_url!r} does not match the replan issue"
+        elif parse_pr_url(res.previous_pr_url).canonical != txn.source_pr_url:
+            mismatch = f"previous_pr_url {res.previous_pr_url!r} does not match the checkpoint"
+        elif res.previous_branch != txn.source_branch:
+            mismatch = f"previous_branch {res.previous_branch!r} does not match the checkpoint"
+        elif res.previous_head_sha != txn.source_head_sha:
+            mismatch = f"previous_head_sha {res.previous_head_sha!r} does not match the checkpoint"
+        elif res.execution_attempt != txn.expected_execution_attempt:
+            mismatch = (
+                f"execution_attempt must be {txn.expected_execution_attempt}, "
+                f"got {res.execution_attempt}"
             )
-        if parse_pr_url(res.previous_pr_url).canonical != progress["previous_pr_url"]:
-            self._reject_replan(
-                "REPLAN_REEXECUTE previous_pr_url does not match checkpoint", claimed_url
+        elif not res.tests_passed:
+            mismatch = "the replacement reports tests_passed=false"
+        elif res.historical_findings_considered < txn.evidence_finding_count:
+            mismatch = (
+                f"the replacement considered {res.historical_findings_considered} of the "
+                f"{txn.evidence_finding_count} historical finding(s) the controller preserved"
             )
-        if res.previous_branch != progress["previous_branch"]:
-            self._reject_replan(
-                "REPLAN_REEXECUTE previous_branch does not match checkpoint", claimed_url
+        if mismatch:
+            return self._blocked_replan(
+                self._reject_replan(
+                    txn, f"REPLAN_REEXECUTE result rejected: {mismatch}", claimed_url
+                )
             )
-        if res.previous_head_sha != progress["previous_head_sha"]:
-            self._reject_replan(
-                "REPLAN_REEXECUTE previous_head_sha does not match checkpoint", claimed_url
+        refused = self._bind_replacement(txn, claimed_url=claimed_url)
+        if refused is not None:
+            return self._blocked_replan(refused)
+        if not txn.is_bound:  # pragma: no cover - _bind_replacement rejects this
+            return self._blocked_replan(
+                self._reject_replan(txn, "no replacement PR is bound to this transaction")
             )
-        if res.execution_attempt != state.execution_attempt + 1:
-            self._reject_replan(
-                f"REPLAN_REEXECUTE execution_attempt must be {state.execution_attempt + 1}, "
-                f"got {res.execution_attempt}",
-                claimed_url,
+        if res.replacement_branch != txn.replacement_branch:
+            return self._blocked_replan(
+                self._reject_replan(
+                    txn,
+                    f"replacement branch mismatch: GitHub reports {txn.replacement_branch!r}, "
+                    f"the agent claimed {res.replacement_branch!r}",
+                    txn.replacement_pr_url,
+                )
             )
-        if not res.tests_passed:
-            self._reject_replan(
-                "REPLAN_REEXECUTE replacement verification reports tests_passed=false",
-                claimed_url,
+        if res.replacement_head_sha != txn.replacement_head_sha:
+            return self._blocked_replan(
+                self._reject_replan(
+                    txn,
+                    f"replacement HEAD mismatch: GitHub reports {txn.replacement_head_sha}, "
+                    f"the agent claimed {res.replacement_head_sha}",
+                    txn.replacement_pr_url,
+                )
             )
-        if res.historical_findings_considered < int(progress["historical_finding_count"]):
-            self._reject_replan(
-                "REPLAN_REEXECUTE did not claim to consider every controller-recorded "
-                "historical finding",
-                claimed_url,
-            )
-        replacement_ref = parse_pr_url(res.replacement_pr_url)
-        try:
-            replacement = self.github.get_pr(replacement_ref.canonical)
-        except GitHubUnavailableError:
-            # Transient: the claim is unverified, not refused. Leave the
-            # checkpoint 'prepared' so a resume can re-check it.
-            raise
-        except GitHubError as exc:
-            self._reject_replan(
-                f"replacement PR {replacement_ref.canonical} could not be verified: {exc}",
-                replacement_ref.canonical,
-            )
-        try:
-            self._verify_replacement_pr(replacement, progress, res.replacement_head_sha)
-        except VerificationError as exc:
-            self._reject_replan(str(exc), replacement_ref.canonical)
-        if replacement.head_ref != res.replacement_branch:
-            self._reject_replan(
-                f"replacement branch mismatch: GitHub reports {replacement.head_ref!r}, "
-                f"agent claimed {res.replacement_branch!r}",
-                replacement_ref.canonical,
-            )
-        progress.update(
-            {
-                "stage": "replacement_verified",
-                "replacement_pr_url": replacement_ref.canonical,
-                "replacement_branch": replacement.head_ref,
-                "replacement_head_sha": replacement.head_sha,
-                "unique_failure_constraints": res.unique_failure_constraints,
-                "historical_findings_considered": res.historical_findings_considered,
-            }
-        )
-        # Durable checkpoint before the controller's GitHub write. If the
-        # process dies after this point, resume will finish disposition rather
-        # than invoke the agent again.
-        self._save()
-        outcome = self._finish_replan()
+        outcome = self._supersede_source(txn)
         if state.phase == Phase.BLOCKED:
-            # `_finish_replan` refused to supersede the old PR (see
-            # `_revalidate_replacement`) and already persisted BLOCKED.
             return Phase.BLOCKED, outcome.message
         return Phase.REVIEW, outcome.message
+
+    @staticmethod
+    def _blocked_replan(outcome: StepOutcome) -> tuple[Phase, str]:
+        """Adapt a persisted replan refusal to the verify/apply return type."""
+        return Phase.BLOCKED, outcome.message
 
     def _reject_next_issue(self, reason: str, *, cause: BaseException) -> tuple[Phase, str]:
         """Bounded re-selection: persist the rejection, re-ask once, then BLOCKED.

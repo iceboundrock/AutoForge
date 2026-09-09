@@ -162,6 +162,7 @@ INITIALIZING
 ANALYZE_EXECUTE
 REVIEW
 FIX
+REPLAN_REEXECUTE
 READY_FOR_MERGE
 MERGE
 UPDATE_EPIC
@@ -179,8 +180,14 @@ INITIALIZING -> ANALYZE_EXECUTE
 ANALYZE_EXECUTE -> REVIEW
 REVIEW -> FIX                 when needs_fix_round == true
 FIX -> REVIEW
+REVIEW -> REPLAN_REEXECUTE    when controller replan policy escalates
+REPLAN_REEXECUTE -> REVIEW    replacement PR, fresh round 1
 REVIEW -> READY_FOR_MERGE     when needs_fix_round == false
 ```
+
+`REVIEW` is `REPLAN_REEXECUTE`'s only entry and its only exit: it is the one
+phase where the controller closes an open PR, so a second edge in or out would
+be a second way into that destructive step.
 
 Later milestones may enable:
 
@@ -237,8 +244,14 @@ workflow:
 ```
 
 - After a review with findings, the controller evaluates replan policy before blocking for the per-PR cap or stagnation. An eligible replan, including one caused by workflow stagnation or the cap, enters `REPLAN_REEXECUTE`; an exhausted replan limit enters `BLOCKED`. Otherwise a review round at the cap enters `BLOCKED` with a clear `block_reason`; no further FIX round is started because its result could never be reviewed. A clean round at the cap proceeds normally. Entering `REVIEW` beyond the cap (stale re-review, HEAD drift, resume) is refused before the reviewer runs.
-- Stagnation is judged on the persisted per-PR `review_history` (round, reviewed SHA, result, finding count, fingerprint of the normalised `required_resolution` texts). Only trailing consecutive rounds that ended with findings count; a clean or stale round breaks the streak. A value of 0 disables a rule. A detected stagnation is an eligible replan trigger only from `review.replan.soft_threshold` onwards; below that round it is an immediate block, because a short identical-resolution streak is usually one FIX round that missed a finding and is not worth discarding the PR for. `_apply_replan` is authoritative over `_recover_replan`, and `review.replan.soft_threshold` is authoritative over `workflow.stagnation_*`: recovery must never re-derive acceptance for a replacement that verification refused.
+- Stagnation is judged on the persisted per-PR `review_history` (round, reviewed SHA, result, finding count, fingerprint of the normalised `required_resolution` texts). Only trailing consecutive rounds that ended with findings count; a clean or stale round breaks the streak. A value of 0 disables a rule. A detected stagnation is an eligible replan trigger only from `review.replan.soft_threshold` onwards; below that round it is an immediate block, because a short identical-resolution streak is usually one FIX round that missed a finding and is not worth discarding the PR for. `review.replan.soft_threshold` is authoritative over `workflow.stagnation_*`. There is no separate recovery policy to be authoritative over: a fresh `REPLAN_REEXECUTE` step and a `resume` run the same reducer over the same persisted transaction, and a refusal is persisted as a terminal `REJECTED` stage that `resume` replays — recovery may replay a decision, never launder one.
 - A replan discards the PR that holds the untruncated findings, so it requires complete evidence. `review_history` entries are bounded (`MAX_PERSISTED_FINDINGS_PER_ROUND`, `MAX_REQUIRED_RESOLUTION_CHARS`) and mark any round whose findings were dropped or clipped. A marked round blocks for a human — in the policy and again at the `REPLAN_REEXECUTE` checkpoint — rather than letting a replacement be accepted against a reduced acknowledgement count. The replacement is also re-read and re-verified at its checkpointed HEAD immediately before the old PR is closed, because the checkpoint that authorised the close may be a crash and a `resume` older than the close itself.
+- `REPLAN_REEXECUTE` is the only phase in which the controller performs a destructive GitHub write on agent-produced work, so it is modelled as one durable transaction (`replan_txn.py`) rather than a sequence of independent checks. The invariants it must hold:
+  - **Causal provenance.** A replacement belongs to a replan only if it publishes that replan's controller-generated transaction id in an `<!-- autoforge-replan-transaction: {...} -->` marker in its PR body, read back from GitHub. The id is random and persisted *before* the agent is invoked. Shape is never proof: "the only other open PR", a matching branch name, a plausible timestamp, or the agent's own `CONTROL_RESULT` claim can select nothing. PRs snapshotted as already open at `PREPARED` can never become the replacement, even carrying a copied marker.
+  - **Two-sided compare-and-swap.** The old PR is closed only while *both* the source (identity, OPEN, branch, exact checkpointed HEAD) and the replacement (identity, repository, issue linkage, OPEN, base, branch, exact verified HEAD) still match their checkpoints. Drift on either side blocks; the close never happens on facts that have moved.
+  - **Ownership of the side effect.** `SUPERSEDE_INTENT` is persisted before `gh pr close` is called. That record is the only thing that distinguishes the controller's own close from a human's afterwards, so a source PR found CLOSED without it blocks instead of being adopted. The close outcome is re-read from GitHub, never inferred from an exit status.
+  - **Rejection monotonicity and UNKNOWN.** A conclusive refusal is written into the transaction as terminal `REJECTED` before the phase blocks, so `resume` replays it. A *transient* GitHub failure is not a refusal: it leaves the stage untouched and stays resumable. Ambiguity (several claimants, an unusable marker, an unknown persisted stage) fails closed.
+  - **Crash idempotency.** Every window has one resolution: because the transaction id cannot exist anywhere before it is persisted, "crashed before invoking the agent" and "crashed while the agent ran" are the same recoverable state, and no crash causes a second implementation attempt, a second close, or a second `superseded_prs` entry.
 - The step budget is measured on the persisted cumulative `step_count`, which is never reset by `resume` or by switching issues. CLI `--max-steps` bounds a single invocation only.
 - Failed invocations consume neither a review round nor a `review_history` entry.
 - Hitting any bound is `BLOCKED` (terminal). The open findings and the PR stay for a human; nothing is merged.

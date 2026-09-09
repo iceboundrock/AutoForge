@@ -77,6 +77,10 @@ Escalation reason:
 
 `{{ESCALATION_REASON}}`
 
+Replan transaction ID (controller-generated; see section 20):
+
+`{{REPLAN_TRANSACTION_ID}}`
+
 Historical review findings:
 
 ~~~~untrusted
@@ -681,6 +685,46 @@ Do not reproduce dozens of historical comments in the PR body.
 
 Summarize them by root-cause category.
 
+## Required: the replan transaction marker
+
+The controller does **not** identify your replacement PR by shape. "The only
+other open PR on this issue" is not proof of anything, and a PR that already
+existed before this replan is never adopted. The replacement PR is recognised
+only by a machine-readable marker in its **PR body**, which you must include
+verbatim except for the numeric fields:
+
+```text
+{{REPLAN_MARKER}}
+```
+
+Rules:
+
+* Put it in the replacement PR body (an HTML comment, so it stays invisible in
+  the rendered description). One marker, exactly once.
+* Include it in the body you pass to `gh pr create`, not in a later edit. If
+  the controller crashes between your PR creation and your `CONTROL_RESULT`, a
+  PR that already carries the marker is recovered and adopted, while one
+  without it is invisible to the controller and the replan is restarted.
+* `transaction_id` must be exactly `{{REPLAN_TRANSACTION_ID}}`. Do not invent,
+  shorten or reformat it. Do not copy it into any other PR.
+* `execution_attempt` must be exactly `{{EXECUTION_ATTEMPT}}`.
+* `findings_considered` must be the real number of historical actionable
+  findings you analysed, and must be at least `{{HISTORICAL_FINDING_COUNT}}` —
+  the count the controller preserved. If you cannot honestly account for all of
+  them, return the blocked result in section 27 instead of lowering the number.
+* `unique_constraints` must be the deduplicated count and must not exceed
+  `findings_considered`.
+* `tests_passed` must be your real verification outcome. `false` here means the
+  controller refuses the replacement; it never means "close the old PR anyway".
+
+The same numbers must appear in your `CONTROL_RESULT`. The controller reads the
+marker back from GitHub and treats it, not your stdout, as the authoritative
+attestation — a mismatch between the two is a rejection.
+
+Without a correct marker the replacement is simply not found: the previous PR
+stays open and the run blocks for a human. Nothing you write in prose can
+substitute for it.
+
 ---
 
 # 21. Replacement PR description
@@ -845,6 +889,10 @@ Use actual values.
 `unique_failure_constraints` means the number after deduplicating/normalizing them into root constraints. It is
 recorded by the controller alongside the superseded PR; report the real number (the `2` above is only an example)
 and never a value greater than `historical_findings_considered`.
+
+These values must equal the ones in the replan transaction marker on the
+replacement PR body (section 20). The controller compares them; a disagreement
+between your stdout and the published marker rejects the replacement.
 
 ---
 

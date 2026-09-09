@@ -88,12 +88,15 @@ class AutoForgeState:
     verification_failures: list[str] = field(default_factory=list)
 
     # Per-issue implementation lifecycle. The original attempt is 1; only a
-    # verified replacement increments it. ``replan_progress`` is a durable
-    # operation journal for the multi-side-effect REPLAN_REEXECUTE phase.
+    # verified replacement increments it.
     execution_attempt: int = 1
     escalation_count: int = 0
     superseded_prs: list[dict] = field(default_factory=list)
-    replan_progress: dict = field(default_factory=dict)
+    # Durable REPLAN_REEXECUTE transaction (see autoforge.replan_txn). Empty
+    # when no replan is in flight; a serialised ``ReplanTransaction`` while
+    # one is. It is the controller's intent record: recovery replays it
+    # rather than re-deriving what the safe disposition should have been.
+    replan_transaction: dict = field(default_factory=dict)
 
     merged_since_epic_update: int = 0
     counted_merged_prs: list[str] = field(default_factory=list)
@@ -161,8 +164,8 @@ class AutoForgeState:
             raise StateError("state field 'verification_failures' must be a list of strings")
         if not isinstance(state.superseded_prs, list):
             raise StateError("state field 'superseded_prs' must be a list")
-        if not isinstance(state.replan_progress, dict):
-            raise StateError("state field 'replan_progress' must be an object")
+        if not isinstance(state.replan_transaction, dict):
+            raise StateError("state field 'replan_transaction' must be an object")
         for name in ("execution_attempt", "escalation_count"):
             value = getattr(state, name)
             minimum = 1 if name == "execution_attempt" else 0
@@ -225,7 +228,7 @@ class AutoForgeState:
         self.execution_attempt = 1
         self.escalation_count = 0
         self.superseded_prs = []
-        self.replan_progress = {}
+        self.replan_transaction = {}
         self.next_issue_rejections = []
         self.attempt = 0
 
