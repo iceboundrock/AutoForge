@@ -705,6 +705,13 @@ Rules:
   the controller crashes between your PR creation and your `CONTROL_RESULT`, a
   PR that already carries the marker is recovered and adopted, while one
   without it is invisible to the controller and the replan is restarted.
+* It must go on a PR **you create for this replan**. The controller recorded
+  the repository's highest pull-request number before this transaction existed,
+  and refuses any PR at or below it. Adding the marker to an already-open PR --
+  including the one being superseded, or an unrelated one you also happen to be
+  working on -- rejects the replan; it does not adopt that PR.
+* Exactly one marker in the body, and nothing marker-shaped beside it. A body
+  carrying a valid marker next to an unparsable one is refused.
 * `transaction_id` must be exactly `{{REPLAN_TRANSACTION_ID}}`. Do not invent,
   shorten or reformat it. Do not copy it into any other PR.
 * `execution_attempt` must be exactly `{{EXECUTION_ATTEMPT}}`.

@@ -187,6 +187,13 @@ class ReplanTransaction:
 
     issue_url: str = ""
 
+    # -- decision point: the review state that routed to this replan -------
+    # Recorded by REVIEW when the transaction is created, before the
+    # controller looks at GitHub again. The source may only be superseded at
+    # exactly this revision: it is the one whose findings justify the replan.
+    decision_head_sha: str = ""
+    decision_branch: str = ""
+
     # -- source checkpoint: exactly what may be superseded -----------------
     source_pr_url: str = ""
     source_branch: str = ""
@@ -203,8 +210,14 @@ class ReplanTransaction:
     rendered_verification_failures: str = ""
 
     # -- provenance -------------------------------------------------------
-    # Open issue PRs that already existed when this transaction was prepared.
-    # None of them can ever be adopted as the replacement.
+    # Largest PR number in the repository when this transaction was prepared,
+    # read *before* the transaction id existed. GitHub allocates PR numbers
+    # from a monotonic per-repository counter, so any PR at or below this
+    # predates the id and therefore cannot be the replacement -- whether or not
+    # it was linked to the issue, named for it, or even open at the time.
+    pr_number_watermark: int = 0
+    # Defence in depth over the watermark: the issue's open PRs at PREPARED,
+    # by identity. None of them can ever be adopted as the replacement.
     preexisting_pr_urls: list[str] = field(default_factory=list)
     expected_execution_attempt: int = 0
 
@@ -287,6 +300,38 @@ def _canonical(url: str) -> str:
         return ""
 
 
+def verify_decision_point(pr: PRInfo, txn: ReplanTransaction) -> str:
+    """The source must still be the revision whose review decided the replan.
+
+    Checked once, before the transaction is prepared. ``REVIEW`` records the
+    HEAD and branch it reviewed; the checkpoint is then taken from GitHub, and
+    between those two moments a human (or a stray push) can move the source.
+    Superseding the moved source would close a revision this replan decision
+    never saw -- the accumulated findings belong to the reviewed revision, not
+    to whatever is on the branch now.
+
+    An empty ``decision_head_sha`` is itself a refusal: without it there is no
+    proof the checkpoint is the decision point.
+    """
+    if not txn.decision_head_sha:
+        return (
+            "the replan transaction does not record the reviewed HEAD that decided it, so the "
+            "source cannot be proven to be the revision the findings belong to"
+        )
+    if pr.head_sha.lower() != txn.decision_head_sha.lower():
+        return (
+            f"source PR {txn.source_pr_url} is at HEAD {pr.head_sha or '(unreadable)'}, but the "
+            f"review that decided this replan ran on {txn.decision_head_sha}; the current work "
+            "was never reviewed against this decision"
+        )
+    if txn.decision_branch and pr.head_ref != txn.decision_branch:
+        return (
+            f"source PR {txn.source_pr_url} is on branch {pr.head_ref!r}, but the review that "
+            f"decided this replan ran on {txn.decision_branch!r}"
+        )
+    return ""
+
+
 def verify_source_checkpoint(pr: PRInfo, txn: ReplanTransaction) -> str:
     """The source PR must still be *exactly* what the transaction checkpointed.
 
@@ -319,6 +364,13 @@ def verify_source_checkpoint(pr: PRInfo, txn: ReplanTransaction) -> str:
             f"source PR {txn.source_pr_url} advanced from the checkpointed HEAD "
             f"{txn.source_head_sha} to {pr.head_sha or '(unreadable)'}; the newer work was never "
             "reviewed against this replan decision"
+        )
+    # Defence in depth: the checkpoint is only allowed to hold the revision the
+    # review decided on, so a journal in which the two disagree is unusable.
+    if txn.decision_head_sha and txn.source_head_sha.lower() != txn.decision_head_sha.lower():
+        return (
+            f"checkpointed source HEAD {txn.source_head_sha} is not the reviewed HEAD "
+            f"{txn.decision_head_sha} that decided this replan"
         )
     return ""
 
@@ -428,11 +480,18 @@ def select_bound_candidate(
     """Find the one PR causally bound to ``txn``, or fail closed.
 
     Binding is positive proof, never shape: a candidate must carry a marker
-    for this exact transaction id, and must not be one of the PRs that
-    already existed when the transaction was prepared. Everything else is
-    ignored, so an unrelated open PR neither gets adopted nor blocks a
-    healthy replan. Two bound candidates are ambiguous, and a candidate whose
-    marker is unusable is a conclusive rejection.
+    for this exact transaction id, and must have been *created* after that id
+    existed. Everything else is ignored, so an unrelated open PR neither gets
+    adopted nor blocks a healthy replan. Two bound candidates are ambiguous,
+    and a candidate whose marker is unusable in any way -- malformed, doubled,
+    or sitting on a PR that predates the transaction -- is a conclusive
+    rejection.
+
+    Novelty is decided by ``pr_number_watermark`` rather than by the snapshot
+    of issue PRs: GitHub numbers PRs from a monotonic per-repository counter,
+    so "number <= watermark" covers every PR that already existed, including
+    ones that were closed, unlinked, or named nothing like this issue at
+    ``PREPARED`` and were only linked to it afterwards.
     """
     if not TRANSACTION_ID_RE.match(txn.transaction_id):
         # No id means nothing can be causally bound to this transaction; a
@@ -442,6 +501,16 @@ def select_bound_candidate(
             reason=(
                 "replan transaction has no usable transaction id; no PR can be proven to be "
                 "its replacement"
+            ),
+        )
+    if txn.pr_number_watermark < 1:
+        # Without the watermark there is no proof any candidate postdates the
+        # transaction id, and provenance would fall back to shape.
+        return CandidateSelection(
+            Disposition.REJECTED,
+            reason=(
+                f"replan transaction {txn.transaction_id} has no pull-request number watermark, "
+                "so no PR can be proven to have been created after it"
             ),
         )
     preexisting = {_canonical(url) for url in txn.preexisting_pr_urls}
@@ -454,26 +523,44 @@ def select_bound_candidate(
             continue
         scan = scan_replan_markers(pr.body or "")
         mine = [a for a in scan.attestations if a.transaction_id == txn.transaction_id]
-        if canonical in preexisting:
+        under_watermark = pr.number <= txn.pr_number_watermark
+        if under_watermark or canonical in preexisting:
             if mine:
-                # The token did not exist when this PR was snapshotted, so a
-                # match means the marker was copied. Never adopt it.
+                # The id did not exist when this PR was created, so a match
+                # means the marker was copied. Never adopt it.
+                how = (
+                    f"its number {pr.number} is at or below the watermark {txn.pr_number_watermark}"
+                    if under_watermark
+                    else "it was in the snapshot of the issue's open PRs"
+                )
                 return CandidateSelection(
                     Disposition.REJECTED,
                     reason=(
                         f"PR {canonical} already existed when replan transaction "
-                        f"{txn.transaction_id} was prepared but carries its marker; refusing to "
-                        "adopt a pre-existing PR as a replacement"
+                        f"{txn.transaction_id} was prepared ({how}) but carries its marker; "
+                        "refusing to adopt a pre-existing PR as a replacement"
                     ),
                 )
             continue
-        if scan.malformed and not mine:
-            malformed.append(f"{canonical}: {'; '.join(scan.malformed)}")
         if len(mine) > 1:
             return CandidateSelection(
                 Disposition.REJECTED,
                 reason=f"PR {canonical} carries {len(mine)} markers for this transaction",
             )
+        if mine and scan.malformed:
+            # A valid marker does not excuse an unusable one beside it: the
+            # body was supposed to carry exactly one attestation, and a
+            # candidate whose provenance data is partly garbage fails closed.
+            return CandidateSelection(
+                Disposition.REJECTED,
+                reason=(
+                    f"PR {canonical} carries the marker for replan transaction "
+                    f"{txn.transaction_id} alongside an unusable one "
+                    f"({'; '.join(scan.malformed)})"
+                ),
+            )
+        if scan.malformed:
+            malformed.append(f"{canonical}: {'; '.join(scan.malformed)}")
         if mine:
             bound.append((pr, mine[0]))
     if len(bound) > 1:

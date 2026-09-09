@@ -108,6 +108,7 @@ from .replan_txn import (
     new_transaction_id,
     select_bound_candidate,
     verify_attestation,
+    verify_decision_point,
     verify_source_checkpoint,
     verify_target_pr,
 )
@@ -1529,7 +1530,10 @@ class ControllerEngine:
         try:
             source = self.github.get_pr(state.current_pr_url)
             repo = self.github.get_repo(state.repository)
-            preexisting = self.github.find_open_prs_for_issue(issue)
+            preexisting = self.github.find_open_prs_for_issue(issue, strict=True)
+            # Read *before* the transaction id is generated below, so every PR
+            # that could already be carrying a copied marker is under it.
+            watermark = self.github.latest_pr_number(state.repository)
         except GitHubUnavailableError:
             raise  # unknown, not refused: `resume` re-reads
         except GitHubError as exc:
@@ -1550,9 +1554,25 @@ class ControllerEngine:
             return self._reject_replan(
                 txn, f"repository {state.repository} has no readable default branch"
             )
-        history = HistoricalReviewCollector(self.github).collect(
-            state.current_pr_url, state.review_history, state.verification_failures
-        )
+        if watermark < source_ref.number:
+            return self._reject_replan(
+                txn,
+                f"repository {state.repository} reports {watermark} as its latest pull-request "
+                f"number, which cannot be right while PR #{source_ref.number} exists",
+            )
+        drift = verify_decision_point(source, txn)
+        if drift:
+            return self._reject_replan(txn, drift)
+        try:
+            history = HistoricalReviewCollector(self.github).collect(
+                state.current_pr_url, state.review_history, state.verification_failures
+            )
+        except GitHubUnavailableError:
+            raise  # the evidence is unread, not incomplete: `resume` re-reads
+        except GitHubError as exc:
+            return self._reject_replan(
+                txn, f"cannot collect the review evidence the replacement must answer for: {exc}"
+            )
         txn.transaction_id = new_transaction_id()
         txn.stage = ReplanStage.PREPARED
         txn.issue_url = state.current_issue_url
@@ -1568,6 +1588,7 @@ class ControllerEngine:
         txn.preexisting_pr_urls = sorted(
             {parse_pr_url(pr.url).canonical for pr in preexisting if pr.url}
         )
+        txn.pr_number_watermark = watermark
         txn.expected_execution_attempt = state.execution_attempt + 1
         self._save_replan_txn(txn)
         return None
@@ -1586,7 +1607,9 @@ class ControllerEngine:
         state = self._require_state()
         issue = parse_issue_url(txn.issue_url)
         try:
-            open_prs = self.github.find_open_prs_for_issue(issue)
+            # Strict: "no candidate exists" decides whether the agent runs
+            # again, so it must not be a truncated listing in disguise.
+            open_prs = self.github.find_open_prs_for_issue(issue, strict=True)
         except GitHubUnavailableError:
             raise  # the candidate set is unknown, not ambiguous: stay resumable
         except GitHubError as exc:
@@ -2030,11 +2053,14 @@ class ControllerEngine:
                     self._replan_refusal(decision) + ". Human intervention is required"
                 )
             if decision.action == "replan":
-                # Only the decision is recorded here. The checkpoint and the
-                # transaction id are created by `_prepare_replan`, inside the
+                # Only the decision is recorded here, together with the
+                # revision it was made on. The checkpoint and the transaction
+                # id are created by `_prepare_replan`, inside the
                 # REPLAN_REEXECUTE step that owns them.
                 state.replan_transaction = ReplanTransaction(
                     stage=ReplanStage.PENDING,
+                    decision_head_sha=expected_head,
+                    decision_branch=state.current_branch,
                     escalation=decision.metadata or {"trigger": decision.reason},
                 ).to_dict()
                 return Phase.REPLAN_REEXECUTE, (
@@ -2238,6 +2264,31 @@ class ControllerEngine:
                     txn.replacement_pr_url,
                 )
             )
+        # The marker is the authoritative attestation, so stdout is not allowed
+        # to tell a different story about it: an internally inconsistent result
+        # means the two numbers were not produced by one honest accounting, and
+        # the controller cannot tell which (if either) is the real one.
+        for field_name, claimed, attested in (
+            (
+                "historical_findings_considered",
+                res.historical_findings_considered,
+                txn.attested_findings_considered,
+            ),
+            (
+                "unique_failure_constraints",
+                res.unique_failure_constraints,
+                txn.attested_unique_constraints,
+            ),
+        ):
+            if claimed != attested:
+                return self._blocked_replan(
+                    self._reject_replan(
+                        txn,
+                        f"CONTROL_RESULT {field_name}={claimed} disagrees with the replan marker "
+                        f"published on {txn.replacement_pr_url}, which attests {attested}",
+                        txn.replacement_pr_url,
+                    )
+                )
         outcome = self._supersede_source(txn)
         if state.phase == Phase.BLOCKED:
             return Phase.BLOCKED, outcome.message

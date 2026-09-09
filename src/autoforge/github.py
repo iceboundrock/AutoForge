@@ -217,6 +217,18 @@ _MERGE_QUEUE_QUERY = (
     " repository(owner: $owner, name: $name) {"
     " pullRequest(number: $number) { isMergeQueueEnabled isInMergeQueue } } }"
 )
+# The highest PR number that exists in a repository right now. GitHub allocates
+# issue/PR numbers from one monotonic per-repository counter at creation time,
+# so the newest-created PR carries the largest number, and *every* PR created
+# later carries a larger one. That makes a single-node read a complete
+# "existed before now" watermark -- no pagination, and unlike a listing it also
+# covers closed and unlinked PRs.
+_LATEST_PR_QUERY = (
+    "query($owner: String!, $name: String!) {"
+    " repository(owner: $owner, name: $name) {"
+    " pullRequests(first: 1, orderBy: {field: CREATED_AT, direction: DESC})"
+    " { nodes { number } } } }"
+)
 _PR_LIST_FIELDS = (
     "url,number,title,state,headRefOid,baseRefName,headRefName,isDraft,body,"
     "headRepository,headRepositoryOwner,closingIssuesReferences"
@@ -229,6 +241,10 @@ def _repo_of(url: str) -> str:
     except Exception:
         return ""
 
+
+# `gh pr list` paginates internally to satisfy --limit; this is the ceiling a
+# strict caller is willing to read before declaring the set unknowable.
+STRICT_PR_LIST_LIMIT = 1000
 
 MERGE_METHODS = ("squash", "merge", "rebase")
 _SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -511,17 +527,66 @@ class GitHubClient:
         )
         return [self._pr_from_data(d) for d in data if isinstance(d, dict)]
 
-    def find_open_prs_for_issue(self, issue: GitHubIssueRef | str) -> list[PRInfo]:
+    def latest_pr_number(self, repo: str) -> int:
+        """The largest PR number that currently exists in ``repo`` (0 if none).
+
+        Used as a provenance watermark: a PR whose number is <= the value read
+        before a replan transaction id was generated cannot have been created
+        after it, so it can never be that transaction's replacement even if the
+        marker is later copied into its body. Malformed data raises
+        GitHubError (fail closed) rather than returning an under-estimate.
+        """
+        owner, _, name = repo.partition("/")
+        data = self._api_json(
+            [
+                "api",
+                "graphql",
+                "-f",
+                f"query={_LATEST_PR_QUERY}",
+                "-F",
+                f"owner={owner}",
+                "-F",
+                f"name={name}",
+            ]
+        )
+        connection = ((data.get("data") or {}).get("repository") or {}).get("pullRequests")
+        if not isinstance(connection, dict):
+            raise GitHubError(f"latest pull-request number for {repo} unavailable: {data}")
+        nodes = connection.get("nodes")
+        if not isinstance(nodes, list):
+            raise GitHubError(f"latest pull-request number for {repo} is not a node list: {nodes}")
+        if not nodes:
+            return 0
+        number = nodes[0].get("number") if isinstance(nodes[0], dict) else None
+        if not isinstance(number, int) or isinstance(number, bool) or number < 1:
+            raise GitHubError(f"latest pull-request number for {repo} is not a number: {nodes[0]}")
+        return number
+
+    def find_open_prs_for_issue(
+        self, issue: GitHubIssueRef | str, *, strict: bool = False
+    ) -> list[PRInfo]:
         """Open PRs that unambiguously belong to ``issue``.
 
         A PR matches when GitHub links it as closing the issue, or its head
         branch follows the controller's naming scheme ``autoforge/<n>-...``.
+
+        ``strict`` raises GitHubError instead of returning a set that may be
+        incomplete: the underlying listing is bounded, and a caller deciding a
+        destructive action on "no candidate exists" must not confuse that with
+        "the candidate was past the limit".
         """
         if isinstance(issue, str):
             issue = parse_issue_url(issue)
+        limit = STRICT_PR_LIST_LIMIT if strict else 100
+        open_prs = self.list_open_prs(issue.repository, limit=limit)
+        if strict and len(open_prs) >= limit:
+            raise GitHubError(
+                f"{issue.repository} has at least {limit} open pull requests, so the listing may "
+                "be truncated and the set of candidates cannot be established"
+            )
         prefix = re.compile(rf"^autoforge/{issue.number}(?:-|$)")
         out = []
-        for pr in self.list_open_prs(issue.repository):
+        for pr in open_prs:
             if issue.number in pr.linked_issue_numbers or prefix.match(pr.head_ref or ""):
                 out.append(pr)
         return out

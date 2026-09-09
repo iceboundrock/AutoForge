@@ -7,7 +7,7 @@ import pytest
 
 from autoforge.errors import GitHubError, GitHubNotFoundError, GitHubUnavailableError
 from autoforge.executor import ExecutionResult
-from autoforge.github import GitHubClient
+from autoforge.github import STRICT_PR_LIST_LIMIT, GitHubClient
 
 
 def _res(payload: dict, exit_code: int = 0, stderr: str = "") -> ExecutionResult:
@@ -147,9 +147,37 @@ def test_find_open_prs_for_issue():
             "baseRefName": "main",
         },
     ]
-    gh = _client(lambda req: ExecutionResult(req.command, None, 0, json.dumps(prs), "", "t", "t"))
+    seen = []
+
+    def handler(req):
+        seen.append(req.command)
+        return ExecutionResult(req.command, None, 0, json.dumps(prs), "", "t", "t")
+
+    def limit_of(cmd):
+        return cmd[cmd.index("--limit") + 1]
+
+    gh = _client(handler)
     found = gh.find_open_prs_for_issue("https://github.com/o/r/issues/2")
     assert sorted(p.number for p in found) == [1, 2]
+    assert limit_of(seen[0]) == "100"
+
+    # strict: reads far more before giving up, and refuses a set it cannot
+    # prove complete rather than reporting "no candidate".
+    found = gh.find_open_prs_for_issue("https://github.com/o/r/issues/2", strict=True)
+    assert sorted(p.number for p in found) == [1, 2]
+    assert limit_of(seen[1]) == str(STRICT_PR_LIST_LIMIT)
+
+    full = [
+        dict(prs[0], number=n, url=f"https://github.com/o/r/pull/{n}")
+        for n in range(1, STRICT_PR_LIST_LIMIT + 1)
+    ]
+    truncating = _client(
+        lambda req: ExecutionResult(req.command, None, 0, json.dumps(full), "", "t", "t")
+    )
+    with pytest.raises(GitHubError, match="truncated"):
+        truncating.find_open_prs_for_issue("https://github.com/o/r/issues/2", strict=True)
+    # Non-strict callers are unaffected: a full page is not an error for them.
+    assert truncating.find_open_prs_for_issue("https://github.com/o/r/issues/2")
 
 
 def test_transient_error_retried_once():
@@ -470,6 +498,38 @@ def test_get_pr_merge_queue_status_uses_graphql_and_fails_closed():
         _client(lambda req: _res({}, exit_code=1, stderr="boom")).get_pr_merge_queue_status(
             "https://github.com/o/r/pull/42"
         )
+
+
+def test_latest_pr_number_uses_graphql_and_fails_closed():
+    """The replan provenance watermark: newest-created PR, no pagination."""
+    seen = []
+
+    def ok(req):
+        seen.append(req.command)
+        return _res({"data": {"repository": {"pullRequests": {"nodes": [{"number": 77}]}}}})
+
+    assert _client(ok).latest_pr_number("o/r") == 77
+    cmd = seen[0]
+    assert cmd[:3] == ["gh", "api", "graphql"]
+    assert "owner=o" in cmd and "name=r" in cmd
+    # Ordering is explicit: "newest created" is what makes this the max number.
+    assert any("CREATED_AT" in part and "DESC" in part for part in cmd)
+
+    # A repository with no pull requests at all has watermark 0.
+    empty = {"data": {"repository": {"pullRequests": {"nodes": []}}}}
+    assert _client(lambda req: _res(empty)).latest_pr_number("o/r") == 0
+
+    for payload, needle in [
+        ({"data": {"repository": None}}, "unavailable"),
+        ({"data": {"repository": {"pullRequests": {"nodes": None}}}}, "not a node list"),
+        ({"data": {"repository": {"pullRequests": {"nodes": [{"number": "7"}]}}}}, "not a number"),
+        ({"data": {"repository": {"pullRequests": {"nodes": [{"number": 0}]}}}}, "not a number"),
+    ]:
+        with pytest.raises(GitHubError, match=needle):
+            _client(lambda req, p=payload: _res(p)).latest_pr_number("o/r")
+
+    with pytest.raises(GitHubError, match="failed"):
+        _client(lambda req: _res({}, exit_code=1, stderr="boom")).latest_pr_number("o/r")
 
 
 def test_disable_auto_merge_argv():

@@ -127,6 +127,9 @@ class FakeGitHub:
         self.get_pr_failures: int = 0  # next N get_pr calls raise GitHubUnavailableError
         self.get_pr_error: GitHubError | None = None  # every get_pr call raises this
         self.get_issue_error: GitHubError | None = None  # every get_issue call raises this
+        self.latest_pr_error: GitHubError | None = None  # every latest_pr_number call raises this
+        self.pr_listing_truncated: bool = False  # a strict PR listing cannot be completed
+        self.comments_error: GitHubError | None = None  # every get_pr_comments call raises this
         self.add_issue(EPIC, "EPIC")
         self.add_issue(ISSUE, "Feature")
 
@@ -258,8 +261,20 @@ class FakeGitHub:
     def list_open_prs(self, repo: str, limit: int = 100) -> list[PRInfo]:
         return [p for p in self.prs.values() if p.is_open and p.repository == repo]
 
-    def find_open_prs_for_issue(self, issue) -> list[PRInfo]:
-        self.calls.append(("find_open_prs_for_issue", issue.number))
+    def latest_pr_number(self, repo: str) -> int:
+        """Highest PR number in the repo, open or closed (the real watermark)."""
+        self.calls.append(("latest_pr_number", repo))
+        if self.latest_pr_error is not None:
+            raise self.latest_pr_error
+        return max((p.number for p in self.prs.values() if p.repository == repo), default=0)
+
+    def find_open_prs_for_issue(self, issue, *, strict: bool = False) -> list[PRInfo]:
+        self.calls.append(("find_open_prs_for_issue", issue.number, strict))
+        if strict and self.pr_listing_truncated:
+            raise GitHubError(
+                f"{issue.repository} has at least 1000 open pull requests, so the listing may "
+                "be truncated and the set of candidates cannot be established"
+            )
         out = []
         for pr in self.list_open_prs(issue.repository):
             if (
@@ -272,6 +287,8 @@ class FakeGitHub:
 
     def get_pr_comments(self, url: str) -> list[CommentInfo]:
         self.calls.append(("get_pr_comments", url))
+        if self.comments_error is not None:
+            raise self.comments_error
         self.get_pr(url)
         return list(self.comments.get(url, []))
 
