@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 
 import pytest
 
@@ -31,6 +32,7 @@ from tests.conftest import (
     PR,
     SHA_A,
     SHA_B,
+    SHA_C,
     FakeGitHub,
     block,
     comment_url,
@@ -565,18 +567,177 @@ def test_historical_rendering_cannot_close_untrusted_fence(length):
 
 
 def test_recorded_finding_count_matches_what_the_prompt_shows(tmp_state_dir):
-    """N6: the controller may only demand the findings it actually rendered."""
+    """N6: the controller demands exactly the findings it actually rendered."""
     findings = [
         {"id": f"R1-F{n}", "classification": "nit", "required_resolution": f"fix {n}"}
-        for n in range(1, 151)
+        for n in range(1, MAX_PERSISTED_FINDINGS_PER_ROUND + 1)
     ]
     record = review_record(1, SHA_A, RESULT_NEEDS_FIX, findings)
-    assert record["finding_count"] == 150
-    assert len(record["findings"]) == MAX_PERSISTED_FINDINGS_PER_ROUND
+    assert record["finding_count"] == len(record["findings"]) == MAX_PERSISTED_FINDINGS_PER_ROUND
     gh = FakeGitHub()
     gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2])
     data = HistoricalReviewCollector(gh).collect(PR, [record], [])
     assert data.recorded_finding_count == len(data.findings) == MAX_PERSISTED_FINDINGS_PER_ROUND
+
+
+def test_truncated_round_evidence_refuses_replan_in_policy():
+    """F1: an incomplete finding record is never traded for a fresh PR."""
+    config = ReplanConfig()
+    history = _history([3] * 19)
+    # One round could not be persisted in full; nothing else about the history
+    # changes, so the same input would otherwise have escalated (see below).
+    assert (
+        evaluate_replan_policy(
+            has_actionable_findings=True,
+            current_review_round=config.hard_threshold,
+            review_history=history,
+            escalation_count=0,
+            config=config,
+        ).action
+        == "replan"
+    )
+    history[7]["evidence_truncated"] = True
+    decision = evaluate_replan_policy(
+        has_actionable_findings=True,
+        current_review_round=config.hard_threshold,
+        review_history=history,
+        escalation_count=0,
+        config=config,
+    )
+    assert decision.action == "block_for_human"
+    assert decision.reason == "replan_evidence_truncated"
+    assert (decision.metadata or {})["truncated_evidence_rounds"] == [8]
+
+
+def test_review_beyond_the_persisted_finding_bound_blocks_instead_of_replanning(tmp_state_dir):
+    """F1 end-to-end: >100 findings cannot supersede the PR that carries them."""
+    finding_ids = [f"R20-F{n}" for n in range(1, MAX_PERSISTED_FINDINGS_PER_ROUND + 2)]
+    gh = FakeGitHub()
+
+    def agent(req):
+        assert req.phase == "REVIEW", f"{req.phase} must not be invoked"
+        gh.add_comment(PR, 120, review_comment_body(20, SHA_A, True, finding_ids))
+        payload = _trigger_review_payload()
+        payload["findings"] = [
+            {"id": fid, "classification": "blocked", "required_resolution": f"resolve {fid}"}
+            for fid in finding_ids
+        ]
+        return block(payload)
+
+    eng = _park_at_hard_threshold(tmp_state_dir, gh, agent)
+    out = eng.step()
+
+    assert out.next_phase == "BLOCKED"
+    assert "replan_evidence_truncated" in eng.state.block_reason
+    assert "round(s) 20" in eng.state.block_reason
+    # The PR carrying finding 101 is untouched and its findings stay persisted.
+    assert gh.prs[PR].state == "OPEN"
+    assert eng.state.current_pr_url == PR
+    assert eng.state.superseded_prs == []
+    assert len(eng.state.open_findings) == len(finding_ids)
+    assert eng.state.escalation_count == 0
+
+    # And a `resume` into REPLAN_REEXECUTE cannot launder it either: the
+    # checkpoint that would authorise a replacement is refused too.
+    eng.state.phase = Phase.REPLAN_REEXECUTE
+    eng.state.replan_progress = {"escalation": {"trigger": "hard_review_round_threshold"}}
+    calls_before = len(eng.provider.calls)
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert "incomplete copy of the review" in eng.state.block_reason
+    assert len(eng.provider.calls) == calls_before  # no replacement agent ran
+    assert gh.prs[PR].state == "OPEN"
+    assert not eng.state.replan_progress.get("stage") == "prepared"
+
+
+def test_replacement_head_drift_after_checkpoint_blocks_instead_of_closing(tmp_state_dir):
+    """F2: the persisted checkpoint is revalidated immediately before close_pr."""
+    gh = FakeGitHub()
+    eng = make_engine(tmp_state_dir, ["must not run"], github=gh)
+    gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2])
+    gh.add_pr(url=REPLACEMENT_PR, head_sha=SHA_B, branch=REPLACEMENT_BRANCH, linked=[2])
+    eng.state.phase = Phase.REPLAN_REEXECUTE
+    eng.state.current_pr_url = PR
+    eng.state.current_branch = BRANCH
+    eng.state.current_head_sha = SHA_A
+    eng.state.replan_progress = {
+        "stage": "replacement_verified",
+        "previous_pr_url": PR,
+        "previous_branch": BRANCH,
+        "previous_head_sha": SHA_A,
+        "previous_review_round": 20,
+        "replacement_pr_url": REPLACEMENT_PR,
+        "replacement_branch": REPLACEMENT_BRANCH,
+        "replacement_head_sha": SHA_B,
+        "default_branch": "main",
+        "escalation": {"trigger": "hard_review_round_threshold"},
+    }
+    # The crash window: the replacement gained a commit after it was verified.
+    gh.set_head(SHA_C, REPLACEMENT_PR)
+
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert "refusing to supersede" in eng.state.block_reason
+    assert "no longer matches its verified checkpoint" in eng.state.block_reason
+    assert gh.prs[PR].state == "OPEN" and gh.closed_prs == []
+    assert eng.state.current_pr_url == PR  # the stale SHA was never activated
+    assert eng.state.current_head_sha == SHA_A
+    assert eng.state.superseded_prs == []
+    assert eng.provider.calls == []
+
+
+@pytest.mark.parametrize(
+    "mutate,needle",
+    [
+        (lambda gh: gh.set_head(SHA_C, REPLACEMENT_PR), "verified checkpoint"),
+        (
+            lambda gh: gh.prs.__setitem__(
+                REPLACEMENT_PR, replace(gh.prs[REPLACEMENT_PR], state="CLOSED")
+            ),
+            "verified checkpoint",
+        ),
+        (
+            lambda gh: gh.prs.__setitem__(
+                REPLACEMENT_PR, replace(gh.prs[REPLACEMENT_PR], head_ref="autoforge/other")
+            ),
+            "checkpointed branch",
+        ),
+    ],
+)
+def test_replacement_drift_blocks_the_apply_path_too(tmp_state_dir, mutate, needle):
+    """The same guard covers the non-crash path from `_apply_replan`."""
+    gh = FakeGitHub()
+
+    def agent(req):
+        if req.phase == "REVIEW":
+            gh.add_comment(PR, 120, review_comment_body(20, SHA_A, True, ["R20-F1"]))
+            return block(_trigger_review_payload())
+        gh.add_pr(url=REPLACEMENT_PR, head_sha=SHA_B, branch=REPLACEMENT_BRANCH, linked=[2])
+        return block(_replan_payload())
+
+    eng = _park_at_hard_threshold(tmp_state_dir, gh, agent)
+    assert eng.step().next_phase == "REPLAN_REEXECUTE"
+    real_close = eng.github.close_pr
+
+    def drift_then_close(url, comment):  # pragma: no cover - must never run
+        raise AssertionError("close_pr must not be reached after checkpoint drift")
+
+    # Drift is injected between the checkpoint write and the close: patch the
+    # verified replacement right before `_finish_replan` re-reads it.
+    original_finish = eng._finish_replan
+
+    def finish(*a, **kw):
+        mutate(gh)
+        return original_finish(*a, **kw)
+
+    eng._finish_replan = finish
+    eng.github.close_pr = drift_then_close
+    out = eng.step()
+    eng.github.close_pr = real_close
+    assert out.next_phase == "BLOCKED"
+    assert needle in eng.state.block_reason
+    assert gh.prs[PR].state == "OPEN"
+    assert eng.state.current_pr_url == PR and eng.state.superseded_prs == []
 
 
 def _rejecting_agent(gh, mutate):

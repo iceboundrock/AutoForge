@@ -11,8 +11,10 @@ from autoforge.loop_guard import (
     normalize_resolution,
     review_record,
     round_cap_reason,
+    round_evidence_is_complete,
     stagnation_reason,
     step_budget_reason,
+    truncated_evidence_rounds,
 )
 from tests.conftest import SHA_A
 
@@ -54,12 +56,54 @@ def test_review_record_shape_and_result_validation():
         review_record(1, SHA_A, "merged", [])
 
 
-def test_review_record_bounds_retained_finding_evidence():
+def test_review_record_bounds_retained_finding_evidence_and_marks_the_loss():
     findings = [_f("x" * 2500, f"R1-F{i}") for i in range(101)]
     record = review_record(1, SHA_A, RESULT_NEEDS_FIX, findings)
     assert record["finding_count"] == 101
     assert len(record["findings"]) == 100
     assert len(record["findings"][0]["required_resolution"]) == 2000
+    # The bound stays, but the loss is never silent: a replan must be able to
+    # see that this round's evidence can no longer be reproduced in full.
+    assert record["evidence_truncated"] is True
+    assert not round_evidence_is_complete(record)
+    assert truncated_evidence_rounds([record]) == [1]
+
+
+@pytest.mark.parametrize(
+    "findings,truncated",
+    [
+        ([_f("x", "R1-F1")], False),
+        ([_f("x" * 2000, "R1-F1")], False),  # exactly at the cap: nothing lost
+        ([_f("x" * 2001, "R1-F1")], True),  # one clipped resolution is enough
+        ([_f("x", f"R1-F{i}") for i in range(100)], False),
+        ([_f("x", f"R1-F{i}") for i in range(101)], True),
+    ],
+)
+def test_evidence_truncation_is_detected_per_round(findings, truncated):
+    record = review_record(1, SHA_A, RESULT_NEEDS_FIX, findings)
+    assert record.get("evidence_truncated", False) is truncated
+    assert round_evidence_is_complete(record) is not truncated
+    assert bool(truncated_evidence_rounds([record])) is truncated
+
+
+def test_only_rounds_with_findings_carry_replan_evidence():
+    """Clean/stale rounds are never collected for a replan, so never block one."""
+    findings = [_f("x", f"R1-F{i}") for i in range(101)]
+    for result in (RESULT_CLEAN, RESULT_STALE):
+        record = review_record(1, SHA_A, result, findings)
+        assert round_evidence_is_complete(record)
+        assert truncated_evidence_rounds([record]) == []
+
+
+def test_evidence_completeness_is_rechecked_against_the_finding_count():
+    """A marker-less record (older history, hand-edited state) still fails closed."""
+    record = review_record(4, SHA_A, RESULT_NEEDS_FIX, [_f("x"), _f("y", "R4-F2")])
+    record.pop("evidence_truncated", None)
+    record["findings"] = record["findings"][:1]
+    assert not round_evidence_is_complete(record)
+    assert truncated_evidence_rounds([record]) == [4]
+    record["finding_count"] = "not-a-number"
+    assert not round_evidence_is_complete(record)
 
 
 # -- review-round cap ---------------------------------------------------------------

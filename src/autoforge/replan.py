@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 from .config import ReplanConfig
 from .github import GitHubClient
-from .loop_guard import RESULT_NEEDS_FIX
+from .loop_guard import RESULT_NEEDS_FIX, truncated_evidence_rounds
 
 # Any run of three or more tildes can close (or open) a tilde code fence, so
 # the escape must break *runs*, not the literal fence string: replacing only
@@ -36,6 +36,11 @@ def evaluate_replan_policy(
 
     A clean review always wins. ``max_replans_per_issue`` counts completed
     fresh reimplementations, not the original implementation attempt.
+
+    A replan is refused outright while any recorded round's findings are
+    truncated (:func:`~autoforge.loop_guard.truncated_evidence_rounds`): that
+    evidence is what the replacement must answer for, and the old PR is the
+    only remaining copy of it.
 
     ``soft_threshold`` is the review round from which the controller may
     *replace* an implementation instead of continuing to patch it. Every
@@ -86,6 +91,14 @@ def evaluate_replan_policy(
     metadata["trigger"] = trigger
     metadata["replan_count"] = escalation_count
     metadata["max_replans_per_issue"] = config.max_replans_per_issue
+    truncated = truncated_evidence_rounds(review_history)
+    if truncated:
+        # Superseding the PR deletes the controller's record of its findings.
+        # If that record is already incomplete, the replacement protocol cannot
+        # require the agent to consider the missing findings, and closing the
+        # PR would drop them for good. Keep the PR and the findings for a human.
+        metadata["truncated_evidence_rounds"] = truncated
+        return ReplanDecision("block_for_human", "replan_evidence_truncated", metadata)
     if escalation_count >= config.max_replans_per_issue:
         return ReplanDecision("block_for_human", "replan_limit_exceeded", metadata)
     return ReplanDecision("replan", trigger, metadata)
@@ -96,11 +109,10 @@ class HistoricalReviewData:
     findings: list[dict]
     observations: list[str]
     verification_failures: list[str]
-    # Number of findings actually rendered into the prompt. The controller
-    # requires the agent to account for exactly these; counting rounds'
-    # untruncated ``finding_count`` instead would demand it account for
-    # findings it was never shown (loop_guard truncates at
-    # MAX_PERSISTED_FINDINGS_PER_ROUND).
+    # Number of findings actually rendered into the prompt, which the agent
+    # must account for exactly. A replan only gets this far when no round was
+    # truncated (``evaluate_replan_policy`` and ``_prepare_replan`` both refuse
+    # otherwise), so this equals the reviews' own untruncated finding counts.
     recorded_finding_count: int = 0
 
     @staticmethod

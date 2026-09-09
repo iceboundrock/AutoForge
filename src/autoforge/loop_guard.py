@@ -14,6 +14,11 @@ functions whether the loop must stop:
   budget, measured on the persisted ``step_count`` so ``resume`` continues
   the same budget instead of starting a new one.
 
+:func:`review_record` keeps that history bounded, so it also records when a
+round's findings had to be dropped or clipped; :func:`truncated_evidence_rounds`
+reports those rounds so the replan policy can refuse to discard a PR whose
+findings the controller can no longer reproduce in full.
+
 Every function returns a human-readable reason (non-empty -> BLOCKED) or
 ``""``. Nothing here reads GitHub or invokes an agent.
 """
@@ -49,6 +54,53 @@ def findings_fingerprint(findings: list[dict]) -> str:
     return digest[:16]
 
 
+def _retained_finding(finding: dict) -> tuple[dict, bool]:
+    """The persisted summary of ``finding`` plus whether its text was clipped."""
+    text = str(finding.get("required_resolution", ""))
+    clipped = text[:MAX_REQUIRED_RESOLUTION_CHARS]
+    return (
+        {
+            "id": str(finding.get("id", "")),
+            "classification": str(finding.get("classification", "")),
+            "required_resolution": clipped,
+        },
+        len(clipped) != len(text),
+    )
+
+
+def round_evidence_is_complete(record: dict) -> bool:
+    """True when ``record`` holds a complete copy of its round's findings.
+
+    Only rounds that ended with findings carry evidence a replacement must
+    consider; clean and stale rounds are trivially complete. The length
+    comparison is a second, independent check on the ``evidence_truncated``
+    marker (it also covers history written before that marker existed).
+    """
+    if record.get("result") != RESULT_NEEDS_FIX:
+        return True
+    if record.get("evidence_truncated"):
+        return False
+    try:
+        expected = int(record.get("finding_count", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    return len(record.get("findings") or []) == expected
+
+
+def truncated_evidence_rounds(history: list[dict]) -> list[int]:
+    """Rounds whose persisted findings are an incomplete copy of the review.
+
+    Replacing a PR deletes the controller's only record of its findings, so a
+    replan is refused while any of that record is missing: no acknowledgement
+    the replacement agent can make covers a finding it was never shown.
+    """
+    return [
+        int(record.get("round", 0) or 0)
+        for record in history
+        if not round_evidence_is_complete(record)
+    ]
+
+
 def review_record(
     round: int,
     reviewed_head_sha: str,
@@ -68,18 +120,15 @@ def review_record(
         "fingerprint": findings_fingerprint(findings),
     }
     # Keep compact, bounded evidence. GitHub remains authoritative for comment
-    # bodies and the full finding list if this history is truncated.
+    # bodies and the full finding list if this history is truncated. Whenever
+    # anything was dropped or clipped the round is marked explicitly, because a
+    # replan discards the PR that carries the untruncated originals — see
+    # :func:`truncated_evidence_rounds`.
     if findings:
-        record["findings"] = [
-            {
-                "id": str(f.get("id", "")),
-                "classification": str(f.get("classification", "")),
-                "required_resolution": str(f.get("required_resolution", ""))[
-                    :MAX_REQUIRED_RESOLUTION_CHARS
-                ],
-            }
-            for f in findings[:MAX_PERSISTED_FINDINGS_PER_ROUND]
-        ]
+        retained = [_retained_finding(f) for f in findings[:MAX_PERSISTED_FINDINGS_PER_ROUND]]
+        record["findings"] = [item for item, _ in retained]
+        if len(findings) > MAX_PERSISTED_FINDINGS_PER_ROUND or any(cut for _, cut in retained):
+            record["evidence_truncated"] = True
     if review_comment_url:
         record["review_comment_url"] = review_comment_url
     if timestamp:

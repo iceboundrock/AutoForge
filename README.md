@@ -146,7 +146,11 @@ Key design points:
   review comments, then asks the separate `replan_reexecute` high-effort
   profile to independently rebuild from the latest verified default branch.
   The controller verifies a distinct, open, issue-linked replacement PR on a
-  new branch and the correct base before closing the old PR without merging it.
+  new branch and the correct base, and re-reads it at its checkpointed HEAD
+  immediately before closing the old PR without merging it; drift in that
+  window blocks and leaves the old PR open. A replan is refused outright while
+  any recorded round's findings had to be truncated to stay within the state
+  bounds, because closing the PR would be the moment those findings are lost.
   At most two replans per issue are allowed; a further eligible trigger blocks
   for human intervention. This retains failure knowledge while intentionally
   discarding implementation anchoring; it does not guarantee convergence.
@@ -162,7 +166,7 @@ Key design points:
 | `ANALYZE_EXECUTE` | Claude Code (`fable`, effort high) | existing open PR for the issue is recovered without re-running the agent; otherwise PR exists in this repo, is OPEN, HEAD SHA and branch match the claim |
 | `REVIEW` | OpenCode (round 1 `openai/gpt-5.6-luna` high, rounds 2–5 `openai/gpt-5.6-terra` high, 6+ `openai/gpt-5.6-sol` medium, intentionally retained through the 20-round cap) | round number, reviewed SHA == bound HEAD, exactly one review comment on this PR with the `# AI Code Review — Round N` heading and the `ai-review-result` marker matching round/SHA/flag, findings invariant; then controller policy: an eligible replan (including workflow stagnation or the cap) enters `REPLAN_REEXECUTE`; an exhausted replan limit or no eligible replan blocks. Entering `REVIEW` past the cap (stale re-review, HEAD drift, resume) is refused before the reviewer runs |
 | `FIX` | Claude Code (`fable`, effort high) | `previous_head_sha` == current HEAD, every open finding ID resolved (`fixed` / `follow_up_created` / `no_change_with_rationale`), follow-up issues exist in this repo and are OPEN, actual PR HEAD == `new_head_sha`, a `fixed` resolution moved HEAD |
-| `REPLAN_REEXECUTE` | OpenCode (`replan_reexecute`, default `openai/gpt-5.6-terra`, effort high) | Before invocation, durable state captures historical findings and the verified default branch. The replacement must be a distinct OPEN issue-linked PR, on a distinct branch, based on that default branch and at its claimed HEAD. Only then does the controller close the old PR without merge and reset the replacement lifecycle so its next review is round 1. |
+| `REPLAN_REEXECUTE` | OpenCode (`replan_reexecute`, default `openai/gpt-5.6-terra`, effort high) | Before invocation, durable state captures historical findings and the verified default branch; a round whose findings could not be persisted in full refuses the replan and keeps the old PR. The replacement must be a distinct OPEN issue-linked PR, on a distinct branch, based on that default branch and at its claimed HEAD, and must still be exactly that PR when it is re-read immediately before the old PR is closed. Only then does the controller close the old PR without merge and reset the replacement lifecycle so its next review is round 1. |
 | `READY_FOR_MERGE` | nobody | holding state; `step`/`resume` refuse to continue unless the merge gate is open (`resume` only re-prints the banner). With the gate open (`step --allow-merge` / `resume --allow-merge`) it runs the full pre-merge verification below against GitHub *before* entering `MERGE`: closed / conflicting / failing / draft / queued PRs go to `BLOCKED` without ever reaching `MERGE`, HEAD drift -> `REVIEW`, an already-merged PR -> `MERGE` to reconcile; inconclusive data (checks running, mergeability unknown, GitHub unreachable / transient read failure) keeps the phase for `resume --allow-merge`, at most `merge.max_verification_attempts` times, then `BLOCKED`; a read that fails conclusively (bad credentials, permissions, unresolvable PR) -> `BLOCKED` at once |
 | `MERGE` (gated) | controller, never an agent | last review clean and PR HEAD == reviewed HEAD; GitHub says PR is OPEN, not draft, every check succeeded, `mergeable=MERGEABLE`, `mergeStateStatus` `CLEAN`/`HAS_HOOKS`, no auto-merge armed, base branch has no merge queue; then `gh pr merge --<method> --match-head-commit <reviewed HEAD>`; counted only once GitHub reports `MERGED` at that HEAD. Conclusive negatives and conclusive read failures (bad credentials, permissions) -> `BLOCKED`; inconclusive data (checks running, mergeability unknown, transient read failure, post-merge re-read failed) stays in `MERGE` for `resume --allow-merge`, at most `merge.max_verification_attempts` times, then `BLOCKED`; HEAD drift -> `REVIEW` |
 | `UPDATE_EPIC` | OpenCode (`update_epic` profile) | `next_issue_url` gets the `INITIALIZING` checks before the controller switches issues: parses as an issue URL of this repo (a foreign URL is never even queried), is neither the EPIC nor the just-finished issue (compared case-insensitively by repository + number, never by URL string), exists on GitHub and is OPEN. A rejected selection, or a transient GitHub failure while checking it, keeps the phase and `resume` asks the agent once more with the reason in its prompt; a second rejection -> `BLOCKED`. A conclusive GitHub failure (authentication, permissions, malformed data) -> `BLOCKED` immediately, without invoking the agent again. Only a verified issue reaches `ANALYZE_EXECUTE`; `null` -> `DONE` |
@@ -274,7 +278,11 @@ resolutions), `step_count` (cumulative for the run, never reset), `attempt`
 and `block_reason`. It also records `execution_attempt` (initial implementation
 is 1), `escalation_count` (completed replans), `superseded_prs`, and a durable
 `replan_progress` checkpoint. State keeps compact finding summaries and review
-comment URLs, rather than copying unbounded PR discussion bodies.
+comment URLs, rather than copying unbounded PR discussion bodies. Those
+summaries are bounded (100 findings per round, 2000 characters per required
+resolution); a round that hits either bound is marked `evidence_truncated`, and
+because superseding a PR deletes the controller's only record of its findings,
+such a round makes the replan policy block for a human instead.
 Relevant controller verification failures are retained as a bounded per-issue
 list and supplied to the replan prompt; all PR comment text remains GitHub
 audit data rather than state payload.

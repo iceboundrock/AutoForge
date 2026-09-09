@@ -96,11 +96,12 @@ from .loop_guard import (
     round_cap_reason,
     stagnation_reason,
     step_budget_reason,
+    truncated_evidence_rounds,
 )
 from .profiles import profile_for_phase
 from .prompts import TEMPLATE_FILES, load_template, render, render_phase
 from .providers import AgentExecutionResult, AgentRequest, ProviderRegistry
-from .replan import HistoricalReviewCollector, evaluate_replan_policy
+from .replan import HistoricalReviewCollector, ReplanDecision, evaluate_replan_policy
 from .result_parser import (
     AnalyzeExecuteResult,
     FixResult,
@@ -708,7 +709,9 @@ class ControllerEngine:
             recovered = self._recover_replan()
             if recovered is not None:
                 return recovered
-            self._prepare_replan()
+            prepared = self._prepare_replan()
+            if prepared is not None:
+                return prepared
 
         payload = self._invoke_phase(previous)
         status = payload.get("status")
@@ -1366,11 +1369,28 @@ class ControllerEngine:
         state.current_head_sha = pr.head_sha
         self._save()
 
-    def _prepare_replan(self) -> None:
-        """Checkpoint all evidence before an agent can create a replacement PR."""
+    def _prepare_replan(self) -> StepOutcome | None:
+        """Checkpoint all evidence before an agent can create a replacement PR.
+
+        Returns a BLOCKED outcome instead of a checkpoint when the persisted
+        review evidence is incomplete. ``evaluate_replan_policy`` already
+        refuses that case, but this phase is also reachable by ``resume``, and
+        the checkpoint is the last point before an agent may open a
+        replacement: the guard is repeated where the loss would become
+        irreversible.
+        """
         state = self._require_state()
         if state.replan_progress.get("stage"):
-            return
+            return None
+        truncated = truncated_evidence_rounds(state.review_history)
+        if truncated:
+            return self._block_replan_recovery(
+                "cannot safely REPLAN_REEXECUTE: the persisted findings of review round(s) "
+                f"{', '.join(str(r) for r in truncated)} are an incomplete copy of the review, "
+                "so the replacement could not be required to consider every actionable "
+                f"finding. PR {state.current_pr_url or '(none)'} stays open with its findings "
+                "for a human."
+            )
         escalation = state.replan_progress.get("escalation", {})
         previous = self._require_open_pr()
         repo = self.github.get_repo(state.repository)
@@ -1394,6 +1414,7 @@ class ControllerEngine:
             "historical_verification_failures": history.render_verification_failures(),
         }
         self._save()
+        return None
 
     def _verify_replacement_pr(self, pr: PRInfo, progress: dict, expected_head: str = "") -> None:
         """Verify objective fresh-implementation facts independently of agent output."""
@@ -1500,12 +1521,53 @@ class ControllerEngine:
         self._save()
         return self._outcome(Phase.REPLAN_REEXECUTE, message=reason)
 
+    def _revalidate_replacement(self, progress: dict) -> str:
+        """Re-read the checkpointed replacement; a reason means "do not supersede".
+
+        The checkpoint that authorises closing the old PR can be minutes (a
+        crash and a ``resume``) older than the close itself. GitHub is the
+        source of truth, so the replacement is read again here — immediately
+        before the irreversible write — and must still be the exact PR that was
+        verified: open, in this repository, linked to the issue, based on the
+        verified default branch, on the checkpointed branch, and at the
+        checkpointed HEAD SHA. A transient GitHub failure is raised, not
+        returned: the answer is unknown, so the run resumes rather than blocks.
+        """
+        url = str(progress["replacement_pr_url"])
+        try:
+            replacement = self.github.get_pr(url)
+        except GitHubUnavailableError:
+            raise
+        except GitHubError as exc:
+            return f"replacement PR {url} could not be re-read: {exc}"
+        try:
+            self._verify_replacement_pr(
+                replacement, progress, str(progress.get("replacement_head_sha", ""))
+            )
+        except VerificationError as exc:
+            return f"replacement PR {url} no longer matches its verified checkpoint: {exc}"
+        expected_branch = str(progress.get("replacement_branch", ""))
+        if replacement.head_ref != expected_branch:
+            return (
+                f"replacement PR {url} moved from the checkpointed branch "
+                f"{expected_branch!r} to {replacement.head_ref!r}"
+            )
+        return ""
+
     def _finish_replan(self, recovered: bool = False) -> StepOutcome:
         """Close the old PR, then atomically activate the verified replacement."""
         state = self._require_state()
         progress = state.replan_progress
         old_url = str(progress["previous_pr_url"])
         replacement_url = str(progress["replacement_pr_url"])
+        if progress.get("stage") != "old_pr_superseded":
+            # The old PR is still open, so the superseding write is still ahead.
+            drift = self._revalidate_replacement(progress)
+            if drift:
+                return self._block_replan_recovery(
+                    f"refusing to supersede {old_url}: {drift}. The old PR stays open with "
+                    "its findings; nothing was closed or merged."
+                )
         try:
             old = self.github.get_pr(old_url)
         except GitHubError as exc:
@@ -1835,8 +1897,7 @@ class ControllerEngine:
             )
             if decision.action == "block_for_human":
                 return Phase.BLOCKED, self._loop_block_reason(
-                    "Automatic reimplementation limit reached (replan_limit_exceeded). "
-                    "Human intervention is required"
+                    self._replan_refusal(decision) + ". Human intervention is required"
                 )
             if decision.action == "replan":
                 state.replan_progress = {
@@ -1862,6 +1923,21 @@ class ControllerEngine:
             f"review round {res.round} clean for HEAD {expected_head[:12]}; "
             "REVIEW -> READY_FOR_MERGE"
         )
+
+    @staticmethod
+    def _replan_refusal(decision: ReplanDecision) -> str:
+        """Human-readable text for a ``block_for_human`` replan decision."""
+        if decision.reason == "replan_evidence_truncated":
+            listed = (decision.metadata or {}).get("truncated_evidence_rounds")
+            rounds = ", ".join(str(r) for r in listed) if isinstance(listed, list) else ""
+            return (
+                "Automatic reimplementation is refused (replan_evidence_truncated): the "
+                f"persisted findings of review round(s) {rounds or '(unknown)'} are an "
+                "incomplete copy of the review, so a replacement could never be required "
+                "to consider every actionable finding. The PR is kept so its findings are "
+                "not lost"
+            )
+        return f"Automatic reimplementation limit reached ({decision.reason})"
 
     def _record_review(self, round: int, head: str, result: str, findings: list[dict]) -> None:
         """Append the completed round to ``review_history`` (bounded per PR)."""
@@ -2046,6 +2122,10 @@ class ControllerEngine:
         # than invoke the agent again.
         self._save()
         outcome = self._finish_replan()
+        if state.phase == Phase.BLOCKED:
+            # `_finish_replan` refused to supersede the old PR (see
+            # `_revalidate_replacement`) and already persisted BLOCKED.
+            return Phase.BLOCKED, outcome.message
         return Phase.REVIEW, outcome.message
 
     def _reject_next_issue(self, reason: str, *, cause: BaseException) -> tuple[Phase, str]:
