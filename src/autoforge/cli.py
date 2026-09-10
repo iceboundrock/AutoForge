@@ -300,11 +300,17 @@ def _finish(engine: ControllerEngine, outcomes: list[StepOutcome], allow_merge: 
     return 0
 
 
-def _existing_run_guard(paths: StatePaths, force: bool) -> tuple[int | None, bool]:
+def _existing_run_guard(
+    paths: StatePaths, force: bool, command: str = "run"
+) -> tuple[int | None, bool]:
     """Decide whether a fresh run may overwrite ``paths.state_file``.
 
     Returns ``(exit_code_or_None, corrupt)``. Must be called with the
     controller lock held: a verdict taken before the lock could go stale.
+
+    ``command`` is the subcommand the operator actually typed, so the advice
+    names a command that can be copied (`run --force`, `local run --force`)
+    rather than a bare flag.
     """
     # lexists, not exists: a dangling state.json symlink is still an entry
     # that a fresh save would silently replace.
@@ -319,7 +325,7 @@ def _existing_run_guard(paths: StatePaths, force: bool) -> tuple[int | None, boo
             print(
                 f"autoforge: error: {exc}\n"
                 "autoforge: error: refusing to start a new run over an unreadable "
-                "state file — repair it, or use '--force' to move it aside as "
+                f"state file — repair it, or use '{command} --force' to move it aside as "
                 f"{paths.state_file.name}.corrupt-<timestamp> and start over",
                 file=sys.stderr,
             )
@@ -329,7 +335,7 @@ def _existing_run_guard(paths: StatePaths, force: bool) -> tuple[int | None, boo
         print(
             f"autoforge: error: existing run {existing.run_id} "
             f"in phase {existing.phase.value} — use 'resume' to continue "
-            "or '--force' to discard it",
+            f"or '{command} --force' to discard it",
             file=sys.stderr,
         )
         return 2, False
@@ -417,7 +423,7 @@ def cmd_local_run(args) -> int:
     # One continuous lock over inspect -> decide -> first save -> execute,
     # for the same reasons as `cmd_run`.
     with engine.locked():
-        rc, corrupt = _existing_run_guard(paths, args.force)
+        rc, corrupt = _existing_run_guard(paths, args.force, "local run")
         if rc is not None:
             return rc
         engine.new_local_run(args.feature, allow_dirty=args.allow_dirty)

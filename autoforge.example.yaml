@@ -224,6 +224,10 @@ local:
   # then DONE if clean, BLOCKED if findings remain (two review passes, one fix
   # pass). 0 means a single review pass, where any finding blocks. This is
   # deliberately not the 20-round remote loop.
+  #
+  # Local review rounds are routed to profiles exactly like remote ones, so a
+  # bound of 5 or more also makes `review_round_6_plus` reachable and therefore
+  # required (checked by `local doctor` and at the start of `local run`).
   max_fix_rounds: 1
 
   # Controller-owned validation, run by AutoForge (not by an agent) after

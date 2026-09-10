@@ -21,9 +21,12 @@ from pathlib import Path
 from .config import AutoForgeConfig, load_config_file, validate_required_profiles
 from .errors import ConfigurationError
 from .executor import ExecutionRequest, ExecutionResult, execute
+from .profiles import local_required_profiles
 from .validation import parse_remote_repository
 
 Runner = Callable[[ExecutionRequest], ExecutionResult]
+# A fixed list of required profile names, or a function of the loaded config.
+RequiredProfiles = list[str] | Callable[[AutoForgeConfig], list[str]]
 
 REQUIRED_PROFILES = [
     "analyze_execute",
@@ -31,15 +34,6 @@ REQUIRED_PROFILES = [
     "review_round_1",
     "review_round_2_5",
     "review_round_6_plus",
-]
-
-# A local run never reaches the round 6+ reviewer (its review bound is small),
-# never replans and never updates an EPIC.
-LOCAL_REQUIRED_PROFILES = [
-    "analyze_execute",
-    "fix",
-    "review_round_1",
-    "review_round_2_5",
 ]
 
 
@@ -92,10 +86,18 @@ class Doctor:
         return CheckResult(name, ok, detail)
 
     # -- checks --------------------------------------------------------------------
-    def check_config(self, required_profiles: list[str] | None = None) -> CheckResult:
+    def check_config(self, required_profiles: RequiredProfiles | None = None) -> CheckResult:
+        """Load the config and require its profiles.
+
+        ``required_profiles`` may be a fixed list or a callable, because a
+        LOCAL run's required reviewer profiles are derived from the config that
+        is only loaded here (see :func:`autoforge.profiles.local_required_profiles`).
+        """
         try:
             self.config = load_config_file(self.config_path)
-            validate_required_profiles(self.config, required_profiles or REQUIRED_PROFILES)
+            required = required_profiles or REQUIRED_PROFILES
+            names = required(self.config) if callable(required) else required
+            validate_required_profiles(self.config, names)
         except ConfigurationError as exc:
             return CheckResult("config", False, str(exc))
         src = self.config_path or "(built-in defaults)"
@@ -168,7 +170,12 @@ class Doctor:
         makes zero GitHub calls, so requiring any of them here would be a
         false failure on exactly the machine local mode exists for.
         """
-        results = [self.check_config(LOCAL_REQUIRED_PROFILES)]
+        # Which reviewer profiles a local run needs depends on its configured
+        # review bound, so the requirement is derived from the loaded config
+        # rather than from a fixed list (`local_required_profiles`). `doctor`
+        # therefore fails on a missing `review_round_6_plus` exactly when a run
+        # with this `local.max_fix_rounds` could actually ask for it.
+        results = [self.check_config(local_required_profiles)]
         cfg = self.config
         claude_cmd, opencode_cmd = self._agent_commands(cfg)
         results.append(self._version_check("git available", ["git", "--version"]))

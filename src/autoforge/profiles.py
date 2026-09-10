@@ -27,6 +27,33 @@ def review_profile_name(round: int) -> str:
     return REVIEW_ROUND_6_PLUS
 
 
+# Profiles every LOCAL run needs whatever its review bound is. The reviewer
+# profiles are not listed here: which of them a local run can reach depends on
+# `local.max_fix_rounds` (see `local_required_profiles`).
+LOCAL_BASE_PROFILES = ["analyze_execute", "fix"]
+
+
+def local_required_profiles(cfg: AutoForgeConfig) -> list[str]:
+    """Profiles a LOCAL run can actually reach, given its configured bound.
+
+    A local run never replans and never updates an EPIC, so those profiles are
+    not required. Its reviewer profiles, however, follow exactly the same round
+    routing as remote: with ``local.max_fix_rounds >= 5`` a local run can
+    complete review round 6 and will ask for ``review_round_6_plus``. Deriving
+    the requirement from the configured bound keeps a missing reviewer profile
+    a config-time failure instead of one discovered five fix rounds into a run.
+
+    The inverse also holds: with ``max_fix_rounds == 0`` only round 1 is
+    reachable, so ``review_round_2_5`` is not required.
+    """
+    names = list(LOCAL_BASE_PROFILES)
+    for round in range(1, cfg.local.max_review_rounds + 1):
+        name = review_profile_name(round)
+        if name not in names:
+            names.append(name)
+    return names
+
+
 def profile_for_phase(cfg: AutoForgeConfig, phase: Phase, review_round: int = 0) -> ProfileConfig:
     """Select the execution profile for a phase (REVIEW uses round routing)."""
     if phase == Phase.REVIEW:

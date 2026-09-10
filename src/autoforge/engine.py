@@ -110,7 +110,7 @@ from .loop_guard import (
     step_budget_reason,
     truncated_evidence_rounds,
 )
-from .profiles import profile_for_phase
+from .profiles import local_required_profiles, profile_for_phase
 from .prompts import (
     COMMON_TEMPLATE,
     LOCAL_COMMON_TEMPLATE,
@@ -120,6 +120,7 @@ from .prompts import (
     render_phase,
 )
 from .providers import AgentExecutionResult, AgentRequest, ProviderRegistry
+from .redaction import redact, redact_argv
 from .replan import HistoricalReviewCollector, ReplanDecision, evaluate_replan_policy
 from .replan_txn import (
     Disposition,
@@ -206,13 +207,6 @@ def generate_run_id() -> str:
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     return f"af-{stamp}-{secrets.token_hex(3)}"
 
-
-LOCAL_REQUIRED_PROFILES = [
-    "analyze_execute",
-    "fix",
-    "review_round_1",
-    "review_round_2_5",
-]
 
 # A local run never creates a PR or an Issue, so a phase whose only purpose
 # is a GitHub side effect has no local template at all.
@@ -431,6 +425,17 @@ class ControllerEngine:
         assert self.state is not None
         save_state(self.state, self.paths.state_file)
 
+    def _record_verification_failure(self, phase: Phase, exc: VerificationError) -> None:
+        """Persist a failed verification attempt (bounded, redacted).
+
+        The message can quote untrusted text — a validation command's output,
+        a PR body — and `state.json` is stored in the clear, so it passes
+        through `redact` before it is persisted.
+        """
+        state = self._require_state()
+        state.verification_failures.append(redact(f"{phase.value}: {exc}"))
+        state.verification_failures = state.verification_failures[-20:]
+
     def _logger(self) -> RunLogger:
         state = self._require_state()
         return RunLogger(self.paths.logs_dir, state.run_id)
@@ -439,9 +444,15 @@ class ControllerEngine:
         """Fail early (ConfigurationError) when a required profile is unusable.
 
         A LOCAL run never enters REPLAN_REEXECUTE or UPDATE_EPIC, so it does
-        not require those profiles to be configured.
+        not require those profiles to be configured. Which reviewer profiles it
+        does require follows from `local.max_fix_rounds`, because local review
+        rounds are routed exactly like remote ones.
         """
-        required = LOCAL_REQUIRED_PROFILES if self.mode == WorkflowMode.LOCAL else REQUIRED_PROFILES
+        required = (
+            local_required_profiles(self.config)
+            if self.mode == WorkflowMode.LOCAL
+            else REQUIRED_PROFILES
+        )
         validate_required_profiles(self.config, required)
 
     # -- prompt context ---------------------------------------------------
@@ -1066,8 +1077,7 @@ class ControllerEngine:
             # verify. Persist the attempt so `resume` re-enters this phase from
             # real state instead of pretending nothing happened.
             if isinstance(exc, VerificationError) and previous in (Phase.REVIEW, Phase.FIX):
-                state.verification_failures.append(f"{previous.value}: {exc}")
-                state.verification_failures = state.verification_failures[-20:]
+                self._record_verification_failure(previous, exc)
             self._save()
             raise
         if nxt_phase == Phase.BLOCKED:
@@ -1143,8 +1153,7 @@ class ControllerEngine:
             # claims did not verify. Persist the attempt so `resume` re-enters
             # this phase from the real state of the tree.
             if isinstance(exc, VerificationError):
-                state.verification_failures.append(f"{previous.value}: {exc}")
-                state.verification_failures = state.verification_failures[-20:]
+                self._record_verification_failure(previous, exc)
             self._save()
             raise
         if nxt_phase == Phase.BLOCKED:
@@ -1387,15 +1396,21 @@ class ControllerEngine:
                     else f"exit {result.exit_code}"
                 )
             logger.log_execution(record, "", result.stdout or "", result.stderr or "")
+            # Both the command line and its output can carry a secret into
+            # `state.verification_failures` (plain `state.json`) through the
+            # raised message, so both are redacted here and not only on the
+            # run-log path. Baseline protection: `redaction` claims no
+            # completeness.
+            shown = " ".join(redact_argv(list(argv)))
             if result.timed_out:
                 raise VerificationError(
-                    f"validation command {' '.join(argv)!r} timed out after "
+                    f"validation command {shown!r} timed out after "
                     f"{req.timeout_seconds}s; {phase.value} is not verified."
                 )
             if result.exit_code != 0:
-                tail = (result.stderr or result.stdout or "").strip()[-2000:]
+                tail = redact((result.stderr or result.stdout or "").strip())[-2000:]
                 raise VerificationError(
-                    f"validation command {' '.join(argv)!r} failed with exit "
+                    f"validation command {shown!r} failed with exit "
                     f"{result.exit_code}; {phase.value} is not verified and the run stays in "
                     f"{phase.value}. Output tail: {tail}"
                 )

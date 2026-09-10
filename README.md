@@ -433,6 +433,10 @@ findings remain. Configure it with `local.max_fix_rounds` (0 means a single
 review pass, and any finding blocks). A blocked local run leaves every change
 in your working tree, untouched, for you to inspect.
 
+Review rounds are routed to profiles exactly as in remote mode, so a bound of
+five or more fix rounds reaches `review_round_6_plus`; that profile is then
+required by `local doctor` and at the start of the run.
+
 ### Validation commands
 
 Optional, controller-owned and controller-run — argv arrays, never shell
@@ -656,9 +660,13 @@ parser), TOML (stdlib), and JSON (stdlib) are accepted.
 
 The `local:` block configures [local mode](#local-mode-no-github) —
 `feature_dir`, `max_fix_rounds` and the argv-array `validation_commands`. A
-local run uses the `analyze_execute`, `fix`, `review_round_1` and
-`review_round_2_5` profiles; `review_round_6_plus`, `replan_reexecute` and
-`update_epic` belong to the remote lifecycle only.
+local run needs only the profiles its configured bound can reach: with the
+default `max_fix_rounds: 1` that is `analyze_execute`, `fix`, `review_round_1`
+and `review_round_2_5`. Local review rounds are routed exactly like remote
+ones, so `max_fix_rounds: 5` or more also requires `review_round_6_plus` —
+`local doctor` and the start of a `local run` check that, rather than leaving
+it to fail five fix rounds in. `replan_reexecute` and `update_epic` belong to
+the remote lifecycle only.
 
 ## Development
 

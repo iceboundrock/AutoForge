@@ -715,3 +715,139 @@ def test_cli_local_run_refuses_a_dirty_tree(tmp_path, monkeypatch, capsys):
     touch_impl(root, "unrelated\n")
     assert main(["local", "run", "features/add-filter.md", "--dry-run"]) == 2
     assert "--allow-dirty" in capsys.readouterr().err
+
+
+# -- required profiles ---------------------------------------------------------------------------
+def test_local_required_profiles_follow_the_configured_review_bound(tmp_path):
+    """A reachable reviewer profile is required at config time, not at round 6.
+
+    Local review rounds are routed exactly like remote ones, so a large
+    `local.max_fix_rounds` reaches `review_round_6_plus`. Requiring a fixed
+    list would turn a missing profile into a `ConfigurationError` raised five
+    fix rounds into a run (PR #44, O1).
+    """
+    from autoforge.profiles import local_required_profiles
+
+    cfg = default_config()
+    cfg.local.max_fix_rounds = 1
+    assert local_required_profiles(cfg) == [
+        "analyze_execute",
+        "fix",
+        "review_round_1",
+        "review_round_2_5",
+    ]
+    # 0 fix rounds: only the first review pass is reachable.
+    cfg.local.max_fix_rounds = 0
+    assert local_required_profiles(cfg) == ["analyze_execute", "fix", "review_round_1"]
+    # 5 fix rounds == 6 review passes: the round 6+ reviewer becomes reachable.
+    cfg.local.max_fix_rounds = 5
+    assert local_required_profiles(cfg) == [
+        "analyze_execute",
+        "fix",
+        "review_round_1",
+        "review_round_2_5",
+        "review_round_6_plus",
+    ]
+    # Never the phases a local run cannot enter.
+    assert "replan_reexecute" not in local_required_profiles(cfg)
+    assert "update_epic" not in local_required_profiles(cfg)
+
+
+def test_a_reachable_reviewer_profile_is_validated_before_the_run_starts(tmp_path):
+    root = local_repo(tmp_path)
+    cfg = default_config()
+    cfg.local.max_fix_rounds = 5
+    del cfg.profiles["review_round_6_plus"]
+
+    # `local run` validates right after creating the run, before any agent.
+    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root, cfg=cfg)
+    assert eng.mode == WorkflowMode.LOCAL
+    with pytest.raises(ConfigurationError, match="review_round_6_plus"):
+        eng.validate_config()
+    # ... and the same config is fine while that round stays unreachable.
+    cfg.local.max_fix_rounds = 1
+    eng.validate_config()
+
+
+def test_local_doctor_requires_only_the_reachable_reviewer_profiles(tmp_path):
+    """`local doctor` applies the same derived requirement (PR #44, O1)."""
+    from autoforge.profiles import local_required_profiles
+
+    root = local_repo(tmp_path)
+    cfg_path = root / "cfg.json"
+
+    def doctor_for(max_fix_rounds: int) -> Doctor:
+        # A profile cannot be deleted by a config file, but an unusable one
+        # (empty model) fails `validate_profile` the same way a missing one does.
+        cfg_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "local": {"max_fix_rounds": max_fix_rounds},
+                    "profiles": {"review_round_6_plus": {"model": ""}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        return Doctor(cwd=str(root), config_path=str(cfg_path), state_dir=str(root / ".autoforge"))
+
+    broken = doctor_for(5).check_config(local_required_profiles)
+    assert not broken.ok and "review_round_6_plus" in broken.detail
+    # Unreachable at the default bound: not required, so not a failure.
+    assert doctor_for(1).check_config(local_required_profiles).ok
+
+
+# -- secret redaction ----------------------------------------------------------------------------
+def test_failing_validation_output_is_redacted_before_it_is_persisted(tmp_path):
+    """A project's own test output can print a token; `state.json` is cleartext.
+
+    PR #44, O2: the output tail of a failed validation command reaches
+    `state.verification_failures`, so it passes through `redact` first.
+    """
+    import sys
+
+    root = local_repo(tmp_path)
+    cfg = default_config()
+    secret = "ghp_" + "A" * 36
+    cfg.local.validation_commands = [
+        [sys.executable, "-c", f"import sys; print('GITHUB_TOKEN={secret}'); sys.exit(1)"]
+    ]
+    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root, cfg=cfg)
+    eng.provider._handler = scripted(
+        eng, root, [(lambda r: touch_impl(r, "v1\n"), lambda e: impl_result())]
+    )
+    with pytest.raises(VerificationError) as excinfo:
+        eng.run(max_steps=3)
+    assert secret not in str(excinfo.value)
+    assert "***REDACTED***" in str(excinfo.value)
+
+    # ANALYZE_EXECUTE failures are not persisted, but the same tail reaching
+    # state via a FIX failure must be redacted too: assert on the recorder.
+    eng.state.verification_failures = []
+    eng._record_verification_failure(Phase.FIX, VerificationError(f"tail: GITHUB_TOKEN={secret}"))
+    eng._save()
+    raw = (root / ".autoforge" / "state.json").read_text(encoding="utf-8")
+    assert secret not in raw
+    assert "***REDACTED***" in raw
+
+
+# -- CLI guard wording ---------------------------------------------------------------------------
+def test_the_existing_run_guard_names_the_subcommand_that_was_typed(tmp_path, monkeypatch, capsys):
+    """The advice must be copy-pasteable for the command in hand (PR #44, O4)."""
+    from autoforge.cli import _existing_run_guard
+
+    root = local_repo(tmp_path)
+    monkeypatch.chdir(root)
+    paths = StatePaths.from_state_dir(root / ".autoforge")
+    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root)
+    save_state(eng.state, paths.state_file)
+
+    assert _existing_run_guard(paths, force=False, command="local run") == (2, False)
+    assert "'local run --force' to discard it" in capsys.readouterr().err
+    # The remote wording is the pre-existing one, unchanged.
+    assert _existing_run_guard(paths, force=False) == (2, False)
+    assert "'run --force' to discard it" in capsys.readouterr().err
+
+    paths.state_file.write_text('{"phase": "REVIEW", "run_id": ', encoding="utf-8")
+    assert _existing_run_guard(paths, force=False, command="local run") == (2, False)
+    assert "'local run --force' to move it aside" in capsys.readouterr().err
