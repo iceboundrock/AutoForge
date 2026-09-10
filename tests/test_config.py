@@ -402,6 +402,22 @@ def test_empty_protected_merge_paths_disables_the_gate(tmp_path):
     assert not safety.protects(".github/workflows/ci.yml")
 
 
+def test_null_protected_merge_paths_is_a_configuration_error(tmp_path):
+    """`[]` is the deliberate opt-out; a value that went missing must not become one."""
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps({"version": 1, "safety": {"protected_merge_paths": None}}), "utf-8")
+    with pytest.raises(ConfigurationError, match="protected_merge_paths is null"):
+        load_config_file(p)
+
+
+def test_a_yaml_key_left_empty_does_not_disable_the_gate(tmp_path):
+    """The shape a hand-edited config actually takes: the key with no value."""
+    p = tmp_path / "cfg.yaml"
+    p.write_text("version: 1\nsafety:\n  protected_merge_paths:\n  allow_merge: true\n", "utf-8")
+    with pytest.raises(ConfigurationError, match="protected_merge_paths is null"):
+        load_config_file(p)
+
+
 @pytest.mark.parametrize(
     "value",
     [".github/workflows/", 5, [".github/workflows/", 7], ["  "]],

@@ -422,7 +422,8 @@ audit data rather than state payload.
   rename count, so moving a protected file *out* of the protected range is
   refused like an edit to it. A changed-file listing GitHub may have
   truncated is refused too — a short listing cannot prove a protected path
-  was left alone. Setting the list to `[]` disables the gate.
+  was left alone. Setting the list to `[]` disables the gate; leaving the
+  key empty (`null`) is a configuration error rather than a silent opt-out.
   What this gates is the *definition* of the checks, not the
   trustworthiness of a green run: the commands still execute the PR's own
   code, so a PR can weaken what its tests assert without touching a

@@ -340,9 +340,20 @@ def _as_options(raw: object, source: str, name: str) -> dict[str, str]:
 
 
 def _as_str_list(raw: object, source: str, key: str) -> list[str]:
-    """A list of non-empty strings -- never a bare string silently split."""
+    """A list of non-empty strings -- never a bare string silently split.
+
+    An explicit ``null`` is rejected rather than read as ``[]``. The empty
+    list is a deliberate opt-out (for ``safety.protected_merge_paths`` it
+    turns the merge gate off), and a key whose value went missing -- a
+    hand-edited config, a generator emitting nothing, a list the YAML subset
+    parser could not read -- must not be able to disable a safety gate by
+    looking like one.
+    """
     if raw is None:
-        return []
+        raise ConfigurationError(
+            f"{source}: {key} is null; write [] to set it empty deliberately, "
+            "or remove the key to keep the default"
+        )
     if isinstance(raw, str) or not isinstance(raw, list):
         raise ConfigurationError(f"{source}: {key} must be a list of strings, got {raw!r}")
     out: list[str] = []
