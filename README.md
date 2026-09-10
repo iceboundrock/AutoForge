@@ -456,8 +456,19 @@ parser), TOML (stdlib), and JSON (stdlib) are accepted.
 make sync       # uv sync (.venv + dev tools)
 make test       # uv run pytest
 make lint       # uv run ruff check src tests
+make fmt        # uv run ruff format src tests
+make fmt-check  # uv run ruff format --check src tests
 make typecheck  # uv run mypy src
+make check      # everything CI runs
 ```
+
+The same four checks run hosted on every pull request and every push to
+`main` (`.github/workflows/ci.yml`): `pytest` on Python 3.11 and 3.12, and
+`ruff check` / `ruff format --check` / `mypy` once. The workflow needs no
+secrets and is granted none. Its aggregate `ci` job is the stable name to
+mark required in branch protection — that is what gives the controller's
+pre-merge gate ("every check on the PR succeeded") something real to verify
+instead of a vacuously green PR.
 
 Tests never call real Claude Code, OpenCode or GitHub write APIs. Agents are
 replaced by a `ScriptedProvider` and GitHub by an in-memory fake; the

@@ -1,0 +1,81 @@
+# Hosted verification for the AutoForge controller.
+#
+# This exists so the controller's own MERGE gate has something real to
+# verify. `READY_FOR_MERGE` / `MERGE` require every check on the PR to have
+# succeeded; with no hosted checks configured that condition is vacuously
+# true. Running the suite here turns "tests passed" from an agent claim into
+# GitHub state, which is what the source-of-truth rule asks for.
+#
+# No secrets are needed and none are granted: the tests use scripted
+# providers and an in-memory GitHub fake, and never invoke `gh`, Claude Code
+# or OpenCode for real.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The project floor (`requires-python = ">=3.11"`) and the next
+        # release. tests/test_ci_workflow.py asserts the floor stays covered.
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          # Sets UV_PYTHON, which takes precedence over the repo's
+          # .python-version pin.
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+      # --locked: install exactly uv.lock and fail if it is stale relative
+      # to pyproject.toml, rather than silently re-resolving in CI.
+      - run: uv sync --locked --group dev
+      - run: uv run pytest
+
+  static:
+    # Lint, format and type checks are interpreter-independent (mypy is
+    # pinned to python_version = "3.11" in pyproject.toml), so they run once
+    # rather than per matrix entry.
+    name: lint + format + types
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          python-version: "3.11"
+          enable-cache: true
+      - run: uv sync --locked --group dev
+      - run: uv run ruff check src tests
+      - run: uv run ruff format --check src tests
+      - run: uv run mypy src
+
+  ci:
+    # One stable check name to mark required in branch protection, so adding
+    # or renaming a matrix entry does not silently drop the requirement.
+    # `skipped` and `cancelled` count as failures here: the controller treats
+    # a SKIPPED check run as passing, so this job must never skip its way to
+    # green.
+    name: ci
+    needs: [test, static]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every job to have succeeded
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
+        run: |
+          echo "test=${{ needs.test.result }} static=${{ needs.static.result }}"
+          exit 1

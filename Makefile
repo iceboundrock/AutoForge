@@ -1,4 +1,4 @@
-.PHONY: test lint typecheck fmt sync lock
+.PHONY: test lint typecheck fmt fmt-check check sync lock
 
 sync:
 	uv sync
@@ -17,3 +17,9 @@ typecheck:
 
 fmt:
 	uv run ruff format src tests
+
+fmt-check:
+	uv run ruff format --check src tests
+
+# Everything the hosted CI workflow runs.
+check: test lint fmt-check typecheck
