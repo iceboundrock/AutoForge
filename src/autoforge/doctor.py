@@ -3,6 +3,11 @@
 Every check is non-destructive: version queries, `gh auth status`,
 `git rev-parse`, reading the config, and creating/removing one temp file in
 the state directory to prove it is writable.
+
+``autoforge local doctor`` runs the LOCAL subset: no `gh`, no `gh auth
+status`, no `origin` remote. A machine with no GitHub CLI and no GitHub
+credentials must pass it, so the checks it omits are omitted entirely rather
+than reported as warnings.
 """
 
 from __future__ import annotations
@@ -26,6 +31,15 @@ REQUIRED_PROFILES = [
     "review_round_1",
     "review_round_2_5",
     "review_round_6_plus",
+]
+
+# A local run never reaches the round 6+ reviewer (its review bound is small),
+# never replans and never updates an EPIC.
+LOCAL_REQUIRED_PROFILES = [
+    "analyze_execute",
+    "fix",
+    "review_round_1",
+    "review_round_2_5",
 ]
 
 
@@ -78,10 +92,10 @@ class Doctor:
         return CheckResult(name, ok, detail)
 
     # -- checks --------------------------------------------------------------------
-    def check_config(self) -> CheckResult:
+    def check_config(self, required_profiles: list[str] | None = None) -> CheckResult:
         try:
             self.config = load_config_file(self.config_path)
-            validate_required_profiles(self.config, REQUIRED_PROFILES)
+            validate_required_profiles(self.config, required_profiles or REQUIRED_PROFILES)
         except ConfigurationError as exc:
             return CheckResult("config", False, str(exc))
         src = self.config_path or "(built-in defaults)"
@@ -121,18 +135,70 @@ class Doctor:
         ok, detail = self._run([gh, "auth", "status"])
         return CheckResult("gh authenticated", ok, detail)
 
-    def run_all(self) -> list[CheckResult]:
-        results = [self.check_config()]
+    def check_feature_spec(self, spec_path: str) -> CheckResult:
+        """Validate a feature specification path the way `local run` would."""
+        from .local_workspace import LocalWorkspace, read_feature_spec
+
+        name = "feature specification"
         cfg = self.config
-        gh = cfg.github.command if cfg else "gh"
-        claude_cmd = "claude"
-        opencode_cmd = "opencode"
+        ws = LocalWorkspace(
+            workdir=self.cwd,
+            state_dir=self.state_dir or (cfg.state_dir if cfg else ".autoforge"),
+            runner=self._runner,
+        )
+        try:
+            spec = read_feature_spec(ws, spec_path)
+        except Exception as exc:
+            return CheckResult(name, False, f"{spec_path}: {exc}")
+        return CheckResult(name, True, f"{spec.relative_path} (sha256 {spec.sha256[:16]}...)")
+
+    def check_validation_commands(self) -> CheckResult:
+        """Report the configured local validation commands (never runs them)."""
+        cfg = self.config
+        cmds = cfg.local.validation_commands if cfg else []
+        name = "local validation commands"
+        if not cmds:
+            return CheckResult(name, True, "(none configured)", required=False)
+        return CheckResult(name, True, "; ".join(" ".join(argv) for argv in cmds))
+
+    def run_local(self, feature_spec_path: str | None = None) -> list[CheckResult]:
+        """Checks a LOCAL run needs — and nothing that touches GitHub.
+
+        No `gh` binary, no `gh auth status`, no `origin` remote: a local run
+        makes zero GitHub calls, so requiring any of them here would be a
+        false failure on exactly the machine local mode exists for.
+        """
+        results = [self.check_config(LOCAL_REQUIRED_PROFILES)]
+        cfg = self.config
+        claude_cmd, opencode_cmd = self._agent_commands(cfg)
+        results.append(self._version_check("git available", ["git", "--version"]))
+        results.append(self.check_git_repo())
+        results.append(
+            self._version_check("implementation agent available", [claude_cmd, "--version"])
+        )
+        results.append(self._version_check("review agent available", [opencode_cmd, "--version"]))
+        results.append(self.check_state_dir())
+        results.append(self.check_validation_commands())
+        if feature_spec_path:
+            results.append(self.check_feature_spec(feature_spec_path))
+        return results
+
+    @staticmethod
+    def _agent_commands(cfg: AutoForgeConfig | None) -> tuple[str, str]:
+        claude_cmd, opencode_cmd = "claude", "opencode"
         if cfg:
             for p in cfg.profiles.values():
                 if p.provider == "claude" and p.command:
                     claude_cmd = p.command
                 if p.provider == "opencode" and p.command:
                     opencode_cmd = p.command
+        return claude_cmd, opencode_cmd
+
+    def run_all(self) -> list[CheckResult]:
+        results = [self.check_config()]
+        cfg = self.config
+        gh = cfg.github.command if cfg else "gh"
+        claude_cmd, opencode_cmd = self._agent_commands(cfg)
         results.append(self._version_check("git available", ["git", "--version"]))
         results.append(self._version_check("gh available", [gh, "--version"]))
         results.append(self.check_gh_auth(gh))
@@ -151,3 +217,16 @@ def run_doctor(
     runner: Runner | None = None,
 ) -> list[CheckResult]:
     return Doctor(config_path=config_path, state_dir=state_dir, cwd=cwd, runner=runner).run_all()
+
+
+def run_local_doctor(
+    config_path: str | None = None,
+    state_dir: str | None = None,
+    cwd: str | None = None,
+    runner: Runner | None = None,
+    feature_spec_path: str | None = None,
+) -> list[CheckResult]:
+    """`autoforge local doctor`: the LOCAL checks only (never touches GitHub)."""
+    return Doctor(config_path=config_path, state_dir=state_dir, cwd=cwd, runner=runner).run_local(
+        feature_spec_path
+    )

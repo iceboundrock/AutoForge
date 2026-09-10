@@ -37,7 +37,7 @@ from pathlib import Path
 from . import __prompt_version__, __protocol_version__, __version__
 from .errors import StateError
 from .loop_guard import validate_review_history
-from .transitions import Phase
+from .transitions import Phase, WorkflowMode
 
 STATE_FILENAME = "state.json"
 LOGS_DIRNAME = "logs"
@@ -54,6 +54,13 @@ class AutoForgeState:
     prompt_version: str = __prompt_version__
 
     run_id: str = ""
+
+    # Which workflow this run executes. Explicit controller state, never
+    # inferred: a LOCAL run has no repository/EPIC/issue/PR at all, and a
+    # state file written before local mode existed has no 'mode' key and
+    # loads as REMOTE (see from_dict).
+    mode: WorkflowMode = WorkflowMode.REMOTE
+
     repository: str = ""
     epic_url: str = ""
 
@@ -106,6 +113,31 @@ class AutoForgeState:
     # rather than re-deriving what the safe disposition should have been.
     replan_transaction: dict = field(default_factory=dict)
 
+    # -- LOCAL mode -----------------------------------------------------
+    # Repository-relative path of the frozen feature specification.
+    feature_spec_path: str = ""
+    # SHA-256 of the specification's bytes at run creation. Re-checked before
+    # and after every agent phase: an agent that rewrites its own acceptance
+    # criteria must not be able to make the run easier.
+    feature_spec_sha256: str = ""
+    # git HEAD when the run was created ("" for an unborn HEAD). Recorded for
+    # the operator; a local run never requires HEAD to move.
+    base_head_sha: str = ""
+    # Workspace fingerprint the controller bound before the current review
+    # (the local analogue of ``current_head_sha``).
+    workspace_fingerprint: str = ""
+    # Fingerprint the last completed review was bound to (the local analogue
+    # of ``reviewed_head_sha``).
+    reviewed_workspace_fingerprint: str = ""
+    # Completed local FIX rounds; bounded by ``local.max_fix_rounds``.
+    local_fix_rounds: int = 0
+    # Working-tree paths that were already dirty when the run was created,
+    # other than the feature specification itself. Normally empty: `local run`
+    # refuses a dirty tree unless the operator passes --allow-dirty, and then
+    # these are named in status and in the review prompt rather than silently
+    # absorbed into the feature's implementation.
+    baseline_dirty_paths: list[str] = field(default_factory=list)
+
     merged_since_epic_update: int = 0
     counted_merged_prs: list[str] = field(default_factory=list)
     # Reasons the controller rejected the UPDATE_EPIC agent's next_issue_url
@@ -127,7 +159,12 @@ class AutoForgeState:
     def to_dict(self) -> dict:
         d = asdict(self)
         d["phase"] = self.phase.value
+        d["mode"] = self.mode.value
         return d
+
+    @property
+    def is_local(self) -> bool:
+        return self.mode == WorkflowMode.LOCAL
 
     @classmethod
     def from_dict(cls, data: dict) -> AutoForgeState:
@@ -139,8 +176,19 @@ class AutoForgeState:
             raise StateError("state file missing required field 'phase'") from None
         except ValueError:
             raise StateError(f"state file has unknown phase {data.get('phase')!r}") from None
+        # A state file written before LOCAL mode existed carries no 'mode'
+        # key; it is a REMOTE run and must keep loading unchanged.
+        raw_mode = data.get("mode", WorkflowMode.REMOTE.value)
+        if isinstance(raw_mode, WorkflowMode):
+            mode = raw_mode
+        else:
+            try:
+                mode = WorkflowMode(raw_mode)
+            except ValueError:
+                raise StateError(f"state file has unknown mode {raw_mode!r}") from None
         kwargs = dict(data)
         kwargs["phase"] = phase
+        kwargs["mode"] = mode
         # Drop unknown future fields defensively? No — fail loudly on wrong
         # types but ignore nothing: keep only known dataclass fields so that
         # hand-edited files with typos surface via required-field checks.
@@ -152,10 +200,25 @@ class AutoForgeState:
             state = cls(**{k: v for k, v in kwargs.items() if k in known})
         except TypeError as exc:
             raise StateError(f"state file has invalid fields: {exc}") from exc
-        # Required-field sanity.
-        for req in ("run_id", "repository", "epic_url", "created_at", "updated_at"):
+        # Required-field sanity. A LOCAL run has no repository/EPIC at all;
+        # its identity is the frozen feature specification instead.
+        required = ["run_id", "created_at", "updated_at"]
+        if state.mode == WorkflowMode.LOCAL:
+            required += ["feature_spec_path", "feature_spec_sha256"]
+        else:
+            required += ["repository", "epic_url"]
+        for req in required:
             if not getattr(state, req, None):
                 raise StateError(f"state file missing required field {req!r}")
+        for name in ("feature_spec_path", "feature_spec_sha256", "base_head_sha"):
+            if not isinstance(getattr(state, name), str):
+                raise StateError(f"state field {name!r} must be a string")
+        if not isinstance(state.local_fix_rounds, int) or isinstance(state.local_fix_rounds, bool):
+            raise StateError("state field 'local_fix_rounds' must be an integer")
+        if not isinstance(state.baseline_dirty_paths, list) or not all(
+            isinstance(path, str) for path in state.baseline_dirty_paths
+        ):
+            raise StateError("state field 'baseline_dirty_paths' must be a list of strings")
         if not isinstance(state.counted_merged_prs, list):
             raise StateError("state field 'counted_merged_prs' must be a list")
         if not isinstance(state.open_findings, list):

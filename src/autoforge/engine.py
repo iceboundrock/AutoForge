@@ -89,7 +89,15 @@ from .errors import (
     StateTransitionError,
     VerificationError,
 )
+from .executor import ExecutionRequest, execute
 from .github import GitHubClient, IssueInfo, PRInfo, build_merge_argv
+from .local_workspace import (
+    FeatureSpec,
+    LocalWorkspace,
+    WorkspaceStatus,
+    read_feature_spec,
+    verify_feature_spec_unchanged,
+)
 from .locking import ControllerLock, repository_lock_path
 from .loop_guard import (
     RESULT_CLEAN,
@@ -103,7 +111,14 @@ from .loop_guard import (
     truncated_evidence_rounds,
 )
 from .profiles import profile_for_phase
-from .prompts import TEMPLATE_FILES, load_template, render, render_phase
+from .prompts import (
+    COMMON_TEMPLATE,
+    LOCAL_COMMON_TEMPLATE,
+    TEMPLATE_FILES,
+    load_template,
+    render,
+    render_phase,
+)
 from .providers import AgentExecutionResult, AgentRequest, ProviderRegistry
 from .replan import HistoricalReviewCollector, ReplanDecision, evaluate_replan_policy
 from .replan_txn import (
@@ -125,6 +140,9 @@ from .replan_txn import (
 from .result_parser import (
     AnalyzeExecuteResult,
     FixResult,
+    LocalAnalyzeExecuteResult,
+    LocalFixResult,
+    LocalReviewResult,
     ReplanReexecuteResult,
     ReviewResult,
     UpdateEpicResult,
@@ -133,10 +151,12 @@ from .result_parser import (
 from .runlog import ExecutionRecord, RunLogger
 from .state import AutoForgeState, StatePaths, load_state, save_state, utcnow_iso
 from .transitions import (
-    LEGAL_EDGES,
     STOP_PHASES,
     TERMINAL_PHASES,
     Phase,
+    WorkflowMode,
+    edges_for,
+    stop_phases_for,
     validate_transition,
 )
 from .validation import (
@@ -185,6 +205,26 @@ _REVIEW_HEADING_RE = re.compile(r"^#\s*AI Code Review\s*[—–-]+\s*Round\s+(\d
 def generate_run_id() -> str:
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     return f"af-{stamp}-{secrets.token_hex(3)}"
+
+
+LOCAL_REQUIRED_PROFILES = [
+    "analyze_execute",
+    "fix",
+    "review_round_1",
+    "review_round_2_5",
+]
+
+# A local run never creates a PR or an Issue, so a phase whose only purpose
+# is a GitHub side effect has no local template at all.
+LOCAL_PHASE_TEMPLATE: dict[Phase, str | None] = {
+    Phase.INITIALIZING: None,  # deterministic: freeze the spec, read the tree
+    Phase.ANALYZE_EXECUTE: "local_analyze_execute.md",
+    Phase.REVIEW: "local_review.md",
+    Phase.FIX: "local_fix.md",
+    Phase.DONE: None,
+    Phase.BLOCKED: None,
+    Phase.FAILED: None,
+}
 
 
 PHASE_TEMPLATE: dict[Phase, str | None] = {
@@ -248,10 +288,17 @@ class ControllerEngine:
         self.paths = StatePaths.from_state_dir(state_dir or config.state_dir or ".autoforge")
         self.workdir = str(workdir)
         self.providers = providers or ProviderRegistry(runner=runner)
-        self.github = github or GitHubClient(
-            gh_command=config.github.command,
-            timeout_seconds=config.github.timeout_seconds,
-        )
+        # The GitHub client is built on first *use*, never on construction: a
+        # LOCAL run must reach DONE without a GitHubClient ever existing, and
+        # `local doctor` must work with no gh binary and no authentication.
+        # An injected client (tests) is used as given.
+        self._github = github
+        self._runner = runner
+        self._workspace: LocalWorkspace | None = None
+        # The workspace status bound immediately before a LOCAL agent phase.
+        # The prompt is rendered from it, so the fingerprint the reviewer is
+        # told to report is exactly the one persisted in state.
+        self._local_bound_status: WorkspaceStatus | None = None
         self.state: AutoForgeState | None = None
         # Set by locked(): the controller lock held for a whole command.
         self._lock: ControllerLock | None = None
@@ -261,6 +308,31 @@ class ControllerEngine:
         # True while self.state is a snapshot of state.json taken by load();
         # such a snapshot is re-read under a self-acquired execution lock.
         self._state_from_disk = False
+
+    @property
+    def github(self) -> GitHubClient:
+        """The GitHub client, constructed on first use (never in LOCAL mode)."""
+        if self._github is None:
+            self._github = GitHubClient(
+                gh_command=self.config.github.command,
+                timeout_seconds=self.config.github.timeout_seconds,
+            )
+        return self._github
+
+    @property
+    def mode(self) -> WorkflowMode:
+        """The workflow of the loaded run (REMOTE before any state exists)."""
+        return self.state.mode if self.state is not None else WorkflowMode.REMOTE
+
+    def workspace(self) -> LocalWorkspace:
+        """The local working-tree reader (LOCAL mode's source of truth)."""
+        if self._workspace is None:
+            self._workspace = LocalWorkspace(
+                workdir=self.workdir,
+                state_dir=self.paths.state_dir,
+                runner=self._runner or execute,
+            )
+        return self._workspace
 
     # -- state handling --------------------------------------------------
     def new_run(self, epic_url: str, issue_url: str) -> AutoForgeState:
@@ -278,6 +350,69 @@ class ControllerEngine:
         )
         self._state_from_disk = False
         return self.state
+
+    def new_local_run(
+        self, feature_spec_path: str | Path, allow_dirty: bool = False
+    ) -> AutoForgeState:
+        """Create a LOCAL run frozen to ``feature_spec_path``.
+
+        Resolves and hashes the specification, records the repository's HEAD
+        and the current working-tree state, and applies the dirty-tree policy
+        (see :meth:`_check_baseline_clean`). Nothing is written to disk here;
+        the caller persists the state under the controller lock.
+        """
+        ws = self.workspace()
+        spec = read_feature_spec(ws, feature_spec_path)
+        status = ws.status()
+        dirty = self._check_baseline_clean(status, spec, allow_dirty)
+        now = utcnow_iso()
+        self.state = AutoForgeState(
+            run_id=generate_run_id(),
+            mode=WorkflowMode.LOCAL,
+            phase=Phase.INITIALIZING,
+            feature_spec_path=spec.relative_path,
+            feature_spec_sha256=spec.sha256,
+            base_head_sha=status.head_sha,
+            workspace_fingerprint=status.fingerprint,
+            baseline_dirty_paths=dirty,
+            created_at=now,
+            updated_at=now,
+            prompt_version=self.config.prompt_version or __prompt_version__,
+        )
+        self._state_from_disk = False
+        return self.state
+
+    @staticmethod
+    def _check_baseline_clean(
+        status: WorkspaceStatus, spec: FeatureSpec, allow_dirty: bool
+    ) -> list[str]:
+        """Dirty-working-tree policy for a new local run.
+
+        v1 is deliberately strict: the tree must be clean apart from the
+        feature specification itself (which is typically brand new and
+        uncommitted). The controller does not try to tell an operator's
+        unrelated in-progress edit apart from the implementation it is about
+        to ask for — an agent may legitimately edit the very same file, so any
+        such split would be a heuristic, and a wrong one would either hide
+        real changes from the reviewer or attribute the operator's work to the
+        feature.
+
+        ``--allow-dirty`` does not make the controller smarter, it makes the
+        situation *explicit*: the pre-existing paths are recorded in state,
+        shown in ``status`` and named to the reviewer as pre-existing. They
+        are never silently absorbed.
+        """
+        dirty = [e.path for e in status.entries if e.path != spec.relative_path]
+        if dirty and not allow_dirty:
+            listed = ", ".join(dirty[:20]) + ("..." if len(dirty) > 20 else "")
+            raise ConfigurationError(
+                f"the working tree has {len(dirty)} change(s) besides the feature "
+                f"specification: {listed}. A local run reviews the whole working tree, and "
+                "the controller will not guess which changes belong to this feature. Commit "
+                "or stash them first, or pass --allow-dirty to record them as pre-existing "
+                "(they are then reported to you and to the reviewer, not hidden)."
+            )
+        return dirty
 
     def load(self) -> AutoForgeState:
         self.state = load_state(self.paths.state_file)
@@ -301,8 +436,13 @@ class ControllerEngine:
         return RunLogger(self.paths.logs_dir, state.run_id)
 
     def validate_config(self) -> None:
-        """Fail early (ConfigurationError) when a required profile is unusable."""
-        validate_required_profiles(self.config, REQUIRED_PROFILES)
+        """Fail early (ConfigurationError) when a required profile is unusable.
+
+        A LOCAL run never enters REPLAN_REEXECUTE or UPDATE_EPIC, so it does
+        not require those profiles to be configured.
+        """
+        required = LOCAL_REQUIRED_PROFILES if self.mode == WorkflowMode.LOCAL else REQUIRED_PROFILES
+        validate_required_profiles(self.config, required)
 
     # -- prompt context ---------------------------------------------------
     @staticmethod
@@ -325,6 +465,50 @@ class ControllerEngine:
             lines.append(head)
             lines.append(f"  Required resolution: {f.get('required_resolution', '')}")
         return "\n".join(lines)
+
+    def _validation_commands_text(self) -> str:
+        cmds = self.config.local.validation_commands
+        if not cmds:
+            return "(none configured)"
+        return "; ".join(" ".join(argv) for argv in cmds)
+
+    def _local_prompt_variables(self) -> dict[str, str | int | None]:
+        """Prompt context for a LOCAL phase: spec + working tree, no GitHub."""
+        s = self._require_state()
+        spec = self._frozen_spec()
+        status = self._local_status_for_prompt()
+        workspace_note = status.describe()
+        if s.baseline_dirty_paths:
+            workspace_note += (
+                " | pre-existing (NOT part of this feature, do not review or revert): "
+                + ", ".join(s.baseline_dirty_paths[:20])
+            )
+        return {
+            "PROMPT_VERSION": s.prompt_version,
+            "REPO_ROOT": str(self.workspace().root()),
+            "FEATURE_SPEC_PATH": s.feature_spec_path,
+            "FEATURE_SPEC_SHA256": s.feature_spec_sha256,
+            "FEATURE_SPEC": spec.content,
+            "BASE_HEAD_SHA": s.base_head_sha or "(no commit yet)",
+            "WORKSPACE_FINGERPRINT": status.fingerprint,
+            "WORKSPACE_STATUS": workspace_note,
+            "VALIDATION_COMMANDS": self._validation_commands_text(),
+            "REVIEW_ROUND": s.review_round + 1 if s.phase != Phase.FIX else s.review_round,
+            "FINDINGS": self._format_findings(s.open_findings),
+        }
+
+    def _frozen_spec(self) -> FeatureSpec:
+        """Re-read the frozen specification, requiring its hash to be unchanged."""
+        s = self._require_state()
+        return verify_feature_spec_unchanged(
+            self.workspace(),
+            s.feature_spec_path,
+            s.feature_spec_sha256,
+            when=f"before {s.phase.value}",
+        )
+
+    def _local_status_for_prompt(self) -> WorkspaceStatus:
+        return self._local_bound_status or self.workspace().status()
 
     def _prompt_variables(self) -> dict[str, str | int | None]:
         s = self._require_state()
@@ -380,14 +564,29 @@ class ControllerEngine:
             )
         return variables
 
+    def template_for(self, phase: Phase) -> str | None:
+        """The prompt template of ``phase`` in the loaded run's mode."""
+        table = LOCAL_PHASE_TEMPLATE if self.mode == WorkflowMode.LOCAL else PHASE_TEMPLATE
+        if self.mode == WorkflowMode.LOCAL and phase not in table:
+            raise StateTransitionError(
+                f"phase {phase.value} belongs to the REMOTE workflow and is never executed "
+                "by a local run"
+            )
+        return table.get(phase)
+
     def render_prompt_for(self, phase: Phase, correction_error: str | None = None) -> str:
-        template = PHASE_TEMPLATE.get(phase)
+        local = self.mode == WorkflowMode.LOCAL
+        template = self.template_for(phase)
         if template is None:
             raise StateTransitionError(f"phase {phase.value} has no agent prompt")
         if template not in TEMPLATE_FILES:
             raise StateTransitionError(f"unknown template {template}")
-        variables = self._prompt_variables()
-        prompt = render_phase(template, variables)
+        variables = self._local_prompt_variables() if local else self._prompt_variables()
+        prompt = render_phase(
+            template,
+            variables,
+            common_template=LOCAL_COMMON_TEMPLATE if local else COMMON_TEMPLATE,
+        )
         if correction_error is not None:
             correction = render(
                 load_template("correction.md"),
@@ -401,6 +600,8 @@ class ControllerEngine:
         s = self._require_state()
         if s.phase in TERMINAL_PHASES:
             raise StateTransitionError(f"phase {s.phase.value} is terminal — nothing to execute")
+        if s.mode == WorkflowMode.LOCAL:
+            return self._plan_local_step(s)
         if s.phase == Phase.INITIALIZING:
             return self._deterministic_plan(
                 s,
@@ -490,9 +691,108 @@ class ControllerEngine:
             review_round=s.review_round + 1 if s.phase == Phase.REVIEW else s.review_round,
             variables={k: str(v) for k, v in variables.items()},
             expected_next=self._expected_next(s.phase),
-            legal_next=self._legal_next_for(s.phase),
+            legal_next=self._legal_next_for(s.phase, s.mode),
             notes=notes,
         )
+
+    def _plan_local_step(self, s: AutoForgeState) -> StepPlan:
+        """Plan one LOCAL step. Pure: reads git and the spec, writes nothing.
+
+        A dry run stops here, so this must never invoke an agent, run a
+        validation command, write state, or touch GitHub.
+        """
+        if s.phase == Phase.INITIALIZING:
+            plan = self._deterministic_plan(
+                s,
+                "INITIALIZING -> ANALYZE_EXECUTE (freeze the feature spec; no agent, no GitHub)",
+                "ANALYZE_EXECUTE",
+                notes=[
+                    "mode: LOCAL (no gh, no PR, no push, no merge, no commits)",
+                    f"feature specification: {s.feature_spec_path}",
+                    f"frozen SHA-256: {s.feature_spec_sha256}",
+                    "would verify: the specification is unchanged and the workspace is readable",
+                ],
+            )
+            plan.variables = {
+                "FEATURE_SPEC_PATH": s.feature_spec_path,
+                "FEATURE_SPEC_SHA256": s.feature_spec_sha256,
+                "BASE_HEAD_SHA": s.base_head_sha or "(no commit yet)",
+                "WORKSPACE_FINGERPRINT": s.workspace_fingerprint,
+            }
+            return plan
+        profile = profile_for_phase(self.config, s.phase, s.review_round)
+        variables = self._local_prompt_variables()
+        prompt = self.render_prompt_for(s.phase)
+        command = self.providers.get(profile).build_command_for(profile, prompt)
+        notes: list[str] = [
+            "mode: LOCAL (no gh, no PR, no push, no merge)",
+            f"feature specification: {s.feature_spec_path} "
+            f"(frozen {s.feature_spec_sha256[:16]}...)",
+            f"workspace fingerprint now: {variables['WORKSPACE_FINGERPRINT']}",
+        ]
+        if s.baseline_dirty_paths:
+            notes.append(
+                "pre-existing working-tree changes recorded at run creation "
+                f"(--allow-dirty): {', '.join(s.baseline_dirty_paths[:20])}"
+            )
+        budget = step_budget_reason(s.step_count, self.config.workflow.max_total_steps)
+        if budget:
+            notes.append(f"would enter BLOCKED without executing: {budget}")
+        if s.phase == Phase.REVIEW:
+            cap = self.config.local.max_review_rounds
+            if s.review_round >= cap:
+                notes.append(
+                    "would enter BLOCKED without invoking the reviewer: local review round "
+                    f"{s.review_round + 1} exceeds local.max_fix_rounds + 1 = {cap}"
+                )
+            notes.append(
+                f"review round {s.review_round + 1} of at most {cap} "
+                f"(local.max_fix_rounds={self.config.local.max_fix_rounds})"
+            )
+            notes.append(
+                "the reviewed workspace fingerprint is computed immediately before the review "
+                "and the review is rejected unless it is bound to exactly that value"
+            )
+        else:
+            notes.append(
+                "would verify afterwards: the feature spec hash is unchanged, the workspace "
+                "changed as claimed, and every configured validation command exits 0"
+            )
+        cmds = self.config.local.validation_commands
+        notes.append(
+            "validation commands that would run after this phase: "
+            + ("; ".join(" ".join(argv) for argv in cmds) if cmds else "(none configured)")
+        )
+        return StepPlan(
+            phase=s.phase.value,
+            profile_name=profile.name,
+            provider=profile.provider,
+            model=profile.model,
+            effort=profile.effort,
+            command=command,
+            timeout_seconds=profile.timeout_seconds
+            or self.config.execution.default_timeout_seconds,
+            prompt_length=len(prompt),
+            prompt_preview=prompt[:1200],
+            prompt_full=prompt,
+            routing=self._routing_info(s, profile.name),
+            template=self.template_for(s.phase) or "",
+            review_round=s.review_round + 1 if s.phase == Phase.REVIEW else s.review_round,
+            variables={k: str(v) for k, v in variables.items()},
+            expected_next=self._local_expected_next(s.phase),
+            legal_next=self._legal_next_for(s.phase, WorkflowMode.LOCAL),
+            notes=notes,
+        )
+
+    @staticmethod
+    def _local_expected_next(phase: Phase) -> str:
+        return {
+            Phase.INITIALIZING: "ANALYZE_EXECUTE",
+            Phase.ANALYZE_EXECUTE: "REVIEW (after workspace + validation verification)",
+            Phase.REVIEW: "DONE if clean, FIX if findings and the fix budget remains, "
+            "BLOCKED if findings remain after it",
+            Phase.FIX: "REVIEW (after workspace + validation verification)",
+        }.get(phase, "")
 
     def _merge_argv(self) -> list[str]:
         """Exact ``gh`` argv the controller would run to merge the current PR."""
@@ -537,7 +837,7 @@ class ControllerEngine:
             template="",
             review_round=state.review_round,
             expected_next=expected,
-            legal_next=ControllerEngine._legal_next_for(state.phase),
+            legal_next=ControllerEngine._legal_next_for(state.phase, state.mode),
             notes=notes,
         )
 
@@ -553,8 +853,8 @@ class ControllerEngine:
         }.get(phase, "")
 
     @staticmethod
-    def _legal_next_for(phase: Phase) -> list[str]:
-        return sorted(p.value for p in LEGAL_EDGES.get(phase, frozenset()))
+    def _legal_next_for(phase: Phase, mode: WorkflowMode = WorkflowMode.REMOTE) -> list[str]:
+        return sorted(p.value for p in edges_for(mode).get(phase, frozenset()))
 
     @staticmethod
     def _routing_info(state: AutoForgeState, profile_name: str) -> str:
@@ -645,7 +945,11 @@ class ControllerEngine:
         """
         if max_steps < 1:
             raise ValueError("max_steps must be >= 1")
-        stop_phases = TERMINAL_PHASES if self.merge_gate_open(allow_merge) else STOP_PHASES
+        if self.mode == WorkflowMode.LOCAL:
+            # No READY_FOR_MERGE holding state exists locally.
+            stop_phases = stop_phases_for(WorkflowMode.LOCAL)
+        else:
+            stop_phases = TERMINAL_PHASES if self.merge_gate_open(allow_merge) else STOP_PHASES
         if dry_run:
             outcomes = [self._step_once(dry_run=True, allow_merge=allow_merge)]
             assert self.state is not None
@@ -708,6 +1012,8 @@ class ControllerEngine:
         budget = step_budget_reason(state.step_count, self.config.workflow.max_total_steps)
         if budget:
             return self._block(previous, plan, self._budget_block_reason(budget))
+        if state.mode == WorkflowMode.LOCAL:
+            return self._local_step_once(previous, plan)
         if previous == Phase.REVIEW:
             # Review-round cap, whatever path led here (FIX, stale re-review,
             # HEAD drift from READY_FOR_MERGE/MERGE, resume): round cap+1 never
@@ -773,6 +1079,326 @@ class ControllerEngine:
         state.attempt = 0
         self._save()
         return self._outcome(previous, plan=plan, result=payload, message=message)
+
+    # ======================================================================
+    # LOCAL mode
+    #
+    # No GitHub client is ever constructed here. The working tree is the
+    # source of truth, exactly as GitHub is in REMOTE mode: every agent claim
+    # is re-derived from `git` by :mod:`autoforge.local_workspace` before it
+    # is acted on, and the frozen feature specification is re-hashed around
+    # every phase.
+    def _local_step_once(self, previous: Phase, plan: StepPlan) -> StepOutcome:
+        state = self._require_state()
+        if previous == Phase.INITIALIZING:
+            state.step_count += 1
+            return self._initialize_local(plan)
+        if previous not in (Phase.ANALYZE_EXECUTE, Phase.REVIEW, Phase.FIX):
+            raise StateTransitionError(f"phase {previous.value} is not part of the LOCAL workflow")
+        if previous == Phase.REVIEW:
+            cap = self.config.local.max_review_rounds
+            if state.review_round >= cap:
+                # Round cap+1 never starts: its findings could never be fixed.
+                return self._block(
+                    previous,
+                    plan,
+                    self._local_block_reason(
+                        f"local review round {state.review_round + 1} would exceed the local "
+                        f"bound of {cap} review round(s) "
+                        f"(local.max_fix_rounds={self.config.local.max_fix_rounds})"
+                    ),
+                )
+
+        state.step_count += 1
+        # Freeze check + fingerprint binding, before the agent runs. The bound
+        # status is what the prompt is rendered from, so the fingerprint the
+        # reviewer is told to report is exactly the one persisted here.
+        self._frozen_spec()
+        before = self.workspace().status()
+        state.workspace_fingerprint = before.fingerprint
+        self._local_bound_status = before
+        self._save()
+        try:
+            payload = self._invoke_phase(previous)
+        finally:
+            self._local_bound_status = None
+
+        status = payload.get("status")
+        if status in ("failure", "blocked"):
+            nxt = Phase.FAILED if status == "failure" else Phase.BLOCKED
+            state.phase = nxt
+            state.block_reason = str(payload.get("message", "") or f"agent reported {status}")
+            self._save()
+            return self._outcome(
+                previous,
+                plan=plan,
+                result=payload,
+                message=f"agent reported {status}: {payload.get('message', '')}",
+            )
+
+        try:
+            nxt_phase, message = self._verify_and_apply_local(previous, payload, before)
+        except (VerificationError, ControlResultValidationError) as exc:
+            # The agent ran and may have changed the working tree, but its
+            # claims did not verify. Persist the attempt so `resume` re-enters
+            # this phase from the real state of the tree.
+            if isinstance(exc, VerificationError):
+                state.verification_failures.append(f"{previous.value}: {exc}")
+                state.verification_failures = state.verification_failures[-20:]
+            self._save()
+            raise
+        if nxt_phase == Phase.BLOCKED:
+            return self._block(previous, plan, message)
+        validate_transition(previous, nxt_phase, WorkflowMode.LOCAL)
+        state.phase = nxt_phase
+        state.attempt = 0
+        self._save()
+        return self._outcome(previous, plan=plan, result=payload, message=message)
+
+    def _initialize_local(self, plan: StepPlan) -> StepOutcome:
+        """Preflight for a local run: config, git, frozen spec. No GitHub."""
+        state = self._require_state()
+        self.validate_config()
+        ws = self.workspace()
+        spec = verify_feature_spec_unchanged(
+            ws, state.feature_spec_path, state.feature_spec_sha256, when="before ANALYZE_EXECUTE"
+        )
+        status = ws.status()
+        state.workspace_fingerprint = status.fingerprint
+        validate_transition(Phase.INITIALIZING, Phase.ANALYZE_EXECUTE, WorkflowMode.LOCAL)
+        state.phase = Phase.ANALYZE_EXECUTE
+        self._save()
+        return self._outcome(
+            Phase.INITIALIZING,
+            plan=plan,
+            message=(
+                f"froze feature specification {spec.relative_path} "
+                f"(sha256 {spec.sha256[:16]}...) at HEAD "
+                f"{status.head_sha[:12] or '(unborn)'}; INITIALIZING -> ANALYZE_EXECUTE"
+            ),
+        )
+
+    def _local_block_reason(self, reason: str) -> str:
+        state = self._require_state()
+        return (
+            f"{reason}. The run stays on feature {state.feature_spec_path}; the work is left "
+            "in the working tree exactly as it is (nothing was committed, reverted or "
+            "discarded). A human must inspect the open findings, or raise "
+            "'local.max_fix_rounds' in the config and start a new run."
+        )
+
+    def _verify_and_apply_local(
+        self, phase: Phase, payload: dict, before: WorkspaceStatus
+    ) -> tuple[Phase, str]:
+        if phase == Phase.ANALYZE_EXECUTE:
+            return self._apply_local_analyze(
+                LocalAnalyzeExecuteResult.from_payload(payload), before
+            )
+        if phase == Phase.REVIEW:
+            return self._apply_local_review(LocalReviewResult.from_payload(payload))
+        if phase == Phase.FIX:
+            return self._apply_local_fix(LocalFixResult.from_payload(payload), before)
+        raise StateTransitionError(f"phase {phase.value} does not accept local agent results")
+
+    def _verify_workspace_change(
+        self, phase: Phase, before: WorkspaceStatus, claimed: bool
+    ) -> WorkspaceStatus:
+        """Re-derive what actually changed and cross-check the agent's claim."""
+        state = self._require_state()
+        verify_feature_spec_unchanged(
+            self.workspace(),
+            state.feature_spec_path,
+            state.feature_spec_sha256,
+            when=f"after {phase.value}",
+        )
+        after = self.workspace().status()
+        changed = after.fingerprint != before.fingerprint
+        if claimed != changed:
+            raise VerificationError(
+                f"{phase.value} reported changed_workspace={claimed} but the controller "
+                f"observed the working tree {'change' if changed else 'stay identical'} "
+                f"(fingerprint {before.fingerprint[:16]}... -> {after.fingerprint[:16]}...). "
+                f"Current state: {after.describe()}"
+            )
+        return after
+
+    def _apply_local_analyze(
+        self, res: LocalAnalyzeExecuteResult, before: WorkspaceStatus
+    ) -> tuple[Phase, str]:
+        state = self._require_state()
+        after = self._verify_workspace_change(Phase.ANALYZE_EXECUTE, before, res.changed_workspace)
+        if after.fingerprint == before.fingerprint:
+            raise VerificationError(
+                "ANALYZE_EXECUTE reported success but the working tree is unchanged: no "
+                "implementation exists to review. An agent that cannot implement the feature "
+                "must report status 'blocked' or 'failure' with a reason instead."
+            )
+        self._run_validation_commands(Phase.ANALYZE_EXECUTE)
+        state.workspace_fingerprint = after.fingerprint
+        state.last_review_result = ""
+        tests = (
+            f", tests attempted: {', '.join(res.tests_attempted)}" if res.tests_attempted else ""
+        )
+        return Phase.REVIEW, (
+            f"implementation verified: {len(after.entries)} changed path(s) in the working "
+            f"tree, fingerprint {after.fingerprint[:16]}...{tests}; "
+            "ANALYZE_EXECUTE -> REVIEW"
+        )
+
+    def _apply_local_review(self, res: LocalReviewResult) -> tuple[Phase, str]:
+        state = self._require_state()
+        expected_round = state.review_round + 1
+        bound = state.workspace_fingerprint
+        if res.round != expected_round:
+            raise VerificationError(
+                f"REVIEW round mismatch: expected {expected_round}, got {res.round}"
+            )
+        if res.reviewed_workspace_fingerprint != bound:
+            raise VerificationError(
+                f"REVIEW fingerprint mismatch: the controller bound workspace {bound}, "
+                f"the agent reviewed {res.reviewed_workspace_fingerprint}. A review is only "
+                "valid for the exact workspace it was bound to."
+            )
+        verify_feature_spec_unchanged(
+            self.workspace(),
+            state.feature_spec_path,
+            state.feature_spec_sha256,
+            when="after REVIEW",
+        )
+        after = self.workspace().status()
+        if after.fingerprint != bound:
+            # REVIEW is read-only; a reviewer that edited the code changed the
+            # very thing it was judging, so its verdict describes nothing that
+            # still exists.
+            raise VerificationError(
+                f"the reviewer modified the working tree during REVIEW (fingerprint "
+                f"{bound[:16]}... -> {after.fingerprint[:16]}...). A local review must not "
+                f"change what it reviews. Current state: {after.describe()}"
+            )
+
+        # A valid review lifecycle: the round is consumed either way.
+        state.review_round = res.round
+        state.reviewed_workspace_fingerprint = bound
+        state.last_review_needs_fix = res.needs_fix_round
+        findings = [f.to_dict() for f in res.findings]
+        # ``review_history`` is shared with REMOTE mode; locally the "reviewed
+        # head" slot carries the workspace fingerprint, which plays exactly
+        # the same role (what this verdict is valid for).
+        self._record_review(
+            res.round, bound, RESULT_NEEDS_FIX if res.needs_fix_round else RESULT_CLEAN, findings
+        )
+        if res.needs_fix_round:
+            state.last_review_result = "needs_fix"
+            state.open_findings = findings
+            budget = self.config.local.max_fix_rounds
+            if state.local_fix_rounds >= budget:
+                return Phase.BLOCKED, self._local_block_reason(
+                    f"local review round {res.round}: {len(findings)} finding(s) remain after "
+                    f"{state.local_fix_rounds} fix round(s), which is the configured local "
+                    f"budget (local.max_fix_rounds={budget})"
+                )
+            return Phase.FIX, (
+                f"local review round {res.round}: {len(findings)} finding(s); REVIEW -> FIX "
+                f"(fix round {state.local_fix_rounds + 1} of {budget})"
+            )
+        state.last_review_result = "clean"
+        state.open_findings = []
+        return Phase.DONE, (
+            f"local review round {res.round} clean for workspace {bound[:16]}...; "
+            "REVIEW -> DONE. The implementation is in the working tree; committing it is "
+            "yours to do."
+        )
+
+    def _apply_local_fix(self, res: LocalFixResult, before: WorkspaceStatus) -> tuple[Phase, str]:
+        state = self._require_state()
+        open_ids = [f["id"] for f in state.open_findings]
+        reported = [r.finding_id for r in res.resolutions]
+        missing = sorted(set(open_ids) - set(reported))
+        extra = sorted(set(reported) - set(open_ids))
+        if missing or extra:
+            raise VerificationError(
+                f"FIX resolutions must cover exactly the open findings; missing={missing} "
+                f"unknown={extra}"
+            )
+        after = self._verify_workspace_change(Phase.FIX, before, res.changed_workspace)
+        fixed = [r for r in res.resolutions if r.resolution == "fixed"]
+        if fixed and after.fingerprint == before.fingerprint:
+            raise VerificationError(
+                f"FIX claims {len(fixed)} 'fixed' resolution(s) but the working tree is "
+                "unchanged; nothing was actually fixed."
+            )
+        self._run_validation_commands(Phase.FIX)
+        state.workspace_fingerprint = after.fingerprint
+        state.last_fix_resolutions = [r.to_dict() for r in res.resolutions]
+        state.local_fix_rounds += 1
+        state.open_findings = []
+        state.last_review_result = "fixed"
+        unresolved = [r.finding_id for r in res.resolutions if r.resolution == "unresolved"]
+        note = (
+            f", {len(unresolved)} left unresolved ({', '.join(unresolved)})" if unresolved else ""
+        )
+        return Phase.REVIEW, (
+            f"local fix round {state.local_fix_rounds} verified: {len(res.resolutions)} "
+            f"resolution(s){note}; FIX -> REVIEW (round {state.review_round + 1})"
+        )
+
+    def _run_validation_commands(self, phase: Phase) -> None:
+        """Run ``local.validation_commands`` and require every one to exit 0.
+
+        Controller-owned verification, not something an agent reports: the
+        commands come from configuration as argv arrays and are executed
+        through the normal executor, never through a shell. A non-zero exit
+        means the phase is not verified, so the run stays in this phase for
+        ``resume`` rather than advancing on an agent's word.
+        """
+        state = self._require_state()
+        commands = self.config.local.validation_commands
+        if not commands:
+            return
+        logger = self._logger()
+        for argv in commands:
+            req = ExecutionRequest(
+                command=list(argv),
+                cwd=self.workdir,
+                timeout_seconds=self.config.execution.default_timeout_seconds,
+            )
+            result = (self._runner or execute)(req)
+            record = ExecutionRecord(
+                run_id=state.run_id,
+                seq=0,
+                phase=f"{phase.value}-validation",
+                attempt=state.attempt,
+                review_round=state.review_round,
+                profile="(controller validation command)",
+                prompt_version=state.prompt_version,
+                command=list(argv),
+                cwd=self.workdir,
+                timeout_seconds=req.timeout_seconds,
+                started_at=result.started_at,
+                finished_at=result.finished_at,
+                exit_code=result.exit_code,
+                timed_out=result.timed_out,
+                metadata={"validation_command": list(argv), "feature": state.feature_spec_path},
+            )
+            if result.timed_out or result.exit_code != 0:
+                record.error = (
+                    f"timed out after {req.timeout_seconds}s"
+                    if result.timed_out
+                    else f"exit {result.exit_code}"
+                )
+            logger.log_execution(record, "", result.stdout or "", result.stderr or "")
+            if result.timed_out:
+                raise VerificationError(
+                    f"validation command {' '.join(argv)!r} timed out after "
+                    f"{req.timeout_seconds}s; {phase.value} is not verified."
+                )
+            if result.exit_code != 0:
+                tail = (result.stderr or result.stdout or "").strip()[-2000:]
+                raise VerificationError(
+                    f"validation command {' '.join(argv)!r} failed with exit "
+                    f"{result.exit_code}; {phase.value} is not verified and the run stays in "
+                    f"{phase.value}. Output tail: {tail}"
+                )
 
     # -- deterministic steps ---------------------------------------------------
     def _initialize(self, plan: StepPlan) -> StepOutcome:
@@ -2188,6 +2814,19 @@ class ControllerEngine:
         )
 
     # -- agent invocation + correction retry ---------------------------------------
+    def _log_metadata(self, phase: Phase) -> dict[str, object]:
+        state = self._require_state()
+        if state.mode == WorkflowMode.LOCAL:
+            return {
+                "mode": "LOCAL",
+                "feature_spec_path": state.feature_spec_path,
+                "feature_spec_sha256": state.feature_spec_sha256,
+                "workspace_fingerprint": state.workspace_fingerprint,
+            }
+        if phase == Phase.REPLAN_REEXECUTE:
+            return self._replan_log_metadata()
+        return {}
+
     def _invoke_phase(self, phase: Phase) -> dict:
         state = self._require_state()
         profile = profile_for_phase(self.config, phase, state.review_round)
@@ -2227,7 +2866,7 @@ class ControllerEngine:
                 command=provider.build_command_for(profile, prompt),
                 cwd=self.workdir,
                 timeout_seconds=timeout,
-                metadata=(self._replan_log_metadata() if phase == Phase.REPLAN_REEXECUTE else {}),
+                metadata=self._log_metadata(phase),
             )
             result: AgentExecutionResult | None = None
             try:
@@ -2260,7 +2899,7 @@ class ControllerEngine:
                     "State unchanged — inspect logs, then 'resume'."
                 )
             try:
-                payload = parse_control_result(stdout, phase)
+                payload = parse_control_result(stdout, phase, state.mode)
             except (ControlResultError, ControlResultValidationError) as exc:
                 record.error = f"{type(exc).__name__}: {exc}"
                 self._logger().log_execution(record, prompt, stdout, stderr)

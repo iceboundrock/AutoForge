@@ -522,3 +522,105 @@ def fake_github():
 @pytest.fixture
 def engine(tmp_state_dir, fake_github):
     return make_engine(tmp_state_dir, [], github=fake_github)
+
+
+# -- LOCAL mode -----------------------------------------------------------------
+class ExplodingGitHub:
+    """A GitHub client that fails the test on any use.
+
+    A LOCAL run must make zero GitHub calls, so the strongest available
+    assertion is to hand the engine a client that cannot be touched at all.
+    """
+
+    def __getattr__(self, name: str):
+        raise AssertionError(f"LOCAL mode touched GitHub: {name!r}")
+
+
+FEATURE_MD = """# Feature: Add Transaction Filter
+
+## Problem
+
+Users cannot filter transactions.
+
+## Requirements
+
+- [ ] Add a `--since` filter.
+
+## Acceptance Criteria
+
+- [ ] Filtering by date returns only later transactions.
+
+## Non-goals
+
+- Pagination.
+
+## Notes / Decisions
+
+None.
+"""
+
+
+def write_feature(repo, name: str = "add-filter", body: str = FEATURE_MD) -> Path:
+    """Write ``features/<name>.md`` inside ``repo`` and return the path."""
+    path = Path(repo) / "features" / f"{name}.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+def commit_all(repo, message: str = "wip") -> None:
+    """Commit everything in ``repo`` (tests need a clean baseline tree)."""
+    root = Path(repo)
+    subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "-m",
+            message,
+        ],
+        check=True,
+    )
+
+
+def make_local_engine(
+    state_dir,
+    feature,
+    script=None,
+    cfg=None,
+    exit_code: int = 0,
+    workdir=None,
+    allow_dirty: bool = False,
+    start: bool = True,
+):
+    """Engine wired for a LOCAL run: scripted agents, exploding GitHub.
+
+    No ``runner`` is injected: ``LocalWorkspace`` must run real ``git`` against
+    the real temporary repository, which is the whole point of the local trust
+    boundary.
+    """
+    cfg = cfg or default_config()
+    if workdir is None:
+        workdir = git_repo(Path(state_dir).parent)
+    provider = ScriptedProvider(script, exit_code=exit_code)
+    registry = ProviderRegistry(
+        overrides={"claude": provider, "opencode": provider, "scripted": provider}
+    )
+    eng = ControllerEngine(
+        config=cfg,
+        state_dir=state_dir,
+        workdir=workdir,
+        github=ExplodingGitHub(),  # type: ignore[arg-type]
+        providers=registry,
+    )
+    if start:
+        eng.new_local_run(feature, allow_dirty=allow_dirty)
+    eng.provider = provider  # type: ignore[attr-defined]
+    return eng

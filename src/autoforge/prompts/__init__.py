@@ -15,6 +15,13 @@ from pathlib import Path
 from ..errors import ConfigurationError
 
 PLACEHOLDER_RE = re.compile(r"\{\{\s*([A-Z][A-Z0-9_]*)\s*\}\}")
+# Placeholders are first replaced by this NUL-delimited marker, which no
+# template or value can contain in practice, and only then by the real
+# value. That keeps substitution strictly single-pass: a value carrying
+# "{{...}}" text (a feature specification is untrusted project data and may
+# well quote one) is inserted verbatim instead of being re-expanded or
+# tripping the "unresolved placeholder" guard below.
+_MARKER_RE = re.compile(r"\x00AF:([A-Z][A-Z0-9_]*)\x00")
 
 TEMPLATE_FILES = (
     "common.md",
@@ -24,7 +31,17 @@ TEMPLATE_FILES = (
     "replan_reexecute.md",
     "update_epic.md",
     "correction.md",
+    # LOCAL mode: separate templates rather than the GitHub ones fed fake
+    # Issue/PR values. Nothing here may mention gh, PRs or merging.
+    "local_common.md",
+    "local_analyze_execute.md",
+    "local_review.md",
+    "local_fix.md",
 )
+
+# The trusted header each mode prepends to its phase template.
+COMMON_TEMPLATE = "common.md"
+LOCAL_COMMON_TEMPLATE = "local_common.md"
 
 
 def prompts_dir() -> Path:
@@ -46,7 +63,9 @@ def render(template: str, variables: dict[str, str | int | None]) -> str:
     """Substitute all {{VARS}}; raise if any required var is missing/empty.
 
     ``None`` values count as missing. Integers are stringified. Any
-    placeholder left over after substitution is an error.
+    placeholder the *template* leaves unresolved is an error; placeholder-like
+    text inside a substituted value is content, not a placeholder, and is
+    inserted verbatim (see ``_MARKER_RE``).
     """
     str_vars: dict[str, str] = {}
     for var in required_variables(template):
@@ -56,26 +75,28 @@ def render(template: str, variables: dict[str, str | int | None]) -> str:
             )
         str_vars[var] = str(variables[var])
 
-    def _sub(match: re.Match[str]) -> str:
-        return str_vars[match.group(1)]
-
-    rendered = PLACEHOLDER_RE.sub(_sub, template)
-    leftover = PLACEHOLDER_RE.findall(rendered)
+    marked = PLACEHOLDER_RE.sub(lambda m: f"\x00AF:{m.group(1)}\x00", template)
+    leftover = PLACEHOLDER_RE.findall(marked)
     if leftover:
         raise ConfigurationError(
             f"prompt rendering left placeholders unresolved: {sorted(set(leftover))}"
         )
-    return rendered
+    return _MARKER_RE.sub(lambda m: str_vars[m.group(1)], marked)
 
 
 def render_phase(
     phase_template: str,
     variables: dict[str, str | int | None],
     include_common: bool = True,
+    common_template: str = COMMON_TEMPLATE,
 ) -> str:
-    """Render ``common.md`` header + phase template with the same variables."""
+    """Render the trusted common header + phase template with one variable set.
+
+    ``common_template`` selects the header: ``common.md`` for REMOTE runs,
+    ``local_common.md`` for LOCAL ones.
+    """
     parts = []
     if include_common:
-        parts.append(render(load_template("common.md"), variables))
+        parts.append(render(load_template(common_template), variables))
     parts.append(render(load_template(phase_template), variables))
     return "\n\n---\n\n".join(parts)

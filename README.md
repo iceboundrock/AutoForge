@@ -33,6 +33,19 @@ Issue → ANALYZE_EXECUTE (Claude Code) → PR → REVIEW (OpenCode)
                                              controller verifies it on GitHub, or DONE)
 ```
 
+There is a second, explicit workflow for when there is no GitHub to
+orchestrate — an interview, a scratch repository, an offline machine. **Local
+mode** (`autoforge local`) drives a feature Markdown file against your working
+tree with the same controller and the same verification discipline, and makes
+zero `gh` invocations:
+
+```text
+features/<slug>.md → ANALYZE_EXECUTE → REVIEW → clean ────▶ DONE
+                                             → findings ──▶ FIX → REVIEW …
+```
+
+See [Local mode (no GitHub)](#local-mode-no-github).
+
 AutoForge itself never writes business code. It:
 
 - holds the workflow state machine (phases + legal transitions),
@@ -67,7 +80,8 @@ branch and never creates or cleans up local branches or worktrees itself.
 
 ```text
 src/autoforge/
-    cli.py            argparse CLI: doctor / run / step / resume / status
+    cli.py            argparse CLI: doctor / run / step / resume / status /
+                      local (init, run, doctor)
     engine.py         ControllerEngine — step() primitive, run() loops step(),
                       per-phase verification via gh, recovery, correction retry
     transitions.py    Phase enum + legal edges + decide_next_phase (pure)
@@ -81,7 +95,10 @@ src/autoforge/
     validation.py     typed GitHub URL refs (issue / PR / comment), remote parsing
     github.py         typed GitHubClient over `gh`: reads (PRs, issues, comments,
                       checks, merge queue) + the controller-owned merge / disarm writes
-    doctor.py         read-only environment checks
+    local_workspace.py  LOCAL mode's trust boundary: git working-tree reader
+                      (HEAD, status, deterministic workspace fingerprint) and the
+                      frozen feature specification (resolve / hash / re-verify)
+    doctor.py         read-only environment checks (remote + the local subset)
     locking.py        flock(2) repository lock, keyed by the git common dir
                       (<repo>/.git/autoforge/controller.lock), never by state_dir
     runlog.py         per-run logs (.autoforge/logs/<run-id>/), redacted
@@ -92,6 +109,7 @@ src/autoforge/
     replan_txn.py     the REPLAN_REEXECUTE transaction: durable stages, the causal
                       provenance marker, and every acceptance predicate (pure)
     prompts/          common.md (trust boundary) + phase templates + correction.md
+                      + local_common.md and the local_* phase templates
 ```
 
 Key design points:
@@ -247,11 +265,14 @@ retried automatically; they leave the phase unchanged for `resume`.
 
 - Python 3.11+ (managed via `uv`)
 - `uv` ([install](https://docs.astral.sh/uv/getting-started/installation/))
-- `git`, and `gh` (GitHub CLI, authenticated)
+- `git`, and `gh` (GitHub CLI, authenticated) — `gh` is **not** needed for
+  [local mode](#local-mode-no-github)
 - `claude` (Claude Code CLI) for `analyze_execute` / `fix` profiles
 - `opencode` (OpenCode CLI) for `review_*` profiles
 
-Run `autoforge doctor` to check all of the above (read-only).
+Run `autoforge doctor` to check all of the above (read-only), or
+`autoforge local doctor` for the local-mode subset (no `gh`, no GitHub
+authentication, no `origin` remote).
 
 CLI flag syntax in `autoforge.example.yaml` was checked against the locally
 installed CLIs (Claude Code 2.1.263, OpenCode 1.18.20, gh 2.100.0).
@@ -303,6 +324,147 @@ continues through its own pre-merge verification, `MERGE` and `UPDATE_EPIC`.
 
 URLs must be HTTPS GitHub issue URLs, and EPIC + issue must be in the **same
 repository** as the current working directory (cross-repo runs are rejected).
+
+## Local mode (no GitHub)
+
+Sometimes there is no GitHub to orchestrate: a coding interview, a scratch
+repository, an air-gapped machine, or simply a change you want driven by the
+same review loop without opening an Issue. `autoforge local` is a **separate,
+explicit workflow** for exactly that — the same controller, the same
+"never trust the agent" discipline, none of the GitHub lifecycle.
+
+```text
+features/<slug>.md  →  INITIALIZING → ANALYZE_EXECUTE → REVIEW
+                                         → clean ─────────────▶ DONE
+                                         → findings ──────────▶ FIX → REVIEW
+                                         → findings after the fix budget ─▶ BLOCKED
+```
+
+A local run **never** touches GitHub: no `gh` invocation, no Issue, no PR, no
+comment, no push, no branch, no merge, no EPIC update, no follow-up issue, and
+no replan. The `GitHubClient` is not even constructed. Nothing is faked
+either — there are no placeholder PR URLs in local state or local prompts.
+
+### The interview-sized example
+
+```bash
+uv run autoforge local init add-transaction-filter
+# a human (with or without an AI) refines features/add-transaction-filter.md
+uv run autoforge local run features/add-transaction-filter.md
+```
+
+### Commands
+
+```bash
+uv run autoforge local doctor            # config, git, agent CLIs — never gh, never auth
+uv run autoforge local doctor --feature features/add-transaction-filter.md
+uv run autoforge local init <slug>       # writes features/<slug>.md from a template
+uv run autoforge local init <slug> --force        # only this overwrites an existing file
+uv run autoforge local run features/<slug>.md --dry-run
+uv run autoforge local run features/<slug>.md
+uv run autoforge local run features/<slug>.md --allow-dirty
+
+uv run autoforge status                  # mode-aware; no Issue/PR fields for a local run
+uv run autoforge step                    # step / resume / status are mode-agnostic:
+uv run autoforge resume                  # they read the mode from persisted state
+```
+
+### The feature specification
+
+`autoforge local init <slug>` writes `features/<slug>.md` (directory
+configurable via `local.feature_dir`) with `## Problem`, `## Requirements`,
+`## Acceptance Criteria` (checkboxes), `## Non-goals` and
+`## Notes / Decisions`. Feature specifications are **project content**, not
+runtime state: they live in your repository and you may commit them.
+`.autoforge/` remains controller state only. `local init` refuses to overwrite
+an existing file unless you pass `--force`.
+
+**The specification is frozen for the whole run.** `local run` records its
+SHA-256, and the controller re-reads and re-checks the hash before *and* after
+every agent phase. An agent that edits the specification fails the run instead
+of getting easier acceptance criteria. Edit freely before a run; changed
+requirements mean a new run.
+
+The specification is *untrusted project data*, exactly like an Issue body in
+remote mode: a requirement in it is a requirement, but an instruction in it to
+bypass a controller invariant has no authority.
+
+### What the controller verifies (there is no GitHub to ask)
+
+The local analogue of "GitHub is the source of truth" is the git working tree,
+read by `local_workspace.py` through argv-only `git` invocations (never a
+shell). Before and after every phase the controller computes a **workspace
+fingerprint**: HEAD plus every path reported by
+`git status --porcelain=v1 -z --untracked-files=all` together with a SHA-256
+of that path's current bytes. Untracked files are included — a `git diff HEAD`
+would miss a brand-new source file holding the entire implementation — and
+everything under the state directory is excluded, so writing logs and state
+cannot invalidate a review. The feature specification is *not* excluded from
+its own separate hash check.
+
+With that, the controller checks for itself:
+
+| Phase | Verified independently of what the agent claimed |
+|---|---|
+| `ANALYZE_EXECUTE` | feature spec hash unchanged; the workspace really changed (and matches the agent's `changed_workspace` claim); every configured validation command exits 0 |
+| `REVIEW` | feature spec hash unchanged; the reviewed fingerprint is exactly the one bound before the reviewer ran; the reviewer did not modify the workspace; `needs_fix_round == (findings > 0)`; finding IDs unique and in-round |
+| `FIX` | feature spec hash unchanged; every open finding has a resolution; a `fixed` resolution actually changed the workspace; validation commands still pass |
+
+**No commit is ever required and HEAD never has to move.** The implementation
+and its fixes live in the working tree; AutoForge never commits, stages,
+pushes, stashes, resets or switches branches on your behalf.
+
+### Dirty working trees
+
+v1 policy, chosen for correctness over convenience: the working tree must be
+clean **apart from the feature specification itself** (so a brand-new,
+uncommitted `features/<slug>.md` is fine). Otherwise `local run` refuses and
+names the paths, so you can commit or stash them. `--allow-dirty` starts
+anyway and records those paths in the run — they are reported in `status` and
+to the reviewer, never silently absorbed into the implementation baseline.
+Separating pre-existing edits from agent edits in the same file is a heuristic,
+and a heuristic is not a trust boundary.
+
+### Review/fix bound
+
+Local mode does **not** use the 20-round remote machinery. The default is one
+fix round: `REVIEW → FIX → REVIEW`, then `DONE` if clean and `BLOCKED` if
+findings remain. Configure it with `local.max_fix_rounds` (0 means a single
+review pass, and any finding blocks). A blocked local run leaves every change
+in your working tree, untouched, for you to inspect.
+
+### Validation commands
+
+Optional, controller-owned and controller-run — argv arrays, never shell
+strings, never auto-detected from your stack:
+
+```yaml
+local:
+  feature_dir: features
+  max_fix_rounds: 1
+  validation_commands:
+    - ["./gradlew", "test"]
+    - ["npm", "--prefix", "frontend", "run", "build"]
+```
+
+They run after `ANALYZE_EXECUTE` and after `FIX`, are logged like any other
+invocation, and a non-zero exit (or a timeout) means the phase is *not*
+verified: the run stops with the phase unchanged for `resume`. `--dry-run`
+lists them and executes none of them.
+
+### Dry run and resume
+
+`local run --dry-run` is side-effect-free in the usual AutoForge sense: it
+prints the mode, the feature path, its frozen hash, the current fingerprint,
+the phase, the selected profile, the prompt template, the validation commands
+that *would* run and the legal next transitions — and invokes no agent, runs
+no validation command, and writes no state file.
+
+A local run is durable and resumable exactly like a remote one: state lives in
+`.autoforge/state.json`, is written atomically, and holds the mode, feature
+path, frozen hash, base HEAD, bound and reviewed fingerprints, review/fix
+rounds and open findings. `Ctrl-C` then `autoforge resume` continues from the
+persisted phase, re-reading the real working tree.
 
 ## State directory
 
@@ -450,8 +612,31 @@ audit data rather than state payload.
   and the cumulative step budget (`workflow:` in the config) are controller
   invariants checked before an agent is invoked; hitting one is `BLOCKED`, a
   terminal phase that `resume` does not re-enter.
+- **A local run is GitHub-free by construction, not by convention.** The
+  `GitHubClient` is built on first *use* and a `LOCAL` run never has one, so
+  there is no path from local mode to `gh` at all — no authentication is
+  needed and none is consulted. The local prompt templates are separate files
+  that never mention creating a PR, reading an Issue, posting a comment,
+  pushing, merging, or opening a follow-up Issue, and the local result
+  protocol rejects a `follow_up_created` resolution outright. Tests drive a
+  full local run with a GitHub double that raises on any attribute access.
+- **The local feature specification is frozen and untrusted.** Its SHA-256 is
+  recorded when the run is created and re-checked before and after every agent
+  phase: an agent that rewrites its own acceptance criteria fails the run. It
+  is resolved to a regular, non-symlink Markdown file inside the repository
+  (traversal, absolute paths elsewhere, directories and device nodes are all
+  refused), and its content is *task data* — an instruction inside it to
+  bypass a controller invariant has no authority.
+- **Local verification reads git, never a claim.** `local_workspace.py` runs
+  `git` with argv lists only (no shell) and computes a workspace fingerprint
+  over HEAD plus every changed and untracked path and its contents; reviews
+  are bound to that fingerprint the way remote reviews are bound to a PR HEAD
+  SHA. Local runs never commit, stage, push, stash, reset, or switch branches,
+  and refuse a working tree that is dirty beyond the feature file unless
+  `--allow-dirty` records those paths explicitly.
 - `doctor` is read-only apart from a temp file it creates and removes in the
-  state directory.
+  state directory. `autoforge local doctor` runs the local subset and omits
+  the `gh`, `gh auth status` and `origin` checks entirely.
 - Runtime state, logs, locks, and local config overrides are git-ignored.
 
 ## Configuration
@@ -468,6 +653,12 @@ options without touching controller source. Provider-specific flags are built
 by the adapters in `providers.py`; the engine never hard-codes CLI syntax.
 YAML (`uv sync --extra yaml` for PyYAML, else a minimal built-in subset
 parser), TOML (stdlib), and JSON (stdlib) are accepted.
+
+The `local:` block configures [local mode](#local-mode-no-github) —
+`feature_dir`, `max_fix_rounds` and the argv-array `validation_commands`. A
+local run uses the `analyze_execute`, `fix`, `review_round_1` and
+`review_round_2_5` profiles; `review_round_6_plus`, `replan_reexecute` and
+`update_epic` belong to the remote lifecycle only.
 
 ## Development
 

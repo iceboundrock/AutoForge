@@ -201,3 +201,39 @@ github:
   # `gh` binary name / path. All GitHub reads/verification go through `gh`.
   command: gh
   timeout_seconds: 120
+
+# ---------------------------------------------------------------------------
+# LOCAL mode (`autoforge local init|run|doctor`).
+#
+# A separate, GitHub-free workflow over a feature Markdown file and the local
+# working tree:
+#
+#   features/<slug>.md -> ANALYZE_EXECUTE -> REVIEW -> FIX -> REVIEW -> DONE
+#
+# A local run makes zero `gh` invocations, needs no GitHub authentication,
+# creates no PR, pushes nothing and commits nothing: the implementation stays
+# in the working tree. It uses the analyze_execute / fix / review_round_1 /
+# review_round_2_5 profiles above; there is no replan and no EPIC update.
+local:
+  # Where `autoforge local init <slug>` writes features/<slug>.md. This is
+  # project content you may commit -- never .autoforge/, which stays runtime
+  # state. `local init` refuses to overwrite an existing file without --force.
+  feature_dir: features
+
+  # Review/fix bound. The default is: REVIEW -> at most one FIX -> REVIEW,
+  # then DONE if clean, BLOCKED if findings remain (two review passes, one fix
+  # pass). 0 means a single review pass, where any finding blocks. This is
+  # deliberately not the 20-round remote loop.
+  max_fix_rounds: 1
+
+  # Controller-owned validation, run by AutoForge (not by an agent) after
+  # ANALYZE_EXECUTE and after FIX. Each entry is an argv ARRAY, never a shell
+  # string: no shell is involved, so quoting, globs, pipes and `&&` do not
+  # work by design. A non-zero exit or a timeout means the phase is not
+  # verified and the run stops with the phase unchanged for `resume`.
+  # `--dry-run` lists them and runs none of them. Nothing is auto-detected;
+  # if this list is empty, the controller runs no checks of its own.
+  validation_commands: []
+    # - ["uv", "run", "pytest", "-q"]
+    # - ["./gradlew", "test"]
+    # - ["npm", "--prefix", "frontend", "run", "build"]

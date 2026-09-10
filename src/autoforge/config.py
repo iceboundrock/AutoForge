@@ -193,6 +193,31 @@ class WorkflowConfig:
 
 
 @dataclass
+class LocalConfig:
+    """LOCAL-mode settings (``local:`` in the config file).
+
+    ``validation_commands`` are **controller-owned** checks: argv arrays, run
+    through :mod:`autoforge.executor` with no shell, after every local
+    implementation and fix phase. A non-zero exit means the phase is not
+    successfully verified. There is no automatic build-system detection: what
+    is not configured here is not run.
+    """
+
+    # Where ``autoforge local init`` writes feature specifications. Project
+    # data, never under the runtime state directory.
+    feature_dir: str = "features"
+    validation_commands: list[list[str]] = field(default_factory=list)
+    # Local review/fix bound: the initial REVIEW, at most this many FIX
+    # rounds, then a final REVIEW. 0 disables FIX entirely (one review pass).
+    max_fix_rounds: int = 1
+
+    @property
+    def max_review_rounds(self) -> int:
+        """Review passes a local run may complete (fix rounds + the first)."""
+        return self.max_fix_rounds + 1
+
+
+@dataclass
 class AutoForgeConfig:
     version: int = CONFIG_VERSION
     state_dir: str = ".autoforge"
@@ -203,6 +228,7 @@ class AutoForgeConfig:
     merge: MergeConfig = field(default_factory=MergeConfig)
     review: ReviewConfig = field(default_factory=ReviewConfig)
     workflow: WorkflowConfig = field(default_factory=WorkflowConfig)
+    local: LocalConfig = field(default_factory=LocalConfig)
     profiles: dict[str, ProfileConfig] = field(default_factory=dict)
 
     def profile(self, name: str) -> ProfileConfig:
@@ -366,6 +392,39 @@ def _as_str_list(raw: object, source: str, key: str) -> list[str]:
     return out
 
 
+def _as_argv_list(raw: object, source: str, key: str) -> list[list[str]]:
+    """A list of argv arrays -- never a shell string.
+
+    ``[["./gradlew", "test"]]`` is accepted; ``["./gradlew test"]`` is not.
+    A command line is not parsed, split or handed to a shell anywhere in
+    AutoForge, so accepting a string here would create the one place where a
+    quoting bug turns into arbitrary command execution.
+    """
+    if raw is None:
+        raise ConfigurationError(
+            f"{source}: {key} is null; write [] to set it empty deliberately, "
+            "or remove the key to keep the default"
+        )
+    if isinstance(raw, str) or not isinstance(raw, list):
+        raise ConfigurationError(f"{source}: {key} must be a list of argv arrays, got {raw!r}")
+    out: list[list[str]] = []
+    for index, entry in enumerate(raw):
+        if isinstance(entry, str) or not isinstance(entry, list) or not entry:
+            raise ConfigurationError(
+                f"{source}: {key}[{index}] must be a non-empty argv array such as "
+                f'["pytest", "-q"] -- a shell command string is never accepted, got {entry!r}'
+            )
+        argv: list[str] = []
+        for item in entry:
+            if not isinstance(item, str) or not item.strip():
+                raise ConfigurationError(
+                    f"{source}: {key}[{index}] must contain non-empty strings, got {item!r}"
+                )
+            argv.append(item)
+        out.append(argv)
+    return out
+
+
 def _as_bool(raw: object, source: str, key: str) -> bool:
     """Accept only a real boolean — never coerce strings like "false" to True."""
     if isinstance(raw, bool):
@@ -498,6 +557,23 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
         raise ConfigurationError(
             f"{source}: 'review.replan.hard_threshold' must be <= 'workflow.max_review_rounds'"
         )
+    local = data.get("local", {}) or {}
+    if not isinstance(local, dict):
+        raise ConfigurationError(f"{source}: 'local' must be a mapping")
+    if "feature_dir" in local:
+        feature_dir = str(local["feature_dir"]).strip()
+        if not feature_dir:
+            raise ConfigurationError(f"{source}: 'local.feature_dir' must not be empty")
+        base.local.feature_dir = feature_dir
+    if "validation_commands" in local:
+        base.local.validation_commands = _as_argv_list(
+            local["validation_commands"], source, "local.validation_commands"
+        )
+    if "max_fix_rounds" in local:
+        value = _as_int(local["max_fix_rounds"], source, "local.max_fix_rounds")
+        if value < 0:
+            raise ConfigurationError(f"{source}: 'local.max_fix_rounds' must be >= 0, got {value}")
+        base.local.max_fix_rounds = value
     profiles = data.get("profiles", {}) or {}
     if not isinstance(profiles, dict):
         raise ConfigurationError(f"{source}: 'profiles' must be a mapping")
