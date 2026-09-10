@@ -395,7 +395,8 @@ audit data rather than state payload.
 - **Pre-merge verification is controller-side and fails closed.** It runs in
   `READY_FOR_MERGE` (before `MERGE` is entered) and again in `MERGE` (before
   the write), reading only controller state and GitHub — never an agent
-  claim. GitHub must report: PR open at the reviewed HEAD, not a draft, every
+  claim. GitHub must report: PR open at the reviewed HEAD, not a draft, no
+  change to any `safety.protected_merge_paths` entry (see below), every
   check in the status rollup succeeded (all checks, not only required ones),
   `mergeable = MERGEABLE`, `mergeStateStatus` in `CLEAN`/`HAS_HOOKS`, no
   auto-merge armed, and no merge queue on the base branch (`gh pr merge`
@@ -403,13 +404,28 @@ audit data rather than state payload.
   asynchronous merge the controller does not own). Conclusive negatives
   (closed PR, conflict, failing check, branch protection, queue) -> `BLOCKED`;
   inconclusive data (checks still running, `mergeable = UNKNOWN`, or the PR /
-  merge-queue read itself failing transiently: timeout, connection error,
+  changed-file / merge-queue read itself failing transiently: timeout, connection error,
   5xx, rate limit) raises and keeps the phase so `resume --allow-merge` (or
   `step --allow-merge`) re-checks, one attempt per invocation, at most
   `merge.max_verification_attempts` times (default 5), then `BLOCKED`. A read
   that fails conclusively (bad credentials, missing permissions, a PR that no
   longer resolves) is `BLOCKED` immediately: re-running would not change it.
   Either way nothing is merged. HEAD drift -> `REVIEW`.
+- **A PR is never merged unattended if it redefines its own checks.** The
+  hosted `ci` result the gate above trusts is produced by the workflow files
+  *in the PR*: GitHub runs the PR's copy of `.github/workflows/` and reports
+  it under the same check name, and a branch ruleset cannot help, because the
+  required check is defined by the branch it gates. So the controller reads
+  the PR's changed files and `BLOCK`s when any of them matches
+  `safety.protected_merge_paths` (default `.github/workflows/`), naming the
+  paths; a human reviews and merges that PR themselves. A changed-file
+  listing GitHub may have truncated is refused too — a short listing cannot
+  prove a protected path was left alone. Setting the list to `[]` disables
+  the gate. What this gates is the *definition* of the checks, not the
+  trustworthiness of a green run: the commands still execute the PR's own
+  code, so a PR can weaken what its tests assert without touching a
+  protected path. That residual gap is why merge stays behind
+  `safety.allow_merge` + `--allow-merge`.
 - **Post-merge is reconciled from GitHub.** The merge is counted only after
   GitHub reports `MERGED` at the reviewed HEAD (idempotently, across crashes).
   If `gh pr merge` returns but the PR is still open, any auto-merge that call
@@ -473,6 +489,19 @@ instead of a vacuously green PR. The same ruleset requires a pull request
 (with zero required approvals, since GitHub forbids self-approval and any
 higher count would deadlock the controller's own merge) and blocks force-push
 and deletion of `main`.
+
+**What a green `ci` does and does not prove.** It proves the suite passed on
+GitHub's runners for that commit, which is strictly more than an agent's
+claim that it ran the tests. It is not a signal independent of the PR: the
+workflow that defines the check, and the code the check runs, both come from
+the PR. Two things bound that. The controller refuses to merge a PR that
+touches `safety.protected_merge_paths` (default `.github/workflows/`), so a
+PR cannot redefine the check that clears it — that refusal lives in the
+controller, in version control and under test, rather than in a repository
+setting that can drift unnoticed. And a PR that weakens its own tests without
+touching a protected path still has to pass the review phase, whose findings
+are what the loop bounds act on. Neither replaces a human reading the diff,
+which is why `safety.allow_merge` is off by default.
 
 Tests never call real Claude Code, OpenCode or GitHub write APIs. Agents are
 replaced by a `ScriptedProvider` and GitHub by an in-memory fake; the

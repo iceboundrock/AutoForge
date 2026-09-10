@@ -458,6 +458,54 @@ def test_get_pr_checks_parses_check_runs_and_status_contexts():
     assert [(c.name, c.outcome) for c in checks] == [("ci", "success"), ("legacy", "pending")]
 
 
+def test_get_pr_changed_files_reports_paths_and_truncation():
+    seen = []
+
+    def ok(req):
+        seen.append(req.command)
+        return _res(
+            {
+                "files": [{"path": ".github/workflows/ci.yml"}, {"path": "README.md"}],
+                "changedFiles": 2,
+            }
+        )
+
+    changed = _client(ok).get_pr_changed_files("https://github.com/o/r/pull/42")
+    assert changed.paths == (".github/workflows/ci.yml", "README.md")
+    assert changed.complete is True
+    assert seen[0][:3] == ["gh", "pr", "view"] and "files,changedFiles" in seen[0]
+
+    # GitHub returns only the first page: the listing proves nothing about the rest.
+    short = _client(
+        lambda req: _res({"files": [{"path": "README.md"}], "changedFiles": 137})
+    ).get_pr_changed_files("https://github.com/o/r/pull/42")
+    assert short.total == 137 and short.complete is False
+
+
+@pytest.mark.parametrize(
+    ("payload", "needle"),
+    [
+        ({"changedFiles": 1}, "unavailable"),  # no 'files' at all
+        ({"files": "README.md", "changedFiles": 1}, "unavailable"),  # not a list
+        ({"files": [{"path": ""}], "changedFiles": 1}, "unusable entry"),
+        ({"files": ["README.md"], "changedFiles": 1}, "unusable entry"),  # not a mapping
+        ({"files": [], "changedFiles": "2"}, "not a count"),
+        ({"files": [], "changedFiles": True}, "not a count"),  # bool is not a count
+        ({"files": []}, "not a count"),
+    ],
+)
+def test_get_pr_changed_files_fails_closed_on_unusable_data(payload, needle):
+    with pytest.raises(GitHubError, match=needle):
+        _client(lambda req: _res(payload)).get_pr_changed_files("https://github.com/o/r/pull/42")
+
+
+def test_get_pr_changed_files_propagates_gh_failure():
+    with pytest.raises(GitHubError, match="failed"):
+        _client(lambda req: _res({}, exit_code=1, stderr="boom")).get_pr_changed_files(
+            "https://github.com/o/r/pull/42"
+        )
+
+
 def test_get_pr_merge_queue_status_uses_graphql_and_fails_closed():
     seen = []
 

@@ -198,6 +198,24 @@ class PRInfo:
 
 
 @dataclass(frozen=True)
+class ChangedFiles:
+    """The paths a PR touches, and whether that listing is provably complete.
+
+    ``gh pr view --json files`` returns only the first page of a PR's files,
+    so a listing shorter than ``total`` says nothing about the paths it does
+    not contain. A caller that uses this to *refuse* something must fail
+    closed when :attr:`complete` is false rather than read absence as proof.
+    """
+
+    paths: tuple[str, ...]
+    total: int
+
+    @property
+    def complete(self) -> bool:
+        return len(self.paths) >= self.total
+
+
+@dataclass(frozen=True)
 class MergeQueueStatus:
     """Merge-queue facts for a PR (GraphQL only; not exposed by ``gh pr view``)."""
 
@@ -466,6 +484,31 @@ class GitHubClient:
 
     def get_pr_checks(self, url: str) -> list[CheckInfo]:
         return self.get_pr(url).checks
+
+    def get_pr_changed_files(self, url: str) -> ChangedFiles:
+        """Every path the PR changes, with GitHub's own count for truncation.
+
+        Missing, non-list or unusable data raises GitHubError (fail closed);
+        a short listing is reported as incomplete rather than as "these are
+        all the files".
+        """
+        ref = parse_pr_url(url)
+        data = self._api_json(["pr", "view", ref.canonical, "--json", "files,changedFiles"])
+        raw = data.get("files")
+        if not isinstance(raw, list):
+            raise GitHubError(f"changed files of {ref.canonical} unavailable: {data}")
+        paths: list[str] = []
+        for entry in raw:
+            path = entry.get("path") if isinstance(entry, dict) else None
+            if not isinstance(path, str) or not path:
+                raise GitHubError(
+                    f"changed files of {ref.canonical} contain an unusable entry: {entry!r}"
+                )
+            paths.append(path)
+        total = data.get("changedFiles")
+        if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+            raise GitHubError(f"changedFiles of {ref.canonical} is not a count: {total!r}")
+        return ChangedFiles(paths=tuple(paths), total=total)
 
     def get_pr_merge_queue_status(self, url: str) -> MergeQueueStatus:
         """Whether the PR's base branch requires a merge queue / the PR is enqueued.

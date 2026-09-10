@@ -9,6 +9,15 @@
 # No secrets are needed and none are granted: the tests use scripted
 # providers and an in-memory GitHub fake, and never invoke `gh`, Claude Code
 # or OpenCode for real.
+#
+# Trust boundary: GitHub runs the *pull request's* copy of this file and
+# reports the result under the same `ci` check name, so a PR that edits this
+# workflow also edits what its own green check means. A branch ruleset cannot
+# close that — the required check is defined by the branch it gates. The
+# controller closes it instead: `safety.protected_merge_paths` (default
+# `.github/workflows/`) makes any PR that touches these files BLOCK in
+# READY_FOR_MERGE / MERGE for a human to review and merge. See README,
+# "What a green `ci` does and does not prove".
 name: CI
 
 on:

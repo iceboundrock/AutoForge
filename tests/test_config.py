@@ -352,3 +352,63 @@ def test_replan_config_validation(tmp_path, body, needle):
     path.write_text(body, encoding="utf-8")
     with pytest.raises(ConfigurationError, match=needle):
         load_config_file(path)
+
+
+# -- safety.protected_merge_paths (PR #38 review R2-F1) -------------------------------
+def test_default_protected_merge_paths_cover_the_workflow_definitions():
+    """The hosted checks the merge gate trusts are defined by these files."""
+    safety = default_config().safety
+    assert safety.protects(".github/workflows/ci.yml")
+    assert safety.protects(".github/workflows/nested/other.yaml")
+    assert safety.protects(".github/workflows")  # the directory itself (rename/delete)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "src/autoforge/engine.py",
+        ".github/ISSUE_TEMPLATE.md",
+        ".github/workflows-notes.md",  # prefix must not match a sibling name
+        "docs/.github/workflows/ci.yml",  # only repo-root paths are protected
+    ],
+)
+def test_unprotected_paths_are_not_matched(path):
+    assert not default_config().safety.protects(path)
+
+
+def test_protected_merge_paths_accept_exact_paths_and_patterns(tmp_path):
+    p = tmp_path / "cfg.json"
+    p.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "safety": {"protected_merge_paths": ["Makefile", "*.lock", "ci/"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    safety = load_config_file(p).safety
+    assert safety.protected_merge_paths == ["Makefile", "*.lock", "ci/"]
+    assert safety.protects("Makefile") and safety.protects("uv.lock")
+    assert safety.protects("ci/run.sh") and not safety.protects("cirrus/run.sh")
+    assert not safety.protects("src/Makefile.in")
+
+
+def test_empty_protected_merge_paths_disables_the_gate(tmp_path):
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps({"version": 1, "safety": {"protected_merge_paths": []}}), "utf-8")
+    safety = load_config_file(p).safety
+    assert safety.protected_merge_paths == []
+    assert not safety.protects(".github/workflows/ci.yml")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [".github/workflows/", 5, [".github/workflows/", 7], ["  "]],
+)
+def test_protected_merge_paths_must_be_a_list_of_non_empty_strings(tmp_path, value):
+    """A bare string is rejected rather than silently iterated per character."""
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps({"version": 1, "safety": {"protected_merge_paths": value}}), "utf-8")
+    with pytest.raises(ConfigurationError, match="protected_merge_paths"):
+        load_config_file(p)

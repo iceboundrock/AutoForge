@@ -1051,6 +1051,66 @@ def test_merge_blocks_on_draft_pr(tmp_state_dir, fake_github):
     assert fake_github.merges == []
 
 
+# -- MERGE: the PR may not redefine the checks the gate trusts (PR #38 review R2-F1) ---------
+# GitHub runs the *PR's* copy of `.github/workflows/` and reports it under the
+# same check name, so "every check on the PR succeeded" says nothing about a PR
+# that rewrites those workflows. Such a PR is never merged unattended.
+WORKFLOW_PATH = ".github/workflows/ci.yml"
+
+
+@pytest.mark.parametrize("phase", [Phase.READY_FOR_MERGE, Phase.MERGE])
+def test_merge_blocks_when_the_pr_changes_the_workflow_defining_its_checks(
+    tmp_state_dir, fake_github, phase
+):
+    fake_github.add_pr().checks = [CheckInfo(name="ci", state="COMPLETED", conclusion="SUCCESS")]
+    fake_github.changed_files[PR] = ["README.md", WORKFLOW_PATH]
+    eng = _in_merge(tmp_state_dir, fake_github, phase=phase)
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "BLOCKED"
+    assert WORKFLOW_PATH in eng.state.block_reason
+    assert "README.md" not in eng.state.block_reason  # only the protected paths are named
+    assert fake_github.merges == [] and eng.state.counted_merged_prs == []
+
+
+def test_merge_proceeds_when_the_pr_touches_no_protected_path(tmp_state_dir, fake_github):
+    fake_github.add_pr()
+    # `.github/` itself is not protected -- only the workflow definitions under it.
+    fake_github.changed_files[PR] = ["src/autoforge/engine.py", ".github/ISSUE_TEMPLATE.md"]
+    eng, out = _park_and_step(tmp_state_dir, fake_github)
+    assert out.next_phase == "UPDATE_EPIC" and len(fake_github.merges) == 1
+    assert ("get_pr_changed_files", PR) in fake_github.calls
+
+
+def test_merge_blocks_when_the_changed_file_listing_may_be_truncated(tmp_state_dir, fake_github):
+    """A listing shorter than GitHub's own count cannot prove absence."""
+    fake_github.add_pr()
+    fake_github.changed_files[PR] = ["src/autoforge/engine.py"]
+    fake_github.changed_files_total[PR] = 137
+    eng, out = _park_and_step(tmp_state_dir, fake_github)
+    assert out.next_phase == "BLOCKED" and "1 of 137 changed files" in eng.state.block_reason
+    assert fake_github.merges == []
+
+
+def test_empty_protected_merge_paths_disables_the_gate_and_reads_nothing(
+    tmp_state_dir, fake_github
+):
+    fake_github.add_pr()
+    fake_github.changed_files[PR] = [WORKFLOW_PATH]
+    eng = _in_merge(tmp_state_dir, fake_github)
+    eng.config.safety.protected_merge_paths = []
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "UPDATE_EPIC" and len(fake_github.merges) == 1
+    assert not any(c[0] == "get_pr_changed_files" for c in fake_github.calls)
+
+
+def test_protected_path_gate_runs_before_check_state_is_consulted(tmp_state_dir, fake_github):
+    """A still-running check would only park the run; the redefinition is conclusive."""
+    fake_github.add_pr().checks = [CheckInfo(name="ci", state="IN_PROGRESS")]
+    fake_github.changed_files[PR] = [WORKFLOW_PATH]
+    eng, out = _park_and_step(tmp_state_dir, fake_github)
+    assert out.next_phase == "BLOCKED" and WORKFLOW_PATH in eng.state.block_reason
+
+
 # -- MERGE: asynchronous merge paths (PR #24 review R1-F2) -----------------------------------
 def test_merge_blocks_when_auto_merge_already_armed(tmp_state_dir, fake_github):
     fake_github.add_pr().auto_merge_enabled = True
@@ -1416,8 +1476,13 @@ def _break_queue_read(gh, exc):
     gh.merge_queue_error = exc
 
 
+def _break_files_read(gh, exc):
+    gh.changed_files_error = exc
+
+
 _READ_FAILURES = [
     pytest.param(_break_pr_read, "could not be read", id="pr-read"),
+    pytest.param(_break_files_read, "changed-file listing", id="files-read"),
     pytest.param(_break_queue_read, "merge-queue status", id="queue-read"),
 ]
 
