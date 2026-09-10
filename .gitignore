@@ -15,6 +15,10 @@ venv/
 # temp files or crash leftovers — exclude the whole directory)
 .autoforge/
 
+# The operator's own config (created from autoforge.example.yaml): local to
+# one checkout, may name local paths, and is not the example everyone reads
+autoforge.yaml
+
 # Local config overrides with possible credentials
 autoforge.local.yaml
 autoforge.local.yml
