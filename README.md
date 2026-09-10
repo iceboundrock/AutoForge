@@ -418,10 +418,12 @@ audit data rather than state payload.
   required check is defined by the branch it gates. So the controller reads
   the PR's changed files and `BLOCK`s when any of them matches
   `safety.protected_merge_paths` (default `.github/workflows/`), naming the
-  paths; a human reviews and merges that PR themselves. A changed-file
-  listing GitHub may have truncated is refused too — a short listing cannot
-  prove a protected path was left alone. Setting the list to `[]` disables
-  the gate. What this gates is the *definition* of the checks, not the
+  paths; a human reviews and merges that PR themselves. Both ends of a
+  rename count, so moving a protected file *out* of the protected range is
+  refused like an edit to it. A changed-file listing GitHub may have
+  truncated is refused too — a short listing cannot prove a protected path
+  was left alone. Setting the list to `[]` disables the gate.
+  What this gates is the *definition* of the checks, not the
   trustworthiness of a green run: the commands still execute the PR's own
   code, so a PR can weaken what its tests assert without touching a
   protected path. That residual gap is why merge stays behind

@@ -27,6 +27,7 @@ from autoforge.errors import (  # noqa: E402
 )
 from autoforge.executor import ExecutionResult  # noqa: E402
 from autoforge.github import (  # noqa: E402
+    ChangedFile,
     ChangedFiles,
     CommentInfo,
     IssueInfo,
@@ -120,9 +121,10 @@ class FakeGitHub:
         # for a transient failure).
         self.merge_queue_error: str | GitHubError = ""
         # Changed-file listing per PR (default: no files, listing complete).
+        # Entries are paths, or a ChangedFile to model a rename's two ends.
         # ``changed_files_total`` overrides GitHub's own count to simulate a
         # truncated first page. Same error convention as merge_queue_error.
-        self.changed_files: dict[str, list[str]] = {}
+        self.changed_files: dict[str, list[str | ChangedFile]] = {}
         self.changed_files_total: dict[str, int] = {}
         self.changed_files_error: str | GitHubError = ""
         self.disable_auto_error: str = ""  # non-empty -> disable_auto_merge raises
@@ -278,8 +280,11 @@ class FakeGitHub:
             raise self.changed_files_error
         if self.changed_files_error:
             raise GitHubError(self.changed_files_error)
-        paths = tuple(self.changed_files.get(canonical, []))
-        return ChangedFiles(paths=paths, total=self.changed_files_total.get(canonical, len(paths)))
+        files = tuple(
+            entry if isinstance(entry, ChangedFile) else ChangedFile(path=entry)
+            for entry in self.changed_files.get(canonical, [])
+        )
+        return ChangedFiles(files=files, total=self.changed_files_total.get(canonical, len(files)))
 
     def get_pr_merge_queue_status(self, url: str) -> MergeQueueStatus:
         from autoforge.validation import parse_pr_url

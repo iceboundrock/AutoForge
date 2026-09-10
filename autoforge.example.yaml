@@ -36,6 +36,8 @@ safety:
   # check name, so a PR that edits those files also edits what "every check
   # succeeded" means. The controller cannot verify that from the outside, so
   # READY_FOR_MERGE / MERGE BLOCK such a PR for a human instead of merging it.
+  # Both ends of a rename are matched, so a PR cannot move a protected file
+  # out of the protected range instead of editing it.
   # Entries ending in "/" are directory prefixes; anything else is an exact
   # path or an fnmatch pattern. An empty list disables the gate.
   # This gates the *definition* of the checks, not the trustworthiness of a

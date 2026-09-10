@@ -15,7 +15,7 @@ from autoforge.errors import (
     VerificationError,
 )
 from autoforge.executor import ExecutionResult
-from autoforge.github import CheckInfo, GitHubClient, MergeQueueStatus
+from autoforge.github import ChangedFile, CheckInfo, GitHubClient, MergeQueueStatus
 from autoforge.loop_guard import RESULT_NEEDS_FIX, review_record
 from autoforge.providers import AgentExecutionResult, ScriptedProvider
 from autoforge.state import load_state
@@ -1079,6 +1079,47 @@ def test_merge_proceeds_when_the_pr_touches_no_protected_path(tmp_state_dir, fak
     eng, out = _park_and_step(tmp_state_dir, fake_github)
     assert out.next_phase == "UPDATE_EPIC" and len(fake_github.merges) == 1
     assert ("get_pr_changed_files", PR) in fake_github.calls
+
+
+@pytest.mark.parametrize(
+    ("previous", "path"),
+    [
+        (WORKFLOW_PATH, "docs/old-ci.yml"),  # renamed *out* of the protected range
+        ("docs/old-ci.yml", WORKFLOW_PATH),  # ... and into it
+    ],
+)
+def test_merge_blocks_when_the_pr_renames_a_protected_path(
+    tmp_state_dir, fake_github, previous, path
+):
+    """A rename is one changed file carrying both ends, never a delete plus an add.
+
+    GitHub's GraphQL listing shows only the current name, so a PR that moves
+    `.github/workflows/ci.yml` elsewhere would read as touching nothing
+    protected while removing the very file that defines the check.
+    """
+    fake_github.add_pr().checks = [CheckInfo(name="ci", state="COMPLETED", conclusion="SUCCESS")]
+    fake_github.changed_files[PR] = [ChangedFile(path=path, previous_path=previous)]
+    eng, out = _park_and_step(tmp_state_dir, fake_github)
+    assert out.next_phase == "BLOCKED"
+    assert f"{previous} -> {path}" in eng.state.block_reason  # both ends are named
+    assert fake_github.merges == [] and eng.state.counted_merged_prs == []
+
+
+def test_merge_proceeds_when_a_rename_touches_no_protected_path(tmp_state_dir, fake_github):
+    fake_github.add_pr()
+    fake_github.changed_files[PR] = [ChangedFile(path="docs/b.md", previous_path="docs/a.md")]
+    eng, out = _park_and_step(tmp_state_dir, fake_github)
+    assert out.next_phase == "UPDATE_EPIC" and len(fake_github.merges) == 1
+
+
+def test_a_rename_counts_as_one_file_against_the_truncation_check(tmp_state_dir, fake_github):
+    """Two paths, one file: counting paths would hide a truncated listing."""
+    fake_github.add_pr()
+    fake_github.changed_files[PR] = [ChangedFile(path="docs/b.md", previous_path="docs/a.md")]
+    fake_github.changed_files_total[PR] = 2
+    eng, out = _park_and_step(tmp_state_dir, fake_github)
+    assert out.next_phase == "BLOCKED" and "1 of 2 changed files" in eng.state.block_reason
+    assert fake_github.merges == []
 
 
 def test_merge_blocks_when_the_changed_file_listing_may_be_truncated(tmp_state_dir, fake_github):

@@ -1334,6 +1334,11 @@ class ControllerEngine:
         gates. Such a PR is BLOCKED for a human instead
         (``safety.protected_merge_paths``; an empty list disables the gate).
 
+        Both ends of a rename count: moving a protected file out of the
+        protected range removes its content just as an edit would, and the
+        listing reports that as one file carrying its former path rather
+        than as a deletion.
+
         Fails closed on a listing GitHub may have truncated: a short file
         list cannot prove a protected path was left alone. GitHubError from
         the read propagates for the caller to classify (transient ->
@@ -1349,7 +1354,11 @@ class ControllerEngine:
             return ""
         with self._reading("the changed-file listing"):
             changed = self.github.get_pr_changed_files(pr.url)
-        hits = sorted(path for path in changed.paths if self.config.safety.protects(path))
+        hits = sorted(
+            f"{file.previous_path} -> {file.path}" if file.previous_path else file.path
+            for file in changed.files
+            if any(self.config.safety.protects(path) for path in file.paths)
+        )
         if hits:
             shown = ", ".join(hits[:5]) + (", ..." if len(hits) > 5 else "")
             return (
@@ -1360,7 +1369,7 @@ class ControllerEngine:
             )
         if not changed.complete:
             return (
-                f"GitHub returned {len(changed.paths)} of {changed.total} changed files for "
+                f"GitHub returned {len(changed.files)} of {changed.total} changed files for "
                 f"PR {pr.url}, so the controller cannot prove the PR leaves "
                 f"{', '.join(patterns)} untouched"
             )

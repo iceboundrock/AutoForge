@@ -198,21 +198,53 @@ class PRInfo:
 
 
 @dataclass(frozen=True)
-class ChangedFiles:
-    """The paths a PR touches, and whether that listing is provably complete.
+class ChangedFile:
+    """One file a PR changes, with the path it had before a rename or copy.
 
-    ``gh pr view --json files`` returns only the first page of a PR's files,
-    so a listing shorter than ``total`` says nothing about the paths it does
-    not contain. A caller that uses this to *refuse* something must fail
-    closed when :attr:`complete` is false rather than read absence as proof.
+    A rename is reported by GitHub as a single changed file carrying both
+    ends, not as a delete plus an add, so ``previous_path`` is the only place
+    the path the PR *removed* appears.
+
+    A copy carries a former path too, and is deliberately not distinguished:
+    treating both ends as touched can at worst refuse something harmless,
+    while reading ``status`` to tell them apart would make a caller that
+    refuses depend on GitHub classifying the change the way it expects.
     """
 
-    paths: tuple[str, ...]
+    path: str
+    previous_path: str = ""
+
+    @property
+    def paths(self) -> tuple[str, ...]:
+        """Every path this change touches -- both ends of a rename."""
+        if self.previous_path and self.previous_path != self.path:
+            return (self.path, self.previous_path)
+        return (self.path,)
+
+
+@dataclass(frozen=True)
+class ChangedFiles:
+    """The files a PR touches, and whether that listing is provably complete.
+
+    The listing returns only the first page of a PR's files, so one shorter
+    than ``total`` says nothing about the files it does not contain. A caller
+    that uses this to *refuse* something must fail closed when
+    :attr:`complete` is false rather than read absence as proof.
+    """
+
+    files: tuple[ChangedFile, ...]
     total: int
 
     @property
+    def paths(self) -> tuple[str, ...]:
+        """Every path the PR touches, the former path of a rename included."""
+        return tuple(path for file in self.files for path in file.paths)
+
+    @property
     def complete(self) -> bool:
-        return len(self.paths) >= self.total
+        # Counted in *files*, never in paths: a rename is one file and two
+        # paths, and GitHub's ``changedFiles`` counts files.
+        return len(self.files) >= self.total
 
 
 @dataclass(frozen=True)
@@ -230,6 +262,11 @@ _PR_FIELDS = (
     "autoMergeRequest,isDraft,body,headRepository,headRepositoryOwner,"
     "closingIssuesReferences,statusCheckRollup"
 )
+# One page of a PR's changed files. Deliberately unpaginated: a listing that
+# does not reach GitHub's own ``changedFiles`` count is reported as incomplete
+# and the merge gate fails closed on it, which is the honest answer for a PR
+# too large for the controller to prove anything about.
+_PR_FILES_PAGE_SIZE = 100
 _MERGE_QUEUE_QUERY = (
     "query($owner: String!, $name: String!, $number: Int!) {"
     " repository(owner: $owner, name: $name) {"
@@ -486,29 +523,41 @@ class GitHubClient:
         return self.get_pr(url).checks
 
     def get_pr_changed_files(self, url: str) -> ChangedFiles:
-        """Every path the PR changes, with GitHub's own count for truncation.
+        """Every file the PR changes, a rename's former path included.
 
-        Missing, non-list or unusable data raises GitHubError (fail closed);
-        a short listing is reported as incomplete rather than as "these are
-        all the files".
+        Read through the REST files endpoint rather than ``gh pr view --json
+        files``: the GraphQL type behind that flag carries a file's *current*
+        path only, so a renamed file appears there under its new name alone.
+        A caller refusing on protected paths would then miss a PR that renames
+        a protected file *out* of the protected range -- the same edit
+        dressed differently. REST names the other end ``previous_filename``.
+
+        The count comes from ``gh pr view`` because REST has none, and is read
+        *after* the listing so that a file added between the two reads makes
+        the listing look short (fail closed) rather than complete. Missing,
+        non-list or unusable data raises GitHubError; a short listing is
+        reported as incomplete rather than as "these are all the files".
         """
         ref = parse_pr_url(url)
-        data = self._api_json(["pr", "view", ref.canonical, "--json", "files,changedFiles"])
-        raw = data.get("files")
+        endpoint = f"repos/{ref.repository}/pulls/{ref.number}/files"
+        raw = self._json(["api", f"{endpoint}?per_page={_PR_FILES_PAGE_SIZE}"])
         if not isinstance(raw, list):
-            raise GitHubError(f"changed files of {ref.canonical} unavailable: {data}")
-        paths: list[str] = []
+            raise GitHubError(f"changed files of {ref.canonical} unavailable: {raw!r}")
+        files: list[ChangedFile] = []
         for entry in raw:
-            path = entry.get("path") if isinstance(entry, dict) else None
-            if not isinstance(path, str) or not path:
+            path = entry.get("filename") if isinstance(entry, dict) else None
+            previous = entry.get("previous_filename") if isinstance(entry, dict) else None
+            bad_previous = previous is not None and (not isinstance(previous, str) or not previous)
+            if not isinstance(path, str) or not path or bad_previous:
                 raise GitHubError(
                     f"changed files of {ref.canonical} contain an unusable entry: {entry!r}"
                 )
-            paths.append(path)
+            files.append(ChangedFile(path=path, previous_path=previous or ""))
+        data = self._api_json(["pr", "view", ref.canonical, "--json", "changedFiles"])
         total = data.get("changedFiles")
         if isinstance(total, bool) or not isinstance(total, int) or total < 0:
             raise GitHubError(f"changedFiles of {ref.canonical} is not a count: {total!r}")
-        return ChangedFiles(paths=tuple(paths), total=total)
+        return ChangedFiles(files=tuple(files), total=total)
 
     def get_pr_merge_queue_status(self, url: str) -> MergeQueueStatus:
         """Whether the PR's base branch requires a merge queue / the PR is enqueued.
