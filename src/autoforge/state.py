@@ -36,6 +36,7 @@ from pathlib import Path
 
 from . import __prompt_version__, __protocol_version__, __version__
 from .errors import StateError
+from .loop_guard import validate_review_history
 from .transitions import Phase
 
 STATE_FILENAME = "state.json"
@@ -80,8 +81,15 @@ class AutoForgeState:
     last_fix_resolutions: list[dict] = field(default_factory=list)
     # One entry per completed review round of the current PR (see
     # loop_guard.review_record): round, reviewed_head_sha, result
-    # (needs_fix | clean | stale), finding_count, fingerprint. Drives the
-    # review-round cap and stagnation detection; cleared per PR.
+    # (needs_fix | clean | stale), finding_count, fingerprint (digest of the
+    # round's normalised required_resolution texts), resolutions (one digest
+    # per distinct non-empty normalised required_resolution, clipped to
+    # loop_guard.MAX_PERSISTED_RESOLUTION_DIGESTS) and resolutions_truncated
+    # (True when that clip dropped digests). No review text is persisted.
+    # An entry written before per-finding digests existed has no
+    # 'resolutions' key at all and keeps the count-only stagnation rule; a
+    # present but malformed field is corruption and fails loudly on load.
+    # Drives the review-round cap and stagnation detection; cleared per PR.
     review_history: list[dict] = field(default_factory=list)
 
     merged_since_epic_update: int = 0
@@ -142,8 +150,10 @@ class AutoForgeState:
             raise StateError("state field 'last_fix_resolutions' must be a list")
         if not isinstance(state.next_issue_rejections, list):
             raise StateError("state field 'next_issue_rejections' must be a list")
-        if not isinstance(state.review_history, list):
-            raise StateError("state field 'review_history' must be a list")
+        try:
+            validate_review_history(state.review_history)
+        except StateError as exc:
+            raise StateError(f"state field {exc}") from None
         if not isinstance(state.step_count, int) or isinstance(state.step_count, bool):
             raise StateError("state field 'step_count' must be an integer")
         if not isinstance(state.review_round, int) or isinstance(state.review_round, bool):
