@@ -127,15 +127,17 @@ class HistoricalReviewData:
     def render_findings(self) -> str:
         if not self.findings:
             return "(none)"
-        return self._render_untrusted("\n".join(
-            "- {id} (round {round}, {classification}): {required_resolution}".format(
-                id=f.get("id", "(unknown)"),
-                round=f.get("round", "?"),
-                classification=f.get("classification", "unknown"),
-                required_resolution=f.get("required_resolution", ""),
+        return self._render_untrusted(
+            "\n".join(
+                "- {id} (round {round}, {classification}): {required_resolution}".format(
+                    id=f.get("id", "(unknown)"),
+                    round=f.get("round", "?"),
+                    classification=f.get("classification", "unknown"),
+                    required_resolution=f.get("required_resolution", ""),
+                )
+                for f in self.findings
             )
-            for f in self.findings
-        ))
+        )
 
     def render_observations(self) -> str:
         if not self.observations:

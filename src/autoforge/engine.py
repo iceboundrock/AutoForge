@@ -466,9 +466,7 @@ class ControllerEngine:
             )
             replan_txn = ReplanTransaction.from_dict(s.replan_transaction)
             if replan_txn.escalation:
-                notes.append(
-                    f"replan policy: {json.dumps(replan_txn.escalation, sort_keys=True)}"
-                )
+                notes.append(f"replan policy: {json.dumps(replan_txn.escalation, sort_keys=True)}")
             notes.append(f"replan transaction stage: {replan_txn.stage.value}")
         return StepPlan(
             phase=s.phase.value,
@@ -1652,9 +1650,7 @@ class ControllerEngine:
             except GitHubUnavailableError:
                 raise  # unknown, not absent: stay resumable
             except GitHubError as exc:
-                return self._reject_replan(
-                    txn, f"cannot list replacement PR candidates: {exc}"
-                )
+                return self._reject_replan(txn, f"cannot list replacement PR candidates: {exc}")
             closed = find_non_open_claimant(all_prs, txn)
             if closed.disposition is not Disposition.NONE:
                 return self._reject_replan(txn, closed.reason)
@@ -1809,9 +1805,7 @@ class ControllerEngine:
             # Our close did not land (it failed while the source was still
             # open, or lost a race a human already won). Adopting the CLOSED
             # source now would be adopting someone else's close.
-            return self._reject_replan(
-                txn, f"closing source PR {txn.source_pr_url} failed: {exc}"
-            )
+            return self._reject_replan(txn, f"closing source PR {txn.source_pr_url} failed: {exc}")
         try:
             source = self.github.get_pr(txn.source_pr_url)
         except GitHubUnavailableError:
@@ -1832,9 +1826,7 @@ class ControllerEngine:
         # receipt now, so a resume can tell this close from a human's. Posted
         # only by the step that observed its own close; a resume never posts.
         try:
-            self.github.comment_pr(
-                txn.source_pr_url, render_close_receipt(txn.transaction_id)
-            )
+            self.github.comment_pr(txn.source_pr_url, render_close_receipt(txn.transaction_id))
         except GitHubUnavailableError:
             raise  # receipt unknown: resume sees CLOSED without one and blocks
         except GitHubError as exc:
@@ -2154,9 +2146,7 @@ class ControllerEngine:
                 command=provider.build_command_for(profile, prompt),
                 cwd=self.workdir,
                 timeout_seconds=timeout,
-                metadata=(
-                    self._replan_log_metadata() if phase == Phase.REPLAN_REEXECUTE else {}
-                ),
+                metadata=(self._replan_log_metadata() if phase == Phase.REPLAN_REEXECUTE else {}),
             )
             result: AgentExecutionResult | None = None
             try:

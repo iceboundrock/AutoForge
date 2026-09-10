@@ -407,8 +407,7 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
             setattr(rp, key, value)
     if rp.hard_threshold < rp.soft_threshold:
         raise ConfigurationError(
-            f"{source}: 'review.replan.hard_threshold' must be >= "
-            "'review.replan.soft_threshold'"
+            f"{source}: 'review.replan.hard_threshold' must be >= 'review.replan.soft_threshold'"
         )
     workflow = data.get("workflow", {}) or {}
     if not isinstance(workflow, dict):
@@ -437,8 +436,7 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
             setattr(base.workflow, key, value)
     if base.review.replan.hard_threshold > base.workflow.max_review_rounds:
         raise ConfigurationError(
-            f"{source}: 'review.replan.hard_threshold' must be <= "
-            "'workflow.max_review_rounds'"
+            f"{source}: 'review.replan.hard_threshold' must be <= 'workflow.max_review_rounds'"
         )
     profiles = data.get("profiles", {}) or {}
     if not isinstance(profiles, dict):

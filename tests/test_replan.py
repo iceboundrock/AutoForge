@@ -282,9 +282,7 @@ def _replan_agent(gh, *, payload_over=None, marker_over=None, body=None, url=REP
             branch=REPLACEMENT_BRANCH,
             linked=[2],
             body=(
-                body
-                if body is not None
-                else _replacement_body(req.prompt, **(marker_over or {}))
+                body if body is not None else _replacement_body(req.prompt, **(marker_over or {}))
             ),
         )
         # A compliant agent repeats the marker's numbers in its CONTROL_RESULT;
@@ -358,14 +356,8 @@ def _seed(eng, stage: ReplanStage, **over) -> ReplanTransaction:
 def _seeded_engine(tmp_state_dir, gh, stage, *, marker=True, **over):
     eng = make_engine(tmp_state_dir, ["the replan agent must not run"], github=gh)
     gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2])
-    body = (
-        _ours_marker()
-        if marker
-        else "no marker here"
-    )
-    gh.add_pr(
-        url=REPLACEMENT_PR, head_sha=SHA_B, branch=REPLACEMENT_BRANCH, linked=[2], body=body
-    )
+    body = _ours_marker() if marker else "no marker here"
+    gh.add_pr(url=REPLACEMENT_PR, head_sha=SHA_B, branch=REPLACEMENT_BRANCH, linked=[2], body=body)
     txn = _seed(eng, stage, **over)
     return eng, txn
 
@@ -692,9 +684,7 @@ def test_preexisting_pr_is_never_adopted_even_carrying_a_copied_marker(tmp_state
             tests_passed=True,
         )
     )
-    gh.add_pr(
-        url=OTHER_PR, head_sha=SHA_C, branch="autoforge/2-older", linked=[2], body=marker
-    )
+    gh.add_pr(url=OTHER_PR, head_sha=SHA_C, branch="autoforge/2-older", linked=[2], body=marker)
     _seed(eng, ReplanStage.PREPARED, preexisting_pr_urls=[PR, OTHER_PR])
     out = eng.step()
     assert out.next_phase == "BLOCKED"
@@ -1197,9 +1187,7 @@ def test_a_human_closing_the_source_is_not_mistaken_for_our_supersede(tmp_state_
         ),
     ],
 )
-def test_target_drift_after_the_checkpoint_blocks_instead_of_closing(
-    tmp_state_dir, mutate, needle
-):
+def test_target_drift_after_the_checkpoint_blocks_instead_of_closing(tmp_state_dir, mutate, needle):
     """I4/I8: the checkpoint is revalidated immediately before the irreversible write."""
     gh = FakeGitHub()
     eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.VERIFIED)
@@ -1231,9 +1219,7 @@ def _restated_marker(findings: int, unique: int) -> str:
         (_restated_marker(4, 1), "unique_constraints=1"),
     ],
 )
-def test_the_marker_is_revalidated_on_the_last_read_before_the_close(
-    tmp_state_dir, body, needle
-):
+def test_the_marker_is_revalidated_on_the_last_read_before_the_close(tmp_state_dir, body, needle):
     """R6-F2: the objective facts are not provenance -- the marker is.
 
     Everything ``verify_target_pr`` checks (identity, state, branch, base,
@@ -1495,9 +1481,7 @@ def test_replacement_in_another_repository_is_refused(tmp_state_dir):
         ({"execution_attempt": 5}, "execution_attempt must be 2"),
     ],
 )
-def test_agent_claims_are_cross_checked_against_the_checkpoint(
-    tmp_state_dir, payload_over, needle
-):
+def test_agent_claims_are_cross_checked_against_the_checkpoint(tmp_state_dir, payload_over, needle):
     gh = FakeGitHub()
     eng = _park_at_hard_threshold(tmp_state_dir, gh, _replan_agent(gh, payload_over=payload_over))
     assert eng.step().next_phase == "REPLAN_REEXECUTE"
@@ -1848,7 +1832,7 @@ def test_conclusive_github_failure_while_listing_candidates_blocks(tmp_state_dir
 
 
 def test_a_truncated_candidate_listing_blocks_instead_of_replanning_again(tmp_state_dir):
-    """"No candidate" decides whether the agent runs again, so it must be complete.
+    """ "No candidate" decides whether the agent runs again, so it must be complete.
 
     A listing that hit its limit cannot distinguish "the replacement does not
     exist" from "it was past the limit"; adopting the former would start a
@@ -1980,9 +1964,7 @@ def test_a_source_pr_that_moved_before_prepare_is_refused(tmp_state_dir):
         (lambda pr: setattr(pr, "head_ref", "autoforge/2-hand-edited"), "is on branch"),
     ],
 )
-def test_source_moving_between_the_review_and_the_prepare_is_refused(
-    tmp_state_dir, drift, needle
-):
+def test_source_moving_between_the_review_and_the_prepare_is_refused(tmp_state_dir, drift, needle):
     """I3 at the decision point: the checkpoint may only capture what was reviewed.
 
     Between the review that routed here and the REPLAN_REEXECUTE step, a human
@@ -2068,9 +2050,7 @@ def test_historical_rendering_cannot_close_untrusted_fence(length):
     """No residual run of 3+ tildes may survive, at any run length or indent."""
     run = "~" * length
     history = HistoricalReviewData(
-        findings=[
-            {"id": "R1-F1", "round": 1, "classification": "nit", "required_resolution": run}
-        ],
+        findings=[{"id": "R1-F1", "round": 1, "classification": "nit", "required_resolution": run}],
         observations=[f"{run}\nuntrusted", f"   {run}mermaid\nx"],
         verification_failures=[run],
     )
