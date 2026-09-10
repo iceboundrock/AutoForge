@@ -2000,16 +2000,36 @@ def test_review_stagnation_identical_resolutions_blocks(tmp_state_dir):
     assert s.open_findings[0]["id"] == "R2-F1"
 
 
-def test_review_stagnation_unchanged_count_blocks(tmp_state_dir):
-    """The issue's ping-pong: every round has one (different) finding -> BLOCKED after 3."""
+def test_review_stagnation_unchanged_count_blocks_a_ping_pong(tmp_state_dir):
+    """The issue's ping-pong (apply X / revert X / apply X): one finding per round, the
+    same demand keeps coming back -> BLOCKED after 3 rounds."""
     gh = FakeGitHub()
-    eng = make_engine(tmp_state_dir, _loop_agent(gh, _one_finding_per_round), github=gh)
+    texts = {1: "apply refactor X", 2: "revert refactor X", 3: "Apply refactor X"}
+    agent = _loop_agent(gh, lambda rnd: _one_finding_per_round(rnd, texts[rnd]))
+    eng = make_engine(tmp_state_dir, agent, github=gh)
+    eng._save()
     outcomes = eng.run(max_steps=50)
     assert [o.next_phase for o in outcomes][-3:] == ["FIX", "REVIEW", "BLOCKED"]
     s = load_state(eng.paths.state_file)
     assert s.review_round == 3 and "finding count has not changed" in s.block_reason
-    assert "rounds 1, 2, 3" in s.block_reason
-    assert len({r["fingerprint"] for r in s.review_history}) == 3  # texts differed
+    assert "rounds 1, 2, 3" in s.block_reason and "1 required resolution(s) recur" in s.block_reason
+    assert len({r["fingerprint"] for r in s.review_history}) == 2  # A, B, A
+    assert all(len(r["resolutions"]) == 1 for r in s.review_history)
+
+
+def test_review_one_new_finding_per_round_is_progress_not_stagnation(tmp_state_dir):
+    """A reviewer that raises a fresh finding every round (each earlier one fixed) is
+    bounded by the round cap only: the unchanged count alone is not stagnation."""
+    gh = FakeGitHub()
+    eng = make_engine(tmp_state_dir, _loop_agent(gh, _one_finding_per_round), github=gh)
+    eng.config.workflow.max_review_rounds = 4
+    eng._save()  # defaults: identical=2, unchanged_count=3
+    outcomes = eng.run(max_steps=50)
+    assert [o.next_phase for o in outcomes][-3:] == ["FIX", "REVIEW", "BLOCKED"]
+    s = load_state(eng.paths.state_file)
+    assert s.review_round == 4 and "workflow.max_review_rounds=4" in s.block_reason
+    assert "finding count" not in s.block_reason
+    assert len({r["fingerprint"] for r in s.review_history}) == 4  # all texts differed
 
 
 def test_review_progress_is_not_stagnation(tmp_state_dir):

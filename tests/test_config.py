@@ -268,6 +268,21 @@ def test_workflow_defaults_and_parsing(tmp_path):
     wf = load_config_file(p).workflow
     assert (wf.max_review_rounds, wf.max_total_steps) == (3, 12)
     assert (wf.stagnation_identical_rounds, wf.stagnation_unchanged_count_rounds) == (0, 0)
+    # 2 is the smallest window either rule can act on (see the rejection of 1).
+    p.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "workflow": {
+                    "stagnation_identical_rounds": 2,
+                    "stagnation_unchanged_count_rounds": 2,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    wf = load_config_file(p).workflow
+    assert (wf.stagnation_identical_rounds, wf.stagnation_unchanged_count_rounds) == (2, 2)
     y = tmp_path / "cfg.yaml"
     y.write_text(
         "version: 1\nworkflow:\n  max_review_rounds: 4\nreview:\n  replan:\n"
@@ -284,11 +299,21 @@ def test_workflow_defaults_and_parsing(tmp_path):
         ('{"version": 1, "workflow": {"max_total_steps": 0}}', "max_total_steps.*>= 1"),
         (
             '{"version": 1, "workflow": {"stagnation_identical_rounds": -1}}',
-            "stagnation_identical_rounds.*>= 0",
+            "stagnation_identical_rounds.*0 .rule disabled. or >= 2",
         ),
         (
             '{"version": 1, "workflow": {"stagnation_unchanged_count_rounds": "3"}}',
             "stagnation_unchanged_count_rounds.*must be an integer",
+        ),
+        # A window of 1 compares a round with nothing: it cannot hold a
+        # recurrence, so it would silently disable the unchanged-count rule.
+        (
+            '{"version": 1, "workflow": {"stagnation_unchanged_count_rounds": 1}}',
+            "stagnation_unchanged_count_rounds.*0 .rule disabled. or >= 2.*got 1",
+        ),
+        (
+            '{"version": 1, "workflow": {"stagnation_identical_rounds": 1}}',
+            "stagnation_identical_rounds.*0 .rule disabled. or >= 2.*got 1",
         ),
         ('{"version": 1, "workflow": {"max_review_rounds": true}}', "must be an integer"),
         ('{"version": 1, "workflow": 6}', "'workflow' must be a mapping"),

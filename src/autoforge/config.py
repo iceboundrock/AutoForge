@@ -147,10 +147,15 @@ class WorkflowConfig:
     max_review_rounds: int = 20
     # Consecutive review rounds with findings whose required resolutions are
     # identical (normalised text) before the loop is declared stagnant.
-    # 0 disables this rule (the hard cap above still applies).
+    # 0 disables this rule (the hard cap above still applies); 1 is rejected
+    # because the rule compares rounds against each other.
     stagnation_identical_rounds: int = 2
     # Consecutive review rounds with findings whose finding *count* never
-    # changed before the loop is declared stagnant. 0 disables this rule.
+    # changed, while at least one required resolution recurs within those
+    # rounds (A/B/A ping-pong), before the loop is declared stagnant. Rounds
+    # of entirely new findings are progress and only meet the cap above.
+    # 0 disables this rule; 1 is rejected (a one-round window can hold no
+    # recurrence, so it would disable the rule while looking enabled).
     stagnation_unchanged_count_rounds: int = 3
     # Cumulative executed steps for the whole run (all issues, all phases,
     # across `resume`). Persisted as ``step_count``; the CLI's ``--max-steps``
@@ -408,17 +413,26 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
     workflow = data.get("workflow", {}) or {}
     if not isinstance(workflow, dict):
         raise ConfigurationError(f"{source}: 'workflow' must be a mapping")
-    for key, minimum in (
-        ("max_review_rounds", 1),
-        ("stagnation_identical_rounds", 0),
-        ("stagnation_unchanged_count_rounds", 0),
-        ("max_total_steps", 1),
-    ):
+    for key, minimum in (("max_review_rounds", 1), ("max_total_steps", 1)):
         if key in workflow:
             value = _as_int(workflow[key], source, f"workflow.{key}")
             if value < minimum:
                 raise ConfigurationError(
                     f"{source}: 'workflow.{key}' must be >= {minimum}, got {value}"
+                )
+            setattr(base.workflow, key, value)
+    # Both stagnation rules compare consecutive rounds *against each other*, so
+    # a window of 1 has no meaning: it would compare a round with nothing and
+    # silently disable the unchanged-count rule (which needs a recurrence
+    # inside the window) while making the identical-resolutions rule fire on
+    # the first round that has findings at all. Only 0 disables a rule.
+    for key in ("stagnation_identical_rounds", "stagnation_unchanged_count_rounds"):
+        if key in workflow:
+            value = _as_int(workflow[key], source, f"workflow.{key}")
+            if value < 0 or value == 1:
+                raise ConfigurationError(
+                    f"{source}: 'workflow.{key}' must be 0 (rule disabled) or >= 2 "
+                    f"(the rule compares consecutive review rounds), got {value}"
                 )
             setattr(base.workflow, key, value)
     if base.review.replan.hard_threshold > base.workflow.max_review_rounds:

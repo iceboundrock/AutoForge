@@ -58,12 +58,16 @@ workflow:
   max_review_rounds: 20
   # Stagnation: this many consecutive rounds with findings whose
   # `required_resolution` texts are identical (ids/locations ignored,
-  # whitespace/case-normalised). -> BLOCKED, unless the round has reached
+  # whitespace/case-normalised) -> BLOCKED, unless the round has reached
   # `review.replan.soft_threshold`, which turns it into a replan trigger.
-  # 0 disables the rule.
+  # 0 disables the rule; 1 is rejected (both rules compare consecutive
+  # rounds, so 2 is the minimum).
   stagnation_identical_rounds: 2
   # Stagnation: this many consecutive rounds with findings whose finding
-  # count did not change. Same routing as above. 0 disables the rule.
+  # count did not change AND in which some `required_resolution` recurs
+  # (A/B/A ping-pong). Same routing as above. Rounds of entirely new
+  # findings are progress and only meet max_review_rounds. 0 disables the
+  # rule; 1 is rejected (a one-round window can never contain a recurrence).
   stagnation_unchanged_count_rounds: 3
   # Cumulative step budget of the whole run (all phases, all issues). It is
   # measured on the persisted `step_count`, so `resume` continues the same
