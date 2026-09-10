@@ -20,6 +20,50 @@ The controller owns workflow state, routing, validation, persistence, recovery, 
 
 ---
 
+## Runtime model
+
+AutoForge is a **single-machine client tool**, not a distributed service.
+
+- One controller process runs on an operator's own machine against a local
+  checkout, driving that machine's `git`, `gh`, and agent CLIs under that
+  user's credentials.
+- There is no server, no network API it exposes, no scheduler, no broker, no
+  shared database, and no multi-tenancy. `.autoforge/` is local, per-checkout
+  runtime state belonging to one operator.
+- Concurrency is bounded by OS-level file locking on one host (see
+  **Locking**), not by leases, quorum, or a coordinator. Do not introduce
+  distributed-systems machinery — leader election, consensus, work queues,
+  outbox tables, heartbeat protocols — for problems a single process holding a
+  local lock does not have.
+- The expected failure modes are a closed laptop, `Ctrl-C`, a killed process,
+  and a reboot. Durability requirements come from **crash recovery on one
+  machine**, not from replication or partition tolerance.
+- What *is* remote and concurrent is GitHub, plus the humans acting on it. That
+  is why GitHub is the source of truth, why agent claims are independently
+  re-verified, and why side effects are checkpointed before they are performed
+  — not because the controller itself is distributed.
+
+### The code under work lives on a feature branch or a worktree
+
+AutoForge operates on a working checkout, and never on the default branch
+directly.
+
+- Every implementation, fix, and replacement lifecycle happens on a dedicated
+  feature branch (for example `autoforge/<issue-number>-<slug>`), and a
+  replan's replacement PR is based on the independently verified default
+  branch.
+- Running the controller in a per-issue `git worktree` is the preferred
+  isolation: the operator's main checkout stays usable while an agent works.
+- The repository lock is keyed by the git common dir, so linked worktrees of
+  one checkout contend for the same lock rather than running concurrently.
+- AutoForge does not create, clean up, or delete local branches or worktrees.
+  Leaving local work untouched is safer than inferring ownership or discarding
+  uncommitted changes; the operator owns that lifecycle.
+- Never commit to, push to, reset, or force-update the default branch. Changes
+  reach it only through a reviewed PR merged behind the merge safety gate.
+
+---
+
 ## Instruction precedence
 
 When working in this repository, follow instructions in this order:
@@ -162,6 +206,7 @@ INITIALIZING
 ANALYZE_EXECUTE
 REVIEW
 FIX
+REPLAN_REEXECUTE
 READY_FOR_MERGE
 MERGE
 UPDATE_EPIC
@@ -179,8 +224,14 @@ INITIALIZING -> ANALYZE_EXECUTE
 ANALYZE_EXECUTE -> REVIEW
 REVIEW -> FIX                 when needs_fix_round == true
 FIX -> REVIEW
+REVIEW -> REPLAN_REEXECUTE    when controller replan policy escalates
+REPLAN_REEXECUTE -> REVIEW    replacement PR, fresh round 1
 REVIEW -> READY_FOR_MERGE     when needs_fix_round == false
 ```
+
+`REVIEW` is `REPLAN_REEXECUTE`'s only entry and its only exit: it is the one
+phase where the controller closes an open PR, so a second edge in or out would
+be a second way into that destructive step.
 
 Later milestones may enable:
 
@@ -230,14 +281,24 @@ The REVIEW/FIX cycle must be bounded by the controller, never by prompt wording:
 
 ```yaml
 workflow:
-  max_review_rounds: 6                  # completed review rounds per PR
+  max_review_rounds: 20                 # completed review rounds per PR
   stagnation_identical_rounds: 2        # identical required_resolution texts
   stagnation_unchanged_count_rounds: 3  # unchanged count + a recurring resolution
   max_total_steps: 300                  # cumulative steps of the run
 ```
 
-- A review round at the cap that still has findings enters `BLOCKED` with a clear `block_reason`; no further FIX round is started because its result could never be reviewed. A clean round at the cap proceeds normally. Entering `REVIEW` beyond the cap (stale re-review, HEAD drift, resume) is refused before the reviewer runs.
-- Stagnation is judged on the persisted per-PR `review_history` (round, reviewed SHA, result, finding count, fingerprint of the normalised `required_resolution` texts, per-finding digests of those texts). Only trailing consecutive rounds that ended with findings count; a clean or stale round breaks the streak. The unchanged-count rule additionally requires a `required_resolution` that recurs within the window (A/B/A ping-pong): rounds of entirely new findings, each earlier one resolved, are progress bounded by the round cap only. A value of 0 disables a rule and 1 is rejected by the config loader: both rules compare consecutive rounds, so a one-round window would silently disable the unchanged-count rule instead of bounding it. The per-round digest list is bounded (`MAX_PERSISTED_RESOLUTION_DIGESTS`) and a clipped round is marked; incomplete evidence can still prove a recurrence but never its absence, so such a window keeps the count-only behaviour. A `required_resolution` that normalises to nothing gets no digest and can never form a recurrence. Persisted `review_history` is validated on load: only a *missing* `resolutions` key is old-controller compatibility; a present malformed field is corruption and fails loudly.
+- After a review with findings, the controller evaluates replan policy before blocking for the per-PR cap or stagnation. An eligible replan, including one caused by workflow stagnation or the cap, enters `REPLAN_REEXECUTE`; an exhausted replan limit enters `BLOCKED`. Otherwise a review round at the cap enters `BLOCKED` with a clear `block_reason`; no further FIX round is started because its result could never be reviewed. A clean round at the cap proceeds normally. Entering `REVIEW` beyond the cap (stale re-review, HEAD drift, resume) is refused before the reviewer runs.
+- Stagnation is judged on the persisted per-PR `review_history` (round, reviewed SHA, result, finding count, fingerprint of the normalised `required_resolution` texts, per-finding digests of those texts). Only trailing consecutive rounds that ended with findings count; a clean or stale round breaks the streak. The unchanged-count rule additionally requires a `required_resolution` that recurs within the window (A/B/A ping-pong): rounds of entirely new findings, each earlier one resolved, are progress bounded by the round cap only. A value of 0 disables a rule and 1 is rejected by the config loader: both rules compare consecutive rounds, so a one-round window would silently disable the unchanged-count rule instead of bounding it. The per-round digest list is bounded (`MAX_PERSISTED_RESOLUTION_DIGESTS`) and a clipped round is marked; incomplete evidence can still prove a recurrence but never its absence, so such a window keeps the count-only behaviour. A `required_resolution` that normalises to nothing gets no digest and can never form a recurrence. Persisted `review_history` is validated on load: only a *missing* `resolutions` key is old-controller compatibility; a present malformed field is corruption and fails loudly. A detected stagnation is an eligible replan trigger only from `review.replan.soft_threshold` onwards; below that round it is an immediate block, because a short identical-resolution streak is usually one FIX round that missed a finding and is not worth discarding the PR for. `review.replan.soft_threshold` is authoritative over `workflow.stagnation_*`. There is no separate recovery policy to be authoritative over: a fresh `REPLAN_REEXECUTE` step and a `resume` run the same reducer over the same persisted transaction, and a refusal is persisted as a terminal `REJECTED` stage that `resume` replays — recovery may replay a decision, never launder one.
+- A replan discards the PR that holds the untruncated findings, so it requires complete evidence. `review_history` entries are bounded (`MAX_PERSISTED_FINDINGS_PER_ROUND`, `MAX_REQUIRED_RESOLUTION_CHARS`) and mark any round whose findings were dropped or clipped. A marked round blocks for a human — in the policy and again at the `REPLAN_REEXECUTE` checkpoint — rather than letting a replacement be accepted against a reduced acknowledgement count. The replacement is also re-read and re-verified at its checkpointed HEAD immediately before the old PR is closed, because the checkpoint that authorised the close may be a crash and a `resume` older than the close itself.
+- `REPLAN_REEXECUTE` is the only phase in which the controller performs a destructive GitHub write on agent-produced work, so it is modelled as one durable transaction (`replan_txn.py`) with a monotonic stage lifecycle — `PENDING`, `PREPARED`, `VERIFIED`, `SUPERSEDE_INTENT`, `COMPENSATING`, `SUPERSEDED`, terminal `REJECTED` — rather than a sequence of independent checks. The invariants it must hold:
+  - **Causal provenance.** A replacement belongs to a replan only if it publishes that replan's controller-generated transaction id in an `<!-- autoforge-replan-transaction: {...} -->` marker in its PR body, read back from GitHub. The id is random and persisted *before* the agent is invoked. Shape is never proof: "the only other open PR", a matching branch name, a plausible timestamp, or the agent's own `CONTROL_RESULT` claim can select nothing. Provenance also requires *creation order*: `PREPARED` records the repository's highest existing PR number, read before the id is generated, and a PR at or below that watermark can never become the replacement even carrying a copied marker. The watermark is what makes this complete — a snapshot of the issue's open PRs would miss one that was unlinked, unnamed or closed at `PREPARED` and only linked to the issue afterwards. Both attestation channels must also agree: the `CONTROL_RESULT` counts must equal the published marker exactly, and a candidate's body must publish *exactly one* attestation in total — a second copy of this transaction's marker, an unusable marker beside the valid one, and a perfectly valid marker belonging to a *different* transaction are all refusals, because provenance that names two transactions proves neither. Candidate binding and the final read before the close apply that same rule through the same predicate, so "acceptable to adopt" and "still acceptable to close the source for" cannot drift into two rules. Unusable is decided by the marker's *name*, not by the shape of its payload: every complete `<!-- autoforge-replan-transaction: ... -->` comment is classified, whatever it contains — angle brackets included — so a payload that is not a usable attestation is malformed evidence rather than an absent marker. (An *incomplete* marker, one with no closing `-->`, is not a comment and is evidence of nothing; the payload may not span a comment delimiter, so an unterminated marker can never swallow a valid one that follows it.) The candidate listing is repository-wide and read strictly: a marker-bearing PR the agent created before linking it to the issue must be *found and refused* for the missing linkage, never missed. A listing filtered to the issue's own PRs would hide it, and "no candidate exists" is what decides whether the agent is invoked again — so the filtered listing is a convenience, never a provenance boundary, and a listing that may have been truncated is refused rather than reported as empty. The watermark is a proven numeric maximum over all PR states (open, closed and merged alike), never inferred from one creation-time-ordered node, and a listing that reaches the ceiling is refused. Before concluding that no candidate exists, an exhaustive all-states listing is consulted: a marker-bearing non-open PR for this transaction is durably rejected with the PR named, never treated as absent, so a replacement that was closed before recovery cannot cause a second implementation attempt. That listing classifies unusable markers exactly as the open one does — a complete named marker on a post-watermark non-open PR is broken evidence, never absent evidence. The source PR is likewise *read before it is excluded*: it can never be adopted as its own replacement, but a marker for this transaction on the PR being superseded is a rejection naming it, not candidate absence — skipping its body would let marker-bearing work exist while a second implementation attempt started on top of it. A valid marker there for another transaction is left alone, since a source may itself be an earlier replan's replacement; a PR that predates the transaction id is evidence of nothing about it, so its unusable markers neither adopt nor block.
+  - **The decision point is what may be closed.** `REVIEW` records the HEAD and branch it reviewed into the `PENDING` transaction, and `PREPARED` may only checkpoint that exact revision. A source that moved between the review and the replan step (a human push, a stray commit) is refused rather than superseded: the accumulated findings belong to the reviewed revision, and closing the moved one would discard work no review ever saw.
+  - **Checkpointed close with compensation.** The old PR is closed only while *both* the source (identity, OPEN, branch, exact checkpointed HEAD, which is the reviewed HEAD) and the replacement (identity, repository, issue linkage, OPEN, base, branch, exact verified HEAD, and a body that still publishes exactly one valid attestation for this transaction id, restating the same counts) match their checkpoints. GitHub exposes no conditional close — `gh pr close` carries no expected-state precondition — so the compare cannot be fused to the write and the controller must not claim it is. The comparison is therefore *completed after* the write: both sides are re-read **by the confirming step itself**, after the close receipt is published, and a checkpoint that moved inside the close window is compensated by reopening the source PR with an explanatory comment and blocking. Reusing a snapshot the caller read earlier — before the receipt, or before the ownership check — would compare against facts a round trip old and let drift through to be merely blocked later, which leaves a controller close standing over a checkpoint it no longer satisfies. A checkpoint that cannot be *confirmed* counts as one that moved: a conclusive read failure on either side means the close cannot be shown to have been correct, and an unproven close is undone rather than kept. The window cannot be removed, only moved — `SUPERSEDED` is persisted after the last read — so the boundary is exactly "the last read before the write": drift before it is compensated, drift after it is terminal (see **Activation is verified**), and making that boundary as late as possible is the whole of what an implementation can do. A compensation that cannot be confirmed (the reopen fails conclusively, or the PR is still closed afterwards) blocks with the manual step named; a transient failure while compensating leaves the stage untouched so `resume` replays the confirmation rather than closing twice. The window is never resolved by accepting the close.
+  - **Ownership of the side effect.** `SUPERSEDE_INTENT` is persisted before `gh pr close` is called, so a crash anywhere in the write window resumes into disposition rather than into a second attempt. It records an *intent*, though, not a performed write: on its own it cannot tell the controller's close from a human's inside that window. The proof is a **close receipt** — an `<!-- autoforge-replan-close: <transaction id> -->` marker posted with a separate `gh pr comment` only after the controller observed its own close landing — never inside `gh pr close --comment`, whose comment predates the close and can therefore be present even when the close never landed. A source found CLOSED carrying this transaction's receipt was closed by this transaction; one found CLOSED without it (no intent at all, or an intent whose close never ran) blocks instead of being adopted, and is never reopened — the controller must not undo a close it did not make. The close outcome is re-read from GitHub, never inferred from an exit status. A conclusive close failure is never adopted even when the source later reads CLOSED, and an OPEN source already carrying the receipt (a prior close landed then reopened) is never closed again — both block instead.
+  - **The compensation is itself a decision, so it is persisted before it acts.** `COMPENSATING` — carrying the drift that made the close unacceptable — is written *before* `gh pr reopen`. Otherwise a reopen that succeeded and was then lost to a crash would leave the transaction at `SUPERSEDE_INTENT` over an OPEN source, and a resume whose drift had meanwhile settled back would close it a second time, laundering a refusal into a completed supersede. From `COMPENSATING` the only outcomes are a confirmed reopen or a block naming the manual step; the reopen is idempotent, so a source already open needs only the confirmation.
+  - **Activation is verified, not replayed from the journal.** `SUPERSEDED` is persisted before the replacement is installed into controller state, so there is a window in which the journal says "activate this PR" while GitHub no longer agrees — the replacement can be closed, retargeted, moved or have its marker edited. Both checkpoints are therefore re-derived from GitHub on the last read before the write, by the writing step and by a `resume` at `SUPERSEDED` alike. Drift there is terminal rather than compensable: the close was confirmed correct when it happened, against the latest reads anything could be checked against, so undoing it would be its own kind of laundering. The run blocks with both PRs named.
+  - **Rejection monotonicity and UNKNOWN.** A conclusive refusal is written into the transaction as terminal `REJECTED` before the phase blocks, so `resume` replays it. A *transient* GitHub failure is not a refusal: it leaves the stage untouched and stays resumable. This holds for every read the phase makes, the collection of the review evidence included. Ambiguity (several claimants, an unusable marker, an unknown persisted stage) fails closed.
+  - **Crash idempotency.** Every window has one resolution: because the transaction id cannot exist anywhere before it is persisted, "crashed before invoking the agent" and "crashed while the agent ran" are the same recoverable state, and no crash causes a second implementation attempt, a second close, or a second `superseded_prs` entry.
 - The step budget is measured on the persisted cumulative `step_count`, which is never reset by `resume` or by switching issues. CLI `--max-steps` bounds a single invocation only.
 - Failed invocations consume neither a review round nor a `review_history` entry.
 - Hitting any bound is `BLOCKED` (terminal). The open findings and the PR stay for a human; nothing is merged.

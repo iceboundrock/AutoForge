@@ -5,6 +5,8 @@ Legal transitions::
     INITIALIZING     -> ANALYZE_EXECUTE
     ANALYZE_EXECUTE  -> REVIEW
     REVIEW           -> FIX               (needs_fix_round=true)
+    REVIEW           -> REPLAN_REEXECUTE  (controller policy; findings remain)
+    REPLAN_REEXECUTE -> REVIEW             (replacement PR, fresh round 1)
     REVIEW           -> READY_FOR_MERGE   (needs_fix_round=false, HEAD unchanged)
     FIX              -> REVIEW
     READY_FOR_MERGE  -> MERGE             (only behind the merge safety gate)
@@ -35,6 +37,7 @@ class Phase(Enum):
     ANALYZE_EXECUTE = "ANALYZE_EXECUTE"
     REVIEW = "REVIEW"
     FIX = "FIX"
+    REPLAN_REEXECUTE = "REPLAN_REEXECUTE"
     READY_FOR_MERGE = "READY_FOR_MERGE"
     MERGE = "MERGE"
     UPDATE_EPIC = "UPDATE_EPIC"
@@ -53,7 +56,9 @@ STOP_PHASES = TERMINAL_PHASES | frozenset({Phase.READY_FOR_MERGE})
 
 # Phases whose step invokes an agent through a provider. MERGE is NOT one of
 # them: the controller runs `gh pr merge` itself (agents never merge).
-AGENT_PHASES = frozenset({Phase.ANALYZE_EXECUTE, Phase.REVIEW, Phase.FIX, Phase.UPDATE_EPIC})
+AGENT_PHASES = frozenset(
+    {Phase.ANALYZE_EXECUTE, Phase.REVIEW, Phase.FIX, Phase.REPLAN_REEXECUTE, Phase.UPDATE_EPIC}
+)
 
 # Static topology: every edge that can ever be legal (conditions on the
 # CONTROL_RESULT payload are checked in decide_next_phase).
@@ -61,8 +66,11 @@ LEGAL_EDGES: dict[Phase, frozenset[Phase]] = {
     Phase.INITIALIZING: frozenset({Phase.ANALYZE_EXECUTE}),
     Phase.ANALYZE_EXECUTE: frozenset({Phase.REVIEW}),
     # REVIEW -> REVIEW: the PR HEAD moved during the review (stale review).
-    Phase.REVIEW: frozenset({Phase.FIX, Phase.READY_FOR_MERGE, Phase.REVIEW}),
+    Phase.REVIEW: frozenset(
+        {Phase.FIX, Phase.REPLAN_REEXECUTE, Phase.READY_FOR_MERGE, Phase.REVIEW}
+    ),
     Phase.FIX: frozenset({Phase.REVIEW}),
+    Phase.REPLAN_REEXECUTE: frozenset({Phase.REVIEW}),
     Phase.READY_FOR_MERGE: frozenset({Phase.MERGE, Phase.REVIEW}),
     Phase.MERGE: frozenset({Phase.ANALYZE_EXECUTE, Phase.UPDATE_EPIC, Phase.DONE, Phase.REVIEW}),
     Phase.UPDATE_EPIC: frozenset({Phase.ANALYZE_EXECUTE, Phase.DONE}),
@@ -104,6 +112,8 @@ def decide_next_phase(current: Phase, result: dict) -> Phase:
     if current == Phase.ANALYZE_EXECUTE:
         return Phase.REVIEW
     if current == Phase.FIX:
+        return Phase.REVIEW
+    if current == Phase.REPLAN_REEXECUTE:
         return Phase.REVIEW
     if current == Phase.REVIEW:
         needs_fix = need("needs_fix_round")

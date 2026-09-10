@@ -33,6 +33,7 @@ AGENT_TEMPLATES = [
     (Phase.ANALYZE_EXECUTE, "analyze_execute.md"),
     (Phase.REVIEW, "review.md"),
     (Phase.FIX, "fix.md"),
+    (Phase.REPLAN_REEXECUTE, "replan_reexecute.md"),
     (Phase.UPDATE_EPIC, "update_epic.md"),
 ]
 
@@ -107,6 +108,44 @@ def test_fix_prompt_contract():
         "new_head_sha",
     ):
         assert phrase in text, phrase
+
+
+def test_replan_prompt_contract():
+    text = prompts.load_template("replan_reexecute.md")
+    for phrase in (
+        "fresh implementation",
+        "latest default branch",
+        "Previous PR",
+        "Historical review findings",
+        "do not inherit the previous PR's solution",
+        "replacement PR",
+        "CONTROL_RESULT",
+        "fresh_review_round",
+        "{{EXECUTION_ATTEMPT}}",
+        "{{HISTORICAL_FINDING_COUNT}}",
+        "Do not run `gh pr close`",
+        "~~~~untrusted",
+    ):
+        assert phrase in text, phrase
+
+
+def test_replan_prompt_forbids_agent_owned_close_and_local_cleanup():
+    """R8-F4: the agent must neither close/mark the source nor touch worktrees."""
+    text = prompts.load_template("replan_reexecute.md")
+    for phrase in (
+        "The controller, not you, owns the previous PR's lifecycle",
+        "Do not run `gh pr close` on the previous PR",
+        "Do not run `gh pr comment`",
+        "Local branches and\nworktrees are operator-owned",
+        "Do not run `git worktree add`",
+        "Leave the old local branch alone and report it",
+    ):
+        assert phrase in text, phrase
+    for forbidden in (
+        "should be marked or closed as superseded",
+        "Clean up the previous local branch/worktree only when safe",
+    ):
+        assert forbidden not in text, forbidden
 
 
 def test_implementation_prompt_contract():

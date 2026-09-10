@@ -3,12 +3,11 @@
 Business logic must use these typed objects, never parse raw `gh` JSON
 inline. Agents perform content writes (branches, PRs, comments, issues)
 under controller prompts, and the controller only *verifies* what they
-claim through this client. The exceptions are :meth:`GitHubClient.merge_pr`
-and :meth:`GitHubClient.disable_auto_merge`: merging is owned by the
-controller (never by an agent), sits behind the merge safety gate in the
-engine, and is always bound to the reviewed HEAD via ``--match-head-commit``;
-disabling auto-merge only undoes an auto-merge the controller's own merge
-call left armed.
+claim through this client. Controller-owned exceptions are
+:meth:`GitHubClient.merge_pr`, :meth:`GitHubClient.disable_auto_merge`, and
+:meth:`GitHubClient.close_pr` for a verified replacement lifecycle. Merging
+is always behind the safety gate and bound to the reviewed HEAD via
+``--match-head-commit``; closing a superseded PR never deletes its branch.
 """
 
 from __future__ import annotations
@@ -218,6 +217,14 @@ _MERGE_QUEUE_QUERY = (
     " repository(owner: $owner, name: $name) {"
     " pullRequest(number: $number) { isMergeQueueEnabled isInMergeQueue } } }"
 )
+# The highest PR number is read as a proven numeric maximum over every PR
+# state, never inferred from one CREATED_AT-ordered node: creation-time
+# ordering has no numeric tie-breaker, so same-second PRs can return a lower
+# number first and let a higher-numbered pre-existing PR slip past the
+# watermark. Listing `--state all` and taking the maximum covers open,
+# closed and merged PRs alike; a listing that reaches the ceiling is refused
+# rather than reported as a maximum.
+_PR_NUMBER_LIST_FIELDS = "number"
 _PR_LIST_FIELDS = (
     "url,number,title,state,headRefOid,baseRefName,headRefName,isDraft,body,"
     "headRepository,headRepositoryOwner,closingIssuesReferences"
@@ -230,6 +237,10 @@ def _repo_of(url: str) -> str:
     except Exception:
         return ""
 
+
+# `gh pr list` paginates internally to satisfy --limit; this is the ceiling a
+# strict caller is willing to read before declaring the set unknowable.
+STRICT_PR_LIST_LIMIT = 1000
 
 MERGE_METHODS = ("squash", "merge", "rebase")
 _SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -495,7 +506,16 @@ class GitHubClient:
         except GitHubError:
             return False
 
-    def list_open_prs(self, repo: str, limit: int = 100) -> list[PRInfo]:
+    def list_open_prs(self, repo: str, limit: int = 100, *, strict: bool = False) -> list[PRInfo]:
+        """Every open PR in ``repo`` (bodies included), as far as the listing goes.
+
+        ``strict`` raises GitHubError instead of returning a set that may be
+        incomplete: the underlying listing is bounded, and a caller deciding a
+        destructive action on "no candidate exists" must not confuse that with
+        "the candidate was past the limit".
+        """
+        if strict:
+            limit = STRICT_PR_LIST_LIMIT
         data = self._api_list(
             [
                 "pr",
@@ -510,19 +530,116 @@ class GitHubClient:
                 _PR_LIST_FIELDS,
             ]
         )
-        return [self._pr_from_data(d) for d in data if isinstance(d, dict)]
+        prs = [self._pr_from_data(d) for d in data if isinstance(d, dict)]
+        if strict and len(prs) >= limit:
+            raise GitHubError(
+                f"{repo} has at least {limit} open pull requests, so the listing may be "
+                "truncated and the set of candidates cannot be established"
+            )
+        return prs
 
-    def find_open_prs_for_issue(self, issue: GitHubIssueRef | str) -> list[PRInfo]:
+    def list_all_prs(self, repo: str, *, strict: bool = False) -> list[PRInfo]:
+        """Every PR in ``repo`` across all states (bodies included).
+
+        Needed where "no candidate exists" must be proven, not assumed: a
+        replacement the agent created and that was then closed is invisible to
+        :meth:`list_open_prs`, and treating it as absent would start a second
+        implementation attempt. ``strict`` refuses a possibly-truncated
+        listing instead of reporting it as complete.
+        """
+        limit = STRICT_PR_LIST_LIMIT if strict else 100
+        data = self._api_list(
+            [
+                "pr",
+                "list",
+                "--repo",
+                repo,
+                "--state",
+                "all",
+                "--limit",
+                str(limit),
+                "--json",
+                _PR_LIST_FIELDS,
+            ]
+        )
+        prs = [self._pr_from_data(d) for d in data if isinstance(d, dict)]
+        if strict and len(prs) >= limit:
+            raise GitHubError(
+                f"{repo} has at least {limit} pull requests, so the listing may be "
+                "truncated and the set of candidates cannot be established"
+            )
+        return prs
+
+    def latest_pr_number(self, repo: str) -> int:
+        """The largest PR number that currently exists in ``repo`` (0 if none).
+
+        Used as a provenance watermark: a PR whose number is <= the value read
+        before a replan transaction id was generated cannot have been created
+        after it, so it can never be that transaction's replacement even if the
+        marker is later copied into its body.
+
+        Implemented as a proven numeric maximum over ``--state all`` (open,
+        closed and merged alike), never inferred from one CREATED_AT-ordered
+        node. A listing that reaches the ceiling, or malformed number data,
+        raises GitHubError (fail closed) rather than returning an
+        under-estimate that would let a pre-existing PR slip past the
+        watermark.
+        """
+        data = self._api_list(
+            [
+                "pr",
+                "list",
+                "--repo",
+                repo,
+                "--state",
+                "all",
+                "--limit",
+                str(STRICT_PR_LIST_LIMIT),
+                "--json",
+                _PR_NUMBER_LIST_FIELDS,
+            ]
+        )
+        if len(data) >= STRICT_PR_LIST_LIMIT:
+            raise GitHubError(
+                f"{repo} has at least {STRICT_PR_LIST_LIMIT} pull requests, so the latest "
+                "pull-request number cannot be established"
+            )
+        highest = 0
+        for entry in data:
+            if not isinstance(entry, dict):
+                raise GitHubError(
+                    f"latest pull-request number for {repo} is not an object: {entry!r}"
+                )
+            number = entry.get("number")
+            if not isinstance(number, int) or isinstance(number, bool) or number < 1:
+                raise GitHubError(
+                    f"latest pull-request number for {repo} is not a number: {entry!r}"
+                )
+            highest = max(highest, number)
+        return highest
+
+    def find_open_prs_for_issue(
+        self, issue: GitHubIssueRef | str, *, strict: bool = False
+    ) -> list[PRInfo]:
         """Open PRs that unambiguously belong to ``issue``.
 
         A PR matches when GitHub links it as closing the issue, or its head
         branch follows the controller's naming scheme ``autoforge/<n>-...``.
+
+        ``strict`` is passed through to :meth:`list_open_prs`, which refuses a
+        listing it cannot prove complete.
+
+        The two rules are a *convenience*, never a provenance boundary: a PR an
+        agent has created but not yet linked to the issue matches neither, so a
+        caller that must not miss such a PR reads :meth:`list_open_prs` and
+        applies its own test.
         """
         if isinstance(issue, str):
             issue = parse_issue_url(issue)
+        open_prs = self.list_open_prs(issue.repository, strict=strict)
         prefix = re.compile(rf"^autoforge/{issue.number}(?:-|$)")
         out = []
-        for pr in self.list_open_prs(issue.repository):
+        for pr in open_prs:
             if issue.number in pr.linked_issue_numbers or prefix.match(pr.head_ref or ""):
                 out.append(pr)
         return out
@@ -552,6 +669,45 @@ class GitHubClient:
         left armed, so no unreviewed HEAD can merge later on its own.
         """
         self._run_gh(build_disable_auto_merge_argv(url))
+
+    def close_pr(self, url: str, comment: str) -> None:
+        """Close an obsolete PR without merging or deleting any branch.
+
+        ``gh pr close`` takes no precondition -- GitHub has no conditional
+        close -- so a caller that needs the close bound to a checkpoint must
+        complete the comparison *after* the write and undo it with
+        :meth:`reopen_pr` when the checkpoint no longer holds.
+
+        The comment posted here must NOT carry ownership proof: ``gh pr close
+        --comment`` posts the comment as a separate effect before the close
+        lands, so a receipt in it can predate the close and later be mistaken
+        for proof that this transaction closed the PR. Ownership is posted
+        afterwards with :meth:`comment_pr`, only after the close is observed.
+        """
+        ref = parse_pr_url(url)
+        self._run_gh(["pr", "close", ref.canonical, "--comment", comment])
+
+    def comment_pr(self, url: str, body: str) -> None:
+        """Post a follow-up comment on a PR (open or closed).
+
+        Used for the replan close receipt: posted only after the controller
+        observed its own close landing, so presence of the receipt proves the
+        close was this transaction's. Never posted by a resume that did not
+        perform the close.
+        """
+        ref = parse_pr_url(url)
+        self._run_gh(["pr", "comment", ref.canonical, "--body", body])
+
+    def reopen_pr(self, url: str, comment: str) -> None:
+        """Undo a controller close (``gh pr reopen``).
+
+        The compensating half of :meth:`close_pr`: the only supported caller
+        is a checkpointed close whose preconditions turned out to have moved
+        inside the write window. The branch is never deleted by ``close_pr``,
+        so the PR comes back with its commits and review history intact.
+        """
+        ref = parse_pr_url(url)
+        self._run_gh(["pr", "reopen", ref.canonical, "--comment", comment])
 
     # -- comments -----------------------------------------------------------
     def get_pr_comments(self, url: str) -> list[CommentInfo]:

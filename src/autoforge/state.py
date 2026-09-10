@@ -91,6 +91,20 @@ class AutoForgeState:
     # present but malformed field is corruption and fails loudly on load.
     # Drives the review-round cap and stagnation detection; cleared per PR.
     review_history: list[dict] = field(default_factory=list)
+    # Bounded controller-side verification failures relevant to this issue;
+    # supplied to a fresh reimplementation as constraints, not prompt policy.
+    verification_failures: list[str] = field(default_factory=list)
+
+    # Per-issue implementation lifecycle. The original attempt is 1; only a
+    # verified replacement increments it.
+    execution_attempt: int = 1
+    escalation_count: int = 0
+    superseded_prs: list[dict] = field(default_factory=list)
+    # Durable REPLAN_REEXECUTE transaction (see autoforge.replan_txn). Empty
+    # when no replan is in flight; a serialised ``ReplanTransaction`` while
+    # one is. It is the controller's intent record: recovery replays it
+    # rather than re-deriving what the safe disposition should have been.
+    replan_transaction: dict = field(default_factory=dict)
 
     merged_since_epic_update: int = 0
     counted_merged_prs: list[str] = field(default_factory=list)
@@ -154,6 +168,19 @@ class AutoForgeState:
             validate_review_history(state.review_history)
         except StateError as exc:
             raise StateError(f"state field {exc}") from None
+        if not isinstance(state.verification_failures, list) or not all(
+            isinstance(reason, str) for reason in state.verification_failures
+        ):
+            raise StateError("state field 'verification_failures' must be a list of strings")
+        if not isinstance(state.superseded_prs, list):
+            raise StateError("state field 'superseded_prs' must be a list")
+        if not isinstance(state.replan_transaction, dict):
+            raise StateError("state field 'replan_transaction' must be an object")
+        for name in ("execution_attempt", "escalation_count"):
+            value = getattr(state, name)
+            minimum = 1 if name == "execution_attempt" else 0
+            if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+                raise StateError(f"state field {name!r} must be a valid integer")
         if not isinstance(state.step_count, int) or isinstance(state.step_count, bool):
             raise StateError("state field 'step_count' must be an integer")
         if not isinstance(state.review_round, int) or isinstance(state.review_round, bool):
@@ -207,6 +234,11 @@ class AutoForgeState:
         self.open_findings = []
         self.last_fix_resolutions = []
         self.review_history = []
+        self.verification_failures = []
+        self.execution_attempt = 1
+        self.escalation_count = 0
+        self.superseded_prs = []
+        self.replan_transaction = {}
         self.next_issue_rejections = []
         self.attempt = 0
 

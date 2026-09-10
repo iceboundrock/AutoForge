@@ -1984,7 +1984,6 @@ def test_review_stagnation_identical_resolutions_blocks(tmp_state_dir):
     seen: list[str] = []
     agent = _loop_agent(gh, lambda rnd: _one_finding_per_round(rnd, "Add a regression test"), seen)
     eng = make_engine(tmp_state_dir, agent, github=gh)
-    eng._save()  # defaults: identical=2, unchanged_count=3, cap=6
     outcomes = eng.run(max_steps=50)
     assert [o.next_phase for o in outcomes] == [
         "ANALYZE_EXECUTE",

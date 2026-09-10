@@ -27,6 +27,7 @@ from .errors import (
     StateTransitionError,
 )
 from .redaction import redact, redact_argv
+from .replan_txn import ReplanTransaction
 from .state import (
     AutoForgeState,
     StatePaths,
@@ -355,11 +356,26 @@ def cmd_status(args) -> int:
     print()
     print(f"Phase:      {state.phase.value}")
     print(f"Review rounds completed: {state.review_round}")
+    print(f"Execution attempt: {state.execution_attempt}")
+    print(f"Replan count: {state.escalation_count}")
     print(f"Current HEAD:  {state.current_head_sha or '-'}")
     print(f"Reviewed HEAD: {state.reviewed_head_sha or '-'}")
     print(f"Last review:   {state.last_review_result or '-'}")
     print(f"Review comment: {state.last_review_comment_url or '-'}")
     print(f"Open findings: {len(state.open_findings)}")
+    if state.superseded_prs:
+        print("Superseded PRs:")
+        for item in state.superseded_prs:
+            print(f"  {item.get('pr_url', '-')} -> {item.get('replacement_pr_url', '-')}")
+    if state.replan_transaction:
+        txn = ReplanTransaction.from_dict(state.replan_transaction)
+        print(f"Replan transaction: {txn.transaction_id or '(not yet created)'}")
+        print(f"  stage:       {txn.stage.value}")
+        print(f"  source PR:   {txn.source_pr_url or '-'}")
+        print(f"  replacement: {txn.replacement_pr_url or '-'}")
+        print(f"  escalation:  {json.dumps(txn.escalation, sort_keys=True)}")
+        if txn.rejection_reason:
+            print(f"  rejected:    {txn.rejection_reason}")
     if state.block_reason:
         print(f"Reason:     {state.block_reason}")
     print()

@@ -17,6 +17,7 @@ def test_defaults_have_all_logical_profiles():
         "review_round_1",
         "review_round_2_5",
         "review_round_6_plus",
+        "replan_reexecute",
         "update_epic",
     ):
         p = cfg.profile(name)
@@ -242,10 +243,12 @@ def test_real_scalars_still_accepted(tmp_path):
 
 def test_workflow_defaults_and_parsing(tmp_path):
     cfg = default_config()
-    assert cfg.workflow.max_review_rounds == 6
+    assert cfg.workflow.max_review_rounds == 20
     assert cfg.workflow.stagnation_identical_rounds == 2
     assert cfg.workflow.stagnation_unchanged_count_rounds == 3
     assert cfg.workflow.max_total_steps == 300
+    assert cfg.review.replan.soft_threshold == 12
+    assert cfg.review.replan.hard_threshold == 20
     p = tmp_path / "cfg.json"
     p.write_text(
         json.dumps(
@@ -257,6 +260,7 @@ def test_workflow_defaults_and_parsing(tmp_path):
                     "stagnation_unchanged_count_rounds": 0,
                     "max_total_steps": 12,
                 },
+                "review": {"replan": {"soft_threshold": 2, "hard_threshold": 3}},
             }
         ),
         encoding="utf-8",
@@ -280,7 +284,11 @@ def test_workflow_defaults_and_parsing(tmp_path):
     wf = load_config_file(p).workflow
     assert (wf.stagnation_identical_rounds, wf.stagnation_unchanged_count_rounds) == (2, 2)
     y = tmp_path / "cfg.yaml"
-    y.write_text("version: 1\nworkflow:\n  max_review_rounds: 4\n", encoding="utf-8")
+    y.write_text(
+        "version: 1\nworkflow:\n  max_review_rounds: 4\nreview:\n  replan:\n"
+        "    soft_threshold: 4\n    hard_threshold: 4\n",
+        encoding="utf-8",
+    )
     assert load_config_file(y).workflow.max_review_rounds == 4
 
 
@@ -316,3 +324,31 @@ def test_workflow_section_rejects_invalid_values(tmp_path, body, key):
     p.write_text(body, encoding="utf-8")
     with pytest.raises(ConfigurationError, match=key):
         load_config_file(p)
+
+
+@pytest.mark.parametrize(
+    "body,needle",
+    [
+        ('{"version": 1, "review": {"replan": {"soft_threshold": 0}}}', "soft_threshold.*>= 1"),
+        (
+            '{"version": 1, "review": {"replan": {"hard_threshold": 11}}}',
+            "hard_threshold.*soft_threshold",
+        ),
+        (
+            '{"version": 1, "review": {"replan": {"stagnation_window": 0}}}',
+            "stagnation_window.*>= 1",
+        ),
+        ('{"version": 1, "review": {"replan": {"max_findings_per_round": -1}}}', "max_findings"),
+        ('{"version": 1, "review": {"replan": {"max_replans_per_issue": -1}}}', "max_replans"),
+        ('{"version": 1, "review": {"replan": {"enabled": "false"}}}', "enabled.*boolean"),
+        (
+            '{"version": 1, "workflow": {"max_review_rounds": 19}}',
+            "hard_threshold.*max_review_rounds",
+        ),
+    ],
+)
+def test_replan_config_validation(tmp_path, body, needle):
+    path = tmp_path / "cfg.json"
+    path.write_text(body, encoding="utf-8")
+    with pytest.raises(ConfigurationError, match=needle):
+        load_config_file(path)

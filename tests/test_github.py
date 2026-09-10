@@ -7,7 +7,7 @@ import pytest
 
 from autoforge.errors import GitHubError, GitHubNotFoundError, GitHubUnavailableError
 from autoforge.executor import ExecutionResult
-from autoforge.github import GitHubClient
+from autoforge.github import STRICT_PR_LIST_LIMIT, GitHubClient
 
 
 def _res(payload: dict, exit_code: int = 0, stderr: str = "") -> ExecutionResult:
@@ -147,9 +147,37 @@ def test_find_open_prs_for_issue():
             "baseRefName": "main",
         },
     ]
-    gh = _client(lambda req: ExecutionResult(req.command, None, 0, json.dumps(prs), "", "t", "t"))
+    seen = []
+
+    def handler(req):
+        seen.append(req.command)
+        return ExecutionResult(req.command, None, 0, json.dumps(prs), "", "t", "t")
+
+    def limit_of(cmd):
+        return cmd[cmd.index("--limit") + 1]
+
+    gh = _client(handler)
     found = gh.find_open_prs_for_issue("https://github.com/o/r/issues/2")
     assert sorted(p.number for p in found) == [1, 2]
+    assert limit_of(seen[0]) == "100"
+
+    # strict: reads far more before giving up, and refuses a set it cannot
+    # prove complete rather than reporting "no candidate".
+    found = gh.find_open_prs_for_issue("https://github.com/o/r/issues/2", strict=True)
+    assert sorted(p.number for p in found) == [1, 2]
+    assert limit_of(seen[1]) == str(STRICT_PR_LIST_LIMIT)
+
+    full = [
+        dict(prs[0], number=n, url=f"https://github.com/o/r/pull/{n}")
+        for n in range(1, STRICT_PR_LIST_LIMIT + 1)
+    ]
+    truncating = _client(
+        lambda req: ExecutionResult(req.command, None, 0, json.dumps(full), "", "t", "t")
+    )
+    with pytest.raises(GitHubError, match="truncated"):
+        truncating.find_open_prs_for_issue("https://github.com/o/r/issues/2", strict=True)
+    # Non-strict callers are unaffected: a full page is not an error for them.
+    assert truncating.find_open_prs_for_issue("https://github.com/o/r/issues/2")
 
 
 def test_transient_error_retried_once():
@@ -472,6 +500,50 @@ def test_get_pr_merge_queue_status_uses_graphql_and_fails_closed():
         )
 
 
+def test_latest_pr_number_is_a_proven_numeric_maximum_and_fails_closed():
+    """R8-F3: the watermark is a numeric max over all states, not one time-ordered node."""
+    seen = []
+
+    def ok(req):
+        seen.append(req.command)
+        # Deliberately out of creation order: the first node carries the
+        # *lower* number, as same-second CREATED_AT ties can. A watermark
+        # inferred from position would return 41 and let PR 77 slip past.
+        return ExecutionResult(
+            req.command, None, 0, json.dumps([{"number": 41}, {"number": 77}]), "", "t", "t"
+        )
+
+    assert _client(ok).latest_pr_number("o/r") == 77
+    cmd = seen[0]
+    assert cmd[:3] == ["gh", "pr", "list"]
+    assert "--state" in cmd and cmd[cmd.index("--state") + 1] == "all"
+    assert cmd[cmd.index("--limit") + 1] == str(STRICT_PR_LIST_LIMIT)
+    assert "number" in cmd[cmd.index("--json") + 1]
+
+    # A repository with no pull requests at all has watermark 0.
+    assert _client(lambda req: _res([])).latest_pr_number("o/r") == 0
+
+    for payload, needle in [
+        ([{"number": "7"}], "not a number"),
+        ([{"number": 0}], "not a number"),
+        ([{"number": True}], "not a number"),
+        (["7"], "not an object"),
+    ]:
+        with pytest.raises(GitHubError, match=needle):
+            _client(lambda req, p=payload: _res(p)).latest_pr_number("o/r")
+
+    with pytest.raises(GitHubError, match="failed"):
+        _client(lambda req: _res({}, exit_code=1, stderr="boom")).latest_pr_number("o/r")
+
+    # A listing that reaches the ceiling cannot prove a maximum.
+    full = [{"number": n} for n in range(1, STRICT_PR_LIST_LIMIT + 1)]
+    truncating = _client(
+        lambda req: ExecutionResult(req.command, None, 0, json.dumps(full), "", "t", "t")
+    )
+    with pytest.raises(GitHubError, match="cannot be established"):
+        truncating.latest_pr_number("o/r")
+
+
 def test_disable_auto_merge_argv():
     from autoforge.github import build_disable_auto_merge_argv
 
@@ -487,3 +559,119 @@ def test_disable_auto_merge_argv():
     assert seen == [["gh", "pr", "merge", url, "--disable-auto"]]
     with pytest.raises(GitHubError, match="denied"):
         _client(lambda req: _res({}, exit_code=1, stderr="denied")).disable_auto_merge(url)
+
+
+def test_list_open_prs_strict_refuses_a_possibly_truncated_listing():
+    """A repository-wide candidate lookup must not report a limit as "none"."""
+    one = [
+        {
+            "url": "https://github.com/o/r/pull/1",
+            "number": 1,
+            "state": "OPEN",
+            "headRefOid": "a" * 40,
+            "headRefName": "feature/x",
+            "baseRefName": "main",
+            "body": "hello",
+        }
+    ]
+    seen = []
+
+    def handler(req):
+        seen.append(req.command)
+        return ExecutionResult(req.command, None, 0, json.dumps(one), "", "t", "t")
+
+    gh = _client(handler)
+    # Repository-wide: no issue linkage or branch-name filter is applied.
+    assert [p.number for p in gh.list_open_prs("o/r")] == [1]
+    assert seen[0][seen[0].index("--limit") + 1] == "100"
+    assert [p.body for p in gh.list_open_prs("o/r", strict=True)] == ["hello"]
+    assert seen[1][seen[1].index("--limit") + 1] == str(STRICT_PR_LIST_LIMIT)
+
+    full = [
+        dict(one[0], number=n, url=f"https://github.com/o/r/pull/{n}")
+        for n in range(1, STRICT_PR_LIST_LIMIT + 1)
+    ]
+    truncating = _client(
+        lambda req: ExecutionResult(req.command, None, 0, json.dumps(full), "", "t", "t")
+    )
+    with pytest.raises(GitHubError, match="truncated"):
+        truncating.list_open_prs("o/r", strict=True)
+    assert len(truncating.list_open_prs("o/r")) == STRICT_PR_LIST_LIMIT
+
+
+def test_list_all_prs_covers_every_state_and_refuses_truncation():
+    """R8-F2: the closed-claimant check needs an exhaustive all-states listing."""
+    rows = [
+        {
+            "url": "https://github.com/o/r/pull/1",
+            "number": 1,
+            "state": "OPEN",
+            "headRefOid": "a" * 40,
+            "headRefName": "feature/x",
+            "baseRefName": "main",
+            "body": "open",
+        },
+        {
+            "url": "https://github.com/o/r/pull/2",
+            "number": 2,
+            "state": "CLOSED",
+            "headRefOid": "b" * 40,
+            "headRefName": "feature/y",
+            "baseRefName": "main",
+            "body": "closed",
+        },
+        {
+            "url": "https://github.com/o/r/pull/3",
+            "number": 3,
+            "state": "MERGED",
+            "headRefOid": "c" * 40,
+            "headRefName": "feature/z",
+            "baseRefName": "main",
+            "body": "merged",
+        },
+    ]
+    seen = []
+
+    def handler(req):
+        seen.append(req.command)
+        return ExecutionResult(req.command, None, 0, json.dumps(rows), "", "t", "t")
+
+    gh = _client(handler)
+    prs = gh.list_all_prs("o/r", strict=True)
+    assert sorted(p.number for p in prs) == [1, 2, 3]
+    assert seen[0][seen[0].index("--state") + 1] == "all"
+    assert seen[0][seen[0].index("--limit") + 1] == str(STRICT_PR_LIST_LIMIT)
+
+    full = [
+        dict(rows[0], number=n, url=f"https://github.com/o/r/pull/{n}")
+        for n in range(1, STRICT_PR_LIST_LIMIT + 1)
+    ]
+    truncating = _client(
+        lambda req: ExecutionResult(req.command, None, 0, json.dumps(full), "", "t", "t")
+    )
+    with pytest.raises(GitHubError, match="truncated"):
+        truncating.list_all_prs("o/r", strict=True)
+
+
+def test_close_and_reopen_pr_argv():
+    """``reopen_pr`` is the undo half of a checkpointed close; no branch is touched."""
+    url = "https://github.com/o/r/pull/42"
+    seen = []
+
+    def runner(req):
+        seen.append(req.command)
+        return _res({}, exit_code=0)
+
+    gh = _client(runner)
+    gh.close_pr(url, "superseded")
+    gh.comment_pr(url, "<!-- autoforge-replan-close: abc -->")
+    gh.reopen_pr(url, "undone")
+    assert seen == [
+        ["gh", "pr", "close", url, "--comment", "superseded"],
+        ["gh", "pr", "comment", url, "--body", "<!-- autoforge-replan-close: abc -->"],
+        ["gh", "pr", "reopen", url, "--comment", "undone"],
+    ]
+    with pytest.raises(GitHubError, match="denied"):
+        _client(lambda req: _res({}, exit_code=1, stderr="denied")).reopen_pr(url, "undone")
+    with pytest.raises(GitHubError, match="denied"):
+        _client(lambda req: _res({}, exit_code=1, stderr="denied")).comment_pr(url, "hi")

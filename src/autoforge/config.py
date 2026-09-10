@@ -107,6 +107,31 @@ class MergeConfig:
 
 
 @dataclass
+class ReplanConfig:
+    """Controller policy for abandoning a non-converging implementation."""
+
+    enabled: bool = True
+    # First review round from which the controller may *replace* an
+    # implementation instead of continuing to patch it. Every stagnation
+    # trigger is gated behind it, including `workflow.stagnation_*`: below
+    # this round a stagnant loop still ends in BLOCKED for a human, which is
+    # far less destructive than discarding a PR after one ineffective FIX.
+    soft_threshold: int = 12
+    # Review round at which findings trigger a replan unconditionally.
+    hard_threshold: int = 20
+    stagnation_window: int = 3
+    max_findings_per_round: int = 2
+    # Counts only completed REPLAN_REEXECUTE lifecycles; initial implementation
+    # is not a replan.
+    max_replans_per_issue: int = 2
+
+
+@dataclass
+class ReviewConfig:
+    replan: ReplanConfig = field(default_factory=ReplanConfig)
+
+
+@dataclass
 class WorkflowConfig:
     """Controller-owned bounds on the workflow loop (see ``loop_guard.py``).
 
@@ -119,7 +144,7 @@ class WorkflowConfig:
     # N == max_review_rounds, is BLOCKED instead of starting another FIX
     # (a FIX whose result could never be reviewed is never invoked); a
     # clean round N still reaches READY_FOR_MERGE. Round N+1 never starts.
-    max_review_rounds: int = 6
+    max_review_rounds: int = 20
     # Consecutive review rounds with findings whose required resolutions are
     # identical (normalised text) before the loop is declared stagnant.
     # 0 disables this rule (the hard cap above still applies); 1 is rejected
@@ -147,6 +172,7 @@ class AutoForgeConfig:
     safety: SafetyConfig = field(default_factory=SafetyConfig)
     github: GitHubConfig = field(default_factory=GitHubConfig)
     merge: MergeConfig = field(default_factory=MergeConfig)
+    review: ReviewConfig = field(default_factory=ReviewConfig)
     workflow: WorkflowConfig = field(default_factory=WorkflowConfig)
     profiles: dict[str, ProfileConfig] = field(default_factory=dict)
 
@@ -195,6 +221,9 @@ def default_config() -> AutoForgeConfig:
         "review_round_2_5": _opencode_profile("review_round_2_5", "openai/gpt-5.6-terra", "high"),
         "review_round_6_plus": _opencode_profile(
             "review_round_6_plus", "openai/gpt-5.6-sol", "medium", timeout=1200
+        ),
+        "replan_reexecute": _opencode_profile(
+            "replan_reexecute", "openai/gpt-5.6-terra", "high", timeout=3600
         ),
         "update_epic": _opencode_profile("update_epic", "openai/gpt-5.6-sol", "high", timeout=1200),
     }
@@ -353,6 +382,34 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
                 f"{source}: 'merge.max_verification_attempts' must be >= 1, got {attempts}"
             )
         base.merge.max_verification_attempts = attempts
+    review = data.get("review", {}) or {}
+    if not isinstance(review, dict):
+        raise ConfigurationError(f"{source}: 'review' must be a mapping")
+    replan = review.get("replan", {}) or {}
+    if not isinstance(replan, dict):
+        raise ConfigurationError(f"{source}: 'review.replan' must be a mapping")
+    rp = base.review.replan
+    if "enabled" in replan:
+        rp.enabled = _as_bool(replan["enabled"], source, "review.replan.enabled")
+    for key, minimum in (
+        ("soft_threshold", 1),
+        ("hard_threshold", 1),
+        ("stagnation_window", 1),
+        ("max_findings_per_round", 0),
+        ("max_replans_per_issue", 0),
+    ):
+        if key in replan:
+            value = _as_int(replan[key], source, f"review.replan.{key}")
+            if value < minimum:
+                raise ConfigurationError(
+                    f"{source}: 'review.replan.{key}' must be >= {minimum}, got {value}"
+                )
+            setattr(rp, key, value)
+    if rp.hard_threshold < rp.soft_threshold:
+        raise ConfigurationError(
+            f"{source}: 'review.replan.hard_threshold' must be >= "
+            "'review.replan.soft_threshold'"
+        )
     workflow = data.get("workflow", {}) or {}
     if not isinstance(workflow, dict):
         raise ConfigurationError(f"{source}: 'workflow' must be a mapping")
@@ -378,6 +435,11 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
                     f"(the rule compares consecutive review rounds), got {value}"
                 )
             setattr(base.workflow, key, value)
+    if base.review.replan.hard_threshold > base.workflow.max_review_rounds:
+        raise ConfigurationError(
+            f"{source}: 'review.replan.hard_threshold' must be <= "
+            "'workflow.max_review_rounds'"
+        )
     profiles = data.get("profiles", {}) or {}
     if not isinstance(profiles, dict):
         raise ConfigurationError(f"{source}: 'profiles' must be a mapping")

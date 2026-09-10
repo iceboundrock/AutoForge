@@ -50,27 +50,64 @@ merge:
 
 workflow:
   # Loop bounds enforced by the controller (never by a prompt). Each one ends
-  # the run in BLOCKED with the reason in `block_reason` / `status`; the open
-  # findings and the PR are kept for a human, nothing is merged.
-  # Hard cap on completed review rounds per PR. A round at the cap that still
-  # has findings blocks instead of starting a FIX whose result could never be
-  # reviewed; a clean round at the cap proceeds to READY_FOR_MERGE.
-  max_review_rounds: 6
+  # the run in BLOCKED with the reason in `block_reason` / `status`, unless an
+  # eligible replan below replaces the non-converging PR.
+  # Hard cap on completed review rounds per PR. A round at the cap with
+  # findings first evaluates replan policy; otherwise it blocks rather than
+  # starting a FIX whose result could never be reviewed.
+  max_review_rounds: 20
   # Stagnation: this many consecutive rounds with findings whose
   # `required_resolution` texts are identical (ids/locations ignored,
-  # whitespace/case-normalised) -> BLOCKED. 0 disables the rule; 1 is
-  # rejected (both rules compare consecutive rounds, so 2 is the minimum).
+  # whitespace/case-normalised) -> BLOCKED, unless the round has reached
+  # `review.replan.soft_threshold`, which turns it into a replan trigger.
+  # 0 disables the rule; 1 is rejected (both rules compare consecutive
+  # rounds, so 2 is the minimum).
   stagnation_identical_rounds: 2
   # Stagnation: this many consecutive rounds with findings whose finding
   # count did not change AND in which some `required_resolution` recurs
-  # (A/B/A ping-pong) -> BLOCKED. Rounds of entirely new findings are
-  # progress and only meet max_review_rounds. 0 disables the rule; 1 is
-  # rejected (a one-round window can never contain a recurrence).
+  # (A/B/A ping-pong). Same routing as above. Rounds of entirely new
+  # findings are progress and only meet max_review_rounds. 0 disables the
+  # rule; 1 is rejected (a one-round window can never contain a recurrence).
   stagnation_unchanged_count_rounds: 3
   # Cumulative step budget of the whole run (all phases, all issues). It is
   # measured on the persisted `step_count`, so `resume` continues the same
   # budget; `--max-steps` only bounds a single invocation.
   max_total_steps: 300
+
+review:
+  # After a review with findings, the controller (never an agent) may abandon
+  # the patch-accumulated PR and create a fresh implementation attempt.
+  #
+  # Closing the superseded PR is the controller's only destructive write on
+  # agent-produced work, so REPLAN_REEXECUTE runs as one durable transaction
+  # persisted in `.autoforge/state.json` as `replan_transaction`. There is
+  # nothing to configure about it, but it is worth knowing what it enforces:
+  #   * the replacement is identified ONLY by the controller-generated
+  #     transaction id it publishes in an `autoforge-replan-transaction`
+  #     marker in its PR body -- never by branch shape, PR count or the
+  #     agent's own report, and never a PR that already existed;
+  #   * the old PR is closed only while both it and the replacement still
+  #     match the checkpoint taken before the agent ran;
+  #   * the intent to close is persisted before the close, and a close receipt
+  #     is posted only after the close is observed (never inside the close
+  #     itself), so a crash can tell the controller's own close from a human's;
+  #   * a refusal is durable (the run stays BLOCKED across `resume`), while a
+  #     transient GitHub failure stays resumable.
+  # `autoforge status` prints the transaction id, stage and both PRs.
+  replan:
+    enabled: true
+    # First round from which the controller may replace (rather than keep
+    # patching) an implementation. Gates every stagnation trigger, including
+    # the workflow.stagnation_* rules above: earlier stagnation -> BLOCKED.
+    soft_threshold: 12
+    # Findings at or beyond this round always trigger a replan.
+    # Must not exceed workflow.max_review_rounds.
+    hard_threshold: 20
+    stagnation_window: 3
+    max_findings_per_round: 2
+    # Fresh reimplementations after the initial attempt. Reaching this limit
+    # blocks for a human rather than endlessly recreating PRs.
+    max_replans_per_issue: 2
 
 profiles:
   analyze_execute:
@@ -119,6 +156,19 @@ profiles:
     effort: medium
     command: opencode
     timeout_seconds: 1200
+    options:
+      output_format: default
+      auto_approve: false
+
+  # An independent logical role: it must not inherit the round-6 reviewer
+  # profile. This high-capability model replans and reimplements from latest
+  # default branch while retaining historical findings as constraints.
+  replan_reexecute:
+    provider: opencode
+    model: openai/gpt-5.6-terra
+    effort: high
+    command: opencode
+    timeout_seconds: 3600
     options:
       output_format: default
       auto_approve: false

@@ -14,8 +14,10 @@ from autoforge.loop_guard import (
     resolution_digests,
     review_record,
     round_cap_reason,
+    round_evidence_is_complete,
     stagnation_reason,
     step_budget_reason,
+    truncated_evidence_rounds,
     validate_review_history,
 )
 from tests.conftest import SHA_A
@@ -45,15 +47,17 @@ def test_fingerprint_ignores_ids_locations_and_order():
 
 def test_review_record_shape_and_result_validation():
     rec = review_record(3, SHA_A, RESULT_NEEDS_FIX, [_f("x"), _f("y", "R3-F2")])
-    assert rec == {
-        "round": 3,
-        "reviewed_head_sha": SHA_A,
-        "result": "needs_fix",
-        "finding_count": 2,
-        "fingerprint": findings_fingerprint([_f("x"), _f("y")]),
-        "resolutions": resolution_digests([_f("x"), _f("y")]),
-        "resolutions_truncated": False,
-    }
+    assert rec["round"] == 3
+    assert rec["reviewed_head_sha"] == SHA_A
+    assert rec["result"] == "needs_fix"
+    assert rec["finding_count"] == 2
+    assert rec["fingerprint"] == findings_fingerprint([_f("x"), _f("y")])
+    assert rec["resolutions"] == resolution_digests([_f("x"), _f("y")])
+    assert rec["resolutions_truncated"] is False
+    assert rec["findings"] == [
+        {"id": "R1-F1", "classification": "nit", "required_resolution": "x"},
+        {"id": "R3-F2", "classification": "nit", "required_resolution": "y"},
+    ]
     assert len(rec["resolutions"]) == 2 and rec["resolutions"] == sorted(rec["resolutions"])
     # per-finding digests ignore ids/locations/whitespace/case and de-duplicate
     assert resolution_digests([_f(" X ", "R9-F9", "z.py"), _f("x")]) == resolution_digests(
@@ -61,6 +65,56 @@ def test_review_record_shape_and_result_validation():
     )
     with pytest.raises(ValueError, match="unknown review result"):
         review_record(1, SHA_A, "merged", [])
+
+
+def test_review_record_bounds_retained_finding_evidence_and_marks_the_loss():
+    findings = [_f("x" * 2500, f"R1-F{i}") for i in range(101)]
+    record = review_record(1, SHA_A, RESULT_NEEDS_FIX, findings)
+    assert record["finding_count"] == 101
+    assert len(record["findings"]) == 100
+    assert len(record["findings"][0]["required_resolution"]) == 2000
+    # The bound stays, but the loss is never silent: a replan must be able to
+    # see that this round's evidence can no longer be reproduced in full.
+    assert record["evidence_truncated"] is True
+    assert not round_evidence_is_complete(record)
+    assert truncated_evidence_rounds([record]) == [1]
+
+
+@pytest.mark.parametrize(
+    "findings,truncated",
+    [
+        ([_f("x", "R1-F1")], False),
+        ([_f("x" * 2000, "R1-F1")], False),  # exactly at the cap: nothing lost
+        ([_f("x" * 2001, "R1-F1")], True),  # one clipped resolution is enough
+        ([_f("x", f"R1-F{i}") for i in range(100)], False),
+        ([_f("x", f"R1-F{i}") for i in range(101)], True),
+    ],
+)
+def test_evidence_truncation_is_detected_per_round(findings, truncated):
+    record = review_record(1, SHA_A, RESULT_NEEDS_FIX, findings)
+    assert record.get("evidence_truncated", False) is truncated
+    assert round_evidence_is_complete(record) is not truncated
+    assert bool(truncated_evidence_rounds([record])) is truncated
+
+
+def test_only_rounds_with_findings_carry_replan_evidence():
+    """Clean/stale rounds are never collected for a replan, so never block one."""
+    findings = [_f("x", f"R1-F{i}") for i in range(101)]
+    for result in (RESULT_CLEAN, RESULT_STALE):
+        record = review_record(1, SHA_A, result, findings)
+        assert round_evidence_is_complete(record)
+        assert truncated_evidence_rounds([record]) == []
+
+
+def test_evidence_completeness_is_rechecked_against_the_finding_count():
+    """A marker-less record (older history, hand-edited state) still fails closed."""
+    record = review_record(4, SHA_A, RESULT_NEEDS_FIX, [_f("x"), _f("y", "R4-F2")])
+    record.pop("evidence_truncated", None)
+    record["findings"] = record["findings"][:1]
+    assert not round_evidence_is_complete(record)
+    assert truncated_evidence_rounds([record]) == [4]
+    record["finding_count"] = "not-a-number"
+    assert not round_evidence_is_complete(record)
 
 
 # -- review-round cap ---------------------------------------------------------------
@@ -223,6 +277,10 @@ def test_validate_review_history_accepts_records_and_legacy_entries():
     del legacy["resolutions"]
     del legacy["resolutions_truncated"]
     validate_review_history([legacy])  # a *missing* key is compatibility, not corruption
+    assert "findings" not in hist[1]  # a clean round carries no retained evidence
+    validate_review_history(
+        [dict(hist[0], review_comment_url="https://x/1#c", timestamp="2026-01-01T00:00:00Z")]
+    )
 
 
 @pytest.mark.parametrize(
@@ -242,6 +300,12 @@ def test_validate_review_history_accepts_records_and_legacy_entries():
         (lambda r: r.pop("result"), "result must be one of"),
         (lambda r: r.update(fingerprint=123), "fingerprint must be a string"),
         (lambda r: r.update(reviewed_head_sha=None), "reviewed_head_sha must be a string"),
+        (lambda r: r.update(findings="R1-F1"), "findings must be a list of objects"),
+        (lambda r: r.update(findings=3), "findings must be a list of objects"),
+        (lambda r: r.update(findings=[{"id": "R1-F1"}, "R1-F2"]), "findings must be a list"),
+        (lambda r: r.update(evidence_truncated="yes"), "evidence_truncated must be a bool"),
+        (lambda r: r.update(review_comment_url=7), "review_comment_url must be a string"),
+        (lambda r: r.update(timestamp=0), "timestamp must be a string"),
     ],
 )
 def test_malformed_history_entry_is_corruption_not_legacy_data(mutate, match):

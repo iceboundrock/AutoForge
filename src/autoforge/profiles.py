@@ -41,6 +41,7 @@ def profile_for_phase(cfg: AutoForgeConfig, phase: Phase, review_round: int = 0)
     mapping = {
         Phase.ANALYZE_EXECUTE: "analyze_execute",
         Phase.FIX: "fix",
+        Phase.REPLAN_REEXECUTE: "replan_reexecute",
         Phase.UPDATE_EPIC: "update_epic",
     }
     if phase not in mapping:

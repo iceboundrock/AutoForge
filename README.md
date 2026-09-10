@@ -22,8 +22,10 @@ against GitHub:
 
 ```text
 Issue → ANALYZE_EXECUTE (Claude Code) → PR → REVIEW (OpenCode)
-      → needs_fix_round? ── YES ──▶ FIX (Claude Code) → REVIEW …
-                          └─ NO ───▶ READY_FOR_MERGE
+       → clean ───────────────────────────────▶ READY_FOR_MERGE
+       → findings ────────────────────────────▶ FIX (Claude Code) → REVIEW …
+       → excessive / low-finding stagnation ──▶ REPLAN_REEXECUTE (OpenCode)
+                                                    → replacement PR → REVIEW round 1
                                        ├─ merge gate closed (default): stops here; human merges
                                        └─ gate open: controller verifies on GitHub
                                           → MERGE (gh pr merge by the controller, no agent)
@@ -50,6 +52,17 @@ AutoForge itself never writes business code. It:
   that exact HEAD, and counts the merge only after GitHub reports `MERGED`,
 - logs every invocation (redacted) under `.autoforge/logs/<run-id>/`.
 
+It is a **single-machine client tool, not a distributed service**: one process
+on your own machine, driving your `git`, `gh`, and agent CLIs under your
+credentials, with local per-checkout state in `.autoforge/` and a single
+OS-level repository lock instead of any coordinator. The expected failure modes
+are a `Ctrl-C`, a killed process, and a reboot — which is why side effects are
+checkpointed before they are performed. What *is* remote and concurrent is
+GitHub and the humans acting on it, which is why nothing GitHub-side is
+believed without being read back. Work happens on a dedicated feature branch,
+ideally in a per-issue `git worktree`; AutoForge never commits to the default
+branch and never creates or cleans up local branches or worktrees itself.
+
 ## Architecture
 
 ```text
@@ -60,7 +73,7 @@ src/autoforge/
     transitions.py    Phase enum + legal edges + decide_next_phase (pure)
     state.py          AutoForgeState + atomic save/load (.autoforge/state.json)
     config.py         file-or-defaults config (yaml/toml/json), profiles, safety gate
-    profiles.py       review-round routing: 1 / 2-5 / 6+ (pure function)
+    profiles.py       review-round routing plus replan_reexecute profile (pure function)
     providers.py      AgentProvider adapters: ClaudeCodeProvider, OpenCodeProvider,
                       ScriptedProvider (tests); CLI flags live only here
     executor.py       subprocess abstraction: argv, timeout, process-tree kill
@@ -75,6 +88,9 @@ src/autoforge/
     redaction.py      baseline secret masking for logs / CLI output
     errors.py         Configuration/State/Transition/Lock/Execution/
                       ControlResult/GitHub/Verification taxonomy
+    replan.py         deterministic replan trigger + bounded historical evidence collector
+    replan_txn.py     the REPLAN_REEXECUTE transaction: durable stages, the causal
+                      provenance marker, and every acceptance predicate (pure)
     prompts/          common.md (trust boundary) + phase templates + correction.md
 ```
 
@@ -118,25 +134,83 @@ Key design points:
   concurrent controller can never be quarantined or overwritten on a stale
   verdict, nor slip in between the first save and the engine loop.
 - **The REVIEW/FIX loop is bounded by the controller.** `workflow.max_review_rounds`
-  (default 6) caps completed review rounds per PR; a round at the cap that
-  still has findings goes to `BLOCKED` instead of starting a FIX that could
-  never be reviewed. Stagnation detection blocks earlier: consecutive rounds
+  (default 20) caps completed review rounds per PR; a round at the cap that
+  still has findings triggers an eligible replan, or goes to `BLOCKED` instead
+  of starting a FIX that could never be reviewed. Stagnation detection: consecutive rounds
   whose `required_resolution` texts are identical
   (`workflow.stagnation_identical_rounds`, default 2) or whose finding count
   does not change while some `required_resolution` recurs across them, an
-  A/B/A ping-pong (`workflow.stagnation_unchanged_count_rounds`, default 3).
-  A reviewer that raises a genuinely new finding every round is progress and
-  only meets the round cap. Both stagnation settings are `0` (rule disabled)
-  or `>= 2`: they compare consecutive rounds, so a window of `1` is rejected
-  by the config loader rather than silently disabling the rule. The
-  recurrence evidence persisted per round is bounded, and a round whose
-  digests were clipped keeps the count-only behaviour instead of being read
-  as "nothing recurred".
+  A/B/A ping-pong (`workflow.stagnation_unchanged_count_rounds`, default 3),
+  go to `BLOCKED`, unless the loop has already reached
+  `review.replan.soft_threshold` (default round 12), in which case they
+  trigger an eligible replan instead. A reviewer that raises a genuinely new
+  finding every round is progress and only meets the round cap. Both
+  stagnation settings are `0` (rule disabled) or `>= 2`: they compare
+  consecutive rounds, so a window of `1` is rejected by the config loader
+  rather than silently disabling the rule. The recurrence evidence persisted
+  per round is bounded, and a round whose digests were clipped keeps the
+  count-only behaviour instead of being read as "nothing recurred".
   `workflow.max_total_steps` (default 300) is a cumulative budget for the whole
   run measured on the persisted `step_count`, so `resume` continues it rather
   than resetting it (`--max-steps` bounds one invocation only). Failed agent
   invocations consume neither a review round nor the history. Every bound
   ends in `BLOCKED` with the reason; findings and the PR stay for a human.
+- **Replanning is controller policy, not reviewer advice.** After a verified
+  review with findings, `review.replan` defaults to a hard trigger at round 20,
+  or from round 12 (`soft_threshold`) either three trailing review rounds each
+  containing at most two actionable findings, or a `workflow.stagnation_*`
+  verdict. `soft_threshold` gates *every* stagnation trigger: before it, a
+  stagnant loop is `BLOCKED` for a human as documented above, because one
+  ineffective FIX round is too weak a signal to discard a whole PR. It
+  preserves compact finding metadata and selected
+  review comments, then asks the separate `replan_reexecute` high-effort
+  profile to independently rebuild from the latest verified default branch.
+  Closing the superseded PR is the controller's only destructive write on
+  agent-produced work, so the whole phase runs as **one durable transaction**
+  (`replan_txn.py`) with an explicit monotonic lifecycle — `PENDING`,
+  `PREPARED`, `VERIFIED`, `SUPERSEDE_INTENT`, `COMPENSATING`, `SUPERSEDED`, or
+  the terminal `REJECTED`. Before the agent is invoked, `PREPARED` checkpoints the source PR
+  and its exact HEAD, the verified default branch, the complete review
+  evidence, the identities of the PRs that already existed, and a random
+  controller-generated transaction id. That id is the **only** accepted proof
+  of causality: the replacement must publish it in an
+  `<!-- autoforge-replan-transaction: {...} -->` marker in its PR body, which
+  the controller reads back from GitHub. Shape is never proof — an unmarked PR
+  is ignored, a PR that already existed is refused even if it carries a copied
+  marker, and two claimants block. Candidates are searched repository-wide, so
+  a marked PR the agent has not yet linked to the issue is refused for the
+  missing linkage rather than missed and re-implemented. Before concluding no candidate
+  exists, an exhaustive all-states listing (open, closed and merged) is consulted, so a
+  replacement that was closed before recovery is rejected with the PR named instead of
+  triggering a second implementation. The PR-number watermark is a proven numeric maximum
+  over all states, never inferred from one creation-time-ordered node. The old PR is closed
+  only while both sides still match their checkpoints — including the marker,
+  re-read on the last read before the close. GitHub has no conditional close,
+  so that comparison cannot be fused to the write: it is *completed after* it,
+  and a checkpoint that moved inside the close window is compensated by
+  reopening the source PR and blocking, never by accepting the close. That
+  compensation is itself a decision, so `COMPENSATING` is persisted *before*
+  the reopen: a crash after a successful reopen resumes into "finish undoing",
+  never into a second close. `SUPERSEDE_INTENT` is persisted *before* the write
+  so a crash resumes into disposition rather than a second attempt, and a separate
+  `gh pr comment` posts an `<!-- autoforge-replan-close: … -->` receipt only after the
+  controller observed its own close landing — never inside `gh pr close --comment`, whose
+  comment predates the close. The receipt is what tells the controller's own close from a
+  human's afterwards — a source found closed without this transaction's receipt blocks
+  and is never reopened, a conclusive close failure is never adopted, and an open source
+  already carrying the receipt (a prior close landed then reopened) is never closed again.
+  `SUPERSEDED` is persisted before the replacement is installed into state, so
+  both checkpoints are re-derived from GitHub once more on that last read; a
+  replacement that was closed, moved or re-marked in that window blocks with
+  both PRs named. A replan is refused outright while
+  any recorded round's findings had to be truncated to stay within the state
+  bounds, because closing the PR would be the moment those findings are lost.
+  At most two replans per issue are allowed; a further eligible trigger blocks
+  for human intervention. This retains failure knowledge while intentionally
+  discarding implementation anchoring; it does not guarantee convergence.
+  AutoForge deliberately performs no local branch or worktree cleanup during
+  this lifecycle: leaving old local work untouched is safer than trying to
+  infer ownership or discard uncommitted user changes.
 
 ## Workflow details
 
@@ -144,8 +218,9 @@ Key design points:
 |---|---|---|
 | `INITIALIZING` | controller | cwd repo == issue repo, issue is in this repo, is not the EPIC, exists and is OPEN |
 | `ANALYZE_EXECUTE` | Claude Code (`fable`, effort high) | existing open PR for the issue is recovered without re-running the agent; otherwise PR exists in this repo, is OPEN, HEAD SHA and branch match the claim |
-| `REVIEW` | OpenCode (round 1 `openai/gpt-5.6-luna` high, rounds 2–5 `openai/gpt-5.6-terra` high, 6+ `openai/gpt-5.6-sol` medium) | round number, reviewed SHA == bound HEAD, exactly one review comment on this PR with the `# AI Code Review — Round N` heading and the `ai-review-result` marker matching round/SHA/flag, findings invariant; then the loop bounds: round == `workflow.max_review_rounds` with findings, or stagnation across the recorded `review_history` -> `BLOCKED` (no further FIX). Entering `REVIEW` past the cap (stale re-review, HEAD drift, resume) is refused before the reviewer runs |
+| `REVIEW` | OpenCode (round 1 `openai/gpt-5.6-luna` high, rounds 2–5 `openai/gpt-5.6-terra` high, 6+ `openai/gpt-5.6-sol` medium, intentionally retained through the 20-round cap) | round number, reviewed SHA == bound HEAD, exactly one review comment on this PR with the `# AI Code Review — Round N` heading and the `ai-review-result` marker matching round/SHA/flag, findings invariant; then controller policy: an eligible replan (including workflow stagnation or the cap) enters `REPLAN_REEXECUTE`; an exhausted replan limit or no eligible replan blocks. Entering `REVIEW` past the cap (stale re-review, HEAD drift, resume) is refused before the reviewer runs |
 | `FIX` | Claude Code (`fable`, effort high) | `previous_head_sha` == current HEAD, every open finding ID resolved (`fixed` / `follow_up_created` / `no_change_with_rationale`), follow-up issues exist in this repo and are OPEN, actual PR HEAD == `new_head_sha`, a `fixed` resolution moved HEAD |
+| `REPLAN_REEXECUTE` | OpenCode (`replan_reexecute`, default `openai/gpt-5.6-terra`, effort high) | One durable transaction. `PREPARED` (written before the agent runs) checkpoints the source PR at its exact HEAD, the verified default branch, the complete historical findings, the identities of the already-open PRs, and a random transaction id; a round whose findings could not be persisted in full refuses the replan here and keeps the old PR. The replacement is found **only** by the transaction marker in its PR body — never by shape, never from the CONTROL_RESULT, and never among the pre-existing PRs; several claimants, a copied marker or an unusable one all block. It must additionally be a distinct OPEN PR of this repository, linked to the issue, on a distinct branch based on the verified default branch, and its marker must attest this transaction id, this execution attempt, passing tests and at least the preserved historical finding count. `VERIFIED` records its HEAD; immediately before the destructive write both sides are re-read and must still match the checkpoint exactly. `SUPERSEDE_INTENT` is persisted *before* `gh pr close` so a crash resumes into disposition, and a separate `gh pr comment` posts an `<!-- autoforge-replan-close: … -->` receipt only after the controller observed its own close landing (never inside `gh pr close --comment`); the receipt is what proves afterwards that the close was the controller's and not a human's; the close outcome is re-read from GitHub rather than inferred from the exit status, a conclusive close failure is never adopted, and an open source already carrying the receipt is never closed again. A checkpoint that moved inside the close window is undone under a durable `COMPENSATING` record written before the reopen, and the replacement is re-verified once more before it is installed into controller state. Only then does the controller close the old PR without merge and reset the replacement lifecycle so its next review is round 1. Every refusal is persisted as `REJECTED` and replayed by `resume`; a transient GitHub failure is left resumable instead. |
 | `READY_FOR_MERGE` | nobody | holding state; `step`/`resume` refuse to continue unless the merge gate is open (`resume` only re-prints the banner). With the gate open (`step --allow-merge` / `resume --allow-merge`) it runs the full pre-merge verification below against GitHub *before* entering `MERGE`: closed / conflicting / failing / draft / queued PRs go to `BLOCKED` without ever reaching `MERGE`, HEAD drift -> `REVIEW`, an already-merged PR -> `MERGE` to reconcile; inconclusive data (checks running, mergeability unknown, GitHub unreachable / transient read failure) keeps the phase for `resume --allow-merge`, at most `merge.max_verification_attempts` times, then `BLOCKED`; a read that fails conclusively (bad credentials, permissions, unresolvable PR) -> `BLOCKED` at once |
 | `MERGE` (gated) | controller, never an agent | last review clean and PR HEAD == reviewed HEAD; GitHub says PR is OPEN, not draft, every check succeeded, `mergeable=MERGEABLE`, `mergeStateStatus` `CLEAN`/`HAS_HOOKS`, no auto-merge armed, base branch has no merge queue; then `gh pr merge --<method> --match-head-commit <reviewed HEAD>`; counted only once GitHub reports `MERGED` at that HEAD. Conclusive negatives and conclusive read failures (bad credentials, permissions) -> `BLOCKED`; inconclusive data (checks running, mergeability unknown, transient read failure, post-merge re-read failed) stays in `MERGE` for `resume --allow-merge`, at most `merge.max_verification_attempts` times, then `BLOCKED`; HEAD drift -> `REVIEW` |
 | `UPDATE_EPIC` | OpenCode (`update_epic` profile) | `next_issue_url` gets the `INITIALIZING` checks before the controller switches issues: parses as an issue URL of this repo (a foreign URL is never even queried), is neither the EPIC nor the just-finished issue (compared case-insensitively by repository + number, never by URL string), exists on GitHub and is OPEN. A rejected selection, or a transient GitHub failure while checking it, keeps the phase and `resume` asks the agent once more with the reason in its prompt; a second rejection -> `BLOCKED`. A conclusive GitHub failure (authentication, permissions, malformed data) -> `BLOCKED` immediately, without invoking the agent again. Only a verified issue reaches `ANALYZE_EXECUTE`; `null` -> `DONE` |
@@ -154,6 +229,13 @@ Recovery rules: if a step crashes after the agent created a PR, `resume`
 re-enters `ANALYZE_EXECUTE`, finds the open PR (linked issue or
 `autoforge/<n>` branch) and moves to `REVIEW` without running the agent. Two
 or more candidate PRs → `BLOCKED` (the controller never guesses).
+`REPLAN_REEXECUTE` has no separate recovery path at all: a fresh step and a
+`resume` both call the same reducer over the persisted transaction, so the
+normal and crash paths cannot drift apart about what is acceptable. Because
+the transaction id is generated and persisted *before* the agent is invoked,
+"crashed before invoking" and "crashed while the agent ran" are one state —
+either a PR carrying that id exists, or none does — and a crash after the
+replacement was created never causes a second implementation attempt.
 
 Correction retry: when an agent exits 0 but its `CONTROL_RESULT` is missing or
 invalid, the controller re-invokes it **once** with a correction prompt that
@@ -254,7 +336,19 @@ State records `current_pr_url`, `current_branch`, `current_head_sha`,
 `review_history` (one entry per completed review round of the current PR:
 round, reviewed SHA, result, finding count, fingerprint of the requested
 resolutions), `step_count` (cumulative for the run, never reset), `attempt`
-and `block_reason`.
+and `block_reason`. It also records `execution_attempt` (initial implementation
+is 1), `escalation_count` (completed replans), `superseded_prs` (each entry
+naming the transaction that superseded it), and the durable
+`replan_transaction` record described above — the controller's intent journal,
+which `resume` replays rather than re-deriving a decision from GitHub facts. State keeps compact finding summaries and review
+comment URLs, rather than copying unbounded PR discussion bodies. Those
+summaries are bounded (100 findings per round, 2000 characters per required
+resolution); a round that hits either bound is marked `evidence_truncated`, and
+because superseding a PR deletes the controller's only record of its findings,
+such a round makes the replan policy block for a human instead.
+Relevant controller verification failures are retained as a bounded per-issue
+list and supplied to the replan prompt; all PR comment text remains GitHub
+audit data rather than state payload.
 
 ## Security model
 
@@ -348,7 +442,7 @@ cp autoforge.example.yaml autoforge.yaml
 ```
 
 Logical profile names (`analyze_execute`, `fix`, `review_round_1`,
-`review_round_2_5`, `review_round_6_plus`, `update_epic`) are stable (there is
+`review_round_2_5`, `review_round_6_plus`, `replan_reexecute`, `update_epic`) are stable (there is
 no `merge` profile: the controller merges, see `merge:` in the example file);
 edit the file to change model identifiers, effort, timeouts and provider
 options without touching controller source. Provider-specific flags are built

@@ -52,6 +52,7 @@ class ExecutionRecord:
     parsed_result: dict | None = None
     error: str = ""
     log_dir: str = ""
+    metadata: dict[str, object] = field(default_factory=dict)
 
 
 class RunLogger:
@@ -108,6 +109,7 @@ class RunLogger:
             "cwd": record.cwd,
             "timeout_seconds": record.timeout_seconds,
             "command": record.command,
+            "metadata": record.metadata,
         }
         execution = {
             "started_at": record.started_at,
