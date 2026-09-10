@@ -30,6 +30,8 @@ from autoforge.replan_txn import (
     ReplanAttestation,
     ReplanStage,
     ReplanTransaction,
+    has_close_receipt,
+    render_close_receipt,
     render_marker,
     scan_replan_markers,
     select_bound_candidate,
@@ -282,6 +284,18 @@ def _replan_agent(gh, *, payload_over=None, marker_over=None, body=None, url=REP
 
 def _txn(eng) -> ReplanTransaction:
     return ReplanTransaction.from_dict(eng.state.replan_transaction)
+
+
+def _closed_by_controller(gh, pr_url: str = PR, txn_id: str = TXN_ID) -> None:
+    """A source PR as this transaction's own close leaves it: CLOSED + receipt."""
+    gh.prs[pr_url].state = "CLOSED"
+    gh.add_comment(pr_url, 900, f"Superseded.\n\n{render_close_receipt(txn_id)}")
+
+
+def _closed_by_a_human(gh, pr_url: str = PR) -> None:
+    """A source PR someone else closed: CLOSED, and no receipt anywhere."""
+    gh.prs[pr_url].state = "CLOSED"
+    gh.add_comment(pr_url, 901, "Closing this, we are going a different way.")
 
 
 def _seed(eng, stage: ReplanStage, **over) -> ReplanTransaction:
@@ -1125,7 +1139,11 @@ def test_a_transient_failure_while_undoing_the_close_stays_resumable(tmp_state_d
     gh.reopen_error = GitHubUnavailableError("gh: 502 Bad Gateway")
     with pytest.raises(GitHubUnavailableError):
         eng.step()
-    assert _txn(eng).stage is ReplanStage.SUPERSEDE_INTENT  # nothing was decided
+    # F2: the *decision* to undo is durable even though the write is unknown,
+    # so the resume can only finish undoing -- it can never supersede instead.
+    txn = _txn(eng)
+    assert txn.stage is ReplanStage.COMPENSATING
+    assert "was never reviewed" in txn.compensation_reason
     assert gh.prs[PR].state == "CLOSED"
     gh.reopen_error = ""
     out = eng.step()
@@ -1384,12 +1402,12 @@ def test_w6_crash_after_intent_but_before_the_close_landed(tmp_state_dir):
 
 
 def test_w7_crash_after_the_close_landed_adopts_it_without_closing_again(tmp_state_dir):
-    """Window 7: the durable intent is the proof that this close was ours."""
+    """Window 7: intent plus the published receipt prove this close was ours."""
     gh = FakeGitHub()
     eng, _ = _seeded_engine(
         tmp_state_dir, gh, ReplanStage.SUPERSEDE_INTENT, close_intent_at="2026-01-01T00:00:00+00:00"
     )
-    gh.prs[PR].state = "CLOSED"  # the write landed before the crash
+    _closed_by_controller(gh)  # the write landed before the crash
     assert eng.step().next_phase == "REVIEW"
     assert gh.closed_prs == []  # I9: exactly once, never twice
     assert eng.state.current_pr_url == REPLACEMENT_PR
@@ -1869,3 +1887,292 @@ def test_marker_regex_cannot_swallow_the_rest_of_a_body():
     )
     scan = scan_replan_markers('<!-- autoforge-replan-transaction: {"a": 1}\n' + good)
     assert [a.transaction_id for a in scan.attestations] == [TXN_ID]
+
+
+# =============================================================================
+# Round 7: ownership of the close, durable compensation, checked activation,
+# and complete marker classification.
+# =============================================================================
+
+
+def test_f1_the_controller_close_publishes_an_ownership_receipt(tmp_state_dir):
+    """The close carries the only durable proof that the controller made it."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.VERIFIED)
+    assert eng.step().next_phase == "REVIEW"
+    (_, comment) = gh.closed_prs[0]
+    assert render_close_receipt(TXN_ID) in comment
+    assert has_close_receipt([c.body for c in gh.get_pr_comments(PR)], TXN_ID)
+
+
+def test_f1_a_human_close_inside_the_intent_window_is_never_adopted(tmp_state_dir):
+    """Crash before `gh pr close`, a human closes the source, then resume.
+
+    The persisted intent proves only that the controller *meant* to close. A
+    source that is CLOSED without this transaction's receipt was closed by
+    somebody else, and superseding on it would activate a replacement on the
+    strength of an action the controller never took.
+    """
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(
+        tmp_state_dir, gh, ReplanStage.SUPERSEDE_INTENT, close_intent_at="2026-01-01T00:00:00+00:00"
+    )
+    _closed_by_a_human(gh)
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert "carries no close receipt" in eng.state.block_reason
+    assert _txn(eng).stage is ReplanStage.REJECTED
+    assert eng.state.current_pr_url == PR  # the replacement was not activated
+    assert eng.state.superseded_prs == []
+    assert gh.reopened_prs == []  # never undo a close the controller did not make
+
+
+def test_f1_a_receipt_for_another_transaction_does_not_count(tmp_state_dir):
+    """Attribution is per transaction, not "some AutoForge close happened"."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(
+        tmp_state_dir, gh, ReplanStage.SUPERSEDE_INTENT, close_intent_at="2026-01-01T00:00:00+00:00"
+    )
+    _closed_by_controller(gh, txn_id="f" * 32)
+    assert eng.step().next_phase == "BLOCKED"
+    assert "carries no close receipt" in eng.state.block_reason
+    assert eng.state.superseded_prs == []
+
+
+def test_f1_an_unreadable_comment_list_is_unknown_not_unowned(tmp_state_dir):
+    """A transient read cannot decide ownership; a conclusive one refuses."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(
+        tmp_state_dir, gh, ReplanStage.SUPERSEDE_INTENT, close_intent_at="2026-01-01T00:00:00+00:00"
+    )
+    _closed_by_controller(gh)
+    gh.comments_error = GitHubUnavailableError("gh: 502 Bad Gateway")
+    with pytest.raises(GitHubUnavailableError):
+        eng.step()
+    assert _txn(eng).stage is ReplanStage.SUPERSEDE_INTENT  # still resumable
+    gh.comments_error = GitHubError("gh: not found")
+    assert eng.step().next_phase == "BLOCKED"
+    assert "could not be read" in eng.state.block_reason
+    assert _txn(eng).stage is ReplanStage.REJECTED
+
+
+def test_f2_a_crash_after_the_reopen_lands_resumes_into_the_undo(tmp_state_dir):
+    """The compensation is a decision, and decisions are persisted before writes.
+
+    Reopen succeeds, the process dies before the rejection is saved, and the
+    drift that caused the undo settles back. Without a durable ``COMPENSATING``
+    record the resume would find an OPEN source and a valid replacement and
+    close it a second time -- laundering a refusal into a supersede.
+    """
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.VERIFIED)
+    gh.close_race = lambda g: g.set_head(SHA_C, PR)
+
+    def die(*_args, **_kwargs):
+        raise RuntimeError("process died after the reopen landed")
+
+    eng._reject_replan = die  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError):
+        eng.step()
+    assert gh.prs[PR].state == "OPEN"  # the undo landed
+    crashed = _txn(eng)
+    assert crashed.stage is ReplanStage.COMPENSATING
+
+    gh.close_race = None
+    gh.set_head(SHA_A, PR)  # the stray push is reverted: the drift is gone
+    resumed = make_engine(tmp_state_dir, ["the replan agent must not run"], github=gh)
+    resumed.state.phase = Phase.REPLAN_REEXECUTE
+    resumed.state.current_issue_url = ISSUE
+    resumed.state.current_pr_url = PR
+    resumed.state.replan_transaction = crashed.to_dict()
+    out = resumed.step()
+    assert out.next_phase == "BLOCKED"
+    assert "the close was undone" in resumed.state.block_reason
+    assert len(gh.closed_prs) == 1  # never a second close
+    assert len(gh.reopened_prs) == 1  # the source was already open
+    assert resumed.state.superseded_prs == []
+
+
+def test_f2_a_lost_reopen_response_is_replayed_not_re_superseded(tmp_state_dir):
+    """``COMPENSATING`` over a still-CLOSED source finishes the undo."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(
+        tmp_state_dir,
+        gh,
+        ReplanStage.COMPENSATING,
+        compensating_at="2026-01-01T00:00:00+00:00",
+        compensation_reason="source PR advanced inside the close window",
+        replacement_pr_url=REPLACEMENT_PR,
+        replacement_branch=REPLACEMENT_BRANCH,
+        replacement_head_sha=SHA_B,
+        attested_findings_considered=4,
+        attested_unique_constraints=2,
+    )
+    _closed_by_controller(gh)
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert "advanced inside the close window" in eng.state.block_reason
+    assert "the close was undone" in eng.state.block_reason
+    assert gh.prs[PR].state == "OPEN"
+    assert gh.closed_prs == []  # the resume closes nothing
+    assert eng.state.superseded_prs == []
+
+
+def test_f2_a_compensation_that_cannot_be_confirmed_names_the_manual_step(tmp_state_dir):
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(
+        tmp_state_dir,
+        gh,
+        ReplanStage.COMPENSATING,
+        compensating_at="2026-01-01T00:00:00+00:00",
+        compensation_reason="replacement PR body no longer carries the marker",
+        replacement_pr_url=REPLACEMENT_PR,
+        replacement_branch=REPLACEMENT_BRANCH,
+        replacement_head_sha=SHA_B,
+    )
+    _closed_by_controller(gh)
+    gh.reopen_leaves_closed = True
+    assert eng.step().next_phase == "BLOCKED"
+    assert "reopened by hand" in eng.state.block_reason
+    assert _txn(eng).stage is ReplanStage.REJECTED
+    assert eng.state.superseded_prs == []
+
+
+def _drift_replacement(gh, **fields) -> None:
+    for name, value in fields.items():
+        setattr(gh.prs[REPLACEMENT_PR], name, value)
+
+
+@pytest.mark.parametrize(
+    "drift,needle",
+    [
+        (lambda gh: _drift_replacement(gh, state="CLOSED"), "CLOSED"),
+        (lambda gh: _drift_replacement(gh, head_sha=SHA_C), "advanced from the verified HEAD"),
+        (lambda gh: _drift_replacement(gh, body=""), "no longer carries"),
+        (lambda gh: _drift_replacement(gh, base_ref="release"), "base"),
+    ],
+)
+def test_f3_a_replacement_that_drifted_before_activation_is_not_installed(
+    tmp_state_dir, drift, needle
+):
+    """``SUPERSEDED`` is persisted before activation; that window is re-checked.
+
+    A crash there leaves a journal that says "activate this PR" while GitHub
+    may no longer agree. The source is legitimately closed, so this is not
+    compensable -- it blocks with both PRs named.
+    """
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(
+        tmp_state_dir, gh, ReplanStage.SUPERSEDED, superseded_at="2026-01-01T00:00:00+00:00"
+    )
+    _closed_by_controller(gh)
+    drift(gh)
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert "can no longer be activated" in eng.state.block_reason
+    assert needle in eng.state.block_reason
+    assert eng.state.current_pr_url == PR  # nothing was installed
+    assert eng.state.superseded_prs == []
+    assert _txn(eng).stage is ReplanStage.REJECTED
+
+
+def test_f3_a_source_reopened_before_activation_blocks(tmp_state_dir):
+    """Both checkpoints are re-derived, not just the replacement's."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(
+        tmp_state_dir, gh, ReplanStage.SUPERSEDED, superseded_at="2026-01-01T00:00:00+00:00"
+    )
+    _closed_by_controller(gh)
+    gh.prs[PR].state = "OPEN"  # a human reopened it before the resume
+    assert eng.step().next_phase == "BLOCKED"
+    assert "expected CLOSED" in eng.state.block_reason
+    assert eng.state.superseded_prs == []
+
+
+def test_f3_a_transient_read_before_activation_stays_resumable(tmp_state_dir):
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(
+        tmp_state_dir, gh, ReplanStage.SUPERSEDED, superseded_at="2026-01-01T00:00:00+00:00"
+    )
+    _closed_by_controller(gh)
+    gh.get_pr_failures = 1
+    with pytest.raises(GitHubUnavailableError):
+        eng.step()
+    assert _txn(eng).stage is ReplanStage.SUPERSEDED  # nothing was decided
+    assert eng.step().next_phase == "REVIEW"
+    assert eng.state.current_pr_url == REPLACEMENT_PR
+
+
+@pytest.mark.parametrize(
+    "payload",
+    ["<invalid>", "<!DOCTYPE html>", '{"transaction_id": "<script>"}', "a > b < c"],
+)
+def test_f4_a_complete_marker_with_angle_brackets_is_malformed_not_absent(payload):
+    """Classification is by the marker's *name*, never by its payload's shape."""
+    scan = scan_replan_markers(f"intro\n<!-- {MARKER_NAME}: {payload} -->\noutro")
+    assert scan.attestations == [] and len(scan.malformed) == 1, payload
+
+
+def _txn_for_marker_tests() -> ReplanTransaction:
+    return ReplanTransaction(
+        transaction_id=TXN_ID,
+        stage=ReplanStage.PREPARED,
+        source_pr_url=PR,
+        issue_url=ISSUE,
+        pr_number_watermark=42,
+    )
+
+
+def test_f4_an_angle_bracket_marker_is_a_refusal_not_another_agent_run():
+    """As the only marker it must reject: NONE would re-invoke the agent."""
+    gh = FakeGitHub()
+    gh.add_pr(
+        url=OTHER_PR,
+        head_sha=SHA_B,
+        branch="other",
+        linked=[2],
+        body=f"<!-- {MARKER_NAME}: <x> -->",
+    )
+    selection = select_bound_candidate([gh.prs[OTHER_PR]], _txn_for_marker_tests())
+    assert selection.disposition is Disposition.REJECTED
+    assert "unusable replan marker" in selection.reason
+
+
+def test_f4_an_angle_bracket_marker_beside_a_valid_one_still_refuses():
+    """It must not slip past the "nothing marker-shaped beside it" rule."""
+    good = render_marker(
+        ReplanAttestation(
+            transaction_id=TXN_ID,
+            execution_attempt=2,
+            findings_considered=4,
+            unique_constraints=2,
+            tests_passed=True,
+        )
+    )
+    gh = FakeGitHub()
+    gh.add_pr(
+        url=OTHER_PR,
+        head_sha=SHA_B,
+        branch="other",
+        linked=[2],
+        body=f"<!-- {MARKER_NAME}: <x> -->\n{good}",
+    )
+    selection = select_bound_candidate([gh.prs[OTHER_PR]], _txn_for_marker_tests())
+    assert selection.disposition is Disposition.REJECTED
+    assert "alongside an unusable one" in selection.reason
+
+
+def test_f4_an_unterminated_marker_with_brackets_still_cannot_swallow():
+    """Widening the payload must not reintroduce the swallowing hazard."""
+    good = render_marker(
+        ReplanAttestation(
+            transaction_id=TXN_ID,
+            execution_attempt=2,
+            findings_considered=1,
+            unique_constraints=1,
+            tests_passed=True,
+        )
+    )
+    scan = scan_replan_markers(f"<!-- {MARKER_NAME}: <unterminated\n{good}")
+    assert [a.transaction_id for a in scan.attestations] == [TXN_ID]
+    assert scan.malformed == []

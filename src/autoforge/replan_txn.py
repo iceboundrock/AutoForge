@@ -15,8 +15,15 @@ the same persisted intent.
 Lifecycle (monotonic; ``REJECTED`` is terminal)::
 
     PENDING ──► PREPARED ──► VERIFIED ──► SUPERSEDE_INTENT ──► SUPERSEDED ──► (activated)
-        │           │             │                │
-        └───────────┴─────────────┴────────────────┴──────────► REJECTED
+        │           │             │                │                │
+        │           │             │                ▼                │
+        │           │             │          COMPENSATING           │
+        │           │             │                │                │
+        └───────────┴─────────────┴────────────────┴────────────────┴──► REJECTED
+
+``COMPENSATING`` is entered when the close landed on facts that had already
+moved; it is persisted *before* the reopen, so a crash after a successful
+reopen resumes into "finish undoing", never into "close again".
 
 ``PREPARED`` is written *before* the agent is invoked, and carries the
 transaction id. Because that id cannot exist anywhere before it is persisted,
@@ -53,6 +60,7 @@ from __future__ import annotations
 import json
 import re
 import secrets
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 
@@ -66,10 +74,24 @@ MARKER_NAME = "autoforge-replan-transaction"
 # pattern that only recognised well-formed payloads would silently downgrade
 # "this PR carries a broken attestation" (a conclusive refusal) to "this PR
 # carries no attestation", which is exactly the ambiguity the phase must fail
-# closed on. `[^<>]` keeps a marker whose own `-->` is missing from swallowing
-# the rest of the body, including a valid marker after it; an attestation
-# payload never legitimately contains `<` or `>`.
-MARKER_RE = re.compile(rf"<!--\s*{MARKER_NAME}\s*:\s*(?P<payload>[^<>]*?)\s*-->")
+# closed on. The payload is therefore *any* text, angle brackets included.
+#
+# The one thing it may not contain is a comment delimiter. Tempering it with
+# `(?!-->|<!--)` stops a marker whose own `-->` is missing from swallowing the
+# body up to some later `-->` and hiding a valid marker inside the match: an
+# unterminated marker is not a complete comment and is evidence of nothing,
+# while every complete one is classified.
+MARKER_RE = re.compile(
+    rf"<!--\s*{MARKER_NAME}\s*:\s*(?P<payload>(?:(?!-->|<!--)[\s\S])*?)\s*-->"
+)
+
+# The controller's receipt for its own destructive close, published in the
+# comment `gh pr close --comment` posts on the source PR (see
+# :func:`render_close_receipt`).
+CLOSE_RECEIPT_NAME = "autoforge-replan-close"
+CLOSE_RECEIPT_RE = re.compile(
+    rf"<!--\s*{CLOSE_RECEIPT_NAME}\s*:\s*(?P<txn>[0-9a-f]{{32}})\s*-->"
+)
 
 TRANSACTION_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
@@ -85,6 +107,37 @@ def render_marker(attestation: ReplanAttestation) -> str:
     return f"<!-- {MARKER_NAME}: {payload} -->"
 
 
+def render_close_receipt(transaction_id: str) -> str:
+    """The receipt the controller publishes *as* it closes the source PR.
+
+    ``SUPERSEDE_INTENT`` is persisted before ``gh pr close`` runs, so on its
+    own it proves an intended write, never a performed one: after a crash in
+    that window, a source a human closed and one this transaction closed look
+    identical from the journal. The receipt is the missing half. ``gh pr close
+    --comment`` posts this text on the source PR in the same invocation that
+    closes it, so a source found CLOSED *carrying* the receipt for this
+    transaction was closed by this transaction, and one found CLOSED without it
+    was closed by somebody else -- which is a refusal, not an adoption.
+
+    This is crash-recovery attribution, not authentication: the transaction id
+    is published in the replacement PR body, so a human who wanted to could
+    copy it into a comment. It is trusted against crashes and concurrent
+    humans, not against a forger.
+    """
+    return f"<!-- {CLOSE_RECEIPT_NAME}: {transaction_id} -->"
+
+
+def has_close_receipt(comment_bodies: Iterable[str], transaction_id: str) -> bool:
+    """True when some comment carries this transaction's close receipt."""
+    if not TRANSACTION_ID_RE.match(transaction_id or ""):
+        return False
+    return any(
+        match.group("txn") == transaction_id
+        for body in comment_bodies
+        for match in CLOSE_RECEIPT_RE.finditer(body or "")
+    )
+
+
 class ReplanStage(StrEnum):
     """Monotonic transaction stages. ``REJECTED`` is terminal for the run."""
 
@@ -95,6 +148,11 @@ class ReplanStage(StrEnum):
     PREPARED = "prepared"
     VERIFIED = "verified"
     SUPERSEDE_INTENT = "supersede_intent"
+    # The controller closed the source, then found a checkpoint had moved
+    # inside the close window. Persisted *before* `gh pr reopen` so that the
+    # decision to undo survives a crash: from here the only outcomes are a
+    # confirmed reopen or a block naming the manual step. Never a second close.
+    COMPENSATING = "compensating"
     SUPERSEDED = "superseded"
     REJECTED = "rejected"
 
@@ -242,6 +300,15 @@ class ReplanTransaction:
     # -- destructive write ------------------------------------------------
     close_intent_at: str = ""
     superseded_at: str = ""
+
+    # -- compensation -----------------------------------------------------
+    # Written together with stage COMPENSATING, before `gh pr reopen` is
+    # called. ``compensation_reason`` is the drift that made the close
+    # unacceptable; it is replayed verbatim by a resume so the undo cannot be
+    # re-derived (and possibly re-decided) from GitHub facts that have since
+    # settled back into place.
+    compensating_at: str = ""
+    compensation_reason: str = ""
 
     # -- disposition ------------------------------------------------------
     rejection_reason: str = ""

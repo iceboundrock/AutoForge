@@ -348,6 +348,10 @@ class FakeGitHub:
         canonical = parse_pr_url(url).canonical
         self.calls.append(("close_pr", canonical, comment))
         self.closed_prs.append((canonical, comment))
+        # `gh pr close --comment` posts the comment as part of the same
+        # invocation, before the close; the controller's close receipt lives
+        # in it, so the fake must record it too.
+        self.add_comment(canonical, 900_000 + len(self.closed_prs), comment)
         if self.close_race is not None:
             # Landed after the controller's last read, before the close.
             self.close_race(self)
@@ -367,6 +371,7 @@ class FakeGitHub:
         canonical = parse_pr_url(url).canonical
         self.calls.append(("reopen_pr", canonical, comment))
         self.reopened_prs.append((canonical, comment))
+        self.add_comment(canonical, 910_000 + len(self.reopened_prs), comment)
         if isinstance(self.reopen_error, GitHubError):
             raise self.reopen_error
         if self.reopen_error:

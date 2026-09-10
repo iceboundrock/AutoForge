@@ -105,7 +105,9 @@ from .replan_txn import (
     Disposition,
     ReplanStage,
     ReplanTransaction,
+    has_close_receipt,
     new_transaction_id,
+    render_close_receipt,
     select_bound_candidate,
     verify_attestation,
     verify_closed_source,
@@ -1403,7 +1405,10 @@ class ControllerEngine:
     #   verification           shared      ``replan_txn`` predicates
     #   supersede / close      controller  ``_supersede_source`` (the only
     #                                      caller of ``close_pr`` in this phase)
-    #   activation             controller  ``_activate_replacement``
+    #   close ownership        controller  ``_close_not_ours`` (receipt)
+    #   compensation           controller  ``_compensate_close`` (durable),
+    #                                      carried out by ``_run_compensation``
+    #   activation             controller  ``_activate_if_verified``
     #   recovery               controller  ``_drive_replan`` (replays intent)
     #   rejection/escalation   controller  ``_reject_replan`` (persisted)
     #
@@ -1432,7 +1437,12 @@ class ControllerEngine:
 
     def _replan_block_text(self, txn: ReplanTransaction, reason: str) -> str:
         """BLOCKED text that always says what happened to the source PR."""
-        if txn.stage in (ReplanStage.SUPERSEDE_INTENT, ReplanStage.SUPERSEDED) or txn.superseded_at:
+        began_closing = (
+            ReplanStage.SUPERSEDE_INTENT,
+            ReplanStage.COMPENSATING,
+            ReplanStage.SUPERSEDED,
+        )
+        if txn.stage in began_closing or txn.superseded_at:
             tail = (
                 f"This transaction had already begun closing the source PR {txn.source_pr_url}, "
                 f"and the replacement {txn.replacement_pr_url or '(none)'} was not activated"
@@ -1488,6 +1498,10 @@ class ControllerEngine:
                 None,
                 self._replan_block_text(txn, txn.rejection_reason or "refused by verification"),
             )
+        if txn.stage is ReplanStage.COMPENSATING:
+            # The undo was decided and persisted before the reopen was
+            # attempted. Replay it; never fall through to the supersede step.
+            return self._run_compensation(txn)
         if txn.stage is ReplanStage.PENDING:
             prepared = self._prepare_replan(txn)
             if prepared is not None:
@@ -1675,18 +1689,20 @@ class ControllerEngine:
         and ``gh pr close`` would otherwise stand. The comparison is therefore
         completed *after* the write, in :meth:`_confirm_supersede`, and a
         checkpoint that moved inside that window is compensated -- the source
-        is reopened and the phase blocks -- rather than accepted. The pre-close
-        checks are kept: they make the common refusal cost nothing.
+        is reopened under a durable ``COMPENSATING`` record and the phase
+        blocks -- rather than accepted. The pre-close checks are kept: they
+        make the common refusal cost nothing.
 
-        ``SUPERSEDE_INTENT`` is persisted before ``close_pr`` is called. That
-        record is the only proof of ownership afterwards: a CLOSED source PR is
-        otherwise indistinguishable from one a human closed, and adopting
-        someone else's close would supersede work this transaction never
-        verified.
+        ``SUPERSEDE_INTENT`` is persisted before ``close_pr`` is called, so a
+        crash anywhere in the write window resumes into disposition rather than
+        into a second attempt. It records an *intent*, though, not a performed
+        write, so it cannot by itself tell the controller's close from a human's
+        in that window: the close comment carries a receipt for exactly that
+        (:meth:`_close_not_ours`), and adopting someone else's close is refused.
         """
         state = self._require_state()
         if txn.stage is ReplanStage.SUPERSEDED:
-            return self._activate_replacement(txn)
+            return self._activate_if_verified(txn)
         if txn.stage not in (ReplanStage.VERIFIED, ReplanStage.SUPERSEDE_INTENT):
             return self._reject_replan(
                 txn, f"replan transaction reached the supersede step at stage {txn.stage.value!r}"
@@ -1730,7 +1746,11 @@ class ControllerEngine:
                 txn.source_pr_url,
                 f"Superseded by {txn.replacement_pr_url} after controller-detected review/fix "
                 "non-convergence. This PR was closed without merge; the replacement starts from "
-                f"the {txn.base_branch} branch. Replan transaction {txn.transaction_id}.",
+                f"the {txn.base_branch} branch. Replan transaction {txn.transaction_id}.\n\n"
+                # The receipt: posted by the same `gh pr close` invocation, so
+                # its presence on the closed source is what proves the close
+                # was this transaction's and not a human's.
+                + render_close_receipt(txn.transaction_id),
             )
         except GitHubUnavailableError:
             # The close may or may not have landed. SUPERSEDE_INTENT is already
@@ -1764,17 +1784,20 @@ class ControllerEngine:
         """The swap half of the compare-and-swap, completed after the close.
 
         Reached with the source CLOSED and the intent durable -- either
-        straight from the write, or on a ``resume`` that missed it. Both
-        checkpoints are compared once more against GitHub; if either moved,
-        the close landed on facts that had already changed and is *undone*
-        (:meth:`_compensate_close`) instead of being activated. Only an
-        unmoved pair reaches ``SUPERSEDED``.
+        straight from the write, or on a ``resume`` that missed it. Ownership
+        is established first, then both checkpoints are compared once more
+        against GitHub; if either moved, the close landed on facts that had
+        already changed and is *undone* (:meth:`_compensate_close`) instead of
+        being activated. Only an unmoved pair reaches ``SUPERSEDED``.
 
         A transient GitHub failure here propagates untouched: the transaction
         stays at ``SUPERSEDE_INTENT``, and a resume runs exactly this method
         again on the same source PR.
         """
         state = self._require_state()
+        unowned = self._close_not_ours(txn)
+        if unowned:
+            return self._reject_replan(txn, unowned)
         drift = verify_closed_source(source, txn)
         if not drift:
             try:
@@ -1792,18 +1815,74 @@ class ControllerEngine:
                 ) or verify_target_marker(target, txn)
         if not drift:
             return self._record_supersede(txn)
-        return self._reject_replan(txn, self._compensate_close(txn, drift), txn.replacement_pr_url)
+        return self._compensate_close(txn, drift)
 
-    def _compensate_close(self, txn: ReplanTransaction, drift: str) -> str:
-        """Reopen the source the controller closed, and report what happened.
+    def _close_not_ours(self, txn: ReplanTransaction) -> str:
+        """Why this transaction may not claim the source's close, or ``""``.
+
+        ``SUPERSEDE_INTENT`` is written before ``gh pr close`` and therefore
+        records only an *intended* write. A crash in that window, followed by
+        a human closing the source, would otherwise be indistinguishable from
+        the controller's own close -- and the resume would supersede on the
+        strength of somebody else's action. ``close_pr`` publishes
+        :func:`render_close_receipt` in the comment it posts as it closes, so
+        the receipt is the durable evidence that the close happened *and* that
+        it was this transaction's.
+
+        Absence is conclusive: the run refuses and blocks, leaving the close
+        exactly as the human made it -- the controller must not reopen a PR it
+        did not close. A transient read failure is not absence and propagates.
+        """
+        try:
+            comments = self.github.get_pr_comments(txn.source_pr_url)
+        except GitHubUnavailableError:
+            raise  # unknown, not unowned: `resume` re-reads
+        except GitHubError as exc:
+            return (
+                f"source PR {txn.source_pr_url} is closed, but its comments could not be read "
+                f"({exc}), so the close cannot be attributed to replan transaction "
+                f"{txn.transaction_id}"
+            )
+        if has_close_receipt((c.body for c in comments), txn.transaction_id):
+            return ""
+        return (
+            f"source PR {txn.source_pr_url} is closed but carries no close receipt for replan "
+            f"transaction {txn.transaction_id}, so this transaction did not close it; refusing "
+            "to supersede on a close the controller cannot prove it performed"
+        )
+
+    def _compensate_close(self, txn: ReplanTransaction, drift: str) -> StepOutcome:
+        """Decide, durably, to undo the close -- then carry the decision out.
 
         The undo is the reason the phase may claim compare-and-swap semantics
         over an API that cannot express them: the close is not permitted to
-        stand on facts that had already moved. ``close_pr`` never deletes the
-        branch, so the reopened PR carries its commits and review history
-        intact. A failed or unconfirmed reopen is stated as such in the block
-        text -- the controller never reports an undo it did not observe.
+        stand on facts that had already moved. Recording ``COMPENSATING``
+        *before* the reopen is what makes the undo itself crash-safe. A reopen
+        that succeeds and is then lost to a crash would otherwise leave the
+        transaction at ``SUPERSEDE_INTENT`` over an OPEN source, and a resume
+        whose drift had meanwhile settled back would close it a second time --
+        laundering a refusal into a completed supersede, which is exactly what
+        rejection monotonicity forbids.
         """
+        txn.stage = ReplanStage.COMPENSATING
+        txn.compensating_at = utcnow_iso()
+        txn.compensation_reason = drift
+        self._save_replan_txn(txn)
+        return self._run_compensation(txn)
+
+    def _run_compensation(self, txn: ReplanTransaction) -> StepOutcome:
+        """Reopen the source the controller closed, and report what happened.
+
+        Idempotent, and the single entry point for both the writing step and a
+        ``resume`` at ``COMPENSATING``: a source already OPEN needs no reopen,
+        only the confirmation. ``close_pr`` never deletes the branch, so the
+        reopened PR carries its commits and review history intact. A failed or
+        unconfirmed reopen is stated as such and names the manual step -- the
+        controller never reports an undo it did not observe -- while a
+        transient failure leaves the stage untouched so the resume replays the
+        confirmation rather than closing twice.
+        """
+        drift = txn.compensation_reason or "the replan checkpoint no longer held at the close"
         comment = (
             f"AutoForge closed this pull request as superseded by {txn.replacement_pr_url}, "
             f"then found that the replan checkpoint no longer held at the moment of the close "
@@ -1811,26 +1890,81 @@ class ControllerEngine:
             f"Replan transaction {txn.transaction_id}."
         )
         try:
-            self.github.reopen_pr(txn.source_pr_url, comment)
-            reopened = self.github.get_pr(txn.source_pr_url)
+            source = self.github.get_pr(txn.source_pr_url)
+            if not source.is_open:
+                self.github.reopen_pr(txn.source_pr_url, comment)
+                source = self.github.get_pr(txn.source_pr_url)
         except GitHubUnavailableError:
             raise  # unresolved, not refused: the transaction stays resumable
         except GitHubError as exc:
-            return (
+            return self._reject_replan(
+                txn,
                 f"{drift}; the source PR was closed inside the compare-and-swap window and "
-                f"could not be reopened ({exc}), so it must be reopened by hand"
+                f"could not be reopened ({exc}), so it must be reopened by hand",
+                txn.replacement_pr_url,
             )
-        if not reopened.is_open:
-            return (
-                f"{drift}; the source PR is still {reopened.state or '(unknown)'} after the "
-                "reopen attempt and must be reopened by hand"
+        if not source.is_open:
+            return self._reject_replan(
+                txn,
+                f"{drift}; the source PR is still {source.state or '(unknown)'} after the "
+                "reopen attempt and must be reopened by hand",
+                txn.replacement_pr_url,
             )
-        return f"{drift}; the close was undone and {txn.source_pr_url} is open again"
+        return self._reject_replan(
+            txn,
+            f"{drift}; the close was undone and {txn.source_pr_url} is open again",
+            txn.replacement_pr_url,
+        )
 
     def _record_supersede(self, txn: ReplanTransaction) -> StepOutcome:
         txn.stage = ReplanStage.SUPERSEDED
         txn.superseded_at = utcnow_iso()
         self._save_replan_txn(txn)
+        return self._activate_if_verified(txn)
+
+    def _activate_if_verified(self, txn: ReplanTransaction) -> StepOutcome:
+        """Re-derive both checkpoints from GitHub, then activate.
+
+        ``SUPERSEDED`` is persisted before the replacement is installed into
+        controller state, so there is a window in which the transaction says
+        "activate this PR" while GitHub no longer agrees: the replacement can
+        be closed, retargeted, moved, or have its marker edited before the
+        activation is written. Activating from the journal alone would install
+        a PR the controller can no longer prove anything about, so the same
+        predicates that authorised the close are re-applied on the last read
+        before the write -- by the writing step and by a ``resume`` at
+        ``SUPERSEDED`` alike, so the two cannot decide differently.
+
+        Drift here is terminal, not compensable: the close was confirmed
+        correct when it happened, and the source is legitimately closed. The
+        run blocks and says so, naming both PRs. Ownership of that close is
+        already durable in ``SUPERSEDED`` and is not re-litigated.
+        """
+        state = self._require_state()
+        try:
+            source = self.github.get_pr(txn.source_pr_url)
+            target = self.github.get_pr(txn.replacement_pr_url)
+        except GitHubUnavailableError:
+            raise  # unknown, not refused: `resume` re-reads and re-verifies
+        except GitHubError as exc:
+            return self._reject_replan(
+                txn,
+                f"the source PR was closed, but the replan checkpoints could not be re-read "
+                f"before activating the replacement ({exc})",
+                txn.replacement_pr_url,
+            )
+        drift = (
+            verify_closed_source(source, txn)
+            or verify_target_pr(target, txn, state.repository, require_checkpoint_head=True)
+            or verify_target_marker(target, txn)
+        )
+        if drift:
+            return self._reject_replan(
+                txn,
+                f"the source PR was closed, but the replacement can no longer be activated: "
+                f"{drift}",
+                txn.replacement_pr_url,
+            )
         return self._activate_replacement(txn)
 
     def _activate_replacement(self, txn: ReplanTransaction) -> StepOutcome:
