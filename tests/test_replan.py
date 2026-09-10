@@ -170,6 +170,27 @@ def test_stagnation_below_soft_threshold_does_not_replan():
 OTHER_PR = "https://github.com/owner/repo/pull/44"  # created after the replacement
 EARLIER_PR = "https://github.com/owner/repo/pull/41"  # already open before the replan
 TXN_ID = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+# A well-formed attestation belonging to a *different* replan: valid in every
+# way except that it is not this transaction's provenance.
+OTHER_TXN_ID = "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+
+
+def _ours_marker(findings: int = 4, unique: int = 2, txn_id: str = TXN_ID) -> str:
+    """The marker a compliant replacement publishes for this transaction."""
+    return render_marker(
+        ReplanAttestation(
+            transaction_id=txn_id,
+            execution_attempt=2,
+            findings_considered=findings,
+            unique_constraints=unique,
+            tests_passed=True,
+        )
+    )
+
+
+def _foreign_marker() -> str:
+    """A perfectly valid marker that simply belongs to another transaction."""
+    return _ours_marker(txn_id=OTHER_TXN_ID)
 
 
 def _from_prompt(prompt: str, pattern: str) -> str:
@@ -338,15 +359,7 @@ def _seeded_engine(tmp_state_dir, gh, stage, *, marker=True, **over):
     eng = make_engine(tmp_state_dir, ["the replan agent must not run"], github=gh)
     gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2])
     body = (
-        render_marker(
-            ReplanAttestation(
-                transaction_id=TXN_ID,
-                execution_attempt=2,
-                findings_considered=4,
-                unique_constraints=2,
-                tests_passed=True,
-            )
-        )
+        _ours_marker()
         if marker
         else "no marker here"
     )
@@ -721,15 +734,7 @@ def test_a_pr_predating_the_transaction_is_refused_even_if_it_was_never_an_issue
         head_sha=SHA_C,
         branch="chore/unrelated-cleanup",
         linked=[2],  # the link the agent added afterwards
-        body=render_marker(
-            ReplanAttestation(
-                transaction_id=TXN_ID,
-                execution_attempt=2,
-                findings_considered=4,
-                unique_constraints=2,
-                tests_passed=True,
-            )
-        ),
+        body=_ours_marker(),
     )
     out = eng.step()
     assert out.next_phase == "BLOCKED"
@@ -754,15 +759,7 @@ def test_r8f2_a_closed_replacement_is_rejected_not_reimplemented(tmp_state_dir):
         head_sha=SHA_B,
         branch=REPLACEMENT_BRANCH,
         linked=[2],
-        body=render_marker(
-            ReplanAttestation(
-                transaction_id=TXN_ID,
-                execution_attempt=2,
-                findings_considered=4,
-                unique_constraints=2,
-                tests_passed=True,
-            )
-        ),
+        body=_ours_marker(),
         state="CLOSED",
     )
     out = eng.step()
@@ -787,15 +784,7 @@ def test_r8f2_a_preexisting_closed_pr_with_a_copied_marker_is_rejected(tmp_state
         head_sha=SHA_C,
         branch="chore/unrelated-cleanup",
         linked=[2],
-        body=render_marker(
-            ReplanAttestation(
-                transaction_id=TXN_ID,
-                execution_attempt=2,
-                findings_considered=4,
-                unique_constraints=2,
-                tests_passed=True,
-            )
-        ),
+        body=_ours_marker(),
         state="CLOSED",
     )
     out = eng.step()
@@ -803,6 +792,151 @@ def test_r8f2_a_preexisting_closed_pr_with_a_copied_marker_is_rejected(tmp_state
     assert "already existed" in eng.state.block_reason
     assert eng.provider.calls == []
     _assert_source_untouched(eng, gh)
+
+
+def test_r9f2_a_marker_on_the_source_pr_rejects_instead_of_reimplementing(tmp_state_dir):
+    """R9-F2: the PR being superseded is excluded from adoption, not from reading.
+
+    The prompt says putting the marker on the superseded PR rejects the replan.
+    Skipping the source's body before scanning it turns that into "no candidate
+    exists" -- and that observation is what decides whether the agent runs
+    again, so marker-bearing work would exist while a second implementation
+    attempt started on top of it.
+    """
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.PREPARED, marker=False)
+    gh.prs[PR].body = "The original implementation.\n\n" + _ours_marker()
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert PR in eng.state.block_reason
+    assert "belongs on the replacement" in eng.state.block_reason
+    assert eng.provider.calls == []  # no second implementation attempt
+    _assert_source_untouched(eng, gh)
+
+
+def test_r9f2_an_unusable_marker_on_the_source_pr_is_not_absence_either(tmp_state_dir):
+    """A botched attestation on the source is broken evidence, not no evidence."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.PREPARED, marker=False)
+    gh.prs[PR].body = UNUSABLE_MARKERS[0]
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert "unusable replan marker" in eng.state.block_reason
+    assert PR in eng.state.block_reason
+    assert eng.provider.calls == []
+    _assert_source_untouched(eng, gh)
+
+
+def test_r9f2_a_closed_source_carrying_the_marker_is_found_by_the_all_states_scan(
+    tmp_state_dir,
+):
+    """The source rule holds on the recovery listing too, not just the open one."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.PREPARED, marker=False)
+    gh.prs[PR].body = _ours_marker()
+    gh.prs[PR].state = "CLOSED"  # a human closed it while the controller was down
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert "belongs on the replacement" in eng.state.block_reason
+    assert eng.provider.calls == []
+    assert eng.state.superseded_prs == []
+
+
+def test_r9f2_an_older_replans_marker_on_the_source_does_not_block_a_healthy_replan(
+    tmp_state_dir,
+):
+    """A source PR may itself be an earlier replan's replacement.
+
+    That older, valid marker is legitimate history and names a different
+    transaction, so it must neither be adopted nor refused -- otherwise every
+    second replan on a chain would block.
+    """
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.PREPARED)
+    gh.prs[PR].body = "Replacement for an earlier replan.\n\n" + _foreign_marker()
+    out = eng.step()
+    assert out.next_phase == "REVIEW"
+    assert eng.state.current_pr_url == REPLACEMENT_PR
+    assert gh.prs[PR].state == "CLOSED"
+
+
+def test_r9f3_a_closed_malformed_claimant_is_rejected_not_reimplemented(tmp_state_dir):
+    """R9-F3: the all-states scan must classify unusable markers, like the open one.
+
+    A post-watermark PR carrying a complete but unusable marker, then closed
+    before recovery, is invisible to the open listing. Reading only valid
+    attestations there reports absence, and absence invokes the agent again.
+    """
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.PREPARED, marker=False)
+    gh.add_pr(
+        url=REPLACEMENT_PR,
+        head_sha=SHA_B,
+        branch=REPLACEMENT_BRANCH,
+        linked=[2],
+        body=UNUSABLE_MARKERS[0],
+        state="CLOSED",
+    )
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert REPLACEMENT_PR in eng.state.block_reason
+    assert "unusable replan marker" in eng.state.block_reason
+    assert "CLOSED" in eng.state.block_reason
+    assert eng.provider.calls == []  # no second implementation attempt
+    _assert_source_untouched(eng, gh)
+
+
+def test_r9f3_an_unusable_marker_on_a_preexisting_closed_pr_is_still_ignored(
+    tmp_state_dir,
+):
+    """Symmetry with the open path: a PR predating the id is evidence of nothing.
+
+    It cannot be adopted and it must not block either, so the agent is invoked
+    exactly once -- the marker garbage belongs to somebody else's PR.
+    """
+    gh = FakeGitHub()
+    gh.add_pr(
+        url=EARLIER_PR,
+        head_sha=SHA_C,
+        branch="chore/unrelated-cleanup",
+        linked=[2],
+        body=UNUSABLE_MARKERS[0],
+        state="CLOSED",
+    )
+    eng = _park_at_hard_threshold(tmp_state_dir, gh, _replan_agent(gh))
+    assert eng.step().next_phase == "REPLAN_REEXECUTE"
+    assert eng.step().next_phase == "REVIEW"
+    assert eng.state.current_pr_url == REPLACEMENT_PR
+
+
+def test_r9f4_a_valid_marker_for_another_transaction_beside_ours_is_refused(
+    tmp_state_dir,
+):
+    """R9-F4: "exactly one marker" counts every attestation, not just ours.
+
+    Counting only our own leaves a body that publishes two provenances at once
+    passing every objective check -- and provenance naming two transactions
+    proves neither.
+    """
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.PREPARED)
+    gh.prs[REPLACEMENT_PR].body += "\n" + _foreign_marker()
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert "valid marker(s) for other transactions" in eng.state.block_reason
+    assert eng.provider.calls == []
+    _assert_source_untouched(eng, gh)
+
+
+def test_r9f4_a_foreign_marker_on_an_unrelated_pr_does_not_block_a_healthy_replan(
+    tmp_state_dir,
+):
+    """The rule is about *our* candidate's body, not about the repository."""
+    gh = FakeGitHub()
+    gh.add_pr(url=OTHER_PR, head_sha=SHA_C, branch="other", linked=[2], body=_foreign_marker())
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.PREPARED)
+    assert eng.step().next_phase == "REVIEW"
+    assert eng.state.current_pr_url == REPLACEMENT_PR
 
 
 def test_a_transaction_without_a_watermark_can_bind_nothing(tmp_state_dir):
@@ -1080,22 +1214,18 @@ def test_target_drift_after_the_checkpoint_blocks_instead_of_closing(
 
 
 def _restated_marker(findings: int, unique: int) -> str:
-    return render_marker(
-        ReplanAttestation(
-            transaction_id=TXN_ID,
-            execution_attempt=2,
-            findings_considered=findings,
-            unique_constraints=unique,
-            tests_passed=True,
-        )
-    )
+    return _ours_marker(findings, unique)
 
 
 @pytest.mark.parametrize(
     "body,needle",
     [
         ("the marker is gone", "no longer carries the marker"),
-        (_restated_marker(4, 2) + "\n" + UNUSABLE_MARKERS[1], "unusable replan marker"),
+        (_restated_marker(4, 2) + "\n" + UNUSABLE_MARKERS[1], "alongside an unusable one"),
+        (
+            _restated_marker(4, 2) + "\n" + _foreign_marker(),
+            "valid marker(s) for other transactions",
+        ),
         (_restated_marker(4, 2) * 2, "carries 2 markers"),
         (_restated_marker(9, 2), "now attests findings_considered=9"),
         (_restated_marker(4, 1), "unique_constraints=1"),
@@ -1218,6 +1348,81 @@ def test_a_transient_failure_while_undoing_the_close_stays_resumable(tmp_state_d
     assert "the close was undone" in eng.state.block_reason
     assert gh.prs[PR].state == "OPEN"
     assert len(gh.closed_prs) == 1  # the resume re-reads, it never closes again
+    assert eng.state.superseded_prs == []
+
+
+@pytest.mark.parametrize(
+    "race,needle",
+    [
+        (lambda gh: gh.set_head(SHA_C, PR), "advanced from the checkpointed HEAD"),
+        (
+            lambda gh: setattr(gh.prs[PR], "head_ref", "somebody/else"),
+            "moved from the checkpointed branch",
+        ),
+    ],
+)
+def test_r9f1_source_drift_after_the_receipt_is_undone_not_merely_blocked(
+    tmp_state_dir, race, needle
+):
+    """R9-F1: the confirmation must compare reads it took *itself*.
+
+    The writing step reads the source back to prove the close landed, then
+    publishes the receipt -- a whole GitHub round trip. Comparing the snapshot
+    from *before* that write would let a source which moved inside the gap
+    reach ``SUPERSEDED``; the later activation check would notice and block,
+    but blocking leaves a controller close standing over a checkpoint it no
+    longer satisfies. Source drift before ``SUPERSEDED`` belongs on the durable
+    compensation path.
+    """
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.VERIFIED)
+    gh.comment_race = race  # lands while the receipt is being published
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert needle in eng.state.block_reason
+    assert "the close was undone" in eng.state.block_reason
+    assert [url for url, _ in gh.reopened_prs] == [PR]
+    assert gh.prs[PR].state == "OPEN"
+    assert _txn(eng).stage is ReplanStage.REJECTED
+    assert eng.state.current_pr_url == PR
+    assert eng.state.superseded_prs == [] and eng.state.escalation_count == 0
+
+
+def _break_the_confirmations_source_read(gh) -> None:
+    """Make the *confirmation's* own re-read of the source fail conclusively.
+
+    The ownership check reads the source's comments first, and the fake reads
+    the PR to serve them, so the first read after the receipt has to succeed:
+    the read under test is the next one -- the one
+    :meth:`_confirm_supersede` takes to compare the checkpoint.
+    """
+    original = gh.get_pr
+    remaining = [1]
+
+    def failing(url: str):
+        if url == PR and not remaining:
+            raise GitHubError("HTTP 451: `gh pr view` refused")
+        if url == PR:
+            remaining.pop()
+        return original(url)
+
+    gh.get_pr = failing
+
+
+def test_r9f1_an_unreadable_source_after_the_close_is_undone_not_adopted(tmp_state_dir):
+    """A checkpoint that cannot be confirmed is not a checkpoint that held.
+
+    Symmetric with the replacement side: an unproven close is undone, exactly
+    as one proven wrong is. A *transient* failure would stay resumable instead.
+    """
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.VERIFIED)
+    gh.comment_race = _break_the_confirmations_source_read
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert "could not be re-read after the close" in eng.state.block_reason
+    assert "reopened by hand" in eng.state.block_reason
+    assert _txn(eng).stage is ReplanStage.REJECTED
     assert eng.state.superseded_prs == []
 
 

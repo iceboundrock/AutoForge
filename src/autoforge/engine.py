@@ -1711,6 +1711,11 @@ class ControllerEngine:
         blocks -- rather than accepted. The pre-close checks are kept: they
         make the common refusal cost nothing.
 
+        The comparison is completed on reads :meth:`_confirm_supersede` takes
+        itself, after the receipt is published: the source snapshot this method
+        reads back is only used to prove the close landed and to decide whether
+        to publish the receipt at all.
+
         ``SUPERSEDE_INTENT`` is persisted before ``close_pr`` is called, so a
         crash anywhere in the write window resumes into disposition rather than
         into a second attempt. It records an *intent*, though, not a performed
@@ -1739,7 +1744,9 @@ class ControllerEngine:
             # Intent recorded before the write is what makes this close ours.
             # A resume lands here having missed the close window entirely, so
             # it owes the same post-close comparison the writing step does.
-            return self._confirm_supersede(txn, source)
+            # It re-reads the source for itself; this snapshot is already one
+            # round trip old by the time the comparison runs.
+            return self._confirm_supersede(txn)
         if txn.stage is ReplanStage.SUPERSEDE_INTENT and source.is_open:
             # A resume retrying the write: a receipt already present means a
             # prior attempt closed the source and it was then reopened. Closing
@@ -1834,9 +1841,9 @@ class ControllerEngine:
                 f"source PR {txn.source_pr_url} was closed, but the close receipt could not be "
                 f"published ({exc}), so the close cannot be proven on resume",
             )
-        return self._confirm_supersede(txn, source)
+        return self._confirm_supersede(txn)
 
-    def _confirm_supersede(self, txn: ReplanTransaction, source: PRInfo) -> StepOutcome:
+    def _confirm_supersede(self, txn: ReplanTransaction) -> StepOutcome:
         """The swap half of the compare-and-swap, completed after the close.
 
         Reached with the source CLOSED and the intent durable -- either
@@ -1846,7 +1853,27 @@ class ControllerEngine:
         already changed and is *undone* (:meth:`_compensate_close`) instead of
         being activated. Only an unmoved pair reaches ``SUPERSEDED``.
 
-        A transient GitHub failure here propagates untouched: the transaction
+        Both sides are re-read *here*, by this method, rather than reused from
+        whatever the caller last saw (R9-F1). The writing step's post-close
+        read happens before the receipt is published, and the resume path's
+        happens before the comments are fetched, so either snapshot is already
+        a round trip stale by the time it would be compared -- and a source
+        that moved inside that gap has to reach the compensation path, not be
+        waved through to be caught later by :meth:`_activate_if_verified`,
+        which blocks without undoing the close.
+
+        The window cannot be *removed*, only moved: ``gh pr close`` takes no
+        precondition and ``SUPERSEDED`` is persisted after the last read, so
+        the boundary is exactly "the last read before the write". Drift before
+        it is compensated; drift after it is terminal (see
+        :meth:`_activate_if_verified`), because by then the close had already
+        been confirmed correct. Making that boundary as late as possible is
+        the whole of what an implementation can do.
+
+        An unconfirmable checkpoint counts as drift, not as absence of it: a
+        conclusive read failure on either side means the close cannot be shown
+        to have been correct, and an unproven close is undone rather than kept.
+        A *transient* GitHub failure propagates untouched: the transaction
         stays at ``SUPERSEDE_INTENT``, and a resume runs exactly this method
         again on the same source PR.
         """
@@ -1854,7 +1881,17 @@ class ControllerEngine:
         unowned = self._close_not_ours(txn)
         if unowned:
             return self._reject_replan(txn, unowned)
-        drift = verify_closed_source(source, txn)
+        try:
+            source = self.github.get_pr(txn.source_pr_url)
+        except GitHubUnavailableError:
+            raise
+        except GitHubError as exc:
+            drift = (
+                f"source PR {txn.source_pr_url} could not be re-read after the close "
+                f"({exc}), so the close cannot be confirmed against its checkpoint"
+            )
+        else:
+            drift = verify_closed_source(source, txn)
         if not drift:
             try:
                 target = self.github.get_pr(txn.replacement_pr_url)
@@ -1994,7 +2031,10 @@ class ControllerEngine:
         ``SUPERSEDED`` alike, so the two cannot decide differently.
 
         Drift here is terminal, not compensable: the close was confirmed
-        correct when it happened, and the source is legitimately closed. The
+        correct when it happened -- against reads :meth:`_confirm_supersede`
+        took after the receipt, the latest point at which anything could be
+        checked -- and the source is legitimately closed. Undoing a close that
+        was right when it was made would be its own kind of laundering, so the
         run blocks and says so, naming both PRs. Ownership of that close is
         already durable in ``SUPERSEDED`` and is not re-litigated.
         """

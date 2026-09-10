@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -131,6 +132,10 @@ class FakeGitHub:
         self.close_error: str | GitHubError = ""
         self.close_leaves_open: bool = False  # gh exits 0 but the PR stays OPEN
         self.comment_error: str | GitHubError = ""  # non-empty -> comment_pr raises
+        # Called at the start of comment_pr: a mutation racing a comment write.
+        # The replan's post-close receipt is the interesting one -- it lands
+        # between the controller's post-close read and its confirmation.
+        self.comment_race = None
         self.commented_prs: list[tuple[str, str]] = []
         self.get_pr_failures: int = 0  # next N get_pr calls raise GitHubUnavailableError
         self.get_pr_error: GitHubError | None = None  # every get_pr call raises this
@@ -221,20 +226,29 @@ class FakeGitHub:
         except GitHubError:
             return False
 
-    def get_pr(self, url: str) -> PRInfo:
+    def _stored(self, url: str) -> PRInfo:
+        """The live record, for the fake's own writes -- never handed to a caller."""
         from autoforge.validation import parse_pr_url
 
+        ref = parse_pr_url(url)
+        try:
+            return self.prs[ref.canonical]
+        except KeyError:
+            raise GitHubError(f"pr not found: {url}") from None
+
+    def get_pr(self, url: str) -> PRInfo:
         self.calls.append(("get_pr", url))
         if self.get_pr_error is not None:
             raise self.get_pr_error
         if self.get_pr_failures > 0:
             self.get_pr_failures -= 1
             raise GitHubUnavailableError("`gh pr view` failed (exit 1): connection reset")
-        ref = parse_pr_url(url)
-        try:
-            return self.prs[ref.canonical]
-        except KeyError:
-            raise GitHubError(f"pr not found: {url}") from None
+        # A *snapshot*, exactly as `gh pr view` returns one: a caller holding a
+        # PRInfo holds what GitHub said at that moment, and a later change on
+        # the server cannot retroactively appear in it. Handing out the live
+        # record instead would hide every staleness bug the controller must not
+        # have -- a stale checkpoint comparison would silently self-heal.
+        return replace(self._stored(url))
 
     def get_pr_head_sha(self, url: str) -> str:
         return self.get_pr(url).head_sha
@@ -273,7 +287,7 @@ class FakeGitHub:
                 f"{repo} has at least 1000 open pull requests, so the listing may be "
                 "truncated and the set of candidates cannot be established"
             )
-        return [p for p in self.prs.values() if p.is_open and p.repository == repo]
+        return [replace(p) for p in self.prs.values() if p.is_open and p.repository == repo]
 
     def list_all_prs(self, repo: str, *, strict: bool = False) -> list[PRInfo]:
         self.calls.append(("list_all_prs", repo, strict))
@@ -282,7 +296,7 @@ class FakeGitHub:
                 f"{repo} has at least 1000 pull requests, so the listing may be "
                 "truncated and the set of candidates cannot be established"
             )
-        return [p for p in self.prs.values() if p.repository == repo]
+        return [replace(p) for p in self.prs.values() if p.repository == repo]
 
     def latest_pr_number(self, repo: str) -> int:
         """Highest PR number in the repo, open or closed (the real watermark)."""
@@ -332,7 +346,7 @@ class FakeGitHub:
         self.merges.append((canonical, method, match_head_sha, delete_branch))
         if self.merge_error:
             raise GitHubError(self.merge_error)
-        pr = self.get_pr(canonical)
+        pr = self._stored(canonical)
         if not pr.is_open:
             raise GitHubError(f"`gh pr merge` failed: PR is {pr.state}")
         if match_head_sha and pr.head_sha != match_head_sha:
@@ -351,7 +365,7 @@ class FakeGitHub:
         self.disabled_auto.append(canonical)
         if self.disable_auto_error:
             raise GitHubError(self.disable_auto_error)
-        self.get_pr(canonical).auto_merge_enabled = False
+        self._stored(canonical).auto_merge_enabled = False
 
     def close_pr(self, url: str, comment: str) -> None:
         from autoforge.validation import parse_pr_url
@@ -371,7 +385,7 @@ class FakeGitHub:
             raise self.close_error
         if self.close_error:
             raise GitHubError(self.close_error)
-        pr = self.get_pr(canonical)
+        pr = self._stored(canonical)
         if not pr.is_open:
             raise GitHubError(f"cannot close PR {canonical}: it is {pr.state}")
         if not self.close_leaves_open:
@@ -387,8 +401,13 @@ class FakeGitHub:
             raise self.comment_error
         if self.comment_error:
             raise GitHubError(self.comment_error)
-        self.get_pr(canonical)  # fails closed on unknown PR, like `gh`
+        self._stored(canonical)  # fails closed on unknown PR, like `gh`
         self.add_comment(canonical, 920_000 + len(self.calls), body)
+        if self.comment_race is not None:
+            # Landed once the comment is durable: for the replan's post-close
+            # receipt, that is after the controller's post-close read and
+            # before it confirms the checkpoints.
+            self.comment_race(self)
 
     def reopen_pr(self, url: str, comment: str) -> None:
         from autoforge.validation import parse_pr_url
@@ -401,7 +420,7 @@ class FakeGitHub:
             raise self.reopen_error
         if self.reopen_error:
             raise GitHubError(self.reopen_error)
-        pr = self.get_pr(canonical)
+        pr = self._stored(canonical)
         if pr.state == "MERGED":
             raise GitHubError(f"cannot reopen PR {canonical}: it is MERGED")
         if not self.reopen_leaves_closed:

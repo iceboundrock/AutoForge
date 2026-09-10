@@ -721,11 +721,14 @@ Rules:
   and refuses any PR at or below it. Adding the marker to an already-open PR --
   including the one being superseded, or an unrelated one you also happen to be
   working on -- rejects the replan; it does not adopt that PR.
-* Exactly one marker in the body, and nothing marker-shaped beside it. Any
-  complete `<!-- autoforge-replan-transaction: ... -->` comment whose payload
-  is not a valid attestation -- prose, an example, an empty payload -- is an
-  unusable marker, and a body carrying one is refused even when a valid marker
-  sits beside it. Do not quote these instructions in the PR body.
+* Exactly one marker in the body *in total*, and nothing marker-shaped beside
+  it. Any complete `<!-- autoforge-replan-transaction: ... -->` comment whose
+  payload is not a valid attestation -- prose, an example, an empty payload --
+  is an unusable marker, and a body carrying one is refused even when a valid
+  marker sits beside it. A second marker that *is* valid but carries a
+  different `transaction_id` is refused too: a body naming two transactions
+  proves neither. Do not quote these instructions in the PR body, and do not
+  copy a marker out of another PR's description into yours.
 * `transaction_id` must be exactly `{{REPLAN_TRANSACTION_ID}}`. Do not invent,
   shorten or reformat it. Do not copy it into any other PR.
 * `execution_attempt` must be exactly `{{EXECUTION_ATTEMPT}}`.

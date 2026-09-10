@@ -243,6 +243,81 @@ def scan_replan_markers(body: str) -> MarkerScan:
     return MarkerScan(attestations, malformed)
 
 
+def sole_attestation(
+    scan: MarkerScan, transaction_id: str, ref: str, label: str = "PR"
+) -> tuple[ReplanAttestation | None, str]:
+    """The one attestation ``ref`` publishes for ``transaction_id``, or a defect.
+
+    ``(None, "")`` means the body claims nothing for this transaction -- not an
+    error, just a PR that is none of this transaction's business. A non-empty
+    defect is *conclusive*: the body carries marker evidence for this
+    transaction that cannot be accepted.
+
+    The prompt asks for exactly one marker and nothing marker-shaped beside it,
+    so that is what is enforced: a second copy of ours, an unusable marker
+    beside the valid one, and a *valid* marker belonging to another transaction
+    are all defects. The last one matters as much as the others -- counting
+    only our own markers would let a body publish two provenances at once while
+    every objective check still passed, and provenance that names two
+    transactions proves neither.
+
+    Candidate binding and the final read before the destructive close share
+    this function, so "acceptable enough to adopt" and "still acceptable to
+    close the source for" cannot drift apart into two different rules.
+    """
+    mine = [a for a in scan.attestations if a.transaction_id == transaction_id]
+    if not mine:
+        return None, ""
+    if len(mine) > 1:
+        return None, f"{label} {ref} carries {len(mine)} markers for this transaction"
+    if scan.malformed:
+        return None, (
+            f"{label} {ref} carries the marker for replan transaction {transaction_id} "
+            f"alongside an unusable one ({'; '.join(scan.malformed)})"
+        )
+    others = len(scan.attestations) - 1
+    if others:
+        return None, (
+            f"{label} {ref} carries the marker for replan transaction {transaction_id} "
+            f"alongside {others} valid marker(s) for other transactions; a replacement "
+            "body must publish exactly one attestation"
+        )
+    return mine[0], ""
+
+
+def source_marker_defect(scan: MarkerScan, transaction_id: str, ref: str) -> str:
+    """Why the *source* PR's own body refuses this replan, or ``""``.
+
+    The source can never be adopted as its own replacement, but excluding it
+    *before* reading its body would turn "the agent marked the PR being
+    superseded" into "no candidate exists" -- and that observation is what
+    decides whether the agent is invoked again. Marker-bearing work would then
+    exist while a second implementation attempt started on top of it, which is
+    exactly what crash idempotency forbids. The prompt says putting the marker
+    on the superseded PR rejects the replan, so it has to be *found and
+    refused*, never missed.
+
+    A valid marker for another transaction is left alone: a source PR may
+    itself be an earlier replan's replacement, and that older marker is
+    legitimate history. An unusable marker is refused, because a body that
+    tried to carry an attestation and failed is evidence of a botched attempt
+    rather than of an unrelated PR.
+    """
+    if any(a.transaction_id == transaction_id for a in scan.attestations):
+        return (
+            f"source PR {ref} carries the marker for replan transaction {transaction_id}; "
+            "the marker belongs on the replacement the agent creates, and a replan whose "
+            "attestation sits on the PR being superseded is refused, never restarted"
+        )
+    if scan.malformed:
+        return (
+            f"source PR {ref} carries an unusable replan marker "
+            f"({'; '.join(scan.malformed)}), which cannot be ruled out as a botched "
+            f"attestation for replan transaction {transaction_id}"
+        )
+    return ""
+
+
 @dataclass
 class ReplanTransaction:
     """Durable intent for one replan. Persisted as ``state.replan_transaction``.
@@ -588,29 +663,30 @@ def verify_target_marker(pr: PRInfo, txn: ReplanTransaction) -> str:
     marker, or restating the attestation with different numbers, leaves every
     objective fact valid while removing the only evidence that this PR belongs
     to this replan. So the body is re-scanned on the final read, under exactly
-    the rules that bound it in the first place -- one usable marker for this
-    transaction, nothing marker-shaped beside it -- plus equality with the
-    attestation the controller checkpointed at ``VERIFIED``.
+    the rules that bound it in the first place -- :func:`sole_attestation`,
+    literally the same function: one usable marker for this transaction and
+    nothing marker-shaped beside it, a valid marker for another transaction
+    included -- plus equality with the attestation the controller checkpointed
+    at ``VERIFIED``.
     """
     scan = scan_replan_markers(pr.body or "")
     ref = _canonical(pr.url) or pr.url or "(none)"
-    if scan.malformed:
-        return (
-            f"replacement PR {ref} carries an unusable replan marker "
-            f"({'; '.join(scan.malformed)})"
-        )
-    mine = [a for a in scan.attestations if a.transaction_id == txn.transaction_id]
-    if not mine:
+    attestation, defect = sole_attestation(scan, txn.transaction_id, ref, "replacement PR")
+    if defect:
+        return defect
+    if attestation is None:
+        if scan.malformed:
+            return (
+                f"replacement PR {ref} carries an unusable replan marker "
+                f"({'; '.join(scan.malformed)})"
+            )
         return (
             f"replacement PR {ref} no longer carries the marker for replan transaction "
             f"{txn.transaction_id}, so it can no longer be proven to be its replacement"
         )
-    if len(mine) > 1:
-        return f"replacement PR {ref} carries {len(mine)} markers for this transaction"
-    drift = verify_attestation(mine[0], txn)
+    drift = verify_attestation(attestation, txn)
     if drift:
         return drift
-    attestation = mine[0]
     if (
         attestation.findings_considered != txn.attested_findings_considered
         or attestation.unique_constraints != txn.attested_unique_constraints
@@ -651,8 +727,13 @@ def select_bound_candidate(open_prs: list[PRInfo], txn: ReplanTransaction) -> Ca
     existed. Everything else is ignored, so an unrelated open PR neither gets
     adopted nor blocks a healthy replan. Two bound candidates are ambiguous,
     and a candidate whose marker is unusable in any way -- malformed, doubled,
-    or sitting on a PR that predates the transaction -- is a conclusive
-    rejection.
+    accompanied by a valid marker for a different transaction, or sitting on a
+    PR that predates the transaction -- is a conclusive rejection.
+
+    The source PR is not adoptable, but it is still *read*: a marker the agent
+    put on the PR being superseded is a refusal, and skipping the body would
+    downgrade it to "no candidate exists" -- the observation that starts a
+    second implementation attempt.
 
     Novelty is decided by ``pr_number_watermark`` rather than by the snapshot
     of issue PRs: GitHub numbers PRs from a monotonic per-repository counter,
@@ -686,9 +767,17 @@ def select_bound_candidate(open_prs: list[PRInfo], txn: ReplanTransaction) -> Ca
     malformed: list[str] = []
     for pr in open_prs:
         canonical = _canonical(pr.url)
-        if not canonical or canonical == source:
+        if not canonical:
             continue
         scan = scan_replan_markers(pr.body or "")
+        if canonical == source:
+            # Read before it is excluded: a marker the agent put on the PR
+            # being superseded must be refused, not silently reported as
+            # "no candidate" -- see :func:`source_marker_defect`.
+            defect = source_marker_defect(scan, txn.transaction_id, canonical)
+            if defect:
+                return CandidateSelection(Disposition.REJECTED, reason=defect)
+            continue
         mine = [a for a in scan.attestations if a.transaction_id == txn.transaction_id]
         under_watermark = pr.number <= txn.pr_number_watermark
         if under_watermark or canonical in preexisting:
@@ -709,27 +798,16 @@ def select_bound_candidate(open_prs: list[PRInfo], txn: ReplanTransaction) -> Ca
                     ),
                 )
             continue
-        if len(mine) > 1:
-            return CandidateSelection(
-                Disposition.REJECTED,
-                reason=f"PR {canonical} carries {len(mine)} markers for this transaction",
-            )
-        if mine and scan.malformed:
-            # A valid marker does not excuse an unusable one beside it: the
-            # body was supposed to carry exactly one attestation, and a
-            # candidate whose provenance data is partly garbage fails closed.
-            return CandidateSelection(
-                Disposition.REJECTED,
-                reason=(
-                    f"PR {canonical} carries the marker for replan transaction "
-                    f"{txn.transaction_id} alongside an unusable one "
-                    f"({'; '.join(scan.malformed)})"
-                ),
-            )
+        # Exactly one attestation, and it is ours: a doubled marker, an
+        # unusable one beside the valid one, and a valid marker for another
+        # transaction are all conclusive refusals rather than adoptions.
+        attestation, defect = sole_attestation(scan, txn.transaction_id, canonical)
+        if defect:
+            return CandidateSelection(Disposition.REJECTED, reason=defect)
         if scan.malformed:
             malformed.append(f"{canonical}: {'; '.join(scan.malformed)}")
-        if mine:
-            bound.append((pr, mine[0]))
+        if attestation is not None:
+            bound.append((pr, attestation))
     if len(bound) > 1:
         urls = ", ".join(sorted(_canonical(pr.url) for pr, _ in bound))
         return CandidateSelection(
@@ -766,7 +844,12 @@ def find_non_open_claimant(
     Pre-existing non-open PRs carrying a copied marker are reported as
     pre-existing, exactly as the open path does; post-watermark ones are
     reported with their observed state (CLOSED/MERGED), because they prove a
-    first implementation attempt already happened.
+    first implementation attempt already happened. A post-watermark PR whose
+    marker is *unusable* is reported the same way rather than skipped: the
+    marker protocol classifies by name, so a complete marker with a garbage
+    payload is broken evidence, never absent evidence. The source PR is read
+    for its own marker here too, for the reason
+    :func:`select_bound_candidate` gives.
     """
     if not TRANSACTION_ID_RE.match(txn.transaction_id):
         return CandidateSelection(Disposition.NONE)
@@ -778,13 +861,37 @@ def find_non_open_claimant(
         if pr.is_open:
             continue
         canonical = _canonical(pr.url)
-        if not canonical or canonical == source:
+        if not canonical:
             continue
         scan = scan_replan_markers(pr.body or "")
+        if canonical == source:
+            defect = source_marker_defect(scan, txn.transaction_id, canonical)
+            if defect:
+                return CandidateSelection(Disposition.REJECTED, reason=defect)
+            continue
         mine = [a for a in scan.attestations if a.transaction_id == txn.transaction_id]
-        if not mine:
+        if not mine and not scan.malformed:
             continue
         under_watermark = pr.number <= txn.pr_number_watermark
+        if (under_watermark or canonical in preexisting) and not mine:
+            # A PR that predates the transaction id cannot be evidence about
+            # it, and the open path ignores its unusable markers for exactly
+            # the same reason. Only a *copied* valid marker is reported below.
+            continue
+        if not mine:
+            # A complete marker with this name whose payload is not a usable
+            # attestation is evidence of a first attempt, not absence of one.
+            # Classified here as strictly as on the open path, because the
+            # alternative is invoking the agent a second time.
+            return CandidateSelection(
+                Disposition.REJECTED,
+                reason=(
+                    f"PR {canonical} carries an unusable replan marker "
+                    f"({'; '.join(scan.malformed)}) and is {pr.state or '(unknown)'}, "
+                    "expected OPEN; complete marker evidence is never absence, so this "
+                    "must be decided by a human, not by invoking the agent again"
+                ),
+            )
         if under_watermark or canonical in preexisting:
             how = (
                 f"its number {pr.number} is at or below the watermark {txn.pr_number_watermark}"
