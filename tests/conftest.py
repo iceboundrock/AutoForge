@@ -130,6 +130,8 @@ class FakeGitHub:
         # (GitHubUnavailableError for a transient failure), a str is conclusive.
         self.close_error: str | GitHubError = ""
         self.close_leaves_open: bool = False  # gh exits 0 but the PR stays OPEN
+        self.comment_error: str | GitHubError = ""  # non-empty -> comment_pr raises
+        self.commented_prs: list[tuple[str, str]] = []
         self.get_pr_failures: int = 0  # next N get_pr calls raise GitHubUnavailableError
         self.get_pr_error: GitHubError | None = None  # every get_pr call raises this
         self.get_issue_error: GitHubError | None = None  # every get_issue call raises this
@@ -273,6 +275,15 @@ class FakeGitHub:
             )
         return [p for p in self.prs.values() if p.is_open and p.repository == repo]
 
+    def list_all_prs(self, repo: str, *, strict: bool = False) -> list[PRInfo]:
+        self.calls.append(("list_all_prs", repo, strict))
+        if strict and self.pr_listing_truncated:
+            raise GitHubError(
+                f"{repo} has at least 1000 pull requests, so the listing may be "
+                "truncated and the set of candidates cannot be established"
+            )
+        return [p for p in self.prs.values() if p.repository == repo]
+
     def latest_pr_number(self, repo: str) -> int:
         """Highest PR number in the repo, open or closed (the real watermark)."""
         self.calls.append(("latest_pr_number", repo))
@@ -349,8 +360,9 @@ class FakeGitHub:
         self.calls.append(("close_pr", canonical, comment))
         self.closed_prs.append((canonical, comment))
         # `gh pr close --comment` posts the comment as part of the same
-        # invocation, before the close; the controller's close receipt lives
-        # in it, so the fake must record it too.
+        # invocation, before the close; it must NOT carry the ownership
+        # receipt (see GitHubClient.close_pr), which is posted afterwards
+        # with `comment_pr` only after the close is observed.
         self.add_comment(canonical, 900_000 + len(self.closed_prs), comment)
         if self.close_race is not None:
             # Landed after the controller's last read, before the close.
@@ -364,6 +376,19 @@ class FakeGitHub:
             raise GitHubError(f"cannot close PR {canonical}: it is {pr.state}")
         if not self.close_leaves_open:
             pr.state = "CLOSED"
+
+    def comment_pr(self, url: str, body: str) -> None:
+        from autoforge.validation import parse_pr_url
+
+        canonical = parse_pr_url(url).canonical
+        self.calls.append(("comment_pr", canonical, body))
+        self.commented_prs.append((canonical, body))
+        if isinstance(self.comment_error, GitHubError):
+            raise self.comment_error
+        if self.comment_error:
+            raise GitHubError(self.comment_error)
+        self.get_pr(canonical)  # fails closed on unknown PR, like `gh`
+        self.add_comment(canonical, 920_000 + len(self.calls), body)
 
     def reopen_pr(self, url: str, comment: str) -> None:
         from autoforge.validation import parse_pr_url

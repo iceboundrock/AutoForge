@@ -84,8 +84,9 @@ review:
   #     agent's own report, and never a PR that already existed;
   #   * the old PR is closed only while both it and the replacement still
   #     match the checkpoint taken before the agent ran;
-  #   * the intent to close is persisted before the close, so a crash can
-  #     tell the controller's own close from a human's;
+  #   * the intent to close is persisted before the close, and a close receipt
+  #     is posted only after the close is observed (never inside the close
+  #     itself), so a crash can tell the controller's own close from a human's;
   #   * a refusal is durable (the run stays BLOCKED across `resume`), while a
   #     transient GitHub failure stays resumable.
   # `autoforge status` prints the transaction id, stage and both PRs.

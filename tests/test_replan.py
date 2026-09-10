@@ -738,6 +738,73 @@ def test_a_pr_predating_the_transaction_is_refused_even_if_it_was_never_an_issue
     _assert_source_untouched(eng, gh)
 
 
+def test_r8f2_a_closed_replacement_is_rejected_not_reimplemented(tmp_state_dir):
+    """R8-F2: a marked replacement that was closed before recovery is evidence.
+
+    The first agent creates the replacement, publishes the marker, and the PR
+    is then closed before the controller resumes. The open listing is empty
+    for this transaction, but the exhaustive all-states listing still finds
+    the closed claimant. It must be durably rejected with the PR named --
+    never treated as absent, which would invoke the agent a second time.
+    """
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.PREPARED, marker=False)
+    gh.add_pr(
+        url=REPLACEMENT_PR,
+        head_sha=SHA_B,
+        branch=REPLACEMENT_BRANCH,
+        linked=[2],
+        body=render_marker(
+            ReplanAttestation(
+                transaction_id=TXN_ID,
+                execution_attempt=2,
+                findings_considered=4,
+                unique_constraints=2,
+                tests_passed=True,
+            )
+        ),
+        state="CLOSED",
+    )
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert REPLACEMENT_PR in eng.state.block_reason
+    assert "CLOSED" in eng.state.block_reason
+    assert "already exists" in eng.state.block_reason or "must be decided by a human" in (
+        eng.state.block_reason
+    )
+    assert eng.provider.calls == []  # no second implementation attempt
+    assert gh.prs[PR].state == "OPEN"  # source untouched
+    assert eng.state.current_pr_url == PR
+    assert eng.state.superseded_prs == []
+
+
+def test_r8f2_a_preexisting_closed_pr_with_a_copied_marker_is_rejected(tmp_state_dir):
+    """R8-F2: a closed pre-existing PR carrying the marker is not absence either."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.PREPARED, marker=False)
+    gh.add_pr(
+        url=EARLIER_PR,
+        head_sha=SHA_C,
+        branch="chore/unrelated-cleanup",
+        linked=[2],
+        body=render_marker(
+            ReplanAttestation(
+                transaction_id=TXN_ID,
+                execution_attempt=2,
+                findings_considered=4,
+                unique_constraints=2,
+                tests_passed=True,
+            )
+        ),
+        state="CLOSED",
+    )
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert "already existed" in eng.state.block_reason
+    assert eng.provider.calls == []
+    _assert_source_untouched(eng, gh)
+
+
 def test_a_transaction_without_a_watermark_can_bind_nothing(tmp_state_dir):
     """Without the watermark, provenance would fall back to shape."""
     txn = ReplanTransaction(
@@ -1896,12 +1963,19 @@ def test_marker_regex_cannot_swallow_the_rest_of_a_body():
 
 
 def test_f1_the_controller_close_publishes_an_ownership_receipt(tmp_state_dir):
-    """The close carries the only durable proof that the controller made it."""
+    """The close carries the only durable proof that the controller made it.
+
+    R8-F1: the receipt is posted *after* the close is observed, never inside
+    the `gh pr close --comment` that predates it.
+    """
     gh = FakeGitHub()
     eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.VERIFIED)
     assert eng.step().next_phase == "REVIEW"
-    (_, comment) = gh.closed_prs[0]
-    assert render_close_receipt(TXN_ID) in comment
+    (_, close_comment) = gh.closed_prs[0]
+    assert render_close_receipt(TXN_ID) not in close_comment
+    assert REPLACEMENT_PR in close_comment  # the close still names the replacement
+    assert gh.commented_prs and gh.commented_prs[0][0] == PR
+    assert render_close_receipt(TXN_ID) in gh.commented_prs[0][1]
     assert has_close_receipt([c.body for c in gh.get_pr_comments(PR)], TXN_ID)
 
 
@@ -1954,6 +2028,84 @@ def test_f1_an_unreadable_comment_list_is_unknown_not_unowned(tmp_state_dir):
     assert eng.step().next_phase == "BLOCKED"
     assert "could not be read" in eng.state.block_reason
     assert _txn(eng).stage is ReplanStage.REJECTED
+
+
+def test_r8f1_a_receipt_that_predates_the_close_proves_nothing(tmp_state_dir):
+    """R8-F1: `gh pr close --comment` posts before the close lands.
+
+    The closing command posts its comment, the process is interrupted before
+    the close lands, and a human then closes the unchanged source. The
+    pre-close comment is already present, but no receipt was ever posted
+    (receipts are post-close only). Resume must block without activating the
+    replacement -- it must not mistake the pre-close comment for ownership.
+    """
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.VERIFIED)
+    gh.close_error = GitHubUnavailableError("`gh pr close` failed: connection reset")
+    with pytest.raises(GitHubUnavailableError):
+        eng.step()
+    # The close comment predates the close (Fake posts it before raising),
+    # the source is still OPEN, and no receipt exists anywhere.
+    assert gh.prs[PR].state == "OPEN"
+    assert gh.closed_prs  # the comment was posted
+    assert render_close_receipt(TXN_ID) not in gh.closed_prs[0][1]
+    assert not has_close_receipt([c.body for c in gh.get_pr_comments(PR)], TXN_ID)
+    assert _txn(eng).stage is ReplanStage.SUPERSEDE_INTENT
+
+    # A human now closes the unchanged source; resume must not adopt it.
+    gh.close_error = ""
+    _closed_by_a_human(gh)
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert "carries no close receipt" in eng.state.block_reason
+    assert _txn(eng).stage is ReplanStage.REJECTED
+    assert eng.state.current_pr_url == PR  # replacement inactive
+    assert eng.state.superseded_prs == []
+    assert gh.reopened_prs == []
+    assert len(gh.commented_prs) == 0  # the resume never posts a receipt
+
+
+def test_r8f1_a_conclusive_close_failure_is_never_adopted(tmp_state_dir):
+    """R8-F1: our close failed, so a CLOSED source afterwards is someone else's.
+
+    A human closes the source inside the write window; our close then fails
+    conclusively. The old code ignored the failure once the source read back
+    CLOSED and adopted on the pre-close comment's receipt. The fix rejects as
+    soon as our close is known not to have landed, without posting a receipt.
+    """
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.VERIFIED)
+    gh.close_race = lambda g: _closed_by_a_human(g)
+    gh.close_error = "denied: cannot close this PR"
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert "closing source PR" in eng.state.block_reason
+    assert _txn(eng).stage is ReplanStage.REJECTED
+    assert eng.state.current_pr_url == PR
+    assert eng.state.superseded_prs == []
+    assert gh.commented_prs == []  # no receipt without an observed close
+    # The human's close is left exactly as found -- never reopened, never adopted.
+    assert gh.prs[PR].state == "CLOSED"
+    assert gh.reopened_prs == []
+
+
+def test_r8f1_an_open_source_already_carrying_a_receipt_is_not_closed_again(
+    tmp_state_dir,
+):
+    """R8-F1: receipt + OPEN at INTENT means a prior close landed then reopened."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(
+        tmp_state_dir, gh, ReplanStage.SUPERSEDE_INTENT, close_intent_at="2026-01-01T00:00:00+00:00"
+    )
+    _closed_by_controller(gh)  # CLOSED + receipt, as our own close leaves it
+    gh.prs[PR].state = "OPEN"  # ... then someone reopened it before resume
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert "already carries the close receipt" in eng.state.block_reason
+    assert "reopened" in eng.state.block_reason
+    assert _txn(eng).stage is ReplanStage.REJECTED
+    assert gh.closed_prs == []  # never a second close
+    assert eng.state.superseded_prs == []
 
 
 def test_f2_a_crash_after_the_reopen_lands_resumes_into_the_undo(tmp_state_dir):

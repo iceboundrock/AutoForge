@@ -500,19 +500,19 @@ The previous PR should remain available as historical evidence.
 
 Do NOT destroy GitHub history.
 
-The old PR should be marked or closed as superseded according to repository policy.
+The controller, not you, owns the previous PR's lifecycle. The controller
+closes it without merging once the replacement is verified. You must not
+close, mark, comment on, or otherwise modify the previous PR:
 
-When appropriate, add a concise comment explaining:
+* Do not run `gh pr close` on the previous PR.
+* Do not run `gh pr comment`, `gh pr edit`, or any other command that marks
+  it as superseded.
+* Do not post the "being superseded" explanation yourself; the controller
+  posts the supersession link when it closes the PR.
 
-```text
-This implementation is being superseded after repeated review/remediation
-cycles. A fresh implementation is being created from the current default
-branch using the accumulated review findings as constraints.
-```
+Describe the linkage only inside the replacement PR body (section 21).
 
-Link the replacement PR once available.
-
-Do not merge the old PR.
+Do not merge the old PR. Never merge a pull request.
 
 ---
 
@@ -530,17 +530,21 @@ Do not:
 * cherry-pick its implementation commits
 * copy its diff wholesale
 
-Clean up the previous local branch/worktree only when safe.
+Do not touch the old local branch or any worktree. Local branches and
+worktrees are operator-owned: the operator's checkout, uncommitted work, and
+existing branches must be left exactly as found.
 
-Never delete:
+* Do not run `git branch -D`, `git branch -d`, `git push --delete`, or any
+  equivalent that deletes the previous branch.
+* Do not run `git worktree add`, `git worktree remove`, `git worktree move`,
+  or otherwise create, clean up, move, or delete any worktree.
+* Do not delete unrelated branches, unrelated worktrees, or uncommitted user
+  work.
 
-* unrelated branches
-* unrelated worktrees
-* uncommitted user work
+The only branch you may create is the NEW replacement branch in section 15,
+and creating it must not delete, rename, or move anything else.
 
-If safe cleanup cannot be guaranteed:
-
-leave the old local branch alone and report it.
+Leave the old local branch alone and report it.
 
 Safety is more important than cleanup.
 

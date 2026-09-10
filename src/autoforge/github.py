@@ -217,18 +217,14 @@ _MERGE_QUEUE_QUERY = (
     " repository(owner: $owner, name: $name) {"
     " pullRequest(number: $number) { isMergeQueueEnabled isInMergeQueue } } }"
 )
-# The highest PR number that exists in a repository right now. GitHub allocates
-# issue/PR numbers from one monotonic per-repository counter at creation time,
-# so the newest-created PR carries the largest number, and *every* PR created
-# later carries a larger one. That makes a single-node read a complete
-# "existed before now" watermark -- no pagination, and unlike a listing it also
-# covers closed and unlinked PRs.
-_LATEST_PR_QUERY = (
-    "query($owner: String!, $name: String!) {"
-    " repository(owner: $owner, name: $name) {"
-    " pullRequests(first: 1, orderBy: {field: CREATED_AT, direction: DESC})"
-    " { nodes { number } } } }"
-)
+# The highest PR number is read as a proven numeric maximum over every PR
+# state, never inferred from one CREATED_AT-ordered node: creation-time
+# ordering has no numeric tie-breaker, so same-second PRs can return a lower
+# number first and let a higher-numbered pre-existing PR slip past the
+# watermark. Listing `--state all` and taking the maximum covers open,
+# closed and merged PRs alike; a listing that reaches the ceiling is refused
+# rather than reported as a maximum.
+_PR_NUMBER_LIST_FIELDS = "number"
 _PR_LIST_FIELDS = (
     "url,number,title,state,headRefOid,baseRefName,headRefName,isDraft,body,"
     "headRepository,headRepositoryOwner,closingIssuesReferences"
@@ -542,40 +538,85 @@ class GitHubClient:
             )
         return prs
 
+    def list_all_prs(self, repo: str, *, strict: bool = False) -> list[PRInfo]:
+        """Every PR in ``repo`` across all states (bodies included).
+
+        Needed where "no candidate exists" must be proven, not assumed: a
+        replacement the agent created and that was then closed is invisible to
+        :meth:`list_open_prs`, and treating it as absent would start a second
+        implementation attempt. ``strict`` refuses a possibly-truncated
+        listing instead of reporting it as complete.
+        """
+        limit = STRICT_PR_LIST_LIMIT if strict else 100
+        data = self._api_list(
+            [
+                "pr",
+                "list",
+                "--repo",
+                repo,
+                "--state",
+                "all",
+                "--limit",
+                str(limit),
+                "--json",
+                _PR_LIST_FIELDS,
+            ]
+        )
+        prs = [self._pr_from_data(d) for d in data if isinstance(d, dict)]
+        if strict and len(prs) >= limit:
+            raise GitHubError(
+                f"{repo} has at least {limit} pull requests, so the listing may be "
+                "truncated and the set of candidates cannot be established"
+            )
+        return prs
+
     def latest_pr_number(self, repo: str) -> int:
         """The largest PR number that currently exists in ``repo`` (0 if none).
 
         Used as a provenance watermark: a PR whose number is <= the value read
         before a replan transaction id was generated cannot have been created
         after it, so it can never be that transaction's replacement even if the
-        marker is later copied into its body. Malformed data raises
-        GitHubError (fail closed) rather than returning an under-estimate.
+        marker is later copied into its body.
+
+        Implemented as a proven numeric maximum over ``--state all`` (open,
+        closed and merged alike), never inferred from one CREATED_AT-ordered
+        node. A listing that reaches the ceiling, or malformed number data,
+        raises GitHubError (fail closed) rather than returning an
+        under-estimate that would let a pre-existing PR slip past the
+        watermark.
         """
-        owner, _, name = repo.partition("/")
-        data = self._api_json(
+        data = self._api_list(
             [
-                "api",
-                "graphql",
-                "-f",
-                f"query={_LATEST_PR_QUERY}",
-                "-F",
-                f"owner={owner}",
-                "-F",
-                f"name={name}",
+                "pr",
+                "list",
+                "--repo",
+                repo,
+                "--state",
+                "all",
+                "--limit",
+                str(STRICT_PR_LIST_LIMIT),
+                "--json",
+                _PR_NUMBER_LIST_FIELDS,
             ]
         )
-        connection = ((data.get("data") or {}).get("repository") or {}).get("pullRequests")
-        if not isinstance(connection, dict):
-            raise GitHubError(f"latest pull-request number for {repo} unavailable: {data}")
-        nodes = connection.get("nodes")
-        if not isinstance(nodes, list):
-            raise GitHubError(f"latest pull-request number for {repo} is not a node list: {nodes}")
-        if not nodes:
-            return 0
-        number = nodes[0].get("number") if isinstance(nodes[0], dict) else None
-        if not isinstance(number, int) or isinstance(number, bool) or number < 1:
-            raise GitHubError(f"latest pull-request number for {repo} is not a number: {nodes[0]}")
-        return number
+        if len(data) >= STRICT_PR_LIST_LIMIT:
+            raise GitHubError(
+                f"{repo} has at least {STRICT_PR_LIST_LIMIT} pull requests, so the latest "
+                "pull-request number cannot be established"
+            )
+        highest = 0
+        for entry in data:
+            if not isinstance(entry, dict):
+                raise GitHubError(
+                    f"latest pull-request number for {repo} is not an object: {entry!r}"
+                )
+            number = entry.get("number")
+            if not isinstance(number, int) or isinstance(number, bool) or number < 1:
+                raise GitHubError(
+                    f"latest pull-request number for {repo} is not a number: {entry!r}"
+                )
+            highest = max(highest, number)
+        return highest
 
     def find_open_prs_for_issue(
         self, issue: GitHubIssueRef | str, *, strict: bool = False
@@ -636,9 +677,26 @@ class GitHubClient:
         close -- so a caller that needs the close bound to a checkpoint must
         complete the comparison *after* the write and undo it with
         :meth:`reopen_pr` when the checkpoint no longer holds.
+
+        The comment posted here must NOT carry ownership proof: ``gh pr close
+        --comment`` posts the comment as a separate effect before the close
+        lands, so a receipt in it can predate the close and later be mistaken
+        for proof that this transaction closed the PR. Ownership is posted
+        afterwards with :meth:`comment_pr`, only after the close is observed.
         """
         ref = parse_pr_url(url)
         self._run_gh(["pr", "close", ref.canonical, "--comment", comment])
+
+    def comment_pr(self, url: str, body: str) -> None:
+        """Post a follow-up comment on a PR (open or closed).
+
+        Used for the replan close receipt: posted only after the controller
+        observed its own close landing, so presence of the receipt proves the
+        close was this transaction's. Never posted by a resume that did not
+        perform the close.
+        """
+        ref = parse_pr_url(url)
+        self._run_gh(["pr", "comment", ref.canonical, "--body", body])
 
     def reopen_pr(self, url: str, comment: str) -> None:
         """Undo a controller close (``gh pr reopen``).

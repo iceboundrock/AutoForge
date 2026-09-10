@@ -85,9 +85,10 @@ MARKER_RE = re.compile(
     rf"<!--\s*{MARKER_NAME}\s*:\s*(?P<payload>(?:(?!-->|<!--)[\s\S])*?)\s*-->"
 )
 
-# The controller's receipt for its own destructive close, published in the
-# comment `gh pr close --comment` posts on the source PR (see
-# :func:`render_close_receipt`).
+# The controller's receipt for its own destructive close, posted with a
+# separate `gh pr comment` after the close is observed (see
+# :func:`render_close_receipt`) -- never inside `gh pr close --comment`,
+# whose comment predates the close.
 CLOSE_RECEIPT_NAME = "autoforge-replan-close"
 CLOSE_RECEIPT_RE = re.compile(
     rf"<!--\s*{CLOSE_RECEIPT_NAME}\s*:\s*(?P<txn>[0-9a-f]{{32}})\s*-->"
@@ -108,14 +109,16 @@ def render_marker(attestation: ReplanAttestation) -> str:
 
 
 def render_close_receipt(transaction_id: str) -> str:
-    """The receipt the controller publishes *as* it closes the source PR.
+    """The receipt the controller publishes *after* it closes the source PR.
 
     ``SUPERSEDE_INTENT`` is persisted before ``gh pr close`` runs, so on its
     own it proves an intended write, never a performed one: after a crash in
     that window, a source a human closed and one this transaction closed look
-    identical from the journal. The receipt is the missing half. ``gh pr close
-    --comment`` posts this text on the source PR in the same invocation that
-    closes it, so a source found CLOSED *carrying* the receipt for this
+    identical from the journal. The receipt is the missing half. It is posted
+    with a separate ``gh pr comment`` only after the controller observed its
+    own close landing -- never inside ``gh pr close --comment``, whose comment
+    predates the close and could therefore be present even when the close never
+    landed. So a source found CLOSED *carrying* the receipt for this
     transaction was closed by this transaction, and one found CLOSED without it
     was closed by somebody else -- which is a refusal, not an adoption.
 
@@ -743,5 +746,66 @@ def select_bound_candidate(open_prs: list[PRInfo], txn: ReplanTransaction) -> Ca
         return CandidateSelection(
             Disposition.REJECTED,
             reason="unusable replan marker on " + "; ".join(malformed),
+        )
+    return CandidateSelection(Disposition.NONE)
+
+
+def find_non_open_claimant(
+    all_prs: list[PRInfo], txn: ReplanTransaction
+) -> CandidateSelection:
+    """A marker-bearing non-open PR for ``txn``, or NONE when there is none.
+
+    ``select_bound_candidate`` only sees open PRs. A replacement the first
+    agent created and that was then closed (by a human, or by the agent
+    itself) is invisible there, and reporting "no candidate" would invoke the
+    agent a second time -- the one outcome crash idempotency forbids. This
+    scans the exhaustive repository-wide set (open, closed and merged alike)
+    for a PR carrying this transaction's marker that is not open, and turns
+    it into a durable rejection naming the PR, never into absence.
+
+    Pre-existing non-open PRs carrying a copied marker are reported as
+    pre-existing, exactly as the open path does; post-watermark ones are
+    reported with their observed state (CLOSED/MERGED), because they prove a
+    first implementation attempt already happened.
+    """
+    if not TRANSACTION_ID_RE.match(txn.transaction_id):
+        return CandidateSelection(Disposition.NONE)
+    if txn.pr_number_watermark < 1:
+        return CandidateSelection(Disposition.NONE)
+    preexisting = {_canonical(url) for url in txn.preexisting_pr_urls}
+    source = _canonical(txn.source_pr_url)
+    for pr in all_prs:
+        if pr.is_open:
+            continue
+        canonical = _canonical(pr.url)
+        if not canonical or canonical == source:
+            continue
+        scan = scan_replan_markers(pr.body or "")
+        mine = [a for a in scan.attestations if a.transaction_id == txn.transaction_id]
+        if not mine:
+            continue
+        under_watermark = pr.number <= txn.pr_number_watermark
+        if under_watermark or canonical in preexisting:
+            how = (
+                f"its number {pr.number} is at or below the watermark {txn.pr_number_watermark}"
+                if under_watermark
+                else "it was in the snapshot of the issue's open PRs"
+            )
+            return CandidateSelection(
+                Disposition.REJECTED,
+                reason=(
+                    f"PR {canonical} already existed when replan transaction "
+                    f"{txn.transaction_id} was prepared ({how}) but carries its marker; "
+                    "refusing to adopt a pre-existing PR as a replacement"
+                ),
+            )
+        return CandidateSelection(
+            Disposition.REJECTED,
+            reason=(
+                f"PR {canonical} carries the marker for replan transaction "
+                f"{txn.transaction_id} but is {pr.state or '(unknown)'}, expected OPEN; "
+                "a first replacement attempt already exists and must be decided by a human, "
+                "not by invoking the agent again"
+            ),
         )
     return CandidateSelection(Disposition.NONE)

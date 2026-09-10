@@ -105,6 +105,7 @@ from .replan_txn import (
     Disposition,
     ReplanStage,
     ReplanTransaction,
+    find_non_open_claimant,
     has_close_receipt,
     new_transaction_id,
     render_close_receipt,
@@ -1638,6 +1639,23 @@ class ControllerEngine:
             return self._reject_replan(txn, f"cannot list replacement PR candidates: {exc}")
         selection = select_bound_candidate(open_prs, txn)
         if selection.disposition is Disposition.NONE:
+            # Open listing says "none" -- but a replacement the first agent
+            # created and that was then closed is invisible to it. Treating
+            # that as absence would invoke the agent a second time, so an
+            # exhaustive all-states listing is consulted before concluding
+            # nothing exists. A marker-bearing non-open claimant is a durable
+            # rejection naming the PR, never absence.
+            try:
+                all_prs = self.github.list_all_prs(state.repository, strict=True)
+            except GitHubUnavailableError:
+                raise  # unknown, not absent: stay resumable
+            except GitHubError as exc:
+                return self._reject_replan(
+                    txn, f"cannot list replacement PR candidates: {exc}"
+                )
+            closed = find_non_open_claimant(all_prs, txn)
+            if closed.disposition is not Disposition.NONE:
+                return self._reject_replan(txn, closed.reason)
             if claimed_url:
                 return self._reject_replan(
                     txn,
@@ -1697,8 +1715,12 @@ class ControllerEngine:
         crash anywhere in the write window resumes into disposition rather than
         into a second attempt. It records an *intent*, though, not a performed
         write, so it cannot by itself tell the controller's close from a human's
-        in that window: the close comment carries a receipt for exactly that
-        (:meth:`_close_not_ours`), and adopting someone else's close is refused.
+        in that window. Ownership is proven by a close receipt posted
+        *after* the close is observed (:meth:`comment_pr`, checked by
+        :meth:`_close_not_ours`): ``gh pr close --comment`` posts its comment
+        before the close lands, so a receipt in it can predate the close and
+        must never count as proof. A resume that did not perform the close
+        never posts a receipt; a CLOSED source without one is refused.
         """
         state = self._require_state()
         if txn.stage is ReplanStage.SUPERSEDED:
@@ -1718,6 +1740,27 @@ class ControllerEngine:
             # A resume lands here having missed the close window entirely, so
             # it owes the same post-close comparison the writing step does.
             return self._confirm_supersede(txn, source)
+        if txn.stage is ReplanStage.SUPERSEDE_INTENT and source.is_open:
+            # A resume retrying the write: a receipt already present means a
+            # prior attempt closed the source and it was then reopened. Closing
+            # again would be a second close on human intervention -- block.
+            try:
+                prior_comments = self.github.get_pr_comments(txn.source_pr_url)
+            except GitHubUnavailableError:
+                raise
+            except GitHubError as exc:
+                return self._reject_replan(
+                    txn,
+                    f"source PR {txn.source_pr_url} is open, but its comments could not be read "
+                    f"({exc}), so a prior close cannot be ruled out",
+                )
+            if has_close_receipt((c.body for c in prior_comments), txn.transaction_id):
+                return self._reject_replan(
+                    txn,
+                    f"source PR {txn.source_pr_url} is open but already carries the close receipt "
+                    f"for replan transaction {txn.transaction_id}; a prior close landed and was "
+                    "then reopened, so the controller will not close it again",
+                )
         # The destructive write is still ahead: revalidate both sides now.
         try:
             target = self.github.get_pr(txn.replacement_pr_url)
@@ -1740,24 +1783,26 @@ class ControllerEngine:
         txn.stage = ReplanStage.SUPERSEDE_INTENT
         txn.close_intent_at = utcnow_iso()
         self._save_replan_txn(txn)
-        close_error: GitHubError | None = None
         try:
+            # No receipt here: `gh pr close --comment` posts before the close
+            # lands, so a receipt in it could predate the close (R8-F1).
             self.github.close_pr(
                 txn.source_pr_url,
                 f"Superseded by {txn.replacement_pr_url} after controller-detected review/fix "
                 "non-convergence. This PR was closed without merge; the replacement starts from "
-                f"the {txn.base_branch} branch. Replan transaction {txn.transaction_id}.\n\n"
-                # The receipt: posted by the same `gh pr close` invocation, so
-                # its presence on the closed source is what proves the close
-                # was this transaction's and not a human's.
-                + render_close_receipt(txn.transaction_id),
+                f"the {txn.base_branch} branch. Replan transaction {txn.transaction_id}.",
             )
         except GitHubUnavailableError:
             # The close may or may not have landed. SUPERSEDE_INTENT is already
             # persisted, so `resume` reads GitHub and resolves it either way.
             raise
         except GitHubError as exc:
-            close_error = exc
+            # Our close did not land (it failed while the source was still
+            # open, or lost a race a human already won). Adopting the CLOSED
+            # source now would be adopting someone else's close.
+            return self._reject_replan(
+                txn, f"closing source PR {txn.source_pr_url} failed: {exc}"
+            )
         try:
             source = self.github.get_pr(txn.source_pr_url)
         except GitHubUnavailableError:
@@ -1768,17 +1813,28 @@ class ControllerEngine:
                 f"source PR {txn.source_pr_url} could not be re-read after the close attempt "
                 f"({exc}); the close may or may not have landed",
             )
-        if source.state == "CLOSED":
-            return self._confirm_supersede(txn, source)
-        if close_error is not None:
+        if source.state != "CLOSED":
             return self._reject_replan(
-                txn, f"closing source PR {txn.source_pr_url} failed: {close_error}"
+                txn,
+                f"source PR {txn.source_pr_url} is {source.state or '(unknown)'} after the close "
+                "attempt; expected CLOSED",
             )
-        return self._reject_replan(
-            txn,
-            f"source PR {txn.source_pr_url} is {source.state or '(unknown)'} after the close "
-            "attempt; expected CLOSED",
-        )
+        # The close landed under this transaction: publish the ownership
+        # receipt now, so a resume can tell this close from a human's. Posted
+        # only by the step that observed its own close; a resume never posts.
+        try:
+            self.github.comment_pr(
+                txn.source_pr_url, render_close_receipt(txn.transaction_id)
+            )
+        except GitHubUnavailableError:
+            raise  # receipt unknown: resume sees CLOSED without one and blocks
+        except GitHubError as exc:
+            return self._reject_replan(
+                txn,
+                f"source PR {txn.source_pr_url} was closed, but the close receipt could not be "
+                f"published ({exc}), so the close cannot be proven on resume",
+            )
+        return self._confirm_supersede(txn, source)
 
     def _confirm_supersede(self, txn: ReplanTransaction, source: PRInfo) -> StepOutcome:
         """The swap half of the compare-and-swap, completed after the close.
@@ -1824,10 +1880,12 @@ class ControllerEngine:
         records only an *intended* write. A crash in that window, followed by
         a human closing the source, would otherwise be indistinguishable from
         the controller's own close -- and the resume would supersede on the
-        strength of somebody else's action. ``close_pr`` publishes
-        :func:`render_close_receipt` in the comment it posts as it closes, so
-        the receipt is the durable evidence that the close happened *and* that
-        it was this transaction's.
+        strength of somebody else's action. The receipt
+        (:func:`render_close_receipt`) is therefore posted with
+        :meth:`comment_pr` *after* the close is observed, never inside the
+        ``gh pr close --comment`` that predates it: presence proves this
+        transaction closed the PR, absence proves it did not (or not
+        observably). A resume never posts a receipt.
 
         Absence is conclusive: the run refuses and blocks, leaving the close
         exactly as the human made it -- the controller must not reopen a PR it
