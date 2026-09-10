@@ -159,6 +159,12 @@ def test_review_findings_invariant_and_ids():
         {"id": "R2-F1", "classification": "nit", "required_resolution": "x"},
         {"id": "R1-F1", "classification": "urgent", "required_resolution": "x"},
         {"id": "R1-F1", "classification": "nit"},
+        # whitespace-only is as absent as "" (R2-F2): a blank demand asks for
+        # nothing, and normalising it to "" would make two such rounds look
+        # like the same required resolution coming back.
+        {"id": "R1-F1", "classification": "nit", "required_resolution": "   "},
+        {"id": "R1-F1", "classification": "nit", "required_resolution": "\n\t "},
+        {"id": "  ", "classification": "nit", "required_resolution": "x"},
     ):
         with pytest.raises(ControlResultValidationError):
             ReviewResult.from_payload(dict(base, needs_fix_round=True, findings=[bad]))

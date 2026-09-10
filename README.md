@@ -114,7 +114,12 @@ Key design points:
   does not change while some `required_resolution` recurs across them, an
   A/B/A ping-pong (`workflow.stagnation_unchanged_count_rounds`, default 3).
   A reviewer that raises a genuinely new finding every round is progress and
-  only meets the round cap.
+  only meets the round cap. Both stagnation settings are `0` (rule disabled)
+  or `>= 2`: they compare consecutive rounds, so a window of `1` is rejected
+  by the config loader rather than silently disabling the rule. The
+  recurrence evidence persisted per round is bounded, and a round whose
+  digests were clipped keeps the count-only behaviour instead of being read
+  as "nothing recurred".
   `workflow.max_total_steps` (default 300) is a cumulative budget for the whole
   run measured on the persisted `step_count`, so `resume` continues it rather
   than resetting it (`--max-steps` bounds one invocation only). Failed agent

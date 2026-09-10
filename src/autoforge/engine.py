@@ -1493,7 +1493,12 @@ class ControllerEngine:
         )
 
     def _record_review(self, round: int, head: str, result: str, findings: list[dict]) -> None:
-        """Append the completed round to ``review_history`` (bounded per PR)."""
+        """Append the completed round to ``review_history``.
+
+        Bounded twice over: one entry per round (rounds are capped by
+        ``workflow.max_review_rounds`` and cleared per PR) and, inside an
+        entry, at most ``MAX_PERSISTED_RESOLUTION_DIGESTS`` digests.
+        """
         state = self._require_state()
         # A completed round replaces any stale entry with the same number
         # (never expected: rounds are strictly increasing per PR).

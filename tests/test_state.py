@@ -152,6 +152,41 @@ def test_review_history_roundtrip_and_validation(tmp_path):
             load_state(p)
 
 
+def test_load_rejects_malformed_review_history_entries(tmp_path):
+    """A present but malformed entry is corruption, never "old controller" data."""
+    p = tmp_path / "state.json"
+    good = {
+        "round": 1,
+        "reviewed_head_sha": "a" * 40,
+        "result": "needs_fix",
+        "finding_count": 1,
+        "fingerprint": "abc",
+        "resolutions": ["d0"],
+        "resolutions_truncated": False,
+    }
+    d = make_state(review_history=[good]).to_dict()
+    p.write_text(json.dumps(d), encoding="utf-8")
+    assert load_state(p).review_history == [good]
+    # a *missing* resolutions key still loads (count-only stagnation rule)
+    legacy = {k: v for k, v in good.items() if not k.startswith("resolutions")}
+    p.write_text(json.dumps(make_state(review_history=[legacy]).to_dict()), encoding="utf-8")
+    assert load_state(p).review_history == [legacy]
+    for bad, match in (
+        ({**good, "resolutions": "d0"}, "resolutions must be a list"),
+        ({**good, "resolutions": {"d0": 1}}, "resolutions must be a list"),
+        ({**good, "resolutions": [None]}, "non-empty digest strings"),
+        ({**good, "resolutions": [""]}, "non-empty digest strings"),
+        ({**good, "resolutions_truncated": "no"}, "resolutions_truncated must be a bool"),
+        ({**good, "result": "done"}, "result must be one of"),
+        ({**good, "round": "1"}, "round must be an integer"),
+        ("not an entry", "must be an object"),
+    ):
+        p.write_text(json.dumps(make_state(review_history=[bad]).to_dict()), encoding="utf-8")
+        with pytest.raises(StateError, match=match) as exc:
+            load_state(p)
+        assert "review_history" in str(exc.value)
+
+
 def test_reset_for_new_issue_clears_review_history_but_keeps_step_budget():
     s = make_state(review_history=[{"round": 1}], review_round=1, step_count=9)
     s.reset_for_new_issue("https://github.com/owner/repo/issues/3")

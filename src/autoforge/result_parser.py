@@ -107,7 +107,15 @@ def _req_str(payload: dict, key: str, phase: str) -> str:
     v = _req(payload, key, phase)
     if not isinstance(v, str):
         raise ControlResultValidationError(f"{phase}: field {key!r} must be a string")
-    return v.strip()
+    # ``_req`` rejects "" before stripping; a whitespace-only value is just as
+    # absent (a blank required_resolution demands nothing) and is rejected
+    # with the same message rather than becoming an empty required field.
+    stripped = v.strip()
+    if not stripped:
+        raise ControlResultValidationError(
+            f"CONTROL_RESULT for {phase} missing required field {key!r}"
+        )
+    return stripped
 
 
 def _req_sha(payload: dict, key: str, phase: str) -> str:

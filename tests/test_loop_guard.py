@@ -2,7 +2,9 @@
 
 import pytest
 
+from autoforge.errors import StateError
 from autoforge.loop_guard import (
+    MAX_PERSISTED_RESOLUTION_DIGESTS,
     RESULT_CLEAN,
     RESULT_NEEDS_FIX,
     RESULT_STALE,
@@ -14,6 +16,7 @@ from autoforge.loop_guard import (
     round_cap_reason,
     stagnation_reason,
     step_budget_reason,
+    validate_review_history,
 )
 from tests.conftest import SHA_A
 
@@ -49,6 +52,7 @@ def test_review_record_shape_and_result_validation():
         "finding_count": 2,
         "fingerprint": findings_fingerprint([_f("x"), _f("y")]),
         "resolutions": resolution_digests([_f("x"), _f("y")]),
+        "resolutions_truncated": False,
     }
     assert len(rec["resolutions"]) == 2 and rec["resolutions"] == sorted(rec["resolutions"])
     # per-finding digests ignore ids/locations/whitespace/case and de-duplicate
@@ -156,3 +160,103 @@ def test_step_budget():
     assert step_budget_reason(299, 300) == ""
     assert "max_total_steps=300" in step_budget_reason(300, 300)
     assert step_budget_reason(301, 300)
+
+
+# -- R2-F1: bounded recurrence evidence ------------------------------------------------------
+def test_review_record_bounds_the_persisted_digests_and_marks_the_clip():
+    """A verbose reviewer must not grow review_history without limit."""
+    many = [_f(f"resolution {i}", f"R1-F{i + 1}") for i in range(MAX_PERSISTED_RESOLUTION_DIGESTS)]
+    rec = review_record(1, SHA_A, RESULT_NEEDS_FIX, many)
+    assert len(rec["resolutions"]) == MAX_PERSISTED_RESOLUTION_DIGESTS
+    assert rec["resolutions_truncated"] is False
+
+    over = many + [_f("one more", "R1-F999")]
+    rec = review_record(1, SHA_A, RESULT_NEEDS_FIX, over)
+    assert rec["finding_count"] == MAX_PERSISTED_RESOLUTION_DIGESTS + 1
+    assert len(rec["resolutions"]) == MAX_PERSISTED_RESOLUTION_DIGESTS
+    assert rec["resolutions_truncated"] is True
+    # the kept digests are still the sorted prefix of the complete set
+    assert rec["resolutions"] == resolution_digests(over)[:MAX_PERSISTED_RESOLUTION_DIGESTS]
+
+
+def test_truncated_evidence_cannot_prove_the_absence_of_a_recurrence():
+    """Clipped rounds fall back to the count-only rule instead of "no recurrence"."""
+    fresh = [
+        (RESULT_NEEDS_FIX, [_f(f"r{n}-{i}", f"R{n}-F{i + 1}") for i in range(60)])
+        for n in (1, 2, 3)
+    ]
+    hist = _hist(*fresh)
+    assert all(r["resolutions_truncated"] for r in hist)
+    reason = stagnation_reason(hist, 0, 3)
+    assert "persisted only the first" in reason and "recurrence cannot be ruled out" in reason
+    # A recurrence that *is* visible in the kept digests is reported as such.
+    shared = _f("same demand", "R9-F1")
+    recurring = _hist(
+        (RESULT_NEEDS_FIX, [shared] + [_f(f"a{i}", f"R1-F{i + 2}") for i in range(60)]),
+        (RESULT_NEEDS_FIX, [shared] + [_f(f"b{i}", f"R2-F{i + 2}") for i in range(60)]),
+    )
+    # (whether the shared digest survives the clip depends on its sort position;
+    # either way the round must not be reported as recurrence-free)
+    assert stagnation_reason(recurring, 0, 2)
+
+
+# -- R2-F2: an empty demand is not recurrence evidence ---------------------------------------
+def test_blank_resolutions_get_no_digest_and_cannot_recur():
+    assert resolution_digests([_f("   "), _f("\n\t", "R1-F2")]) == []
+    assert resolution_digests([_f(" "), _f("real", "R1-F2")]) == resolution_digests([_f("real")])
+    # blank / new demand / blank must not look like an A/B/A ping-pong
+    hist = _hist(
+        (RESULT_NEEDS_FIX, [_f("  ")]),
+        (RESULT_NEEDS_FIX, [_f("a genuinely new demand")]),
+        (RESULT_NEEDS_FIX, [_f("\t\n")]),
+    )
+    assert stagnation_reason(hist, 0, 3) == ""
+    # ... while the identical-resolutions rule still catches two blank rounds
+    assert stagnation_reason(hist[:1] + hist[2:], 2, 0)
+
+
+# -- R1-F2: malformed persisted history fails loudly -----------------------------------------
+def test_validate_review_history_accepts_records_and_legacy_entries():
+    hist = _hist((RESULT_NEEDS_FIX, [_f("a")]), (RESULT_CLEAN, []))
+    validate_review_history(hist)
+    legacy = dict(hist[0])
+    del legacy["resolutions"]
+    del legacy["resolutions_truncated"]
+    validate_review_history([legacy])  # a *missing* key is compatibility, not corruption
+
+
+@pytest.mark.parametrize(
+    "mutate, match",
+    [
+        (lambda r: r.update(resolutions="a,b"), "resolutions must be a list"),
+        (lambda r: r.update(resolutions={"a": 1}), "resolutions must be a list"),
+        (lambda r: r.update(resolutions=None), "resolutions must be a list"),
+        (lambda r: r.update(resolutions=[1, 2]), "non-empty digest strings"),
+        (lambda r: r.update(resolutions=["ok", ""]), "non-empty digest strings"),
+        (lambda r: r.update(resolutions=["ok", "  "]), "non-empty digest strings"),
+        (lambda r: r.update(resolutions_truncated="yes"), "resolutions_truncated must be a bool"),
+        (lambda r: r.update(round="3"), "round must be an integer"),
+        (lambda r: r.update(round=True), "round must be an integer"),
+        (lambda r: r.update(finding_count=None), "finding_count must be an integer"),
+        (lambda r: r.update(result="needs-fix"), "result must be one of"),
+        (lambda r: r.pop("result"), "result must be one of"),
+        (lambda r: r.update(fingerprint=123), "fingerprint must be a string"),
+        (lambda r: r.update(reviewed_head_sha=None), "reviewed_head_sha must be a string"),
+    ],
+)
+def test_malformed_history_entry_is_corruption_not_legacy_data(mutate, match):
+    """A present malformed field must not be reinterpreted as an old entry."""
+    hist = _hist((RESULT_NEEDS_FIX, [_f("a")]), (RESULT_NEEDS_FIX, [_f("b")]))
+    mutate(hist[-1])
+    with pytest.raises(StateError, match=match):
+        validate_review_history(hist)
+    # the loop guards refuse to decide on it as well
+    with pytest.raises(StateError, match=match):
+        stagnation_reason(hist, 2, 2)
+
+
+def test_validate_review_history_rejects_non_entries():
+    with pytest.raises(StateError, match="'review_history' must be a list"):
+        validate_review_history({"round": 1})
+    with pytest.raises(StateError, match=r"review_history\[0\]. must be an object"):
+        validate_review_history(["round 1"])
