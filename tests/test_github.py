@@ -547,3 +547,61 @@ def test_disable_auto_merge_argv():
     assert seen == [["gh", "pr", "merge", url, "--disable-auto"]]
     with pytest.raises(GitHubError, match="denied"):
         _client(lambda req: _res({}, exit_code=1, stderr="denied")).disable_auto_merge(url)
+
+
+def test_list_open_prs_strict_refuses_a_possibly_truncated_listing():
+    """A repository-wide candidate lookup must not report a limit as "none"."""
+    one = [
+        {
+            "url": "https://github.com/o/r/pull/1",
+            "number": 1,
+            "state": "OPEN",
+            "headRefOid": "a" * 40,
+            "headRefName": "feature/x",
+            "baseRefName": "main",
+            "body": "hello",
+        }
+    ]
+    seen = []
+
+    def handler(req):
+        seen.append(req.command)
+        return ExecutionResult(req.command, None, 0, json.dumps(one), "", "t", "t")
+
+    gh = _client(handler)
+    # Repository-wide: no issue linkage or branch-name filter is applied.
+    assert [p.number for p in gh.list_open_prs("o/r")] == [1]
+    assert seen[0][seen[0].index("--limit") + 1] == "100"
+    assert [p.body for p in gh.list_open_prs("o/r", strict=True)] == ["hello"]
+    assert seen[1][seen[1].index("--limit") + 1] == str(STRICT_PR_LIST_LIMIT)
+
+    full = [
+        dict(one[0], number=n, url=f"https://github.com/o/r/pull/{n}")
+        for n in range(1, STRICT_PR_LIST_LIMIT + 1)
+    ]
+    truncating = _client(
+        lambda req: ExecutionResult(req.command, None, 0, json.dumps(full), "", "t", "t")
+    )
+    with pytest.raises(GitHubError, match="truncated"):
+        truncating.list_open_prs("o/r", strict=True)
+    assert len(truncating.list_open_prs("o/r")) == STRICT_PR_LIST_LIMIT
+
+
+def test_close_and_reopen_pr_argv():
+    """``reopen_pr`` is the undo half of a checkpointed close; no branch is touched."""
+    url = "https://github.com/o/r/pull/42"
+    seen = []
+
+    def runner(req):
+        seen.append(req.command)
+        return _res({}, exit_code=0)
+
+    gh = _client(runner)
+    gh.close_pr(url, "superseded")
+    gh.reopen_pr(url, "undone")
+    assert seen == [
+        ["gh", "pr", "close", url, "--comment", "superseded"],
+        ["gh", "pr", "reopen", url, "--comment", "undone"],
+    ]
+    with pytest.raises(GitHubError, match="denied"):
+        _client(lambda req: _res({}, exit_code=1, stderr="denied")).reopen_pr(url, "undone")

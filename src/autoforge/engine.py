@@ -108,8 +108,10 @@ from .replan_txn import (
     new_transaction_id,
     select_bound_candidate,
     verify_attestation,
+    verify_closed_source,
     verify_decision_point,
     verify_source_checkpoint,
+    verify_target_marker,
     verify_target_pr,
 )
 from .result_parser import (
@@ -1530,7 +1532,10 @@ class ControllerEngine:
         try:
             source = self.github.get_pr(state.current_pr_url)
             repo = self.github.get_repo(state.repository)
-            preexisting = self.github.find_open_prs_for_issue(issue, strict=True)
+            # Repository-wide and strict, for the same reason the candidate
+            # lookup is: an issue-shaped filter cannot see a PR that is not
+            # (yet) linked to the issue.
+            preexisting = self.github.list_open_prs(state.repository, strict=True)
             # Read *before* the transaction id is generated below, so every PR
             # that could already be carrying a copied marker is under it.
             watermark = self.github.latest_pr_number(state.repository)
@@ -1575,7 +1580,7 @@ class ControllerEngine:
             )
         txn.transaction_id = new_transaction_id()
         txn.stage = ReplanStage.PREPARED
-        txn.issue_url = state.current_issue_url
+        txn.issue_url = issue.canonical
         txn.source_pr_url = source_ref.canonical
         txn.source_branch = state.current_branch or source.head_ref
         txn.source_head_sha = source.head_sha
@@ -1605,11 +1610,14 @@ class ControllerEngine:
         checked against the one GitHub proves.
         """
         state = self._require_state()
-        issue = parse_issue_url(txn.issue_url)
         try:
-            # Strict: "no candidate exists" decides whether the agent runs
-            # again, so it must not be a truncated listing in disguise.
-            open_prs = self.github.find_open_prs_for_issue(issue, strict=True)
+            # Every open PR in the repository, strictly: "no candidate exists"
+            # decides whether the agent runs again, so it must be neither a
+            # truncated listing in disguise nor a filtered one. A replacement
+            # the agent created but had not yet linked to the issue is exactly
+            # what an issue-shaped filter drops, and re-running the agent on it
+            # is the one outcome crash idempotency forbids.
+            open_prs = self.github.list_open_prs(state.repository, strict=True)
         except GitHubUnavailableError:
             raise  # the candidate set is unknown, not ambiguous: stay resumable
         except GitHubError as exc:
@@ -1619,8 +1627,8 @@ class ControllerEngine:
             if claimed_url:
                 return self._reject_replan(
                     txn,
-                    f"the agent reports replacement PR {claimed_url}, but no open PR for issue "
-                    f"#{issue.number} carries the marker for replan transaction "
+                    f"the agent reports replacement PR {claimed_url}, but no open PR in "
+                    f"{state.repository} carries the marker for replan transaction "
                     f"{txn.transaction_id}",
                     claimed_url,
                 )
@@ -1654,13 +1662,21 @@ class ControllerEngine:
         return None
 
     def _supersede_source(self, txn: ReplanTransaction) -> StepOutcome:
-        """Close the source PR under a two-sided compare-and-swap, then activate.
+        """Close the source PR under a compensated two-sided swap, then activate.
 
         Closing is irreversible for the review evidence the source carries, so
         it happens only while *both* checkpoints still hold: the source is
         exactly the implementation the controller decided to replace, and the
         target is exactly the replacement it verified. Either side having
         drifted means the decision rests on facts that no longer exist.
+
+        GitHub has no conditional close, so the compare cannot be fused to the
+        write: a push, a close, or a body edit landing between the last read
+        and ``gh pr close`` would otherwise stand. The comparison is therefore
+        completed *after* the write, in :meth:`_confirm_supersede`, and a
+        checkpoint that moved inside that window is compensated -- the source
+        is reopened and the phase blocks -- rather than accepted. The pre-close
+        checks are kept: they make the common refusal cost nothing.
 
         ``SUPERSEDE_INTENT`` is persisted before ``close_pr`` is called. That
         record is the only proof of ownership afterwards: a CLOSED source PR is
@@ -1683,13 +1699,9 @@ class ControllerEngine:
             return self._reject_replan(txn, f"cannot read source PR {txn.source_pr_url}: {exc}")
         if txn.stage is ReplanStage.SUPERSEDE_INTENT and not source.is_open:
             # Intent recorded before the write is what makes this close ours.
-            if source.state != "CLOSED":
-                return self._reject_replan(
-                    txn,
-                    f"source PR {txn.source_pr_url} is {source.state or '(unknown)'} after this "
-                    "transaction's close attempt; expected CLOSED",
-                )
-            return self._record_supersede(txn)
+            # A resume lands here having missed the close window entirely, so
+            # it owes the same post-close comparison the writing step does.
+            return self._confirm_supersede(txn, source)
         # The destructive write is still ahead: revalidate both sides now.
         try:
             target = self.github.get_pr(txn.replacement_pr_url)
@@ -1701,7 +1713,9 @@ class ControllerEngine:
                 f"replacement PR {txn.replacement_pr_url} could not be re-read: {exc}",
                 txn.replacement_pr_url,
             )
-        drift = verify_target_pr(target, txn, state.repository, require_checkpoint_head=True)
+        drift = verify_target_pr(
+            target, txn, state.repository, require_checkpoint_head=True
+        ) or verify_target_marker(target, txn)
         if drift:
             return self._reject_replan(txn, drift, txn.replacement_pr_url)
         drift = verify_source_checkpoint(source, txn)
@@ -1735,7 +1749,7 @@ class ControllerEngine:
                 f"({exc}); the close may or may not have landed",
             )
         if source.state == "CLOSED":
-            return self._record_supersede(txn)
+            return self._confirm_supersede(txn, source)
         if close_error is not None:
             return self._reject_replan(
                 txn, f"closing source PR {txn.source_pr_url} failed: {close_error}"
@@ -1745,6 +1759,73 @@ class ControllerEngine:
             f"source PR {txn.source_pr_url} is {source.state or '(unknown)'} after the close "
             "attempt; expected CLOSED",
         )
+
+    def _confirm_supersede(self, txn: ReplanTransaction, source: PRInfo) -> StepOutcome:
+        """The swap half of the compare-and-swap, completed after the close.
+
+        Reached with the source CLOSED and the intent durable -- either
+        straight from the write, or on a ``resume`` that missed it. Both
+        checkpoints are compared once more against GitHub; if either moved,
+        the close landed on facts that had already changed and is *undone*
+        (:meth:`_compensate_close`) instead of being activated. Only an
+        unmoved pair reaches ``SUPERSEDED``.
+
+        A transient GitHub failure here propagates untouched: the transaction
+        stays at ``SUPERSEDE_INTENT``, and a resume runs exactly this method
+        again on the same source PR.
+        """
+        state = self._require_state()
+        drift = verify_closed_source(source, txn)
+        if not drift:
+            try:
+                target = self.github.get_pr(txn.replacement_pr_url)
+            except GitHubUnavailableError:
+                raise
+            except GitHubError as exc:
+                drift = (
+                    f"replacement PR {txn.replacement_pr_url} could not be re-read after the "
+                    f"close ({exc}), so the replacement cannot be confirmed"
+                )
+            else:
+                drift = verify_target_pr(
+                    target, txn, state.repository, require_checkpoint_head=True
+                ) or verify_target_marker(target, txn)
+        if not drift:
+            return self._record_supersede(txn)
+        return self._reject_replan(txn, self._compensate_close(txn, drift), txn.replacement_pr_url)
+
+    def _compensate_close(self, txn: ReplanTransaction, drift: str) -> str:
+        """Reopen the source the controller closed, and report what happened.
+
+        The undo is the reason the phase may claim compare-and-swap semantics
+        over an API that cannot express them: the close is not permitted to
+        stand on facts that had already moved. ``close_pr`` never deletes the
+        branch, so the reopened PR carries its commits and review history
+        intact. A failed or unconfirmed reopen is stated as such in the block
+        text -- the controller never reports an undo it did not observe.
+        """
+        comment = (
+            f"AutoForge closed this pull request as superseded by {txn.replacement_pr_url}, "
+            f"then found that the replan checkpoint no longer held at the moment of the close "
+            f"({drift}). The close has been undone and the run has stopped for a human. "
+            f"Replan transaction {txn.transaction_id}."
+        )
+        try:
+            self.github.reopen_pr(txn.source_pr_url, comment)
+            reopened = self.github.get_pr(txn.source_pr_url)
+        except GitHubUnavailableError:
+            raise  # unresolved, not refused: the transaction stays resumable
+        except GitHubError as exc:
+            return (
+                f"{drift}; the source PR was closed inside the compare-and-swap window and "
+                f"could not be reopened ({exc}), so it must be reopened by hand"
+            )
+        if not reopened.is_open:
+            return (
+                f"{drift}; the source PR is still {reopened.state or '(unknown)'} after the "
+                "reopen attempt and must be reopened by hand"
+            )
+        return f"{drift}; the close was undone and {txn.source_pr_url} is open again"
 
     def _record_supersede(self, txn: ReplanTransaction) -> StepOutcome:
         txn.stage = ReplanStage.SUPERSEDED

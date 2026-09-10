@@ -673,7 +673,11 @@ Create a new Pull Request.
 
 The replacement PR must:
 
-* link the original issue
+* link the original issue with a closing keyword (`Closes #<n>`) **in the body
+  you pass to `gh pr create`**, not in a later edit. The controller reads every
+  open pull request in the repository looking for your marker, so a marked PR
+  that is not linked to the issue is not overlooked -- it is *refused*, and the
+  run blocks for a human.
 * clearly identify itself as a fresh reimplementation
 * link the superseded PR
 * explain why reimplementation was chosen
@@ -701,6 +705,9 @@ Rules:
 
 * Put it in the replacement PR body (an HTML comment, so it stays invisible in
   the rendered description). One marker, exactly once.
+* Leave it there. The controller re-reads the body one last time immediately
+  before it closes the superseded PR, and refuses if the marker has been
+  removed or now attests different numbers. Do not "tidy" the body afterwards.
 * Include it in the body you pass to `gh pr create`, not in a later edit. If
   the controller crashes between your PR creation and your `CONTROL_RESULT`, a
   PR that already carries the marker is recovered and adopted, while one
@@ -710,8 +717,11 @@ Rules:
   and refuses any PR at or below it. Adding the marker to an already-open PR --
   including the one being superseded, or an unrelated one you also happen to be
   working on -- rejects the replan; it does not adopt that PR.
-* Exactly one marker in the body, and nothing marker-shaped beside it. A body
-  carrying a valid marker next to an unparsable one is refused.
+* Exactly one marker in the body, and nothing marker-shaped beside it. Any
+  complete `<!-- autoforge-replan-transaction: ... -->` comment whose payload
+  is not a valid attestation -- prose, an example, an empty payload -- is an
+  unusable marker, and a body carrying one is refused even when a valid marker
+  sits beside it. Do not quote these instructions in the PR body.
 * `transaction_id` must be exactly `{{REPLAN_TRANSACTION_ID}}`. Do not invent,
   shorten or reformat it. Do not copy it into any other PR.
 * `execution_attempt` must be exactly `{{EXECUTION_ATTEMPT}}`.

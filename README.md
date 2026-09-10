@@ -159,9 +159,15 @@ Key design points:
   `<!-- autoforge-replan-transaction: {...} -->` marker in its PR body, which
   the controller reads back from GitHub. Shape is never proof — an unmarked PR
   is ignored, a PR that already existed is refused even if it carries a copied
-  marker, and two claimants block. The old PR is closed only under a two-sided
-  compare-and-swap (both source and replacement still exactly as checkpointed),
-  with `SUPERSEDE_INTENT` persisted *before* the write so a crash can tell the
+  marker, and two claimants block. Candidates are searched repository-wide, so
+  a marked PR the agent has not yet linked to the issue is refused for the
+  missing linkage rather than missed and re-implemented. The old PR is closed
+  only while both sides still match their checkpoints — including the marker,
+  re-read on the last read before the close. GitHub has no conditional close,
+  so that comparison cannot be fused to the write: it is *completed after* it,
+  and a checkpoint that moved inside the close window is compensated by
+  reopening the source PR and blocking, never by accepting the close.
+  `SUPERSEDE_INTENT` is persisted *before* the write so a crash can tell the
   controller's own close from a human's. A replan is refused outright while
   any recorded round's findings had to be truncated to stay within the state
   bounds, because closing the PR would be the moment those findings are lost.

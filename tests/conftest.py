@@ -120,6 +120,12 @@ class FakeGitHub:
         self.disable_auto_error: str = ""  # non-empty -> disable_auto_merge raises
         self.disabled_auto: list[str] = []  # PRs on which disable_auto_merge ran
         self.closed_prs: list[tuple[str, str]] = []
+        self.reopened_prs: list[tuple[str, str]] = []
+        self.reopen_error: str | GitHubError = ""  # as close_error, for reopen_pr
+        self.reopen_leaves_closed: bool = False  # gh exits 0 but the PR stays CLOSED
+        # Called at the start of close_pr, before the close lands: a mutation
+        # racing the destructive write (a push, a body edit, a human close).
+        self.close_race = None
         # non-empty -> close_pr raises; an exception instance is raised as-is
         # (GitHubUnavailableError for a transient failure), a str is conclusive.
         self.close_error: str | GitHubError = ""
@@ -258,7 +264,13 @@ class FakeGitHub:
         except GitHubError:
             return False
 
-    def list_open_prs(self, repo: str, limit: int = 100) -> list[PRInfo]:
+    def list_open_prs(self, repo: str, limit: int = 100, *, strict: bool = False) -> list[PRInfo]:
+        self.calls.append(("list_open_prs", repo, strict))
+        if strict and self.pr_listing_truncated:
+            raise GitHubError(
+                f"{repo} has at least 1000 open pull requests, so the listing may be "
+                "truncated and the set of candidates cannot be established"
+            )
         return [p for p in self.prs.values() if p.is_open and p.repository == repo]
 
     def latest_pr_number(self, repo: str) -> int:
@@ -270,13 +282,8 @@ class FakeGitHub:
 
     def find_open_prs_for_issue(self, issue, *, strict: bool = False) -> list[PRInfo]:
         self.calls.append(("find_open_prs_for_issue", issue.number, strict))
-        if strict and self.pr_listing_truncated:
-            raise GitHubError(
-                f"{issue.repository} has at least 1000 open pull requests, so the listing may "
-                "be truncated and the set of candidates cannot be established"
-            )
         out = []
-        for pr in self.list_open_prs(issue.repository):
+        for pr in self.list_open_prs(issue.repository, strict=strict):
             if (
                 issue.number in pr.linked_issue_numbers
                 or pr.head_ref.startswith(f"autoforge/{issue.number}-")
@@ -341,6 +348,9 @@ class FakeGitHub:
         canonical = parse_pr_url(url).canonical
         self.calls.append(("close_pr", canonical, comment))
         self.closed_prs.append((canonical, comment))
+        if self.close_race is not None:
+            # Landed after the controller's last read, before the close.
+            self.close_race(self)
         if isinstance(self.close_error, GitHubError):
             raise self.close_error
         if self.close_error:
@@ -350,6 +360,22 @@ class FakeGitHub:
             raise GitHubError(f"cannot close PR {canonical}: it is {pr.state}")
         if not self.close_leaves_open:
             pr.state = "CLOSED"
+
+    def reopen_pr(self, url: str, comment: str) -> None:
+        from autoforge.validation import parse_pr_url
+
+        canonical = parse_pr_url(url).canonical
+        self.calls.append(("reopen_pr", canonical, comment))
+        self.reopened_prs.append((canonical, comment))
+        if isinstance(self.reopen_error, GitHubError):
+            raise self.reopen_error
+        if self.reopen_error:
+            raise GitHubError(self.reopen_error)
+        pr = self.get_pr(canonical)
+        if pr.state == "MERGED":
+            raise GitHubError(f"cannot reopen PR {canonical}: it is MERGED")
+        if not self.reopen_leaves_closed:
+            pr.state = "OPEN"
 
 
 def scripted_config():

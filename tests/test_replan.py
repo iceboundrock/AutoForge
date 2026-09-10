@@ -792,12 +792,24 @@ def test_two_bound_candidates_are_ambiguous_and_fail_closed(tmp_state_dir):
     _assert_source_untouched(eng, gh)
 
 
-def test_malformed_marker_is_a_conclusive_rejection(tmp_state_dir):
+UNUSABLE_MARKERS = [
+    # A JSON object the schema rejects.
+    '<!-- autoforge-replan-transaction: {"transaction_id": "nope"} -->',
+    # Payloads that are not JSON at all, or not an object. These must be
+    # *unusable*, never invisible: a marker recognised only when it parses
+    # would turn "this PR carries a broken attestation" into "this PR does not
+    # claim the transaction", i.e. into another implementation attempt.
+    "<!-- autoforge-replan-transaction: not-json -->",
+    "<!-- autoforge-replan-transaction: -->",
+    "<!-- autoforge-replan-transaction: [1, 2] -->",
+]
+
+
+@pytest.mark.parametrize("marker", UNUSABLE_MARKERS)
+def test_malformed_marker_is_a_conclusive_rejection(tmp_state_dir, marker):
     gh = FakeGitHub()
     eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.PREPARED)
-    gh.prs[REPLACEMENT_PR].body = (
-        '<!-- autoforge-replan-transaction: {"transaction_id": "nope"} -->'
-    )
+    gh.prs[REPLACEMENT_PR].body = marker
     out = eng.step()
     assert out.next_phase == "BLOCKED"
     assert "unusable replan marker" in eng.state.block_reason
@@ -805,13 +817,12 @@ def test_malformed_marker_is_a_conclusive_rejection(tmp_state_dir):
     _assert_source_untouched(eng, gh)
 
 
-def test_a_valid_marker_does_not_excuse_an_unusable_one_beside_it(tmp_state_dir):
+@pytest.mark.parametrize("marker", UNUSABLE_MARKERS)
+def test_a_valid_marker_does_not_excuse_an_unusable_one_beside_it(tmp_state_dir, marker):
     """Fail closed: one body was supposed to carry exactly one attestation."""
     gh = FakeGitHub()
     eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.PREPARED)
-    gh.prs[REPLACEMENT_PR].body += (
-        '\n<!-- autoforge-replan-transaction: {"transaction_id": "nope"} -->'
-    )
+    gh.prs[REPLACEMENT_PR].body += "\n" + marker
     out = eng.step()
     assert out.next_phase == "BLOCKED"
     assert "alongside an unusable one" in eng.state.block_reason
@@ -987,6 +998,154 @@ def test_target_drift_after_the_checkpoint_blocks_instead_of_closing(
     assert eng.provider.calls == []
 
 
+def _restated_marker(findings: int, unique: int) -> str:
+    return render_marker(
+        ReplanAttestation(
+            transaction_id=TXN_ID,
+            execution_attempt=2,
+            findings_considered=findings,
+            unique_constraints=unique,
+            tests_passed=True,
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "body,needle",
+    [
+        ("the marker is gone", "no longer carries the marker"),
+        (_restated_marker(4, 2) + "\n" + UNUSABLE_MARKERS[1], "unusable replan marker"),
+        (_restated_marker(4, 2) * 2, "carries 2 markers"),
+        (_restated_marker(9, 2), "now attests findings_considered=9"),
+        (_restated_marker(4, 1), "unique_constraints=1"),
+    ],
+)
+def test_the_marker_is_revalidated_on_the_last_read_before_the_close(
+    tmp_state_dir, body, needle
+):
+    """R6-F2: the objective facts are not provenance -- the marker is.
+
+    Everything ``verify_target_pr`` checks (identity, state, branch, base,
+    linkage, HEAD) survives an edit that removes or rewrites the attestation,
+    so a body edited after ``VERIFIED`` would otherwise let the controller
+    close the source for a PR that no longer proves it belongs to this replan.
+    """
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.VERIFIED)
+    gh.prs[REPLACEMENT_PR].body = body
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert needle in eng.state.block_reason
+    assert gh.prs[PR].state == "OPEN" and gh.closed_prs == []
+    assert eng.state.current_pr_url == PR
+    assert eng.state.superseded_prs == []
+
+
+# =============================================================================
+# The close window: GitHub has no conditional close, so the compare is
+# completed after the write and a checkpoint that moved is compensated.
+# =============================================================================
+
+
+@pytest.mark.parametrize(
+    "race,needle",
+    [
+        (lambda gh: gh.set_head(SHA_C, PR), "inside the close window"),
+        (
+            lambda gh: setattr(gh.prs[PR], "head_ref", "somebody/else"),
+            "moved from the checkpointed branch",
+        ),
+        (lambda gh: gh.set_head(SHA_C, REPLACEMENT_PR), "advanced from the verified HEAD"),
+        (
+            lambda gh: setattr(gh.prs[REPLACEMENT_PR], "body", "marker removed"),
+            "no longer carries the marker",
+        ),
+        (
+            lambda gh: setattr(gh.prs[REPLACEMENT_PR], "linked_issue_numbers", []),
+            "not linked to issue",
+        ),
+    ],
+)
+def test_a_mutation_racing_the_close_is_undone_instead_of_accepted(tmp_state_dir, race, needle):
+    """R6-F1: a change landing between the last read and ``gh pr close``.
+
+    ``gh pr close`` takes no precondition, so this window cannot be closed by
+    checking harder beforehand. The comparison is completed afterwards, and a
+    checkpoint that moved inside the window makes the close *wrong* -- so it is
+    undone and the run stops, rather than the replacement being activated on
+    facts that had already changed.
+    """
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.VERIFIED)
+    gh.close_race = race
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert needle in eng.state.block_reason
+    assert "the close was undone" in eng.state.block_reason
+    assert [url for url, _ in gh.closed_prs] == [PR]
+    assert [url for url, _ in gh.reopened_prs] == [PR]
+    assert gh.prs[PR].state == "OPEN"  # the source is back, branch never deleted
+    assert _txn(eng).stage is ReplanStage.REJECTED
+    assert eng.state.current_pr_url == PR and eng.state.current_head_sha == SHA_A
+    assert eng.state.superseded_prs == [] and eng.state.escalation_count == 0
+
+
+@pytest.mark.parametrize(
+    "setup,needle",
+    [
+        (
+            lambda gh: setattr(gh, "reopen_error", "HTTP 403: Resource not accessible"),
+            "could not be reopened",
+        ),
+        (
+            lambda gh: setattr(gh, "reopen_leaves_closed", True),
+            "is still CLOSED after the reopen attempt",
+        ),
+    ],
+)
+def test_an_undo_that_did_not_land_is_reported_as_such(tmp_state_dir, setup, needle):
+    """The controller never claims a compensation it did not observe."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.VERIFIED)
+    gh.close_race = lambda g: g.set_head(SHA_C, PR)
+    setup(gh)
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert needle in eng.state.block_reason
+    assert "reopened by hand" in eng.state.block_reason
+    assert _txn(eng).stage is ReplanStage.REJECTED
+    assert eng.state.superseded_prs == []
+
+
+def test_a_transient_failure_while_undoing_the_close_stays_resumable(tmp_state_dir):
+    """The undo is a GitHub write like any other: unknown is not refused."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.VERIFIED)
+    gh.close_race = lambda g: g.set_head(SHA_C, PR)
+    gh.reopen_error = GitHubUnavailableError("gh: 502 Bad Gateway")
+    with pytest.raises(GitHubUnavailableError):
+        eng.step()
+    assert _txn(eng).stage is ReplanStage.SUPERSEDE_INTENT  # nothing was decided
+    assert gh.prs[PR].state == "CLOSED"
+    gh.reopen_error = ""
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert "the close was undone" in eng.state.block_reason
+    assert gh.prs[PR].state == "OPEN"
+    assert len(gh.closed_prs) == 1  # the resume re-reads, it never closes again
+    assert eng.state.superseded_prs == []
+
+
+def test_a_clean_close_window_still_supersedes(tmp_state_dir):
+    """The post-close comparison must not make the healthy path any harder."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.VERIFIED)
+    out = eng.step()
+    assert out.next_phase == "REVIEW"
+    assert gh.prs[PR].state == "CLOSED" and gh.reopened_prs == []
+    assert eng.state.current_pr_url == REPLACEMENT_PR
+
+
 @pytest.mark.parametrize(
     "field,value,needle",
     [
@@ -994,7 +1153,9 @@ def test_target_drift_after_the_checkpoint_blocks_instead_of_closing(
         # A closed or unlinked PR is not even a candidate, so the refusal is
         # "nothing carries the marker" -- still fail-closed, never adopted.
         ("state", "CLOSED", "carries the marker"),
-        ("linked_issue_numbers", [], "carries the marker"),
+        # Found repository-wide and refused on its merits, not skipped by an
+        # issue-shaped filter: see the crash-recovery test for why that matters.
+        ("linked_issue_numbers", [], "not linked to issue #2"),
     ],
 )
 def test_target_facts_are_checked_on_the_apply_path_too(tmp_state_dir, field, value, needle):
@@ -1146,6 +1307,31 @@ def test_w3_crash_between_the_agents_write_and_its_control_result(tmp_state_dir)
     assert eng.state.current_pr_url == REPLACEMENT_PR
     assert gh.prs[PR].state == "CLOSED"
     assert len(gh.closed_prs) == 1
+
+
+def test_w3b_a_marked_replacement_the_agent_never_linked_is_found_not_reimplemented(
+    tmp_state_dir,
+):
+    """Window 3b / R6-F3: creating the PR and linking it are separate writes.
+
+    A crash between them leaves a PR that carries the transaction marker but
+    matches no issue-shaped filter. Discovering the candidate set through such
+    a filter would report "nothing exists" and start a *second* implementation
+    attempt on top of the first -- the one outcome crash idempotency forbids.
+    Found repository-wide, it is refused on its merits instead, with the PR
+    named for the human who has to reconcile it.
+    """
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.PREPARED)
+    replacement = gh.prs[REPLACEMENT_PR]
+    replacement.linked_issue_numbers = []  # `gh pr create` landed, the link did not
+    replacement.head_ref = "wip/rewrite"  # ... and the branch says nothing either
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert "not linked to issue #2" in eng.state.block_reason
+    assert REPLACEMENT_PR in eng.state.block_reason
+    assert eng.provider.calls == []  # no second implementation attempt
+    _assert_source_untouched(eng, gh)
 
 
 def test_w4_recovery_holds_the_same_bar_as_the_control_result_path(tmp_state_dir):
@@ -1309,16 +1495,16 @@ def test_transient_github_failure_while_listing_candidates_stays_resumable(tmp_s
     """I6: a flaky `gh pr list` must not permanently block a healthy replan."""
     gh = FakeGitHub()
     eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.PREPARED)
-    real = gh.find_open_prs_for_issue
+    real = gh.list_open_prs
     calls = {"n": 0}
 
-    def flaky(issue, *, strict=False):
+    def flaky(repo, limit=100, *, strict=False):
         calls["n"] += 1
         if calls["n"] == 1:
             raise GitHubUnavailableError("gh: connection reset")
-        return real(issue, strict=strict)
+        return real(repo, limit, strict=strict)
 
-    gh.find_open_prs_for_issue = flaky
+    gh.list_open_prs = flaky
     with pytest.raises(GitHubUnavailableError):
         eng.step()
     assert eng.state.phase == Phase.REPLAN_REEXECUTE and not eng.state.block_reason
@@ -1361,10 +1547,10 @@ def test_conclusive_github_failure_while_listing_candidates_blocks(tmp_state_dir
     gh = FakeGitHub()
     eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.PREPARED)
 
-    def denied(issue, *, strict=False):
+    def denied(repo, limit=100, *, strict=False):
         raise GitHubError("HTTP 403: Resource not accessible by integration")
 
-    gh.find_open_prs_for_issue = denied
+    gh.list_open_prs = denied
     out = eng.step()
     assert out.next_phase == "BLOCKED"
     assert "cannot list replacement PR candidates" in eng.state.block_reason
@@ -1642,10 +1828,20 @@ def test_marker_scanner_rejects_payloads_that_are_not_attestations():
     for body in bad:
         scan = scan_replan_markers(body)
         assert scan.attestations == [] and scan.malformed, body
-    # Text that is not marker-shaped at all is simply not a marker.
-    assert scan_replan_markers("<!-- autoforge-replan-transaction: not json -->") == MarkerScan(
-        [], []
-    )
+    # A marker is recognised by its *name*, not by a payload that happens to
+    # parse: a complete marker carrying anything else is unusable, never
+    # absent. Reporting it as absent would downgrade a conclusive refusal to
+    # "this PR does not claim the transaction".
+    for body in (
+        "<!-- autoforge-replan-transaction: not json -->",
+        "<!-- autoforge-replan-transaction: -->",
+        "<!--autoforge-replan-transaction:[1, 2]-->",
+        '<!-- autoforge-replan-transaction: "a string" -->',
+    ):
+        scan = scan_replan_markers(body)
+        assert scan.attestations == [] and len(scan.malformed) == 1, body
+    # Text that is not a marker at all stays invisible.
+    assert scan_replan_markers("<!-- unrelated: {} -->\nprose") == MarkerScan([], [])
 
 
 def test_marker_scanner_reads_a_well_formed_attestation():
