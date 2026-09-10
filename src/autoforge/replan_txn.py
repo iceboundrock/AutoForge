@@ -81,18 +81,14 @@ MARKER_NAME = "autoforge-replan-transaction"
 # body up to some later `-->` and hiding a valid marker inside the match: an
 # unterminated marker is not a complete comment and is evidence of nothing,
 # while every complete one is classified.
-MARKER_RE = re.compile(
-    rf"<!--\s*{MARKER_NAME}\s*:\s*(?P<payload>(?:(?!-->|<!--)[\s\S])*?)\s*-->"
-)
+MARKER_RE = re.compile(rf"<!--\s*{MARKER_NAME}\s*:\s*(?P<payload>(?:(?!-->|<!--)[\s\S])*?)\s*-->")
 
 # The controller's receipt for its own destructive close, posted with a
 # separate `gh pr comment` after the close is observed (see
 # :func:`render_close_receipt`) -- never inside `gh pr close --comment`,
 # whose comment predates the close.
 CLOSE_RECEIPT_NAME = "autoforge-replan-close"
-CLOSE_RECEIPT_RE = re.compile(
-    rf"<!--\s*{CLOSE_RECEIPT_NAME}\s*:\s*(?P<txn>[0-9a-f]{{32}})\s*-->"
-)
+CLOSE_RECEIPT_RE = re.compile(rf"<!--\s*{CLOSE_RECEIPT_NAME}\s*:\s*(?P<txn>[0-9a-f]{{32}})\s*-->")
 
 TRANSACTION_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
@@ -571,9 +567,7 @@ def verify_target_pr(
             f"{txn.replacement_branch!r} to {pr.head_ref!r}"
         )
     if pr.base_ref != txn.base_branch:
-        return (
-            f"replacement PR base {pr.base_ref!r} != verified default branch {txn.base_branch!r}"
-        )
+        return f"replacement PR base {pr.base_ref!r} != verified default branch {txn.base_branch!r}"
     issue_number = parse_issue_url(txn.issue_url).number
     if issue_number not in pr.linked_issue_numbers:
         return f"replacement PR {ref_canonical} is not linked to issue #{issue_number}"
@@ -828,9 +822,7 @@ def select_bound_candidate(open_prs: list[PRInfo], txn: ReplanTransaction) -> Ca
     return CandidateSelection(Disposition.NONE)
 
 
-def find_non_open_claimant(
-    all_prs: list[PRInfo], txn: ReplanTransaction
-) -> CandidateSelection:
+def find_non_open_claimant(all_prs: list[PRInfo], txn: ReplanTransaction) -> CandidateSelection:
     """A marker-bearing non-open PR for ``txn``, or NONE when there is none.
 
     ``select_bound_candidate`` only sees open PRs. A replacement the first

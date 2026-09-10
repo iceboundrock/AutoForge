@@ -27,6 +27,8 @@ from autoforge.errors import (  # noqa: E402
 )
 from autoforge.executor import ExecutionResult  # noqa: E402
 from autoforge.github import (  # noqa: E402
+    ChangedFile,
+    ChangedFiles,
     CommentInfo,
     IssueInfo,
     MergeQueueStatus,
@@ -118,6 +120,13 @@ class FakeGitHub:
         # GitHubError, an exception instance is raised as-is (GitHubUnavailableError
         # for a transient failure).
         self.merge_queue_error: str | GitHubError = ""
+        # Changed-file listing per PR (default: no files, listing complete).
+        # Entries are paths, or a ChangedFile to model a rename's two ends.
+        # ``changed_files_total`` overrides GitHub's own count to simulate a
+        # truncated first page. Same error convention as merge_queue_error.
+        self.changed_files: dict[str, list[str | ChangedFile]] = {}
+        self.changed_files_total: dict[str, int] = {}
+        self.changed_files_error: str | GitHubError = ""
         self.disable_auto_error: str = ""  # non-empty -> disable_auto_merge raises
         self.disabled_auto: list[str] = []  # PRs on which disable_auto_merge ran
         self.closed_prs: list[tuple[str, str]] = []
@@ -261,6 +270,21 @@ class FakeGitHub:
 
     def get_pr_checks(self, url: str):
         return self.get_pr(url).checks
+
+    def get_pr_changed_files(self, url: str) -> ChangedFiles:
+        from autoforge.validation import parse_pr_url
+
+        canonical = parse_pr_url(url).canonical
+        self.calls.append(("get_pr_changed_files", canonical))
+        if isinstance(self.changed_files_error, GitHubError):
+            raise self.changed_files_error
+        if self.changed_files_error:
+            raise GitHubError(self.changed_files_error)
+        files = tuple(
+            entry if isinstance(entry, ChangedFile) else ChangedFile(path=entry)
+            for entry in self.changed_files.get(canonical, [])
+        )
+        return ChangedFiles(files=files, total=self.changed_files_total.get(canonical, len(files)))
 
     def get_pr_merge_queue_status(self, url: str) -> MergeQueueStatus:
         from autoforge.validation import parse_pr_url

@@ -23,3 +23,19 @@ def test_git_ignores_arbitrary_runtime_files():
             text=True,
         )
         assert res.returncode == 0, f"{candidate} is not git-ignored"
+
+
+def test_git_ignores_the_operator_config_but_not_the_example():
+    """`cp autoforge.example.yaml autoforge.yaml` must not leave a file to commit."""
+    for candidate, ignored in (
+        ("autoforge.yaml", True),
+        ("autoforge.local.yaml", True),
+        ("autoforge.example.yaml", False),
+    ):
+        res = subprocess.run(
+            ["git", "check-ignore", "-q", candidate],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        assert (res.returncode == 0) is ignored, f"{candidate}: unexpected ignore status"

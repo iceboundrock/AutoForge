@@ -30,6 +30,7 @@ Supported config file formats:
 
 from __future__ import annotations
 
+import fnmatch
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -78,11 +79,39 @@ class ExecutionConfig:
     allow_merge: bool = False
 
 
+# Paths whose contents define what the hosted checks actually run. See
+# ``SafetyConfig.protected_merge_paths``.
+DEFAULT_PROTECTED_MERGE_PATHS = (".github/workflows/",)
+
+
 @dataclass
 class SafetyConfig:
     # Controller invariant: no real merge unless this is true AND the CLI
     # passes --allow-merge. Default off for this milestone.
     allow_merge: bool = False
+    # Paths a PR may not change and still be merged unattended. The hosted
+    # checks the merge gate trusts ("every check on the PR succeeded") are
+    # defined by the workflow files *in the PR itself*: GitHub runs the PR's
+    # version of `.github/workflows/` and reports the result under the same
+    # check name, so a PR that edits them also edits the meaning of its own
+    # green result. The controller cannot verify that from the outside, so
+    # it refuses to merge such a PR unattended and leaves it to a human.
+    # Entries ending in "/" are directory prefixes; anything else is an exact
+    # path or an fnmatch pattern (where "*" also spans "/"). An empty list
+    # disables the gate.
+    protected_merge_paths: list[str] = field(
+        default_factory=lambda: list(DEFAULT_PROTECTED_MERGE_PATHS)
+    )
+
+    def protects(self, path: str) -> bool:
+        """Whether ``path`` (a POSIX repo-relative path) is protected."""
+        for pattern in self.protected_merge_paths:
+            if pattern.endswith("/"):
+                if path == pattern[:-1] or path.startswith(pattern):
+                    return True
+            elif path == pattern or fnmatch.fnmatchcase(path, pattern):
+                return True
+        return False
 
 
 @dataclass
@@ -310,6 +339,33 @@ def _as_options(raw: object, source: str, name: str) -> dict[str, str]:
     return out
 
 
+def _as_str_list(raw: object, source: str, key: str) -> list[str]:
+    """A list of non-empty strings -- never a bare string silently split.
+
+    An explicit ``null`` is rejected rather than read as ``[]``. The empty
+    list is a deliberate opt-out (for ``safety.protected_merge_paths`` it
+    turns the merge gate off), and a key whose value went missing -- a
+    hand-edited config, a generator emitting nothing, a list the YAML subset
+    parser could not read -- must not be able to disable a safety gate by
+    looking like one.
+    """
+    if raw is None:
+        raise ConfigurationError(
+            f"{source}: {key} is null; write [] to set it empty deliberately, "
+            "or remove the key to keep the default"
+        )
+    if isinstance(raw, str) or not isinstance(raw, list):
+        raise ConfigurationError(f"{source}: {key} must be a list of strings, got {raw!r}")
+    out: list[str] = []
+    for item in raw:
+        if not isinstance(item, str) or not item.strip():
+            raise ConfigurationError(
+                f"{source}: {key} must contain non-empty strings, got {item!r}"
+            )
+        out.append(item.strip())
+    return out
+
+
 def _as_bool(raw: object, source: str, key: str) -> bool:
     """Accept only a real boolean — never coerce strings like "false" to True."""
     if isinstance(raw, bool):
@@ -352,6 +408,10 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
         raise ConfigurationError(f"{source}: 'safety' must be a mapping")
     if "allow_merge" in safety:
         base.safety.allow_merge = _as_bool(safety["allow_merge"], source, "safety.allow_merge")
+    if "protected_merge_paths" in safety:
+        base.safety.protected_merge_paths = _as_str_list(
+            safety["protected_merge_paths"], source, "safety.protected_merge_paths"
+        )
     gh = data.get("github", {}) or {}
     if not isinstance(gh, dict):
         raise ConfigurationError(f"{source}: 'github' must be a mapping")
@@ -407,8 +467,7 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
             setattr(rp, key, value)
     if rp.hard_threshold < rp.soft_threshold:
         raise ConfigurationError(
-            f"{source}: 'review.replan.hard_threshold' must be >= "
-            "'review.replan.soft_threshold'"
+            f"{source}: 'review.replan.hard_threshold' must be >= 'review.replan.soft_threshold'"
         )
     workflow = data.get("workflow", {}) or {}
     if not isinstance(workflow, dict):
@@ -437,8 +496,7 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
             setattr(base.workflow, key, value)
     if base.review.replan.hard_threshold > base.workflow.max_review_rounds:
         raise ConfigurationError(
-            f"{source}: 'review.replan.hard_threshold' must be <= "
-            "'workflow.max_review_rounds'"
+            f"{source}: 'review.replan.hard_threshold' must be <= 'workflow.max_review_rounds'"
         )
     profiles = data.get("profiles", {}) or {}
     if not isinstance(profiles, dict):

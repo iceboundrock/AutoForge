@@ -17,6 +17,9 @@ agent claim against GitHub** before acting on it:
   phases run the same controller-side pre-merge verification against
   GitHub (fail closed): the state carries a clean review bound to a HEAD,
   the PR is OPEN in this repository at exactly that HEAD, is not a draft,
+  changes none of ``safety.protected_merge_paths`` (a PR that edits the
+  workflow files defining the hosted checks also edits what a green check
+  means, so it is never merged unattended),
   every check succeeded, ``mergeable`` is MERGEABLE, ``mergeStateStatus``
   is CLEAN/HAS_HOOKS, no auto-merge is armed and the base branch has no
   merge queue. Conclusive negatives -> BLOCKED; HEAD drift -> REVIEW;
@@ -416,8 +419,9 @@ class ControllerEngine:
                 notes=[
                     MERGE_GATE_MESSAGE,
                     "with the gate open, would verify via gh before entering MERGE: last "
-                    "review clean, PR open at the reviewed HEAD, not draft, all checks "
-                    "succeeded, mergeable, no auto-merge / merge queue (fail closed)",
+                    "review clean, PR open at the reviewed HEAD, not draft, no change to "
+                    "safety.protected_merge_paths, all checks succeeded, mergeable, no "
+                    "auto-merge / merge queue (fail closed)",
                 ],
             )
         if s.phase == Phase.MERGE:
@@ -428,7 +432,8 @@ class ControllerEngine:
                 notes=[
                     MERGE_GATE_MESSAGE,
                     "would verify: last review clean, PR open at the reviewed HEAD, not "
-                    "draft, all checks succeeded, mergeable, no auto-merge / merge queue",
+                    "draft, no change to safety.protected_merge_paths, all checks "
+                    "succeeded, mergeable, no auto-merge / merge queue",
                     "would run the command below (bound to the reviewed HEAD via "
                     "--match-head-commit), then re-read the PR and require state MERGED",
                 ],
@@ -466,9 +471,7 @@ class ControllerEngine:
             )
             replan_txn = ReplanTransaction.from_dict(s.replan_transaction)
             if replan_txn.escalation:
-                notes.append(
-                    f"replan policy: {json.dumps(replan_txn.escalation, sort_keys=True)}"
-                )
+                notes.append(f"replan policy: {json.dumps(replan_txn.escalation, sort_keys=True)}")
             notes.append(f"replan transaction stage: {replan_txn.stage.value}")
         return StepPlan(
             phase=s.phase.value,
@@ -998,6 +1001,23 @@ class ControllerEngine:
             f"{state.attempt}/{limit}) — 'resume --allow-merge' to re-check."
         ) from cause
 
+    @staticmethod
+    @contextmanager
+    def _reading(what: str) -> Iterator[None]:
+        """Name the read a GitHubError came from without losing its class.
+
+        The engine classifies pre-merge read failures by type (transient ->
+        bounded re-check, anything else -> BLOCKED), so the wrapper must
+        re-raise the *same* class; only the message gains the identity of
+        the read, which is what a human then reads in ``block_reason``.
+        """
+        try:
+            yield
+        except GitHubUnavailableError as exc:
+            raise GitHubUnavailableError(f"{what} could not be read: {exc}") from exc
+        except GitHubError as exc:
+            raise GitHubError(f"{what} could not be read: {exc}") from exc
+
     def _github_read_failed(
         self, phase: Phase, plan: StepPlan | None, what: str, exc: GitHubError
     ) -> StepOutcome:
@@ -1100,7 +1120,7 @@ class ControllerEngine:
             return self._inconclusive(phase, plan, str(exc), cause=exc)
         except GitHubError as exc:
             return self._github_read_failed(
-                phase, plan, f"merge-queue status of PR {url} could not be read", exc
+                phase, plan, f"a pre-merge GitHub read for PR {url} failed", exc
             )
         if not_ready:
             return self._block(phase, plan, f"{not_ready}. Nothing was merged or counted.")
@@ -1242,7 +1262,7 @@ class ControllerEngine:
         Returns a non-empty reason when the PR must NOT be merged (-> BLOCKED).
         Raises VerificationError when GitHub's data is inconclusive (the
         caller keeps the phase and bounds the re-checks) and lets GitHubError
-        from the merge-queue read propagate (the caller classifies it:
+        from the changed-file / merge-queue reads propagate (the caller classifies it:
         transient -> same bounded path, conclusive -> BLOCKED). Returns "" only when
         every fact the controller can read says a synchronous merge of this
         exact HEAD is acceptable right now.
@@ -1251,7 +1271,12 @@ class ControllerEngine:
         if pr.is_draft:
             return f"PR {url} is a draft"
 
-        # 1. checks: all of them, not only the ones GitHub marks required
+        # 1. the PR must not redefine the very checks this gate trusts.
+        redefines = self._protected_path_problem(pr)
+        if redefines:
+            return redefines
+
+        # 2. checks: all of them, not only the ones GitHub marks required
         #    (gh does not expose which are required; stricter is safer).
         failed = [c.name or "?" for c in pr.checks if c.outcome in ("failure", "unknown")]
         pending = [c.name or "?" for c in pr.checks if c.outcome == "pending"]
@@ -1260,7 +1285,7 @@ class ControllerEngine:
         if pending:
             raise VerificationError(f"PR {url} has checks still running: {', '.join(pending)}")
 
-        # 2. mergeability as computed by GitHub
+        # 3. mergeability as computed by GitHub
         if pr.mergeable == "CONFLICTING":
             return f"PR {url} has merge conflicts (mergeable=CONFLICTING)"
         if pr.mergeable != "MERGEABLE":
@@ -1279,13 +1304,14 @@ class ControllerEngine:
                 f"{MERGE_STATE_HINTS.get(status, 'not accepted by the controller')})"
             )
 
-        # 3. asynchronous merge paths the controller would not own
+        # 4. asynchronous merge paths the controller would not own
         if pr.auto_merge_enabled:
             return (
                 f"PR {url} already has GitHub auto-merge armed; the controller only performs "
                 "synchronous merges of the reviewed HEAD. Disable auto-merge on GitHub"
             )
-        queue = self.github.get_pr_merge_queue_status(url)
+        with self._reading("the merge-queue status"):
+            queue = self.github.get_pr_merge_queue_status(url)
         if queue.in_queue:
             return f"PR {url} is already in a merge queue the controller does not own"
         if queue.enabled:
@@ -1293,6 +1319,59 @@ class ControllerEngine:
                 f"the base branch of PR {url} requires a merge queue; `gh pr merge` would "
                 "enqueue the PR or arm auto-merge instead of merging the reviewed HEAD "
                 "synchronously, which the controller does not allow"
+            )
+        return ""
+
+    def _protected_path_problem(self, pr: PRInfo) -> str:
+        """Refuse to merge unattended a PR that edits the definition of its own checks.
+
+        The green `ci` this gate trusts is produced by the workflow files
+        *in the PR*: GitHub runs the PR's version of `.github/workflows/`
+        and reports it under the same check name, so a PR that changes them
+        also changes what "every check succeeded" means. The controller
+        cannot verify that from the outside, and GitHub's own protections
+        cannot either while the required check is defined by the branch it
+        gates. Such a PR is BLOCKED for a human instead
+        (``safety.protected_merge_paths``; an empty list disables the gate).
+
+        Both ends of a rename count: moving a protected file out of the
+        protected range removes its content just as an edit would, and the
+        listing reports that as one file carrying its former path rather
+        than as a deletion.
+
+        Fails closed on a listing GitHub may have truncated: a short file
+        list cannot prove a protected path was left alone. GitHubError from
+        the read propagates for the caller to classify (transient ->
+        bounded re-check, conclusive -> BLOCKED).
+
+        This gates the *definition* of the check, not the trustworthiness of
+        a green run: the commands still execute the PR's own code, so a PR
+        can weaken what its tests assert without touching a protected path.
+        That residual gap is why merge stays behind ``safety.allow_merge``.
+        """
+        patterns = self.config.safety.protected_merge_paths
+        if not patterns:
+            return ""
+        with self._reading("the changed-file listing"):
+            changed = self.github.get_pr_changed_files(pr.url)
+        hits = sorted(
+            f"{file.previous_path} -> {file.path}" if file.previous_path else file.path
+            for file in changed.files
+            if any(self.config.safety.protects(path) for path in file.paths)
+        )
+        if hits:
+            shown = ", ".join(hits[:5]) + (", ..." if len(hits) > 5 else "")
+            return (
+                f"PR {pr.url} changes {shown}: these paths define the hosted checks whose "
+                "green result the merge gate trusts, so a green check on this PR is not "
+                "independent evidence about it. Review and merge it manually, or narrow "
+                "safety.protected_merge_paths"
+            )
+        if not changed.complete:
+            return (
+                f"GitHub returned {len(changed.files)} of {changed.total} changed files for "
+                f"PR {pr.url}, so the controller cannot prove the PR leaves "
+                f"{', '.join(patterns)} untouched"
             )
         return ""
 
@@ -1652,9 +1731,7 @@ class ControllerEngine:
             except GitHubUnavailableError:
                 raise  # unknown, not absent: stay resumable
             except GitHubError as exc:
-                return self._reject_replan(
-                    txn, f"cannot list replacement PR candidates: {exc}"
-                )
+                return self._reject_replan(txn, f"cannot list replacement PR candidates: {exc}")
             closed = find_non_open_claimant(all_prs, txn)
             if closed.disposition is not Disposition.NONE:
                 return self._reject_replan(txn, closed.reason)
@@ -1809,9 +1886,7 @@ class ControllerEngine:
             # Our close did not land (it failed while the source was still
             # open, or lost a race a human already won). Adopting the CLOSED
             # source now would be adopting someone else's close.
-            return self._reject_replan(
-                txn, f"closing source PR {txn.source_pr_url} failed: {exc}"
-            )
+            return self._reject_replan(txn, f"closing source PR {txn.source_pr_url} failed: {exc}")
         try:
             source = self.github.get_pr(txn.source_pr_url)
         except GitHubUnavailableError:
@@ -1832,9 +1907,7 @@ class ControllerEngine:
         # receipt now, so a resume can tell this close from a human's. Posted
         # only by the step that observed its own close; a resume never posts.
         try:
-            self.github.comment_pr(
-                txn.source_pr_url, render_close_receipt(txn.transaction_id)
-            )
+            self.github.comment_pr(txn.source_pr_url, render_close_receipt(txn.transaction_id))
         except GitHubUnavailableError:
             raise  # receipt unknown: resume sees CLOSED without one and blocks
         except GitHubError as exc:
@@ -2154,9 +2227,7 @@ class ControllerEngine:
                 command=provider.build_command_for(profile, prompt),
                 cwd=self.workdir,
                 timeout_seconds=timeout,
-                metadata=(
-                    self._replan_log_metadata() if phase == Phase.REPLAN_REEXECUTE else {}
-                ),
+                metadata=(self._replan_log_metadata() if phase == Phase.REPLAN_REEXECUTE else {}),
             )
             result: AgentExecutionResult | None = None
             try:

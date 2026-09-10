@@ -7,10 +7,10 @@ import pytest
 
 from autoforge.errors import GitHubError, GitHubNotFoundError, GitHubUnavailableError
 from autoforge.executor import ExecutionResult
-from autoforge.github import STRICT_PR_LIST_LIMIT, GitHubClient
+from autoforge.github import STRICT_PR_LIST_LIMIT, ChangedFile, GitHubClient
 
 
-def _res(payload: dict, exit_code: int = 0, stderr: str = "") -> ExecutionResult:
+def _res(payload: object, exit_code: int = 0, stderr: str = "") -> ExecutionResult:
     return ExecutionResult(
         command=["gh"],
         cwd=None,
@@ -456,6 +456,88 @@ def test_get_pr_checks_parses_check_runs_and_status_contexts():
     )
     checks = gh.get_pr_checks("https://github.com/o/r/pull/42")
     assert [(c.name, c.outcome) for c in checks] == [("ci", "success"), ("legacy", "pending")]
+
+
+def _changed_files_runner(files, total):
+    """Dispatch the REST files listing and the `gh pr view` count separately."""
+    seen = []
+
+    def handler(req):
+        seen.append(req.command)
+        if req.command[1] == "api":
+            return _res(files)
+        return _res({"changedFiles": total})
+
+    return handler, seen
+
+
+def test_get_pr_changed_files_reports_paths_and_truncation():
+    handler, seen = _changed_files_runner(
+        [{"filename": ".github/workflows/ci.yml"}, {"filename": "README.md"}], 2
+    )
+    changed = _client(handler).get_pr_changed_files("https://github.com/o/r/pull/42")
+    assert changed.paths == (".github/workflows/ci.yml", "README.md")
+    assert changed.complete is True
+    assert seen[0][:2] == ["gh", "api"]
+    assert seen[0][2] == "repos/o/r/pulls/42/files?per_page=100"
+    assert seen[1][:3] == ["gh", "pr", "view"] and "changedFiles" in seen[1]
+
+    # GitHub returns only the first page: the listing proves nothing about the rest.
+    handler, _ = _changed_files_runner([{"filename": "README.md"}], 137)
+    short = _client(handler).get_pr_changed_files("https://github.com/o/r/pull/42")
+    assert short.total == 137 and short.complete is False
+
+
+def test_get_pr_changed_files_reports_both_ends_of_a_rename():
+    """`gh pr view --json files` shows only the new name; REST shows both."""
+    handler, _ = _changed_files_runner(
+        [
+            {"filename": "docs/ci.yml", "previous_filename": ".github/workflows/ci.yml"},
+            {"filename": "README.md"},
+        ],
+        2,
+    )
+    changed = _client(handler).get_pr_changed_files("https://github.com/o/r/pull/42")
+    assert changed.files[0] == ChangedFile(
+        path="docs/ci.yml", previous_path=".github/workflows/ci.yml"
+    )
+    assert changed.paths == ("docs/ci.yml", ".github/workflows/ci.yml", "README.md")
+    # A rename is one *file* and two paths: counting paths would let a
+    # truncated listing of renames pass as complete.
+    assert changed.complete is True
+    handler, _ = _changed_files_runner(
+        [{"filename": "b", "previous_filename": "a"}, {"filename": "d", "previous_filename": "c"}],
+        3,
+    )
+    assert _client(handler).get_pr_changed_files("https://github.com/o/r/pull/42").complete is False
+
+
+@pytest.mark.parametrize(
+    ("files", "total", "needle"),
+    [
+        (None, 1, "unavailable"),  # not a list
+        ({"filename": "README.md"}, 1, "unavailable"),  # a bare object
+        ([{"filename": ""}], 1, "unusable entry"),
+        (["README.md"], 1, "unusable entry"),  # not a mapping
+        ([{"path": "README.md"}], 1, "unusable entry"),  # GraphQL key, not REST's
+        ([{"filename": "b", "previous_filename": ""}], 1, "unusable entry"),
+        ([{"filename": "b", "previous_filename": 7}], 1, "unusable entry"),
+        ([], "2", "not a count"),
+        ([], True, "not a count"),  # bool is not a count
+        ([], None, "not a count"),  # changedFiles absent
+    ],
+)
+def test_get_pr_changed_files_fails_closed_on_unusable_data(files, total, needle):
+    handler, _ = _changed_files_runner(files, total)
+    with pytest.raises(GitHubError, match=needle):
+        _client(handler).get_pr_changed_files("https://github.com/o/r/pull/42")
+
+
+def test_get_pr_changed_files_propagates_gh_failure():
+    with pytest.raises(GitHubError, match="failed"):
+        _client(lambda req: _res({}, exit_code=1, stderr="boom")).get_pr_changed_files(
+            "https://github.com/o/r/pull/42"
+        )
 
 
 def test_get_pr_merge_queue_status_uses_graphql_and_fails_closed():
