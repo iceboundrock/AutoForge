@@ -35,7 +35,9 @@ jobs:
         python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      # Pinned to a full version on purpose: setup-uv stopped publishing
+      # floating major tags after v7, so `@v10` does not resolve.
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
           # Sets UV_PYTHON, which takes precedence over the repo's
           # .python-version pin.
@@ -54,7 +56,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      # Pinned to a full version on purpose: setup-uv stopped publishing
+      # floating major tags after v7, so `@v10` does not resolve.
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
           python-version: "3.11"
           enable-cache: true
