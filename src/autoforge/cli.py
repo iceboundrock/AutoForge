@@ -28,7 +28,7 @@ from .errors import (
     StateError,
     StateTransitionError,
 )
-from .local_workspace import LocalWorkspace, init_feature_file
+from .local_workspace import init_feature_file
 from .redaction import redact, redact_argv
 from .replan_txn import ReplanTransaction
 from .state import (
@@ -379,15 +379,26 @@ def cmd_run(args) -> int:
 
 
 def cmd_local_init(args) -> int:
-    """Create features/<slug>.md. Never overwrites without --force."""
+    """Create features/<slug>.md under the repository lock. No --force, no overwrite.
+
+    The controller lock covers this the same way it covers `local run`. A
+    feature specification is not a scratch file: a run freezes its SHA-256 and
+    re-checks it around every phase, so `local init --force` racing an active
+    run could rewrite the specification while the controller was hashing it,
+    rendering it into a prompt or verifying it — which is precisely the
+    "an agent cannot rewrite its own acceptance criteria" guarantee, undone
+    from the operator's side. One controller at a time owns the repository,
+    and creating this file is a controller write like any other.
+    """
     cfg = _load_cfg(args)
-    ws = LocalWorkspace(workdir=os.getcwd(), state_dir=args.state_dir or cfg.state_dir)
-    path = init_feature_file(
-        ws,
-        args.slug,
-        feature_dir=args.feature_dir or cfg.local.feature_dir,
-        overwrite=args.force,
-    )
+    engine = _engine_for(args, cfg)
+    with engine.locked():
+        path = init_feature_file(
+            engine.workspace(),
+            args.slug,
+            feature_dir=args.feature_dir or cfg.local.feature_dir,
+            overwrite=args.force,
+        )
     rel = os.path.relpath(path, os.getcwd())
     print(f"Created {rel}")
     print()

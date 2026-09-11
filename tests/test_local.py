@@ -1434,3 +1434,434 @@ def test_run_log_metadata_is_redacted(tmp_path):
     # Non-string scalars survive intact rather than being stringified.
     parsed = json.loads(request)["metadata"]
     assert parsed["count"] == 3 and parsed["flag"] is True and parsed["none"] is None
+
+
+# -- PR #44 second review regressions (R1-F1..R1-F7) ---------------------------
+def _failed_git(req, stderr: str, exit_code: int = 128):
+    """An ExecutionResult shaped like a `git` invocation that failed."""
+    from autoforge.executor import ExecutionResult
+
+    return ExecutionResult(
+        command=list(req.command),
+        cwd=req.cwd,
+        exit_code=exit_code,
+        stdout="",
+        stderr=stderr,
+        started_at="2026-01-01T00:00:00+00:00",
+        finished_at="2026-01-01T00:00:01+00:00",
+    )
+
+
+def test_a_state_directory_holding_project_content_is_refused(tmp_path):
+    """R1-F1: `--state-dir src` excluded the implementation from the fingerprint.
+
+    Everything under the state directory is excluded so AutoForge's own
+    `state.json` and `logs/` cannot invalidate the workspace fingerprint. An
+    excluded path is a path no review is bound to, so the directory has to
+    hold nothing else: pointed at `src`, editing `src/app.py` left the
+    fingerprint unchanged and a clean review was accepted for code no
+    reviewer ever saw.
+    """
+    root = local_repo(tmp_path)
+    ws = LocalWorkspace(workdir=root, state_dir=root / "src")
+    assert ws.state_dir_relpath() == "src"
+    with pytest.raises(ConfigurationError, match="content AutoForge did not write"):
+        ws.check_state_dir()
+    # The fingerprint read refuses too, naming what it found.
+    with pytest.raises(ConfigurationError, match="app.py"):
+        ws.status()
+
+    # `features` is the same hole one level over: the frozen specification
+    # itself would stop being covered by the fingerprint.
+    features = LocalWorkspace(workdir=root, state_dir=root / "features")
+    with pytest.raises(ConfigurationError, match="add-filter.md"):
+        features.check_state_dir()
+
+    # A directory that does not exist yet is fine — the run creates and owns it.
+    fresh = LocalWorkspace(workdir=root, state_dir=root / ".autoforge")
+    fresh.check_state_dir()
+    # ... and so is one holding only entries AutoForge itself writes.
+    state_dir = root / ".autoforge"
+    (state_dir / "logs").mkdir(parents=True)
+    (state_dir / "state.json").write_text("{}", encoding="utf-8")
+    (state_dir / "state.json.corrupt-20260101T000000Z").write_text("{", encoding="utf-8")
+    (state_dir / ".state-abcdef.tmp").write_text("{}", encoding="utf-8")
+    fresh.check_state_dir()
+    # One stray project file is enough to refuse it again.
+    (state_dir / "notes.md").write_text("mine\n", encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="notes.md"):
+        fresh.check_state_dir()
+
+
+def test_a_state_directory_over_source_blocks_before_any_agent_runs(tmp_path):
+    """The refusal lands in INITIALIZING, not at the first fingerprint read."""
+    root = local_repo(tmp_path)
+    with pytest.raises(ConfigurationError, match="content AutoForge did not write"):
+        make_local_engine(root / "src", "features/add-filter.md", workdir=root)
+
+
+def test_local_init_refuses_a_feature_directory_reached_through_a_symlink(tmp_path):
+    """R1-F2: the repository-boundary check ran on a partly lexical path.
+
+    `realpath` was applied to the target's parent only when that exact
+    directory already existed. With `features` a symlink out of the
+    repository and a target of `features/new/<slug>.md`, `features/new` does
+    not exist, so the in-repository-looking lexical path passed the boundary
+    check and `mkdir(parents=True)` then followed the link and wrote the
+    specification outside the checkout.
+    """
+    root = git_repo(tmp_path / "repo")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "features").symlink_to(outside)
+    ws = LocalWorkspace(workdir=root, state_dir=".autoforge")
+
+    # The nested, not-yet-existing parent is the case that used to slip through.
+    with pytest.raises(ConfigurationError, match="outside the repository"):
+        init_feature_file(ws, "spec", feature_dir="features/new")
+    # The direct case is refused for the same reason.
+    with pytest.raises(ConfigurationError, match="outside the repository"):
+        init_feature_file(ws, "spec", feature_dir="features")
+    assert list(outside.iterdir()) == [], "nothing may be written outside the repository"
+
+
+def test_local_init_never_writes_through_a_symlink_at_the_target(tmp_path):
+    """O_NOFOLLOW on the final component: `--force` must not follow a link."""
+    root = git_repo(tmp_path / "repo")
+    outside = tmp_path / "elsewhere.md"
+    outside.write_text("operator content\n", encoding="utf-8")
+    (root / "features").mkdir()
+    (root / "features" / "spec.md").symlink_to(outside)
+    ws = LocalWorkspace(workdir=root, state_dir=".autoforge")
+
+    with pytest.raises(ConfigurationError, match="already exists"):
+        init_feature_file(ws, "spec")
+    with pytest.raises(ConfigurationError, match="not a regular file"):
+        init_feature_file(ws, "spec", overwrite=True)
+    assert outside.read_text(encoding="utf-8") == "operator content\n"
+
+
+def test_cli_local_init_refuses_while_another_controller_holds_the_lock(
+    tmp_path, monkeypatch, capsys
+):
+    """R1-F3: `local init` is a controller write, so it takes the repository lock.
+
+    A run freezes the specification's SHA-256 and re-checks it around every
+    phase; `local init --force` racing an active run could rewrite the
+    acceptance criteria while the controller was hashing or rendering them.
+    """
+    from autoforge.locking import ControllerLock, repository_lock_path
+
+    root = git_repo(tmp_path)
+    monkeypatch.chdir(root)
+    other = ControllerLock(repository_lock_path(root)).acquire()
+    try:
+        assert main(["local", "init", "add-filter"]) == 2
+    finally:
+        other.release()
+    err = capsys.readouterr().err
+    assert "controller.lock" in err
+    assert not (root / "features").exists(), "nothing may be created while the lock is held"
+
+    # Released: the same command now succeeds.
+    assert main(["local", "init", "add-filter"]) == 0
+    assert (root / "features" / "add-filter.md").is_file()
+
+
+def test_a_failed_fix_validation_does_not_charge_a_fix_round(tmp_path):
+    """R1-F4: the fix budget counted attempts the controller never accepted.
+
+    `local_fix_rounds` was incremented before the validation commands ran, so
+    a FIX whose tests failed spent a round on work no controller verified —
+    with `max_fix_rounds: 1` the retry was then refused for exhausting a
+    budget it had never actually used. Re-entry stays bounded by the separate
+    `local_pending_attempts` checkpoint, which counts invocations.
+    """
+    root = local_repo(tmp_path)
+    cfg = default_config()
+    # Passes while the marker is absent: ANALYZE_EXECUTE validates, the first
+    # FIX attempt (which creates it) does not.
+    marker = tmp_path / "FAIL_VALIDATION"
+    cfg.local.validation_commands = [["test", "!", "-e", str(marker)]]
+    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root, cfg=cfg)
+    eng.provider._handler = scripted(
+        eng,
+        root,
+        [
+            (lambda r: touch_impl(r, "v1\n"), lambda e: impl_result()),
+            (None, lambda e: review_result(e.state.workspace_fingerprint, 1, [finding(1)])),
+            (
+                lambda r: (touch_impl(r, "v2\n"), marker.write_text("x", encoding="utf-8")),
+                lambda e: fix_result(["R1-F1"]),
+            ),
+        ],
+    )
+    eng.step()  # INITIALIZING -> ANALYZE_EXECUTE
+    eng.step()  # implementation
+    eng.step()  # REVIEW -> FIX
+    assert eng.state.phase == Phase.FIX
+    with pytest.raises(VerificationError, match="validation command"):
+        eng.step()
+
+    assert eng.state.phase == Phase.FIX, "an unverified fix must stay resumable"
+    assert eng.state.local_fix_rounds == 0, "an unverified attempt must not spend a fix round"
+    assert eng.state.local_pending_phase == "FIX"
+    assert eng.state.local_pending_attempts == 1
+    reloaded = load_state(StatePaths.from_state_dir(root / ".autoforge").state_file)
+    assert reloaded.local_fix_rounds == 0 and reloaded.local_pending_attempts == 1
+
+    # The retry is accepted, and *that* is the round that gets charged.
+    marker.unlink()
+    eng.provider._handler = scripted(
+        eng, root, [(lambda r: touch_impl(r, "v3\n"), lambda e: fix_result(["R1-F1"]))]
+    )
+    outcome = eng.step()
+    assert outcome.next_phase == "REVIEW"
+    assert eng.state.local_fix_rounds == 1
+    assert "local fix round 1 verified" in outcome.message
+
+
+def test_an_unreadable_file_cannot_be_bound_and_fails_closed(tmp_path):
+    """R1-F5: `unreadable:PermissionError` read as a digest and compared equal.
+
+    A stable marker for a path that could not be hashed said "I could not
+    look", but behaved like "nothing changed": the bytes behind it could be
+    swapped freely with the fingerprint unmoved, and the review still counted
+    as bound to the workspace.
+    """
+    import os
+
+    if os.geteuid() == 0:
+        pytest.skip("root bypasses file permissions, so the file stays readable")
+    root = local_repo(tmp_path)
+    ws = LocalWorkspace(workdir=root, state_dir=".autoforge")
+    secret = root / "src" / "blob.bin"
+    secret.write_bytes(b"v1")
+    secret.chmod(0o000)
+    try:
+        with pytest.raises(VerificationError, match="cannot be read"):
+            ws.status()
+        # The swap the old marker hid: still refused, never "unchanged".
+        secret.chmod(0o600)
+        secret.write_bytes(b"v2")
+        secret.chmod(0o000)
+        with pytest.raises(VerificationError, match="cannot be read"):
+            ws.status()
+    finally:
+        secret.chmod(0o600)
+    assert ws.status().fingerprint  # readable again: a normal content hash
+
+
+def test_a_dirty_submodule_cannot_be_bound_and_fails_closed(tmp_path):
+    """R1-F5: `git status` reports a bare directory, which no digest can bind.
+
+    The old `"dir"` marker made every change inside a dirty submodule (and
+    inside an untracked nested repository) invisible to the fingerprint.
+    """
+    root = local_repo(tmp_path)
+    upstream = tmp_path / "upstream"
+    subprocess.run(["git", "init", "-q", str(upstream)], check=True)
+    (upstream / "f.txt").write_text("v1\n", encoding="utf-8")
+    commit_all(upstream, "upstream")
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            str(upstream),
+            "vendor",
+        ],
+        check=True,
+    )
+    commit_all(root, "add submodule")
+    ws = LocalWorkspace(workdir=root, state_dir=".autoforge")
+    assert ws.status().is_clean
+
+    (root / "vendor" / "f.txt").write_text("v2\n", encoding="utf-8")
+    with pytest.raises(VerificationError, match="is a directory"):
+        ws.status()
+
+    # An untracked nested repository is reported the same way, and refused too.
+    (root / "vendor" / "f.txt").write_text("v1\n", encoding="utf-8")
+    nested = root / "tool"
+    subprocess.run(["git", "init", "-q", str(nested)], check=True)
+    (nested / "x.txt").write_text("v1\n", encoding="utf-8")
+    with pytest.raises(VerificationError, match="nested repository"):
+        ws.status()
+
+
+def test_a_failed_anchor_read_is_not_evidence_that_nothing_moved(tmp_path):
+    """R1-F6: a failing `git rev-parse` used to look exactly like an unborn HEAD.
+
+    Both collapsed into `""`, so a damaged repository, a permissions change
+    or a missing object store read as "HEAD has not moved" and the run
+    continued over a git identity the controller could no longer establish.
+    """
+    from autoforge.executor import execute
+
+    root = local_repo(tmp_path)
+
+    def breaking(argv: list[str]):
+        """Real git, except that the two anchor reads fail with git's own 128."""
+
+        def runner(req):
+            if req.command[2:] == argv:
+                return _failed_git(
+                    req, "fatal: not a git repository (or any of the parent directories)"
+                )
+            return execute(req)
+
+        return runner
+
+    head_argv = ["rev-parse", "--verify", "--quiet", "HEAD"]
+    branch_argv = ["symbolic-ref", "--quiet", "--short", "HEAD"]
+
+    ws = LocalWorkspace(workdir=root, state_dir=".autoforge", runner=breaking(head_argv))
+    with pytest.raises(VerificationError, match="cannot read HEAD"):
+        ws.head_sha()
+    ws = LocalWorkspace(workdir=root, state_dir=".autoforge", runner=breaking(branch_argv))
+    with pytest.raises(VerificationError, match="cannot read the checked-out branch"):
+        ws.branch()
+
+    # Exit 1 remains the observed fact it always was.
+    subprocess.run(["git", "-C", str(root), "checkout", "-q", "--detach"], check=True)
+    plain = LocalWorkspace(workdir=root, state_dir=".autoforge")
+    assert plain.branch() == ""
+    assert plain.head_sha()
+    empty = LocalWorkspace(workdir=git_repo(tmp_path / "empty"), state_dir=".autoforge")
+    assert empty.head_sha() == ""
+
+
+def test_a_failed_anchor_read_blocks_before_the_agent_is_invoked(tmp_path):
+    """The controller must not launch a write-capable agent it cannot anchor."""
+    from autoforge.executor import execute
+
+    root = local_repo(tmp_path)
+    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root)
+    eng.step()  # INITIALIZING -> ANALYZE_EXECUTE
+
+    invoked = {"n": 0}
+
+    def handler(req):
+        invoked["n"] += 1
+        return impl_result()
+
+    eng.provider._handler = handler
+
+    def runner(req):
+        if req.command[2:] == ["rev-parse", "--verify", "--quiet", "HEAD"]:
+            return _failed_git(req, "fatal: bad object HEAD")
+        return execute(req)
+
+    eng.workspace()._runner = runner
+    with pytest.raises(VerificationError, match="cannot read HEAD"):
+        eng.step()
+    assert invoked["n"] == 0, "the agent must not run against an unreadable anchor"
+    assert eng.state.phase == Phase.ANALYZE_EXECUTE
+
+
+def test_a_state_file_with_an_unknown_field_is_corruption(tmp_path):
+    """R1-F7: unknown fields were dropped, so a newer state loaded as an older one.
+
+    `from_dict` deleted anything it did not recognise and carried on, which
+    turned a state file written by a controller that knows about (say) a
+    pending-invocation checkpoint into a valid-looking file without one.
+    """
+    root = local_repo(tmp_path)
+    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root)
+    path = StatePaths.from_state_dir(root / ".autoforge").state_file
+    save_state(eng.state, path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    bad = dict(payload, local_future_checkpoint="something this controller ignores")
+    path.write_text(json.dumps(bad), encoding="utf-8")
+    with pytest.raises(StateError, match="unknown field"):
+        load_state(path)
+
+    # A newer protocol version is reported as such, not as a pile of unknown
+    # fields: the protocol check runs first so the message names the cause.
+    bad["protocol_version"] = "999.0"
+    path.write_text(json.dumps(bad), encoding="utf-8")
+    with pytest.raises(StateError, match="protocol_version"):
+        load_state(path)
+
+
+def test_a_state_file_with_a_malformed_pending_checkpoint_is_refused(tmp_path):
+    """R1-F7: the pending-invocation checkpoint is a bound, so it is validated.
+
+    It decides whether a write-capable agent is re-invoked and against which
+    baseline, and `MAX_LOCAL_PHASE_ATTEMPTS` is enforced on the persisted
+    counter. A hand-edited or truncated checkpoint must fail loudly rather
+    than silently disable the bound.
+    """
+    root = local_repo(tmp_path)
+    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root)
+    path = StatePaths.from_state_dir(root / ".autoforge").state_file
+    save_state(eng.state, path)
+    good = json.loads(path.read_text(encoding="utf-8"))
+    assert good["mode"] == "LOCAL"
+
+    def refuses(match: str, **fields):
+        path.write_text(json.dumps({**good, **fields}), encoding="utf-8")
+        with pytest.raises(StateError, match=match):
+            load_state(path)
+
+    refuses("non-negative integer", local_fix_rounds=-1)
+    refuses("non-negative integer", local_pending_attempts=-1)
+    refuses("non-negative integer", review_round=-1)
+    refuses("non-negative integer", step_count=-1)
+    # A phase that is not a phase, and one whose agent cannot write.
+    refuses(
+        "local_pending_phase",
+        local_pending_phase="NOT_A_PHASE",
+        local_pending_fingerprint="a" * 64,
+        local_pending_attempts=1,
+    )
+    refuses(
+        "local_pending_phase",
+        local_pending_phase="REVIEW",
+        local_pending_fingerprint="a" * 64,
+        local_pending_attempts=1,
+    )
+    # Partial checkpoints in both directions.
+    refuses("local_pending_fingerprint", local_pending_phase="FIX", local_pending_attempts=1)
+    refuses(
+        "local_pending_attempts",
+        local_pending_phase="FIX",
+        local_pending_fingerprint="a" * 64,
+        local_pending_attempts=0,
+    )
+    refuses("local_pending_fingerprint", local_pending_fingerprint="a" * 64)
+    refuses("local_pending_attempts", local_pending_attempts=2)
+    # A checkpoint on a REMOTE run is not a checkpoint at all.
+    remote = {
+        **good,
+        "mode": "REMOTE",
+        "repository": "owner/repo",
+        "epic_url": "https://github.com/owner/repo/issues/1",
+        "local_pending_phase": "FIX",
+        "local_pending_fingerprint": "a" * 64,
+        "local_pending_attempts": 1,
+    }
+    path.write_text(json.dumps(remote), encoding="utf-8")
+    with pytest.raises(StateError, match="on a REMOTE run"):
+        load_state(path)
+
+    # The well-formed checkpoint still loads.
+    path.write_text(
+        json.dumps(
+            {
+                **good,
+                "local_pending_phase": "FIX",
+                "local_pending_fingerprint": "a" * 64,
+                "local_pending_attempts": 2,
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert load_state(path).local_pending_attempts == 2

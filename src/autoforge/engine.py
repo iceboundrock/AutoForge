@@ -152,6 +152,7 @@ from .result_parser import (
 from .runlog import ExecutionRecord, RunLogger
 from .state import AutoForgeState, StatePaths, load_state, save_state, utcnow_iso
 from .transitions import (
+    LOCAL_WRITE_PHASES,
     STOP_PHASES,
     TERMINAL_PHASES,
     Phase,
@@ -175,10 +176,6 @@ from .validation import (
 # verified would be re-invoked by every ``resume`` forever.
 MAX_LOCAL_PHASE_ATTEMPTS = 3
 
-# LOCAL phases whose agent can change the working tree. REVIEW is excluded: it
-# is read-only and rejected outright if it edits anything, so it needs no
-# "work may already exist" checkpoint.
-LOCAL_WRITE_PHASES = (Phase.ANALYZE_EXECUTE, Phase.FIX)
 
 REQUIRED_PROFILES = [
     "analyze_execute",
@@ -1498,7 +1495,17 @@ class ControllerEngine:
             )
         state.workspace_fingerprint = after.fingerprint
         state.last_fix_resolutions = [redact_dict(r.to_dict()) for r in res.resolutions]
-        state.local_fix_rounds += 1
+        # The round number this attempt would conclude. `local_fix_rounds`
+        # counts fix rounds the controller *concluded* — either back to REVIEW
+        # or terminally BLOCKED — and deliberately not ones still in flight,
+        # so it is charged at each of those two exits rather than here. A FIX
+        # whose validation command fails is neither: the phase stays at FIX
+        # for `resume`, and charging the budget for an attempt no controller
+        # verified would spend a fix round on work that was never accepted and
+        # block a later round that would have been. Re-entry stays bounded by
+        # the separate `local_pending_attempts` checkpoint, which counts
+        # *invocations* and is what stops a phase that can never be completed.
+        round_no = state.local_fix_rounds + 1
 
         # An 'unresolved' disposition is the agent saying the finding is real
         # and it could not resolve it. That is an agent-reported blocker, and
@@ -1513,17 +1520,20 @@ class ControllerEngine:
             keep = {r.finding_id for r in unresolved}
             state.open_findings = [f for f in state.open_findings if f.get("id") in keep]
             state.last_review_result = "unresolved"
+            # Concluded, terminally: the round is charged.
+            state.local_fix_rounds = round_no
             detail = "; ".join(
                 f"{r.finding_id}: {redact(r.rationale) or '(no rationale)'}" for r in unresolved
             )
             return Phase.BLOCKED, self._local_block_reason(
-                f"local fix round {state.local_fix_rounds} left {len(unresolved)} of "
+                f"local fix round {round_no} left {len(unresolved)} of "
                 f"{len(res.resolutions)} finding(s) explicitly unresolved, so the "
                 f"implementation is not complete and no later review can clear them "
                 f"({detail}). The validation commands were not run"
             )
 
         self._run_validation_commands(Phase.FIX)
+        state.local_fix_rounds = round_no
         state.open_findings = []
         state.last_review_result = "fixed"
         no_change = [r.finding_id for r in res.resolutions if r.resolution != "fixed"]
@@ -1533,7 +1543,7 @@ class ControllerEngine:
             else ""
         )
         return Phase.REVIEW, (
-            f"local fix round {state.local_fix_rounds} verified: {len(res.resolutions)} "
+            f"local fix round {round_no} verified: {len(res.resolutions)} "
             f"resolution(s){note}; FIX -> REVIEW (round {state.review_round + 1})"
         )
 

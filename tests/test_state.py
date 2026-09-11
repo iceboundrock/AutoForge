@@ -517,3 +517,36 @@ def test_quarantine_refuses_directory_and_leaves_it_untouched(tmp_path):
         quarantine_state_file(p)
     assert [q.name for q in tmp_path.iterdir()] == ["state.json"]
     assert (p / "keep").read_text(encoding="utf-8") == "x"
+
+
+def test_save_state_fsyncs_the_directory_entry_after_the_rename(tmp_path, monkeypatch):
+    """PR #44, O3: fsyncing the bytes says nothing about the rename that publishes them.
+
+    A crash right after `save_state` returned could leave the previous
+    `state.json` in place — losing the pending-invocation checkpoint a LOCAL
+    write phase persists *before* launching an agent.
+    """
+    import os
+
+    from autoforge import state as state_mod
+
+    synced: list[int] = []
+    real_fsync = os.fsync
+    monkeypatch.setattr(os, "fsync", lambda fd: (synced.append(fd), real_fsync(fd))[1])
+
+    p = tmp_path / "run" / "state.json"
+    save_state(make_state(), p)
+    assert len(synced) == 2, "the temp file and its directory must both be flushed"
+    assert load_state(p).run_id == "af-test-1"
+
+    # Best effort: a filesystem that cannot fsync a directory must not fail the run.
+    real_open = os.open
+
+    def refuse(path, flags, *args, **kwargs):
+        if os.path.isdir(path):
+            raise OSError("no directory fsync here")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(state_mod.os, "open", refuse)
+    save_state(make_state(review_round=4), p)
+    assert load_state(p).review_round == 4

@@ -37,14 +37,95 @@ from pathlib import Path
 from . import __prompt_version__, __protocol_version__, __version__
 from .errors import StateError
 from .loop_guard import validate_review_history
-from .transitions import Phase, WorkflowMode
+from .transitions import LOCAL_WRITE_PHASES, Phase, WorkflowMode
 
 STATE_FILENAME = "state.json"
 LOGS_DIRNAME = "logs"
+CORRUPT_SUFFIX = ".corrupt-"
+# Prefix/suffix of the temporary file :func:`save_state` renames into place.
+TMP_PREFIX = ".state-"
+TMP_SUFFIX = ".tmp"
+
+
+def is_runtime_artifact(name: str) -> bool:
+    """True when ``name`` is an entry AutoForge itself writes into a state directory.
+
+    The single list of everything the controller may create under
+    ``state_dir``.  :meth:`autoforge.local_workspace.LocalWorkspace.check_state_dir`
+    uses it to refuse a state directory that also holds project content: a
+    LOCAL run excludes the whole state directory from the workspace
+    fingerprint, so a state directory pointed at, say, ``src/`` would hide the
+    implementation from the very binding that makes a review trustworthy.
+    Anything added here must also be written by this module or
+    :mod:`autoforge.runlog`, and vice versa.
+    """
+    if name in (STATE_FILENAME, LOGS_DIRNAME):
+        return True
+    if name.startswith(f"{STATE_FILENAME}{CORRUPT_SUFFIX}"):
+        return True
+    return name.startswith(TMP_PREFIX) and name.endswith(TMP_SUFFIX)
 
 
 def utcnow_iso() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _validate_local_pending(state: AutoForgeState) -> None:
+    """Check the LOCAL pending-invocation checkpoint is internally consistent.
+
+    ``local_pending_phase`` records that a write-capable LOCAL phase was
+    launched and its work may already be in the working tree; the fingerprint
+    beside it is the tree from *before* the first attempt, and the attempt
+    count is what bounds re-entry.  The three fields are one record, so a file
+    carrying only some of them is corruption — and corruption that matters:
+    a lost ``local_pending_phase`` makes an already-launched phase look like a
+    first invocation (so "the tree is unchanged, nothing was implemented"
+    becomes unprovable), while a lost fingerprint silently rebases that
+    question onto the tree the failed attempt left behind.  A typo in the
+    phase value would do the same, which is why it is matched against
+    :data:`~autoforge.transitions.LOCAL_WRITE_PHASES` rather than merely being
+    a string.
+    """
+    pending = state.local_pending_phase
+    allowed = ", ".join(p.value for p in LOCAL_WRITE_PHASES)
+    if not pending:
+        if state.local_pending_fingerprint or state.local_pending_attempts:
+            raise StateError(
+                "state fields 'local_pending_fingerprint' and 'local_pending_attempts' "
+                "must be empty when 'local_pending_phase' is not set (found "
+                f"{state.local_pending_fingerprint!r} / {state.local_pending_attempts}); "
+                "a pending invocation without the phase it belongs to is corruption"
+            )
+        return
+    try:
+        pending_phase = Phase(pending)
+    except ValueError:
+        raise StateError(
+            f"state file has unknown local_pending_phase {pending!r} (expected one of {allowed})"
+        ) from None
+    if pending_phase not in LOCAL_WRITE_PHASES:
+        raise StateError(
+            f"state field 'local_pending_phase' must be one of {allowed}, not {pending!r}: "
+            "only a write-capable LOCAL phase can leave work in the tree to recover"
+        )
+    if state.mode != WorkflowMode.LOCAL:
+        raise StateError(
+            f"state field 'local_pending_phase' is set ({pending!r}) on a "
+            f"{state.mode.value} run, which has no local working-tree checkpoint"
+        )
+    if not state.local_pending_fingerprint:
+        raise StateError(
+            "state field 'local_pending_fingerprint' must be set whenever "
+            f"'local_pending_phase' is ({pending!r}): without the fingerprint from before "
+            "the first attempt the controller cannot tell work that was already produced "
+            "from work that was never done"
+        )
+    if state.local_pending_attempts < 1:
+        raise StateError(
+            "state field 'local_pending_attempts' must be at least 1 whenever "
+            f"'local_pending_phase' is ({pending!r}): the checkpoint is written when an "
+            "invocation is launched, so zero attempts is corruption"
+        )
 
 
 @dataclass
@@ -204,16 +285,34 @@ class AutoForgeState:
                 mode = WorkflowMode(raw_mode)
             except ValueError:
                 raise StateError(f"state file has unknown mode {raw_mode!r}") from None
+        # The protocol version decides what "unknown field" even means, so it
+        # is checked before the fields are: a file written by a newer
+        # controller must be reported as an unsupported protocol, not as a
+        # pile of typos.
+        raw_protocol = data.get("protocol_version", __protocol_version__)
+        if raw_protocol != __protocol_version__:
+            raise StateError(
+                f"unsupported protocol_version {raw_protocol!r} "
+                f"(controller speaks {__protocol_version__!r})"
+            )
         kwargs = dict(data)
         kwargs["phase"] = phase
         kwargs["mode"] = mode
-        # Drop unknown future fields defensively? No — fail loudly on wrong
-        # types but ignore nothing: keep only known dataclass fields so that
-        # hand-edited files with typos surface via required-field checks.
+        # Unknown fields are corruption, not forward compatibility: at this
+        # protocol version the controller knows every field it writes, so an
+        # unexpected key is a hand edit, a truncated merge or a foreign file.
+        # Dropping it silently would let `local_fix_round` (say) sit next to a
+        # `local_fix_rounds` that quietly kept its dataclass default of 0 —
+        # substituting a default for a bound the operator meant to set.
         known = {f for f in cls.__dataclass_fields__}
-        unknown = set(kwargs) - known
-        for u in unknown:
-            del kwargs[u]
+        unknown = sorted(set(kwargs) - known)
+        if unknown:
+            raise StateError(
+                "state file has unknown field(s) "
+                + ", ".join(repr(u) for u in unknown)
+                + f" for protocol_version {__protocol_version__!r}; refusing to load — "
+                "a field the controller does not know is corruption, not state"
+            )
         try:
             state = cls(**{k: v for k, v in kwargs.items() if k in known})
         except TypeError as exc:
@@ -238,10 +337,20 @@ class AutoForgeState:
         ):
             if not isinstance(getattr(state, name), str):
                 raise StateError(f"state field {name!r} must be a string")
-        for name in ("local_fix_rounds", "local_pending_attempts"):
+        # Range, not just type: `local_fix_rounds: -1` would sail past the
+        # `>= max_fix_rounds` budget guard and buy the run unlimited extra fix
+        # rounds, and a negative `step_count` does the same to the cumulative
+        # step budget. A counter that cannot be trusted is not a counter.
+        for name in (
+            "local_fix_rounds",
+            "local_pending_attempts",
+            "step_count",
+            "review_round",
+        ):
             value = getattr(state, name)
-            if not isinstance(value, int) or isinstance(value, bool):
-                raise StateError(f"state field {name!r} must be an integer")
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise StateError(f"state field {name!r} must be a non-negative integer")
+        _validate_local_pending(state)
         if not isinstance(state.baseline_dirty_paths, list) or not all(
             isinstance(path, str) for path in state.baseline_dirty_paths
         ):
@@ -271,19 +380,10 @@ class AutoForgeState:
             minimum = 1 if name == "execution_attempt" else 0
             if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
                 raise StateError(f"state field {name!r} must be a valid integer")
-        if not isinstance(state.step_count, int) or isinstance(state.step_count, bool):
-            raise StateError("state field 'step_count' must be an integer")
-        if not isinstance(state.review_round, int) or isinstance(state.review_round, bool):
-            raise StateError("state field 'review_round' must be an integer")
         if state.last_review_needs_fix is not None and not isinstance(
             state.last_review_needs_fix, bool
         ):
             raise StateError("state field 'last_review_needs_fix' must be a boolean or null")
-        if state.protocol_version != __protocol_version__:
-            raise StateError(
-                f"unsupported protocol_version {state.protocol_version!r} "
-                f"(controller speaks {__protocol_version__!r})"
-            )
         return state
 
     def touch(self) -> None:
@@ -362,19 +462,47 @@ class StatePaths:
 
 
 # -- persistence ----------------------------------------------------------
+def _fsync_dir(directory: Path) -> None:
+    """Flush the *directory entry* so a completed ``os.replace`` survives power loss.
+
+    ``fsync`` on the temp file makes its bytes durable; it says nothing about
+    the rename that publishes them.  Without this a crash right after
+    :func:`save_state` returns can leave the previous ``state.json`` in place
+    — losing, among other things, the pending-invocation checkpoint a LOCAL
+    write phase persists *before* launching an agent, which is exactly the
+    record recovery depends on.
+
+    Best effort by design: opening a directory for ``fsync`` is not portable
+    (it fails on Windows) and some filesystems do not implement it.  A state
+    file whose bytes are already fsynced and renamed is not worth failing a
+    run over, so a failure here is not raised.
+    """
+    try:
+        fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 def save_state(state: AutoForgeState, path: str | Path) -> None:
-    """Atomically persist state: temp file + fsync + atomic replace."""
+    """Atomically persist state: temp file + fsync + atomic replace + fsync dir."""
     dest = Path(path)
     dest.parent.mkdir(parents=True, exist_ok=True)
     state.touch()
     payload = json.dumps(state.to_dict(), indent=2, sort_keys=True) + "\n"
-    fd, tmp_name = tempfile.mkstemp(prefix=".state-", suffix=".tmp", dir=str(dest.parent))
+    fd, tmp_name = tempfile.mkstemp(prefix=TMP_PREFIX, suffix=TMP_SUFFIX, dir=str(dest.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(payload)
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp_name, dest)
+        _fsync_dir(dest.parent)
     except BaseException:
         try:
             os.unlink(tmp_name)
@@ -482,7 +610,6 @@ def load_state(path: str | Path) -> AutoForgeState:
     return AutoForgeState.from_dict(data)
 
 
-CORRUPT_SUFFIX = ".corrupt-"
 _QUARANTINE_MAX_ATTEMPTS = 1000
 
 

@@ -83,6 +83,13 @@ TERMINAL_PHASES = frozenset({Phase.DONE, Phase.BLOCKED, Phase.FAILED})
 # the loop only stops at TERMINAL_PHASES.
 STOP_PHASES = TERMINAL_PHASES | frozenset({Phase.READY_FOR_MERGE})
 
+# LOCAL phases whose agent can change the working tree. REVIEW is excluded: it
+# is read-only and the controller *rejects* a reviewer that changed anything.
+# A pending-invocation checkpoint (``AutoForgeState.local_pending_phase``) may
+# name one of these and nothing else, which is why the tuple lives here rather
+# than in the engine: ``state`` validates a loaded checkpoint against it.
+LOCAL_WRITE_PHASES = (Phase.ANALYZE_EXECUTE, Phase.FIX)
+
 # Phases whose step invokes an agent through a provider. MERGE is NOT one of
 # them: the controller runs `gh pr merge` itself (agents never merge).
 AGENT_PHASES = frozenset(

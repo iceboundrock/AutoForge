@@ -377,7 +377,10 @@ configurable via `local.feature_dir`) with `## Problem`, `## Requirements`,
 `## Notes / Decisions`. Feature specifications are **project content**, not
 runtime state: they live in your repository and you may commit them.
 `.autoforge/` remains controller state only. `local init` refuses to overwrite
-an existing file unless you pass `--force`.
+an existing file unless you pass `--force`, never writes through a symbolic
+link, and refuses a `local.feature_dir` that resolves outside the repository.
+It takes the repository controller lock like any other controller write, so it
+cannot rewrite a specification an active run has frozen.
 
 **The specification is frozen for the whole run.** `local run` records its
 SHA-256, and the controller re-reads and re-checks the hash before *and* after
@@ -401,6 +404,21 @@ would miss a brand-new source file holding the entire implementation — and
 everything under the state directory is excluded, so writing logs and state
 cannot invalidate a review. The feature specification is *not* excluded from
 its own separate hash check.
+
+Because an excluded path is a path no review is bound to, an in-repository
+state directory must hold **only** entries AutoForge itself writes
+(`state.json`, `logs/`, a moved-aside corrupt state, a temp file mid-rename).
+`--state-dir src` is refused rather than quietly excluding the implementation
+from the fingerprint; so is a state directory that *is* the repository root.
+A path outside the repository excludes nothing and is always fine.
+
+Every changed path must also be *bindable*. A path that cannot be
+content-hashed — unreadable, a dirty submodule or nested repository (`git
+status` reports a bare directory), a FIFO or device — fails the run closed
+instead of getting a stable "could not look" marker, because such a marker
+compares equal to itself and would let the bytes behind it be swapped with
+the fingerprint unmoved. A deleted path is the one exception: absence is an
+observed fact.
 
 With that, the controller checks for itself:
 
