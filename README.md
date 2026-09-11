@@ -399,7 +399,10 @@ read by `local_workspace.py` through argv-only `git` invocations (never a
 shell). Before and after every phase the controller computes a **workspace
 fingerprint**: HEAD plus every path reported by
 `git status --porcelain=v1 -z --untracked-files=all` together with a SHA-256
-of that path's current bytes. Untracked files are included — a `git diff HEAD`
+of that path's current bytes *and its permission bits* (on a file that is
+already dirty, `chmod +x` moves neither the content digest nor the porcelain
+status code, and whether a script is executable decides what a validation
+command does with it). Untracked files are included — a `git diff HEAD`
 would miss a brand-new source file holding the entire implementation — and
 everything under the state directory is excluded, so writing logs and state
 cannot invalidate a review. The feature specification is *not* excluded from
@@ -407,10 +410,23 @@ its own separate hash check.
 
 Because an excluded path is a path no review is bound to, an in-repository
 state directory must hold **only** entries AutoForge itself writes
-(`state.json`, `logs/`, a moved-aside corrupt state, a temp file mid-rename).
-`--state-dir src` is refused rather than quietly excluding the implementation
-from the fingerprint; so is a state directory that *is* the repository root.
-A path outside the repository excludes nothing and is always fine.
+(`state.json`, `logs/`, a moved-aside corrupt state, a temp file mid-rename),
+each matched as the exact shape the controller produces and each required to
+be the *kind* of entry it claims: `logs` a real directory, everything else a
+regular file. A symbolic link there would exclude a name whose content lives
+somewhere else entirely, and would send controller writes outside the
+checkout. `--state-dir src` is refused rather than quietly excluding the
+implementation from the fingerprint; so is a state directory that *is* the
+repository root. A path outside the repository excludes nothing, is never
+name-trusted, and is always fine.
+
+Runtime artifacts are written the same way the state file is read: a
+directory the controller creates is verified to be a real directory, and
+every log artifact is opened without following symbolic links and without an
+open that can block (`safeio.py`). A `logs` symlink cannot relocate a run's
+artifacts, a FIFO cannot hang the controller, and `run_id` — which names
+`logs/<run_id>` — is validated as a single safe path component when state is
+loaded, not trusted because the controller generated it once.
 
 Every changed path must also be *bindable*. A path that cannot be
 content-hashed — unreadable, a dirty submodule or nested repository (`git

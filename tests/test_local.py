@@ -261,6 +261,38 @@ def test_fingerprint_tracks_tracked_untracked_and_ignores_state_dir(tmp_path):
     assert ws.status().fingerprint == stable
 
 
+def test_fingerprint_notices_a_mode_change_on_an_already_dirty_file(tmp_path):
+    """R3-F3: content + status code do not describe a working tree; the mode does too.
+
+    On a file that is *already* modified, `chmod +x` moves neither the
+    content digest nor the porcelain code (it stays " M"), so the fingerprint
+    was identical before and after. A reviewer could therefore make a script
+    executable after the review it was bound to, and the post-review equality
+    check still passed — while what a validation command does with that file
+    changed.
+    """
+    root = local_repo(tmp_path)
+    ws = LocalWorkspace(workdir=root, state_dir=".autoforge")
+    script = root / IMPL_FILE
+    script.write_text("print('hi')\n", encoding="utf-8")  # dirty, mode unchanged
+    dirty = ws.status().fingerprint
+
+    script.chmod(0o755)
+    assert ws.status().fingerprint != dirty
+    assert [e.mode for e in ws.status().entries if e.path == IMPL_FILE] == ["0755"]
+
+    # ... and back again: the fingerprint is a function of the tree, not a ratchet.
+    script.chmod(0o644)
+    assert ws.status().fingerprint == dirty
+
+    # The same holds for a file that is only *newly* executable and untracked.
+    extra = root / "src" / "tool.sh"
+    extra.write_text("#!/bin/sh\necho hi\n", encoding="utf-8")
+    before = ws.status().fingerprint
+    extra.chmod(0o755)
+    assert ws.status().fingerprint != before
+
+
 def test_fingerprint_notices_a_deleted_tracked_file(tmp_path):
     root = local_repo(tmp_path)
     ws = LocalWorkspace(workdir=root, state_dir=".autoforge")
@@ -1491,6 +1523,80 @@ def test_a_state_directory_holding_project_content_is_refused(tmp_path):
     (state_dir / "notes.md").write_text("mine\n", encoding="utf-8")
     with pytest.raises(ConfigurationError, match="notes.md"):
         fresh.check_state_dir()
+
+
+def test_a_state_directory_entry_must_be_the_kind_it_claims(tmp_path):
+    """R3-F4 (part): a runtime *name* is evidence of authorship, not proof of it.
+
+    The state directory is excluded from the workspace fingerprint, so an
+    entry the exclusion covers has to be the entry AutoForge writes. A `logs`
+    symbolic link is the sharp case: the controller creates directories and
+    files under it on every step, so a link puts run artifacts wherever it
+    points — outside the checkout a LOCAL run promises not to touch.
+    """
+    root = local_repo(tmp_path)
+    state_dir = root / ".autoforge"
+    state_dir.mkdir()
+    ws = LocalWorkspace(workdir=root, state_dir=state_dir)
+
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (state_dir / "logs").symlink_to(outside)
+    with pytest.raises(ConfigurationError, match=r"logs \(symbolic link\)"):
+        ws.check_state_dir()
+    (state_dir / "logs").unlink()
+
+    # `logs` must be a directory, not a file the controller could never use.
+    (state_dir / "logs").write_text("not a directory\n", encoding="utf-8")
+    with pytest.raises(ConfigurationError, match=r"logs \(not a directory"):
+        ws.check_state_dir()
+    (state_dir / "logs").unlink()
+    (state_dir / "logs").mkdir()
+
+    # Everything else must be a plain regular file: a directory named like a
+    # temp file would hide a whole tree behind one excluded name.
+    (state_dir / ".state-abcdef.tmp").mkdir()
+    with pytest.raises(ConfigurationError, match=r"\.state-abcdef\.tmp \(not a regular file"):
+        ws.check_state_dir()
+    (state_dir / ".state-abcdef.tmp").rmdir()
+
+    (state_dir / "state.json").symlink_to(tmp_path / "real-state.json")
+    with pytest.raises(ConfigurationError, match=r"state\.json \(symbolic link\)"):
+        ws.check_state_dir()
+    (state_dir / "state.json").unlink()
+
+    (state_dir / "state.json").write_text("{}", encoding="utf-8")
+    ws.check_state_dir()  # the real shapes still pass
+
+
+def test_runtime_names_are_matched_as_shapes_not_as_prefixes(tmp_path):
+    """R3-F4 (part): narrow the names a foreign file can hide behind.
+
+    `quarantine_state_file` writes `state.json.corrupt-<UTC stamp>` and
+    `save_state` renames a `mkstemp` temp file into place. Trusting any name
+    that merely *starts* with `state.json.corrupt-` (or starts with `.state-`
+    and ends with `.tmp`) excluded a far larger set of names from the
+    fingerprint than the controller can ever produce.
+    """
+    root = local_repo(tmp_path)
+    state_dir = root / ".autoforge"
+    (state_dir / "logs").mkdir(parents=True)
+    ws = LocalWorkspace(workdir=root, state_dir=state_dir)
+
+    (state_dir / "state.json.corrupt-notes.md").write_text("mine\n", encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="content AutoForge did not write"):
+        ws.check_state_dir()
+    (state_dir / "state.json.corrupt-notes.md").unlink()
+
+    (state_dir / ".state-hidden-payload.tmp").write_text("mine\n", encoding="utf-8")
+    with pytest.raises(ConfigurationError, match=r"\.state-hidden-payload\.tmp"):
+        ws.check_state_dir()
+    (state_dir / ".state-hidden-payload.tmp").unlink()
+
+    # The shapes the controller actually writes are still accepted.
+    (state_dir / "state.json.corrupt-20260101T000000Z.2").write_text("{", encoding="utf-8")
+    (state_dir / ".state-a1b2c3d4.tmp").write_text("{}", encoding="utf-8")
+    ws.check_state_dir()
 
 
 def test_a_state_directory_over_source_blocks_before_any_agent_runs(tmp_path):

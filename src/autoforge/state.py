@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 import tempfile
 from dataclasses import asdict, dataclass, field
@@ -37,6 +38,8 @@ from pathlib import Path
 from . import __prompt_version__, __protocol_version__, __version__
 from .errors import StateError
 from .loop_guard import validate_review_history
+from .runlog import validate_run_id
+from .safeio import entry_kind
 from .transitions import LOCAL_WRITE_PHASES, Phase, WorkflowMode
 
 STATE_FILENAME = "state.json"
@@ -47,8 +50,20 @@ TMP_PREFIX = ".state-"
 TMP_SUFFIX = ".tmp"
 
 
+# The exact shapes the controller writes: `quarantine_state_file` stamps
+# "<state.json>.corrupt-YYYYMMDDTHHMMSSZ" (plus ".<n>" on a name collision)
+# and `save_state` renames a `tempfile.mkstemp(prefix=".state-",
+# suffix=".tmp")` into place. Matching the shape rather than a bare
+# prefix/suffix keeps the set of names that are trusted as runtime artifacts
+# as small as the set the controller can actually produce.
+_CORRUPT_ARCHIVE_RE = re.compile(
+    rf"^{re.escape(STATE_FILENAME + CORRUPT_SUFFIX)}\d{{8}}T\d{{6}}Z(?:\.\d+)?$"
+)
+_TMP_STATE_RE = re.compile(rf"^{re.escape(TMP_PREFIX)}[A-Za-z0-9_]{{1,64}}{re.escape(TMP_SUFFIX)}$")
+
+
 def is_runtime_artifact(name: str) -> bool:
-    """True when ``name`` is an entry AutoForge itself writes into a state directory.
+    """True when ``name`` has the shape of an entry AutoForge writes into a state directory.
 
     The single list of everything the controller may create under
     ``state_dir``.  :meth:`autoforge.local_workspace.LocalWorkspace.check_state_dir`
@@ -58,12 +73,20 @@ def is_runtime_artifact(name: str) -> bool:
     implementation from the very binding that makes a review trustworthy.
     Anything added here must also be written by this module or
     :mod:`autoforge.runlog`, and vice versa.
+
+    This is a statement about the *name*, which is evidence of authorship
+    but not proof of it: nothing stops a file that AutoForge did not write
+    from being called ``state.json``.  The caller therefore checks the entry
+    kind as well (a ``logs`` that is a symbolic link is not the directory
+    this controller created), and the two categories that exist only after a
+    crash or a quarantine are matched against the exact shapes the
+    controller produces rather than a bare prefix.  See
+    ``check_state_dir`` for what remains, and why a state directory outside
+    the repository is the answer when name-shaped evidence is not enough.
     """
     if name in (STATE_FILENAME, LOGS_DIRNAME):
         return True
-    if name.startswith(f"{STATE_FILENAME}{CORRUPT_SUFFIX}"):
-        return True
-    return name.startswith(TMP_PREFIX) and name.endswith(TMP_SUFFIX)
+    return bool(_CORRUPT_ARCHIVE_RE.match(name) or _TMP_STATE_RE.match(name))
 
 
 def utcnow_iso() -> str:
@@ -327,6 +350,13 @@ class AutoForgeState:
         for req in required:
             if not getattr(state, req, None):
                 raise StateError(f"state file missing required field {req!r}")
+        # `run_id` is not just an identifier: it names `<state_dir>/logs/<run_id>`,
+        # the directory every artifact of the run is written into. A hand-edited
+        # or truncated state carrying "../escape" (or an absolute path) would
+        # redirect those writes out of the state directory entirely, so the
+        # shape is checked here — corruption fails on load, naming the state
+        # file, rather than at the first log write.
+        validate_run_id(state.run_id)
         for name in (
             "feature_spec_path",
             "feature_spec_sha256",
@@ -509,23 +539,6 @@ def save_state(state: AutoForgeState, path: str | Path) -> None:
         except OSError:
             pass
         raise
-
-
-def entry_kind(mode: int) -> str | None:
-    """Human name of a non-regular entry kind, or None for a regular file."""
-    if stat.S_ISREG(mode):
-        return None
-    if stat.S_ISDIR(mode):
-        return "directory"
-    if stat.S_ISFIFO(mode):
-        return "FIFO"
-    if stat.S_ISSOCK(mode):
-        return "socket"
-    if stat.S_ISCHR(mode):
-        return "character device"
-    if stat.S_ISBLK(mode):
-        return "block device"
-    return "special file"
 
 
 def _not_regular(p: Path, kind: str, is_link: bool) -> StateError:

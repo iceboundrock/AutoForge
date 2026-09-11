@@ -23,8 +23,10 @@ review to exactly the code that was reviewed. It covers:
 - the checked-out branch (or the fact that HEAD is detached),
 - every path ``git status --porcelain=v1 -z --untracked-files=all`` reports
   (tracked modifications, staged modifications, deletions, renames and
-  *untracked* files, which is where an implementation may well live), and
-- the SHA-256 of each of those paths' current bytes.
+  *untracked* files, which is where an implementation may well live),
+- the SHA-256 of each of those paths' current bytes, and
+- each of those paths' permission bits, because "the reviewer saw exactly
+  this tree" includes whether a file is executable.
 
 Every reported path is hashed by *content*, whatever its size: a fingerprint
 that fell back to ``(size, mtime)`` for large files would accept an
@@ -56,7 +58,8 @@ from pathlib import Path
 
 from .errors import ConfigurationError, VerificationError
 from .executor import ExecutionRequest, ExecutionResult, execute
-from .state import is_runtime_artifact
+from .safeio import entry_kind
+from .state import LOGS_DIRNAME, is_runtime_artifact
 
 Runner = Callable[[ExecutionRequest], ExecutionResult]
 
@@ -86,6 +89,35 @@ def _unbindable(rel: str, why: str) -> str:
     )
 
 
+def _state_entry_problem(entry: os.DirEntry[str]) -> str | None:
+    """Why a state-directory entry is not the kind of entry AutoForge writes, or None.
+
+    ``check_state_dir`` trusts a *name* to decide what is excluded from the
+    fingerprint; this is the other half of that decision. ``logs`` must be a
+    real directory — the controller creates directories and files under it on
+    every step, and a symbolic link there would put those writes outside the
+    working tree (see :mod:`autoforge.safeio`, which refuses to follow one at
+    write time). Every other runtime name must be a plain regular file.
+
+    LOCAL mode is deliberately stricter here than :func:`autoforge.state.load_state`,
+    which tolerates a ``state.json`` symlink because its job is only to read
+    the file and never to silently re-initialise over it. The question here is
+    a different one: this directory is *excluded from the review binding*, so
+    an entry that is really a pointer somewhere else is exactly what the
+    exclusion must not cover.
+    """
+    try:
+        st = entry.stat(follow_symlinks=False)
+    except OSError as exc:  # pragma: no cover - scandir just listed it
+        return f"cannot be inspected: {exc}"
+    if stat.S_ISLNK(st.st_mode):
+        return "symbolic link"
+    if entry.name == LOGS_DIRNAME:
+        return None if stat.S_ISDIR(st.st_mode) else f"not a directory: {entry_kind(st.st_mode)}"
+    kind = entry_kind(st.st_mode)
+    return None if kind is None else f"not a regular file: {kind}"
+
+
 @dataclass(frozen=True)
 class WorkspaceEntry:
     """One path `git status` reported, with the digest of its current bytes."""
@@ -93,6 +125,13 @@ class WorkspaceEntry:
     path: str
     code: str  # the two-character porcelain XY status code
     digest: str  # sha256 of the content, or a "<kind>:..." marker
+    # Permission bits as four octal digits for a regular file ("0644"),
+    # "lnk" for a symbolic link, "-" for a path that is gone. Content and
+    # status code alone do not describe a working tree: on an *already*
+    # modified file `chmod +x` changes neither, and the porcelain code stays
+    # " M", so without this a mode flip after a clean review was invisible to
+    # the binding that is supposed to make the review trustworthy.
+    mode: str = "-"
 
     @property
     def is_untracked(self) -> bool:
@@ -291,7 +330,7 @@ class LocalWorkspace:
         That exclusion is only safe while the directory holds nothing else,
         because an excluded path is a path no review is bound to.
 
-        Two ways it can stop being safe, both refused here:
+        Three ways it can stop being safe, all refused here:
 
         *The state directory is the repository root.* There is no prefix to
         exclude — every path in the tree would have to be — so the
@@ -312,6 +351,24 @@ class LocalWorkspace:
         ``logs/`` the *project* legitimately has, which is the same hole one
         level down. Refusing the configuration is the only answer that leaves
         nothing excluded that a reviewer needed to see.
+
+        *An entry is not the kind of entry it is named after.* A name is
+        evidence of authorship, not proof of it (see
+        :func:`autoforge.state.is_runtime_artifact`), so each excluded entry
+        must also be what it claims: ``logs`` a real directory the controller
+        writes run logs into, everything else a regular file. A ``logs``
+        symlink would put every artifact of the run outside the checkout a
+        LOCAL run promises not to leave, and a link anywhere here excludes a
+        name whose real content lives somewhere else entirely.
+
+        What remains is the crash-shaped residue: a moved-aside corrupt state
+        and a temp file left by a killed ``save_state`` are trusted by name
+        and shape alone, because nothing durable records that the controller
+        created them (see #48). Both are *excluded* rather than fingerprinted
+        for a reason — a quarantine archive is written by ``run --force``
+        before the baseline is read, so binding it would make recovery from a
+        corrupt state report a dirty tree. A state directory outside the
+        repository excludes nothing and needs none of this.
         """
         rel = self.state_dir_relpath()
         if rel is None:
@@ -327,7 +384,8 @@ class LocalWorkspace:
             )
         directory = root / rel
         try:
-            names = sorted(entry.name for entry in os.scandir(directory))
+            with os.scandir(directory) as it:
+                entries = sorted(it, key=lambda e: e.name)
         except FileNotFoundError:
             return  # not created yet: the run will create it and own it
         except NotADirectoryError:
@@ -339,7 +397,23 @@ class LocalWorkspace:
             raise ConfigurationError(
                 f"cannot inspect the state directory {directory}: {exc}"
             ) from exc
-        foreign = [n for n in names if not is_runtime_artifact(n)]
+        wrong_kind = [
+            f"{entry.name} ({problem})"
+            for entry in entries
+            if is_runtime_artifact(entry.name) and (problem := _state_entry_problem(entry))
+        ]
+        if wrong_kind:
+            raise ConfigurationError(
+                f"the state directory {directory} holds an entry AutoForge did not create: "
+                + ", ".join(wrong_kind)
+                + ". A runtime name is evidence of authorship, not proof of it, so local "
+                "mode also requires each excluded entry to be what it claims: 'logs' a real "
+                "directory the controller writes run logs into, everything else a regular "
+                "file. A link there would send controller writes outside the checkout and "
+                "exclude a path whose real content lives somewhere else entirely. Move the "
+                "entry aside, or use a state directory outside the repository."
+            )
+        foreign = [entry.name for entry in entries if not is_runtime_artifact(entry.name)]
         if foreign:
             listed = ", ".join(foreign[:10]) + ("..." if len(foreign) > 10 else "")
             raise ConfigurationError(
@@ -370,9 +444,8 @@ class LocalWorkspace:
         for code, path in self._porcelain():
             if any(path.startswith(prefix) for prefix in excluded):
                 continue
-            entries.append(
-                WorkspaceEntry(path=path, code=code, digest=self._digest(root / path, path))
-            )
+            mode, digest = self._inspect(root / path, path)
+            entries.append(WorkspaceEntry(path=path, code=code, digest=digest, mode=mode))
         entries.sort(key=lambda e: e.path)
         return WorkspaceStatus(
             root=root,
@@ -417,8 +490,8 @@ class LocalWorkspace:
         return out
 
     @staticmethod
-    def _digest(path: Path, rel: str) -> str:
-        """SHA-256 of a changed working-tree path. Fails closed, never guesses.
+    def _inspect(path: Path, rel: str) -> tuple[str, str]:
+        """Mode + SHA-256 of a changed working-tree path. Fails closed, never guesses.
 
         Content is hashed regardless of file size. An earlier revision fell
         back to ``(size, mtime_ns)`` above a threshold to keep the cost
@@ -438,12 +511,20 @@ class LocalWorkspace:
         Absence is the one non-hash value kept: a deleted or renamed-away path
         is a fact ``git status`` reported and ``lstat`` confirms, not a failure
         to observe one.
+
+        The permission bits come from the same ``lstat`` as the content, so
+        the pair describes one observation of one entry rather than two
+        observations that could straddle a change. They are part of the
+        binding because they are part of the working tree: whether a script
+        is executable decides what a validation command does with it, and on
+        a file that is already dirty a mode change moves neither the content
+        digest nor the porcelain status code.
         """
         try:
             st = os.lstat(path)
         except FileNotFoundError:
             # A deleted (or renamed-away) path: absence is part of the state.
-            return "absent"
+            return "-", "absent"
         except OSError as exc:
             raise VerificationError(_unbindable(rel, f"cannot be inspected ({exc})")) from exc
         if stat.S_ISLNK(st.st_mode):
@@ -453,7 +534,9 @@ class LocalWorkspace:
                 raise VerificationError(
                     _unbindable(rel, f"is a symbolic link whose target cannot be read ({exc})")
                 ) from exc
-            return "symlink:" + hash_bytes(target.encode("utf-8", "surrogateescape"))
+            # A symbolic link's own permission bits are not meaningful (and not
+            # portable); the target it points at is the whole of its content.
+            return "lnk", "symlink:" + hash_bytes(target.encode("utf-8", "surrogateescape"))
         if stat.S_ISDIR(st.st_mode):
             raise VerificationError(
                 _unbindable(
@@ -481,18 +564,20 @@ class LocalWorkspace:
                     h.update(chunk)
         except OSError as exc:
             raise VerificationError(_unbindable(rel, f"cannot be read ({exc})")) from exc
-        return h.hexdigest()
+        return f"{stat.S_IMODE(st.st_mode):04o}", h.hexdigest()
 
     @staticmethod
     def _fingerprint(head_sha: str, branch: str, entries: list[WorkspaceEntry]) -> str:
         h = hashlib.sha256()
-        h.update(b"autoforge-workspace-v2\n")
+        h.update(b"autoforge-workspace-v3\n")
         h.update(f"HEAD:{head_sha or '(unborn)'}\n".encode())
         h.update(f"BRANCH:{branch or '(detached)'}\n".encode("utf-8", "surrogateescape"))
         for e in sorted(entries, key=lambda x: x.path):
             h.update(e.code.encode("utf-8", "surrogateescape"))
             h.update(b"\0")
             h.update(e.path.encode("utf-8", "surrogateescape"))
+            h.update(b"\0")
+            h.update(e.mode.encode())
             h.update(b"\0")
             h.update(e.digest.encode())
             h.update(b"\n")

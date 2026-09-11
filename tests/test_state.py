@@ -350,6 +350,27 @@ def test_quarantine_unlink_failure_leaves_original_and_drops_reservation(tmp_pat
     assert [q.name for q in tmp_path.iterdir()] == ["state.json"]
 
 
+def test_a_run_id_that_is_a_path_is_corrupt_state(tmp_path):
+    """R3-F2: `run_id` names `<state_dir>/logs/<run_id>`, so it is a write path.
+
+    Loading only checked that it was non-empty, so a hand-edited or truncated
+    state carrying "../escape" was accepted and every log artifact of the run
+    was then written outside the state directory. A state file that cannot be
+    turned into a path fails loudly here, naming the state file, rather than
+    silently relocating the controller's own audit trail.
+    """
+    p = tmp_path / "state.json"
+    for bad in ("../escape", "/absolute", "sub/dir", "..", "."):
+        data = make_state().to_dict()
+        data["run_id"] = bad
+        p.write_text(json.dumps(data), encoding="utf-8")
+        with pytest.raises(StateError, match="invalid run_id"):
+            load_state(p)
+    # A generated identifier still round-trips.
+    save_state(make_state(run_id="af-20260101T000000Z-abc123"), p)
+    assert load_state(p).run_id == "af-20260101T000000Z-abc123"
+
+
 def test_load_dangling_symlink_is_corrupt_state(tmp_path):
     """R4-F2: a dangling state.json symlink is an existing (unreadable) entry, not 'no state'."""
     import os
