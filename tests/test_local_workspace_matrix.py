@@ -415,6 +415,27 @@ def test_the_cost_bounds_fail_closed_rather_than_hashing_less(tmp_path):
     assert "local.max_workspace_entries" in str(exc.value)
 
 
+def test_snapshot_refuses_a_file_that_grows_during_hashing(tmp_path, monkeypatch):
+    from autoforge import local_workspace as workspace_mod
+
+    root = base_repo(tmp_path / "repo")
+    real_open = workspace_mod.open_regular_at
+    grown = False
+
+    def open_then_grow(dir_fd, name, flags, **kwargs):
+        nonlocal grown
+        fd = real_open(dir_fd, name, flags, **kwargs)
+        if kwargs.get("where") == "src/app.py" and not grown:
+            grown = True
+            with (root / "src" / "app.py").open("ab") as app:
+                app.write(b"changed while reading\n")
+        return fd
+
+    monkeypatch.setattr(workspace_mod, "open_regular_at", open_then_grow)
+    with pytest.raises(VerificationError, match="grew or shrank"):
+        LocalWorkspace(workdir=root).snapshot()
+
+
 @pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses file permissions")
 def test_an_executable_bit_survives_a_round_trip_through_the_fingerprint(tmp_path):
     """Mode is metadata, and metadata that is bound must be bound exactly."""

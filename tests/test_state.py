@@ -5,7 +5,7 @@ import json
 import pytest
 
 from autoforge.errors import StateError
-from autoforge.state import AutoForgeState, load_state, save_state
+from autoforge.state import AutoForgeState, StatePaths, load_state, save_state
 from autoforge.transitions import Phase
 
 
@@ -98,6 +98,25 @@ def test_load_rejects_non_list_next_issue_rejections(tmp_path):
     d["next_issue_rejections"] = "oops"
     p.write_text(json.dumps(d), encoding="utf-8")
     with pytest.raises(StateError, match="next_issue_rejections"):
+        load_state(p)
+
+
+@pytest.mark.parametrize(
+    ("field", "bad"),
+    [
+        ("counted_merged_prs", [1]),
+        ("open_findings", [1]),
+        ("last_fix_resolutions", [1]),
+        ("next_issue_rejections", [1]),
+        ("superseded_prs", [1]),
+    ],
+)
+def test_load_rejects_wrong_list_element_types(tmp_path, field, bad):
+    p = tmp_path / "state.json"
+    data = make_state().to_dict()
+    data[field] = bad
+    p.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(StateError, match=field):
         load_state(p)
 
 
@@ -352,6 +371,32 @@ def test_quarantine_unlink_failure_leaves_original_and_drops_reservation(tmp_pat
     assert [q.name for q in tmp_path.iterdir()] == ["state.json"]
 
 
+def test_quarantine_refuses_a_source_replaced_after_reservation(tmp_path, monkeypatch):
+    import os
+
+    from autoforge.state import quarantine_state_file
+
+    p = tmp_path / "state.json"
+    p.write_text("corrupt", encoding="utf-8")
+    real_link = os.link
+    replaced = False
+
+    def racing_link(src, dst, *args, **kwargs):
+        nonlocal replaced
+        result = real_link(src, dst, *args, **kwargs)
+        if not replaced:
+            replaced = True
+            p.unlink()
+            p.write_text("fresh state", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(os, "link", racing_link)
+    with pytest.raises(StateError, match="changed while being quarantined"):
+        quarantine_state_file(p)
+    assert p.read_text(encoding="utf-8") == "fresh state"
+    assert [q.name for q in tmp_path.iterdir()] == ["state.json"]
+
+
 def test_a_run_id_that_is_a_path_is_corrupt_state(tmp_path):
     """R3-F2: `run_id` names `<state_dir>/logs/<run_id>`, so it is a write path.
 
@@ -569,7 +614,7 @@ def test_save_state_fsyncs_the_directory_entry_after_the_rename(tmp_path, monkey
 
     p = tmp_path / "run" / "state.json"
     save_state(make_state(), p)
-    assert len(synced) == 2, "the temp file and its directory must both be flushed"
+    assert len(synced) >= 2, "the temp file and its directory must both be flushed"
     assert load_state(p).run_id == "af-test-1"
 
     # Best effort: a filesystem that cannot fsync a directory must not fail the
@@ -585,3 +630,32 @@ def test_save_state_fsyncs_the_directory_entry_after_the_rename(tmp_path, monkey
     save_state(make_state(review_round=4), p)
     assert load_state(p).review_round == 4
     assert state_mod is not None  # the module under test, imported above
+
+
+def test_save_state_does_not_swallow_fatal_directory_fsync(tmp_path, monkeypatch):
+    import os
+    import stat as stat_mod
+
+    p = tmp_path / "state.json"
+    save_state(make_state(), p)
+    real_fsync = os.fsync
+
+    def failing_fsync(fd):
+        if stat_mod.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(5, "I/O error")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", failing_fsync)
+    with pytest.raises(OSError, match="I/O error"):
+        save_state(make_state(review_round=4), p)
+
+
+def test_state_paths_reject_a_normal_directory_replacement(tmp_path):
+    paths = StatePaths.from_state_dir(tmp_path / "state")
+    with paths.open_root(create=True):
+        pass
+    moved = tmp_path / "moved"
+    (tmp_path / "state").rename(moved)
+    (tmp_path / "state").mkdir()
+    with pytest.raises(StateError, match="state directory .* replaced"):
+        paths.open_root()

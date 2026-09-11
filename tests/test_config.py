@@ -472,3 +472,65 @@ def test_a_positive_default_timeout_is_still_accepted(tmp_path):
     p = tmp_path / "cfg.json"
     p.write_text('{"version": 1, "execution": {"default_timeout_seconds": 1}}', encoding="utf-8")
     assert load_config_file(p).execution.default_timeout_seconds == 1
+
+
+# -- the `local:` block ---------------------------------------------------------
+def _local_cfg(tmp_path, local: dict):
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps({"version": 1, "local": local}), encoding="utf-8")
+    return load_config_file(p)
+
+
+def test_local_defaults_are_the_documented_ones():
+    local = default_config().local
+    assert local.feature_dir == "features"
+    assert local.max_fix_rounds == 1
+    assert local.validation_commands == []
+    assert local.exclude == []
+    assert local.max_workspace_entries == 50_000
+    assert local.max_workspace_bytes == 512 * 1024 * 1024
+
+
+def test_local_exclude_is_normalized_deduplicated_and_sorted(tmp_path):
+    """The list is hashed into the fingerprint and frozen with the run, so two
+    spellings of one policy have to reduce to one text."""
+    cfg = _local_cfg(tmp_path, {"exclude": ["build/", ".venv", "build", "/target/"]})
+    assert cfg.local.exclude == [".venv", "build", "target"]
+
+
+@pytest.mark.parametrize(
+    ("local", "match"),
+    [
+        ({"exclude": ".venv"}, "must be a list"),
+        ({"exclude": [".venv", 7]}, "must be a string"),
+        ({"exclude": [""]}, "must not be empty"),
+        ({"exclude": ["../outside"]}, "may not contain"),
+        ({"exclude": ["a/./b"]}, "may not contain"),
+        ({"feature_dir": "   "}, "must not be empty"),
+        ({"max_fix_rounds": -1}, "must be >= 0"),
+        ({"max_workspace_entries": 0}, "must be >= 1"),
+        ({"max_workspace_bytes": 0}, "must be >= 1"),
+        ({"validation_commands": ["uv run pytest"]}, "validation_commands"),
+        ({"validation_commands": [[]]}, "validation_commands"),
+    ],
+)
+def test_local_block_rejects_unusable_values(tmp_path, local, match):
+    with pytest.raises(ConfigurationError, match=match):
+        _local_cfg(tmp_path, local)
+
+
+def test_local_validation_commands_stay_argv_arrays(tmp_path):
+    cfg = _local_cfg(
+        tmp_path, {"validation_commands": [["uv", "run", "pytest", "-q"], ["./gradlew", "test"]]}
+    )
+    assert cfg.local.validation_commands == [
+        ["uv", "run", "pytest", "-q"],
+        ["./gradlew", "test"],
+    ]
+
+
+def test_a_non_mapping_local_block_is_refused(tmp_path):
+    p = tmp_path / "cfg.json"
+    p.write_text('{"version": 1, "local": ["features"]}', encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="'local' must be a mapping"):
+        load_config_file(p)

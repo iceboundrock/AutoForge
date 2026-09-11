@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 
 from autoforge.config import default_config
-from autoforge.errors import ConfigurationError, VerificationError
+from autoforge.errors import ConfigurationError, StateError, VerificationError
 from autoforge.local_workspace import KIND_EXCLUDED, LocalWorkspace, init_feature_file
 from autoforge.safefs import SafeRoot, UnsafePathError
 
@@ -479,3 +479,67 @@ def _is_inside(path: Path, root: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+# -- 18 ------------------------------------------------------------------------
+def test_a_state_directory_replaced_by_an_ordinary_directory_redirects_nothing(tmp_path):
+    """Invariant R, again: a link is not the only way to re-point a name.
+
+    R6-F1. Attack 17 is defeated by `O_NOFOLLOW`, which is a statement about
+    *symbolic links* — so the same attack with a prepared ordinary directory
+    moved into the name passed every check: it is a real directory, it is not
+    a link, and `open_root()` resolved the pathname afresh for each write.
+    The controller's next checkpoint and its logs landed in an inode the
+    controller never created, which a `mount --bind` or a rename can put
+    anywhere on the machine.
+
+    The fix is the one the descriptor was always standing in for: the state
+    root's pathname is bound to its *inode* at first open, and every later
+    open must still reach that inode.
+    """
+    from .conftest import make_local_engine
+    from .test_local import IMPL_FILE, impl_result, local_repo, review_result, scripted
+
+    # The repository is a subdirectory so the planted directory is genuinely
+    # outside the reviewed tree rather than merely somewhere the walk ignores.
+    root = local_repo(tmp_path / "repo")
+    # A prepared ordinary directory somewhere else entirely, with a sentinel
+    # so "nothing reached it" is checked as bytes, not as an absent exception.
+    planted = Path(tmp_path) / "planted"
+    planted.mkdir()
+    sentinel = planted / "notes.txt"
+    sentinel.write_text("operator's own file\n", encoding="utf-8")
+    before = sentinel.stat()
+
+    eng = make_local_engine(root, root / "features" / "add-filter.md", cfg=default_config())
+    state_dir = Path(eng.paths.state_dir)
+
+    def implement_then_swap(r):
+        (r / IMPL_FILE).write_text("def main():\n    return 1\n", encoding="utf-8")
+        # The agent's phase is over; the controller has yet to log it.
+        shutil.rmtree(state_dir)
+        os.rename(planted, state_dir)
+
+    eng.provider._handler = scripted(
+        eng,
+        root,
+        [
+            (implement_then_swap, lambda e: impl_result()),
+            (None, lambda e: review_result(e.state.workspace_fingerprint)),
+        ],
+    )
+    with pytest.raises(StateError, match="state directory .* replaced"):
+        eng.run(max_steps=6, dry_run=False, allow_merge=False)
+
+    # Nothing of the controller's reached the replacement, and the operator's
+    # file inside it -- now reachable at the state path, which is the point --
+    # is byte-, inode- and mtime-identical to the one prepared elsewhere.
+    assert sorted(p.name for p in state_dir.iterdir()) == ["notes.txt"]
+    moved = state_dir / "notes.txt"
+    after = moved.stat()
+    assert moved.read_text(encoding="utf-8") == "operator's own file\n"
+    assert (after.st_dev, after.st_ino, after.st_mtime_ns) == (
+        before.st_dev,
+        before.st_ino,
+        before.st_mtime_ns,
+    )

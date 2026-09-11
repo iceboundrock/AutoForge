@@ -342,7 +342,34 @@ class LocalWorkspace:
         # key is a cache key only: it never becomes part of the fingerprint,
         # so a forged mtime can at worst cost a re-hash, never bind the wrong
         # bytes... and ctime cannot be set backwards without root at all.
-        self._digests: dict[tuple[int, int, int, int, int], str] = {}
+        self._digests: dict[tuple[int, int, int, int, int, int], str] = {}
+
+    # -- reader policy ----------------------------------------------------
+    def policy_identity(self) -> str:
+        """Canonical text of everything about this reader that shapes a snapshot.
+
+        A fingerprint binds the working tree *as this reader classifies it*,
+        so the reader's own configuration is part of what a review means: a
+        run resumed with ``local.exclude: ["src"]`` added would re-snapshot
+        with the implementation outside the bound scope, persist that
+        fingerprint, and accept a clean review of a tree nobody reviewed.
+        The fingerprint itself cannot catch that, because both sides of
+        ``reviewed_fingerprint == current_fingerprint`` are computed with the
+        *new* policy.
+
+        The whole policy is frozen, not the part that is provably unsafe to
+        change. The bounds only ever turn a snapshot into a refusal, so
+        carving them out would be sound today -- and would be one more
+        enumeration of which knobs happen to be benign, which is exactly the
+        shape of reasoning this design replaced. "The reader that bound this
+        run is the reader that keeps binding it" is the closed statement.
+
+        The text is human-readable rather than a digest so a drift message can
+        name what changed, and it is canonical (sorted, normalised patterns)
+        so two spellings of one policy compare equal.
+        """
+        patterns = ",".join(self.exclude)
+        return f"v1 exclude=[{patterns}] max_entries={self.max_entries} max_bytes={self.max_bytes}"
 
     # -- git plumbing -----------------------------------------------------
     def _git(self, argv: list[str], *, allow_failure: bool = False) -> ExecutionResult:
@@ -754,7 +781,14 @@ class LocalWorkspace:
                 )
 
     def _digest(self, dir_fd: int, name: str, relpath: str, st: os.stat_result) -> str:
-        key = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+        key = (
+            st.st_dev,
+            st.st_ino,
+            st.st_size,
+            st.st_mtime_ns,
+            st.st_ctime_ns,
+            stat.S_IMODE(st.st_mode),
+        )
         cached = self._digests.get(key)
         if cached is not None:
             return cached
@@ -770,11 +804,36 @@ class LocalWorkspace:
         h = hashlib.sha256()
         try:
             with os.fdopen(fd, "rb") as fh:
-                while True:
-                    chunk = fh.read(_CHUNK)
+                remaining = st.st_size
+                while remaining:
+                    chunk = fh.read(min(_CHUNK, remaining))
                     if not chunk:
                         break
                     h.update(chunk)
+                    remaining -= len(chunk)
+                if remaining or fh.read(1):
+                    raise _refuse(
+                        relpath,
+                        "grew or shrank while it was being read",
+                        "Something is writing the working tree while the controller is binding it; "
+                        "stop it and re-run.",
+                    )
+                final = os.fstat(fh.fileno())
+                final_key = (
+                    final.st_dev,
+                    final.st_ino,
+                    final.st_size,
+                    final.st_mtime_ns,
+                    final.st_ctime_ns,
+                    stat.S_IMODE(final.st_mode),
+                )
+                if final_key != key:
+                    raise _refuse(
+                        relpath,
+                        "changed while it was being read",
+                        "Something is writing the working tree while the controller is binding it; "
+                        "stop it and re-run.",
+                    )
         except OSError as exc:
             raise _refuse(
                 relpath, f"unreadable ({exc})", "Fix it, or add it to local.exclude."

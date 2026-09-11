@@ -115,6 +115,7 @@ from .prompts import (
     COMMON_TEMPLATE,
     LOCAL_COMMON_TEMPLATE,
     TEMPLATE_FILES,
+    fenced_untrusted_block,
     load_template,
     render,
     render_phase,
@@ -368,7 +369,12 @@ class ControllerEngine:
         return self.state.mode if self.state is not None else WorkflowMode.REMOTE
 
     def workspace(self) -> LocalWorkspace:
-        """The local working-tree reader (LOCAL mode's source of truth)."""
+        """The local working-tree reader (LOCAL mode's source of truth).
+
+        Every LOCAL snapshot is reached through here, which is why the run's
+        frozen reader policy is checked here and not at each of the call
+        sites: a snapshot cannot be added that forgets to ask.
+        """
         if self._workspace is None:
             local = self.config.local
             self._workspace = LocalWorkspace(
@@ -378,7 +384,40 @@ class ControllerEngine:
                 max_entries=local.max_workspace_entries,
                 max_bytes=local.max_workspace_bytes,
             )
+        self._check_workspace_policy(self._workspace)
         return self._workspace
+
+    def _check_workspace_policy(self, ws: LocalWorkspace) -> None:
+        """Refuse a loaded LOCAL run whose reviewed scope the config would move.
+
+        The fingerprint cannot police this by itself: a re-snapshot after a
+        config change computes the stored and the current fingerprint under
+        the *new* policy, so the two agree -- about a tree whose newly
+        excluded region no reviewer ever saw. The run therefore carries the
+        policy it was created with, and it is compared here (see
+        :meth:`autoforge.local_workspace.LocalWorkspace.policy_identity`).
+
+        This is a VerificationError, not BLOCKED: the operator changed a
+        setting, and both restoring it and starting a new run under the new
+        one must stay possible. Nothing is persisted, so the run is exactly
+        as resumable afterwards as it was before.
+        """
+        state = self.state
+        if state is None or not state.is_local:
+            return
+        recorded = state.local_workspace_policy
+        current = ws.policy_identity()
+        if recorded == current:
+            return
+        raise VerificationError(
+            "the LOCAL workspace policy changed since this run was created: the run was "
+            f"bound with {recorded!r} and the current configuration is {current!r}. A "
+            "workspace fingerprint means 'the tree as these rules classify it', so "
+            "continuing would rebind the review to a different scope -- an implementation "
+            "hidden by a new local.exclude entry would never be reviewed. Restore the "
+            "previous local.* settings to resume this run, or start a new run under the "
+            "new ones."
+        )
 
     def bind_local_state_dir(self, explicit: str | Path | None = None) -> None:
         """Point :attr:`paths` at where this LOCAL run keeps its runtime state.
@@ -437,6 +476,7 @@ class ControllerEngine:
             feature_spec_sha256=spec.sha256,
             base_head_sha=snapshot.head_sha,
             base_branch=snapshot.branch,
+            local_workspace_policy=ws.policy_identity(),
             workspace_fingerprint=snapshot.fingerprint,
             baseline_dirty_paths=dirty,
             created_at=now,
@@ -585,7 +625,7 @@ class ControllerEngine:
             "REPO_ROOT": str(self.workspace().root()),
             "FEATURE_SPEC_PATH": s.feature_spec_path,
             "FEATURE_SPEC_SHA256": s.feature_spec_sha256,
-            "FEATURE_SPEC": spec.content,
+            "FEATURE_SPEC_BLOCK": fenced_untrusted_block(spec.content, "markdown"),
             "BASE_HEAD_SHA": s.base_head_sha or "(no commit yet)",
             "BASE_BRANCH": s.base_branch or "(detached HEAD)",
             "PRIOR_ATTEMPT": self._prior_attempt_note(),

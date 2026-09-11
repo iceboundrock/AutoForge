@@ -202,6 +202,13 @@ class AutoForgeState:
     # forbidden by the prompt.
     base_head_sha: str = ""
     base_branch: str = ""
+    # The workspace reader's own configuration, frozen at run creation (see
+    # ``LocalWorkspace.policy_identity``). A fingerprint binds the tree *as
+    # the reader classifies it*, so the exclusion rules and cost bounds are
+    # part of what a review covered. Comparing fingerprints cannot detect a
+    # policy change, because a re-snapshot after the change computes both
+    # sides under the new policy; recording the policy is what closes that.
+    local_workspace_policy: str = ""
     # Workspace fingerprint the controller bound before the current review
     # (the local analogue of ``current_head_sha``).
     workspace_fingerprint: str = ""
@@ -329,7 +336,7 @@ class AutoForgeState:
         # its identity is the frozen feature specification instead.
         required = ["run_id", "created_at", "updated_at"]
         if state.mode == WorkflowMode.LOCAL:
-            required += ["feature_spec_path", "feature_spec_sha256"]
+            required += ["feature_spec_path", "feature_spec_sha256", "local_workspace_policy"]
         else:
             required += ["repository", "epic_url"]
         for req in required:
@@ -367,14 +374,22 @@ class AutoForgeState:
             isinstance(path, str) for path in state.baseline_dirty_paths
         ):
             raise StateError("state field 'baseline_dirty_paths' must be a list of strings")
-        if not isinstance(state.counted_merged_prs, list):
-            raise StateError("state field 'counted_merged_prs' must be a list")
-        if not isinstance(state.open_findings, list):
-            raise StateError("state field 'open_findings' must be a list")
-        if not isinstance(state.last_fix_resolutions, list):
-            raise StateError("state field 'last_fix_resolutions' must be a list")
-        if not isinstance(state.next_issue_rejections, list):
-            raise StateError("state field 'next_issue_rejections' must be a list")
+        if not isinstance(state.counted_merged_prs, list) or not all(
+            isinstance(url, str) for url in state.counted_merged_prs
+        ):
+            raise StateError("state field 'counted_merged_prs' must be a list of strings")
+        if not isinstance(state.open_findings, list) or not all(
+            isinstance(finding, dict) for finding in state.open_findings
+        ):
+            raise StateError("state field 'open_findings' must be a list of objects")
+        if not isinstance(state.last_fix_resolutions, list) or not all(
+            isinstance(resolution, dict) for resolution in state.last_fix_resolutions
+        ):
+            raise StateError("state field 'last_fix_resolutions' must be a list of objects")
+        if not isinstance(state.next_issue_rejections, list) or not all(
+            isinstance(reason, str) for reason in state.next_issue_rejections
+        ):
+            raise StateError("state field 'next_issue_rejections' must be a list of strings")
         try:
             validate_review_history(state.review_history)
         except StateError as exc:
@@ -383,8 +398,10 @@ class AutoForgeState:
             isinstance(reason, str) for reason in state.verification_failures
         ):
             raise StateError("state field 'verification_failures' must be a list of strings")
-        if not isinstance(state.superseded_prs, list):
-            raise StateError("state field 'superseded_prs' must be a list")
+        if not isinstance(state.superseded_prs, list) or not all(
+            isinstance(item, dict) for item in state.superseded_prs
+        ):
+            raise StateError("state field 'superseded_prs' must be a list of objects")
         if not isinstance(state.replan_transaction, dict):
             raise StateError("state field 'replan_transaction' must be an object")
         for name in _MINIMUM_ONE_FIELDS:
@@ -498,6 +515,9 @@ class StatePaths:
     logs_dir: Path
     anchor: Path
     relative: tuple[str, ...]
+    _expected_identity: tuple[int, int] | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     @classmethod
     def from_state_dir(
@@ -525,14 +545,34 @@ class StatePaths:
         )
 
     def open_root(self, *, create: bool = True) -> SafeRoot:
-        """Open the state directory as a capability (the caller closes it)."""
+        """Open the state directory as a capability (the caller closes it).
+
+        The first open binds the pathname to its directory inode. Later opens
+        are checked against that binding so an agent cannot replace the state
+        directory with another ordinary directory and redirect a subsequent
+        checkpoint or log write.
+        """
         root = SafeRoot.open(self.anchor, create=create)
         if not self.relative:
-            return root
+            candidate = root
+        else:
+            try:
+                candidate = root.subroot("/".join(self.relative), create=create)
+            finally:
+                root.close()
         try:
-            return root.subroot("/".join(self.relative), create=create)
-        finally:
-            root.close()
+            expected = self._expected_identity
+            if expected is None:
+                object.__setattr__(self, "_expected_identity", candidate.identity)
+            elif candidate.identity != expected:
+                raise StateError(
+                    f"state directory {self.state_dir} was replaced while the controller was "
+                    "running; refusing to continue against a different directory"
+                )
+            return candidate
+        except BaseException:
+            candidate.close()
+            raise
 
 
 # -- persistence ----------------------------------------------------------
@@ -680,6 +720,7 @@ def quarantine_state_file(path: str | Path, *, root: SafeRoot | None = None) -> 
                 f"cannot move corrupted state file {src} aside: it is a directory; "
                 "move it out of the way by hand and re-run"
             )
+        source_identity = (st.st_dev, st.st_ino, st.st_mode)
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         base = f"{name}{CORRUPT_SUFFIX}{stamp}"
         candidate = base
@@ -689,6 +730,19 @@ def quarantine_state_file(path: str | Path, *, root: SafeRoot | None = None) -> 
             except FileExistsError:
                 candidate = f"{base}.{n}"
                 continue
+            current = fs.lstat(name)
+            current_identity = (
+                None if current is None else (current.st_dev, current.st_ino, current.st_mode)
+            )
+            if current_identity != source_identity:
+                try:
+                    fs.unlink(candidate)
+                except StateError:  # pragma: no cover - cleanup best effort
+                    pass
+                raise StateError(
+                    f"cannot move corrupted state file {src} aside: it changed while being "
+                    "quarantined; refusing to remove the replacement"
+                )
             try:
                 fs.unlink(name)
             except StateError as exc:

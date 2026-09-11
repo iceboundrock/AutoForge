@@ -44,6 +44,30 @@ COMMON_TEMPLATE = "common.md"
 LOCAL_COMMON_TEMPLATE = "local_common.md"
 
 
+_BACKTICK_RUN_RE = re.compile(r"`+")
+
+
+def fenced_untrusted_block(content: str, info: str = "") -> str:
+    """Quote untrusted text in a fence that nothing inside it can close.
+
+    A fixed ``` fence made the quoting itself the injection vector: a feature
+    specification containing a ``` line ended the block, and every line after
+    it read as prompt structure the *controller* had written. CommonMark
+    closes a fenced block only on a backtick run at least as long as the
+    opening one, so a fence longer than the longest run in the content cannot
+    be terminated early -- by any content, without enumerating what content
+    might do.
+
+    This is delimiter safety, not a trust boundary on its own: the prose
+    around the block is what says the quoted text is data. The two are
+    complementary, and neither is load-bearing without the other.
+    """
+    longest = max((len(m.group(0)) for m in _BACKTICK_RUN_RE.finditer(content)), default=0)
+    fence = "`" * max(3, longest + 1)
+    body = content if content.endswith("\n") else content + "\n"
+    return f"{fence}{info}\n{body}{fence}"
+
+
 def prompts_dir() -> Path:
     return Path(__file__).parent
 

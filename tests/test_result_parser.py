@@ -232,3 +232,53 @@ def test_fix_resolution_rules():
         FixResult.from_payload(
             dict(base, resolutions=[{"finding_id": "R1-F1", "resolution": "fixed"}] * 2)
         )
+
+
+# -- R6-F3: optional free-text fields are validated, never coerced ------------
+@pytest.mark.parametrize("bad", [1, 1.5, True, ["x"], {"a": 1}])
+def test_finding_optional_text_fields_reject_non_strings(bad):
+    """`str(...)` turned a schema violation into content.
+
+    A number, list or object in `title`/`location` used to be stringified and
+    then persisted, rendered into the next FIX prompt, and shown to a human as
+    if the agent had written it. The field is a string or it is absent.
+    """
+    base = dict(GOOD_REVIEW, needs_fix_round=True)
+    for field_name in ("title", "location"):
+        payload = dict(_finding(1, 1))
+        payload[field_name] = bad
+        with pytest.raises(ControlResultValidationError, match=field_name):
+            ReviewResult.from_payload(dict(base, findings=[payload]))
+
+
+def test_finding_optional_text_fields_accept_absent_null_and_strings():
+    base = dict(GOOD_REVIEW, needs_fix_round=True)
+    absent = ReviewResult.from_payload(dict(base, findings=[_finding(1, 1)]))
+    assert absent.findings[0].title == "" and absent.findings[0].location == ""
+    nulled = ReviewResult.from_payload(
+        dict(base, findings=[dict(_finding(1, 1), title=None, location=None)])
+    )
+    assert nulled.findings[0].title == "" and nulled.findings[0].location == ""
+    given = ReviewResult.from_payload(
+        dict(base, findings=[dict(_finding(1, 1), title=" t ", location=" src/a.py:1 ")])
+    )
+    assert given.findings[0].title == "t" and given.findings[0].location == "src/a.py:1"
+
+
+@pytest.mark.parametrize("key", ["rationale", "follow_up_issue_url", "commit_sha"])
+@pytest.mark.parametrize("bad", [1, ["x"], {"a": 1}])
+def test_remote_fix_optional_text_fields_reject_non_strings(key, bad):
+    base = {"phase": "FIX", "status": "success", "previous_head_sha": SHA_A, "new_head_sha": SHA_B}
+    resolution = {"finding_id": "R1-F1", "resolution": "fixed", key: bad}
+    with pytest.raises(ControlResultValidationError, match=key):
+        FixResult.from_payload(dict(base, resolutions=[resolution]))
+
+
+@pytest.mark.parametrize("bad", [1, ["x"], {"a": 1}])
+def test_local_fix_rationale_rejects_non_strings(bad):
+    from autoforge.result_parser import LocalFixResult
+
+    with pytest.raises(ControlResultValidationError, match="rationale"):
+        LocalFixResult.from_payload(
+            {"resolutions": [{"finding_id": "R1-F1", "resolution": "fixed", "rationale": bad}]}
+        )

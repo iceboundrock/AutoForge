@@ -44,6 +44,25 @@ def test_runlog_layout_and_redaction(tmp_path):
     assert d2.name == "002-fix-2"
 
 
+def test_runlog_recovers_sequence_from_record_and_step_names(tmp_path):
+    log_dir = tmp_path / "logs" / "run-1"
+    log_dir.mkdir(parents=True)
+    (log_dir / "events.jsonl").write_text('{"seq": 7}\n', encoding="utf-8")
+    (log_dir / "011-review-1").mkdir()
+
+    log = RunLogger(tmp_path / "logs", "run-1")
+    step = log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="FIX"))
+    assert step.name == "012-fix-1"
+
+
+def test_runlog_rejects_a_corrupt_event_journal(tmp_path):
+    run_dir = tmp_path / "logs" / "run-1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "events.jsonl").write_text("not-json\n", encoding="utf-8")
+    with pytest.raises(StateError, match="corrupted event journal"):
+        RunLogger(tmp_path / "logs", "run-1")
+
+
 # -- R3-F1: the log tree is never followed anywhere ---------------------------
 def test_a_logs_symlink_never_redirects_controller_writes(tmp_path):
     """A `logs` symlink put every artifact of the run outside the checkout.
@@ -90,11 +109,10 @@ def test_a_symlinked_step_artifact_is_replaced_not_written_through(tmp_path):
     """
     outside = tmp_path / "outside"
     outside.mkdir()
+    log = RunLogger(tmp_path / "logs", "run-1")
     step = tmp_path / "logs" / "run-1" / "001-review-1"
     step.mkdir(parents=True)
     (step / "stdout.log").symlink_to(outside / "leak.log")
-
-    log = RunLogger(tmp_path / "logs", "run-1")
     log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="REVIEW"), stdout="out")
 
     assert not (outside / "leak.log").exists(), "the link target must never be created"
@@ -210,14 +228,14 @@ def test_a_write_never_lands_on_a_hard_link_and_never_truncates_first(tmp_path):
     assert artifact.stat().st_nlink == 1
 
 
-def test_a_hard_linked_events_journal_is_refused_before_it_is_appended_to(tmp_path):
+def test_a_hard_linked_events_journal_is_replaced_before_it_is_appended_to(tmp_path):
     outside = tmp_path / "notes.txt"
     outside.write_text("mine\n", encoding="utf-8")
     log = RunLogger(tmp_path / "logs", "run-1")
     os.link(outside, log.events_path)
-    with pytest.raises(StateError, match="hard link"):
-        log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="REVIEW"))
+    log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="REVIEW"))
     assert outside.read_text(encoding="utf-8") == "mine\n"
+    assert log.events_path.stat().st_nlink == 1
 
 
 def test_a_rewritten_artifact_never_keeps_a_tail_of_the_old_one(tmp_path):

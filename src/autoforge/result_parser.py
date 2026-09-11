@@ -128,6 +128,27 @@ def _req_str(payload: dict, key: str, phase: str) -> str:
     return stripped
 
 
+def _opt_str(payload: dict, key: str, phase: str) -> str:
+    """An optional free-text field: absent, JSON ``null``, or a string.
+
+    Never ``str(...)``. Coercion made a number, a list or an object into a
+    *successful* result whose text the controller then persisted and rendered
+    back into a prompt, so a schema violation arrived as content instead of as
+    a rejection. ``null`` is JSON's other spelling of "absent" and is treated
+    as such (the same rule :func:`_opt_str_list` already applies); anything
+    else is the protocol violation it looks like.
+    """
+    raw = payload.get(key)
+    if raw is None:
+        return ""
+    if not isinstance(raw, str):
+        raise ControlResultValidationError(
+            f"{phase}: optional field {key!r} must be a string when present, got "
+            f"{type(raw).__name__}"
+        )
+    return raw.strip()
+
+
 def _req_sha(payload: dict, key: str, phase: str) -> str:
     v = _req_str(payload, key, phase)
     if not _SHA_RE.match(v):
@@ -215,8 +236,8 @@ class Finding:
             id=fid,
             classification=cls_,
             required_resolution=_req_str(raw, "required_resolution", ph),
-            title=str(raw.get("title", "") or ""),
-            location=str(raw.get("location", "") or ""),
+            title=_opt_str(raw, "title", ph),
+            location=_opt_str(raw, "location", ph),
         )
 
     def to_dict(self) -> dict:
@@ -290,8 +311,8 @@ class FindingResolution:
             raise ControlResultValidationError(
                 f"{ph}: resolution for {fid} must be one of {FIX_RESOLUTIONS}, got {res!r}"
             )
-        rationale = str(raw.get("rationale", "") or "").strip()
-        follow_up = str(raw.get("follow_up_issue_url", "") or "").strip()
+        rationale = _opt_str(raw, "rationale", ph)
+        follow_up = _opt_str(raw, "follow_up_issue_url", ph)
         if res == "no_change_with_rationale":
             if len(rationale) < MIN_RATIONALE_CHARS:
                 raise ControlResultValidationError(
@@ -311,7 +332,7 @@ class FindingResolution:
             resolution=res,
             rationale=rationale,
             follow_up_issue_url=follow_up,
-            commit_sha=str(raw.get("commit_sha", "") or ""),
+            commit_sha=_opt_str(raw, "commit_sha", ph),
         )
 
     def to_dict(self) -> dict:
@@ -584,7 +605,7 @@ class LocalFindingResolution:
                     else ""
                 )
             )
-        rationale = str(raw.get("rationale", "") or "").strip()
+        rationale = _opt_str(raw, "rationale", ph)
         # Both non-fix dispositions are only acceptable with real reasoning:
         # "won't fix" and "couldn't fix" are decisions a human has to judge.
         if res in ("no_change_with_rationale", "unresolved") and len(rationale) < (

@@ -148,9 +148,38 @@ class RunLogger:
 
     def _existing_event_count(self, logs: SafeRoot) -> int:
         content = logs.read_text(f"{self.run_id}/events.jsonl")
-        if content is None:
-            return 0
-        return sum(1 for line in content.splitlines() if line.strip())
+        highest = 0
+        if content is not None:
+            for line_number, line in enumerate(content.splitlines(), 1):
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise StateError(
+                        f"corrupted event journal for run {self.run_id}: line {line_number} "
+                        f"is not valid JSON ({exc})"
+                    ) from exc
+                seq = record.get("seq") if isinstance(record, dict) else None
+                if not isinstance(seq, int) or isinstance(seq, bool) or seq < 1:
+                    raise StateError(
+                        f"corrupted event journal for run {self.run_id}: line {line_number} "
+                        "has no positive integer seq"
+                    )
+                highest = max(highest, seq)
+
+        # A crash can publish a step directory before its journal line. Use
+        # those names too, or the next invocation could reuse the directory
+        # and overwrite a completed execution's artifacts.
+        prefix = f"{self.run_id}/"
+        for entry in logs.walk():
+            if not entry.relpath.startswith(prefix):
+                continue
+            step_name = entry.relpath[len(prefix) :].split("/", 1)[0]
+            match = re.match(r"^(\d+)-", step_name)
+            if match:
+                highest = max(highest, int(match.group(1)))
+        return highest
 
     def _step_name(self, seq: int, phase: str, attempt: int) -> str:
         safe_phase = re.sub(r"[^a-z0-9._-]", "-", phase.lower()) or "unknown"

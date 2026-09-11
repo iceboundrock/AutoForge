@@ -414,8 +414,10 @@ class SafeRoot:
         try:
             for depth, part in enumerate(parts):
                 if create:
+                    made = False
                     try:
                         os.mkdir(part, 0o700, dir_fd=fd)
+                        made = True
                     except FileExistsError:
                         pass
                     except OSError as exc:
@@ -423,6 +425,8 @@ class SafeRoot:
                         raise StateError(
                             f"cannot create controller directory {where}: {exc}"
                         ) from exc
+                    if made:
+                        _fsync_fd(fd)
                 try:
                     nxt = os.open(part, _DIR_OPEN_FLAGS, dir_fd=fd)
                 except FileNotFoundError:
@@ -535,19 +539,37 @@ class SafeRoot:
             os.close(parent)
 
     def append_text(self, relpath: str, text: str, *, mode: int = 0o600) -> None:
-        """Append to ``relpath``, creating it if needed."""
+        """Append to ``relpath`` by replacing its name, creating it if needed.
+
+        Appending through an opened inode would leave a hard-link race between
+        the link-count check and the write. Reading the old bytes and publishing
+        a fresh inode keeps a second name, planted at any point in the window,
+        untouched.
+        """
         parts = split_relpath(relpath)
         parent = self._parent_of(parts, create=True)
         try:
-            fd = open_regular_at(
+            existing = b""
+            existing_mode = mode
+            try:
+                fd = open_regular_at(parent, parts[-1], os.O_RDONLY, where=self._describe(parts))
+            except FileNotFoundError:
+                pass
+            else:
+                try:
+                    existing_mode = stat.S_IMODE(os.fstat(fd).st_mode)
+                except BaseException:
+                    os.close(fd)
+                    raise
+                with os.fdopen(fd, "rb") as fh:
+                    existing = fh.read()
+            self._replace_at(
                 parent,
                 parts[-1],
-                os.O_WRONLY | os.O_CREAT | os.O_APPEND,
-                mode=mode,
+                existing + text.encode("utf-8"),
+                mode=existing_mode,
                 where=self._describe(parts),
             )
-            with os.fdopen(fd, "a", encoding="utf-8") as fh:
-                fh.write(text)
         finally:
             os.close(parent)
 
@@ -739,19 +761,48 @@ def _mkdir_tree(p: Path) -> None:
     is created through :meth:`SafeRoot.ensure_dir`, which is
     descriptor-relative.
     """
+    missing: list[Path] = []
+    current = p
+    while not current.exists():
+        missing.append(current)
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
     try:
         os.makedirs(p, 0o700, exist_ok=True)
+        for created in missing:
+            _fsync_path(created)
+            _fsync_path(created.parent)
     except OSError as exc:
-        raise StateError(f"cannot create controller root {p}: {exc}") from exc
+        raise StateError(f"cannot create or durably publish controller root {p}: {exc}") from exc
+
+
+def _fsync_path(path: Path) -> None:
+    fd = os.open(path, _DIR_OPEN_FLAGS & ~_O_NOFOLLOW)
+    try:
+        _fsync_fd(fd)
+    finally:
+        os.close(fd)
 
 
 def _fsync_fd(fd: int) -> None:
     try:
         os.fsync(fd)
-    except OSError:
-        # Directory fsync is unsupported on some filesystems; the replace
-        # itself is still atomic, only its durability is weaker.
-        pass
+    except OSError as exc:
+        # Some filesystems reject fsync on directories. That is a weaker
+        # durability guarantee, not a reason to fail a write. I/O, space and
+        # permission failures are different: reporting success after one of
+        # those would lose a checkpoint while the caller believes it durable.
+        unsupported = {
+            errno.EINVAL,
+            errno.ENOSYS,
+            getattr(errno, "ENOTSUP", errno.EINVAL),
+            getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+        }
+        if exc.errno in unsupported:
+            return
+        raise
 
 
 def _quiet_unlink(dir_fd: int, name: str) -> None:

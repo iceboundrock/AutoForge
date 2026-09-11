@@ -33,6 +33,7 @@ def good_local() -> dict:
         phase=Phase.REVIEW,
         feature_spec_path="features/add-filter.md",
         feature_spec_sha256="a" * 64,
+        local_workspace_policy="v1 exclude=[] max_entries=50000 max_bytes=536870912",
         workspace_fingerprint="b" * 64,
         base_head_sha="c" * 40,
         base_branch="main",
@@ -54,6 +55,7 @@ def holds_every_invariant(s: AutoForgeState) -> None:
     if s.mode == WorkflowMode.LOCAL:
         assert s.phase in LOCAL_PHASES
         assert s.feature_spec_path and s.feature_spec_sha256
+        assert s.local_workspace_policy
         if s.local_pending_phase:
             assert Phase(s.local_pending_phase) in LOCAL_WRITE_PHASES
             assert s.local_pending_fingerprint
@@ -133,6 +135,10 @@ ILLEGAL = {
     # Losing the run's identity, which is what binds it to a feature.
     "no feature specification": {"feature_spec_path": ""},
     "no specification hash": {"feature_spec_sha256": ""},
+    # Losing the reader policy the fingerprints were computed under: without
+    # it a resume cannot tell that `local.exclude` moved the review scope.
+    "no workspace policy": {"local_workspace_policy": ""},
+    "a list where the workspace policy belongs": {"local_workspace_policy": ["v1"]},
     "no run id": {"run_id": ""},
     "a run id that is a path": {"run_id": "../elsewhere"},
     "a run id that is absolute": {"run_id": "/etc"},

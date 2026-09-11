@@ -181,6 +181,20 @@ def test_a_write_over_a_planted_entry_still_produces_the_controllers_own_file(tm
     sentinel.assert_untouched()
 
 
+def test_append_replaces_a_hard_link_instead_of_writing_the_shared_inode(tmp_path):
+    sentinel = Sentinel(tmp_path)
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    os.link(sentinel.path, root_dir / "events.jsonl")
+
+    with SafeRoot.open(root_dir) as root:
+        root.append_text("events.jsonl", "controller\n")
+
+    sentinel.assert_untouched()
+    assert (root_dir / "events.jsonl").read_text(encoding="utf-8") == SENTINEL + "controller\n"
+    assert (root_dir / "events.jsonl").stat().st_nlink == 1
+
+
 def test_a_directory_at_the_target_is_refused_while_a_special_entry_is_replaced(tmp_path):
     """Two different answers, because they are two different facts.
 

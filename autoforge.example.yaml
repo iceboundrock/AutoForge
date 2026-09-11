@@ -262,8 +262,16 @@ local:
   # Patterns match component-wise against repository-relative paths: `*` and
   # `?` match within one component, `**` spans any number. The list is hashed
   # into the fingerprint and named to the review agent in its prompt, so "what
-  # was not reviewed" is part of the review's identity. A run started with a
-  # different exclude list can never satisfy a review taken under this one.
+  # was not reviewed" is part of the review's identity.
+  #
+  # This whole block -- `exclude` plus the two bounds below -- is *frozen with
+  # the run*. A fingerprint means "the tree as these rules classify it", so
+  # comparing fingerprints cannot detect a rule change: a re-snapshot computes
+  # both sides under the new rules and they agree, about a tree whose newly
+  # excluded region no reviewer saw. The settings in force at `local run` are
+  # therefore recorded in the run's state, and resuming with any of them
+  # changed is refused, naming what moved. Restore them to resume, or start a
+  # new run under the new ones.
   #
   # A symbolic link *into* an excluded region is refused rather than followed:
   # its bytes are not bound, so the reviewer could read something the

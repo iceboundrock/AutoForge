@@ -5,6 +5,9 @@
 - **Base:** `main` (merge-base `316ba0365985b9c99b2d9858a8613462be960f2a`)
 - **Supersedes:** the `git status` fingerprint and the `safeio.py` pathname
   checks of review rounds 1–4
+- **Amended:** round 6 — §5.4 (state-root inode binding, R6-F1), §5.7 (the
+  reader policy is frozen with the run, R6-F2), §5.8 (delimiter-safe
+  specification quoting)
 - **Closes by design:** #46, #47, #48, #49, #50; #45 (see *Compatibility*)
 
 ## 1. Problem
@@ -40,6 +43,7 @@ means the finding was a sample of an open-ended set.
 | #45 | — | `--allow-dirty` records paths but does not pin their contents | Review binding | — | systemic |
 | #46 | — | hashing has no cost bound | Availability | — | local |
 | #47 | — | submodules/nested repos unsupported | Product guarantee | — | systemic |
+| R6-F2 | 6 | a resume with a new `local.exclude` re-bound the review to a narrower tree | Review binding | — | systemic |
 
 Every systemic row has the same cause, and it is one sentence:
 
@@ -71,6 +75,7 @@ have written", which an agent could simply write into.
 | R5-F3 | 5 | a **parent** component replaced by a symlink redirected every write | link × *parent* × all | systemic |
 | R5-F4 | 5 | `local init --force` truncated an external **hard link** target | hardlink × final × truncate | systemic |
 | #50 | — | all of the above are pathname checks, so check ≠ use | — | systemic |
+| R6-F1 | 6 | the state **root** replaced by an ordinary directory redirected state and logs | directory × *root* × all | systemic |
 
 Again one cause:
 
@@ -176,6 +181,13 @@ is closed by construction. This limit is stated in the code and pinned by a
 test (`test_the_root_pathname_is_resolved_normally_and_that_is_the_stated_limit`)
 so that no future round mistakes it for an oversight.
 
+It is a statement about the *first* resolution only, and round 6 drew the line
+more sharply (§5.4): the state root's pathname is resolved normally **once**,
+and thereafter the controller writes to the inode that resolution reached, not
+to the name. What cannot be prevented is a redirection that was already in
+place before the controller started; what is now prevented is one introduced
+while it runs.
+
 ## 3. Required invariants
 
 Stated so that each is mechanically checkable, before any code.
@@ -186,10 +198,17 @@ Stated so that each is mechanically checkable, before any code.
   covered by a rule that is itself in the fingerprint, or the snapshot does
   not exist (refusal). *There is no fourth outcome, and in particular no
   "not reported, so not seen".*
+- **P (reader policy).** A fingerprint is only meaningful relative to the
+  rules that produced it, so the classification policy in force when a run was
+  created is recorded in that run's state, and a run whose configuration no
+  longer matches it does not proceed. *Comparing two fingerprints can never
+  establish this, because both sides of the comparison are recomputed under
+  the new policy.*
 - **R (runtime writes).** Every write the controller performs resolves below a
   directory it holds an open descriptor for, follows no symbolic link at any
   component below that descriptor, and lands on an inode the controller
-  created — or fails.
+  created — or fails. The directory the descriptor is opened *on* is itself
+  bound by identity, so the root of that chain is not a pathname either.
 - **S (state).** A state object that exists satisfies every invariant of its
   mode. Illegal combinations are impossible to construct from a file, not
   merely unlikely.
@@ -311,6 +330,19 @@ file descriptor; every name below it is resolved with `dir_fd=` plus
 - a parent component that is a symbolic link cannot be traversed, closing
   R5-F3 as a property of the mechanism rather than as a new validation step.
 
+The descriptor chain has to start somewhere, and until round 6 it started at a
+*pathname*: `StatePaths.open_root()` re-resolved `<git common dir>/autoforge/
+state` for every checkpoint and every logger. `O_NOFOLLOW` says nothing about
+an ordinary directory, so an agent could `rmdir`/`rename` a directory it had
+prepared elsewhere into that name and every subsequent controller write landed
+in an inode the controller never created — R6-F1, and R5-F3's mechanism
+applied one level further up than R5-F3 looked. The fix is the one the
+descriptor was always standing in for: the first `open_root()` binds the
+pathname to its `(st_dev, st_ino)`, and a later open that reaches a different
+inode is a `StateError`, not a write. The root is now an identity like every
+name below it, so "no pathname is load-bearing in the write path" is true of
+the whole chain rather than of all of it but the first link.
+
 Whole-file artifacts are written as a fresh `O_CREAT|O_EXCL` temporary **in
 the target's own directory**, fsynced, then `os.replace(src_dir_fd=,
 dst_dir_fd=)` over the name. Two consequences follow, and both are stated as
@@ -353,6 +385,65 @@ list. The hand-written list had already missed `workspace_fingerprint`, which
 could load as `null` and reach the review binding as a value no reviewer's
 fingerprint could equal. Declaring a field's type is now the same act as
 validating it.
+
+### 5.7 The reader's own policy is part of the run
+
+§5.1 says a fingerprint binds the tree *as this reader classifies it*. That
+makes the reader's configuration — `local.exclude` and the two cost bounds —
+part of what a review covered, and round 6 showed what follows when only the
+fingerprint is persisted (R6-F2): a run resumed with `local.exclude: ["src"]`
+added re-snapshots with the implementation outside the bound scope, stores
+that fingerprint, and accepts a clean review of a tree nobody reviewed. The
+`reviewed_fingerprint == current_fingerprint` check cannot see it, because
+after the change *both sides* are computed under the new policy and agree.
+
+So the policy is frozen with the run: `new_local_run` records
+`LocalWorkspace.policy_identity()` into the state, and every LOCAL snapshot —
+reached through the single `ControllerEngine.workspace()` chokepoint, so a
+future call site cannot forget to ask — is refused when the current
+configuration no longer matches, naming what moved.
+
+Two choices inside that are worth stating:
+
+- **The whole policy is frozen, not the part that is provably unsafe to
+  change.** The cost bounds can only ever turn a snapshot into a *refusal*, so
+  exempting them would be sound today — and would be one more enumeration of
+  which knobs happen to be benign, which is the exact shape of reasoning this
+  ADR replaced. *"The reader that bound this run is the reader that keeps
+  binding it"* is the closed statement.
+- **It is a `VerificationError`, not `BLOCKED`.** The operator changed a
+  setting; restoring it and resuming, or starting a new run under the new one,
+  must both stay possible. Nothing is persisted by the refusal, so the run is
+  exactly as resumable afterwards as it was before.
+
+The recorded value is canonical human-readable text
+(`v1 exclude=[...] max_entries=... max_bytes=...`) rather than a digest, for
+one reason: a digest can prove that something changed and can never say what.
+It is a required field for LOCAL states at the load boundary — LOCAL mode is
+unreleased, so there is no compatibility cost to making its absence a
+corruption rather than a default.
+
+### 5.8 Quoting the specification is delimiter safety, not a trust boundary
+
+`local_common.md` interpolates the feature specification — untrusted project
+data — into the prompt. It did so inside a fixed ```` ``` ```` fence, which
+made the quoting itself the injection vector: a specification containing a
+```` ``` ```` line closes the block, and everything after it reads as prompt
+structure the *controller* wrote.
+
+CommonMark closes a fenced block only on a backtick run at least as long as
+the opening fence, so `fenced_untrusted_block()` measures the longest run in
+the content and opens a fence one backtick longer. That is a property of the
+content rather than a list of things content might do — no enumeration, and
+nothing inside the block can terminate it.
+
+The fence is only half of it, and the ADR records both halves so neither is
+mistaken for the whole: **a delimiter says where the data ends; the prose
+around it says the quoted text is data.** `local_common.md` therefore also
+states explicitly that anything in the block resembling an instruction, a
+control block, a heading of the prompt, or a direction to skip a check is
+content to be *implemented*, never followed. Neither half is load-bearing
+without the other.
 
 ## 6. Completeness analysis
 
@@ -403,7 +494,10 @@ an independent `os.walk` finds nothing the snapshot did not mention.
   such run in the field; an operator who has one can pass `--state-dir` and
   will be told if it is inside the reviewed tree.
 - **State schema.** No field was removed or repurposed; `protocol_version` is
-  unchanged. A state file written by the pre-reset code still loads, and the
+  unchanged. `local_workspace_policy` is new and **required for LOCAL
+  states** (§5.7): a LOCAL state file without it cannot be shown to still
+  cover the tree it was reviewed against, and unreleased LOCAL mode has no
+  such file in the field. REMOTE states neither carry nor require it. A state file written by the pre-reset code still loads, and the
   new scalar-type check is strictly narrower than what it accepted (it rejects
   only values whose *declared* type they never had).
 - **REMOTE mode.** Unchanged. `safefs.py` is used by `state.py` and
