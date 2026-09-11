@@ -20,16 +20,24 @@ Workspace fingerprint
 review to exactly the code that was reviewed. It covers:
 
 - the current HEAD (or the fact that HEAD is unborn),
+- the checked-out branch (or the fact that HEAD is detached),
 - every path ``git status --porcelain=v1 -z --untracked-files=all`` reports
   (tracked modifications, staged modifications, deletions, renames and
   *untracked* files, which is where an implementation may well live), and
 - the SHA-256 of each of those paths' current bytes.
 
+Every reported path is hashed by *content*, whatever its size: a fingerprint
+that fell back to ``(size, mtime)`` for large files would accept an
+equal-sized replacement whose mtime was restored, and "the reviewer saw
+exactly these bytes" is the one question this function exists to answer.
+
 ``git diff HEAD`` alone would miss untracked files entirely, so it is not
 used. Paths under the configured state directory are excluded: AutoForge's
 own logs and ``state.json`` change on every step and must not invalidate the
-fingerprint. The feature specification is *not* excluded — it is covered by
-the fingerprint and, independently, by its own SHA-256 (see
+fingerprint. A state directory that *is* the repository root is rejected
+rather than excluded, since excluding it would exclude the whole tree. The
+feature specification is *not* excluded — it is covered by the
+fingerprint and, independently, by its own SHA-256 (see
 :func:`hash_bytes` and ``AutoForgeState.feature_spec_sha256``).
 
 The fingerprint is deliberately not a general VCS abstraction: it answers
@@ -55,10 +63,6 @@ GIT_TIMEOUT_SECONDS = 60
 
 # Bytes read per file when hashing working-tree content.
 _CHUNK = 1024 * 1024
-# A file larger than this is fingerprinted by (size, mtime_ns) instead of by
-# content: hashing a multi-gigabyte artefact on every step would make the
-# controller unusable, and such a file is never the feature implementation.
-MAX_HASHED_FILE_BYTES = 32 * 1024 * 1024
 
 FEATURE_SPEC_SUFFIXES = (".md", ".markdown")
 
@@ -84,8 +88,19 @@ class WorkspaceEntry:
 class WorkspaceStatus:
     root: Path
     head_sha: str  # "" when HEAD is unborn (a repository with no commit yet)
+    # Checked-out branch, or "" when HEAD is detached. Together with
+    # ``head_sha`` this is the *git anchor* a LOCAL run is pinned to: the
+    # controller refuses to continue when either moves (see
+    # ``AutoForgeState.base_head_sha`` / ``base_branch``).
+    branch: str = ""
     entries: tuple[WorkspaceEntry, ...] = field(default_factory=tuple)
     fingerprint: str = ""
+
+    @property
+    def anchor(self) -> str:
+        """Human-readable HEAD + branch, for error messages."""
+        head = self.head_sha[:12] if self.head_sha else "(unborn)"
+        return f"{head} on {self.branch or '(detached HEAD)'}"
 
     @property
     def is_clean(self) -> bool:
@@ -132,7 +147,10 @@ class LocalWorkspace:
     def _git(self, argv: list[str], *, allow_failure: bool = False) -> ExecutionResult:
         res = self._runner(
             ExecutionRequest(
-                command=["git", *argv],
+                # --no-optional-locks: every call here is a read, and a
+                # `git status` that refreshes the index would write
+                # `.git/index` — a side effect a `--dry-run` must not have.
+                command=["git", "--no-optional-locks", *argv],
                 cwd=str(self.workdir),
                 timeout_seconds=self.timeout,
             )
@@ -173,9 +191,27 @@ class LocalWorkspace:
             return ""
         return (res.stdout or "").strip().lower()
 
+    def branch(self) -> str:
+        """Checked-out branch name, or "" when HEAD is detached.
+
+        ``symbolic-ref`` rather than ``rev-parse --abbrev-ref HEAD``: the
+        latter reports the literal string "HEAD" for a detached HEAD, which is
+        indistinguishable from a branch actually named ``HEAD``. An unborn
+        HEAD still has a symbolic ref, so a repository with no commit reports
+        its branch normally.
+        """
+        res = self._git(["symbolic-ref", "--quiet", "--short", "HEAD"], allow_failure=True)
+        if res.exit_code != 0:
+            return ""
+        return (res.stdout or "").strip()
+
     # -- state-directory exclusion ----------------------------------------
-    def _excluded_prefixes(self) -> tuple[str, ...]:
-        """Repository-relative prefixes whose contents never affect the fingerprint."""
+    def state_dir_relpath(self) -> str | None:
+        """Repository-relative path of the state directory, or None if outside.
+
+        ``""`` means it resolves to the repository root itself, which is not a
+        usable exclusion (see :meth:`check_state_dir`).
+        """
         root = self.root()
         candidate = self.state_dir
         if not candidate.is_absolute():
@@ -183,10 +219,39 @@ class LocalWorkspace:
         try:
             rel = os.path.relpath(os.path.realpath(candidate), root)
         except ValueError:  # different drive (Windows); not inside the repo
-            return ()
+            return None
         if rel.startswith("..") or os.path.isabs(rel):
-            return ()
-        rel = rel.replace(os.sep, "/").strip("/")
+            return None
+        rel = os.path.normpath(rel).replace(os.sep, "/").strip("/")
+        return "" if rel in ("", ".") else rel
+
+    def check_state_dir(self) -> None:
+        """Reject a state directory that *is* the repository root.
+
+        The fingerprint excludes the state directory so AutoForge's own
+        ``state.json`` and ``logs/`` cannot invalidate it. When the state
+        directory resolves to the repository root there is no prefix to
+        exclude — every path in the tree would have to be excluded — so the
+        controller's own writes start showing up as workspace changes: a
+        read-only REVIEW appears to have modified the tree, and the reviewer
+        is rejected because the controller logged its invocation. Excluding
+        the individual runtime entries instead would silently hide any
+        ``state.json`` or ``logs/`` the *project* legitimately has at its
+        root, so the value is refused rather than special-cased.
+        """
+        if self.state_dir_relpath() == "":
+            raise ConfigurationError(
+                f"the state directory resolves to the repository root ({self.root()}); "
+                "local mode fingerprints the working tree and excludes the state "
+                "directory from it, which is impossible when the two are the same "
+                "directory. Use a subdirectory such as '.autoforge' (the default), or a "
+                "path outside the repository."
+            )
+
+    def _excluded_prefixes(self) -> tuple[str, ...]:
+        """Repository-relative prefixes whose contents never affect the fingerprint."""
+        self.check_state_dir()
+        rel = self.state_dir_relpath()
         return (f"{rel}/",) if rel else ()
 
     # -- status + fingerprint ---------------------------------------------
@@ -194,6 +259,7 @@ class LocalWorkspace:
         """Read HEAD + working-tree status and compute the fingerprint."""
         root = self.root()
         head = self.head_sha()
+        branch = self.branch()
         excluded = self._excluded_prefixes()
         entries: list[WorkspaceEntry] = []
         for code, path in self._porcelain():
@@ -204,8 +270,9 @@ class LocalWorkspace:
         return WorkspaceStatus(
             root=root,
             head_sha=head,
+            branch=branch,
             entries=tuple(entries),
-            fingerprint=self._fingerprint(head, entries),
+            fingerprint=self._fingerprint(head, branch, entries),
         )
 
     def _porcelain(self) -> list[tuple[str, str]]:
@@ -244,7 +311,15 @@ class LocalWorkspace:
 
     @staticmethod
     def _digest(path: Path) -> str:
-        """SHA-256 of a working-tree path, or a marker for anything else."""
+        """SHA-256 of a working-tree path, or a marker for anything else.
+
+        Content is hashed regardless of file size. An earlier revision fell
+        back to ``(size, mtime_ns)`` above a threshold to keep the cost
+        bounded; that made the fingerprint metadata-bound rather than
+        content-bound for exactly the files where a silent swap is easiest to
+        hide, so a review could be accepted for bytes it never saw. The set of
+        hashed paths is bounded by what ``git status`` reports as changed.
+        """
         try:
             st = os.lstat(path)
         except FileNotFoundError:
@@ -261,8 +336,6 @@ class LocalWorkspace:
             return "dir"
         if not stat.S_ISREG(st.st_mode):
             return f"special:{st.st_mode:o}"
-        if st.st_size > MAX_HASHED_FILE_BYTES:
-            return f"large:{st.st_size}:{st.st_mtime_ns}"
         h = hashlib.sha256()
         try:
             with open(path, "rb") as fh:
@@ -273,10 +346,11 @@ class LocalWorkspace:
         return h.hexdigest()
 
     @staticmethod
-    def _fingerprint(head_sha: str, entries: list[WorkspaceEntry]) -> str:
+    def _fingerprint(head_sha: str, branch: str, entries: list[WorkspaceEntry]) -> str:
         h = hashlib.sha256()
-        h.update(b"autoforge-workspace-v1\n")
+        h.update(b"autoforge-workspace-v2\n")
         h.update(f"HEAD:{head_sha or '(unborn)'}\n".encode())
+        h.update(f"BRANCH:{branch or '(detached)'}\n".encode("utf-8", "surrogateescape"))
         for e in sorted(entries, key=lambda x: x.path):
             h.update(e.code.encode("utf-8", "surrogateescape"))
             h.update(b"\0")

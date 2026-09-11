@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from autoforge.config import default_config, load_config_file
+from autoforge.config import default_config, load_config_file, validate_required_profiles
 from autoforge.errors import ConfigurationError
 from autoforge.validation import parse_github_url, validate_epic_and_issue
 
@@ -428,3 +428,47 @@ def test_protected_merge_paths_must_be_a_list_of_non_empty_strings(tmp_path, val
     p.write_text(json.dumps({"version": 1, "safety": {"protected_merge_paths": value}}), "utf-8")
     with pytest.raises(ConfigurationError, match="protected_merge_paths"):
         load_config_file(p)
+
+
+@pytest.mark.parametrize("value", [0, -1, -1800])
+def test_a_non_positive_default_timeout_is_rejected(tmp_path, value):
+    """PR #44, R1-F6: `timeout=0` disables the timeout rather than tightening it.
+
+    `subprocess.run(..., timeout=0)` is not "fail immediately", and a negative
+    value is not a timeout at all — both leave a hung agent running forever
+    against the operator's machine, which is exactly what the timeout exists
+    to bound. A configuration that reads as "no time allowed" must not
+    silently become "unlimited time".
+    """
+    p = tmp_path / "cfg.json"
+    p.write_text(
+        f'{{"version": 1, "execution": {{"default_timeout_seconds": {value}}}}}',
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigurationError, match="default_timeout_seconds.*must be > 0"):
+        load_config_file(p)
+
+
+@pytest.mark.parametrize("value", [0, -5])
+def test_a_non_positive_profile_timeout_is_rejected(tmp_path, value):
+    """The same bound on the per-profile override that shadows the default.
+
+    The profile override is checked when the profile is validated (the
+    controller's preflight and `doctor`) rather than at parse time, because a
+    config may legitimately carry profiles a given run never reaches.
+    """
+    p = tmp_path / "cfg.json"
+    p.write_text(
+        f'{{"version": 1, "profiles": {{"fix": {{"timeout_seconds": {value}}}}}}}',
+        encoding="utf-8",
+    )
+    cfg = load_config_file(p)
+    assert cfg.profile("fix").timeout_seconds == value
+    with pytest.raises(ConfigurationError, match="timeout_seconds must be > 0"):
+        validate_required_profiles(cfg, ["fix"])
+
+
+def test_a_positive_default_timeout_is_still_accepted(tmp_path):
+    p = tmp_path / "cfg.json"
+    p.write_text('{"version": 1, "execution": {"default_timeout_seconds": 1}}', encoding="utf-8")
+    assert load_config_file(p).execution.default_timeout_seconds == 1

@@ -28,6 +28,10 @@ Runner = Callable[[ExecutionRequest], ExecutionResult]
 # A fixed list of required profile names, or a function of the loaded config.
 RequiredProfiles = list[str] | Callable[[AutoForgeConfig], list[str]]
 
+# Fallback executable for a provider whose profile does not set `command`,
+# matching the provider adapters' own defaults.
+DEFAULT_AGENT_COMMANDS = {"claude": "claude", "opencode": "opencode"}
+
 REQUIRED_PROFILES = [
     "analyze_execute",
     "fix",
@@ -177,18 +181,82 @@ class Doctor:
         # with this `local.max_fix_rounds` could actually ask for it.
         results = [self.check_config(local_required_profiles)]
         cfg = self.config
-        claude_cmd, opencode_cmd = self._agent_commands(cfg)
         results.append(self._version_check("git available", ["git", "--version"]))
         results.append(self.check_git_repo())
-        results.append(
-            self._version_check("implementation agent available", [claude_cmd, "--version"])
-        )
-        results.append(self._version_check("review agent available", [opencode_cmd, "--version"]))
+        results.extend(self._local_agent_checks(cfg))
         results.append(self.check_state_dir())
+        results.append(self.check_local_state_dir())
         results.append(self.check_validation_commands())
         if feature_spec_path:
             results.append(self.check_feature_spec(feature_spec_path))
         return results
+
+    def _local_agent_checks(self, cfg: AutoForgeConfig | None) -> list[CheckResult]:
+        """One `--version` check per external CLI a LOCAL run can actually reach.
+
+        Derived from `local_required_profiles`, not from every configured
+        profile: a machine only needs the binaries the *reachable* local
+        profiles name. A local configuration that routes everything through
+        OpenCode must not fail because an unrelated remote profile mentions
+        `claude`, and one that uses only `scripted` profiles must not require
+        an external CLI at all — `scripted` spawns the configured argv
+        directly rather than an agent CLI, so there is no version to query.
+        Each distinct command is checked once, labelled with the profiles that
+        reach it.
+        """
+        if cfg is None:
+            return []
+        try:
+            reachable = local_required_profiles(cfg)
+        except ConfigurationError:
+            return []
+        commands: dict[str, list[str]] = {}
+        for name in reachable:
+            profile = cfg.profiles.get(name)
+            if profile is None or profile.provider == "scripted":
+                continue
+            command = profile.command or DEFAULT_AGENT_COMMANDS.get(profile.provider, "")
+            if not command:
+                continue
+            commands.setdefault(command, []).append(name)
+        if not commands:
+            return [
+                CheckResult(
+                    "agent CLI available",
+                    True,
+                    "(no external agent CLI is reachable for this local configuration)",
+                    required=False,
+                )
+            ]
+        return [
+            self._version_check(
+                f"agent '{command}' available ({', '.join(names)})", [command, "--version"]
+            )
+            for command, names in commands.items()
+        ]
+
+    def check_local_state_dir(self) -> CheckResult:
+        """The state directory must not be the repository root itself.
+
+        A LOCAL run excludes the state directory from the workspace
+        fingerprint; when the two are the same directory there is nothing to
+        exclude and AutoForge's own `state.json` and `logs/` start counting as
+        workspace changes (see `LocalWorkspace.check_state_dir`).
+        """
+        from .local_workspace import LocalWorkspace
+
+        cfg = self.config
+        name = "state dir separate from the repository root"
+        ws = LocalWorkspace(
+            workdir=self.cwd,
+            state_dir=self.state_dir or (cfg.state_dir if cfg else ".autoforge"),
+            runner=self._runner,
+        )
+        try:
+            ws.check_state_dir()
+        except Exception as exc:
+            return CheckResult(name, False, str(exc))
+        return CheckResult(name, True, str(ws.state_dir))
 
     @staticmethod
     def _agent_commands(cfg: AutoForgeConfig | None) -> tuple[str, str]:

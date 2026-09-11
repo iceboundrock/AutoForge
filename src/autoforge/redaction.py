@@ -56,3 +56,31 @@ def redact(text: str | None) -> str:
 
 def redact_argv(argv: list[str]) -> list[str]:
     return [redact(a) for a in argv]
+
+
+def redact_obj(value: object) -> object:
+    """Recursively redact every string inside a JSON-shaped structure.
+
+    Log metadata and agent-supplied CONTROL_RESULT fields are persisted as
+    nested dicts/lists, so redacting only the top-level text would leave a
+    secret sitting one level down (``metadata["validation_command"]``, a
+    finding's ``required_resolution``). Mapping *keys* are redacted too: a key
+    is as capable of carrying a token as a value. Non-string scalars are
+    returned unchanged; anything exotic is stringified through `redact`, which
+    never raises.
+    """
+    if isinstance(value, str):
+        return redact(value)
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, dict):
+        return {redact(str(k)): redact_obj(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [redact_obj(v) for v in value]
+    return redact(str(value))
+
+
+def redact_dict(value: dict) -> dict:
+    """`redact_obj` for a mapping, typed for callers that persist dicts."""
+    result = redact_obj(value)
+    return result if isinstance(result, dict) else {}

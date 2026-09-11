@@ -120,9 +120,15 @@ class AutoForgeState:
     # and after every agent phase: an agent that rewrites its own acceptance
     # criteria must not be able to make the run easier.
     feature_spec_sha256: str = ""
-    # git HEAD when the run was created ("" for an unborn HEAD). Recorded for
-    # the operator; a local run never requires HEAD to move.
+    # The *git anchor* a local run is pinned to: HEAD and the checked-out
+    # branch when the run was created ("" for an unborn HEAD, "" for a
+    # detached one). A local run never requires HEAD to move and never allows
+    # it to: the controller re-reads both around every agent phase and enters
+    # BLOCKED when either changed, so an agent that commits, resets or
+    # switches branches is caught by the controller rather than only
+    # forbidden by the prompt.
     base_head_sha: str = ""
+    base_branch: str = ""
     # Workspace fingerprint the controller bound before the current review
     # (the local analogue of ``current_head_sha``).
     workspace_fingerprint: str = ""
@@ -131,6 +137,18 @@ class AutoForgeState:
     reviewed_workspace_fingerprint: str = ""
     # Completed local FIX rounds; bounded by ``local.max_fix_rounds``.
     local_fix_rounds: int = 0
+    # Durable checkpoint for a LOCAL agent invocation that may already have
+    # written to the working tree. Persisted *before* the agent is launched,
+    # so a crash (or a rejected result) cannot make `resume` mistake work that
+    # already exists for work that was never done. ``local_pending_phase`` is
+    # the phase value, ``local_pending_fingerprint`` the fingerprint from
+    # *before the first* attempt of that phase entry, and
+    # ``local_pending_attempts`` how many invocations that entry has launched
+    # (bounded, so a phase that can never be completed blocks instead of
+    # looping over `resume`).
+    local_pending_phase: str = ""
+    local_pending_fingerprint: str = ""
+    local_pending_attempts: int = 0
     # Working-tree paths that were already dirty when the run was created,
     # other than the feature specification itself. Normally empty: `local run`
     # refuses a dirty tree unless the operator passes --allow-dirty, and then
@@ -210,11 +228,20 @@ class AutoForgeState:
         for req in required:
             if not getattr(state, req, None):
                 raise StateError(f"state file missing required field {req!r}")
-        for name in ("feature_spec_path", "feature_spec_sha256", "base_head_sha"):
+        for name in (
+            "feature_spec_path",
+            "feature_spec_sha256",
+            "base_head_sha",
+            "base_branch",
+            "local_pending_phase",
+            "local_pending_fingerprint",
+        ):
             if not isinstance(getattr(state, name), str):
                 raise StateError(f"state field {name!r} must be a string")
-        if not isinstance(state.local_fix_rounds, int) or isinstance(state.local_fix_rounds, bool):
-            raise StateError("state field 'local_fix_rounds' must be an integer")
+        for name in ("local_fix_rounds", "local_pending_attempts"):
+            value = getattr(state, name)
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise StateError(f"state field {name!r} must be an integer")
         if not isinstance(state.baseline_dirty_paths, list) or not all(
             isinstance(path, str) for path in state.baseline_dirty_paths
         ):

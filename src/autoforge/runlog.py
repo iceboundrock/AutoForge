@@ -23,7 +23,7 @@ import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from .redaction import redact, redact_argv
+from .redaction import redact, redact_argv, redact_dict
 
 
 @dataclass
@@ -90,6 +90,11 @@ class RunLogger:
         step_dir = self._step_dir(self._seq, record.phase, record.attempt)
         record.log_dir = str(step_dir)
         record.command = redact_argv(record.command)
+        # Metadata is caller-supplied and can quote untrusted text (a
+        # validation command's argv, a feature path). It is written to both
+        # request.json and events.jsonl, so it passes the same boundary the
+        # command and the parsed result do.
+        record.metadata = redact_dict(record.metadata)
         if isinstance(record.parsed_result, dict):
             record.parsed_result = json.loads(redact(json.dumps(record.parsed_result)))
         request = {

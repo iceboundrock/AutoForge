@@ -59,6 +59,13 @@ merge**. Do NOT:
 - `git reset`, `git checkout -- <path>`, `git stash`, or otherwise discard
   work you did not create in this phase
 
+This is **enforced by the controller, not just asked of you**: it reads HEAD
+and the checked-out branch before and after every phase and compares them with
+the anchor the run was pinned to (`{{BASE_HEAD_SHA}}` on `{{BASE_BRANCH}}`).
+A commit, reset, checkout or branch switch blocks the run for a human. The
+controller never rolls any of it back, so the mess is left for someone to
+clean up by hand.
+
 Leave your work as **changes in the working tree** on the current checkout.
 New files may stay untracked; the controller sees them. The human operator
 owns committing, branching and history.
@@ -96,6 +103,7 @@ with exactly one machine-readable block:
 - Repository root: {{REPO_ROOT}}
 - Feature specification: {{FEATURE_SPEC_PATH}} (frozen, SHA-256 `{{FEATURE_SPEC_SHA256}}`)
 - Base git HEAD at run creation: {{BASE_HEAD_SHA}}
+- Checked-out branch the run is pinned to: {{BASE_BRANCH}}
 - Review round: {{REVIEW_ROUND}}
 - Workspace fingerprint (computed by the controller just now): `{{WORKSPACE_FINGERPRINT}}`
 

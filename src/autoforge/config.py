@@ -453,9 +453,20 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
     if not isinstance(exe, dict):
         raise ConfigurationError(f"{source}: 'execution' must be a mapping")
     if "default_timeout_seconds" in exe:
-        base.execution.default_timeout_seconds = _as_int(
+        timeout = _as_int(
             exe["default_timeout_seconds"], source, "execution.default_timeout_seconds"
         )
+        if timeout <= 0:
+            # The executor treats a non-positive timeout as "no timeout at
+            # all", and this value is what controller-owned work (a LOCAL
+            # validation command, a profile that does not override it) runs
+            # under. An unbounded subprocess would hold the repository lock
+            # forever, so the bound is required rather than optional.
+            raise ConfigurationError(
+                f"{source}: 'execution.default_timeout_seconds' must be > 0, got {timeout} "
+                "(a non-positive value would disable the timeout entirely)"
+            )
+        base.execution.default_timeout_seconds = timeout
     if "max_correction_attempts" in exe:
         base.execution.max_correction_attempts = _as_int(
             exe["max_correction_attempts"], source, "execution.max_correction_attempts"

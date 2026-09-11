@@ -10,6 +10,10 @@ working tree. There is no Issue, no branch to create, no PR and no commit.
 - Current working-tree state as the controller sees it: {{WORKSPACE_STATUS}}
 - Validation commands the controller will run after you finish: {{VALIDATION_COMMANDS}}
 
+### Earlier attempt at this phase
+
+{{PRIOR_ATTEMPT}}
+
 ## Steps
 
 1. Read the repository's `AGENTS.md` and `CLAUDE.md` if they exist. Their

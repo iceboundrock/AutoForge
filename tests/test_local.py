@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -547,7 +548,7 @@ def test_local_doctor_never_runs_gh(tmp_path):
         seen.append(list(req.command))
         from autoforge.executor import ExecutionResult
 
-        stdout = str(root) if req.command[:2] == ["git", "rev-parse"] else "ok"
+        stdout = str(root) if "rev-parse" in req.command else "ok"
         return ExecutionResult(
             command=list(req.command),
             cwd=req.cwd,
@@ -564,8 +565,83 @@ def test_local_doctor_never_runs_gh(tmp_path):
     assert not any("remote" in cmd for cmd in seen)
     names = {r.name for r in results}
     assert "gh authenticated" not in names and "GitHub remote" not in names
-    assert {"implementation agent available", "review agent available"} <= names
+    # One check per *reachable* local profile's CLI, derived from the config
+    # rather than a fixed claude+opencode pair (PR #44, R1-F10).
+    agent_checks = sorted(n for n in names if n.startswith("agent "))
+    assert agent_checks == [
+        "agent 'claude' available (analyze_execute, fix)",
+        "agent 'opencode' available (review_round_1, review_round_2_5)",
+    ], agent_checks
     assert [r for r in results if r.name == "feature specification"][0].ok
+
+
+def test_local_doctor_checks_only_the_reachable_providers(tmp_path):
+    """A local config that never reaches a Claude profile must not need `claude`.
+
+    `_agent_commands` used to scan *every* configured profile and then always
+    check one Claude and one OpenCode binary, so a valid OpenCode-only local
+    setup failed doctor because an unrelated remote profile mentioned a CLI it
+    would never run (PR #44, R1-F10).
+    """
+    root = local_repo(tmp_path)
+    cfg_path = root / "autoforge.toml"
+    seen: list[list[str]] = []
+
+    def runner(req):
+        seen.append(list(req.command))
+        from autoforge.executor import ExecutionResult
+
+        stdout = str(root) if "rev-parse" in req.command else "ok"
+        return ExecutionResult(
+            command=list(req.command),
+            cwd=req.cwd,
+            exit_code=0,
+            stdout=stdout,
+            stderr="",
+            started_at="2026-01-01T00:00:00+00:00",
+            finished_at="2026-01-01T00:00:01+00:00",
+        )
+
+    # Zero fix rounds: only analyze_execute and review_round_1 are reachable,
+    # and both are `scripted`, so no external agent CLI is needed at all.
+    cfg_path.write_text(
+        "version = 1\n"
+        "[local]\nmax_fix_rounds = 0\n"
+        '[profiles.analyze_execute]\nprovider = "scripted"\ncommand = "/bin/true"\n'
+        '[profiles.review_round_1]\nprovider = "scripted"\ncommand = "/bin/true"\n',
+        encoding="utf-8",
+    )
+    doc = Doctor(
+        config_path=str(cfg_path),
+        cwd=str(root),
+        state_dir=str(root / ".autoforge"),
+        runner=runner,
+    )
+    results = doc.run_local()
+    assert all(r.ok for r in results), [(r.name, r.detail) for r in results if not r.ok]
+    assert not any(cmd[0] in ("claude", "opencode") for cmd in seen), seen
+
+    # One reviewer profile keeps its real CLI: exactly that binary is checked,
+    # and the Claude-backed `fix` profile is still unreachable, so `claude` is
+    # never probed.
+    cfg_path.write_text(
+        "version = 1\n"
+        "[local]\nmax_fix_rounds = 0\n"
+        '[profiles.analyze_execute]\nprovider = "scripted"\ncommand = "/bin/true"\n'
+        '[profiles.review_round_1]\ncommand = "oc"\n',
+        encoding="utf-8",
+    )
+    seen.clear()
+    results = Doctor(
+        config_path=str(cfg_path),
+        cwd=str(root),
+        state_dir=str(root / ".autoforge"),
+        runner=runner,
+    ).run_local()
+    assert all(r.ok for r in results), [(r.name, r.detail) for r in results if not r.ok]
+    assert ["oc", "--version"] in seen
+    assert not any(cmd[0] == "claude" for cmd in seen), seen
+    assert "agent 'oc' available (review_round_1)" in {r.name for r in results}
 
 
 # -- CLI ------------------------------------------------------------------------------------
@@ -736,9 +812,10 @@ def test_local_required_profiles_follow_the_configured_review_bound(tmp_path):
         "review_round_1",
         "review_round_2_5",
     ]
-    # 0 fix rounds: only the first review pass is reachable.
+    # 0 fix rounds: FIX is unreachable and so is every review pass after the
+    # first, so neither may be required (PR #44, R1-F7).
     cfg.local.max_fix_rounds = 0
-    assert local_required_profiles(cfg) == ["analyze_execute", "fix", "review_round_1"]
+    assert local_required_profiles(cfg) == ["analyze_execute", "review_round_1"]
     # 5 fix rounds == 6 review passes: the round 6+ reviewer becomes reachable.
     cfg.local.max_fix_rounds = 5
     assert local_required_profiles(cfg) == [
@@ -851,3 +928,509 @@ def test_the_existing_run_guard_names_the_subcommand_that_was_typed(tmp_path, mo
     paths.state_file.write_text('{"phase": "REVIEW", "run_id": ', encoding="utf-8")
     assert _existing_run_guard(paths, force=False, command="local run") == (2, False)
     assert "'local run --force' to move it aside" in capsys.readouterr().err
+
+
+# -- PR #44 review regressions -------------------------------------------------
+def test_an_unresolved_finding_blocks_instead_of_reaching_a_clean_review(tmp_path):
+    """R1-F1: `unresolved` is an agent-reported blocker, not a passed baton.
+
+    FIX used to clear `open_findings` for every reported resolution whatever
+    its disposition, so a finding the fix agent explicitly could *not* resolve
+    went back to a fresh reviewer with no memory of it. A clean round 2 then
+    carried the run to DONE with an acknowledged, unaddressed finding in the
+    tree.
+    """
+    root = local_repo(tmp_path)
+    cfg = default_config()
+    # A validation command that appends one character per run, so the test can
+    # tell "ran for ANALYZE_EXECUTE" from "ran again for FIX": an unresolved
+    # finding is terminal *before* the FIX round's validation is executed.
+    tally = root / "VALIDATION_RUNS"
+    cfg.local.validation_commands = [
+        [sys.executable, "-c", f"open({str(tally)!r}, 'a').write('x')"]
+    ]
+    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root, cfg=cfg)
+
+    def two_findings(e):
+        return review_result(e.state.workspace_fingerprint, 1, [finding(1, 1), finding(1, 2)])
+
+    def one_unresolved(e):
+        return block(
+            {
+                "phase": "FIX",
+                "status": "success",
+                "changed_workspace": True,
+                "resolutions": [
+                    {
+                        "finding_id": "R1-F1",
+                        "resolution": "fixed",
+                        "rationale": "Added the missing unit test for the date filter.",
+                    },
+                    {
+                        "finding_id": "R1-F2",
+                        "resolution": "unresolved",
+                        "rationale": (
+                            "The filter needs a schema migration that is out of scope for "
+                            "this feature specification; a human has to decide."
+                        ),
+                    },
+                ],
+                "blocked_reason": "",
+            }
+        )
+
+    eng.provider._handler = scripted(
+        eng,
+        root,
+        [
+            (lambda r: touch_impl(r, "v1\n"), lambda e: impl_result()),
+            (None, two_findings),
+            (lambda r: touch_impl(r, "v2\n"), one_unresolved),
+        ],
+    )
+    outcomes = eng.run(max_steps=8)
+    assert eng.state.phase == Phase.BLOCKED
+    assert [o.next_phase for o in outcomes][-1] == "BLOCKED"
+    # Only the unresolved finding survives, and it survives by id.
+    assert [f["id"] for f in eng.state.open_findings] == ["R1-F2"]
+    assert eng.state.last_review_result == "unresolved"
+    assert "explicitly unresolved" in eng.state.block_reason
+    # The rationale reaches the operator rather than being swallowed.
+    assert "schema migration" in eng.state.block_reason
+    assert tally.read_text(encoding="utf-8") == "x", "FIX validation must not have run"
+    # The fix round still counted: it consumed an agent invocation.
+    assert eng.state.local_fix_rounds == 1
+
+
+def test_a_no_change_with_rationale_resolution_still_advances(tmp_path):
+    """The other non-`fixed` disposition is a *resolution* and must not block.
+
+    Guards the R1-F1 fix against over-reach: `no_change_with_rationale` is the
+    agent judging the finding answered, which is a resolution; only
+    `unresolved` is "I could not do it".
+    """
+    root = local_repo(tmp_path)
+    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root)
+    eng.provider._handler = scripted(
+        eng,
+        root,
+        [
+            (lambda r: touch_impl(r, "v1\n"), lambda e: impl_result()),
+            (None, lambda e: review_result(e.state.workspace_fingerprint, 1, [finding(1)])),
+            (
+                lambda r: touch_impl(r, "v2\n"),
+                lambda e: fix_result(["R1-F1"], resolution="no_change_with_rationale"),
+            ),
+            (None, lambda e: review_result(e.state.workspace_fingerprint, 2)),
+        ],
+    )
+    eng.run(max_steps=8)
+    assert eng.state.phase == Phase.DONE
+    assert eng.state.open_findings == []
+
+
+def test_a_failed_phase_is_re_invoked_against_its_original_baseline(tmp_path):
+    """R1-F2: an unverified write phase must stay resumable.
+
+    The controller persists the invocation checkpoint *before* the agent runs,
+    so a crash, a malformed CONTROL_RESULT or a failing validation command all
+    leave the same record. Without it the retry compared the tree against the
+    tree the failed attempt had already written and rejected it as "unchanged
+    since this phase was first invoked" — a dead-locked run whose only escape
+    was hand-editing `state.json`.
+    """
+    root = local_repo(tmp_path)
+    cfg = default_config()
+    marker = root / "PASS_VALIDATION"
+    # Exits 0 only once the marker exists: the first attempt's validation
+    # fails, the second one passes.
+    cfg.local.validation_commands = [["test", "-e", str(marker)]]
+    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root, cfg=cfg)
+    ws = LocalWorkspace(workdir=root, state_dir=root / ".autoforge")
+    baseline = ws.status().fingerprint
+
+    eng.provider._handler = scripted(
+        eng, root, [(lambda r: touch_impl(r, "v1\n"), lambda e: impl_result())]
+    )
+    eng.step()  # INITIALIZING -> ANALYZE_EXECUTE
+    with pytest.raises(VerificationError, match="validation command"):
+        eng.step()
+
+    # The phase did not advance, and the checkpoint records both that it ran
+    # and the fingerprint it started from.
+    assert eng.state.phase == Phase.ANALYZE_EXECUTE
+    assert eng.state.local_pending_phase == "ANALYZE_EXECUTE"
+    assert eng.state.local_pending_fingerprint == baseline
+    assert eng.state.local_pending_attempts == 1
+    # It is durable, not in-memory: a fresh process sees the same thing.
+    reloaded = load_state(StatePaths.from_state_dir(root / ".autoforge").state_file)
+    assert reloaded.local_pending_fingerprint == baseline
+
+    # Resume. The work from the first attempt is already in the tree, so this
+    # attempt changes nothing further and honestly says so.
+    marker.write_text("ok\n", encoding="utf-8")
+    eng.provider._handler = scripted(eng, root, [(None, lambda e: impl_result(changed=False))])
+    outcome = eng.step()
+    assert outcome.next_phase == "REVIEW"
+    assert eng.state.phase == Phase.REVIEW
+    # Resolved: the checkpoint is closed so the next phase entry starts clean.
+    assert eng.state.local_pending_phase == ""
+    assert eng.state.local_pending_attempts == 0
+
+
+def test_the_resumed_phase_prompt_tells_the_agent_about_the_earlier_attempt(tmp_path):
+    """A re-invoked agent must be told work may already be in the tree.
+
+    Otherwise it re-implements from scratch over its own half-finished output.
+    """
+    root = local_repo(tmp_path)
+    cfg = default_config()
+    cfg.local.validation_commands = [["false"]]
+    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root, cfg=cfg)
+    eng.provider._handler = scripted(
+        eng, root, [(lambda r: touch_impl(r, "v1\n"), lambda e: impl_result())]
+    )
+    eng.step()
+    with pytest.raises(VerificationError):
+        eng.step()
+
+    prompts: list[str] = []
+
+    def capture(req):
+        prompts.append(req.prompt)
+        return impl_result(changed=False)
+
+    eng.provider._handler = capture
+    with pytest.raises(VerificationError):
+        eng.step()
+    assert prompts, "the phase was not re-invoked"
+    assert "Earlier attempt at this phase" in prompts[0]
+    assert "never produced a result the controller could verify" in prompts[0]
+    assert "continue it rather than starting over" in prompts[0]
+
+    # The plan a human sees reports the same checkpoint, with the bound.
+    notes = " ".join(eng.plan_step().notes)
+    assert "was checkpointed and never verified" in notes
+    assert "2 of 3 attempt(s) used" in notes
+
+
+def test_a_write_phase_that_never_verifies_blocks_instead_of_looping(tmp_path):
+    """The retry in R1-F2 is bounded: three attempts, then BLOCKED.
+
+    Re-invoking a write-capable agent is cheap in LOCAL mode (the only side
+    effect is the working tree) but it is not free, and a phase that can never
+    be verified must not become an infinite `resume` loop.
+    """
+    root = local_repo(tmp_path)
+    cfg = default_config()
+    cfg.local.validation_commands = [["false"]]
+    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root, cfg=cfg)
+
+    counter = {"n": 0}
+
+    def always_writes(req):
+        counter["n"] += 1
+        touch_impl(root, f"v{counter['n']}\n")
+        return impl_result()
+
+    eng.provider._handler = always_writes
+    eng.step()  # INITIALIZING -> ANALYZE_EXECUTE
+    for _ in range(3):
+        with pytest.raises(VerificationError):
+            eng.step()
+    assert eng.state.local_pending_attempts == 3
+    assert counter["n"] == 3
+
+    # The fourth entry refuses to launch the agent at all.
+    outcome = eng.step()
+    assert outcome.next_phase == "BLOCKED"
+    assert eng.state.phase == Phase.BLOCKED
+    assert counter["n"] == 3, "a blocked phase must not invoke the agent"
+    assert "without ever producing a verified result" in eng.state.block_reason
+
+
+def test_a_review_that_fails_verification_leaves_no_pending_checkpoint(tmp_path):
+    """REVIEW is read-only, so it is not checkpointed as a write phase."""
+    root = local_repo(tmp_path)
+    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root)
+    eng.provider._handler = scripted(
+        eng,
+        root,
+        [
+            (lambda r: touch_impl(r, "v1\n"), lambda e: impl_result()),
+            (None, lambda e: review_result("f" * 64)),
+        ],
+    )
+    eng.step()
+    eng.step()
+    with pytest.raises(VerificationError):
+        eng.step()
+    assert eng.state.phase == Phase.REVIEW
+    assert eng.state.local_pending_phase == ""
+
+
+# -- the git anchor ---------------------------------------------------------------
+def test_an_agent_that_commits_blocks_the_run(tmp_path):
+    """A LOCAL run is pinned to the HEAD and branch it started from.
+
+    This is LOCAL mode's analogue of "bind reviews to the PR HEAD SHA": the
+    findings and the frozen specification describe the tree as anchored, and
+    the controller cannot tell an agent's commit from an operator's.
+    """
+    root = local_repo(tmp_path)
+    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root)
+
+    def commit(r):
+        touch_impl(r, "v1\n")
+        commit_all(r, "the agent committed")
+
+    eng.provider._handler = scripted(eng, root, [(commit, lambda e: impl_result())])
+    eng.step()  # INITIALIZING -> ANALYZE_EXECUTE
+    outcome = eng.step()
+    assert outcome.next_phase == "BLOCKED"
+    assert eng.state.phase == Phase.BLOCKED
+    assert "HEAD moved" in eng.state.block_reason
+    assert "Nothing was rolled back" in eng.state.block_reason
+
+
+def test_an_agent_that_switches_branches_blocks_the_run(tmp_path):
+    """Branch identity is part of the anchor, even when HEAD does not move."""
+    root = local_repo(tmp_path)
+    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root)
+    assert eng.state.base_branch, "a fresh repository has a checked-out branch"
+
+    def switch(r):
+        touch_impl(r, "v1\n")
+        # A new branch at the same commit: HEAD is unchanged, identity is not.
+        subprocess.run(["git", "-C", str(r), "checkout", "-q", "-b", "sidetrack"], check=True)
+
+    eng.provider._handler = scripted(eng, root, [(switch, lambda e: impl_result())])
+    eng.step()
+    outcome = eng.step()
+    assert outcome.next_phase == "BLOCKED"
+    assert "checked-out branch changed" in eng.state.block_reason
+    assert "HEAD moved" not in eng.state.block_reason
+
+
+def test_a_head_move_before_the_agent_runs_blocks_without_invoking_it(tmp_path):
+    """The anchor is checked on the way in as well as on the way out."""
+    root = local_repo(tmp_path)
+    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root)
+    eng.step()  # INITIALIZING -> ANALYZE_EXECUTE
+
+    invoked = {"n": 0}
+
+    def handler(req):
+        invoked["n"] += 1
+        return impl_result()
+
+    eng.provider._handler = handler
+    touch_impl(root, "an operator committed mid-run\n")
+    commit_all(root, "operator commit")
+
+    outcome = eng.step()
+    assert outcome.next_phase == "BLOCKED"
+    assert invoked["n"] == 0, "the agent must not run against a moved anchor"
+    assert "HEAD moved" in eng.state.block_reason
+
+
+def test_the_branch_is_part_of_the_workspace_fingerprint(tmp_path):
+    """Two checkouts with identical trees but different branches differ."""
+    root = local_repo(tmp_path)
+    ws = LocalWorkspace(workdir=root, state_dir=".autoforge")
+    on_main = ws.status()
+    assert on_main.branch
+    assert on_main.anchor.endswith(on_main.branch)
+
+    subprocess.run(["git", "-C", str(root), "checkout", "-q", "-b", "other"], check=True)
+    on_other = ws.status()
+    assert on_other.branch == "other"
+    assert on_other.fingerprint != on_main.fingerprint
+
+    subprocess.run(["git", "-C", str(root), "checkout", "-q", "--detach"], check=True)
+    detached = ws.status()
+    assert detached.branch == ""
+    assert "(detached HEAD)" in detached.anchor
+    assert detached.fingerprint not in (on_main.fingerprint, on_other.fingerprint)
+
+
+# -- the state directory ------------------------------------------------------------
+def test_a_state_directory_at_the_repository_root_is_refused(tmp_path):
+    """R1-F4: there is no prefix to exclude, so nothing can be excluded.
+
+    Excluding the individual runtime entries (`state.json`, `logs/`) instead
+    would silently hide a project's own files with those names, so the only
+    safe answer is to reject the configuration.
+    """
+    root = local_repo(tmp_path)
+    ws = LocalWorkspace(workdir=root, state_dir=root)
+    assert ws.state_dir_relpath() == ""
+    with pytest.raises(ConfigurationError, match="repository root"):
+        ws.check_state_dir()
+    with pytest.raises(ConfigurationError, match=r"\.autoforge"):
+        ws.status()
+
+    # A subdirectory is fine, and so is a state directory outside the repo.
+    assert LocalWorkspace(workdir=root, state_dir=".autoforge").state_dir_relpath() == ".autoforge"
+    outside = LocalWorkspace(workdir=root, state_dir=tmp_path.parent / "elsewhere")
+    assert outside.state_dir_relpath() is None
+    outside.check_state_dir()  # does not raise
+
+
+def test_a_root_state_directory_blocks_before_any_agent_runs(tmp_path):
+    """The refusal happens in INITIALIZING, not at the first fingerprint."""
+    root = local_repo(tmp_path)
+    with pytest.raises(ConfigurationError, match="repository root"):
+        make_local_engine(root, "features/add-filter.md", workdir=root)
+
+
+# -- fingerprint robustness -----------------------------------------------------------
+def test_a_large_file_is_content_hashed_not_stat_hashed(tmp_path):
+    """R1-F9: a same-size, same-mtime rewrite must change the fingerprint.
+
+    The fingerprint used to fall back to `(size, mtime_ns)` above a size
+    threshold, which made it metadata-bound for exactly the files where a
+    silent swap is easiest to hide: a clean review could then be accepted for
+    bytes no reviewer ever saw.
+    """
+    import os
+
+    root = local_repo(tmp_path)
+    ws = LocalWorkspace(workdir=root, state_dir=".autoforge")
+    big = root / "src" / "big.bin"
+    size = 40 * 1024 * 1024  # comfortably past the old 32 MB threshold
+    big.write_bytes(b"a" * size)
+    st = os.stat(big)
+    before = ws.status().fingerprint
+
+    # Same length, different bytes, and the timestamps restored exactly.
+    big.write_bytes(b"a" * (size - 1) + b"b")
+    os.utime(big, ns=(st.st_atime_ns, st.st_mtime_ns))
+    after = os.stat(big)
+    assert after.st_size == st.st_size and after.st_mtime_ns == st.st_mtime_ns
+
+    assert ws.status().fingerprint != before
+
+
+def test_workspace_git_reads_do_not_take_the_optional_index_lock(tmp_path):
+    """`git status` refreshes the index by default, which takes `.git/index.lock`.
+
+    AutoForge runs it against the operator's own live checkout, where an IDE
+    or a concurrent `git` can hold that lock; a fingerprint read must never
+    contend for it, and must never write to the index of a repository it is
+    only inspecting.
+    """
+    root = local_repo(tmp_path)
+    seen: list[list[str]] = []
+
+    def runner(req):
+        seen.append(list(req.command))
+        return subprocess_result(req)
+
+    def subprocess_result(req):
+        from autoforge.executor import ExecutionResult
+
+        proc = subprocess.run(req.command, cwd=str(req.cwd), capture_output=True)
+        return ExecutionResult(
+            command=list(req.command),
+            cwd=str(req.cwd),
+            exit_code=proc.returncode,
+            stdout=proc.stdout.decode("utf-8", "replace"),
+            stderr=proc.stderr.decode("utf-8", "replace"),
+            started_at="2026-01-01T00:00:00+00:00",
+            finished_at="2026-01-01T00:00:01+00:00",
+        )
+
+    ws = LocalWorkspace(workdir=root, state_dir=".autoforge", runner=runner)
+    ws.status()
+    assert seen, "no git command was run"
+    for cmd in seen:
+        assert cmd[0] == "git"
+        assert cmd[1] == "--no-optional-locks", cmd
+
+
+# -- redaction at the persistence boundary --------------------------------------------
+def test_an_agent_message_is_redacted_before_it_reaches_state(tmp_path):
+    """R1-F5: `block_reason` is persisted in the clear and printed verbatim."""
+    root = local_repo(tmp_path)
+    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root)
+    secret = "ghp_" + "A" * 36
+    eng.provider._handler = scripted(
+        eng,
+        root,
+        [
+            (
+                None,
+                lambda e: block(
+                    {
+                        "phase": "ANALYZE_EXECUTE",
+                        "status": "blocked",
+                        "message": f"could not authenticate with {secret}",
+                    }
+                ),
+            )
+        ],
+    )
+    eng.step()
+    outcome = eng.step()
+    assert eng.state.phase == Phase.BLOCKED
+    assert secret not in eng.state.block_reason
+    assert secret not in outcome.message
+    assert "***REDACTED***" in eng.state.block_reason
+    assert secret not in (root / ".autoforge" / "state.json").read_text(encoding="utf-8")
+
+
+def test_findings_and_resolutions_are_redacted_before_they_are_persisted(tmp_path):
+    """Agent-authored finding text is persisted and re-rendered into prompts."""
+    root = local_repo(tmp_path)
+    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root)
+    secret = "sk-ant-" + "B" * 30
+
+    def leaky_review(e):
+        f = finding(1)
+        f["required_resolution"] = f"Set ANTHROPIC_API_KEY={secret} in the test fixture."
+        return review_result(e.state.workspace_fingerprint, 1, [f])
+
+    eng.provider._handler = scripted(
+        eng,
+        root,
+        [
+            (lambda r: touch_impl(r, "v1\n"), lambda e: impl_result()),
+            (None, leaky_review),
+        ],
+    )
+    eng.run(max_steps=3)
+    assert eng.state.phase == Phase.FIX
+    persisted = (root / ".autoforge" / "state.json").read_text(encoding="utf-8")
+    assert secret not in persisted
+    assert "***REDACTED***" in json.dumps(eng.state.open_findings)
+
+
+def test_run_log_metadata_is_redacted(tmp_path):
+    """Metadata is caller-supplied text written to request.json and events.jsonl."""
+    from autoforge.runlog import ExecutionRecord, RunLogger
+
+    secret = "ghp_" + "C" * 36
+    logger = RunLogger(tmp_path / "logs", "run-1")
+    step_dir = logger.log_execution(
+        ExecutionRecord(
+            run_id="run-1",
+            seq=0,
+            phase="FIX",
+            metadata={
+                "validation_command": ["deploy", f"--token={secret}"],
+                "nested": {"GITHUB_TOKEN": secret},
+                f"key-{secret}": "value",
+                "count": 3,
+                "flag": True,
+                "none": None,
+            },
+        )
+    )
+    request = (step_dir / "request.json").read_text(encoding="utf-8")
+    events = (logger.events_path).read_text(encoding="utf-8")
+    assert secret not in request and secret not in events
+    assert "***REDACTED***" in request
+    # Non-string scalars survive intact rather than being stringified.
+    parsed = json.loads(request)["metadata"]
+    assert parsed["count"] == 3 and parsed["flag"] is True and parsed["none"] is None
