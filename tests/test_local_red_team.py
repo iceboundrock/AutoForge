@@ -12,6 +12,7 @@ architecture is not finished. None of these did.
 """
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -20,7 +21,7 @@ import pytest
 from autoforge.config import default_config
 from autoforge.errors import ConfigurationError, VerificationError
 from autoforge.local_workspace import KIND_EXCLUDED, LocalWorkspace, init_feature_file
-from autoforge.safefs import SafeRoot
+from autoforge.safefs import SafeRoot, UnsafePathError
 
 from .conftest import commit_all, write_feature
 
@@ -423,3 +424,58 @@ def test_the_review_binding_is_recomputed_and_never_read_back_from_state(tmp_pat
     )
     with pytest.raises(VerificationError, match="fingerprint"):
         eng.run(max_steps=6, dry_run=False, allow_merge=False)
+
+
+# -- 17 ------------------------------------------------------------------------
+def test_an_agent_replacing_the_state_directory_mid_run_redirects_nothing(tmp_path):
+    """Invariant R. The run holds the state directory as a descriptor, not a path.
+
+    R5-F3's concrete reproduction: an agent replaces the state directory with
+    a symbolic link to somewhere outside the checkout, between its own phase
+    and the controller's next write, so that the run's logs and `state.json`
+    are created under the external directory. `ensure_directory` used to
+    validate only the final component, so the `mkdir` followed the link.
+
+    Two things now stop it independently: the state directory no longer lives
+    inside the reviewed tree at all, and the controller opened it once as a
+    capability -- so even a replacement performed between two writes reaches
+    nothing, because no pathname is resolved again.
+    """
+    from .conftest import make_local_engine
+    from .test_local import IMPL_FILE, impl_result, local_repo, review_result, scripted
+
+    root = local_repo(tmp_path)
+    outside = Path(tmp_path) / "outside"
+    outside.mkdir()
+    eng = make_local_engine(root, root / "features" / "add-filter.md", cfg=default_config())
+    state_dir = Path(eng.paths.state_dir)
+    # Outside the *reviewed* tree: inside the git directory, which the snapshot
+    # excludes by inode and which the walk therefore never enters.
+    assert _is_inside(state_dir, root / ".git"), "state must not live in the reviewed tree"
+
+    def implement_then_redirect(r):
+        (r / IMPL_FILE).write_text("def main():\n    return 1\n", encoding="utf-8")
+        # The agent's phase is over; the controller has yet to log it.
+        shutil.rmtree(state_dir)
+        state_dir.symlink_to(outside)
+
+    eng.provider._handler = scripted(
+        eng,
+        root,
+        [
+            (implement_then_redirect, lambda e: impl_result()),
+            (None, lambda e: review_result(e.state.workspace_fingerprint)),
+        ],
+    )
+    with pytest.raises(UnsafePathError, match="symbolic link"):
+        eng.run(max_steps=6, dry_run=False, allow_merge=False)
+
+    assert list(outside.iterdir()) == [], "controller artefacts landed outside the checkout"
+
+
+def _is_inside(path: Path, root: Path) -> bool:
+    try:
+        Path(os.path.realpath(path)).relative_to(os.path.realpath(root))
+    except ValueError:
+        return False
+    return True
