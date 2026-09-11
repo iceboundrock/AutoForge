@@ -24,6 +24,7 @@ from autoforge.local_workspace import (
     read_feature_spec,
     resolve_feature_spec,
 )
+from autoforge.safefs import UnsafePathError
 from autoforge.state import AutoForgeState, StatePaths, load_state, save_state
 from autoforge.transitions import Phase, WorkflowMode
 
@@ -130,7 +131,7 @@ def scripted(engine, root: Path, steps: list):
 # -- `local init` ---------------------------------------------------------------
 def test_local_init_creates_the_template(tmp_path):
     root = git_repo(tmp_path)
-    ws = LocalWorkspace(workdir=root, state_dir=".autoforge")
+    ws = LocalWorkspace(workdir=root)
     path = init_feature_file(ws, "add-transaction-filter")
     assert path == root / "features" / "add-transaction-filter.md"
     text = path.read_text(encoding="utf-8")
@@ -150,7 +151,7 @@ def test_local_init_creates_the_template(tmp_path):
 
 def test_local_init_refuses_to_overwrite(tmp_path):
     root = git_repo(tmp_path)
-    ws = LocalWorkspace(workdir=root, state_dir=".autoforge")
+    ws = LocalWorkspace(workdir=root)
     path = init_feature_file(ws, "keepme")
     path.write_text("# Feature: hand written\n", encoding="utf-8")
     with pytest.raises(ConfigurationError, match="already exists"):
@@ -163,7 +164,7 @@ def test_local_init_refuses_to_overwrite(tmp_path):
 
 def test_local_init_rejects_a_slug_with_a_path_separator(tmp_path):
     root = git_repo(tmp_path)
-    ws = LocalWorkspace(workdir=root, state_dir=".autoforge")
+    ws = LocalWorkspace(workdir=root)
     with pytest.raises(ConfigurationError, match="invalid feature slug"):
         init_feature_file(ws, "../../etc/passwd")
 
@@ -173,7 +174,7 @@ def test_feature_spec_outside_the_repository_is_rejected(tmp_path):
     root = git_repo(tmp_path / "repo")
     outside = tmp_path / "outside.md"
     outside.write_text(FEATURE_MD, encoding="utf-8")
-    ws = LocalWorkspace(workdir=root, state_dir=".autoforge")
+    ws = LocalWorkspace(workdir=root)
     with pytest.raises(ConfigurationError, match="outside the repository"):
         resolve_feature_spec(ws, outside)
     with pytest.raises(ConfigurationError, match="outside the repository"):
@@ -182,7 +183,7 @@ def test_feature_spec_outside_the_repository_is_rejected(tmp_path):
 
 def test_feature_spec_must_be_a_regular_markdown_file(tmp_path):
     root = local_repo(tmp_path)
-    ws = LocalWorkspace(workdir=root, state_dir=".autoforge")
+    ws = LocalWorkspace(workdir=root)
 
     (root / "features" / "dir.md").mkdir()
     with pytest.raises(ConfigurationError, match="not a regular file"):
@@ -204,7 +205,7 @@ def test_feature_spec_must_be_a_regular_markdown_file(tmp_path):
 # -- run creation ----------------------------------------------------------------
 def test_new_local_run_freezes_the_specification(tmp_path):
     root = local_repo(tmp_path)
-    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root)
+    eng = make_local_engine(root, "features/add-filter.md")
     state = eng.state
     assert state.mode == WorkflowMode.LOCAL
     assert state.phase == Phase.INITIALIZING
@@ -221,44 +222,44 @@ def test_dirty_working_tree_is_refused_unless_allowed(tmp_path):
     root = local_repo(tmp_path)
     touch_impl(root, "# unrelated local edit\n")
     with pytest.raises(ConfigurationError, match="--allow-dirty"):
-        make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root)
-    eng = make_local_engine(
-        root / ".autoforge", "features/add-filter.md", workdir=root, allow_dirty=True
-    )
+        make_local_engine(root, "features/add-filter.md")
+    eng = make_local_engine(root, "features/add-filter.md", allow_dirty=True)
     assert eng.state.baseline_dirty_paths == [IMPL_FILE]
 
 
 def test_an_uncommitted_feature_file_is_an_acceptable_baseline(tmp_path):
     root = local_repo(tmp_path)
     write_feature(root, "brand-new")
-    eng = make_local_engine(root / ".autoforge", "features/brand-new.md", workdir=root)
+    eng = make_local_engine(root, "features/brand-new.md")
     assert eng.state.baseline_dirty_paths == []
 
 
 # -- fingerprint ------------------------------------------------------------------
-def test_fingerprint_tracks_tracked_untracked_and_ignores_state_dir(tmp_path):
+def test_fingerprint_tracks_tracked_untracked_and_clean_alike(tmp_path):
     root = local_repo(tmp_path)
-    ws = LocalWorkspace(workdir=root, state_dir=".autoforge")
-    base = ws.status().fingerprint
+    ws = LocalWorkspace(workdir=root)
+    base = ws.snapshot().fingerprint
 
     touch_impl(root, "def main():\n    return 1\n")
-    tracked = ws.status().fingerprint
+    tracked = ws.snapshot().fingerprint
     assert tracked != base
 
     (root / "src" / "new_module.py").write_text("VALUE = 1\n", encoding="utf-8")
-    untracked = ws.status().fingerprint
+    untracked = ws.snapshot().fingerprint
     assert untracked != tracked
 
     (root / "src" / "new_module.py").write_text("VALUE = 2\n", encoding="utf-8")
-    assert ws.status().fingerprint != untracked
+    assert ws.snapshot().fingerprint != untracked
 
-    (root / ".autoforge" / "logs").mkdir(parents=True, exist_ok=True)
-    (root / ".autoforge" / "logs" / "run.log").write_text("noise\n", encoding="utf-8")
-    (root / ".autoforge" / "state.json").write_text("{}", encoding="utf-8")
-    assert ws.status().fingerprint == ws.status().fingerprint
-    stable = ws.status().fingerprint
-    (root / ".autoforge" / "logs" / "run.log").write_text("more noise\n", encoding="utf-8")
-    assert ws.status().fingerprint == stable
+    # Writing under the git directory -- where LOCAL state now lives -- moves
+    # nothing: it is excluded by inode identity, not by name.
+    state_dir = ws.local_state_dir()
+    (state_dir / "logs").mkdir(parents=True, exist_ok=True)
+    (state_dir / "logs" / "run.log").write_text("noise\n", encoding="utf-8")
+    (state_dir / "state.json").write_text("{}", encoding="utf-8")
+    stable = ws.snapshot().fingerprint
+    (state_dir / "logs" / "run.log").write_text("more noise\n", encoding="utf-8")
+    assert ws.snapshot().fingerprint == stable
 
 
 def test_fingerprint_notices_a_mode_change_on_an_already_dirty_file(tmp_path):
@@ -272,33 +273,33 @@ def test_fingerprint_notices_a_mode_change_on_an_already_dirty_file(tmp_path):
     changed.
     """
     root = local_repo(tmp_path)
-    ws = LocalWorkspace(workdir=root, state_dir=".autoforge")
+    ws = LocalWorkspace(workdir=root)
     script = root / IMPL_FILE
     script.write_text("print('hi')\n", encoding="utf-8")  # dirty, mode unchanged
-    dirty = ws.status().fingerprint
+    dirty = ws.snapshot().fingerprint
 
     script.chmod(0o755)
-    assert ws.status().fingerprint != dirty
-    assert [e.mode for e in ws.status().entries if e.path == IMPL_FILE] == ["0755"]
+    assert ws.snapshot().fingerprint != dirty
+    assert [e.mode for e in ws.snapshot().entries if e.path == IMPL_FILE] == ["0755"]
 
     # ... and back again: the fingerprint is a function of the tree, not a ratchet.
     script.chmod(0o644)
-    assert ws.status().fingerprint == dirty
+    assert ws.snapshot().fingerprint == dirty
 
     # The same holds for a file that is only *newly* executable and untracked.
     extra = root / "src" / "tool.sh"
     extra.write_text("#!/bin/sh\necho hi\n", encoding="utf-8")
-    before = ws.status().fingerprint
+    before = ws.snapshot().fingerprint
     extra.chmod(0o755)
-    assert ws.status().fingerprint != before
+    assert ws.snapshot().fingerprint != before
 
 
 def test_fingerprint_notices_a_deleted_tracked_file(tmp_path):
     root = local_repo(tmp_path)
-    ws = LocalWorkspace(workdir=root, state_dir=".autoforge")
-    base = ws.status().fingerprint
+    ws = LocalWorkspace(workdir=root)
+    base = ws.snapshot().fingerprint
     (root / IMPL_FILE).unlink()
-    assert ws.status().fingerprint != base
+    assert ws.snapshot().fingerprint != base
 
 
 # -- the happy path ----------------------------------------------------------------
@@ -307,7 +308,7 @@ def test_clean_review_reaches_done_without_any_commit(tmp_path):
     head_before = subprocess.run(
         ["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True, check=True
     ).stdout.strip()
-    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root)
+    eng = make_local_engine(root, "features/add-filter.md")
     eng.provider._handler = scripted(
         eng,
         root,
@@ -332,7 +333,7 @@ def test_clean_review_reaches_done_without_any_commit(tmp_path):
 
 def test_findings_route_through_fix_and_back_to_review(tmp_path):
     root = local_repo(tmp_path)
-    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root)
+    eng = make_local_engine(root, "features/add-filter.md")
     eng.provider._handler = scripted(
         eng,
         root,
@@ -357,7 +358,7 @@ def test_findings_route_through_fix_and_back_to_review(tmp_path):
 
 def test_findings_after_the_fix_budget_block(tmp_path):
     root = local_repo(tmp_path)
-    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root)
+    eng = make_local_engine(root, "features/add-filter.md")
     eng.provider._handler = scripted(
         eng,
         root,
@@ -376,7 +377,7 @@ def test_findings_after_the_fix_budget_block(tmp_path):
 
 def test_review_is_bound_to_the_controller_fingerprint(tmp_path):
     root = local_repo(tmp_path)
-    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root)
+    eng = make_local_engine(root, "features/add-filter.md")
     eng.provider._handler = scripted(
         eng,
         root,
@@ -394,7 +395,7 @@ def test_review_is_bound_to_the_controller_fingerprint(tmp_path):
 
 def test_a_reviewer_that_edits_the_workspace_is_refused(tmp_path):
     root = local_repo(tmp_path)
-    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root)
+    eng = make_local_engine(root, "features/add-filter.md")
     eng.provider._handler = scripted(
         eng,
         root,
@@ -414,7 +415,7 @@ def test_a_reviewer_that_edits_the_workspace_is_refused(tmp_path):
 
 def test_implementation_that_changes_nothing_is_refused(tmp_path):
     root = local_repo(tmp_path)
-    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root)
+    eng = make_local_engine(root, "features/add-filter.md")
     eng.provider._handler = scripted(eng, root, [(None, lambda e: impl_result(changed=True))])
     with pytest.raises(VerificationError):
         eng.run(max_steps=3)
@@ -424,7 +425,7 @@ def test_implementation_that_changes_nothing_is_refused(tmp_path):
 # -- the frozen specification --------------------------------------------------------
 def test_specification_edited_during_implementation_is_detected(tmp_path):
     root = local_repo(tmp_path)
-    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root)
+    eng = make_local_engine(root, "features/add-filter.md")
 
     def rewrite(r):
         (r / "features" / "add-filter.md").write_text(
@@ -439,7 +440,7 @@ def test_specification_edited_during_implementation_is_detected(tmp_path):
 
 def test_specification_edited_before_review_is_detected(tmp_path):
     root = local_repo(tmp_path)
-    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root)
+    eng = make_local_engine(root, "features/add-filter.md")
     eng.provider._handler = scripted(
         eng,
         root,
@@ -460,7 +461,7 @@ def test_failing_validation_command_prevents_advancement(tmp_path):
     root = local_repo(tmp_path)
     cfg = default_config()
     cfg.local.validation_commands = [["false"]]
-    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root, cfg=cfg)
+    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
     eng.provider._handler = scripted(
         eng, root, [(lambda r: touch_impl(r, "v1\n"), lambda e: impl_result())]
     )
@@ -473,7 +474,7 @@ def test_passing_validation_command_allows_advancement(tmp_path):
     root = local_repo(tmp_path)
     cfg = default_config()
     cfg.local.validation_commands = [["true"]]
-    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root, cfg=cfg)
+    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
     eng.provider._handler = scripted(
         eng,
         root,
@@ -491,11 +492,11 @@ def test_local_dry_run_has_no_side_effects(tmp_path):
     root = local_repo(tmp_path)
     cfg = default_config()
     cfg.local.validation_commands = [["touch", str(root / "SHOULD_NOT_EXIST")]]
-    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root, cfg=cfg)
+    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
     outcomes = eng.run(max_steps=3, dry_run=True)
     assert eng.provider.calls == []
     assert not (root / "SHOULD_NOT_EXIST").exists()
-    assert not (root / ".autoforge" / "state.json").exists()
+    assert not eng.paths.state_file.exists()
     plan = outcomes[0].plan
     assert plan.phase == "INITIALIZING"
     notes = " ".join(plan.notes)
@@ -507,8 +508,7 @@ def test_local_dry_run_has_no_side_effects(tmp_path):
 # -- resume ------------------------------------------------------------------------------
 def test_local_run_is_resumable_from_persisted_state(tmp_path):
     root = local_repo(tmp_path)
-    paths = StatePaths.from_state_dir(root / ".autoforge")
-    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root)
+    eng = make_local_engine(root, "features/add-filter.md")
     eng.provider._handler = scripted(
         eng, root, [(lambda r: touch_impl(r, "v1\n"), lambda e: impl_result())]
     )
@@ -517,9 +517,7 @@ def test_local_run_is_resumable_from_persisted_state(tmp_path):
     assert eng.state.phase == Phase.REVIEW
 
     # A fresh process: nothing but state.json and the working tree survive.
-    eng2 = make_local_engine(
-        root / ".autoforge", "features/add-filter.md", workdir=root, start=False
-    )
+    eng2 = make_local_engine(root, "features/add-filter.md", start=False)
     state = eng2.load()
     assert state.mode == WorkflowMode.LOCAL
     assert state.phase == Phase.REVIEW
@@ -528,7 +526,7 @@ def test_local_run_is_resumable_from_persisted_state(tmp_path):
     )
     eng2.run(max_steps=3)
     assert eng2.state.phase == Phase.DONE
-    assert load_state(paths.state_file).phase == Phase.DONE
+    assert load_state(eng2.paths.state_file).phase == Phase.DONE
 
 
 # -- backward compatibility -----------------------------------------------------------------
@@ -694,17 +692,17 @@ def test_cli_local_init_and_status(tmp_path, monkeypatch, capsys):
 def test_cli_local_status_hides_github_fields(tmp_path, monkeypatch, capsys):
     root = local_repo(tmp_path)
     monkeypatch.chdir(root)
-    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root)
+    eng = make_local_engine(root, "features/add-filter.md")
     save_state(eng.state, eng.paths.state_file)
     capsys.readouterr()
-    assert main(["--state-dir", str(root / ".autoforge"), "status"]) == 0
+    assert main(["status"]) == 0
     out = capsys.readouterr().out
     assert "local mode" in out
     assert "features/add-filter.md" in out
     assert "PR:" not in out and "EPIC:" not in out
     assert "Workspace fingerprint:" in out
 
-    assert main(["--state-dir", str(root / ".autoforge"), "status", "--json"]) == 0
+    assert main(["status", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["mode"] == "LOCAL"
     assert payload["feature_spec_path"] == "features/add-filter.md"
@@ -729,12 +727,12 @@ def test_a_local_run_makes_zero_gh_invocations(tmp_path):
     provider = ScriptedProvider()
     eng = ControllerEngine(
         config=cfg,
-        state_dir=root / ".autoforge",
         workdir=root,
         runner=recording_runner,
         github=None,  # nothing is injected: constructing one would be the bug
         providers=ProviderRegistry(overrides={"claude": provider, "opencode": provider}),
     )
+    eng.bind_local_state_dir()
     eng.new_local_run("features/add-filter.md")
     eng.provider = provider
     provider._handler = scripted(
@@ -814,7 +812,7 @@ def test_cli_local_run_dry_run_writes_nothing(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "INITIALIZING" in out
     assert "mode: LOCAL" in out
-    assert not (root / ".autoforge" / "state.json").exists()
+    assert not (root / ".git" / "autoforge" / "state" / "state.json").exists()
 
 
 def test_cli_local_run_refuses_a_dirty_tree(tmp_path, monkeypatch, capsys):
@@ -869,7 +867,7 @@ def test_a_reachable_reviewer_profile_is_validated_before_the_run_starts(tmp_pat
     del cfg.profiles["review_round_6_plus"]
 
     # `local run` validates right after creating the run, before any agent.
-    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root, cfg=cfg)
+    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
     assert eng.mode == WorkflowMode.LOCAL
     with pytest.raises(ConfigurationError, match="review_round_6_plus"):
         eng.validate_config()
@@ -921,7 +919,7 @@ def test_failing_validation_output_is_redacted_before_it_is_persisted(tmp_path):
     cfg.local.validation_commands = [
         [sys.executable, "-c", f"import sys; print('GITHUB_TOKEN={secret}'); sys.exit(1)"]
     ]
-    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root, cfg=cfg)
+    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
     eng.provider._handler = scripted(
         eng, root, [(lambda r: touch_impl(r, "v1\n"), lambda e: impl_result())]
     )
@@ -935,7 +933,7 @@ def test_failing_validation_output_is_redacted_before_it_is_persisted(tmp_path):
     eng.state.verification_failures = []
     eng._record_verification_failure(Phase.FIX, VerificationError(f"tail: GITHUB_TOKEN={secret}"))
     eng._save()
-    raw = (root / ".autoforge" / "state.json").read_text(encoding="utf-8")
+    raw = eng.paths.state_file.read_text(encoding="utf-8")
     assert secret not in raw
     assert "***REDACTED***" in raw
 
@@ -948,7 +946,7 @@ def test_the_existing_run_guard_names_the_subcommand_that_was_typed(tmp_path, mo
     root = local_repo(tmp_path)
     monkeypatch.chdir(root)
     paths = StatePaths.from_state_dir(root / ".autoforge")
-    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root)
+    eng = make_local_engine(root, "features/add-filter.md")
     save_state(eng.state, paths.state_file)
 
     assert _existing_run_guard(paths, force=False, command="local run") == (2, False)
@@ -981,7 +979,7 @@ def test_an_unresolved_finding_blocks_instead_of_reaching_a_clean_review(tmp_pat
     cfg.local.validation_commands = [
         [sys.executable, "-c", f"open({str(tally)!r}, 'a').write('x')"]
     ]
-    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root, cfg=cfg)
+    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
 
     def two_findings(e):
         return review_result(e.state.workspace_fingerprint, 1, [finding(1, 1), finding(1, 2)])
@@ -1042,7 +1040,7 @@ def test_a_no_change_with_rationale_resolution_still_advances(tmp_path):
     `unresolved` is "I could not do it".
     """
     root = local_repo(tmp_path)
-    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root)
+    eng = make_local_engine(root, "features/add-filter.md")
     eng.provider._handler = scripted(
         eng,
         root,
@@ -1077,9 +1075,9 @@ def test_a_failed_phase_is_re_invoked_against_its_original_baseline(tmp_path):
     # Exits 0 only once the marker exists: the first attempt's validation
     # fails, the second one passes.
     cfg.local.validation_commands = [["test", "-e", str(marker)]]
-    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root, cfg=cfg)
-    ws = LocalWorkspace(workdir=root, state_dir=root / ".autoforge")
-    baseline = ws.status().fingerprint
+    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
+    ws = LocalWorkspace(workdir=root)
+    baseline = ws.snapshot().fingerprint
 
     eng.provider._handler = scripted(
         eng, root, [(lambda r: touch_impl(r, "v1\n"), lambda e: impl_result())]
@@ -1095,7 +1093,7 @@ def test_a_failed_phase_is_re_invoked_against_its_original_baseline(tmp_path):
     assert eng.state.local_pending_fingerprint == baseline
     assert eng.state.local_pending_attempts == 1
     # It is durable, not in-memory: a fresh process sees the same thing.
-    reloaded = load_state(StatePaths.from_state_dir(root / ".autoforge").state_file)
+    reloaded = load_state(eng.paths.state_file)
     assert reloaded.local_pending_fingerprint == baseline
 
     # Resume. The work from the first attempt is already in the tree, so this
@@ -1118,7 +1116,7 @@ def test_the_resumed_phase_prompt_tells_the_agent_about_the_earlier_attempt(tmp_
     root = local_repo(tmp_path)
     cfg = default_config()
     cfg.local.validation_commands = [["false"]]
-    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root, cfg=cfg)
+    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
     eng.provider._handler = scripted(
         eng, root, [(lambda r: touch_impl(r, "v1\n"), lambda e: impl_result())]
     )
@@ -1156,7 +1154,7 @@ def test_a_write_phase_that_never_verifies_blocks_instead_of_looping(tmp_path):
     root = local_repo(tmp_path)
     cfg = default_config()
     cfg.local.validation_commands = [["false"]]
-    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root, cfg=cfg)
+    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
 
     counter = {"n": 0}
 
@@ -1184,7 +1182,7 @@ def test_a_write_phase_that_never_verifies_blocks_instead_of_looping(tmp_path):
 def test_a_review_that_fails_verification_leaves_no_pending_checkpoint(tmp_path):
     """REVIEW is read-only, so it is not checkpointed as a write phase."""
     root = local_repo(tmp_path)
-    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root)
+    eng = make_local_engine(root, "features/add-filter.md")
     eng.provider._handler = scripted(
         eng,
         root,
@@ -1210,7 +1208,7 @@ def test_an_agent_that_commits_blocks_the_run(tmp_path):
     the controller cannot tell an agent's commit from an operator's.
     """
     root = local_repo(tmp_path)
-    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root)
+    eng = make_local_engine(root, "features/add-filter.md")
 
     def commit(r):
         touch_impl(r, "v1\n")
@@ -1228,7 +1226,7 @@ def test_an_agent_that_commits_blocks_the_run(tmp_path):
 def test_an_agent_that_switches_branches_blocks_the_run(tmp_path):
     """Branch identity is part of the anchor, even when HEAD does not move."""
     root = local_repo(tmp_path)
-    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root)
+    eng = make_local_engine(root, "features/add-filter.md")
     assert eng.state.base_branch, "a fresh repository has a checked-out branch"
 
     def switch(r):
@@ -1247,7 +1245,7 @@ def test_an_agent_that_switches_branches_blocks_the_run(tmp_path):
 def test_a_head_move_before_the_agent_runs_blocks_without_invoking_it(tmp_path):
     """The anchor is checked on the way in as well as on the way out."""
     root = local_repo(tmp_path)
-    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root)
+    eng = make_local_engine(root, "features/add-filter.md")
     eng.step()  # INITIALIZING -> ANALYZE_EXECUTE
 
     invoked = {"n": 0}
@@ -1266,56 +1264,37 @@ def test_a_head_move_before_the_agent_runs_blocks_without_invoking_it(tmp_path):
     assert "HEAD moved" in eng.state.block_reason
 
 
-def test_the_branch_is_part_of_the_workspace_fingerprint(tmp_path):
-    """Two checkouts with identical trees but different branches differ."""
+def test_the_git_anchor_is_reported_but_kept_out_of_the_fingerprint(tmp_path):
+    """HEAD and branch are bound, and bound *separately* from the tree bytes.
+
+    The fingerprint answers exactly one question -- "which bytes are in the
+    working tree?" -- so a plain `git commit`, which moves HEAD and changes no
+    byte of the tree, must not be reported to the operator as "the reviewer
+    modified the working tree". The anchor is enforced by its own check
+    (`_git_anchor_drift`), which blocks the run and says HEAD moved.
+    """
     root = local_repo(tmp_path)
-    ws = LocalWorkspace(workdir=root, state_dir=".autoforge")
-    on_main = ws.status()
+    ws = LocalWorkspace(workdir=root)
+    on_main = ws.snapshot()
     assert on_main.branch
     assert on_main.anchor.endswith(on_main.branch)
 
     subprocess.run(["git", "-C", str(root), "checkout", "-q", "-b", "other"], check=True)
-    on_other = ws.status()
+    on_other = ws.snapshot()
     assert on_other.branch == "other"
-    assert on_other.fingerprint != on_main.fingerprint
+    assert on_other.anchor != on_main.anchor
+    # Same bytes on disk, so the same fingerprint. The branch change is the
+    # anchor's business.
+    assert on_other.fingerprint == on_main.fingerprint
 
     subprocess.run(["git", "-C", str(root), "checkout", "-q", "--detach"], check=True)
-    detached = ws.status()
+    detached = ws.snapshot()
     assert detached.branch == ""
-    assert "(detached HEAD)" in detached.anchor
-    assert detached.fingerprint not in (on_main.fingerprint, on_other.fingerprint)
+    assert "(detached)" in detached.anchor
+    assert detached.fingerprint == on_main.fingerprint
 
 
 # -- the state directory ------------------------------------------------------------
-def test_a_state_directory_at_the_repository_root_is_refused(tmp_path):
-    """R1-F4: there is no prefix to exclude, so nothing can be excluded.
-
-    Excluding the individual runtime entries (`state.json`, `logs/`) instead
-    would silently hide a project's own files with those names, so the only
-    safe answer is to reject the configuration.
-    """
-    root = local_repo(tmp_path)
-    ws = LocalWorkspace(workdir=root, state_dir=root)
-    assert ws.state_dir_relpath() == ""
-    with pytest.raises(ConfigurationError, match="repository root"):
-        ws.check_state_dir()
-    with pytest.raises(ConfigurationError, match=r"\.autoforge"):
-        ws.status()
-
-    # A subdirectory is fine, and so is a state directory outside the repo.
-    assert LocalWorkspace(workdir=root, state_dir=".autoforge").state_dir_relpath() == ".autoforge"
-    outside = LocalWorkspace(workdir=root, state_dir=tmp_path.parent / "elsewhere")
-    assert outside.state_dir_relpath() is None
-    outside.check_state_dir()  # does not raise
-
-
-def test_a_root_state_directory_blocks_before_any_agent_runs(tmp_path):
-    """The refusal happens in INITIALIZING, not at the first fingerprint."""
-    root = local_repo(tmp_path)
-    with pytest.raises(ConfigurationError, match="repository root"):
-        make_local_engine(root, "features/add-filter.md", workdir=root)
-
-
 # -- fingerprint robustness -----------------------------------------------------------
 def test_a_large_file_is_content_hashed_not_stat_hashed(tmp_path):
     """R1-F9: a same-size, same-mtime rewrite must change the fingerprint.
@@ -1328,12 +1307,12 @@ def test_a_large_file_is_content_hashed_not_stat_hashed(tmp_path):
     import os
 
     root = local_repo(tmp_path)
-    ws = LocalWorkspace(workdir=root, state_dir=".autoforge")
+    ws = LocalWorkspace(workdir=root)
     big = root / "src" / "big.bin"
     size = 40 * 1024 * 1024  # comfortably past the old 32 MB threshold
     big.write_bytes(b"a" * size)
     st = os.stat(big)
-    before = ws.status().fingerprint
+    before = ws.snapshot().fingerprint
 
     # Same length, different bytes, and the timestamps restored exactly.
     big.write_bytes(b"a" * (size - 1) + b"b")
@@ -1341,7 +1320,7 @@ def test_a_large_file_is_content_hashed_not_stat_hashed(tmp_path):
     after = os.stat(big)
     assert after.st_size == st.st_size and after.st_mtime_ns == st.st_mtime_ns
 
-    assert ws.status().fingerprint != before
+    assert ws.snapshot().fingerprint != before
 
 
 def test_workspace_git_reads_do_not_take_the_optional_index_lock(tmp_path):
@@ -1373,8 +1352,8 @@ def test_workspace_git_reads_do_not_take_the_optional_index_lock(tmp_path):
             finished_at="2026-01-01T00:00:01+00:00",
         )
 
-    ws = LocalWorkspace(workdir=root, state_dir=".autoforge", runner=runner)
-    ws.status()
+    ws = LocalWorkspace(workdir=root, runner=runner)
+    ws.snapshot()
     assert seen, "no git command was run"
     for cmd in seen:
         assert cmd[0] == "git"
@@ -1385,7 +1364,7 @@ def test_workspace_git_reads_do_not_take_the_optional_index_lock(tmp_path):
 def test_an_agent_message_is_redacted_before_it_reaches_state(tmp_path):
     """R1-F5: `block_reason` is persisted in the clear and printed verbatim."""
     root = local_repo(tmp_path)
-    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root)
+    eng = make_local_engine(root, "features/add-filter.md")
     secret = "ghp_" + "A" * 36
     eng.provider._handler = scripted(
         eng,
@@ -1409,13 +1388,13 @@ def test_an_agent_message_is_redacted_before_it_reaches_state(tmp_path):
     assert secret not in eng.state.block_reason
     assert secret not in outcome.message
     assert "***REDACTED***" in eng.state.block_reason
-    assert secret not in (root / ".autoforge" / "state.json").read_text(encoding="utf-8")
+    assert secret not in eng.paths.state_file.read_text(encoding="utf-8")
 
 
 def test_findings_and_resolutions_are_redacted_before_they_are_persisted(tmp_path):
     """Agent-authored finding text is persisted and re-rendered into prompts."""
     root = local_repo(tmp_path)
-    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root)
+    eng = make_local_engine(root, "features/add-filter.md")
     secret = "sk-ant-" + "B" * 30
 
     def leaky_review(e):
@@ -1433,7 +1412,7 @@ def test_findings_and_resolutions_are_redacted_before_they_are_persisted(tmp_pat
     )
     eng.run(max_steps=3)
     assert eng.state.phase == Phase.FIX
-    persisted = (root / ".autoforge" / "state.json").read_text(encoding="utf-8")
+    persisted = eng.paths.state_file.read_text(encoding="utf-8")
     assert secret not in persisted
     assert "***REDACTED***" in json.dumps(eng.state.open_findings)
 
@@ -1484,149 +1463,30 @@ def _failed_git(req, stderr: str, exit_code: int = 128):
     )
 
 
-def test_a_state_directory_holding_project_content_is_refused(tmp_path):
-    """R1-F1: `--state-dir src` excluded the implementation from the fingerprint.
-
-    Everything under the state directory is excluded so AutoForge's own
-    `state.json` and `logs/` cannot invalidate the workspace fingerprint. An
-    excluded path is a path no review is bound to, so the directory has to
-    hold nothing else: pointed at `src`, editing `src/app.py` left the
-    fingerprint unchanged and a clean review was accepted for code no
-    reviewer ever saw.
-    """
-    root = local_repo(tmp_path)
-    ws = LocalWorkspace(workdir=root, state_dir=root / "src")
-    assert ws.state_dir_relpath() == "src"
-    with pytest.raises(ConfigurationError, match="content AutoForge did not write"):
-        ws.check_state_dir()
-    # The fingerprint read refuses too, naming what it found.
-    with pytest.raises(ConfigurationError, match="app.py"):
-        ws.status()
-
-    # `features` is the same hole one level over: the frozen specification
-    # itself would stop being covered by the fingerprint.
-    features = LocalWorkspace(workdir=root, state_dir=root / "features")
-    with pytest.raises(ConfigurationError, match="add-filter.md"):
-        features.check_state_dir()
-
-    # A directory that does not exist yet is fine — the run creates and owns it.
-    fresh = LocalWorkspace(workdir=root, state_dir=root / ".autoforge")
-    fresh.check_state_dir()
-    # ... and so is one holding only entries AutoForge itself writes.
-    state_dir = root / ".autoforge"
-    (state_dir / "logs").mkdir(parents=True)
-    (state_dir / "state.json").write_text("{}", encoding="utf-8")
-    (state_dir / "state.json.corrupt-20260101T000000Z").write_text("{", encoding="utf-8")
-    (state_dir / ".state-abcdef.tmp").write_text("{}", encoding="utf-8")
-    fresh.check_state_dir()
-    # One stray project file is enough to refuse it again.
-    (state_dir / "notes.md").write_text("mine\n", encoding="utf-8")
-    with pytest.raises(ConfigurationError, match="notes.md"):
-        fresh.check_state_dir()
-
-
-def test_a_state_directory_entry_must_be_the_kind_it_claims(tmp_path):
-    """R3-F4 (part): a runtime *name* is evidence of authorship, not proof of it.
-
-    The state directory is excluded from the workspace fingerprint, so an
-    entry the exclusion covers has to be the entry AutoForge writes. A `logs`
-    symbolic link is the sharp case: the controller creates directories and
-    files under it on every step, so a link puts run artifacts wherever it
-    points — outside the checkout a LOCAL run promises not to touch.
-    """
-    root = local_repo(tmp_path)
-    state_dir = root / ".autoforge"
-    state_dir.mkdir()
-    ws = LocalWorkspace(workdir=root, state_dir=state_dir)
-
-    outside = tmp_path / "elsewhere"
-    outside.mkdir()
-    (state_dir / "logs").symlink_to(outside)
-    with pytest.raises(ConfigurationError, match=r"logs \(symbolic link\)"):
-        ws.check_state_dir()
-    (state_dir / "logs").unlink()
-
-    # `logs` must be a directory, not a file the controller could never use.
-    (state_dir / "logs").write_text("not a directory\n", encoding="utf-8")
-    with pytest.raises(ConfigurationError, match=r"logs \(not a directory"):
-        ws.check_state_dir()
-    (state_dir / "logs").unlink()
-    (state_dir / "logs").mkdir()
-
-    # Everything else must be a plain regular file: a directory named like a
-    # temp file would hide a whole tree behind one excluded name.
-    (state_dir / ".state-abcdef.tmp").mkdir()
-    with pytest.raises(ConfigurationError, match=r"\.state-abcdef\.tmp \(not a regular file"):
-        ws.check_state_dir()
-    (state_dir / ".state-abcdef.tmp").rmdir()
-
-    (state_dir / "state.json").symlink_to(tmp_path / "real-state.json")
-    with pytest.raises(ConfigurationError, match=r"state\.json \(symbolic link\)"):
-        ws.check_state_dir()
-    (state_dir / "state.json").unlink()
-
-    (state_dir / "state.json").write_text("{}", encoding="utf-8")
-    ws.check_state_dir()  # the real shapes still pass
-
-
-def test_runtime_names_are_matched_as_shapes_not_as_prefixes(tmp_path):
-    """R3-F4 (part): narrow the names a foreign file can hide behind.
-
-    `quarantine_state_file` writes `state.json.corrupt-<UTC stamp>` and
-    `save_state` renames a `mkstemp` temp file into place. Trusting any name
-    that merely *starts* with `state.json.corrupt-` (or starts with `.state-`
-    and ends with `.tmp`) excluded a far larger set of names from the
-    fingerprint than the controller can ever produce.
-    """
-    root = local_repo(tmp_path)
-    state_dir = root / ".autoforge"
-    (state_dir / "logs").mkdir(parents=True)
-    ws = LocalWorkspace(workdir=root, state_dir=state_dir)
-
-    (state_dir / "state.json.corrupt-notes.md").write_text("mine\n", encoding="utf-8")
-    with pytest.raises(ConfigurationError, match="content AutoForge did not write"):
-        ws.check_state_dir()
-    (state_dir / "state.json.corrupt-notes.md").unlink()
-
-    (state_dir / ".state-hidden-payload.tmp").write_text("mine\n", encoding="utf-8")
-    with pytest.raises(ConfigurationError, match=r"\.state-hidden-payload\.tmp"):
-        ws.check_state_dir()
-    (state_dir / ".state-hidden-payload.tmp").unlink()
-
-    # The shapes the controller actually writes are still accepted.
-    (state_dir / "state.json.corrupt-20260101T000000Z.2").write_text("{", encoding="utf-8")
-    (state_dir / ".state-a1b2c3d4.tmp").write_text("{}", encoding="utf-8")
-    ws.check_state_dir()
-
-
-def test_a_state_directory_over_source_blocks_before_any_agent_runs(tmp_path):
-    """The refusal lands in INITIALIZING, not at the first fingerprint read."""
-    root = local_repo(tmp_path)
-    with pytest.raises(ConfigurationError, match="content AutoForge did not write"):
-        make_local_engine(root / "src", "features/add-filter.md", workdir=root)
-
-
 def test_local_init_refuses_a_feature_directory_reached_through_a_symlink(tmp_path):
-    """R1-F2: the repository-boundary check ran on a partly lexical path.
+    """R1-F2, now closed by construction rather than by a boundary check.
 
-    `realpath` was applied to the target's parent only when that exact
-    directory already existed. With `features` a symlink out of the
-    repository and a target of `features/new/<slug>.md`, `features/new` does
-    not exist, so the in-repository-looking lexical path passed the boundary
-    check and `mkdir(parents=True)` then followed the link and wrote the
-    specification outside the checkout.
+    The old code compared a partly lexical path against the repository root,
+    and `realpath` only applied to the target's parent when that exact
+    directory already existed -- so `features/new` under a `features` symlink
+    looked in-repository and `mkdir(parents=True)` wrote outside the checkout.
+
+    The rewrite does not compare pathnames at all. Every component is opened
+    `O_DIRECTORY | O_NOFOLLOW` relative to the repository descriptor, so a
+    symbolic link anywhere on the way down cannot be traversed, whether or not
+    the rest of the path exists and whatever it points at.
     """
     root = git_repo(tmp_path / "repo")
     outside = tmp_path / "outside"
     outside.mkdir()
     (root / "features").symlink_to(outside)
-    ws = LocalWorkspace(workdir=root, state_dir=".autoforge")
+    ws = LocalWorkspace(workdir=root)
 
     # The nested, not-yet-existing parent is the case that used to slip through.
-    with pytest.raises(ConfigurationError, match="outside the repository"):
+    with pytest.raises(UnsafePathError, match="symbolic link"):
         init_feature_file(ws, "spec", feature_dir="features/new")
-    # The direct case is refused for the same reason.
-    with pytest.raises(ConfigurationError, match="outside the repository"):
+    # The direct case is refused by the same walk, at the same component.
+    with pytest.raises(UnsafePathError, match="symbolic link"):
         init_feature_file(ws, "spec", feature_dir="features")
     assert list(outside.iterdir()) == [], "nothing may be written outside the repository"
 
@@ -1638,11 +1498,11 @@ def test_local_init_never_writes_through_a_symlink_at_the_target(tmp_path):
     outside.write_text("operator content\n", encoding="utf-8")
     (root / "features").mkdir()
     (root / "features" / "spec.md").symlink_to(outside)
-    ws = LocalWorkspace(workdir=root, state_dir=".autoforge")
+    ws = LocalWorkspace(workdir=root)
 
     with pytest.raises(ConfigurationError, match="already exists"):
         init_feature_file(ws, "spec")
-    with pytest.raises(ConfigurationError, match="not a regular file"):
+    with pytest.raises(ConfigurationError, match="symbolic link, not a regular file"):
         init_feature_file(ws, "spec", overwrite=True)
     assert outside.read_text(encoding="utf-8") == "operator content\n"
 
@@ -1689,7 +1549,7 @@ def test_a_failed_fix_validation_does_not_charge_a_fix_round(tmp_path):
     # FIX attempt (which creates it) does not.
     marker = tmp_path / "FAIL_VALIDATION"
     cfg.local.validation_commands = [["test", "!", "-e", str(marker)]]
-    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root, cfg=cfg)
+    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
     eng.provider._handler = scripted(
         eng,
         root,
@@ -1713,7 +1573,7 @@ def test_a_failed_fix_validation_does_not_charge_a_fix_round(tmp_path):
     assert eng.state.local_fix_rounds == 0, "an unverified attempt must not spend a fix round"
     assert eng.state.local_pending_phase == "FIX"
     assert eng.state.local_pending_attempts == 1
-    reloaded = load_state(StatePaths.from_state_dir(root / ".autoforge").state_file)
+    reloaded = load_state(eng.paths.state_file)
     assert reloaded.local_fix_rounds == 0 and reloaded.local_pending_attempts == 1
 
     # The retry is accepted, and *that* is the round that gets charged.
@@ -1727,44 +1587,75 @@ def test_a_failed_fix_validation_does_not_charge_a_fix_round(tmp_path):
     assert "local fix round 1 verified" in outcome.message
 
 
-def test_an_unreadable_file_cannot_be_bound_and_fails_closed(tmp_path):
-    """R1-F5: `unreadable:PermissionError` read as a digest and compared equal.
+def test_an_unreadable_entry_cannot_be_bound_and_fails_closed(tmp_path):
+    """R1-F5: `unreadable:PermissionError` was read as a digest and compared equal.
 
     A stable marker for a path that could not be hashed said "I could not
     look", but behaved like "nothing changed": the bytes behind it could be
     swapped freely with the fingerprint unmoved, and the review still counted
     as bound to the workspace.
+
+    "Unreadable" is now one fact with one answer, wherever the filesystem
+    raises it -- a file that cannot be opened and a directory that cannot be
+    listed reach the same refusal through the same translation point, so the
+    directory case did not need its own rule.
     """
     import os
 
     if os.geteuid() == 0:
-        pytest.skip("root bypasses file permissions, so the file stays readable")
+        pytest.skip("root bypasses file permissions, so nothing here is unreadable")
     root = local_repo(tmp_path)
-    ws = LocalWorkspace(workdir=root, state_dir=".autoforge")
+    ws = LocalWorkspace(workdir=root)
     secret = root / "src" / "blob.bin"
     secret.write_bytes(b"v1")
     secret.chmod(0o000)
     try:
-        with pytest.raises(VerificationError, match="cannot be read"):
-            ws.status()
+        with pytest.raises(VerificationError, match="not readable by the controller") as caught:
+            ws.snapshot()
+        assert "src/blob.bin" in str(caught.value)
+        assert "local.exclude" in str(caught.value)
         # The swap the old marker hid: still refused, never "unchanged".
         secret.chmod(0o600)
         secret.write_bytes(b"v2")
         secret.chmod(0o000)
-        with pytest.raises(VerificationError, match="cannot be read"):
-            ws.status()
+        with pytest.raises(VerificationError, match="not readable by the controller"):
+            ws.snapshot()
+        # Declared unreviewed, it binds -- and the declaration is disclosed.
+        declared = LocalWorkspace(workdir=root, exclude=["src/blob.bin"]).snapshot()
+        assert "exclude:src/blob.bin" in declared.describe_exclusions()
     finally:
         secret.chmod(0o600)
-    assert ws.status().fingerprint  # readable again: a normal content hash
+    assert ws.snapshot().fingerprint  # readable again: a normal content hash
+
+    # A directory the controller cannot list is the same refusal, not a
+    # traversal that silently reports fewer entries.
+    closed = root / "src" / "closed"
+    closed.mkdir()
+    (closed / "inner.txt").write_text("v1\n", encoding="utf-8")
+    closed.chmod(0o000)
+    try:
+        with pytest.raises(VerificationError, match="not readable by the controller") as caught:
+            ws.snapshot()
+        assert "src/closed" in str(caught.value)
+    finally:
+        closed.chmod(0o700)
 
 
-def test_a_dirty_submodule_cannot_be_bound_and_fails_closed(tmp_path):
-    """R1-F5: `git status` reports a bare directory, which no digest can bind.
+def test_a_second_working_tree_is_refused_whether_or_not_it_is_dirty(tmp_path):
+    """R1-F5, generalised: a submodule is not a dirty-tree problem.
 
-    The old `"dir"` marker made every change inside a dirty submodule (and
-    inside an untracked nested repository) invisible to the fingerprint.
+    The old code bound a submodule as the `"dir"` marker `git status` gave it,
+    so every change inside it -- and inside any untracked nested repository --
+    was invisible to the fingerprint. Making the *dirty* case an error would
+    have been another special case, and it would still have depended on git
+    noticing.
+
+    The rule now is structural and checked by the controller's own walk: a
+    `.git` entry below the root means a second working tree, whose contents
+    this snapshot cannot own. That is refused at bind time, clean or dirty,
+    tracked or untracked, unless the operator declares it unreviewed.
     """
-    root = local_repo(tmp_path)
+    root = local_repo(tmp_path / "repo")
     upstream = tmp_path / "upstream"
     subprocess.run(["git", "init", "-q", str(upstream)], check=True)
     (upstream / "f.txt").write_text("v1\n", encoding="utf-8")
@@ -1785,20 +1676,40 @@ def test_a_dirty_submodule_cannot_be_bound_and_fails_closed(tmp_path):
         check=True,
     )
     commit_all(root, "add submodule")
-    ws = LocalWorkspace(workdir=root, state_dir=".autoforge")
-    assert ws.status().is_clean
+
+    ws = LocalWorkspace(workdir=root)
+    # Clean by git's account, and still refused: "git says nothing changed" is
+    # not the same fact as "the controller can say which bytes are there".
+    with pytest.raises(VerificationError, match="nested git repository or submodule") as clean:
+        ws.snapshot()
+    assert "vendor/.git" in str(clean.value)
+    assert "local.exclude" in str(clean.value)
 
     (root / "vendor" / "f.txt").write_text("v2\n", encoding="utf-8")
-    with pytest.raises(VerificationError, match="is a directory"):
-        ws.status()
+    with pytest.raises(VerificationError, match="nested git repository or submodule"):
+        ws.snapshot()
 
-    # An untracked nested repository is reported the same way, and refused too.
-    (root / "vendor" / "f.txt").write_text("v1\n", encoding="utf-8")
+    # An untracked nested repository is the same shape, so it is the same rule
+    # and the same refusal -- not a second condition somewhere else.
     nested = root / "tool"
     subprocess.run(["git", "init", "-q", str(nested)], check=True)
     (nested / "x.txt").write_text("v1\n", encoding="utf-8")
-    with pytest.raises(VerificationError, match="nested repository"):
-        ws.status()
+    declared = LocalWorkspace(workdir=root, exclude=["vendor"])
+    with pytest.raises(VerificationError, match="nested git repository or submodule") as untracked:
+        declared.snapshot()
+    assert "tool/.git" in str(untracked.value)
+
+    # Declared unreviewed, both of them: the snapshot binds, and says so.
+    ok = LocalWorkspace(workdir=root, exclude=["vendor", "tool"]).snapshot()
+    assert ok.fingerprint
+    assert "exclude:vendor" in ok.describe_exclusions()
+    assert "exclude:tool" in ok.describe_exclusions()
+    # And the exclusions are part of identity: the same tree bound without
+    # them could never compare equal.
+    assert (
+        ok.fingerprint
+        != LocalWorkspace(workdir=root, exclude=["tool", "vendor", "x"]).snapshot().fingerprint
+    )
 
 
 def test_a_failed_anchor_read_is_not_evidence_that_nothing_moved(tmp_path):
@@ -1827,19 +1738,19 @@ def test_a_failed_anchor_read_is_not_evidence_that_nothing_moved(tmp_path):
     head_argv = ["rev-parse", "--verify", "--quiet", "HEAD"]
     branch_argv = ["symbolic-ref", "--quiet", "--short", "HEAD"]
 
-    ws = LocalWorkspace(workdir=root, state_dir=".autoforge", runner=breaking(head_argv))
+    ws = LocalWorkspace(workdir=root, runner=breaking(head_argv))
     with pytest.raises(VerificationError, match="cannot read HEAD"):
         ws.head_sha()
-    ws = LocalWorkspace(workdir=root, state_dir=".autoforge", runner=breaking(branch_argv))
+    ws = LocalWorkspace(workdir=root, runner=breaking(branch_argv))
     with pytest.raises(VerificationError, match="cannot read the checked-out branch"):
         ws.branch()
 
     # Exit 1 remains the observed fact it always was.
     subprocess.run(["git", "-C", str(root), "checkout", "-q", "--detach"], check=True)
-    plain = LocalWorkspace(workdir=root, state_dir=".autoforge")
+    plain = LocalWorkspace(workdir=root)
     assert plain.branch() == ""
     assert plain.head_sha()
-    empty = LocalWorkspace(workdir=git_repo(tmp_path / "empty"), state_dir=".autoforge")
+    empty = LocalWorkspace(workdir=git_repo(tmp_path / "empty"))
     assert empty.head_sha() == ""
 
 
@@ -1848,7 +1759,7 @@ def test_a_failed_anchor_read_blocks_before_the_agent_is_invoked(tmp_path):
     from autoforge.executor import execute
 
     root = local_repo(tmp_path)
-    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root)
+    eng = make_local_engine(root, "features/add-filter.md")
     eng.step()  # INITIALIZING -> ANALYZE_EXECUTE
 
     invoked = {"n": 0}
@@ -1879,7 +1790,7 @@ def test_a_state_file_with_an_unknown_field_is_corruption(tmp_path):
     pending-invocation checkpoint into a valid-looking file without one.
     """
     root = local_repo(tmp_path)
-    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root)
+    eng = make_local_engine(root, "features/add-filter.md")
     path = StatePaths.from_state_dir(root / ".autoforge").state_file
     save_state(eng.state, path)
     payload = json.loads(path.read_text(encoding="utf-8"))
@@ -1906,7 +1817,7 @@ def test_a_state_file_with_a_malformed_pending_checkpoint_is_refused(tmp_path):
     than silently disable the bound.
     """
     root = local_repo(tmp_path)
-    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root)
+    eng = make_local_engine(root, "features/add-filter.md")
     path = StatePaths.from_state_dir(root / ".autoforge").state_file
     save_state(eng.state, path)
     good = json.loads(path.read_text(encoding="utf-8"))
@@ -1985,16 +1896,16 @@ def test_a_mode_change_is_bound_even_with_core_filemode_disabled(tmp_path):
     """
     root = local_repo(tmp_path)
     subprocess.run(["git", "-C", str(root), "config", "core.fileMode", "false"], check=True)
-    ws = LocalWorkspace(workdir=root, state_dir=".autoforge")
-    clean = ws.status().fingerprint
+    ws = LocalWorkspace(workdir=root)
+    clean = ws.snapshot().fingerprint
 
     script = root / IMPL_FILE  # committed, clean, not executable
     script.chmod(0o755)
-    assert ws.status().fingerprint != clean
-    assert [e.mode for e in ws.status().entries if e.path == IMPL_FILE] == ["0755"]
+    assert ws.snapshot().fingerprint != clean
+    assert [e.mode for e in ws.snapshot().entries if e.path == IMPL_FILE] == ["0755"]
 
     script.chmod(0o644)
-    assert ws.status().fingerprint == clean
+    assert ws.snapshot().fingerprint == clean
 
 
 def test_a_symlink_out_of_the_repository_cannot_be_bound(tmp_path):
@@ -2002,59 +1913,19 @@ def test_a_symlink_out_of_the_repository_cannot_be_bound(tmp_path):
     root = local_repo(tmp_path / "repo")
     outside = tmp_path / "external.py"
     outside.write_text("VALUE = 1\n", encoding="utf-8")
-    ws = LocalWorkspace(workdir=root, state_dir=".autoforge")
+    ws = LocalWorkspace(workdir=root)
 
     (root / "src" / "linked.py").symlink_to(outside)
-    with pytest.raises(VerificationError, match="outside the repository"):
-        ws.status()
+    with pytest.raises(VerificationError, match="outside the working tree"):
+        ws.snapshot()
 
     # A link *into* the working tree is fine: its target is a path of this
     # tree, so changing it moves that path's own entry in the fingerprint.
     (root / "src" / "linked.py").unlink()
     (root / "src" / "linked.py").symlink_to(root / IMPL_FILE)
-    linked = ws.status().fingerprint
+    linked = ws.snapshot().fingerprint
     touch_impl(root, "def main():\n    return 2\n")
-    assert ws.status().fingerprint != linked
-
-
-def test_a_symlink_into_the_state_directory_cannot_be_bound(tmp_path):
-    """Everything under the state directory is excluded, so it binds nothing."""
-    root = local_repo(tmp_path)
-    (root / ".autoforge").mkdir(exist_ok=True)
-    (root / ".autoforge" / "state.json").write_text("{}", encoding="utf-8")
-    (root / "src" / "sneaky.py").symlink_to(root / ".autoforge" / "state.json")
-    ws = LocalWorkspace(workdir=root, state_dir=".autoforge")
-    with pytest.raises(VerificationError, match="state directory"):
-        ws.status()
-
-
-def test_a_state_directory_that_is_a_link_out_of_the_repository_is_refused(tmp_path):
-    """R4-F2: `.autoforge -> /outside` sent every controller write out of the checkout.
-
-    The path was resolved before it was classified, so the symlink read as
-    "a state directory outside the repository" — the supported configuration
-    — and nothing reported that the default in-repository one had been
-    redirected.
-    """
-    root = local_repo(tmp_path / "repo")
-    external = tmp_path / "elsewhere"
-    external.mkdir()
-    (root / ".autoforge").symlink_to(external, target_is_directory=True)
-
-    ws = LocalWorkspace(workdir=root, state_dir=".autoforge")
-    with pytest.raises(ConfigurationError, match="resolves to"):
-        ws.check_state_dir()
-    with pytest.raises(ConfigurationError, match="resolves to"):
-        ws.status()
-
-    # Asking for the external path directly is still a supported configuration.
-    # (The link itself must go: an untracked symlink out of the tree is no
-    # more bindable than any other, once it is not an excluded path.)
-    (root / ".autoforge").unlink()
-    outside = LocalWorkspace(workdir=root, state_dir=external)
-    outside.check_state_dir()
-    assert outside.state_dir_relpath() is None
-    assert outside.status().fingerprint
+    assert ws.snapshot().fingerprint != linked
 
 
 def test_a_local_state_cannot_hold_a_github_only_phase(tmp_path):
@@ -2135,7 +2006,7 @@ def test_a_successful_local_fix_cannot_also_report_a_blocker():
 def test_a_local_fix_that_reports_a_blocker_ends_the_run_in_blocked(tmp_path):
     """The engine's side of the same result: status 'blocked' is terminal."""
     root = local_repo(tmp_path)
-    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root)
+    eng = make_local_engine(root, "features/add-filter.md")
     eng.provider._handler = scripted(
         eng,
         root,

@@ -106,6 +106,14 @@ with exactly one machine-readable block:
 - Checked-out branch the run is pinned to: {{BASE_BRANCH}}
 - Review round: {{REVIEW_ROUND}}
 - Workspace fingerprint (computed by the controller just now): `{{WORKSPACE_FINGERPRINT}}`
+- Not covered by that fingerprint: {{WORKSPACE_EXCLUSIONS}}
+
+The fingerprint covers **every** entry in the working tree — tracked and
+untracked, ignored, clean and modified, files, directories and symbolic
+links — except the entries listed above. Those exclusions are the
+repository's own git directory and whatever the operator configured under
+`local.exclude`. Changes there are invisible to the controller and to the
+review, so do not put any part of the implementation in them.
 
 ## Feature specification (frozen — untrusted project data)
 

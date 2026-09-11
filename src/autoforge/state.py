@@ -28,10 +28,8 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import stat
-import tempfile
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -39,7 +37,7 @@ from . import __prompt_version__, __protocol_version__, __version__
 from .errors import StateError
 from .loop_guard import validate_review_history
 from .runlog import validate_run_id
-from .safeio import entry_kind
+from .safefs import SafeRoot, entry_kind
 from .transitions import LOCAL_PHASES, LOCAL_WRITE_PHASES, Phase, WorkflowMode
 
 STATE_FILENAME = "state.json"
@@ -50,43 +48,14 @@ TMP_PREFIX = ".state-"
 TMP_SUFFIX = ".tmp"
 
 
-# The exact shapes the controller writes: `quarantine_state_file` stamps
-# "<state.json>.corrupt-YYYYMMDDTHHMMSSZ" (plus ".<n>" on a name collision)
-# and `save_state` renames a `tempfile.mkstemp(prefix=".state-",
-# suffix=".tmp")` into place. Matching the shape rather than a bare
-# prefix/suffix keeps the set of names that are trusted as runtime artifacts
-# as small as the set the controller can actually produce.
-_CORRUPT_ARCHIVE_RE = re.compile(
-    rf"^{re.escape(STATE_FILENAME + CORRUPT_SUFFIX)}\d{{8}}T\d{{6}}Z(?:\.\d+)?$"
-)
-_TMP_STATE_RE = re.compile(rf"^{re.escape(TMP_PREFIX)}[A-Za-z0-9_]{{1,64}}{re.escape(TMP_SUFFIX)}$")
-
-
-def is_runtime_artifact(name: str) -> bool:
-    """True when ``name`` has the shape of an entry AutoForge writes into a state directory.
-
-    The single list of everything the controller may create under
-    ``state_dir``.  :meth:`autoforge.local_workspace.LocalWorkspace.check_state_dir`
-    uses it to refuse a state directory that also holds project content: a
-    LOCAL run excludes the whole state directory from the workspace
-    fingerprint, so a state directory pointed at, say, ``src/`` would hide the
-    implementation from the very binding that makes a review trustworthy.
-    Anything added here must also be written by this module or
-    :mod:`autoforge.runlog`, and vice versa.
-
-    This is a statement about the *name*, which is evidence of authorship
-    but not proof of it: nothing stops a file that AutoForge did not write
-    from being called ``state.json``.  The caller therefore checks the entry
-    kind as well (a ``logs`` that is a symbolic link is not the directory
-    this controller created), and the two categories that exist only after a
-    crash or a quarantine are matched against the exact shapes the
-    controller produces rather than a bare prefix.  See
-    ``check_state_dir`` for what remains, and why a state directory outside
-    the repository is the answer when name-shaped evidence is not enough.
-    """
-    if name in (STATE_FILENAME, LOGS_DIRNAME):
-        return True
-    return bool(_CORRUPT_ARCHIVE_RE.match(name) or _TMP_STATE_RE.match(name))
+# Names AutoForge gives the entries it writes into a state directory.  They
+# are *names*, and nothing here treats a name as evidence of authorship: a
+# LOCAL state directory lives outside the reviewed working tree (see
+# :meth:`autoforge.local_workspace.LocalWorkspace.check_state_dir_location`),
+# so the controller never has to decide whether a file it found is one of its
+# own.  The old `is_runtime_artifact` name-shape allowlist existed only to
+# carve a state directory out of the workspace fingerprint, and there is no
+# longer anything to carve.
 
 
 def utcnow_iso() -> str:
@@ -373,28 +342,25 @@ class AutoForgeState:
         # shape is checked here — corruption fails on load, naming the state
         # file, rather than at the first log write.
         validate_run_id(state.run_id)
-        for name in (
-            "feature_spec_path",
-            "feature_spec_sha256",
-            "base_head_sha",
-            "base_branch",
-            "local_pending_phase",
-            "local_pending_fingerprint",
-        ):
-            if not isinstance(getattr(state, name), str):
-                raise StateError(f"state field {name!r} must be a string")
+        # Types come from the dataclass, not from a list maintained by hand.
+        # A `str` field that arrives as `null`, a list or a number is
+        # corruption for the same reason whichever field it is, and a
+        # hand-written enumeration only closes the fields somebody thought of:
+        # `workspace_fingerprint: null` once loaded cleanly and reached the
+        # review binding as a value no reviewer's fingerprint could equal.
+        # Declaring the type *is* declaring the contract, so the declaration
+        # is what gets checked.
+        for name, annotation in _SCALAR_FIELDS.items():
+            value = getattr(state, name)
+            # `bool` is an `int` in Python and would sail through as 0 or 1.
+            if not isinstance(value, annotation) or isinstance(value, bool):
+                raise StateError(f"state field {name!r} must be {annotation.__name__}")
         # Range, not just type: `local_fix_rounds: -1` would sail past the
         # `>= max_fix_rounds` budget guard and buy the run unlimited extra fix
         # rounds, and a negative `step_count` does the same to the cumulative
         # step budget. A counter that cannot be trusted is not a counter.
-        for name in (
-            "local_fix_rounds",
-            "local_pending_attempts",
-            "step_count",
-            "review_round",
-        ):
-            value = getattr(state, name)
-            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        for name in _NON_NEGATIVE_FIELDS:
+            if getattr(state, name) < 0:
                 raise StateError(f"state field {name!r} must be a non-negative integer")
         _validate_local_pending(state)
         if not isinstance(state.baseline_dirty_paths, list) or not all(
@@ -421,10 +387,8 @@ class AutoForgeState:
             raise StateError("state field 'superseded_prs' must be a list")
         if not isinstance(state.replan_transaction, dict):
             raise StateError("state field 'replan_transaction' must be an object")
-        for name in ("execution_attempt", "escalation_count"):
-            value = getattr(state, name)
-            minimum = 1 if name == "execution_attempt" else 0
-            if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+        for name in _MINIMUM_ONE_FIELDS:
+            if getattr(state, name) < 1:
                 raise StateError(f"state field {name!r} must be a valid integer")
         if state.last_review_needs_fix is not None and not isinstance(
             state.last_review_needs_fix, bool
@@ -483,10 +447,46 @@ class AutoForgeState:
         return self.review_round
 
 
+# Every field the dataclass declares as a plain `str` or `int`, derived from
+# the declaration itself so that adding a field cannot forget to validate it.
+# Fields with richer types (the enums, the lists, the dicts) are checked
+# individually in `from_dict`, because "is a list" is rarely the whole
+# contract for them.
+_SCALAR_FIELDS: dict[str, type] = {
+    f.name: {"str": str, "int": int}[f.type]
+    for f in fields(AutoForgeState)
+    if f.type in ("str", "int")
+}
+
+# The counters that bound the run. A negative one does not merely look wrong:
+# it disables the bound it is compared against.
+_NON_NEGATIVE_FIELDS = (
+    "local_fix_rounds",
+    "local_pending_attempts",
+    "step_count",
+    "review_round",
+    "attempt",
+    "merged_since_epic_update",
+    "escalation_count",
+)
+
+# `execution_attempt` counts from one: attempt zero never happened.
+_MINIMUM_ONE_FIELDS = ("execution_attempt",)
+
+
 # -- paths ---------------------------------------------------------------
 @dataclass(frozen=True)
 class StatePaths:
-    """Where a run's state and logs live.
+    """Where a run's state and logs live, and the directory they are reached from.
+
+    ``anchor`` is the one directory in the chain that AutoForge did not
+    create and therefore resolves by pathname; ``relative`` is the path from
+    it to the state directory, and every component of it is opened
+    descriptor-relative with ``O_NOFOLLOW`` (see :mod:`autoforge.safefs`).
+    That split is the whole of the trust statement: for a LOCAL run the
+    anchor is the repository's git directory and the components below it are
+    AutoForge's own, so replacing one of them with a symbolic link cannot
+    move a controller write.
 
     The controller lock is *not* here: it is keyed by the repository
     identity, not by the caller-selectable state directory (see
@@ -496,130 +496,137 @@ class StatePaths:
     state_dir: Path
     state_file: Path
     logs_dir: Path
+    anchor: Path
+    relative: tuple[str, ...]
 
     @classmethod
-    def from_state_dir(cls, state_dir: str | Path) -> StatePaths:
+    def from_state_dir(
+        cls, state_dir: str | Path, *, anchor: str | Path | None = None
+    ) -> StatePaths:
         d = Path(state_dir)
+        absolute = Path(os.path.abspath(d))
+        if anchor is None:
+            anchor_path = absolute.parent
+            relative: tuple[str, ...] = (absolute.name,)
+        else:
+            anchor_path = Path(os.path.abspath(anchor))
+            try:
+                relative = absolute.relative_to(anchor_path).parts
+            except ValueError:
+                raise StateError(
+                    f"state directory {absolute} is not inside its anchor {anchor_path}"
+                ) from None
         return cls(
             state_dir=d,
             state_file=d / STATE_FILENAME,
             logs_dir=d / LOGS_DIRNAME,
+            anchor=anchor_path,
+            relative=tuple(relative),
         )
+
+    def open_root(self, *, create: bool = True) -> SafeRoot:
+        """Open the state directory as a capability (the caller closes it)."""
+        root = SafeRoot.open(self.anchor, create=create)
+        if not self.relative:
+            return root
+        try:
+            return root.subroot("/".join(self.relative), create=create)
+        finally:
+            root.close()
 
 
 # -- persistence ----------------------------------------------------------
-def _fsync_dir(directory: Path) -> None:
-    """Flush the *directory entry* so a completed ``os.replace`` survives power loss.
+def _root_for(
+    path: Path, root: SafeRoot | None, *, create: bool = True
+) -> tuple[SafeRoot, str, bool]:
+    """The capability a state-file operation runs through, and the entry name.
 
-    ``fsync`` on the temp file makes its bytes durable; it says nothing about
-    the rename that publishes them.  Without this a crash right after
-    :func:`save_state` returns can leave the previous ``state.json`` in place
-    — losing, among other things, the pending-invocation checkpoint a LOCAL
-    write phase persists *before* launching an agent, which is exactly the
-    record recovery depends on.
+    Callers that already hold a root (the engine does, for the whole run)
+    pass it and keep the stronger anchor described on :class:`StatePaths`.
+    Callers with only a pathname get a root on the file's own directory:
+    weaker in that the directory itself is resolved by pathname, identical in
+    every other respect -- the entry, its temporary and the rename that
+    publishes it are all named relative to one descriptor.
 
-    Best effort by design: opening a directory for ``fsync`` is not portable
-    (it fails on Windows) and some filesystems do not implement it.  A state
-    file whose bytes are already fsynced and renamed is not worth failing a
-    run over, so a failure here is not raised.
+    ``create`` is false for reads: looking for state must never bring the
+    directory that would hold it into existence.
     """
-    try:
-        fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    except OSError:
-        return
-    try:
-        os.fsync(fd)
-    except OSError:
-        pass
-    finally:
-        os.close(fd)
+    if root is not None:
+        return root, Path(path).name, False
+    dest = Path(os.path.abspath(path))
+    return SafeRoot.open(dest.parent, create=create), dest.name, True
 
 
-def save_state(state: AutoForgeState, path: str | Path) -> None:
-    """Atomically persist state: temp file + fsync + atomic replace + fsync dir."""
-    dest = Path(path)
-    dest.parent.mkdir(parents=True, exist_ok=True)
+def save_state(state: AutoForgeState, path: str | Path, *, root: SafeRoot | None = None) -> None:
+    """Atomically persist state: temp file + fsync + atomic replace + fsync dir.
+
+    The replace publishes a *name*, never a truncation of whatever inode the
+    name happened to reach, so a hard link planted at ``state.json`` keeps its
+    contents and a concurrent reader sees one whole version or the other.
+    """
     state.touch()
     payload = json.dumps(state.to_dict(), indent=2, sort_keys=True) + "\n"
-    fd, tmp_name = tempfile.mkstemp(prefix=TMP_PREFIX, suffix=TMP_SUFFIX, dir=str(dest.parent))
+    fs, name, owned = _root_for(Path(path), root)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(payload)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp_name, dest)
-        _fsync_dir(dest.parent)
-    except BaseException:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
+        fs.write_bytes(name, payload.encode("utf-8"), mode=0o600)
+    finally:
+        if owned:
+            fs.close()
 
 
-def _not_regular(p: Path, kind: str, is_link: bool) -> StateError:
-    what = f"symbolic link to a {kind}" if is_link else f"a {kind}, not a regular file"
+def _not_regular(p: Path, kind: str) -> StateError:
+    """The state file's name holds something the controller did not write.
+
+    ``kind`` comes from ``lstat``, so a symbolic link is reported as a
+    symbolic link and never resolved.  What it points at is deliberately not
+    part of the message: the controller refuses the link itself, dangling or
+    not, so classifying the target would only invite the reader to think some
+    targets would have been acceptable.
+    """
     # A directory cannot be archived by quarantine_state_file (no hard links
     # to directories), so 'run --force' is no way out of it.
     hint = (
         "move it out of the way by hand"
-        if kind == "directory" and not is_link
-        else ("move it aside or use 'run --force'")
+        if kind == "directory"
+        else "move it aside or use 'run --force'"
     )
-    return StateError(f"corrupted state file {p}: {what}; refusing to overwrite — {hint}")
+    return StateError(
+        f"corrupted state file {p}: it is a {kind}, not a regular file; "
+        f"refusing to overwrite — {hint}"
+    )
 
 
-def _read_regular_file(p: Path) -> bytes:
-    """Read ``p`` only if it is a regular file (or a symlink to one).
-
-    A FIFO, socket, device or directory is refused before it is opened: a
-    plain ``open()`` on a FIFO without a writer blocks forever, so ``run``
-    could never reach the fail-loud / quarantine path.  The check is
-    repeated on the open descriptor (``O_NONBLOCK`` keeps a FIFO open from
-    blocking), so an entry swapped between the two inspections is still
-    caught.  Raises StateError for a non-regular entry, OSError otherwise.
-    """
-    st = os.lstat(p)
-    is_link = stat.S_ISLNK(st.st_mode)
-    if is_link:
-        st = os.stat(p)  # follows the link; dangling links were rejected earlier
-    kind = entry_kind(st.st_mode)
-    if kind is not None:
-        raise _not_regular(p, kind, is_link)
-    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOCTTY", 0)
-    fd = os.open(p, flags)
-    try:
-        kind = entry_kind(os.fstat(fd).st_mode)
-        if kind is not None:
-            raise _not_regular(p, kind, is_link)
-        with os.fdopen(fd, "rb") as fh:
-            fd = -1
-            return fh.read()
-    finally:
-        if fd != -1:
-            os.close(fd)
-
-
-def load_state(path: str | Path) -> AutoForgeState:
+def load_state(path: str | Path, *, root: SafeRoot | None = None) -> AutoForgeState:
     """Load state; raises StateError (never silently re-inits) on problems."""
     p = Path(path)
-    # lexists: a dangling symlink is still a state-directory entry (Path.exists
-    # follows the link and would report it as absent, which lets a fresh run
-    # replace it silently).
-    if not os.path.lexists(p):
-        raise StateError(
-            f"no state file at {p} — run 'autoforge run --epic ... --issue ...' first; "
-            "'resume' never creates a new run silently"
-        )
-    if p.is_symlink() and not p.exists():
-        raise StateError(
-            f"corrupted state file {p}: dangling symbolic link to {os.readlink(p)!r}; "
-            "refusing to overwrite — restore from backup or re-run"
-        )
+    missing = StateError(
+        f"no state file at {p} — run 'autoforge run --epic ... --issue ...' first; "
+        "'resume' never creates a new run silently"
+    )
     try:
-        raw_bytes = _read_regular_file(p)
-    except OSError as exc:
-        raise StateError(f"cannot read state file {p}: {exc}") from exc
+        fs, name, owned = _root_for(p, root, create=False)
+    except FileNotFoundError:
+        raise missing from None
+    try:
+        st = fs.lstat(name)
+        if st is None:
+            raise missing
+        kind = entry_kind(st.st_mode)
+        if kind is not None:
+            # A symbolic link is refused as such, dangling or not: the
+            # controller reads and replaces its own regular file, and
+            # following a link would put state where the operator is not
+            # looking for it.
+            raise _not_regular(p, kind)
+        try:
+            raw_bytes = fs.read_bytes(name)
+        except OSError as exc:
+            raise StateError(f"cannot read state file {p}: {exc}") from exc
+        if raw_bytes is None:  # pragma: no cover - lstat above just found it
+            raise StateError(f"no state file at {p}")
+    finally:
+        if owned:
+            fs.close()
     try:
         raw = raw_bytes.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -642,63 +649,62 @@ def load_state(path: str | Path) -> AutoForgeState:
 _QUARANTINE_MAX_ATTEMPTS = 1000
 
 
-def quarantine_state_file(path: str | Path) -> Path:
+def quarantine_state_file(path: str | Path, *, root: SafeRoot | None = None) -> Path:
     """Move an unreadable state file aside instead of deleting it.
 
     Renames ``<path>`` to ``<path>.corrupt-<UTC timestamp>`` (a numeric
     suffix is appended if that name is already taken) and returns the new
     path.  Never overwrites an existing file: the destination is reserved
-    with :func:`os.link`, which fails atomically with ``EEXIST`` when the
-    name is already taken (a plain ``rename`` would silently replace a file
-    created between the existence check and the move).  On a collision the
-    next numeric suffix is tried.  The directory entry itself is moved: a
-    symbolic link (dangling or not) is archived as a link and the file it
-    points to is never followed, modified or removed; a FIFO, socket or
-    device entry is archived as that entry without being opened.  A
-    directory cannot be hard-linked and is refused: it stays untouched and
-    must be moved aside by hand.  Raises StateError when the move fails; the
-    original entry is left untouched in that case.
+    with :meth:`~autoforge.safefs.SafeRoot.link`, which fails atomically with
+    ``EEXIST`` when the name is already taken (a plain rename would silently
+    replace a file created between the existence check and the move).  The
+    directory entry itself is moved: a symbolic link (dangling or not) is
+    archived as a link and the file it points to is never followed, modified
+    or removed; a FIFO, socket or device entry is archived as that entry
+    without being opened.  A directory cannot be hard-linked and is refused:
+    it stays untouched and must be moved aside by hand.  Raises StateError
+    when the move fails; the original entry is left untouched in that case.
 
     The caller must hold the controller lock (the CLI does, via
     ``ControllerEngine.locked()``): link and unlink are two syscalls, and a
     writer replacing ``path`` in between would see the replacement removed.
     """
     src = Path(path)
+    fs, name, owned = _root_for(src, root)
     try:
-        src_mode = os.lstat(src).st_mode
-    except OSError as exc:
-        raise StateError(f"cannot move corrupted state file {src} aside: {exc}") from exc
-    if stat.S_ISDIR(src_mode):
-        raise StateError(
-            f"cannot move corrupted state file {src} aside: it is a directory; "
-            "move it out of the way by hand and re-run"
-        )
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    base = src.with_name(f"{src.name}{CORRUPT_SUFFIX}{stamp}")
-    candidate = base
-    for n in range(1, _QUARANTINE_MAX_ATTEMPTS + 1):
-        try:
-            # Atomic no-replace reservation: link() never clobbers a
-            # destination that appeared after we picked the candidate.
-            # follow_symlinks=False links the entry itself, so a (dangling)
-            # symlink is preserved as such instead of failing on its target.
-            os.link(src, candidate, follow_symlinks=False)
-        except FileExistsError:
-            candidate = base.with_name(f"{base.name}.{n}")
-            continue
-        except OSError as exc:
-            raise StateError(f"cannot move corrupted state file {src} aside: {exc}") from exc
-        try:
-            os.unlink(src)
-        except OSError as exc:
-            # Drop the reservation so the original is the only copy again.
+        st = fs.lstat(name)
+        if st is None:
+            raise StateError(f"cannot move corrupted state file {src} aside: it is gone")
+        if stat.S_ISDIR(st.st_mode):
+            raise StateError(
+                f"cannot move corrupted state file {src} aside: it is a directory; "
+                "move it out of the way by hand and re-run"
+            )
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        base = f"{name}{CORRUPT_SUFFIX}{stamp}"
+        candidate = base
+        for n in range(1, _QUARANTINE_MAX_ATTEMPTS + 1):
             try:
-                os.unlink(candidate)
-            except OSError:
-                pass
-            raise StateError(f"cannot move corrupted state file {src} aside: {exc}") from exc
-        return candidate
-    raise StateError(
-        f"cannot move corrupted state file {src} aside: "
-        f"no free name after {_QUARANTINE_MAX_ATTEMPTS} attempts (last tried {candidate})"
-    )
+                fs.link(name, candidate)
+            except FileExistsError:
+                candidate = f"{base}.{n}"
+                continue
+            try:
+                fs.unlink(name)
+            except StateError as exc:
+                # Drop the reservation so the original is the only copy again,
+                # and report the operation that failed rather than the syscall:
+                # the caller asked to quarantine a file, not to unlink a name.
+                try:
+                    fs.unlink(candidate)
+                except StateError:  # pragma: no cover - cleanup best effort
+                    pass
+                raise StateError(f"cannot move corrupted state file {src} aside: {exc}") from exc
+            return src.with_name(candidate)
+        raise StateError(
+            f"cannot move corrupted state file {src} aside: "
+            f"no free name after {_QUARANTINE_MAX_ATTEMPTS} attempts (last tried {candidate})"
+        )
+    finally:
+        if owned:
+            fs.close()

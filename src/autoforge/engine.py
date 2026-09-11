@@ -74,7 +74,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from . import __prompt_version__
-from .config import AutoForgeConfig, validate_required_profiles
+from .config import DEFAULT_STATE_DIR, AutoForgeConfig, validate_required_profiles
 from .errors import (
     ConfigurationError,
     ControlResultError,
@@ -94,7 +94,7 @@ from .github import GitHubClient, IssueInfo, PRInfo, build_merge_argv
 from .local_workspace import (
     FeatureSpec,
     LocalWorkspace,
-    WorkspaceStatus,
+    WorkspaceSnapshot,
     read_feature_spec,
     verify_feature_spec_unchanged,
 )
@@ -278,6 +278,40 @@ class StepOutcome:
     message: str = ""
 
 
+def local_state_paths(
+    workspace: LocalWorkspace,
+    *,
+    explicit: str | Path | None = None,
+    configured: str | Path | None = None,
+) -> StatePaths:
+    """Where a LOCAL run keeps its runtime state.
+
+    A LOCAL run fingerprints *every* entry in the working tree, so its own
+    state directory cannot live there: it would invalidate its own fingerprint
+    on every step, or have to be carved out of it by path -- a region an agent
+    could then write into without moving the fingerprint. The default is
+    therefore ``<git dir>/autoforge/state``. The git directory is already
+    outside the reviewed tree for reasons that have nothing to do with
+    AutoForge, and it is the natural anchor: it is the deepest directory in
+    the chain the controller did not create, so every component below it is
+    opened ``O_NOFOLLOW`` from a descriptor (see
+    :class:`autoforge.state.StatePaths`).
+
+    ``explicit`` is ``--state-dir`` and is honoured as given. ``configured``
+    is ``config.state_dir``, which is REMOTE's setting: a value left at its
+    default is not a choice, and anything else is. Either way the caller
+    checks the result against the working tree; this function only decides
+    *which* directory is meant.
+    """
+    chosen = explicit or (
+        configured if configured and str(configured) != DEFAULT_STATE_DIR else None
+    )
+    if chosen is not None:
+        return StatePaths.from_state_dir(chosen)
+    git_dir = workspace.git_dirs()[0]
+    return StatePaths.from_state_dir(git_dir / "autoforge" / "state", anchor=git_dir)
+
+
 class ControllerEngine:
     def __init__(
         self,
@@ -299,10 +333,10 @@ class ControllerEngine:
         self._github = github
         self._runner = runner
         self._workspace: LocalWorkspace | None = None
-        # The workspace status bound immediately before a LOCAL agent phase.
-        # The prompt is rendered from it, so the fingerprint the reviewer is
-        # told to report is exactly the one persisted in state.
-        self._local_bound_status: WorkspaceStatus | None = None
+        # The workspace snapshot bound immediately before a LOCAL agent
+        # phase. The prompt is rendered from it, so the fingerprint the
+        # reviewer is told to report is exactly the one persisted in state.
+        self._local_bound_snapshot: WorkspaceSnapshot | None = None
         # True while the LOCAL phase being invoked is a *retry* of an
         # invocation that was already launched once (see
         # ``AutoForgeState.local_pending_phase``); the prompt then tells the
@@ -336,12 +370,31 @@ class ControllerEngine:
     def workspace(self) -> LocalWorkspace:
         """The local working-tree reader (LOCAL mode's source of truth)."""
         if self._workspace is None:
+            local = self.config.local
             self._workspace = LocalWorkspace(
                 workdir=self.workdir,
-                state_dir=self.paths.state_dir,
                 runner=self._runner or execute,
+                exclude=local.exclude,
+                max_entries=local.max_workspace_entries,
+                max_bytes=local.max_workspace_bytes,
             )
         return self._workspace
+
+    def bind_local_state_dir(self, explicit: str | Path | None = None) -> None:
+        """Point :attr:`paths` at where this LOCAL run keeps its runtime state.
+
+        See :func:`local_state_paths` for the rule. The resolved directory is
+        checked against the working tree here rather than at first write: a
+        state directory inside the reviewed tree is refused, never quietly
+        excluded from the fingerprint.
+        """
+        ws = self.workspace()
+        self.paths = local_state_paths(ws, explicit=explicit, configured=self.config.state_dir)
+        ws.check_state_dir_location(self.paths.state_dir)
+
+    def local_state_paths(self) -> StatePaths:
+        """LOCAL mode's *default* state location, ignoring any configured one."""
+        return local_state_paths(self.workspace())
 
     # -- state handling --------------------------------------------------
     def new_run(self, epic_url: str, issue_url: str) -> AutoForgeState:
@@ -371,9 +424,10 @@ class ControllerEngine:
         the caller persists the state under the controller lock.
         """
         ws = self.workspace()
+        ws.check_state_dir_location(self.paths.state_dir)
         spec = read_feature_spec(ws, feature_spec_path)
-        status = ws.status()
-        dirty = self._check_baseline_clean(status, spec, allow_dirty)
+        dirty = self._check_baseline_clean(ws.dirty_paths(), spec, allow_dirty)
+        snapshot = ws.snapshot()
         now = utcnow_iso()
         self.state = AutoForgeState(
             run_id=generate_run_id(),
@@ -381,9 +435,9 @@ class ControllerEngine:
             phase=Phase.INITIALIZING,
             feature_spec_path=spec.relative_path,
             feature_spec_sha256=spec.sha256,
-            base_head_sha=status.head_sha,
-            base_branch=status.branch,
-            workspace_fingerprint=status.fingerprint,
+            base_head_sha=snapshot.head_sha,
+            base_branch=snapshot.branch,
+            workspace_fingerprint=snapshot.fingerprint,
             baseline_dirty_paths=dirty,
             created_at=now,
             updated_at=now,
@@ -394,7 +448,7 @@ class ControllerEngine:
 
     @staticmethod
     def _check_baseline_clean(
-        status: WorkspaceStatus, spec: FeatureSpec, allow_dirty: bool
+        dirty_paths: list[str], spec: FeatureSpec, allow_dirty: bool
     ) -> list[str]:
         """Dirty-working-tree policy for a new local run.
 
@@ -410,9 +464,16 @@ class ControllerEngine:
         ``--allow-dirty`` does not make the controller smarter, it makes the
         situation *explicit*: the pre-existing paths are recorded in state,
         shown in ``status`` and named to the reviewer as pre-existing. They
-        are never silently absorbed.
+        are never silently absorbed — and their *contents* are pinned, because
+        the run's first fingerprint covers the whole working tree, dirty
+        baseline included.
+
+        The list comes from ``git status``, which is the operator's own notion
+        of "work in the way". That is the right input for this policy question
+        and the wrong one for identity, which is why the fingerprint is built
+        from the controller's own walk instead.
         """
-        dirty = [e.path for e in status.entries if e.path != spec.relative_path]
+        dirty = [p for p in dirty_paths if p != spec.relative_path]
         if dirty and not allow_dirty:
             listed = ", ".join(dirty[:20]) + ("..." if len(dirty) > 20 else "")
             raise ConfigurationError(
@@ -425,7 +486,15 @@ class ControllerEngine:
         return dirty
 
     def load(self) -> AutoForgeState:
-        self.state = load_state(self.paths.state_file)
+        try:
+            root = self.paths.open_root(create=False)
+        except FileNotFoundError:
+            # Reading never creates: no state directory means no run here,
+            # and load_state phrases that for the caller.
+            self.state = load_state(self.paths.state_file)
+        else:
+            with root:
+                self.state = load_state(self.paths.state_file, root=root)
         self._state_from_disk = True
         return self.state
 
@@ -439,7 +508,8 @@ class ControllerEngine:
 
     def _save(self) -> None:
         assert self.state is not None
-        save_state(self.state, self.paths.state_file)
+        with self.paths.open_root() as root:
+            save_state(self.state, self.paths.state_file, root=root)
 
     def _record_verification_failure(self, phase: Phase, exc: VerificationError) -> None:
         """Persist a failed verification attempt (bounded, redacted).
@@ -454,7 +524,7 @@ class ControllerEngine:
 
     def _logger(self) -> RunLogger:
         state = self._require_state()
-        return RunLogger(self.paths.logs_dir, state.run_id)
+        return RunLogger(self.paths.logs_dir, state.run_id, open_state_root=self.paths.open_root)
 
     def validate_config(self) -> None:
         """Fail early (ConfigurationError) when a required profile is unusable.
@@ -503,8 +573,8 @@ class ControllerEngine:
         """Prompt context for a LOCAL phase: spec + working tree, no GitHub."""
         s = self._require_state()
         spec = self._frozen_spec()
-        status = self._local_status_for_prompt()
-        workspace_note = status.describe()
+        snapshot = self._local_snapshot_for_prompt()
+        workspace_note = snapshot.describe()
         if s.baseline_dirty_paths:
             workspace_note += (
                 " | pre-existing (NOT part of this feature, do not review or revert): "
@@ -519,8 +589,9 @@ class ControllerEngine:
             "BASE_HEAD_SHA": s.base_head_sha or "(no commit yet)",
             "BASE_BRANCH": s.base_branch or "(detached HEAD)",
             "PRIOR_ATTEMPT": self._prior_attempt_note(),
-            "WORKSPACE_FINGERPRINT": status.fingerprint,
+            "WORKSPACE_FINGERPRINT": snapshot.fingerprint,
             "WORKSPACE_STATUS": workspace_note,
+            "WORKSPACE_EXCLUSIONS": snapshot.describe_exclusions(),
             "VALIDATION_COMMANDS": self._validation_commands_text(),
             "REVIEW_ROUND": s.review_round + 1 if s.phase != Phase.FIX else s.review_round,
             "FINDINGS": self._format_findings(s.open_findings),
@@ -550,8 +621,8 @@ class ControllerEngine:
             when=f"before {s.phase.value}",
         )
 
-    def _local_status_for_prompt(self) -> WorkspaceStatus:
-        return self._local_bound_status or self.workspace().status()
+    def _local_snapshot_for_prompt(self) -> WorkspaceSnapshot:
+        return self._local_bound_snapshot or self.workspace().snapshot()
 
     def _prompt_variables(self) -> dict[str, str | int | None]:
         s = self._require_state()
@@ -1173,7 +1244,7 @@ class ControllerEngine:
         drift = self._git_anchor_drift()
         if drift:
             return self._block(previous, plan, self._local_anchor_block_reason(drift))
-        before = self.workspace().status()
+        before = self.workspace().snapshot()
         state.workspace_fingerprint = before.fingerprint
 
         # Durable invocation checkpoint for the write-capable phases. It is
@@ -1206,12 +1277,12 @@ class ControllerEngine:
                 state.local_pending_fingerprint = before.fingerprint
                 state.local_pending_attempts = 0
             state.local_pending_attempts += 1
-        self._local_bound_status = before
+        self._local_bound_snapshot = before
         self._save()
         try:
             payload = self._invoke_phase(previous)
         finally:
-            self._local_bound_status = None
+            self._local_bound_snapshot = None
             self._local_resumed_invocation = False
 
         status = payload.get("status")
@@ -1304,17 +1375,19 @@ class ControllerEngine:
         state = self._require_state()
         self.validate_config()
         ws = self.workspace()
-        # Refuses a state directory that is the repository root, before any
-        # fingerprint is computed from it (see LocalWorkspace.check_state_dir).
-        ws.check_state_dir()
+        # Refuses a state directory inside the reviewed tree before any
+        # fingerprint is computed (see check_state_dir_location). Re-checked
+        # here, not only in `new_local_run`, because `resume` can be invoked
+        # with a different --state-dir than the run was created with.
+        ws.check_state_dir_location(self.paths.state_dir)
         spec = verify_feature_spec_unchanged(
             ws, state.feature_spec_path, state.feature_spec_sha256, when="before ANALYZE_EXECUTE"
         )
         drift = self._git_anchor_drift()
         if drift:
             return self._block(Phase.INITIALIZING, plan, self._local_anchor_block_reason(drift))
-        status = ws.status()
-        state.workspace_fingerprint = status.fingerprint
+        snapshot = ws.snapshot()
+        state.workspace_fingerprint = snapshot.fingerprint
         validate_transition(Phase.INITIALIZING, Phase.ANALYZE_EXECUTE, WorkflowMode.LOCAL)
         state.phase = Phase.ANALYZE_EXECUTE
         self._save()
@@ -1323,7 +1396,7 @@ class ControllerEngine:
             plan=plan,
             message=(
                 f"froze feature specification {spec.relative_path} "
-                f"(sha256 {spec.sha256[:16]}...) at {status.anchor}; "
+                f"(sha256 {spec.sha256[:16]}...) at {snapshot.anchor}; "
                 "INITIALIZING -> ANALYZE_EXECUTE"
             ),
         )
@@ -1338,7 +1411,7 @@ class ControllerEngine:
         )
 
     def _verify_and_apply_local(
-        self, phase: Phase, payload: dict, before: WorkspaceStatus, baseline: str
+        self, phase: Phase, payload: dict, before: WorkspaceSnapshot, baseline: str
     ) -> tuple[Phase, str]:
         """Verify one LOCAL agent result.
 
@@ -1361,8 +1434,8 @@ class ControllerEngine:
         raise StateTransitionError(f"phase {phase.value} does not accept local agent results")
 
     def _verify_workspace_change(
-        self, phase: Phase, before: WorkspaceStatus, claimed: bool
-    ) -> WorkspaceStatus:
+        self, phase: Phase, before: WorkspaceSnapshot, claimed: bool
+    ) -> WorkspaceSnapshot:
         """Re-derive what actually changed and cross-check the agent's claim."""
         state = self._require_state()
         verify_feature_spec_unchanged(
@@ -1371,7 +1444,7 @@ class ControllerEngine:
             state.feature_spec_sha256,
             when=f"after {phase.value}",
         )
-        after = self.workspace().status()
+        after = self.workspace().snapshot()
         changed = after.fingerprint != before.fingerprint
         if claimed != changed:
             raise VerificationError(
@@ -1383,7 +1456,7 @@ class ControllerEngine:
         return after
 
     def _apply_local_analyze(
-        self, res: LocalAnalyzeExecuteResult, before: WorkspaceStatus, baseline: str
+        self, res: LocalAnalyzeExecuteResult, before: WorkspaceSnapshot, baseline: str
     ) -> tuple[Phase, str]:
         state = self._require_state()
         after = self._verify_workspace_change(Phase.ANALYZE_EXECUTE, before, res.changed_workspace)
@@ -1401,8 +1474,8 @@ class ControllerEngine:
             f", tests attempted: {', '.join(res.tests_attempted)}" if res.tests_attempted else ""
         )
         return Phase.REVIEW, (
-            f"implementation verified: {len(after.entries)} changed path(s) in the working "
-            f"tree, fingerprint {after.fingerprint[:16]}...{tests}; "
+            f"implementation verified: working tree now holds {after.describe()}, "
+            f"fingerprint {after.fingerprint[:16]}...{tests}; "
             "ANALYZE_EXECUTE -> REVIEW"
         )
 
@@ -1426,7 +1499,7 @@ class ControllerEngine:
             state.feature_spec_sha256,
             when="after REVIEW",
         )
-        after = self.workspace().status()
+        after = self.workspace().snapshot()
         if after.fingerprint != bound:
             # REVIEW is read-only; a reviewer that edited the code changed the
             # very thing it was judging, so its verdict describes nothing that
@@ -1474,7 +1547,7 @@ class ControllerEngine:
         )
 
     def _apply_local_fix(
-        self, res: LocalFixResult, before: WorkspaceStatus, baseline: str
+        self, res: LocalFixResult, before: WorkspaceSnapshot, baseline: str
     ) -> tuple[Phase, str]:
         state = self._require_state()
         open_ids = [f["id"] for f in state.open_findings]

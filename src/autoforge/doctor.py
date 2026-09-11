@@ -21,6 +21,7 @@ from pathlib import Path
 from .config import AutoForgeConfig, load_config_file, validate_required_profiles
 from .errors import ConfigurationError
 from .executor import ExecutionRequest, ExecutionResult, execute
+from .local_workspace import DEFAULT_MAX_BYTES, DEFAULT_MAX_ENTRIES
 from .profiles import local_required_profiles
 from .validation import parse_remote_repository
 
@@ -112,13 +113,9 @@ class Doctor:
     def check_state_dir(self) -> CheckResult:
         d = self.state_dir or (self.config.state_dir if self.config else ".autoforge")
         path = Path(self.cwd) / d if not Path(d).is_absolute() else Path(d)
-        try:
-            path.mkdir(parents=True, exist_ok=True)
-            fd, tmp = tempfile.mkstemp(prefix=".doctor-", dir=str(path))
-            os.close(fd)
-            os.unlink(tmp)
-        except OSError as exc:
-            return CheckResult("state dir writable", False, f"{path}: {exc}")
+        problem = self._writable(path)
+        if problem is not None:
+            return CheckResult("state dir writable", False, f"{path}: {problem}")
         return CheckResult("state dir writable", True, str(path))
 
     def check_git_repo(self) -> CheckResult:
@@ -143,15 +140,10 @@ class Doctor:
 
     def check_feature_spec(self, spec_path: str) -> CheckResult:
         """Validate a feature specification path the way `local run` would."""
-        from .local_workspace import LocalWorkspace, read_feature_spec
+        from .local_workspace import read_feature_spec
 
         name = "feature specification"
-        cfg = self.config
-        ws = LocalWorkspace(
-            workdir=self.cwd,
-            state_dir=self.state_dir or (cfg.state_dir if cfg else ".autoforge"),
-            runner=self._runner,
-        )
+        ws = self._workspace()
         try:
             spec = read_feature_spec(ws, spec_path)
         except Exception as exc:
@@ -184,7 +176,6 @@ class Doctor:
         results.append(self._version_check("git available", ["git", "--version"]))
         results.append(self.check_git_repo())
         results.extend(self._local_agent_checks(cfg))
-        results.append(self.check_state_dir())
         results.append(self.check_local_state_dir())
         results.append(self.check_validation_commands())
         if feature_spec_path:
@@ -235,28 +226,57 @@ class Doctor:
             for command, names in commands.items()
         ]
 
-    def check_local_state_dir(self) -> CheckResult:
-        """The state directory must not be the repository root itself.
-
-        A LOCAL run excludes the state directory from the workspace
-        fingerprint; when the two are the same directory there is nothing to
-        exclude and AutoForge's own `state.json` and `logs/` start counting as
-        workspace changes (see `LocalWorkspace.check_state_dir`).
-        """
+    def _workspace(self):
+        """A LocalWorkspace over the doctor's cwd, configured like a real run."""
         from .local_workspace import LocalWorkspace
 
         cfg = self.config
-        name = "state dir separate from the repository root"
-        ws = LocalWorkspace(
+        local = cfg.local if cfg else None
+        return LocalWorkspace(
             workdir=self.cwd,
-            state_dir=self.state_dir or (cfg.state_dir if cfg else ".autoforge"),
             runner=self._runner,
+            exclude=local.exclude if local else (),
+            max_entries=local.max_workspace_entries if local else DEFAULT_MAX_ENTRIES,
+            max_bytes=local.max_workspace_bytes if local else DEFAULT_MAX_BYTES,
         )
+
+    def check_local_state_dir(self) -> CheckResult:
+        """Where this run would keep its state — outside the reviewed tree, writable.
+
+        This replaces the generic `check_state_dir` for local mode rather than
+        joining it: the generic check would create `.autoforge/` inside the
+        working tree, and in LOCAL mode that directory is part of what gets
+        fingerprinted. A read-only diagnostic must not change what a run would
+        review.
+        """
+        from .engine import local_state_paths
+
+        cfg = self.config
+        name = "state dir outside the reviewed working tree"
+        ws = self._workspace()
         try:
-            ws.check_state_dir()
+            paths = local_state_paths(
+                ws, explicit=self.state_dir, configured=cfg.state_dir if cfg else None
+            )
+            ws.check_state_dir_location(paths.state_dir)
         except Exception as exc:
             return CheckResult(name, False, str(exc))
-        return CheckResult(name, True, str(ws.state_dir))
+        writable = self._writable(paths.state_dir)
+        if writable is not None:
+            return CheckResult(name, False, f"{paths.state_dir}: {writable}")
+        return CheckResult(name, True, str(paths.state_dir))
+
+    @staticmethod
+    def _writable(path: Path) -> str | None:
+        """None when a temp file can be created in ``path``, else why not."""
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(prefix=".doctor-", dir=str(path))
+            os.close(fd)
+            os.unlink(tmp)
+        except OSError as exc:
+            return str(exc)
+        return None
 
     @staticmethod
     def _agent_commands(cfg: AutoForgeConfig | None) -> tuple[str, str]:

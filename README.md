@@ -95,9 +95,13 @@ src/autoforge/
     validation.py     typed GitHub URL refs (issue / PR / comment), remote parsing
     github.py         typed GitHubClient over `gh`: reads (PRs, issues, comments,
                       checks, merge queue) + the controller-owned merge / disarm writes
-    local_workspace.py  LOCAL mode's trust boundary: git working-tree reader
-                      (HEAD, status, deterministic workspace fingerprint) and the
-                      frozen feature specification (resolve / hash / re-verify)
+    local_workspace.py  LOCAL mode's trust boundary: the controller's own walk of
+                      the working tree (total classification -> workspace
+                      fingerprint), the git anchor (HEAD/branch), and the frozen
+                      feature specification (resolve / hash / re-verify)
+    safefs.py         the one filesystem capability boundary: SafeRoot, every name
+                      below it opened with dir_fd= and O_NOFOLLOW; whole-file
+                      writes replace a name, never an inode
     doctor.py         read-only environment checks (remote + the local subset)
     locking.py        flock(2) repository lock, keyed by the git common dir
                       (<repo>/.git/autoforge/controller.lock), never by state_dir
@@ -376,9 +380,11 @@ configurable via `local.feature_dir`) with `## Problem`, `## Requirements`,
 `## Acceptance Criteria` (checkboxes), `## Non-goals` and
 `## Notes / Decisions`. Feature specifications are **project content**, not
 runtime state: they live in your repository and you may commit them.
-`.autoforge/` remains controller state only. `local init` refuses to overwrite
-an existing file unless you pass `--force`, never writes through a symbolic
-link, and refuses a `local.feature_dir` that resolves outside the repository.
+Controller state stays out of the tree entirely. `local init` refuses to
+overwrite an existing file unless you pass `--force`, refuses to write through
+anything that is not already a regular file it could have written itself
+(a symbolic link, a directory, a device), and refuses a `local.feature_dir`
+that resolves outside the repository or is reached through a symbolic link.
 It takes the repository controller lock like any other controller write, so it
 cannot rewrite a specification an active run has frozen.
 
@@ -394,47 +400,63 @@ bypass a controller invariant has no authority.
 
 ### What the controller verifies (there is no GitHub to ask)
 
-The local analogue of "GitHub is the source of truth" is the git working tree,
-read by `local_workspace.py` through argv-only `git` invocations (never a
-shell). Before and after every phase the controller computes a **workspace
-fingerprint**: HEAD plus every path reported by
-`git status --porcelain=v1 -z --untracked-files=all` together with a SHA-256
-of that path's current bytes *and its permission bits* (on a file that is
-already dirty, `chmod +x` moves neither the content digest nor the porcelain
-status code, and whether a script is executable decides what a validation
-command does with it). Untracked files are included — a `git diff HEAD`
-would miss a brand-new source file holding the entire implementation — and
-everything under the state directory is excluded, so writing logs and state
-cannot invalidate a review. The feature specification is *not* excluded from
-its own separate hash check.
+The local analogue of "GitHub is the source of truth" is the **working tree
+itself** — not git's opinion of it. Before and after every phase the controller
+walks the tree through its own directory descriptors and computes a **workspace
+fingerprint** over everything it finds.
 
-Because an excluded path is a path no review is bound to, an in-repository
-state directory must hold **only** entries AutoForge itself writes
-(`state.json`, `logs/`, a moved-aside corrupt state, a temp file mid-rename),
-each matched as the exact shape the controller produces and each required to
-be the *kind* of entry it claims: `logs` a real directory, everything else a
-regular file. A symbolic link there would exclude a name whose content lives
-somewhere else entirely, and would send controller writes outside the
-checkout. `--state-dir src` is refused rather than quietly excluding the
-implementation from the fingerprint; so is a state directory that *is* the
-repository root. A path outside the repository excludes nothing, is never
-name-trusted, and is always fine.
+It is a walk, not a `git status`, and that is the central design decision.
+`git status` answers "what would I commit?", which is a different question
+from "which bytes could the reviewer have read". An ignored file, a file
+marked `assume-unchanged` or `skip-worktree`, a mode change under
+`core.fileMode=false`, an empty directory, a symbolic link whose target text
+changed — git reports none of those, and each one is code a reviewer can read
+and an agent can edit. So git is asked only what it is authoritative about
+(where the repository is, what HEAD and the branch are); the filesystem is
+asked what is in the tree.
 
-Runtime artifacts are written the same way the state file is read: a
-directory the controller creates is verified to be a real directory, and
-every log artifact is opened without following symbolic links and without an
-open that can block (`safeio.py`). A `logs` symlink cannot relocate a run's
-artifacts, a FIFO cannot hang the controller, and `run_id` — which names
-`logs/<run_id>` — is validated as a single safe path component when state is
-loaded, not trusted because the controller generated it once.
+Every entry the walk finds lands in exactly one of four states, and there is
+no fifth:
 
-Every changed path must also be *bindable*. A path that cannot be
-content-hashed — unreadable, a dirty submodule or nested repository (`git
-status` reports a bare directory), a FIFO or device — fails the run closed
-instead of getting a stable "could not look" marker, because such a marker
-compares equal to itself and would let the bytes behind it be swapped with
-the fingerprint unmoved. A deleted path is the one exception: absence is an
-observed fact.
+| | |
+|---|---|
+| **hashed** | regular files: SHA-256 of the bytes, plus the permission bits (whether a script is executable decides what a validation command does with it) |
+| **metadata** | directories and symbolic links: the mode, and for a link its target *text* — never what the target contains |
+| **excluded** | the repository's own git directory (identified by `(st_dev, st_ino)`, not by the name `.git`) and anything matching `local.exclude`. Both are hashed into the fingerprint as *rules* and named to the reviewer in its prompt, so "what was not reviewed" is part of the review's identity |
+| **refused** | anything that cannot be bound at all: a FIFO, socket or device; an unreadable file or unlistable directory; a nested repository or submodule; a symbolic link pointing outside the tree or into an excluded region. The run fails closed, naming the entry and the exclusion that would accept it |
+
+Nothing is silently skipped, so "the snapshot does not mention it" and "it is
+not in the tree" are the same statement.
+
+Two things are deliberately *not* in the fingerprint. The first is HEAD and
+the branch: they are bound separately, so an ordinary `git commit` — which
+changes no byte of the working tree — is reported as what it is (the git
+anchor moved, and the run blocks) rather than as "the reviewer modified the
+workspace". The second is the run's own state, which lives outside the
+reviewed tree entirely, under `<git dir>/autoforge/state`: a controller that
+writes into the tree it fingerprints would either invalidate its own review on
+every step or have to carve a region out by name — a region an agent could
+then write into without moving the fingerprint. An explicit `--state-dir`
+inside the working tree is refused for the same reason.
+
+The walk is bounded by `local.max_workspace_entries` and
+`local.max_workspace_bytes`. These are refusal thresholds, not sampling ones:
+a tree too large is refused with the largest subtrees named, because a
+fingerprint that fell back to metadata for the remainder would accept an
+equal-sized replacement with a restored mtime.
+
+Runtime writes go through one capability boundary (`safefs.py`): the state
+directory is opened once as a descriptor, and every name below it is resolved
+with `dir_fd=` and `O_NOFOLLOW`, so no path component can be redirected
+between the check and the use. Whole-file artifacts are written as a fresh
+`O_CREAT|O_EXCL` temporary in the target's own directory and renamed over the
+name, which means a symbolic link, hard link, FIFO or device planted at an
+artifact's name is *replaced*: it is never opened, so whatever it pointed at
+is provably untouched. The append-only `events.jsonl` is the one artifact that
+must be opened in place, and there the open is `O_NOFOLLOW|O_NONBLOCK` and
+refuses a hard link outright. `run_id` — which names `logs/<run_id>` — is
+validated as a single safe path component whenever state is loaded, not
+trusted because the controller generated it once.
 
 With that, the controller checks for itself:
 
@@ -458,6 +480,11 @@ anyway and records those paths in the run — they are reported in `status` and
 to the reviewer, never silently absorbed into the implementation baseline.
 Separating pre-existing edits from agent edits in the same file is a heuristic,
 and a heuristic is not a trust boundary.
+
+What `--allow-dirty` does *not* do is loosen the binding: the snapshot taken
+at the start of the run hashes those dirty files like every other entry, so
+their contents at the moment the run began are pinned exactly as a clean
+file's are. The recorded paths are disclosure, not an exemption.
 
 ### Review/fix bound
 
@@ -499,17 +526,32 @@ that *would* run and the legal next transitions — and invokes no agent, runs
 no validation command, and writes no state file.
 
 A local run is durable and resumable exactly like a remote one: state lives in
-`.autoforge/state.json`, is written atomically, and holds the mode, feature
-path, frozen hash, base HEAD, bound and reviewed fingerprints, review/fix
-rounds and open findings. `Ctrl-C` then `autoforge resume` continues from the
-persisted phase, re-reading the real working tree.
+`<git dir>/autoforge/state/state.json`, is written atomically, and holds the
+mode, feature path, frozen hash, base HEAD, bound and reviewed fingerprints,
+review/fix rounds and open findings. `Ctrl-C` then `autoforge resume` continues
+from the persisted phase, re-reading the real working tree.
+
+Recovery never trusts what the dead process believed. Every fact the next
+transition depends on — the fingerprint, the git anchor, the specification
+hash — is re-derived after the restart, and an illegal combination of fields
+fails at the moment the state file is read rather than somewhere downstream.
+The one thing that *is* carried across is a checkpoint written **before** a
+write-capable agent is launched, recording the phase and the fingerprint it
+started from. That is what makes "crashed before implementing" and "crashed
+after implementing" distinguishable without asking the agent: the resumed
+attempt is judged against the tree from before the *first* attempt, so work
+already in the tree counts, and re-entry is bounded rather than endless.
 
 ## State directory
 
-Default `.autoforge/` (overridable via `--state-dir` or config):
+Remote mode defaults to `.autoforge/` in the working directory (overridable
+via `--state-dir` or config). A **local** run defaults to
+`<git dir>/autoforge/state` instead — outside the tree it fingerprints, since
+its own writes would otherwise keep invalidating its own review. Same layout
+either way:
 
 ```text
-.autoforge/
+<state dir>/
     state.json          # persisted run state (atomic writes)
     state.json.corrupt-<timestamp>   # unreadable state moved aside by 'run --force'
     logs/<run-id>/

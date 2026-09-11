@@ -36,12 +36,24 @@ from pathlib import Path
 
 from . import __prompt_version__
 from .errors import ConfigurationError
+from .local_workspace import (
+    DEFAULT_MAX_BYTES,
+    DEFAULT_MAX_ENTRIES,
+    normalize_exclude_pattern,
+)
 
 CONFIG_VERSION = 1
 
 DEFAULT_TIMEOUT_SECONDS = 1800
 
 KNOWN_PROVIDERS = ("claude", "opencode", "scripted")
+
+
+# Where a REMOTE run keeps its state, relative to the invocation directory.
+# A LOCAL run defaults elsewhere -- see
+# :meth:`autoforge.engine.ControllerEngine.bind_local_state_dir` -- because its
+# fingerprint covers the whole working tree and runtime state must not be in it.
+DEFAULT_STATE_DIR = ".autoforge"
 
 
 @dataclass
@@ -201,6 +213,26 @@ class LocalConfig:
     implementation and fix phase. A non-zero exit means the phase is not
     successfully verified. There is no automatic build-system detection: what
     is not configured here is not run.
+
+    ``exclude`` is the *only* way to remove anything from the workspace
+    snapshot that binds a LOCAL review (the repository's own git directory
+    aside, which is identified by inode). A LOCAL run hashes every entry of
+    the working tree, ignored files included, because the alternative is
+    letting a ``.gitignore`` edit decide which bytes a review covers. That
+    completeness has a cost the operator has to pay explicitly: build output,
+    virtual environments and caches are rewritten by the very validation
+    commands the controller runs, so they must be declared unreviewed rather
+    than silently tolerated. Each pattern is matched component-wise against
+    repository-relative paths; ``*`` and ``?`` match within one component and
+    ``**`` spans any number of them. The patterns are hashed into the
+    fingerprint and named to the review agent in its prompt, so "what was not
+    reviewed" is part of the review's identity rather than a local detail.
+
+    ``max_workspace_entries`` / ``max_workspace_bytes`` bound the walk. They
+    are refusal thresholds, not sampling thresholds: exceeding one fails the
+    run with the largest subtrees named, because a fingerprint that fell back
+    to metadata for the rest would accept an equal-sized replacement with a
+    restored mtime.
     """
 
     # Where ``autoforge local init`` writes feature specifications. Project
@@ -210,6 +242,10 @@ class LocalConfig:
     # Local review/fix bound: the initial REVIEW, at most this many FIX
     # rounds, then a final REVIEW. 0 disables FIX entirely (one review pass).
     max_fix_rounds: int = 1
+    # Declared-unreviewed regions of the working tree (see the class docstring).
+    exclude: list[str] = field(default_factory=list)
+    max_workspace_entries: int = DEFAULT_MAX_ENTRIES
+    max_workspace_bytes: int = DEFAULT_MAX_BYTES
 
     @property
     def max_review_rounds(self) -> int:
@@ -220,7 +256,7 @@ class LocalConfig:
 @dataclass
 class AutoForgeConfig:
     version: int = CONFIG_VERSION
-    state_dir: str = ".autoforge"
+    state_dir: str = DEFAULT_STATE_DIR
     prompt_version: str = __prompt_version__
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
@@ -585,6 +621,31 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
         if value < 0:
             raise ConfigurationError(f"{source}: 'local.max_fix_rounds' must be >= 0, got {value}")
         base.local.max_fix_rounds = value
+    if "exclude" in local:
+        raw = local["exclude"]
+        if isinstance(raw, str) or not isinstance(raw, list):
+            raise ConfigurationError(
+                f"{source}: 'local.exclude' must be a list of path patterns, e.g. "
+                "['.venv', '**/__pycache__']"
+            )
+        patterns: list[str] = []
+        for item in raw:
+            try:
+                patterns.append(normalize_exclude_pattern(item))
+            except ConfigurationError as exc:
+                raise ConfigurationError(f"{source}: {exc}") from None
+        base.local.exclude = sorted(dict.fromkeys(patterns))
+    for name, attr, minimum in (
+        ("max_workspace_entries", "max_workspace_entries", 1),
+        ("max_workspace_bytes", "max_workspace_bytes", 1),
+    ):
+        if name in local:
+            value = _as_int(local[name], source, f"local.{name}")
+            if value < minimum:
+                raise ConfigurationError(
+                    f"{source}: 'local.{name}' must be >= {minimum}, got {value}"
+                )
+            setattr(base.local, attr, value)
     profiles = data.get("profiles", {}) or {}
     if not isinstance(profiles, dict):
         raise ConfigurationError(f"{source}: 'profiles' must be a mapping")

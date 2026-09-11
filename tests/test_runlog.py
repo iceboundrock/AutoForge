@@ -78,8 +78,16 @@ def test_a_fifo_event_log_fails_instead_of_hanging_the_controller(tmp_path):
         RunLogger(tmp_path / "logs", "run-1")
 
 
-def test_a_pre_existing_symlinked_step_artifact_is_refused(tmp_path):
-    """Each artifact is opened with O_NOFOLLOW, not just the directories above it."""
+def test_a_symlinked_step_artifact_is_replaced_not_written_through(tmp_path):
+    """The invariant is where the bytes land, not which exception is raised.
+
+    A whole-file artifact is created as a fresh temporary in the artifact's
+    own directory and renamed over the name, so a symbolic link planted at
+    that name is *replaced* -- the link's target is never opened, never
+    created and never written. Asserting a refusal here would be asserting an
+    implementation detail; asserting that the outside file is untouched is
+    asserting the guarantee.
+    """
     outside = tmp_path / "outside"
     outside.mkdir()
     step = tmp_path / "logs" / "run-1" / "001-review-1"
@@ -87,9 +95,34 @@ def test_a_pre_existing_symlinked_step_artifact_is_refused(tmp_path):
     (step / "stdout.log").symlink_to(outside / "leak.log")
 
     log = RunLogger(tmp_path / "logs", "run-1")
+    log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="REVIEW"), stdout="out")
+
+    assert not (outside / "leak.log").exists(), "the link target must never be created"
+    assert list(outside.iterdir()) == []
+    written = step / "stdout.log"
+    assert not written.is_symlink(), "the name now holds the controller's own file"
+    assert written.read_text(encoding="utf-8") == "out"
+
+
+def test_a_symlinked_events_journal_is_refused_rather_than_appended_through(tmp_path):
+    """The journal is the one artifact that cannot be written by replacement.
+
+    `events.jsonl` is appended to, so there is no fresh temporary to rename
+    over the name: the existing entry must be opened. That open is
+    `O_NOFOLLOW`, so a link there is a refusal -- and the refusal, not a
+    replacement, is what keeps the target untouched.
+    """
+    outside = tmp_path / "notes.txt"
+    outside.write_text("mine\n", encoding="utf-8")
+    run_dir = tmp_path / "logs" / "run-1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "events.jsonl").symlink_to(outside)
+
+    # The counter resume reads the journal, so the refusal arrives at
+    # construction -- before any agent runs, which is the right moment for it.
     with pytest.raises(StateError, match="symbolic link"):
-        log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="REVIEW"), stdout="out")
-    assert not (outside / "leak.log").exists()
+        RunLogger(tmp_path / "logs", "run-1")
+    assert outside.read_text(encoding="utf-8") == "mine\n"
 
 
 def test_a_directory_where_an_artifact_belongs_is_refused(tmp_path):
@@ -154,19 +187,27 @@ def test_a_write_never_lands_on_a_hard_link_and_never_truncates_first(tmp_path):
 
     `O_TRUNC` was handed to `os.open`, so the kernel emptied the linked file
     *before* anything could look at the descriptor: the refusal arrived after
-    the damage. The open is intact now, and a second name for the file is the
-    refusal.
+    the damage was done. Replacement removes the question -- the target inode
+    is never opened at all, so the second name keeps both its content and its
+    identity, and the controller still gets its artifact.
     """
     outside = tmp_path / "precious.txt"
     outside.write_text("do not lose me\n", encoding="utf-8")
+    before = outside.stat()
     log = RunLogger(tmp_path / "logs", "run-1")
     step_dir = log.run_dir / "001-review-1"
     os.makedirs(step_dir, exist_ok=True)
     os.link(outside, step_dir / "stdout.log")
 
-    with pytest.raises(StateError, match="hard link"):
-        log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="REVIEW"), stdout="x")
+    log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="REVIEW"), stdout="x")
+
     assert outside.read_text(encoding="utf-8") == "do not lose me\n"
+    assert outside.stat().st_ino == before.st_ino
+    assert outside.stat().st_size == before.st_size
+    artifact = step_dir / "stdout.log"
+    assert artifact.read_text(encoding="utf-8") == "x"
+    assert artifact.stat().st_ino != before.st_ino, "a new inode, not the linked one"
+    assert artifact.stat().st_nlink == 1
 
 
 def test_a_hard_linked_events_journal_is_refused_before_it_is_appended_to(tmp_path):
@@ -179,11 +220,11 @@ def test_a_hard_linked_events_journal_is_refused_before_it_is_appended_to(tmp_pa
     assert outside.read_text(encoding="utf-8") == "mine\n"
 
 
-def test_a_plain_regular_file_is_still_truncated_on_rewrite(tmp_path):
-    """Deferring O_TRUNC to ftruncate must not leave a stale tail behind."""
-    from autoforge.safeio import read_text, write_text
+def test_a_rewritten_artifact_never_keeps_a_tail_of_the_old_one(tmp_path):
+    """Replacing rather than truncating must still leave exactly the new bytes."""
+    from autoforge.safefs import SafeRoot
 
-    target = tmp_path / "artifact.log"
-    write_text(target, "a long first line that must not survive\n")
-    write_text(target, "short\n")
-    assert read_text(target) == "short\n"
+    with SafeRoot.open(tmp_path) as root:
+        root.write_text("artifact.log", "a long first line that must not survive\n")
+        root.write_text("artifact.log", "short\n")
+        assert root.read_text("artifact.log") == "short\n"

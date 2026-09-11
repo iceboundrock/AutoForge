@@ -20,13 +20,16 @@ Logs never pollute state.json.
 from __future__ import annotations
 
 import json
+import os
 import re
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from .errors import StateError
 from .redaction import redact, redact_argv, redact_dict
-from .safeio import append_text, ensure_directory, read_text, write_text
+from .safefs import SafeRoot
 
 # A run identifier is a *file name*: it names the directory this run's logs
 # live in.  `generate_run_id` produces "af-<UTC stamp>-<hex>", but the value
@@ -88,34 +91,70 @@ class ExecutionRecord:
 class RunLogger:
     """Writes one directory per agent invocation under ``<logs_dir>/<run_id>``.
 
-    The log tree usually lives inside the operator's checkout, where the
-    agents the controller launches also write.  So no path here is trusted
-    by name: ``run_id`` must be a single safe path component (it comes from
-    ``state.json``, which a hand edit or a truncated write can corrupt), and
-    every directory and artifact is created through :mod:`autoforge.safeio`,
-    which refuses to follow a symbolic link or to open a FIFO, socket or
-    device.  Without that a ``logs`` symlink would put controller artifacts
-    outside the working tree and a FIFO at ``events.jsonl`` would hang the
-    controller on startup instead of failing it.
+    The log tree lives in the controller's state directory, on a machine
+    where the agents the controller launches run as the same user.  So no
+    path here is trusted by name: ``run_id`` must be a single safe path
+    component (it comes from ``state.json``, which a hand edit or a truncated
+    write can corrupt), and every directory and artifact is reached through a
+    :class:`~autoforge.safefs.SafeRoot` -- descriptor-relative, so neither
+    ``logs`` nor ``logs/<run_id>`` nor any step directory can be swapped for a
+    symbolic link that puts controller artifacts somewhere else, and no
+    artifact write can land on a FIFO, a device or a second name for someone
+    else's file.
+
+    The engine passes ``open_state_root`` -- :meth:`autoforge.state
+    .StatePaths.open_root`, which walks from the one directory AutoForge did
+    not create down to the state directory -- so every component from that
+    anchor to a step artifact is checked. A caller with only a pathname gets
+    an anchor at the state directory's parent instead, which still reaches
+    ``logs`` and everything below it without following a link.
     """
 
-    def __init__(self, logs_dir: str | Path, run_id: str) -> None:
-        logs_root = ensure_directory(logs_dir)
-        self.run_dir = logs_root / validate_run_id(run_id)
-        ensure_directory(self.run_dir)
+    def __init__(
+        self,
+        logs_dir: str | Path,
+        run_id: str,
+        *,
+        open_state_root: Callable[[], SafeRoot] | None = None,
+    ) -> None:
+        self.run_id = validate_run_id(run_id)
+        self._open_state_root = open_state_root
+        absolute = Path(os.path.abspath(logs_dir))
+        self._anchor = absolute.parent
+        self._logs_name = absolute.name
+        self.run_dir = Path(logs_dir) / self.run_id
         self.events_path = self.run_dir / "events.jsonl"
-        # Sequence counter resumes across process restarts.
-        self._seq = self._existing_event_count()
+        with self._logs_root() as logs:
+            logs.ensure_dir(self.run_id)
+            # Sequence counter resumes across process restarts.
+            self._seq = self._existing_event_count(logs)
 
-    def _existing_event_count(self) -> int:
-        content = read_text(self.events_path)
+    @contextmanager
+    def _logs_root(self) -> Iterator[SafeRoot]:
+        """The ``logs`` directory as a capability, for the duration of one call."""
+        base = (
+            self._open_state_root()
+            if self._open_state_root is not None
+            else SafeRoot.open(self._anchor, create=True)
+        )
+        try:
+            root = base.subroot(self._logs_name, create=True)
+        finally:
+            base.close()
+        try:
+            yield root
+        finally:
+            root.close()
+
+    def _existing_event_count(self, logs: SafeRoot) -> int:
+        content = logs.read_text(f"{self.run_id}/events.jsonl")
         if content is None:
             return 0
         return sum(1 for line in content.splitlines() if line.strip())
 
-    def _step_dir(self, seq: int, phase: str, attempt: int) -> Path:
+    def _step_name(self, seq: int, phase: str, attempt: int) -> str:
         safe_phase = re.sub(r"[^a-z0-9._-]", "-", phase.lower()) or "unknown"
-        return ensure_directory(self.run_dir / f"{seq:03d}-{safe_phase}-{attempt}")
+        return f"{seq:03d}-{safe_phase}-{attempt}"
 
     def log_execution(
         self,
@@ -127,7 +166,8 @@ class RunLogger:
         """Persist one execution record + artifacts. Returns the step dir."""
         self._seq += 1
         record.seq = self._seq
-        step_dir = self._step_dir(self._seq, record.phase, record.attempt)
+        step = self._step_name(self._seq, record.phase, record.attempt)
+        step_dir = self.run_dir / step
         record.log_dir = str(step_dir)
         record.command = redact_argv(record.command)
         # Metadata is caller-supplied and can quote untrusted text (a
@@ -172,19 +212,26 @@ class RunLogger:
             "stderr_chars": len(stderr or ""),
             "error": record.error,
         }
-        write_text(step_dir / "request.json", json.dumps(request, indent=2, sort_keys=True) + "\n")
-        write_text(step_dir / "prompt.md", redact(prompt or ""))
-        write_text(
-            step_dir / "execution.json", json.dumps(execution, indent=2, sort_keys=True) + "\n"
-        )
-        write_text(step_dir / "stdout.log", redact(stdout))
-        write_text(step_dir / "stderr.log", redact(stderr))
-        if isinstance(record.parsed_result, dict):
-            write_text(
-                step_dir / "control-result.json",
-                json.dumps(record.parsed_result, indent=2, sort_keys=True) + "\n",
+        base = f"{self.run_id}/{step}"
+        with self._logs_root() as logs:
+            logs.ensure_dir(base)
+            logs.write_text(
+                f"{base}/request.json", json.dumps(request, indent=2, sort_keys=True) + "\n"
             )
-        if record.error:
-            write_text(step_dir / "error.txt", record.error + "\n")
-        append_text(self.events_path, json.dumps(asdict(record), sort_keys=True) + "\n")
+            logs.write_text(f"{base}/prompt.md", redact(prompt or ""))
+            logs.write_text(
+                f"{base}/execution.json", json.dumps(execution, indent=2, sort_keys=True) + "\n"
+            )
+            logs.write_text(f"{base}/stdout.log", redact(stdout))
+            logs.write_text(f"{base}/stderr.log", redact(stderr))
+            if isinstance(record.parsed_result, dict):
+                logs.write_text(
+                    f"{base}/control-result.json",
+                    json.dumps(record.parsed_result, indent=2, sort_keys=True) + "\n",
+                )
+            if record.error:
+                logs.write_text(f"{base}/error.txt", record.error + "\n")
+            logs.append_text(
+                f"{self.run_id}/events.jsonl", json.dumps(asdict(record), sort_keys=True) + "\n"
+            )
         return step_dir

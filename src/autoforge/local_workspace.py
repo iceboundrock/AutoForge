@@ -10,63 +10,107 @@ checks out, stashes or discards anything: a local run leaves the operator's
 work exactly where it found it, and an implementation may legitimately
 consist of uncommitted (even untracked) files.
 
-Every invocation goes through :mod:`autoforge.executor` with an argv list.
-``shell=True`` is never used, so a path containing a space, a quote, ``;``
-or ``$(...)`` is one opaque argument.
+Workspace identity
+------------------
+A review is only meaningful if the controller can say *which bytes* were
+reviewed and prove they did not change afterwards. That is the workspace
+snapshot, and it is defined by one rule:
 
-Workspace fingerprint
----------------------
-:meth:`LocalWorkspace.status` returns a SHA-256 fingerprint that binds a
-review to exactly the code that was reviewed. It covers:
+    The snapshot covers **every entry in the working tree**, found by the
+    controller walking the tree itself, and the only entries it does not
+    cover are the ones an explicitly enumerated, fingerprinted exclusion rule
+    removes.  There is no third category.
 
-- the current HEAD (or the fact that HEAD is unborn),
-- the checked-out branch (or the fact that HEAD is detached),
-- every path ``git status --porcelain=v1 -z --untracked-files=all`` reports
-  (tracked modifications, staged modifications, deletions, renames and
-  *untracked* files, which is where an implementation may well live),
-- the SHA-256 of each of those paths' current bytes, and
-- each of those paths' permission bits, because "the reviewer saw exactly
-  this tree" includes whether a file is executable. The porcelain read forces
-  ``core.fileMode=true`` so that which paths get bound does not depend on a
-  repository setting under which git reports no change at all for ``chmod +x``.
+This is deliberately *not* built on ``git status``. Git reports what is
+interesting to git, which is a moving target: an ignored file, a file marked
+``assume-unchanged`` or ``skip-worktree``, a mode change under
+``core.fileMode=false``, a clean tracked file, the contents of a submodule —
+each is invisible to some git invocation while being perfectly able to change
+what a reviewer concluded. Asking git "what changed?" and fingerprinting the
+answer makes the snapshot's completeness a property of git's configuration,
+which the agent under review can edit. The controller walks the tree instead,
+so no git setting, index flag or ignore rule can subtract from the snapshot.
 
-A symbolic link is bound by its link text, and its target must be a path of
-this working tree that the fingerprint also covers — a link out of the
-repository, or into the excluded state directory, points at bytes that could
-be replaced without the fingerprint moving, and is refused rather than bound.
+Git keeps exactly one job in LOCAL mode: telling the controller where the
+repository is (its working tree and its git directory) and what its *anchor*
+is (HEAD and the checked-out branch). Those are separate facts, checked
+separately; no decision about which bytes are bound depends on git.
 
-Every reported path is hashed by *content*, whatever its size: a fingerprint
-that fell back to ``(size, mtime)`` for large files would accept an
-equal-sized replacement whose mtime was restored, and "the reviewer saw
-exactly these bytes" is the one question this function exists to answer.
+Classification is total. Every entry the walk meets is exactly one of:
 
-``git diff HEAD`` alone would miss untracked files entirely, so it is not
-used. Paths under the configured state directory are excluded: AutoForge's
-own logs and ``state.json`` change on every step and must not invalidate the
-fingerprint. A state directory that *is* the repository root is rejected
-rather than excluded, since excluding it would exclude the whole tree. The
-feature specification is *not* excluded — it is covered by the
-fingerprint and, independently, by its own SHA-256 (see
-:func:`hash_bytes` and ``AutoForgeState.feature_spec_sha256``).
+===================  =========================================================
+regular file         included: permission bits + SHA-256 of its bytes
+directory            included: permission bits; the walk descends into it
+symbolic link        included: SHA-256 of its *link text*, and the target must
+                     resolve inside the working tree and outside every
+                     excluded region — a link to bytes the snapshot does not
+                     cover would let those bytes change without the
+                     fingerprint moving
+excluded             an enumerated rule matched: the rule and the path are
+                     recorded *in* the fingerprint, so what is not covered is
+                     itself part of the workspace's identity
+anything else        refused (fail closed): FIFOs, sockets, devices,
+                     unreadable entries, and nested git repositories
+===================  =========================================================
 
-The fingerprint is deliberately not a general VCS abstraction: it answers
-one question, "is this the same workspace the reviewer saw?".
+There is no "git did not report it, so the controller did not see it" state.
+
+Exclusion rules
+---------------
+Exactly two kinds of rule exist, and both are recorded in the fingerprint:
+
+``gitdir``
+    This repository's own git directory, matched by ``(st_dev, st_ino)``
+    rather than by the name ``.git`` — a name is not evidence. (A linked
+    worktree's ``.git`` *file* at the top level is matched too: it is the
+    pointer git itself put there.) Any **other** entry named ``.git`` is
+    refused: a submodule or a nested repository holds a whole second tree
+    whose contents git will not show through the outer one, and LOCAL v1
+    does not support binding it. Fail closed, not silently unbound.
+
+``exclude:<pattern>``
+    An operator-declared pattern from ``local.exclude``. This exists because
+    a complete walk really is complete: ``.venv/``, ``node_modules/`` and
+    ``__pycache__/`` are in the working tree, the test suite the controller
+    itself runs rewrites them, and no amount of cleverness makes "the
+    reviewer changed nothing" true over bytes that a build tool rewrites.
+    The honest answer is an explicit, operator-visible list that is hashed
+    into the fingerprint and named to the reviewer in its prompt — not a
+    built-in default that quietly decides which bytes do not count.
+
+A LOCAL state directory is **not** an exclusion rule, because it is not
+inside the reviewed tree: see :meth:`LocalWorkspace.check_state_dir_location`.
+
+Cost
+----
+A complete walk is bounded by ``local.max_workspace_entries`` and
+``local.max_workspace_bytes``. Exceeding either is a *refusal* naming the
+largest subtrees seen so far and the exact YAML to paste — never a silent
+downgrade to metadata-only hashing, which would accept an equal-sized
+replacement with a restored mtime.
 """
 
 from __future__ import annotations
 
 import hashlib
 import os
+import posixpath
 import re
 import stat
-from collections.abc import Callable
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
+from fnmatch import fnmatchcase
 from pathlib import Path
 
 from .errors import ConfigurationError, VerificationError
 from .executor import ExecutionRequest, ExecutionResult, execute
-from .safeio import entry_kind
-from .state import LOGS_DIRNAME, is_runtime_artifact
+from .safefs import (
+    SafeRoot,
+    UnreadableEntryError,
+    entry_kind,
+    open_regular_at,
+    readlink_at,
+)
 
 Runner = Callable[[ExecutionRequest], ExecutionResult]
 
@@ -77,6 +121,13 @@ _CHUNK = 1024 * 1024
 
 FEATURE_SPEC_SUFFIXES = (".md", ".markdown")
 
+#: Bumped whenever the *meaning* of a fingerprint changes, so a fingerprint
+#: persisted by an older controller can never compare equal to a new one.
+SNAPSHOT_TAG = "autoforge-workspace-v4"
+
+DEFAULT_MAX_ENTRIES = 50_000
+DEFAULT_MAX_BYTES = 512 * 1024 * 1024
+
 # A full object name as `git rev-parse` prints it (40 hex for SHA-1, 64 for a
 # SHA-256 repository). Anything else from a successful read is not an anchor.
 _OBJECT_NAME_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
@@ -86,166 +137,183 @@ def hash_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _require_link_target_bound(
-    path: Path, rel: str, target: str, root: Path, excluded: tuple[str, ...]
-) -> None:
-    """Refuse a symbolic link whose content the fingerprint would not cover.
+# -- exclusion rules ---------------------------------------------------------
+def normalize_exclude_pattern(pattern: str) -> str:
+    """Canonical text of one ``local.exclude`` pattern (ConfigurationError if unusable).
 
-    A link is bound by its *link text*, which is all that belongs to the link
-    itself. That is enough only while the bytes it points at are bound too --
-    and inside the repository they are, transitively: the target is a path of
-    this working tree, so changing it makes `git status` report that path and
-    the fingerprint hashes it there. The digest of the link and the digest of
-    the target are two entries of one fingerprint.
-
-    Outside the repository nothing reports it. ``impl.py -> /tmp/impl.py``
-    keeps the same link text and the same porcelain record no matter what is
-    written to ``/tmp/impl.py``, so the reviewed content can be replaced
-    wholesale while the fingerprint stays identical and the clean review still
-    counts as bound to it. The state directory is the same hole one level in:
-    its contents are *excluded* from the fingerprint precisely because the
-    controller rewrites them, so a link into it points at bytes nothing binds
-    either.
-
-    Both are refused rather than followed. Reading the target's bytes into the
-    digest instead would mean re-deciding, at every fingerprint, that the
-    resolved path is still a regular file, still readable and still not a
-    device -- re-implementing `_inspect` against a path outside the tree the
-    controller was pointed at. A local run reviews one working tree; an
-    implementation that reaches outside it is not one this controller can
-    prove anything about.
+    The canonical form is what gets hashed into the fingerprint, so two
+    spellings of the same rule must not produce two different workspace
+    identities.
     """
-    resolved = os.path.realpath(path)
-    try:
-        rel_target = os.path.relpath(resolved, root)
-    except ValueError:  # different drive (Windows): certainly outside
-        rel_target = ".."
-    escapes = (
-        rel_target == ".." or rel_target.startswith(".." + os.sep) or os.path.isabs(rel_target)
-    )
-    if escapes:
-        raise VerificationError(
-            _unbindable(
-                rel,
-                f"is a symbolic link to {target!r}, which resolves to {resolved} -- outside "
-                f"the repository {root}. Only the link text can be bound, and the bytes it "
-                "points at can then change without the fingerprint moving, so the review "
-                "would be bound to content it cannot see. Replace the link with the file "
-                "itself, or point it inside the working tree",
-            )
+    if not isinstance(pattern, str):
+        raise ConfigurationError(f"local.exclude entry must be a string, got {pattern!r}")
+    text = pattern.strip().replace(os.sep, "/").strip("/")
+    if not text:
+        raise ConfigurationError("local.exclude entry must not be empty")
+    if "\0" in text:
+        raise ConfigurationError(f"local.exclude entry {pattern!r} contains a NUL byte")
+    parts = [p for p in text.split("/") if p != ""]
+    if any(p in (".", "..") for p in parts):
+        raise ConfigurationError(
+            f"local.exclude entry {pattern!r} may not contain '.' or '..': patterns are "
+            "matched against paths relative to the repository root"
         )
-    posix_target = rel_target.replace(os.sep, "/")
-    if any(posix_target.startswith(prefix) for prefix in excluded):
-        raise VerificationError(
-            _unbindable(
-                rel,
-                f"is a symbolic link to {target!r}, which resolves into the state directory "
-                f"({posix_target}). Everything there is excluded from the fingerprint because "
-                "the controller rewrites it, so the link's content would be bound by nothing",
-            )
-        )
+    return "/".join(parts)
 
 
-def _unbindable(rel: str, why: str) -> str:
-    """Message for a changed path the workspace fingerprint cannot bind."""
-    return (
-        f"the working-tree path {rel!r} changed but {why}. The workspace fingerprint binds "
-        "a review to the exact bytes it saw, so a path it cannot hash makes the whole "
-        "binding unprovable and the run stops here rather than reviewing a tree it can "
-        "only partly describe."
-    )
+def _match_components(pattern: tuple[str, ...], path: tuple[str, ...]) -> bool:
+    """Component-wise glob match with ``**`` spanning zero or more components."""
+    if not pattern:
+        return not path
+    head, rest = pattern[0], pattern[1:]
+    if head == "**":
+        # Zero components, or one component consumed and try again.
+        if _match_components(rest, path):
+            return True
+        return bool(path) and _match_components(pattern, path[1:])
+    if not path:
+        return False
+    if not fnmatchcase(path[0], head):
+        return False
+    return _match_components(rest, path[1:])
 
 
-def _state_entry_problem(entry: os.DirEntry[str]) -> str | None:
-    """Why a state-directory entry is not the kind of entry AutoForge writes, or None.
+@dataclass(frozen=True)
+class Exclusion:
+    """One reason a path is not covered by the snapshot."""
 
-    ``check_state_dir`` trusts a *name* to decide what is excluded from the
-    fingerprint; this is the other half of that decision. ``logs`` must be a
-    real directory — the controller creates directories and files under it on
-    every step, and a symbolic link there would put those writes outside the
-    working tree (see :mod:`autoforge.safeio`, which refuses to follow one at
-    write time). Every other runtime name must be a plain regular file.
+    path: str  # repository-relative, "/"-separated
+    rule: str  # canonical rule text, e.g. "gitdir" or "exclude:.venv"
 
-    LOCAL mode is deliberately stricter here than :func:`autoforge.state.load_state`,
-    which tolerates a ``state.json`` symlink because its job is only to read
-    the file and never to silently re-initialise over it. The question here is
-    a different one: this directory is *excluded from the review binding*, so
-    an entry that is really a pointer somewhere else is exactly what the
-    exclusion must not cover.
-    """
-    try:
-        st = entry.stat(follow_symlinks=False)
-    except OSError as exc:  # pragma: no cover - scandir just listed it
-        return f"cannot be inspected: {exc}"
-    if stat.S_ISLNK(st.st_mode):
-        return "symbolic link"
-    if entry.name == LOGS_DIRNAME:
-        return None if stat.S_ISDIR(st.st_mode) else f"not a directory: {entry_kind(st.st_mode)}"
-    kind = entry_kind(st.st_mode)
-    return None if kind is None else f"not a regular file: {kind}"
+
+# -- snapshot ----------------------------------------------------------------
+KIND_FILE = "file"
+KIND_DIR = "dir"
+KIND_LINK = "link"
+KIND_EXCLUDED = "excluded"
 
 
 @dataclass(frozen=True)
 class WorkspaceEntry:
-    """One path `git status` reported, with the digest of its current bytes."""
+    """One classified entry of the working tree.
+
+    ``digest`` is the SHA-256 of a regular file's bytes, or of a symbolic
+    link's target text; it is empty for a directory and for an excluded path.
+    ``detail`` carries a directory's permission bits and, for an excluded
+    path, the rule that excluded it.
+    """
 
     path: str
-    code: str  # the two-character porcelain XY status code
-    digest: str  # sha256 of the content, or a "<kind>:..." marker
-    # Permission bits as four octal digits for a regular file ("0644"),
-    # "lnk" for a symbolic link, "-" for a path that is gone. Content and
-    # status code alone do not describe a working tree: on an *already*
-    # modified file `chmod +x` changes neither, and the porcelain code stays
-    # " M", so without this a mode flip after a clean review was invisible to
-    # the binding that is supposed to make the review trustworthy.
-    mode: str = "-"
-
-    @property
-    def is_untracked(self) -> bool:
-        return self.code == "??"
+    kind: str
+    mode: str
+    digest: str
+    detail: str = ""
 
 
 @dataclass(frozen=True)
-class WorkspaceStatus:
+class WorkspaceSnapshot:
+    """Exactly which bytes the working tree held when this was taken."""
+
     root: Path
-    head_sha: str  # "" when HEAD is unborn (a repository with no commit yet)
-    # Checked-out branch, or "" when HEAD is detached. Together with
-    # ``head_sha`` this is the *git anchor* a LOCAL run is pinned to: the
-    # controller refuses to continue when either moves (see
-    # ``AutoForgeState.base_head_sha`` / ``base_branch``).
-    branch: str = ""
-    entries: tuple[WorkspaceEntry, ...] = field(default_factory=tuple)
-    fingerprint: str = ""
+    head_sha: str
+    branch: str
+    entries: tuple[WorkspaceEntry, ...]
+    rules: tuple[str, ...]
+    fingerprint: str
+    total_bytes: int
 
     @property
     def anchor(self) -> str:
-        """Human-readable HEAD + branch, for error messages."""
-        head = self.head_sha[:12] if self.head_sha else "(unborn)"
-        return f"{head} on {self.branch or '(detached HEAD)'}"
+        """HEAD + branch, the git fact bound independently of the tree bytes."""
+        head = self.head_sha or "(unborn)"
+        branch = self.branch or "(detached)"
+        return f"{head}@{branch}"
 
     @property
-    def is_clean(self) -> bool:
-        return not self.entries
+    def file_count(self) -> int:
+        return sum(1 for e in self.entries if e.kind == KIND_FILE)
 
     @property
-    def paths(self) -> tuple[str, ...]:
-        return tuple(e.path for e in self.entries)
-
-    @property
-    def untracked_paths(self) -> tuple[str, ...]:
-        return tuple(e.path for e in self.entries if e.is_untracked)
-
-    @property
-    def tracked_paths(self) -> tuple[str, ...]:
-        return tuple(e.path for e in self.entries if not e.is_untracked)
+    def exclusions(self) -> tuple[Exclusion, ...]:
+        return tuple(
+            Exclusion(path=e.path, rule=e.detail) for e in self.entries if e.kind == KIND_EXCLUDED
+        )
 
     def describe(self, limit: int = 12) -> str:
-        if not self.entries:
-            return "(clean working tree)"
-        shown = [f"{e.code} {e.path}" for e in self.entries[:limit]]
-        if len(self.entries) > limit:
-            shown.append(f"... and {len(self.entries) - limit} more")
-        return ", ".join(shown)
+        """One line for a prompt or a block reason."""
+        files = self.file_count
+        dirs = sum(1 for e in self.entries if e.kind == KIND_DIR)
+        links = sum(1 for e in self.entries if e.kind == KIND_LINK)
+        excluded = self.exclusions
+        parts = [
+            f"{files} file(s), {dirs} director(ies), {links} symlink(s), "
+            f"{self.total_bytes} byte(s) hashed"
+        ]
+        if excluded:
+            shown = ", ".join(f"{x.path} [{x.rule}]" for x in excluded[:limit])
+            more = "" if len(excluded) <= limit else f" and {len(excluded) - limit} more"
+            parts.append(f"excluded: {shown}{more}")
+        return " | ".join(parts)
+
+    def describe_exclusions(self) -> str:
+        """What the reviewer must be told is *not* bound by the fingerprint."""
+        excluded = self.exclusions
+        if not excluded:
+            return "(none — every entry in the working tree is covered by the fingerprint)"
+        return "; ".join(f"{x.path} [{x.rule}]" for x in excluded)
+
+
+def _fingerprint(
+    entries: Iterable[WorkspaceEntry],
+    rules: Iterable[str],
+) -> str:
+    """SHA-256 over the classified tree and the rules that shaped it.
+
+    Every field is length-prefixed before it is fed to the hash, because a
+    path may contain any byte except NUL and ``/`` — including a newline —
+    and a separator-delimited encoding would let two different trees produce
+    one digest.
+
+    The git anchor is deliberately *not* part of this: "which bytes are in the
+    tree" and "which commit is checked out" are two facts with two different
+    failure modes, and mixing them would report a plain ``git commit`` (which
+    changes HEAD and nothing else) as "the reviewer modified the working
+    tree".
+    """
+    h = hashlib.sha256()
+
+    def feed(value: str) -> None:
+        raw = value.encode("utf-8", errors="surrogateescape")
+        h.update(str(len(raw)).encode("ascii"))
+        h.update(b"\0")
+        h.update(raw)
+        h.update(b"\0")
+
+    feed(SNAPSHOT_TAG)
+    ordered_rules = sorted(rules)
+    feed(str(len(ordered_rules)))
+    for rule in ordered_rules:
+        feed(rule)
+    ordered = sorted(entries, key=lambda e: e.path.encode("utf-8", errors="surrogateescape"))
+    feed(str(len(ordered)))
+    for entry in ordered:
+        feed(entry.kind)
+        feed(entry.mode)
+        feed(entry.digest)
+        feed(entry.detail)
+        feed(entry.path)
+    return h.hexdigest()
+
+
+def _mode_text(st: os.stat_result) -> str:
+    return f"{stat.S_IMODE(st.st_mode):04o}"
+
+
+def _refuse(path: str, what: str, remedy: str) -> VerificationError:
+    return VerificationError(
+        f"cannot bind the working tree: {path} is {what}. A LOCAL run must be able to say "
+        f"exactly which bytes the reviewer reviewed, and it cannot for this entry. {remedy}"
+    )
 
 
 class LocalWorkspace:
@@ -254,15 +322,27 @@ class LocalWorkspace:
     def __init__(
         self,
         workdir: str | Path = ".",
-        state_dir: str | Path = ".autoforge",
         runner: Runner | None = None,
         timeout_seconds: int = GIT_TIMEOUT_SECONDS,
+        exclude: Iterable[str] = (),
+        max_entries: int = DEFAULT_MAX_ENTRIES,
+        max_bytes: int = DEFAULT_MAX_BYTES,
     ) -> None:
         self.workdir = Path(workdir)
-        self.state_dir = Path(state_dir)
         self._runner: Runner = runner or execute
         self.timeout = timeout_seconds
+        self.exclude: tuple[str, ...] = tuple(
+            sorted({normalize_exclude_pattern(p) for p in exclude})
+        )
+        self.max_entries = max_entries
+        self.max_bytes = max_bytes
         self._root: Path | None = None
+        self._git_dirs: tuple[Path, ...] | None = None
+        # Content-digest memo, keyed by identity *and* change indicators. The
+        # key is a cache key only: it never becomes part of the fingerprint,
+        # so a forged mtime can at worst cost a re-hash, never bind the wrong
+        # bytes... and ctime cannot be set backwards without root at all.
+        self._digests: dict[tuple[int, int, int, int, int], str] = {}
 
     # -- git plumbing -----------------------------------------------------
     def _git(self, argv: list[str], *, allow_failure: bool = False) -> ExecutionResult:
@@ -305,6 +385,46 @@ class LocalWorkspace:
             self._root = Path(os.path.realpath(top))
         return self._root
 
+    def git_dirs(self) -> tuple[Path, ...]:
+        """This repository's git directories (per-worktree and common), resolved.
+
+        Both are needed: in a linked worktree ``--git-dir`` is
+        ``<main>/.git/worktrees/<name>`` while ``--git-common-dir`` is
+        ``<main>/.git``, and either can be the directory that physically sits
+        inside the tree being walked.
+        """
+        if self._git_dirs is None:
+            found: list[Path] = []
+            for flag in ("--git-dir", "--git-common-dir"):
+                res = self._git(["rev-parse", flag], allow_failure=True)
+                if res.exit_code != 0:
+                    raise VerificationError(
+                        f"cannot locate the git directory of {self.workdir} "
+                        f"(`git rev-parse {flag}` exited {res.exit_code}); the controller "
+                        "will not walk a working tree whose git directory it cannot identify, "
+                        "because it could not then tell the repository's own metadata apart "
+                        "from reviewable content"
+                    )
+                text = (res.stdout or "").strip()
+                if not text:
+                    raise VerificationError(
+                        f"`git rev-parse {flag}` returned nothing for {self.workdir}"
+                    )
+                found.append(Path(os.path.realpath(Path(self.workdir) / text)))
+            self._git_dirs = tuple(dict.fromkeys(found))
+        return self._git_dirs
+
+    def local_state_dir(self) -> Path:
+        """Where a LOCAL run keeps its runtime state by default.
+
+        Inside the git directory, which is *outside* the reviewed tree by
+        construction. That is the whole point: a state directory in the
+        working tree would have to be carved out of the workspace snapshot by
+        name, and "these particular file names do not count" is exactly the
+        kind of rule an agent writing into the tree can exploit.
+        """
+        return self.git_dirs()[0] / "autoforge" / "state"
+
     def head_sha(self) -> str:
         """Current HEAD, or "" when the repository has no commit yet.
 
@@ -314,9 +434,8 @@ class LocalWorkspace:
         repository, a permissions change, a missing object store).  Both used
         to collapse into ``""``, which is also the legitimate value for an
         unborn HEAD — so a failing read looked exactly like "HEAD has not
-        moved" to :meth:`ControllerEngine._git_anchor_drift`, and a run whose
-        git identity could no longer be established continued instead of
-        failing closed.
+        moved", and a run whose git identity could no longer be established
+        continued instead of failing closed.
         """
         res = self._git(["rev-parse", "--verify", "--quiet", "HEAD"], allow_failure=True)
         if res.exit_code == 1:
@@ -369,372 +488,342 @@ class LocalWorkspace:
             "whose identity the controller can no longer establish."
         )
 
-    # -- state-directory exclusion ----------------------------------------
-    def state_dir_relpath(self) -> str | None:
-        """Repository-relative path of the state directory, or None if outside.
+    def dirty_paths(self) -> list[str]:
+        """Paths git considers changed, for the *start-up dirty-tree policy* only.
 
-        ``""`` means it resolves to the repository root itself, which is not a
-        usable exclusion (see :meth:`check_state_dir`).
+        This is a policy question ("is the operator's work in the way?"), not
+        an identity question: nothing derived from it enters the fingerprint.
+        Git's own notion of "changed" is exactly right here — it is the
+        operator's mental model of their uncommitted work — and it is exactly
+        wrong for identity, which is why the two are separate methods.
+        """
+        res = self._git(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        out = res.stdout or ""
+        fields = out.split("\0")
+        paths: list[str] = []
+        index = 0
+        while index < len(fields):
+            record = fields[index]
+            index += 1
+            if not record:
+                continue
+            if len(record) < 4:
+                raise VerificationError(f"cannot parse `git status` record {record!r}")
+            code, path = record[:2], record[3:]
+            if code[0] == "R" or code[1] == "R":
+                # A rename is two NUL-separated fields: "<code> <new>\0<old>".
+                if index < len(fields):
+                    old = fields[index]
+                    index += 1
+                    if old:
+                        paths.append(old)
+            if path:
+                paths.append(path)
+        return sorted(dict.fromkeys(paths))
+
+    # -- state directory --------------------------------------------------
+    def check_state_dir_location(self, state_dir: str | Path) -> None:
+        """Require the state directory to sit outside the reviewed tree.
+
+        LOCAL mode's workspace snapshot covers the *whole* working tree. A
+        state directory inside it would be rewritten by the controller on
+        every step, so it would have to be excluded — and an exclusion carved
+        out by path is a region of the tree an agent can write into knowing
+        the fingerprint will not move. Putting runtime state in the git
+        directory removes the problem instead of managing it: the git
+        directory is already excluded, by inode identity, for reasons that
+        have nothing to do with AutoForge.
         """
         root = self.root()
-        try:
-            rel = os.path.relpath(self._state_dir_real(), root)
-        except ValueError:  # different drive (Windows); not inside the repo
-            return None
-        if rel.startswith("..") or os.path.isabs(rel):
-            return None
-        rel = os.path.normpath(rel).replace(os.sep, "/").strip("/")
-        return "" if rel in ("", ".") else rel
-
-    def _state_dir_spelled(self) -> str:
-        """The state directory as configured, with only ``workdir`` resolved.
-
-        The prefix has to be resolved: ``workdir`` is the operator's cwd and
-        may legitimately sit under a symbolic link (``/home`` is one on
-        several distributions), and :meth:`root` is a real path, so comparing
-        an unresolved ``workdir`` against it would call every such checkout
-        "outside the repository". Everything the *configuration* spells is
-        left alone -- that tail is exactly what :meth:`check_state_dir`
-        compares against its resolved form.
-        """
-        candidate = self.state_dir
-        if candidate.is_absolute():
-            return os.path.normpath(str(candidate))
-        return os.path.normpath(os.path.join(os.path.realpath(self.workdir), str(candidate)))
-
-    def _state_dir_real(self) -> str:
-        return os.path.realpath(self._state_dir_spelled())
-
-    def check_state_dir_containment(self) -> None:
-        """Refuse a state directory that is spelled inside the repository but is not.
-
-        A state directory outside the checkout is a supported configuration:
-        ``--state-dir /var/tmp/af`` excludes nothing from the fingerprint and
-        needs none of :meth:`check_state_dir`'s rules. What must not happen is
-        arriving there *without having asked for it*. ``.autoforge`` (the
-        default) made a symbolic link to somewhere else sends every controller
-        write -- ``state.json``, the whole run-log tree -- out of the checkout
-        that a LOCAL run promises to be the only thing it touches, and it does
-        so silently, because the path is resolved before it is classified and
-        the resolved path is then "outside the repository: nothing is
-        excluded".
-
-        So the two readings of the configured path must agree: what it spells
-        and where it lands. They differ only when a component of it is a
-        symbolic link, and a state directory reached through one is refused
-        rather than followed. A path spelled outside the repository is not
-        checked -- it is the configuration this method exists to distinguish
-        from -- and one spelled inside that also lands inside, through a link
-        or not, is where the controller's own rules already apply.
-
-        This is checked on every :meth:`status`, not once at startup, so a
-        directory replaced by a link part-way through a run is caught at the
-        next fingerprint rather than at the end of it. It is not a defence
-        against something racing the controller between the check and the
-        write (see :mod:`autoforge.safeio` for where that boundary is): it is
-        the controller declining to write where it was not told to.
-        """
-        spelled = self._state_dir_spelled()
-        real = self._state_dir_real()
-        if real == spelled:
+        resolved = Path(os.path.realpath(state_dir))
+        if not _is_within(resolved, root):
             return
-        root = str(self.root())
-        try:
-            rel = os.path.relpath(spelled, root)
-        except ValueError:  # different drive (Windows): spelled outside
-            return
-        if rel.startswith("..") or os.path.isabs(rel):
-            return  # spelled outside the repository: the operator asked for that
+        for git_dir in self.git_dirs():
+            if resolved == git_dir or _is_within(resolved, git_dir):
+                return
         raise ConfigurationError(
-            f"the state directory is configured as {self.state_dir} -- inside the repository "
-            f"{root} -- but resolves to {real}. A component of that path is a symbolic link, "
-            "so 'state.json' and the whole run-log tree would be written outside the checkout "
-            "while the controller reported an in-repository state directory, and a local run "
-            "touches nothing outside the working tree it was pointed at. Replace the link with "
-            "a real directory, or configure the external path directly (--state-dir "
-            f"{real}), which is a supported configuration."
+            f"state directory {resolved} is inside the LOCAL working tree {root}. A LOCAL "
+            "run fingerprints every byte of the working tree, so runtime state kept there "
+            "would either invalidate its own fingerprint on every step or have to be carved "
+            "out of it by path — a region an agent could then write into unnoticed. Leave "
+            f"--state-dir unset (the default is {self.local_state_dir()}) or point it "
+            "outside the repository."
         )
 
-    def check_state_dir(self) -> None:
-        """Require an in-repository state directory to hold *only* runtime state.
-
-        The fingerprint excludes everything under the state directory so
-        AutoForge's own ``state.json`` and ``logs/`` cannot invalidate it.
-        That exclusion is only safe while the directory holds nothing else,
-        because an excluded path is a path no review is bound to.
-
-        Three ways it can stop being safe, all refused here:
-
-        *The state directory is the repository root.* There is no prefix to
-        exclude — every path in the tree would have to be — so the
-        controller's own writes start showing up as workspace changes: a
-        read-only REVIEW appears to have modified the tree and the reviewer is
-        rejected because the controller logged its invocation.
-
-        *The state directory holds project content.* ``--state-dir src`` was
-        accepted, and then every path under ``src/`` was excluded from the
-        fingerprint: editing ``src/app.py`` left the fingerprint unchanged, so
-        the controller would bind a review to a workspace digest that said
-        nothing about the implementation, and accept code no reviewer ever
-        saw. The directory must therefore contain only entries AutoForge
-        itself writes (:func:`autoforge.state.is_runtime_artifact`).
-
-        Excluding the individual runtime entries instead of the directory
-        would not fix this: it would silently hide any ``state.json`` or
-        ``logs/`` the *project* legitimately has, which is the same hole one
-        level down. Refusing the configuration is the only answer that leaves
-        nothing excluded that a reviewer needed to see.
-
-        *An entry is not the kind of entry it is named after.* A name is
-        evidence of authorship, not proof of it (see
-        :func:`autoforge.state.is_runtime_artifact`), so each excluded entry
-        must also be what it claims: ``logs`` a real directory the controller
-        writes run logs into, everything else a regular file. A ``logs``
-        symlink would put every artifact of the run outside the checkout a
-        LOCAL run promises not to leave, and a link anywhere here excludes a
-        name whose real content lives somewhere else entirely.
-
-        What remains is the crash-shaped residue: a moved-aside corrupt state
-        and a temp file left by a killed ``save_state`` are trusted by name
-        and shape alone, because nothing durable records that the controller
-        created them (see #48). Both are *excluded* rather than fingerprinted
-        for a reason — a quarantine archive is written by ``run --force``
-        before the baseline is read, so binding it would make recovery from a
-        corrupt state report a dirty tree. A state directory outside the
-        repository excludes nothing and needs none of this.
-        """
-        self.check_state_dir_containment()
-        rel = self.state_dir_relpath()
-        if rel is None:
-            return  # outside the repository: nothing is excluded at all
-        root = self.root()
-        if rel == "":
-            raise ConfigurationError(
-                f"the state directory resolves to the repository root ({root}); "
-                "local mode fingerprints the working tree and excludes the state "
-                "directory from it, which is impossible when the two are the same "
-                "directory. Use a subdirectory such as '.autoforge' (the default), or a "
-                "path outside the repository."
-            )
-        directory = root / rel
-        try:
-            with os.scandir(directory) as it:
-                entries = sorted(it, key=lambda e: e.name)
-        except FileNotFoundError:
-            return  # not created yet: the run will create it and own it
-        except NotADirectoryError:
-            raise ConfigurationError(
-                f"the state directory {directory} is not a directory; local mode needs a "
-                "directory it owns for 'state.json' and 'logs/'"
-            ) from None
-        except OSError as exc:
-            raise ConfigurationError(
-                f"cannot inspect the state directory {directory}: {exc}"
-            ) from exc
-        wrong_kind = [
-            f"{entry.name} ({problem})"
-            for entry in entries
-            if is_runtime_artifact(entry.name) and (problem := _state_entry_problem(entry))
-        ]
-        if wrong_kind:
-            raise ConfigurationError(
-                f"the state directory {directory} holds an entry AutoForge did not create: "
-                + ", ".join(wrong_kind)
-                + ". A runtime name is evidence of authorship, not proof of it, so local "
-                "mode also requires each excluded entry to be what it claims: 'logs' a real "
-                "directory the controller writes run logs into, everything else a regular "
-                "file. A link there would send controller writes outside the checkout and "
-                "exclude a path whose real content lives somewhere else entirely. Move the "
-                "entry aside, or use a state directory outside the repository."
-            )
-        foreign = [entry.name for entry in entries if not is_runtime_artifact(entry.name)]
-        if foreign:
-            listed = ", ".join(foreign[:10]) + ("..." if len(foreign) > 10 else "")
-            raise ConfigurationError(
-                f"the state directory {directory} is inside the repository and holds "
-                f"content AutoForge did not write ({listed}); local mode excludes "
-                f"everything under {rel!r} from the workspace fingerprint, so a state "
-                "directory that also holds project content would hide exactly the changes "
-                "a review must be bound to — an edit under it would leave the fingerprint "
-                "unchanged and the controller would accept code no reviewer ever saw. Use "
-                "a dedicated runtime directory such as '.autoforge' (the default), or a "
-                "path outside the repository."
-            )
-
-    def _excluded_prefixes(self) -> tuple[str, ...]:
-        """Repository-relative prefixes whose contents never affect the fingerprint."""
-        self.check_state_dir()
-        rel = self.state_dir_relpath()
-        return (f"{rel}/",) if rel else ()
-
-    # -- status + fingerprint ---------------------------------------------
-    def status(self) -> WorkspaceStatus:
-        """Read HEAD + working-tree status and compute the fingerprint."""
+    # -- the snapshot -----------------------------------------------------
+    def snapshot(self) -> WorkspaceSnapshot:
+        """Classify every entry of the working tree and fingerprint the result."""
         root = self.root()
         head = self.head_sha()
         branch = self.branch()
-        excluded = self._excluded_prefixes()
+        git_ids = self._git_dir_identities()
         entries: list[WorkspaceEntry] = []
-        for code, path in self._porcelain():
-            if any(path.startswith(prefix) for prefix in excluded):
-                continue
-            mode, digest = self._inspect(root / path, path, root, excluded)
-            entries.append(WorkspaceEntry(path=path, code=code, digest=digest, mode=mode))
-        entries.sort(key=lambda e: e.path)
-        return WorkspaceStatus(
+        total_bytes = 0
+        count = 0
+        by_top: dict[str, int] = {}
+
+        # One translation point for "the controller may not read this".
+        # Whether it is a file it cannot open or a directory it cannot list,
+        # unreadable means unbindable, and the answer is the same refusal.
+        try:
+            with SafeRoot.open(root) as tree:
+                for entry in tree.walk():
+                    count += 1
+                    top = entry.relpath.split("/", 1)[0]
+                    by_top[top] = by_top.get(top, 0) + 1
+                    if count > self.max_entries:
+                        raise self._too_big(
+                            f"the working tree has more than {self.max_entries} entries",
+                            "local.max_workspace_entries",
+                            by_top,
+                        )
+                    rule = self._exclusion_rule(entry.relpath, entry.st, git_ids)
+                    if rule is not None:
+                        entries.append(
+                            WorkspaceEntry(
+                                path=entry.relpath,
+                                kind=KIND_EXCLUDED,
+                                mode="",
+                                digest="",
+                                detail=rule,
+                            )
+                        )
+                        entry.skip = True
+                        continue
+                    if entry.name == ".git":
+                        raise _refuse(
+                            entry.relpath,
+                            "a nested git repository or submodule",
+                            "LOCAL mode binds one working tree and cannot see inside a second one, "
+                            "so it refuses rather than reviewing code it cannot pin. Remove it, or "
+                            f"declare it unreviewed by adding '{posixpath.dirname(entry.relpath)}' "
+                            "to local.exclude.",
+                        )
+                    if entry.is_dir:
+                        entries.append(
+                            WorkspaceEntry(
+                                path=entry.relpath,
+                                kind=KIND_DIR,
+                                mode=_mode_text(entry.st),
+                                digest="",
+                            )
+                        )
+                    elif entry.is_symlink:
+                        target = readlink_at(entry.dir_fd, entry.name)
+                        self._check_link_target(entry.relpath, target, root, git_ids)
+                        entries.append(
+                            WorkspaceEntry(
+                                path=entry.relpath,
+                                kind=KIND_LINK,
+                                mode="",
+                                digest=hash_bytes(target.encode("utf-8", errors="surrogateescape")),
+                            )
+                        )
+                    elif entry.is_regular:
+                        total_bytes += entry.st.st_size
+                        if total_bytes > self.max_bytes:
+                            raise self._too_big(
+                                f"the working tree holds more than {self.max_bytes} bytes of "
+                                "regular-file content",
+                                "local.max_workspace_bytes",
+                                by_top,
+                            )
+                        entries.append(
+                            WorkspaceEntry(
+                                path=entry.relpath,
+                                kind=KIND_FILE,
+                                mode=_mode_text(entry.st),
+                                digest=self._digest(
+                                    entry.dir_fd, entry.name, entry.relpath, entry.st
+                                ),
+                            )
+                        )
+                    else:
+                        raise _refuse(
+                            entry.relpath,
+                            f"a {entry_kind(entry.st.st_mode)}",
+                            "Its contents are not a sequence of bytes the controller can hash, so "
+                            "it cannot be part of a reviewed snapshot. Move it out of the working "
+                            "tree, or add it to local.exclude to declare it unreviewed.",
+                        )
+        except UnreadableEntryError as exc:
+            raise _refuse(
+                exc.path,
+                "not readable by the controller",
+                "An entry the controller cannot read is an entry it cannot prove "
+                "unchanged. Fix its permissions, or add it to local.exclude to declare "
+                "it unreviewed.",
+            ) from exc
+
+        rules = ("gitdir",) + tuple(f"exclude:{p}" for p in self.exclude)
+        return WorkspaceSnapshot(
             root=root,
             head_sha=head,
             branch=branch,
             entries=tuple(entries),
-            fingerprint=self._fingerprint(head, branch, entries),
+            rules=rules,
+            fingerprint=_fingerprint(entries, rules),
+            total_bytes=total_bytes,
         )
 
-    def _porcelain(self) -> list[tuple[str, str]]:
-        """`git status --porcelain=v1 -z -uall` as (XY code, path) pairs.
-
-        NUL-delimited output is parsed rather than the line-based form: a
-        path containing a newline, a quote or a backslash is returned raw by
-        ``-z`` and would otherwise be C-quoted and ambiguous. A rename entry
-        ('R'/'C') is followed by a second record holding the *original* path;
-        both ends are recorded, so moving a file cannot hide from the
-        fingerprint.
-        """
-        res = self._git(
-            # -c core.fileMode=true: with `core.fileMode=false` git ignores the
-            # executable bit entirely, so `chmod +x` on an otherwise *clean*
-            # tracked file produces no porcelain entry at all -- the path is
-            # never inspected, and neither its mode nor its bytes reach the
-            # fingerprint. The mode is part of the binding (see `_inspect`),
-            # so the read that decides which paths are bound must not depend
-            # on a repository setting that can be flipped mid-run. Forcing it
-            # on can only make the controller see *more* change than git's
-            # configuration would: on a filesystem that genuinely cannot store
-            # modes the tree reads as broadly dirty, which costs hashing and
-            # binds more than necessary, and never less.
-            ["-c", "core.fileMode=true", "status", "--porcelain=v1", "-z", "--untracked-files=all"]
-        )
-        raw = res.stdout or ""
-        fields = raw.split("\0")
-        out: list[tuple[str, str]] = []
-        i = 0
-        while i < len(fields):
-            entry = fields[i]
-            i += 1
-            if not entry:
-                continue
-            if len(entry) < 4 or entry[2] != " ":
-                # Not a status record we understand; recording it verbatim
-                # keeps the fingerprint sensitive to it instead of dropping it.
-                out.append(("??", entry))
-                continue
-            code, path = entry[:2], entry[3:]
-            out.append((code, path))
-            if code[0] in ("R", "C") and i < len(fields):
-                original = fields[i]
-                i += 1
-                if original:
-                    out.append((f"{code[0]}~", original))
-        return out
-
-    @staticmethod
-    def _inspect(path: Path, rel: str, root: Path, excluded: tuple[str, ...]) -> tuple[str, str]:
-        """Mode + SHA-256 of a changed working-tree path. Fails closed, never guesses.
-
-        Content is hashed regardless of file size. An earlier revision fell
-        back to ``(size, mtime_ns)`` above a threshold to keep the cost
-        bounded; that made the fingerprint metadata-bound rather than
-        content-bound for exactly the files where a silent swap is easiest to
-        hide, so a review could be accepted for bytes it never saw. The set of
-        hashed paths is bounded by what ``git status`` reports as changed.
-
-        The same argument rules out *stable markers* for paths that cannot be
-        hashed. Returning ``"unreadable:PermissionError"`` or ``"dir"`` reads
-        as a digest and compares equal to itself, so replacing an unreadable
-        file's bytes — or changing everything inside a dirty submodule — left
-        the fingerprint identical and the review still counted as bound. A
-        marker that says "I could not look" is not evidence that nothing
-        changed, so anything that cannot be content-bound raises instead.
-
-        Absence is the one non-hash value kept: a deleted or renamed-away path
-        is a fact ``git status`` reported and ``lstat`` confirms, not a failure
-        to observe one.
-
-        The permission bits come from the same ``lstat`` as the content, so
-        the pair describes one observation of one entry rather than two
-        observations that could straddle a change. They are part of the
-        binding because they are part of the working tree: whether a script
-        is executable decides what a validation command does with it, and on
-        a file that is already dirty a mode change moves neither the content
-        digest nor the porcelain status code.
-        """
-        try:
-            st = os.lstat(path)
-        except FileNotFoundError:
-            # A deleted (or renamed-away) path: absence is part of the state.
-            return "-", "absent"
-        except OSError as exc:
-            raise VerificationError(_unbindable(rel, f"cannot be inspected ({exc})")) from exc
-        if stat.S_ISLNK(st.st_mode):
+    def _git_dir_identities(self) -> set[tuple[int, int]]:
+        ids: set[tuple[int, int]] = set()
+        for git_dir in self.git_dirs():
             try:
-                target = os.readlink(path)
+                st = os.lstat(git_dir)
             except OSError as exc:
                 raise VerificationError(
-                    _unbindable(rel, f"is a symbolic link whose target cannot be read ({exc})")
+                    f"cannot inspect the git directory {git_dir}: {exc}. The controller "
+                    "identifies it by inode, not by name, and will not walk the working tree "
+                    "without that identity."
                 ) from exc
-            _require_link_target_bound(path, rel, target, root, excluded)
-            # A symbolic link's own permission bits are not meaningful (and not
-            # portable); the link text is all of it that is its own -- what it
-            # points at is bound by being a path the fingerprint also covers,
-            # which `_require_link_target_bound` is what establishes.
-            return "lnk", "symlink:" + hash_bytes(target.encode("utf-8", "surrogateescape"))
-        if stat.S_ISDIR(st.st_mode):
-            raise VerificationError(
-                _unbindable(
-                    rel,
-                    "is a directory, whose contents no single digest can bind. `git status` "
-                    "reports a bare directory for a dirty submodule and for an untracked "
-                    "nested repository, and its contents can then change freely without the "
-                    "workspace fingerprint moving. Commit or remove the nested repository, "
-                    "or run the feature in a checkout without it: LOCAL mode reviews one "
-                    "working tree and does not descend into submodules",
-                )
+            ids.add((st.st_dev, st.st_ino))
+        return ids
+
+    def _exclusion_rule(
+        self, relpath: str, st: os.stat_result, git_ids: set[tuple[int, int]]
+    ) -> str | None:
+        """The rule excluding ``relpath``, or ``None`` when it is covered.
+
+        Identity first: the git directory is recognised by ``(st_dev,
+        st_ino)``, so a decoy named ``.git`` is not excluded and a git
+        directory under any other name still is.
+        """
+        if stat.S_ISDIR(st.st_mode) and (st.st_dev, st.st_ino) in git_ids:
+            return "gitdir"
+        if relpath == ".git" and stat.S_ISREG(st.st_mode):
+            # A linked worktree's pointer file. It is git's own metadata and
+            # it names a directory the walk never enters.
+            return "gitdir"
+        return self._config_rule(relpath)
+
+    def _config_rule(self, relpath: str) -> str | None:
+        """The ``local.exclude`` rule covering ``relpath`` or any ancestor of it."""
+        parts = tuple(p for p in relpath.split("/") if p)
+        for pattern in self.exclude:
+            pat = tuple(pattern.split("/"))
+            for depth in range(1, len(parts) + 1):
+                if _match_components(pat, parts[:depth]):
+                    return f"exclude:{pattern}"
+        return None
+
+    def _check_link_target(
+        self, relpath: str, target: str, root: Path, git_ids: set[tuple[int, int]]
+    ) -> None:
+        """A symbolic link may only point at bytes this snapshot also covers.
+
+        The link *text* is what the snapshot binds, so the link itself cannot
+        change without moving the fingerprint. What the link resolves to is a
+        different question: if it leaves the working tree, or lands in an
+        excluded region, the reviewer read bytes that can be replaced with the
+        fingerprint standing still.
+
+        The resolution uses ``realpath``, which follows other links — and that
+        is sound here rather than a hole, because *every* link in the tree
+        gets this check: if any link on the resolved path escaped, that link
+        is itself refused. The conjunction over the whole walk is the
+        invariant, not each check in isolation.
+        """
+        parent = root / posixpath.dirname(relpath) if posixpath.dirname(relpath) else root
+        resolved = Path(os.path.realpath(os.path.join(str(parent), target)))
+        if resolved != root and not _is_within(resolved, root):
+            raise _refuse(
+                relpath,
+                f"a symbolic link to {resolved}, which is outside the working tree",
+                "The reviewer would read bytes the snapshot cannot bind, so they could be "
+                "replaced without the fingerprint changing. Point it inside the repository, "
+                "or add it to local.exclude to declare it unreviewed.",
             )
-        if not stat.S_ISREG(st.st_mode):
-            raise VerificationError(
-                _unbindable(
-                    rel,
-                    f"is not a regular file (mode {st.st_mode:o}); a FIFO, socket or device "
-                    "has no stable content for a review to be bound to",
+        for git_dir in self.git_dirs():
+            if resolved == git_dir or _is_within(resolved, git_dir):
+                raise _refuse(
+                    relpath,
+                    f"a symbolic link into the git directory ({resolved})",
+                    "That region is excluded from the snapshot, so its bytes are not bound. "
+                    "Remove the link or add it to local.exclude.",
                 )
-            )
+        rel = os.path.relpath(resolved, root).replace(os.sep, "/")
+        if rel not in (".", ""):
+            rule = self._config_rule(rel)
+            if rule is not None:
+                raise _refuse(
+                    relpath,
+                    f"a symbolic link to {rel}, which '{rule}' excludes from the snapshot",
+                    "Its bytes are not bound, so they could change without the fingerprint "
+                    "moving. Remove the link, or exclude the link itself as well.",
+                )
+
+    def _digest(self, dir_fd: int, name: str, relpath: str, st: os.stat_result) -> str:
+        key = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+        cached = self._digests.get(key)
+        if cached is not None:
+            return cached
+        try:
+            fd = open_regular_at(dir_fd, name, os.O_RDONLY, where=relpath)
+        except FileNotFoundError as exc:
+            raise _refuse(
+                relpath,
+                "gone between being listed and being read",
+                "Something is writing the working tree while the controller is binding it; "
+                "stop it and re-run.",
+            ) from exc
         h = hashlib.sha256()
         try:
-            with open(path, "rb") as fh:
-                while chunk := fh.read(_CHUNK):
+            with os.fdopen(fd, "rb") as fh:
+                while True:
+                    chunk = fh.read(_CHUNK)
+                    if not chunk:
+                        break
                     h.update(chunk)
         except OSError as exc:
-            raise VerificationError(_unbindable(rel, f"cannot be read ({exc})")) from exc
-        return f"{stat.S_IMODE(st.st_mode):04o}", h.hexdigest()
+            raise _refuse(
+                relpath, f"unreadable ({exc})", "Fix it, or add it to local.exclude."
+            ) from exc
+        digest = h.hexdigest()
+        self._digests[key] = digest
+        return digest
 
-    @staticmethod
-    def _fingerprint(head_sha: str, branch: str, entries: list[WorkspaceEntry]) -> str:
-        h = hashlib.sha256()
-        h.update(b"autoforge-workspace-v3\n")
-        h.update(f"HEAD:{head_sha or '(unborn)'}\n".encode())
-        h.update(f"BRANCH:{branch or '(detached)'}\n".encode("utf-8", "surrogateescape"))
-        for e in sorted(entries, key=lambda x: x.path):
-            h.update(e.code.encode("utf-8", "surrogateescape"))
-            h.update(b"\0")
-            h.update(e.path.encode("utf-8", "surrogateescape"))
-            h.update(b"\0")
-            h.update(e.mode.encode())
-            h.update(b"\0")
-            h.update(e.digest.encode())
-            h.update(b"\n")
-        return h.hexdigest()
+    def _too_big(self, what: str, setting: str, by_top: dict[str, int]) -> VerificationError:
+        biggest = sorted(by_top.items(), key=lambda kv: -kv[1])[:8]
+        listing = "\n".join(f"    - {name}   ({n} entries seen so far)" for name, n in biggest)
+        return VerificationError(
+            f"refusing to fingerprint the working tree: {what}.\n"
+            "A LOCAL run binds the review to every byte of the tree, and it will not fall "
+            "back to hashing metadata instead — an equal-sized replacement with a restored "
+            "mtime would then pass. Either exclude what does not need reviewing:\n"
+            "  local:\n"
+            "    exclude:\n"
+            "      - .venv\n"
+            "      - '**/__pycache__'\n"
+            f"or raise {setting} deliberately.\n"
+            f"Largest top-level entries seen so far:\n{listing}"
+        )
+
+    # -- writes into the working tree -------------------------------------
+    def tree_root(self) -> SafeRoot:
+        """A write capability on the working tree (caller closes it).
+
+        The only controller writes into the working tree are the ones
+        ``autoforge local init`` makes, and they go through the same boundary
+        as every other controller write.
+        """
+        return SafeRoot.open(self.root())
 
 
-# -- feature specification ------------------------------------------------
+def _is_within(path: Path, base: Path) -> bool:
+    """True when ``path`` is ``base`` or lies beneath it (both already resolved).
+
+    Compared component-wise: a textual prefix test would say ``/repo-backup``
+    is inside ``/repo``.
+    """
+    try:
+        path.relative_to(base)
+    except ValueError:
+        return False
+    return True
+
+
+# -- feature specifications ---------------------------------------------------
 @dataclass(frozen=True)
 class FeatureSpec:
     """A resolved, frozen feature specification."""
@@ -801,10 +890,16 @@ def resolve_feature_spec(workspace: LocalWorkspace, spec_path: str | Path) -> Pa
 def read_feature_spec(workspace: LocalWorkspace, spec_path: str | Path) -> FeatureSpec:
     """Resolve + read + hash a feature specification (ConfigurationError on any problem)."""
     resolved = resolve_feature_spec(workspace, spec_path)
-    try:
-        data = resolved.read_bytes()
-    except OSError as exc:
-        raise ConfigurationError(f"cannot read feature specification {resolved}: {exc}") from exc
+    rel = os.path.relpath(resolved, workspace.root()).replace(os.sep, "/")
+    with workspace.tree_root() as tree:
+        try:
+            data = tree.read_bytes(rel)
+        except OSError as exc:
+            raise ConfigurationError(
+                f"cannot read feature specification {resolved}: {exc}"
+            ) from exc
+    if data is None:
+        raise ConfigurationError(f"feature specification not found: {resolved}")
     try:
         content = data.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -816,7 +911,6 @@ def read_feature_spec(workspace: LocalWorkspace, spec_path: str | Path) -> Featu
             f"feature specification {resolved} is empty; describe the feature first "
             "(see 'autoforge local init')"
         )
-    rel = os.path.relpath(resolved, workspace.root()).replace(os.sep, "/")
     return FeatureSpec(
         path=resolved,
         relative_path=rel,
@@ -890,35 +984,6 @@ def feature_template(slug: str) -> str:
     return FEATURE_TEMPLATE.format(title=slug_to_title(slug))
 
 
-def _resolve_existing_parent(directory: Path) -> Path:
-    """Resolve ``directory`` by resolving every component that already exists.
-
-    ``realpath`` was previously applied to the target's parent only when that
-    exact directory already existed. With ``features`` a symlink to somewhere
-    outside the repository and a target of ``features/new/spec.md``,
-    ``features/new`` does not exist, so the lexical (in-repository looking)
-    path survived the repository-boundary check and ``mkdir(parents=True)``
-    then followed the link and created the file outside the checkout.
-
-    Walking up to the deepest component that *does* exist and resolving that
-    removes the gap: every symlink on the path is resolved, and the components
-    below it cannot be symlinks because they do not exist yet. The caller
-    re-checks the parent after creating it, and writes with ``O_NOFOLLOW``.
-    """
-    missing: list[str] = []
-    probe = directory
-    while not os.path.lexists(probe):
-        parent = probe.parent
-        if parent == probe:  # reached the filesystem root
-            break
-        missing.append(probe.name)
-        probe = parent
-    resolved = Path(os.path.realpath(probe))
-    for name in reversed(missing):
-        resolved = resolved / name
-    return resolved
-
-
 def init_feature_file(
     workspace: LocalWorkspace,
     slug: str,
@@ -929,10 +994,15 @@ def init_feature_file(
 
     Refuses to overwrite an existing file unless ``overwrite`` is set: the
     feature specification is the operator's own work, and clobbering it on a
-    mistyped slug would destroy exactly the input a run depends on. The file
-    is deliberately *not* placed under the state directory — ``.autoforge/``
-    stays runtime state, while a feature specification is project content the
-    operator edits and may commit.
+    mistyped slug would destroy exactly the input a run depends on.
+
+    The write goes through the working tree's :class:`~autoforge.safefs
+    .SafeRoot`, which is what makes this safe rather than a fourth hand-rolled
+    set of checks: no component of ``features/<slug>.md`` can be a symbolic
+    link, ``--force`` *replaces the name* instead of truncating an inode (so a
+    hard link planted at the target keeps its contents), and without
+    ``--force`` the create is ``O_EXCL``, which is atomic rather than a
+    check a racing writer can slip past.
     """
     if not SLUG_RE.match(slug):
         raise ConfigurationError(
@@ -941,49 +1011,36 @@ def init_feature_file(
         )
     root = workspace.root()
     directory = Path(feature_dir)
-    target = (directory if directory.is_absolute() else root / directory) / f"{slug}.md"
-    resolved = _resolve_existing_parent(target.parent) / target.name
-    rel = os.path.relpath(resolved, root)
-    if rel.startswith("..") or os.path.isabs(rel):
-        raise ConfigurationError(
-            f"feature directory {feature_dir!r} resolves to {resolved.parent}, which is "
-            f"outside the repository {root}"
-        )
-    if os.path.lexists(resolved):
-        if not overwrite:
+    if directory.is_absolute():
+        try:
+            rel_dir = directory.relative_to(root)
+        except ValueError:
             raise ConfigurationError(
-                f"feature specification already exists: {resolved} — edit it, choose another "
-                "slug, or pass --force to overwrite it"
-            )
-        if os.path.islink(resolved) or not resolved.is_file():
-            raise ConfigurationError(f"refusing to overwrite {resolved}: it is not a regular file")
-    try:
-        resolved.parent.mkdir(parents=True, exist_ok=True)
-        # Re-check what the parent really is now that it exists: the check
-        # above described the path as it was, and the directories were created
-        # since. Together with O_NOFOLLOW on the final component this closes
-        # the window in which a symlink appears between the two.
-        created = Path(os.path.realpath(resolved.parent))
-        rel_after = os.path.relpath(created, root)
-        if rel_after.startswith("..") or os.path.isabs(rel_after):
-            raise ConfigurationError(
-                f"feature directory {feature_dir!r} resolves to {created}, which is outside "
-                f"the repository {root}; refusing to write there"
-            )
-        final = created / target.name
-        # O_NOFOLLOW: never write *through* a symbolic link, whoever created
-        # it. O_EXCL without --force makes "already exists" atomic rather than
-        # a check that a racing writer can slip past.
-        flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
-        flags |= os.O_TRUNC if overwrite else os.O_EXCL
-        fd = os.open(final, flags, 0o644)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(feature_template(slug))
-    except FileExistsError:
-        raise ConfigurationError(
-            f"feature specification already exists: {resolved} — edit it, choose another "
-            "slug, or pass --force to overwrite it"
-        ) from None
-    except OSError as exc:
-        raise ConfigurationError(f"cannot create feature specification {resolved}: {exc}") from exc
-    return final
+                f"feature directory {feature_dir!r} is outside the repository {root}"
+            ) from None
+    else:
+        rel_dir = directory
+    rel = f"{rel_dir.as_posix()}/{slug}.md".lstrip("/")
+    if rel.startswith("..") or "/../" in f"/{rel}":
+        raise ConfigurationError(f"feature directory {feature_dir!r} escapes the repository {root}")
+    content = feature_template(slug).encode("utf-8")
+    with workspace.tree_root() as tree:
+        if overwrite:
+            existing = tree.lstat(rel)
+            if existing is not None and not stat.S_ISREG(existing.st_mode):
+                raise ConfigurationError(
+                    f"refusing to overwrite {root / rel}: it is a "
+                    f"{entry_kind(existing.st_mode)}, not a regular file. --force replaces "
+                    "a specification AutoForge could have written; it does not write through "
+                    "an entry the operator put there. Move it aside, or choose another slug."
+                )
+            tree.write_bytes(rel, content, mode=0o644)
+        else:
+            try:
+                tree.create_exclusive(rel, content, mode=0o644)
+            except FileExistsError:
+                raise ConfigurationError(
+                    f"feature specification already exists: {root / rel} — edit it, choose "
+                    "another slug, or pass --force to overwrite it"
+                ) from None
+    return root / rel

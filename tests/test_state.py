@@ -1,7 +1,6 @@
 """State: serialize/deserialize, atomic save/load, corruption, idempotency."""
 
 import json
-from pathlib import Path
 
 import pytest
 
@@ -290,10 +289,13 @@ def test_quarantine_preserves_archive_created_after_candidate_selection(tmp_path
     attempts: list[str] = []
 
     def racing_link(src, dst, *args, **kwargs):
+        # The reservation is made relative to an open directory descriptor, so
+        # `dst` is a bare name; that is the point -- no pathname is re-resolved
+        # between selecting a candidate and claiming it.
         attempts.append(os.fspath(dst))
         if len(attempts) == 1:
             # Another process wins the race for the selected name right before our move.
-            assert os.fspath(dst) == str(expected_first)
+            assert os.fspath(dst) == expected_first.name
             expected_first.write_text("preexisting-archive", encoding="utf-8")
         return real_link(src, dst, *args, **kwargs)
 
@@ -301,8 +303,8 @@ def test_quarantine_preserves_archive_created_after_candidate_selection(tmp_path
     moved = quarantine_state_file(p)
 
     assert attempts == [
-        str(expected_first),
-        str(tmp_path / "state.json.corrupt-20260906T120000Z.1"),
+        expected_first.name,
+        expected_first.name + ".1",
     ]
     assert moved == tmp_path / "state.json.corrupt-20260906T120000Z.1"
     assert expected_first.read_text(encoding="utf-8") == "preexisting-archive"
@@ -339,7 +341,7 @@ def test_quarantine_unlink_failure_leaves_original_and_drops_reservation(tmp_pat
     real_unlink = os.unlink
 
     def failing_unlink(path, *args, **kwargs):
-        if os.fspath(path) == str(p):
+        if os.fspath(path) == p.name:
             raise PermissionError(13, "Permission denied", os.fspath(path))
         return real_unlink(path, *args, **kwargs)
 
@@ -372,12 +374,18 @@ def test_a_run_id_that_is_a_path_is_corrupt_state(tmp_path):
 
 
 def test_load_dangling_symlink_is_corrupt_state(tmp_path):
-    """R4-F2: a dangling state.json symlink is an existing (unreadable) entry, not 'no state'."""
+    """R4-F2: a dangling state.json symlink is an existing (unreadable) entry, not 'no state'.
+
+    The refusal names the link, never what it points at: the controller reads
+    and replaces its own regular file, so a link is refused whether its target
+    exists, is a FIFO, or is someone else's file. Classifying the target would
+    imply some targets are acceptable.
+    """
     import os
 
     p = tmp_path / "state.json"
     p.symlink_to("missing-target.json")
-    with pytest.raises(StateError, match="dangling symbolic link"):
+    with pytest.raises(StateError, match="a symbolic link, not a regular file"):
         load_state(p)
     assert p.is_symlink() and os.readlink(p) == "missing-target.json"
 
@@ -450,7 +458,7 @@ def test_load_symlink_to_fifo_fails_loudly_without_blocking(tmp_path):
     os.mkfifo(tmp_path / "real.fifo")
     p = tmp_path / "state.json"
     p.symlink_to("real.fifo")
-    with pytest.raises(StateError, match="symbolic link to a FIFO"):
+    with pytest.raises(StateError, match="a symbolic link, not a regular file"):
         _call_with_timeout(lambda: load_state(p))
     assert p.is_symlink() and os.readlink(p) == "real.fifo"
 
@@ -488,9 +496,13 @@ def test_load_rejects_entry_swapped_for_a_fifo_after_inspection(tmp_path, monkey
     p.write_text("{}", encoding="utf-8")
     real_lstat = os.lstat
 
+    swapped = False
+
     def swapping_lstat(path, *a, **kw):
+        nonlocal swapped
         st = real_lstat(path, *a, **kw)
-        if Path(path) == p:
+        if not swapped and os.fspath(path) == p.name:
+            swapped = True
             p.unlink()
             os.mkfifo(p)
         return st
@@ -560,14 +572,16 @@ def test_save_state_fsyncs_the_directory_entry_after_the_rename(tmp_path, monkey
     assert len(synced) == 2, "the temp file and its directory must both be flushed"
     assert load_state(p).run_id == "af-test-1"
 
-    # Best effort: a filesystem that cannot fsync a directory must not fail the run.
-    real_open = os.open
+    # Best effort: a filesystem that cannot fsync a directory must not fail the
+    # run. The replace is atomic either way; only its durability is weaker.
+    import stat as stat_mod
 
-    def refuse(path, flags, *args, **kwargs):
-        if os.path.isdir(path):
-            raise OSError("no directory fsync here")
-        return real_open(path, flags, *args, **kwargs)
+    def refusing_fsync(fd):
+        if stat_mod.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(22, "no directory fsync here")
+        return real_fsync(fd)
 
-    monkeypatch.setattr(state_mod.os, "open", refuse)
+    monkeypatch.setattr(os, "fsync", refusing_fsync)
     save_state(make_state(review_round=4), p)
     assert load_state(p).review_round == 4
+    assert state_mod is not None  # the module under test, imported above

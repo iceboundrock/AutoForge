@@ -186,15 +186,6 @@ def _add_local_parser(sub) -> None:
     ld.add_argument("--feature", default=None, help="also validate this feature Markdown path")
 
 
-def _resolve_state_dir(args) -> str:
-    if args.state_dir:
-        return args.state_dir
-    if args.config:
-        cfg = load_config_file(args.config)
-        return cfg.state_dir
-    return ".autoforge"
-
-
 def _load_cfg(args) -> AutoForgeConfig:
     return load_config_file(args.config)
 
@@ -237,6 +228,53 @@ def _engine_for(args, cfg: AutoForgeConfig | None = None) -> ControllerEngine:
     cfg = cfg or _load_cfg(args)
     state_dir = args.state_dir or cfg.state_dir
     return ControllerEngine(config=cfg, state_dir=state_dir)
+
+
+def _local_engine_for(args, cfg: AutoForgeConfig | None = None) -> ControllerEngine:
+    """An engine for a LOCAL command, with its state directory resolved.
+
+    LOCAL state never lives in the reviewed working tree; see
+    :meth:`ControllerEngine.bind_local_state_dir`.
+    """
+    engine = _engine_for(args, cfg)
+    engine.bind_local_state_dir(args.state_dir)
+    return engine
+
+
+def _bind_existing_run(engine: ControllerEngine) -> None:
+    """Resolve which run a mode-agnostic command (`resume`, `step`, `status`) means.
+
+    A REMOTE run keeps its state under `config.state_dir` (`.autoforge` by
+    default); a LOCAL run keeps it in the git directory, because the LOCAL
+    fingerprint covers the working tree. The two locations are disjoint and
+    the mode is not known until state is read, so the command looks for a
+    `state.json` in both. Exactly one match is used. Two matches is a real
+    ambiguity and is refused rather than resolved by precedence: picking one
+    would silently `resume` the wrong workflow. Zero matches leaves the
+    configured location so the error names it.
+
+    `--state-dir` is an answer to this question, so it is never second-guessed
+    (the caller does not reach here when it was given).
+    """
+    configured = engine.paths
+    try:
+        local = engine.local_state_paths()
+    except (AutoForgeError, OSError):
+        # Not a git repository (or git is unusable): only the configured
+        # location can hold a run, and any real problem surfaces there.
+        return
+    if os.path.abspath(local.state_dir) == os.path.abspath(configured.state_dir):
+        return
+    here = os.path.lexists(configured.state_file)
+    there = os.path.lexists(local.state_file)
+    if here and there:
+        raise StateError(
+            f"two runs exist: a remote-style one at {configured.state_file} and a local "
+            f"one at {local.state_file}. Pass --state-dir to say which one this command "
+            "means; the controller will not pick for you."
+        )
+    if there:
+        engine.paths = local
 
 
 def _doctor_runner():
@@ -391,7 +429,7 @@ def cmd_local_init(args) -> int:
     and creating this file is a controller write like any other.
     """
     cfg = _load_cfg(args)
-    engine = _engine_for(args, cfg)
+    engine = _local_engine_for(args, cfg)
     with engine.locked():
         path = init_feature_file(
             engine.workspace(),
@@ -417,7 +455,7 @@ def cmd_local_run(args) -> int:
     gate. The engine never constructs a GitHubClient for a LOCAL run.
     """
     cfg = _load_cfg(args)
-    engine = _engine_for(args, cfg)
+    engine = _local_engine_for(args, cfg)
     paths = engine.paths
 
     if args.dry_run:
@@ -450,6 +488,8 @@ def cmd_local_run(args) -> int:
 
 def cmd_step(args) -> int:
     engine = _engine_for(args)
+    if not args.state_dir:
+        _bind_existing_run(engine)
     if args.dry_run:
         # Read-only: no lock, nothing written.
         engine.load()
@@ -467,6 +507,8 @@ def cmd_step(args) -> int:
 
 def cmd_resume(args) -> int:
     engine = _engine_for(args)
+    if not args.state_dir:
+        _bind_existing_run(engine)
     if args.dry_run:
         # Read-only: no lock, nothing written.
         state = engine.load()
@@ -506,16 +548,18 @@ def _resume_holding_state(
             return 0
         print(
             f"run {state.run_id} is in terminal phase {state.phase.value}: "
-            f"{state.block_reason or '-'} — inspect .autoforge/logs/ and start a new run"
+            f"{state.block_reason or '-'} — inspect {engine.paths.logs_dir}/ "
+            "and start a new run"
         )
         return 1
     return None
 
 
 def cmd_status(args) -> int:
-    state_dir = _resolve_state_dir(args)
-    paths = StatePaths.from_state_dir(state_dir)
-    state = load_state(paths.state_file)  # StateError when missing/corrupt
+    engine = _engine_for(args)
+    if not args.state_dir:
+        _bind_existing_run(engine)
+    state = engine.load()  # StateError when missing/corrupt
     if args.as_json:
         # to_dict() already carries "mode" plus the local fields, so the JSON
         # shape stays additive for remote consumers.

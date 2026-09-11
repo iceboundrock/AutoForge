@@ -10,6 +10,7 @@ review comment to post anywhere.
 - Repository root: {{REPO_ROOT}}
 - Workspace under review (bound by the controller): `{{WORKSPACE_FINGERPRINT}}`
 - Working-tree state as the controller sees it: {{WORKSPACE_STATUS}}
+- Not covered by the fingerprint you are reviewing: {{WORKSPACE_EXCLUSIONS}}
 - Base git HEAD at run creation: {{BASE_HEAD_SHA}}
 
 ## Steps

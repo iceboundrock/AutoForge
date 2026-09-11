@@ -591,12 +591,12 @@ def commit_all(repo, message: str = "wip") -> None:
 
 
 def make_local_engine(
-    state_dir,
+    workdir,
     feature,
     script=None,
     cfg=None,
     exit_code: int = 0,
-    workdir=None,
+    state_dir=None,
     allow_dirty: bool = False,
     start: bool = True,
 ):
@@ -605,10 +605,12 @@ def make_local_engine(
     No ``runner`` is injected: ``LocalWorkspace`` must run real ``git`` against
     the real temporary repository, which is the whole point of the local trust
     boundary.
+
+    ``state_dir`` is left unset by default so the engine resolves it the way
+    the CLI does -- ``<git dir>/autoforge/state``, outside the reviewed tree.
+    Tests that exercise state-dir placement pass one explicitly.
     """
     cfg = cfg or default_config()
-    if workdir is None:
-        workdir = git_repo(Path(state_dir).parent)
     provider = ScriptedProvider(script, exit_code=exit_code)
     registry = ProviderRegistry(
         overrides={"claude": provider, "opencode": provider, "scripted": provider}
@@ -620,6 +622,7 @@ def make_local_engine(
         github=ExplodingGitHub(),  # type: ignore[arg-type]
         providers=registry,
     )
+    eng.bind_local_state_dir(state_dir)
     if start:
         eng.new_local_run(feature, allow_dirty=allow_dirty)
     eng.provider = provider  # type: ignore[attr-defined]

@@ -214,10 +214,18 @@ github:
 # creates no PR, pushes nothing and commits nothing: the implementation stays
 # in the working tree. It uses the analyze_execute / fix / review_round_1 /
 # review_round_2_5 profiles above; there is no replan and no EPIC update.
+#
+# What binds a local review is a *workspace fingerprint*: the controller walks
+# the working tree itself and hashes every entry it finds -- tracked, ignored,
+# untracked, symbolic links, file modes and empty directories alike -- rather
+# than asking `git status` which files are interesting. Git decides what is
+# committed; it does not decide what a reviewer read. Run state lives outside
+# that tree, under `<git dir>/autoforge/`, so the controller's own files are
+# not part of what it reviews.
 local:
   # Where `autoforge local init <slug>` writes features/<slug>.md. This is
-  # project content you may commit -- never .autoforge/, which stays runtime
-  # state. `local init` refuses to overwrite an existing file without --force.
+  # project content you may commit -- never runtime state.
+  # `local init` refuses to overwrite an existing file without --force.
   feature_dir: features
 
   # Review/fix bound. The default is: REVIEW -> at most one FIX -> REVIEW,
@@ -241,3 +249,35 @@ local:
     # - ["uv", "run", "pytest", "-q"]
     # - ["./gradlew", "test"]
     # - ["npm", "--prefix", "frontend", "run", "build"]
+
+  # The only way to leave part of the working tree out of the fingerprint.
+  #
+  # Everything else is hashed, ignored files included, because a .gitignore
+  # edit must not be able to decide which bytes a review covers. The cost of
+  # that completeness is paid here, explicitly: build output, virtual
+  # environments and caches are rewritten by the very validation commands
+  # above, so they have to be *declared* unreviewed rather than silently
+  # tolerated.
+  #
+  # Patterns match component-wise against repository-relative paths: `*` and
+  # `?` match within one component, `**` spans any number. The list is hashed
+  # into the fingerprint and named to the review agent in its prompt, so "what
+  # was not reviewed" is part of the review's identity. A run started with a
+  # different exclude list can never satisfy a review taken under this one.
+  #
+  # A symbolic link *into* an excluded region is refused rather than followed:
+  # its bytes are not bound, so the reviewer could read something the
+  # fingerprint would not notice changing.
+  exclude: []
+    # - node_modules
+    # - .venv
+    # - "**/__pycache__"
+    # - target
+
+  # Fail-closed bounds on the walk, not sampling thresholds. A tree bigger
+  # than these is refused with the largest subtrees named -- the run never
+  # falls back to hashing less, because a fingerprint built from metadata
+  # would accept an equal-sized replacement with a restored mtime. Raise them,
+  # or exclude what is large, and re-run.
+  max_workspace_entries: 50000
+  max_workspace_bytes: 536870912   # 512 MiB

@@ -57,7 +57,7 @@ from types import TracebackType
 
 from .errors import ExecutionError, LockError
 from .executor import ExecutionRequest, ExecutionResult, execute
-from .state import entry_kind
+from .safefs import entry_kind
 
 LOCK_DIRNAME = "autoforge"  # inside the git common dir
 LOCK_FILENAME = "controller.lock"
