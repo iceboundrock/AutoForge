@@ -1971,3 +1971,185 @@ def test_a_state_file_with_a_malformed_pending_checkpoint_is_refused(tmp_path):
         encoding="utf-8",
     )
     assert load_state(path).local_pending_attempts == 2
+
+
+# -- PR #44 R4: the fingerprint's edges ---------------------------------------
+def test_a_mode_change_is_bound_even_with_core_filemode_disabled(tmp_path):
+    """R4-F4: `core.fileMode=false` hides `chmod +x` on a *clean* tracked file.
+
+    Git then reports no porcelain entry at all, so the path is never
+    inspected and neither its mode nor its bytes reach the fingerprint: a
+    clean review stayed valid across a change to what a validation command
+    does with that script. The porcelain read forces the setting on, so which
+    paths are bound no longer depends on a repository setting.
+    """
+    root = local_repo(tmp_path)
+    subprocess.run(["git", "-C", str(root), "config", "core.fileMode", "false"], check=True)
+    ws = LocalWorkspace(workdir=root, state_dir=".autoforge")
+    clean = ws.status().fingerprint
+
+    script = root / IMPL_FILE  # committed, clean, not executable
+    script.chmod(0o755)
+    assert ws.status().fingerprint != clean
+    assert [e.mode for e in ws.status().entries if e.path == IMPL_FILE] == ["0755"]
+
+    script.chmod(0o644)
+    assert ws.status().fingerprint == clean
+
+
+def test_a_symlink_out_of_the_repository_cannot_be_bound(tmp_path):
+    """R4-F5: only the link text was bound, so the bytes could be swapped freely."""
+    root = local_repo(tmp_path / "repo")
+    outside = tmp_path / "external.py"
+    outside.write_text("VALUE = 1\n", encoding="utf-8")
+    ws = LocalWorkspace(workdir=root, state_dir=".autoforge")
+
+    (root / "src" / "linked.py").symlink_to(outside)
+    with pytest.raises(VerificationError, match="outside the repository"):
+        ws.status()
+
+    # A link *into* the working tree is fine: its target is a path of this
+    # tree, so changing it moves that path's own entry in the fingerprint.
+    (root / "src" / "linked.py").unlink()
+    (root / "src" / "linked.py").symlink_to(root / IMPL_FILE)
+    linked = ws.status().fingerprint
+    touch_impl(root, "def main():\n    return 2\n")
+    assert ws.status().fingerprint != linked
+
+
+def test_a_symlink_into_the_state_directory_cannot_be_bound(tmp_path):
+    """Everything under the state directory is excluded, so it binds nothing."""
+    root = local_repo(tmp_path)
+    (root / ".autoforge").mkdir(exist_ok=True)
+    (root / ".autoforge" / "state.json").write_text("{}", encoding="utf-8")
+    (root / "src" / "sneaky.py").symlink_to(root / ".autoforge" / "state.json")
+    ws = LocalWorkspace(workdir=root, state_dir=".autoforge")
+    with pytest.raises(VerificationError, match="state directory"):
+        ws.status()
+
+
+def test_a_state_directory_that_is_a_link_out_of_the_repository_is_refused(tmp_path):
+    """R4-F2: `.autoforge -> /outside` sent every controller write out of the checkout.
+
+    The path was resolved before it was classified, so the symlink read as
+    "a state directory outside the repository" — the supported configuration
+    — and nothing reported that the default in-repository one had been
+    redirected.
+    """
+    root = local_repo(tmp_path / "repo")
+    external = tmp_path / "elsewhere"
+    external.mkdir()
+    (root / ".autoforge").symlink_to(external, target_is_directory=True)
+
+    ws = LocalWorkspace(workdir=root, state_dir=".autoforge")
+    with pytest.raises(ConfigurationError, match="resolves to"):
+        ws.check_state_dir()
+    with pytest.raises(ConfigurationError, match="resolves to"):
+        ws.status()
+
+    # Asking for the external path directly is still a supported configuration.
+    # (The link itself must go: an untracked symlink out of the tree is no
+    # more bindable than any other, once it is not an excluded path.)
+    (root / ".autoforge").unlink()
+    outside = LocalWorkspace(workdir=root, state_dir=external)
+    outside.check_state_dir()
+    assert outside.state_dir_relpath() is None
+    assert outside.status().fingerprint
+
+
+def test_a_local_state_cannot_hold_a_github_only_phase(tmp_path):
+    """R4-F6: `Phase(...)` proves the value exists, not that this run can be in it.
+
+    A persisted LOCAL run in READY_FOR_MERGE loaded cleanly and `resume` then
+    read it as the remote merge hold, for a run with no repository and no PR.
+    """
+    path = tmp_path / "state.json"
+    good = {
+        "run_id": "af-x",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z",
+        "mode": "LOCAL",
+        "feature_spec_path": "docs/feature.md",
+        "feature_spec_sha256": "a" * 64,
+        "phase": "REVIEW",
+    }
+    assert load_state_from(path, good).phase == Phase.REVIEW
+    for phase in ("READY_FOR_MERGE", "MERGE", "UPDATE_EPIC", "REPLAN_REEXECUTE"):
+        with pytest.raises(StateError, match="belongs to the GitHub workflow"):
+            load_state_from(path, {**good, "phase": phase})
+    # The same phases remain perfectly valid for a REMOTE run.
+    remote = {
+        **good,
+        "mode": "REMOTE",
+        "repository": "owner/repo",
+        "epic_url": "https://github.com/owner/repo/issues/1",
+        "phase": "READY_FOR_MERGE",
+    }
+    del remote["feature_spec_path"], remote["feature_spec_sha256"]
+    assert load_state_from(path, remote).phase == Phase.READY_FOR_MERGE
+
+
+def load_state_from(path: Path, payload: dict) -> AutoForgeState:
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return load_state(path)
+
+
+def test_a_successful_local_fix_cannot_also_report_a_blocker():
+    """R4-F7: `blocked_reason` was parsed on a successful FIX and then dropped.
+
+    A fix could report a run-level obstacle, pass validation, be reviewed
+    clean and reach DONE with nothing having carried the blocker anywhere.
+    The protocol already has one channel for it — status "blocked" — and the
+    engine routes that to BLOCKED, so a result claiming both is refused
+    rather than silently keeping the half the controller acts on.
+    """
+    from autoforge.errors import ControlResultValidationError
+    from autoforge.result_parser import parse_control_result
+
+    payload = {
+        "phase": "FIX",
+        "status": "success",
+        "changed_workspace": True,
+        "resolutions": [{"finding_id": "R1-F1", "resolution": "fixed"}],
+        "blocked_reason": "the test database is unreachable",
+    }
+    with pytest.raises(ControlResultValidationError, match="blocked_reason"):
+        parse_control_result(block(payload), Phase.FIX, WorkflowMode.LOCAL)
+
+    # An empty (or absent) field is not a claim and stays accepted.
+    parse_control_result(block({**payload, "blocked_reason": ""}), Phase.FIX, WorkflowMode.LOCAL)
+    parse_control_result(
+        block({k: v for k, v in payload.items() if k != "blocked_reason"}),
+        Phase.FIX,
+        WorkflowMode.LOCAL,
+    )
+    # ... and the blocker still has a home of its own.
+    blocked = parse_control_result(
+        block({"phase": "FIX", "status": "blocked", "message": "db unreachable"}),
+        Phase.FIX,
+        WorkflowMode.LOCAL,
+    )
+    assert blocked["status"] == "blocked"
+
+
+def test_a_local_fix_that_reports_a_blocker_ends_the_run_in_blocked(tmp_path):
+    """The engine's side of the same result: status 'blocked' is terminal."""
+    root = local_repo(tmp_path)
+    eng = make_local_engine(root / ".autoforge", "features/add-filter.md", workdir=root)
+    eng.provider._handler = scripted(
+        eng,
+        root,
+        [
+            (lambda r: touch_impl(r, "v1\n"), lambda e: impl_result()),
+            (None, lambda e: review_result(e.state.workspace_fingerprint, 1, [finding(1)])),
+            (
+                None,
+                lambda e: block(
+                    {"phase": "FIX", "status": "blocked", "message": "toolchain is unavailable"}
+                ),
+            ),
+        ],
+    )
+    eng.run(max_steps=8)
+    assert eng.state.phase == Phase.BLOCKED
+    assert "toolchain is unavailable" in (eng.state.block_reason or "")

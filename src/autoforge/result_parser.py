@@ -617,7 +617,6 @@ class LocalFindingResolution:
 class LocalFixResult:
     resolutions: list[LocalFindingResolution] = field(default_factory=list)
     changed_workspace: bool = False
-    blocked_reason: str = ""
 
     @classmethod
     def from_payload(cls, p: dict) -> LocalFixResult:
@@ -629,10 +628,28 @@ class LocalFixResult:
         ids = [r.finding_id for r in resolutions]
         if len(set(ids)) != len(ids):
             raise ControlResultValidationError(f"duplicate resolution finding_ids: {ids}")
+        # `from_payload` only runs for status "success" (see
+        # `parse_control_result`), so a non-empty run-level blocker here is a
+        # result that contradicts itself: the protocol already carries one,
+        # as status "blocked" plus a message, and the engine routes that to
+        # BLOCKED. Accepting it alongside "success" gave the field nowhere to
+        # go -- it was parsed and dropped, so a FIX could report a blocker,
+        # pass validation, be reviewed clean and reach DONE with the blocker
+        # never seen by anyone. Rejecting it puts the claim back on the one
+        # channel the controller acts on rather than quietly keeping both.
+        blocker = p.get("blocked_reason")
+        if isinstance(blocker, str) and blocker.strip():
+            raise ControlResultValidationError(
+                f"{ph}: status 'success' carries a non-empty 'blocked_reason' "
+                f"({blocker.strip()[:200]!r}); a run-level blocker and a successful fix are "
+                "not both true. Report the obstacle as status 'blocked' with a 'message', or "
+                "report the finding it concerns with resolution 'unresolved' and a rationale"
+            )
+        if blocker is not None and not isinstance(blocker, str):
+            raise ControlResultValidationError(f"{ph}: field 'blocked_reason' must be a string")
         return cls(
             resolutions=resolutions,
             changed_workspace=_req_bool(p, "changed_workspace", ph),
-            blocked_reason=str(p.get("blocked_reason", "") or "").strip(),
         )
 
 

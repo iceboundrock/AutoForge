@@ -121,3 +121,69 @@ def test_a_generated_run_id_is_accepted(tmp_path):
     assert validate_run_id(run_id) == run_id
     log = RunLogger(tmp_path / "logs", run_id)
     assert log.run_dir.parent == tmp_path / "logs"
+
+
+# -- PR #44 R4-F3: the journal serialises the whole record ---------------------
+def test_the_event_journal_never_carries_an_unredacted_error(tmp_path):
+    """`events.jsonl` is `asdict(record)`, so redacting at each write site missed it.
+
+    `execution.json` and `error.txt` were each redacted where they were
+    written; the journal line was not, and a controller-side error quotes
+    agent output and failing command lines. The record itself is redacted
+    now, so every persistence path gets the same text.
+    """
+    secret = "ghp_" + "a" * 36
+    log = RunLogger(tmp_path / "logs", "run-1")
+    step = log.log_execution(
+        ExecutionRecord(
+            run_id="run-1",
+            seq=0,
+            phase="FIX",
+            error=f"agent failed: GITHUB_TOKEN={secret} rejected",
+        )
+    )
+    journal = (log.events_path).read_text(encoding="utf-8")
+    assert secret not in journal
+    assert "REDACTED" in journal
+    for name in ("execution.json", "error.txt"):
+        assert secret not in (step / name).read_text(encoding="utf-8")
+
+
+def test_a_write_never_lands_on_a_hard_link_and_never_truncates_first(tmp_path):
+    """PR #44 R4-F1: a hard link is a regular file by every other test.
+
+    `O_TRUNC` was handed to `os.open`, so the kernel emptied the linked file
+    *before* anything could look at the descriptor: the refusal arrived after
+    the damage. The open is intact now, and a second name for the file is the
+    refusal.
+    """
+    outside = tmp_path / "precious.txt"
+    outside.write_text("do not lose me\n", encoding="utf-8")
+    log = RunLogger(tmp_path / "logs", "run-1")
+    step_dir = log.run_dir / "001-review-1"
+    os.makedirs(step_dir, exist_ok=True)
+    os.link(outside, step_dir / "stdout.log")
+
+    with pytest.raises(StateError, match="hard link"):
+        log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="REVIEW"), stdout="x")
+    assert outside.read_text(encoding="utf-8") == "do not lose me\n"
+
+
+def test_a_hard_linked_events_journal_is_refused_before_it_is_appended_to(tmp_path):
+    outside = tmp_path / "notes.txt"
+    outside.write_text("mine\n", encoding="utf-8")
+    log = RunLogger(tmp_path / "logs", "run-1")
+    os.link(outside, log.events_path)
+    with pytest.raises(StateError, match="hard link"):
+        log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="REVIEW"))
+    assert outside.read_text(encoding="utf-8") == "mine\n"
+
+
+def test_a_plain_regular_file_is_still_truncated_on_rewrite(tmp_path):
+    """Deferring O_TRUNC to ftruncate must not leave a stale tail behind."""
+    from autoforge.safeio import read_text, write_text
+
+    target = tmp_path / "artifact.log"
+    write_text(target, "a long first line that must not survive\n")
+    write_text(target, "short\n")
+    assert read_text(target) == "short\n"

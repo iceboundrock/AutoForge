@@ -135,6 +135,13 @@ class RunLogger:
         # request.json and events.jsonl, so it passes the same boundary the
         # command and the parsed result do.
         record.metadata = redact_dict(record.metadata)
+        # Redacted on the record itself, not at each write site: `error` is
+        # persisted three times (execution.json, error.txt and the whole
+        # record in events.jsonl) and a controller-side error quotes agent
+        # stdout, a failing command line and the occasional environment
+        # value. Redacting per call site left the journal -- which serialises
+        # the record wholesale -- with the only unredacted copy.
+        record.error = redact(record.error)
         if isinstance(record.parsed_result, dict):
             record.parsed_result = json.loads(redact(json.dumps(record.parsed_result)))
         request = {
@@ -163,7 +170,7 @@ class RunLogger:
             "timed_out": record.timed_out,
             "stdout_chars": len(stdout or ""),
             "stderr_chars": len(stderr or ""),
-            "error": redact(record.error),
+            "error": record.error,
         }
         write_text(step_dir / "request.json", json.dumps(request, indent=2, sort_keys=True) + "\n")
         write_text(step_dir / "prompt.md", redact(prompt or ""))
@@ -178,6 +185,6 @@ class RunLogger:
                 json.dumps(record.parsed_result, indent=2, sort_keys=True) + "\n",
             )
         if record.error:
-            write_text(step_dir / "error.txt", redact(record.error) + "\n")
+            write_text(step_dir / "error.txt", record.error + "\n")
         append_text(self.events_path, json.dumps(asdict(record), sort_keys=True) + "\n")
         return step_dir

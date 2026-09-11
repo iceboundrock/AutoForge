@@ -26,7 +26,14 @@ review to exactly the code that was reviewed. It covers:
   *untracked* files, which is where an implementation may well live),
 - the SHA-256 of each of those paths' current bytes, and
 - each of those paths' permission bits, because "the reviewer saw exactly
-  this tree" includes whether a file is executable.
+  this tree" includes whether a file is executable. The porcelain read forces
+  ``core.fileMode=true`` so that which paths get bound does not depend on a
+  repository setting under which git reports no change at all for ``chmod +x``.
+
+A symbolic link is bound by its link text, and its target must be a path of
+this working tree that the fingerprint also covers — a link out of the
+repository, or into the excluded state directory, points at bytes that could
+be replaced without the fingerprint moving, and is refused rather than bound.
 
 Every reported path is hashed by *content*, whatever its size: a fingerprint
 that fell back to ``(size, mtime)`` for large files would accept an
@@ -77,6 +84,66 @@ _OBJECT_NAME_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 
 def hash_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _require_link_target_bound(
+    path: Path, rel: str, target: str, root: Path, excluded: tuple[str, ...]
+) -> None:
+    """Refuse a symbolic link whose content the fingerprint would not cover.
+
+    A link is bound by its *link text*, which is all that belongs to the link
+    itself. That is enough only while the bytes it points at are bound too --
+    and inside the repository they are, transitively: the target is a path of
+    this working tree, so changing it makes `git status` report that path and
+    the fingerprint hashes it there. The digest of the link and the digest of
+    the target are two entries of one fingerprint.
+
+    Outside the repository nothing reports it. ``impl.py -> /tmp/impl.py``
+    keeps the same link text and the same porcelain record no matter what is
+    written to ``/tmp/impl.py``, so the reviewed content can be replaced
+    wholesale while the fingerprint stays identical and the clean review still
+    counts as bound to it. The state directory is the same hole one level in:
+    its contents are *excluded* from the fingerprint precisely because the
+    controller rewrites them, so a link into it points at bytes nothing binds
+    either.
+
+    Both are refused rather than followed. Reading the target's bytes into the
+    digest instead would mean re-deciding, at every fingerprint, that the
+    resolved path is still a regular file, still readable and still not a
+    device -- re-implementing `_inspect` against a path outside the tree the
+    controller was pointed at. A local run reviews one working tree; an
+    implementation that reaches outside it is not one this controller can
+    prove anything about.
+    """
+    resolved = os.path.realpath(path)
+    try:
+        rel_target = os.path.relpath(resolved, root)
+    except ValueError:  # different drive (Windows): certainly outside
+        rel_target = ".."
+    escapes = (
+        rel_target == ".." or rel_target.startswith(".." + os.sep) or os.path.isabs(rel_target)
+    )
+    if escapes:
+        raise VerificationError(
+            _unbindable(
+                rel,
+                f"is a symbolic link to {target!r}, which resolves to {resolved} -- outside "
+                f"the repository {root}. Only the link text can be bound, and the bytes it "
+                "points at can then change without the fingerprint moving, so the review "
+                "would be bound to content it cannot see. Replace the link with the file "
+                "itself, or point it inside the working tree",
+            )
+        )
+    posix_target = rel_target.replace(os.sep, "/")
+    if any(posix_target.startswith(prefix) for prefix in excluded):
+        raise VerificationError(
+            _unbindable(
+                rel,
+                f"is a symbolic link to {target!r}, which resolves into the state directory "
+                f"({posix_target}). Everything there is excluded from the fingerprint because "
+                "the controller rewrites it, so the link's content would be bound by nothing",
+            )
+        )
 
 
 def _unbindable(rel: str, why: str) -> str:
@@ -310,17 +377,83 @@ class LocalWorkspace:
         usable exclusion (see :meth:`check_state_dir`).
         """
         root = self.root()
-        candidate = self.state_dir
-        if not candidate.is_absolute():
-            candidate = Path(self.workdir) / candidate
         try:
-            rel = os.path.relpath(os.path.realpath(candidate), root)
+            rel = os.path.relpath(self._state_dir_real(), root)
         except ValueError:  # different drive (Windows); not inside the repo
             return None
         if rel.startswith("..") or os.path.isabs(rel):
             return None
         rel = os.path.normpath(rel).replace(os.sep, "/").strip("/")
         return "" if rel in ("", ".") else rel
+
+    def _state_dir_spelled(self) -> str:
+        """The state directory as configured, with only ``workdir`` resolved.
+
+        The prefix has to be resolved: ``workdir`` is the operator's cwd and
+        may legitimately sit under a symbolic link (``/home`` is one on
+        several distributions), and :meth:`root` is a real path, so comparing
+        an unresolved ``workdir`` against it would call every such checkout
+        "outside the repository". Everything the *configuration* spells is
+        left alone -- that tail is exactly what :meth:`check_state_dir`
+        compares against its resolved form.
+        """
+        candidate = self.state_dir
+        if candidate.is_absolute():
+            return os.path.normpath(str(candidate))
+        return os.path.normpath(os.path.join(os.path.realpath(self.workdir), str(candidate)))
+
+    def _state_dir_real(self) -> str:
+        return os.path.realpath(self._state_dir_spelled())
+
+    def check_state_dir_containment(self) -> None:
+        """Refuse a state directory that is spelled inside the repository but is not.
+
+        A state directory outside the checkout is a supported configuration:
+        ``--state-dir /var/tmp/af`` excludes nothing from the fingerprint and
+        needs none of :meth:`check_state_dir`'s rules. What must not happen is
+        arriving there *without having asked for it*. ``.autoforge`` (the
+        default) made a symbolic link to somewhere else sends every controller
+        write -- ``state.json``, the whole run-log tree -- out of the checkout
+        that a LOCAL run promises to be the only thing it touches, and it does
+        so silently, because the path is resolved before it is classified and
+        the resolved path is then "outside the repository: nothing is
+        excluded".
+
+        So the two readings of the configured path must agree: what it spells
+        and where it lands. They differ only when a component of it is a
+        symbolic link, and a state directory reached through one is refused
+        rather than followed. A path spelled outside the repository is not
+        checked -- it is the configuration this method exists to distinguish
+        from -- and one spelled inside that also lands inside, through a link
+        or not, is where the controller's own rules already apply.
+
+        This is checked on every :meth:`status`, not once at startup, so a
+        directory replaced by a link part-way through a run is caught at the
+        next fingerprint rather than at the end of it. It is not a defence
+        against something racing the controller between the check and the
+        write (see :mod:`autoforge.safeio` for where that boundary is): it is
+        the controller declining to write where it was not told to.
+        """
+        spelled = self._state_dir_spelled()
+        real = self._state_dir_real()
+        if real == spelled:
+            return
+        root = str(self.root())
+        try:
+            rel = os.path.relpath(spelled, root)
+        except ValueError:  # different drive (Windows): spelled outside
+            return
+        if rel.startswith("..") or os.path.isabs(rel):
+            return  # spelled outside the repository: the operator asked for that
+        raise ConfigurationError(
+            f"the state directory is configured as {self.state_dir} -- inside the repository "
+            f"{root} -- but resolves to {real}. A component of that path is a symbolic link, "
+            "so 'state.json' and the whole run-log tree would be written outside the checkout "
+            "while the controller reported an in-repository state directory, and a local run "
+            "touches nothing outside the working tree it was pointed at. Replace the link with "
+            "a real directory, or configure the external path directly (--state-dir "
+            f"{real}), which is a supported configuration."
+        )
 
     def check_state_dir(self) -> None:
         """Require an in-repository state directory to hold *only* runtime state.
@@ -370,6 +503,7 @@ class LocalWorkspace:
         corrupt state report a dirty tree. A state directory outside the
         repository excludes nothing and needs none of this.
         """
+        self.check_state_dir_containment()
         rel = self.state_dir_relpath()
         if rel is None:
             return  # outside the repository: nothing is excluded at all
@@ -444,7 +578,7 @@ class LocalWorkspace:
         for code, path in self._porcelain():
             if any(path.startswith(prefix) for prefix in excluded):
                 continue
-            mode, digest = self._inspect(root / path, path)
+            mode, digest = self._inspect(root / path, path, root, excluded)
             entries.append(WorkspaceEntry(path=path, code=code, digest=digest, mode=mode))
         entries.sort(key=lambda e: e.path)
         return WorkspaceStatus(
@@ -465,7 +599,20 @@ class LocalWorkspace:
         both ends are recorded, so moving a file cannot hide from the
         fingerprint.
         """
-        res = self._git(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        res = self._git(
+            # -c core.fileMode=true: with `core.fileMode=false` git ignores the
+            # executable bit entirely, so `chmod +x` on an otherwise *clean*
+            # tracked file produces no porcelain entry at all -- the path is
+            # never inspected, and neither its mode nor its bytes reach the
+            # fingerprint. The mode is part of the binding (see `_inspect`),
+            # so the read that decides which paths are bound must not depend
+            # on a repository setting that can be flipped mid-run. Forcing it
+            # on can only make the controller see *more* change than git's
+            # configuration would: on a filesystem that genuinely cannot store
+            # modes the tree reads as broadly dirty, which costs hashing and
+            # binds more than necessary, and never less.
+            ["-c", "core.fileMode=true", "status", "--porcelain=v1", "-z", "--untracked-files=all"]
+        )
         raw = res.stdout or ""
         fields = raw.split("\0")
         out: list[tuple[str, str]] = []
@@ -490,7 +637,7 @@ class LocalWorkspace:
         return out
 
     @staticmethod
-    def _inspect(path: Path, rel: str) -> tuple[str, str]:
+    def _inspect(path: Path, rel: str, root: Path, excluded: tuple[str, ...]) -> tuple[str, str]:
         """Mode + SHA-256 of a changed working-tree path. Fails closed, never guesses.
 
         Content is hashed regardless of file size. An earlier revision fell
@@ -534,8 +681,11 @@ class LocalWorkspace:
                 raise VerificationError(
                     _unbindable(rel, f"is a symbolic link whose target cannot be read ({exc})")
                 ) from exc
+            _require_link_target_bound(path, rel, target, root, excluded)
             # A symbolic link's own permission bits are not meaningful (and not
-            # portable); the target it points at is the whole of its content.
+            # portable); the link text is all of it that is its own -- what it
+            # points at is bound by being a path the fingerprint also covers,
+            # which `_require_link_target_bound` is what establishes.
             return "lnk", "symlink:" + hash_bytes(target.encode("utf-8", "surrogateescape"))
         if stat.S_ISDIR(st.st_mode):
             raise VerificationError(

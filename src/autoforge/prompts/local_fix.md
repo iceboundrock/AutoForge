@@ -75,8 +75,7 @@ resolution and creating a follow-up Issue is not an option.
      "rationale": "<concrete technical reasoning, at least a couple of sentences>"},
     {"finding_id": "R{{REVIEW_ROUND}}-F3", "resolution": "unresolved",
      "rationale": "<what you tried and why it needs a human decision>"}
-  ],
-  "blocked_reason": ""
+  ]
 }
 <<<END_CONTROL_RESULT>>>
 ```
@@ -85,6 +84,8 @@ resolution and creating a follow-up Issue is not an option.
 - `"changed_workspace"` must be `true` if and only if you actually modified or
   created files. The controller fingerprints the working tree before and after
   this phase and rejects a result that disagrees with what it observed.
-- `"blocked_reason"` is optional; use it for a run-level obstacle, not for a
-  per-finding explanation.
 - On failure: `"status": "failure"` plus `"message"`.
+- A run-level obstacle is `"status": "blocked"` plus `"message"` — never
+  `"status": "success"` with a blocker alongside it. A result that reports a
+  successful fix and a blocker at the same time is rejected; if the obstacle
+  concerns one finding, report that finding as `"unresolved"` with a rationale.

@@ -40,7 +40,7 @@ from .errors import StateError
 from .loop_guard import validate_review_history
 from .runlog import validate_run_id
 from .safeio import entry_kind
-from .transitions import LOCAL_WRITE_PHASES, Phase, WorkflowMode
+from .transitions import LOCAL_PHASES, LOCAL_WRITE_PHASES, Phase, WorkflowMode
 
 STATE_FILENAME = "state.json"
 LOGS_DIRNAME = "logs"
@@ -340,6 +340,22 @@ class AutoForgeState:
             state = cls(**{k: v for k, v in kwargs.items() if k in known})
         except TypeError as exc:
             raise StateError(f"state file has invalid fields: {exc}") from exc
+        # A phase that exists is not a phase this run can be in. `Phase(...)`
+        # above only proves the value is one the controller knows; LOCAL and
+        # REMOTE are two topologies over that one enum, and the LOCAL one has
+        # no REPLAN_REEXECUTE, READY_FOR_MERGE, MERGE or UPDATE_EPIC in it
+        # (see transitions.LOCAL_PHASES). Without this a corrupt or hand-edited
+        # `mode: LOCAL, phase: READY_FOR_MERGE` loads cleanly and `resume`
+        # reads it as the remote merge hold -- printing a merge banner, and
+        # with the gate open entering the GitHub pre-merge verification for a
+        # run that has no repository, no PR and nothing to merge. A state whose
+        # phase its own mode can never execute is corruption.
+        if state.mode == WorkflowMode.LOCAL and state.phase not in LOCAL_PHASES:
+            raise StateError(
+                f"state file is a LOCAL run in phase {state.phase.value}, which belongs to "
+                "the GitHub workflow and no local run can reach; refusing to load — "
+                "a phase outside the mode's own topology is corruption, not state"
+            )
         # Required-field sanity. A LOCAL run has no repository/EPIC at all;
         # its identity is the frozen feature specification instead.
         required = ["run_id", "created_at", "updated_at"]
