@@ -128,6 +128,26 @@ def _denied_text(exc: OSError) -> str:
     return exc.strerror or os.strerror(exc.errno or errno.EACCES)
 
 
+class ReadLimitExceeded(StateError):
+    """A bounded :meth:`SafeRoot.read_bytes` met a file larger than its limit."""
+
+    def __init__(self, relpath: str, limit: int) -> None:
+        super().__init__(f"{relpath} is larger than {limit} bytes")
+        self.relpath = relpath
+        self.limit = limit
+
+
+class WalkBudgetExceeded(StateError):
+    """A bounded :meth:`SafeRoot.walk` listed more entries than its budget."""
+
+    def __init__(self, max_entries: int, where: str) -> None:
+        super().__init__(
+            f"the walk listed more than {max_entries} directory entries (while listing {where})"
+        )
+        self.max_entries = max_entries
+        self.where = where
+
+
 class UnreadableEntryError(StateError):
     """An entry exists, is of a kind the controller accepts, and cannot be read.
 
@@ -367,32 +387,65 @@ class SafeRoot:
         """``(st_dev, st_ino)`` of the directory this root is bound to."""
         return (self._dev, self._ino)
 
-    def verify_identity(self) -> None:
+    def verify_identity(self, *, role: str = "controller root") -> None:
         """Fail if the root's pathname no longer names the directory we hold.
 
         The controller's writes are safe either way -- they go to the
         descriptor -- but a root that has been renamed or replaced means the
         operator is no longer looking at the files the controller is writing,
-        so continuing silently would be the wrong kind of correct.
+        so continuing silently would be the wrong kind of correct. The check
+        is by ``lstat``: a symbolic link planted at the pathname is reported
+        as what it is rather than followed to wherever it points.
+        ``role`` names the root in the message (``"state directory"``).
         """
+        if self._closed:
+            raise StateError(f"{role} {self._path} is already closed")
         try:
             st = os.lstat(self._path)
         except OSError as exc:
             raise StateError(
-                f"controller root {self._path} is no longer readable: {exc}. "
+                f"{role} {self._path} is no longer readable: {exc}. "
                 "It was moved or replaced while the controller was running."
             ) from exc
+        if stat.S_ISLNK(st.st_mode):
+            raise _unsafe(
+                f"{role} {self._path}",
+                "a symbolic link now, planted while the controller was running",
+            )
         if (st.st_dev, st.st_ino) != (self._dev, self._ino):
             raise StateError(
-                f"controller root {self._path} was replaced while the controller was running: "
+                f"{role} {self._path} was replaced while the controller was running: "
                 "it now names a different directory. Refusing to continue against a root that "
                 "is no longer the one this run started in."
             )
+
+    def dup(self) -> SafeRoot:
+        """An independent handle on the same directory (closed separately).
+
+        For handing the held capability to a component that closes what it
+        is given: the copy shares the inode binding, not the lifetime.
+        """
+        fd = os.dup(self.fd)
+        try:
+            st = os.fstat(fd)
+        except BaseException:  # pragma: no cover - the dup just succeeded
+            os.close(fd)
+            raise
+        return SafeRoot(fd, self._path, st)
 
     def close(self) -> None:
         if not self._closed:
             self._closed = True
             os.close(self._fd)
+
+    def __del__(self) -> None:
+        # Descriptor hygiene only: a root dropped without ``close`` must not
+        # leak its descriptor for the rest of the process. Nothing about
+        # safety depends on finalisation running.
+        try:
+            self.close()
+        except Exception:  # pragma: no cover - interpreter shutdown
+            pass
 
     def __enter__(self) -> SafeRoot:
         return self
@@ -472,8 +525,14 @@ class SafeRoot:
         finally:
             os.close(parent)
 
-    def read_bytes(self, relpath: str) -> bytes | None:
-        """Read ``relpath``; ``None`` when it (or a parent) does not exist."""
+    def read_bytes(self, relpath: str, *, limit: int | None = None) -> bytes | None:
+        """Read ``relpath``; ``None`` when it (or a parent) does not exist.
+
+        With a ``limit`` the read stops one byte past it and raises
+        :class:`ReadLimitExceeded`: a file the caller has decided is too
+        large to hold is never materialised, whatever ``st_size`` claimed
+        before the file was opened.
+        """
         parts = split_relpath(relpath)
         try:
             parent = self._parent_of(parts, create=False)
@@ -486,10 +545,15 @@ class SafeRoot:
         finally:
             os.close(parent)
         with os.fdopen(fd, "rb") as fh:
-            return fh.read()
+            if limit is None:
+                return fh.read()
+            data = fh.read(limit + 1)
+        if len(data) > limit:
+            raise ReadLimitExceeded(relpath, limit)
+        return data
 
-    def read_text(self, relpath: str) -> str | None:
-        data = self.read_bytes(relpath)
+    def read_text(self, relpath: str, *, limit: int | None = None) -> str | None:
+        data = self.read_bytes(relpath, limit=limit)
         if data is None:
             return None
         return data.decode("utf-8", errors="replace")
@@ -515,26 +579,21 @@ class SafeRoot:
         self.write_bytes(relpath, text.encode("utf-8"), mode=mode)
 
     def create_exclusive(self, relpath: str, data: bytes, *, mode: int = 0o600) -> None:
-        """Create ``relpath`` with ``data``, failing if any entry already exists.
+        """Create ``relpath`` holding exactly ``data``, or fail because an
+        entry of that name already exists.
 
-        ``O_CREAT | O_EXCL`` fails on an existing symbolic link too, so this
-        cannot be talked into writing through one.
+        The name is published only after the bytes are durable: ``data`` is
+        written and fsynced into a fresh temporary in the same directory and
+        then *linked* to ``relpath``.  ``link(2)`` fails with ``EEXIST`` on any
+        existing entry -- a symbolic link included -- so the exclusivity is
+        the same as ``O_CREAT | O_EXCL`` would give, but a crash can no longer
+        leave a half-written file behind under the final name for a later
+        invocation to find and trust.
         """
         parts = split_relpath(relpath)
         parent = self._parent_of(parts, create=True)
         try:
-            fd = open_regular_at(
-                parent,
-                parts[-1],
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                mode=mode,
-                where=self._describe(parts),
-            )
-            with os.fdopen(fd, "wb") as fh:
-                fh.write(data)
-                fh.flush()
-                os.fsync(fh.fileno())
-            _fsync_fd(parent)
+            self._publish_new_at(parent, parts[-1], data, mode=mode, where=self._describe(parts))
         finally:
             os.close(parent)
 
@@ -644,7 +703,13 @@ class SafeRoot:
         finally:
             os.close(src_parent)
 
-    def _replace_at(self, parent: int, name: str, data: bytes, *, mode: int, where: str) -> None:
+    def _durable_tmp_at(self, parent: int, data: bytes, *, mode: int, where: str) -> str:
+        """Write ``data`` into a fresh, fsynced temporary beside ``where``.
+
+        Returns the temporary's name; the caller publishes it under the final
+        name (or unlinks it).  The name carries the pid and a random token, so
+        two controllers and two attempts by one controller never collide.
+        """
         tmp = f".af-tmp-{os.getpid():x}-{secrets.token_hex(8)}"
         fd = open_regular_at(
             parent, tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode=mode, where=where
@@ -657,6 +722,10 @@ class SafeRoot:
         except BaseException:
             _quiet_unlink(parent, tmp)
             raise
+        return tmp
+
+    def _replace_at(self, parent: int, name: str, data: bytes, *, mode: int, where: str) -> None:
+        tmp = self._durable_tmp_at(parent, data, mode=mode, where=where)
         try:
             os.replace(tmp, name, src_dir_fd=parent, dst_dir_fd=parent)
         except OSError as exc:
@@ -666,21 +735,119 @@ class SafeRoot:
             raise StateError(f"cannot write {where}: {exc}") from exc
         _fsync_fd(parent)
 
+    def _publish_new_at(
+        self, parent: int, name: str, data: bytes, *, mode: int, where: str
+    ) -> None:
+        tmp = self._durable_tmp_at(parent, data, mode=mode, where=where)
+        try:
+            os.link(tmp, name, src_dir_fd=parent, dst_dir_fd=parent, follow_symlinks=False)
+        except OSError as exc:
+            _quiet_unlink(parent, tmp)
+            if exc.errno == errno.EEXIST:
+                raise FileExistsError(errno.EEXIST, f"{where} already exists") from exc
+            raise StateError(f"cannot create {where}: {exc}") from exc
+        _quiet_unlink(parent, tmp)
+        _fsync_fd(parent)
+
     # -- walking ------------------------------------------------------------
-    def walk(self) -> Iterator[WalkEntry]:
+    def walk(self, *, max_entries: int | None = None) -> Iterator[WalkEntry]:
         """Yield every entry beneath the root, parents before children.
 
         The walk descends only through descriptors it opened itself with
         ``O_NOFOLLOW``, so it can neither be redirected out of the root by a
         symbolic link nor be made to follow one.  Set ``entry.skip = True`` on
         a directory entry to stop the walk descending into it.
-        """
-        yield from self._walk_dir(self.fd, "")
 
-    def _walk_dir(self, dir_fd: int, prefix: str) -> Iterator[WalkEntry]:
+        ``max_entries`` bounds the *work*, not just the result: directory
+        entries are counted as they are listed, before any of them is sorted,
+        stat'ed or yielded, and the walk raises :class:`WalkBudgetExceeded`
+        the moment the count passes the bound -- so one directory holding a
+        million names costs a million ``readdir`` records and nothing more.
+        The walk is iterative (an explicit stack, one descriptor per open
+        level), so the tree's depth is bounded by the same budget rather than
+        by the interpreter's recursion limit: a nest of ten thousand
+        directories is ten thousand entries, not a ``RecursionError``.
+        """
+        listed = 0
+        # (directory descriptor, relpath prefix, names still to visit)
+        stack: list[tuple[int, str, list[str]]] = []
+        names = self._list_dir(self.fd, "", listed=0, max_entries=max_entries)
+        listed += len(names)
+        stack.append((self.fd, "", names))
+        try:
+            while stack:
+                dir_fd, prefix, names = stack[-1]
+                if not names:
+                    stack.pop()
+                    if dir_fd != self.fd:
+                        os.close(dir_fd)
+                    continue
+                name = names.pop()
+                relpath = f"{prefix}/{name}" if prefix else name
+                try:
+                    st = os.lstat(name, dir_fd=dir_fd)
+                except FileNotFoundError:
+                    # Vanished between the listing and the stat.  A file that
+                    # is not there when we look is not part of the snapshot;
+                    # it cannot be, and pretending otherwise would be a lie
+                    # about what was read.
+                    continue
+                except OSError as exc:
+                    if _denied(exc):
+                        raise UnreadableEntryError(
+                            relpath, f"cannot inspect {self._path / relpath}: {_denied_text(exc)}"
+                        ) from exc
+                    raise StateError(f"cannot inspect {self._path / relpath}: {exc}") from exc
+                entry = WalkEntry(relpath=relpath, name=name, dir_fd=dir_fd, st=st)
+                yield entry
+                if entry.skip or not entry.is_dir:
+                    continue
+                try:
+                    child = os.open(name, _DIR_OPEN_FLAGS, dir_fd=dir_fd)
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    if exc.errno in (errno.ELOOP, errno.EMLINK, errno.ENOTDIR):
+                        # lstat said directory, the O_NOFOLLOW open disagrees:
+                        # the entry was swapped underneath us.
+                        raise _unsafe(
+                            str(self._path / relpath), "not the directory it just was"
+                        ) from exc
+                    if _denied(exc):
+                        raise UnreadableEntryError(
+                            relpath, f"cannot open {self._path / relpath}: {_denied_text(exc)}"
+                        ) from exc
+                    raise StateError(f"cannot open {self._path / relpath}: {exc}") from exc
+                try:
+                    children = self._list_dir(
+                        child, relpath, listed=listed, max_entries=max_entries
+                    )
+                except BaseException:
+                    os.close(child)
+                    raise
+                listed += len(children)
+                stack.append((child, relpath, children))
+        finally:
+            for dir_fd, _, _ in stack:
+                if dir_fd != self.fd:
+                    os.close(dir_fd)
+
+    def _list_dir(
+        self, dir_fd: int, prefix: str, *, listed: int, max_entries: int | None
+    ) -> list[str]:
+        """The names in ``dir_fd``, sorted for iteration in reverse (``pop``).
+
+        ``listed`` is how many entries the walk has already read elsewhere;
+        with a ``max_entries`` the listing raises as soon as the total would
+        pass it, without materialising the rest of the directory.
+        """
+        names: list[str] = []
         try:
             with os.scandir(dir_fd) as it:
-                names = sorted(entry.name for entry in it)
+                for entry in it:
+                    if max_entries is not None and listed + len(names) >= max_entries:
+                        raise WalkBudgetExceeded(max_entries, prefix or ".")
+                    names.append(entry.name)
         except OSError as exc:
             where = self._path / prefix if prefix else self._path
             if _denied(exc):
@@ -688,46 +855,8 @@ class SafeRoot:
                     prefix or ".", f"cannot list {where}: {_denied_text(exc)}"
                 ) from exc
             raise StateError(f"cannot list {where}: {exc}") from exc
-        for name in names:
-            relpath = f"{prefix}/{name}" if prefix else name
-            try:
-                st = os.lstat(name, dir_fd=dir_fd)
-            except FileNotFoundError:
-                # Vanished between the listing and the stat.  A file that is
-                # not there when we look is not part of the snapshot; it
-                # cannot be, and pretending otherwise would be a lie about
-                # what was read.
-                continue
-            except OSError as exc:
-                if _denied(exc):
-                    raise UnreadableEntryError(
-                        relpath, f"cannot inspect {self._path / relpath}: {_denied_text(exc)}"
-                    ) from exc
-                raise StateError(f"cannot inspect {self._path / relpath}: {exc}") from exc
-            entry = WalkEntry(relpath=relpath, name=name, dir_fd=dir_fd, st=st)
-            yield entry
-            if entry.skip or not entry.is_dir:
-                continue
-            try:
-                child = os.open(name, _DIR_OPEN_FLAGS, dir_fd=dir_fd)
-            except FileNotFoundError:
-                continue
-            except OSError as exc:
-                if exc.errno in (errno.ELOOP, errno.EMLINK, errno.ENOTDIR):
-                    # lstat said directory, the O_NOFOLLOW open disagrees:
-                    # the entry was swapped underneath us.
-                    raise _unsafe(
-                        str(self._path / relpath), "not the directory it just was"
-                    ) from exc
-                if _denied(exc):
-                    raise UnreadableEntryError(
-                        relpath, f"cannot open {self._path / relpath}: {_denied_text(exc)}"
-                    ) from exc
-                raise StateError(f"cannot open {self._path / relpath}: {exc}") from exc
-            try:
-                yield from self._walk_dir(child, relpath)
-            finally:
-                os.close(child)
+        names.sort(reverse=True)
+        return names
 
 
 def _kind_at(dir_fd: int, name: str, fallback: str) -> str:

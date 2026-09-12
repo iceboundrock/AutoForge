@@ -25,6 +25,8 @@ from autoforge.errors import StateError
 from autoforge.state import AutoForgeState, load_state, save_state, utcnow_iso
 from autoforge.transitions import LOCAL_PHASES, LOCAL_WRITE_PHASES, Phase, WorkflowMode
 
+from .conftest import sample_contract
+
 
 def good_local() -> dict:
     state = AutoForgeState(
@@ -33,7 +35,7 @@ def good_local() -> dict:
         phase=Phase.REVIEW,
         feature_spec_path="features/add-filter.md",
         feature_spec_sha256="a" * 64,
-        local_workspace_policy="v1 exclude=[] max_entries=50000 max_bytes=536870912",
+        local_run_contract=sample_contract(),
         workspace_fingerprint="b" * 64,
         base_head_sha="c" * 40,
         base_branch="main",
@@ -55,7 +57,8 @@ def holds_every_invariant(s: AutoForgeState) -> None:
     if s.mode == WorkflowMode.LOCAL:
         assert s.phase in LOCAL_PHASES
         assert s.feature_spec_path and s.feature_spec_sha256
-        assert s.local_workspace_policy
+        assert s.local_run_contract
+        s.local_contract()  # parses strictly, or the state would not exist
         if s.local_pending_phase:
             assert Phase(s.local_pending_phase) in LOCAL_WRITE_PHASES
             assert s.local_pending_fingerprint
@@ -135,10 +138,55 @@ ILLEGAL = {
     # Losing the run's identity, which is what binds it to a feature.
     "no feature specification": {"feature_spec_path": ""},
     "no specification hash": {"feature_spec_sha256": ""},
-    # Losing the reader policy the fingerprints were computed under: without
-    # it a resume cannot tell that `local.exclude` moved the review scope.
-    "no workspace policy": {"local_workspace_policy": ""},
-    "a list where the workspace policy belongs": {"local_workspace_policy": ["v1"]},
+    # Losing the run contract the run was defined under: without it a resume
+    # cannot tell that `local.exclude` (or anything else) moved the run, and
+    # the controller must never rebuild it from the configuration of the day.
+    "no run contract": {"local_run_contract": {}},
+    "a list where the run contract belongs": {"local_run_contract": ["v1"]},
+    "a pre-release policy string beside the contract": {
+        "local_workspace_policy": "v1 exclude=[] max_entries=50000 max_bytes=536870912"
+    },
+    "a contract missing a field": {
+        "local_run_contract": {k: v for k, v in sample_contract().items() if k != "max_fix_rounds"}
+    },
+    "a contract with a field from another controller": {
+        "local_run_contract": {**sample_contract(), "max_total_steps": 300}
+    },
+    "a contract from another schema": {"local_run_contract": {**sample_contract(), "schema": 2}},
+    "a contract whose policy digest lies": {
+        "local_run_contract": {
+            **sample_contract(),
+            "workspace_policy": {**sample_contract()["workspace_policy"], "digest": "0" * 64},
+        }
+    },
+    "a contract whose policy is the pre-release text": {
+        "local_run_contract": {
+            **sample_contract(),
+            "workspace_policy": {
+                "version": "v1",
+                "policy": "v1 exclude=[] max_entries=50000 max_bytes=536870912",
+                "digest": "0" * 64,
+            },
+        }
+    },
+    "a contract with a negative fix budget": {
+        "local_run_contract": {**sample_contract(), "max_fix_rounds": -1}
+    },
+    "a contract with a boolean fix budget": {
+        "local_run_contract": {**sample_contract(), "max_fix_rounds": True}
+    },
+    "a contract whose validation commands are strings": {
+        "local_run_contract": {**sample_contract(), "validation_commands": ["pytest -q"]}
+    },
+    "a contract whose validation command is empty": {
+        "local_run_contract": {**sample_contract(), "validation_commands": [[]]}
+    },
+    "a contract with an empty repository root": {
+        "local_run_contract": {**sample_contract(), "repository_root": ""}
+    },
+    "a contract with a null state root": {
+        "local_run_contract": {**sample_contract(), "state_root": None}
+    },
     "no run id": {"run_id": ""},
     "a run id that is a path": {"run_id": "../elsewhere"},
     "a run id that is absolute": {"run_id": "/etc"},
@@ -170,8 +218,15 @@ def test_an_illegal_local_state_never_loads(tmp_path, name):
 def test_every_illegal_row_is_actually_a_mutation(tmp_path):
     """Guard against a row that silently matches the baseline and proves nothing."""
     base = good_local()
+
+    def differs(a, b) -> bool:
+        # `True == 1` in Python; a boolean where an int belongs *is* a mutation.
+        if isinstance(a, dict) and isinstance(b, dict):
+            return set(a) != set(b) or any(differs(a[k], b[k]) for k in a)
+        return a != b or type(a) is not type(b)
+
     for name, override in ILLEGAL.items():
-        assert any(base.get(k) != v for k, v in override.items()), f"{name} changes nothing"
+        assert any(differs(base.get(k), v) for k, v in override.items()), f"{name} changes nothing"
 
 
 # -- the same question asked at random ------------------------------------------

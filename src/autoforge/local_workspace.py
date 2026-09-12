@@ -104,9 +104,13 @@ from pathlib import Path
 
 from .errors import ConfigurationError, VerificationError
 from .executor import ExecutionRequest, ExecutionResult, execute
+from .prompts import escape_inline
+from .run_contract import WorkspacePolicy
 from .safefs import (
+    ReadLimitExceeded,
     SafeRoot,
     UnreadableEntryError,
+    WalkBudgetExceeded,
     entry_kind,
     open_regular_at,
     readlink_at,
@@ -250,7 +254,9 @@ class WorkspaceSnapshot:
             f"{self.total_bytes} byte(s) hashed"
         ]
         if excluded:
-            shown = ", ".join(f"{x.path} [{x.rule}]" for x in excluded[:limit])
+            shown = ", ".join(
+                f"{escape_inline(x.path)} [{escape_inline(x.rule)}]" for x in excluded[:limit]
+            )
             more = "" if len(excluded) <= limit else f" and {len(excluded) - limit} more"
             parts.append(f"excluded: {shown}{more}")
         return " | ".join(parts)
@@ -260,7 +266,7 @@ class WorkspaceSnapshot:
         excluded = self.exclusions
         if not excluded:
             return "(none — every entry in the working tree is covered by the fingerprint)"
-        return "; ".join(f"{x.path} [{x.rule}]" for x in excluded)
+        return "; ".join(f"{escape_inline(x.path)} [{escape_inline(x.rule)}]" for x in excluded)
 
 
 def _fingerprint(
@@ -345,31 +351,21 @@ class LocalWorkspace:
         self._digests: dict[tuple[int, int, int, int, int, int], str] = {}
 
     # -- reader policy ----------------------------------------------------
-    def policy_identity(self) -> str:
-        """Canonical text of everything about this reader that shapes a snapshot.
+    def policy(self) -> WorkspacePolicy:
+        """Everything about this reader that shapes a snapshot, as contract data.
 
         A fingerprint binds the working tree *as this reader classifies it*,
-        so the reader's own configuration is part of what a review means: a
-        run resumed with ``local.exclude: ["src"]`` added would re-snapshot
-        with the implementation outside the bound scope, persist that
-        fingerprint, and accept a clean review of a tree nobody reviewed.
-        The fingerprint itself cannot catch that, because both sides of
-        ``reviewed_fingerprint == current_fingerprint`` are computed with the
-        *new* policy.
-
-        The whole policy is frozen, not the part that is provably unsafe to
-        change. The bounds only ever turn a snapshot into a refusal, so
-        carving them out would be sound today -- and would be one more
-        enumeration of which knobs happen to be benign, which is exactly the
-        shape of reasoning this design replaced. "The reader that bound this
-        run is the reader that keeps binding it" is the closed statement.
-
-        The text is human-readable rather than a digest so a drift message can
-        name what changed, and it is canonical (sorted, normalised patterns)
-        so two spellings of one policy compare equal.
+        so the reader's configuration is part of what a review means (see
+        :class:`autoforge.run_contract.WorkspacePolicy`). The snapshot tag
+        is included because the walk's classification rules are part of the
+        reader too.
         """
-        patterns = ",".join(self.exclude)
-        return f"v1 exclude=[{patterns}] max_entries={self.max_entries} max_bytes={self.max_bytes}"
+        return WorkspacePolicy(
+            exclude=self.exclude,
+            max_entries=self.max_entries,
+            max_bytes=self.max_bytes,
+            snapshot_tag=SNAPSHOT_TAG,
+        )
 
     # -- git plumbing -----------------------------------------------------
     def _git(self, argv: list[str], *, allow_failure: bool = False) -> ExecutionResult:
@@ -586,24 +582,20 @@ class LocalWorkspace:
         git_ids = self._git_dir_identities()
         entries: list[WorkspaceEntry] = []
         total_bytes = 0
-        count = 0
         by_top: dict[str, int] = {}
 
         # One translation point for "the controller may not read this".
         # Whether it is a file it cannot open or a directory it cannot list,
         # unreadable means unbindable, and the answer is the same refusal.
+        # The entry budget is the walk's own: it is charged as directory
+        # entries are *listed*, before they are sorted, stat'ed or handed
+        # here, so a directory of a million names or a nest ten thousand deep
+        # costs at most the budget in work and never a RecursionError.
         try:
             with SafeRoot.open(root) as tree:
-                for entry in tree.walk():
-                    count += 1
+                for entry in tree.walk(max_entries=self.max_entries):
                     top = entry.relpath.split("/", 1)[0]
                     by_top[top] = by_top.get(top, 0) + 1
-                    if count > self.max_entries:
-                        raise self._too_big(
-                            f"the working tree has more than {self.max_entries} entries",
-                            "local.max_workspace_entries",
-                            by_top,
-                        )
                     rule = self._exclusion_rule(entry.relpath, entry.st, git_ids)
                     if rule is not None:
                         entries.append(
@@ -673,6 +665,13 @@ class LocalWorkspace:
                             "it cannot be part of a reviewed snapshot. Move it out of the working "
                             "tree, or add it to local.exclude to declare it unreviewed.",
                         )
+        except WalkBudgetExceeded as exc:
+            raise self._too_big(
+                f"the working tree has more than {self.max_entries} entries "
+                f"(the budget ran out while listing {exc.where})",
+                "local.max_workspace_entries",
+                by_top,
+            ) from exc
         except UnreadableEntryError as exc:
             raise _refuse(
                 exc.path,
@@ -708,20 +707,28 @@ class LocalWorkspace:
         return ids
 
     def _exclusion_rule(
-        self, relpath: str, st: os.stat_result, git_ids: set[tuple[int, int]]
+        self, relpath: str, st: os.stat_result | None, git_ids: set[tuple[int, int]]
     ) -> str | None:
         """The rule excluding ``relpath``, or ``None`` when it is covered.
+
+        This is the *only* definition of "excluded from the snapshot": the
+        walk asks it about every entry, and the link-target check asks it
+        about every ancestor of a resolved target, so the two can never
+        disagree about what a reviewer may read unbound. ``st`` is the
+        entry's ``lstat``, or ``None`` for a path that does not exist (a
+        dangling link's target), for which only the path rules apply.
 
         Identity first: the git directory is recognised by ``(st_dev,
         st_ino)``, so a decoy named ``.git`` is not excluded and a git
         directory under any other name still is.
         """
-        if stat.S_ISDIR(st.st_mode) and (st.st_dev, st.st_ino) in git_ids:
-            return "gitdir"
-        if relpath == ".git" and stat.S_ISREG(st.st_mode):
-            # A linked worktree's pointer file. It is git's own metadata and
-            # it names a directory the walk never enters.
-            return "gitdir"
+        if st is not None:
+            if stat.S_ISDIR(st.st_mode) and (st.st_dev, st.st_ino) in git_ids:
+                return "gitdir"
+            if relpath == ".git" and stat.S_ISREG(st.st_mode):
+                # A linked worktree's pointer file. It is git's own metadata
+                # and it names a directory the walk never enters.
+                return "gitdir"
         return self._config_rule(relpath)
 
     def _config_rule(self, relpath: str) -> str | None:
@@ -750,6 +757,13 @@ class LocalWorkspace:
         gets this check: if any link on the resolved path escaped, that link
         is itself refused. The conjunction over the whole walk is the
         invariant, not each check in isolation.
+
+        "Excluded" is decided by :meth:`_exclusion_rule`, asked about every
+        ancestor of the resolved target exactly as the walk asks it about
+        every entry: a target the walk would have skipped (a git directory
+        by inode, a linked worktree's ``.git`` pointer file, a
+        ``local.exclude`` region) is a target whose bytes are unbound,
+        whichever of those rules would have skipped it.
         """
         parent = root / posixpath.dirname(relpath) if posixpath.dirname(relpath) else root
         resolved = Path(os.path.realpath(os.path.join(str(parent), target)))
@@ -761,21 +775,22 @@ class LocalWorkspace:
                 "replaced without the fingerprint changing. Point it inside the repository, "
                 "or add it to local.exclude to declare it unreviewed.",
             )
-        for git_dir in self.git_dirs():
-            if resolved == git_dir or _is_within(resolved, git_dir):
-                raise _refuse(
-                    relpath,
-                    f"a symbolic link into the git directory ({resolved})",
-                    "That region is excluded from the snapshot, so its bytes are not bound. "
-                    "Remove the link or add it to local.exclude.",
-                )
         rel = os.path.relpath(resolved, root).replace(os.sep, "/")
-        if rel not in (".", ""):
-            rule = self._config_rule(rel)
+        if rel in (".", ""):
+            return
+        parts = rel.split("/")
+        for depth in range(1, len(parts) + 1):
+            prefix = "/".join(parts[:depth])
+            try:
+                st: os.stat_result | None = os.lstat(root.joinpath(*parts[:depth]))
+            except OSError:
+                # Nothing exists there (yet): only the path rules can apply.
+                st = None
+            rule = self._exclusion_rule(prefix, st, git_ids)
             if rule is not None:
                 raise _refuse(
                     relpath,
-                    f"a symbolic link to {rel}, which '{rule}' excludes from the snapshot",
+                    f"a symbolic link to {prefix}, which '{rule}' excludes from the snapshot",
                     "Its bytes are not bound, so they could change without the fingerprint "
                     "moving. Remove the link, or exclude the link itself as well.",
                 )
@@ -950,9 +965,18 @@ def read_feature_spec(workspace: LocalWorkspace, spec_path: str | Path) -> Featu
     """Resolve + read + hash a feature specification (ConfigurationError on any problem)."""
     resolved = resolve_feature_spec(workspace, spec_path)
     rel = os.path.relpath(resolved, workspace.root()).replace(os.sep, "/")
+    # The specification is bounded by the same budget as the tree it lives
+    # in: a run's prompts carry it verbatim, and a spec the snapshot would
+    # refuse to fingerprint is not one the controller should read whole.
     with workspace.tree_root() as tree:
         try:
-            data = tree.read_bytes(rel)
+            data = tree.read_bytes(rel, limit=workspace.max_bytes)
+        except ReadLimitExceeded as exc:
+            raise ConfigurationError(
+                f"feature specification {resolved} is larger than {exc.limit} bytes "
+                "(local.max_workspace_bytes); a specification is a short Markdown "
+                "document, not a corpus"
+            ) from exc
         except OSError as exc:
             raise ConfigurationError(
                 f"cannot read feature specification {resolved}: {exc}"

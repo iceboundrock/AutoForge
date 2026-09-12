@@ -531,6 +531,19 @@ mode, feature path, frozen hash, base HEAD, bound and reviewed fingerprints,
 review/fix rounds and open findings. `Ctrl-C` then `autoforge resume` continues
 from the persisted phase, re-reading the real working tree.
 
+It also holds the run's **contract**: the repository root, the state
+directory, the workspace policy (`local.exclude`, both cost bounds and the
+snapshot algorithm), `local.validation_commands`, `local.max_fix_rounds` and
+the prompt version, as they were when the run started. A resumed run may
+revalidate its contract but never redefines it: every later invocation —
+`resume`, `step`, `status`, a dry run, a crash recovery — compares what it
+would define against the record before it binds the run, and refuses with
+each moved field named (`local.exclude: run: [] current: ["src"]`) rather
+than reviewing a tree under rules nobody reviewed it under. Restore the
+setting to resume, or start a new run under the new one. A LOCAL state file
+without a readable contract is refused, never filled in from today's
+configuration.
+
 Recovery never trusts what the dead process believed. Every fact the next
 transition depends on — the fingerprint, the git anchor, the specification
 hash — is re-derived after the restart, and an illegal combination of fields

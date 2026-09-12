@@ -265,13 +265,16 @@ local:
   # was not reviewed" is part of the review's identity.
   #
   # This whole block -- `exclude` plus the two bounds below -- is *frozen with
-  # the run*. A fingerprint means "the tree as these rules classify it", so
-  # comparing fingerprints cannot detect a rule change: a re-snapshot computes
-  # both sides under the new rules and they agree, about a tree whose newly
-  # excluded region no reviewer saw. The settings in force at `local run` are
-  # therefore recorded in the run's state, and resuming with any of them
-  # changed is refused, naming what moved. Restore them to resume, or start a
-  # new run under the new ones.
+  # the run*, together with `validation_commands`, `max_fix_rounds`, the
+  # prompt version and the repository and state-directory paths: they are
+  # the run's contract, recorded in its state at `local run`. A fingerprint
+  # means "the tree as these rules classify it", so comparing fingerprints
+  # cannot detect a rule change: a re-snapshot computes both sides under the
+  # new rules and they agree, about a tree whose newly excluded region no
+  # reviewer saw. Resuming with any contract field changed (or the checkout
+  # moved) is refused, naming each field that moved, e.g.
+  # `local.exclude: run: [] current: ["src"]`. Restore it to resume, or
+  # start a new run under the new definition.
   #
   # A symbolic link *into* an excluded region is refused rather than followed:
   # its bytes are not bound, so the reviewer could read something the

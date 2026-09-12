@@ -115,6 +115,7 @@ from .prompts import (
     COMMON_TEMPLATE,
     LOCAL_COMMON_TEMPLATE,
     TEMPLATE_FILES,
+    escape_inline,
     fenced_untrusted_block,
     load_template,
     render,
@@ -150,8 +151,19 @@ from .result_parser import (
     UpdateEpicResult,
     parse_control_result,
 )
+from .run_contract import LocalRunContract, validate_local_run_contract
 from .runlog import ExecutionRecord, RunLogger
-from .state import AutoForgeState, StatePaths, load_state, save_state, utcnow_iso
+from .safefs import SafeRoot
+from .state import (
+    STATE_FILENAME,
+    AutoForgeState,
+    StatePaths,
+    load_state,
+    no_state_error,
+    quarantine_state_file,
+    save_state,
+    utcnow_iso,
+)
 from .transitions import (
     LOCAL_WRITE_PHASES,
     STOP_PHASES,
@@ -324,7 +336,13 @@ class ControllerEngine:
         providers: ProviderRegistry | None = None,
     ) -> None:
         self.config = config
-        self.paths = StatePaths.from_state_dir(state_dir or config.state_dir or ".autoforge")
+        self._paths = StatePaths.from_state_dir(state_dir or config.state_dir or ".autoforge")
+        # The state directory as a capability, opened once per run by
+        # :meth:`state_root` and held for the engine's lifetime: every
+        # controller read and write of run state goes through this descriptor,
+        # and the pathname is only ever *re-verified* against it, never
+        # re-resolved into a new binding.
+        self._state_root: SafeRoot | None = None
         self.workdir = str(workdir)
         self.providers = providers or ProviderRegistry(runner=runner)
         # The GitHub client is built on first *use*, never on construction: a
@@ -353,6 +371,48 @@ class ControllerEngine:
         # such a snapshot is re-read under a self-acquired execution lock.
         self._state_from_disk = False
 
+    # -- the state directory as a held capability --------------------------
+    @property
+    def paths(self) -> StatePaths:
+        """Where this engine's run keeps its state (see :class:`StatePaths`)."""
+        return self._paths
+
+    @paths.setter
+    def paths(self, value: StatePaths) -> None:
+        # Re-pointing the engine at another location is a new binding, so a
+        # capability held on the old one is released rather than carried.
+        if self._state_root is not None:
+            self._state_root.close()
+            self._state_root = None
+        self._paths = value
+
+    def state_root(self, *, create: bool = True) -> SafeRoot:
+        """The run's state directory as a capability (owned by the engine).
+
+        Opened once -- the only pathname resolution of the state directory
+        this engine ever performs -- and held thereafter. Every later call
+        proves the pathname still names the held directory
+        (:meth:`SafeRoot.verify_identity`) and returns the same descriptor,
+        so a state directory replaced mid-run (by a symbolic link, a prepared
+        ordinary directory, a rename) is a refusal and never a redirection:
+        no write, no log and no read of ``state.json`` can reach the
+        replacement, because nothing re-resolves the name into a binding.
+
+        ``create=False`` raises ``FileNotFoundError`` when the directory does
+        not exist (reads never create it).
+        """
+        if self._state_root is None:
+            self._state_root = self._paths.open_root(create=create)
+        else:
+            self._state_root.verify_identity(role="state directory")
+        return self._state_root
+
+    def close(self) -> None:
+        """Release the held state-directory capability (idempotent)."""
+        if self._state_root is not None:
+            self._state_root.close()
+            self._state_root = None
+
     @property
     def github(self) -> GitHubClient:
         """The GitHub client, constructed on first use (never in LOCAL mode)."""
@@ -371,9 +431,10 @@ class ControllerEngine:
     def workspace(self) -> LocalWorkspace:
         """The local working-tree reader (LOCAL mode's source of truth).
 
-        Every LOCAL snapshot is reached through here, which is why the run's
-        frozen reader policy is checked here and not at each of the call
-        sites: a snapshot cannot be added that forgets to ask.
+        Built from the *current* configuration: for a new run that is the
+        definition being created, and for a loaded run it is what the
+        contract gate (:meth:`local_contract`) compares against the
+        persisted definition before any phase executes.
         """
         if self._workspace is None:
             local = self.config.local
@@ -384,40 +445,28 @@ class ControllerEngine:
                 max_entries=local.max_workspace_entries,
                 max_bytes=local.max_workspace_bytes,
             )
-        self._check_workspace_policy(self._workspace)
         return self._workspace
 
-    def _check_workspace_policy(self, ws: LocalWorkspace) -> None:
-        """Refuse a loaded LOCAL run whose reviewed scope the config would move.
+    # -- the LOCAL run contract ------------------------------------------
+    def _invocation_contract(self) -> LocalRunContract:
+        """What *this* invocation would define a LOCAL run as (never persisted twice)."""
+        return LocalRunContract.from_config(self.config, self.workspace(), self.paths)
 
-        The fingerprint cannot police this by itself: a re-snapshot after a
-        config change computes the stored and the current fingerprint under
-        the *new* policy, so the two agree -- about a tree whose newly
-        excluded region no reviewer ever saw. The run therefore carries the
-        policy it was created with, and it is compared here (see
-        :meth:`autoforge.local_workspace.LocalWorkspace.policy_identity`).
+    def local_contract(self) -> LocalRunContract:
+        """The loaded LOCAL run's persisted contract, proven to match this invocation.
 
-        This is a VerificationError, not BLOCKED: the operator changed a
-        setting, and both restoring it and starting a new run under the new
-        one must stay possible. Nothing is persisted, so the run is exactly
-        as resumable afterwards as it was before.
+        This is the one gate between "state was read" and "anything is
+        executed or decided" (see :mod:`autoforge.run_contract`): it runs at
+        :meth:`load`, at the top of every LOCAL step, and at every use of a
+        run-defining value, because execution reads such values *from the
+        contract this returns* rather than from the configuration. Drift is a
+        VerificationError, not BLOCKED: the operator changed a setting (or
+        moved the checkout), and both restoring it and starting a new run
+        under the new one must stay possible. Nothing is persisted, so the
+        run is exactly as resumable afterwards as it was before.
         """
-        state = self.state
-        if state is None or not state.is_local:
-            return
-        recorded = state.local_workspace_policy
-        current = ws.policy_identity()
-        if recorded == current:
-            return
-        raise VerificationError(
-            "the LOCAL workspace policy changed since this run was created: the run was "
-            f"bound with {recorded!r} and the current configuration is {current!r}. A "
-            "workspace fingerprint means 'the tree as these rules classify it', so "
-            "continuing would rebind the review to a different scope -- an implementation "
-            "hidden by a new local.exclude entry would never be reviewed. Restore the "
-            "previous local.* settings to resume this run, or start a new run under the "
-            "new ones."
-        )
+        state = self._require_state()
+        return validate_local_run_contract(state.local_contract(), self._invocation_contract())
 
     def bind_local_state_dir(self, explicit: str | Path | None = None) -> None:
         """Point :attr:`paths` at where this LOCAL run keeps its runtime state.
@@ -467,6 +516,9 @@ class ControllerEngine:
         spec = read_feature_spec(ws, feature_spec_path)
         dirty = self._check_baseline_clean(ws.dirty_paths(), spec, allow_dirty)
         snapshot = ws.snapshot()
+        # The one moment the current configuration *defines* the run. From
+        # here on it is only ever compared against this.
+        contract = self._invocation_contract()
         now = utcnow_iso()
         self.state = AutoForgeState(
             run_id=generate_run_id(),
@@ -476,12 +528,12 @@ class ControllerEngine:
             feature_spec_sha256=spec.sha256,
             base_head_sha=snapshot.head_sha,
             base_branch=snapshot.branch,
-            local_workspace_policy=ws.policy_identity(),
+            local_run_contract=contract.to_dict(),
             workspace_fingerprint=snapshot.fingerprint,
             baseline_dirty_paths=dirty,
             created_at=now,
             updated_at=now,
-            prompt_version=self.config.prompt_version or __prompt_version__,
+            prompt_version=contract.prompt_version,
         )
         self._state_from_disk = False
         return self.state
@@ -526,17 +578,45 @@ class ControllerEngine:
         return dirty
 
     def load(self) -> AutoForgeState:
+        """Read the run at :attr:`paths` through the held state root.
+
+        A LOCAL run is additionally passed through the contract gate here,
+        so no command -- ``resume``, ``step``, ``status``, a crash recovery
+        -- can act on a run whose definition this invocation would change.
+        """
         try:
-            root = self.paths.open_root(create=False)
+            root = self.state_root(create=False)
         except FileNotFoundError:
-            # Reading never creates: no state directory means no run here,
-            # and load_state phrases that for the caller.
-            self.state = load_state(self.paths.state_file)
-        else:
-            with root:
-                self.state = load_state(self.paths.state_file, root=root)
+            # Reading never creates: no state directory means no run here.
+            raise no_state_error(self.paths.state_file) from None
+        state = load_state(self.paths.state_file, root=root)
+        if state.is_local:
+            # Gate *before* binding: an engine never holds a run whose
+            # definition this invocation would change.
+            validate_local_run_contract(state.local_contract(), self._invocation_contract())
+        self.state = state
         self._state_from_disk = True
-        return self.state
+        return state
+
+    def existing_run(self) -> AutoForgeState | None:
+        """The run recorded at :attr:`paths`, or ``None`` when there is none.
+
+        For the pre-flight of a *new* run: an unreadable or foreign state
+        file is a StateError for the caller to refuse or quarantine, and a
+        LOCAL run is *not* passed through the contract gate, because the
+        question here is only whether something would be overwritten.
+        """
+        try:
+            root = self.state_root(create=False)
+        except FileNotFoundError:
+            return None
+        if root.lstat(STATE_FILENAME) is None:
+            return None
+        return load_state(self.paths.state_file, root=root)
+
+    def quarantine_state(self) -> Path:
+        """Move an unreadable ``state.json`` aside (see :func:`quarantine_state_file`)."""
+        return quarantine_state_file(self.paths.state_file, root=self.state_root())
 
     def _require_state(self) -> AutoForgeState:
         if self.state is None:
@@ -546,10 +626,12 @@ class ControllerEngine:
             )
         return self.state
 
-    def _save(self) -> None:
+    def save(self) -> None:
+        """Persist the current state through the held state root."""
         assert self.state is not None
-        with self.paths.open_root() as root:
-            save_state(self.state, self.paths.state_file, root=root)
+        save_state(self.state, self.paths.state_file, root=self.state_root())
+
+    _save = save
 
     def _record_verification_failure(self, phase: Phase, exc: VerificationError) -> None:
         """Persist a failed verification attempt (bounded, redacted).
@@ -564,7 +646,13 @@ class ControllerEngine:
 
     def _logger(self) -> RunLogger:
         state = self._require_state()
-        return RunLogger(self.paths.logs_dir, state.run_id, open_state_root=self.paths.open_root)
+        return RunLogger(
+            self.paths.logs_dir,
+            state.run_id,
+            # The logger closes what it is handed, so it gets its own handle
+            # on the held (and just re-verified) directory.
+            open_state_root=lambda: self.state_root().dup(),
+        )
 
     def validate_config(self) -> None:
         """Fail early (ConfigurationError) when a required profile is unusable.
@@ -588,23 +676,33 @@ class ControllerEngine:
 
     @staticmethod
     def _format_findings(findings: list[dict]) -> str:
+        """The open findings as one untrusted block for a FIX prompt.
+
+        Findings are reviewer output: evidence for the fixing agent to judge,
+        never controller instructions. The whole list is quoted through the
+        same unclosable fence as every other untrusted block, and each
+        finding's one-line fields are kept to one line, so a title or a
+        location cannot forge a second finding or a heading of its own.
+        """
         if not findings:
-            return "(none)"
+            return fenced_untrusted_block("(none)", "text")
         lines = []
         for f in findings:
-            title = f.get("title") or ""
+            fid = escape_inline(str(f.get("id")))
+            head = f"- {fid} [{escape_inline(str(f.get('classification')))}]"
             loc = f.get("location") or ""
-            head = f"- **{f.get('id')}** [{f.get('classification')}]"
+            title = f.get("title") or ""
             if loc:
-                head += f" `{loc}`"
+                head += f" {escape_inline(str(loc))}"
             if title:
-                head += f" — {title}"
+                head += f" — {escape_inline(str(title))}"
             lines.append(head)
-            lines.append(f"  Required resolution: {f.get('required_resolution', '')}")
-        return "\n".join(lines)
+            resolution = str(f.get("required_resolution", ""))
+            lines.append("  Required resolution: " + resolution.replace("\n", "\n    "))
+        return fenced_untrusted_block("\n".join(lines), "text")
 
     def _validation_commands_text(self) -> str:
-        cmds = self.config.local.validation_commands
+        cmds = self.local_contract().validation_commands
         if not cmds:
             return "(none configured)"
         return "; ".join(" ".join(argv) for argv in cmds)
@@ -618,12 +716,12 @@ class ControllerEngine:
         if s.baseline_dirty_paths:
             workspace_note += (
                 " | pre-existing (NOT part of this feature, do not review or revert): "
-                + ", ".join(s.baseline_dirty_paths[:20])
+                + ", ".join(escape_inline(path) for path in s.baseline_dirty_paths[:20])
             )
         return {
             "PROMPT_VERSION": s.prompt_version,
-            "REPO_ROOT": str(self.workspace().root()),
-            "FEATURE_SPEC_PATH": s.feature_spec_path,
+            "REPO_ROOT": escape_inline(str(self.workspace().root())),
+            "FEATURE_SPEC_PATH": escape_inline(s.feature_spec_path),
             "FEATURE_SPEC_SHA256": s.feature_spec_sha256,
             "FEATURE_SPEC_BLOCK": fenced_untrusted_block(spec.content, "markdown"),
             "BASE_HEAD_SHA": s.base_head_sha or "(no commit yet)",
@@ -744,7 +842,7 @@ class ControllerEngine:
         if correction_error is not None:
             correction = render(
                 load_template("correction.md"),
-                {"PREVIOUS_ERROR": correction_error[:2000]},
+                {"PREVIOUS_ERROR_BLOCK": fenced_untrusted_block(correction_error[:2000], "text")},
             )
             prompt = prompt + "\n\n---\n\n" + correction
         return prompt
@@ -902,8 +1000,9 @@ class ControllerEngine:
         budget = step_budget_reason(s.step_count, self.config.workflow.max_total_steps)
         if budget:
             notes.append(f"would enter BLOCKED without executing: {budget}")
+        contract = self.local_contract()
         if s.phase == Phase.REVIEW:
-            cap = self.config.local.max_review_rounds
+            cap = contract.max_review_rounds
             if s.review_round >= cap:
                 notes.append(
                     "would enter BLOCKED without invoking the reviewer: local review round "
@@ -911,7 +1010,7 @@ class ControllerEngine:
                 )
             notes.append(
                 f"review round {s.review_round + 1} of at most {cap} "
-                f"(local.max_fix_rounds={self.config.local.max_fix_rounds})"
+                f"(local.max_fix_rounds={contract.max_fix_rounds})"
             )
             notes.append(
                 "the reviewed workspace fingerprint is computed immediately before the review "
@@ -922,7 +1021,7 @@ class ControllerEngine:
                 "would verify afterwards: the feature spec hash is unchanged, the workspace "
                 "changed as claimed, and every configured validation command exits 0"
             )
-        cmds = self.config.local.validation_commands
+        cmds = contract.validation_commands
         notes.append(
             "validation commands that would run after this phase: "
             + ("; ".join(" ".join(argv) for argv in cmds) if cmds else "(none configured)")
@@ -1256,13 +1355,15 @@ class ControllerEngine:
     # every phase.
     def _local_step_once(self, previous: Phase, plan: StepPlan) -> StepOutcome:
         state = self._require_state()
+        # The contract gate, before anything is counted, verified or run.
+        contract = self.local_contract()
         if previous == Phase.INITIALIZING:
             state.step_count += 1
             return self._initialize_local(plan)
         if previous not in (Phase.ANALYZE_EXECUTE, Phase.REVIEW, Phase.FIX):
             raise StateTransitionError(f"phase {previous.value} is not part of the LOCAL workflow")
         if previous == Phase.REVIEW:
-            cap = self.config.local.max_review_rounds
+            cap = contract.max_review_rounds
             if state.review_round >= cap:
                 # Round cap+1 never starts: its findings could never be fixed.
                 return self._block(
@@ -1271,7 +1372,7 @@ class ControllerEngine:
                     self._local_block_reason(
                         f"local review round {state.review_round + 1} would exceed the local "
                         f"bound of {cap} review round(s) "
-                        f"(local.max_fix_rounds={self.config.local.max_fix_rounds})"
+                        f"(local.max_fix_rounds={contract.max_fix_rounds})"
                     ),
                 )
 
@@ -1413,12 +1514,13 @@ class ControllerEngine:
     def _initialize_local(self, plan: StepPlan) -> StepOutcome:
         """Preflight for a local run: config, git, frozen spec. No GitHub."""
         state = self._require_state()
+        self.local_contract()
         self.validate_config()
         ws = self.workspace()
         # Refuses a state directory inside the reviewed tree before any
-        # fingerprint is computed (see check_state_dir_location). Re-checked
-        # here, not only in `new_local_run`, because `resume` can be invoked
-        # with a different --state-dir than the run was created with.
+        # fingerprint is computed (see check_state_dir_location). The contract
+        # already proves the state directory is the one the run was created
+        # with; this keeps the location rule itself in one place.
         ws.check_state_dir_location(self.paths.state_dir)
         spec = verify_feature_spec_unchanged(
             ws, state.feature_spec_path, state.feature_spec_sha256, when="before ANALYZE_EXECUTE"
@@ -1567,7 +1669,7 @@ class ControllerEngine:
         if res.needs_fix_round:
             state.last_review_result = "needs_fix"
             state.open_findings = findings
-            budget = self.config.local.max_fix_rounds
+            budget = self.local_contract().max_fix_rounds
             if state.local_fix_rounds >= budget:
                 return Phase.BLOCKED, self._local_block_reason(
                     f"local review round {res.round}: {len(findings)} finding(s) remain after "
@@ -1670,7 +1772,9 @@ class ControllerEngine:
         ``resume`` rather than advancing on an agent's word.
         """
         state = self._require_state()
-        commands = self.config.local.validation_commands
+        # From the contract, not the configuration: what verifies this run
+        # was decided when the run was created.
+        commands = self.local_contract().validation_commands
         if not commands:
             return
         logger = self._logger()

@@ -47,6 +47,27 @@ LOCAL_COMMON_TEMPLATE = "local_common.md"
 _BACKTICK_RUN_RE = re.compile(r"`+")
 
 
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+
+
+def escape_inline(text: str) -> str:
+    """Render untrusted text that must occupy *one line* of a prompt.
+
+    Every string that reaches a prompt from outside the controller -- a
+    working-tree path, a finding's id or title, a branch name -- is rendered
+    through exactly one of two primitives: this one for text that is quoted
+    inline, :func:`fenced_untrusted_block` for text quoted as a block.  A
+    control character (a newline first of all, but also a carriage return,
+    an escape sequence introducer, or a Unicode line separator) is replaced
+    by its ``\\x``/``\\u`` escape, so the text cannot start a new line, a new
+    list item or a new heading in the prompt the controller composed around
+    it.  Printable text, backslashes included, is left as it is: the point is
+    that the *structure* of the prompt stays the controller's, not that the
+    agent can decode the string byte-for-byte.
+    """
+    return _CONTROL_CHAR_RE.sub(lambda m: m.group(0).encode("unicode_escape").decode("ascii"), text)
+
+
 def fenced_untrusted_block(content: str, info: str = "") -> str:
     """Quote untrusted text in a fence that nothing inside it can close.
 

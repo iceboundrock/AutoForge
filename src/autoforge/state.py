@@ -36,6 +36,7 @@ from pathlib import Path
 from . import __prompt_version__, __protocol_version__, __version__
 from .errors import StateError
 from .loop_guard import validate_review_history
+from .run_contract import LocalRunContract
 from .runlog import validate_run_id
 from .safefs import SafeRoot, entry_kind
 from .transitions import LOCAL_PHASES, LOCAL_WRITE_PHASES, Phase, WorkflowMode
@@ -202,13 +203,15 @@ class AutoForgeState:
     # forbidden by the prompt.
     base_head_sha: str = ""
     base_branch: str = ""
-    # The workspace reader's own configuration, frozen at run creation (see
-    # ``LocalWorkspace.policy_identity``). A fingerprint binds the tree *as
-    # the reader classifies it*, so the exclusion rules and cost bounds are
-    # part of what a review covered. Comparing fingerprints cannot detect a
-    # policy change, because a re-snapshot after the change computes both
-    # sides under the new policy; recording the policy is what closes that.
-    local_workspace_policy: str = ""
+    # The run's durable contract (see :mod:`autoforge.run_contract`): the
+    # repository root, state root, workspace policy, validation commands,
+    # fix-round budget and prompt version the run was *defined* with. Every
+    # later invocation compares what it would define against this before it
+    # executes anything, and execution reads these values from here -- never
+    # from the configuration of the moment -- so a resume can revalidate the
+    # contract but cannot redefine it. Persisted as the contract's own dict
+    # form and parsed strictly on load; ``{}`` for REMOTE runs.
+    local_run_contract: dict = field(default_factory=dict)
     # Workspace fingerprint the controller bound before the current review
     # (the local analogue of ``current_head_sha``).
     workspace_fingerprint: str = ""
@@ -253,6 +256,13 @@ class AutoForgeState:
     created_at: str = ""
     updated_at: str = ""
 
+    # -- the LOCAL run contract ------------------------------------------
+    def local_contract(self) -> LocalRunContract:
+        """The persisted contract of this LOCAL run (StateError for a REMOTE one)."""
+        if self.mode != WorkflowMode.LOCAL:
+            raise StateError("a REMOTE run has no local run contract")
+        return LocalRunContract.from_dict(self.local_run_contract)
+
     # -- serialization -------------------------------------------------
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -293,6 +303,20 @@ class AutoForgeState:
             raise StateError(
                 f"unsupported protocol_version {raw_protocol!r} "
                 f"(controller speaks {__protocol_version__!r})"
+            )
+        # A LOCAL state written before the run contract existed has no
+        # persisted definition of what it reviewed under. It is not migrated:
+        # the only source a migration could fill the contract from is the
+        # *current* configuration, and "missing field -> fill from current
+        # config" is precisely the silent rebinding the contract forbids.
+        if mode == WorkflowMode.LOCAL and (
+            "local_workspace_policy" in data or "local_run_contract" not in data
+        ):
+            raise StateError(
+                "state file is a LOCAL run created by a pre-release controller that did "
+                "not persist the run contract; it is not migrated, because the contract "
+                "cannot be reconstructed from the current configuration without "
+                "redefining the run -- start a new run"
             )
         kwargs = dict(data)
         kwargs["phase"] = phase
@@ -336,7 +360,7 @@ class AutoForgeState:
         # its identity is the frozen feature specification instead.
         required = ["run_id", "created_at", "updated_at"]
         if state.mode == WorkflowMode.LOCAL:
-            required += ["feature_spec_path", "feature_spec_sha256", "local_workspace_policy"]
+            required += ["feature_spec_path", "feature_spec_sha256", "local_run_contract"]
         else:
             required += ["repository", "epic_url"]
         for req in required:
@@ -370,6 +394,15 @@ class AutoForgeState:
             if getattr(state, name) < 0:
                 raise StateError(f"state field {name!r} must be a non-negative integer")
         _validate_local_pending(state)
+        if not isinstance(state.local_run_contract, dict):
+            raise StateError("state field 'local_run_contract' must be an object")
+        if state.mode == WorkflowMode.LOCAL:
+            try:
+                LocalRunContract.from_dict(state.local_run_contract)
+            except StateError as exc:
+                raise StateError(f"state field 'local_run_contract': {exc}") from None
+        elif state.local_run_contract:
+            raise StateError("state field 'local_run_contract' must be empty for a REMOTE run")
         if not isinstance(state.baseline_dirty_paths, list) or not all(
             isinstance(path, str) for path in state.baseline_dirty_paths
         ):
@@ -515,9 +548,6 @@ class StatePaths:
     logs_dir: Path
     anchor: Path
     relative: tuple[str, ...]
-    _expected_identity: tuple[int, int] | None = field(
-        default=None, init=False, repr=False, compare=False
-    )
 
     @classmethod
     def from_state_dir(
@@ -544,35 +574,28 @@ class StatePaths:
             relative=tuple(relative),
         )
 
+    def canonical_state_dir(self) -> str:
+        """The state directory's canonical absolute pathname (contract form)."""
+        return os.path.realpath(os.path.abspath(self.state_dir))
+
     def open_root(self, *, create: bool = True) -> SafeRoot:
         """Open the state directory as a capability (the caller closes it).
 
-        The first open binds the pathname to its directory inode. Later opens
-        are checked against that binding so an agent cannot replace the state
-        directory with another ordinary directory and redirect a subsequent
-        checkpoint or log write.
+        This is a *pathname* operation and is therefore performed once per
+        run by the engine, which then holds the capability for its lifetime
+        (see ``Engine.state_root``): every later write goes through the held
+        descriptor and ``SafeRoot.verify_identity`` proves the pathname still
+        names it. Opening a second time would bind whatever the pathname
+        names *now*, which is the rebinding the held capability exists to
+        prevent, so nothing in the controller calls this twice for one run.
         """
         root = SafeRoot.open(self.anchor, create=create)
         if not self.relative:
-            candidate = root
-        else:
-            try:
-                candidate = root.subroot("/".join(self.relative), create=create)
-            finally:
-                root.close()
+            return root
         try:
-            expected = self._expected_identity
-            if expected is None:
-                object.__setattr__(self, "_expected_identity", candidate.identity)
-            elif candidate.identity != expected:
-                raise StateError(
-                    f"state directory {self.state_dir} was replaced while the controller was "
-                    "running; refusing to continue against a different directory"
-                )
-            return candidate
-        except BaseException:
-            candidate.close()
-            raise
+            return root.subroot("/".join(self.relative), create=create)
+        finally:
+            root.close()
 
 
 # -- persistence ----------------------------------------------------------
@@ -636,13 +659,18 @@ def _not_regular(p: Path, kind: str) -> StateError:
     )
 
 
+def no_state_error(path: str | Path) -> StateError:
+    """There is no run at ``path`` (and a read never creates one)."""
+    return StateError(
+        f"no state file at {Path(path)} — run 'autoforge run --epic ... --issue ...' first; "
+        "'resume' never creates a new run silently"
+    )
+
+
 def load_state(path: str | Path, *, root: SafeRoot | None = None) -> AutoForgeState:
     """Load state; raises StateError (never silently re-inits) on problems."""
     p = Path(path)
-    missing = StateError(
-        f"no state file at {p} — run 'autoforge run --epic ... --issue ...' first; "
-        "'resume' never creates a new run silently"
-    )
+    missing = no_state_error(p)
     try:
         fs, name, owned = _root_for(p, root, create=False)
     except FileNotFoundError:

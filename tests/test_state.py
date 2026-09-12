@@ -650,12 +650,39 @@ def test_save_state_does_not_swallow_fatal_directory_fsync(tmp_path, monkeypatch
         save_state(make_state(review_round=4), p)
 
 
-def test_state_paths_reject_a_normal_directory_replacement(tmp_path):
-    paths = StatePaths.from_state_dir(tmp_path / "state")
-    with paths.open_root(create=True):
-        pass
-    moved = tmp_path / "moved"
-    (tmp_path / "state").rename(moved)
+def test_the_engine_holds_its_state_root_and_refuses_a_replacement(tmp_path):
+    """The state directory is opened once per run and only ever re-verified.
+
+    `StatePaths.open_root` is a pathname operation, so the engine performs it
+    once and holds the capability; a later access checks that the pathname
+    still names the held inode and never re-resolves it into a new binding.
+    An ordinary directory moved into the name is therefore a refusal, not a
+    redirection -- and the same for a symbolic link, which `lstat` reports as
+    what it is rather than following it.
+    """
+    from autoforge.config import default_config
+    from autoforge.engine import ControllerEngine
+    from autoforge.safefs import UnsafePathError
+
+    engine = ControllerEngine(default_config(), state_dir=tmp_path / "state")
+    first = engine.state_root(create=True)
+    assert engine.state_root() is first, "one capability for the engine's lifetime"
+
+    (tmp_path / "state").rename(tmp_path / "moved")
     (tmp_path / "state").mkdir()
     with pytest.raises(StateError, match="state directory .* replaced"):
-        paths.open_root()
+        engine.state_root()
+    assert list((tmp_path / "state").iterdir()) == []
+
+    (tmp_path / "state").rmdir()
+    (tmp_path / "state").symlink_to(tmp_path / "moved")
+    with pytest.raises(UnsafePathError, match="symbolic link"):
+        engine.state_root()
+
+    # Re-pointing the engine releases the capability; a fresh one is bound
+    # to whatever the new location names, once.
+    engine.paths = StatePaths.from_state_dir(tmp_path / "other")
+    assert first.identity != engine.state_root(create=True).identity
+    engine.close()
+    with pytest.raises(StateError, match="closed"):
+        _ = first.fd

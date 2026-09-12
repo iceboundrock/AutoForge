@@ -560,6 +560,36 @@ None.
 """
 
 
+def sample_contract(
+    *,
+    repository_root: str = "/repo",
+    state_root: str = "/repo/.git/autoforge/state",
+    exclude: tuple[str, ...] = (),
+    max_entries: int = 50_000,
+    max_bytes: int = 512 * 1024 * 1024,
+    validation_commands: tuple[tuple[str, ...], ...] = (),
+    max_fix_rounds: int = 1,
+    prompt_version: str = "v1",
+) -> dict:
+    """A well-formed persisted LOCAL run contract (see ``autoforge.run_contract``)."""
+    from autoforge.local_workspace import SNAPSHOT_TAG
+    from autoforge.run_contract import LocalRunContract, WorkspacePolicy
+
+    return LocalRunContract(
+        repository_root=repository_root,
+        state_root=state_root,
+        workspace_policy=WorkspacePolicy(
+            exclude=exclude,
+            max_entries=max_entries,
+            max_bytes=max_bytes,
+            snapshot_tag=SNAPSHOT_TAG,
+        ),
+        validation_commands=validation_commands,
+        max_fix_rounds=max_fix_rounds,
+        prompt_version=prompt_version,
+    ).to_dict()
+
+
 def write_feature(repo, name: str = "add-filter", body: str = FEATURE_MD) -> Path:
     """Write ``features/<name>.md`` inside ``repo`` and return the path."""
     path = Path(repo) / "features" / f"{name}.md"

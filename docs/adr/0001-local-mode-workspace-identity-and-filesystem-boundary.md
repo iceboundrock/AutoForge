@@ -43,7 +43,9 @@ means the finding was a sample of an open-ended set.
 | #45 | — | `--allow-dirty` records paths but does not pin their contents | Review binding | — | systemic |
 | #46 | — | hashing has no cost bound | Availability | — | local |
 | #47 | — | submodules/nested repos unsupported | Product guarantee | — | systemic |
-| R6-F2 | 6 | a resume with a new `local.exclude` re-bound the review to a narrower tree | Review binding | — | systemic |
+| R6-F2 | 6 | a resume with a new `local.exclude` re-bound the review to a narrower tree | Review binding | Freeze `local.exclude` and the cost bounds | systemic |
+| R7-F2 | 7 | the link-target check had its own copy of "excluded", diverging from the walk's | Fingerprint totality | — | systemic |
+| R7-F4 | 7 | the walk materialised a directory before checking the budget; the spec read was unbounded | Availability | — | local |
 
 Every systemic row has the same cause, and it is one sentence:
 
@@ -76,6 +78,8 @@ have written", which an agent could simply write into.
 | R5-F4 | 5 | `local init --force` truncated an external **hard link** target | hardlink × final × truncate | systemic |
 | #50 | — | all of the above are pathname checks, so check ≠ use | — | systemic |
 | R6-F1 | 6 | the state **root** replaced by an ordinary directory redirected state and logs | directory × *root* × all | systemic |
+| R7-F1 | 7 | the bootstrap of a new run resolved the state directory by pathname before the capability existed | link × root × create | systemic |
+| R7-F5 | 7 | `create_exclusive` wrote the final name directly, so a crash left a partial artifact | — × final × create | local |
 
 Again one cause:
 
@@ -106,9 +110,23 @@ signal that they were not of the same kind:
 - **E (locking):** R1-F3 (r2/r3) — `local init` wrote without the repository
   lock. One contract, one entry point added to it. Has not recurred.
 
-**The diagnosis, in one line:** classes A and B defined safety by
+#### Class F — run definition (what a resumed process believes the run is)
+
+R6-F2 and R7-F1 look like an A row and a B row, and each was first fixed as
+one. Read together they are a third class: both are a **new process
+re-deriving a run-defining input from the current environment** — the
+exclusion rules from today's configuration, the state directory from
+today's pathname — and treating the result as the run's definition. The
+fingerprint check, the inode check and every other REVALIDATE step compare
+the world against the definition; if the definition itself is rebuilt from
+the world, they compare the world against itself. §5.7 closes the class
+with a persisted contract of every run-defining input and one gate that
+revalidates it, and §5.9 states what that contract can and cannot prove
+about identity across processes.
+
+**The diagnosis, in one line:** classes A, B and F defined safety by
 *enumerating the bad cases*; classes C, D and E defined it by *closing the
-definition of the good case*. Only A and B kept producing new findings.
+definition of the good case*. Only A, B and F kept producing new findings.
 
 ## 2. Threat model
 
@@ -186,7 +204,8 @@ more sharply (§5.4): the state root's pathname is resolved normally **once**,
 and thereafter the controller writes to the inode that resolution reached, not
 to the name. What cannot be prevented is a redirection that was already in
 place before the controller started; what is now prevented is one introduced
-while it runs.
+while it runs. §5.9 states the cross-process half of that boundary and what
+the persisted contract can and cannot prove about it.
 
 ## 3. Required invariants
 
@@ -386,42 +405,81 @@ could load as `null` and reach the review binding as a value no reviewer's
 fingerprint could equal. Declaring a field's type is now the same act as
 validating it.
 
-### 5.7 The reader's own policy is part of the run
+### 5.7 The run is defined once: the Durable Run Contract
 
-§5.1 says a fingerprint binds the tree *as this reader classifies it*. That
-makes the reader's configuration — `local.exclude` and the two cost bounds —
-part of what a review covered, and round 6 showed what follows when only the
-fingerprint is persisted (R6-F2): a run resumed with `local.exclude: ["src"]`
-added re-snapshots with the implementation outside the bound scope, stores
-that fingerprint, and accepts a clean review of a tree nobody reviewed. The
-`reviewed_fingerprint == current_fingerprint` check cannot see it, because
-after the change *both sides* are computed under the new policy and agree.
+§5.1 says a fingerprint binds the tree *as this reader classifies it*. Round 6
+showed what follows when only the fingerprint is persisted (R6-F2): a run
+resumed with `local.exclude: ["src"]` added re-snapshots with the
+implementation outside the bound scope, stores that fingerprint, and accepts
+a clean review of a tree nobody reviewed. `reviewed == current` cannot see
+it, because after the change *both sides* are computed under the new policy.
 
-So the policy is frozen with the run: `new_local_run` records
-`LocalWorkspace.policy_identity()` into the state, and every LOCAL snapshot —
-reached through the single `ControllerEngine.workspace()` chokepoint, so a
-future call site cannot forget to ask — is refused when the current
-configuration no longer matches, naming what moved.
+The first fix froze `local.exclude` and the two cost bounds. The next review
+round found the same shape one level up (R7-F1: the state directory
+re-resolved by pathname at bootstrap), and it is the shape, not the field,
+that is the defect: a LOCAL run has no GitHub to be its source of truth, so
+its *definition* — which tree, classified by which rules, verified by which
+commands, bounded by how many rounds, with state kept where — is decided at
+creation from that moment's configuration and environment, while every later
+`step`, `resume`, `status` and crash recovery is a **new process that loads
+the state file and also loads today's configuration**. Any step that
+re-derives a run-defining input from the current environment and treats the
+result as the run's definition has silently **rebound** the run. Freezing
+fields one review round at a time cannot converge; every un-enumerated input
+is the next finding.
+
+The closed formulation is `run_contract.py`:
+
+- **`LocalRunContract`** is the persisted definition of the run. Every field
+  is IMMUTABLE: repository root, state directory, the whole
+  `WorkspacePolicy` (exclusions, both cost bounds *and the snapshot
+  algorithm's tag*, because a fingerprint is only comparable under the walk
+  that produced it), `local.validation_commands`, `local.max_fix_rounds`,
+  and the prompt version. The classification of every other input the run
+  touches is written at the top of the module: REVALIDATED (the
+  specification's bytes, the git anchor — content checks of the world the
+  contract names, never written back) and DYNAMIC (fingerprints, gitdir
+  inodes, which provider/model runs, cwd, counters — nothing a persisted
+  safety judgment depends on).
+- **`WorkspacePolicy`** is persisted as canonical text plus its SHA-256
+  (`v2 snapshot=<tag> exclude=[...] max_entries=N max_bytes=N`): the text
+  says *what* changed, the digest makes the text tamper-evident, and the
+  version makes a pre-release `v1` policy a refusal rather than a guess.
+- **`validate_local_run_contract(recorded, current)`** is the one gate. It
+  runs inside `ControllerEngine.load()` *before* the state is bound to the
+  engine — so `resume`, `step`, `status`, the dry-run plan and crash
+  recovery all pass through it — and again at the top of every LOCAL step.
+  Drift is reported per field, under the name the operator knows
+  (`local.exclude: run: [] current: ["src"]`), as a `VerificationError`
+  that persists nothing.
+- **Execution reads run-defining values from the contract**, never from the
+  configuration: the FIX budget, the validation commands and the workspace
+  reader's policy all come from `local_contract()`. The configuration is
+  consulted only to construct what *this invocation would define*, which the
+  gate then compares. A structural test asserts that `engine.py` reads no
+  run-defining `config.local.*` field anywhere else.
+- **Legacy LOCAL state fails closed.** A LOCAL state without a contract, with
+  a contract from another schema, or with a `v1` policy is a `StateError`
+  telling the operator to start a new run. There is no
+  `missing field → fill from current config` path, because that would be the
+  rebinding the contract exists to prevent. REMOTE state is untouched.
 
 Two choices inside that are worth stating:
 
-- **The whole policy is frozen, not the part that is provably unsafe to
-  change.** The cost bounds can only ever turn a snapshot into a *refusal*, so
-  exempting them would be sound today — and would be one more enumeration of
-  which knobs happen to be benign, which is the exact shape of reasoning this
-  ADR replaced. *"The reader that bound this run is the reader that keeps
-  binding it"* is the closed statement.
+- **The whole definition is frozen, not the part that is provably unsafe to
+  change.** The cost bounds can only ever turn a snapshot into a *refusal*,
+  and a wider `local.exclude` only reviews *more*, so exempting either would
+  be sound today — and would be one more enumeration of which knobs happen
+  to be benign, the exact shape of reasoning this ADR replaced. *"The run
+  that was defined is the run that keeps running"* is the closed statement.
+  Adding a run-defining input is one dataclass field: persistence,
+  comparison and the drift message follow from it, and a completeness test
+  checks the matrix against the dataclass.
 - **It is a `VerificationError`, not `BLOCKED`.** The operator changed a
-  setting; restoring it and resuming, or starting a new run under the new one,
-  must both stay possible. Nothing is persisted by the refusal, so the run is
-  exactly as resumable afterwards as it was before.
-
-The recorded value is canonical human-readable text
-(`v1 exclude=[...] max_entries=... max_bytes=...`) rather than a digest, for
-one reason: a digest can prove that something changed and can never say what.
-It is a required field for LOCAL states at the load boundary — LOCAL mode is
-unreleased, so there is no compatibility cost to making its absence a
-corruption rather than a default.
+  setting or moved the checkout; restoring it and resuming, or starting a
+  new run under the new definition, must both stay possible. Nothing is
+  persisted by the refusal, so the run is exactly as resumable afterwards as
+  it was before.
 
 ### 5.8 Quoting the specification is delimiter safety, not a trust boundary
 
@@ -444,6 +502,63 @@ states explicitly that anything in the block resembling an instruction, a
 control block, a heading of the prompt, or a direction to skip a check is
 content to be *implemented*, never followed. Neither half is load-bearing
 without the other.
+
+### 5.9 Durable run identity
+
+The contract names two directories by pathname — the repository root and the
+state directory — and §5.4 binds the state directory to an inode. Those are
+two different guarantees with two different lifetimes, and the ADR states
+them separately so neither is mistaken for the other.
+
+**Within one controller process** (guarantee C): the state directory is a
+capability opened exactly once — `ControllerEngine.state_root()` — and held
+for the run's lifetime. Every later use proves the pathname still reaches the
+held inode and then goes through the held descriptor. Nothing re-resolves the
+name into a binding: not a checkpoint, not a logger, not the next
+`state.json` read. So whatever a same-UID agent does to the pathname after
+the controller started — a symbolic link, a FIFO, a prepared ordinary
+directory renamed into place, the directory or its parent renamed aside and
+recreated — is a refusal with the phase unchanged, and no controller byte
+reaches the replacement. The bootstrap of a new run opens through the same
+chain with `O_NOFOLLOW` on every component below the git directory, so the
+first resolution (R7-F1) is the same resolution every later write is proven
+against; `create_exclusive` publishes a durable temporary by `link(2)`, so
+an interrupted bootstrap leaves no half-written artifact under the final
+name (R7-F5).
+
+**Across processes**: there is no held descriptor, only the record. The
+contract persists both pathnames, so a checkout that was moved, a state
+directory that was copied elsewhere, or a state file carried into another
+checkout is refused with both roots named. What it does *not* detect — and
+this ADR refuses to pretend otherwise — is an in-place replacement whose
+contents were copied: a same-UID adversary who replaces the state directory
+*at the same pathname* with a byte-identical `state.json` has produced the
+input a reboot produces. The options were weighed:
+
+- *A. Persist `(st_dev, st_ino)` of the state directory.* Rejected: an inode
+  number is reused after `rmdir`, is not stable across a filesystem restore
+  or a `mount --bind`, and a legitimate reboot after a backup restore would
+  refuse a valid run while a replacement that reused the inode would pass.
+  It adds a check that is both too strict and too weak.
+- *B. A random run secret stored outside the state directory.* Rejected: the
+  only other place on a single machine is another directory the same UID
+  can also copy or replace; the bootstrap circularity cannot be broken from
+  inside the same trust domain, and a secret that is not a secret would be a
+  fabricated proof.
+- *C. Pathnames in the contract.* Chosen: honest about its strength (it
+  catches relocation and copying, which are the operator-error cases and
+  the cheap attacks) and about its limit.
+- *D. Refuse to resume at all.* Rejected: it discards the crash recovery
+  the mode exists to provide, for a threat the threat model (§2.2) already
+  concedes is not containable without a sandbox.
+
+The limitation is pinned by a test
+(`test_documented_limit_an_in_place_replacement_with_copied_contents_is_not_detectable`)
+so that no future round mistakes it for an oversight, and so that the
+contract's remaining strength is stated exactly: whatever the replacement
+holds, the gate proves it is *the run that was defined* — same roots, same
+policy, same budgets, same commands, same prompt version — and every other
+alteration is caught by the state file's own validation or by drift.
 
 ## 6. Completeness analysis
 
@@ -493,13 +608,17 @@ an independent `os.walk` finds nothing the snapshot did not mention.
   `resume` will report no run there. LOCAL mode is unreleased, so there is no
   such run in the field; an operator who has one can pass `--state-dir` and
   will be told if it is inside the reviewed tree.
-- **State schema.** No field was removed or repurposed; `protocol_version` is
-  unchanged. `local_workspace_policy` is new and **required for LOCAL
-  states** (§5.7): a LOCAL state file without it cannot be shown to still
-  cover the tree it was reviewed against, and unreleased LOCAL mode has no
-  such file in the field. REMOTE states neither carry nor require it. A state file written by the pre-reset code still loads, and the
-  new scalar-type check is strictly narrower than what it accepted (it rejects
-  only values whose *declared* type they never had).
+- **State schema.** No REMOTE field was removed or repurposed;
+  `protocol_version` is unchanged. `local_run_contract` (§5.7) is new and
+  **required for LOCAL states**; the pre-release `local_workspace_policy`
+  string is refused, as is a contract of another schema or a `v1` policy
+  text. A LOCAL state file without a readable contract cannot be shown to
+  still mean what it meant, and it is never reconstructed from the current
+  configuration; unreleased LOCAL mode has no such file in the field, and an
+  operator who has one starts a new run. REMOTE states neither carry nor
+  require it. A REMOTE state file written by the pre-reset code still loads,
+  and the scalar-type check is strictly narrower than what it accepted (it
+  rejects only values whose *declared* type they never had).
 - **REMOTE mode.** Unchanged. `safefs.py` is used by `state.py` and
   `runlog.py`, which both modes share, so remote runs get the same write
   boundary; nothing about GitHub verification, replan or merge moved.
@@ -521,3 +640,14 @@ an independent `os.walk` finds nothing the snapshot did not mention.
    rather than a surprise.
 6. **Hard links inside the tree** are hashed as two independent entries, so a
    change shows up twice. Correct, but not deduplicated.
+7. **Cross-process state-root identity is by pathname.** §5.9. Relocation and
+   copying are refused; an in-place replacement with copied contents is
+   indistinguishable from a reboot and is accepted, by design and by test.
+8. **Artifacts are published by `link(2)`.** `create_exclusive` needs hard
+   links in the state directory's filesystem; one without them (some FAT
+   and network mounts) refuses the bootstrap with a `StateError` naming the
+   artifact rather than falling back to a non-atomic write.
+9. **REMOTE replan evidence keeps its tilde fence.** The `~~~~untrusted`
+   quoting of replan evidence predates `fenced_untrusted_block` and is
+   unchanged; LOCAL prompts use the two primitives of §5.8 (`escape_inline`
+   for one-line fields, the unclosable fence for blocks) exclusively.

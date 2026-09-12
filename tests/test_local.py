@@ -34,6 +34,7 @@ from .conftest import (
     commit_all,
     git_repo,
     make_local_engine,
+    sample_contract,
     write_feature,
 )
 
@@ -529,7 +530,7 @@ def test_local_run_is_resumable_from_persisted_state(tmp_path):
     assert load_state(eng2.paths.state_file).phase == Phase.DONE
 
 
-# -- R6-F2: the reviewed scope is frozen with the run ---------------------------
+# -- the run contract: the reviewed scope is frozen with the run -----------------
 def test_a_resume_cannot_hide_the_implementation_behind_a_new_exclusion(tmp_path):
     """The fingerprint cannot police the rules that produced it.
 
@@ -537,7 +538,8 @@ def test_a_resume_cannot_hide_the_implementation_behind_a_new_exclusion(tmp_path
     re-snapshots with the implementation outside the bound scope. Both sides
     of `reviewed == current` are then computed under the new policy, so they
     agree -- about a tree whose implementation nobody reviewed. Only the
-    recorded policy catches it.
+    recorded contract catches it, and it does so at `load()`: before a step,
+    a status or a recovery could act on the redefined run.
     """
     root = local_repo(tmp_path)
     eng = make_local_engine(root, "features/add-filter.md")
@@ -551,12 +553,9 @@ def test_a_resume_cannot_hide_the_implementation_behind_a_new_exclusion(tmp_path
     narrowed = default_config()
     narrowed.local.exclude = ["src"]
     eng2 = make_local_engine(root, "features/add-filter.md", cfg=narrowed, start=False)
-    eng2.load()
-    eng2.provider._handler = scripted(
-        eng2, root, [(None, lambda e: review_result(e.state.workspace_fingerprint))]
-    )
-    with pytest.raises(VerificationError, match="workspace policy changed"):
-        eng2.step()
+    with pytest.raises(VerificationError) as exc:
+        eng2.load()
+    assert 'local.exclude: run: [] current: ["src"]' in str(exc.value)
 
     # Nothing moved: the run is exactly as resumable as it was.
     persisted = load_state(eng2.paths.state_file)
@@ -581,14 +580,14 @@ def test_a_resume_that_widens_the_cost_bounds_is_refused_too(tmp_path):
     benign -- the reasoning this design exists to replace.
     """
     root = local_repo(tmp_path)
-    make_local_engine(root, "features/add-filter.md")._save()
+    make_local_engine(root, "features/add-filter.md").save()
 
     widened = default_config()
     widened.local.max_workspace_entries += 1
     eng = make_local_engine(root, "features/add-filter.md", cfg=widened, start=False)
-    eng.load()
-    with pytest.raises(VerificationError, match="workspace policy changed"):
-        eng.step()
+    with pytest.raises(VerificationError) as exc:
+        eng.load()
+    assert "local.max_workspace_entries: run: 50000 current: 50001" in str(exc.value)
 
 
 def test_the_recorded_policy_is_canonical_not_the_operators_spelling(tmp_path):
@@ -597,16 +596,16 @@ def test_the_recorded_policy_is_canonical_not_the_operators_spelling(tmp_path):
     first = default_config()
     first.local.exclude = ["build", ".venv"]
     eng = make_local_engine(root, "features/add-filter.md", cfg=first)
-    eng._save()
-    recorded = eng.state.local_workspace_policy
-    assert "exclude=[.venv,build]" in recorded
+    eng.save()
+    recorded = eng.state.local_run_contract
+    assert "exclude=[.venv,build]" in recorded["workspace_policy"]["policy"]
 
     reordered = default_config()
     reordered.local.exclude = [".venv/", "build", ".venv"]
     eng2 = make_local_engine(root, "features/add-filter.md", cfg=reordered, start=False)
     eng2.load()
     eng2.step()  # must not raise: same policy, different spelling
-    assert eng2.state.local_workspace_policy == recorded
+    assert eng2.state.local_run_contract == recorded
 
 
 # -- backward compatibility -----------------------------------------------------------------
@@ -1089,11 +1088,19 @@ def test_failing_validation_output_is_redacted_before_it_is_persisted(tmp_path):
     """
     import sys
 
-    root = local_repo(tmp_path)
+    root = local_repo(tmp_path / "repo")
     cfg = default_config()
     secret = "ghp_" + "A" * 36
+    # The secret is *printed* by the command, not part of its argv: the argv
+    # is the run's own contract and is persisted as such.
+    leak = tmp_path / "leak.txt"
+    leak.write_text(secret, encoding="utf-8")
     cfg.local.validation_commands = [
-        [sys.executable, "-c", f"import sys; print('GITHUB_TOKEN={secret}'); sys.exit(1)"]
+        [
+            sys.executable,
+            "-c",
+            f"import sys; print('GITHUB_TOKEN=' + open({str(leak)!r}).read()); sys.exit(1)",
+        ]
     ]
     eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
     eng.provider._handler = scripted(
@@ -1121,18 +1128,19 @@ def test_the_existing_run_guard_names_the_subcommand_that_was_typed(tmp_path, mo
 
     root = local_repo(tmp_path)
     monkeypatch.chdir(root)
-    paths = StatePaths.from_state_dir(root / ".autoforge")
     eng = make_local_engine(root, "features/add-filter.md")
-    save_state(eng.state, paths.state_file)
+    eng.save()
+    # A second engine at the same location, as a second `local run` would be.
+    eng2 = make_local_engine(root, "features/add-filter.md", start=False)
 
-    assert _existing_run_guard(paths, force=False, command="local run") == (2, False)
+    assert _existing_run_guard(eng2, force=False, command="local run") == (2, False)
     assert "'local run --force' to discard it" in capsys.readouterr().err
     # The remote wording is the pre-existing one, unchanged.
-    assert _existing_run_guard(paths, force=False) == (2, False)
+    assert _existing_run_guard(eng2, force=False) == (2, False)
     assert "'run --force' to discard it" in capsys.readouterr().err
 
-    paths.state_file.write_text('{"phase": "REVIEW", "run_id": ', encoding="utf-8")
-    assert _existing_run_guard(paths, force=False, command="local run") == (2, False)
+    eng.paths.state_file.write_text('{"phase": "REVIEW", "run_id": ', encoding="utf-8")
+    assert _existing_run_guard(eng2, force=False, command="local run") == (2, False)
     assert "'local run --force' to move it aside" in capsys.readouterr().err
 
 
@@ -2118,7 +2126,7 @@ def test_a_local_state_cannot_hold_a_github_only_phase(tmp_path):
         "mode": "LOCAL",
         "feature_spec_path": "docs/feature.md",
         "feature_spec_sha256": "a" * 64,
-        "local_workspace_policy": "v1 exclude=[] max_entries=50000 max_bytes=536870912",
+        "local_run_contract": sample_contract(),
         "phase": "REVIEW",
     }
     assert load_state_from(path, good).phase == Phase.REVIEW
@@ -2134,7 +2142,7 @@ def test_a_local_state_cannot_hold_a_github_only_phase(tmp_path):
         "phase": "READY_FOR_MERGE",
     }
     del remote["feature_spec_path"], remote["feature_spec_sha256"]
-    del remote["local_workspace_policy"]
+    del remote["local_run_contract"]
     assert load_state_from(path, remote).phase == Phase.READY_FOR_MERGE
 
 

@@ -31,13 +31,7 @@ from .errors import (
 from .local_workspace import init_feature_file
 from .redaction import redact, redact_argv
 from .replan_txn import ReplanTransaction
-from .state import (
-    AutoForgeState,
-    StatePaths,
-    load_state,
-    quarantine_state_file,
-    save_state,
-)
+from .state import AutoForgeState
 from .transitions import TERMINAL_PHASES, Phase, WorkflowMode
 
 
@@ -339,23 +333,23 @@ def _finish(engine: ControllerEngine, outcomes: list[StepOutcome], allow_merge: 
 
 
 def _existing_run_guard(
-    paths: StatePaths, force: bool, command: str = "run"
+    engine: ControllerEngine, force: bool, command: str = "run"
 ) -> tuple[int | None, bool]:
-    """Decide whether a fresh run may overwrite ``paths.state_file``.
+    """Decide whether a fresh run may overwrite the run at ``engine.paths``.
 
     Returns ``(exit_code_or_None, corrupt)``. Must be called with the
     controller lock held: a verdict taken before the lock could go stale.
+    The inspection goes through the engine's held state root -- the same
+    capability the first save and every later write will use -- so the
+    directory that is inspected is the directory that is written.
 
     ``command`` is the subcommand the operator actually typed, so the advice
     names a command that can be copied (`run --force`, `local run --force`)
     rather than a bare flag.
     """
-    # lexists, not exists: a dangling state.json symlink is still an entry
-    # that a fresh save would silently replace.
-    if not os.path.lexists(paths.state_file):
-        return None, False
+    paths = engine.paths
     try:
-        existing = load_state(paths.state_file)
+        existing = engine.existing_run()
     except StateError as exc:
         # Unreadable / foreign-protocol state is fatal: a fresh run must
         # never silently replace it (merge counters etc. would be lost).
@@ -369,6 +363,8 @@ def _existing_run_guard(
             )
             return 2, False
         return None, True
+    if existing is None:
+        return None, False
     if existing.phase not in TERMINAL_PHASES and not force:
         print(
             f"autoforge: error: existing run {existing.run_id} "
@@ -384,7 +380,6 @@ def cmd_run(args) -> int:
     cfg = _load_cfg(args)
     engine = _engine_for(args, cfg)
     engine.validate_config()
-    paths = engine.paths
 
     if args.dry_run:
         # Fully side-effect-free: in-memory state, plan printed, nothing written.
@@ -403,15 +398,15 @@ def cmd_run(args) -> int:
     # would let a second controller take over the repository and both would
     # then run agents and persist state over each other.
     with engine.locked():
-        rc, corrupt = _existing_run_guard(paths, args.force)
+        rc, corrupt = _existing_run_guard(engine, args.force)
         if rc is not None:
             return rc
         engine.new_run(args.epic, args.issue)
         assert engine.state is not None
         if corrupt:
-            moved = quarantine_state_file(paths.state_file)
+            moved = engine.quarantine_state()
             print(f"autoforge: moved unreadable state file aside: {moved}", file=sys.stderr)
-        save_state(engine.state, paths.state_file)
+        engine.save()
         outcomes = engine.run(max_steps=args.max_steps, dry_run=False, allow_merge=args.allow_merge)
     return _finish(engine, outcomes, args.allow_merge)
 
@@ -456,7 +451,6 @@ def cmd_local_run(args) -> int:
     """
     cfg = _load_cfg(args)
     engine = _local_engine_for(args, cfg)
-    paths = engine.paths
 
     if args.dry_run:
         # Fully side-effect-free: in-memory state, plan printed, nothing
@@ -472,16 +466,16 @@ def cmd_local_run(args) -> int:
     # One continuous lock over inspect -> decide -> first save -> execute,
     # for the same reasons as `cmd_run`.
     with engine.locked():
-        rc, corrupt = _existing_run_guard(paths, args.force, "local run")
+        rc, corrupt = _existing_run_guard(engine, args.force, "local run")
         if rc is not None:
             return rc
         engine.new_local_run(args.feature, allow_dirty=args.allow_dirty)
         engine.validate_config()
         assert engine.state is not None
         if corrupt:
-            moved = quarantine_state_file(paths.state_file)
+            moved = engine.quarantine_state()
             print(f"autoforge: moved unreadable state file aside: {moved}", file=sys.stderr)
-        save_state(engine.state, paths.state_file)
+        engine.save()
         outcomes = engine.run(max_steps=args.max_steps, dry_run=False)
     return _finish(engine, outcomes, allow_merge=False)
 

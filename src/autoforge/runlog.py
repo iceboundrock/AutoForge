@@ -171,11 +171,16 @@ class RunLogger:
         # A crash can publish a step directory before its journal line. Use
         # those names too, or the next invocation could reuse the directory
         # and overwrite a completed execution's artifacts.
+        # Only the run's own directory and its immediate children matter, so
+        # the walk descends no further: sibling runs and the step directories'
+        # contents are skipped, not listed.
         prefix = f"{self.run_id}/"
         for entry in logs.walk():
+            if entry.relpath != self.run_id:
+                entry.skip = True
             if not entry.relpath.startswith(prefix):
                 continue
-            step_name = entry.relpath[len(prefix) :].split("/", 1)[0]
+            step_name = entry.relpath[len(prefix) :]
             match = re.match(r"^(\d+)-", step_name)
             if match:
                 highest = max(highest, int(match.group(1)))
