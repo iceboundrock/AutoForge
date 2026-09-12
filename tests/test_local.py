@@ -598,7 +598,7 @@ def test_the_recorded_policy_is_canonical_not_the_operators_spelling(tmp_path):
     eng = make_local_engine(root, "features/add-filter.md", cfg=first)
     eng.save()
     recorded = eng.state.local_run_contract
-    assert "exclude=[.venv,build]" in recorded["workspace_policy"]["policy"]
+    assert recorded["workspace_policy"]["exclude"] == [".venv", "build"]
 
     reordered = default_config()
     reordered.local.exclude = [".venv/", "build", ".venv"]

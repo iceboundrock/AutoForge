@@ -124,6 +124,16 @@ with a persisted contract of every run-defining input and one gate that
 revalidates it, and §5.9 states what that contract can and cannot prove
 about identity across processes.
 
+Round 8 tested that formulation rather than adding to the class: R8-F1
+asked for the contract to be complete (validation commands, the fix
+budget, both roots and the snapshot algorithm, not only the exclusions
+and the bounds), and R8-F2 found that the policy's *encoding* was itself
+a rebinding — a comma-joined line under which `["a,b", "c"]` and
+`["a", "b,c"]` were one policy, so the gate could pass while the excluded
+set changed. The contract is one dataclass, so completeness is a field
+list rather than a search; the encoding is canonical JSON with every
+pattern its own string (§5.7).
+
 **The diagnosis, in one line:** classes A, B and F defined safety by
 *enumerating the bad cases*; classes C, D and E defined it by *closing the
 definition of the good case*. Only A, B and F kept producing new findings.
@@ -441,10 +451,16 @@ The closed formulation is `run_contract.py`:
   contract names, never written back) and DYNAMIC (fingerprints, gitdir
   inodes, which provider/model runs, cwd, counters — nothing a persisted
   safety judgment depends on).
-- **`WorkspacePolicy`** is persisted as canonical text plus its SHA-256
-  (`v2 snapshot=<tag> exclude=[...] max_entries=N max_bytes=N`): the text
-  says *what* changed, the digest makes the text tamper-evident, and the
-  version makes a pre-release `v1` policy a refusal rather than a guess.
+- **`WorkspacePolicy`** is persisted as its fields (`version`,
+  `snapshot_tag`, `exclude`, `max_entries`, `max_bytes`) plus the SHA-256
+  of their canonical JSON encoding (sorted keys, no whitespace, every
+  pattern its own JSON string). The fields say *what* changed, the digest
+  makes them tamper-evident, and the version makes a pre-release `v1`
+  policy a refusal rather than a guess. The encoding is structured rather
+  than a joined line because a comma is a legal character in a pattern:
+  the `v1` text `exclude=[a,b,c]` was one spelling for `["a,b", "c"]` and
+  `["a", "b,c"]`, so a resume could pass the gate while changing which
+  paths were excluded (round 8, R8-F2).
 - **`validate_local_run_contract(recorded, current)`** is the one gate. It
   runs inside `ControllerEngine.load()` *before* the state is bound to the
   engine — so `resume`, `step`, `status`, the dry-run plan and crash

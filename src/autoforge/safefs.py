@@ -719,6 +719,11 @@ class SafeRoot:
                 fh.write(data)
                 fh.flush()
                 os.fsync(fh.fileno())
+        except OSError as exc:
+            # The temporary is never published, so a failed write leaves
+            # neither a partial final name nor a stray temporary behind.
+            _quiet_unlink(parent, tmp)
+            raise StateError(f"cannot write {where}: {exc}") from exc
         except BaseException:
             _quiet_unlink(parent, tmp)
             raise

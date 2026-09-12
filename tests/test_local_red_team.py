@@ -22,6 +22,7 @@ from autoforge.config import default_config
 from autoforge.errors import ConfigurationError, StateError, VerificationError
 from autoforge.local_workspace import KIND_EXCLUDED, LocalWorkspace, init_feature_file
 from autoforge.safefs import SafeRoot, UnsafePathError
+from autoforge.state import Phase
 
 from .conftest import commit_all, write_feature
 
@@ -543,3 +544,59 @@ def test_a_state_directory_replaced_by_an_ordinary_directory_redirects_nothing(t
         before.st_ino,
         before.st_mtime_ns,
     )
+
+
+# -- 19 ------------------------------------------------------------------------
+def test_a_link_to_a_linked_worktrees_git_pointer_is_refused_before_and_after_binding(tmp_path):
+    """Invariant W in a linked worktree. R7-F2.
+
+    In a linked worktree the top-level `.git` is a *regular file* whose one
+    line names the real git directory. The walk excludes it (it is git's own
+    metadata), and excluded means *unbound*: its bytes are not in the
+    fingerprint. A reviewable link that resolves to it therefore exposes
+    bytes that can change -- re-pointed at another worktree's gitdir with the
+    same detached HEAD -- while the link text, and so the fingerprint, stands
+    still. The previous link-target check knew about git *directories* by
+    inode and let the pointer *file* through.
+
+    Two moments, because the initial binding and the re-binding after an
+    agent phase are different code paths with the same predicate: the link
+    exists before the run starts (refused at the first snapshot), and the
+    implementing agent creates it (refused at the snapshot that would have
+    bound its work for the reviewer).
+    """
+    from .conftest import make_local_engine
+    from .test_local import IMPL_FILE, impl_result, local_repo, review_result, scripted
+
+    main = local_repo(tmp_path / "main")
+    linked = Path(tmp_path) / "linked"
+    subprocess.run(["git", "-C", str(main), "worktree", "add", "-q", str(linked)], check=True)
+    assert (linked / ".git").is_file(), "not a linked worktree"
+
+    # Before binding: the snapshot refuses the link outright.
+    (linked / "src" / "peek").symlink_to("../.git")
+    with pytest.raises(VerificationError) as exc:
+        LocalWorkspace(workdir=linked).snapshot()
+    assert "src/peek" in str(exc.value) and "gitdir" in str(exc.value)
+    (linked / "src" / "peek").unlink()
+
+    # After binding: the run starts on a clean tree, the agent plants the link
+    # with its implementation, and the controller refuses to bind the result.
+    eng = make_local_engine(linked, linked / "features" / "add-filter.md", cfg=default_config())
+
+    def implement_and_plant(r):
+        (r / IMPL_FILE).write_text("def main():\n    return 1\n", encoding="utf-8")
+        (r / "src" / "peek").symlink_to("../.git")
+
+    eng.provider._handler = scripted(
+        eng,
+        linked,
+        [
+            (implement_and_plant, lambda e: impl_result()),
+            (None, lambda e: review_result(e.state.workspace_fingerprint)),
+        ],
+    )
+    with pytest.raises(VerificationError) as exc:
+        eng.run(max_steps=6, dry_run=False, allow_merge=False)
+    assert "src/peek" in str(exc.value) and "gitdir" in str(exc.value)
+    assert eng.state.phase != Phase.REVIEW, "the planted tree was bound for review"

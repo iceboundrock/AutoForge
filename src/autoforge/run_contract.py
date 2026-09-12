@@ -21,7 +21,7 @@ cannot converge: every un-enumerated input is the next finding.
 The closed formulation is a contract:
 
 * :class:`WorkspacePolicy` -- everything about the workspace reader that
-  shapes a snapshot, in one canonical, parseable, digested form.
+  shapes a snapshot, in one canonical, unambiguous, digested form.
 * :class:`LocalRunContract` -- every run-defining input, classified
   **IMMUTABLE** (persisted at creation; a later invocation must present the
   same value or the run refuses to continue).
@@ -88,15 +88,13 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 #: :meth:`LocalRunContract.from_dict`).
 CONTRACT_SCHEMA = 1
 
-#: Schema of the canonical workspace policy text. ``v1`` (the pre-release
-#: form that did not name the snapshot algorithm) is refused.
+#: Schema of the persisted workspace policy. ``v1`` (the pre-release form:
+#: one comma-joined line that did not name the snapshot algorithm and could
+#: not tell ``["a,b", "c"]`` from ``["a", "b,c"]``) is refused.
 POLICY_SCHEMA = "v2"
 
-_POLICY_RE = re.compile(
-    r"^(?P<schema>v[0-9]+) snapshot=(?P<tag>[A-Za-z0-9._-]+) "
-    r"exclude=\[(?P<exclude>[^\]]*)\] "
-    r"max_entries=(?P<entries>[0-9]+) max_bytes=(?P<bytes>[0-9]+)$"
-)
+_POLICY_FIELDS = ("snapshot_tag", "exclude", "max_entries", "max_bytes")
+_SNAPSHOT_TAG_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 def _digest(text: str) -> str:
@@ -138,51 +136,83 @@ class WorkspacePolicy:
         object.__setattr__(self, "exclude", tuple(sorted(set(self.exclude))))
 
     def canonical(self) -> str:
-        """Human-readable canonical text (sorted, normalised); what is digested."""
-        return (
-            f"{POLICY_SCHEMA} snapshot={self.snapshot_tag} exclude=[{','.join(self.exclude)}] "
-            f"max_entries={self.max_entries} max_bytes={self.max_bytes}"
+        """The one canonical spelling of this policy; what is digested.
+
+        A JSON object with sorted keys and no whitespace. Every exclusion
+        pattern is its own JSON string, so the encoding is unambiguous for
+        any pattern the loader accepts: a comma, a bracket or a quote inside
+        a pattern is quoted, never a delimiter. (The pre-release ``v1`` text
+        joined the patterns with commas, and ``["a,b", "c"]`` and
+        ``["a", "b,c"]`` were one policy under it.)
+        """
+        return json.dumps(
+            {
+                "version": POLICY_SCHEMA,
+                "snapshot_tag": self.snapshot_tag,
+                "exclude": list(self.exclude),
+                "max_entries": self.max_entries,
+                "max_bytes": self.max_bytes,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
         )
 
     def digest(self) -> str:
         return _digest(self.canonical())
 
-    @classmethod
-    def parse(cls, text: str) -> WorkspacePolicy:
-        """Strictly parse canonical text (StateError on any other shape)."""
-        m = _POLICY_RE.match(text) if isinstance(text, str) else None
-        if m is None:
-            raise StateError(f"workspace policy text is not canonical: {text!r}")
-        if m.group("schema") != POLICY_SCHEMA:
-            raise StateError(
-                f"workspace policy schema {m.group('schema')!r} is not {POLICY_SCHEMA!r}"
-            )
-        raw = m.group("exclude")
-        exclude = tuple(raw.split(",")) if raw else ()
-        if any(not p or "," in p for p in exclude) or list(exclude) != sorted(set(exclude)):
-            raise StateError(f"workspace policy exclusions are not canonical: {raw!r}")
-        return cls(
-            exclude=exclude,
-            max_entries=int(m.group("entries")),
-            max_bytes=int(m.group("bytes")),
-            snapshot_tag=m.group("tag"),
-        )
-
     def to_dict(self) -> dict:
-        return {"version": POLICY_SCHEMA, "policy": self.canonical(), "digest": self.digest()}
+        """The persisted form: the fields, readable as they are, plus the digest."""
+        return {
+            "version": POLICY_SCHEMA,
+            "snapshot_tag": self.snapshot_tag,
+            "exclude": list(self.exclude),
+            "max_entries": self.max_entries,
+            "max_bytes": self.max_bytes,
+            "digest": self.digest(),
+        }
 
     @classmethod
     def from_dict(cls, data: Any) -> WorkspacePolicy:
-        """Decode the persisted form; the digest must match the text it covers."""
-        if not isinstance(data, dict) or set(data) != {"version", "policy", "digest"}:
-            raise StateError("workspace policy must be an object with version, policy, digest")
+        """Strictly decode the persisted form; the digest must match the fields.
+
+        The fields are required to be *already canonical* (sorted, unique,
+        loader-normalised patterns): a policy the controller wrote is, and
+        one that is not was written by something else.
+        """
+        expected = {"version", "digest", *_POLICY_FIELDS}
+        if not isinstance(data, dict) or set(data) != expected:
+            raise StateError(
+                "workspace policy must be an object with exactly the fields "
+                + ", ".join(sorted(expected))
+            )
         if data["version"] != POLICY_SCHEMA:
             raise StateError(
-                f"workspace policy version {data['version']!r} is not {POLICY_SCHEMA!r}"
+                f"workspace policy version {data['version']!r} is not {POLICY_SCHEMA!r}; "
+                "this run was created by a different controller release and is not "
+                "migrated -- start a new run"
             )
-        policy = cls.parse(data["policy"])
+        tag = data["snapshot_tag"]
+        if not isinstance(tag, str) or not _SNAPSHOT_TAG_RE.match(tag):
+            raise StateError(f"workspace policy snapshot tag is not usable: {tag!r}")
+        exclude = data["exclude"]
+        if (
+            not isinstance(exclude, list)
+            or not all(isinstance(p, str) and p and "\0" not in p for p in exclude)
+            or exclude != sorted(set(exclude))
+        ):
+            raise StateError(f"workspace policy exclusions are not canonical: {exclude!r}")
+        bounds = {}
+        for name in ("max_entries", "max_bytes"):
+            value = data[name]
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise StateError(f"workspace policy field {name!r} must be a non-negative integer")
+            bounds[name] = value
+        if not isinstance(data["digest"], str):
+            raise StateError("workspace policy digest must be a string")
+        policy = cls(exclude=tuple(exclude), snapshot_tag=tag, **bounds)
         if data["digest"] != policy.digest():
-            raise StateError("workspace policy digest does not match its text")
+            raise StateError("workspace policy digest does not match its fields")
         return policy
 
     def drift(self, current: WorkspacePolicy) -> list[str]:
