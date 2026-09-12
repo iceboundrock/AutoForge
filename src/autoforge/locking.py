@@ -1,8 +1,10 @@
 """Repository-level locking: at most one controller per repository.
 
-Implemented with POSIX flock(2) on ``<git common dir>/autoforge/controller.lock``
+Implemented with POSIX flock(2) on the git common directory descriptor
 (LOCK_EX | LOCK_NB). A second instance fails fast with LockError instead of
-operating concurrently on the same repository.
+operating concurrently on the same repository. ``autoforge/controller.lock``
+remains as a PID record, but is not the lock inode: that keeps a replacement of
+the ``autoforge`` directory from creating a second lock domain.
 
 The lock is keyed by the *repository identity*, not by a caller-selectable
 path: :func:`repository_lock_path` asks ``git rev-parse --git-common-dir``
@@ -24,8 +26,10 @@ opened as a directory descriptor; the ``autoforge`` directory is created with
 ``fstat``-checked, so an ``autoforge`` entry that is a symbolic link or not a
 directory is refused with LockError before ``controller.lock`` is touched;
 ``controller.lock`` in turn is opened relative to the validated directory
-descriptor (``dir_fd``) with ``O_NOFOLLOW``, so a parent replaced between the
-two opens cannot redirect the lock either. The lock entry must be a regular
+descriptor (``dir_fd``) with ``O_NOFOLLOW``, so a parent replacement cannot
+redirect the PID record. The lock itself is taken on the already-open git
+common directory descriptor, whose inode is shared by all such attempts. The
+lock entry must be a regular
 file with exactly one name (``st_nlink == 1``): a ``controller.lock`` that is
 a symbolic link, FIFO, socket, device or directory, or a hard link sharing
 its inode with another file, is refused with LockError before anything is
@@ -37,12 +41,10 @@ the way out.
 Tampering model: these checks validate the entries *as found* (damaged or
 tampered at rest). They are taken on open descriptors, but a writer with
 write access to the git directory who races between the ``fstat`` and the
-PID write (for example by adding a hard link in that window), or who
-replaces the ``autoforge`` directory with another directory between two
-controller invocations so that they lock different inodes, can still defeat
-them. Such a writer has the controller's own privileges and is outside the
-trust boundary the lock defends; the git directory is assumed to be writable
-only by the operating user.
+PID write (for example by adding a hard link in that window) can still alter
+the record. The lock domain itself remains the common-directory inode, so
+replacing ``autoforge`` cannot make two controllers acquire independent locks.
+The git directory is assumed to be writable only by the operating user.
 """
 
 from __future__ import annotations
@@ -57,7 +59,7 @@ from types import TracebackType
 
 from .errors import ExecutionError, LockError
 from .executor import ExecutionRequest, ExecutionResult, execute
-from .state import entry_kind
+from .safefs import entry_kind
 
 LOCK_DIRNAME = "autoforge"  # inside the git common dir
 LOCK_FILENAME = "controller.lock"
@@ -131,6 +133,8 @@ class ControllerLock:
     def __init__(self, lock_path: str | Path) -> None:
         self.lock_path = Path(lock_path)
         self._fd: int | None = None
+        self._pid_fd: int | None = None
+        self._base_fd: int | None = None
 
     def _refuse(self, reason: str) -> LockError:
         return LockError(f"cannot use {self.lock_path} as the controller lock: {reason}")
@@ -179,16 +183,20 @@ class ControllerLock:
                         f"its directory {lock_dir} is {self._describe_dir_entry(base_fd)}"
                     ) from exc
                 raise self._refuse(f"cannot open its directory {lock_dir}: {exc}") from exc
-        finally:
+        except BaseException:
             os.close(base_fd)
+            raise
         try:
             st = os.fstat(dir_fd)
         except OSError as exc:
             os.close(dir_fd)
+            os.close(base_fd)
             raise self._refuse(f"cannot stat its directory {lock_dir}: {exc}") from exc
         if not stat.S_ISDIR(st.st_mode):
             os.close(dir_fd)
+            os.close(base_fd)
             raise self._refuse(f"its directory {lock_dir} is not a directory")
+        self._base_fd = base_fd
         return dir_fd
 
     def _open(self) -> int:
@@ -212,22 +220,36 @@ class ControllerLock:
                 if exc.errno == errno.EISDIR:
                     raise self._refuse("it is a directory, not a regular file") from exc
                 raise self._refuse(f"cannot open it: {exc}") from exc
+        except BaseException:
+            if self._base_fd is not None:
+                os.close(self._base_fd)
+                self._base_fd = None
+            raise
         finally:
             os.close(dir_fd)
         try:
             st = os.fstat(fd)
         except OSError as exc:
             os.close(fd)
+            if self._base_fd is not None:
+                os.close(self._base_fd)
+                self._base_fd = None
             raise self._refuse(f"cannot stat it: {exc}") from exc
         kind = entry_kind(st.st_mode)
         if kind is not None:
             os.close(fd)
+            if self._base_fd is not None:
+                os.close(self._base_fd)
+                self._base_fd = None
             raise self._refuse(f"it is a {kind}, not a regular file")
         if st.st_nlink != 1:
             # A hard link passes O_NOFOLLOW and S_ISREG but shares its inode
             # with another name: truncating / writing the PID would modify
             # that other file. Refuse; nothing has been written.
             os.close(fd)
+            if self._base_fd is not None:
+                os.close(self._base_fd)
+                self._base_fd = None
             raise self._refuse(
                 f"it has {st.st_nlink} hard links, so it shares its inode with "
                 "another file; remove it and re-run (the other file has not been touched)"
@@ -235,10 +257,19 @@ class ControllerLock:
         return fd
 
     def acquire(self) -> ControllerLock:
-        fd = self._open()
+        if self.held:
+            raise self._refuse("it is already held by this controller")
+        pid_fd = self._open()
+        base_fd = self._base_fd
+        self._base_fd = None
+        if base_fd is None:  # pragma: no cover - _open always retains the base
+            os.close(pid_fd)
+            raise self._refuse("its repository directory descriptor was lost")
         try:
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                # Lock the stable repository directory inode, not the PID
+                # record below `autoforge`, which an agent can replace.
+                fcntl.flock(base_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
                 raise LockError(
                     f"another AutoForge controller holds {self.lock_path} — "
@@ -248,14 +279,16 @@ class ControllerLock:
                 raise self._refuse(f"flock failed: {exc}") from exc
             try:
                 # Replace, do not append: the file holds exactly the current PID.
-                os.ftruncate(fd, 0)
-                os.write(fd, f"{os.getpid()}\n".encode("ascii"))
+                os.ftruncate(pid_fd, 0)
+                os.write(pid_fd, f"{os.getpid()}\n".encode("ascii"))
             except OSError as exc:
                 raise self._refuse(f"cannot record the holder PID: {exc}") from exc
         except BaseException:
-            os.close(fd)  # also drops the flock if it was taken
+            os.close(pid_fd)
+            os.close(base_fd)  # also drops the flock if it was taken
             raise
-        self._fd = fd
+        self._fd = base_fd
+        self._pid_fd = pid_fd
         return self
 
     def release(self) -> None:
@@ -265,6 +298,9 @@ class ControllerLock:
                 fcntl.flock(fd, fcntl.LOCK_UN)
             finally:
                 os.close(fd)
+        if self._pid_fd is not None:
+            pid_fd, self._pid_fd = self._pid_fd, None
+            os.close(pid_fd)
 
     @property
     def held(self) -> bool:

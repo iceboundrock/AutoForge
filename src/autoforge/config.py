@@ -36,12 +36,24 @@ from pathlib import Path
 
 from . import __prompt_version__
 from .errors import ConfigurationError
+from .local_workspace import (
+    DEFAULT_MAX_BYTES,
+    DEFAULT_MAX_ENTRIES,
+    normalize_exclude_pattern,
+)
 
 CONFIG_VERSION = 1
 
 DEFAULT_TIMEOUT_SECONDS = 1800
 
 KNOWN_PROVIDERS = ("claude", "opencode", "scripted")
+
+
+# Where a REMOTE run keeps its state, relative to the invocation directory.
+# A LOCAL run defaults elsewhere -- see
+# :meth:`autoforge.engine.ControllerEngine.bind_local_state_dir` -- because its
+# fingerprint covers the whole working tree and runtime state must not be in it.
+DEFAULT_STATE_DIR = ".autoforge"
 
 
 @dataclass
@@ -193,9 +205,58 @@ class WorkflowConfig:
 
 
 @dataclass
+class LocalConfig:
+    """LOCAL-mode settings (``local:`` in the config file).
+
+    ``validation_commands`` are **controller-owned** checks: argv arrays, run
+    through :mod:`autoforge.executor` with no shell, after every local
+    implementation and fix phase. A non-zero exit means the phase is not
+    successfully verified. There is no automatic build-system detection: what
+    is not configured here is not run.
+
+    ``exclude`` is the *only* way to remove anything from the workspace
+    snapshot that binds a LOCAL review (the repository's own git directory
+    aside, which is identified by inode). A LOCAL run hashes every entry of
+    the working tree, ignored files included, because the alternative is
+    letting a ``.gitignore`` edit decide which bytes a review covers. That
+    completeness has a cost the operator has to pay explicitly: build output,
+    virtual environments and caches are rewritten by the very validation
+    commands the controller runs, so they must be declared unreviewed rather
+    than silently tolerated. Each pattern is matched component-wise against
+    repository-relative paths; ``*`` and ``?`` match within one component and
+    ``**`` spans any number of them. The patterns are hashed into the
+    fingerprint and named to the review agent in its prompt, so "what was not
+    reviewed" is part of the review's identity rather than a local detail.
+
+    ``max_workspace_entries`` / ``max_workspace_bytes`` bound the walk. They
+    are refusal thresholds, not sampling thresholds: exceeding one fails the
+    run with the largest subtrees named, because a fingerprint that fell back
+    to metadata for the rest would accept an equal-sized replacement with a
+    restored mtime.
+    """
+
+    # Where ``autoforge local init`` writes feature specifications. Project
+    # data, never under the runtime state directory.
+    feature_dir: str = "features"
+    validation_commands: list[list[str]] = field(default_factory=list)
+    # Local review/fix bound: the initial REVIEW, at most this many FIX
+    # rounds, then a final REVIEW. 0 disables FIX entirely (one review pass).
+    max_fix_rounds: int = 1
+    # Declared-unreviewed regions of the working tree (see the class docstring).
+    exclude: list[str] = field(default_factory=list)
+    max_workspace_entries: int = DEFAULT_MAX_ENTRIES
+    max_workspace_bytes: int = DEFAULT_MAX_BYTES
+
+    @property
+    def max_review_rounds(self) -> int:
+        """Review passes a local run may complete (fix rounds + the first)."""
+        return self.max_fix_rounds + 1
+
+
+@dataclass
 class AutoForgeConfig:
     version: int = CONFIG_VERSION
-    state_dir: str = ".autoforge"
+    state_dir: str = DEFAULT_STATE_DIR
     prompt_version: str = __prompt_version__
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
@@ -203,6 +264,7 @@ class AutoForgeConfig:
     merge: MergeConfig = field(default_factory=MergeConfig)
     review: ReviewConfig = field(default_factory=ReviewConfig)
     workflow: WorkflowConfig = field(default_factory=WorkflowConfig)
+    local: LocalConfig = field(default_factory=LocalConfig)
     profiles: dict[str, ProfileConfig] = field(default_factory=dict)
 
     def profile(self, name: str) -> ProfileConfig:
@@ -366,6 +428,39 @@ def _as_str_list(raw: object, source: str, key: str) -> list[str]:
     return out
 
 
+def _as_argv_list(raw: object, source: str, key: str) -> list[list[str]]:
+    """A list of argv arrays -- never a shell string.
+
+    ``[["./gradlew", "test"]]`` is accepted; ``["./gradlew test"]`` is not.
+    A command line is not parsed, split or handed to a shell anywhere in
+    AutoForge, so accepting a string here would create the one place where a
+    quoting bug turns into arbitrary command execution.
+    """
+    if raw is None:
+        raise ConfigurationError(
+            f"{source}: {key} is null; write [] to set it empty deliberately, "
+            "or remove the key to keep the default"
+        )
+    if isinstance(raw, str) or not isinstance(raw, list):
+        raise ConfigurationError(f"{source}: {key} must be a list of argv arrays, got {raw!r}")
+    out: list[list[str]] = []
+    for index, entry in enumerate(raw):
+        if isinstance(entry, str) or not isinstance(entry, list) or not entry:
+            raise ConfigurationError(
+                f"{source}: {key}[{index}] must be a non-empty argv array such as "
+                f'["pytest", "-q"] -- a shell command string is never accepted, got {entry!r}'
+            )
+        argv: list[str] = []
+        for item in entry:
+            if not isinstance(item, str) or not item.strip():
+                raise ConfigurationError(
+                    f"{source}: {key}[{index}] must contain non-empty strings, got {item!r}"
+                )
+            argv.append(item)
+        out.append(argv)
+    return out
+
+
 def _as_bool(raw: object, source: str, key: str) -> bool:
     """Accept only a real boolean — never coerce strings like "false" to True."""
     if isinstance(raw, bool):
@@ -394,9 +489,20 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
     if not isinstance(exe, dict):
         raise ConfigurationError(f"{source}: 'execution' must be a mapping")
     if "default_timeout_seconds" in exe:
-        base.execution.default_timeout_seconds = _as_int(
+        timeout = _as_int(
             exe["default_timeout_seconds"], source, "execution.default_timeout_seconds"
         )
+        if timeout <= 0:
+            # The executor treats a non-positive timeout as "no timeout at
+            # all", and this value is what controller-owned work (a LOCAL
+            # validation command, a profile that does not override it) runs
+            # under. An unbounded subprocess would hold the repository lock
+            # forever, so the bound is required rather than optional.
+            raise ConfigurationError(
+                f"{source}: 'execution.default_timeout_seconds' must be > 0, got {timeout} "
+                "(a non-positive value would disable the timeout entirely)"
+            )
+        base.execution.default_timeout_seconds = timeout
     if "max_correction_attempts" in exe:
         base.execution.max_correction_attempts = _as_int(
             exe["max_correction_attempts"], source, "execution.max_correction_attempts"
@@ -498,6 +604,48 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
         raise ConfigurationError(
             f"{source}: 'review.replan.hard_threshold' must be <= 'workflow.max_review_rounds'"
         )
+    local = data.get("local", {}) or {}
+    if not isinstance(local, dict):
+        raise ConfigurationError(f"{source}: 'local' must be a mapping")
+    if "feature_dir" in local:
+        feature_dir = str(local["feature_dir"]).strip()
+        if not feature_dir:
+            raise ConfigurationError(f"{source}: 'local.feature_dir' must not be empty")
+        base.local.feature_dir = feature_dir
+    if "validation_commands" in local:
+        base.local.validation_commands = _as_argv_list(
+            local["validation_commands"], source, "local.validation_commands"
+        )
+    if "max_fix_rounds" in local:
+        value = _as_int(local["max_fix_rounds"], source, "local.max_fix_rounds")
+        if value < 0:
+            raise ConfigurationError(f"{source}: 'local.max_fix_rounds' must be >= 0, got {value}")
+        base.local.max_fix_rounds = value
+    if "exclude" in local:
+        raw = local["exclude"]
+        if isinstance(raw, str) or not isinstance(raw, list):
+            raise ConfigurationError(
+                f"{source}: 'local.exclude' must be a list of path patterns, e.g. "
+                "['.venv', '**/__pycache__']"
+            )
+        patterns: list[str] = []
+        for item in raw:
+            try:
+                patterns.append(normalize_exclude_pattern(item))
+            except ConfigurationError as exc:
+                raise ConfigurationError(f"{source}: {exc}") from None
+        base.local.exclude = sorted(dict.fromkeys(patterns))
+    for name, attr, minimum in (
+        ("max_workspace_entries", "max_workspace_entries", 1),
+        ("max_workspace_bytes", "max_workspace_bytes", 1),
+    ):
+        if name in local:
+            value = _as_int(local[name], source, f"local.{name}")
+            if value < minimum:
+                raise ConfigurationError(
+                    f"{source}: 'local.{name}' must be >= {minimum}, got {value}"
+                )
+            setattr(base.local, attr, value)
     profiles = data.get("profiles", {}) or {}
     if not isinstance(profiles, dict):
         raise ConfigurationError(f"{source}: 'profiles' must be a mapping")

@@ -74,7 +74,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from . import __prompt_version__
-from .config import AutoForgeConfig, validate_required_profiles
+from .config import DEFAULT_STATE_DIR, AutoForgeConfig, validate_required_profiles
 from .errors import (
     ConfigurationError,
     ControlResultError,
@@ -89,7 +89,15 @@ from .errors import (
     StateTransitionError,
     VerificationError,
 )
+from .executor import ExecutionRequest, execute
 from .github import GitHubClient, IssueInfo, PRInfo, build_merge_argv
+from .local_workspace import (
+    FeatureSpec,
+    LocalWorkspace,
+    WorkspaceSnapshot,
+    read_feature_spec,
+    verify_feature_spec_unchanged,
+)
 from .locking import ControllerLock, repository_lock_path
 from .loop_guard import (
     RESULT_CLEAN,
@@ -102,9 +110,19 @@ from .loop_guard import (
     step_budget_reason,
     truncated_evidence_rounds,
 )
-from .profiles import profile_for_phase
-from .prompts import TEMPLATE_FILES, load_template, render, render_phase
+from .profiles import local_required_profiles, profile_for_phase
+from .prompts import (
+    COMMON_TEMPLATE,
+    LOCAL_COMMON_TEMPLATE,
+    TEMPLATE_FILES,
+    escape_inline,
+    fenced_untrusted_block,
+    load_template,
+    render,
+    render_phase,
+)
 from .providers import AgentExecutionResult, AgentRequest, ProviderRegistry
+from .redaction import redact, redact_argv, redact_dict
 from .replan import HistoricalReviewCollector, ReplanDecision, evaluate_replan_policy
 from .replan_txn import (
     Disposition,
@@ -125,18 +143,35 @@ from .replan_txn import (
 from .result_parser import (
     AnalyzeExecuteResult,
     FixResult,
+    LocalAnalyzeExecuteResult,
+    LocalFixResult,
+    LocalReviewResult,
     ReplanReexecuteResult,
     ReviewResult,
     UpdateEpicResult,
     parse_control_result,
 )
+from .run_contract import LocalRunContract, validate_local_run_contract
 from .runlog import ExecutionRecord, RunLogger
-from .state import AutoForgeState, StatePaths, load_state, save_state, utcnow_iso
+from .safefs import SafeRoot
+from .state import (
+    STATE_FILENAME,
+    AutoForgeState,
+    StatePaths,
+    load_state,
+    no_state_error,
+    quarantine_state_file,
+    save_state,
+    utcnow_iso,
+)
 from .transitions import (
-    LEGAL_EDGES,
+    LOCAL_WRITE_PHASES,
     STOP_PHASES,
     TERMINAL_PHASES,
     Phase,
+    WorkflowMode,
+    edges_for,
+    stop_phases_for,
     validate_transition,
 )
 from .validation import (
@@ -145,6 +180,18 @@ from .validation import (
     parse_pr_url,
     validate_epic_and_issue,
 )
+
+# How many times one LOCAL phase entry may launch a write-capable agent
+# before the run blocks. Every launch is charged and checkpointed before the
+# agent starts (see ``AutoForgeState.local_pending_phase``) -- the phase
+# entry's first launch and each correction retry after a malformed
+# CONTROL_RESULT alike (R9-F3) -- so a crash, a malformed result or a failing
+# validation command all leave a record that ``resume`` continues from, and
+# ``execution.max_correction_attempts`` can never multiply this bound.
+# Without it, a phase that can never be verified would be re-invoked by every
+# ``resume`` forever.
+MAX_LOCAL_PHASE_ATTEMPTS = 3
+
 
 REQUIRED_PROFILES = [
     "analyze_execute",
@@ -185,6 +232,19 @@ _REVIEW_HEADING_RE = re.compile(r"^#\s*AI Code Review\s*[—–-]+\s*Round\s+(\d
 def generate_run_id() -> str:
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     return f"af-{stamp}-{secrets.token_hex(3)}"
+
+
+# A local run never creates a PR or an Issue, so a phase whose only purpose
+# is a GitHub side effect has no local template at all.
+LOCAL_PHASE_TEMPLATE: dict[Phase, str | None] = {
+    Phase.INITIALIZING: None,  # deterministic: freeze the spec, read the tree
+    Phase.ANALYZE_EXECUTE: "local_analyze_execute.md",
+    Phase.REVIEW: "local_review.md",
+    Phase.FIX: "local_fix.md",
+    Phase.DONE: None,
+    Phase.BLOCKED: None,
+    Phase.FAILED: None,
+}
 
 
 PHASE_TEMPLATE: dict[Phase, str | None] = {
@@ -234,6 +294,40 @@ class StepOutcome:
     message: str = ""
 
 
+def local_state_paths(
+    workspace: LocalWorkspace,
+    *,
+    explicit: str | Path | None = None,
+    configured: str | Path | None = None,
+) -> StatePaths:
+    """Where a LOCAL run keeps its runtime state.
+
+    A LOCAL run fingerprints *every* entry in the working tree, so its own
+    state directory cannot live there: it would invalidate its own fingerprint
+    on every step, or have to be carved out of it by path -- a region an agent
+    could then write into without moving the fingerprint. The default is
+    therefore ``<git dir>/autoforge/state``. The git directory is already
+    outside the reviewed tree for reasons that have nothing to do with
+    AutoForge, and it is the natural anchor: it is the deepest directory in
+    the chain the controller did not create, so every component below it is
+    opened ``O_NOFOLLOW`` from a descriptor (see
+    :class:`autoforge.state.StatePaths`).
+
+    ``explicit`` is ``--state-dir`` and is honoured as given. ``configured``
+    is ``config.state_dir``, which is REMOTE's setting: a value left at its
+    default is not a choice, and anything else is. Either way the caller
+    checks the result against the working tree; this function only decides
+    *which* directory is meant.
+    """
+    chosen = explicit or (
+        configured if configured and str(configured) != DEFAULT_STATE_DIR else None
+    )
+    if chosen is not None:
+        return StatePaths.from_state_dir(chosen)
+    git_dir = workspace.git_dirs()[0]
+    return StatePaths.from_state_dir(git_dir / "autoforge" / "state", anchor=git_dir)
+
+
 class ControllerEngine:
     def __init__(
         self,
@@ -245,13 +339,31 @@ class ControllerEngine:
         providers: ProviderRegistry | None = None,
     ) -> None:
         self.config = config
-        self.paths = StatePaths.from_state_dir(state_dir or config.state_dir or ".autoforge")
+        self._paths = StatePaths.from_state_dir(state_dir or config.state_dir or ".autoforge")
+        # The state directory as a capability, opened once per run by
+        # :meth:`state_root` and held for the engine's lifetime: every
+        # controller read and write of run state goes through this descriptor,
+        # and the pathname is only ever *re-verified* against it, never
+        # re-resolved into a new binding.
+        self._state_root: SafeRoot | None = None
         self.workdir = str(workdir)
         self.providers = providers or ProviderRegistry(runner=runner)
-        self.github = github or GitHubClient(
-            gh_command=config.github.command,
-            timeout_seconds=config.github.timeout_seconds,
-        )
+        # The GitHub client is built on first *use*, never on construction: a
+        # LOCAL run must reach DONE without a GitHubClient ever existing, and
+        # `local doctor` must work with no gh binary and no authentication.
+        # An injected client (tests) is used as given.
+        self._github = github
+        self._runner = runner
+        self._workspace: LocalWorkspace | None = None
+        # The workspace snapshot bound immediately before a LOCAL agent
+        # phase. The prompt is rendered from it, so the fingerprint the
+        # reviewer is told to report is exactly the one persisted in state.
+        self._local_bound_snapshot: WorkspaceSnapshot | None = None
+        # True while the LOCAL phase being invoked is a *retry* of an
+        # invocation that was already launched once (see
+        # ``AutoForgeState.local_pending_phase``); the prompt then tells the
+        # agent that work from the earlier attempt may already be present.
+        self._local_resumed_invocation = False
         self.state: AutoForgeState | None = None
         # Set by locked(): the controller lock held for a whole command.
         self._lock: ControllerLock | None = None
@@ -261,6 +373,119 @@ class ControllerEngine:
         # True while self.state is a snapshot of state.json taken by load();
         # such a snapshot is re-read under a self-acquired execution lock.
         self._state_from_disk = False
+
+    # -- the state directory as a held capability --------------------------
+    @property
+    def paths(self) -> StatePaths:
+        """Where this engine's run keeps its state (see :class:`StatePaths`)."""
+        return self._paths
+
+    @paths.setter
+    def paths(self, value: StatePaths) -> None:
+        # Re-pointing the engine at another location is a new binding, so a
+        # capability held on the old one is released rather than carried.
+        if self._state_root is not None:
+            self._state_root.close()
+            self._state_root = None
+        self._paths = value
+
+    def state_root(self, *, create: bool = True) -> SafeRoot:
+        """The run's state directory as a capability (owned by the engine).
+
+        Opened once -- the only pathname resolution of the state directory
+        this engine ever performs -- and held thereafter. Every later call
+        proves the pathname still names the held directory
+        (:meth:`SafeRoot.verify_identity`) and returns the same descriptor,
+        so a state directory replaced mid-run (by a symbolic link, a prepared
+        ordinary directory, a rename) is a refusal and never a redirection:
+        no write, no log and no read of ``state.json`` can reach the
+        replacement, because nothing re-resolves the name into a binding.
+
+        ``create=False`` raises ``FileNotFoundError`` when the directory does
+        not exist (reads never create it).
+        """
+        if self._state_root is None:
+            self._state_root = self._paths.open_root(create=create)
+        else:
+            self._state_root.verify_identity(role="state directory")
+        return self._state_root
+
+    def close(self) -> None:
+        """Release the held state-directory capability (idempotent)."""
+        if self._state_root is not None:
+            self._state_root.close()
+            self._state_root = None
+
+    @property
+    def github(self) -> GitHubClient:
+        """The GitHub client, constructed on first use (never in LOCAL mode)."""
+        if self._github is None:
+            self._github = GitHubClient(
+                gh_command=self.config.github.command,
+                timeout_seconds=self.config.github.timeout_seconds,
+            )
+        return self._github
+
+    @property
+    def mode(self) -> WorkflowMode:
+        """The workflow of the loaded run (REMOTE before any state exists)."""
+        return self.state.mode if self.state is not None else WorkflowMode.REMOTE
+
+    def workspace(self) -> LocalWorkspace:
+        """The local working-tree reader (LOCAL mode's source of truth).
+
+        Built from the *current* configuration: for a new run that is the
+        definition being created, and for a loaded run it is what the
+        contract gate (:meth:`local_contract`) compares against the
+        persisted definition before any phase executes.
+        """
+        if self._workspace is None:
+            local = self.config.local
+            self._workspace = LocalWorkspace(
+                workdir=self.workdir,
+                runner=self._runner or execute,
+                exclude=local.exclude,
+                max_entries=local.max_workspace_entries,
+                max_bytes=local.max_workspace_bytes,
+            )
+        return self._workspace
+
+    # -- the LOCAL run contract ------------------------------------------
+    def _invocation_contract(self) -> LocalRunContract:
+        """What *this* invocation would define a LOCAL run as (never persisted twice)."""
+        return LocalRunContract.from_config(self.config, self.workspace(), self.paths)
+
+    def local_contract(self) -> LocalRunContract:
+        """The loaded LOCAL run's persisted contract, proven to match this invocation.
+
+        This is the one gate between "state was read" and "anything is
+        executed or decided" (see :mod:`autoforge.run_contract`): it runs at
+        :meth:`load`, at the top of every LOCAL step, and at every use of a
+        run-defining value, because execution reads such values *from the
+        contract this returns* rather than from the configuration. Drift is a
+        VerificationError, not BLOCKED: the operator changed a setting (or
+        moved the checkout), and both restoring it and starting a new run
+        under the new one must stay possible. Nothing is persisted, so the
+        run is exactly as resumable afterwards as it was before.
+        """
+        state = self._require_state()
+        return validate_local_run_contract(state.local_contract(), self._invocation_contract())
+
+    def bind_local_state_dir(self, explicit: str | Path | None = None) -> None:
+        """Point :attr:`paths` at where this LOCAL run keeps its runtime state.
+
+        See :func:`local_state_paths` for the rule. The resolved directory is
+        checked against the working tree here rather than at first write: a
+        state directory inside the reviewed tree is refused, never quietly
+        excluded from the fingerprint.
+        """
+        ws = self.workspace()
+        self.paths = local_state_paths(ws, explicit=explicit, configured=self.config.state_dir)
+        ws.check_state_dir_location(self.paths.state_dir)
+
+    def local_state_paths(self) -> StatePaths:
+        """LOCAL mode's *default* state location, ignoring any configured one."""
+        return local_state_paths(self.workspace())
 
     # -- state handling --------------------------------------------------
     def new_run(self, epic_url: str, issue_url: str) -> AutoForgeState:
@@ -279,10 +504,122 @@ class ControllerEngine:
         self._state_from_disk = False
         return self.state
 
-    def load(self) -> AutoForgeState:
-        self.state = load_state(self.paths.state_file)
-        self._state_from_disk = True
+    def new_local_run(
+        self, feature_spec_path: str | Path, allow_dirty: bool = False
+    ) -> AutoForgeState:
+        """Create a LOCAL run frozen to ``feature_spec_path``.
+
+        Resolves and hashes the specification, records the repository's HEAD
+        and the current working-tree state, and applies the dirty-tree policy
+        (see :meth:`_check_baseline_clean`). Nothing is written to disk here;
+        the caller persists the state under the controller lock.
+        """
+        ws = self.workspace()
+        ws.check_state_dir_location(self.paths.state_dir)
+        spec = read_feature_spec(ws, feature_spec_path)
+        dirty = self._check_baseline_clean(ws.dirty_paths(), spec, allow_dirty)
+        snapshot = ws.snapshot()
+        # The one moment the current configuration *defines* the run. From
+        # here on it is only ever compared against this.
+        contract = self._invocation_contract()
+        now = utcnow_iso()
+        self.state = AutoForgeState(
+            run_id=generate_run_id(),
+            mode=WorkflowMode.LOCAL,
+            phase=Phase.INITIALIZING,
+            feature_spec_path=spec.relative_path,
+            feature_spec_sha256=spec.sha256,
+            base_head_sha=snapshot.head_sha,
+            base_branch=snapshot.branch,
+            local_run_contract=contract.to_dict(),
+            workspace_fingerprint=snapshot.fingerprint,
+            baseline_dirty_paths=dirty,
+            created_at=now,
+            updated_at=now,
+            prompt_version=contract.prompt_version,
+        )
+        self._state_from_disk = False
         return self.state
+
+    @staticmethod
+    def _check_baseline_clean(
+        dirty_paths: list[str], spec: FeatureSpec, allow_dirty: bool
+    ) -> list[str]:
+        """Dirty-working-tree policy for a new local run.
+
+        v1 is deliberately strict: the tree must be clean apart from the
+        feature specification itself (which is typically brand new and
+        uncommitted). The controller does not try to tell an operator's
+        unrelated in-progress edit apart from the implementation it is about
+        to ask for — an agent may legitimately edit the very same file, so any
+        such split would be a heuristic, and a wrong one would either hide
+        real changes from the reviewer or attribute the operator's work to the
+        feature.
+
+        ``--allow-dirty`` does not make the controller smarter, it makes the
+        situation *explicit*: the pre-existing paths are recorded in state,
+        shown in ``status`` and named to the reviewer as pre-existing. They
+        are never silently absorbed — and their *contents* are pinned, because
+        the run's first fingerprint covers the whole working tree, dirty
+        baseline included.
+
+        The list comes from ``git status``, which is the operator's own notion
+        of "work in the way". That is the right input for this policy question
+        and the wrong one for identity, which is why the fingerprint is built
+        from the controller's own walk instead.
+        """
+        dirty = [p for p in dirty_paths if p != spec.relative_path]
+        if dirty and not allow_dirty:
+            listed = ", ".join(dirty[:20]) + ("..." if len(dirty) > 20 else "")
+            raise ConfigurationError(
+                f"the working tree has {len(dirty)} change(s) besides the feature "
+                f"specification: {listed}. A local run reviews the whole working tree, and "
+                "the controller will not guess which changes belong to this feature. Commit "
+                "or stash them first, or pass --allow-dirty to record them as pre-existing "
+                "(they are then reported to you and to the reviewer, not hidden)."
+            )
+        return dirty
+
+    def load(self) -> AutoForgeState:
+        """Read the run at :attr:`paths` through the held state root.
+
+        A LOCAL run is additionally passed through the contract gate here,
+        so no command -- ``resume``, ``step``, ``status``, a crash recovery
+        -- can act on a run whose definition this invocation would change.
+        """
+        try:
+            root = self.state_root(create=False)
+        except FileNotFoundError:
+            # Reading never creates: no state directory means no run here.
+            raise no_state_error(self.paths.state_file) from None
+        state = load_state(self.paths.state_file, root=root)
+        if state.is_local:
+            # Gate *before* binding: an engine never holds a run whose
+            # definition this invocation would change.
+            validate_local_run_contract(state.local_contract(), self._invocation_contract())
+        self.state = state
+        self._state_from_disk = True
+        return state
+
+    def existing_run(self) -> AutoForgeState | None:
+        """The run recorded at :attr:`paths`, or ``None`` when there is none.
+
+        For the pre-flight of a *new* run: an unreadable or foreign state
+        file is a StateError for the caller to refuse or quarantine, and a
+        LOCAL run is *not* passed through the contract gate, because the
+        question here is only whether something would be overwritten.
+        """
+        try:
+            root = self.state_root(create=False)
+        except FileNotFoundError:
+            return None
+        if root.lstat(STATE_FILENAME) is None:
+            return None
+        return load_state(self.paths.state_file, root=root)
+
+    def quarantine_state(self) -> Path:
+        """Move an unreadable ``state.json`` aside (see :func:`quarantine_state_file`)."""
+        return quarantine_state_file(self.paths.state_file, root=self.state_root())
 
     def _require_state(self) -> AutoForgeState:
         if self.state is None:
@@ -292,17 +629,48 @@ class ControllerEngine:
             )
         return self.state
 
-    def _save(self) -> None:
+    def save(self) -> None:
+        """Persist the current state through the held state root."""
         assert self.state is not None
-        save_state(self.state, self.paths.state_file)
+        save_state(self.state, self.paths.state_file, root=self.state_root())
+
+    _save = save
+
+    def _record_verification_failure(self, phase: Phase, exc: VerificationError) -> None:
+        """Persist a failed verification attempt (bounded, redacted).
+
+        The message can quote untrusted text — a validation command's output,
+        a PR body — and `state.json` is stored in the clear, so it passes
+        through `redact` before it is persisted.
+        """
+        state = self._require_state()
+        state.verification_failures.append(redact(f"{phase.value}: {exc}"))
+        state.verification_failures = state.verification_failures[-20:]
 
     def _logger(self) -> RunLogger:
         state = self._require_state()
-        return RunLogger(self.paths.logs_dir, state.run_id)
+        return RunLogger(
+            self.paths.logs_dir,
+            state.run_id,
+            # The logger closes what it is handed, so it gets its own handle
+            # on the held (and just re-verified) directory.
+            open_state_root=lambda: self.state_root().dup(),
+        )
 
     def validate_config(self) -> None:
-        """Fail early (ConfigurationError) when a required profile is unusable."""
-        validate_required_profiles(self.config, REQUIRED_PROFILES)
+        """Fail early (ConfigurationError) when a required profile is unusable.
+
+        A LOCAL run never enters REPLAN_REEXECUTE or UPDATE_EPIC, so it does
+        not require those profiles to be configured. Which reviewer profiles it
+        does require follows from `local.max_fix_rounds`, because local review
+        rounds are routed exactly like remote ones.
+        """
+        required = (
+            local_required_profiles(self.config)
+            if self.mode == WorkflowMode.LOCAL
+            else REQUIRED_PROFILES
+        )
+        validate_required_profiles(self.config, required)
 
     # -- prompt context ---------------------------------------------------
     @staticmethod
@@ -311,20 +679,91 @@ class ControllerEngine:
 
     @staticmethod
     def _format_findings(findings: list[dict]) -> str:
+        """The open findings as one untrusted block for a FIX prompt.
+
+        Findings are reviewer output: evidence for the fixing agent to judge,
+        never controller instructions. The whole list is quoted through the
+        same unclosable fence as every other untrusted block, and each
+        finding's one-line fields are kept to one line, so a title or a
+        location cannot forge a second finding or a heading of its own.
+        """
         if not findings:
-            return "(none)"
+            return fenced_untrusted_block("(none)", "text")
         lines = []
         for f in findings:
-            title = f.get("title") or ""
+            fid = escape_inline(str(f.get("id")))
+            head = f"- {fid} [{escape_inline(str(f.get('classification')))}]"
             loc = f.get("location") or ""
-            head = f"- **{f.get('id')}** [{f.get('classification')}]"
+            title = f.get("title") or ""
             if loc:
-                head += f" `{loc}`"
+                head += f" {escape_inline(str(loc))}"
             if title:
-                head += f" — {title}"
+                head += f" — {escape_inline(str(title))}"
             lines.append(head)
-            lines.append(f"  Required resolution: {f.get('required_resolution', '')}")
-        return "\n".join(lines)
+            resolution = str(f.get("required_resolution", ""))
+            lines.append("  Required resolution: " + resolution.replace("\n", "\n    "))
+        return fenced_untrusted_block("\n".join(lines), "text")
+
+    def _validation_commands_text(self) -> str:
+        cmds = self.local_contract().validation_commands
+        if not cmds:
+            return "(none configured)"
+        return "; ".join(" ".join(argv) for argv in cmds)
+
+    def _local_prompt_variables(self) -> dict[str, str | int | None]:
+        """Prompt context for a LOCAL phase: spec + working tree, no GitHub."""
+        s = self._require_state()
+        spec = self._frozen_spec()
+        snapshot = self._local_snapshot_for_prompt()
+        workspace_note = snapshot.describe()
+        if s.baseline_dirty_paths:
+            workspace_note += (
+                " | pre-existing (NOT part of this feature, do not review or revert): "
+                + ", ".join(escape_inline(path) for path in s.baseline_dirty_paths[:20])
+            )
+        return {
+            "PROMPT_VERSION": s.prompt_version,
+            "REPO_ROOT": escape_inline(str(self.workspace().root())),
+            "FEATURE_SPEC_PATH": escape_inline(s.feature_spec_path),
+            "FEATURE_SPEC_SHA256": s.feature_spec_sha256,
+            "FEATURE_SPEC_BLOCK": fenced_untrusted_block(spec.content, "markdown"),
+            "BASE_HEAD_SHA": s.base_head_sha or "(no commit yet)",
+            "BASE_BRANCH": s.base_branch or "(detached HEAD)",
+            "PRIOR_ATTEMPT": self._prior_attempt_note(),
+            "WORKSPACE_FINGERPRINT": snapshot.fingerprint,
+            "WORKSPACE_STATUS": workspace_note,
+            "WORKSPACE_EXCLUSIONS": snapshot.describe_exclusions(),
+            "VALIDATION_COMMANDS": self._validation_commands_text(),
+            "REVIEW_ROUND": s.review_round + 1 if s.phase != Phase.FIX else s.review_round,
+            "FINDINGS": self._format_findings(s.open_findings),
+        }
+
+    def _prior_attempt_note(self) -> str:
+        """What to tell an agent whose phase was already invoked once."""
+        s = self._require_state()
+        if not self._local_resumed_invocation or s.local_pending_phase != s.phase.value:
+            return "(none — this is the first attempt at this phase in this run)"
+        return (
+            f"A previous invocation of {s.phase.value} in this run was launched and never "
+            "produced a result the controller could verify (it crashed, returned an invalid "
+            "CONTROL_RESULT, or its validation commands failed). Work from that attempt may "
+            "already be present in the working tree. Read what is there before you change "
+            "anything, continue it rather than starting over, and do not revert or delete it "
+            "just because you did not write it in this invocation."
+        )
+
+    def _frozen_spec(self) -> FeatureSpec:
+        """Re-read the frozen specification, requiring its hash to be unchanged."""
+        s = self._require_state()
+        return verify_feature_spec_unchanged(
+            self.workspace(),
+            s.feature_spec_path,
+            s.feature_spec_sha256,
+            when=f"before {s.phase.value}",
+        )
+
+    def _local_snapshot_for_prompt(self) -> WorkspaceSnapshot:
+        return self._local_bound_snapshot or self.workspace().snapshot()
 
     def _prompt_variables(self) -> dict[str, str | int | None]:
         s = self._require_state()
@@ -380,18 +819,33 @@ class ControllerEngine:
             )
         return variables
 
+    def template_for(self, phase: Phase) -> str | None:
+        """The prompt template of ``phase`` in the loaded run's mode."""
+        table = LOCAL_PHASE_TEMPLATE if self.mode == WorkflowMode.LOCAL else PHASE_TEMPLATE
+        if self.mode == WorkflowMode.LOCAL and phase not in table:
+            raise StateTransitionError(
+                f"phase {phase.value} belongs to the REMOTE workflow and is never executed "
+                "by a local run"
+            )
+        return table.get(phase)
+
     def render_prompt_for(self, phase: Phase, correction_error: str | None = None) -> str:
-        template = PHASE_TEMPLATE.get(phase)
+        local = self.mode == WorkflowMode.LOCAL
+        template = self.template_for(phase)
         if template is None:
             raise StateTransitionError(f"phase {phase.value} has no agent prompt")
         if template not in TEMPLATE_FILES:
             raise StateTransitionError(f"unknown template {template}")
-        variables = self._prompt_variables()
-        prompt = render_phase(template, variables)
+        variables = self._local_prompt_variables() if local else self._prompt_variables()
+        prompt = render_phase(
+            template,
+            variables,
+            common_template=LOCAL_COMMON_TEMPLATE if local else COMMON_TEMPLATE,
+        )
         if correction_error is not None:
             correction = render(
                 load_template("correction.md"),
-                {"PREVIOUS_ERROR": correction_error[:2000]},
+                {"PREVIOUS_ERROR_BLOCK": fenced_untrusted_block(correction_error[:2000], "text")},
             )
             prompt = prompt + "\n\n---\n\n" + correction
         return prompt
@@ -401,6 +855,8 @@ class ControllerEngine:
         s = self._require_state()
         if s.phase in TERMINAL_PHASES:
             raise StateTransitionError(f"phase {s.phase.value} is terminal — nothing to execute")
+        if s.mode == WorkflowMode.LOCAL:
+            return self._plan_local_step(s)
         if s.phase == Phase.INITIALIZING:
             return self._deterministic_plan(
                 s,
@@ -490,9 +946,119 @@ class ControllerEngine:
             review_round=s.review_round + 1 if s.phase == Phase.REVIEW else s.review_round,
             variables={k: str(v) for k, v in variables.items()},
             expected_next=self._expected_next(s.phase),
-            legal_next=self._legal_next_for(s.phase),
+            legal_next=self._legal_next_for(s.phase, s.mode),
             notes=notes,
         )
+
+    def _plan_local_step(self, s: AutoForgeState) -> StepPlan:
+        """Plan one LOCAL step. Pure: reads git and the spec, writes nothing.
+
+        A dry run stops here, so this must never invoke an agent, run a
+        validation command, write state, or touch GitHub.
+        """
+        if s.phase == Phase.INITIALIZING:
+            plan = self._deterministic_plan(
+                s,
+                "INITIALIZING -> ANALYZE_EXECUTE (freeze the feature spec; no agent, no GitHub)",
+                "ANALYZE_EXECUTE",
+                notes=[
+                    "mode: LOCAL (no gh, no PR, no push, no merge, no commits)",
+                    f"feature specification: {s.feature_spec_path}",
+                    f"frozen SHA-256: {s.feature_spec_sha256}",
+                    "would verify: the specification is unchanged and the workspace is readable",
+                ],
+            )
+            plan.variables = {
+                "FEATURE_SPEC_PATH": s.feature_spec_path,
+                "FEATURE_SPEC_SHA256": s.feature_spec_sha256,
+                "BASE_HEAD_SHA": s.base_head_sha or "(no commit yet)",
+                "BASE_BRANCH": s.base_branch or "(detached HEAD)",
+                "WORKSPACE_FINGERPRINT": s.workspace_fingerprint,
+            }
+            return plan
+        profile = profile_for_phase(self.config, s.phase, s.review_round)
+        variables = self._local_prompt_variables()
+        prompt = self.render_prompt_for(s.phase)
+        command = self.providers.get(profile).build_command_for(profile, prompt)
+        notes: list[str] = [
+            "mode: LOCAL (no gh, no PR, no push, no merge)",
+            f"feature specification: {s.feature_spec_path} "
+            f"(frozen {s.feature_spec_sha256[:16]}...)",
+            f"git anchor the run is pinned to: "
+            f"{s.base_head_sha[:12] or '(unborn)'} on {s.base_branch or '(detached HEAD)'} "
+            "(a commit, reset, checkout or branch switch enters BLOCKED)",
+            f"workspace fingerprint now: {variables['WORKSPACE_FINGERPRINT']}",
+        ]
+        if s.local_pending_phase == s.phase.value:
+            notes.append(
+                f"a previous {s.phase.value} invocation was checkpointed and never verified "
+                f"({s.local_pending_attempts} of {MAX_LOCAL_PHASE_ATTEMPTS} attempt(s) used); "
+                "its work is credited against the fingerprint from before that attempt"
+            )
+        if s.baseline_dirty_paths:
+            notes.append(
+                "pre-existing working-tree changes recorded at run creation "
+                f"(--allow-dirty): {', '.join(s.baseline_dirty_paths[:20])}"
+            )
+        contract = self.local_contract()
+        budget = step_budget_reason(s.step_count, contract.max_total_steps)
+        if budget:
+            notes.append(f"would enter BLOCKED without executing: {budget}")
+        if s.phase == Phase.REVIEW:
+            cap = contract.max_review_rounds
+            if s.review_round >= cap:
+                notes.append(
+                    "would enter BLOCKED without invoking the reviewer: local review round "
+                    f"{s.review_round + 1} exceeds local.max_fix_rounds + 1 = {cap}"
+                )
+            notes.append(
+                f"review round {s.review_round + 1} of at most {cap} "
+                f"(local.max_fix_rounds={contract.max_fix_rounds})"
+            )
+            notes.append(
+                "the reviewed workspace fingerprint is computed immediately before the review "
+                "and the review is rejected unless it is bound to exactly that value"
+            )
+        else:
+            notes.append(
+                "would verify afterwards: the feature spec hash is unchanged, the workspace "
+                "changed as claimed, and every configured validation command exits 0"
+            )
+        cmds = contract.validation_commands
+        notes.append(
+            "validation commands that would run after this phase: "
+            + ("; ".join(" ".join(argv) for argv in cmds) if cmds else "(none configured)")
+        )
+        return StepPlan(
+            phase=s.phase.value,
+            profile_name=profile.name,
+            provider=profile.provider,
+            model=profile.model,
+            effort=profile.effort,
+            command=command,
+            timeout_seconds=profile.timeout_seconds
+            or self.config.execution.default_timeout_seconds,
+            prompt_length=len(prompt),
+            prompt_preview=prompt[:1200],
+            prompt_full=prompt,
+            routing=self._routing_info(s, profile.name),
+            template=self.template_for(s.phase) or "",
+            review_round=s.review_round + 1 if s.phase == Phase.REVIEW else s.review_round,
+            variables={k: str(v) for k, v in variables.items()},
+            expected_next=self._local_expected_next(s.phase),
+            legal_next=self._legal_next_for(s.phase, WorkflowMode.LOCAL),
+            notes=notes,
+        )
+
+    @staticmethod
+    def _local_expected_next(phase: Phase) -> str:
+        return {
+            Phase.INITIALIZING: "ANALYZE_EXECUTE",
+            Phase.ANALYZE_EXECUTE: "REVIEW (after workspace + validation verification)",
+            Phase.REVIEW: "DONE if clean, FIX if findings and the fix budget remains, "
+            "BLOCKED if findings remain after it",
+            Phase.FIX: "REVIEW (after workspace + validation verification)",
+        }.get(phase, "")
 
     def _merge_argv(self) -> list[str]:
         """Exact ``gh`` argv the controller would run to merge the current PR."""
@@ -537,7 +1103,7 @@ class ControllerEngine:
             template="",
             review_round=state.review_round,
             expected_next=expected,
-            legal_next=ControllerEngine._legal_next_for(state.phase),
+            legal_next=ControllerEngine._legal_next_for(state.phase, state.mode),
             notes=notes,
         )
 
@@ -553,8 +1119,8 @@ class ControllerEngine:
         }.get(phase, "")
 
     @staticmethod
-    def _legal_next_for(phase: Phase) -> list[str]:
-        return sorted(p.value for p in LEGAL_EDGES.get(phase, frozenset()))
+    def _legal_next_for(phase: Phase, mode: WorkflowMode = WorkflowMode.REMOTE) -> list[str]:
+        return sorted(p.value for p in edges_for(mode).get(phase, frozenset()))
 
     @staticmethod
     def _routing_info(state: AutoForgeState, profile_name: str) -> str:
@@ -645,7 +1211,11 @@ class ControllerEngine:
         """
         if max_steps < 1:
             raise ValueError("max_steps must be >= 1")
-        stop_phases = TERMINAL_PHASES if self.merge_gate_open(allow_merge) else STOP_PHASES
+        if self.mode == WorkflowMode.LOCAL:
+            # No READY_FOR_MERGE holding state exists locally.
+            stop_phases = stop_phases_for(WorkflowMode.LOCAL)
+        else:
+            stop_phases = TERMINAL_PHASES if self.merge_gate_open(allow_merge) else STOP_PHASES
         if dry_run:
             outcomes = [self._step_once(dry_run=True, allow_merge=allow_merge)]
             assert self.state is not None
@@ -703,6 +1273,10 @@ class ControllerEngine:
                 message=f"[dry-run] would execute {previous.value} via profile {plan.profile_name}",
             )
 
+        if state.mode == WorkflowMode.LOCAL:
+            # A LOCAL run's step budget is part of its contract, so it is
+            # checked there, from the persisted value.
+            return self._local_step_once(previous, plan)
         # Cumulative step budget: measured on persisted state, so `resume`
         # continues the same budget. Checked before anything executes.
         budget = step_budget_reason(state.step_count, self.config.workflow.max_total_steps)
@@ -743,14 +1317,17 @@ class ControllerEngine:
         status = payload.get("status")
         if status in ("failure", "blocked"):
             nxt = Phase.FAILED if status == "failure" else Phase.BLOCKED
+            # Agent-supplied text, persisted in a plain `state.json` and
+            # printed by the CLI: same redaction boundary as the run log.
+            message = redact(str(payload.get("message", "") or f"agent reported {status}"))
             state.phase = nxt
-            state.block_reason = str(payload.get("message", "") or f"agent reported {status}")
+            state.block_reason = message
             self._save()
             return self._outcome(
                 previous,
                 plan=plan,
                 result=payload,
-                message=f"agent reported {status}: {payload.get('message', '')}",
+                message=f"agent reported {status}: {message}",
             )
 
         try:
@@ -760,8 +1337,7 @@ class ControllerEngine:
             # verify. Persist the attempt so `resume` re-enters this phase from
             # real state instead of pretending nothing happened.
             if isinstance(exc, VerificationError) and previous in (Phase.REVIEW, Phase.FIX):
-                state.verification_failures.append(f"{previous.value}: {exc}")
-                state.verification_failures = state.verification_failures[-20:]
+                self._record_verification_failure(previous, exc)
             self._save()
             raise
         if nxt_phase == Phase.BLOCKED:
@@ -773,6 +1349,534 @@ class ControllerEngine:
         state.attempt = 0
         self._save()
         return self._outcome(previous, plan=plan, result=payload, message=message)
+
+    # ======================================================================
+    # LOCAL mode
+    #
+    # No GitHub client is ever constructed here. The working tree is the
+    # source of truth, exactly as GitHub is in REMOTE mode: every agent claim
+    # is re-derived from `git` by :mod:`autoforge.local_workspace` before it
+    # is acted on, and the frozen feature specification is re-hashed around
+    # every phase.
+    def _local_step_once(self, previous: Phase, plan: StepPlan) -> StepOutcome:
+        state = self._require_state()
+        # The contract gate, before anything is counted, verified or run.
+        contract = self.local_contract()
+        # Cumulative step budget, from the contract: the bound the run was
+        # created under, not today's `workflow.max_total_steps` (R9-F2 --
+        # the gate above already refuses a changed one, and execution reads
+        # run-defining values from the contract regardless).
+        budget = step_budget_reason(state.step_count, contract.max_total_steps)
+        if budget:
+            return self._block(previous, plan, self._local_budget_block_reason(budget))
+        if previous == Phase.INITIALIZING:
+            state.step_count += 1
+            return self._initialize_local(plan)
+        if previous not in (Phase.ANALYZE_EXECUTE, Phase.REVIEW, Phase.FIX):
+            raise StateTransitionError(f"phase {previous.value} is not part of the LOCAL workflow")
+        if previous == Phase.REVIEW:
+            cap = contract.max_review_rounds
+            if state.review_round >= cap:
+                # Round cap+1 never starts: its findings could never be fixed.
+                return self._block(
+                    previous,
+                    plan,
+                    self._local_block_reason(
+                        f"local review round {state.review_round + 1} would exceed the local "
+                        f"bound of {cap} review round(s) "
+                        f"(local.max_fix_rounds={contract.max_fix_rounds})"
+                    ),
+                )
+
+        state.step_count += 1
+        # Freeze check + git anchor + fingerprint binding, before the agent
+        # runs. The bound status is what the prompt is rendered from, so the
+        # fingerprint the reviewer is told to report is exactly the one
+        # persisted here.
+        self._frozen_spec()
+        drift = self._git_anchor_drift()
+        if drift:
+            return self._block(previous, plan, self._local_anchor_block_reason(drift))
+        before = self.workspace().snapshot()
+        state.workspace_fingerprint = before.fingerprint
+
+        # Durable invocation checkpoint for the write-capable phases. It is
+        # persisted *before* the agent starts, so a crash mid-invocation, a
+        # malformed CONTROL_RESULT or a failing validation command all leave
+        # the same recoverable record: "this phase was launched once and its
+        # work may already be in the tree".
+        baseline = before.fingerprint
+        if state.local_pending_phase and state.local_pending_phase != previous.value:
+            # `load_state` refuses this shape; the check is repeated here so
+            # that no in-memory path can resolve one phase and then close the
+            # checkpoint another phase left behind.
+            raise StateError(
+                f"cannot enter {previous.value}: the LOCAL checkpoint records an "
+                f"unverified {state.local_pending_phase} launch, which only "
+                f"{state.local_pending_phase} may resume"
+            )
+        if previous in LOCAL_WRITE_PHASES:
+            if state.local_pending_phase == previous.value:
+                # An earlier attempt at this same phase entry never produced a
+                # verified result. Its work counts, so "did anything actually
+                # get implemented?" is judged against the fingerprint from
+                # before *that* attempt, not against the tree it left behind.
+                baseline = state.local_pending_fingerprint or before.fingerprint
+                if state.local_pending_attempts >= MAX_LOCAL_PHASE_ATTEMPTS:
+                    return self._block(
+                        previous,
+                        plan,
+                        self._local_block_reason(
+                            f"{previous.value} was invoked {state.local_pending_attempts} "
+                            f"time(s) without ever producing a verified result, which is "
+                            f"the bound of {MAX_LOCAL_PHASE_ATTEMPTS}. The controller will "
+                            "not launch a write-capable agent at the same phase again"
+                        ),
+                    )
+                self._local_resumed_invocation = True
+            else:
+                state.local_pending_phase = previous.value
+                state.local_pending_fingerprint = before.fingerprint
+                state.local_pending_attempts = 0
+            state.local_pending_attempts += 1
+        self._local_bound_snapshot = before
+        self._save()
+        try:
+            payload = self._invoke_phase(previous)
+        finally:
+            self._local_bound_snapshot = None
+            self._local_resumed_invocation = False
+
+        status = payload.get("status")
+        if status in ("failure", "blocked"):
+            nxt = Phase.FAILED if status == "failure" else Phase.BLOCKED
+            # The message is agent-supplied text; `state.json` is stored in the
+            # clear and the CLI prints this verbatim, so it passes the same
+            # redaction boundary as the run log.
+            message = redact(str(payload.get("message", "") or f"agent reported {status}"))
+            state.phase = nxt
+            state.block_reason = message
+            self._clear_local_invocation()
+            self._save()
+            return self._outcome(
+                previous,
+                plan=plan,
+                result=payload,
+                message=f"agent reported {status}: {message}",
+            )
+
+        drift = self._git_anchor_drift()
+        if drift:
+            # The agent committed, reset or switched branches during its run.
+            # The prompts forbid it; this is the controller enforcing it.
+            return self._block(previous, plan, self._local_anchor_block_reason(drift))
+
+        try:
+            nxt_phase, message = self._verify_and_apply_local(previous, payload, before, baseline)
+        except (VerificationError, ControlResultValidationError) as exc:
+            # The agent ran and may have changed the working tree, but its
+            # claims did not verify. Persist the attempt so `resume` re-enters
+            # this phase from the real state of the tree — the invocation
+            # checkpoint above is what keeps that re-entry from mistaking
+            # already-produced work for work that was never done.
+            if isinstance(exc, VerificationError):
+                self._record_verification_failure(previous, exc)
+            self._save()
+            raise
+        self._clear_local_invocation()
+        if nxt_phase == Phase.BLOCKED:
+            return self._block(previous, plan, message)
+        validate_transition(previous, nxt_phase, WorkflowMode.LOCAL)
+        state.phase = nxt_phase
+        state.attempt = 0
+        self._save()
+        return self._outcome(previous, plan=plan, result=payload, message=message)
+
+    def _charge_local_launch(self, phase: Phase) -> str:
+        """Charge one more write-capable launch of ``phase`` to the LOCAL checkpoint.
+
+        Returns ``""`` after persisting the charge, so the launch may proceed,
+        or the reason it may not: the checkpoint has already spent
+        :data:`MAX_LOCAL_PHASE_ATTEMPTS`. The persisted count is what bounds
+        the phase entry, so it must be written *before* the agent starts --
+        a launch that was never charged is a launch a crash would let
+        ``resume`` repeat. A REMOTE run, or a read-only LOCAL phase, has no
+        checkpoint to charge and is never refused here.
+        """
+        state = self._require_state()
+        if state.mode != WorkflowMode.LOCAL or phase not in LOCAL_WRITE_PHASES:
+            return ""
+        if state.local_pending_phase != phase.value:
+            raise StateError(
+                f"cannot charge a {phase.value} launch: the LOCAL checkpoint records "
+                f"{state.local_pending_phase or 'no pending phase'}"
+            )
+        if state.local_pending_attempts >= MAX_LOCAL_PHASE_ATTEMPTS:
+            return (
+                f"{phase.value} has been launched {state.local_pending_attempts} time(s) "
+                f"without ever producing a verified result, which is the bound of "
+                f"{MAX_LOCAL_PHASE_ATTEMPTS}; the next step enters BLOCKED"
+            )
+        state.local_pending_attempts += 1
+        self._save()
+        return ""
+
+    def _clear_local_invocation(self) -> None:
+        """Close the pending-invocation checkpoint (the phase is resolved)."""
+        state = self._require_state()
+        state.local_pending_phase = ""
+        state.local_pending_fingerprint = ""
+        state.local_pending_attempts = 0
+
+    def _git_anchor_drift(self) -> str:
+        """Describe how HEAD/branch moved since the run started, or "".
+
+        Two cheap `git` reads, deliberately not a full :meth:`status` call:
+        this runs immediately before and after every agent phase, and hashing
+        the tree to answer "did HEAD move?" would be wasteful.
+        """
+        state = self._require_state()
+        ws = self.workspace()
+        head, branch = ws.head_sha(), ws.branch()
+        drift: list[str] = []
+        if head != state.base_head_sha:
+            drift.append(
+                f"HEAD moved from {state.base_head_sha[:12] or '(unborn)'} to "
+                f"{head[:12] or '(unborn)'}"
+            )
+        if branch != state.base_branch:
+            drift.append(
+                f"the checked-out branch changed from "
+                f"{state.base_branch or '(detached HEAD)'} to {branch or '(detached HEAD)'}"
+            )
+        return " and ".join(drift)
+
+    def _local_anchor_block_reason(self, drift: str) -> str:
+        return self._local_block_reason(
+            f"the repository's git anchor moved during the run: {drift}. A local run never "
+            "commits, resets, checks out or switches branches, and it requires the same to "
+            "be true of the agents it invokes: the accumulated findings and the frozen "
+            "specification describe the working tree as it was anchored, and the controller "
+            "cannot tell an agent's commit from an operator's. Nothing was rolled back — "
+            "the controller never undoes a git operation it did not perform"
+        )
+
+    def _initialize_local(self, plan: StepPlan) -> StepOutcome:
+        """Preflight for a local run: config, git, frozen spec. No GitHub."""
+        state = self._require_state()
+        self.local_contract()
+        self.validate_config()
+        ws = self.workspace()
+        # Refuses a state directory inside the reviewed tree before any
+        # fingerprint is computed (see check_state_dir_location). The contract
+        # already proves the state directory is the one the run was created
+        # with; this keeps the location rule itself in one place.
+        ws.check_state_dir_location(self.paths.state_dir)
+        spec = verify_feature_spec_unchanged(
+            ws, state.feature_spec_path, state.feature_spec_sha256, when="before ANALYZE_EXECUTE"
+        )
+        drift = self._git_anchor_drift()
+        if drift:
+            return self._block(Phase.INITIALIZING, plan, self._local_anchor_block_reason(drift))
+        snapshot = ws.snapshot()
+        state.workspace_fingerprint = snapshot.fingerprint
+        validate_transition(Phase.INITIALIZING, Phase.ANALYZE_EXECUTE, WorkflowMode.LOCAL)
+        state.phase = Phase.ANALYZE_EXECUTE
+        self._save()
+        return self._outcome(
+            Phase.INITIALIZING,
+            plan=plan,
+            message=(
+                f"froze feature specification {spec.relative_path} "
+                f"(sha256 {spec.sha256[:16]}...) at {snapshot.anchor}; "
+                "INITIALIZING -> ANALYZE_EXECUTE"
+            ),
+        )
+
+    def _local_block_reason(self, reason: str) -> str:
+        state = self._require_state()
+        return (
+            f"{reason}. The run stays on feature {state.feature_spec_path}; the work is left "
+            "in the working tree exactly as it is (nothing was committed, reverted or "
+            "discarded). A human must inspect the open findings, or raise "
+            "'local.max_fix_rounds' in the config and start a new run."
+        )
+
+    def _verify_and_apply_local(
+        self, phase: Phase, payload: dict, before: WorkspaceSnapshot, baseline: str
+    ) -> tuple[Phase, str]:
+        """Verify one LOCAL agent result.
+
+        ``before`` is the fingerprint from immediately before *this*
+        invocation, which is what the agent's own ``changed_workspace`` claim
+        describes. ``baseline`` is the fingerprint from before the *first*
+        invocation of this phase entry; on a first attempt they are the same
+        value, and on a retry ``baseline`` is what "an implementation exists"
+        is judged against, so work an earlier attempt already produced is not
+        demanded a second time.
+        """
+        if phase == Phase.ANALYZE_EXECUTE:
+            return self._apply_local_analyze(
+                LocalAnalyzeExecuteResult.from_payload(payload), before, baseline
+            )
+        if phase == Phase.REVIEW:
+            return self._apply_local_review(LocalReviewResult.from_payload(payload))
+        if phase == Phase.FIX:
+            return self._apply_local_fix(LocalFixResult.from_payload(payload), before, baseline)
+        raise StateTransitionError(f"phase {phase.value} does not accept local agent results")
+
+    def _verify_workspace_change(
+        self, phase: Phase, before: WorkspaceSnapshot, claimed: bool
+    ) -> WorkspaceSnapshot:
+        """Re-derive what actually changed and cross-check the agent's claim."""
+        state = self._require_state()
+        verify_feature_spec_unchanged(
+            self.workspace(),
+            state.feature_spec_path,
+            state.feature_spec_sha256,
+            when=f"after {phase.value}",
+        )
+        after = self.workspace().snapshot()
+        changed = after.fingerprint != before.fingerprint
+        if claimed != changed:
+            raise VerificationError(
+                f"{phase.value} reported changed_workspace={claimed} but the controller "
+                f"observed the working tree {'change' if changed else 'stay identical'} "
+                f"(fingerprint {before.fingerprint[:16]}... -> {after.fingerprint[:16]}...). "
+                f"Current state: {after.describe()}"
+            )
+        return after
+
+    def _apply_local_analyze(
+        self, res: LocalAnalyzeExecuteResult, before: WorkspaceSnapshot, baseline: str
+    ) -> tuple[Phase, str]:
+        state = self._require_state()
+        after = self._verify_workspace_change(Phase.ANALYZE_EXECUTE, before, res.changed_workspace)
+        if after.fingerprint == baseline:
+            raise VerificationError(
+                "ANALYZE_EXECUTE reported success but the working tree is unchanged since "
+                "this phase was first invoked: no implementation exists to review. An agent "
+                "that cannot implement the feature must report status 'blocked' or 'failure' "
+                "with a reason instead."
+            )
+        self._run_validation_commands(Phase.ANALYZE_EXECUTE)
+        state.workspace_fingerprint = after.fingerprint
+        state.last_review_result = ""
+        tests = (
+            f", tests attempted: {', '.join(res.tests_attempted)}" if res.tests_attempted else ""
+        )
+        return Phase.REVIEW, (
+            f"implementation verified: working tree now holds {after.describe()}, "
+            f"fingerprint {after.fingerprint[:16]}...{tests}; "
+            "ANALYZE_EXECUTE -> REVIEW"
+        )
+
+    def _apply_local_review(self, res: LocalReviewResult) -> tuple[Phase, str]:
+        state = self._require_state()
+        expected_round = state.review_round + 1
+        bound = state.workspace_fingerprint
+        if res.round != expected_round:
+            raise VerificationError(
+                f"REVIEW round mismatch: expected {expected_round}, got {res.round}"
+            )
+        if res.reviewed_workspace_fingerprint != bound:
+            raise VerificationError(
+                f"REVIEW fingerprint mismatch: the controller bound workspace {bound}, "
+                f"the agent reviewed {res.reviewed_workspace_fingerprint}. A review is only "
+                "valid for the exact workspace it was bound to."
+            )
+        verify_feature_spec_unchanged(
+            self.workspace(),
+            state.feature_spec_path,
+            state.feature_spec_sha256,
+            when="after REVIEW",
+        )
+        after = self.workspace().snapshot()
+        if after.fingerprint != bound:
+            # REVIEW is read-only; a reviewer that edited the code changed the
+            # very thing it was judging, so its verdict describes nothing that
+            # still exists.
+            raise VerificationError(
+                f"the reviewer modified the working tree during REVIEW (fingerprint "
+                f"{bound[:16]}... -> {after.fingerprint[:16]}...). A local review must not "
+                f"change what it reviews. Current state: {after.describe()}"
+            )
+
+        # A valid review lifecycle: the round is consumed either way.
+        state.review_round = res.round
+        state.reviewed_workspace_fingerprint = bound
+        state.last_review_needs_fix = res.needs_fix_round
+        # Findings are agent-authored text persisted in plain `state.json` and
+        # rendered into the next FIX prompt, so they cross the same redaction
+        # boundary as the run log.
+        findings = [redact_dict(f.to_dict()) for f in res.findings]
+        # ``review_history`` is shared with REMOTE mode; locally the "reviewed
+        # head" slot carries the workspace fingerprint, which plays exactly
+        # the same role (what this verdict is valid for).
+        self._record_review(
+            res.round, bound, RESULT_NEEDS_FIX if res.needs_fix_round else RESULT_CLEAN, findings
+        )
+        if res.needs_fix_round:
+            state.last_review_result = "needs_fix"
+            state.open_findings = findings
+            budget = self.local_contract().max_fix_rounds
+            if state.local_fix_rounds >= budget:
+                return Phase.BLOCKED, self._local_block_reason(
+                    f"local review round {res.round}: {len(findings)} finding(s) remain after "
+                    f"{state.local_fix_rounds} fix round(s), which is the configured local "
+                    f"budget (local.max_fix_rounds={budget})"
+                )
+            return Phase.FIX, (
+                f"local review round {res.round}: {len(findings)} finding(s); REVIEW -> FIX "
+                f"(fix round {state.local_fix_rounds + 1} of {budget})"
+            )
+        state.last_review_result = "clean"
+        state.open_findings = []
+        return Phase.DONE, (
+            f"local review round {res.round} clean for workspace {bound[:16]}...; "
+            "REVIEW -> DONE. The implementation is in the working tree; committing it is "
+            "yours to do."
+        )
+
+    def _apply_local_fix(
+        self, res: LocalFixResult, before: WorkspaceSnapshot, baseline: str
+    ) -> tuple[Phase, str]:
+        state = self._require_state()
+        open_ids = [f["id"] for f in state.open_findings]
+        reported = [r.finding_id for r in res.resolutions]
+        missing = sorted(set(open_ids) - set(reported))
+        extra = sorted(set(reported) - set(open_ids))
+        if missing or extra:
+            raise VerificationError(
+                f"FIX resolutions must cover exactly the open findings; missing={missing} "
+                f"unknown={extra}"
+            )
+        after = self._verify_workspace_change(Phase.FIX, before, res.changed_workspace)
+        fixed = [r for r in res.resolutions if r.resolution == "fixed"]
+        if fixed and after.fingerprint == baseline:
+            raise VerificationError(
+                f"FIX claims {len(fixed)} 'fixed' resolution(s) but the working tree is "
+                "unchanged since this fix round was first invoked; nothing was actually fixed."
+            )
+        state.workspace_fingerprint = after.fingerprint
+        state.last_fix_resolutions = [redact_dict(r.to_dict()) for r in res.resolutions]
+        # The round number this attempt would conclude. `local_fix_rounds`
+        # counts fix rounds the controller *concluded* — either back to REVIEW
+        # or terminally BLOCKED — and deliberately not ones still in flight,
+        # so it is charged at each of those two exits rather than here. A FIX
+        # whose validation command fails is neither: the phase stays at FIX
+        # for `resume`, and charging the budget for an attempt no controller
+        # verified would spend a fix round on work that was never accepted and
+        # block a later round that would have been. Re-entry stays bounded by
+        # the separate `local_pending_attempts` checkpoint, which counts
+        # *invocations* and is what stops a phase that can never be completed.
+        round_no = state.local_fix_rounds + 1
+
+        # An 'unresolved' disposition is the agent saying the finding is real
+        # and it could not resolve it. That is an agent-reported blocker, and
+        # the controller must not let it evaporate: clearing `open_findings`
+        # here would let the next reviewer return a clean verdict and carry
+        # the run to DONE with an acknowledged, unaddressed finding in it.
+        # There is no "re-review it and see" policy to fall back on — the
+        # reviewer is a different profile with no memory of the disposition —
+        # so this is terminal and a human decides.
+        unresolved = [r for r in res.resolutions if not r.is_resolved]
+        if unresolved:
+            keep = {r.finding_id for r in unresolved}
+            state.open_findings = [f for f in state.open_findings if f.get("id") in keep]
+            state.last_review_result = "unresolved"
+            # Concluded, terminally: the round is charged.
+            state.local_fix_rounds = round_no
+            detail = "; ".join(
+                f"{r.finding_id}: {redact(r.rationale) or '(no rationale)'}" for r in unresolved
+            )
+            return Phase.BLOCKED, self._local_block_reason(
+                f"local fix round {round_no} left {len(unresolved)} of "
+                f"{len(res.resolutions)} finding(s) explicitly unresolved, so the "
+                f"implementation is not complete and no later review can clear them "
+                f"({detail}). The validation commands were not run"
+            )
+
+        self._run_validation_commands(Phase.FIX)
+        state.local_fix_rounds = round_no
+        state.open_findings = []
+        state.last_review_result = "fixed"
+        no_change = [r.finding_id for r in res.resolutions if r.resolution != "fixed"]
+        note = (
+            f", {len(no_change)} resolved without a change ({', '.join(no_change)})"
+            if no_change
+            else ""
+        )
+        return Phase.REVIEW, (
+            f"local fix round {round_no} verified: {len(res.resolutions)} "
+            f"resolution(s){note}; FIX -> REVIEW (round {state.review_round + 1})"
+        )
+
+    def _run_validation_commands(self, phase: Phase) -> None:
+        """Run ``local.validation_commands`` and require every one to exit 0.
+
+        Controller-owned verification, not something an agent reports: the
+        commands come from configuration as argv arrays and are executed
+        through the normal executor, never through a shell. A non-zero exit
+        means the phase is not verified, so the run stays in this phase for
+        ``resume`` rather than advancing on an agent's word.
+        """
+        state = self._require_state()
+        # From the contract, not the configuration: what verifies this run
+        # was decided when the run was created.
+        commands = self.local_contract().validation_commands
+        if not commands:
+            return
+        logger = self._logger()
+        for argv in commands:
+            req = ExecutionRequest(
+                command=list(argv),
+                cwd=self.workdir,
+                timeout_seconds=self.config.execution.default_timeout_seconds,
+            )
+            result = (self._runner or execute)(req)
+            record = ExecutionRecord(
+                run_id=state.run_id,
+                seq=0,
+                phase=f"{phase.value}-validation",
+                attempt=state.attempt,
+                review_round=state.review_round,
+                profile="(controller validation command)",
+                prompt_version=state.prompt_version,
+                command=list(argv),
+                cwd=self.workdir,
+                timeout_seconds=req.timeout_seconds,
+                started_at=result.started_at,
+                finished_at=result.finished_at,
+                exit_code=result.exit_code,
+                timed_out=result.timed_out,
+                metadata={"validation_command": list(argv), "feature": state.feature_spec_path},
+            )
+            if result.timed_out or result.exit_code != 0:
+                record.error = (
+                    f"timed out after {req.timeout_seconds}s"
+                    if result.timed_out
+                    else f"exit {result.exit_code}"
+                )
+            logger.log_execution(record, "", result.stdout or "", result.stderr or "")
+            # Both the command line and its output can carry a secret into
+            # `state.verification_failures` (plain `state.json`) through the
+            # raised message, so both are redacted here and not only on the
+            # run-log path. Baseline protection: `redaction` claims no
+            # completeness.
+            shown = " ".join(redact_argv(list(argv)))
+            if result.timed_out:
+                raise VerificationError(
+                    f"validation command {shown!r} timed out after "
+                    f"{req.timeout_seconds}s; {phase.value} is not verified."
+                )
+            if result.exit_code != 0:
+                tail = redact((result.stderr or result.stdout or "").strip())[-2000:]
+                raise VerificationError(
+                    f"validation command {shown!r} failed with exit "
+                    f"{result.exit_code}; {phase.value} is not verified and the run stays in "
+                    f"{phase.value}. Output tail: {tail}"
+                )
 
     # -- deterministic steps ---------------------------------------------------
     def _initialize(self, plan: StepPlan) -> StepOutcome:
@@ -969,6 +2073,14 @@ class ControllerEngine:
             f"{reason}. This budget is cumulative for the run and is not reset by 'resume'; "
             "nothing was merged. Raise 'workflow.max_total_steps' in the config or start a "
             "new run."
+        )
+
+    @staticmethod
+    def _local_budget_block_reason(reason: str) -> str:
+        return (
+            f"{reason}. This budget is cumulative for the run, is not reset by 'resume', and "
+            "is part of the run's contract: raising 'workflow.max_total_steps' in the config "
+            "does not extend this run. Start a new run under the larger budget."
         )
 
     def _inconclusive(
@@ -2188,6 +3300,19 @@ class ControllerEngine:
         )
 
     # -- agent invocation + correction retry ---------------------------------------
+    def _log_metadata(self, phase: Phase) -> dict[str, object]:
+        state = self._require_state()
+        if state.mode == WorkflowMode.LOCAL:
+            return {
+                "mode": "LOCAL",
+                "feature_spec_path": state.feature_spec_path,
+                "feature_spec_sha256": state.feature_spec_sha256,
+                "workspace_fingerprint": state.workspace_fingerprint,
+            }
+        if phase == Phase.REPLAN_REEXECUTE:
+            return self._replan_log_metadata()
+        return {}
+
     def _invoke_phase(self, phase: Phase) -> dict:
         state = self._require_state()
         profile = profile_for_phase(self.config, phase, state.review_round)
@@ -2227,7 +3352,7 @@ class ControllerEngine:
                 command=provider.build_command_for(profile, prompt),
                 cwd=self.workdir,
                 timeout_seconds=timeout,
-                metadata=(self._replan_log_metadata() if phase == Phase.REPLAN_REEXECUTE else {}),
+                metadata=self._log_metadata(phase),
             )
             result: AgentExecutionResult | None = None
             try:
@@ -2260,14 +3385,23 @@ class ControllerEngine:
                     "State unchanged — inspect logs, then 'resume'."
                 )
             try:
-                payload = parse_control_result(stdout, phase)
+                payload = parse_control_result(stdout, phase, state.mode)
             except (ControlResultError, ControlResultValidationError) as exc:
                 record.error = f"{type(exc).__name__}: {exc}"
                 self._logger().log_execution(record, prompt, stdout, stderr)
                 self._save()
                 if attempt <= max_corrections:
-                    correction_error = f"{type(exc).__name__}: {exc}"
-                    continue
+                    # A correction re-launches the same write-capable agent,
+                    # so in LOCAL mode it is charged against the same durable
+                    # bound as the launch that preceded it.
+                    refusal = self._charge_local_launch(phase)
+                    if not refusal:
+                        correction_error = f"{type(exc).__name__}: {exc}"
+                        continue
+                    raise ControlResultValidationError(
+                        f"agent '{profile.name}' did not return a valid CONTROL_RESULT after "
+                        f"{attempt} attempt(s): {exc}. Not re-invoked: {refusal}"
+                    ) from exc
                 raise ControlResultValidationError(
                     f"agent '{profile.name}' did not return a valid CONTROL_RESULT after "
                     f"{attempt} attempt(s): {exc}"
@@ -2405,7 +3539,10 @@ class ControllerEngine:
         state.reviewed_head_sha = expected_head
         state.last_review_comment_url = res.review_comment_url
         state.last_review_needs_fix = res.needs_fix_round
-        findings = [f.to_dict() for f in res.findings]
+        # Findings are agent-authored text persisted in plain `state.json` and
+        # rendered into the next FIX prompt, so they cross the same redaction
+        # boundary as the run log.
+        findings = [redact_dict(f.to_dict()) for f in res.findings]
 
         latest = self._require_open_pr()
         if latest.head_sha != expected_head:

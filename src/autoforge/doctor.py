@@ -3,6 +3,11 @@
 Every check is non-destructive: version queries, `gh auth status`,
 `git rev-parse`, reading the config, and creating/removing one temp file in
 the state directory to prove it is writable.
+
+``autoforge local doctor`` runs the LOCAL subset: no `gh`, no `gh auth
+status`, no `origin` remote. A machine with no GitHub CLI and no GitHub
+credentials must pass it, so the checks it omits are omitted entirely rather
+than reported as warnings.
 """
 
 from __future__ import annotations
@@ -16,9 +21,17 @@ from pathlib import Path
 from .config import AutoForgeConfig, load_config_file, validate_required_profiles
 from .errors import ConfigurationError
 from .executor import ExecutionRequest, ExecutionResult, execute
+from .local_workspace import DEFAULT_MAX_BYTES, DEFAULT_MAX_ENTRIES
+from .profiles import local_required_profiles
 from .validation import parse_remote_repository
 
 Runner = Callable[[ExecutionRequest], ExecutionResult]
+# A fixed list of required profile names, or a function of the loaded config.
+RequiredProfiles = list[str] | Callable[[AutoForgeConfig], list[str]]
+
+# Fallback executable for a provider whose profile does not set `command`,
+# matching the provider adapters' own defaults.
+DEFAULT_AGENT_COMMANDS = {"claude": "claude", "opencode": "opencode"}
 
 REQUIRED_PROFILES = [
     "analyze_execute",
@@ -78,10 +91,18 @@ class Doctor:
         return CheckResult(name, ok, detail)
 
     # -- checks --------------------------------------------------------------------
-    def check_config(self) -> CheckResult:
+    def check_config(self, required_profiles: RequiredProfiles | None = None) -> CheckResult:
+        """Load the config and require its profiles.
+
+        ``required_profiles`` may be a fixed list or a callable, because a
+        LOCAL run's required reviewer profiles are derived from the config that
+        is only loaded here (see :func:`autoforge.profiles.local_required_profiles`).
+        """
         try:
             self.config = load_config_file(self.config_path)
-            validate_required_profiles(self.config, REQUIRED_PROFILES)
+            required = required_profiles or REQUIRED_PROFILES
+            names = required(self.config) if callable(required) else required
+            validate_required_profiles(self.config, names)
         except ConfigurationError as exc:
             return CheckResult("config", False, str(exc))
         src = self.config_path or "(built-in defaults)"
@@ -92,13 +113,9 @@ class Doctor:
     def check_state_dir(self) -> CheckResult:
         d = self.state_dir or (self.config.state_dir if self.config else ".autoforge")
         path = Path(self.cwd) / d if not Path(d).is_absolute() else Path(d)
-        try:
-            path.mkdir(parents=True, exist_ok=True)
-            fd, tmp = tempfile.mkstemp(prefix=".doctor-", dir=str(path))
-            os.close(fd)
-            os.unlink(tmp)
-        except OSError as exc:
-            return CheckResult("state dir writable", False, f"{path}: {exc}")
+        problem = self._writable(path)
+        if problem is not None:
+            return CheckResult("state dir writable", False, f"{path}: {problem}")
         return CheckResult("state dir writable", True, str(path))
 
     def check_git_repo(self) -> CheckResult:
@@ -121,18 +138,162 @@ class Doctor:
         ok, detail = self._run([gh, "auth", "status"])
         return CheckResult("gh authenticated", ok, detail)
 
-    def run_all(self) -> list[CheckResult]:
-        results = [self.check_config()]
+    def check_feature_spec(self, spec_path: str) -> CheckResult:
+        """Validate a feature specification path the way `local run` would."""
+        from .local_workspace import read_feature_spec
+
+        name = "feature specification"
+        ws = self._workspace()
+        try:
+            spec = read_feature_spec(ws, spec_path)
+        except Exception as exc:
+            return CheckResult(name, False, f"{spec_path}: {exc}")
+        return CheckResult(name, True, f"{spec.relative_path} (sha256 {spec.sha256[:16]}...)")
+
+    def check_validation_commands(self) -> CheckResult:
+        """Report the configured local validation commands (never runs them)."""
         cfg = self.config
-        gh = cfg.github.command if cfg else "gh"
-        claude_cmd = "claude"
-        opencode_cmd = "opencode"
+        cmds = cfg.local.validation_commands if cfg else []
+        name = "local validation commands"
+        if not cmds:
+            return CheckResult(name, True, "(none configured)", required=False)
+        return CheckResult(name, True, "; ".join(" ".join(argv) for argv in cmds))
+
+    def run_local(self, feature_spec_path: str | None = None) -> list[CheckResult]:
+        """Checks a LOCAL run needs — and nothing that touches GitHub.
+
+        No `gh` binary, no `gh auth status`, no `origin` remote: a local run
+        makes zero GitHub calls, so requiring any of them here would be a
+        false failure on exactly the machine local mode exists for.
+        """
+        # Which reviewer profiles a local run needs depends on its configured
+        # review bound, so the requirement is derived from the loaded config
+        # rather than from a fixed list (`local_required_profiles`). `doctor`
+        # therefore fails on a missing `review_round_6_plus` exactly when a run
+        # with this `local.max_fix_rounds` could actually ask for it.
+        results = [self.check_config(local_required_profiles)]
+        cfg = self.config
+        results.append(self._version_check("git available", ["git", "--version"]))
+        results.append(self.check_git_repo())
+        results.extend(self._local_agent_checks(cfg))
+        results.append(self.check_local_state_dir())
+        results.append(self.check_validation_commands())
+        if feature_spec_path:
+            results.append(self.check_feature_spec(feature_spec_path))
+        return results
+
+    def _local_agent_checks(self, cfg: AutoForgeConfig | None) -> list[CheckResult]:
+        """One `--version` check per external CLI a LOCAL run can actually reach.
+
+        Derived from `local_required_profiles`, not from every configured
+        profile: a machine only needs the binaries the *reachable* local
+        profiles name. A local configuration that routes everything through
+        OpenCode must not fail because an unrelated remote profile mentions
+        `claude`, and one that uses only `scripted` profiles must not require
+        an external CLI at all — `scripted` spawns the configured argv
+        directly rather than an agent CLI, so there is no version to query.
+        Each distinct command is checked once, labelled with the profiles that
+        reach it.
+        """
+        if cfg is None:
+            return []
+        try:
+            reachable = local_required_profiles(cfg)
+        except ConfigurationError:
+            return []
+        commands: dict[str, list[str]] = {}
+        for name in reachable:
+            profile = cfg.profiles.get(name)
+            if profile is None or profile.provider == "scripted":
+                continue
+            command = profile.command or DEFAULT_AGENT_COMMANDS.get(profile.provider, "")
+            if not command:
+                continue
+            commands.setdefault(command, []).append(name)
+        if not commands:
+            return [
+                CheckResult(
+                    "agent CLI available",
+                    True,
+                    "(no external agent CLI is reachable for this local configuration)",
+                    required=False,
+                )
+            ]
+        return [
+            self._version_check(
+                f"agent '{command}' available ({', '.join(names)})", [command, "--version"]
+            )
+            for command, names in commands.items()
+        ]
+
+    def _workspace(self):
+        """A LocalWorkspace over the doctor's cwd, configured like a real run."""
+        from .local_workspace import LocalWorkspace
+
+        cfg = self.config
+        local = cfg.local if cfg else None
+        return LocalWorkspace(
+            workdir=self.cwd,
+            runner=self._runner,
+            exclude=local.exclude if local else (),
+            max_entries=local.max_workspace_entries if local else DEFAULT_MAX_ENTRIES,
+            max_bytes=local.max_workspace_bytes if local else DEFAULT_MAX_BYTES,
+        )
+
+    def check_local_state_dir(self) -> CheckResult:
+        """Where this run would keep its state — outside the reviewed tree, writable.
+
+        This replaces the generic `check_state_dir` for local mode rather than
+        joining it: the generic check would create `.autoforge/` inside the
+        working tree, and in LOCAL mode that directory is part of what gets
+        fingerprinted. A read-only diagnostic must not change what a run would
+        review.
+        """
+        from .engine import local_state_paths
+
+        cfg = self.config
+        name = "state dir outside the reviewed working tree"
+        ws = self._workspace()
+        try:
+            paths = local_state_paths(
+                ws, explicit=self.state_dir, configured=cfg.state_dir if cfg else None
+            )
+            ws.check_state_dir_location(paths.state_dir)
+        except Exception as exc:
+            return CheckResult(name, False, str(exc))
+        writable = self._writable(paths.state_dir)
+        if writable is not None:
+            return CheckResult(name, False, f"{paths.state_dir}: {writable}")
+        return CheckResult(name, True, str(paths.state_dir))
+
+    @staticmethod
+    def _writable(path: Path) -> str | None:
+        """None when a temp file can be created in ``path``, else why not."""
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(prefix=".doctor-", dir=str(path))
+            os.close(fd)
+            os.unlink(tmp)
+        except OSError as exc:
+            return str(exc)
+        return None
+
+    @staticmethod
+    def _agent_commands(cfg: AutoForgeConfig | None) -> tuple[str, str]:
+        claude_cmd, opencode_cmd = "claude", "opencode"
         if cfg:
             for p in cfg.profiles.values():
                 if p.provider == "claude" and p.command:
                     claude_cmd = p.command
                 if p.provider == "opencode" and p.command:
                     opencode_cmd = p.command
+        return claude_cmd, opencode_cmd
+
+    def run_all(self) -> list[CheckResult]:
+        results = [self.check_config()]
+        cfg = self.config
+        gh = cfg.github.command if cfg else "gh"
+        claude_cmd, opencode_cmd = self._agent_commands(cfg)
         results.append(self._version_check("git available", ["git", "--version"]))
         results.append(self._version_check("gh available", [gh, "--version"]))
         results.append(self.check_gh_auth(gh))
@@ -151,3 +312,16 @@ def run_doctor(
     runner: Runner | None = None,
 ) -> list[CheckResult]:
     return Doctor(config_path=config_path, state_dir=state_dir, cwd=cwd, runner=runner).run_all()
+
+
+def run_local_doctor(
+    config_path: str | None = None,
+    state_dir: str | None = None,
+    cwd: str | None = None,
+    runner: Runner | None = None,
+    feature_spec_path: str | None = None,
+) -> list[CheckResult]:
+    """`autoforge local doctor`: the LOCAL checks only (never touches GitHub)."""
+    return Doctor(config_path=config_path, state_dir=state_dir, cwd=cwd, runner=runner).run_local(
+        feature_spec_path
+    )

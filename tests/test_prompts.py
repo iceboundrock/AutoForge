@@ -181,7 +181,7 @@ def test_correction_prompt_exact_text():
     text = prompts.load_template("correction.md")
     assert "Your previous execution did not return a valid CONTROL_RESULT." in text
     assert "Do not blindly repeat GitHub or repository operations" in text
-    assert "{{PREVIOUS_ERROR}}" in text
+    assert "{{PREVIOUS_ERROR_BLOCK}}" in text
 
 
 def test_engine_prompt_variables_review_and_fix(engine):
