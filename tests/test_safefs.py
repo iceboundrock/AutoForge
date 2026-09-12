@@ -11,8 +11,10 @@ These tests do not check that a particular exception is raised, because that
 is an implementation detail that changed once already and will change again.
 They check the guarantee:
 
-    a controller write lands inside the inode opened as the root, on a regular
-    file with exactly one name, or it does not happen at all --
+    a controller write lands inside the inode opened as the root, on an inode
+    the controller created or opened as a single-named regular file, and a
+    name is published only over an inode found single-named after the write,
+    or it does not happen at all --
 
 by planting an *external sentinel* outside the root and asserting, in every
 cell, that it is byte-for-byte and inode-for-inode what it was before.
@@ -193,6 +195,49 @@ def test_append_replaces_a_hard_link_instead_of_writing_the_shared_inode(tmp_pat
     sentinel.assert_untouched()
     assert (root_dir / "events.jsonl").read_text(encoding="utf-8") == SENTINEL + "controller\n"
     assert (root_dir / "events.jsonl").stat().st_nlink == 1
+
+
+def test_a_temporary_hard_linked_out_during_the_write_is_never_published(tmp_path, monkeypatch):
+    """R10-F2: the create-then-write window on the *named* temporary.
+
+    ``_durable_tmp_at`` creates ``.af-tmp-*`` with ``O_EXCL``, which proves the
+    inode is the controller's own -- but it has a name, and a same-user
+    process can ``link(2)`` that name outside the root before the bytes are
+    written. The race is made deterministic by planting the extra link inside
+    the create call itself, so it exists before the first byte is written.
+
+    What must hold: the write is refused, nothing is published under the
+    final name, the temporary is gone, and the link the other process holds
+    ends up as an *empty* file -- the controller's bytes were emptied through
+    the descriptor they were written through, so the outside name keeps no
+    copy of a state file it did not own.
+    """
+    import autoforge.safefs as safefs
+
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    planted = outside / "stolen-tmp"
+    real_open = safefs.open_regular_at
+
+    def open_and_hard_link_the_temporary(parent, name, flags, **kwargs):
+        fd = real_open(parent, name, flags, **kwargs)
+        if name.startswith(".af-tmp-"):
+            os.link(name, planted, src_dir_fd=parent)
+        return fd
+
+    monkeypatch.setattr(safefs, "open_regular_at", open_and_hard_link_the_temporary)
+
+    with SafeRoot.open(root_dir) as root:
+        with pytest.raises(UnsafePathError, match="linked the controller's temporary"):
+            root.write_bytes("state.json", b"controller secret state\n")
+
+    assert not (root_dir / "state.json").exists(), "the write was published anyway"
+    assert [e.name for e in root_dir.iterdir()] == [], "the temporary was left behind"
+    assert planted.exists(), "the test did not model the race"
+    assert planted.stat().st_nlink == 1, "the controller's own name still exists"
+    assert planted.read_bytes() == b"", "the controller's bytes reached the planted name"
 
 
 def test_a_directory_at_the_target_is_refused_while_a_special_entry_is_replaced(tmp_path):

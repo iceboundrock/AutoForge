@@ -7,7 +7,10 @@
   checks of review rounds 1–4
 - **Amended:** round 6 — §5.4 (state-root inode binding, R6-F1), §5.7 (the
   reader policy is frozen with the run, R6-F2), §5.8 (delimiter-safe
-  specification quoting)
+  specification quoting); round 10 — §3 V and §5.10 (REVIEW never binds a
+  new fingerprint, R10-F1), §5.4 and §8.10 (the named-temporary window,
+  R10-F2), §5.5 (the state file is bounded, R10-F3), §5.4 (the doctor probes
+  through the capability, R10-F4)
 - **Closes by design:** #46, #47, #48, #49, #50; #45 (see *Compatibility*)
 
 ## 1. Problem
@@ -47,6 +50,7 @@ means the finding was a sample of an open-ended set.
 | R7-F2 | 7 | the link-target check had its own copy of "excluded", diverging from the walk's | Fingerprint totality | — | systemic |
 | R7-F4 | 7 | the walk materialised a directory before checking the budget; the spec read was unbounded | Availability | — | local |
 | R9-F1 | 9 | a link to the root, or to any directory *containing* an exclusion, reached excluded bytes at an unexcluded path | Fingerprint totality | Check the target and its ancestors | systemic |
+| R10-F1 | 10 | REVIEW re-bound the fingerprint on every entry, so a reviewer's own (crashed or refused) edit was reviewed as the implementation | Review binding | — | systemic |
 
 Every systemic row has the same cause, and it is one sentence:
 
@@ -81,6 +85,9 @@ have written", which an agent could simply write into.
 | R6-F1 | 6 | the state **root** replaced by an ordinary directory redirected state and logs | directory × *root* × all | systemic |
 | R7-F1 | 7 | the bootstrap of a new run resolved the state directory by pathname before the capability existed | link × root × create | systemic |
 | R7-F5 | 7 | `create_exclusive` wrote the final name directly, so a crash left a partial artifact | — × final × create | local |
+| R10-F2 | 10 | the `O_EXCL` temporary has a *name* for the length of the write, and a second `link(2)` to it lets the bytes be observed outside the root | hardlink × temporary × write | local |
+| R10-F3 | 10 | `state.json` was read without a bound, so a sparse or oversized file was materialised whole | — × final × read | local |
+| R10-F4 | 10 | `doctor` located the state dir by resolved pathname, then probed it by pathname (`mkdir`, `mkstemp`) through a symlinked `<git dir>/autoforge` | link × parent × create (doctor) | systemic |
 
 Again one cause:
 
@@ -112,6 +119,10 @@ signal that they were not of the same kind:
   REVIEW could close a FIX checkpoint unexamined). Both were closed by naming
   the fact — every launch is charged before it starts; the checkpoint is
   resumed only by the phase that wrote it, or kept by a terminal phase.
+  Round 10 added R10-F1, which is a Class A row by symptom (a reviewer's own
+  edit reviewed as the implementation) and a C row by cause: the fact that
+  authorises binding a fingerprint is "the controller verified this tree",
+  and REVIEW had been binding one without it (§5.10).
 - **D (secrets):** R1-F5 (r1), F3 (r4) — the journal was serialised from a
   record that had not been redacted. Fixed once, at the record, not per
   call site. Has not recurred.
@@ -258,7 +269,12 @@ Stated so that each is mechanically checkable, before any code.
   its dead predecessor's side effects as absent, and never advances past work
   it did not verify *after* the crash.
 - **V (review).** A review is accepted only while `reviewed_fingerprint ==
-  current_fingerprint`, both computed by the controller, never reported.
+  current_fingerprint`, both computed by the controller, never reported —
+  and `reviewed_fingerprint` is bound only by a phase whose result the
+  controller *verified* (the write phases, after their validation commands
+  ran). REVIEW compares against that value and never binds a new one: a tree
+  that no longer matches it is refused before a reviewer is launched, since
+  the controller cannot tell a reviewer's leftover edit from an operator's.
 - **G (git anchor).** HEAD, branch and repository identity are read by the
   controller before and after every phase and are bound separately from the
   tree contents.
@@ -405,9 +421,24 @@ contract rather than accident:
 
 The one artifact that must be opened in place is the append-only
 `events.jsonl`; there the open is `O_NOFOLLOW|O_NONBLOCK|O_NOCTTY` and
-`st_nlink > 1` is refused on the descriptor. That is the complete set of
-refusals in the write path, and it is small because the *mechanism*, not a
-list, is doing the work.
+`st_nlink > 1` is refused on the descriptor. The temporary gets the same
+inspection on the same descriptor once its bytes are durable and before it
+is published (R10-F2, §8.10): the `O_EXCL` create proves the inode is the
+controller's, but the inode has a *name* for the length of the write, and a
+same-user process can give it a second one. A temporary found with more
+than one name is emptied through the controller's descriptor, unlinked and
+refused; it is never renamed or linked over the target. That is the complete
+set of refusals in the write path, and it is small because the *mechanism*,
+not a list, is doing the work.
+
+The `doctor` command is held to the same boundary (R10-F4). Its writability
+probe used to be a pathname `mkdir` + `mkstemp` after a *resolved-pathname*
+location check, so a symbolic link at `<git dir>/autoforge` passed the
+location check and was followed by the probe — the doctor wrote outside the
+repository in exactly the place a run would have refused to. The probe is
+now a `create_exclusive` + `unlink` through `StatePaths.open_root()`, the
+capability the run itself would hold, so the doctor's answer is the run's
+answer.
 
 Three filesystem facts are typed separately so callers cannot conflate them:
 **absence** (`None` / `FileNotFoundError`), **unsafe shape**
@@ -423,6 +454,15 @@ proven unchanged.
 fingerprint that accepts an equal-sized replacement with a restored mtime,
 which is worse than refusing. #46 is closed this way rather than by a
 heuristic.
+
+The state file has the same shape of bound (R10-F3). Everything the
+controller persists is already bounded per field, so a real `state.json` is
+kilobytes; `MAX_STATE_FILE_BYTES` (64 MiB) makes the *file* bounded too. The
+read is `SafeRoot.read_bytes(limit=)`, which asks for one byte past the
+budget and no more, so a sparse or oversized file a same-user process left
+at that name is refused as corrupt — the same `StateError` an unparseable
+file gets, so `--force` quarantines it by rename instead of reading it —
+without ever being held in memory.
 
 ### 5.6 Types are the contract at the state boundary
 
@@ -595,6 +635,47 @@ holds, the gate proves it is *the run that was defined* — same roots, same
 policy, same budgets, same commands, same prompt version — and every other
 alteration is caught by the state file's own validation or by drift.
 
+### 5.10 REVIEW never binds a fingerprint
+
+Until round 10, `_local_step_once` bound `workspace_fingerprint` to the
+current tree at the start of *every* phase, and only the write phases were
+checkpointed before the agent ran (§5.7, C). Read together those two rules
+had a gap R10-F1 named: a reviewer that edits the tree and then crashes (or
+is refused for that edit) leaves its edit in place; the next REVIEW entry —
+from `resume` or from the very next step — re-bound to the edited tree, and
+a reviewer that reported *that* fingerprint cleared the run to `DONE`
+without any validation command having run over the reviewer's bytes.
+
+The finding asked for the narrower fix — checkpoint REVIEW like the write
+phases and block on drift at resume. The options:
+
+- *A. Checkpoint REVIEW and compare at resume.* Closes the crash case only.
+  It leaves the refused-then-resumed case, an edit between two persisted
+  steps, and the plain "step, edit, step" of a controller that never
+  crashed; each is the same gap with a different clock. It also adds a
+  state field and its cross-field validation for a phase that has no side
+  effect to recover.
+- *B. At REVIEW entry, if the tree drifted, re-run the validation commands
+  and re-bind.* Rejected: it launders a reviewer's policy violation (or any
+  unattributed edit) into an accepted implementation. The validation
+  commands check that a tree *builds*; they are not a review of who wrote
+  it.
+- *C. REVIEW never binds.* Chosen. The fingerprint is bound only by a phase
+  whose result the controller verified — `ANALYZE_EXECUTE` and `FIX`, after
+  their validation commands ran — and REVIEW compares the tree against that
+  value: equal, launch the reviewer; different, `BLOCKED` naming both
+  fingerprints, before any launch. No new state. This is the G rule
+  applied to the tree: the controller cannot tell a reviewer's edit from an
+  operator's, so it refuses both and rolls back neither.
+
+For "verified fingerprint" to be well-defined the write phases bind the
+snapshot taken *after* the validation commands, not before: a build cache
+or a generated file the commands leave behind is part of the tree the
+reviewer will read, and binding the pre-validation snapshot would have made
+every configured command a self-inflicted drift. The extra walk happens
+only when commands are configured. The `--dry-run` plan for REVIEW reports
+the block the run would take, so a drifted tree is visible without a launch.
+
 ## 6. Completeness analysis
 
 Every shape a working tree or repository can present, and its state. There is
@@ -687,3 +768,18 @@ an independent `os.walk` finds nothing the snapshot did not mention.
    quoting of replan evidence predates `fenced_untrusted_block` and is
    unchanged; LOCAL prompts use the two primitives of §5.8 (`escape_inline`
    for one-line fields, the unclosable fence for blocks) exclusively.
+10. **A controller write can be *observed* through a planted hard link,
+    never redirected by one.** §5.4, R10-F2. The whole-file temporary is
+    created `O_CREAT|O_EXCL` — an inode this process made, empty — but it has
+    a name in a directory a same-user process can list, and that process can
+    `link(2)` the name elsewhere before the bytes are written. The descriptor
+    is re-inspected after the write and before the publish, so such a
+    temporary is emptied, unlinked and refused rather than published; what
+    remains is that the other process may have *read* the bytes through its
+    link first. Within §2.2 that is nothing: every byte the controller writes
+    is already readable by that process, and it can never make a controller
+    write land on an inode the controller did not create. Linux `O_TMPFILE`
+    (an unnamed inode published with `linkat(AT_EMPTY_PATH)`) would remove
+    even the observation window; it is not used because it does not exist on
+    macOS and the guarantee would then differ by platform. Tracked as a
+    follow-up, not a defect of the boundary.

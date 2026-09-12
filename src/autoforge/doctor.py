@@ -13,16 +13,17 @@ than reported as warnings.
 from __future__ import annotations
 
 import os
-import tempfile
+import secrets
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from .config import AutoForgeConfig, load_config_file, validate_required_profiles
-from .errors import ConfigurationError
+from .errors import ConfigurationError, StateError
 from .executor import ExecutionRequest, ExecutionResult, execute
 from .local_workspace import DEFAULT_MAX_BYTES, DEFAULT_MAX_ENTRIES
 from .profiles import local_required_profiles
+from .safefs import SafeRoot
 from .validation import parse_remote_repository
 
 Runner = Callable[[ExecutionRequest], ExecutionResult]
@@ -113,7 +114,7 @@ class Doctor:
     def check_state_dir(self) -> CheckResult:
         d = self.state_dir or (self.config.state_dir if self.config else ".autoforge")
         path = Path(self.cwd) / d if not Path(d).is_absolute() else Path(d)
-        problem = self._writable(path)
+        problem = self._writable(lambda: SafeRoot.open(path, create=True))
         if problem is not None:
             return CheckResult("state dir writable", False, f"{path}: {problem}")
         return CheckResult("state dir writable", True, str(path))
@@ -261,20 +262,30 @@ class Doctor:
             ws.check_state_dir_location(paths.state_dir)
         except Exception as exc:
             return CheckResult(name, False, str(exc))
-        writable = self._writable(paths.state_dir)
+        # The probe goes through the same capability a run would hold
+        # (``StatePaths.open_root``: descriptor-relative from the git dir,
+        # refusing a symbolic link at any component), so the doctor cannot be
+        # made to write where the run would refuse to -- a symlinked
+        # ``<git dir>/autoforge`` fails this check instead of being followed.
+        writable = self._writable(lambda: paths.open_root(create=True))
         if writable is not None:
             return CheckResult(name, False, f"{paths.state_dir}: {writable}")
         return CheckResult(name, True, str(paths.state_dir))
 
     @staticmethod
-    def _writable(path: Path) -> str | None:
-        """None when a temp file can be created in ``path``, else why not."""
+    def _writable(open_root: Callable[[], SafeRoot]) -> str | None:
+        """None when a probe file can be created through ``open_root()``, else why not.
+
+        The probe is a controller write like any other: it is created and
+        removed through the opened root, never by pathname, so the check
+        exercises exactly the boundary a run's writes would go through.
+        """
+        probe = f".doctor-probe-{secrets.token_hex(8)}"
         try:
-            path.mkdir(parents=True, exist_ok=True)
-            fd, tmp = tempfile.mkstemp(prefix=".doctor-", dir=str(path))
-            os.close(fd)
-            os.unlink(tmp)
-        except OSError as exc:
+            with open_root() as root:
+                root.create_exclusive(probe, b"")
+                root.unlink(probe)
+        except (OSError, StateError) as exc:
             return str(exc)
         return None
 

@@ -38,7 +38,7 @@ from .errors import StateError
 from .loop_guard import validate_review_history
 from .run_contract import LocalRunContract
 from .runlog import validate_run_id
-from .safefs import SafeRoot, entry_kind
+from .safefs import ReadLimitExceeded, SafeRoot, entry_kind
 from .transitions import LOCAL_PHASES, LOCAL_WRITE_PHASES, Phase, WorkflowMode
 
 STATE_FILENAME = "state.json"
@@ -47,6 +47,14 @@ CORRUPT_SUFFIX = ".corrupt-"
 # Prefix/suffix of the temporary file :func:`save_state` renames into place.
 TMP_PREFIX = ".state-"
 TMP_SUFFIX = ".tmp"
+# The most a state file may be before :func:`load_state` refuses it as
+# corrupt without reading it.  Everything the controller persists is bounded
+# (findings per round, resolution text, digests, verification failures), and
+# a real state file is a few tens of kilobytes; the budget is generous so a
+# controller upgrade never trips it, and finite so an oversized or sparse
+# ``state.json`` -- a same-user process can plant either -- is refused
+# rather than materialised into memory.
+MAX_STATE_FILE_BYTES = 64 * 1024 * 1024
 
 
 # Names AutoForge gives the entries it writes into a state directory.  They
@@ -705,7 +713,15 @@ def load_state(path: str | Path, *, root: SafeRoot | None = None) -> AutoForgeSt
             # looking for it.
             raise _not_regular(p, kind)
         try:
-            raw_bytes = fs.read_bytes(name)
+            raw_bytes = fs.read_bytes(name, limit=MAX_STATE_FILE_BYTES)
+        except ReadLimitExceeded as exc:
+            # Refused before it is held: the bounded read stops one byte past
+            # the limit, so a sparse or oversized file costs at most that.
+            raise StateError(
+                f"corrupted state file {p}: larger than {MAX_STATE_FILE_BYTES} bytes, "
+                "which no controller state can be; "
+                "refusing to overwrite — restore from backup or re-run"
+            ) from exc
         except OSError as exc:
             raise StateError(f"cannot read state file {p}: {exc}") from exc
         if raw_bytes is None:  # pragma: no cover - lstat above just found it

@@ -689,6 +689,42 @@ def test_local_doctor_never_runs_gh(tmp_path):
     assert [r for r in results if r.name == "feature specification"][0].ok
 
 
+def test_local_doctor_probes_the_state_dir_through_the_same_root_a_run_would_use(
+    tmp_path, tmp_path_factory
+):
+    """R10-F4: the writability probe cannot be redirected by a planted symlink.
+
+    Doctor used to check the state dir's *location* by resolved pathname and
+    then probe it by pathname (``mkdir`` + ``mkstemp``); with ``<git dir>/
+    autoforge`` replaced by a symbolic link, the location check still passed
+    and the probe wrote through the link, outside the repository -- exactly
+    what ``StatePaths.open_root()`` exists to refuse for the run itself.
+    The probe now goes through that root, so the check *fails* and nothing
+    is created on the far side of the link.
+    """
+    root = local_repo(tmp_path)
+    # Genuinely outside the repository: the location check (resolved
+    # pathname) must pass, so that only the probe itself stands in the way.
+    outside = tmp_path_factory.mktemp("outside")
+    (root / ".git" / "autoforge").symlink_to(outside)
+
+    result = Doctor(cwd=str(root)).check_local_state_dir()
+
+    assert not result.ok, result
+    assert "symbolic link" in result.detail, result.detail
+    assert list(outside.iterdir()) == [], "the doctor wrote through the planted link"
+    assert (root / ".git" / "autoforge").is_symlink(), "the doctor replaced the operator's entry"
+
+
+def test_local_doctor_probe_leaves_only_the_state_dir_behind(tmp_path):
+    root = local_repo(tmp_path)
+    result = Doctor(cwd=str(root)).check_local_state_dir()
+    assert result.ok, result
+    state_dir = root / ".git" / "autoforge" / "state"
+    assert state_dir.is_dir()
+    assert list(state_dir.iterdir()) == [], "the probe file was left behind"
+
+
 def test_local_doctor_checks_only_the_reachable_providers(tmp_path):
     """A local config that never reaches a Claude profile must not need `claude`.
 

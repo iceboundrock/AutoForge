@@ -36,30 +36,52 @@ to the target one component at a time with ``O_DIRECTORY | O_NOFOLLOW`` and
   opened intact, validated, and only then truncated through ``ftruncate`` on
   the very descriptor that was validated.
 
-Whole-file writes do not truncate at all: they create a fresh unlinked-name
-temporary with ``O_CREAT | O_EXCL`` in the target's own directory, fsync it,
+Whole-file writes do not truncate at all: they create a fresh temporary
+with ``O_CREAT | O_EXCL`` in the target's own directory, write and fsync it,
 and ``os.replace`` it over the target with both sides named by descriptor.
 That replaces a *name*, never an inode, so a hard link planted at the target
 survives untouched, and a reader either sees the whole old file or the whole
-new one.
+new one.  The temporary is an inode this process created, so the bytes can
+only ever land on something the controller made -- but it has a name in a
+directory another process can list, and that process can give the inode a
+second name (``link(2)``) between the create and the write.  The descriptor
+is therefore re-inspected after the write and before the publish: an inode
+that has acquired a second name is emptied through the still-open descriptor,
+unlinked and reported, never renamed over the target.
 
 What this does and does not guarantee
 -------------------------------------
 
-Guaranteed: a controller write always lands inside the inode that was opened
-as the root, on a regular file with exactly one name, or it fails.  No
-sequence of symlink, hard link, FIFO, device, directory-replacement or rename
-operations performed by another process under the same user can move a
-controller write outside that inode or onto an object the controller did not
-create.  This is a property of descriptor-relative addressing, not of a list
-of rejected shapes, so a shape nobody has thought of yet is covered too.
+Guaranteed: a controller write always lands on an inode the controller itself
+created (or opened as a regular file with one name), reached through the
+directory descriptor that was opened as the root, or it fails; and a name the
+controller *publishes* -- the final rename or link -- names an inode that had
+exactly one name at the last inspection before the publish.  No sequence of
+symlink, hard link, FIFO, device, directory-replacement or rename operations
+performed by another process under the same user can move a controller write
+outside that root or onto an object the controller did not create.  This is a
+property of descriptor-relative addressing, not of a list of rejected shapes,
+so a shape nobody has thought of yet is covered too.
 
-Not guaranteed: the *initial* resolution of the root path itself.  ``SafeRoot
-.open`` resolves an ordinary pathname, and a process that can redirect that
-pathname in the instant before the open can point the controller at a
-different directory.  That is equivalent to being able to redirect the
-repository checkout itself and no pathname-based defence can close it; it is
-stated here rather than papered over.  Everything *below* the root is closed.
+Not guaranteed: that a same-user process cannot *observe* a controller write
+through a name it planted.  A named temporary can be hard-linked out of the
+root in the window between its creation and the write, and the bytes reach
+that link before the post-write inspection detects it; the write is then
+refused and the inode emptied, but the other process may already have read
+it.  Every byte the controller writes is already readable by that process
+(same user, same files), so this discloses nothing, and it can never make a
+controller write *replace* anything: the inode was created by this process,
+empty, an instant earlier.  Linux could close even the observation window
+with an unnamed ``O_TMPFILE`` inode; that is not done because it does not
+exist on macOS and would make the guarantee platform-shaped.
+
+Also not guaranteed: the *initial* resolution of the root path itself.
+``SafeRoot.open`` resolves an ordinary pathname, and a process that can
+redirect that pathname in the instant before the open can point the
+controller at a different directory.  That is equivalent to being able to
+redirect the repository checkout itself and no pathname-based defence can
+close it; it is stated here rather than papered over.  Everything *below* the
+root is closed.
 """
 
 from __future__ import annotations
@@ -709,6 +731,15 @@ class SafeRoot:
         Returns the temporary's name; the caller publishes it under the final
         name (or unlinks it).  The name carries the pid and a random token, so
         two controllers and two attempts by one controller never collide.
+
+        The temporary is created ``O_EXCL`` -- it is this process's inode --
+        but it is *named*, and a same-user process can hard-link that name
+        elsewhere between the create and the write.  So the descriptor is
+        inspected again once the bytes are durable and before the name is
+        handed to the caller: a temporary that has gained a second name is
+        emptied through the descriptor it was written through, unlinked, and
+        refused (see the module docstring for exactly what that closes and
+        what it cannot).
         """
         tmp = f".af-tmp-{os.getpid():x}-{secrets.token_hex(8)}"
         fd = open_regular_at(
@@ -719,6 +750,20 @@ class SafeRoot:
                 fh.write(data)
                 fh.flush()
                 os.fsync(fh.fileno())
+                nlink = os.fstat(fh.fileno()).st_nlink
+                if nlink > 1:
+                    # Our inode, emptied through our descriptor: the second
+                    # name keeps an empty file, and nothing is published.
+                    os.ftruncate(fh.fileno(), 0)
+                    _quiet_unlink(parent, tmp)
+                    raise _unsafe(
+                        where,
+                        f"being written through a temporary that acquired {nlink - 1} extra "
+                        "directory entr(ies) while it was being written; another process "
+                        "linked the controller's temporary file elsewhere",
+                    )
+        except UnsafePathError:
+            raise
         except OSError as exc:
             # The temporary is never published, so a failed write leaves
             # neither a partial final name nor a stray temporary behind.

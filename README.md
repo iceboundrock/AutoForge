@@ -467,7 +467,7 @@ With that, the controller checks for itself:
 | Phase | Verified independently of what the agent claimed |
 |---|---|
 | `ANALYZE_EXECUTE` | feature spec hash unchanged; the workspace really changed (and matches the agent's `changed_workspace` claim); every configured validation command exits 0 |
-| `REVIEW` | feature spec hash unchanged; the reviewed fingerprint is exactly the one bound before the reviewer ran; the reviewer did not modify the workspace; `needs_fix_round == (findings > 0)`; finding IDs unique and in-round |
+| `REVIEW` | feature spec hash unchanged; the tree still matches the fingerprint the controller bound after the last verified write phase (`REVIEW` never binds a new one — a tree that drifted, whatever moved it, is `BLOCKED` before the reviewer is launched); the reviewed fingerprint is exactly that value; the reviewer did not modify the workspace; `needs_fix_round == (findings > 0)`; finding IDs unique and in-round |
 | `FIX` | feature spec hash unchanged; every open finding has a resolution; a `fixed` resolution actually changed the workspace; validation commands still pass |
 
 **No commit is ever required and HEAD never has to move.** The implementation
@@ -519,7 +519,10 @@ local:
 They run after `ANALYZE_EXECUTE` and after `FIX`, are logged like any other
 invocation, and a non-zero exit (or a timeout) means the phase is *not*
 verified: the run stops with the phase unchanged for `resume`. `--dry-run`
-lists them and executes none of them.
+lists them and executes none of them. The fingerprint a review is bound to
+is taken *after* they ran, so a build cache or a generated file they leave
+in the tree is part of the reviewed tree rather than a drift the next phase
+would refuse.
 
 ### Dry run and resume
 

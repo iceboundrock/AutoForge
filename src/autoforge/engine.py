@@ -1015,9 +1015,17 @@ class ControllerEngine:
                 f"review round {s.review_round + 1} of at most {cap} "
                 f"(local.max_fix_rounds={contract.max_fix_rounds})"
             )
+            if variables["WORKSPACE_FINGERPRINT"] != s.workspace_fingerprint:
+                notes.append(
+                    "would enter BLOCKED without invoking the reviewer: the working tree "
+                    f"changed since the controller last verified it (bound "
+                    f"{s.workspace_fingerprint[:16]}...); REVIEW never re-binds"
+                )
             notes.append(
-                "the reviewed workspace fingerprint is computed immediately before the review "
-                "and the review is rejected unless it is bound to exactly that value"
+                "the review is bound to the tree the controller last verified "
+                f"({s.workspace_fingerprint[:16]}...); it is refused unless the tree still "
+                "matches when the reviewer starts, and unless the reviewer reports exactly "
+                "that value and leaves the tree unchanged"
             )
         else:
             notes.append(
@@ -1398,7 +1406,21 @@ class ControllerEngine:
         if drift:
             return self._block(previous, plan, self._local_anchor_block_reason(drift))
         before = self.workspace().snapshot()
-        state.workspace_fingerprint = before.fingerprint
+        if previous == Phase.REVIEW:
+            # REVIEW never binds a new fingerprint. `workspace_fingerprint` is
+            # the tree as the controller last *verified* it -- the bytes the
+            # validation commands passed on -- and a review is only ever bound
+            # to that. A tree that differs here was written by something the
+            # controller did not verify: a reviewer that edited the code and
+            # then crashed (or returned, was refused, and is being resumed), a
+            # process an agent left behind, or the operator. The controller
+            # cannot tell those apart and does not try; re-binding would let
+            # the next reviewer clear bytes no validation command ever saw
+            # (R10-F1), so the run blocks and the tree is left as it is.
+            if before.fingerprint != state.workspace_fingerprint:
+                return self._block(previous, plan, self._local_unverified_tree_block_reason(before))
+        else:
+            state.workspace_fingerprint = before.fingerprint
 
         # Durable invocation checkpoint for the write-capable phases. It is
         # persisted *before* the agent starts, so a crash mid-invocation, a
@@ -1561,6 +1583,19 @@ class ControllerEngine:
             "the controller never undoes a git operation it did not perform"
         )
 
+    def _local_unverified_tree_block_reason(self, now: WorkspaceSnapshot) -> str:
+        state = self._require_state()
+        return self._local_block_reason(
+            f"the working tree changed since the controller last verified it (fingerprint "
+            f"{state.workspace_fingerprint[:16]}... -> {now.fingerprint[:16]}...; now "
+            f"{now.describe()}). A review is bound only to a tree whose bytes passed the "
+            "validation commands, and REVIEW never re-binds to a tree it did not verify: "
+            "the change may be a reviewer's edit from an invocation that crashed or was "
+            "refused, a process an agent left running, or an operator's, and the controller "
+            "cannot tell those apart. Nothing was rolled back -- the controller never "
+            "undoes a write it did not perform"
+        )
+
     def _initialize_local(self, plan: StepPlan) -> StepOutcome:
         """Preflight for a local run: config, git, frozen spec. No GitHub."""
         state = self._require_state()
@@ -1659,17 +1694,33 @@ class ControllerEngine:
                 "that cannot implement the feature must report status 'blocked' or 'failure' "
                 "with a reason instead."
             )
-        self._run_validation_commands(Phase.ANALYZE_EXECUTE)
-        state.workspace_fingerprint = after.fingerprint
+        verified = self._verified_snapshot(Phase.ANALYZE_EXECUTE, after)
+        state.workspace_fingerprint = verified.fingerprint
         state.last_review_result = ""
         tests = (
             f", tests attempted: {', '.join(res.tests_attempted)}" if res.tests_attempted else ""
         )
         return Phase.REVIEW, (
-            f"implementation verified: working tree now holds {after.describe()}, "
-            f"fingerprint {after.fingerprint[:16]}...{tests}; "
+            f"implementation verified: working tree now holds {verified.describe()}, "
+            f"fingerprint {verified.fingerprint[:16]}...{tests}; "
             "ANALYZE_EXECUTE -> REVIEW"
         )
+
+    def _verified_snapshot(self, phase: Phase, after: WorkspaceSnapshot) -> WorkspaceSnapshot:
+        """Run the validation commands and return the tree they left behind.
+
+        ``after`` is the tree the agent produced. The commands are the
+        controller's own, from the contract, and they may write into the tree
+        (a test runner's cache, a build output), so the fingerprint the next
+        REVIEW is bound to is taken *after* they ran: it is the tree as the
+        controller's verification left it, and REVIEW refuses any other. When
+        no command is configured nothing controller-side touched the tree
+        and ``after`` is that fingerprint already; a second walk would only
+        re-derive it.
+        """
+        if not self._run_validation_commands(phase):
+            return after
+        return self.workspace().snapshot()
 
     def _apply_local_review(self, res: LocalReviewResult) -> tuple[Phase, str]:
         state = self._require_state()
@@ -1758,7 +1809,6 @@ class ControllerEngine:
                 f"FIX claims {len(fixed)} 'fixed' resolution(s) but the working tree is "
                 "unchanged since this fix round was first invoked; nothing was actually fixed."
             )
-        state.workspace_fingerprint = after.fingerprint
         state.last_fix_resolutions = [redact_dict(r.to_dict()) for r in res.resolutions]
         # The round number this attempt would conclude. `local_fix_rounds`
         # counts fix rounds the controller *concluded* — either back to REVIEW
@@ -1797,7 +1847,8 @@ class ControllerEngine:
                 f"({detail}). The validation commands were not run"
             )
 
-        self._run_validation_commands(Phase.FIX)
+        verified = self._verified_snapshot(Phase.FIX, after)
+        state.workspace_fingerprint = verified.fingerprint
         state.local_fix_rounds = round_no
         state.open_findings = []
         state.last_review_result = "fixed"
@@ -1812,21 +1863,22 @@ class ControllerEngine:
             f"resolution(s){note}; FIX -> REVIEW (round {state.review_round + 1})"
         )
 
-    def _run_validation_commands(self, phase: Phase) -> None:
+    def _run_validation_commands(self, phase: Phase) -> bool:
         """Run ``local.validation_commands`` and require every one to exit 0.
 
         Controller-owned verification, not something an agent reports: the
         commands come from configuration as argv arrays and are executed
         through the normal executor, never through a shell. A non-zero exit
         means the phase is not verified, so the run stays in this phase for
-        ``resume`` rather than advancing on an agent's word.
+        ``resume`` rather than advancing on an agent's word. Returns whether
+        any command ran (``False`` when none is configured).
         """
         state = self._require_state()
         # From the contract, not the configuration: what verifies this run
         # was decided when the run was created.
         commands = self.local_contract().validation_commands
         if not commands:
-            return
+            return False
         logger = self._logger()
         for argv in commands:
             req = ExecutionRequest(
@@ -1877,6 +1929,7 @@ class ControllerEngine:
                     f"{result.exit_code}; {phase.value} is not verified and the run stays in "
                     f"{phase.value}. Output tail: {tail}"
                 )
+        return True
 
     # -- deterministic steps ---------------------------------------------------
     def _initialize(self, plan: StepPlan) -> StepOutcome:

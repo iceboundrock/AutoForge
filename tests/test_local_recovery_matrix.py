@@ -301,12 +301,16 @@ def test_a_crash_before_a_findings_review_is_persisted_does_not_charge_a_round(t
     assert [f["id"] for f in eng2.state.open_findings] == ["R1-F1"]
 
 
-def test_the_tree_moving_while_the_controller_was_dead_invalidates_the_review(tmp_path):
+def test_the_tree_moving_while_the_controller_was_dead_blocks_the_review(tmp_path):
     """The reviewed bytes are the only thing a clean review is about.
 
-    A crash is a window in which the operator can edit anything, so the
-    fingerprint the resumed reviewer is bound to is re-derived, never
-    inherited -- and a review quoting the pre-crash fingerprint is stale.
+    A crash is a window in which anything can edit the tree: the operator,
+    the dead reviewer's own last writes, a process an agent left behind. The
+    controller cannot attribute the change, and only ANALYZE_EXECUTE and FIX
+    output is ever run through the validation commands -- so REVIEW does not
+    re-bind to whatever the tree is now (R10-F1). A review quoting the old
+    fingerprint is stale, and the run stops rather than reviewing bytes the
+    controller never verified.
     """
     root = local_repo(tmp_path)
     eng = make_local_engine(root, FEATURE)
@@ -324,16 +328,172 @@ def test_the_tree_moving_while_the_controller_was_dead_invalidates_the_review(tm
     (root / "src" / "extra.py").write_text("EDITED = 1\n", encoding="utf-8")
 
     eng2 = fresh(root)
-    assert eng2.state.workspace_fingerprint == reviewed, "state still holds the old value"
-    eng2.provider._handler = lambda req: review_result(reviewed)
-    with pytest.raises(VerificationError, match="fingerprint"):
-        eng2.step()
-    assert eng2.state.phase == Phase.REVIEW
-    # Re-bound: the reviewer is told about the tree as it is now, and a review
-    # of *that* is accepted.
-    eng3 = fresh(root)
-    eng3.provider._handler = lambda req: review_result(eng3.state.workspace_fingerprint)
-    assert eng3.state.workspace_fingerprint != reviewed
+    assert eng2.state.workspace_fingerprint == reviewed, "state still holds the verified value"
+    calls: list[object] = []
+    eng2.provider._handler = lambda req: (calls.append(req), review_result(reviewed))[1]
+    outcome = eng2.step()
+    assert outcome.next_phase == "BLOCKED"
+    assert eng2.state.phase == Phase.BLOCKED
+    assert calls == [], "the reviewer is never invoked against an unverified tree"
+    assert "changed since the controller last verified it" in eng2.state.block_reason
+    assert reviewed[:16] in eng2.state.block_reason
+    assert eng2.state.workspace_fingerprint == reviewed, "never re-bound"
+    assert (root / "src" / "extra.py").read_text(encoding="utf-8") == "EDITED = 1\n"
+    assert load_state(eng2.paths.state_file).phase == Phase.BLOCKED
+
+
+def test_a_reviewer_that_edits_the_tree_and_crashes_cannot_have_its_edit_reviewed(tmp_path):
+    """R10-F1: the regression the finding asked for.
+
+    The reviewer writes a file that would fail the validation commands, then
+    dies before returning. Nothing verified that file: REVIEW is read-only so
+    it has no validation step, and the crash means the after-review check
+    never ran. Re-binding on resume would hand the next reviewer a tree
+    containing the file, and a clean verdict would carry the run to DONE
+    with a validation failure inside it. The resumed step must refuse.
+    """
+    root = local_repo(tmp_path)
+    cfg = default_config()
+    planted = root / "src" / "planted_by_reviewer.py"
+    cfg.local.validation_commands = [["test", "!", "-e", str(planted)]]
+    eng = make_local_engine(root, FEATURE, cfg=cfg)
+    eng.step()
+    eng.provider._handler = lambda req: (touch_impl(root, "v1\n"), impl_result())[1]
+    assert eng.step().next_phase == "REVIEW", "validation passed on the implementation"
+    verified = eng.state.workspace_fingerprint
+
+    def edit_then_die(req):
+        planted.write_text("BROKEN = 1\n", encoding="utf-8")
+        raise Crash("reviewer killed after writing into the tree")
+
+    eng.provider._handler = edit_then_die
+    with pytest.raises(Crash):
+        eng.step()
+    assert planted.exists(), "the dead reviewer's write is in the tree"
+    saved = load_state(eng.paths.state_file)
+    assert saved.phase == Phase.REVIEW
+    assert saved.workspace_fingerprint == verified, "the checkpoint holds the verified tree"
+
+    # A resumed controller must not review -- let alone complete on -- the
+    # planted tree, whatever the next reviewer would have said about it.
+    eng2 = fresh(root, cfg=cfg)
+    calls: list[object] = []
+    eng2.provider._handler = lambda req: (
+        calls.append(req),
+        review_result(eng2.state.workspace_fingerprint),
+    )[1]
+    outcome = eng2.step()
+    assert outcome.next_phase == "BLOCKED"
+    assert calls == [], "no reviewer was launched"
+    assert eng2.state.phase == Phase.BLOCKED
+    assert eng2.state.review_round == 0
+    assert eng2.state.workspace_fingerprint == verified
+    assert "changed since the controller last verified it" in eng2.state.block_reason
+    assert planted.exists(), "nothing was rolled back"
+    # And a second resume from BLOCKED does not launder it either.
+    eng3 = fresh(root, cfg=cfg)
+    assert eng3.state.phase == Phase.BLOCKED
+
+
+def test_a_reviewer_that_edits_the_tree_and_returns_is_refused_and_stays_refused(tmp_path):
+    """The non-crash twin of the previous case.
+
+    The reviewer edits and then *does* return a verdict: the after-review
+    check refuses it, which it always did. What must also hold is that the
+    resume afterwards does not accept the edited tree as the new baseline.
+    """
+    root = local_repo(tmp_path)
+    eng = make_local_engine(root, FEATURE)
+    eng.step()
+    eng.provider._handler = lambda req: (touch_impl(root, "v1\n"), impl_result())[1]
+    eng.step()
+    verified = eng.state.workspace_fingerprint
+
+    def edit_and_return(req):
+        (root / "src" / "sneaky.py").write_text("X = 1\n", encoding="utf-8")
+        return review_result(verified)
+
+    eng.provider._handler = edit_and_return
+    with pytest.raises(VerificationError, match="modified the working tree during REVIEW"):
+        eng.step()
+    assert eng.state.phase == Phase.REVIEW
+
+    eng2 = fresh(root)
+    eng2.provider._handler = lambda req: review_result(eng2.state.workspace_fingerprint)
+    assert eng2.step().next_phase == "BLOCKED"
+    assert eng2.state.workspace_fingerprint == verified
+    assert (root / "src" / "sneaky.py").exists()
+
+
+def test_an_operator_edit_between_a_verified_phase_and_review_blocks_too(tmp_path):
+    """No crash at all: the tree is edited between two persisted steps.
+
+    The same rule, because the controller cannot tell this edit from the
+    previous test's. The block names both fingerprints so the operator can
+    see what happened; nothing is reverted.
+    """
+    root = local_repo(tmp_path)
+    eng = make_local_engine(root, FEATURE)
+    eng.step()
+    eng.provider._handler = lambda req: (touch_impl(root, "v1\n"), impl_result())[1]
+    eng.step()
+    verified = eng.state.workspace_fingerprint
+    touch_impl(root, "v1 with a manual tweak\n")
+
+    eng2 = fresh(root)
+    eng2.provider._handler = lambda req: review_result(eng2.state.workspace_fingerprint)
+    outcome = eng2.step()
+    assert outcome.next_phase == "BLOCKED"
+    assert verified[:16] in eng2.state.block_reason
+    assert (root / IMPL_FILE).read_text(encoding="utf-8") == "v1 with a manual tweak\n"
+
+
+def test_validation_command_output_is_part_of_the_verified_tree(tmp_path):
+    """Validation commands may write into the tree; REVIEW is bound to what they left.
+
+    The controller's own commands (a test runner's cache, a build) change the
+    tree after the agent's snapshot. That is the controller's verification
+    at work, not an unverified edit, so the fingerprint handed to REVIEW is
+    taken after they ran -- and the reviewer must report exactly that value,
+    not the pre-validation one.
+    """
+    root = local_repo(tmp_path)
+    cfg = default_config()
+    cache = root / ".build-cache"
+    cfg.local.validation_commands = [["sh", "-c", f"echo built >> {cache}"]]
+    eng = make_local_engine(root, FEATURE, cfg=cfg)
+    eng.step()
+    eng.provider._handler = lambda req: (touch_impl(root, "v1\n"), impl_result())[1]
+    outcome = eng.step()
+    assert outcome.next_phase == "REVIEW"
+    assert cache.read_text(encoding="utf-8") == "built\n"
+    assert eng.state.workspace_fingerprint == fingerprint(root), "bound after validation"
+
+    # A reviewer quoting the pre-validation fingerprint reviewed a tree that
+    # no longer exists; one quoting the bound value is accepted, and the
+    # run completes without the cache file ever counting as drift.
+    eng2 = fresh(root, cfg=cfg)
+    eng2.provider._handler = lambda req: review_result(eng2.state.workspace_fingerprint)
+    assert eng2.step().next_phase == "DONE"
+
+    # FIX binds the same way: the cache grows again during its validation.
+    root2 = local_repo(tmp_path / "second")
+    cache2 = root2 / ".build-cache"
+    cfg2 = default_config()
+    cfg2.local.validation_commands = [["sh", "-c", f"echo built >> {cache2}"]]
+    eng3 = make_local_engine(root2, FEATURE, cfg=cfg2)
+    eng3.step()
+    eng3.provider._handler = lambda req: (touch_impl(root2, "v1\n"), impl_result())[1]
+    eng3.step()
+    eng3.provider._handler = lambda req: review_result(
+        eng3.state.workspace_fingerprint, findings=[finding()]
+    )
+    assert eng3.step().next_phase == "FIX"
+    eng3.provider._handler = lambda req: (touch_impl(root2, "v2\n"), fix_result(["R1-F1"]))[1]
+    assert eng3.step().next_phase == "REVIEW"
+    assert cache2.read_text(encoding="utf-8") == "built\nbuilt\n"
+    assert eng3.state.workspace_fingerprint == fingerprint(root2)
+    eng3.provider._handler = lambda req: review_result(eng3.state.workspace_fingerprint, round=2)
     assert eng3.step().next_phase == "DONE"
 
 
@@ -504,3 +664,19 @@ def test_the_implementation_file_the_dead_agent_wrote_is_never_reverted(tmp_path
     eng2.provider._handler = lambda req: impl_result(changed=False)
     eng2.step()
     assert (root / IMPL_FILE).read_text(encoding="utf-8") == "half-finished work\n"
+
+
+def test_the_dry_run_plan_for_review_reports_an_unverified_tree(tmp_path):
+    """`--dry-run` says what the step would do, so it says this too."""
+    root = local_repo(tmp_path)
+    eng = make_local_engine(root, FEATURE)
+    eng.step()
+    eng.provider._handler = lambda req: (touch_impl(root, "v1\n"), impl_result())[1]
+    eng.step()
+    eng2 = fresh(root)
+    assert "would enter BLOCKED" not in " ".join(eng2.plan_step().notes)
+    touch_impl(root, "edited after verification\n")
+    notes = " ".join(fresh(root).plan_step().notes)
+    assert "would enter BLOCKED without invoking the reviewer" in notes
+    assert "REVIEW never re-binds" in notes
+    assert eng2.state.workspace_fingerprint[:16] in notes

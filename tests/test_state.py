@@ -508,6 +508,59 @@ def test_load_symlink_to_fifo_fails_loudly_without_blocking(tmp_path):
     assert p.is_symlink() and os.readlink(p) == "real.fifo"
 
 
+def test_load_oversized_state_file_is_corrupt_state_without_materialising_it(tmp_path, monkeypatch):
+    """R10-F3: an oversized or sparse ``state.json`` is refused, never read whole.
+
+    The file is a sparse hole far past the budget: on any filesystem that
+    supports holes it costs nothing to create and would cost the whole
+    apparent size to ``read()``.  The loader must refuse it as corrupt (so
+    ``--force`` quarantines it like any other unreadable state) and must not
+    have asked for more than the budget plus a byte.
+    """
+    import os
+
+    import autoforge.safefs as safefs
+    from autoforge.state import MAX_STATE_FILE_BYTES
+
+    p = tmp_path / "state.json"
+    p.write_bytes(b'{"phase": "REVIEW"}')
+    os.truncate(p, 16 * MAX_STATE_FILE_BYTES)
+    assert p.stat().st_size == 16 * MAX_STATE_FILE_BYTES
+
+    asked: list[int] = []
+    real_fdopen = safefs.os.fdopen
+
+    def fdopen_with_counted_reads(fd, *args, **kwargs):
+        fh = real_fdopen(fd, *args, **kwargs)
+        real_read = fh.read
+
+        def read(n=-1):
+            asked.append(n)
+            return real_read(n)
+
+        fh.read = read  # type: ignore[method-assign]
+        return fh
+
+    monkeypatch.setattr(safefs.os, "fdopen", fdopen_with_counted_reads)
+    with pytest.raises(StateError, match="[Cc]orrupt.*larger than .* bytes.*refusing to overwrite"):
+        load_state(p)
+    assert asked and max(asked) == MAX_STATE_FILE_BYTES + 1, asked
+    assert p.stat().st_size == 16 * MAX_STATE_FILE_BYTES, "loader never writes"
+
+
+def test_load_state_file_at_the_budget_still_loads(tmp_path):
+    """The bound is a ceiling on what is read, not on what is valid."""
+    from autoforge.state import MAX_STATE_FILE_BYTES
+
+    p = tmp_path / "state.json"
+    st = make_state()
+    body = json.dumps(st.to_dict()).encode("utf-8")
+    padding = b" " * (MAX_STATE_FILE_BYTES - len(body))
+    p.write_bytes(body + padding)
+    assert p.stat().st_size == MAX_STATE_FILE_BYTES
+    assert load_state(p).run_id == st.run_id
+
+
 def test_load_directory_state_entry_is_corrupt_state(tmp_path):
     p = tmp_path / "state.json"
     p.mkdir()
