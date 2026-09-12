@@ -473,6 +473,130 @@ def test_the_fix_budget_is_the_recorded_one_not_the_current_one(tmp_path):
 
 
 # =============================================================================
+# Execution context: an argv is a program only relative to a directory
+# =============================================================================
+#
+# The contract freezes `local.validation_commands` as argv arrays. An argv
+# means something only relative to the directory it is launched from --
+# `["./verify"]` from `src/` is a different program -- so the directory is
+# part of what "verified" means, and it must come from the contract too.
+# The invocation's cwd is DYNAMIC only because nothing executes from it: it
+# decides where the repository is *found*, and the gate then proves it is
+# the recorded one (R11-F1).
+
+
+def _verifier(path: Path, exit_code: int) -> None:
+    path.write_text(f"#!/bin/sh\nexit {exit_code}\n", encoding="utf-8")
+    path.chmod(0o755)
+
+
+def _two_verifiers(tmp_path, *, root_exit: int, subdir_exit: int):
+    """A checkout with `./verify` at the root and a different `./verify` in `src/`."""
+    root = local_repo(tmp_path / "repo")
+    _verifier(root / "verify", root_exit)
+    _verifier(root / "src" / "verify", subdir_exit)
+    commit_all(root, "two verifiers")
+    cfg = default_config()
+    cfg.local.validation_commands = [["./verify"]]
+    return root, cfg
+
+
+def _start_and_leave_at_analyze(root, cfg):
+    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
+    eng.step()  # INITIALIZING -> ANALYZE_EXECUTE; nothing has executed yet
+    assert eng.state.phase == Phase.ANALYZE_EXECUTE
+    eng.close()
+
+
+def _resume_from(directory, root, cfg):
+    eng = make_local_engine(directory, "features/add-filter.md", cfg=cfg, start=False)
+    eng.load()
+    eng.provider._handler = scripted(
+        eng, root, [(lambda r: (r / IMPL_FILE).write_text("done\n"), lambda e: impl_result())]
+    )
+    return eng
+
+
+def test_reproduction_a_resume_from_a_subdirectory_still_runs_the_root_verifier(tmp_path):
+    """R11-F1: the root `./verify` fails, `src/verify` passes; a resume from
+    `src/` must run the former, so the phase is *not* verified."""
+    root, cfg = _two_verifiers(tmp_path, root_exit=1, subdir_exit=0)
+    _start_and_leave_at_analyze(root, cfg)
+
+    eng = _resume_from(root / "src", root, cfg)
+    with pytest.raises(VerificationError, match="validation command"):
+        eng.step()
+    assert eng.state.phase == Phase.ANALYZE_EXECUTE
+
+    # Both the agent and the verifier ran from the contract's root, not
+    # from the invocation's cwd -- and the log says so.
+    expected = os.path.realpath(root)
+    assert eng.state.local_run_contract["repository_root"] == expected
+    assert [call.cwd for call in eng.provider.calls] == [expected]
+    requests = sorted(Path(eng.paths.state_dir).glob("logs/*/*/request.json"))
+    assert requests, "no execution was logged"
+    for request in requests:
+        assert json.loads(request.read_text(encoding="utf-8"))["cwd"] == expected
+    eng.close()
+
+
+def test_control_the_root_verifier_is_what_passes_from_a_subdirectory_too(tmp_path):
+    """The mirror image: root passes, subdirectory fails; a resume from the
+    subdirectory advances, proving the *root* verifier is the one that ran
+    (not merely that something failed)."""
+    root, cfg = _two_verifiers(tmp_path, root_exit=0, subdir_exit=1)
+    _start_and_leave_at_analyze(root, cfg)
+
+    eng = _resume_from(root / "src", root, cfg)
+    eng.step()
+    assert eng.state.phase == Phase.REVIEW
+    assert [call.cwd for call in eng.provider.calls] == [os.path.realpath(root)]
+    eng.close()
+
+
+def test_the_cwd_a_run_is_created_from_is_not_recorded_because_nothing_runs_from_it(tmp_path):
+    """Creating the run from `src/` and resuming from the root is the same run:
+    the cwd only locates the repository, so it is neither drift nor a
+    different verifier."""
+    root, cfg = _two_verifiers(tmp_path, root_exit=1, subdir_exit=0)
+    # The specification is named relative to the invocation, then frozen
+    # under its repository-relative name.
+    eng = make_local_engine(root / "src", "../features/add-filter.md", cfg=cfg)
+    assert eng.state.feature_spec_path == "features/add-filter.md"
+    assert eng.state.local_run_contract["repository_root"] == os.path.realpath(root)
+    eng.step()
+    eng.close()
+
+    eng = _resume_from(root, root, cfg)
+    with pytest.raises(VerificationError, match="validation command"):
+        eng.step()
+    assert eng.state.phase == Phase.ANALYZE_EXECUTE
+    eng.close()
+
+
+def test_the_dry_run_plan_names_the_frozen_execution_directory(tmp_path):
+    root, cfg = _two_verifiers(tmp_path, root_exit=0, subdir_exit=0)
+    _start_and_leave_at_analyze(root, cfg)
+    eng = make_local_engine(root / "src", "features/add-filter.md", cfg=cfg, start=False)
+    eng.load()
+    plan = eng.plan_step()
+    expected = os.path.realpath(root)
+    assert any(f"run from the run's repository root {expected}" in note for note in plan.notes), (
+        plan.notes
+    )
+    eng.close()
+
+
+def test_a_remote_run_is_still_launched_from_the_invocation_directory(tmp_path):
+    """REMOTE has no contract and GitHub as its source of truth: unchanged."""
+    from .conftest import make_engine
+
+    eng = make_engine(tmp_path / ".autoforge")
+    assert eng.mode.value == "REMOTE"
+    assert eng._execution_cwd() == eng.workdir
+
+
+# =============================================================================
 # Workspace-policy adversarial matrix
 # =============================================================================
 

@@ -63,6 +63,117 @@ def test_runlog_rejects_a_corrupt_event_journal(tmp_path):
         RunLogger(tmp_path / "logs", "run-1")
 
 
+# -- R11-F2: recovery reads the journal bounded, never wholesale ---------------
+#
+# The journal lives where the agents write (same OS user), and recovery
+# needs it only for the highest seq it holds. Like ``state.json`` (R10-F3)
+# it is read through ``SafeRoot.read_bytes(limit=)``: an oversized or sparse
+# file is refused as corrupt after at most one byte past the budget.
+
+
+def _counted_reads(monkeypatch) -> list[int]:
+    """Record every ``read(n)`` the bounded reader asks a file object for."""
+    import autoforge.safefs as safefs
+
+    asked: list[int] = []
+    real_fdopen = safefs.os.fdopen
+
+    def fdopen_with_counted_reads(fd, *args, **kwargs):
+        fh = real_fdopen(fd, *args, **kwargs)
+        real_read = fh.read
+
+        def read(n=-1):
+            asked.append(n)
+            return real_read(n)
+
+        fh.read = read  # type: ignore[method-assign]
+        return fh
+
+    monkeypatch.setattr(safefs.os, "fdopen", fdopen_with_counted_reads)
+    return asked
+
+
+def test_an_oversized_event_journal_is_refused_without_being_read_wholesale(tmp_path, monkeypatch):
+    from autoforge.runlog import MAX_EVENT_JOURNAL_BYTES
+
+    run_dir = tmp_path / "logs" / "run-1"
+    run_dir.mkdir(parents=True)
+    journal = run_dir / "events.jsonl"
+    journal.write_text('{"seq": 1}\n', encoding="utf-8")
+    # A sparse file: costs nothing to create, would cost the whole apparent
+    # size to read() -- and a same-user agent can leave one at this name.
+    os.truncate(journal, 16 * MAX_EVENT_JOURNAL_BYTES)
+    asked = _counted_reads(monkeypatch)
+    with pytest.raises(StateError, match="corrupted event journal.*larger than .* bytes"):
+        RunLogger(tmp_path / "logs", "run-1")
+    assert asked and max(asked) == MAX_EVENT_JOURNAL_BYTES + 1, asked
+    assert journal.stat().st_size == 16 * MAX_EVENT_JOURNAL_BYTES, "recovery never writes"
+
+
+def test_a_journal_at_the_byte_budget_still_recovers_the_sequence(tmp_path):
+    """The bound is a ceiling on what is read, not on what is valid."""
+    from autoforge.runlog import MAX_EVENT_JOURNAL_BYTES
+
+    run_dir = tmp_path / "logs" / "run-1"
+    run_dir.mkdir(parents=True)
+    body = b'{"seq": 7}\n'
+    (run_dir / "events.jsonl").write_bytes(body + b" " * (MAX_EVENT_JOURNAL_BYTES - len(body)))
+    log = RunLogger(tmp_path / "logs", "run-1")
+    assert log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="FIX")).name == (
+        "008-fix-1"
+    )
+
+
+def test_a_journal_with_too_many_records_is_refused_before_any_line_is_parsed(
+    tmp_path, monkeypatch
+):
+    """Records are counted on the bytes: a journal of a million empty lines
+    is refused before it is split into a million objects."""
+    import autoforge.runlog as runlog
+
+    monkeypatch.setattr(runlog, "MAX_EVENT_JOURNAL_RECORDS", 3)
+    run_dir = tmp_path / "logs" / "run-1"
+    run_dir.mkdir(parents=True)
+    # Four records, the last one unterminated and not JSON: the count is what
+    # refuses it, so the parser never gets to complain about the last line.
+    (run_dir / "events.jsonl").write_bytes(b'{"seq": 1}\n\n\nnot-json')
+    with pytest.raises(StateError, match="corrupted event journal.*more than 3 records"):
+        RunLogger(tmp_path / "logs", "run-1")
+    # Exactly the budget, unterminated last line included, loads.
+    (run_dir / "events.jsonl").write_bytes(b'{"seq": 1}\n\n{"seq": 5}')
+    log = RunLogger(tmp_path / "logs", "run-1")
+    assert log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="FIX")).name == (
+        "006-fix-1"
+    )
+
+
+def test_the_journal_refusal_names_the_manual_step(tmp_path, monkeypatch):
+    """Refusing recovery must not strand the run: the message says what to
+    move aside, and the step directories keep the sequence monotonic."""
+    import autoforge.runlog as runlog
+
+    monkeypatch.setattr(runlog, "MAX_EVENT_JOURNAL_RECORDS", 1)
+    run_dir = tmp_path / "logs" / "run-1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "events.jsonl").write_bytes(b'{"seq": 1}\n{"seq": 2}\n')
+    (run_dir / "002-review-1").mkdir()
+    with pytest.raises(StateError, match="move logs/run-1/events.jsonl aside"):
+        RunLogger(tmp_path / "logs", "run-1")
+    (run_dir / "events.jsonl").rename(run_dir / "events.jsonl.aside")
+    log = RunLogger(tmp_path / "logs", "run-1")
+    assert log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="FIX")).name == (
+        "003-fix-1"
+    )
+
+
+def test_a_journal_that_is_not_utf8_is_corrupt_not_silently_repaired(tmp_path):
+    run_dir = tmp_path / "logs" / "run-1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "events.jsonl").write_bytes(b'{"seq": 1}\n\xff\xfe\n')
+    with pytest.raises(StateError, match="corrupted event journal.*line 2"):
+        RunLogger(tmp_path / "logs", "run-1")
+
+
 # -- R3-F1: the log tree is never followed anywhere ---------------------------
 def test_a_logs_symlink_never_redirects_controller_writes(tmp_path):
     """A `logs` symlink put every artifact of the run outside the checkout.

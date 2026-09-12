@@ -524,6 +524,67 @@ def test_a_fix_round_is_not_charged_twice_by_a_crash(tmp_path):
     assert eng2.state.local_fix_rounds == 1, "one fix round, not two"
 
 
+# -- the journal recovery reads --------------------------------------------------
+def test_an_oversized_event_journal_left_by_an_agent_is_refused_not_materialised(
+    tmp_path, monkeypatch
+):
+    """R11-F2: the journal is where the agents can write. A resumed phase
+    opens the logger before it executes anything, and that open must be
+    bounded: a sparse journal is refused as corrupt after one byte past the
+    budget, with nothing persisted and nothing executed."""
+    import os
+
+    import autoforge.safefs as safefs
+    from autoforge.runlog import MAX_EVENT_JOURNAL_BYTES
+
+    root = local_repo(tmp_path)
+    eng = make_local_engine(root, FEATURE)
+    eng.provider._handler = lambda req: (touch_impl(root, "v1\n"), impl_result())[1]
+    eng.step()
+    eng.step()
+    assert eng.state.phase == Phase.REVIEW
+    eng.close()
+
+    journals = list(Path(eng.paths.state_dir).glob("logs/*/events.jsonl"))
+    assert len(journals) == 1
+    os.truncate(journals[0], 4 * MAX_EVENT_JOURNAL_BYTES)
+
+    # Every bounded read the step performs (state.json, the specification,
+    # the journal): what it asked for and what it got back.
+    asked: list[int] = []
+    got: list[int] = []
+    real_fdopen = safefs.os.fdopen
+
+    def counted(fd, *a, **k):
+        fh = real_fdopen(fd, *a, **k)
+        real_read = fh.read
+
+        def read(n=-1):
+            asked.append(n)
+            data = real_read(n)
+            got.append(len(data))
+            return data
+
+        fh.read = read  # type: ignore[method-assign]
+        return fh
+
+    monkeypatch.setattr(safefs.os, "fdopen", counted)
+    again = fresh(root)
+    again.provider._handler = lambda req: pytest.fail("the reviewer must not be launched")
+    with pytest.raises(StateError, match="corrupted event journal.*larger than"):
+        again.step()
+    assert MAX_EVENT_JOURNAL_BYTES + 1 in asked, asked
+    assert max(got) == MAX_EVENT_JOURNAL_BYTES + 1, "the sparse journal was materialised"
+    # The step charged its budget (persisted before any launch, as always)
+    # and nothing else moved: same phase, same round, same bound tree.
+    after = load_state(Path(eng.paths.state_dir) / "state.json")
+    assert after.phase == Phase.REVIEW
+    assert after.review_round == eng.state.review_round == 0
+    assert after.workspace_fingerprint == eng.state.workspace_fingerprint
+    assert after.review_history == []
+    again.close()
+
+
 # -- the boundaries around the run itself --------------------------------------
 def test_a_crash_before_the_run_was_ever_persisted_leaves_no_run(tmp_path):
     """`new_local_run` writes nothing; a crash before the first save is a no-op.

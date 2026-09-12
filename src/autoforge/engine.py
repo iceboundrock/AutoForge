@@ -471,6 +471,28 @@ class ControllerEngine:
         state = self._require_state()
         return validate_local_run_contract(state.local_contract(), self._invocation_contract())
 
+    def _execution_cwd(self) -> str:
+        """The directory agents and validation commands are launched from.
+
+        For a LOCAL run this is the contract's ``repository_root``, never
+        the invocation's cwd. A validation command is an argv, and an argv
+        only means something relative to a directory: ``["./verify"]`` run
+        from ``src/`` is a different program, and ``["pytest"]`` run from a
+        subdirectory discovers a different rootdir and conftest. Freezing
+        the argv while letting the directory float would let a ``resume``
+        from a subdirectory silently redefine what verifies the run (round
+        11, R11-F1). Taking the directory from the contract -- which the
+        gate has already proven names this checkout -- is what makes the
+        invocation's cwd genuinely DYNAMIC (see :mod:`autoforge.run_contract`):
+        it decides where the repository is *found*, and nothing else.
+
+        A REMOTE run has no contract and is launched from ``workdir`` as
+        before; GitHub, not a working-tree verifier, is its source of truth.
+        """
+        if self.mode is WorkflowMode.LOCAL:
+            return self.local_contract().repository_root
+        return self.workdir
+
     def bind_local_state_dir(self, explicit: str | Path | None = None) -> None:
         """Point :attr:`paths` at where this LOCAL run keeps its runtime state.
 
@@ -1036,6 +1058,10 @@ class ControllerEngine:
         notes.append(
             "validation commands that would run after this phase: "
             + ("; ".join(" ".join(argv) for argv in cmds) if cmds else "(none configured)")
+        )
+        notes.append(
+            "the agent and the validation commands run from the run's repository root "
+            f"{contract.repository_root} (frozen; never the invocation's cwd)"
         )
         return StepPlan(
             phase=s.phase.value,
@@ -1879,11 +1905,14 @@ class ControllerEngine:
         commands = self.local_contract().validation_commands
         if not commands:
             return False
+        # Likewise the directory they run *from*: an argv is only a program
+        # relative to one (see :meth:`_execution_cwd`).
+        cwd = self._execution_cwd()
         logger = self._logger()
         for argv in commands:
             req = ExecutionRequest(
                 command=list(argv),
-                cwd=self.workdir,
+                cwd=cwd,
                 timeout_seconds=self.config.execution.default_timeout_seconds,
             )
             result = (self._runner or execute)(req)
@@ -1896,7 +1925,7 @@ class ControllerEngine:
                 profile="(controller validation command)",
                 prompt_version=state.prompt_version,
                 command=list(argv),
-                cwd=self.workdir,
+                cwd=cwd,
                 timeout_seconds=req.timeout_seconds,
                 started_at=result.started_at,
                 finished_at=result.finished_at,
@@ -3373,6 +3402,19 @@ class ControllerEngine:
         provider.validate_profile(profile)
         timeout = profile.timeout_seconds or self.config.execution.default_timeout_seconds
         max_corrections = max(0, self.config.execution.max_correction_attempts)
+        # Read once per invocation, before the loop: the agent and the record
+        # of it are launched from the same directory, and for a LOCAL run
+        # that directory comes from the contract (see :meth:`_execution_cwd`).
+        cwd = self._execution_cwd()
+        # The logger is opened -- and the event journal read -- *before* the
+        # agent is launched, not at the first write after it returns. The
+        # journal lives where the agents write, so its recovery read is
+        # bounded (see :data:`autoforge.runlog.MAX_EVENT_JOURNAL_BYTES`) and
+        # can refuse; a refusal must land before a write-capable agent has
+        # done work that would then go unlogged. One logger serves every
+        # attempt of this invocation; each write still re-verifies the
+        # state-directory capability it goes through.
+        logger = self._logger()
         correction_error: str | None = None
         attempt = 0
         while True:
@@ -3382,7 +3424,7 @@ class ControllerEngine:
             req = AgentRequest(
                 phase=phase.value,
                 prompt=prompt,
-                cwd=self.workdir,
+                cwd=cwd,
                 profile=profile,
                 timeout_seconds=timeout,
                 attempt=state.attempt,
@@ -3403,7 +3445,7 @@ class ControllerEngine:
                 effort=profile.effort,
                 prompt_version=state.prompt_version,
                 command=provider.build_command_for(profile, prompt),
-                cwd=self.workdir,
+                cwd=cwd,
                 timeout_seconds=timeout,
                 metadata=self._log_metadata(phase),
             )
@@ -3412,7 +3454,7 @@ class ControllerEngine:
                 result = provider.execute(req)
             except ExecutionError as exc:
                 record.error = f"{type(exc).__name__}: {exc}"
-                self._logger().log_execution(record, prompt, "", "")
+                logger.log_execution(record, prompt, "", "")
                 self._save()
                 raise
             record.started_at = result.started_at
@@ -3422,7 +3464,7 @@ class ControllerEngine:
             stdout, stderr = result.stdout or "", result.stderr or ""
             if result.timed_out:
                 record.error = f"timed out after {timeout}s"
-                self._logger().log_execution(record, prompt, stdout, stderr)
+                logger.log_execution(record, prompt, stdout, stderr)
                 self._save()
                 raise ExecutionTimeoutError(
                     f"agent '{profile.name}' timed out after {timeout}s and was killed. "
@@ -3430,7 +3472,7 @@ class ControllerEngine:
                 )
             if result.exit_code != 0:
                 record.error = f"exit {result.exit_code}"
-                self._logger().log_execution(record, prompt, stdout, stderr)
+                logger.log_execution(record, prompt, stdout, stderr)
                 self._save()
                 raise ExecutionError(
                     f"agent '{profile.name}' exited {result.exit_code}. "
@@ -3441,7 +3483,7 @@ class ControllerEngine:
                 payload = parse_control_result(stdout, phase, state.mode)
             except (ControlResultError, ControlResultValidationError) as exc:
                 record.error = f"{type(exc).__name__}: {exc}"
-                self._logger().log_execution(record, prompt, stdout, stderr)
+                logger.log_execution(record, prompt, stdout, stderr)
                 self._save()
                 if attempt <= max_corrections:
                     # A correction re-launches the same write-capable agent,
@@ -3460,7 +3502,7 @@ class ControllerEngine:
                     f"{attempt} attempt(s): {exc}"
                 ) from exc
             record.parsed_result = payload
-            self._logger().log_execution(record, prompt, stdout, stderr)
+            logger.log_execution(record, prompt, stdout, stderr)
             return payload
 
     # -- verification + state application -------------------------------------------

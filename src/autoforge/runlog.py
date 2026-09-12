@@ -29,7 +29,7 @@ from pathlib import Path
 
 from .errors import StateError
 from .redaction import redact, redact_argv, redact_dict
-from .safefs import SafeRoot
+from .safefs import ReadLimitExceeded, SafeRoot
 
 # A run identifier is a *file name*: it names the directory this run's logs
 # live in.  `generate_run_id` produces "af-<UTC stamp>-<hex>", but the value
@@ -37,6 +37,21 @@ from .safefs import SafeRoot
 # is turned into a path rather than trusted because the controller once
 # generated it.
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+# The most an event journal may be before recovery refuses it as corrupt
+# without reading it. Recovery needs the journal only for the highest ``seq``
+# it holds, and it lives where the agents the controller launches also write
+# (the same OS user), so like ``state.json`` (``MAX_STATE_FILE_BYTES``) it is
+# read through ``SafeRoot.read_bytes(limit=)``: one byte past the budget and
+# no more, so a sparse or oversized file at that name costs at most the
+# budget rather than the machine's memory. A real journal is a few kilobytes
+# per line and at most a few thousand lines (one per invocation, bounded by
+# the run's step budget and the correction attempts), so the budget is
+# generous; the record bound is checked *before* the journal is split into
+# lines, so a journal of millions of empty records cannot allocate its way
+# around the byte budget either.
+MAX_EVENT_JOURNAL_BYTES = 64 * 1024 * 1024
+MAX_EVENT_JOURNAL_RECORDS = 100_000
 
 
 def validate_run_id(run_id: str) -> str:
@@ -146,16 +161,39 @@ class RunLogger:
         finally:
             root.close()
 
+    def _refuse_journal(self, why: str) -> StateError:
+        return StateError(
+            f"corrupted event journal for run {self.run_id}: {why}. The journal is only "
+            "read to continue the step sequence, so move "
+            f"logs/{self.run_id}/events.jsonl aside to resume; the step directories are "
+            "kept and the sequence continues from their names"
+        )
+
     def _existing_event_count(self, logs: SafeRoot) -> int:
-        content = logs.read_text(f"{self.run_id}/events.jsonl")
+        path = f"{self.run_id}/events.jsonl"
+        try:
+            data = logs.read_bytes(path, limit=MAX_EVENT_JOURNAL_BYTES)
+        except ReadLimitExceeded:
+            # Refused before it is held: the bounded read stops one byte past
+            # the budget, whatever st_size claimed.
+            raise self._refuse_journal(
+                f"larger than {MAX_EVENT_JOURNAL_BYTES} bytes, which no controller journal can be"
+            ) from None
         highest = 0
-        if content is not None:
-            for line_number, line in enumerate(content.splitlines(), 1):
+        if data is not None:
+            # Counted on the bytes, before any line is materialised.
+            records = data.count(b"\n") + (0 if data.endswith(b"\n") or not data else 1)
+            if records > MAX_EVENT_JOURNAL_RECORDS:
+                raise self._refuse_journal(
+                    f"more than {MAX_EVENT_JOURNAL_RECORDS} records, which no controller "
+                    "journal can hold"
+                )
+            for line_number, line in enumerate(data.splitlines(), 1):
                 if not line.strip():
                     continue
                 try:
                     record = json.loads(line)
-                except json.JSONDecodeError as exc:
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                     raise StateError(
                         f"corrupted event journal for run {self.run_id}: line {line_number} "
                         f"is not valid JSON ({exc})"

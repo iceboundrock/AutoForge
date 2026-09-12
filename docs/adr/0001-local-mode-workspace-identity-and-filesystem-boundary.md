@@ -10,7 +10,9 @@
   specification quoting); round 10 — §3 V and §5.10 (REVIEW never binds a
   new fingerprint, R10-F1), §5.4 and §8.10 (the named-temporary window,
   R10-F2), §5.5 (the state file is bounded, R10-F3), §5.4 (the doctor probes
-  through the capability, R10-F4)
+  through the capability, R10-F4); round 11 — §5.7 (agents and validation
+  commands run from the contract's repository root, R11-F1), §5.5 (the event
+  journal is bounded, R11-F2)
 - **Closes by design:** #46, #47, #48, #49, #50; #45 (see *Compatibility*)
 
 ## 1. Problem
@@ -51,6 +53,7 @@ means the finding was a sample of an open-ended set.
 | R7-F4 | 7 | the walk materialised a directory before checking the budget; the spec read was unbounded | Availability | — | local |
 | R9-F1 | 9 | a link to the root, or to any directory *containing* an exclusion, reached excluded bytes at an unexcluded path | Fingerprint totality | Check the target and its ancestors | systemic |
 | R10-F1 | 10 | REVIEW re-bound the fingerprint on every entry, so a reviewer's own (crashed or refused) edit was reviewed as the implementation | Review binding | — | systemic |
+| R11-F1 | 11 | `local.validation_commands` were frozen as argv but launched from the invocation's cwd, so a resume from a subdirectory ran a different `./verify` | Review binding | — | systemic |
 
 Every systemic row has the same cause, and it is one sentence:
 
@@ -88,6 +91,7 @@ have written", which an agent could simply write into.
 | R10-F2 | 10 | the `O_EXCL` temporary has a *name* for the length of the write, and a second `link(2)` to it lets the bytes be observed outside the root | hardlink × temporary × write | local |
 | R10-F3 | 10 | `state.json` was read without a bound, so a sparse or oversized file was materialised whole | — × final × read | local |
 | R10-F4 | 10 | `doctor` located the state dir by resolved pathname, then probed it by pathname (`mkdir`, `mkstemp`) through a symlinked `<git dir>/autoforge` | link × parent × create (doctor) | systemic |
+| R11-F2 | 11 | `events.jsonl` was read without a bound at recovery, so a sparse or oversized journal was materialised whole | — × final × read | local |
 
 Again one cause:
 
@@ -464,6 +468,18 @@ at that name is refused as corrupt — the same `StateError` an unparseable
 file gets, so `--force` quarantines it by rename instead of reading it —
 without ever being held in memory.
 
+The event journal is the other file recovery reads, and it lives where the
+agents write too (R11-F2). It is read the same way — `read_bytes(limit=
+MAX_EVENT_JOURNAL_BYTES)`, 64 MiB — plus a record bound
+(`MAX_EVENT_JOURNAL_RECORDS`) that is counted on the bytes *before* the
+journal is split into lines, so a journal of millions of empty records
+cannot allocate its way around the byte budget. Recovery needs the journal
+only for the highest `seq` it holds, so the refusal names the manual step
+(move `events.jsonl` aside; the step directories keep the sequence
+monotonic) rather than stranding the run. The read now happens *before* the
+agent is launched, not at the first write after it returns: a refusal must
+land before a write-capable agent has done work that would go unlogged.
+
 ### 5.6 Types are the contract at the state boundary
 
 The `str`/`int` field checks in `AutoForgeState.from_dict` are derived from
@@ -508,7 +524,8 @@ The closed formulation is `run_contract.py`:
   touches is written at the top of the module: REVALIDATED (the
   specification's bytes, the git anchor — content checks of the world the
   contract names, never written back) and DYNAMIC (fingerprints, gitdir
-  inodes, which provider/model runs, cwd, counters — nothing a persisted
+  inodes, which provider/model runs, the invocation's cwd (nothing is
+  launched from it, see below), counters — nothing a persisted
   safety judgment depends on).
 - **`WorkspacePolicy`** is persisted as its fields (`version`,
   `snapshot_tag`, `exclude`, `max_entries`, `max_bytes`) plus the SHA-256
@@ -533,6 +550,19 @@ The closed formulation is `run_contract.py`:
   consulted only to construct what *this invocation would define*, which the
   gate then compares. A structural test asserts that `engine.py` reads no
   run-defining `config.local.*` field anywhere else.
+- **Execution runs from the contract's repository root**, never from the
+  invocation's cwd (round 11, R11-F1). An argv is a program only relative
+  to a directory: `["./verify"]` launched from `src/` is a different
+  verifier, and `["pytest"]` from a subdirectory discovers a different
+  rootdir. Freezing the argv while letting the directory float left a
+  run-defining input the contract did not record. Rather than adding the
+  cwd as a field — which would force the operator to resume from the exact
+  subdirectory the run was created in — agents and validation commands are
+  launched from `contract.repository_root`, which the gate has already
+  proven names this checkout. That is what makes the cwd genuinely DYNAMIC:
+  it decides where the repository is *found*, and nothing else. The
+  `cwd` in every `request.json` and the dry-run plan both name the frozen
+  directory.
 - **Legacy LOCAL state fails closed.** A LOCAL state without a contract, with
   a contract from another schema, or with a `v1` policy is a `StateError`
   telling the operator to start a new run. There is no

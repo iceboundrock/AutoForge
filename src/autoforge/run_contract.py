@@ -64,6 +64,15 @@ DYNAMIC (observed, never defining):
     what it is asked to do), the invocation's cwd and PATH, counters. No
     persisted safety judgment depends on any of them, which is the proof
     that they may change.
+
+    The invocation's cwd earns that classification only because nothing is
+    *executed* from it: agents and validation commands are launched from
+    the contract's ``repository_root`` (``ControllerEngine._execution_cwd``),
+    so the cwd decides where the repository is found and the gate then
+    proves it is the recorded one. An argv is a program only relative to a
+    directory -- ``["./verify"]`` from ``src/`` is a different verifier --
+    so launching from the cwd would have made it a run-defining input the
+    contract did not record (round 11, R11-F1).
 """
 
 from __future__ import annotations
