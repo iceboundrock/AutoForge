@@ -77,7 +77,11 @@ def _validate_local_pending(state: AutoForgeState) -> None:
     question onto the tree the failed attempt left behind.  A typo in the
     phase value would do the same, which is why it is matched against
     :data:`~autoforge.transitions.LOCAL_WRITE_PHASES` rather than merely being
-    a string.
+    a string.  And the record belongs to *one* phase entry: a checkpoint for
+    FIX under a run whose phase is REVIEW would be closed by the next clean
+    review without anyone looking at the work it records, so a mismatch is
+    refused unless the run has already ended in BLOCKED or FAILED, where the
+    checkpoint is crash evidence rather than a pending resumption (R9-F4).
     """
     pending = state.local_pending_phase
     allowed = ", ".join(p.value for p in LOCAL_WRITE_PHASES)
@@ -118,6 +122,20 @@ def _validate_local_pending(state: AutoForgeState) -> None:
             "state field 'local_pending_attempts' must be at least 1 whenever "
             f"'local_pending_phase' is ({pending!r}): the checkpoint is written when an "
             "invocation is launched, so zero attempts is corruption"
+        )
+    if state.phase != pending_phase and state.phase not in (Phase.BLOCKED, Phase.FAILED):
+        # The checkpoint belongs to the phase entry that wrote it. A run
+        # whose current phase is a different, live phase would resolve that
+        # phase and then close a checkpoint it never examined, silently
+        # discarding the unverified work the checkpoint exists to recover.
+        # A terminal phase may keep it: a run that blocked or failed on top
+        # of an unverified launch carries the evidence of that launch, and
+        # nothing runs after it that could misread the record.
+        raise StateError(
+            f"state field 'local_pending_phase' ({pending!r}) does not match the current "
+            f"phase {state.phase.value!r}: a pending write-phase checkpoint can only be "
+            "resumed by the phase that wrote it, or kept as evidence by a terminal "
+            "BLOCKED/FAILED phase"
         )
 
 

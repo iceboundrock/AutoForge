@@ -183,10 +183,18 @@ def test_a_symlink_cycle_does_not_hang_or_recurse_the_walk(tmp_path):
     (root / "b").symlink_to("a")
     (root / "self").symlink_to(root)
 
+    # The link to the root is refused (R9-F1: it reaches the git directory,
+    # and every other exclusion, at an unexcluded path) -- but refused by a
+    # check that ran *after* a complete, finite walk, not by a walk that
+    # descended into it.
+    with pytest.raises(VerificationError, match="self is a symbolic link to the working tree"):
+        LocalWorkspace(workdir=root).snapshot()
+    (root / "self").unlink()
+
     snap = LocalWorkspace(workdir=root).snapshot()
     paths = {e.path for e in snap.entries}
-    assert {"a", "b", "self"} <= paths
-    assert not any(p.startswith("self/") for p in paths), "the walk followed a link"
+    assert {"a", "b"} <= paths
+    assert not any(p.startswith(("a/", "b/")) for p in paths), "the walk followed a link"
 
 
 # -- 8 -------------------------------------------------------------------------
@@ -600,3 +608,92 @@ def test_a_link_to_a_linked_worktrees_git_pointer_is_refused_before_and_after_bi
         eng.run(max_steps=6, dry_run=False, allow_merge=False)
     assert "src/peek" in str(exc.value) and "gitdir" in str(exc.value)
     assert eng.state.phase != Phase.REVIEW, "the planted tree was bound for review"
+
+
+# -- 20 ------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "link,target,reaches",
+    [
+        ("src/escape", "..", ".git"),  # the root: contains every exclusion
+        ("src/escape", "../build", "build"),  # the excluded directory itself
+        ("src/escape", "../build/out", "build"),  # a file inside it
+        ("src/escape", "../vendor", "vendor/lib/gen"),  # an *ancestor* of a nested one
+        ("src/escape", "../vendor/lib", "vendor/lib/gen"),  # its parent
+        ("escape", "src", "src/__pycache__"),  # a sibling directory holding one
+        ("src/escape", "../.git", "gitdir"),  # the git directory
+        ("src/escape/deep", "../..", ".git"),  # the root, from deeper down
+    ],
+    ids=[
+        "root",
+        "the-exclusion",
+        "inside-the-exclusion",
+        "grandparent-of-a-nested-exclusion",
+        "parent-of-a-nested-exclusion",
+        "sibling-directory",
+        "gitdir",
+        "root-from-deeper",
+    ],
+)
+def test_a_directory_link_cannot_reach_excluded_bytes_at_an_unexcluded_path(
+    tmp_path, link, target, reaches
+):
+    """Invariant W (R9-F1). A link may not *contain* an exclusion either.
+
+    The attack: `local.exclude: [build]`, `build/out` present, and
+    `src/escape -> ..`. The link's target is the root, which no rule
+    excludes, so the old check accepted it; but `src/escape/build/out`
+    dereferences to `build/out`, whose bytes no entry binds. Changing
+    `build/out` left the fingerprint still while a reviewer read the new
+    bytes through the link. The same holds for a link to any directory whose
+    subtree contains an exclusion, and a link to the root contains them all
+    (the git directory included), so it is refused by the same rule and not
+    by a special case.
+    """
+    root = repo(tmp_path)
+    (root / "build").mkdir()
+    (root / "build" / "out").write_text("one\n", encoding="utf-8")
+    (root / "vendor" / "lib" / "gen").mkdir(parents=True)
+    (root / "vendor" / "lib" / "gen" / "x.py").write_text("x = 1\n", encoding="utf-8")
+    (root / "src" / "__pycache__").mkdir()
+    (root / "src" / "__pycache__" / "app.pyc").write_bytes(b"\x00")
+    exclude = ("build", "vendor/lib/gen", "**/__pycache__")
+
+    (root / link).parent.mkdir(parents=True, exist_ok=True)
+    (root / link).symlink_to(target)
+    with pytest.raises(VerificationError) as exc:
+        LocalWorkspace(workdir=root, exclude=exclude).snapshot()
+    message = str(exc.value)
+    assert f"{link} is a symbolic link" in message, message
+    assert reaches in message, message
+
+
+def test_a_directory_link_below_every_exclusion_is_still_bound(tmp_path):
+    """Invariant W (R9-F1). The reach rule refuses only what it must.
+
+    A link to a directory that contains no exclusion is a link to bytes the
+    snapshot binds in full, so it is accepted; and because an exclusion's
+    *path* enters the fingerprint, one appearing under the target later
+    moves the fingerprint *and* makes the next snapshot refuse the link --
+    the reviewer can never read unbound bytes through it unnoticed.
+    """
+    root = repo(tmp_path)
+    (root / "build").mkdir()
+    (root / "build" / "out").write_text("one\n", encoding="utf-8")
+    (root / "lib").mkdir()
+    (root / "lib" / "util.py").write_text("U = 1\n", encoding="utf-8")
+    (root / "src" / "shared").symlink_to("../lib")
+    ws = LocalWorkspace(workdir=root, exclude=("build",))
+
+    bound = ws.snapshot()
+    assert "src/shared" in {e.path for e in bound.entries}
+    # Bytes reachable through the link are bound at their own path.
+    (root / "lib" / "util.py").write_text("U = 2\n", encoding="utf-8")
+    assert ws.snapshot().fingerprint != bound.fingerprint
+
+    # A `build` appearing *under* the link's target: the excluded entry's
+    # path moves the fingerprint, and the link is refused from then on.
+    (root / "lib" / "build").mkdir()
+    (root / "lib" / "build" / "gen").write_text("g\n", encoding="utf-8")
+    ws_nested = LocalWorkspace(workdir=root, exclude=("**/build",))
+    with pytest.raises(VerificationError, match="src/shared is a symbolic link to lib"):
+        ws_nested.snapshot()

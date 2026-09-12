@@ -46,6 +46,7 @@ means the finding was a sample of an open-ended set.
 | R6-F2 | 6 | a resume with a new `local.exclude` re-bound the review to a narrower tree | Review binding | Freeze `local.exclude` and the cost bounds | systemic |
 | R7-F2 | 7 | the link-target check had its own copy of "excluded", diverging from the walk's | Fingerprint totality | — | systemic |
 | R7-F4 | 7 | the walk materialised a directory before checking the budget; the spec read was unbounded | Availability | — | local |
+| R9-F1 | 9 | a link to the root, or to any directory *containing* an exclusion, reached excluded bytes at an unexcluded path | Fingerprint totality | Check the target and its ancestors | systemic |
 
 Every systemic row has the same cause, and it is one sentence:
 
@@ -104,6 +105,13 @@ signal that they were not of the same kind:
   read read as an unborn HEAD), R1-F7 / F6 (corrupt state accepted). Each
   already had the right shape: *which independently verified fact authorises
   this transition?* They needed the fact identified, not a new architecture.
+  Round 9 added two of the same shape: R9-F3 (a correction retry launched a
+  write-capable agent without charging the persisted per-phase bound, so
+  `execution.max_correction_attempts` multiplied it) and R9-F4 (a pending
+  checkpoint was validated for shape but not for *whose* it was, so a clean
+  REVIEW could close a FIX checkpoint unexamined). Both were closed by naming
+  the fact — every launch is charged before it starts; the checkpoint is
+  resumed only by the phase that wrote it, or kept by a terminal phase.
 - **D (secrets):** R1-F5 (r1), F3 (r4) — the journal was serialised from a
   record that had not been redacted. Fixed once, at the record, not per
   call site. Has not recurred.
@@ -132,7 +140,11 @@ a rebinding — a comma-joined line under which `["a,b", "c"]` and
 `["a", "b,c"]` were one policy, so the gate could pass while the excluded
 set changed. The contract is one dataclass, so completeness is a field
 list rather than a search; the encoding is canonical JSON with every
-pattern its own string (§5.7).
+pattern its own string (§5.7). Round 9 (R9-F2) found the list still short
+by one: the cumulative step budget was enforced from the *current*
+`workflow.max_total_steps`, so a run could resume under a larger budget
+without the gate noticing. It is a contract field now (schema 2), and the
+LOCAL step reads the budget from the contract, never from the config.
 
 **The diagnosis, in one line:** classes A, B and F defined safety by
 *enumerating the bad cases*; classes C, D and E defined it by *closing the
@@ -305,9 +317,15 @@ Consequences, each of which was previously a separate finding:
 - Ignored, `assume-unchanged` and `skip-worktree` paths are ordinary files to
   a walk, so R5-F1 does not arise — the walk never asked git.
 - A clean tracked symlink is an entry like any other, so R5-F2 does not arise;
-  its target *text* is hashed, and a target outside the tree (or inside an
-  excluded region) is refused, because its bytes could change with the
-  fingerprint unmoved. #49 is closed by the same rule.
+  its target *text* is hashed, and a target outside the tree, inside an
+  excluded region, or *containing* one (the root included — it contains
+  everything, and always contains the git directory) is refused, because
+  its bytes could change with the fingerprint unmoved. The containment half
+  is decided after the walk against the walk's own list of excluded
+  entries, so there is one definition of "excluded" (R7-F2) and no second
+  walk; an exclusion that appears later moves the fingerprint, since
+  excluded entries are recorded by path, and the next snapshot refuses the
+  link. #49 and R9-F1 are closed by the same rule.
 - `core.fileMode` is a git setting; the mode comes from `lstat`.
 - Empty directories, which git cannot represent at all, are entries.
 - The git directory is excluded by **inode** (`(st_dev, st_ino)` compared
@@ -445,7 +463,8 @@ The closed formulation is `run_contract.py`:
   `WorkspacePolicy` (exclusions, both cost bounds *and the snapshot
   algorithm's tag*, because a fingerprint is only comparable under the walk
   that produced it), `local.validation_commands`, `local.max_fix_rounds`,
-  and the prompt version. The classification of every other input the run
+  `workflow.max_total_steps` (schema 2) and the prompt version. The
+  classification of every other input the run
   touches is written at the top of the module: REVALIDATED (the
   specification's bytes, the git anchor — content checks of the world the
   contract names, never written back) and DYNAMIC (fingerprints, gitdir
@@ -599,6 +618,7 @@ an independent `os.walk` finds nothing the snapshot did not mention.
 | Symbolic link (target outside the tree) | **rejected fail-closed** | its bytes cannot be bound |
 | Symbolic link into the git directory | **rejected fail-closed** | points into an unbound region |
 | Symbolic link into a `local.exclude` region | **rejected fail-closed** | same |
+| Symbolic link to the root, or to a directory *containing* an excluded entry | **rejected fail-closed** | excluded bytes would be reachable at an unexcluded path (R9-F1) |
 | Dangling symbolic link | represented by metadata, or rejected | the text is hashed; the target is resolved lexically and refused if it leaves the tree, exactly like a live link |
 | Hard link (tree-internal) | included & hashed | it is a regular file; both names are entries |
 | Submodule / gitlink | **rejected fail-closed** | §5.3 — a second working tree |

@@ -569,6 +569,7 @@ def sample_contract(
     max_bytes: int = 512 * 1024 * 1024,
     validation_commands: tuple[tuple[str, ...], ...] = (),
     max_fix_rounds: int = 1,
+    max_total_steps: int = 300,
     prompt_version: str = "v1",
 ) -> dict:
     """A well-formed persisted LOCAL run contract (see ``autoforge.run_contract``)."""
@@ -586,6 +587,7 @@ def sample_contract(
         ),
         validation_commands=validation_commands,
         max_fix_rounds=max_fix_rounds,
+        max_total_steps=max_total_steps,
         prompt_version=prompt_version,
     ).to_dict()
 

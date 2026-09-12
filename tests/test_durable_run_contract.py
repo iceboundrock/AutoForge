@@ -75,6 +75,7 @@ FIELD_MUTATIONS = {
     ),
     "validation_commands": lambda c: replace(c, validation_commands=(("pytest", "-q"),)),
     "max_fix_rounds": lambda c: replace(c, max_fix_rounds=c.max_fix_rounds + 1),
+    "max_total_steps": lambda c: replace(c, max_total_steps=c.max_total_steps + 1),
     "prompt_version": lambda c: replace(c, prompt_version="v0"),
 }
 
@@ -87,6 +88,7 @@ FIELD_LABELS = {
     "workspace_policy.snapshot_tag": "workspace snapshot algorithm",
     "validation_commands": "local.validation_commands",
     "max_fix_rounds": "local.max_fix_rounds",
+    "max_total_steps": "workflow.max_total_steps",
     "prompt_version": "prompt_version",
 }
 
@@ -128,8 +130,14 @@ def test_an_identical_contract_passes_the_gate_and_the_recorded_one_is_returned(
 def test_the_persisted_form_round_trips_exactly_and_carries_a_schema():
     recorded = _contract(exclude=(".venv", "build"), validation_commands=(("make", "test"),))
     data = recorded.to_dict()
-    assert data["schema"] == 1
+    assert data["schema"] == 2  # 2: R9-F2 added the cumulative step budget
+    assert data["max_total_steps"] == recorded.max_total_steps
     assert LocalRunContract.from_dict(json.loads(json.dumps(data))) == recorded
+    # A schema-1 contract (no step budget) is refused, never filled in.
+    older = {k: v for k, v in data.items() if k != "max_total_steps"}
+    older["schema"] = 1
+    with pytest.raises(StateError, match="schema 1 is not 2|missing field"):
+        LocalRunContract.from_dict(older)
 
 
 def test_the_policy_is_persisted_as_structured_fields_with_their_digest():
@@ -255,6 +263,10 @@ def _cfg_validation(cfg):
     cfg.local.validation_commands = [["true"]]
 
 
+def _cfg_total_steps(cfg):
+    cfg.workflow.max_total_steps += 1
+
+
 def _cfg_prompt_version(cfg):
     cfg.prompt_version = "v0"
 
@@ -270,6 +282,11 @@ CONFIG_ROWS = [
         'local.validation_commands: run: [] current: [["true"]]',
     ),
     ("prompt_version", _cfg_prompt_version, 'prompt_version: run: "v1" current: "v0"'),
+    (
+        "workflow.max_total_steps",
+        _cfg_total_steps,
+        "workflow.max_total_steps: run: 300 current: 301",
+    ),
 ]
 
 
@@ -382,6 +399,54 @@ def test_the_unchanged_invocation_resumes_and_finishes(tmp_path):
     eng.run(max_steps=3)
     assert eng.state.phase == Phase.DONE
     assert eng.state.local_run_contract == first.state.local_run_contract
+
+
+def test_the_step_budget_is_the_recorded_one_not_the_current_one(tmp_path):
+    """R9-F2: `workflow.max_total_steps` bounds the whole run, so it is frozen.
+
+    Before this the contract did not carry it and the engine enforced the
+    *current* configuration, so a run created with a small budget resumed
+    under a larger one and exceeded its original cumulative bound without
+    any drift being reported -- the one kind of input the contract exists
+    to freeze.
+    """
+    small = default_config()
+    small.workflow.max_total_steps = 2
+    root, first = _run_to_review(tmp_path, cfg=small)
+    assert first.state.local_run_contract["max_total_steps"] == 2
+    assert first.state.step_count == 2
+
+    # The raised budget is drift, refused before the run is bound.
+    raised = default_config()
+    raised.workflow.max_total_steps = 50
+    eng = make_local_engine(root, "features/add-filter.md", cfg=raised, start=False)
+    with pytest.raises(VerificationError, match="workflow.max_total_steps: run: 2 current: 50"):
+        eng.load()
+    assert eng.state is None
+
+    # Under the recorded budget the run is out of steps: BLOCKED before the
+    # reviewer is invoked, with the contract named as the reason it cannot
+    # be raised in place.
+    eng = make_local_engine(root, "features/add-filter.md", cfg=small, start=False)
+    eng.load()
+    notes = " ".join(eng.plan_step().notes)
+    assert "would enter BLOCKED without executing" in notes and "max_total_steps=2" in notes
+    eng.provider._handler = lambda req: pytest.fail("the reviewer was invoked over budget")
+    outcome = eng.step()
+    assert outcome.next_phase == "BLOCKED"
+    assert eng.state.phase == Phase.BLOCKED
+    assert "workflow.max_total_steps=2" in eng.state.block_reason
+    assert "part of the run's contract" in eng.state.block_reason
+    assert eng.state.step_count == 2, "a blocked step is not charged"
+
+    # The enforcement reads the *contract*, not the configuration: with the
+    # persisted budget honoured, an in-memory config edit after load changes
+    # nothing but the gate's verdict.
+    eng2 = make_local_engine(root, "features/add-filter.md", cfg=small, start=False)
+    eng2.load()
+    eng2.config.workflow.max_total_steps = 50
+    with pytest.raises(VerificationError, match="workflow.max_total_steps: run: 2 current: 50"):
+        eng2.step()
 
 
 def test_the_fix_budget_is_the_recorded_one_not_the_current_one(tmp_path):

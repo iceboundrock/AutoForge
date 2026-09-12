@@ -17,7 +17,12 @@ import pytest
 from autoforge.cli import main
 from autoforge.config import default_config
 from autoforge.doctor import Doctor
-from autoforge.errors import ConfigurationError, StateError, VerificationError
+from autoforge.errors import (
+    ConfigurationError,
+    ControlResultValidationError,
+    StateError,
+    VerificationError,
+)
 from autoforge.local_workspace import (
     LocalWorkspace,
     init_feature_file,
@@ -1363,6 +1368,112 @@ def test_a_write_phase_that_never_verifies_blocks_instead_of_looping(tmp_path):
     assert "without ever producing a verified result" in eng.state.block_reason
 
 
+def _run_to(eng, root: Path, phase: Phase) -> None:
+    """Drive a fresh LOCAL run to the start of ``phase`` (ANALYZE_EXECUTE or FIX)."""
+    eng.step()  # INITIALIZING -> ANALYZE_EXECUTE
+    if phase is Phase.ANALYZE_EXECUTE:
+        return
+    eng.provider._handler = scripted(
+        eng,
+        root,
+        [
+            (lambda r: touch_impl(r, "v1\n"), lambda e: impl_result()),
+            (None, lambda e: review_result(e.state.workspace_fingerprint, 1, [finding(1)])),
+        ],
+    )
+    eng.step()  # ANALYZE_EXECUTE -> REVIEW
+    eng.step()  # REVIEW -> FIX
+    assert eng.state.phase is phase
+
+
+@pytest.mark.parametrize("phase", [Phase.ANALYZE_EXECUTE, Phase.FIX])
+def test_correction_retries_are_charged_against_the_same_durable_bound(tmp_path, phase):
+    """R9-F3: a correction retry is a write-capable launch, so it is charged.
+
+    `execution.max_correction_attempts` re-invokes an agent whose stdout
+    carried no valid CONTROL_RESULT. In LOCAL mode that agent may already
+    have written to the tree, so every such launch must be counted against
+    `MAX_LOCAL_PHASE_ATTEMPTS` and checkpointed *before* it starts -- not
+    once per phase entry. Otherwise each of the three entries could run
+    `1 + max_correction_attempts` agents, and the bound would be a multiple
+    the config chooses rather than the three the state file promises.
+    """
+    root = local_repo(tmp_path)
+    cfg = default_config()
+    cfg.execution.max_correction_attempts = 5
+    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
+    _run_to(eng, root, phase)
+
+    seen: list[int] = []
+
+    def malformed(req):
+        # Read the checkpoint as it is *on disk* when the agent starts: the
+        # charge for this launch must already be durable.
+        seen.append(load_state(eng.paths.state_file).local_pending_attempts)
+        touch_impl(root, f"garbage {len(seen)}\n")
+        return "I did some work but forgot the control block.\n"
+
+    eng.provider._handler = malformed
+    with pytest.raises(ControlResultValidationError, match="Not re-invoked"):
+        eng.step()
+    assert seen == [1, 2, 3], "every launch is checkpointed before it starts"
+    assert eng.state.phase is phase
+    assert eng.state.local_pending_phase == phase.value
+    assert load_state(eng.paths.state_file).local_pending_attempts == 3
+
+    # The next entry refuses to launch anything: the bound is spent.
+    outcome = eng.step()
+    assert outcome.next_phase == "BLOCKED"
+    assert len(seen) == 3, "a blocked phase must not invoke the agent"
+    assert "without ever producing a verified result" in eng.state.block_reason
+
+
+@pytest.mark.parametrize("phase", [Phase.ANALYZE_EXECUTE, Phase.FIX])
+def test_a_crash_between_corrections_resumes_under_the_remaining_bound(tmp_path, phase):
+    """A malformed first attempt, then a crash: `resume` sees the two launches.
+
+    The correction's charge is persisted before the corrected agent starts,
+    so a process that dies during that second launch leaves
+    `local_pending_attempts == 2` behind and the resumed entry gets exactly
+    one more launch, not a fresh three.
+    """
+    root = local_repo(tmp_path)
+    cfg = default_config()
+    cfg.execution.max_correction_attempts = 5
+    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
+    _run_to(eng, root, phase)
+
+    launches = {"n": 0}
+
+    def malformed_then_crash(req):
+        launches["n"] += 1
+        if launches["n"] == 1:
+            return "no control block\n"
+        raise KeyboardInterrupt  # the operator's Ctrl-C mid-correction
+
+    eng.provider._handler = malformed_then_crash
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    persisted = load_state(eng.paths.state_file)
+    assert persisted.local_pending_phase == phase.value
+    assert persisted.local_pending_attempts == 2
+
+    eng2 = make_local_engine(root, "features/add-filter.md", cfg=cfg, start=False)
+    eng2.load()
+    resumed = {"n": 0}
+
+    def still_malformed(req):
+        resumed["n"] += 1
+        return "still no control block\n"
+
+    eng2.provider._handler = still_malformed
+    with pytest.raises(ControlResultValidationError, match="Not re-invoked"):
+        eng2.step()
+    assert resumed["n"] == 1, "one launch remained of the three"
+    assert load_state(eng2.paths.state_file).local_pending_attempts == 3
+    assert eng2.step().next_phase == "BLOCKED"
+
+
 def test_a_review_that_fails_verification_leaves_no_pending_checkpoint(tmp_path):
     """REVIEW is read-only, so it is not checkpointed as a write phase."""
     root = local_repo(tmp_path)
@@ -2053,19 +2164,76 @@ def test_a_state_file_with_a_malformed_pending_checkpoint_is_refused(tmp_path):
     with pytest.raises(StateError, match="on a REMOTE run"):
         load_state(path)
 
-    # The well-formed checkpoint still loads.
-    path.write_text(
-        json.dumps(
-            {
-                **good,
-                "local_pending_phase": "FIX",
-                "local_pending_fingerprint": "a" * 64,
-                "local_pending_attempts": 2,
-            }
-        ),
-        encoding="utf-8",
+    # R9-F4: the checkpoint belongs to the phase entry that wrote it. Under
+    # any other live phase it would be closed unexamined -- a clean REVIEW
+    # reaches `_clear_local_invocation` and the unverified FIX work is simply
+    # forgotten -- so the mismatch is refused at load.
+    checkpoint = {
+        "local_pending_phase": "FIX",
+        "local_pending_fingerprint": "a" * 64,
+        "local_pending_attempts": 2,
+    }
+    for phase in ("INITIALIZING", "ANALYZE_EXECUTE", "REVIEW", "DONE"):
+        refuses("does not match the current phase", phase=phase, **checkpoint)
+    refuses(
+        "does not match the current phase",
+        phase="ANALYZE_EXECUTE",
+        **{**checkpoint, "local_pending_phase": "FIX"},
     )
-    assert load_state(path).local_pending_attempts == 2
+    refuses(
+        "does not match the current phase",
+        phase="FIX",
+        **{**checkpoint, "local_pending_phase": "ANALYZE_EXECUTE"},
+    )
+
+    # The well-formed checkpoint still loads under its own phase, and under
+    # a terminal phase, where it is the evidence of the launch the run
+    # blocked or failed on top of.
+    for phase in ("FIX", "BLOCKED", "FAILED"):
+        path.write_text(json.dumps({**good, "phase": phase, **checkpoint}), encoding="utf-8")
+        assert load_state(path).local_pending_attempts == 2, phase
+
+
+def test_a_checkpoint_from_another_phase_is_not_closed_by_a_clean_review(tmp_path):
+    """R9-F4, end to end: the state that used to load is also refused to run.
+
+    A FIX checkpoint under a REVIEW phase means unverified FIX work sits in
+    the tree. A clean review would have advanced the run and closed the
+    checkpoint without anyone looking at that work. The load refuses it; and
+    if the shape ever reached the engine in memory, the step refuses it too,
+    before the reviewer is invoked.
+    """
+    root = local_repo(tmp_path)
+    eng = make_local_engine(root, "features/add-filter.md")
+    eng.provider._handler = scripted(
+        eng,
+        root,
+        [(lambda r: touch_impl(r, "v1\n"), lambda e: impl_result())],
+    )
+    eng.step()  # INITIALIZING -> ANALYZE_EXECUTE
+    eng.step()  # ANALYZE_EXECUTE -> REVIEW
+    assert eng.state.phase is Phase.REVIEW
+    assert eng.state.local_pending_phase == ""
+
+    # Hand-plant the other phase's checkpoint.
+    eng.state.local_pending_phase = "FIX"
+    eng.state.local_pending_fingerprint = eng.state.workspace_fingerprint
+    eng.state.local_pending_attempts = 1
+    save_state(eng.state, eng.paths.state_file)
+    with pytest.raises(StateError, match="does not match the current phase"):
+        load_state(eng.paths.state_file)
+
+    invoked = {"n": 0}
+
+    def reviewer(req):
+        invoked["n"] += 1
+        return review_result(eng.state.workspace_fingerprint)
+
+    eng.provider._handler = reviewer
+    with pytest.raises(StateError, match="only FIX may resume"):
+        eng.step()
+    assert invoked["n"] == 0, "the reviewer must not run over another phase's checkpoint"
+    assert eng.state.local_pending_phase == "FIX", "the checkpoint is never silently closed"
 
 
 # -- PR #44 R4: the fingerprint's edges ---------------------------------------

@@ -63,6 +63,10 @@ def holds_every_invariant(s: AutoForgeState) -> None:
             assert Phase(s.local_pending_phase) in LOCAL_WRITE_PHASES
             assert s.local_pending_fingerprint
             assert s.local_pending_attempts >= 1
+            # R9-F4: the checkpoint is resumed by the phase that wrote it,
+            # or kept as evidence by a terminal phase -- never held by
+            # another live phase that would close it unexamined.
+            assert s.phase in (Phase(s.local_pending_phase), Phase.BLOCKED, Phase.FAILED)
         else:
             assert not s.local_pending_fingerprint
             assert s.local_pending_attempts == 0
@@ -109,6 +113,25 @@ ILLEGAL = {
     "negative review round": {"review_round": -1},
     "negative fix rounds": {"local_fix_rounds": -1},
     "negative step count": {"step_count": -1},
+    # A checkpoint held by a phase other than the one that wrote it (the
+    # baseline row is in REVIEW), which would close it without looking.
+    "checkpoint for another phase": {
+        "local_pending_phase": "FIX",
+        "local_pending_fingerprint": "d" * 64,
+        "local_pending_attempts": 1,
+    },
+    "checkpoint for another write phase": {
+        "phase": "ANALYZE_EXECUTE",
+        "local_pending_phase": "FIX",
+        "local_pending_fingerprint": "d" * 64,
+        "local_pending_attempts": 1,
+    },
+    "checkpoint on a finished run": {
+        "phase": "DONE",
+        "local_pending_phase": "FIX",
+        "local_pending_fingerprint": "d" * 64,
+        "local_pending_attempts": 1,
+    },
     # Claiming a checkpoint for a phase that cannot write.
     "checkpoint on a read-only phase": {
         "local_pending_phase": "REVIEW",
@@ -150,9 +173,21 @@ ILLEGAL = {
         "local_run_contract": {k: v for k, v in sample_contract().items() if k != "max_fix_rounds"}
     },
     "a contract with a field from another controller": {
-        "local_run_contract": {**sample_contract(), "max_total_steps": 300}
+        "local_run_contract": {**sample_contract(), "max_merge_rounds": 3}
     },
-    "a contract from another schema": {"local_run_contract": {**sample_contract(), "schema": 2}},
+    "a contract from another schema": {"local_run_contract": {**sample_contract(), "schema": 1}},
+    "a contract from a schema-1 controller (no step budget)": {
+        "local_run_contract": {
+            **{k: v for k, v in sample_contract().items() if k != "max_total_steps"},
+            "schema": 1,
+        }
+    },
+    "a contract with a zero step budget": {
+        "local_run_contract": {**sample_contract(), "max_total_steps": 0}
+    },
+    "a contract with a boolean step budget": {
+        "local_run_contract": {**sample_contract(), "max_total_steps": True}
+    },
     "a contract whose policy digest lies": {
         "local_run_contract": {
             **sample_contract(),

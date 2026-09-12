@@ -42,10 +42,12 @@ Classification is total. Every entry the walk meets is exactly one of:
 regular file         included: permission bits + SHA-256 of its bytes
 directory            included: permission bits; the walk descends into it
 symbolic link        included: SHA-256 of its *link text*, and the target must
-                     resolve inside the working tree and outside every
-                     excluded region — a link to bytes the snapshot does not
-                     cover would let those bytes change without the
-                     fingerprint moving
+                     resolve inside the working tree and must neither lie in
+                     an excluded region nor *contain* one — a link to bytes
+                     the snapshot does not cover, or to a directory through
+                     which such bytes can be reached at an unexcluded path,
+                     would let those bytes change without the fingerprint
+                     moving
 excluded             an enumerated rule matched: the rule and the path are
                      recorded *in* the fingerprint, so what is not covered is
                      itself part of the workspace's identity
@@ -581,6 +583,10 @@ class LocalWorkspace:
         branch = self.branch()
         git_ids = self._git_dir_identities()
         entries: list[WorkspaceEntry] = []
+        # Every link's resolved target (repository-relative, "." for the
+        # root), checked against the excluded entries once the walk is
+        # complete: see :meth:`_check_link_reach`.
+        link_targets: list[tuple[str, str]] = []
         total_bytes = 0
         by_top: dict[str, int] = {}
 
@@ -629,7 +635,12 @@ class LocalWorkspace:
                         )
                     elif entry.is_symlink:
                         target = readlink_at(entry.dir_fd, entry.name)
-                        self._check_link_target(entry.relpath, target, root, git_ids)
+                        link_targets.append(
+                            (
+                                entry.relpath,
+                                self._check_link_target(entry.relpath, target, root, git_ids),
+                            )
+                        )
                         entries.append(
                             WorkspaceEntry(
                                 path=entry.relpath,
@@ -680,6 +691,8 @@ class LocalWorkspace:
                 "unchanged. Fix its permissions, or add it to local.exclude to declare "
                 "it unreviewed.",
             ) from exc
+
+        self._check_link_reach(link_targets, entries)
 
         rules = ("gitdir",) + tuple(f"exclude:{p}" for p in self.exclude)
         return WorkspaceSnapshot(
@@ -743,7 +756,7 @@ class LocalWorkspace:
 
     def _check_link_target(
         self, relpath: str, target: str, root: Path, git_ids: set[tuple[int, int]]
-    ) -> None:
+    ) -> str:
         """A symbolic link may only point at bytes this snapshot also covers.
 
         The link *text* is what the snapshot binds, so the link itself cannot
@@ -764,6 +777,12 @@ class LocalWorkspace:
         by inode, a linked worktree's ``.git`` pointer file, a
         ``local.exclude`` region) is a target whose bytes are unbound,
         whichever of those rules would have skipped it.
+
+        Returns the resolved target, repository-relative (``"."`` for the
+        root itself). This checks the target and its *ancestors*; what the
+        target *contains* is checked by :meth:`_check_link_reach` once the
+        walk has listed every excluded entry. The root is not special: it
+        has no ancestors, and it contains everything.
         """
         parent = root / posixpath.dirname(relpath) if posixpath.dirname(relpath) else root
         resolved = Path(os.path.realpath(os.path.join(str(parent), target)))
@@ -777,7 +796,7 @@ class LocalWorkspace:
             )
         rel = os.path.relpath(resolved, root).replace(os.sep, "/")
         if rel in (".", ""):
-            return
+            return "."
         parts = rel.split("/")
         for depth in range(1, len(parts) + 1):
             prefix = "/".join(parts[:depth])
@@ -794,6 +813,47 @@ class LocalWorkspace:
                     "Its bytes are not bound, so they could change without the fingerprint "
                     "moving. Remove the link, or exclude the link itself as well.",
                 )
+        return rel
+
+    @staticmethod
+    def _check_link_reach(
+        link_targets: Iterable[tuple[str, str]], entries: Iterable[WorkspaceEntry]
+    ) -> None:
+        """No symbolic link may *contain* an excluded entry.
+
+        :meth:`_check_link_target` refuses a link whose target is excluded or
+        lies under an exclusion. The converse escape is a link to a directory
+        *above* one: with ``local.exclude: [build]`` and ``src/escape -> ..``,
+        the reviewer reads ``src/escape/build/out`` — a path no rule matches
+        — and gets the bytes of ``build/out``, which no entry binds. A link
+        to the root reaches every exclusion at once (the git directory
+        included), so it is refused by the same rule rather than by a
+        special case.
+
+        The excluded entries are exactly the ones the walk recorded as
+        :data:`KIND_EXCLUDED`, so "reachable through the link" and "skipped by
+        the walk" cannot disagree; the check runs after the walk because an
+        exclusion may be listed after the link that reaches it. A link to a
+        regular file contains nothing and passes. An exclusion that does not
+        exist yet cannot be reached; when it appears, the excluded entry's
+        *path* enters the fingerprint (see the module docstring) and the next
+        snapshot refuses the link.
+        """
+        excluded = [e.path for e in entries if e.kind == KIND_EXCLUDED]
+        if not excluded:
+            return
+        for relpath, rel in link_targets:
+            for path in excluded:
+                if rel == "." or path == rel or path.startswith(rel + "/"):
+                    where = "the working tree root" if rel == "." else rel
+                    raise _refuse(
+                        relpath,
+                        f"a symbolic link to {where}, through which {path} (excluded from "
+                        "the snapshot) can be reached at an unexcluded path",
+                        "Its bytes are not bound, so they could change without the "
+                        "fingerprint moving. Remove the link, point it below every "
+                        "exclusion, or exclude the link itself as well.",
+                    )
 
     def _digest(self, dir_fd: int, name: str, relpath: str, st: os.stat_result) -> str:
         key = (

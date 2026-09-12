@@ -211,6 +211,35 @@ SHAPES = [
         exclude=("build",),
     ),
     Shape(
+        "symlink-above-an-operator-exclusion",
+        REFUSED,
+        lambda root: (
+            _write("build/out.js", "one\n")(root),
+            (root / "src" / "escape").symlink_to(".."),
+        ),
+        lambda root: None,
+        exclude=("build",),
+        note="R9-F1: src/escape/build/out.js reads excluded bytes at an unexcluded path",
+    ),
+    Shape(
+        "symlink-to-the-root",
+        REFUSED,
+        lambda root: (root / "src" / "top").symlink_to(root),
+        lambda root: None,
+        note="R9-F1: the root contains every exclusion, the git directory included",
+    ),
+    Shape(
+        "symlink-to-a-directory-holding-no-exclusion",
+        BOUND,
+        lambda root: (
+            _write("lib/util.py", "U = 1\n")(root),
+            (root / "src" / "shared").symlink_to("../lib"),
+        ),
+        _write("lib/util.py", "U = 2\n"),
+        exclude=("build",),
+        note="R9-F1: the bytes reachable through the link are bound at their own path",
+    ),
+    Shape(
         "fifo",
         REFUSED,
         lambda root: os.mkfifo(root / "src" / "pipe"),

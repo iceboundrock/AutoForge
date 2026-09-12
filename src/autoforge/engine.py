@@ -182,11 +182,14 @@ from .validation import (
 )
 
 # How many times one LOCAL phase entry may launch a write-capable agent
-# before the run blocks. Each attempt is checkpointed before the agent starts
-# (see ``AutoForgeState.local_pending_phase``), so a crash, a malformed
-# CONTROL_RESULT or a failing validation command leaves a record that
-# ``resume`` continues from. Without a bound, a phase that can never be
-# verified would be re-invoked by every ``resume`` forever.
+# before the run blocks. Every launch is charged and checkpointed before the
+# agent starts (see ``AutoForgeState.local_pending_phase``) -- the phase
+# entry's first launch and each correction retry after a malformed
+# CONTROL_RESULT alike (R9-F3) -- so a crash, a malformed result or a failing
+# validation command all leave a record that ``resume`` continues from, and
+# ``execution.max_correction_attempts`` can never multiply this bound.
+# Without it, a phase that can never be verified would be re-invoked by every
+# ``resume`` forever.
 MAX_LOCAL_PHASE_ATTEMPTS = 3
 
 
@@ -997,10 +1000,10 @@ class ControllerEngine:
                 "pre-existing working-tree changes recorded at run creation "
                 f"(--allow-dirty): {', '.join(s.baseline_dirty_paths[:20])}"
             )
-        budget = step_budget_reason(s.step_count, self.config.workflow.max_total_steps)
+        contract = self.local_contract()
+        budget = step_budget_reason(s.step_count, contract.max_total_steps)
         if budget:
             notes.append(f"would enter BLOCKED without executing: {budget}")
-        contract = self.local_contract()
         if s.phase == Phase.REVIEW:
             cap = contract.max_review_rounds
             if s.review_round >= cap:
@@ -1270,13 +1273,15 @@ class ControllerEngine:
                 message=f"[dry-run] would execute {previous.value} via profile {plan.profile_name}",
             )
 
+        if state.mode == WorkflowMode.LOCAL:
+            # A LOCAL run's step budget is part of its contract, so it is
+            # checked there, from the persisted value.
+            return self._local_step_once(previous, plan)
         # Cumulative step budget: measured on persisted state, so `resume`
         # continues the same budget. Checked before anything executes.
         budget = step_budget_reason(state.step_count, self.config.workflow.max_total_steps)
         if budget:
             return self._block(previous, plan, self._budget_block_reason(budget))
-        if state.mode == WorkflowMode.LOCAL:
-            return self._local_step_once(previous, plan)
         if previous == Phase.REVIEW:
             # Review-round cap, whatever path led here (FIX, stale re-review,
             # HEAD drift from READY_FOR_MERGE/MERGE, resume): round cap+1 never
@@ -1357,6 +1362,13 @@ class ControllerEngine:
         state = self._require_state()
         # The contract gate, before anything is counted, verified or run.
         contract = self.local_contract()
+        # Cumulative step budget, from the contract: the bound the run was
+        # created under, not today's `workflow.max_total_steps` (R9-F2 --
+        # the gate above already refuses a changed one, and execution reads
+        # run-defining values from the contract regardless).
+        budget = step_budget_reason(state.step_count, contract.max_total_steps)
+        if budget:
+            return self._block(previous, plan, self._local_budget_block_reason(budget))
         if previous == Phase.INITIALIZING:
             state.step_count += 1
             return self._initialize_local(plan)
@@ -1394,6 +1406,15 @@ class ControllerEngine:
         # the same recoverable record: "this phase was launched once and its
         # work may already be in the tree".
         baseline = before.fingerprint
+        if state.local_pending_phase and state.local_pending_phase != previous.value:
+            # `load_state` refuses this shape; the check is repeated here so
+            # that no in-memory path can resolve one phase and then close the
+            # checkpoint another phase left behind.
+            raise StateError(
+                f"cannot enter {previous.value}: the LOCAL checkpoint records an "
+                f"unverified {state.local_pending_phase} launch, which only "
+                f"{state.local_pending_phase} may resume"
+            )
         if previous in LOCAL_WRITE_PHASES:
             if state.local_pending_phase == previous.value:
                 # An earlier attempt at this same phase entry never produced a
@@ -1470,6 +1491,35 @@ class ControllerEngine:
         state.attempt = 0
         self._save()
         return self._outcome(previous, plan=plan, result=payload, message=message)
+
+    def _charge_local_launch(self, phase: Phase) -> str:
+        """Charge one more write-capable launch of ``phase`` to the LOCAL checkpoint.
+
+        Returns ``""`` after persisting the charge, so the launch may proceed,
+        or the reason it may not: the checkpoint has already spent
+        :data:`MAX_LOCAL_PHASE_ATTEMPTS`. The persisted count is what bounds
+        the phase entry, so it must be written *before* the agent starts --
+        a launch that was never charged is a launch a crash would let
+        ``resume`` repeat. A REMOTE run, or a read-only LOCAL phase, has no
+        checkpoint to charge and is never refused here.
+        """
+        state = self._require_state()
+        if state.mode != WorkflowMode.LOCAL or phase not in LOCAL_WRITE_PHASES:
+            return ""
+        if state.local_pending_phase != phase.value:
+            raise StateError(
+                f"cannot charge a {phase.value} launch: the LOCAL checkpoint records "
+                f"{state.local_pending_phase or 'no pending phase'}"
+            )
+        if state.local_pending_attempts >= MAX_LOCAL_PHASE_ATTEMPTS:
+            return (
+                f"{phase.value} has been launched {state.local_pending_attempts} time(s) "
+                f"without ever producing a verified result, which is the bound of "
+                f"{MAX_LOCAL_PHASE_ATTEMPTS}; the next step enters BLOCKED"
+            )
+        state.local_pending_attempts += 1
+        self._save()
+        return ""
 
     def _clear_local_invocation(self) -> None:
         """Close the pending-invocation checkpoint (the phase is resolved)."""
@@ -2023,6 +2073,14 @@ class ControllerEngine:
             f"{reason}. This budget is cumulative for the run and is not reset by 'resume'; "
             "nothing was merged. Raise 'workflow.max_total_steps' in the config or start a "
             "new run."
+        )
+
+    @staticmethod
+    def _local_budget_block_reason(reason: str) -> str:
+        return (
+            f"{reason}. This budget is cumulative for the run, is not reset by 'resume', and "
+            "is part of the run's contract: raising 'workflow.max_total_steps' in the config "
+            "does not extend this run. Start a new run under the larger budget."
         )
 
     def _inconclusive(
@@ -3333,8 +3391,17 @@ class ControllerEngine:
                 self._logger().log_execution(record, prompt, stdout, stderr)
                 self._save()
                 if attempt <= max_corrections:
-                    correction_error = f"{type(exc).__name__}: {exc}"
-                    continue
+                    # A correction re-launches the same write-capable agent,
+                    # so in LOCAL mode it is charged against the same durable
+                    # bound as the launch that preceded it.
+                    refusal = self._charge_local_launch(phase)
+                    if not refusal:
+                        correction_error = f"{type(exc).__name__}: {exc}"
+                        continue
+                    raise ControlResultValidationError(
+                        f"agent '{profile.name}' did not return a valid CONTROL_RESULT after "
+                        f"{attempt} attempt(s): {exc}. Not re-invoked: {refusal}"
+                    ) from exc
                 raise ControlResultValidationError(
                     f"agent '{profile.name}' did not return a valid CONTROL_RESULT after "
                     f"{attempt} attempt(s): {exc}"

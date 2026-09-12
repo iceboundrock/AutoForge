@@ -44,7 +44,7 @@ Classification of the run's inputs
 IMMUTABLE (in the contract, compared by the gate, drift refuses):
     repository root, state root, workspace policy (exclusion rules, cost
     bounds, snapshot algorithm), validation commands, fix-round budget,
-    prompt version. Also, outside the contract object but with the same
+    cumulative step budget, prompt version. Also, outside the contract object but with the same
     semantics: the protocol version (checked on load) and the feature
     specification path (persisted; re-supplied by nothing, so it cannot
     drift).
@@ -85,8 +85,10 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 #: Schema of the persisted contract. Bumped when a field is added, removed or
 #: reinterpreted; an older schema is refused, never migrated (see
-#: :meth:`LocalRunContract.from_dict`).
-CONTRACT_SCHEMA = 1
+#: :meth:`LocalRunContract.from_dict`). 2 added ``max_total_steps``: a run
+#: created under schema 1 could resume under a larger cumulative step budget
+#: than the one it was created with, without any drift being reported.
+CONTRACT_SCHEMA = 2
 
 #: Schema of the persisted workspace policy. ``v1`` (the pre-release form:
 #: one comma-joined line that did not name the snapshot algorithm and could
@@ -246,6 +248,10 @@ class LocalRunContract:
         metadata={"label": "local.validation_commands"}
     )
     max_fix_rounds: int = field(metadata={"label": "local.max_fix_rounds"})
+    # The run's cumulative step budget. It bounds the run as a whole (every
+    # phase entry, across `resume`), so it is as run-defining as the fix
+    # budget: enforced from here, never from the configuration of the day.
+    max_total_steps: int = field(metadata={"label": "workflow.max_total_steps"})
     prompt_version: str = field(metadata={"label": "prompt_version"})
 
     @property
@@ -271,6 +277,7 @@ class LocalRunContract:
                 tuple(str(a) for a in argv) for argv in config.local.validation_commands
             ),
             max_fix_rounds=int(config.local.max_fix_rounds),
+            max_total_steps=int(config.workflow.max_total_steps),
             prompt_version=config.prompt_version or __prompt_version__,
         )
 
@@ -283,6 +290,7 @@ class LocalRunContract:
             "workspace_policy": self.workspace_policy.to_dict(),
             "validation_commands": [list(argv) for argv in self.validation_commands],
             "max_fix_rounds": self.max_fix_rounds,
+            "max_total_steps": self.max_total_steps,
             "prompt_version": self.prompt_version,
         }
 
@@ -323,6 +331,13 @@ class LocalRunContract:
             raise StateError(
                 "local run contract field 'max_fix_rounds' must be a non-negative integer"
             )
+        steps = data["max_total_steps"]
+        if not isinstance(steps, int) or isinstance(steps, bool) or steps < 1:
+            # The loader refuses a budget below 1, so a persisted one is
+            # something the controller never wrote.
+            raise StateError(
+                "local run contract field 'max_total_steps' must be a positive integer"
+            )
         commands = data["validation_commands"]
         if not isinstance(commands, list) or not all(
             isinstance(argv, list) and argv and all(isinstance(a, str) for a in argv)
@@ -338,6 +353,7 @@ class LocalRunContract:
             workspace_policy=WorkspacePolicy.from_dict(data["workspace_policy"]),
             validation_commands=tuple(tuple(argv) for argv in commands),
             max_fix_rounds=rounds,
+            max_total_steps=steps,
             prompt_version=data["prompt_version"],
         )
 

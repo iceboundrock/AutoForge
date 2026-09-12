@@ -260,10 +260,14 @@ either a PR carrying that id exists, or none does — and a crash after the
 replacement was created never causes a second implementation attempt.
 
 Correction retry: when an agent exits 0 but its `CONTROL_RESULT` is missing or
-invalid, the controller re-invokes it **once** with a correction prompt that
-tells it to inspect real Git/GitHub state first and not repeat completed
-operations. Non-zero exits, timeouts and verification failures are not
-retried automatically; they leave the phase unchanged for `resume`.
+invalid, the controller re-invokes it (`execution.max_correction_attempts`,
+default once) with a correction prompt that tells it to inspect real
+Git/GitHub state first and not repeat completed operations. In LOCAL mode a
+correction is one more write-capable launch, so it is charged against and
+checkpointed in the same durable per-phase bound as the launch before it (see
+**Recovery** under LOCAL mode); the setting can never multiply that bound.
+Non-zero exits, timeouts and verification failures are not retried
+automatically; they leave the phase unchanged for `resume`.
 
 ## Prerequisites
 
@@ -423,7 +427,7 @@ no fifth:
 | **hashed** | regular files: SHA-256 of the bytes, plus the permission bits (whether a script is executable decides what a validation command does with it) |
 | **metadata** | directories and symbolic links: the mode, and for a link its target *text* — never what the target contains |
 | **excluded** | the repository's own git directory (identified by `(st_dev, st_ino)`, not by the name `.git`) and anything matching `local.exclude`. Both are hashed into the fingerprint as *rules* and named to the reviewer in its prompt, so "what was not reviewed" is part of the review's identity |
-| **refused** | anything that cannot be bound at all: a FIFO, socket or device; an unreadable file or unlistable directory; a nested repository or submodule; a symbolic link pointing outside the tree or into an excluded region. The run fails closed, naming the entry and the exclusion that would accept it |
+| **refused** | anything that cannot be bound at all: a FIFO, socket or device; an unreadable file or unlistable directory; a nested repository or submodule; a symbolic link pointing outside the tree, into an excluded region, or to a directory (the root included) through which an excluded entry can be reached at an unexcluded path. The run fails closed, naming the entry and the exclusion that would accept it |
 
 Nothing is silently skipped, so "the snapshot does not mention it" and "it is
 not in the tree" are the same statement.
@@ -533,8 +537,9 @@ from the persisted phase, re-reading the real working tree.
 
 It also holds the run's **contract**: the repository root, the state
 directory, the workspace policy (`local.exclude`, both cost bounds and the
-snapshot algorithm), `local.validation_commands`, `local.max_fix_rounds` and
-the prompt version, as they were when the run started. A resumed run may
+snapshot algorithm), `local.validation_commands`, `local.max_fix_rounds`,
+`workflow.max_total_steps` and the prompt version, as they were when the run
+started. A resumed run may
 revalidate its contract but never redefines it: every later invocation —
 `resume`, `step`, `status`, a dry run, a crash recovery — compares what it
 would define against the record before it binds the run, and refuses with
@@ -553,7 +558,14 @@ write-capable agent is launched, recording the phase and the fingerprint it
 started from. That is what makes "crashed before implementing" and "crashed
 after implementing" distinguishable without asking the agent: the resumed
 attempt is judged against the tree from before the *first* attempt, so work
-already in the tree counts, and re-entry is bounded rather than endless.
+already in the tree counts, and re-entry is bounded rather than endless:
+three launches per phase entry, counting every launch — the entry's own, a
+correction retry after a malformed `CONTROL_RESULT`, a resumed attempt —
+each written to the state file before the agent starts, then `BLOCKED`. The
+checkpoint belongs to the phase that wrote it: a state file holding one
+under a different live phase is refused at load rather than closed by that
+phase without the recorded work ever being examined; only a run that ended
+in `BLOCKED` or `FAILED` keeps it, as evidence.
 
 ## State directory
 
