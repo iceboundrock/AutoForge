@@ -111,6 +111,31 @@ class Doctor:
             "config", True, f"{src}; profiles: {', '.join(sorted(self.config.profiles))}"
         )
 
+    def check_merge_gate(self) -> CheckResult:
+        """Report the effective merge gate and which line set it (informational).
+
+        The gate has two halves -- `safety.allow_merge` in config AND
+        `--allow-merge` on the CLI -- and `doctor` cannot see the flag, so it
+        states what the flag *would* do with this config. The source is named
+        so an operator who believes the gate is closed can check the line that
+        decides it rather than the line they last edited.
+        """
+        name = "merge gate"
+        cfg = self.config
+        if cfg is None:
+            return CheckResult(name, False, "(config not loaded)", required=False)
+        source = cfg.safety.allow_merge_source
+        if cfg.merge_allowed_by_config:
+            detail = (
+                f"config half OPEN: safety.allow_merge=true ({source}); "
+                "a run with --allow-merge WILL merge PRs itself"
+            )
+        else:
+            detail = (
+                f"CLOSED: safety.allow_merge=false ({source}); --allow-merge alone cannot merge"
+            )
+        return CheckResult(name, True, detail, required=False)
+
     def check_state_dir(self) -> CheckResult:
         d = self.state_dir or (self.config.state_dir if self.config else ".autoforge")
         path = Path(self.cwd) / d if not Path(d).is_absolute() else Path(d)
@@ -301,7 +326,7 @@ class Doctor:
         return claude_cmd, opencode_cmd
 
     def run_all(self) -> list[CheckResult]:
-        results = [self.check_config()]
+        results = [self.check_config(), self.check_merge_gate()]
         cfg = self.config
         gh = cfg.github.command if cfg else "gh"
         claude_cmd, opencode_cmd = self._agent_commands(cfg)

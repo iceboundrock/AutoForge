@@ -87,8 +87,6 @@ class ExecutionConfig:
     # How many times a *malformed CONTROL_RESULT* (exit 0) triggers a
     # correction prompt before the step fails. 0 disables correction.
     max_correction_attempts: int = 1
-    # Deprecated location for the merge gate; mirrored into safety.allow_merge.
-    allow_merge: bool = False
 
 
 # Paths whose contents define what the hosted checks actually run. See
@@ -96,11 +94,27 @@ class ExecutionConfig:
 DEFAULT_PROTECTED_MERGE_PATHS = (".github/workflows/",)
 
 
+# The keys `safety:` may contain. Anything else is a hard error: a typo such
+# as `allow_merges: true` must not fail closed *silently*, because the operator
+# then believes the gate is in the state they wrote, not the state it is in.
+SAFETY_KEYS = ("allow_merge", "protected_merge_paths")
+
+# `safety.allow_merge` when no config file sets it.
+DEFAULT_ALLOW_MERGE_SOURCE = "built-in default"
+
+
 @dataclass
 class SafetyConfig:
     # Controller invariant: no real merge unless this is true AND the CLI
-    # passes --allow-merge. Default off for this milestone.
+    # passes --allow-merge. Default off for this milestone. This is the ONLY
+    # key that opens the gate: the historical `execution.allow_merge` is
+    # rejected on load rather than read, so two keys can never disagree about
+    # the most dangerous setting in the file.
     allow_merge: bool = False
+    # Where `allow_merge` came from (`<config file>: safety.allow_merge`, or
+    # the built-in default) so `doctor` can show the effective gate state and
+    # the operator can find the line that set it.
+    allow_merge_source: str = DEFAULT_ALLOW_MERGE_SOURCE
     # Paths a PR may not change and still be merged unattended. The hosted
     # checks the merge gate trusts ("every check on the PR succeeded") are
     # defined by the workflow files *in the PR itself*: GitHub runs the PR's
@@ -275,7 +289,8 @@ class AutoForgeConfig:
 
     @property
     def merge_allowed_by_config(self) -> bool:
-        return bool(self.safety.allow_merge or self.execution.allow_merge)
+        """The config half of the merge gate: `safety.allow_merge` and nothing else."""
+        return bool(self.safety.allow_merge)
 
 
 def _claude_profile(name: str) -> ProfileConfig:
@@ -508,12 +523,26 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
             exe["max_correction_attempts"], source, "execution.max_correction_attempts"
         )
     if "allow_merge" in exe:
-        base.execution.allow_merge = _as_bool(exe["allow_merge"], source, "execution.allow_merge")
+        # Once a second, deprecated location for the merge gate. It is not
+        # read any more -- not even as `false` -- because a config that sets
+        # both can be "disabled" in one place and still open in the other.
+        raise ConfigurationError(
+            f"{source}: 'execution.allow_merge' is no longer supported; the merge gate "
+            "is 'safety.allow_merge' only. Remove the key from 'execution' (moving it "
+            "to 'safety' if you meant to open the gate)"
+        )
     safety = data.get("safety", {}) or {}
     if not isinstance(safety, dict):
         raise ConfigurationError(f"{source}: 'safety' must be a mapping")
+    unknown_safety = sorted(str(k) for k in safety if k not in SAFETY_KEYS)
+    if unknown_safety:
+        raise ConfigurationError(
+            f"{source}: unknown key(s) under 'safety': {', '.join(unknown_safety)} "
+            f"(known: {', '.join(SAFETY_KEYS)})"
+        )
     if "allow_merge" in safety:
         base.safety.allow_merge = _as_bool(safety["allow_merge"], source, "safety.allow_merge")
+        base.safety.allow_merge_source = f"{source}: safety.allow_merge"
     if "protected_merge_paths" in safety:
         base.safety.protected_merge_paths = _as_str_list(
             safety["protected_merge_paths"], source, "safety.protected_merge_paths"
