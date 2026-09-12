@@ -2001,7 +2001,7 @@ def _loop_agent(gh: FakeGitHub, findings_for_round, seen: list[str] | None = Non
             return block(review_payload(rnd, sha, findings, cid=100 + rnd))
         if req.phase == "FIX":
             prev = gh.prs[PR].head_sha
-            ids = re.findall(r"\*\*(R\d+-F\d+)\*\*", req.prompt)
+            ids = re.findall(r"^- (R\d+-F\d+) \[", req.prompt, re.M)
             new = _sha(rounds["n"])
             gh.set_head(new)
             return block(

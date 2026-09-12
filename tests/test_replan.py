@@ -30,6 +30,7 @@ from autoforge.replan_txn import (
     ReplanAttestation,
     ReplanStage,
     ReplanTransaction,
+    find_non_open_claimant,
     has_close_receipt,
     render_close_receipt,
     render_marker,
@@ -804,19 +805,6 @@ def test_r9f2_a_marker_on_the_source_pr_rejects_instead_of_reimplementing(tmp_st
     _assert_source_untouched(eng, gh)
 
 
-def test_r9f2_an_unusable_marker_on_the_source_pr_is_not_absence_either(tmp_state_dir):
-    """A botched attestation on the source is broken evidence, not no evidence."""
-    gh = FakeGitHub()
-    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.PREPARED, marker=False)
-    gh.prs[PR].body = UNUSABLE_MARKERS[0]
-    out = eng.step()
-    assert out.next_phase == "BLOCKED"
-    assert "unusable replan marker" in eng.state.block_reason
-    assert PR in eng.state.block_reason
-    assert eng.provider.calls == []
-    _assert_source_untouched(eng, gh)
-
-
 def test_r9f2_a_closed_source_carrying_the_marker_is_found_by_the_all_states_scan(
     tmp_state_dir,
 ):
@@ -1008,6 +996,73 @@ UNUSABLE_MARKERS = [
     "<!-- autoforge-replan-transaction: -->",
     "<!-- autoforge-replan-transaction: [1, 2] -->",
 ]
+
+
+@pytest.mark.parametrize("unusable", UNUSABLE_MARKERS, ids=range(len(UNUSABLE_MARKERS)))
+def test_an_unusable_marker_on_the_pre_existing_source_is_evidence_of_nothing(
+    tmp_state_dir, unusable
+):
+    """The source predates the transaction id, so it gets the watermark rule.
+
+    A pre-transaction PR is evidence of nothing about the new transaction:
+    its unusable marker neither adopts nor blocks, exactly as on every other
+    pre-existing PR. The healthy replan proceeds, and the source is closed
+    only through the checkpointed supersede.
+    """
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.PREPARED)
+    gh.prs[PR].body = "Some description.\n\n" + unusable
+    assert gh.prs[PR].number <= eng.state.replan_transaction["pr_number_watermark"]
+    out = eng.step()
+    assert out.next_phase == "REVIEW"
+    assert eng.state.current_pr_url == REPLACEMENT_PR
+    assert gh.prs[PR].state == "CLOSED"
+
+
+def test_an_unusable_marker_on_the_pre_existing_source_is_ignored_by_the_all_states_scan(
+    tmp_state_dir,
+):
+    """The recovery listing classifies the source by age exactly as the open one."""
+    gh = FakeGitHub()
+    eng, txn = _seeded_engine(tmp_state_dir, gh, ReplanStage.PREPARED, marker=False)
+    gh.prs[PR].body = UNUSABLE_MARKERS[0]
+    gh.prs[PR].state = "CLOSED"  # a human closed it while the controller was down
+    listing = find_non_open_claimant(list(gh.prs.values()), txn)
+    assert listing.disposition is Disposition.NONE, listing.reason
+    # And through the engine: no claimant found, so the phase falls through
+    # to the agent (the stub returns nothing usable) instead of blocking on
+    # the source's broken marker.
+    calls_before = len(eng.provider.calls)
+    with pytest.raises(ControlResultValidationError):
+        eng.step()
+    assert len(eng.provider.calls) > calls_before
+    assert eng.state.superseded_prs == []
+
+
+def test_an_unusable_marker_on_a_source_that_postdates_the_transaction_still_blocks(
+    tmp_state_dir,
+):
+    """The exemption is the classification, not the source role.
+
+    A source whose number is above the watermark and outside the snapshot
+    cannot happen in a consistent transaction, but if the persisted
+    checkpoint says so, its botched attestation is evidence of a first
+    attempt and is refused like any other post-watermark PR's.
+    """
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.PREPARED, marker=False)
+    txn = dict(eng.state.replan_transaction)
+    txn["pr_number_watermark"] = gh.prs[PR].number - 1
+    txn["preexisting_pr_urls"] = []
+    eng.state.replan_transaction = txn
+    eng.save()
+    gh.prs[PR].body = UNUSABLE_MARKERS[0]
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert "unusable replan marker" in eng.state.block_reason
+    assert PR in eng.state.block_reason
+    assert eng.provider.calls == []
+    _assert_source_untouched(eng, gh)
 
 
 @pytest.mark.parametrize("marker", UNUSABLE_MARKERS)

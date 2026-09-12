@@ -245,6 +245,23 @@ def test_lock_is_opened_relative_to_the_validated_directory(tmp_path, monkeypatc
         assert (moved / "controller.lock").read_text(encoding="utf-8") == f"{os.getpid()}\n"
 
 
+def test_replacing_the_lock_directory_cannot_create_a_second_lock(tmp_path):
+    """The lock inode is the stable git-common directory, not `autoforge`."""
+    base, lock_dir, path = _lock_layout(tmp_path)
+    first = ControllerLock(path).acquire()
+    try:
+        moved = tmp_path / "moved-away"
+        os.rename(lock_dir, moved)
+        lock_dir.mkdir()
+        with pytest.raises(LockError, match="another AutoForge controller"):
+            ControllerLock(path).acquire()
+    finally:
+        first.release()
+
+    with ControllerLock(path):
+        pass
+
+
 # -- repository_lock_path (R6-F1) ----------------------------------------------
 def _git(*argv, cwd):
     import subprocess

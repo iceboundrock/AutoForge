@@ -6,6 +6,8 @@ Commands:
   step    execute exactly one phase step from persisted state
   resume  continue a persisted run until a stop phase / max-steps
   status  show the persisted run summary (--json for machine output)
+  local   LOCAL mode: feature Markdown -> implement -> review -> fix -> DONE,
+          with no GitHub involved at any point (init / run / doctor)
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ import sys
 
 from . import __version__
 from .config import AutoForgeConfig, load_config_file
-from .doctor import run_doctor
+from .doctor import CheckResult, run_doctor, run_local_doctor
 from .engine import ControllerEngine, StepOutcome, StepPlan
 from .errors import (
     AutoForgeError,
@@ -26,16 +28,11 @@ from .errors import (
     StateError,
     StateTransitionError,
 )
+from .local_workspace import init_feature_file
 from .redaction import redact, redact_argv
 from .replan_txn import ReplanTransaction
-from .state import (
-    AutoForgeState,
-    StatePaths,
-    load_state,
-    quarantine_state_file,
-    save_state,
-)
-from .transitions import TERMINAL_PHASES, Phase
+from .state import AutoForgeState
+from .transitions import TERMINAL_PHASES, Phase, WorkflowMode
 
 
 def _positive_int(text: str) -> int:
@@ -115,16 +112,72 @@ def build_parser() -> argparse.ArgumentParser:
 
     st = sub.add_parser("status", help="show persisted run status")
     st.add_argument("--json", action="store_true", dest="as_json")
+
+    _add_local_parser(sub)
     return p
 
 
-def _resolve_state_dir(args) -> str:
-    if args.state_dir:
-        return args.state_dir
-    if args.config:
-        cfg = load_config_file(args.config)
-        return cfg.state_dir
-    return ".autoforge"
+def _add_local_parser(sub) -> None:
+    """`autoforge local ...`: the GitHub-free workflow.
+
+    ``status``/``step``/``resume`` stay mode-agnostic (they read the mode from
+    persisted state), so only the commands that *differ* live here.
+    """
+    loc = sub.add_parser(
+        "local",
+        help="local mode: drive a feature Markdown file with no GitHub involved",
+        description=(
+            "LOCAL mode: features/<slug>.md -> ANALYZE_EXECUTE -> REVIEW -> FIX -> "
+            "REVIEW -> DONE, entirely in the working tree. No gh, no PR, no push, "
+            "no merge, no commits. Use 'autoforge status/step/resume' as usual."
+        ),
+    )
+    lsub = loc.add_subparsers(dest="local_command", required=True)
+
+    li = lsub.add_parser("init", help="create features/<slug>.md from the template")
+    li.add_argument("slug", help="feature slug, e.g. add-transaction-filter")
+    li.add_argument(
+        "--feature-dir",
+        default=None,
+        help="directory for the file (default: config local.feature_dir)",
+    )
+    li.add_argument(
+        "--force",
+        action="store_true",
+        help="overwrite an existing feature file (refused by default)",
+    )
+
+    lr = lsub.add_parser(
+        "run", help="create a local run from a feature Markdown file and advance it"
+    )
+    lr.add_argument("feature", help="path to the feature Markdown file (inside this repository)")
+    lr.add_argument("--dry-run", action="store_true", help="plan only; no side effects")
+    lr.add_argument(
+        "--force",
+        action="store_true",
+        help="discard an existing non-terminal run (see 'run --force')",
+    )
+    lr.add_argument(
+        "--max-steps", type=_positive_int, default=50, help="steps for this invocation (>= 1)"
+    )
+    lr.add_argument(
+        "--allow-dirty",
+        action="store_true",
+        help=(
+            "start even though the working tree has changes other than the feature file; "
+            "they are recorded in the run and reported to the reviewer, never treated as "
+            "part of the implementation"
+        ),
+    )
+    lr.add_argument(
+        "--full-prompt", action="store_true", help="print full rendered prompt in dry-run"
+    )
+
+    ld = lsub.add_parser(
+        "doctor", help="check config/git/agent CLIs for local mode (never touches GitHub)"
+    )
+    ld.add_argument("--json", action="store_true", dest="as_json")
+    ld.add_argument("--feature", default=None, help="also validate this feature Markdown path")
 
 
 def _load_cfg(args) -> AutoForgeConfig:
@@ -145,6 +198,15 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_resume(args)
         if args.command == "status":
             return cmd_status(args)
+        if args.command == "local":
+            if args.local_command == "init":
+                return cmd_local_init(args)
+            if args.local_command == "run":
+                return cmd_local_run(args)
+            if args.local_command == "doctor":
+                return cmd_local_doctor(args)
+            parser.error(f"unknown local command {args.local_command}")
+            return 2
         parser.error(f"unknown command {args.command}")
         return 2
     except (ConfigurationError, StateError, StateTransitionError, LockError) as exc:
@@ -162,6 +224,53 @@ def _engine_for(args, cfg: AutoForgeConfig | None = None) -> ControllerEngine:
     return ControllerEngine(config=cfg, state_dir=state_dir)
 
 
+def _local_engine_for(args, cfg: AutoForgeConfig | None = None) -> ControllerEngine:
+    """An engine for a LOCAL command, with its state directory resolved.
+
+    LOCAL state never lives in the reviewed working tree; see
+    :meth:`ControllerEngine.bind_local_state_dir`.
+    """
+    engine = _engine_for(args, cfg)
+    engine.bind_local_state_dir(args.state_dir)
+    return engine
+
+
+def _bind_existing_run(engine: ControllerEngine) -> None:
+    """Resolve which run a mode-agnostic command (`resume`, `step`, `status`) means.
+
+    A REMOTE run keeps its state under `config.state_dir` (`.autoforge` by
+    default); a LOCAL run keeps it in the git directory, because the LOCAL
+    fingerprint covers the working tree. The two locations are disjoint and
+    the mode is not known until state is read, so the command looks for a
+    `state.json` in both. Exactly one match is used. Two matches is a real
+    ambiguity and is refused rather than resolved by precedence: picking one
+    would silently `resume` the wrong workflow. Zero matches leaves the
+    configured location so the error names it.
+
+    `--state-dir` is an answer to this question, so it is never second-guessed
+    (the caller does not reach here when it was given).
+    """
+    configured = engine.paths
+    try:
+        local = engine.local_state_paths()
+    except (AutoForgeError, OSError):
+        # Not a git repository (or git is unusable): only the configured
+        # location can hold a run, and any real problem surfaces there.
+        return
+    if os.path.abspath(local.state_dir) == os.path.abspath(configured.state_dir):
+        return
+    here = os.path.lexists(configured.state_file)
+    there = os.path.lexists(local.state_file)
+    if here and there:
+        raise StateError(
+            f"two runs exist: a remote-style one at {configured.state_file} and a local "
+            f"one at {local.state_file}. Pass --state-dir to say which one this command "
+            "means; the controller will not pick for you."
+        )
+    if there:
+        engine.paths = local
+
+
 def _doctor_runner():
     """Command runner used by `doctor` (indirection so tests can inject a fake)."""
     return None
@@ -169,7 +278,22 @@ def _doctor_runner():
 
 def cmd_doctor(args) -> int:
     results = run_doctor(config_path=args.config, state_dir=args.state_dir, runner=_doctor_runner())
-    if args.as_json:
+    return _report_checks(results, args.as_json, "AutoForge doctor (read-only checks)")
+
+
+def cmd_local_doctor(args) -> int:
+    """`autoforge local doctor`: no gh, no gh auth, no 'origin' remote."""
+    results = run_local_doctor(
+        config_path=args.config,
+        state_dir=args.state_dir,
+        runner=_doctor_runner(),
+        feature_spec_path=args.feature,
+    )
+    return _report_checks(results, args.as_json, "AutoForge doctor — local mode (read-only checks)")
+
+
+def _report_checks(results: list[CheckResult], as_json: bool, title: str) -> int:
+    if as_json:
         checks = [
             {"name": r.name, "ok": r.ok, "required": r.required, "detail": redact(r.detail)}
             for r in results
@@ -181,7 +305,7 @@ def cmd_doctor(args) -> int:
             )
         )
     else:
-        print("AutoForge doctor (read-only checks)")
+        print(title)
         print()
         for r in results:
             print(f"  [{r.label}] {r.name}: {redact(r.detail)}")
@@ -208,11 +332,54 @@ def _finish(engine: ControllerEngine, outcomes: list[StepOutcome], allow_merge: 
     return 0
 
 
+def _existing_run_guard(
+    engine: ControllerEngine, force: bool, command: str = "run"
+) -> tuple[int | None, bool]:
+    """Decide whether a fresh run may overwrite the run at ``engine.paths``.
+
+    Returns ``(exit_code_or_None, corrupt)``. Must be called with the
+    controller lock held: a verdict taken before the lock could go stale.
+    The inspection goes through the engine's held state root -- the same
+    capability the first save and every later write will use -- so the
+    directory that is inspected is the directory that is written.
+
+    ``command`` is the subcommand the operator actually typed, so the advice
+    names a command that can be copied (`run --force`, `local run --force`)
+    rather than a bare flag.
+    """
+    paths = engine.paths
+    try:
+        existing = engine.existing_run()
+    except StateError as exc:
+        # Unreadable / foreign-protocol state is fatal: a fresh run must
+        # never silently replace it (merge counters etc. would be lost).
+        if not force:
+            print(
+                f"autoforge: error: {exc}\n"
+                "autoforge: error: refusing to start a new run over an unreadable "
+                f"state file — repair it, or use '{command} --force' to move it aside as "
+                f"{paths.state_file.name}.corrupt-<timestamp> and start over",
+                file=sys.stderr,
+            )
+            return 2, False
+        return None, True
+    if existing is None:
+        return None, False
+    if existing.phase not in TERMINAL_PHASES and not force:
+        print(
+            f"autoforge: error: existing run {existing.run_id} "
+            f"in phase {existing.phase.value} — use 'resume' to continue "
+            f"or '{command} --force' to discard it",
+            file=sys.stderr,
+        )
+        return 2, False
+    return None, False
+
+
 def cmd_run(args) -> int:
     cfg = _load_cfg(args)
     engine = _engine_for(args, cfg)
     engine.validate_config()
-    paths = engine.paths
 
     if args.dry_run:
         # Fully side-effect-free: in-memory state, plan printed, nothing written.
@@ -231,47 +398,92 @@ def cmd_run(args) -> int:
     # would let a second controller take over the repository and both would
     # then run agents and persist state over each other.
     with engine.locked():
-        corrupt = False
-        # lexists, not exists: a dangling state.json symlink is still an
-        # entry that a fresh save would silently replace.
-        if os.path.lexists(paths.state_file):
-            try:
-                existing = load_state(paths.state_file)
-            except StateError as exc:
-                # Unreadable / foreign-protocol state is fatal: a fresh run
-                # must never silently replace it (merge counters etc. would
-                # be lost).
-                if not args.force:
-                    print(
-                        f"autoforge: error: {exc}\n"
-                        "autoforge: error: refusing to start a new run over an unreadable "
-                        "state file — repair it, or use 'run --force' to move it aside as "
-                        f"{paths.state_file.name}.corrupt-<timestamp> and start over",
-                        file=sys.stderr,
-                    )
-                    return 2
-                corrupt = True
-            else:
-                if existing.phase not in TERMINAL_PHASES and not args.force:
-                    print(
-                        f"autoforge: error: existing run {existing.run_id} "
-                        f"in phase {existing.phase.value} — use 'resume' to continue "
-                        "or 'run --force' to discard it",
-                        file=sys.stderr,
-                    )
-                    return 2
+        rc, corrupt = _existing_run_guard(engine, args.force)
+        if rc is not None:
+            return rc
         engine.new_run(args.epic, args.issue)
         assert engine.state is not None
         if corrupt:
-            moved = quarantine_state_file(paths.state_file)
+            moved = engine.quarantine_state()
             print(f"autoforge: moved unreadable state file aside: {moved}", file=sys.stderr)
-        save_state(engine.state, paths.state_file)
+        engine.save()
         outcomes = engine.run(max_steps=args.max_steps, dry_run=False, allow_merge=args.allow_merge)
     return _finish(engine, outcomes, args.allow_merge)
 
 
+def cmd_local_init(args) -> int:
+    """Create features/<slug>.md under the repository lock. No --force, no overwrite.
+
+    The controller lock covers this the same way it covers `local run`. A
+    feature specification is not a scratch file: a run freezes its SHA-256 and
+    re-checks it around every phase, so `local init --force` racing an active
+    run could rewrite the specification while the controller was hashing it,
+    rendering it into a prompt or verifying it — which is precisely the
+    "an agent cannot rewrite its own acceptance criteria" guarantee, undone
+    from the operator's side. One controller at a time owns the repository,
+    and creating this file is a controller write like any other.
+    """
+    cfg = _load_cfg(args)
+    engine = _local_engine_for(args, cfg)
+    with engine.locked():
+        path = init_feature_file(
+            engine.workspace(),
+            args.slug,
+            feature_dir=args.feature_dir or cfg.local.feature_dir,
+            overwrite=args.force,
+        )
+    rel = os.path.relpath(path, os.getcwd())
+    print(f"Created {rel}")
+    print()
+    print("Next:")
+    print(f"  1. Describe the feature in {rel} (problem, requirements, acceptance criteria).")
+    print(f"  2. autoforge local run {rel}")
+    print()
+    print("The specification is frozen (SHA-256) when the run starts: edit it before, not during.")
+    return 0
+
+
+def cmd_local_run(args) -> int:
+    """Create a LOCAL run from a feature Markdown file and advance it.
+
+    Mirrors ``cmd_run`` minus everything GitHub: no EPIC, no issue, no merge
+    gate. The engine never constructs a GitHubClient for a LOCAL run.
+    """
+    cfg = _load_cfg(args)
+    engine = _local_engine_for(args, cfg)
+
+    if args.dry_run:
+        # Fully side-effect-free: in-memory state, plan printed, nothing
+        # written, no agent invoked and no validation command executed.
+        engine.new_local_run(args.feature, allow_dirty=args.allow_dirty)
+        engine.validate_config()
+        outcomes = engine.run(max_steps=args.max_steps, dry_run=True)
+        for o in outcomes:
+            assert o.plan is not None
+            print_plan(o.plan, full_prompt=args.full_prompt)
+        return 0
+
+    # One continuous lock over inspect -> decide -> first save -> execute,
+    # for the same reasons as `cmd_run`.
+    with engine.locked():
+        rc, corrupt = _existing_run_guard(engine, args.force, "local run")
+        if rc is not None:
+            return rc
+        engine.new_local_run(args.feature, allow_dirty=args.allow_dirty)
+        engine.validate_config()
+        assert engine.state is not None
+        if corrupt:
+            moved = engine.quarantine_state()
+            print(f"autoforge: moved unreadable state file aside: {moved}", file=sys.stderr)
+        engine.save()
+        outcomes = engine.run(max_steps=args.max_steps, dry_run=False)
+    return _finish(engine, outcomes, allow_merge=False)
+
+
 def cmd_step(args) -> int:
     engine = _engine_for(args)
+    if not args.state_dir:
+        _bind_existing_run(engine)
     if args.dry_run:
         # Read-only: no lock, nothing written.
         engine.load()
@@ -289,6 +501,8 @@ def cmd_step(args) -> int:
 
 def cmd_resume(args) -> int:
     engine = _engine_for(args)
+    if not args.state_dir:
+        _bind_existing_run(engine)
     if args.dry_run:
         # Read-only: no lock, nothing written.
         state = engine.load()
@@ -328,19 +542,25 @@ def _resume_holding_state(
             return 0
         print(
             f"run {state.run_id} is in terminal phase {state.phase.value}: "
-            f"{state.block_reason or '-'} — inspect .autoforge/logs/ and start a new run"
+            f"{state.block_reason or '-'} — inspect {engine.paths.logs_dir}/ "
+            "and start a new run"
         )
         return 1
     return None
 
 
 def cmd_status(args) -> int:
-    state_dir = _resolve_state_dir(args)
-    paths = StatePaths.from_state_dir(state_dir)
-    state = load_state(paths.state_file)  # StateError when missing/corrupt
+    engine = _engine_for(args)
+    if not args.state_dir:
+        _bind_existing_run(engine)
+    state = engine.load()  # StateError when missing/corrupt
     if args.as_json:
+        # to_dict() already carries "mode" plus the local fields, so the JSON
+        # shape stays additive for remote consumers.
         print(json.dumps(state.to_dict(), indent=2, sort_keys=True))
         return 0
+    if state.mode == WorkflowMode.LOCAL:
+        return _print_local_status(state)
 
     def _num(url: str) -> str:
         return url.rstrip("/").rsplit("/", 1)[-1] if url else "-"
@@ -381,6 +601,51 @@ def cmd_status(args) -> int:
     print()
     print(f"Steps executed: {state.step_count}")
     print(f"Merged since EPIC update: {state.merged_since_epic_update}")
+    print()
+    print(f"Created:    {state.created_at}")
+    print(f"Updated:    {state.updated_at}")
+    return 0
+
+
+def _print_local_status(state: AutoForgeState) -> int:
+    """Human status for a LOCAL run.
+
+    Deliberately omits Issue/PR/branch/merge fields: a local run has none, and
+    printing empty ones would suggest the GitHub lifecycle is merely stalled.
+    """
+    fix_budget = state.local_fix_rounds
+
+    print("AutoForge (local mode)")
+    print()
+    print(f"Run:        {state.run_id}")
+    print(f"Mode:       {state.mode.value} (no GitHub: no issue, no PR, no push, no merge)")
+    print(f"Feature:    {state.feature_spec_path or '-'}")
+    print(f"Frozen SHA: {state.feature_spec_sha256 or '-'}")
+    print()
+    print(f"Phase:      {state.phase.value}")
+    print(f"Review rounds completed: {state.review_round}")
+    print(f"Fix rounds completed:    {fix_budget}")
+    print(f"Last review:   {state.last_review_result or '-'}")
+    print(f"Open findings: {len(state.open_findings)}")
+    for finding in state.open_findings:
+        print(
+            f"  {finding.get('id', '?')} [{finding.get('severity', '?')}] "
+            f"{str(finding.get('title', '')).strip()[:80]}"
+        )
+    print()
+    print(f"Base HEAD:   {state.base_head_sha or '(unborn)'}")
+    print(f"Workspace fingerprint: {state.workspace_fingerprint or '-'}")
+    print(f"Reviewed fingerprint:  {state.reviewed_workspace_fingerprint or '-'}")
+    if state.baseline_dirty_paths:
+        print("Pre-existing working-tree changes at run creation (--allow-dirty):")
+        for path in state.baseline_dirty_paths[:20]:
+            print(f"  {path}")
+        if len(state.baseline_dirty_paths) > 20:
+            print(f"  ... and {len(state.baseline_dirty_paths) - 20} more")
+    if state.block_reason:
+        print(f"Reason:     {state.block_reason}")
+    print()
+    print(f"Steps executed: {state.step_count}")
     print()
     print(f"Created:    {state.created_at}")
     print(f"Updated:    {state.updated_at}")

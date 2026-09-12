@@ -281,7 +281,9 @@ def sole_attestation(
     return mine[0], ""
 
 
-def source_marker_defect(scan: MarkerScan, transaction_id: str, ref: str) -> str:
+def source_marker_defect(
+    scan: MarkerScan, transaction_id: str, ref: str, *, preexisting: bool
+) -> str:
     """Why the *source* PR's own body refuses this replan, or ``""``.
 
     The source can never be adopted as its own replacement, but excluding it
@@ -295,9 +297,15 @@ def source_marker_defect(scan: MarkerScan, transaction_id: str, ref: str) -> str
 
     A valid marker for another transaction is left alone: a source PR may
     itself be an earlier replan's replacement, and that older marker is
-    legitimate history. An unusable marker is refused, because a body that
-    tried to carry an attestation and failed is evidence of a botched attempt
-    rather than of an unrelated PR.
+    legitimate history. An unusable marker is refused only when the source
+    postdates the transaction id (``preexisting`` is false, the same
+    watermark/snapshot classification every other candidate gets): a body
+    that tried to carry an attestation and failed is then evidence of a
+    botched attempt. A source that already existed when the transaction was
+    prepared is evidence of nothing about it -- its unusable markers, like
+    those on any other pre-existing PR, neither adopt nor block -- while a
+    *valid* marker for this transaction is a copied one and is refused
+    whatever the source's age.
     """
     if any(a.transaction_id == transaction_id for a in scan.attestations):
         return (
@@ -305,7 +313,7 @@ def source_marker_defect(scan: MarkerScan, transaction_id: str, ref: str) -> str
             "the marker belongs on the replacement the agent creates, and a replan whose "
             "attestation sits on the PR being superseded is refused, never restarted"
         )
-    if scan.malformed:
+    if scan.malformed and not preexisting:
         return (
             f"source PR {ref} carries an unusable replan marker "
             f"({'; '.join(scan.malformed)}), which cannot be ruled out as a botched "
@@ -764,17 +772,18 @@ def select_bound_candidate(open_prs: list[PRInfo], txn: ReplanTransaction) -> Ca
         if not canonical:
             continue
         scan = scan_replan_markers(pr.body or "")
+        under_watermark = pr.number <= txn.pr_number_watermark
+        predates = under_watermark or canonical in preexisting
         if canonical == source:
             # Read before it is excluded: a marker the agent put on the PR
             # being superseded must be refused, not silently reported as
             # "no candidate" -- see :func:`source_marker_defect`.
-            defect = source_marker_defect(scan, txn.transaction_id, canonical)
+            defect = source_marker_defect(scan, txn.transaction_id, canonical, preexisting=predates)
             if defect:
                 return CandidateSelection(Disposition.REJECTED, reason=defect)
             continue
         mine = [a for a in scan.attestations if a.transaction_id == txn.transaction_id]
-        under_watermark = pr.number <= txn.pr_number_watermark
-        if under_watermark or canonical in preexisting:
+        if predates:
             if mine:
                 # The id did not exist when this PR was created, so a match
                 # means the marker was copied. Never adopt it.
@@ -856,16 +865,17 @@ def find_non_open_claimant(all_prs: list[PRInfo], txn: ReplanTransaction) -> Can
         if not canonical:
             continue
         scan = scan_replan_markers(pr.body or "")
+        under_watermark = pr.number <= txn.pr_number_watermark
+        predates = under_watermark or canonical in preexisting
         if canonical == source:
-            defect = source_marker_defect(scan, txn.transaction_id, canonical)
+            defect = source_marker_defect(scan, txn.transaction_id, canonical, preexisting=predates)
             if defect:
                 return CandidateSelection(Disposition.REJECTED, reason=defect)
             continue
         mine = [a for a in scan.attestations if a.transaction_id == txn.transaction_id]
         if not mine and not scan.malformed:
             continue
-        under_watermark = pr.number <= txn.pr_number_watermark
-        if (under_watermark or canonical in preexisting) and not mine:
+        if predates and not mine:
             # A PR that predates the transaction id cannot be evidence about
             # it, and the open path ignores its unusable markers for exactly
             # the same reason. Only a *copied* valid marker is reported below.
@@ -884,7 +894,7 @@ def find_non_open_claimant(all_prs: list[PRInfo], txn: ReplanTransaction) -> Can
                     "must be decided by a human, not by invoking the agent again"
                 ),
             )
-        if under_watermark or canonical in preexisting:
+        if predates:
             how = (
                 f"its number {pr.number} is at or below the watermark {txn.pr_number_watermark}"
                 if under_watermark
