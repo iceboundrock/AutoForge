@@ -841,6 +841,15 @@ touching a protected path still has to pass the review phase, whose findings
 are what the loop bounds act on. Neither replaces a human reading the diff,
 which is why `safety.allow_merge` is off by default.
 
+The third-party actions the workflow runs are the remaining input: a
+required check is only as trustworthy as the code that produces it, and a
+tag such as `actions/checkout@v7` can be repointed upstream without any
+change in this repository. `ci.yml` therefore pins every action to a full
+commit SHA (with the version as a trailing comment), a test refuses a
+`uses:` that is not SHA-pinned, and Dependabot (`.github/dependabot.yml`)
+proposes bumps so the pins do not rot. Those PRs edit a protected path, so
+they are always merged by a human, never by the controller.
+
 Tests never call real Claude Code, OpenCode or GitHub write APIs. Agents are
 replaced by a `ScriptedProvider` and GitHub by an in-memory fake; the
 executor tests use real local Python subprocesses only.

@@ -24,6 +24,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+DEPENDABOT = REPO_ROOT / ".github" / "dependabot.yml"
 
 if str(REPO_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "src"))
@@ -176,8 +177,61 @@ def test_the_merge_gate_refuses_to_merge_a_pr_that_edits_this_workflow():
     assert default_config().safety.protects(relative)
 
 
+def _action_refs(text: str) -> list[tuple[str, str, str]]:
+    """Every ``uses:`` step as ``(action, ref, trailing comment)``."""
+    refs = re.findall(r"^\s*-\s*uses:\s*(\S+)@(\S+)[ \t]*(#.*)?$", text, flags=re.MULTILINE)
+    assert refs, "the CI workflow uses no actions; update this test if that is intended"
+    return refs
+
+
+def test_actions_are_pinned_to_commit_shas():
+    """A required check is only as trustworthy as the code producing it (issue #39).
+
+    A tag (`@v7`, `@v10.0.1`) can be repointed by the action's owner or by
+    whoever compromises that repository, and nothing here would record the
+    change. A full commit SHA cannot move. The trailing comment keeps the
+    version readable and is what Dependabot rewrites alongside the SHA; it
+    must name a full version, because a floating major would not say what
+    the SHA is.
+    """
+    for action, ref, comment in _action_refs(_code()):
+        assert re.fullmatch(r"[0-9a-f]{40}", ref), (
+            f"{action}@{ref} is a mutable ref; pin it to the full commit SHA the tag "
+            "resolves to (gh api repos/<action>/git/ref/tags/<tag> --jq .object.sha)"
+        )
+        assert re.fullmatch(r"#\s*v\d+\.\d+\.\d+", comment), (
+            f"{action}@{ref} must carry a trailing `# vX.Y.Z` comment naming the "
+            f"version the SHA was resolved from, got {comment!r}"
+        )
+
+
+def test_dependabot_keeps_the_action_pins_fresh():
+    """Pinning trades freshness for immutability; without updates the pins rot.
+
+    Its PRs edit `.github/workflows/`, which `safety.protected_merge_paths`
+    protects, so a bumped SHA is always merged by a human and never by the
+    controller.
+    """
+    assert DEPENDABOT.is_file(), "no .github/dependabot.yml: the SHA pins would only move by hand"
+    config = _strip_comments(DEPENDABOT.read_text(encoding="utf-8"))
+    assert re.search(r"^version:\s*2\s*$", config, flags=re.MULTILINE)
+    assert re.search(
+        r"package-ecosystem:\s*[\"']?github-actions[\"']?\s*$", config, flags=re.MULTILINE
+    ), "Dependabot does not watch the github-actions ecosystem"
+    assert re.search(r"directory:\s*[\"']?/[\"']?\s*$", config, flags=re.MULTILINE), (
+        "the github-actions ecosystem must be rooted at `/` to see .github/workflows/"
+    )
+
+
 def test_comments_cannot_satisfy_the_guards():
     """The guards read code, not prose: a comment claiming CI runs X does not count."""
     commented = "# on:\n#   pull_request:\n#     run: uv run pytest\njobs:\n  ci:\n"
     assert _strip_comments(commented) == "jobs:\n  ci:"
     assert "pull_request" not in _strip_comments(commented)
+    # A trailing comment is kept: the SHA-pin guard reads the version from it.
+    pinned = "      - uses: a/b@" + "0" * 40 + " # v1.2.3\n"
+    assert _strip_comments(pinned) == pinned.rstrip("\n")
+    ((_, ref, comment),) = _action_refs(pinned)
+    assert (ref, comment) == ("0" * 40, "# v1.2.3")
+    # And prose claiming a pin is not one.
+    assert _action_refs("      - uses: a/b@v1 # " + "0" * 40) == [("a/b", "v1", "# " + "0" * 40)]

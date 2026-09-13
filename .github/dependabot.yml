@@ -1,0 +1,13 @@
+# Keeps the SHA-pinned actions in .github/workflows/ from rotting (issue #39).
+#
+# Pinning to a commit trades freshness for immutability; without this the
+# pins would only ever move by hand. Dependabot bumps the SHA and the
+# trailing `# vX.Y.Z` comment together. Its PRs edit `.github/workflows/`,
+# which `safety.protected_merge_paths` protects, so the controller never
+# merges them unattended: a human reviews the new SHA and merges.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

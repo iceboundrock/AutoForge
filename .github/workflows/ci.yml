@@ -18,6 +18,13 @@
 # `.github/workflows/`) makes any PR that touches these files BLOCK in
 # READY_FOR_MERGE / MERGE for a human to review and merge. See README,
 # "What a green `ci` does and does not prove".
+#
+# Actions are pinned to full commit SHAs, not tags (issue #39). `ci` is a
+# required check on `main`, so the merge gate is only as trustworthy as the
+# code that produces it, and a tag can be repointed without any change here.
+# The trailing `# vX.Y.Z` comment is the human-readable version and is what
+# Dependabot (.github/dependabot.yml) updates together with the SHA.
+# tests/test_ci_workflow.py refuses a `uses:` that is not SHA-pinned.
 name: CI
 
 on:
@@ -43,10 +50,11 @@ jobs:
         # release. tests/test_ci_workflow.py asserts the floor stays covered.
         python-version: ["3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v7
-      # Pinned to a full version on purpose: setup-uv stopped publishing
-      # floating major tags after v7, so `@v10` does not resolve.
-      - uses: astral-sh/setup-uv@v10.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The trailing comment names a full version on purpose: setup-uv
+      # stopped publishing floating major tags after v7, so `@v10` does not
+      # resolve and Dependabot must track a full semver tag.
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           # Sets UV_PYTHON, which takes precedence over the repo's
           # .python-version pin.
@@ -64,10 +72,11 @@ jobs:
     name: lint + format + types
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      # Pinned to a full version on purpose: setup-uv stopped publishing
-      # floating major tags after v7, so `@v10` does not resolve.
-      - uses: astral-sh/setup-uv@v10.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The trailing comment names a full version on purpose: setup-uv
+      # stopped publishing floating major tags after v7, so `@v10` does not
+      # resolve and Dependabot must track a full semver tag.
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           python-version: "3.11"
           enable-cache: true
