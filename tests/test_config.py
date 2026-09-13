@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+from autoforge import config
 from autoforge.config import default_config, load_config_file, validate_required_profiles
 from autoforge.errors import ConfigurationError
 from autoforge.validation import parse_github_url, validate_epic_and_issue
@@ -57,18 +58,13 @@ def test_unknown_profile_raises():
         default_config().profile("nope")
 
 
-def test_example_yaml_loads_without_pyyaml(tmp_path, monkeypatch):
-    import sys
-    from pathlib import Path
-
-    import autoforge
-
-    repo_example = Path(autoforge.__file__).parents[2] / "autoforge.example.yaml"
-    assert repo_example.exists(), f"example config missing: {repo_example}"
-    # Force the built-in subset parser even if PyYAML is installed.
-    monkeypatch.setitem(sys.modules, "yaml", None)
+@pytest.fixture
+def no_pyyaml(monkeypatch):
+    """Force the built-in YAML subset parser even though PyYAML is installed."""
     import builtins
+    import sys
 
+    monkeypatch.setitem(sys.modules, "yaml", None)
     real_import = builtins.__import__
 
     def fake_import(name, *a, **k):
@@ -77,6 +73,31 @@ def test_example_yaml_loads_without_pyyaml(tmp_path, monkeypatch):
         return real_import(name, *a, **k)
 
     monkeypatch.setattr(builtins, "__import__", fake_import)
+
+
+@pytest.fixture(params=["pyyaml", "subset"])
+def yaml_backend(request):
+    """Run a YAML case under PyYAML and under the subset parser.
+
+    An operator with ``autoforge[yaml]`` reads every config through PyYAML,
+    and PyYAML's own answers (last duplicate wins, any root type, typed keys)
+    are exactly where the loader's fail-closed rules need their own check,
+    so a rule proven only on the subset parser is proven on the wrong path.
+    """
+    if request.param == "pyyaml":
+        pytest.importorskip("yaml")
+    else:
+        request.getfixturevalue("no_pyyaml")
+    return request.param
+
+
+def test_example_yaml_loads_without_pyyaml(tmp_path, no_pyyaml):
+    from pathlib import Path
+
+    import autoforge
+
+    repo_example = Path(autoforge.__file__).parents[2] / "autoforge.example.yaml"
+    assert repo_example.exists(), f"example config missing: {repo_example}"
     cfg = load_config_file(repo_example)
     assert cfg.profile("analyze_execute").model == "fable"
     assert cfg.profile("review_round_1").model == "openai/gpt-5.6-luna"
@@ -195,6 +216,287 @@ def test_unknown_safety_key_rejected_in_yaml_too(tmp_path):
     p.write_text("version: 1\nsafety:\n  allow_merges: true\n", encoding="utf-8")
     with pytest.raises(ConfigurationError, match="allow_merges"):
         load_config_file(p)
+
+
+# One (section label, path into the JSON document, a valid key with a value,
+# the known keys as `_merge_config` names them) per section that has a closed
+# key set. `profiles` is keyed by name, so its entry is one profile mapping.
+SECTION_SCHEMAS = [
+    ("the top level", (), ("state_dir", '".autoforge"'), config.TOP_LEVEL_KEYS),
+    ("execution", ("execution",), ("max_correction_attempts", "1"), config.EXECUTION_KEYS),
+    ("safety", ("safety",), ("allow_merge", "false"), config.SAFETY_KEYS),
+    ("github", ("github",), ("timeout_seconds", "60"), config.GITHUB_KEYS),
+    ("merge", ("merge",), ("method", '"squash"'), config.MERGE_KEYS),
+    ("review", ("review",), ("replan", "{}"), config.REVIEW_KEYS),
+    ("review.replan", ("review", "replan"), ("enabled", "false"), config.REPLAN_KEYS),
+    ("workflow", ("workflow",), ("max_review_rounds", "3"), config.WORKFLOW_KEYS),
+    ("local", ("local",), ("max_fix_rounds", "0"), config.LOCAL_KEYS),
+    ("profiles.fix", ("profiles", "fix"), ("effort", '"high"'), config.PROFILE_KEYS),
+]
+
+
+def _document(path, entries):
+    """A JSON config with ``entries`` (``"key": value`` strings) at ``path``."""
+    body = "{" + ", ".join(entries) + "}"
+    for key in reversed(path):
+        body = f'{{"{key}": {body}}}'
+    if not path:
+        body = "{" + ", ".join(['"version": 1'] + entries) + "}"
+    return body
+
+
+@pytest.mark.parametrize("label, path, valid, known", SECTION_SCHEMAS, ids=lambda v: str(v)[:20])
+@pytest.mark.parametrize("beside_valid_key", [False, True])
+def test_unknown_keys_are_rejected_in_every_section(
+    tmp_path, label, path, valid, known, beside_valid_key
+):
+    """A misspelled key is an error everywhere, not a no-op that keeps the default.
+
+    The message names the section, the offending key(s) and the keys the
+    loader would have read, in the shape `safety` already used.
+    """
+    entries = [f'"{valid[0]}": {valid[1]}'] if beside_valid_key else []
+    entries += ['"bogus_key": 1', '"another_bogus": true']
+    p = tmp_path / "cfg.json"
+    p.write_text(_document(path, entries), encoding="utf-8")
+    with pytest.raises(ConfigurationError, match=f"unknown key.*under '{label}'") as info:
+        load_config_file(p)
+    message = str(info.value)
+    assert "another_bogus, bogus_key" in message  # every unknown key, sorted
+    assert f"(known: {', '.join(known)})" in message
+    assert valid[0] not in message.split("(known:")[0]  # the valid key is not blamed
+
+
+@pytest.mark.parametrize(
+    "body, label, key",
+    [
+        # The examples from issue #59, each of which used to load without error.
+        ('{"version": 1, "merge": {"methd": "squash"}}', "merge", "methd"),
+        ('{"version": 1, "workflow": {"max_review_round": 3}}', "workflow", "max_review_round"),
+        (
+            '{"version": 1, "workflow": {"stagnation_identical_round": 2}}',
+            "workflow",
+            "stagnation_identical_round",
+        ),
+        ('{"version": 1, "review": {"replan": {"enable": false}}}', "review.replan", "enable"),
+        (
+            '{"version": 1, "execution": {"default_timeout_second": 60}}',
+            "execution",
+            "default_timeout_second",
+        ),
+        # A key that exists, but under another section.
+        ('{"version": 1, "workflow": {"soft_threshold": 3}}', "workflow", "soft_threshold"),
+        ('{"version": 1, "review": {"enabled": false}}', "review", "enabled"),
+        ('{"version": 1, "merge": {"allow_merge": true}}', "merge", "allow_merge"),
+        ('{"version": 1, "local": {"max_review_rounds": 2}}', "local", "max_review_rounds"),
+        ('{"version": 1, "github": {"cmd": "gh"}}', "github", "cmd"),
+        # Top level: a section name misspelled, or a key that was never read.
+        ('{"version": 1, "workflows": {"max_review_rounds": 3}}', "the top level", "workflows"),
+        ('{"version": 1, "repository": "o/r"}', "the top level", "repository"),
+        # A profile key, on a built-in profile and on a new one alike.
+        ('{"version": 1, "profiles": {"fix": {"modle": "x"}}}', "profiles.fix", "modle"),
+        ('{"version": 1, "profiles": {"extra": {"timeout": 5}}}', "profiles.extra", "timeout"),
+    ],
+)
+def test_typos_from_the_issue_are_rejected(tmp_path, body, label, key):
+    p = tmp_path / "cfg.json"
+    p.write_text(body, encoding="utf-8")
+    with pytest.raises(ConfigurationError, match=f"unknown key.*under '{label}': {key} "):
+        load_config_file(p)
+
+
+def test_unknown_keys_rejected_in_yaml_and_toml_too(tmp_path):
+    yaml = tmp_path / "cfg.yaml"
+    yaml.write_text("version: 1\nworkflow:\n  max_review_round: 3\n", encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="under 'workflow': max_review_round"):
+        load_config_file(yaml)
+    toml = tmp_path / "cfg.toml"
+    toml.write_text("version = 1\n[review.replan]\nenable = false\n", encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="under 'review.replan': enable"):
+        load_config_file(toml)
+
+
+def test_unknown_keys_rejected_on_both_yaml_backends(tmp_path, yaml_backend):
+    p = tmp_path / "cfg.yaml"
+    p.write_text("version: 1\nworkflow:\n  max_review_round: 3\n", encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="under 'workflow': max_review_round"):
+        load_config_file(p)
+
+
+# A key written twice in one mapping. `json.loads`, PyYAML and the subset
+# parser all keep the last value and drop the earlier one *before* the loader
+# sees the document, so a typo in the dropped copy would be the very silent
+# no-op the unknown-key check exists to refuse. `tomllib` refuses it itself.
+@pytest.mark.parametrize(
+    "text, key",
+    [
+        # The whole section repeated: the first copy, typo and all, is gone.
+        (
+            "version: 1\nworkflow:\n  max_review_round: 3\nworkflow:\n  max_review_rounds: 20\n",
+            "workflow",
+        ),
+        # One leaf repeated: which bound is in force is decided by file order.
+        (
+            "version: 1\nworkflow:\n  max_review_rounds: 3\n  max_review_rounds: 20\n",
+            "max_review_rounds",
+        ),
+        # A repeated profile name.
+        (
+            "version: 1\nprofiles:\n  fix:\n    model: a\n  fix:\n    model: b\n",
+            "fix",
+        ),
+    ],
+)
+def test_duplicate_yaml_key_is_a_parse_error(tmp_path, yaml_backend, text, key):
+    p = tmp_path / "cfg.yaml"
+    p.write_text(text, encoding="utf-8")
+    with pytest.raises(ConfigurationError, match=f"cannot parse config .*duplicate key '{key}'"):
+        load_config_file(p)
+
+
+def test_duplicate_json_key_is_a_parse_error(tmp_path):
+    p = tmp_path / "cfg.json"
+    p.write_text(
+        '{"version": 1, "workflow": {"max_review_round": 3}, '
+        '"workflow": {"max_review_rounds": 20}}',
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigurationError, match="cannot parse config .*duplicate key 'workflow'"):
+        load_config_file(p)
+    p.write_text('{"version": 1, "safety": {"allow_merge": false, "allow_merge": true}}')
+    with pytest.raises(ConfigurationError, match="duplicate key 'allow_merge'"):
+        load_config_file(p)
+
+
+def test_duplicate_toml_key_is_a_parse_error(tmp_path):
+    p = tmp_path / "cfg.toml"
+    p.write_text(
+        "version = 1\n[workflow]\nmax_review_round = 3\n[workflow]\nmax_review_rounds = 20\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigurationError, match="cannot parse config .*twice"):
+        load_config_file(p)
+
+
+def test_yaml_same_key_in_different_mappings_is_not_a_duplicate(tmp_path, yaml_backend):
+    """Only a key repeated within *one* mapping is a duplicate."""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(
+        "version: 1\nprofiles:\n  fix:\n    model: a\n  analyze_execute:\n    model: b\n",
+        encoding="utf-8",
+    )
+    cfg = load_config_file(p)
+    assert cfg.profile("fix").model == "a" and cfg.profile("analyze_execute").model == "b"
+
+
+def test_pyyaml_merge_key_override_is_not_a_duplicate(tmp_path):
+    """``<<`` exists to be overridden; only PyYAML reads it, and it still may."""
+    pytest.importorskip("yaml")
+    p = tmp_path / "cfg.yaml"
+    p.write_text(
+        "version: 1\nprofiles:\n  fix: &base\n    model: a\n    effort: low\n"
+        "  analyze_execute:\n    <<: *base\n    model: b\n",
+        encoding="utf-8",
+    )
+    cfg = load_config_file(p)
+    assert cfg.profile("analyze_execute").model == "b"
+    assert cfg.profile("analyze_execute").effort == "low"
+
+
+# PyYAML used to have its non-mapping root replaced by `{}` before the root
+# check ran, so `false` or a list loaded as the built-in configuration while
+# the subset parser refused the same file.
+@pytest.mark.parametrize("text", ["false\n", "- item\n", "just a string\n", "42\n"])
+def test_non_mapping_yaml_root_rejected_on_both_backends(tmp_path, yaml_backend, text):
+    p = tmp_path / "cfg.yaml"
+    p.write_text(text, encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="mapping at top level|cannot parse"):
+        load_config_file(p)
+
+
+@pytest.mark.parametrize("text", ["", "# nothing but a comment\n", "\n\n"])
+def test_empty_yaml_document_is_the_defaults(tmp_path, yaml_backend, text):
+    """No content is the one non-mapping root that means "all defaults"."""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(text, encoding="utf-8")
+    cfg = load_config_file(p)
+    assert cfg.safety.allow_merge is False
+    assert cfg.workflow.max_review_rounds == default_config().workflow.max_review_rounds
+
+
+# PyYAML types its keys, so `1:` is the int 1 and `~:` is None. Such a name
+# used to load into `dict[str, ProfileConfig]` and only fail later, as a raw
+# `TypeError` when `doctor` sorted the names.
+@pytest.mark.parametrize("name", ["1", "true", "~", "1.5"])
+def test_non_string_pyyaml_profile_name_rejected(tmp_path, name):
+    pytest.importorskip("yaml")
+    p = tmp_path / "cfg.yaml"
+    p.write_text(f"version: 1\nprofiles:\n  {name}:\n    provider: scripted\n", encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="profile names must be non-empty strings"):
+        load_config_file(p)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        '{"version": 1, "profiles": {"": {"provider": "scripted"}}}',
+        '{"version": 1, "profiles": {"   ": {"provider": "scripted"}}}',
+    ],
+)
+def test_blank_profile_name_rejected(tmp_path, body):
+    p = tmp_path / "cfg.json"
+    p.write_text(body, encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="profile names must be non-empty strings"):
+        load_config_file(p)
+
+
+def test_quoted_numeric_profile_name_is_a_string(tmp_path, yaml_backend):
+    p = tmp_path / "cfg.yaml"
+    p.write_text('version: 1\nprofiles:\n  "1":\n    provider: scripted\n', encoding="utf-8")
+    assert load_config_file(p).profile("1").provider == "scripted"
+
+
+def test_removed_execution_allow_merge_keeps_its_own_message(tmp_path):
+    """The deprecated gate key explains where it went instead of reading as a typo."""
+    p = tmp_path / "cfg.json"
+    p.write_text('{"version": 1, "execution": {"allow_merge": true, "bogus": 1}}', encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="no longer supported") as info:
+        load_config_file(p)
+    assert "unknown key" not in str(info.value)
+
+
+@pytest.mark.parametrize(
+    "keys, config_cls",
+    [
+        (config.EXECUTION_KEYS, config.ExecutionConfig),
+        (config.SAFETY_KEYS, config.SafetyConfig),
+        (config.GITHUB_KEYS, config.GitHubConfig),
+        (config.MERGE_KEYS, config.MergeConfig),
+        (config.REVIEW_KEYS, config.ReviewConfig),
+        (config.REPLAN_KEYS, config.ReplanConfig),
+        (config.WORKFLOW_KEYS, config.WorkflowConfig),
+        (config.LOCAL_KEYS, config.LocalConfig),
+        (config.PROFILE_KEYS, config.ProfileConfig),
+        (config.TOP_LEVEL_KEYS, config.AutoForgeConfig),
+    ],
+)
+def test_known_key_tables_name_real_fields(keys, config_cls):
+    """Every key the loader accepts lands on a field; nothing accepted is a no-op."""
+    from dataclasses import fields
+
+    names = {f.name for f in fields(config_cls)}
+    assert set(keys) <= names, set(keys) - names
+    # Fields the loader deliberately does not read from the file.
+    derived = {"allow_merge_source", "name"}
+    assert names - set(keys) <= derived, names - set(keys) - derived
+
+
+def test_every_key_in_the_example_file_is_known(tmp_path):
+    """The documented example is the reference config; a key it uses must load."""
+    from pathlib import Path
+
+    cfg = load_config_file(Path(__file__).resolve().parents[1] / "autoforge.example.yaml")
+    assert cfg.workflow.max_review_rounds == 20 and cfg.local.max_workspace_entries == 50000
 
 
 # Every JSON falsy value that is not a mapping. `data.get("safety", {}) or {}`
