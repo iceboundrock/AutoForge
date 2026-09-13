@@ -134,6 +134,28 @@ def is_access_denied_gh_failure(stderr: str) -> bool:
     )
 
 
+# The oldest `gh` the client works with. `gh api --paginate --slurp` (the
+# page-of-pages listing behind every paginated read: branch rules in `doctor`,
+# a PR's changed files at the merge gate) arrived in 2.48.0; an older `gh`
+# rejects the flag, so those reads fail conclusively instead of paginating.
+GH_MIN_VERSION = (2, 48, 0)
+_GH_VERSION_RE = re.compile(r"^gh version (\d+)\.(\d+)\.(\d+)\b")
+
+
+def parse_gh_version(text: str) -> tuple[int, int, int] | None:
+    """The ``X.Y.Z`` of a `gh --version` output's first line, or None if unparsable.
+
+    Only the shape `gh` prints (``gh version 2.48.0 (2024-04-09)``) is read;
+    anything else is "unknown", never a guess in either direction.
+    """
+    first = (text or "").strip().splitlines()
+    match = _GH_VERSION_RE.match(first[0]) if first else None
+    if match is None:
+        return None
+    major, minor, patch = (int(part) for part in match.groups())
+    return (major, minor, patch)
+
+
 @dataclass
 class RepoInfo:
     name_with_owner: str
@@ -253,10 +275,11 @@ class ChangedFile:
 class ChangedFiles:
     """The files a PR touches, and whether that listing is provably complete.
 
-    The listing returns only the first page of a PR's files, so one shorter
-    than ``total`` says nothing about the files it does not contain. A caller
-    that uses this to *refuse* something must fail closed when
-    :attr:`complete` is false rather than read absence as proof.
+    Every page of the listing is read, but GitHub serves at most 3000 files
+    of a PR through the files endpoint, so a listing shorter than
+    ``total`` says nothing about the files it does not contain. A caller that
+    uses this to *refuse* something must fail closed when :attr:`complete` is
+    false rather than read absence as proof.
     """
 
     files: tuple[ChangedFile, ...]
@@ -348,10 +371,11 @@ _PR_FIELDS = (
     "autoMergeRequest,isDraft,body,headRepository,headRepositoryOwner,"
     "closingIssuesReferences,statusCheckRollup"
 )
-# One page of a PR's changed files. Deliberately unpaginated: a listing that
-# does not reach GitHub's own ``changedFiles`` count is reported as incomplete
-# and the merge gate fails closed on it, which is the honest answer for a PR
-# too large for the controller to prove anything about.
+# Page size of a PR's changed-files listing; every page is read. GitHub stops
+# the endpoint at 3000 files whatever the paging, so a listing that does not
+# reach GitHub's own ``changedFiles`` count is reported as incomplete and the
+# merge gate fails closed on it, which is the honest answer for a PR too
+# large for the controller to prove anything about.
 _PR_FILES_PAGE_SIZE = 100
 _MERGE_QUEUE_QUERY = (
     "query($owner: String!, $name: String!, $number: Int!) {"
@@ -535,7 +559,9 @@ class GitHubClient:
         """
         data = self._json(["api", "--paginate", "--slurp", endpoint])
         if not isinstance(data, list) or not all(isinstance(page, list) for page in data):
-            raise GitHubError(f"`gh api {endpoint}` returned a non-paginated JSON payload")
+            raise GitHubError(
+                f"`gh api {endpoint}` returned a non-paginated JSON payload: {data!r:.200}"
+            )
         return [item for page in data for item in page]
 
     # -- environment / doctor --------------------------------------------
@@ -746,6 +772,10 @@ class GitHubClient:
         a protected file *out* of the protected range -- the same edit
         dressed differently. REST names the other end ``previous_filename``.
 
+        Every page is read (``gh api --paginate --slurp``), so the listing
+        is short only past GitHub's own 3000-file ceiling on this endpoint,
+        not past one page of it.
+
         The count comes from ``gh pr view`` because REST has none, and is read
         *after* the listing so that a file added between the two reads makes
         the listing look short (fail closed) rather than complete. Missing,
@@ -754,9 +784,7 @@ class GitHubClient:
         """
         ref = parse_pr_url(url)
         endpoint = f"repos/{ref.repository}/pulls/{ref.number}/files"
-        raw = self._json(["api", f"{endpoint}?per_page={_PR_FILES_PAGE_SIZE}"])
-        if not isinstance(raw, list):
-            raise GitHubError(f"changed files of {ref.canonical} unavailable: {raw!r}")
+        raw = self._api_pages(f"{endpoint}?per_page={_PR_FILES_PAGE_SIZE}")
         files: list[ChangedFile] = []
         for entry in raw:
             path = entry.get("filename") if isinstance(entry, dict) else None

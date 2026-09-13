@@ -273,7 +273,10 @@ automatically; they leave the phase unchanged for `resume`.
 
 - Python 3.11+ (managed via `uv`)
 - `uv` ([install](https://docs.astral.sh/uv/getting-started/installation/))
-- `git`, and `gh` (GitHub CLI, authenticated) — `gh` is **not** needed for
+- `git`, and `gh` (GitHub CLI **2.48.0 or newer**, authenticated) — the
+  client lists branch rules and a PR's changed files with
+  `gh api --paginate --slurp`, which older releases reject; `autoforge doctor`
+  refuses an older `gh` up front. `gh` is **not** needed for
   [local mode](#local-mode-no-github)
 - `claude` (Claude Code CLI) for `analyze_execute` / `fix` profiles
 - `opencode` (OpenCode CLI) for `review_*` profiles
@@ -717,9 +720,13 @@ audit data rather than state payload.
   `safety.protected_merge_paths` (default `.github/workflows/`), naming the
   paths; a human reviews and merges that PR themselves. Both ends of a
   rename count, so moving a protected file *out* of the protected range is
-  refused like an edit to it. A changed-file listing GitHub may have
-  truncated is refused too — a short listing cannot prove a protected path
-  was left alone. Setting the list to `[]` disables the gate; leaving the
+  refused like an edit to it. The listing is read in full
+  (`gh api --paginate --slurp`, every page), so a PR is judged on all of
+  its files rather than on the first hundred; GitHub itself stops the
+  endpoint at 3,000 files, and a listing that stays short of GitHub's own
+  `changedFiles` count is refused — a short listing cannot prove a protected
+  path was left alone, and a PR that large is not one to merge unattended
+  anyway. Setting the list to `[]` disables the gate; leaving the
   key empty (`null`) is a configuration error rather than a silent opt-out.
   What this gates is the *definition* of the checks, not the
   trustworthiness of a green run: the commands still execute the PR's own

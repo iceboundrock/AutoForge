@@ -463,14 +463,20 @@ def test_get_pr_checks_parses_check_runs_and_status_contexts():
     assert [(c.name, c.outcome) for c in checks] == [("ci", "success"), ("legacy", "pending")]
 
 
-def _changed_files_runner(files, total):
-    """Dispatch the REST files listing and the `gh pr view` count separately."""
+def _changed_files_runner(files, total, *, pages=None):
+    """Dispatch the REST files listing and the `gh pr view` count separately.
+
+    ``files`` is served as the single page of a `--paginate --slurp` listing
+    (``pages`` overrides it with an explicit page list); a non-list ``files``
+    is printed raw, the way a broken `gh` would.
+    """
     seen = []
+    listing = pages if pages is not None else ([files] if isinstance(files, list) else files)
 
     def handler(req):
         seen.append(req.command)
         if req.command[1] == "api":
-            return _res(files)
+            return _res(listing)
         return _res({"changedFiles": total})
 
     return handler, seen
@@ -483,14 +489,74 @@ def test_get_pr_changed_files_reports_paths_and_truncation():
     changed = _client(handler).get_pr_changed_files("https://github.com/o/r/pull/42")
     assert changed.paths == (".github/workflows/ci.yml", "README.md")
     assert changed.complete is True
-    assert seen[0][:2] == ["gh", "api"]
-    assert seen[0][2] == "repos/o/r/pulls/42/files?per_page=100"
+    # Every page is read, not the first one (issue #43).
+    assert seen[0] == [
+        "gh",
+        "api",
+        "--paginate",
+        "--slurp",
+        "repos/o/r/pulls/42/files?per_page=100",
+    ]
     assert seen[1][:3] == ["gh", "pr", "view"] and "changedFiles" in seen[1]
 
-    # GitHub returns only the first page: the listing proves nothing about the rest.
+    # GitHub stops the listing below its own count (past the 3000-file
+    # ceiling of the endpoint): the listing proves nothing about the rest.
     handler, _ = _changed_files_runner([{"filename": "README.md"}], 137)
     short = _client(handler).get_pr_changed_files("https://github.com/o/r/pull/42")
     assert short.total == 137 and short.complete is False
+
+
+def test_get_pr_changed_files_flattens_every_page():
+    """A PR with more than one page of files is listed in full (issue #43).
+
+    Before, only the first page was read, so a PR touching more than 100
+    files could never pass the protected-path gate whatever it changed.
+    """
+    first = [{"filename": f"src/f{i}.py"} for i in range(100)]
+    second = [{"filename": f"src/g{i}.py"} for i in range(50)]
+    handler, _ = _changed_files_runner(None, 150, pages=[first, second])
+    changed = _client(handler).get_pr_changed_files("https://github.com/o/r/pull/42")
+    assert len(changed.files) == 150 and changed.complete is True
+    assert changed.paths[:2] == ("src/f0.py", "src/f1.py")
+    assert changed.paths[-1] == "src/g49.py"
+
+
+def test_get_pr_changed_files_keeps_a_protected_path_from_a_later_page():
+    """The page boundary must not hide a file: the second page is evidence too."""
+    first = [{"filename": f"src/f{i}.py"} for i in range(100)]
+    second = [{"filename": "docs/x.md"}, {"filename": ".github/workflows/ci.yml"}]
+    handler, _ = _changed_files_runner(None, 102, pages=[first, second])
+    changed = _client(handler).get_pr_changed_files("https://github.com/o/r/pull/42")
+    assert changed.complete is True
+    assert ".github/workflows/ci.yml" in changed.paths
+    # A rename's former path on a later page is kept as well.
+    second = [{"filename": "docs/ci.yml", "previous_filename": ".github/workflows/ci.yml"}]
+    handler, _ = _changed_files_runner(None, 101, pages=[first, second])
+    changed = _client(handler).get_pr_changed_files("https://github.com/o/r/pull/42")
+    assert changed.complete is True and ".github/workflows/ci.yml" in changed.paths
+
+
+def test_get_pr_changed_files_stays_incomplete_when_the_pages_stop_short():
+    """Paging moves the fail-closed threshold; it does not remove it."""
+    pages = [[{"filename": f"src/f{i}.py"} for i in range(100)] for _ in range(2)]
+    handler, _ = _changed_files_runner(None, 3001, pages=pages)
+    changed = _client(handler).get_pr_changed_files("https://github.com/o/r/pull/42")
+    assert len(changed.files) == 200 and changed.total == 3001
+    assert changed.complete is False
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [{"filename": "README.md"}],  # one flat page, not a page of pages
+        [[{"filename": "README.md"}], {"filename": "b"}],  # a page that is not an array
+        "README.md",
+    ],
+)
+def test_get_pr_changed_files_rejects_a_listing_that_is_not_a_page_of_pages(payload):
+    handler, _ = _changed_files_runner(None, 1, pages=payload)
+    with pytest.raises(GitHubError, match="non-paginated"):
+        _client(handler).get_pr_changed_files("https://github.com/o/r/pull/42")
 
 
 def test_get_pr_changed_files_reports_both_ends_of_a_rename():
@@ -520,8 +586,8 @@ def test_get_pr_changed_files_reports_both_ends_of_a_rename():
 @pytest.mark.parametrize(
     ("files", "total", "needle"),
     [
-        (None, 1, "unavailable"),  # not a list
-        ({"filename": "README.md"}, 1, "unavailable"),  # a bare object
+        (None, 1, "non-paginated"),  # not a list
+        ({"filename": "README.md"}, 1, "non-paginated"),  # a bare object
         ([{"filename": ""}], 1, "unusable entry"),
         (["README.md"], 1, "unusable entry"),  # not a mapping
         ([{"path": "README.md"}], 1, "unusable entry"),  # GraphQL key, not REST's
