@@ -98,3 +98,30 @@ def test_merge_gate_not_claimed_when_config_fails_to_load(tmp_path):
     gate = results["merge gate"]
     assert gate.detail == "(config not loaded)"
     assert not gate.ok and not gate.required  # a WARN, never a claim about the gate
+
+
+def test_reused_doctor_forgets_a_config_that_turned_invalid(tmp_path):
+    """PR #58 review: a stale cached config must not describe a rejected file.
+
+    A `Doctor` that loaded a valid open-gate config and is then run again after
+    the file gained the deprecated `execution.allow_merge` key must report the
+    gate as unknown, not replay the previous OPEN state next to a failed
+    `config` row.
+    """
+    cfg = tmp_path / "c.json"
+    cfg.write_text('{"version": 1, "safety": {"allow_merge": true}, "state_dir": "custom"}')
+    d = Doctor(config_path=str(cfg), cwd=str(tmp_path), runner=_runner_factory())
+    first = {r.name: r for r in d.run_all()}
+    assert first["config"].ok
+    assert first["merge gate"].ok and first["merge gate"].detail.startswith("config half OPEN")
+    assert d.config is not None and d.config.state_dir == "custom"
+
+    cfg.write_text('{"version": 1, "execution": {"allow_merge": true}}')
+    second = {r.name: r for r in d.run_all()}
+    assert not second["config"].ok and "execution.allow_merge" in second["config"].detail
+    gate = second["merge gate"]
+    assert gate.detail == "(config not loaded)"
+    assert not gate.ok and not gate.required
+    # Every other check reads the same cache: none may keep using the old file.
+    assert d.config is None
+    assert "custom" not in second["state dir writable"].detail

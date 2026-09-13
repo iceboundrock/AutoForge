@@ -35,7 +35,7 @@ safety:
   # This is the only key that opens the gate, and any other key under
   # `safety` (a typo such as `allow_merges`) is a configuration error rather
   # than a silent no-op. `autoforge doctor` prints the effective gate state
-  # and the file/line it came from.
+  # and the file/key it came from.
   allow_merge: false
   # Paths a PR may not change and still be merged unattended. GitHub runs the
   # *PR's own* copy of `.github/workflows/` and reports it under the same

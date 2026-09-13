@@ -98,7 +98,14 @@ class Doctor:
         ``required_profiles`` may be a fixed list or a callable, because a
         LOCAL run's required reviewer profiles are derived from the config that
         is only loaded here (see :func:`autoforge.profiles.local_required_profiles`).
+
+        ``self.config`` is what *this* attempt loaded, never a previous one:
+        every later check reads it, so a `Doctor` reused after its config file
+        turned invalid must not keep describing the old file -- least of all
+        the merge gate, which would otherwise claim the state of a config that
+        was just rejected.
         """
+        self.config = None
         try:
             self.config = load_config_file(self.config_path)
             required = required_profiles or REQUIRED_PROFILES
@@ -112,13 +119,13 @@ class Doctor:
         )
 
     def check_merge_gate(self) -> CheckResult:
-        """Report the effective merge gate and which line set it (informational).
+        """Report the effective merge gate and the file/key that set it (informational).
 
         The gate has two halves -- `safety.allow_merge` in config AND
         `--allow-merge` on the CLI -- and `doctor` cannot see the flag, so it
         states what the flag *would* do with this config. The source is named
-        so an operator who believes the gate is closed can check the line that
-        decides it rather than the line they last edited.
+        so an operator who believes the gate is closed can check the key that
+        decides it rather than the one they last edited.
         """
         name = "merge gate"
         cfg = self.config
