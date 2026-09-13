@@ -1,12 +1,75 @@
 """Doctor: read-only checks with a fake command runner."""
 
+import json
+
 from autoforge.doctor import Doctor
 from autoforge.executor import ExecutionResult
 
+RULES_ENDPOINT = "repos/owner/repo/rules/branches/main"
+RULESET_ENDPOINT = "repos/owner/repo/rulesets/22792049"
+RULESETS_ENDPOINT = "repos/owner/repo/rulesets"
+PROTECTION_ENDPOINT = "repos/owner/repo/branches/main/protection"
 
-def _runner_factory(git_remote="https://github.com/owner/repo.git", fail=()):
+
+def _status_rule(*contexts, ruleset_id=22792049):
+    return {
+        "type": "required_status_checks",
+        "parameters": {
+            "strict_required_status_checks_policy": False,
+            "do_not_enforce_on_create": False,
+            "required_status_checks": [{"context": c, "integration_id": 15368} for c in contexts],
+        },
+        "ruleset_source_type": "Repository",
+        "ruleset_source": "owner/repo",
+        "ruleset_id": ruleset_id,
+    }
+
+
+def _ruleset(enforcement="active", bypass_actors=(), can_bypass="never", ruleset_id=22792049):
+    """``bypass_actors=None`` is the field GitHub withholds from a token without
+    write access to the ruleset (the read itself still succeeds)."""
+    data = {
+        "id": ruleset_id,
+        "name": "main",
+        "target": "branch",
+        "source_type": "Repository",
+        "source": "owner/repo",
+        "enforcement": enforcement,
+        "bypass_actors": None if bypass_actors is None else list(bypass_actors),
+        "current_user_can_bypass": can_bypass,
+        "_links": {"html": {"href": f"https://github.com/owner/repo/rules/{ruleset_id}"}},
+    }
+    if bypass_actors is None:
+        del data["bypass_actors"]
+    return data
+
+
+# What a healthy repository answers: one active ruleset requiring `ci` on `main`.
+HEALTHY_GITHUB = {
+    RULES_ENDPOINT: [{"type": "deletion", "ruleset_id": 22792049}, _status_rule("ci")],
+    RULESET_ENDPOINT: _ruleset(),
+    RULESETS_ENDPOINT: [_ruleset()],
+    PROTECTION_ENDPOINT: (1, "gh: Branch not protected (HTTP 404)"),
+}
+
+
+def _runner_factory(
+    git_remote="https://github.com/owner/repo.git",
+    fail=(),
+    github=None,
+    default_branch="main",
+    calls=None,
+):
+    """Fake runner. ``github`` maps a `gh api` endpoint to its JSON payload, or to
+    an ``(exit_code, stderr)`` pair for a failed read; ``--paginate --slurp``
+    listings are wrapped in one page the way `gh` does."""
+    responses = dict(HEALTHY_GITHUB)
+    responses.update(github or {})
+
     def runner(req):
         argv = req.command
+        if calls is not None:
+            calls.append(argv)
         key = " ".join(argv[:2])
         if any(key.startswith(f) for f in fail):
             return ExecutionResult(argv, req.cwd, 1, "", "boom", "t", "t")
@@ -14,11 +77,30 @@ def _runner_factory(git_remote="https://github.com/owner/repo.git", fail=()):
             out = git_remote
         elif argv[:2] == ["git", "rev-parse"]:
             out = "/repo"
+        elif argv[:3] == ["gh", "repo", "view"]:
+            out = json.dumps(
+                {"nameWithOwner": "owner/repo", "defaultBranchRef": {"name": default_branch}}
+            )
+        elif argv[:2] == ["gh", "api"]:
+            endpoint = argv[-1]
+            paginated = "--slurp" in argv
+            if endpoint not in responses:
+                return ExecutionResult(argv, req.cwd, 1, "", f"unscripted {endpoint}", "t", "t")
+            payload = responses[endpoint]
+            if isinstance(payload, tuple):
+                code, stderr = payload
+                return ExecutionResult(argv, req.cwd, code, "", stderr, "t", "t")
+            out = json.dumps([payload] if paginated else payload)
         else:
             out = f"{argv[0]} version 1.0"
         return ExecutionResult(argv, req.cwd, 0, out + "\n", "", "t", "t")
 
     return runner
+
+
+def _required_checks(tmp_path, **kwargs):
+    d = Doctor(cwd=str(tmp_path), runner=_runner_factory(**kwargs))
+    return {r.name: r for r in d.run_all()}["default branch requires checks"]
 
 
 def test_all_checks_pass(tmp_path):
@@ -35,6 +117,7 @@ def test_all_checks_pass(tmp_path):
         "opencode available",
         "cwd is a git repository",
         "GitHub remote",
+        "default branch requires checks",
         "state dir writable",
     ):
         assert expected in names
@@ -149,3 +232,247 @@ def test_merge_gate_not_claimed_when_a_required_profile_is_invalid(tmp_path):
     assert not gate.ok and not gate.required
     assert d.config is None
     assert "custom" not in results["state dir writable"].detail
+
+
+# -- default branch requires checks (issue #41) ----------------------------------------
+def test_required_check_present_and_enforced(tmp_path):
+    """The healthy state: an active ruleset with no bypass actors requires `ci` on main."""
+    calls = []
+    check = _required_checks(tmp_path, calls=calls)
+    assert check.ok and check.required and not check.skipped, check
+    assert "'main' requires: ci via ruleset #22792049 (Repository owner/repo)" == check.detail
+    # Effective rules are read with every page, and the ruleset once for its enforcement.
+    assert ["gh", "api", "--paginate", "--slurp", RULES_ENDPOINT] in calls
+    assert ["gh", "api", RULESET_ENDPOINT] in calls
+    # Every `gh api` call is a GET: `doctor` never mutates.
+    api_calls = [argv for argv in calls if argv[:2] == ["gh", "api"]]
+    assert api_calls
+    assert not any(
+        flag in argv for argv in api_calls for flag in ("-X", "--method", "-f", "-F", "--input")
+    )
+
+
+def test_required_check_not_required_fails_with_remedy(tmp_path):
+    """No ruleset and no classic protection: FAIL, with the settings URL and rule named."""
+    check = _required_checks(
+        tmp_path, github={RULES_ENDPOINT: [{"type": "deletion", "ruleset_id": 1}]}
+    )
+    assert not check.ok and check.required and not check.skipped
+    assert check.detail.startswith("no rule requires a status check on 'main'")
+    assert "https://github.com/owner/repo/settings/rules" in check.detail
+    assert "naming ci" in check.detail and "no bypass actors" in check.detail
+
+
+def test_required_check_renamed_context_fails(tmp_path):
+    """A rule that requires a differently named check does not satisfy `safety.required_checks`."""
+    check = _required_checks(tmp_path, github={RULES_ENDPOINT: [_status_rule("build", "lint")]})
+    assert not check.ok and not check.skipped
+    assert "'main' requires: build, lint" in check.detail
+    assert "required contexts do not include 'ci'" in check.detail
+
+
+def test_required_check_rule_without_context_fails(tmp_path):
+    check = _required_checks(tmp_path, github={RULES_ENDPOINT: [_status_rule()]})
+    assert not check.ok and "names no status check context" in check.detail
+
+
+def test_required_check_enforcement_disabled_fails_and_names_the_ruleset(tmp_path):
+    """GitHub lists only active rules, so a disabled ruleset shows as "nothing required";
+    the listing is consulted so the remedy can say the ruleset exists but is off."""
+    check = _required_checks(
+        tmp_path,
+        github={RULES_ENDPOINT: [], RULESETS_ENDPOINT: [_ruleset(enforcement="disabled")]},
+    )
+    assert not check.ok and not check.skipped
+    assert "no rule requires a status check on 'main'" in check.detail
+    assert "ruleset 'main' (#22792049) exists but its enforcement is 'disabled'" in check.detail
+
+
+def test_required_check_missing_rule_stays_a_failure_when_the_listing_is_denied(tmp_path):
+    """The ruleset listing only enriches the remedy; a denied listing is not a SKIP."""
+    check = _required_checks(
+        tmp_path,
+        github={
+            RULES_ENDPOINT: [],
+            RULESETS_ENDPOINT: (1, "gh: Resource not accessible by integration (HTTP 403)"),
+        },
+    )
+    assert not check.ok and check.required and not check.skipped
+    assert "no rule requires a status check on 'main'" in check.detail
+    assert "settings/rules" in check.detail
+
+
+def test_required_check_ruleset_read_as_not_active_fails(tmp_path):
+    """Belt and braces: the ruleset's own enforcement field is checked too."""
+    check = _required_checks(tmp_path, github={RULESET_ENDPOINT: _ruleset(enforcement="evaluate")})
+    assert not check.ok
+    assert "ruleset 'main' (#22792049) enforcement is 'evaluate', not 'active'" in check.detail
+
+
+def test_required_check_bypass_actor_fails(tmp_path):
+    check = _required_checks(
+        tmp_path,
+        github={
+            RULESET_ENDPOINT: _ruleset(
+                bypass_actors=[
+                    {"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}
+                ],
+                can_bypass="always",
+            )
+        },
+    )
+    assert not check.ok and not check.skipped
+    assert "can be bypassed by: RepositoryRole 5 (always) (this token: always)" in check.detail
+    assert check.detail.startswith("'main' requires: ci via")
+
+
+def test_required_check_hidden_bypass_actors_is_skipped_never_ok(tmp_path):
+    """A token without write access to the ruleset reads the rule but not who may bypass
+    it: GitHub answers 200 with no `bypass_actors` field. That is not "no bypass actors"."""
+    check = _required_checks(tmp_path, github={RULESET_ENDPOINT: _ruleset(bypass_actors=None)})
+    assert check.skipped and not check.ok and not check.required, check
+    assert check.label == "SKIP"
+    assert check.detail.startswith("'main' requires: ci via ruleset #22792049")
+    assert "bypass actors of ruleset 'main' (#22792049) are not visible to this token" in (
+        check.detail
+    )
+    assert "write access to the ruleset" in check.detail
+    assert "'no bypass actors' is unverified" in check.detail
+
+    # The visible half still decides when it is a problem: hidden actors never
+    # soften a missing context or a non-active ruleset into a SKIP.
+    check = _required_checks(
+        tmp_path,
+        github={
+            RULES_ENDPOINT: [_status_rule("build")],
+            RULESET_ENDPOINT: _ruleset(bypass_actors=None),
+        },
+    )
+    assert not check.ok and not check.skipped and check.required
+    assert "required contexts do not include 'ci'" in check.detail
+    assert "are not visible to this token" in check.detail
+
+    check = _required_checks(
+        tmp_path, github={RULESET_ENDPOINT: _ruleset(enforcement="evaluate", bypass_actors=None)}
+    )
+    assert not check.ok and not check.skipped
+    assert "enforcement is 'evaluate', not 'active'" in check.detail
+
+
+def test_required_check_token_that_can_bypass_fails_even_when_actors_are_hidden(tmp_path):
+    """`current_user_can_bypass` is returned to every caller; a token that may bypass the
+    rule is a bypass actor whether or not GitHub shows the list."""
+    for actors in (None, ()):
+        check = _required_checks(
+            tmp_path,
+            github={RULESET_ENDPOINT: _ruleset(bypass_actors=actors, can_bypass="always")},
+        )
+        assert not check.ok and not check.skipped and check.required, (actors, check)
+        assert "ruleset 'main' (#22792049) can be bypassed by this token (always)" in check.detail
+
+
+def test_required_check_read_denied_is_skipped_not_failed(tmp_path):
+    """A token that may not read rulesets has not shown anything: SKIP, and doctor still passes."""
+    for stderr in (
+        "gh: Bad credentials (HTTP 401)",
+        "gh: Must have admin rights to Repository. (HTTP 403)",
+        "gh: Not Found (HTTP 404)",
+        "To get started with GitHub CLI, please run:  gh auth login",
+    ):
+        check = _required_checks(tmp_path, github={RULES_ENDPOINT: (1, stderr)})
+        assert check.skipped and not check.ok and not check.required, (stderr, check)
+        assert check.label == "SKIP"
+        assert "cannot read the branch rules of owner/repo" in check.detail
+
+
+def test_required_check_transient_failure_is_skipped(tmp_path):
+    check = _required_checks(
+        tmp_path, github={RULES_ENDPOINT: (1, "error connecting to api.github.com")}
+    )
+    assert check.skipped and "transient" in check.detail
+
+
+def test_required_check_other_conclusive_failure_is_reported(tmp_path):
+    """A malformed answer is neither a pass nor a permission problem: FAIL with the reason."""
+    check = _required_checks(tmp_path, github={RULES_ENDPOINT: (1, "gh: something odd")})
+    assert not check.ok and not check.skipped and "something odd" in check.detail
+
+
+def test_required_check_classic_branch_protection_counts(tmp_path):
+    """A repository still on classic branch protection is not a false alarm."""
+    classic = {
+        "required_status_checks": {"strict": False, "contexts": ["ci"], "checks": []},
+        "enforce_admins": {"enabled": True},
+    }
+    check = _required_checks(tmp_path, github={RULES_ENDPOINT: [], PROTECTION_ENDPOINT: classic})
+    assert check.ok, check
+    assert check.detail == "'main' requires: ci via classic branch protection"
+
+    classic["enforce_admins"] = {"enabled": False}
+    classic["required_status_checks"]["contexts"] = ["build"]
+    check = _required_checks(tmp_path, github={RULES_ENDPOINT: [], PROTECTION_ENDPOINT: classic})
+    assert not check.ok
+    assert "required contexts do not include 'ci'" in check.detail
+    assert "bypassing" in check.detail
+
+    # Protection that exists but requires no check is a conclusive negative.
+    check = _required_checks(
+        tmp_path,
+        github={RULES_ENDPOINT: [], PROTECTION_ENDPOINT: {"enforce_admins": {"enabled": True}}},
+    )
+    assert not check.ok and not check.skipped
+    assert "classic branch protection exists but requires no status check" in check.detail
+
+
+def test_required_check_classic_protection_unreadable_is_skipped(tmp_path):
+    """Rulesets require nothing and the classic read is forbidden: no conclusion either way."""
+    check = _required_checks(
+        tmp_path,
+        github={
+            RULES_ENDPOINT: [],
+            PROTECTION_ENDPOINT: (1, "gh: Must have admin rights to Repository. (HTTP 403)"),
+        },
+    )
+    assert check.skipped
+    assert "cannot read its classic branch protection" in check.detail
+
+
+def test_required_check_uses_configured_contexts(tmp_path):
+    cfg = tmp_path / "c.json"
+    cfg.write_text('{"version": 1, "safety": {"required_checks": ["build", "ci"]}}')
+    d = Doctor(config_path=str(cfg), cwd=str(tmp_path), runner=_runner_factory())
+    check = {r.name: r for r in d.run_all()}["default branch requires checks"]
+    assert not check.ok and "do not include 'build'" in check.detail
+
+    # An empty list requires only that *some* check is required.
+    cfg.write_text('{"version": 1, "safety": {"required_checks": []}}')
+    d = Doctor(
+        config_path=str(cfg),
+        cwd=str(tmp_path),
+        runner=_runner_factory(github={RULES_ENDPOINT: [_status_rule("build")]}),
+    )
+    check = {r.name: r for r in d.run_all()}["default branch requires checks"]
+    assert check.ok and "'main' requires: build" in check.detail
+
+
+def test_required_check_reads_the_default_branch_not_main(tmp_path):
+    calls = []
+    check = _required_checks(
+        tmp_path,
+        default_branch="trunk",
+        calls=calls,
+        github={"repos/owner/repo/rules/branches/trunk": [_status_rule("ci")]},
+    )
+    assert check.ok and "'trunk' requires: ci" in check.detail
+    assert not any(argv[-1] == RULES_ENDPOINT for argv in calls)
+
+
+def test_required_check_skipped_when_prerequisites_failed(tmp_path):
+    check = _required_checks(tmp_path, git_remote="git@gitlab.com:o/r.git")
+    assert check.skipped and check.detail == "(GitHub remote check failed)"
+
+    cfg = tmp_path / "c.json"
+    cfg.write_text('{"version": 1, "execution": {"allow_merge": true}}')
+    d = Doctor(config_path=str(cfg), cwd=str(tmp_path), runner=_runner_factory())
+    check = {r.name: r for r in d.run_all()}["default branch requires checks"]
+    assert check.skipped and check.detail == "(config check failed)"

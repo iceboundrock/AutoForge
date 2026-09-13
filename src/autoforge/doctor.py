@@ -19,8 +19,15 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .config import AutoForgeConfig, load_config_file, validate_required_profiles
-from .errors import ConfigurationError, StateError
+from .errors import (
+    ConfigurationError,
+    GitHubError,
+    GitHubNotFoundError,
+    GitHubUnavailableError,
+    StateError,
+)
 from .executor import ExecutionRequest, ExecutionResult, execute
+from .github import GitHubClient, is_access_denied_gh_failure
 from .local_workspace import DEFAULT_MAX_BYTES, DEFAULT_MAX_ENTRIES
 from .profiles import local_required_profiles
 from .safefs import SafeRoot
@@ -33,6 +40,9 @@ RequiredProfiles = list[str] | Callable[[AutoForgeConfig], list[str]]
 # Fallback executable for a provider whose profile does not set `command`,
 # matching the provider adapters' own defaults.
 DEFAULT_AGENT_COMMANDS = {"claude": "claude", "opencode": "opencode"}
+
+# Name of the `doctor` row that verifies the default branch's required checks.
+REQUIRED_CHECKS_ROW = "default branch requires checks"
 
 REQUIRED_PROFILES = [
     "analyze_execute",
@@ -49,12 +59,23 @@ class CheckResult:
     ok: bool
     detail: str = ""
     required: bool = True
+    # The check could not be performed (a read this token is not allowed to
+    # make, a transient GitHub failure, an earlier check it depends on
+    # failed). Neither a pass nor a failure: it never fails `doctor`, and it
+    # never claims the property holds.
+    skipped: bool = False
 
     @property
     def label(self) -> str:
+        if self.skipped:
+            return "SKIP"
         if self.ok:
             return "OK  "
         return "FAIL" if self.required else "WARN"
+
+    @classmethod
+    def skip(cls, name: str, detail: str) -> CheckResult:
+        return cls(name, False, detail, required=False, skipped=True)
 
 
 class Doctor:
@@ -72,6 +93,8 @@ class Doctor:
         self._runner: Runner = runner or execute
         self.timeout = timeout_seconds
         self.config: AutoForgeConfig | None = None
+        # 'owner/repo' of the `origin` remote, set exactly when `check_remote` passes.
+        self.repo: str | None = None
 
     # -- helpers -----------------------------------------------------------------
     def _run(self, argv: list[str]) -> tuple[bool, str]:
@@ -159,6 +182,7 @@ class Doctor:
         return CheckResult("cwd is a git repository", True, detail)
 
     def check_remote(self) -> CheckResult:
+        self.repo = None
         ok, detail = self._run(["git", "remote", "get-url", "origin"])
         if not ok:
             return CheckResult("GitHub remote", False, f"no 'origin' remote: {detail}")
@@ -166,7 +190,156 @@ class Doctor:
             repo = parse_remote_repository(detail)
         except Exception as exc:
             return CheckResult("GitHub remote", False, f"{detail!r}: {exc}")
+        self.repo = repo
         return CheckResult("GitHub remote", True, f"{repo} ({detail})")
+
+    def check_required_checks(self, gh: str) -> CheckResult:
+        """Whether the default branch really *requires* `safety.required_checks`.
+
+        The merge gate verifies that every check on the PR succeeded, which
+        is a statement about check results, not about whether any check had
+        to exist: a branch that requires nothing makes a PR with no check
+        runs vacuously green. The requirement lives in repository settings,
+        outside version control, so this is the only place drift is caught.
+
+        Read-only, and skipped -- never failed -- when the answer cannot be
+        read: no credentials, a token or plan that cannot see rulesets, or a
+        transient GitHub failure say nothing about the branch. The same
+        holds for a partial answer: GitHub returns a ruleset's bypass actors
+        only to a token with write access to it, and a rule this token can
+        see but whose bypass list it cannot is not shown to be unbypassable.
+        A problem that *is* visible (a missing context, a non-active
+        ruleset, a bypass actor) is a FAIL regardless of what stayed hidden.
+        """
+        name = REQUIRED_CHECKS_ROW
+        cfg = self.config
+        if cfg is None:
+            return CheckResult.skip(name, "(config check failed)")
+        if self.repo is None:
+            return CheckResult.skip(name, "(GitHub remote check failed)")
+        client = GitHubClient(gh_command=gh, timeout_seconds=self.timeout, runner=self._runner)
+        try:
+            return self._required_checks(client, self.repo, cfg.safety.required_checks)
+        except GitHubUnavailableError as exc:
+            return CheckResult.skip(name, f"GitHub could not be read (transient): {exc}")
+        except GitHubError as exc:
+            if isinstance(exc, GitHubNotFoundError) or is_access_denied_gh_failure(str(exc)):
+                return CheckResult.skip(
+                    name, f"this token cannot read the branch rules of {self.repo}: {exc}"
+                )
+            return CheckResult(name, False, str(exc))
+
+    def _required_checks(self, client: GitHubClient, repo: str, expected: list[str]) -> CheckResult:
+        name = REQUIRED_CHECKS_ROW
+        branch = client.get_repo(repo).default_branch
+        if not branch:
+            return CheckResult(name, False, f"{repo}: GitHub reports no default branch")
+        rules = client.get_required_status_check_rules(repo, branch)
+        if not rules:
+            return self._required_checks_without_ruleset(client, repo, branch, expected)
+        contexts = sorted({context for rule in rules for context in rule.contexts})
+        problems = _missing_contexts(contexts, expected)
+        # The effective-rules read lists active rulesets only, but the
+        # ruleset itself says who may bypass it, and that is read separately.
+        # GitHub withholds `bypass_actors` from a token without write access
+        # to the ruleset (the read still succeeds), so "no bypass actors" is
+        # established only by an explicitly empty list; `current_user_can_
+        # bypass` is returned to every caller and a token that may bypass the
+        # rule is a bypass actor whether or not the list is visible.
+        unseen: list[str] = []
+        for ruleset_id in sorted({rule.ruleset_id for rule in rules}):
+            ruleset = client.get_ruleset(repo, ruleset_id)
+            label = f"ruleset '{ruleset.name}' (#{ruleset.id})"
+            can_bypass = ruleset.current_user_can_bypass
+            if not ruleset.is_active:
+                problems.append(f"{label} enforcement is '{ruleset.enforcement}', not 'active'")
+            if ruleset.bypass_actors:
+                problems.append(
+                    f"{label} can be bypassed by: {', '.join(ruleset.bypass_actors)}"
+                    + (f" (this token: {can_bypass})" if can_bypass else "")
+                )
+            elif can_bypass not in ("", "never"):
+                problems.append(f"{label} can be bypassed by this token ({can_bypass})")
+            elif ruleset.bypass_actors is None:
+                unseen.append(label)
+        sources = ", ".join(
+            f"ruleset #{rule.ruleset_id} ({rule.ruleset_source_type or '?'} {rule.ruleset_source})"
+            for rule in rules
+        )
+        summary = f"'{branch}' requires: {', '.join(contexts) or '(no context)'} via {sources}"
+        hidden = (
+            [
+                f"bypass actors of {', '.join(unseen)} are not visible to this token (GitHub "
+                "returns them only with write access to the ruleset), so 'no bypass actors' "
+                "is unverified"
+            ]
+            if unseen
+            else []
+        )
+        if problems:
+            # A visible problem is conclusive whatever else stayed hidden;
+            # the hidden part is still named so the remedy is known to be partial.
+            return CheckResult(name, False, "; ".join([summary, *problems, *hidden]))
+        if hidden:
+            return CheckResult.skip(name, f"{summary}; {hidden[0]}")
+        return CheckResult(name, True, summary)
+
+    def _required_checks_without_ruleset(
+        self, client: GitHubClient, repo: str, branch: str, expected: list[str]
+    ) -> CheckResult:
+        """No active ruleset requires a check: classic branch protection is the last resort."""
+        name = REQUIRED_CHECKS_ROW
+        remedy = (
+            f"add a ruleset at https://github.com/{repo}/settings/rules targeting '{branch}' "
+            f"with a 'Require status checks to pass' rule naming "
+            f"{', '.join(expected) or 'the CI check'}, enforcement 'active' and no bypass actors"
+        )
+        try:
+            classic = client.get_branch_protection(repo, branch)
+        except GitHubUnavailableError:
+            raise
+        except GitHubError as exc:
+            if not is_access_denied_gh_failure(str(exc)):
+                raise
+            # Rulesets require nothing, and the only other mechanism cannot
+            # be read: no conclusion either way.
+            return CheckResult.skip(
+                name,
+                f"no active ruleset requires a status check on '{branch}', and this token "
+                f"cannot read its classic branch protection: {exc}",
+            )
+        if classic is not None and classic.required_status_checks:
+            contexts = sorted(classic.required_contexts)
+            problems = _missing_contexts(contexts, expected)
+            if not classic.enforce_admins:
+                problems.append("'Do not allow bypassing the above settings' is off for admins")
+            summary = (
+                f"'{branch}' requires: {', '.join(contexts) or '(no context)'} "
+                "via classic branch protection"
+            )
+            if problems:
+                return CheckResult(name, False, f"{summary}; {'; '.join(problems)}")
+            return CheckResult(name, True, summary)
+        # A disabled ruleset is invisible to the effective-rules read, so the
+        # listing is consulted to make the remedy concrete. It is a hint only:
+        # a listing this token may not read changes nothing about the answer.
+        try:
+            rulesets = client.list_rulesets(repo)
+        except GitHubUnavailableError:
+            raise
+        except GitHubError as exc:
+            if not is_access_denied_gh_failure(str(exc)):
+                raise
+            rulesets = []
+        hints = [
+            f"ruleset '{r.name}' (#{r.id}) exists but its enforcement is '{r.enforcement}'"
+            for r in rulesets
+            if r.target == "branch" and not r.is_active
+        ]
+        detail = f"no rule requires a status check on '{branch}'"
+        if classic is not None:
+            detail += " (classic branch protection exists but requires no status check)"
+        return CheckResult(name, False, "; ".join([detail, *hints, remedy]))
 
     def check_gh_auth(self, gh: str) -> CheckResult:
         ok, detail = self._run([gh, "auth", "status"])
@@ -345,8 +518,19 @@ class Doctor:
         results.append(self._version_check("opencode available", [opencode_cmd, "--version"]))
         results.append(self.check_git_repo())
         results.append(self.check_remote())
+        results.append(self.check_required_checks(gh))
         results.append(self.check_state_dir())
         return results
+
+
+def _missing_contexts(contexts: list[str], expected: list[str]) -> list[str]:
+    """The problems an expected-context list has with the required contexts (often none)."""
+    if not contexts:
+        return ["the rule names no status check context at all"]
+    missing = [context for context in expected if context not in contexts]
+    if missing:
+        return [f"required contexts do not include {', '.join(repr(m) for m in missing)}"]
+    return []
 
 
 def run_doctor(

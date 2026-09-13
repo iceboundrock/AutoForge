@@ -1,7 +1,8 @@
 """AutoForge command-line interface.
 
 Commands:
-  doctor  read-only environment checks (git, gh, auth, claude, opencode, repo, config)
+  doctor  read-only environment checks (git, gh, auth, claude, opencode, repo, config,
+          default-branch required checks)
   run     create a run (Issue -> ...) and advance it until READY_FOR_MERGE/DONE/BLOCKED/FAILED
   step    execute exactly one phase step from persisted state
   resume  continue a persisted run until a stop phase / max-steps
@@ -295,7 +296,13 @@ def cmd_local_doctor(args) -> int:
 def _report_checks(results: list[CheckResult], as_json: bool, title: str) -> int:
     if as_json:
         checks = [
-            {"name": r.name, "ok": r.ok, "required": r.required, "detail": redact(r.detail)}
+            {
+                "name": r.name,
+                "ok": r.ok,
+                "required": r.required,
+                "skipped": r.skipped,
+                "detail": redact(r.detail),
+            }
             for r in results
         ]
         print(
@@ -314,7 +321,8 @@ def _report_checks(results: list[CheckResult], as_json: bool, title: str) -> int
     if failed:
         print(f"{len(failed)} required check(s) failed.", file=sys.stderr)
         return 1
-    print("All checks passed.")
+    # Keep stdout to the JSON document alone in --json mode.
+    print("All checks passed.", file=sys.stderr if as_json else sys.stdout)
     return 0
 
 

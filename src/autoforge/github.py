@@ -107,6 +107,33 @@ def is_not_found_gh_failure(stderr: str) -> bool:
     return any(m in text for m in _NOT_FOUND_MARKERS) or bool(_NOT_FOUND_HTTP_STATUS.search(text))
 
 
+# Conclusive "you may not read this" answers: no credentials at all (`gh`
+# prints ``To get started with GitHub CLI, please run:  gh auth login``),
+# rejected credentials (``HTTP 401: Bad credentials``) or a token / plan that
+# cannot see the object (``HTTP 403``, ``Must have admin rights``, ``Resource
+# not accessible by integration``). A read-only diagnostic distinguishes these
+# from a *negative answer*: they say nothing about the repository, only about
+# what this token may see of it.
+_ACCESS_DENIED_MARKERS = (
+    "gh auth login",
+    "bad credentials",
+    "requires authentication",
+    "must have admin",
+    "resource not accessible",
+    "forbidden",
+    "unauthorized",
+)
+_ACCESS_DENIED_HTTP_STATUS = re.compile(r"\bhttp\s+40[13]\b")
+
+
+def is_access_denied_gh_failure(stderr: str) -> bool:
+    """Whether a failed `gh` invocation's stderr says the token may not read the object."""
+    text = stderr.lower()
+    return any(m in text for m in _ACCESS_DENIED_MARKERS) or bool(
+        _ACCESS_DENIED_HTTP_STATUS.search(text)
+    )
+
+
 @dataclass
 class RepoInfo:
     name_with_owner: str
@@ -255,6 +282,65 @@ class MergeQueueStatus:
     in_queue: bool  # the PR is currently enqueued
 
 
+@dataclass(frozen=True)
+class RequiredStatusChecksRule:
+    """One ``required_status_checks`` rule in effect on a branch, and where it came from.
+
+    Read from ``GET /repos/{owner}/{repo}/rules/branches/{branch}``, which
+    lists the rules of every *active* ruleset that applies to the branch --
+    repository and organization rulesets alike -- and nothing from a
+    disabled or evaluate-only ruleset, nor from classic branch protection.
+    """
+
+    contexts: tuple[str, ...]
+    ruleset_id: int
+    ruleset_source: str = ""  # "owner/repo" or the organization name
+    ruleset_source_type: str = ""  # Repository | Organization
+    strict: bool = False  # strict_required_status_checks_policy
+
+
+@dataclass(frozen=True)
+class RulesetInfo:
+    """A ruleset as GitHub describes it (``GET /repos/{owner}/{repo}/rulesets[/{id}]``).
+
+    ``bypass_actors`` is ``None`` when GitHub did not return the field, which
+    it withholds from any token without write access to the ruleset -- a
+    read-only token gets a 200 with the field absent -- and which the listing
+    endpoint never includes. Absent is not empty: ``()`` is GitHub saying
+    nobody may bypass, ``None`` is GitHub declining to say.
+    ``current_user_can_bypass`` is returned to every caller of the
+    single-ruleset read.
+    """
+
+    id: int
+    name: str
+    enforcement: str  # active | evaluate | disabled
+    target: str = ""  # branch | tag | push
+    source: str = ""
+    source_type: str = ""
+    bypass_actors: tuple[str, ...] | None = None  # "<actor_type> <actor_id> (<bypass_mode>)"
+    current_user_can_bypass: str = ""  # always | pull_requests_only | never
+    html_url: str = ""
+
+    @property
+    def is_active(self) -> bool:
+        return self.enforcement == "active"
+
+
+@dataclass(frozen=True)
+class ClassicBranchProtection:
+    """Classic branch protection (``GET /repos/{owner}/{repo}/branches/{branch}/protection``).
+
+    The pre-ruleset mechanism. ``required_contexts`` is empty when the
+    protection exists but requires no status check; ``enforce_admins`` is the
+    classic analogue of "no bypass actors".
+    """
+
+    required_status_checks: bool
+    required_contexts: tuple[str, ...]
+    enforce_admins: bool
+
+
 Runner = Callable[[ExecutionRequest], ExecutionResult]
 
 _PR_FIELDS = (
@@ -333,6 +419,45 @@ def build_disable_auto_merge_argv(pr_url: str) -> list[str]:
     return ["pr", "merge", parse_pr_url(pr_url).canonical, "--disable-auto"]
 
 
+def _as_int(value: object, what: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise GitHubError(f"`gh` returned a non-integer {what}: {value!r}")
+    return value
+
+
+def _ruleset_from_data(data: dict) -> RulesetInfo:
+    # Presence is the evidence: GitHub omits `bypass_actors` for a token
+    # without write access to the ruleset, so an absent field must not read
+    # as an empty list.
+    actors: list[str] | None = None
+    if "bypass_actors" in data:
+        raw = data["bypass_actors"]
+        if not isinstance(raw, list):
+            raise GitHubError("ruleset bypass_actors is not an array")
+        actors = []
+        for actor in raw:
+            if not isinstance(actor, dict):
+                raise GitHubError("ruleset bypass_actors entry is not an object")
+            actor_type = actor.get("actor_type") or "?"
+            actor_id = actor.get("actor_id")
+            mode = actor.get("bypass_mode") or "always"
+            label = f"{actor_type} {actor_id}" if actor_id is not None else str(actor_type)
+            actors.append(f"{label} ({mode})")
+    links = data.get("_links") or {}
+    html = links.get("html") if isinstance(links, dict) else None
+    return RulesetInfo(
+        id=_as_int(data.get("id"), "ruleset id"),
+        name=str(data.get("name") or ""),
+        enforcement=str(data.get("enforcement") or ""),
+        target=str(data.get("target") or ""),
+        source=str(data.get("source") or ""),
+        source_type=str(data.get("source_type") or ""),
+        bypass_actors=None if actors is None else tuple(actors),
+        current_user_can_bypass=str(data.get("current_user_can_bypass") or ""),
+        html_url=str(html.get("href") or "") if isinstance(html, dict) else "",
+    )
+
+
 class GitHubClient:
     """Thin typed wrapper around `gh`. Inject ``runner`` for tests."""
 
@@ -401,6 +526,18 @@ class GitHubClient:
             raise GitHubError("`gh` returned a non-array JSON payload")
         return data
 
+    def _api_pages(self, endpoint: str) -> list:
+        """Every item of a paginated REST array endpoint, all pages read.
+
+        ``gh api --paginate --slurp`` wraps the pages in one outer array, so
+        the result is a JSON array of pages and each page a JSON array; any
+        other shape is a malformed answer, not an empty one.
+        """
+        data = self._json(["api", "--paginate", "--slurp", endpoint])
+        if not isinstance(data, list) or not all(isinstance(page, list) for page in data):
+            raise GitHubError(f"`gh api {endpoint}` returned a non-paginated JSON payload")
+        return [item for page in data for item in page]
+
     # -- environment / doctor --------------------------------------------
     def version(self) -> str:
         res = self._run_gh(["--version"])
@@ -436,6 +573,83 @@ class GitHubClient:
         return RepoInfo(
             name_with_owner=data.get("nameWithOwner", ""),
             default_branch=(data.get("defaultBranchRef") or {}).get("name", ""),
+        )
+
+    # -- branch rules (read-only; `doctor`) ---------------------------------
+    def get_required_status_check_rules(
+        self, repo: str, branch: str
+    ) -> list[RequiredStatusChecksRule]:
+        """The ``required_status_checks`` rules in effect on ``branch`` (may be empty).
+
+        Effective rules only: what GitHub *enforces* on the branch right now,
+        which is the question a merge gate asks. Every page is read, so an
+        empty result means no active ruleset requires a check, not that the
+        first page held none.
+        """
+        rules: list[RequiredStatusChecksRule] = []
+        for item in self._api_pages(f"repos/{repo}/rules/branches/{branch}"):
+            if not isinstance(item, dict) or item.get("type") != "required_status_checks":
+                continue
+            params = item.get("parameters") or {}
+            if not isinstance(params, dict):
+                raise GitHubError("branch rule `required_status_checks` has no parameters")
+            contexts = []
+            for check in params.get("required_status_checks") or []:
+                context = check.get("context") if isinstance(check, dict) else None
+                if not isinstance(context, str) or not context:
+                    raise GitHubError("branch rule `required_status_checks` names no context")
+                contexts.append(context)
+            rules.append(
+                RequiredStatusChecksRule(
+                    contexts=tuple(contexts),
+                    ruleset_id=_as_int(item.get("ruleset_id"), "ruleset_id"),
+                    ruleset_source=str(item.get("ruleset_source") or ""),
+                    ruleset_source_type=str(item.get("ruleset_source_type") or ""),
+                    strict=bool(params.get("strict_required_status_checks_policy", False)),
+                )
+            )
+        return rules
+
+    def get_ruleset(self, repo: str, ruleset_id: int) -> RulesetInfo:
+        """One ruleset with its enforcement level and bypass actors."""
+        data = self._api_json(["api", f"repos/{repo}/rulesets/{ruleset_id}"])
+        return _ruleset_from_data(data)
+
+    def list_rulesets(self, repo: str) -> list[RulesetInfo]:
+        """Every ruleset applying to ``repo`` (organization ones included), any enforcement."""
+        return [
+            _ruleset_from_data(item)
+            for item in self._api_pages(f"repos/{repo}/rulesets")
+            if isinstance(item, dict)
+        ]
+
+    def get_branch_protection(self, repo: str, branch: str) -> ClassicBranchProtection | None:
+        """Classic branch protection on ``branch``, or None when GitHub says it has none.
+
+        ``HTTP 404: Branch not protected`` is the conclusive negative answer
+        and yields None; an access failure propagates, because a token that
+        may not read the protection has not shown the branch to be
+        unprotected.
+        """
+        try:
+            data = self._api_json(["api", f"repos/{repo}/branches/{branch}/protection"])
+        except GitHubNotFoundError:
+            return None
+        checks = data.get("required_status_checks")
+        contexts: list[str] = []
+        if isinstance(checks, dict):
+            for context in checks.get("contexts") or []:
+                if isinstance(context, str) and context:
+                    contexts.append(context)
+            for check in checks.get("checks") or []:
+                context = check.get("context") if isinstance(check, dict) else None
+                if isinstance(context, str) and context and context not in contexts:
+                    contexts.append(context)
+        admins = data.get("enforce_admins")
+        return ClassicBranchProtection(
+            required_status_checks=isinstance(checks, dict),
+            required_contexts=tuple(contexts),
+            enforce_admins=bool(admins.get("enabled")) if isinstance(admins, dict) else False,
         )
 
     # -- issues -----------------------------------------------------------

@@ -459,6 +459,36 @@ def test_doctor_with_fake_runner(tmp_path, capsys, monkeypatch):
     assert any(c["name"] == "GitHub remote" and c["ok"] for c in data["checks"])
     gate = next(c for c in data["checks"] if c["name"] == "merge gate")
     assert gate["ok"] and not gate["required"] and gate["detail"].startswith("CLOSED")
+    assert not gate["skipped"]
+    # `gh api` answers "ok 1.0" here, not JSON: a conclusive read failure is a FAIL.
+    rules = next(c for c in data["checks"] if c["name"] == "default branch requires checks")
+    assert not rules["ok"] and rules["required"] and not rules["skipped"]
+
+
+def test_doctor_reports_an_unreadable_branch_rule_as_skipped(tmp_path, capsys, monkeypatch):
+    """Issue #41: a token that cannot read rulesets is SKIP, and doctor still exits 0."""
+    monkeypatch.chdir(tmp_path)
+
+    def runner(req):
+        argv = req.command
+        if argv[:3] == ["git", "remote", "get-url"]:
+            return ExecutionResult(argv, req.cwd, 0, "git@github.com:o/r.git\n", "", "t", "t")
+        if argv[:3] == ["gh", "repo", "view"]:
+            out = '{"nameWithOwner": "o/r", "defaultBranchRef": {"name": "main"}}'
+            return ExecutionResult(argv, req.cwd, 0, out, "", "t", "t")
+        if argv[:2] == ["gh", "api"]:
+            return ExecutionResult(argv, req.cwd, 1, "", "gh: Not Found (HTTP 404)", "t", "t")
+        return ExecutionResult(argv, req.cwd, 0, "ok 1.0\n", "", "t", "t")
+
+    monkeypatch.setattr(cli, "_doctor_runner", lambda: runner)
+    assert cli.main(["--state-dir", str(tmp_path / ".autoforge"), "doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "[SKIP] default branch requires checks: this token cannot read the branch rules" in out
+    assert cli.main(["--state-dir", str(tmp_path / ".autoforge"), "doctor", "--json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["ok"]
+    rules = next(c for c in data["checks"] if c["name"] == "default branch requires checks")
+    assert rules["skipped"] and not rules["ok"] and not rules["required"]
 
 
 def test_resume_never_resets_the_step_budget(tmp_path, capsys, monkeypatch, fakes):
