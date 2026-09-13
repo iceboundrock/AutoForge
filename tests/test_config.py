@@ -703,6 +703,14 @@ def test_premerge_verification_keys_load(tmp_path):
     assert cfg.merge.verification_commands == [["uv", "run", "pytest", "-q"], ["make"]]
 
 
+def test_verification_command_argv_elements_are_stored_verbatim(tmp_path):
+    """Surrounding whitespace in an argv element is the value, never trimmed away."""
+    p = tmp_path / "cfg.json"
+    argv = ["pytest", " -k", "smoke "]
+    p.write_text(json.dumps({"version": 1, "merge": {"verification_commands": [argv]}}), "utf-8")
+    assert load_config_file(p).merge.verification_commands == [argv]
+
+
 @pytest.mark.parametrize(
     ("section", "body", "key"),
     [
@@ -713,6 +721,7 @@ def test_premerge_verification_keys_load(tmp_path):
         ("merge", {"verification_commands": ["make check"]}, "verification_commands"),
         ("merge", {"verification_commands": [[]]}, "verification_commands"),
         ("merge", {"verification_commands": [["make", 1]]}, "verification_commands"),
+        ("merge", {"verification_commands": [["make", "  "]]}, "verification_commands"),
     ],
 )
 def test_premerge_verification_keys_reject_bad_shapes(tmp_path, section, body, key):

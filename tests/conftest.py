@@ -38,6 +38,7 @@ from autoforge.github import (  # noqa: E402
     WorkflowJob,
     WorkflowRunInfo,
     WorkflowRunJobs,
+    WorkflowRuns,
 )
 from autoforge.providers import ProviderRegistry, ScriptedProvider  # noqa: E402
 from autoforge.result_parser import BEGIN, END  # noqa: E402
@@ -229,6 +230,9 @@ class FakeGitHub:
         }
         self.workflow_jobs: dict[int, WorkflowRunJobs] = {BASE_RUN_ID: ci_jobs()}
         self.branch_heads: dict[str, str] = {"main": MAIN_SHA}
+        # GitHub claims this many more runs than find_workflow_runs lists: a
+        # listing the controller could not complete.
+        self.workflow_runs_unlisted: int = 0
         # non-empty -> every Actions read raises (same convention as merge_queue_error)
         self.actions_error: str | GitHubError = ""
         self.add_issue(EPIC, "EPIC")
@@ -415,10 +419,10 @@ class FakeGitHub:
 
     def find_workflow_runs(
         self, repository: str, workflow_id: int, *, branch: str, event: str, head_sha: str
-    ) -> list[WorkflowRunInfo]:
+    ) -> WorkflowRuns:
         self.calls.append(("find_workflow_runs", repository, workflow_id, branch, event, head_sha))
         self._actions_failure()
-        return [
+        runs = tuple(
             run
             for run in self.workflow_runs.values()
             if run.repository.lower() == repository.lower()
@@ -426,7 +430,8 @@ class FakeGitHub:
             and run.head_branch == branch
             and run.event == event
             and run.head_sha == head_sha
-        ]
+        )
+        return WorkflowRuns(runs=runs, total=len(runs) + self.workflow_runs_unlisted)
 
     def pr_exists(self, url: str) -> bool:
         try:

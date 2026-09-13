@@ -103,14 +103,17 @@ merge:
   # every GitHub-side fact above has passed. The reviewed commit is exported
   # into a fresh temporary directory (`git read-tree` + `checkout-index`; no
   # worktree, no branch, no `.git`, submodules not populated) which is the
-  # commands' cwd; if the commit is not local yet, `refs/pull/<n>/head` is
-  # fetched from `origin` (objects only, no local ref). A non-zero exit or a
-  # timeout (`execution.default_timeout_seconds`) is BLOCKED with the output
-  # tail; an unfetchable or unexportable commit is inconclusive. A pass is
-  # persisted per (HEAD, command list) so `resume` does not repeat it, and is
-  # cleared when the run moves to another issue. Dry-run runs nothing and
-  # lists the commands in the plan. The commands inherit the operator's
-  # environment. Empty (the default): nothing runs locally before a merge.
+  # commands' cwd -- a command that needs git metadata (`git describe`,
+  # `setuptools-scm` version stamping) or a submodule fails there, so keep
+  # such steps out of this list. If the commit is not local yet,
+  # `refs/pull/<n>/head` is fetched from `origin` (objects only, no local
+  # ref). A non-zero exit or a timeout (`execution.default_timeout_seconds`)
+  # is BLOCKED with the output tail; an unfetchable or unexportable commit is
+  # inconclusive. A pass is persisted per (HEAD, command list) so `resume`
+  # does not repeat it, and is cleared when the run moves to another issue.
+  # Dry-run runs nothing and lists the commands in the plan. The commands
+  # inherit the operator's environment. Empty (the default): nothing runs
+  # locally before a merge.
   verification_commands: []
   #  - ["uv", "run", "--frozen", "pytest", "-q"]
   #  - ["uv", "run", "ruff", "check", "src", "tests"]

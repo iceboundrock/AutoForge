@@ -2762,7 +2762,7 @@ class ControllerEngine:
         Conclusive shortfalls (a context absent or duplicated in the rollup,
         not an Actions run, a run at another commit or in another
         repository, no base-branch run to compare against, a short job
-        listing) return a reason. A base-branch run still in progress raises
+        or run listing) return a reason. A base-branch run still in progress raises
         VerificationError (inconclusive); GitHubError from the reads
         propagates for the caller to classify. Disabled by
         ``safety.verify_check_definition: false`` or an empty
@@ -2837,11 +2837,18 @@ class ControllerEngine:
                         event="push",
                         head_sha=base_tip,
                     )
+                if not runs.complete:
+                    return (
+                        f"GitHub returned {len(runs.runs)} of {runs.total} push runs of "
+                        f"{run.path} on base branch {pr.base_ref!r} at {base_tip[:12]}, so the "
+                        f"reference definition for required check {context!r} of PR {url} "
+                        "cannot be chosen"
+                    )
                 # The filter is GitHub's; the facts are re-checked on what
                 # came back rather than trusted from the query string.
                 candidates = [
                     candidate
-                    for candidate in runs
+                    for candidate in runs.runs
                     if candidate.workflow_id == run.workflow_id
                     and candidate.head_sha == base_tip
                     and candidate.head_branch == pr.base_ref

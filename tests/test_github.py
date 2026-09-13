@@ -1178,13 +1178,18 @@ def test_get_branch_head_sha():
         _client(lambda req: _res({"name": "main", "commit": {}})).get_branch_head_sha("o/r", "main")
 
 
-def test_find_workflow_runs_filters_through_the_query_string():
+def test_find_workflow_runs_filters_through_the_query_string_and_reads_every_page():
     seen = []
-    listed = {**_RUN, "id": 99, "event": "push", "head_branch": "main"}
+    first = {**_RUN, "id": 99, "event": "push", "head_branch": "main"}
+    second = {**_RUN, "id": 100, "event": "push", "head_branch": "main"}
+    pages = [
+        {"total_count": 2, "workflow_runs": [first]},
+        {"total_count": 2, "workflow_runs": [second]},
+    ]
 
     def handler(req):
         seen.append(req.command)
-        return _res({"total_count": 1, "workflow_runs": [listed]})
+        return _res(pages)
 
     runs = _client(handler).find_workflow_runs(
         "o/r", 77, branch="release/1.x", event="push", head_sha="abc"
@@ -1193,12 +1198,42 @@ def test_find_workflow_runs_filters_through_the_query_string():
         [
             "gh",
             "api",
+            "--paginate",
+            "--slurp",
             "repos/o/r/actions/workflows/77/runs?"
             "branch=release%2F1.x&event=push&head_sha=abc&per_page=100",
         ]
     ]
-    assert [(r.id, r.event, r.head_branch) for r in runs] == [(99, "push", "main")]
-    with pytest.raises(GitHubError, match="workflow_runs"):
-        _client(lambda req: _res({"total_count": 0})).find_workflow_runs(
+    assert runs.complete and runs.total == 2
+    assert [(r.id, r.event, r.head_branch) for r in runs.runs] == [
+        (99, "push", "main"),
+        (100, "push", "main"),
+    ]
+
+
+def test_find_workflow_runs_reports_a_short_listing_as_incomplete():
+    """A listing that stops before GitHub's own count cannot pick a reference (#63 R1-F2)."""
+    page = {"total_count": 101, "workflow_runs": [{**_RUN, "id": 99}]}
+    runs = _client(lambda req: _res([page])).find_workflow_runs(
+        "o/r", 77, branch="main", event="push", head_sha="abc"
+    )
+    assert not runs.complete and len(runs.runs) == 1 and runs.total == 101
+
+
+@pytest.mark.parametrize(
+    "pages",
+    [
+        {"total_count": 1, "workflow_runs": [_RUN]},  # not slurped
+        [[_RUN]],  # array pages, not object pages
+        [{"total_count": "1", "workflow_runs": [_RUN]}],
+        [{"total_count": 0}],
+        [{"total_count": 1, "workflow_runs": None}],
+        [{"total_count": 1, "workflow_runs": [{**_RUN, "id": "99"}]}],
+        [],
+    ],
+)
+def test_find_workflow_runs_rejects_unusable_data(pages):
+    with pytest.raises(GitHubError):
+        _client(lambda req: _res(pages)).find_workflow_runs(
             "o/r", 77, branch="main", event="push", head_sha="abc"
         )

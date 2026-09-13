@@ -302,6 +302,18 @@ class WorkflowRunJobs:
         return tuple(sorted((job.name, job.steps) for job in self.jobs))
 
 
+@dataclass(frozen=True)
+class WorkflowRuns:
+    """The runs one listing matched and GitHub's own count, so a short listing shows."""
+
+    runs: tuple[WorkflowRunInfo, ...]
+    total: int
+
+    @property
+    def complete(self) -> bool:
+        return len(self.runs) == self.total
+
+
 @dataclass
 class CommentInfo:
     id: int
@@ -1026,24 +1038,37 @@ class GitHubClient:
 
     def find_workflow_runs(
         self, repository: str, workflow_id: int, *, branch: str, event: str, head_sha: str
-    ) -> list[WorkflowRunInfo]:
-        """Runs of one workflow filtered by branch, event and head commit (first page).
+    ) -> WorkflowRuns:
+        """Runs of one workflow filtered by branch, event and head commit, all pages read.
 
-        Bounded to one page on purpose: the caller asks for the runs of a
-        single commit on a single branch, which is normally one run, and a
-        commit with more than a page of runs is not a reference worth
-        trusting anyway.
+        The runs of a single commit on a single branch are normally one, but
+        the caller picks a *reference* out of them, so the listing is read
+        like the jobs listing: every page, against GitHub's own
+        ``total_count``, and a listing that does not reach it is reported as
+        incomplete rather than as "these are all the runs".
         """
         query = urlencode(
             {"branch": branch, "event": event, "head_sha": head_sha, "per_page": _RUNS_PAGE_SIZE}
         )
         what = f"the runs of workflow {workflow_id} of {repository}"
         endpoint = f"repos/{repository}/actions/workflows/{workflow_id}/runs?{query}"
-        data = self._api_json(["api", endpoint])
-        listed = data.get("workflow_runs")
-        if not isinstance(listed, list):
-            raise GitHubError(f"{what}: workflow_runs is not a list: {listed!r:.200}")
-        return [self._run_from_data(run, f"a run in {what}") for run in listed]
+        pages = self._json(["api", "--paginate", "--slurp", endpoint])
+        if not isinstance(pages, list) or not all(isinstance(page, dict) for page in pages):
+            raise GitHubError(f"{what}: non-paginated JSON payload: {pages!r:.200}")
+        total = -1
+        runs: list[WorkflowRunInfo] = []
+        for page in pages:
+            count = page.get("total_count")
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise GitHubError(f"{what}: total_count is not a count: {count!r}")
+            total = max(total, count)
+            listed = page.get("workflow_runs")
+            if not isinstance(listed, list):
+                raise GitHubError(f"{what}: workflow_runs is not a list: {listed!r:.200}")
+            runs.extend(self._run_from_data(run, f"a run in {what}") for run in listed)
+        if total < 0:
+            raise GitHubError(f"{what}: no page was returned")
+        return WorkflowRuns(runs=tuple(runs), total=total)
 
     def pr_exists(self, url: str) -> bool:
         try:

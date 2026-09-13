@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import shutil
 import tempfile
+from collections import Counter
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -44,21 +45,41 @@ _GIT_TIMEOUT_SECONDS = 600
 def describe_definition_difference(pr_jobs: WorkflowRunJobs, base_jobs: WorkflowRunJobs) -> str:
     """Name the first way the PR run's structure differs from the base run's.
 
-    Returns "" when both runs have the same jobs and, per job, the same step
-    names in the same order. Job order is irrelevant (matrix legs start in
-    any order); step order is part of the definition and is compared.
+    Returns "" only when both runs have the same jobs and, per job, the same
+    step names in the same order. Job order is irrelevant (matrix legs start
+    in any order); step order is part of the definition and is compared.
+
+    Jobs are compared as a multiset: two jobs of one run may share a name
+    (``name:`` set without interpolating the matrix, two job ids with the
+    same display name), and a job added under a name the run already has
+    must be an extra job, not a duplicate that collapses into the one kept.
     """
-    pr_shape = dict(pr_jobs.structure())
-    base_shape = dict(base_jobs.structure())
-    missing = sorted(set(base_shape) - set(pr_shape))
-    if missing:
-        return f"job {missing[0]!r} of the base branch's run is missing from the PR's run"
-    extra = sorted(set(pr_shape) - set(base_shape))
-    if extra:
-        return f"job {extra[0]!r} of the PR's run does not exist in the base branch's run"
-    for name in sorted(base_shape):
-        base_steps = base_shape[name]
-        pr_steps = pr_shape[name]
+    pr_shape = pr_jobs.structure()
+    base_shape = base_jobs.structure()
+    if pr_shape == base_shape:
+        return ""
+    pr_names = Counter(name for name, _ in pr_shape)
+    base_names = Counter(name for name, _ in base_shape)
+    for name in sorted(base_names):
+        if pr_names[name] < base_names[name]:
+            if base_names[name] == 1:
+                return f"job {name!r} of the base branch's run is missing from the PR's run"
+            return (
+                f"the base branch's run has {base_names[name]} jobs named {name!r}, the PR's "
+                f"run has {pr_names[name]}"
+            )
+    for name in sorted(pr_names):
+        if pr_names[name] > base_names[name]:
+            if base_names[name] == 0:
+                return f"job {name!r} of the PR's run does not exist in the base branch's run"
+            return (
+                f"the PR's run has {pr_names[name]} jobs named {name!r}, the base branch's "
+                f"run has {base_names[name]}"
+            )
+    # Same job names with the same multiplicities; the sorted shapes pair
+    # same-named jobs up by their step lists, so the first pair that differs
+    # is a real difference even when the name is shared.
+    for (name, base_steps), (_, pr_steps) in zip(base_shape, pr_shape, strict=True):
         if base_steps == pr_steps:
             continue
         for index, (base_step, pr_step) in enumerate(zip(base_steps, pr_steps, strict=False)):
@@ -70,7 +91,9 @@ def describe_definition_difference(pr_jobs: WorkflowRunJobs, base_jobs: Workflow
         if len(pr_steps) < len(base_steps):
             return f"job {name!r} lacks step {base_steps[len(pr_steps)]!r} of the base branch's run"
         return f"job {name!r} has an extra step {pr_steps[len(base_steps)]!r} in the PR's run"
-    return ""
+    # Unreachable when the shapes differ, but a difference must never be
+    # reported as "" -- the gate fails closed on what it could not name.
+    return "the PR's run and the base branch's run differ in structure"
 
 
 @dataclass(frozen=True)

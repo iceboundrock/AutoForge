@@ -520,6 +520,10 @@ def _as_argv_list(raw: object, source: str, key: str) -> list[list[str]]:
                 raise ConfigurationError(
                     f"{source}: {key}[{index}] must contain non-empty strings, got {item!r}"
                 )
+            # Stored verbatim, unlike `_as_str_list`: an argv element reaches
+            # the process exactly as written, so surrounding whitespace is
+            # part of the argument, not trimmed away. Only a blank element is
+            # refused, since it can never be anything but a slip.
             argv.append(item)
         out.append(argv)
     return out

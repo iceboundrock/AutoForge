@@ -79,6 +79,60 @@ def test_first_difference_is_named(pr, expected):
     assert describe_definition_difference(pr, BASE).startswith(expected)
 
 
+# Two jobs of one run may share a display name (`name:` without the matrix
+# interpolated, two job ids with one name). The comparison is a multiset, so
+# an extra job hiding behind a kept job's name is a named difference (#63 R1-F1).
+DUPLICATED = _jobs(("test", ("Set up job", "Run pytest")), ("test", ("Set up job", "Run pytest")))
+
+
+def test_duplicate_job_names_compare_equal_as_a_multiset():
+    assert describe_definition_difference(DUPLICATED, DUPLICATED) == ""
+    swapped = _jobs(("test", ("Run pytest",)), ("test", ("Run ruff",)))
+    assert (
+        describe_definition_difference(
+            swapped, _jobs(("test", ("Run ruff",)), ("test", ("Run pytest",)))
+        )
+        == ""
+    )
+
+
+@pytest.mark.parametrize(
+    ("pr", "base", "expected"),
+    [
+        (
+            _jobs(("test", ("Set up job", "Run pytest")), ("test", ("Set up job", "Run rm"))),
+            _jobs(("test", ("Set up job", "Run pytest"))),
+            "the PR's run has 2 jobs named 'test', the base branch's run has 1",
+        ),
+        (
+            _jobs(("test", ("Set up job", "Run pytest"))),
+            DUPLICATED,
+            "the base branch's run has 2 jobs named 'test', the PR's run has 1",
+        ),
+        (
+            _jobs(("test", ("Set up job", "Run pytest")), ("test", ("Set up job", "Run rm"))),
+            DUPLICATED,
+            "job 'test' step 2 is 'Run rm' in the PR's run but 'Run pytest'",
+        ),
+        (
+            _jobs(("test", ("Set up job", "Run pytest")), ("test", ("Set up job",))),
+            DUPLICATED,
+            "job 'test' lacks step 'Run pytest'",
+        ),
+        (
+            _jobs(
+                ("test", ("Set up job", "Run pytest", "Run rm")),
+                ("test", ("Set up job", "Run pytest")),
+            ),
+            DUPLICATED,
+            "job 'test' has an extra step 'Run rm'",
+        ),
+    ],
+)
+def test_duplicate_job_names_never_hide_a_difference(pr, base, expected):
+    assert describe_definition_difference(pr, base).startswith(expected)
+
+
 # -- tree export ------------------------------------------------------------------------
 def _git(repo: Path, *args: str) -> str:
     return subprocess.run(

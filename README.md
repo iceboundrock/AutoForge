@@ -758,9 +758,12 @@ audit data rather than state payload.
   fresh temporary export of the reviewed HEAD — `git read-tree` +
   `git checkout-index` into `autoforge-premerge-*`, so no worktree or branch
   is created, the operator's checkout is untouched and there is no `.git`
-  for a command to reach; the export is deleted afterwards. A commit that is
-  not local yet is fetched from `origin` as `refs/pull/<n>/head`, objects
-  only, without creating a local ref. A non-zero exit or a timeout
+  for a command to reach; the export is deleted afterwards. That also means
+  a command that needs git metadata (`git describe`, `setuptools-scm` and
+  other version stamping) or populated submodules fails in the export, so
+  keep those out of the list or make them tolerate a plain tree. A commit
+  that is not local yet is fetched from `origin` as `refs/pull/<n>/head`,
+  objects only, without creating a local ref. A non-zero exit or a timeout
   (`execution.default_timeout_seconds`) is `BLOCKED` with the redacted
   output tail; an unfetchable or unexportable commit is inconclusive and
   re-checked by `resume --allow-merge`. A pass is persisted with the HEAD

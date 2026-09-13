@@ -1310,6 +1310,10 @@ def test_definition_gate_ignores_job_order(tmp_state_dir, fake_github):
         ),
         (lambda gh: gh.branch_heads.__setitem__("main", SHA_C), "has no push run"),
         (
+            lambda gh: setattr(gh, "workflow_runs_unlisted", 100),
+            "returned 1 of 101 push runs of .github/workflows/ci.yml on base branch 'main'",
+        ),
+        (
             lambda gh: gh.workflow_runs.__setitem__(
                 BASE_RUN_ID, replace(gh.workflow_runs[BASE_RUN_ID], conclusion="failure")
             ),
