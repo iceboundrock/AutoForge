@@ -22,7 +22,7 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [dependency-groups]
-dev = ["pytest>=8", "ruff>=0.4", "mypy>=1.10"]
+dev = ["pytest>=8", "ruff>=0.4", "mypy>=1.10", "pyyaml>=6"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -500,6 +500,7 @@ def load_config_file(path: str | Path | None) -> AutoForgeConfig:
     if not p.exists():
         raise ConfigurationError(f"config file not found: {p}")
     suffix = p.suffix.lower()
+    data: object
     try:
         if suffix == ".toml":
             import tomllib
@@ -508,7 +509,9 @@ def load_config_file(path: str | Path | None) -> AutoForgeConfig:
         elif suffix == ".json":
             import json
 
-            data = json.loads(p.read_text(encoding="utf-8"))
+            data = json.loads(
+                p.read_text(encoding="utf-8"), object_pairs_hook=_pairs_without_duplicates
+            )
         elif suffix in (".yaml", ".yml"):
             data = _load_yaml(p)
         else:
@@ -522,6 +525,22 @@ def load_config_file(path: str | Path | None) -> AutoForgeConfig:
     if not isinstance(data, dict):
         raise ConfigurationError(f"config {p} must contain a mapping at top level")
     return _merge_config(cfg, data, source=str(p))
+
+
+# Every parser backend must hand `_merge_config` the document as written: a
+# key the operator wrote and the loader never saw is the silent no-op that
+# `_reject_unknown_keys` exists to refuse, and a duplicate key is exactly
+# that -- `json.loads`, PyYAML and the subset parser all keep the last value
+# and drop the earlier one, typo included, before any validation runs. TOML
+# (`tomllib`) rejects a duplicate on its own; the other three are told to.
+def _pairs_without_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """``json.loads`` object hook: a repeated key is a parse error, not a merge."""
+    out: dict[str, object] = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError(f"duplicate key {key!r}")
+        out[key] = value
+    return out
 
 
 def _as_options(raw: object, source: str, name: str) -> dict[str, str]:
@@ -855,6 +874,13 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
     # mapping rather than to the section.
     profiles = _section(data, "profiles", source, known=None)
     for name, p in profiles.items():
+        # YAML keys are not necessarily strings (`1:`, `true:`, `null:`), and
+        # a name is looked up, sorted and printed as one: a non-string would
+        # load here and fail as a `TypeError` in `doctor` instead.
+        if not isinstance(name, str) or not name.strip():
+            raise ConfigurationError(
+                f"{source}: profile names must be non-empty strings, got {name!r}"
+            )
         if not isinstance(p, dict):
             raise ConfigurationError(f"{source}: profile {name!r} must be a mapping")
         _reject_unknown_keys(p, PROFILE_KEYS, source, f"profiles.{name}")
@@ -894,15 +920,48 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
     return base
 
 
-def _load_yaml(path: Path) -> dict:
+def _load_yaml(path: Path) -> object:
+    """The YAML document as parsed; ``load_config_file`` checks the root type.
+
+    Only an *empty* document (no content, or comments only) reads as ``{}``:
+    that is what the subset parser produces for it, and it means "all
+    defaults" the same way an omitted file does. Any other non-mapping root
+    (``false``, a list, a bare string) is returned as is so the root check
+    rejects it on both backends alike, rather than PyYAML alone reading it as
+    the built-in configuration.
+    """
     text = path.read_text(encoding="utf-8")
     try:
         import yaml  # type: ignore
-
-        data = yaml.safe_load(text)
-        return data if isinstance(data, dict) else {}
     except ImportError:
         return _minimal_yaml_parse(text)
+
+    class UniqueKeySafeLoader(yaml.SafeLoader):
+        """``SafeLoader`` that refuses a key repeated within one mapping.
+
+        PyYAML keeps the last value of a repeated key, so the earlier one --
+        and any typo in it -- would vanish before ``_reject_unknown_keys``
+        runs. Merge keys (``<<``) are left to PyYAML: overriding a merged
+        key is what they are for, not a duplicate.
+        """
+
+        def construct_mapping(self, node: object, deep: bool = False) -> dict:
+            seen: set[object] = set()
+            for key_node, _value_node in node.value:  # type: ignore[attr-defined]
+                if key_node.tag == "tag:yaml.org,2002:merge":
+                    continue
+                key = self.construct_object(key_node, deep=deep)
+                try:
+                    repeated = key in seen
+                except TypeError:  # unhashable key: PyYAML reports it below
+                    continue
+                if repeated:
+                    raise ValueError(f"duplicate key {key!r} (line {key_node.start_mark.line + 1})")
+                seen.add(key)
+            return super().construct_mapping(node, deep=deep)
+
+    data = yaml.load(text, Loader=UniqueKeySafeLoader)  # a SafeLoader subclass
+    return {} if data is None else data
 
 
 def _minimal_yaml_parse(text: str) -> dict:
@@ -980,6 +1039,8 @@ def _parse_yaml_subset(text: str) -> dict:
                 )
             key, _, rest = content.partition(":")
             key = key.strip().strip('"').strip("'")
+            if key in mapping:
+                raise ValueError(f"duplicate key {key!r} at: {content!r}")
             rest = rest.strip()
             pos += 1
             if rest == "":

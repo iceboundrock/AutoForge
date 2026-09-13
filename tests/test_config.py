@@ -58,18 +58,13 @@ def test_unknown_profile_raises():
         default_config().profile("nope")
 
 
-def test_example_yaml_loads_without_pyyaml(tmp_path, monkeypatch):
-    import sys
-    from pathlib import Path
-
-    import autoforge
-
-    repo_example = Path(autoforge.__file__).parents[2] / "autoforge.example.yaml"
-    assert repo_example.exists(), f"example config missing: {repo_example}"
-    # Force the built-in subset parser even if PyYAML is installed.
-    monkeypatch.setitem(sys.modules, "yaml", None)
+@pytest.fixture
+def no_pyyaml(monkeypatch):
+    """Force the built-in YAML subset parser even though PyYAML is installed."""
     import builtins
+    import sys
 
+    monkeypatch.setitem(sys.modules, "yaml", None)
     real_import = builtins.__import__
 
     def fake_import(name, *a, **k):
@@ -78,6 +73,31 @@ def test_example_yaml_loads_without_pyyaml(tmp_path, monkeypatch):
         return real_import(name, *a, **k)
 
     monkeypatch.setattr(builtins, "__import__", fake_import)
+
+
+@pytest.fixture(params=["pyyaml", "subset"])
+def yaml_backend(request):
+    """Run a YAML case under PyYAML and under the subset parser.
+
+    An operator with ``autoforge[yaml]`` reads every config through PyYAML,
+    and PyYAML's own answers (last duplicate wins, any root type, typed keys)
+    are exactly where the loader's fail-closed rules need their own check,
+    so a rule proven only on the subset parser is proven on the wrong path.
+    """
+    if request.param == "pyyaml":
+        pytest.importorskip("yaml")
+    else:
+        request.getfixturevalue("no_pyyaml")
+    return request.param
+
+
+def test_example_yaml_loads_without_pyyaml(tmp_path, no_pyyaml):
+    from pathlib import Path
+
+    import autoforge
+
+    repo_example = Path(autoforge.__file__).parents[2] / "autoforge.example.yaml"
+    assert repo_example.exists(), f"example config missing: {repo_example}"
     cfg = load_config_file(repo_example)
     assert cfg.profile("analyze_execute").model == "fable"
     assert cfg.profile("review_round_1").model == "openai/gpt-5.6-luna"
@@ -294,6 +314,146 @@ def test_unknown_keys_rejected_in_yaml_and_toml_too(tmp_path):
     toml.write_text("version = 1\n[review.replan]\nenable = false\n", encoding="utf-8")
     with pytest.raises(ConfigurationError, match="under 'review.replan': enable"):
         load_config_file(toml)
+
+
+def test_unknown_keys_rejected_on_both_yaml_backends(tmp_path, yaml_backend):
+    p = tmp_path / "cfg.yaml"
+    p.write_text("version: 1\nworkflow:\n  max_review_round: 3\n", encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="under 'workflow': max_review_round"):
+        load_config_file(p)
+
+
+# A key written twice in one mapping. `json.loads`, PyYAML and the subset
+# parser all keep the last value and drop the earlier one *before* the loader
+# sees the document, so a typo in the dropped copy would be the very silent
+# no-op the unknown-key check exists to refuse. `tomllib` refuses it itself.
+@pytest.mark.parametrize(
+    "text, key",
+    [
+        # The whole section repeated: the first copy, typo and all, is gone.
+        (
+            "version: 1\nworkflow:\n  max_review_round: 3\nworkflow:\n  max_review_rounds: 20\n",
+            "workflow",
+        ),
+        # One leaf repeated: which bound is in force is decided by file order.
+        (
+            "version: 1\nworkflow:\n  max_review_rounds: 3\n  max_review_rounds: 20\n",
+            "max_review_rounds",
+        ),
+        # A repeated profile name.
+        (
+            "version: 1\nprofiles:\n  fix:\n    model: a\n  fix:\n    model: b\n",
+            "fix",
+        ),
+    ],
+)
+def test_duplicate_yaml_key_is_a_parse_error(tmp_path, yaml_backend, text, key):
+    p = tmp_path / "cfg.yaml"
+    p.write_text(text, encoding="utf-8")
+    with pytest.raises(ConfigurationError, match=f"cannot parse config .*duplicate key '{key}'"):
+        load_config_file(p)
+
+
+def test_duplicate_json_key_is_a_parse_error(tmp_path):
+    p = tmp_path / "cfg.json"
+    p.write_text(
+        '{"version": 1, "workflow": {"max_review_round": 3}, '
+        '"workflow": {"max_review_rounds": 20}}',
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigurationError, match="cannot parse config .*duplicate key 'workflow'"):
+        load_config_file(p)
+    p.write_text('{"version": 1, "safety": {"allow_merge": false, "allow_merge": true}}')
+    with pytest.raises(ConfigurationError, match="duplicate key 'allow_merge'"):
+        load_config_file(p)
+
+
+def test_duplicate_toml_key_is_a_parse_error(tmp_path):
+    p = tmp_path / "cfg.toml"
+    p.write_text(
+        "version = 1\n[workflow]\nmax_review_round = 3\n[workflow]\nmax_review_rounds = 20\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigurationError, match="cannot parse config .*twice"):
+        load_config_file(p)
+
+
+def test_yaml_same_key_in_different_mappings_is_not_a_duplicate(tmp_path, yaml_backend):
+    """Only a key repeated within *one* mapping is a duplicate."""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(
+        "version: 1\nprofiles:\n  fix:\n    model: a\n  analyze_execute:\n    model: b\n",
+        encoding="utf-8",
+    )
+    cfg = load_config_file(p)
+    assert cfg.profile("fix").model == "a" and cfg.profile("analyze_execute").model == "b"
+
+
+def test_pyyaml_merge_key_override_is_not_a_duplicate(tmp_path):
+    """``<<`` exists to be overridden; only PyYAML reads it, and it still may."""
+    pytest.importorskip("yaml")
+    p = tmp_path / "cfg.yaml"
+    p.write_text(
+        "version: 1\nprofiles:\n  fix: &base\n    model: a\n    effort: low\n"
+        "  analyze_execute:\n    <<: *base\n    model: b\n",
+        encoding="utf-8",
+    )
+    cfg = load_config_file(p)
+    assert cfg.profile("analyze_execute").model == "b"
+    assert cfg.profile("analyze_execute").effort == "low"
+
+
+# PyYAML used to have its non-mapping root replaced by `{}` before the root
+# check ran, so `false` or a list loaded as the built-in configuration while
+# the subset parser refused the same file.
+@pytest.mark.parametrize("text", ["false\n", "- item\n", "just a string\n", "42\n"])
+def test_non_mapping_yaml_root_rejected_on_both_backends(tmp_path, yaml_backend, text):
+    p = tmp_path / "cfg.yaml"
+    p.write_text(text, encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="mapping at top level|cannot parse"):
+        load_config_file(p)
+
+
+@pytest.mark.parametrize("text", ["", "# nothing but a comment\n", "\n\n"])
+def test_empty_yaml_document_is_the_defaults(tmp_path, yaml_backend, text):
+    """No content is the one non-mapping root that means "all defaults"."""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(text, encoding="utf-8")
+    cfg = load_config_file(p)
+    assert cfg.safety.allow_merge is False
+    assert cfg.workflow.max_review_rounds == default_config().workflow.max_review_rounds
+
+
+# PyYAML types its keys, so `1:` is the int 1 and `~:` is None. Such a name
+# used to load into `dict[str, ProfileConfig]` and only fail later, as a raw
+# `TypeError` when `doctor` sorted the names.
+@pytest.mark.parametrize("name", ["1", "true", "~", "1.5"])
+def test_non_string_pyyaml_profile_name_rejected(tmp_path, name):
+    pytest.importorskip("yaml")
+    p = tmp_path / "cfg.yaml"
+    p.write_text(f"version: 1\nprofiles:\n  {name}:\n    provider: scripted\n", encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="profile names must be non-empty strings"):
+        load_config_file(p)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        '{"version": 1, "profiles": {"": {"provider": "scripted"}}}',
+        '{"version": 1, "profiles": {"   ": {"provider": "scripted"}}}',
+    ],
+)
+def test_blank_profile_name_rejected(tmp_path, body):
+    p = tmp_path / "cfg.json"
+    p.write_text(body, encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="profile names must be non-empty strings"):
+        load_config_file(p)
+
+
+def test_quoted_numeric_profile_name_is_a_string(tmp_path, yaml_backend):
+    p = tmp_path / "cfg.yaml"
+    p.write_text('version: 1\nprofiles:\n  "1":\n    provider: scripted\n', encoding="utf-8")
+    assert load_config_file(p).profile("1").provider == "scripted"
 
 
 def test_removed_execution_allow_merge_keeps_its_own_message(tmp_path):

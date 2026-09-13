@@ -852,7 +852,13 @@ leaves the built-in default in force: several of these keys are loop bounds
 or merge behaviour, where "ignored" means a looser bound than the operator
 wrote while `autoforge doctor` calls the file valid. Provider-specific
 `options` under a profile are the one free mapping; the adapter in
-`providers.py` validates what it reads there.
+`providers.py` validates what it reads there. The same contract covers what
+a parser would otherwise settle before the controller looks: a key written
+twice in one mapping is a parse error on every format (PyYAML and
+`json.loads` would keep the last copy and drop the first, typo included), a
+YAML document whose root is not a mapping is refused on both YAML backends
+(only an empty or comment-only file means "all defaults"), and a profile
+name must be a non-empty string (PyYAML types unquoted `1:` as an integer).
 
 The `local:` block configures [local mode](#local-mode-no-github) —
 `feature_dir`, `max_fix_rounds` and the argv-array `validation_commands`. A
