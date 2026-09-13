@@ -453,9 +453,12 @@ def test_doctor_with_fake_runner(tmp_path, capsys, monkeypatch):
     rc = cli.main(["--state-dir", str(tmp_path / ".autoforge"), "doctor"])
     out = capsys.readouterr().out
     assert rc == 1 and "gh authenticated" in out and "FAIL" in out
+    assert "merge gate: CLOSED: safety.allow_merge=false (built-in default)" in out
     assert cli.main(["--state-dir", str(tmp_path / ".autoforge"), "doctor", "--json"]) == 1
     data = json.loads(capsys.readouterr().out)
     assert any(c["name"] == "GitHub remote" and c["ok"] for c in data["checks"])
+    gate = next(c for c in data["checks"] if c["name"] == "merge gate")
+    assert gate["ok"] and not gate["required"] and gate["detail"].startswith("CLOSED")
 
 
 def test_resume_never_resets_the_step_budget(tmp_path, capsys, monkeypatch, fakes):

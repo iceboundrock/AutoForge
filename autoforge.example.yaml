@@ -26,10 +26,16 @@ execution:
   # A malformed CONTROL_RESULT with exit code 0 triggers at most this many
   # correction prompts before the step fails (0 disables correction).
   max_correction_attempts: 1
+  # There is no `execution.allow_merge`: older configs that set the merge
+  # gate here are rejected on load (the key lives under `safety` only).
 
 safety:
   # Controller invariant: no real merge unless this is true AND the CLI is
   # invoked with --allow-merge. Automatic merge is disabled in this milestone.
+  # This is the only key that opens the gate, and any other key under
+  # `safety` (a typo such as `allow_merges`) is a configuration error rather
+  # than a silent no-op. `autoforge doctor` prints the effective gate state
+  # and the file/key it came from.
   allow_merge: false
   # Paths a PR may not change and still be merged unattended. GitHub runs the
   # *PR's own* copy of `.github/workflows/` and reports it under the same

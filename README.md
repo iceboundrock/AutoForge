@@ -657,7 +657,12 @@ audit data rather than state payload.
   reachable only from `READY_FOR_MERGE` and only when **both**
   `safety.allow_merge: true` is set in config **and** `--allow-merge` is
   passed on the CLI. With the gate closed `run`/`resume` stop at
-  `READY_FOR_MERGE` and a human merges.
+  `READY_FOR_MERGE` and a human merges. `safety.allow_merge` is the *only*
+  config key that opens the gate: the historical `execution.allow_merge` is
+  rejected on load rather than read, and an unknown key under `safety` (a
+  typo such as `allow_merges`) is a configuration error, so the gate can
+  never be "disabled" in one place while still open in another.
+  `autoforge doctor` prints the effective gate state and the file that set it.
 - **Agents never merge.** When the gate is open, the *controller* performs the
   merge itself: `gh pr merge --<merge.method> --match-head-commit <reviewed HEAD>`
   through `GitHubClient`, with no prompt and no agent invocation. Every agent

@@ -120,14 +120,139 @@ def test_claude_command_shape():
     assert argv[-1] == "hello prompt"  # single argv element, no shell
 
 
-def test_safety_gate_from_either_location(tmp_path):
+# -- AF-SEC-001: exactly one key opens the merge gate ------------------------
+def test_safety_gate_opens_from_safety_allow_merge_only(tmp_path):
     p = tmp_path / "cfg.json"
     p.write_text('{"version": 1, "safety": {"allow_merge": true}}', encoding="utf-8")
-    assert load_config_file(p).merge_allowed_by_config is True
-    p.write_text('{"version": 1, "execution": {"allow_merge": true}}', encoding="utf-8")
-    assert load_config_file(p).merge_allowed_by_config is True
+    cfg = load_config_file(p)
+    assert cfg.merge_allowed_by_config is True
+    assert cfg.safety.allow_merge_source == f"{p}: safety.allow_merge"
+    p.write_text('{"version": 1, "safety": {"allow_merge": false}}', encoding="utf-8")
+    cfg = load_config_file(p)
+    assert cfg.merge_allowed_by_config is False
+    assert cfg.safety.allow_merge_source == f"{p}: safety.allow_merge"
     p.write_text('{"version": 1}', encoding="utf-8")
-    assert load_config_file(p).merge_allowed_by_config is False
+    cfg = load_config_file(p)
+    assert cfg.merge_allowed_by_config is False
+    assert cfg.safety.allow_merge_source == "built-in default"
+    assert default_config().safety.allow_merge_source == "built-in default"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # The issue's failure scenario: a config copied from an old example
+        # opens the gate under `execution`, the operator later "closes" it
+        # under `safety`, and --allow-merge would merge.
+        '{"version": 1, "execution": {"allow_merge": true}, "safety": {"allow_merge": false}}',
+        '{"version": 1, "execution": {"allow_merge": true}}',
+        # Not even `false` is read: the key is gone, not tolerated.
+        '{"version": 1, "execution": {"allow_merge": false}}',
+        # Rejected for being present, before its value is even type-checked.
+        '{"version": 1, "execution": {"allow_merge": "true"}}',
+    ],
+)
+def test_deprecated_execution_allow_merge_is_a_hard_error(tmp_path, body):
+    p = tmp_path / "cfg.json"
+    p.write_text(body, encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="execution.allow_merge.*no longer supported"):
+        load_config_file(p)
+
+
+def test_execution_config_has_no_allow_merge_field():
+    """The deprecated key cannot survive as an attribute nothing reads or validates."""
+    from dataclasses import fields
+
+    from autoforge.config import ExecutionConfig
+
+    assert "allow_merge" not in {f.name for f in fields(ExecutionConfig)}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        '{"version": 1, "safety": {"allow_merges": true}}',
+        '{"version": 1, "safety": {"allow_merge": true, "allowMerge": false}}',
+        '{"version": 1, "safety": {"protected_paths": []}}',
+    ],
+)
+def test_unknown_safety_keys_are_rejected_not_ignored(tmp_path, body):
+    """A misspelled gate key fails loudly rather than silently leaving the gate closed."""
+    p = tmp_path / "cfg.json"
+    p.write_text(body, encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="unknown key.*under 'safety'") as info:
+        load_config_file(p)
+    message = str(info.value)
+    unknown = [k for k in ("allow_merges", "allowMerge", "protected_paths") if k in body]
+    assert all(k in message for k in unknown)
+    assert "allow_merge, protected_merge_paths" in message  # the known keys are named
+
+
+def test_unknown_safety_key_rejected_in_yaml_too(tmp_path):
+    p = tmp_path / "cfg.yaml"
+    p.write_text("version: 1\nsafety:\n  allow_merges: true\n", encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="allow_merges"):
+        load_config_file(p)
+
+
+# Every JSON falsy value that is not a mapping. `data.get("safety", {}) or {}`
+# used to turn all of these into an omitted section, so the "must be a
+# mapping" check right after it was unreachable for exactly the values a
+# hand edit or a generator is most likely to produce.
+FALSY_NON_MAPPINGS = ["[]", "false", '""', "0"]
+
+
+@pytest.mark.parametrize("value", FALSY_NON_MAPPINGS + ['"yes"', "[1]", "1"])
+def test_non_mapping_safety_section_is_rejected(tmp_path, value):
+    """A present `safety` that is not a mapping fails loudly, whatever its truthiness."""
+    p = tmp_path / "cfg.json"
+    p.write_text(f'{{"version": 1, "safety": {value}}}', encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="'safety' must be a mapping"):
+        load_config_file(p)
+
+
+@pytest.mark.parametrize("value", FALSY_NON_MAPPINGS)
+def test_non_mapping_safety_section_rejected_in_yaml_too(tmp_path, value):
+    p = tmp_path / "cfg.yaml"
+    p.write_text(f"version: 1\nsafety: {value}\n", encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="'safety' must be a mapping"):
+        load_config_file(p)
+
+
+@pytest.mark.parametrize(
+    "section",
+    ["execution", "github", "merge", "review", "workflow", "local", "profiles"],
+)
+@pytest.mark.parametrize("value", FALSY_NON_MAPPINGS)
+def test_non_mapping_sections_are_rejected_everywhere(tmp_path, section, value):
+    """The same contract for every section: the fix is in the reader, not in `safety`."""
+    p = tmp_path / "cfg.json"
+    p.write_text(f'{{"version": 1, "{section}": {value}}}', encoding="utf-8")
+    with pytest.raises(ConfigurationError, match=f"'{section}' must be a mapping"):
+        load_config_file(p)
+
+
+@pytest.mark.parametrize("value", FALSY_NON_MAPPINGS)
+def test_non_mapping_replan_section_is_rejected(tmp_path, value):
+    p = tmp_path / "cfg.json"
+    p.write_text(f'{{"version": 1, "review": {{"replan": {value}}}}}', encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="'review.replan' must be a mapping"):
+        load_config_file(p)
+
+
+def test_empty_safety_section_header_is_the_default(tmp_path):
+    """`safety:` with every child commented out is how a hand-edited YAML file
+    looks; it reads as null and yields the same fail-closed defaults as omitting
+    the section. An explicit JSON null is the same value and the same case."""
+    yaml = tmp_path / "cfg.yaml"
+    yaml.write_text("version: 1\nsafety:\n  # allow_merge: true\nmerge:\n", encoding="utf-8")
+    cfg = load_config_file(yaml)
+    assert cfg.merge_allowed_by_config is False
+    assert cfg.safety.allow_merge_source == "built-in default"
+    assert cfg.safety.protected_merge_paths == default_config().safety.protected_merge_paths
+    js = tmp_path / "cfg.json"
+    js.write_text('{"version": 1, "safety": null}', encoding="utf-8")
+    assert load_config_file(js).safety == default_config().safety
 
 
 def test_required_profiles_validation(tmp_path):
@@ -173,7 +298,6 @@ def test_url_validation():
     [
         '{"version": 1, "safety": {"allow_merge": "false"}}',
         '{"version": 1, "safety": {"allow_merge": 1}}',
-        '{"version": 1, "execution": {"allow_merge": "true"}}',
     ],
 )
 def test_allow_merge_rejects_non_boolean(tmp_path, body):

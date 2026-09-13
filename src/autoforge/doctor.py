@@ -98,18 +98,51 @@ class Doctor:
         ``required_profiles`` may be a fixed list or a callable, because a
         LOCAL run's required reviewer profiles are derived from the config that
         is only loaded here (see :func:`autoforge.profiles.local_required_profiles`).
+
+        ``self.config`` is set exactly when this check passes, and to what
+        *this* attempt accepted. Every later check reads it, so it must not
+        describe a config a run would refuse: not a previous file (a `Doctor`
+        reused after its config turned invalid), and not one that parsed but
+        failed profile validation -- a run does not start on such a config
+        (`ControllerEngine.validate_config`), so the merge gate must not claim
+        what a run "WILL" do with it.
         """
+        self.config = None
         try:
-            self.config = load_config_file(self.config_path)
+            cfg = load_config_file(self.config_path)
             required = required_profiles or REQUIRED_PROFILES
-            names = required(self.config) if callable(required) else required
-            validate_required_profiles(self.config, names)
+            names = required(cfg) if callable(required) else required
+            validate_required_profiles(cfg, names)
         except ConfigurationError as exc:
             return CheckResult("config", False, str(exc))
+        self.config = cfg
         src = self.config_path or "(built-in defaults)"
-        return CheckResult(
-            "config", True, f"{src}; profiles: {', '.join(sorted(self.config.profiles))}"
-        )
+        return CheckResult("config", True, f"{src}; profiles: {', '.join(sorted(cfg.profiles))}")
+
+    def check_merge_gate(self) -> CheckResult:
+        """Report the effective merge gate and the file/key that set it (informational).
+
+        The gate has two halves -- `safety.allow_merge` in config AND
+        `--allow-merge` on the CLI -- and `doctor` cannot see the flag, so it
+        states what the flag *would* do with this config. The source is named
+        so an operator who believes the gate is closed can check the key that
+        decides it rather than the one they last edited.
+        """
+        name = "merge gate"
+        cfg = self.config
+        if cfg is None:
+            return CheckResult(name, False, "(config check failed)", required=False)
+        source = cfg.safety.allow_merge_source
+        if cfg.merge_allowed_by_config:
+            detail = (
+                f"config half OPEN: safety.allow_merge=true ({source}); "
+                "a run with --allow-merge WILL merge PRs itself"
+            )
+        else:
+            detail = (
+                f"CLOSED: safety.allow_merge=false ({source}); --allow-merge alone cannot merge"
+            )
+        return CheckResult(name, True, detail, required=False)
 
     def check_state_dir(self) -> CheckResult:
         d = self.state_dir or (self.config.state_dir if self.config else ".autoforge")
@@ -301,7 +334,7 @@ class Doctor:
         return claude_cmd, opencode_cmd
 
     def run_all(self) -> list[CheckResult]:
-        results = [self.check_config()]
+        results = [self.check_config(), self.check_merge_gate()]
         cfg = self.config
         gh = cfg.github.command if cfg else "gh"
         claude_cmd, opencode_cmd = self._agent_commands(cfg)

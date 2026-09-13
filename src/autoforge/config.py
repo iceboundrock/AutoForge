@@ -87,8 +87,6 @@ class ExecutionConfig:
     # How many times a *malformed CONTROL_RESULT* (exit 0) triggers a
     # correction prompt before the step fails. 0 disables correction.
     max_correction_attempts: int = 1
-    # Deprecated location for the merge gate; mirrored into safety.allow_merge.
-    allow_merge: bool = False
 
 
 # Paths whose contents define what the hosted checks actually run. See
@@ -96,11 +94,27 @@ class ExecutionConfig:
 DEFAULT_PROTECTED_MERGE_PATHS = (".github/workflows/",)
 
 
+# The keys `safety:` may contain. Anything else is a hard error: a typo such
+# as `allow_merges: true` must not fail closed *silently*, because the operator
+# then believes the gate is in the state they wrote, not the state it is in.
+SAFETY_KEYS = ("allow_merge", "protected_merge_paths")
+
+# `safety.allow_merge` when no config file sets it.
+DEFAULT_ALLOW_MERGE_SOURCE = "built-in default"
+
+
 @dataclass
 class SafetyConfig:
     # Controller invariant: no real merge unless this is true AND the CLI
-    # passes --allow-merge. Default off for this milestone.
+    # passes --allow-merge. Default off for this milestone. This is the ONLY
+    # key that opens the gate: the historical `execution.allow_merge` is
+    # rejected on load rather than read, so two keys can never disagree about
+    # the most dangerous setting in the file.
     allow_merge: bool = False
+    # Where `allow_merge` came from (`<config file>: safety.allow_merge`, or
+    # the built-in default) so `doctor` can show the effective gate state and
+    # the operator can find the line that set it.
+    allow_merge_source: str = DEFAULT_ALLOW_MERGE_SOURCE
     # Paths a PR may not change and still be merged unattended. The hosted
     # checks the merge gate trusts ("every check on the PR succeeded") are
     # defined by the workflow files *in the PR itself*: GitHub runs the PR's
@@ -275,7 +289,8 @@ class AutoForgeConfig:
 
     @property
     def merge_allowed_by_config(self) -> bool:
-        return bool(self.safety.allow_merge or self.execution.allow_merge)
+        """The config half of the merge gate: `safety.allow_merge` and nothing else."""
+        return bool(self.safety.allow_merge)
 
 
 def _claude_profile(name: str) -> ProfileConfig:
@@ -475,6 +490,25 @@ def _as_int(raw: object, source: str, key: str) -> int:
     raise ConfigurationError(f"{source}: {key!r} must be an integer, got {raw!r}")
 
 
+def _section(data: dict, key: str, source: str, label: str | None = None) -> dict:
+    """A config section: absent or ``null`` is the built-in default, else a mapping.
+
+    ``null`` is what the YAML reader produces for a section header with every
+    child commented out (``safety:`` alone on its line), and an empty section
+    yields the same fail-closed defaults as an omitted one. Any other
+    non-mapping value (``[]``, ``false``, ``""``, ``0``, a string) is rejected
+    rather than normalised into an omitted section: ``data.get(key, {}) or
+    {}`` would turn ``safety: []`` into a silently closed gate and let ``doctor``
+    call that configuration valid.
+    """
+    raw = data.get(key)
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigurationError(f"{source}: '{label or key}' must be a mapping, got {raw!r}")
+    return raw
+
+
 def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeConfig:
     version = data.get("version", CONFIG_VERSION)
     if version != CONFIG_VERSION:
@@ -485,9 +519,7 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
         base.state_dir = str(data["state_dir"])
     if "prompt_version" in data:
         base.prompt_version = str(data["prompt_version"])
-    exe = data.get("execution", {}) or {}
-    if not isinstance(exe, dict):
-        raise ConfigurationError(f"{source}: 'execution' must be a mapping")
+    exe = _section(data, "execution", source)
     if "default_timeout_seconds" in exe:
         timeout = _as_int(
             exe["default_timeout_seconds"], source, "execution.default_timeout_seconds"
@@ -508,28 +540,36 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
             exe["max_correction_attempts"], source, "execution.max_correction_attempts"
         )
     if "allow_merge" in exe:
-        base.execution.allow_merge = _as_bool(exe["allow_merge"], source, "execution.allow_merge")
-    safety = data.get("safety", {}) or {}
-    if not isinstance(safety, dict):
-        raise ConfigurationError(f"{source}: 'safety' must be a mapping")
+        # Once a second, deprecated location for the merge gate. It is not
+        # read any more -- not even as `false` -- because a config that sets
+        # both can be "disabled" in one place and still open in the other.
+        raise ConfigurationError(
+            f"{source}: 'execution.allow_merge' is no longer supported; the merge gate "
+            "is 'safety.allow_merge' only. Remove the key from 'execution' (moving it "
+            "to 'safety' if you meant to open the gate)"
+        )
+    safety = _section(data, "safety", source)
+    unknown_safety = sorted(str(k) for k in safety if k not in SAFETY_KEYS)
+    if unknown_safety:
+        raise ConfigurationError(
+            f"{source}: unknown key(s) under 'safety': {', '.join(unknown_safety)} "
+            f"(known: {', '.join(SAFETY_KEYS)})"
+        )
     if "allow_merge" in safety:
         base.safety.allow_merge = _as_bool(safety["allow_merge"], source, "safety.allow_merge")
+        base.safety.allow_merge_source = f"{source}: safety.allow_merge"
     if "protected_merge_paths" in safety:
         base.safety.protected_merge_paths = _as_str_list(
             safety["protected_merge_paths"], source, "safety.protected_merge_paths"
         )
-    gh = data.get("github", {}) or {}
-    if not isinstance(gh, dict):
-        raise ConfigurationError(f"{source}: 'github' must be a mapping")
+    gh = _section(data, "github", source)
     if "command" in gh:
         base.github.command = str(gh["command"])
     if "timeout_seconds" in gh:
         base.github.timeout_seconds = _as_int(
             gh["timeout_seconds"], source, "github.timeout_seconds"
         )
-    merge = data.get("merge", {}) or {}
-    if not isinstance(merge, dict):
-        raise ConfigurationError(f"{source}: 'merge' must be a mapping")
+    merge = _section(data, "merge", source)
     if "method" in merge:
         method = merge["method"]
         if not isinstance(method, str) or method not in MERGE_METHODS:
@@ -548,12 +588,8 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
                 f"{source}: 'merge.max_verification_attempts' must be >= 1, got {attempts}"
             )
         base.merge.max_verification_attempts = attempts
-    review = data.get("review", {}) or {}
-    if not isinstance(review, dict):
-        raise ConfigurationError(f"{source}: 'review' must be a mapping")
-    replan = review.get("replan", {}) or {}
-    if not isinstance(replan, dict):
-        raise ConfigurationError(f"{source}: 'review.replan' must be a mapping")
+    review = _section(data, "review", source)
+    replan = _section(review, "replan", source, label="review.replan")
     rp = base.review.replan
     if "enabled" in replan:
         rp.enabled = _as_bool(replan["enabled"], source, "review.replan.enabled")
@@ -575,9 +611,7 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
         raise ConfigurationError(
             f"{source}: 'review.replan.hard_threshold' must be >= 'review.replan.soft_threshold'"
         )
-    workflow = data.get("workflow", {}) or {}
-    if not isinstance(workflow, dict):
-        raise ConfigurationError(f"{source}: 'workflow' must be a mapping")
+    workflow = _section(data, "workflow", source)
     for key, minimum in (("max_review_rounds", 1), ("max_total_steps", 1)):
         if key in workflow:
             value = _as_int(workflow[key], source, f"workflow.{key}")
@@ -604,9 +638,7 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
         raise ConfigurationError(
             f"{source}: 'review.replan.hard_threshold' must be <= 'workflow.max_review_rounds'"
         )
-    local = data.get("local", {}) or {}
-    if not isinstance(local, dict):
-        raise ConfigurationError(f"{source}: 'local' must be a mapping")
+    local = _section(data, "local", source)
     if "feature_dir" in local:
         feature_dir = str(local["feature_dir"]).strip()
         if not feature_dir:
@@ -646,9 +678,7 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
                     f"{source}: 'local.{name}' must be >= {minimum}, got {value}"
                 )
             setattr(base.local, attr, value)
-    profiles = data.get("profiles", {}) or {}
-    if not isinstance(profiles, dict):
-        raise ConfigurationError(f"{source}: 'profiles' must be a mapping")
+    profiles = _section(data, "profiles", source)
     for name, p in profiles.items():
         if not isinstance(p, dict):
             raise ConfigurationError(f"{source}: profile {name!r} must be a mapping")
