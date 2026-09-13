@@ -97,7 +97,12 @@ DEFAULT_PROTECTED_MERGE_PATHS = (".github/workflows/",)
 # The keys `safety:` may contain. Anything else is a hard error: a typo such
 # as `allow_merges: true` must not fail closed *silently*, because the operator
 # then believes the gate is in the state they wrote, not the state it is in.
-SAFETY_KEYS = ("allow_merge", "protected_merge_paths", "required_checks")
+SAFETY_KEYS = (
+    "allow_merge",
+    "protected_merge_paths",
+    "required_checks",
+    "verify_check_definition",
+)
 
 # `safety.required_checks` when no config file sets it: the aggregate check
 # name of this repository's own `.github/workflows/ci.yml`.
@@ -140,6 +145,22 @@ class SafetyConfig:
     # branch rules and fails when one of these contexts is not required. An
     # empty list only requires that *some* status check is required.
     required_checks: list[str] = field(default_factory=lambda: list(DEFAULT_REQUIRED_CHECKS))
+    # Whether READY_FOR_MERGE / MERGE also verify *where* each required check
+    # came from. A green `ci` proves that the workflow defining it ran to
+    # completion on the PR; it does not prove that the workflow was the one
+    # the base branch defines. With this on, the controller resolves each
+    # `required_checks` context to the GitHub Actions run that produced it,
+    # requires that run to be at the reviewed HEAD, and requires its job and
+    # step structure (job names, step names in order) to equal that of the
+    # base branch's own most recent run of the same workflow at the base
+    # branch's current tip. A redefined, extended or trimmed workflow is a
+    # difference and BLOCKS the merge; so does a required context that is not
+    # an Actions check run, appears more than once, or has no base-branch run
+    # to compare against. This is a check on the *definition* that produced
+    # the green result, complementary to `protected_merge_paths` (which reads
+    # the PR's file list instead of GitHub's run record); neither proves what
+    # the tests in the PR assert (see `merge.verification_commands`).
+    verify_check_definition: bool = True
 
     def protects(self, path: str) -> bool:
         """Whether ``path`` (a POSIX repo-relative path) is protected."""
@@ -171,6 +192,22 @@ class MergeConfig:
     # post-merge re-read failed) is re-checked on `resume` at most this many
     # times per phase; then the run is BLOCKED instead of retrying forever.
     max_verification_attempts: int = 5
+    # Controller-owned verification of the reviewed HEAD *before* the merge,
+    # on the operator's machine. The hosted check runs the PR's own code, so
+    # a PR that weakens what its tests assert produces a genuine green check
+    # without touching any protected path; nothing GitHub reports can tell
+    # that apart from a real pass. These argv arrays (never shell strings)
+    # are the controller's own evidence: once every GitHub-side check has
+    # passed, the exact reviewed commit is exported -- `git read-tree` +
+    # `git checkout-index` into a private temporary directory, never the
+    # operator's checkout, never a worktree or branch -- and each command
+    # runs there in order, under `execution.default_timeout_seconds`. Any
+    # non-zero exit or timeout BLOCKS the merge for a human. A pass is
+    # persisted against the HEAD and the command list, so MERGE does not
+    # repeat it for the same commit. An empty list disables this
+    # verification: the commands are the project's own (`pytest`, `make
+    # check`, ...) and there is no build-system detection.
+    verification_commands: list[list[str]] = field(default_factory=list)
 
 
 @dataclass
@@ -483,6 +520,10 @@ def _as_argv_list(raw: object, source: str, key: str) -> list[list[str]]:
                 raise ConfigurationError(
                     f"{source}: {key}[{index}] must contain non-empty strings, got {item!r}"
                 )
+            # Stored verbatim, unlike `_as_str_list`: an argv element reaches
+            # the process exactly as written, so surrounding whitespace is
+            # part of the argument, not trimmed away. Only a blank element is
+            # refused, since it can never be anything but a slip.
             argv.append(item)
         out.append(argv)
     return out
@@ -578,6 +619,10 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
         base.safety.required_checks = _as_str_list(
             safety["required_checks"], source, "safety.required_checks"
         )
+    if "verify_check_definition" in safety:
+        base.safety.verify_check_definition = _as_bool(
+            safety["verify_check_definition"], source, "safety.verify_check_definition"
+        )
     gh = _section(data, "github", source)
     if "command" in gh:
         base.github.command = str(gh["command"])
@@ -604,6 +649,10 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
                 f"{source}: 'merge.max_verification_attempts' must be >= 1, got {attempts}"
             )
         base.merge.max_verification_attempts = attempts
+    if "verification_commands" in merge:
+        base.merge.verification_commands = _as_argv_list(
+            merge["verification_commands"], source, "merge.verification_commands"
+        )
     review = _section(data, "review", source)
     replan = _section(review, "replan", source, label="review.replan")
     rp = base.review.replan

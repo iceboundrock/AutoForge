@@ -20,9 +20,16 @@ agent claim against GitHub** before acting on it:
   changes none of ``safety.protected_merge_paths`` (a PR that edits the
   workflow files defining the hosted checks also edits what a green check
   means, so it is never merged unattended),
-  every check succeeded, ``mergeable`` is MERGEABLE, ``mergeStateStatus``
+  every check succeeded, each ``safety.required_checks`` context came from
+  a GitHub Actions run at that HEAD whose job/step structure equals the
+  base branch's own run of the same workflow (``verify_check_definition``:
+  a green check produced by a different definition is not the check the
+  gate trusts), ``mergeable`` is MERGEABLE, ``mergeStateStatus``
   is CLEAN/HAS_HOOKS, no auto-merge is armed and the base branch has no
-  merge queue. Conclusive negatives -> BLOCKED; HEAD drift -> REVIEW;
+  merge queue. Only then, because it executes the PR's code, the reviewed
+  commit is exported into a private temporary directory (never the
+  operator's checkout, never a worktree) and ``merge.verification_commands``
+  run there; any failure -> BLOCKED. Conclusive negatives -> BLOCKED; HEAD drift -> REVIEW;
   inconclusive data raises and keeps the phase, re-checked on ``resume``
   at most ``merge.max_verification_attempts`` times, then BLOCKED. MERGE
   then runs ``gh pr merge`` bound to the reviewed HEAD
@@ -90,7 +97,7 @@ from .errors import (
     VerificationError,
 )
 from .executor import ExecutionRequest, execute
-from .github import GitHubClient, IssueInfo, PRInfo, build_merge_argv
+from .github import GitHubClient, IssueInfo, PRInfo, WorkflowRunJobs, build_merge_argv
 from .local_workspace import (
     FeatureSpec,
     LocalWorkspace,
@@ -109,6 +116,12 @@ from .loop_guard import (
     stagnation_reason,
     step_budget_reason,
     truncated_evidence_rounds,
+)
+from .premerge import (
+    commit_is_local,
+    describe_definition_difference,
+    export_commit_tree,
+    fetch_pr_head,
 )
 from .profiles import local_required_profiles, profile_for_phase
 from .prompts import (
@@ -900,6 +913,7 @@ class ControllerEngine:
                     "review clean, PR open at the reviewed HEAD, not draft, no change to "
                     "safety.protected_merge_paths, all checks succeeded, mergeable, no "
                     "auto-merge / merge queue (fail closed)",
+                    *self._premerge_plan_notes(),
                 ],
             )
         if s.phase == Phase.MERGE:
@@ -912,6 +926,7 @@ class ControllerEngine:
                     "would verify: last review clean, PR open at the reviewed HEAD, not "
                     "draft, no change to safety.protected_merge_paths, all checks "
                     "succeeded, mergeable, no auto-merge / merge queue",
+                    *self._premerge_plan_notes(),
                     "would run the command below (bound to the reviewed HEAD via "
                     "--match-head-commit), then re-read the PR and require state MERGED",
                 ],
@@ -2099,6 +2114,32 @@ class ControllerEngine:
             ),
         )
 
+    def _premerge_plan_notes(self) -> list[str]:
+        """Dry-run description of the controller's own pre-merge evidence (#42)."""
+        notes: list[str] = []
+        safety = self.config.safety
+        if safety.verify_check_definition and safety.required_checks:
+            notes.append(
+                "would verify the definition behind each required check "
+                f"({', '.join(safety.required_checks)}): a GitHub Actions run at the reviewed "
+                "HEAD whose jobs and steps equal the base branch's own push run of that "
+                "workflow at its current tip (safety.verify_check_definition)"
+            )
+        commands = self.config.merge.verification_commands
+        if commands:
+            shown = "; ".join(" ".join(redact_argv(list(argv))) for argv in commands)
+            notes.append(
+                "would then export the reviewed HEAD into a temporary directory (no "
+                f"worktree, no branch) and run merge.verification_commands there: {shown} "
+                "(any failure -> BLOCKED; dry-run runs nothing)"
+            )
+        else:
+            notes.append(
+                "no merge.verification_commands configured: nothing runs locally before the "
+                "merge, so a green check is the only evidence about what the tests assert"
+            )
+        return notes
+
     def _ready_for_merge_step(self, plan: StepPlan, allow_merge: bool) -> StepOutcome:
         """READY_FOR_MERGE -> MERGE only after the full pre-merge verification.
 
@@ -2318,7 +2359,135 @@ class ControllerEngine:
             )
         if not_ready:
             return self._block(phase, plan, f"{not_ready}. Nothing was merged or counted.")
+        # Last, because it executes the PR's own code: only a PR that every
+        # GitHub-side fact already accepts gets run on the operator's machine.
+        try:
+            unverified = self._local_verification_problem(phase, pr)
+        except VerificationError as exc:
+            return self._inconclusive(phase, plan, str(exc), cause=exc)
+        if unverified:
+            return self._block(phase, plan, f"{unverified}. Nothing was merged or counted.")
         return pr
+
+    def _local_verification_problem(self, phase: Phase, pr: PRInfo) -> str:
+        """Run ``merge.verification_commands`` on the reviewed commit, exported privately.
+
+        The hosted check ran the PR's own code, so nothing GitHub reports can
+        tell a weakened test suite from a passing one. These commands are the
+        controller's own evidence: the exact reviewed commit (``pr.head_sha``,
+        already proven equal to ``reviewed_head_sha``) is written out with
+        ``git read-tree`` + ``git checkout-index`` into a fresh temporary
+        directory -- never the operator's checkout, no worktree, no branch,
+        no ``.git`` inside -- and every command runs there in order, through
+        the normal executor (argv only, never a shell), under
+        ``execution.default_timeout_seconds``. The directory is deleted
+        afterwards whatever happened.
+
+        Returns a non-empty reason when a command failed or timed out (the
+        caller BLOCKS: re-running would not change the code). Raises
+        VerificationError when the commit cannot be materialised (not local
+        and not fetchable as ``refs/pull/<n>/head``, or the export itself
+        failed): that is inconclusive, and the caller bounds the re-checks.
+        A pass is persisted against the HEAD and the command list so MERGE
+        does not repeat what READY_FOR_MERGE already proved for the same
+        commit; a different HEAD or a different command list runs again.
+        Returns "" when nothing is configured.
+        """
+        argvs = [list(argv) for argv in self.config.merge.verification_commands]
+        if not argvs:
+            return ""
+        state = self._require_state()
+        if (
+            state.premerge_verified_head_sha == pr.head_sha
+            and state.premerge_verified_commands == argvs
+        ):
+            return ""
+        runner = self._runner or execute
+        repo = self.workdir
+        sha = pr.head_sha
+        if not commit_is_local(runner, repo, sha):
+            try:
+                fetch_pr_head(runner, repo, pr.number)
+            except VerificationError as exc:
+                raise VerificationError(
+                    f"the reviewed HEAD {sha[:12]} of PR {pr.url} is not in the local "
+                    f"repository and fetching refs/pull/{pr.number}/head failed: {exc}"
+                ) from exc
+            if not commit_is_local(runner, repo, sha):
+                raise VerificationError(
+                    f"the reviewed HEAD {sha[:12]} of PR {pr.url} is still not in the local "
+                    f"repository after fetching refs/pull/{pr.number}/head"
+                )
+        try:
+            with export_commit_tree(runner, repo, sha) as exported:
+                for argv in argvs:
+                    problem = self._run_premerge_command(phase, pr, argv, str(exported.root))
+                    if problem:
+                        return problem
+        except VerificationError as exc:
+            raise VerificationError(
+                f"the reviewed HEAD {sha[:12]} of PR {pr.url} could not be exported for "
+                f"merge.verification_commands: {exc}"
+            ) from exc
+        state.premerge_verified_head_sha = sha
+        state.premerge_verified_commands = argvs
+        self._save()
+        return ""
+
+    def _run_premerge_command(self, phase: Phase, pr: PRInfo, argv: list[str], cwd: str) -> str:
+        """One ``merge.verification_commands`` entry in the exported tree; "" on exit 0."""
+        state = self._require_state()
+        req = ExecutionRequest(
+            command=list(argv),
+            cwd=cwd,
+            timeout_seconds=self.config.execution.default_timeout_seconds,
+        )
+        result = (self._runner or execute)(req)
+        record = ExecutionRecord(
+            run_id=state.run_id,
+            seq=0,
+            phase=f"{phase.value}-premerge-verification",
+            attempt=state.attempt,
+            review_round=state.review_round,
+            profile="(controller pre-merge verification command)",
+            prompt_version=state.prompt_version,
+            command=list(argv),
+            cwd=cwd,
+            timeout_seconds=req.timeout_seconds,
+            started_at=result.started_at,
+            finished_at=result.finished_at,
+            exit_code=result.exit_code,
+            timed_out=result.timed_out,
+            metadata={
+                "verification_command": list(argv),
+                "pr_url": pr.url,
+                "head_sha": pr.head_sha,
+            },
+        )
+        if result.timed_out or result.exit_code != 0:
+            record.error = (
+                f"timed out after {req.timeout_seconds}s"
+                if result.timed_out
+                else f"exit {result.exit_code}"
+            )
+        self._logger().log_execution(record, "", result.stdout or "", result.stderr or "")
+        # The command line and its output both reach `block_reason` in plain
+        # `state.json`, so both are redacted here as well as on the log path.
+        shown = " ".join(redact_argv(list(argv)))
+        if result.timed_out:
+            return (
+                f"pre-merge verification command {shown!r} timed out after "
+                f"{req.timeout_seconds}s on the reviewed HEAD {pr.head_sha[:12]} of PR "
+                f"{pr.url}; the green check is not corroborated locally"
+            )
+        if result.exit_code != 0:
+            tail = redact((result.stderr or result.stdout or "").strip())[-2000:]
+            return (
+                f"pre-merge verification command {shown!r} failed with exit "
+                f"{result.exit_code} on the reviewed HEAD {pr.head_sha[:12]} of PR {pr.url}; "
+                f"the green check is not corroborated locally. Output tail: {tail}"
+            )
+        return ""
 
     def _head_drift_to_review(
         self, phase: Phase, plan: StepPlan, pr: PRInfo, detail: str = ""
@@ -2478,6 +2647,11 @@ class ControllerEngine:
             return f"PR {url} has failing or inconclusive checks: {', '.join(failed)}"
         if pending:
             raise VerificationError(f"PR {url} has checks still running: {', '.join(pending)}")
+        #    ... and the required ones came from the definition the base
+        #    branch has, not merely from a run that reported the same name.
+        redefined = self._check_definition_problem(pr)
+        if redefined:
+            return redefined
 
         # 3. mergeability as computed by GitHub
         if pr.mergeable == "CONFLICTING":
@@ -2567,6 +2741,162 @@ class ControllerEngine:
                 f"PR {pr.url}, so the controller cannot prove the PR leaves "
                 f"{', '.join(patterns)} untouched"
             )
+        return ""
+
+    def _check_definition_problem(self, pr: PRInfo) -> str:
+        """Refuse a required check whose green result came from another definition.
+
+        ``_protected_path_problem`` reads the PR's file list; this reads
+        GitHub's own record of *what ran*. Each ``safety.required_checks``
+        context must resolve, through its details URL, to exactly one GitHub
+        Actions run in this repository at the reviewed HEAD, and that run's
+        jobs and step names must equal those of the base branch's own most
+        recent successful ``push`` run of the same workflow at the base
+        branch's current tip. A workflow the PR redefined (also through a
+        reusable workflow or an action outside the protected paths), a
+        trimmed or extended job, a step whose command changed -- all are a
+        named difference and the PR is BLOCKED for a human. The comparison
+        is structural: it proves the same definition ran, not that the
+        commands it ran assert anything (see ``merge.verification_commands``).
+
+        Conclusive shortfalls (a context absent or duplicated in the rollup,
+        not an Actions run, a run at another commit or in another
+        repository, no base-branch run to compare against, a short job
+        or run listing) return a reason. A base-branch run still in progress raises
+        VerificationError (inconclusive); GitHubError from the reads
+        propagates for the caller to classify. Disabled by
+        ``safety.verify_check_definition: false`` or an empty
+        ``safety.required_checks``.
+        """
+        safety = self.config.safety
+        if not safety.verify_check_definition or not safety.required_checks:
+            return ""
+        state = self._require_state()
+        repository = state.repository
+        url = pr.url
+        if not pr.base_ref:
+            return f"PR {url} reports no base branch, so its checks have no reference definition"
+        base_tip = ""
+        references: dict[int, tuple[int, WorkflowRunJobs]] = {}
+        for context in safety.required_checks:
+            matches = [check for check in pr.checks if check.name == context]
+            if len(matches) != 1:
+                return (
+                    f"required check {context!r} appears {len(matches)} times in the status "
+                    f"rollup of PR {url}, so the controller cannot attribute one workflow run "
+                    "to it"
+                )
+            check = matches[0]
+            ref = check.actions_run
+            if ref is None:
+                return (
+                    f"required check {context!r} of PR {url} is not a GitHub Actions check "
+                    f"run (details URL: {check.details_url or 'none'}), so the controller "
+                    "cannot read back the workflow definition that produced it"
+                )
+            if ref.repository.lower() != repository.lower():
+                return (
+                    f"required check {context!r} of PR {url} was produced by a workflow run "
+                    f"in {ref.repository}, not in {repository}"
+                )
+            with self._reading(f"workflow run {ref.run_id} behind required check {context!r}"):
+                run = self.github.get_workflow_run(ref.repository, ref.run_id)
+            if run.repository.lower() != repository.lower():
+                return (
+                    f"workflow run {run.id} behind required check {context!r} of PR {url} "
+                    f"belongs to {run.repository}, not to {repository}"
+                )
+            if run.head_sha != pr.head_sha:
+                return (
+                    f"workflow run {run.id} behind required check {context!r} of PR {url} ran "
+                    f"at {run.head_sha[:12]}, not at the reviewed HEAD {pr.head_sha[:12]}"
+                )
+            if not run.completed:
+                raise VerificationError(
+                    f"workflow run {run.id} behind required check {context!r} of PR {url} is "
+                    f"{run.status}, not completed"
+                )
+            with self._reading(f"the jobs of workflow run {run.id}"):
+                pr_jobs = self.github.get_workflow_run_jobs(ref.repository, run.id)
+            if not pr_jobs.complete:
+                return (
+                    f"GitHub returned {len(pr_jobs.jobs)} of {pr_jobs.total} jobs of workflow "
+                    f"run {run.id} behind required check {context!r} of PR {url}, so its "
+                    "definition cannot be compared"
+                )
+            if not base_tip:
+                with self._reading(f"the head of base branch {pr.base_ref!r}"):
+                    base_tip = self.github.get_branch_head_sha(repository, pr.base_ref)
+            cached = references.get(run.workflow_id)
+            if cached is None:
+                with self._reading(f"the base branch's runs of {run.path}"):
+                    runs = self.github.find_workflow_runs(
+                        repository,
+                        run.workflow_id,
+                        branch=pr.base_ref,
+                        event="push",
+                        head_sha=base_tip,
+                    )
+                if not runs.complete:
+                    return (
+                        f"GitHub returned {len(runs.runs)} of {runs.total} push runs of "
+                        f"{run.path} on base branch {pr.base_ref!r} at {base_tip[:12]}, so the "
+                        f"reference definition for required check {context!r} of PR {url} "
+                        "cannot be chosen"
+                    )
+                # The filter is GitHub's; the facts are re-checked on what
+                # came back rather than trusted from the query string.
+                candidates = [
+                    candidate
+                    for candidate in runs.runs
+                    if candidate.workflow_id == run.workflow_id
+                    and candidate.head_sha == base_tip
+                    and candidate.head_branch == pr.base_ref
+                    and candidate.event == "push"
+                    and candidate.repository.lower() == repository.lower()
+                ]
+                if not candidates:
+                    return (
+                        f"base branch {pr.base_ref!r} has no push run of {run.path} at its "
+                        f"current tip {base_tip[:12]}, so there is no reference definition to "
+                        f"compare required check {context!r} of PR {url} against. The "
+                        "workflow must run on pushes to the base branch (or disable "
+                        "safety.verify_check_definition)"
+                    )
+                running = [candidate for candidate in candidates if not candidate.completed]
+                if running:
+                    raise VerificationError(
+                        f"the base branch's own run {running[0].id} of {run.path} at "
+                        f"{base_tip[:12]} is still {running[0].status}"
+                    )
+                reference = max(candidates, key=lambda c: (c.id, c.run_attempt))
+                if reference.conclusion != "success":
+                    return (
+                        f"the base branch's own run {reference.id} of {run.path} at "
+                        f"{base_tip[:12]} concluded {reference.conclusion!r}, not success, so "
+                        "it cannot serve as the reference definition for required check "
+                        f"{context!r} of PR {url}; make {pr.base_ref!r} green first"
+                    )
+                with self._reading(f"the jobs of the base branch's workflow run {reference.id}"):
+                    base_jobs = self.github.get_workflow_run_jobs(repository, reference.id)
+                if not base_jobs.complete:
+                    return (
+                        f"GitHub returned {len(base_jobs.jobs)} of {base_jobs.total} jobs of "
+                        f"the base branch's run {reference.id} of {run.path}, so the reference "
+                        "definition is incomplete"
+                    )
+                cached = (reference.id, base_jobs)
+                references[run.workflow_id] = cached
+            reference_id, base_jobs = cached
+            difference = describe_definition_difference(pr_jobs, base_jobs)
+            if difference:
+                return (
+                    f"workflow run {run.id} behind required check {context!r} of PR {url} "
+                    f"does not match the base branch's own run {reference_id} of {run.path} "
+                    f"at {base_tip[:12]}: {difference}. A green check produced by a different "
+                    "definition is not the check the merge gate trusts; review and merge "
+                    "manually, or disable safety.verify_check_definition"
+                )
         return ""
 
     def _disarm_async_merge(self, url: str, after: PRInfo) -> tuple[str, bool]:

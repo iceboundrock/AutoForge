@@ -463,6 +463,14 @@ Verify:
 - PR remains open
 - PR is mergeable
 - required checks pass
+- each required check's run has the same jobs and steps as the base branch's
+  own run of that workflow (`safety.verify_check_definition`): a green check
+  is produced by the PR's copy of the workflow, so its name alone proves only
+  that whatever the PR defined passed
+- every `merge.verification_commands` command passes in a temporary export of
+  the reviewed HEAD, run by the controller itself after the GitHub-side facts
+  above; a hosted check runs the PR's own code and cannot say what the PR's
+  tests still assert
 - latest clean review applies to current HEAD
 
 ### After MERGE

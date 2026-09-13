@@ -9,7 +9,6 @@ from autoforge import cli
 from autoforge.engine import ControllerEngine
 from autoforge.errors import LockError
 from autoforge.executor import ExecutionResult
-from autoforge.github import CheckInfo
 from autoforge.locking import ControllerLock, repository_lock_path
 from autoforge.providers import ProviderRegistry, ScriptedProvider
 from autoforge.state import AutoForgeState, load_state, quarantine_state_file, save_state
@@ -22,6 +21,7 @@ from tests.conftest import (
     SHA_A,
     FakeGitHub,
     block,
+    ci_check,
     comment_url,
     git_repo,
     review_comment_body,
@@ -314,10 +314,10 @@ def test_resume_with_gate_open_merges_via_controller_to_done(tmp_path, capsys, m
         cli.main(["--config", cfg, "--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE]) == 0
     )
     capsys.readouterr()
-    gh.prs[PR].checks = [CheckInfo(name="ci", state="IN_PROGRESS")]
+    gh.prs[PR].checks = [ci_check(state="IN_PROGRESS", conclusion="")]
     assert cli.main(["--config", cfg, "--state-dir", sd, "resume", "--allow-merge"]) == 1
     assert "still running: ci" in capsys.readouterr().err
-    gh.prs[PR].checks = [CheckInfo(name="ci", state="COMPLETED", conclusion="SUCCESS")]
+    gh.prs[PR].checks = [ci_check()]
 
     # --max-steps 1 exhausts the budget in MERGE: banner is not the "disabled" one
     assert (

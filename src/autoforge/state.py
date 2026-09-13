@@ -265,6 +265,12 @@ class AutoForgeState:
     # absorbed into the feature's implementation.
     baseline_dirty_paths: list[str] = field(default_factory=list)
 
+    # The HEAD (and the exact command list) that ``merge.verification_commands``
+    # last passed on, so MERGE does not repeat what READY_FOR_MERGE proved
+    # for the same commit. Either differing means the commands run again.
+    premerge_verified_head_sha: str = ""
+    premerge_verified_commands: list[list[str]] = field(default_factory=list)
+
     merged_since_epic_update: int = 0
     counted_merged_prs: list[str] = field(default_factory=list)
     # Reasons the controller rejected the UPDATE_EPIC agent's next_issue_url
@@ -437,6 +443,13 @@ class AutoForgeState:
             isinstance(url, str) for url in state.counted_merged_prs
         ):
             raise StateError("state field 'counted_merged_prs' must be a list of strings")
+        if not isinstance(state.premerge_verified_commands, list) or not all(
+            isinstance(argv, list) and all(isinstance(arg, str) for arg in argv)
+            for argv in state.premerge_verified_commands
+        ):
+            raise StateError(
+                "state field 'premerge_verified_commands' must be a list of string lists"
+            )
         if not isinstance(state.open_findings, list) or not all(
             isinstance(finding, dict) for finding in state.open_findings
         ):
@@ -511,6 +524,8 @@ class AutoForgeState:
         self.last_fix_resolutions = []
         self.review_history = []
         self.verification_failures = []
+        self.premerge_verified_head_sha = ""
+        self.premerge_verified_commands = []
         self.execution_attempt = 1
         self.escalation_count = 0
         self.superseded_prs = []

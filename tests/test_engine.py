@@ -1,7 +1,10 @@
 """Engine: verification of agent claims, SHA binding, routing, recovery, gate."""
 
 import json
+import os
 import re
+import subprocess
+from dataclasses import replace
 
 import pytest
 
@@ -15,23 +18,37 @@ from autoforge.errors import (
     VerificationError,
 )
 from autoforge.executor import ExecutionResult
-from autoforge.github import ChangedFile, CheckInfo, GitHubClient, MergeQueueStatus
+from autoforge.github import (
+    ChangedFile,
+    CheckInfo,
+    GitHubClient,
+    MergeQueueStatus,
+    WorkflowJob,
+    WorkflowRunJobs,
+)
 from autoforge.loop_guard import RESULT_NEEDS_FIX, review_record
 from autoforge.providers import AgentExecutionResult, ScriptedProvider
 from autoforge.state import load_state
 from autoforge.transitions import Phase
 from tests.conftest import (
+    BASE_RUN_ID,
     BRANCH,
+    CI_RUN_ID,
+    CI_WORKFLOW_ID,
     EPIC,
     ISSUE,
     ISSUE3,
+    MAIN_SHA,
     PR,
     SHA_A,
     SHA_B,
     SHA_C,
     FakeGitHub,
     block,
+    ci_check,
+    ci_jobs,
     comment_url,
+    git_repo,
     make_engine,
     review_comment_body,
 )
@@ -975,7 +992,7 @@ def test_merge_unknown_mergeability_stays_in_merge_for_resume(tmp_state_dir, fak
 @pytest.mark.parametrize(
     "check",
     [
-        CheckInfo(name="ci", state="COMPLETED", conclusion="FAILURE"),
+        ci_check(conclusion="FAILURE"),
         CheckInfo(name="ci", state="COMPLETED", conclusion="CANCELLED"),
         CheckInfo(name="ci", state="COMPLETED", conclusion="TIMED_OUT"),
         CheckInfo(name="ci", state="FAILURE"),  # legacy commit status
@@ -996,8 +1013,8 @@ def test_merge_blocks_on_failing_or_unknown_check(tmp_state_dir, fake_github, ch
 @pytest.mark.parametrize(
     "check",
     [
-        CheckInfo(name="ci", state="IN_PROGRESS"),
-        CheckInfo(name="ci", state="QUEUED"),
+        ci_check(state="IN_PROGRESS", conclusion=""),
+        ci_check(state="QUEUED", conclusion=""),
         CheckInfo(name="ci", state="PENDING"),  # legacy commit status
     ],
 )
@@ -1007,13 +1024,13 @@ def test_merge_waits_for_pending_checks_without_merging(tmp_state_dir, fake_gith
     with pytest.raises(VerificationError, match="still running: ci"):
         eng.step(allow_merge=True)
     assert eng.state.phase == Phase.MERGE and fake_github.merges == []
-    fake_github.prs[PR].checks = [CheckInfo(name="ci", state="COMPLETED", conclusion="SUCCESS")]
+    fake_github.prs[PR].checks = [ci_check()]
     assert eng.step(allow_merge=True).next_phase == "UPDATE_EPIC"
 
 
 def test_merge_with_all_checks_green_proceeds(tmp_state_dir, fake_github):
     fake_github.add_pr().checks = [
-        CheckInfo(name="ci", state="COMPLETED", conclusion="SUCCESS"),
+        ci_check(),
         CheckInfo(name="docs", state="COMPLETED", conclusion="SKIPPED"),
         CheckInfo(name="legacy", state="SUCCESS"),
     ]
@@ -1062,7 +1079,7 @@ WORKFLOW_PATH = ".github/workflows/ci.yml"
 def test_merge_blocks_when_the_pr_changes_the_workflow_defining_its_checks(
     tmp_state_dir, fake_github, phase
 ):
-    fake_github.add_pr().checks = [CheckInfo(name="ci", state="COMPLETED", conclusion="SUCCESS")]
+    fake_github.add_pr().checks = [ci_check()]
     fake_github.changed_files[PR] = ["README.md", WORKFLOW_PATH]
     eng = _in_merge(tmp_state_dir, fake_github, phase=phase)
     out = eng.step(allow_merge=True)
@@ -1097,7 +1114,7 @@ def test_merge_blocks_when_the_pr_renames_a_protected_path(
     `.github/workflows/ci.yml` elsewhere would read as touching nothing
     protected while removing the very file that defines the check.
     """
-    fake_github.add_pr().checks = [CheckInfo(name="ci", state="COMPLETED", conclusion="SUCCESS")]
+    fake_github.add_pr().checks = [ci_check()]
     fake_github.changed_files[PR] = [ChangedFile(path=path, previous_path=previous)]
     eng, out = _park_and_step(tmp_state_dir, fake_github)
     assert out.next_phase == "BLOCKED"
@@ -1128,7 +1145,7 @@ def test_merge_blocks_on_a_protected_path_past_the_first_page(tmp_state_dir, fak
     The protected file sits after the first 100 entries: a complete listing
     blocks for the *path*, not for a listing the controller could not read.
     """
-    fake_github.add_pr().checks = [CheckInfo(name="ci", state="COMPLETED", conclusion="SUCCESS")]
+    fake_github.add_pr().checks = [ci_check()]
     files = [f"src/pkg/module_{i}.py" for i in range(120)] + [WORKFLOW_PATH]
     fake_github.changed_files[PR] = files
     fake_github.changed_files_total[PR] = len(files)
@@ -1174,10 +1191,431 @@ def test_empty_protected_merge_paths_disables_the_gate_and_reads_nothing(
 
 def test_protected_path_gate_runs_before_check_state_is_consulted(tmp_state_dir, fake_github):
     """A still-running check would only park the run; the redefinition is conclusive."""
-    fake_github.add_pr().checks = [CheckInfo(name="ci", state="IN_PROGRESS")]
+    fake_github.add_pr().checks = [ci_check(state="IN_PROGRESS", conclusion="")]
     fake_github.changed_files[PR] = [WORKFLOW_PATH]
     eng, out = _park_and_step(tmp_state_dir, fake_github)
     assert out.next_phase == "BLOCKED" and WORKFLOW_PATH in eng.state.block_reason
+
+
+# -- MERGE: the definition behind a green required check (#42, option 2) -------------------
+def _actions_calls(gh):
+    return [
+        c
+        for c in gh.calls
+        if c[0]
+        in (
+            "get_workflow_run",
+            "get_workflow_run_jobs",
+            "get_branch_head_sha",
+            "find_workflow_runs",
+        )
+    ]
+
+
+def test_merge_compares_the_pr_run_with_the_base_branch_run(tmp_state_dir, fake_github):
+    """The green `ci` is attributed to its run, and that run's shape to the base branch's."""
+    fake_github.add_pr()
+    eng, out = _park_and_step(tmp_state_dir, fake_github)
+    assert out.next_phase == "UPDATE_EPIC" and len(fake_github.merges) == 1
+    assert _actions_calls(fake_github) == [
+        ("get_workflow_run", "owner/repo", CI_RUN_ID),
+        ("get_workflow_run_jobs", "owner/repo", CI_RUN_ID),
+        ("get_branch_head_sha", "owner/repo", "main"),
+        ("find_workflow_runs", "owner/repo", CI_WORKFLOW_ID, "main", "push", MAIN_SHA),
+        ("get_workflow_run_jobs", "owner/repo", BASE_RUN_ID),
+    ]
+
+
+def _with_step(jobs, job, step, new):
+    """``jobs`` with one step of one job renamed (a `run:` whose command changed)."""
+    return WorkflowRunJobs(
+        jobs=tuple(
+            WorkflowJob(j.name, tuple(new if s == step else s for s in j.steps))
+            if j.name == job
+            else j
+            for j in jobs.jobs
+        ),
+        total=jobs.total,
+    )
+
+
+def test_merge_blocks_when_the_pr_run_differs_from_the_base_branch_run(tmp_state_dir, fake_github):
+    """A `ci` produced by a redefined workflow is a named difference, not a green check."""
+    fake_github.add_pr()
+    fake_github.workflow_jobs[CI_RUN_ID] = _with_step(
+        ci_jobs(), "test (3.11)", "Run pytest", "Run pytest -k smoke"
+    )
+    eng, out = _park_and_step(tmp_state_dir, fake_github)
+    assert out.next_phase == "BLOCKED" and fake_github.merges == []
+    reason = eng.state.block_reason
+    assert f"workflow run {CI_RUN_ID} behind required check 'ci'" in reason
+    assert f"base branch's own run {BASE_RUN_ID} of .github/workflows/ci.yml" in reason
+    assert "job 'test (3.11)' step 3 is 'Run pytest -k smoke'" in reason
+    assert "safety.verify_check_definition" in reason
+
+
+def test_merge_blocks_when_the_pr_run_lost_a_job(tmp_state_dir, fake_github):
+    kept = ci_jobs()
+    fake_github.workflow_jobs[CI_RUN_ID] = WorkflowRunJobs(
+        jobs=tuple(j for j in kept.jobs if j.name != "lint"), total=kept.total - 1
+    )
+    fake_github.add_pr()
+    eng, out = _park_and_step(tmp_state_dir, fake_github)
+    assert out.next_phase == "BLOCKED"
+    assert "job 'lint' of the base branch's run is missing" in eng.state.block_reason
+
+
+def test_definition_gate_ignores_job_order(tmp_state_dir, fake_github):
+    kept = ci_jobs()
+    fake_github.workflow_jobs[CI_RUN_ID] = WorkflowRunJobs(
+        jobs=tuple(reversed(kept.jobs)), total=kept.total
+    )
+    fake_github.add_pr()
+    _, out = _park_and_step(tmp_state_dir, fake_github)
+    assert out.next_phase == "UPDATE_EPIC"
+
+
+@pytest.mark.parametrize(
+    ("prepare", "expected"),
+    [
+        (lambda gh: setattr(gh.prs[PR], "checks", []), "appears 0 times"),
+        (lambda gh: setattr(gh.prs[PR], "checks", [ci_check(), ci_check()]), "appears 2 times"),
+        (
+            lambda gh: setattr(gh.prs[PR], "checks", [CheckInfo("ci", "COMPLETED", "SUCCESS")]),
+            "not a GitHub Actions check run",
+        ),
+        (
+            lambda gh: setattr(
+                gh.prs[PR],
+                "checks",
+                [replace(ci_check(), details_url="https://ci.example/build/9")],
+            ),
+            "not a GitHub Actions check run (details URL: https://ci.example/build/9)",
+        ),
+        (
+            lambda gh: setattr(gh.prs[PR], "checks", [ci_check(repo="other/repo")]),
+            "workflow run in other/repo, not in owner/repo",
+        ),
+        (
+            lambda gh: gh.workflow_runs.__setitem__(
+                CI_RUN_ID, replace(gh.workflow_runs[CI_RUN_ID], head_sha=SHA_B)
+            ),
+            f"ran at {SHA_B[:12]}, not at the reviewed HEAD {SHA_A[:12]}",
+        ),
+        (
+            lambda gh: gh.workflow_jobs.__setitem__(
+                CI_RUN_ID, replace(ci_jobs(), total=ci_jobs().total + 1)
+            ),
+            "returned 4 of 5 jobs",
+        ),
+        (lambda gh: gh.branch_heads.__setitem__("main", SHA_C), "has no push run"),
+        (
+            lambda gh: setattr(gh, "workflow_runs_unlisted", 100),
+            "returned 1 of 101 push runs of .github/workflows/ci.yml on base branch 'main'",
+        ),
+        (
+            lambda gh: gh.workflow_runs.__setitem__(
+                BASE_RUN_ID, replace(gh.workflow_runs[BASE_RUN_ID], conclusion="failure")
+            ),
+            "concluded 'failure', not success",
+        ),
+        (
+            lambda gh: gh.workflow_jobs.__setitem__(
+                BASE_RUN_ID, replace(ci_jobs(), total=ci_jobs().total + 2)
+            ),
+            "returned 4 of 6 jobs of the base branch's run",
+        ),
+        (lambda gh: setattr(gh.prs[PR], "base_ref", ""), "reports no base branch"),
+    ],
+)
+def test_definition_gate_conclusive_shortfalls_block(tmp_state_dir, fake_github, prepare, expected):
+    fake_github.add_pr()
+    prepare(fake_github)
+    eng, out = _park_and_step(tmp_state_dir, fake_github)
+    assert out.next_phase == "BLOCKED", eng.state.block_reason
+    assert expected in eng.state.block_reason and fake_github.merges == []
+
+
+def test_definition_gate_base_run_still_running_is_inconclusive(tmp_state_dir, fake_github):
+    fake_github.add_pr()
+    base = fake_github.workflow_runs[BASE_RUN_ID]
+    fake_github.workflow_runs[BASE_RUN_ID] = replace(base, status="in_progress", conclusion="")
+    eng = _in_merge(tmp_state_dir, fake_github)
+    with pytest.raises(VerificationError, match="still in_progress"):
+        eng.step(allow_merge=True)
+    assert eng.state.phase == Phase.MERGE and eng.state.attempt == 1
+    fake_github.workflow_runs[BASE_RUN_ID] = base
+    assert eng.step(allow_merge=True).next_phase == "UPDATE_EPIC"
+
+
+def test_definition_gate_pr_run_not_completed_is_inconclusive(tmp_state_dir, fake_github):
+    """The rollup says COMPLETED but the run object does not: re-read, never guessed."""
+    fake_github.add_pr()
+    run = fake_github.workflow_runs[CI_RUN_ID]
+    fake_github.workflow_runs[CI_RUN_ID] = replace(run, status="in_progress", conclusion="")
+    eng = _in_merge(tmp_state_dir, fake_github)
+    with pytest.raises(VerificationError, match="is in_progress, not completed"):
+        eng.step(allow_merge=True)
+    assert eng.state.phase == Phase.MERGE and fake_github.merges == []
+
+
+def test_definition_gate_transient_read_failure_is_inconclusive(tmp_state_dir, fake_github):
+    fake_github.add_pr()
+    fake_github.actions_error = GitHubUnavailableError("HTTP 502: Bad Gateway")
+    eng = _in_merge(tmp_state_dir, fake_github)
+    with pytest.raises(VerificationError, match="GitHub unavailable") as info:
+        eng.step(allow_merge=True)
+    assert "workflow run 1001 behind required check 'ci' could not be read" in str(info.value)
+    assert eng.state.phase == Phase.MERGE and eng.state.attempt == 1
+    fake_github.actions_error = ""
+    assert eng.step(allow_merge=True).next_phase == "UPDATE_EPIC"
+
+
+def test_definition_gate_conclusive_read_failure_blocks(tmp_state_dir, fake_github):
+    fake_github.add_pr()
+    fake_github.actions_error = "HTTP 403: Resource not accessible by integration"
+    eng, out = _park_and_step(tmp_state_dir, fake_github)
+    assert out.next_phase == "BLOCKED" and "HTTP 403" in eng.state.block_reason
+    assert fake_github.merges == []
+
+
+def test_definition_gate_disabled_reads_nothing(tmp_state_dir, fake_github):
+    fake_github.add_pr()
+    fake_github.workflow_jobs[CI_RUN_ID] = WorkflowRunJobs(jobs=(), total=0)  # would block
+    eng = _in_merge(tmp_state_dir, fake_github)
+    eng.config.safety.verify_check_definition = False
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "UPDATE_EPIC" and _actions_calls(fake_github) == []
+
+
+def test_definition_gate_without_required_checks_reads_nothing(tmp_state_dir, fake_github):
+    fake_github.add_pr()
+    fake_github.workflow_jobs[CI_RUN_ID] = WorkflowRunJobs(jobs=(), total=0)
+    eng = _in_merge(tmp_state_dir, fake_github)
+    eng.config.safety.required_checks = []
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "UPDATE_EPIC" and _actions_calls(fake_github) == []
+
+
+def test_definition_gate_only_covers_required_checks(tmp_state_dir, fake_github):
+    """An extra green check without an Actions run is still "every check succeeded"."""
+    fake_github.add_pr().checks = [ci_check(), CheckInfo("legacy", "SUCCESS")]
+    _, out = _park_and_step(tmp_state_dir, fake_github)
+    assert out.next_phase == "UPDATE_EPIC"
+
+
+def test_definition_gate_reads_one_reference_per_workflow(tmp_state_dir, fake_github):
+    fake_github.add_pr().checks = [ci_check(), ci_check(name="lint")]
+    eng = _in_merge(tmp_state_dir, fake_github)
+    eng.config.safety.required_checks = ["ci", "lint"]
+    assert eng.step(allow_merge=True).next_phase == "UPDATE_EPIC"
+    calls = _actions_calls(fake_github)
+    assert calls.count(("get_workflow_run_jobs", "owner/repo", BASE_RUN_ID)) == 1
+    assert calls.count(("get_workflow_run", "owner/repo", CI_RUN_ID)) == 2
+
+
+def test_definition_gate_runs_after_check_state_and_before_mergeability(tmp_state_dir, fake_github):
+    # a failing check is conclusive on its own: no Actions read is made
+    fake_github.add_pr().checks = [ci_check(conclusion="FAILURE")]
+    eng, out = _park_and_step(tmp_state_dir, fake_github)
+    assert out.next_phase == "BLOCKED" and _actions_calls(fake_github) == []
+    # a redefinition is conclusive even while mergeability is still UNKNOWN
+    gh = FakeGitHub()
+    gh.add_pr().mergeable = "UNKNOWN"
+    gh.workflow_jobs[CI_RUN_ID] = WorkflowRunJobs(jobs=(), total=0)
+    eng, out = _park_and_step(tmp_state_dir / "b", gh)
+    assert out.next_phase == "BLOCKED" and "does not match" in eng.state.block_reason
+
+
+def test_ready_for_merge_runs_the_definition_gate_too(tmp_state_dir, fake_github):
+    fake_github.add_pr()
+    fake_github.workflow_jobs[CI_RUN_ID] = WorkflowRunJobs(jobs=(), total=0)
+    eng = _in_ready(tmp_state_dir, fake_github)
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "BLOCKED" and "does not match" in eng.state.block_reason
+
+
+# -- MERGE: merge.verification_commands on the exported reviewed HEAD (#42, option 1) --------
+def _git(repo, *args):
+    return subprocess.run(
+        ["git", "-C", str(repo), *args], check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def _commit(repo, name, content, message="c"):
+    (repo / name).write_text(content)
+    _git(repo, "add", name)
+    _git(repo, "-c", "user.name=t", "-c", "user.email=t@x", "commit", "-q", "-m", message)
+    return _git(repo, "rev-parse", "HEAD")
+
+
+_RECORD_CWD = (
+    "import os, pathlib, sys; "
+    "pathlib.Path(sys.argv[1]).open('a').write(os.getcwd() + '\\n'); "
+    "sys.exit(0 if pathlib.Path('proof.txt').read_text() == sys.argv[2] else 3)"
+)
+
+
+def _record_cwd(marker, expected="v1\n"):
+    """A verification command proving *where* it ran and *which* content it saw."""
+    return ["python3", "-c", _RECORD_CWD, str(marker), expected]
+
+
+def _in_merge_on_commit(tmp_state_dir, gh, commands, phase=Phase.MERGE, content="v1\n"):
+    """Engine parked with the gate open on a PR whose HEAD is a real local commit."""
+    repo = git_repo(tmp_state_dir.parent)
+    sha = _commit(repo, "proof.txt", content)
+    _commit(repo, "later.txt", "not the reviewed commit\n")  # HEAD moved on; the PR did not
+    gh.add_pr(head_sha=sha)
+    eng = _in_merge(tmp_state_dir, gh, reviewed=sha, phase=phase)
+    eng.config.merge.verification_commands = commands
+    return eng, sha
+
+
+def test_verification_commands_run_in_an_export_of_the_reviewed_head(tmp_state_dir, fake_github):
+    marker = tmp_state_dir.parent / "cwd.txt"
+    eng, sha = _in_merge_on_commit(tmp_state_dir, fake_github, [_record_cwd(marker)])
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "UPDATE_EPIC" and len(fake_github.merges) == 1
+    cwds = marker.read_text().splitlines()
+    assert len(cwds) == 1
+    exported = cwds[0]
+    assert not exported.startswith(str(tmp_state_dir.parent))  # never the operator's checkout
+    assert "autoforge-premerge-" in exported
+    assert not os.path.exists(exported)  # deleted afterwards
+    assert eng.state.premerge_verified_head_sha == sha
+    assert eng.state.premerge_verified_commands == [_record_cwd(marker)]
+    # The operator's checkout was not touched: no worktree, no branch, HEAD where it was.
+    assert _git(tmp_state_dir.parent, "worktree", "list").count("\n") == 0
+    assert _git(tmp_state_dir.parent, "branch", "--list").count("\n") == 0
+    assert _git(tmp_state_dir.parent, "rev-parse", "HEAD") != sha
+    # ... and the run is journaled like a validation command.
+    run_dir = eng.paths.logs_dir / eng.state.run_id
+    steps = [p.name for p in run_dir.iterdir() if p.is_dir()]
+    assert any("merge-premerge-verification" in name for name in steps)
+
+
+def test_failing_verification_command_blocks_the_merge(tmp_state_dir, fake_github):
+    marker = tmp_state_dir.parent / "cwd.txt"
+    commands = [_record_cwd(marker), ["python3", "-c", "import sys; sys.exit(1)"]]
+    eng, sha = _in_merge_on_commit(tmp_state_dir, fake_github, commands, content="v2\n")
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "BLOCKED" and fake_github.merges == []
+    reason = eng.state.block_reason
+    assert "pre-merge verification command" in reason and "failed with exit 3" in reason
+    assert f"reviewed HEAD {sha[:12]}" in reason and "not corroborated locally" in reason
+    assert len(marker.read_text().splitlines()) == 1  # the second command never ran
+    assert eng.state.premerge_verified_head_sha == ""
+
+
+def test_verification_command_timeout_blocks_the_merge(tmp_state_dir, fake_github):
+    commands = [["python3", "-c", "import time; time.sleep(30)"]]
+    eng, _ = _in_merge_on_commit(tmp_state_dir, fake_github, commands)
+    eng.config.execution.default_timeout_seconds = 1
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "BLOCKED" and "timed out after 1s" in eng.state.block_reason
+    assert fake_github.merges == []
+
+
+def test_verification_commands_never_run_before_github_accepts_the_pr(tmp_state_dir, fake_github):
+    """They execute the PR's code, so every GitHub-side fact is checked first."""
+    marker = tmp_state_dir.parent / "cwd.txt"
+    eng, _ = _in_merge_on_commit(tmp_state_dir, fake_github, [_record_cwd(marker)])
+    fake_github.prs[PR].checks = [ci_check(conclusion="FAILURE")]
+    assert eng.step(allow_merge=True).next_phase == "BLOCKED"
+    assert not marker.exists()
+
+
+def test_verification_commands_do_not_run_in_dry_run(tmp_state_dir, fake_github):
+    marker = tmp_state_dir.parent / "cwd.txt"
+    eng, _ = _in_merge_on_commit(tmp_state_dir, fake_github, [_record_cwd(marker)])
+    plan = eng.step(dry_run=True).plan
+    assert any("merge.verification_commands" in n and "python3 -c" in n for n in plan.notes)
+    assert any("safety.verify_check_definition" in n for n in plan.notes)
+    assert not marker.exists() and fake_github.merges == []
+
+
+def test_dry_run_names_the_absence_of_verification_commands(tmp_state_dir, fake_github):
+    fake_github.add_pr()
+    eng = _in_ready(tmp_state_dir, fake_github)
+    plan = eng.step(dry_run=True).plan
+    assert any("no merge.verification_commands configured" in n for n in plan.notes)
+
+
+def test_verification_pass_is_not_repeated_for_the_same_head(tmp_state_dir, fake_github):
+    marker = tmp_state_dir.parent / "cwd.txt"
+    eng, sha = _in_merge_on_commit(
+        tmp_state_dir, fake_github, [_record_cwd(marker)], phase=Phase.READY_FOR_MERGE
+    )
+    assert eng.step(allow_merge=True).next_phase == "MERGE"
+    assert load_state(eng.paths.state_file).premerge_verified_head_sha == sha
+    assert eng.step(allow_merge=True).next_phase == "UPDATE_EPIC"
+    assert len(marker.read_text().splitlines()) == 1  # READY_FOR_MERGE's pass carried over
+
+
+def test_verification_reruns_when_the_command_list_changes(tmp_state_dir, fake_github):
+    marker = tmp_state_dir.parent / "cwd.txt"
+    eng, sha = _in_merge_on_commit(
+        tmp_state_dir, fake_github, [_record_cwd(marker)], phase=Phase.READY_FOR_MERGE
+    )
+    assert eng.step(allow_merge=True).next_phase == "MERGE"
+    eng.config.merge.verification_commands = [_record_cwd(marker), ["true"]]
+    assert eng.step(allow_merge=True).next_phase == "UPDATE_EPIC"
+    assert len(marker.read_text().splitlines()) == 2
+
+
+def test_verification_pass_does_not_survive_a_new_issue(tmp_state_dir, fake_github):
+    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    eng.state.premerge_verified_head_sha = SHA_A
+    eng.state.premerge_verified_commands = [["true"]]
+    eng.state.reset_for_new_issue(ISSUE3)
+    assert eng.state.premerge_verified_head_sha == ""
+    assert eng.state.premerge_verified_commands == []
+
+
+def test_unreachable_reviewed_head_is_inconclusive_not_blocked(tmp_state_dir, fake_github):
+    """No local commit and no `origin`: bounded re-check, the code is never guessed at."""
+    git_repo(tmp_state_dir.parent)
+    fake_github.add_pr(head_sha=SHA_A)
+    eng = _in_merge(tmp_state_dir, fake_github)
+    eng.config.merge.verification_commands = [["true"]]
+    with pytest.raises(VerificationError, match="not in the local repository") as info:
+        eng.step(allow_merge=True)
+    assert "refs/pull/42/head" in str(info.value)
+    assert eng.state.phase == Phase.MERGE and eng.state.attempt == 1
+    assert fake_github.merges == []
+
+
+def test_reviewed_head_is_fetched_from_the_pull_ref_when_not_local(tmp_state_dir, fake_github):
+    origin = git_repo(tmp_state_dir.parent / "origin")
+    base = _commit(origin, "base.txt", "base\n")
+    sha = _commit(origin, "proof.txt", "v1\n")
+    _git(origin, "update-ref", "refs/pull/42/head", sha)
+    _git(origin, "reset", "-q", "--hard", base)
+    local = git_repo(tmp_state_dir.parent)
+    _git(local, "remote", "add", "origin", str(origin))
+    _git(local, "fetch", "-q", "origin", "HEAD")
+    marker = tmp_state_dir.parent / "cwd.txt"
+    fake_github.add_pr(head_sha=sha)
+    eng = _in_merge(tmp_state_dir, fake_github, reviewed=sha)
+    eng.config.merge.verification_commands = [_record_cwd(marker)]
+    assert eng.step(allow_merge=True).next_phase == "UPDATE_EPIC"
+    assert len(marker.read_text().splitlines()) == 1
+    assert "refs/pull" not in _git(local, "for-each-ref", "--format=%(refname)")
+
+
+def test_no_verification_commands_means_no_git_plumbing(tmp_state_dir, fake_github):
+    fake_github.add_pr()
+    eng = _in_merge(tmp_state_dir, fake_github)
+    seen = []
+
+    def runner(req):
+        seen.append(req.command)
+        return ExecutionResult(req.command, req.cwd, 0, "", "", "t", "t")
+
+    eng._runner = runner
+    assert eng.step(allow_merge=True).next_phase == "UPDATE_EPIC"
+    assert seen == []
 
 
 # -- MERGE: asynchronous merge paths (PR #24 review R1-F2) -----------------------------------
@@ -1367,7 +1805,7 @@ def test_ready_for_merge_already_merged_pr_routes_to_merge_for_reconciliation(
 def test_ready_for_merge_conflicting_pr_blocks_and_never_enters_merge(tmp_state_dir, fake_github):
     pr = fake_github.add_pr(head_sha=SHA_A)
     pr.mergeable = "CONFLICTING"
-    pr.checks = [CheckInfo(name="ci", state="COMPLETED", conclusion="FAILURE")]
+    pr.checks = [ci_check(conclusion="FAILURE")]
     eng = _in_ready(tmp_state_dir, fake_github)
     out = eng.step(allow_merge=True)
     assert out.next_phase == "BLOCKED"
@@ -1384,9 +1822,7 @@ def test_ready_for_merge_conflicting_pr_blocks_and_never_enters_merge(tmp_state_
         (lambda pr: setattr(pr, "merge_state_status", "BLOCKED"), "mergeStateStatus=BLOCKED"),
         (lambda pr: setattr(pr, "auto_merge_enabled", True), "auto-merge armed"),
         (
-            lambda pr: setattr(
-                pr, "checks", [CheckInfo(name="ci", state="COMPLETED", conclusion="FAILURE")]
-            ),
+            lambda pr: setattr(pr, "checks", [ci_check(conclusion="FAILURE")]),
             "failing or inconclusive checks: ci",
         ),
     ],
@@ -1408,13 +1844,13 @@ def test_ready_for_merge_merge_queue_blocks(tmp_state_dir, fake_github):
 
 
 def test_ready_for_merge_pending_checks_hold_then_proceed(tmp_state_dir, fake_github):
-    fake_github.add_pr(head_sha=SHA_A).checks = [CheckInfo(name="ci", state="IN_PROGRESS")]
+    fake_github.add_pr(head_sha=SHA_A).checks = [ci_check(state="IN_PROGRESS", conclusion="")]
     eng = _in_ready(tmp_state_dir, fake_github)
     with pytest.raises(VerificationError, match="still running: ci.*READY_FOR_MERGE"):
         eng.step(allow_merge=True)
     assert eng.state.phase == Phase.READY_FOR_MERGE and eng.state.attempt == 1
     assert load_state(eng.paths.state_file).attempt == 1  # persisted across resume
-    fake_github.prs[PR].checks = [CheckInfo(name="ci", state="COMPLETED", conclusion="SUCCESS")]
+    fake_github.prs[PR].checks = [ci_check()]
     assert eng.step(allow_merge=True).next_phase == "MERGE"
     assert eng.state.attempt == 0  # reset on transition
 
@@ -1484,18 +1920,18 @@ def test_run_with_gate_open_bounds_inconclusive_ready_for_merge_rechecks(
 
 
 def test_run_with_gate_open_proceeds_once_checks_finish(tmp_state_dir, fake_github):
-    fake_github.add_pr(head_sha=SHA_A).checks = [CheckInfo(name="ci", state="IN_PROGRESS")]
+    fake_github.add_pr(head_sha=SHA_A).checks = [ci_check(state="IN_PROGRESS", conclusion="")]
     eng = _in_ready(tmp_state_dir, fake_github)
     with pytest.raises(VerificationError, match="still running: ci"):
         eng.run(max_steps=50, allow_merge=True)
     assert eng.state.phase == Phase.READY_FOR_MERGE and eng.state.attempt == 1
-    fake_github.prs[PR].checks = [CheckInfo(name="ci", state="COMPLETED", conclusion="SUCCESS")]
+    fake_github.prs[PR].checks = [ci_check()]
     outcomes = eng.run(max_steps=1, allow_merge=True)
     assert [o.next_phase for o in outcomes] == ["MERGE"] and eng.state.attempt == 0
 
 
 def test_inconclusive_bound_of_one_blocks_immediately(tmp_state_dir, fake_github):
-    fake_github.add_pr(head_sha=SHA_A).checks = [CheckInfo(name="ci", state="QUEUED")]
+    fake_github.add_pr(head_sha=SHA_A).checks = [ci_check(state="QUEUED", conclusion="")]
     eng = _in_merge(tmp_state_dir, fake_github)
     eng.config.merge.max_verification_attempts = 1
     out = eng.step(allow_merge=True)

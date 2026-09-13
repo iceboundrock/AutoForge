@@ -17,6 +17,7 @@ import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from urllib.parse import urlencode
 
 from .errors import (
     ConfigurationError,
@@ -187,6 +188,16 @@ class CheckInfo:
     name: str
     state: str  # CheckRun: COMPLETED | IN_PROGRESS | ... ; StatusContext: SUCCESS | PENDING | ...
     conclusion: str = ""  # CheckRun only: SUCCESS | FAILURE | ...
+    # Where GitHub says the result came from. For a GitHub Actions check run
+    # this is ``https://github.com/<owner>/<repo>/actions/runs/<id>/job/<job>``
+    # and names the exact workflow run; the merge gate uses it to verify the
+    # *definition* that produced a green required check (see
+    # :func:`parse_actions_run_url`). Empty for a legacy commit status.
+    details_url: str = ""
+
+    @property
+    def actions_run(self) -> ActionsRunRef | None:
+        return parse_actions_run_url(self.details_url)
 
     @property
     def outcome(self) -> str:
@@ -209,6 +220,98 @@ class CheckInfo:
         if state in ("FAILURE", "ERROR") and not conclusion:
             return "failure"
         return "unknown"
+
+
+@dataclass(frozen=True)
+class ActionsRunRef:
+    """A GitHub Actions workflow run named by a check's details URL."""
+
+    repository: str  # owner/repo, as written in the URL
+    run_id: int
+
+
+_ACTIONS_RUN_URL = re.compile(
+    r"^https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/actions/runs/([1-9][0-9]*)(?:/.*)?$"
+)
+
+
+def parse_actions_run_url(url: str) -> ActionsRunRef | None:
+    """``https://github.com/<owner>/<repo>/actions/runs/<id>[/job/<n>...]`` or None.
+
+    Anything else (a legacy status target, an external CI dashboard, an
+    empty URL) is ``None``: the check did not come from a GitHub Actions run
+    the controller can read back, which is a fact for the caller to refuse
+    on, not a shape to guess around.
+    """
+    m = _ACTIONS_RUN_URL.match(url or "")
+    if not m:
+        return None
+    return ActionsRunRef(repository=f"{m.group(1)}/{m.group(2)}", run_id=int(m.group(3)))
+
+
+@dataclass(frozen=True)
+class WorkflowRunInfo:
+    """One GitHub Actions workflow run, as the REST API reports it."""
+
+    id: int
+    repository: str  # owner/repo the run belongs to (where its workflow file lives)
+    path: str  # workflow file, e.g. ``.github/workflows/ci.yml``
+    workflow_id: int
+    event: str  # ``push`` | ``pull_request`` | ...
+    head_sha: str  # lower-case; for ``pull_request`` runs the PR head, not the merge commit
+    head_branch: str
+    status: str  # ``completed`` | ``in_progress`` | ``queued`` | ...
+    conclusion: str  # ``success`` | ``failure`` | ``cancelled`` | ... ; "" while not completed
+    run_attempt: int = 1
+
+    @property
+    def completed(self) -> bool:
+        return self.status == "completed"
+
+
+@dataclass(frozen=True)
+class WorkflowJob:
+    """A job of a workflow run: its name and its step names in order.
+
+    Step names are what GitHub shows: a ``name:`` when the step has one,
+    otherwise ``Run <command>`` / ``Run <action>``, so an unnamed ``run:``
+    whose command changed is visible as a different step name.
+    """
+
+    name: str
+    steps: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class WorkflowRunJobs:
+    """The jobs of one run and GitHub's own count, so a short listing shows."""
+
+    jobs: tuple[WorkflowJob, ...]
+    total: int
+
+    @property
+    def complete(self) -> bool:
+        return len(self.jobs) == self.total
+
+    def structure(self) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        """``((job name, step names), ...)`` sorted by job name.
+
+        GitHub lists jobs in no fixed order (matrix legs start in parallel),
+        so two runs of one definition compare equal only on the sorted shape.
+        """
+        return tuple(sorted((job.name, job.steps) for job in self.jobs))
+
+
+@dataclass(frozen=True)
+class WorkflowRuns:
+    """The runs one listing matched and GitHub's own count, so a short listing shows."""
+
+    runs: tuple[WorkflowRunInfo, ...]
+    total: int
+
+    @property
+    def complete(self) -> bool:
+        return len(self.runs) == self.total
 
 
 @dataclass
@@ -377,6 +480,9 @@ _PR_FIELDS = (
 # merge gate fails closed on it, which is the honest answer for a PR too
 # large for the controller to prove anything about.
 _PR_FILES_PAGE_SIZE = 100
+# Page sizes of the Actions listings behind the check-definition gate.
+_JOBS_PAGE_SIZE = 100
+_RUNS_PAGE_SIZE = 100
 _MERGE_QUEUE_QUERY = (
     "query($owner: String!, $name: String!, $number: Int!) {"
     " repository(owner: $owner, name: $name) {"
@@ -708,11 +814,13 @@ class GitHubClient:
         checks = []
         for c in data.get("statusCheckRollup") or []:
             if isinstance(c, dict):
+                details = c.get("detailsUrl") or c.get("targetUrl") or ""
                 checks.append(
                     CheckInfo(
                         name=str(c.get("name", "") or c.get("context", "")),
                         state=str(c.get("status", "") or c.get("state", "")).upper(),
                         conclusion=str(c.get("conclusion", "")).upper(),
+                        details_url=details if isinstance(details, str) else "",
                     )
                 )
         linked: list[int] = []
@@ -832,6 +940,135 @@ class GitHubClient:
         if not isinstance(enabled, bool) or not isinstance(in_queue, bool):
             raise GitHubError(f"merge-queue status for {ref.canonical} is not boolean: {pr}")
         return MergeQueueStatus(enabled=enabled, in_queue=in_queue)
+
+    # -- GitHub Actions (the definition behind a required check) -------------
+    def _run_from_data(self, data: object, what: str) -> WorkflowRunInfo:
+        if not isinstance(data, dict):
+            raise GitHubError(f"{what} is not an object: {data!r:.200}")
+        repo = data.get("repository")
+        full_name = repo.get("full_name") if isinstance(repo, dict) else None
+        run_id = data.get("id")
+        workflow_id = data.get("workflow_id")
+        attempt = data.get("run_attempt", 1)
+        head_sha = data.get("head_sha")
+        for name, value in (("id", run_id), ("workflow_id", workflow_id), ("run_attempt", attempt)):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise GitHubError(f"{what} has no usable {name}: {value!r}")
+        assert isinstance(run_id, int) and isinstance(workflow_id, int)
+        assert isinstance(attempt, int)
+        if not isinstance(full_name, str) or not full_name:
+            raise GitHubError(f"{what} names no repository: {repo!r:.200}")
+        if not isinstance(head_sha, str) or not head_sha:
+            raise GitHubError(f"{what} has no head_sha: {head_sha!r}")
+        text = {
+            key: value if isinstance(value := data.get(key), str) else ""
+            for key in ("path", "event", "head_branch", "status", "conclusion")
+        }
+        if not text["path"] or not text["status"]:
+            raise GitHubError(f"{what} has no workflow path or status: {data!r:.200}")
+        return WorkflowRunInfo(
+            id=run_id,
+            repository=full_name,
+            path=text["path"],
+            workflow_id=workflow_id,
+            event=text["event"],
+            head_sha=head_sha.lower(),
+            head_branch=text["head_branch"],
+            status=text["status"],
+            conclusion=text["conclusion"],
+            run_attempt=attempt,
+        )
+
+    def get_workflow_run(self, repository: str, run_id: int) -> WorkflowRunInfo:
+        """One workflow run by id, in the repository the check's URL names."""
+        what = f"workflow run {run_id} of {repository}"
+        data = self._api_json(["api", f"repos/{repository}/actions/runs/{run_id}"])
+        return self._run_from_data(data, what)
+
+    def get_workflow_run_jobs(self, repository: str, run_id: int) -> WorkflowRunJobs:
+        """Every job of the run's latest attempt with its step names, all pages read.
+
+        The endpoint answers an object per page (``total_count`` + ``jobs``);
+        the count comes from GitHub, so a listing that does not reach it is
+        reported as incomplete rather than as "these are all the jobs". A job
+        without a usable name, or a step without one, is malformed data
+        (GitHubError): the comparison built on it would compare nothing.
+        """
+        what = f"the jobs of workflow run {run_id} of {repository}"
+        endpoint = f"repos/{repository}/actions/runs/{run_id}/jobs?per_page={_JOBS_PAGE_SIZE}"
+        pages = self._json(["api", "--paginate", "--slurp", endpoint])
+        if not isinstance(pages, list) or not all(isinstance(page, dict) for page in pages):
+            raise GitHubError(f"{what}: non-paginated JSON payload: {pages!r:.200}")
+        total = -1
+        jobs: list[WorkflowJob] = []
+        for page in pages:
+            count = page.get("total_count")
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise GitHubError(f"{what}: total_count is not a count: {count!r}")
+            total = max(total, count)
+            listed = page.get("jobs")
+            if not isinstance(listed, list):
+                raise GitHubError(f"{what}: jobs is not a list: {listed!r:.200}")
+            for job in listed:
+                name = job.get("name") if isinstance(job, dict) else None
+                steps = job.get("steps") if isinstance(job, dict) else None
+                if not isinstance(name, str) or not name or not isinstance(steps, list):
+                    raise GitHubError(f"{what}: unusable job entry: {job!r:.200}")
+                names: list[str] = []
+                for step in steps:
+                    step_name = step.get("name") if isinstance(step, dict) else None
+                    if not isinstance(step_name, str) or not step_name:
+                        raise GitHubError(
+                            f"{what}: job {name!r} has an unusable step: {step!r:.200}"
+                        )
+                    names.append(step_name)
+                jobs.append(WorkflowJob(name=name, steps=tuple(names)))
+        if total < 0:
+            raise GitHubError(f"{what}: no page was returned")
+        return WorkflowRunJobs(jobs=tuple(jobs), total=total)
+
+    def get_branch_head_sha(self, repository: str, branch: str) -> str:
+        """The commit a branch currently points at (lower-case SHA)."""
+        data = self._api_json(["api", f"repos/{repository}/branches/{branch}"])
+        commit = data.get("commit")
+        sha = commit.get("sha") if isinstance(commit, dict) else None
+        if not isinstance(sha, str) or not sha:
+            raise GitHubError(f"branch {branch!r} of {repository} has no readable head SHA")
+        return sha.lower()
+
+    def find_workflow_runs(
+        self, repository: str, workflow_id: int, *, branch: str, event: str, head_sha: str
+    ) -> WorkflowRuns:
+        """Runs of one workflow filtered by branch, event and head commit, all pages read.
+
+        The runs of a single commit on a single branch are normally one, but
+        the caller picks a *reference* out of them, so the listing is read
+        like the jobs listing: every page, against GitHub's own
+        ``total_count``, and a listing that does not reach it is reported as
+        incomplete rather than as "these are all the runs".
+        """
+        query = urlencode(
+            {"branch": branch, "event": event, "head_sha": head_sha, "per_page": _RUNS_PAGE_SIZE}
+        )
+        what = f"the runs of workflow {workflow_id} of {repository}"
+        endpoint = f"repos/{repository}/actions/workflows/{workflow_id}/runs?{query}"
+        pages = self._json(["api", "--paginate", "--slurp", endpoint])
+        if not isinstance(pages, list) or not all(isinstance(page, dict) for page in pages):
+            raise GitHubError(f"{what}: non-paginated JSON payload: {pages!r:.200}")
+        total = -1
+        runs: list[WorkflowRunInfo] = []
+        for page in pages:
+            count = page.get("total_count")
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise GitHubError(f"{what}: total_count is not a count: {count!r}")
+            total = max(total, count)
+            listed = page.get("workflow_runs")
+            if not isinstance(listed, list):
+                raise GitHubError(f"{what}: workflow_runs is not a list: {listed!r:.200}")
+            runs.extend(self._run_from_data(run, f"a run in {what}") for run in listed)
+        if total < 0:
+            raise GitHubError(f"{what}: no page was returned")
+        return WorkflowRuns(runs=tuple(runs), total=total)
 
     def pr_exists(self, url: str) -> bool:
         try:

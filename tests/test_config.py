@@ -185,7 +185,9 @@ def test_unknown_safety_keys_are_rejected_not_ignored(tmp_path, body):
     message = str(info.value)
     unknown = [k for k in ("allow_merges", "allowMerge", "protected_paths") if k in body]
     assert all(k in message for k in unknown)
-    assert "allow_merge, protected_merge_paths, required_checks" in message  # known keys named
+    assert "allow_merge, protected_merge_paths, required_checks, verify_check_definition" in (
+        message
+    )  # known keys named
 
 
 def test_unknown_safety_key_rejected_in_yaml_too(tmp_path):
@@ -674,4 +676,57 @@ def test_required_checks_default_and_override(tmp_path):
         load_config_file(p)
     p.write_text('{"version": 1, "safety": {"required_checks": "ci"}}')
     with pytest.raises(ConfigurationError, match="required_checks must be a list"):
+        load_config_file(p)
+
+
+# -- #42: the controller's own pre-merge evidence ---------------------------------------
+def test_premerge_verification_defaults():
+    cfg = default_config()
+    assert cfg.safety.verify_check_definition is True
+    assert cfg.merge.verification_commands == []
+
+
+def test_premerge_verification_keys_load(tmp_path):
+    p = tmp_path / "cfg.json"
+    p.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "safety": {"verify_check_definition": False},
+                "merge": {"verification_commands": [["uv", "run", "pytest", "-q"], ["make"]]},
+            }
+        ),
+        "utf-8",
+    )
+    cfg = load_config_file(p)
+    assert cfg.safety.verify_check_definition is False
+    assert cfg.merge.verification_commands == [["uv", "run", "pytest", "-q"], ["make"]]
+
+
+def test_verification_command_argv_elements_are_stored_verbatim(tmp_path):
+    """Surrounding whitespace in an argv element is the value, never trimmed away."""
+    p = tmp_path / "cfg.json"
+    argv = ["pytest", " -k", "smoke "]
+    p.write_text(json.dumps({"version": 1, "merge": {"verification_commands": [argv]}}), "utf-8")
+    assert load_config_file(p).merge.verification_commands == [argv]
+
+
+@pytest.mark.parametrize(
+    ("section", "body", "key"),
+    [
+        ("safety", {"verify_check_definition": None}, "verify_check_definition"),
+        ("safety", {"verify_check_definition": "yes"}, "verify_check_definition"),
+        ("merge", {"verification_commands": None}, "verification_commands"),
+        ("merge", {"verification_commands": "make check"}, "verification_commands"),
+        ("merge", {"verification_commands": ["make check"]}, "verification_commands"),
+        ("merge", {"verification_commands": [[]]}, "verification_commands"),
+        ("merge", {"verification_commands": [["make", 1]]}, "verification_commands"),
+        ("merge", {"verification_commands": [["make", "  "]]}, "verification_commands"),
+    ],
+)
+def test_premerge_verification_keys_reject_bad_shapes(tmp_path, section, body, key):
+    """A shell string or a missing value never silently becomes "run nothing"."""
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps({"version": 1, section: body}), "utf-8")
+    with pytest.raises(ConfigurationError, match=key):
         load_config_file(p)

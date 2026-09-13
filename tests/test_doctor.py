@@ -524,3 +524,40 @@ def test_required_check_skipped_when_prerequisites_failed(tmp_path):
     d = Doctor(config_path=str(cfg), cwd=str(tmp_path), runner=_runner_factory())
     check = {r.name: r for r in d.run_all()}["default branch requires checks"]
     assert check.skipped and check.detail == "(config check failed)"
+
+
+def test_premerge_verification_reported_and_never_run(tmp_path):
+    """#42: doctor names the controller's own pre-merge evidence without executing it."""
+    d = Doctor(cwd=str(tmp_path), runner=_runner_factory())
+    check = {r.name: r for r in d.run_all()}["pre-merge verification"]
+    assert check.ok and not check.required
+    assert "check definition compared to the base branch's run (ci)" in check.detail
+    assert "no merge.verification_commands" in check.detail
+    assert "consider merge.verification_commands" not in check.detail  # gate closed
+
+    cfg = tmp_path / "c.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "safety": {"allow_merge": True, "verify_check_definition": False},
+                "merge": {"verification_commands": [["false"], ["make", "check"]]},
+            }
+        )
+    )
+    calls: list = []
+    d = Doctor(config_path=str(cfg), cwd=str(tmp_path), runner=_runner_factory(calls=calls))
+    check = {r.name: r for r in d.run_all()}["pre-merge verification"]
+    assert "check definition NOT verified" in check.detail
+    assert "local commands: false; make check" in check.detail
+    assert not any(argv[:1] in (["false"], ["make"]) for argv in calls)
+
+    cfg.write_text('{"version": 1, "safety": {"allow_merge": true}}')
+    d = Doctor(config_path=str(cfg), cwd=str(tmp_path), runner=_runner_factory())
+    check = {r.name: r for r in d.run_all()}["pre-merge verification"]
+    assert "consider merge.verification_commands" in check.detail
+
+    cfg.write_text('{"version": 1, "execution": {"allow_merge": true}}')
+    d = Doctor(config_path=str(cfg), cwd=str(tmp_path), runner=_runner_factory())
+    check = {r.name: r for r in d.run_all()}["pre-merge verification"]
+    assert check.detail == "(config check failed)" and not check.ok and not check.required
