@@ -60,7 +60,7 @@ from __future__ import annotations
 import json
 import re
 import secrets
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field, fields
 from enum import StrEnum
 
@@ -323,11 +323,23 @@ def source_marker_defect(
     return ""
 
 
-# Persisted URL fields are validated by shape as well as by type: a string
-# that is not a GitHub URL would otherwise surface as a ``ConfigurationError``
-# from the first ``parse_*_url`` on the resume path -- a crash, not a refusal.
+# Persisted URL and id fields are validated by shape as well as by type: a
+# string that is not a GitHub URL would otherwise surface as a
+# ``ConfigurationError`` from the first ``parse_*_url`` on the resume path -- a
+# crash, not a refusal -- and a transaction id that is not one would be
+# silently overwritten (at PENDING) or could bind nothing (later) without the
+# journal ever being called what it is: corrupt.
 _ISSUE_URL_FIELDS = frozenset({"issue_url"})
 _PR_URL_FIELDS = frozenset({"source_pr_url", "replacement_pr_url", "rejected_pr_url"})
+_PR_URL_LIST_FIELDS = frozenset({"preexisting_pr_urls"})
+
+
+def _url_defect(name: str, value: str, parser: Callable[[str], object]) -> str:
+    try:
+        parser(value)
+    except ConfigurationError as exc:
+        return f"{name} is not a GitHub URL ({exc})"
+    return ""
 
 
 def _field_defect(name: str, annotation: str, value: object) -> str:
@@ -344,10 +356,9 @@ def _field_defect(name: str, annotation: str, value: object) -> str:
             return f"{name} must be a string, got {kind}"
         if value and name in _ISSUE_URL_FIELDS | _PR_URL_FIELDS:
             parser = parse_issue_url if name in _ISSUE_URL_FIELDS else parse_pr_url
-            try:
-                parser(value)
-            except ConfigurationError as exc:
-                return f"{name} is not a GitHub URL ({exc})"
+            return _url_defect(name, value, parser)
+        if value and name == "transaction_id" and not TRANSACTION_ID_RE.match(value):
+            return f"{name} must be 32 lowercase hex characters, got {value!r}"
         return ""
     if annotation == "int":
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
@@ -356,12 +367,79 @@ def _field_defect(name: str, annotation: str, value: object) -> str:
     if annotation == "list[str]":
         if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
             return f"{name} must be a list of strings, got {kind}"
+        if name in _PR_URL_LIST_FIELDS:
+            for item in value:
+                defect = _url_defect(f"{name} entry {item!r}", item, parse_pr_url)
+                if defect:
+                    return defect
         return ""
     if annotation == "dict":
         if not isinstance(value, dict):
             return f"{name} must be an object, got {kind}"
         return ""
     raise TypeError(f"ReplanTransaction field {name!r} has unvalidated type {annotation!r}")
+
+
+# The fields each stage's writer fills *together with* the stage. A journal at
+# a stage in which one of them is empty was not written by this controller (a
+# hand edit, a truncated write, an older version), so the type-valid fields
+# around it prove nothing either: it is corruption, not a checkpoint with a
+# gap. Requirements accumulate along the lifecycle, and ``REJECTED`` -- which
+# any stage can reach -- requires nothing. Type validity alone would let a
+# ``VERIFIED`` journal with ``source_branch == ""`` reach the close with a
+# checkpoint that was never proven (#35 R2-F1); this table is what rules that
+# out, and the verifiers refuse the same gap again in depth.
+_STAGE_ORDER: tuple[ReplanStage, ...] = (
+    ReplanStage.PENDING,
+    ReplanStage.PREPARED,
+    ReplanStage.VERIFIED,
+    ReplanStage.SUPERSEDE_INTENT,
+)
+_REQUIRED_AT_STAGE: dict[ReplanStage, tuple[str, ...]] = {
+    ReplanStage.PENDING: ("decision_head_sha",),
+    ReplanStage.PREPARED: (
+        "transaction_id",
+        "issue_url",
+        "source_pr_url",
+        "source_branch",
+        "source_head_sha",
+        "base_branch",
+        "pr_number_watermark",
+        "expected_execution_attempt",
+    ),
+    ReplanStage.VERIFIED: ("replacement_pr_url", "replacement_branch", "replacement_head_sha"),
+    ReplanStage.SUPERSEDE_INTENT: ("close_intent_at",),
+    # Both follow SUPERSEDE_INTENT and are alternatives to each other.
+    ReplanStage.COMPENSATING: ("compensating_at", "compensation_reason"),
+    ReplanStage.SUPERSEDED: ("superseded_at",),
+}
+
+
+def required_fields_at(stage: ReplanStage) -> tuple[str, ...]:
+    """Every field a journal at ``stage`` must carry non-empty, in lifecycle order."""
+    if stage is ReplanStage.REJECTED:
+        return ()
+    if stage in _STAGE_ORDER:
+        reached = _STAGE_ORDER[: _STAGE_ORDER.index(stage) + 1]
+    else:
+        reached = (*_STAGE_ORDER, stage)
+    return tuple(name for earlier in reached for name in _REQUIRED_AT_STAGE[earlier])
+
+
+def _stage_defects(stage: ReplanStage, values: dict[str, object]) -> list[str]:
+    """Required-but-empty (or forbidden-but-set) fields for ``stage``."""
+    defects: list[str] = []
+    for name in required_fields_at(stage):
+        if name not in values:
+            defects.append(f"{name} is required at stage {stage.value!r} but missing")
+        elif not values[name]:
+            defects.append(f"{name} is required at stage {stage.value!r} but empty")
+    # The id is created together with PREPARED and can exist nowhere before
+    # it (see the module docstring); a PENDING journal carrying one was not
+    # written by this controller.
+    if stage is ReplanStage.PENDING and values.get("transaction_id"):
+        defects.append(f"transaction_id is set at stage {stage.value!r}, before it is created")
+    return defects
 
 
 @dataclass
@@ -467,6 +545,12 @@ class ReplanTransaction:
         instead of crashing on the first use of the field so that every
         ``resume`` dies identically. The unreadable fields fall back to their
         defaults in memory only (see ``journal_defects``).
+
+        Omission is only tolerated where the stage tolerates it: every field
+        the recorded stage's writer fills is required to be present and
+        non-empty (:func:`required_fields_at`), so an incomplete checkpoint
+        is corruption rather than a checkpoint some later verifier might
+        compare vacuously.
         """
         if not isinstance(data, dict):
             raise ValueError("replan transaction must be a JSON object")
@@ -489,6 +573,11 @@ class ReplanTransaction:
                 defects.append(defect)
                 continue
             kwargs[spec.name] = value
+        if not defects:
+            # Only a journal whose fields all read cleanly is judged for
+            # completeness: a field that already failed its type check has
+            # been reported once and must not be reported again as "empty".
+            defects.extend(_stage_defects(stage, kwargs))
         if defects:
             stage = ReplanStage.REJECTED
             prior = kwargs.get("rejection_reason", "")
@@ -542,6 +631,30 @@ def _same_sha(observed: str, expected: str) -> bool:
     side never matches: an unreadable HEAD is not "the same" as anything.
     """
     return bool(observed) and bool(expected) and observed.lower() == expected.lower()
+
+
+def _source_branch_drift(pr: PRInfo, txn: ReplanTransaction, when: str = "") -> str:
+    """The source branch comparison, shared by the pre- and post-close reads.
+
+    Like :func:`_same_sha`, never vacuous: the branch is checkpointed by
+    ``PREPARED`` together with the HEAD and is half of what "exactly the
+    implementation the controller decided to replace" means, so a checkpoint
+    that records no branch has not proven it and must not be closed on.
+    :meth:`ReplanTransaction.from_dict` already refuses such a journal at any
+    stage from ``PREPARED`` on; this is the same rule again at the point of
+    use, so a transaction assembled any other way cannot slip past it.
+    """
+    if not txn.source_branch:
+        return (
+            f"the replan transaction records no branch for source PR {txn.source_pr_url}, so "
+            "the checkpoint cannot prove which branch it decided to supersede"
+        )
+    if pr.head_ref != txn.source_branch:
+        return (
+            f"source PR {txn.source_pr_url} moved from the checkpointed branch "
+            f"{txn.source_branch!r} to {pr.head_ref!r}{when}"
+        )
+    return ""
 
 
 def verify_decision_point(pr: PRInfo, txn: ReplanTransaction) -> str:
@@ -598,11 +711,9 @@ def verify_source_checkpoint(pr: PRInfo, txn: ReplanTransaction) -> str:
             f"source PR {txn.source_pr_url} is {pr.state or '(unknown)'}, expected OPEN at the "
             "checkpoint; it was not closed by this transaction"
         )
-    if txn.source_branch and pr.head_ref != txn.source_branch:
-        return (
-            f"source PR {txn.source_pr_url} moved from the checkpointed branch "
-            f"{txn.source_branch!r} to {pr.head_ref!r}"
-        )
+    drift = _source_branch_drift(pr, txn)
+    if drift:
+        return drift
     if not _same_sha(pr.head_sha, txn.source_head_sha):
         return (
             f"source PR {txn.source_pr_url} advanced from the checkpointed HEAD "
@@ -629,8 +740,10 @@ def verify_target_pr(
     """Objective facts a replacement must satisfy, re-derived from GitHub.
 
     ``require_checkpoint_head`` is off while the candidate is first being
-    bound (its HEAD *becomes* the checkpoint) and on for every later read,
-    including the final read immediately before the destructive write.
+    bound (its HEAD and branch *become* the checkpoint) and on for every later
+    read, including the final read immediately before the destructive write;
+    on those reads the checkpointed branch must exist as well as match, for
+    the reason :func:`_source_branch_drift` gives for the source.
     """
     ref_canonical = _canonical(pr.url)
     if not ref_canonical:
@@ -653,6 +766,11 @@ def verify_target_pr(
         return f"replacement PR {ref_canonical} has no readable head SHA"
     if not pr.head_ref or pr.head_ref == txn.source_branch:
         return "replacement branch must be present and differ from the superseded branch"
+    if require_checkpoint_head and not txn.replacement_branch:
+        return (
+            f"the replan transaction records no branch for replacement PR {ref_canonical}, so "
+            "the verified checkpoint is incomplete"
+        )
     if txn.replacement_branch and pr.head_ref != txn.replacement_branch:
         return (
             f"replacement PR {ref_canonical} moved from the checkpointed branch "
@@ -729,11 +847,9 @@ def verify_closed_source(pr: PRInfo, txn: ReplanTransaction) -> str:
             f"source PR {txn.source_pr_url} is {pr.state or '(unknown)'} after this "
             "transaction's close attempt; expected CLOSED"
         )
-    if txn.source_branch and pr.head_ref != txn.source_branch:
-        return (
-            f"source PR {txn.source_pr_url} moved from the checkpointed branch "
-            f"{txn.source_branch!r} to {pr.head_ref!r} inside the close window"
-        )
+    drift = _source_branch_drift(pr, txn, " inside the close window")
+    if drift:
+        return drift
     if not _same_sha(pr.head_sha, txn.source_head_sha):
         return (
             f"source PR {txn.source_pr_url} advanced from the checkpointed HEAD "
