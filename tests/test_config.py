@@ -195,6 +195,66 @@ def test_unknown_safety_key_rejected_in_yaml_too(tmp_path):
         load_config_file(p)
 
 
+# Every JSON falsy value that is not a mapping. `data.get("safety", {}) or {}`
+# used to turn all of these into an omitted section, so the "must be a
+# mapping" check right after it was unreachable for exactly the values a
+# hand edit or a generator is most likely to produce.
+FALSY_NON_MAPPINGS = ["[]", "false", '""', "0"]
+
+
+@pytest.mark.parametrize("value", FALSY_NON_MAPPINGS + ['"yes"', "[1]", "1"])
+def test_non_mapping_safety_section_is_rejected(tmp_path, value):
+    """A present `safety` that is not a mapping fails loudly, whatever its truthiness."""
+    p = tmp_path / "cfg.json"
+    p.write_text(f'{{"version": 1, "safety": {value}}}', encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="'safety' must be a mapping"):
+        load_config_file(p)
+
+
+@pytest.mark.parametrize("value", FALSY_NON_MAPPINGS)
+def test_non_mapping_safety_section_rejected_in_yaml_too(tmp_path, value):
+    p = tmp_path / "cfg.yaml"
+    p.write_text(f"version: 1\nsafety: {value}\n", encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="'safety' must be a mapping"):
+        load_config_file(p)
+
+
+@pytest.mark.parametrize(
+    "section",
+    ["execution", "github", "merge", "review", "workflow", "local", "profiles"],
+)
+@pytest.mark.parametrize("value", FALSY_NON_MAPPINGS)
+def test_non_mapping_sections_are_rejected_everywhere(tmp_path, section, value):
+    """The same contract for every section: the fix is in the reader, not in `safety`."""
+    p = tmp_path / "cfg.json"
+    p.write_text(f'{{"version": 1, "{section}": {value}}}', encoding="utf-8")
+    with pytest.raises(ConfigurationError, match=f"'{section}' must be a mapping"):
+        load_config_file(p)
+
+
+@pytest.mark.parametrize("value", FALSY_NON_MAPPINGS)
+def test_non_mapping_replan_section_is_rejected(tmp_path, value):
+    p = tmp_path / "cfg.json"
+    p.write_text(f'{{"version": 1, "review": {{"replan": {value}}}}}', encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="'review.replan' must be a mapping"):
+        load_config_file(p)
+
+
+def test_empty_safety_section_header_is_the_default(tmp_path):
+    """`safety:` with every child commented out is how a hand-edited YAML file
+    looks; it reads as null and yields the same fail-closed defaults as omitting
+    the section. An explicit JSON null is the same value and the same case."""
+    yaml = tmp_path / "cfg.yaml"
+    yaml.write_text("version: 1\nsafety:\n  # allow_merge: true\nmerge:\n", encoding="utf-8")
+    cfg = load_config_file(yaml)
+    assert cfg.merge_allowed_by_config is False
+    assert cfg.safety.allow_merge_source == "built-in default"
+    assert cfg.safety.protected_merge_paths == default_config().safety.protected_merge_paths
+    js = tmp_path / "cfg.json"
+    js.write_text('{"version": 1, "safety": null}', encoding="utf-8")
+    assert load_config_file(js).safety == default_config().safety
+
+
 def test_required_profiles_validation(tmp_path):
     from autoforge.config import validate_required_profiles
     from autoforge.engine import REQUIRED_PROFILES
