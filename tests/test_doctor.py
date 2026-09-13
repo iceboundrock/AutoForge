@@ -96,7 +96,7 @@ def test_merge_gate_not_claimed_when_config_fails_to_load(tmp_path):
     results = {r.name: r for r in d.run_all()}
     assert not results["config"].ok and "execution.allow_merge" in results["config"].detail
     gate = results["merge gate"]
-    assert gate.detail == "(config not loaded)"
+    assert gate.detail == "(config check failed)"
     assert not gate.ok and not gate.required  # a WARN, never a claim about the gate
 
 
@@ -120,8 +120,32 @@ def test_reused_doctor_forgets_a_config_that_turned_invalid(tmp_path):
     second = {r.name: r for r in d.run_all()}
     assert not second["config"].ok and "execution.allow_merge" in second["config"].detail
     gate = second["merge gate"]
-    assert gate.detail == "(config not loaded)"
+    assert gate.detail == "(config check failed)"
     assert not gate.ok and not gate.required
     # Every other check reads the same cache: none may keep using the old file.
     assert d.config is None
     assert "custom" not in second["state dir writable"].detail
+
+
+def test_merge_gate_not_claimed_when_a_required_profile_is_invalid(tmp_path):
+    """PR #58 review: a config that parses but fails profile validation is not accepted.
+
+    `safety.allow_merge` is read before the profiles are validated, so the
+    gate row could say "a run with --allow-merge WILL merge" about a config no
+    run would start on. The config is retained only once the whole `config`
+    check passes, so every later row -- the gate first -- describes an
+    accepted config or none.
+    """
+    cfg = tmp_path / "c.json"
+    cfg.write_text(
+        '{"version": 1, "safety": {"allow_merge": true}, "state_dir": "custom",'
+        ' "profiles": {"fix": {"provider": "nope"}}}'
+    )
+    d = Doctor(config_path=str(cfg), cwd=str(tmp_path), runner=_runner_factory())
+    results = {r.name: r for r in d.run_all()}
+    assert not results["config"].ok and "unknown provider 'nope'" in results["config"].detail
+    gate = results["merge gate"]
+    assert gate.detail == "(config check failed)"
+    assert not gate.ok and not gate.required
+    assert d.config is None
+    assert "custom" not in results["state dir writable"].detail

@@ -99,24 +99,25 @@ class Doctor:
         LOCAL run's required reviewer profiles are derived from the config that
         is only loaded here (see :func:`autoforge.profiles.local_required_profiles`).
 
-        ``self.config`` is what *this* attempt loaded, never a previous one:
-        every later check reads it, so a `Doctor` reused after its config file
-        turned invalid must not keep describing the old file -- least of all
-        the merge gate, which would otherwise claim the state of a config that
-        was just rejected.
+        ``self.config`` is set exactly when this check passes, and to what
+        *this* attempt accepted. Every later check reads it, so it must not
+        describe a config a run would refuse: not a previous file (a `Doctor`
+        reused after its config turned invalid), and not one that parsed but
+        failed profile validation -- a run does not start on such a config
+        (`ControllerEngine.validate_config`), so the merge gate must not claim
+        what a run "WILL" do with it.
         """
         self.config = None
         try:
-            self.config = load_config_file(self.config_path)
+            cfg = load_config_file(self.config_path)
             required = required_profiles or REQUIRED_PROFILES
-            names = required(self.config) if callable(required) else required
-            validate_required_profiles(self.config, names)
+            names = required(cfg) if callable(required) else required
+            validate_required_profiles(cfg, names)
         except ConfigurationError as exc:
             return CheckResult("config", False, str(exc))
+        self.config = cfg
         src = self.config_path or "(built-in defaults)"
-        return CheckResult(
-            "config", True, f"{src}; profiles: {', '.join(sorted(self.config.profiles))}"
-        )
+        return CheckResult("config", True, f"{src}; profiles: {', '.join(sorted(cfg.profiles))}")
 
     def check_merge_gate(self) -> CheckResult:
         """Report the effective merge gate and the file/key that set it (informational).
@@ -130,7 +131,7 @@ class Doctor:
         name = "merge gate"
         cfg = self.config
         if cfg is None:
-            return CheckResult(name, False, "(config not loaded)", required=False)
+            return CheckResult(name, False, "(config check failed)", required=False)
         source = cfg.safety.allow_merge_source
         if cfg.merge_allowed_by_config:
             detail = (
