@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+from autoforge import config
 from autoforge.config import default_config, load_config_file, validate_required_profiles
 from autoforge.errors import ConfigurationError
 from autoforge.validation import parse_github_url, validate_epic_and_issue
@@ -195,6 +196,147 @@ def test_unknown_safety_key_rejected_in_yaml_too(tmp_path):
     p.write_text("version: 1\nsafety:\n  allow_merges: true\n", encoding="utf-8")
     with pytest.raises(ConfigurationError, match="allow_merges"):
         load_config_file(p)
+
+
+# One (section label, path into the JSON document, a valid key with a value,
+# the known keys as `_merge_config` names them) per section that has a closed
+# key set. `profiles` is keyed by name, so its entry is one profile mapping.
+SECTION_SCHEMAS = [
+    ("the top level", (), ("state_dir", '".autoforge"'), config.TOP_LEVEL_KEYS),
+    ("execution", ("execution",), ("max_correction_attempts", "1"), config.EXECUTION_KEYS),
+    ("safety", ("safety",), ("allow_merge", "false"), config.SAFETY_KEYS),
+    ("github", ("github",), ("timeout_seconds", "60"), config.GITHUB_KEYS),
+    ("merge", ("merge",), ("method", '"squash"'), config.MERGE_KEYS),
+    ("review", ("review",), ("replan", "{}"), config.REVIEW_KEYS),
+    ("review.replan", ("review", "replan"), ("enabled", "false"), config.REPLAN_KEYS),
+    ("workflow", ("workflow",), ("max_review_rounds", "3"), config.WORKFLOW_KEYS),
+    ("local", ("local",), ("max_fix_rounds", "0"), config.LOCAL_KEYS),
+    ("profiles.fix", ("profiles", "fix"), ("effort", '"high"'), config.PROFILE_KEYS),
+]
+
+
+def _document(path, entries):
+    """A JSON config with ``entries`` (``"key": value`` strings) at ``path``."""
+    body = "{" + ", ".join(entries) + "}"
+    for key in reversed(path):
+        body = f'{{"{key}": {body}}}'
+    if not path:
+        body = "{" + ", ".join(['"version": 1'] + entries) + "}"
+    return body
+
+
+@pytest.mark.parametrize("label, path, valid, known", SECTION_SCHEMAS, ids=lambda v: str(v)[:20])
+@pytest.mark.parametrize("beside_valid_key", [False, True])
+def test_unknown_keys_are_rejected_in_every_section(
+    tmp_path, label, path, valid, known, beside_valid_key
+):
+    """A misspelled key is an error everywhere, not a no-op that keeps the default.
+
+    The message names the section, the offending key(s) and the keys the
+    loader would have read, in the shape `safety` already used.
+    """
+    entries = [f'"{valid[0]}": {valid[1]}'] if beside_valid_key else []
+    entries += ['"bogus_key": 1', '"another_bogus": true']
+    p = tmp_path / "cfg.json"
+    p.write_text(_document(path, entries), encoding="utf-8")
+    with pytest.raises(ConfigurationError, match=f"unknown key.*under '{label}'") as info:
+        load_config_file(p)
+    message = str(info.value)
+    assert "another_bogus, bogus_key" in message  # every unknown key, sorted
+    assert f"(known: {', '.join(known)})" in message
+    assert valid[0] not in message.split("(known:")[0]  # the valid key is not blamed
+
+
+@pytest.mark.parametrize(
+    "body, label, key",
+    [
+        # The examples from issue #59, each of which used to load without error.
+        ('{"version": 1, "merge": {"methd": "squash"}}', "merge", "methd"),
+        ('{"version": 1, "workflow": {"max_review_round": 3}}', "workflow", "max_review_round"),
+        (
+            '{"version": 1, "workflow": {"stagnation_identical_round": 2}}',
+            "workflow",
+            "stagnation_identical_round",
+        ),
+        ('{"version": 1, "review": {"replan": {"enable": false}}}', "review.replan", "enable"),
+        (
+            '{"version": 1, "execution": {"default_timeout_second": 60}}',
+            "execution",
+            "default_timeout_second",
+        ),
+        # A key that exists, but under another section.
+        ('{"version": 1, "workflow": {"soft_threshold": 3}}', "workflow", "soft_threshold"),
+        ('{"version": 1, "review": {"enabled": false}}', "review", "enabled"),
+        ('{"version": 1, "merge": {"allow_merge": true}}', "merge", "allow_merge"),
+        ('{"version": 1, "local": {"max_review_rounds": 2}}', "local", "max_review_rounds"),
+        ('{"version": 1, "github": {"cmd": "gh"}}', "github", "cmd"),
+        # Top level: a section name misspelled, or a key that was never read.
+        ('{"version": 1, "workflows": {"max_review_rounds": 3}}', "the top level", "workflows"),
+        ('{"version": 1, "repository": "o/r"}', "the top level", "repository"),
+        # A profile key, on a built-in profile and on a new one alike.
+        ('{"version": 1, "profiles": {"fix": {"modle": "x"}}}', "profiles.fix", "modle"),
+        ('{"version": 1, "profiles": {"extra": {"timeout": 5}}}', "profiles.extra", "timeout"),
+    ],
+)
+def test_typos_from_the_issue_are_rejected(tmp_path, body, label, key):
+    p = tmp_path / "cfg.json"
+    p.write_text(body, encoding="utf-8")
+    with pytest.raises(ConfigurationError, match=f"unknown key.*under '{label}': {key} "):
+        load_config_file(p)
+
+
+def test_unknown_keys_rejected_in_yaml_and_toml_too(tmp_path):
+    yaml = tmp_path / "cfg.yaml"
+    yaml.write_text("version: 1\nworkflow:\n  max_review_round: 3\n", encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="under 'workflow': max_review_round"):
+        load_config_file(yaml)
+    toml = tmp_path / "cfg.toml"
+    toml.write_text("version = 1\n[review.replan]\nenable = false\n", encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="under 'review.replan': enable"):
+        load_config_file(toml)
+
+
+def test_removed_execution_allow_merge_keeps_its_own_message(tmp_path):
+    """The deprecated gate key explains where it went instead of reading as a typo."""
+    p = tmp_path / "cfg.json"
+    p.write_text('{"version": 1, "execution": {"allow_merge": true, "bogus": 1}}', encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="no longer supported") as info:
+        load_config_file(p)
+    assert "unknown key" not in str(info.value)
+
+
+@pytest.mark.parametrize(
+    "keys, config_cls",
+    [
+        (config.EXECUTION_KEYS, config.ExecutionConfig),
+        (config.SAFETY_KEYS, config.SafetyConfig),
+        (config.GITHUB_KEYS, config.GitHubConfig),
+        (config.MERGE_KEYS, config.MergeConfig),
+        (config.REVIEW_KEYS, config.ReviewConfig),
+        (config.REPLAN_KEYS, config.ReplanConfig),
+        (config.WORKFLOW_KEYS, config.WorkflowConfig),
+        (config.LOCAL_KEYS, config.LocalConfig),
+        (config.PROFILE_KEYS, config.ProfileConfig),
+        (config.TOP_LEVEL_KEYS, config.AutoForgeConfig),
+    ],
+)
+def test_known_key_tables_name_real_fields(keys, config_cls):
+    """Every key the loader accepts lands on a field; nothing accepted is a no-op."""
+    from dataclasses import fields
+
+    names = {f.name for f in fields(config_cls)}
+    assert set(keys) <= names, set(keys) - names
+    # Fields the loader deliberately does not read from the file.
+    derived = {"allow_merge_source", "name"}
+    assert names - set(keys) <= derived, names - set(keys) - derived
+
+
+def test_every_key_in_the_example_file_is_known(tmp_path):
+    """The documented example is the reference config; a key it uses must load."""
+    from pathlib import Path
+
+    cfg = load_config_file(Path(__file__).resolve().parents[1] / "autoforge.example.yaml")
+    assert cfg.workflow.max_review_rounds == 20 and cfg.local.max_workspace_entries == 50000
 
 
 # Every JSON falsy value that is not a mapping. `data.get("safety", {}) or {}`

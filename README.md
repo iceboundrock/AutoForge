@@ -664,7 +664,10 @@ audit data rather than state payload.
   config key that opens the gate: the historical `execution.allow_merge` is
   rejected on load rather than read, and an unknown key under `safety` (a
   typo such as `allow_merges`) is a configuration error, so the gate can
-  never be "disabled" in one place while still open in another.
+  never be "disabled" in one place while still open in another. The same
+  rule holds for every other section and for the top level (see
+  "Configuration"): a misspelled loop bound keeps no looser default behind
+  the operator's back.
   `autoforge doctor` prints the effective gate state and the file that set it.
 - **`doctor` verifies that the default branch still requires the CI check.**
   The pre-merge gate below trusts "every check on the PR succeeded", which
@@ -838,6 +841,18 @@ options without touching controller source. Provider-specific flags are built
 by the adapters in `providers.py`; the engine never hard-codes CLI syntax.
 YAML (`uv sync --extra yaml` for PyYAML, else a minimal built-in subset
 parser), TOML (stdlib), and JSON (stdlib) are accepted.
+
+Every key in the file must be one the controller reads. An unknown key —
+at the top level, in any section (`execution`, `safety`, `github`, `merge`,
+`review`, `review.replan`, `workflow`, `local`) or in a profile mapping — is
+a configuration error naming the section, the offending key and the keys
+that section knows, e.g. `unknown key(s) under 'workflow': max_review_round
+(known: max_review_rounds, ...)`. A typo cannot be a silent no-op that
+leaves the built-in default in force: several of these keys are loop bounds
+or merge behaviour, where "ignored" means a looser bound than the operator
+wrote while `autoforge doctor` calls the file valid. Provider-specific
+`options` under a profile are the one free mapping; the adapter in
+`providers.py` validates what it reads there.
 
 The `local:` block configures [local mode](#local-mode-no-github) —
 `feature_dir`, `max_fix_rounds` and the argv-array `validation_commands`. A

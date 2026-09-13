@@ -81,6 +81,22 @@ class ProfileConfig:
         return provider_for(self).build_command_for(self, prompt)
 
 
+# The keys a profile mapping under `profiles:` may contain. `options` is
+# itself a free mapping of provider-specific knobs; its *contents* are the
+# provider adapter's to validate, its presence is checked here.
+PROFILE_KEYS = (
+    "provider",
+    "model",
+    "effort",
+    "command",
+    "extra_args",
+    "timeout_seconds",
+    "options",
+)
+
+EXECUTION_KEYS = ("default_timeout_seconds", "max_correction_attempts")
+
+
 @dataclass
 class ExecutionConfig:
     default_timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
@@ -97,6 +113,9 @@ DEFAULT_PROTECTED_MERGE_PATHS = (".github/workflows/",)
 # The keys `safety:` may contain. Anything else is a hard error: a typo such
 # as `allow_merges: true` must not fail closed *silently*, because the operator
 # then believes the gate is in the state they wrote, not the state it is in.
+# Every other section holds itself to the same rule (see `_section`): most of
+# them carry loop bounds or merge behaviour, where a misspelled key keeps a
+# looser built-in bound than the operator wrote.
 SAFETY_KEYS = (
     "allow_merge",
     "protected_merge_paths",
@@ -173,6 +192,9 @@ class SafetyConfig:
         return False
 
 
+GITHUB_KEYS = ("command", "timeout_seconds")
+
+
 @dataclass
 class GitHubConfig:
     command: str = "gh"
@@ -180,6 +202,8 @@ class GitHubConfig:
 
 
 MERGE_METHODS = ("squash", "merge", "rebase")
+
+MERGE_KEYS = ("method", "delete_branch", "max_verification_attempts", "verification_commands")
 
 
 @dataclass
@@ -210,6 +234,16 @@ class MergeConfig:
     verification_commands: list[list[str]] = field(default_factory=list)
 
 
+REPLAN_KEYS = (
+    "enabled",
+    "soft_threshold",
+    "hard_threshold",
+    "stagnation_window",
+    "max_findings_per_round",
+    "max_replans_per_issue",
+)
+
+
 @dataclass
 class ReplanConfig:
     """Controller policy for abandoning a non-converging implementation."""
@@ -230,9 +264,20 @@ class ReplanConfig:
     max_replans_per_issue: int = 2
 
 
+REVIEW_KEYS = ("replan",)
+
+
 @dataclass
 class ReviewConfig:
     replan: ReplanConfig = field(default_factory=ReplanConfig)
+
+
+WORKFLOW_KEYS = (
+    "max_review_rounds",
+    "stagnation_identical_rounds",
+    "stagnation_unchanged_count_rounds",
+    "max_total_steps",
+)
 
 
 @dataclass
@@ -265,6 +310,16 @@ class WorkflowConfig:
     # across `resume`). Persisted as ``step_count``; the CLI's ``--max-steps``
     # is only a per-invocation slice of this budget.
     max_total_steps: int = 300
+
+
+LOCAL_KEYS = (
+    "feature_dir",
+    "validation_commands",
+    "max_fix_rounds",
+    "exclude",
+    "max_workspace_entries",
+    "max_workspace_bytes",
+)
 
 
 @dataclass
@@ -314,6 +369,24 @@ class LocalConfig:
     def max_review_rounds(self) -> int:
         """Review passes a local run may complete (fix rounds + the first)."""
         return self.max_fix_rounds + 1
+
+
+# The keys a config file may contain at top level: the scalars read directly
+# below plus one entry per section. There is no `repository` key: the
+# repository comes from the issue URLs on the command line.
+TOP_LEVEL_KEYS = (
+    "version",
+    "state_dir",
+    "prompt_version",
+    "execution",
+    "safety",
+    "github",
+    "merge",
+    "review",
+    "workflow",
+    "local",
+    "profiles",
+)
 
 
 @dataclass
@@ -543,7 +616,31 @@ def _as_int(raw: object, source: str, key: str) -> int:
     raise ConfigurationError(f"{source}: {key!r} must be an integer, got {raw!r}")
 
 
-def _section(data: dict, key: str, source: str, label: str | None = None) -> dict:
+def _reject_unknown_keys(mapping: dict, known: tuple[str, ...], source: str, label: str) -> None:
+    """Fail on any key of ``mapping`` that the loader would not read.
+
+    Every known key is read with ``if key in section``, so a key that is not
+    known is not a wrong value: it is a *silent no-op* that leaves the
+    built-in default in force while ``doctor`` calls the file valid. For a
+    loop bound or a merge setting that means a looser bound than the operator
+    wrote, so the typo is an error, in the same shape for every section.
+    """
+    unknown = sorted(str(k) for k in mapping if k not in known)
+    if unknown:
+        raise ConfigurationError(
+            f"{source}: unknown key(s) under '{label}': {', '.join(unknown)} "
+            f"(known: {', '.join(known)})"
+        )
+
+
+def _section(
+    data: dict,
+    key: str,
+    source: str,
+    known: tuple[str, ...] | None,
+    label: str | None = None,
+    removed: dict[str, str] | None = None,
+) -> dict:
     """A config section: absent or ``null`` is the built-in default, else a mapping.
 
     ``null`` is what the YAML reader produces for a section header with every
@@ -553,16 +650,42 @@ def _section(data: dict, key: str, source: str, label: str | None = None) -> dic
     rather than normalised into an omitted section: ``data.get(key, {}) or
     {}`` would turn ``safety: []`` into a silently closed gate and let ``doctor``
     call that configuration valid.
+
+    ``known`` is the closed set of keys the section may contain; any other key
+    is rejected (see ``_reject_unknown_keys``). ``None`` is for a section
+    whose keys are *names* rather than a schema (``profiles``), where the
+    check belongs on each named mapping instead. ``removed`` maps a key that
+    used to be read to the message explaining where it went, so a config from
+    an older controller gets that explanation rather than "unknown key".
     """
     raw = data.get(key)
     if raw is None:
         return {}
+    name = label or key
     if not isinstance(raw, dict):
-        raise ConfigurationError(f"{source}: '{label or key}' must be a mapping, got {raw!r}")
+        raise ConfigurationError(f"{source}: '{name}' must be a mapping, got {raw!r}")
+    for old_key, message in (removed or {}).items():
+        if old_key in raw:
+            raise ConfigurationError(f"{source}: {message}")
+    if known is not None:
+        _reject_unknown_keys(raw, known, source, name)
     return raw
 
 
+# The merge gate once had a second, deprecated location. It is not read any
+# more -- not even as `false` -- because a config that sets both can be
+# "disabled" in one place and still open in the other.
+REMOVED_EXECUTION_KEYS = {
+    "allow_merge": (
+        "'execution.allow_merge' is no longer supported; the merge gate is "
+        "'safety.allow_merge' only. Remove the key from 'execution' (moving it to "
+        "'safety' if you meant to open the gate)"
+    ),
+}
+
+
 def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeConfig:
+    _reject_unknown_keys(data, TOP_LEVEL_KEYS, source, "the top level")
     version = data.get("version", CONFIG_VERSION)
     if version != CONFIG_VERSION:
         raise ConfigurationError(
@@ -572,7 +695,7 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
         base.state_dir = str(data["state_dir"])
     if "prompt_version" in data:
         base.prompt_version = str(data["prompt_version"])
-    exe = _section(data, "execution", source)
+    exe = _section(data, "execution", source, EXECUTION_KEYS, removed=REMOVED_EXECUTION_KEYS)
     if "default_timeout_seconds" in exe:
         timeout = _as_int(
             exe["default_timeout_seconds"], source, "execution.default_timeout_seconds"
@@ -592,22 +715,7 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
         base.execution.max_correction_attempts = _as_int(
             exe["max_correction_attempts"], source, "execution.max_correction_attempts"
         )
-    if "allow_merge" in exe:
-        # Once a second, deprecated location for the merge gate. It is not
-        # read any more -- not even as `false` -- because a config that sets
-        # both can be "disabled" in one place and still open in the other.
-        raise ConfigurationError(
-            f"{source}: 'execution.allow_merge' is no longer supported; the merge gate "
-            "is 'safety.allow_merge' only. Remove the key from 'execution' (moving it "
-            "to 'safety' if you meant to open the gate)"
-        )
-    safety = _section(data, "safety", source)
-    unknown_safety = sorted(str(k) for k in safety if k not in SAFETY_KEYS)
-    if unknown_safety:
-        raise ConfigurationError(
-            f"{source}: unknown key(s) under 'safety': {', '.join(unknown_safety)} "
-            f"(known: {', '.join(SAFETY_KEYS)})"
-        )
+    safety = _section(data, "safety", source, SAFETY_KEYS)
     if "allow_merge" in safety:
         base.safety.allow_merge = _as_bool(safety["allow_merge"], source, "safety.allow_merge")
         base.safety.allow_merge_source = f"{source}: safety.allow_merge"
@@ -623,14 +731,14 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
         base.safety.verify_check_definition = _as_bool(
             safety["verify_check_definition"], source, "safety.verify_check_definition"
         )
-    gh = _section(data, "github", source)
+    gh = _section(data, "github", source, GITHUB_KEYS)
     if "command" in gh:
         base.github.command = str(gh["command"])
     if "timeout_seconds" in gh:
         base.github.timeout_seconds = _as_int(
             gh["timeout_seconds"], source, "github.timeout_seconds"
         )
-    merge = _section(data, "merge", source)
+    merge = _section(data, "merge", source, MERGE_KEYS)
     if "method" in merge:
         method = merge["method"]
         if not isinstance(method, str) or method not in MERGE_METHODS:
@@ -653,8 +761,8 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
         base.merge.verification_commands = _as_argv_list(
             merge["verification_commands"], source, "merge.verification_commands"
         )
-    review = _section(data, "review", source)
-    replan = _section(review, "replan", source, label="review.replan")
+    review = _section(data, "review", source, REVIEW_KEYS)
+    replan = _section(review, "replan", source, REPLAN_KEYS, label="review.replan")
     rp = base.review.replan
     if "enabled" in replan:
         rp.enabled = _as_bool(replan["enabled"], source, "review.replan.enabled")
@@ -676,7 +784,7 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
         raise ConfigurationError(
             f"{source}: 'review.replan.hard_threshold' must be >= 'review.replan.soft_threshold'"
         )
-    workflow = _section(data, "workflow", source)
+    workflow = _section(data, "workflow", source, WORKFLOW_KEYS)
     for key, minimum in (("max_review_rounds", 1), ("max_total_steps", 1)):
         if key in workflow:
             value = _as_int(workflow[key], source, f"workflow.{key}")
@@ -703,7 +811,7 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
         raise ConfigurationError(
             f"{source}: 'review.replan.hard_threshold' must be <= 'workflow.max_review_rounds'"
         )
-    local = _section(data, "local", source)
+    local = _section(data, "local", source, LOCAL_KEYS)
     if "feature_dir" in local:
         feature_dir = str(local["feature_dir"]).strip()
         if not feature_dir:
@@ -743,10 +851,13 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
                     f"{source}: 'local.{name}' must be >= {minimum}, got {value}"
                 )
             setattr(base.local, attr, value)
-    profiles = _section(data, "profiles", source)
+    # Keyed by profile *name*, so the closed key set applies to each profile
+    # mapping rather than to the section.
+    profiles = _section(data, "profiles", source, known=None)
     for name, p in profiles.items():
         if not isinstance(p, dict):
             raise ConfigurationError(f"{source}: profile {name!r} must be a mapping")
+        _reject_unknown_keys(p, PROFILE_KEYS, source, f"profiles.{name}")
         if name in base.profiles:
             cur = base.profiles[name]
             if "provider" in p:

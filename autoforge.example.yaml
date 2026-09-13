@@ -5,6 +5,11 @@
 # command / model identifiers live here so controller source never changes
 # when vendors rename flags or models.
 #
+# Every key must be one the controller reads. A key it does not know -- at
+# the top level, under any section, or in a profile -- is a load error that
+# names the section and its known keys, never a silently ignored typo (a
+# misspelled loop bound would otherwise keep the looser built-in default).
+#
 # CLI facts these defaults were checked against (2026-09):
 #   claude   2.1.x   -> claude -p --output-format text --model <alias> --effort <e>
 #                       --permission-mode <mode> --no-session-persistence -- <prompt>
@@ -32,10 +37,11 @@ execution:
 safety:
   # Controller invariant: no real merge unless this is true AND the CLI is
   # invoked with --allow-merge. Automatic merge is disabled in this milestone.
-  # This is the only key that opens the gate, and any other key under
-  # `safety` (a typo such as `allow_merges`) is a configuration error rather
-  # than a silent no-op. `autoforge doctor` prints the effective gate state
-  # and the file/key it came from.
+  # This is the only key that opens the gate. Like every section in this
+  # file, `safety` accepts only the keys the controller reads: a typo such as
+  # `allow_merges` is a configuration error rather than a silent no-op.
+  # `autoforge doctor` prints the effective gate state and the file/key it
+  # came from.
   allow_merge: false
   # Paths a PR may not change and still be merged unattended. GitHub runs the
   # *PR's own* copy of `.github/workflows/` and reports it under the same
