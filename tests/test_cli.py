@@ -453,6 +453,8 @@ def test_doctor_with_fake_runner(tmp_path, capsys, monkeypatch):
     rc = cli.main(["--state-dir", str(tmp_path / ".autoforge"), "doctor"])
     out = capsys.readouterr().out
     assert rc == 1 and "gh authenticated" in out and "FAIL" in out
+    # `gh --version` answers "ok 1.0" here: an unreadable version is a FAIL, not a pass.
+    assert "[FAIL] gh available: cannot read the gh version" in out
     assert "merge gate: CLOSED: safety.allow_merge=false (built-in default)" in out
     assert cli.main(["--state-dir", str(tmp_path / ".autoforge"), "doctor", "--json"]) == 1
     data = json.loads(capsys.readouterr().out)
@@ -478,6 +480,10 @@ def test_doctor_reports_an_unreadable_branch_rule_as_skipped(tmp_path, capsys, m
             return ExecutionResult(argv, req.cwd, 0, out, "", "t", "t")
         if argv[:2] == ["gh", "api"]:
             return ExecutionResult(argv, req.cwd, 1, "", "gh: Not Found (HTTP 404)", "t", "t")
+        if argv == ["gh", "--version"]:
+            return ExecutionResult(
+                argv, req.cwd, 0, "gh version 2.48.0 (2024-04-09)\n", "", "t", "t"
+            )
         return ExecutionResult(argv, req.cwd, 0, "ok 1.0\n", "", "t", "t")
 
     monkeypatch.setattr(cli, "_doctor_runner", lambda: runner)

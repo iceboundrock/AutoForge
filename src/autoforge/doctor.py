@@ -27,7 +27,12 @@ from .errors import (
     StateError,
 )
 from .executor import ExecutionRequest, ExecutionResult, execute
-from .github import GitHubClient, is_access_denied_gh_failure
+from .github import (
+    GH_MIN_VERSION,
+    GitHubClient,
+    is_access_denied_gh_failure,
+    parse_gh_version,
+)
 from .local_workspace import DEFAULT_MAX_BYTES, DEFAULT_MAX_ENTRIES
 from .profiles import local_required_profiles
 from .safefs import SafeRoot
@@ -341,6 +346,35 @@ class Doctor:
             detail += " (classic branch protection exists but requires no status check)"
         return CheckResult(name, False, "; ".join([detail, *hints, remedy]))
 
+    def check_gh_version(self, gh: str) -> CheckResult:
+        """`gh` runs and is at least :data:`GH_MIN_VERSION`.
+
+        The client's paginated reads use `gh api --paginate --slurp`, which an
+        older `gh` rejects. That would surface only as a conclusive read
+        failure at the merge gate (BLOCKED) or as a SKIP of the branch-rule
+        check, so the version is refused here, up front, with the minimum
+        named. A `--version` line the check cannot parse is a FAIL too: an
+        unknown version is not a known-good one.
+        """
+        name = "gh available"
+        ok, detail = self._run([gh, "--version"])
+        if not ok:
+            return CheckResult(name, False, detail)
+        minimum = ".".join(str(part) for part in GH_MIN_VERSION)
+        found = parse_gh_version(detail)
+        if found is None:
+            return CheckResult(
+                name, False, f"cannot read the gh version from {detail!r} (need >= {minimum})"
+            )
+        if found < GH_MIN_VERSION:
+            return CheckResult(
+                name,
+                False,
+                f"{detail}: gh >= {minimum} is required "
+                "(`gh api --paginate --slurp`, used to list branch rules and a PR's changed files)",
+            )
+        return CheckResult(name, True, detail)
+
     def check_gh_auth(self, gh: str) -> CheckResult:
         ok, detail = self._run([gh, "auth", "status"])
         return CheckResult("gh authenticated", ok, detail)
@@ -512,7 +546,7 @@ class Doctor:
         gh = cfg.github.command if cfg else "gh"
         claude_cmd, opencode_cmd = self._agent_commands(cfg)
         results.append(self._version_check("git available", ["git", "--version"]))
-        results.append(self._version_check("gh available", [gh, "--version"]))
+        results.append(self.check_gh_version(gh))
         results.append(self.check_gh_auth(gh))
         results.append(self._version_check("claude available", [claude_cmd, "--version"]))
         results.append(self._version_check("opencode available", [opencode_cmd, "--version"]))

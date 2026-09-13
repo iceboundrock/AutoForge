@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 from autoforge.doctor import Doctor
 from autoforge.executor import ExecutionResult
 
@@ -53,12 +55,17 @@ HEALTHY_GITHUB = {
 }
 
 
+# What a recent enough `gh --version` prints (first line).
+GH_VERSION_LINE = "gh version 2.48.0 (2024-04-09)"
+
+
 def _runner_factory(
     git_remote="https://github.com/owner/repo.git",
     fail=(),
     github=None,
     default_branch="main",
     calls=None,
+    gh_version=GH_VERSION_LINE,
 ):
     """Fake runner. ``github`` maps a `gh api` endpoint to its JSON payload, or to
     an ``(exit_code, stderr)`` pair for a failed read; ``--paginate --slurp``
@@ -91,6 +98,8 @@ def _runner_factory(
                 code, stderr = payload
                 return ExecutionResult(argv, req.cwd, code, "", stderr, "t", "t")
             out = json.dumps([payload] if paginated else payload)
+        elif argv == ["gh", "--version"]:
+            out = gh_version + "\nhttps://github.com/cli/cli/releases/tag/v2.48.0"
         else:
             out = f"{argv[0]} version 1.0"
         return ExecutionResult(argv, req.cwd, 0, out + "\n", "", "t", "t")
@@ -133,6 +142,45 @@ def test_failures_are_reported_not_raised(tmp_path):
     assert not results["gh authenticated"].ok
     assert not results["opencode available"].ok
     assert results["git available"].ok
+
+
+# -- `gh` minimum version (issue #43) ------------------------------------------------------
+# Every paginated read (`gh api --paginate --slurp`) needs gh >= 2.48.0; an
+# older gh would fail those reads conclusively at the merge gate instead.
+def _gh_check(tmp_path, gh_version):
+    d = Doctor(cwd=str(tmp_path), runner=_runner_factory(gh_version=gh_version))
+    return {r.name: r for r in d.run_all()}["gh available"]
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["gh version 2.48.0 (2024-04-09)", "gh version 2.100.0 (2026-09-03)", "gh version 3.0.0"],
+)
+def test_gh_at_or_above_the_minimum_passes(tmp_path, line):
+    result = _gh_check(tmp_path, line)
+    assert result.ok and result.detail == line
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["gh version 2.47.9 (2024-03-20)", "gh version 1.99.0", "gh version 2.9.0 (2022-01-01)"],
+)
+def test_gh_below_the_minimum_fails_and_names_it(tmp_path, line):
+    result = _gh_check(tmp_path, line)
+    assert not result.ok
+    assert line in result.detail and "2.48.0" in result.detail and "--slurp" in result.detail
+
+
+@pytest.mark.parametrize("line", ["", "gh 2.48.0", "version 2.48.0", "gh version two"])
+def test_an_unreadable_gh_version_fails_rather_than_passes(tmp_path, line):
+    result = _gh_check(tmp_path, line)
+    assert not result.ok and "2.48.0" in result.detail
+
+
+def test_a_missing_gh_is_reported_as_before(tmp_path):
+    d = Doctor(cwd=str(tmp_path), runner=_runner_factory(fail=("gh --version",)))
+    result = {r.name: r for r in d.run_all()}["gh available"]
+    assert not result.ok and "boom" in result.detail
 
 
 def test_non_github_remote_fails(tmp_path):

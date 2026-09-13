@@ -1122,6 +1122,34 @@ def test_a_rename_counts_as_one_file_against_the_truncation_check(tmp_state_dir,
     assert fake_github.merges == []
 
 
+def test_merge_blocks_on_a_protected_path_past_the_first_page(tmp_state_dir, fake_github):
+    """A PR with more than one page of files is judged on all of them (issue #43).
+
+    The protected file sits after the first 100 entries: a complete listing
+    blocks for the *path*, not for a listing the controller could not read.
+    """
+    fake_github.add_pr().checks = [CheckInfo(name="ci", state="COMPLETED", conclusion="SUCCESS")]
+    files = [f"src/pkg/module_{i}.py" for i in range(120)] + [WORKFLOW_PATH]
+    fake_github.changed_files[PR] = files
+    fake_github.changed_files_total[PR] = len(files)
+    eng, out = _park_and_step(tmp_state_dir, fake_github)
+    assert out.next_phase == "BLOCKED"
+    assert WORKFLOW_PATH in eng.state.block_reason
+    assert "changed files for" not in eng.state.block_reason
+    assert fake_github.merges == []
+
+
+def test_merge_proceeds_on_a_complete_multi_page_listing_without_protected_paths(
+    tmp_state_dir, fake_github
+):
+    fake_github.add_pr()
+    files = [f"src/pkg/module_{i}.py" for i in range(250)]
+    fake_github.changed_files[PR] = files
+    fake_github.changed_files_total[PR] = len(files)
+    eng, out = _park_and_step(tmp_state_dir, fake_github)
+    assert out.next_phase == "UPDATE_EPIC" and len(fake_github.merges) == 1
+
+
 def test_merge_blocks_when_the_changed_file_listing_may_be_truncated(tmp_state_dir, fake_github):
     """A listing shorter than GitHub's own count cannot prove absence."""
     fake_github.add_pr()
