@@ -61,9 +61,10 @@ import json
 import re
 import secrets
 from collections.abc import Iterable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from enum import StrEnum
 
+from .errors import ConfigurationError
 from .github import PRInfo
 from .validation import parse_issue_url, parse_pr_url
 
@@ -322,6 +323,47 @@ def source_marker_defect(
     return ""
 
 
+# Persisted URL fields are validated by shape as well as by type: a string
+# that is not a GitHub URL would otherwise surface as a ``ConfigurationError``
+# from the first ``parse_*_url`` on the resume path -- a crash, not a refusal.
+_ISSUE_URL_FIELDS = frozenset({"issue_url"})
+_PR_URL_FIELDS = frozenset({"source_pr_url", "replacement_pr_url", "rejected_pr_url"})
+
+
+def _field_defect(name: str, annotation: str, value: object) -> str:
+    """Why ``value`` cannot be loaded into the field ``name``, or ``""``.
+
+    The check is driven by the dataclass annotation (a string, because the
+    module defers annotation evaluation), so a field added to the transaction
+    is validated by construction: an annotation this does not understand is a
+    programming error and is raised, never waved through.
+    """
+    kind = type(value).__name__
+    if annotation == "str":
+        if not isinstance(value, str):
+            return f"{name} must be a string, got {kind}"
+        if value and name in _ISSUE_URL_FIELDS | _PR_URL_FIELDS:
+            parser = parse_issue_url if name in _ISSUE_URL_FIELDS else parse_pr_url
+            try:
+                parser(value)
+            except ConfigurationError as exc:
+                return f"{name} is not a GitHub URL ({exc})"
+        return ""
+    if annotation == "int":
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return f"{name} must be an integer >= 0, got {value!r}"
+        return ""
+    if annotation == "list[str]":
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            return f"{name} must be a list of strings, got {kind}"
+        return ""
+    if annotation == "dict":
+        if not isinstance(value, dict):
+            return f"{name} must be an object, got {kind}"
+        return ""
+    raise TypeError(f"ReplanTransaction field {name!r} has unvalidated type {annotation!r}")
+
+
 @dataclass
 class ReplanTransaction:
     """Durable intent for one replan. Persisted as ``state.replan_transaction``.
@@ -398,35 +440,66 @@ class ReplanTransaction:
 
     escalation: dict = field(default_factory=dict)
 
+    # -- journal integrity (never persisted) ------------------------------
+    # Why :meth:`from_dict` coerced this transaction to ``REJECTED``: one
+    # reason per persisted field it could not read. Empty for a well-formed
+    # journal. Kept off disk so the corrupt evidence is never overwritten by
+    # the defaults that stand in for it here.
+    journal_defects: list[str] = field(default_factory=list)
+
     # -- persistence ------------------------------------------------------
     def to_dict(self) -> dict:
         data = asdict(self)
         data["stage"] = self.stage.value
+        del data["journal_defects"]
         return data
 
     @classmethod
     def from_dict(cls, data: dict) -> ReplanTransaction:
         """Load persisted intent; unknown/omitted fields fall back to defaults.
 
-        An unreadable stage is *not* coerced to a runnable one — it becomes
-        ``REJECTED`` so a hand-edited or future-version journal fails closed
-        instead of resuming a destructive write from an unknown position.
+        Every *present* field is schema-checked. A field that cannot be read
+        -- an unknown stage, a watermark stored as a string, an escalation
+        stored as a list -- is *not* coerced to a runnable value: the
+        transaction becomes ``REJECTED`` with the defects named, so a
+        hand-edited, truncated or future-version journal fails closed
+        instead of resuming a destructive write from an unknown position, and
+        instead of crashing on the first use of the field so that every
+        ``resume`` dies identically. The unreadable fields fall back to their
+        defaults in memory only (see ``journal_defects``).
         """
         if not isinstance(data, dict):
             raise ValueError("replan transaction must be a JSON object")
-        known = {f for f in cls.__dataclass_fields__}
-        kwargs = {k: v for k, v in data.items() if k in known}
-        raw_stage = kwargs.pop("stage", ReplanStage.PENDING.value)
+        kwargs: dict = {}
+        defects: list[str] = []
+        raw_stage = data.get("stage", ReplanStage.PENDING.value)
         try:
+            if not isinstance(raw_stage, str):
+                raise ValueError(raw_stage)
             stage = ReplanStage(raw_stage)
         except ValueError:
             stage = ReplanStage.REJECTED
-            if not kwargs.get("rejection_reason"):
-                kwargs["rejection_reason"] = (
-                    f"persisted replan transaction has unknown stage {raw_stage!r}"
-                )
-        txn = cls(stage=stage, **kwargs)
-        return txn
+            defects.append(f"unknown stage {raw_stage!r}")
+        for spec in fields(cls):
+            if spec.name in ("stage", "journal_defects") or spec.name not in data:
+                continue
+            value = data[spec.name]
+            defect = _field_defect(spec.name, str(spec.type), value)
+            if defect:
+                defects.append(defect)
+                continue
+            kwargs[spec.name] = value
+        if defects:
+            stage = ReplanStage.REJECTED
+            prior = kwargs.get("rejection_reason", "")
+            kwargs["rejection_reason"] = (
+                "persisted replan transaction is corrupt: "
+                + "; ".join(defects)
+                + f" (recorded stage {raw_stage!r}"
+                + (f", recorded rejection: {prior}" if prior else "")
+                + ")"
+            )
+        return cls(stage=stage, journal_defects=defects, **kwargs)
 
     @property
     def is_bound(self) -> bool:
@@ -460,6 +533,17 @@ def _canonical(url: str) -> str:
         return ""
 
 
+def _same_sha(observed: str, expected: str) -> bool:
+    """One rule for every SHA comparison: case-insensitive, and never vacuous.
+
+    `gh` reports hexadecimal SHAs in lower case, but a checkpoint can come
+    from anywhere a human can type (state recorded from a CONTROL_RESULT, a
+    hand-repaired journal), so case must not decide a supersede. An empty
+    side never matches: an unreadable HEAD is not "the same" as anything.
+    """
+    return bool(observed) and bool(expected) and observed.lower() == expected.lower()
+
+
 def verify_decision_point(pr: PRInfo, txn: ReplanTransaction) -> str:
     """The source must still be the revision whose review decided the replan.
 
@@ -478,7 +562,7 @@ def verify_decision_point(pr: PRInfo, txn: ReplanTransaction) -> str:
             "the replan transaction does not record the reviewed HEAD that decided it, so the "
             "source cannot be proven to be the revision the findings belong to"
         )
-    if pr.head_sha.lower() != txn.decision_head_sha.lower():
+    if not _same_sha(pr.head_sha, txn.decision_head_sha):
         return (
             f"source PR {txn.source_pr_url} is at HEAD {pr.head_sha or '(unreadable)'}, but the "
             f"review that decided this replan ran on {txn.decision_head_sha}; the current work "
@@ -519,7 +603,7 @@ def verify_source_checkpoint(pr: PRInfo, txn: ReplanTransaction) -> str:
             f"source PR {txn.source_pr_url} moved from the checkpointed branch "
             f"{txn.source_branch!r} to {pr.head_ref!r}"
         )
-    if pr.head_sha != txn.source_head_sha:
+    if not _same_sha(pr.head_sha, txn.source_head_sha):
         return (
             f"source PR {txn.source_pr_url} advanced from the checkpointed HEAD "
             f"{txn.source_head_sha} to {pr.head_sha or '(unreadable)'}; the newer work was never "
@@ -527,7 +611,7 @@ def verify_source_checkpoint(pr: PRInfo, txn: ReplanTransaction) -> str:
         )
     # Defence in depth: the checkpoint is only allowed to hold the revision the
     # review decided on, so a journal in which the two disagree is unusable.
-    if txn.decision_head_sha and txn.source_head_sha.lower() != txn.decision_head_sha.lower():
+    if txn.decision_head_sha and not _same_sha(txn.source_head_sha, txn.decision_head_sha):
         return (
             f"checkpointed source HEAD {txn.source_head_sha} is not the reviewed HEAD "
             f"{txn.decision_head_sha} that decided this replan"
@@ -576,10 +660,13 @@ def verify_target_pr(
         )
     if pr.base_ref != txn.base_branch:
         return f"replacement PR base {pr.base_ref!r} != verified default branch {txn.base_branch!r}"
-    issue_number = parse_issue_url(txn.issue_url).number
+    try:
+        issue_number = parse_issue_url(txn.issue_url).number
+    except ConfigurationError as exc:
+        return f"replan transaction records no usable issue URL ({exc})"
     if issue_number not in pr.linked_issue_numbers:
         return f"replacement PR {ref_canonical} is not linked to issue #{issue_number}"
-    if require_checkpoint_head and pr.head_sha != txn.replacement_head_sha:
+    if require_checkpoint_head and not _same_sha(pr.head_sha, txn.replacement_head_sha):
         return (
             f"replacement PR {ref_canonical} advanced from the verified HEAD "
             f"{txn.replacement_head_sha} to {pr.head_sha}; it is no longer the implementation "
@@ -647,7 +734,7 @@ def verify_closed_source(pr: PRInfo, txn: ReplanTransaction) -> str:
             f"source PR {txn.source_pr_url} moved from the checkpointed branch "
             f"{txn.source_branch!r} to {pr.head_ref!r} inside the close window"
         )
-    if pr.head_sha != txn.source_head_sha:
+    if not _same_sha(pr.head_sha, txn.source_head_sha):
         return (
             f"source PR {txn.source_pr_url} advanced from the checkpointed HEAD "
             f"{txn.source_head_sha} to {pr.head_sha or '(unreadable)'} inside the close window; "

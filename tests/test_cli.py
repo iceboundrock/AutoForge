@@ -136,6 +136,42 @@ def test_run_then_status_json(tmp_path, capsys, monkeypatch, fakes):
     assert "ANALYZE_EXECUTE" in capsys.readouterr().out
 
 
+def test_status_describes_a_corrupt_replan_transaction_instead_of_crashing(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """#35 F6: an unreadable journal field is reported, not raised as a traceback."""
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    assert (
+        cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"])
+        == 0
+    )
+    capsys.readouterr()
+    state_file = tmp_path / ".autoforge" / "state.json"
+    data = json.loads(state_file.read_text())
+    data["phase"] = "REPLAN_REEXECUTE"
+    data["replan_transaction"] = {
+        "transaction_id": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+        "stage": "supersede_intent",
+        "source_pr_url": PR,
+        "pr_number_watermark": "12",
+        "escalation": ["hard_review_round_threshold"],
+    }
+    state_file.write_text(json.dumps(data))
+    assert cli.main(["--state-dir", sd, "status"]) == 0
+    out = capsys.readouterr().out
+    assert "Replan transaction: a1b2c3d4e5f60718293a4b5c6d7e8f90" in out
+    assert "stage:       rejected" in out
+    assert "journal:     CORRUPT (" in out
+    assert "pr_number_watermark must be an integer" in out
+    assert "escalation must be an object" in out
+    assert "recorded stage 'supersede_intent'" in out
+    # --json prints the journal as persisted, corrupt values included.
+    assert cli.main(["--state-dir", sd, "status", "--json"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["replan_transaction"]["pr_number_watermark"] == "12"
+
+
 def test_run_refuses_to_overwrite_active_state(tmp_path, capsys, monkeypatch, fakes):
     monkeypatch.chdir(tmp_path)
     sd = str(tmp_path / ".autoforge")

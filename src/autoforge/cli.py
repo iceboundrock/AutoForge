@@ -596,9 +596,16 @@ def cmd_status(args) -> int:
         for item in state.superseded_prs:
             print(f"  {item.get('pr_url', '-')} -> {item.get('replacement_pr_url', '-')}")
     if state.replan_transaction:
-        txn = ReplanTransaction.from_dict(state.replan_transaction)
+        try:
+            txn = ReplanTransaction.from_dict(state.replan_transaction)
+        except ValueError as exc:
+            # The same loud failure `load()` gives an unreadable state file:
+            # status must describe a corrupt journal, never die on it.
+            raise StateError(f"state field 'replan_transaction' is unusable: {exc}") from None
         print(f"Replan transaction: {txn.transaction_id or '(not yet created)'}")
         print(f"  stage:       {txn.stage.value}")
+        if txn.journal_defects:
+            print(f"  journal:     CORRUPT ({'; '.join(txn.journal_defects)})")
         print(f"  source PR:   {txn.source_pr_url or '-'}")
         print(f"  replacement: {txn.replacement_pr_url or '-'}")
         print(f"  escalation:  {json.dumps(txn.escalation, sort_keys=True)}")

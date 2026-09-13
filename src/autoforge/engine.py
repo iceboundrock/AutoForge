@@ -3048,7 +3048,17 @@ class ControllerEngine:
             ReplanStage.COMPENSATING,
             ReplanStage.SUPERSEDED,
         )
-        if txn.stage in began_closing or txn.superseded_at:
+        if txn.journal_defects:
+            # The journal could not be read in full, so it cannot say whether
+            # the close it may have recorded was performed. Never claim that
+            # nothing happened on the strength of fields that fell back to
+            # their defaults.
+            tail = (
+                "The persisted transaction is unreadable, so whether the source PR "
+                f"{txn.source_pr_url or '(unknown)'} was already closed by it cannot be "
+                "determined from local state; check GitHub before repairing the journal"
+            )
+        elif txn.stage in began_closing or txn.superseded_at:
             tail = (
                 f"This transaction had already begun closing the source PR {txn.source_pr_url}, "
                 f"and the replacement {txn.replacement_pr_url or '(none)'} was not activated"
@@ -3148,7 +3158,10 @@ class ControllerEngine:
             )
         if not state.current_pr_url:
             raise StateError("REPLAN_REEXECUTE requires current_pr_url in state")
-        issue = parse_issue_url(state.current_issue_url)
+        try:
+            issue = parse_issue_url(state.current_issue_url)
+        except ConfigurationError as exc:
+            return self._reject_replan(txn, f"cannot checkpoint the replan source: {exc}")
         try:
             source = self.github.get_pr(state.current_pr_url)
             repo = self.github.get_repo(state.repository)
@@ -3163,17 +3176,29 @@ class ControllerEngine:
             raise  # unknown, not refused: `resume` re-reads
         except GitHubError as exc:
             return self._reject_replan(txn, f"cannot checkpoint the replan source: {exc}")
-        source_ref = parse_pr_url(source.url or state.current_pr_url)
+        try:
+            # URLs read back from GitHub are data, not proof of shape: a
+            # malformed one is a conclusive refusal, not a crash.
+            source_ref = parse_pr_url(source.url or state.current_pr_url)
+            preexisting_urls = sorted(
+                {parse_pr_url(pr.url).canonical for pr in preexisting if pr.url}
+            )
+        except ConfigurationError as exc:
+            return self._reject_replan(txn, f"cannot checkpoint the replan source: {exc}")
         if source_ref.repository.lower() != state.repository.lower():
             return self._reject_replan(
                 txn, f"PR {source_ref.canonical} is not in {state.repository}"
             )
-        if not source.is_open or not source.head_sha:
+        if not source.is_open or not source.head_sha or not source.head_ref:
+            # The branch is checkpointed alongside the HEAD and enforced by
+            # every later source comparison; an empty one would enforce
+            # nothing, so it is refused exactly like an unreadable HEAD.
             return self._reject_replan(
                 txn,
                 f"PR {source_ref.canonical} is {source.state or '(unknown)'} with HEAD "
-                f"{source.head_sha or '(unreadable)'}; only an OPEN PR at a readable HEAD can be "
-                "superseded",
+                f"{source.head_sha or '(unreadable)'} on branch "
+                f"{source.head_ref or '(unreadable)'}; only an OPEN PR at a readable HEAD and "
+                "branch can be superseded",
             )
         if not repo.default_branch:
             return self._reject_replan(
@@ -3210,9 +3235,7 @@ class ControllerEngine:
         txn.rendered_findings = history.render_findings()
         txn.rendered_observations = history.render_observations()
         txn.rendered_verification_failures = history.render_verification_failures()
-        txn.preexisting_pr_urls = sorted(
-            {parse_pr_url(pr.url).canonical for pr in preexisting if pr.url}
-        )
+        txn.preexisting_pr_urls = preexisting_urls
         txn.pr_number_watermark = watermark
         txn.expected_execution_attempt = state.execution_attempt + 1
         self._save_replan_txn(txn)
