@@ -65,6 +65,21 @@ safety:
   # check is required.
   required_checks:
     - "ci"
+  # Compare each required check's *definition* with the base branch's before
+  # a merge. GitHub runs the PR's own copy of the workflow, so a green check
+  # proves that whatever the PR defined passed. With this on, the controller
+  # resolves every context in `required_checks` to its GitHub Actions run
+  # (must be in this repository, at the reviewed HEAD, completed), reads the
+  # run's jobs and steps, and compares that structure with the base branch's
+  # own `push` run of the same workflow at the branch's current tip. Any
+  # difference -- a job or step missing, added, renamed or reordered -- is
+  # BLOCKED with the first difference named; a base branch without a
+  # successful run of that workflow at its tip is BLOCKED too (make the base
+  # branch green first); a base run still in progress is inconclusive and
+  # re-checked on `resume --allow-merge`. Structural only: step *commands*
+  # are not compared, and a check that is not an Actions run cannot be
+  # verified and is BLOCKED. Set to false to trust the check name alone.
+  verify_check_definition: true
 
 merge:
   # How the CONTROLLER merges once the gate above is open. Agents never merge:
@@ -81,6 +96,25 @@ merge:
   # `step --allow-merge`), one attempt per invocation, at most this many
   # times per phase; then the run is BLOCKED instead of retrying forever.
   max_verification_attempts: 5
+  # Commands the CONTROLLER runs locally on the reviewed HEAD before merging
+  # (argv lists; nothing goes through a shell). A hosted check runs the PR's
+  # own code, so it cannot tell whether the PR weakened what its tests
+  # assert; these commands are the controller's own evidence, run only after
+  # every GitHub-side fact above has passed. The reviewed commit is exported
+  # into a fresh temporary directory (`git read-tree` + `checkout-index`; no
+  # worktree, no branch, no `.git`, submodules not populated) which is the
+  # commands' cwd; if the commit is not local yet, `refs/pull/<n>/head` is
+  # fetched from `origin` (objects only, no local ref). A non-zero exit or a
+  # timeout (`execution.default_timeout_seconds`) is BLOCKED with the output
+  # tail; an unfetchable or unexportable commit is inconclusive. A pass is
+  # persisted per (HEAD, command list) so `resume` does not repeat it, and is
+  # cleared when the run moves to another issue. Dry-run runs nothing and
+  # lists the commands in the plan. The commands inherit the operator's
+  # environment. Empty (the default): nothing runs locally before a merge.
+  verification_commands: []
+  #  - ["uv", "run", "--frozen", "pytest", "-q"]
+  #  - ["uv", "run", "ruff", "check", "src", "tests"]
+  #  - ["uv", "run", "mypy", "src"]
 
 workflow:
   # Loop bounds enforced by the controller (never by a prompt). Each one ends

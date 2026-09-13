@@ -172,6 +172,43 @@ class Doctor:
             )
         return CheckResult(name, True, detail, required=False)
 
+    def check_premerge_verification(self) -> CheckResult:
+        """Report the controller's own pre-merge evidence (informational; runs nothing).
+
+        A green required check proves the PR's workflow ran, not that the
+        base branch's definition ran (``safety.verify_check_definition``)
+        and not what the tests assert (``merge.verification_commands``).
+        With the config half of the merge gate open and neither in place,
+        the hosted check alone decides what gets merged unattended, which
+        is worth stating next to the gate rather than discovering later.
+        """
+        name = "pre-merge verification"
+        cfg = self.config
+        if cfg is None:
+            return CheckResult(name, False, "(config check failed)", required=False)
+        definition = bool(cfg.safety.verify_check_definition and cfg.safety.required_checks)
+        commands = cfg.merge.verification_commands
+        parts = [
+            (
+                "check definition compared to the base branch's run "
+                f"({', '.join(cfg.safety.required_checks)})"
+                if definition
+                else "check definition NOT verified (safety.verify_check_definition)"
+            ),
+            (
+                "local commands: " + "; ".join(" ".join(argv) for argv in commands)
+                if commands
+                else "no merge.verification_commands: nothing runs locally before a merge"
+            ),
+        ]
+        detail = "; ".join(parts)
+        if cfg.merge_allowed_by_config and not commands:
+            detail += (
+                " -- with safety.allow_merge=true a green check is the only evidence about "
+                "what the PR's tests assert; consider merge.verification_commands"
+            )
+        return CheckResult(name, True, detail, required=False)
+
     def check_state_dir(self) -> CheckResult:
         d = self.state_dir or (self.config.state_dir if self.config else ".autoforge")
         path = Path(self.cwd) / d if not Path(d).is_absolute() else Path(d)
@@ -541,7 +578,7 @@ class Doctor:
         return claude_cmd, opencode_cmd
 
     def run_all(self) -> list[CheckResult]:
-        results = [self.check_config(), self.check_merge_gate()]
+        results = [self.check_config(), self.check_merge_gate(), self.check_premerge_verification()]
         cfg = self.config
         gh = cfg.github.command if cfg else "gh"
         claude_cmd, opencode_cmd = self._agent_commands(cfg)

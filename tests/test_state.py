@@ -109,6 +109,9 @@ def test_load_rejects_non_list_next_issue_rejections(tmp_path):
         ("last_fix_resolutions", [1]),
         ("next_issue_rejections", [1]),
         ("superseded_prs", [1]),
+        ("premerge_verified_commands", ["make check"]),
+        ("premerge_verified_commands", [["make", 1]]),
+        ("premerge_verified_commands", "make check"),
     ],
 )
 def test_load_rejects_wrong_list_element_types(tmp_path, field, bad):
@@ -739,3 +742,19 @@ def test_the_engine_holds_its_state_root_and_refuses_a_replacement(tmp_path):
     engine.close()
     with pytest.raises(StateError, match="closed"):
         _ = first.fd
+
+
+def test_premerge_verification_pass_round_trips_and_is_optional(tmp_path):
+    """#42: the pass is bound to a HEAD and a command list; an old state has neither."""
+    p = tmp_path / "state.json"
+    s = make_state(premerge_verified_head_sha="a" * 40, premerge_verified_commands=[["make"]])
+    save_state(s, p)
+    loaded = load_state(p)
+    assert loaded.premerge_verified_head_sha == "a" * 40
+    assert loaded.premerge_verified_commands == [["make"]]
+    d = s.to_dict()
+    del d["premerge_verified_head_sha"]
+    del d["premerge_verified_commands"]
+    p.write_text(json.dumps(d), encoding="utf-8")
+    loaded = load_state(p)
+    assert loaded.premerge_verified_head_sha == "" and loaded.premerge_verified_commands == []

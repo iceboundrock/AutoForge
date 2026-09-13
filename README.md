@@ -243,8 +243,8 @@ Key design points:
 | `REVIEW` | OpenCode (round 1 `openai/gpt-5.6-luna` high, rounds 2–5 `openai/gpt-5.6-terra` high, 6+ `openai/gpt-5.6-sol` medium, intentionally retained through the 20-round cap) | round number, reviewed SHA == bound HEAD, exactly one review comment on this PR with the `# AI Code Review — Round N` heading and the `ai-review-result` marker matching round/SHA/flag, findings invariant; then controller policy: an eligible replan (including workflow stagnation or the cap) enters `REPLAN_REEXECUTE`; an exhausted replan limit or no eligible replan blocks. Entering `REVIEW` past the cap (stale re-review, HEAD drift, resume) is refused before the reviewer runs |
 | `FIX` | Claude Code (`fable`, effort high) | `previous_head_sha` == current HEAD, every open finding ID resolved (`fixed` / `follow_up_created` / `no_change_with_rationale`), follow-up issues exist in this repo and are OPEN, actual PR HEAD == `new_head_sha`, a `fixed` resolution moved HEAD |
 | `REPLAN_REEXECUTE` | OpenCode (`replan_reexecute`, default `openai/gpt-5.6-terra`, effort high) | One durable transaction. `PREPARED` (written before the agent runs) checkpoints the source PR at its exact HEAD, the verified default branch, the complete historical findings, the identities of the already-open PRs, and a random transaction id; a round whose findings could not be persisted in full refuses the replan here and keeps the old PR. The replacement is found **only** by the transaction marker in its PR body — never by shape, never from the CONTROL_RESULT, and never among the pre-existing PRs; several claimants, a copied marker or an unusable one all block. It must additionally be a distinct OPEN PR of this repository, linked to the issue, on a distinct branch based on the verified default branch, and its marker must attest this transaction id, this execution attempt, passing tests and at least the preserved historical finding count. `VERIFIED` records its HEAD; immediately before the destructive write both sides are re-read and must still match the checkpoint exactly. `SUPERSEDE_INTENT` is persisted *before* `gh pr close` so a crash resumes into disposition, and a separate `gh pr comment` posts an `<!-- autoforge-replan-close: … -->` receipt only after the controller observed its own close landing (never inside `gh pr close --comment`); the receipt is what proves afterwards that the close was the controller's and not a human's; the close outcome is re-read from GitHub rather than inferred from the exit status, a conclusive close failure is never adopted, and an open source already carrying the receipt is never closed again. A checkpoint that moved inside the close window is undone under a durable `COMPENSATING` record written before the reopen, and the replacement is re-verified once more before it is installed into controller state. Only then does the controller close the old PR without merge and reset the replacement lifecycle so its next review is round 1. Every refusal is persisted as `REJECTED` and replayed by `resume`; a transient GitHub failure is left resumable instead. |
-| `READY_FOR_MERGE` | nobody | holding state; `step`/`resume` refuse to continue unless the merge gate is open (`resume` only re-prints the banner). With the gate open (`step --allow-merge` / `resume --allow-merge`) it runs the full pre-merge verification below against GitHub *before* entering `MERGE`: closed / conflicting / failing / draft / queued PRs go to `BLOCKED` without ever reaching `MERGE`, HEAD drift -> `REVIEW`, an already-merged PR -> `MERGE` to reconcile; inconclusive data (checks running, mergeability unknown, GitHub unreachable / transient read failure) keeps the phase for `resume --allow-merge`, at most `merge.max_verification_attempts` times, then `BLOCKED`; a read that fails conclusively (bad credentials, permissions, unresolvable PR) -> `BLOCKED` at once |
-| `MERGE` (gated) | controller, never an agent | last review clean and PR HEAD == reviewed HEAD; GitHub says PR is OPEN, not draft, every check succeeded, `mergeable=MERGEABLE`, `mergeStateStatus` `CLEAN`/`HAS_HOOKS`, no auto-merge armed, base branch has no merge queue; then `gh pr merge --<method> --match-head-commit <reviewed HEAD>`; counted only once GitHub reports `MERGED` at that HEAD. Conclusive negatives and conclusive read failures (bad credentials, permissions) -> `BLOCKED`; inconclusive data (checks running, mergeability unknown, transient read failure, post-merge re-read failed) stays in `MERGE` for `resume --allow-merge`, at most `merge.max_verification_attempts` times, then `BLOCKED`; HEAD drift -> `REVIEW` |
+| `READY_FOR_MERGE` | nobody | holding state; `step`/`resume` refuse to continue unless the merge gate is open (`resume` only re-prints the banner). With the gate open (`step --allow-merge` / `resume --allow-merge`) it runs the full pre-merge verification below against GitHub *before* entering `MERGE`: closed / conflicting / failing / draft / queued PRs, a required check whose job/step structure differs from the base branch's own run, and a failing `merge.verification_commands` command on the exported reviewed HEAD go to `BLOCKED` without ever reaching `MERGE`, HEAD drift -> `REVIEW`, an already-merged PR -> `MERGE` to reconcile; inconclusive data (checks running, the base branch's own run still running, mergeability unknown, GitHub unreachable / transient read failure, reviewed commit not fetchable) keeps the phase for `resume --allow-merge`, at most `merge.max_verification_attempts` times, then `BLOCKED`; a read that fails conclusively (bad credentials, permissions, unresolvable PR) -> `BLOCKED` at once |
+| `MERGE` (gated) | controller, never an agent | last review clean and PR HEAD == reviewed HEAD; GitHub says PR is OPEN, not draft, every check succeeded, `mergeable=MERGEABLE`, `mergeStateStatus` `CLEAN`/`HAS_HOOKS`, no auto-merge armed, base branch has no merge queue, every `safety.required_checks` run has the same jobs and steps as the base branch's own run of that workflow (`safety.verify_check_definition`); then every `merge.verification_commands` command passes in a temporary export of the reviewed HEAD (persisted per HEAD + command list, so a resume does not repeat it); then `gh pr merge --<method> --match-head-commit <reviewed HEAD>`; counted only once GitHub reports `MERGED` at that HEAD. Conclusive negatives (a failing local command included) and conclusive read failures (bad credentials, permissions) -> `BLOCKED`; inconclusive data (checks running, base run still running, mergeability unknown, transient read failure, unfetchable reviewed commit, post-merge re-read failed) stays in `MERGE` for `resume --allow-merge`, at most `merge.max_verification_attempts` times, then `BLOCKED`; HEAD drift -> `REVIEW` |
 | `UPDATE_EPIC` | OpenCode (`update_epic` profile) | `next_issue_url` gets the `INITIALIZING` checks before the controller switches issues: parses as an issue URL of this repo (a foreign URL is never even queried), is neither the EPIC nor the just-finished issue (compared case-insensitively by repository + number, never by URL string), exists on GitHub and is OPEN. A rejected selection, or a transient GitHub failure while checking it, keeps the phase and `resume` asks the agent once more with the reason in its prompt; a second rejection -> `BLOCKED`. A conclusive GitHub failure (authentication, permissions, malformed data) -> `BLOCKED` immediately, without invoking the agent again. Only a verified issue reaches `ANALYZE_EXECUTE`; `null` -> `DONE` |
 
 Recovery rules: if a step crashes after the agent created a PR, `resume`
@@ -731,8 +731,46 @@ audit data rather than state payload.
   What this gates is the *definition* of the checks, not the
   trustworthiness of a green run: the commands still execute the PR's own
   code, so a PR can weaken what its tests assert without touching a
-  protected path. That residual gap is why merge stays behind
-  `safety.allow_merge` + `--allow-merge`.
+  protected path. The two gates below narrow that gap; what remains is why
+  merge stays behind `safety.allow_merge` + `--allow-merge`.
+- **A required check is trusted only if it ran the base branch's definition.**
+  With `safety.verify_check_definition` (default `true`) the controller
+  resolves every `safety.required_checks` context in the PR's status rollup
+  to its GitHub Actions run through the check's details URL and requires the
+  run to be in this repository, at the reviewed HEAD and completed; a
+  context that appears zero or several times, or that is not an Actions
+  run, is refused. It then reads the run's jobs and their steps (every page,
+  a short listing is refused) and compares that structure with the base
+  branch's own `push` run of the same workflow at the branch's current tip:
+  same job names, same step names in the same order, job order ignored.
+  The first difference — a job or step missing, added or renamed — is
+  `BLOCKED` with the difference named. The reference must be a completed,
+  successful run; a base branch without one at its tip is `BLOCKED` (make
+  it green first), and a reference still running is inconclusive. This
+  catches a PR that rewrites what the check *is* through an untouched
+  workflow file (a reusable action, a `Makefile` target the workflow calls
+  by a different job or step name) but it is structural: a step whose name
+  stayed the same while its command changed passes. Setting the key to
+  `false`, or leaving `required_checks` empty, skips the comparison.
+- **The controller can run its own verification on the reviewed commit.**
+  `merge.verification_commands` (argv lists, empty by default) run on the
+  operator's machine after every GitHub-side fact above has passed, in a
+  fresh temporary export of the reviewed HEAD — `git read-tree` +
+  `git checkout-index` into `autoforge-premerge-*`, so no worktree or branch
+  is created, the operator's checkout is untouched and there is no `.git`
+  for a command to reach; the export is deleted afterwards. A commit that is
+  not local yet is fetched from `origin` as `refs/pull/<n>/head`, objects
+  only, without creating a local ref. A non-zero exit or a timeout
+  (`execution.default_timeout_seconds`) is `BLOCKED` with the redacted
+  output tail; an unfetchable or unexportable commit is inconclusive and
+  re-checked by `resume --allow-merge`. A pass is persisted with the HEAD
+  and the command list, so a resume at the same HEAD does not rerun it and a
+  changed command list or a new HEAD does; it is cleared when the run moves
+  to the next issue. Each run is logged like an agent invocation. Dry-run
+  runs nothing and lists the commands in the plan; `autoforge doctor`
+  reports what is configured without running it. Submodules are not
+  populated in the export and the commands inherit the operator's
+  environment (environment allow-listing remains a separate task).
 - **Post-merge is reconciled from GitHub.** The merge is counted only after
   GitHub reports `MERGED` at the reviewed HEAD (idempotently, across crashes).
   If `gh pr merge` returns but the PR is still open, any auto-merge that call
@@ -839,14 +877,22 @@ actor is noticed before an unattended run relies on it.
 GitHub's runners for that commit, which is strictly more than an agent's
 claim that it ran the tests. It is not a signal independent of the PR: the
 workflow that defines the check, and the code the check runs, both come from
-the PR. Two things bound that. The controller refuses to merge a PR that
+the PR. Four things bound that. The controller refuses to merge a PR that
 touches `safety.protected_merge_paths` (default `.github/workflows/`), so a
 PR cannot redefine the check that clears it — that refusal lives in the
 controller, in version control and under test, rather than in a repository
-setting that can drift unnoticed. And a PR that weakens its own tests without
-touching a protected path still has to pass the review phase, whose findings
-are what the loop bounds act on. Neither replaces a human reading the diff,
-which is why `safety.allow_merge` is off by default.
+setting that can drift unnoticed. With `safety.verify_check_definition` it
+also compares the jobs and steps the `ci` run actually executed with the
+base branch's own run of the same workflow, so a check that was redefined
+through something the protected paths do not cover is refused too. With
+`merge.verification_commands` set, the controller runs the repository's own
+checks (`pytest`, `ruff`, `mypy`, …) on an export of the reviewed commit
+before it merges — evidence it produced itself, not a check name it read.
+And a PR that weakens what its tests assert still has to pass the review
+phase, whose findings are what the loop bounds act on. None of this replaces
+a human reading the diff — the local commands still run the PR's tests,
+just under the controller's eye rather than the PR's workflow — which is
+why `safety.allow_merge` is off by default.
 
 Tests never call real Claude Code, OpenCode or GitHub write APIs. Agents are
 replaced by a `ScriptedProvider` and GitHub by an in-memory fake; the

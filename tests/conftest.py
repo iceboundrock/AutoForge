@@ -29,11 +29,15 @@ from autoforge.executor import ExecutionResult  # noqa: E402
 from autoforge.github import (  # noqa: E402
     ChangedFile,
     ChangedFiles,
+    CheckInfo,
     CommentInfo,
     IssueInfo,
     MergeQueueStatus,
     PRInfo,
     RepoInfo,
+    WorkflowJob,
+    WorkflowRunInfo,
+    WorkflowRunJobs,
 )
 from autoforge.providers import ProviderRegistry, ScriptedProvider  # noqa: E402
 from autoforge.result_parser import BEGIN, END  # noqa: E402
@@ -47,6 +51,70 @@ SHA_A = "a" * 40
 SHA_B = "b" * 40
 SHA_C = "c" * 40
 BRANCH = "autoforge/2-feature"
+# The base branch's tip and the two GitHub Actions runs the check-definition
+# gate reads: the PR's own `pull_request` run (the one its `ci` check names)
+# and the base branch's `push` run at its tip (the reference definition).
+MAIN_SHA = "e" * 40
+CI_WORKFLOW_ID = 77
+CI_WORKFLOW_PATH = ".github/workflows/ci.yml"
+BASE_RUN_ID = 1000
+CI_RUN_ID = 1001
+
+
+def ci_check(
+    name: str = "ci",
+    state: str = "COMPLETED",
+    conclusion: str = "SUCCESS",
+    run_id: int = CI_RUN_ID,
+    repo: str = "owner/repo",
+) -> CheckInfo:
+    """A check run as `gh pr view --json statusCheckRollup` reports an Actions job."""
+    return CheckInfo(
+        name=name,
+        state=state,
+        conclusion=conclusion,
+        details_url=f"https://github.com/{repo}/actions/runs/{run_id}/job/{run_id * 10}",
+    )
+
+
+def ci_jobs() -> WorkflowRunJobs:
+    """The job/step structure of one run of the default fake workflow."""
+    return WorkflowRunJobs(
+        jobs=(
+            WorkflowJob(
+                "lint", ("Set up job", "Run actions/checkout@v7", "Run ruff", "Complete job")
+            ),
+            WorkflowJob("test (3.12)", ("Set up job", "Run actions/checkout@v7", "Run pytest")),
+            WorkflowJob("test (3.11)", ("Set up job", "Run actions/checkout@v7", "Run pytest")),
+            WorkflowJob("ci", ("Set up job", "Run true", "Complete job")),
+        ),
+        total=4,
+    )
+
+
+def workflow_run(
+    run_id: int,
+    head_sha: str,
+    *,
+    event: str = "pull_request",
+    head_branch: str = BRANCH,
+    status: str = "completed",
+    conclusion: str = "success",
+    repo: str = "owner/repo",
+    workflow_id: int = CI_WORKFLOW_ID,
+    path: str = CI_WORKFLOW_PATH,
+) -> WorkflowRunInfo:
+    return WorkflowRunInfo(
+        id=run_id,
+        repository=repo,
+        path=path,
+        workflow_id=workflow_id,
+        event=event,
+        head_sha=head_sha,
+        head_branch=head_branch,
+        status=status,
+        conclusion=conclusion,
+    )
 
 
 def block(payload: str | dict) -> str:
@@ -152,6 +220,17 @@ class FakeGitHub:
         self.latest_pr_error: GitHubError | None = None  # every latest_pr_number call raises this
         self.pr_listing_truncated: bool = False  # a strict PR listing cannot be completed
         self.comments_error: GitHubError | None = None  # every get_pr_comments call raises this
+        # GitHub Actions read model behind `safety.verify_check_definition`:
+        # runs by id, their jobs, and where each branch points. `add_pr`
+        # registers the PR's own run at its HEAD; the base branch has one
+        # successful push run at its tip with the same structure.
+        self.workflow_runs: dict[int, WorkflowRunInfo] = {
+            BASE_RUN_ID: workflow_run(BASE_RUN_ID, MAIN_SHA, event="push", head_branch="main")
+        }
+        self.workflow_jobs: dict[int, WorkflowRunJobs] = {BASE_RUN_ID: ci_jobs()}
+        self.branch_heads: dict[str, str] = {"main": MAIN_SHA}
+        # non-empty -> every Actions read raises (same convention as merge_queue_error)
+        self.actions_error: str | GitHubError = ""
         self.add_issue(EPIC, "EPIC")
         self.add_issue(ISSUE, "Feature")
 
@@ -177,10 +256,15 @@ class FakeGitHub:
         linked: list[int] | None = None,
         body: str = "",
         base_ref: str = "main",
+        checks: list[CheckInfo] | None = None,
     ) -> PRInfo:
         from autoforge.validation import parse_pr_url
 
         ref = parse_pr_url(url)
+        # The PR's own run is at its HEAD: a green `ci` names it, and the
+        # check-definition gate reads it back.
+        self.workflow_runs[CI_RUN_ID] = workflow_run(CI_RUN_ID, head_sha, head_branch=branch)
+        self.workflow_jobs.setdefault(CI_RUN_ID, ci_jobs())
         info = PRInfo(
             url=ref.canonical,
             number=ref.number,
@@ -194,6 +278,7 @@ class FakeGitHub:
             repository=ref.repository,
             linked_issue_numbers=list(linked or []),
             body=body,
+            checks=[ci_check()] if checks is None else list(checks),
         )
         self.prs[ref.canonical] = info
         return info
@@ -204,7 +289,9 @@ class FakeGitHub:
         return c
 
     def set_head(self, sha: str, pr_url: str = PR) -> None:
+        """A push to the PR: new HEAD, and a new run of its checks at that HEAD."""
         self.prs[pr_url].head_sha = sha
+        self.workflow_runs[CI_RUN_ID] = replace(self.workflow_runs[CI_RUN_ID], head_sha=sha)
 
     # -- client API --------------------------------------------------------------
     def current_repo(self) -> RepoInfo:
@@ -296,6 +383,50 @@ class FakeGitHub:
         if self.merge_queue_error:
             raise GitHubError(self.merge_queue_error)
         return self.merge_queue.get(canonical, MergeQueueStatus(enabled=False, in_queue=False))
+
+    def _actions_failure(self) -> None:
+        if isinstance(self.actions_error, GitHubError):
+            raise self.actions_error
+        if self.actions_error:
+            raise GitHubError(self.actions_error)
+
+    def get_workflow_run(self, repository: str, run_id: int) -> WorkflowRunInfo:
+        self.calls.append(("get_workflow_run", repository, run_id))
+        self._actions_failure()
+        run = self.workflow_runs.get(run_id)
+        if run is None or run.repository.lower() != repository.lower():
+            raise GitHubNotFoundError(f"workflow run not found: {repository} {run_id}")
+        return run
+
+    def get_workflow_run_jobs(self, repository: str, run_id: int) -> WorkflowRunJobs:
+        self.calls.append(("get_workflow_run_jobs", repository, run_id))
+        self._actions_failure()
+        self.get_workflow_run(repository, run_id)
+        self.calls.pop()
+        return self.workflow_jobs[run_id]
+
+    def get_branch_head_sha(self, repository: str, branch: str) -> str:
+        self.calls.append(("get_branch_head_sha", repository, branch))
+        self._actions_failure()
+        try:
+            return self.branch_heads[branch]
+        except KeyError:
+            raise GitHubNotFoundError(f"branch not found: {branch}") from None
+
+    def find_workflow_runs(
+        self, repository: str, workflow_id: int, *, branch: str, event: str, head_sha: str
+    ) -> list[WorkflowRunInfo]:
+        self.calls.append(("find_workflow_runs", repository, workflow_id, branch, event, head_sha))
+        self._actions_failure()
+        return [
+            run
+            for run in self.workflow_runs.values()
+            if run.repository.lower() == repository.lower()
+            and run.workflow_id == workflow_id
+            and run.head_branch == branch
+            and run.event == event
+            and run.head_sha == head_sha
+        ]
 
     def pr_exists(self, url: str) -> bool:
         try:

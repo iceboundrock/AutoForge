@@ -9,9 +9,12 @@ from autoforge.errors import GitHubError, GitHubNotFoundError, GitHubUnavailable
 from autoforge.executor import ExecutionResult
 from autoforge.github import (
     STRICT_PR_LIST_LIMIT,
+    ActionsRunRef,
     ChangedFile,
     GitHubClient,
+    WorkflowJob,
     is_access_denied_gh_failure,
+    parse_actions_run_url,
 )
 
 
@@ -453,14 +456,29 @@ def test_get_pr_checks_parses_check_runs_and_status_contexts():
                         "name": "ci",
                         "status": "COMPLETED",
                         "conclusion": "SUCCESS",
+                        "detailsUrl": "https://github.com/o/r/actions/runs/123/job/456",
                     },
-                    {"__typename": "StatusContext", "context": "legacy", "state": "PENDING"},
+                    {
+                        "__typename": "StatusContext",
+                        "context": "legacy",
+                        "state": "PENDING",
+                        "targetUrl": "https://ci.example/build/9",
+                    },
+                    {"__typename": "CheckRun", "name": "odd", "status": "QUEUED", "detailsUrl": 7},
                 ],
             }
         )
     )
     checks = gh.get_pr_checks("https://github.com/o/r/pull/42")
-    assert [(c.name, c.outcome) for c in checks] == [("ci", "success"), ("legacy", "pending")]
+    assert [(c.name, c.outcome) for c in checks] == [
+        ("ci", "success"),
+        ("legacy", "pending"),
+        ("odd", "pending"),
+    ]
+    assert checks[0].actions_run == ActionsRunRef(repository="o/r", run_id=123)
+    assert checks[1].details_url == "https://ci.example/build/9"
+    assert checks[1].actions_run is None
+    assert checks[2].details_url == "" and checks[2].actions_run is None
 
 
 def _changed_files_runner(files, total, *, pages=None):
@@ -1006,3 +1024,181 @@ def test_is_access_denied_gh_failure():
     assert not is_access_denied_gh_failure("gh: Not Found (HTTP 404)")
     assert not is_access_denied_gh_failure("HTTP 502: Bad Gateway")
     assert not is_access_denied_gh_failure("PR #401 could not be found")
+
+
+# -- #42: GitHub Actions reads behind the check-definition gate ---------------------------
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://github.com/o/r/actions/runs/123/job/456", ActionsRunRef("o/r", 123)),
+        ("https://github.com/o/r/actions/runs/123", ActionsRunRef("o/r", 123)),
+        ("https://github.com/o/r/actions/runs/123/attempts/2", ActionsRunRef("o/r", 123)),
+        ("https://github.com/o/r/actions/runs/0", None),
+        ("https://github.com/o/r/actions/runs/abc", None),
+        ("https://github.com/o/r/actions/workflows/ci.yml", None),
+        ("https://ghe.example.com/o/r/actions/runs/123", None),
+        ("http://github.com/o/r/actions/runs/123", None),
+        ("https://github.com/o/r/pull/42/checks", None),
+        ("https://ci.example/build/9", None),
+        ("", None),
+    ],
+)
+def test_parse_actions_run_url(url, expected):
+    assert parse_actions_run_url(url) == expected
+
+
+_RUN = {
+    "id": 123,
+    "name": "ci",
+    "path": ".github/workflows/ci.yml",
+    "workflow_id": 77,
+    "event": "pull_request",
+    "head_sha": "ABCDEF" + "0" * 34,
+    "head_branch": "feature",
+    "status": "completed",
+    "conclusion": "success",
+    "run_attempt": 2,
+    "repository": {"full_name": "o/r"},
+    "head_repository": {"full_name": "fork/r"},
+}
+
+
+def test_get_workflow_run_parses_the_rest_shape():
+    seen = []
+
+    def handler(req):
+        seen.append(req.command)
+        return _res(_RUN)
+
+    run = _client(handler).get_workflow_run("o/r", 123)
+    assert seen == [["gh", "api", "repos/o/r/actions/runs/123"]]
+    assert run.id == 123 and run.workflow_id == 77 and run.run_attempt == 2
+    assert run.repository == "o/r" and run.path == ".github/workflows/ci.yml"
+    assert run.event == "pull_request" and run.head_branch == "feature"
+    assert run.head_sha == "abcdef" + "0" * 34  # normalised like PRInfo.head_sha
+    assert run.completed and run.conclusion == "success"
+
+
+def test_get_workflow_run_in_progress_has_no_conclusion():
+    run = _client(lambda req: _res({**_RUN, "status": "in_progress", "conclusion": None}))
+    info = run.get_workflow_run("o/r", 123)
+    assert not info.completed and info.conclusion == ""
+
+
+@pytest.mark.parametrize(
+    "broken",
+    [
+        [],
+        {**_RUN, "id": "123"},
+        {**_RUN, "workflow_id": None},
+        {**_RUN, "run_attempt": 0},
+        {**_RUN, "repository": {}},
+        {**_RUN, "head_sha": ""},
+        {**_RUN, "path": ""},
+        {**_RUN, "status": None},
+    ],
+)
+def test_get_workflow_run_rejects_unusable_data(broken):
+    with pytest.raises(GitHubError):
+        _client(lambda req: _res(broken)).get_workflow_run("o/r", 123)
+
+
+def _job(name, *steps):
+    return {
+        "name": name,
+        "status": "completed",
+        "conclusion": "success",
+        "steps": [{"name": s, "number": i + 1} for i, s in enumerate(steps)],
+    }
+
+
+def test_get_workflow_run_jobs_reads_every_page_and_keeps_step_order():
+    seen = []
+    pages = [
+        {"total_count": 3, "jobs": [_job("test (3.12)", "Set up job", "Run pytest")]},
+        {"total_count": 3, "jobs": [_job("lint", "Set up job", "Run ruff"), _job("ci")]},
+    ]
+
+    def handler(req):
+        seen.append(req.command)
+        return _res(pages)
+
+    jobs = _client(handler).get_workflow_run_jobs("o/r", 123)
+    assert seen == [
+        ["gh", "api", "--paginate", "--slurp", "repos/o/r/actions/runs/123/jobs?per_page=100"]
+    ]
+    assert jobs.complete and jobs.total == 3
+    assert jobs.jobs == (
+        WorkflowJob("test (3.12)", ("Set up job", "Run pytest")),
+        WorkflowJob("lint", ("Set up job", "Run ruff")),
+        WorkflowJob("ci", ()),
+    )
+    # The comparison shape is order-independent for jobs, ordered for steps.
+    assert jobs.structure() == (
+        ("ci", ()),
+        ("lint", ("Set up job", "Run ruff")),
+        ("test (3.12)", ("Set up job", "Run pytest")),
+    )
+
+
+def test_get_workflow_run_jobs_reports_a_short_listing_as_incomplete():
+    page = {"total_count": 5, "jobs": [_job("ci", "Run true")]}
+    jobs = _client(lambda req: _res([page])).get_workflow_run_jobs("o/r", 123)
+    assert not jobs.complete and len(jobs.jobs) == 1 and jobs.total == 5
+
+
+@pytest.mark.parametrize(
+    "pages",
+    [
+        {"total_count": 1, "jobs": [_job("ci")]},  # not slurped
+        [[_job("ci")]],  # array pages, not object pages
+        [{"total_count": "1", "jobs": [_job("ci")]}],
+        [{"total_count": 1, "jobs": None}],
+        [{"total_count": 1, "jobs": [{"name": "", "steps": []}]}],
+        [{"total_count": 1, "jobs": [{"name": "ci", "steps": [{"number": 1}]}]}],
+        [{"total_count": 1, "jobs": [{"name": "ci", "steps": [{"name": ""}]}]}],
+        [],
+    ],
+)
+def test_get_workflow_run_jobs_rejects_unusable_data(pages):
+    with pytest.raises(GitHubError):
+        _client(lambda req: _res(pages)).get_workflow_run_jobs("o/r", 123)
+
+
+def test_get_branch_head_sha():
+    seen = []
+
+    def handler(req):
+        seen.append(req.command)
+        return _res({"name": "main", "commit": {"sha": "ABC" + "0" * 37}})
+
+    assert _client(handler).get_branch_head_sha("o/r", "main") == "abc" + "0" * 37
+    assert seen == [["gh", "api", "repos/o/r/branches/main"]]
+    with pytest.raises(GitHubError, match="head SHA"):
+        _client(lambda req: _res({"name": "main", "commit": {}})).get_branch_head_sha("o/r", "main")
+
+
+def test_find_workflow_runs_filters_through_the_query_string():
+    seen = []
+    listed = {**_RUN, "id": 99, "event": "push", "head_branch": "main"}
+
+    def handler(req):
+        seen.append(req.command)
+        return _res({"total_count": 1, "workflow_runs": [listed]})
+
+    runs = _client(handler).find_workflow_runs(
+        "o/r", 77, branch="release/1.x", event="push", head_sha="abc"
+    )
+    assert seen == [
+        [
+            "gh",
+            "api",
+            "repos/o/r/actions/workflows/77/runs?"
+            "branch=release%2F1.x&event=push&head_sha=abc&per_page=100",
+        ]
+    ]
+    assert [(r.id, r.event, r.head_branch) for r in runs] == [(99, "push", "main")]
+    with pytest.raises(GitHubError, match="workflow_runs"):
+        _client(lambda req: _res({"total_count": 0})).find_workflow_runs(
+            "o/r", 77, branch="main", event="push", head_sha="abc"
+        )
