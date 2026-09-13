@@ -97,7 +97,11 @@ DEFAULT_PROTECTED_MERGE_PATHS = (".github/workflows/",)
 # The keys `safety:` may contain. Anything else is a hard error: a typo such
 # as `allow_merges: true` must not fail closed *silently*, because the operator
 # then believes the gate is in the state they wrote, not the state it is in.
-SAFETY_KEYS = ("allow_merge", "protected_merge_paths")
+SAFETY_KEYS = ("allow_merge", "protected_merge_paths", "required_checks")
+
+# `safety.required_checks` when no config file sets it: the aggregate check
+# name of this repository's own `.github/workflows/ci.yml`.
+DEFAULT_REQUIRED_CHECKS = ("ci",)
 
 # `safety.allow_merge` when no config file sets it.
 DEFAULT_ALLOW_MERGE_SOURCE = "built-in default"
@@ -128,6 +132,14 @@ class SafetyConfig:
     protected_merge_paths: list[str] = field(
         default_factory=lambda: list(DEFAULT_PROTECTED_MERGE_PATHS)
     )
+    # Status-check contexts the default branch is expected to *require*
+    # (repository ruleset or classic branch protection). The merge gate
+    # trusts "every check on the PR succeeded", which says nothing about
+    # whether any check had to exist: with the requirement gone, a PR with no
+    # check runs is vacuously green. `autoforge doctor` reads the effective
+    # branch rules and fails when one of these contexts is not required. An
+    # empty list only requires that *some* status check is required.
+    required_checks: list[str] = field(default_factory=lambda: list(DEFAULT_REQUIRED_CHECKS))
 
     def protects(self, path: str) -> bool:
         """Whether ``path`` (a POSIX repo-relative path) is protected."""
@@ -561,6 +573,10 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
     if "protected_merge_paths" in safety:
         base.safety.protected_merge_paths = _as_str_list(
             safety["protected_merge_paths"], source, "safety.protected_merge_paths"
+        )
+    if "required_checks" in safety:
+        base.safety.required_checks = _as_str_list(
+            safety["required_checks"], source, "safety.required_checks"
         )
     gh = _section(data, "github", source)
     if "command" in gh:

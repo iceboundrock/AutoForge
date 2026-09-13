@@ -663,6 +663,24 @@ audit data rather than state payload.
   typo such as `allow_merges`) is a configuration error, so the gate can
   never be "disabled" in one place while still open in another.
   `autoforge doctor` prints the effective gate state and the file that set it.
+- **`doctor` verifies that the default branch still requires the CI check.**
+  The pre-merge gate below trusts "every check on the PR succeeded", which
+  says nothing about whether any check *had* to exist: with the branch
+  ruleset gone, a PR with no check runs at all is vacuously green. That
+  ruleset lives in repository settings, outside version control, so
+  `autoforge doctor` reads the effective rules of the default branch
+  (`gh api repos/{owner}/{repo}/rules/branches/{branch}`, every page) and
+  reports which contexts a `required_status_checks` rule names, whether each
+  of `safety.required_checks` (default `ci`) is among them, whether the
+  ruleset's enforcement is `active`, and whether it has bypass actors — any
+  of those missing is a `FAIL` with the settings URL and the rule to add. A
+  repository still on classic branch protection is checked through that
+  instead (`enforce_admins` standing in for "no bypass actors"). A read the
+  token is not allowed to make (no credentials, a plan that hides rulesets,
+  a non-admin token and no ruleset) or a transient GitHub failure is `SKIP`,
+  never a false alarm; `doctor --json` carries it as `"skipped": true`. The
+  check is read-only and runs in `doctor` only: the `READY_FOR_MERGE` gate
+  itself does not yet consult branch rules.
 - **Agents never merge.** When the gate is open, the *controller* performs the
   merge itself: `gh pr merge --<merge.method> --match-head-commit <reviewed HEAD>`
   through `GitHubClient`, with no prompt and no agent invocation. Every agent
@@ -748,8 +766,10 @@ audit data rather than state payload.
   and refuse a working tree that is dirty beyond the feature file unless
   `--allow-dirty` records those paths explicitly.
 - `doctor` is read-only apart from a temp file it creates and removes in the
-  state directory. `autoforge local doctor` runs the local subset and omits
-  the `gh`, `gh auth status` and `origin` checks entirely.
+  state directory; its GitHub reads (`gh repo view`, `gh api` GETs of the
+  default branch's rules) never write. `autoforge local doctor` runs the
+  local subset and omits the `gh`, `gh auth status`, `origin` and
+  branch-rule checks entirely.
 - Runtime state, logs, locks, and local config overrides are git-ignored.
 
 ## Configuration
@@ -799,7 +819,10 @@ pre-merge gate ("every check on the PR succeeded") something real to verify
 instead of a vacuously green PR. The same ruleset requires a pull request
 (with zero required approvals, since GitHub forbids self-approval and any
 higher count would deadlock the controller's own merge) and blocks force-push
-and deletion of `main`.
+and deletion of `main`. Because that ruleset is repository configuration
+rather than code, `autoforge doctor` re-reads it (see "Security model")
+so that disabling it, renaming the context or adding a bypass
+actor is noticed before an unattended run relies on it.
 
 **What a green `ci` does and does not prove.** It proves the suite passed on
 GitHub's runners for that commit, which is strictly more than an agent's

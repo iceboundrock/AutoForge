@@ -185,7 +185,7 @@ def test_unknown_safety_keys_are_rejected_not_ignored(tmp_path, body):
     message = str(info.value)
     unknown = [k for k in ("allow_merges", "allowMerge", "protected_paths") if k in body]
     assert all(k in message for k in unknown)
-    assert "allow_merge, protected_merge_paths" in message  # the known keys are named
+    assert "allow_merge, protected_merge_paths, required_checks" in message  # known keys named
 
 
 def test_unknown_safety_key_rejected_in_yaml_too(tmp_path):
@@ -657,4 +657,21 @@ def test_a_non_mapping_local_block_is_refused(tmp_path):
     p = tmp_path / "cfg.json"
     p.write_text('{"version": 1, "local": ["features"]}', encoding="utf-8")
     with pytest.raises(ConfigurationError, match="'local' must be a mapping"):
+        load_config_file(p)
+
+
+# -- safety.required_checks (issue #41) -------------------------------------------------
+def test_required_checks_default_and_override(tmp_path):
+    """`doctor` verifies the default branch requires these contexts; default is `ci`."""
+    assert default_config().safety.required_checks == ["ci"]
+    p = tmp_path / "cfg.json"
+    p.write_text('{"version": 1, "safety": {"required_checks": ["build", " lint "]}}')
+    assert load_config_file(p).safety.required_checks == ["build", "lint"]
+    p.write_text('{"version": 1, "safety": {"required_checks": []}}')
+    assert load_config_file(p).safety.required_checks == []
+    p.write_text('{"version": 1, "safety": {"required_checks": null}}')
+    with pytest.raises(ConfigurationError, match="required_checks is null"):
+        load_config_file(p)
+    p.write_text('{"version": 1, "safety": {"required_checks": "ci"}}')
+    with pytest.raises(ConfigurationError, match="required_checks must be a list"):
         load_config_file(p)

@@ -51,6 +51,18 @@ safety:
   # green run: the commands still execute the PR's own code.
   protected_merge_paths:
     - ".github/workflows/"
+  # Status-check contexts the default branch must *require* (repository
+  # ruleset, or classic branch protection). The merge gate only verifies that
+  # every check on the PR succeeded; whether any check had to exist is
+  # decided by a branch rule in repository settings, outside version control,
+  # and nothing else notices when that rule is disabled, renamed or given a
+  # bypass actor. `autoforge doctor` reads the effective rules of the default
+  # branch and FAILs when one of these contexts is not required, the ruleset
+  # is not `active`, or it has bypass actors. A token that cannot read the
+  # rules reports SKIP, never a false alarm. An empty list ([]) requires only
+  # that *some* status check is required.
+  required_checks:
+    - "ci"
 
 merge:
   # How the CONTROLLER merges once the gate above is open. Agents never merge:

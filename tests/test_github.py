@@ -7,7 +7,12 @@ import pytest
 
 from autoforge.errors import GitHubError, GitHubNotFoundError, GitHubUnavailableError
 from autoforge.executor import ExecutionResult
-from autoforge.github import STRICT_PR_LIST_LIMIT, ChangedFile, GitHubClient
+from autoforge.github import (
+    STRICT_PR_LIST_LIMIT,
+    ChangedFile,
+    GitHubClient,
+    is_access_denied_gh_failure,
+)
 
 
 def _res(payload: object, exit_code: int = 0, stderr: str = "") -> ExecutionResult:
@@ -757,3 +762,163 @@ def test_close_and_reopen_pr_argv():
         _client(lambda req: _res({}, exit_code=1, stderr="denied")).reopen_pr(url, "undone")
     with pytest.raises(GitHubError, match="denied"):
         _client(lambda req: _res({}, exit_code=1, stderr="denied")).comment_pr(url, "hi")
+
+
+# -- branch rules (issue #41; read-only, used by `doctor`) ---------------------------------
+def _paged(*pages):
+    """What `gh api --paginate --slurp` prints: one outer array holding each page."""
+    return _res(list(pages))
+
+
+def test_get_required_status_check_rules_reads_every_page():
+    calls = []
+
+    def handler(req):
+        calls.append(req.command)
+        return _paged(
+            [{"type": "deletion", "ruleset_id": 7}],
+            [
+                {
+                    "type": "required_status_checks",
+                    "parameters": {
+                        "strict_required_status_checks_policy": True,
+                        "required_status_checks": [
+                            {"context": "ci", "integration_id": 15368},
+                            {"context": "lint"},
+                        ],
+                    },
+                    "ruleset_source_type": "Organization",
+                    "ruleset_source": "o",
+                    "ruleset_id": 9,
+                }
+            ],
+        )
+
+    rules = _client(handler).get_required_status_check_rules("o/r", "main")
+    assert calls == [["gh", "api", "--paginate", "--slurp", "repos/o/r/rules/branches/main"]]
+    assert len(rules) == 1
+    rule = rules[0]
+    assert rule.contexts == ("ci", "lint") and rule.strict
+    assert rule.ruleset_id == 9 and rule.ruleset_source_type == "Organization"
+    assert rule.ruleset_source == "o"
+
+
+def test_get_required_status_check_rules_empty_and_malformed():
+    assert _client(lambda req: _paged([])).get_required_status_check_rules("o/r", "main") == []
+    # Not the page-of-pages shape `--slurp` produces: malformed, never "empty".
+    with pytest.raises(GitHubError, match="non-paginated"):
+        _client(lambda req: _res([{"type": "deletion"}])).get_required_status_check_rules(
+            "o/r", "main"
+        )
+    with pytest.raises(GitHubError, match="non-paginated"):
+        _client(lambda req: _res({"type": "deletion"})).get_required_status_check_rules(
+            "o/r", "main"
+        )
+    # A rule that names a check without a context is malformed evidence.
+    bad = [
+        {
+            "type": "required_status_checks",
+            "parameters": {"required_status_checks": [{"integration_id": 1}]},
+            "ruleset_id": 1,
+        }
+    ]
+    with pytest.raises(GitHubError, match="names no context"):
+        _client(lambda req: _paged(bad)).get_required_status_check_rules("o/r", "main")
+    no_id = [{"type": "required_status_checks", "parameters": {"required_status_checks": []}}]
+    with pytest.raises(GitHubError, match="non-integer ruleset_id"):
+        _client(lambda req: _paged(no_id)).get_required_status_check_rules("o/r", "main")
+
+
+def test_get_ruleset_and_list_rulesets():
+    detail = {
+        "id": 22792049,
+        "name": "main",
+        "target": "branch",
+        "source_type": "Repository",
+        "source": "o/r",
+        "enforcement": "active",
+        "bypass_actors": [
+            {"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "pull_request"},
+            {"actor_type": "OrganizationAdmin"},
+        ],
+        "current_user_can_bypass": "pull_requests_only",
+        "_links": {"html": {"href": "https://github.com/o/r/rules/22792049"}},
+    }
+    calls = []
+
+    def handler(req):
+        calls.append(req.command)
+        if "--slurp" in req.command:
+            return _paged([{k: v for k, v in detail.items() if k != "bypass_actors"}])
+        return _res(detail)
+
+    gh = _client(handler)
+    ruleset = gh.get_ruleset("o/r", 22792049)
+    assert calls[-1] == ["gh", "api", "repos/o/r/rulesets/22792049"]
+    assert ruleset.id == 22792049 and ruleset.name == "main" and ruleset.is_active
+    assert ruleset.bypass_actors == (
+        "RepositoryRole 5 (pull_request)",
+        "OrganizationAdmin (always)",
+    )
+    assert ruleset.current_user_can_bypass == "pull_requests_only"
+    assert ruleset.html_url == "https://github.com/o/r/rules/22792049"
+
+    listed = gh.list_rulesets("o/r")
+    assert calls[-1] == ["gh", "api", "--paginate", "--slurp", "repos/o/r/rulesets"]
+    assert [r.id for r in listed] == [22792049] and listed[0].bypass_actors == ()
+
+    with pytest.raises(GitHubError, match="non-integer ruleset id"):
+        _client(lambda req: _res({"name": "x", "enforcement": "active"})).get_ruleset("o/r", 1)
+
+
+def test_get_branch_protection():
+    calls = []
+
+    def handler(req):
+        calls.append(req.command)
+        return _res(
+            {
+                "required_status_checks": {
+                    "strict": True,
+                    "contexts": ["ci"],
+                    "checks": [{"context": "ci", "app_id": 1}, {"context": "lint"}],
+                },
+                "enforce_admins": {"enabled": True},
+            }
+        )
+
+    protection = _client(handler).get_branch_protection("o/r", "main")
+    assert calls == [["gh", "api", "repos/o/r/branches/main/protection"]]
+    assert protection is not None
+    assert protection.required_status_checks
+    assert protection.required_contexts == ("ci", "lint") and protection.enforce_admins
+
+    # "Branch not protected" is the conclusive negative answer.
+    not_protected = _client(
+        lambda req: _res({}, exit_code=1, stderr="gh: Branch not protected (HTTP 404)")
+    )
+    assert not_protected.get_branch_protection("o/r", "main") is None
+    # Protection without a status-check requirement: exists, requires nothing.
+    bare = _client(lambda req: _res({"enforce_admins": {"enabled": False}}))
+    protection = bare.get_branch_protection("o/r", "main")
+    assert protection is not None and not protection.required_status_checks
+    assert protection.required_contexts == () and not protection.enforce_admins
+    # An access failure is not a negative answer: it propagates.
+    denied = _client(
+        lambda req: _res({}, exit_code=1, stderr="gh: Must have admin rights (HTTP 403)")
+    )
+    with pytest.raises(GitHubError, match="HTTP 403"):
+        denied.get_branch_protection("o/r", "main")
+
+
+def test_is_access_denied_gh_failure():
+    assert is_access_denied_gh_failure("gh: Bad credentials (HTTP 401)")
+    assert is_access_denied_gh_failure("gh: Must have admin rights to Repository. (HTTP 403)")
+    assert is_access_denied_gh_failure("gh: Resource not accessible by integration (HTTP 403)")
+    assert is_access_denied_gh_failure(
+        "To get started with GitHub CLI, please run:  gh auth login\n"
+        "Alternatively, populate the GH_TOKEN environment variable"
+    )
+    assert not is_access_denied_gh_failure("gh: Not Found (HTTP 404)")
+    assert not is_access_denied_gh_failure("HTTP 502: Bad Gateway")
+    assert not is_access_denied_gh_failure("PR #401 could not be found")
