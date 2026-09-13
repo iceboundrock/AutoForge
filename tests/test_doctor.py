@@ -26,17 +26,22 @@ def _status_rule(*contexts, ruleset_id=22792049):
 
 
 def _ruleset(enforcement="active", bypass_actors=(), can_bypass="never", ruleset_id=22792049):
-    return {
+    """``bypass_actors=None`` is the field GitHub withholds from a token without
+    write access to the ruleset (the read itself still succeeds)."""
+    data = {
         "id": ruleset_id,
         "name": "main",
         "target": "branch",
         "source_type": "Repository",
         "source": "owner/repo",
         "enforcement": enforcement,
-        "bypass_actors": list(bypass_actors),
+        "bypass_actors": None if bypass_actors is None else list(bypass_actors),
         "current_user_can_bypass": can_bypass,
         "_links": {"html": {"href": f"https://github.com/owner/repo/rules/{ruleset_id}"}},
     }
+    if bypass_actors is None:
+        del data["bypass_actors"]
+    return data
 
 
 # What a healthy repository answers: one active ruleset requiring `ci` on `main`.
@@ -319,6 +324,51 @@ def test_required_check_bypass_actor_fails(tmp_path):
     assert not check.ok and not check.skipped
     assert "can be bypassed by: RepositoryRole 5 (always) (this token: always)" in check.detail
     assert check.detail.startswith("'main' requires: ci via")
+
+
+def test_required_check_hidden_bypass_actors_is_skipped_never_ok(tmp_path):
+    """A token without write access to the ruleset reads the rule but not who may bypass
+    it: GitHub answers 200 with no `bypass_actors` field. That is not "no bypass actors"."""
+    check = _required_checks(tmp_path, github={RULESET_ENDPOINT: _ruleset(bypass_actors=None)})
+    assert check.skipped and not check.ok and not check.required, check
+    assert check.label == "SKIP"
+    assert check.detail.startswith("'main' requires: ci via ruleset #22792049")
+    assert "bypass actors of ruleset 'main' (#22792049) are not visible to this token" in (
+        check.detail
+    )
+    assert "write access to the ruleset" in check.detail
+    assert "'no bypass actors' is unverified" in check.detail
+
+    # The visible half still decides when it is a problem: hidden actors never
+    # soften a missing context or a non-active ruleset into a SKIP.
+    check = _required_checks(
+        tmp_path,
+        github={
+            RULES_ENDPOINT: [_status_rule("build")],
+            RULESET_ENDPOINT: _ruleset(bypass_actors=None),
+        },
+    )
+    assert not check.ok and not check.skipped and check.required
+    assert "required contexts do not include 'ci'" in check.detail
+    assert "are not visible to this token" in check.detail
+
+    check = _required_checks(
+        tmp_path, github={RULESET_ENDPOINT: _ruleset(enforcement="evaluate", bypass_actors=None)}
+    )
+    assert not check.ok and not check.skipped
+    assert "enforcement is 'evaluate', not 'active'" in check.detail
+
+
+def test_required_check_token_that_can_bypass_fails_even_when_actors_are_hidden(tmp_path):
+    """`current_user_can_bypass` is returned to every caller; a token that may bypass the
+    rule is a bypass actor whether or not GitHub shows the list."""
+    for actors in (None, ()):
+        check = _required_checks(
+            tmp_path,
+            github={RULESET_ENDPOINT: _ruleset(bypass_actors=actors, can_bypass="always")},
+        )
+        assert not check.ok and not check.skipped and check.required, (actors, check)
+        assert "ruleset 'main' (#22792049) can be bypassed by this token (always)" in check.detail
 
 
 def test_required_check_read_denied_is_skipped_not_failed(tmp_path):

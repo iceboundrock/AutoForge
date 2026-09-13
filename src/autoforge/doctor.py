@@ -204,7 +204,12 @@ class Doctor:
 
         Read-only, and skipped -- never failed -- when the answer cannot be
         read: no credentials, a token or plan that cannot see rulesets, or a
-        transient GitHub failure say nothing about the branch.
+        transient GitHub failure say nothing about the branch. The same
+        holds for a partial answer: GitHub returns a ruleset's bypass actors
+        only to a token with write access to it, and a rule this token can
+        see but whose bypass list it cannot is not shown to be unbypassable.
+        A problem that *is* visible (a missing context, a non-active
+        ruleset, a bypass actor) is a FAIL regardless of what stayed hidden.
         """
         name = REQUIRED_CHECKS_ROW
         cfg = self.config
@@ -236,27 +241,47 @@ class Doctor:
         problems = _missing_contexts(contexts, expected)
         # The effective-rules read lists active rulesets only, but the
         # ruleset itself says who may bypass it, and that is read separately.
+        # GitHub withholds `bypass_actors` from a token without write access
+        # to the ruleset (the read still succeeds), so "no bypass actors" is
+        # established only by an explicitly empty list; `current_user_can_
+        # bypass` is returned to every caller and a token that may bypass the
+        # rule is a bypass actor whether or not the list is visible.
+        unseen: list[str] = []
         for ruleset_id in sorted({rule.ruleset_id for rule in rules}):
             ruleset = client.get_ruleset(repo, ruleset_id)
             label = f"ruleset '{ruleset.name}' (#{ruleset.id})"
+            can_bypass = ruleset.current_user_can_bypass
             if not ruleset.is_active:
                 problems.append(f"{label} enforcement is '{ruleset.enforcement}', not 'active'")
             if ruleset.bypass_actors:
                 problems.append(
                     f"{label} can be bypassed by: {', '.join(ruleset.bypass_actors)}"
-                    + (
-                        f" (this token: {ruleset.current_user_can_bypass})"
-                        if ruleset.current_user_can_bypass
-                        else ""
-                    )
+                    + (f" (this token: {can_bypass})" if can_bypass else "")
                 )
+            elif can_bypass not in ("", "never"):
+                problems.append(f"{label} can be bypassed by this token ({can_bypass})")
+            elif ruleset.bypass_actors is None:
+                unseen.append(label)
         sources = ", ".join(
             f"ruleset #{rule.ruleset_id} ({rule.ruleset_source_type or '?'} {rule.ruleset_source})"
             for rule in rules
         )
         summary = f"'{branch}' requires: {', '.join(contexts) or '(no context)'} via {sources}"
+        hidden = (
+            [
+                f"bypass actors of {', '.join(unseen)} are not visible to this token (GitHub "
+                "returns them only with write access to the ruleset), so 'no bypass actors' "
+                "is unverified"
+            ]
+            if unseen
+            else []
+        )
         if problems:
-            return CheckResult(name, False, f"{summary}; {'; '.join(problems)}")
+            # A visible problem is conclusive whatever else stayed hidden;
+            # the hidden part is still named so the remedy is known to be partial.
+            return CheckResult(name, False, "; ".join([summary, *problems, *hidden]))
+        if hidden:
+            return CheckResult.skip(name, f"{summary}; {hidden[0]}")
         return CheckResult(name, True, summary)
 
     def _required_checks_without_ruleset(

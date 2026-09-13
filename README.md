@@ -678,7 +678,11 @@ audit data rather than state payload.
   instead (`enforce_admins` standing in for "no bypass actors"). A read the
   token is not allowed to make (no credentials, a plan that hides rulesets,
   a non-admin token and no ruleset) or a transient GitHub failure is `SKIP`,
-  never a false alarm; `doctor --json` carries it as `"skipped": true`. The
+  never a false alarm; so is a *partial* read — GitHub returns a ruleset's
+  `bypass_actors` only to a token with write access to it, and a rule this
+  token can see but whose bypass list it cannot is `SKIP` rather than `OK`
+  (a token that GitHub says may itself bypass the rule is a `FAIL` either
+  way). `doctor --json` carries a skip as `"skipped": true`. The
   check is read-only and runs in `doctor` only: the `READY_FOR_MERGE` gate
   itself does not yet consult branch rules.
 - **Agents never merge.** When the gate is open, the *controller* performs the

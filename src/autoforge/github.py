@@ -303,8 +303,13 @@ class RequiredStatusChecksRule:
 class RulesetInfo:
     """A ruleset as GitHub describes it (``GET /repos/{owner}/{repo}/rulesets[/{id}]``).
 
-    ``bypass_actors`` and ``current_user_can_bypass`` are only present on the
-    single-ruleset read; the listing leaves them empty.
+    ``bypass_actors`` is ``None`` when GitHub did not return the field, which
+    it withholds from any token without write access to the ruleset -- a
+    read-only token gets a 200 with the field absent -- and which the listing
+    endpoint never includes. Absent is not empty: ``()`` is GitHub saying
+    nobody may bypass, ``None`` is GitHub declining to say.
+    ``current_user_can_bypass`` is returned to every caller of the
+    single-ruleset read.
     """
 
     id: int
@@ -313,7 +318,7 @@ class RulesetInfo:
     target: str = ""  # branch | tag | push
     source: str = ""
     source_type: str = ""
-    bypass_actors: tuple[str, ...] = ()  # "<actor_type> <actor_id> (<bypass_mode>)"
+    bypass_actors: tuple[str, ...] | None = None  # "<actor_type> <actor_id> (<bypass_mode>)"
     current_user_can_bypass: str = ""  # always | pull_requests_only | never
     html_url: str = ""
 
@@ -421,15 +426,23 @@ def _as_int(value: object, what: str) -> int:
 
 
 def _ruleset_from_data(data: dict) -> RulesetInfo:
-    actors = []
-    for actor in data.get("bypass_actors") or []:
-        if not isinstance(actor, dict):
-            raise GitHubError("ruleset bypass_actors entry is not an object")
-        actor_type = actor.get("actor_type") or "?"
-        actor_id = actor.get("actor_id")
-        mode = actor.get("bypass_mode") or "always"
-        label = f"{actor_type} {actor_id}" if actor_id is not None else str(actor_type)
-        actors.append(f"{label} ({mode})")
+    # Presence is the evidence: GitHub omits `bypass_actors` for a token
+    # without write access to the ruleset, so an absent field must not read
+    # as an empty list.
+    actors: list[str] | None = None
+    if "bypass_actors" in data:
+        raw = data["bypass_actors"]
+        if not isinstance(raw, list):
+            raise GitHubError("ruleset bypass_actors is not an array")
+        actors = []
+        for actor in raw:
+            if not isinstance(actor, dict):
+                raise GitHubError("ruleset bypass_actors entry is not an object")
+            actor_type = actor.get("actor_type") or "?"
+            actor_id = actor.get("actor_id")
+            mode = actor.get("bypass_mode") or "always"
+            label = f"{actor_type} {actor_id}" if actor_id is not None else str(actor_type)
+            actors.append(f"{label} ({mode})")
     links = data.get("_links") or {}
     html = links.get("html") if isinstance(links, dict) else None
     return RulesetInfo(
@@ -439,7 +452,7 @@ def _ruleset_from_data(data: dict) -> RulesetInfo:
         target=str(data.get("target") or ""),
         source=str(data.get("source") or ""),
         source_type=str(data.get("source_type") or ""),
-        bypass_actors=tuple(actors),
+        bypass_actors=None if actors is None else tuple(actors),
         current_user_can_bypass=str(data.get("current_user_can_bypass") or ""),
         html_url=str(html.get("href") or "") if isinstance(html, dict) else "",
     )

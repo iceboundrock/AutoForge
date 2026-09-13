@@ -59,8 +59,10 @@ safety:
   # bypass actor. `autoforge doctor` reads the effective rules of the default
   # branch and FAILs when one of these contexts is not required, the ruleset
   # is not `active`, or it has bypass actors. A token that cannot read the
-  # rules reports SKIP, never a false alarm. An empty list ([]) requires only
-  # that *some* status check is required.
+  # rules -- or can read them but not who may bypass them, which GitHub shows
+  # only with write access to the ruleset -- reports SKIP, never a false
+  # alarm and never OK. An empty list ([]) requires only that *some* status
+  # check is required.
   required_checks:
     - "ci"
 

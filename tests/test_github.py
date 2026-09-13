@@ -863,12 +863,30 @@ def test_get_ruleset_and_list_rulesets():
     assert ruleset.current_user_can_bypass == "pull_requests_only"
     assert ruleset.html_url == "https://github.com/o/r/rules/22792049"
 
+    # The listing never carries `bypass_actors`: unknown, not none.
     listed = gh.list_rulesets("o/r")
     assert calls[-1] == ["gh", "api", "--paginate", "--slurp", "repos/o/r/rulesets"]
-    assert [r.id for r in listed] == [22792049] and listed[0].bypass_actors == ()
+    assert [r.id for r in listed] == [22792049] and listed[0].bypass_actors is None
 
     with pytest.raises(GitHubError, match="non-integer ruleset id"):
         _client(lambda req: _res({"name": "x", "enforcement": "active"})).get_ruleset("o/r", 1)
+
+
+def test_get_ruleset_keeps_absent_bypass_actors_apart_from_empty():
+    """GitHub omits `bypass_actors` for a token without write access to the ruleset --
+    the read still succeeds -- so absence must not be read as "nobody may bypass"."""
+    base = {"id": 7, "name": "main", "enforcement": "active", "current_user_can_bypass": "never"}
+    withheld = _client(lambda req: _res(base)).get_ruleset("o/r", 7)
+    assert withheld.bypass_actors is None
+    assert withheld.current_user_can_bypass == "never"
+
+    explicit = _client(lambda req: _res({**base, "bypass_actors": []})).get_ruleset("o/r", 7)
+    assert explicit.bypass_actors == ()
+
+    with pytest.raises(GitHubError, match="bypass_actors is not an array"):
+        _client(lambda req: _res({**base, "bypass_actors": None})).get_ruleset("o/r", 7)
+    with pytest.raises(GitHubError, match="bypass_actors entry is not an object"):
+        _client(lambda req: _res({**base, "bypass_actors": ["admin"]})).get_ruleset("o/r", 7)
 
 
 def test_get_branch_protection():
