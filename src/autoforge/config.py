@@ -257,6 +257,12 @@ class ReplanConfig:
     soft_threshold: int = 12
     # Review round at which findings trigger a replan unconditionally.
     hard_threshold: int = 20
+    # Window rule, from `soft_threshold`: this many trailing review rounds
+    # with findings, each holding at most `max_findings_per_round`, trigger a
+    # replan. It deliberately counts rounds of entirely new findings too --
+    # recurrence is what `workflow.stagnation_*` detects, and that verdict is
+    # already a replan trigger from the same round; this rule exists for the
+    # long tail of small, fresh findings that never ends.
     stagnation_window: int = 3
     max_findings_per_round: int = 2
     # Counts only completed REPLAN_REEXECUTE lifecycles; initial implementation

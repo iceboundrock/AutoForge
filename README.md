@@ -181,10 +181,14 @@ Key design points:
   review with findings, `review.replan` defaults to a hard trigger at round 20,
   or from round 12 (`soft_threshold`) either three trailing review rounds each
   containing at most two actionable findings, or a `workflow.stagnation_*`
-  verdict. `soft_threshold` gates *every* stagnation trigger: before it, a
-  stagnant loop is `BLOCKED` for a human as documented above, because one
-  ineffective FIX round is too weak a signal to discard a whole PR. It
-  preserves compact finding metadata and selected
+  verdict. The three-round window deliberately counts rounds of entirely new
+  findings (no recurring resolution is required): recurrence is what the
+  `workflow.stagnation_*` rules detect, so the window rule is the trigger for
+  the long tail of small, fresh findings that never ends. `soft_threshold`
+  gates *every* stagnation trigger: before it, a stagnant loop is `BLOCKED`
+  for a human as documented above, because one ineffective FIX round is too
+  weak a signal to discard a whole PR. It preserves compact finding metadata
+  and selected
   review comments, then asks the separate `replan_reexecute` high-effort
   profile to independently rebuild from the latest verified default branch.
   Closing the superseded PR is the controller's only destructive write on
