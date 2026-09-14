@@ -422,6 +422,52 @@ def test_replan_result_schema_rejects_invalid_cross_fields(mutate, needle):
         parse_control_result(block(payload), Phase.REPLAN_REEXECUTE)
 
 
+REPLAN_REQUIRED_FIELDS = [
+    "issue_url",
+    "previous_pr_url",
+    "replacement_pr_url",
+    "previous_branch",
+    "replacement_branch",
+    "previous_head_sha",
+    "replacement_head_sha",
+    "execution_attempt",
+    "historical_findings_considered",
+    "unique_failure_constraints",
+    "fresh_review_round",
+    "previous_pr_disposition",
+    "verification",
+]
+
+
+@pytest.mark.parametrize("field", REPLAN_REQUIRED_FIELDS)
+def test_replan_result_schema_requires_every_field(field):
+    """Every REPLAN_REEXECUTE field is required; none defaults into a valid result."""
+    payload = _replan_payload()
+    del payload[field]
+    with pytest.raises(ControlResultValidationError, match=f"missing required field {field!r}"):
+        parse_control_result(block(payload), Phase.REPLAN_REEXECUTE)
+    payload = _replan_payload()
+    payload[field] = None
+    with pytest.raises(ControlResultValidationError, match=field):
+        parse_control_result(block(payload), Phase.REPLAN_REEXECUTE)
+
+
+@pytest.mark.parametrize(
+    "verification,needle",
+    [
+        ({"tests_passed": True}, "verification.tests_run must be a list"),
+        ({"tests_run": "pytest", "tests_passed": True}, "verification.tests_run must be a list"),
+        ({"tests_run": ["pytest"]}, "verification.tests_passed must be a boolean"),
+        ({"tests_run": ["pytest"], "tests_passed": "yes"}, "tests_passed must be a boolean"),
+        ("passed", "verification must be an object"),
+    ],
+)
+def test_replan_result_schema_requires_a_complete_verification_object(verification, needle):
+    payload = _replan_payload(verification=verification)
+    with pytest.raises(ControlResultValidationError, match=needle):
+        parse_control_result(block(payload), Phase.REPLAN_REEXECUTE)
+
+
 # =============================================================================
 # Happy path and policy routing
 # =============================================================================
@@ -442,6 +488,7 @@ def test_hard_threshold_replaces_pr_and_starts_fresh_review(tmp_state_dir):
     assert state.current_pr_url == REPLACEMENT_PR
     assert state.current_branch == REPLACEMENT_BRANCH
     assert state.current_head_sha == SHA_B
+    assert gh.merges == []  # a replan closes; it never merges anything
     assert state.review_round == 0  # next REVIEW is round 1 under persisted semantics
     assert state.review_history == [] and state.open_findings == []
     assert state.execution_attempt == 2 and state.escalation_count == 1
@@ -789,8 +836,9 @@ def test_r8f2_a_closed_replacement_is_rejected_not_reimplemented(tmp_state_dir):
     assert out.next_phase == "BLOCKED"
     assert REPLACEMENT_PR in eng.state.block_reason
     assert "CLOSED" in eng.state.block_reason
-    assert "already exists" in eng.state.block_reason or "must be decided by a human" in (
-        eng.state.block_reason
+    assert (
+        "a first replacement attempt already exists and must be decided by a human"
+        in eng.state.block_reason
     )
     assert eng.provider.calls == []  # no second implementation attempt
     assert gh.prs[PR].state == "OPEN"  # source untouched
@@ -919,6 +967,28 @@ def test_r9f3_an_unusable_marker_on_a_preexisting_closed_pr_is_still_ignored(
     assert eng.state.current_pr_url == REPLACEMENT_PR
 
 
+def test_an_unusable_marker_on_a_preexisting_open_pr_is_ignored_by_the_open_listing(
+    tmp_state_dir,
+):
+    """The OPEN counterpart: garbage on a PR that predates the id neither adopts nor blocks."""
+    gh = FakeGitHub()
+    gh.add_pr(
+        url=EARLIER_PR,
+        head_sha=SHA_C,
+        branch="chore/unrelated-cleanup",
+        linked=[2],
+        body=UNUSABLE_MARKERS[0],
+        state="OPEN",
+    )
+    eng = _park_at_hard_threshold(tmp_state_dir, gh, _replan_agent(gh))
+    assert eng.step().next_phase == "REPLAN_REEXECUTE"
+    assert eng.step().next_phase == "REVIEW"
+    assert eng.state.current_pr_url == REPLACEMENT_PR
+    assert gh.prs[EARLIER_PR].state == "OPEN"  # left exactly as found
+    replan_calls = [c for c in eng.provider.calls if c.phase == "REPLAN_REEXECUTE"]
+    assert len(replan_calls) == 1
+
+
 def test_r9f4_a_valid_marker_for_another_transaction_beside_ours_is_refused(
     tmp_state_dir,
 ):
@@ -947,6 +1017,30 @@ def test_r9f4_a_foreign_marker_on_an_unrelated_pr_does_not_block_a_healthy_repla
     eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.PREPARED)
     assert eng.step().next_phase == "REVIEW"
     assert eng.state.current_pr_url == REPLACEMENT_PR
+
+
+def test_n9_a_pre_close_refusal_does_not_assert_that_the_source_is_open(tmp_state_dir):
+    """Issue #37 N9: before the close the controller vouches for its own writes only.
+
+    Whether the source is *open* is a GitHub fact a human can change at any
+    time; the block text says what the transaction did (nothing destructive)
+    and never claims what GitHub currently shows.
+    """
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.PREPARED, marker=False)
+    gh.add_pr(
+        url=REPLACEMENT_PR,
+        head_sha=SHA_B,
+        branch=REPLACEMENT_BRANCH,
+        linked=[2],
+        body=UNUSABLE_MARKERS[0],
+    )
+    assert eng.step().next_phase == "BLOCKED"
+    reason = eng.state.block_reason
+    assert f"This transaction did not close PR {PR}" in reason
+    assert "nothing was closed or merged by the controller" in reason
+    assert "stays open" not in reason
+    _assert_source_untouched(eng, gh)
 
 
 def test_a_transaction_without_a_watermark_can_bind_nothing(tmp_state_dir):
@@ -1169,6 +1263,42 @@ def test_agent_claiming_a_different_pr_than_the_marked_one_is_rejected(tmp_state
     assert eng.step().next_phase == "REPLAN_REEXECUTE"
     assert eng.step().next_phase == "BLOCKED"
     assert "the PR bound to replan transaction" in eng.state.block_reason
+    _assert_source_untouched(eng, gh)
+
+
+@pytest.mark.parametrize(
+    "payload_over",
+    [
+        {"previous_pr_url": "https://github.com/Owner/REPO/pull/42"},
+        {"replacement_pr_url": "https://github.com/Owner/REPO/pull/43"},
+    ],
+    ids=["previous", "replacement"],
+)
+def test_n1_agent_claimed_pr_urls_are_compared_by_identity(tmp_state_dir, payload_over):
+    """Issue #37 N1: `Owner/REPO` is this repository as GitHub sees it.
+
+    The agent's `previous_pr_url` is checked against the checkpoint and its
+    `replacement_pr_url` against the marker-bound PR; both are identity
+    comparisons (repository case-insensitively, then the number), never
+    string equality of canonical forms that keep the agent's spelling.
+    """
+    gh = FakeGitHub()
+    eng = _park_at_hard_threshold(tmp_state_dir, gh, _replan_agent(gh, payload_over=payload_over))
+    assert eng.step().next_phase == "REPLAN_REEXECUTE"
+    assert eng.step().next_phase == "REVIEW"
+    assert eng.state.current_pr_url == REPLACEMENT_PR  # the run's spelling, not the agent's
+    assert eng.state.superseded_prs[0]["pr_url"] == PR
+
+
+def test_n1_an_agent_claiming_another_pr_of_the_same_number_elsewhere_is_refused(tmp_state_dir):
+    """Identity is repository *and* number: a different repository is a mismatch."""
+    gh = FakeGitHub()
+    over = {"previous_pr_url": "https://github.com/other/repo/pull/42"}
+    eng = _park_at_hard_threshold(tmp_state_dir, gh, _replan_agent(gh, payload_over=over))
+    assert eng.step().next_phase == "REPLAN_REEXECUTE"
+    assert eng.step().next_phase == "BLOCKED"
+    assert "previous_pr_url" in eng.state.block_reason
+    assert "does not match the checkpoint" in eng.state.block_reason
     _assert_source_untouched(eng, gh)
 
 
@@ -1501,6 +1631,68 @@ def test_r9f1_an_unreadable_source_after_the_close_is_undone_not_adopted(tmp_sta
     assert eng.state.superseded_prs == []
 
 
+def _break_the_confirmations_target_read(gh, error: Exception, *, once: bool = False) -> None:
+    """Make the confirmation's re-read of the *replacement* fail with ``error``.
+
+    Installed from ``comment_race`` so that it applies only after the close
+    receipt landed -- the pre-close verification read of the replacement
+    must succeed, or the close would never be attempted.
+    """
+    original = gh.get_pr
+
+    def failing(url: str):
+        if url == REPLACEMENT_PR:
+            if once:
+                gh.get_pr = original
+            raise error
+        return original(url)
+
+    gh.get_pr = failing
+
+
+def test_t5_an_unreadable_replacement_after_the_close_is_undone_not_adopted(tmp_state_dir):
+    """Issue #37 T5: the replacement side of the unconfirmable-checkpoint rule.
+
+    Symmetric with the source side: a conclusive failure to re-read the
+    replacement after the close means the close cannot be shown to have
+    been correct, so it is undone -- the source is reopened and the run
+    blocks -- rather than kept on the strength of the pre-close read.
+    """
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.VERIFIED)
+    gh.comment_race = lambda fake: _break_the_confirmations_target_read(
+        fake, GitHubError("HTTP 451: `gh pr view` refused")
+    )
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    reason = eng.state.block_reason
+    assert f"replacement PR {REPLACEMENT_PR} could not be re-read after the close" in reason
+    assert "the close was undone" in reason and "is open again" in reason
+    assert len(gh.closed_prs) == 1 and len(gh.reopened_prs) == 1
+    assert gh.prs[PR].state == "OPEN"
+    assert _txn(eng).stage is ReplanStage.REJECTED
+    assert eng.state.current_pr_url == PR and eng.state.superseded_prs == []
+
+
+def test_t5_a_transient_replacement_read_after_the_close_stays_resumable(tmp_state_dir):
+    """A transient failure is not drift: nothing is decided, and the resume confirms."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.VERIFIED)
+    gh.comment_race = lambda fake: _break_the_confirmations_target_read(
+        fake, GitHubUnavailableError("HTTP 502: bad gateway"), once=True
+    )
+    with pytest.raises(GitHubUnavailableError):
+        eng.step()
+    assert _txn(eng).stage is ReplanStage.SUPERSEDE_INTENT  # nothing was decided
+    assert gh.reopened_prs == [] and gh.prs[PR].state == "CLOSED"
+    # The resume finds its own receipt on the closed source, confirms both
+    # checkpoints, and activates -- without a second close.
+    assert eng.step().next_phase == "REVIEW"
+    assert len(gh.closed_prs) == 1 and gh.reopened_prs == []
+    assert eng.state.current_pr_url == REPLACEMENT_PR
+    assert eng.state.superseded_prs[0]["pr_url"] == PR
+
+
 def test_a_clean_close_window_still_supersedes(tmp_state_dir):
     """The post-close comparison must not make the healthy path any harder."""
     gh = FakeGitHub()
@@ -1635,6 +1827,116 @@ def test_failed_or_inconsistent_attestation_is_refused(
 # crash at that point would leave it and asserts what `resume` may and may not
 # do. "The agent must not run" is asserted by the scripted provider itself.
 # =============================================================================
+
+
+def _restart(eng, gh, script=None):
+    """A new controller process over the state ``eng`` persisted: save, construct, load."""
+    eng.save()
+    eng2 = make_engine(eng.paths.state_dir, script or ["the replan agent must not run"], github=gh)
+    eng2.load()
+    assert eng2.state.phase is Phase.REPLAN_REEXECUTE
+    return eng2
+
+
+def test_t1_prepared_survives_a_restart_and_invokes_the_agent_once(tmp_state_dir):
+    """Issue #37 T1: PREPARED, persisted, loaded by a fresh engine -> one invocation.
+
+    The in-memory windows prove the reducer; this proves the journal round
+    trip: the transaction id the fresh process hands the agent is the one the
+    crashed process persisted, so the marker the agent publishes binds.
+    """
+    gh = FakeGitHub()
+    eng = make_engine(tmp_state_dir, ["crashed here"], github=gh)
+    gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2])
+    _seed(eng, ReplanStage.PREPARED)
+    eng2 = _restart(eng, gh, _replan_agent(gh))
+    assert _txn(eng2).stage is ReplanStage.PREPARED
+    assert _txn(eng2).transaction_id == TXN_ID
+    assert eng2.step().next_phase == "REVIEW"
+    replan_calls = [c for c in eng2.provider.calls if c.phase == "REPLAN_REEXECUTE"]
+    assert len(replan_calls) == 1
+    assert TXN_ID in replan_calls[0].prompt
+    assert eng.provider.calls == []  # the crashed process never ran it
+    assert eng2.state.current_pr_url == REPLACEMENT_PR
+    assert len(eng2.state.superseded_prs) == 1
+    assert len(gh.closed_prs) == 1
+
+
+def test_t1_prepared_with_a_bound_replacement_adopts_it_after_a_restart(tmp_state_dir):
+    """PREPARED plus a marker-bearing PR: the fresh process binds, never re-invokes."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.PREPARED)
+    eng2 = _restart(eng, gh)
+    assert eng2.step().next_phase == "REVIEW"
+    assert eng2.provider.calls == []
+    assert eng2.state.current_pr_url == REPLACEMENT_PR
+
+
+def test_t1_supersede_intent_with_the_receipt_adopts_the_close_after_a_restart(tmp_state_dir):
+    """SUPERSEDE_INTENT reloaded: the persisted intent plus the receipt on GitHub
+    prove the close was this transaction's, so it is adopted and never repeated."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(
+        tmp_state_dir, gh, ReplanStage.SUPERSEDE_INTENT, close_intent_at="2026-01-01T00:00:00+00:00"
+    )
+    _closed_by_controller(gh)
+    eng2 = _restart(eng, gh)
+    assert _txn(eng2).close_intent_at == "2026-01-01T00:00:00+00:00"
+    assert eng2.step().next_phase == "REVIEW"
+    assert gh.closed_prs == [] and gh.reopened_prs == []
+    assert eng2.provider.calls == []
+    assert eng2.state.current_pr_url == REPLACEMENT_PR
+    assert eng2.state.superseded_prs[0]["transaction_id"] == TXN_ID
+
+
+def test_t1_supersede_intent_over_an_open_source_refuses_after_a_restart(tmp_state_dir):
+    """The reload must not turn a recorded intent into a licence to close."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(
+        tmp_state_dir, gh, ReplanStage.SUPERSEDE_INTENT, close_intent_at="2026-01-01T00:00:00+00:00"
+    )
+    eng2 = _restart(eng, gh)
+    assert eng2.step().next_phase == "BLOCKED"
+    assert "carries no close receipt" in eng2.state.block_reason
+    assert gh.closed_prs == [] and gh.prs[PR].state == "OPEN"
+    assert _txn(eng2).stage is ReplanStage.REJECTED
+    persisted = load_state(eng2.paths.state_file).replan_transaction
+    assert persisted["stage"] == ReplanStage.REJECTED.value
+
+
+def test_t1_compensating_replays_the_reopen_after_a_restart(tmp_state_dir):
+    """COMPENSATING reloaded: the persisted drift is what the reopen is for; the
+    fresh process reopens the still-closed source and blocks with it open."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.COMPENSATING)
+    _closed_by_controller(gh)
+    eng2 = _restart(eng, gh)
+    assert _txn(eng2).compensation_reason == "the replan checkpoint no longer held at the close"
+    assert eng2.step().next_phase == "BLOCKED"
+    assert "the replan checkpoint no longer held at the close" in eng2.state.block_reason
+    assert "the close was undone" in eng2.state.block_reason
+    assert "is open again" in eng2.state.block_reason
+    assert len(gh.reopened_prs) == 1 and gh.prs[PR].state == "OPEN"
+    assert gh.closed_prs == []  # never closed again
+    assert _txn(eng2).stage is ReplanStage.REJECTED
+    assert eng2.state.current_pr_url == PR and eng2.state.superseded_prs == []
+
+
+def test_t1_superseded_activates_after_a_restart(tmp_state_dir):
+    """SUPERSEDED reloaded: activation re-derives both checkpoints and installs."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(
+        tmp_state_dir, gh, ReplanStage.SUPERSEDED, superseded_at="2026-01-01T00:00:00+00:00"
+    )
+    _closed_by_controller(gh)
+    eng2 = _restart(eng, gh)
+    assert eng2.step().next_phase == "REVIEW"
+    assert gh.closed_prs == [] and gh.reopened_prs == []
+    assert eng2.state.current_pr_url == REPLACEMENT_PR
+    assert eng2.state.review_round == 0 and eng2.state.escalation_count == 1
+    persisted = load_state(eng2.paths.state_file)
+    assert persisted.replan_transaction == {}
+    assert persisted.superseded_prs[0]["pr_url"] == PR
 
 
 def test_w1_crash_before_prepare_still_prepares_and_invokes_once(tmp_state_dir):
@@ -1967,6 +2269,47 @@ def test_a_truncated_candidate_listing_blocks_instead_of_replanning_again(tmp_st
     _assert_source_untouched(eng, gh)
 
 
+def test_t6_a_truncated_all_states_listing_refuses_instead_of_reinvoking(tmp_state_dir):
+    """Issue #37 T6: the exhaustive listing is what proves "no candidate exists".
+
+    The open listing is complete and empty for this transaction; the
+    all-states listing -- the last check before the agent would be invoked
+    again -- cannot be completed. That is a refusal: a closed claimant is
+    sitting past the truncation point, and reporting "absent" would start a
+    second implementation attempt on top of it.
+    """
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.PREPARED, marker=False)
+    gh.add_pr(
+        url=REPLACEMENT_PR,
+        head_sha=SHA_B,
+        branch=REPLACEMENT_BRANCH,
+        linked=[2],
+        body=_ours_marker(),
+        state="CLOSED",
+    )
+    strict_seen: list[bool] = []
+
+    def truncated(repo, *, strict=False):
+        gh.calls.append(("list_all_prs", repo, strict))
+        strict_seen.append(strict)
+        raise GitHubError(
+            f"{repo} has at least 1000 pull requests, so the listing may be truncated and "
+            "the set of candidates cannot be established"
+        )
+
+    gh.list_all_prs = truncated
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert "cannot list replacement PR candidates" in eng.state.block_reason
+    assert "truncated" in eng.state.block_reason
+    assert strict_seen == [True]  # the exhaustive listing was read strictly, once
+    assert ("list_open_prs", "owner/repo", True) in gh.calls
+    assert eng.provider.calls == []  # no second implementation attempt
+    assert _txn(eng).stage is ReplanStage.REJECTED
+    _assert_source_untouched(eng, gh)
+
+
 def test_a_truncated_listing_at_prepare_blocks_before_any_agent_runs(tmp_state_dir):
     gh = FakeGitHub()
     eng = _pending_at_the_source(tmp_state_dir, gh)
@@ -2178,6 +2521,44 @@ def test_replan_prompt_uses_controller_checkpoint_not_agent_input(tmp_state_dir)
     assert '"historical_findings_considered": 4' in prompt
     assert TXN_ID in prompt
     assert MARKER_NAME in prompt
+
+
+@pytest.mark.parametrize(
+    "stage",
+    [
+        ReplanStage.PENDING,
+        ReplanStage.PREPARED,
+        ReplanStage.VERIFIED,
+        ReplanStage.SUPERSEDE_INTENT,
+        ReplanStage.COMPENSATING,
+        ReplanStage.SUPERSEDED,
+    ],
+    ids=lambda s: s.value,
+)
+def test_t3_a_dry_run_from_replan_reexecute_neither_writes_nor_invokes(tmp_state_dir, stage):
+    """Issue #37 T3: dry-run is a controller invariant in the destructive phase too.
+
+    From every stage a crash can leave, a dry-run step renders the plan and
+    nothing else: no agent, no `gh` call of any kind (so no close, reopen or
+    comment), no journal movement and no state write.
+    """
+    gh = FakeGitHub()
+    eng, txn = _seeded_engine(tmp_state_dir, gh, stage)
+    if stage in (ReplanStage.SUPERSEDE_INTENT, ReplanStage.COMPENSATING, ReplanStage.SUPERSEDED):
+        _closed_by_controller(gh)
+    eng.save()
+    state_bytes = eng.paths.state_file.read_bytes()
+    calls_before = list(gh.calls)
+    out = eng.step(dry_run=True)
+    assert out.dry_run and out.plan is not None
+    assert out.plan.template == "replan_reexecute.md"
+    assert eng.provider.calls == []
+    assert gh.calls == calls_before
+    assert gh.closed_prs == [] and gh.reopened_prs == [] and gh.commented_prs == []
+    assert eng.paths.state_file.read_bytes() == state_bytes
+    assert eng.state.phase is Phase.REPLAN_REEXECUTE
+    assert eng.state.replan_transaction == txn.to_dict()
+    assert not eng.paths.logs_dir.exists()
 
 
 def test_replan_prompt_before_the_checkpoint_shows_placeholders(tmp_state_dir):
@@ -2625,17 +3006,39 @@ def test_f3_a_replacement_that_drifted_before_activation_is_not_installed(
     assert _txn(eng).stage is ReplanStage.REJECTED
 
 
-def test_f3_a_source_reopened_before_activation_blocks(tmp_state_dir):
-    """Both checkpoints are re-derived, not just the replacement's."""
+@pytest.mark.parametrize(
+    "drift,needle",
+    [
+        (lambda gh: setattr(gh.prs[PR], "state", "OPEN"), "expected CLOSED"),
+        (lambda gh: gh.set_head(SHA_C, PR), "advanced from the checkpointed HEAD"),
+        (
+            lambda gh: setattr(gh.prs[PR], "head_ref", "somebody/else"),
+            "moved from the checkpointed branch",
+        ),
+    ],
+    ids=["reopened", "head", "branch"],
+)
+def test_f3_a_source_that_drifted_before_activation_blocks(tmp_state_dir, drift, needle):
+    """Both checkpoints are re-derived, not just the replacement's (issue #37 T4).
+
+    A reopen, a push, or a branch move on the closed source inside the
+    activation window is terminal, not compensable: the close was confirmed
+    correct against the last reads before it, so the source is not reopened
+    and the replacement is not installed.
+    """
     gh = FakeGitHub()
     eng, _ = _seeded_engine(
         tmp_state_dir, gh, ReplanStage.SUPERSEDED, superseded_at="2026-01-01T00:00:00+00:00"
     )
     _closed_by_controller(gh)
-    gh.prs[PR].state = "OPEN"  # a human reopened it before the resume
+    drift(gh)
     assert eng.step().next_phase == "BLOCKED"
-    assert "expected CLOSED" in eng.state.block_reason
+    assert "can no longer be activated" in eng.state.block_reason
+    assert needle in eng.state.block_reason
     assert eng.state.superseded_prs == []
+    assert eng.state.current_pr_url == PR  # nothing was installed
+    assert gh.reopened_prs == [] and gh.closed_prs == []  # terminal: no compensation
+    assert _txn(eng).stage is ReplanStage.REJECTED
 
 
 def test_f3_a_transient_read_before_activation_stays_resumable(tmp_state_dir):
@@ -2709,6 +3112,35 @@ def test_f4_an_angle_bracket_marker_beside_a_valid_one_still_refuses():
     selection = select_bound_candidate([gh.prs[OTHER_PR]], _txn_for_marker_tests())
     assert selection.disposition is Disposition.REJECTED
     assert "alongside an unusable one" in selection.reason
+
+
+def test_n5_a_marker_whose_payload_contains_an_opener_is_not_a_complete_marker():
+    """Issue #37 N5, pinned: the payload may not span a comment delimiter.
+
+    `<!-- autoforge-replan-transaction: {"x": "<!--"} -->` is not matched as a
+    marker at all: the inner `<!--` ends the payload, so the outer text is an
+    unterminated marker (evidence of nothing) and the inner one is not a
+    named marker. That is the documented rule (AGENTS.md: "the payload may
+    not span a comment delimiter"), and it is what keeps an unterminated
+    marker from swallowing a valid one that follows it. Treating such a body
+    as *malformed* instead would be a change of marker semantics, not a bug
+    fix, and is deliberately not made here.
+    """
+    good = render_marker(
+        ReplanAttestation(
+            transaction_id=TXN_ID,
+            execution_attempt=2,
+            findings_considered=1,
+            unique_constraints=1,
+            tests_passed=True,
+        )
+    )
+    spanning = f'<!-- {MARKER_NAME}: {{"transaction_id": "<!--"}} -->'
+    alone = scan_replan_markers(spanning)
+    assert alone.attestations == [] and alone.malformed == []
+    scan = scan_replan_markers(f"{spanning}\n{good}")
+    assert [a.transaction_id for a in scan.attestations] == [TXN_ID]
+    assert scan.malformed == []
 
 
 def test_f4_an_unterminated_marker_with_brackets_still_cannot_swallow():

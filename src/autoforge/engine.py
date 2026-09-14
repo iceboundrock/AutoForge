@@ -251,6 +251,20 @@ def _same_issue(observed: str, expected: str) -> bool:
         return False
 
 
+def _same_pr(observed: str, expected: str) -> bool:
+    """PR identity as GitHub sees it (see :func:`_same_issue`).
+
+    Agent-claimed URLs are compared with this, never by string equality of
+    their canonical forms: the canonical form keeps the owner and repository
+    spelling the agent used, and GitHub treats ``Owner/Repo`` and
+    ``owner/repo`` as one repository.
+    """
+    try:
+        return parse_pr_url(observed).same_target(parse_pr_url(expected))
+    except ConfigurationError:
+        return False
+
+
 def generate_run_id() -> str:
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     return f"af-{stamp}-{secrets.token_hex(3)}"
@@ -3074,10 +3088,14 @@ class ControllerEngine:
                 f"and the replacement {txn.replacement_pr_url or '(none)'} was not activated"
             )
         else:
+            # Pre-close stages: the controller performed no destructive write,
+            # which is all it can vouch for. Whether the source is *open* is a
+            # GitHub fact that may have changed under a human's hand since it
+            # was last read, so it is not asserted here.
             tail = (
-                f"PR {txn.source_pr_url or txn.decision_pr_url or '(none)'} stays open with its "
-                "findings; "
-                "nothing was closed or merged"
+                f"This transaction did not close PR "
+                f"{txn.source_pr_url or txn.decision_pr_url or '(none)'}, which keeps its "
+                "findings; nothing was closed or merged by the controller"
             )
         return f"cannot safely REPLAN_REEXECUTE: {reason}. {tail}. A human must decide next."
 
@@ -3355,7 +3373,7 @@ class ControllerEngine:
         pr, attestation = selection.pr, selection.attestation
         assert pr is not None and attestation is not None  # Disposition.OK invariant
         canonical = parse_pr_url(pr.url).canonical
-        if claimed_url and claimed_url != canonical:
+        if claimed_url and not _same_pr(claimed_url, canonical):
             return self._reject_replan(
                 txn,
                 f"the agent reports replacement PR {claimed_url}, but the PR bound to replan "
@@ -3975,7 +3993,7 @@ class ControllerEngine:
     def _apply_analyze(self, res: AnalyzeExecuteResult) -> tuple[Phase, str]:
         state = self._require_state()
         issue = parse_issue_url(res.issue_url)
-        if issue.canonical != state.current_issue_url:
+        if not _same_issue(issue.canonical, state.current_issue_url):
             raise VerificationError(
                 f"agent reported issue {issue.canonical} but the run is for "
                 f"{state.current_issue_url}"
@@ -4024,7 +4042,7 @@ class ControllerEngine:
                 f"review_comment_url is not a GitHub PR comment URL: {exc}"
             ) from exc
         pr_ref = parse_pr_url(state.current_pr_url)
-        if cref.parent.canonical != pr_ref.canonical:
+        if not cref.parent.same_target(pr_ref):
             raise VerificationError(
                 f"review comment {res.review_comment_url} does not belong to PR {pr_ref.canonical}"
             )
@@ -4253,7 +4271,7 @@ class ControllerEngine:
                         f"follow-up issue {ref.canonical} for {r.finding_id} is outside "
                         f"{state.repository}"
                     )
-                if ref.canonical == state.current_issue_url:
+                if _same_issue(ref.canonical, state.current_issue_url):
                     raise VerificationError(
                         f"follow-up for {r.finding_id} points at the current issue itself"
                     )
@@ -4315,7 +4333,7 @@ class ControllerEngine:
         mismatch = ""
         if not _same_issue(res.issue_url, txn.issue_url):
             mismatch = f"issue_url {res.issue_url!r} does not match the replan issue"
-        elif parse_pr_url(res.previous_pr_url).canonical != txn.source_pr_url:
+        elif not _same_pr(res.previous_pr_url, txn.source_pr_url):
             mismatch = f"previous_pr_url {res.previous_pr_url!r} does not match the checkpoint"
         elif res.previous_branch != txn.source_branch:
             mismatch = f"previous_branch {res.previous_branch!r} does not match the checkpoint"

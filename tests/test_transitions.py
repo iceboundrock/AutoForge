@@ -2,11 +2,12 @@
 
 import pytest
 
-from autoforge.errors import StateTransitionError
+from autoforge.errors import ControlResultValidationError, StateTransitionError
 from autoforge.transitions import (
     LEGAL_EDGES,
     TERMINAL_PHASES,
     Phase,
+    WorkflowMode,
     decide_next_phase,
     is_legal,
     validate_transition,
@@ -79,6 +80,39 @@ def test_every_phase_appears_in_the_topology():
 def test_decide_review_routing():
     assert decide_next_phase(Phase.REVIEW, {"needs_fix_round": True}) == Phase.FIX
     assert decide_next_phase(Phase.REVIEW, {"needs_fix_round": False}) == Phase.READY_FOR_MERGE
+
+
+def test_decide_review_can_express_the_controllers_replan_decision():
+    """REVIEW -> REPLAN_REEXECUTE is a legal edge, so the router must know it.
+
+    The decision is the controller's (replan policy), carried as ``replan``
+    beside the reviewer's fields; an explicit ``replan: false`` routes exactly
+    like an absent one.
+    """
+    result = {"needs_fix_round": True, "replan": True}
+    assert decide_next_phase(Phase.REVIEW, result) == Phase.REPLAN_REEXECUTE
+    assert is_legal(Phase.REVIEW, Phase.REPLAN_REEXECUTE)
+    assert decide_next_phase(Phase.REVIEW, {"needs_fix_round": True, "replan": False}) == Phase.FIX
+    assert (
+        decide_next_phase(Phase.REVIEW, {"needs_fix_round": False, "replan": False})
+        == Phase.READY_FOR_MERGE
+    )
+
+
+def test_decide_review_refuses_a_replan_over_a_clean_review():
+    """Only a review with findings can escalate; a clean one never replans."""
+    with pytest.raises(ControlResultValidationError, match="needs_fix_round == true"):
+        decide_next_phase(Phase.REVIEW, {"needs_fix_round": False, "replan": True})
+    with pytest.raises(ControlResultValidationError, match="'replan' must be a boolean"):
+        decide_next_phase(Phase.REVIEW, {"needs_fix_round": True, "replan": "yes"})
+
+
+def test_local_review_ignores_no_replan_silently():
+    """LOCAL mode has no REPLAN_REEXECUTE; the replan key is never consulted there."""
+    assert not is_legal(Phase.REVIEW, Phase.REPLAN_REEXECUTE, WorkflowMode.LOCAL)
+    assert (
+        decide_next_phase(Phase.REVIEW, {"needs_fix_round": True}, WorkflowMode.LOCAL) == Phase.FIX
+    )
 
 
 def test_decide_merge_is_controller_owned():

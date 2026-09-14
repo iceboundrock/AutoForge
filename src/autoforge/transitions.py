@@ -176,9 +176,11 @@ def decide_next_phase(
     """Pure function: current phase + validated CONTROL_RESULT -> next phase.
 
     ``result`` is the parsed CONTROL_RESULT payload whose ``phase`` field
-    must equal ``current.value`` (checked by the result parser beforehand).
-    Missing/invalid decision fields raise ControlResultValidationError;
-    terminal phases raise StateTransitionError.
+    must equal ``current.value`` (checked by the result parser beforehand),
+    possibly extended with the controller's own observations and decisions
+    (``head_changed_after_review`` in READY_FOR_MERGE/MERGE, ``replan`` in
+    REVIEW). Missing/invalid decision fields raise
+    ControlResultValidationError; terminal phases raise StateTransitionError.
     """
     from .errors import ControlResultValidationError
 
@@ -211,6 +213,21 @@ def decide_next_phase(
         needs_fix = need("needs_fix_round")
         if not isinstance(needs_fix, bool):
             raise ControlResultValidationError("'needs_fix_round' must be a boolean")
+        # ``replan`` is the controller's own decision (engine replan policy),
+        # never a reviewer field: the agent's CONTROL_RESULT has no say in
+        # whether its PR is replaced. It is only meaningful over findings --
+        # REVIEW -> REPLAN_REEXECUTE without a fix round to escalate is not a
+        # route this topology has.
+        replan = result.get("replan", False)
+        if not isinstance(replan, bool):
+            raise ControlResultValidationError("'replan' must be a boolean")
+        if replan:
+            if not needs_fix:
+                raise ControlResultValidationError(
+                    "a replan decision requires needs_fix_round == true: "
+                    "only a review with findings can escalate to REPLAN_REEXECUTE"
+                )
+            return Phase.REPLAN_REEXECUTE
         return Phase.FIX if needs_fix else Phase.READY_FOR_MERGE
     if current == Phase.READY_FOR_MERGE:
         if result.get("head_changed_after_review") is True:

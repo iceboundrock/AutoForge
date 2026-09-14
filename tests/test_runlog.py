@@ -311,6 +311,36 @@ def test_the_event_journal_never_carries_an_unredacted_error(tmp_path):
         assert secret not in (step / name).read_text(encoding="utf-8")
 
 
+def test_the_event_journal_and_request_never_carry_an_unredacted_metadata_value(tmp_path):
+    """Issue #37 F5: `metadata` is persisted raw into `request.json` and the journal.
+
+    `metadata` is free-form and carries whatever the caller attached -- a
+    failing command line, a redirect URL with a token in it -- so it gets
+    the same redaction as `error`, and every persistence path (the request
+    file, `execution.json`, the events journal) must show the redacted text.
+    """
+    secret = "ghp_" + "b" * 36
+    log = RunLogger(tmp_path / "logs", "run-1")
+    step = log.log_execution(
+        ExecutionRecord(
+            run_id="run-1",
+            seq=0,
+            phase="MERGE",
+            metadata={
+                "command": f"gh api -H 'Authorization: Bearer {secret}' /repos/o/r",
+                "nested": {"env": [f"GH_TOKEN={secret}"]},
+            },
+        )
+    )
+    journal = log.events_path.read_text(encoding="utf-8")
+    assert secret not in journal
+    assert "REDACTED" in journal
+    request = (step / "request.json").read_text(encoding="utf-8")
+    assert secret not in request
+    assert "REDACTED" in request
+    assert secret not in (step / "execution.json").read_text(encoding="utf-8")
+
+
 def test_a_write_never_lands_on_a_hard_link_and_never_truncates_first(tmp_path):
     """PR #44 R4-F1: a hard link is a regular file by every other test.
 
