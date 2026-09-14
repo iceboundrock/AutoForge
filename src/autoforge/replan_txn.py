@@ -66,7 +66,7 @@ from enum import StrEnum
 
 from .errors import ConfigurationError
 from .github import PRInfo
-from .validation import GitHubPullRequestRef, parse_issue_url, parse_pr_url
+from .validation import GitHubPullRequestRef, parse_issue_url, parse_pr_url, same_pr_url
 
 MARKER_NAME = "autoforge-replan-transaction"
 # Matches *every* complete comment bearing this name, whatever the payload
@@ -794,14 +794,6 @@ def _canonical(url: str) -> str:
         return ""
 
 
-def _same_pr(observed: str, expected: str) -> bool:
-    """PR identity as GitHub sees it, never vacuous: an unusable URL matches nothing."""
-    try:
-        return parse_pr_url(observed).same_target(parse_pr_url(expected))
-    except ConfigurationError:
-        return False
-
-
 def _same_sha(observed: str, expected: str) -> bool:
     """One rule for every SHA comparison: case-insensitive, and never vacuous.
 
@@ -980,7 +972,7 @@ def verify_decision_point(pr: PRInfo, txn: ReplanTransaction) -> str:
             "the replan transaction does not record the PR whose review decided it, so the "
             "source cannot be proven to be the PR the findings belong to"
         )
-    if not _same_pr(pr.url, txn.decision_pr_url):
+    if not same_pr_url(pr.url, txn.decision_pr_url):
         return (
             f"source PR read back as {pr.url or '(none)'}, but the review that decided this "
             f"replan ran on {txn.decision_pr_url}; the current work was never reviewed "

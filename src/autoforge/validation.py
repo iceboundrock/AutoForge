@@ -97,6 +97,28 @@ class GitHubCommentRef:
 ParsedURL = GitHubRef
 
 
+def same_issue_url(observed: str, expected: str) -> bool:
+    """Issue identity as GitHub sees it, never vacuous: an unusable URL matches nothing.
+
+    Agent-claimed and persisted URLs are compared with this, never by string
+    equality of their canonical forms: the canonical form keeps the owner and
+    repository spelling its author used, and GitHub treats ``Owner/Repo`` and
+    ``owner/repo`` as one repository (see :meth:`GitHubRef.same_target`).
+    """
+    try:
+        return parse_issue_url(observed).same_target(parse_issue_url(expected))
+    except ConfigurationError:
+        return False
+
+
+def same_pr_url(observed: str, expected: str) -> bool:
+    """PR identity as GitHub sees it (see :func:`same_issue_url`)."""
+    try:
+        return parse_pr_url(observed).same_target(parse_pr_url(expected))
+    except ConfigurationError:
+        return False
+
+
 def _split(url: str):
     if not isinstance(url, str) or not url.strip():
         raise ConfigurationError(f"not a valid HTTPS GitHub URL: {url!r} ({_EXPECTED})")

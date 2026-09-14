@@ -192,6 +192,8 @@ from .validation import (
     parse_comment_url,
     parse_issue_url,
     parse_pr_url,
+    same_issue_url,
+    same_pr_url,
     validate_epic_and_issue,
 )
 
@@ -241,28 +243,6 @@ MERGE_STATE_HINTS = {
 
 _REVIEW_MARKER_RE = re.compile(r"<!--\s*ai-review-result:\s*(\{.*?\})\s*-->", re.DOTALL)
 _REVIEW_HEADING_RE = re.compile(r"^#\s*AI Code Review\s*[—–-]+\s*Round\s+(\d+)\s*$", re.MULTILINE)
-
-
-def _same_issue(observed: str, expected: str) -> bool:
-    """Issue identity as GitHub sees it, never vacuous: an unusable URL matches nothing."""
-    try:
-        return parse_issue_url(observed).same_target(parse_issue_url(expected))
-    except ConfigurationError:
-        return False
-
-
-def _same_pr(observed: str, expected: str) -> bool:
-    """PR identity as GitHub sees it (see :func:`_same_issue`).
-
-    Agent-claimed URLs are compared with this, never by string equality of
-    their canonical forms: the canonical form keeps the owner and repository
-    spelling the agent used, and GitHub treats ``Owner/Repo`` and
-    ``owner/repo`` as one repository.
-    """
-    try:
-        return parse_pr_url(observed).same_target(parse_pr_url(expected))
-    except ConfigurationError:
-        return False
 
 
 def generate_run_id() -> str:
@@ -3373,7 +3353,7 @@ class ControllerEngine:
         pr, attestation = selection.pr, selection.attestation
         assert pr is not None and attestation is not None  # Disposition.OK invariant
         canonical = parse_pr_url(pr.url).canonical
-        if claimed_url and not _same_pr(claimed_url, canonical):
+        if claimed_url and not same_pr_url(claimed_url, canonical):
             return self._reject_replan(
                 txn,
                 f"the agent reports replacement PR {claimed_url}, but the PR bound to replan "
@@ -3993,7 +3973,7 @@ class ControllerEngine:
     def _apply_analyze(self, res: AnalyzeExecuteResult) -> tuple[Phase, str]:
         state = self._require_state()
         issue = parse_issue_url(res.issue_url)
-        if not _same_issue(issue.canonical, state.current_issue_url):
+        if not same_issue_url(issue.canonical, state.current_issue_url):
             raise VerificationError(
                 f"agent reported issue {issue.canonical} but the run is for "
                 f"{state.current_issue_url}"
@@ -4271,7 +4251,7 @@ class ControllerEngine:
                         f"follow-up issue {ref.canonical} for {r.finding_id} is outside "
                         f"{state.repository}"
                     )
-                if _same_issue(ref.canonical, state.current_issue_url):
+                if same_issue_url(ref.canonical, state.current_issue_url):
                     raise VerificationError(
                         f"follow-up for {r.finding_id} points at the current issue itself"
                     )
@@ -4331,9 +4311,9 @@ class ControllerEngine:
             )
         claimed_url = parse_pr_url(res.replacement_pr_url).canonical
         mismatch = ""
-        if not _same_issue(res.issue_url, txn.issue_url):
+        if not same_issue_url(res.issue_url, txn.issue_url):
             mismatch = f"issue_url {res.issue_url!r} does not match the replan issue"
-        elif not _same_pr(res.previous_pr_url, txn.source_pr_url):
+        elif not same_pr_url(res.previous_pr_url, txn.source_pr_url):
             mismatch = f"previous_pr_url {res.previous_pr_url!r} does not match the checkpoint"
         elif res.previous_branch != txn.source_branch:
             mismatch = f"previous_branch {res.previous_branch!r} does not match the checkpoint"

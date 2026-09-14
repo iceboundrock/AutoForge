@@ -107,12 +107,23 @@ def test_decide_review_refuses_a_replan_over_a_clean_review():
         decide_next_phase(Phase.REVIEW, {"needs_fix_round": True, "replan": "yes"})
 
 
-def test_local_review_ignores_no_replan_silently():
-    """LOCAL mode has no REPLAN_REEXECUTE; the replan key is never consulted there."""
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"needs_fix_round": True},
+        {"needs_fix_round": True, "replan": True},
+        {"needs_fix_round": True, "replan": "yes"},
+    ],
+    ids=["absent", "true", "not-a-boolean"],
+)
+def test_local_review_ignores_replan_silently(result):
+    """LOCAL mode has no REPLAN_REEXECUTE; the replan key is never consulted there.
+
+    Never consulted means never validated either: a ``replan`` that REMOTE
+    would route on or refuse still routes LOCAL's review with findings to FIX.
+    """
     assert not is_legal(Phase.REVIEW, Phase.REPLAN_REEXECUTE, WorkflowMode.LOCAL)
-    assert (
-        decide_next_phase(Phase.REVIEW, {"needs_fix_round": True}, WorkflowMode.LOCAL) == Phase.FIX
-    )
+    assert decide_next_phase(Phase.REVIEW, result, WorkflowMode.LOCAL) == Phase.FIX
 
 
 def test_decide_merge_is_controller_owned():
