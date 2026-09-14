@@ -626,6 +626,7 @@ def test_review_beyond_the_persisted_finding_bound_blocks_instead_of_replanning(
     eng.state.phase = Phase.REPLAN_REEXECUTE
     eng.state.replan_transaction = ReplanTransaction(
         stage=ReplanStage.PENDING,
+        issue_url=ISSUE,
         decision_pr_url=PR,
         decision_head_sha=SHA_A,
         decision_branch=BRANCH,
@@ -1985,6 +1986,7 @@ def test_conclusive_failure_reading_the_source_at_prepare_blocks(tmp_state_dir):
     eng.state.current_branch = BRANCH
     eng.state.replan_transaction = ReplanTransaction(
         stage=ReplanStage.PENDING,
+        issue_url=ISSUE,
         decision_pr_url=PR,
         decision_head_sha=SHA_A,
         decision_branch=BRANCH,
@@ -2006,6 +2008,7 @@ def _pending_at_the_source(tmp_state_dir, gh):
     eng.state.current_head_sha = SHA_A
     eng.state.replan_transaction = ReplanTransaction(
         stage=ReplanStage.PENDING,
+        issue_url=ISSUE,
         decision_pr_url=PR,
         decision_head_sha=SHA_A,
         decision_branch=BRANCH,
@@ -2049,6 +2052,7 @@ def test_a_source_pr_that_moved_before_prepare_is_refused(tmp_state_dir):
     eng.state.current_branch = BRANCH
     eng.state.replan_transaction = ReplanTransaction(
         stage=ReplanStage.PENDING,
+        issue_url=ISSUE,
         decision_pr_url=PR,
         decision_head_sha=SHA_A,
         decision_branch=BRANCH,
@@ -2762,6 +2766,7 @@ def test_f1_a_source_without_a_readable_branch_is_refused_at_prepare(tmp_state_d
     eng.state.current_head_sha = SHA_A
     eng.state.replan_transaction = ReplanTransaction(
         stage=ReplanStage.PENDING,
+        issue_url=ISSUE,
         decision_pr_url=PR,
         decision_head_sha=SHA_A,
         decision_branch=BRANCH,
@@ -2817,6 +2822,7 @@ def test_n3_a_malformed_pr_url_from_the_listing_is_a_refusal_not_a_crash(tmp_sta
     eng.state.current_head_sha = SHA_A
     eng.state.replan_transaction = ReplanTransaction(
         stage=ReplanStage.PENDING,
+        issue_url=ISSUE,
         decision_pr_url=PR,
         decision_head_sha=SHA_A,
         decision_branch=BRANCH,
@@ -3047,6 +3053,7 @@ def test_r2f2_a_pending_journal_may_not_carry_a_transaction_id():
     """The id is created with PREPARED; one at PENDING was written by somebody else."""
     data = ReplanTransaction(
         stage=ReplanStage.PENDING,
+        issue_url=ISSUE,
         decision_pr_url=PR,
         decision_head_sha=SHA_A,
         decision_branch=BRANCH,
@@ -3185,21 +3192,23 @@ def test_r3f1_the_run_binding_compares_identity_not_url_strings():
     from autoforge.replan_txn import verify_run_binding
 
     txn = _seed_txn(ReplanStage.VERIFIED)
-    assert verify_run_binding(txn, "owner/repo", PR) == ""
+    assert verify_run_binding(txn, "owner/repo", PR, ISSUE) == ""
     # GitHub owner and repository names are case-insensitive.
-    assert verify_run_binding(txn, "Owner/Repo", PR) == ""
-    assert verify_run_binding(txn, "owner/repo", "https://github.com/Owner/REPO/pull/42") == ""
-    assert "is not in other/repo" in verify_run_binding(txn, "other/repo", PR)
-    assert "is not the run's current PR" in verify_run_binding(txn, "owner/repo", EARLIER_PR)
-    assert "current PR URL is unusable" in verify_run_binding(txn, "owner/repo", "")
-    assert "current PR URL is unusable" in verify_run_binding(txn, "owner/repo", ISSUE)
+    assert verify_run_binding(txn, "Owner/Repo", PR, ISSUE) == ""
+    assert (
+        verify_run_binding(txn, "owner/repo", "https://github.com/Owner/REPO/pull/42", ISSUE) == ""
+    )
+    assert "is not in other/repo" in verify_run_binding(txn, "other/repo", PR, ISSUE)
+    assert "is not the run's current PR" in verify_run_binding(txn, "owner/repo", EARLIER_PR, ISSUE)
+    assert "current PR URL is unusable" in verify_run_binding(txn, "owner/repo", "", ISSUE)
+    assert "current PR URL is unusable" in verify_run_binding(txn, "owner/repo", ISSUE, ISSUE)
     # PENDING names no checkpointed source yet; every later stage must.
     pending = _seed_txn(ReplanStage.PENDING, source_pr_url="")
-    assert verify_run_binding(pending, "owner/repo", PR) == ""
+    assert verify_run_binding(pending, "owner/repo", PR, ISSUE) == ""
     prepared = _seed_txn(ReplanStage.PREPARED, source_pr_url="")
-    assert "names no source PR" in verify_run_binding(prepared, "owner/repo", PR)
+    assert "names no source PR" in verify_run_binding(prepared, "owner/repo", PR, ISSUE)
     assert "is unusable" in verify_run_binding(
-        _seed_txn(ReplanStage.PREPARED, source_pr_url=ISSUE), "owner/repo", PR
+        _seed_txn(ReplanStage.PREPARED, source_pr_url=ISSUE), "owner/repo", PR, ISSUE
     )
 
 
@@ -3211,31 +3220,35 @@ def test_r4f1_the_run_binding_is_two_sided_and_binds_the_decision_pr_at_every_st
     from autoforge.replan_txn import verify_run_binding
 
     pending = _seed_txn(ReplanStage.PENDING, source_pr_url="")
-    assert verify_run_binding(pending, "owner/repo", PR) == ""
-    assert verify_run_binding(pending, "Owner/Repo", "https://github.com/Owner/REPO/pull/42") == ""
+    assert verify_run_binding(pending, "owner/repo", PR, ISSUE) == ""
+    assert (
+        verify_run_binding(pending, "Owner/Repo", "https://github.com/Owner/REPO/pull/42", ISSUE)
+        == ""
+    )
     # The run now holds another PR: the decision was not made on it.
     assert f"decision PR {PR} is not the run's current PR {EARLIER_PR}" in verify_run_binding(
-        pending, "owner/repo", EARLIER_PR
+        pending, "owner/repo", EARLIER_PR, ISSUE
     )
-    assert "is not in other/repo" in verify_run_binding(pending, "other/repo", PR)
+    assert "is not in other/repo" in verify_run_binding(pending, "other/repo", PR, ISSUE)
     for stage in ReplanStage:
         if stage is ReplanStage.REJECTED:
             continue
         # A decision recorded for another PR is refused whatever the checkpoint says.
         assert "is not the run's current PR" in verify_run_binding(
-            _seed_txn(stage, decision_pr_url=EARLIER_PR), "owner/repo", PR
+            _seed_txn(stage, decision_pr_url=EARLIER_PR), "owner/repo", PR, ISSUE
         ), stage
         assert "does not record the PR whose review decided it" in verify_run_binding(
-            _seed_txn(stage, decision_pr_url=""), "owner/repo", PR
+            _seed_txn(stage, decision_pr_url=""), "owner/repo", PR, ISSUE
         ), stage
         assert "decision PR URL is unusable" in verify_run_binding(
-            _seed_txn(stage, decision_pr_url=ISSUE), "owner/repo", PR
+            _seed_txn(stage, decision_pr_url=ISSUE), "owner/repo", PR, ISSUE
         ), stage
     # A checkpoint that does not bind is reported before the decision is looked at.
     assert "checkpointed source PR" in verify_run_binding(
         _seed_txn(ReplanStage.PREPARED, source_pr_url=EARLIER_PR, decision_pr_url=EARLIER_PR),
         "owner/repo",
         PR,
+        ISSUE,
     )
 
 
@@ -3596,3 +3609,234 @@ def test_r5f1_every_journal_the_controller_writes_loads_complete(tmp_state_dir):
     assert PR in prepared["preexisting_pr_urls"]
     assert "R20-F1" in prepared["rendered_findings"]
     assert prepared["rendered_verification_failures"] == "(none)"
+
+
+# =============================================================================
+# #35 R6-F1: the journal's issue is bound to the run, not only its PRs
+# =============================================================================
+
+
+def test_r6f1_the_reviewers_reproduction_a_cross_issue_journal_never_closes_the_source(
+    tmp_state_dir,
+):
+    """A complete VERIFIED journal for source PR #42 (issue #2) whose
+    `issue_url` was substituted for same-repository issue #3, and a marked,
+    post-watermark replacement linked only to #3. Before the issue was bound
+    to the run this closed #42, activated the replacement, and left
+    `current_issue_url` at #2."""
+    from tests.conftest import ISSUE3
+
+    gh = FakeGitHub()
+    eng = make_engine(tmp_state_dir, ["the replan agent must not run"], github=gh)
+    gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2])
+    gh.add_pr(
+        url=REPLACEMENT_PR,
+        head_sha=SHA_B,
+        branch=REPLACEMENT_BRANCH,
+        linked=[3],
+        body=_ours_marker(),
+    )
+    _seed(eng, ReplanStage.VERIFIED, issue_url=ISSUE3)
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    reason = eng.state.block_reason
+    assert f"replan issue {ISSUE3} is not the run's current issue {ISSUE}" in reason
+    assert eng.provider.calls == []
+    assert gh.closed_prs == [] and gh.reopened_prs == []
+    assert eng.state.current_issue_url == ISSUE
+    _assert_source_untouched(eng, gh)
+    assert _txn(eng).stage is ReplanStage.REJECTED
+    # The journal stays on disk as it was; the refusal replays identically.
+    assert load_state(eng.paths.state_file).replan_transaction["issue_url"] == ISSUE3
+    eng.state.phase = Phase.REPLAN_REEXECUTE
+    assert eng.step().next_phase == "BLOCKED"
+    assert eng.state.block_reason == reason
+    assert eng.provider.calls == [] and gh.closed_prs == []
+    assert eng.state.current_pr_url == PR and eng.state.current_issue_url == ISSUE
+
+
+@pytest.mark.parametrize(
+    "stage",
+    [s for s in ReplanStage if s is not ReplanStage.REJECTED],
+    ids=lambda v: v.value,
+)
+def test_r6f1_a_journal_about_another_issue_is_refused_at_every_stage(tmp_state_dir, stage):
+    """Not the agent (PENDING, PREPARED), not the close (VERIFIED,
+    SUPERSEDE_INTENT), not the reopen (COMPENSATING), not the activation
+    (SUPERSEDED)."""
+    from tests.conftest import ISSUE3
+
+    gh = FakeGitHub()
+    over = {"issue_url": ISSUE3}
+    if stage is ReplanStage.PENDING:
+        over["source_pr_url"] = ""
+    eng, _ = _seeded_engine(tmp_state_dir, gh, stage, **over)
+    gh.prs[REPLACEMENT_PR].linked_issue_numbers = [3]
+    if stage is ReplanStage.SUPERSEDED:
+        _closed_by_controller(gh)
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert f"replan issue {ISSUE3} is not the run's current issue {ISSUE}" in (
+        eng.state.block_reason
+    )
+    assert gh.closed_prs == [] and gh.reopened_prs == [] and eng.provider.calls == []
+    assert eng.state.current_pr_url == PR and eng.state.current_issue_url == ISSUE
+    assert eng.state.superseded_prs == [] and eng.state.escalation_count == 0
+    assert _txn(eng).stage is ReplanStage.REJECTED
+    assert load_state(eng.paths.state_file).replan_transaction["issue_url"] == ISSUE3
+
+
+def test_r6f1_the_run_binding_binds_the_issue_by_identity_at_every_stage():
+    from autoforge.replan_txn import verify_run_binding
+    from tests.conftest import ISSUE3
+
+    for stage in ReplanStage:
+        if stage is ReplanStage.REJECTED:
+            continue
+        over = {"source_pr_url": ""} if stage is ReplanStage.PENDING else {}
+        txn = _seed_txn(stage, **over)
+        assert verify_run_binding(txn, "owner/repo", PR, ISSUE) == "", stage
+        # GitHub owner and repository names are case-insensitive.
+        assert (
+            verify_run_binding(txn, "owner/repo", PR, "https://github.com/Owner/REPO/issues/2")
+            == ""
+        ), stage
+        assert f"replan issue {ISSUE3} is not the run's current issue" in verify_run_binding(
+            _seed_txn(stage, issue_url=ISSUE3, **over), "owner/repo", PR, ISSUE
+        ), stage
+        assert f"replan issue {ISSUE} is not the run's current issue {ISSUE3}" in (
+            verify_run_binding(txn, "owner/repo", PR, ISSUE3)
+        ), stage
+        assert "is not in other/repo" in verify_run_binding(txn, "other/repo", PR, ISSUE), stage
+        assert "does not record the issue whose review decided it" in verify_run_binding(
+            _seed_txn(stage, issue_url="", **over), "owner/repo", PR, ISSUE
+        ), stage
+        assert "replan issue URL is unusable" in verify_run_binding(
+            _seed_txn(stage, issue_url=PR, **over), "owner/repo", PR, ISSUE
+        ), stage
+        assert "current issue URL is unusable" in verify_run_binding(txn, "owner/repo", PR, ""), (
+            stage
+        )
+        assert "current issue URL is unusable" in verify_run_binding(txn, "owner/repo", PR, PR), (
+            stage
+        )
+    # An issue of another repository is refused even when the run's own
+    # issue URL carries the same number.
+    foreign = "https://github.com/other/repo/issues/2"
+    assert f"replan issue {foreign} is not in owner/repo" in verify_run_binding(
+        _seed_txn(ReplanStage.VERIFIED, issue_url=foreign), "owner/repo", PR, ISSUE
+    )
+
+
+def test_r6f1_the_target_verifier_refuses_an_issue_of_another_repository():
+    """Linkage is a number within one repository; the same rule at the point of use."""
+    from autoforge.github import PRInfo
+    from autoforge.replan_txn import verify_target_pr
+
+    txn = _seed_txn(ReplanStage.VERIFIED, issue_url="https://github.com/other/repo/issues/2")
+    pr = PRInfo(
+        url=REPLACEMENT_PR,
+        number=43,
+        title="PR",
+        state="OPEN",
+        head_sha=SHA_B,
+        base_ref="main",
+        head_ref=REPLACEMENT_BRANCH,
+        repository="owner/repo",
+        linked_issue_numbers=[2],
+    )
+    drift = verify_target_pr(pr, txn, "owner/repo", require_checkpoint_head=True)
+    assert "replan issue https://github.com/other/repo/issues/2 is not in owner/repo" in drift
+    txn.issue_url = "https://github.com/Owner/REPO/issues/2"
+    assert verify_target_pr(pr, txn, "owner/repo", require_checkpoint_head=True) == ""
+
+
+def test_r6f1_review_records_the_issue_with_the_decision_and_prepare_keeps_it(tmp_state_dir):
+    """The issue is recorded at PENDING and never re-derived from
+    `current_issue_url` by the prepare step; a case-variant of the run's
+    issue is the same issue throughout."""
+    from autoforge.validation import parse_issue_url
+
+    gh = FakeGitHub()
+    eng = _park_at_hard_threshold(tmp_state_dir, gh, _replan_agent(gh))
+    eng.state.current_issue_url = "https://github.com/Owner/REPO/issues/2"
+    assert eng.step().next_phase == "REPLAN_REEXECUTE"
+    txn = _txn(eng)
+    assert txn.stage is ReplanStage.PENDING
+    assert parse_issue_url(txn.issue_url).same_target(parse_issue_url(ISSUE))
+    recorded = txn.issue_url
+    saved: list[dict] = []
+    real_save = eng._save_replan_txn
+
+    def capture(journal):
+        real_save(journal)
+        saved.append(dict(eng.state.replan_transaction))
+
+    eng._save_replan_txn = capture  # type: ignore[method-assign]
+    assert eng.step().next_phase == "REVIEW"
+    assert eng.state.current_pr_url == REPLACEMENT_PR
+    assert {d["stage"] for d in saved} >= {"prepared", "verified", "superseded"}
+    assert all(d["issue_url"] == recorded for d in saved)
+
+
+def test_r6f1_a_pending_decision_for_another_issue_never_prepares_the_run_s_issue(
+    tmp_state_dir,
+):
+    """`current_issue_url` is persisted state too: substituted between the
+    review and the prepare step, it must not become the issue the
+    replacement is required to be linked to."""
+    from tests.conftest import ISSUE3
+
+    gh = FakeGitHub()
+    eng = _park_at_hard_threshold(tmp_state_dir, gh, _replan_agent(gh))
+    assert eng.step().next_phase == "REPLAN_REEXECUTE"
+    assert _txn(eng).issue_url == ISSUE
+    eng.state.current_issue_url = ISSUE3
+    eng._save()
+    calls_before = len(eng.provider.calls)
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert f"replan issue {ISSUE} is not the run's current issue {ISSUE3}" in eng.state.block_reason
+    assert len(eng.provider.calls) == calls_before
+    assert gh.closed_prs == [] and gh.prs[PR].state == "OPEN"
+    txn = _txn(eng)
+    assert txn.stage is ReplanStage.REJECTED
+    assert txn.transaction_id == "" and txn.source_pr_url == ""  # nothing was checkpointed
+    eng.state.phase = Phase.REPLAN_REEXECUTE
+    assert eng.step().next_phase == "BLOCKED"
+    assert len(eng.provider.calls) == calls_before and gh.closed_prs == []
+
+
+def test_r6f1_a_pending_decision_naming_no_issue_is_corruption(tmp_state_dir):
+    gh = FakeGitHub()
+    eng = _pending_at_the_source(tmp_state_dir, gh)
+    del eng.state.replan_transaction["issue_url"]
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert "issue_url is required at stage 'pending' but missing" in eng.state.block_reason
+    assert eng.provider.calls == []
+    _assert_source_untouched(eng, gh)
+    assert "issue_url" not in load_state(eng.paths.state_file).replan_transaction
+
+
+def test_r6f1_the_agent_s_issue_claim_is_compared_by_identity(tmp_state_dir):
+    """The claim check accepts a case-variant of the replan issue and refuses
+    another issue, without depending on URL strings."""
+    from tests.conftest import ISSUE3
+
+    gh = FakeGitHub()
+    agent = _replan_agent(gh, payload_over={"issue_url": "https://github.com/Owner/REPO/issues/2"})
+    eng = _park_at_hard_threshold(tmp_state_dir, gh, agent)
+    assert eng.step().next_phase == "REPLAN_REEXECUTE"
+    assert eng.step().next_phase == "REVIEW"
+    assert eng.state.current_pr_url == REPLACEMENT_PR
+
+    gh = FakeGitHub()
+    eng = _park_at_hard_threshold(
+        tmp_state_dir, gh, _replan_agent(gh, payload_over={"issue_url": ISSUE3})
+    )
+    assert eng.step().next_phase == "REPLAN_REEXECUTE"
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert "does not match the replan issue" in eng.state.block_reason
+    assert gh.closed_prs == [] and gh.prs[PR].state == "OPEN"

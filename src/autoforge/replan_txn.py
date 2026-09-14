@@ -416,12 +416,16 @@ _STAGE_ORDER: tuple[ReplanStage, ...] = (
     ReplanStage.SUPERSEDE_INTENT,
 )
 _REQUIRED_AT_STAGE: dict[ReplanStage, tuple[str, ...]] = {
-    # REVIEW records the PR it decided on and both halves of the revision it
-    # reviewed there; a branch-less decision could only be compared vacuously
-    # (#35 R3-F2), and a PR-less one would let the prepare step take its
-    # source from whatever the run happens to hold (#35 R4-F1). The policy
-    # metadata is recorded with the decision and always names its trigger.
+    # REVIEW records the issue whose lifecycle it was reviewing, the PR it
+    # decided on and both halves of the revision it reviewed there; a
+    # branch-less decision could only be compared vacuously (#35 R3-F2), a
+    # PR-less one would let the prepare step take its source from whatever
+    # the run happens to hold (#35 R4-F1), and an issue-less one would let it
+    # take the issue the replacement must be linked to from whatever the run
+    # happens to hold (#35 R6-F1). The policy metadata is recorded with the
+    # decision and always names its trigger.
     ReplanStage.PENDING: (
+        "issue_url",
         "decision_pr_url",
         "decision_head_sha",
         "decision_branch",
@@ -429,7 +433,6 @@ _REQUIRED_AT_STAGE: dict[ReplanStage, tuple[str, ...]] = {
     ),
     ReplanStage.PREPARED: (
         "transaction_id",
-        "issue_url",
         "source_pr_url",
         "source_branch",
         "source_head_sha",
@@ -516,8 +519,6 @@ class ReplanTransaction:
     transaction_id: str = ""
     stage: ReplanStage = ReplanStage.PENDING
 
-    issue_url: str = ""
-
     # -- decision point: the review state that routed to this replan -------
     # Recorded by REVIEW when the transaction is created, before the
     # controller looks at GitHub again. The source may only be superseded at
@@ -526,7 +527,13 @@ class ReplanTransaction:
     # because the prepare step otherwise has only ``state.current_pr_url`` to
     # take its source from, and two open PRs can share a HEAD and a branch
     # (one branch, two bases); a decision that binds the revision but not the
-    # PR could be checkpointed onto the wrong one.
+    # PR could be checkpointed onto the wrong one. The issue is recorded here
+    # for the same reason: it is the lifecycle the source belongs to and the
+    # one the replacement must be linked to, and the prepare step would
+    # otherwise take it from ``state.current_issue_url``. It is never
+    # re-derived later; :func:`verify_run_binding` binds it to the run's
+    # active issue at every stage instead.
+    issue_url: str = ""
     decision_pr_url: str = ""
     decision_head_sha: str = ""
     decision_branch: str = ""
@@ -733,8 +740,11 @@ def _source_branch_drift(pr: PRInfo, txn: ReplanTransaction, when: str = "") -> 
     return ""
 
 
-def verify_run_binding(txn: ReplanTransaction, repository: str, current_pr_url: str) -> str:
-    """Every PR the journal names as the source must be the PR this run holds.
+def verify_run_binding(
+    txn: ReplanTransaction, repository: str, current_pr_url: str, current_issue_url: str
+) -> str:
+    """Every PR the journal names as the source must be the PR this run holds,
+    and the issue it names must be the issue this run is working on.
 
     Every other source verifier compares GitHub against the journal, so a
     journal whose ``source_pr_url`` was substituted for the well-formed URL of
@@ -758,6 +768,20 @@ def verify_run_binding(txn: ReplanTransaction, repository: str, current_pr_url: 
     step would checkpoint -- and later close -- a PR no review decided on
     (#35 R4-F1). From ``PREPARED`` on both are required and both must bind,
     which also pins the checkpoint to the decision.
+
+    The issue is bound the same way, because the PR binding alone proves only
+    *which PR* may be closed, not *for which lifecycle*. The replacement is
+    accepted on the strength of being linked to ``txn.issue_url``
+    (:func:`verify_target_pr`), so a well-formed journal whose ``issue_url``
+    was substituted for another issue of the same repository would let a
+    marker-bearing PR linked only to that other issue be adopted, the source
+    of *this* issue be closed for it, and the run carry on with
+    ``current_issue_url`` pointing at an issue the active PR no longer
+    implements (#35 R6-F1). So ``REVIEW`` records the issue it was reviewing
+    for together with the decision, the prepare step never re-derives it, and
+    here it is compared by identity against the run's ``current_issue_url``
+    at every stage -- which also pins the linkage requirement to the issue
+    whose source is being superseded.
     """
     try:
         held = parse_pr_url(current_pr_url)
@@ -777,7 +801,41 @@ def verify_run_binding(txn: ReplanTransaction, repository: str, current_pr_url: 
             "the replan transaction does not record the PR whose review decided it, so the "
             "source cannot be bound to that decision"
         )
-    return _bind_to_run("decision PR", txn.decision_pr_url, repository, held)
+    drift = _bind_to_run("decision PR", txn.decision_pr_url, repository, held)
+    if drift:
+        return drift
+    return _bind_issue_to_run(txn, repository, current_issue_url)
+
+
+def _bind_issue_to_run(txn: ReplanTransaction, repository: str, current_issue_url: str) -> str:
+    """The issue the journal names must be the issue the run is working on."""
+    try:
+        held = parse_issue_url(current_issue_url)
+    except ConfigurationError as exc:
+        return (
+            f"the run's current issue URL is unusable ({exc}), so the replan transaction "
+            "cannot be bound to it"
+        )
+    if not txn.issue_url:
+        return (
+            "the replan transaction does not record the issue whose review decided it, so "
+            "the replacement cannot be required to belong to the same lifecycle as the source"
+        )
+    try:
+        ref = parse_issue_url(txn.issue_url)
+    except ConfigurationError as exc:
+        return f"the replan issue URL is unusable: {exc}"
+    if not ref.same_repository(repository):
+        return (
+            f"replan issue {ref.canonical} is not in {repository}; the transaction does not "
+            "belong to this run"
+        )
+    if not ref.same_target(held):
+        return (
+            f"replan issue {ref.canonical} is not the run's current issue {held.canonical}; "
+            "the transaction does not belong to this run"
+        )
+    return ""
 
 
 def _bind_to_run(what: str, url: str, repository: str, held: GitHubPullRequestRef) -> str:
@@ -945,11 +1003,17 @@ def verify_target_pr(
     if pr.base_ref != txn.base_branch:
         return f"replacement PR base {pr.base_ref!r} != verified default branch {txn.base_branch!r}"
     try:
-        issue_number = parse_issue_url(txn.issue_url).number
+        issue = parse_issue_url(txn.issue_url)
     except ConfigurationError as exc:
         return f"replan transaction records no usable issue URL ({exc})"
-    if issue_number not in pr.linked_issue_numbers:
-        return f"replacement PR {ref_canonical} is not linked to issue #{issue_number}"
+    if not issue.same_repository(repository):
+        # Linkage is a number within one repository, so an issue of another
+        # repository can never be what a PR here is linked to.
+        # ``verify_run_binding`` refuses such a journal before this is
+        # reached; this is the same rule at the point of use.
+        return f"replan issue {issue.canonical} is not in {repository}"
+    if issue.number not in pr.linked_issue_numbers:
+        return f"replacement PR {ref_canonical} is not linked to issue #{issue.number}"
     if require_checkpoint_head and not _same_sha(pr.head_sha, txn.replacement_head_sha):
         return (
             f"replacement PR {ref_canonical} advanced from the verified HEAD "

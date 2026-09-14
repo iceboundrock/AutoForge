@@ -243,6 +243,14 @@ _REVIEW_MARKER_RE = re.compile(r"<!--\s*ai-review-result:\s*(\{.*?\})\s*-->", re
 _REVIEW_HEADING_RE = re.compile(r"^#\s*AI Code Review\s*[—–-]+\s*Round\s+(\d+)\s*$", re.MULTILINE)
 
 
+def _same_issue(observed: str, expected: str) -> bool:
+    """Issue identity as GitHub sees it, never vacuous: an unusable URL matches nothing."""
+    try:
+        return parse_issue_url(observed).same_target(parse_issue_url(expected))
+    except ConfigurationError:
+        return False
+
+
 def generate_run_id() -> str:
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     return f"af-{stamp}-{secrets.token_hex(3)}"
@@ -3145,7 +3153,7 @@ class ControllerEngine:
         return self._supersede_source(txn)
 
     def _replan_unbound(self, txn: ReplanTransaction) -> StepOutcome | None:
-        """Refuse a transaction whose source is not this run's current PR.
+        """Refuse a transaction whose source or issue is not this run's.
 
         :func:`verify_run_binding` is the rule; this persists its refusal so
         ``resume`` replays it. Called at the entry of :meth:`_drive_replan`,
@@ -3154,7 +3162,9 @@ class ControllerEngine:
         which the post-agent path reaches without re-entering the reducer.
         """
         state = self._require_state()
-        reason = verify_run_binding(txn, state.repository, state.current_pr_url)
+        reason = verify_run_binding(
+            txn, state.repository, state.current_pr_url, state.current_issue_url
+        )
         if reason:
             return self._reject_replan(txn, reason)
         return None
@@ -3183,10 +3193,10 @@ class ControllerEngine:
             )
         if not state.current_pr_url:
             raise StateError("REPLAN_REEXECUTE requires current_pr_url in state")
-        try:
-            issue = parse_issue_url(state.current_issue_url)
-        except ConfigurationError as exc:
-            return self._reject_replan(txn, f"cannot checkpoint the replan source: {exc}")
+        # ``txn.issue_url`` is not taken from ``state.current_issue_url`` here:
+        # REVIEW recorded it with the decision and ``_replan_unbound`` has
+        # already bound it to the run, so the prepare step re-derives nothing
+        # a substituted state could redirect.
         try:
             source = self.github.get_pr(state.current_pr_url)
             repo = self.github.get_repo(state.repository)
@@ -3275,7 +3285,6 @@ class ControllerEngine:
             )
         txn.transaction_id = new_transaction_id()
         txn.stage = ReplanStage.PREPARED
-        txn.issue_url = issue.canonical
         txn.source_pr_url = source_ref.canonical
         txn.source_branch = state.current_branch or source.head_ref
         txn.source_head_sha = source.head_sha
@@ -4088,6 +4097,10 @@ class ControllerEngine:
                     decision_pr = parse_pr_url(state.current_pr_url).canonical
                 except ConfigurationError as exc:
                     unbound = f"the reviewed PR URL is unusable ({exc})"
+                try:
+                    decision_issue = parse_issue_url(state.current_issue_url).canonical
+                except ConfigurationError as exc:  # pragma: no cover - parsed by the prompt
+                    unbound = f"the reviewed issue URL is unusable ({exc})"
                 if unbound:
                     return Phase.BLOCKED, self._loop_block_reason(
                         f"review round {res.round}: {len(findings)} finding(s); controller "
@@ -4095,12 +4108,13 @@ class ControllerEngine:
                         "so the replan decision cannot bind the revision it was made on. Human "
                         "intervention is required"
                     )
-                # Only the decision is recorded here, together with the PR and
-                # the revision it was made on. The checkpoint and the
-                # transaction id are created by `_prepare_replan`, inside the
-                # REPLAN_REEXECUTE step that owns them.
+                # Only the decision is recorded here, together with the issue,
+                # the PR and the revision it was made on. The checkpoint and
+                # the transaction id are created by `_prepare_replan`, inside
+                # the REPLAN_REEXECUTE step that owns them.
                 state.replan_transaction = ReplanTransaction(
                     stage=ReplanStage.PENDING,
+                    issue_url=decision_issue,
                     decision_pr_url=decision_pr,
                     decision_head_sha=expected_head,
                     decision_branch=state.current_branch,
@@ -4261,7 +4275,7 @@ class ControllerEngine:
             )
         claimed_url = parse_pr_url(res.replacement_pr_url).canonical
         mismatch = ""
-        if parse_issue_url(res.issue_url).canonical != txn.issue_url:
+        if not _same_issue(res.issue_url, txn.issue_url):
             mismatch = f"issue_url {res.issue_url!r} does not match the replan issue"
         elif parse_pr_url(res.previous_pr_url).canonical != txn.source_pr_url:
             mismatch = f"previous_pr_url {res.previous_pr_url!r} does not match the checkpoint"
