@@ -3056,7 +3056,8 @@ class ControllerEngine:
             # their defaults.
             tail = (
                 "The persisted transaction is unreadable, so whether the source PR "
-                f"{txn.source_pr_url or '(unknown)'} was already closed by it cannot be "
+                f"{txn.source_pr_url or txn.decision_pr_url or '(unknown)'} was already closed "
+                "by it cannot be "
                 "determined from local state; check GitHub before repairing the journal"
             )
         elif txn.stage in began_closing or txn.superseded_at:
@@ -3066,7 +3067,8 @@ class ControllerEngine:
             )
         else:
             tail = (
-                f"PR {txn.source_pr_url or '(none)'} stays open with its findings; "
+                f"PR {txn.source_pr_url or txn.decision_pr_url or '(none)'} stays open with its "
+                "findings; "
                 "nothing was closed or merged"
             )
         return f"cannot safely REPLAN_REEXECUTE: {reason}. {tail}. A human must decide next."
@@ -4050,24 +4052,31 @@ class ControllerEngine:
                     self._replan_refusal(decision) + ". Human intervention is required"
                 )
             if decision.action == "replan":
+                # The decision binds the PR and the branch as well as the HEAD,
+                # and a journal missing any of them is refused on load; refuse
+                # here, where nothing has been recorded yet, rather than
+                # persist a decision that can only be replayed as corruption.
+                unbound = ""
                 if not state.current_branch:
-                    # The decision binds the branch as well as the HEAD, and a
-                    # journal without one is refused on load; refuse here, where
-                    # nothing has been recorded yet, rather than persist a
-                    # decision that can only be replayed as corruption.
+                    unbound = "the reviewed branch is not recorded in controller state"
+                try:
+                    decision_pr = parse_pr_url(state.current_pr_url).canonical
+                except ConfigurationError as exc:
+                    unbound = f"the reviewed PR URL is unusable ({exc})"
+                if unbound:
                     return Phase.BLOCKED, self._loop_block_reason(
                         f"review round {res.round}: {len(findings)} finding(s); controller "
-                        f"policy triggered REPLAN_REEXECUTE ({decision.reason}), but the "
-                        "reviewed branch is not recorded in controller state, so the replan "
-                        "decision cannot bind the revision it was made on. Human intervention "
-                        "is required"
+                        f"policy triggered REPLAN_REEXECUTE ({decision.reason}), but {unbound}, "
+                        "so the replan decision cannot bind the revision it was made on. Human "
+                        "intervention is required"
                     )
-                # Only the decision is recorded here, together with the
-                # revision it was made on. The checkpoint and the transaction
-                # id are created by `_prepare_replan`, inside the
+                # Only the decision is recorded here, together with the PR and
+                # the revision it was made on. The checkpoint and the
+                # transaction id are created by `_prepare_replan`, inside the
                 # REPLAN_REEXECUTE step that owns them.
                 state.replan_transaction = ReplanTransaction(
                     stage=ReplanStage.PENDING,
+                    decision_pr_url=decision_pr,
                     decision_head_sha=expected_head,
                     decision_branch=state.current_branch,
                     escalation=decision.metadata or {"trigger": decision.reason},

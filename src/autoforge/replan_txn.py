@@ -66,7 +66,7 @@ from enum import StrEnum
 
 from .errors import ConfigurationError
 from .github import PRInfo
-from .validation import parse_issue_url, parse_pr_url
+from .validation import GitHubPullRequestRef, parse_issue_url, parse_pr_url
 
 MARKER_NAME = "autoforge-replan-transaction"
 # Matches *every* complete comment bearing this name, whatever the payload
@@ -330,7 +330,9 @@ def source_marker_defect(
 # silently overwritten (at PENDING) or could bind nothing (later) without the
 # journal ever being called what it is: corrupt.
 _ISSUE_URL_FIELDS = frozenset({"issue_url"})
-_PR_URL_FIELDS = frozenset({"source_pr_url", "replacement_pr_url", "rejected_pr_url"})
+_PR_URL_FIELDS = frozenset(
+    {"decision_pr_url", "source_pr_url", "replacement_pr_url", "rejected_pr_url"}
+)
 _PR_URL_LIST_FIELDS = frozenset({"preexisting_pr_urls"})
 
 
@@ -396,9 +398,11 @@ _STAGE_ORDER: tuple[ReplanStage, ...] = (
     ReplanStage.SUPERSEDE_INTENT,
 )
 _REQUIRED_AT_STAGE: dict[ReplanStage, tuple[str, ...]] = {
-    # REVIEW records both halves of the revision it decided on; a branch-less
-    # decision could only be compared vacuously (#35 R3-F2).
-    ReplanStage.PENDING: ("decision_head_sha", "decision_branch"),
+    # REVIEW records the PR it decided on and both halves of the revision it
+    # reviewed there; a branch-less decision could only be compared vacuously
+    # (#35 R3-F2), and a PR-less one would let the prepare step take its
+    # source from whatever the run happens to hold (#35 R4-F1).
+    ReplanStage.PENDING: ("decision_pr_url", "decision_head_sha", "decision_branch"),
     ReplanStage.PREPARED: (
         "transaction_id",
         "issue_url",
@@ -463,7 +467,13 @@ class ReplanTransaction:
     # -- decision point: the review state that routed to this replan -------
     # Recorded by REVIEW when the transaction is created, before the
     # controller looks at GitHub again. The source may only be superseded at
-    # exactly this revision: it is the one whose findings justify the replan.
+    # exactly this revision of exactly this PR: it is the one whose findings
+    # justify the replan. The PR identity is recorded alongside the revision
+    # because the prepare step otherwise has only ``state.current_pr_url`` to
+    # take its source from, and two open PRs can share a HEAD and a branch
+    # (one branch, two bases); a decision that binds the revision but not the
+    # PR could be checkpointed onto the wrong one.
+    decision_pr_url: str = ""
     decision_head_sha: str = ""
     decision_branch: str = ""
 
@@ -624,6 +634,14 @@ def _canonical(url: str) -> str:
         return ""
 
 
+def _same_pr(observed: str, expected: str) -> bool:
+    """PR identity as GitHub sees it, never vacuous: an unusable URL matches nothing."""
+    try:
+        return parse_pr_url(observed).same_target(parse_pr_url(expected))
+    except ConfigurationError:
+        return False
+
+
 def _same_sha(observed: str, expected: str) -> bool:
     """One rule for every SHA comparison: case-insensitive, and never vacuous.
 
@@ -660,7 +678,7 @@ def _source_branch_drift(pr: PRInfo, txn: ReplanTransaction, when: str = "") -> 
 
 
 def verify_run_binding(txn: ReplanTransaction, repository: str, current_pr_url: str) -> str:
-    """The checkpointed source must be the PR this run holds, in this repository.
+    """Every PR the journal names as the source must be the PR this run holds.
 
     Every other source verifier compares GitHub against the journal, so a
     journal whose ``source_pr_url`` was substituted for the well-formed URL of
@@ -675,33 +693,52 @@ def verify_run_binding(txn: ReplanTransaction, repository: str, current_pr_url: 
     as GitHub does (repository case-insensitively, then the number), never as
     URL strings.
 
-    A ``PENDING`` journal names no source yet: the checkpoint is created from
-    ``current_pr_url`` by the prepare step itself.
+    The binding is two-sided. ``current_pr_url`` is itself persisted state,
+    and a ``PENDING`` journal names no checkpointed source yet: the prepare
+    step creates one from ``current_pr_url``. So the decision ``REVIEW``
+    recorded must name the PR it reviewed, and that ``decision_pr_url`` is
+    bound to the run exactly like the checkpoint is; otherwise a run whose
+    ``current_pr_url`` was substituted between the review and the prepare
+    step would checkpoint -- and later close -- a PR no review decided on
+    (#35 R4-F1). From ``PREPARED`` on both are required and both must bind,
+    which also pins the checkpoint to the decision.
     """
-    if not txn.source_pr_url:
-        if txn.stage is ReplanStage.PENDING:
-            return ""
-        return "the replan transaction names no source PR, so there is nothing it may act on"
-    try:
-        source = parse_pr_url(txn.source_pr_url)
-    except ConfigurationError as exc:
-        return f"the checkpointed source PR URL is unusable: {exc}"
-    if not source.same_repository(repository):
-        return (
-            f"checkpointed source PR {source.canonical} is not in {repository}; the transaction "
-            "does not belong to this run"
-        )
     try:
         held = parse_pr_url(current_pr_url)
     except ConfigurationError as exc:
         return (
-            f"the run's current PR URL is unusable ({exc}), so the checkpointed source "
-            f"{source.canonical} cannot be bound to it"
+            f"the run's current PR URL is unusable ({exc}), so the replan transaction "
+            "cannot be bound to it"
         )
-    if not source.same_target(held):
+    if txn.source_pr_url:
+        drift = _bind_to_run("checkpointed source PR", txn.source_pr_url, repository, held)
+        if drift:
+            return drift
+    elif txn.stage is not ReplanStage.PENDING:
+        return "the replan transaction names no source PR, so there is nothing it may act on"
+    if not txn.decision_pr_url:
         return (
-            f"checkpointed source PR {source.canonical} is not the run's current PR "
-            f"{held.canonical}; the transaction does not belong to this run"
+            "the replan transaction does not record the PR whose review decided it, so the "
+            "source cannot be bound to that decision"
+        )
+    return _bind_to_run("decision PR", txn.decision_pr_url, repository, held)
+
+
+def _bind_to_run(what: str, url: str, repository: str, held: GitHubPullRequestRef) -> str:
+    """One identity rule for every PR the journal names as the source."""
+    try:
+        ref = parse_pr_url(url)
+    except ConfigurationError as exc:
+        return f"the {what} URL is unusable: {exc}"
+    if not ref.same_repository(repository):
+        return (
+            f"{what} {ref.canonical} is not in {repository}; the transaction does not belong "
+            "to this run"
+        )
+    if not ref.same_target(held):
+        return (
+            f"{what} {ref.canonical} is not the run's current PR {held.canonical}; the "
+            "transaction does not belong to this run"
         )
     return ""
 
@@ -716,11 +753,28 @@ def verify_decision_point(pr: PRInfo, txn: ReplanTransaction) -> str:
     never saw -- the accumulated findings belong to the reviewed revision, not
     to whatever is on the branch now.
 
-    An empty ``decision_head_sha`` or ``decision_branch`` is itself a refusal:
-    without both there is no proof the checkpoint is the decision point.
-    :meth:`ReplanTransaction.from_dict` refuses such a journal at every stage;
-    this is the same rule at the point of use, never vacuous.
+    The PR read must also *be* the PR the decision names: the prepare step
+    reads it from ``state.current_pr_url``, and :func:`verify_run_binding`
+    has bound that to the decision, but the identity GitHub reports is the
+    fact, so it is compared here rather than assumed.
+
+    An empty ``decision_pr_url``, ``decision_head_sha`` or ``decision_branch``
+    is itself a refusal: without all three there is no proof the checkpoint
+    is the decision point. :meth:`ReplanTransaction.from_dict` refuses such a
+    journal at every stage; this is the same rule at the point of use, never
+    vacuous.
     """
+    if not txn.decision_pr_url:
+        return (
+            "the replan transaction does not record the PR whose review decided it, so the "
+            "source cannot be proven to be the PR the findings belong to"
+        )
+    if not _same_pr(pr.url, txn.decision_pr_url):
+        return (
+            f"source PR read back as {pr.url or '(none)'}, but the review that decided this "
+            f"replan ran on {txn.decision_pr_url}; the current work was never reviewed "
+            "against this decision"
+        )
     if not txn.decision_head_sha:
         return (
             "the replan transaction does not record the reviewed HEAD that decided it, so the "

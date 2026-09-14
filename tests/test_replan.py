@@ -338,6 +338,7 @@ def _seed_txn(stage: ReplanStage, **over) -> ReplanTransaction:
         transaction_id="" if stage is ReplanStage.PENDING else TXN_ID,
         stage=stage,
         issue_url=ISSUE,
+        decision_pr_url=PR,
         decision_head_sha=SHA_A,
         decision_branch=BRANCH,
         source_pr_url=PR,
@@ -622,6 +623,7 @@ def test_review_beyond_the_persisted_finding_bound_blocks_instead_of_replanning(
     eng.state.phase = Phase.REPLAN_REEXECUTE
     eng.state.replan_transaction = ReplanTransaction(
         stage=ReplanStage.PENDING,
+        decision_pr_url=PR,
         decision_head_sha=SHA_A,
         decision_branch=BRANCH,
         escalation={"trigger": "hard_review_round_threshold"},
@@ -1978,6 +1980,7 @@ def test_conclusive_failure_reading_the_source_at_prepare_blocks(tmp_state_dir):
     eng.state.current_branch = BRANCH
     eng.state.replan_transaction = ReplanTransaction(
         stage=ReplanStage.PENDING,
+        decision_pr_url=PR,
         decision_head_sha=SHA_A,
         decision_branch=BRANCH,
         escalation={"trigger": "hard_review_round_threshold"},
@@ -1998,6 +2001,7 @@ def _pending_at_the_source(tmp_state_dir, gh):
     eng.state.current_head_sha = SHA_A
     eng.state.replan_transaction = ReplanTransaction(
         stage=ReplanStage.PENDING,
+        decision_pr_url=PR,
         decision_head_sha=SHA_A,
         decision_branch=BRANCH,
         escalation={"trigger": "hard_review_round_threshold"},
@@ -2040,6 +2044,7 @@ def test_a_source_pr_that_moved_before_prepare_is_refused(tmp_state_dir):
     eng.state.current_branch = BRANCH
     eng.state.replan_transaction = ReplanTransaction(
         stage=ReplanStage.PENDING,
+        decision_pr_url=PR,
         decision_head_sha=SHA_A,
         decision_branch=BRANCH,
         escalation={"trigger": "hard_review_round_threshold"},
@@ -2071,6 +2076,7 @@ def test_source_moving_between_the_review_and_the_prepare_is_refused(tmp_state_d
     assert eng.step().next_phase == "REPLAN_REEXECUTE"
     txn = _txn(eng)
     assert txn.stage is ReplanStage.PENDING
+    assert txn.decision_pr_url == PR
     assert txn.decision_head_sha == SHA_A and txn.decision_branch == BRANCH
 
     drift(gh.prs[PR])
@@ -2110,6 +2116,8 @@ def test_a_transaction_that_never_recorded_its_decision_point_is_refused(tmp_sta
     assert eng.provider.calls == []
     _assert_source_untouched(eng, gh)
     source = PRInfo(url=PR, number=42, title="PR", state="OPEN", head_sha=SHA_A, head_ref=BRANCH)
+    assert "does not record the PR whose review decided it" in verify_decision_point(source, txn)
+    txn.decision_pr_url = PR
     assert "does not record the reviewed HEAD" in verify_decision_point(source, txn)
 
 
@@ -2749,6 +2757,7 @@ def test_f1_a_source_without_a_readable_branch_is_refused_at_prepare(tmp_state_d
     eng.state.current_head_sha = SHA_A
     eng.state.replan_transaction = ReplanTransaction(
         stage=ReplanStage.PENDING,
+        decision_pr_url=PR,
         decision_head_sha=SHA_A,
         decision_branch=BRANCH,
         escalation={"trigger": "hard_review_round_threshold"},
@@ -2803,6 +2812,7 @@ def test_n3_a_malformed_pr_url_from_the_listing_is_a_refusal_not_a_crash(tmp_sta
     eng.state.current_head_sha = SHA_A
     eng.state.replan_transaction = ReplanTransaction(
         stage=ReplanStage.PENDING,
+        decision_pr_url=PR,
         decision_head_sha=SHA_A,
         decision_branch=BRANCH,
         escalation={"trigger": "hard_review_round_threshold"},
@@ -2870,6 +2880,7 @@ def test_r2f1_required_fields_accumulate_along_the_lifecycle():
 @pytest.mark.parametrize(
     "stage,name",
     [
+        (ReplanStage.PENDING, "decision_pr_url"),
         (ReplanStage.PENDING, "decision_head_sha"),
         (ReplanStage.PENDING, "decision_branch"),
         (ReplanStage.PREPARED, "transaction_id"),
@@ -3018,6 +3029,7 @@ def test_r2f2_a_pending_journal_may_not_carry_a_transaction_id():
     """The id is created with PREPARED; one at PENDING was written by somebody else."""
     data = ReplanTransaction(
         stage=ReplanStage.PENDING,
+        decision_pr_url=PR,
         decision_head_sha=SHA_A,
         decision_branch=BRANCH,
         transaction_id=TXN_ID,
@@ -3162,7 +3174,7 @@ def test_r3f1_the_run_binding_compares_identity_not_url_strings():
     assert "is not the run's current PR" in verify_run_binding(txn, "owner/repo", EARLIER_PR)
     assert "current PR URL is unusable" in verify_run_binding(txn, "owner/repo", "")
     assert "current PR URL is unusable" in verify_run_binding(txn, "owner/repo", ISSUE)
-    # PENDING names no source yet; every later stage must.
+    # PENDING names no checkpointed source yet; every later stage must.
     pending = _seed_txn(ReplanStage.PENDING, source_pr_url="")
     assert verify_run_binding(pending, "owner/repo", PR) == ""
     prepared = _seed_txn(ReplanStage.PREPARED, source_pr_url="")
@@ -3170,6 +3182,130 @@ def test_r3f1_the_run_binding_compares_identity_not_url_strings():
     assert "is unusable" in verify_run_binding(
         _seed_txn(ReplanStage.PREPARED, source_pr_url=ISSUE), "owner/repo", PR
     )
+
+
+def test_r4f1_the_run_binding_is_two_sided_and_binds_the_decision_pr_at_every_stage():
+    """`current_pr_url` is persisted state too, so the decision REVIEW recorded
+    must name its PR and that PR must be the one the run holds -- at PENDING,
+    where it is the only source identity there is, and afterwards, where it
+    pins the checkpoint to the decision."""
+    from autoforge.replan_txn import verify_run_binding
+
+    pending = _seed_txn(ReplanStage.PENDING, source_pr_url="")
+    assert verify_run_binding(pending, "owner/repo", PR) == ""
+    assert verify_run_binding(pending, "Owner/Repo", "https://github.com/Owner/REPO/pull/42") == ""
+    # The run now holds another PR: the decision was not made on it.
+    assert f"decision PR {PR} is not the run's current PR {EARLIER_PR}" in verify_run_binding(
+        pending, "owner/repo", EARLIER_PR
+    )
+    assert "is not in other/repo" in verify_run_binding(pending, "other/repo", PR)
+    for stage in ReplanStage:
+        if stage is ReplanStage.REJECTED:
+            continue
+        # A decision recorded for another PR is refused whatever the checkpoint says.
+        assert "is not the run's current PR" in verify_run_binding(
+            _seed_txn(stage, decision_pr_url=EARLIER_PR), "owner/repo", PR
+        ), stage
+        assert "does not record the PR whose review decided it" in verify_run_binding(
+            _seed_txn(stage, decision_pr_url=""), "owner/repo", PR
+        ), stage
+        assert "decision PR URL is unusable" in verify_run_binding(
+            _seed_txn(stage, decision_pr_url=ISSUE), "owner/repo", PR
+        ), stage
+    # A checkpoint that does not bind is reported before the decision is looked at.
+    assert "checkpointed source PR" in verify_run_binding(
+        _seed_txn(ReplanStage.PREPARED, source_pr_url=EARLIER_PR, decision_pr_url=EARLIER_PR),
+        "owner/repo",
+        PR,
+    )
+
+
+def test_r4f1_the_decision_point_verifier_binds_the_pr_it_reads():
+    from autoforge.replan_txn import verify_decision_point
+
+    txn = _seed_txn(ReplanStage.PENDING, source_pr_url="")
+    assert verify_decision_point(_pr(), txn) == ""
+    assert verify_decision_point(_pr(url="https://github.com/Owner/REPO/pull/42"), txn) == ""
+    assert "never reviewed against this decision" in verify_decision_point(_pr(url=EARLIER_PR), txn)
+    assert "read back as (none)" in verify_decision_point(_pr(url=""), txn)
+    txn.decision_pr_url = ""
+    assert "does not record the PR whose review decided it" in verify_decision_point(_pr(), txn)
+
+
+def test_r4f1_a_pending_decision_for_another_pr_never_prepares_the_run_s_current_pr(
+    tmp_state_dir,
+):
+    """The reviewer's reproduction: REVIEW decides a replan for PR A, then the
+    run's `current_pr_url` is substituted with same-repository PR B at the
+    same HEAD on the same branch (one branch, two bases). PR B satisfies the
+    revision half of the decision, so before the PR half was recorded the
+    prepare step would checkpoint B as the source and the close would go to
+    a PR no review decided on."""
+    gh = FakeGitHub()
+    eng = _park_at_hard_threshold(tmp_state_dir, gh, _replan_agent(gh))
+    assert eng.step().next_phase == "REPLAN_REEXECUTE"
+    txn = _txn(eng)
+    assert txn.stage is ReplanStage.PENDING and txn.decision_pr_url == PR
+    gh.add_pr(url=EARLIER_PR, head_sha=SHA_A, branch=BRANCH, linked=[2], base_ref="develop")
+    eng.state.current_pr_url = EARLIER_PR
+    eng._save()
+    calls_before = len(eng.provider.calls)
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert f"decision PR {PR} is not the run's current PR {EARLIER_PR}" in eng.state.block_reason
+    assert len(eng.provider.calls) == calls_before
+    assert gh.closed_prs == [] and gh.reopened_prs == []
+    assert gh.prs[PR].state == "OPEN" and gh.prs[EARLIER_PR].state == "OPEN"
+    assert eng.state.superseded_prs == [] and eng.state.escalation_count == 0
+    txn = _txn(eng)
+    assert txn.stage is ReplanStage.REJECTED
+    assert txn.transaction_id == "" and txn.source_pr_url == ""  # nothing was checkpointed
+    # The refusal replays: a resume cannot prepare it either.
+    eng.state.phase = Phase.REPLAN_REEXECUTE
+    assert eng.step().next_phase == "BLOCKED"
+    assert len(eng.provider.calls) == calls_before and gh.closed_prs == []
+
+
+def test_r4f1_a_pending_decision_naming_no_pr_is_corruption_not_a_free_source(tmp_state_dir):
+    """A journal written before the PR half of the decision existed is refused
+    on load like every other incomplete checkpoint, rather than prepared from
+    whatever `current_pr_url` holds."""
+    gh = FakeGitHub()
+    eng = _pending_at_the_source(tmp_state_dir, gh)
+    del eng.state.replan_transaction["decision_pr_url"]
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert "decision_pr_url is required at stage 'pending' but missing" in eng.state.block_reason
+    assert eng.provider.calls == []
+    _assert_source_untouched(eng, gh)
+    assert "decision_pr_url" not in load_state(eng.paths.state_file).replan_transaction
+
+
+def test_r4f1_the_prepared_source_is_read_from_github_and_must_be_the_decision_pr(
+    tmp_state_dir,
+):
+    """`verify_run_binding` binds the URL the run holds; the decision point
+    verifier binds the PR GitHub actually returned for it."""
+    from autoforge.github import PRInfo
+
+    gh = FakeGitHub()
+    eng = _pending_at_the_source(tmp_state_dir, gh)
+    # GitHub answers the run's URL with a different PR.
+    gh.prs[PR] = PRInfo(
+        url=EARLIER_PR,
+        number=41,
+        title="PR",
+        state="OPEN",
+        head_sha=SHA_A,
+        head_ref=BRANCH,
+        repository="owner/repo",
+    )
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert f"source PR read back as {EARLIER_PR}" in eng.state.block_reason
+    assert "never reviewed against this decision" in eng.state.block_reason
+    assert _txn(eng).stage is ReplanStage.REJECTED and _txn(eng).transaction_id == ""
+    assert eng.provider.calls == [] and gh.closed_prs == []
 
 
 def test_r3f2_the_decision_point_verifier_refuses_a_missing_branch():
