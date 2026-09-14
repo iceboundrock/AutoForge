@@ -683,6 +683,98 @@ class ReplanTransaction:
 
 
 # ---------------------------------------------------------------------------
+# State-protocol migration. The journal's schema is part of the state
+# protocol, and the protocol went from 1 to 2 when REVIEW started recording
+# the PR and the issue its replan decision was made on (``decision_pr_url``;
+# ``issue_url`` at PENDING) so that every later stage could be bound to that
+# decision rather than to whatever the run happened to hold. A protocol-1
+# journal was written whole by the controller of its day and is not corrupt;
+# it simply never recorded the decision, and there is nothing to reconstruct
+# it from: "missing field -> fill from the run's current PR and issue" is
+# precisely the rebinding the decision fields exist to forbid (#35 R4-F1,
+# R6-F1), and #66 R7-F1 is where an in-flight protocol-1 journal was found
+# to be refused as *corruption* under a protocol that still called itself 1.
+# ---------------------------------------------------------------------------
+
+LEGACY_JOURNAL_PROTOCOL = "1"
+
+_LEGACY_STAGE_FATES: dict[str, str] = {
+    ReplanStage.PENDING.value: (
+        "the decision to replan was recorded but nothing was checkpointed, no transaction id "
+        "exists and no PR was closed"
+    ),
+    ReplanStage.PREPARED.value: (
+        "a transaction id was created and the replan agent may have been invoked, so a "
+        "replacement PR carrying its marker may exist; no PR was closed by it"
+    ),
+    ReplanStage.VERIFIED.value: (
+        "a replacement PR was verified against the checkpoint; no PR was closed by it"
+    ),
+    ReplanStage.SUPERSEDE_INTENT.value: (
+        "the controller intended to close the source PR and may have done so: a CLOSED source "
+        f"carrying an `<!-- {CLOSE_RECEIPT_NAME}: <transaction id> -->` comment was closed by "
+        "this transaction, and one without it was not; the replacement was not activated"
+    ),
+    ReplanStage.COMPENSATING.value: (
+        "the controller closed the source PR, found a checkpoint had moved, and decided to "
+        "reopen it; the reopen may not have been performed or confirmed, so the source PR may "
+        "still be CLOSED; the replacement was not activated"
+    ),
+    ReplanStage.SUPERSEDED.value: (
+        "the controller closed the source PR and confirmed the close; the replacement was not "
+        "activated in the run's state"
+    ),
+}
+
+
+def legacy_journal_refusal(raw: object, *, written_by: str) -> str:
+    """Why a protocol-1 state cannot be loaded as protocol 2, or ``""`` when it can.
+
+    The only difference between the two protocols is the replan journal, so a
+    protocol-1 state whose journal is empty -- no replan in flight -- or
+    terminal (``REJECTED``, of which both protocols read nothing but the
+    recorded reason) *is* a protocol-2 state and is loaded as one. A journal
+    at any other stage is in flight under a schema that never bound the
+    decision, and it is refused at the state boundary: never migrated, since
+    the binding cannot be reconstructed without re-deciding the replan, and
+    never read as corruption, since it was written whole. The refusal names
+    the stage, the PRs, what that stage implies about the source PR, and the
+    two ways out -- finish or undo the transaction with the controller that
+    wrote it, or resolve it by hand on GitHub and start a new run.
+
+    ``raw`` is read defensively: this runs before any schema check, so a
+    non-object journal is left for the state's own type check, and an
+    unreadable stage or PR is reported as such rather than trusted.
+    """
+    if not isinstance(raw, dict) or not raw:
+        return ""
+    stage = raw.get("stage")
+    if stage == ReplanStage.REJECTED.value:
+        return ""
+
+    def _text(name: str) -> str:
+        value = raw.get(name)
+        return value if isinstance(value, str) and value else "(none)"
+
+    fate = _LEGACY_STAGE_FATES.get(stage) if isinstance(stage, str) else None
+    if fate is None:
+        fate = (
+            f"the journal records an unreadable stage {stage!r}, so what it did to the source "
+            "PR cannot be determined from local state"
+        )
+    return (
+        f"state file was written by controller {written_by or '(unknown)'} under "
+        f"protocol_version {LEGACY_JOURNAL_PROTOCOL!r} with a replan in flight (stage "
+        f"{stage!r}, transaction {_text('transaction_id')}, source PR {_text('source_pr_url')}, "
+        f"replacement PR {_text('replacement_pr_url')}); protocol {LEGACY_JOURNAL_PROTOCOL!r} "
+        "did not record the PR and issue the replan decision was made on, and this controller "
+        "does not reconstruct them from the run's current PR and issue. At that stage "
+        f"{fate}. Finish or undo the replan with the controller that wrote it, then upgrade; "
+        "or resolve it by hand on GitHub and start a new run. The state file was left unchanged"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Verification predicates. Each returns "" when the check passes, or a
 # human-readable reason why the transaction must not proceed. They are the
 # single definition of "acceptable" for the normal path and for `resume`:

@@ -172,6 +172,50 @@ def test_status_describes_a_corrupt_replan_transaction_instead_of_crashing(
     assert printed["replan_transaction"]["pr_number_watermark"] == "12"
 
 
+def test_status_and_resume_refuse_an_in_flight_protocol_1_replan(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """#66 R7-F1: a protocol-1 state with a replan in the close window is a
+    protocol incompatibility reported at the boundary -- not a corrupt journal,
+    not a resumed close -- and `run` will not replace it without --force."""
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    assert (
+        cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"])
+        == 0
+    )
+    capsys.readouterr()
+    state_file = tmp_path / ".autoforge" / "state.json"
+    data = json.loads(state_file.read_text())
+    data["protocol_version"] = "1"
+    data["phase"] = "REPLAN_REEXECUTE"
+    data["current_pr_url"] = PR
+    data["replan_transaction"] = {
+        "transaction_id": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+        "stage": "supersede_intent",
+        "issue_url": ISSUE,
+        "source_pr_url": PR,
+        "replacement_pr_url": "https://github.com/owner/repo/pull/43",
+        "close_intent_at": "2026-01-01T00:00:00+00:00",
+    }
+    raw = json.dumps(data)
+    state_file.write_text(raw)
+    for argv in (["status"], ["resume"]):
+        assert cli.main(["--state-dir", sd, *argv]) == 2
+        err = capsys.readouterr().err
+        assert "protocol_version '1'" in err and "stage 'supersede_intent'" in err
+        assert PR in err and "pull/43" in err
+        assert "may have done so" in err and "autoforge-replan-close" in err
+        assert "controller that wrote it" in err
+        assert "corrupt" not in err.lower()
+        assert state_file.read_text() == raw
+    rc = cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"])
+    err = capsys.readouterr().err
+    assert rc == 2 and "--force" in err and "protocol_version '1'" in err
+    assert state_file.read_text() == raw
+    assert fakes["gh"].closed_prs == [] and fakes["gh"].reopened_prs == []
+
+
 def test_run_refuses_to_overwrite_active_state(tmp_path, capsys, monkeypatch, fakes):
     monkeypatch.chdir(tmp_path)
     sd = str(tmp_path / ".autoforge")

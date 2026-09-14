@@ -518,6 +518,8 @@ atomic replace
 
 A corrupt existing state file must fail loudly. Never silently replace corrupted state with a fresh run.
 
+The `protocol_version` is the state file's schema, the nested replan journal included, and it is what tells an old-controller file from a corrupt one: a field a controller of *this* protocol always writes is corruption when absent, so a schema change that tightens what a stage requires must bump the protocol rather than let the old shape be diagnosed as corruption. Old-controller compatibility is decided at the state boundary by the version label, never by shape, and it is explicit and tested per stage: protocol 1 → 2 added the review decision's PR and issue binding to the replan journal, so a protocol-1 file with no replan in flight (an empty or `REJECTED` journal) is loaded and relabelled, while one with an in-flight journal is refused with its stage, PRs and the fate of the source PR named, and never migrated by filling the decision from the run's current PR and issue — that is the rebinding the fields exist to forbid — and never handed to the journal loader to be called corrupt. `run --force` moves such a file aside as it does any unreadable one; it is never overwritten in place.
+
 ---
 
 ## Idempotency and crash recovery

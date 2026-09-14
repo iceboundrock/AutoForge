@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 
 import pytest
@@ -3840,3 +3841,228 @@ def test_r6f1_the_agent_s_issue_claim_is_compared_by_identity(tmp_state_dir):
     assert out.next_phase == "BLOCKED"
     assert "does not match the replan issue" in eng.state.block_reason
     assert gh.closed_prs == [] and gh.prs[PR].state == "OPEN"
+
+
+# ---------------------------------------------------------------------------
+# #66 R7-F1: a journal written by the protocol-1 controller is a *protocol*
+# incompatibility, not corruption. It is decided at the state boundary by the
+# version label, never by the journal's shape: a protocol-1 state with no
+# replan in flight is a protocol-2 state and loads as one; an in-flight
+# protocol-1 journal is refused with its stage and PRs named, is never
+# migrated by filling the decision from the run's current PR and issue, and
+# is never handed to the journal loader to be called corrupt.
+# ---------------------------------------------------------------------------
+
+_PROTOCOL_1_STAGES = (
+    ReplanStage.PENDING,
+    ReplanStage.PREPARED,
+    ReplanStage.VERIFIED,
+    ReplanStage.SUPERSEDE_INTENT,
+    ReplanStage.COMPENSATING,
+    ReplanStage.SUPERSEDED,
+)
+
+
+def _protocol_1_journal(stage: ReplanStage) -> dict:
+    """Exactly what the protocol-1 controller's ``to_dict`` wrote at ``stage``.
+
+    The key set is the protocol-1 dataclass: every current field except
+    ``decision_pr_url``, which did not exist. ``issue_url`` was filled by the
+    prepare step, so a PENDING journal carries it *present and empty*. This is
+    a literal transcription of that controller's serialisation, so that a
+    change to the current schema cannot quietly rewrite what "old" means.
+    """
+    prepared = stage is not ReplanStage.PENDING
+    after_verified = stage in _PROTOCOL_1_STAGES[2:]
+    data = {
+        "transaction_id": TXN_ID if prepared else "",
+        "stage": stage.value,
+        "issue_url": ISSUE if prepared else "",
+        "decision_head_sha": SHA_A,
+        "decision_branch": BRANCH,
+        "source_pr_url": PR if prepared else "",
+        "source_branch": BRANCH if prepared else "",
+        "source_head_sha": SHA_A if prepared else "",
+        "source_review_round": 20 if prepared else 0,
+        "base_branch": "main" if prepared else "",
+        "evidence_finding_count": 3 if prepared else 0,
+        "rendered_findings": "- R20-F1 (round 20, blocked): fix it" if prepared else "",
+        "rendered_observations": "(none)" if prepared else "",
+        "rendered_verification_failures": "(none)" if prepared else "",
+        "pr_number_watermark": 42 if prepared else 0,
+        "preexisting_pr_urls": [PR] if prepared else [],
+        "expected_execution_attempt": 2 if prepared else 0,
+        "replacement_pr_url": REPLACEMENT_PR if after_verified else "",
+        "replacement_branch": REPLACEMENT_BRANCH if after_verified else "",
+        "replacement_head_sha": SHA_B if after_verified else "",
+        "attested_findings_considered": 4 if after_verified else 0,
+        "attested_unique_constraints": 2 if after_verified else 0,
+        "close_intent_at": "2026-01-01T00:00:00+00:00" if stage in _PROTOCOL_1_STAGES[3:] else "",
+        "superseded_at": "2026-01-01T00:00:01+00:00" if stage is ReplanStage.SUPERSEDED else "",
+        "compensating_at": "2026-01-01T00:00:01+00:00" if stage is ReplanStage.COMPENSATING else "",
+        "compensation_reason": (
+            "the replan checkpoint no longer held at the close"
+            if stage is ReplanStage.COMPENSATING
+            else ""
+        ),
+        "rejection_reason": "",
+        "rejected_pr_url": "",
+        "escalation": {"trigger": "hard_review_round_threshold"},
+    }
+    assert "decision_pr_url" not in data
+    return data
+
+
+def _protocol_1_state_file(eng, journal: dict) -> dict:
+    """Rewrite the engine's state file as the protocol-1 controller left it."""
+    data = json.loads(eng.paths.state_file.read_text(encoding="utf-8"))
+    data["protocol_version"] = "1"
+    data["phase"] = Phase.REPLAN_REEXECUTE.value
+    data["current_issue_url"] = ISSUE
+    data["current_pr_url"] = PR
+    data["current_branch"] = BRANCH
+    data["current_head_sha"] = SHA_A
+    data["replan_transaction"] = journal
+    eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
+    return data
+
+
+@pytest.mark.parametrize("stage", _PROTOCOL_1_STAGES, ids=lambda s: s.value)
+def test_r7f1_a_protocol_1_journal_is_refused_by_the_journal_loader_only_as_corruption(stage):
+    """What the fix rules out: under protocol 2 the journal loader can only
+    call the old shape corrupt, so it must never be reached from a protocol-1
+    file. (Reached from a protocol-2 file, the same shape *is* corruption.)"""
+    txn = ReplanTransaction.from_dict(_protocol_1_journal(stage))
+    assert txn.stage is ReplanStage.REJECTED
+    assert "persisted replan transaction is corrupt" in txn.rejection_reason
+    missing = f"decision_pr_url is required at stage {stage.value!r} but missing"
+    assert missing in txn.journal_defects
+
+
+@pytest.mark.parametrize("stage", _PROTOCOL_1_STAGES, ids=lambda s: s.value)
+def test_r7f1_an_in_flight_protocol_1_journal_is_refused_at_the_state_boundary(
+    tmp_state_dir, stage
+):
+    """Every in-flight stage written by the protocol-1 controller, the close
+    window included: the state file does not load, nothing is read from or
+    written to GitHub, no agent runs, and the file is left byte-for-byte."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, stage)
+    eng.save()
+    data = _protocol_1_state_file(eng, _protocol_1_journal(stage))
+    before = eng.paths.state_file.read_bytes()
+    with pytest.raises(StateError) as info:
+        eng.load()
+    message = str(info.value)
+    assert "protocol_version '1'" in message and "replan in flight" in message
+    assert f"stage {stage.value!r}" in message
+    assert "did not record the PR and issue the replan decision was made on" in message
+    assert "does not reconstruct them from the run's current PR and issue" in message
+    assert "Finish or undo the replan with the controller that wrote it" in message
+    assert "start a new run" in message
+    # Never diagnosed as corruption, and never a claim about a close that the
+    # journal cannot prove either way.
+    assert "corrupt" not in message
+    assert "nothing was closed or merged" not in message
+    if stage is ReplanStage.PENDING:
+        assert "source PR (none)" in message and "no PR was closed" in message
+    else:
+        assert f"transaction {TXN_ID}" in message and f"source PR {PR}" in message
+    if stage in _PROTOCOL_1_STAGES[2:]:
+        assert f"replacement PR {REPLACEMENT_PR}" in message
+    if stage is ReplanStage.SUPERSEDE_INTENT:
+        assert "may have done so" in message
+        assert "<!-- autoforge-replan-close: <transaction id> -->" in message
+    if stage is ReplanStage.COMPENSATING:
+        assert "the source PR may still be CLOSED" in message
+    if stage is ReplanStage.SUPERSEDED:
+        assert "confirmed the close" in message
+    assert eng.paths.state_file.read_bytes() == before
+    assert json.loads(before)["replan_transaction"] == data["replan_transaction"]
+    assert gh.closed_prs == [] and gh.reopened_prs == [] and gh.commented_prs == []
+    assert gh.prs[PR].state == "OPEN" and eng.provider.calls == []
+
+
+def test_r7f1_a_protocol_1_state_without_a_replan_in_flight_loads_as_protocol_2(tmp_state_dir):
+    """The one difference between the protocols is the journal, so a
+    protocol-1 file with an empty or terminal journal is a protocol-2 file
+    with an old label; the label is rewritten on the next save."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.VERIFIED)
+    eng.save()
+    rejected = {
+        "stage": "rejected",
+        "rejection_reason": "the replacement attests tests_passed=false",
+    }
+    for journal in ({}, rejected):
+        data = _protocol_1_state_file(eng, journal)
+        data["phase"] = "REVIEW" if not journal else "BLOCKED"
+        eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
+        loaded = eng.load()
+        assert loaded.protocol_version == "2"
+        assert loaded.replan_transaction == journal
+        eng.save()
+        assert json.loads(eng.paths.state_file.read_text())["protocol_version"] == "2"
+    # A protocol-1 file that predates the journal field altogether is the
+    # same case: no replan in flight.
+    data = json.loads(eng.paths.state_file.read_text())
+    data["protocol_version"] = "1"
+    del data["replan_transaction"]
+    eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
+    assert eng.load().replan_transaction == {}
+
+
+def test_r7f1_a_rejected_protocol_1_journal_replays_its_block_under_protocol_2(tmp_state_dir):
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.VERIFIED)
+    eng.save()
+    journal = _protocol_1_journal(ReplanStage.VERIFIED)
+    journal["stage"] = "rejected"
+    journal["rejection_reason"] = "the replacement attests tests_passed=false"
+    _protocol_1_state_file(eng, journal)
+    eng.load()
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert "the replacement attests tests_passed=false" in eng.state.block_reason
+    assert "corrupt" not in eng.state.block_reason
+    _assert_source_untouched(eng, gh)
+    assert eng.provider.calls == []
+
+
+def test_r7f1_the_version_label_decides_not_the_journal_shape(tmp_state_dir):
+    """A protocol-1 journal that happens to carry the protocol-2 fields is
+    still refused (an in-flight protocol-1 transaction is one whatever a hand
+    edit added), and a protocol-2 journal missing them is corruption, not a
+    legacy journal (the label says this controller wrote it)."""
+    gh = FakeGitHub()
+    eng, txn = _seeded_engine(tmp_state_dir, gh, ReplanStage.SUPERSEDE_INTENT)
+    eng.save()
+    _protocol_1_state_file(eng, txn.to_dict())
+    with pytest.raises(StateError, match="replan in flight"):
+        eng.load()
+    data = json.loads(eng.paths.state_file.read_text())
+    data["protocol_version"] = "2"
+    del data["replan_transaction"]["decision_pr_url"]
+    eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
+    eng.load()
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert "persisted replan transaction is corrupt" in eng.state.block_reason
+    assert "decision_pr_url is required at stage 'supersede_intent' but missing" in (
+        eng.state.block_reason
+    )
+    assert gh.closed_prs == [] and eng.provider.calls == []
+
+
+def test_r7f1_an_unreadable_stage_in_a_protocol_1_journal_is_still_a_refusal(tmp_state_dir):
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.PENDING)
+    eng.save()
+    journal = _protocol_1_journal(ReplanStage.PENDING)
+    journal["stage"] = 7
+    _protocol_1_state_file(eng, journal)
+    with pytest.raises(StateError) as info:
+        eng.load()
+    assert "unreadable stage 7" in str(info.value)
+    assert "cannot be determined from local state" in str(info.value)
+    assert eng.provider.calls == [] and gh.closed_prs == []
