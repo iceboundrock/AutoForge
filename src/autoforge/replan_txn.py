@@ -396,7 +396,9 @@ _STAGE_ORDER: tuple[ReplanStage, ...] = (
     ReplanStage.SUPERSEDE_INTENT,
 )
 _REQUIRED_AT_STAGE: dict[ReplanStage, tuple[str, ...]] = {
-    ReplanStage.PENDING: ("decision_head_sha",),
+    # REVIEW records both halves of the revision it decided on; a branch-less
+    # decision could only be compared vacuously (#35 R3-F2).
+    ReplanStage.PENDING: ("decision_head_sha", "decision_branch"),
     ReplanStage.PREPARED: (
         "transaction_id",
         "issue_url",
@@ -657,6 +659,53 @@ def _source_branch_drift(pr: PRInfo, txn: ReplanTransaction, when: str = "") -> 
     return ""
 
 
+def verify_run_binding(txn: ReplanTransaction, repository: str, current_pr_url: str) -> str:
+    """The checkpointed source must be the PR this run holds, in this repository.
+
+    Every other source verifier compares GitHub against the journal, so a
+    journal whose ``source_pr_url`` was substituted for the well-formed URL of
+    some *other* PR would only ever be compared against itself: that PR reads
+    back as OPEN, on the checkpointed branch, at the checkpointed HEAD, and
+    the close goes to a PR outside this run's lifecycle -- in another
+    repository, if the operator's credentials reach it (#35 R3-F1). The
+    journal is recovery input, not authority over what the run is working on,
+    so before any stage reads or writes the source it is re-bound to the
+    controller's own ``repository`` and ``current_pr_url``, which
+    ``_prepare_replan`` took it from in the first place. Identity is compared
+    as GitHub does (repository case-insensitively, then the number), never as
+    URL strings.
+
+    A ``PENDING`` journal names no source yet: the checkpoint is created from
+    ``current_pr_url`` by the prepare step itself.
+    """
+    if not txn.source_pr_url:
+        if txn.stage is ReplanStage.PENDING:
+            return ""
+        return "the replan transaction names no source PR, so there is nothing it may act on"
+    try:
+        source = parse_pr_url(txn.source_pr_url)
+    except ConfigurationError as exc:
+        return f"the checkpointed source PR URL is unusable: {exc}"
+    if not source.same_repository(repository):
+        return (
+            f"checkpointed source PR {source.canonical} is not in {repository}; the transaction "
+            "does not belong to this run"
+        )
+    try:
+        held = parse_pr_url(current_pr_url)
+    except ConfigurationError as exc:
+        return (
+            f"the run's current PR URL is unusable ({exc}), so the checkpointed source "
+            f"{source.canonical} cannot be bound to it"
+        )
+    if not source.same_target(held):
+        return (
+            f"checkpointed source PR {source.canonical} is not the run's current PR "
+            f"{held.canonical}; the transaction does not belong to this run"
+        )
+    return ""
+
+
 def verify_decision_point(pr: PRInfo, txn: ReplanTransaction) -> str:
     """The source must still be the revision whose review decided the replan.
 
@@ -667,12 +716,19 @@ def verify_decision_point(pr: PRInfo, txn: ReplanTransaction) -> str:
     never saw -- the accumulated findings belong to the reviewed revision, not
     to whatever is on the branch now.
 
-    An empty ``decision_head_sha`` is itself a refusal: without it there is no
-    proof the checkpoint is the decision point.
+    An empty ``decision_head_sha`` or ``decision_branch`` is itself a refusal:
+    without both there is no proof the checkpoint is the decision point.
+    :meth:`ReplanTransaction.from_dict` refuses such a journal at every stage;
+    this is the same rule at the point of use, never vacuous.
     """
     if not txn.decision_head_sha:
         return (
             "the replan transaction does not record the reviewed HEAD that decided it, so the "
+            "source cannot be proven to be the revision the findings belong to"
+        )
+    if not txn.decision_branch:
+        return (
+            "the replan transaction does not record the reviewed branch that decided it, so the "
             "source cannot be proven to be the revision the findings belong to"
         )
     if not _same_sha(pr.head_sha, txn.decision_head_sha):
@@ -681,7 +737,7 @@ def verify_decision_point(pr: PRInfo, txn: ReplanTransaction) -> str:
             f"review that decided this replan ran on {txn.decision_head_sha}; the current work "
             "was never reviewed against this decision"
         )
-    if txn.decision_branch and pr.head_ref != txn.decision_branch:
+    if pr.head_ref != txn.decision_branch:
         return (
             f"source PR {txn.source_pr_url} is on branch {pr.head_ref!r}, but the review that "
             f"decided this replan ran on {txn.decision_branch!r}"

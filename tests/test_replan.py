@@ -623,6 +623,7 @@ def test_review_beyond_the_persisted_finding_bound_blocks_instead_of_replanning(
     eng.state.replan_transaction = ReplanTransaction(
         stage=ReplanStage.PENDING,
         decision_head_sha=SHA_A,
+        decision_branch=BRANCH,
         escalation={"trigger": "hard_review_round_threshold"},
     ).to_dict()
     calls_before = len(eng.provider.calls)
@@ -1762,7 +1763,13 @@ def test_w8_crash_after_supersede_before_activation(tmp_state_dir):
 
 
 def test_w9_activation_is_idempotent_across_a_repeated_resume(tmp_state_dir):
-    """Window 9: a resume after activation must not count the supersede twice."""
+    """Window 9: a resume after activation must not count the supersede twice.
+
+    Activation installs the replacement and clears the transaction in one
+    atomic save, so a journal that still names the old source while the run
+    already holds the replacement was not left by a crash: it no longer
+    belongs to the run and is refused (#35 R3-F1), moving no counter at all.
+    """
     gh = FakeGitHub()
     eng, txn = _seeded_engine(
         tmp_state_dir, gh, ReplanStage.SUPERSEDED, superseded_at="2026-01-01T00:00:00+00:00"
@@ -1774,10 +1781,12 @@ def test_w9_activation_is_idempotent_across_a_repeated_resume(tmp_state_dir):
     # Replay the same durable transaction as a duplicated crash-resume would.
     eng.state.phase = Phase.REPLAN_REEXECUTE
     eng.state.replan_transaction = txn.to_dict()
-    eng.step()
+    assert eng.step().next_phase == "BLOCKED"
+    assert "is not the run's current PR" in eng.state.block_reason
     assert eng.state.superseded_prs == superseded  # one entry, not two
-    assert eng.state.escalation_count == escalations + 1  # only the replay counter moves
-    assert gh.closed_prs == []
+    assert eng.state.escalation_count == escalations  # nothing is counted twice
+    assert eng.state.current_pr_url == REPLACEMENT_PR
+    assert gh.closed_prs == [] and gh.reopened_prs == []
 
 
 @pytest.mark.parametrize(
@@ -1970,6 +1979,7 @@ def test_conclusive_failure_reading_the_source_at_prepare_blocks(tmp_state_dir):
     eng.state.replan_transaction = ReplanTransaction(
         stage=ReplanStage.PENDING,
         decision_head_sha=SHA_A,
+        decision_branch=BRANCH,
         escalation={"trigger": "hard_review_round_threshold"},
     ).to_dict()
     gh.get_pr_error = GitHubError("HTTP 404: Not Found")
@@ -2031,6 +2041,7 @@ def test_a_source_pr_that_moved_before_prepare_is_refused(tmp_state_dir):
     eng.state.replan_transaction = ReplanTransaction(
         stage=ReplanStage.PENDING,
         decision_head_sha=SHA_A,
+        decision_branch=BRANCH,
         escalation={"trigger": "hard_review_round_threshold"},
     ).to_dict()
     out = eng.step()
@@ -2739,6 +2750,7 @@ def test_f1_a_source_without_a_readable_branch_is_refused_at_prepare(tmp_state_d
     eng.state.replan_transaction = ReplanTransaction(
         stage=ReplanStage.PENDING,
         decision_head_sha=SHA_A,
+        decision_branch=BRANCH,
         escalation={"trigger": "hard_review_round_threshold"},
     ).to_dict()
     out = eng.step()
@@ -2792,6 +2804,7 @@ def test_n3_a_malformed_pr_url_from_the_listing_is_a_refusal_not_a_crash(tmp_sta
     eng.state.replan_transaction = ReplanTransaction(
         stage=ReplanStage.PENDING,
         decision_head_sha=SHA_A,
+        decision_branch=BRANCH,
         escalation={"trigger": "hard_review_round_threshold"},
     ).to_dict()
     out = eng.step()
@@ -2858,6 +2871,7 @@ def test_r2f1_required_fields_accumulate_along_the_lifecycle():
     "stage,name",
     [
         (ReplanStage.PENDING, "decision_head_sha"),
+        (ReplanStage.PENDING, "decision_branch"),
         (ReplanStage.PREPARED, "transaction_id"),
         (ReplanStage.PREPARED, "source_branch"),
         (ReplanStage.PREPARED, "source_head_sha"),
@@ -3003,7 +3017,10 @@ def test_r2f2_semantic_values_are_validated_not_normalised(name, value, needle):
 def test_r2f2_a_pending_journal_may_not_carry_a_transaction_id():
     """The id is created with PREPARED; one at PENDING was written by somebody else."""
     data = ReplanTransaction(
-        stage=ReplanStage.PENDING, decision_head_sha=SHA_A, transaction_id=TXN_ID
+        stage=ReplanStage.PENDING,
+        decision_head_sha=SHA_A,
+        decision_branch=BRANCH,
+        transaction_id=TXN_ID,
     ).to_dict()
     txn = ReplanTransaction.from_dict(data)
     assert txn.stage is ReplanStage.REJECTED
@@ -3034,4 +3051,150 @@ def test_r2f2_an_unusable_preexisting_url_blocks_on_resume_instead_of_being_drop
     assert out.next_phase == "BLOCKED"
     assert "preexisting_pr_urls entry 'garbage'" in eng.state.block_reason
     assert eng.provider.calls == []
+    _assert_source_untouched(eng, gh)
+
+
+# =============================================================================
+# #35 review round 3: the journal is bound to the run, and PENDING binds the
+# branch it decided on
+# =============================================================================
+
+FOREIGN_PR = "https://github.com/other/repo/pull/42"
+
+
+def test_r3f1_a_verified_journal_naming_a_pr_in_another_repository_never_closes_it(
+    tmp_state_dir,
+):
+    """The reviewer's reproduction: every source verifier compares GitHub with
+    the journal, so a foreign PR that matches its own checkpoint would pass
+    them all. The run's own repository and PR are what the source is bound to."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.VERIFIED, source_pr_url=FOREIGN_PR)
+    # The foreign PR is exactly what the substituted checkpoint says it is.
+    gh.add_pr(url=FOREIGN_PR, head_sha=SHA_A, branch=BRANCH, linked=[2])
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    reason = eng.state.block_reason
+    assert f"checkpointed source PR {FOREIGN_PR} is not in owner/repo" in reason
+    assert gh.prs[FOREIGN_PR].state == "OPEN" and gh.prs[PR].state == "OPEN"
+    assert gh.closed_prs == [] and gh.reopened_prs == [] and eng.provider.calls == []
+    assert eng.state.current_pr_url == PR and eng.state.superseded_prs == []
+    assert _txn(eng).stage is ReplanStage.REJECTED
+    # The evidence stays on disk as it was; the refusal replays on resume.
+    assert load_state(eng.paths.state_file).replan_transaction["source_pr_url"] == FOREIGN_PR
+    eng.state.phase = Phase.REPLAN_REEXECUTE
+    assert eng.step().next_phase == "BLOCKED"
+    assert eng.state.block_reason == reason and gh.closed_prs == []
+
+
+@pytest.mark.parametrize(
+    "stage",
+    [
+        ReplanStage.PREPARED,
+        ReplanStage.VERIFIED,
+        ReplanStage.SUPERSEDE_INTENT,
+        ReplanStage.COMPENSATING,
+        ReplanStage.SUPERSEDED,
+    ],
+    ids=lambda v: v.value,
+)
+def test_r3f1_a_journal_about_another_pr_of_this_repository_is_refused_at_every_stage(
+    tmp_state_dir, stage
+):
+    """Same repository, different PR: the transaction does not belong to this run.
+
+    Nothing may act on it, whichever stage it claims: not the agent (PREPARED),
+    not the close (VERIFIED, SUPERSEDE_INTENT), not the reopen (COMPENSATING),
+    and not the activation (SUPERSEDED).
+    """
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, stage, source_pr_url=EARLIER_PR)
+    gh.add_pr(url=EARLIER_PR, head_sha=SHA_A, branch=BRANCH, linked=[2])
+    if stage is ReplanStage.SUPERSEDED:
+        _closed_by_controller(gh, EARLIER_PR)
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert f"checkpointed source PR {EARLIER_PR} is not the run's current PR {PR}" in (
+        eng.state.block_reason
+    )
+    assert gh.closed_prs == [] and gh.reopened_prs == [] and eng.provider.calls == []
+    assert gh.prs[PR].state == "OPEN"
+    assert eng.state.current_pr_url == PR and eng.state.superseded_prs == []
+    assert eng.state.escalation_count == 0
+    assert _txn(eng).stage is ReplanStage.REJECTED
+    assert load_state(eng.paths.state_file).replan_transaction["source_pr_url"] == EARLIER_PR
+
+
+def test_r3f1_a_journal_substituted_while_the_agent_ran_never_reaches_the_close(tmp_state_dir):
+    """The post-agent path does not re-enter the reducer, so the binding is
+    checked again immediately before the destructive write."""
+    gh = FakeGitHub()
+    holder: dict = {}
+    # The agent's claim agrees with the substituted journal, so the claim
+    # check passes and only the binding stands between it and the close.
+    inner = _replan_agent(gh, payload_over={"previous_pr_url": EARLIER_PR})
+
+    def agent(req):
+        if req.phase == "REPLAN_REEXECUTE":
+            holder["eng"].state.replan_transaction["source_pr_url"] = EARLIER_PR
+        return inner(req)
+
+    eng = _park_at_hard_threshold(tmp_state_dir, gh, agent)
+    holder["eng"] = eng
+    gh.add_pr(url=EARLIER_PR, head_sha=SHA_A, branch=BRANCH, linked=[2])
+    assert eng.step().next_phase == "REPLAN_REEXECUTE"
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert "is not the run's current PR" in eng.state.block_reason
+    assert gh.closed_prs == [] and gh.prs[PR].state == "OPEN"
+    assert eng.state.current_pr_url == PR and eng.state.superseded_prs == []
+
+
+def test_r3f1_the_run_binding_compares_identity_not_url_strings():
+    from autoforge.replan_txn import verify_run_binding
+
+    txn = _seed_txn(ReplanStage.VERIFIED)
+    assert verify_run_binding(txn, "owner/repo", PR) == ""
+    # GitHub owner and repository names are case-insensitive.
+    assert verify_run_binding(txn, "Owner/Repo", PR) == ""
+    assert verify_run_binding(txn, "owner/repo", "https://github.com/Owner/REPO/pull/42") == ""
+    assert "is not in other/repo" in verify_run_binding(txn, "other/repo", PR)
+    assert "is not the run's current PR" in verify_run_binding(txn, "owner/repo", EARLIER_PR)
+    assert "current PR URL is unusable" in verify_run_binding(txn, "owner/repo", "")
+    assert "current PR URL is unusable" in verify_run_binding(txn, "owner/repo", ISSUE)
+    # PENDING names no source yet; every later stage must.
+    pending = _seed_txn(ReplanStage.PENDING, source_pr_url="")
+    assert verify_run_binding(pending, "owner/repo", PR) == ""
+    prepared = _seed_txn(ReplanStage.PREPARED, source_pr_url="")
+    assert "names no source PR" in verify_run_binding(prepared, "owner/repo", PR)
+    assert "is unusable" in verify_run_binding(
+        _seed_txn(ReplanStage.PREPARED, source_pr_url=ISSUE), "owner/repo", PR
+    )
+
+
+def test_r3f2_the_decision_point_verifier_refuses_a_missing_branch():
+    """Never vacuous at the point of use, like the source and target verifiers."""
+    from autoforge.replan_txn import verify_decision_point
+
+    txn = _seed_txn(ReplanStage.PENDING, decision_branch="")
+    assert "does not record the reviewed branch" in verify_decision_point(_pr(), txn)
+    txn.decision_branch = BRANCH
+    assert verify_decision_point(_pr(), txn) == ""
+    assert "is on branch" in verify_decision_point(_pr(head_ref="other"), txn)
+
+
+def test_r3f2_review_does_not_decide_a_replan_it_cannot_bind_to_a_branch(tmp_state_dir):
+    """A PENDING journal without the reviewed branch is refused on load, so
+    REVIEW refuses to write one: it blocks before anything is recorded, with
+    the reason in its own words rather than as journal corruption."""
+    gh = FakeGitHub()
+    eng = _park_at_hard_threshold(tmp_state_dir, gh, _replan_agent(gh))
+    gh.prs[PR].head_ref = ""
+    eng.state.current_branch = ""
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert "reviewed branch is not recorded in controller state" in eng.state.block_reason
+    assert eng.state.replan_transaction == {}
+    assert [c.phase for c in eng.provider.calls] == ["REVIEW"]
+    assert eng.state.review_round == 20 and len(eng.state.open_findings) == 1
     _assert_source_untouched(eng, gh)

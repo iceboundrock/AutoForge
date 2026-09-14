@@ -149,6 +149,7 @@ from .replan_txn import (
     verify_attestation,
     verify_closed_source,
     verify_decision_point,
+    verify_run_binding,
     verify_source_checkpoint,
     verify_target_marker,
     verify_target_pr,
@@ -3114,6 +3115,13 @@ class ControllerEngine:
                 None,
                 self._replan_block_text(txn, txn.rejection_reason or "refused by verification"),
             )
+        # Before any stage reads or writes the source -- the compensation and
+        # the activation included -- the journal's source must be the PR this
+        # run holds. A well-formed journal about some other PR is not a
+        # checkpoint the run may act on, whatever GitHub says about that PR.
+        unbound = self._replan_unbound(txn)
+        if unbound is not None:
+            return unbound
         if txn.stage is ReplanStage.COMPENSATING:
             # The undo was decided and persisted before the reopen was
             # attempted. Replay it; never fall through to the supersede step.
@@ -3133,6 +3141,21 @@ class ControllerEngine:
             if not txn.is_bound:
                 return None  # nothing exists yet -> invoke the replan agent
         return self._supersede_source(txn)
+
+    def _replan_unbound(self, txn: ReplanTransaction) -> StepOutcome | None:
+        """Refuse a transaction whose source is not this run's current PR.
+
+        :func:`verify_run_binding` is the rule; this persists its refusal so
+        ``resume`` replays it. Called at the entry of :meth:`_drive_replan`,
+        which every stage passes through, and again by
+        :meth:`_supersede_source` immediately before the destructive write,
+        which the post-agent path reaches without re-entering the reducer.
+        """
+        state = self._require_state()
+        reason = verify_run_binding(txn, state.repository, state.current_pr_url)
+        if reason:
+            return self._reject_replan(txn, reason)
+        return None
 
     def _prepare_replan(self, txn: ReplanTransaction) -> StepOutcome | None:
         """Checkpoint every fact the replan decision rests on, before invoking.
@@ -3354,6 +3377,9 @@ class ControllerEngine:
         never posts a receipt; a CLOSED source without one is refused.
         """
         state = self._require_state()
+        unbound = self._replan_unbound(txn)
+        if unbound is not None:
+            return unbound
         if txn.stage is ReplanStage.SUPERSEDED:
             return self._activate_if_verified(txn)
         if txn.stage not in (ReplanStage.VERIFIED, ReplanStage.SUPERSEDE_INTENT):
@@ -4024,6 +4050,18 @@ class ControllerEngine:
                     self._replan_refusal(decision) + ". Human intervention is required"
                 )
             if decision.action == "replan":
+                if not state.current_branch:
+                    # The decision binds the branch as well as the HEAD, and a
+                    # journal without one is refused on load; refuse here, where
+                    # nothing has been recorded yet, rather than persist a
+                    # decision that can only be replayed as corruption.
+                    return Phase.BLOCKED, self._loop_block_reason(
+                        f"review round {res.round}: {len(findings)} finding(s); controller "
+                        f"policy triggered REPLAN_REEXECUTE ({decision.reason}), but the "
+                        "reviewed branch is not recorded in controller state, so the replan "
+                        "decision cannot bind the revision it was made on. Human intervention "
+                        "is required"
+                    )
                 # Only the decision is recorded here, together with the
                 # revision it was made on. The checkpoint and the transaction
                 # id are created by `_prepare_replan`, inside the
