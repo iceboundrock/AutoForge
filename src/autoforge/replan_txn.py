@@ -117,7 +117,12 @@ def render_close_receipt(transaction_id: str) -> str:
     predates the close and could therefore be present even when the close never
     landed. So a source found CLOSED *carrying* the receipt for this
     transaction was closed by this transaction, and one found CLOSED without it
-    was closed by somebody else -- which is a refusal, not an adoption.
+    cannot be attributed to it -- a human may have closed it, or the controller
+    may have crashed between its close and the receipt -- which is a refusal,
+    not an adoption. The same gap is why a source found OPEN under a recorded
+    intent is never closed from a resume: without the receipt, "the close never
+    ran" and "it landed, lost its receipt to a crash, and a human reopened the
+    PR" are the same evidence, and only a refusal is safe against both.
 
     This is crash-recovery attribution, not authentication: the transaction id
     is published in the replacement PR body, so a human who wanted to could

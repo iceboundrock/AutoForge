@@ -1734,15 +1734,32 @@ def test_w5_crash_after_verification_completes_the_supersede(tmp_state_dir):
 
 
 def test_w6_crash_after_intent_but_before_the_close_landed(tmp_state_dir):
-    """Window 6: intent recorded, source still OPEN -> the close is retried once."""
+    """Window 6: intent recorded, source OPEN, no receipt -> refused, never retried.
+
+    From local state this is the same evidence as "the close landed, the
+    receipt was lost to a crash, and a human reopened the PR" (R11-F1), so
+    the write is never repeated from a resume; the refusal is durable and the
+    source is left exactly as found.
+    """
     gh = FakeGitHub()
     eng, _ = _seeded_engine(
         tmp_state_dir, gh, ReplanStage.SUPERSEDE_INTENT, close_intent_at="2026-01-01T00:00:00+00:00"
     )
-    assert eng.step().next_phase == "REVIEW"
-    assert len(gh.closed_prs) == 1
-    assert gh.prs[PR].state == "CLOSED"
-    assert eng.state.current_pr_url == REPLACEMENT_PR
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert "carries no close receipt" in eng.state.block_reason
+    assert "cannot tell the two apart" in eng.state.block_reason
+    assert "had already begun closing" in eng.state.block_reason
+    assert _txn(eng).stage is ReplanStage.REJECTED
+    assert gh.closed_prs == [] and gh.reopened_prs == [] and gh.commented_prs == []
+    assert gh.prs[PR].state == "OPEN"
+    assert eng.state.current_pr_url == PR
+    assert eng.state.superseded_prs == []
+    # Replayed, not re-derived: a second resume neither closes nor re-decides.
+    eng.state.phase = Phase.REPLAN_REEXECUTE
+    calls_before = len(gh.calls)
+    assert eng.step().next_phase == "BLOCKED"
+    assert gh.closed_prs == [] and len(gh.calls) == calls_before
 
 
 def test_w7_crash_after_the_close_landed_adopts_it_without_closing_again(tmp_state_dir):
@@ -1906,10 +1923,14 @@ def test_transient_failure_during_the_close_leaves_recorded_intent(tmp_state_dir
     assert _txn(eng).stage is ReplanStage.SUPERSEDE_INTENT
     assert _txn(eng).close_intent_at
     assert eng.state.phase == Phase.REPLAN_REEXECUTE
-    # The close never landed; the retry completes it exactly once.
+    # The close never landed, but the journal cannot know that: an OPEN source
+    # under a recorded intent is refused, never retried (R11-F1).
     gh.close_error = ""
-    assert eng.step().next_phase == "REVIEW"
-    assert gh.prs[PR].state == "CLOSED"
+    assert eng.step().next_phase == "BLOCKED"
+    assert "carries no close receipt" in eng.state.block_reason
+    assert gh.prs[PR].state == "OPEN"
+    assert len(gh.closed_prs) == 1  # the one failed attempt; never a second
+    assert _txn(eng).stage is ReplanStage.REJECTED
 
 
 def test_conclusive_github_failure_while_listing_candidates_blocks(tmp_state_dir):
@@ -2414,6 +2435,73 @@ def test_r8f1_an_open_source_already_carrying_a_receipt_is_not_closed_again(
     assert _txn(eng).stage is ReplanStage.REJECTED
     assert gh.closed_prs == []  # never a second close
     assert eng.state.superseded_prs == []
+
+
+def test_r11f1_a_close_that_lost_its_receipt_to_a_crash_is_never_repeated(tmp_state_dir):
+    """R11-F1: close landed -> crash before the receipt -> human reopen -> resume.
+
+    The source is OPEN with no receipt, exactly as a crash *before* the close
+    would leave it. The old resume treated that as an unattempted write and
+    closed again, overriding the human's reopen. It must block instead: no
+    second close, no activation, no reopen, and a refusal that survives a
+    further resume.
+    """
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.VERIFIED)
+
+    def die(*_args, **_kwargs):
+        raise RuntimeError("process died after the close landed, before the receipt")
+
+    eng.github.comment_pr = die  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError):
+        eng.step()
+    assert gh.prs[PR].state == "CLOSED"  # the close landed ...
+    assert gh.commented_prs == []  # ... but no receipt was published
+    assert not has_close_receipt([c.body for c in gh.get_pr_comments(PR)], TXN_ID)
+    crashed = _txn(eng)
+    assert crashed.stage is ReplanStage.SUPERSEDE_INTENT
+
+    gh.prs[PR].state = "OPEN"  # a human reopens it before the resume
+    resumed = make_engine(tmp_state_dir, ["the replan agent must not run"], github=gh)
+    resumed.state.phase = Phase.REPLAN_REEXECUTE
+    resumed.state.current_issue_url = ISSUE
+    resumed.state.current_pr_url = PR
+    resumed.state.replan_transaction = crashed.to_dict()
+    out = resumed.step()
+    assert out.next_phase == "BLOCKED"
+    assert "carries no close receipt" in resumed.state.block_reason
+    assert "reopened by a human" in resumed.state.block_reason
+    assert _txn(resumed).stage is ReplanStage.REJECTED
+    assert len(gh.closed_prs) == 1  # never a second close
+    assert gh.prs[PR].state == "OPEN"  # the human's reopen stands
+    assert gh.reopened_prs == [] and gh.commented_prs == []
+    assert resumed.state.current_pr_url == PR  # the replacement was not activated
+    assert resumed.state.superseded_prs == []
+    assert resumed.state.escalation_count == 0
+    # The refusal is durable: another resume replays it without touching GitHub.
+    resumed.state.phase = Phase.REPLAN_REEXECUTE
+    calls_before = len(gh.calls)
+    assert resumed.step().next_phase == "BLOCKED"
+    assert len(gh.calls) == calls_before and len(gh.closed_prs) == 1
+
+
+def test_r11f1_an_unreadable_comment_list_over_an_open_source_is_unknown_then_refused(
+    tmp_state_dir,
+):
+    """The OPEN-at-intent refusal keeps the transient/conclusive split."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(
+        tmp_state_dir, gh, ReplanStage.SUPERSEDE_INTENT, close_intent_at="2026-01-01T00:00:00+00:00"
+    )
+    gh.comments_error = GitHubUnavailableError("gh: 502 Bad Gateway")
+    with pytest.raises(GitHubUnavailableError):
+        eng.step()
+    assert _txn(eng).stage is ReplanStage.SUPERSEDE_INTENT  # still resumable
+    gh.comments_error = GitHubError("gh: not found")
+    assert eng.step().next_phase == "BLOCKED"
+    assert "a prior close cannot be ruled out" in eng.state.block_reason
+    assert _txn(eng).stage is ReplanStage.REJECTED
+    assert gh.closed_prs == [] and gh.prs[PR].state == "OPEN"
 
 
 def test_f2_a_crash_after_the_reopen_lands_resumes_into_the_undo(tmp_state_dir):

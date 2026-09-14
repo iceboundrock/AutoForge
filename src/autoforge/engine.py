@@ -3409,8 +3409,12 @@ class ControllerEngine:
         *after* the close is observed (:meth:`comment_pr`, checked by
         :meth:`_close_not_ours`): ``gh pr close --comment`` posts its comment
         before the close lands, so a receipt in it can predate the close and
-        must never count as proof. A resume that did not perform the close
-        never posts a receipt; a CLOSED source without one is refused.
+        must never count as proof. A resume never posts a receipt and never
+        performs the close: the write is reachable from ``VERIFIED`` only. A
+        CLOSED source without the receipt is refused, and so is an OPEN one
+        under a recorded intent -- with or without the receipt -- because the
+        journal cannot tell a close that never ran from one that landed, lost
+        its receipt to a crash, and was then reopened by a human (R11-F1).
         """
         state = self._require_state()
         unbound = self._replan_unbound(txn)
@@ -3435,10 +3439,17 @@ class ControllerEngine:
             # It re-reads the source for itself; this snapshot is already one
             # round trip old by the time the comparison runs.
             return self._confirm_supersede(txn)
-        if txn.stage is ReplanStage.SUPERSEDE_INTENT and source.is_open:
-            # A resume retrying the write: a receipt already present means a
-            # prior attempt closed the source and it was then reopened. Closing
-            # again would be a second close on human intervention -- block.
+        if txn.stage is ReplanStage.SUPERSEDE_INTENT:
+            # An OPEN source under a durable intent is never closed from here.
+            # The intent proves a close was *about* to be attempted, not
+            # whether it was: "crashed before `gh pr close` ran" and "closed,
+            # crashed before the receipt was published, then reopened by a
+            # human" leave the same OPEN source with no receipt, and only the
+            # second is a decision a retry would override (R11-F1). The
+            # receipt can make the second story certain; its absence never
+            # makes the first one so. Both refuse, naming the story the
+            # evidence supports, and the write below stays reachable from
+            # VERIFIED alone.
             try:
                 prior_comments = self.github.get_pr_comments(txn.source_pr_url)
             except GitHubUnavailableError:
@@ -3446,8 +3457,9 @@ class ControllerEngine:
             except GitHubError as exc:
                 return self._reject_replan(
                     txn,
-                    f"source PR {txn.source_pr_url} is open, but its comments could not be read "
-                    f"({exc}), so a prior close cannot be ruled out",
+                    f"source PR {txn.source_pr_url} is open under a recorded close intent, but "
+                    f"its comments could not be read ({exc}), so a prior close cannot be ruled "
+                    "out and the controller will not close it",
                 )
             if has_close_receipt((c.body for c in prior_comments), txn.transaction_id):
                 return self._reject_replan(
@@ -3456,7 +3468,16 @@ class ControllerEngine:
                     f"for replan transaction {txn.transaction_id}; a prior close landed and was "
                     "then reopened, so the controller will not close it again",
                 )
-        # The destructive write is still ahead: revalidate both sides now.
+            return self._reject_replan(
+                txn,
+                f"source PR {txn.source_pr_url} is open under a recorded close intent for replan "
+                f"transaction {txn.transaction_id} but carries no close receipt; the close may "
+                "never have run, or it may have landed and been reopened by a human before the "
+                "receipt was published, and local state cannot tell the two apart, so the "
+                "controller will not close it",
+            )
+        # Reached from VERIFIED only: the destructive write is ahead, and no
+        # earlier attempt at it was ever recorded. Revalidate both sides now.
         try:
             target = self.github.get_pr(txn.replacement_pr_url)
         except GitHubUnavailableError:
@@ -3605,8 +3626,10 @@ class ControllerEngine:
         (:func:`render_close_receipt`) is therefore posted with
         :meth:`comment_pr` *after* the close is observed, never inside the
         ``gh pr close --comment`` that predates it: presence proves this
-        transaction closed the PR, absence proves it did not (or not
-        observably). A resume never posts a receipt.
+        transaction closed the PR; absence proves only that the close cannot
+        be attributed to it -- a human may have closed it, or this transaction
+        may have closed it and crashed before the receipt was published. A
+        resume never posts a receipt.
 
         Absence is conclusive: the run refuses and blocks, leaving the close
         exactly as the human made it -- the controller must not reopen a PR it
@@ -3626,8 +3649,10 @@ class ControllerEngine:
             return ""
         return (
             f"source PR {txn.source_pr_url} is closed but carries no close receipt for replan "
-            f"transaction {txn.transaction_id}, so this transaction did not close it; refusing "
-            "to supersede on a close the controller cannot prove it performed"
+            f"transaction {txn.transaction_id}, so the close cannot be attributed to this "
+            "transaction (a human may have closed it, or this transaction may have closed it "
+            "and crashed before the receipt was published); refusing to supersede on a close "
+            "the controller cannot prove it performed"
         )
 
     def _compensate_close(self, txn: ReplanTransaction, drift: str) -> StepOutcome:
