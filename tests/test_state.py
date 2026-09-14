@@ -254,6 +254,53 @@ def test_replan_state_defaults_and_reset_are_backward_compatible(tmp_path):
     assert loaded.replan_transaction == {}
 
 
+def test_protocol_1_is_migrated_only_without_a_replan_in_flight(tmp_path):
+    """#66 R7-F1: the 1 -> 2 protocol change is confined to the replan journal.
+
+    A protocol-1 file with an empty or terminal journal loads and is
+    relabelled; one with a replan in flight is refused at the boundary with
+    the transaction described; any other label is unsupported as before.
+    """
+    path = tmp_path / "state.json"
+    base = make_state().to_dict()
+    assert base["protocol_version"] == "2"
+    for journal in ({}, {"stage": "rejected", "rejection_reason": "refused by verification"}):
+        data = dict(base, protocol_version="1", replan_transaction=journal)
+        path.write_text(json.dumps(data), encoding="utf-8")
+        loaded = load_state(path)
+        assert loaded.protocol_version == "2" and loaded.replan_transaction == journal
+        save_state(loaded, path)
+        assert json.loads(path.read_text())["protocol_version"] == "2"
+    in_flight = {
+        "stage": "prepared",
+        "transaction_id": "a" * 32,
+        "source_pr_url": "https://github.com/owner/repo/pull/42",
+    }
+    data = dict(base, protocol_version="1", replan_transaction=in_flight)
+    data["controller_version"] = "0.1.0"
+    raw = json.dumps(data)
+    path.write_text(raw, encoding="utf-8")
+    with pytest.raises(StateError) as info:
+        load_state(path)
+    message = str(info.value)
+    assert "written by controller 0.1.0 under protocol_version '1'" in message
+    assert "stage 'prepared'" in message and "pull/42" in message
+    assert "replacement PR (none)" in message
+    assert "corrupt" not in message
+    assert path.read_text(encoding="utf-8") == raw
+    data["protocol_version"] = "3"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(StateError, match="unsupported protocol_version '3'"):
+        load_state(path)
+    # The type check still owns a journal that is not an object, whatever
+    # the label says.
+    data["protocol_version"] = "1"
+    data["replan_transaction"] = ["prepared"]
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(StateError, match="'replan_transaction' must be an object"):
+        load_state(path)
+
+
 def test_quarantine_state_file_renames_without_overwriting(tmp_path, monkeypatch):
     from datetime import datetime
 

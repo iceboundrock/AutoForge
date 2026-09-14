@@ -36,6 +36,7 @@ from pathlib import Path
 from . import __prompt_version__, __protocol_version__, __version__
 from .errors import StateError
 from .loop_guard import validate_review_history
+from .replan_txn import LEGACY_JOURNAL_PROTOCOL, legacy_journal_refusal
 from .run_contract import LocalRunContract
 from .runlog import validate_run_id
 from .safefs import ReadLimitExceeded, SafeRoot, entry_kind
@@ -330,8 +331,26 @@ class AutoForgeState:
         # is checked before the fields are: a file written by a newer
         # controller must be reported as an unsupported protocol, not as a
         # pile of typos.
+        #
+        # Protocol 1 -> 2 changed exactly one thing: the replan journal
+        # records the PR and issue its decision was made on. A protocol-1
+        # file with no replan in flight is therefore a protocol-2 file with
+        # an old label and is loaded as one (the label is rewritten on the
+        # next save); one with a replan in flight is refused *here*, at the
+        # boundary, with the transaction described -- never migrated by
+        # filling the decision from the run's current PR and issue, which is
+        # the rebinding the fields forbid, and never handed to the journal
+        # loader, which would call it corrupt. See
+        # :func:`replan_txn.legacy_journal_refusal`.
         raw_protocol = data.get("protocol_version", __protocol_version__)
-        if raw_protocol != __protocol_version__:
+        if raw_protocol == LEGACY_JOURNAL_PROTOCOL:
+            refusal = legacy_journal_refusal(
+                data.get("replan_transaction", {}),
+                written_by=str(data.get("controller_version", "")),
+            )
+            if refusal:
+                raise StateError(refusal)
+        elif raw_protocol != __protocol_version__:
             raise StateError(
                 f"unsupported protocol_version {raw_protocol!r} "
                 f"(controller speaks {__protocol_version__!r})"
@@ -353,6 +372,7 @@ class AutoForgeState:
         kwargs = dict(data)
         kwargs["phase"] = phase
         kwargs["mode"] = mode
+        kwargs["protocol_version"] = __protocol_version__
         # Unknown fields are corruption, not forward compatibility: at this
         # protocol version the controller knows every field it writes, so an
         # unexpected key is a hand edit, a truncated merge or a foreign file.

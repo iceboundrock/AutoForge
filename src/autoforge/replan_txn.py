@@ -60,12 +60,13 @@ from __future__ import annotations
 import json
 import re
 import secrets
-from collections.abc import Iterable
-from dataclasses import asdict, dataclass, field
+from collections.abc import Callable, Iterable
+from dataclasses import asdict, dataclass, field, fields
 from enum import StrEnum
 
+from .errors import ConfigurationError
 from .github import PRInfo
-from .validation import parse_issue_url, parse_pr_url
+from .validation import GitHubPullRequestRef, parse_issue_url, parse_pr_url
 
 MARKER_NAME = "autoforge-replan-transaction"
 # Matches *every* complete comment bearing this name, whatever the payload
@@ -116,7 +117,12 @@ def render_close_receipt(transaction_id: str) -> str:
     predates the close and could therefore be present even when the close never
     landed. So a source found CLOSED *carrying* the receipt for this
     transaction was closed by this transaction, and one found CLOSED without it
-    was closed by somebody else -- which is a refusal, not an adoption.
+    cannot be attributed to it -- a human may have closed it, or the controller
+    may have crashed between its close and the receipt -- which is a refusal,
+    not an adoption. The same gap is why a source found OPEN under a recorded
+    intent is never closed from a resume: without the receipt, "the close never
+    ran" and "it landed, lost its receipt to a crash, and a human reopened the
+    PR" are the same evidence, and only a refusal is safe against both.
 
     This is crash-recovery attribution, not authentication: the transaction id
     is published in the replacement PR body, so a human who wanted to could
@@ -322,6 +328,188 @@ def source_marker_defect(
     return ""
 
 
+# Persisted URL and id fields are validated by shape as well as by type: a
+# string that is not a GitHub URL would otherwise surface as a
+# ``ConfigurationError`` from the first ``parse_*_url`` on the resume path -- a
+# crash, not a refusal -- and a transaction id that is not one would be
+# silently overwritten (at PENDING) or could bind nothing (later) without the
+# journal ever being called what it is: corrupt.
+_ISSUE_URL_FIELDS = frozenset({"issue_url"})
+_PR_URL_FIELDS = frozenset(
+    {"decision_pr_url", "source_pr_url", "replacement_pr_url", "rejected_pr_url"}
+)
+_PR_URL_LIST_FIELDS = frozenset({"preexisting_pr_urls"})
+
+
+def _url_defect(name: str, value: str, parser: Callable[[str], object]) -> str:
+    try:
+        parser(value)
+    except ConfigurationError as exc:
+        return f"{name} is not a GitHub URL ({exc})"
+    return ""
+
+
+def _field_defect(name: str, annotation: str, value: object) -> str:
+    """Why ``value`` cannot be loaded into the field ``name``, or ``""``.
+
+    The check is driven by the dataclass annotation (a string, because the
+    module defers annotation evaluation), so a field added to the transaction
+    is validated by construction: an annotation this does not understand is a
+    programming error and is raised, never waved through.
+    """
+    kind = type(value).__name__
+    if annotation == "str":
+        if not isinstance(value, str):
+            return f"{name} must be a string, got {kind}"
+        if value and name in _ISSUE_URL_FIELDS | _PR_URL_FIELDS:
+            parser = parse_issue_url if name in _ISSUE_URL_FIELDS else parse_pr_url
+            return _url_defect(name, value, parser)
+        if value and name == "transaction_id" and not TRANSACTION_ID_RE.match(value):
+            return f"{name} must be 32 lowercase hex characters, got {value!r}"
+        return ""
+    if annotation == "int":
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return f"{name} must be an integer >= 0, got {value!r}"
+        return ""
+    if annotation == "list[str]":
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            return f"{name} must be a list of strings, got {kind}"
+        if name in _PR_URL_LIST_FIELDS:
+            for item in value:
+                defect = _url_defect(f"{name} entry {item!r}", item, parse_pr_url)
+                if defect:
+                    return defect
+        return ""
+    if annotation == "dict":
+        if not isinstance(value, dict):
+            return f"{name} must be an object, got {kind}"
+        return ""
+    raise TypeError(f"ReplanTransaction field {name!r} has unvalidated type {annotation!r}")
+
+
+# The fields each stage's writer fills *together with* the stage. A journal at
+# a stage in which one of them is empty was not written by this controller (a
+# hand edit, a truncated write, an older version), so the type-valid fields
+# around it prove nothing either: it is corruption, not a checkpoint with a
+# gap. Requirements accumulate along the lifecycle, and ``REJECTED`` -- which
+# any stage can reach -- requires nothing. Type validity alone would let a
+# ``VERIFIED`` journal with ``source_branch == ""`` reach the close with a
+# checkpoint that was never proven (#35 R2-F1); this table is what rules that
+# out, and the verifiers refuse the same gap again in depth.
+#
+# The table must cover *every* field its stage writes, not only the ones a
+# verifier compares: an omitted field falls back to the dataclass default,
+# and a default is a value the acceptance predicates will happily enforce.
+# ``evidence_finding_count`` defaulting to 0 is the case that shows why (#35
+# R5-F1): ``verify_attestation`` would then accept a replacement attesting it
+# considered 0 findings, and the source holding the real ones would be closed
+# against an acknowledgement nobody required. So the evidence group is
+# required whole, and the values the writer records there are never
+# legitimately empty -- a replan is only ever decided after a review that
+# ended with findings, so the preserved count is >= 1 and its rendering is
+# non-empty; the observations and verification failures render "(none)" when
+# there are none; the review round that decided the replan is >= 1; and the
+# open-PR snapshot contains the source itself, which ``_prepare_replan`` reads
+# as OPEN and requires to be listed. A field whose legitimate value *can* be
+# falsy is required to be present instead (``_PRESENT_AT_STAGE``): the
+# replacement's ``unique_constraints`` may honestly be 0, but a journal at
+# ``VERIFIED`` that does not record it at all was not written whole.
+_STAGE_ORDER: tuple[ReplanStage, ...] = (
+    ReplanStage.PENDING,
+    ReplanStage.PREPARED,
+    ReplanStage.VERIFIED,
+    ReplanStage.SUPERSEDE_INTENT,
+)
+_REQUIRED_AT_STAGE: dict[ReplanStage, tuple[str, ...]] = {
+    # REVIEW records the issue whose lifecycle it was reviewing, the PR it
+    # decided on and both halves of the revision it reviewed there; a
+    # branch-less decision could only be compared vacuously (#35 R3-F2), a
+    # PR-less one would let the prepare step take its source from whatever
+    # the run happens to hold (#35 R4-F1), and an issue-less one would let it
+    # take the issue the replacement must be linked to from whatever the run
+    # happens to hold (#35 R6-F1). The policy metadata is recorded with the
+    # decision and always names its trigger.
+    ReplanStage.PENDING: (
+        "issue_url",
+        "decision_pr_url",
+        "decision_head_sha",
+        "decision_branch",
+        "escalation",
+    ),
+    ReplanStage.PREPARED: (
+        "transaction_id",
+        "source_pr_url",
+        "source_branch",
+        "source_head_sha",
+        "source_review_round",
+        "base_branch",
+        "evidence_finding_count",
+        "rendered_findings",
+        "rendered_observations",
+        "rendered_verification_failures",
+        "preexisting_pr_urls",
+        "pr_number_watermark",
+        "expected_execution_attempt",
+    ),
+    # The verified attestation is re-checked exactly on the last read before
+    # the close and again before activation; it must be >= the preserved
+    # evidence count, so it is never legitimately 0 either.
+    ReplanStage.VERIFIED: (
+        "replacement_pr_url",
+        "replacement_branch",
+        "replacement_head_sha",
+        "attested_findings_considered",
+    ),
+    ReplanStage.SUPERSEDE_INTENT: ("close_intent_at",),
+    # Both follow SUPERSEDE_INTENT and are alternatives to each other.
+    ReplanStage.COMPENSATING: ("compensating_at", "compensation_reason"),
+    ReplanStage.SUPERSEDED: ("superseded_at",),
+}
+# Written together with the stage, but 0 is an honest value: present-or-corrupt.
+_PRESENT_AT_STAGE: dict[ReplanStage, tuple[str, ...]] = {
+    ReplanStage.VERIFIED: ("attested_unique_constraints",),
+}
+
+
+def _stages_reached(stage: ReplanStage) -> tuple[ReplanStage, ...]:
+    if stage is ReplanStage.REJECTED:
+        return ()
+    if stage in _STAGE_ORDER:
+        return _STAGE_ORDER[: _STAGE_ORDER.index(stage) + 1]
+    return (*_STAGE_ORDER, stage)
+
+
+def required_fields_at(stage: ReplanStage) -> tuple[str, ...]:
+    """Every field a journal at ``stage`` must carry non-empty, in lifecycle order."""
+    return tuple(name for earlier in _stages_reached(stage) for name in _REQUIRED_AT_STAGE[earlier])
+
+
+def present_fields_at(stage: ReplanStage) -> tuple[str, ...]:
+    """Every field a journal at ``stage`` must carry, though possibly falsy."""
+    return tuple(
+        name for earlier in _stages_reached(stage) for name in _PRESENT_AT_STAGE.get(earlier, ())
+    )
+
+
+def _stage_defects(stage: ReplanStage, values: dict[str, object]) -> list[str]:
+    """Required-but-empty (or forbidden-but-set) fields for ``stage``."""
+    defects: list[str] = []
+    for name in required_fields_at(stage):
+        if name not in values:
+            defects.append(f"{name} is required at stage {stage.value!r} but missing")
+        elif not values[name]:
+            defects.append(f"{name} is required at stage {stage.value!r} but empty")
+    for name in present_fields_at(stage):
+        if name not in values:
+            defects.append(f"{name} is required at stage {stage.value!r} but missing")
+    # The id is created together with PREPARED and can exist nowhere before
+    # it (see the module docstring); a PENDING journal carrying one was not
+    # written by this controller.
+    if stage is ReplanStage.PENDING and values.get("transaction_id"):
+        defects.append(f"transaction_id is set at stage {stage.value!r}, before it is created")
+    return defects
+
+
 @dataclass
 class ReplanTransaction:
     """Durable intent for one replan. Persisted as ``state.replan_transaction``.
@@ -336,12 +524,22 @@ class ReplanTransaction:
     transaction_id: str = ""
     stage: ReplanStage = ReplanStage.PENDING
 
-    issue_url: str = ""
-
     # -- decision point: the review state that routed to this replan -------
     # Recorded by REVIEW when the transaction is created, before the
     # controller looks at GitHub again. The source may only be superseded at
-    # exactly this revision: it is the one whose findings justify the replan.
+    # exactly this revision of exactly this PR: it is the one whose findings
+    # justify the replan. The PR identity is recorded alongside the revision
+    # because the prepare step otherwise has only ``state.current_pr_url`` to
+    # take its source from, and two open PRs can share a HEAD and a branch
+    # (one branch, two bases); a decision that binds the revision but not the
+    # PR could be checkpointed onto the wrong one. The issue is recorded here
+    # for the same reason: it is the lifecycle the source belongs to and the
+    # one the replacement must be linked to, and the prepare step would
+    # otherwise take it from ``state.current_issue_url``. It is never
+    # re-derived later; :func:`verify_run_binding` binds it to the run's
+    # active issue at every stage instead.
+    issue_url: str = ""
+    decision_pr_url: str = ""
     decision_head_sha: str = ""
     decision_branch: str = ""
 
@@ -398,35 +596,79 @@ class ReplanTransaction:
 
     escalation: dict = field(default_factory=dict)
 
+    # -- journal integrity (never persisted) ------------------------------
+    # Why :meth:`from_dict` coerced this transaction to ``REJECTED``: one
+    # reason per persisted field it could not read. Empty for a well-formed
+    # journal. Kept off disk so the corrupt evidence is never overwritten by
+    # the defaults that stand in for it here.
+    journal_defects: list[str] = field(default_factory=list)
+
     # -- persistence ------------------------------------------------------
     def to_dict(self) -> dict:
         data = asdict(self)
         data["stage"] = self.stage.value
+        del data["journal_defects"]
         return data
 
     @classmethod
     def from_dict(cls, data: dict) -> ReplanTransaction:
         """Load persisted intent; unknown/omitted fields fall back to defaults.
 
-        An unreadable stage is *not* coerced to a runnable one — it becomes
-        ``REJECTED`` so a hand-edited or future-version journal fails closed
-        instead of resuming a destructive write from an unknown position.
+        Every *present* field is schema-checked. A field that cannot be read
+        -- an unknown stage, a watermark stored as a string, an escalation
+        stored as a list -- is *not* coerced to a runnable value: the
+        transaction becomes ``REJECTED`` with the defects named, so a
+        hand-edited, truncated or future-version journal fails closed
+        instead of resuming a destructive write from an unknown position, and
+        instead of crashing on the first use of the field so that every
+        ``resume`` dies identically. The unreadable fields fall back to their
+        defaults in memory only (see ``journal_defects``).
+
+        Omission is only tolerated where the stage tolerates it: every field
+        the recorded stage's writer fills is required to be present and
+        non-empty (:func:`required_fields_at`), or at least present where 0
+        is an honest value (:func:`present_fields_at`), so an incomplete
+        checkpoint is corruption rather than a checkpoint some later verifier
+        might compare vacuously -- or, for the evidence fields, enforce at
+        their defaults.
         """
         if not isinstance(data, dict):
             raise ValueError("replan transaction must be a JSON object")
-        known = {f for f in cls.__dataclass_fields__}
-        kwargs = {k: v for k, v in data.items() if k in known}
-        raw_stage = kwargs.pop("stage", ReplanStage.PENDING.value)
+        kwargs: dict = {}
+        defects: list[str] = []
+        raw_stage = data.get("stage", ReplanStage.PENDING.value)
         try:
+            if not isinstance(raw_stage, str):
+                raise ValueError(raw_stage)
             stage = ReplanStage(raw_stage)
         except ValueError:
             stage = ReplanStage.REJECTED
-            if not kwargs.get("rejection_reason"):
-                kwargs["rejection_reason"] = (
-                    f"persisted replan transaction has unknown stage {raw_stage!r}"
-                )
-        txn = cls(stage=stage, **kwargs)
-        return txn
+            defects.append(f"unknown stage {raw_stage!r}")
+        for spec in fields(cls):
+            if spec.name in ("stage", "journal_defects") or spec.name not in data:
+                continue
+            value = data[spec.name]
+            defect = _field_defect(spec.name, str(spec.type), value)
+            if defect:
+                defects.append(defect)
+                continue
+            kwargs[spec.name] = value
+        if not defects:
+            # Only a journal whose fields all read cleanly is judged for
+            # completeness: a field that already failed its type check has
+            # been reported once and must not be reported again as "empty".
+            defects.extend(_stage_defects(stage, kwargs))
+        if defects:
+            stage = ReplanStage.REJECTED
+            prior = kwargs.get("rejection_reason", "")
+            kwargs["rejection_reason"] = (
+                "persisted replan transaction is corrupt: "
+                + "; ".join(defects)
+                + f" (recorded stage {raw_stage!r}"
+                + (f", recorded rejection: {prior}" if prior else "")
+                + ")"
+            )
+        return cls(stage=stage, journal_defects=defects, **kwargs)
 
     @property
     def is_bound(self) -> bool:
@@ -446,6 +688,98 @@ class ReplanTransaction:
 
 
 # ---------------------------------------------------------------------------
+# State-protocol migration. The journal's schema is part of the state
+# protocol, and the protocol went from 1 to 2 when REVIEW started recording
+# the PR and the issue its replan decision was made on (``decision_pr_url``;
+# ``issue_url`` at PENDING) so that every later stage could be bound to that
+# decision rather than to whatever the run happened to hold. A protocol-1
+# journal was written whole by the controller of its day and is not corrupt;
+# it simply never recorded the decision, and there is nothing to reconstruct
+# it from: "missing field -> fill from the run's current PR and issue" is
+# precisely the rebinding the decision fields exist to forbid (#35 R4-F1,
+# R6-F1), and #66 R7-F1 is where an in-flight protocol-1 journal was found
+# to be refused as *corruption* under a protocol that still called itself 1.
+# ---------------------------------------------------------------------------
+
+LEGACY_JOURNAL_PROTOCOL = "1"
+
+_LEGACY_STAGE_FATES: dict[str, str] = {
+    ReplanStage.PENDING.value: (
+        "the decision to replan was recorded but nothing was checkpointed, no transaction id "
+        "exists and no PR was closed"
+    ),
+    ReplanStage.PREPARED.value: (
+        "a transaction id was created and the replan agent may have been invoked, so a "
+        "replacement PR carrying its marker may exist; no PR was closed by it"
+    ),
+    ReplanStage.VERIFIED.value: (
+        "a replacement PR was verified against the checkpoint; no PR was closed by it"
+    ),
+    ReplanStage.SUPERSEDE_INTENT.value: (
+        "the controller intended to close the source PR and may have done so: a CLOSED source "
+        f"carrying an `<!-- {CLOSE_RECEIPT_NAME}: <transaction id> -->` comment was closed by "
+        "this transaction, and one without it was not; the replacement was not activated"
+    ),
+    ReplanStage.COMPENSATING.value: (
+        "the controller closed the source PR, found a checkpoint had moved, and decided to "
+        "reopen it; the reopen may not have been performed or confirmed, so the source PR may "
+        "still be CLOSED; the replacement was not activated"
+    ),
+    ReplanStage.SUPERSEDED.value: (
+        "the controller closed the source PR and confirmed the close; the replacement was not "
+        "activated in the run's state"
+    ),
+}
+
+
+def legacy_journal_refusal(raw: object, *, written_by: str) -> str:
+    """Why a protocol-1 state cannot be loaded as protocol 2, or ``""`` when it can.
+
+    The only difference between the two protocols is the replan journal, so a
+    protocol-1 state whose journal is empty -- no replan in flight -- or
+    terminal (``REJECTED``, of which both protocols read nothing but the
+    recorded reason) *is* a protocol-2 state and is loaded as one. A journal
+    at any other stage is in flight under a schema that never bound the
+    decision, and it is refused at the state boundary: never migrated, since
+    the binding cannot be reconstructed without re-deciding the replan, and
+    never read as corruption, since it was written whole. The refusal names
+    the stage, the PRs, what that stage implies about the source PR, and the
+    two ways out -- finish or undo the transaction with the controller that
+    wrote it, or resolve it by hand on GitHub and start a new run.
+
+    ``raw`` is read defensively: this runs before any schema check, so a
+    non-object journal is left for the state's own type check, and an
+    unreadable stage or PR is reported as such rather than trusted.
+    """
+    if not isinstance(raw, dict) or not raw:
+        return ""
+    stage = raw.get("stage")
+    if stage == ReplanStage.REJECTED.value:
+        return ""
+
+    def _text(name: str) -> str:
+        value = raw.get(name)
+        return value if isinstance(value, str) and value else "(none)"
+
+    fate = _LEGACY_STAGE_FATES.get(stage) if isinstance(stage, str) else None
+    if fate is None:
+        fate = (
+            f"the journal records an unreadable stage {stage!r}, so what it did to the source "
+            "PR cannot be determined from local state"
+        )
+    return (
+        f"state file was written by controller {written_by or '(unknown)'} under "
+        f"protocol_version {LEGACY_JOURNAL_PROTOCOL!r} with a replan in flight (stage "
+        f"{stage!r}, transaction {_text('transaction_id')}, source PR {_text('source_pr_url')}, "
+        f"replacement PR {_text('replacement_pr_url')}); protocol {LEGACY_JOURNAL_PROTOCOL!r} "
+        "did not record the PR and issue the replan decision was made on, and this controller "
+        "does not reconstruct them from the run's current PR and issue. At that stage "
+        f"{fate}. Finish or undo the replan with the controller that wrote it, then upgrade; "
+        "or resolve it by hand on GitHub and start a new run. The state file was left unchanged"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Verification predicates. Each returns "" when the check passes, or a
 # human-readable reason why the transaction must not proceed. They are the
 # single definition of "acceptable" for the normal path and for `resume`:
@@ -460,6 +794,166 @@ def _canonical(url: str) -> str:
         return ""
 
 
+def _same_pr(observed: str, expected: str) -> bool:
+    """PR identity as GitHub sees it, never vacuous: an unusable URL matches nothing."""
+    try:
+        return parse_pr_url(observed).same_target(parse_pr_url(expected))
+    except ConfigurationError:
+        return False
+
+
+def _same_sha(observed: str, expected: str) -> bool:
+    """One rule for every SHA comparison: case-insensitive, and never vacuous.
+
+    `gh` reports hexadecimal SHAs in lower case, but a checkpoint can come
+    from anywhere a human can type (state recorded from a CONTROL_RESULT, a
+    hand-repaired journal), so case must not decide a supersede. An empty
+    side never matches: an unreadable HEAD is not "the same" as anything.
+    """
+    return bool(observed) and bool(expected) and observed.lower() == expected.lower()
+
+
+def _source_branch_drift(pr: PRInfo, txn: ReplanTransaction, when: str = "") -> str:
+    """The source branch comparison, shared by the pre- and post-close reads.
+
+    Like :func:`_same_sha`, never vacuous: the branch is checkpointed by
+    ``PREPARED`` together with the HEAD and is half of what "exactly the
+    implementation the controller decided to replace" means, so a checkpoint
+    that records no branch has not proven it and must not be closed on.
+    :meth:`ReplanTransaction.from_dict` already refuses such a journal at any
+    stage from ``PREPARED`` on; this is the same rule again at the point of
+    use, so a transaction assembled any other way cannot slip past it.
+    """
+    if not txn.source_branch:
+        return (
+            f"the replan transaction records no branch for source PR {txn.source_pr_url}, so "
+            "the checkpoint cannot prove which branch it decided to supersede"
+        )
+    if pr.head_ref != txn.source_branch:
+        return (
+            f"source PR {txn.source_pr_url} moved from the checkpointed branch "
+            f"{txn.source_branch!r} to {pr.head_ref!r}{when}"
+        )
+    return ""
+
+
+def verify_run_binding(
+    txn: ReplanTransaction, repository: str, current_pr_url: str, current_issue_url: str
+) -> str:
+    """Every PR the journal names as the source must be the PR this run holds,
+    and the issue it names must be the issue this run is working on.
+
+    Every other source verifier compares GitHub against the journal, so a
+    journal whose ``source_pr_url`` was substituted for the well-formed URL of
+    some *other* PR would only ever be compared against itself: that PR reads
+    back as OPEN, on the checkpointed branch, at the checkpointed HEAD, and
+    the close goes to a PR outside this run's lifecycle -- in another
+    repository, if the operator's credentials reach it (#35 R3-F1). The
+    journal is recovery input, not authority over what the run is working on,
+    so before any stage reads or writes the source it is re-bound to the
+    controller's own ``repository`` and ``current_pr_url``, which
+    ``_prepare_replan`` took it from in the first place. Identity is compared
+    as GitHub does (repository case-insensitively, then the number), never as
+    URL strings.
+
+    The binding is two-sided. ``current_pr_url`` is itself persisted state,
+    and a ``PENDING`` journal names no checkpointed source yet: the prepare
+    step creates one from ``current_pr_url``. So the decision ``REVIEW``
+    recorded must name the PR it reviewed, and that ``decision_pr_url`` is
+    bound to the run exactly like the checkpoint is; otherwise a run whose
+    ``current_pr_url`` was substituted between the review and the prepare
+    step would checkpoint -- and later close -- a PR no review decided on
+    (#35 R4-F1). From ``PREPARED`` on both are required and both must bind,
+    which also pins the checkpoint to the decision.
+
+    The issue is bound the same way, because the PR binding alone proves only
+    *which PR* may be closed, not *for which lifecycle*. The replacement is
+    accepted on the strength of being linked to ``txn.issue_url``
+    (:func:`verify_target_pr`), so a well-formed journal whose ``issue_url``
+    was substituted for another issue of the same repository would let a
+    marker-bearing PR linked only to that other issue be adopted, the source
+    of *this* issue be closed for it, and the run carry on with
+    ``current_issue_url`` pointing at an issue the active PR no longer
+    implements (#35 R6-F1). So ``REVIEW`` records the issue it was reviewing
+    for together with the decision, the prepare step never re-derives it, and
+    here it is compared by identity against the run's ``current_issue_url``
+    at every stage -- which also pins the linkage requirement to the issue
+    whose source is being superseded.
+    """
+    try:
+        held = parse_pr_url(current_pr_url)
+    except ConfigurationError as exc:
+        return (
+            f"the run's current PR URL is unusable ({exc}), so the replan transaction "
+            "cannot be bound to it"
+        )
+    if txn.source_pr_url:
+        drift = _bind_to_run("checkpointed source PR", txn.source_pr_url, repository, held)
+        if drift:
+            return drift
+    elif txn.stage is not ReplanStage.PENDING:
+        return "the replan transaction names no source PR, so there is nothing it may act on"
+    if not txn.decision_pr_url:
+        return (
+            "the replan transaction does not record the PR whose review decided it, so the "
+            "source cannot be bound to that decision"
+        )
+    drift = _bind_to_run("decision PR", txn.decision_pr_url, repository, held)
+    if drift:
+        return drift
+    return _bind_issue_to_run(txn, repository, current_issue_url)
+
+
+def _bind_issue_to_run(txn: ReplanTransaction, repository: str, current_issue_url: str) -> str:
+    """The issue the journal names must be the issue the run is working on."""
+    try:
+        held = parse_issue_url(current_issue_url)
+    except ConfigurationError as exc:
+        return (
+            f"the run's current issue URL is unusable ({exc}), so the replan transaction "
+            "cannot be bound to it"
+        )
+    if not txn.issue_url:
+        return (
+            "the replan transaction does not record the issue whose review decided it, so "
+            "the replacement cannot be required to belong to the same lifecycle as the source"
+        )
+    try:
+        ref = parse_issue_url(txn.issue_url)
+    except ConfigurationError as exc:
+        return f"the replan issue URL is unusable: {exc}"
+    if not ref.same_repository(repository):
+        return (
+            f"replan issue {ref.canonical} is not in {repository}; the transaction does not "
+            "belong to this run"
+        )
+    if not ref.same_target(held):
+        return (
+            f"replan issue {ref.canonical} is not the run's current issue {held.canonical}; "
+            "the transaction does not belong to this run"
+        )
+    return ""
+
+
+def _bind_to_run(what: str, url: str, repository: str, held: GitHubPullRequestRef) -> str:
+    """One identity rule for every PR the journal names as the source."""
+    try:
+        ref = parse_pr_url(url)
+    except ConfigurationError as exc:
+        return f"the {what} URL is unusable: {exc}"
+    if not ref.same_repository(repository):
+        return (
+            f"{what} {ref.canonical} is not in {repository}; the transaction does not belong "
+            "to this run"
+        )
+    if not ref.same_target(held):
+        return (
+            f"{what} {ref.canonical} is not the run's current PR {held.canonical}; the "
+            "transaction does not belong to this run"
+        )
+    return ""
+
+
 def verify_decision_point(pr: PRInfo, txn: ReplanTransaction) -> str:
     """The source must still be the revision whose review decided the replan.
 
@@ -470,21 +964,45 @@ def verify_decision_point(pr: PRInfo, txn: ReplanTransaction) -> str:
     never saw -- the accumulated findings belong to the reviewed revision, not
     to whatever is on the branch now.
 
-    An empty ``decision_head_sha`` is itself a refusal: without it there is no
-    proof the checkpoint is the decision point.
+    The PR read must also *be* the PR the decision names: the prepare step
+    reads it from ``state.current_pr_url``, and :func:`verify_run_binding`
+    has bound that to the decision, but the identity GitHub reports is the
+    fact, so it is compared here rather than assumed.
+
+    An empty ``decision_pr_url``, ``decision_head_sha`` or ``decision_branch``
+    is itself a refusal: without all three there is no proof the checkpoint
+    is the decision point. :meth:`ReplanTransaction.from_dict` refuses such a
+    journal at every stage; this is the same rule at the point of use, never
+    vacuous.
     """
+    if not txn.decision_pr_url:
+        return (
+            "the replan transaction does not record the PR whose review decided it, so the "
+            "source cannot be proven to be the PR the findings belong to"
+        )
+    if not _same_pr(pr.url, txn.decision_pr_url):
+        return (
+            f"source PR read back as {pr.url or '(none)'}, but the review that decided this "
+            f"replan ran on {txn.decision_pr_url}; the current work was never reviewed "
+            "against this decision"
+        )
     if not txn.decision_head_sha:
         return (
             "the replan transaction does not record the reviewed HEAD that decided it, so the "
             "source cannot be proven to be the revision the findings belong to"
         )
-    if pr.head_sha.lower() != txn.decision_head_sha.lower():
+    if not txn.decision_branch:
+        return (
+            "the replan transaction does not record the reviewed branch that decided it, so the "
+            "source cannot be proven to be the revision the findings belong to"
+        )
+    if not _same_sha(pr.head_sha, txn.decision_head_sha):
         return (
             f"source PR {txn.source_pr_url} is at HEAD {pr.head_sha or '(unreadable)'}, but the "
             f"review that decided this replan ran on {txn.decision_head_sha}; the current work "
             "was never reviewed against this decision"
         )
-    if txn.decision_branch and pr.head_ref != txn.decision_branch:
+    if pr.head_ref != txn.decision_branch:
         return (
             f"source PR {txn.source_pr_url} is on branch {pr.head_ref!r}, but the review that "
             f"decided this replan ran on {txn.decision_branch!r}"
@@ -514,12 +1032,10 @@ def verify_source_checkpoint(pr: PRInfo, txn: ReplanTransaction) -> str:
             f"source PR {txn.source_pr_url} is {pr.state or '(unknown)'}, expected OPEN at the "
             "checkpoint; it was not closed by this transaction"
         )
-    if txn.source_branch and pr.head_ref != txn.source_branch:
-        return (
-            f"source PR {txn.source_pr_url} moved from the checkpointed branch "
-            f"{txn.source_branch!r} to {pr.head_ref!r}"
-        )
-    if pr.head_sha != txn.source_head_sha:
+    drift = _source_branch_drift(pr, txn)
+    if drift:
+        return drift
+    if not _same_sha(pr.head_sha, txn.source_head_sha):
         return (
             f"source PR {txn.source_pr_url} advanced from the checkpointed HEAD "
             f"{txn.source_head_sha} to {pr.head_sha or '(unreadable)'}; the newer work was never "
@@ -527,7 +1043,7 @@ def verify_source_checkpoint(pr: PRInfo, txn: ReplanTransaction) -> str:
         )
     # Defence in depth: the checkpoint is only allowed to hold the revision the
     # review decided on, so a journal in which the two disagree is unusable.
-    if txn.decision_head_sha and txn.source_head_sha.lower() != txn.decision_head_sha.lower():
+    if txn.decision_head_sha and not _same_sha(txn.source_head_sha, txn.decision_head_sha):
         return (
             f"checkpointed source HEAD {txn.source_head_sha} is not the reviewed HEAD "
             f"{txn.decision_head_sha} that decided this replan"
@@ -545,8 +1061,10 @@ def verify_target_pr(
     """Objective facts a replacement must satisfy, re-derived from GitHub.
 
     ``require_checkpoint_head`` is off while the candidate is first being
-    bound (its HEAD *becomes* the checkpoint) and on for every later read,
-    including the final read immediately before the destructive write.
+    bound (its HEAD and branch *become* the checkpoint) and on for every later
+    read, including the final read immediately before the destructive write;
+    on those reads the checkpointed branch must exist as well as match, for
+    the reason :func:`_source_branch_drift` gives for the source.
     """
     ref_canonical = _canonical(pr.url)
     if not ref_canonical:
@@ -569,6 +1087,11 @@ def verify_target_pr(
         return f"replacement PR {ref_canonical} has no readable head SHA"
     if not pr.head_ref or pr.head_ref == txn.source_branch:
         return "replacement branch must be present and differ from the superseded branch"
+    if require_checkpoint_head and not txn.replacement_branch:
+        return (
+            f"the replan transaction records no branch for replacement PR {ref_canonical}, so "
+            "the verified checkpoint is incomplete"
+        )
     if txn.replacement_branch and pr.head_ref != txn.replacement_branch:
         return (
             f"replacement PR {ref_canonical} moved from the checkpointed branch "
@@ -576,10 +1099,19 @@ def verify_target_pr(
         )
     if pr.base_ref != txn.base_branch:
         return f"replacement PR base {pr.base_ref!r} != verified default branch {txn.base_branch!r}"
-    issue_number = parse_issue_url(txn.issue_url).number
-    if issue_number not in pr.linked_issue_numbers:
-        return f"replacement PR {ref_canonical} is not linked to issue #{issue_number}"
-    if require_checkpoint_head and pr.head_sha != txn.replacement_head_sha:
+    try:
+        issue = parse_issue_url(txn.issue_url)
+    except ConfigurationError as exc:
+        return f"replan transaction records no usable issue URL ({exc})"
+    if not issue.same_repository(repository):
+        # Linkage is a number within one repository, so an issue of another
+        # repository can never be what a PR here is linked to.
+        # ``verify_run_binding`` refuses such a journal before this is
+        # reached; this is the same rule at the point of use.
+        return f"replan issue {issue.canonical} is not in {repository}"
+    if issue.number not in pr.linked_issue_numbers:
+        return f"replacement PR {ref_canonical} is not linked to issue #{issue.number}"
+    if require_checkpoint_head and not _same_sha(pr.head_sha, txn.replacement_head_sha):
         return (
             f"replacement PR {ref_canonical} advanced from the verified HEAD "
             f"{txn.replacement_head_sha} to {pr.head_sha}; it is no longer the implementation "
@@ -642,12 +1174,10 @@ def verify_closed_source(pr: PRInfo, txn: ReplanTransaction) -> str:
             f"source PR {txn.source_pr_url} is {pr.state or '(unknown)'} after this "
             "transaction's close attempt; expected CLOSED"
         )
-    if txn.source_branch and pr.head_ref != txn.source_branch:
-        return (
-            f"source PR {txn.source_pr_url} moved from the checkpointed branch "
-            f"{txn.source_branch!r} to {pr.head_ref!r} inside the close window"
-        )
-    if pr.head_sha != txn.source_head_sha:
+    drift = _source_branch_drift(pr, txn, " inside the close window")
+    if drift:
+        return drift
+    if not _same_sha(pr.head_sha, txn.source_head_sha):
         return (
             f"source PR {txn.source_pr_url} advanced from the checkpointed HEAD "
             f"{txn.source_head_sha} to {pr.head_sha or '(unreadable)'} inside the close window; "

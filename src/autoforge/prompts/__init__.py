@@ -105,9 +105,11 @@ def required_variables(template: str) -> set[str]:
 
 
 def render(template: str, variables: dict[str, str | int | None]) -> str:
-    """Substitute all {{VARS}}; raise if any required var is missing/empty.
+    """Substitute all {{VARS}}; raise if any required var is missing or ``None``.
 
-    ``None`` values count as missing. Integers are stringified. Any
+    An empty string is a provided value and is substituted as such: callers
+    that want a visible placeholder pass one (``"(none)"``) rather than rely
+    on rendering to refuse a blank. Integers are stringified. Any
     placeholder the *template* leaves unresolved is an error; placeholder-like
     text inside a substituted value is content, not a placeholder, and is
     inserted verbatim (see ``_MARKER_RE``).
