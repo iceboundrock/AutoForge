@@ -3235,6 +3235,18 @@ class ControllerEngine:
                 f"repository {state.repository} reports {watermark} as its latest pull-request "
                 f"number, which cannot be right while PR #{source_ref.number} exists",
             )
+        if source_ref.canonical not in preexisting_urls:
+            # The source was just read as OPEN, so a consistent listing holds
+            # it; one that does not was taken after the source moved. The
+            # snapshot is checkpointed as the set of PRs that can never be the
+            # replacement, and a journal is refused on load when it is empty,
+            # so it must be proven to contain the source before it is written.
+            return self._reject_replan(
+                txn,
+                f"PR {source_ref.canonical} was read as OPEN but is missing from the open "
+                f"pull-request listing of {state.repository}; the source moved between reads "
+                "and cannot be checkpointed",
+            )
         drift = verify_decision_point(source, txn)
         if drift:
             return self._reject_replan(txn, drift)
@@ -3247,6 +3259,19 @@ class ControllerEngine:
         except GitHubError as exc:
             return self._reject_replan(
                 txn, f"cannot collect the review evidence the replacement must answer for: {exc}"
+            )
+        if history.recorded_finding_count < 1:
+            # A replan is decided only by a review that ended with findings,
+            # and those findings are what the replacement must acknowledge.
+            # Evidence that collects to nothing is a history no review wrote
+            # (a hand edit), not a replan with nothing to answer for: the
+            # acknowledgement requirement would be vacuous, and the journal
+            # would be refused on load as incomplete anyway.
+            return self._reject_replan(
+                txn,
+                f"the persisted review history of PR {source_ref.canonical} records no "
+                "actionable finding, so there is no evidence a replacement could be required "
+                "to answer for",
             )
         txn.transaction_id = new_transaction_id()
         txn.stage = ReplanStage.PREPARED

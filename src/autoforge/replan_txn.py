@@ -391,6 +391,24 @@ def _field_defect(name: str, annotation: str, value: object) -> str:
 # ``VERIFIED`` journal with ``source_branch == ""`` reach the close with a
 # checkpoint that was never proven (#35 R2-F1); this table is what rules that
 # out, and the verifiers refuse the same gap again in depth.
+#
+# The table must cover *every* field its stage writes, not only the ones a
+# verifier compares: an omitted field falls back to the dataclass default,
+# and a default is a value the acceptance predicates will happily enforce.
+# ``evidence_finding_count`` defaulting to 0 is the case that shows why (#35
+# R5-F1): ``verify_attestation`` would then accept a replacement attesting it
+# considered 0 findings, and the source holding the real ones would be closed
+# against an acknowledgement nobody required. So the evidence group is
+# required whole, and the values the writer records there are never
+# legitimately empty -- a replan is only ever decided after a review that
+# ended with findings, so the preserved count is >= 1 and its rendering is
+# non-empty; the observations and verification failures render "(none)" when
+# there are none; the review round that decided the replan is >= 1; and the
+# open-PR snapshot contains the source itself, which ``_prepare_replan`` reads
+# as OPEN and requires to be listed. A field whose legitimate value *can* be
+# falsy is required to be present instead (``_PRESENT_AT_STAGE``): the
+# replacement's ``unique_constraints`` may honestly be 0, but a journal at
+# ``VERIFIED`` that does not record it at all was not written whole.
 _STAGE_ORDER: tuple[ReplanStage, ...] = (
     ReplanStage.PENDING,
     ReplanStage.PREPARED,
@@ -401,35 +419,68 @@ _REQUIRED_AT_STAGE: dict[ReplanStage, tuple[str, ...]] = {
     # REVIEW records the PR it decided on and both halves of the revision it
     # reviewed there; a branch-less decision could only be compared vacuously
     # (#35 R3-F2), and a PR-less one would let the prepare step take its
-    # source from whatever the run happens to hold (#35 R4-F1).
-    ReplanStage.PENDING: ("decision_pr_url", "decision_head_sha", "decision_branch"),
+    # source from whatever the run happens to hold (#35 R4-F1). The policy
+    # metadata is recorded with the decision and always names its trigger.
+    ReplanStage.PENDING: (
+        "decision_pr_url",
+        "decision_head_sha",
+        "decision_branch",
+        "escalation",
+    ),
     ReplanStage.PREPARED: (
         "transaction_id",
         "issue_url",
         "source_pr_url",
         "source_branch",
         "source_head_sha",
+        "source_review_round",
         "base_branch",
+        "evidence_finding_count",
+        "rendered_findings",
+        "rendered_observations",
+        "rendered_verification_failures",
+        "preexisting_pr_urls",
         "pr_number_watermark",
         "expected_execution_attempt",
     ),
-    ReplanStage.VERIFIED: ("replacement_pr_url", "replacement_branch", "replacement_head_sha"),
+    # The verified attestation is re-checked exactly on the last read before
+    # the close and again before activation; it must be >= the preserved
+    # evidence count, so it is never legitimately 0 either.
+    ReplanStage.VERIFIED: (
+        "replacement_pr_url",
+        "replacement_branch",
+        "replacement_head_sha",
+        "attested_findings_considered",
+    ),
     ReplanStage.SUPERSEDE_INTENT: ("close_intent_at",),
     # Both follow SUPERSEDE_INTENT and are alternatives to each other.
     ReplanStage.COMPENSATING: ("compensating_at", "compensation_reason"),
     ReplanStage.SUPERSEDED: ("superseded_at",),
 }
+# Written together with the stage, but 0 is an honest value: present-or-corrupt.
+_PRESENT_AT_STAGE: dict[ReplanStage, tuple[str, ...]] = {
+    ReplanStage.VERIFIED: ("attested_unique_constraints",),
+}
+
+
+def _stages_reached(stage: ReplanStage) -> tuple[ReplanStage, ...]:
+    if stage is ReplanStage.REJECTED:
+        return ()
+    if stage in _STAGE_ORDER:
+        return _STAGE_ORDER[: _STAGE_ORDER.index(stage) + 1]
+    return (*_STAGE_ORDER, stage)
 
 
 def required_fields_at(stage: ReplanStage) -> tuple[str, ...]:
     """Every field a journal at ``stage`` must carry non-empty, in lifecycle order."""
-    if stage is ReplanStage.REJECTED:
-        return ()
-    if stage in _STAGE_ORDER:
-        reached = _STAGE_ORDER[: _STAGE_ORDER.index(stage) + 1]
-    else:
-        reached = (*_STAGE_ORDER, stage)
-    return tuple(name for earlier in reached for name in _REQUIRED_AT_STAGE[earlier])
+    return tuple(name for earlier in _stages_reached(stage) for name in _REQUIRED_AT_STAGE[earlier])
+
+
+def present_fields_at(stage: ReplanStage) -> tuple[str, ...]:
+    """Every field a journal at ``stage`` must carry, though possibly falsy."""
+    return tuple(
+        name for earlier in _stages_reached(stage) for name in _PRESENT_AT_STAGE.get(earlier, ())
+    )
 
 
 def _stage_defects(stage: ReplanStage, values: dict[str, object]) -> list[str]:
@@ -440,6 +491,9 @@ def _stage_defects(stage: ReplanStage, values: dict[str, object]) -> list[str]:
             defects.append(f"{name} is required at stage {stage.value!r} but missing")
         elif not values[name]:
             defects.append(f"{name} is required at stage {stage.value!r} but empty")
+    for name in present_fields_at(stage):
+        if name not in values:
+            defects.append(f"{name} is required at stage {stage.value!r} but missing")
     # The id is created together with PREPARED and can exist nowhere before
     # it (see the module docstring); a PENDING journal carrying one was not
     # written by this controller.
@@ -560,9 +614,11 @@ class ReplanTransaction:
 
         Omission is only tolerated where the stage tolerates it: every field
         the recorded stage's writer fills is required to be present and
-        non-empty (:func:`required_fields_at`), so an incomplete checkpoint
-        is corruption rather than a checkpoint some later verifier might
-        compare vacuously.
+        non-empty (:func:`required_fields_at`), or at least present where 0
+        is an honest value (:func:`present_fields_at`), so an incomplete
+        checkpoint is corruption rather than a checkpoint some later verifier
+        might compare vacuously -- or, for the evidence fields, enforce at
+        their defaults.
         """
         if not isinstance(data, dict):
             raise ValueError("replan transaction must be a JSON object")

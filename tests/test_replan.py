@@ -347,6 +347,9 @@ def _seed_txn(stage: ReplanStage, **over) -> ReplanTransaction:
         source_review_round=20,
         base_branch="main",
         evidence_finding_count=3,
+        rendered_findings="- R20-F1 (round 20, blocked): fix it",
+        rendered_observations="(none)",
+        rendered_verification_failures="(none)",
         preexisting_pr_urls=[PR],
         pr_number_watermark=42,
         expected_execution_attempt=2,
@@ -1073,13 +1076,15 @@ def test_an_unusable_marker_on_a_source_that_postdates_the_transaction_still_blo
     A source whose number is above the watermark and outside the snapshot
     cannot happen in a consistent transaction, but if the persisted
     checkpoint says so, its botched attestation is evidence of a first
-    attempt and is refused like any other post-watermark PR's.
+    attempt and is refused like any other post-watermark PR's. (The snapshot
+    stays non-empty: an empty one is refused on load as an incomplete
+    checkpoint before any marker is looked at.)
     """
     gh = FakeGitHub()
     eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.PREPARED, marker=False)
     txn = dict(eng.state.replan_transaction)
     txn["pr_number_watermark"] = gh.prs[PR].number - 1
-    txn["preexisting_pr_urls"] = []
+    txn["preexisting_pr_urls"] = ["https://github.com/owner/repo/pull/41"]
     eng.state.replan_transaction = txn
     eng.save()
     gh.prs[PR].body = UNUSABLE_MARKERS[0]
@@ -2864,6 +2869,7 @@ def test_r2f1_required_fields_accumulate_along_the_lifecycle():
 
     prepared = required_fields_at(ReplanStage.PREPARED)
     assert "decision_head_sha" in prepared and "source_branch" in prepared
+    assert "evidence_finding_count" in prepared and "rendered_findings" in prepared
     assert set(prepared) < set(required_fields_at(ReplanStage.VERIFIED))
     assert set(required_fields_at(ReplanStage.VERIFIED)) < set(
         required_fields_at(ReplanStage.SUPERSEDE_INTENT)
@@ -2883,28 +2889,40 @@ def test_r2f1_required_fields_accumulate_along_the_lifecycle():
         (ReplanStage.PENDING, "decision_pr_url"),
         (ReplanStage.PENDING, "decision_head_sha"),
         (ReplanStage.PENDING, "decision_branch"),
+        (ReplanStage.PENDING, "escalation"),
         (ReplanStage.PREPARED, "transaction_id"),
         (ReplanStage.PREPARED, "source_branch"),
         (ReplanStage.PREPARED, "source_head_sha"),
+        (ReplanStage.PREPARED, "source_review_round"),
         (ReplanStage.PREPARED, "base_branch"),
+        (ReplanStage.PREPARED, "evidence_finding_count"),
+        (ReplanStage.PREPARED, "rendered_findings"),
+        (ReplanStage.PREPARED, "rendered_observations"),
+        (ReplanStage.PREPARED, "rendered_verification_failures"),
+        (ReplanStage.PREPARED, "preexisting_pr_urls"),
         (ReplanStage.PREPARED, "pr_number_watermark"),
         (ReplanStage.PREPARED, "expected_execution_attempt"),
         (ReplanStage.VERIFIED, "source_branch"),
+        (ReplanStage.VERIFIED, "evidence_finding_count"),
         (ReplanStage.VERIFIED, "replacement_pr_url"),
         (ReplanStage.VERIFIED, "replacement_branch"),
         (ReplanStage.VERIFIED, "replacement_head_sha"),
+        (ReplanStage.VERIFIED, "attested_findings_considered"),
         (ReplanStage.SUPERSEDE_INTENT, "close_intent_at"),
         (ReplanStage.SUPERSEDE_INTENT, "source_branch"),
+        (ReplanStage.SUPERSEDE_INTENT, "rendered_findings"),
+        (ReplanStage.SUPERSEDE_INTENT, "attested_findings_considered"),
         (ReplanStage.COMPENSATING, "compensation_reason"),
         (ReplanStage.SUPERSEDED, "superseded_at"),
         (ReplanStage.SUPERSEDED, "replacement_branch"),
+        (ReplanStage.SUPERSEDED, "evidence_finding_count"),
     ],
     ids=lambda v: v.value if isinstance(v, ReplanStage) else v,
 )
 def test_r2f1_a_field_the_stage_requires_may_be_neither_empty_nor_missing(stage, name):
     """Type-valid but incomplete is still corrupt: the checkpoint was never proven."""
     empty = _seed_dict(stage)
-    empty[name] = "" if isinstance(empty[name], str) else 0
+    empty[name] = type(empty[name])()  # "", 0, [] or {} -- the dataclass default
     txn = ReplanTransaction.from_dict(empty)
     assert txn.stage is ReplanStage.REJECTED
     assert txn.journal_defects == [f"{name} is required at stage {stage.value!r} but empty"]
@@ -3032,6 +3050,7 @@ def test_r2f2_a_pending_journal_may_not_carry_a_transaction_id():
         decision_pr_url=PR,
         decision_head_sha=SHA_A,
         decision_branch=BRANCH,
+        escalation={"trigger": "hard_review_round_threshold"},
         transaction_id=TXN_ID,
     ).to_dict()
     txn = ReplanTransaction.from_dict(data)
@@ -3334,3 +3353,246 @@ def test_r3f2_review_does_not_decide_a_replan_it_cannot_bind_to_a_branch(tmp_sta
     assert [c.phase for c in eng.provider.calls] == ["REVIEW"]
     assert eng.state.review_round == 20 and len(eng.state.open_findings) == 1
     _assert_source_untouched(eng, gh)
+
+
+# =============================================================================
+# Issue #35, review round 5 (R5-F1): the completeness table covers the review
+# evidence a PREPARED journal carries and the attestation a VERIFIED one
+# carries, so an omitted field can never be enforced at its dataclass default
+# =============================================================================
+
+EVIDENCE_FIELDS = (
+    "source_review_round",
+    "evidence_finding_count",
+    "rendered_findings",
+    "rendered_observations",
+    "rendered_verification_failures",
+    "preexisting_pr_urls",
+)
+ATTESTATION_FIELDS = ("attested_findings_considered", "attested_unique_constraints")
+
+
+def test_r5f1_the_reviewers_reproduction_a_zero_claim_is_never_accepted(tmp_state_dir):
+    """A PREPARED journal without ``evidence_finding_count`` used to default the
+    acknowledgement requirement to 0, so a replacement attesting it considered
+    0 findings passed ``verify_attestation`` and the source holding the real
+    findings could be closed. The journal is now refused on load, before any
+    candidate is read; with the field present the same claim is refused by the
+    attestation rule, so the two layers agree."""
+    from autoforge.replan_txn import verify_attestation
+
+    zero_claim = ReplanAttestation(
+        transaction_id=TXN_ID,
+        execution_attempt=2,
+        findings_considered=0,
+        unique_constraints=0,
+        tests_passed=True,
+    )
+    complete = _seed_txn(ReplanStage.PREPARED)
+    assert "considered 0 of the 3 historical finding(s)" in verify_attestation(zero_claim, complete)
+
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.PREPARED, marker=False)
+    gh.prs[REPLACEMENT_PR].body = render_marker(zero_claim)
+    del eng.state.replan_transaction["evidence_finding_count"]
+    eng.save()
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    reason = eng.state.block_reason
+    assert "evidence_finding_count is required at stage 'prepared' but missing" in reason
+    assert "cannot be determined from local state" in reason
+    assert eng.provider.calls == []
+    _assert_source_untouched(eng, gh)
+    assert gh.reopened_prs == [] and gh.prs[REPLACEMENT_PR].state == "OPEN"
+    assert _txn(eng).stage is ReplanStage.REJECTED
+    assert _txn(eng).replacement_pr_url == ""
+    # The evidence on disk is left as found, and a resume replays the refusal.
+    assert "evidence_finding_count" not in load_state(eng.paths.state_file).replan_transaction
+    eng.state.phase = Phase.REPLAN_REEXECUTE
+    assert eng.step().next_phase == "BLOCKED"
+    assert eng.state.block_reason == reason
+    assert eng.provider.calls == [] and gh.closed_prs == []
+
+
+@pytest.mark.parametrize(
+    "stage,name",
+    [
+        *[(ReplanStage.PREPARED, name) for name in EVIDENCE_FIELDS],
+        *[(ReplanStage.VERIFIED, name) for name in (*EVIDENCE_FIELDS, *ATTESTATION_FIELDS)],
+        *[(ReplanStage.SUPERSEDE_INTENT, name) for name in (*EVIDENCE_FIELDS, *ATTESTATION_FIELDS)],
+    ],
+    ids=lambda v: v.value if isinstance(v, ReplanStage) else v,
+)
+def test_r5f1_a_journal_missing_evidence_or_attestation_never_reaches_the_close(
+    tmp_state_dir, stage, name
+):
+    """Recovery from every stage before the close: BLOCKED, no agent run, no
+    close, no reopen, no activation, and the journal on disk left as found."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, stage)
+    del eng.state.replan_transaction[name]
+    eng.save()
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    reason = eng.state.block_reason
+    assert f"{name} is required at stage {stage.value!r} but missing" in reason
+    assert eng.provider.calls == []
+    _assert_source_untouched(eng, gh)
+    assert gh.reopened_prs == [] and gh.prs[REPLACEMENT_PR].state == "OPEN"
+    assert eng.state.current_branch == BRANCH and eng.state.reviewed_head_sha != SHA_B
+    assert name not in load_state(eng.paths.state_file).replan_transaction
+    eng.state.phase = Phase.REPLAN_REEXECUTE
+    assert eng.step().next_phase == "BLOCKED"
+    assert eng.state.block_reason == reason and gh.closed_prs == []
+
+
+@pytest.mark.parametrize("name", [*EVIDENCE_FIELDS, *ATTESTATION_FIELDS])
+def test_r5f1_a_superseded_journal_missing_evidence_or_attestation_is_not_activated(
+    tmp_state_dir, name
+):
+    """After the close the drift is terminal: nothing is reopened, nothing activated."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.SUPERSEDED)
+    _closed_by_controller(gh)
+    del eng.state.replan_transaction[name]
+    eng.save()
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert f"{name} is required at stage 'superseded' but missing" in eng.state.block_reason
+    assert eng.provider.calls == []
+    assert eng.state.current_pr_url == PR and eng.state.superseded_prs == []
+    assert eng.state.escalation_count == 0
+    assert gh.reopened_prs == [] and gh.closed_prs == []
+    assert name not in load_state(eng.paths.state_file).replan_transaction
+
+
+def test_r5f1_an_honest_zero_unique_constraints_is_present_not_empty():
+    """0 is a legitimate ``unique_constraints`` (the prompt's own example uses
+    it), so the field is required to be *present* at VERIFIED, never non-zero."""
+    from autoforge.replan_txn import present_fields_at, required_fields_at
+
+    assert "attested_unique_constraints" not in required_fields_at(ReplanStage.SUPERSEDED)
+    assert "attested_unique_constraints" in present_fields_at(ReplanStage.VERIFIED)
+    assert "attested_unique_constraints" in present_fields_at(ReplanStage.SUPERSEDED)
+    assert present_fields_at(ReplanStage.PREPARED) == ()
+    assert present_fields_at(ReplanStage.REJECTED) == ()
+
+    honest = _seed_dict(ReplanStage.VERIFIED)
+    honest["attested_unique_constraints"] = 0
+    txn = ReplanTransaction.from_dict(honest)
+    assert txn.journal_defects == [] and txn.stage is ReplanStage.VERIFIED
+    del honest["attested_unique_constraints"]
+    txn = ReplanTransaction.from_dict(honest)
+    assert txn.stage is ReplanStage.REJECTED
+    assert txn.journal_defects == [
+        "attested_unique_constraints is required at stage 'verified' but missing"
+    ]
+    # Before VERIFIED the attestation does not exist yet, so nothing is implied.
+    prepared = _seed_dict(ReplanStage.PREPARED)
+    del prepared["attested_unique_constraints"]
+    del prepared["attested_findings_considered"]
+    assert ReplanTransaction.from_dict(prepared).journal_defects == []
+
+
+def test_r5f1_a_prepared_journal_missing_rendered_findings_never_renders_the_prompt(
+    tmp_state_dir,
+):
+    """Without the rendering the prompt would carry the pre-execution placeholder
+    instead of the persisted cross-round findings; the journal is refused
+    before the prompt is built, so the agent never sees that prompt."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.PREPARED, marker=False)
+    del eng.state.replan_transaction["rendered_findings"]
+    eng.save()
+    assert eng.step().next_phase == "BLOCKED"
+    assert "rendered_findings is required at stage 'prepared'" in eng.state.block_reason
+    assert eng.provider.calls == []
+    _assert_source_untouched(eng, gh)
+
+
+def test_r5f1_the_prepare_step_refuses_evidence_that_collects_to_nothing(tmp_state_dir):
+    """The write side of the same rule: a PREPARED journal must carry a non-zero
+    evidence count, so the controller never writes one. A history whose
+    needs-fix rounds record no finding was not written by a review (the review
+    invariant ties needs_fix to findings > 0) and has nothing a replacement
+    could be required to acknowledge."""
+    gh = FakeGitHub()
+    eng = make_engine(tmp_state_dir, ["must not run"], github=gh)
+    gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2])
+    eng.state.phase = Phase.REPLAN_REEXECUTE
+    eng.state.current_issue_url = ISSUE
+    eng.state.current_pr_url = PR
+    eng.state.current_branch = BRANCH
+    eng.state.current_head_sha = SHA_A
+    eng.state.review_round = 1
+    eng.state.review_history = _history([0])  # needs_fix, finding_count 0, complete
+    eng.state.replan_transaction = _seed_txn(ReplanStage.PENDING).to_dict()
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert "records no actionable finding" in eng.state.block_reason
+    assert eng.provider.calls == []
+    txn = _txn(eng)
+    assert txn.stage is ReplanStage.REJECTED and txn.transaction_id == ""
+    _assert_source_untouched(eng, gh)
+
+
+def test_r5f1_the_prepare_step_refuses_a_listing_that_lost_the_source(tmp_state_dir):
+    """The snapshot is checkpointed as non-empty (it holds the source, which was
+    just read as OPEN); a listing without it was taken after the source moved,
+    and is refused rather than written as a journal a resume would call corrupt."""
+    gh = FakeGitHub()
+    eng = make_engine(tmp_state_dir, ["must not run"], github=gh)
+    gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2])
+    gh.list_open_prs = lambda repo, limit=100, *, strict=False: []  # type: ignore[method-assign]
+    eng.state.phase = Phase.REPLAN_REEXECUTE
+    eng.state.current_issue_url = ISSUE
+    eng.state.current_pr_url = PR
+    eng.state.current_branch = BRANCH
+    eng.state.current_head_sha = SHA_A
+    eng.state.review_round = 20
+    eng.state.review_history = _history([3] * 20)
+    eng.state.replan_transaction = _seed_txn(ReplanStage.PENDING).to_dict()
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert "missing from the open pull-request listing" in eng.state.block_reason
+    assert eng.provider.calls == []
+    txn = _txn(eng)
+    assert txn.stage is ReplanStage.REJECTED and txn.transaction_id == ""
+    _assert_source_untouched(eng, gh)
+
+
+def test_r5f1_every_journal_the_controller_writes_loads_complete(tmp_state_dir):
+    """Round trip through the real lifecycle: every field the table requires at
+    a stage is one that stage's writer fills, so a journal the controller
+    wrote is never called corrupt by its own resume. Each persisted journal is
+    captured as it is saved and reloaded through ``from_dict``."""
+    from autoforge.replan_txn import present_fields_at, required_fields_at
+
+    gh = FakeGitHub()
+    eng = _park_at_hard_threshold(tmp_state_dir, gh, _replan_agent(gh))
+    saved: list[dict] = []
+    real_save = eng._save_replan_txn
+
+    def capture(txn):
+        real_save(txn)
+        saved.append(dict(eng.state.replan_transaction))
+
+    eng._save_replan_txn = capture  # type: ignore[method-assign]
+    assert eng.step().next_phase == "REPLAN_REEXECUTE"
+    saved.append(dict(eng.state.replan_transaction))  # PENDING, written by REVIEW
+    assert eng.step().next_phase == "REVIEW"
+    stages = [ReplanTransaction.from_dict(d).stage for d in saved]
+    assert stages[0] is ReplanStage.PENDING
+    assert {ReplanStage.PREPARED, ReplanStage.VERIFIED, ReplanStage.SUPERSEDED} <= set(stages)
+    for data in saved:
+        journal = ReplanTransaction.from_dict(data)
+        assert journal.journal_defects == [], data
+        for name in present_fields_at(journal.stage):
+            assert name in data, (journal.stage, name)
+        for name in required_fields_at(journal.stage):
+            assert data.get(name), (journal.stage, name)
+    prepared = next(d for d in saved if d["stage"] == ReplanStage.PREPARED.value)
+    assert prepared["evidence_finding_count"] >= 1 and prepared["source_review_round"] == 20
+    assert PR in prepared["preexisting_pr_urls"]
+    assert "R20-F1" in prepared["rendered_findings"]
+    assert prepared["rendered_verification_failures"] == "(none)"
