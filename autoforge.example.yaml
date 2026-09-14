@@ -180,6 +180,13 @@ review:
     # Findings at or beyond this round always trigger a replan.
     # Must not exceed workflow.max_review_rounds.
     hard_threshold: 20
+    # Window rule, from soft_threshold: this many trailing review rounds with
+    # findings, each holding at most max_findings_per_round, trigger a replan.
+    # It deliberately counts rounds of entirely new findings too (no recurring
+    # resolution is required): recurrence is what workflow.stagnation_* detects
+    # and that verdict already triggers a replan from the same round, so this
+    # rule is for the long tail of small, fresh findings that never ends.
+    # Below soft_threshold such rounds are progress and only meet the cap.
     stagnation_window: 3
     max_findings_per_round: 2
     # Fresh reimplementations after the initial attempt. Reaching this limit

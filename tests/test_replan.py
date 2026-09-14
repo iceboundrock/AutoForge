@@ -18,6 +18,7 @@ from autoforge.loop_guard import (
     MAX_PERSISTED_FINDINGS_PER_ROUND,
     RESULT_NEEDS_FIX,
     review_record,
+    stagnation_reason,
 )
 from autoforge.replan import (
     HistoricalReviewCollector,
@@ -4154,3 +4155,166 @@ def test_r7f1_an_unreadable_stage_in_a_protocol_1_journal_is_still_a_refusal(tmp
     assert "unreadable stage 7" in str(info.value)
     assert "cannot be determined from local state" in str(info.value)
     assert eng.provider.calls == [] and gh.closed_prs == []
+
+
+# =============================================================================
+# #36 follow-up: trigger semantics (F3), budget idempotence (F4), step
+# accounting (T2)
+# =============================================================================
+
+
+def test_f3_the_window_rule_deliberately_counts_rounds_of_entirely_new_findings():
+    """F3: the soft-threshold window rule is the long-tail trigger.
+
+    ``_history`` gives every round findings nobody asked for before, so the
+    ``workflow.stagnation_*`` rules (which need a recurrence) see progress
+    here. The window rule still escalates from ``soft_threshold`` on: it is
+    scoped to exactly this trickle, and the threshold -- not a recurrence --
+    is what keeps an early productive loop out of it.
+    """
+    config = ReplanConfig()
+    history = _history([5] * (config.soft_threshold - 3) + [2, 1, 2])
+    assert stagnation_reason(history, 2, 3) == ""  # all-new findings are progress there
+    decision = evaluate_replan_policy(
+        has_actionable_findings=True,
+        current_review_round=config.soft_threshold,
+        review_history=history,
+        escalation_count=0,
+        config=config,
+    )
+    assert decision.action == "replan" and decision.reason == "stagnation_after_soft_threshold"
+    assert decision.metadata is not None
+    assert decision.metadata["recent_finding_counts"] == [2, 1, 2]
+    # The same tail one round before the threshold is bounded by the cap only.
+    early = evaluate_replan_policy(
+        has_actionable_findings=True,
+        current_review_round=config.soft_threshold - 1,
+        review_history=history[:-1],
+        escalation_count=0,
+        config=config,
+    )
+    assert early.action == "continue_fix"
+
+
+def test_f4_activation_counts_the_replan_budget_once_per_transaction(tmp_state_dir):
+    """F4: replaying one durable SUPERSEDED transaction moves no counter twice.
+
+    The run binding already refuses the replay at the reducer's entry (W9);
+    this drives the activation itself a second time over the same journal,
+    so the idempotence does not depend on that refusal.
+    """
+    gh = FakeGitHub()
+    eng, txn = _seeded_engine(
+        tmp_state_dir, gh, ReplanStage.SUPERSEDED, superseded_at="2026-01-01T00:00:00+00:00"
+    )
+    gh.prs[PR].state = "CLOSED"
+    assert eng.step().next_phase == "REVIEW"
+    assert eng.state.execution_attempt == txn.expected_execution_attempt == 2
+    assert eng.state.escalation_count == 1
+    assert [item["transaction_id"] for item in eng.state.superseded_prs] == [TXN_ID]
+
+    eng.state.phase = Phase.REPLAN_REEXECUTE
+    assert eng._activate_replacement(txn).next_phase == "REVIEW"
+    assert eng.state.execution_attempt == 2 and eng.state.escalation_count == 1
+    assert [item["transaction_id"] for item in eng.state.superseded_prs] == [TXN_ID]
+    assert eng.state.current_pr_url == REPLACEMENT_PR and eng.state.review_round == 0
+    persisted = load_state(eng.paths.state_file)
+    assert persisted.execution_attempt == 2 and persisted.escalation_count == 1
+    assert len(persisted.superseded_prs) == 1
+
+
+def test_t2_replan_steps_consume_the_cumulative_step_budget(tmp_state_dir):
+    """T2: the REVIEW that decides a replan and the replan step each count."""
+    gh = FakeGitHub()
+    eng = _park_at_hard_threshold(tmp_state_dir, gh, _replan_agent(gh))
+    eng.state.step_count = 7
+    assert eng.step().next_phase == "REPLAN_REEXECUTE"
+    assert eng.state.step_count == 8
+    assert eng.step().next_phase == "REVIEW"
+    assert eng.state.step_count == 9
+    assert load_state(eng.paths.state_file).step_count == 9
+
+
+def test_t2_the_step_budget_blocks_replan_before_the_agent_or_the_journal_moves(tmp_state_dir):
+    """T2: `max_total_steps` is checked before a replan step does anything."""
+    gh = FakeGitHub()
+    eng = _park_at_hard_threshold(tmp_state_dir, gh, _replan_agent(gh))
+    assert eng.step().next_phase == "REPLAN_REEXECUTE"
+    assert _txn(eng).stage is ReplanStage.PENDING
+    steps = eng.state.step_count
+    eng.config.workflow.max_total_steps = steps
+    calls_before = len(eng.provider.calls)
+
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert f"workflow.max_total_steps={steps}" in eng.state.block_reason
+    assert "not reset by 'resume'" in eng.state.block_reason
+    assert len(eng.provider.calls) == calls_before  # the replan agent never ran
+    # Nothing executed: the step did not count and the journal is exactly as
+    # the review left it -- PENDING, with no transaction id created.
+    persisted = load_state(eng.paths.state_file)
+    assert persisted.step_count == steps and persisted.phase == Phase.BLOCKED
+    journal = ReplanTransaction.from_dict(persisted.replan_transaction)
+    assert journal.stage is ReplanStage.PENDING and journal.transaction_id == ""
+    _assert_source_untouched(eng, gh)
+    assert eng.state.review_round == 20 and len(eng.state.review_history) == 20
+
+
+def _replan_agent_that_fails(gh, stdout):
+    """REVIEW at the hard threshold, then a replan invocation whose output is ``stdout``."""
+
+    def agent(req):
+        if req.phase == "REVIEW":
+            gh.add_comment(PR, 120, review_comment_body(20, SHA_A, True, ["R20-F1"]))
+            return block(_trigger_review_payload())
+        assert req.phase == "REPLAN_REEXECUTE", req.phase
+        return stdout
+
+    return agent
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["agent_failure", "malformed_result", "verification_refusal"],
+)
+def test_t2_a_failed_replan_leaves_the_review_accounting_untouched(tmp_state_dir, failure):
+    """T2: a replan that does not complete consumes a step and nothing else.
+
+    Mirrors the REVIEW rule that a failed invocation consumes no review round:
+    `review_round`, `review_history`, `escalation_count` and
+    `execution_attempt` are exactly what the deciding review left, and the
+    source PR is still open.
+    """
+    gh = FakeGitHub()
+    if failure == "agent_failure":
+        payload = {"phase": "REPLAN_REEXECUTE", "status": "failure", "message": "tests fail"}
+        agent = _replan_agent_that_fails(gh, block(payload))
+    elif failure == "malformed_result":
+        agent = _replan_agent_that_fails(gh, "no control block at all")
+    else:
+        agent = _replan_agent(gh, marker_over={"tests_passed": False})
+    eng = _park_at_hard_threshold(tmp_state_dir, gh, agent)
+    eng.config.execution.max_correction_attempts = 0
+    assert eng.step().next_phase == "REPLAN_REEXECUTE"
+    assert eng.state.review_round == 20 and len(eng.state.review_history) == 20
+    assert eng.state.execution_attempt == 1 and eng.state.escalation_count == 0
+    steps = eng.state.step_count
+
+    if failure == "agent_failure":
+        out = eng.step()
+        assert out.next_phase == "FAILED" and "tests fail" in eng.state.block_reason
+    elif failure == "malformed_result":
+        with pytest.raises(ControlResultValidationError):
+            eng.step()
+        assert eng.state.phase == Phase.REPLAN_REEXECUTE  # resumable, not laundered
+    else:
+        out = eng.step()
+        assert out.next_phase == "BLOCKED" and "tests_passed=false" in eng.state.block_reason
+        assert _txn(eng).stage is ReplanStage.REJECTED
+
+    persisted = load_state(eng.paths.state_file)
+    assert persisted.step_count == steps + 1  # the attempt itself is a step
+    assert persisted.review_round == 20 and len(persisted.review_history) == 20
+    assert persisted.execution_attempt == 1 and persisted.escalation_count == 0
+    assert persisted.superseded_prs == [] and persisted.current_pr_url == PR
+    assert gh.prs[PR].state == "OPEN" and gh.closed_prs == []

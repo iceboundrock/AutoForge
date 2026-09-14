@@ -51,6 +51,19 @@ def evaluate_replan_policy(
     documented BLOCKED. Below the threshold this returns ``continue_fix`` and
     the caller's ordinary loop bounds (cap / stagnation -> BLOCKED) apply
     unchanged; at or above it, sustained non-convergence escalates to a replan.
+
+    The window rule (``stagnation_window`` trailing rounds with findings, each
+    holding at most ``max_findings_per_round`` of them) deliberately counts
+    rounds of *entirely new* findings. Unlike ``workflow.stagnation_*`` it
+    requires no recurring ``required_resolution``: recurrence is what those
+    rules already detect, and their verdict arrives here as
+    ``workflow_stagnation_reason``, so a recurrence requirement would leave
+    this rule nothing of its own to catch. Its purpose is the long tail -- an
+    implementation that, ``soft_threshold`` rounds in, still draws a small
+    but never-ending trickle of fresh findings from every review. Below the
+    threshold such rounds are progress bounded by the round cap only, exactly
+    as the workflow rules treat them; the threshold, not a recurrence, is
+    what protects a productive loop from being replaced.
     """
     if not has_actionable_findings or not config.enabled:
         return ReplanDecision("continue_fix")

@@ -3775,9 +3775,24 @@ class ControllerEngine:
         return self._activate_replacement(txn)
 
     def _activate_replacement(self, txn: ReplanTransaction) -> StepOutcome:
-        """Make the verified replacement the current implementation (idempotent)."""
+        """Make the verified replacement the current implementation (idempotent).
+
+        The supersede is recorded once per transaction id, and the replan
+        budget (``escalation_count``) and ``execution_attempt`` move together
+        with that record, never on their own: a replay of the same durable
+        ``SUPERSEDED`` transaction installs the same replacement again but
+        counts it once, as the merge counter counts a merged PR once. The run
+        binding refuses such a replay before it reaches here (the journal's
+        source is no longer the run's PR); this keeps the activation itself
+        idempotent instead of relying on that.
+        """
         state = self._require_state()
-        if not any(item.get("pr_url") == txn.source_pr_url for item in state.superseded_prs):
+        already_counted = any(
+            item.get("transaction_id") == txn.transaction_id for item in state.superseded_prs
+        )
+        if not already_counted:
+            state.execution_attempt += 1
+            state.escalation_count += 1
             state.superseded_prs.append(
                 {
                     "pr_url": txn.source_pr_url,
@@ -3805,8 +3820,6 @@ class ControllerEngine:
         state.last_review_comment_url = ""
         state.last_review_result = ""
         state.last_review_needs_fix = None
-        state.execution_attempt += 1
-        state.escalation_count += 1
         state.replan_transaction = {}
         validate_transition(Phase.REPLAN_REEXECUTE, Phase.REVIEW)
         state.phase = Phase.REVIEW
