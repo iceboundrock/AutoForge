@@ -4185,15 +4185,21 @@ def test_f3_the_window_rule_deliberately_counts_rounds_of_entirely_new_findings(
     assert decision.action == "replan" and decision.reason == "stagnation_after_soft_threshold"
     assert decision.metadata is not None
     assert decision.metadata["recent_finding_counts"] == [2, 1, 2]
-    # The same tail one round before the threshold is bounded by the cap only.
+    # The same tail, every round within `max_findings_per_round`, one round
+    # before the threshold: the count gate would pass it, so the threshold
+    # alone is what keeps this loop bounded by the round cap only. (Not
+    # ``history[:-1]``, whose tail ``[5, 2, 1]`` already fails the count gate.)
+    early_history = _history([5] * (config.soft_threshold - 4) + [2, 1, 2])
+    assert [r["finding_count"] for r in early_history[-3:]] == [2, 1, 2]
+    assert stagnation_reason(early_history, 2, 3) == ""
     early = evaluate_replan_policy(
         has_actionable_findings=True,
         current_review_round=config.soft_threshold - 1,
-        review_history=history[:-1],
+        review_history=early_history,
         escalation_count=0,
         config=config,
     )
-    assert early.action == "continue_fix"
+    assert early.action == "continue_fix" and early.metadata is None
 
 
 def test_f4_activation_counts_the_replan_budget_once_per_transaction(tmp_state_dir):
