@@ -27,6 +27,21 @@ def test_same_target_ignores_owner_and_repo_casing():
     assert a.canonical != parse_issue_url("https://github.com/OWNER/Repo/issues/23").canonical
 
 
+def test_identity_is_the_key_same_target_compares():
+    """A set keyed by ``identity`` applies exactly the rule ``same_target`` does,
+    so a membership test and a pairwise comparison cannot drift apart."""
+    a = parse_pr_url("https://github.com/owner/repo/pull/42")
+    b = parse_pr_url("https://github.com/OWNER/Repo/pull/42")
+    assert a.identity == b.identity == ("pr", "owner", "repo", 42)
+    assert a.same_target(b) and b.identity in {a.identity}
+    for other in (
+        parse_pr_url("https://github.com/owner/repo/pull/43"),
+        parse_pr_url("https://github.com/other/repo/pull/42"),
+        parse_issue_url("https://github.com/owner/repo/issues/42"),
+    ):
+        assert a.same_target(other) is (a.identity == other.identity) is False
+
+
 def test_issue_and_pr_refs():
     i = parse_issue_url("https://github.com/Owner/Repo/issues/12")
     assert isinstance(i, GitHubIssueRef)

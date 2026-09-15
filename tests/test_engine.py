@@ -205,6 +205,19 @@ def test_analyze_head_sha_mismatch_rejected(tmp_state_dir, fake_github):
     assert eng.state.current_pr_url == ""  # never entered REVIEW
 
 
+def test_analyze_issue_claim_is_compared_by_identity_not_url_string(tmp_state_dir, fake_github):
+    """Issue #37 N1: `Owner/REPO` names the run's repository as GitHub sees it."""
+    payload = dict(ANALYZE_OK, issue_url="https://github.com/Owner/REPO/issues/2")
+    eng = make_engine(tmp_state_dir, [block(payload)], github=fake_github)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    eng.provider._handler = lambda req: (
+        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2]),
+        block(payload),
+    )[1]
+    assert eng.step().next_phase == "REVIEW"
+    assert eng.state.current_issue_url == ISSUE  # the run's own spelling is kept
+
+
 def test_analyze_issue_repo_mismatch_rejected(tmp_state_dir, fake_github):
     payload = dict(ANALYZE_OK, issue_url="https://github.com/other/repo/issues/2")
     eng = make_engine(tmp_state_dir, [block(payload)], github=fake_github)
@@ -349,6 +362,16 @@ def test_review_comment_on_other_pr_rejected(tmp_state_dir):
     eng = _in_review(tmp_state_dir, gh, [block(payload)])
     with pytest.raises(VerificationError, match="does not belong"):
         eng.step()
+
+
+def test_review_comment_on_a_case_variant_of_the_pr_belongs_to_it(tmp_state_dir):
+    """Issue #37 N1: the comment's parent PR is compared by identity, not URL text."""
+    gh = FakeGitHub()
+    gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
+    payload = review_payload(1, SHA_A, [])
+    payload["review_comment_url"] = comment_url("https://github.com/Owner/REPO/pull/42", 100)
+    eng = _in_review(tmp_state_dir, gh, [block(payload)])
+    assert eng.step().next_phase == "READY_FOR_MERGE"
 
 
 def test_review_wrong_reviewed_sha_rejected(tmp_state_dir):
@@ -516,6 +539,20 @@ def test_fix_follow_up_issue_missing_rejected(tmp_state_dir):
     ]
     eng = _in_fix(tmp_state_dir, gh, [block(fix_payload(SHA_A, SHA_A, res))])
     with pytest.raises(VerificationError, match="does not exist"):
+        eng.step()
+
+
+def test_fix_follow_up_on_a_case_variant_of_the_current_issue_is_self_reference(tmp_state_dir):
+    """Issue #37 N1: `Owner/REPO/issues/2` *is* the current issue; it must not slip
+    past the self-reference check by spelling."""
+    gh = FakeGitHub()
+    variant = "https://github.com/Owner/REPO/issues/2"
+    gh.add_issue(variant, "the same issue")
+    res = [
+        {"finding_id": "R1-F1", "resolution": "follow_up_created", "follow_up_issue_url": variant}
+    ]
+    eng = _in_fix(tmp_state_dir, gh, [block(fix_payload(SHA_A, SHA_A, res))])
+    with pytest.raises(VerificationError, match="points at the current issue itself"):
         eng.step()
 
 

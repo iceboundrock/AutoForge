@@ -92,7 +92,18 @@ def resolution_digests(findings: list[dict]) -> list[str]:
 
 
 def _retained_finding(finding: dict) -> tuple[dict, bool]:
-    """The persisted summary of ``finding`` plus whether its text was clipped."""
+    """The persisted summary of ``finding`` plus whether its text was clipped.
+
+    Only ``id``, ``classification`` and ``required_resolution`` are kept. A
+    finding's ``title``, ``location`` and any other field the reviewer
+    supplied are dropped *by design* and that is not truncation: the
+    persisted evidence exists so a replan can show the replacement agent
+    every demand the reviews made, and the demand is the
+    ``required_resolution`` text. So "complete" in
+    :func:`round_evidence_is_complete` means *complete resolutions* -- every
+    finding retained and none of their resolution texts clipped -- never a
+    verbatim copy of the review comment, which stays on GitHub.
+    """
     text = str(finding.get("required_resolution", ""))
     clipped = text[:MAX_REQUIRED_RESOLUTION_CHARS]
     return (
@@ -107,6 +118,11 @@ def _retained_finding(finding: dict) -> tuple[dict, bool]:
 
 def round_evidence_is_complete(record: dict) -> bool:
     """True when ``record`` holds a complete copy of its round's findings.
+
+    "Complete" means complete *resolutions*: every finding of the round is
+    retained and no ``required_resolution`` text was clipped. The retained
+    summary never carries a finding's ``title`` or ``location`` (see
+    :func:`_retained_finding`), and their absence is not truncation.
 
     Only rounds that ended with findings carry evidence a replacement must
     consider; clean and stale rounds are trivially complete. The length

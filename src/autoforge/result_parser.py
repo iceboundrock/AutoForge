@@ -389,7 +389,7 @@ class ReplanReexecuteResult:
         ph = "REPLAN_REEXECUTE"
         previous_pr = _req_url(p, "previous_pr_url", ph, "pr")
         replacement_pr = _req_url(p, "replacement_pr_url", ph, "pr")
-        if parse_pr_url(previous_pr).canonical == parse_pr_url(replacement_pr).canonical:
+        if parse_pr_url(previous_pr).same_target(parse_pr_url(replacement_pr)):
             raise ControlResultValidationError(
                 "REPLAN_REEXECUTE: replacement_pr_url must differ from previous_pr_url"
             )

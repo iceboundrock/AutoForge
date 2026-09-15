@@ -48,6 +48,18 @@ class GitHubRef:
     def canonical(self) -> str:
         return f"https://github.com/{self.owner}/{self.repo}/{self._path_segment}/{self.number}"
 
+    @property
+    def identity(self) -> tuple[str, str, str, int]:
+        """The issue / PR as GitHub identifies it: kind, owner, repo, number.
+
+        Owner and repository are folded to lower case because GitHub treats
+        them case-insensitively. This is the one definition of identity:
+        :meth:`same_target` compares it, and a set or dict keyed by it (a
+        snapshot of PRs, a membership check) applies the same rule as a
+        pairwise comparison, so the two can never drift.
+        """
+        return (self.kind, self.owner.lower(), self.repo.lower(), self.number)
+
     def same_repository(self, other: GitHubRef | str) -> bool:
         other_repo = other if isinstance(other, str) else other.repository
         return self.repository.lower() == other_repo.strip().lower()
@@ -58,11 +70,9 @@ class GitHubRef:
         GitHub owner and repository names are case-insensitive, so
         ``.../Owner/Repo/issues/23`` and ``.../owner/repo/issues/23`` are the
         same issue although their canonical URLs differ. Identity checks must
-        use this, never a string comparison of URLs.
+        use this (or :attr:`identity`), never a string comparison of URLs.
         """
-        return (
-            self.kind == other.kind and self.same_repository(other) and self.number == other.number
-        )
+        return self.identity == other.identity
 
 
 @dataclass(frozen=True)
@@ -95,6 +105,28 @@ class GitHubCommentRef:
 
 # Backwards-compatible alias used by Phase-1 callers/tests.
 ParsedURL = GitHubRef
+
+
+def same_issue_url(observed: str, expected: str) -> bool:
+    """Issue identity as GitHub sees it, never vacuous: an unusable URL matches nothing.
+
+    Agent-claimed and persisted URLs are compared with this, never by string
+    equality of their canonical forms: the canonical form keeps the owner and
+    repository spelling its author used, and GitHub treats ``Owner/Repo`` and
+    ``owner/repo`` as one repository (see :meth:`GitHubRef.same_target`).
+    """
+    try:
+        return parse_issue_url(observed).same_target(parse_issue_url(expected))
+    except ConfigurationError:
+        return False
+
+
+def same_pr_url(observed: str, expected: str) -> bool:
+    """PR identity as GitHub sees it (see :func:`same_issue_url`)."""
+    try:
+        return parse_pr_url(observed).same_target(parse_pr_url(expected))
+    except ConfigurationError:
+        return False
 
 
 def _split(url: str):

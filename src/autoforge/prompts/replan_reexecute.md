@@ -108,13 +108,13 @@ AutoForge has determined that continuing the existing implementation is no longe
 Typical trigger:
 
 ```text
-review_round > configured threshold
+review_round >= configured threshold
 ```
 
 For example:
 
 ```text
-review_round > 20
+review_round >= 20
 ```
 
 with additional strong evidence such as:
