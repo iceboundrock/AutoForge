@@ -28,6 +28,12 @@ from autoforge.github import (
 )
 from autoforge.loop_guard import RESULT_NEEDS_FIX, review_record
 from autoforge.providers import AgentExecutionResult, ScriptedProvider
+from autoforge.result_parser import (
+    MAX_FINDING_LOCATION_CHARS,
+    MAX_FINDING_RESOLUTION_CHARS,
+    MAX_FINDING_TITLE_CHARS,
+    MAX_FINDINGS_PER_REVIEW,
+)
 from autoforge.state import load_state
 from autoforge.transitions import Phase
 from tests.conftest import (
@@ -2751,3 +2757,95 @@ def test_dry_run_plan_reports_loop_bounds(tmp_state_dir, fake_github):
     assert "would enter BLOCKED without executing" in notes and "max_total_steps=10" in notes
     assert "review round 3 of at most 2" in notes
     assert eng.state.phase == Phase.REVIEW and not eng.paths.state_file.exists()
+
+
+# -- REVIEW payload bounds (#34) -------------------------------------------------------
+def _oversized_review(rnd: int, sha: str, cid: int = 100) -> dict:
+    findings = [_finding(rnd, n) for n in range(1, MAX_FINDINGS_PER_REVIEW + 2)]
+    return review_payload(rnd, sha, findings, cid=cid)
+
+
+def test_oversized_review_is_rejected_and_corrected(tmp_state_dir, fake_github):
+    """Too many findings: the round is refused whole and the reviewer re-emits."""
+    ids = [f"R1-F{n}" for n in range(1, MAX_FINDINGS_PER_REVIEW + 2)]
+
+    def agent(req):
+        fake_github.add_comment(PR, 100, review_comment_body(1, SHA_A, True, ids[:1]))
+        if not req.correction:
+            return block(_oversized_review(1, SHA_A))
+        return block(review_payload(1, SHA_A, [_finding(1, 1)]))
+
+    eng = _in_review(tmp_state_dir, fake_github, agent)
+    out = eng.step()
+    assert out.next_phase == "FIX"
+    assert len(eng.provider.calls) == 2
+    second = eng.provider.calls[1]
+    assert second.correction is True
+    assert f"at most {MAX_FINDINGS_PER_REVIEW} per review round" in second.prompt
+    assert [f["id"] for f in eng.state.open_findings] == ["R1-F1"]
+    assert eng.state.review_round == 1
+
+
+def test_oversized_resolution_never_reaches_state_or_a_prompt(tmp_state_dir, fake_github):
+    """One finding past the text bound is refused; state and its file are untouched."""
+    huge = ("resolve everything " * 200).strip()  # far past MAX_FINDING_RESOLUTION_CHARS
+    assert len(huge) > MAX_FINDING_RESOLUTION_CHARS
+    fake_github.add_comment(PR, 100, review_comment_body(1, SHA_A, True, ["R1-F1"]))
+    payload = review_payload(1, SHA_A, [dict(_finding(1, 1), required_resolution=huge)])
+    eng = _in_review(tmp_state_dir, fake_github, [block(payload)])
+    eng.config.execution.max_correction_attempts = 0
+    eng._save()
+    before = eng.paths.state_file.read_bytes()
+
+    with pytest.raises(ControlResultValidationError) as excinfo:
+        eng.step()
+    msg = str(excinfo.value)
+    assert f"is {len(huge)} characters" in msg
+    assert f"at most {MAX_FINDING_RESOLUTION_CHARS}" in msg
+    assert "resolve everything" not in msg  # size, never the text
+
+    after = load_state(eng.paths.state_file)
+    assert after.phase == Phase.REVIEW and after.review_round == 0
+    assert after.open_findings == [] and after.review_history == []
+    # The only differences on disk are the counters of the refused launch.
+    persisted = json.loads(eng.paths.state_file.read_bytes())
+    for volatile in ("updated_at",):
+        persisted.pop(volatile)
+    expected = json.loads(before) | {"attempt": 1, "step_count": 1}
+    expected.pop("updated_at")
+    assert persisted == expected
+    assert "resolve everything" not in eng.paths.state_file.read_text()
+    eng.state.phase = Phase.FIX
+    assert "resolve everything" not in eng.render_prompt_for(Phase.FIX)
+
+
+def test_fix_prompt_size_is_bounded_by_the_review_bounds(tmp_state_dir, fake_github):
+    """The largest round the parser accepts renders into a FIX prompt of bounded size."""
+    from autoforge.result_parser import ReviewResult
+
+    findings = [
+        dict(
+            _finding(1, n),
+            required_resolution="r" * MAX_FINDING_RESOLUTION_CHARS,
+            title="t" * MAX_FINDING_TITLE_CHARS,
+            location="l" * MAX_FINDING_LOCATION_CHARS,
+        )
+        for n in range(1, MAX_FINDINGS_PER_REVIEW + 1)
+    ]
+    accepted = ReviewResult.from_payload(review_payload(1, SHA_A, findings))
+    eng = _in_review(tmp_state_dir, fake_github, [])
+    eng.state.phase = Phase.FIX
+    eng.state.review_round = 1
+    eng.state.reviewed_head_sha = SHA_A
+    eng.state.open_findings = []
+    empty = len(eng.render_prompt_for(Phase.FIX))
+    eng.state.open_findings = [f.to_dict() for f in accepted.findings]
+    full = eng.render_prompt_for(Phase.FIX)
+    per_finding_text = (
+        MAX_FINDING_RESOLUTION_CHARS + MAX_FINDING_TITLE_CHARS + MAX_FINDING_LOCATION_CHARS
+    )
+    # Every finding contributes its bounded text plus a small fixed framing
+    # (id, classification, separators); nothing is unbounded.
+    framing = 64
+    assert len(full) - empty <= MAX_FINDINGS_PER_REVIEW * (per_finding_text + framing)
+    assert full.count("\n- R1-F") == MAX_FINDINGS_PER_REVIEW  # one rendered line per finding

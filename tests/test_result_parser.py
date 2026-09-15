@@ -4,10 +4,15 @@ import json
 
 import pytest
 
+from autoforge import loop_guard
 from autoforge.errors import ControlResultError, ControlResultValidationError
 from autoforge.result_parser import (
     BEGIN,
     END,
+    MAX_FINDING_LOCATION_CHARS,
+    MAX_FINDING_RESOLUTION_CHARS,
+    MAX_FINDING_TITLE_CHARS,
+    MAX_FINDINGS_PER_REVIEW,
     AnalyzeExecuteResult,
     Finding,
     FixResult,
@@ -441,3 +446,137 @@ def test_every_optional_string_field_accepts_a_string(label, phase, mode, build)
 )
 def test_every_optional_string_field_treats_null_as_absent(label, phase, mode, build):
     parse_control_result(build(None), phase, _mode(mode))
+
+
+# -- REVIEW payload bounds (#34) -------------------------------------------------
+# Review output is untrusted, and every accepted finding is persisted whole in
+# ``state.open_findings`` and rendered whole into the FIX prompt. The parser
+# bounds the payload and *rejects* an oversized one (correctable: the reviewer
+# re-emits) rather than clipping it (which would silently drop the work the
+# FIX round has to act on).
+
+
+def _review_with(findings: list[dict], mode: str) -> tuple[str, WorkflowMode]:
+    if mode == "REMOTE":
+        return block(
+            dict(GOOD_REVIEW, needs_fix_round=True, findings=findings)
+        ), WorkflowMode.REMOTE
+    return _local_review_block(findings), WorkflowMode.LOCAL
+
+
+def _local_review_block(findings: list[dict]) -> str:
+    return block(
+        {
+            "phase": "REVIEW",
+            "status": "success",
+            "round": 1,
+            "reviewed_workspace_fingerprint": "a" * 64,
+            "needs_fix_round": True,
+            "findings": findings,
+        }
+    )
+
+
+@pytest.mark.parametrize("mode", ["REMOTE", "LOCAL"])
+def test_finding_count_is_bounded_and_rejected_whole(mode):
+    at_bound = [_finding(1, n) for n in range(1, MAX_FINDINGS_PER_REVIEW + 1)]
+    stdout, wf_mode = _review_with(at_bound, mode)
+    payload = parse_control_result(stdout, Phase.REVIEW, wf_mode)
+    assert len(payload["findings"]) == MAX_FINDINGS_PER_REVIEW
+
+    over = at_bound + [_finding(1, MAX_FINDINGS_PER_REVIEW + 1)]
+    stdout, wf_mode = _review_with(over, mode)
+    with pytest.raises(ControlResultValidationError) as excinfo:
+        parse_control_result(stdout, Phase.REVIEW, wf_mode)
+    msg = str(excinfo.value)
+    assert f"{MAX_FINDINGS_PER_REVIEW + 1} findings" in msg
+    assert f"at most {MAX_FINDINGS_PER_REVIEW}" in msg
+    assert "re-emit" in msg
+
+
+@pytest.mark.parametrize("mode", ["REMOTE", "LOCAL"])
+def test_finding_count_is_checked_before_any_element_is_parsed(mode):
+    """An oversized list is refused as a list, not element by element."""
+    junk: list = list(range(MAX_FINDINGS_PER_REVIEW + 1))  # not even objects
+    stdout, wf_mode = _review_with(junk, mode)
+    with pytest.raises(ControlResultValidationError, match="findings reported"):
+        parse_control_result(stdout, Phase.REVIEW, wf_mode)
+    # One fewer element and the per-element validation is what speaks.
+    stdout, wf_mode = _review_with(junk[:-1], mode)
+    with pytest.raises(ControlResultValidationError, match=r"findings\[0\] must be an object"):
+        parse_control_result(stdout, Phase.REVIEW, wf_mode)
+
+
+@pytest.mark.parametrize(
+    "key,limit",
+    [
+        ("required_resolution", MAX_FINDING_RESOLUTION_CHARS),
+        ("title", MAX_FINDING_TITLE_CHARS),
+        ("location", MAX_FINDING_LOCATION_CHARS),
+    ],
+)
+@pytest.mark.parametrize("mode", ["REMOTE", "LOCAL"])
+def test_finding_text_fields_are_bounded(key, limit, mode):
+    exact = "x" * limit
+    stdout, wf_mode = _review_with([dict(_finding(1, 1), **{key: exact})], mode)
+    payload = parse_control_result(stdout, Phase.REVIEW, wf_mode)
+    assert payload["findings"][0][key] == exact
+    # The bound applies to the stripped value the controller persists, so
+    # surrounding whitespace does not count against it.
+    stdout, wf_mode = _review_with([dict(_finding(1, 1), **{key: f"\n  {exact}  \n"})], mode)
+    parse_control_result(stdout, Phase.REVIEW, wf_mode)
+
+    over = "y" * (limit + 1)
+    stdout, wf_mode = _review_with([dict(_finding(1, 1), **{key: over})], mode)
+    with pytest.raises(ControlResultValidationError) as excinfo:
+        parse_control_result(stdout, Phase.REVIEW, wf_mode)
+    msg = str(excinfo.value)
+    assert f"R1-F1 field {key!r} is {limit + 1} characters" in msg
+    assert f"at most {limit}" in msg
+    # The rejection names the size, never the text: the message is echoed
+    # into the correction prompt and the run log.
+    assert "yyyy" not in msg
+
+
+def test_oversized_finding_is_rejected_not_clipped():
+    over = "z" * (MAX_FINDING_RESOLUTION_CHARS + 1)
+    with pytest.raises(ControlResultValidationError):
+        ReviewResult.from_payload(
+            dict(
+                GOOD_REVIEW,
+                needs_fix_round=True,
+                findings=[dict(_finding(1, 1), required_resolution=over)],
+            )
+        )
+    with pytest.raises(ControlResultValidationError):
+        Finding.from_payload(dict(_finding(1, 1), required_resolution=over), 1, 0)
+
+
+def test_parser_bounds_never_exceed_the_persisted_evidence_bounds():
+    """A round the parser accepted is always retained complete in history.
+
+    ``loop_guard`` clips persisted evidence and marks the round truncated,
+    which refuses a later replan. With the parser bounds at or below those
+    limits, that marker can only come from state persisted before the parser
+    bounds existed, never from a result the controller itself accepted.
+    """
+    assert MAX_FINDINGS_PER_REVIEW <= loop_guard.MAX_PERSISTED_FINDINGS_PER_ROUND
+    assert MAX_FINDINGS_PER_REVIEW <= loop_guard.MAX_PERSISTED_RESOLUTION_DIGESTS
+    assert MAX_FINDING_RESOLUTION_CHARS <= loop_guard.MAX_REQUIRED_RESOLUTION_CHARS
+    findings = [
+        dict(
+            _finding(1, n),
+            required_resolution="r" * MAX_FINDING_RESOLUTION_CHARS,
+            title="t" * MAX_FINDING_TITLE_CHARS,
+            location="l" * MAX_FINDING_LOCATION_CHARS,
+        )
+        for n in range(1, MAX_FINDINGS_PER_REVIEW + 1)
+    ]
+    res = ReviewResult.from_payload(dict(GOOD_REVIEW, needs_fix_round=True, findings=findings))
+    record = loop_guard.review_record(
+        1, SHA_A, loop_guard.RESULT_NEEDS_FIX, [f.to_dict() for f in res.findings]
+    )
+    assert record["finding_count"] == len(record["findings"]) == MAX_FINDINGS_PER_REVIEW
+    assert "evidence_truncated" not in record
+    assert record["resolutions_truncated"] is False
+    assert loop_guard.truncated_evidence_rounds([record]) == []

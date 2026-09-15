@@ -121,4 +121,11 @@ Read back the comment URL from the `gh pr comment` output.
 - `"needs_fix_round"` must be `true` if and only if `findings` is non-empty.
   The controller rejects results where the two disagree.
 - `"findings"` is an empty list when the PR is clean.
+- Bounds: at most {{MAX_FINDINGS_PER_REVIEW}} findings per round;
+  `required_resolution` at most {{MAX_FINDING_RESOLUTION_CHARS}} characters,
+  `title` at most {{MAX_FINDING_TITLE_CHARS}}, `location` at most
+  {{MAX_FINDING_LOCATION_CHARS}}. A larger result is rejected as a whole and
+  you are asked to re-emit it; the controller never clips findings. Keep each
+  `required_resolution` to what must change, and put anything that does not
+  require action in Observations.
 - On failure to complete the review: `"status": "failure"` plus `"message"`.

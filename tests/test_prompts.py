@@ -96,6 +96,34 @@ def test_review_prompt_contract():
         assert phrase in text, phrase
 
 
+def test_review_prompts_state_the_parser_bounds(engine):
+    """#34: the reviewer is told the exact bounds the parser rejects against."""
+    from autoforge.result_parser import (
+        MAX_FINDING_LOCATION_CHARS,
+        MAX_FINDING_RESOLUTION_CHARS,
+        MAX_FINDING_TITLE_CHARS,
+        MAX_FINDINGS_PER_REVIEW,
+    )
+
+    for template in ("review.md", "local_review.md"):
+        text = prompts.load_template(template)
+        # Template variables, never literal numbers, so the two cannot drift.
+        for var in (
+            "MAX_FINDINGS_PER_REVIEW",
+            "MAX_FINDING_RESOLUTION_CHARS",
+            "MAX_FINDING_TITLE_CHARS",
+            "MAX_FINDING_LOCATION_CHARS",
+        ):
+            assert "{{" + var + "}}" in text, (template, var)
+        assert "never clips findings" in text
+    engine.state.phase = Phase.REVIEW
+    rendered = engine.render_prompt_for(Phase.REVIEW)
+    assert f"at most {MAX_FINDINGS_PER_REVIEW} findings per round" in rendered
+    assert f"`required_resolution` at most {MAX_FINDING_RESOLUTION_CHARS} characters" in rendered
+    assert f"`title` at most {MAX_FINDING_TITLE_CHARS}" in rendered
+    assert f"`location` at most\n  {MAX_FINDING_LOCATION_CHARS}" in rendered
+
+
 def test_fix_prompt_contract():
     text = prompts.load_template("fix.md")
     for phrase in (

@@ -52,6 +52,37 @@ findings=[] and needs_fix_round=true
 findings=[...] and needs_fix_round=false
 ```
 
+### Review payload bounds
+
+Review output is untrusted project data, and every accepted finding is
+persisted in full in `state.open_findings` (a full atomic rewrite of
+`state.json`) and rendered verbatim into the next FIX prompt. The parser
+therefore bounds what a `REVIEW` result may carry (`src/autoforge/result_parser.py`):
+
+```text
+MAX_FINDINGS_PER_REVIEW         findings per review round
+MAX_FINDING_RESOLUTION_CHARS    required_resolution length (after stripping)
+MAX_FINDING_TITLE_CHARS         title length
+MAX_FINDING_LOCATION_CHARS      location length
+```
+
+The failure mode is **rejection, never clipping**: the findings are the work
+the FIX round has to act on, so clipping them would silently drop work,
+whereas a rejected `CONTROL_RESULT` is correctable (the reviewer re-emits a
+bounded result through the ordinary correction retry) and leaves state
+unchanged. The rejection message states the offending size and the limit,
+never the oversized text. The count is checked before any element is parsed.
+
+Each parser bound is at or below the corresponding persisted-evidence bound
+in `loop_guard` (`MAX_PERSISTED_FINDINGS_PER_ROUND`,
+`MAX_PERSISTED_RESOLUTION_DIGESTS`, `MAX_REQUIRED_RESOLUTION_CHARS`), so a
+round the parser accepted is always retained complete in `review_history`;
+the `loop_guard` clipping and its truncation markers remain as a defence for
+state persisted before the parser bounds existed or edited outside the
+controller. The review prompts state the bounds through template variables
+that the engine fills from the same constants, so the number the reviewer is
+told is the number it is held to.
+
 ---
 
 ## Findings versus observations

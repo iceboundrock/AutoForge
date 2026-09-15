@@ -19,6 +19,7 @@ from autoforge.loop_guard import (
     RESULT_NEEDS_FIX,
     review_record,
     stagnation_reason,
+    truncated_evidence_rounds,
 )
 from autoforge.replan import (
     HistoricalReviewCollector,
@@ -39,7 +40,7 @@ from autoforge.replan_txn import (
     scan_replan_markers,
     select_bound_candidate,
 )
-from autoforge.result_parser import parse_control_result
+from autoforge.result_parser import MAX_FINDINGS_PER_REVIEW, parse_control_result
 from autoforge.state import load_state
 from autoforge.transitions import Phase
 from tests.conftest import (
@@ -651,9 +652,14 @@ def test_truncated_round_evidence_refuses_replan_in_policy():
     assert (decision.metadata or {})["truncated_evidence_rounds"] == [8]
 
 
-def test_review_beyond_the_persisted_finding_bound_blocks_instead_of_replanning(tmp_state_dir):
-    """I1 end-to-end: >100 findings cannot supersede the PR that carries them."""
-    finding_ids = [f"R20-F{n}" for n in range(1, MAX_PERSISTED_FINDINGS_PER_ROUND + 2)]
+def test_review_beyond_the_parser_bound_is_refused_before_it_can_be_persisted(tmp_state_dir):
+    """#34: an oversized round is rejected at the parser, so it never marks history.
+
+    The parser bound is at or below the persisted bound, which is why the
+    truncation marker below can only come from state the controller did not
+    itself accept.
+    """
+    finding_ids = [f"R20-F{n}" for n in range(1, MAX_FINDINGS_PER_REVIEW + 2)]
     gh = FakeGitHub()
 
     def agent(req):
@@ -667,13 +673,38 @@ def test_review_beyond_the_persisted_finding_bound_blocks_instead_of_replanning(
         return block(payload)
 
     eng = _park_at_hard_threshold(tmp_state_dir, gh, agent)
+    eng.config.execution.max_correction_attempts = 0
+    with pytest.raises(ControlResultValidationError, match="accepts at most"):
+        eng.step()
+    assert eng.state.phase == Phase.REVIEW and eng.state.review_round == 19
+    assert eng.state.open_findings == []
+    assert len(eng.state.review_history) == 19
+    assert truncated_evidence_rounds(eng.state.review_history) == []
+    _assert_source_untouched(eng, gh)
+
+
+def test_review_beyond_the_persisted_finding_bound_blocks_instead_of_replanning(tmp_state_dir):
+    """I1 end-to-end: a truncated round cannot supersede the PR that carries it.
+
+    Such a round can no longer be produced through the parser (above); it is
+    state persisted before the parser bounds existed, or edited outside the
+    controller. The persisted-evidence guard still refuses to replan on it.
+    """
+    gh = FakeGitHub()
+    eng = _park_at_hard_threshold(tmp_state_dir, gh, _replan_agent(gh))
+    legacy = [
+        {"id": f"R8-F{n}", "classification": "blocked", "required_resolution": f"resolve {n}"}
+        for n in range(1, MAX_PERSISTED_FINDINGS_PER_ROUND + 2)
+    ]
+    eng.state.review_history[7] = review_record(8, SHA_A, RESULT_NEEDS_FIX, legacy)
+    assert eng.state.review_history[7]["evidence_truncated"] is True
     out = eng.step()
 
     assert out.next_phase == "BLOCKED"
     assert "replan_evidence_truncated" in eng.state.block_reason
-    assert "round(s) 20" in eng.state.block_reason
+    assert "round(s) 8" in eng.state.block_reason
     _assert_source_untouched(eng, gh)
-    assert len(eng.state.open_findings) == len(finding_ids)
+    assert len(eng.state.open_findings) == 1
 
     # And a `resume` straight into REPLAN_REEXECUTE cannot launder it: the
     # checkpoint that would authorise a replacement is refused too.
