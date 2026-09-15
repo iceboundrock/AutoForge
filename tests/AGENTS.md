@@ -47,6 +47,4 @@ config, CLI, doctor, CI drift guards  test_config.py, test_cli.py, test_doctor.p
 
 Add a new test next to the behaviour's existing file; create a new file only
 for a new subsystem. Run `make test` (or `uv run pytest tests/<file>`) and
-`make lint`; `make check` runs the same commands as the hosted CI, which
-additionally installs from the lockfile and tests on every interpreter in its
-matrix (`.github/workflows/ci.yml`).
+`make lint`; the full `make check` is what CI runs.

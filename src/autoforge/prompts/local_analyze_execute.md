@@ -34,7 +34,7 @@ working tree. There is no Issue, no branch to create, no PR and no commit.
    acceptance criteria and the failure behaviour of what you changed.
 6. Run the repository's existing tests and lint/typecheck commands where they
    are useful and cheap. Fix what you broke. If the listed validation commands
-   above exist, run them yourself first — the controller will run them again
+   above exist, run them yourself first; the controller will run them again
    and a failure prevents the phase from being accepted.
 7. Leave everything in the working tree. Do not commit, do not push, do not
    switch branches, do not `git stash`, and do not revert changes you did not

@@ -1,16 +1,16 @@
-# ADR 0001 — LOCAL mode: workspace identity and the filesystem boundary
+# ADR 0001. LOCAL mode: workspace identity and the filesystem boundary
 
 - **Status:** accepted, implemented in PR #44 (`feature/local-mode`)
 - **Reviewed PR HEAD:** `3fb17c1a7ca0552cc25b17664569f90cff4c5904`
 - **Base:** `main` (merge-base `316ba0365985b9c99b2d9858a8613462be960f2a`)
 - **Supersedes:** the `git status` fingerprint and the `safeio.py` pathname
-  checks of review rounds 1–4
-- **Amended:** round 6 — §5.4 (state-root inode binding, R6-F1), §5.7 (the
+  checks of review rounds 1 to 4
+- **Amended:** round 6: §5.4 (state-root inode binding, R6-F1), §5.7 (the
   reader policy is frozen with the run, R6-F2), §5.8 (delimiter-safe
-  specification quoting); round 10 — §3 V and §5.10 (REVIEW never binds a
+  specification quoting); round 10: §3 V and §5.10 (REVIEW never binds a
   new fingerprint, R10-F1), §5.4 and §8.10 (the named-temporary window,
   R10-F2), §5.5 (the state file is bounded, R10-F3), §5.4 (the doctor probes
-  through the capability, R10-F4); round 11 — §5.7 (agents and validation
+  through the capability, R10-F4); round 11: §5.7 (agents and validation
   commands run from the contract's repository root, R11-F1), §5.5 (the event
   journal is bounded, R11-F2)
 - **Closes by design:** #46, #47, #48, #49, #50; #45 (see *Compatibility*)
@@ -23,16 +23,16 @@ same two places: *which bytes did the reviewer review*, and *where can the
 controller's own writes land*. Each round was closed with another branch in an
 existing helper, and each fix made the next gap smaller but not less likely.
 
-The question this ADR answers is not "how do the round-5 findings get fixed".
-It is: **what design makes this class of finding stop existing?**
+The question this ADR answers is not how the round-5 findings get fixed, but
+what design makes this class of finding stop existing.
 
 ### 1.1 Historical finding ledger, by root cause
 
 Grouped by the mechanism that produced them, not by the round that found
-them. "Local" means the fix was genuinely about that one entry; "systemic"
-means the finding was a sample of an open-ended set.
+them. "Local" means the fix was about that one entry; "systemic" means the
+finding was a sample of an open-ended set.
 
-#### Class A — workspace identity (the reviewed byte set)
+#### Class A: workspace identity (the reviewed byte set)
 
 | Finding | Round | Symptom | Invariant broken | Previous fix | Kind |
 |---|---|---|---|---|---|
@@ -55,26 +55,26 @@ means the finding was a sample of an open-ended set.
 | R10-F1 | 10 | REVIEW re-bound the fingerprint on every entry, so a reviewer's own (crashed or refused) edit was reviewed as the implementation | Review binding | — | systemic |
 | R11-F1 | 11 | `local.validation_commands` were frozen as argv but launched from the invocation's cwd, so a resume from a subdirectory ran a different `./verify` | Review binding | — | systemic |
 
-Every systemic row has the same cause, and it is one sentence:
+Every systemic row has the same cause:
 
 > **`git status` was used as the enumerator of the filesystem universe.**
 
 `git status --porcelain --untracked-files=all` answers *"what would I commit?"*
-That is a genuinely different question from *"which bytes could the reviewer
-have read?"*, and the gap between them is not a bug list — it is a feature
-list, and git keeps adding to it. Ignored files, `assume-unchanged`,
-`skip-worktree`, `core.fileMode=false`, clean tracked symlinks, submodule
-gitlinks, empty directories: each is a deliberate git feature for *not*
-reporting something, and each one is code a reviewer can read and an agent can
-edit. A design that enumerates them will always be one git feature behind.
+That is a different question from *"which bytes could the reviewer have
+read?"*, and the gap between them is a feature list that git keeps adding to.
+Ignored files, `assume-unchanged`, `skip-worktree`, `core.fileMode=false`,
+clean tracked symlinks, submodule gitlinks and empty directories: each is a
+deliberate git feature for *not* reporting something, and each one is code a
+reviewer can read and an agent can edit. A design that enumerates them will
+always be one git feature behind.
 
 The state-directory rows (R1-F4, R1-F1, F4/#48) are the same error inverted:
 having made git the enumerator, the controller then had to *subtract* its own
-files from git's answer, and it did so by matching **names**. A name is not
+files from git's answer, and it did so by matching names. A name is not
 evidence of authorship. That produced an allowlist of "shapes AutoForge could
-have written", which an agent could simply write into.
+have written", which an agent could write into.
 
-#### Class B — runtime filesystem safety (where controller writes land)
+#### Class B: runtime filesystem safety (where controller writes land)
 
 | Finding | Round | Symptom | Cell of the matrix | Kind |
 |---|---|---|---|---|
@@ -99,16 +99,17 @@ Again one cause:
 > operation, so every fix closed one cell of an
 > (entry kind × path position × operation) matrix.**
 
-The matrix has at least 6 × 3 × 12 cells. Rounds 1–4 closed the cells somebody
-had thought of; round 5 found `parent × symlink` and `final × hardlink`. There
-were more. Worse, a pathname predicate is not even sound for the cell it
-closes: between `lstat(p)` and `open(p)` the name can be re-pointed (#50), and
-four modules had each grown their own private copy of the checks.
+The matrix has at least 6 × 3 × 12 cells. Rounds 1 to 4 closed the cells
+somebody had thought of; round 5 found `parent × symlink` and
+`final × hardlink`, and others remained. Worse, a pathname predicate is not
+sound even for the cell it closes: between `lstat(p)` and `open(p)` the name
+can be re-pointed (#50), and four modules had each grown their own private
+copy of the checks.
 
-#### Classes C, D, E — state machine, secrets, locking
+#### Classes C, D, E: state machine, secrets, locking
 
-These were raised and closed *without* recurring, which is the diagnostic
-signal that they were not of the same kind:
+These were raised and closed *without* recurring, which is the sign that they
+were not of the same kind:
 
 - **C (state/recovery):** R1-F1 (`unresolved` cleared), R1-F2 (resume
   re-invoking a writer after its side effect), R1-F3 (no-commit invariant),
@@ -121,25 +122,25 @@ signal that they were not of the same kind:
   `execution.max_correction_attempts` multiplied it) and R9-F4 (a pending
   checkpoint was validated for shape but not for *whose* it was, so a clean
   REVIEW could close a FIX checkpoint unexamined). Both were closed by naming
-  the fact — every launch is charged before it starts; the checkpoint is
+  the fact: every launch is charged before it starts; the checkpoint is
   resumed only by the phase that wrote it, or kept by a terminal phase.
   Round 10 added R10-F1, which is a Class A row by symptom (a reviewer's own
   edit reviewed as the implementation) and a C row by cause: the fact that
   authorises binding a fingerprint is "the controller verified this tree",
   and REVIEW had been binding one without it (§5.10).
-- **D (secrets):** R1-F5 (r1), F3 (r4) — the journal was serialised from a
+- **D (secrets):** R1-F5 (r1), F3 (r4): the journal was serialised from a
   record that had not been redacted. Fixed once, at the record, not per
   call site. Has not recurred.
-- **E (locking):** R1-F3 (r2/r3) — `local init` wrote without the repository
+- **E (locking):** R1-F3 (r2/r3): `local init` wrote without the repository
   lock. One contract, one entry point added to it. Has not recurred.
 
-#### Class F — run definition (what a resumed process believes the run is)
+#### Class F: run definition (what a resumed process believes the run is)
 
 R6-F2 and R7-F1 look like an A row and a B row, and each was first fixed as
-one. Read together they are a third class: both are a **new process
-re-deriving a run-defining input from the current environment** — the
+one. Read together they are a third class: both are a new process
+re-deriving a run-defining input from the current environment (the
 exclusion rules from today's configuration, the state directory from
-today's pathname — and treating the result as the run's definition. The
+today's pathname) and treating the result as the run's definition. The
 fingerprint check, the inode check and every other REVALIDATE step compare
 the world against the definition; if the definition itself is rebuilt from
 the world, they compare the world against itself. §5.7 closes the class
@@ -151,7 +152,7 @@ Round 8 tested that formulation rather than adding to the class: R8-F1
 asked for the contract to be complete (validation commands, the fix
 budget, both roots and the snapshot algorithm, not only the exclusions
 and the bounds), and R8-F2 found that the policy's *encoding* was itself
-a rebinding — a comma-joined line under which `["a,b", "c"]` and
+a rebinding: a comma-joined line under which `["a,b", "c"]` and
 `["a", "b,c"]` were one policy, so the gate could pass while the excluded
 set changed. The contract is one dataclass, so completeness is a field
 list rather than a search; the encoding is canonical JSON with every
@@ -161,9 +162,9 @@ by one: the cumulative step budget was enforced from the *current*
 without the gate noticing. It is a contract field now (schema 2), and the
 LOCAL step reads the budget from the contract, never from the config.
 
-**The diagnosis, in one line:** classes A, B and F defined safety by
-*enumerating the bad cases*; classes C, D and E defined it by *closing the
-definition of the good case*. Only A, B and F kept producing new findings.
+The diagnosis: classes A, B and F defined safety by *enumerating the bad
+cases*; classes C, D and E defined it by *closing the definition of the good
+case*. Only A, B and F kept producing new findings.
 
 ## 2. Threat model
 
@@ -188,17 +189,17 @@ which writes one feature specification before any run exists.
 > When the LOCAL agent runs under the same OS user as the controller with no
 > sandbox, is it a fallible collaborator or an adversarial filesystem actor?
 
-**Neither assumption is available, so the honest answer is: it is an
-adversarial actor that we cannot fully contain, and the design says so.**
+Neither assumption is available: it is an adversarial actor that we cannot
+fully contain, and the design says so.
 
 A same-UID unsandboxed process can do everything the controller can. It can
 `kill` the controller, rewrite `state.json`, `ptrace` the process, replace
-`git` on `PATH`, or edit the operator's shell profile. **No amount of
-`resolve()`, `lstat()` or `startswith()` in Python changes that.** Claiming
+`git` on `PATH`, or edit the operator's shell profile. No amount of
+`resolve()`, `lstat()` or `startswith()` in Python changes that. Claiming
 "AutoForge confines the agent" would be false, and every pathname check added
 in that belief was a patch on an unachievable promise.
 
-What *is* achievable is narrower and worth stating exactly:
+What *is* achievable is narrower, and can be stated exactly:
 
 **Achievable (and enforced).**
 1. **Fidelity of the controller's own writes.** No filesystem entry an agent
@@ -222,22 +223,22 @@ What *is* achievable is narrower and worth stating exactly:
    with respect to a concurrent writer; what is guaranteed is *detection*, not
    exclusion.
 
-The operator-facing consequence: **run LOCAL mode on a checkout you would let
-an agent edit anyway**, ideally a dedicated `git worktree`. Real isolation is
+The operator-facing consequence: run LOCAL mode on a checkout you would let
+an agent edit anyway, ideally a dedicated `git worktree`. Real isolation is
 a sandbox (container, user namespace, separate UID), which is out of scope for
 v1 and is the honest answer to anyone wanting guarantee (1) above.
 
 ### 2.3 The one guarantee we deliberately do not try to give with pathnames
 
-`SafeRoot.open(root)` resolves the *root pathname* normally — symbolic links
+`SafeRoot.open(root)` resolves the *root pathname* normally, symbolic links
 included. A process that can redirect that pathname can redirect the checkout
-itself, which is not a problem Python can solve. Everything **below** the root
+itself, which is not a problem Python can solve. Everything *below* the root
 is closed by construction. This limit is stated in the code and pinned by a
 test (`test_the_root_pathname_is_resolved_normally_and_that_is_the_stated_limit`)
 so that no future round mistakes it for an oversight.
 
 It is a statement about the *first* resolution only, and round 6 drew the line
-more sharply (§5.4): the state root's pathname is resolved normally **once**,
+more sharply (§5.4): the state root's pathname is resolved normally *once*,
 and thereafter the controller writes to the inode that resolution reached, not
 to the name. What cannot be prevented is a redirection that was already in
 place before the controller started; what is now prevented is one introduced
@@ -263,7 +264,7 @@ Stated so that each is mechanically checkable, before any code.
 - **R (runtime writes).** Every write the controller performs resolves below a
   directory it holds an open descriptor for, follows no symbolic link at any
   component below that descriptor, and lands on an inode the controller
-  created — or fails. The directory the descriptor is opened *on* is itself
+  created, or fails. The directory the descriptor is opened *on* is itself
   bound by identity, so the root of that chain is not a pathname either.
 - **S (state).** A state object that exists satisfies every invariant of its
   mode. Illegal combinations are impossible to construct from a file, not
@@ -273,8 +274,8 @@ Stated so that each is mechanically checkable, before any code.
   its dead predecessor's side effects as absent, and never advances past work
   it did not verify *after* the crash.
 - **V (review).** A review is accepted only while `reviewed_fingerprint ==
-  current_fingerprint`, both computed by the controller, never reported —
-  and `reviewed_fingerprint` is bound only by a phase whose result the
+  current_fingerprint`, both computed by the controller, never reported.
+  `reviewed_fingerprint` is bound only by a phase whose result the
   controller *verified* (the write phases, after their validation commands
   ran). REVIEW compares against that value and never binds a new one: a tree
   that no longer matches it is refused before a reviewer is launched, since
@@ -285,7 +286,7 @@ Stated so that each is mechanically checkable, before any code.
 
 ## 4. Options considered
 
-### Option A — harden the live working tree with better pathname checks
+### Option A: harden the live working tree with better pathname checks
 Keep `git status` + `safeio.py`; add the round-5 cases (ignored paths, index
 flags, clean symlinks, parent components, hard links).
 
@@ -295,20 +296,20 @@ pathname checks would still be unsound against the check/use window (#50) no
 matter how many are added. The diff would have looked exactly like "several
 more special cases", which is the failure mode this reset exists to end.
 
-### Option B — snapshot / staging architecture
+### Option B: snapshot / staging architecture
 Copy the tree into a controller-owned staging area, let agents work there, and
 review the copy.
 
 *Rejected.* It buys atomicity we do not need and costs the thing LOCAL mode is
 *for*: the operator's own working tree, with their editor open on it and their
-build running against it. It also does not solve the problem — a same-UID
-agent can write the staging area too — while adding a copy of every repository
-on every step, a reconciliation step, and a second source of truth. It trades
-a real guarantee for an apparent one.
+build running against it. It also does not solve the problem, since a
+same-UID agent can write the staging area too, while adding a copy of every
+repository on every step, a reconciliation step, and a second source of truth.
+It trades a real guarantee for an apparent one.
 
-### Option C — a constrained LOCAL v1: close the definition of the good case
+### Option C: a constrained LOCAL v1, close the definition of the good case
 Make the controller, not git, enumerate the tree; make one capability object,
-not pathnames, define where writes land; and **refuse** repository shapes the
+not pathnames, define where writes land; and refuse repository shapes the
 controller cannot bind, rather than supporting them approximately.
 
 **Chosen.**
@@ -326,19 +327,19 @@ root, and classifies every entry into exactly one of:
 | `dir` | directories | the mode (so an empty directory is a real entry) |
 | `link` | symbolic links | the link's target **text** (never the target's content) |
 | `excluded` | the git directory; `local.exclude` matches | the *rule*, hashed into the fingerprint and disclosed to the reviewer |
-| *refused* | everything else | nothing — the run stops |
+| *refused* | everything else | nothing; the run stops |
 
 Git's role shrinks to the three things it is actually authoritative about:
 where the repository is, what HEAD and the branch are, and the start-up dirty
-policy. **The fingerprint contains no git output at all.**
+policy. The fingerprint contains no git output at all.
 
 Consequences, each of which was previously a separate finding:
 
 - Ignored, `assume-unchanged` and `skip-worktree` paths are ordinary files to
-  a walk, so R5-F1 does not arise — the walk never asked git.
+  a walk, so R5-F1 does not arise; the walk never asked git.
 - A clean tracked symlink is an entry like any other, so R5-F2 does not arise;
   its target *text* is hashed, and a target outside the tree, inside an
-  excluded region, or *containing* one (the root included — it contains
+  excluded region, or *containing* one (the root included: it contains
   everything, and always contains the git directory) is refused, because
   its bytes could change with the fingerprint unmoved. The containment half
   is decided after the walk against the walk's own list of excluded
@@ -350,7 +351,7 @@ Consequences, each of which was previously a separate finding:
 - Empty directories, which git cannot represent at all, are entries.
 - The git directory is excluded by **inode** (`(st_dev, st_ino)` compared
   against `git rev-parse --git-dir --git-common-dir`), not by the name
-  `.git` — so a decoy directory named `.git` is not excluded, and a real git
+  `.git`, so a decoy directory named `.git` is not excluded, and a real git
   directory reached under another name still is.
 - `--allow-dirty` pins the *contents* of the dirty files, because the snapshot
   hashes them like everything else. #45 is dissolved; the recorded path list
@@ -372,16 +373,16 @@ working tree is refused outright.
 
 ### 5.3 Nested repositories are refused, not approximated
 
-A `.git` entry anywhere below the root — submodule or plain nested clone,
-clean or dirty, tracked or untracked — refuses the snapshot, naming the
+A `.git` entry anywhere below the root (submodule or plain nested clone,
+clean or dirty, tracked or untracked) refuses the snapshot, naming the
 `local.exclude` entry that would accept it as unreviewed.
 
-**This is a change to the product guarantee, and it is the right one.** A
+This is a change to the product guarantee, and it is the right one. A
 submodule's contents are a second working tree with its own index, ignore
 rules and HEAD; binding it correctly means recursing the whole design into it,
 and binding it *incorrectly* means telling an operator their review covered
 code it did not. #47 is therefore not "unsupported, see the follow-up issue"
-but **an explicit, disclosed, enforced limitation of LOCAL v1**, with a
+but an explicit, disclosed and enforced limitation of LOCAL v1, with a
 documented way to proceed (exclude it, and the exclusion is part of the
 review's identity).
 
@@ -391,9 +392,9 @@ review's identity).
 file descriptor; every name below it is resolved with `dir_fd=` plus
 `O_NOFOLLOW` (and `O_DIRECTORY` for components), so:
 
-- there is no pathname to re-point between check and use — the descriptor
-  *is* the check, and it is the same object the write goes through. **#50 is
-  dissolved rather than assessed.**
+- there is no pathname to re-point between check and use: the descriptor
+  *is* the check, and it is the same object the write goes through. #50 is
+  dissolved rather than assessed.
 - a parent component that is a symbolic link cannot be traversed, closing
   R5-F3 as a property of the mechanism rather than as a new validation step.
 
@@ -402,7 +403,7 @@ The descriptor chain has to start somewhere, and until round 6 it started at a
 state` for every checkpoint and every logger. `O_NOFOLLOW` says nothing about
 an ordinary directory, so an agent could `rmdir`/`rename` a directory it had
 prepared elsewhere into that name and every subsequent controller write landed
-in an inode the controller never created — R6-F1, and R5-F3's mechanism
+in an inode the controller never created. That is R6-F1: R5-F3's mechanism
 applied one level further up than R5-F3 looked. The fix is the one the
 descriptor was always standing in for: the first `open_root()` binds the
 pathname to its `(st_dev, st_ino)`, and a later open that reaches a different
@@ -416,7 +417,7 @@ dst_dir_fd=)` over the name. Two consequences follow, and both are stated as
 contract rather than accident:
 
 - A symbolic link, hard link, FIFO, socket or device planted at an artifact's
-  name is **replaced, not refused** — nothing is ever opened through it, so
+  name is replaced, not refused: nothing is ever opened through it, so
   the external target is provably untouched. R5-F4's hard-link truncation
   cannot happen because no `O_TRUNC` is ever handed to `os.open`; truncation,
   where it is needed at all, happens on a validated descriptor.
@@ -438,18 +439,17 @@ not a list, is doing the work.
 The `doctor` command is held to the same boundary (R10-F4). Its writability
 probe used to be a pathname `mkdir` + `mkstemp` after a *resolved-pathname*
 location check, so a symbolic link at `<git dir>/autoforge` passed the
-location check and was followed by the probe — the doctor wrote outside the
+location check and was followed by the probe; the doctor wrote outside the
 repository in exactly the place a run would have refused to. The probe is
 now a `create_exclusive` + `unlink` through `StatePaths.open_root()`, the
 capability the run itself would hold, so the doctor's answer is the run's
 answer.
 
 Three filesystem facts are typed separately so callers cannot conflate them:
-**absence** (`None` / `FileNotFoundError`), **unsafe shape**
-(`UnsafePathError`), and **unreadable** (`UnreadableEntryError`, carrying the
-path). Workspace identity translates "unreadable" into a bind refusal at
-exactly one place, because a file that cannot be read is a file that cannot be
-proven unchanged.
+absence (`None` / `FileNotFoundError`), unsafe shape (`UnsafePathError`), and
+unreadable (`UnreadableEntryError`, carrying the path). Workspace identity
+translates "unreadable" into a bind refusal at exactly one place, because a
+file that cannot be read is a file that cannot be proven unchanged.
 
 ### 5.5 Cost is a refusal, not a sample
 
@@ -464,13 +464,13 @@ controller persists is already bounded per field, so a real `state.json` is
 kilobytes; `MAX_STATE_FILE_BYTES` (64 MiB) makes the *file* bounded too. The
 read is `SafeRoot.read_bytes(limit=)`, which asks for one byte past the
 budget and no more, so a sparse or oversized file a same-user process left
-at that name is refused as corrupt — the same `StateError` an unparseable
-file gets, so `--force` quarantines it by rename instead of reading it —
-without ever being held in memory.
+at that name is refused as corrupt without ever being held in memory. The
+refusal is the same `StateError` an unparseable file gets, so `--force`
+quarantines it by rename instead of reading it.
 
 The event journal is the other file recovery reads, and it lives where the
-agents write too (R11-F2). It is read the same way — `read_bytes(limit=
-MAX_EVENT_JOURNAL_BYTES)`, 64 MiB — plus a record bound
+agents write too (R11-F2). It is read the same way
+(`read_bytes(limit=MAX_EVENT_JOURNAL_BYTES)`, 64 MiB), plus a record bound
 (`MAX_EVENT_JOURNAL_RECORDS`) that is counted on the bytes *before* the
 journal is split into lines, so a journal of millions of empty records
 cannot allocate its way around the byte budget. Recovery needs the journal
@@ -502,8 +502,8 @@ The first fix froze `local.exclude` and the two cost bounds. The next review
 round found the same shape one level up (R7-F1: the state directory
 re-resolved by pathname at bootstrap), and it is the shape, not the field,
 that is the defect: a LOCAL run has no GitHub to be its source of truth, so
-its *definition* — which tree, classified by which rules, verified by which
-commands, bounded by how many rounds, with state kept where — is decided at
+its *definition* (which tree, classified by which rules, verified by which
+commands, bounded by how many rounds, with state kept where) is decided at
 creation from that moment's configuration and environment, while every later
 `step`, `resume`, `status` and crash recovery is a **new process that loads
 the state file and also loads today's configuration**. Any step that
@@ -522,11 +522,11 @@ The closed formulation is `run_contract.py`:
   `workflow.max_total_steps` (schema 2) and the prompt version. The
   classification of every other input the run
   touches is written at the top of the module: REVALIDATED (the
-  specification's bytes, the git anchor — content checks of the world the
+  specification's bytes and the git anchor, content checks of the world the
   contract names, never written back) and DYNAMIC (fingerprints, gitdir
   inodes, which provider/model runs, the invocation's cwd (nothing is
-  launched from it, see below), counters — nothing a persisted
-  safety judgment depends on).
+  launched from it, see below), counters; nothing a persisted safety
+  judgment depends on).
 - **`WorkspacePolicy`** is persisted as its fields (`version`,
   `snapshot_tag`, `exclude`, `max_entries`, `max_bytes`) plus the SHA-256
   of their canonical JSON encoding (sorted keys, no whitespace, every
@@ -539,8 +539,8 @@ The closed formulation is `run_contract.py`:
   paths were excluded (round 8, R8-F2).
 - **`validate_local_run_contract(recorded, current)`** is the one gate. It
   runs inside `ControllerEngine.load()` *before* the state is bound to the
-  engine — so `resume`, `step`, `status`, the dry-run plan and crash
-  recovery all pass through it — and again at the top of every LOCAL step.
+  engine (so `resume`, `step`, `status`, the dry-run plan and crash
+  recovery all pass through it), and again at the top of every LOCAL step.
   Drift is reported per field, under the name the operator knows
   (`local.exclude: run: [] current: ["src"]`), as a `VerificationError`
   that persists nothing.
@@ -556,10 +556,10 @@ The closed formulation is `run_contract.py`:
   verifier, and `["pytest"]` from a subdirectory discovers a different
   rootdir. Freezing the argv while letting the directory float left a
   run-defining input the contract did not record. Rather than adding the
-  cwd as a field — which would force the operator to resume from the exact
-  subdirectory the run was created in — agents and validation commands are
+  cwd as a field, which would force the operator to resume from the exact
+  subdirectory the run was created in, agents and validation commands are
   launched from `contract.repository_root`, which the gate has already
-  proven names this checkout. That is what makes the cwd genuinely DYNAMIC:
+  proven names this checkout. That is what makes the cwd DYNAMIC:
   it decides where the repository is *found*, and nothing else. The
   `cwd` in every `request.json` and the dry-run plan both name the frozen
   directory.
@@ -574,12 +574,12 @@ Two choices inside that are worth stating:
 - **The whole definition is frozen, not the part that is provably unsafe to
   change.** The cost bounds can only ever turn a snapshot into a *refusal*,
   and a wider `local.exclude` only reviews *more*, so exempting either would
-  be sound today — and would be one more enumeration of which knobs happen
-  to be benign, the exact shape of reasoning this ADR replaced. *"The run
-  that was defined is the run that keeps running"* is the closed statement.
-  Adding a run-defining input is one dataclass field: persistence,
-  comparison and the drift message follow from it, and a completeness test
-  checks the matrix against the dataclass.
+  be sound today. It would also be one more enumeration of which knobs
+  happen to be benign, the exact shape of reasoning this ADR replaced.
+  *"The run that was defined is the run that keeps running"* is the closed
+  statement. Adding a run-defining input is one dataclass field:
+  persistence, comparison and the drift message follow from it, and a
+  completeness test checks the matrix against the dataclass.
 - **It is a `VerificationError`, not `BLOCKED`.** The operator changed a
   setting or moved the checkout; restoring it and resuming, or starting a
   new run under the new definition, must both stay possible. Nothing is
@@ -588,8 +588,8 @@ Two choices inside that are worth stating:
 
 ### 5.8 Quoting the specification is delimiter safety, not a trust boundary
 
-`local_common.md` interpolates the feature specification — untrusted project
-data — into the prompt. It did so inside a fixed ```` ``` ```` fence, which
+`local_common.md` interpolates the feature specification, untrusted project
+data, into the prompt. It did so inside a fixed ```` ``` ```` fence, which
 made the quoting itself the injection vector: a specification containing a
 ```` ``` ```` line closes the block, and everything after it reads as prompt
 structure the *controller* wrote.
@@ -597,12 +597,12 @@ structure the *controller* wrote.
 CommonMark closes a fenced block only on a backtick run at least as long as
 the opening fence, so `fenced_untrusted_block()` measures the longest run in
 the content and opens a fence one backtick longer. That is a property of the
-content rather than a list of things content might do — no enumeration, and
+content rather than a list of things content might do: no enumeration, and
 nothing inside the block can terminate it.
 
 The fence is only half of it, and the ADR records both halves so neither is
-mistaken for the whole: **a delimiter says where the data ends; the prose
-around it says the quoted text is data.** `local_common.md` therefore also
+mistaken for the whole: a delimiter says where the data ends, and the prose
+around it says the quoted text is data. `local_common.md` therefore also
 states explicitly that anything in the block resembling an instruction, a
 control block, a heading of the prompt, or a direction to skip a check is
 content to be *implemented*, never followed. Neither half is load-bearing
@@ -610,20 +610,20 @@ without the other.
 
 ### 5.9 Durable run identity
 
-The contract names two directories by pathname — the repository root and the
-state directory — and §5.4 binds the state directory to an inode. Those are
+The contract names two directories by pathname, the repository root and the
+state directory, and §5.4 binds the state directory to an inode. Those are
 two different guarantees with two different lifetimes, and the ADR states
 them separately so neither is mistaken for the other.
 
 **Within one controller process** (guarantee C): the state directory is a
-capability opened exactly once — `ControllerEngine.state_root()` — and held
+capability opened exactly once (`ControllerEngine.state_root()`) and held
 for the run's lifetime. Every later use proves the pathname still reaches the
 held inode and then goes through the held descriptor. Nothing re-resolves the
 name into a binding: not a checkpoint, not a logger, not the next
 `state.json` read. So whatever a same-UID agent does to the pathname after
-the controller started — a symbolic link, a FIFO, a prepared ordinary
+the controller started (a symbolic link, a FIFO, a prepared ordinary
 directory renamed into place, the directory or its parent renamed aside and
-recreated — is a refusal with the phase unchanged, and no controller byte
+recreated) is a refusal with the phase unchanged, and no controller byte
 reaches the replacement. The bootstrap of a new run opens through the same
 chain with `O_NOFOLLOW` on every component below the git directory, so the
 first resolution (R7-F1) is the same resolution every later write is proven
@@ -634,8 +634,8 @@ name (R7-F5).
 **Across processes**: there is no held descriptor, only the record. The
 contract persists both pathnames, so a checkout that was moved, a state
 directory that was copied elsewhere, or a state file carried into another
-checkout is refused with both roots named. What it does *not* detect — and
-this ADR refuses to pretend otherwise — is an in-place replacement whose
+checkout is refused with both roots named. What it does *not* detect, and
+this ADR does not pretend otherwise, is an in-place replacement whose
 contents were copied: a same-UID adversary who replaces the state directory
 *at the same pathname* with a byte-identical `state.json` has produced the
 input a reboot produces. The options were weighed:
@@ -661,8 +661,8 @@ The limitation is pinned by a test
 (`test_documented_limit_an_in_place_replacement_with_copied_contents_is_not_detectable`)
 so that no future round mistakes it for an oversight, and so that the
 contract's remaining strength is stated exactly: whatever the replacement
-holds, the gate proves it is *the run that was defined* — same roots, same
-policy, same budgets, same commands, same prompt version — and every other
+holds, the gate proves it is *the run that was defined* (same roots, same
+policy, same budgets, same commands, same prompt version), and every other
 alteration is caught by the state file's own validation or by drift.
 
 ### 5.10 REVIEW never binds a fingerprint
@@ -671,12 +671,12 @@ Until round 10, `_local_step_once` bound `workspace_fingerprint` to the
 current tree at the start of *every* phase, and only the write phases were
 checkpointed before the agent ran (§5.7, C). Read together those two rules
 had a gap R10-F1 named: a reviewer that edits the tree and then crashes (or
-is refused for that edit) leaves its edit in place; the next REVIEW entry —
-from `resume` or from the very next step — re-bound to the edited tree, and
+is refused for that edit) leaves its edit in place; the next REVIEW entry,
+from `resume` or from the very next step, re-bound to the edited tree, and
 a reviewer that reported *that* fingerprint cleared the run to `DONE`
 without any validation command having run over the reviewer's bytes.
 
-The finding asked for the narrower fix — checkpoint REVIEW like the write
+The finding asked for the narrower fix: checkpoint REVIEW like the write
 phases and block on drift at resume. The options:
 
 - *A. Checkpoint REVIEW and compare at resume.* Closes the crash case only.
@@ -691,8 +691,8 @@ phases and block on drift at resume. The options:
   commands check that a tree *builds*; they are not a review of who wrote
   it.
 - *C. REVIEW never binds.* Chosen. The fingerprint is bound only by a phase
-  whose result the controller verified — `ANALYZE_EXECUTE` and `FIX`, after
-  their validation commands ran — and REVIEW compares the tree against that
+  whose result the controller verified (`ANALYZE_EXECUTE` and `FIX`, after
+  their validation commands ran), and REVIEW compares the tree against that
   value: equal, launch the reviewer; different, `BLOCKED` naming both
   fingerprints, before any launch. No new state. This is the G rule
   applied to the tree: the controller cannot tell a reviewer's edit from an
@@ -732,7 +732,7 @@ an independent `os.walk` finds nothing the snapshot did not mention.
 | Symbolic link to the root, or to a directory *containing* an excluded entry | **rejected fail-closed** | excluded bytes would be reachable at an unexcluded path (R9-F1) |
 | Dangling symbolic link | represented by metadata, or rejected | the text is hashed; the target is resolved lexically and refused if it leaves the tree, exactly like a live link |
 | Hard link (tree-internal) | included & hashed | it is a regular file; both names are entries |
-| Submodule / gitlink | **rejected fail-closed** | §5.3 — a second working tree |
+| Submodule / gitlink | **rejected fail-closed** | §5.3: a second working tree |
 | Nested repository (untracked) | **rejected fail-closed** | §5.3 |
 | Unreadable file (EACCES) | **rejected fail-closed** | cannot be read ⇒ cannot be proven unchanged |
 | Unlistable directory (EACCES) | **rejected fail-closed** | same |
@@ -800,7 +800,7 @@ an independent `os.walk` finds nothing the snapshot did not mention.
    for one-line fields, the unclosable fence for blocks) exclusively.
 10. **A controller write can be *observed* through a planted hard link,
     never redirected by one.** §5.4, R10-F2. The whole-file temporary is
-    created `O_CREAT|O_EXCL` — an inode this process made, empty — but it has
+    created `O_CREAT|O_EXCL` (an inode this process made, empty), but it has
     a name in a directory a same-user process can list, and that process can
     `link(2)` the name elsewhere before the bytes are written. The descriptor
     is re-inspected after the write and before the publish, so such a
