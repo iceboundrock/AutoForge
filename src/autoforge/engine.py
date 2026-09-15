@@ -155,6 +155,7 @@ from .replan_txn import (
     verify_target_pr,
 )
 from .result_parser import (
+    MAX_FINDING_ID_CHARS,
     MAX_FINDING_LOCATION_CHARS,
     MAX_FINDING_RESOLUTION_CHARS,
     MAX_FINDING_TITLE_CHARS,
@@ -210,6 +211,7 @@ REVIEW_BOUND_VARIABLES: dict[str, str | int | None] = {
     "MAX_FINDING_RESOLUTION_CHARS": MAX_FINDING_RESOLUTION_CHARS,
     "MAX_FINDING_TITLE_CHARS": MAX_FINDING_TITLE_CHARS,
     "MAX_FINDING_LOCATION_CHARS": MAX_FINDING_LOCATION_CHARS,
+    "MAX_FINDING_ID_CHARS": MAX_FINDING_ID_CHARS,
 }
 
 # How many times one LOCAL phase entry may launch a write-capable agent

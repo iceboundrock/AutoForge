@@ -87,9 +87,17 @@ in `loop_guard` (`MAX_PERSISTED_FINDINGS_PER_ROUND`,
 round the parser accepted is always retained complete in `review_history`;
 the `loop_guard` clipping and its truncation markers remain as a defence for
 state persisted before the parser bounds existed or edited outside the
-controller. The review prompts state the bounds through template variables
-that the engine fills from the same constants, so the number the reviewer is
-told is the number it is held to.
+controller. The review prompts state every parser bound (the id bound
+included) through template variables that the engine fills from the same
+constants, so the number the reviewer is told is the number it is held to.
+
+The FIX prompt these findings are rendered into is bounded by a constant
+factor of the parser bounds, not by their sum: the renderer's safety measures
+each cost characters (a control character in a one-line field becomes its
+`\xNN` or `\uNNNN` escape, a newline inside a `required_resolution` is
+indented under its finding, and the fence grows one past the longest backtick
+run in the findings). The engine test for the largest accepted round covers
+each of those shapes, not only plain text.
 
 ---
 

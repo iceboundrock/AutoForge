@@ -2820,23 +2820,55 @@ def test_oversized_resolution_never_reaches_state_or_a_prompt(tmp_state_dir, fak
     assert "resolve everything" not in eng.render_prompt_for(Phase.FIX)
 
 
-def test_fix_prompt_size_is_bounded_by_the_review_bounds(tmp_state_dir, fake_github):
-    """The largest round the parser accepts renders into a FIX prompt of bounded size."""
+# The largest REVIEW payloads the parser accepts, each the most expensive
+# along one axis of the FIX renderer (PR #76 review, R2-F2). Every field is
+# filled to its bound; the head/tail letters keep the stripped length at the
+# bound when the filler is whitespace (a newline, U+2028).
+_WORST_CASE_FILLERS = {
+    "plain": "r",
+    "backticks": "`",  # the fence must outgrow the longest backtick run
+    "newlines": "\n",  # a newline inside required_resolution is indented
+    "control": "\x00",  # escape_inline renders it as ``\\x00`` (4 characters)
+    "line_separator": "\u2028",  # the widest escape, ``\\u2028`` (6 characters)
+}
+
+
+def _filled(filler: str, length: int) -> str:
+    return "a" + filler * (length - 2) + "b"
+
+
+@pytest.mark.parametrize("filler", sorted(_WORST_CASE_FILLERS), ids=str)
+def test_fix_prompt_size_is_bounded_by_the_review_bounds(tmp_state_dir, fake_github, filler):
+    """The largest round the parser accepts renders into a FIX prompt of bounded size.
+
+    The renderer's safety measures each cost characters: the fence grows past
+    the longest backtick run in the findings, a control character in a
+    one-line field becomes its escape, and a newline in a resolution is
+    indented under its finding. The bound is therefore a constant factor of
+    the parser bounds, not the sum of them, and it holds for every shape of
+    accepted content, not only plain text.
+    """
     from autoforge.result_parser import ReviewResult
 
+    ch = _WORST_CASE_FILLERS[filler]
     findings = [
         dict(
             _finding(1, n),
             # ``R1-F<n>`` padded to the id bound; distinct because the tail differs.
             id="R1-F" + "9" * (MAX_FINDING_ID_CHARS - 4 - len(str(n))) + str(n),
-            required_resolution="r" * MAX_FINDING_RESOLUTION_CHARS,
-            title="t" * MAX_FINDING_TITLE_CHARS,
-            location="l" * MAX_FINDING_LOCATION_CHARS,
+            required_resolution=_filled(ch, MAX_FINDING_RESOLUTION_CHARS),
+            title=_filled(ch, MAX_FINDING_TITLE_CHARS),
+            location=_filled(ch, MAX_FINDING_LOCATION_CHARS),
         )
         for n in range(1, MAX_FINDINGS_PER_REVIEW + 1)
     ]
     assert all(len(f["id"]) == MAX_FINDING_ID_CHARS for f in findings)
+    # The parser accepts this payload whole: the bound below is about content
+    # the FIX round can actually be handed, not content that was refused.
     accepted = ReviewResult.from_payload(review_payload(1, SHA_A, findings))
+    assert len(accepted.findings) == MAX_FINDINGS_PER_REVIEW
+    assert len(accepted.findings[0].required_resolution) == MAX_FINDING_RESOLUTION_CHARS
+
     eng = _in_review(tmp_state_dir, fake_github, [])
     eng.state.phase = Phase.FIX
     eng.state.review_round = 1
@@ -2845,14 +2877,26 @@ def test_fix_prompt_size_is_bounded_by_the_review_bounds(tmp_state_dir, fake_git
     empty = len(eng.render_prompt_for(Phase.FIX))
     eng.state.open_findings = [f.to_dict() for f in accepted.findings]
     full = eng.render_prompt_for(Phase.FIX)
-    per_finding_text = (
-        MAX_FINDING_ID_CHARS
-        + MAX_FINDING_RESOLUTION_CHARS
-        + MAX_FINDING_TITLE_CHARS
-        + MAX_FINDING_LOCATION_CHARS
+
+    escape_width = 6  # escape_inline: a control character renders as \\xNN or \\uNNNN
+    indent_width = 5  # a newline inside required_resolution renders as "\n" + 4 spaces
+    framing = 64  # classification, separators, the "Required resolution:" label
+    per_finding = (
+        MAX_FINDING_ID_CHARS  # the id's shape admits no control character
+        + escape_width * (MAX_FINDING_TITLE_CHARS + MAX_FINDING_LOCATION_CHARS)
+        + indent_width * MAX_FINDING_RESOLUTION_CHARS
+        + framing
     )
-    # Every finding contributes its bounded text plus a small fixed framing
-    # (classification, separators); nothing is unbounded.
-    framing = 64
-    assert len(full) - empty <= MAX_FINDINGS_PER_REVIEW * (per_finding_text + framing)
+    # Opening and closing fence, one longer than the longest possible run.
+    longest_field = max(
+        MAX_FINDING_RESOLUTION_CHARS, MAX_FINDING_TITLE_CHARS, MAX_FINDING_LOCATION_CHARS
+    )
+    fence_overhead = 2 * (longest_field + 1)
+    assert len(full) - empty <= MAX_FINDINGS_PER_REVIEW * per_finding + fence_overhead
     assert full.count("\n- R1-F") == MAX_FINDINGS_PER_REVIEW  # one rendered line per finding
+    if ch in ("\x00", "\u2028"):
+        # The one-line fields were escaped, not passed through; the resolution
+        # is block-quoted, so the fence, not an escape, is what contains it.
+        heads = [line for line in full.split("\n") if line.startswith("- R1-F")]
+        assert len(heads) == MAX_FINDINGS_PER_REVIEW
+        assert not any(ch in line for line in heads)

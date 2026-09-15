@@ -99,6 +99,7 @@ def test_review_prompt_contract():
 def test_review_prompts_state_the_parser_bounds(engine):
     """#34: the reviewer is told the exact bounds the parser rejects against."""
     from autoforge.result_parser import (
+        MAX_FINDING_ID_CHARS,
         MAX_FINDING_LOCATION_CHARS,
         MAX_FINDING_RESOLUTION_CHARS,
         MAX_FINDING_TITLE_CHARS,
@@ -113,6 +114,7 @@ def test_review_prompts_state_the_parser_bounds(engine):
             "MAX_FINDING_RESOLUTION_CHARS",
             "MAX_FINDING_TITLE_CHARS",
             "MAX_FINDING_LOCATION_CHARS",
+            "MAX_FINDING_ID_CHARS",
         ):
             assert "{{" + var + "}}" in text, (template, var)
         assert "never clips findings" in text
@@ -122,6 +124,7 @@ def test_review_prompts_state_the_parser_bounds(engine):
     assert f"`required_resolution` at most {MAX_FINDING_RESOLUTION_CHARS} characters" in rendered
     assert f"`title` at most {MAX_FINDING_TITLE_CHARS}" in rendered
     assert f"`location` at most\n  {MAX_FINDING_LOCATION_CHARS}" in rendered
+    assert f"`id` at most {MAX_FINDING_ID_CHARS}" in rendered
 
 
 def test_fix_prompt_contract():
