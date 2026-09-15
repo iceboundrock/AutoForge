@@ -37,7 +37,7 @@ looks good
 merged successfully
 ```
 
-### Important review invariant
+### Review invariant
 
 For `REVIEW`:
 

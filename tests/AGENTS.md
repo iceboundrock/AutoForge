@@ -1,7 +1,7 @@
-# tests/ — test scope
+# Test scope: tests/
 
-Applies to everything under `tests/`. The root `AGENTS.md` contract is
-inherited; this file adds only what is specific to writing tests here. The
+Applies to everything under `tests/`. The root `AGENTS.md` contract applies
+here too; this file adds only what is specific to writing tests. The
 coverage contract (which behaviours must be tested, and the scripted
 end-to-end loop that must keep working) is `docs/agent-guides/testing.md`;
 read it before adding tests for a listed area.

@@ -18,7 +18,7 @@ Never print or commit:
 - authorization headers
 - environment dumps containing secrets
 
-Redact common patterns before persisting logs, including values associated with:
+Redact common patterns before persisting logs, including the values of:
 
 ```text
 GITHUB_TOKEN

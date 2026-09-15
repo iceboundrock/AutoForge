@@ -2,8 +2,8 @@
 
 Read this before adding or changing tests, or before changing behaviour in an
 area listed under "High-priority coverage" (each such change must come with
-the corresponding test). The test-scope conventions — fakes, fixtures and what
-a test may never do — are in `tests/AGENTS.md`; this document is the coverage
+the corresponding test). The test-scope conventions (fakes, fixtures and what
+a test may never do) are in `tests/AGENTS.md`; this document is the coverage
 contract.
 
 ---

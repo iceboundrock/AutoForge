@@ -1,11 +1,11 @@
 # Architectural boundaries
 
 Read this before adding or moving responsibilities between the engine, a
-provider adapter, the executor, the GitHub client, or the prompt system —
-including any change that would make one of them know something that belongs
-to another (a CLI flag in the engine, workflow state in the executor, a raw
-`gh --json` dictionary crossing into business logic, a long prompt as a
-Python string literal).
+provider adapter, the executor, the GitHub client, or the prompt system.
+That includes any change that would make one of them know something
+belonging to another: a CLI flag in the engine, workflow state in the
+executor, a raw `gh --json` dictionary crossing into business logic, or a
+long prompt as a Python string literal.
 
 ---
 
@@ -35,7 +35,7 @@ The engine must not contain Claude Code or OpenCode CLI-specific flag logic.
 
 ### Provider adapters
 
-Provider-specific code is responsible for translating an abstract agent request into a real CLI invocation.
+Provider-specific code translates an abstract agent request into a real CLI invocation.
 
 Examples:
 
@@ -68,13 +68,13 @@ It should remain independent of workflow semantics.
 
 ### GitHub client
 
-GitHub integration should be centralized behind a `GitHubClient` or equivalent abstraction.
+Centralize GitHub integration behind a `GitHubClient` or equivalent abstraction.
 
 Prefer typed return values rather than passing raw `gh --json` dictionaries throughout business logic.
 
 ### Prompt system
 
-Large prompts belong in prompt template files under `src/autoforge/prompts/` rather than embedded as long Python string literals.
+Large prompts belong in template files under `src/autoforge/prompts/`, not in long Python string literals.
 
 Missing required template variables must fail explicitly.
 

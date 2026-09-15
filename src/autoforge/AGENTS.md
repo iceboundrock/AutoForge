@@ -1,8 +1,8 @@
-# src/autoforge/ — source scope
+# Source scope: src/autoforge/
 
 Applies to production code in this package. The repository contract in the
 root `AGENTS.md` (precedence, untrusted data, branch safety, boundaries,
-conventions, routing rules) is inherited, not restated here.
+conventions, routing rules) also applies here and is not repeated below.
 
 ## Module map
 
@@ -48,7 +48,7 @@ prompts/            file-based templates ({{VAR}}); renderer in prompts/__init__
   from an exit status or an agent claim, and a destructive write is
   checkpointed in persisted state before it is performed. Persisted state is
   validated on load and corruption fails loudly; a new persisted field
-  follows the same rule. Both are specified in the routed references.
+  follows the same rule. The routed references specify both.
 - LOCAL mode (`autoforge local`) makes zero `gh` invocations and has its own
   prompt templates (`prompts/local_*.md`) and transition table; do not let a
   GitHub-only concern leak into it. Its workspace and filesystem boundary is
