@@ -14,7 +14,11 @@ fields are enforced with typed dataclass models.
 
 The controller never "guesses what the agent meant": a REVIEW result whose
 ``needs_fix_round`` disagrees with its ``findings`` list, or a FIX
-resolution without the evidence its kind requires, is rejected outright.
+resolution without the evidence its kind requires, is rejected outright. So
+is a REVIEW result larger than the controller is willing to persist and
+render (``MAX_FINDINGS_PER_REVIEW`` and the per-field character bounds,
+finding ids included): it is refused whole, never clipped, so the reviewer
+can re-emit it.
 """
 
 from __future__ import annotations
@@ -43,6 +47,29 @@ FIX_RESOLUTIONS = ("fixed", "follow_up_created", "no_change_with_rationale")
 # resolve it and says why. The controller treats it as a remaining finding.
 LOCAL_FIX_RESOLUTIONS = ("fixed", "no_change_with_rationale", "unresolved")
 MIN_RATIONALE_CHARS = 40
+
+# Bounds on the REVIEW payload the controller accepts. Review output is
+# untrusted project data, and every accepted finding is persisted in full in
+# ``state.open_findings`` (a full atomic rewrite of ``state.json``) and
+# rendered verbatim into the next FIX prompt. Without a controller-owned
+# limit a single pathological round decides the size of both. An oversized
+# result is *rejected*, never clipped: the findings are the work the FIX
+# round has to act on, so clipping them would silently drop work, whereas a
+# rejection is correctable (the reviewer re-emits a bounded result through the
+# ordinary correction retry). Each bound is at or below the corresponding
+# persisted-evidence bound in ``loop_guard`` so an accepted round is always
+# retained complete (``tests/test_result_parser.py`` pins that relation).
+MAX_FINDINGS_PER_REVIEW = 50
+MAX_FINDING_RESOLUTION_CHARS = 2000
+MAX_FINDING_TITLE_CHARS = 200
+MAX_FINDING_LOCATION_CHARS = 300
+# A finding id is ``R<round>-F<n>``; its shape does not bound its length (the
+# digit runs are open-ended), and the id is persisted and rendered like every
+# other finding field, so it is bounded explicitly. The bound is checked
+# before the shape, so an oversized id is never echoed into a message. A FIX
+# ``finding_id`` must equal an accepted finding's id, so the same bound
+# applies to it at parse time rather than after the coverage check.
+MAX_FINDING_ID_CHARS = 32
 
 
 def extract_last_block(stdout: str) -> str:
@@ -200,6 +227,81 @@ class AnalyzeExecuteResult:
         )
 
 
+def _bounded(text: str, fid: str, key: str, limit: int) -> str:
+    """Reject a finding text field longer than ``limit`` characters.
+
+    The message reports the size, never the text: the oversized value is the
+    thing being refused, and the error is echoed into the correction prompt
+    and the run log.
+    """
+    if len(text) > limit:
+        raise ControlResultValidationError(
+            f"REVIEW: finding {fid} field {key!r} is {len(text)} characters; the controller "
+            f"accepts at most {limit}. Shorten it (or split the finding) and re-emit the "
+            "CONTROL_RESULT."
+        )
+    return text
+
+
+def _finding_id(payload: dict, key: str, phase: str, round: int | None = None) -> str:
+    """The bounded, well-formed finding id at ``payload[key]``.
+
+    Length is checked first: the shape and round checks quote the id in their
+    messages, and those messages reach the correction prompt and the run log.
+    With ``round`` given (REVIEW), the id must belong to that round.
+    """
+    fid = _req_str(payload, key, phase)
+    if len(fid) > MAX_FINDING_ID_CHARS:
+        raise ControlResultValidationError(
+            f"{phase}: field {key!r} is {len(fid)} characters; a finding id is R<round>-F<n> "
+            f"and the controller accepts at most {MAX_FINDING_ID_CHARS}. Re-emit the "
+            "CONTROL_RESULT with well-formed ids."
+        )
+    m = _FINDING_ID_RE.match(fid)
+    if not m:
+        if round is None:
+            raise ControlResultValidationError(f"{phase}: invalid {key} {fid!r}")
+        raise ControlResultValidationError(
+            f"{phase}: finding id {fid!r} must look like R<round>-F<n> (e.g. R{round}-F1)"
+        )
+    if round is not None and int(m.group("round")) != round:
+        raise ControlResultValidationError(
+            f"{phase}: finding id {fid!r} does not belong to review round {round}"
+        )
+    return fid
+
+
+def _parse_findings(payload: dict, round: int, needs_fix: bool) -> list[Finding]:
+    """The bounded, validated findings list of a REVIEW result (any mode).
+
+    The count is checked before any element is parsed, so an oversized list is
+    refused without the controller doing per-element work on it, and the
+    review invariant (``needs_fix_round == (findings > 0)``) is enforced here
+    so REMOTE and LOCAL reviews cannot drift apart.
+    """
+    raw_findings = payload.get("findings")
+    if not isinstance(raw_findings, list):
+        raise ControlResultValidationError("'findings' must be a list (empty when clean)")
+    if len(raw_findings) > MAX_FINDINGS_PER_REVIEW:
+        raise ControlResultValidationError(
+            f"REVIEW: {len(raw_findings)} findings reported; the controller accepts at most "
+            f"{MAX_FINDINGS_PER_REVIEW} per review round. Keep the actionable findings, move "
+            "non-actionable remarks to observations, and re-emit the CONTROL_RESULT."
+        )
+    findings = [Finding.from_payload(f, round, i) for i, f in enumerate(raw_findings)]
+    ids = [f.id for f in findings]
+    if len(set(ids)) != len(ids):
+        raise ControlResultValidationError(f"duplicate finding ids: {ids}")
+    # Controller invariant (§14): the boolean must agree with the list.
+    if needs_fix != (len(findings) > 0):
+        raise ControlResultValidationError(
+            f"invalid REVIEW result: needs_fix_round={needs_fix} but "
+            f"{len(findings)} finding(s) reported — the two must agree "
+            "(any finding, even a nit, requires a fix round; observations are not findings)"
+        )
+    return findings
+
+
 @dataclass
 class Finding:
     id: str
@@ -216,16 +318,7 @@ class Finding:
                 f"{ph}: findings[{index}] must be an object with id/classification/"
                 "required_resolution"
             )
-        fid = _req_str(raw, "id", ph)
-        m = _FINDING_ID_RE.match(fid)
-        if not m:
-            raise ControlResultValidationError(
-                f"{ph}: finding id {fid!r} must look like R<round>-F<n> (e.g. R{round}-F1)"
-            )
-        if int(m.group("round")) != round:
-            raise ControlResultValidationError(
-                f"{ph}: finding id {fid!r} does not belong to review round {round}"
-            )
+        fid = _finding_id(raw, "id", ph, round)
         cls_ = _req_str(raw, "classification", ph)
         if cls_ not in FINDING_CLASSIFICATIONS:
             raise ControlResultValidationError(
@@ -235,9 +328,16 @@ class Finding:
         return cls(
             id=fid,
             classification=cls_,
-            required_resolution=_req_str(raw, "required_resolution", ph),
-            title=_opt_str(raw, "title", ph),
-            location=_opt_str(raw, "location", ph),
+            required_resolution=_bounded(
+                _req_str(raw, "required_resolution", ph),
+                fid,
+                "required_resolution",
+                MAX_FINDING_RESOLUTION_CHARS,
+            ),
+            title=_bounded(_opt_str(raw, "title", ph), fid, "title", MAX_FINDING_TITLE_CHARS),
+            location=_bounded(
+                _opt_str(raw, "location", ph), fid, "location", MAX_FINDING_LOCATION_CHARS
+            ),
         )
 
     def to_dict(self) -> dict:
@@ -265,20 +365,7 @@ class ReviewResult:
         if not isinstance(rnd, int) or isinstance(rnd, bool) or rnd < 1:
             raise ControlResultValidationError("'round' must be an int >= 1")
         needs_fix = _req_bool(p, "needs_fix_round", ph)
-        raw_findings = p.get("findings")
-        if not isinstance(raw_findings, list):
-            raise ControlResultValidationError("'findings' must be a list (empty when clean)")
-        findings = [Finding.from_payload(f, rnd, i) for i, f in enumerate(raw_findings)]
-        ids = [f.id for f in findings]
-        if len(set(ids)) != len(ids):
-            raise ControlResultValidationError(f"duplicate finding ids: {ids}")
-        # Controller invariant (§14): the boolean must agree with the list.
-        if needs_fix != (len(findings) > 0):
-            raise ControlResultValidationError(
-                f"invalid REVIEW result: needs_fix_round={needs_fix} but "
-                f"{len(findings)} finding(s) reported — the two must agree "
-                "(any finding, even a nit, requires a fix round; observations are not findings)"
-            )
+        findings = _parse_findings(p, rnd, needs_fix)
         return cls(
             round=rnd,
             reviewed_head_sha=_req_sha(p, "reviewed_head_sha", ph),
@@ -303,9 +390,7 @@ class FindingResolution:
             raise ControlResultValidationError(
                 f"{ph}: resolutions[{index}] must be an object with finding_id/resolution"
             )
-        fid = _req_str(raw, "finding_id", ph)
-        if not _FINDING_ID_RE.match(fid):
-            raise ControlResultValidationError(f"{ph}: invalid finding_id {fid!r}")
+        fid = _finding_id(raw, "finding_id", ph)
         res = _req_str(raw, "resolution", ph)
         if res not in FIX_RESOLUTIONS:
             raise ControlResultValidationError(
@@ -551,19 +636,7 @@ class LocalReviewResult:
         if not isinstance(rnd, int) or isinstance(rnd, bool) or rnd < 1:
             raise ControlResultValidationError("'round' must be an int >= 1")
         needs_fix = _req_bool(p, "needs_fix_round", ph)
-        raw_findings = p.get("findings")
-        if not isinstance(raw_findings, list):
-            raise ControlResultValidationError("'findings' must be a list (empty when clean)")
-        findings = [Finding.from_payload(f, rnd, i) for i, f in enumerate(raw_findings)]
-        ids = [f.id for f in findings]
-        if len(set(ids)) != len(ids):
-            raise ControlResultValidationError(f"duplicate finding ids: {ids}")
-        if needs_fix != (len(findings) > 0):
-            raise ControlResultValidationError(
-                f"invalid REVIEW result: needs_fix_round={needs_fix} but "
-                f"{len(findings)} finding(s) reported — the two must agree "
-                "(any finding, even a nit, requires a fix round; observations are not findings)"
-            )
+        findings = _parse_findings(p, rnd, needs_fix)
         return cls(
             round=rnd,
             # Binds the review to exactly the workspace the controller
@@ -591,9 +664,7 @@ class LocalFindingResolution:
             raise ControlResultValidationError(
                 f"{ph}: resolutions[{index}] must be an object with finding_id/resolution"
             )
-        fid = _req_str(raw, "finding_id", ph)
-        if not _FINDING_ID_RE.match(fid):
-            raise ControlResultValidationError(f"{ph}: invalid finding_id {fid!r}")
+        fid = _finding_id(raw, "finding_id", ph)
         res = _req_str(raw, "resolution", ph)
         if res not in LOCAL_FIX_RESOLUTIONS:
             raise ControlResultValidationError(

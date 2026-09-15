@@ -155,6 +155,11 @@ from .replan_txn import (
     verify_target_pr,
 )
 from .result_parser import (
+    MAX_FINDING_ID_CHARS,
+    MAX_FINDING_LOCATION_CHARS,
+    MAX_FINDING_RESOLUTION_CHARS,
+    MAX_FINDING_TITLE_CHARS,
+    MAX_FINDINGS_PER_REVIEW,
     AnalyzeExecuteResult,
     FixResult,
     LocalAnalyzeExecuteResult,
@@ -196,6 +201,18 @@ from .validation import (
     same_pr_url,
     validate_epic_and_issue,
 )
+
+# The REVIEW payload bounds the parser enforces, rendered into the review
+# prompts so the reviewer is told the contract it will be held to. The
+# templates carry no literal numbers: the value the prompt states is the
+# value ``result_parser`` rejects against.
+REVIEW_BOUND_VARIABLES: dict[str, str | int | None] = {
+    "MAX_FINDINGS_PER_REVIEW": MAX_FINDINGS_PER_REVIEW,
+    "MAX_FINDING_RESOLUTION_CHARS": MAX_FINDING_RESOLUTION_CHARS,
+    "MAX_FINDING_TITLE_CHARS": MAX_FINDING_TITLE_CHARS,
+    "MAX_FINDING_LOCATION_CHARS": MAX_FINDING_LOCATION_CHARS,
+    "MAX_FINDING_ID_CHARS": MAX_FINDING_ID_CHARS,
+}
 
 # How many times one LOCAL phase entry may launch a write-capable agent
 # before the run blocks. Every launch is charged and checkpointed before the
@@ -774,6 +791,7 @@ class ControllerEngine:
             "VALIDATION_COMMANDS": self._validation_commands_text(),
             "REVIEW_ROUND": s.review_round + 1 if s.phase != Phase.FIX else s.review_round,
             "FINDINGS": self._format_findings(s.open_findings),
+            **REVIEW_BOUND_VARIABLES,
         }
 
     def _prior_attempt_note(self) -> str:
@@ -829,6 +847,7 @@ class ControllerEngine:
             "NEXT_ISSUE_REJECTION": (
                 s.next_issue_rejections[-1] if s.next_issue_rejections else "(none)"
             ),
+            **REVIEW_BOUND_VARIABLES,
         }
         if s.phase == Phase.REPLAN_REEXECUTE:
             # Before `_prepare_replan` has run (plan/dry-run rendering) the
