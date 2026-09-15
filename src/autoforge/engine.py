@@ -3243,7 +3243,7 @@ class ControllerEngine:
                 f"repository {state.repository} reports {watermark} as its latest pull-request "
                 f"number, which cannot be right while PR #{source_ref.number} exists",
             )
-        if source_ref.canonical not in preexisting_urls:
+        if not any(same_pr_url(source_ref.canonical, url) for url in preexisting_urls):
             # The source was just read as OPEN, so a consistent listing holds
             # it; one that does not was taken after the source moved. The
             # snapshot is checkpointed as the set of PRs that can never be the

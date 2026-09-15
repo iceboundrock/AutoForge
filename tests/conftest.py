@@ -327,14 +327,23 @@ class FakeGitHub:
             return False
 
     def _stored(self, url: str) -> PRInfo:
-        """The live record, for the fake's own writes -- never handed to a caller."""
+        """The live record, for the fake's own writes -- never handed to a caller.
+
+        Resolved as GitHub resolves a URL: owner/repo case-insensitively, then
+        the number. The record keeps the spelling it was registered under, so
+        a caller asking for ``owner/repo/pull/42`` reads back whatever spelling
+        the fake's GitHub holds, exactly as ``gh pr view --json url`` does.
+        """
         from autoforge.validation import parse_pr_url
 
         ref = parse_pr_url(url)
-        try:
-            return self.prs[ref.canonical]
-        except KeyError:
-            raise GitHubError(f"pr not found: {url}") from None
+        for known, info in self.prs.items():
+            if parse_pr_url(known).same_target(ref):
+                return info
+        raise GitHubError(f"pr not found: {url}")
+
+    def _same_repo(self, repository: str, repo: str) -> bool:
+        return repository.lower() == repo.lower()
 
     def get_pr(self, url: str) -> PRInfo:
         self.calls.append(("get_pr", url))
@@ -447,7 +456,11 @@ class FakeGitHub:
                 f"{repo} has at least 1000 open pull requests, so the listing may be "
                 "truncated and the set of candidates cannot be established"
             )
-        return [replace(p) for p in self.prs.values() if p.is_open and p.repository == repo]
+        return [
+            replace(p)
+            for p in self.prs.values()
+            if p.is_open and self._same_repo(p.repository, repo)
+        ]
 
     def list_all_prs(self, repo: str, *, strict: bool = False) -> list[PRInfo]:
         self.calls.append(("list_all_prs", repo, strict))
@@ -456,14 +469,16 @@ class FakeGitHub:
                 f"{repo} has at least 1000 pull requests, so the listing may be "
                 "truncated and the set of candidates cannot be established"
             )
-        return [replace(p) for p in self.prs.values() if p.repository == repo]
+        return [replace(p) for p in self.prs.values() if self._same_repo(p.repository, repo)]
 
     def latest_pr_number(self, repo: str) -> int:
         """Highest PR number in the repo, open or closed (the real watermark)."""
         self.calls.append(("latest_pr_number", repo))
         if self.latest_pr_error is not None:
             raise self.latest_pr_error
-        return max((p.number for p in self.prs.values() if p.repository == repo), default=0)
+        return max(
+            (p.number for p in self.prs.values() if self._same_repo(p.repository, repo)), default=0
+        )
 
     def find_open_prs_for_issue(self, issue, *, strict: bool = False) -> list[PRInfo]:
         self.calls.append(("find_open_prs_for_issue", issue.number, strict))
@@ -481,8 +496,18 @@ class FakeGitHub:
         self.calls.append(("get_pr_comments", url))
         if self.comments_error is not None:
             raise self.comments_error
+        from autoforge.validation import parse_pr_url
+
         self.get_pr(url)
-        return list(self.comments.get(url, []))
+        ref = parse_pr_url(url)
+        # Comments are keyed by the URL they were posted under; the PR they
+        # belong to is the same whatever spelling that URL used.
+        return [
+            c
+            for known, cs in self.comments.items()
+            if parse_pr_url(known).same_target(ref)
+            for c in cs
+        ]
 
     def get_comment(self, url: str) -> CommentInfo:
         for cs in self.comments.values():

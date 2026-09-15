@@ -788,10 +788,30 @@ def legacy_journal_refusal(raw: object, *, written_by: str) -> str:
 
 
 def _canonical(url: str) -> str:
+    """A PR URL as text, for messages -- never for an identity comparison.
+
+    The canonical form keeps the owner/repository spelling its author used,
+    and GitHub treats ``Owner/Repo`` and ``owner/repo`` as one repository, so
+    two canonical strings can differ while naming the same PR. Identity is
+    :func:`same_pr_url` for a pair and :func:`_identity` for a set.
+    """
     try:
         return parse_pr_url(url).canonical
     except Exception:
         return ""
+
+
+def _identity(url: str) -> tuple[str, str, str, int] | None:
+    """The PR as GitHub identifies it (:attr:`GitHubRef.identity`), or None.
+
+    ``None`` for an unusable URL, and a caller must never compare two ``None``
+    values as equal: an unusable checkpoint matches nothing, exactly as
+    :func:`same_pr_url` returns False for it.
+    """
+    try:
+        return parse_pr_url(url).identity
+    except Exception:
+        return None
 
 
 def _same_sha(observed: str, expected: str) -> bool:
@@ -1012,7 +1032,7 @@ def verify_source_checkpoint(pr: PRInfo, txn: ReplanTransaction) -> str:
     controller is no longer looking at the implementation it decided to
     replace, and must not close it.
     """
-    if _canonical(pr.url) != _canonical(txn.source_pr_url):
+    if not same_pr_url(pr.url, txn.source_pr_url):
         return (
             f"source PR identity mismatch: read {pr.url or '(none)'}, "
             f"checkpoint {txn.source_pr_url}"
@@ -1061,9 +1081,9 @@ def verify_target_pr(
     ref_canonical = _canonical(pr.url)
     if not ref_canonical:
         return f"replacement PR URL {pr.url!r} is not a pull-request URL"
-    if ref_canonical == _canonical(txn.source_pr_url):
+    if same_pr_url(ref_canonical, txn.source_pr_url):
         return "replacement PR must differ from the superseded PR"
-    if txn.replacement_pr_url and ref_canonical != _canonical(txn.replacement_pr_url):
+    if txn.replacement_pr_url and not same_pr_url(ref_canonical, txn.replacement_pr_url):
         return (
             f"replacement PR identity mismatch: read {ref_canonical}, "
             f"checkpoint {txn.replacement_pr_url}"
@@ -1156,7 +1176,7 @@ def verify_closed_source(pr: PRInfo, txn: ReplanTransaction) -> str:
     write window, i.e. the close destroyed the visibility of work that no
     review ever saw -- the caller undoes the close rather than accepting it.
     """
-    if _canonical(pr.url) != _canonical(txn.source_pr_url):
+    if not same_pr_url(pr.url, txn.source_pr_url):
         return (
             f"source PR identity mismatch after the close: read {pr.url or '(none)'}, "
             f"checkpoint {txn.source_pr_url}"
@@ -1285,18 +1305,23 @@ def select_bound_candidate(open_prs: list[PRInfo], txn: ReplanTransaction) -> Ca
                 "so no PR can be proven to have been created after it"
             ),
         )
-    preexisting = {_canonical(url) for url in txn.preexisting_pr_urls}
-    source = _canonical(txn.source_pr_url)
+    # Membership and the source comparison are by GitHub identity: a listing
+    # that spells the repository differently from the checkpoint names the
+    # same PRs. ``source`` is None for an unusable checkpoint and a listed
+    # PR's identity never is, so the two can never compare equal.
+    preexisting = {ident for url in txn.preexisting_pr_urls if (ident := _identity(url))}
+    source = _identity(txn.source_pr_url)
     bound: list[tuple[PRInfo, ReplanAttestation]] = []
     malformed: list[str] = []
     for pr in open_prs:
         canonical = _canonical(pr.url)
         if not canonical:
             continue
+        identity = _identity(pr.url)
         scan = scan_replan_markers(pr.body or "")
         under_watermark = pr.number <= txn.pr_number_watermark
-        predates = under_watermark or canonical in preexisting
-        if canonical == source:
+        predates = under_watermark or identity in preexisting
+        if identity == source:
             # Read before it is excluded: a marker the agent put on the PR
             # being superseded must be refused, not silently reported as
             # "no candidate" -- see :func:`source_marker_defect`.
@@ -1378,18 +1403,23 @@ def find_non_open_claimant(all_prs: list[PRInfo], txn: ReplanTransaction) -> Can
         return CandidateSelection(Disposition.NONE)
     if txn.pr_number_watermark < 1:
         return CandidateSelection(Disposition.NONE)
-    preexisting = {_canonical(url) for url in txn.preexisting_pr_urls}
-    source = _canonical(txn.source_pr_url)
+    # Membership and the source comparison are by GitHub identity: a listing
+    # that spells the repository differently from the checkpoint names the
+    # same PRs. ``source`` is None for an unusable checkpoint and a listed
+    # PR's identity never is, so the two can never compare equal.
+    preexisting = {ident for url in txn.preexisting_pr_urls if (ident := _identity(url))}
+    source = _identity(txn.source_pr_url)
     for pr in all_prs:
         if pr.is_open:
             continue
         canonical = _canonical(pr.url)
         if not canonical:
             continue
+        identity = _identity(pr.url)
         scan = scan_replan_markers(pr.body or "")
         under_watermark = pr.number <= txn.pr_number_watermark
-        predates = under_watermark or canonical in preexisting
-        if canonical == source:
+        predates = under_watermark or identity in preexisting
+        if identity == source:
             defect = source_marker_defect(scan, txn.transaction_id, canonical, preexisting=predates)
             if defect:
                 return CandidateSelection(Disposition.REJECTED, reason=defect)

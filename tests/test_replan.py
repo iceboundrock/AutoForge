@@ -410,6 +410,11 @@ def _assert_source_untouched(eng, gh):
     "mutate,needle",
     [
         (lambda p: p.update(replacement_pr_url=PR), "replacement_pr_url must differ"),
+        # `Owner/REPO/pull/42` *is* PR 42: GitHub identity, not URL spelling.
+        (
+            lambda p: p.update(replacement_pr_url="https://github.com/Owner/REPO/pull/42"),
+            "replacement_pr_url must differ",
+        ),
         (lambda p: p.update(replacement_branch=BRANCH), "replacement_branch must differ"),
         (lambda p: p.update(fresh_review_round=2), "fresh_review_round"),
         (lambda p: p.pop("replacement_head_sha"), "replacement_head_sha"),
@@ -4756,3 +4761,277 @@ def test_t2_a_failed_replan_leaves_the_review_accounting_untouched(tmp_state_dir
     assert persisted.execution_attempt == 1 and persisted.escalation_count == 0
     assert persisted.superseded_prs == [] and persisted.current_pr_url == PR
     assert gh.prs[PR].state == "OPEN" and gh.closed_prs == []
+
+
+# =============================================================================
+# PR #72 review, R10-F1: checkpoint and listing identity is GitHub identity
+#
+# The journal stores canonical URLs, which keep the owner/repository spelling
+# their author used, while GitHub reads back its own spelling. Every identity
+# comparison the transaction makes -- the source and replacement checkpoints
+# before and after the close, the source and the snapshot in both candidate
+# listings, and the prepare step's listing membership -- is therefore by
+# identity (repository case-insensitively, then the number), never by string
+# equality of canonical forms. A case-only difference is not drift: it must
+# neither refuse the close nor, worse, compensate a correct one.
+# =============================================================================
+
+PR_VARIANT = "https://github.com/Owner/REPO/pull/42"  # GitHub's spelling of PR
+REPLACEMENT_VARIANT = "https://github.com/Owner/REPO/pull/43"  # ... and of REPLACEMENT_PR
+VARIANT_REPO = "Owner/REPO"
+
+
+def test_r10f1_the_source_verifiers_compare_identity_not_spelling():
+    from autoforge.replan_txn import verify_closed_source, verify_source_checkpoint
+
+    txn = _seed_txn(ReplanStage.VERIFIED)
+    assert verify_source_checkpoint(_pr(url=PR_VARIANT), txn) == ""
+    assert verify_closed_source(_pr(url=PR_VARIANT, state="CLOSED"), txn) == ""
+    # Identity is repository *and* number, and never vacuous.
+    assert "source PR identity mismatch" in verify_source_checkpoint(_pr(url=EARLIER_PR), txn)
+    assert "identity mismatch after the close" in verify_closed_source(
+        _pr(url="https://github.com/other/repo/pull/42", state="CLOSED"), txn
+    )
+    assert "source PR identity mismatch" in verify_source_checkpoint(_pr(url=""), txn)
+    txn.source_pr_url = ""
+    # Two unusable sides are not "the same": an empty checkpoint matches nothing.
+    assert "source PR identity mismatch" in verify_source_checkpoint(_pr(url=""), txn)
+    assert "identity mismatch after the close" in verify_closed_source(
+        _pr(url="", state="CLOSED"), txn
+    )
+
+
+def test_r10f1_the_target_verifier_compares_identity_not_spelling():
+    from dataclasses import replace
+
+    from autoforge.replan_txn import verify_target_pr
+
+    txn = _seed_txn(ReplanStage.VERIFIED)
+    gh = FakeGitHub()
+    target = gh.add_pr(
+        url=REPLACEMENT_VARIANT, head_sha=SHA_B, branch=REPLACEMENT_BRANCH, linked=[2]
+    )
+    assert target.repository == VARIANT_REPO
+    assert verify_target_pr(target, txn, "owner/repo", require_checkpoint_head=True) == ""
+    # A case variant of the source *is* the source: never its own replacement.
+    as_source = replace(target, url=PR_VARIANT, number=42)
+    assert "replacement PR must differ from the superseded PR" in verify_target_pr(
+        as_source, txn, "owner/repo", require_checkpoint_head=True
+    )
+    # Another number is another PR, whatever the spelling.
+    other = replace(target, url="https://github.com/Owner/REPO/pull/44", number=44)
+    assert "replacement PR identity mismatch" in verify_target_pr(
+        other, txn, "owner/repo", require_checkpoint_head=True
+    )
+
+
+def _txn_with_a_snapshot(**over) -> ReplanTransaction:
+    """PREPARED with a watermark *below* the snapshot's numbers, so that only
+    snapshot membership can prove a listed PR pre-existed the transaction."""
+    return _seed_txn(
+        ReplanStage.PREPARED,
+        pr_number_watermark=41,
+        preexisting_pr_urls=[PR, "https://github.com/owner/repo/pull/45"],
+        **over,
+    )
+
+
+def test_r10f1_candidate_selection_recognises_the_source_and_the_snapshot_by_identity():
+    gh = FakeGitHub()
+    txn = _txn_with_a_snapshot()
+    # The source, listed under GitHub's spelling and carrying this
+    # transaction's marker: read *as the source* and refused for it, never
+    # treated as a pre-existing PR, never adopted.
+    source = gh.add_pr(
+        url=PR_VARIANT, head_sha=SHA_A, branch=BRANCH, linked=[2], body=_ours_marker()
+    )
+    selection = select_bound_candidate([source], txn)
+    assert selection.disposition is Disposition.REJECTED
+    assert f"source PR {PR_VARIANT} carries the marker" in selection.reason
+    # A snapshot member under GitHub's spelling, above the watermark: still
+    # pre-existing, by membership -- a copied marker can never be adopted.
+    copied = gh.add_pr(
+        url="https://github.com/Owner/REPO/pull/45",
+        head_sha=SHA_B,
+        branch="other",
+        linked=[2],
+        body=_ours_marker(),
+    )
+    selection = select_bound_candidate([copied], txn)
+    assert selection.disposition is Disposition.REJECTED
+    assert "it was in the snapshot of the issue's open PRs" in selection.reason
+    # The genuine replacement, under GitHub's spelling, is adopted.
+    replacement = gh.add_pr(
+        url=REPLACEMENT_VARIANT,
+        head_sha=SHA_B,
+        branch=REPLACEMENT_BRANCH,
+        linked=[2],
+        body=_ours_marker(),
+    )
+    selection = select_bound_candidate([replacement], txn)
+    assert selection.disposition is Disposition.OK
+    assert selection.pr is replacement
+
+
+def test_r10f1_the_non_open_listing_recognises_the_source_and_the_snapshot_by_identity():
+    gh = FakeGitHub()
+    txn = _txn_with_a_snapshot()
+    source = gh.add_pr(
+        url=PR_VARIANT, head_sha=SHA_A, branch=BRANCH, state="CLOSED", body=_ours_marker()
+    )
+    listing = find_non_open_claimant([source], txn)
+    assert listing.disposition is Disposition.REJECTED
+    assert f"source PR {PR_VARIANT} carries the marker" in listing.reason
+    copied = gh.add_pr(
+        url="https://github.com/Owner/REPO/pull/45",
+        head_sha=SHA_B,
+        branch="other",
+        state="CLOSED",
+        body=_ours_marker(),
+    )
+    listing = find_non_open_claimant([copied], txn)
+    assert listing.disposition is Disposition.REJECTED
+    assert "it was in the snapshot of the issue's open PRs" in listing.reason
+    claimant = gh.add_pr(
+        url=REPLACEMENT_VARIANT,
+        head_sha=SHA_B,
+        branch=REPLACEMENT_BRANCH,
+        state="CLOSED",
+        body=_ours_marker(),
+    )
+    listing = find_non_open_claimant([claimant], txn)
+    assert listing.disposition is Disposition.REJECTED
+    assert f"PR {REPLACEMENT_VARIANT} carries the marker" in listing.reason
+    assert "is CLOSED, expected OPEN" in listing.reason
+
+
+def _github_spelling_differs_from_the_journal(tmp_state_dir, gh, stage, **over):
+    """A journal written in the run's spelling over a GitHub that reads back its own."""
+    eng = make_engine(tmp_state_dir, ["the replan agent must not run"], github=gh)
+    gh.add_pr(url=PR_VARIANT, head_sha=SHA_A, branch=BRANCH, linked=[2])
+    gh.add_pr(
+        url=REPLACEMENT_VARIANT,
+        head_sha=SHA_B,
+        branch=REPLACEMENT_BRANCH,
+        linked=[2],
+        body=_ours_marker(),
+    )
+    txn = _seed(eng, stage, **over)
+    assert txn.source_pr_url == PR and txn.replacement_pr_url == REPLACEMENT_PR
+    return eng
+
+
+def test_r10f1_github_s_own_spelling_of_both_checkpoints_is_not_drift(tmp_state_dir):
+    """The write path: pre-close verification, the close, and the post-close
+    confirmation all read back `Owner/REPO` for a journal that says `owner/repo`.
+    Neither side is refused, and the correct close is not compensated."""
+    gh = FakeGitHub()
+    eng = _github_spelling_differs_from_the_journal(tmp_state_dir, gh, ReplanStage.VERIFIED)
+    assert eng.step().next_phase == "REVIEW"
+    assert len(gh.closed_prs) == 1 and gh.reopened_prs == []
+    assert gh.prs[PR_VARIANT].state == "CLOSED"
+    assert eng.state.replan_transaction == {}  # activated, the journal is retired
+    assert eng.state.current_pr_url == REPLACEMENT_PR  # the journal's spelling is kept
+    assert eng.state.superseded_prs[0]["pr_url"] == PR
+
+
+@pytest.mark.parametrize(
+    "stage,over",
+    [
+        (ReplanStage.SUPERSEDE_INTENT, {}),
+        (ReplanStage.SUPERSEDED, {"superseded_at": "2026-01-01T00:00:01+00:00"}),
+    ],
+)
+def test_r10f1_github_s_own_spelling_is_not_drift_on_resume_either(tmp_state_dir, stage, over):
+    """The resume paths that re-derive the checkpoints -- the confirmation a
+    crashed write owes, and activation -- apply the same identity rule."""
+    gh = FakeGitHub()
+    eng = _github_spelling_differs_from_the_journal(tmp_state_dir, gh, stage, **over)
+    _closed_by_controller(gh, PR_VARIANT)
+    eng2 = _restart(eng, gh)
+    assert eng2.step().next_phase == "REVIEW"
+    assert gh.closed_prs == [] and gh.reopened_prs == []
+    assert eng2.provider.calls == []
+    assert eng2.state.current_pr_url == REPLACEMENT_PR
+    assert eng2.state.superseded_prs[0]["transaction_id"] == TXN_ID
+
+
+def _respell_inside_the_close_window(fake) -> None:
+    """GitHub starts reporting its own spelling between the last read and the
+    close -- what a case-only rename of the repository looks like from here."""
+    for old, new in ((PR, PR_VARIANT), (REPLACEMENT_PR, REPLACEMENT_VARIANT)):
+        info = fake.prs.pop(old)
+        info.url = new
+        info.repository = VARIANT_REPO
+        fake.prs[new] = info
+
+
+def test_r10f1_a_case_only_respelling_inside_the_close_window_is_not_compensated(tmp_state_dir):
+    """The post-close comparison is the one place a false identity mismatch is
+    worse than a refusal: it would *reopen* a PR the controller closed
+    correctly. A respelling inside the window is the same PR, so the close
+    stands and the run activates."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.VERIFIED)
+    gh.close_race = _respell_inside_the_close_window
+    assert eng.step().next_phase == "REVIEW"
+    assert len(gh.closed_prs) == 1 and gh.reopened_prs == []
+    assert gh.prs[PR_VARIANT].state == "CLOSED"
+    assert eng.state.replan_transaction == {}
+    assert eng.state.current_pr_url == REPLACEMENT_PR
+    assert eng.state.superseded_prs[0]["pr_url"] == PR
+
+
+def test_r10f1_a_case_only_respelling_still_refuses_real_drift_beside_it(tmp_state_dir):
+    """Identity is not the only check the respelled read must pass: a push
+    landing in the same window is still drift, and is still compensated."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.VERIFIED)
+
+    def respell_and_push(fake):
+        _respell_inside_the_close_window(fake)
+        fake.prs[PR_VARIANT].head_sha = SHA_C
+
+    gh.close_race = respell_and_push
+    assert eng.step().next_phase == "BLOCKED"
+    assert "inside the close window" in eng.state.block_reason
+    assert "the close was undone" in eng.state.block_reason
+    assert len(gh.closed_prs) == 1 and len(gh.reopened_prs) == 1
+    assert gh.prs[PR_VARIANT].state == "OPEN"
+    assert _txn(eng).stage is ReplanStage.REJECTED
+
+
+def test_r10f1_the_prepare_step_finds_the_source_in_a_listing_that_spells_it_differently(
+    tmp_state_dir,
+):
+    """`gh pr view` without a `url` field falls back to the requested spelling
+    (the run's), while the repository-wide listing reports GitHub's. The
+    source is in that listing by identity; a string membership test would
+    refuse to checkpoint a source that was just read as OPEN."""
+    from dataclasses import replace
+
+    from autoforge.validation import parse_pr_url
+
+    gh = FakeGitHub()
+    inner = _replan_agent(gh)
+    prepared = {}
+
+    def agent(req):
+        if req.phase == "REPLAN_REEXECUTE":
+            # The journal as PREPARED persisted it, before the agent ran.
+            prepared.update(load_state(eng.paths.state_file).replan_transaction)
+        return inner(req)
+
+    eng = _park_at_hard_threshold(tmp_state_dir, gh, agent)
+    info = gh.prs.pop(PR)
+    info.url, info.repository = PR_VARIANT, VARIANT_REPO
+    gh.prs[PR_VARIANT] = info
+    original = gh.get_pr
+    gh.get_pr = lambda url: replace(original(url), url=parse_pr_url(url).canonical)
+    assert eng.step().next_phase == "REPLAN_REEXECUTE"
+    assert eng.step().next_phase == "REVIEW"
+    assert prepared["stage"] == ReplanStage.PREPARED.value
+    assert prepared["source_pr_url"] == PR  # the run's spelling, as read back
+    assert PR_VARIANT in prepared["preexisting_pr_urls"]  # the listing's spelling
+    assert eng.state.current_pr_url == REPLACEMENT_PR
+    assert eng.state.superseded_prs[0]["pr_url"] == PR
