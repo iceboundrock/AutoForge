@@ -19,7 +19,7 @@ review comment to post anywhere.
 2. Re-read the specification's Requirements and Acceptance Criteria.
 3. Read the **full** change: `git status --porcelain=v1 --untracked-files=all`,
    `git diff` and `git diff --staged` for tracked edits, and read the untracked
-   files in full — part of the implementation may live in files git has never
+   files in full; part of the implementation may live in files git has never
    seen.
 4. Read the surrounding code the change touches, not just the diff.
 5. Review for: correctness and bugs; regressions in existing behaviour;
@@ -37,15 +37,15 @@ review comment to post anywhere.
 A **finding** is an issue that REQUIRES ACTION in this run before the feature
 can be considered done. Classify each finding:
 
-- `blocked` — must be fixed; the implementation is incorrect, unsafe,
+- `blocked`: must be fixed; the implementation is incorrect, unsafe,
   incomplete or violates the specification.
-- `non-blocked` — should be fixed now; a real defect or standards violation
+- `non-blocked`: should be fixed now; a real defect or standards violation
   with limited blast radius.
-- `nit` — small but real issue (naming, comment accuracy, minor style rule)
+- `nit`: small but real issue (naming, comment accuracy, minor style rule)
   that still requires an explicit resolution.
 
 **Any finding, including a nit, means another fix round is needed**, and this
-run allows only a small, fixed number of them — so do not inflate optional
+run allows only a small, fixed number of them, so do not inflate optional
 preferences into findings. Each finding gets a stable ID
 `R{{REVIEW_ROUND}}-F<n>` (`R{{REVIEW_ROUND}}-F1`, `R{{REVIEW_ROUND}}-F2`, ...)
 and a `required_resolution` stating what would resolve it.

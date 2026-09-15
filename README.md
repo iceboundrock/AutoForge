@@ -2,23 +2,22 @@
 
 **Autonomous orchestration for AI-driven software development.**
 
-智铸——AI 驱动的软件工程自动化控制器。
+智铸：AI 驱动的软件工程自动化控制器。
 
 > **Early development (Phase 2).** The first real AI development loop is
-> wired end to end — GitHub issue → Claude Code implementation → PR
+> wired end to end: GitHub issue → Claude Code implementation → PR
 > verification → OpenCode review → Claude Code remediation → repeated review
-> → `READY_FOR_MERGE`. **Merging is opt-in and controller-owned:** by default
-> the loop stops at `READY_FOR_MERGE` for a human; with the merge safety gate
-> open (`safety.allow_merge: true` in config **and** `--allow-merge` on the
-> CLI) the controller itself verifies the PR on GitHub and merges it — agents
-> never merge. Nothing here is production ready yet.
+> → `READY_FOR_MERGE`. Merging is opt-in and controller-owned: by default the
+> loop stops at `READY_FOR_MERGE` for a human; with the merge safety gate
+> open (`safety.allow_merge: true` in config and `--allow-merge` on the CLI)
+> the controller itself verifies the PR on GitHub and merges it. Agents never
+> merge. Nothing here is production ready yet.
 
 ## What AutoForge is (and is not)
 
-AutoForge is **not another coding agent**. It is a **deterministic
-orchestration layer** that drives existing agents through the software
-lifecycle and refuses to trust anything they claim without checking it
-against GitHub:
+AutoForge is not another coding agent. It is a deterministic orchestration
+layer that drives existing agents through the software lifecycle and refuses
+to trust anything they claim without checking it against GitHub:
 
 ```text
 Issue → ANALYZE_EXECUTE (Claude Code) → PR → REVIEW (OpenCode)
@@ -34,8 +33,8 @@ Issue → ANALYZE_EXECUTE (Claude Code) → PR → REVIEW (OpenCode)
 ```
 
 There is a second, explicit workflow for when there is no GitHub to
-orchestrate — an interview, a scratch repository, an offline machine. **Local
-mode** (`autoforge local`) drives a feature Markdown file against your working
+orchestrate: an interview, a scratch repository, an offline machine. Local
+mode (`autoforge local`) drives a feature Markdown file against your working
 tree with the same controller and the same verification discipline, and makes
 zero `gh` invocations:
 
@@ -52,24 +51,25 @@ AutoForge itself never writes business code. It:
 - selects the execution profile (which provider/model/effort for which round),
 - renders strictly-validated prompts from file templates,
 - invokes `claude` / `opencode` through provider adapters and `gh` through a
-  typed `GitHubClient` (argv lists only, never a shell) — read-only except for
-  the gated, controller-owned merge (`gh pr merge --match-head-commit`) and
-  the disarming of any auto-merge that call left behind,
+  typed `GitHubClient` (argv lists only, never a shell), all of it read-only
+  except for the gated, controller-owned merge
+  (`gh pr merge --match-head-commit`) and the disarming of any auto-merge
+  that call left behind,
 - parses the machine-readable `CONTROL_RESULT` protocol from agent stdout,
-- **verifies every claim** (PR exists / is OPEN / HEAD SHA / branch, review
+- verifies every claim (PR exists / is OPEN / HEAD SHA / branch, review
   comment exists on the right PR for the right round and SHA, follow-up issue
   exists, fix actually moved HEAD) before advancing state atomically,
-- **merges only itself, only when told to, and only what was reviewed**: with
+- merges only itself, only when told to, and only what was reviewed: with
   the safety gate open it re-verifies the PR on GitHub (open, at the reviewed
   HEAD, checks green, mergeable, no auto-merge / merge queue), merges bound to
   that exact HEAD, and counts the merge only after GitHub reports `MERGED`,
 - logs every invocation (redacted) under `.autoforge/logs/<run-id>/`.
 
-It is a **single-machine client tool, not a distributed service**: one process
+It is a single-machine client tool, not a distributed service: one process
 on your own machine, driving your `git`, `gh`, and agent CLIs under your
 credentials, with local per-checkout state in `.autoforge/` and a single
 OS-level repository lock instead of any coordinator. The expected failure modes
-are a `Ctrl-C`, a killed process, and a reboot — which is why side effects are
+are a `Ctrl-C`, a killed process, and a reboot, which is why side effects are
 checkpointed before they are performed. What *is* remote and concurrent is
 GitHub and the humans acting on it, which is why nothing GitHub-side is
 believed without being read back. Work happens on a dedicated feature branch,
@@ -116,9 +116,9 @@ src/autoforge/
                       + local_common.md and the local_* phase templates
 ```
 
-Key design points:
+Design points:
 
-- **Transition logic lives only in `transitions.py`** — never in CLI handlers.
+- **Transition logic lives only in `transitions.py`**, never in CLI handlers.
 - **`step()` is the core primitive**; `run()`/`resume` just loop it until a
   stop phase (`READY_FOR_MERGE`, `DONE`, `BLOCKED`, `FAILED`). With the merge
   gate open (`safety.allow_merge: true` **and** `--allow-merge`)
@@ -137,22 +137,22 @@ Key design points:
   `needs_fix_round == (len(findings) > 0)`. Non-actionable remarks belong in
   Observations and do not block.
 - **Dry-run is side-effect-free**: no subprocess, no `gh` call, no state
-  write, no lock — it only prints the plan (phase, provider, model/effort,
+  write, no lock. It only prints the plan (phase, provider, model/effort,
   round, template, variables, command, expected transition), redacted.
 - **Trust boundary**: `prompts/common.md` declares GitHub issues/PRs/comments,
-  source, tests, and logs **untrusted data**; controller instructions and the
+  source, tests, and logs untrusted data; controller instructions and the
   repo's `AGENTS.md`/`CLAUDE.md` outrank them.
 - **Atomic persistence**: temp file + fsync + `os.replace`; corrupted state
   fails loudly and is never silently overwritten: `run`, `resume`, `step` and
   `status` all exit 2 on an unreadable or foreign-protocol `state.json`
   (bad JSON, unknown phase, invalid UTF-8, dangling symlink, or a
-  non-regular entry such as a FIFO, socket, device or directory — the entry
+  non-regular entry such as a FIFO, socket, device or directory; the entry
   is inspected and opened non-blocking, so a FIFO never hangs the command),
   and `run --force` moves the entry aside as `state.json.corrupt-<timestamp>`
   instead of deleting it (a symlink is archived as a link; its target is
   never touched; a directory cannot be archived and is refused).
   `run` inspects, decides, quarantines, writes the first
-  state **and executes it** under one continuous controller lock, so a
+  state and executes it under one continuous controller lock, so a
   concurrent controller can never be quarantined or overwritten on a stale
   verdict, nor slip in between the first save and the engine loop.
 - **The REVIEW/FIX loop is bounded by the controller.** `workflow.max_review_rounds`
@@ -193,7 +193,7 @@ Key design points:
   profile to independently rebuild from the latest verified default branch.
   Closing the superseded PR is the controller's only destructive write on
   agent-produced work, so the whole phase runs as **one durable transaction**
-  (`replan_txn.py`) with an explicit monotonic lifecycle — `PENDING`,
+  (`replan_txn.py`) with an explicit monotonic lifecycle: `PENDING`,
   `PREPARED`, `VERIFIED`, `SUPERSEDE_INTENT`, `COMPENSATING`, `SUPERSEDED`, or
   the terminal `REJECTED`. Before the agent is invoked, `PREPARED` checkpoints the source PR
   and its exact HEAD, the verified default branch, the complete review
@@ -201,7 +201,7 @@ Key design points:
   controller-generated transaction id. That id is the **only** accepted proof
   of causality: the replacement must publish it in an
   `<!-- autoforge-replan-transaction: {...} -->` marker in its PR body, which
-  the controller reads back from GitHub. Shape is never proof — an unmarked PR
+  the controller reads back from GitHub. Shape is never proof: an unmarked PR
   is ignored, a PR that already existed is refused even if it carries a copied
   marker, and two claimants block. Candidates are searched repository-wide, so
   a marked PR the agent has not yet linked to the issue is refused for the
@@ -210,7 +210,7 @@ Key design points:
   replacement that was closed before recovery is rejected with the PR named instead of
   triggering a second implementation. The PR-number watermark is a proven numeric maximum
   over all states, never inferred from one creation-time-ordered node. The old PR is closed
-  only while both sides still match their checkpoints — including the marker,
+  only while both sides still match their checkpoints, including the marker,
   re-read on the last read before the close. GitHub has no conditional close,
   so that comparison cannot be fused to the write: it is *completed after* it,
   and a checkpoint that moved inside the close window is compensated by
@@ -220,11 +220,11 @@ Key design points:
   never into a second close. `SUPERSEDE_INTENT` is persisted *before* the write
   so a crash resumes into disposition rather than a second attempt, and a separate
   `gh pr comment` posts an `<!-- autoforge-replan-close: … -->` receipt only after the
-  controller observed its own close landing — never inside `gh pr close --comment`, whose
+  controller observed its own close landing, never inside `gh pr close --comment`, whose
   comment predates the close. The receipt is what tells the controller's own close from a
-  human's afterwards — a source found closed without this transaction's receipt blocks
+  human's afterwards. A source found closed without this transaction's receipt blocks
   and is never reopened, a conclusive close failure is never adopted, and an open source
-  found under a recorded intent is never closed from a resume — with the receipt it is a
+  found under a recorded intent is never closed from a resume: with the receipt it is a
   prior close a human reopened, and without it the journal cannot tell "the close never
   ran" from "it landed, lost its receipt to a crash, and was reopened", so both block.
   `SUPERSEDED` is persisted before the replacement is installed into state, so
@@ -246,9 +246,9 @@ Key design points:
 |---|---|---|
 | `INITIALIZING` | controller | cwd repo == issue repo, issue is in this repo, is not the EPIC, exists and is OPEN |
 | `ANALYZE_EXECUTE` | Claude Code (`fable`, effort high) | existing open PR for the issue is recovered without re-running the agent; otherwise PR exists in this repo, is OPEN, HEAD SHA and branch match the claim |
-| `REVIEW` | OpenCode (round 1 `openai/gpt-5.6-luna` high, rounds 2–5 `openai/gpt-5.6-terra` high, 6+ `openai/gpt-5.6-sol` medium, intentionally retained through the 20-round cap) | round number, reviewed SHA == bound HEAD, exactly one review comment on this PR with the `# AI Code Review — Round N` heading and the `ai-review-result` marker matching round/SHA/flag, findings invariant; then controller policy: an eligible replan (including workflow stagnation or the cap) enters `REPLAN_REEXECUTE`; an exhausted replan limit or no eligible replan blocks. Entering `REVIEW` past the cap (stale re-review, HEAD drift, resume) is refused before the reviewer runs |
+| `REVIEW` | OpenCode (round 1 `openai/gpt-5.6-luna` high, rounds 2 to 5 `openai/gpt-5.6-terra` high, 6+ `openai/gpt-5.6-sol` medium, intentionally retained through the 20-round cap) | round number, reviewed SHA == bound HEAD, exactly one review comment on this PR with the `# AI Code Review — Round N` heading and the `ai-review-result` marker matching round/SHA/flag, findings invariant; then controller policy: an eligible replan (including workflow stagnation or the cap) enters `REPLAN_REEXECUTE`; an exhausted replan limit or no eligible replan blocks. Entering `REVIEW` past the cap (stale re-review, HEAD drift, resume) is refused before the reviewer runs |
 | `FIX` | Claude Code (`fable`, effort high) | `previous_head_sha` == current HEAD, every open finding ID resolved (`fixed` / `follow_up_created` / `no_change_with_rationale`), follow-up issues exist in this repo and are OPEN, actual PR HEAD == `new_head_sha`, a `fixed` resolution moved HEAD |
-| `REPLAN_REEXECUTE` | OpenCode (`replan_reexecute`, default `openai/gpt-5.6-terra`, effort high) | One durable transaction. `PREPARED` (written before the agent runs) checkpoints the source PR at its exact HEAD, the verified default branch, the complete historical findings, the identities of the already-open PRs, and a random transaction id; a round whose findings could not be persisted in full refuses the replan here and keeps the old PR. The replacement is found **only** by the transaction marker in its PR body — never by shape, never from the CONTROL_RESULT, and never among the pre-existing PRs; several claimants, a copied marker or an unusable one all block. It must additionally be a distinct OPEN PR of this repository, linked to the issue, on a distinct branch based on the verified default branch, and its marker must attest this transaction id, this execution attempt, passing tests and at least the preserved historical finding count. `VERIFIED` records its HEAD; immediately before the destructive write both sides are re-read and must still match the checkpoint exactly. `SUPERSEDE_INTENT` is persisted *before* `gh pr close` so a crash resumes into disposition, and a separate `gh pr comment` posts an `<!-- autoforge-replan-close: … -->` receipt only after the controller observed its own close landing (never inside `gh pr close --comment`); the receipt is what proves afterwards that the close was the controller's and not a human's; the close outcome is re-read from GitHub rather than inferred from the exit status, a conclusive close failure is never adopted, and an open source under a recorded intent is never closed from a resume, with or without the receipt. A checkpoint that moved inside the close window is undone under a durable `COMPENSATING` record written before the reopen, and the replacement is re-verified once more before it is installed into controller state. Only then does the controller close the old PR without merge and reset the replacement lifecycle so its next review is round 1. Every refusal is persisted as `REJECTED` and replayed by `resume`; a transient GitHub failure is left resumable instead. |
+| `REPLAN_REEXECUTE` | OpenCode (`replan_reexecute`, default `openai/gpt-5.6-terra`, effort high) | One durable transaction. `PREPARED` (written before the agent runs) checkpoints the source PR at its exact HEAD, the verified default branch, the complete historical findings, the identities of the already-open PRs, and a random transaction id; a round whose findings could not be persisted in full refuses the replan here and keeps the old PR. The replacement is found **only** by the transaction marker in its PR body, never by shape, never from the CONTROL_RESULT, and never among the pre-existing PRs; several claimants, a copied marker or an unusable one all block. It must also be a distinct OPEN PR of this repository, linked to the issue, on a distinct branch based on the verified default branch, and its marker must attest this transaction id, this execution attempt, passing tests and at least the preserved historical finding count. `VERIFIED` records its HEAD; immediately before the destructive write both sides are re-read and must still match the checkpoint exactly. `SUPERSEDE_INTENT` is persisted *before* `gh pr close` so a crash resumes into disposition, and a separate `gh pr comment` posts an `<!-- autoforge-replan-close: … -->` receipt only after the controller observed its own close landing (never inside `gh pr close --comment`); the receipt is what proves afterwards that the close was the controller's and not a human's; the close outcome is re-read from GitHub rather than inferred from the exit status, a conclusive close failure is never adopted, and an open source under a recorded intent is never closed from a resume, with or without the receipt. A checkpoint that moved inside the close window is undone under a durable `COMPENSATING` record written before the reopen, and the replacement is re-verified once more before it is installed into controller state. Only then does the controller close the old PR without merge and reset the replacement lifecycle so its next review is round 1. Every refusal is persisted as `REJECTED` and replayed by `resume`; a transient GitHub failure is left resumable instead. |
 | `READY_FOR_MERGE` | nobody | holding state; `step`/`resume` refuse to continue unless the merge gate is open (`resume` only re-prints the banner). With the gate open (`step --allow-merge` / `resume --allow-merge`) it runs the full pre-merge verification below against GitHub *before* entering `MERGE`: closed / conflicting / failing / draft / queued PRs, a required check whose job/step structure differs from the base branch's own run, and a failing `merge.verification_commands` command on the exported reviewed HEAD go to `BLOCKED` without ever reaching `MERGE`, HEAD drift -> `REVIEW`, an already-merged PR -> `MERGE` to reconcile; inconclusive data (checks running, the base branch's own run still running, mergeability unknown, GitHub unreachable / transient read failure, reviewed commit not fetchable) keeps the phase for `resume --allow-merge`, at most `merge.max_verification_attempts` times, then `BLOCKED`; a read that fails conclusively (bad credentials, permissions, unresolvable PR) -> `BLOCKED` at once |
 | `MERGE` (gated) | controller, never an agent | last review clean and PR HEAD == reviewed HEAD; GitHub says PR is OPEN, not draft, every check succeeded, `mergeable=MERGEABLE`, `mergeStateStatus` `CLEAN`/`HAS_HOOKS`, no auto-merge armed, base branch has no merge queue, every `safety.required_checks` run has the same jobs and steps as the base branch's own run of that workflow (`safety.verify_check_definition`); then every `merge.verification_commands` command passes in a temporary export of the reviewed HEAD (persisted per HEAD + command list, so a resume does not repeat it); then `gh pr merge --<method> --match-head-commit <reviewed HEAD>`; counted only once GitHub reports `MERGED` at that HEAD. Conclusive negatives (a failing local command included) and conclusive read failures (bad credentials, permissions) -> `BLOCKED`; inconclusive data (checks running, base run still running, mergeability unknown, transient read failure, unfetchable reviewed commit, post-merge re-read failed) stays in `MERGE` for `resume --allow-merge`, at most `merge.max_verification_attempts` times, then `BLOCKED`; HEAD drift -> `REVIEW` |
 | `UPDATE_EPIC` | OpenCode (`update_epic` profile) | `next_issue_url` gets the `INITIALIZING` checks before the controller switches issues: parses as an issue URL of this repo (a foreign URL is never even queried), is neither the EPIC nor the just-finished issue (compared case-insensitively by repository + number, never by URL string), exists on GitHub and is OPEN. A rejected selection, or a transient GitHub failure while checking it, keeps the phase and `resume` asks the agent once more with the reason in its prompt; a second rejection -> `BLOCKED`. A conclusive GitHub failure (authentication, permissions, malformed data) -> `BLOCKED` immediately, without invoking the agent again. Only a verified issue reaches `ANALYZE_EXECUTE`; `null` -> `DONE` |
@@ -261,8 +261,8 @@ or more candidate PRs → `BLOCKED` (the controller never guesses).
 `resume` both call the same reducer over the persisted transaction, so the
 normal and crash paths cannot drift apart about what is acceptable. Because
 the transaction id is generated and persisted *before* the agent is invoked,
-"crashed before invoking" and "crashed while the agent ran" are one state —
-either a PR carrying that id exists, or none does — and a crash after the
+"crashed before invoking" and "crashed while the agent ran" are one state
+(either a PR carrying that id exists, or none does), and a crash after the
 replacement was created never causes a second implementation attempt.
 
 Correction retry: when an agent exits 0 but its `CONTROL_RESULT` is missing or
@@ -279,7 +279,7 @@ automatically; they leave the phase unchanged for `resume`.
 
 - Python 3.11+ (managed via `uv`)
 - `uv` ([install](https://docs.astral.sh/uv/getting-started/installation/))
-- `git`, and `gh` (GitHub CLI **2.48.0 or newer**, authenticated) — the
+- `git`, and `gh` (GitHub CLI **2.48.0 or newer**, authenticated): the
   client lists branch rules and a PR's changed files with
   `gh api --paginate --slurp`, which older releases reject; `autoforge doctor`
   refuses an older `gh` up front. `gh` is **not** needed for
@@ -339,15 +339,15 @@ HEAD, and states that automatic merge is disabled: a human merges the PR.
 gate open (`resume --allow-merge` / `step --allow-merge`) the controller
 continues through its own pre-merge verification, `MERGE` and `UPDATE_EPIC`.
 
-URLs must be HTTPS GitHub issue URLs, and EPIC + issue must be in the **same
-repository** as the current working directory (cross-repo runs are rejected).
+URLs must be HTTPS GitHub issue URLs, and EPIC + issue must be in the same
+repository as the current working directory (cross-repo runs are rejected).
 
 ## Local mode (no GitHub)
 
 Sometimes there is no GitHub to orchestrate: a coding interview, a scratch
 repository, an air-gapped machine, or simply a change you want driven by the
-same review loop without opening an Issue. `autoforge local` is a **separate,
-explicit workflow** for exactly that — the same controller, the same
+same review loop without opening an Issue. `autoforge local` is a separate,
+explicit workflow for exactly that: the same controller, the same
 "never trust the agent" discipline, none of the GitHub lifecycle.
 
 ```text
@@ -357,10 +357,10 @@ features/<slug>.md  →  INITIALIZING → ANALYZE_EXECUTE → REVIEW
                                          → findings after the fix budget ─▶ BLOCKED
 ```
 
-A local run **never** touches GitHub: no `gh` invocation, no Issue, no PR, no
+A local run never touches GitHub: no `gh` invocation, no Issue, no PR, no
 comment, no push, no branch, no merge, no EPIC update, no follow-up issue, and
 no replan. The `GitHubClient` is not even constructed. Nothing is faked
-either — there are no placeholder PR URLs in local state or local prompts.
+either: there are no placeholder PR URLs in local state or local prompts.
 
 ### The interview-sized example
 
@@ -391,7 +391,7 @@ uv run autoforge resume                  # they read the mode from persisted sta
 `autoforge local init <slug>` writes `features/<slug>.md` (directory
 configurable via `local.feature_dir`) with `## Problem`, `## Requirements`,
 `## Acceptance Criteria` (checkboxes), `## Non-goals` and
-`## Notes / Decisions`. Feature specifications are **project content**, not
+`## Notes / Decisions`. Feature specifications are project content, not
 runtime state: they live in your repository and you may commit them.
 Controller state stays out of the tree entirely. `local init` refuses to
 overwrite an existing file unless you pass `--force`, refuses to write through
@@ -413,18 +413,18 @@ bypass a controller invariant has no authority.
 
 ### What the controller verifies (there is no GitHub to ask)
 
-The local analogue of "GitHub is the source of truth" is the **working tree
-itself** — not git's opinion of it. Before and after every phase the controller
+The local analogue of "GitHub is the source of truth" is the working tree
+itself, not git's opinion of it. Before and after every phase the controller
 walks the tree through its own directory descriptors and computes a **workspace
 fingerprint** over everything it finds.
 
 It is a walk, not a `git status`, and that is the central design decision.
 `git status` answers "what would I commit?", which is a different question
-from "which bytes could the reviewer have read". An ignored file, a file
-marked `assume-unchanged` or `skip-worktree`, a mode change under
-`core.fileMode=false`, an empty directory, a symbolic link whose target text
-changed — git reports none of those, and each one is code a reviewer can read
-and an agent can edit. So git is asked only what it is authoritative about
+from "which bytes could the reviewer have read". Git reports none of these:
+an ignored file, a file marked `assume-unchanged` or `skip-worktree`, a mode
+change under `core.fileMode=false`, an empty directory, a symbolic link whose
+target text changed. Each one is code a reviewer can read and an agent can
+edit. So git is asked only what it is authoritative about
 (where the repository is, what HEAD and the branch are); the filesystem is
 asked what is in the tree.
 
@@ -434,7 +434,7 @@ no fifth:
 | | |
 |---|---|
 | **hashed** | regular files: SHA-256 of the bytes, plus the permission bits (whether a script is executable decides what a validation command does with it) |
-| **metadata** | directories and symbolic links: the mode, and for a link its target *text* — never what the target contains |
+| **metadata** | directories and symbolic links: the mode, and for a link its target *text*, never what the target contains |
 | **excluded** | the repository's own git directory (identified by `(st_dev, st_ino)`, not by the name `.git`) and anything matching `local.exclude`. Both are hashed into the fingerprint as *rules* and named to the reviewer in its prompt, so "what was not reviewed" is part of the review's identity |
 | **refused** | anything that cannot be bound at all: a FIFO, socket or device; an unreadable file or unlistable directory; a nested repository or submodule; a symbolic link pointing outside the tree, into an excluded region, or to a directory (the root included) through which an excluded entry can be reached at an unexcluded path. The run fails closed, naming the entry and the exclusion that would accept it |
 
@@ -442,13 +442,13 @@ Nothing is silently skipped, so "the snapshot does not mention it" and "it is
 not in the tree" are the same statement.
 
 Two things are deliberately *not* in the fingerprint. The first is HEAD and
-the branch: they are bound separately, so an ordinary `git commit` — which
-changes no byte of the working tree — is reported as what it is (the git
+the branch: they are bound separately, so an ordinary `git commit`, which
+changes no byte of the working tree, is reported as what it is (the git
 anchor moved, and the run blocks) rather than as "the reviewer modified the
 workspace". The second is the run's own state, which lives outside the
 reviewed tree entirely, under `<git dir>/autoforge/state`: a controller that
 writes into the tree it fingerprints would either invalidate its own review on
-every step or have to carve a region out by name — a region an agent could
+every step or have to carve a region out by name, a region an agent could
 then write into without moving the fingerprint. An explicit `--state-dir`
 inside the working tree is refused for the same reason.
 
@@ -467,7 +467,7 @@ name, which means a symbolic link, hard link, FIFO or device planted at an
 artifact's name is *replaced*: it is never opened, so whatever it pointed at
 is provably untouched. The append-only `events.jsonl` is the one artifact that
 must be opened in place, and there the open is `O_NOFOLLOW|O_NONBLOCK` and
-refuses a hard link outright. `run_id` — which names `logs/<run_id>` — is
+refuses a hard link outright. `run_id`, which names `logs/<run_id>`, is
 validated as a single safe path component whenever state is loaded, not
 trusted because the controller generated it once.
 
@@ -476,7 +476,7 @@ With that, the controller checks for itself:
 | Phase | Verified independently of what the agent claimed |
 |---|---|
 | `ANALYZE_EXECUTE` | feature spec hash unchanged; the workspace really changed (and matches the agent's `changed_workspace` claim); every configured validation command exits 0 |
-| `REVIEW` | feature spec hash unchanged; the tree still matches the fingerprint the controller bound after the last verified write phase (`REVIEW` never binds a new one — a tree that drifted, whatever moved it, is `BLOCKED` before the reviewer is launched); the reviewed fingerprint is exactly that value; the reviewer did not modify the workspace; `needs_fix_round == (findings > 0)`; finding IDs unique and in-round |
+| `REVIEW` | feature spec hash unchanged; the tree still matches the fingerprint the controller bound after the last verified write phase (`REVIEW` never binds a new one; a tree that drifted, whatever moved it, is `BLOCKED` before the reviewer is launched); the reviewed fingerprint is exactly that value; the reviewer did not modify the workspace; `needs_fix_round == (findings > 0)`; finding IDs unique and in-round |
 | `FIX` | feature spec hash unchanged; every open finding has a resolution; a `fixed` resolution actually changed the workspace; validation commands still pass |
 
 **No commit is ever required and HEAD never has to move.** The implementation
@@ -486,10 +486,10 @@ pushes, stashes, resets or switches branches on your behalf.
 ### Dirty working trees
 
 v1 policy, chosen for correctness over convenience: the working tree must be
-clean **apart from the feature specification itself** (so a brand-new,
+clean apart from the feature specification itself (so a brand-new,
 uncommitted `features/<slug>.md` is fine). Otherwise `local run` refuses and
 names the paths, so you can commit or stash them. `--allow-dirty` starts
-anyway and records those paths in the run — they are reported in `status` and
+anyway and records those paths in the run: they are reported in `status` and
 to the reviewer, never silently absorbed into the implementation baseline.
 Separating pre-existing edits from agent edits in the same file is a heuristic,
 and a heuristic is not a trust boundary.
@@ -501,7 +501,7 @@ file's are. The recorded paths are disclosure, not an exemption.
 
 ### Review/fix bound
 
-Local mode does **not** use the 20-round remote machinery. The default is one
+Local mode does not use the 20-round remote machinery. The default is one
 fix round: `REVIEW → FIX → REVIEW`, then `DONE` if clean and `BLOCKED` if
 findings remain. Configure it with `local.max_fix_rounds` (0 means a single
 review pass, and any finding blocks). A blocked local run leaves every change
@@ -513,7 +513,7 @@ required by `local doctor` and at the start of the run.
 
 ### Validation commands
 
-Optional, controller-owned and controller-run — argv arrays, never shell
+Optional, controller-owned and controller-run: argv arrays, never shell
 strings, never auto-detected from your stack:
 
 ```yaml
@@ -538,7 +538,7 @@ would refuse.
 `local run --dry-run` is side-effect-free in the usual AutoForge sense: it
 prints the mode, the feature path, its frozen hash, the current fingerprint,
 the phase, the selected profile, the prompt template, the validation commands
-that *would* run and the legal next transitions — and invokes no agent, runs
+that *would* run and the legal next transitions. It invokes no agent, runs
 no validation command, and writes no state file.
 
 A local run is durable and resumable exactly like a remote one: state lives in
@@ -547,13 +547,13 @@ mode, feature path, frozen hash, base HEAD, bound and reviewed fingerprints,
 review/fix rounds and open findings. `Ctrl-C` then `autoforge resume` continues
 from the persisted phase, re-reading the real working tree.
 
-It also holds the run's **contract**: the repository root, the state
+It also holds the run's contract: the repository root, the state
 directory, the workspace policy (`local.exclude`, both cost bounds and the
 snapshot algorithm), `local.validation_commands`, `local.max_fix_rounds`,
 `workflow.max_total_steps` and the prompt version, as they were when the run
 started. A resumed run may
-revalidate its contract but never redefines it: every later invocation —
-`resume`, `step`, `status`, a dry run, a crash recovery — compares what it
+revalidate its contract but never redefines it: every later invocation
+(`resume`, `step`, `status`, a dry run, a crash recovery) compares what it
 would define against the record before it binds the run, and refuses with
 each moved field named (`local.exclude: run: [] current: ["src"]`) rather
 than reviewing a tree under rules nobody reviewed it under. Restore the
@@ -562,8 +562,8 @@ without a readable contract is refused, never filled in from today's
 configuration.
 
 Recovery never trusts what the dead process believed. Every fact the next
-transition depends on — the fingerprint, the git anchor, the specification
-hash — is re-derived after the restart, and an illegal combination of fields
+transition depends on (the fingerprint, the git anchor, the specification
+hash) is re-derived after the restart, and an illegal combination of fields
 fails at the moment the state file is read rather than somewhere downstream.
 The one thing that *is* carried across is a checkpoint written **before** a
 write-capable agent is launched, recording the phase and the fingerprint it
@@ -571,8 +571,8 @@ started from. That is what makes "crashed before implementing" and "crashed
 after implementing" distinguishable without asking the agent: the resumed
 attempt is judged against the tree from before the *first* attempt, so work
 already in the tree counts, and re-entry is bounded rather than endless:
-three launches per phase entry, counting every launch — the entry's own, a
-correction retry after a malformed `CONTROL_RESULT`, a resumed attempt —
+three launches per phase entry, counting every launch (the entry's own, a
+correction retry after a malformed `CONTROL_RESULT`, a resumed attempt),
 each written to the state file before the agent starts, then `BLOCKED`. The
 checkpoint belongs to the phase that wrote it: a state file holding one
 under a different live phase is refused at load rather than closed by that
@@ -582,8 +582,8 @@ in `BLOCKED` or `FAILED` keeps it, as evidence.
 ## State directory
 
 Remote mode defaults to `.autoforge/` in the working directory (overridable
-via `--state-dir` or config). A **local** run defaults to
-`<git dir>/autoforge/state` instead — outside the tree it fingerprints, since
+via `--state-dir` or config). A local run defaults to
+`<git dir>/autoforge/state` instead, outside the tree it fingerprints, since
 its own writes would otherwise keep invalidating its own review. Same layout
 either way:
 
@@ -601,7 +601,7 @@ either way:
             control-result.json            # parsed CONTROL_RESULT (when valid)
 ```
 
-The controller lock is deliberately **not** in the state directory. It lives
+The controller lock is deliberately not in the state directory. It lives
 in the repository's git directory, `<repo>/.git/autoforge/controller.lock`
 (resolved with `git rev-parse --git-common-dir` from the controller's working
 directory), so it is the same file for every `--state-dir`, every
@@ -618,7 +618,7 @@ resolutions), `step_count` (cumulative for the run, never reset), `attempt`
 and `block_reason`. It also records `execution_attempt` (initial implementation
 is 1), `escalation_count` (completed replans), `superseded_prs` (each entry
 naming the transaction that superseded it), and the durable
-`replan_transaction` record described above — the controller's intent journal,
+`replan_transaction` record described above: the controller's intent journal,
 which `resume` replays rather than re-deriving a decision from GitHub facts. State keeps compact finding summaries and review
 comment URLs, rather than copying unbounded PR discussion bodies. Those
 summaries are bounded (100 findings per round, 2000 characters per required
@@ -654,7 +654,7 @@ audit data rather than state payload.
   single name: `controller.lock` is opened with `O_NOFOLLOW` and
   `fstat`-checked, so a symlink, FIFO, socket, device or directory in its
   place, or a hard link that shares its inode with another file, is refused
-  with `LockError` (exit 2) before anything is written — a tampered path or
+  with `LockError` (exit 2) before anything is written: a tampered path or
   entry can neither redirect the PID write to another file nor produce a
   traceback. These checks cover entries that are damaged or tampered *at
   rest*; a writer with write access to the git directory who races the
@@ -663,8 +663,8 @@ audit data rather than state payload.
   privileges and is outside the trust boundary (the git directory is assumed
   to be writable only by the operating user).
 - **Automatic merge is off by default and opt-in only.** The `MERGE` phase is
-  reachable only from `READY_FOR_MERGE` and only when **both**
-  `safety.allow_merge: true` is set in config **and** `--allow-merge` is
+  reachable only from `READY_FOR_MERGE` and only when both
+  `safety.allow_merge: true` is set in config and `--allow-merge` is
   passed on the CLI. With the gate closed `run`/`resume` stop at
   `READY_FOR_MERGE` and a human merges. `safety.allow_merge` is the *only*
   config key that opens the gate: the historical `execution.allow_merge` is
@@ -684,13 +684,13 @@ audit data rather than state payload.
   (`gh api repos/{owner}/{repo}/rules/branches/{branch}`, every page) and
   reports which contexts a `required_status_checks` rule names, whether each
   of `safety.required_checks` (default `ci`) is among them, whether the
-  ruleset's enforcement is `active`, and whether it has bypass actors — any
+  ruleset's enforcement is `active`, and whether it has bypass actors. Any
   of those missing is a `FAIL` with the settings URL and the rule to add. A
   repository still on classic branch protection is checked through that
   instead (`enforce_admins` standing in for "no bypass actors"). A read the
   token is not allowed to make (no credentials, a plan that hides rulesets,
   a non-admin token and no ruleset) or a transient GitHub failure is `SKIP`,
-  never a false alarm; so is a *partial* read — GitHub returns a ruleset's
+  never a false alarm; so is a *partial* read: GitHub returns a ruleset's
   `bypass_actors` only to a token with write access to it, and a rule this
   token can see but whose bypass list it cannot is `SKIP` rather than `OK`
   (a token that GitHub says may itself bypass the rule is a `FAIL` either
@@ -703,7 +703,7 @@ audit data rather than state payload.
   prompt carries the unconditional rule "never merge a pull request".
 - **Pre-merge verification is controller-side and fails closed.** It runs in
   `READY_FOR_MERGE` (before `MERGE` is entered) and again in `MERGE` (before
-  the write), reading only controller state and GitHub — never an agent
+  the write), reading only controller state and GitHub, never an agent
   claim. GitHub must report: PR open at the reviewed HEAD, not a draft, no
   change to any `safety.protected_merge_paths` entry (see below), every
   check in the status rollup succeeded (all checks, not only required ones),
@@ -733,7 +733,7 @@ audit data rather than state payload.
   (`gh api --paginate --slurp`, every page), so a PR is judged on all of
   its files rather than on the first hundred; GitHub itself stops the
   endpoint at 3,000 files, and a listing that stays short of GitHub's own
-  `changedFiles` count is refused — a short listing cannot prove a protected
+  `changedFiles` count is refused: a short listing cannot prove a protected
   path was left alone, and a PR that large is not one to merge unattended
   anyway. Setting the list to `[]` disables the gate; leaving the
   key empty (`null`) is a configuration error rather than a silent opt-out.
@@ -752,7 +752,7 @@ audit data rather than state payload.
   a short listing is refused) and compares that structure with the base
   branch's own `push` run of the same workflow at the branch's current tip:
   same job names, same step names in the same order, job order ignored.
-  The first difference — a job or step missing, added or renamed — is
+  The first difference (a job or step missing, added or renamed) is
   `BLOCKED` with the difference named. The reference must be a completed,
   successful run; a base branch without one at its tip is `BLOCKED` (make
   it green first), and a reference still running is inconclusive. This
@@ -764,7 +764,7 @@ audit data rather than state payload.
 - **The controller can run its own verification on the reviewed commit.**
   `merge.verification_commands` (argv lists, empty by default) run on the
   operator's machine after every GitHub-side fact above has passed, in a
-  fresh temporary export of the reviewed HEAD — `git read-tree` +
+  fresh temporary export of the reviewed HEAD: `git read-tree` +
   `git checkout-index` into `autoforge-premerge-*`, so no worktree or branch
   is created, the operator's checkout is untouched and there is no `.git`
   for a command to reach; the export is deleted afterwards. That also means
@@ -787,7 +787,7 @@ audit data rather than state payload.
   GitHub reports `MERGED` at the reviewed HEAD (idempotently, across crashes).
   If `gh pr merge` returns but the PR is still open, any auto-merge that call
   armed is disabled again (`gh pr merge --disable-auto`) and the run is
-  `BLOCKED` — unless the PR is open at a *different* HEAD (pushed between the
+  `BLOCKED`, unless the PR is open at a *different* HEAD (pushed between the
   verification and the write, so `--match-head-commit` refused it) and no
   asynchronous merge is pending: then nothing unreviewed merged, the clean
   review is stale and the run goes back to `REVIEW`. If the post-merge re-read fails, the outcome is treated as
@@ -796,7 +796,8 @@ audit data rather than state payload.
   bounded by the same `merge.max_verification_attempts`, then `BLOCKED`.
 - Logs and CLI output pass through baseline secret redaction (`GITHUB_TOKEN`,
   `GH_TOKEN`, `*_API_KEY`, `Authorization: Bearer`, `ghp_*`, `sk-*`, …). No
-  environment dump is ever written. Baseline only — no claim of completeness.
+  environment dump is ever written. Baseline only, with no claim of
+  completeness.
 - No `os.system` / `shell=True` anywhere; prompts travel as a single argv
   element so shell metacharacters in issue text cannot be interpreted.
   Agents run in a new session and the whole process group is killed on timeout.
@@ -806,7 +807,7 @@ audit data rather than state payload.
   terminal phase that `resume` does not re-enter.
 - **A local run is GitHub-free by construction, not by convention.** The
   `GitHubClient` is built on first *use* and a `LOCAL` run never has one, so
-  there is no path from local mode to `gh` at all — no authentication is
+  there is no path from local mode to `gh` at all: no authentication is
   needed and none is consulted. The local prompt templates are separate files
   that never mention creating a PR, reading an Issue, posting a comment,
   pushing, merging, or opening a follow-up Issue, and the local result
@@ -817,7 +818,7 @@ audit data rather than state payload.
   phase: an agent that rewrites its own acceptance criteria fails the run. It
   is resolved to a regular, non-symlink Markdown file inside the repository
   (traversal, absolute paths elsewhere, directories and device nodes are all
-  refused), and its content is *task data* — an instruction inside it to
+  refused), and its content is *task data*: an instruction inside it to
   bypass a controller invariant has no authority.
 - **Local verification reads git, never a claim.** `local_workspace.py` runs
   `git` with argv lists only (no shell) and computes a workspace fingerprint
@@ -848,15 +849,15 @@ by the adapters in `providers.py`; the engine never hard-codes CLI syntax.
 YAML (`uv sync --extra yaml` for PyYAML, else a minimal built-in subset
 parser), TOML (stdlib), and JSON (stdlib) are accepted.
 
-Every key in the file must be one the controller reads. An unknown key —
-at the top level, in any section (`execution`, `safety`, `github`, `merge`,
-`review`, `review.replan`, `workflow`, `local`) or in a profile mapping — is
-a configuration error naming the section, the offending key and the keys
-that section knows, e.g. `unknown key(s) under 'workflow': max_review_round
-(known: max_review_rounds, ...)`. A typo cannot be a silent no-op that
-leaves the built-in default in force: several of these keys are loop bounds
-or merge behaviour, where "ignored" means a looser bound than the operator
-wrote while `autoforge doctor` calls the file valid. Provider-specific
+Every key in the file must be one the controller reads. An unknown key,
+whether at the top level, in any section (`execution`, `safety`, `github`,
+`merge`, `review`, `review.replan`, `workflow`, `local`) or in a profile
+mapping, is a configuration error naming the section, the offending key and
+the keys that section knows, e.g. `unknown key(s) under 'workflow':
+max_review_round (known: max_review_rounds, ...)`. A typo cannot be a silent
+no-op that leaves the built-in default in force: several of these keys are
+loop bounds or merge behaviour, where "ignored" means a looser bound than the
+operator wrote while `autoforge doctor` calls the file valid. Provider-specific
 `options` under a profile are the one free mapping; the adapter in
 `providers.py` validates what it reads there. The same contract covers what
 a parser would otherwise settle before the controller looks: a key written
@@ -866,12 +867,12 @@ YAML document whose root is not a mapping is refused on both YAML backends
 (only an empty or comment-only file means "all defaults"), and a profile
 name must be a non-empty string (PyYAML types unquoted `1:` as an integer).
 
-The `local:` block configures [local mode](#local-mode-no-github) —
+The `local:` block configures [local mode](#local-mode-no-github):
 `feature_dir`, `max_fix_rounds` and the argv-array `validation_commands`. A
 local run needs only the profiles its configured bound can reach: with the
 default `max_fix_rounds: 1` that is `analyze_execute`, `fix`, `review_round_1`
 and `review_round_2_5`. Local review rounds are routed exactly like remote
-ones, so `max_fix_rounds: 5` or more also requires `review_round_6_plus` —
+ones, so `max_fix_rounds: 5` or more also requires `review_round_6_plus`.
 `local doctor` and the start of a `local run` check that, rather than leaving
 it to fail five fix rounds in. `replan_reexecute` and `update_epic` belong to
 the remote lifecycle only.
@@ -885,15 +886,16 @@ make lint       # uv run ruff check src tests
 make fmt        # uv run ruff format src tests
 make fmt-check  # uv run ruff format --check src tests
 make typecheck  # uv run mypy src
-make check      # everything CI runs
+make check      # the four CI commands, in the local environment
 ```
 
 The same four checks run hosted on every pull request and every push to
-`main` (`.github/workflows/ci.yml`): `pytest` on Python 3.11 and 3.12, and
-`ruff check` / `ruff format --check` / `mypy` once. The workflow needs no
+`main` (`.github/workflows/ci.yml`), each after a locked install
+(`uv sync --locked`): `pytest` on Python 3.11 and 3.12, and `ruff check` /
+`ruff format --check` / `mypy` once. The workflow needs no
 secrets and is granted none. Its aggregate `ci` job is a single stable check
-name that survives adding or renaming a matrix entry, and it is **required on
-`main`** by a repository ruleset — that is what gives the controller's
+name that survives adding or renaming a matrix entry, and it is required on
+`main` by a repository ruleset. That is what gives the controller's
 pre-merge gate ("every check on the PR succeeded") something real to verify
 instead of a vacuously green PR. The same ruleset requires a pull request
 (with zero required approvals, since GitHub forbids self-approval and any
@@ -909,7 +911,7 @@ claim that it ran the tests. It is not a signal independent of the PR: the
 workflow that defines the check, and the code the check runs, both come from
 the PR. Four things bound that. The controller refuses to merge a PR that
 touches `safety.protected_merge_paths` (default `.github/workflows/`), so a
-PR cannot redefine the check that clears it — that refusal lives in the
+PR cannot redefine the check that clears it; that refusal lives in the
 controller, in version control and under test, rather than in a repository
 setting that can drift unnoticed. With `safety.verify_check_definition` it
 also compares the jobs and steps the `ci` run actually executed with the
@@ -917,12 +919,12 @@ base branch's own run of the same workflow, so a check that was redefined
 through something the protected paths do not cover is refused too. With
 `merge.verification_commands` set, the controller runs the repository's own
 checks (`pytest`, `ruff`, `mypy`, …) on an export of the reviewed commit
-before it merges — evidence it produced itself, not a check name it read.
+before it merges: evidence it produced itself, not a check name it read.
 And a PR that weakens what its tests assert still has to pass the review
 phase, whose findings are what the loop bounds act on. None of this replaces
-a human reading the diff — the local commands still run the PR's tests,
-just under the controller's eye rather than the PR's workflow — which is
-why `safety.allow_merge` is off by default.
+a human reading the diff (the local commands still run the PR's tests, just
+under the controller's eye rather than the PR's workflow), which is why
+`safety.allow_merge` is off by default.
 
 Tests never call real Claude Code, OpenCode or GitHub write APIs. Agents are
 replaced by a `ScriptedProvider` and GitHub by an in-memory fake; the
@@ -937,8 +939,8 @@ Claude Code remediation of finding IDs → repeated review with SHA binding →
 retry for malformed results; `doctor`; redacted per-invocation logs.
 
 **Explicitly not yet:** automatic merge (gated off; when opened, the
-controller-owned `MERGE` step — including its pre-merge mergeability / check
-verification — and `UPDATE_EPIC` are exercised only against the in-memory
+controller-owned `MERGE` step, including its pre-merge mergeability / check
+verification, and `UPDATE_EPIC` are exercised only against the in-memory
 fake, never against real services), controller-owned EPIC batching (#13),
 unattended production operation, CI checks as a review input, dequeuing a PR
 from a merge queue (the controller refuses to merge into queue-protected

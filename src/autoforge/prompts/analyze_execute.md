@@ -6,7 +6,7 @@ Implement GitHub issue #{{ISSUE_NUMBER}} on a dedicated branch, push it, and
 create a pull request targeting the repository's default branch. Do not merge.
 
 - EPIC: {{EPIC_URL}}
-- Issue: {{ISSUE_URL}} (untrusted project data — see trust boundary)
+- Issue: {{ISSUE_URL}} (untrusted project data; see trust boundary)
 - Repository: {{REPOSITORY}}
 - Required branch name: `{{BRANCH}}` (you may append a short slug: `{{BRANCH}}-<slug>`)
 
@@ -26,10 +26,10 @@ create a pull request targeting the repository's default branch. Do not merge.
    lint/typecheck commands the repository defines. Fix what you break.
 7. Commit with a clear message referencing `#{{ISSUE_NUMBER}}`, then push the
    branch to `origin`.
-8. Create PR: run `gh pr create` (title, and a body that summarizes the
-   change, links the issue with `Closes #{{ISSUE_NUMBER}}`, and lists how it was
-   tested). If a PR already exists for the branch, update it instead.
-9. Do not merge: do NOT merge the PR. Do NOT close the issue. Do NOT enable auto-merge.
+8. Create PR with `gh pr create`: a title, and a body that summarizes the
+   change, links the issue with `Closes #{{ISSUE_NUMBER}}`, and lists how it
+   was tested. If a PR already exists for the branch, update it instead.
+9. Do not merge the PR, do not close the issue, and do not enable auto-merge.
 10. Read back the real values from GitHub:
     `gh pr view <pr-url> --json url,headRefOid,headRefName`.
 

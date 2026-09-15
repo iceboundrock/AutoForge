@@ -1,4 +1,4 @@
-# AutoForge — ESCALATED REPLAN / REEXECUTE
+# AutoForge: ESCALATED REPLAN / REEXECUTE
 
 你正在执行 AutoForge 的高级恢复流程：
 
@@ -125,9 +125,9 @@ the last 3 review rounds each contained fewer than 3 findings
 
 while still failing to reach a stable clean review.
 
-This pattern often means the implementation is no longer failing because of one large missing feature.
+The failures at this point usually do not come from one large missing feature.
 
-Instead, the implementation may have accumulated structural inconsistencies where each small correction exposes another small problem.
+More often the implementation has accumulated structural inconsistencies where each small correction exposes another small problem.
 
 Do not interpret the small number of recent findings as evidence that another patch is necessarily the best approach.
 
@@ -207,11 +207,9 @@ Begin by asking:
 
 > Given the issue specification and the repository as it exists on the latest default branch, what is the simplest correct implementation I would choose if the previous PR had never existed?
 
-Only after independently forming that solution should you compare it against the historical findings.
+Compare your solution against the historical findings only after you have independently formed it; the order matters.
 
 Then verify that the proposed solution avoids those known failure modes.
-
-This order matters.
 
 Use:
 
@@ -340,8 +338,6 @@ Replacement implementation must guarantee cache invalidation
 occurs before any path can expose the new state to concurrent readers.
 ```
 
-This distinction is essential.
-
 ---
 
 # 8. Historical findings are constraints, not instructions
@@ -445,7 +441,7 @@ Do not produce a plan whose structure is simply the previous PR with modificatio
 
 # 11. Prefer simplification
 
-A replacement implementation should generally try to reduce accumulated complexity.
+A replacement implementation should generally reduce accumulated complexity.
 
 Look for opportunities to:
 
@@ -680,7 +676,7 @@ The replacement PR must:
 * link the original issue with a closing keyword (`Closes #<n>`) **in the body
   you pass to `gh pr create`**, not in a later edit. The controller reads every
   open pull request in the repository looking for your marker, so a marked PR
-  that is not linked to the issue is not overlooked -- it is *refused*, and the
+  that is not linked to the issue is not overlooked: it is *refused*, and the
   run blocks for a human.
 * clearly identify itself as a fresh reimplementation
 * link the superseded PR
@@ -718,13 +714,13 @@ Rules:
   without it is invisible to the controller and the replan is restarted.
 * It must go on a PR **you create for this replan**. The controller recorded
   the repository's highest pull-request number before this transaction existed,
-  and refuses any PR at or below it. Adding the marker to an already-open PR --
-  including the one being superseded, or an unrelated one you also happen to be
-  working on -- rejects the replan; it does not adopt that PR.
+  and refuses any PR at or below it. Adding the marker to an already-open PR
+  (including the one being superseded, or an unrelated one you also happen to
+  be working on) rejects the replan; it does not adopt that PR.
 * Exactly one marker in the body *in total*, and nothing marker-shaped beside
   it. Any complete `<!-- autoforge-replan-transaction: ... -->` comment whose
-  payload is not a valid attestation -- prose, an example, an empty payload --
-  is an unusable marker, and a body carrying one is refused even when a valid
+  payload is not a valid attestation (prose, an example, an empty payload) is
+  an unusable marker, and a body carrying one is refused even when a valid
   marker sits beside it. A second marker that *is* valid but carries a
   different `transaction_id` is refused too: a body naming two transactions
   proves neither. Do not quote these instructions in the PR body, and do not
@@ -733,7 +729,7 @@ Rules:
   shorten or reformat it. Do not copy it into any other PR.
 * `execution_attempt` must be exactly `{{EXECUTION_ATTEMPT}}`.
 * `findings_considered` must be the real number of historical actionable
-  findings you analysed, and must be at least `{{HISTORICAL_FINDING_COUNT}}` —
+  findings you analysed, and must be at least `{{HISTORICAL_FINDING_COUNT}}`,
   the count the controller preserved. If you cannot honestly account for all of
   them, return the blocked result in section 27 instead of lowering the number.
 * `unique_constraints` must be the deduplicated count and must not exceed
@@ -743,9 +739,9 @@ Rules:
 
 The same numbers must appear in your `CONTROL_RESULT`. The controller reads the
 marker back from GitHub and treats it, not your stdout, as the authoritative
-attestation — a mismatch between the two is a rejection.
+attestation; a mismatch between the two is a rejection.
 
-Without a correct marker the replacement is simply not found: the previous PR
+Without a correct marker the replacement is not found at all: the previous PR
 stays open and the run blocks for a human. Nothing you write in prose can
 substitute for it.
 
@@ -948,8 +944,6 @@ Do not fabricate a successful replacement.
 ---
 
 # 28. Final discipline
-
-Remember:
 
 The purpose of this phase is NOT:
 
