@@ -29,6 +29,7 @@ from autoforge.github import (
 from autoforge.loop_guard import RESULT_NEEDS_FIX, review_record
 from autoforge.providers import AgentExecutionResult, ScriptedProvider
 from autoforge.result_parser import (
+    MAX_FINDING_ID_CHARS,
     MAX_FINDING_LOCATION_CHARS,
     MAX_FINDING_RESOLUTION_CHARS,
     MAX_FINDING_TITLE_CHARS,
@@ -2826,12 +2827,15 @@ def test_fix_prompt_size_is_bounded_by_the_review_bounds(tmp_state_dir, fake_git
     findings = [
         dict(
             _finding(1, n),
+            # ``R1-F<n>`` padded to the id bound; distinct because the tail differs.
+            id="R1-F" + "9" * (MAX_FINDING_ID_CHARS - 4 - len(str(n))) + str(n),
             required_resolution="r" * MAX_FINDING_RESOLUTION_CHARS,
             title="t" * MAX_FINDING_TITLE_CHARS,
             location="l" * MAX_FINDING_LOCATION_CHARS,
         )
         for n in range(1, MAX_FINDINGS_PER_REVIEW + 1)
     ]
+    assert all(len(f["id"]) == MAX_FINDING_ID_CHARS for f in findings)
     accepted = ReviewResult.from_payload(review_payload(1, SHA_A, findings))
     eng = _in_review(tmp_state_dir, fake_github, [])
     eng.state.phase = Phase.FIX
@@ -2842,10 +2846,13 @@ def test_fix_prompt_size_is_bounded_by_the_review_bounds(tmp_state_dir, fake_git
     eng.state.open_findings = [f.to_dict() for f in accepted.findings]
     full = eng.render_prompt_for(Phase.FIX)
     per_finding_text = (
-        MAX_FINDING_RESOLUTION_CHARS + MAX_FINDING_TITLE_CHARS + MAX_FINDING_LOCATION_CHARS
+        MAX_FINDING_ID_CHARS
+        + MAX_FINDING_RESOLUTION_CHARS
+        + MAX_FINDING_TITLE_CHARS
+        + MAX_FINDING_LOCATION_CHARS
     )
     # Every finding contributes its bounded text plus a small fixed framing
-    # (id, classification, separators); nothing is unbounded.
+    # (classification, separators); nothing is unbounded.
     framing = 64
     assert len(full) - empty <= MAX_FINDINGS_PER_REVIEW * (per_finding_text + framing)
     assert full.count("\n- R1-F") == MAX_FINDINGS_PER_REVIEW  # one rendered line per finding

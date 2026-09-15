@@ -64,7 +64,15 @@ MAX_FINDINGS_PER_REVIEW         findings per review round
 MAX_FINDING_RESOLUTION_CHARS    required_resolution length (after stripping)
 MAX_FINDING_TITLE_CHARS         title length
 MAX_FINDING_LOCATION_CHARS      location length
+MAX_FINDING_ID_CHARS            id length (checked before the id's shape)
 ```
+
+The id bound exists because the id's shape (`R<round>-F<n>`) does not bound
+its length, and the id is persisted and rendered like every other finding
+field. It is checked before the shape and round checks so an oversized id is
+never quoted in a rejection message. A `FIX` resolution's `finding_id` must
+equal an accepted finding's id, so the same bound is applied to it at parse
+time rather than after the engine's coverage check.
 
 The failure mode is **rejection, never clipping**: the findings are the work
 the FIX round has to act on, so clipping them would silently drop work,

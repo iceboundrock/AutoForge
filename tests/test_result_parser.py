@@ -9,6 +9,7 @@ from autoforge.errors import ControlResultError, ControlResultValidationError
 from autoforge.result_parser import (
     BEGIN,
     END,
+    MAX_FINDING_ID_CHARS,
     MAX_FINDING_LOCATION_CHARS,
     MAX_FINDING_RESOLUTION_CHARS,
     MAX_FINDING_TITLE_CHARS,
@@ -16,6 +17,7 @@ from autoforge.result_parser import (
     AnalyzeExecuteResult,
     Finding,
     FixResult,
+    LocalFixResult,
     ReviewResult,
     parse_control_result,
 )
@@ -536,6 +538,91 @@ def test_finding_text_fields_are_bounded(key, limit, mode):
     # The rejection names the size, never the text: the message is echoed
     # into the correction prompt and the run log.
     assert "yyyy" not in msg
+
+
+def _id_of_length(length: int, round: int = 1, n: int = 1) -> str:
+    """A well-formed ``R<round>-F<n>`` id padded to exactly ``length`` characters."""
+    head = f"R{round}-F"
+    tail = str(n)
+    fid = head + "9" * (length - len(head) - len(tail)) + tail
+    assert len(fid) == length
+    return fid
+
+
+@pytest.mark.parametrize("mode", ["REMOTE", "LOCAL"])
+def test_finding_id_is_bounded(mode):
+    """The id's shape does not bound its length; the parser does (PR #76 review)."""
+    exact = _id_of_length(MAX_FINDING_ID_CHARS)
+    stdout, wf_mode = _review_with([dict(_finding(1, 1), id=exact)], mode)
+    payload = parse_control_result(stdout, Phase.REVIEW, wf_mode)
+    assert payload["findings"][0]["id"] == exact
+
+    over = _id_of_length(MAX_FINDING_ID_CHARS + 1)
+    stdout, wf_mode = _review_with([dict(_finding(1, 1), id=over)], mode)
+    with pytest.raises(ControlResultValidationError) as excinfo:
+        parse_control_result(stdout, Phase.REVIEW, wf_mode)
+    msg = str(excinfo.value)
+    assert f"'id' is {MAX_FINDING_ID_CHARS + 1} characters" in msg
+    assert f"at most {MAX_FINDING_ID_CHARS}" in msg
+    assert "9999" not in msg
+
+
+@pytest.mark.parametrize(
+    "fid",
+    [
+        "R1-F" + "9" * 100_000,  # the reviewer's reproduction: well-formed, huge
+        "R" + "1" * 5_000 + "-F1",  # a round component past int()'s digit limit
+        "Q" * 100_000,  # malformed: the shape error would quote it whole
+    ],
+    ids=["huge-ordinal", "huge-round", "huge-malformed"],
+)
+def test_oversized_finding_id_is_refused_before_it_is_quoted_or_converted(fid):
+    """Length is checked before the shape and round checks.
+
+    The shape and round messages quote the id, and those messages reach the
+    correction prompt and the run log; and ``int()`` of a digit run past the
+    interpreter's conversion limit is a ``ValueError``, not a rejection.
+    """
+    with pytest.raises(ControlResultValidationError) as excinfo:
+        Finding.from_payload(dict(_finding(1, 1), id=fid), 1, 0)
+    msg = str(excinfo.value)
+    assert f"is {len(fid)} characters" in msg
+    assert len(msg) < 300
+
+
+def test_fix_finding_id_is_bounded_at_parse_time():
+    """A FIX finding_id can only ever match a bounded REVIEW id, so it is
+    refused at parse rather than echoed back by the engine's coverage check."""
+    exact = _id_of_length(MAX_FINDING_ID_CHARS)
+    over = _id_of_length(MAX_FINDING_ID_CHARS + 1)
+    remote = {
+        "phase": "FIX",
+        "status": "success",
+        "previous_head_sha": SHA_A,
+        "new_head_sha": SHA_B,
+    }
+    ok = FixResult.from_payload(
+        dict(remote, resolutions=[{"finding_id": exact, "resolution": "fixed"}])
+    )
+    assert ok.resolutions[0].finding_id == exact
+    with pytest.raises(ControlResultValidationError) as excinfo:
+        FixResult.from_payload(
+            dict(remote, resolutions=[{"finding_id": over, "resolution": "fixed"}])
+        )
+    assert f"FIX: field 'finding_id' is {MAX_FINDING_ID_CHARS + 1} characters" in str(excinfo.value)
+    assert "9999" not in str(excinfo.value)
+
+    ok_local = LocalFixResult.from_payload(
+        {"resolutions": [{"finding_id": exact, "resolution": "fixed"}], "changed_workspace": True}
+    )
+    assert ok_local.resolutions[0].finding_id == exact
+    with pytest.raises(ControlResultValidationError, match="at most"):
+        LocalFixResult.from_payload(
+            {
+                "resolutions": [{"finding_id": over, "resolution": "fixed"}],
+                "changed_workspace": True,
+            }
+        )
 
 
 def test_oversized_finding_is_rejected_not_clipped():

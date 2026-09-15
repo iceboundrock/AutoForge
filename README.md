@@ -136,8 +136,8 @@ Design points:
   `nit`) forces a fix round; the controller enforces
   `needs_fix_round == (len(findings) > 0)`. Non-actionable remarks belong in
   Observations and do not block. A review round is also bounded in size
-  (findings per round, `required_resolution` / `title` / `location` length;
-  see `result_parser.py`): an oversized result is rejected whole and the
+  (findings per round, `required_resolution` / `title` / `location` / `id`
+  length; see `result_parser.py`): an oversized result is rejected whole and the
   reviewer is asked to re-emit it, never clipped, because the findings are
   the work the next fix round has to act on.
 - **Dry-run is side-effect-free**: no subprocess, no `gh` call, no state

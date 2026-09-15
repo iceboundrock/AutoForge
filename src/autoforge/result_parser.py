@@ -16,8 +16,9 @@ The controller never "guesses what the agent meant": a REVIEW result whose
 ``needs_fix_round`` disagrees with its ``findings`` list, or a FIX
 resolution without the evidence its kind requires, is rejected outright. So
 is a REVIEW result larger than the controller is willing to persist and
-render (``MAX_FINDINGS_PER_REVIEW`` and the per-field character bounds): it
-is refused whole, never clipped, so the reviewer can re-emit it.
+render (``MAX_FINDINGS_PER_REVIEW`` and the per-field character bounds,
+finding ids included): it is refused whole, never clipped, so the reviewer
+can re-emit it.
 """
 
 from __future__ import annotations
@@ -62,6 +63,13 @@ MAX_FINDINGS_PER_REVIEW = 50
 MAX_FINDING_RESOLUTION_CHARS = 2000
 MAX_FINDING_TITLE_CHARS = 200
 MAX_FINDING_LOCATION_CHARS = 300
+# A finding id is ``R<round>-F<n>``; its shape does not bound its length (the
+# digit runs are open-ended), and the id is persisted and rendered like every
+# other finding field, so it is bounded explicitly. The bound is checked
+# before the shape, so an oversized id is never echoed into a message. A FIX
+# ``finding_id`` must equal an accepted finding's id, so the same bound
+# applies to it at parse time rather than after the coverage check.
+MAX_FINDING_ID_CHARS = 32
 
 
 def extract_last_block(stdout: str) -> str:
@@ -235,6 +243,34 @@ def _bounded(text: str, fid: str, key: str, limit: int) -> str:
     return text
 
 
+def _finding_id(payload: dict, key: str, phase: str, round: int | None = None) -> str:
+    """The bounded, well-formed finding id at ``payload[key]``.
+
+    Length is checked first: the shape and round checks quote the id in their
+    messages, and those messages reach the correction prompt and the run log.
+    With ``round`` given (REVIEW), the id must belong to that round.
+    """
+    fid = _req_str(payload, key, phase)
+    if len(fid) > MAX_FINDING_ID_CHARS:
+        raise ControlResultValidationError(
+            f"{phase}: field {key!r} is {len(fid)} characters; a finding id is R<round>-F<n> "
+            f"and the controller accepts at most {MAX_FINDING_ID_CHARS}. Re-emit the "
+            "CONTROL_RESULT with well-formed ids."
+        )
+    m = _FINDING_ID_RE.match(fid)
+    if not m:
+        if round is None:
+            raise ControlResultValidationError(f"{phase}: invalid {key} {fid!r}")
+        raise ControlResultValidationError(
+            f"{phase}: finding id {fid!r} must look like R<round>-F<n> (e.g. R{round}-F1)"
+        )
+    if round is not None and int(m.group("round")) != round:
+        raise ControlResultValidationError(
+            f"{phase}: finding id {fid!r} does not belong to review round {round}"
+        )
+    return fid
+
+
 def _parse_findings(payload: dict, round: int, needs_fix: bool) -> list[Finding]:
     """The bounded, validated findings list of a REVIEW result (any mode).
 
@@ -282,16 +318,7 @@ class Finding:
                 f"{ph}: findings[{index}] must be an object with id/classification/"
                 "required_resolution"
             )
-        fid = _req_str(raw, "id", ph)
-        m = _FINDING_ID_RE.match(fid)
-        if not m:
-            raise ControlResultValidationError(
-                f"{ph}: finding id {fid!r} must look like R<round>-F<n> (e.g. R{round}-F1)"
-            )
-        if int(m.group("round")) != round:
-            raise ControlResultValidationError(
-                f"{ph}: finding id {fid!r} does not belong to review round {round}"
-            )
+        fid = _finding_id(raw, "id", ph, round)
         cls_ = _req_str(raw, "classification", ph)
         if cls_ not in FINDING_CLASSIFICATIONS:
             raise ControlResultValidationError(
@@ -363,9 +390,7 @@ class FindingResolution:
             raise ControlResultValidationError(
                 f"{ph}: resolutions[{index}] must be an object with finding_id/resolution"
             )
-        fid = _req_str(raw, "finding_id", ph)
-        if not _FINDING_ID_RE.match(fid):
-            raise ControlResultValidationError(f"{ph}: invalid finding_id {fid!r}")
+        fid = _finding_id(raw, "finding_id", ph)
         res = _req_str(raw, "resolution", ph)
         if res not in FIX_RESOLUTIONS:
             raise ControlResultValidationError(
@@ -639,9 +664,7 @@ class LocalFindingResolution:
             raise ControlResultValidationError(
                 f"{ph}: resolutions[{index}] must be an object with finding_id/resolution"
             )
-        fid = _req_str(raw, "finding_id", ph)
-        if not _FINDING_ID_RE.match(fid):
-            raise ControlResultValidationError(f"{ph}: invalid finding_id {fid!r}")
+        fid = _finding_id(raw, "finding_id", ph)
         res = _req_str(raw, "resolution", ph)
         if res not in LOCAL_FIX_RESOLUTIONS:
             raise ControlResultValidationError(
