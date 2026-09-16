@@ -9,8 +9,9 @@ Layout::
                               # cwd, timeout, redacted argv (no environment dump)
             prompt.md         # rendered prompt sent to the agent (redacted)
             execution.json    # timestamps, exit code, timed_out, stdout/stderr sizes
-            stdout.log        # redacted stdout
-            stderr.log        # redacted stderr
+                              # and whether either stream was truncated at the capture bound
+            stdout.log        # redacted stdout (head + omission marker + tail when truncated)
+            stderr.log        # redacted stderr (same)
             control-result.json   # parsed CONTROL_RESULT when one was accepted
             error.txt         # controller-side error, when the step failed
 
@@ -96,6 +97,10 @@ class ExecutionRecord:
     finished_at: str = ""
     exit_code: int = 0
     timed_out: bool = False
+    # The executor kept head + marker + tail of the stream (see
+    # ``executor.DEFAULT_MAX_OUTPUT_BYTES``); ``stdout.log`` shows the cut.
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
     dry_run: bool = False
     parsed_result: dict | None = None
     error: str = ""
@@ -280,6 +285,8 @@ class RunLogger:
             "finished_at": record.finished_at,
             "exit_code": record.exit_code,
             "timed_out": record.timed_out,
+            "stdout_truncated": record.stdout_truncated,
+            "stderr_truncated": record.stderr_truncated,
             "stdout_chars": len(stdout or ""),
             "stderr_chars": len(stderr or ""),
             "error": record.error,

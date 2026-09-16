@@ -1,11 +1,18 @@
 """Executor: real subprocesses (python -c) — argv safety, timeout, exit codes."""
 
+import os
+import random
+import signal
 import sys
+import time
+import tracemalloc
+from pathlib import Path
 
 import pytest
 
+from autoforge import executor
 from autoforge.errors import ExecutionError
-from autoforge.executor import ExecutionRequest, execute
+from autoforge.executor import ExecutionRequest, _BoundedBuffer, execute
 
 PY = sys.executable
 
@@ -53,6 +60,153 @@ def test_timeout_kills_process_tree():
     assert "start" in res.stdout
 
 
+# A child that spawns a descendant which inherits stdout/stderr, prints the
+# descendant's pid and exits at once; the descendant sleeps far past the
+# timeout. ``setsid`` makes it leave the child's process group as well.
+_ORPHAN = (
+    "import subprocess, sys\n"
+    "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'],\n"
+    "                     start_new_session=sys.argv[1] == 'setsid')\n"
+    "print('child done', p.pid, flush=True)\n"
+)
+
+
+def _orphan_pid(res) -> int:
+    return int(res.stdout.split()[-1])
+
+
+def _gone(pid: int, within: float) -> bool:
+    """True once ``pid`` no longer runs (an orphan lingers as a zombie until
+    init reaps it, which is dead enough)."""
+    deadline = time.monotonic() + within
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        try:
+            state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+        except OSError:
+            return True
+        if state == "Z":
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_descendant_holding_the_pipe_is_bounded_by_the_timeout():
+    """The child exits at once but a descendant that inherited its pipes keeps
+    them open (PR #84 review, P1): the invocation is not over until EOF, that
+    wait runs under the same timeout, and at the timeout the group is killed
+    so the descendant does not outlive the invocation."""
+    started = time.monotonic()
+    res = execute(ExecutionRequest(command=[PY, "-c", _ORPHAN, "group"], timeout_seconds=1))
+    elapsed = time.monotonic() - started
+    assert res.timed_out and not res.ok and res.exit_code == -1
+    assert res.stdout.startswith("child done ")
+    assert elapsed < 10, elapsed  # the timeout plus the SIGTERM grace, never the 60 s sleep
+    assert _gone(_orphan_pid(res), within=5)
+
+
+def test_descendant_outside_the_group_cannot_hold_the_capture_open(monkeypatch):
+    """A descendant that also called ``setsid`` cannot be reached by the group
+    kill; the capture is abandoned after the grace period rather than waited
+    for, so ``execute`` still returns within a bounded time."""
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    started = time.monotonic()
+    res = execute(ExecutionRequest(command=[PY, "-c", _ORPHAN, "setsid"], timeout_seconds=1))
+    elapsed = time.monotonic() - started
+    pid = _orphan_pid(res)
+    try:
+        assert res.timed_out and res.exit_code == -1
+        assert res.stdout.startswith("child done ")
+        assert elapsed < 5, elapsed
+        assert not _gone(pid, within=0.1)  # nothing here can kill it; it is not waited for
+    finally:
+        os.kill(pid, signal.SIGKILL)
+
+
+# A child that spawns a descendant in its own process group with stdio sent
+# to /dev/null and SIGTERM ignored, prints the descendant's pid and sleeps
+# past the timeout. On SIGTERM the child dies and the pipes reach EOF while
+# the descendant lives on; only a group liveness check can see it.
+_DEAF_DESCENDANT = (
+    "import subprocess, sys, time\n"
+    "p = subprocess.Popen([sys.executable, '-c', 'import signal, time; "
+    "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)'],\n"
+    "                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+    "print('descendant', p.pid, flush=True)\n"
+    "time.sleep(60)\n"
+)
+
+
+def test_same_group_descendant_with_closed_pipes_that_ignores_sigterm_is_killed(monkeypatch):
+    """The child is reaped and both pipes reach EOF after SIGTERM, but a
+    descendant that closed its stdio and ignores SIGTERM is still in the
+    group (PR #84 review, P1): the kill must escalate to SIGKILL and return
+    only once the group has no member left, not merely once the pipes closed."""
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    started = time.monotonic()
+    res = execute(ExecutionRequest(command=[PY, "-c", _DEAF_DESCENDANT], timeout_seconds=1))
+    elapsed = time.monotonic() - started
+    pid = _orphan_pid(res)
+    try:
+        assert res.timed_out and res.exit_code == -1
+        assert res.stdout.startswith("descendant ")
+        assert elapsed < 5, elapsed  # the timeout plus the two grace periods
+        assert _gone(pid, within=0.5), "the SIGTERM-ignoring descendant outlived execute()"
+    finally:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def test_direct_child_that_survives_sigkill_is_not_waited_for(monkeypatch):
+    """A direct child that neither SIGTERM nor SIGKILL removes within the grace
+    (uninterruptible in the kernel, say) must not turn the timeout into an
+    unbounded ``wait()`` (PR #84 review, P1): after both grace periods the
+    capture is abandoned and the timeout is reported, and the child is left
+    unreaped rather than waited for. The kill is neutered here to simulate the
+    survivor, so the child really does outlive ``execute()``."""
+    import subprocess
+
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    real_killpg = os.killpg
+    signalled: list[tuple[int, int]] = []
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: signalled.append((pgid, int(sig))))
+    real_wait = subprocess.Popen.wait
+    procs: list[subprocess.Popen] = []
+    waits: list[float | None] = []
+
+    def spying_wait(self, timeout=None):
+        procs.append(self)
+        waits.append(timeout)
+        return real_wait(self, timeout=timeout)
+
+    monkeypatch.setattr(subprocess.Popen, "wait", spying_wait)
+    started = time.monotonic()
+    res = execute(
+        ExecutionRequest(
+            command=[PY, "-c", "import time; print('start', flush=True); time.sleep(20)"],
+            timeout_seconds=1,
+        )
+    )
+    elapsed = time.monotonic() - started
+    proc = procs[0]
+    try:
+        assert res.timed_out and not res.ok and res.exit_code == -1
+        assert res.stdout == "start\n"
+        assert elapsed < 4, elapsed  # the timeout plus the two grace periods, never the sleep
+        assert None not in waits, "the child was waited for without a bound"
+        assert [sig for _, sig in signalled] == [signal.SIGTERM, signal.SIGKILL]
+        assert all(pgid == proc.pid for pgid, _ in signalled)
+        assert proc.poll() is None, "the simulated survivor should still be running"
+    finally:
+        real_killpg(proc.pid, signal.SIGKILL)
+        real_wait(proc, timeout=5)
+
+
 def test_stdin_is_closed_not_interactive():
     res = execute(
         ExecutionRequest(
@@ -78,3 +232,196 @@ def test_missing_binary_raises_execution_error():
         execute(
             ExecutionRequest(command=["autoforge-definitely-missing-binary-xyz"], timeout_seconds=5)
         )
+
+
+def test_non_utf8_output_is_replaced_not_raised():
+    """A stray byte in agent output (#17) must not escape ``execute`` as a
+    UnicodeDecodeError: the invocation completes and the byte is replaced."""
+    res = execute(
+        ExecutionRequest(
+            command=[
+                PY,
+                "-c",
+                "import sys; sys.stdout.buffer.write(b'ok \\xff\\xfe end\\n'); "
+                "sys.stderr.buffer.write(b'err \\xc3\\x28\\n')",
+            ],
+            timeout_seconds=30,
+        )
+    )
+    assert res.ok and res.exit_code == 0
+    assert res.stdout == "ok �� end\n"
+    assert res.stderr == "err �(\n"
+
+
+def test_multibyte_character_across_the_capture_split_is_intact():
+    """Within the bound the head/tail split is internal (PR #84 review, P2):
+    a character whose bytes straddle it must decode whole, not as two
+    replacement characters on either side of an invisible seam."""
+    res = execute(
+        ExecutionRequest(
+            command=[PY, "-c", "import sys; sys.stdout.buffer.write('ab€'.encode())"],
+            timeout_seconds=30,
+            max_output_bytes=6,
+        )
+    )
+    assert res.ok and not res.stdout_truncated
+    assert res.stdout == "ab€" and res.stdout_tail == "ab€"
+
+
+# -- bounded capture (#53) ---------------------------------------------------
+# A child that writes ``total`` bytes to ``stream``; the last line is the one
+# a CONTROL_RESULT would occupy, so a kept tail must still end with it.
+_FLOOD = (
+    "import sys\n"
+    "out = getattr(sys, sys.argv[1]).buffer\n"
+    "total = int(sys.argv[2])\n"
+    "line = b'x' * 1023 + b'\\n'\n"
+    "written = 0\n"
+    "while written + len(line) < total:\n"
+    "    out.write(line); written += len(line)\n"
+    "out.write(b'TAIL-MARKER\\n')\n"
+)
+
+
+def _flood(stream: str, total: int, bound: int):
+    return execute(
+        ExecutionRequest(
+            command=[PY, "-c", _FLOOD, stream, str(total)],
+            timeout_seconds=60,
+            max_output_bytes=bound,
+        )
+    )
+
+
+def test_output_within_bound_is_kept_whole():
+    res = _flood("stdout", 100_000, 1_000_000)
+    assert res.ok and not res.stdout_truncated and not res.stderr_truncated
+    assert res.stdout.count("\n") == 100_000 // 1024 + 1
+    assert res.stdout.endswith("TAIL-MARKER\n")
+    assert res.stdout_tail == res.stdout
+
+
+def test_stdout_past_bound_keeps_head_and_tail():
+    bound = 64 * 1024
+    res = _flood("stdout", 20 * 1024 * 1024, bound)
+    assert res.exit_code == 0 and res.stdout_truncated and not res.stderr_truncated
+    assert not res.ok
+    with pytest.raises(ExecutionError, match="truncated"):
+        res.raise_if_failed()
+    # The kept text is head + marker + tail: about the bound, never the 20 MiB.
+    assert len(res.stdout) < bound + 500
+    assert res.stdout.startswith("x" * 1023 + "\n")
+    assert res.stdout.endswith("TAIL-MARKER\n")
+    assert "bytes of stdout omitted" in res.stdout
+    # The tail is the part captured contiguously up to EOF: it is where a
+    # CONTROL_RESULT lives, it starts after the marker and it is intact.
+    tail = res.stdout_tail
+    assert tail.endswith("TAIL-MARKER\n") and "omitted" not in tail
+    assert bound // 2 - 1024 <= len(tail) <= bound // 2
+
+
+def test_stderr_past_bound_is_truncated_independently():
+    res = _flood("stderr", 2 * 1024 * 1024, 32 * 1024)
+    assert res.stderr_truncated and not res.stdout_truncated
+    assert res.stderr.endswith("TAIL-MARKER\n") and "bytes of stderr omitted" in res.stderr
+    assert res.stdout == "" and res.stdout_tail == ""
+
+
+def test_timeout_with_flooded_output_still_returns():
+    res = execute(
+        ExecutionRequest(
+            command=[
+                PY,
+                "-c",
+                "import sys, time\n"
+                "sys.stdout.buffer.write(b'y' * 300_000); sys.stdout.flush()\n"
+                "time.sleep(30)",
+            ],
+            timeout_seconds=1,
+            max_output_bytes=16 * 1024,
+        )
+    )
+    assert res.timed_out and res.stdout_truncated
+    assert len(res.stdout) < 20 * 1024
+
+
+def test_bound_below_one_read_is_honoured():
+    """A bound smaller than the read chunk (PR #84 review, P2): the kept text
+    is one head byte, the marker and one tail byte."""
+    res = _flood("stdout", 1_000_000, 2)
+    assert res.stdout_truncated and not res.ok
+    assert res.stdout.startswith("x\n[autoforge: ") and res.stdout.endswith(" were kept]\n\n")
+    assert res.stdout_tail == "\n"
+
+
+def test_bounded_buffer_never_retains_more_than_the_limit():
+    """Whatever the chunking -- one read far larger than the bound included --
+    the buffer holds at most ``limit`` bytes at every step and still yields
+    the first and last bytes of the stream."""
+    rng = random.Random(53)
+    for limit in (1, 2, 3, 7, 100, 4096):
+        buf = _BoundedBuffer(limit, "stdout")
+        stream = b""
+        for _ in range(40):
+            chunk = bytes(rng.randrange(256) for _ in range(rng.choice((1, 5, 100, 8192))))
+            buf.feed(chunk)
+            stream += chunk
+            assert buf.retained <= limit, (limit, len(stream))
+        head, tail = limit - limit // 2, limit // 2
+        got = buf.captured()
+        assert got.truncated
+        expected_tail = stream[len(stream) - tail :] if tail else b""
+        assert got.text.startswith(stream[:head].decode("utf-8", errors="replace"))
+        assert got.text[got.tail_offset :] == expected_tail.decode("utf-8", errors="replace")
+
+
+def test_bounded_buffer_is_exact_under_fragmented_input():
+    """Thousands of one-to-three-byte reads (the tail ring wraps on nearly
+    every one): the kept head and tail are exactly the first and last bytes
+    of the stream, for limits where the tail is empty, one byte, or larger."""
+    rng = random.Random(84)
+    for limit in (1, 2, 3, 7, 64, 1000):
+        buf = _BoundedBuffer(limit, "stdout")
+        stream = bytearray()
+        for _ in range(3000):
+            chunk = bytes(rng.randrange(256) for _ in range(rng.randrange(1, 4)))
+            buf.feed(chunk)
+            stream += chunk
+            assert buf.retained <= limit
+        head, tail = limit - limit // 2, limit // 2
+        got = buf.captured()
+        assert got.truncated
+        assert got.text.startswith(stream[:head].decode("utf-8", errors="replace"))
+        expected_tail = bytes(stream[len(stream) - tail :]) if tail else b""
+        assert got.text[got.tail_offset :] == expected_tail.decode("utf-8", errors="replace")
+
+
+def test_bounded_buffer_memory_is_the_limit_plus_a_constant():
+    """The bound is on memory, not only on payload length (PR #84 review,
+    P3): a writer that causes one-byte reads must not cost a per-chunk
+    object each. With a deque of chunks this stream cost about forty times
+    the limit; the ring costs the limit plus allocator slack."""
+    limit = 400_000
+    total = 3 * limit
+    tracemalloc.start()
+    try:
+        buf = _BoundedBuffer(limit, "stdout")
+        tracemalloc.reset_peak()
+        baseline = tracemalloc.get_traced_memory()[0]
+        for i in range(total):
+            buf.feed(bytes((i & 0xFF,)))
+        current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert buf.retained == limit
+    assert current - baseline < limit * 1.5, current - baseline
+    assert peak - baseline < limit * 1.5, peak - baseline
+    got = buf.captured()
+    expected_tail = bytes(i & 0xFF for i in range(total - limit // 2, total))
+    assert got.truncated
+    assert got.text[got.tail_offset :] == expected_tail.decode("utf-8", errors="replace")
+
+
+def test_non_positive_bound_is_refused():
+    with pytest.raises(ExecutionError, match="max_output_bytes"):
+        execute(ExecutionRequest(command=[PY, "-c", "pass"], max_output_bytes=0))

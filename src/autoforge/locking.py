@@ -107,6 +107,10 @@ def repository_lock_path(workdir: str | Path, runner: Runner = execute) -> Path:
         ) from exc
     if res.timed_out:
         raise LockError(f"cannot derive the controller lock for {shown}: git rev-parse timed out")
+    if res.truncated:
+        raise LockError(
+            f"cannot derive the controller lock for {shown}: git rev-parse output was truncated"
+        )
     if res.exit_code != 0:
         detail = (res.stderr or res.stdout).strip().splitlines()
         raise LockError(

@@ -620,6 +620,14 @@ class GitHubClient:
             if res.timed_out:
                 last_error = f"`gh {' '.join(args)}` timed out after {self.timeout_seconds}s"
                 transient = True
+            elif res.truncated:
+                # Head + marker + tail of a reply is not the reply: parsing it
+                # would read a document `gh` never returned. Not transient,
+                # and not something `allow_fail` may hand back as output.
+                raise GitHubError(
+                    f"`gh {' '.join(args)}` output was truncated at the executor's capture "
+                    "bound and cannot be parsed"
+                )
             elif res.exit_code != 0:
                 tail = res.stderr.strip()[-1000:]
                 last_error = f"`gh {' '.join(args)}` failed (exit {res.exit_code}): {tail}"

@@ -90,7 +90,7 @@ src/autoforge/
     profiles.py       review-round routing plus replan_reexecute profile (pure function)
     providers.py      AgentProvider adapters: ClaudeCodeProvider, OpenCodeProvider,
                       ScriptedProvider (tests); CLI flags live only here
-    executor.py       subprocess abstraction: argv, timeout, process-tree kill
+    executor.py       subprocess abstraction: argv, timeout, process-tree kill, bounded capture
     result_parser.py  <<<CONTROL_RESULT>>> extraction + typed per-phase results
     validation.py     typed GitHub URL refs (issue / PR / comment), remote parsing
     github.py         typed GitHubClient over `gh`: reads (PRs, issues, comments,
@@ -604,8 +604,8 @@ either way:
         <seq>-<phase>-<attempt>/
             request.json                   # profile, model, effort, command, timeout
             prompt.md                      # rendered prompt (redacted)
-            execution.json                 # exit code, timing, timed_out, error
-            stdout.log / stderr.log        # redacted
+            execution.json                 # exit code, timing, timed_out, truncation, error
+            stdout.log / stderr.log        # redacted; head + marker + tail past the capture bound
             control-result.json            # parsed CONTROL_RESULT (when valid)
 ```
 
@@ -813,7 +813,11 @@ audit data rather than state payload.
   completeness.
 - No `os.system` / `shell=True` anywhere; prompts travel as a single argv
   element so shell metacharacters in issue text cannot be interpreted.
-  Agents run in a new session and the whole process group is killed on timeout.
+  Agents run in a new session and the whole process group is killed on timeout,
+  and the kill is complete only once no process is left in the group; the
+  timeout also covers a descendant that keeps the agent's output pipes open
+  after the agent itself has exited. Every wait in the kill is bounded, so
+  whatever survives it is abandoned and the controller still gets its result.
 - **Runs cannot loop forever.** The review-round cap, stagnation detection
   and the cumulative step budget (`workflow:` in the config) are controller
   invariants checked before an agent is invoked; hitting one is `BLOCKED`, a

@@ -5,6 +5,7 @@ import pytest
 from autoforge.config import ProfileConfig, default_config
 from autoforge.errors import ConfigurationError
 from autoforge.providers import (
+    AgentExecutionResult,
     AgentRequest,
     ClaudeCodeProvider,
     OpenCodeProvider,
@@ -117,3 +118,27 @@ def test_provider_execute_uses_injected_runner():
     assert res.ok and res.stdout == "ok" and res.model == "fable"
     assert seen[0].timeout_seconds == 7 and seen[0].cwd == "/tmp"
     assert seen[0].command[-1] == "prompt"
+
+
+def test_agent_result_carries_capture_truncation_and_tail():
+    """The engine parses ``stdout_tail``, so the executor's truncation facts
+    must survive the provider boundary unchanged (#53)."""
+    from autoforge.executor import ExecutionResult
+
+    res = ExecutionResult(
+        command=["x"],
+        cwd=None,
+        exit_code=0,
+        stdout="head\n[marker]\ntail",
+        stderr="e",
+        started_at="t",
+        finished_at="t",
+        stdout_truncated=True,
+        stderr_truncated=True,
+        stdout_tail_offset=len("head\n[marker]\n"),
+    )
+    p = default_config().profile("analyze_execute")
+    got = AgentExecutionResult.from_execution(res, p)
+    assert got.stdout_truncated and got.stderr_truncated
+    assert got.stdout_tail == "tail"
+    assert got.stdout == "head\n[marker]\ntail"

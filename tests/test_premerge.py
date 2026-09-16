@@ -230,3 +230,14 @@ def test_fetch_pr_head_brings_the_commit_without_creating_a_local_ref(tmp_path):
 
     with pytest.raises(VerificationError, match="fetch"):
         fetch_pr_head(execute, str(local), 8)
+
+
+def test_git_plumbing_refuses_truncated_output():
+    """A git reply past the capture bound is not the command's output (#53)."""
+    from autoforge.executor import ExecutionResult
+
+    def truncated(req):
+        return ExecutionResult(req.command, req.cwd, 0, "", "", "t", "t", stdout_truncated=True)
+
+    with pytest.raises(VerificationError, match="truncated"):
+        fetch_pr_head(truncated, "/nonexistent", 1)

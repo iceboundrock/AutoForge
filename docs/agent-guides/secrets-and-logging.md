@@ -37,3 +37,10 @@ resolution bound in `loop_guard`) depend on that factor, so a new pattern
 must keep it, or raise it together with those bounds and their tests.
 
 Do not log the entire process environment.
+
+`stdout.log` and `stderr.log` hold what the executor captured, which is
+bounded (`executor.DEFAULT_MAX_OUTPUT_BYTES` per stream): past the bound the
+file is the head of the stream, a `[autoforge: N bytes of stdout omitted; ...]`
+marker and the tail, and `execution.json` records `stdout_truncated` /
+`stderr_truncated`. Redaction runs over that bounded text, so the redaction
+pass, like the capture, costs at most the bound.

@@ -10,6 +10,7 @@ from autoforge.redaction import MAX_GROWTH_FACTOR, redact_dict
 from autoforge.result_parser import (
     BEGIN,
     END,
+    MAX_CONTROL_RESULT_CHARS,
     MAX_FINDING_ID_CHARS,
     MAX_FINDING_LOCATION_CHARS,
     MAX_FINDING_RESOLUTION_CHARS,
@@ -681,3 +682,50 @@ def test_parser_bounds_never_exceed_the_persisted_evidence_bounds():
     assert "evidence_truncated" not in record
     assert record["resolutions_truncated"] is False
     assert loop_guard.truncated_evidence_rounds([record]) == []
+
+
+# -- whole-payload bound (#53) ---------------------------------------------------------------
+def test_oversized_block_is_rejected_before_it_is_parsed():
+    """The accepted payload is persisted whole (control-result.json, the
+    events.jsonl line) and acted on by the next phase, so its size is bounded
+    at parse time and an oversized block is refused, never clipped."""
+    filler = "x" * (MAX_CONTROL_RESULT_CHARS + 1)
+    payload = dict(GOOD_REVIEW, summary=filler)
+    with pytest.raises(ControlResultValidationError) as excinfo:
+        parse_control_result(block(payload), Phase.REVIEW)
+    msg = str(excinfo.value)
+    assert f"at most {MAX_CONTROL_RESULT_CHARS}" in msg and "characters" in msg
+    assert "re-emit" in msg.lower()
+    assert "xxxxxxxx" not in msg  # the oversized text is never echoed
+
+
+def test_block_bound_is_checked_before_json_is_decoded():
+    """A block past the bound is refused by size alone: it is not decoded
+    (an oversized block full of junk still gets the size message)."""
+    stdout = block("{" + "junk" * (MAX_CONTROL_RESULT_CHARS // 4 + 1))
+    with pytest.raises(ControlResultValidationError, match="at most"):
+        parse_control_result(stdout, Phase.REVIEW)
+
+
+@pytest.mark.parametrize("mode", ["REMOTE", "LOCAL"])
+def test_largest_review_the_field_bounds_accept_fits_the_block_bound(mode):
+    """Pins the relation between the bounds: a REVIEW at every field bound,
+    in the worst-case JSON encoding (non-ASCII text escaped as \\uXXXX, six
+    characters per character), is still under the whole-block bound, so the
+    field bounds -- not the block bound -- are what a reviewer is held to."""
+    findings = [
+        {
+            "id": f"R1-F{n}",
+            "classification": "blocked",
+            "required_resolution": "汉" * MAX_FINDING_RESOLUTION_CHARS,
+            "title": "汉" * MAX_FINDING_TITLE_CHARS,
+            "location": "汉" * MAX_FINDING_LOCATION_CHARS,
+        }
+        for n in range(1, MAX_FINDINGS_PER_REVIEW + 1)
+    ]
+    stdout, wf_mode = _review_with(findings, mode)
+    assert "\\u6c49" in stdout  # json.dumps escaped the text: the worst case
+    raw = stdout.split(BEGIN, 1)[1].split(END, 1)[0].strip()
+    assert len(raw) <= MAX_CONTROL_RESULT_CHARS
+    payload = parse_control_result(stdout, Phase.REVIEW, wf_mode)
+    assert len(payload["findings"]) == MAX_FINDINGS_PER_REVIEW

@@ -233,3 +233,23 @@ def test_engine_prompt_variables_review_and_fix(engine):
     assert "R1-F1" in text and SHA_A in text and "do x" in text
     corr = engine.render_prompt_for(Phase.FIX, correction_error="boom")
     assert "did not return a valid CONTROL_RESULT" in corr and "boom" in corr
+
+
+def test_common_prompts_state_the_whole_block_bound(engine, tmp_path):
+    """#53: every agent is told the size the parser holds the whole
+    CONTROL_RESULT block to, through the same constant the parser rejects against."""
+    from autoforge.result_parser import MAX_CONTROL_RESULT_CHARS
+    from tests.conftest import commit_all, git_repo, make_local_engine, write_feature
+
+    for template in ("common.md", "local_common.md"):
+        assert "{{MAX_CONTROL_RESULT_CHARS}}" in prompts.load_template(template), template
+    engine.state.phase = Phase.ANALYZE_EXECUTE
+    rendered = engine.render_prompt_for(Phase.ANALYZE_EXECUTE)
+    assert f"at most\n  {MAX_CONTROL_RESULT_CHARS} characters" in rendered
+
+    root = git_repo(tmp_path)
+    write_feature(root)
+    commit_all(root, "spec")
+    local = make_local_engine(root, "features/add-filter.md")
+    rendered = local.render_prompt_for(Phase.ANALYZE_EXECUTE)
+    assert f"at most\n  {MAX_CONTROL_RESULT_CHARS} characters" in rendered

@@ -21,12 +21,18 @@ Controller behavior:
 
 1. Find complete control-result blocks.
 2. Use only the last complete block.
-3. Parse strict JSON.
-4. Require a JSON object.
-5. Validate required fields for the current phase.
-6. Reject phase mismatch.
-7. Reject schema/invariant mismatch.
-8. Do not advance state when validation fails.
+3. Reject a block larger than `MAX_CONTROL_RESULT_CHARS` by size alone.
+4. Parse strict JSON.
+5. Require a JSON object.
+6. Validate required fields for the current phase.
+7. Reject phase mismatch.
+8. Reject schema/invariant mismatch.
+9. Do not advance state when validation fails.
+
+The stdout the parser searches is bounded and, when the agent wrote more
+than the executor's capture bound, it is only the *tail* of that stdout: the
+part captured contiguously up to EOF. See "Whole-block bound and truncated
+stdout" below.
 
 Never infer workflow state by searching natural-language output for phrases such as:
 
@@ -98,6 +104,37 @@ marked truncated, and every later replan of that PR refused (#33). The
 review prompts state every parser bound (the id bound included) through
 template variables that the engine fills from the same constants, so the
 number the reviewer is told is the number it is held to.
+
+### Whole-block bound and truncated stdout
+
+The accepted payload is persisted whole (`control-result.json` and one
+`events.jsonl` line per invocation) and its fields are what the next phase
+acts on, so the block as a whole is bounded where it is accepted:
+`MAX_CONTROL_RESULT_CHARS` (`src/autoforge/result_parser.py`) is the most
+raw JSON text the parser will decode. It is checked by size alone, before
+`json.loads`, and an oversized block is rejected, never clipped, through the
+same correction retry as any other malformed result; the rejection states the
+size and the limit, never the text. The bound sits above the largest `REVIEW`
+the field bounds admit in the worst JSON encoding (every character escaped as
+`\uXXXX`), and `tests/test_result_parser.py` pins that relation, so the
+field bounds -- not the block bound -- are what a reviewer is held to. The
+common prompt states the block bound through a template variable filled from
+the same constant.
+
+Agent stdout is itself bounded before the parser sees it. The executor keeps
+at most `DEFAULT_MAX_OUTPUT_BYTES` (`src/autoforge/executor.py`) of each
+stream -- the first half and the last half of what the agent wrote, with an
+omission marker between -- so a runaway or adversarial transcript costs the
+controller a bounded amount of memory, not its size. The block is the last
+thing the agent writes, so the kept tail preserves a legitimate one. The
+engine therefore searches only `stdout_tail`, the part captured contiguously
+up to EOF, never the head: a block before the cut is either stale (the agent
+wrote more after it) or spans the cut (head, marker and tail could assemble
+into a document the agent never wrote), and neither is the agent's final
+result. When the search of a truncated stdout fails, the rejection says so,
+so the correction prompt tells the agent to keep its transcript short and end
+it with the block. The whole marked stdout still reaches `stdout.log`, and
+`execution.json` records `stdout_truncated` / `stderr_truncated`.
 
 The FIX prompt these findings are rendered into is bounded by a constant
 factor of the parser bounds, not by their sum: the renderer's safety measures

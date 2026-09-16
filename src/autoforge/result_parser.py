@@ -18,7 +18,9 @@ resolution without the evidence its kind requires, is rejected outright. So
 is a REVIEW result larger than the controller is willing to persist and
 render (``MAX_FINDINGS_PER_REVIEW`` and the per-field character bounds,
 finding ids included): it is refused whole, never clipped, so the reviewer
-can re-emit it.
+can re-emit it. The same holds for the block as a whole
+(``MAX_CONTROL_RESULT_CHARS``): the accepted payload is persisted whole and
+is what the next phase acts on, so its size is checked before it is decoded.
 """
 
 from __future__ import annotations
@@ -70,6 +72,17 @@ MAX_FINDING_LOCATION_CHARS = 300
 # ``finding_id`` must equal an accepted finding's id, so the same bound
 # applies to it at parse time rather than after the coverage check.
 MAX_FINDING_ID_CHARS = 32
+# Bound on the whole CONTROL_RESULT block (the raw JSON text between the
+# markers, in characters). The accepted payload is written whole to
+# ``control-result.json`` and as one ``events.jsonl`` line, and its fields
+# drive the next phase, so it is bounded where it is accepted: checked by
+# size alone before ``json.loads``, rejected rather than clipped. The bound
+# sits above the largest REVIEW the field bounds admit even in the worst
+# JSON encoding (every character escaped as ``\uXXXX``, six per character:
+# ``tests/test_result_parser.py`` pins that relation), so the field bounds,
+# not this one, are what a reviewer is held to. Any stdout the parser sees is
+# itself bounded by the executor's capture bound.
+MAX_CONTROL_RESULT_CHARS = 1024 * 1024
 
 
 def extract_last_block(stdout: str) -> str:
@@ -100,6 +113,12 @@ def parse_control_result(
     a PR URL, a comment URL or a follow-up Issue.
     """
     raw = extract_last_block(stdout)
+    if len(raw) > MAX_CONTROL_RESULT_CHARS:
+        raise ControlResultValidationError(
+            f"CONTROL_RESULT block is {len(raw)} characters and the controller accepts at "
+            f"most {MAX_CONTROL_RESULT_CHARS}. Keep the block to the fields the phase "
+            "requires and re-emit it."
+        )
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:

@@ -383,6 +383,12 @@ class LocalWorkspace:
         )
         if res.timed_out:
             raise VerificationError(f"`git {' '.join(argv)}` timed out in {self.workdir}")
+        if res.truncated:
+            # Head + marker + tail of a listing is not the working tree.
+            raise VerificationError(
+                f"`git {' '.join(argv)}` output in {self.workdir} was truncated at the "
+                "executor's capture bound"
+            )
         if res.exit_code != 0 and not allow_failure:
             detail = (res.stderr or res.stdout).strip().splitlines()
             raise VerificationError(

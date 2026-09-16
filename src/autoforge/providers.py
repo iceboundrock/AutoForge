@@ -71,10 +71,31 @@ class AgentExecutionResult:
     provider: str = ""
     model: str = ""
     effort: str = ""
+    # Capture facts from the executor (see :class:`ExecutionResult`): the
+    # engine logs the whole marked ``stdout`` but parses only ``stdout_tail``.
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
+    stdout_tail_offset: int = 0
+
+    @property
+    def stdout_tail(self) -> str:
+        """The part of stdout captured contiguously up to EOF."""
+        return self.stdout[self.stdout_tail_offset :]
 
     @property
     def ok(self) -> bool:
-        return not self.timed_out and self.exit_code == 0
+        """Whether the invocation ran to a usable end.
+
+        Narrower than :attr:`ExecutionResult.ok` on purpose: for plumbing
+        (``gh --json``, ``git``) the whole output is the reply, so either
+        stream past the bound spoils it, whereas an agent's reply is the
+        CONTROL_RESULT on stdout and its stderr is diagnostics (an OpenCode
+        tool trace), which the engine logs but never parses; a stderr past
+        the bound is recorded, not a failure. The engine reads the underlying
+        facts (``timed_out``, ``exit_code``, ``stdout_tail``) rather than
+        this property.
+        """
+        return not self.timed_out and self.exit_code == 0 and not self.stdout_truncated
 
     @classmethod
     def from_execution(cls, res: ExecutionResult, profile: ProfileConfig) -> AgentExecutionResult:
@@ -86,6 +107,9 @@ class AgentExecutionResult:
             started_at=res.started_at,
             finished_at=res.finished_at,
             timed_out=res.timed_out,
+            stdout_truncated=res.stdout_truncated,
+            stderr_truncated=res.stderr_truncated,
+            stdout_tail_offset=res.stdout_tail_offset,
             provider=profile.provider,
             model=profile.model,
             effort=profile.effort,
