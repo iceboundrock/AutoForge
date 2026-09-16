@@ -6,6 +6,7 @@ import pytest
 
 from autoforge import loop_guard
 from autoforge.errors import ControlResultError, ControlResultValidationError
+from autoforge.prompts import CONTROL_CHAR_RE, escape_inline
 from autoforge.redaction import MAX_GROWTH_FACTOR, redact_dict
 from autoforge.result_parser import (
     BEGIN,
@@ -895,6 +896,124 @@ def test_fix_bounds_relate_to_the_review_and_persisted_bounds():
     assert MAX_FIX_RATIONALE_CHARS < len(persisted["rationale"])
     assert len(persisted["rationale"]) <= loop_guard.MAX_REQUIRED_RESOLUTION_CHARS
     assert "HF_TOKEN=x" not in persisted["rationale"]
+
+
+# -- control characters in finding and resolution text (#78) -----------------------
+# A finding's one-line fields are rendered on one line of the FIX prompt
+# through ``escape_inline``; the parser refuses at parse time what that
+# renderer would otherwise have to escape, so an accepted value is shown as
+# it was written. A multi-line field keeps newlines and tabs, nothing else.
+_CONTROL_SAMPLES = {
+    "nul": "\x00",
+    "newline": "\n",
+    "carriage_return": "\r",
+    "tab": "\t",
+    "escape": "\x1b",
+    "delete": "\x7f",
+    "next_line": "\x85",
+    "line_separator": "\u2028",
+    "paragraph_separator": "\u2029",
+}
+_PRINTABLE = "café — «quoted» 日本語 🙂 \\backslash `code` [x](y) #heading"
+
+
+def _review_finding(**fields) -> Finding:
+    finding = {"id": "R1-F1", "classification": "nit", "required_resolution": "fix it", **fields}
+    return ReviewResult.from_payload(
+        dict(GOOD_REVIEW, needs_fix_round=True, findings=[finding])
+    ).findings[0]
+
+
+@pytest.mark.parametrize("key", ["title", "location"])
+@pytest.mark.parametrize("name", sorted(_CONTROL_SAMPLES), ids=str)
+def test_a_one_line_finding_field_rejects_every_control_character(key, name):
+    ch = _CONTROL_SAMPLES[name]
+    with pytest.raises(ControlResultValidationError) as excinfo:
+        _review_finding(**{key: f"abc{ch}def"})
+    msg = str(excinfo.value)
+    assert f"REVIEW: finding R1-F1 field {key!r} contains a control character" in msg
+    assert f"(U+{ord(ch):04X} at index 3)" in msg
+    assert "one line of printable text" in msg
+    assert "abc" not in msg and ch not in msg  # code point and index, never the text
+
+
+@pytest.mark.parametrize("key", ["title", "location"])
+def test_a_one_line_finding_field_accepts_printable_unicode(key):
+    assert getattr(_review_finding(**{key: _PRINTABLE}), key) == _PRINTABLE
+
+
+def test_one_line_acceptance_is_exactly_what_escape_inline_leaves_alone():
+    """The parser refuses precisely the characters the renderer would escape:
+    one class, defined once in ``prompts``, so the two cannot drift."""
+    sampled = [chr(cp) for cp in range(0x0000, 0x0300)]
+    sampled += [chr(cp) for cp in range(0x2000, 0x2070)]
+    sampled += [chr(cp) for cp in (0xFEFF, 0x3000, 0x1F642, 0xE000, 0xFFFD, 0x10FFFF)]
+    for ch in sampled:
+        text = f"a{ch}b"
+        try:
+            _review_finding(title=text)
+            accepted = True
+        except ControlResultValidationError as exc:
+            assert "control character" in str(exc), (hex(ord(ch)), str(exc))
+            accepted = False
+        assert accepted == (escape_inline(text) == text), hex(ord(ch))
+        assert accepted == (CONTROL_CHAR_RE.search(ch) is None), hex(ord(ch))
+
+
+@pytest.mark.parametrize("name", sorted(_CONTROL_SAMPLES), ids=str)
+def test_required_resolution_keeps_newlines_and_tabs_and_nothing_else(name):
+    ch = _CONTROL_SAMPLES[name]
+    text = f"first{ch}second"
+    if ch in ("\n", "\t"):
+        assert _review_finding(required_resolution=text).required_resolution == text
+        return
+    with pytest.raises(ControlResultValidationError) as excinfo:
+        _review_finding(required_resolution=text)
+    msg = str(excinfo.value)
+    assert "REVIEW: finding R1-F1 field 'required_resolution' contains a control character" in msg
+    assert f"(U+{ord(ch):04X} at index 5)" in msg
+    assert "only newlines and tabs are accepted inside 'required_resolution'" in msg
+    assert "first" not in msg and "second" not in msg
+
+
+@pytest.mark.parametrize("mode", ["REMOTE", "LOCAL"])
+@pytest.mark.parametrize("name", sorted(_CONTROL_SAMPLES), ids=str)
+def test_fix_rationale_keeps_newlines_and_tabs_and_nothing_else(mode, name):
+    ch = _CONTROL_SAMPLES[name]
+    text = f"The change is already covered by the existing suite;{ch}nothing to do."
+    res = {"finding_id": "R1-F1", "resolution": "no_change_with_rationale", "rationale": text}
+    stdout, wf_mode = _fix_with([res], mode)
+    if ch in ("\n", "\t"):
+        payload = parse_control_result(stdout, Phase.FIX, wf_mode)
+        assert payload["resolutions"][0]["rationale"] == text
+        return
+    with pytest.raises(ControlResultValidationError) as excinfo:
+        parse_control_result(stdout, Phase.FIX, wf_mode)
+    msg = str(excinfo.value)
+    assert "FIX: resolution for R1-F1 field 'rationale' contains a control character" in msg
+    assert f"(U+{ord(ch):04X} at index" in msg
+    assert "only newlines and tabs are accepted inside 'rationale'" in msg
+    assert "existing suite" not in msg
+
+
+def test_the_length_bound_speaks_before_the_control_character_rule():
+    """An oversized value is refused for its size whatever it contains, so
+    the index in a control-character message is always into a value of
+    accepted size, and the size message never has to inspect the text."""
+    over = "\x00" * (MAX_FINDING_TITLE_CHARS + 1)
+    with pytest.raises(ControlResultValidationError) as excinfo:
+        _review_finding(title=over)
+    msg = str(excinfo.value)
+    assert f"is {MAX_FINDING_TITLE_CHARS + 1} characters" in msg
+    assert "control character" not in msg
+
+
+def test_control_characters_are_refused_where_the_renderer_would_escape_them_only():
+    """Fields outside findings keep their existing rules: a REVIEW
+    ``summary``/``message`` or a LOCAL ``observations`` entry is quoted as a
+    block or not rendered at all, and is out of scope for #78."""
+    payload = dict(GOOD_REVIEW, summary="line one\x1bline two", message="a\rb")
+    ReviewResult.from_payload(payload)
 
 
 # -- whole-payload bound (#53) ---------------------------------------------------------------

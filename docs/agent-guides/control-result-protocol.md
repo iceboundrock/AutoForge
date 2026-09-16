@@ -105,6 +105,30 @@ review prompts state every parser bound (the id bound included) through
 template variables that the engine fills from the same constants, so the
 number the reviewer is told is the number it is held to.
 
+### Control characters in finding text
+
+A finding's one-line fields (`title`, `location`) may carry **no control
+character at all**; `required_resolution` and a `FIX` `rationale` may carry a
+newline or a tab and nothing else (#78). The class is
+`prompts.CONTROL_CHARS` -- C0 and C1 controls, DEL, and the Unicode line and
+paragraph separators -- defined once: `escape_inline` renders exactly those
+characters as `\xNN` / `\uNNNN` escapes when a one-line field is placed in
+a FIX prompt, and the parser imports the same class to refuse them at parse
+time, so the set a reviewer is held to is the set the renderer would
+otherwise have to rewrite. The reason is the same as for the size bounds: a
+value the controller must alter before it can show it is not the reviewer's
+finding any more, and the renderer's escape was a containment, not a
+rendering the fixer was meant to read. A tab is refused in a one-line field
+(it is inside the escaped class, and a title has no use for one) and kept in
+a multi-line field (it is ordinary indentation in a quoted snippet). A
+rejection names the field, the code point (`U+XXXX`) and its index into the
+stripped value, never the text, and the length bound is checked first so
+that index is always into a value of accepted size. `escape_inline` and the
+resolution indentation stay in the renderer unchanged, as the defence for
+state persisted by a controller without this rule or edited by hand. Fields
+that are not rendered on one line of a prompt (`summary`, `message`,
+`branch`, `tests_attempted`, LOCAL `observations`) keep their existing rules.
+
 ### Fix payload bounds
 
 A `FIX` result is untrusted in the same way and is persisted the same way:
@@ -176,8 +200,10 @@ factor of the parser bounds, not by their sum: the renderer's safety measures
 each cost characters (a control character in a one-line field becomes its
 `\xNN` or `\uNNNN` escape, a newline inside a `required_resolution` is
 indented under its finding, and the fence grows one past the longest backtick
-run in the findings). The engine test for the largest accepted round covers
-each of those shapes, not only plain text.
+run in the findings). The engine test for the largest round covers each of
+those shapes, not only plain text; the shapes the parser now refuses (#78)
+are seeded into state directly, standing for state an older controller
+persisted, and the bound must still hold for them.
 
 ---
 

@@ -21,7 +21,12 @@ finding ids included): it is refused whole, never clipped, so the reviewer
 can re-emit it. The FIX payload is bounded the same way
 (``MAX_RESOLUTIONS_PER_FIX``, ``MAX_FIX_RATIONALE_CHARS``, the shape of
 ``commit_sha`` and the length of any URL): every resolution is persisted
-whole. The same holds for the block as a whole
+whole. A finding's one-line fields (``title``, ``location``) may carry no
+control character at all, and its ``required_resolution`` and a FIX
+``rationale`` only a newline or a tab (#78): the prompt renderer would
+escape or indent anything else, and a value the controller would have to
+rewrite before it can show it is refused, not repaired. The same holds for
+the block as a whole
 (``MAX_CONTROL_RESULT_CHARS``): the accepted payload is persisted whole and
 is what the next phase acts on, so its size is checked before it is decoded.
 """
@@ -33,6 +38,7 @@ import re
 from dataclasses import dataclass, field
 
 from .errors import ConfigurationError, ControlResultError, ControlResultValidationError
+from .prompts import CONTROL_CHAR_RE, CONTROL_CHARS
 from .transitions import Phase, WorkflowMode
 from .validation import parse_comment_url, parse_issue_url, parse_pr_url
 
@@ -300,6 +306,46 @@ class AnalyzeExecuteResult:
         )
 
 
+# Control characters a *multi-line* text field may still carry: a newline
+# structures a resolution and a tab is ordinary indentation; every other
+# member of the class the prompt renderer escapes is refused (#78).
+_MULTI_LINE_CONTROL_RE = re.compile(rf"(?![\n\t])[{CONTROL_CHARS}]")
+
+
+def _one_line(text: str, phase: str, subject: str, key: str) -> str:
+    """Reject a one-line text field of ``subject`` carrying a control character.
+
+    The class is ``prompts.CONTROL_CHAR_RE``, the one ``escape_inline`` would
+    otherwise escape when the field is rendered on one line of a prompt: a
+    value the controller would have to rewrite before it can show it is not
+    accepted. The message names the code point and its index, never the
+    text. Length is checked first (``_bounded``), so the index is into a
+    value of accepted size.
+    """
+    m = CONTROL_CHAR_RE.search(text)
+    if m is not None:
+        raise ControlResultValidationError(
+            f"{phase}: {subject} field {key!r} contains a control character "
+            f"(U+{ord(m.group(0)):04X} at index {m.start()}); keep it to one line of "
+            "printable text and re-emit the CONTROL_RESULT."
+        )
+    return text
+
+
+def _multi_line(text: str, phase: str, subject: str, key: str) -> str:
+    """Reject a multi-line text field of ``subject`` carrying a control
+    character other than a newline or a tab. Same message discipline as
+    :func:`_one_line`."""
+    m = _MULTI_LINE_CONTROL_RE.search(text)
+    if m is not None:
+        raise ControlResultValidationError(
+            f"{phase}: {subject} field {key!r} contains a control character "
+            f"(U+{ord(m.group(0)):04X} at index {m.start()}); only newlines and tabs are "
+            f"accepted inside {key!r}. Remove it and re-emit the CONTROL_RESULT."
+        )
+    return text
+
+
 def _bounded(text: str, phase: str, subject: str, key: str, limit: int) -> str:
     """Reject a text field of ``subject`` longer than ``limit`` characters.
 
@@ -416,18 +462,35 @@ class Finding:
         return cls(
             id=fid,
             classification=cls_,
-            required_resolution=_bounded(
-                _req_str(raw, "required_resolution", ph),
+            required_resolution=_multi_line(
+                _bounded(
+                    _req_str(raw, "required_resolution", ph),
+                    ph,
+                    subject,
+                    "required_resolution",
+                    MAX_FINDING_RESOLUTION_CHARS,
+                ),
                 ph,
                 subject,
                 "required_resolution",
-                MAX_FINDING_RESOLUTION_CHARS,
             ),
-            title=_bounded(
-                _opt_str(raw, "title", ph), ph, subject, "title", MAX_FINDING_TITLE_CHARS
+            title=_one_line(
+                _bounded(_opt_str(raw, "title", ph), ph, subject, "title", MAX_FINDING_TITLE_CHARS),
+                ph,
+                subject,
+                "title",
             ),
-            location=_bounded(
-                _opt_str(raw, "location", ph), ph, subject, "location", MAX_FINDING_LOCATION_CHARS
+            location=_one_line(
+                _bounded(
+                    _opt_str(raw, "location", ph),
+                    ph,
+                    subject,
+                    "location",
+                    MAX_FINDING_LOCATION_CHARS,
+                ),
+                ph,
+                subject,
+                "location",
             ),
         )
 
@@ -487,12 +550,14 @@ class FindingResolution:
             raise ControlResultValidationError(
                 f"{ph}: resolution for {fid} must be one of {FIX_RESOLUTIONS}, got {res!r}"
             )
-        rationale = _bounded(
-            _opt_str(raw, "rationale", ph),
+        subject = f"resolution for {fid}"
+        rationale = _multi_line(
+            _bounded(
+                _opt_str(raw, "rationale", ph), ph, subject, "rationale", MAX_FIX_RATIONALE_CHARS
+            ),
             ph,
-            f"resolution for {fid}",
+            subject,
             "rationale",
-            MAX_FIX_RATIONALE_CHARS,
         )
         follow_up = _opt_url(raw, "follow_up_issue_url", ph, "issue")
         if res == "no_change_with_rationale":
@@ -772,12 +837,14 @@ class LocalFindingResolution:
                     else ""
                 )
             )
-        rationale = _bounded(
-            _opt_str(raw, "rationale", ph),
+        subject = f"resolution for {fid}"
+        rationale = _multi_line(
+            _bounded(
+                _opt_str(raw, "rationale", ph), ph, subject, "rationale", MAX_FIX_RATIONALE_CHARS
+            ),
             ph,
-            f"resolution for {fid}",
+            subject,
             "rationale",
-            MAX_FIX_RATIONALE_CHARS,
         )
         # Both non-fix dispositions are only acceptable with real reasoning:
         # "won't fix" and "couldn't fix" are decisions a human has to judge.

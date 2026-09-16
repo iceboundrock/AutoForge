@@ -47,7 +47,13 @@ LOCAL_COMMON_TEMPLATE = "local_common.md"
 _BACKTICK_RUN_RE = re.compile(r"`+")
 
 
-_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+# The characters a one-line prompt field may not carry: C0 and C1 controls
+# (DEL included) and the Unicode line and paragraph separators. This is the
+# single definition: ``escape_inline`` renders them harmless here and
+# ``result_parser`` refuses them at parse time (#78), so the set the parser
+# holds a reviewer to is the set the renderer would otherwise have to escape.
+CONTROL_CHARS = r"\x00-\x1f\x7f-\x9f\u2028\u2029"
+CONTROL_CHAR_RE = re.compile(f"[{CONTROL_CHARS}]")
 
 
 def escape_inline(text: str) -> str:
@@ -65,7 +71,7 @@ def escape_inline(text: str) -> str:
     that the *structure* of the prompt stays the controller's, not that the
     agent can decode the string byte-for-byte.
     """
-    return _CONTROL_CHAR_RE.sub(lambda m: m.group(0).encode("unicode_escape").decode("ascii"), text)
+    return CONTROL_CHAR_RE.sub(lambda m: m.group(0).encode("unicode_escape").decode("ascii"), text)
 
 
 def fenced_untrusted_block(content: str, info: str = "") -> str:
