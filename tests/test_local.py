@@ -1510,6 +1510,122 @@ def test_a_crash_between_corrections_resumes_under_the_remaining_bound(tmp_path,
     assert eng2.step().next_phase == "BLOCKED"
 
 
+def _corrupt_journal(eng) -> Path:
+    """Plant an unparseable ``events.jsonl`` for the current run."""
+    journal = Path(eng.paths.logs_dir) / eng.state.run_id / "events.jsonl"
+    journal.parent.mkdir(parents=True, exist_ok=True)
+    journal.write_text("not json\n")
+    return journal
+
+
+@pytest.mark.parametrize("phase", [Phase.ANALYZE_EXECUTE, Phase.FIX])
+def test_a_journal_refused_before_the_launch_is_not_charged_as_a_launch(tmp_path, phase):
+    """#57: a refusal that happens before any agent starts charges nothing.
+
+    `_invoke_phase` opens the run logger (and so reads the event journal)
+    before it launches the agent. A journal it refuses used to land *after*
+    the launch had been charged to the durable per-phase bound, so three
+    refused `resume`s spent the bound with zero launches, and the repaired
+    run then blocked with "invoked 3 time(s)". The charge belongs at the
+    launch site: it is written immediately before the agent starts, so a
+    refusal before that point leaves no checkpoint at all.
+    """
+    root = local_repo(tmp_path)
+    eng = make_local_engine(root, "features/add-filter.md")
+    _run_to(eng, root, phase)
+    journal = _corrupt_journal(eng)
+    eng.provider._handler = lambda req: pytest.fail("no agent may be launched")
+
+    for _ in range(3):
+        with pytest.raises(StateError, match="corrupted event journal"):
+            eng.step()
+        persisted = load_state(eng.paths.state_file)
+        assert persisted.phase is phase
+        assert persisted.local_pending_phase == ""
+        assert persisted.local_pending_attempts == 0
+
+    # The operator moves the journal aside, as the refusal tells them to,
+    # and the phase launches for the first time -- not the fourth.
+    journal.rename(journal.with_suffix(".bad"))
+    launches: list[int] = []
+
+    def implements(req):
+        launches.append(load_state(eng.paths.state_file).local_pending_attempts)
+        touch_impl(root, "repaired\n")
+        return impl_result() if phase is Phase.ANALYZE_EXECUTE else fix_result(["R1-F1"])
+
+    eng.provider._handler = implements
+    assert eng.step().next_phase == "REVIEW"
+    assert launches == [1], "the first real launch is charged as the first"
+    assert eng.state.local_pending_attempts == 0, "resolved, so the checkpoint is closed"
+
+
+@pytest.mark.parametrize("phase", [Phase.ANALYZE_EXECUTE, Phase.FIX])
+def test_a_profile_refused_before_the_launch_is_not_charged_as_a_launch(tmp_path, phase):
+    """#57, the other pre-launch refusal: an unusable execution profile."""
+    root = local_repo(tmp_path)
+    eng = make_local_engine(root, "features/add-filter.md")
+    _run_to(eng, root, phase)
+
+    def refuses(profile):
+        raise ConfigurationError(f"profile {profile.name!r}: unusable")
+
+    eng.provider.validate_profile = refuses  # type: ignore[method-assign]
+    eng.provider._handler = lambda req: pytest.fail("no agent may be launched")
+    for _ in range(3):
+        with pytest.raises(ConfigurationError, match="unusable"):
+            eng.step()
+    persisted = load_state(eng.paths.state_file)
+    assert persisted.phase is phase
+    assert persisted.local_pending_phase == ""
+    assert persisted.local_pending_attempts == 0
+
+
+def test_a_pre_launch_refusal_on_a_resumed_entry_keeps_the_earlier_charge(tmp_path):
+    """One real launch, then a refusal before the retry: still one launch."""
+    root = local_repo(tmp_path)
+    eng = make_local_engine(root, "features/add-filter.md")
+    eng.step()  # INITIALIZING -> ANALYZE_EXECUTE
+    before = eng.workspace().snapshot().fingerprint
+
+    def writes_then_dies(req):
+        touch_impl(root, "partial\n")
+        raise KeyboardInterrupt
+
+    eng.provider._handler = writes_then_dies
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    assert load_state(eng.paths.state_file).local_pending_attempts == 1
+
+    eng2 = make_local_engine(root, "features/add-filter.md", start=False)
+    eng2.load()
+    journal = _corrupt_journal(eng2)
+    eng2.provider._handler = lambda req: pytest.fail("no agent may be launched")
+    with pytest.raises(StateError, match="corrupted event journal"):
+        eng2.step()
+    persisted = load_state(eng2.paths.state_file)
+    assert persisted.local_pending_phase == "ANALYZE_EXECUTE"
+    assert persisted.local_pending_fingerprint == before
+    assert persisted.local_pending_attempts == 1, "the refusal launched nothing"
+
+    # Repaired: the retry is the second launch and is told it is a retry.
+    # The dead attempt's work is already in the tree, so an honest "changed
+    # nothing" is accepted against the baseline from before that attempt.
+    journal.unlink()
+    prompts: list[str] = []
+    launches: list[int] = []
+
+    def continues(req):
+        prompts.append(req.prompt)
+        launches.append(load_state(eng2.paths.state_file).local_pending_attempts)
+        return impl_result(changed=False)
+
+    eng2.provider._handler = continues
+    assert eng2.step().next_phase == "REVIEW"
+    assert launches == [2]
+    assert "A previous invocation of ANALYZE_EXECUTE" in prompts[0]
+
+
 def test_a_review_that_fails_verification_leaves_no_pending_checkpoint(tmp_path):
     """REVIEW is read-only, so it is not checkpointed as a write phase."""
     root = local_repo(tmp_path)

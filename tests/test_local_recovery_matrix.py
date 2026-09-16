@@ -66,14 +66,20 @@ def fresh(root: Path, cfg=None):
     return eng
 
 
-# A LOCAL step persists twice: the pre-agent invocation checkpoint, and the
-# transition once everything verified. Naming them makes each test say which
-# side of the agent it is crashing on.
-SAVE_CHECKPOINT = 1
-SAVE_TRANSITION = 2
+# Where a LOCAL step persists. Every phase binds first (step count, the
+# fingerprint the agent is judged against). A write-capable phase then
+# charges the launch to its durable per-phase checkpoint immediately before
+# the agent starts (#57: after every refusal that launches nothing), and a
+# read-only REVIEW has no such charge. Both persist the transition last.
+# Naming the saves makes each test say which side of the agent it is
+# crashing on.
+SAVE_BINDING = 1
+SAVE_LAUNCH = 2
+SAVE_WRITE_TRANSITION = 3
+SAVE_REVIEW_TRANSITION = 2
 
 
-def crash_on_save(eng, nth: int = SAVE_TRANSITION):
+def crash_on_save(eng, nth: int):
     """Make the ``nth`` remaining state persist die instead of landing."""
     original = eng._save
     left = {"n": nth}
@@ -129,6 +135,46 @@ def test_a_crash_before_the_agent_ran_leaves_the_phase_to_be_done(tmp_path):
     eng3 = fresh(root)
     eng3.provider._handler = lambda req: (touch_impl(root, "v1\n"), impl_result())[1]
     assert eng3.step().next_phase == "REVIEW"
+
+
+def test_a_crash_on_the_launch_charge_is_a_launch_that_never_happened(tmp_path):
+    """The charge is the last save before the agent; a crash there launched nothing.
+
+    #57: the checkpoint is opened and charged in one write immediately before
+    the launch. If that write dies, the state file still says the entry was
+    never launched, so the resumed attempt is the first: charged as one, and
+    not told that earlier work may be in the tree.
+    """
+    root = local_repo(tmp_path)
+    eng = make_local_engine(root, FEATURE)
+    eng.step()  # INITIALIZING -> ANALYZE_EXECUTE
+    before = fingerprint(root)
+
+    eng.provider._handler = lambda req: pytest.fail("the charge died; no agent may start")
+    crash_on_save(eng, SAVE_LAUNCH)
+    with pytest.raises(Crash):
+        eng.step()
+
+    saved = load_state(eng.paths.state_file)
+    assert saved.phase == Phase.ANALYZE_EXECUTE
+    assert saved.local_pending_phase == ""
+    assert saved.local_pending_attempts == 0
+    assert saved.workspace_fingerprint == before, "the binding save had landed"
+
+    eng2 = fresh(root)
+    launches: list[int] = []
+    prompts: list[str] = []
+
+    def implements(req):
+        launches.append(load_state(eng2.paths.state_file).local_pending_attempts)
+        prompts.append(req.prompt)
+        touch_impl(root, "v1\n")
+        return impl_result()
+
+    eng2.provider._handler = implements
+    assert eng2.step().next_phase == "REVIEW"
+    assert launches == [1], "the first launch that happened is the first launch charged"
+    assert "this is the first attempt at this phase" in prompts[0]
 
 
 def test_a_crash_after_the_agents_side_effect_does_not_demand_the_work_twice(tmp_path):
@@ -208,7 +254,7 @@ def test_a_crash_after_validation_but_before_the_transition_is_persisted(tmp_pat
     eng.step()
 
     eng.provider._handler = lambda req: (touch_impl(root, "v1\n"), impl_result())[1]
-    crash_on_save(eng, SAVE_TRANSITION)  # the persist of ANALYZE_EXECUTE -> REVIEW
+    crash_on_save(eng, SAVE_WRITE_TRANSITION)  # ANALYZE_EXECUTE -> REVIEW
     with pytest.raises(Crash):
         eng.step()
 
@@ -261,7 +307,7 @@ def test_a_crash_before_a_clean_review_is_persisted_re_reviews(tmp_path):
     eng.step()
 
     eng.provider._handler = lambda req: review_result(eng.state.workspace_fingerprint)
-    crash_on_save(eng, SAVE_TRANSITION)
+    crash_on_save(eng, SAVE_REVIEW_TRANSITION)
     with pytest.raises(Crash):
         eng.step()
 
@@ -286,7 +332,7 @@ def test_a_crash_before_a_findings_review_is_persisted_does_not_charge_a_round(t
     eng.provider._handler = lambda req: review_result(
         eng.state.workspace_fingerprint, findings=[finding()]
     )
-    crash_on_save(eng, SAVE_TRANSITION)
+    crash_on_save(eng, SAVE_REVIEW_TRANSITION)
     with pytest.raises(Crash):
         eng.step()
     assert load_state(eng.paths.state_file).review_round == 0
@@ -319,7 +365,7 @@ def test_the_tree_moving_while_the_controller_was_dead_blocks_the_review(tmp_pat
     eng.step()
     reviewed = eng.state.workspace_fingerprint
 
-    crash_on_save(eng, SAVE_TRANSITION)
+    crash_on_save(eng, SAVE_REVIEW_TRANSITION)
     eng.provider._handler = lambda req: review_result(reviewed)
     with pytest.raises(Crash):
         eng.step()
@@ -595,7 +641,7 @@ def test_a_crash_before_the_run_was_ever_persisted_leaves_no_run(tmp_path):
     """
     root = local_repo(tmp_path)
     eng = make_local_engine(root, FEATURE)
-    crash_on_save(eng, SAVE_CHECKPOINT)
+    crash_on_save(eng, SAVE_BINDING)  # the run's first save
     with pytest.raises(Crash):
         eng.step()
 
