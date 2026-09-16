@@ -1581,6 +1581,124 @@ def test_a_profile_refused_before_the_launch_is_not_charged_as_a_launch(tmp_path
     assert persisted.local_pending_attempts == 0
 
 
+def _edited_templates(tmp_path, monkeypatch) -> Path:
+    """Serve the shipped prompt templates from an editable copy."""
+    import shutil
+
+    import autoforge.prompts as prompts_module
+
+    templates = tmp_path / "prompts"
+    shutil.copytree(prompts_module.prompts_dir(), templates)
+    monkeypatch.setattr(prompts_module, "prompts_dir", lambda: templates)
+    return templates
+
+
+@pytest.mark.parametrize("phase", [Phase.ANALYZE_EXECUTE, Phase.FIX])
+def test_a_template_refused_before_the_launch_is_not_charged_as_a_launch(
+    tmp_path, monkeypatch, phase
+):
+    """#57, the third pre-launch refusal: a phase template that cannot render.
+
+    A phase template naming a variable the engine does not provide is
+    refused while the step is *planned* (``step`` renders the prompt to
+    plan before it executes), so nothing downstream -- the step count, the
+    binding, the charge -- is ever reached. This pins the observable class
+    from the issue; the in-loop render order is pinned by the correction
+    test below, which is the render that planning does not cover.
+    """
+    root = local_repo(tmp_path)
+    eng = make_local_engine(root, "features/add-filter.md")
+    _run_to(eng, root, phase)
+    steps_before = load_state(eng.paths.state_file).step_count
+
+    templates = _edited_templates(tmp_path, monkeypatch)
+    template_name = eng.template_for(phase)
+    assert template_name is not None
+    template = templates / template_name
+    shipped = template.read_text(encoding="utf-8")
+    template.write_text(shipped + "\n{{NOT_A_VARIABLE}}\n", encoding="utf-8")
+    eng.provider._handler = lambda req: pytest.fail("no agent may be launched")
+
+    for _ in range(3):
+        with pytest.raises(ConfigurationError, match="NOT_A_VARIABLE"):
+            eng.step()
+        persisted = load_state(eng.paths.state_file)
+        assert persisted.phase is phase
+        assert persisted.local_pending_phase == ""
+        assert persisted.local_pending_attempts == 0
+        assert persisted.step_count == steps_before, "refused while planning: no step"
+
+    # Repaired: the template renders again and the phase launches for the
+    # first time.
+    template.write_text(shipped, encoding="utf-8")
+    launches: list[int] = []
+
+    def implements(req):
+        launches.append(load_state(eng.paths.state_file).local_pending_attempts)
+        touch_impl(root, "repaired\n")
+        return impl_result() if phase is Phase.ANALYZE_EXECUTE else fix_result(["R1-F1"])
+
+    eng.provider._handler = implements
+    assert eng.step().next_phase == "REVIEW"
+    assert launches == [1], "the first real launch is charged as the first"
+    assert eng.state.local_pending_attempts == 0, "resolved, so the checkpoint is closed"
+
+
+@pytest.mark.parametrize("phase", [Phase.ANALYZE_EXECUTE, Phase.FIX])
+def test_a_correction_refused_at_its_template_is_not_charged_as_a_launch(
+    tmp_path, monkeypatch, phase
+):
+    """#57: the correction prompt is rendered before the correction is charged.
+
+    ``correction.md`` is only rendered for a correction retry, inside the
+    invocation loop, so planning never sees it. If it cannot render, the
+    launch that preceded it stays charged (it ran) and the correction is
+    refused without being charged. Before the fix the correction was charged
+    first and rendered second, so the refusal cost a launch that never
+    started.
+    """
+    root = local_repo(tmp_path)
+    cfg = default_config()
+    cfg.execution.max_correction_attempts = 5
+    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
+    _run_to(eng, root, phase)
+
+    templates = _edited_templates(tmp_path, monkeypatch)
+    correction = templates / "correction.md"
+    shipped = correction.read_text(encoding="utf-8")
+    correction.write_text(shipped + "\n{{NOT_A_VARIABLE}}\n", encoding="utf-8")
+    launches: list[int] = []
+
+    def malformed(req):
+        launches.append(load_state(eng.paths.state_file).local_pending_attempts)
+        return "no control block\n"
+
+    eng.provider._handler = malformed
+    with pytest.raises(ConfigurationError, match="NOT_A_VARIABLE"):
+        eng.step()
+    assert launches == [1], "the one real launch was charged; the correction never started"
+    persisted = load_state(eng.paths.state_file)
+    assert persisted.phase is phase
+    assert persisted.local_pending_phase == phase.value
+    assert persisted.local_pending_attempts == 1, "the refused correction is not charged"
+
+    # Repaired and resumed: the retry is the second launch, not the third.
+    correction.write_text(shipped, encoding="utf-8")
+    eng2 = make_local_engine(root, "features/add-filter.md", cfg=cfg, start=False)
+    eng2.load()
+    resumed: list[int] = []
+
+    def implements(req):
+        resumed.append(load_state(eng2.paths.state_file).local_pending_attempts)
+        touch_impl(root, "repaired\n")
+        return impl_result() if phase is Phase.ANALYZE_EXECUTE else fix_result(["R1-F1"])
+
+    eng2.provider._handler = implements
+    assert eng2.step().next_phase == "REVIEW"
+    assert resumed == [2]
+    assert eng2.state.local_pending_attempts == 0
+
+
 def test_a_pre_launch_refusal_on_a_resumed_entry_keeps_the_earlier_charge(tmp_path):
     """One real launch, then a refusal before the retry: still one launch."""
     root = local_repo(tmp_path)
