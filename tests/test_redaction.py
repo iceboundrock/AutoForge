@@ -45,6 +45,9 @@ _WORST_CASE_UNITS = {
     "bearer_header": "Authorization:Token x ",
     "github_pat": "ghp_aaaaaaaa ",
     "sk_key": "sk-aaaaaaaa ",
+    # Matched by the ``sk-`` pattern before its own; listed so a narrower
+    # ``sk-`` pattern could not leave it unpinned.
+    "sk_ant_key": "sk-ant-aaaaaaaa ",
     "generic_assignment": "token=aaaaaaaaaaaa ",
 }
 
@@ -73,3 +76,15 @@ def test_redaction_growth_does_not_compound_across_patterns():
     out = redact(text)
     assert "ghp_aaaaaaaa" not in out and "sk-aaaaaaaaaaaa" not in out
     assert len(out) <= MAX_GROWTH_FACTOR * len(text)
+
+
+def test_redaction_marker_wrapped_by_a_later_pattern_never_grows():
+    """The bearer value class admits ``*``, so it can match a marker the
+    assignment pattern wrote; that match holds the whole marker, so it is at
+    least as long as its replacement and the second pass cannot grow it."""
+    grown = redact("HF_TOKEN=x")  # 10 -> 23, the first pass grew it
+    assert grown == "HF_TOKEN=***REDACTED***"
+    text = "Authorization: Bearer HF_TOKEN=x"
+    out = redact(text)
+    assert out == "Authorization: Bearer ***REDACTED***"
+    assert len(out) < len("Authorization: Bearer ") + len(grown)

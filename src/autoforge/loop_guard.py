@@ -35,21 +35,25 @@ import hashlib
 import re
 
 from .errors import StateError
+from .redaction import MAX_GROWTH_FACTOR
+from .result_parser import MAX_FINDING_RESOLUTION_CHARS
 
 _WS_RE = re.compile(r"\s+")
 # Per-round bounds on the persisted findings. Both are at or above what the
 # parser lets a REVIEW result carry (``result_parser.MAX_FINDINGS_PER_REVIEW``,
 # ``MAX_FINDING_RESOLUTION_CHARS``), so a round the controller accepted is
 # always retained complete and the clipping below only ever applies to state
-# that did not come through the parser. The resolution bound is the parser
-# bound times ``redaction.MAX_GROWTH_FACTOR``: the engine redacts a finding
-# between the parser and this record, and redaction can lengthen a text (a
-# one-character secret becomes a 14-character marker), so a bound equal to
-# the parser's would clip an accepted resolution and mark the round
-# truncated, which refuses every later replan of the PR (#33).
-# ``tests/test_result_parser.py`` pins both relations.
+# that did not come through the parser. The count bound is an independent
+# number above the parser's; ``tests/test_result_parser.py`` pins that
+# relation. The resolution bound is *computed* from the parser bound and
+# ``redaction.MAX_GROWTH_FACTOR`` (2000 x 3 = 6000) rather than restated: the
+# engine redacts a finding between the parser and this record, and redaction
+# can lengthen a text (a one-character secret becomes a 14-character marker),
+# so a bound equal to the parser's would clip an accepted resolution and mark
+# the round truncated, which refuses every later replan of the PR (#33).
+# Deriving it means neither input can drift away from it unnoticed.
 MAX_PERSISTED_FINDINGS_PER_ROUND = 100
-MAX_REQUIRED_RESOLUTION_CHARS = 6000
+MAX_REQUIRED_RESOLUTION_CHARS = MAX_FINDING_RESOLUTION_CHARS * MAX_GROWTH_FACTOR
 
 # ``result`` values recorded per review round.
 RESULT_NEEDS_FIX = "needs_fix"
