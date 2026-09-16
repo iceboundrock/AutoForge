@@ -38,7 +38,9 @@ def test_none_and_non_str_safe():
 
 
 # The shortest text each pattern recognises, with the separator that lets the
-# shape repeat: the most a pattern can grow a text is this unit's ratio.
+# shape repeat, so the filled case below is meaningful. The bare shape without
+# the separator has a marginally higher ratio (``HF_TOKEN=x``, 10 to 23, is the
+# worst text of all and is pinned by the wrapping test); no text grows past it.
 _WORST_CASE_UNITS = {
     "named_assignment": "HF_TOKEN=x;",
     "named_assignment_quoted": 'HF_TOKEN="x"',

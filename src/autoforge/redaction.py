@@ -45,8 +45,10 @@ _REDACTED = "***REDACTED***"
 # :func:`redact` never returns more than this many times its input's length.
 # Every pattern replaces a run of at least one character with the 14-character
 # marker, so a text can *grow* under redaction; the worst shape is a one
-# character secret behind the shortest recognised name (``HF_TOKEN=x;`` is 11
-# characters and becomes 24, a factor of about 2.2). Growth does not compound
+# character secret behind the shortest recognised name: ``HF_TOKEN=x`` is 10
+# characters and becomes 23, a factor of 2.3, and repeating it needs a
+# separator (``HF_TOKEN=x;``, 11 to 24), so no longer text reaches that
+# ratio. Growth does not compound
 # across patterns: a later pattern can only lengthen the text by matching a
 # run *shorter* than the marker, and a marker is never part of such a run.
 # The value classes that admit ``*`` (the named-assignment and bearer values)
