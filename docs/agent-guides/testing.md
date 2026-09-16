@@ -52,10 +52,13 @@ High-priority coverage includes:
 - success
 - non-zero exit
 - timeout, including a descendant that holds the inherited pipes after the
-  child has exited (inside the process group, and outside it via `setsid`)
-- bounded capture: a stream past the bound keeps its head and tail, and the
-  retained size honours a bound smaller than one pipe read
-- non-UTF-8 output is replaced, not raised
+  child has exited (inside the process group, and outside it via `setsid`),
+  and a same-group descendant that closed its stdio and ignores SIGTERM
+- bounded capture: a stream past the bound keeps its head and tail, the
+  retained size honours a bound smaller than one pipe read, and memory stays
+  at the bound plus a constant under one-byte reads
+- non-UTF-8 output is replaced, not raised; a multi-byte character across
+  the internal head/tail split is intact when nothing was omitted
 - arguments containing shell metacharacters
 
 ### GitHub verification

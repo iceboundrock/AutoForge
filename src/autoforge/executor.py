@@ -9,19 +9,22 @@ Safety properties:
 - stdin is ``/dev/null`` so a CLI that expects an interactive TTY cannot
   hang waiting for input;
 - the child runs in its own session/process group; on timeout the whole
-  group is terminated (SIGTERM, then SIGKILL) so grandchildren spawned by an
-  agent (test runners, editors, servers) do not linger. The timeout bounds
-  the whole invocation: the child's exit *and* EOF on its pipes. A descendant
-  that inherited them (a server the agent left running) keeps them open past
-  the child's exit, and one that also left the process group cannot be
-  killed from here, so the capture is abandoned rather than waited for;
+  group is terminated (SIGTERM, then SIGKILL) and the kill is complete only
+  when no process is left in the group, so grandchildren spawned by an agent
+  (test runners, editors, servers) do not linger, whether or not they still
+  hold the agent's pipes. The timeout bounds the whole invocation: the
+  child's exit *and* EOF on its pipes. A descendant that inherited them (a
+  server the agent left running) keeps them open past the child's exit, and
+  one that also left the process group cannot be killed from here, so the
+  capture is abandoned rather than waited for;
 - capture is bounded: each stream keeps at most ``max_output_bytes`` (the
-  first half and the last half of what the child wrote), so a runaway or
-  adversarial child costs the controller a bounded amount of memory, not the
-  size of its output. The tail is kept because the CONTROL_RESULT block is
-  the last thing on stdout; :attr:`ExecutionResult.stdout_tail` is the part
-  known to be contiguous up to EOF, so a caller that parses a truncated
-  stream never sees text that spans the cut.
+  first half and the last half of what the child wrote) in a buffer whose
+  memory is that bound plus a constant, so a runaway or adversarial child
+  costs the controller a bounded amount of memory, not the size of its
+  output, however it chunks it. The tail is kept because the CONTROL_RESULT
+  block is the last thing on stdout; :attr:`ExecutionResult.stdout_tail` is
+  the part known to be contiguous up to EOF, so a caller that parses a
+  truncated stream never sees text that spans the cut.
 """
 
 from __future__ import annotations
@@ -32,7 +35,6 @@ import signal
 import subprocess
 import threading
 import time
-from collections import deque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import IO
@@ -40,6 +42,7 @@ from typing import IO
 from .errors import ExecutionError, ExecutionTimeoutError
 
 _KILL_GRACE_SECONDS = 5.0
+_GROUP_POLL_SECONDS = 0.02
 _READ_CHUNK_BYTES = 64 * 1024
 
 # Per-stream capture bound. A Claude Code ``-p`` transcript is kilobytes and
@@ -121,10 +124,13 @@ class _BoundedBuffer:
     """Keep at most ``limit`` bytes of a stream: its head and its tail.
 
     The first ``limit - limit // 2`` bytes are the head and the last
-    ``limit // 2`` the tail (a deque of chunks, so trimming is O(chunk), not
-    O(tail)); everything between is counted and dropped. The tail is trimmed
-    to the byte, so what is retained never exceeds ``limit`` however the
-    stream is chunked -- a bound smaller than one read is honoured too.
+    ``limit // 2`` the tail; everything between is counted and dropped. The
+    tail is a ring buffer (one ``bytearray``, filled once and then
+    overwritten in place), so the memory the buffer holds is the limit plus a
+    constant, whatever the stream's chunking: a writer that produces one byte
+    per read costs no per-chunk objects. The tail is trimmed to the byte, so
+    what is retained never exceeds ``limit``, and a bound smaller than one
+    read is honoured too.
     """
 
     def __init__(self, limit: int, name: str) -> None:
@@ -133,14 +139,17 @@ class _BoundedBuffer:
         self._head_limit = limit - limit // 2
         self._tail_limit = limit // 2
         self._head = bytearray()
-        self._tail: deque[bytes] = deque()
-        self._tail_len = 0
+        # The ring grows by appending until it holds ``_tail_limit`` bytes and
+        # is overwritten in place from ``_pos`` after that; ``_pos`` is the
+        # oldest byte once the ring is full and 0 before.
+        self._ring = bytearray()
+        self._pos = 0
         self._total = 0
 
     @property
     def retained(self) -> int:
         """Bytes currently held; never more than the limit."""
-        return len(self._head) + self._tail_len
+        return len(self._head) + len(self._ring)
 
     def feed(self, chunk: bytes) -> None:
         self._total += len(chunk)
@@ -148,29 +157,44 @@ class _BoundedBuffer:
         if room > 0:
             self._head += chunk[:room]
             chunk = chunk[room:]
-        if not chunk:
+        size = self._tail_limit
+        if not chunk or size == 0:
             return
-        self._tail.append(chunk)
-        self._tail_len += len(chunk)
-        excess = self._tail_len - self._tail_limit
-        while excess > 0:
-            oldest = self._tail[0]
-            if len(oldest) <= excess:
-                self._tail.popleft()
-                self._tail_len -= len(oldest)
-                excess -= len(oldest)
-            else:
-                self._tail[0] = oldest[excess:]
-                self._tail_len -= excess
-                excess = 0
+        if len(self._ring) < size:
+            fill = size - len(self._ring)
+            self._ring += chunk[:fill]
+            chunk = chunk[fill:]
+            if not chunk:
+                return
+        if len(chunk) >= size:
+            self._ring[:] = chunk[len(chunk) - size :]
+            self._pos = 0
+            return
+        end = self._pos + len(chunk)
+        if end <= size:
+            self._ring[self._pos : end] = chunk
+        else:
+            split = size - self._pos
+            self._ring[self._pos :] = chunk[:split]
+            self._ring[: len(chunk) - split] = chunk[split:]
+        self._pos = end % size
+
+    def _tail(self) -> bytes:
+        return bytes(self._ring[self._pos :] + self._ring[: self._pos])
 
     def captured(self) -> _Captured:
-        tail = b"".join(self._tail)
+        tail = self._tail()
         omitted = self._total - len(self._head) - len(tail)
+        if omitted <= 0:
+            # Nothing was dropped, so the split between head and tail is an
+            # internal detail: decode the stream whole, or a multi-byte
+            # character that straddles it would come out as replacements.
+            return _Captured((self._head + tail).decode("utf-8", errors="replace"), False, 0)
+        # Past the bound the head and the tail are separate pieces of the
+        # stream; a character cut by the bound decodes to replacements on
+        # either side of the marker, which is what was captured.
         head_text = self._head.decode("utf-8", errors="replace")
         tail_text = tail.decode("utf-8", errors="replace")
-        if omitted <= 0:
-            return _Captured(head_text + tail_text, False, 0)
         marker = (
             f"\n[autoforge: {omitted} bytes of {self._name} omitted; the capture bound is "
             f"{self._limit} bytes, the first {len(self._head)} and last {len(tail)} "
@@ -258,6 +282,31 @@ def _eof(readers: tuple[_BoundedReader, ...], deadline: float | None) -> bool:
     return all(reader.wait(deadline) for reader in readers)
 
 
+def _group_alive(pgid: int) -> bool:
+    """True while any process still belongs to the group.
+
+    The group id stays reserved while a member lives, however the member was
+    started and wherever its output goes; ``EPERM`` names a member that
+    cannot be signalled from here, which is still a member.
+    """
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _group_gone(pgid: int, deadline: float) -> bool:
+    """Poll until the group has no member left or ``deadline``; True when gone."""
+    while _group_alive(pgid):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(_GROUP_POLL_SECONDS)
+    return True
+
+
 def _terminate_group(
     pgid: int, proc: subprocess.Popen, readers: tuple[_BoundedReader, ...]
 ) -> None:
@@ -266,16 +315,20 @@ def _terminate_group(
     ``pgid`` is signalled rather than ``proc``: the child leads its own group
     (``start_new_session``), so its descendants can be reached after the
     child itself has exited and been reaped, and the group id stays reserved
-    while any of them lives. The group is dead when the child is reaped *and*
-    its pipes reached EOF. A writer that survives SIGKILL left the group
-    (``setsid``) and cannot be reached from here, so the capture is abandoned
-    rather than waited for.
+    while any of them lives. The group is dead when the child is reaped, its
+    pipes reached EOF *and* no process is left in the group; the last check
+    is what catches a descendant that closed its inherited pipes and ignores
+    SIGTERM, which the first two cannot see. Each wait is bounded by the
+    kill grace. A member that survives SIGKILL past the grace (uninterruptible
+    in the kernel, or not signallable from here) is not waited for, and a
+    writer that left the group (``setsid``) cannot be reached at all, so the
+    capture is then abandoned rather than waited for.
     """
     for sig in (signal.SIGTERM, signal.SIGKILL):
         if not _signal_group(pgid, sig):
             break
         deadline = time.monotonic() + _KILL_GRACE_SECONDS
-        if _reaped(proc, deadline) and _eof(readers, deadline):
+        if _reaped(proc, deadline) and _eof(readers, deadline) and _group_gone(pgid, deadline):
             return
     if proc.poll() is None:
         proc.wait()

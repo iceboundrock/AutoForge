@@ -813,8 +813,9 @@ audit data rather than state payload.
   completeness.
 - No `os.system` / `shell=True` anywhere; prompts travel as a single argv
   element so shell metacharacters in issue text cannot be interpreted.
-  Agents run in a new session and the whole process group is killed on timeout;
-  the timeout also covers a descendant that keeps the agent's output pipes open
+  Agents run in a new session and the whole process group is killed on timeout,
+  and the kill is complete only once no process is left in the group; the
+  timeout also covers a descendant that keeps the agent's output pipes open
   after the agent itself has exited.
 - **Runs cannot loop forever.** The review-round cap, stagnation detection
   and the cumulative step budget (`workflow:` in the config) are controller

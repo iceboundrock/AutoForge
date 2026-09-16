@@ -5,6 +5,7 @@ import random
 import signal
 import sys
 import time
+import tracemalloc
 from pathlib import Path
 
 import pytest
@@ -125,6 +126,42 @@ def test_descendant_outside_the_group_cannot_hold_the_capture_open(monkeypatch):
         os.kill(pid, signal.SIGKILL)
 
 
+# A child that spawns a descendant in its own process group with stdio sent
+# to /dev/null and SIGTERM ignored, prints the descendant's pid and sleeps
+# past the timeout. On SIGTERM the child dies and the pipes reach EOF while
+# the descendant lives on; only a group liveness check can see it.
+_DEAF_DESCENDANT = (
+    "import subprocess, sys, time\n"
+    "p = subprocess.Popen([sys.executable, '-c', 'import signal, time; "
+    "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)'],\n"
+    "                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+    "print('descendant', p.pid, flush=True)\n"
+    "time.sleep(60)\n"
+)
+
+
+def test_same_group_descendant_with_closed_pipes_that_ignores_sigterm_is_killed(monkeypatch):
+    """The child is reaped and both pipes reach EOF after SIGTERM, but a
+    descendant that closed its stdio and ignores SIGTERM is still in the
+    group (PR #84 review, P1): the kill must escalate to SIGKILL and return
+    only once the group has no member left, not merely once the pipes closed."""
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    started = time.monotonic()
+    res = execute(ExecutionRequest(command=[PY, "-c", _DEAF_DESCENDANT], timeout_seconds=1))
+    elapsed = time.monotonic() - started
+    pid = _orphan_pid(res)
+    try:
+        assert res.timed_out and res.exit_code == -1
+        assert res.stdout.startswith("descendant ")
+        assert elapsed < 5, elapsed  # the timeout plus the two grace periods
+        assert _gone(pid, within=0.5), "the SIGTERM-ignoring descendant outlived execute()"
+    finally:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
 def test_stdin_is_closed_not_interactive():
     res = execute(
         ExecutionRequest(
@@ -169,6 +206,21 @@ def test_non_utf8_output_is_replaced_not_raised():
     assert res.ok and res.exit_code == 0
     assert res.stdout == "ok �� end\n"
     assert res.stderr == "err �(\n"
+
+
+def test_multibyte_character_across_the_capture_split_is_intact():
+    """Within the bound the head/tail split is internal (PR #84 review, P2):
+    a character whose bytes straddle it must decode whole, not as two
+    replacement characters on either side of an invisible seam."""
+    res = execute(
+        ExecutionRequest(
+            command=[PY, "-c", "import sys; sys.stdout.buffer.write('ab€'.encode())"],
+            timeout_seconds=30,
+            max_output_bytes=6,
+        )
+    )
+    assert res.ok and not res.stdout_truncated
+    assert res.stdout == "ab€" and res.stdout_tail == "ab€"
 
 
 # -- bounded capture (#53) ---------------------------------------------------
@@ -276,6 +328,53 @@ def test_bounded_buffer_never_retains_more_than_the_limit():
         expected_tail = stream[len(stream) - tail :] if tail else b""
         assert got.text.startswith(stream[:head].decode("utf-8", errors="replace"))
         assert got.text[got.tail_offset :] == expected_tail.decode("utf-8", errors="replace")
+
+
+def test_bounded_buffer_is_exact_under_fragmented_input():
+    """Thousands of one-to-three-byte reads (the tail ring wraps on nearly
+    every one): the kept head and tail are exactly the first and last bytes
+    of the stream, for limits where the tail is empty, one byte, or larger."""
+    rng = random.Random(84)
+    for limit in (1, 2, 3, 7, 64, 1000):
+        buf = _BoundedBuffer(limit, "stdout")
+        stream = bytearray()
+        for _ in range(3000):
+            chunk = bytes(rng.randrange(256) for _ in range(rng.randrange(1, 4)))
+            buf.feed(chunk)
+            stream += chunk
+            assert buf.retained <= limit
+        head, tail = limit - limit // 2, limit // 2
+        got = buf.captured()
+        assert got.truncated
+        assert got.text.startswith(stream[:head].decode("utf-8", errors="replace"))
+        expected_tail = bytes(stream[len(stream) - tail :]) if tail else b""
+        assert got.text[got.tail_offset :] == expected_tail.decode("utf-8", errors="replace")
+
+
+def test_bounded_buffer_memory_is_the_limit_plus_a_constant():
+    """The bound is on memory, not only on payload length (PR #84 review,
+    P3): a writer that causes one-byte reads must not cost a per-chunk
+    object each. With a deque of chunks this stream cost about forty times
+    the limit; the ring costs the limit plus allocator slack."""
+    limit = 400_000
+    total = 3 * limit
+    tracemalloc.start()
+    try:
+        buf = _BoundedBuffer(limit, "stdout")
+        tracemalloc.reset_peak()
+        baseline = tracemalloc.get_traced_memory()[0]
+        for i in range(total):
+            buf.feed(bytes((i & 0xFF,)))
+        current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert buf.retained == limit
+    assert current - baseline < limit * 1.5, current - baseline
+    assert peak - baseline < limit * 1.5, peak - baseline
+    got = buf.captured()
+    expected_tail = bytes(i & 0xFF for i in range(total - limit // 2, total))
+    assert got.truncated
+    assert got.text[got.tail_offset :] == expected_tail.decode("utf-8", errors="replace")
 
 
 def test_non_positive_bound_is_refused():

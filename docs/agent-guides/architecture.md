@@ -72,10 +72,13 @@ EOF. A descendant that inherited the pipes (a server the agent left running)
 keeps them open past the child's exit, so the wait for EOF runs under the
 same deadline, and at the deadline the child's whole process group is
 killed and the result is a timeout, exactly as when the child itself
-overruns. A writer the group kill cannot reach (a descendant that also
-called `setsid`) is not waited for: the capture is abandoned after the kill
-grace period, so `execute()` returns within the timeout plus a bounded grace
-whatever the child left behind.
+overruns. The kill is complete only when no process is left in the group,
+not merely when the child is reaped and its pipes closed: a descendant that
+closed its inherited stdio and ignores SIGTERM is caught by that check and
+escalated to SIGKILL. A writer the group kill cannot reach (a descendant
+that also called `setsid`) is not waited for: the capture is abandoned after
+the kill grace period, so `execute()` returns within the timeout plus a
+bounded grace whatever the child left behind.
 
 Capture is bounded and lossless in encoding terms: each stream is read as
 bytes and decoded as UTF-8 with replacement (a stray byte in agent output is
@@ -84,7 +87,13 @@ data, never an exception), and each stream keeps at most
 above any legitimate transcript): the first half, an omission marker and the
 last half. The bound is on what the reader retains, trimmed to the byte, so
 it holds for any positive value, a bound smaller than one pipe read
-included. `ExecutionResult` reports `stdout_truncated` / `stderr_truncated`
+included, and it is a bound on memory, not only on payload length: the tail
+is a ring buffer, so a stream delivered one byte per read costs the bound
+plus a constant, never a per-chunk object. Within the bound the head/tail
+split is invisible (the stream is decoded whole, so a multi-byte character
+that straddles it is intact); past the bound a character cut by the bound
+decodes to replacement characters beside the marker, which is what was
+captured. `ExecutionResult` reports `stdout_truncated` / `stderr_truncated`
 and exposes `stdout_tail`, the part of stdout captured contiguously up to
 EOF, which is the only part a CONTROL_RESULT parser may search. A caller that
 parses a command's output as a whole (`gh --json`, `git` plumbing) treats a
