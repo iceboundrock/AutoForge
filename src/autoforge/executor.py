@@ -105,7 +105,12 @@ def execute(req: ExecutionRequest) -> ExecutionResult:
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            # Agent output is untrusted bytes (a dumped binary, a mis-encoded
+            # file the agent cats). A decode error is not an AutoForgeError
+            # and would leave the invocation unlogged, so it is replaced.
             text=True,
+            encoding="utf-8",
+            errors="replace",
             start_new_session=True,
         )
     except FileNotFoundError as exc:

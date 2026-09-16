@@ -78,3 +78,22 @@ def test_missing_binary_raises_execution_error():
         execute(
             ExecutionRequest(command=["autoforge-definitely-missing-binary-xyz"], timeout_seconds=5)
         )
+
+
+def test_non_utf8_output_is_replaced_not_raised():
+    """A stray byte in agent output (#17) must not escape ``execute`` as a
+    UnicodeDecodeError: the invocation completes and the byte is replaced."""
+    res = execute(
+        ExecutionRequest(
+            command=[
+                PY,
+                "-c",
+                "import sys; sys.stdout.buffer.write(b'ok \\xff\\xfe end\\n'); "
+                "sys.stderr.buffer.write(b'err \\xc3\\x28\\n')",
+            ],
+            timeout_seconds=30,
+        )
+    )
+    assert res.ok and res.exit_code == 0
+    assert res.stdout == "ok �� end\n"
+    assert res.stderr == "err �(\n"
