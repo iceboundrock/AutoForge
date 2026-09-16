@@ -1486,10 +1486,15 @@ class ControllerEngine:
             state.workspace_fingerprint = before.fingerprint
 
         # Durable invocation checkpoint for the write-capable phases. It is
-        # persisted *before* the agent starts, so a crash mid-invocation, a
+        # written by :meth:`_charge_local_launch` immediately before the agent
+        # starts (inside ``_invoke_phase``), so a crash mid-invocation, a
         # malformed CONTROL_RESULT or a failing validation command all leave
         # the same recoverable record: "this phase was launched once and its
-        # work may already be in the tree".
+        # work may already be in the tree" -- and a refusal *before* the
+        # launch (a corrupt event journal, an unusable profile, a missing
+        # template) leaves no record, because nothing was launched (#57).
+        # Here the entry only decides whether it is a fresh one or a retry
+        # of a launched one, and whether the retry is still within bound.
         baseline = before.fingerprint
         if state.local_pending_phase and state.local_pending_phase != previous.value:
             # `load_state` refuses this shape; the check is repeated here so
@@ -1519,11 +1524,6 @@ class ControllerEngine:
                         ),
                     )
                 self._local_resumed_invocation = True
-            else:
-                state.local_pending_phase = previous.value
-                state.local_pending_fingerprint = before.fingerprint
-                state.local_pending_attempts = 0
-            state.local_pending_attempts += 1
         self._local_bound_snapshot = before
         self._save()
         try:
@@ -1578,23 +1578,40 @@ class ControllerEngine:
         return self._outcome(previous, plan=plan, result=payload, message=message)
 
     def _charge_local_launch(self, phase: Phase) -> str:
-        """Charge one more write-capable launch of ``phase`` to the LOCAL checkpoint.
+        """Charge one write-capable launch of ``phase`` to the LOCAL checkpoint.
+
+        Called immediately before *every* launch of a write-capable agent --
+        the phase entry's first, a correction retry, a resumed attempt -- and
+        nowhere else, so that what is charged is exactly what was launched.
+        A refusal that lands earlier in ``_invoke_phase`` (the event journal,
+        the profile, the prompt template) therefore charges nothing (#57).
 
         Returns ``""`` after persisting the charge, so the launch may proceed,
         or the reason it may not: the checkpoint has already spent
         :data:`MAX_LOCAL_PHASE_ATTEMPTS`. The persisted count is what bounds
         the phase entry, so it must be written *before* the agent starts --
         a launch that was never charged is a launch a crash would let
-        ``resume`` repeat. A REMOTE run, or a read-only LOCAL phase, has no
-        checkpoint to charge and is never refused here.
+        ``resume`` repeat. The first launch of an entry opens the checkpoint
+        (phase, the fingerprint the entry was bound to, one attempt) in the
+        same write; a checkpoint is never persisted with zero launches. A
+        REMOTE run, or a read-only LOCAL phase, has no checkpoint to charge
+        and is never refused here.
         """
         state = self._require_state()
         if state.mode != WorkflowMode.LOCAL or phase not in LOCAL_WRITE_PHASES:
             return ""
-        if state.local_pending_phase != phase.value:
+        if not state.local_pending_phase:
+            if self._local_bound_snapshot is None:
+                raise StateError(
+                    f"cannot charge a {phase.value} launch: no workspace snapshot is bound"
+                )
+            state.local_pending_phase = phase.value
+            state.local_pending_fingerprint = self._local_bound_snapshot.fingerprint
+            state.local_pending_attempts = 0
+        elif state.local_pending_phase != phase.value:
             raise StateError(
                 f"cannot charge a {phase.value} launch: the LOCAL checkpoint records "
-                f"{state.local_pending_phase or 'no pending phase'}"
+                f"{state.local_pending_phase}"
             )
         if state.local_pending_attempts >= MAX_LOCAL_PHASE_ATTEMPTS:
             return (
@@ -3888,9 +3905,20 @@ class ControllerEngine:
         correction_error: str | None = None
         attempt = 0
         while True:
+            prompt = self.render_prompt_for(phase, correction_error)
+            # The launch is charged to the durable LOCAL bound here, after
+            # every step that can refuse without launching and immediately
+            # before the one that launches. The first launch of an entry is
+            # never refused (``_local_step_once`` already blocked a spent
+            # entry); a correction can be, and is then not re-invoked.
+            refusal = self._charge_local_launch(phase)
+            if refusal:
+                raise ControlResultValidationError(
+                    f"agent '{profile.name}' did not return a valid CONTROL_RESULT after "
+                    f"{attempt} attempt(s): {correction_error}. Not re-invoked: {refusal}"
+                )
             attempt += 1
             state.attempt += 1
-            prompt = self.render_prompt_for(phase, correction_error)
             req = AgentRequest(
                 phase=phase.value,
                 prompt=prompt,
@@ -3956,17 +3984,11 @@ class ControllerEngine:
                 logger.log_execution(record, prompt, stdout, stderr)
                 self._save()
                 if attempt <= max_corrections:
-                    # A correction re-launches the same write-capable agent,
-                    # so in LOCAL mode it is charged against the same durable
-                    # bound as the launch that preceded it.
-                    refusal = self._charge_local_launch(phase)
-                    if not refusal:
-                        correction_error = f"{type(exc).__name__}: {exc}"
-                        continue
-                    raise ControlResultValidationError(
-                        f"agent '{profile.name}' did not return a valid CONTROL_RESULT after "
-                        f"{attempt} attempt(s): {exc}. Not re-invoked: {refusal}"
-                    ) from exc
+                    # A correction re-launches the same write-capable agent;
+                    # the top of the loop charges it against the same durable
+                    # bound as the launch that preceded it, or refuses.
+                    correction_error = f"{type(exc).__name__}: {exc}"
+                    continue
                 raise ControlResultValidationError(
                     f"agent '{profile.name}' did not return a valid CONTROL_RESULT after "
                     f"{attempt} attempt(s): {exc}"

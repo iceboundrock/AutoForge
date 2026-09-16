@@ -577,8 +577,12 @@ attempt is judged against the tree from before the *first* attempt, so work
 already in the tree counts, and re-entry is bounded rather than endless:
 three launches per phase entry, counting every launch (the entry's own, a
 correction retry after a malformed `CONTROL_RESULT`, a resumed attempt),
-each written to the state file before the agent starts, then `BLOCKED`. The
-checkpoint belongs to the phase that wrote it: a state file holding one
+each written to the state file immediately before the agent starts, then
+`BLOCKED`. Only a launch is counted: a step that is refused before the agent
+starts (a corrupted event journal, an unusable execution profile, a prompt
+template that cannot be rendered) charges nothing, so repairing the cause and
+resuming does not spend the bound. The checkpoint belongs to the phase that
+wrote it: a state file holding one
 under a different live phase is refused at load rather than closed by that
 phase without the recorded work ever being examined; only a run that ended
 in `BLOCKED` or `FAILED` keeps it, as evidence.
