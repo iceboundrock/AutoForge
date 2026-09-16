@@ -66,12 +66,25 @@ The process executor owns:
 
 It should remain independent of workflow semantics.
 
+The timeout bounds the whole invocation, not only the child's exit: an
+invocation is complete when the child has exited *and* both pipes reached
+EOF. A descendant that inherited the pipes (a server the agent left running)
+keeps them open past the child's exit, so the wait for EOF runs under the
+same deadline, and at the deadline the child's whole process group is
+killed and the result is a timeout, exactly as when the child itself
+overruns. A writer the group kill cannot reach (a descendant that also
+called `setsid`) is not waited for: the capture is abandoned after the kill
+grace period, so `execute()` returns within the timeout plus a bounded grace
+whatever the child left behind.
+
 Capture is bounded and lossless in encoding terms: each stream is read as
 bytes and decoded as UTF-8 with replacement (a stray byte in agent output is
 data, never an exception), and each stream keeps at most
 `ExecutionRequest.max_output_bytes` (default `DEFAULT_MAX_OUTPUT_BYTES`, well
 above any legitimate transcript): the first half, an omission marker and the
-last half. `ExecutionResult` reports `stdout_truncated` / `stderr_truncated`
+last half. The bound is on what the reader retains, trimmed to the byte, so
+it holds for any positive value, a bound smaller than one pipe read
+included. `ExecutionResult` reports `stdout_truncated` / `stderr_truncated`
 and exposes `stdout_tail`, the part of stdout captured contiguously up to
 EOF, which is the only part a CONTROL_RESULT parser may search. A caller that
 parses a command's output as a whole (`gh --json`, `git` plumbing) treats a

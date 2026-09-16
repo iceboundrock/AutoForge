@@ -84,6 +84,17 @@ class AgentExecutionResult:
 
     @property
     def ok(self) -> bool:
+        """Whether the invocation ran to a usable end.
+
+        Narrower than :attr:`ExecutionResult.ok` on purpose: for plumbing
+        (``gh --json``, ``git``) the whole output is the reply, so either
+        stream past the bound spoils it, whereas an agent's reply is the
+        CONTROL_RESULT on stdout and its stderr is diagnostics (an OpenCode
+        tool trace), which the engine logs but never parses; a stderr past
+        the bound is recorded, not a failure. The engine reads the underlying
+        facts (``timed_out``, ``exit_code``, ``stdout_tail``) rather than
+        this property.
+        """
         return not self.timed_out and self.exit_code == 0 and not self.stdout_truncated
 
     @classmethod

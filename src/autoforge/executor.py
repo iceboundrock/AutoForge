@@ -10,7 +10,11 @@ Safety properties:
   hang waiting for input;
 - the child runs in its own session/process group; on timeout the whole
   group is terminated (SIGTERM, then SIGKILL) so grandchildren spawned by an
-  agent (test runners, editors, servers) do not linger;
+  agent (test runners, editors, servers) do not linger. The timeout bounds
+  the whole invocation: the child's exit *and* EOF on its pipes. A descendant
+  that inherited them (a server the agent left running) keeps them open past
+  the child's exit, and one that also left the process group cannot be
+  killed from here, so the capture is abandoned rather than waited for;
 - capture is bounded: each stream keeps at most ``max_output_bytes`` (the
   first half and the last half of what the child wrote), so a runaway or
   adversarial child costs the controller a bounded amount of memory, not the
@@ -23,6 +27,7 @@ Safety properties:
 from __future__ import annotations
 
 import os
+import selectors
 import signal
 import subprocess
 import threading
@@ -112,19 +117,17 @@ class _Captured:
     tail_offset: int
 
 
-class _BoundedReader(threading.Thread):
-    """Drain one pipe, keeping at most ``limit`` bytes of it.
+class _BoundedBuffer:
+    """Keep at most ``limit`` bytes of a stream: its head and its tail.
 
-    The first ``limit - limit // 2`` bytes are kept as the head and the last
-    ``limit // 2`` as a rolling tail (a deque of chunks, so trimming is
-    O(chunk), not O(tail)); everything between is counted and dropped. The
-    pipe is drained to EOF whatever the child writes, so the child never
-    blocks on a full pipe the way it would if the controller stopped reading.
+    The first ``limit - limit // 2`` bytes are the head and the last
+    ``limit // 2`` the tail (a deque of chunks, so trimming is O(chunk), not
+    O(tail)); everything between is counted and dropped. The tail is trimmed
+    to the byte, so what is retained never exceeds ``limit`` however the
+    stream is chunked -- a bound smaller than one read is honoured too.
     """
 
-    def __init__(self, stream: IO[bytes], limit: int, name: str) -> None:
-        super().__init__(name=f"autoforge-capture-{name}", daemon=True)
-        self._fd = stream.fileno()
+    def __init__(self, limit: int, name: str) -> None:
         self._name = name
         self._limit = limit
         self._head_limit = limit - limit // 2
@@ -133,19 +136,13 @@ class _BoundedReader(threading.Thread):
         self._tail: deque[bytes] = deque()
         self._tail_len = 0
         self._total = 0
-        self.error: OSError | None = None
 
-    def run(self) -> None:
-        try:
-            while True:
-                chunk = os.read(self._fd, _READ_CHUNK_BYTES)
-                if not chunk:
-                    return
-                self._feed(chunk)
-        except OSError as exc:
-            self.error = exc
+    @property
+    def retained(self) -> int:
+        """Bytes currently held; never more than the limit."""
+        return len(self._head) + self._tail_len
 
-    def _feed(self, chunk: bytes) -> None:
+    def feed(self, chunk: bytes) -> None:
         self._total += len(chunk)
         room = self._head_limit - len(self._head)
         if room > 0:
@@ -155,12 +152,20 @@ class _BoundedReader(threading.Thread):
             return
         self._tail.append(chunk)
         self._tail_len += len(chunk)
-        while self._tail and self._tail_len - len(self._tail[0]) >= self._tail_limit:
-            self._tail_len -= len(self._tail.popleft())
+        excess = self._tail_len - self._tail_limit
+        while excess > 0:
+            oldest = self._tail[0]
+            if len(oldest) <= excess:
+                self._tail.popleft()
+                self._tail_len -= len(oldest)
+                excess -= len(oldest)
+            else:
+                self._tail[0] = oldest[excess:]
+                self._tail_len -= excess
+                excess = 0
 
     def captured(self) -> _Captured:
-        """Decode what was kept; call only after :meth:`join`."""
-        tail = b"".join(self._tail)[-self._tail_limit :] if self._tail_limit else b""
+        tail = b"".join(self._tail)
         omitted = self._total - len(self._head) - len(tail)
         head_text = self._head.decode("utf-8", errors="replace")
         tail_text = tail.decode("utf-8", errors="replace")
@@ -174,30 +179,119 @@ class _BoundedReader(threading.Thread):
         return _Captured(head_text + marker + tail_text, True, len(head_text) + len(marker))
 
 
+class _BoundedReader(threading.Thread):
+    """Drain one pipe into a :class:`_BoundedBuffer` until EOF or abandoned.
+
+    The pipe is drained whatever the child writes, so the child never blocks
+    on a full pipe the way it would if the controller stopped reading. EOF
+    arrives only once every writer is gone; :meth:`abandon` ends the read
+    without it, for a writer nothing here can kill.
+    """
+
+    def __init__(self, stream: IO[bytes], limit: int, name: str) -> None:
+        super().__init__(name=f"autoforge-capture-{name}", daemon=True)
+        self._fd = stream.fileno()
+        self.buffer = _BoundedBuffer(limit, name)
+        self._wake_r, self._wake_w = os.pipe()
+        self.error: OSError | None = None
+
+    def run(self) -> None:
+        try:
+            with selectors.DefaultSelector() as sel:
+                sel.register(self._fd, selectors.EVENT_READ)
+                sel.register(self._wake_r, selectors.EVENT_READ)
+                while True:
+                    ready = {key.fd for key, _ in sel.select()}
+                    if self._wake_r in ready:
+                        return
+                    chunk = os.read(self._fd, _READ_CHUNK_BYTES)
+                    if not chunk:
+                        return
+                    self.buffer.feed(chunk)
+        except OSError as exc:
+            self.error = exc
+
+    def wait(self, deadline: float | None) -> bool:
+        """Join until EOF or ``deadline`` (``time.monotonic()``); True on EOF."""
+        self.join(None if deadline is None else max(0.0, deadline - time.monotonic()))
+        return not self.is_alive()
+
+    def abandon(self) -> None:
+        """Stop reading without EOF; what was read so far is what is captured."""
+        os.write(self._wake_w, b"\0")
+        self.join()
+
+    def close(self) -> None:
+        for fd in (self._wake_r, self._wake_w):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def captured(self) -> _Captured:
+        """Decode what was kept; call only once the thread has ended."""
+        return self.buffer.captured()
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _terminate_group(proc: subprocess.Popen) -> None:
-    """SIGTERM the child's process group, escalate to SIGKILL after a grace period."""
+def _signal_group(pgid: int, sig: signal.Signals) -> bool:
+    """Signal a process group; False when no process is left in it."""
     try:
-        pgid = os.getpgid(proc.pid)
+        os.killpg(pgid, sig)
     except ProcessLookupError:
-        return
+        return False
+    return True
+
+
+def _reaped(proc: subprocess.Popen, deadline: float) -> bool:
+    try:
+        proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        return False
+    return True
+
+
+def _eof(readers: tuple[_BoundedReader, ...], deadline: float | None) -> bool:
+    return all(reader.wait(deadline) for reader in readers)
+
+
+def _terminate_group(
+    pgid: int, proc: subprocess.Popen, readers: tuple[_BoundedReader, ...]
+) -> None:
+    """SIGTERM the child's process group, escalate to SIGKILL, and stop reading.
+
+    ``pgid`` is signalled rather than ``proc``: the child leads its own group
+    (``start_new_session``), so its descendants can be reached after the
+    child itself has exited and been reaped, and the group id stays reserved
+    while any of them lives. The group is dead when the child is reaped *and*
+    its pipes reached EOF. A writer that survives SIGKILL left the group
+    (``setsid``) and cannot be reached from here, so the capture is abandoned
+    rather than waited for.
+    """
     for sig in (signal.SIGTERM, signal.SIGKILL):
-        try:
-            os.killpg(pgid, sig)
-        except ProcessLookupError:
-            return
+        if not _signal_group(pgid, sig):
+            break
         deadline = time.monotonic() + _KILL_GRACE_SECONDS
-        while time.monotonic() < deadline:
-            if proc.poll() is not None:
-                return
-            time.sleep(0.05)
+        if _reaped(proc, deadline) and _eof(readers, deadline):
+            return
+    if proc.poll() is None:
+        proc.wait()
+    if not _eof(readers, time.monotonic() + _KILL_GRACE_SECONDS):
+        for reader in readers:
+            reader.abandon()
 
 
 def execute(req: ExecutionRequest) -> ExecutionResult:
     """Run one subprocess to completion, capturing output.
+
+    Completion is the child's exit *and* EOF on both pipes, bounded together
+    by ``timeout_seconds``: a descendant that inherited the pipes and outlives
+    the child keeps the invocation open, and past the timeout the whole group
+    is killed and the result is a timeout, as it is when the child itself
+    overruns.
 
     Timeouts, non-zero exits and truncated output are *returned* (not
     raised) so callers can log stdout/stderr first; use ``raise_if_failed()``
@@ -228,6 +322,8 @@ def execute(req: ExecutionRequest) -> ExecutionResult:
     except OSError as exc:
         raise ExecutionError(f"failed to spawn {' '.join(req.command)}: {exc}") from exc
     assert proc.stdout is not None and proc.stderr is not None
+    pgid = proc.pid  # start_new_session: the child leads a group of its own
+    deadline = None if timeout is None else time.monotonic() + timeout
     # Output is read as bytes and decoded with replacement: agent output is
     # untrusted (a dumped binary, a mis-encoded file the agent cats), and a
     # decode error is not an AutoForgeError, so it would leave the
@@ -244,17 +340,19 @@ def execute(req: ExecutionRequest) -> ExecutionResult:
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             timed_out = True
-            _terminate_group(proc)
-            if proc.poll() is None:
-                proc.kill()
-                proc.wait()
+        # The child has exited, but the invocation is over only at EOF, which
+        # a descendant holding the inherited pipes can delay indefinitely;
+        # the wait for it runs under the same deadline.
+        if not timed_out and not _eof(readers, deadline):
+            timed_out = True
+        if timed_out:
+            _terminate_group(pgid, proc, readers)
     except BaseException:
-        _terminate_group(proc)
+        _terminate_group(pgid, proc, readers)
         raise
-    # EOF arrives once every writer of the pipe is gone, which the group
-    # kill guarantees for the timeout path.
-    for reader in readers:
-        reader.join()
+    finally:
+        for reader in readers:
+            reader.close()
     proc.stdout.close()
     proc.stderr.close()
     for reader in readers:
