@@ -2942,3 +2942,75 @@ def test_fix_prompt_size_is_bounded_by_the_review_bounds(tmp_state_dir, fake_git
         heads = [line for line in full.split("\n") if line.startswith("- R1-F")]
         assert len(heads) == MAX_FINDINGS_PER_REVIEW
         assert not any(ch in line for line in heads)
+
+
+# -- bounded stdout capture (#53) ---------------------------------------------------------
+class _TruncatedOutputProvider(ScriptedProvider):
+    """Returns what the executor returns for an agent whose stdout passed the
+    capture bound: ``head + marker + tail`` with the tail offset recorded."""
+
+    def __init__(self, head: str, tail: str, on_call=None) -> None:
+        super().__init__()
+        self.marker = "\n[autoforge: 999 bytes of stdout omitted; ...]\n"
+        self.head, self.tail = head, tail
+        self.on_call = on_call
+
+    def execute(self, req):
+        self.calls.append(req)
+        if self.on_call is not None:
+            self.on_call()
+        return AgentExecutionResult(
+            command=["x"],
+            exit_code=0,
+            stdout=self.head + self.marker + self.tail,
+            stderr="",
+            started_at="t",
+            finished_at="t",
+            stdout_truncated=True,
+            stdout_tail_offset=len(self.head) + len(self.marker),
+        )
+
+
+def _install(eng, provider):
+    eng.providers._overrides = {"claude": provider, "opencode": provider}
+    eng.provider = provider
+
+
+def test_truncated_stdout_accepts_a_block_that_lies_in_the_tail(tmp_state_dir, fake_github):
+    """The block is the last thing on stdout, so the kept tail preserves it;
+    the whole (marked) capture is what reaches stdout.log."""
+    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    provider = _TruncatedOutputProvider(
+        "runaway logs " * 100,
+        "last logs\n" + block(ANALYZE_OK),
+        on_call=lambda: fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2]),
+    )
+    _install(eng, provider)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    out = eng.step()
+    assert out.next_phase == "REVIEW" and len(provider.calls) == 1
+    run_dir = eng.paths.logs_dir / eng.state.run_id
+    step = next(p for p in run_dir.iterdir() if p.is_dir())
+    assert "bytes of stdout omitted" in (step / "stdout.log").read_text(encoding="utf-8")
+    execution = json.loads((step / "execution.json").read_text(encoding="utf-8"))
+    assert execution["stdout_truncated"] is True and execution["stderr_truncated"] is False
+    event = json.loads((run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+    assert event["stdout_truncated"] is True
+
+
+def test_truncated_stdout_never_accepts_a_block_from_the_head(tmp_state_dir, fake_github):
+    """A block before the cut is stale (the agent wrote more after it) or
+    spans the cut; either way it is not the agent's final result. The
+    rejection names the truncation so the correction prompt carries it."""
+    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    eng.config.execution.max_correction_attempts = 0
+    provider = _TruncatedOutputProvider(block(ANALYZE_OK), "trailing logs only\n")
+    _install(eng, provider)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    with pytest.raises(ControlResultValidationError, match="capture bound") as exc:
+        eng.step()
+    assert "no CONTROL_RESULT block found" in str(exc.value)
+    assert eng.state.phase == Phase.ANALYZE_EXECUTE and len(provider.calls) == 1
+    run_dir = eng.paths.logs_dir / eng.state.run_id
+    step = next(p for p in run_dir.iterdir() if p.is_dir())
+    assert "capture bound" in (step / "error.txt").read_text(encoding="utf-8")

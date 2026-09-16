@@ -90,7 +90,7 @@ src/autoforge/
     profiles.py       review-round routing plus replan_reexecute profile (pure function)
     providers.py      AgentProvider adapters: ClaudeCodeProvider, OpenCodeProvider,
                       ScriptedProvider (tests); CLI flags live only here
-    executor.py       subprocess abstraction: argv, timeout, process-tree kill
+    executor.py       subprocess abstraction: argv, timeout, process-tree kill, bounded capture
     result_parser.py  <<<CONTROL_RESULT>>> extraction + typed per-phase results
     validation.py     typed GitHub URL refs (issue / PR / comment), remote parsing
     github.py         typed GitHubClient over `gh`: reads (PRs, issues, comments,
@@ -604,8 +604,8 @@ either way:
         <seq>-<phase>-<attempt>/
             request.json                   # profile, model, effort, command, timeout
             prompt.md                      # rendered prompt (redacted)
-            execution.json                 # exit code, timing, timed_out, error
-            stdout.log / stderr.log        # redacted
+            execution.json                 # exit code, timing, timed_out, truncation, error
+            stdout.log / stderr.log        # redacted; head + marker + tail past the capture bound
             control-result.json            # parsed CONTROL_RESULT (when valid)
 ```
 

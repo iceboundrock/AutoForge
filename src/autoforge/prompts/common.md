@@ -64,6 +64,10 @@ with exactly one machine-readable block:
   `git rev-parse HEAD` / `gh pr view --json headRefOid` returned verbatim).
 - Emit the block only once, as the very last thing on stdout, and never
   inside a Markdown code fence.
+- Keep the block small: the controller accepts a block of at most
+  {{MAX_CONTROL_RESULT_CHARS}} characters and rejects a larger one whole
+  (it never clips it). Put logs, diffs and explanations before the block,
+  not inside it.
 - If the phase could not be completed, still emit the block with
   `"status": "failure"` (or `"status": "blocked"` when a human decision is
   required) and a human-readable `"message"`; never omit it.

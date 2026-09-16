@@ -118,6 +118,8 @@ def _git(runner: Runner, repo: str, args: list[str], env: dict[str, str] | None 
     if res.exit_code != 0:
         tail = (res.stderr or res.stdout or "").strip()[-500:]
         raise VerificationError(f"`{shown}` failed (exit {res.exit_code}): {tail}")
+    if res.truncated:
+        raise VerificationError(f"`{shown}` output was truncated at the executor's capture bound")
     return res.stdout or ""
 
 

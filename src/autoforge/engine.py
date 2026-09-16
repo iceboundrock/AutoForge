@@ -96,7 +96,7 @@ from .errors import (
     StateTransitionError,
     VerificationError,
 )
-from .executor import ExecutionRequest, execute
+from .executor import DEFAULT_MAX_OUTPUT_BYTES, ExecutionRequest, execute
 from .github import GitHubClient, IssueInfo, PRInfo, WorkflowRunJobs, build_merge_argv
 from .local_workspace import (
     FeatureSpec,
@@ -155,6 +155,7 @@ from .replan_txn import (
     verify_target_pr,
 )
 from .result_parser import (
+    MAX_CONTROL_RESULT_CHARS,
     MAX_FINDING_ID_CHARS,
     MAX_FINDING_LOCATION_CHARS,
     MAX_FINDING_RESOLUTION_CHARS,
@@ -202,11 +203,13 @@ from .validation import (
     validate_epic_and_issue,
 )
 
-# The REVIEW payload bounds the parser enforces, rendered into the review
-# prompts so the reviewer is told the contract it will be held to. The
+# The payload bounds the parser enforces, rendered into the prompts so the
+# agent is told the contract it will be held to: the REVIEW field bounds in
+# the review prompts, the whole-block bound in the common instructions. The
 # templates carry no literal numbers: the value the prompt states is the
 # value ``result_parser`` rejects against.
 REVIEW_BOUND_VARIABLES: dict[str, str | int | None] = {
+    "MAX_CONTROL_RESULT_CHARS": MAX_CONTROL_RESULT_CHARS,
     "MAX_FINDINGS_PER_REVIEW": MAX_FINDINGS_PER_REVIEW,
     "MAX_FINDING_RESOLUTION_CHARS": MAX_FINDING_RESOLUTION_CHARS,
     "MAX_FINDING_TITLE_CHARS": MAX_FINDING_TITLE_CHARS,
@@ -1985,6 +1988,8 @@ class ControllerEngine:
                 finished_at=result.finished_at,
                 exit_code=result.exit_code,
                 timed_out=result.timed_out,
+                stdout_truncated=result.stdout_truncated,
+                stderr_truncated=result.stderr_truncated,
                 metadata={"validation_command": list(argv), "feature": state.feature_spec_path},
             )
             if result.timed_out or result.exit_code != 0:
@@ -2497,6 +2502,8 @@ class ControllerEngine:
             finished_at=result.finished_at,
             exit_code=result.exit_code,
             timed_out=result.timed_out,
+            stdout_truncated=result.stdout_truncated,
+            stderr_truncated=result.stderr_truncated,
             metadata={
                 "verification_command": list(argv),
                 "pr_url": pr.url,
@@ -3959,6 +3966,8 @@ class ControllerEngine:
             record.finished_at = result.finished_at
             record.exit_code = result.exit_code
             record.timed_out = result.timed_out
+            record.stdout_truncated = result.stdout_truncated
+            record.stderr_truncated = result.stderr_truncated
             stdout, stderr = result.stdout or "", result.stderr or ""
             if result.timed_out:
                 record.error = f"timed out after {timeout}s"
@@ -3978,20 +3987,30 @@ class ControllerEngine:
                     "State unchanged — inspect logs, then 'resume'."
                 )
             try:
-                payload = parse_control_result(stdout, phase, state.mode)
+                # Only the tail of a truncated stdout is searched: the block
+                # is the last thing the agent writes, so the kept tail holds
+                # a whole one; a block before the cut is stale or spans it.
+                payload = parse_control_result(result.stdout_tail, phase, state.mode)
             except (ControlResultError, ControlResultValidationError) as exc:
-                record.error = f"{type(exc).__name__}: {exc}"
+                detail = str(exc)
+                if result.stdout_truncated:
+                    detail += (
+                        f" (stdout exceeded the {DEFAULT_MAX_OUTPUT_BYTES}-byte capture bound; "
+                        "only the last part of it was searched -- keep the transcript short "
+                        "and end it with the CONTROL_RESULT block)"
+                    )
+                record.error = f"{type(exc).__name__}: {detail}"
                 logger.log_execution(record, prompt, stdout, stderr)
                 self._save()
                 if attempt <= max_corrections:
                     # A correction re-launches the same write-capable agent;
                     # the top of the loop charges it against the same durable
                     # bound as the launch that preceded it, or refuses.
-                    correction_error = f"{type(exc).__name__}: {exc}"
+                    correction_error = f"{type(exc).__name__}: {detail}"
                     continue
                 raise ControlResultValidationError(
                     f"agent '{profile.name}' did not return a valid CONTROL_RESULT after "
-                    f"{attempt} attempt(s): {exc}"
+                    f"{attempt} attempt(s): {detail}"
                 ) from exc
             record.parsed_result = payload
             logger.log_execution(record, prompt, stdout, stderr)

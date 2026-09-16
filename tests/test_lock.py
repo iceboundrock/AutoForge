@@ -375,3 +375,24 @@ def test_repository_lock_path_runs_git_in_the_workdir_and_joins_relative_output(
     assert path == (tmp_path / ".git" / "autoforge" / "controller.lock").resolve()
     assert seen[0].command == ["git", "rev-parse", "--git-common-dir"]
     assert seen[0].cwd == str(sub)
+
+
+def test_repository_lock_path_refuses_truncated_git_output(tmp_path):
+    """`git rev-parse` output past the capture bound cannot name the git dir (#53)."""
+    from autoforge.executor import ExecutionResult
+    from autoforge.locking import repository_lock_path
+
+    def truncated(req):
+        return ExecutionResult(
+            command=req.command,
+            cwd=req.cwd,
+            exit_code=0,
+            stdout=".git\n[autoforge: ... omitted]\n.git",
+            stderr="",
+            started_at="",
+            finished_at="",
+            stdout_truncated=True,
+        )
+
+    with pytest.raises(LockError, match="truncated"):
+        repository_lock_path(tmp_path, runner=truncated)

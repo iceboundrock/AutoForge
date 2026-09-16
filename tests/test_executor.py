@@ -97,3 +97,85 @@ def test_non_utf8_output_is_replaced_not_raised():
     assert res.ok and res.exit_code == 0
     assert res.stdout == "ok �� end\n"
     assert res.stderr == "err �(\n"
+
+
+# -- bounded capture (#53) ---------------------------------------------------
+# A child that writes ``total`` bytes to ``stream``; the last line is the one
+# a CONTROL_RESULT would occupy, so a kept tail must still end with it.
+_FLOOD = (
+    "import sys\n"
+    "out = getattr(sys, sys.argv[1]).buffer\n"
+    "total = int(sys.argv[2])\n"
+    "line = b'x' * 1023 + b'\\n'\n"
+    "written = 0\n"
+    "while written + len(line) < total:\n"
+    "    out.write(line); written += len(line)\n"
+    "out.write(b'TAIL-MARKER\\n')\n"
+)
+
+
+def _flood(stream: str, total: int, bound: int):
+    return execute(
+        ExecutionRequest(
+            command=[PY, "-c", _FLOOD, stream, str(total)],
+            timeout_seconds=60,
+            max_output_bytes=bound,
+        )
+    )
+
+
+def test_output_within_bound_is_kept_whole():
+    res = _flood("stdout", 100_000, 1_000_000)
+    assert res.ok and not res.stdout_truncated and not res.stderr_truncated
+    assert res.stdout.count("\n") == 100_000 // 1024 + 1
+    assert res.stdout.endswith("TAIL-MARKER\n")
+    assert res.stdout_tail == res.stdout
+
+
+def test_stdout_past_bound_keeps_head_and_tail():
+    bound = 64 * 1024
+    res = _flood("stdout", 20 * 1024 * 1024, bound)
+    assert res.exit_code == 0 and res.stdout_truncated and not res.stderr_truncated
+    assert not res.ok
+    with pytest.raises(ExecutionError, match="truncated"):
+        res.raise_if_failed()
+    # The kept text is head + marker + tail: about the bound, never the 20 MiB.
+    assert len(res.stdout) < bound + 500
+    assert res.stdout.startswith("x" * 1023 + "\n")
+    assert res.stdout.endswith("TAIL-MARKER\n")
+    assert "bytes of stdout omitted" in res.stdout
+    # The tail is the part captured contiguously up to EOF: it is where a
+    # CONTROL_RESULT lives, it starts after the marker and it is intact.
+    tail = res.stdout_tail
+    assert tail.endswith("TAIL-MARKER\n") and "omitted" not in tail
+    assert bound // 2 - 1024 <= len(tail) <= bound // 2
+
+
+def test_stderr_past_bound_is_truncated_independently():
+    res = _flood("stderr", 2 * 1024 * 1024, 32 * 1024)
+    assert res.stderr_truncated and not res.stdout_truncated
+    assert res.stderr.endswith("TAIL-MARKER\n") and "bytes of stderr omitted" in res.stderr
+    assert res.stdout == "" and res.stdout_tail == ""
+
+
+def test_timeout_with_flooded_output_still_returns():
+    res = execute(
+        ExecutionRequest(
+            command=[
+                PY,
+                "-c",
+                "import sys, time\n"
+                "sys.stdout.buffer.write(b'y' * 300_000); sys.stdout.flush()\n"
+                "time.sleep(30)",
+            ],
+            timeout_seconds=1,
+            max_output_bytes=16 * 1024,
+        )
+    )
+    assert res.timed_out and res.stdout_truncated
+    assert len(res.stdout) < 20 * 1024
+
+
+def test_non_positive_bound_is_refused():
+    with pytest.raises(ExecutionError, match="max_output_bytes"):
+        execute(ExecutionRequest(command=[PY, "-c", "pass"], max_output_bytes=0))

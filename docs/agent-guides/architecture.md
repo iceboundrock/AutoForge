@@ -66,6 +66,20 @@ The process executor owns:
 
 It should remain independent of workflow semantics.
 
+Capture is bounded and lossless in encoding terms: each stream is read as
+bytes and decoded as UTF-8 with replacement (a stray byte in agent output is
+data, never an exception), and each stream keeps at most
+`ExecutionRequest.max_output_bytes` (default `DEFAULT_MAX_OUTPUT_BYTES`, well
+above any legitimate transcript): the first half, an omission marker and the
+last half. `ExecutionResult` reports `stdout_truncated` / `stderr_truncated`
+and exposes `stdout_tail`, the part of stdout captured contiguously up to
+EOF, which is the only part a CONTROL_RESULT parser may search. A caller that
+parses a command's output as a whole (`gh --json`, `git` plumbing) treats a
+truncated result as a failure, the way it treats a timeout; the executor's
+`raise_if_failed()` and `ok` do the same. How the engine handles a truncated
+agent stdout is in
+[control-result-protocol.md](control-result-protocol.md).
+
 ### GitHub client
 
 Centralize GitHub integration behind a `GitHubClient` or equivalent abstraction.

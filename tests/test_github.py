@@ -1237,3 +1237,15 @@ def test_find_workflow_runs_rejects_unusable_data(pages):
         _client(lambda req: _res(pages)).find_workflow_runs(
             "o/r", 77, branch="main", event="push", head_sha="abc"
         )
+
+
+def test_truncated_gh_output_is_an_error_never_parsed():
+    """A `gh` reply past the executor's capture bound is head + marker + tail:
+    parsing it would read a JSON document that was never returned (#53)."""
+
+    def handler(req):
+        return replace(_res({}), stdout_truncated=True)
+
+    gh = GitHubClient(runner=handler, retry_delay_seconds=0)
+    with pytest.raises(GitHubError, match="truncated"):
+        gh.get_pr("https://github.com/o/r/pull/42")

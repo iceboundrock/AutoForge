@@ -2648,3 +2648,20 @@ def test_a_local_fix_that_reports_a_blocker_ends_the_run_in_blocked(tmp_path):
     eng.run(max_steps=8)
     assert eng.state.phase == Phase.BLOCKED
     assert "toolchain is unavailable" in (eng.state.block_reason or "")
+
+
+def test_local_workspace_refuses_truncated_git_output(tmp_path):
+    """A `git` listing past the capture bound is head + marker + tail, not the
+    working tree; the workspace must fail loudly rather than fingerprint it (#53)."""
+    from dataclasses import replace
+
+    from autoforge.executor import execute
+    from autoforge.local_workspace import LocalWorkspace
+
+    root = local_repo(tmp_path)
+
+    def truncated(req):
+        return replace(execute(req), stdout_truncated=True)
+
+    with pytest.raises(VerificationError, match="truncated"):
+        LocalWorkspace(root, runner=truncated).root()
