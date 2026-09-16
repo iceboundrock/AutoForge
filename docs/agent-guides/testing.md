@@ -53,7 +53,9 @@ High-priority coverage includes:
 - non-zero exit
 - timeout, including a descendant that holds the inherited pipes after the
   child has exited (inside the process group, and outside it via `setsid`),
-  and a same-group descendant that closed its stdio and ignores SIGTERM
+  a same-group descendant that closed its stdio and ignores SIGTERM, and a
+  direct child that survives SIGKILL (the kill neutered), which is abandoned
+  after the grace rather than waited for
 - bounded capture: a stream past the bound keeps its head and tail, the
   retained size honours a bound smaller than one pipe read, and memory stays
   at the bound plus a constant under one-byte reads

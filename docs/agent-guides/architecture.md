@@ -75,10 +75,14 @@ killed and the result is a timeout, exactly as when the child itself
 overruns. The kill is complete only when no process is left in the group,
 not merely when the child is reaped and its pipes closed: a descendant that
 closed its inherited stdio and ignores SIGTERM is caught by that check and
-escalated to SIGKILL. A writer the group kill cannot reach (a descendant
-that also called `setsid`) is not waited for: the capture is abandoned after
-the kill grace period, so `execute()` returns within the timeout plus a
-bounded grace whatever the child left behind.
+escalated to SIGKILL. Every wait in that kill is bounded by the kill grace
+period, and nothing is waited for past the SIGKILL grace: not a writer the
+group kill cannot reach (a descendant that also called `setsid`), and not a
+member that survives SIGKILL itself (uninterruptible in the kernel), the
+direct child included. The capture is then abandoned, an unreaped child is
+left to the `subprocess` module, and the result is the timeout, so
+`execute()` returns within the timeout plus two grace periods whatever the
+child left behind.
 
 Capture is bounded and lossless in encoding terms: each stream is read as
 bytes and decoded as UTF-8 with replacement (a stray byte in agent output is

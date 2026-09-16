@@ -318,21 +318,28 @@ def _terminate_group(
     while any of them lives. The group is dead when the child is reaped, its
     pipes reached EOF *and* no process is left in the group; the last check
     is what catches a descendant that closed its inherited pipes and ignores
-    SIGTERM, which the first two cannot see. Each wait is bounded by the
-    kill grace. A member that survives SIGKILL past the grace (uninterruptible
-    in the kernel, or not signallable from here) is not waited for, and a
-    writer that left the group (``setsid``) cannot be reached at all, so the
-    capture is then abandoned rather than waited for.
+    SIGTERM, which the first two cannot see. Every wait here is bounded by
+    the kill grace, so the whole function returns within two grace periods
+    (SIGTERM, then SIGKILL) whatever the group left behind. What survives
+    the SIGKILL grace cannot be dealt with from here and is not waited for:
+    a member stuck in the kernel (uninterruptible sleep) or not signallable,
+    the direct child included, and a writer that left the group (``setsid``)
+    and so was never reached. The capture is then abandoned, and a child
+    still unreaped is left to the ``subprocess`` module, which reaps it when
+    it finally dies; ``execute()`` reports the timeout either way, and never
+    a stale exit status, since a timed-out result carries no exit code.
     """
+    deadline = time.monotonic() + _KILL_GRACE_SECONDS
     for sig in (signal.SIGTERM, signal.SIGKILL):
         if not _signal_group(pgid, sig):
             break
         deadline = time.monotonic() + _KILL_GRACE_SECONDS
         if _reaped(proc, deadline) and _eof(readers, deadline) and _group_gone(pgid, deadline):
             return
-    if proc.poll() is None:
-        proc.wait()
-    if not _eof(readers, time.monotonic() + _KILL_GRACE_SECONDS):
+    # The group is empty (the signal found nobody) or its remains are past
+    # help; the remaining EOF wait runs out the deadline already in hand,
+    # never a fresh one, so the bound above holds.
+    if not _eof(readers, deadline):
         for reader in readers:
             reader.abandon()
 

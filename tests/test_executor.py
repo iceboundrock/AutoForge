@@ -162,6 +162,51 @@ def test_same_group_descendant_with_closed_pipes_that_ignores_sigterm_is_killed(
             pass
 
 
+def test_direct_child_that_survives_sigkill_is_not_waited_for(monkeypatch):
+    """A direct child that neither SIGTERM nor SIGKILL removes within the grace
+    (uninterruptible in the kernel, say) must not turn the timeout into an
+    unbounded ``wait()`` (PR #84 review, P1): after both grace periods the
+    capture is abandoned and the timeout is reported, and the child is left
+    unreaped rather than waited for. The kill is neutered here to simulate the
+    survivor, so the child really does outlive ``execute()``."""
+    import subprocess
+
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    real_killpg = os.killpg
+    signalled: list[tuple[int, int]] = []
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: signalled.append((pgid, int(sig))))
+    real_wait = subprocess.Popen.wait
+    procs: list[subprocess.Popen] = []
+    waits: list[float | None] = []
+
+    def spying_wait(self, timeout=None):
+        procs.append(self)
+        waits.append(timeout)
+        return real_wait(self, timeout=timeout)
+
+    monkeypatch.setattr(subprocess.Popen, "wait", spying_wait)
+    started = time.monotonic()
+    res = execute(
+        ExecutionRequest(
+            command=[PY, "-c", "import time; print('start', flush=True); time.sleep(20)"],
+            timeout_seconds=1,
+        )
+    )
+    elapsed = time.monotonic() - started
+    proc = procs[0]
+    try:
+        assert res.timed_out and not res.ok and res.exit_code == -1
+        assert res.stdout == "start\n"
+        assert elapsed < 4, elapsed  # the timeout plus the two grace periods, never the sleep
+        assert None not in waits, "the child was waited for without a bound"
+        assert [sig for _, sig in signalled] == [signal.SIGTERM, signal.SIGKILL]
+        assert all(pgid == proc.pid for pgid, _ in signalled)
+        assert proc.poll() is None, "the simulated survivor should still be running"
+    finally:
+        real_killpg(proc.pid, signal.SIGKILL)
+        real_wait(proc, timeout=5)
+
+
 def test_stdin_is_closed_not_interactive():
     res = execute(
         ExecutionRequest(
