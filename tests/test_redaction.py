@@ -2,7 +2,7 @@
 
 import pytest
 
-from autoforge.redaction import MAX_GROWTH_FACTOR, redact
+from autoforge.redaction import _PATTERNS, MAX_GROWTH_FACTOR, redact
 
 
 def test_github_token_assignment():
@@ -70,6 +70,24 @@ def test_redaction_growth_is_bounded(unit):
     assert len(single) <= MAX_GROWTH_FACTOR * len(text)
     filled = text * (2000 // len(text) + 1)
     assert len(redact(filled)) <= MAX_GROWTH_FACTOR * len(filled)
+
+
+def test_every_redaction_pattern_has_a_growth_pin():
+    """A pattern with no matrix unit would escape the growth bound unnoticed.
+
+    The units are representative shapes, not a property test, so the guard
+    against a new pattern is that it cannot be added without a unit that it
+    matches on its own. ``sk-ant-`` is matched through ``redact`` by the
+    ``sk-`` pattern first, so each pattern is checked directly, not via the
+    marker ``redact`` leaves.
+    """
+    units = list(_WORST_CASE_UNITS.values())
+    unpinned = [
+        pattern.pattern
+        for pattern, _ in _PATTERNS
+        if not any(pattern.search(unit) for unit in units)
+    ]
+    assert unpinned == []
 
 
 def test_redaction_growth_does_not_compound_across_patterns():
