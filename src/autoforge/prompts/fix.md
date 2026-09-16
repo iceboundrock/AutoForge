@@ -62,7 +62,14 @@ below and push the result to the PR branch. Do not merge.
 <<<END_CONTROL_RESULT>>>
 ```
 
-- `resolutions` must contain exactly one entry per finding ID listed above.
+- `resolutions` must contain exactly one entry per finding ID listed above
+  (the controller accepts at most {{MAX_RESOLUTIONS_PER_FIX}} resolutions,
+  which is the most findings a review round can carry).
+- Bounds: a `rationale` is between {{MIN_RATIONALE_CHARS}} and
+  {{MAX_FIX_RATIONALE_CHARS}} characters; `commit_sha`, when given, is a git
+  SHA; `follow_up_issue_url` is the real issue URL. A result outside these
+  bounds is rejected as a whole and you are asked to re-emit it; the
+  controller never clips a resolution.
 - The controller verifies `new_head_sha` against the real PR HEAD and each
   follow-up issue URL against GitHub; mismatches fail the phase.
 - On failure: `"status": "failure"` plus `"message"`.

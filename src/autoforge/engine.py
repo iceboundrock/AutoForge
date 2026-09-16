@@ -161,6 +161,9 @@ from .result_parser import (
     MAX_FINDING_RESOLUTION_CHARS,
     MAX_FINDING_TITLE_CHARS,
     MAX_FINDINGS_PER_REVIEW,
+    MAX_FIX_RATIONALE_CHARS,
+    MAX_RESOLUTIONS_PER_FIX,
+    MIN_RATIONALE_CHARS,
     AnalyzeExecuteResult,
     FixResult,
     LocalAnalyzeExecuteResult,
@@ -215,6 +218,12 @@ REVIEW_BOUND_VARIABLES: dict[str, str | int | None] = {
     "MAX_FINDING_TITLE_CHARS": MAX_FINDING_TITLE_CHARS,
     "MAX_FINDING_LOCATION_CHARS": MAX_FINDING_LOCATION_CHARS,
     "MAX_FINDING_ID_CHARS": MAX_FINDING_ID_CHARS,
+}
+# The FIX payload bounds (#77), stated to the fixer the same way.
+FIX_BOUND_VARIABLES: dict[str, str | int | None] = {
+    "MAX_RESOLUTIONS_PER_FIX": MAX_RESOLUTIONS_PER_FIX,
+    "MAX_FIX_RATIONALE_CHARS": MAX_FIX_RATIONALE_CHARS,
+    "MIN_RATIONALE_CHARS": MIN_RATIONALE_CHARS,
 }
 
 # How many times one LOCAL phase entry may launch a write-capable agent
@@ -795,6 +804,7 @@ class ControllerEngine:
             "REVIEW_ROUND": s.review_round + 1 if s.phase != Phase.FIX else s.review_round,
             "FINDINGS": self._format_findings(s.open_findings),
             **REVIEW_BOUND_VARIABLES,
+            **FIX_BOUND_VARIABLES,
         }
 
     def _prior_attempt_note(self) -> str:
@@ -851,6 +861,7 @@ class ControllerEngine:
                 s.next_issue_rejections[-1] if s.next_issue_rejections else "(none)"
             ),
             **REVIEW_BOUND_VARIABLES,
+            **FIX_BOUND_VARIABLES,
         }
         if s.phase == Phase.REPLAN_REEXECUTE:
             # Before `_prepare_replan` has run (plan/dry-run rendering) the

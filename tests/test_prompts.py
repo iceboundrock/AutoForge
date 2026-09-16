@@ -127,6 +127,29 @@ def test_review_prompts_state_the_parser_bounds(engine):
     assert f"`id` at most {MAX_FINDING_ID_CHARS}" in rendered
 
 
+def test_fix_prompts_state_the_parser_bounds(engine):
+    """#77: the fixer is told the exact bounds the parser rejects against."""
+    from autoforge.result_parser import (
+        MAX_FIX_RATIONALE_CHARS,
+        MAX_RESOLUTIONS_PER_FIX,
+        MIN_RATIONALE_CHARS,
+    )
+
+    for template in ("fix.md", "local_fix.md"):
+        text = prompts.load_template(template)
+        # Template variables, never literal numbers, so the two cannot drift.
+        for var in ("MAX_RESOLUTIONS_PER_FIX", "MAX_FIX_RATIONALE_CHARS", "MIN_RATIONALE_CHARS"):
+            assert "{{" + var + "}}" in text, (template, var)
+        assert "never clips a resolution" in " ".join(text.split())
+    engine.state.phase = Phase.FIX
+    rendered = " ".join(engine.render_prompt_for(Phase.FIX).split())
+    assert f"at most {MAX_RESOLUTIONS_PER_FIX} resolutions" in rendered
+    assert (
+        f"`rationale` is between {MIN_RATIONALE_CHARS} and {MAX_FIX_RATIONALE_CHARS} characters"
+        in rendered
+    )
+
+
 def test_fix_prompt_contract():
     text = prompts.load_template("fix.md")
     for phrase in (

@@ -139,7 +139,9 @@ Design points:
   (findings per round, `required_resolution` / `title` / `location` / `id`
   length; see `result_parser.py`): an oversized result is rejected whole and the
   reviewer is asked to re-emit it, never clipped, because the findings are
-  the work the next fix round has to act on.
+  the work the next fix round has to act on. A fix round is bounded the same
+  way (resolutions per fix, `rationale` length, the shape of `commit_sha`,
+  the length of any URL), because every resolution is persisted whole.
 - **Dry-run is side-effect-free**: no subprocess, no `gh` call, no state
   write, no lock. It only prints the plan (phase, provider, model/effort,
   round, template, variables, command, expected transition), redacted.

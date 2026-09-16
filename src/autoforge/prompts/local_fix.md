@@ -78,7 +78,13 @@ resolution and creating a follow-up Issue is not an option.
 <<<END_CONTROL_RESULT>>>
 ```
 
-- `resolutions` must contain exactly one entry per finding ID listed above.
+- `resolutions` must contain exactly one entry per finding ID listed above
+  (the controller accepts at most {{MAX_RESOLUTIONS_PER_FIX}} resolutions,
+  which is the most findings a review round can carry).
+- Bounds: a `rationale` is between {{MIN_RATIONALE_CHARS}} and
+  {{MAX_FIX_RATIONALE_CHARS}} characters. A result outside these bounds is
+  rejected as a whole and you are asked to re-emit it; the controller never
+  clips a resolution.
 - `"changed_workspace"` must be `true` if and only if you actually modified or
   created files. The controller fingerprints the working tree before and after
   this phase and rejects a result that disagrees with what it observed.

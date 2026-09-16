@@ -34,6 +34,7 @@ from autoforge.result_parser import (
     MAX_FINDING_RESOLUTION_CHARS,
     MAX_FINDING_TITLE_CHARS,
     MAX_FINDINGS_PER_REVIEW,
+    MAX_FIX_RATIONALE_CHARS,
 )
 from autoforge.state import load_state
 from autoforge.transitions import Phase
@@ -2860,6 +2861,44 @@ def test_oversized_resolution_never_reaches_state_or_a_prompt(tmp_state_dir, fak
     assert "resolve everything" not in eng.paths.state_file.read_text()
     eng.state.phase = Phase.FIX
     assert "resolve everything" not in eng.render_prompt_for(Phase.FIX)
+
+
+# -- FIX payload bounds (#77) --------------------------------------------------------
+def test_oversized_fix_rationale_is_refused_and_corrected(tmp_state_dir):
+    """A FIX past the rationale bound is refused whole; the correction prompt
+    names the limit and never the text; the corrected FIX is applied."""
+    gh = FakeGitHub()
+    huge = ("because " * 400).strip()
+    assert len(huge) > MAX_FIX_RATIONALE_CHARS
+    fine = "The behaviour is already covered by the existing suite; nothing to change."
+
+    def agent(req):
+        rationale = fine if req.correction else huge
+        return block(
+            fix_payload(
+                SHA_A,
+                SHA_A,
+                [
+                    {
+                        "finding_id": "R1-F1",
+                        "resolution": "no_change_with_rationale",
+                        "rationale": rationale,
+                    }
+                ],
+            )
+        )
+
+    eng = _in_fix(tmp_state_dir, gh, agent)
+    out = eng.step()
+    assert out.next_phase == "REVIEW"
+    assert len(eng.provider.calls) == 2
+    second = eng.provider.calls[1]
+    assert second.correction is True
+    assert f"is {len(huge)} characters" in second.prompt
+    assert f"at most {MAX_FIX_RATIONALE_CHARS}" in second.prompt
+    assert "because because" not in second.prompt
+    assert eng.state.last_fix_resolutions[0]["rationale"] == fine
+    assert "because because" not in eng.paths.state_file.read_text()
 
 
 # The largest REVIEW payloads the parser accepts, each the most expensive

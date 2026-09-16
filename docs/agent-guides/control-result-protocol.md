@@ -105,6 +105,41 @@ review prompts state every parser bound (the id bound included) through
 template variables that the engine fills from the same constants, so the
 number the reviewer is told is the number it is held to.
 
+### Fix payload bounds
+
+A `FIX` result is untrusted in the same way and is persisted the same way:
+every accepted resolution is stored whole (after redaction) in
+`state.last_fix_resolutions`, and in LOCAL mode an `unresolved` rationale is
+echoed into the persisted `block_reason` that `status` shows the operator.
+The parser therefore bounds the `FIX` payload with the same policy
+(rejection, never clipping; the message states the size and the limit,
+never the text; the count is checked before any element is parsed):
+
+```text
+MAX_RESOLUTIONS_PER_FIX         resolutions per FIX (== MAX_FINDINGS_PER_REVIEW)
+MAX_FIX_RATIONALE_CHARS         rationale length (after stripping), both modes
+MAX_URL_CHARS                   any URL field, checked before the URL is parsed
+```
+
+The resolution count is equal to the finding count by construction: the
+engine already refuses a resolution whose `finding_id` is not an open
+finding, so a `FIX` can never legitimately carry more resolutions than the
+controller accepted findings, and the count bound only moves that refusal
+before the elements are parsed. The rationale bound is pinned below the
+persisted `MAX_REQUIRED_RESOLUTION_CHARS` through `redaction.MAX_GROWTH_FACTOR`
+in the same test that pins the review bounds, so a redacted rationale is
+never larger than a redacted resolution. A `commit_sha`, when present, must
+have the shape of a git SHA (`_SHA_RE`, the same rule as every required SHA
+field); a SHA rejection quotes the value only when it is short enough to be
+one and otherwise states its length. Every URL field (`follow_up_issue_url`,
+`issue_url`, `pr_url`, `review_comment_url`, `next_issue_url`) is bounded by
+length before `validation.parse_*` sees it, because those parsers quote the
+URL in their error and that error reaches the correction prompt and the run
+log; a malformed `follow_up_issue_url` is thereby a validation error of the
+`FIX` result rather than a `ConfigurationError` raised later by the engine.
+The fix prompts state the bounds through template variables filled from the
+same constants.
+
 ### Whole-block bound and truncated stdout
 
 The accepted payload is persisted whole (`control-result.json` and one

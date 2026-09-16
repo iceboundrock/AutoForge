@@ -18,7 +18,10 @@ resolution without the evidence its kind requires, is rejected outright. So
 is a REVIEW result larger than the controller is willing to persist and
 render (``MAX_FINDINGS_PER_REVIEW`` and the per-field character bounds,
 finding ids included): it is refused whole, never clipped, so the reviewer
-can re-emit it. The same holds for the block as a whole
+can re-emit it. The FIX payload is bounded the same way
+(``MAX_RESOLUTIONS_PER_FIX``, ``MAX_FIX_RATIONALE_CHARS``, the shape of
+``commit_sha`` and the length of any URL): every resolution is persisted
+whole. The same holds for the block as a whole
 (``MAX_CONTROL_RESULT_CHARS``): the accepted payload is persisted whole and
 is what the next phase acts on, so its size is checked before it is decoded.
 """
@@ -72,6 +75,24 @@ MAX_FINDING_LOCATION_CHARS = 300
 # ``finding_id`` must equal an accepted finding's id, so the same bound
 # applies to it at parse time rather than after the coverage check.
 MAX_FINDING_ID_CHARS = 32
+# Bounds on the FIX payload (#77). Every accepted resolution is persisted
+# whole in ``state.last_fix_resolutions`` (after redaction, which can lengthen
+# it), and in LOCAL mode an ``unresolved`` rationale is echoed into the
+# persisted ``block_reason`` that ``status`` shows. A FIX can never
+# legitimately report more resolutions than the controller accepted findings,
+# so the count bound *is* the REVIEW's, derived rather than restated, and it
+# is checked before any element is parsed. The rationale bound times
+# ``redaction.MAX_GROWTH_FACTOR`` is at or below
+# ``loop_guard.MAX_REQUIRED_RESOLUTION_CHARS`` (``tests/test_result_parser.py``
+# pins that relation), so a persisted rationale is never larger than a
+# persisted resolution. Rejected, never clipped, like a REVIEW field.
+MAX_RESOLUTIONS_PER_FIX = MAX_FINDINGS_PER_REVIEW
+MAX_FIX_RATIONALE_CHARS = 2000
+# Bound on any URL field before the ``validation`` parser sees it: that
+# parser quotes the value in its error, and the error is echoed into the
+# correction prompt and the run log. A real GitHub issue, PR or comment URL
+# is far shorter.
+MAX_URL_CHARS = 512
 # Bound on the whole CONTROL_RESULT block (the raw JSON text between the
 # markers, in characters). The accepted payload is written whole to
 # ``control-result.json`` and as one ``events.jsonl`` line, and its fields
@@ -195,17 +216,40 @@ def _opt_str(payload: dict, key: str, phase: str) -> str:
     return raw.strip()
 
 
-def _req_sha(payload: dict, key: str, phase: str) -> str:
-    v = _req_str(payload, key, phase)
+def _checked_sha(v: str, key: str, phase: str) -> str:
+    """``v`` as a lower-cased git SHA, or a rejection that quotes it only
+    when it is no longer than a SHA: an oversized value is reported by its
+    length, never echoed into the correction prompt or the run log."""
     if not _SHA_RE.match(v):
+        shown = repr(v) if len(v) <= 40 else f"{len(v)} characters"
         raise ControlResultValidationError(
-            f"{phase}: field {key!r} must be a git SHA (7-40 hex chars), got {v!r}"
+            f"{phase}: field {key!r} must be a git SHA (7-40 hex chars), got {shown}"
         )
     return v.lower()
 
 
-def _req_url(payload: dict, key: str, phase: str, kind: str) -> str:
-    v = _req_str(payload, key, phase)
+def _req_sha(payload: dict, key: str, phase: str) -> str:
+    return _checked_sha(_req_str(payload, key, phase), key, phase)
+
+
+def _opt_sha(payload: dict, key: str, phase: str) -> str:
+    """An optional SHA: absent or ``null`` is ``""``; a present value must be a SHA."""
+    v = _opt_str(payload, key, phase)
+    return _checked_sha(v, key, phase) if v else ""
+
+
+def _checked_url(v: str, key: str, phase: str, kind: str) -> str:
+    """``v`` validated as a GitHub ``kind`` URL, bounded first.
+
+    The ``validation`` parser quotes the value in its error, and that error
+    reaches the correction prompt and the run log, so the length is checked
+    before the parser sees the text.
+    """
+    if len(v) > MAX_URL_CHARS:
+        raise ControlResultValidationError(
+            f"{phase}: field {key!r} is {len(v)} characters; a GitHub {kind} URL is at most "
+            f"{MAX_URL_CHARS}. Re-emit the CONTROL_RESULT with the real URL."
+        )
     parser = {"issue": parse_issue_url, "pr": parse_pr_url, "comment": parse_comment_url}[kind]
     try:
         parser(v)
@@ -214,6 +258,16 @@ def _req_url(payload: dict, key: str, phase: str, kind: str) -> str:
             f"{phase}: field {key!r} must be a GitHub {kind} URL: {exc}"
         ) from exc
     return v
+
+
+def _req_url(payload: dict, key: str, phase: str, kind: str) -> str:
+    return _checked_url(_req_str(payload, key, phase), key, phase, kind)
+
+
+def _opt_url(payload: dict, key: str, phase: str, kind: str) -> str:
+    """An optional URL: absent or ``null`` is ``""``; a present value must parse."""
+    v = _opt_str(payload, key, phase)
+    return _checked_url(v, key, phase, kind) if v else ""
 
 
 def _req_bool(payload: dict, key: str, phase: str) -> bool:
@@ -246,8 +300,8 @@ class AnalyzeExecuteResult:
         )
 
 
-def _bounded(text: str, fid: str, key: str, limit: int) -> str:
-    """Reject a finding text field longer than ``limit`` characters.
+def _bounded(text: str, phase: str, subject: str, key: str, limit: int) -> str:
+    """Reject a text field of ``subject`` longer than ``limit`` characters.
 
     The message reports the size, never the text: the oversized value is the
     thing being refused, and the error is echoed into the correction prompt
@@ -255,11 +309,25 @@ def _bounded(text: str, fid: str, key: str, limit: int) -> str:
     """
     if len(text) > limit:
         raise ControlResultValidationError(
-            f"REVIEW: finding {fid} field {key!r} is {len(text)} characters; the controller "
-            f"accepts at most {limit}. Shorten it (or split the finding) and re-emit the "
-            "CONTROL_RESULT."
+            f"{phase}: {subject} field {key!r} is {len(text)} characters; the controller "
+            f"accepts at most {limit}. Shorten it and re-emit the CONTROL_RESULT."
         )
     return text
+
+
+def _raw_resolutions(p: dict) -> list:
+    """The ``resolutions`` list of a FIX result, count-checked before any
+    element is parsed (both modes)."""
+    raw = p.get("resolutions")
+    if not isinstance(raw, list):
+        raise ControlResultValidationError("'resolutions' must be a list (one per finding)")
+    if len(raw) > MAX_RESOLUTIONS_PER_FIX:
+        raise ControlResultValidationError(
+            f"FIX: {len(raw)} resolutions reported; the controller accepts at most "
+            f"{MAX_RESOLUTIONS_PER_FIX}, one per open finding. Report exactly one resolution "
+            "per finding id listed in the prompt and re-emit the CONTROL_RESULT."
+        )
+    return raw
 
 
 def _finding_id(payload: dict, key: str, phase: str, round: int | None = None) -> str:
@@ -338,6 +406,7 @@ class Finding:
                 "required_resolution"
             )
         fid = _finding_id(raw, "id", ph, round)
+        subject = f"finding {fid}"
         cls_ = _req_str(raw, "classification", ph)
         if cls_ not in FINDING_CLASSIFICATIONS:
             raise ControlResultValidationError(
@@ -349,13 +418,16 @@ class Finding:
             classification=cls_,
             required_resolution=_bounded(
                 _req_str(raw, "required_resolution", ph),
-                fid,
+                ph,
+                subject,
                 "required_resolution",
                 MAX_FINDING_RESOLUTION_CHARS,
             ),
-            title=_bounded(_opt_str(raw, "title", ph), fid, "title", MAX_FINDING_TITLE_CHARS),
+            title=_bounded(
+                _opt_str(raw, "title", ph), ph, subject, "title", MAX_FINDING_TITLE_CHARS
+            ),
             location=_bounded(
-                _opt_str(raw, "location", ph), fid, "location", MAX_FINDING_LOCATION_CHARS
+                _opt_str(raw, "location", ph), ph, subject, "location", MAX_FINDING_LOCATION_CHARS
             ),
         )
 
@@ -415,8 +487,14 @@ class FindingResolution:
             raise ControlResultValidationError(
                 f"{ph}: resolution for {fid} must be one of {FIX_RESOLUTIONS}, got {res!r}"
             )
-        rationale = _opt_str(raw, "rationale", ph)
-        follow_up = _opt_str(raw, "follow_up_issue_url", ph)
+        rationale = _bounded(
+            _opt_str(raw, "rationale", ph),
+            ph,
+            f"resolution for {fid}",
+            "rationale",
+            MAX_FIX_RATIONALE_CHARS,
+        )
+        follow_up = _opt_url(raw, "follow_up_issue_url", ph, "issue")
         if res == "no_change_with_rationale":
             if len(rationale) < MIN_RATIONALE_CHARS:
                 raise ControlResultValidationError(
@@ -436,7 +514,7 @@ class FindingResolution:
             resolution=res,
             rationale=rationale,
             follow_up_issue_url=follow_up,
-            commit_sha=_opt_str(raw, "commit_sha", ph),
+            commit_sha=_opt_sha(raw, "commit_sha", ph),
         )
 
     def to_dict(self) -> dict:
@@ -458,10 +536,9 @@ class FixResult:
     @classmethod
     def from_payload(cls, p: dict) -> FixResult:
         ph = "FIX"
-        raw = p.get("resolutions")
-        if not isinstance(raw, list):
-            raise ControlResultValidationError("'resolutions' must be a list (one per finding)")
-        resolutions = [FindingResolution.from_payload(r, i) for i, r in enumerate(raw)]
+        resolutions = [
+            FindingResolution.from_payload(r, i) for i, r in enumerate(_raw_resolutions(p))
+        ]
         ids = [r.finding_id for r in resolutions]
         if len(set(ids)) != len(ids):
             raise ControlResultValidationError(f"duplicate resolution finding_ids: {ids}")
@@ -695,7 +772,13 @@ class LocalFindingResolution:
                     else ""
                 )
             )
-        rationale = _opt_str(raw, "rationale", ph)
+        rationale = _bounded(
+            _opt_str(raw, "rationale", ph),
+            ph,
+            f"resolution for {fid}",
+            "rationale",
+            MAX_FIX_RATIONALE_CHARS,
+        )
         # Both non-fix dispositions are only acceptable with real reasoning:
         # "won't fix" and "couldn't fix" are decisions a human has to judge.
         if res in ("no_change_with_rationale", "unresolved") and len(rationale) < (
@@ -732,10 +815,9 @@ class LocalFixResult:
     @classmethod
     def from_payload(cls, p: dict) -> LocalFixResult:
         ph = "FIX"
-        raw = p.get("resolutions")
-        if not isinstance(raw, list):
-            raise ControlResultValidationError("'resolutions' must be a list (one per finding)")
-        resolutions = [LocalFindingResolution.from_payload(r, i) for i, r in enumerate(raw)]
+        resolutions = [
+            LocalFindingResolution.from_payload(r, i) for i, r in enumerate(_raw_resolutions(p))
+        ]
         ids = [r.finding_id for r in resolutions]
         if len(set(ids)) != len(ids):
             raise ControlResultValidationError(f"duplicate resolution finding_ids: {ids}")
