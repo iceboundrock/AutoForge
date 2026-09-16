@@ -4293,7 +4293,7 @@ class ControllerEngine:
         if any_fixed and res.new_head_sha == expected_prev:
             raise VerificationError("FIX claims 'fixed' resolutions but the PR HEAD did not change")
         state.current_head_sha = pr.head_sha
-        state.last_fix_resolutions = [r.to_dict() for r in res.resolutions]
+        state.last_fix_resolutions = [redact_dict(r.to_dict()) for r in res.resolutions]
         state.open_findings = []
         state.last_review_result = "fixed"
         return Phase.REVIEW, (

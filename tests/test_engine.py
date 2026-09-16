@@ -586,6 +586,48 @@ def test_fix_no_change_requires_rationale(tmp_state_dir):
         eng.step()
 
 
+# -- redaction at the persistence boundary (#81) -----------------------------------
+# REVIEW findings and FIX resolutions are agent-authored text that lands in
+# plain `state.json` and in `status --json`; the engine redacts them before
+# they are assigned to state, mirroring the LOCAL-mode test in test_local.py.
+def test_remote_review_findings_are_redacted_before_they_are_persisted(tmp_state_dir):
+    secret = "sk-ant-" + "B" * 30
+    gh = FakeGitHub()
+    gh.add_comment(PR, 100, review_comment_body(1, SHA_A, True, ["R1-F1"]))
+    leaky = _finding(1)
+    leaky["required_resolution"] = f"Set ANTHROPIC_API_KEY={secret} in the test fixture."
+    eng = _in_review(tmp_state_dir, gh, [block(review_payload(1, SHA_A, [leaky]))])
+    out = eng.step()
+    assert out.next_phase == "FIX"
+    assert secret not in json.dumps(eng.state.open_findings)
+    assert "***REDACTED***" in eng.state.open_findings[0]["required_resolution"]
+    assert secret not in eng.paths.state_file.read_text(encoding="utf-8")
+
+
+def test_remote_fix_resolutions_are_redacted_before_they_are_persisted(tmp_state_dir):
+    secret = "sk-ant-" + "B" * 30
+    gh = FakeGitHub()
+    res = [
+        {"finding_id": "R1-F1", "resolution": "fixed"},
+        {
+            "finding_id": "R1-F2",
+            "resolution": "no_change_with_rationale",
+            "rationale": f"The fixture already sets ANTHROPIC_API_KEY={secret}, so nothing to do.",
+        },
+    ]
+
+    def on_call(req):
+        gh.set_head(SHA_B)
+        return block(fix_payload(SHA_A, SHA_B, res))
+
+    eng = _in_fix(tmp_state_dir, gh, on_call, findings=[_finding(1, 1), _finding(1, 2)])
+    out = eng.step()
+    assert out.next_phase == "REVIEW"
+    assert secret not in json.dumps(eng.state.last_fix_resolutions)
+    assert "***REDACTED***" in eng.state.last_fix_resolutions[1]["rationale"]
+    assert secret not in eng.paths.state_file.read_text(encoding="utf-8")
+
+
 # -- correction retry ---------------------------------------------------------------------
 def test_malformed_result_triggers_one_correction(tmp_state_dir, fake_github):
     def agent(req):
