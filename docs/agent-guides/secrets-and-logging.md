@@ -30,4 +30,10 @@ Authorization: Bearer ...
 
 Redaction is defense in depth; do not claim it detects every possible secret.
 
+Redaction can lengthen a text (a short secret becomes the fixed marker), and
+`redact` guarantees it never returns more than `MAX_GROWTH_FACTOR` times its
+input. Persisted bounds applied *after* redaction (the review-history
+resolution bound in `loop_guard`) depend on that factor, so a new pattern
+must keep it, or raise it together with those bounds and their tests.
+
 Do not log the entire process environment.

@@ -6,6 +6,7 @@ import pytest
 
 from autoforge import loop_guard
 from autoforge.errors import ControlResultError, ControlResultValidationError
+from autoforge.redaction import MAX_GROWTH_FACTOR, redact_dict
 from autoforge.result_parser import (
     BEGIN,
     END,
@@ -649,21 +650,34 @@ def test_parser_bounds_never_exceed_the_persisted_evidence_bounds():
     """
     assert MAX_FINDINGS_PER_REVIEW <= loop_guard.MAX_PERSISTED_FINDINGS_PER_ROUND
     assert MAX_FINDINGS_PER_REVIEW <= loop_guard.MAX_PERSISTED_RESOLUTION_DIGESTS
-    assert MAX_FINDING_RESOLUTION_CHARS <= loop_guard.MAX_REQUIRED_RESOLUTION_CHARS
+    # The engine redacts a finding between the parser and the history, and
+    # redaction can lengthen a text, so the persisted bound must absorb the
+    # growth of a resolution that is exactly at the parser bound (#33).
+    assert (
+        MAX_FINDING_RESOLUTION_CHARS * MAX_GROWTH_FACTOR <= loop_guard.MAX_REQUIRED_RESOLUTION_CHARS
+    )
+    # The worst shape redaction can grow: a one-character secret behind the
+    # shortest recognised name, repeated to fill the parser bound exactly.
+    unit = "HF_TOKEN=x;"
+    resolution = (unit * (MAX_FINDING_RESOLUTION_CHARS // len(unit) + 1))[
+        :MAX_FINDING_RESOLUTION_CHARS
+    ]
     findings = [
         dict(
             _finding(1, n),
-            required_resolution="r" * MAX_FINDING_RESOLUTION_CHARS,
+            required_resolution=resolution,
             title="t" * MAX_FINDING_TITLE_CHARS,
             location="l" * MAX_FINDING_LOCATION_CHARS,
         )
         for n in range(1, MAX_FINDINGS_PER_REVIEW + 1)
     ]
     res = ReviewResult.from_payload(dict(GOOD_REVIEW, needs_fix_round=True, findings=findings))
-    record = loop_guard.review_record(
-        1, SHA_A, loop_guard.RESULT_NEEDS_FIX, [f.to_dict() for f in res.findings]
-    )
+    persisted = [redact_dict(f.to_dict()) for f in res.findings]  # the engine's own path
+    assert len(persisted[0]["required_resolution"]) > MAX_FINDING_RESOLUTION_CHARS
+    assert "HF_TOKEN=x" not in persisted[0]["required_resolution"]
+    record = loop_guard.review_record(1, SHA_A, loop_guard.RESULT_NEEDS_FIX, persisted)
     assert record["finding_count"] == len(record["findings"]) == MAX_FINDINGS_PER_REVIEW
+    assert record["findings"][0]["required_resolution"] == persisted[0]["required_resolution"]
     assert "evidence_truncated" not in record
     assert record["resolutions_truncated"] is False
     assert loop_guard.truncated_evidence_rounds([record]) == []

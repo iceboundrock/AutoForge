@@ -40,7 +40,11 @@ from autoforge.replan_txn import (
     scan_replan_markers,
     select_bound_candidate,
 )
-from autoforge.result_parser import MAX_FINDINGS_PER_REVIEW, parse_control_result
+from autoforge.result_parser import (
+    MAX_FINDING_RESOLUTION_CHARS,
+    MAX_FINDINGS_PER_REVIEW,
+    parse_control_result,
+)
 from autoforge.state import load_state
 from autoforge.transitions import Phase
 from tests.conftest import (
@@ -681,6 +685,53 @@ def test_review_beyond_the_parser_bound_is_refused_before_it_can_be_persisted(tm
     assert len(eng.state.review_history) == 19
     assert truncated_evidence_rounds(eng.state.review_history) == []
     _assert_source_untouched(eng, gh)
+
+
+def test_redaction_growth_never_marks_an_accepted_round_truncated(tmp_state_dir):
+    """#33: the one way an accepted review could still exceed the persisted bound.
+
+    A resolution exactly at the parser bound that quotes a secret grows under
+    redaction (a short token becomes the 14-character marker) before it is
+    persisted. The persisted bound absorbs that growth, so the round is
+    retained complete, the replan is not refused, every finding is rendered
+    into the replan prompt and the acknowledgement count covers it.
+    """
+    gh = FakeGitHub()
+    # Long enough that the marker cannot fit inside the parser bound.
+    quoted = "remove the hard-coded header Authorization: Bearer s3cr3t "
+    resolution = (quoted * (MAX_FINDING_RESOLUTION_CHARS // len(quoted) + 1))[
+        :MAX_FINDING_RESOLUTION_CHARS
+    ]
+    assert len(resolution) == MAX_FINDING_RESOLUTION_CHARS
+    replan = _replan_agent(gh)
+
+    def agent(req):
+        if req.phase != "REVIEW":
+            return replan(req)
+        gh.add_comment(PR, 120, review_comment_body(20, SHA_A, True, ["R20-F1"]))
+        payload = _trigger_review_payload()
+        payload["findings"][0]["required_resolution"] = resolution
+        return block(payload)
+
+    eng = _park_at_hard_threshold(tmp_state_dir, gh, agent)
+    assert eng.step().next_phase == "REPLAN_REEXECUTE"
+    record = eng.state.review_history[-1]
+    persisted = record["findings"][0]["required_resolution"]
+    assert len(persisted) > MAX_FINDING_RESOLUTION_CHARS  # it did grow ...
+    assert "s3cr3t" not in persisted and "***REDACTED***" in persisted
+    assert "evidence_truncated" not in record  # ... and was retained whole
+    assert truncated_evidence_rounds(eng.state.review_history) == []
+    # Every finding of every round, the grown one included, is what the
+    # replacement must acknowledge.
+    expected = sum(r["finding_count"] for r in eng.state.review_history)
+    assert expected == sum(len(r.get("findings", [])) for r in eng.state.review_history)
+
+    assert eng.step().next_phase == "REVIEW"
+    prompt = eng.provider.calls[-1].prompt
+    assert "s3cr3t" not in prompt and persisted in prompt
+    assert f'"historical_findings_considered": {expected},' in prompt
+    assert eng.state.current_pr_url == REPLACEMENT_PR
+    assert eng.state.superseded_prs[0]["pr_url"] == PR
 
 
 def test_review_beyond_the_persisted_finding_bound_blocks_instead_of_replanning(tmp_state_dir):

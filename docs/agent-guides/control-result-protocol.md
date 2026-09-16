@@ -87,9 +87,17 @@ in `loop_guard` (`MAX_PERSISTED_FINDINGS_PER_ROUND`,
 round the parser accepted is always retained complete in `review_history`;
 the `loop_guard` clipping and its truncation markers remain as a defence for
 state persisted before the parser bounds existed or edited outside the
-controller. The review prompts state every parser bound (the id bound
-included) through template variables that the engine fills from the same
-constants, so the number the reviewer is told is the number it is held to.
+controller. The resolution bound is not merely *equal* to the parser's: the
+engine redacts every finding between the parser and the history, and
+redaction can lengthen a text (a one-character secret becomes the
+14-character marker), so `MAX_REQUIRED_RESOLUTION_CHARS` is computed as the
+parser bound times `redaction.MAX_GROWTH_FACTOR`, not restated as a number,
+so neither input can drift from it. Otherwise a resolution at the parser
+bound that quotes a token would be clipped after it was accepted, the round
+marked truncated, and every later replan of that PR refused (#33). The
+review prompts state every parser bound (the id bound included) through
+template variables that the engine fills from the same constants, so the
+number the reviewer is told is the number it is held to.
 
 The FIX prompt these findings are rendered into is bounded by a constant
 factor of the parser bounds, not by their sum: the renderer's safety measures

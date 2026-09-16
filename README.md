@@ -625,10 +625,15 @@ naming the transaction that superseded it), and the durable
 `replan_transaction` record described above: the controller's intent journal,
 which `resume` replays rather than re-deriving a decision from GitHub facts. State keeps compact finding summaries and review
 comment URLs, rather than copying unbounded PR discussion bodies. Those
-summaries are bounded (100 findings per round, 2000 characters per required
-resolution); a round that hits either bound is marked `evidence_truncated`, and
-because superseding a PR deletes the controller's only record of its findings,
-such a round makes the replan policy block for a human instead.
+summaries are bounded (100 findings per round, above the 50 findings the parser
+accepts; 6000 characters per required resolution, which is the parser's
+2000-character bound times the most redaction can lengthen a text); a round
+that hits either bound is marked
+`evidence_truncated`, and because superseding a PR deletes the controller's
+only record of its findings, such a round makes the replan policy block for a
+human instead. Because the parser refuses an oversized review before it is
+recorded, only state written by an older controller or edited by hand can
+carry that mark.
 Relevant controller verification failures are retained as a bounded per-issue
 list and supplied to the replan prompt; all PR comment text remains GitHub
 audit data rather than state payload.
