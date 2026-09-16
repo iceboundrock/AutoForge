@@ -42,6 +42,18 @@ _PATTERNS: list[tuple[re.Pattern[str], str]] = [
 
 _REDACTED = "***REDACTED***"
 
+# :func:`redact` never returns more than this many times its input's length.
+# Every pattern replaces a run of at least one character with the 14-character
+# marker, so a text can *grow* under redaction; the worst shape is a one
+# character secret behind the shortest recognised name (``HF_TOKEN=x;`` is 11
+# characters and becomes 24, a factor of about 2.2). Later patterns cannot
+# grow the marker again: ``*`` is outside every value class that replaces a
+# shorter run. ``tests/test_redaction.py`` pins the factor against the
+# worst-case shape of every pattern; a new pattern must keep it, or raise it
+# together with the persisted bound in :mod:`autoforge.loop_guard` that
+# depends on it.
+MAX_GROWTH_FACTOR = 3
+
 
 def redact(text: str | None) -> str:
     """Redact known secret shapes. Never raises; non-str input -> str()."""

@@ -37,8 +37,19 @@ import re
 from .errors import StateError
 
 _WS_RE = re.compile(r"\s+")
+# Per-round bounds on the persisted findings. Both are at or above what the
+# parser lets a REVIEW result carry (``result_parser.MAX_FINDINGS_PER_REVIEW``,
+# ``MAX_FINDING_RESOLUTION_CHARS``), so a round the controller accepted is
+# always retained complete and the clipping below only ever applies to state
+# that did not come through the parser. The resolution bound is the parser
+# bound times ``redaction.MAX_GROWTH_FACTOR``: the engine redacts a finding
+# between the parser and this record, and redaction can lengthen a text (a
+# one-character secret becomes a 14-character marker), so a bound equal to
+# the parser's would clip an accepted resolution and mark the round
+# truncated, which refuses every later replan of the PR (#33).
+# ``tests/test_result_parser.py`` pins both relations.
 MAX_PERSISTED_FINDINGS_PER_ROUND = 100
-MAX_REQUIRED_RESOLUTION_CHARS = 2000
+MAX_REQUIRED_RESOLUTION_CHARS = 6000
 
 # ``result`` values recorded per review round.
 RESULT_NEEDS_FIX = "needs_fix"

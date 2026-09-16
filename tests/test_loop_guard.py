@@ -4,7 +4,9 @@ import pytest
 
 from autoforge.errors import StateError
 from autoforge.loop_guard import (
+    MAX_PERSISTED_FINDINGS_PER_ROUND,
     MAX_PERSISTED_RESOLUTION_DIGESTS,
+    MAX_REQUIRED_RESOLUTION_CHARS,
     RESULT_CLEAN,
     RESULT_NEEDS_FIX,
     RESULT_STALE,
@@ -68,11 +70,14 @@ def test_review_record_shape_and_result_validation():
 
 
 def test_review_record_bounds_retained_finding_evidence_and_marks_the_loss():
-    findings = [_f("x" * 2500, f"R1-F{i}") for i in range(101)]
+    findings = [
+        _f("x" * (MAX_REQUIRED_RESOLUTION_CHARS + 500), f"R1-F{i}")
+        for i in range(MAX_PERSISTED_FINDINGS_PER_ROUND + 1)
+    ]
     record = review_record(1, SHA_A, RESULT_NEEDS_FIX, findings)
-    assert record["finding_count"] == 101
-    assert len(record["findings"]) == 100
-    assert len(record["findings"][0]["required_resolution"]) == 2000
+    assert record["finding_count"] == MAX_PERSISTED_FINDINGS_PER_ROUND + 1
+    assert len(record["findings"]) == MAX_PERSISTED_FINDINGS_PER_ROUND
+    assert len(record["findings"][0]["required_resolution"]) == MAX_REQUIRED_RESOLUTION_CHARS
     # The bound stays, but the loss is never silent: a replan must be able to
     # see that this round's evidence can no longer be reproduced in full.
     assert record["evidence_truncated"] is True
@@ -84,10 +89,12 @@ def test_review_record_bounds_retained_finding_evidence_and_marks_the_loss():
     "findings,truncated",
     [
         ([_f("x", "R1-F1")], False),
-        ([_f("x" * 2000, "R1-F1")], False),  # exactly at the cap: nothing lost
-        ([_f("x" * 2001, "R1-F1")], True),  # one clipped resolution is enough
-        ([_f("x", f"R1-F{i}") for i in range(100)], False),
-        ([_f("x", f"R1-F{i}") for i in range(101)], True),
+        # exactly at the cap: nothing lost
+        ([_f("x" * MAX_REQUIRED_RESOLUTION_CHARS, "R1-F1")], False),
+        # one clipped resolution is enough
+        ([_f("x" * (MAX_REQUIRED_RESOLUTION_CHARS + 1), "R1-F1")], True),
+        ([_f("x", f"R1-F{i}") for i in range(MAX_PERSISTED_FINDINGS_PER_ROUND)], False),
+        ([_f("x", f"R1-F{i}") for i in range(MAX_PERSISTED_FINDINGS_PER_ROUND + 1)], True),
     ],
 )
 def test_evidence_truncation_is_detected_per_round(findings, truncated):
