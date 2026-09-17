@@ -17,6 +17,39 @@ below and push the result to the PR branch. Do not merge.
 
 {{FINDINGS}}
 
+## Follow-up issues (one marker per finding; existing issues are authoritative)
+
+{{FOLLOW_UP_ISSUES}}
+
+A follow-up issue you create for a finding MUST contain that finding's marker
+line verbatim in its body (it is how the controller recognises the issue as
+the finding's follow-up), exactly as given: the JSON payload has the two
+keys shown and no other. An issue may carry several `ai-follow-up` markers
+for different findings, never the same one twice. A marker the controller
+cannot read (edited, truncated, extra keys, a finding id that is not of the
+form `R<round>-F<n>`) is not "no marker": it makes the open-issue set
+unreadable and blocks the run until a human repairs the issue. Where an existing issue is listed for a finding,
+an earlier invocation of this phase already created it: do NOT create a
+second one, report that issue's URL as the finding's `follow_up_issue_url`
+(or resolve the finding differently only if that issue was created in
+error, in which case close it first). The controller verifies afterwards
+that a claimed follow-up is the one open issue carrying its finding's
+marker, and that a finding resolved any other way has no open issue
+carrying its marker.
+
+Follow-up issues already open for this PR from earlier rounds (finding id:
+issue):
+
+{{EXISTING_FOLLOW_UP_ISSUES}}
+
+The reviewer was shown these and does not normally re-raise a deferred
+problem. If a finding above nevertheless is the same problem as one of them,
+do not open a second issue: either resolve it in this PR (the reviewer asked
+for that), or, when deferring it again is right, add this finding's marker
+line to that existing issue's body (`gh issue edit <url> --body-file <file>`,
+keeping the rest of the body) and report that issue's URL. An issue carrying
+two markers is the follow-up of both findings.
+
 ## Steps
 
 1. Read the repository's `AGENTS.md` / `CLAUDE.md` if present.
@@ -29,9 +62,10 @@ below and push the result to the PR branch. Do not merge.
    - `fixed`: you changed code/tests/docs in this PR to resolve it.
    - `follow_up_created`: the finding is a real issue but clearly OUT OF SCOPE
      for this PR. Create a GitHub issue in this repository (`gh issue create`)
-     describing it and link it. Follow-up issues are only for real
-     out-of-scope problems; never use follow-up issues to defer the current
-     issue's core acceptance criteria.
+     describing it, with the finding's marker line in its body, and link it
+     (or report the existing issue listed above). Follow-up issues are only
+     for real out-of-scope problems; never use follow-up issues to defer the
+     current issue's core acceptance criteria.
    - `no_change_with_rationale`: after investigation the finding does not
      require a change. Give a concrete technical rationale (what you checked
      and why the current code is correct). A bare "won't fix" is not
@@ -72,5 +106,7 @@ below and push the result to the PR branch. Do not merge.
   bounds is rejected as a whole and you are asked to re-emit it; the
   controller never clips a resolution.
 - The controller verifies `new_head_sha` against the real PR HEAD and each
-  follow-up issue URL against GitHub; mismatches fail the phase.
+  follow-up issue URL against GitHub (it exists, is OPEN, is in this
+  repository, and is the one open issue carrying the finding's marker);
+  mismatches fail the phase.
 - On failure: `"status": "failure"` plus `"message"`.

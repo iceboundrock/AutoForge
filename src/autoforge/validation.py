@@ -102,6 +102,14 @@ class GitHubCommentRef:
     def canonical(self) -> str:
         return f"{self.parent.canonical}#issuecomment-{self.comment_id}"
 
+    @property
+    def identity(self) -> tuple:
+        return (*self.parent.identity, self.comment_id)
+
+    def same_target(self, other: GitHubCommentRef) -> bool:
+        """Same comment as GitHub sees it: same parent identity, same comment id."""
+        return self.identity == other.identity
+
 
 # Backwards-compatible alias used by Phase-1 callers/tests.
 ParsedURL = GitHubRef

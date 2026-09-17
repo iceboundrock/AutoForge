@@ -11,6 +11,11 @@ PR comment describing the outcome. This is review round {{REVIEW_ROUND}}.
 - Repository: {{REPOSITORY}}
 - Reviewed HEAD (bound by the controller): `{{REVIEWED_HEAD_SHA}}`
 - Previous review comment (if any): {{PREVIOUS_REVIEW_COMMENT_URL}}
+- Comment already posted for THIS round at THIS HEAD (if any):
+  {{EXISTING_REVIEW_COMMENT_URL}}
+- Follow-up issues already open for this PR (finding id: issue), from
+  earlier rounds:
+  {{EXISTING_FOLLOW_UP_ISSUES}}
 
 ## Steps
 
@@ -55,10 +60,52 @@ future ideas, optional improvements, educational commentary, non-actionable
 preferences, and information-only remarks. Do not inflate observations into
 findings, and do not hide real defects as observations.
 
+A problem an earlier round already deferred to one of the follow-up issues
+listed above is not a finding of this round either: a fixer records that
+decision by creating the issue, and finding ids are round-scoped, so raising
+it again under a new id would have the next fixer create a second issue for
+the same problem. Read those issues (`gh issue view <url>`); mention the
+problem under **Observations** with the issue's URL if it is worth noting.
+Raise it as a finding only when the deferral is wrong for this PR, that is,
+when the problem must be resolved within this PR's lifecycle after all; say
+so in its `required_resolution`, so the fixer does not defer it once more.
+
+## If a comment for this round already exists
+
+The controller reads the PR before launching you. When the line "Comment
+already posted for THIS round at THIS HEAD" above names a URL, an earlier
+invocation of this same round posted that comment (it carries the
+`ai-review-result` marker for round {{REVIEW_ROUND}} at
+`{{REVIEWED_HEAD_SHA}}`) and the controller could not record the result.
+That comment IS this round's comment; do NOT post a second one. Read it:
+
+- If it is a complete review in the layout below, adopt it: report its URL as
+  `review_comment_url` and its findings (same IDs, classifications and
+  required resolutions) in the CONTROL_RESULT.
+- If it is incomplete or wrong, replace its body in place
+  (`gh api -X PATCH repos/{{REPOSITORY}}/issues/comments/<id> -F body=@<file>`)
+  and report the same URL.
+
+A round has exactly one review comment at its HEAD. The controller rejects
+the round when the PR ends up with two comments carrying the marker for
+round {{REVIEW_ROUND}} at `{{REVIEWED_HEAD_SHA}}`, and blocks the run on
+the next entry until a human removes one.
+
+The marker is the comment's identity, and the controller reads it
+strictly: one `ai-review-result` marker per comment, whose payload is a JSON
+object with exactly the keys `round` (integer), `reviewed_head_sha` (the 40
+character SHA), `needs_fix_round` (boolean) and optionally `finding_ids` (a
+list of this round's distinct finding ids). A marker it cannot read (a
+second marker in the same comment, an edited or truncated payload, an
+extra key) is not "no marker": it makes the round's comment set
+unreadable, the result is rejected, and the run blocks until a human
+repairs the comment.
+
 ## Post exactly one review comment
 
 Post ONE top-level comment on the PR with `gh pr comment {{PR_URL}} --body-file <file>`
-(never several comments, never an inline review) using exactly this layout:
+(never several comments, never an inline review; when the controller named an
+existing comment above, edit that one instead) using exactly this layout:
 
 ```markdown
 # AI Code Review — Round {{REVIEW_ROUND}}
@@ -87,8 +134,16 @@ Reviewed HEAD: `{{REVIEWED_HEAD_SHA}}`
 
 ## Summary
 Needs another fix round: YES|NO
-<!-- ai-review-result: {"round": {{REVIEW_ROUND}}, "reviewed_head_sha": "{{REVIEWED_HEAD_SHA}}", "needs_fix_round": true|false, "finding_ids": ["R{{REVIEW_ROUND}}-F1"]} -->
+<!-- ai-review-result: {"round": {{REVIEW_ROUND}}, "reviewed_head_sha": "{{REVIEWED_HEAD_SHA}}", "needs_fix_round": <true or false>, "finding_ids": [<this round's finding ids, or nothing>]} -->
 ```
+
+The marker's payload must be real JSON when you post it: `needs_fix_round`
+is the literal `true` or `false` matching the Summary line, and
+`finding_ids` lists exactly the ids under Findings (an empty list when there
+are none); the controller compares them to the CONTROL_RESULT findings and
+rejects the round when they differ.
+Every `<...>` above is a placeholder to replace, never text to copy; a
+payload that still contains one cannot be read and the round is rejected.
 
 Read back the comment URL from the `gh pr comment` output.
 

@@ -128,6 +128,44 @@ def comment_url(pr_url: str, cid: int) -> str:
     return f"{pr_url}#issuecomment-{cid}"
 
 
+def progress_comment_body(issue_url: str = ISSUE, pr_url: str = PR) -> str:
+    """An UPDATE_EPIC progress comment carrying the (issue, PR) marker."""
+    from autoforge.engine import render_progress_marker
+
+    return (
+        f"Progress: {issue_url} done via {pr_url}\n\n{render_progress_marker(issue_url, pr_url)}\n"
+    )
+
+
+def post_progress_comment(gh: FakeGitHub, cid: int = 300) -> None:
+    """What a well-behaved UPDATE_EPIC agent does: post the progress comment once.
+
+    An agent asked again (a rejected selection, a correction) adopts the one
+    it already posted, so a second call posts nothing.
+    """
+    from autoforge.engine import render_progress_marker
+
+    if any(render_progress_marker(ISSUE, PR) in c.body for c in gh.comments.get(EPIC, [])):
+        return
+    gh.add_comment(EPIC, cid, progress_comment_body())
+
+
+def implementation_pr_body(issue_url: str = ISSUE) -> str:
+    """A PR body carrying the issue's implementation marker (what the agent must write)."""
+    from autoforge.engine import render_implementation_marker
+
+    return f"Closes {issue_url}\n\n{render_implementation_marker(issue_url)}\n"
+
+
+def follow_up_issue_body(finding_id: str, pr_url: str = PR) -> str:
+    """A follow-up issue body carrying the (PR, finding) marker."""
+    from autoforge.engine import render_follow_up_marker
+
+    return (
+        f"Follow-up for {finding_id} of {pr_url}\n\n{render_follow_up_marker(pr_url, finding_id)}\n"
+    )
+
+
 def review_comment_body(
     round: int, sha: str, needs_fix: bool, finding_ids: list[str] | None = None
 ) -> str:
@@ -220,7 +258,9 @@ class FakeGitHub:
         self.get_issue_error: GitHubError | None = None  # every get_issue call raises this
         self.latest_pr_error: GitHubError | None = None  # every latest_pr_number call raises this
         self.pr_listing_truncated: bool = False  # a strict PR listing cannot be completed
-        self.comments_error: GitHubError | None = None  # every get_pr_comments call raises this
+        self.issue_listing_truncated: bool = False  # a strict issue listing cannot be completed
+        # every get_pr_comments / get_issue_comments call raises this
+        self.comments_error: GitHubError | None = None
         # GitHub Actions read model behind `safety.verify_check_definition`:
         # runs by id, their jobs, and where each branch points. `add_pr`
         # registers the PR's own run at its HEAD; the base branch has one
@@ -239,13 +279,16 @@ class FakeGitHub:
         self.add_issue(ISSUE, "Feature")
 
     # -- test helpers ---------------------------------------------------------
-    def add_issue(self, url: str, title: str = "t", state: str = "OPEN") -> IssueInfo:
+    def add_issue(
+        self, url: str, title: str = "t", state: str = "OPEN", body: str = ""
+    ) -> IssueInfo:
         ref = parse_issue_url(url)
         info = IssueInfo(
             url=ref.canonical,
             number=ref.number,
             title=title,
             state=state,
+            body=body,
             repository=ref.repository,
         )
         self.issues[ref.canonical] = info
@@ -318,6 +361,19 @@ class FakeGitHub:
 
     def get_issue_state(self, url: str) -> str:
         return self.get_issue(url).state
+
+    def list_open_issues(self, repo: str, *, strict: bool = False) -> list[IssueInfo]:
+        self.calls.append(("list_open_issues", repo, strict))
+        if strict and self.issue_listing_truncated:
+            raise GitHubError(
+                f"{repo} has at least 1000 open issues, so the listing may be truncated "
+                "and the set of follow-up issues cannot be established"
+            )
+        return [
+            replace(i)
+            for i in self.issues.values()
+            if i.is_open and self._same_repo(i.repository, repo)
+        ]
 
     def issue_exists(self, url: str) -> bool:
         try:
@@ -480,18 +536,6 @@ class FakeGitHub:
             (p.number for p in self.prs.values() if self._same_repo(p.repository, repo)), default=0
         )
 
-    def find_open_prs_for_issue(self, issue, *, strict: bool = False) -> list[PRInfo]:
-        self.calls.append(("find_open_prs_for_issue", issue.number, strict))
-        out = []
-        for pr in self.list_open_prs(issue.repository, strict=strict):
-            if (
-                issue.number in pr.linked_issue_numbers
-                or pr.head_ref.startswith(f"autoforge/{issue.number}-")
-                or pr.head_ref == f"autoforge/{issue.number}"
-            ):
-                out.append(pr)
-        return out
-
     def get_pr_comments(self, url: str) -> list[CommentInfo]:
         self.calls.append(("get_pr_comments", url))
         if self.comments_error is not None:
@@ -499,13 +543,23 @@ class FakeGitHub:
         from autoforge.validation import parse_pr_url
 
         self.get_pr(url)
-        ref = parse_pr_url(url)
-        # Comments are keyed by the URL they were posted under; the PR they
-        # belong to is the same whatever spelling that URL used.
+        return self._comments_of(parse_pr_url(url))
+
+    def get_issue_comments(self, url: str) -> list[CommentInfo]:
+        self.calls.append(("get_issue_comments", url))
+        if self.comments_error is not None:
+            raise self.comments_error
+        return self._comments_of(parse_issue_url(url))
+
+    def _comments_of(self, ref) -> list[CommentInfo]:
+        from autoforge.validation import parse_github_url
+
+        # Comments are keyed by the URL they were posted under; the PR or
+        # issue they belong to is the same whatever spelling that URL used.
         return [
             c
             for known, cs in self.comments.items()
-            if parse_pr_url(known).same_target(ref)
+            if parse_github_url(known).same_target(ref)
             for c in cs
         ]
 

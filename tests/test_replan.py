@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import re
+import time
 
 import pytest
 
+from autoforge.claims import render_implementation_marker
 from autoforge.config import ReplanConfig
 from autoforge.errors import (
     ControlResultValidationError,
@@ -63,6 +65,9 @@ from tests.conftest import (
 
 REPLACEMENT_PR = "https://github.com/owner/repo/pull/43"
 REPLACEMENT_BRANCH = "autoforge/retry-2-2"
+# The replacement is the issue's implementation PR: it carries the marker
+# ANALYZE_EXECUTE identifies the issue's PR by, beside the transaction marker.
+IMPLEMENTATION_MARKER = render_implementation_marker(ISSUE)
 
 
 def _history(counts: list[int]) -> list[dict]:
@@ -225,7 +230,13 @@ def _marker_for_prompt(prompt: str, **override) -> str:
 
 def _replacement_body(prompt: str, **override) -> str:
     marker = _marker_for_prompt(prompt, **override)
-    return f"## Fresh Reimplementation\n\nReplaces {PR}.\n\n{marker}"
+    implementation = _from_prompt(prompt, r"(<!-- ai-implementation: \{[^\n]*\} -->)")
+    return f"## Fresh Reimplementation\n\nReplaces {PR}.\n\n{implementation}\n{marker}"
+
+
+def _replacement(marker: str) -> str:
+    """A replacement PR body publishing ``marker`` beside the implementation marker."""
+    return f"{IMPLEMENTATION_MARKER}\n{marker}"
 
 
 def _replan_payload(**override) -> dict:
@@ -389,7 +400,7 @@ def _seed_txn(stage: ReplanStage, **over) -> ReplanTransaction:
 def _seeded_engine(tmp_state_dir, gh, stage, *, marker=True, **over):
     eng = make_engine(tmp_state_dir, ["the replan agent must not run"], github=gh)
     gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2])
-    body = _ours_marker() if marker else "no marker here"
+    body = _replacement(_ours_marker()) if marker else "no marker here"
     gh.add_pr(url=REPLACEMENT_PR, head_sha=SHA_B, branch=REPLACEMENT_BRANCH, linked=[2], body=body)
     txn = _seed(eng, stage, **over)
     return eng, txn
@@ -873,6 +884,118 @@ def test_unrelated_preexisting_pr_does_not_block_a_healthy_replan(tmp_state_dir)
     assert eng.state.replan_transaction == {}  # retired on activation
 
 
+LATE_PR = "https://github.com/owner/repo/pull/44"  # opened during the replan
+SOLE_CLAIMANT_NEEDLE = "cannot be shown to be the one open PR implementing issue #2"
+
+
+def _competitor(gh, url: str = EARLIER_PR, body: str = IMPLEMENTATION_MARKER) -> None:
+    """Another open PR carrying the issue's implementation marker (or a broken one)."""
+    gh.add_pr(url=url, head_sha=SHA_C, branch="autoforge/2-other", linked=[2], body=body)
+
+
+@pytest.mark.parametrize(
+    "when",
+    [
+        pytest.param("before", id="predates-the-replan"),
+        pytest.param("during", id="opened-by-the-agent"),
+    ],
+)
+def test_binding_refuses_a_replacement_that_is_one_of_two_implementation_claimants(
+    tmp_state_dir, when
+):
+    """The replacement is the issue's implementation PR only if it is the
+    *only* open PR carrying the marker, the source aside: one of two is the
+    choice the next ANALYZE_EXECUTE entry refuses to make, so activating one
+    would install a PR that entry then blocks on. Binding asks the entry's
+    question of its own strict snapshot and refuses, whether the competitor
+    was already open or the agent opened it beside the replacement."""
+    gh = FakeGitHub()
+    if when == "before":
+        _competitor(gh)
+    inner = _replan_agent(gh)
+
+    def agent(req):
+        out = inner(req)
+        if req.phase == "REPLAN_REEXECUTE" and when == "during":
+            _competitor(gh, LATE_PR)
+        return out
+
+    eng = _park_at_hard_threshold(tmp_state_dir, gh, agent)
+    assert eng.step().next_phase == "REPLAN_REEXECUTE"
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    reason = load_state(eng.paths.state_file).block_reason
+    assert SOLE_CLAIMANT_NEEDLE in reason and "ANALYZE_EXECUTE entry would refuse" in reason
+    assert _txn(eng).stage is ReplanStage.REJECTED
+    _assert_source_untouched(eng, gh)
+
+
+def test_binding_refuses_while_an_unreadable_implementation_marker_is_open(tmp_state_dir):
+    """A defect anywhere in the listing makes the sole-claimant question
+    inconclusive, exactly as it does for the ANALYZE_EXECUTE entry: the PR
+    may be this issue's, botched by an interrupted agent."""
+    gh = FakeGitHub()
+    _competitor(gh, body="<!-- ai-implementation: {broken -->")
+    eng = _park_at_hard_threshold(tmp_state_dir, gh, _replan_agent(gh))
+    assert eng.step().next_phase == "REPLAN_REEXECUTE"
+    assert eng.step().next_phase == "BLOCKED"
+    reason = load_state(eng.paths.state_file).block_reason
+    assert SOLE_CLAIMANT_NEEDLE in reason and f"open PR {EARLIER_PR}" in reason
+    assert _txn(eng).stage is ReplanStage.REJECTED
+    _assert_source_untouched(eng, gh)
+
+
+def test_the_source_carrying_the_issue_marker_does_not_block_a_healthy_replan(tmp_state_dir):
+    """The source is the issue's implementation PR until it is superseded, so
+    it legitimately carries the marker the read-back accepted. The question
+    is what the entry finds once the source is closed: the source is excluded
+    by identity, not counted as a competitor."""
+    gh = FakeGitHub()
+    eng = _park_at_hard_threshold(tmp_state_dir, gh, _replan_agent(gh))
+    gh.prs[PR].body = IMPLEMENTATION_MARKER
+    assert eng.step().next_phase == "REPLAN_REEXECUTE"
+    assert eng.step().next_phase == "REVIEW"
+    assert eng.state.current_pr_url == REPLACEMENT_PR
+    assert [url for url, _ in gh.closed_prs] == [PR]
+
+
+def test_a_competitor_appearing_before_the_close_stops_the_replan_without_closing(
+    tmp_state_dir,
+):
+    """VERIFIED reloaded: the final read before the destructive write asks the
+    sole-claimant question again. A second marked PR that appeared since
+    binding is a refusal before the close, not a block after it."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.VERIFIED)
+    gh.prs[PR].body = IMPLEMENTATION_MARKER  # the source's own marker is not a competitor
+    _competitor(gh, LATE_PR)
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert SOLE_CLAIMANT_NEEDLE in eng.state.block_reason
+    assert _txn(eng).stage is ReplanStage.REJECTED
+    _assert_source_untouched(eng, gh)
+
+
+def test_a_competitor_after_the_close_blocks_activation_and_names_both(tmp_state_dir):
+    """SUPERSEDED reloaded: the source is closed by this transaction and a
+    second marked PR is now open beside the replacement. Activating either
+    would install a PR the next entry blocks on, so activation refuses and
+    the operator is told which PRs compete."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(
+        tmp_state_dir, gh, ReplanStage.SUPERSEDED, superseded_at="2026-01-01T00:00:00+00:00"
+    )
+    _closed_by_controller(gh)
+    _competitor(gh, LATE_PR)
+    eng2 = _restart(eng, gh)
+    out = eng2.step()
+    assert out.next_phase == "BLOCKED"
+    reason = eng2.state.block_reason
+    assert SOLE_CLAIMANT_NEEDLE in reason and REPLACEMENT_PR in reason and LATE_PR in reason
+    assert eng2.state.current_pr_url == PR and eng2.state.superseded_prs == []
+    assert gh.closed_prs == [] and gh.reopened_prs == []
+
+
 def test_a_pr_predating_the_transaction_is_refused_even_if_it_was_never_an_issue_pr(
     tmp_state_dir,
 ):
@@ -1353,6 +1476,81 @@ def test_agent_claiming_a_different_pr_than_the_marked_one_is_rejected(tmp_state
     _assert_source_untouched(eng, gh)
 
 
+# -- the replacement is the issue's implementation PR ------------------------------
+# ANALYZE_EXECUTE identifies the issue's PR by the `ai-implementation` marker
+# alone, so a replacement without it would be activated here and be
+# invisible to the next entry after a lost state file, which launches a
+# second implementation. The target predicate holds the replacement to the
+# same marker at binding, at the close and at activation.
+
+
+def _replacement_without(tmp_state_dir, gh, implementation: str | None):
+    def agent(req):
+        if req.phase == "REVIEW":
+            gh.add_comment(PR, 120, review_comment_body(20, SHA_A, True, ["R20-F1"]))
+            return block(_trigger_review_payload())
+        lines = [_marker_for_prompt(req.prompt)]
+        if implementation is not None:
+            lines.insert(0, implementation)
+        gh.add_pr(
+            url=REPLACEMENT_PR,
+            head_sha=SHA_B,
+            branch=REPLACEMENT_BRANCH,
+            linked=[2],
+            body="\n".join(lines),
+        )
+        return block(_replan_payload())
+
+    return _park_at_hard_threshold(tmp_state_dir, gh, agent)
+
+
+def test_a_replacement_without_the_issues_implementation_marker_is_refused(tmp_state_dir):
+    gh = FakeGitHub()
+    eng = _replacement_without(tmp_state_dir, gh, None)
+    assert eng.step().next_phase == "REPLAN_REEXECUTE"
+    assert eng.step().next_phase == "BLOCKED"
+    assert "does not carry the ai-implementation marker for issue #2" in eng.state.block_reason
+    _assert_source_untouched(eng, gh)
+    assert _txn(eng).stage is ReplanStage.REJECTED
+
+
+def test_a_replacement_marked_as_another_issues_implementation_is_refused(tmp_state_dir):
+    gh = FakeGitHub()
+    other = render_implementation_marker("https://github.com/owner/repo/issues/3")
+    eng = _replacement_without(tmp_state_dir, gh, other)
+    assert eng.step().next_phase == "REPLAN_REEXECUTE"
+    assert eng.step().next_phase == "BLOCKED"
+    assert "not of issue #2" in eng.state.block_reason
+    _assert_source_untouched(eng, gh)
+
+
+def test_a_replacement_with_an_unreadable_implementation_marker_is_refused(tmp_state_dir):
+    gh = FakeGitHub()
+    eng = _replacement_without(tmp_state_dir, gh, "<!-- ai-implementation: {broken -->")
+    assert eng.step().next_phase == "REPLAN_REEXECUTE"
+    assert eng.step().next_phase == "BLOCKED"
+    assert "unreadable ai-implementation marker" in eng.state.block_reason
+    _assert_source_untouched(eng, gh)
+
+
+def test_an_activated_replacement_is_what_a_fresh_analyze_entry_finds(tmp_state_dir):
+    """The read-back never accepts what the next entry could not find again:
+    with the state file gone, ANALYZE_EXECUTE for the same issue adopts the
+    activated replacement (the superseded PR is closed) instead of launching
+    a second implementation."""
+    gh = FakeGitHub()
+    eng = _park_at_hard_threshold(tmp_state_dir, gh, _replan_agent(gh))
+    assert eng.step().next_phase == "REPLAN_REEXECUTE"
+    assert eng.step().next_phase == "REVIEW"
+    assert eng.state.current_pr_url == REPLACEMENT_PR and gh.prs[PR].state == "CLOSED"
+    fresh = make_engine(tmp_state_dir / "fresh", ["never"], github=gh)
+    fresh.state.phase = Phase.ANALYZE_EXECUTE
+    out = fresh.step()
+    assert out.next_phase == "REVIEW" and fresh.provider.calls == []
+    assert fresh.state.current_pr_url == REPLACEMENT_PR
+    assert fresh.state.current_head_sha == SHA_B
+
+
 @pytest.mark.parametrize(
     "payload_over",
     [
@@ -1514,15 +1712,18 @@ def _restated_marker(findings: int, unique: int) -> str:
 @pytest.mark.parametrize(
     "body,needle",
     [
-        ("the marker is gone", "no longer carries the marker"),
-        (_restated_marker(4, 2) + "\n" + UNUSABLE_MARKERS[1], "alongside an unusable one"),
+        (_replacement("the marker is gone"), "no longer carries the marker"),
         (
-            _restated_marker(4, 2) + "\n" + _foreign_marker(),
+            _replacement(_restated_marker(4, 2) + "\n" + UNUSABLE_MARKERS[1]),
+            "alongside an unusable one",
+        ),
+        (
+            _replacement(_restated_marker(4, 2) + "\n" + _foreign_marker()),
             "valid marker(s) for other transactions",
         ),
-        (_restated_marker(4, 2) * 2, "carries 2 markers"),
-        (_restated_marker(9, 2), "now attests findings_considered=9"),
-        (_restated_marker(4, 1), "unique_constraints=1"),
+        (_replacement(_restated_marker(4, 2) * 2), "carries 2 markers"),
+        (_replacement(_restated_marker(9, 2)), "now attests findings_considered=9"),
+        (_replacement(_restated_marker(4, 1)), "unique_constraints=1"),
     ],
 )
 def test_the_marker_is_revalidated_on_the_last_read_before_the_close(tmp_state_dir, body, needle):
@@ -1560,13 +1761,14 @@ def test_the_marker_is_revalidated_on_the_last_read_before_the_close(tmp_state_d
         ),
         (lambda gh: gh.set_head(SHA_C, REPLACEMENT_PR), "advanced from the verified HEAD"),
         (
-            lambda gh: setattr(gh.prs[REPLACEMENT_PR], "body", "marker removed"),
+            lambda gh: setattr(gh.prs[REPLACEMENT_PR], "body", _replacement("marker removed")),
             "no longer carries the marker",
         ),
         (
             lambda gh: setattr(gh.prs[REPLACEMENT_PR], "linked_issue_numbers", []),
             "not linked to issue",
         ),
+        (lambda gh: _competitor(gh, LATE_PR), SOLE_CLAIMANT_NEEDLE),
     ],
 )
 def test_a_mutation_racing_the_close_is_undone_instead_of_accepted(tmp_state_dir, race, needle):
@@ -2096,13 +2298,15 @@ def test_w4_recovery_holds_the_same_bar_as_the_control_result_path(tmp_state_dir
     """
     gh = FakeGitHub()
     eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.PREPARED)
-    gh.prs[REPLACEMENT_PR].body = render_marker(
-        ReplanAttestation(
-            transaction_id=TXN_ID,
-            execution_attempt=2,
-            findings_considered=4,
-            unique_constraints=2,
-            tests_passed=False,  # the replacement's own tests did not pass
+    gh.prs[REPLACEMENT_PR].body = _replacement(
+        render_marker(
+            ReplanAttestation(
+                transaction_id=TXN_ID,
+                execution_attempt=2,
+                findings_considered=4,
+                unique_constraints=2,
+                tests_passed=False,  # the replacement's own tests did not pass
+            )
         )
     )
     out = eng.step()
@@ -2739,6 +2943,27 @@ def test_marker_scanner_reads_a_well_formed_attestation():
     assert scan.attestations == [attestation] and scan.malformed == []
 
 
+_HOSTILE_BODIES = {
+    "unterminated marker then blanks": f"<!-- {MARKER_NAME}: " + " " * 65000,
+    "unterminated payload then blanks": f"<!-- {MARKER_NAME}: a" + " " * 65000,
+    "many unterminated markers with blank runs": (f"<!-- {MARKER_NAME}: a" + " " * 3000) * 20,
+    "unterminated marker then text": f"<!-- {MARKER_NAME}: " + "a" * 65000,
+    "named openers only": f"<!-- {MARKER_NAME}:" * 1900,
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_HOSTILE_BODIES))
+def test_scanning_a_hostile_body_takes_linear_time(shape):
+    """Same pattern shape, same cost contract as `claims.MarkerKind.pattern`:
+    the candidate listing scans every open PR body in the repository."""
+    body = _HOSTILE_BODIES[shape]
+    assert len(body) <= 65536
+    started = time.perf_counter()
+    result = scan_replan_markers(body)
+    assert time.perf_counter() - started < 1.0, shape
+    assert result.attestations == [] and result.malformed == []
+
+
 def test_marker_regex_cannot_swallow_the_rest_of_a_body():
     """An unterminated marker must not consume an adjacent valid one."""
     good = render_marker(
@@ -3065,7 +3290,11 @@ def _drift_replacement(gh, **fields) -> None:
     [
         (lambda gh: _drift_replacement(gh, state="CLOSED"), "CLOSED"),
         (lambda gh: _drift_replacement(gh, head_sha=SHA_C), "advanced from the verified HEAD"),
-        (lambda gh: _drift_replacement(gh, body=""), "no longer carries"),
+        (lambda gh: _drift_replacement(gh, body=IMPLEMENTATION_MARKER), "no longer carries"),
+        (
+            lambda gh: _drift_replacement(gh, body=_ours_marker()),
+            "does not carry the ai-implementation marker",
+        ),
         (lambda gh: _drift_replacement(gh, base_ref="release"), "base"),
     ],
 )
@@ -3633,6 +3862,7 @@ def test_r2f1_the_target_verifier_requires_the_branch_once_it_is_a_checkpoint():
         head_ref=REPLACEMENT_BRANCH,
         repository="owner/repo",
         linked_issue_numbers=[2],
+        body=IMPLEMENTATION_MARKER,
     )
     # While binding, the branch is about to *become* the checkpoint.
     assert verify_target_pr(target, txn, "owner/repo", require_checkpoint_head=False) == ""
@@ -4353,6 +4583,7 @@ def test_r6f1_the_target_verifier_refuses_an_issue_of_another_repository():
         head_ref=REPLACEMENT_BRANCH,
         repository="owner/repo",
         linked_issue_numbers=[2],
+        body=IMPLEMENTATION_MARKER,
     )
     drift = verify_target_pr(pr, txn, "owner/repo", require_checkpoint_head=True)
     assert "replan issue https://github.com/other/repo/issues/2 is not in owner/repo" in drift
@@ -4891,7 +5122,11 @@ def test_r10f1_the_target_verifier_compares_identity_not_spelling():
     txn = _seed_txn(ReplanStage.VERIFIED)
     gh = FakeGitHub()
     target = gh.add_pr(
-        url=REPLACEMENT_VARIANT, head_sha=SHA_B, branch=REPLACEMENT_BRANCH, linked=[2]
+        url=REPLACEMENT_VARIANT,
+        head_sha=SHA_B,
+        branch=REPLACEMENT_BRANCH,
+        linked=[2],
+        body=IMPLEMENTATION_MARKER,
     )
     assert target.repository == VARIANT_REPO
     assert verify_target_pr(target, txn, "owner/repo", require_checkpoint_head=True) == ""
@@ -4996,7 +5231,7 @@ def _github_spelling_differs_from_the_journal(tmp_state_dir, gh, stage, **over):
         head_sha=SHA_B,
         branch=REPLACEMENT_BRANCH,
         linked=[2],
-        body=_ours_marker(),
+        body=_replacement(_ours_marker()),
     )
     txn = _seed(eng, stage, **over)
     assert txn.source_pr_url == PR and txn.replacement_pr_url == REPLACEMENT_PR

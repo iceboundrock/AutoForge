@@ -283,6 +283,66 @@ def test_a_fifo_never_blocks_the_controller(tmp_path):
                 OPERATIONS[op](root, "pipe")
 
 
+# -- #55: the append reads the file, so the read is bounded like any other ------
+def _reads_asked(monkeypatch) -> list[int]:
+    """Every ``read(n)`` a ``SafeRoot`` file object is asked for."""
+    import autoforge.safefs as safefs
+
+    asked: list[int] = []
+    real_fdopen = safefs.os.fdopen
+
+    def counted(fd, *args, **kwargs):
+        fh = real_fdopen(fd, *args, **kwargs)
+        real_read = fh.read
+
+        def read(n=-1):
+            asked.append(n)
+            return real_read(n)
+
+        fh.read = read  # type: ignore[method-assign]
+        return fh
+
+    monkeypatch.setattr(safefs.os, "fdopen", counted)
+    return asked
+
+
+def test_a_bounded_append_refuses_an_oversized_file_without_reading_or_touching_it(
+    tmp_path, monkeypatch
+):
+    """`append_text` is read-existing + publish-fresh-inode, so the read is the
+    cost. With a limit it asks for one byte past it and no more, and the
+    refusal lands before anything is written: the oversized file keeps its
+    name, its inode and its size, and is never carried into a fresh inode."""
+    from autoforge.safefs import ReadLimitExceeded
+
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    target = root_dir / "events.jsonl"
+    target.write_bytes(b"x" * 10)
+    os.truncate(target, 1 << 20)  # sparse: cheap to plant, expensive to read
+    before = target.stat()
+    asked = _reads_asked(monkeypatch)
+    with SafeRoot.open(root_dir) as root:
+        with pytest.raises(ReadLimitExceeded) as exc:
+            root.append_text("events.jsonl", "line\n", limit=100)
+    assert exc.value.relpath == "events.jsonl" and exc.value.limit == 100
+    assert asked == [101], asked
+    after = target.stat()
+    assert (after.st_ino, after.st_size) == (before.st_ino, before.st_size)
+    assert sorted(p.name for p in root_dir.iterdir()) == ["events.jsonl"], "no temporary left"
+
+
+def test_a_bounded_append_at_exactly_the_limit_still_appends(tmp_path):
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    (root_dir / "events.jsonl").write_bytes(b"x" * 100)
+    with SafeRoot.open(root_dir) as root:
+        root.append_text("events.jsonl", "line\n", limit=100)
+        root.append_text("missing.jsonl", "first\n", limit=0)
+    assert (root_dir / "events.jsonl").read_bytes() == b"x" * 100 + b"line\n"
+    assert (root_dir / "missing.jsonl").read_bytes() == b"first\n"
+
+
 # -- identity: a root is an inode, not a pathname ------------------------------
 def test_a_root_renamed_after_it_was_opened_keeps_receiving_the_writes(tmp_path):
     """The capability is the descriptor. Renaming the directory cannot redirect it."""

@@ -164,7 +164,8 @@ log; a malformed `follow_up_issue_url` is thereby a validation error of the
 and a malformed `next_issue_url` a validation error of the `UPDATE_EPIC`
 result rather than a selection for the engine to reject: the shape of the
 field is the parser's, which issue it names is the engine's
-([github-safety.md](github-safety.md), "After UPDATE_EPIC"), and an
+([github-safety.md](github-safety.md), "After FIX" for the follow-up marker
+a claimed issue must carry, "After UPDATE_EPIC"), and an
 oversized value is never quoted into `next_issue_rejections`, the
 re-selection prompt or the run log. The fix prompts state the bounds
 through template variables filled from the same constants.

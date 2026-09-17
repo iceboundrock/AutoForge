@@ -631,6 +631,144 @@ def test_an_oversized_event_journal_left_by_an_agent_is_refused_not_materialised
     again.close()
 
 
+def test_a_journal_enlarged_by_the_agent_refuses_the_post_run_append_bounded(tmp_path, monkeypatch):
+    """#55: the append that records the invocation reads the journal *after*
+    the agent returned, so it is the one read an agent can enlarge the file
+    for. It is bounded like the recovery read: refused one byte past the
+    budget, with the invocation's artifacts already published and the launch
+    checkpoint already durable, so `resume` re-enters the phase as a retry
+    judged against the baseline from before the agent -- it does not demand a
+    second implementation on top of the first."""
+    import os
+
+    import autoforge.safefs as safefs
+    from autoforge.runlog import MAX_EVENT_JOURNAL_BYTES
+
+    root = local_repo(tmp_path)
+    eng = make_local_engine(root, FEATURE)
+    eng.step()  # INITIALIZING -> ANALYZE_EXECUTE
+    before = fingerprint(root)
+    journal = Path(eng.paths.logs_dir) / eng.state.run_id / "events.jsonl"
+
+    def implements_and_enlarges_the_journal(req):
+        touch_impl(root, "v1\n")
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        journal.touch()
+        os.truncate(journal, 2 * MAX_EVENT_JOURNAL_BYTES)
+        return impl_result()
+
+    got: list[int] = []
+    real_fdopen = safefs.os.fdopen
+
+    def counted(fd, *a, **k):
+        fh = real_fdopen(fd, *a, **k)
+        real_read = fh.read
+
+        def read(n=-1):
+            data = real_read(n)
+            got.append(len(data))
+            return data
+
+        fh.read = read  # type: ignore[method-assign]
+        return fh
+
+    monkeypatch.setattr(safefs.os, "fdopen", counted)
+    eng.provider._handler = implements_and_enlarges_the_journal
+    with pytest.raises(StateError, match="corrupted event journal.*larger than"):
+        eng.step()
+    assert max(got) == MAX_EVENT_JOURNAL_BYTES + 1, "the oversized journal was materialised"
+    assert journal.stat().st_size == 2 * MAX_EVENT_JOURNAL_BYTES, "not carried forward"
+    step_dirs = sorted(p.name for p in journal.parent.iterdir() if p.is_dir())
+    assert step_dirs == ["001-analyze_execute-1"], "the invocation's artifacts were published"
+    saved = load_state(eng.paths.state_file)
+    assert saved.phase == Phase.ANALYZE_EXECUTE
+    assert saved.local_pending_phase == "ANALYZE_EXECUTE"
+    assert saved.local_pending_fingerprint == before
+    assert saved.local_pending_attempts == 1
+    eng.close()
+
+    # The operator moves the journal aside, as the refusal says, and resumes
+    # in a new process. The work is in the tree, so an honest "changed
+    # nothing" is accepted against the baseline from before the first launch.
+    journal.rename(journal.with_suffix(".aside"))
+    eng2 = fresh(root)
+    launches: list[int] = []
+    prompts: list[str] = []
+
+    def continues(req):
+        launches.append(load_state(eng2.paths.state_file).local_pending_attempts)
+        prompts.append(req.prompt)
+        return impl_result(changed=False)
+
+    eng2.provider._handler = continues
+    assert eng2.step().next_phase == "REVIEW"
+    assert launches == [2], "a retry of the same entry, not a fresh one"
+    assert "A previous invocation of ANALYZE_EXECUTE" in prompts[0]
+    steps = sorted(p.name for p in journal.parent.iterdir() if p.is_dir())
+    assert len(steps) == 2 and steps[1].startswith("002-analyze_execute-"), steps
+    eng2.close()
+
+
+def test_a_timed_out_agent_that_enlarged_the_journal_keeps_its_checkpoint(tmp_path):
+    """PR #89 F2, LOCAL: the launch checkpoint and the attempt are persisted
+    in one save before the agent starts, so an invocation that times out and
+    then has its journal append refused is still charged as attempt 1 with
+    its artifacts published, and the refusal names the timeout it
+    interrupted and that `resume` retries against the checkpoint."""
+    import os
+
+    from autoforge.providers import AgentExecutionResult, ScriptedProvider
+    from autoforge.runlog import MAX_EVENT_JOURNAL_BYTES
+
+    root = local_repo(tmp_path)
+    eng = make_local_engine(root, FEATURE)
+    eng.step()  # INITIALIZING -> ANALYZE_EXECUTE
+    before = fingerprint(root)
+    journal = Path(eng.paths.logs_dir) / eng.state.run_id / "events.jsonl"
+    seen: list[tuple[str, int]] = []
+
+    class TimesOutAfterEnlarging(ScriptedProvider):
+        def execute(self, req):
+            self.calls.append(req)
+            saved = load_state(eng.paths.state_file)
+            seen.append((saved.local_pending_phase, saved.local_pending_attempts))
+            touch_impl(root, "v1\n")
+            journal.parent.mkdir(parents=True, exist_ok=True)
+            journal.touch()
+            os.truncate(journal, 2 * MAX_EVENT_JOURNAL_BYTES)
+            return AgentExecutionResult(
+                command=["x"],
+                exit_code=-1,
+                stdout="",
+                stderr="",
+                started_at="t",
+                finished_at="t",
+                timed_out=True,
+            )
+
+    provider = TimesOutAfterEnlarging(None)
+    eng.providers._overrides = {k: provider for k in ("claude", "opencode", "scripted")}
+    with pytest.raises(
+        StateError,
+        match=r"corrupted event journal.*interrupted attempt 1 of ANALYZE_EXECUTE after the "
+        r"agent had returned with: timed out after \d+s\. Its launch was checkpointed before "
+        r"it started.*'resume' re-enters ANALYZE_EXECUTE as a retry judged against that "
+        r"checkpoint",
+    ):
+        eng.step()
+    assert seen == [("ANALYZE_EXECUTE", 1)], "the checkpoint was not durable before the launch"
+    assert len(provider.calls) == 1
+    saved = load_state(eng.paths.state_file)
+    assert saved.phase == Phase.ANALYZE_EXECUTE and saved.attempt == 1
+    assert saved.local_pending_phase == "ANALYZE_EXECUTE"
+    assert saved.local_pending_fingerprint == before
+    assert saved.local_pending_attempts == 1
+    step_dirs = sorted(p.name for p in journal.parent.iterdir() if p.is_dir())
+    assert step_dirs == ["001-analyze_execute-1"]
+    assert (journal.parent / step_dirs[0] / "error.txt").exists()
+    eng.close()
+
+
 # -- the boundaries around the run itself --------------------------------------
 def test_a_crash_before_the_run_was_ever_persisted_leaves_no_run(tmp_path):
     """`new_local_run` writes nothing; a crash before the first save is a no-op.

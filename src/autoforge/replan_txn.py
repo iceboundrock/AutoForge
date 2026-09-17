@@ -64,7 +64,8 @@ from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field, fields
 from enum import StrEnum
 
-from .errors import ConfigurationError
+from .claims import IMPLEMENTATION, collect, scan
+from .errors import ClaimConflictError, ConfigurationError
 from .github import PRInfo
 from .validation import GitHubPullRequestRef, parse_issue_url, parse_pr_url, same_pr_url
 
@@ -82,7 +83,11 @@ MARKER_NAME = "autoforge-replan-transaction"
 # body up to some later `-->` and hiding a valid marker inside the match: an
 # unterminated marker is not a complete comment and is evidence of nothing,
 # while every complete one is classified.
-MARKER_RE = re.compile(rf"<!--\s*{MARKER_NAME}\s*:\s*(?P<payload>(?:(?!-->|<!--)[\s\S])*?)\s*-->")
+#
+# The pattern is linear in the body it scans (see ``claims.MarkerKind.pattern``
+# for the rule): possessive whitespace runs and no whitespace quantifier next
+# to the lazy payload, which :func:`scan_replan_markers` strips instead.
+MARKER_RE = re.compile(rf"<!--\s*+{MARKER_NAME}\s*+:(?P<payload>(?:(?!-->|<!--)[\s\S])*?)-->")
 
 # The controller's receipt for its own destructive close, posted with a
 # separate `gh pr comment` after the close is observed (see
@@ -229,7 +234,7 @@ def scan_replan_markers(body: str) -> MarkerScan:
     attestations: list[ReplanAttestation] = []
     malformed: list[str] = []
     for match in MARKER_RE.finditer(body or ""):
-        raw = match.group("payload")
+        raw = match.group("payload").strip()
         try:
             payload = json.loads(raw)
         except ValueError as exc:
@@ -1123,11 +1128,88 @@ def verify_target_pr(
         return f"replan issue {issue.canonical} is not in {repository}"
     if issue.number not in pr.linked_issue_numbers:
         return f"replacement PR {ref_canonical} is not linked to issue #{issue.number}"
+    # The replacement is the issue's implementation PR from here on, and the
+    # issue's implementation PR is identified by one durable claim everywhere
+    # (``claims.IMPLEMENTATION``): ANALYZE_EXECUTE adopts the open PR carrying
+    # it and refuses to persist one without it. A replacement without the
+    # marker would be activated here and then be invisible to the next entry
+    # after a lost state file, which launches a second implementation.
+    marked = scan(IMPLEMENTATION, pr.body or "")
+    if marked.defects:
+        return (
+            f"replacement PR {ref_canonical} carries an unreadable ai-implementation marker "
+            f"({'; '.join(marked.defects)})"
+        )
+    if not marked.claims:
+        return (
+            f"replacement PR {ref_canonical} does not carry the ai-implementation marker for "
+            f"issue #{issue.number}; without it no later entry could find it as the issue's PR"
+        )
+    if marked.claims[0].issue.identity != issue.identity:
+        return (
+            f"replacement PR {ref_canonical} carries the ai-implementation marker of "
+            f"{marked.claims[0].issue.canonical}, not of issue #{issue.number}"
+        )
     if require_checkpoint_head and not _same_sha(pr.head_sha, txn.replacement_head_sha):
         return (
             f"replacement PR {ref_canonical} advanced from the verified HEAD "
             f"{txn.replacement_head_sha} to {pr.head_sha}; it is no longer the implementation "
             "the controller verified"
+        )
+    return ""
+
+
+def verify_sole_implementation_claimant(
+    open_prs: list[PRInfo], target_url: str, txn: ReplanTransaction, repository: str
+) -> str:
+    """The replacement is the issue's *only* open implementation claimant, or why not.
+
+    :func:`verify_target_pr` proves the replacement's own body carries the
+    issue's ``ai-implementation`` marker; this proves nothing else does. The
+    marker is the identity every ``ANALYZE_EXECUTE`` entry and read-back
+    finds the issue's PR by, and both refuse two claimants rather than
+    choose (github-safety.md, "Before/After ANALYZE_EXECUTE"). A replan that
+    installed one of two would therefore activate a PR precisely where the
+    entry fails closed, and the run would carry toward merge a choice the
+    controller never makes. So the same strict open listing the entry reads
+    is asked the same question at every checkpoint of the transaction:
+    exactly one open PR carries the marker, and it is the replacement.
+
+    The source is left out of the question, claims and defects alike: it is
+    the PR the replan is closing, it legitimately carries the marker (the
+    read-back that accepted it required it to), and the question is what
+    the entry will find once it is gone. Before the close that is a
+    prediction; after it, the listing no longer holds the source anyway.
+    Every other open PR counts, whatever its branch, linkage or age: a
+    second marked PR is ambiguity and an unreadable marker anywhere is
+    inconclusive, exactly as at entry.
+
+    ``open_prs`` must be a *strict* listing (one that may be truncated is
+    refused by the client before it reaches here), because "nothing else
+    claims the issue" is not knowable from a partial set.
+    """
+    try:
+        issue = parse_issue_url(txn.issue_url)
+    except ConfigurationError as exc:
+        return f"replan transaction records no usable issue URL ({exc})"
+    if not issue.same_repository(repository):
+        return f"replan issue {issue.canonical} is not in {repository}"
+    others = [pr for pr in open_prs if not same_pr_url(pr.url, txn.source_pr_url)]
+    claimants = collect(IMPLEMENTATION, others, "open PR").claimants(
+        issue.identity, f"issue {issue.canonical}"
+    )
+    try:
+        holder = claimants.exactly_one()
+    except ClaimConflictError as exc:
+        return (
+            f"the replacement cannot be shown to be the one open PR implementing issue "
+            f"#{issue.number} (the superseded PR aside): {exc}; the next ANALYZE_EXECUTE "
+            "entry would refuse to choose, so the replan does not either"
+        )
+    if not same_pr_url(holder.obj.url, target_url):
+        return (
+            f"the open PR carrying the ai-implementation marker for issue #{issue.number} is "
+            f"{holder.obj.url}, not the replacement {target_url}"
         )
     return ""
 

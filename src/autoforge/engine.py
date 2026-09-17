@@ -74,15 +74,34 @@ from __future__ import annotations
 import json
 import re
 import secrets
-from collections.abc import Iterator
+from collections.abc import Callable, Hashable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import overload
 
 from . import __prompt_version__
+from .claims import (
+    FOLLOW_UP,
+    IMPLEMENTATION,
+    PROGRESS,
+    REVIEW,
+    Claimants,
+    Collection,
+    FollowUpClaim,
+    Holder,
+    ImplementationClaim,
+    ProgressClaim,
+    ReviewClaim,
+    collect,
+    render_follow_up_marker,
+    render_implementation_marker,
+    render_progress_marker,
+)
 from .config import DEFAULT_STATE_DIR, AutoForgeConfig, validate_required_profiles
 from .errors import (
+    ClaimConflictError,
     ConfigurationError,
     ControlResultError,
     ControlResultValidationError,
@@ -97,7 +116,14 @@ from .errors import (
     VerificationError,
 )
 from .executor import DEFAULT_MAX_OUTPUT_BYTES, ExecutionRequest, execute
-from .github import GitHubClient, IssueInfo, PRInfo, WorkflowRunJobs, build_merge_argv
+from .github import (
+    CommentInfo,
+    GitHubClient,
+    IssueInfo,
+    PRInfo,
+    WorkflowRunJobs,
+    build_merge_argv,
+)
 from .local_workspace import (
     FeatureSpec,
     LocalWorkspace,
@@ -150,6 +176,7 @@ from .replan_txn import (
     verify_closed_source,
     verify_decision_point,
     verify_run_binding,
+    verify_sole_implementation_claimant,
     verify_source_checkpoint,
     verify_target_marker,
     verify_target_pr,
@@ -198,6 +225,8 @@ from .transitions import (
     validate_transition,
 )
 from .validation import (
+    GitHubIssueRef,
+    GitHubPullRequestRef,
     parse_comment_url,
     parse_issue_url,
     parse_pr_url,
@@ -270,7 +299,27 @@ MERGE_STATE_HINTS = {
     "UNSTABLE": "a non-required check is failing",
 }
 
-_REVIEW_MARKER_RE = re.compile(r"<!--\s*ai-review-result:\s*(\{.*?\})\s*-->", re.DOTALL)
+# -- durable markers -------------------------------------------------------
+#
+# An agent's GitHub write is identified to the controller by a marker the
+# agent embeds in it. ``autoforge.claims`` owns the whole contract (exact
+# payload schemas, renderers, the scan, explicit cardinality); the engine
+# only decides what a :class:`ClaimConflictError` means where it is raised:
+# at a phase entry it is ``BLOCKED`` without launching an agent, on a
+# post-agent read-back it is a :class:`VerificationError`.
+
+
+def _follow_up_pairs(
+    grouped: dict[Hashable, tuple[Holder[IssueInfo, FollowUpClaim], ...]],
+) -> list[tuple[str, str]]:
+    """``(finding id, issue URL)`` for every holder, ordered by finding id then URL."""
+    return sorted((h.claim.finding_id, h.obj.url) for hs in grouped.values() for h in hs)
+
+
+def _finding_what(pr_ref: GitHubPullRequestRef, finding_id: str) -> str:
+    return f"finding {finding_id} of PR {pr_ref.canonical}"
+
+
 _REVIEW_HEADING_RE = re.compile(r"^#\s*AI Code Review\s*[—–-]+\s*Round\s+(\d+)\s*$", re.MULTILINE)
 
 
@@ -373,6 +422,33 @@ def local_state_paths(
     return StatePaths.from_state_dir(git_dir / "autoforge" / "state", anchor=git_dir)
 
 
+# What a REMOTE re-entry does before the phase's agent is launched again,
+# quoted in the error of an invocation interrupted after the agent returned.
+# Every REMOTE phase that launches an agent has an entry, because every one
+# of them reconciles with GitHub in :meth:`ControllerEngine._remote_entry`
+# before launching; the table is complete by construction (a test holds it
+# against ``PHASE_TEMPLATE``), so no phase is ever described as "relaunched".
+_REMOTE_REENTRY_RECONCILIATION: dict[Phase, str] = {
+    Phase.ANALYZE_EXECUTE: (
+        "adopts the open PR carrying the issue's implementation marker, if one exists, "
+        "instead of relaunching the agent"
+    ),
+    Phase.REVIEW: (
+        "hands a review comment already posted for this round at this HEAD to the "
+        "reviewer to adopt instead of posting a second one"
+    ),
+    Phase.FIX: (
+        "routes a HEAD already pushed past the reviewed one back to REVIEW instead of "
+        "relaunching the fixer"
+    ),
+    Phase.REPLAN_REEXECUTE: "replays the persisted replan transaction",
+    Phase.UPDATE_EPIC: (
+        "hands a progress comment already posted on the EPIC for this issue to the "
+        "agent to adopt instead of posting a second one"
+    ),
+}
+
+
 class ControllerEngine:
     def __init__(
         self,
@@ -409,6 +485,26 @@ class ControllerEngine:
         # ``AutoForgeState.local_pending_phase``); the prompt then tells the
         # agent that work from the earlier attempt may already be present.
         self._local_resumed_invocation = False
+        # The review comment the REVIEW entry probe found already posted for
+        # the upcoming round at the bound HEAD (see
+        # :meth:`_reconcile_review_entry`), handed to the reviewer as
+        # ``EXISTING_REVIEW_COMMENT_URL`` so it adopts it instead of posting a
+        # second one. Re-derived from GitHub on every REVIEW entry.
+        self._existing_review_comment_url = ""
+        # Likewise for the other phases whose agents write to GitHub: the EPIC
+        # progress comment the UPDATE_EPIC entry found already posted for the
+        # finished issue (``EXISTING_PROGRESS_COMMENT_URL``), and the open
+        # follow-up issues the FIX entry found already carrying a marker for
+        # one of the open findings (rendered into ``FOLLOW_UP_ISSUES``).
+        # Re-derived from GitHub on every entry, never persisted.
+        self._existing_progress_comment_url = ""
+        self._existing_follow_ups: dict[str, str] = {}
+        # The follow-up issues already open for this PR from earlier rounds,
+        # as (finding id, issue URL): found by the REVIEW and FIX entries and
+        # rendered into ``EXISTING_FOLLOW_UP_ISSUES``, so a problem a fixer
+        # already deferred is not raised, and deferred, a second time under a
+        # new finding id (PR #89 review F2, #90).
+        self._existing_pr_follow_ups: list[tuple[str, str]] = []
         self.state: AutoForgeState | None = None
         # Set by locked(): the controller lock held for a whole command.
         self._lock: ControllerLock | None = None
@@ -745,6 +841,38 @@ class ControllerEngine:
         return f"autoforge/{parse_issue_url(issue_url).number}"
 
     @staticmethod
+    def _format_follow_ups(pr_url: str, findings: list[dict], existing: dict[str, str]) -> str:
+        """Per open finding: its follow-up marker and the follow-up issue that exists.
+
+        Controller-rendered, not agent text: the finding ids passed the
+        parser's shape check (``R<n>-F<m>``), the marker is built by
+        :func:`render_follow_up_marker` and the URLs come from GitHub.
+        """
+        if not pr_url or not findings:
+            return "(none)"
+        lines = []
+        for f in findings:
+            fid = str(f.get("id"))
+            marker = render_follow_up_marker(pr_url, fid)
+            url = existing.get(fid, "(none)")
+            lines.append(
+                f"- {escape_inline(fid)}: marker `{marker}`; existing issue: {escape_inline(url)}"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_existing_follow_ups(pairs: list[tuple[str, str]]) -> str:
+        """The follow-up issues already open for this PR, one line per (finding, issue).
+
+        Controller-rendered: the finding ids come from markers that passed
+        the strict scan and the URLs from GitHub. An issue's title is
+        untrusted text and is not quoted; the agent reads the issue itself.
+        """
+        if not pairs:
+            return "(none)"
+        return "\n".join(f"- {escape_inline(fid)}: {escape_inline(url)}" for fid, url in pairs)
+
+    @staticmethod
     def _format_findings(findings: list[dict]) -> str:
         """The open findings as one untrusted block for a FIX prompt.
 
@@ -850,6 +978,24 @@ class ControllerEngine:
             "HEAD_SHA": s.current_head_sha or "(none)",
             "REVIEW_COMMENT_URL": s.last_review_comment_url or "(none)",
             "PREVIOUS_REVIEW_COMMENT_URL": s.last_review_comment_url or "(none)",
+            "EXISTING_REVIEW_COMMENT_URL": self._existing_review_comment_url or "(none)",
+            "EXISTING_PROGRESS_COMMENT_URL": self._existing_progress_comment_url or "(none)",
+            "PROGRESS_MARKER": (
+                render_progress_marker(s.current_issue_url, s.current_pr_url)
+                if s.current_issue_url and s.current_pr_url
+                else "(none)"
+            ),
+            "FOLLOW_UP_ISSUES": self._format_follow_ups(
+                s.current_pr_url, s.open_findings, self._existing_follow_ups
+            ),
+            "EXISTING_FOLLOW_UP_ISSUES": self._format_existing_follow_ups(
+                self._existing_pr_follow_ups
+            ),
+            "IMPLEMENTATION_MARKER": (
+                render_implementation_marker(s.current_issue_url)
+                if s.current_issue_url
+                else "(none)"
+            ),
             "REVIEWED_HEAD_SHA": (
                 s.current_head_sha if s.phase == Phase.REVIEW else s.reviewed_head_sha
             )
@@ -1382,23 +1528,16 @@ class ControllerEngine:
             return self._ready_for_merge_step(plan, allow_merge)
         if previous == Phase.MERGE:
             return self._merge_step(plan, allow_merge)
-        if previous == Phase.ANALYZE_EXECUTE:
-            recovered = self._try_recover_pr()
-            if recovered is not None:
-                return recovered
-        if previous == Phase.REVIEW:
-            self._bind_review_head()
-        if previous == Phase.FIX:
-            self._prepare_fix()
-        if previous == Phase.REPLAN_REEXECUTE:
-            # One reducer for the fresh step and for `resume`: it either
-            # resolves the transaction (activated or refused) or falls through
-            # to invoke the replacement agent.
-            driven = self._drive_replan()
-            if driven is not None:
-                return driven
+        resolved = self._remote_entry(previous, plan)
+        if resolved is not None:
+            return resolved
 
-        payload = self._invoke_phase(previous)
+        invoked = self._invoke_phase(previous, lambda: self._remote_entry(previous, plan))
+        if isinstance(invoked, StepOutcome):
+            # A correction relaunch was pre-empted by the entry reconciliation:
+            # the malformed attempt's GitHub work resolved the phase.
+            return invoked
+        payload = invoked
         status = payload.get("status")
         if status in ("failure", "blocked"):
             nxt = Phase.FAILED if status == "failure" else Phase.BLOCKED
@@ -1434,6 +1573,44 @@ class ControllerEngine:
         state.attempt = 0
         self._save()
         return self._outcome(previous, plan=plan, result=payload, message=message)
+
+    def _remote_entry(self, previous: Phase, plan: StepPlan) -> StepOutcome | None:
+        """Reconcile a REMOTE phase entry with GitHub before its agent is launched.
+
+        The controller cannot tell a first entry from a re-entry after an
+        interrupted invocation (timeout, non-zero exit, malformed result,
+        verification failure, refused run-log write, crash), and in every
+        one of those the agent may already have done the phase's GitHub
+        work. GitHub is the source of truth, so the entry reads it and either
+        resolves the phase without an agent (returning the outcome), hands
+        the existing write to the agent to adopt, or finds nothing and lets
+        the launch proceed (returning ``None``).
+
+        This runs before *every* launch of the phase's agent, not once per
+        step: :meth:`_step_once` calls it before the first launch and
+        :meth:`_invoke_phase` calls it again before each correction relaunch,
+        because a correction is a re-entry too -- the agent whose result was
+        malformed had every opportunity to post, push or create before it
+        returned, and the correction prompt is advice to the agent, not a
+        controller check. The probes are pure reads plus the persisted HEAD
+        binding; none consumes a review round, a ``review_history`` entry or
+        an attempt.
+        """
+        if previous == Phase.ANALYZE_EXECUTE:
+            return self._try_recover_pr()
+        if previous == Phase.REVIEW:
+            self._bind_review_head()
+            return self._reconcile_review_entry(plan)
+        if previous == Phase.FIX:
+            return self._prepare_fix(plan)
+        if previous == Phase.REPLAN_REEXECUTE:
+            # One reducer for the fresh step and for `resume`: it either
+            # resolves the transaction (activated or refused) or falls through
+            # to invoke the replacement agent.
+            return self._drive_replan()
+        if previous == Phase.UPDATE_EPIC:
+            return self._reconcile_update_epic_entry(plan)
+        return None
 
     # ======================================================================
     # LOCAL mode
@@ -1600,16 +1777,17 @@ class ControllerEngine:
         A refusal that lands earlier in ``_invoke_phase`` (the event journal,
         the profile, the prompt template) therefore charges nothing (#57).
 
-        Returns ``""`` after persisting the charge, so the launch may proceed,
-        or the reason it may not: the checkpoint has already spent
-        :data:`MAX_LOCAL_PHASE_ATTEMPTS`. The persisted count is what bounds
-        the phase entry, so it must be written *before* the agent starts --
-        a launch that was never charged is a launch a crash would let
-        ``resume`` repeat. The first launch of an entry opens the checkpoint
-        (phase, the fingerprint the entry was bound to, one attempt) in the
-        same write; a checkpoint is never persisted with zero launches. A
-        REMOTE run, or a read-only LOCAL phase, has no checkpoint to charge
-        and is never refused here.
+        Returns ``""`` after charging, so the launch may proceed, or the
+        reason it may not: the checkpoint has already spent
+        :data:`MAX_LOCAL_PHASE_ATTEMPTS`. The charge is persisted by the
+        caller's pre-launch save (:meth:`_invoke_phase`), together with the
+        attempt counter, in the one write that precedes the agent: the
+        persisted count is what bounds the phase entry, and a launch that was
+        never charged is a launch a crash would let ``resume`` repeat. The
+        first launch of an entry opens the checkpoint (phase, the fingerprint
+        the entry was bound to, one attempt) in that same write; a checkpoint
+        is never persisted with zero launches. A REMOTE run, or a read-only
+        LOCAL phase, has no checkpoint to charge and is never refused here.
         """
         state = self._require_state()
         if state.mode != WorkflowMode.LOCAL or phase not in LOCAL_WRITE_PHASES:
@@ -1634,7 +1812,6 @@ class ControllerEngine:
                 f"{MAX_LOCAL_PHASE_ATTEMPTS}; the next step enters BLOCKED"
             )
         state.local_pending_attempts += 1
-        self._save()
         return ""
 
     def _clear_local_invocation(self) -> None:
@@ -2114,6 +2291,18 @@ class ControllerEngine:
 
         Returns a StepOutcome when the phase was resolved without invoking the
         agent (recovered -> REVIEW, or ambiguous -> BLOCKED); None otherwise.
+
+        The issue's implementation PR is the open PR carrying the
+        ``ai-implementation`` marker for it (:func:`render_implementation_marker`),
+        found in a strict listing of the repository's open PRs: a listing the
+        client cannot prove complete blocks, because "no PR exists" is then
+        not knowable and launching an agent on that guess is how a second
+        implementation gets created. The marker is the identity
+        :meth:`_apply_analyze` requires of the PR the agent claims, so a PR
+        the read-back would accept is a PR every later entry finds, whatever
+        its branch is called and whether or not GitHub links it to the
+        issue. A PR the controller already persisted is a candidate as well,
+        marker or not: it is the controller's own verified record.
         """
         state = self._require_state()
         issue = parse_issue_url(state.current_issue_url)
@@ -2121,39 +2310,61 @@ class ControllerEngine:
         if state.current_pr_url:
             try:
                 pr = self.github.get_pr(state.current_pr_url)
+            except GitHubUnavailableError:
+                raise
             except GitHubError as exc:
-                state.phase = Phase.BLOCKED
-                state.block_reason = (
-                    f"state references PR {state.current_pr_url} but it cannot be read: {exc}"
+                return self._block(
+                    Phase.ANALYZE_EXECUTE,
+                    None,
+                    f"state references PR {state.current_pr_url} but it cannot be read: {exc}",
                 )
-                self._save()
-                return self._outcome(Phase.ANALYZE_EXECUTE, message=state.block_reason)
             if pr.is_open:
                 candidates[parse_pr_url(pr.url).canonical] = pr
-        for pr in self.github.find_open_prs_for_issue(issue):
-            candidates.setdefault(parse_pr_url(pr.url).canonical, pr)
+        try:
+            holder = self._implementation_prs(issue).at_most_one()
+        except GitHubUnavailableError:
+            raise
+        except GitHubError as exc:
+            return self._block(
+                Phase.ANALYZE_EXECUTE,
+                None,
+                f"cannot establish whether an open PR already implements issue "
+                f"#{issue.number}: {exc}. The controller will not launch an agent that "
+                "could create a second one",
+            )
+        except ClaimConflictError as exc:
+            return self._block(
+                Phase.ANALYZE_EXECUTE,
+                None,
+                f"{exc}. The controller will not launch an agent that could create a second "
+                "implementation and never guesses which PR is the issue's: close the stale "
+                "PR(s) or repair the unreadable marker, then resume",
+            )
+        if holder is not None:
+            candidates.setdefault(parse_pr_url(holder.obj.url).canonical, holder.obj)
         if not candidates:
             return None
         if len(candidates) > 1:
-            state.phase = Phase.BLOCKED
-            state.block_reason = (
-                "multiple open PRs appear to belong to issue "
-                f"#{issue.number}: {', '.join(sorted(candidates))}. "
-                "Close the stale ones and resume; the controller never guesses."
+            return self._block(
+                Phase.ANALYZE_EXECUTE,
+                None,
+                f"{len(candidates)} open PRs claim to implement issue #{issue.number}: "
+                f"{', '.join(sorted(candidates))}. Close the stale ones and resume; the "
+                "controller never guesses.",
             )
-            self._save()
-            return self._outcome(Phase.ANALYZE_EXECUTE, message=state.block_reason)
         url, pr = next(iter(candidates.items()))
         if parse_pr_url(url).repository.lower() != state.repository.lower():
-            state.phase = Phase.BLOCKED
-            state.block_reason = f"open PR {url} is not in repository {state.repository}"
-            self._save()
-            return self._outcome(Phase.ANALYZE_EXECUTE, message=state.block_reason)
+            return self._block(
+                Phase.ANALYZE_EXECUTE,
+                None,
+                f"open PR {url} is not in repository {state.repository}",
+            )
         if not pr.head_sha:
-            state.phase = Phase.BLOCKED
-            state.block_reason = f"open PR {url} has no readable head SHA; cannot recover"
-            self._save()
-            return self._outcome(Phase.ANALYZE_EXECUTE, message=state.block_reason)
+            return self._block(
+                Phase.ANALYZE_EXECUTE,
+                None,
+                f"open PR {url} has no readable head SHA; cannot recover",
+            )
         state.current_pr_url = url
         state.current_head_sha = pr.head_sha
         state.current_branch = pr.head_ref
@@ -2547,12 +2758,13 @@ class ControllerEngine:
         return ""
 
     def _head_drift_to_review(
-        self, phase: Phase, plan: StepPlan, pr: PRInfo, detail: str = ""
+        self, phase: Phase, plan: StepPlan, pr: PRInfo, detail: str = "", message: str = ""
     ) -> StepOutcome:
-        """The OPEN PR's HEAD is no longer the reviewed one: the clean review is stale.
+        """The OPEN PR's HEAD is no longer the reviewed one: the last review is stale.
 
-        Persists the new HEAD, marks the review stale and routes back to
-        REVIEW (``phase -> REVIEW``). Nothing has been merged or counted.
+        Persists the new HEAD, marks the review stale, drops its findings and
+        routes back to REVIEW (``phase -> REVIEW``). Nothing has been merged or
+        counted. ``message`` replaces the default merge-path wording.
         """
         state = self._require_state()
         state.current_head_sha = pr.head_sha
@@ -2565,7 +2777,8 @@ class ControllerEngine:
         return self._outcome(
             phase,
             plan=plan,
-            message=(
+            message=message
+            or (
                 f"PR HEAD moved after the clean review{detail}; {phase.value} -> REVIEW "
                 "(not merged)"
             ),
@@ -3044,13 +3257,259 @@ class ControllerEngine:
         state.current_branch = pr.head_ref or state.current_branch
         self._save()
 
-    def _prepare_fix(self) -> None:
+    def _reconcile_review_entry(self, plan: StepPlan) -> StepOutcome | None:
+        """Read the PR for this round's comment before the reviewer is launched.
+
+        A reviewer whose result was never recorded (timeout, non-zero exit,
+        refused run-log write, verification failure, crash) may already have
+        posted the round's comment. GitHub is the source of truth, so the
+        controller looks before relaunching: exactly one comment carrying the
+        ``ai-review-result`` marker for the upcoming round at the bound HEAD
+        is handed to the reviewer (``EXISTING_REVIEW_COMMENT_URL``) to adopt
+        rather than duplicate, and :meth:`_verify_review_comment` enforces
+        afterwards that the round still has exactly one. Two or more is a
+        state the controller cannot resolve without guessing which review is
+        the round's, so it blocks without invoking anyone. Comments for the
+        same round at another HEAD (an earlier run, a stale re-review) are not
+        this round's and are ignored.
+
+        The reviewer is also told which problems earlier rounds already
+        deferred: the open issues carrying this PR's ``ai-follow-up`` marker
+        for any finding id (``EXISTING_FOLLOW_UP_ISSUES``). Finding ids are
+        round-scoped, so a problem re-raised under a new id would otherwise
+        be deferred again into a second issue by the next fixer; the review
+        that knows about the first issue does not re-raise it (#90). The
+        listing is strict for the same reason the FIX entry's is: "no such
+        issue exists" is not knowable from a listing that may be truncated.
+        """
         state = self._require_state()
+        self._existing_review_comment_url = ""
+        self._existing_pr_follow_ups = []
+        upcoming = state.review_round + 1
+        head = state.current_head_sha.lower()
+        pr_ref = parse_pr_url(state.current_pr_url)
+        try:
+            holder = self._review_comments(pr_ref, upcoming, head).at_most_one()
+        except GitHubUnavailableError:
+            raise
+        except GitHubError as exc:
+            return self._block(
+                Phase.REVIEW,
+                plan,
+                f"cannot establish which comment carries the review for round {upcoming} at "
+                f"HEAD {head[:12]} of PR {pr_ref.canonical}: {exc}. The controller will not "
+                "launch a reviewer that could post a second review comment",
+            )
+        except ClaimConflictError as exc:
+            return self._block(
+                Phase.REVIEW,
+                plan,
+                f"{exc}. The controller never chooses between them: remove or edit the extra "
+                "or unreadable comment(s) so exactly one remains, then start a new run",
+            )
+        if holder is not None:
+            self._existing_review_comment_url = holder.obj.url
+        try:
+            deferred = self._follow_up_issues(pr_ref).grouped(
+                lambda c: True, f"PR {pr_ref.canonical}"
+            )
+        except GitHubUnavailableError:
+            raise
+        except (GitHubError, ClaimConflictError) as exc:
+            return self._block(
+                Phase.REVIEW,
+                plan,
+                f"cannot establish which follow-up issues already exist for PR "
+                f"{pr_ref.canonical}: {exc}. The controller will not launch a reviewer that "
+                "could re-raise a problem an earlier round already deferred",
+            )
+        self._existing_pr_follow_ups = _follow_up_pairs(deferred)
+        return None
+
+    def _prepare_fix(self, plan: StepPlan) -> StepOutcome | None:
+        """Re-read the PR before the fixer runs; an unreviewed push goes back to REVIEW.
+
+        FIX resolves the findings of one review, and those findings are bound
+        to the HEAD that review saw. A PR HEAD past it before the fixer is
+        launched is a push the controller never verified: an earlier fixer
+        whose result was not recorded (timeout, non-zero exit, refused run-log
+        write, verification failure, crash) or an operator. Which findings
+        that push resolved, if any, is not knowable from controller state and
+        is never inferred, so the rule for every other HEAD drift applies
+        here too: the review is stale and the actual HEAD is reviewed
+        (``FIX -> REVIEW``) instead of a fixer being launched against findings
+        of a commit that is no longer the PR. The cost is one review round;
+        the review of the actual HEAD is what says what remains.
+
+        A push is not the only write a fixer makes: a ``follow_up_created``
+        resolution creates an issue and moves no HEAD. So with the HEAD
+        still the reviewed one, the open issues of the repository are read
+        for the ``ai-follow-up`` marker of (this PR, an open finding id):
+        exactly one per finding is handed to the fixer (``FOLLOW_UP_ISSUES``)
+        to report instead of creating a second, two or more for one finding
+        is a state the controller cannot resolve without choosing and blocks
+        without launching anyone, and a listing that cannot be proven
+        complete blocks too, because "no such issue exists" is then not
+        knowable. :meth:`_apply_fix` enforces the same one-per-finding rule
+        on read-back.
+        """
+        state = self._require_state()
+        self._existing_follow_ups = {}
+        self._existing_pr_follow_ups = []
         if not state.open_findings:
             raise StateError("FIX phase entered without open findings in state")
         pr = self._require_open_pr()
+        reviewed = state.reviewed_head_sha.lower()
+        if pr.head_sha.lower() != reviewed:
+            state.last_fix_resolutions = []
+            return self._head_drift_to_review(
+                Phase.FIX,
+                plan,
+                pr,
+                message=(
+                    f"PR HEAD {pr.head_sha[:12]} is past the reviewed HEAD {reviewed[:12]} "
+                    f"that the open findings of round {state.review_round} are bound to "
+                    "(an unrecorded fix or an operator push; the controller does not infer "
+                    "which findings it resolved); FIX -> REVIEW of the actual HEAD, no fixer "
+                    "launched"
+                ),
+            )
+        pr_ref = parse_pr_url(state.current_pr_url)
+        open_ids = [str(f["id"]) for f in state.open_findings]
+        try:
+            # One listing serves both: the open findings' own follow-ups
+            # (checked below) and the earlier rounds' deferrals, handed to
+            # the fixer so a re-raised problem is recorded on the issue that
+            # already exists instead of in a second one (#90).
+            follow_ups = self._follow_up_issues(pr_ref)
+            for fid in open_ids:
+                holder = follow_ups.claimants(
+                    (pr_ref.identity, fid), _finding_what(pr_ref, fid)
+                ).at_most_one()
+                if holder is not None:
+                    self._existing_follow_ups[fid] = holder.obj.url
+            deferred = follow_ups.grouped(
+                lambda c: c.finding_id not in open_ids, f"PR {pr_ref.canonical}"
+            )
+        except GitHubUnavailableError:
+            raise
+        except GitHubError as exc:
+            return self._block(
+                Phase.FIX,
+                plan,
+                f"cannot establish which follow-up issues already exist for the open "
+                f"findings of PR {pr_ref.canonical}: {exc}. The controller will not launch a "
+                "fixer that could create a second one",
+            )
+        except ClaimConflictError as exc:
+            return self._block(
+                Phase.FIX,
+                plan,
+                f"{exc}. The controller never chooses between them: close or repair the "
+                "extra or unreadable issue(s) so exactly one remains, then start a new run",
+            )
+        self._existing_pr_follow_ups = _follow_up_pairs(deferred)
         state.current_head_sha = pr.head_sha
         self._save()
+        return None
+
+    # -- durable-claim reads --------------------------------------------------
+    #
+    # One read per marker kind, shared by the phase entry and the post-agent
+    # read-back, so both consume the same validated identity model. Listings
+    # are strict: a set the client cannot prove complete, or a row it cannot
+    # decode as the object asked for, raises GitHubError. A defective marker
+    # anywhere in the set raises ClaimConflictError when a cardinality
+    # question is asked (``autoforge.claims``). Every consumer applies one
+    # rule to what it gets: GitHubUnavailableError is transient and
+    # propagates; a conclusive GitHubError or a ClaimConflictError blocks an
+    # entry without launching and rejects a read-back (VerificationError).
+
+    def _follow_up_issues(
+        self, pr_ref: GitHubPullRequestRef
+    ) -> Collection[IssueInfo, FollowUpClaim]:
+        """Every follow-up claim naming ``pr_ref`` across the repository's open issues.
+
+        Claims for another PR are not this PR's business and are dropped; a
+        defect on any open issue still counts, whatever PR it names, because
+        the object carrying it was not readable.
+        """
+        state = self._require_state()
+        issues = self.github.list_open_issues(state.repository, strict=True)
+        whole = collect(FOLLOW_UP, issues, "open issue")
+        mine = tuple(h for h in whole.holders if h.claim.pr.identity == pr_ref.identity)
+        return Collection(whole.kind, whole.noun, mine, whole.defects)
+
+    def _implementation_prs(self, issue: GitHubIssueRef) -> Claimants[PRInfo, ImplementationClaim]:
+        """The open PRs claiming to implement ``issue``, from one strict listing."""
+        state = self._require_state()
+        prs = self.github.list_open_prs(state.repository, strict=True)
+        return collect(IMPLEMENTATION, prs, "open PR").claimants(
+            issue.identity, f"issue {issue.canonical}"
+        )
+
+    def _review_comments(
+        self, pr_ref: GitHubPullRequestRef, round_: int, head: str
+    ) -> Claimants[CommentInfo, ReviewClaim]:
+        """The PR's comments claiming review ``round_`` at ``head``."""
+        comments = self.github.get_pr_comments(pr_ref.canonical)
+        return collect(REVIEW, comments, "comment").claimants(
+            (round_, head.lower()),
+            f"round {round_} at HEAD {head[:12]} of PR {pr_ref.canonical}",
+        )
+
+    def _progress_comments(self) -> Claimants[CommentInfo, ProgressClaim]:
+        """The EPIC comments claiming this entry's (finished issue, merged PR)."""
+        state = self._require_state()
+        if not state.current_pr_url:
+            raise StateError("UPDATE_EPIC entered without the merged PR in state")
+        issue = parse_issue_url(state.current_issue_url)
+        pr = parse_pr_url(state.current_pr_url)
+        comments = self.github.get_issue_comments(state.epic_url)
+        return collect(PROGRESS, comments, "comment").claimants(
+            (issue.identity, pr.identity),
+            f"issue {issue.canonical} (PR {pr.canonical}) on EPIC {state.epic_url}",
+        )
+
+    def _reconcile_update_epic_entry(self, plan: StepPlan) -> StepOutcome | None:
+        """Read the EPIC for this issue's progress comment before the agent runs.
+
+        UPDATE_EPIC's writes are a progress comment on the EPIC and its task
+        list edits; the comment is the one with an identity, and it carries
+        the ``ai-epic-progress`` marker of (finished issue, merged PR). An
+        agent whose result was never recorded may already have posted it, and
+        so may the agent of a rejected selection that is being asked again.
+        Exactly one such comment is handed to the agent
+        (``EXISTING_PROGRESS_COMMENT_URL``) to adopt rather than duplicate;
+        two or more block without launching anyone; :meth:`_apply_update_epic`
+        enforces afterwards that the EPIC carries exactly one. The task list
+        edits are idempotent by nature (a checked box stays checked) and are
+        not read back; their confinement is #4 and #13.
+        """
+        state = self._require_state()
+        self._existing_progress_comment_url = ""
+        try:
+            holder = self._progress_comments().at_most_one()
+        except GitHubUnavailableError:
+            raise
+        except GitHubError as exc:
+            return self._block(
+                Phase.UPDATE_EPIC,
+                plan,
+                f"cannot establish which comment on EPIC {state.epic_url} is the progress "
+                f"comment for issue {state.current_issue_url}: {exc}. The controller will "
+                "not launch an agent that could post a second one",
+            )
+        except ClaimConflictError as exc:
+            return self._block(
+                Phase.UPDATE_EPIC,
+                plan,
+                f"{exc}. The controller never chooses between them: remove or repair the "
+                "extra or unreadable comment(s) so exactly one remains, then start a new run",
+            )
+        if holder is not None:
+            self._existing_progress_comment_url = holder.obj.url
+        return None
 
     # ======================================================================
     # REPLAN_REEXECUTE
@@ -3414,9 +3873,15 @@ class ControllerEngine:
                 f"transaction {txn.transaction_id} is {canonical}",
                 claimed_url,
             )
-        drift = verify_target_pr(
-            pr, txn, state.repository, require_checkpoint_head=False
-        ) or verify_attestation(attestation, txn)
+        drift = (
+            verify_target_pr(pr, txn, state.repository, require_checkpoint_head=False)
+            or verify_attestation(attestation, txn)
+            # The same snapshot that bound the candidate answers whether it
+            # is the issue's one open implementation claimant, the source
+            # aside: one of two is a PR the next ANALYZE_EXECUTE entry would
+            # refuse to choose between, so the replan does not choose either.
+            or verify_sole_implementation_claimant(open_prs, canonical, txn, state.repository)
+        )
         if drift:
             return self._reject_replan(txn, drift, canonical)
         txn.replacement_pr_url = canonical
@@ -3429,6 +3894,28 @@ class ControllerEngine:
         # here a crash resumes into disposition, never into a second agent run.
         self._save_replan_txn(txn)
         return None
+
+    def _target_drift(self, target: PRInfo, open_prs: list[PRInfo], txn: ReplanTransaction) -> str:
+        """Why the checkpointed replacement can no longer be acted on, or ``""``.
+
+        The one rule for every read after binding: the final read before the
+        close, the confirmation after it, and the activation. Objective facts
+        at the checkpointed HEAD (:func:`verify_target_pr`), the transaction
+        marker that proves provenance (:func:`verify_target_marker`), and the
+        strict open listing that proves the replacement is the issue's one
+        implementation claimant, the source aside
+        (:func:`verify_sole_implementation_claimant`). Binding applies the
+        same three rules on its own snapshot, with the HEAD becoming the
+        checkpoint rather than being compared to it.
+        """
+        repository = self._require_state().repository
+        return (
+            verify_target_pr(target, txn, repository, require_checkpoint_head=True)
+            or verify_target_marker(target, txn)
+            or verify_sole_implementation_claimant(
+                open_prs, txn.replacement_pr_url, txn, repository
+            )
+        )
 
     def _supersede_source(self, txn: ReplanTransaction) -> StepOutcome:
         """Close the source PR under a compensated two-sided swap, then activate.
@@ -3532,6 +4019,7 @@ class ControllerEngine:
         # earlier attempt at it was ever recorded. Revalidate both sides now.
         try:
             target = self.github.get_pr(txn.replacement_pr_url)
+            open_prs = self.github.list_open_prs(state.repository, strict=True)
         except GitHubUnavailableError:
             raise
         except GitHubError as exc:
@@ -3540,9 +4028,7 @@ class ControllerEngine:
                 f"replacement PR {txn.replacement_pr_url} could not be re-read: {exc}",
                 txn.replacement_pr_url,
             )
-        drift = verify_target_pr(
-            target, txn, state.repository, require_checkpoint_head=True
-        ) or verify_target_marker(target, txn)
+        drift = self._target_drift(target, open_prs, txn)
         if drift:
             return self._reject_replan(txn, drift, txn.replacement_pr_url)
         drift = verify_source_checkpoint(source, txn)
@@ -3652,6 +4138,7 @@ class ControllerEngine:
         if not drift:
             try:
                 target = self.github.get_pr(txn.replacement_pr_url)
+                open_prs = self.github.list_open_prs(state.repository, strict=True)
             except GitHubUnavailableError:
                 raise
             except GitHubError as exc:
@@ -3660,9 +4147,7 @@ class ControllerEngine:
                     f"close ({exc}), so the replacement cannot be confirmed"
                 )
             else:
-                drift = verify_target_pr(
-                    target, txn, state.repository, require_checkpoint_head=True
-                ) or verify_target_marker(target, txn)
+                drift = self._target_drift(target, open_prs, txn)
         if not drift:
             return self._record_supersede(txn)
         return self._compensate_close(txn, drift)
@@ -3803,6 +4288,7 @@ class ControllerEngine:
         try:
             source = self.github.get_pr(txn.source_pr_url)
             target = self.github.get_pr(txn.replacement_pr_url)
+            open_prs = self.github.list_open_prs(state.repository, strict=True)
         except GitHubUnavailableError:
             raise  # unknown, not refused: `resume` re-reads and re-verifies
         except GitHubError as exc:
@@ -3812,11 +4298,7 @@ class ControllerEngine:
                 f"before activating the replacement ({exc})",
                 txn.replacement_pr_url,
             )
-        drift = (
-            verify_closed_source(source, txn)
-            or verify_target_pr(target, txn, state.repository, require_checkpoint_head=True)
-            or verify_target_marker(target, txn)
-        )
+        drift = verify_closed_source(source, txn) or self._target_drift(target, open_prs, txn)
         if drift:
             return self._reject_replan(
                 txn,
@@ -3900,7 +4382,28 @@ class ControllerEngine:
             return self._replan_log_metadata()
         return {}
 
-    def _invoke_phase(self, phase: Phase) -> dict:
+    @overload
+    def _invoke_phase(self, phase: Phase) -> dict: ...
+
+    @overload
+    def _invoke_phase(
+        self, phase: Phase, reconcile: Callable[[], StepOutcome | None]
+    ) -> dict | StepOutcome: ...
+
+    def _invoke_phase(
+        self, phase: Phase, reconcile: Callable[[], StepOutcome | None] | None = None
+    ) -> dict | StepOutcome:
+        """Launch the phase's agent, correcting a malformed result within bound.
+
+        ``reconcile`` is the phase-entry reconciliation (:meth:`_remote_entry`)
+        and is called before every correction relaunch: the agent that
+        returned the malformed result may already have done the phase's
+        GitHub work, and the relaunch must see it exactly as ``resume``
+        would. An outcome from it resolves the phase without relaunching and
+        is returned in place of a payload. A LOCAL run passes none: its
+        write phases are judged against the durable launch checkpoint and
+        its review verification refuses a tree the reviewer changed.
+        """
         state = self._require_state()
         profile = profile_for_phase(self.config, phase, state.review_round)
         provider = self.providers.get(profile)
@@ -3923,6 +4426,13 @@ class ControllerEngine:
         correction_error: str | None = None
         attempt = 0
         while True:
+            if correction_error is not None and reconcile is not None:
+                # The malformed attempt is a launch that returned; whatever it
+                # wrote to GitHub is reconciled before anything is launched
+                # again, and the prompt below is rendered from that.
+                resolved = reconcile()
+                if resolved is not None:
+                    return resolved
             prompt = self.render_prompt_for(phase, correction_error)
             # The launch is charged to the durable LOCAL bound here, after
             # every step that can refuse without launching and immediately
@@ -3937,6 +4447,13 @@ class ControllerEngine:
                 )
             attempt += 1
             state.attempt += 1
+            # The one write before the agent starts, in both modes: the
+            # attempt counter and, for a LOCAL write phase, the checkpoint
+            # charged just above land together. A crash while the agent runs,
+            # or a refused run-log write after it returned, therefore never
+            # leaves controller state claiming the phase was not yet
+            # attempted (#55, PR #89).
+            self._save()
             req = AgentRequest(
                 phase=phase.value,
                 prompt=prompt,
@@ -3970,8 +4487,7 @@ class ControllerEngine:
                 result = provider.execute(req)
             except ExecutionError as exc:
                 record.error = f"{type(exc).__name__}: {exc}"
-                logger.log_execution(record, prompt, "", "")
-                self._save()
+                self._record_invocation(logger, record, prompt, "", "", phase)
                 raise
             record.started_at = result.started_at
             record.finished_at = result.finished_at
@@ -3982,16 +4498,14 @@ class ControllerEngine:
             stdout, stderr = result.stdout or "", result.stderr or ""
             if result.timed_out:
                 record.error = f"timed out after {timeout}s"
-                logger.log_execution(record, prompt, stdout, stderr)
-                self._save()
+                self._record_invocation(logger, record, prompt, stdout, stderr, phase)
                 raise ExecutionTimeoutError(
                     f"agent '{profile.name}' timed out after {timeout}s and was killed. "
                     "State unchanged — inspect the real Git/GitHub state, then 'resume'."
                 )
             if result.exit_code != 0:
                 record.error = f"exit {result.exit_code}"
-                logger.log_execution(record, prompt, stdout, stderr)
-                self._save()
+                self._record_invocation(logger, record, prompt, stdout, stderr, phase)
                 raise ExecutionError(
                     f"agent '{profile.name}' exited {result.exit_code}. "
                     f"stderr tail: {stderr[-2000:]} "
@@ -4011,8 +4525,7 @@ class ControllerEngine:
                         "and end it with the CONTROL_RESULT block)"
                     )
                 record.error = f"{type(exc).__name__}: {detail}"
-                logger.log_execution(record, prompt, stdout, stderr)
-                self._save()
+                self._record_invocation(logger, record, prompt, stdout, stderr, phase)
                 if attempt <= max_corrections:
                     # A correction re-launches the same write-capable agent;
                     # the top of the loop charges it against the same durable
@@ -4024,8 +4537,60 @@ class ControllerEngine:
                     f"{attempt} attempt(s): {detail}"
                 ) from exc
             record.parsed_result = payload
-            logger.log_execution(record, prompt, stdout, stderr)
+            self._record_invocation(logger, record, prompt, stdout, stderr, phase)
             return payload
+
+    def _record_invocation(
+        self,
+        logger: RunLogger,
+        record: ExecutionRecord,
+        prompt: str,
+        stdout: str,
+        stderr: str,
+        phase: Phase,
+    ) -> None:
+        """Publish the invocation's artifacts and journal line, or refuse loudly.
+
+        The one exit for every outcome of a launch (provider error, timeout,
+        non-zero exit, malformed result, accepted result). The launch itself
+        was persisted before the agent started, so a refusal here (a journal
+        an agent enlarged past its budget, #55; a run directory it filled; an
+        I/O failure) loses no controller state; what it does mean is that the
+        run log can no longer record what agents do, so the phase is left
+        unchanged and nothing is launched again -- not even a correction --
+        until the operator repairs it. The refusal names the invocation's own
+        outcome, so the failure that was being recorded is not masked by the
+        failure to record it, and says what ``resume`` will do, which differs
+        by mode: a LOCAL launch was checkpointed and is retried against that
+        checkpoint; a REMOTE re-entry first reconciles with GitHub, where the
+        agent's side effects may already be.
+        """
+        state = self._require_state()
+        try:
+            logger.log_execution(record, prompt, stdout, stderr)
+        except StateError as exc:
+            # Re-raised as the same object: its type is the filesystem cause
+            # (an oversized journal, an unsafe path) and callers distinguish
+            # on it. Only the message grows.
+            outcome = record.error or "a CONTROL_RESULT the controller accepted"
+            if state.mode == WorkflowMode.LOCAL:
+                follow_up = (
+                    "Its launch was checkpointed before it started, so once the log "
+                    f"directory is repaired 'resume' re-enters {phase.value} as a retry "
+                    "judged against that checkpoint"
+                )
+            else:
+                reentry = _REMOTE_REENTRY_RECONCILIATION[phase]
+                follow_up = (
+                    "Its GitHub side effects (a comment, a push, a PR) may exist while the "
+                    "controller state does not record them. Repair the log directory, then "
+                    f"'resume': it re-enters {phase.value} and {reentry}"
+                )
+            exc.args = (
+                f"{exc}. This refusal interrupted attempt {record.attempt} of {phase.value} "
+                f"after the agent had returned with: {outcome}. {follow_up}.",
+            )
+            raise
 
     # -- verification + state application -------------------------------------------
     def _verify_and_apply(self, phase: Phase, payload: dict) -> tuple[Phase, str]:
@@ -4054,12 +4619,30 @@ class ControllerEngine:
             raise VerificationError(
                 f"agent reported PR {pr_ref.canonical} outside repository {state.repository}"
             )
+        # The identity the next entry will look for, read the way the entry
+        # reads it: one strict listing of the open PRs, in which exactly one
+        # carries this issue's implementation marker, and it is the PR the
+        # agent reported. Accepting a PR without the marker would persist a
+        # PR no re-entry after a lost state file could find again; accepting
+        # one of two would choose, and the entry never chooses. The reported
+        # PR's state, HEAD and branch are read from the same snapshot.
+        marker = render_implementation_marker(state.current_issue_url)
         try:
-            pr = self.github.get_pr(pr_ref.canonical)
-        except GitHubError as exc:
+            holder = self._implementation_prs(issue).exactly_one()
+        except GitHubUnavailableError:
+            raise
+        except (GitHubError, ClaimConflictError) as exc:
             raise VerificationError(
-                f"agent reported PR {pr_ref.canonical} but GitHub cannot resolve it: {exc}"
+                f"cannot accept PR {pr_ref.canonical} as the implementation of issue "
+                f"#{issue.number}: {exc}; the marker {marker!r} identifies the issue's one "
+                "open PR"
             ) from exc
+        pr = holder.obj
+        if not parse_pr_url(pr.url).same_target(pr_ref):
+            raise VerificationError(
+                f"agent reported PR {pr_ref.canonical} but the open PR carrying the "
+                f"implementation marker {marker!r} is {pr.url}"
+            )
         if not pr.is_open:
             raise VerificationError(f"PR {pr_ref.canonical} is {pr.state}, expected OPEN")
         if pr.head_sha != res.head_sha:
@@ -4097,44 +4680,47 @@ class ControllerEngine:
             raise VerificationError(
                 f"review comment {res.review_comment_url} does not belong to PR {pr_ref.canonical}"
             )
-        comments = self.github.get_pr_comments(pr_ref.canonical)
-        match = None
-        for c in comments:
-            if c.id == cref.comment_id or (c.url and c.url == res.review_comment_url):
-                match = c
-                break
-        if match is None:
+        # The same read the entry made: exactly one comment on the PR claims
+        # this round at this HEAD, and it is the comment the result names.
+        # A second one, whoever posted it, leaves the round's review
+        # ambiguous and the next REVIEW entry would block on it rather than
+        # choose; a comment whose marker is unreadable is refused for the
+        # same reason it would be refused at entry.
+        try:
+            holder = self._review_comments(pr_ref, res.round, expected_head).exactly_one()
+        except GitHubUnavailableError:
+            raise
+        except (GitHubError, ClaimConflictError) as exc:
             raise VerificationError(
-                f"review comment {res.review_comment_url} was not found on PR {pr_ref.canonical}"
+                f"{exc}; a round has exactly one review comment at its HEAD"
+            ) from exc
+        if not parse_comment_url(holder.obj.url).same_target(cref):
+            raise VerificationError(
+                f"review comment {res.review_comment_url} is not the comment carrying the "
+                f"round {res.round} marker at HEAD {expected_head[:12]} (that is {holder.obj.url})"
             )
-        body = match.body or ""
-        heading = _REVIEW_HEADING_RE.search(body)
+        heading = _REVIEW_HEADING_RE.search(holder.obj.body or "")
         if heading is None or int(heading.group(1)) != res.round:
             raise VerificationError(
                 f"review comment lacks the '# AI Code Review — Round {res.round}' heading"
             )
-        marker = _REVIEW_MARKER_RE.search(body)
-        if marker is None:
-            raise VerificationError("review comment lacks the '<!-- ai-review-result -->' marker")
-        try:
-            data = json.loads(marker.group(1))
-        except json.JSONDecodeError as exc:
-            raise VerificationError(f"review comment marker is not valid JSON: {exc}") from exc
-        if not isinstance(data, dict) or data.get("round") != res.round:
-            got = data.get("round") if isinstance(data, dict) else data
-            raise VerificationError(
-                f"review comment marker round {got!r} != expected round {res.round}"
-            )
-        marker_sha = str(data.get("reviewed_head_sha", "")).lower()
-        if marker_sha != expected_head:
-            raise VerificationError(
-                f"review comment marker reviewed_head_sha {marker_sha!r} "
-                f"!= bound HEAD {expected_head}"
-            )
-        if "needs_fix_round" in data and data["needs_fix_round"] != res.needs_fix_round:
+        if holder.claim.needs_fix_round != res.needs_fix_round:
             raise VerificationError(
                 "review comment marker needs_fix_round disagrees with CONTROL_RESULT"
             )
+        # The marker's finding ids are the durable copy of the round's
+        # findings; when published they must be the findings being
+        # persisted, as a set (order is presentation, and both sides are
+        # distinct by construction). Both lists hold validated ids, so
+        # quoting them is safe.
+        if holder.claim.finding_ids is not None:
+            marked = sorted(holder.claim.finding_ids)
+            reported = sorted(f.id for f in res.findings)
+            if marked != reported:
+                raise VerificationError(
+                    f"review comment marker finding_ids {marked} disagree with the "
+                    f"CONTROL_RESULT findings {reported}"
+                )
 
     def _apply_review(self, res: ReviewResult) -> tuple[Phase, str]:
         state = self._require_state()
@@ -4314,28 +4900,62 @@ class ControllerEngine:
                 f"FIX resolutions must cover exactly the open findings; missing={missing} "
                 f"unknown={extra}"
             )
+        pr_ref = parse_pr_url(state.current_pr_url)
+        pr_url = pr_ref.canonical
+        # The same read the entry made: the open issues carrying this PR's
+        # follow-up marker, per finding. A follow-up the result claims must
+        # be the one marked open issue of its finding, and a finding resolved
+        # any other way must have none: the marked issue is the durable
+        # record of the decision, and state never records a different one.
+        follow_ups = self._follow_up_issues(pr_ref)
         for r in res.resolutions:
-            if r.resolution == "follow_up_created":
-                ref = parse_issue_url(r.follow_up_issue_url)
-                if ref.repository.lower() != state.repository.lower():
+            try:
+                marked = follow_ups.claimants(
+                    (pr_ref.identity, r.finding_id), _finding_what(pr_ref, r.finding_id)
+                ).at_most_one()
+            except ClaimConflictError as exc:
+                raise VerificationError(
+                    f"{exc}; a finding has at most one follow-up issue"
+                ) from exc
+            if r.resolution != "follow_up_created":
+                if marked is not None:
                     raise VerificationError(
-                        f"follow-up issue {ref.canonical} for {r.finding_id} is outside "
-                        f"{state.repository}"
+                        f"{r.finding_id} is resolved as {r.resolution} but open issue "
+                        f"{marked.obj.url} carries its follow-up marker"
                     )
-                if same_issue_url(ref.canonical, state.current_issue_url):
-                    raise VerificationError(
-                        f"follow-up for {r.finding_id} points at the current issue itself"
+                continue
+            ref = parse_issue_url(r.follow_up_issue_url)
+            if ref.repository.lower() != state.repository.lower():
+                raise VerificationError(
+                    f"follow-up issue {ref.canonical} for {r.finding_id} is outside "
+                    f"{state.repository}"
+                )
+            if same_issue_url(ref.canonical, state.current_issue_url):
+                raise VerificationError(
+                    f"follow-up for {r.finding_id} points at the current issue itself"
+                )
+            try:
+                issue = self.github.get_issue(ref.canonical)
+            except GitHubUnavailableError:
+                raise
+            except GitHubError as exc:
+                raise VerificationError(
+                    f"follow-up issue {ref.canonical} for {r.finding_id} does not exist: {exc}"
+                ) from exc
+            if not issue.is_open:
+                raise VerificationError(
+                    f"follow-up issue {ref.canonical} for {r.finding_id} is {issue.state}"
+                )
+            if marked is None or not same_issue_url(marked.obj.url, ref.canonical):
+                raise VerificationError(
+                    f"follow-up issue {ref.canonical} for {r.finding_id} is not the open issue "
+                    f"carrying the marker {render_follow_up_marker(pr_url, r.finding_id)!r}"
+                    + (
+                        f" (that is {marked.obj.url})"
+                        if marked is not None
+                        else " (no open issue does)"
                     )
-                try:
-                    issue = self.github.get_issue(ref.canonical)
-                except GitHubError as exc:
-                    raise VerificationError(
-                        f"follow-up issue {ref.canonical} for {r.finding_id} does not exist: {exc}"
-                    ) from exc
-                if not issue.is_open:
-                    raise VerificationError(
-                        f"follow-up issue {ref.canonical} for {r.finding_id} is {issue.state}"
-                    )
+                )
         pr = self._require_open_pr()
         if pr.head_sha != res.new_head_sha:
             raise VerificationError(
@@ -4490,6 +5110,26 @@ class ControllerEngine:
             f"{n}/{MAX_NEXT_ISSUE_SELECTIONS}) — 'resume' to let the agent select again."
         ) from cause
 
+    def _verify_progress_comment(self) -> None:
+        """The EPIC carries exactly one progress comment for this entry.
+
+        Read back, never inferred from the result: a missing comment means
+        the agent did not do the phase's write (the next entry finds nothing
+        and relaunches), a second one means it duplicated the one it was
+        handed (the next entry blocks on the pair).
+        """
+        state = self._require_state()
+        try:
+            self._progress_comments().exactly_one()
+        except GitHubUnavailableError:
+            raise
+        except (GitHubError, ClaimConflictError) as exc:
+            raise VerificationError(
+                f"{exc}; the marker "
+                f"{render_progress_marker(state.current_issue_url, state.current_pr_url)!r} "
+                "identifies the issue's one progress comment on the EPIC"
+            ) from exc
+
     def _apply_update_epic(self, res: UpdateEpicResult) -> tuple[Phase, str]:
         """Switch issues only after the agent's selection verified on GitHub.
 
@@ -4506,11 +5146,14 @@ class ControllerEngine:
           asks the agent once more (with the reason in its prompt); reaching
           ``MAX_NEXT_ISSUE_SELECTIONS`` rejections returns BLOCKED;
         - any other GitHubError (authentication, permissions, malformed data)
-          is conclusive: asking the agent again would repeat UPDATE_EPIC's
-          GitHub writes while the controller still could not verify anything,
-          so the run is BLOCKED immediately without another invocation.
+          is conclusive: asking the agent again could not verify anything
+          either, so the run is BLOCKED immediately without another invocation.
+
+        Before any of that, the progress comment the phase exists to post is
+        read back from the EPIC (:meth:`_verify_progress_comment`).
         """
         state = self._require_state()
+        self._verify_progress_comment()
         if res.next_issue_url is None:
             state.record_epic_update()
             state.next_issue_rejections = []

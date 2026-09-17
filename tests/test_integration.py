@@ -18,7 +18,9 @@ from tests.conftest import (
     FakeGitHub,
     block,
     comment_url,
+    implementation_pr_body,
     make_engine,
+    post_progress_comment,
     review_comment_body,
 )
 
@@ -30,7 +32,7 @@ def test_full_loop_to_ready_for_merge(tmp_state_dir):
     def agent(req):
         phases_seen.append((req.phase, req.profile.model, req.profile.effort))
         if req.phase == "ANALYZE_EXECUTE":
-            gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2])
+            gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
             return block(
                 {
                     "phase": "ANALYZE_EXECUTE",
@@ -124,7 +126,7 @@ def test_run_loops_until_ready_for_merge(tmp_state_dir):
 
     def agent(req):
         if req.phase == "ANALYZE_EXECUTE":
-            gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2])
+            gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
             return block(
                 {
                     "phase": "ANALYZE_EXECUTE",
@@ -168,7 +170,7 @@ def test_gate_open_loop_merges_via_controller_then_update_epic_to_done(tmp_state
     def agent(req):
         phases_seen.append(req.phase)
         if req.phase == "ANALYZE_EXECUTE":
-            gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2])
+            gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
             return block(
                 {
                     "phase": "ANALYZE_EXECUTE",
@@ -195,6 +197,7 @@ def test_gate_open_loop_merges_via_controller_then_update_epic_to_done(tmp_state
         if req.phase == "UPDATE_EPIC":
             assert "Never merge a pull request" in req.prompt
             assert "gh pr merge" not in req.prompt.replace("no `gh pr merge`", "")
+            post_progress_comment(gh)
             return block({"phase": "UPDATE_EPIC", "status": "success", "next_issue_url": None})
         raise AssertionError(f"unexpected call {req.phase}")
 
@@ -235,7 +238,7 @@ def test_runaway_review_fix_loop_is_bounded(tmp_state_dir):
     def agent(req):
         phases_seen.append(req.phase)
         if req.phase == "ANALYZE_EXECUTE":
-            gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2])
+            gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
             return block(
                 {
                     "phase": "ANALYZE_EXECUTE",

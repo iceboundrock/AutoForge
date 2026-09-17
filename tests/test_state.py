@@ -106,6 +106,10 @@ def test_load_rejects_non_list_next_issue_rejections(tmp_path):
     [
         ("counted_merged_prs", [1]),
         ("open_findings", [1]),
+        ("open_findings", [{"classification": "nit"}]),
+        ("open_findings", [{"id": 1}]),
+        ("open_findings", [{"id": "R1-F1\n"}]),
+        ("open_findings", [{"id": "F1"}]),
         ("last_fix_resolutions", [1]),
         ("next_issue_rejections", [1]),
         ("superseded_prs", [1]),

@@ -92,6 +92,22 @@ def test_review_prompt_contract():
         "blocked",
         "non-blocked",
         "nit",
+        # PR #89 F1: an earlier invocation's comment for this round is adopted,
+        # never duplicated; the controller enforces one comment per (round, HEAD).
+        "{{EXISTING_REVIEW_COMMENT_URL}}",
+        "If a comment for this round already exists",
+        "do NOT post a second one",
+        "exactly one review comment at its HEAD",
+        # The marker layout holds placeholders that cannot be mistaken for
+        # values: a copied `true|false` was invalid JSON that read as a
+        # template to fill; `<...>` is the template's own placeholder form.
+        '"needs_fix_round": <true or false>',
+        "Every `<...>` above is a placeholder to replace",
+        # PR #89 F2 (#90): a problem an earlier round deferred to a follow-up
+        # issue is not re-raised under a new finding id.
+        "{{EXISTING_FOLLOW_UP_ISSUES}}",
+        "is not a finding of this round either",
+        "Raise it as a finding only when the deferral is wrong",
     ):
         assert phrase in text, phrase
 
@@ -194,6 +210,10 @@ def test_replan_prompt_contract():
         "{{HISTORICAL_FINDING_COUNT}}",
         "Do not run `gh pr close`",
         "~~~~untrusted",
+        # The replacement is the issue's implementation PR: it carries the
+        # same marker ANALYZE_EXECUTE adopts, or no later entry could find it.
+        "{{IMPLEMENTATION_MARKER}}",
+        "the replacement PR body\ncarries both",
     ):
         assert phrase in text, phrase
 
@@ -219,9 +239,34 @@ def test_replan_prompt_forbids_agent_owned_close_and_local_cleanup():
 
 def test_implementation_prompt_contract():
     text = prompts.load_template("analyze_execute.md")
-    for phrase in ("AGENTS.md", "CLAUDE.md", "CONTROL_RESULT", "pr_url", "head_sha", "branch"):
+    for phrase in (
+        "AGENTS.md",
+        "CLAUDE.md",
+        "CONTROL_RESULT",
+        "pr_url",
+        "head_sha",
+        "branch",
+        # PR #89 F1: the PR body carries the controller's marker, verbatim; an
+        # existing unmarked PR is given it rather than duplicated.
+        "{{IMPLEMENTATION_MARKER}}",
+        "verbatim",
+        "gh pr edit",
+        "Never put it in the body of any other PR",
+        "a PR without it is rejected",
+    ):
         assert phrase in text, phrase
     assert "create pr" in text.lower() and "do not merge" in text.lower()
+
+
+def test_engine_implementation_prompt_carries_the_issues_marker(engine):
+    from autoforge.engine import render_implementation_marker
+    from tests.conftest import ISSUE
+
+    engine.state.phase = Phase.ANALYZE_EXECUTE
+    text = engine.render_prompt_for(Phase.ANALYZE_EXECUTE)
+    marker = render_implementation_marker(ISSUE)
+    assert marker == '<!-- ai-implementation: {"issue": "' + ISSUE + '"} -->'
+    assert f"PR body marker (required, verbatim): `{marker}`" in text
 
 
 def test_update_epic_prompt_contract():
@@ -233,8 +278,63 @@ def test_update_epic_prompt_contract():
         "neither the EPIC",
         "{{NEXT_ISSUE_REJECTION}}",
         "do not repeat",
+        # PR #89 F2: the progress comment carries a marker; one already posted
+        # is adopted, never duplicated; the controller reads back exactly one.
+        "{{PROGRESS_MARKER}}",
+        "{{EXISTING_PROGRESS_COMMENT_URL}}",
+        "do NOT post a second one",
+        "exactly one",
     ):
         assert phrase in text, phrase
+
+
+def test_fix_prompt_hands_over_existing_follow_up_issues():
+    """PR #89 F3: a follow-up issue an earlier fixer created is reported, not recreated."""
+    text = prompts.load_template("fix.md")
+    for phrase in (
+        "{{FOLLOW_UP_ISSUES}}",
+        "line verbatim in its body",
+        "do NOT create a\nsecond one",
+        "the one open issue carrying its finding's",
+        "no open issue\ncarrying its marker",
+        # PR #89 F2 (#90): earlier rounds' deferrals are listed so a re-raised
+        # problem is recorded on the existing issue, never in a second one.
+        "{{EXISTING_FOLLOW_UP_ISSUES}}",
+        "do not open a second issue",
+        "two markers is the follow-up of both findings",
+    ):
+        assert phrase in text, phrase
+
+
+def test_engine_fix_prompt_lists_a_marker_and_the_existing_issue_per_finding(engine):
+    from autoforge.engine import render_follow_up_marker
+    from tests.conftest import ISSUE3, PR
+
+    engine.state.phase = Phase.FIX
+    engine.state.current_pr_url = PR
+    engine.state.open_findings = [
+        {"id": "R1-F1", "classification": "nit", "title": "t", "location": "l"},
+        {"id": "R1-F2", "classification": "nit", "title": "t", "location": "l"},
+    ]
+    engine._existing_follow_ups = {"R1-F2": ISSUE3}
+    text = engine.render_prompt_for(Phase.FIX)
+    m1, m2 = render_follow_up_marker(PR, "R1-F1"), render_follow_up_marker(PR, "R1-F2")
+    assert f"- R1-F1: marker `{m1}`; existing issue: (none)" in text
+    assert f"- R1-F2: marker `{m2}`; existing issue: {ISSUE3}" in text
+
+
+def test_engine_update_epic_prompt_carries_the_progress_marker_and_existing_comment(engine):
+    from autoforge.engine import render_progress_marker
+    from tests.conftest import EPIC, ISSUE, PR, comment_url
+
+    engine.state.phase = Phase.UPDATE_EPIC
+    engine.state.current_pr_url = PR
+    text = engine.render_prompt_for(Phase.UPDATE_EPIC)
+    assert f"`{render_progress_marker(ISSUE, PR)}`" in text
+    assert "for this issue (if any):\n  (none)" in text
+    engine._existing_progress_comment_url = comment_url(EPIC, 300)
+    text = engine.render_prompt_for(Phase.UPDATE_EPIC)
+    assert f"for this issue (if any):\n  {comment_url(EPIC, 300)}" in text
 
 
 def test_engine_prompt_carries_last_next_issue_rejection(engine):
@@ -263,6 +363,12 @@ def test_engine_prompt_variables_review_and_fix(engine):
     engine.state.review_round = 1
     text = engine.render_prompt_for(Phase.REVIEW)
     assert "Round 2" in text and SHA_B in text  # reviews the *current* HEAD
+    # Rendered outside a step, no PR was read: no existing comment is named.
+    assert "Comment already posted for THIS round at THIS HEAD (if any):\n  (none)" in text
+    engine._existing_review_comment_url = f"{PR}#issuecomment-7"
+    text = engine.render_prompt_for(Phase.REVIEW)
+    assert f"THIS HEAD (if any):\n  {PR}#issuecomment-7" in text
+    engine._existing_review_comment_url = ""
     engine.state.phase = Phase.FIX
     engine.state.open_findings = [
         {"id": "R1-F1", "classification": "nit", "required_resolution": "do x"}

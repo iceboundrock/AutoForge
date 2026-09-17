@@ -76,6 +76,17 @@ class GitHubNotFoundError(GitHubError):
     """
 
 
+class ClaimConflictError(AutoForgeError):
+    """A durable-claim read is inconclusive or ambiguous (``autoforge.claims``).
+
+    Raised when the objects carrying a marker kind cannot answer "which one
+    is this phase's write": a marker that could not be read (defective
+    object), several objects claiming the same key, or none where exactly
+    one is required. A phase entry turns it into ``BLOCKED`` without
+    launching an agent; a read-back turns it into :class:`VerificationError`.
+    """
+
+
 class VerificationError(AutoForgeError):
     """Post-execution verification failed (HEAD mismatch, PR state, guards).
 

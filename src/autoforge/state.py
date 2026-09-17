@@ -37,6 +37,7 @@ from . import __prompt_version__, __protocol_version__, __version__
 from .errors import StateError
 from .loop_guard import validate_review_history
 from .replan_txn import LEGACY_JOURNAL_PROTOCOL, legacy_journal_refusal
+from .result_parser import FINDING_ID_RE, MAX_FINDING_ID_CHARS
 from .run_contract import LocalRunContract
 from .runlog import validate_run_id
 from .safefs import ReadLimitExceeded, SafeRoot, entry_kind
@@ -474,6 +475,20 @@ class AutoForgeState:
             isinstance(finding, dict) for finding in state.open_findings
         ):
             raise StateError("state field 'open_findings' must be a list of objects")
+        for finding in state.open_findings:
+            # An open finding's id is rendered into controller syntax (the
+            # follow-up marker of the FIX prompt), so the persisted id is held
+            # to the parser's rule on load rather than crashing the renderer.
+            fid = finding.get("id")
+            if (
+                not isinstance(fid, str)
+                or len(fid) > MAX_FINDING_ID_CHARS
+                or FINDING_ID_RE.match(fid) is None
+            ):
+                raise StateError(
+                    "state field 'open_findings' holds an entry whose 'id' is not a finding id "
+                    "of the form R<round>-F<n>"
+                )
         if not isinstance(state.last_fix_resolutions, list) or not all(
             isinstance(resolution, dict) for resolution in state.last_fix_resolutions
         ):

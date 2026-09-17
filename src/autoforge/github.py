@@ -31,7 +31,6 @@ from .validation import (
     GitHubIssueRef,
     GitHubPullRequestRef,
     parse_comment_url,
-    parse_github_url,
     parse_issue_url,
     parse_pr_url,
 )
@@ -502,16 +501,86 @@ _PR_LIST_FIELDS = (
 )
 
 
-def _repo_of(url: str) -> str:
-    try:
-        return parse_github_url(url).repository
-    except Exception:
+# -- strict row decoding ----------------------------------------------------------
+#
+# One decoder per object kind, used by every view and every listing. A row
+# that is not the object we asked for is a conclusive GitHubError, never an
+# object with a manufactured identity (``url=""``, ``number=0``, ``id=0``):
+# such an object matches nothing and is invisible to every later comparison,
+# so a listing containing it would prove "absent" for something that exists.
+# The identity of a row is its ``url`` parsed with the typed parser; a
+# ``number`` the row also carries must agree with it.
+
+
+def _row_object(row: object, what: str) -> dict:
+    if not isinstance(row, dict):
+        raise GitHubError(f"{what}: `gh` returned a non-object entry ({type(row).__name__})")
+    return row
+
+
+def _text_field(row: dict, key: str, what: str) -> str:
+    """A string field, ``null``/absent read as empty; any other type is malformed."""
+    value = row.get(key)
+    if value is None:
         return ""
+    if not isinstance(value, str):
+        raise GitHubError(f"{what}: field {key!r} is {type(value).__name__}, expected a string")
+    return value
+
+
+def _number_field(row: dict, key: str, what: str, expected: int) -> int:
+    value = row.get(key)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise GitHubError(f"{what}: field {key!r} is not an integer")
+    if value != expected:
+        raise GitHubError(f"{what}: field {key!r} is {value} but the url names #{expected}")
+    return value
+
+
+def _decode_issue(row: object, what: str) -> IssueInfo:
+    data = _row_object(row, what)
+    url = _text_field(data, "url", what)
+    try:
+        ref = parse_issue_url(url)
+    except ConfigurationError as exc:
+        raise GitHubError(f"{what}: url {url!r} is not a GitHub issue URL ({exc})") from exc
+    return IssueInfo(
+        url=ref.canonical,
+        number=_number_field(data, "number", what, ref.number),
+        title=_text_field(data, "title", what),
+        state=_text_field(data, "state", what).upper(),
+        body=_text_field(data, "body", what),
+        repository=ref.repository,
+    )
+
+
+def _decode_comment(row: object, parent_url: str) -> CommentInfo:
+    what = f"comment on {parent_url}"
+    data = _row_object(row, what)
+    url = _text_field(data, "url", what)
+    try:
+        ref = parse_comment_url(url)
+    except ConfigurationError as exc:
+        raise GitHubError(f"{what}: url {url!r} is not a GitHub comment URL ({exc})") from exc
+    author = data.get("author")
+    login = _text_field(author, "login", what) if isinstance(author, dict) else ""
+    return CommentInfo(
+        id=ref.comment_id,
+        url=ref.canonical,
+        body=_text_field(data, "body", what),
+        author=login,
+        created_at=_text_field(data, "createdAt", what),
+        parent_url=parent_url,
+    )
 
 
 # `gh pr list` paginates internally to satisfy --limit; this is the ceiling a
 # strict caller is willing to read before declaring the set unknowable.
 STRICT_PR_LIST_LIMIT = 1000
+# The same ceiling for `gh issue list`: a FIX entry reads every open issue to
+# find the follow-up issues an earlier fixer created.
+STRICT_ISSUE_LIST_LIMIT = 1000
+_ISSUE_LIST_FIELDS = "url,number,title,state,body"
 
 MERGE_METHODS = ("squash", "merge", "rebase")
 _SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -798,17 +867,46 @@ class GitHubClient:
         data = self._api_json(
             ["issue", "view", ref.canonical, "--json", "url,number,title,state,body"]
         )
-        return IssueInfo(
-            url=data.get("url", ref.canonical),
-            number=int(data.get("number", 0)),
-            title=data.get("title", ""),
-            state=str(data.get("state", "")).upper(),
-            body=data.get("body", "") or "",
-            repository=_repo_of(data.get("url", ref.canonical)) or ref.repository,
-        )
+        issue = _decode_issue(data, f"issue {ref.canonical}")
+        if not parse_issue_url(issue.url).same_target(ref):
+            raise GitHubError(f"issue {ref.canonical}: `gh` answered with {issue.url}")
+        return issue
 
     def get_issue_state(self, url: str) -> str:
         return self.get_issue(url).state
+
+    def list_open_issues(self, repo: str, *, strict: bool = False) -> list[IssueInfo]:
+        """Every open issue in ``repo`` (bodies included), pull requests excluded.
+
+        ``strict`` raises GitHubError instead of returning a set that may be
+        incomplete: the listing is bounded by :data:`STRICT_ISSUE_LIST_LIMIT`,
+        and a caller deciding "no such issue exists" must not confuse that
+        with "the issue was past the limit".
+        """
+        limit = STRICT_ISSUE_LIST_LIMIT if strict else 100
+        data = self._api_list(
+            [
+                "issue",
+                "list",
+                "--repo",
+                repo,
+                "--state",
+                "open",
+                "--limit",
+                str(limit),
+                "--json",
+                _ISSUE_LIST_FIELDS,
+            ]
+        )
+        # Truncation is judged on the rows `gh` returned, before any of them
+        # is decoded: a malformed row must not shorten the count below the
+        # ceiling and turn "may be truncated" into "complete".
+        if strict and len(data) >= limit:
+            raise GitHubError(
+                f"{repo} has at least {limit} open issues, so the listing may be truncated "
+                "and the set of follow-up issues cannot be established"
+            )
+        return [_decode_issue(d, f"open issue listing of {repo}") for d in data]
 
     def issue_exists(self, url: str) -> bool:
         try:
@@ -818,7 +916,18 @@ class GitHubClient:
             return False
 
     # -- pull requests ------------------------------------------------------
-    def _pr_from_data(self, data: dict, fallback_url: str = "") -> PRInfo:
+    @staticmethod
+    def _pr_from_data(row: object, what: str) -> PRInfo:
+        """One strict decoder for every PR view and listing (see ``_decode_issue``)."""
+        data = _row_object(row, what)
+        url = _text_field(data, "url", what)
+        try:
+            ref = parse_pr_url(url)
+        except ConfigurationError as exc:
+            raise GitHubError(
+                f"{what}: url {url!r} is not a GitHub pull request URL ({exc})"
+            ) from exc
+        number = _number_field(data, "number", what, ref.number)
         checks = []
         for c in data.get("statusCheckRollup") or []:
             if isinstance(c, dict):
@@ -841,21 +950,20 @@ class GitHubClient:
         if isinstance(hr, dict) and hr.get("name"):
             owner = hro.get("login", "") if isinstance(hro, dict) else ""
             head_repo = f"{owner}/{hr['name']}" if owner else str(hr["name"])
-        url = data.get("url", fallback_url) or fallback_url
         return PRInfo(
-            url=url,
-            number=int(data.get("number", 0)),
-            title=data.get("title", ""),
-            state=str(data.get("state", "")).upper(),
-            head_sha=(data.get("headRefOid", "") or "").lower(),
-            base_ref=data.get("baseRefName", "") or "",
-            head_ref=data.get("headRefName", "") or "",
-            mergeable=str(data.get("mergeable", "") or "").upper(),
-            merge_state_status=str(data.get("mergeStateStatus", "") or "").upper(),
+            url=ref.canonical,
+            number=number,
+            title=_text_field(data, "title", what),
+            state=_text_field(data, "state", what).upper(),
+            head_sha=_text_field(data, "headRefOid", what).lower(),
+            base_ref=_text_field(data, "baseRefName", what),
+            head_ref=_text_field(data, "headRefName", what),
+            mergeable=_text_field(data, "mergeable", what).upper(),
+            merge_state_status=_text_field(data, "mergeStateStatus", what).upper(),
             auto_merge_enabled=data.get("autoMergeRequest") is not None,
             is_draft=bool(data.get("isDraft", False)),
-            body=data.get("body", "") or "",
-            repository=_repo_of(url),
+            body=_text_field(data, "body", what),
+            repository=ref.repository,
             head_repository=head_repo,
             linked_issue_numbers=linked,
             checks=checks,
@@ -864,7 +972,10 @@ class GitHubClient:
     def get_pr(self, url: str) -> PRInfo:
         ref = parse_pr_url(url)
         data = self._api_json(["pr", "view", ref.canonical, "--json", _PR_FIELDS])
-        return self._pr_from_data(data, ref.canonical)
+        pr = self._pr_from_data(data, f"PR {ref.canonical}")
+        if not parse_pr_url(pr.url).same_target(ref):
+            raise GitHubError(f"PR {ref.canonical}: `gh` answered with {pr.url}")
+        return pr
 
     def get_pr_head_sha(self, url: str) -> str:
         return self.get_pr(url).head_sha
@@ -1109,13 +1220,12 @@ class GitHubClient:
                 _PR_LIST_FIELDS,
             ]
         )
-        prs = [self._pr_from_data(d) for d in data if isinstance(d, dict)]
-        if strict and len(prs) >= limit:
+        if strict and len(data) >= limit:
             raise GitHubError(
                 f"{repo} has at least {limit} open pull requests, so the listing may be "
                 "truncated and the set of candidates cannot be established"
             )
-        return prs
+        return [self._pr_from_data(d, f"open PR listing of {repo}") for d in data]
 
     def list_all_prs(self, repo: str, *, strict: bool = False) -> list[PRInfo]:
         """Every PR in ``repo`` across all states (bodies included).
@@ -1141,13 +1251,12 @@ class GitHubClient:
                 _PR_LIST_FIELDS,
             ]
         )
-        prs = [self._pr_from_data(d) for d in data if isinstance(d, dict)]
-        if strict and len(prs) >= limit:
+        if strict and len(data) >= limit:
             raise GitHubError(
                 f"{repo} has at least {limit} pull requests, so the listing may be "
                 "truncated and the set of candidates cannot be established"
             )
-        return prs
+        return [self._pr_from_data(d, f"PR listing of {repo}") for d in data]
 
     def latest_pr_number(self, repo: str) -> int:
         """The largest PR number that currently exists in ``repo`` (0 if none).
@@ -1196,32 +1305,6 @@ class GitHubClient:
                 )
             highest = max(highest, number)
         return highest
-
-    def find_open_prs_for_issue(
-        self, issue: GitHubIssueRef | str, *, strict: bool = False
-    ) -> list[PRInfo]:
-        """Open PRs that unambiguously belong to ``issue``.
-
-        A PR matches when GitHub links it as closing the issue, or its head
-        branch follows the controller's naming scheme ``autoforge/<n>-...``.
-
-        ``strict`` is passed through to :meth:`list_open_prs`, which refuses a
-        listing it cannot prove complete.
-
-        The two rules are a *convenience*, never a provenance boundary: a PR an
-        agent has created but not yet linked to the issue matches neither, so a
-        caller that must not miss such a PR reads :meth:`list_open_prs` and
-        applies its own test.
-        """
-        if isinstance(issue, str):
-            issue = parse_issue_url(issue)
-        open_prs = self.list_open_prs(issue.repository, strict=strict)
-        prefix = re.compile(rf"^autoforge/{issue.number}(?:-|$)")
-        out = []
-        for pr in open_prs:
-            if issue.number in pr.linked_issue_numbers or prefix.match(pr.head_ref or ""):
-                out.append(pr)
-        return out
 
     # -- merge (the only write; controller-owned, engine-gated) ------------------
     def merge_pr(
@@ -1292,28 +1375,22 @@ class GitHubClient:
     def get_pr_comments(self, url: str) -> list[CommentInfo]:
         ref = parse_pr_url(url)
         data = self._api_json(["pr", "view", ref.canonical, "--json", "comments"])
-        out = []
-        for c in data.get("comments") or []:
-            if not isinstance(c, dict):
-                continue
-            curl = str(c.get("url", "") or "")
-            cid = 0
-            try:
-                cid = parse_comment_url(curl).comment_id
-            except Exception:
-                pass
-            author = c.get("author") or {}
-            out.append(
-                CommentInfo(
-                    id=cid,
-                    url=curl,
-                    body=c.get("body", "") or "",
-                    author=str(author.get("login", "")) if isinstance(author, dict) else "",
-                    created_at=str(c.get("createdAt", "") or ""),
-                    parent_url=ref.canonical,
-                )
-            )
-        return out
+        return self._comments_from_data(data, ref.canonical)
+
+    def get_issue_comments(self, url: str) -> list[CommentInfo]:
+        """The issue-style comments of an issue (an EPIC's progress comments)."""
+        ref = parse_issue_url(url)
+        data = self._api_json(["issue", "view", ref.canonical, "--json", "comments"])
+        return self._comments_from_data(data, ref.canonical)
+
+    @staticmethod
+    def _comments_from_data(data: dict, parent_url: str) -> list[CommentInfo]:
+        rows = data.get("comments")
+        if rows is None:
+            rows = []
+        if not isinstance(rows, list):
+            raise GitHubError(f"comments of {parent_url}: `gh` returned a non-array field")
+        return [_decode_comment(c, parent_url) for c in rows]
 
     def get_comment(self, comment_url: str) -> CommentInfo:
         """Fetch one issue-style comment by its HTML URL (``#issuecomment-<id>``)."""

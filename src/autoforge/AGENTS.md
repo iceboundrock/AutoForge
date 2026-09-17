@@ -22,6 +22,7 @@ replan_txn.py       REPLAN_REEXECUTE durable transaction state and verifiers
 providers.py        provider adapters: the only place that knows real CLI flags
 executor.py         subprocess lifecycle, timeouts, capture (no workflow semantics)
 github.py           GitHubClient over `gh`: verification reads + controller-owned merge
+claims.py           durable GitHub claims: marker schemas, renderers, scan, cardinality
 validation.py       typed GitHub URL parsing and run-argument validation
 premerge.py         controller-produced pre-merge evidence (check definitions, tree export)
 result_parser.py    CONTROL_RESULT extraction and strict per-phase validation
@@ -66,7 +67,7 @@ transitions.py, profiles.py, loop_guard.py, replan.py,
 engine.py (phase sequencing, resume)             -> docs/agent-guides/workflow.md
 replan_txn.py, engine.py (REPLAN_REEXECUTE),
 prompts/replan_reexecute.md                       -> docs/agent-guides/replan-transaction.md (+ workflow.md)
-github.py, validation.py, premerge.py,
+github.py, claims.py, validation.py, premerge.py,
 engine.py (post-phase verification, merge gate,
 dry-run), prompts/update_epic.md                  -> docs/agent-guides/github-safety.md
 state.py, run_contract.py, safefs.py, locking.py,

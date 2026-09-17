@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -14,6 +15,7 @@ from autoforge.errors import (
     ExecutionTimeoutError,
     GitHubError,
     GitHubUnavailableError,
+    StateError,
     StateTransitionError,
     VerificationError,
 )
@@ -57,8 +59,12 @@ from tests.conftest import (
     ci_check,
     ci_jobs,
     comment_url,
+    follow_up_issue_body,
     git_repo,
+    implementation_pr_body,
     make_engine,
+    post_progress_comment,
+    progress_comment_body,
     review_comment_body,
 )
 
@@ -182,7 +188,7 @@ def test_analyze_valid_pr_verified_enters_review(tmp_state_dir, fake_github):
     eng.step()  # INITIALIZING
 
     def on_call(req):  # the agent "creates" the PR as a side effect
-        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2])
+        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
         return block(ANALYZE_OK)
 
     eng.provider._handler = on_call
@@ -199,7 +205,7 @@ def test_analyze_valid_pr_verified_enters_review(tmp_state_dir, fake_github):
 def test_analyze_fake_pr_url_rejected(tmp_state_dir, fake_github):
     eng = make_engine(tmp_state_dir, [block(ANALYZE_OK)], github=fake_github)
     eng.state.phase = Phase.ANALYZE_EXECUTE
-    with pytest.raises(VerificationError, match="cannot resolve"):
+    with pytest.raises(VerificationError, match="no open PR carries the ai-implementation marker"):
         eng.step()
     assert load_state(eng.paths.state_file).phase == Phase.ANALYZE_EXECUTE
 
@@ -207,7 +213,10 @@ def test_analyze_fake_pr_url_rejected(tmp_state_dir, fake_github):
 def test_analyze_head_sha_mismatch_rejected(tmp_state_dir, fake_github):
     eng = make_engine(tmp_state_dir, [block(ANALYZE_OK)], github=fake_github)
     eng.state.phase = Phase.ANALYZE_EXECUTE
-    eng.provider._handler = lambda req: (fake_github.add_pr(head_sha=SHA_B), block(ANALYZE_OK))[1]
+    eng.provider._handler = lambda req: (
+        fake_github.add_pr(head_sha=SHA_B, body=implementation_pr_body()),
+        block(ANALYZE_OK),
+    )[1]
     with pytest.raises(VerificationError, match="head mismatch"):
         eng.step()
     assert eng.state.phase == Phase.ANALYZE_EXECUTE
@@ -220,7 +229,9 @@ def test_analyze_issue_claim_is_compared_by_identity_not_url_string(tmp_state_di
     eng = make_engine(tmp_state_dir, [block(payload)], github=fake_github)
     eng.state.phase = Phase.ANALYZE_EXECUTE
     eng.provider._handler = lambda req: (
-        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2]),
+        fake_github.add_pr(
+            head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body()
+        ),
         block(payload),
     )[1]
     assert eng.step().next_phase == "REVIEW"
@@ -244,28 +255,150 @@ def test_analyze_pr_in_other_repo_rejected(tmp_state_dir, fake_github):
 
 
 def test_analyze_branch_mismatch_rejected(tmp_state_dir, fake_github):
-    fake_github.add_pr(head_sha=SHA_A, branch="feature/other")
     eng = make_engine(tmp_state_dir, [block(ANALYZE_OK)], github=fake_github)
     eng.state.phase = Phase.ANALYZE_EXECUTE
-    # recovery does not match (branch not autoforge/2-*, not linked) -> agent runs
+    eng.provider._handler = lambda req: (
+        fake_github.add_pr(head_sha=SHA_A, branch="feature/other", body=implementation_pr_body()),
+        block(ANALYZE_OK),
+    )[1]
     with pytest.raises(VerificationError, match="branch mismatch"):
+        eng.step()
+    assert eng.state.phase == Phase.ANALYZE_EXECUTE and eng.state.current_pr_url == ""
+
+
+# -- ANALYZE_EXECUTE read-back: the implementation marker (PR #89 review F1) --------------
+def test_analyze_pr_without_the_implementation_marker_is_rejected(tmp_state_dir, fake_github):
+    """A PR the read-back accepts must be a PR every later entry finds. The
+    entry finds PRs by the marker alone, so a PR without it (branch and
+    linkage notwithstanding) is not accepted, whatever the agent claims."""
+    from autoforge.engine import render_implementation_marker
+
+    eng = make_engine(tmp_state_dir, [block(ANALYZE_OK)], github=fake_github)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    eng.provider._handler = lambda req: (
+        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2]),
+        block(ANALYZE_OK),
+    )[1]
+    with pytest.raises(VerificationError, match="no open PR carries the ai-implementation marker"):
+        eng.step()
+    assert eng.state.phase == Phase.ANALYZE_EXECUTE and eng.state.current_pr_url == ""
+    assert render_implementation_marker(ISSUE) in eng.provider.calls[0].prompt
+
+
+def test_analyze_pr_marked_for_another_issue_is_rejected(tmp_state_dir, fake_github):
+    eng = make_engine(tmp_state_dir, [block(ANALYZE_OK)], github=fake_github)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    eng.provider._handler = lambda req: (
+        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, body=implementation_pr_body(ISSUE3)),
+        block(ANALYZE_OK),
+    )[1]
+    with pytest.raises(VerificationError, match="no open PR carries the ai-implementation marker"):
         eng.step()
 
 
+def test_analyze_second_marked_pr_is_rejected_then_the_next_entry_blocks(
+    tmp_state_dir, fake_github
+):
+    """Read-back and entry agree: two open PRs carrying the issue's marker is
+    a pair the read-back rejects and the next entry blocks on, so the
+    controller never picks one of them."""
+    other = "https://github.com/owner/repo/pull/43"
+
+    def creates_two(req):
+        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, body=implementation_pr_body())
+        fake_github.add_pr(
+            url=other, head_sha=SHA_B, branch="autoforge/2-again", body=implementation_pr_body()
+        )
+        return block(ANALYZE_OK)
+
+    eng = make_engine(tmp_state_dir, creates_two, github=fake_github)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    with pytest.raises(VerificationError, match="2 open PRs carry the ai-implementation marker"):
+        eng.step()
+    assert eng.state.current_pr_url == ""
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and len(eng.provider.calls) == 1
+    reason = load_state(eng.paths.state_file).block_reason
+    assert "2 open PRs carry the ai-implementation marker" in reason
+    assert PR in reason and other in reason and "never guesses" in reason
+
+
 # -- recovery ------------------------------------------------------------------------
-def test_recovery_existing_open_pr_skips_agent(tmp_state_dir, fake_github):
-    fake_github.add_pr(head_sha=SHA_B, branch="autoforge/2-x")
+def test_recovery_adopts_the_marked_pr_whatever_its_branch_or_linkage(tmp_state_dir, fake_github):
+    """PR #89 review F1: the agent created the PR on a branch of its own
+    naming, without linking the issue, and was interrupted before the
+    controller persisted it. The marker in its body is what identifies it,
+    so the entry adopts it instead of launching a second implementation."""
+    fake_github.add_pr(head_sha=SHA_B, branch="feature/anything", body=implementation_pr_body())
     eng = make_engine(tmp_state_dir, ["never"], github=fake_github)
     eng.state.phase = Phase.ANALYZE_EXECUTE
     out = eng.step()
     assert out.next_phase == "REVIEW" and "recovered" in out.message
     assert eng.provider.calls == []
     assert eng.state.current_pr_url == PR and eng.state.current_head_sha == SHA_B
+    assert eng.state.current_branch == "feature/anything"
+    assert ("list_open_prs", "owner/repo", True) in fake_github.calls
+
+
+def test_recovery_blocks_when_the_open_pr_listing_cannot_be_proven_complete(
+    tmp_state_dir, fake_github
+):
+    """ "No PR implements this issue yet" is a claim about every open PR; a
+    listing that may be truncated cannot make it, and an agent launched on
+    it would create a second implementation. BLOCKED, nobody launched."""
+    fake_github.pr_listing_truncated = True
+    eng = make_engine(tmp_state_dir, ["never"], github=fake_github)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and eng.provider.calls == []
+    reason = load_state(eng.paths.state_file).block_reason
+    assert "cannot establish whether an open PR already implements issue #2" in reason
+    assert "may be truncated" in reason and "will not launch an agent" in reason
+
+
+def test_recovery_ignores_a_pr_marked_for_another_issue(tmp_state_dir, fake_github):
+    fake_github.add_pr(
+        head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body(ISSUE3)
+    )
+
+    def agent(req):
+        fake_github.prs[PR].body = implementation_pr_body()  # takes it over, as told
+        return block(ANALYZE_OK)
+
+    eng = make_engine(tmp_state_dir, agent, github=fake_github)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    assert eng.step().next_phase == "REVIEW" and len(eng.provider.calls) == 1
+
+
+def test_recovery_does_not_adopt_an_unmarked_pr_the_agent_is_told_to_mark(
+    tmp_state_dir, fake_github
+):
+    """A linked PR on the controller's branch but without the marker is not
+    provenance (a human, an older controller): it is not adopted. The agent
+    runs, is told the marker, gives the existing PR the marker instead of
+    opening a second one, and the read-back then accepts it."""
+    from autoforge.engine import render_implementation_marker
+
+    fake_github.add_pr(head_sha=SHA_A, branch="autoforge/2-x", linked=[2])
+    payload = dict(ANALYZE_OK, branch="autoforge/2-x")
+
+    def marks_the_existing_pr(req):
+        assert f"`{render_implementation_marker(ISSUE)}`" in req.prompt
+        assert "gh pr edit" in req.prompt
+        fake_github.prs[PR].body = implementation_pr_body()
+        return block(payload)
+
+    eng = make_engine(tmp_state_dir, marks_the_existing_pr, github=fake_github)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    out = eng.step()
+    assert out.next_phase == "REVIEW" and len(eng.provider.calls) == 1
+    assert eng.state.current_pr_url == PR
 
 
 def test_recovery_after_crash_with_persisted_pr(tmp_state_dir, fake_github):
-    """PR created + state persisted, crash before transition -> resume recovers."""
-    fake_github.add_pr(head_sha=SHA_A, branch="feature/x")  # not detectable by naming
+    """PR created + state persisted, crash before transition -> resume recovers
+    the controller's own record, marker or not."""
+    fake_github.add_pr(head_sha=SHA_A, branch="feature/x")
     eng = make_engine(tmp_state_dir, ["never"], github=fake_github)
     eng.state.phase = Phase.ANALYZE_EXECUTE
     eng.state.current_pr_url = PR
@@ -276,22 +409,37 @@ def test_recovery_after_crash_with_persisted_pr(tmp_state_dir, fake_github):
     assert out.next_phase == "REVIEW" and eng2.provider.calls == []
 
 
+def test_recovery_lets_an_unavailable_persisted_pr_read_through_as_transient(
+    tmp_state_dir, fake_github
+):
+    """The persisted PR is the controller's own record; a `gh` that cannot be
+    reached says nothing about it. The read is retried, never turned into a
+    BLOCKED state that a human has to clear."""
+    fake_github.add_pr(head_sha=SHA_A, branch="feature/x")
+    eng = make_engine(tmp_state_dir, ["never"], github=fake_github)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    eng.state.current_pr_url = PR
+    eng._save()
+    fake_github.get_pr_error = GitHubUnavailableError("`gh pr view` failed (exit 1): HTTP 502")
+    with pytest.raises(GitHubUnavailableError):
+        eng.step()
+    assert eng.provider.calls == []
+    assert load_state(eng.paths.state_file).phase == Phase.ANALYZE_EXECUTE
+
+
 def test_recovery_ambiguous_blocks(tmp_state_dir, fake_github):
-    fake_github.add_pr(url=PR, head_sha=SHA_A, branch="autoforge/2-a")
-    fake_github.add_pr(url="https://github.com/owner/repo/pull/43", head_sha=SHA_B, linked=[2])
+    fake_github.add_pr(
+        url=PR, head_sha=SHA_A, branch="autoforge/2-a", body=implementation_pr_body()
+    )
+    fake_github.add_pr(
+        url="https://github.com/owner/repo/pull/43", head_sha=SHA_B, body=implementation_pr_body()
+    )
     eng = make_engine(tmp_state_dir, ["never"], github=fake_github)
     eng.state.phase = Phase.ANALYZE_EXECUTE
     out = eng.step()
-    assert out.next_phase == "BLOCKED" and "multiple open PRs" in eng.state.block_reason
+    assert out.next_phase == "BLOCKED"
+    assert "2 open PRs carry the ai-implementation marker" in eng.state.block_reason
     assert eng.provider.calls == []
-
-
-def test_recovery_pr_not_persisted_agent_reuses(tmp_state_dir, fake_github):
-    """PR exists on GitHub, nothing persisted: naming rule recovers it."""
-    fake_github.add_pr(head_sha=SHA_A, branch="autoforge/2")
-    eng = make_engine(tmp_state_dir, ["never"], github=fake_github)
-    eng.state.phase = Phase.ANALYZE_EXECUTE
-    assert eng.step().next_phase == "REVIEW"
 
 
 # -- REVIEW ---------------------------------------------------------------------------
@@ -343,7 +491,7 @@ def test_review_invariant_mismatch_rejected(tmp_state_dir):
 def test_review_comment_missing_rejected(tmp_state_dir):
     gh = FakeGitHub()
     eng = _in_review(tmp_state_dir, gh, [block(review_payload(1, SHA_A, []))])
-    with pytest.raises(VerificationError, match="not found on PR"):
+    with pytest.raises(VerificationError, match="no comment carries the ai-review-result marker"):
         eng.step()
     assert eng.state.review_round == 0 and eng.state.phase == Phase.REVIEW
 
@@ -352,15 +500,72 @@ def test_review_comment_wrong_round_marker_rejected(tmp_state_dir):
     gh = FakeGitHub()
     gh.add_comment(PR, 100, review_comment_body(2, SHA_A, False))
     eng = _in_review(tmp_state_dir, gh, [block(review_payload(1, SHA_A, []))])
-    with pytest.raises(VerificationError, match="Round 1"):
+    with pytest.raises(VerificationError, match="no comment carries .* for round 1"):
         eng.step()
+
+
+@pytest.mark.parametrize(
+    "marked, reported",
+    [
+        pytest.param([], ["R1-F1"], id="marker-empty-result-has-finding"),
+        pytest.param(["R1-F2"], ["R1-F1"], id="different-id"),
+        pytest.param(["R1-F1"], [], id="marker-has-finding-result-empty"),
+        pytest.param(["R1-F1"], ["R1-F1", "R1-F2"], id="marker-misses-one"),
+    ],
+)
+def test_review_comment_finding_ids_disagreeing_with_the_result_are_rejected(
+    tmp_state_dir, marked, reported
+):
+    """The marker's finding ids are the durable copy of the round's findings:
+    a later entry, a fixer, or a human reads them from the comment while the
+    controller persists the CONTROL_RESULT's. The read-back holds the two to
+    each other, as it already does for the HEAD and the verdict, instead of
+    letting the comment and the state tell different stories."""
+    gh = FakeGitHub()
+    findings = [_finding(1, int(fid.split("-F")[1])) for fid in reported]
+
+    def reviews(req):
+        gh.add_comment(PR, 100, review_comment_body(1, SHA_A, bool(reported), marked))
+        return block(review_payload(1, SHA_A, findings))
+
+    eng = _in_review(tmp_state_dir, gh, reviews)
+    with pytest.raises(VerificationError, match="finding_ids .* disagree with the CONTROL_RESULT"):
+        eng.step()
+    assert eng.state.phase == Phase.REVIEW and eng.state.review_round == 0
+
+
+@pytest.mark.parametrize(
+    "marker_ids",
+    [
+        pytest.param(["R1-F2", "R1-F1"], id="reordered"),
+        pytest.param(None, id="omitted"),
+    ],
+)
+def test_review_comment_finding_ids_are_compared_as_a_set_and_may_be_omitted(
+    tmp_state_dir, marker_ids
+):
+    """Order is presentation, and the key is optional by the documented schema."""
+    gh = FakeGitHub()
+    findings = [_finding(1, 1), _finding(1, 2)]
+
+    def reviews(req):
+        body = review_comment_body(1, SHA_A, True, marker_ids)
+        if marker_ids is None:
+            body = body.replace(', "finding_ids": []', "")
+            assert "finding_ids" not in body
+        gh.add_comment(PR, 100, body)
+        return block(review_payload(1, SHA_A, findings))
+
+    eng = _in_review(tmp_state_dir, gh, reviews)
+    assert eng.step().next_phase == "FIX"
+    assert eng.state.review_round == 1
 
 
 def test_review_comment_wrong_sha_marker_rejected(tmp_state_dir):
     gh = FakeGitHub()
     gh.add_comment(PR, 100, review_comment_body(1, SHA_B, False))
     eng = _in_review(tmp_state_dir, gh, [block(review_payload(1, SHA_A, []))])
-    with pytest.raises(VerificationError, match="reviewed_head_sha"):
+    with pytest.raises(VerificationError, match=f"no comment carries .* at HEAD {SHA_A[:12]}"):
         eng.step()
 
 
@@ -407,6 +612,266 @@ def test_review_binds_head_fetched_before_review(tmp_state_dir):
     assert eng.step().next_phase == "READY_FOR_MERGE"
     assert SHA_B in eng.provider.calls[0].prompt
     assert eng.state.reviewed_head_sha == SHA_B
+
+
+def test_review_post_agent_journal_refusal_keeps_the_phase_for_resume(tmp_state_dir):
+    """#55 in REMOTE mode: the journal append that records the invocation is
+    refused after the reviewer returned, in the same window as a timeout, a
+    non-zero exit or a verification failure. The phase is left unchanged with
+    no round consumed, the attempt the launch was charged as is persisted,
+    the invocation's artifacts are published, the oversized journal is neither
+    materialised nor carried forward, and the refusal names the outcome it
+    interrupted and what `resume` will do. A resume in a new process re-enters
+    REVIEW, finds the round-1 comment the dead reviewer posted at this HEAD,
+    and hands it to the reviewer to adopt: the round ends with one comment."""
+    from autoforge.runlog import MAX_EVENT_JOURNAL_BYTES
+
+    gh = FakeGitHub()
+    eng = _in_review(tmp_state_dir, gh, None)
+    journal = Path(eng.paths.logs_dir) / eng.state.run_id / "events.jsonl"
+
+    def reviews_then_enlarges_the_journal(req):
+        gh.add_comment(PR, 100, review_comment_body(1, SHA_A, True, ["R1-F1"]))
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        journal.touch()
+        os.truncate(journal, 2 * MAX_EVENT_JOURNAL_BYTES)
+        return block(review_payload(1, SHA_A, [_finding(1)]))
+
+    eng.provider._handler = reviews_then_enlarges_the_journal
+    with pytest.raises(
+        StateError,
+        match=r"corrupted event journal.*larger than.*interrupted attempt 1 of REVIEW after the "
+        r"agent had returned with: a CONTROL_RESULT the controller accepted.*"
+        r"a comment, a push, a PR.*may exist.*Repair the log directory, then 'resume'.*"
+        r"re-enters REVIEW and hands a review comment already posted",
+    ):
+        eng.step()
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.REVIEW and s.review_round == 0 and s.attempt == 1
+    assert s.open_findings == [] and s.last_review_comment_url == ""
+    assert journal.stat().st_size == 2 * MAX_EVENT_JOURNAL_BYTES, "not carried forward"
+    steps = sorted(p.name for p in journal.parent.iterdir() if p.is_dir())
+    assert steps == ["001-review-1"]
+    assert (journal.parent / steps[0] / "control-result.json").exists()
+    assert len(gh.comments[PR]) == 1
+    eng.close()
+
+    # The operator repairs the journal and resumes in a new process.
+    os.truncate(journal, 0)
+    eng2 = make_engine(tmp_state_dir, None, github=gh)
+    eng2.load()
+
+    def adopts_the_existing_comment(req):
+        assert comment_url(PR, 100) in req.prompt, "the existing comment was not handed over"
+        return block(review_payload(1, SHA_A, [_finding(1)]))
+
+    eng2.provider._handler = adopts_the_existing_comment
+    assert eng2.step().next_phase == "FIX"
+    assert len(eng2.provider.calls) == 1
+    s = load_state(eng2.paths.state_file)
+    assert s.review_round == 1 and s.attempt == 0
+    assert s.last_review_comment_url == comment_url(PR, 100)
+    assert [f["id"] for f in s.open_findings] == ["R1-F1"]
+    assert len(gh.comments[PR]) == 1, "the round has exactly one comment"
+
+
+# -- REVIEW entry: reconciliation with the PR before the reviewer runs (PR #89 F1) ---------
+def test_review_entry_hands_an_existing_round_comment_to_the_reviewer(tmp_state_dir):
+    """A comment carrying the marker for the upcoming round at the bound HEAD
+    already exists (a reviewer whose result was never recorded). The
+    controller reads the PR first and names it in the prompt; the reviewer
+    adopts it instead of posting a second one."""
+    gh = FakeGitHub()
+    gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
+    eng = _in_review(tmp_state_dir, gh, [block(review_payload(1, SHA_A, []))])
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    prompt = eng.provider.calls[0].prompt
+    assert (
+        f"Comment already posted for THIS round at THIS HEAD (if any):\n  {comment_url(PR, 100)}"
+        in prompt
+    )
+    assert "THIS HEAD (if any):\n  (none)" not in prompt
+    assert len(gh.comments[PR]) == 1
+
+
+def test_review_entry_ignores_a_comment_for_the_round_at_another_head(tmp_state_dir):
+    """The marker binds a comment to (round, HEAD). A round-1 comment at SHA_B
+    when the round is bound to SHA_A is not this round's comment."""
+    gh = FakeGitHub()
+    gh.add_comment(PR, 90, review_comment_body(1, SHA_B, True, ["R1-F1"]))
+
+    def reviews(req):
+        gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
+        return block(review_payload(1, SHA_A, []))
+
+    eng = _in_review(tmp_state_dir, gh, reviews)
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    prompt = eng.provider.calls[0].prompt
+    assert "Comment already posted for THIS round at THIS HEAD (if any):\n  (none)" in prompt
+    assert comment_url(PR, 90) not in prompt
+
+
+def test_review_entry_blocks_on_two_comments_for_the_round_without_invoking(tmp_state_dir):
+    """Two comments claim the same (round, HEAD): the controller cannot know
+    which review is the round's and never chooses. BLOCKED, nobody launched,
+    and the reason names both so the operator can remove one."""
+    gh = FakeGitHub()
+    gh.add_comment(PR, 100, review_comment_body(1, SHA_A, True, ["R1-F1"]))
+    gh.add_comment(PR, 101, review_comment_body(1, SHA_A, False))
+    eng = _in_review(tmp_state_dir, gh, ["never"])
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and eng.provider.calls == []
+    reason = load_state(eng.paths.state_file).block_reason
+    assert "2 comments carry the ai-review-result marker for round 1" in reason
+    assert comment_url(PR, 100) in reason and comment_url(PR, 101) in reason
+    assert "exactly one remains" in reason
+
+
+def test_reviewer_posting_a_second_comment_for_the_round_is_rejected_then_blocked(
+    tmp_state_dir,
+):
+    """The reviewer ignores the existing comment and posts another: the round
+    is rejected after the fact (the uniqueness rule is enforced on read-back,
+    not trusted to the prompt), no round is consumed, and the next entry
+    blocks on the two comments instead of launching a third reviewer."""
+    gh = FakeGitHub()
+    gh.add_comment(PR, 100, review_comment_body(1, SHA_A, True, ["R1-F1"]))
+
+    def posts_again(req):
+        gh.add_comment(PR, 101, review_comment_body(1, SHA_A, True, ["R1-F1"]))
+        return block(review_payload(1, SHA_A, [_finding(1)], cid=101))
+
+    eng = _in_review(tmp_state_dir, gh, posts_again)
+    with pytest.raises(
+        VerificationError,
+        match=r"2 comments carry the ai-review-result marker for round 1.*exactly one review",
+    ):
+        eng.step()
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.REVIEW and s.review_round == 0 and s.open_findings == []
+    assert eng.step().next_phase == "BLOCKED"
+    assert len(eng.provider.calls) == 1
+
+
+def _review_body_with_marker(marker_json: str) -> str:
+    return review_comment_body(1, SHA_A, False).split("<!-- ai-review-result")[0] + (
+        f"<!-- ai-review-result: {marker_json} -->\n"
+    )
+
+
+_MALFORMED_MARKERS = [
+    pytest.param(
+        json.dumps({"round": True, "reviewed_head_sha": SHA_A, "needs_fix_round": False}),
+        id="bool-round",
+    ),
+    pytest.param(
+        json.dumps({"round": 1.0, "reviewed_head_sha": SHA_A, "needs_fix_round": False}),
+        id="float-round",
+    ),
+    pytest.param(
+        json.dumps({"round": "1", "reviewed_head_sha": SHA_A, "needs_fix_round": False}),
+        id="string-round",
+    ),
+    pytest.param(
+        json.dumps({"round": 0, "reviewed_head_sha": SHA_A, "needs_fix_round": False}),
+        id="zero-round",
+    ),
+    pytest.param(json.dumps({"round": 1, "reviewed_head_sha": SHA_A}), id="missing-needs-fix"),
+    pytest.param(
+        json.dumps({"round": 1, "reviewed_head_sha": SHA_A, "needs_fix_round": 0}),
+        id="int-needs-fix",
+    ),
+    pytest.param(
+        json.dumps({"round": 1, "reviewed_head_sha": SHA_A[:7], "needs_fix_round": False}),
+        id="short-sha",
+    ),
+    pytest.param(
+        json.dumps({"round": 1, "reviewed_head_sha": 1, "needs_fix_round": False}), id="int-sha"
+    ),
+    pytest.param(json.dumps([1]), id="not-an-object"),
+    pytest.param("{not json", id="not-json"),
+    pytest.param(
+        json.dumps({"round": 1, "reviewed_head_sha": SHA_A, "needs_fix_round": False, "note": "x"}),
+        id="extra-key",
+    ),
+    pytest.param(
+        json.dumps(
+            {
+                "round": 1,
+                "reviewed_head_sha": SHA_A,
+                "needs_fix_round": True,
+                "finding_ids": "R1-F1",
+            }
+        ),
+        id="finding-ids-not-a-list",
+    ),
+    pytest.param(
+        json.dumps(
+            {
+                "round": 1,
+                "reviewed_head_sha": SHA_A,
+                "needs_fix_round": True,
+                "finding_ids": ["R2-F1"],
+            }
+        ),
+        id="finding-id-of-another-round",
+    ),
+    pytest.param(
+        json.dumps(
+            {
+                "round": 1,
+                "reviewed_head_sha": SHA_A,
+                "needs_fix_round": True,
+                "finding_ids": ["R1-F1", "R1-F1"],
+            }
+        ),
+        id="finding-id-repeated",
+    ),
+    pytest.param(
+        # Two complete, well-formed markers in one comment: the comment
+        # publishes two identities and proves neither.
+        json.dumps({"round": 1, "reviewed_head_sha": SHA_A, "needs_fix_round": False})
+        + " -->\n<!-- ai-review-result: "
+        + json.dumps({"round": 1, "reviewed_head_sha": SHA_A, "needs_fix_round": True}),
+        id="two-markers-in-one-comment",
+    ),
+]
+
+
+@pytest.mark.parametrize("marker_json", _MALFORMED_MARKERS)
+def test_review_verification_rejects_a_malformed_marker(tmp_state_dir, marker_json):
+    """The reviewer posts a comment whose marker is not the documented shape
+    (`true == 1` and `1.0 == 1` in Python must not make it round 1). The
+    read-back meets a marker it cannot read: the round's comment set is
+    inconclusive, the result is rejected, nothing is consumed."""
+    gh = FakeGitHub()
+
+    def reviews(req):
+        gh.add_comment(PR, 100, _review_body_with_marker(marker_json))
+        return block(review_payload(1, SHA_A, []))
+
+    eng = _in_review(tmp_state_dir, gh, reviews)
+    with pytest.raises(VerificationError, match="cannot establish which comment carries"):
+        eng.step()
+    assert eng.state.phase == Phase.REVIEW and eng.state.review_round == 0
+
+
+@pytest.mark.parametrize("marker_json", _MALFORMED_MARKERS)
+def test_review_entry_blocks_on_a_malformed_marker_without_invoking(tmp_state_dir, marker_json):
+    """The entry scan and the read-back consume the same claim model: a
+    comment carrying a review marker the controller cannot read is neither
+    adopted nor passed over. "No comment claims this round" is not provable
+    while one comment's claim is unreadable (it may be an interrupted
+    reviewer's post), so the entry blocks and names the comment instead of
+    launching a reviewer that would post a second review."""
+    gh = FakeGitHub()
+    gh.add_comment(PR, 90, _review_body_with_marker(marker_json))
+    eng = _in_review(tmp_state_dir, gh, ["never"])
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and eng.provider.calls == []
+    reason = load_state(eng.paths.state_file).block_reason
+    assert "cannot establish which comment carries the ai-review-result marker" in reason
+    assert comment_url(PR, 90) in reason and eng.state.review_round == 0
 
 
 def test_review_head_changes_during_review_re_reviews(tmp_state_dir):
@@ -482,6 +947,87 @@ def test_fix_valid_head_changed(tmp_state_dir):
     assert s.review_round == 1  # next review is round 2
 
 
+def test_fix_post_agent_journal_refusal_keeps_the_phase_for_resume(tmp_state_dir):
+    """#55 in REMOTE mode, FIX: the fixer pushed, then the journal append was
+    refused. The phase, the bound HEAD and the open findings are unchanged
+    and the launch is persisted as attempt 1; the refusal names the accepted
+    result it interrupted and that `resume` re-enters FIX and routes a pushed
+    HEAD back to REVIEW. The resume then finds HEAD past the reviewed one and
+    schedules the review of the actual HEAD without launching a fixer."""
+    from autoforge.runlog import MAX_EVENT_JOURNAL_BYTES
+
+    gh = FakeGitHub()
+
+    def fixes_then_enlarges_the_journal(req):
+        gh.set_head(SHA_B)
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        journal.touch()
+        os.truncate(journal, 2 * MAX_EVENT_JOURNAL_BYTES)
+        return block(fix_payload(SHA_A, SHA_B, [{"finding_id": "R1-F1", "resolution": "fixed"}]))
+
+    eng = _in_fix(tmp_state_dir, gh, fixes_then_enlarges_the_journal)
+    journal = Path(eng.paths.logs_dir) / eng.state.run_id / "events.jsonl"
+    with pytest.raises(
+        StateError,
+        match=r"corrupted event journal.*interrupted attempt 1 of FIX after the agent had "
+        r"returned with: a CONTROL_RESULT the controller accepted.*then 'resume': it "
+        r"re-enters FIX and routes a HEAD already pushed past the reviewed one back to REVIEW",
+    ):
+        eng.step()
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.FIX and s.review_round == 1 and s.attempt == 1
+    assert s.current_head_sha == SHA_A and s.reviewed_head_sha == SHA_A
+    assert [f["id"] for f in s.open_findings] == ["R1-F1"] and s.last_fix_resolutions == []
+    assert journal.stat().st_size == 2 * MAX_EVENT_JOURNAL_BYTES, "not carried forward"
+    assert sorted(p.name for p in journal.parent.iterdir() if p.is_dir()) == ["001-fix-1"]
+    eng.close()
+
+    os.truncate(journal, 0)
+    eng2 = make_engine(tmp_state_dir, ["never"], github=gh)
+    eng2.load()
+    out = eng2.step()
+    assert out.next_phase == "REVIEW" and "no fixer launched" in out.message
+    assert eng2.provider.calls == []
+    s = load_state(eng2.paths.state_file)
+    assert s.phase == Phase.REVIEW and s.current_head_sha == SHA_B
+    assert s.open_findings == [] and s.last_review_result == "stale" and s.attempt == 0
+
+
+def test_fix_entry_with_head_past_the_reviewed_one_goes_to_review_without_a_fixer(
+    tmp_state_dir,
+):
+    """PR #89 F1, FIX side: the HEAD the findings are bound to is no longer
+    the PR HEAD when FIX is entered (an unrecorded fix, an operator push).
+    The general HEAD-binding rule applies: the review is stale, the actual
+    HEAD gets reviewed, and no fixer is launched against findings of a
+    commit that is no longer the PR."""
+    gh = FakeGitHub()
+    eng = _in_fix(tmp_state_dir, gh, ["never"])
+    gh.set_head(SHA_B)
+    out = eng.step()
+    assert out.next_phase == "REVIEW" and eng.provider.calls == []
+    assert "past the reviewed HEAD" in out.message and "no fixer launched" in out.message
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.REVIEW and s.review_round == 1
+    assert s.current_head_sha == SHA_B and s.reviewed_head_sha == SHA_A
+    assert s.open_findings == [] and s.last_fix_resolutions == []
+    assert s.last_review_result == "stale" and s.attempt == 0
+
+
+def test_fix_entry_binds_the_unchanged_head_and_launches_the_fixer(tmp_state_dir):
+    """HEAD still equals the reviewed HEAD at FIX entry: the fixer runs."""
+    gh = FakeGitHub()
+
+    def on_call(req):
+        gh.set_head(SHA_B)
+        return block(fix_payload(SHA_A, SHA_B, [{"finding_id": "R1-F1", "resolution": "fixed"}]))
+
+    eng = _in_fix(tmp_state_dir, gh, on_call)
+    assert eng.step().next_phase == "REVIEW"
+    assert len(eng.provider.calls) == 1
+    assert ("get_pr", PR) in gh.calls
+
+
 def test_fix_returned_sha_mismatch_rejected(tmp_state_dir):
     gh = FakeGitHub()
 
@@ -532,13 +1078,273 @@ def test_fix_must_cover_all_findings(tmp_state_dir):
 
 def test_fix_follow_up_issue_verified(tmp_state_dir):
     gh = FakeGitHub()
-    gh.add_issue(ISSUE3, "follow-up")
-    res = [
-        {"finding_id": "R1-F1", "resolution": "follow_up_created", "follow_up_issue_url": ISSUE3}
-    ]
-    eng = _in_fix(tmp_state_dir, gh, [block(fix_payload(SHA_A, SHA_A, res))])
+
+    def creates_follow_up(req):
+        gh.add_issue(ISSUE3, "follow-up", body=follow_up_issue_body("R1-F1"))
+        return block(fix_payload(SHA_A, SHA_A, _follow_up("R1-F1", ISSUE3)))
+
+    eng = _in_fix(tmp_state_dir, gh, creates_follow_up)
     assert eng.step().next_phase == "REVIEW"  # no commit needed for a pure follow-up
     assert ("get_issue", ISSUE3) in gh.calls
+    assert ("list_open_issues", "owner/repo", True) in gh.calls
+
+
+def _follow_up(finding_id: str, url: str) -> list[dict]:
+    return [
+        {"finding_id": finding_id, "resolution": "follow_up_created", "follow_up_issue_url": url}
+    ]
+
+
+# -- FIX entry and read-back: follow-up issues (PR #89 review, F3) -------------------------
+def test_fix_entry_hands_an_existing_follow_up_issue_to_the_fixer(tmp_state_dir):
+    """A fixer whose result was never recorded created the follow-up issue and
+    pushed nothing, so the HEAD is unchanged and a HEAD probe sees nothing.
+    The open issue carrying the (PR, finding) marker is what records that
+    write; the entry finds it, names it in the prompt, and the fixer reports
+    it instead of creating a second one."""
+    gh = FakeGitHub()
+    gh.add_issue(ISSUE3, "follow-up", body=follow_up_issue_body("R1-F1"))
+    from autoforge.engine import render_follow_up_marker
+
+    def adopts(req):
+        marker = render_follow_up_marker(PR, "R1-F1")
+        assert f"- R1-F1: marker `{marker}`; existing issue: {ISSUE3}" in req.prompt
+        return block(fix_payload(SHA_A, SHA_A, _follow_up("R1-F1", ISSUE3)))
+
+    eng = _in_fix(tmp_state_dir, gh, adopts)
+    assert eng.step().next_phase == "REVIEW"
+    assert len(eng.provider.calls) == 1 and len(gh.issues) == 1 + 2  # EPIC, ISSUE, ISSUE3
+
+
+def test_fix_entry_blocks_on_two_follow_up_issues_for_one_finding_without_invoking(
+    tmp_state_dir,
+):
+    gh = FakeGitHub()
+    other = "https://github.com/owner/repo/issues/4"
+    gh.add_issue(ISSUE3, "follow-up", body=follow_up_issue_body("R1-F1"))
+    gh.add_issue(other, "follow-up again", body=follow_up_issue_body("R1-F1"))
+    eng = _in_fix(tmp_state_dir, gh, ["never"])
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and eng.provider.calls == []
+    reason = load_state(eng.paths.state_file).block_reason
+    assert "2 open issues carry the ai-follow-up marker for finding R1-F1" in reason
+    assert ISSUE3 in reason and other in reason and "exactly one remains" in reason
+
+
+def test_fix_entry_blocks_when_the_open_issue_listing_cannot_be_proven_complete(
+    tmp_state_dir,
+):
+    """ "No follow-up issue exists" is a claim about every open issue; a listing
+    that may be truncated cannot make it, and a fixer launched on it could
+    create a second issue. BLOCKED, nobody launched, HEAD not bound."""
+    gh = FakeGitHub()
+    gh.issue_listing_truncated = True
+    eng = _in_fix(tmp_state_dir, gh, ["never"])
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and eng.provider.calls == []
+    reason = load_state(eng.paths.state_file).block_reason
+    assert "cannot establish which follow-up issues already exist" in reason
+    assert "may be truncated" in reason
+
+
+def test_fix_entry_ignores_a_closed_issue_carrying_the_marker(tmp_state_dir):
+    """A closed follow-up is not the finding's open follow-up: the fixer is
+    told none exists and may create one during its run."""
+    gh = FakeGitHub()
+    gh.add_issue(ISSUE3, "closed follow-up", state="CLOSED", body=follow_up_issue_body("R1-F1"))
+    new = "https://github.com/owner/repo/issues/5"
+
+    def creates(req):
+        assert "; existing issue: (none)" in req.prompt and ISSUE3 not in req.prompt
+        gh.add_issue(new, "follow-up", body=follow_up_issue_body("R1-F1"))
+        return block(fix_payload(SHA_A, SHA_A, _follow_up("R1-F1", new)))
+
+    eng = _in_fix(tmp_state_dir, gh, creates)
+    assert eng.step().next_phase == "REVIEW"
+
+
+# -- earlier rounds' follow-ups reach the reviewer and the fixer (PR #89 review F2, #90) ---
+def test_review_entry_hands_the_prs_existing_follow_up_issues_to_the_reviewer(tmp_state_dir):
+    """Finding ids are round-scoped, so the reviewer of round 2 is told which
+    problems round 1's fixer already deferred, by finding id and issue."""
+    gh = FakeGitHub()
+    other = "https://github.com/owner/repo/issues/4"
+    gh.add_issue(ISSUE3, "deferred", body=follow_up_issue_body("R1-F2"))
+    gh.add_issue(other, "deferred too", body=follow_up_issue_body("R1-F1"))
+    gh.add_issue(
+        "https://github.com/owner/repo/issues/5",
+        "closed",
+        state="CLOSED",
+        body=follow_up_issue_body("R1-F3"),
+    )
+    gh.add_issue(
+        "https://github.com/owner/repo/issues/6",
+        "another PR",
+        body=follow_up_issue_body("R1-F1", "https://github.com/owner/repo/pull/41"),
+    )
+
+    def reviews(req):
+        assert (f"from\n  earlier rounds:\n  - R1-F1: {other}\n- R1-F2: {ISSUE3}\n") in req.prompt
+        assert "issues/5" not in req.prompt and "issues/6" not in req.prompt
+        gh.add_comment(PR, 100, review_comment_body(2, SHA_A, False))
+        return block(review_payload(2, SHA_A, []))
+
+    eng = _in_review(tmp_state_dir, gh, reviews, round_done=1)
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    assert ("list_open_issues", "owner/repo", True) in gh.calls
+
+
+def test_review_entry_blocks_when_the_open_issue_listing_cannot_be_proven_complete(
+    tmp_state_dir,
+):
+    gh = FakeGitHub()
+    gh.issue_listing_truncated = True
+    eng = _in_review(tmp_state_dir, gh, ["never"])
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and eng.provider.calls == []
+    reason = load_state(eng.paths.state_file).block_reason
+    assert "cannot establish which follow-up issues already exist for PR" in reason
+    assert "may be truncated" in reason
+
+
+def test_fix_entry_hands_earlier_rounds_follow_ups_to_the_fixer(tmp_state_dir):
+    """The open finding's own follow-up slot is empty; the deferral of an
+    earlier round is listed separately, so a re-raised problem can be
+    recorded on the issue that exists instead of in a second one."""
+    gh = FakeGitHub()
+    gh.add_issue(ISSUE3, "deferred in round 1", body=follow_up_issue_body("R1-F2"))
+    from autoforge.engine import render_follow_up_marker
+
+    def adds_the_marker(req):
+        marker = render_follow_up_marker(PR, "R2-F1")
+        assert f"- R2-F1: marker `{marker}`; existing issue: (none)" in req.prompt
+        assert f"earlier rounds (finding id:\nissue):\n\n- R1-F2: {ISSUE3}\n" in req.prompt
+        gh.issues[ISSUE3].body += marker + "\n"  # the same problem: one issue, two markers
+        return block(fix_payload(SHA_A, SHA_A, _follow_up("R2-F1", ISSUE3)))
+
+    eng = _in_fix(tmp_state_dir, gh, adds_the_marker, findings=[_finding(2)])
+    eng.state.review_round = 2
+    assert eng.step().next_phase == "REVIEW"
+    assert len(gh.issues) == 3  # EPIC, ISSUE, ISSUE3: no second follow-up issue
+    assert eng.state.last_fix_resolutions[0]["follow_up_issue_url"] == ISSUE3
+
+
+def test_a_deferral_survives_an_unrecorded_fix_round(tmp_state_dir):
+    """Issue #90's scenario end to end: the fixer creates the follow-up issue,
+    pushes, and loses its result. The FIX re-entry routes to REVIEW of the
+    pushed HEAD (which findings the push resolved is not inferred), and that
+    review is told about the issue, so the problem is not re-raised under a
+    new id; the run ends clean with one follow-up issue."""
+    gh = FakeGitHub()
+    new = "https://github.com/owner/repo/issues/5"
+
+    def agent(req):
+        if req.phase == "FIX":
+            assert not req.correction
+            gh.add_issue(new, "follow-up", body=follow_up_issue_body("R1-F1"))
+            gh.set_head(SHA_B)
+            return "junk\n"  # the result block was lost
+        assert req.phase == "REVIEW"
+        assert f"earlier rounds:\n  - R1-F1: {new}\n" in req.prompt
+        gh.add_comment(PR, 100, review_comment_body(2, SHA_B, False))
+        return block(review_payload(2, SHA_B, []))
+
+    eng = _in_fix(tmp_state_dir, gh, agent)
+    out = eng.step()
+    assert out.next_phase == "REVIEW" and "no fixer launched" in out.message
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    assert [c.phase for c in eng.provider.calls] == ["FIX", "REVIEW"]
+    assert len(gh.issues) == 3  # EPIC, ISSUE, the one follow-up
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "",
+        follow_up_issue_body("R1-F2"),
+        follow_up_issue_body("R1-F1", "https://github.com/owner/repo/pull/41"),
+    ],
+    ids=["no-marker", "another-finding", "another-pr"],
+)
+def test_fix_follow_up_issue_not_carrying_the_findings_marker_is_rejected(tmp_state_dir, body):
+    """An existing open issue is not a follow-up of this finding unless it
+    carries the (PR, finding) marker; the marker is what a later entry finds,
+    so an unmarked follow-up would be recreated on the next relaunch."""
+    gh = FakeGitHub()
+    gh.add_issue(ISSUE3, "some issue", body=body)
+    eng = _in_fix(
+        tmp_state_dir, gh, [block(fix_payload(SHA_A, SHA_A, _follow_up("R1-F1", ISSUE3)))]
+    )
+    with pytest.raises(VerificationError, match="is not the open issue carrying the marker"):
+        eng.step()
+    assert eng.state.phase == Phase.FIX
+
+
+def test_fix_follow_up_claiming_another_issue_than_the_marked_one_is_rejected(tmp_state_dir):
+    gh = FakeGitHub()
+    other = "https://github.com/owner/repo/issues/4"
+    gh.add_issue(ISSUE3, "the marked one", body=follow_up_issue_body("R1-F1"))
+    gh.add_issue(other, "unmarked")
+    eng = _in_fix(tmp_state_dir, gh, [block(fix_payload(SHA_A, SHA_A, _follow_up("R1-F1", other)))])
+    with pytest.raises(VerificationError, match=rf"carrying the marker .*\(that is {ISSUE3}\)"):
+        eng.step()
+
+
+def test_fix_resolving_a_finding_otherwise_while_its_follow_up_issue_is_open_is_rejected(
+    tmp_state_dir,
+):
+    """The marked open issue is the durable record of the finding's
+    disposition; a result that contradicts it is not adopted, and state never
+    records a resolution GitHub does not carry."""
+    gh = FakeGitHub()
+    gh.add_issue(ISSUE3, "follow-up", body=follow_up_issue_body("R1-F1"))
+
+    def fixes_instead(req):
+        gh.set_head(SHA_B)
+        return block(fix_payload(SHA_A, SHA_B, [{"finding_id": "R1-F1", "resolution": "fixed"}]))
+
+    eng = _in_fix(tmp_state_dir, gh, fixes_instead)
+    with pytest.raises(VerificationError, match="resolved as fixed but open issue .* carries"):
+        eng.step()
+    assert eng.state.phase == Phase.FIX and eng.state.last_fix_resolutions == []
+
+
+def test_fix_creating_a_second_follow_up_issue_is_rejected_then_blocked(tmp_state_dir):
+    """The fixer ignores the existing issue and creates another: the result is
+    rejected on read-back (the rule is not trusted to the prompt), and the
+    next entry blocks on the pair instead of launching a third fixer."""
+    gh = FakeGitHub()
+    other = "https://github.com/owner/repo/issues/4"
+    gh.add_issue(ISSUE3, "follow-up", body=follow_up_issue_body("R1-F1"))
+
+    def creates_again(req):
+        gh.add_issue(other, "follow-up again", body=follow_up_issue_body("R1-F1"))
+        return block(fix_payload(SHA_A, SHA_A, _follow_up("R1-F1", other)))
+
+    eng = _in_fix(tmp_state_dir, gh, creates_again)
+    with pytest.raises(VerificationError, match="2 open issues carry the ai-follow-up marker"):
+        eng.step()
+    assert eng.step().next_phase == "BLOCKED"
+    assert len(eng.provider.calls) == 1
+
+
+def test_fix_follow_up_read_back_lets_an_unavailable_issue_read_through_as_transient(
+    tmp_state_dir,
+):
+    """A follow-up issue `gh` cannot reach is not a follow-up issue that does
+    not exist: the transient error propagates instead of becoming a
+    VerificationError that feeds the correction loop and stagnation."""
+    gh = FakeGitHub()
+    gh.add_issue(ISSUE3, "follow-up", body=follow_up_issue_body("R1-F1"))
+
+    def fixes(req):
+        gh.get_issue_error = GitHubUnavailableError("`gh issue view` failed (exit 1): HTTP 502")
+        return block(fix_payload(SHA_A, SHA_A, _follow_up("R1-F1", ISSUE3)))
+
+    eng = _in_fix(tmp_state_dir, gh, fixes)
+    with pytest.raises(GitHubUnavailableError):
+        eng.step()
+    assert len(eng.provider.calls) == 1
 
 
 def test_fix_follow_up_issue_missing_rejected(tmp_state_dir):
@@ -631,12 +1437,36 @@ def test_remote_fix_resolutions_are_redacted_before_they_are_persisted(tmp_state
 
 
 # -- correction retry ---------------------------------------------------------------------
+def test_malformed_result_after_the_pr_was_created_is_recovered_not_corrected(
+    tmp_state_dir, fake_github
+):
+    """PR #89 review F1: a correction relaunch is a re-entry like any other,
+    so the phase's GitHub reconciliation runs before it. The agent created
+    the PR and then lost its result block: the PR is adopted and no
+    correction is launched."""
+
+    def agent(req):
+        assert not req.correction
+        fake_github.add_pr(
+            head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body()
+        )  # PR was created…
+        return "no block here\n"  # …but the result block was lost
+
+    eng = make_engine(tmp_state_dir, agent, github=fake_github)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    out = eng.step()
+    assert out.next_phase == "REVIEW" and "recovered" in out.message
+    assert len(eng.provider.calls) == 1
+    s = load_state(eng.paths.state_file)
+    assert s.current_pr_url == PR and s.current_head_sha == SHA_A and s.attempt == 0
+
+
 def test_malformed_result_triggers_one_correction(tmp_state_dir, fake_github):
     def agent(req):
         if not req.correction:
-            fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2])  # PR was created…
-            return "no block here\n"  # …but the result block was lost
-        return block(ANALYZE_OK)  # correction run recovers and reports it
+            return "no block here\n"  # nothing was done, and no result block
+        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
+        return block(ANALYZE_OK)  # correction run does the work and reports it
 
     eng = make_engine(tmp_state_dir, agent, github=fake_github)
     eng.state.phase = Phase.ANALYZE_EXECUTE
@@ -655,6 +1485,75 @@ def test_malformed_result_triggers_one_correction(tmp_state_dir, fake_github):
     assert len(dirs) == 2 and dirs[0].endswith("-1") and dirs[1].endswith("-2")
     assert (run_dir / dirs[0] / "error.txt").exists()
     assert (run_dir / dirs[1] / "control-result.json").exists()
+
+
+def test_correction_after_the_review_comment_was_posted_adopts_it(tmp_state_dir):
+    """The reviewer posted the round's comment, then returned junk. The
+    correction relaunch is preceded by the REVIEW entry probe: the comment is
+    handed to the corrected reviewer, which adopts it. One comment remains."""
+    gh = FakeGitHub()
+
+    def reviews(req):
+        if not req.correction:
+            gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
+            return "junk\n"
+        assert f"THIS HEAD (if any):\n  {comment_url(PR, 100)}" in req.prompt
+        return block(review_payload(1, SHA_A, []))
+
+    eng = _in_review(tmp_state_dir, gh, reviews)
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    assert len(eng.provider.calls) == 2 and len(gh.comments[PR]) == 1
+
+
+def test_correction_after_the_fix_was_pushed_goes_to_review_without_relaunching(tmp_state_dir):
+    """The fixer pushed, then returned junk. Before the correction relaunch
+    the FIX entry probe sees the HEAD past the reviewed one and routes to
+    REVIEW of the actual HEAD; a fixer is never relaunched against findings
+    its push may have resolved."""
+    gh = FakeGitHub()
+
+    def pushes_then_junk(req):
+        assert not req.correction
+        gh.set_head(SHA_B)
+        return "junk\n"
+
+    eng = _in_fix(tmp_state_dir, gh, pushes_then_junk)
+    out = eng.step()
+    assert out.next_phase == "REVIEW" and "no fixer launched" in out.message
+    assert len(eng.provider.calls) == 1
+    s = load_state(eng.paths.state_file)
+    assert s.current_head_sha == SHA_B and s.last_review_result == "stale" and s.attempt == 0
+
+
+def test_correction_after_the_progress_comment_was_posted_adopts_it(tmp_state_dir, fake_github):
+    """UPDATE_EPIC: the agent posted the progress comment, then returned junk.
+    The correction is told about the comment and does not post again."""
+
+    def agent(req):
+        if not req.correction:
+            post_progress_comment(fake_github)
+            return "junk\n"
+        assert f"for this issue (if any):\n  {comment_url(EPIC, 300)}" in req.prompt
+        return _epic_result(None)
+
+    eng = _in_update_epic(tmp_state_dir, fake_github, agent)
+    assert eng.step().next_phase == "DONE"
+    assert len(eng.provider.calls) == 2 and len(fake_github.comments[EPIC]) == 1
+
+
+def test_every_remote_agent_phase_reconciles_with_github_before_launching():
+    """The run-log refusal names what `resume` does on re-entry; every REMOTE
+    phase with an agent prompt has such a description because every one of
+    them reconciles in `_remote_entry`. The table cannot silently fall back
+    to "relaunches the agent" for a phase that was left out."""
+    from autoforge.engine import _REMOTE_REENTRY_RECONCILIATION, PHASE_TEMPLATE
+
+    agent_phases = {p for p, template in PHASE_TEMPLATE.items() if template}
+    assert set(_REMOTE_REENTRY_RECONCILIATION) == agent_phases
+    assert all(
+        "relaunch" not in text or "instead of relaunching" in text
+        for text in _REMOTE_REENTRY_RECONCILIATION.values()
+    )
 
 
 def test_correction_is_bounded(tmp_state_dir, fake_github):
@@ -707,6 +1606,95 @@ def test_timeout_raises_and_keeps_state(tmp_state_dir, fake_github):
     with pytest.raises(ExecutionTimeoutError):
         eng.step()
     assert eng.state.phase == Phase.ANALYZE_EXECUTE
+
+
+# -- post-agent run-log refusal: every outcome persists the launch (PR #89 F2) ---------
+class _TimingOut(ScriptedProvider):
+    def execute(self, req):
+        self.calls.append(req)
+        if self._handler is not None:
+            self._handler(req)
+        return AgentExecutionResult(
+            command=["x"],
+            exit_code=-1,
+            stdout="",
+            stderr="",
+            started_at="t",
+            finished_at="t",
+            timed_out=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "outcome, expected",
+    [
+        ("timeout", r"timed out after \d+s"),
+        ("exit", r"exit 3"),
+        ("malformed", r"ControlResultError: "),
+    ],
+)
+def test_post_agent_journal_refusal_names_the_outcome_and_keeps_the_attempt(
+    tmp_state_dir, outcome, expected
+):
+    """PR #89 F2: the launch is persisted before the agent starts, so an
+    invocation that times out, exits non-zero or returns no result and then
+    has its journal append refused is still on disk as attempt 1, its
+    artifacts are published, and the refusal names the outcome it
+    interrupted instead of masking it. Nothing is launched again -- not the
+    correction a malformed result would otherwise earn."""
+    from autoforge.runlog import MAX_EVENT_JOURNAL_BYTES
+
+    gh = FakeGitHub()
+    seen_attempts: list[int] = []
+    eng = _in_review(tmp_state_dir, gh, None)
+    journal = Path(eng.paths.logs_dir) / eng.state.run_id / "events.jsonl"
+
+    def enlarges_the_journal(req):
+        seen_attempts.append(load_state(eng.paths.state_file).attempt)
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        journal.touch()
+        os.truncate(journal, 2 * MAX_EVENT_JOURNAL_BYTES)
+        return "no block here\n"
+
+    if outcome == "timeout":
+        provider = _TimingOut(None)
+        provider._handler = enlarges_the_journal
+        eng.providers._overrides = {"claude": provider, "opencode": provider}
+    else:
+        provider = eng.provider
+        provider._handler = enlarges_the_journal
+        if outcome == "exit":
+            provider.exit_code = 3
+    with pytest.raises(
+        StateError,
+        match=r"corrupted event journal.*interrupted attempt 1 of REVIEW after the agent had "
+        r"returned with: " + expected,
+    ):
+        eng.step()
+    assert seen_attempts == [1], "the launch was not persisted before the agent ran"
+    assert len(provider.calls) == 1, "nothing is launched again until the log is repaired"
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.REVIEW and s.review_round == 0 and s.attempt == 1
+    step_dirs = sorted(p.name for p in journal.parent.iterdir() if p.is_dir())
+    assert step_dirs == ["001-review-1"]
+    assert (journal.parent / step_dirs[0] / "error.txt").exists()
+    assert journal.stat().st_size == 2 * MAX_EVENT_JOURNAL_BYTES, "not carried forward"
+
+
+def test_launch_is_persisted_before_the_agent_runs(tmp_state_dir):
+    """The attempt counter is on disk when the agent starts: a crash anywhere
+    inside the invocation leaves a state that says a launch happened."""
+    gh = FakeGitHub()
+    seen: list[int] = []
+
+    def reads_state(req):
+        seen.append(load_state(eng.paths.state_file).attempt)
+        gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
+        return block(review_payload(1, SHA_A, []))
+
+    eng = _in_review(tmp_state_dir, gh, reads_state)
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    assert seen == [1] and load_state(eng.paths.state_file).attempt == 0
 
 
 # -- agent-reported failure / blocked ----------------------------------------------------------
@@ -2269,8 +3257,23 @@ def _epic_result(next_issue_url) -> str:
     return block({"phase": "UPDATE_EPIC", "status": "success", "next_issue_url": next_issue_url})
 
 
-def _in_update_epic(tmp_state_dir, gh, script):
-    """Engine parked in UPDATE_EPIC right after the controller merged PR for ISSUE."""
+def _in_update_epic(tmp_state_dir, gh, script, posts_progress: bool = True):
+    """Engine parked in UPDATE_EPIC right after the controller merged PR for ISSUE.
+
+    A list of scripted results stands for an agent that posts the progress
+    comment once (an invocation asked again adopts the one it posted) and
+    returns the results in turn; ``posts_progress=False`` is an agent that
+    skipped the phase's write.
+    """
+    if isinstance(script, list):
+        queue = list(script)
+
+        def scripted(req):
+            if posts_progress:
+                post_progress_comment(gh)
+            return queue.pop(0)
+
+        script = scripted
     eng = make_engine(tmp_state_dir, script, github=gh)
     gh.add_pr(head_sha=SHA_A, state="MERGED")
     eng.state.phase = Phase.UPDATE_EPIC
@@ -2305,6 +3308,88 @@ def test_update_epic_null_completes_the_run(tmp_state_dir, fake_github):
     s = load_state(eng.paths.state_file)
     assert s.current_issue_url == ISSUE and s.merged_since_epic_update == 0
     assert [c for c in fake_github.calls if c[0] == "get_issue"] == []
+
+
+# -- UPDATE_EPIC entry and read-back: the progress comment (PR #89 review, F2) -------------
+def test_update_epic_entry_hands_an_existing_progress_comment_to_the_agent(
+    tmp_state_dir, fake_github
+):
+    """An interrupted UPDATE_EPIC already posted the progress comment. The
+    entry reads the EPIC, names the comment, and the agent adopts it."""
+    fake_github.add_comment(EPIC, 300, progress_comment_body())
+
+    def adopts(req):
+        assert f"for this issue (if any):\n  {comment_url(EPIC, 300)}" in req.prompt
+        return _epic_result(None)
+
+    eng = _in_update_epic(tmp_state_dir, fake_github, adopts)
+    assert eng.step().next_phase == "DONE"
+    assert len(fake_github.comments[EPIC]) == 1
+    assert ("get_issue_comments", EPIC) in fake_github.calls
+
+
+def test_update_epic_entry_ignores_a_progress_comment_for_another_pr(tmp_state_dir, fake_github):
+    """The marker binds the comment to (issue, PR): an earlier issue's or PR's
+    progress comment on the same EPIC is not this entry's."""
+    other_pr = "https://github.com/owner/repo/pull/41"
+    fake_github.add_comment(EPIC, 299, progress_comment_body(ISSUE, other_pr))
+    fake_github.add_comment(EPIC, 298, progress_comment_body(ISSUE3, PR))
+
+    def posts(req):
+        assert "for this issue (if any):\n  (none)" in req.prompt
+        post_progress_comment(fake_github)
+        return _epic_result(None)
+
+    eng = _in_update_epic(tmp_state_dir, fake_github, posts)
+    assert eng.step().next_phase == "DONE"
+    assert len(fake_github.comments[EPIC]) == 3
+
+
+def test_update_epic_entry_blocks_on_two_progress_comments_without_invoking(
+    tmp_state_dir, fake_github
+):
+    fake_github.add_comment(EPIC, 300, progress_comment_body())
+    fake_github.add_comment(EPIC, 301, progress_comment_body())
+    eng = _in_update_epic(tmp_state_dir, fake_github, ["never"])
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and eng.provider.calls == []
+    s = load_state(eng.paths.state_file)
+    assert "2 comments carry the ai-epic-progress marker for issue" in s.block_reason
+    assert comment_url(EPIC, 300) in s.block_reason and comment_url(EPIC, 301) in s.block_reason
+    assert s.current_issue_url == ISSUE and s.merged_since_epic_update == 1
+
+
+def test_update_epic_without_the_progress_comment_is_rejected(tmp_state_dir, fake_github):
+    """The phase's write is read back, never inferred from the result: an
+    agent that selected the next issue but posted nothing has not done the
+    phase. No switch, no selection queried, the phase stays for `resume`."""
+    fake_github.add_issue(ISSUE3, "Next")
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(ISSUE3)], posts_progress=False)
+    with pytest.raises(VerificationError, match="no comment carries the ai-epic-progress marker"):
+        eng.step()
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.UPDATE_EPIC and s.current_issue_url == ISSUE and s.attempt == 1
+    assert s.next_issue_rejections == []  # not a selection rejection
+    assert [c for c in fake_github.calls if c[0] == "get_issue"] == []
+
+
+def test_update_epic_posting_a_second_progress_comment_is_rejected_then_blocked(
+    tmp_state_dir, fake_github
+):
+    fake_github.add_comment(EPIC, 300, progress_comment_body())
+
+    def posts_again(req):
+        fake_github.add_comment(EPIC, 301, progress_comment_body())
+        return _epic_result(None)
+
+    eng = _in_update_epic(tmp_state_dir, fake_github, posts_again)
+    with pytest.raises(
+        VerificationError, match="2 comments carry the ai-epic-progress marker.*one progress"
+    ):
+        eng.step()
+    assert load_state(eng.paths.state_file).phase == Phase.UPDATE_EPIC
+    assert eng.step().next_phase == "BLOCKED"
+    assert len(eng.provider.calls) == 1
 
 
 def _assert_not_switched(eng, gh, url_queried: str | None):
@@ -2479,6 +3564,10 @@ def test_update_epic_rejection_is_retried_once_with_the_reason_then_blocked(
     assert len(eng.provider.calls) == 2
     retry_prompt = eng.provider.calls[1].prompt
     assert "issues/999 does not exist on GitHub" in retry_prompt
+    # PR #89 F2: the re-selection is a re-entry; the progress comment the
+    # first invocation posted is handed over, not posted again.
+    assert f"for this issue (if any):\n  {comment_url(EPIC, 300)}" in retry_prompt
+    assert len(fake_github.comments[EPIC]) == 1
     assert out.next_phase == "BLOCKED"
     s = load_state(eng.paths.state_file)
     assert s.phase == Phase.BLOCKED and "2 time(s)" in s.block_reason
@@ -2585,7 +3674,7 @@ def _loop_agent(gh: FakeGitHub, findings_for_round, seen: list[str] | None = Non
     def agent(req):
         seen.append(req.phase)
         if req.phase == "ANALYZE_EXECUTE":
-            gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2])
+            gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
             return block(ANALYZE_OK)
         if req.phase == "REVIEW":
             rounds["n"] += 1
@@ -2777,7 +3866,7 @@ def test_review_stale_round_is_recorded_and_breaks_the_stagnation_streak(tmp_sta
 def test_failed_review_invocation_consumes_neither_round_nor_history(tmp_state_dir):
     gh = FakeGitHub()
     eng = _in_review(tmp_state_dir, gh, [block(review_payload(1, SHA_A, [_finding(1)]))])
-    with pytest.raises(VerificationError, match="not found on PR"):  # no review comment
+    with pytest.raises(VerificationError, match="no comment carries"):  # no review comment
         eng.step()
     s = load_state(eng.paths.state_file)
     assert s.review_round == 0 and s.review_history == [] and s.phase == Phase.REVIEW
@@ -2785,7 +3874,7 @@ def test_failed_review_invocation_consumes_neither_round_nor_history(tmp_state_d
 
 def test_new_pr_resets_review_history(tmp_state_dir, fake_github):
     def on_call(req):
-        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH)
+        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, body=implementation_pr_body())
         return block(ANALYZE_OK)
 
     eng = make_engine(tmp_state_dir, on_call, github=fake_github)
@@ -2859,8 +3948,10 @@ def test_oversized_review_is_rejected_and_corrected(tmp_state_dir, fake_github):
     ids = [f"R1-F{n}" for n in range(1, MAX_FINDINGS_PER_REVIEW + 2)]
 
     def agent(req):
-        fake_github.add_comment(PR, 100, review_comment_body(1, SHA_A, True, ids[:1]))
         if not req.correction:
+            # Posted once; the correction re-emits the result for that
+            # comment instead of posting a second one for the round.
+            fake_github.add_comment(PR, 100, review_comment_body(1, SHA_A, True, ids[:1]))
             return block(_oversized_review(1, SHA_A))
         return block(review_payload(1, SHA_A, [_finding(1, 1)]))
 
@@ -3027,11 +4118,16 @@ def test_fix_prompt_size_is_bounded_by_the_review_bounds(tmp_state_dir, fake_git
     escape_width = 6  # escape_inline: a control character renders as \\xNN or \\uNNNN
     indent_width = 5  # a newline inside required_resolution renders as "\n" + 4 spaces
     framing = 64  # classification, separators, the "Required resolution:" label
+    # The follow-up section renders one more line per finding: the id, its
+    # marker (the PR URL and the id again, JSON-quoted) and the existing
+    # issue URL or "(none)"; every part is bounded by the id and URL bounds.
+    follow_up_line = 2 * MAX_FINDING_ID_CHARS + 2 * MAX_URL_CHARS + framing
     per_finding = (
         MAX_FINDING_ID_CHARS  # the id's shape admits no control character
         + escape_width * (MAX_FINDING_TITLE_CHARS + MAX_FINDING_LOCATION_CHARS)
         + indent_width * MAX_FINDING_RESOLUTION_CHARS
         + framing
+        + follow_up_line
     )
     # Opening and closing fence, one longer than the longest possible run.
     longest_field = max(
@@ -3039,12 +4135,14 @@ def test_fix_prompt_size_is_bounded_by_the_review_bounds(tmp_state_dir, fake_git
     )
     fence_overhead = 2 * (longest_field + 1)
     assert len(full) - empty <= MAX_FINDINGS_PER_REVIEW * per_finding + fence_overhead
-    assert full.count("\n- R1-F") == MAX_FINDINGS_PER_REVIEW  # one rendered line per finding
+    # One rendered line per finding in the findings list and one in the
+    # follow-up section, nothing else.
+    assert full.count("\n- R1-F") == 2 * MAX_FINDINGS_PER_REVIEW
     if ch in ("\x00", "\u2028"):
         # The one-line fields were escaped, not passed through; the resolution
         # is block-quoted, so the fence, not an escape, is what contains it.
         heads = [line for line in full.split("\n") if line.startswith("- R1-F")]
-        assert len(heads) == MAX_FINDINGS_PER_REVIEW
+        assert len(heads) == 2 * MAX_FINDINGS_PER_REVIEW  # findings + follow-up section
         assert not any(ch in line for line in heads)
 
 
@@ -3087,7 +4185,9 @@ def test_truncated_stdout_accepts_a_block_that_lies_in_the_tail(tmp_state_dir, f
     provider = _TruncatedOutputProvider(
         "runaway logs " * 100,
         "last logs\n" + block(ANALYZE_OK),
-        on_call=lambda: fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2]),
+        on_call=lambda: fake_github.add_pr(
+            head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body()
+        ),
     )
     _install(eng, provider)
     eng.state.phase = Phase.ANALYZE_EXECUTE
@@ -3118,3 +4218,521 @@ def test_truncated_stdout_never_accepts_a_block_from_the_head(tmp_state_dir, fak
     run_dir = eng.paths.logs_dir / eng.state.run_id
     step = next(p for p in run_dir.iterdir() if p.is_dir())
     assert "capture bound" in (step / "error.txt").read_text(encoding="utf-8")
+
+
+# =====================================================================================
+# The shared durable-claim protocol (PR #89 re-review): entry reconciliation and
+# post-agent read-back consume one validated identity model, for every marker kind.
+# =====================================================================================
+PR41 = "https://github.com/owner/repo/pull/41"
+ISSUE4 = "https://github.com/owner/repo/issues/4"
+
+
+def _impl_marker(payload: object) -> str:
+    text = payload if isinstance(payload, str) else json.dumps(payload)
+    return f"Closes {ISSUE}\n\n<!-- ai-implementation: {text} -->\n"
+
+
+_UNREADABLE_IMPLEMENTATION_BODIES = [
+    pytest.param(_impl_marker({"issue": 2}), id="issue-not-a-url"),
+    pytest.param(_impl_marker({"issue": ISSUE, "pr": PR}), id="extra-key"),
+    pytest.param(_impl_marker("{broken"), id="not-json"),
+    pytest.param(_impl_marker([ISSUE]), id="not-an-object"),
+    pytest.param(implementation_pr_body(ISSUE) + implementation_pr_body(ISSUE3), id="two-issues"),
+    pytest.param(implementation_pr_body(ISSUE) * 2, id="same-issue-twice"),
+    pytest.param(implementation_pr_body(ISSUE3) * 2, id="another-issue-twice"),
+]
+
+
+def test_analyze_entry_block_reason_never_carries_an_over_long_marker_url(
+    tmp_state_dir, fake_github
+):
+    """A marker URL is untrusted text the entry persists a defect about: the
+    reason names its length and the bound, and stays bounded itself, so a
+    hostile PR body cannot write itself into the state file."""
+    hostile = "https://github.com/owner/repo/issues/" + "9" * 10_000
+    fake_github.add_pr(
+        url=PR41, head_sha=SHA_B, branch="feature/lost", body=_impl_marker({"issue": hostile})
+    )
+    eng = make_engine(tmp_state_dir, ["never"], github=fake_github)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and eng.provider.calls == []
+    reason = load_state(eng.paths.state_file).block_reason
+    assert "9" * 64 not in reason and len(reason) < 2_000
+    assert f"{len(hostile)} characters" in reason and f"at most {MAX_URL_CHARS}" in reason
+    assert f"open PR {PR41}" in reason and "repair the unreadable marker" in reason
+
+
+@pytest.mark.parametrize("body", _UNREADABLE_IMPLEMENTATION_BODIES)
+def test_analyze_entry_blocks_on_an_unreadable_implementation_marker_without_launching(
+    tmp_state_dir, fake_github, body
+):
+    """An open PR carrying a marker the controller cannot read is not "no
+    PR": it may be this issue's PR, botched by an interrupted agent. "No PR
+    implements this issue yet" is not provable while it exists, so the entry
+    blocks, names the PR, and launches no agent that could create a second
+    implementation. This holds when the unreadable PR is marked for another
+    issue too: the defect is the object's, whatever it names."""
+    fake_github.add_pr(url=PR41, head_sha=SHA_B, branch="feature/lost", body=body)
+    eng = make_engine(tmp_state_dir, ["never"], github=fake_github)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and eng.provider.calls == []
+    reason = load_state(eng.paths.state_file).block_reason
+    assert "ai-implementation marker" in reason and f"open PR {PR41}" in reason
+    assert "repair the unreadable marker" in reason and eng.state.current_pr_url == ""
+
+
+@pytest.mark.parametrize("body", _UNREADABLE_IMPLEMENTATION_BODIES)
+def test_analyze_read_back_rejects_when_any_open_pr_carries_an_unreadable_marker(
+    tmp_state_dir, fake_github, body
+):
+    """The read-back asks the same question of the same collection: the agent
+    created the right PR, but another open PR (its own abandoned draft, an
+    operator's) carries a marker that could not be read, so "exactly one PR
+    carries this issue's marker" is not established and nothing is persisted."""
+
+    def agent(req):
+        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, body=implementation_pr_body())
+        fake_github.add_pr(url=PR41, head_sha=SHA_B, branch="feature/draft", body=body)
+        return block(ANALYZE_OK)
+
+    eng = make_engine(tmp_state_dir, agent, github=fake_github)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    with pytest.raises(VerificationError, match=f"cannot accept PR {PR} .*open PR {PR41}"):
+        eng.step()
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.ANALYZE_EXECUTE and s.current_pr_url == ""
+
+
+def test_analyze_pr_carrying_this_issues_marker_and_anothers_is_rejected_then_blocked(
+    tmp_state_dir, fake_github
+):
+    """PR #89 F4: a PR marked for the current issue *and* another issue is not
+    "the current issue's PR with noise". It publishes two identities and
+    proves neither, on read-back and at the next entry alike."""
+
+    def agent(req):
+        fake_github.add_pr(
+            head_sha=SHA_A,
+            branch=BRANCH,
+            body=implementation_pr_body(ISSUE) + implementation_pr_body(ISSUE3),
+        )
+        return block(ANALYZE_OK)
+
+    eng = make_engine(tmp_state_dir, agent, github=fake_github)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    with pytest.raises(VerificationError, match="carries 2 ai-implementation markers"):
+        eng.step()
+    assert eng.state.current_pr_url == ""
+    assert eng.step().next_phase == "BLOCKED" and len(eng.provider.calls) == 1
+    reason = load_state(eng.paths.state_file).block_reason
+    assert f"open PR {PR}: carries 2 ai-implementation markers" in reason
+
+
+def test_analyze_read_back_reads_the_pr_from_the_listing_snapshot_not_a_second_view(
+    tmp_state_dir,
+):
+    """PR #89 F1: the identity check and the state/HEAD/branch checks must
+    see the same PR. A client whose single-PR view still shows the marker
+    while the listing (the collection the next entry reads) does not must
+    not get the PR accepted: the listing is the one snapshot."""
+
+    class ViewDisagrees(FakeGitHub):
+        def get_pr(self, url):
+            pr = super().get_pr(url)
+            return replace(pr, body=implementation_pr_body())  # the view says "marked"
+
+    gh = ViewDisagrees()
+
+    def agent(req):
+        gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body="")  # the listing says "not"
+        return block(ANALYZE_OK)
+
+    eng = make_engine(tmp_state_dir, agent, github=gh)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    with pytest.raises(VerificationError, match="no open PR carries the ai-implementation marker"):
+        eng.step()
+    assert eng.state.current_pr_url == ""
+
+
+def test_analyze_read_back_rejects_when_the_marked_pr_is_not_the_reported_one(
+    tmp_state_dir, fake_github
+):
+    """The agent reports PR 42 while the one open PR carrying the marker is
+    PR 41: the report is not adopted, and neither is PR 41 (the agent's
+    claim and GitHub's record disagree, so nothing is proven)."""
+
+    def agent(req):
+        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, body="")
+        fake_github.add_pr(url=PR41, head_sha=SHA_A, branch=BRANCH, body=implementation_pr_body())
+        return block(ANALYZE_OK)
+
+    eng = make_engine(tmp_state_dir, agent, github=fake_github)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    with pytest.raises(VerificationError, match=f"agent reported PR {PR} but .* is {PR41}"):
+        eng.step()
+    assert eng.state.current_pr_url == ""
+
+
+def test_analyze_read_back_rejects_when_the_open_pr_listing_cannot_be_proven_complete(
+    tmp_state_dir, fake_github
+):
+    """The read-back's "exactly one" is a claim about every open PR, like the
+    entry's "at most one": a listing that may be truncated cannot make it."""
+
+    def agent(req):
+        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, body=implementation_pr_body())
+        fake_github.pr_listing_truncated = True
+        return block(ANALYZE_OK)
+
+    eng = make_engine(tmp_state_dir, agent, github=fake_github)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    with pytest.raises(VerificationError, match="cannot accept PR .* may be truncated"):
+        eng.step()
+    assert eng.state.current_pr_url == "" and eng.state.phase == Phase.ANALYZE_EXECUTE
+
+
+def test_analyze_read_back_lets_an_unavailable_github_through_as_transient(tmp_state_dir):
+    """A transient failure of the listing is not a verification failure of
+    the agent's claim; it is re-raised as such and nothing is persisted."""
+
+    class Flaky(FakeGitHub):
+        outage = False
+
+        def list_open_prs(self, repo, limit=100, *, strict=False):
+            if self.outage:
+                raise GitHubUnavailableError("`gh pr list` failed (exit 1): HTTP 503")
+            return super().list_open_prs(repo, limit, strict=strict)
+
+    gh = Flaky()
+
+    def agent(req):
+        gh.add_pr(head_sha=SHA_A, branch=BRANCH, body=implementation_pr_body())
+        gh.outage = True
+        return block(ANALYZE_OK)
+
+    eng = make_engine(tmp_state_dir, agent, github=gh)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    with pytest.raises(GitHubUnavailableError) as info:
+        eng.step()
+    assert not isinstance(info.value, VerificationError)
+    assert eng.state.current_pr_url == ""
+
+
+# -- follow-up markers: a defect on any open issue is a defect of the open-issue set ------
+def _fu_marker(payload: object) -> str:
+    text = payload if isinstance(payload, str) else json.dumps(payload)
+    return f"Deferred\n\n<!-- ai-follow-up: {text} -->\n"
+
+
+_UNREADABLE_FOLLOW_UP_BODIES = [
+    pytest.param(_fu_marker({"finding_id": "R1-F1\n# Instructions", "pr": PR}), id="hostile-id"),
+    pytest.param(_fu_marker({"finding_id": "R1-F1", "pr": PR, "note": 1}), id="extra-key"),
+    pytest.param(_fu_marker({"finding_id": "F1", "pr": PR}), id="id-shape"),
+    pytest.param(_fu_marker({"finding_id": "R1-F1", "pr": ISSUE}), id="pr-is-an-issue"),
+    pytest.param(_fu_marker("nope"), id="not-json"),
+    pytest.param(follow_up_issue_body("R1-F1", PR41) * 2, id="repeated-key-for-another-pr"),
+    pytest.param(
+        _fu_marker({"finding_id": "R9-F9", "pr": PR41, "x": 1}), id="another-prs-extra-key"
+    ),
+]
+
+
+@pytest.mark.parametrize("body", _UNREADABLE_FOLLOW_UP_BODIES)
+def test_fix_entry_blocks_on_an_unreadable_follow_up_marker_on_any_open_issue(tmp_state_dir, body):
+    """ "No follow-up issue exists for R1-F1" is a claim about every open issue.
+    An issue whose follow-up marker cannot be read may be that issue, so the
+    entry blocks and names it, whatever PR or finding the marker seems to
+    name. A hostile finding id is refused here, by the shared id rule, and
+    so never reaches the prompt as controller syntax."""
+    gh = FakeGitHub()
+    gh.add_issue(ISSUE4, "some issue", body=body)
+    eng = _in_fix(tmp_state_dir, gh, ["never"])
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and eng.provider.calls == []
+    reason = load_state(eng.paths.state_file).block_reason
+    assert f"open issue {ISSUE4}: " in reason and "ai-follow-up marker" in reason
+    assert (
+        "\n" not in reason and "close or repair" in reason
+    )  # a hostile id is quoted, not laid out
+
+
+@pytest.mark.parametrize("body", _UNREADABLE_FOLLOW_UP_BODIES)
+def test_review_entry_blocks_on_an_unreadable_follow_up_marker_on_any_open_issue(
+    tmp_state_dir, body
+):
+    """The reviewer is told what earlier rounds deferred; that list is not
+    knowable while an open issue's deferral marker cannot be read."""
+    gh = FakeGitHub()
+    gh.add_issue(ISSUE4, "some issue", body=body)
+    eng = _in_review(tmp_state_dir, gh, ["never"])
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and eng.provider.calls == []
+    reason = load_state(eng.paths.state_file).block_reason
+    assert "cannot establish which follow-up issues already exist for PR" in reason
+    assert f"open issue {ISSUE4}: " in reason and "\n" not in reason
+
+
+def test_fix_read_back_rejects_when_any_open_issue_carries_an_unreadable_follow_up_marker(
+    tmp_state_dir,
+):
+    """The fixer created a well-formed follow-up issue and also botched a
+    marker elsewhere (an edit to another issue): the open-issue set is
+    inconclusive, the result is rejected, no resolution is recorded."""
+    gh = FakeGitHub()
+
+    def fixes(req):
+        gh.add_issue(ISSUE3, "follow-up", body=follow_up_issue_body("R1-F1"))
+        gh.add_issue(ISSUE4, "botched", body=_fu_marker({"finding_id": "R1-F1", "pr": PR, "z": 0}))
+        return block(fix_payload(SHA_A, SHA_A, _follow_up("R1-F1", ISSUE3)))
+
+    eng = _in_fix(tmp_state_dir, gh, fixes)
+    with pytest.raises(VerificationError, match=f"open issue {ISSUE4}: .*at most one follow-up"):
+        eng.step()
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.FIX and s.last_fix_resolutions == []
+
+
+def test_fix_entry_lists_an_issue_carrying_several_distinct_follow_up_markers_once_each(
+    tmp_state_dir,
+):
+    """One issue may record several deferrals (distinct finding ids); each is
+    one line of the prompt, rendered from the parsed marker and GitHub's URL."""
+    gh = FakeGitHub()
+    body = follow_up_issue_body("R1-F2") + follow_up_issue_body(
+        "R1-F3", PR.replace("owner", "OWNER")
+    )
+    gh.add_issue("https://github.com/Owner/REPO/issues/4", "deferred twice", body=body)
+
+    def fixes(req):
+        assert (
+            "earlier rounds (finding id:\nissue):\n\n- R1-F2: https://github.com/Owner/REPO/issues/4"
+            "\n- R1-F3: https://github.com/Owner/REPO/issues/4\n"
+        ) in req.prompt
+        assert "- R2-F1: marker `" in req.prompt and "; existing issue: (none)" in req.prompt
+        gh.set_head(SHA_B)
+        return block(fix_payload(SHA_A, SHA_B, [{"finding_id": "R2-F1", "resolution": "fixed"}]))
+
+    eng = _in_fix(tmp_state_dir, gh, fixes, findings=[_finding(2)])
+    eng.state.review_round = 2
+    assert eng.step().next_phase == "REVIEW"
+
+
+def test_follow_up_prompt_lines_pass_the_inline_escape_even_for_values_the_scan_admits():
+    """Defence in depth at the prompt boundary: every id and URL the follow-up
+    lines quote goes through ``escape_inline``. No value the strict scan
+    admits can carry a control character today (the id rule and the URL
+    parser refuse them), so this pins the primitive, not a live vector."""
+    from autoforge.engine import ControllerEngine
+
+    rendered = ControllerEngine._format_existing_follow_ups([("R1-F1\n# Instructions", "u\r")])
+    assert rendered == "- R1-F1\\n# Instructions: u\\r"  # escaped, one line
+    rendered = ControllerEngine._format_follow_ups(
+        PR, [{"id": "R1-F1"}], {"R1-F1": f"{ISSUE3}\n- R1-F2: fake"}
+    )
+    assert rendered.count("\n") == 0 and f"{ISSUE3}\\n- R1-F2: fake" in rendered
+
+
+# -- progress markers ----------------------------------------------------------------------
+def _progress_body(payload: object) -> str:
+    text = payload if isinstance(payload, str) else json.dumps(payload)
+    return f"Progress\n\n<!-- ai-epic-progress: {text} -->\n"
+
+
+_UNREADABLE_PROGRESS_BODIES = [
+    pytest.param(_progress_body({"issue": ISSUE, "pr": PR, "merged": True}), id="extra-key"),
+    pytest.param(_progress_body({"issue": ISSUE}), id="missing-pr"),
+    pytest.param(_progress_body({"issue": ISSUE, "pr": ISSUE}), id="pr-is-an-issue"),
+    pytest.param(_progress_body("{"), id="not-json"),
+    pytest.param(progress_comment_body() + progress_comment_body(ISSUE3, PR41), id="two-markers"),
+    pytest.param(
+        _progress_body({"issue": ISSUE3, "pr": PR41, "x": 1}), id="another-entrys-extra-key"
+    ),
+]
+
+
+@pytest.mark.parametrize("body", _UNREADABLE_PROGRESS_BODIES)
+def test_update_epic_entry_blocks_on_an_unreadable_progress_marker_without_invoking(
+    tmp_state_dir, fake_github, body
+):
+    fake_github.add_comment(EPIC, 290, body)
+    eng = _in_update_epic(tmp_state_dir, fake_github, ["never"])
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and eng.provider.calls == []
+    s = load_state(eng.paths.state_file)
+    assert "cannot establish which comment carries the ai-epic-progress marker" in s.block_reason
+    assert f"comment {comment_url(EPIC, 290)}: " in s.block_reason
+    assert s.current_issue_url == ISSUE and s.merged_since_epic_update == 1
+
+
+@pytest.mark.parametrize("body", _UNREADABLE_PROGRESS_BODIES)
+def test_update_epic_read_back_rejects_an_unreadable_progress_marker(
+    tmp_state_dir, fake_github, body
+):
+    def agent(req):
+        fake_github.add_comment(EPIC, 290, body)
+        return _epic_result(None)
+
+    eng = _in_update_epic(tmp_state_dir, fake_github, agent)
+    with pytest.raises(VerificationError, match="cannot establish which comment carries"):
+        eng.step()
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.UPDATE_EPIC and s.current_issue_url == ISSUE
+
+
+# -- the correction relaunch is an entry: a botched write blocks it, it does not relaunch --
+def test_correction_after_a_botched_review_comment_blocks_instead_of_relaunching(tmp_state_dir):
+    """The reviewer posted a comment whose marker cannot be read, then
+    returned junk. The correction relaunch is preceded by the REVIEW entry,
+    which meets the defect and blocks: a second reviewer would post a
+    second comment beside the unreadable one."""
+    gh = FakeGitHub()
+
+    def reviews(req):
+        assert not req.correction, "a correction must not be launched"
+        gh.add_comment(PR, 100, _review_body_with_marker(json.dumps({"round": 1})))
+        return "junk\n"
+
+    eng = _in_review(tmp_state_dir, gh, reviews)
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and len(eng.provider.calls) == 1
+    reason = load_state(eng.paths.state_file).block_reason
+    assert "cannot establish which comment carries the ai-review-result marker" in reason
+    assert comment_url(PR, 100) in reason and len(gh.comments[PR]) == 1
+
+
+def test_correction_after_a_botched_progress_comment_blocks_instead_of_relaunching(
+    tmp_state_dir, fake_github
+):
+    def agent(req):
+        assert not req.correction, "a correction must not be launched"
+        fake_github.add_comment(EPIC, 300, _progress_body({"issue": ISSUE, "pr": PR, "k": 1}))
+        return "junk\n"
+
+    eng = _in_update_epic(tmp_state_dir, fake_github, agent)
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and len(eng.provider.calls) == 1
+    reason = load_state(eng.paths.state_file).block_reason
+    assert "cannot establish which comment carries the ai-epic-progress marker" in reason
+    assert len(fake_github.comments[EPIC]) == 1
+
+
+def test_correction_after_a_botched_implementation_pr_blocks_instead_of_relaunching(
+    tmp_state_dir, fake_github
+):
+    def agent(req):
+        assert not req.correction, "a correction must not be launched"
+        fake_github.add_pr(
+            head_sha=SHA_A, branch=BRANCH, body=_impl_marker({"issue": ISSUE, "n": 1})
+        )
+        return "junk\n"
+
+    eng = make_engine(tmp_state_dir, agent, github=fake_github)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and len(eng.provider.calls) == 1
+    reason = load_state(eng.paths.state_file).block_reason
+    assert f"open PR {PR}: ai-implementation marker payload is invalid" in reason
+    assert len(fake_github.prs) == 1
+
+
+# -- a comment listing the client refuses is inconclusive, like any other strict read --
+# One rule for every durable-claim read: GitHubUnavailableError is transient and
+# propagates; a conclusive GitHubError (a row `gh` returned that is not a comment)
+# blocks the entry without launching and rejects the read-back. A malformed row
+# must never read as "no comment carries the marker".
+_MALFORMED_COMMENT_ROW = GitHubError(
+    "comment on https://github.com/owner/repo/pull/42: url None is not a GitHub comment URL"
+)
+
+
+def test_review_entry_blocks_when_the_comment_listing_cannot_be_decoded(tmp_state_dir):
+    gh = FakeGitHub()
+    gh.comments_error = _MALFORMED_COMMENT_ROW
+    eng = _in_review(tmp_state_dir, gh, ["never"])
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and eng.provider.calls == []
+    reason = load_state(eng.paths.state_file).block_reason
+    assert "cannot establish which comment carries the review for round 1" in reason
+    assert "not a GitHub comment URL" in reason and eng.state.review_round == 0
+
+
+def test_review_entry_lets_an_unavailable_comment_listing_through_as_transient(tmp_state_dir):
+    gh = FakeGitHub()
+    gh.comments_error = GitHubUnavailableError("`gh pr view` failed (exit 1): HTTP 502")
+    eng = _in_review(tmp_state_dir, gh, ["never"])
+    with pytest.raises(GitHubUnavailableError):
+        eng.step()
+    assert eng.provider.calls == [] and load_state(eng.paths.state_file).phase == Phase.REVIEW
+
+
+def test_review_read_back_rejects_when_the_comment_listing_cannot_be_decoded(tmp_state_dir):
+    gh = FakeGitHub()
+
+    def reviews(req):
+        gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
+        gh.comments_error = _MALFORMED_COMMENT_ROW
+        return block(review_payload(1, SHA_A, []))
+
+    eng = _in_review(tmp_state_dir, gh, reviews)
+    with pytest.raises(VerificationError, match="not a GitHub comment URL.*exactly one review"):
+        eng.step()
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.REVIEW and s.review_round == 0 and s.review_history == []
+
+
+def test_review_read_back_lets_an_unavailable_comment_listing_through_as_transient(
+    tmp_state_dir,
+):
+    gh = FakeGitHub()
+
+    def reviews(req):
+        gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
+        gh.comments_error = GitHubUnavailableError("`gh pr view` failed (exit 1): HTTP 502")
+        return block(review_payload(1, SHA_A, []))
+
+    eng = _in_review(tmp_state_dir, gh, reviews)
+    with pytest.raises(GitHubUnavailableError):
+        eng.step()
+    assert load_state(eng.paths.state_file).review_round == 0
+
+
+def test_update_epic_entry_blocks_when_the_comment_listing_cannot_be_decoded(
+    tmp_state_dir, fake_github
+):
+    fake_github.comments_error = _MALFORMED_COMMENT_ROW
+    eng = _in_update_epic(tmp_state_dir, fake_github, ["never"])
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and eng.provider.calls == []
+    s = load_state(eng.paths.state_file)
+    assert "is the progress comment for issue" in s.block_reason
+    assert "not a GitHub comment URL" in s.block_reason
+    assert s.current_issue_url == ISSUE and s.merged_since_epic_update == 1
+
+
+def test_update_epic_entry_lets_an_unavailable_comment_listing_through_as_transient(
+    tmp_state_dir, fake_github
+):
+    fake_github.comments_error = GitHubUnavailableError("`gh issue view` failed: HTTP 502")
+    eng = _in_update_epic(tmp_state_dir, fake_github, ["never"])
+    with pytest.raises(GitHubUnavailableError):
+        eng.step()
+    assert eng.provider.calls == []
+    assert load_state(eng.paths.state_file).phase == Phase.UPDATE_EPIC
+
+
+def test_update_epic_read_back_rejects_when_the_comment_listing_cannot_be_decoded(
+    tmp_state_dir, fake_github
+):
+    def agent(req):
+        post_progress_comment(fake_github)
+        fake_github.comments_error = _MALFORMED_COMMENT_ROW
+        return _epic_result(None)
+
+    eng = _in_update_epic(tmp_state_dir, fake_github, agent)
+    with pytest.raises(VerificationError, match="not a GitHub comment URL.*identifies the issue"):
+        eng.step()
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.UPDATE_EPIC and s.current_issue_url == ISSUE
