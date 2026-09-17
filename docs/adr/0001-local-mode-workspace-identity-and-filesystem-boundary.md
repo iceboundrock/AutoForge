@@ -495,13 +495,15 @@ The invocation is not lost to the refusal: its step directory and artifacts
 are published before the journal line, the refusal says where they are, and
 the launch checkpoint was persisted before the agent started, so `resume`
 re-enters the phase as a retry judged against the baseline from before the
-first launch. A REMOTE run has no such checkpoint; there the refusal lands
+first launch. A REMOTE run has no tree checkpoint; there the refusal lands
 in the same window as a timeout, a non-zero exit or a verification failure
-(README "Recovery rules"): the phase is left unchanged, the error says that
-the agent's GitHub side effects may already exist, and `resume` re-enters
-the phase. The controller-side probe that would adopt an existing review
-comment or a landed push instead of relaunching the agent is #14, and is
-what closes that window for every failure in it, this one included.
+(README "Recovery rules"): the launch is persisted as a used attempt, the
+phase is left unchanged, the error says that the agent's GitHub side effects
+may already exist, and `resume` re-enters the phase, which reconciles with
+GitHub before launching anyone (an existing open PR, a review comment
+already posted for the round at its HEAD, a HEAD already pushed past the
+reviewed one). That reconciliation is what closes the window for every
+failure in it, this one included.
 
 The crash guard that continues the sequence from step-directory names lists
 only the run's own directory, opened as a sub-root, and lists it under a

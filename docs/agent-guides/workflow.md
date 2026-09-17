@@ -116,6 +116,7 @@ workflow:
   touching anything `REPLAN_REEXECUTE` does after the policy has decided.
 - The step budget is measured on the persisted cumulative `step_count`, which is never reset by `resume` or by switching issues. CLI `--max-steps` bounds a single invocation only.
 - Failed invocations consume neither a review round nor a `review_history` entry.
+- A `FIX` entry that finds the PR HEAD past the reviewed HEAD goes back to `REVIEW` without launching the fixer (see **Re-entering REVIEW and FIX** below). That review of the actual HEAD is an ordinary round: it counts against the cap, and if it reports the same findings as the previous round it counts towards stagnation like any other repeated round. This is intended: the loop guard measures whether the PR is converging, and an unrecorded push that resolved nothing is not progress.
 - Hitting any bound is `BLOCKED` (terminal). The open findings and the PR stay for a human; nothing is merged.
 
 ---
@@ -135,6 +136,41 @@ current_pr_head_sha == reviewed_head_sha
 If the PR HEAD changes after review, the prior clean review is stale and the PR must return to `REVIEW`.
 
 Never merge code that has changed since the latest clean review.
+
+The same rule covers a review with findings. The open findings are bound to
+`reviewed_head_sha`; a PR HEAD past it that the controller did not verify
+(an unrecorded fix, an operator push) makes those findings findings of a
+commit that is no longer the PR. Which of them the push resolved is not
+knowable from controller state and is never inferred, so `FIX` is entered
+only while `current_pr_head_sha == reviewed_head_sha`; otherwise the review
+is marked stale and the actual HEAD is reviewed (`FIX -> REVIEW`).
+
+### Re-entering REVIEW and FIX
+
+`resume` re-enters the persisted phase, and the engine cannot tell a first
+entry from a re-entry after an interrupted step (timeout, non-zero exit,
+malformed result, verification failure, refused run-log write, crash). In
+every one of those the agent may already have done its GitHub work. GitHub
+is the source of truth, so both phases read the PR before launching anyone,
+exactly as `ANALYZE_EXECUTE` recovers an existing open PR:
+
+- `REVIEW` reads the PR comments for the `ai-review-result` marker of the
+  upcoming round at the bound HEAD. One such comment is handed to the
+  reviewer (`EXISTING_REVIEW_COMMENT_URL`) to adopt, or to edit in place,
+  instead of posting a second one. Two or more is a state the controller
+  cannot resolve without choosing which review is the round's, so it enters
+  `BLOCKED` without invoking anyone and names the comments. A comment for the
+  same round at another HEAD is not this round's and is ignored. After the
+  reviewer returns, verification enforces that the round still has exactly
+  one comment at its HEAD; a reviewer that posted a second one has its round
+  rejected, and the next entry blocks on the pair.
+- `FIX` re-reads the PR HEAD. Equal to the reviewed HEAD: the fixer runs.
+  Past it: `FIX -> REVIEW` of the actual HEAD, no fixer launched (the rule
+  above). A fixer whose push landed but whose result was never recorded is
+  therefore never relaunched against findings its push may have resolved.
+
+Neither probe consumes a review round, a `review_history` entry, or an
+attempt.
 
 ---
 

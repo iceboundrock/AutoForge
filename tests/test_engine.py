@@ -415,11 +415,12 @@ def test_review_post_agent_journal_refusal_keeps_the_phase_for_resume(tmp_state_
     """#55 in REMOTE mode: the journal append that records the invocation is
     refused after the reviewer returned, in the same window as a timeout, a
     non-zero exit or a verification failure. The phase is left unchanged with
-    no round consumed, the invocation's artifacts are published, the oversized
-    journal is neither materialised nor carried forward, and the error tells
-    the operator that the comment may already exist on the PR. A resume
-    re-enters REVIEW; the controller-side probe that would adopt the existing
-    round-1 comment instead of relaunching the reviewer is #14."""
+    no round consumed, the attempt the launch was charged as is persisted,
+    the invocation's artifacts are published, the oversized journal is neither
+    materialised nor carried forward, and the refusal names the outcome it
+    interrupted and what `resume` will do. A resume in a new process re-enters
+    REVIEW, finds the round-1 comment the dead reviewer posted at this HEAD,
+    and hands it to the reviewer to adopt: the round ends with one comment."""
     from autoforge.runlog import MAX_EVENT_JOURNAL_BYTES
 
     gh = FakeGitHub()
@@ -436,8 +437,10 @@ def test_review_post_agent_journal_refusal_keeps_the_phase_for_resume(tmp_state_
     eng.provider._handler = reviews_then_enlarges_the_journal
     with pytest.raises(
         StateError,
-        match=r"corrupted event journal.*larger than.*a comment, a push, a PR.*may exist.*"
-        r"inspect the real Git/GitHub state, then 'resume', which re-enters REVIEW",
+        match=r"corrupted event journal.*larger than.*interrupted attempt 1 of REVIEW after the "
+        r"agent had returned with: a CONTROL_RESULT the controller accepted.*"
+        r"a comment, a push, a PR.*may exist.*Repair the log directory, then 'resume'.*"
+        r"re-enters REVIEW and hands a review comment already posted",
     ):
         eng.step()
     s = load_state(eng.paths.state_file)
@@ -448,6 +451,102 @@ def test_review_post_agent_journal_refusal_keeps_the_phase_for_resume(tmp_state_
     assert steps == ["001-review-1"]
     assert (journal.parent / steps[0] / "control-result.json").exists()
     assert len(gh.comments[PR]) == 1
+    eng.close()
+
+    # The operator repairs the journal and resumes in a new process.
+    os.truncate(journal, 0)
+    eng2 = make_engine(tmp_state_dir, None, github=gh)
+    eng2.load()
+
+    def adopts_the_existing_comment(req):
+        assert comment_url(PR, 100) in req.prompt, "the existing comment was not handed over"
+        return block(review_payload(1, SHA_A, [_finding(1)]))
+
+    eng2.provider._handler = adopts_the_existing_comment
+    assert eng2.step().next_phase == "FIX"
+    assert len(eng2.provider.calls) == 1
+    s = load_state(eng2.paths.state_file)
+    assert s.review_round == 1 and s.attempt == 0
+    assert s.last_review_comment_url == comment_url(PR, 100)
+    assert [f["id"] for f in s.open_findings] == ["R1-F1"]
+    assert len(gh.comments[PR]) == 1, "the round has exactly one comment"
+
+
+# -- REVIEW entry: reconciliation with the PR before the reviewer runs (PR #89 F1) ---------
+def test_review_entry_hands_an_existing_round_comment_to_the_reviewer(tmp_state_dir):
+    """A comment carrying the marker for the upcoming round at the bound HEAD
+    already exists (a reviewer whose result was never recorded). The
+    controller reads the PR first and names it in the prompt; the reviewer
+    adopts it instead of posting a second one."""
+    gh = FakeGitHub()
+    gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
+    eng = _in_review(tmp_state_dir, gh, [block(review_payload(1, SHA_A, []))])
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    prompt = eng.provider.calls[0].prompt
+    assert (
+        f"Comment already posted for THIS round at THIS HEAD (if any):\n  {comment_url(PR, 100)}"
+        in prompt
+    )
+    assert "THIS HEAD (if any):\n  (none)" not in prompt
+    assert len(gh.comments[PR]) == 1
+
+
+def test_review_entry_ignores_a_comment_for_the_round_at_another_head(tmp_state_dir):
+    """The marker binds a comment to (round, HEAD). A round-1 comment at SHA_B
+    when the round is bound to SHA_A is not this round's comment."""
+    gh = FakeGitHub()
+    gh.add_comment(PR, 90, review_comment_body(1, SHA_B, True, ["R1-F1"]))
+
+    def reviews(req):
+        gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
+        return block(review_payload(1, SHA_A, []))
+
+    eng = _in_review(tmp_state_dir, gh, reviews)
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    prompt = eng.provider.calls[0].prompt
+    assert "Comment already posted for THIS round at THIS HEAD (if any):\n  (none)" in prompt
+    assert comment_url(PR, 90) not in prompt
+
+
+def test_review_entry_blocks_on_two_comments_for_the_round_without_invoking(tmp_state_dir):
+    """Two comments claim the same (round, HEAD): the controller cannot know
+    which review is the round's and never chooses. BLOCKED, nobody launched,
+    and the reason names both so the operator can remove one."""
+    gh = FakeGitHub()
+    gh.add_comment(PR, 100, review_comment_body(1, SHA_A, True, ["R1-F1"]))
+    gh.add_comment(PR, 101, review_comment_body(1, SHA_A, False))
+    eng = _in_review(tmp_state_dir, gh, ["never"])
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and eng.provider.calls == []
+    reason = load_state(eng.paths.state_file).block_reason
+    assert "2 review comments for round 1" in reason
+    assert comment_url(PR, 100) in reason and comment_url(PR, 101) in reason
+    assert "exactly one remains" in reason
+
+
+def test_reviewer_posting_a_second_comment_for_the_round_is_rejected_then_blocked(
+    tmp_state_dir,
+):
+    """The reviewer ignores the existing comment and posts another: the round
+    is rejected after the fact (the uniqueness rule is enforced on read-back,
+    not trusted to the prompt), no round is consumed, and the next entry
+    blocks on the two comments instead of launching a third reviewer."""
+    gh = FakeGitHub()
+    gh.add_comment(PR, 100, review_comment_body(1, SHA_A, True, ["R1-F1"]))
+
+    def posts_again(req):
+        gh.add_comment(PR, 101, review_comment_body(1, SHA_A, True, ["R1-F1"]))
+        return block(review_payload(1, SHA_A, [_finding(1)], cid=101))
+
+    eng = _in_review(tmp_state_dir, gh, posts_again)
+    with pytest.raises(
+        VerificationError, match=r"2 review comments for round 1.*exactly one review comment"
+    ):
+        eng.step()
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.REVIEW and s.review_round == 0 and s.open_findings == []
+    assert eng.step().next_phase == "BLOCKED"
+    assert len(eng.provider.calls) == 1
 
 
 def test_review_head_changes_during_review_re_reviews(tmp_state_dir):
@@ -525,10 +624,11 @@ def test_fix_valid_head_changed(tmp_state_dir):
 
 def test_fix_post_agent_journal_refusal_keeps_the_phase_for_resume(tmp_state_dir):
     """#55 in REMOTE mode, FIX: the fixer pushed, then the journal append was
-    refused. The phase, the bound HEAD and the open findings are unchanged for
-    `resume`, and the error says the push may already have landed. The FIX
-    entry check that would notice HEAD != reviewed HEAD before relaunching is
-    #14."""
+    refused. The phase, the bound HEAD and the open findings are unchanged
+    and the launch is persisted as attempt 1; the refusal names the accepted
+    result it interrupted and that `resume` re-enters FIX and routes a pushed
+    HEAD back to REVIEW. The resume then finds HEAD past the reviewed one and
+    schedules the review of the actual HEAD without launching a fixer."""
     from autoforge.runlog import MAX_EVENT_JOURNAL_BYTES
 
     gh = FakeGitHub()
@@ -543,7 +643,10 @@ def test_fix_post_agent_journal_refusal_keeps_the_phase_for_resume(tmp_state_dir
     eng = _in_fix(tmp_state_dir, gh, fixes_then_enlarges_the_journal)
     journal = Path(eng.paths.logs_dir) / eng.state.run_id / "events.jsonl"
     with pytest.raises(
-        StateError, match=r"corrupted event journal.*then 'resume', which re-enters FIX"
+        StateError,
+        match=r"corrupted event journal.*interrupted attempt 1 of FIX after the agent had "
+        r"returned with: a CONTROL_RESULT the controller accepted.*then 'resume': it "
+        r"re-enters FIX and routes a HEAD already pushed past the reviewed one back to REVIEW",
     ):
         eng.step()
     s = load_state(eng.paths.state_file)
@@ -552,6 +655,52 @@ def test_fix_post_agent_journal_refusal_keeps_the_phase_for_resume(tmp_state_dir
     assert [f["id"] for f in s.open_findings] == ["R1-F1"] and s.last_fix_resolutions == []
     assert journal.stat().st_size == 2 * MAX_EVENT_JOURNAL_BYTES, "not carried forward"
     assert sorted(p.name for p in journal.parent.iterdir() if p.is_dir()) == ["001-fix-1"]
+    eng.close()
+
+    os.truncate(journal, 0)
+    eng2 = make_engine(tmp_state_dir, ["never"], github=gh)
+    eng2.load()
+    out = eng2.step()
+    assert out.next_phase == "REVIEW" and "no fixer launched" in out.message
+    assert eng2.provider.calls == []
+    s = load_state(eng2.paths.state_file)
+    assert s.phase == Phase.REVIEW and s.current_head_sha == SHA_B
+    assert s.open_findings == [] and s.last_review_result == "stale" and s.attempt == 0
+
+
+def test_fix_entry_with_head_past_the_reviewed_one_goes_to_review_without_a_fixer(
+    tmp_state_dir,
+):
+    """PR #89 F1, FIX side: the HEAD the findings are bound to is no longer
+    the PR HEAD when FIX is entered (an unrecorded fix, an operator push).
+    The general HEAD-binding rule applies: the review is stale, the actual
+    HEAD gets reviewed, and no fixer is launched against findings of a
+    commit that is no longer the PR."""
+    gh = FakeGitHub()
+    eng = _in_fix(tmp_state_dir, gh, ["never"])
+    gh.set_head(SHA_B)
+    out = eng.step()
+    assert out.next_phase == "REVIEW" and eng.provider.calls == []
+    assert "past the reviewed HEAD" in out.message and "no fixer launched" in out.message
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.REVIEW and s.review_round == 1
+    assert s.current_head_sha == SHA_B and s.reviewed_head_sha == SHA_A
+    assert s.open_findings == [] and s.last_fix_resolutions == []
+    assert s.last_review_result == "stale" and s.attempt == 0
+
+
+def test_fix_entry_binds_the_unchanged_head_and_launches_the_fixer(tmp_state_dir):
+    """HEAD still equals the reviewed HEAD at FIX entry: the fixer runs."""
+    gh = FakeGitHub()
+
+    def on_call(req):
+        gh.set_head(SHA_B)
+        return block(fix_payload(SHA_A, SHA_B, [{"finding_id": "R1-F1", "resolution": "fixed"}]))
+
+    eng = _in_fix(tmp_state_dir, gh, on_call)
+    assert eng.step().next_phase == "REVIEW"
+    assert len(eng.provider.calls) == 1
+    assert ("get_pr", PR) in gh.calls
 
 
 def test_fix_returned_sha_mismatch_rejected(tmp_state_dir):
@@ -779,6 +928,95 @@ def test_timeout_raises_and_keeps_state(tmp_state_dir, fake_github):
     with pytest.raises(ExecutionTimeoutError):
         eng.step()
     assert eng.state.phase == Phase.ANALYZE_EXECUTE
+
+
+# -- post-agent run-log refusal: every outcome persists the launch (PR #89 F2) ---------
+class _TimingOut(ScriptedProvider):
+    def execute(self, req):
+        self.calls.append(req)
+        if self._handler is not None:
+            self._handler(req)
+        return AgentExecutionResult(
+            command=["x"],
+            exit_code=-1,
+            stdout="",
+            stderr="",
+            started_at="t",
+            finished_at="t",
+            timed_out=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "outcome, expected",
+    [
+        ("timeout", r"timed out after \d+s"),
+        ("exit", r"exit 3"),
+        ("malformed", r"ControlResultError: "),
+    ],
+)
+def test_post_agent_journal_refusal_names_the_outcome_and_keeps_the_attempt(
+    tmp_state_dir, outcome, expected
+):
+    """PR #89 F2: the launch is persisted before the agent starts, so an
+    invocation that times out, exits non-zero or returns no result and then
+    has its journal append refused is still on disk as attempt 1, its
+    artifacts are published, and the refusal names the outcome it
+    interrupted instead of masking it. Nothing is launched again -- not the
+    correction a malformed result would otherwise earn."""
+    from autoforge.runlog import MAX_EVENT_JOURNAL_BYTES
+
+    gh = FakeGitHub()
+    seen_attempts: list[int] = []
+    eng = _in_review(tmp_state_dir, gh, None)
+    journal = Path(eng.paths.logs_dir) / eng.state.run_id / "events.jsonl"
+
+    def enlarges_the_journal(req):
+        seen_attempts.append(load_state(eng.paths.state_file).attempt)
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        journal.touch()
+        os.truncate(journal, 2 * MAX_EVENT_JOURNAL_BYTES)
+        return "no block here\n"
+
+    if outcome == "timeout":
+        provider = _TimingOut(None)
+        provider._handler = enlarges_the_journal
+        eng.providers._overrides = {"claude": provider, "opencode": provider}
+    else:
+        provider = eng.provider
+        provider._handler = enlarges_the_journal
+        if outcome == "exit":
+            provider.exit_code = 3
+    with pytest.raises(
+        StateError,
+        match=r"corrupted event journal.*interrupted attempt 1 of REVIEW after the agent had "
+        r"returned with: " + expected,
+    ):
+        eng.step()
+    assert seen_attempts == [1], "the launch was not persisted before the agent ran"
+    assert len(provider.calls) == 1, "nothing is launched again until the log is repaired"
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.REVIEW and s.review_round == 0 and s.attempt == 1
+    step_dirs = sorted(p.name for p in journal.parent.iterdir() if p.is_dir())
+    assert step_dirs == ["001-review-1"]
+    assert (journal.parent / step_dirs[0] / "error.txt").exists()
+    assert journal.stat().st_size == 2 * MAX_EVENT_JOURNAL_BYTES, "not carried forward"
+
+
+def test_launch_is_persisted_before_the_agent_runs(tmp_state_dir):
+    """The attempt counter is on disk when the agent starts: a crash anywhere
+    inside the invocation leaves a state that says a launch happened."""
+    gh = FakeGitHub()
+    seen: list[int] = []
+
+    def reads_state(req):
+        seen.append(load_state(eng.paths.state_file).attempt)
+        gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
+        return block(review_payload(1, SHA_A, []))
+
+    eng = _in_review(tmp_state_dir, gh, reads_state)
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    assert seen == [1] and load_state(eng.paths.state_file).attempt == 0
 
 
 # -- agent-reported failure / blocked ----------------------------------------------------------
@@ -2931,8 +3169,10 @@ def test_oversized_review_is_rejected_and_corrected(tmp_state_dir, fake_github):
     ids = [f"R1-F{n}" for n in range(1, MAX_FINDINGS_PER_REVIEW + 2)]
 
     def agent(req):
-        fake_github.add_comment(PR, 100, review_comment_body(1, SHA_A, True, ids[:1]))
         if not req.correction:
+            # Posted once; the correction re-emits the result for that
+            # comment instead of posting a second one for the round.
+            fake_github.add_comment(PR, 100, review_comment_body(1, SHA_A, True, ids[:1]))
             return block(_oversized_review(1, SHA_A))
         return block(review_payload(1, SHA_A, [_finding(1, 1)]))
 

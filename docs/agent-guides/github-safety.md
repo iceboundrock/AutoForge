@@ -27,6 +27,19 @@ Verify:
 - branch is correct
 - returned HEAD SHA matches GitHub
 
+### Before REVIEW
+
+The reviewer is launched only after the controller has read the PR's
+comments for a comment already carrying the `ai-review-result` marker of the
+upcoming round at the bound HEAD (an earlier invocation of the same round
+whose result was never recorded):
+
+- exactly one: its URL is handed to the reviewer as
+  `EXISTING_REVIEW_COMMENT_URL`, to adopt or edit in place, never duplicate
+- two or more: `BLOCKED` without launching the reviewer; the controller
+  never chooses which review is the round's
+- a comment for the same round at another HEAD is not this round's
+
 ### After REVIEW
 
 Verify:
@@ -35,6 +48,17 @@ Verify:
 - it belongs to the expected PR
 - review round marker is correct
 - reviewed HEAD is correct
+- it is the only comment carrying this round's marker at this HEAD; a
+  second one rejects the round (the uniqueness rule is enforced on
+  read-back, never trusted to the prompt)
+
+### Before FIX
+
+The fixer is launched only while the PR HEAD read from GitHub equals the
+reviewed HEAD the open findings are bound to. A HEAD past it is an
+unverified push (an unrecorded fix, an operator); the review is stale and
+the phase goes to `REVIEW` of the actual HEAD without launching the fixer
+(workflow.md, "Bind reviews to PR HEAD SHA").
 
 ### After FIX
 

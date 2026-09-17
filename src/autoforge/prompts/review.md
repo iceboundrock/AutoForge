@@ -11,6 +11,8 @@ PR comment describing the outcome. This is review round {{REVIEW_ROUND}}.
 - Repository: {{REPOSITORY}}
 - Reviewed HEAD (bound by the controller): `{{REVIEWED_HEAD_SHA}}`
 - Previous review comment (if any): {{PREVIOUS_REVIEW_COMMENT_URL}}
+- Comment already posted for THIS round at THIS HEAD (if any):
+  {{EXISTING_REVIEW_COMMENT_URL}}
 
 ## Steps
 
@@ -55,10 +57,32 @@ future ideas, optional improvements, educational commentary, non-actionable
 preferences, and information-only remarks. Do not inflate observations into
 findings, and do not hide real defects as observations.
 
+## If a comment for this round already exists
+
+The controller reads the PR before launching you. When the line "Comment
+already posted for THIS round at THIS HEAD" above names a URL, an earlier
+invocation of this same round posted that comment (it carries the
+`ai-review-result` marker for round {{REVIEW_ROUND}} at
+`{{REVIEWED_HEAD_SHA}}`) and the controller could not record the result.
+That comment IS this round's comment; do NOT post a second one. Read it:
+
+- If it is a complete review in the layout below, adopt it: report its URL as
+  `review_comment_url` and its findings (same IDs, classifications and
+  required resolutions) in the CONTROL_RESULT.
+- If it is incomplete or wrong, replace its body in place
+  (`gh api -X PATCH repos/{{REPOSITORY}}/issues/comments/<id> -F body=@<file>`)
+  and report the same URL.
+
+A round has exactly one review comment at its HEAD. The controller rejects
+the round when the PR ends up with two comments carrying the marker for
+round {{REVIEW_ROUND}} at `{{REVIEWED_HEAD_SHA}}`, and blocks the run on
+the next entry until a human removes one.
+
 ## Post exactly one review comment
 
 Post ONE top-level comment on the PR with `gh pr comment {{PR_URL}} --body-file <file>`
-(never several comments, never an inline review) using exactly this layout:
+(never several comments, never an inline review; when the controller named an
+existing comment above, edit that one instead) using exactly this layout:
 
 ```markdown
 # AI Code Review — Round {{REVIEW_ROUND}}

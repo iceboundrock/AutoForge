@@ -92,6 +92,12 @@ def test_review_prompt_contract():
         "blocked",
         "non-blocked",
         "nit",
+        # PR #89 F1: an earlier invocation's comment for this round is adopted,
+        # never duplicated; the controller enforces one comment per (round, HEAD).
+        "{{EXISTING_REVIEW_COMMENT_URL}}",
+        "If a comment for this round already exists",
+        "do NOT post a second one",
+        "exactly one review comment at its HEAD",
     ):
         assert phrase in text, phrase
 
@@ -263,6 +269,12 @@ def test_engine_prompt_variables_review_and_fix(engine):
     engine.state.review_round = 1
     text = engine.render_prompt_for(Phase.REVIEW)
     assert "Round 2" in text and SHA_B in text  # reviews the *current* HEAD
+    # Rendered outside a step, no PR was read: no existing comment is named.
+    assert "Comment already posted for THIS round at THIS HEAD (if any):\n  (none)" in text
+    engine._existing_review_comment_url = f"{PR}#issuecomment-7"
+    text = engine.render_prompt_for(Phase.REVIEW)
+    assert f"THIS HEAD (if any):\n  {PR}#issuecomment-7" in text
+    engine._existing_review_comment_url = ""
     engine.state.phase = Phase.FIX
     engine.state.open_findings = [
         {"id": "R1-F1", "classification": "nit", "required_resolution": "do x"}

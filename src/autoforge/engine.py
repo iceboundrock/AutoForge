@@ -97,7 +97,14 @@ from .errors import (
     VerificationError,
 )
 from .executor import DEFAULT_MAX_OUTPUT_BYTES, ExecutionRequest, execute
-from .github import GitHubClient, IssueInfo, PRInfo, WorkflowRunJobs, build_merge_argv
+from .github import (
+    CommentInfo,
+    GitHubClient,
+    IssueInfo,
+    PRInfo,
+    WorkflowRunJobs,
+    build_merge_argv,
+)
 from .local_workspace import (
     FeatureSpec,
     LocalWorkspace,
@@ -271,6 +278,46 @@ MERGE_STATE_HINTS = {
 }
 
 _REVIEW_MARKER_RE = re.compile(r"<!--\s*ai-review-result:\s*(\{.*?\})\s*-->", re.DOTALL)
+
+
+def _review_comments_claiming(
+    comments: list[CommentInfo], round_: int, head: str
+) -> list[CommentInfo]:
+    """The comments whose ``ai-review-result`` marker claims ``round_`` at ``head``.
+
+    The marker is the review comment's identity for the controller: the
+    heading and the layout are presentation and are checked separately when
+    a comment is verified. A marker that does not parse, or names another
+    round or HEAD, is not a claimant.
+    """
+    found: list[CommentInfo] = []
+    for c in comments:
+        for marker in _REVIEW_MARKER_RE.finditer(c.body or ""):
+            try:
+                data = json.loads(marker.group(1))
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(data, dict):
+                continue
+            claimed = data.get("round")
+            if isinstance(claimed, bool) or claimed != round_:
+                continue
+            if str(data.get("reviewed_head_sha", "")).lower() == head:
+                found.append(c)
+                break
+    return found
+
+
+def _duplicate_review_comments_reason(
+    pr_url: str, round_: int, head: str, claimants: list[CommentInfo]
+) -> str:
+    urls = ", ".join(c.url or f"comment {c.id}" for c in claimants)
+    return (
+        f"PR {pr_url} carries {len(claimants)} review comments for round {round_} at "
+        f"HEAD {head[:12]} ({urls})"
+    )
+
+
 _REVIEW_HEADING_RE = re.compile(r"^#\s*AI Code Review\s*[—–-]+\s*Round\s+(\d+)\s*$", re.MULTILINE)
 
 
@@ -373,6 +420,26 @@ def local_state_paths(
     return StatePaths.from_state_dir(git_dir / "autoforge" / "state", anchor=git_dir)
 
 
+# What a REMOTE `resume` does on re-entering a phase whose last invocation
+# was interrupted after the agent returned, quoted in that interruption's
+# error. Each entry names an actual controller-side reconciliation; a phase
+# without one is relaunched, and the error says so.
+_REMOTE_REENTRY_RECONCILIATION: dict[Phase, str] = {
+    Phase.ANALYZE_EXECUTE: (
+        "adopts the open PR of the issue, if one exists, instead of relaunching the agent"
+    ),
+    Phase.REVIEW: (
+        "hands a review comment already posted for this round at this HEAD to the "
+        "reviewer to adopt instead of posting a second one"
+    ),
+    Phase.FIX: (
+        "routes a HEAD already pushed past the reviewed one back to REVIEW instead of "
+        "relaunching the fixer"
+    ),
+    Phase.REPLAN_REEXECUTE: "replays the persisted replan transaction",
+}
+
+
 class ControllerEngine:
     def __init__(
         self,
@@ -409,6 +476,12 @@ class ControllerEngine:
         # ``AutoForgeState.local_pending_phase``); the prompt then tells the
         # agent that work from the earlier attempt may already be present.
         self._local_resumed_invocation = False
+        # The review comment the REVIEW entry probe found already posted for
+        # the upcoming round at the bound HEAD (see
+        # :meth:`_reconcile_review_entry`), handed to the reviewer as
+        # ``EXISTING_REVIEW_COMMENT_URL`` so it adopts it instead of posting a
+        # second one. Re-derived from GitHub on every REVIEW entry.
+        self._existing_review_comment_url = ""
         self.state: AutoForgeState | None = None
         # Set by locked(): the controller lock held for a whole command.
         self._lock: ControllerLock | None = None
@@ -850,6 +923,7 @@ class ControllerEngine:
             "HEAD_SHA": s.current_head_sha or "(none)",
             "REVIEW_COMMENT_URL": s.last_review_comment_url or "(none)",
             "PREVIOUS_REVIEW_COMMENT_URL": s.last_review_comment_url or "(none)",
+            "EXISTING_REVIEW_COMMENT_URL": self._existing_review_comment_url or "(none)",
             "REVIEWED_HEAD_SHA": (
                 s.current_head_sha if s.phase == Phase.REVIEW else s.reviewed_head_sha
             )
@@ -1388,8 +1462,13 @@ class ControllerEngine:
                 return recovered
         if previous == Phase.REVIEW:
             self._bind_review_head()
+            ambiguous = self._reconcile_review_entry(plan)
+            if ambiguous is not None:
+                return ambiguous
         if previous == Phase.FIX:
-            self._prepare_fix()
+            drifted = self._prepare_fix(plan)
+            if drifted is not None:
+                return drifted
         if previous == Phase.REPLAN_REEXECUTE:
             # One reducer for the fresh step and for `resume`: it either
             # resolves the transaction (activated or refused) or falls through
@@ -1600,16 +1679,17 @@ class ControllerEngine:
         A refusal that lands earlier in ``_invoke_phase`` (the event journal,
         the profile, the prompt template) therefore charges nothing (#57).
 
-        Returns ``""`` after persisting the charge, so the launch may proceed,
-        or the reason it may not: the checkpoint has already spent
-        :data:`MAX_LOCAL_PHASE_ATTEMPTS`. The persisted count is what bounds
-        the phase entry, so it must be written *before* the agent starts --
-        a launch that was never charged is a launch a crash would let
-        ``resume`` repeat. The first launch of an entry opens the checkpoint
-        (phase, the fingerprint the entry was bound to, one attempt) in the
-        same write; a checkpoint is never persisted with zero launches. A
-        REMOTE run, or a read-only LOCAL phase, has no checkpoint to charge
-        and is never refused here.
+        Returns ``""`` after charging, so the launch may proceed, or the
+        reason it may not: the checkpoint has already spent
+        :data:`MAX_LOCAL_PHASE_ATTEMPTS`. The charge is persisted by the
+        caller's pre-launch save (:meth:`_invoke_phase`), together with the
+        attempt counter, in the one write that precedes the agent: the
+        persisted count is what bounds the phase entry, and a launch that was
+        never charged is a launch a crash would let ``resume`` repeat. The
+        first launch of an entry opens the checkpoint (phase, the fingerprint
+        the entry was bound to, one attempt) in that same write; a checkpoint
+        is never persisted with zero launches. A REMOTE run, or a read-only
+        LOCAL phase, has no checkpoint to charge and is never refused here.
         """
         state = self._require_state()
         if state.mode != WorkflowMode.LOCAL or phase not in LOCAL_WRITE_PHASES:
@@ -1634,7 +1714,6 @@ class ControllerEngine:
                 f"{MAX_LOCAL_PHASE_ATTEMPTS}; the next step enters BLOCKED"
             )
         state.local_pending_attempts += 1
-        self._save()
         return ""
 
     def _clear_local_invocation(self) -> None:
@@ -2547,12 +2626,13 @@ class ControllerEngine:
         return ""
 
     def _head_drift_to_review(
-        self, phase: Phase, plan: StepPlan, pr: PRInfo, detail: str = ""
+        self, phase: Phase, plan: StepPlan, pr: PRInfo, detail: str = "", message: str = ""
     ) -> StepOutcome:
-        """The OPEN PR's HEAD is no longer the reviewed one: the clean review is stale.
+        """The OPEN PR's HEAD is no longer the reviewed one: the last review is stale.
 
-        Persists the new HEAD, marks the review stale and routes back to
-        REVIEW (``phase -> REVIEW``). Nothing has been merged or counted.
+        Persists the new HEAD, marks the review stale, drops its findings and
+        routes back to REVIEW (``phase -> REVIEW``). Nothing has been merged or
+        counted. ``message`` replaces the default merge-path wording.
         """
         state = self._require_state()
         state.current_head_sha = pr.head_sha
@@ -2565,7 +2645,8 @@ class ControllerEngine:
         return self._outcome(
             phase,
             plan=plan,
-            message=(
+            message=message
+            or (
                 f"PR HEAD moved after the clean review{detail}; {phase.value} -> REVIEW "
                 "(not merged)"
             ),
@@ -3044,13 +3125,77 @@ class ControllerEngine:
         state.current_branch = pr.head_ref or state.current_branch
         self._save()
 
-    def _prepare_fix(self) -> None:
+    def _reconcile_review_entry(self, plan: StepPlan) -> StepOutcome | None:
+        """Read the PR for this round's comment before the reviewer is launched.
+
+        A reviewer whose result was never recorded (timeout, non-zero exit,
+        refused run-log write, verification failure, crash) may already have
+        posted the round's comment. GitHub is the source of truth, so the
+        controller looks before relaunching: exactly one comment carrying the
+        ``ai-review-result`` marker for the upcoming round at the bound HEAD
+        is handed to the reviewer (``EXISTING_REVIEW_COMMENT_URL``) to adopt
+        rather than duplicate, and :meth:`_verify_review_comment` enforces
+        afterwards that the round still has exactly one. Two or more is a
+        state the controller cannot resolve without guessing which review is
+        the round's, so it blocks without invoking anyone. Comments for the
+        same round at another HEAD (an earlier run, a stale re-review) are not
+        this round's and are ignored.
+        """
+        state = self._require_state()
+        self._existing_review_comment_url = ""
+        upcoming = state.review_round + 1
+        head = state.current_head_sha.lower()
+        pr_url = parse_pr_url(state.current_pr_url).canonical
+        claimants = _review_comments_claiming(self.github.get_pr_comments(pr_url), upcoming, head)
+        if len(claimants) > 1:
+            return self._block(
+                Phase.REVIEW,
+                plan,
+                _duplicate_review_comments_reason(pr_url, upcoming, head, claimants)
+                + ". The controller never chooses between them: remove or edit the extra "
+                "comment(s) so exactly one remains, then start a new run",
+            )
+        if claimants:
+            self._existing_review_comment_url = claimants[0].url
+        return None
+
+    def _prepare_fix(self, plan: StepPlan) -> StepOutcome | None:
+        """Re-read the PR before the fixer runs; an unreviewed push goes back to REVIEW.
+
+        FIX resolves the findings of one review, and those findings are bound
+        to the HEAD that review saw. A PR HEAD past it before the fixer is
+        launched is a push the controller never verified: an earlier fixer
+        whose result was not recorded (timeout, non-zero exit, refused run-log
+        write, verification failure, crash) or an operator. Which findings
+        that push resolved, if any, is not knowable from controller state and
+        is never inferred, so the rule for every other HEAD drift applies
+        here too: the review is stale and the actual HEAD is reviewed
+        (``FIX -> REVIEW``) instead of a fixer being launched against findings
+        of a commit that is no longer the PR. The cost is one review round;
+        the review of the actual HEAD is what says what remains.
+        """
         state = self._require_state()
         if not state.open_findings:
             raise StateError("FIX phase entered without open findings in state")
         pr = self._require_open_pr()
+        reviewed = state.reviewed_head_sha.lower()
+        if pr.head_sha.lower() != reviewed:
+            state.last_fix_resolutions = []
+            return self._head_drift_to_review(
+                Phase.FIX,
+                plan,
+                pr,
+                message=(
+                    f"PR HEAD {pr.head_sha[:12]} is past the reviewed HEAD {reviewed[:12]} "
+                    f"that the open findings of round {state.review_round} are bound to "
+                    "(an unrecorded fix or an operator push; the controller does not infer "
+                    "which findings it resolved); FIX -> REVIEW of the actual HEAD, no fixer "
+                    "launched"
+                ),
+            )
         state.current_head_sha = pr.head_sha
         self._save()
+        return None
 
     # ======================================================================
     # REPLAN_REEXECUTE
@@ -3937,6 +4082,13 @@ class ControllerEngine:
                 )
             attempt += 1
             state.attempt += 1
+            # The one write before the agent starts, in both modes: the
+            # attempt counter and, for a LOCAL write phase, the checkpoint
+            # charged just above land together. A crash while the agent runs,
+            # or a refused run-log write after it returned, therefore never
+            # leaves controller state claiming the phase was not yet
+            # attempted (#55, PR #89).
+            self._save()
             req = AgentRequest(
                 phase=phase.value,
                 prompt=prompt,
@@ -3970,8 +4122,7 @@ class ControllerEngine:
                 result = provider.execute(req)
             except ExecutionError as exc:
                 record.error = f"{type(exc).__name__}: {exc}"
-                logger.log_execution(record, prompt, "", "")
-                self._save()
+                self._record_invocation(logger, record, prompt, "", "", phase)
                 raise
             record.started_at = result.started_at
             record.finished_at = result.finished_at
@@ -3982,16 +4133,14 @@ class ControllerEngine:
             stdout, stderr = result.stdout or "", result.stderr or ""
             if result.timed_out:
                 record.error = f"timed out after {timeout}s"
-                logger.log_execution(record, prompt, stdout, stderr)
-                self._save()
+                self._record_invocation(logger, record, prompt, stdout, stderr, phase)
                 raise ExecutionTimeoutError(
                     f"agent '{profile.name}' timed out after {timeout}s and was killed. "
                     "State unchanged — inspect the real Git/GitHub state, then 'resume'."
                 )
             if result.exit_code != 0:
                 record.error = f"exit {result.exit_code}"
-                logger.log_execution(record, prompt, stdout, stderr)
-                self._save()
+                self._record_invocation(logger, record, prompt, stdout, stderr, phase)
                 raise ExecutionError(
                     f"agent '{profile.name}' exited {result.exit_code}. "
                     f"stderr tail: {stderr[-2000:]} "
@@ -4011,8 +4160,7 @@ class ControllerEngine:
                         "and end it with the CONTROL_RESULT block)"
                     )
                 record.error = f"{type(exc).__name__}: {detail}"
-                logger.log_execution(record, prompt, stdout, stderr)
-                self._save()
+                self._record_invocation(logger, record, prompt, stdout, stderr, phase)
                 if attempt <= max_corrections:
                     # A correction re-launches the same write-capable agent;
                     # the top of the loop charges it against the same durable
@@ -4024,36 +4172,60 @@ class ControllerEngine:
                     f"{attempt} attempt(s): {detail}"
                 ) from exc
             record.parsed_result = payload
-            try:
-                logger.log_execution(record, prompt, stdout, stderr)
-            except StateError as exc:
-                # Recording the invocation was refused (the journal an agent
-                # enlarged past its budget, #55; a run directory it filled;
-                # an I/O failure) after the agent had already returned. This
-                # is the same window as a timeout, a non-zero exit or a
-                # verification failure: the phase is left unchanged for
-                # `resume`, which re-enters it. A LOCAL retry is judged
-                # against the checkpoint persisted before the launch; a
-                # REMOTE re-entry has no such checkpoint, so the operator is
-                # told what the agent may already have done. The controller-
-                # side probe that would adopt an existing review comment or a
-                # landed push instead of relaunching is #14.
-                self._save()
-                if state.mode == WorkflowMode.LOCAL:
-                    guidance = (
-                        "The agent had already returned; its launch was checkpointed before "
-                        "it started, so once the log directory is repaired 'resume' re-enters "
-                        f"{phase.value} as a retry judged against that checkpoint."
-                    )
-                else:
-                    guidance = (
-                        "The agent had already returned, so its GitHub side effects (a "
-                        "comment, a push, a PR) may exist while the controller state does "
-                        "not record them. State unchanged: repair the log directory, inspect "
-                        f"the real Git/GitHub state, then 'resume', which re-enters {phase.value}."
-                    )
-                raise StateError(f"{exc}. {guidance}") from exc
+            self._record_invocation(logger, record, prompt, stdout, stderr, phase)
             return payload
+
+    def _record_invocation(
+        self,
+        logger: RunLogger,
+        record: ExecutionRecord,
+        prompt: str,
+        stdout: str,
+        stderr: str,
+        phase: Phase,
+    ) -> None:
+        """Publish the invocation's artifacts and journal line, or refuse loudly.
+
+        The one exit for every outcome of a launch (provider error, timeout,
+        non-zero exit, malformed result, accepted result). The launch itself
+        was persisted before the agent started, so a refusal here (a journal
+        an agent enlarged past its budget, #55; a run directory it filled; an
+        I/O failure) loses no controller state; what it does mean is that the
+        run log can no longer record what agents do, so the phase is left
+        unchanged and nothing is launched again -- not even a correction --
+        until the operator repairs it. The refusal names the invocation's own
+        outcome, so the failure that was being recorded is not masked by the
+        failure to record it, and says what ``resume`` will do, which differs
+        by mode: a LOCAL launch was checkpointed and is retried against that
+        checkpoint; a REMOTE re-entry first reconciles with GitHub, where the
+        agent's side effects may already be.
+        """
+        state = self._require_state()
+        try:
+            logger.log_execution(record, prompt, stdout, stderr)
+        except StateError as exc:
+            # Re-raised as the same object: its type is the filesystem cause
+            # (an oversized journal, an unsafe path) and callers distinguish
+            # on it. Only the message grows.
+            outcome = record.error or "a CONTROL_RESULT the controller accepted"
+            if state.mode == WorkflowMode.LOCAL:
+                follow_up = (
+                    "Its launch was checkpointed before it started, so once the log "
+                    f"directory is repaired 'resume' re-enters {phase.value} as a retry "
+                    "judged against that checkpoint"
+                )
+            else:
+                reentry = _REMOTE_REENTRY_RECONCILIATION.get(phase, "relaunches the agent")
+                follow_up = (
+                    "Its GitHub side effects (a comment, a push, a PR) may exist while the "
+                    "controller state does not record them. Repair the log directory, then "
+                    f"'resume': it re-enters {phase.value} and {reentry}"
+                )
+            exc.args = (
+                f"{exc}. This refusal interrupted attempt {record.attempt} of {phase.value} "
+                f"after the agent had returned with: {outcome}. {follow_up}.",
+            )
+            raise
 
     # -- verification + state application -------------------------------------------
     def _verify_and_apply(self, phase: Phase, payload: dict) -> tuple[Phase, str]:
@@ -4126,6 +4298,17 @@ class ControllerEngine:
                 f"review comment {res.review_comment_url} does not belong to PR {pr_ref.canonical}"
             )
         comments = self.github.get_pr_comments(pr_ref.canonical)
+        claimants = _review_comments_claiming(comments, res.round, expected_head)
+        if len(claimants) > 1:
+            # A second comment for the round at this HEAD, whoever posted it,
+            # leaves the round's review ambiguous; the next REVIEW entry
+            # blocks on it rather than choose (see `_reconcile_review_entry`).
+            raise VerificationError(
+                _duplicate_review_comments_reason(
+                    pr_ref.canonical, res.round, expected_head, claimants
+                )
+                + "; a round has exactly one review comment at its HEAD"
+            )
         match = None
         for c in comments:
             if c.id == cref.comment_id or (c.url and c.url == res.review_comment_url):
