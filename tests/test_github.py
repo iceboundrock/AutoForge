@@ -427,7 +427,9 @@ def test_get_pr_parses_merge_state_and_auto_merge():
     assert pr.merge_state_status == "CLEAN" and pr.auto_merge_enabled is True
     assert "mergeStateStatus" in seen[0][-1] and "autoMergeRequest" in seen[0][-1]
 
-    pr2 = _client(lambda req: _res({"url": "https://github.com/o/r/pull/42", "state": "OPEN"}))
+    pr2 = _client(
+        lambda req: _res({"url": "https://github.com/o/r/pull/42", "number": 42, "state": "OPEN"})
+    )
     info = pr2.get_pr("https://github.com/o/r/pull/42")
     assert info.merge_state_status == "" and info.mergeable == ""
     assert info.auto_merge_enabled is False  # null / missing -> not armed
@@ -466,6 +468,7 @@ def test_get_pr_checks_parses_check_runs_and_status_contexts():
         lambda req: _res(
             {
                 "url": "https://github.com/o/r/pull/42",
+                "number": 42,
                 "state": "OPEN",
                 "statusCheckRollup": [
                     {
@@ -1266,3 +1269,183 @@ def test_truncated_gh_output_is_an_error_never_parsed():
     gh = GitHubClient(runner=handler, retry_delay_seconds=0)
     with pytest.raises(GitHubError, match="truncated"):
         gh.get_pr("https://github.com/o/r/pull/42")
+
+
+# -- strict row decoding: a row that is not the object asked for is an error, never
+# an object with a manufactured identity (PR #89 re-review, shared claim protocol) ----
+_ISSUE_ROW = {
+    "url": "https://github.com/o/r/issues/9",
+    "number": 9,
+    "title": "Follow-up",
+    "state": "OPEN",
+    "body": "<!-- ai-follow-up: {} -->",
+}
+_PR_ROW = {
+    "url": "https://github.com/o/r/pull/1",
+    "number": 1,
+    "state": "OPEN",
+    "headRefOid": "a" * 40,
+    "headRefName": "feature/x",
+    "baseRefName": "main",
+    "body": "hello",
+}
+
+
+@pytest.mark.parametrize(
+    "row, needle",
+    [
+        ("not an object", "non-object"),
+        (dict(_ISSUE_ROW, url=None), "not a GitHub issue URL"),
+        ({k: v for k, v in _ISSUE_ROW.items() if k != "url"}, "not a GitHub issue URL"),
+        (dict(_ISSUE_ROW, url="https://github.com/o/r/pull/9"), "not a GitHub issue URL"),
+        (dict(_ISSUE_ROW, url="https://github.com/o/r/issues/9?x=1"), "not a GitHub issue URL"),
+        (dict(_ISSUE_ROW, number=10), "field 'number' is 10 but the url names #9"),
+        (dict(_ISSUE_ROW, number="9"), "field 'number' is not an integer"),
+        ({k: v for k, v in _ISSUE_ROW.items() if k != "number"}, "not an integer"),
+        (dict(_ISSUE_ROW, number=True), "field 'number' is not an integer"),
+        (dict(_ISSUE_ROW, body=7), "field 'body' is int, expected a string"),
+        (dict(_ISSUE_ROW, state=["OPEN"]), "field 'state' is list, expected a string"),
+    ],
+    ids=[
+        "non-object",
+        "null-url",
+        "missing-url",
+        "pr-url",
+        "url-with-query",
+        "number-disagrees",
+        "string-number",
+        "missing-number",
+        "bool-number",
+        "int-body",
+        "list-state",
+    ],
+)
+def test_a_malformed_issue_row_is_a_github_error_in_every_listing_and_view(row, needle):
+    """A malformed row would otherwise decode to an issue nothing matches
+    (``url=""``, ``number=0``), making a listing "prove" the absence of an
+    issue that exists. Both the strict and the plain listing refuse, and so
+    does the single-object view."""
+    gh = _client(lambda req: _res([_ISSUE_ROW, row]))
+    for strict in (False, True):
+        with pytest.raises(GitHubError, match=needle) as exc:
+            gh.list_open_issues("o/r", strict=strict)
+        assert "open issue listing of o/r" in str(exc.value)
+    single = _client(lambda req: _res(row))
+    with pytest.raises(GitHubError, match=needle):
+        single.get_issue("https://github.com/o/r/issues/9")
+
+
+@pytest.mark.parametrize(
+    "row, needle",
+    [
+        (["url"], "non-object"),
+        ({k: v for k, v in _PR_ROW.items() if k != "url"}, "not a GitHub pull request URL"),
+        (dict(_PR_ROW, url="https://github.com/o/r/issues/1"), "not a GitHub pull request URL"),
+        (dict(_PR_ROW, url="https://github.com/o/r/pull/1/files"), "not a GitHub pull request"),
+        (dict(_PR_ROW, number=2), "field 'number' is 2 but the url names #1"),
+        (dict(_PR_ROW, number=1.0), "field 'number' is not an integer"),
+        (dict(_PR_ROW, headRefOid=["a" * 40]), "field 'headRefOid' is list, expected a string"),
+        (dict(_PR_ROW, body={"text": "hello"}), "field 'body' is dict, expected a string"),
+        (dict(_PR_ROW, headRefName=5), "field 'headRefName' is int"),
+    ],
+    ids=[
+        "non-object",
+        "missing-url",
+        "issue-url",
+        "url-with-path",
+        "number-disagrees",
+        "float-number",
+        "list-sha",
+        "object-body",
+        "int-branch",
+    ],
+)
+def test_a_malformed_pr_row_is_a_github_error_in_every_listing_and_view(row, needle):
+    gh = _client(lambda req: _res([_PR_ROW, row]))
+    for strict in (False, True):
+        with pytest.raises(GitHubError, match=needle):
+            gh.list_open_prs("o/r", strict=strict)
+        with pytest.raises(GitHubError, match=needle):
+            gh.list_all_prs("o/r", strict=strict)
+    single = _client(lambda req: _res(row))
+    with pytest.raises(GitHubError, match=needle):
+        single.get_pr("https://github.com/o/r/pull/1")
+
+
+def test_a_view_that_answers_with_another_object_is_refused():
+    """``gh`` answering `pull/43` when `pull/42` was asked for (a redirect, a
+    moved repository, a stale cache) is not PR 42; the same for an issue."""
+    gh = _client(lambda req: _res(dict(_PR_ROW, url="https://github.com/o/r/pull/43", number=43)))
+    with pytest.raises(GitHubError, match="answered with .*pull/43"):
+        gh.get_pr("https://github.com/o/r/pull/42")
+    gh = _client(lambda req: _res(dict(_ISSUE_ROW, url="https://github.com/o/x/issues/9")))
+    with pytest.raises(GitHubError, match="answered with .*o/x/issues/9"):
+        gh.get_issue("https://github.com/o/r/issues/9")
+    # A casing variant of the requested URL is the same object.
+    gh = _client(lambda req: _res(dict(_PR_ROW, url="https://github.com/O/R/pull/1")))
+    assert gh.get_pr("https://github.com/o/r/pull/1").url == "https://github.com/O/R/pull/1"
+
+
+def test_truncation_is_judged_on_the_raw_row_count_before_any_row_is_decoded():
+    """A listing of ``limit`` rows is "may be truncated" even when one of
+    them is malformed: the incomplete-set answer is the one that matters to
+    a strict caller, and it must not be masked by a row-level error."""
+    prs = [
+        dict(_PR_ROW, number=n, url=f"https://github.com/o/r/pull/{n}")
+        for n in range(1, STRICT_PR_LIST_LIMIT + 1)
+    ]
+    prs[-1] = "garbage"
+    with pytest.raises(GitHubError, match="truncated"):
+        _client(lambda req: _res(prs)).list_open_prs("o/r", strict=True)
+    with pytest.raises(GitHubError, match="truncated"):
+        _client(lambda req: _res(prs)).list_all_prs("o/r", strict=True)
+    issues = [
+        dict(_ISSUE_ROW, number=n, url=f"https://github.com/o/r/issues/{n}")
+        for n in range(1, STRICT_ISSUE_LIST_LIMIT + 1)
+    ]
+    issues[0] = None
+    with pytest.raises(GitHubError, match="truncated"):
+        _client(lambda req: _res(issues)).list_open_issues("o/r", strict=True)
+
+
+@pytest.mark.parametrize(
+    "row, needle",
+    [
+        ("text", "non-object entry"),
+        ({"id": 5, "body": "x"}, "not a GitHub comment URL"),
+        ({"id": 5, "url": "https://github.com/o/r/pull/42", "body": "x"}, "not a GitHub comment"),
+        (
+            {"id": 5, "url": "https://github.com/o/r/pull/42#issuecomment-5", "body": 5},
+            "'body' is int",
+        ),
+        (
+            {"id": 5, "url": "https://github.com/o/r/pull/42#issuecomment-5", "createdAt": 1},
+            "'createdAt' is int",
+        ),
+    ],
+    ids=["non-object", "missing-url", "parent-url", "int-body", "int-created"],
+)
+def test_a_malformed_comment_row_is_a_github_error(row, needle):
+    good = {"id": 5, "url": "https://github.com/o/r/pull/42#issuecomment-5", "body": "ok"}
+    gh = _client(
+        lambda req: _res({"url": "https://github.com/o/r/pull/42", "comments": [good, row]})
+    )
+    with pytest.raises(GitHubError, match=needle) as exc:
+        gh.get_pr_comments("https://github.com/o/r/pull/42")
+    assert "comment on https://github.com/o/r/pull/42" in str(exc.value)
+    gh = _client(lambda req: _res({"url": "https://github.com/o/r/pull/42", "comments": "none"}))
+    with pytest.raises(GitHubError, match="non-array"):
+        gh.get_pr_comments("https://github.com/o/r/pull/42")
+
+
+def test_a_comment_row_identity_is_its_url_and_its_author_may_be_absent():
+    row = {
+        "id": 99,  # disagrees with the URL: the URL is the identity
+        "url": "https://github.com/O/R/pull/42#issuecomment-5",
+        "body": "ok",
+        "author": None,
+    }
+    gh = _client(lambda req: _res({"url": "https://github.com/o/r/pull/42", "comments": [row]}))
+    (c,) = gh.get_pr_comments("https://github.com/o/r/pull/42")
+    assert c.id == 5 and c.url == "https://github.com/O/R/pull/42#issuecomment-5"
+    assert c.author == "" and c.parent_url == "https://github.com/o/r/pull/42"

@@ -64,6 +64,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field, fields
 from enum import StrEnum
 
+from .claims import IMPLEMENTATION, scan
 from .errors import ConfigurationError
 from .github import PRInfo
 from .validation import GitHubPullRequestRef, parse_issue_url, parse_pr_url, same_pr_url
@@ -82,7 +83,11 @@ MARKER_NAME = "autoforge-replan-transaction"
 # body up to some later `-->` and hiding a valid marker inside the match: an
 # unterminated marker is not a complete comment and is evidence of nothing,
 # while every complete one is classified.
-MARKER_RE = re.compile(rf"<!--\s*{MARKER_NAME}\s*:\s*(?P<payload>(?:(?!-->|<!--)[\s\S])*?)\s*-->")
+#
+# The pattern is linear in the body it scans (see ``claims.MarkerKind.pattern``
+# for the rule): possessive whitespace runs and no whitespace quantifier next
+# to the lazy payload, which :func:`scan_replan_markers` strips instead.
+MARKER_RE = re.compile(rf"<!--\s*+{MARKER_NAME}\s*+:(?P<payload>(?:(?!-->|<!--)[\s\S])*?)-->")
 
 # The controller's receipt for its own destructive close, posted with a
 # separate `gh pr comment` after the close is observed (see
@@ -229,7 +234,7 @@ def scan_replan_markers(body: str) -> MarkerScan:
     attestations: list[ReplanAttestation] = []
     malformed: list[str] = []
     for match in MARKER_RE.finditer(body or ""):
-        raw = match.group("payload")
+        raw = match.group("payload").strip()
         try:
             payload = json.loads(raw)
         except ValueError as exc:
@@ -1123,6 +1128,28 @@ def verify_target_pr(
         return f"replan issue {issue.canonical} is not in {repository}"
     if issue.number not in pr.linked_issue_numbers:
         return f"replacement PR {ref_canonical} is not linked to issue #{issue.number}"
+    # The replacement is the issue's implementation PR from here on, and the
+    # issue's implementation PR is identified by one durable claim everywhere
+    # (``claims.IMPLEMENTATION``): ANALYZE_EXECUTE adopts the open PR carrying
+    # it and refuses to persist one without it. A replacement without the
+    # marker would be activated here and then be invisible to the next entry
+    # after a lost state file, which launches a second implementation.
+    marked = scan(IMPLEMENTATION, pr.body or "")
+    if marked.defects:
+        return (
+            f"replacement PR {ref_canonical} carries an unreadable ai-implementation marker "
+            f"({'; '.join(marked.defects)})"
+        )
+    if not marked.claims:
+        return (
+            f"replacement PR {ref_canonical} does not carry the ai-implementation marker for "
+            f"issue #{issue.number}; without it no later entry could find it as the issue's PR"
+        )
+    if marked.claims[0].issue.identity != issue.identity:
+        return (
+            f"replacement PR {ref_canonical} carries the ai-implementation marker of "
+            f"{marked.claims[0].issue.canonical}, not of issue #{issue.number}"
+        )
     if require_checkpoint_head and not _same_sha(pr.head_sha, txn.replacement_head_sha):
         return (
             f"replacement PR {ref_canonical} advanced from the verified HEAD "

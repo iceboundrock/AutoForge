@@ -689,6 +689,23 @@ Do not reproduce dozens of historical comments in the PR body.
 
 Summarize them by root-cause category.
 
+## Required: the issue's implementation marker
+
+The replacement becomes the issue's implementation PR, and the controller
+identifies the issue's implementation PR by one marker only, never by branch
+name or issue linkage. Put this line in the replacement PR body **verbatim**,
+exactly once, in the body you pass to `gh pr create`:
+
+```text
+{{IMPLEMENTATION_MARKER}}
+```
+
+Without it the replacement is refused: a PR the controller could not find
+again after a restart is never activated. Never put it in the body of any
+other PR, and never copy another PR's implementation marker into yours. It is
+a different marker from the transaction marker below; the replacement PR body
+carries both.
+
 ## Required: the replan transaction marker
 
 The controller does **not** identify your replacement PR by shape. "The only

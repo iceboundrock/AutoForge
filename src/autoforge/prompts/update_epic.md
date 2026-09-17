@@ -16,10 +16,16 @@ Update the EPIC with a progress comment and select the next issue to work on
 
 1. Post a concise progress comment on the EPIC (`gh issue comment`):
    what was implemented, PR links, test evidence. The comment MUST contain
-   this marker line verbatim (it is how the controller recognises the
-   comment as this issue's; keep the JSON exactly as given):
+   this marker line verbatim, exactly once (it is how the controller
+   recognises the comment as this issue's; keep the JSON exactly as given,
+   with its two keys and no other):
 
    `{{PROGRESS_MARKER}}`
+
+   A marker the controller cannot read (a second marker in the same
+   comment, an edited or truncated payload, an extra key) is not "no
+   marker": it makes the EPIC's comment set unreadable, the result is
+   rejected, and the run blocks until a human repairs the comment.
 
    If a progress comment for this issue already exists (the URL above is not
    `(none)`), do NOT post a second one: an earlier invocation of this phase

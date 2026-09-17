@@ -23,7 +23,12 @@ below and push the result to the PR branch. Do not merge.
 
 A follow-up issue you create for a finding MUST contain that finding's marker
 line verbatim in its body (it is how the controller recognises the issue as
-the finding's follow-up). Where an existing issue is listed for a finding,
+the finding's follow-up), exactly as given: the JSON payload has the two
+keys shown and no other. An issue may carry several `ai-follow-up` markers
+for different findings, never the same one twice. A marker the controller
+cannot read (edited, truncated, extra keys, a finding id that is not of the
+form `R<round>-F<n>`) is not "no marker": it makes the open-issue set
+unreadable and blocks the run until a human repairs the issue. Where an existing issue is listed for a finding,
 an earlier invocation of this phase already created it: do NOT create a
 second one, report that issue's URL as the finding's `follow_up_issue_url`
 (or resolve the finding differently only if that issue was created in

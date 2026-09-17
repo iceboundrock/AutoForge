@@ -74,7 +74,7 @@ from __future__ import annotations
 import json
 import re
 import secrets
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Hashable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -82,8 +82,26 @@ from pathlib import Path
 from typing import overload
 
 from . import __prompt_version__
+from .claims import (
+    FOLLOW_UP,
+    IMPLEMENTATION,
+    PROGRESS,
+    REVIEW,
+    Claimants,
+    Collection,
+    FollowUpClaim,
+    Holder,
+    ImplementationClaim,
+    ProgressClaim,
+    ReviewClaim,
+    collect,
+    render_follow_up_marker,
+    render_implementation_marker,
+    render_progress_marker,
+)
 from .config import DEFAULT_STATE_DIR, AutoForgeConfig, validate_required_profiles
 from .errors import (
+    ClaimConflictError,
     ConfigurationError,
     ControlResultError,
     ControlResultValidationError,
@@ -206,6 +224,8 @@ from .transitions import (
     validate_transition,
 )
 from .validation import (
+    GitHubIssueRef,
+    GitHubPullRequestRef,
     parse_comment_url,
     parse_issue_url,
     parse_pr_url,
@@ -281,264 +301,22 @@ MERGE_STATE_HINTS = {
 # -- durable markers -------------------------------------------------------
 #
 # An agent's GitHub write is identified to the controller by a marker the
-# agent embeds in it: an HTML comment carrying a small JSON object. The marker
-# is what a phase entry reads back before it launches (so an interrupted
-# invocation's write is adopted, never repeated) and what verification reads
-# back after the agent returns (so the write the result claims is the write
-# GitHub has). Every marker is parsed by one strict validator that both
-# paths share: a payload that is not exactly the documented shape is not a
-# claim, whether it is met while adopting or while verifying.
+# agent embeds in it. ``autoforge.claims`` owns the whole contract (exact
+# payload schemas, renderers, the scan, explicit cardinality); the engine
+# only decides what a :class:`ClaimConflictError` means where it is raised:
+# at a phase entry it is ``BLOCKED`` without launching an agent, on a
+# post-agent read-back it is a :class:`VerificationError`.
 
 
-_FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+def _follow_up_pairs(
+    grouped: dict[Hashable, tuple[Holder[IssueInfo, FollowUpClaim], ...]],
+) -> list[tuple[str, str]]:
+    """``(finding id, issue URL)`` for every holder, ordered by finding id then URL."""
+    return sorted((h.claim.finding_id, h.obj.url) for hs in grouped.values() for h in hs)
 
 
-def _marker_re(name: str) -> re.Pattern[str]:
-    return re.compile(rf"<!--\s*{re.escape(name)}\s*:\s*(\{{.*?\}})\s*-->", re.DOTALL)
-
-
-_REVIEW_MARKER_RE = _marker_re("ai-review-result")
-_PROGRESS_MARKER_NAME = "ai-epic-progress"
-_PROGRESS_MARKER_RE = _marker_re(_PROGRESS_MARKER_NAME)
-_FOLLOW_UP_MARKER_NAME = "ai-follow-up"
-_FOLLOW_UP_MARKER_RE = _marker_re(_FOLLOW_UP_MARKER_NAME)
-_IMPLEMENTATION_MARKER_NAME = "ai-implementation"
-_IMPLEMENTATION_MARKER_RE = _marker_re(_IMPLEMENTATION_MARKER_NAME)
-
-
-def _marker_object(raw: str) -> dict:
-    """The JSON object of a marker payload; ``ValueError`` names why it is not one."""
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"marker payload is not valid JSON ({exc})") from exc
-    if not isinstance(data, dict):
-        raise ValueError("marker payload must be a JSON object")
-    return data
-
-
-@dataclass(frozen=True)
-class ReviewMarker:
-    """The strictly typed ``ai-review-result`` payload of a review comment."""
-
-    round: int
-    reviewed_head_sha: str  # lowercased
-    needs_fix_round: bool
-
-
-def parse_review_marker(raw: str) -> ReviewMarker:
-    """Strict ``ai-review-result`` payload; ``ValueError`` names the defect.
-
-    ``round`` must be a JSON integer (``true`` is not round 1 and ``1.0`` is
-    not round 1), ``reviewed_head_sha`` a git SHA and ``needs_fix_round`` a
-    JSON boolean; all three are required. The claimant scan and the
-    read-back verification both go through here, so they can never disagree
-    about which comments are valid claims.
-    """
-    data = _marker_object(raw)
-    round_ = data.get("round")
-    if not isinstance(round_, int) or isinstance(round_, bool) or round_ < 1:
-        raise ValueError(f"round must be a JSON integer >= 1, got {round_!r}")
-    sha = data.get("reviewed_head_sha")
-    if not isinstance(sha, str) or not _FULL_SHA_RE.match(sha):
-        raise ValueError(f"reviewed_head_sha must be a 40-character git SHA, got {sha!r}")
-    needs_fix = data.get("needs_fix_round")
-    if not isinstance(needs_fix, bool):
-        raise ValueError(f"needs_fix_round must be a JSON boolean, got {needs_fix!r}")
-    return ReviewMarker(round=round_, reviewed_head_sha=sha.lower(), needs_fix_round=needs_fix)
-
-
-def _review_comments_claiming(
-    comments: list[CommentInfo], round_: int, head: str
-) -> list[CommentInfo]:
-    """The comments whose ``ai-review-result`` marker claims ``round_`` at ``head``.
-
-    The marker is the review comment's identity for the controller: the
-    heading and the layout are presentation and are checked separately when
-    a comment is verified. A marker that is not a valid
-    :class:`ReviewMarker`, or names another round or HEAD, is not a claimant.
-    """
-    found: list[CommentInfo] = []
-    for c in comments:
-        for match in _REVIEW_MARKER_RE.finditer(c.body or ""):
-            try:
-                marker = parse_review_marker(match.group(1))
-            except ValueError:
-                continue
-            if marker.round == round_ and marker.reviewed_head_sha == head:
-                found.append(c)
-                break
-    return found
-
-
-def render_progress_marker(issue_url: str, pr_url: str) -> str:
-    """The exact ``ai-epic-progress`` marker an EPIC progress comment carries.
-
-    The pair (finished issue, merged PR) identifies one UPDATE_EPIC entry:
-    that is the write the entry makes on the EPIC and the one it reads back.
-    """
-    payload = json.dumps({"issue": issue_url, "pr": pr_url}, sort_keys=True)
-    return f"<!-- {_PROGRESS_MARKER_NAME}: {payload} -->"
-
-
-def _progress_comments_claiming(
-    comments: list[CommentInfo], issue_url: str, pr_url: str
-) -> list[CommentInfo]:
-    """The EPIC comments whose ``ai-epic-progress`` marker claims (issue, PR).
-
-    Both URLs are compared as GitHub identities (repository case-insensitive
-    plus number), never as strings. A marker that is not exactly the
-    documented shape, or names another issue or PR, is not a claimant.
-    """
-    try:
-        issue_ref = parse_issue_url(issue_url)
-        pr_ref = parse_pr_url(pr_url)
-    except ConfigurationError:
-        return []
-    found: list[CommentInfo] = []
-    for c in comments:
-        for match in _PROGRESS_MARKER_RE.finditer(c.body or ""):
-            try:
-                data = _marker_object(match.group(1))
-                claimed_issue = data.get("issue")
-                claimed_pr = data.get("pr")
-                if not isinstance(claimed_issue, str) or not isinstance(claimed_pr, str):
-                    continue
-                same = parse_issue_url(claimed_issue).same_target(issue_ref) and parse_pr_url(
-                    claimed_pr
-                ).same_target(pr_ref)
-            except (ValueError, ConfigurationError):
-                continue
-            if same:
-                found.append(c)
-                break
-    return found
-
-
-def render_follow_up_marker(pr_url: str, finding_id: str) -> str:
-    """The exact ``ai-follow-up`` marker a follow-up issue for ``finding_id`` carries.
-
-    The pair (PR, finding id) identifies one follow-up decision: finding ids
-    are unique within a PR because review rounds only ever count up.
-    """
-    payload = json.dumps({"finding_id": finding_id, "pr": pr_url}, sort_keys=True)
-    return f"<!-- {_FOLLOW_UP_MARKER_NAME}: {payload} -->"
-
-
-def _follow_up_issues_claiming(
-    issues: list[IssueInfo], pr_url: str, finding_ids: list[str] | None = None
-) -> dict[str, list[IssueInfo]]:
-    """Per finding id, the issues whose ``ai-follow-up`` marker claims it for ``pr_url``.
-
-    With ``finding_ids`` given, every id in it is a key (possibly with no
-    claimants) and a marker naming another finding is not a claim on this
-    entry. Without it, every finding of ``pr_url`` that some issue claims
-    is a key: that is how a later round learns which problems earlier rounds
-    already deferred. A marker that is not exactly the documented shape or
-    names another PR is never a claim.
-    """
-    wanted = None if finding_ids is None else set(finding_ids)
-    found: dict[str, list[IssueInfo]] = {fid: [] for fid in finding_ids or ()}
-    try:
-        pr_ref = parse_pr_url(pr_url)
-    except ConfigurationError:
-        return found
-    for issue in issues:
-        claimed: set[str] = set()
-        for match in _FOLLOW_UP_MARKER_RE.finditer(issue.body or ""):
-            try:
-                data = _marker_object(match.group(1))
-                fid = data.get("finding_id")
-                claimed_pr = data.get("pr")
-                if not isinstance(fid, str) or not isinstance(claimed_pr, str):
-                    continue
-                same = parse_pr_url(claimed_pr).same_target(pr_ref)
-            except (ValueError, ConfigurationError):
-                continue
-            if same and (wanted is None or fid in wanted):
-                claimed.add(fid)
-        for fid in sorted(claimed):
-            found.setdefault(fid, []).append(issue)
-    return found
-
-
-def render_implementation_marker(issue_url: str) -> str:
-    """The exact ``ai-implementation`` marker the issue's implementation PR carries.
-
-    The issue identifies the PR: ANALYZE_EXECUTE creates at most one open PR
-    per issue, and that PR is what the phase's entry looks for before
-    launching an agent and what its read-back requires of the PR the agent
-    claims. A PR is the issue's implementation because it carries this
-    marker, never because of its branch name or the issues GitHub links it
-    to: those are conventions the read-back does not enforce, so a PR
-    following neither would otherwise be accepted by the read-back and then
-    missed by every later entry (PR #89 review F1).
-    """
-    payload = json.dumps({"issue": issue_url}, sort_keys=True)
-    return f"<!-- {_IMPLEMENTATION_MARKER_NAME}: {payload} -->"
-
-
-def _implementation_prs_claiming(prs: list[PRInfo], issue_url: str) -> list[PRInfo]:
-    """The PRs whose ``ai-implementation`` marker claims ``issue_url``.
-
-    The issue is compared as a GitHub identity (repository case-insensitive
-    plus number), never as a string. A marker that is not exactly the
-    documented shape, or names another issue, is not a claim.
-    """
-    try:
-        issue_ref = parse_issue_url(issue_url)
-    except ConfigurationError:
-        return []
-    found: list[PRInfo] = []
-    for pr in prs:
-        for match in _IMPLEMENTATION_MARKER_RE.finditer(pr.body or ""):
-            try:
-                claimed = _marker_object(match.group(1)).get("issue")
-                if not isinstance(claimed, str):
-                    continue
-                same = parse_issue_url(claimed).same_target(issue_ref)
-            except (ValueError, ConfigurationError):
-                continue
-            if same:
-                found.append(pr)
-                break
-    return found
-
-
-def _follow_up_pairs(claimants: dict[str, list[IssueInfo]]) -> list[tuple[str, str]]:
-    """``(finding id, issue URL)`` for every claimant, ordered by finding id then URL."""
-    return sorted((fid, issue.url) for fid, issues in claimants.items() for issue in issues)
-
-
-def _duplicate_review_comments_reason(
-    pr_url: str, round_: int, head: str, claimants: list[CommentInfo]
-) -> str:
-    urls = ", ".join(c.url or f"comment {c.id}" for c in claimants)
-    return (
-        f"PR {pr_url} carries {len(claimants)} review comments for round {round_} at "
-        f"HEAD {head[:12]} ({urls})"
-    )
-
-
-def _duplicate_follow_ups_reason(pr_url: str, finding_id: str, issues: list[IssueInfo]) -> str:
-    urls = ", ".join(i.url for i in issues)
-    return (
-        f"{len(issues)} open issues carry the follow-up marker for finding {finding_id} of "
-        f"PR {pr_url} ({urls})"
-    )
-
-
-def _duplicate_implementation_prs_reason(issue_url: str, prs: list[PRInfo]) -> str:
-    urls = ", ".join(sorted(parse_pr_url(p.url).canonical for p in prs))
-    return f"{len(prs)} open PRs carry the implementation marker for issue {issue_url} ({urls})"
-
-
-def _duplicate_progress_comments_reason(state: AutoForgeState, claimants: list[CommentInfo]) -> str:
-    urls = ", ".join(c.url or f"comment {c.id}" for c in claimants)
-    return (
-        f"EPIC {state.epic_url} carries {len(claimants)} progress comments for issue "
-        f"{state.current_issue_url} (PR {state.current_pr_url}) ({urls})"
-    )
+def _finding_what(pr_ref: GitHubPullRequestRef, finding_id: str) -> str:
+    return f"finding {finding_id} of PR {pr_ref.canonical}"
 
 
 _REVIEW_HEADING_RE = re.compile(r"^#\s*AI Code Review\s*[—–-]+\s*Round\s+(\d+)\s*$", re.MULTILINE)
@@ -1076,7 +854,9 @@ class ControllerEngine:
             fid = str(f.get("id"))
             marker = render_follow_up_marker(pr_url, fid)
             url = existing.get(fid, "(none)")
-            lines.append(f"- {fid}: marker `{marker}`; existing issue: {url}")
+            lines.append(
+                f"- {escape_inline(fid)}: marker `{marker}`; existing issue: {escape_inline(url)}"
+            )
         return "\n".join(lines)
 
     @staticmethod
@@ -1089,7 +869,7 @@ class ControllerEngine:
         """
         if not pairs:
             return "(none)"
-        return "\n".join(f"- {fid}: {url}" for fid, url in pairs)
+        return "\n".join(f"- {escape_inline(fid)}: {escape_inline(url)}" for fid, url in pairs)
 
     @staticmethod
     def _format_findings(findings: list[dict]) -> str:
@@ -2529,6 +2309,8 @@ class ControllerEngine:
         if state.current_pr_url:
             try:
                 pr = self.github.get_pr(state.current_pr_url)
+            except GitHubUnavailableError:
+                raise
             except GitHubError as exc:
                 return self._block(
                     Phase.ANALYZE_EXECUTE,
@@ -2538,7 +2320,7 @@ class ControllerEngine:
             if pr.is_open:
                 candidates[parse_pr_url(pr.url).canonical] = pr
         try:
-            claimants = self._implementation_prs(issue.canonical)
+            holder = self._implementation_prs(issue).at_most_one()
         except GitHubUnavailableError:
             raise
         except GitHubError as exc:
@@ -2549,8 +2331,16 @@ class ControllerEngine:
                 f"#{issue.number}: {exc}. The controller will not launch an agent that "
                 "could create a second one",
             )
-        for pr in claimants:
-            candidates.setdefault(parse_pr_url(pr.url).canonical, pr)
+        except ClaimConflictError as exc:
+            return self._block(
+                Phase.ANALYZE_EXECUTE,
+                None,
+                f"{exc}. The controller will not launch an agent that could create a second "
+                "implementation and never guesses which PR is the issue's: close the stale "
+                "PR(s) or repair the unreadable marker, then resume",
+            )
+        if holder is not None:
+            candidates.setdefault(parse_pr_url(holder.obj.url).canonical, holder.obj)
         if not candidates:
             return None
         if len(candidates) > 1:
@@ -3496,29 +3286,41 @@ class ControllerEngine:
         self._existing_pr_follow_ups = []
         upcoming = state.review_round + 1
         head = state.current_head_sha.lower()
-        pr_url = parse_pr_url(state.current_pr_url).canonical
-        claimants = _review_comments_claiming(self.github.get_pr_comments(pr_url), upcoming, head)
-        if len(claimants) > 1:
-            return self._block(
-                Phase.REVIEW,
-                plan,
-                _duplicate_review_comments_reason(pr_url, upcoming, head, claimants)
-                + ". The controller never chooses between them: remove or edit the extra "
-                "comment(s) so exactly one remains, then start a new run",
-            )
-        if claimants:
-            self._existing_review_comment_url = claimants[0].url
+        pr_ref = parse_pr_url(state.current_pr_url)
         try:
-            deferred = self._follow_up_issues(pr_url)
+            holder = self._review_comments(pr_ref, upcoming, head).at_most_one()
         except GitHubUnavailableError:
             raise
         except GitHubError as exc:
             return self._block(
                 Phase.REVIEW,
                 plan,
-                f"cannot establish which follow-up issues already exist for PR {pr_url}: "
-                f"{exc}. The controller will not launch a reviewer that could re-raise a "
-                "problem an earlier round already deferred",
+                f"cannot establish which comment carries the review for round {upcoming} at "
+                f"HEAD {head[:12]} of PR {pr_ref.canonical}: {exc}. The controller will not "
+                "launch a reviewer that could post a second review comment",
+            )
+        except ClaimConflictError as exc:
+            return self._block(
+                Phase.REVIEW,
+                plan,
+                f"{exc}. The controller never chooses between them: remove or edit the extra "
+                "or unreadable comment(s) so exactly one remains, then start a new run",
+            )
+        if holder is not None:
+            self._existing_review_comment_url = holder.obj.url
+        try:
+            deferred = self._follow_up_issues(pr_ref).grouped(
+                lambda c: True, f"PR {pr_ref.canonical}"
+            )
+        except GitHubUnavailableError:
+            raise
+        except (GitHubError, ClaimConflictError) as exc:
+            return self._block(
+                Phase.REVIEW,
+                plan,
+                f"cannot establish which follow-up issues already exist for PR "
+                f"{pr_ref.canonical}: {exc}. The controller will not launch a reviewer that "
+                "could re-raise a problem an earlier round already deferred",
             )
         self._existing_pr_follow_ups = _follow_up_pairs(deferred)
         return None
@@ -3571,14 +3373,23 @@ class ControllerEngine:
                     "launched"
                 ),
             )
-        pr_url = parse_pr_url(state.current_pr_url).canonical
+        pr_ref = parse_pr_url(state.current_pr_url)
         open_ids = [str(f["id"]) for f in state.open_findings]
         try:
             # One listing serves both: the open findings' own follow-ups
             # (checked below) and the earlier rounds' deferrals, handed to
             # the fixer so a re-raised problem is recorded on the issue that
             # already exists instead of in a second one (#90).
-            deferred = self._follow_up_issues(pr_url)
+            follow_ups = self._follow_up_issues(pr_ref)
+            for fid in open_ids:
+                holder = follow_ups.claimants(
+                    (pr_ref.identity, fid), _finding_what(pr_ref, fid)
+                ).at_most_one()
+                if holder is not None:
+                    self._existing_follow_ups[fid] = holder.obj.url
+            deferred = follow_ups.grouped(
+                lambda c: c.finding_id not in open_ids, f"PR {pr_ref.canonical}"
+            )
         except GitHubUnavailableError:
             raise
         except GitHubError as exc:
@@ -3586,53 +3397,78 @@ class ControllerEngine:
                 Phase.FIX,
                 plan,
                 f"cannot establish which follow-up issues already exist for the open "
-                f"findings of PR {pr_url}: {exc}. The controller will not launch a fixer "
-                "that could create a second one",
+                f"findings of PR {pr_ref.canonical}: {exc}. The controller will not launch a "
+                "fixer that could create a second one",
             )
-        for fid in open_ids:
-            issues = deferred.get(fid, [])
-            if len(issues) > 1:
-                return self._block(
-                    Phase.FIX,
-                    plan,
-                    _duplicate_follow_ups_reason(pr_url, fid, issues)
-                    + ". The controller never chooses between them: close the extra "
-                    "issue(s) so exactly one remains, then start a new run",
-                )
-            if issues:
-                self._existing_follow_ups[fid] = issues[0].url
-        self._existing_pr_follow_ups = _follow_up_pairs(
-            {fid: issues for fid, issues in deferred.items() if fid not in open_ids}
-        )
+        except ClaimConflictError as exc:
+            return self._block(
+                Phase.FIX,
+                plan,
+                f"{exc}. The controller never chooses between them: close or repair the "
+                "extra or unreadable issue(s) so exactly one remains, then start a new run",
+            )
+        self._existing_pr_follow_ups = _follow_up_pairs(deferred)
         state.current_head_sha = pr.head_sha
         self._save()
         return None
 
-    def _follow_up_issues(
-        self, pr_url: str, finding_ids: list[str] | None = None
-    ) -> dict[str, list[IssueInfo]]:
-        """The open issues carrying a follow-up marker for (``pr_url``, each finding).
+    # -- durable-claim reads --------------------------------------------------
+    #
+    # One read per marker kind, shared by the phase entry and the post-agent
+    # read-back, so both consume the same validated identity model. Listings
+    # are strict: a set the client cannot prove complete, or a row it cannot
+    # decode as the object asked for, raises GitHubError. A defective marker
+    # anywhere in the set raises ClaimConflictError when a cardinality
+    # question is asked (``autoforge.claims``). Every consumer applies one
+    # rule to what it gets: GitHubUnavailableError is transient and
+    # propagates; a conclusive GitHubError or a ClaimConflictError blocks an
+    # entry without launching and rejects a read-back (VerificationError).
 
-        With ``finding_ids``, every one of them is a key; without, every
-        finding of the PR some open issue claims is (see
-        :func:`_follow_up_issues_claiming`). A strict listing: an open-issue
-        set the client cannot prove complete raises GitHubError, and the
-        caller decides what that means for it.
+    def _follow_up_issues(
+        self, pr_ref: GitHubPullRequestRef
+    ) -> Collection[IssueInfo, FollowUpClaim]:
+        """Every follow-up claim naming ``pr_ref`` across the repository's open issues.
+
+        Claims for another PR are not this PR's business and are dropped; a
+        defect on any open issue still counts, whatever PR it names, because
+        the object carrying it was not readable.
         """
         state = self._require_state()
         issues = self.github.list_open_issues(state.repository, strict=True)
-        return _follow_up_issues_claiming(issues, pr_url, finding_ids)
+        whole = collect(FOLLOW_UP, issues, "open issue")
+        mine = tuple(h for h in whole.holders if h.claim.pr.identity == pr_ref.identity)
+        return Collection(whole.kind, whole.noun, mine, whole.defects)
 
-    def _implementation_prs(self, issue_url: str) -> list[PRInfo]:
-        """The open PRs carrying the implementation marker for ``issue_url``.
-
-        A strict listing, for the same reason as :meth:`_follow_up_issues`:
-        the entry that finds none launches an agent that creates a PR, and
-        the read-back that finds one accepts it as the only one.
-        """
+    def _implementation_prs(self, issue: GitHubIssueRef) -> Claimants[PRInfo, ImplementationClaim]:
+        """The open PRs claiming to implement ``issue``, from one strict listing."""
         state = self._require_state()
         prs = self.github.list_open_prs(state.repository, strict=True)
-        return _implementation_prs_claiming(prs, issue_url)
+        return collect(IMPLEMENTATION, prs, "open PR").claimants(
+            issue.identity, f"issue {issue.canonical}"
+        )
+
+    def _review_comments(
+        self, pr_ref: GitHubPullRequestRef, round_: int, head: str
+    ) -> Claimants[CommentInfo, ReviewClaim]:
+        """The PR's comments claiming review ``round_`` at ``head``."""
+        comments = self.github.get_pr_comments(pr_ref.canonical)
+        return collect(REVIEW, comments, "comment").claimants(
+            (round_, head.lower()),
+            f"round {round_} at HEAD {head[:12]} of PR {pr_ref.canonical}",
+        )
+
+    def _progress_comments(self) -> Claimants[CommentInfo, ProgressClaim]:
+        """The EPIC comments claiming this entry's (finished issue, merged PR)."""
+        state = self._require_state()
+        if not state.current_pr_url:
+            raise StateError("UPDATE_EPIC entered without the merged PR in state")
+        issue = parse_issue_url(state.current_issue_url)
+        pr = parse_pr_url(state.current_pr_url)
+        comments = self.github.get_issue_comments(state.epic_url)
+        return collect(PROGRESS, comments, "comment").claimants(
+            (issue.identity, pr.identity),
+            f"issue {issue.canonical} (PR {pr.canonical}) on EPIC {state.epic_url}",
+        )
 
     def _reconcile_update_epic_entry(self, plan: StepPlan) -> StepOutcome | None:
         """Read the EPIC for this issue's progress comment before the agent runs.
@@ -3651,26 +3487,28 @@ class ControllerEngine:
         """
         state = self._require_state()
         self._existing_progress_comment_url = ""
-        claimants = self._progress_comments()
-        if len(claimants) > 1:
+        try:
+            holder = self._progress_comments().at_most_one()
+        except GitHubUnavailableError:
+            raise
+        except GitHubError as exc:
             return self._block(
                 Phase.UPDATE_EPIC,
                 plan,
-                _duplicate_progress_comments_reason(state, claimants)
-                + ". The controller never chooses between them: remove the extra "
-                "comment(s) so exactly one remains, then start a new run",
+                f"cannot establish which comment on EPIC {state.epic_url} is the progress "
+                f"comment for issue {state.current_issue_url}: {exc}. The controller will "
+                "not launch an agent that could post a second one",
             )
-        if claimants:
-            self._existing_progress_comment_url = claimants[0].url
+        except ClaimConflictError as exc:
+            return self._block(
+                Phase.UPDATE_EPIC,
+                plan,
+                f"{exc}. The controller never chooses between them: remove or repair the "
+                "extra or unreadable comment(s) so exactly one remains, then start a new run",
+            )
+        if holder is not None:
+            self._existing_progress_comment_url = holder.obj.url
         return None
-
-    def _progress_comments(self) -> list[CommentInfo]:
-        """The EPIC comments claiming this entry's (finished issue, merged PR)."""
-        state = self._require_state()
-        if not state.current_pr_url:
-            raise StateError("UPDATE_EPIC entered without the merged PR in state")
-        comments = self.github.get_issue_comments(state.epic_url)
-        return _progress_comments_claiming(comments, state.current_issue_url, state.current_pr_url)
 
     # ======================================================================
     # REPLAN_REEXECUTE
@@ -4757,12 +4595,30 @@ class ControllerEngine:
             raise VerificationError(
                 f"agent reported PR {pr_ref.canonical} outside repository {state.repository}"
             )
+        # The identity the next entry will look for, read the way the entry
+        # reads it: one strict listing of the open PRs, in which exactly one
+        # carries this issue's implementation marker, and it is the PR the
+        # agent reported. Accepting a PR without the marker would persist a
+        # PR no re-entry after a lost state file could find again; accepting
+        # one of two would choose, and the entry never chooses. The reported
+        # PR's state, HEAD and branch are read from the same snapshot.
+        marker = render_implementation_marker(state.current_issue_url)
         try:
-            pr = self.github.get_pr(pr_ref.canonical)
-        except GitHubError as exc:
+            holder = self._implementation_prs(issue).exactly_one()
+        except GitHubUnavailableError:
+            raise
+        except (GitHubError, ClaimConflictError) as exc:
             raise VerificationError(
-                f"agent reported PR {pr_ref.canonical} but GitHub cannot resolve it: {exc}"
+                f"cannot accept PR {pr_ref.canonical} as the implementation of issue "
+                f"#{issue.number}: {exc}; the marker {marker!r} identifies the issue's one "
+                "open PR"
             ) from exc
+        pr = holder.obj
+        if not parse_pr_url(pr.url).same_target(pr_ref):
+            raise VerificationError(
+                f"agent reported PR {pr_ref.canonical} but the open PR carrying the "
+                f"implementation marker {marker!r} is {pr.url}"
+            )
         if not pr.is_open:
             raise VerificationError(f"PR {pr_ref.canonical} is {pr.state}, expected OPEN")
         if pr.head_sha != res.head_sha:
@@ -4773,23 +4629,6 @@ class ControllerEngine:
         if pr.head_ref and pr.head_ref != res.branch:
             raise VerificationError(
                 f"PR branch mismatch: GitHub reports {pr.head_ref!r}, agent claimed {res.branch!r}"
-            )
-        # The identity the next entry will look for: the PR carries this
-        # issue's implementation marker, and it is the only open PR that
-        # does. Accepting a PR without it would persist a PR that no
-        # re-entry after a lost state file could find again; accepting one
-        # of two would choose, and the entry never chooses.
-        marker = render_implementation_marker(state.current_issue_url)
-        if not _implementation_prs_claiming([pr], state.current_issue_url):
-            raise VerificationError(
-                f"PR {pr_ref.canonical} does not carry the implementation marker {marker!r} "
-                "in its body; the controller cannot recognise it as the issue's PR"
-            )
-        claimants = self._implementation_prs(state.current_issue_url)
-        if len(claimants) > 1:
-            raise VerificationError(
-                _duplicate_implementation_prs_reason(state.current_issue_url, claimants)
-                + "; an issue has at most one open implementation PR"
             )
         state.current_pr_url = pr_ref.canonical
         state.current_head_sha = pr.head_sha
@@ -4817,50 +4656,31 @@ class ControllerEngine:
             raise VerificationError(
                 f"review comment {res.review_comment_url} does not belong to PR {pr_ref.canonical}"
             )
-        comments = self.github.get_pr_comments(pr_ref.canonical)
-        claimants = _review_comments_claiming(comments, res.round, expected_head)
-        if len(claimants) > 1:
-            # A second comment for the round at this HEAD, whoever posted it,
-            # leaves the round's review ambiguous; the next REVIEW entry
-            # blocks on it rather than choose (see `_reconcile_review_entry`).
+        # The same read the entry made: exactly one comment on the PR claims
+        # this round at this HEAD, and it is the comment the result names.
+        # A second one, whoever posted it, leaves the round's review
+        # ambiguous and the next REVIEW entry would block on it rather than
+        # choose; a comment whose marker is unreadable is refused for the
+        # same reason it would be refused at entry.
+        try:
+            holder = self._review_comments(pr_ref, res.round, expected_head).exactly_one()
+        except GitHubUnavailableError:
+            raise
+        except (GitHubError, ClaimConflictError) as exc:
             raise VerificationError(
-                _duplicate_review_comments_reason(
-                    pr_ref.canonical, res.round, expected_head, claimants
-                )
-                + "; a round has exactly one review comment at its HEAD"
-            )
-        match = None
-        for c in comments:
-            if c.id == cref.comment_id or (c.url and c.url == res.review_comment_url):
-                match = c
-                break
-        if match is None:
+                f"{exc}; a round has exactly one review comment at its HEAD"
+            ) from exc
+        if not parse_comment_url(holder.obj.url).same_target(cref):
             raise VerificationError(
-                f"review comment {res.review_comment_url} was not found on PR {pr_ref.canonical}"
+                f"review comment {res.review_comment_url} is not the comment carrying the "
+                f"round {res.round} marker at HEAD {expected_head[:12]} (that is {holder.obj.url})"
             )
-        body = match.body or ""
-        heading = _REVIEW_HEADING_RE.search(body)
+        heading = _REVIEW_HEADING_RE.search(holder.obj.body or "")
         if heading is None or int(heading.group(1)) != res.round:
             raise VerificationError(
                 f"review comment lacks the '# AI Code Review — Round {res.round}' heading"
             )
-        match_ = _REVIEW_MARKER_RE.search(body)
-        if match_ is None:
-            raise VerificationError("review comment lacks the '<!-- ai-review-result -->' marker")
-        try:
-            marker = parse_review_marker(match_.group(1))
-        except ValueError as exc:
-            raise VerificationError(f"review comment marker is unusable: {exc}") from exc
-        if marker.round != res.round:
-            raise VerificationError(
-                f"review comment marker round {marker.round} != expected round {res.round}"
-            )
-        if marker.reviewed_head_sha != expected_head:
-            raise VerificationError(
-                f"review comment marker reviewed_head_sha {marker.reviewed_head_sha!r} "
-                f"!= bound HEAD {expected_head}"
-            )
-        if marker.needs_fix_round != res.needs_fix_round:
+        if holder.claim.needs_fix_round != res.needs_fix_round:
             raise VerificationError(
                 "review comment marker needs_fix_round disagrees with CONTROL_RESULT"
             )
@@ -5043,25 +4863,28 @@ class ControllerEngine:
                 f"FIX resolutions must cover exactly the open findings; missing={missing} "
                 f"unknown={extra}"
             )
-        pr_url = parse_pr_url(state.current_pr_url).canonical
+        pr_ref = parse_pr_url(state.current_pr_url)
+        pr_url = pr_ref.canonical
         # The same read the entry made: the open issues carrying this PR's
         # follow-up marker, per finding. A follow-up the result claims must
         # be the one marked open issue of its finding, and a finding resolved
         # any other way must have none: the marked issue is the durable
         # record of the decision, and state never records a different one.
-        claimants = self._follow_up_issues(pr_url, open_ids)
+        follow_ups = self._follow_up_issues(pr_ref)
         for r in res.resolutions:
-            marked = claimants[r.finding_id]
-            if len(marked) > 1:
+            try:
+                marked = follow_ups.claimants(
+                    (pr_ref.identity, r.finding_id), _finding_what(pr_ref, r.finding_id)
+                ).at_most_one()
+            except ClaimConflictError as exc:
                 raise VerificationError(
-                    _duplicate_follow_ups_reason(pr_url, r.finding_id, marked)
-                    + "; a finding has at most one follow-up issue"
-                )
+                    f"{exc}; a finding has at most one follow-up issue"
+                ) from exc
             if r.resolution != "follow_up_created":
-                if marked:
+                if marked is not None:
                     raise VerificationError(
                         f"{r.finding_id} is resolved as {r.resolution} but open issue "
-                        f"{marked[0].url} carries its follow-up marker"
+                        f"{marked.obj.url} carries its follow-up marker"
                     )
                 continue
             ref = parse_issue_url(r.follow_up_issue_url)
@@ -5076,6 +4899,8 @@ class ControllerEngine:
                 )
             try:
                 issue = self.github.get_issue(ref.canonical)
+            except GitHubUnavailableError:
+                raise
             except GitHubError as exc:
                 raise VerificationError(
                     f"follow-up issue {ref.canonical} for {r.finding_id} does not exist: {exc}"
@@ -5084,11 +4909,15 @@ class ControllerEngine:
                 raise VerificationError(
                     f"follow-up issue {ref.canonical} for {r.finding_id} is {issue.state}"
                 )
-            if not marked or not same_issue_url(marked[0].url, ref.canonical):
+            if marked is None or not same_issue_url(marked.obj.url, ref.canonical):
                 raise VerificationError(
                     f"follow-up issue {ref.canonical} for {r.finding_id} is not the open issue "
                     f"carrying the marker {render_follow_up_marker(pr_url, r.finding_id)!r}"
-                    + (f" (that is {marked[0].url})" if marked else " (no open issue does)")
+                    + (
+                        f" (that is {marked.obj.url})"
+                        if marked is not None
+                        else " (no open issue does)"
+                    )
                 )
         pr = self._require_open_pr()
         if pr.head_sha != res.new_head_sha:
@@ -5253,17 +5082,16 @@ class ControllerEngine:
         handed (the next entry blocks on the pair).
         """
         state = self._require_state()
-        claimants = self._progress_comments()
-        if not claimants:
+        try:
+            self._progress_comments().exactly_one()
+        except GitHubUnavailableError:
+            raise
+        except (GitHubError, ClaimConflictError) as exc:
             raise VerificationError(
-                f"EPIC {state.epic_url} carries no progress comment with the marker "
-                f"{render_progress_marker(state.current_issue_url, state.current_pr_url)!r}"
-            )
-        if len(claimants) > 1:
-            raise VerificationError(
-                _duplicate_progress_comments_reason(state, claimants)
-                + "; an issue has exactly one progress comment on the EPIC"
-            )
+                f"{exc}; the marker "
+                f"{render_progress_marker(state.current_issue_url, state.current_pr_url)!r} "
+                "identifies the issue's one progress comment on the EPIC"
+            ) from exc
 
     def _apply_update_epic(self, res: UpdateEpicResult) -> tuple[Phase, str]:
         """Switch issues only after the agent's selection verified on GitHub.

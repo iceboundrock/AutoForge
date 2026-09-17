@@ -11,6 +11,7 @@ from autoforge.redaction import MAX_GROWTH_FACTOR, redact_dict
 from autoforge.result_parser import (
     BEGIN,
     END,
+    FINDING_ID_RE,
     MAX_CONTROL_RESULT_CHARS,
     MAX_FINDING_ID_CHARS,
     MAX_FINDING_LOCATION_CHARS,
@@ -599,6 +600,18 @@ def test_oversized_finding_id_is_refused_before_it_is_quoted_or_converted(fid):
     msg = str(excinfo.value)
     assert f"is {len(fid)} characters" in msg
     assert len(msg) < 300
+
+
+def test_a_finding_id_is_stripped_at_the_result_boundary_but_the_rule_itself_is_exact():
+    """A CONTROL_RESULT string field is stripped before its shape is checked,
+    so ``"R1-F1\\n"`` in a result *is* ``R1-F1``. The shared rule the
+    marker scanner applies to unstripped GitHub data must not accept the
+    newline itself: ``$`` would (it matches before a trailing newline), so
+    the rule ends in ``\\Z`` and ``autoforge.claims`` refuses the marker."""
+    assert Finding.from_payload(dict(_finding(1, 1), id="R1-F1\n"), 1, 0).id == "R1-F1"
+    assert FINDING_ID_RE.match("R1-F1") is not None
+    for fid in ("R1-F1\n", "R1-F1\r\n", "\nR1-F1", "R1-F1 "):
+        assert FINDING_ID_RE.match(fid) is None, repr(fid)
 
 
 def test_fix_finding_id_is_bounded_at_parse_time():

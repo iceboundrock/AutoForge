@@ -50,7 +50,14 @@ Verify:
 - returned HEAD SHA matches GitHub
 - its body carries the issue's `ai-implementation` marker, and it is the
   only open PR that does: a PR without the marker is one no later entry
-  could find again, and one of two is a choice the entry never makes
+  could find again, and one of two is a choice the entry never makes. The
+  read-back uses the same strict listing the entry uses (one snapshot: the
+  marked PR's state, HEAD and branch are read from it), so the two cannot
+  disagree about which PR is the issue's. A replan's replacement PR is held
+  to the same marker by the transaction's target predicate, at binding, on
+  the final read before the close and at activation
+  ([replan-transaction.md](replan-transaction.md)), so the PR the
+  controller activates is one this entry finds again after a lost state file
 
 ### Before every launch
 
@@ -59,9 +66,35 @@ relaunch after a malformed result: the phase's GitHub reconciliation
 (workflow.md, "Re-entering a phase") runs before the first launch and again
 before each correction, so an agent that did its GitHub work and then lost
 its result block is never asked to do it again unaware. The markers below
-are the identities those probes and the read-backs share; each is validated
-by one strict parser used by both the entry scan and the verification, so a
-comment or issue the read-back would reject is never adopted at entry.
+are the identities those probes and the read-backs share. They are owned
+by `src/autoforge/claims.py`, which is the only code that parses or renders
+one, and every probe and read-back reads them through it:
+
+- **exact schema**: a marker's payload is a JSON object with exactly the
+  documented keys, each of the documented type; URLs inside it are parsed
+  with the typed parsers and compared as GitHub identities (repository
+  case-insensitive plus number), never as strings
+- **every marker is classified, none is skipped**: a marker of the kind
+  whose payload is not the schema, a second single-kind marker on one
+  object, or the same follow-up marker twice on one issue is a *defect* of
+  that object. A defect anywhere in the scanned set makes every question
+  about the set inconclusive: the entry enters `BLOCKED` naming the object
+  without launching an agent, the read-back rejects the result. "No object
+  claims this key" is never concluded while an object carries a claim that
+  could not be read
+- **explicit cardinality**: an entry asks *at most one* (nothing yet, or the
+  one write to adopt); a read-back asks *exactly one* (the write the agent
+  claims exists and is the only one). Two or more is refused by both
+- **strict decoding of GitHub rows**: every issue, PR and comment row a
+  listing or view returns is decoded by one strict decoder per kind
+  (`github.py`); a row without a usable URL of the right kind, or whose
+  `number` disagrees with its URL, is a conclusive `GitHubError`, never an
+  object with an empty identity that no comparison could match. Truncation
+  is judged on the raw row count before decoding
+- **the prompt trust boundary**: finding ids and URLs recovered from
+  markers are validated by the same rules as `CONTROL_RESULT` fields and
+  escaped before they are rendered into a prompt; a marker's text never
+  becomes controller or prompt syntax
 
 ### Before REVIEW
 
@@ -75,9 +108,11 @@ whose result was never recorded):
 - two or more: `BLOCKED` without launching the reviewer; the controller
   never chooses which review is the round's
 - a comment for the same round at another HEAD is not this round's
-- the marker is a JSON object with an integer `round` (not a boolean, not a
-  float), a 40-hex `reviewed_head_sha` and a boolean `needs_fix_round`;
-  anything else is not a marker, at entry or on read-back
+- the marker is a JSON object with exactly an integer `round` (not a
+  boolean, not a float), a 40-hex `reviewed_head_sha`, a boolean
+  `needs_fix_round` and optionally `finding_ids` (distinct ids of that
+  round); anything else is a defect that blocks the entry and rejects the
+  read-back, never "no marker"
 
 The same entry lists the repository's open issues (strictly, as before FIX)
 for every `ai-follow-up` marker naming this PR, whatever the finding id, and
@@ -97,9 +132,9 @@ Verify:
 - it belongs to the expected PR
 - review round marker is correct
 - reviewed HEAD is correct
-- it is the only comment carrying this round's marker at this HEAD; a
-  second one rejects the round (the uniqueness rule is enforced on
-  read-back, never trusted to the prompt)
+- it is the only comment carrying this round's marker at this HEAD, and it
+  is the comment the result names; a second one rejects the round (the
+  uniqueness rule is enforced on read-back, never trusted to the prompt)
 
 ### Before FIX
 
@@ -119,6 +154,10 @@ be truncated blocks, because "none exists" is then not knowable) for the
   `FOLLOW_UP_ISSUES` to report as that finding's `follow_up_issue_url`,
   never to recreate
 - two or more for one finding: `BLOCKED` without launching the fixer
+- a marker whose `finding_id` is not of the form `R<round>-F<n>` (or longer
+  than the parser's bound), an issue carrying the same marker twice, or any
+  other unreadable follow-up marker on an open issue: `BLOCKED` naming the
+  issue, whatever PR the marker names
 - a closed issue carrying the marker is not the finding's open follow-up
 - the same listing's issues carrying this PR's marker for a finding of an
   earlier round go to the fixer as `EXISTING_FOLLOW_UP_ISSUES`; a finding

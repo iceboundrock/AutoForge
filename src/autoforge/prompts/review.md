@@ -91,6 +91,16 @@ the round when the PR ends up with two comments carrying the marker for
 round {{REVIEW_ROUND}} at `{{REVIEWED_HEAD_SHA}}`, and blocks the run on
 the next entry until a human removes one.
 
+The marker is the comment's identity, and the controller reads it
+strictly: one `ai-review-result` marker per comment, whose payload is a JSON
+object with exactly the keys `round` (integer), `reviewed_head_sha` (the 40
+character SHA), `needs_fix_round` (boolean) and optionally `finding_ids` (a
+list of this round's distinct finding ids). A marker it cannot read (a
+second marker in the same comment, an edited or truncated payload, an
+extra key) is not "no marker": it makes the round's comment set
+unreadable, the result is rejected, and the run blocks until a human
+repairs the comment.
+
 ## Post exactly one review comment
 
 Post ONE top-level comment on the PR with `gh pr comment {{PR_URL}} --body-file <file>`
@@ -124,8 +134,15 @@ Reviewed HEAD: `{{REVIEWED_HEAD_SHA}}`
 
 ## Summary
 Needs another fix round: YES|NO
-<!-- ai-review-result: {"round": {{REVIEW_ROUND}}, "reviewed_head_sha": "{{REVIEWED_HEAD_SHA}}", "needs_fix_round": true|false, "finding_ids": ["R{{REVIEW_ROUND}}-F1"]} -->
+<!-- ai-review-result: {"round": {{REVIEW_ROUND}}, "reviewed_head_sha": "{{REVIEWED_HEAD_SHA}}", "needs_fix_round": <true or false>, "finding_ids": [<this round's finding ids, or nothing>]} -->
 ```
+
+The marker's payload must be real JSON when you post it: `needs_fix_round`
+is the literal `true` or `false` matching the Summary line, and
+`finding_ids` lists exactly the ids under Findings (an empty list when there
+are none). Every `<...>` above is a placeholder to replace, never text to
+copy; a payload that still contains one cannot be read and the round is
+rejected.
 
 Read back the comment URL from the `gh pr comment` output.
 

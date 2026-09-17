@@ -21,7 +21,11 @@ verifies that the PR you report carries the marker and is the only open PR
 that does; a PR without it is rejected, whatever its branch is called and
 whichever issue it links.
 
-- Put the marker line in the body of the PR you create.
+- Put the marker line in the body of the PR you create, exactly once and
+  exactly as given: the JSON payload has the one key shown and no other. A
+  marker the controller cannot read (edited, truncated, extra keys) is not
+  "no marker": it makes the PR unreadable and blocks the run. A PR carrying
+  two `ai-implementation` markers is rejected, whatever they say.
 - If an open PR for this issue already exists without it (created by hand,
   or by an earlier run), continue that work and add the line to its body
   (`gh pr edit <url> --body-file <file>`, keeping the rest of the body).

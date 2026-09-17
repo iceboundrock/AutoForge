@@ -47,7 +47,13 @@ END = "<<<END_CONTROL_RESULT>>>"
 
 _BLOCK_RE = re.compile(r"<<<CONTROL_RESULT>>>(.*?)<<<END_CONTROL_RESULT>>>", re.DOTALL)
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
-_FINDING_ID_RE = re.compile(r"^R(?P<round>[1-9][0-9]*)-F(?P<n>[1-9][0-9]*)$")
+# The one finding-id rule: the parser applies it to CONTROL_RESULT ids and
+# ``autoforge.claims`` to the ids read back from follow-up markers, so a
+# marker can never carry an id the parser would have refused. ``\Z``, not
+# ``$``: ``$`` also matches before a trailing newline, and ``"R1-F1\n"`` is
+# not a finding id (it would look like one and compare unequal to it).
+FINDING_ID_RE = re.compile(r"^R(?P<round>[1-9][0-9]*)-F(?P<n>[1-9][0-9]*)\Z")
+_FINDING_ID_RE = FINDING_ID_RE
 _FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
 
 ALLOWED_STATUSES = ("success", "failure", "blocked")

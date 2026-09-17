@@ -269,7 +269,10 @@ re-enters `ANALYZE_EXECUTE`, finds the open PR carrying the issue's
 not provenance) and moves to `REVIEW` without running the agent. Two or
 more candidate PRs → `BLOCKED` (the controller never guesses); a PR listing
 that may be truncated → `BLOCKED` too, since "no PR yet" is then not
-knowable and the agent would create a second one. Every
+knowable and the agent would create a second one. A marker the controller
+cannot read (an edited payload, a PR carrying two) is not "no marker": the
+run blocks naming the object, because "no PR yet" is not provable while
+one PR carries a claim that could not be read. Every
 other agent phase re-enters the same way: `REVIEW` finds a comment the
 interrupted reviewer already posted for this round at this HEAD and hands it
 to the reviewer to adopt (two such comments → `BLOCKED`); `FIX` finds a HEAD

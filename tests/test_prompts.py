@@ -98,6 +98,11 @@ def test_review_prompt_contract():
         "If a comment for this round already exists",
         "do NOT post a second one",
         "exactly one review comment at its HEAD",
+        # The marker layout holds placeholders that cannot be mistaken for
+        # values: a copied `true|false` was invalid JSON that read as a
+        # template to fill; `<...>` is the template's own placeholder form.
+        '"needs_fix_round": <true or false>',
+        "Every `<...>` above is a placeholder to replace",
         # PR #89 F2 (#90): a problem an earlier round deferred to a follow-up
         # issue is not re-raised under a new finding id.
         "{{EXISTING_FOLLOW_UP_ISSUES}}",
@@ -205,6 +210,10 @@ def test_replan_prompt_contract():
         "{{HISTORICAL_FINDING_COUNT}}",
         "Do not run `gh pr close`",
         "~~~~untrusted",
+        # The replacement is the issue's implementation PR: it carries the
+        # same marker ANALYZE_EXECUTE adopts, or no later entry could find it.
+        "{{IMPLEMENTATION_MARKER}}",
+        "the replacement PR body\ncarries both",
     ):
         assert phrase in text, phrase
 

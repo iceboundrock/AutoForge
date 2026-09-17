@@ -160,6 +160,18 @@ reconciled with, not relaunched unaware. The table of what each phase's
 re-entry does is complete by construction: every phase with an agent prompt
 has an entry, and a test holds the two tables together.
 
+Every probe below and the read-back after the agent consume one identity
+model, `src/autoforge/claims.py`: one exact-schema decoder per marker kind,
+one renderer, one scan that classifies *every* marker it meets, and
+explicit cardinality (`at_most_one` at entry, `exactly_one` on read-back).
+A marker the controller cannot read, a second single-kind marker on one
+object, or the same follow-up marker twice on one issue is a *defect* of
+that object, not "no marker": while it exists, "nothing claims this key" is
+not provable, so the entry enters `BLOCKED` naming the object (no agent is
+launched) and the read-back rejects the result. The entry never adopts
+what the read-back would refuse, and the read-back never accepts what the
+next entry could not find again.
+
 - `ANALYZE_EXECUTE` adopts the open PR carrying the issue's
   `ai-implementation` marker (the persisted PR, or the one found by a
   strict listing of the repository's open PRs), if one exists, without
@@ -167,7 +179,8 @@ has an entry, and a test holds the two tables together.
   cannot be proven complete, since "none exists" is then not knowable. A
   PR is identified by that marker alone, never by its branch name or a
   linked issue; the read-back after the agent holds the reported PR to the
-  same rule (github-safety.md, "Before ANALYZE_EXECUTE").
+  same rule (github-safety.md, "Before ANALYZE_EXECUTE"), and so does the
+  replan transaction for its replacement PR (replan-transaction.md).
 - `REVIEW` reads the PR comments for the `ai-review-result` marker of the
   upcoming round at the bound HEAD. One such comment is handed to the
   reviewer (`EXISTING_REVIEW_COMMENT_URL`) to adopt, or to edit in place,
