@@ -14,7 +14,8 @@
   commands run from the contract's repository root, R11-F1), §5.5 (the event
   journal is bounded, R11-F2); after review: §5.4 and §5.5 (the journal is
   write-only and appended in place, its size a sanity check rather than a
-  read bound, #51; it subsumes #55 and #56)
+  read bound, #51; it subsumes #55 and #56), §5.5 (a torn line fuses with
+  the next, an unwritable journal is refused, PR #91 review)
 - **Closes by design:** #46, #47, #48, #49, #50; #45 (see *Compatibility*)
 
 ## 1. Problem
@@ -528,8 +529,9 @@ run.
 
 The invocation is not lost to a refused append: its step directory and
 artifacts are published before the journal line, the refusal says where
-they are (whatever its filesystem cause: the oversized-journal error and
-the `UnsafePathError` for a planted link both carry that note), and the
+they are (whatever its filesystem cause: the oversized-journal error, the
+`UnsafePathError` for a planted link and the `UnreadableEntryError` for a
+journal made unwritable all carry that note), and the
 launch checkpoint was persisted before the agent started, so `resume`
 re-enters the phase as a retry judged against the baseline from before the
 first launch. A REMOTE run has no tree checkpoint; there the refusal lands
@@ -543,14 +545,31 @@ reviewed one). That reconciliation is what closes the window for every
 failure in it, this one included.
 
 Two consequences of the journal being write-only are accepted rather than
-guarded. An operator who deletes the *newest* step directories restarts the
-sequence below the journal's last `seq`, so the journal can hold two lines
-with one number; the journal is a log for humans, not controller state,
-and the step directories it names are still distinct. A torn last line
-after power loss (the line's `write(2)` completed, the `fsync` did not) is
-not detected by the controller, for the same reason: nothing reads it. A
-tool that does read the journal must treat it as untrusted project data
-(root `AGENTS.md`), as it always had to.
+guarded, and one of the append being in place. An operator who deletes the
+*newest* step directories restarts the sequence below the journal's last
+`seq`, so the journal can hold two lines with one number; the journal is a
+log for humans, not controller state, and the step directories it names are
+still distinct. A torn last line after power loss (the line's `write(2)`
+completed, the `fsync` did not) is not detected by the controller, for the
+same reason: nothing reads it, and nothing inspects the tail before the
+next append either, so the next line is appended to the torn bytes and one
+crash costs a line-oriented reader *two* records, the torn one and the one
+glued to it. A tool that reads the journal must therefore resync on its own
+(skip to the next line that parses) rather than assume at most one bad
+line, and must treat what it reads as untrusted project data (root
+`AGENTS.md`), as it always had to. Prefixing a newline when the last byte
+is not one (a `pread` of one byte at `st_size - 1`) was considered and
+rejected: it would make the controller read the journal, which is the
+property this section establishes and the tests pin, and it would not
+restore a one-bad-line guarantee anyway, because a line torn by a crash can
+lose interior bytes as well as its tail. Finally, a journal the controller
+cannot open for writing is refused, not replaced: the read-then-rewrite
+design needed a writable *directory*, the in-place append needs a writable
+*file*, so an `events.jsonl` made read-only (the controller creates it
+`0600`; this is an operator's or an agent's `chmod`) is refused at the
+logger open, before the launch, with the access cause kept
+(`UnreadableEntryError`) and the same manual step the size refusal names:
+make it writable or move it aside; the step directories keep the sequence.
 
 The crash guard that continues the sequence from step-directory names lists
 only the run's own directory, opened as a sub-root, and lists it under a

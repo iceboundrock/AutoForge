@@ -304,9 +304,8 @@ checkpointed in the same durable per-phase bound as the launch before it (see
 **Recovery** under LOCAL mode); the setting can never multiply that bound.
 Non-zero exits, timeouts, verification failures and a refused run-log write
 after the agent returned (an `events.jsonl` an agent enlarged past its
-budget or replaced with a link, see Security) are not retried automatically;
-they leave the phase
-unchanged for `resume`. The launch itself is persisted before the agent
+budget, replaced with a link or made read-only, see Security) are not
+retried automatically; they leave the phase unchanged for `resume`. The launch itself is persisted before the agent
 starts, so every one of these is on disk as a used attempt, and a refused
 run-log write names the outcome it interrupted (the timeout, the exit code,
 the malformed result, or an accepted result) rather than masking it, and

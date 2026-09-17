@@ -222,6 +222,61 @@ def test_the_journal_refusal_names_the_manual_step(tmp_path, monkeypatch):
     )
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses file permissions")
+def test_a_read_only_journal_is_refused_before_the_launch_with_the_manual_step(tmp_path):
+    """The in-place append needs a writable *file* where the read-then-rewrite
+    of PR #44 needed only a writable directory, so a journal made read-only
+    (the controller creates it 0600; this is someone else's chmod) is
+    refused at the open before the launch. The refusal keeps its access
+    cause and, like the size refusal, says how to resume."""
+    from autoforge.safefs import UnreadableEntryError
+
+    log = RunLogger(tmp_path / "logs", "run-1")
+    log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="REVIEW"))
+    before = log.events_path.read_bytes()
+    log.events_path.chmod(0o444)
+    try:
+        with pytest.raises(UnreadableEntryError, match="Permission denied") as exc:
+            RunLogger(tmp_path / "logs", "run-1")
+        assert exc.value.path.endswith("events.jsonl")
+        assert "make logs/run-1/events.jsonl writable, or move it aside" in str(exc.value)
+        assert "never reads it" in str(exc.value)
+        assert "sequence continues from their names" in str(exc.value)
+        assert log.events_path.read_bytes() == before
+    finally:
+        log.events_path.chmod(0o600)
+    # Made writable again, the sequence continues from the step directory.
+    step = RunLogger(tmp_path / "logs", "run-1").log_execution(
+        ExecutionRecord(run_id="run-1", seq=0, phase="FIX")
+    )
+    assert step.name == "002-fix-1"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses file permissions")
+def test_a_journal_made_read_only_after_the_logger_opened_refuses_the_append(tmp_path):
+    """#55 for the access cause: the append after the agent returned refuses,
+    the artifacts are published, and the refusal names both the manual step
+    and where the invocation's record is."""
+    from autoforge.safefs import UnreadableEntryError
+
+    log = RunLogger(tmp_path / "logs", "run-1")
+    log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="REVIEW"))
+    before = log.events_path.read_bytes()
+    # The agent runs here, and leaves the journal read-only.
+    log.events_path.chmod(0o444)
+    try:
+        with pytest.raises(UnreadableEntryError, match="Permission denied") as exc:
+            log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="FIX"), stdout="work")
+        assert log.events_path.read_bytes() == before, "neither appended to nor replaced"
+    finally:
+        log.events_path.chmod(0o600)
+    assert (log.run_dir / "002-fix-1" / "stdout.log").read_text(encoding="utf-8") == "work"
+    message = str(exc.value)
+    assert "make logs/run-1/events.jsonl writable, or move it aside" in message
+    assert "logs/run-1/002-fix-1/" in message
+    assert "journal line was not written" in message
+
+
 # -- #55: the post-agent append is the other open of the journal ----------------
 #
 # R11-F2 bounded the recovery read and moved it before the launch. The

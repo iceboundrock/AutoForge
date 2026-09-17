@@ -26,7 +26,10 @@ is appended, so the highest directory number is never below the highest
 write-only for the controller -- appended to in place through a descriptor
 that has been proved a single-named regular file, and refused on its size
 (``MAX_EVENT_JOURNAL_BYTES``) without being read -- so the cost of recording
-an invocation is the line, however long the run.
+an invocation is the line, however long the run. Nothing inspects the tail
+before a line is appended either, so a last line torn by a crash is glued
+to the line appended after it: a reader of the journal must resync on its
+own and cannot assume at most one bad line (ADR 0001 §5.5).
 """
 
 from __future__ import annotations
@@ -41,7 +44,7 @@ from pathlib import Path
 
 from .errors import StateError
 from .redaction import redact, redact_argv, redact_dict
-from .safefs import ReadLimitExceeded, SafeRoot, WalkBudgetExceeded
+from .safefs import ReadLimitExceeded, SafeRoot, UnreadableEntryError, WalkBudgetExceeded
 
 # A run identifier is a *file name*: it names the directory this run's logs
 # live in.  `generate_run_id` produces "af-<UTC stamp>-<hex>", but the value
@@ -193,13 +196,51 @@ class RunLogger:
         finally:
             root.close()
 
-    def _refuse_journal(self, why: str) -> StateError:
-        return StateError(
-            f"corrupted event journal for run {self.run_id}: {why}. The controller only "
-            "appends to the journal and never reads it, so move "
-            f"logs/{self.run_id}/events.jsonl aside to resume; the step directories are "
-            "kept and the sequence continues from their names"
+    def _journal_remedy(self, step: str) -> str:
+        """The way to resume that a refused journal leaves the operator."""
+        return (
+            f"The controller only appends to the journal and never reads it, so {step} to "
+            "resume; the step directories are kept and the sequence continues from their "
+            "names"
         )
+
+    @contextmanager
+    def _refusing_journal(self, unrecorded: str = "") -> Iterator[None]:
+        """Word a refusal of the journal so that it names the manual step.
+
+        The journal is opened twice per invocation, before the launch
+        (:meth:`_recover_sequence`) and at the append after the agent
+        returned (:meth:`log_execution`), and both opens refuse for the same
+        causes. Every refusal must leave the operator a way to resume, and
+        the cause decides what that is: a file past the size budget is not
+        a controller journal and is moved aside; a journal the controller
+        may not open for writing (``EACCES``: the in-place append needs a
+        writable file where a whole-file replacement needed only a writable
+        directory, and the controller creates the journal ``0600``, so this
+        is a file planted or ``chmod``-ed by someone else) is made writable
+        or moved aside; a link, a FIFO or a directory already says to move
+        the entry aside. The error keeps its type, so the filesystem cause
+        stays distinguishable; only the message grows. ``unrecorded`` says
+        where an invocation's artifacts are when the refusal is the append's.
+        """
+        journal = f"logs/{self.run_id}/events.jsonl"
+        tail = f"; {unrecorded}" if unrecorded else ""
+        try:
+            yield
+        except ReadLimitExceeded:
+            raise StateError(
+                f"corrupted event journal for run {self.run_id}: larger than "
+                f"{MAX_EVENT_JOURNAL_BYTES} bytes, which no controller journal can be. "
+                f"{self._journal_remedy(f'move {journal} aside')}{tail}"
+            ) from None
+        except UnreadableEntryError as exc:
+            remedy = self._journal_remedy(f"make {journal} writable, or move it aside,")
+            exc.args = (f"{exc}. {remedy}{tail}",)
+            raise
+        except StateError as exc:
+            if tail:
+                exc.args = (f"{exc}{tail}",)
+            raise
 
     def _refuse_run_dir(self, why: str) -> StateError:
         return StateError(
@@ -223,12 +264,8 @@ class RunLogger:
         write-capable agent has done work that would then go unlogged.
         Nothing is read or written by that check.
         """
-        try:
+        with self._refusing_journal():
             logs.verify_appendable(f"{self.run_id}/events.jsonl", limit=MAX_EVENT_JOURNAL_BYTES)
-        except ReadLimitExceeded:
-            raise self._refuse_journal(
-                f"larger than {MAX_EVENT_JOURNAL_BYTES} bytes, which no controller journal can be"
-            ) from None
 
         # Only the run's own directory and its immediate children matter, so
         # the walk starts *at* the run directory (a sub-root, so sibling runs
@@ -339,26 +376,16 @@ class RunLogger:
             # recoverable from the directory names. The append happens after
             # the agent returned, which is the one moment an agent has had
             # to replace or enlarge the journal; the open proves the file
-            # again and the size check refuses without reading (#55).
+            # again and the size check refuses without reading (#55). A
+            # refusal of any cause says where the invocation's record is.
             unrecorded = (
                 f"the invocation's artifacts are in logs/{self.run_id}/{step}/ but its "
                 "journal line was not written"
             )
-            try:
+            with self._refusing_journal(unrecorded):
                 logs.append_text(
                     f"{self.run_id}/events.jsonl",
                     json.dumps(asdict(record), sort_keys=True) + "\n",
                     limit=MAX_EVENT_JOURNAL_BYTES,
                 )
-            except ReadLimitExceeded:
-                raise self._refuse_journal(
-                    f"larger than {MAX_EVENT_JOURNAL_BYTES} bytes, which no controller "
-                    f"journal can be; {unrecorded}"
-                ) from None
-            except StateError as exc:
-                # The same object, so its type (an unsafe path, an unreadable
-                # entry) still says what the filesystem cause was; only the
-                # message grows, to say where the invocation's record is.
-                exc.args = (f"{exc}; {unrecorded}",)
-                raise
         return step_dir

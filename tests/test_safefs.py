@@ -435,6 +435,33 @@ def test_verify_appendable_refuses_every_entry_the_append_would_refuse(tmp_path)
     sentinel.assert_untouched()
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses file permissions")
+def test_an_unwritable_file_is_refused_by_the_append_and_by_the_check_alike(tmp_path):
+    """A regular file the controller may not open for writing is an access
+    fact, not an unsafe path: both opens report it as such, with the same
+    message, and neither writes, replaces or creates anything."""
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    target = root_dir / "events.jsonl"
+    target.write_bytes(b"theirs\n")
+    target.chmod(0o444)
+    before = target.stat()
+    try:
+        with SafeRoot.open(root_dir) as root:
+            with pytest.raises(UnreadableEntryError) as by_check:
+                root.verify_appendable("events.jsonl")
+            with pytest.raises(UnreadableEntryError) as by_append:
+                root.append_text("events.jsonl", "controller\n")
+    finally:
+        target.chmod(0o600)
+    assert str(by_check.value) == str(by_append.value)
+    assert by_append.value.path.endswith("events.jsonl")
+    assert "Permission denied" in str(by_append.value)
+    assert target.read_bytes() == b"theirs\n"
+    assert (target.stat().st_ino, target.stat().st_size) == (before.st_ino, before.st_size)
+    assert sorted(p.name for p in root_dir.iterdir()) == ["events.jsonl"], "no temporary left"
+
+
 # -- identity: a root is an inode, not a pathname ------------------------------
 def test_a_root_renamed_after_it_was_opened_keeps_receiving_the_writes(tmp_path):
     """The capability is the descriptor. Renaming the directory cannot redirect it."""
