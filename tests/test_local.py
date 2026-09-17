@@ -1613,6 +1613,47 @@ def test_a_journal_refused_before_the_launch_is_not_charged_as_a_launch(tmp_path
 
 
 @pytest.mark.parametrize("phase", [Phase.ANALYZE_EXECUTE, Phase.FIX])
+def test_a_run_directory_refused_before_the_launch_is_not_charged_as_a_launch(
+    tmp_path, phase, monkeypatch
+):
+    """#56 with #57: the step-directory scan is bounded, and its refusal is a
+    pre-launch refusal like a corrupt journal, so it charges nothing."""
+    import autoforge.runlog as runlog
+
+    monkeypatch.setattr(runlog, "MAX_RUN_LOG_ENTRIES", 16)
+    root = local_repo(tmp_path)
+    eng = make_local_engine(root, "features/add-filter.md")
+    _run_to(eng, root, phase)
+    run_dir = Path(eng.paths.logs_dir) / eng.state.run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    planted = [run_dir / f"planted-{i:02}" for i in range(17)]
+    for path in planted:
+        path.write_text("x")
+    eng.provider._handler = lambda req: pytest.fail("no agent may be launched")
+
+    for _ in range(3):
+        with pytest.raises(StateError, match="corrupted run log directory.*more than 16"):
+            eng.step()
+        persisted = load_state(eng.paths.state_file)
+        assert persisted.phase is phase
+        assert persisted.local_pending_phase == ""
+        assert persisted.local_pending_attempts == 0
+
+    for path in planted:
+        path.unlink()
+    launches: list[int] = []
+
+    def implements(req):
+        launches.append(load_state(eng.paths.state_file).local_pending_attempts)
+        touch_impl(root, "repaired\n")
+        return impl_result() if phase is Phase.ANALYZE_EXECUTE else fix_result(["R1-F1"])
+
+    eng.provider._handler = implements
+    assert eng.step().next_phase == "REVIEW"
+    assert launches == [1], "the first real launch is charged as the first"
+
+
+@pytest.mark.parametrize("phase", [Phase.ANALYZE_EXECUTE, Phase.FIX])
 def test_a_profile_refused_before_the_launch_is_not_charged_as_a_launch(tmp_path, phase):
     """#57, the other pre-launch refusal: an unusable execution profile."""
     root = local_repo(tmp_path)

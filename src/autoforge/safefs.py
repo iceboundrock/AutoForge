@@ -93,6 +93,7 @@ import stat
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import BinaryIO
 
 from .errors import StateError
 
@@ -567,12 +568,7 @@ class SafeRoot:
         finally:
             os.close(parent)
         with os.fdopen(fd, "rb") as fh:
-            if limit is None:
-                return fh.read()
-            data = fh.read(limit + 1)
-        if len(data) > limit:
-            raise ReadLimitExceeded(relpath, limit)
-        return data
+            return _read_within(fh, relpath, limit)
 
     def read_text(self, relpath: str, *, limit: int | None = None) -> str | None:
         data = self.read_bytes(relpath, limit=limit)
@@ -619,13 +615,21 @@ class SafeRoot:
         finally:
             os.close(parent)
 
-    def append_text(self, relpath: str, text: str, *, mode: int = 0o600) -> None:
+    def append_text(
+        self, relpath: str, text: str, *, mode: int = 0o600, limit: int | None = None
+    ) -> None:
         """Append to ``relpath`` by replacing its name, creating it if needed.
 
         Appending through an opened inode would leave a hard-link race between
         the link-count check and the write. Reading the old bytes and publishing
         a fresh inode keeps a second name, planted at any point in the window,
         untouched.
+
+        The append therefore *reads* the file, and with a ``limit`` that read
+        is bounded exactly as :meth:`read_bytes` is: one byte past the limit
+        and no more, then :class:`ReadLimitExceeded`. The refusal lands before
+        anything is written, so an oversized file at the name is neither held
+        in memory nor carried forward into a fresh inode.
         """
         parts = split_relpath(relpath)
         parent = self._parent_of(parts, create=True)
@@ -643,7 +647,7 @@ class SafeRoot:
                     os.close(fd)
                     raise
                 with os.fdopen(fd, "rb") as fh:
-                    existing = fh.read()
+                    existing = _read_within(fh, relpath, limit)
             self._replace_at(
                 parent,
                 parts[-1],
@@ -907,6 +911,22 @@ class SafeRoot:
             raise StateError(f"cannot list {where}: {exc}") from exc
         names.sort(reverse=True)
         return names
+
+
+def _read_within(fh: BinaryIO, relpath: str, limit: int | None) -> bytes:
+    """Read all of ``fh``, or with a ``limit`` at most one byte past it.
+
+    A file the caller has decided is too large to hold is never
+    materialised, whatever ``st_size`` claimed before it was opened: the
+    read asks for ``limit + 1`` bytes and raises :class:`ReadLimitExceeded`
+    when it gets them all.
+    """
+    if limit is None:
+        return fh.read()
+    data = fh.read(limit + 1)
+    if len(data) > limit:
+        raise ReadLimitExceeded(relpath, limit)
+    return data
 
 
 def _kind_at(dir_fd: int, name: str, fallback: str) -> str:

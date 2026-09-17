@@ -30,7 +30,7 @@ from pathlib import Path
 
 from .errors import StateError
 from .redaction import redact, redact_argv, redact_dict
-from .safefs import ReadLimitExceeded, SafeRoot
+from .safefs import ReadLimitExceeded, SafeRoot, WalkBudgetExceeded
 
 # A run identifier is a *file name*: it names the directory this run's logs
 # live in.  `generate_run_id` produces "af-<UTC stamp>-<hex>", but the value
@@ -39,20 +39,36 @@ from .safefs import ReadLimitExceeded, SafeRoot
 # generated it.
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
-# The most an event journal may be before recovery refuses it as corrupt
-# without reading it. Recovery needs the journal only for the highest ``seq``
-# it holds, and it lives where the agents the controller launches also write
-# (the same OS user), so like ``state.json`` (``MAX_STATE_FILE_BYTES``) it is
-# read through ``SafeRoot.read_bytes(limit=)``: one byte past the budget and
-# no more, so a sparse or oversized file at that name costs at most the
-# budget rather than the machine's memory. A real journal is a few kilobytes
-# per line and at most a few thousand lines (one per invocation, bounded by
-# the run's step budget and the correction attempts), so the budget is
-# generous; the record bound is checked *before* the journal is split into
-# lines, so a journal of millions of empty records cannot allocate its way
-# around the byte budget either.
+# The most an event journal may be before the controller refuses it as
+# corrupt without reading it. Recovery needs the journal only for the highest
+# ``seq`` it holds, and it lives where the agents the controller launches
+# also write (the same OS user), so like ``state.json``
+# (``MAX_STATE_FILE_BYTES``) it is read through ``SafeRoot.read_bytes(limit=)``:
+# one byte past the budget and no more, so a sparse or oversized file at that
+# name costs at most the budget rather than the machine's memory. The same
+# budget bounds the *append* (#55): ``SafeRoot.append_text`` publishes a
+# fresh inode from the existing bytes plus the new line, and that read
+# happens after the agent returned -- the one moment an agent has had to
+# enlarge the file -- so it goes through the same bounded read and refuses
+# rather than materialise the file or carry it forward. A real journal is a
+# few kilobytes per line and at most a few thousand lines (one per
+# invocation, bounded by the run's step budget and the correction attempts),
+# so the budget is generous; the record bound is checked *before* the journal
+# is split into lines, so a journal of millions of empty records cannot
+# allocate its way around the byte budget either.
 MAX_EVENT_JOURNAL_BYTES = 64 * 1024 * 1024
 MAX_EVENT_JOURNAL_RECORDS = 100_000
+# The most entries the run's own log directory may hold before the crash
+# guard that lists it (the step directories continue the sequence when a
+# journal line was never written) refuses instead of listing without end
+# (#56). A run publishes at most one step directory per journal record, so
+# the record bound is the natural ceiling; the journal itself, and the copies
+# an operator moved aside as a refusal told them to, are a handful of names
+# against it, and doubling is simpler than counting them. Only the run's own
+# directory is listed: sibling runs under ``logs/`` never count, so a state
+# directory with a long history of runs cannot exhaust this for a reason
+# unrelated to the run being resumed.
+MAX_RUN_LOG_ENTRIES = 2 * MAX_EVENT_JOURNAL_RECORDS
 
 
 def validate_run_id(run_id: str) -> str:
@@ -174,6 +190,14 @@ class RunLogger:
             "kept and the sequence continues from their names"
         )
 
+    def _refuse_run_dir(self, why: str) -> StateError:
+        return StateError(
+            f"corrupted run log directory for run {self.run_id}: {why}. The directory is "
+            "only listed to continue the step sequence from the step directories it "
+            f"holds, so move the entries AutoForge did not create out of "
+            f"logs/{self.run_id}/ to resume"
+        )
+
     def _existing_event_count(self, logs: SafeRoot) -> int:
         path = f"{self.run_id}/events.jsonl"
         try:
@@ -215,18 +239,25 @@ class RunLogger:
         # those names too, or the next invocation could reuse the directory
         # and overwrite a completed execution's artifacts.
         # Only the run's own directory and its immediate children matter, so
-        # the walk descends no further: sibling runs and the step directories'
-        # contents are skipped, not listed.
-        prefix = f"{self.run_id}/"
-        for entry in logs.walk():
-            if entry.relpath != self.run_id:
-                entry.skip = True
-            if not entry.relpath.startswith(prefix):
-                continue
-            step_name = entry.relpath[len(prefix) :]
-            match = re.match(r"^(\d+)-", step_name)
-            if match:
-                highest = max(highest, int(match.group(1)))
+        # the walk starts *at* the run directory (a sub-root, so sibling runs
+        # under ``logs/`` are never listed -- #56) and descends no further:
+        # every entry is skipped, so the step directories' contents are not
+        # listed either. The listing is budgeted like the journal it stands in
+        # for (``MAX_RUN_LOG_ENTRIES``): more entries than a run can publish
+        # is not a run directory the controller wrote, and the walk refuses
+        # while listing rather than after holding a planted million names.
+        with logs.subroot(self.run_id) as run:
+            try:
+                for entry in run.walk(max_entries=MAX_RUN_LOG_ENTRIES):
+                    entry.skip = True
+                    match = re.match(r"^(\d+)-", entry.name)
+                    if match:
+                        highest = max(highest, int(match.group(1)))
+            except WalkBudgetExceeded:
+                raise self._refuse_run_dir(
+                    f"more than {MAX_RUN_LOG_ENTRIES} entries, which no controller run "
+                    "directory can hold (at most one step directory per journal record)"
+                ) from None
         return highest
 
     def _step_name(self, seq: int, phase: str, attempt: int) -> str:
@@ -310,7 +341,22 @@ class RunLogger:
                 )
             if record.error:
                 logs.write_text(f"{base}/error.txt", record.error + "\n")
-            logs.append_text(
-                f"{self.run_id}/events.jsonl", json.dumps(asdict(record), sort_keys=True) + "\n"
-            )
+            # The step directory and its artifacts are published above,
+            # before the journal line, so a refusal here leaves the sequence
+            # recoverable from the directory names. The append reads the
+            # journal after the agent returned, which is the one read an
+            # agent could have enlarged the file for; it is bounded like the
+            # recovery read and refused the same way (#55).
+            try:
+                logs.append_text(
+                    f"{self.run_id}/events.jsonl",
+                    json.dumps(asdict(record), sort_keys=True) + "\n",
+                    limit=MAX_EVENT_JOURNAL_BYTES,
+                )
+            except ReadLimitExceeded:
+                raise self._refuse_journal(
+                    f"larger than {MAX_EVENT_JOURNAL_BYTES} bytes, which no controller "
+                    f"journal can be; the invocation's artifacts are in logs/{self.run_id}/"
+                    f"{step}/ but its journal line was not written"
+                ) from None
         return step_dir

@@ -92,6 +92,8 @@ have written", which an agent could write into.
 | R10-F3 | 10 | `state.json` was read without a bound, so a sparse or oversized file was materialised whole | — × final × read | local |
 | R10-F4 | 10 | `doctor` located the state dir by resolved pathname, then probed it by pathname (`mkdir`, `mkstemp`) through a symlinked `<git dir>/autoforge` | link × parent × create (doctor) | systemic |
 | R11-F2 | 11 | `events.jsonl` was read without a bound at recovery, so a sparse or oversized journal was materialised whole | — × final × read | local |
+| #55 | — | the post-agent append read `events.jsonl` without a bound, so a journal enlarged during the invocation was materialised whole and carried forward | — × final × append | local |
+| #56 | — | the step-directory scan listed every sibling run under `logs/` with no budget before skipping it | — × parent × list | local |
 
 Again one cause:
 
@@ -479,6 +481,29 @@ only for the highest `seq` it holds, so the refusal names the manual step
 monotonic) rather than stranding the run. The read now happens *before* the
 agent is launched, not at the first write after it returns: a refusal must
 land before a write-capable agent has done work that would go unlogged.
+
+The journal is read a second time after the agent returns: `append_text` is
+read-existing + publish-fresh-inode (so a planted second name stays
+untouched), and that read is the one an agent has had the whole invocation
+to enlarge the file for. It goes through the same bounded read
+(`append_text(limit=MAX_EVENT_JOURNAL_BYTES)`, #55) and is refused the same
+way, before anything is written, so an oversized journal is neither held in
+memory nor carried forward into the fresh inode. The invocation is not lost
+to the refusal: its step directory and artifacts are published before the
+journal line, the refusal says where they are, and the launch checkpoint
+was persisted before the agent started, so `resume` re-enters the phase as
+a retry judged against the baseline from before the first launch.
+
+The crash guard that continues the sequence from step-directory names lists
+only the run's own directory, opened as a sub-root, and lists it under a
+budget (`MAX_RUN_LOG_ENTRIES`, #56). Walking `logs/` and skipping the
+siblings still listed and `lstat`ed every sibling run first, so the cost of
+opening the logger -- before every launch and after every validation run --
+grew with the operator's history and with whatever an agent planted beside
+the run. A run publishes at most one step directory per journal record, so
+more entries than that is not a directory the controller wrote; the walk
+refuses while listing, and the refusal names the manual step (move the
+entries AutoForge did not create out of the run directory).
 
 ### 5.6 Types are the contract at the state boundary
 

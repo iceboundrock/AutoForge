@@ -477,7 +477,11 @@ name, which means a symbolic link, hard link, FIFO or device planted at an
 artifact's name is *replaced*: it is never opened, so whatever it pointed at
 is provably untouched. The append-only `events.jsonl` is the one artifact that
 must be opened in place, and there the open is `O_NOFOLLOW|O_NONBLOCK` and
-refuses a hard link outright. `run_id`, which names `logs/<run_id>`, is
+refuses a hard link outright. Every read of it is bounded, at recovery and at
+the append after an agent returns alike, and the run's log directory is
+listed under a budget of its own, so a same-user agent that plants an
+oversized journal or a million names there makes the controller refuse, not
+run out of memory. `run_id`, which names `logs/<run_id>`, is
 validated as a single safe path component whenever state is loaded, not
 trusted because the controller generated it once.
 

@@ -4,6 +4,7 @@ The log tree lives inside the operator's checkout, where the agents the
 controller launches also write, so nothing under it is trusted by name.
 """
 
+import json
 import os
 
 import pytest
@@ -172,6 +173,144 @@ def test_a_journal_that_is_not_utf8_is_corrupt_not_silently_repaired(tmp_path):
     (run_dir / "events.jsonl").write_bytes(b'{"seq": 1}\n\xff\xfe\n')
     with pytest.raises(StateError, match="corrupted event journal.*line 2"):
         RunLogger(tmp_path / "logs", "run-1")
+
+
+# -- #55: the post-agent append is the other read of the journal -----------------
+#
+# R11-F2 bounded the read at recovery and moved it before the launch. The
+# append that records the invocation reads the journal again *after* the
+# agent returned, which is exactly when an agent has had the chance to
+# enlarge it. That read is bounded the same way and refused the same way.
+
+
+def test_a_journal_enlarged_after_the_logger_opened_refuses_the_append_not_the_machine(
+    tmp_path, monkeypatch
+):
+    from autoforge.runlog import MAX_EVENT_JOURNAL_BYTES
+
+    log = RunLogger(tmp_path / "logs", "run-1")
+    log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="REVIEW"))
+    # The agent runs here, and leaves the journal sparse and twice the budget.
+    os.truncate(log.events_path, 2 * MAX_EVENT_JOURNAL_BYTES)
+    before = log.events_path.stat()
+    asked = _counted_reads(monkeypatch)
+
+    with pytest.raises(StateError, match="corrupted event journal.*larger than .* bytes") as exc:
+        log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="FIX"), stdout="work")
+    assert max(asked) == MAX_EVENT_JOURNAL_BYTES + 1, asked
+    # Refused before anything was written: the oversized file is neither
+    # materialised nor carried forward into a fresh inode ...
+    after = log.events_path.stat()
+    assert (after.st_ino, after.st_size) == (before.st_ino, before.st_size)
+    # ... and the invocation is not lost: its artifacts were published
+    # first, the message says where they are, and the sequence continues
+    # from the directory name once the journal is moved aside.
+    step = log.run_dir / "002-fix-1"
+    assert (step / "stdout.log").read_text(encoding="utf-8") == "work"
+    assert "logs/run-1/002-fix-1/" in str(exc.value)
+    assert "move logs/run-1/events.jsonl aside" in str(exc.value)
+    log.events_path.rename(log.events_path.with_suffix(".aside"))
+    assert (
+        RunLogger(tmp_path / "logs", "run-1")
+        .log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="REVIEW"))
+        .name
+        == "003-review-1"
+    )
+
+
+def test_a_journal_at_exactly_the_byte_budget_is_still_appended_to(tmp_path):
+    from autoforge.runlog import MAX_EVENT_JOURNAL_BYTES
+
+    log = RunLogger(tmp_path / "logs", "run-1")
+    body = b'{"seq": 1}\n'
+    log.events_path.write_bytes(body + b" " * (MAX_EVENT_JOURNAL_BYTES - len(body)))
+    log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="FIX"))
+    journal = log.events_path.read_bytes()
+    assert journal.startswith(body)
+    assert len(journal) > MAX_EVENT_JOURNAL_BYTES
+    assert json.loads(journal.splitlines()[-1])["seq"] == 1
+
+
+# -- #56: the crash guard lists the run's own directory, bounded ------------------
+#
+# The step-directory scan used to walk ``logs/`` and skip every sibling run,
+# which still listed and stat'ed all of them first. It now opens the run's
+# directory as a sub-root and lists that alone, with a budget.
+
+
+def _recorded_listings(monkeypatch) -> list[str]:
+    """Every directory entry name any ``scandir`` in ``safefs`` produces."""
+    import autoforge.safefs as safefs
+
+    seen: list[str] = []
+    real_scandir = safefs.os.scandir
+
+    class Recording:
+        def __init__(self, it):
+            self._it = it
+
+        def __enter__(self):
+            self._it.__enter__()
+            return self
+
+        def __exit__(self, *exc):
+            return self._it.__exit__(*exc)
+
+        def __iter__(self):
+            for entry in self._it:
+                seen.append(entry.name)
+                yield entry
+
+    monkeypatch.setattr(safefs.os, "scandir", lambda *a, **k: Recording(real_scandir(*a, **k)))
+    return seen
+
+
+def test_opening_the_logger_never_lists_sibling_runs(tmp_path, monkeypatch):
+    logs = tmp_path / "logs"
+    run_dir = logs / "run-1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "events.jsonl").write_text('{"seq": 3}\n', encoding="utf-8")
+    (run_dir / "005-review-1").mkdir()
+    (run_dir / "005-review-1" / "stdout.log").write_text("not a step name", encoding="utf-8")
+    for i in range(2000):
+        (logs / f"sibling-{i:04}").mkdir()
+        (logs / f"planted-{i:04}").write_text("x", encoding="utf-8")
+    seen = _recorded_listings(monkeypatch)
+
+    log = RunLogger(logs, "run-1")
+
+    assert sorted(seen) == ["005-review-1", "events.jsonl"], "only the run's own top level"
+    assert log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="FIX")).name == (
+        "006-fix-1"
+    )
+
+
+def test_a_run_directory_with_more_entries_than_a_run_can_produce_is_refused_while_listing(
+    tmp_path, monkeypatch
+):
+    import autoforge.runlog as runlog
+
+    monkeypatch.setattr(runlog, "MAX_RUN_LOG_ENTRIES", 8)
+    run_dir = tmp_path / "logs" / "run-1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "events.jsonl").write_text('{"seq": 1}\n', encoding="utf-8")
+    planted = [run_dir / f"planted-{i:03}" for i in range(100)]
+    for path in planted:
+        path.mkdir()
+    seen = _recorded_listings(monkeypatch)
+    with pytest.raises(StateError, match="corrupted run log directory.*more than 8 entries") as exc:
+        RunLogger(tmp_path / "logs", "run-1")
+    # Refused on the readdir record that passes the budget, before the rest
+    # of the directory is listed, sorted or stat'ed.
+    assert len(seen) == 9, seen
+    assert "move the entries AutoForge did not create out of logs/run-1/" in str(exc.value)
+    # The manual step works: within the budget again, the sequence resumes.
+    for path in planted[7:]:
+        path.rmdir()
+    log = RunLogger(tmp_path / "logs", "run-1")
+    assert log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="FIX")).name == (
+        "002-fix-1"
+    )
 
 
 # -- R3-F1: the log tree is never followed anywhere ---------------------------
