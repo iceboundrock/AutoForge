@@ -13,7 +13,17 @@ from autoforge.errors import LockError
 from autoforge.locking import ControllerLock, repository_lock_path
 from autoforge.state import save_state
 from autoforge.transitions import Phase
-from tests.conftest import BRANCH, ISSUE, PR, SHA_A, FakeGitHub, block, git_repo, make_engine
+from tests.conftest import (
+    BRANCH,
+    ISSUE,
+    PR,
+    SHA_A,
+    FakeGitHub,
+    block,
+    git_repo,
+    implementation_pr_body,
+    make_engine,
+)
 
 ANALYZE_OK = {
     "phase": "ANALYZE_EXECUTE",
@@ -33,7 +43,7 @@ def _github() -> FakeGitHub:
 
 def _analyze_ok(gh: FakeGitHub) -> str:
     """Agent stdout for ANALYZE_EXECUTE; creates the PR it claims on the fake GitHub."""
-    gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2])
+    gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
     return block(ANALYZE_OK)
 
 

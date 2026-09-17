@@ -150,6 +150,13 @@ def post_progress_comment(gh: FakeGitHub, cid: int = 300) -> None:
     gh.add_comment(EPIC, cid, progress_comment_body())
 
 
+def implementation_pr_body(issue_url: str = ISSUE) -> str:
+    """A PR body carrying the issue's implementation marker (what the agent must write)."""
+    from autoforge.engine import render_implementation_marker
+
+    return f"Closes {issue_url}\n\n{render_implementation_marker(issue_url)}\n"
+
+
 def follow_up_issue_body(finding_id: str, pr_url: str = PR) -> str:
     """A follow-up issue body carrying the (PR, finding) marker."""
     from autoforge.engine import render_follow_up_marker
@@ -528,18 +535,6 @@ class FakeGitHub:
         return max(
             (p.number for p in self.prs.values() if self._same_repo(p.repository, repo)), default=0
         )
-
-    def find_open_prs_for_issue(self, issue, *, strict: bool = False) -> list[PRInfo]:
-        self.calls.append(("find_open_prs_for_issue", issue.number, strict))
-        out = []
-        for pr in self.list_open_prs(issue.repository, strict=strict):
-            if (
-                issue.number in pr.linked_issue_numbers
-                or pr.head_ref.startswith(f"autoforge/{issue.number}-")
-                or pr.head_ref == f"autoforge/{issue.number}"
-            ):
-                out.append(pr)
-        return out
 
     def get_pr_comments(self, url: str) -> list[CommentInfo]:
         self.calls.append(("get_pr_comments", url))

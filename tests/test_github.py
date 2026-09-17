@@ -205,67 +205,6 @@ def test_list_open_issues_strict_refuses_a_possibly_truncated_listing():
     assert len(truncating.list_open_issues("o/r")) == STRICT_ISSUE_LIST_LIMIT
 
 
-def test_find_open_prs_for_issue():
-    prs = [
-        {
-            "url": "https://github.com/o/r/pull/1",
-            "number": 1,
-            "state": "OPEN",
-            "headRefOid": "a" * 40,
-            "headRefName": "autoforge/2-x",
-            "baseRefName": "main",
-        },
-        {
-            "url": "https://github.com/o/r/pull/2",
-            "number": 2,
-            "state": "OPEN",
-            "headRefOid": "b" * 40,
-            "headRefName": "feature/other",
-            "baseRefName": "main",
-            "closingIssuesReferences": [{"number": 2}],
-        },
-        {
-            "url": "https://github.com/o/r/pull/3",
-            "number": 3,
-            "state": "OPEN",
-            "headRefOid": "c" * 40,
-            "headRefName": "autoforge/20",
-            "baseRefName": "main",
-        },
-    ]
-    seen = []
-
-    def handler(req):
-        seen.append(req.command)
-        return ExecutionResult(req.command, None, 0, json.dumps(prs), "", "t", "t")
-
-    def limit_of(cmd):
-        return cmd[cmd.index("--limit") + 1]
-
-    gh = _client(handler)
-    found = gh.find_open_prs_for_issue("https://github.com/o/r/issues/2")
-    assert sorted(p.number for p in found) == [1, 2]
-    assert limit_of(seen[0]) == "100"
-
-    # strict: reads far more before giving up, and refuses a set it cannot
-    # prove complete rather than reporting "no candidate".
-    found = gh.find_open_prs_for_issue("https://github.com/o/r/issues/2", strict=True)
-    assert sorted(p.number for p in found) == [1, 2]
-    assert limit_of(seen[1]) == str(STRICT_PR_LIST_LIMIT)
-
-    full = [
-        dict(prs[0], number=n, url=f"https://github.com/o/r/pull/{n}")
-        for n in range(1, STRICT_PR_LIST_LIMIT + 1)
-    ]
-    truncating = _client(
-        lambda req: ExecutionResult(req.command, None, 0, json.dumps(full), "", "t", "t")
-    )
-    with pytest.raises(GitHubError, match="truncated"):
-        truncating.find_open_prs_for_issue("https://github.com/o/r/issues/2", strict=True)
-    # Non-strict callers are unaffected: a full page is not an error for them.
-    assert truncating.find_open_prs_for_issue("https://github.com/o/r/issues/2")
-
-
 def test_transient_error_retried_once():
     calls = []
 

@@ -24,6 +24,7 @@ from tests.conftest import (
     ci_check,
     comment_url,
     git_repo,
+    implementation_pr_body,
     post_progress_comment,
     review_comment_body,
 )
@@ -251,7 +252,7 @@ def test_full_run_prints_ready_banner(tmp_path, capsys, monkeypatch, fakes):
 
     def agent(req):
         if req.phase == "ANALYZE_EXECUTE":
-            gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2])
+            gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
             return block(
                 {
                     "phase": "ANALYZE_EXECUTE",
@@ -302,7 +303,7 @@ def _drive_to_ready(fakes):
 
     def agent(req):
         if req.phase == "ANALYZE_EXECUTE":
-            gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2])
+            gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
             return block(
                 {
                     "phase": "ANALYZE_EXECUTE",
@@ -587,7 +588,7 @@ def test_resume_never_resets_the_step_budget(tmp_path, capsys, monkeypatch, fake
 
     def agent(req):
         if req.phase == "ANALYZE_EXECUTE":
-            gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2])
+            gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
             return block(
                 {
                     "phase": "ANALYZE_EXECUTE",
@@ -951,7 +952,7 @@ def test_run_refuses_state_created_by_a_concurrent_controller_before_lock(
 
 # -- R5-F1: one continuous lock per command ----------------------------------
 def _analyze_ok(gh) -> str:
-    gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2])
+    gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
     return block(
         {
             "phase": "ANALYZE_EXECUTE",

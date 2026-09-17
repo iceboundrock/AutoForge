@@ -61,6 +61,7 @@ from tests.conftest import (
     comment_url,
     follow_up_issue_body,
     git_repo,
+    implementation_pr_body,
     make_engine,
     post_progress_comment,
     progress_comment_body,
@@ -187,7 +188,7 @@ def test_analyze_valid_pr_verified_enters_review(tmp_state_dir, fake_github):
     eng.step()  # INITIALIZING
 
     def on_call(req):  # the agent "creates" the PR as a side effect
-        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2])
+        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
         return block(ANALYZE_OK)
 
     eng.provider._handler = on_call
@@ -225,7 +226,9 @@ def test_analyze_issue_claim_is_compared_by_identity_not_url_string(tmp_state_di
     eng = make_engine(tmp_state_dir, [block(payload)], github=fake_github)
     eng.state.phase = Phase.ANALYZE_EXECUTE
     eng.provider._handler = lambda req: (
-        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2]),
+        fake_github.add_pr(
+            head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body()
+        ),
         block(payload),
     )[1]
     assert eng.step().next_phase == "REVIEW"
@@ -252,25 +255,143 @@ def test_analyze_branch_mismatch_rejected(tmp_state_dir, fake_github):
     fake_github.add_pr(head_sha=SHA_A, branch="feature/other")
     eng = make_engine(tmp_state_dir, [block(ANALYZE_OK)], github=fake_github)
     eng.state.phase = Phase.ANALYZE_EXECUTE
-    # recovery does not match (branch not autoforge/2-*, not linked) -> agent runs
+    # recovery does not match (no implementation marker in the body) -> agent runs
     with pytest.raises(VerificationError, match="branch mismatch"):
         eng.step()
 
 
+# -- ANALYZE_EXECUTE read-back: the implementation marker (PR #89 review F1) --------------
+def test_analyze_pr_without_the_implementation_marker_is_rejected(tmp_state_dir, fake_github):
+    """A PR the read-back accepts must be a PR every later entry finds. The
+    entry finds PRs by the marker alone, so a PR without it (branch and
+    linkage notwithstanding) is not accepted, whatever the agent claims."""
+    from autoforge.engine import render_implementation_marker
+
+    eng = make_engine(tmp_state_dir, [block(ANALYZE_OK)], github=fake_github)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    eng.provider._handler = lambda req: (
+        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2]),
+        block(ANALYZE_OK),
+    )[1]
+    with pytest.raises(VerificationError, match="does not carry the implementation marker"):
+        eng.step()
+    assert eng.state.phase == Phase.ANALYZE_EXECUTE and eng.state.current_pr_url == ""
+    assert render_implementation_marker(ISSUE) in eng.provider.calls[0].prompt
+
+
+def test_analyze_pr_marked_for_another_issue_is_rejected(tmp_state_dir, fake_github):
+    eng = make_engine(tmp_state_dir, [block(ANALYZE_OK)], github=fake_github)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    eng.provider._handler = lambda req: (
+        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, body=implementation_pr_body(ISSUE3)),
+        block(ANALYZE_OK),
+    )[1]
+    with pytest.raises(VerificationError, match="does not carry the implementation marker"):
+        eng.step()
+
+
+def test_analyze_second_marked_pr_is_rejected_then_the_next_entry_blocks(
+    tmp_state_dir, fake_github
+):
+    """Read-back and entry agree: two open PRs carrying the issue's marker is
+    a pair the read-back rejects and the next entry blocks on, so the
+    controller never picks one of them."""
+    other = "https://github.com/owner/repo/pull/43"
+
+    def creates_two(req):
+        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, body=implementation_pr_body())
+        fake_github.add_pr(
+            url=other, head_sha=SHA_B, branch="autoforge/2-again", body=implementation_pr_body()
+        )
+        return block(ANALYZE_OK)
+
+    eng = make_engine(tmp_state_dir, creates_two, github=fake_github)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    with pytest.raises(VerificationError, match="2 open PRs carry the implementation marker"):
+        eng.step()
+    assert eng.state.current_pr_url == ""
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and len(eng.provider.calls) == 1
+    reason = load_state(eng.paths.state_file).block_reason
+    assert "2 open PRs claim to implement issue #2" in reason and PR in reason and other in reason
+
+
 # -- recovery ------------------------------------------------------------------------
-def test_recovery_existing_open_pr_skips_agent(tmp_state_dir, fake_github):
-    fake_github.add_pr(head_sha=SHA_B, branch="autoforge/2-x")
+def test_recovery_adopts_the_marked_pr_whatever_its_branch_or_linkage(tmp_state_dir, fake_github):
+    """PR #89 review F1: the agent created the PR on a branch of its own
+    naming, without linking the issue, and was interrupted before the
+    controller persisted it. The marker in its body is what identifies it,
+    so the entry adopts it instead of launching a second implementation."""
+    fake_github.add_pr(head_sha=SHA_B, branch="feature/anything", body=implementation_pr_body())
     eng = make_engine(tmp_state_dir, ["never"], github=fake_github)
     eng.state.phase = Phase.ANALYZE_EXECUTE
     out = eng.step()
     assert out.next_phase == "REVIEW" and "recovered" in out.message
     assert eng.provider.calls == []
     assert eng.state.current_pr_url == PR and eng.state.current_head_sha == SHA_B
+    assert eng.state.current_branch == "feature/anything"
+    assert ("list_open_prs", "owner/repo", True) in fake_github.calls
+
+
+def test_recovery_blocks_when_the_open_pr_listing_cannot_be_proven_complete(
+    tmp_state_dir, fake_github
+):
+    """ "No PR implements this issue yet" is a claim about every open PR; a
+    listing that may be truncated cannot make it, and an agent launched on
+    it would create a second implementation. BLOCKED, nobody launched."""
+    fake_github.pr_listing_truncated = True
+    eng = make_engine(tmp_state_dir, ["never"], github=fake_github)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and eng.provider.calls == []
+    reason = load_state(eng.paths.state_file).block_reason
+    assert "cannot establish whether an open PR already implements issue #2" in reason
+    assert "may be truncated" in reason and "will not launch an agent" in reason
+
+
+def test_recovery_ignores_a_pr_marked_for_another_issue(tmp_state_dir, fake_github):
+    fake_github.add_pr(
+        head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body(ISSUE3)
+    )
+
+    def agent(req):
+        fake_github.prs[PR].body = implementation_pr_body()  # takes it over, as told
+        return block(ANALYZE_OK)
+
+    eng = make_engine(tmp_state_dir, agent, github=fake_github)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    assert eng.step().next_phase == "REVIEW" and len(eng.provider.calls) == 1
+
+
+def test_recovery_does_not_adopt_an_unmarked_pr_the_agent_is_told_to_mark(
+    tmp_state_dir, fake_github
+):
+    """A linked PR on the controller's branch but without the marker is not
+    provenance (a human, an older controller): it is not adopted. The agent
+    runs, is told the marker, gives the existing PR the marker instead of
+    opening a second one, and the read-back then accepts it."""
+    from autoforge.engine import render_implementation_marker
+
+    fake_github.add_pr(head_sha=SHA_A, branch="autoforge/2-x", linked=[2])
+    payload = dict(ANALYZE_OK, branch="autoforge/2-x")
+
+    def marks_the_existing_pr(req):
+        assert f"`{render_implementation_marker(ISSUE)}`" in req.prompt
+        assert "gh pr edit" in req.prompt
+        fake_github.prs[PR].body = implementation_pr_body()
+        return block(payload)
+
+    eng = make_engine(tmp_state_dir, marks_the_existing_pr, github=fake_github)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    out = eng.step()
+    assert out.next_phase == "REVIEW" and len(eng.provider.calls) == 1
+    assert eng.state.current_pr_url == PR
 
 
 def test_recovery_after_crash_with_persisted_pr(tmp_state_dir, fake_github):
-    """PR created + state persisted, crash before transition -> resume recovers."""
-    fake_github.add_pr(head_sha=SHA_A, branch="feature/x")  # not detectable by naming
+    """PR created + state persisted, crash before transition -> resume recovers
+    the controller's own record, marker or not."""
+    fake_github.add_pr(head_sha=SHA_A, branch="feature/x")
     eng = make_engine(tmp_state_dir, ["never"], github=fake_github)
     eng.state.phase = Phase.ANALYZE_EXECUTE
     eng.state.current_pr_url = PR
@@ -282,21 +403,17 @@ def test_recovery_after_crash_with_persisted_pr(tmp_state_dir, fake_github):
 
 
 def test_recovery_ambiguous_blocks(tmp_state_dir, fake_github):
-    fake_github.add_pr(url=PR, head_sha=SHA_A, branch="autoforge/2-a")
-    fake_github.add_pr(url="https://github.com/owner/repo/pull/43", head_sha=SHA_B, linked=[2])
+    fake_github.add_pr(
+        url=PR, head_sha=SHA_A, branch="autoforge/2-a", body=implementation_pr_body()
+    )
+    fake_github.add_pr(
+        url="https://github.com/owner/repo/pull/43", head_sha=SHA_B, body=implementation_pr_body()
+    )
     eng = make_engine(tmp_state_dir, ["never"], github=fake_github)
     eng.state.phase = Phase.ANALYZE_EXECUTE
     out = eng.step()
-    assert out.next_phase == "BLOCKED" and "multiple open PRs" in eng.state.block_reason
+    assert out.next_phase == "BLOCKED" and "2 open PRs claim to implement" in eng.state.block_reason
     assert eng.provider.calls == []
-
-
-def test_recovery_pr_not_persisted_agent_reuses(tmp_state_dir, fake_github):
-    """PR exists on GitHub, nothing persisted: naming rule recovers it."""
-    fake_github.add_pr(head_sha=SHA_A, branch="autoforge/2")
-    eng = make_engine(tmp_state_dir, ["never"], github=fake_github)
-    eng.state.phase = Phase.ANALYZE_EXECUTE
-    assert eng.step().next_phase == "REVIEW"
 
 
 # -- REVIEW ---------------------------------------------------------------------------
@@ -927,6 +1044,100 @@ def test_fix_entry_ignores_a_closed_issue_carrying_the_marker(tmp_state_dir):
     assert eng.step().next_phase == "REVIEW"
 
 
+# -- earlier rounds' follow-ups reach the reviewer and the fixer (PR #89 review F2, #90) ---
+def test_review_entry_hands_the_prs_existing_follow_up_issues_to_the_reviewer(tmp_state_dir):
+    """Finding ids are round-scoped, so the reviewer of round 2 is told which
+    problems round 1's fixer already deferred, by finding id and issue."""
+    gh = FakeGitHub()
+    other = "https://github.com/owner/repo/issues/4"
+    gh.add_issue(ISSUE3, "deferred", body=follow_up_issue_body("R1-F2"))
+    gh.add_issue(other, "deferred too", body=follow_up_issue_body("R1-F1"))
+    gh.add_issue(
+        "https://github.com/owner/repo/issues/5",
+        "closed",
+        state="CLOSED",
+        body=follow_up_issue_body("R1-F3"),
+    )
+    gh.add_issue(
+        "https://github.com/owner/repo/issues/6",
+        "another PR",
+        body=follow_up_issue_body("R1-F1", "https://github.com/owner/repo/pull/41"),
+    )
+
+    def reviews(req):
+        assert (f"from\n  earlier rounds:\n  - R1-F1: {other}\n- R1-F2: {ISSUE3}\n") in req.prompt
+        assert "issues/5" not in req.prompt and "issues/6" not in req.prompt
+        gh.add_comment(PR, 100, review_comment_body(2, SHA_A, False))
+        return block(review_payload(2, SHA_A, []))
+
+    eng = _in_review(tmp_state_dir, gh, reviews, round_done=1)
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    assert ("list_open_issues", "owner/repo", True) in gh.calls
+
+
+def test_review_entry_blocks_when_the_open_issue_listing_cannot_be_proven_complete(
+    tmp_state_dir,
+):
+    gh = FakeGitHub()
+    gh.issue_listing_truncated = True
+    eng = _in_review(tmp_state_dir, gh, ["never"])
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and eng.provider.calls == []
+    reason = load_state(eng.paths.state_file).block_reason
+    assert "cannot establish which follow-up issues already exist for PR" in reason
+    assert "may be truncated" in reason
+
+
+def test_fix_entry_hands_earlier_rounds_follow_ups_to_the_fixer(tmp_state_dir):
+    """The open finding's own follow-up slot is empty; the deferral of an
+    earlier round is listed separately, so a re-raised problem can be
+    recorded on the issue that exists instead of in a second one."""
+    gh = FakeGitHub()
+    gh.add_issue(ISSUE3, "deferred in round 1", body=follow_up_issue_body("R1-F2"))
+    from autoforge.engine import render_follow_up_marker
+
+    def adds_the_marker(req):
+        marker = render_follow_up_marker(PR, "R2-F1")
+        assert f"- R2-F1: marker `{marker}`; existing issue: (none)" in req.prompt
+        assert f"earlier rounds (finding id:\nissue):\n\n- R1-F2: {ISSUE3}\n" in req.prompt
+        gh.issues[ISSUE3].body += marker + "\n"  # the same problem: one issue, two markers
+        return block(fix_payload(SHA_A, SHA_A, _follow_up("R2-F1", ISSUE3)))
+
+    eng = _in_fix(tmp_state_dir, gh, adds_the_marker, findings=[_finding(2)])
+    eng.state.review_round = 2
+    assert eng.step().next_phase == "REVIEW"
+    assert len(gh.issues) == 3  # EPIC, ISSUE, ISSUE3: no second follow-up issue
+    assert eng.state.last_fix_resolutions[0]["follow_up_issue_url"] == ISSUE3
+
+
+def test_a_deferral_survives_an_unrecorded_fix_round(tmp_state_dir):
+    """Issue #90's scenario end to end: the fixer creates the follow-up issue,
+    pushes, and loses its result. The FIX re-entry routes to REVIEW of the
+    pushed HEAD (which findings the push resolved is not inferred), and that
+    review is told about the issue, so the problem is not re-raised under a
+    new id; the run ends clean with one follow-up issue."""
+    gh = FakeGitHub()
+    new = "https://github.com/owner/repo/issues/5"
+
+    def agent(req):
+        if req.phase == "FIX":
+            assert not req.correction
+            gh.add_issue(new, "follow-up", body=follow_up_issue_body("R1-F1"))
+            gh.set_head(SHA_B)
+            return "junk\n"  # the result block was lost
+        assert req.phase == "REVIEW"
+        assert f"earlier rounds:\n  - R1-F1: {new}\n" in req.prompt
+        gh.add_comment(PR, 100, review_comment_body(2, SHA_B, False))
+        return block(review_payload(2, SHA_B, []))
+
+    eng = _in_fix(tmp_state_dir, gh, agent)
+    out = eng.step()
+    assert out.next_phase == "REVIEW" and "no fixer launched" in out.message
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    assert [c.phase for c in eng.provider.calls] == ["FIX", "REVIEW"]
+    assert len(gh.issues) == 3  # EPIC, ISSUE, the one follow-up
+
+
 @pytest.mark.parametrize(
     "body",
     [
@@ -1098,7 +1309,9 @@ def test_malformed_result_after_the_pr_was_created_is_recovered_not_corrected(
 
     def agent(req):
         assert not req.correction
-        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2])  # PR was created…
+        fake_github.add_pr(
+            head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body()
+        )  # PR was created…
         return "no block here\n"  # …but the result block was lost
 
     eng = make_engine(tmp_state_dir, agent, github=fake_github)
@@ -1114,7 +1327,7 @@ def test_malformed_result_triggers_one_correction(tmp_state_dir, fake_github):
     def agent(req):
         if not req.correction:
             return "no block here\n"  # nothing was done, and no result block
-        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2])
+        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
         return block(ANALYZE_OK)  # correction run does the work and reports it
 
     eng = make_engine(tmp_state_dir, agent, github=fake_github)
@@ -3321,7 +3534,7 @@ def _loop_agent(gh: FakeGitHub, findings_for_round, seen: list[str] | None = Non
     def agent(req):
         seen.append(req.phase)
         if req.phase == "ANALYZE_EXECUTE":
-            gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2])
+            gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
             return block(ANALYZE_OK)
         if req.phase == "REVIEW":
             rounds["n"] += 1
@@ -3521,7 +3734,7 @@ def test_failed_review_invocation_consumes_neither_round_nor_history(tmp_state_d
 
 def test_new_pr_resets_review_history(tmp_state_dir, fake_github):
     def on_call(req):
-        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH)
+        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, body=implementation_pr_body())
         return block(ANALYZE_OK)
 
     eng = make_engine(tmp_state_dir, on_call, github=fake_github)
@@ -3832,7 +4045,9 @@ def test_truncated_stdout_accepts_a_block_that_lies_in_the_tail(tmp_state_dir, f
     provider = _TruncatedOutputProvider(
         "runaway logs " * 100,
         "last logs\n" + block(ANALYZE_OK),
-        on_call=lambda: fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2]),
+        on_call=lambda: fake_github.add_pr(
+            head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body()
+        ),
     )
     _install(eng, provider)
     eng.state.phase = Phase.ANALYZE_EXECUTE

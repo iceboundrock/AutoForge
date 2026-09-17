@@ -13,6 +13,9 @@ PR comment describing the outcome. This is review round {{REVIEW_ROUND}}.
 - Previous review comment (if any): {{PREVIOUS_REVIEW_COMMENT_URL}}
 - Comment already posted for THIS round at THIS HEAD (if any):
   {{EXISTING_REVIEW_COMMENT_URL}}
+- Follow-up issues already open for this PR (finding id: issue), from
+  earlier rounds:
+  {{EXISTING_FOLLOW_UP_ISSUES}}
 
 ## Steps
 
@@ -56,6 +59,16 @@ The following are NOT findings and must go under **Observations** instead:
 future ideas, optional improvements, educational commentary, non-actionable
 preferences, and information-only remarks. Do not inflate observations into
 findings, and do not hide real defects as observations.
+
+A problem an earlier round already deferred to one of the follow-up issues
+listed above is not a finding of this round either: a fixer records that
+decision by creating the issue, and finding ids are round-scoped, so raising
+it again under a new id would have the next fixer create a second issue for
+the same problem. Read those issues (`gh issue view <url>`); mention the
+problem under **Observations** with the issue's URL if it is worth noting.
+Raise it as a finding only when the deferral is wrong for this PR, that is,
+when the problem must be resolved within this PR's lifecycle after all; say
+so in its `required_resolution`, so the fixer does not defer it once more.
 
 ## If a comment for this round already exists
 

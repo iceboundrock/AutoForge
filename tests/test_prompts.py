@@ -98,6 +98,11 @@ def test_review_prompt_contract():
         "If a comment for this round already exists",
         "do NOT post a second one",
         "exactly one review comment at its HEAD",
+        # PR #89 F2 (#90): a problem an earlier round deferred to a follow-up
+        # issue is not re-raised under a new finding id.
+        "{{EXISTING_FOLLOW_UP_ISSUES}}",
+        "is not a finding of this round either",
+        "Raise it as a finding only when the deferral is wrong",
     ):
         assert phrase in text, phrase
 
@@ -225,9 +230,34 @@ def test_replan_prompt_forbids_agent_owned_close_and_local_cleanup():
 
 def test_implementation_prompt_contract():
     text = prompts.load_template("analyze_execute.md")
-    for phrase in ("AGENTS.md", "CLAUDE.md", "CONTROL_RESULT", "pr_url", "head_sha", "branch"):
+    for phrase in (
+        "AGENTS.md",
+        "CLAUDE.md",
+        "CONTROL_RESULT",
+        "pr_url",
+        "head_sha",
+        "branch",
+        # PR #89 F1: the PR body carries the controller's marker, verbatim; an
+        # existing unmarked PR is given it rather than duplicated.
+        "{{IMPLEMENTATION_MARKER}}",
+        "verbatim",
+        "gh pr edit",
+        "Never put it in the body of any other PR",
+        "a PR without it is rejected",
+    ):
         assert phrase in text, phrase
     assert "create pr" in text.lower() and "do not merge" in text.lower()
+
+
+def test_engine_implementation_prompt_carries_the_issues_marker(engine):
+    from autoforge.engine import render_implementation_marker
+    from tests.conftest import ISSUE
+
+    engine.state.phase = Phase.ANALYZE_EXECUTE
+    text = engine.render_prompt_for(Phase.ANALYZE_EXECUTE)
+    marker = render_implementation_marker(ISSUE)
+    assert marker == '<!-- ai-implementation: {"issue": "' + ISSUE + '"} -->'
+    assert f"PR body marker (required, verbatim): `{marker}`" in text
 
 
 def test_update_epic_prompt_contract():
@@ -258,6 +288,11 @@ def test_fix_prompt_hands_over_existing_follow_up_issues():
         "do NOT create a\nsecond one",
         "the one open issue carrying its finding's",
         "no open issue\ncarrying its marker",
+        # PR #89 F2 (#90): earlier rounds' deferrals are listed so a re-raised
+        # problem is recorded on the existing issue, never in a second one.
+        "{{EXISTING_FOLLOW_UP_ISSUES}}",
+        "do not open a second issue",
+        "two markers is the follow-up of both findings",
     ):
         assert phrase in text, phrase
 

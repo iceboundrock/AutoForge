@@ -160,8 +160,14 @@ reconciled with, not relaunched unaware. The table of what each phase's
 re-entry does is complete by construction: every phase with an agent prompt
 has an entry, and a test holds the two tables together.
 
-- `ANALYZE_EXECUTE` adopts the issue's open PR, if one exists, without
-  launching the agent (two candidates: `BLOCKED`).
+- `ANALYZE_EXECUTE` adopts the open PR carrying the issue's
+  `ai-implementation` marker (the persisted PR, or the one found by a
+  strict listing of the repository's open PRs), if one exists, without
+  launching the agent; two candidates block, and so does a listing that
+  cannot be proven complete, since "none exists" is then not knowable. A
+  PR is identified by that marker alone, never by its branch name or a
+  linked issue; the read-back after the agent holds the reported PR to the
+  same rule (github-safety.md, "Before ANALYZE_EXECUTE").
 - `REVIEW` reads the PR comments for the `ai-review-result` marker of the
   upcoming round at the bound HEAD. One such comment is handed to the
   reviewer (`EXISTING_REVIEW_COMMENT_URL`) to adopt, or to edit in place,
@@ -171,7 +177,11 @@ has an entry, and a test holds the two tables together.
   same round at another HEAD is not this round's and is ignored. After the
   reviewer returns, verification enforces that the round still has exactly
   one comment at its HEAD; a reviewer that posted a second one has its round
-  rejected, and the next entry blocks on the pair.
+  rejected, and the next entry blocks on the pair. The same entry lists the
+  open issues carrying this PR's `ai-follow-up` marker for any finding id
+  (strictly; a listing that cannot be proven complete blocks) and hands
+  them to the reviewer (`EXISTING_FOLLOW_UP_ISSUES`), so a problem an
+  earlier round deferred is not raised again under this round's ids.
 - `FIX` re-reads the PR HEAD. Past the reviewed HEAD: `FIX -> REVIEW` of the
   actual HEAD, no fixer launched (the rule above); a fixer whose push landed
   but whose result was never recorded is therefore never relaunched against
@@ -181,7 +191,11 @@ has an entry, and a test holds the two tables together.
   moves no HEAD. One per finding is handed to the fixer (`FOLLOW_UP_ISSUES`)
   to report instead of recreate; two for one finding block; a listing that
   cannot be proven complete blocks, since "none exists" is then not
-  knowable. Read-back holds the fixer to the same rule.
+  knowable. Read-back holds the fixer to the same rule. The issues the
+  listing found for earlier rounds' findings are handed over as well
+  (`EXISTING_FOLLOW_UP_ISSUES`), so a re-raised problem is recorded on the
+  issue that exists (a second marker in its body) rather than in a second
+  issue.
 - `REPLAN_REEXECUTE` replays its durable transaction (replan-transaction.md).
 - `UPDATE_EPIC` reads the EPIC's comments for the `ai-epic-progress` marker
   of (finished issue, merged PR). One is handed to the agent

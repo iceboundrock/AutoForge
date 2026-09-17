@@ -32,6 +32,19 @@ that a claimed follow-up is the one open issue carrying its finding's
 marker, and that a finding resolved any other way has no open issue
 carrying its marker.
 
+Follow-up issues already open for this PR from earlier rounds (finding id:
+issue):
+
+{{EXISTING_FOLLOW_UP_ISSUES}}
+
+The reviewer was shown these and does not normally re-raise a deferred
+problem. If a finding above nevertheless is the same problem as one of them,
+do not open a second issue: either resolve it in this PR (the reviewer asked
+for that), or, when deferring it again is right, add this finding's marker
+line to that existing issue's body (`gh issue edit <url> --body-file <file>`,
+keeping the rest of the body) and report that issue's URL. An issue carrying
+two markers is the follow-up of both findings.
+
 ## Steps
 
 1. Read the repository's `AGENTS.md` / `CLAUDE.md` if present.

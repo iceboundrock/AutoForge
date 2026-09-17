@@ -17,6 +17,28 @@ Independently verify important facts using GitHub / git.
 
 Examples:
 
+### Before ANALYZE_EXECUTE
+
+The implementer is launched only after the controller has established that
+no open PR already implements the issue. The PR the controller persisted is
+read first; then the repository's open PRs are listed (strictly: a listing
+that may be truncated blocks, because "none exists" is then not knowable)
+for the `ai-implementation` marker of `{"issue"}`, which the controller
+renders into the implementer's prompt (`IMPLEMENTATION_MARKER`) and the
+agent must put in the PR body verbatim:
+
+- exactly one: it is adopted (recorded as the issue's PR, `REVIEW` next)
+  without launching the agent, whatever its branch name and whether or not
+  GitHub links it to the issue
+- two or more: `BLOCKED` without launching the agent; the controller never
+  chooses which PR is the issue's
+- a PR carrying another issue's marker, or no marker, is not a candidate.
+  Linked issues and `autoforge/<n>` branch names are shape, and shape is
+  never proof of provenance (a human's PR, another tool's PR); the agent is
+  told about such a PR's existence only through its own GitHub reads, and
+  the prompt tells it to continue an existing PR for the issue and give it
+  the marker rather than open a second one
+
 ### After ANALYZE_EXECUTE
 
 Verify:
@@ -26,6 +48,9 @@ Verify:
 - PR is open
 - branch is correct
 - returned HEAD SHA matches GitHub
+- its body carries the issue's `ai-implementation` marker, and it is the
+  only open PR that does: a PR without the marker is one no later entry
+  could find again, and one of two is a choice the entry never makes
 
 ### Before every launch
 
@@ -53,6 +78,16 @@ whose result was never recorded):
 - the marker is a JSON object with an integer `round` (not a boolean, not a
   float), a 40-hex `reviewed_head_sha` and a boolean `needs_fix_round`;
   anything else is not a marker, at entry or on read-back
+
+The same entry lists the repository's open issues (strictly, as before FIX)
+for every `ai-follow-up` marker naming this PR, whatever the finding id, and
+hands them to the reviewer as `EXISTING_FOLLOW_UP_ISSUES` (finding id and
+issue URL). Finding ids are round-scoped, so a problem an earlier round
+deferred to a follow-up issue would otherwise be re-raised under a new id
+and deferred again into a second issue (#90). The reviewer is told that a
+deferred problem is not a finding of the round unless the deferral itself is
+wrong for this PR. A listing that may be truncated blocks: a reviewer
+launched on an incomplete list could re-raise a deferred problem.
 
 ### After REVIEW
 
@@ -85,6 +120,12 @@ be truncated blocks, because "none exists" is then not knowable) for the
   never to recreate
 - two or more for one finding: `BLOCKED` without launching the fixer
 - a closed issue carrying the marker is not the finding's open follow-up
+- the same listing's issues carrying this PR's marker for a finding of an
+  earlier round go to the fixer as `EXISTING_FOLLOW_UP_ISSUES`; a finding
+  that turns out to be one of those problems is resolved in the PR or, when
+  deferring again is right, recorded by adding the new finding's marker to
+  that existing issue (an issue may carry several markers), never by a
+  second issue
 
 ### After FIX
 

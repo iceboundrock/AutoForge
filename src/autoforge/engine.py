@@ -302,6 +302,8 @@ _PROGRESS_MARKER_NAME = "ai-epic-progress"
 _PROGRESS_MARKER_RE = _marker_re(_PROGRESS_MARKER_NAME)
 _FOLLOW_UP_MARKER_NAME = "ai-follow-up"
 _FOLLOW_UP_MARKER_RE = _marker_re(_FOLLOW_UP_MARKER_NAME)
+_IMPLEMENTATION_MARKER_NAME = "ai-implementation"
+_IMPLEMENTATION_MARKER_RE = _marker_re(_IMPLEMENTATION_MARKER_NAME)
 
 
 def _marker_object(raw: str) -> dict:
@@ -424,20 +426,23 @@ def render_follow_up_marker(pr_url: str, finding_id: str) -> str:
 
 
 def _follow_up_issues_claiming(
-    issues: list[IssueInfo], pr_url: str, finding_ids: list[str]
+    issues: list[IssueInfo], pr_url: str, finding_ids: list[str] | None = None
 ) -> dict[str, list[IssueInfo]]:
     """Per finding id, the issues whose ``ai-follow-up`` marker claims it for ``pr_url``.
 
-    Every id in ``finding_ids`` is a key (possibly with no claimants). A
-    marker that is not exactly the documented shape, names another PR, or
-    names a finding outside ``finding_ids``, is not a claim on this entry.
+    With ``finding_ids`` given, every id in it is a key (possibly with no
+    claimants) and a marker naming another finding is not a claim on this
+    entry. Without it, every finding of ``pr_url`` that some issue claims
+    is a key: that is how a later round learns which problems earlier rounds
+    already deferred. A marker that is not exactly the documented shape or
+    names another PR is never a claim.
     """
+    wanted = None if finding_ids is None else set(finding_ids)
+    found: dict[str, list[IssueInfo]] = {fid: [] for fid in finding_ids or ()}
     try:
         pr_ref = parse_pr_url(pr_url)
     except ConfigurationError:
-        return {fid: [] for fid in finding_ids}
-    wanted = set(finding_ids)
-    found: dict[str, list[IssueInfo]] = {fid: [] for fid in finding_ids}
+        return found
     for issue in issues:
         claimed: set[str] = set()
         for match in _FOLLOW_UP_MARKER_RE.finditer(issue.body or ""):
@@ -450,11 +455,59 @@ def _follow_up_issues_claiming(
                 same = parse_pr_url(claimed_pr).same_target(pr_ref)
             except (ValueError, ConfigurationError):
                 continue
-            if same and fid in wanted:
+            if same and (wanted is None or fid in wanted):
                 claimed.add(fid)
         for fid in sorted(claimed):
-            found[fid].append(issue)
+            found.setdefault(fid, []).append(issue)
     return found
+
+
+def render_implementation_marker(issue_url: str) -> str:
+    """The exact ``ai-implementation`` marker the issue's implementation PR carries.
+
+    The issue identifies the PR: ANALYZE_EXECUTE creates at most one open PR
+    per issue, and that PR is what the phase's entry looks for before
+    launching an agent and what its read-back requires of the PR the agent
+    claims. A PR is the issue's implementation because it carries this
+    marker, never because of its branch name or the issues GitHub links it
+    to: those are conventions the read-back does not enforce, so a PR
+    following neither would otherwise be accepted by the read-back and then
+    missed by every later entry (PR #89 review F1).
+    """
+    payload = json.dumps({"issue": issue_url}, sort_keys=True)
+    return f"<!-- {_IMPLEMENTATION_MARKER_NAME}: {payload} -->"
+
+
+def _implementation_prs_claiming(prs: list[PRInfo], issue_url: str) -> list[PRInfo]:
+    """The PRs whose ``ai-implementation`` marker claims ``issue_url``.
+
+    The issue is compared as a GitHub identity (repository case-insensitive
+    plus number), never as a string. A marker that is not exactly the
+    documented shape, or names another issue, is not a claim.
+    """
+    try:
+        issue_ref = parse_issue_url(issue_url)
+    except ConfigurationError:
+        return []
+    found: list[PRInfo] = []
+    for pr in prs:
+        for match in _IMPLEMENTATION_MARKER_RE.finditer(pr.body or ""):
+            try:
+                claimed = _marker_object(match.group(1)).get("issue")
+                if not isinstance(claimed, str):
+                    continue
+                same = parse_issue_url(claimed).same_target(issue_ref)
+            except (ValueError, ConfigurationError):
+                continue
+            if same:
+                found.append(pr)
+                break
+    return found
+
+
+def _follow_up_pairs(claimants: dict[str, list[IssueInfo]]) -> list[tuple[str, str]]:
+    """``(finding id, issue URL)`` for every claimant, ordered by finding id then URL."""
+    return sorted((fid, issue.url) for fid, issues in claimants.items() for issue in issues)
 
 
 def _duplicate_review_comments_reason(
@@ -473,6 +526,11 @@ def _duplicate_follow_ups_reason(pr_url: str, finding_id: str, issues: list[Issu
         f"{len(issues)} open issues carry the follow-up marker for finding {finding_id} of "
         f"PR {pr_url} ({urls})"
     )
+
+
+def _duplicate_implementation_prs_reason(issue_url: str, prs: list[PRInfo]) -> str:
+    urls = ", ".join(sorted(parse_pr_url(p.url).canonical for p in prs))
+    return f"{len(prs)} open PRs carry the implementation marker for issue {issue_url} ({urls})"
 
 
 def _duplicate_progress_comments_reason(state: AutoForgeState, claimants: list[CommentInfo]) -> str:
@@ -593,7 +651,8 @@ def local_state_paths(
 # against ``PHASE_TEMPLATE``), so no phase is ever described as "relaunched".
 _REMOTE_REENTRY_RECONCILIATION: dict[Phase, str] = {
     Phase.ANALYZE_EXECUTE: (
-        "adopts the open PR of the issue, if one exists, instead of relaunching the agent"
+        "adopts the open PR carrying the issue's implementation marker, if one exists, "
+        "instead of relaunching the agent"
     ),
     Phase.REVIEW: (
         "hands a review comment already posted for this round at this HEAD to the "
@@ -661,6 +720,12 @@ class ControllerEngine:
         # Re-derived from GitHub on every entry, never persisted.
         self._existing_progress_comment_url = ""
         self._existing_follow_ups: dict[str, str] = {}
+        # The follow-up issues already open for this PR from earlier rounds,
+        # as (finding id, issue URL): found by the REVIEW and FIX entries and
+        # rendered into ``EXISTING_FOLLOW_UP_ISSUES``, so a problem a fixer
+        # already deferred is not raised, and deferred, a second time under a
+        # new finding id (PR #89 review F2, #90).
+        self._existing_pr_follow_ups: list[tuple[str, str]] = []
         self.state: AutoForgeState | None = None
         # Set by locked(): the controller lock held for a whole command.
         self._lock: ControllerLock | None = None
@@ -1015,6 +1080,18 @@ class ControllerEngine:
         return "\n".join(lines)
 
     @staticmethod
+    def _format_existing_follow_ups(pairs: list[tuple[str, str]]) -> str:
+        """The follow-up issues already open for this PR, one line per (finding, issue).
+
+        Controller-rendered: the finding ids come from markers that passed
+        the strict scan and the URLs from GitHub. An issue's title is
+        untrusted text and is not quoted; the agent reads the issue itself.
+        """
+        if not pairs:
+            return "(none)"
+        return "\n".join(f"- {fid}: {url}" for fid, url in pairs)
+
+    @staticmethod
     def _format_findings(findings: list[dict]) -> str:
         """The open findings as one untrusted block for a FIX prompt.
 
@@ -1129,6 +1206,14 @@ class ControllerEngine:
             ),
             "FOLLOW_UP_ISSUES": self._format_follow_ups(
                 s.current_pr_url, s.open_findings, self._existing_follow_ups
+            ),
+            "EXISTING_FOLLOW_UP_ISSUES": self._format_existing_follow_ups(
+                self._existing_pr_follow_ups
+            ),
+            "IMPLEMENTATION_MARKER": (
+                render_implementation_marker(s.current_issue_url)
+                if s.current_issue_url
+                else "(none)"
             ),
             "REVIEWED_HEAD_SHA": (
                 s.current_head_sha if s.phase == Phase.REVIEW else s.reviewed_head_sha
@@ -2425,6 +2510,18 @@ class ControllerEngine:
 
         Returns a StepOutcome when the phase was resolved without invoking the
         agent (recovered -> REVIEW, or ambiguous -> BLOCKED); None otherwise.
+
+        The issue's implementation PR is the open PR carrying the
+        ``ai-implementation`` marker for it (:func:`render_implementation_marker`),
+        found in a strict listing of the repository's open PRs: a listing the
+        client cannot prove complete blocks, because "no PR exists" is then
+        not knowable and launching an agent on that guess is how a second
+        implementation gets created. The marker is the identity
+        :meth:`_apply_analyze` requires of the PR the agent claims, so a PR
+        the read-back would accept is a PR every later entry finds, whatever
+        its branch is called and whether or not GitHub links it to the
+        issue. A PR the controller already persisted is a candidate as well,
+        marker or not: it is the controller's own verified record.
         """
         state = self._require_state()
         issue = parse_issue_url(state.current_issue_url)
@@ -2433,38 +2530,50 @@ class ControllerEngine:
             try:
                 pr = self.github.get_pr(state.current_pr_url)
             except GitHubError as exc:
-                state.phase = Phase.BLOCKED
-                state.block_reason = (
-                    f"state references PR {state.current_pr_url} but it cannot be read: {exc}"
+                return self._block(
+                    Phase.ANALYZE_EXECUTE,
+                    None,
+                    f"state references PR {state.current_pr_url} but it cannot be read: {exc}",
                 )
-                self._save()
-                return self._outcome(Phase.ANALYZE_EXECUTE, message=state.block_reason)
             if pr.is_open:
                 candidates[parse_pr_url(pr.url).canonical] = pr
-        for pr in self.github.find_open_prs_for_issue(issue):
+        try:
+            claimants = self._implementation_prs(issue.canonical)
+        except GitHubUnavailableError:
+            raise
+        except GitHubError as exc:
+            return self._block(
+                Phase.ANALYZE_EXECUTE,
+                None,
+                f"cannot establish whether an open PR already implements issue "
+                f"#{issue.number}: {exc}. The controller will not launch an agent that "
+                "could create a second one",
+            )
+        for pr in claimants:
             candidates.setdefault(parse_pr_url(pr.url).canonical, pr)
         if not candidates:
             return None
         if len(candidates) > 1:
-            state.phase = Phase.BLOCKED
-            state.block_reason = (
-                "multiple open PRs appear to belong to issue "
-                f"#{issue.number}: {', '.join(sorted(candidates))}. "
-                "Close the stale ones and resume; the controller never guesses."
+            return self._block(
+                Phase.ANALYZE_EXECUTE,
+                None,
+                f"{len(candidates)} open PRs claim to implement issue #{issue.number}: "
+                f"{', '.join(sorted(candidates))}. Close the stale ones and resume; the "
+                "controller never guesses.",
             )
-            self._save()
-            return self._outcome(Phase.ANALYZE_EXECUTE, message=state.block_reason)
         url, pr = next(iter(candidates.items()))
         if parse_pr_url(url).repository.lower() != state.repository.lower():
-            state.phase = Phase.BLOCKED
-            state.block_reason = f"open PR {url} is not in repository {state.repository}"
-            self._save()
-            return self._outcome(Phase.ANALYZE_EXECUTE, message=state.block_reason)
+            return self._block(
+                Phase.ANALYZE_EXECUTE,
+                None,
+                f"open PR {url} is not in repository {state.repository}",
+            )
         if not pr.head_sha:
-            state.phase = Phase.BLOCKED
-            state.block_reason = f"open PR {url} has no readable head SHA; cannot recover"
-            self._save()
-            return self._outcome(Phase.ANALYZE_EXECUTE, message=state.block_reason)
+            return self._block(
+                Phase.ANALYZE_EXECUTE,
+                None,
+                f"open PR {url} has no readable head SHA; cannot recover",
+            )
         state.current_pr_url = url
         state.current_head_sha = pr.head_sha
         state.current_branch = pr.head_ref
@@ -3372,9 +3481,19 @@ class ControllerEngine:
         the round's, so it blocks without invoking anyone. Comments for the
         same round at another HEAD (an earlier run, a stale re-review) are not
         this round's and are ignored.
+
+        The reviewer is also told which problems earlier rounds already
+        deferred: the open issues carrying this PR's ``ai-follow-up`` marker
+        for any finding id (``EXISTING_FOLLOW_UP_ISSUES``). Finding ids are
+        round-scoped, so a problem re-raised under a new id would otherwise
+        be deferred again into a second issue by the next fixer; the review
+        that knows about the first issue does not re-raise it (#90). The
+        listing is strict for the same reason the FIX entry's is: "no such
+        issue exists" is not knowable from a listing that may be truncated.
         """
         state = self._require_state()
         self._existing_review_comment_url = ""
+        self._existing_pr_follow_ups = []
         upcoming = state.review_round + 1
         head = state.current_head_sha.lower()
         pr_url = parse_pr_url(state.current_pr_url).canonical
@@ -3389,6 +3508,19 @@ class ControllerEngine:
             )
         if claimants:
             self._existing_review_comment_url = claimants[0].url
+        try:
+            deferred = self._follow_up_issues(pr_url)
+        except GitHubUnavailableError:
+            raise
+        except GitHubError as exc:
+            return self._block(
+                Phase.REVIEW,
+                plan,
+                f"cannot establish which follow-up issues already exist for PR {pr_url}: "
+                f"{exc}. The controller will not launch a reviewer that could re-raise a "
+                "problem an earlier round already deferred",
+            )
+        self._existing_pr_follow_ups = _follow_up_pairs(deferred)
         return None
 
     def _prepare_fix(self, plan: StepPlan) -> StepOutcome | None:
@@ -3420,6 +3552,7 @@ class ControllerEngine:
         """
         state = self._require_state()
         self._existing_follow_ups = {}
+        self._existing_pr_follow_ups = []
         if not state.open_findings:
             raise StateError("FIX phase entered without open findings in state")
         pr = self._require_open_pr()
@@ -3441,7 +3574,11 @@ class ControllerEngine:
         pr_url = parse_pr_url(state.current_pr_url).canonical
         open_ids = [str(f["id"]) for f in state.open_findings]
         try:
-            claimants = self._follow_up_issues(pr_url, open_ids)
+            # One listing serves both: the open findings' own follow-ups
+            # (checked below) and the earlier rounds' deferrals, handed to
+            # the fixer so a re-raised problem is recorded on the issue that
+            # already exists instead of in a second one (#90).
+            deferred = self._follow_up_issues(pr_url)
         except GitHubUnavailableError:
             raise
         except GitHubError as exc:
@@ -3453,7 +3590,7 @@ class ControllerEngine:
                 "that could create a second one",
             )
         for fid in open_ids:
-            issues = claimants[fid]
+            issues = deferred.get(fid, [])
             if len(issues) > 1:
                 return self._block(
                     Phase.FIX,
@@ -3464,19 +3601,38 @@ class ControllerEngine:
                 )
             if issues:
                 self._existing_follow_ups[fid] = issues[0].url
+        self._existing_pr_follow_ups = _follow_up_pairs(
+            {fid: issues for fid, issues in deferred.items() if fid not in open_ids}
+        )
         state.current_head_sha = pr.head_sha
         self._save()
         return None
 
-    def _follow_up_issues(self, pr_url: str, finding_ids: list[str]) -> dict[str, list[IssueInfo]]:
+    def _follow_up_issues(
+        self, pr_url: str, finding_ids: list[str] | None = None
+    ) -> dict[str, list[IssueInfo]]:
         """The open issues carrying a follow-up marker for (``pr_url``, each finding).
 
-        A strict listing: an open-issue set the client cannot prove complete
-        raises GitHubError, and the caller decides what that means for it.
+        With ``finding_ids``, every one of them is a key; without, every
+        finding of the PR some open issue claims is (see
+        :func:`_follow_up_issues_claiming`). A strict listing: an open-issue
+        set the client cannot prove complete raises GitHubError, and the
+        caller decides what that means for it.
         """
         state = self._require_state()
         issues = self.github.list_open_issues(state.repository, strict=True)
         return _follow_up_issues_claiming(issues, pr_url, finding_ids)
+
+    def _implementation_prs(self, issue_url: str) -> list[PRInfo]:
+        """The open PRs carrying the implementation marker for ``issue_url``.
+
+        A strict listing, for the same reason as :meth:`_follow_up_issues`:
+        the entry that finds none launches an agent that creates a PR, and
+        the read-back that finds one accepts it as the only one.
+        """
+        state = self._require_state()
+        prs = self.github.list_open_prs(state.repository, strict=True)
+        return _implementation_prs_claiming(prs, issue_url)
 
     def _reconcile_update_epic_entry(self, plan: StepPlan) -> StepOutcome | None:
         """Read the EPIC for this issue's progress comment before the agent runs.
@@ -4617,6 +4773,23 @@ class ControllerEngine:
         if pr.head_ref and pr.head_ref != res.branch:
             raise VerificationError(
                 f"PR branch mismatch: GitHub reports {pr.head_ref!r}, agent claimed {res.branch!r}"
+            )
+        # The identity the next entry will look for: the PR carries this
+        # issue's implementation marker, and it is the only open PR that
+        # does. Accepting a PR without it would persist a PR that no
+        # re-entry after a lost state file could find again; accepting one
+        # of two would choose, and the entry never chooses.
+        marker = render_implementation_marker(state.current_issue_url)
+        if not _implementation_prs_claiming([pr], state.current_issue_url):
+            raise VerificationError(
+                f"PR {pr_ref.canonical} does not carry the implementation marker {marker!r} "
+                "in its body; the controller cannot recognise it as the issue's PR"
+            )
+        claimants = self._implementation_prs(state.current_issue_url)
+        if len(claimants) > 1:
+            raise VerificationError(
+                _duplicate_implementation_prs_reason(state.current_issue_url, claimants)
+                + "; an issue has at most one open implementation PR"
             )
         state.current_pr_url = pr_ref.canonical
         state.current_head_sha = pr.head_sha

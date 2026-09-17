@@ -1243,32 +1243,6 @@ class GitHubClient:
             highest = max(highest, number)
         return highest
 
-    def find_open_prs_for_issue(
-        self, issue: GitHubIssueRef | str, *, strict: bool = False
-    ) -> list[PRInfo]:
-        """Open PRs that unambiguously belong to ``issue``.
-
-        A PR matches when GitHub links it as closing the issue, or its head
-        branch follows the controller's naming scheme ``autoforge/<n>-...``.
-
-        ``strict`` is passed through to :meth:`list_open_prs`, which refuses a
-        listing it cannot prove complete.
-
-        The two rules are a *convenience*, never a provenance boundary: a PR an
-        agent has created but not yet linked to the issue matches neither, so a
-        caller that must not miss such a PR reads :meth:`list_open_prs` and
-        applies its own test.
-        """
-        if isinstance(issue, str):
-            issue = parse_issue_url(issue)
-        open_prs = self.list_open_prs(issue.repository, strict=strict)
-        prefix = re.compile(rf"^autoforge/{issue.number}(?:-|$)")
-        out = []
-        for pr in open_prs:
-            if issue.number in pr.linked_issue_numbers or prefix.match(pr.head_ref or ""):
-                out.append(pr)
-        return out
-
     # -- merge (the only write; controller-owned, engine-gated) ------------------
     def merge_pr(
         self,
