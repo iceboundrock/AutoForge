@@ -1257,6 +1257,58 @@ def test_an_unresolved_finding_blocks_instead_of_reaching_a_clean_review(tmp_pat
     assert eng.state.local_fix_rounds == 1
 
 
+def test_an_oversized_unresolved_rationale_never_reaches_the_block_reason(tmp_path):
+    """#77: an ``unresolved`` rationale is echoed into the persisted block
+    reason, so the parser bounds it; a FIX past the bound is refused before
+    any of it is persisted, and the phase stays at FIX for the retry."""
+    from autoforge.result_parser import MAX_FIX_RATIONALE_CHARS
+
+    root = local_repo(tmp_path)
+    eng = make_local_engine(root, "features/add-filter.md")
+    eng.config.execution.max_correction_attempts = 0
+    huge = ("needs a human decision " * 100).strip()
+    assert len(huge) > MAX_FIX_RATIONALE_CHARS
+
+    def one_finding(e):
+        return review_result(e.state.workspace_fingerprint, 1, [finding(1, 1)])
+
+    def unresolved(e):
+        return block(
+            {
+                "phase": "FIX",
+                "status": "success",
+                "changed_workspace": False,
+                "resolutions": [
+                    {"finding_id": "R1-F1", "resolution": "unresolved", "rationale": huge}
+                ],
+            }
+        )
+
+    eng.provider._handler = scripted(
+        eng,
+        root,
+        [
+            (lambda r: touch_impl(r, "v1\n"), lambda e: impl_result()),
+            (None, one_finding),
+            (None, unresolved),
+        ],
+    )
+    for _ in range(3):  # INITIALIZING -> ANALYZE_EXECUTE -> REVIEW -> FIX
+        eng.step()
+    assert eng.state.phase == Phase.FIX
+    with pytest.raises(ControlResultValidationError) as excinfo:
+        eng.step()
+    msg = str(excinfo.value)
+    assert f"at most {MAX_FIX_RATIONALE_CHARS}" in msg
+    assert "needs a human" not in msg
+    reloaded = load_state(eng.paths.state_file)
+    assert reloaded.phase == Phase.FIX
+    assert reloaded.block_reason == ""
+    assert reloaded.last_fix_resolutions == []
+    assert [f["id"] for f in reloaded.open_findings] == ["R1-F1"]
+    assert "needs a human" not in eng.paths.state_file.read_text(encoding="utf-8")
+
+
 def test_a_no_change_with_rationale_resolution_still_advances(tmp_path):
     """The other non-`fixed` disposition is a *resolution* and must not block.
 

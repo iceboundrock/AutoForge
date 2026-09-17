@@ -89,8 +89,11 @@ information-only remarks. Do not hide real defects as observations either.
   `required_resolution` at most {{MAX_FINDING_RESOLUTION_CHARS}} characters,
   `title` at most {{MAX_FINDING_TITLE_CHARS}}, `location` at most
   {{MAX_FINDING_LOCATION_CHARS}}, `id` at most {{MAX_FINDING_ID_CHARS}} (a
-  well-formed `R<round>-F<n>` id is far shorter). A larger result is rejected as
-  a whole and you are asked to re-emit it; the controller never clips findings.
+  well-formed `R<round>-F<n>` id is far shorter). `title` and `location` are
+  one line of printable text: no newline, tab or other control character.
+  `required_resolution` may contain newlines and tabs but no other control
+  character. A result outside these bounds is rejected as a whole and you are
+  asked to re-emit it; the controller never clips findings.
   Keep each `required_resolution` to what must change, and put anything that
   does not require action in `observations`.
 - `"observations"` may be an empty list.

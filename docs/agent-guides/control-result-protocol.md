@@ -105,6 +105,65 @@ review prompts state every parser bound (the id bound included) through
 template variables that the engine fills from the same constants, so the
 number the reviewer is told is the number it is held to.
 
+### Control characters in finding text
+
+A finding's one-line fields (`title`, `location`) may carry **no control
+character at all**; `required_resolution` and a `FIX` `rationale` may carry a
+newline or a tab and nothing else (#78). The class is
+`prompts.CONTROL_CHARS` -- C0 and C1 controls, DEL, and the Unicode line and
+paragraph separators -- defined once: `escape_inline` renders exactly those
+characters as `\xNN` / `\uNNNN` escapes when a one-line field is placed in
+a FIX prompt, and the parser imports the same class to refuse them at parse
+time, so the set a reviewer is held to is the set the renderer would
+otherwise have to rewrite. The reason is the same as for the size bounds: a
+value the controller must alter before it can show it is not the reviewer's
+finding any more, and the renderer's escape was a containment, not a
+rendering the fixer was meant to read. A tab is refused in a one-line field
+(it is inside the escaped class, and a title has no use for one) and kept in
+a multi-line field (it is ordinary indentation in a quoted snippet). A
+rejection names the field, the code point (`U+XXXX`) and its index into the
+stripped value, never the text, and the length bound is checked first so
+that index is always into a value of accepted size. `escape_inline` and the
+resolution indentation stay in the renderer unchanged, as the defence for
+state persisted by a controller without this rule or edited by hand. Fields
+that are not rendered on one line of a prompt (`summary`, `message`,
+`branch`, `tests_attempted`, LOCAL `observations`) keep their existing rules.
+
+### Fix payload bounds
+
+A `FIX` result is untrusted in the same way and is persisted the same way:
+every accepted resolution is stored whole (after redaction) in
+`state.last_fix_resolutions`, and in LOCAL mode an `unresolved` rationale is
+echoed into the persisted `block_reason` that `status` shows the operator.
+The parser therefore bounds the `FIX` payload with the same policy
+(rejection, never clipping; the message states the size and the limit,
+never the text; the count is checked before any element is parsed):
+
+```text
+MAX_RESOLUTIONS_PER_FIX         resolutions per FIX (== MAX_FINDINGS_PER_REVIEW)
+MAX_FIX_RATIONALE_CHARS         rationale length (after stripping), both modes
+MAX_URL_CHARS                   any URL field, checked before the URL is parsed
+```
+
+The resolution count is equal to the finding count by construction: the
+engine already refuses a resolution whose `finding_id` is not an open
+finding, so a `FIX` can never legitimately carry more resolutions than the
+controller accepted findings, and the count bound only moves that refusal
+before the elements are parsed. The rationale bound is pinned below the
+persisted `MAX_REQUIRED_RESOLUTION_CHARS` through `redaction.MAX_GROWTH_FACTOR`
+in the same test that pins the review bounds, so a redacted rationale is
+never larger than a redacted resolution. A `commit_sha`, when present, must
+have the shape of a git SHA (`_SHA_RE`, the same rule as every required SHA
+field); a SHA rejection quotes the value only when it is short enough to be
+one and otherwise states its length. Every URL field (`follow_up_issue_url`,
+`issue_url`, `pr_url`, `review_comment_url`, `next_issue_url`) is bounded by
+length before `validation.parse_*` sees it, because those parsers quote the
+URL in their error and that error reaches the correction prompt and the run
+log; a malformed `follow_up_issue_url` is thereby a validation error of the
+`FIX` result rather than a `ConfigurationError` raised later by the engine.
+The fix prompts state the bounds through template variables filled from the
+same constants.
+
 ### Whole-block bound and truncated stdout
 
 The accepted payload is persisted whole (`control-result.json` and one
@@ -141,8 +200,10 @@ factor of the parser bounds, not by their sum: the renderer's safety measures
 each cost characters (a control character in a one-line field becomes its
 `\xNN` or `\uNNNN` escape, a newline inside a `required_resolution` is
 indented under its finding, and the fence grows one past the longest backtick
-run in the findings). The engine test for the largest accepted round covers
-each of those shapes, not only plain text.
+run in the findings). The engine test for the largest round covers each of
+those shapes, not only plain text; the shapes the parser now refuses (#78)
+are seeded into state directly, standing for state an older controller
+persisted, and the bound must still hold for them.
 
 ---
 

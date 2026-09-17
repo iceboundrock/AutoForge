@@ -34,6 +34,7 @@ from autoforge.result_parser import (
     MAX_FINDING_RESOLUTION_CHARS,
     MAX_FINDING_TITLE_CHARS,
     MAX_FINDINGS_PER_REVIEW,
+    MAX_FIX_RATIONALE_CHARS,
 )
 from autoforge.state import load_state
 from autoforge.transitions import Phase
@@ -2862,6 +2863,44 @@ def test_oversized_resolution_never_reaches_state_or_a_prompt(tmp_state_dir, fak
     assert "resolve everything" not in eng.render_prompt_for(Phase.FIX)
 
 
+# -- FIX payload bounds (#77) --------------------------------------------------------
+def test_oversized_fix_rationale_is_refused_and_corrected(tmp_state_dir):
+    """A FIX past the rationale bound is refused whole; the correction prompt
+    names the limit and never the text; the corrected FIX is applied."""
+    gh = FakeGitHub()
+    huge = ("because " * 400).strip()
+    assert len(huge) > MAX_FIX_RATIONALE_CHARS
+    fine = "The behaviour is already covered by the existing suite; nothing to change."
+
+    def agent(req):
+        rationale = fine if req.correction else huge
+        return block(
+            fix_payload(
+                SHA_A,
+                SHA_A,
+                [
+                    {
+                        "finding_id": "R1-F1",
+                        "resolution": "no_change_with_rationale",
+                        "rationale": rationale,
+                    }
+                ],
+            )
+        )
+
+    eng = _in_fix(tmp_state_dir, gh, agent)
+    out = eng.step()
+    assert out.next_phase == "REVIEW"
+    assert len(eng.provider.calls) == 2
+    second = eng.provider.calls[1]
+    assert second.correction is True
+    assert f"is {len(huge)} characters" in second.prompt
+    assert f"at most {MAX_FIX_RATIONALE_CHARS}" in second.prompt
+    assert "because because" not in second.prompt
+    assert eng.state.last_fix_resolutions[0]["rationale"] == fine
+    assert "because because" not in eng.paths.state_file.read_text()
+
+
 # The largest REVIEW payloads the parser accepts, each the most expensive
 # along one axis of the FIX renderer (PR #76 review, R2-F2). Every field is
 # filled to its bound; the head/tail letters keep the stripped length at the
@@ -2872,6 +2911,15 @@ _WORST_CASE_FILLERS = {
     "newlines": "\n",  # a newline inside required_resolution is indented
     "control": "\x00",  # escape_inline renders it as ``\\x00`` (4 characters)
     "line_separator": "\u2028",  # the widest escape, ``\\u2028`` (6 characters)
+}
+# #78: the parser refuses a control character in a one-line field and any
+# but a newline or tab in a resolution, so only these shapes reach state
+# through it; the others are seeded into state directly below, standing for
+# state written before #78 or edited by hand, which the renderer must still
+# contain.
+_PARSER_ACCEPTS = {
+    "plain",
+    "backticks",
 }
 
 
@@ -2888,9 +2936,15 @@ def test_fix_prompt_size_is_bounded_by_the_review_bounds(tmp_state_dir, fake_git
     one-line field becomes its escape, and a newline in a resolution is
     indented under its finding. The bound is therefore a constant factor of
     the parser bounds, not the sum of them, and it holds for every shape of
-    accepted content, not only plain text.
+    content the renderer defends against, not only plain text.
+
+    Since #78 the parser itself refuses a control character in ``title`` or
+    ``location`` and any but a newline or tab in ``required_resolution``, so
+    those shapes are asserted refused and then seeded into state directly:
+    the renderer's escape and indentation remain the defence for state a
+    controller without that rule persisted, or a hand-edited state file.
     """
-    from autoforge.result_parser import ReviewResult
+    from autoforge.result_parser import Finding, ReviewResult
 
     ch = _WORST_CASE_FILLERS[filler]
     findings = [
@@ -2905,11 +2959,16 @@ def test_fix_prompt_size_is_bounded_by_the_review_bounds(tmp_state_dir, fake_git
         for n in range(1, MAX_FINDINGS_PER_REVIEW + 1)
     ]
     assert all(len(f["id"]) == MAX_FINDING_ID_CHARS for f in findings)
-    # The parser accepts this payload whole: the bound below is about content
-    # the FIX round can actually be handed, not content that was refused.
-    accepted = ReviewResult.from_payload(review_payload(1, SHA_A, findings))
-    assert len(accepted.findings) == MAX_FINDINGS_PER_REVIEW
-    assert len(accepted.findings[0].required_resolution) == MAX_FINDING_RESOLUTION_CHARS
+    if filler in _PARSER_ACCEPTS:
+        # The parser accepts this payload whole: the bound below is about
+        # content the FIX round can actually be handed, not content refused.
+        accepted = ReviewResult.from_payload(review_payload(1, SHA_A, findings)).findings
+    else:
+        with pytest.raises(ControlResultValidationError, match="contains a control character"):
+            ReviewResult.from_payload(review_payload(1, SHA_A, findings))
+        accepted = [Finding(**f) for f in findings]
+    assert len(accepted) == MAX_FINDINGS_PER_REVIEW
+    assert len(accepted[0].required_resolution) == MAX_FINDING_RESOLUTION_CHARS
 
     eng = _in_review(tmp_state_dir, fake_github, [])
     eng.state.phase = Phase.FIX
@@ -2917,7 +2976,7 @@ def test_fix_prompt_size_is_bounded_by_the_review_bounds(tmp_state_dir, fake_git
     eng.state.reviewed_head_sha = SHA_A
     eng.state.open_findings = []
     empty = len(eng.render_prompt_for(Phase.FIX))
-    eng.state.open_findings = [f.to_dict() for f in accepted.findings]
+    eng.state.open_findings = [f.to_dict() for f in accepted]
     full = eng.render_prompt_for(Phase.FIX)
 
     escape_width = 6  # escape_inline: a control character renders as \\xNN or \\uNNNN
