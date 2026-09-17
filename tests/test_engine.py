@@ -35,6 +35,7 @@ from autoforge.result_parser import (
     MAX_FINDING_TITLE_CHARS,
     MAX_FINDINGS_PER_REVIEW,
     MAX_FIX_RATIONALE_CHARS,
+    MAX_URL_CHARS,
 )
 from autoforge.state import load_state
 from autoforge.transitions import Phase
@@ -2403,11 +2404,55 @@ def test_update_epic_accepts_a_casing_variant_of_a_valid_next_issue(tmp_state_di
     assert load_state(eng.paths.state_file).current_issue_url == variant
 
 
-def test_update_epic_rejects_malformed_url_as_verification_error(tmp_state_dir, fake_github):
-    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result("not a url")])
+def test_update_epic_malformed_next_issue_url_is_refused_at_parse_time_and_corrected(
+    tmp_state_dir, fake_github
+):
+    """A string that is not an issue URL is a malformed UPDATE_EPIC result (the
+    next_issue_url half of #15): it takes the ordinary correction retry, is
+    never queried on GitHub and does not spend one of the bounded re-selections."""
+    eng = _in_update_epic(
+        tmp_state_dir, fake_github, [_epic_result("not a url"), _epic_result(None)]
+    )
+    out = eng.step()
+    assert out.next_phase == "DONE"
+    assert len(eng.provider.calls) == 2
+    second = eng.provider.calls[1]
+    assert second.correction is True
+    assert "'next_issue_url' must be a GitHub issue URL" in second.prompt
+    assert [c for c in fake_github.calls if c[0] == "get_issue"] == []
+    assert load_state(eng.paths.state_file).next_issue_rejections == []
+
+
+def test_update_epic_oversized_next_issue_url_is_refused_and_never_quoted(
+    tmp_state_dir, fake_github
+):
+    """An oversized next_issue_url is refused by length before any URL parser
+    quotes it: the correction prompt states the size and the limit, and the
+    text reaches neither next_issue_rejections, the state file nor the
+    controller's error record."""
+    huge = "https://github.com/owner/repo/issues/" + "7" * MAX_URL_CHARS
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(huge), _epic_result(None)])
+    out = eng.step()
+    assert out.next_phase == "DONE"
+    second = eng.provider.calls[1]
+    assert second.correction is True
+    assert f"is {len(huge)} characters" in second.prompt
+    assert f"at most {MAX_URL_CHARS}" in second.prompt
+    assert "7777" not in second.prompt
+    s = load_state(eng.paths.state_file)
+    assert s.next_issue_rejections == [] and s.phase == Phase.DONE
+    assert "7777" not in eng.paths.state_file.read_text()
+    errors = list((eng.paths.logs_dir / s.run_id).rglob("error.txt"))
+    assert errors and all("7777" not in f.read_text() for f in errors)
+
+
+def test_verify_issue_selectable_still_refuses_a_malformed_url(tmp_state_dir, fake_github):
+    """Defence in depth: the engine's own parse stays for INITIALIZING (whose
+    URL comes from the operator) and for a result that reached it unparsed."""
+    eng = _in_update_epic(tmp_state_dir, fake_github, [])
     with pytest.raises(VerificationError, match="'not a url' is not a GitHub issue URL"):
-        eng.step()
-    _assert_not_switched(eng, fake_github, None)
+        eng._verify_issue_selectable("not a url", switching=True)
+    assert [c for c in fake_github.calls if c[0] == "get_issue"] == []
 
 
 def test_update_epic_issue_repository_from_github_must_match(tmp_state_dir, fake_github):

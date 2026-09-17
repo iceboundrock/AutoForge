@@ -160,9 +160,14 @@ one and otherwise states its length. Every URL field (`follow_up_issue_url`,
 length before `validation.parse_*` sees it, because those parsers quote the
 URL in their error and that error reaches the correction prompt and the run
 log; a malformed `follow_up_issue_url` is thereby a validation error of the
-`FIX` result rather than a `ConfigurationError` raised later by the engine.
-The fix prompts state the bounds through template variables filled from the
-same constants.
+`FIX` result rather than a `ConfigurationError` raised later by the engine,
+and a malformed `next_issue_url` a validation error of the `UPDATE_EPIC`
+result rather than a selection for the engine to reject: the shape of the
+field is the parser's, which issue it names is the engine's
+([github-safety.md](github-safety.md), "After UPDATE_EPIC"), and an
+oversized value is never quoted into `next_issue_rejections`, the
+re-selection prompt or the run log. The fix prompts state the bounds
+through template variables filled from the same constants.
 
 ### Whole-block bound and truncated stdout
 
