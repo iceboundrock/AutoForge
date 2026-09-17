@@ -25,6 +25,7 @@ from autoforge.result_parser import (
     FixResult,
     LocalFixResult,
     ReviewResult,
+    UpdateEpicResult,
     parse_control_result,
 )
 from autoforge.transitions import Phase, WorkflowMode
@@ -830,6 +831,26 @@ def test_fix_follow_up_issue_url_is_shape_checked_at_parse_time():
             follow_up(bad)
 
 
+def test_update_epic_next_issue_url_is_shape_checked_at_parse_time():
+    """A malformed next issue URL is a validation error of the UPDATE_EPIC
+    result (the next_issue_url half of #15), not a selection for the engine
+    to reject; ``null`` and ``""`` still mean "the epic is complete"."""
+
+    def nxt(url):
+        return UpdateEpicResult.from_payload(
+            {"phase": "UPDATE_EPIC", "status": "success", "next_issue_url": url}
+        )
+
+    assert nxt(ISSUE).next_issue_url == ISSUE
+    assert nxt(None).next_issue_url is None
+    assert nxt("").next_issue_url is None
+    for bad in ("not a url", PR, ISSUE + "?x=1", "http://github.com/o/r/issues/1"):
+        with pytest.raises(
+            ControlResultValidationError, match="'next_issue_url' must be a GitHub issue URL"
+        ):
+            nxt(bad)
+
+
 @pytest.mark.parametrize(
     "label,build",
     [
@@ -858,8 +879,14 @@ def test_fix_follow_up_issue_url_is_shape_checked_at_parse_time():
             "REVIEW.review_comment_url",
             lambda v: ReviewResult.from_payload(dict(GOOD_REVIEW, review_comment_url=v)),
         ),
+        (
+            "UPDATE_EPIC.next_issue_url",
+            lambda v: UpdateEpicResult.from_payload(
+                {"phase": "UPDATE_EPIC", "status": "success", "next_issue_url": v}
+            ),
+        ),
     ],
-    ids=["optional-issue", "required-issue", "required-comment"],
+    ids=["optional-issue", "required-issue", "required-comment", "nullable-issue"],
 )
 def test_url_fields_are_bounded_before_the_url_parser_quotes_them(label, build):
     """``validation`` quotes the URL in its error, and that error reaches the

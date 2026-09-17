@@ -56,6 +56,14 @@ Identity checks (EPIC, just-finished issue) compare repository
 case-insensitively plus issue number, never URL strings: GitHub owner and
 repository names are case-insensitive.
 
+A `next_issue_url` that is not an issue URL at all, or is longer than
+`MAX_URL_CHARS`, is refused by the parser as a malformed `UPDATE_EPIC`
+result and goes through the ordinary correction retry; it is not a
+selection and does not spend one of the bounded re-selections below. The
+engine still parses the URL itself before any GitHub read: the same check
+serves `INITIALIZING`, whose URL comes from the operator, and it is the
+defence for a result that reached the engine some other way.
+
 A rejected selection is retried once (with the controller's reason in the
 prompt); a second rejection enters `BLOCKED`. A transient GitHub failure
 while checking the selection takes the same bounded retry. Any other GitHub

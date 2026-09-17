@@ -730,6 +730,15 @@ class UpdateEpicResult:
             raise ControlResultValidationError("'next_issue_url' must be a string or null")
         if isinstance(nxt, str) and nxt == "":
             nxt = None
+        if nxt is not None:
+            # Shape and length at parse time (the ``next_issue_url`` half of
+            # #15). Which issue the URL names is the engine's to verify
+            # (repository, EPIC, finished issue, exists, OPEN); whether the
+            # string is an issue URL at all is a malformed result, corrected
+            # like any other rather than spent as a selection, and an
+            # oversized value is never quoted into ``next_issue_rejections``,
+            # the re-selection prompt or the run log.
+            nxt = _checked_url(nxt, "next_issue_url", "UPDATE_EPIC", "issue")
         return cls(next_issue_url=nxt)
 
 
