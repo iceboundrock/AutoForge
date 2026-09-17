@@ -116,7 +116,7 @@ workflow:
   touching anything `REPLAN_REEXECUTE` does after the policy has decided.
 - The step budget is measured on the persisted cumulative `step_count`, which is never reset by `resume` or by switching issues. CLI `--max-steps` bounds a single invocation only.
 - Failed invocations consume neither a review round nor a `review_history` entry.
-- A `FIX` entry that finds the PR HEAD past the reviewed HEAD goes back to `REVIEW` without launching the fixer (see **Re-entering REVIEW and FIX** below). That review of the actual HEAD is an ordinary round: it counts against the cap, and if it reports the same findings as the previous round it counts towards stagnation like any other repeated round. This is intended: the loop guard measures whether the PR is converging, and an unrecorded push that resolved nothing is not progress.
+- A `FIX` entry that finds the PR HEAD past the reviewed HEAD goes back to `REVIEW` without launching the fixer (see **Re-entering a phase** below). That review of the actual HEAD is an ordinary round: it counts against the cap, and if it reports the same findings as the previous round it counts towards stagnation like any other repeated round. This is intended: the loop guard measures whether the PR is converging, and an unrecorded push that resolved nothing is not progress.
 - Hitting any bound is `BLOCKED` (terminal). The open findings and the PR stay for a human; nothing is merged.
 
 ---
@@ -145,15 +145,23 @@ knowable from controller state and is never inferred, so `FIX` is entered
 only while `current_pr_head_sha == reviewed_head_sha`; otherwise the review
 is marked stale and the actual HEAD is reviewed (`FIX -> REVIEW`).
 
-### Re-entering REVIEW and FIX
+### Re-entering a phase
 
 `resume` re-enters the persisted phase, and the engine cannot tell a first
 entry from a re-entry after an interrupted step (timeout, non-zero exit,
 malformed result, verification failure, refused run-log write, crash). In
 every one of those the agent may already have done its GitHub work. GitHub
-is the source of truth, so both phases read the PR before launching anyone,
-exactly as `ANALYZE_EXECUTE` recovers an existing open PR:
+is the source of truth, so every REMOTE phase that launches an agent reads
+GitHub before launching anyone, in one place (`_remote_entry`), exactly as
+`ANALYZE_EXECUTE` recovers an existing open PR. The correction relaunch
+after a malformed result is a re-entry too and runs the same probe first:
+an agent that posted, pushed or created and then lost its result block is
+reconciled with, not relaunched unaware. The table of what each phase's
+re-entry does is complete by construction: every phase with an agent prompt
+has an entry, and a test holds the two tables together.
 
+- `ANALYZE_EXECUTE` adopts the issue's open PR, if one exists, without
+  launching the agent (two candidates: `BLOCKED`).
 - `REVIEW` reads the PR comments for the `ai-review-result` marker of the
   upcoming round at the bound HEAD. One such comment is handed to the
   reviewer (`EXISTING_REVIEW_COMMENT_URL`) to adopt, or to edit in place,
@@ -164,13 +172,25 @@ exactly as `ANALYZE_EXECUTE` recovers an existing open PR:
   reviewer returns, verification enforces that the round still has exactly
   one comment at its HEAD; a reviewer that posted a second one has its round
   rejected, and the next entry blocks on the pair.
-- `FIX` re-reads the PR HEAD. Equal to the reviewed HEAD: the fixer runs.
-  Past it: `FIX -> REVIEW` of the actual HEAD, no fixer launched (the rule
-  above). A fixer whose push landed but whose result was never recorded is
-  therefore never relaunched against findings its push may have resolved.
+- `FIX` re-reads the PR HEAD. Past the reviewed HEAD: `FIX -> REVIEW` of the
+  actual HEAD, no fixer launched (the rule above); a fixer whose push landed
+  but whose result was never recorded is therefore never relaunched against
+  findings its push may have resolved. Equal to it: the repository's open
+  issues are listed for the `ai-follow-up` marker of (this PR, an open
+  finding), because a `follow_up_created` resolution creates an issue and
+  moves no HEAD. One per finding is handed to the fixer (`FOLLOW_UP_ISSUES`)
+  to report instead of recreate; two for one finding block; a listing that
+  cannot be proven complete blocks, since "none exists" is then not
+  knowable. Read-back holds the fixer to the same rule.
+- `REPLAN_REEXECUTE` replays its durable transaction (replan-transaction.md).
+- `UPDATE_EPIC` reads the EPIC's comments for the `ai-epic-progress` marker
+  of (finished issue, merged PR). One is handed to the agent
+  (`EXISTING_PROGRESS_COMMENT_URL`) to adopt instead of posting a second;
+  two or more block. The bounded re-selection after a rejected
+  `next_issue_url` is a re-entry and adopts the comment the same way. After
+  the agent returns, the EPIC must carry exactly one such comment.
 
-Neither probe consumes a review round, a `review_history` entry, or an
-attempt.
+No probe consumes a review round, a `review_history` entry, or an attempt.
 
 ---
 

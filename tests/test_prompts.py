@@ -239,8 +239,58 @@ def test_update_epic_prompt_contract():
         "neither the EPIC",
         "{{NEXT_ISSUE_REJECTION}}",
         "do not repeat",
+        # PR #89 F2: the progress comment carries a marker; one already posted
+        # is adopted, never duplicated; the controller reads back exactly one.
+        "{{PROGRESS_MARKER}}",
+        "{{EXISTING_PROGRESS_COMMENT_URL}}",
+        "do NOT post a second one",
+        "exactly one",
     ):
         assert phrase in text, phrase
+
+
+def test_fix_prompt_hands_over_existing_follow_up_issues():
+    """PR #89 F3: a follow-up issue an earlier fixer created is reported, not recreated."""
+    text = prompts.load_template("fix.md")
+    for phrase in (
+        "{{FOLLOW_UP_ISSUES}}",
+        "line verbatim in its body",
+        "do NOT create a\nsecond one",
+        "the one open issue carrying its finding's",
+        "no open issue\ncarrying its marker",
+    ):
+        assert phrase in text, phrase
+
+
+def test_engine_fix_prompt_lists_a_marker_and_the_existing_issue_per_finding(engine):
+    from autoforge.engine import render_follow_up_marker
+    from tests.conftest import ISSUE3, PR
+
+    engine.state.phase = Phase.FIX
+    engine.state.current_pr_url = PR
+    engine.state.open_findings = [
+        {"id": "R1-F1", "classification": "nit", "title": "t", "location": "l"},
+        {"id": "R1-F2", "classification": "nit", "title": "t", "location": "l"},
+    ]
+    engine._existing_follow_ups = {"R1-F2": ISSUE3}
+    text = engine.render_prompt_for(Phase.FIX)
+    m1, m2 = render_follow_up_marker(PR, "R1-F1"), render_follow_up_marker(PR, "R1-F2")
+    assert f"- R1-F1: marker `{m1}`; existing issue: (none)" in text
+    assert f"- R1-F2: marker `{m2}`; existing issue: {ISSUE3}" in text
+
+
+def test_engine_update_epic_prompt_carries_the_progress_marker_and_existing_comment(engine):
+    from autoforge.engine import render_progress_marker
+    from tests.conftest import EPIC, ISSUE, PR, comment_url
+
+    engine.state.phase = Phase.UPDATE_EPIC
+    engine.state.current_pr_url = PR
+    text = engine.render_prompt_for(Phase.UPDATE_EPIC)
+    assert f"`{render_progress_marker(ISSUE, PR)}`" in text
+    assert "for this issue (if any):\n  (none)" in text
+    engine._existing_progress_comment_url = comment_url(EPIC, 300)
+    text = engine.render_prompt_for(Phase.UPDATE_EPIC)
+    assert f"for this issue (if any):\n  {comment_url(EPIC, 300)}" in text
 
 
 def test_engine_prompt_carries_last_next_issue_rejection(engine):

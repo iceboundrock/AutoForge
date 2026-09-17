@@ -59,8 +59,11 @@ from tests.conftest import (
     ci_check,
     ci_jobs,
     comment_url,
+    follow_up_issue_body,
     git_repo,
     make_engine,
+    post_progress_comment,
+    progress_comment_body,
     review_comment_body,
 )
 
@@ -549,6 +552,92 @@ def test_reviewer_posting_a_second_comment_for_the_round_is_rejected_then_blocke
     assert len(eng.provider.calls) == 1
 
 
+def _review_body_with_marker(marker_json: str) -> str:
+    return review_comment_body(1, SHA_A, False).split("<!-- ai-review-result")[0] + (
+        f"<!-- ai-review-result: {marker_json} -->\n"
+    )
+
+
+_MALFORMED_MARKERS = [
+    pytest.param(
+        json.dumps({"round": True, "reviewed_head_sha": SHA_A, "needs_fix_round": False}),
+        id="bool-round",
+    ),
+    pytest.param(
+        json.dumps({"round": 1.0, "reviewed_head_sha": SHA_A, "needs_fix_round": False}),
+        id="float-round",
+    ),
+    pytest.param(
+        json.dumps({"round": "1", "reviewed_head_sha": SHA_A, "needs_fix_round": False}),
+        id="string-round",
+    ),
+    pytest.param(
+        json.dumps({"round": 0, "reviewed_head_sha": SHA_A, "needs_fix_round": False}),
+        id="zero-round",
+    ),
+    pytest.param(json.dumps({"round": 1, "reviewed_head_sha": SHA_A}), id="missing-needs-fix"),
+    pytest.param(
+        json.dumps({"round": 1, "reviewed_head_sha": SHA_A, "needs_fix_round": 0}),
+        id="int-needs-fix",
+    ),
+    pytest.param(
+        json.dumps({"round": 1, "reviewed_head_sha": SHA_A[:7], "needs_fix_round": False}),
+        id="short-sha",
+    ),
+    pytest.param(
+        json.dumps({"round": 1, "reviewed_head_sha": 1, "needs_fix_round": False}), id="int-sha"
+    ),
+    pytest.param(json.dumps([1]), id="not-an-object"),
+    pytest.param("{not json", id="not-json"),
+]
+
+
+@pytest.mark.parametrize("marker_json", _MALFORMED_MARKERS)
+def test_parse_review_marker_rejects_malformed_markers(marker_json):
+    """PR #89 review F4: one strict validator; `true == 1` and `1.0 == 1` in
+    Python must not make a malformed marker match a round."""
+    from autoforge.engine import parse_review_marker
+
+    with pytest.raises(ValueError):
+        parse_review_marker(marker_json)
+
+
+def test_parse_review_marker_accepts_a_well_formed_marker():
+    from autoforge.engine import parse_review_marker
+
+    m = parse_review_marker(
+        json.dumps({"round": 2, "reviewed_head_sha": SHA_A.upper(), "needs_fix_round": True})
+    )
+    assert (m.round, m.reviewed_head_sha, m.needs_fix_round) == (2, SHA_A, True)
+
+
+@pytest.mark.parametrize("marker_json", _MALFORMED_MARKERS)
+def test_review_verification_rejects_a_malformed_marker(tmp_state_dir, marker_json):
+    gh = FakeGitHub()
+    gh.add_comment(PR, 100, _review_body_with_marker(marker_json))
+    eng = _in_review(tmp_state_dir, gh, [block(review_payload(1, SHA_A, []))])
+    # A payload that is not even a JSON object never matches the marker shape.
+    with pytest.raises(VerificationError, match="marker is unusable|lacks the .* marker"):
+        eng.step()
+    assert eng.state.phase == Phase.REVIEW and eng.state.review_round == 0
+
+
+@pytest.mark.parametrize("marker_json", _MALFORMED_MARKERS)
+def test_review_entry_does_not_adopt_a_malformed_marker(tmp_state_dir, marker_json):
+    """The entry scan and the read-back use the same validator: a comment the
+    read-back would reject is not handed to the reviewer as the round's."""
+    gh = FakeGitHub()
+    gh.add_comment(PR, 90, _review_body_with_marker(marker_json))
+
+    def reviews(req):
+        assert "THIS HEAD (if any):\n  (none)" in req.prompt
+        gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
+        return block(review_payload(1, SHA_A, []))
+
+    eng = _in_review(tmp_state_dir, gh, reviews)
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+
+
 def test_review_head_changes_during_review_re_reviews(tmp_state_dir):
     gh = FakeGitHub()
     gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
@@ -753,13 +842,160 @@ def test_fix_must_cover_all_findings(tmp_state_dir):
 
 def test_fix_follow_up_issue_verified(tmp_state_dir):
     gh = FakeGitHub()
-    gh.add_issue(ISSUE3, "follow-up")
-    res = [
-        {"finding_id": "R1-F1", "resolution": "follow_up_created", "follow_up_issue_url": ISSUE3}
-    ]
-    eng = _in_fix(tmp_state_dir, gh, [block(fix_payload(SHA_A, SHA_A, res))])
+
+    def creates_follow_up(req):
+        gh.add_issue(ISSUE3, "follow-up", body=follow_up_issue_body("R1-F1"))
+        return block(fix_payload(SHA_A, SHA_A, _follow_up("R1-F1", ISSUE3)))
+
+    eng = _in_fix(tmp_state_dir, gh, creates_follow_up)
     assert eng.step().next_phase == "REVIEW"  # no commit needed for a pure follow-up
     assert ("get_issue", ISSUE3) in gh.calls
+    assert ("list_open_issues", "owner/repo", True) in gh.calls
+
+
+def _follow_up(finding_id: str, url: str) -> list[dict]:
+    return [
+        {"finding_id": finding_id, "resolution": "follow_up_created", "follow_up_issue_url": url}
+    ]
+
+
+# -- FIX entry and read-back: follow-up issues (PR #89 review, F3) -------------------------
+def test_fix_entry_hands_an_existing_follow_up_issue_to_the_fixer(tmp_state_dir):
+    """A fixer whose result was never recorded created the follow-up issue and
+    pushed nothing, so the HEAD is unchanged and a HEAD probe sees nothing.
+    The open issue carrying the (PR, finding) marker is what records that
+    write; the entry finds it, names it in the prompt, and the fixer reports
+    it instead of creating a second one."""
+    gh = FakeGitHub()
+    gh.add_issue(ISSUE3, "follow-up", body=follow_up_issue_body("R1-F1"))
+    from autoforge.engine import render_follow_up_marker
+
+    def adopts(req):
+        marker = render_follow_up_marker(PR, "R1-F1")
+        assert f"- R1-F1: marker `{marker}`; existing issue: {ISSUE3}" in req.prompt
+        return block(fix_payload(SHA_A, SHA_A, _follow_up("R1-F1", ISSUE3)))
+
+    eng = _in_fix(tmp_state_dir, gh, adopts)
+    assert eng.step().next_phase == "REVIEW"
+    assert len(eng.provider.calls) == 1 and len(gh.issues) == 1 + 2  # EPIC, ISSUE, ISSUE3
+
+
+def test_fix_entry_blocks_on_two_follow_up_issues_for_one_finding_without_invoking(
+    tmp_state_dir,
+):
+    gh = FakeGitHub()
+    other = "https://github.com/owner/repo/issues/4"
+    gh.add_issue(ISSUE3, "follow-up", body=follow_up_issue_body("R1-F1"))
+    gh.add_issue(other, "follow-up again", body=follow_up_issue_body("R1-F1"))
+    eng = _in_fix(tmp_state_dir, gh, ["never"])
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and eng.provider.calls == []
+    reason = load_state(eng.paths.state_file).block_reason
+    assert "2 open issues carry the follow-up marker for finding R1-F1" in reason
+    assert ISSUE3 in reason and other in reason and "exactly one remains" in reason
+
+
+def test_fix_entry_blocks_when_the_open_issue_listing_cannot_be_proven_complete(
+    tmp_state_dir,
+):
+    """ "No follow-up issue exists" is a claim about every open issue; a listing
+    that may be truncated cannot make it, and a fixer launched on it could
+    create a second issue. BLOCKED, nobody launched, HEAD not bound."""
+    gh = FakeGitHub()
+    gh.issue_listing_truncated = True
+    eng = _in_fix(tmp_state_dir, gh, ["never"])
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and eng.provider.calls == []
+    reason = load_state(eng.paths.state_file).block_reason
+    assert "cannot establish which follow-up issues already exist" in reason
+    assert "may be truncated" in reason
+
+
+def test_fix_entry_ignores_a_closed_issue_carrying_the_marker(tmp_state_dir):
+    """A closed follow-up is not the finding's open follow-up: the fixer is
+    told none exists and may create one during its run."""
+    gh = FakeGitHub()
+    gh.add_issue(ISSUE3, "closed follow-up", state="CLOSED", body=follow_up_issue_body("R1-F1"))
+    new = "https://github.com/owner/repo/issues/5"
+
+    def creates(req):
+        assert "; existing issue: (none)" in req.prompt and ISSUE3 not in req.prompt
+        gh.add_issue(new, "follow-up", body=follow_up_issue_body("R1-F1"))
+        return block(fix_payload(SHA_A, SHA_A, _follow_up("R1-F1", new)))
+
+    eng = _in_fix(tmp_state_dir, gh, creates)
+    assert eng.step().next_phase == "REVIEW"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "",
+        follow_up_issue_body("R1-F2"),
+        follow_up_issue_body("R1-F1", "https://github.com/owner/repo/pull/41"),
+    ],
+    ids=["no-marker", "another-finding", "another-pr"],
+)
+def test_fix_follow_up_issue_not_carrying_the_findings_marker_is_rejected(tmp_state_dir, body):
+    """An existing open issue is not a follow-up of this finding unless it
+    carries the (PR, finding) marker; the marker is what a later entry finds,
+    so an unmarked follow-up would be recreated on the next relaunch."""
+    gh = FakeGitHub()
+    gh.add_issue(ISSUE3, "some issue", body=body)
+    eng = _in_fix(
+        tmp_state_dir, gh, [block(fix_payload(SHA_A, SHA_A, _follow_up("R1-F1", ISSUE3)))]
+    )
+    with pytest.raises(VerificationError, match="is not the open issue carrying the marker"):
+        eng.step()
+    assert eng.state.phase == Phase.FIX
+
+
+def test_fix_follow_up_claiming_another_issue_than_the_marked_one_is_rejected(tmp_state_dir):
+    gh = FakeGitHub()
+    other = "https://github.com/owner/repo/issues/4"
+    gh.add_issue(ISSUE3, "the marked one", body=follow_up_issue_body("R1-F1"))
+    gh.add_issue(other, "unmarked")
+    eng = _in_fix(tmp_state_dir, gh, [block(fix_payload(SHA_A, SHA_A, _follow_up("R1-F1", other)))])
+    with pytest.raises(VerificationError, match=rf"carrying the marker .*\(that is {ISSUE3}\)"):
+        eng.step()
+
+
+def test_fix_resolving_a_finding_otherwise_while_its_follow_up_issue_is_open_is_rejected(
+    tmp_state_dir,
+):
+    """The marked open issue is the durable record of the finding's
+    disposition; a result that contradicts it is not adopted, and state never
+    records a resolution GitHub does not carry."""
+    gh = FakeGitHub()
+    gh.add_issue(ISSUE3, "follow-up", body=follow_up_issue_body("R1-F1"))
+
+    def fixes_instead(req):
+        gh.set_head(SHA_B)
+        return block(fix_payload(SHA_A, SHA_B, [{"finding_id": "R1-F1", "resolution": "fixed"}]))
+
+    eng = _in_fix(tmp_state_dir, gh, fixes_instead)
+    with pytest.raises(VerificationError, match="resolved as fixed but open issue .* carries"):
+        eng.step()
+    assert eng.state.phase == Phase.FIX and eng.state.last_fix_resolutions == []
+
+
+def test_fix_creating_a_second_follow_up_issue_is_rejected_then_blocked(tmp_state_dir):
+    """The fixer ignores the existing issue and creates another: the result is
+    rejected on read-back (the rule is not trusted to the prompt), and the
+    next entry blocks on the pair instead of launching a third fixer."""
+    gh = FakeGitHub()
+    other = "https://github.com/owner/repo/issues/4"
+    gh.add_issue(ISSUE3, "follow-up", body=follow_up_issue_body("R1-F1"))
+
+    def creates_again(req):
+        gh.add_issue(other, "follow-up again", body=follow_up_issue_body("R1-F1"))
+        return block(fix_payload(SHA_A, SHA_A, _follow_up("R1-F1", other)))
+
+    eng = _in_fix(tmp_state_dir, gh, creates_again)
+    with pytest.raises(VerificationError, match="2 open issues carry the follow-up marker"):
+        eng.step()
+    assert eng.step().next_phase == "BLOCKED"
+    assert len(eng.provider.calls) == 1
 
 
 def test_fix_follow_up_issue_missing_rejected(tmp_state_dir):
@@ -852,12 +1088,34 @@ def test_remote_fix_resolutions_are_redacted_before_they_are_persisted(tmp_state
 
 
 # -- correction retry ---------------------------------------------------------------------
+def test_malformed_result_after_the_pr_was_created_is_recovered_not_corrected(
+    tmp_state_dir, fake_github
+):
+    """PR #89 review F1: a correction relaunch is a re-entry like any other,
+    so the phase's GitHub reconciliation runs before it. The agent created
+    the PR and then lost its result block: the PR is adopted and no
+    correction is launched."""
+
+    def agent(req):
+        assert not req.correction
+        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2])  # PR was created…
+        return "no block here\n"  # …but the result block was lost
+
+    eng = make_engine(tmp_state_dir, agent, github=fake_github)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    out = eng.step()
+    assert out.next_phase == "REVIEW" and "recovered" in out.message
+    assert len(eng.provider.calls) == 1
+    s = load_state(eng.paths.state_file)
+    assert s.current_pr_url == PR and s.current_head_sha == SHA_A and s.attempt == 0
+
+
 def test_malformed_result_triggers_one_correction(tmp_state_dir, fake_github):
     def agent(req):
         if not req.correction:
-            fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2])  # PR was created…
-            return "no block here\n"  # …but the result block was lost
-        return block(ANALYZE_OK)  # correction run recovers and reports it
+            return "no block here\n"  # nothing was done, and no result block
+        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2])
+        return block(ANALYZE_OK)  # correction run does the work and reports it
 
     eng = make_engine(tmp_state_dir, agent, github=fake_github)
     eng.state.phase = Phase.ANALYZE_EXECUTE
@@ -876,6 +1134,75 @@ def test_malformed_result_triggers_one_correction(tmp_state_dir, fake_github):
     assert len(dirs) == 2 and dirs[0].endswith("-1") and dirs[1].endswith("-2")
     assert (run_dir / dirs[0] / "error.txt").exists()
     assert (run_dir / dirs[1] / "control-result.json").exists()
+
+
+def test_correction_after_the_review_comment_was_posted_adopts_it(tmp_state_dir):
+    """The reviewer posted the round's comment, then returned junk. The
+    correction relaunch is preceded by the REVIEW entry probe: the comment is
+    handed to the corrected reviewer, which adopts it. One comment remains."""
+    gh = FakeGitHub()
+
+    def reviews(req):
+        if not req.correction:
+            gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
+            return "junk\n"
+        assert f"THIS HEAD (if any):\n  {comment_url(PR, 100)}" in req.prompt
+        return block(review_payload(1, SHA_A, []))
+
+    eng = _in_review(tmp_state_dir, gh, reviews)
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    assert len(eng.provider.calls) == 2 and len(gh.comments[PR]) == 1
+
+
+def test_correction_after_the_fix_was_pushed_goes_to_review_without_relaunching(tmp_state_dir):
+    """The fixer pushed, then returned junk. Before the correction relaunch
+    the FIX entry probe sees the HEAD past the reviewed one and routes to
+    REVIEW of the actual HEAD; a fixer is never relaunched against findings
+    its push may have resolved."""
+    gh = FakeGitHub()
+
+    def pushes_then_junk(req):
+        assert not req.correction
+        gh.set_head(SHA_B)
+        return "junk\n"
+
+    eng = _in_fix(tmp_state_dir, gh, pushes_then_junk)
+    out = eng.step()
+    assert out.next_phase == "REVIEW" and "no fixer launched" in out.message
+    assert len(eng.provider.calls) == 1
+    s = load_state(eng.paths.state_file)
+    assert s.current_head_sha == SHA_B and s.last_review_result == "stale" and s.attempt == 0
+
+
+def test_correction_after_the_progress_comment_was_posted_adopts_it(tmp_state_dir, fake_github):
+    """UPDATE_EPIC: the agent posted the progress comment, then returned junk.
+    The correction is told about the comment and does not post again."""
+
+    def agent(req):
+        if not req.correction:
+            post_progress_comment(fake_github)
+            return "junk\n"
+        assert f"for this issue (if any):\n  {comment_url(EPIC, 300)}" in req.prompt
+        return _epic_result(None)
+
+    eng = _in_update_epic(tmp_state_dir, fake_github, agent)
+    assert eng.step().next_phase == "DONE"
+    assert len(eng.provider.calls) == 2 and len(fake_github.comments[EPIC]) == 1
+
+
+def test_every_remote_agent_phase_reconciles_with_github_before_launching():
+    """The run-log refusal names what `resume` does on re-entry; every REMOTE
+    phase with an agent prompt has such a description because every one of
+    them reconciles in `_remote_entry`. The table cannot silently fall back
+    to "relaunches the agent" for a phase that was left out."""
+    from autoforge.engine import _REMOTE_REENTRY_RECONCILIATION, PHASE_TEMPLATE
+
+    agent_phases = {p for p, template in PHASE_TEMPLATE.items() if template}
+    assert set(_REMOTE_REENTRY_RECONCILIATION) == agent_phases
+    assert all(
+        "relaunch" not in text or "instead of relaunching" in text
+        for text in _REMOTE_REENTRY_RECONCILIATION.values()
+    )
 
 
 def test_correction_is_bounded(tmp_state_dir, fake_github):
@@ -2579,8 +2906,23 @@ def _epic_result(next_issue_url) -> str:
     return block({"phase": "UPDATE_EPIC", "status": "success", "next_issue_url": next_issue_url})
 
 
-def _in_update_epic(tmp_state_dir, gh, script):
-    """Engine parked in UPDATE_EPIC right after the controller merged PR for ISSUE."""
+def _in_update_epic(tmp_state_dir, gh, script, posts_progress: bool = True):
+    """Engine parked in UPDATE_EPIC right after the controller merged PR for ISSUE.
+
+    A list of scripted results stands for an agent that posts the progress
+    comment once (an invocation asked again adopts the one it posted) and
+    returns the results in turn; ``posts_progress=False`` is an agent that
+    skipped the phase's write.
+    """
+    if isinstance(script, list):
+        queue = list(script)
+
+        def scripted(req):
+            if posts_progress:
+                post_progress_comment(gh)
+            return queue.pop(0)
+
+        script = scripted
     eng = make_engine(tmp_state_dir, script, github=gh)
     gh.add_pr(head_sha=SHA_A, state="MERGED")
     eng.state.phase = Phase.UPDATE_EPIC
@@ -2615,6 +2957,86 @@ def test_update_epic_null_completes_the_run(tmp_state_dir, fake_github):
     s = load_state(eng.paths.state_file)
     assert s.current_issue_url == ISSUE and s.merged_since_epic_update == 0
     assert [c for c in fake_github.calls if c[0] == "get_issue"] == []
+
+
+# -- UPDATE_EPIC entry and read-back: the progress comment (PR #89 review, F2) -------------
+def test_update_epic_entry_hands_an_existing_progress_comment_to_the_agent(
+    tmp_state_dir, fake_github
+):
+    """An interrupted UPDATE_EPIC already posted the progress comment. The
+    entry reads the EPIC, names the comment, and the agent adopts it."""
+    fake_github.add_comment(EPIC, 300, progress_comment_body())
+
+    def adopts(req):
+        assert f"for this issue (if any):\n  {comment_url(EPIC, 300)}" in req.prompt
+        return _epic_result(None)
+
+    eng = _in_update_epic(tmp_state_dir, fake_github, adopts)
+    assert eng.step().next_phase == "DONE"
+    assert len(fake_github.comments[EPIC]) == 1
+    assert ("get_issue_comments", EPIC) in fake_github.calls
+
+
+def test_update_epic_entry_ignores_a_progress_comment_for_another_pr(tmp_state_dir, fake_github):
+    """The marker binds the comment to (issue, PR): an earlier issue's or PR's
+    progress comment on the same EPIC is not this entry's."""
+    other_pr = "https://github.com/owner/repo/pull/41"
+    fake_github.add_comment(EPIC, 299, progress_comment_body(ISSUE, other_pr))
+    fake_github.add_comment(EPIC, 298, progress_comment_body(ISSUE3, PR))
+
+    def posts(req):
+        assert "for this issue (if any):\n  (none)" in req.prompt
+        post_progress_comment(fake_github)
+        return _epic_result(None)
+
+    eng = _in_update_epic(tmp_state_dir, fake_github, posts)
+    assert eng.step().next_phase == "DONE"
+    assert len(fake_github.comments[EPIC]) == 3
+
+
+def test_update_epic_entry_blocks_on_two_progress_comments_without_invoking(
+    tmp_state_dir, fake_github
+):
+    fake_github.add_comment(EPIC, 300, progress_comment_body())
+    fake_github.add_comment(EPIC, 301, progress_comment_body())
+    eng = _in_update_epic(tmp_state_dir, fake_github, ["never"])
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and eng.provider.calls == []
+    s = load_state(eng.paths.state_file)
+    assert "carries 2 progress comments for issue" in s.block_reason
+    assert comment_url(EPIC, 300) in s.block_reason and comment_url(EPIC, 301) in s.block_reason
+    assert s.current_issue_url == ISSUE and s.merged_since_epic_update == 1
+
+
+def test_update_epic_without_the_progress_comment_is_rejected(tmp_state_dir, fake_github):
+    """The phase's write is read back, never inferred from the result: an
+    agent that selected the next issue but posted nothing has not done the
+    phase. No switch, no selection queried, the phase stays for `resume`."""
+    fake_github.add_issue(ISSUE3, "Next")
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(ISSUE3)], posts_progress=False)
+    with pytest.raises(VerificationError, match="carries no progress comment with the marker"):
+        eng.step()
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.UPDATE_EPIC and s.current_issue_url == ISSUE and s.attempt == 1
+    assert s.next_issue_rejections == []  # not a selection rejection
+    assert [c for c in fake_github.calls if c[0] == "get_issue"] == []
+
+
+def test_update_epic_posting_a_second_progress_comment_is_rejected_then_blocked(
+    tmp_state_dir, fake_github
+):
+    fake_github.add_comment(EPIC, 300, progress_comment_body())
+
+    def posts_again(req):
+        fake_github.add_comment(EPIC, 301, progress_comment_body())
+        return _epic_result(None)
+
+    eng = _in_update_epic(tmp_state_dir, fake_github, posts_again)
+    with pytest.raises(VerificationError, match="2 progress comments .*exactly one progress"):
+        eng.step()
+    assert load_state(eng.paths.state_file).phase == Phase.UPDATE_EPIC
+    assert eng.step().next_phase == "BLOCKED"
+    assert len(eng.provider.calls) == 1
 
 
 def _assert_not_switched(eng, gh, url_queried: str | None):
@@ -2789,6 +3211,10 @@ def test_update_epic_rejection_is_retried_once_with_the_reason_then_blocked(
     assert len(eng.provider.calls) == 2
     retry_prompt = eng.provider.calls[1].prompt
     assert "issues/999 does not exist on GitHub" in retry_prompt
+    # PR #89 F2: the re-selection is a re-entry; the progress comment the
+    # first invocation posted is handed over, not posted again.
+    assert f"for this issue (if any):\n  {comment_url(EPIC, 300)}" in retry_prompt
+    assert len(fake_github.comments[EPIC]) == 1
     assert out.next_phase == "BLOCKED"
     s = load_state(eng.paths.state_file)
     assert s.phase == Phase.BLOCKED and "2 time(s)" in s.block_reason
@@ -3339,11 +3765,16 @@ def test_fix_prompt_size_is_bounded_by_the_review_bounds(tmp_state_dir, fake_git
     escape_width = 6  # escape_inline: a control character renders as \\xNN or \\uNNNN
     indent_width = 5  # a newline inside required_resolution renders as "\n" + 4 spaces
     framing = 64  # classification, separators, the "Required resolution:" label
+    # The follow-up section renders one more line per finding: the id, its
+    # marker (the PR URL and the id again, JSON-quoted) and the existing
+    # issue URL or "(none)"; every part is bounded by the id and URL bounds.
+    follow_up_line = 2 * MAX_FINDING_ID_CHARS + 2 * MAX_URL_CHARS + framing
     per_finding = (
         MAX_FINDING_ID_CHARS  # the id's shape admits no control character
         + escape_width * (MAX_FINDING_TITLE_CHARS + MAX_FINDING_LOCATION_CHARS)
         + indent_width * MAX_FINDING_RESOLUTION_CHARS
         + framing
+        + follow_up_line
     )
     # Opening and closing fence, one longer than the longest possible run.
     longest_field = max(
@@ -3351,12 +3782,14 @@ def test_fix_prompt_size_is_bounded_by_the_review_bounds(tmp_state_dir, fake_git
     )
     fence_overhead = 2 * (longest_field + 1)
     assert len(full) - empty <= MAX_FINDINGS_PER_REVIEW * per_finding + fence_overhead
-    assert full.count("\n- R1-F") == MAX_FINDINGS_PER_REVIEW  # one rendered line per finding
+    # One rendered line per finding in the findings list and one in the
+    # follow-up section, nothing else.
+    assert full.count("\n- R1-F") == 2 * MAX_FINDINGS_PER_REVIEW
     if ch in ("\x00", "\u2028"):
         # The one-line fields were escaped, not passed through; the resolution
         # is block-quoted, so the fence, not an escape, is what contains it.
         heads = [line for line in full.split("\n") if line.startswith("- R1-F")]
-        assert len(heads) == MAX_FINDINGS_PER_REVIEW
+        assert len(heads) == 2 * MAX_FINDINGS_PER_REVIEW  # findings + follow-up section
         assert not any(ch in line for line in heads)
 
 

@@ -27,6 +27,17 @@ Verify:
 - branch is correct
 - returned HEAD SHA matches GitHub
 
+### Before every launch
+
+Every launch of a REMOTE agent is a re-entry, including the correction
+relaunch after a malformed result: the phase's GitHub reconciliation
+(workflow.md, "Re-entering a phase") runs before the first launch and again
+before each correction, so an agent that did its GitHub work and then lost
+its result block is never asked to do it again unaware. The markers below
+are the identities those probes and the read-backs share; each is validated
+by one strict parser used by both the entry scan and the verification, so a
+comment or issue the read-back would reject is never adopted at entry.
+
 ### Before REVIEW
 
 The reviewer is launched only after the controller has read the PR's
@@ -39,6 +50,9 @@ whose result was never recorded):
 - two or more: `BLOCKED` without launching the reviewer; the controller
   never chooses which review is the round's
 - a comment for the same round at another HEAD is not this round's
+- the marker is a JSON object with an integer `round` (not a boolean, not a
+  float), a 40-hex `reviewed_head_sha` and a boolean `needs_fix_round`;
+  anything else is not a marker, at entry or on read-back
 
 ### After REVIEW
 
@@ -60,17 +74,55 @@ unverified push (an unrecorded fix, an operator); the review is stale and
 the phase goes to `REVIEW` of the actual HEAD without launching the fixer
 (workflow.md, "Bind reviews to PR HEAD SHA").
 
+A push is not the only write a fixer makes: a `follow_up_created`
+resolution creates an issue and moves no HEAD. With the HEAD unchanged the
+controller lists the repository's open issues (strictly: a listing that may
+be truncated blocks, because "none exists" is then not knowable) for the
+`ai-follow-up` marker of `{"finding_id", "pr"}`:
+
+- exactly one per finding: its URL is handed to the fixer in
+  `FOLLOW_UP_ISSUES` to report as that finding's `follow_up_issue_url`,
+  never to recreate
+- two or more for one finding: `BLOCKED` without launching the fixer
+- a closed issue carrying the marker is not the finding's open follow-up
+
 ### After FIX
 
 Verify:
 
 - current PR HEAD matches the returned new HEAD
-- claimed follow-up issues exist
+- a claimed follow-up issue exists in this repository, is `OPEN`, is not the
+  current issue, and is the one open issue carrying its finding's marker
+- a finding resolved any other way has no open issue carrying its marker;
+  the marked issue is the durable record of the decision and state never
+  records a resolution GitHub contradicts
+
+### Before UPDATE_EPIC
+
+The phase's writes are a progress comment on the EPIC and its task-list
+edits. The comment carries the `ai-epic-progress` marker of
+`{"issue", "pr"}` (the finished issue and the merged PR, rendered into the
+prompt as `PROGRESS_MARKER`); before the agent is launched the EPIC's
+comments are read for it:
+
+- exactly one: its URL is handed to the agent as
+  `EXISTING_PROGRESS_COMMENT_URL`, to adopt or edit in place, never
+  duplicate; this covers an interrupted step and the bounded re-selection
+  below equally, since both are re-entries
+- two or more: `BLOCKED` without launching the agent
+- a comment for another issue or PR on the same EPIC is not this entry's
+
+The task-list edits are idempotent by nature (a checked box stays checked)
+and are not read back; confining them to a managed section is #4 and #13.
 
 ### After UPDATE_EPIC
 
-Verify `next_issue_url` exactly like the first issue in `INITIALIZING`
-before switching issues:
+First read the EPIC back: exactly one comment carrying this entry's marker.
+None means the agent did not do the phase's write (the result is rejected
+and the next entry finds nothing and launches again); two means it
+duplicated the one it was handed (rejected; the next entry blocks on the
+pair). Only then verify `next_issue_url` exactly like the first issue in
+`INITIALIZING` before switching issues:
 
 - it parses as an issue URL of the configured repository
 - it is neither the EPIC nor the issue just finished
@@ -93,7 +145,9 @@ prompt); a second rejection enters `BLOCKED`. A transient GitHub failure
 while checking the selection takes the same bounded retry. Any other GitHub
 failure (authentication, permissions, malformed data) is conclusive and
 enters `BLOCKED` immediately without invoking the agent again. Never switch
-to an unverified issue.
+to an unverified issue. A rejected selection has no effect the controller
+did not already verify: the progress comment is adopted on the retry, the
+task-list edits are idempotent, and no issue was switched.
 
 ### Before MERGE
 

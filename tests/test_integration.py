@@ -19,6 +19,7 @@ from tests.conftest import (
     block,
     comment_url,
     make_engine,
+    post_progress_comment,
     review_comment_body,
 )
 
@@ -195,6 +196,7 @@ def test_gate_open_loop_merges_via_controller_then_update_epic_to_done(tmp_state
         if req.phase == "UPDATE_EPIC":
             assert "Never merge a pull request" in req.prompt
             assert "gh pr merge" not in req.prompt.replace("no `gh pr merge`", "")
+            post_progress_comment(gh)
             return block({"phase": "UPDATE_EPIC", "status": "success", "next_issue_url": None})
         raise AssertionError(f"unexpected call {req.phase}")
 

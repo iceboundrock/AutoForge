@@ -512,6 +512,10 @@ def _repo_of(url: str) -> str:
 # `gh pr list` paginates internally to satisfy --limit; this is the ceiling a
 # strict caller is willing to read before declaring the set unknowable.
 STRICT_PR_LIST_LIMIT = 1000
+# The same ceiling for `gh issue list`: a FIX entry reads every open issue to
+# find the follow-up issues an earlier fixer created.
+STRICT_ISSUE_LIST_LIMIT = 1000
+_ISSUE_LIST_FIELDS = "url,number,title,state,body"
 
 MERGE_METHODS = ("squash", "merge", "rebase")
 _SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -809,6 +813,48 @@ class GitHubClient:
 
     def get_issue_state(self, url: str) -> str:
         return self.get_issue(url).state
+
+    def list_open_issues(self, repo: str, *, strict: bool = False) -> list[IssueInfo]:
+        """Every open issue in ``repo`` (bodies included), pull requests excluded.
+
+        ``strict`` raises GitHubError instead of returning a set that may be
+        incomplete: the listing is bounded by :data:`STRICT_ISSUE_LIST_LIMIT`,
+        and a caller deciding "no such issue exists" must not confuse that
+        with "the issue was past the limit".
+        """
+        limit = STRICT_ISSUE_LIST_LIMIT if strict else 100
+        data = self._api_list(
+            [
+                "issue",
+                "list",
+                "--repo",
+                repo,
+                "--state",
+                "open",
+                "--limit",
+                str(limit),
+                "--json",
+                _ISSUE_LIST_FIELDS,
+            ]
+        )
+        issues = [self._issue_from_data(d, repo) for d in data if isinstance(d, dict)]
+        if strict and len(issues) >= limit:
+            raise GitHubError(
+                f"{repo} has at least {limit} open issues, so the listing may be truncated "
+                "and the set of follow-up issues cannot be established"
+            )
+        return issues
+
+    def _issue_from_data(self, data: dict, repo: str) -> IssueInfo:
+        url = str(data.get("url", "") or "")
+        return IssueInfo(
+            url=url,
+            number=int(data.get("number", 0)),
+            title=data.get("title", ""),
+            state=str(data.get("state", "")).upper(),
+            body=data.get("body", "") or "",
+            repository=_repo_of(url) or repo,
+        )
 
     def issue_exists(self, url: str) -> bool:
         try:
@@ -1292,6 +1338,16 @@ class GitHubClient:
     def get_pr_comments(self, url: str) -> list[CommentInfo]:
         ref = parse_pr_url(url)
         data = self._api_json(["pr", "view", ref.canonical, "--json", "comments"])
+        return self._comments_from_data(data, ref.canonical)
+
+    def get_issue_comments(self, url: str) -> list[CommentInfo]:
+        """The issue-style comments of an issue (an EPIC's progress comments)."""
+        ref = parse_issue_url(url)
+        data = self._api_json(["issue", "view", ref.canonical, "--json", "comments"])
+        return self._comments_from_data(data, ref.canonical)
+
+    @staticmethod
+    def _comments_from_data(data: dict, parent_url: str) -> list[CommentInfo]:
         out = []
         for c in data.get("comments") or []:
             if not isinstance(c, dict):
@@ -1310,7 +1366,7 @@ class GitHubClient:
                     body=c.get("body", "") or "",
                     author=str(author.get("login", "")) if isinstance(author, dict) else "",
                     created_at=str(c.get("createdAt", "") or ""),
-                    parent_url=ref.canonical,
+                    parent_url=parent_url,
                 )
             )
         return out

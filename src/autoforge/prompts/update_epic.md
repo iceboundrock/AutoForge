@@ -9,13 +9,26 @@ Update the EPIC with a progress comment and select the next issue to work on
 - Just-finished issue: {{ISSUE_URL}}
 - Just-merged PRs: {{PR_URL}}
 - PRs merged in this batch: {{MERGED_SINCE_EPIC_UPDATE}}
+- Progress comment already posted on the EPIC for this issue (if any):
+  {{EXISTING_PROGRESS_COMMENT_URL}}
 
 ## Steps
 
 1. Post a concise progress comment on the EPIC (`gh issue comment`):
-   what was implemented, PR links, test evidence.
+   what was implemented, PR links, test evidence. The comment MUST contain
+   this marker line verbatim (it is how the controller recognises the
+   comment as this issue's; keep the JSON exactly as given):
+
+   `{{PROGRESS_MARKER}}`
+
+   If a progress comment for this issue already exists (the URL above is not
+   `(none)`), do NOT post a second one: an earlier invocation of this phase
+   already posted it. Edit it in place if it needs changes, otherwise leave
+   it. The controller verifies afterwards that the EPIC carries exactly one
+   comment with this marker; a second one fails the phase.
 2. Check off completed tasks in the EPIC body if it uses task lists
-   (`gh issue view` / `gh issue edit`).
+   (`gh issue view` / `gh issue edit`). A box that is already checked stays
+   checked; do not edit anything else in the body.
 3. Pick the next open issue in the EPIC. If none remains, return
    `"next_issue_url": null`.
 

@@ -5,9 +5,15 @@ from dataclasses import replace
 
 import pytest
 
-from autoforge.errors import GitHubError, GitHubNotFoundError, GitHubUnavailableError
+from autoforge.errors import (
+    ConfigurationError,
+    GitHubError,
+    GitHubNotFoundError,
+    GitHubUnavailableError,
+)
 from autoforge.executor import ExecutionResult
 from autoforge.github import (
+    STRICT_ISSUE_LIST_LIMIT,
     STRICT_PR_LIST_LIMIT,
     ActionsRunRef,
     ChangedFile,
@@ -125,6 +131,78 @@ def test_get_pr_comments_and_get_comment():
     c = gh.get_comment("https://github.com/o/r/pull/42#issuecomment-5")
     assert c.id == 5 and "Round 1" in c.body
     assert seen[-1][:2] == ["gh", "api"] and "repos/o/r/issues/comments/5" in seen[-1][2]
+
+
+def test_get_issue_comments_reads_the_issue_not_a_pr():
+    """PR #89 F2: the EPIC's progress comments are read with `gh issue view`."""
+    seen = []
+
+    def handler(req):
+        seen.append(req.command)
+        return _res(
+            {
+                "url": "https://github.com/o/r/issues/1",
+                "comments": [
+                    {
+                        "id": 7,
+                        "url": "https://github.com/o/r/issues/1#issuecomment-7",
+                        "body": "progress",
+                        "author": {"login": "bot"},
+                        "createdAt": "2026-01-01T00:00:00Z",
+                    }
+                ],
+            }
+        )
+
+    gh = _client(handler)
+    comments = gh.get_issue_comments("https://github.com/o/r/issues/1")
+    assert [(c.id, c.body, c.author) for c in comments] == [(7, "progress", "bot")]
+    assert comments[0].parent_url == "https://github.com/o/r/issues/1"
+    assert seen == [
+        ["gh", "issue", "view", "https://github.com/o/r/issues/1", "--json", "comments"]
+    ]
+    with pytest.raises(ConfigurationError):
+        gh.get_issue_comments("https://github.com/o/r/pull/42")
+
+
+def test_list_open_issues_strict_refuses_a_possibly_truncated_listing():
+    """PR #89 F3: "no follow-up issue exists" needs every open issue, bodies included."""
+    one = [
+        {
+            "url": "https://github.com/o/r/issues/9",
+            "number": 9,
+            "title": "Follow-up",
+            "state": "OPEN",
+            "body": "<!-- ai-follow-up: {} -->",
+        }
+    ]
+    seen = []
+
+    def handler(req):
+        seen.append(req.command)
+        return _res(one)
+
+    gh = _client(handler)
+    issues = gh.list_open_issues("o/r")
+    assert [(i.number, i.body, i.repository, i.is_open) for i in issues] == [
+        (9, "<!-- ai-follow-up: {} -->", "o/r", True)
+    ]
+    cmd = seen[0]
+    assert cmd[:6] == ["gh", "issue", "list", "--repo", "o/r", "--state"]
+    assert cmd[cmd.index("--state") + 1] == "open"
+    assert cmd[cmd.index("--limit") + 1] == "100"
+    assert cmd[cmd.index("--json") + 1] == "url,number,title,state,body"
+    assert [i.number for i in gh.list_open_issues("o/r", strict=True)] == [9]
+    assert seen[1][seen[1].index("--limit") + 1] == str(STRICT_ISSUE_LIST_LIMIT)
+
+    full = [
+        dict(one[0], number=n, url=f"https://github.com/o/r/issues/{n}")
+        for n in range(1, STRICT_ISSUE_LIST_LIMIT + 1)
+    ]
+    truncating = _client(lambda req: _res(full))
+    with pytest.raises(GitHubError, match="truncated"):
+        truncating.list_open_issues("o/r", strict=True)
+    assert len(truncating.list_open_issues("o/r")) == STRICT_ISSUE_LIST_LIMIT
 
 
 def test_find_open_prs_for_issue():

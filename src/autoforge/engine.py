@@ -74,11 +74,12 @@ from __future__ import annotations
 import json
 import re
 import secrets
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import overload
 
 from . import __prompt_version__
 from .config import DEFAULT_STATE_DIR, AutoForgeConfig, validate_required_profiles
@@ -277,7 +278,72 @@ MERGE_STATE_HINTS = {
     "UNSTABLE": "a non-required check is failing",
 }
 
-_REVIEW_MARKER_RE = re.compile(r"<!--\s*ai-review-result:\s*(\{.*?\})\s*-->", re.DOTALL)
+# -- durable markers -------------------------------------------------------
+#
+# An agent's GitHub write is identified to the controller by a marker the
+# agent embeds in it: an HTML comment carrying a small JSON object. The marker
+# is what a phase entry reads back before it launches (so an interrupted
+# invocation's write is adopted, never repeated) and what verification reads
+# back after the agent returns (so the write the result claims is the write
+# GitHub has). Every marker is parsed by one strict validator that both
+# paths share: a payload that is not exactly the documented shape is not a
+# claim, whether it is met while adopting or while verifying.
+
+
+_FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+
+
+def _marker_re(name: str) -> re.Pattern[str]:
+    return re.compile(rf"<!--\s*{re.escape(name)}\s*:\s*(\{{.*?\}})\s*-->", re.DOTALL)
+
+
+_REVIEW_MARKER_RE = _marker_re("ai-review-result")
+_PROGRESS_MARKER_NAME = "ai-epic-progress"
+_PROGRESS_MARKER_RE = _marker_re(_PROGRESS_MARKER_NAME)
+_FOLLOW_UP_MARKER_NAME = "ai-follow-up"
+_FOLLOW_UP_MARKER_RE = _marker_re(_FOLLOW_UP_MARKER_NAME)
+
+
+def _marker_object(raw: str) -> dict:
+    """The JSON object of a marker payload; ``ValueError`` names why it is not one."""
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"marker payload is not valid JSON ({exc})") from exc
+    if not isinstance(data, dict):
+        raise ValueError("marker payload must be a JSON object")
+    return data
+
+
+@dataclass(frozen=True)
+class ReviewMarker:
+    """The strictly typed ``ai-review-result`` payload of a review comment."""
+
+    round: int
+    reviewed_head_sha: str  # lowercased
+    needs_fix_round: bool
+
+
+def parse_review_marker(raw: str) -> ReviewMarker:
+    """Strict ``ai-review-result`` payload; ``ValueError`` names the defect.
+
+    ``round`` must be a JSON integer (``true`` is not round 1 and ``1.0`` is
+    not round 1), ``reviewed_head_sha`` a git SHA and ``needs_fix_round`` a
+    JSON boolean; all three are required. The claimant scan and the
+    read-back verification both go through here, so they can never disagree
+    about which comments are valid claims.
+    """
+    data = _marker_object(raw)
+    round_ = data.get("round")
+    if not isinstance(round_, int) or isinstance(round_, bool) or round_ < 1:
+        raise ValueError(f"round must be a JSON integer >= 1, got {round_!r}")
+    sha = data.get("reviewed_head_sha")
+    if not isinstance(sha, str) or not _FULL_SHA_RE.match(sha):
+        raise ValueError(f"reviewed_head_sha must be a 40-character git SHA, got {sha!r}")
+    needs_fix = data.get("needs_fix_round")
+    if not isinstance(needs_fix, bool):
+        raise ValueError(f"needs_fix_round must be a JSON boolean, got {needs_fix!r}")
+    return ReviewMarker(round=round_, reviewed_head_sha=sha.lower(), needs_fix_round=needs_fix)
 
 
 def _review_comments_claiming(
@@ -287,24 +353,107 @@ def _review_comments_claiming(
 
     The marker is the review comment's identity for the controller: the
     heading and the layout are presentation and are checked separately when
-    a comment is verified. A marker that does not parse, or names another
-    round or HEAD, is not a claimant.
+    a comment is verified. A marker that is not a valid
+    :class:`ReviewMarker`, or names another round or HEAD, is not a claimant.
     """
     found: list[CommentInfo] = []
     for c in comments:
-        for marker in _REVIEW_MARKER_RE.finditer(c.body or ""):
+        for match in _REVIEW_MARKER_RE.finditer(c.body or ""):
             try:
-                data = json.loads(marker.group(1))
-            except json.JSONDecodeError:
+                marker = parse_review_marker(match.group(1))
+            except ValueError:
                 continue
-            if not isinstance(data, dict):
-                continue
-            claimed = data.get("round")
-            if isinstance(claimed, bool) or claimed != round_:
-                continue
-            if str(data.get("reviewed_head_sha", "")).lower() == head:
+            if marker.round == round_ and marker.reviewed_head_sha == head:
                 found.append(c)
                 break
+    return found
+
+
+def render_progress_marker(issue_url: str, pr_url: str) -> str:
+    """The exact ``ai-epic-progress`` marker an EPIC progress comment carries.
+
+    The pair (finished issue, merged PR) identifies one UPDATE_EPIC entry:
+    that is the write the entry makes on the EPIC and the one it reads back.
+    """
+    payload = json.dumps({"issue": issue_url, "pr": pr_url}, sort_keys=True)
+    return f"<!-- {_PROGRESS_MARKER_NAME}: {payload} -->"
+
+
+def _progress_comments_claiming(
+    comments: list[CommentInfo], issue_url: str, pr_url: str
+) -> list[CommentInfo]:
+    """The EPIC comments whose ``ai-epic-progress`` marker claims (issue, PR).
+
+    Both URLs are compared as GitHub identities (repository case-insensitive
+    plus number), never as strings. A marker that is not exactly the
+    documented shape, or names another issue or PR, is not a claimant.
+    """
+    try:
+        issue_ref = parse_issue_url(issue_url)
+        pr_ref = parse_pr_url(pr_url)
+    except ConfigurationError:
+        return []
+    found: list[CommentInfo] = []
+    for c in comments:
+        for match in _PROGRESS_MARKER_RE.finditer(c.body or ""):
+            try:
+                data = _marker_object(match.group(1))
+                claimed_issue = data.get("issue")
+                claimed_pr = data.get("pr")
+                if not isinstance(claimed_issue, str) or not isinstance(claimed_pr, str):
+                    continue
+                same = parse_issue_url(claimed_issue).same_target(issue_ref) and parse_pr_url(
+                    claimed_pr
+                ).same_target(pr_ref)
+            except (ValueError, ConfigurationError):
+                continue
+            if same:
+                found.append(c)
+                break
+    return found
+
+
+def render_follow_up_marker(pr_url: str, finding_id: str) -> str:
+    """The exact ``ai-follow-up`` marker a follow-up issue for ``finding_id`` carries.
+
+    The pair (PR, finding id) identifies one follow-up decision: finding ids
+    are unique within a PR because review rounds only ever count up.
+    """
+    payload = json.dumps({"finding_id": finding_id, "pr": pr_url}, sort_keys=True)
+    return f"<!-- {_FOLLOW_UP_MARKER_NAME}: {payload} -->"
+
+
+def _follow_up_issues_claiming(
+    issues: list[IssueInfo], pr_url: str, finding_ids: list[str]
+) -> dict[str, list[IssueInfo]]:
+    """Per finding id, the issues whose ``ai-follow-up`` marker claims it for ``pr_url``.
+
+    Every id in ``finding_ids`` is a key (possibly with no claimants). A
+    marker that is not exactly the documented shape, names another PR, or
+    names a finding outside ``finding_ids``, is not a claim on this entry.
+    """
+    try:
+        pr_ref = parse_pr_url(pr_url)
+    except ConfigurationError:
+        return {fid: [] for fid in finding_ids}
+    wanted = set(finding_ids)
+    found: dict[str, list[IssueInfo]] = {fid: [] for fid in finding_ids}
+    for issue in issues:
+        claimed: set[str] = set()
+        for match in _FOLLOW_UP_MARKER_RE.finditer(issue.body or ""):
+            try:
+                data = _marker_object(match.group(1))
+                fid = data.get("finding_id")
+                claimed_pr = data.get("pr")
+                if not isinstance(fid, str) or not isinstance(claimed_pr, str):
+                    continue
+                same = parse_pr_url(claimed_pr).same_target(pr_ref)
+            except (ValueError, ConfigurationError):
+                continue
+            if same and fid in wanted:
+                claimed.add(fid)
+        for fid in sorted(claimed):
+            found[fid].append(issue)
     return found
 
 
@@ -315,6 +464,22 @@ def _duplicate_review_comments_reason(
     return (
         f"PR {pr_url} carries {len(claimants)} review comments for round {round_} at "
         f"HEAD {head[:12]} ({urls})"
+    )
+
+
+def _duplicate_follow_ups_reason(pr_url: str, finding_id: str, issues: list[IssueInfo]) -> str:
+    urls = ", ".join(i.url for i in issues)
+    return (
+        f"{len(issues)} open issues carry the follow-up marker for finding {finding_id} of "
+        f"PR {pr_url} ({urls})"
+    )
+
+
+def _duplicate_progress_comments_reason(state: AutoForgeState, claimants: list[CommentInfo]) -> str:
+    urls = ", ".join(c.url or f"comment {c.id}" for c in claimants)
+    return (
+        f"EPIC {state.epic_url} carries {len(claimants)} progress comments for issue "
+        f"{state.current_issue_url} (PR {state.current_pr_url}) ({urls})"
     )
 
 
@@ -420,10 +585,12 @@ def local_state_paths(
     return StatePaths.from_state_dir(git_dir / "autoforge" / "state", anchor=git_dir)
 
 
-# What a REMOTE `resume` does on re-entering a phase whose last invocation
-# was interrupted after the agent returned, quoted in that interruption's
-# error. Each entry names an actual controller-side reconciliation; a phase
-# without one is relaunched, and the error says so.
+# What a REMOTE re-entry does before the phase's agent is launched again,
+# quoted in the error of an invocation interrupted after the agent returned.
+# Every REMOTE phase that launches an agent has an entry, because every one
+# of them reconciles with GitHub in :meth:`ControllerEngine._remote_entry`
+# before launching; the table is complete by construction (a test holds it
+# against ``PHASE_TEMPLATE``), so no phase is ever described as "relaunched".
 _REMOTE_REENTRY_RECONCILIATION: dict[Phase, str] = {
     Phase.ANALYZE_EXECUTE: (
         "adopts the open PR of the issue, if one exists, instead of relaunching the agent"
@@ -437,6 +604,10 @@ _REMOTE_REENTRY_RECONCILIATION: dict[Phase, str] = {
         "relaunching the fixer"
     ),
     Phase.REPLAN_REEXECUTE: "replays the persisted replan transaction",
+    Phase.UPDATE_EPIC: (
+        "hands a progress comment already posted on the EPIC for this issue to the "
+        "agent to adopt instead of posting a second one"
+    ),
 }
 
 
@@ -482,6 +653,14 @@ class ControllerEngine:
         # ``EXISTING_REVIEW_COMMENT_URL`` so it adopts it instead of posting a
         # second one. Re-derived from GitHub on every REVIEW entry.
         self._existing_review_comment_url = ""
+        # Likewise for the other phases whose agents write to GitHub: the EPIC
+        # progress comment the UPDATE_EPIC entry found already posted for the
+        # finished issue (``EXISTING_PROGRESS_COMMENT_URL``), and the open
+        # follow-up issues the FIX entry found already carrying a marker for
+        # one of the open findings (rendered into ``FOLLOW_UP_ISSUES``).
+        # Re-derived from GitHub on every entry, never persisted.
+        self._existing_progress_comment_url = ""
+        self._existing_follow_ups: dict[str, str] = {}
         self.state: AutoForgeState | None = None
         # Set by locked(): the controller lock held for a whole command.
         self._lock: ControllerLock | None = None
@@ -818,6 +997,24 @@ class ControllerEngine:
         return f"autoforge/{parse_issue_url(issue_url).number}"
 
     @staticmethod
+    def _format_follow_ups(pr_url: str, findings: list[dict], existing: dict[str, str]) -> str:
+        """Per open finding: its follow-up marker and the follow-up issue that exists.
+
+        Controller-rendered, not agent text: the finding ids passed the
+        parser's shape check (``R<n>-F<m>``), the marker is built by
+        :func:`render_follow_up_marker` and the URLs come from GitHub.
+        """
+        if not pr_url or not findings:
+            return "(none)"
+        lines = []
+        for f in findings:
+            fid = str(f.get("id"))
+            marker = render_follow_up_marker(pr_url, fid)
+            url = existing.get(fid, "(none)")
+            lines.append(f"- {fid}: marker `{marker}`; existing issue: {url}")
+        return "\n".join(lines)
+
+    @staticmethod
     def _format_findings(findings: list[dict]) -> str:
         """The open findings as one untrusted block for a FIX prompt.
 
@@ -924,6 +1121,15 @@ class ControllerEngine:
             "REVIEW_COMMENT_URL": s.last_review_comment_url or "(none)",
             "PREVIOUS_REVIEW_COMMENT_URL": s.last_review_comment_url or "(none)",
             "EXISTING_REVIEW_COMMENT_URL": self._existing_review_comment_url or "(none)",
+            "EXISTING_PROGRESS_COMMENT_URL": self._existing_progress_comment_url or "(none)",
+            "PROGRESS_MARKER": (
+                render_progress_marker(s.current_issue_url, s.current_pr_url)
+                if s.current_issue_url and s.current_pr_url
+                else "(none)"
+            ),
+            "FOLLOW_UP_ISSUES": self._format_follow_ups(
+                s.current_pr_url, s.open_findings, self._existing_follow_ups
+            ),
             "REVIEWED_HEAD_SHA": (
                 s.current_head_sha if s.phase == Phase.REVIEW else s.reviewed_head_sha
             )
@@ -1456,28 +1662,16 @@ class ControllerEngine:
             return self._ready_for_merge_step(plan, allow_merge)
         if previous == Phase.MERGE:
             return self._merge_step(plan, allow_merge)
-        if previous == Phase.ANALYZE_EXECUTE:
-            recovered = self._try_recover_pr()
-            if recovered is not None:
-                return recovered
-        if previous == Phase.REVIEW:
-            self._bind_review_head()
-            ambiguous = self._reconcile_review_entry(plan)
-            if ambiguous is not None:
-                return ambiguous
-        if previous == Phase.FIX:
-            drifted = self._prepare_fix(plan)
-            if drifted is not None:
-                return drifted
-        if previous == Phase.REPLAN_REEXECUTE:
-            # One reducer for the fresh step and for `resume`: it either
-            # resolves the transaction (activated or refused) or falls through
-            # to invoke the replacement agent.
-            driven = self._drive_replan()
-            if driven is not None:
-                return driven
+        resolved = self._remote_entry(previous, plan)
+        if resolved is not None:
+            return resolved
 
-        payload = self._invoke_phase(previous)
+        invoked = self._invoke_phase(previous, lambda: self._remote_entry(previous, plan))
+        if isinstance(invoked, StepOutcome):
+            # A correction relaunch was pre-empted by the entry reconciliation:
+            # the malformed attempt's GitHub work resolved the phase.
+            return invoked
+        payload = invoked
         status = payload.get("status")
         if status in ("failure", "blocked"):
             nxt = Phase.FAILED if status == "failure" else Phase.BLOCKED
@@ -1513,6 +1707,44 @@ class ControllerEngine:
         state.attempt = 0
         self._save()
         return self._outcome(previous, plan=plan, result=payload, message=message)
+
+    def _remote_entry(self, previous: Phase, plan: StepPlan) -> StepOutcome | None:
+        """Reconcile a REMOTE phase entry with GitHub before its agent is launched.
+
+        The controller cannot tell a first entry from a re-entry after an
+        interrupted invocation (timeout, non-zero exit, malformed result,
+        verification failure, refused run-log write, crash), and in every
+        one of those the agent may already have done the phase's GitHub
+        work. GitHub is the source of truth, so the entry reads it and either
+        resolves the phase without an agent (returning the outcome), hands
+        the existing write to the agent to adopt, or finds nothing and lets
+        the launch proceed (returning ``None``).
+
+        This runs before *every* launch of the phase's agent, not once per
+        step: :meth:`_step_once` calls it before the first launch and
+        :meth:`_invoke_phase` calls it again before each correction relaunch,
+        because a correction is a re-entry too -- the agent whose result was
+        malformed had every opportunity to post, push or create before it
+        returned, and the correction prompt is advice to the agent, not a
+        controller check. The probes are pure reads plus the persisted HEAD
+        binding; none consumes a review round, a ``review_history`` entry or
+        an attempt.
+        """
+        if previous == Phase.ANALYZE_EXECUTE:
+            return self._try_recover_pr()
+        if previous == Phase.REVIEW:
+            self._bind_review_head()
+            return self._reconcile_review_entry(plan)
+        if previous == Phase.FIX:
+            return self._prepare_fix(plan)
+        if previous == Phase.REPLAN_REEXECUTE:
+            # One reducer for the fresh step and for `resume`: it either
+            # resolves the transaction (activated or refused) or falls through
+            # to invoke the replacement agent.
+            return self._drive_replan()
+        if previous == Phase.UPDATE_EPIC:
+            return self._reconcile_update_epic_entry(plan)
+        return None
 
     # ======================================================================
     # LOCAL mode
@@ -3173,8 +3405,21 @@ class ControllerEngine:
         (``FIX -> REVIEW``) instead of a fixer being launched against findings
         of a commit that is no longer the PR. The cost is one review round;
         the review of the actual HEAD is what says what remains.
+
+        A push is not the only write a fixer makes: a ``follow_up_created``
+        resolution creates an issue and moves no HEAD. So with the HEAD
+        still the reviewed one, the open issues of the repository are read
+        for the ``ai-follow-up`` marker of (this PR, an open finding id):
+        exactly one per finding is handed to the fixer (``FOLLOW_UP_ISSUES``)
+        to report instead of creating a second, two or more for one finding
+        is a state the controller cannot resolve without choosing and blocks
+        without launching anyone, and a listing that cannot be proven
+        complete blocks too, because "no such issue exists" is then not
+        knowable. :meth:`_apply_fix` enforces the same one-per-finding rule
+        on read-back.
         """
         state = self._require_state()
+        self._existing_follow_ups = {}
         if not state.open_findings:
             raise StateError("FIX phase entered without open findings in state")
         pr = self._require_open_pr()
@@ -3193,9 +3438,83 @@ class ControllerEngine:
                     "launched"
                 ),
             )
+        pr_url = parse_pr_url(state.current_pr_url).canonical
+        open_ids = [str(f["id"]) for f in state.open_findings]
+        try:
+            claimants = self._follow_up_issues(pr_url, open_ids)
+        except GitHubUnavailableError:
+            raise
+        except GitHubError as exc:
+            return self._block(
+                Phase.FIX,
+                plan,
+                f"cannot establish which follow-up issues already exist for the open "
+                f"findings of PR {pr_url}: {exc}. The controller will not launch a fixer "
+                "that could create a second one",
+            )
+        for fid in open_ids:
+            issues = claimants[fid]
+            if len(issues) > 1:
+                return self._block(
+                    Phase.FIX,
+                    plan,
+                    _duplicate_follow_ups_reason(pr_url, fid, issues)
+                    + ". The controller never chooses between them: close the extra "
+                    "issue(s) so exactly one remains, then start a new run",
+                )
+            if issues:
+                self._existing_follow_ups[fid] = issues[0].url
         state.current_head_sha = pr.head_sha
         self._save()
         return None
+
+    def _follow_up_issues(self, pr_url: str, finding_ids: list[str]) -> dict[str, list[IssueInfo]]:
+        """The open issues carrying a follow-up marker for (``pr_url``, each finding).
+
+        A strict listing: an open-issue set the client cannot prove complete
+        raises GitHubError, and the caller decides what that means for it.
+        """
+        state = self._require_state()
+        issues = self.github.list_open_issues(state.repository, strict=True)
+        return _follow_up_issues_claiming(issues, pr_url, finding_ids)
+
+    def _reconcile_update_epic_entry(self, plan: StepPlan) -> StepOutcome | None:
+        """Read the EPIC for this issue's progress comment before the agent runs.
+
+        UPDATE_EPIC's writes are a progress comment on the EPIC and its task
+        list edits; the comment is the one with an identity, and it carries
+        the ``ai-epic-progress`` marker of (finished issue, merged PR). An
+        agent whose result was never recorded may already have posted it, and
+        so may the agent of a rejected selection that is being asked again.
+        Exactly one such comment is handed to the agent
+        (``EXISTING_PROGRESS_COMMENT_URL``) to adopt rather than duplicate;
+        two or more block without launching anyone; :meth:`_apply_update_epic`
+        enforces afterwards that the EPIC carries exactly one. The task list
+        edits are idempotent by nature (a checked box stays checked) and are
+        not read back; their confinement is #4 and #13.
+        """
+        state = self._require_state()
+        self._existing_progress_comment_url = ""
+        claimants = self._progress_comments()
+        if len(claimants) > 1:
+            return self._block(
+                Phase.UPDATE_EPIC,
+                plan,
+                _duplicate_progress_comments_reason(state, claimants)
+                + ". The controller never chooses between them: remove the extra "
+                "comment(s) so exactly one remains, then start a new run",
+            )
+        if claimants:
+            self._existing_progress_comment_url = claimants[0].url
+        return None
+
+    def _progress_comments(self) -> list[CommentInfo]:
+        """The EPIC comments claiming this entry's (finished issue, merged PR)."""
+        state = self._require_state()
+        if not state.current_pr_url:
+            raise StateError("UPDATE_EPIC entered without the merged PR in state")
+        comments = self.github.get_issue_comments(state.epic_url)
+        return _progress_comments_claiming(comments, state.current_issue_url, state.current_pr_url)
 
     # ======================================================================
     # REPLAN_REEXECUTE
@@ -4045,7 +4364,28 @@ class ControllerEngine:
             return self._replan_log_metadata()
         return {}
 
-    def _invoke_phase(self, phase: Phase) -> dict:
+    @overload
+    def _invoke_phase(self, phase: Phase) -> dict: ...
+
+    @overload
+    def _invoke_phase(
+        self, phase: Phase, reconcile: Callable[[], StepOutcome | None]
+    ) -> dict | StepOutcome: ...
+
+    def _invoke_phase(
+        self, phase: Phase, reconcile: Callable[[], StepOutcome | None] | None = None
+    ) -> dict | StepOutcome:
+        """Launch the phase's agent, correcting a malformed result within bound.
+
+        ``reconcile`` is the phase-entry reconciliation (:meth:`_remote_entry`)
+        and is called before every correction relaunch: the agent that
+        returned the malformed result may already have done the phase's
+        GitHub work, and the relaunch must see it exactly as ``resume``
+        would. An outcome from it resolves the phase without relaunching and
+        is returned in place of a payload. A LOCAL run passes none: its
+        write phases are judged against the durable launch checkpoint and
+        its review verification refuses a tree the reviewer changed.
+        """
         state = self._require_state()
         profile = profile_for_phase(self.config, phase, state.review_round)
         provider = self.providers.get(profile)
@@ -4068,6 +4408,13 @@ class ControllerEngine:
         correction_error: str | None = None
         attempt = 0
         while True:
+            if correction_error is not None and reconcile is not None:
+                # The malformed attempt is a launch that returned; whatever it
+                # wrote to GitHub is reconciled before anything is launched
+                # again, and the prompt below is rendered from that.
+                resolved = reconcile()
+                if resolved is not None:
+                    return resolved
             prompt = self.render_prompt_for(phase, correction_error)
             # The launch is charged to the durable LOCAL bound here, after
             # every step that can refuse without launching and immediately
@@ -4215,7 +4562,7 @@ class ControllerEngine:
                     "judged against that checkpoint"
                 )
             else:
-                reentry = _REMOTE_REENTRY_RECONCILIATION.get(phase, "relaunches the agent")
+                reentry = _REMOTE_REENTRY_RECONCILIATION[phase]
                 follow_up = (
                     "Its GitHub side effects (a comment, a push, a PR) may exist while the "
                     "controller state does not record them. Repair the log directory, then "
@@ -4324,25 +4671,23 @@ class ControllerEngine:
             raise VerificationError(
                 f"review comment lacks the '# AI Code Review — Round {res.round}' heading"
             )
-        marker = _REVIEW_MARKER_RE.search(body)
-        if marker is None:
+        match_ = _REVIEW_MARKER_RE.search(body)
+        if match_ is None:
             raise VerificationError("review comment lacks the '<!-- ai-review-result -->' marker")
         try:
-            data = json.loads(marker.group(1))
-        except json.JSONDecodeError as exc:
-            raise VerificationError(f"review comment marker is not valid JSON: {exc}") from exc
-        if not isinstance(data, dict) or data.get("round") != res.round:
-            got = data.get("round") if isinstance(data, dict) else data
+            marker = parse_review_marker(match_.group(1))
+        except ValueError as exc:
+            raise VerificationError(f"review comment marker is unusable: {exc}") from exc
+        if marker.round != res.round:
             raise VerificationError(
-                f"review comment marker round {got!r} != expected round {res.round}"
+                f"review comment marker round {marker.round} != expected round {res.round}"
             )
-        marker_sha = str(data.get("reviewed_head_sha", "")).lower()
-        if marker_sha != expected_head:
+        if marker.reviewed_head_sha != expected_head:
             raise VerificationError(
-                f"review comment marker reviewed_head_sha {marker_sha!r} "
+                f"review comment marker reviewed_head_sha {marker.reviewed_head_sha!r} "
                 f"!= bound HEAD {expected_head}"
             )
-        if "needs_fix_round" in data and data["needs_fix_round"] != res.needs_fix_round:
+        if marker.needs_fix_round != res.needs_fix_round:
             raise VerificationError(
                 "review comment marker needs_fix_round disagrees with CONTROL_RESULT"
             )
@@ -4525,28 +4870,53 @@ class ControllerEngine:
                 f"FIX resolutions must cover exactly the open findings; missing={missing} "
                 f"unknown={extra}"
             )
+        pr_url = parse_pr_url(state.current_pr_url).canonical
+        # The same read the entry made: the open issues carrying this PR's
+        # follow-up marker, per finding. A follow-up the result claims must
+        # be the one marked open issue of its finding, and a finding resolved
+        # any other way must have none: the marked issue is the durable
+        # record of the decision, and state never records a different one.
+        claimants = self._follow_up_issues(pr_url, open_ids)
         for r in res.resolutions:
-            if r.resolution == "follow_up_created":
-                ref = parse_issue_url(r.follow_up_issue_url)
-                if ref.repository.lower() != state.repository.lower():
+            marked = claimants[r.finding_id]
+            if len(marked) > 1:
+                raise VerificationError(
+                    _duplicate_follow_ups_reason(pr_url, r.finding_id, marked)
+                    + "; a finding has at most one follow-up issue"
+                )
+            if r.resolution != "follow_up_created":
+                if marked:
                     raise VerificationError(
-                        f"follow-up issue {ref.canonical} for {r.finding_id} is outside "
-                        f"{state.repository}"
+                        f"{r.finding_id} is resolved as {r.resolution} but open issue "
+                        f"{marked[0].url} carries its follow-up marker"
                     )
-                if same_issue_url(ref.canonical, state.current_issue_url):
-                    raise VerificationError(
-                        f"follow-up for {r.finding_id} points at the current issue itself"
-                    )
-                try:
-                    issue = self.github.get_issue(ref.canonical)
-                except GitHubError as exc:
-                    raise VerificationError(
-                        f"follow-up issue {ref.canonical} for {r.finding_id} does not exist: {exc}"
-                    ) from exc
-                if not issue.is_open:
-                    raise VerificationError(
-                        f"follow-up issue {ref.canonical} for {r.finding_id} is {issue.state}"
-                    )
+                continue
+            ref = parse_issue_url(r.follow_up_issue_url)
+            if ref.repository.lower() != state.repository.lower():
+                raise VerificationError(
+                    f"follow-up issue {ref.canonical} for {r.finding_id} is outside "
+                    f"{state.repository}"
+                )
+            if same_issue_url(ref.canonical, state.current_issue_url):
+                raise VerificationError(
+                    f"follow-up for {r.finding_id} points at the current issue itself"
+                )
+            try:
+                issue = self.github.get_issue(ref.canonical)
+            except GitHubError as exc:
+                raise VerificationError(
+                    f"follow-up issue {ref.canonical} for {r.finding_id} does not exist: {exc}"
+                ) from exc
+            if not issue.is_open:
+                raise VerificationError(
+                    f"follow-up issue {ref.canonical} for {r.finding_id} is {issue.state}"
+                )
+            if not marked or not same_issue_url(marked[0].url, ref.canonical):
+                raise VerificationError(
+                    f"follow-up issue {ref.canonical} for {r.finding_id} is not the open issue "
+                    f"carrying the marker {render_follow_up_marker(pr_url, r.finding_id)!r}"
+                    + (f" (that is {marked[0].url})" if marked else " (no open issue does)")
+                )
         pr = self._require_open_pr()
         if pr.head_sha != res.new_head_sha:
             raise VerificationError(
@@ -4701,6 +5071,27 @@ class ControllerEngine:
             f"{n}/{MAX_NEXT_ISSUE_SELECTIONS}) — 'resume' to let the agent select again."
         ) from cause
 
+    def _verify_progress_comment(self) -> None:
+        """The EPIC carries exactly one progress comment for this entry.
+
+        Read back, never inferred from the result: a missing comment means
+        the agent did not do the phase's write (the next entry finds nothing
+        and relaunches), a second one means it duplicated the one it was
+        handed (the next entry blocks on the pair).
+        """
+        state = self._require_state()
+        claimants = self._progress_comments()
+        if not claimants:
+            raise VerificationError(
+                f"EPIC {state.epic_url} carries no progress comment with the marker "
+                f"{render_progress_marker(state.current_issue_url, state.current_pr_url)!r}"
+            )
+        if len(claimants) > 1:
+            raise VerificationError(
+                _duplicate_progress_comments_reason(state, claimants)
+                + "; an issue has exactly one progress comment on the EPIC"
+            )
+
     def _apply_update_epic(self, res: UpdateEpicResult) -> tuple[Phase, str]:
         """Switch issues only after the agent's selection verified on GitHub.
 
@@ -4717,11 +5108,14 @@ class ControllerEngine:
           asks the agent once more (with the reason in its prompt); reaching
           ``MAX_NEXT_ISSUE_SELECTIONS`` rejections returns BLOCKED;
         - any other GitHubError (authentication, permissions, malformed data)
-          is conclusive: asking the agent again would repeat UPDATE_EPIC's
-          GitHub writes while the controller still could not verify anything,
-          so the run is BLOCKED immediately without another invocation.
+          is conclusive: asking the agent again could not verify anything
+          either, so the run is BLOCKED immediately without another invocation.
+
+        Before any of that, the progress comment the phase exists to post is
+        read back from the EPIC (:meth:`_verify_progress_comment`).
         """
         state = self._require_state()
+        self._verify_progress_comment()
         if res.next_issue_url is None:
             state.record_epic_update()
             state.next_issue_rejections = []
