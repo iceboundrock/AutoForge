@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -14,6 +15,7 @@ from autoforge.errors import (
     ExecutionTimeoutError,
     GitHubError,
     GitHubUnavailableError,
+    StateError,
     StateTransitionError,
     VerificationError,
 )
@@ -409,6 +411,45 @@ def test_review_binds_head_fetched_before_review(tmp_state_dir):
     assert eng.state.reviewed_head_sha == SHA_B
 
 
+def test_review_post_agent_journal_refusal_keeps_the_phase_for_resume(tmp_state_dir):
+    """#55 in REMOTE mode: the journal append that records the invocation is
+    refused after the reviewer returned, in the same window as a timeout, a
+    non-zero exit or a verification failure. The phase is left unchanged with
+    no round consumed, the invocation's artifacts are published, the oversized
+    journal is neither materialised nor carried forward, and the error tells
+    the operator that the comment may already exist on the PR. A resume
+    re-enters REVIEW; the controller-side probe that would adopt the existing
+    round-1 comment instead of relaunching the reviewer is #14."""
+    from autoforge.runlog import MAX_EVENT_JOURNAL_BYTES
+
+    gh = FakeGitHub()
+    eng = _in_review(tmp_state_dir, gh, None)
+    journal = Path(eng.paths.logs_dir) / eng.state.run_id / "events.jsonl"
+
+    def reviews_then_enlarges_the_journal(req):
+        gh.add_comment(PR, 100, review_comment_body(1, SHA_A, True, ["R1-F1"]))
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        journal.touch()
+        os.truncate(journal, 2 * MAX_EVENT_JOURNAL_BYTES)
+        return block(review_payload(1, SHA_A, [_finding(1)]))
+
+    eng.provider._handler = reviews_then_enlarges_the_journal
+    with pytest.raises(
+        StateError,
+        match=r"corrupted event journal.*larger than.*a comment, a push, a PR.*may exist.*"
+        r"inspect the real Git/GitHub state, then 'resume', which re-enters REVIEW",
+    ):
+        eng.step()
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.REVIEW and s.review_round == 0 and s.attempt == 1
+    assert s.open_findings == [] and s.last_review_comment_url == ""
+    assert journal.stat().st_size == 2 * MAX_EVENT_JOURNAL_BYTES, "not carried forward"
+    steps = sorted(p.name for p in journal.parent.iterdir() if p.is_dir())
+    assert steps == ["001-review-1"]
+    assert (journal.parent / steps[0] / "control-result.json").exists()
+    assert len(gh.comments[PR]) == 1
+
+
 def test_review_head_changes_during_review_re_reviews(tmp_state_dir):
     gh = FakeGitHub()
     gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
@@ -480,6 +521,37 @@ def test_fix_valid_head_changed(tmp_state_dir):
     assert s.current_head_sha == SHA_B and s.open_findings == []
     assert s.last_fix_resolutions[0]["resolution"] == "fixed"
     assert s.review_round == 1  # next review is round 2
+
+
+def test_fix_post_agent_journal_refusal_keeps_the_phase_for_resume(tmp_state_dir):
+    """#55 in REMOTE mode, FIX: the fixer pushed, then the journal append was
+    refused. The phase, the bound HEAD and the open findings are unchanged for
+    `resume`, and the error says the push may already have landed. The FIX
+    entry check that would notice HEAD != reviewed HEAD before relaunching is
+    #14."""
+    from autoforge.runlog import MAX_EVENT_JOURNAL_BYTES
+
+    gh = FakeGitHub()
+
+    def fixes_then_enlarges_the_journal(req):
+        gh.set_head(SHA_B)
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        journal.touch()
+        os.truncate(journal, 2 * MAX_EVENT_JOURNAL_BYTES)
+        return block(fix_payload(SHA_A, SHA_B, [{"finding_id": "R1-F1", "resolution": "fixed"}]))
+
+    eng = _in_fix(tmp_state_dir, gh, fixes_then_enlarges_the_journal)
+    journal = Path(eng.paths.logs_dir) / eng.state.run_id / "events.jsonl"
+    with pytest.raises(
+        StateError, match=r"corrupted event journal.*then 'resume', which re-enters FIX"
+    ):
+        eng.step()
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.FIX and s.review_round == 1 and s.attempt == 1
+    assert s.current_head_sha == SHA_A and s.reviewed_head_sha == SHA_A
+    assert [f["id"] for f in s.open_findings] == ["R1-F1"] and s.last_fix_resolutions == []
+    assert journal.stat().st_size == 2 * MAX_EVENT_JOURNAL_BYTES, "not carried forward"
+    assert sorted(p.name for p in journal.parent.iterdir() if p.is_dir()) == ["001-fix-1"]
 
 
 def test_fix_returned_sha_mismatch_rejected(tmp_state_dir):

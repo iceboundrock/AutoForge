@@ -55,7 +55,9 @@ RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 # invocation, bounded by the run's step budget and the correction attempts),
 # so the budget is generous; the record bound is checked *before* the journal
 # is split into lines, so a journal of millions of empty records cannot
-# allocate its way around the byte budget either.
+# allocate its way around the byte budget either. The budget bounds what a
+# read *holds*, not the file's final size: a journal at exactly the budget is
+# still appended to, and the resulting file is refused by the next read.
 MAX_EVENT_JOURNAL_BYTES = 64 * 1024 * 1024
 MAX_EVENT_JOURNAL_RECORDS = 100_000
 # The most entries the run's own log directory may hold before the crash
@@ -67,7 +69,10 @@ MAX_EVENT_JOURNAL_RECORDS = 100_000
 # against it, and doubling is simpler than counting them. Only the run's own
 # directory is listed: sibling runs under ``logs/`` never count, so a state
 # directory with a long history of runs cannot exhaust this for a reason
-# unrelated to the run being resumed.
+# unrelated to the run being resumed. It is a budget on the listing work,
+# checked when the logger is opened, not a ceiling on what the directory may
+# come to hold: a logger opened at the budget still publishes its step
+# directory, and the next open refuses.
 MAX_RUN_LOG_ENTRIES = 2 * MAX_EVENT_JOURNAL_RECORDS
 
 

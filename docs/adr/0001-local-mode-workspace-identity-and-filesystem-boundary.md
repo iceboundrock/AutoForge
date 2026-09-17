@@ -488,11 +488,20 @@ untouched), and that read is the one an agent has had the whole invocation
 to enlarge the file for. It goes through the same bounded read
 (`append_text(limit=MAX_EVENT_JOURNAL_BYTES)`, #55) and is refused the same
 way, before anything is written, so an oversized journal is neither held in
-memory nor carried forward into the fresh inode. The invocation is not lost
-to the refusal: its step directory and artifacts are published before the
-journal line, the refusal says where they are, and the launch checkpoint
-was persisted before the agent started, so `resume` re-enters the phase as
-a retry judged against the baseline from before the first launch.
+memory nor carried forward into the fresh inode. The budget bounds what a
+read holds, not the file's final size: a journal at exactly the budget is
+still appended to, and the file that results is refused by the next read.
+The invocation is not lost to the refusal: its step directory and artifacts
+are published before the journal line, the refusal says where they are, and
+the launch checkpoint was persisted before the agent started, so `resume`
+re-enters the phase as a retry judged against the baseline from before the
+first launch. A REMOTE run has no such checkpoint; there the refusal lands
+in the same window as a timeout, a non-zero exit or a verification failure
+(README "Recovery rules"): the phase is left unchanged, the error says that
+the agent's GitHub side effects may already exist, and `resume` re-enters
+the phase. The controller-side probe that would adopt an existing review
+comment or a landed push instead of relaunching the agent is #14, and is
+what closes that window for every failure in it, this one included.
 
 The crash guard that continues the sequence from step-directory names lists
 only the run's own directory, opened as a sub-root, and lists it under a
@@ -503,7 +512,10 @@ grew with the operator's history and with whatever an agent planted beside
 the run. A run publishes at most one step directory per journal record, so
 more entries than that is not a directory the controller wrote; the walk
 refuses while listing, and the refusal names the manual step (move the
-entries AutoForge did not create out of the run directory).
+entries AutoForge did not create out of the run directory). The budget is
+on the listing work, checked when the logger is opened, not a ceiling on
+what the directory may come to hold: a logger opened at the budget still
+publishes its step directory, and the next open refuses.
 
 ### 5.6 Types are the contract at the state boundary
 

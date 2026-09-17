@@ -282,8 +282,13 @@ Git/GitHub state first and not repeat completed operations. In LOCAL mode a
 correction is one more write-capable launch, so it is charged against and
 checkpointed in the same durable per-phase bound as the launch before it (see
 **Recovery** under LOCAL mode); the setting can never multiply that bound.
-Non-zero exits, timeouts and verification failures are not retried
-automatically; they leave the phase unchanged for `resume`.
+Non-zero exits, timeouts, verification failures and a refused run-log write
+after the agent returned (an `events.jsonl` an agent enlarged past its
+budget, see Security) are not retried automatically; they leave the phase
+unchanged for `resume`. In every one of these the agent may already have
+posted a comment, pushed or opened a PR that the controller state does not
+record, so the error says to inspect the real Git/GitHub state before
+resuming; the resumed agent is told the same in its prompt.
 
 ## Prerequisites
 

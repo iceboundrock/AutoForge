@@ -4024,7 +4024,35 @@ class ControllerEngine:
                     f"{attempt} attempt(s): {detail}"
                 ) from exc
             record.parsed_result = payload
-            logger.log_execution(record, prompt, stdout, stderr)
+            try:
+                logger.log_execution(record, prompt, stdout, stderr)
+            except StateError as exc:
+                # Recording the invocation was refused (the journal an agent
+                # enlarged past its budget, #55; a run directory it filled;
+                # an I/O failure) after the agent had already returned. This
+                # is the same window as a timeout, a non-zero exit or a
+                # verification failure: the phase is left unchanged for
+                # `resume`, which re-enters it. A LOCAL retry is judged
+                # against the checkpoint persisted before the launch; a
+                # REMOTE re-entry has no such checkpoint, so the operator is
+                # told what the agent may already have done. The controller-
+                # side probe that would adopt an existing review comment or a
+                # landed push instead of relaunching is #14.
+                self._save()
+                if state.mode == WorkflowMode.LOCAL:
+                    guidance = (
+                        "The agent had already returned; its launch was checkpointed before "
+                        "it started, so once the log directory is repaired 'resume' re-enters "
+                        f"{phase.value} as a retry judged against that checkpoint."
+                    )
+                else:
+                    guidance = (
+                        "The agent had already returned, so its GitHub side effects (a "
+                        "comment, a push, a PR) may exist while the controller state does "
+                        "not record them. State unchanged: repair the log directory, inspect "
+                        f"the real Git/GitHub state, then 'resume', which re-enters {phase.value}."
+                    )
+                raise StateError(f"{exc}. {guidance}") from exc
             return payload
 
     # -- verification + state application -------------------------------------------
