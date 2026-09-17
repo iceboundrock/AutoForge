@@ -32,7 +32,7 @@ from autoforge.claims import (
     scan,
 )
 from autoforge.errors import ClaimConflictError, ConfigurationError
-from autoforge.result_parser import MAX_FINDING_ID_CHARS
+from autoforge.result_parser import MAX_FINDING_ID_CHARS, MAX_URL_CHARS
 from autoforge.validation import parse_issue_url, parse_pr_url
 
 ISSUE = "https://github.com/owner/repo/issues/2"
@@ -186,6 +186,28 @@ def test_an_over_long_finding_id_is_refused_without_being_quoted():
     hostile = "R1-F" + "9" * 200
     (reason,) = scan(FOLLOW_UP, marker("ai-follow-up", {"finding_id": hostile, "pr": PR})).defects
     assert hostile not in reason and f"longer than {MAX_FINDING_ID_CHARS}" in reason
+
+
+@pytest.mark.parametrize(
+    "kind, name, key, what",
+    [
+        pytest.param(IMPLEMENTATION, "ai-implementation", "issue", "issue", id="issue-url"),
+        pytest.param(FOLLOW_UP, "ai-follow-up", "pr", "pull request", id="pr-url"),
+    ],
+)
+def test_an_over_long_url_is_refused_by_length_without_being_quoted(kind, name, key, what):
+    """A marker URL is bounded before any parser sees it: the typed parsers
+    quote what they reject, and the defect text reaches a block reason, so an
+    unbounded URL would be persisted whole. The refusal names the length and
+    the bound, never the value."""
+    hostile = "https://github.com/owner/repo/" + "x" * (MAX_URL_CHARS * 4)
+    payload = _valid(kind)
+    payload[key] = hostile
+    (reason,) = scan(kind, marker(name, payload)).defects
+    assert "x" * 64 not in reason
+    assert f"{len(hostile)} characters" in reason and f"at most {MAX_URL_CHARS}" in reason
+    assert f"GitHub {what} URL" in reason
+    assert len(reason) < MAX_URL_CHARS
 
 
 def test_a_hostile_finding_id_is_quoted_with_repr_so_it_cannot_break_a_line():

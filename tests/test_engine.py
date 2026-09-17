@@ -504,6 +504,63 @@ def test_review_comment_wrong_round_marker_rejected(tmp_state_dir):
         eng.step()
 
 
+@pytest.mark.parametrize(
+    "marked, reported",
+    [
+        pytest.param([], ["R1-F1"], id="marker-empty-result-has-finding"),
+        pytest.param(["R1-F2"], ["R1-F1"], id="different-id"),
+        pytest.param(["R1-F1"], [], id="marker-has-finding-result-empty"),
+        pytest.param(["R1-F1"], ["R1-F1", "R1-F2"], id="marker-misses-one"),
+    ],
+)
+def test_review_comment_finding_ids_disagreeing_with_the_result_are_rejected(
+    tmp_state_dir, marked, reported
+):
+    """The marker's finding ids are the durable copy of the round's findings:
+    a later entry, a fixer, or a human reads them from the comment while the
+    controller persists the CONTROL_RESULT's. The read-back holds the two to
+    each other, as it already does for the HEAD and the verdict, instead of
+    letting the comment and the state tell different stories."""
+    gh = FakeGitHub()
+    findings = [_finding(1, int(fid.split("-F")[1])) for fid in reported]
+
+    def reviews(req):
+        gh.add_comment(PR, 100, review_comment_body(1, SHA_A, bool(reported), marked))
+        return block(review_payload(1, SHA_A, findings))
+
+    eng = _in_review(tmp_state_dir, gh, reviews)
+    with pytest.raises(VerificationError, match="finding_ids .* disagree with the CONTROL_RESULT"):
+        eng.step()
+    assert eng.state.phase == Phase.REVIEW and eng.state.review_round == 0
+
+
+@pytest.mark.parametrize(
+    "marker_ids",
+    [
+        pytest.param(["R1-F2", "R1-F1"], id="reordered"),
+        pytest.param(None, id="omitted"),
+    ],
+)
+def test_review_comment_finding_ids_are_compared_as_a_set_and_may_be_omitted(
+    tmp_state_dir, marker_ids
+):
+    """Order is presentation, and the key is optional by the documented schema."""
+    gh = FakeGitHub()
+    findings = [_finding(1, 1), _finding(1, 2)]
+
+    def reviews(req):
+        body = review_comment_body(1, SHA_A, True, marker_ids)
+        if marker_ids is None:
+            body = body.replace(', "finding_ids": []', "")
+            assert "finding_ids" not in body
+        gh.add_comment(PR, 100, body)
+        return block(review_payload(1, SHA_A, findings))
+
+    eng = _in_review(tmp_state_dir, gh, reviews)
+    assert eng.step().next_phase == "FIX"
+    assert eng.state.review_round == 1
+
+
 def test_review_comment_wrong_sha_marker_rejected(tmp_state_dir):
     gh = FakeGitHub()
     gh.add_comment(PR, 100, review_comment_body(1, SHA_B, False))
@@ -4185,6 +4242,26 @@ _UNREADABLE_IMPLEMENTATION_BODIES = [
     pytest.param(implementation_pr_body(ISSUE) * 2, id="same-issue-twice"),
     pytest.param(implementation_pr_body(ISSUE3) * 2, id="another-issue-twice"),
 ]
+
+
+def test_analyze_entry_block_reason_never_carries_an_over_long_marker_url(
+    tmp_state_dir, fake_github
+):
+    """A marker URL is untrusted text the entry persists a defect about: the
+    reason names its length and the bound, and stays bounded itself, so a
+    hostile PR body cannot write itself into the state file."""
+    hostile = "https://github.com/owner/repo/issues/" + "9" * 10_000
+    fake_github.add_pr(
+        url=PR41, head_sha=SHA_B, branch="feature/lost", body=_impl_marker({"issue": hostile})
+    )
+    eng = make_engine(tmp_state_dir, ["never"], github=fake_github)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and eng.provider.calls == []
+    reason = load_state(eng.paths.state_file).block_reason
+    assert "9" * 64 not in reason and len(reason) < 2_000
+    assert f"{len(hostile)} characters" in reason and f"at most {MAX_URL_CHARS}" in reason
+    assert f"open PR {PR41}" in reason and "repair the unreadable marker" in reason
 
 
 @pytest.mark.parametrize("body", _UNREADABLE_IMPLEMENTATION_BODIES)

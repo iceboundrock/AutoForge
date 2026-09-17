@@ -140,9 +140,10 @@ Needs another fix round: YES|NO
 The marker's payload must be real JSON when you post it: `needs_fix_round`
 is the literal `true` or `false` matching the Summary line, and
 `finding_ids` lists exactly the ids under Findings (an empty list when there
-are none). Every `<...>` above is a placeholder to replace, never text to
-copy; a payload that still contains one cannot be read and the round is
-rejected.
+are none); the controller compares them to the CONTROL_RESULT findings and
+rejects the round when they differ.
+Every `<...>` above is a placeholder to replace, never text to copy; a
+payload that still contains one cannot be read and the round is rejected.
 
 Read back the comment URL from the `gh pr comment` output.
 

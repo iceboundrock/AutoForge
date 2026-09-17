@@ -176,6 +176,7 @@ from .replan_txn import (
     verify_closed_source,
     verify_decision_point,
     verify_run_binding,
+    verify_sole_implementation_claimant,
     verify_source_checkpoint,
     verify_target_marker,
     verify_target_pr,
@@ -3872,9 +3873,15 @@ class ControllerEngine:
                 f"transaction {txn.transaction_id} is {canonical}",
                 claimed_url,
             )
-        drift = verify_target_pr(
-            pr, txn, state.repository, require_checkpoint_head=False
-        ) or verify_attestation(attestation, txn)
+        drift = (
+            verify_target_pr(pr, txn, state.repository, require_checkpoint_head=False)
+            or verify_attestation(attestation, txn)
+            # The same snapshot that bound the candidate answers whether it
+            # is the issue's one open implementation claimant, the source
+            # aside: one of two is a PR the next ANALYZE_EXECUTE entry would
+            # refuse to choose between, so the replan does not choose either.
+            or verify_sole_implementation_claimant(open_prs, canonical, txn, state.repository)
+        )
         if drift:
             return self._reject_replan(txn, drift, canonical)
         txn.replacement_pr_url = canonical
@@ -3887,6 +3894,28 @@ class ControllerEngine:
         # here a crash resumes into disposition, never into a second agent run.
         self._save_replan_txn(txn)
         return None
+
+    def _target_drift(self, target: PRInfo, open_prs: list[PRInfo], txn: ReplanTransaction) -> str:
+        """Why the checkpointed replacement can no longer be acted on, or ``""``.
+
+        The one rule for every read after binding: the final read before the
+        close, the confirmation after it, and the activation. Objective facts
+        at the checkpointed HEAD (:func:`verify_target_pr`), the transaction
+        marker that proves provenance (:func:`verify_target_marker`), and the
+        strict open listing that proves the replacement is the issue's one
+        implementation claimant, the source aside
+        (:func:`verify_sole_implementation_claimant`). Binding applies the
+        same three rules on its own snapshot, with the HEAD becoming the
+        checkpoint rather than being compared to it.
+        """
+        repository = self._require_state().repository
+        return (
+            verify_target_pr(target, txn, repository, require_checkpoint_head=True)
+            or verify_target_marker(target, txn)
+            or verify_sole_implementation_claimant(
+                open_prs, txn.replacement_pr_url, txn, repository
+            )
+        )
 
     def _supersede_source(self, txn: ReplanTransaction) -> StepOutcome:
         """Close the source PR under a compensated two-sided swap, then activate.
@@ -3990,6 +4019,7 @@ class ControllerEngine:
         # earlier attempt at it was ever recorded. Revalidate both sides now.
         try:
             target = self.github.get_pr(txn.replacement_pr_url)
+            open_prs = self.github.list_open_prs(state.repository, strict=True)
         except GitHubUnavailableError:
             raise
         except GitHubError as exc:
@@ -3998,9 +4028,7 @@ class ControllerEngine:
                 f"replacement PR {txn.replacement_pr_url} could not be re-read: {exc}",
                 txn.replacement_pr_url,
             )
-        drift = verify_target_pr(
-            target, txn, state.repository, require_checkpoint_head=True
-        ) or verify_target_marker(target, txn)
+        drift = self._target_drift(target, open_prs, txn)
         if drift:
             return self._reject_replan(txn, drift, txn.replacement_pr_url)
         drift = verify_source_checkpoint(source, txn)
@@ -4110,6 +4138,7 @@ class ControllerEngine:
         if not drift:
             try:
                 target = self.github.get_pr(txn.replacement_pr_url)
+                open_prs = self.github.list_open_prs(state.repository, strict=True)
             except GitHubUnavailableError:
                 raise
             except GitHubError as exc:
@@ -4118,9 +4147,7 @@ class ControllerEngine:
                     f"close ({exc}), so the replacement cannot be confirmed"
                 )
             else:
-                drift = verify_target_pr(
-                    target, txn, state.repository, require_checkpoint_head=True
-                ) or verify_target_marker(target, txn)
+                drift = self._target_drift(target, open_prs, txn)
         if not drift:
             return self._record_supersede(txn)
         return self._compensate_close(txn, drift)
@@ -4261,6 +4288,7 @@ class ControllerEngine:
         try:
             source = self.github.get_pr(txn.source_pr_url)
             target = self.github.get_pr(txn.replacement_pr_url)
+            open_prs = self.github.list_open_prs(state.repository, strict=True)
         except GitHubUnavailableError:
             raise  # unknown, not refused: `resume` re-reads and re-verifies
         except GitHubError as exc:
@@ -4270,11 +4298,7 @@ class ControllerEngine:
                 f"before activating the replacement ({exc})",
                 txn.replacement_pr_url,
             )
-        drift = (
-            verify_closed_source(source, txn)
-            or verify_target_pr(target, txn, state.repository, require_checkpoint_head=True)
-            or verify_target_marker(target, txn)
-        )
+        drift = verify_closed_source(source, txn) or self._target_drift(target, open_prs, txn)
         if drift:
             return self._reject_replan(
                 txn,
@@ -4684,6 +4708,19 @@ class ControllerEngine:
             raise VerificationError(
                 "review comment marker needs_fix_round disagrees with CONTROL_RESULT"
             )
+        # The marker's finding ids are the durable copy of the round's
+        # findings; when published they must be the findings being
+        # persisted, as a set (order is presentation, and both sides are
+        # distinct by construction). Both lists hold validated ids, so
+        # quoting them is safe.
+        if holder.claim.finding_ids is not None:
+            marked = sorted(holder.claim.finding_ids)
+            reported = sorted(f.id for f in res.findings)
+            if marked != reported:
+                raise VerificationError(
+                    f"review comment marker finding_ids {marked} disagree with the "
+                    f"CONTROL_RESULT findings {reported}"
+                )
 
     def _apply_review(self, res: ReviewResult) -> tuple[Phase, str]:
         state = self._require_state()

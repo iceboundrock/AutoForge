@@ -54,8 +54,10 @@ Verify:
   read-back uses the same strict listing the entry uses (one snapshot: the
   marked PR's state, HEAD and branch are read from it), so the two cannot
   disagree about which PR is the issue's. A replan's replacement PR is held
-  to the same marker by the transaction's target predicate, at binding, on
-  the final read before the close and at activation
+  to the same rule, marker and sole-claimant alike, by the transaction's
+  target predicates on one strict listing at binding, on the final read
+  before the close, at the confirmation after it and at activation, with
+  the PR being superseded excluded by identity
   ([replan-transaction.md](replan-transaction.md)), so the PR the
   controller activates is one this entry finds again after a lost state file
 
@@ -71,8 +73,11 @@ by `src/autoforge/claims.py`, which is the only code that parses or renders
 one, and every probe and read-back reads them through it:
 
 - **exact schema**: a marker's payload is a JSON object with exactly the
-  documented keys, each of the documented type; URLs inside it are parsed
-  with the typed parsers and compared as GitHub identities (repository
+  documented keys, each of the documented type; URLs inside it are bounded
+  by `MAX_URL_CHARS` before any parser sees them (an over-long one is a
+  defect that names its length and the bound, never the value, because a
+  defect's text reaches the persisted block reason), then parsed with the
+  typed parsers and compared as GitHub identities (repository
   case-insensitive plus number), never as strings
 - **every marker is classified, none is skipped**: a marker of the kind
   whose payload is not the schema, a second single-kind marker on one
@@ -135,6 +140,11 @@ Verify:
 - it is the only comment carrying this round's marker at this HEAD, and it
   is the comment the result names; a second one rejects the round (the
   uniqueness rule is enforced on read-back, never trusted to the prompt)
+- the marker's `needs_fix_round` equals the result's, and its
+  `finding_ids`, when present, are exactly the ids of the result's findings
+  as a set (order is presentation); the marker is the durable copy of the
+  round that a later entry, the fixer and a human read, so it may not tell
+  a different story from the findings the controller persists
 
 ### Before FIX
 

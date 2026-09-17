@@ -33,7 +33,11 @@ The contract every consumer gets from :func:`collect`:
   There is no "not more than one".
 - **Identity is GitHub's.** URLs inside payloads are parsed with the typed
   parsers and compared by :attr:`GitHubRef.identity` (owner and repository
-  case-insensitive, plus number), never as strings.
+  case-insensitive, plus number), never as strings. They are bounded by
+  ``MAX_URL_CHARS`` before they are parsed, exactly as ``CONTROL_RESULT``
+  URLs are: a marker is untrusted text, and the defect it produces is
+  persisted as a block reason, so an oversized value is refused by its
+  length and never quoted.
 
 ``replan_txn`` keeps its own transaction marker: that one is bound to a
 controller-generated transaction id and a PR-number watermark, and its
@@ -49,7 +53,7 @@ from dataclasses import dataclass
 from typing import Generic, Protocol, TypeVar
 
 from .errors import ClaimConflictError, ConfigurationError
-from .result_parser import FINDING_ID_RE, MAX_FINDING_ID_CHARS
+from .result_parser import FINDING_ID_RE, MAX_FINDING_ID_CHARS, MAX_URL_CHARS
 from .validation import GitHubIssueRef, GitHubPullRequestRef, parse_issue_url, parse_pr_url
 
 _FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
@@ -139,10 +143,27 @@ def _exact_keys(payload: dict, required: tuple[str, ...], optional: tuple[str, .
         raise ValueError(f"unknown key(s) {', '.join(unknown)}")
 
 
-def _issue_ref(payload: dict, key: str) -> GitHubIssueRef:
+def _url(payload: dict, key: str, what: str) -> str:
+    """The URL string under ``key``, bounded before any parser can quote it.
+
+    The ``MAX_URL_CHARS`` rule of ``result_parser``: the typed parsers quote
+    the value in their error, and a marker's error reaches a block reason
+    and the run log, so an oversized value is refused by its length alone
+    and never quoted. A marker is GitHub-authored text like a
+    ``CONTROL_RESULT`` is agent-authored text; both cross the same boundary.
+    """
     value = payload[key]
     if not isinstance(value, str):
-        raise ValueError(f"{key} must be a GitHub issue URL string")
+        raise ValueError(f"{key} must be a GitHub {what} URL string")
+    if len(value) > MAX_URL_CHARS:
+        raise ValueError(
+            f"{key} is {len(value)} characters; a GitHub {what} URL is at most {MAX_URL_CHARS}"
+        )
+    return value
+
+
+def _issue_ref(payload: dict, key: str) -> GitHubIssueRef:
+    value = _url(payload, key, "issue")
     try:
         return parse_issue_url(value)
     except ConfigurationError as exc:
@@ -150,9 +171,7 @@ def _issue_ref(payload: dict, key: str) -> GitHubIssueRef:
 
 
 def _pr_ref(payload: dict, key: str) -> GitHubPullRequestRef:
-    value = payload[key]
-    if not isinstance(value, str):
-        raise ValueError(f"{key} must be a GitHub pull request URL string")
+    value = _url(payload, key, "pull request")
     try:
         return parse_pr_url(value)
     except ConfigurationError as exc:
