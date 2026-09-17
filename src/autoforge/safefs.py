@@ -283,11 +283,14 @@ def open_regular_at(
             raise _unsafe(label, f"a {kind}, not a regular file")
         # st_nlink is 0 where a platform does not report link counts; only a
         # count that positively proves a second name is a refusal.
+        # The wording is mode-neutral: a truncating open would replace the
+        # shared inode's contents, an appending one would extend them, and
+        # either way the change shows at the other name.
         if writing and st.st_nlink > 1:
             raise _unsafe(
                 label,
                 f"a hard link: {st.st_nlink} directory entries name this file, so writing "
-                "here would replace the contents of a file AutoForge did not create",
+                "here would alter a file AutoForge did not create",
             )
         if truncate:
             os.ftruncate(fd, 0)
@@ -688,13 +691,16 @@ class SafeRoot:
     def verify_appendable(self, relpath: str, *, limit: int | None = None) -> bool:
         """Open ``relpath`` exactly as :meth:`append_text` would, and write nothing.
 
-        Every refusal the append would raise is raised here -- a link, a
-        FIFO, a device, a directory, a second name, or with a ``limit`` a
-        file already larger than it -- so a caller can make the refusal land
-        at a time of its choosing (before an agent is launched, rather than
-        when its result is being recorded). Returns whether the file exists;
-        an absent file is appendable (the append creates it) and is not
-        created here.
+        Every refusal the append would raise *for the file at that name* is
+        raised here -- a link, a FIFO, a device, a directory, a second name,
+        a file this process may not write, or with a ``limit`` a file
+        already larger than it -- so a caller can make the refusal land at a
+        time of its choosing (before an agent is launched, rather than when
+        its result is being recorded). Returns whether the file exists; an
+        absent file is appendable (the append creates it) and is not created
+        here. Whether the file *can* be created there -- the directory's
+        existence and writability -- is not checked: that is the append's
+        ``O_CREAT`` to discover, since this method creates nothing.
         """
         parts = split_relpath(relpath)
         try:

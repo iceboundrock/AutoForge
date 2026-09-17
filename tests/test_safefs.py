@@ -198,10 +198,13 @@ def test_append_refuses_a_hard_link_instead_of_writing_the_shared_inode(tmp_path
     os.link(sentinel.path, root_dir / "events.jsonl")
     before = (root_dir / "events.jsonl").stat()
 
+    # The refusal describes what an append would do to the shared inode
+    # (alter it through its other name), not the replacement it never does.
+    refusal = "hard link: 2 directory entries name this file, so writing here would alter"
     with SafeRoot.open(root_dir) as root:
-        with pytest.raises(UnsafePathError, match="hard link: 2 directory entries"):
+        with pytest.raises(UnsafePathError, match=refusal):
             root.append_text("events.jsonl", "controller\n")
-        with pytest.raises(UnsafePathError, match="hard link: 2 directory entries"):
+        with pytest.raises(UnsafePathError, match=refusal):
             root.verify_appendable("events.jsonl")
 
     sentinel.assert_untouched()
@@ -460,6 +463,30 @@ def test_an_unwritable_file_is_refused_by_the_append_and_by_the_check_alike(tmp_
     assert target.read_bytes() == b"theirs\n"
     assert (target.stat().st_ino, target.stat().st_size) == (before.st_ino, before.st_size)
     assert sorted(p.name for p in root_dir.iterdir()) == ["events.jsonl"], "no temporary left"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses file permissions")
+def test_verify_appendable_answers_for_the_file_not_for_its_directory(tmp_path):
+    """The check's contract stops at the file: an absent journal is appendable
+    even when its directory cannot take a new entry, because the check
+    creates nothing and so has no ``O_CREAT`` to fail. The append discovers
+    the directory. (Unreachable through ``RunLogger``, which publishes the
+    step directory into the same run directory before it appends, so the
+    ``mkdir`` fails first; pinned so the docstring stays exact.)"""
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    run_dir = root_dir / "run-1"
+    run_dir.mkdir()
+    run_dir.chmod(0o500)
+    try:
+        with SafeRoot.open(root_dir) as root:
+            assert root.verify_appendable("run-1/events.jsonl") is False
+            with pytest.raises(UnreadableEntryError) as by_append:
+                root.append_text("run-1/events.jsonl", "controller\n")
+    finally:
+        run_dir.chmod(0o700)
+    assert "Permission denied" in str(by_append.value)
+    assert sorted(p.name for p in run_dir.iterdir()) == [], "nothing was created"
 
 
 # -- identity: a root is an inode, not a pathname ------------------------------
