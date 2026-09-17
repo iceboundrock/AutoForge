@@ -8,6 +8,7 @@ trust boundary is `git` itself) with scripted agents and an
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -1563,10 +1564,18 @@ def test_a_crash_between_corrections_resumes_under_the_remaining_bound(tmp_path,
 
 
 def _corrupt_journal(eng) -> Path:
-    """Plant an unparseable ``events.jsonl`` for the current run."""
+    """Plant an ``events.jsonl`` the controller refuses for the current run.
+
+    The controller never reads the journal (#51), so its content cannot be
+    corrupt; what it refuses is a journal larger than any it could have
+    written. The file is sparse, so planting it costs nothing.
+    """
+    from autoforge.runlog import MAX_EVENT_JOURNAL_BYTES
+
     journal = Path(eng.paths.logs_dir) / eng.state.run_id / "events.jsonl"
     journal.parent.mkdir(parents=True, exist_ok=True)
-    journal.write_text("not json\n")
+    journal.touch()
+    os.truncate(journal, MAX_EVENT_JOURNAL_BYTES + 1)
     return journal
 
 
@@ -1574,8 +1583,8 @@ def _corrupt_journal(eng) -> Path:
 def test_a_journal_refused_before_the_launch_is_not_charged_as_a_launch(tmp_path, phase):
     """#57: a refusal that happens before any agent starts charges nothing.
 
-    `_invoke_phase` opens the run logger (and so reads the event journal)
-    before it launches the agent. A journal it refuses used to land *after*
+    `_invoke_phase` opens the run logger (and so proves the event journal
+    appendable) before it launches the agent. A journal it refuses used to land *after*
     the launch had been charged to the durable per-phase bound, so three
     refused `resume`s spent the bound with zero launches, and the repaired
     run then blocked with "invoked 3 time(s)". The charge belongs at the

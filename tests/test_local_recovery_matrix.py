@@ -574,10 +574,11 @@ def test_a_fix_round_is_not_charged_twice_by_a_crash(tmp_path):
 def test_an_oversized_event_journal_left_by_an_agent_is_refused_not_materialised(
     tmp_path, monkeypatch
 ):
-    """R11-F2: the journal is where the agents can write. A resumed phase
-    opens the logger before it executes anything, and that open must be
-    bounded: a sparse journal is refused as corrupt after one byte past the
-    budget, with nothing persisted and nothing executed."""
+    """R11-F2, then #51: the journal is where the agents can write. A resumed
+    phase opens the logger before it executes anything, and that open must
+    not depend on what the journal holds: a sparse journal past the budget
+    is refused as corrupt on its size alone, without a byte of it being
+    read, with nothing persisted and nothing executed."""
     import os
 
     import autoforge.safefs as safefs
@@ -619,8 +620,11 @@ def test_an_oversized_event_journal_left_by_an_agent_is_refused_not_materialised
     again.provider._handler = lambda req: pytest.fail("the reviewer must not be launched")
     with pytest.raises(StateError, match="corrupted event journal.*larger than"):
         again.step()
-    assert MAX_EVENT_JOURNAL_BYTES + 1 in asked, asked
-    assert max(got) == MAX_EVENT_JOURNAL_BYTES + 1, "the sparse journal was materialised"
+    # The sparse journal was neither materialised nor read at all: the only
+    # bounded reads are state.json and the specification, each a few
+    # kilobytes, and no read came back anywhere near the journal budget.
+    assert asked and got, "the step's other reads still happen"
+    assert max(got) < 1024 * 1024, "the sparse journal was read"
     # The step charged its budget (persisted before any launch, as always)
     # and nothing else moved: same phase, same round, same bound tree.
     after = load_state(Path(eng.paths.state_dir) / "state.json")
@@ -632,10 +636,10 @@ def test_an_oversized_event_journal_left_by_an_agent_is_refused_not_materialised
 
 
 def test_a_journal_enlarged_by_the_agent_refuses_the_post_run_append_bounded(tmp_path, monkeypatch):
-    """#55: the append that records the invocation reads the journal *after*
-    the agent returned, so it is the one read an agent can enlarge the file
-    for. It is bounded like the recovery read: refused one byte past the
-    budget, with the invocation's artifacts already published and the launch
+    """#55, then #51: the append that records the invocation opens the
+    journal *after* the agent returned, so it is the one open an agent can
+    enlarge the file for. It is refused on the file's size without reading
+    it, with the invocation's artifacts already published and the launch
     checkpoint already durable, so `resume` re-enters the phase as a retry
     judged against the baseline from before the agent -- it does not demand a
     second implementation on top of the first."""
@@ -676,7 +680,7 @@ def test_a_journal_enlarged_by_the_agent_refuses_the_post_run_append_bounded(tmp
     eng.provider._handler = implements_and_enlarges_the_journal
     with pytest.raises(StateError, match="corrupted event journal.*larger than"):
         eng.step()
-    assert max(got) == MAX_EVENT_JOURNAL_BYTES + 1, "the oversized journal was materialised"
+    assert not got or max(got) < 1024 * 1024, "the oversized journal was read"
     assert journal.stat().st_size == 2 * MAX_EVENT_JOURNAL_BYTES, "not carried forward"
     step_dirs = sorted(p.name for p in journal.parent.iterdir() if p.is_dir())
     assert step_dirs == ["001-analyze_execute-1"], "the invocation's artifacts were published"

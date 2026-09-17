@@ -304,7 +304,8 @@ checkpointed in the same durable per-phase bound as the launch before it (see
 **Recovery** under LOCAL mode); the setting can never multiply that bound.
 Non-zero exits, timeouts, verification failures and a refused run-log write
 after the agent returned (an `events.jsonl` an agent enlarged past its
-budget, see Security) are not retried automatically; they leave the phase
+budget or replaced with a link, see Security) are not retried automatically;
+they leave the phase
 unchanged for `resume`. The launch itself is persisted before the agent
 starts, so every one of these is on disk as a used attempt, and a refused
 run-log write names the outcome it interrupted (the timeout, the exit code,
@@ -506,12 +507,16 @@ between the check and the use. Whole-file artifacts are written as a fresh
 name, which means a symbolic link, hard link, FIFO or device planted at an
 artifact's name is *replaced*: it is never opened, so whatever it pointed at
 is provably untouched. The append-only `events.jsonl` is the one artifact that
-must be opened in place, and there the open is `O_NOFOLLOW|O_NONBLOCK` and
-refuses a hard link outright. Every read of it is bounded, at recovery and at
-the append after an agent returns alike, and the run's log directory is
-listed under a budget of its own, so a same-user agent that plants an
-oversized journal or a million names there makes the controller refuse, not
-run out of memory. `run_id`, which names `logs/<run_id>`, is
+must be opened in place, and there the open is `O_NOFOLLOW|O_NONBLOCK|O_APPEND`
+and refuses a hard link outright. The controller never reads the journal:
+the step sequence is recovered from the step directory names, and each line
+is appended in place, so the cost of logging an invocation is the line
+rather than the journal. What the journal is checked for is its size, on
+the opened descriptor, before the agent is launched and again at the append
+after it returns; the run's log directory is listed under a budget of its
+own. A same-user agent that plants an oversized journal or a million names
+there makes the controller refuse, not run out of memory or time.
+`run_id`, which names `logs/<run_id>`, is
 validated as a single safe path component whenever state is loaded, not
 trusted because the controller generated it once.
 
@@ -640,7 +645,7 @@ either way:
     state.json          # persisted run state (atomic writes)
     state.json.corrupt-<timestamp>   # unreadable state moved aside by 'run --force'
     logs/<run-id>/
-        events.jsonl                       # one line per agent invocation
+        events.jsonl                       # one line per agent invocation, append-only
         <seq>-<phase>-<attempt>/
             request.json                   # profile, model, effort, command, timeout
             prompt.md                      # rendered prompt (redacted)

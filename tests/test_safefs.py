@@ -183,18 +183,31 @@ def test_a_write_over_a_planted_entry_still_produces_the_controllers_own_file(tm
     sentinel.assert_untouched()
 
 
-def test_append_replaces_a_hard_link_instead_of_writing_the_shared_inode(tmp_path):
+def test_append_refuses_a_hard_link_instead_of_writing_the_shared_inode(tmp_path):
+    """#51 restored the in-place append, so a hard link at the journal's name
+    is refused on the descriptor -- the inode has two names, and appending
+    through it would extend a file the controller did not create -- and
+    nothing is written anywhere: not to the shared inode, not to a fresh
+    one. The name keeps both its content and its identity for the operator
+    to look at, as the refusal tells them to."""
+    from autoforge.safefs import UnsafePathError
+
     sentinel = Sentinel(tmp_path)
     root_dir = tmp_path / "root"
     root_dir.mkdir()
     os.link(sentinel.path, root_dir / "events.jsonl")
+    before = (root_dir / "events.jsonl").stat()
 
     with SafeRoot.open(root_dir) as root:
-        root.append_text("events.jsonl", "controller\n")
+        with pytest.raises(UnsafePathError, match="hard link: 2 directory entries"):
+            root.append_text("events.jsonl", "controller\n")
+        with pytest.raises(UnsafePathError, match="hard link: 2 directory entries"):
+            root.verify_appendable("events.jsonl")
 
     sentinel.assert_untouched()
-    assert (root_dir / "events.jsonl").read_text(encoding="utf-8") == SENTINEL + "controller\n"
-    assert (root_dir / "events.jsonl").stat().st_nlink == 1
+    after = (root_dir / "events.jsonl").stat()
+    assert (after.st_ino, after.st_nlink, after.st_size) == (before.st_ino, 2, before.st_size)
+    assert sorted(p.name for p in root_dir.iterdir()) == ["events.jsonl"], "no temporary left"
 
 
 def test_a_temporary_hard_linked_out_during_the_write_is_never_published(tmp_path, monkeypatch):
@@ -309,10 +322,10 @@ def _reads_asked(monkeypatch) -> list[int]:
 def test_a_bounded_append_refuses_an_oversized_file_without_reading_or_touching_it(
     tmp_path, monkeypatch
 ):
-    """`append_text` is read-existing + publish-fresh-inode, so the read is the
-    cost. With a limit it asks for one byte past it and no more, and the
-    refusal lands before anything is written: the oversized file keeps its
-    name, its inode and its size, and is never carried into a fresh inode."""
+    """`append_text` writes in place through the opened descriptor, so the
+    file's size is a single `fstat` and nothing is ever read. With a limit
+    the refusal lands before anything is written: the oversized file keeps
+    its name, its inode and its size, and no temporary is created."""
     from autoforge.safefs import ReadLimitExceeded
 
     root_dir = tmp_path / "root"
@@ -325,8 +338,10 @@ def test_a_bounded_append_refuses_an_oversized_file_without_reading_or_touching_
     with SafeRoot.open(root_dir) as root:
         with pytest.raises(ReadLimitExceeded) as exc:
             root.append_text("events.jsonl", "line\n", limit=100)
+        with pytest.raises(ReadLimitExceeded):
+            root.verify_appendable("events.jsonl", limit=100)
     assert exc.value.relpath == "events.jsonl" and exc.value.limit == 100
-    assert asked == [101], asked
+    assert asked == [], asked
     after = target.stat()
     assert (after.st_ino, after.st_size) == (before.st_ino, before.st_size)
     assert sorted(p.name for p in root_dir.iterdir()) == ["events.jsonl"], "no temporary left"
@@ -341,6 +356,83 @@ def test_a_bounded_append_at_exactly_the_limit_still_appends(tmp_path):
         root.append_text("missing.jsonl", "first\n", limit=0)
     assert (root_dir / "events.jsonl").read_bytes() == b"x" * 100 + b"line\n"
     assert (root_dir / "missing.jsonl").read_bytes() == b"first\n"
+
+
+def test_an_append_extends_the_inode_in_place_at_the_cost_of_the_line(tmp_path, monkeypatch):
+    """#51: the journal is appended to, not rewritten. Across many appends
+    the name keeps one inode, every byte written to it is a byte of a line
+    (no copy of the existing content), nothing is read, and no temporary is
+    published over the name."""
+    import autoforge.safefs as safefs
+
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    target = root_dir / "events.jsonl"
+    written: list[int] = []
+    replaced: list[str] = []
+    real_write = safefs.os.write
+    real_replace = safefs.os.replace
+
+    def counted_write(fd, data):
+        n = real_write(fd, data)
+        written.append(n)
+        return n
+
+    def counted_replace(src, dst, **kwargs):
+        replaced.append(dst)
+        return real_replace(src, dst, **kwargs)
+
+    monkeypatch.setattr(safefs.os, "write", counted_write)
+    monkeypatch.setattr(safefs.os, "replace", counted_replace)
+    asked = _reads_asked(monkeypatch)
+    lines = [f"line {i} " + "x" * (1000 * i) + "\n" for i in range(1, 9)]
+    with SafeRoot.open(root_dir) as root:
+        root.append_text("events.jsonl", lines[0])
+        first = target.stat()
+        for line in lines[1:]:
+            root.append_text("events.jsonl", line)
+    assert target.read_text(encoding="utf-8") == "".join(lines)
+    assert target.stat().st_ino == first.st_ino, "the same inode throughout"
+    assert sum(written) == sum(len(line.encode()) for line in lines), "only the lines were written"
+    assert replaced == [] and asked == []
+    assert sorted(p.name for p in root_dir.iterdir()) == ["events.jsonl"]
+
+
+def test_verify_appendable_reports_absence_and_creates_nothing(tmp_path):
+    """The pre-launch check answers whether the journal *can* be appended to,
+    so an absent journal is appendable (the first append creates it) and the
+    check must not be the thing that creates it -- nor its parent."""
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    with SafeRoot.open(root_dir) as root:
+        assert root.verify_appendable("run-1/events.jsonl") is False
+        assert not (root_dir / "run-1").exists(), "the parent was not created"
+        root.ensure_dir("run-1")
+        assert root.verify_appendable("run-1/events.jsonl") is False
+        assert sorted(p.name for p in (root_dir / "run-1").iterdir()) == []
+        root.append_text("run-1/events.jsonl", "first\n")
+        assert root.verify_appendable("run-1/events.jsonl", limit=6) is True
+    assert (root_dir / "run-1" / "events.jsonl").read_bytes() == b"first\n"
+
+
+def test_verify_appendable_refuses_every_entry_the_append_would_refuse(tmp_path):
+    """Whatever the append after the agent would refuse, the check before the
+    launch refuses too, so the refusal lands before any work is done."""
+    from autoforge.safefs import UnsafePathError
+
+    sentinel = Sentinel(tmp_path)
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    for kind in ("symlink", "hardlink", "fifo", "directory"):
+        rel = f"{kind}.jsonl"
+        plant_final(root_dir, rel, kind, sentinel)
+        with SafeRoot.open(root_dir) as root:
+            with pytest.raises(UnsafePathError) as by_check:
+                root.verify_appendable(rel)
+            with pytest.raises(UnsafePathError) as by_append:
+                root.append_text(rel, "controller\n")
+        assert str(by_check.value) == str(by_append.value), kind
+    sentinel.assert_untouched()
 
 
 # -- identity: a root is an inode, not a pathname ------------------------------

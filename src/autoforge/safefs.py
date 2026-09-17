@@ -49,6 +49,13 @@ is therefore re-inspected after the write and before the publish: an inode
 that has acquired a second name is emptied through the still-open descriptor,
 unlinked and reported, never renamed over the target.
 
+The one write that is not a whole-file replacement is the append
+(``append_text``): a journal line is written through the opened inode with
+``O_APPEND``, after the descriptor has been inspected as a regular file with
+exactly one name, so the cost of an append is the line rather than the file.
+The method docstring says why a second name acquired after that inspection
+cannot redirect the write.
+
 What this does and does not guarantee
 -------------------------------------
 
@@ -152,7 +159,13 @@ def _denied_text(exc: OSError) -> str:
 
 
 class ReadLimitExceeded(StateError):
-    """A bounded :meth:`SafeRoot.read_bytes` met a file larger than its limit."""
+    """A bounded operation met a file larger than the limit the caller set.
+
+    Raised by :meth:`SafeRoot.read_bytes` when a read would have to hold
+    more than the limit, and by :meth:`SafeRoot.append_text` and
+    :meth:`SafeRoot.verify_appendable` when the file is already larger than
+    it: in every case the file is refused before it is read or written.
+    """
 
     def __init__(self, relpath: str, limit: int) -> None:
         super().__init__(f"{relpath} is larger than {limit} bytes")
@@ -618,45 +631,90 @@ class SafeRoot:
     def append_text(
         self, relpath: str, text: str, *, mode: int = 0o600, limit: int | None = None
     ) -> None:
-        """Append to ``relpath`` by replacing its name, creating it if needed.
+        """Append ``text`` to ``relpath`` in place, creating it if needed.
 
-        Appending through an opened inode would leave a hard-link race between
-        the link-count check and the write. Reading the old bytes and publishing
-        a fresh inode keeps a second name, planted at any point in the window,
-        untouched.
+        The one write that is not a whole-file replacement. Replacing the
+        name would mean reading the existing bytes and publishing them again
+        with the new ones, which costs the whole file on every append; a
+        journal appended to N times would be rewritten N times. The append
+        therefore goes through the opened inode: ``O_WRONLY | O_APPEND`` with
+        the same ``O_NOFOLLOW | O_NONBLOCK | O_NOCTTY`` open as every other
+        controller open, and the descriptor is inspected before the write --
+        a regular file (no link, FIFO, device or directory) with exactly one
+        name, or :class:`UnsafePathError`.
 
-        The append therefore *reads* the file, and with a ``limit`` that read
-        is bounded exactly as :meth:`read_bytes` is: one byte past the limit
-        and no more, then :class:`ReadLimitExceeded`. The refusal lands before
-        anything is written, so an oversized file at the name is neither held
-        in memory nor carried forward into a fresh inode.
+        Why a second name planted *after* that inspection is harmless: the
+        write lands in the inode the descriptor holds, and at the inspection
+        that inode had exactly one name, this one, under this root. A second
+        name added later only lets the same-user process that added it
+        observe the bytes through another path, which it could already do
+        through this one; it cannot make the write reach an inode the
+        controller did not open. A foreign inode can carry this name with
+        one link only by having been *renamed* here, giving up its old name,
+        at which point it is the file at this name and nothing else. This is
+        the "opened as a regular file with one name" half of the module
+        guarantee, and it holds without a post-write inspection because
+        there is no publish step to withhold: the bytes are already where
+        they belong.
+
+        With a ``limit`` a file that is already larger than it is refused
+        with :class:`ReadLimitExceeded` before anything is written; nothing
+        is ever read, so the cost of the append is the line, whatever the
+        file's size.
         """
         parts = split_relpath(relpath)
+        where = self._describe(parts)
         parent = self._parent_of(parts, create=True)
         try:
-            existing = b""
-            existing_mode = mode
-            try:
-                fd = open_regular_at(parent, parts[-1], os.O_RDONLY, where=self._describe(parts))
-            except FileNotFoundError:
-                pass
-            else:
-                try:
-                    existing_mode = stat.S_IMODE(os.fstat(fd).st_mode)
-                except BaseException:
-                    os.close(fd)
-                    raise
-                with os.fdopen(fd, "rb") as fh:
-                    existing = _read_within(fh, relpath, limit)
-            self._replace_at(
-                parent,
-                parts[-1],
-                existing + text.encode("utf-8"),
-                mode=existing_mode,
-                where=self._describe(parts),
+            fd = open_regular_at(
+                parent, parts[-1], os.O_WRONLY | os.O_CREAT | os.O_APPEND, mode=mode, where=where
             )
+            try:
+                _refuse_past(fd, relpath, limit)
+                view = memoryview(text.encode("utf-8"))
+                while view:
+                    view = view[os.write(fd, view) :]
+                os.fsync(fd)
+            except OSError as exc:
+                raise StateError(f"cannot append to {where}: {exc}") from exc
+            finally:
+                os.close(fd)
+            # The name may have been created by this open; its directory
+            # entry is made durable the way a published temporary's is.
+            _fsync_fd(parent)
         finally:
             os.close(parent)
+
+    def verify_appendable(self, relpath: str, *, limit: int | None = None) -> bool:
+        """Open ``relpath`` exactly as :meth:`append_text` would, and write nothing.
+
+        Every refusal the append would raise is raised here -- a link, a
+        FIFO, a device, a directory, a second name, or with a ``limit`` a
+        file already larger than it -- so a caller can make the refusal land
+        at a time of its choosing (before an agent is launched, rather than
+        when its result is being recorded). Returns whether the file exists;
+        an absent file is appendable (the append creates it) and is not
+        created here.
+        """
+        parts = split_relpath(relpath)
+        try:
+            parent = self._parent_of(parts, create=False)
+        except FileNotFoundError:
+            return False
+        try:
+            try:
+                fd = open_regular_at(
+                    parent, parts[-1], os.O_WRONLY | os.O_APPEND, where=self._describe(parts)
+                )
+            except FileNotFoundError:
+                return False
+            try:
+                _refuse_past(fd, relpath, limit)
+            finally:
+                os.close(fd)
+        finally:
+            os.close(parent)
+        return True
 
     def unlink(self, relpath: str) -> None:
         parts = split_relpath(relpath)
@@ -911,6 +969,18 @@ class SafeRoot:
             raise StateError(f"cannot list {where}: {exc}") from exc
         names.sort(reverse=True)
         return names
+
+
+def _refuse_past(fd: int, relpath: str, limit: int | None) -> None:
+    """Raise :class:`ReadLimitExceeded` when the open file is larger than ``limit``.
+
+    ``st_size`` is trusted here because nothing is read: the check bounds
+    what an append is willing to extend, not what a read would hold, so a
+    sparse file that claims a size it does not occupy is refused for the
+    size it claims, which is the size an operator's tools would pay for.
+    """
+    if limit is not None and os.fstat(fd).st_size > limit:
+        raise ReadLimitExceeded(relpath, limit)
 
 
 def _read_within(fh: BinaryIO, relpath: str, limit: int | None) -> bytes:

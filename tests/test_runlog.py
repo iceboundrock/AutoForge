@@ -45,31 +45,40 @@ def test_runlog_layout_and_redaction(tmp_path):
     assert d2.name == "002-fix-2"
 
 
-def test_runlog_recovers_sequence_from_record_and_step_names(tmp_path):
+def test_runlog_recovers_sequence_from_step_names_never_from_the_journal(tmp_path):
+    """#51: the journal is write-only for the controller. The step sequence
+    comes from the directory names, which are published before the journal
+    line and so are never behind it; whatever the journal says -- a higher
+    seq, no JSON at all -- is neither believed nor looked at."""
     log_dir = tmp_path / "logs" / "run-1"
     log_dir.mkdir(parents=True)
-    (log_dir / "events.jsonl").write_text('{"seq": 7}\n', encoding="utf-8")
+    (log_dir / "events.jsonl").write_text('{"seq": 70}\nnot-json\n', encoding="utf-8")
     (log_dir / "011-review-1").mkdir()
 
     log = RunLogger(tmp_path / "logs", "run-1")
     step = log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="FIX"))
     assert step.name == "012-fix-1"
+    lines = (log_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    assert lines[:2] == ['{"seq": 70}', "not-json"], "appended after, never rewritten"
+    assert json.loads(lines[2])["seq"] == 12
 
 
-def test_runlog_rejects_a_corrupt_event_journal(tmp_path):
-    run_dir = tmp_path / "logs" / "run-1"
-    run_dir.mkdir(parents=True)
-    (run_dir / "events.jsonl").write_text("not-json\n", encoding="utf-8")
-    with pytest.raises(StateError, match="corrupted event journal"):
-        RunLogger(tmp_path / "logs", "run-1")
+def test_a_step_directory_published_without_its_journal_line_is_never_reused(tmp_path):
+    """A crash between the step-directory publish and the journal append
+    leaves a directory the journal does not name; the next invocation must
+    not reuse it and overwrite the dead invocation's artifacts."""
+    log = RunLogger(tmp_path / "logs", "run-1")
+    log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="REVIEW"), stdout="one")
+    log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="FIX"), stdout="two")
+    # The crash: the third step directory exists, its journal line does not.
+    (log.run_dir / "003-review-1").mkdir()
+    (log.run_dir / "003-review-1" / "stdout.log").write_text("dead", encoding="utf-8")
+    assert [json.loads(line)["seq"] for line in log.events_path.read_text().splitlines()] == [1, 2]
 
-
-# -- R11-F2: recovery reads the journal bounded, never wholesale ---------------
-#
-# The journal lives where the agents write (same OS user), and recovery
-# needs it only for the highest seq it holds. Like ``state.json`` (R10-F3)
-# it is read through ``SafeRoot.read_bytes(limit=)``: an oversized or sparse
-# file is refused as corrupt after at most one byte past the budget.
+    again = RunLogger(tmp_path / "logs", "run-1")
+    step = again.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="REVIEW"), stdout="x")
+    assert step.name == "004-review-1"
+    assert (log.run_dir / "003-review-1" / "stdout.log").read_text(encoding="utf-8") == "dead"
 
 
 def _counted_reads(monkeypatch) -> list[int]:
@@ -94,7 +103,64 @@ def _counted_reads(monkeypatch) -> list[int]:
     return asked
 
 
-def test_an_oversized_event_journal_is_refused_without_being_read_wholesale(tmp_path, monkeypatch):
+def test_opening_and_appending_never_read_the_journal(tmp_path, monkeypatch):
+    """The cost of opening the logger and of recording an invocation must not
+    grow with the journal (#51): a long run's journal is opened, sized and
+    appended to, and no byte of it is ever read back."""
+    log = RunLogger(tmp_path / "logs", "run-1")
+    for _ in range(3):
+        log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="REVIEW"))
+    asked = _counted_reads(monkeypatch)
+    again = RunLogger(tmp_path / "logs", "run-1")
+    assert again.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="FIX")).name == (
+        "004-fix-1"
+    )
+    assert asked == [], asked
+
+
+def test_an_append_costs_the_line_not_the_journal(tmp_path, monkeypatch):
+    """#51: recording an invocation appends its line in place. Across a run
+    the journal keeps one inode, grows by exactly the lines written, and is
+    never replaced by a temporary: the read-then-rewrite that made every
+    append cost the whole journal is gone."""
+    import autoforge.safefs as safefs
+
+    log = RunLogger(tmp_path / "logs", "run-1")
+    replaced: list[str] = []
+    real_replace = safefs.os.replace
+
+    def counted_replace(src, dst, **kwargs):
+        replaced.append(dst)
+        return real_replace(src, dst, **kwargs)
+
+    monkeypatch.setattr(safefs.os, "replace", counted_replace)
+    asked = _counted_reads(monkeypatch)
+    log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="REVIEW"), stdout="x")
+    first = log.events_path.stat()
+    for i in range(1, 6):
+        log.log_execution(
+            ExecutionRecord(run_id="run-1", seq=0, phase="FIX", command=["c"] * (1000 * i)),
+            stdout="x",
+        )
+    after = log.events_path.stat()
+    lines = log.events_path.read_bytes().splitlines(keepends=True)
+    assert after.st_ino == first.st_ino, "the same inode throughout"
+    assert after.st_size == sum(len(line) for line in lines)
+    assert [json.loads(line)["seq"] for line in lines] == [1, 2, 3, 4, 5, 6]
+    assert "events.jsonl" not in replaced, "artifacts are replaced, the journal is appended"
+    assert asked == [], "nothing was read"
+
+
+# -- R11-F2, then #51: the journal is refused on its size, never read -----------
+#
+# The journal lives where the agents write (same OS user). It used to be
+# read, bounded, for the highest seq it held; now it is never read at all,
+# and what remains of the bound is a sanity check on the opened descriptor's
+# size: a file larger than any journal the controller could have written is
+# not a controller journal, and is refused before anything is written to it.
+
+
+def test_an_oversized_event_journal_is_refused_without_being_read(tmp_path, monkeypatch):
     from autoforge.runlog import MAX_EVENT_JOURNAL_BYTES
 
     run_dir = tmp_path / "logs" / "run-1"
@@ -107,59 +173,48 @@ def test_an_oversized_event_journal_is_refused_without_being_read_wholesale(tmp_
     asked = _counted_reads(monkeypatch)
     with pytest.raises(StateError, match="corrupted event journal.*larger than .* bytes"):
         RunLogger(tmp_path / "logs", "run-1")
-    assert asked and max(asked) == MAX_EVENT_JOURNAL_BYTES + 1, asked
-    assert journal.stat().st_size == 16 * MAX_EVENT_JOURNAL_BYTES, "recovery never writes"
+    assert asked == [], asked
+    assert journal.stat().st_size == 16 * MAX_EVENT_JOURNAL_BYTES, "opening never writes"
 
 
-def test_a_journal_at_the_byte_budget_still_recovers_the_sequence(tmp_path):
-    """The bound is a ceiling on what is read, not on what is valid."""
+def test_a_journal_at_the_byte_budget_is_appended_to_and_the_result_refused_next(tmp_path):
+    """The bound is on what the controller is willing to extend, not on the
+    file's final size: at exactly the budget the line is still appended, in
+    place, and the journal that results is refused by the next open."""
     from autoforge.runlog import MAX_EVENT_JOURNAL_BYTES
 
     run_dir = tmp_path / "logs" / "run-1"
     run_dir.mkdir(parents=True)
     body = b'{"seq": 7}\n'
-    (run_dir / "events.jsonl").write_bytes(body + b" " * (MAX_EVENT_JOURNAL_BYTES - len(body)))
+    journal = run_dir / "events.jsonl"
+    journal.write_bytes(body + b" " * (MAX_EVENT_JOURNAL_BYTES - len(body)))
+    before = journal.stat()
     log = RunLogger(tmp_path / "logs", "run-1")
     assert log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="FIX")).name == (
-        "008-fix-1"
+        "001-fix-1"
     )
-
-
-def test_a_journal_with_too_many_records_is_refused_before_any_line_is_parsed(
-    tmp_path, monkeypatch
-):
-    """Records are counted on the bytes: a journal of a million empty lines
-    is refused before it is split into a million objects."""
-    import autoforge.runlog as runlog
-
-    monkeypatch.setattr(runlog, "MAX_EVENT_JOURNAL_RECORDS", 3)
-    run_dir = tmp_path / "logs" / "run-1"
-    run_dir.mkdir(parents=True)
-    # Four records, the last one unterminated and not JSON: the count is what
-    # refuses it, so the parser never gets to complain about the last line.
-    (run_dir / "events.jsonl").write_bytes(b'{"seq": 1}\n\n\nnot-json')
-    with pytest.raises(StateError, match="corrupted event journal.*more than 3 records"):
+    after = journal.stat()
+    assert after.st_ino == before.st_ino
+    assert after.st_size > MAX_EVENT_JOURNAL_BYTES
+    tail = journal.read_bytes()[MAX_EVENT_JOURNAL_BYTES:]
+    assert json.loads(tail)["seq"] == 1
+    with pytest.raises(StateError, match="corrupted event journal.*larger than"):
         RunLogger(tmp_path / "logs", "run-1")
-    # Exactly the budget, unterminated last line included, loads.
-    (run_dir / "events.jsonl").write_bytes(b'{"seq": 1}\n\n{"seq": 5}')
-    log = RunLogger(tmp_path / "logs", "run-1")
-    assert log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="FIX")).name == (
-        "006-fix-1"
-    )
 
 
 def test_the_journal_refusal_names_the_manual_step(tmp_path, monkeypatch):
-    """Refusing recovery must not strand the run: the message says what to
-    move aside, and the step directories keep the sequence monotonic."""
+    """Refusing must not strand the run: the message says what to move
+    aside, and the step directories keep the sequence monotonic."""
     import autoforge.runlog as runlog
 
-    monkeypatch.setattr(runlog, "MAX_EVENT_JOURNAL_RECORDS", 1)
+    monkeypatch.setattr(runlog, "MAX_EVENT_JOURNAL_BYTES", 16)
     run_dir = tmp_path / "logs" / "run-1"
     run_dir.mkdir(parents=True)
-    (run_dir / "events.jsonl").write_bytes(b'{"seq": 1}\n{"seq": 2}\n')
+    (run_dir / "events.jsonl").write_bytes(b"x" * 17)
     (run_dir / "002-review-1").mkdir()
-    with pytest.raises(StateError, match="move logs/run-1/events.jsonl aside"):
+    with pytest.raises(StateError, match="move logs/run-1/events.jsonl aside") as exc:
         RunLogger(tmp_path / "logs", "run-1")
+    assert "never reads it" in str(exc.value)
     (run_dir / "events.jsonl").rename(run_dir / "events.jsonl.aside")
     log = RunLogger(tmp_path / "logs", "run-1")
     assert log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="FIX")).name == (
@@ -167,20 +222,13 @@ def test_the_journal_refusal_names_the_manual_step(tmp_path, monkeypatch):
     )
 
 
-def test_a_journal_that_is_not_utf8_is_corrupt_not_silently_repaired(tmp_path):
-    run_dir = tmp_path / "logs" / "run-1"
-    run_dir.mkdir(parents=True)
-    (run_dir / "events.jsonl").write_bytes(b'{"seq": 1}\n\xff\xfe\n')
-    with pytest.raises(StateError, match="corrupted event journal.*line 2"):
-        RunLogger(tmp_path / "logs", "run-1")
-
-
-# -- #55: the post-agent append is the other read of the journal -----------------
+# -- #55: the post-agent append is the other open of the journal ----------------
 #
-# R11-F2 bounded the read at recovery and moved it before the launch. The
-# append that records the invocation reads the journal again *after* the
+# R11-F2 bounded the recovery read and moved it before the launch. The
+# append that records the invocation opens the journal again *after* the
 # agent returned, which is exactly when an agent has had the chance to
-# enlarge it. That read is bounded the same way and refused the same way.
+# enlarge or replace it. That open proves the file again and refuses on its
+# size the same way, still without reading it (#51).
 
 
 def test_a_journal_enlarged_after_the_logger_opened_refuses_the_append_not_the_machine(
@@ -197,7 +245,7 @@ def test_a_journal_enlarged_after_the_logger_opened_refuses_the_append_not_the_m
 
     with pytest.raises(StateError, match="corrupted event journal.*larger than .* bytes") as exc:
         log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="FIX"), stdout="work")
-    assert max(asked) == MAX_EVENT_JOURNAL_BYTES + 1, asked
+    assert asked == [], asked
     # Refused before anything was written: the oversized file is neither
     # materialised nor carried forward into a fresh inode ...
     after = log.events_path.stat()
@@ -218,17 +266,30 @@ def test_a_journal_enlarged_after_the_logger_opened_refuses_the_append_not_the_m
     )
 
 
-def test_a_journal_at_exactly_the_byte_budget_is_still_appended_to(tmp_path):
-    from autoforge.runlog import MAX_EVENT_JOURNAL_BYTES
+def test_a_journal_replaced_by_a_hard_link_after_the_logger_opened_refuses_the_append(
+    tmp_path,
+):
+    """A second name for the journal's inode planted between the open and
+    the append is refused on the descriptor (the inode has two names when
+    it is inspected), the artifacts are published, and the refusal keeps
+    its filesystem cause while saying where the record is."""
+    from autoforge.safefs import UnsafePathError
 
+    outside = tmp_path / "notes.txt"
+    outside.write_text("mine\n", encoding="utf-8")
     log = RunLogger(tmp_path / "logs", "run-1")
-    body = b'{"seq": 1}\n'
-    log.events_path.write_bytes(body + b" " * (MAX_EVENT_JOURNAL_BYTES - len(body)))
-    log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="FIX"))
-    journal = log.events_path.read_bytes()
-    assert journal.startswith(body)
-    assert len(journal) > MAX_EVENT_JOURNAL_BYTES
-    assert json.loads(journal.splitlines()[-1])["seq"] == 1
+    log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="REVIEW"))
+    # The agent runs here, and puts the operator's file at the journal's name.
+    log.events_path.unlink()
+    os.link(outside, log.events_path)
+
+    with pytest.raises(UnsafePathError, match="hard link: 2 directory entries") as exc:
+        log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="FIX"), stdout="work")
+    assert outside.read_text(encoding="utf-8") == "mine\n"
+    assert log.events_path.stat().st_nlink == 2, "neither appended to nor replaced"
+    assert (log.run_dir / "002-fix-1" / "stdout.log").read_text(encoding="utf-8") == "work"
+    assert "logs/run-1/002-fix-1/" in str(exc.value)
+    assert "journal line was not written" in str(exc.value)
 
 
 # -- #56: the crash guard lists the run's own directory, bounded ------------------
@@ -294,6 +355,7 @@ def test_a_run_directory_with_more_entries_than_a_run_can_produce_is_refused_whi
     run_dir = tmp_path / "logs" / "run-1"
     run_dir.mkdir(parents=True)
     (run_dir / "events.jsonl").write_text('{"seq": 1}\n', encoding="utf-8")
+    (run_dir / "001-review-1").mkdir()
     planted = [run_dir / f"planted-{i:03}" for i in range(100)]
     for path in planted:
         path.mkdir()
@@ -305,7 +367,7 @@ def test_a_run_directory_with_more_entries_than_a_run_can_produce_is_refused_whi
     assert len(seen) == 9, seen
     assert "move the entries AutoForge did not create out of logs/run-1/" in str(exc.value)
     # The manual step works: within the budget again, the sequence resumes.
-    for path in planted[7:]:
+    for path in planted[6:]:
         path.rmdir()
     log = RunLogger(tmp_path / "logs", "run-1")
     assert log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="FIX")).name == (
@@ -336,9 +398,9 @@ def test_a_logs_symlink_never_redirects_controller_writes(tmp_path):
 def test_a_fifo_event_log_fails_instead_of_hanging_the_controller(tmp_path):
     """`open()` on a FIFO with no writer blocks forever; the controller must not.
 
-    `_existing_event_count` opened `events.jsonl` to resume the sequence
-    counter, so a FIFO left at that path stalled every invocation before the
-    first agent ran, with no error and no timeout.
+    `_recover_sequence` opens `events.jsonl` to prove it appendable before
+    the first agent runs, so a FIFO left at that path would stall every
+    invocation before that agent ran, with no error and no timeout.
     """
     run_dir = tmp_path / "logs" / "run-1"
     run_dir.mkdir(parents=True)
@@ -508,14 +570,22 @@ def test_a_write_never_lands_on_a_hard_link_and_never_truncates_first(tmp_path):
     assert artifact.stat().st_nlink == 1
 
 
-def test_a_hard_linked_events_journal_is_replaced_before_it_is_appended_to(tmp_path):
+def test_a_hard_linked_events_journal_is_refused_before_any_agent_is_launched(tmp_path):
+    """PR #44 R4-F1 replaced a hard-linked journal; #51 refuses it instead,
+    at the open that precedes the launch, so the operator's file is neither
+    appended to nor displaced and no agent has done work that would go
+    unlogged."""
+    from autoforge.safefs import UnsafePathError
+
     outside = tmp_path / "notes.txt"
     outside.write_text("mine\n", encoding="utf-8")
-    log = RunLogger(tmp_path / "logs", "run-1")
-    os.link(outside, log.events_path)
-    log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="REVIEW"))
+    run_dir = tmp_path / "logs" / "run-1"
+    run_dir.mkdir(parents=True)
+    os.link(outside, run_dir / "events.jsonl")
+    with pytest.raises(UnsafePathError, match="hard link: 2 directory entries"):
+        RunLogger(tmp_path / "logs", "run-1")
     assert outside.read_text(encoding="utf-8") == "mine\n"
-    assert log.events_path.stat().st_nlink == 1
+    assert (run_dir / "events.jsonl").stat().st_nlink == 2
 
 
 def test_a_rewritten_artifact_never_keeps_a_tail_of_the_old_one(tmp_path):
