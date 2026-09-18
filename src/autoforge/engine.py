@@ -1531,6 +1531,12 @@ class ControllerEngine:
             if cap:
                 return self._block(previous, plan, self._loop_block_reason(cap))
 
+        # In memory until the step's first save: the launch checkpoint of an
+        # agent step (`_invoke_phase`), or the resolution of a step that needs
+        # none. An entry read that fails transiently before either persists
+        # nothing, so it is not a step and is not charged: `resume` re-reads
+        # with the same budget. The replan exemption above inherits this rule
+        # rather than adding one.
         state.step_count += 1
         if previous == Phase.INITIALIZING:
             return self._initialize(plan)

@@ -3922,6 +3922,38 @@ def test_step_budget_applies_to_deterministic_steps_too(tmp_state_dir, fake_gith
     assert eng.state.step_count == 1
 
 
+def test_a_transient_entry_failure_is_not_a_step_and_is_not_charged(tmp_state_dir):
+    """A step is charged when it first persists; an entry read that fails transiently never does.
+
+    Before the launch checkpoint (or, for a step that needs no agent, the
+    step's resolution) the incremented count exists only in memory, so a
+    GitHub outage at the phase entry leaves the state file byte-identical and
+    ``resume`` re-reads with the same budget. Once GitHub answers, the launch
+    checkpoint charges the step before the agent runs. The REPLAN_REEXECUTE
+    budget exemption inherits this rule rather than adding one (#71).
+    """
+    gh = FakeGitHub()
+    gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
+    eng = _in_review(tmp_state_dir, gh, [block(review_payload(1, SHA_A, []))])
+    eng.config.workflow.max_total_steps = 5
+    eng.state.step_count = 4  # the last step the budget allows
+    eng._save()
+    before = eng.paths.state_file.read_bytes()
+
+    gh.get_pr_failures = 1  # the HEAD binding at the REVIEW entry
+    with pytest.raises(GitHubUnavailableError):
+        eng.step()
+    assert eng.paths.state_file.read_bytes() == before
+    assert eng.provider.calls == []
+
+    resumed = make_engine(tmp_state_dir, [block(review_payload(1, SHA_A, []))], github=gh)
+    resumed.load()
+    assert resumed.state.step_count == 4
+    assert resumed.step().next_phase == "READY_FOR_MERGE"
+    assert len(resumed.provider.calls) == 1
+    assert load_state(resumed.paths.state_file).step_count == 5  # counted once
+
+
 def test_dry_run_plan_reports_loop_bounds(tmp_state_dir, fake_github):
     gh = fake_github
     eng = _in_review(tmp_state_dir, gh, [], round_done=2)

@@ -5124,6 +5124,73 @@ def test_a_resume_at_the_budget_never_closes_from_a_recorded_intent(tmp_state_di
     assert load_state(eng2.paths.state_file).step_count == steps + 1
 
 
+def _fresh_process(eng, gh):
+    """A new controller process over what is *on disk*, without saving ``eng`` first.
+
+    ``_restart`` persists the in-memory state; this deliberately does not, so
+    a fresh engine sees exactly what an interrupted step left behind.
+    """
+    eng2 = make_engine(eng.paths.state_dir, ["the replan agent must not run"], github=gh)
+    eng2.load()
+    return eng2
+
+
+@pytest.mark.parametrize(
+    "stage", [ReplanStage.SUPERSEDE_INTENT, ReplanStage.SUPERSEDED, ReplanStage.COMPENSATING]
+)
+def test_a_transient_failure_while_finishing_at_the_budget_is_not_a_step(tmp_state_dir, stage):
+    """PR #92 review: an outage while finishing under a spent budget is not a step.
+
+    A step is charged when it first persists: the launch checkpoint of an
+    agent step, the resolution of a step that needs none. The finishing read
+    that fails transiently persists nothing, so the state file -- count,
+    phase and journal -- is byte-identical afterwards and the next ``resume``
+    re-reads, exactly as any phase does under an outage; the exemption admits
+    no more than that, and never a write. Once GitHub answers, the step
+    finishes, is counted once, and the budget ends the run at the next
+    boundary. An outage therefore defers the finish; it never repeats it.
+    """
+    gh = FakeGitHub()
+    eng, txn = _seeded_engine(tmp_state_dir, gh, stage)
+    _closed_by_controller(gh)
+    steps = _at_the_budget(eng)
+    eng2 = _restart(eng, gh)
+    before = eng2.paths.state_file.read_bytes()
+
+    gh.get_pr_failures = 1
+    with pytest.raises(GitHubUnavailableError):
+        eng2.step()
+    assert eng2.paths.state_file.read_bytes() == before
+    persisted = load_state(eng2.paths.state_file)
+    assert persisted.step_count == steps and persisted.phase == Phase.REPLAN_REEXECUTE
+    assert not persisted.block_reason
+    assert ReplanTransaction.from_dict(persisted.replan_transaction) == txn
+    assert gh.calls == [("get_pr", PR)]  # the one read that failed, and nothing else
+    assert gh.closed_prs == [] and gh.reopened_prs == [] and eng2.provider.calls == []
+
+    # The operator's `resume` once GitHub answers: the finishing step, counted once.
+    eng3 = _fresh_process(eng2, gh)
+    out = eng3.step()
+    persisted = load_state(eng3.paths.state_file)
+    assert persisted.step_count == steps + 1
+    assert eng3.provider.calls == [] and gh.closed_prs == []
+    if stage is ReplanStage.COMPENSATING:
+        assert out.next_phase == "BLOCKED"
+        assert "the close was undone" in persisted.block_reason
+        assert "max_total_steps" not in persisted.block_reason
+        assert len(gh.reopened_prs) == 1 and gh.prs[PR].state == "OPEN"
+        return
+    assert out.next_phase == "REVIEW", persisted.block_reason
+    assert persisted.current_pr_url == REPLACEMENT_PR and persisted.escalation_count == 1
+    assert gh.reopened_prs == [] and gh.prs[PR].state == "CLOSED"
+    # The budget ends the run at the phase boundary the finish reached.
+    out = _fresh_process(eng3, gh).step()
+    assert out.next_phase == "BLOCKED"
+    final = load_state(eng3.paths.state_file)
+    assert f"workflow.max_total_steps={steps}" in final.block_reason
+    assert final.step_count == steps + 1 and final.current_pr_url == REPLACEMENT_PR
+
+
 @pytest.mark.parametrize("stage", [ReplanStage.PREPARED, ReplanStage.VERIFIED])
 def test_the_budget_still_blocks_a_replan_before_the_write(tmp_state_dir, stage):
     """#71: PREPARED and VERIFIED keep blocking exactly as PENDING does.
