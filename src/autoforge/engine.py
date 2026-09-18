@@ -56,7 +56,12 @@ Loop bounds (``workflow:`` config, enforced from persisted state so
   (``stagnation_unchanged_count_rounds``) -> BLOCKED. Rounds of all-new
   findings are progress and only meet the cap.
 - ``max_total_steps``: the run's cumulative ``step_count`` (all issues, all
-  phases, across ``resume``) -> BLOCKED before another step executes.
+  phases, across ``resume``) -> BLOCKED before another step executes. One
+  exception: a REPLAN_REEXECUTE journal past the destructive write
+  (SUPERSEDE_INTENT, COMPENSATING, SUPERSEDED) is finished first -- the
+  step counts, no agent runs, nothing is closed -- so the source PR the
+  controller closed is never stranded unrecorded; the budget ends the run
+  at the next phase boundary (``replan_txn.budget_may_stop``, #71).
 Failed invocations never consume a round or a history entry.
 
 Safety rules:
@@ -164,9 +169,11 @@ from .providers import AgentExecutionResult, AgentRequest, ProviderRegistry
 from .redaction import redact, redact_argv, redact_dict
 from .replan import HistoricalReviewCollector, ReplanDecision, evaluate_replan_policy
 from .replan_txn import (
+    CLOSE_BEGUN_STAGES,
     Disposition,
     ReplanStage,
     ReplanTransaction,
+    budget_may_stop,
     find_non_open_claimant,
     has_close_receipt,
     new_transaction_id,
@@ -1120,7 +1127,9 @@ class ControllerEngine:
         command = self.providers.get(profile).build_command_for(profile, prompt)
         notes: list[str] = []
         budget = step_budget_reason(s.step_count, self.config.workflow.max_total_steps)
-        if budget:
+        if budget and not self._budget_may_stop(s.phase):
+            notes.append(self._replan_finishes_under_budget_note(budget))
+        elif budget:
             notes.append(f"would enter BLOCKED without executing: {budget}")
         if s.phase == Phase.ANALYZE_EXECUTE:
             notes.append("would first check for an existing open PR (recovery -> REVIEW)")
@@ -1509,9 +1518,10 @@ class ControllerEngine:
             # checked there, from the persisted value.
             return self._local_step_once(previous, plan)
         # Cumulative step budget: measured on persisted state, so `resume`
-        # continues the same budget. Checked before anything executes.
+        # continues the same budget. Checked before anything executes -- except
+        # that a replan journal past the write is finished first (#71).
         budget = step_budget_reason(state.step_count, self.config.workflow.max_total_steps)
-        if budget:
+        if budget and self._budget_may_stop(previous):
             return self._block(previous, plan, self._budget_block_reason(budget))
         if previous == Phase.REVIEW:
             # Review-round cap, whatever path led here (FIX, stale re-review,
@@ -2462,6 +2472,41 @@ class ControllerEngine:
             f"{reason}. This budget is cumulative for the run and is not reset by 'resume'; "
             "nothing was merged. Raise 'workflow.max_total_steps' in the config or start a "
             "new run."
+        )
+
+    def _budget_may_stop(self, phase: Phase) -> bool:
+        """Whether the exhausted step budget blocks ``phase`` before it executes.
+
+        Every phase but one: a REPLAN_REEXECUTE journal that has begun
+        closing the source PR is a persisted decision the controller
+        finishes (:func:`budget_may_stop`). Blocking it would leave the
+        source closed by the controller with nothing in the run's state
+        saying so, and ``resume`` refuses BLOCKED, so raising the budget
+        could not repair it. The reducer at those stages invokes no agent and
+        never closes; the budget ends the run at the next step instead.
+        """
+        if phase is not Phase.REPLAN_REEXECUTE:
+            return True
+        journal = self._require_state().replan_transaction
+        return budget_may_stop(ReplanTransaction.from_dict(journal))
+
+    def _replan_finishes_under_budget_note(self, budget: str) -> str:
+        """Dry-run note for a replan step that runs although the budget is reached."""
+        txn = ReplanTransaction.from_dict(self._require_state().replan_transaction)
+        if txn.stage in CLOSE_BEGUN_STAGES:
+            return (
+                f"step budget reached ({budget}), but the replan transaction has already begun "
+                f"closing the source PR {txn.source_pr_url}; would finish the transaction "
+                f"(stage {txn.stage.value}: re-read GitHub, confirm the close, then activate "
+                f"the replacement {txn.replacement_pr_url or '(none)'} or undo the close) "
+                "without invoking an agent and without closing anything; the step counts and "
+                "the budget ends the run at the next step"
+            )
+        return (
+            f"step budget reached ({budget}), but the replan transaction is "
+            f"{txn.stage.value}; would replay its refusal, which names the source PR "
+            f"{txn.source_pr_url or txn.decision_pr_url or '(unknown)'} and its fate, instead "
+            "of blocking with the plain budget text"
         )
 
     @staticmethod
@@ -3559,11 +3604,6 @@ class ControllerEngine:
 
     def _replan_block_text(self, txn: ReplanTransaction, reason: str) -> str:
         """BLOCKED text that always says what happened to the source PR."""
-        began_closing = (
-            ReplanStage.SUPERSEDE_INTENT,
-            ReplanStage.COMPENSATING,
-            ReplanStage.SUPERSEDED,
-        )
         if txn.journal_defects:
             # The journal could not be read in full, so it cannot say whether
             # the close it may have recorded was performed. Never claim that
@@ -3575,7 +3615,7 @@ class ControllerEngine:
                 "by it cannot be "
                 "determined from local state; check GitHub before repairing the journal"
             )
-        elif txn.stage in began_closing or txn.superseded_at:
+        elif txn.stage in CLOSE_BEGUN_STAGES or txn.superseded_at:
             tail = (
                 f"This transaction had already begun closing the source PR {txn.source_pr_url}, "
                 f"and the replacement {txn.replacement_pr_url or '(none)'} was not activated"
