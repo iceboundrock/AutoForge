@@ -1662,6 +1662,70 @@ def test_a_run_directory_refused_before_the_launch_is_not_charged_as_a_launch(
     assert launches == [1], "the first real launch is charged as the first"
 
 
+def _plant_step_shaped_file(run_dir: Path) -> Path:
+    planted = run_dir / "900-review-1"
+    planted.write_text("x")
+    return planted
+
+
+def _plant_step_past_the_bound(run_dir: Path) -> Path:
+    planted = run_dir / ("9" * 240 + "-review-1")
+    planted.mkdir()
+    return planted
+
+
+@pytest.mark.parametrize("phase", [Phase.ANALYZE_EXECUTE, Phase.FIX])
+@pytest.mark.parametrize(
+    "plant",
+    [_plant_step_shaped_file, _plant_step_past_the_bound],
+    ids=["a step-shaped regular file", "a step numbered past the bound"],
+)
+def test_a_planted_step_name_is_refused_before_the_launch_not_after_the_agent(
+    tmp_path, phase, plant
+):
+    """PR #91 review, fourth round, with #57: the step directory names are
+    the sequence's only input and a same-user agent can plant them. A
+    numeric prefix of a few hundred digits used to be believed as the
+    sequence, so the agent was launched and the step directory's ``mkdir``
+    failed on a name too long for the filesystem after it had returned,
+    with its work done and unlogged. A name of a step's exact shape that is
+    not what the controller publishes is now a corrupt run log at the
+    logger open: refused before the launch, charging nothing, and the
+    repaired run launches for the first time."""
+    root = local_repo(tmp_path)
+    eng = make_local_engine(root, "features/add-filter.md")
+    _run_to(eng, root, phase)
+    run_dir = Path(eng.paths.logs_dir) / eng.state.run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    before = sorted(p.name for p in run_dir.iterdir())
+    planted = plant(run_dir)
+    eng.provider._handler = lambda req: pytest.fail("no agent may be launched")
+
+    for _ in range(3):
+        with pytest.raises(StateError, match="corrupted run log directory"):
+            eng.step()
+        persisted = load_state(eng.paths.state_file)
+        assert persisted.phase is phase
+        assert persisted.local_pending_phase == ""
+        assert persisted.local_pending_attempts == 0
+    assert sorted(p.name for p in run_dir.iterdir()) == sorted([*before, planted.name])
+
+    planted.rmdir() if planted.is_dir() else planted.unlink()
+    launches: list[int] = []
+
+    def implements(req):
+        launches.append(load_state(eng.paths.state_file).local_pending_attempts)
+        touch_impl(root, "repaired\n")
+        return impl_result() if phase is Phase.ANALYZE_EXECUTE else fix_result(["R1-F1"])
+
+    eng.provider._handler = implements
+    assert eng.step().next_phase == "REVIEW"
+    assert launches == [1], "the first real launch is charged as the first"
+    # The step the agent's work was recorded under is the run's own next one.
+    steps = sorted(p.name for p in run_dir.iterdir() if p.is_dir())
+    assert steps[-1].startswith(f"{len(steps):03d}-")
+
+
 @pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses file permissions")
 @pytest.mark.parametrize("phase", [Phase.ANALYZE_EXECUTE, Phase.FIX])
 def test_a_run_directory_that_cannot_be_published_into_is_refused_before_the_launch(

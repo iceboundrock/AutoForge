@@ -277,6 +277,59 @@ def test_an_append_follows_its_inode_when_the_name_is_moved_after_the_inspection
     assert [e.name for e in root_dir.iterdir()] == [], "a temporary or a replacement appeared"
 
 
+@pytest.mark.parametrize("operation", ["append_text", "verify_appendable"])
+def test_an_append_refuses_an_inode_unlinked_before_the_inspection(
+    tmp_path, monkeypatch, operation
+):
+    """PR #91 review, fourth round: the inspection must find exactly one name.
+
+    The stated limit of the append opens *after* the inspection, when the
+    same-user process moves the inspected inode. Before it there is no
+    limit: a name unlinked between the ``open`` and the ``fstat`` leaves a
+    descriptor on an inode with ``st_nlink == 0``, and a write through it
+    would go into a file nothing names and report success, with no journal
+    left under the root to show for it. The race is made deterministic by
+    unlinking the name inside the open call, before the real inspection.
+
+    What must hold: the write is refused on the descriptor, the bytes reach
+    no inode at all (the unlinked one included), the sentinel is untouched
+    and nothing is created under the root. ``verify_appendable`` opens the
+    same way and refuses the same way, so the refusal can land before an
+    agent is launched.
+    """
+    import autoforge.safefs as safefs
+
+    sentinel = Sentinel(tmp_path)
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    journal = root_dir / "events.jsonl"
+    journal.write_text("old\n", encoding="utf-8")
+    keep = os.open(journal, os.O_RDONLY)  # the unlinked inode, for inspection afterwards
+    real_open = os.open
+
+    def open_then_unlink_the_name(name, flags, *args, **kwargs):
+        fd = real_open(name, flags, *args, **kwargs)
+        if name == "events.jsonl":
+            os.unlink(name, dir_fd=kwargs["dir_fd"])
+        return fd
+
+    monkeypatch.setattr(safefs.os, "open", open_then_unlink_the_name)
+
+    try:
+        with SafeRoot.open(root_dir) as root:
+            with pytest.raises(UnsafePathError, match="no directory entry names"):
+                if operation == "append_text":
+                    root.append_text("events.jsonl", "controller\n")
+                else:
+                    root.verify_appendable("events.jsonl")
+        sentinel.assert_untouched()
+        assert os.fstat(keep).st_size == len("old\n"), "the unlinked inode received the line"
+        assert os.fstat(keep).st_nlink == 0
+    finally:
+        os.close(keep)
+    assert [e.name for e in root_dir.iterdir()] == [], "a journal or a temporary was created"
+
+
 def test_a_temporary_hard_linked_out_during_the_write_is_never_published(tmp_path, monkeypatch):
     """R10-F2: the create-then-write window on the *named* temporary.
 

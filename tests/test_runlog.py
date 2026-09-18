@@ -81,6 +81,125 @@ def test_a_step_directory_published_without_its_journal_line_is_never_reused(tmp
     assert (log.run_dir / "003-review-1" / "stdout.log").read_text(encoding="utf-8") == "dead"
 
 
+# -- PR #91 review, fourth round: the names are untrusted input ----------------
+HUGE = "9" * 240  # a numeric prefix the filesystem accepts and `int` believes
+
+
+def test_only_an_entry_shaped_like_a_step_directory_counts_toward_the_sequence(tmp_path):
+    """The step directory names are the sequence's only input, and the run
+    directory is where a same-user agent writes too. An entry that merely
+    starts with digits used to be parsed for a number, so a planted
+    ``999...9-p`` (a regular file was enough) became the sequence and the
+    next step's path was too long for the filesystem, after the agent had
+    returned. Only the exact shape ``<seq>-<phase>-<attempt>`` is a step;
+    everything else -- the journal, the probe, a moved-aside copy, a name
+    that starts with digits -- is skipped without being parsed."""
+    run_dir = tmp_path / "logs" / "run-1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "002-review-1").mkdir()
+    (run_dir / f"{HUGE}-p").write_text("planted", encoding="utf-8")
+    (run_dir / "12-notes.txt").mkdir()
+    (run_dir / "events.jsonl.1").write_text('{"seq": 90}\n', encoding="utf-8")
+    (run_dir / ".af-probe-dead").write_text("", encoding="utf-8")
+    before = sorted(p.name for p in run_dir.iterdir())
+
+    log = RunLogger(tmp_path / "logs", "run-1")
+    step = log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="FIX"), stdout="work")
+    assert step.name == "003-fix-1"
+    assert (step / "stdout.log").read_text(encoding="utf-8") == "work"
+    assert sorted(p.name for p in run_dir.iterdir()) == sorted(
+        [*before, "003-fix-1", "events.jsonl"]
+    )
+    assert (run_dir / f"{HUGE}-p").read_text(encoding="utf-8") == "planted"
+
+
+@pytest.mark.parametrize("kind", ["regular file", "symbolic link", "FIFO"])
+def test_a_step_shaped_entry_that_is_not_a_directory_is_refused_before_the_launch(tmp_path, kind):
+    """A name of exactly a step's shape that is not a directory is not one
+    the controller published, and it cannot be skipped either: the next
+    ``mkdir`` of that name would collide with it after the agent had
+    returned. It is refused as a corrupt run log at the logger open, with
+    the manual step, and the sequence resumes once it is moved aside."""
+    run_dir = tmp_path / "logs" / "run-1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "002-review-1").mkdir()
+    planted = run_dir / "003-fix-1"
+    if kind == "regular file":
+        planted.write_text("x", encoding="utf-8")
+    elif kind == "symbolic link":
+        planted.symlink_to("002-review-1")
+    else:
+        os.mkfifo(planted)
+
+    with pytest.raises(StateError, match="corrupted run log directory") as exc:
+        RunLogger(tmp_path / "logs", "run-1")
+    assert f"003-fix-1 is named like a step directory but is a {kind}" in str(exc.value)
+    assert "move the entries AutoForge did not create out of logs/run-1/" in str(exc.value)
+    assert sorted(p.name for p in run_dir.iterdir()) == ["002-review-1", "003-fix-1"]
+
+    planted.unlink()
+    log = RunLogger(tmp_path / "logs", "run-1")
+    assert log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="FIX")).name == (
+        "003-fix-1"
+    )
+
+
+def test_a_step_numbered_past_what_a_run_can_make_is_refused_before_the_launch(
+    tmp_path, monkeypatch
+):
+    """The number in a step-shaped name decides the width of the next step's
+    path, so it is bounded before it is believed: a step past
+    ``MAX_STEP_SEQ`` (more invocations than a run can make) is a corrupt
+    run log, refused at the open with the manual step. Like the listing
+    budget, the bound is on what is believed, not on what is published: a
+    logger opened at the bound still records its step, and the next open
+    refuses the result."""
+    import autoforge.runlog as runlog
+
+    run_dir = tmp_path / "logs" / "run-1"
+    run_dir.mkdir(parents=True)
+    # The real bound, against a name the filesystem accepts.
+    (run_dir / f"{HUGE}-review-1").mkdir()
+    with pytest.raises(StateError, match="corrupted run log directory") as exc:
+        RunLogger(tmp_path / "logs", "run-1")
+    assert f"{HUGE}-review-1 numbers a step past {runlog.MAX_STEP_SEQ}" in str(exc.value)
+    assert "move the entries AutoForge did not create out of logs/run-1/" in str(exc.value)
+    (run_dir / f"{HUGE}-review-1").rmdir()
+
+    # The edge, with the bound lowered so the numbers stay readable.
+    monkeypatch.setattr(runlog, "MAX_STEP_SEQ", 8)
+    (run_dir / "009-review-1").mkdir()
+    with pytest.raises(StateError, match="009-review-1 numbers a step past 8"):
+        RunLogger(tmp_path / "logs", "run-1")
+    (run_dir / "009-review-1").rmdir()
+    (run_dir / "008-review-1").mkdir()
+    log = RunLogger(tmp_path / "logs", "run-1")
+    assert log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="FIX")).name == (
+        "009-fix-1"
+    )
+    with pytest.raises(StateError, match="009-fix-1 numbers a step past 8"):
+        RunLogger(tmp_path / "logs", "run-1")
+
+
+def test_every_step_name_the_logger_publishes_is_one_it_recovers(tmp_path):
+    """The shape the recovery accepts (``STEP_DIR_RE``) and the shape the
+    logger publishes (``_step_name``) are two places that must agree, or a
+    real step would be skipped and its number reused. Every phase the
+    controller has, and the sanitised forms of names it does not, round-trip
+    through a reopen."""
+    from autoforge.runlog import STEP_DIR_RE
+    from autoforge.transitions import Phase
+
+    phases = [phase.value for phase in Phase] + ["Weird Phase!", "", "trailing-"]
+    log = RunLogger(tmp_path / "logs", "run-1")
+    for attempt, phase in enumerate(phases, start=1):
+        step = log.log_execution(
+            ExecutionRecord(run_id="run-1", seq=0, phase=phase, attempt=attempt)
+        )
+        assert STEP_DIR_RE.match(step.name), step.name
+    assert RunLogger(tmp_path / "logs", "run-1")._seq == len(phases)
+
+
 def _counted_reads(monkeypatch) -> list[int]:
     """Record every ``read(n)`` the bounded reader asks a file object for."""
     import autoforge.safefs as safefs

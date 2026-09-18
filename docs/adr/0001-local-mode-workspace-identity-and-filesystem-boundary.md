@@ -19,7 +19,11 @@
   §8.10 (the append's guarantee is the inode, not the name: a journal moved
   out from under its name after the inspection receives the line, stated
   as the limit), §5.5 (the pre-launch gate probes the run directory, PR #91
-  review, third round)
+  review, third round), §5.4 and §8.10 (a write open requires exactly one
+  name, so an inode unlinked before the inspection is refused rather than
+  written into), §5.5 (only a name of the step directory's exact shape,
+  a directory numbered within `MAX_STEP_SEQ`, is a sequence record; PR #91
+  review, fourth round)
 - **Closes by design:** #46, #47, #48, #49, #50; #45 (see *Compatibility*)
 
 ## 1. Problem
@@ -436,8 +440,13 @@ contract rather than accident:
 
 The one artifact that must be opened in place is the append-only
 `events.jsonl`; there the open is `O_NOFOLLOW|O_NONBLOCK|O_NOCTTY|O_APPEND`
-and `st_nlink > 1` is refused on the descriptor (round 6 had replaced the
-in-place append with a read-then-rewrite; #51 restored it, see §5.5). What
+and a link count other than one is refused on the descriptor: more than one
+is a hard link, and none is an inode whose name was unlinked between the
+open and the inspection, which a write would reach and report success on
+while no journal remained under the root (PR #91 review, fourth round; every
+write open in the module holds to `st_nlink == 1`, as `locking` always has).
+Round 6 had replaced the in-place append with a read-then-rewrite; #51
+restored it, see §5.5. What
 that inspection guarantees is the *inode*: the bytes land in the inode the
 descriptor already holds, which had exactly one name, under the root, when
 it was inspected, so the append can never extend a foreign file through a
@@ -450,13 +459,17 @@ the bytes land (§8.10): a same-user process can, after the inspection,
 `link(2)` the journal's inode to a name outside the root and unlink this
 one, or `rename(2)` it there, and the line is then written into the
 controller's own journal at its new name, with nothing published afterwards
-that a re-inspection could withhold, so the append reports success. That is
-a move of the controller's bytes by a process that could already read and
-copy every one of them, not a write into anything that process planted; no
-re-inspection closes it, because the move can follow any check, and a
-rename involves no link count at all. It is stated as the limit and pinned
-by a test (`test_an_append_follows_its_inode_when_the_name_is_moved_after_the_inspection`),
-as §2.3 states the root's. The temporary gets the same
+that a re-inspection could withhold, so the append reports success; or it
+can unlink the name outright, and the line is then written into an inode
+nothing names and lost with it, the append again reporting success. That is
+a move or a deletion of the controller's bytes by a process that could
+already read, copy or delete every one of them, not a write into anything
+that process planted; no re-inspection closes it, because the move can
+follow any check, and a rename involves no link count at all. It is stated
+as the limit and pinned by tests
+(`test_an_append_follows_its_inode_when_the_name_is_moved_after_the_inspection`
+for the move, `test_an_append_refuses_an_inode_unlinked_before_the_inspection`
+for where the window begins), as §2.3 states the root's. The temporary gets the same
 inspection on the same descriptor once its bytes are durable and before it
 is published (R10-F2, §8.10): the `O_EXCL` create proves the inode is the
 controller's, but the inode has a *name* for the length of the write, and a
@@ -508,7 +521,20 @@ appended, so the highest directory number is never below the highest `seq`
 in the journal; the directory names are also what a crash between the two
 writes leaves behind, which is why they were the crash guard already. What
 the journal holds is therefore never parsed, and no record bound is
-needed. Two earlier states of this paragraph are superseded: R11-F2 read
+needed. The names are the sequence's only input, and they are untrusted
+(PR #91 review, fourth round): a numeric prefix of a few hundred digits on
+any entry, a regular file included, used to be believed as the sequence,
+so the agent was launched and the next step's `mkdir` failed on a name too
+long for the filesystem after it had returned. Only an entry of exactly the
+shape the controller publishes (`STEP_DIR_RE`, `<seq>-<phase>-<attempt>`)
+is a sequence record, and one of that shape must be a directory numbered
+at most `MAX_STEP_SEQ` (`MAX_RUN_LOG_ENTRIES`, since a step number is at
+most the run's invocation count) or the run log is refused as corrupt at
+the logger open, before the launch, with the move-aside step; a
+step-shaped file cannot merely be skipped, because the next step's `mkdir`
+would collide with it. Every other name (the journal, the probe, a
+moved-aside copy) is skipped without being parsed. Two earlier states of
+this paragraph are superseded: R11-F2 read
 the journal, bounded (`read_bytes(limit=MAX_EVENT_JOURNAL_BYTES)`, plus a
 record bound counted on the bytes), for the highest `seq` it held; round 6
 had made `append_text` read-existing + publish-fresh-inode, so that every
@@ -951,7 +977,13 @@ an independent `os.walk` finds nothing the snapshot did not mention.
     and unlink the root name, or simply `rename(2)` it, which no link
     count sees -- and the line is then written into the controller's own
     journal at its new name and the append reports success, since nothing
-    is published afterwards that a re-inspection could withhold. The
+    is published afterwards that a re-inspection could withhold; or unlink
+    it outright, and the line is written into an inode nothing names and
+    lost with it. The window opens *after* the inspection, never before
+    it: an inode already unlinked when it is inspected (`st_nlink == 0`)
+    is refused like a hard link, so a name dropped between the open and
+    the `fstat` is a refusal, not a line written into nothing (PR #91
+    review, fourth round). The
     guarantee that holds is the inode-level one of §2.2: the controller
     never extends a foreign inode, and a foreign inode reaches the
     journal's name with one link only by being renamed there, at which

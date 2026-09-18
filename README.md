@@ -513,12 +513,19 @@ under the log directory, never in a foreign file reached through a planted
 name. It does not guarantee the name: a same-user agent can move the
 journal's inode out of the log directory (link it elsewhere and unlink it,
 or rename it) between the inspection and the write, and the line then lands
-in the controller's own journal at its new name; that agent could already
-read and copy every byte of the journal, so this is stated as the limit
-(ADR 0001 §8.10) rather than guarded. The controller never reads the journal:
+in the controller's own journal at its new name, or unlink it outright and
+the line is lost with the file; that agent could already read, copy and
+delete every byte of the journal, so this is stated as the limit
+(ADR 0001 §8.10) rather than guarded. The inspection itself refuses an inode
+that is already unlinked when it looks, so the window opens only after it.
+The controller never reads the journal:
 the step sequence is recovered from the step directory names, and each line
 is appended in place, so the cost of logging an invocation is the line
-rather than the journal. What the journal is checked for is its size, on
+rather than the journal. Those names are untrusted too: only an entry of
+exactly the shape the controller publishes counts, and one of that shape
+that is not a directory, or numbers a step past what a run can make, is
+refused as a corrupt run log before the launch rather than turned into the
+next step's path. What the journal is checked for is its size, on
 the opened descriptor, before the agent is launched and again at the append
 after it returns; the run's log directory is probed for a new entry before
 the launch as well, and listed under a budget of its

@@ -29,8 +29,10 @@ to the target one component at a time with ``O_DIRECTORY | O_NOFOLLOW`` and
 * the final open adds ``O_NOFOLLOW`` (a link fails the open), ``O_NONBLOCK``
   and ``O_NOCTTY`` (a FIFO or a device cannot stall or steal a terminal), and
   an ``fstat`` on the descriptor rejects every non-regular kind;
-* a write open requires ``st_nlink == 1``, because a hard link is a second
-  name for an ordinary file and passes every other test;
+* a write open requires ``st_nlink == 1``: more is a hard link, a second
+  name for an ordinary file that passes every other test, and none is an
+  inode unlinked between the open and the inspection (or a filesystem that
+  reports no link count), which a write would reach and report success;
 * ``O_TRUNC`` is never handed to ``os.open`` -- the kernel applies it during
   the open, which is before the descriptor can be inspected -- so a file is
   opened intact, validated, and only then truncated through ``ftruncate`` on
@@ -88,13 +90,18 @@ inspection and the ``write(2)`` it can give the journal's inode a second
 name outside the root and drop this one, or rename it there outright, and
 the line then lands in that inode under its new name, with nothing
 published afterwards that a re-inspection could withhold, so the append
-reports success while the journal's name under the root is gone.  That is
-the controller's *own* journal moved by a process that could already read
-and copy every byte of it; it is not a write into a foreign file, because
-a foreign inode reaches the journal's name with one link only by being
-renamed there, at which point it is the journal.  No re-inspection closes
-the window, since the move can follow any check, so it is stated as the
-limit and pinned by a test rather than checked for.  Linux could close
+reports success while the journal's name under the root is gone; or it
+can unlink the name outright, and the line is then written into an inode
+nothing names and lost with it, the append again reporting success.  That
+is the controller's *own* journal moved or dropped by a process that could
+already read, copy or delete every byte of it; it is not a write into a
+foreign file, because a foreign inode reaches the journal's name with one
+link only by being renamed there, at which point it is the journal.  No
+re-inspection closes the window, since the move can follow any check, so
+it is stated as the limit and pinned by a test rather than checked for;
+the inspection itself does refuse an inode that is *already* unlinked
+when it looks (``st_nlink == 0``), so the window opens after the
+inspection, never before it.  Linux could close
 even the observation window with an unnamed ``O_TMPFILE`` inode for the
 temporary; that is not done because it does not exist on macOS and would
 make the guarantee platform-shaped, and it would not help the append,
@@ -299,16 +306,27 @@ def open_regular_at(
         kind = entry_kind(st.st_mode)
         if kind is not None:
             raise _unsafe(label, f"a {kind}, not a regular file")
-        # st_nlink is 0 where a platform does not report link counts; only a
-        # count that positively proves a second name is a refusal.
-        # The wording is mode-neutral: a truncating open would replace the
-        # shared inode's contents, an appending one would extend them, and
-        # either way the change shows at the other name.
+        # A write open requires exactly one name. More than one is a hard
+        # link, and the wording is mode-neutral: a truncating open would
+        # replace the shared inode's contents, an appending one would extend
+        # them, and either way the change shows at the other name. None at
+        # all means the name was unlinked between the open and this
+        # inspection (the descriptor still holds the inode, so a write would
+        # go into a file nothing names and report success), or that the
+        # filesystem reports no link count, in which case a second name can
+        # never be ruled out; both are refused rather than written to.
         if writing and st.st_nlink > 1:
             raise _unsafe(
                 label,
                 f"a hard link: {st.st_nlink} directory entries name this file, so writing "
                 "here would alter a file AutoForge did not create",
+            )
+        if writing and st.st_nlink < 1:
+            raise _unsafe(
+                label,
+                "a file no directory entry names: it was unlinked after it was opened, or "
+                "this filesystem reports no link count, so a write here could not be "
+                "proved to reach a single-named file",
             )
         if truncate:
             os.ftruncate(fd, 0)
@@ -683,10 +701,16 @@ class SafeRoot:
         afterwards that a re-inspection could withhold. That moves the
         controller's own journal, whose every byte that process could
         already read and copy, and it is the same window the named
-        temporary has (module docstring, "Not guaranteed"). A post-write
-        re-inspection would not close it, since the move can follow any
-        check, so the limit is stated and pinned by a test rather than
-        checked for.
+        temporary has (module docstring, "Not guaranteed"). The same process
+        can instead unlink the name outright after the inspection, and the
+        line is then written into an inode nothing names and is lost with
+        it, the append again reporting success. A post-write re-inspection
+        would not close either, since the move can follow any check, so the
+        limit is stated and pinned by a test rather than checked for. What
+        *is* checked is the inspection itself: an inode already unlinked
+        when it is inspected (``st_nlink == 0``) is refused, so a name
+        dropped between the open and the ``fstat`` is a refusal, not a
+        line written into nothing.
 
         With a ``limit`` a file that is already larger than it is refused
         with :class:`ReadLimitExceeded` before anything is written; nothing

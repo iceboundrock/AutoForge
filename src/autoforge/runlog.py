@@ -22,7 +22,13 @@ The step sequence is recovered from the step directory names, not from the
 journal: a step directory is published (and fsynced) before its journal line
 is appended, so the highest directory number is never below the highest
 ``seq`` in the journal, and listing the run's own directory is bounded
-(``MAX_RUN_LOG_ENTRIES``) while the journal is not. The journal is
+(``MAX_RUN_LOG_ENTRIES``) while the journal is not. Those names are the
+one input the sequence has, and the run directory is where the agents
+write too, so only an entry of exactly the shape the controller publishes
+(``STEP_DIR_RE``) counts: an entry named like a step that is not a
+directory, or that numbers a step past ``MAX_STEP_SEQ``, is refused as a
+corrupt run log when the logger is opened, before any agent is launched,
+rather than believed and turned into the next step's path. The journal is
 write-only for the controller -- appended to in place through a descriptor
 that has been proved a single-named regular file, and refused on its size
 (``MAX_EVENT_JOURNAL_BYTES``) without being read -- so the cost of recording
@@ -45,7 +51,13 @@ from pathlib import Path
 
 from .errors import StateError
 from .redaction import redact, redact_argv, redact_dict
-from .safefs import ReadLimitExceeded, SafeRoot, UnreadableEntryError, WalkBudgetExceeded
+from .safefs import (
+    ReadLimitExceeded,
+    SafeRoot,
+    UnreadableEntryError,
+    WalkBudgetExceeded,
+    entry_kind,
+)
 
 # A run identifier is a *file name*: it names the directory this run's logs
 # live in.  `generate_run_id` produces "af-<UTC stamp>-<hex>", but the value
@@ -84,6 +96,26 @@ MAX_EVENT_JOURNAL_BYTES = 64 * 1024 * 1024
 # directory may come to hold: a logger opened at the budget still publishes
 # its step directory, and the next open refuses.
 MAX_RUN_LOG_ENTRIES = 200_000
+# The highest step number the controller will believe from a directory
+# name. A step number is assigned once per invocation and one directory is
+# published for each, so the number of a run's newest step is at most the
+# number of invocations the run has made, and ``MAX_RUN_LOG_ENTRIES`` is
+# already the statement of how many of those a run can have. A name
+# numbering a step past it was not published by this controller, and the
+# number would decide the width of the next step's path (``_step_name``):
+# a same-user agent that plants a name with a few hundred digits must be
+# refused at the logger open, not believed and turned into a name the
+# filesystem rejects after the agent has returned (PR #91 review, fourth
+# round). Like the listing budget it bounds what is believed, not what is
+# published: a logger opened at the bound still records its step, and the
+# next open refuses the result.
+MAX_STEP_SEQ = MAX_RUN_LOG_ENTRIES
+# The exact shape of a step directory name, as ``RunLogger._step_name``
+# publishes it: the zero-padded step number, the lower-cased phase and the
+# attempt. Only an entry of this shape is a sequence record; the journal,
+# the pre-launch probe, and whatever an operator moved aside are not, and
+# are ignored rather than parsed for a number.
+STEP_DIR_RE = re.compile(r"^(\d+)-[a-z0-9._-]+-\d+$")
 
 
 def validate_run_id(run_id: str) -> str:
@@ -309,6 +341,18 @@ class RunLogger:
         journal, and they are what a crash between the two leaves behind;
         reading the journal as well would only add a cost that grows with
         the run (#51).
+
+        The names are untrusted: the agents write under the same user. An
+        entry counts only if it has exactly the shape :meth:`_step_name`
+        publishes (``STEP_DIR_RE``), and an entry of that shape must then
+        be what the controller would have published, a directory numbered
+        at most ``MAX_STEP_SEQ``, or the run log is refused as corrupt
+        here, before the launch, with the manual step (move the entry
+        aside). Believing the number would build the next step's path
+        from it; ignoring a step-shaped file would let the next step's
+        ``mkdir`` collide with it after the agent had returned. Any other
+        name (the journal, the probe, an operator's moved-aside copy) is
+        not a step and is skipped without being parsed.
         """
         # Only the run's own directory and its immediate children matter, so
         # the walk starts *at* the run directory (a sub-root, so sibling runs
@@ -323,9 +367,23 @@ class RunLogger:
             try:
                 for entry in run.walk(max_entries=MAX_RUN_LOG_ENTRIES):
                     entry.skip = True
-                    match = re.match(r"^(\d+)-", entry.name)
-                    if match:
-                        highest = max(highest, int(match.group(1)))
+                    match = STEP_DIR_RE.match(entry.name)
+                    if match is None:
+                        continue
+                    if not entry.is_dir:
+                        kind = entry_kind(entry.st.st_mode) or "regular file"
+                        raise self._refuse_run_dir(
+                            f"{entry.name} is named like a step directory but is a {kind}"
+                        )
+                    # A name is at most NAME_MAX bytes, so the conversion
+                    # is bounded by the filesystem before it is bounded here.
+                    seq = int(match.group(1))
+                    if seq > MAX_STEP_SEQ:
+                        raise self._refuse_run_dir(
+                            f"{entry.name} numbers a step past {MAX_STEP_SEQ}, which is more "
+                            "invocations than a run can make"
+                        )
+                    highest = max(highest, seq)
             except WalkBudgetExceeded:
                 raise self._refuse_run_dir(
                     f"more than {MAX_RUN_LOG_ENTRIES} entries, which no controller run "
