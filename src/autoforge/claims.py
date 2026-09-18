@@ -57,6 +57,10 @@ from .result_parser import FINDING_ID_RE, MAX_FINDING_ID_CHARS, MAX_URL_CHARS
 from .validation import GitHubIssueRef, GitHubPullRequestRef, parse_issue_url, parse_pr_url
 
 _FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+# A git refname component is at most 255 bytes and a branch name a few of
+# them; the bound only keeps an oversized marker value out of a block reason.
+MAX_BASE_REF_CHARS = 512
+_BASE_REF_FORBIDDEN_RE = re.compile(r"[\s\x00-\x1f\x7f]")
 
 
 class Marked(Protocol):
@@ -94,16 +98,30 @@ class ImplementationClaim:
 
 @dataclass(frozen=True)
 class ReviewClaim:
-    """``ai-review-result``: a review comment names its round and reviewed HEAD."""
+    """``ai-review-result``: a review comment names the revision its round decided on.
+
+    The revision is the PR diff: the reviewed HEAD against the base branch
+    the PR targeted when the round was bound. Both are part of the key, so
+    a comment posted while the PR targeted another base is not this
+    round's, exactly as one posted at another HEAD is not, and is never
+    adopted by a later entry as a review of the base the PR targets now.
+
+    ``reviewed_base_ref`` is ``None`` for a marker written before the base
+    was part of the schema. Such a comment reviewed a base nobody recorded,
+    so it matches no bound key and is never adopted; it is not a defect
+    either, because a mid-flight PR carries one from every earlier round
+    and a defect anywhere would block every later entry on that PR.
+    """
 
     round: int
     reviewed_head_sha: str  # lowercased
     needs_fix_round: bool
     finding_ids: tuple[str, ...] | None = None
+    reviewed_base_ref: str | None = None
 
     @property
     def key(self) -> Hashable:
-        return (self.round, self.reviewed_head_sha)
+        return (self.round, self.reviewed_head_sha, self.reviewed_base_ref)
 
 
 @dataclass(frozen=True)
@@ -178,6 +196,28 @@ def _pr_ref(payload: dict, key: str) -> GitHubPullRequestRef:
         raise ValueError(f"{key} is not a GitHub pull request URL ({exc})") from exc
 
 
+def _base_ref(value: object) -> str:
+    """The base branch a review marker names, as GitHub reports it.
+
+    Compared for equality with the ``baseRefName`` the controller bound
+    right before the round, never interpreted, so the only shape rule is
+    the one git imposes on every refname (non-empty, no whitespace, no
+    control character) plus a bound before the value can be quoted.
+    """
+    if not isinstance(value, str):
+        raise ValueError("reviewed_base_ref must be a branch name string")
+    if not value or len(value) > MAX_BASE_REF_CHARS:
+        raise ValueError(
+            f"reviewed_base_ref is {len(value)} characters; a branch name is 1 to "
+            f"{MAX_BASE_REF_CHARS}"
+        )
+    if _BASE_REF_FORBIDDEN_RE.search(value):
+        raise ValueError(
+            f"reviewed_base_ref {value!r} is not a branch name (whitespace or control character)"
+        )
+    return value
+
+
 def _finding_id(value: object, what: str, round_: int | None = None) -> str:
     """The finding id rule of ``result_parser``, applied to marker data.
 
@@ -203,7 +243,11 @@ def _decode_implementation(payload: dict) -> ImplementationClaim:
 
 
 def _decode_review(payload: dict) -> ReviewClaim:
-    _exact_keys(payload, ("round", "reviewed_head_sha", "needs_fix_round"), ("finding_ids",))
+    _exact_keys(
+        payload,
+        ("round", "reviewed_head_sha", "needs_fix_round"),
+        ("finding_ids", "reviewed_base_ref"),
+    )
     round_ = payload["round"]
     if not isinstance(round_, int) or isinstance(round_, bool) or round_ < 1:
         raise ValueError(f"round must be a JSON integer >= 1, got {round_!r}")
@@ -222,11 +266,15 @@ def _decode_review(payload: dict) -> ReviewClaim:
         if len(set(ids)) != len(ids):
             raise ValueError("finding_ids repeats an id")
         finding_ids = tuple(ids)
+    base_ref: str | None = None
+    if "reviewed_base_ref" in payload:
+        base_ref = _base_ref(payload["reviewed_base_ref"])
     return ReviewClaim(
         round=round_,
         reviewed_head_sha=sha.lower(),
         needs_fix_round=needs_fix,
         finding_ids=finding_ids,
+        reviewed_base_ref=base_ref,
     )
 
 
@@ -455,6 +503,7 @@ def collect(kind: MarkerKind[C], objects: Iterable[O], noun: str) -> Collection[
 __all__ = [
     "FOLLOW_UP",
     "IMPLEMENTATION",
+    "MAX_BASE_REF_CHARS",
     "PROGRESS",
     "REVIEW",
     "Claimants",

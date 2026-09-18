@@ -688,10 +688,10 @@ def test_review_entry_hands_an_existing_round_comment_to_the_reviewer(tmp_state_
     assert eng.step().next_phase == "READY_FOR_MERGE"
     prompt = eng.provider.calls[0].prompt
     assert (
-        f"Comment already posted for THIS round at THIS HEAD (if any):\n  {comment_url(PR, 100)}"
-        in prompt
+        "Comment already posted for THIS round at THIS HEAD against THIS base (if\n  any): "
+        f"{comment_url(PR, 100)}" in prompt
     )
-    assert "THIS HEAD (if any):\n  (none)" not in prompt
+    assert "THIS HEAD against THIS base (if\n  any): (none)" not in prompt
     assert len(gh.comments[PR]) == 1
 
 
@@ -708,7 +708,10 @@ def test_review_entry_ignores_a_comment_for_the_round_at_another_head(tmp_state_
     eng = _in_review(tmp_state_dir, gh, reviews)
     assert eng.step().next_phase == "READY_FOR_MERGE"
     prompt = eng.provider.calls[0].prompt
-    assert "Comment already posted for THIS round at THIS HEAD (if any):\n  (none)" in prompt
+    assert (
+        "Comment already posted for THIS round at THIS HEAD against THIS base (if\n  any): (none)"
+        in prompt
+    )
     assert comment_url(PR, 90) not in prompt
 
 
@@ -1498,7 +1501,7 @@ def test_correction_after_the_review_comment_was_posted_adopts_it(tmp_state_dir)
         if not req.correction:
             gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
             return "junk\n"
-        assert f"THIS HEAD (if any):\n  {comment_url(PR, 100)}" in req.prompt
+        assert f"THIS HEAD against THIS base (if\n  any): {comment_url(PR, 100)}" in req.prompt
         return block(review_payload(1, SHA_A, []))
 
     eng = _in_review(tmp_state_dir, gh, reviews)
@@ -4887,7 +4890,7 @@ def test_review_after_a_retarget_rebinds_the_base_and_then_merges(tmp_state_dir,
     fake_github.workflow_runs[BASE_RUN_ID] = replace(
         fake_github.workflow_runs[BASE_RUN_ID], head_branch="release/1.x"
     )
-    fake_github.add_comment(PR, 100, review_comment_body(3, SHA_A, False))
+    fake_github.add_comment(PR, 100, review_comment_body(3, SHA_A, False, base_ref="release/1.x"))
     eng = _in_merge(tmp_state_dir, fake_github, [block(review_payload(3, SHA_A, []))])
     assert eng.step(allow_merge=True).next_phase == "REVIEW"
     assert eng.step(allow_merge=True).next_phase == "READY_FOR_MERGE"
@@ -5017,6 +5020,74 @@ def test_review_base_changed_during_the_review_is_stale(tmp_state_dir):
     assert s.reviewed_base_ref == "main" and s.current_base_ref == "release/1.x"
     assert s.reviewed_pr_url == PR and s.open_findings == []
     assert [r["result"] for r in s.review_history] == ["stale"]
+
+
+def test_review_reentry_after_a_retarget_does_not_adopt_the_old_base_comment(tmp_state_dir):
+    """PR #93 review (High): round 1 was posted while the PR targeted main
+    and the result was lost; the PR was then retargeted at the same HEAD.
+    The re-entry binds the new base and must not hand the old comment to the
+    reviewer as this round's: it reviewed the diff against main, and adopting
+    it would record release/1.x as reviewed by a review it never had."""
+    gh = FakeGitHub()
+    gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False, base_ref="main"))
+    prompts = []
+
+    def reviews(req):
+        prompts.append(req.prompt)
+        gh.add_comment(PR, 101, review_comment_body(1, SHA_A, False, base_ref="release/1.x"))
+        return block(review_payload(1, SHA_A, [], cid=101))
+
+    eng = _in_review(tmp_state_dir, gh, reviews)
+    gh.prs[PR].base_ref = "release/1.x"
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    assert "THIS HEAD against THIS base (if\n  any): (none)" in prompts[0]
+    assert comment_url(PR, 100) not in prompts[0]
+    assert "Reviewed base branch (bound by the controller): `release/1.x`" in prompts[0]
+    assert '"reviewed_base_ref": "release/1.x"' in prompts[0]
+    s = load_state(eng.paths.state_file)
+    assert (s.reviewed_pr_url, s.reviewed_head_sha, s.reviewed_base_ref) == (
+        PR,
+        SHA_A,
+        "release/1.x",
+    )
+    assert s.last_review_comment_url == comment_url(PR, 101)
+
+
+@pytest.mark.parametrize("old_base", ["main", None], ids=["other-base", "no-base"])
+def test_review_result_naming_a_comment_for_another_base_is_rejected(tmp_state_dir, old_base):
+    """A reviewer that adopts the old-base (or pre-base) comment anyway is
+    held to the same key the entry used: the round is rejected, nothing is
+    bound, and no round is consumed."""
+    gh = FakeGitHub()
+    gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False, base_ref=old_base))
+    eng = _in_review(tmp_state_dir, gh, [block(review_payload(1, SHA_A, [], cid=100))])
+    gh.prs[PR].base_ref = "release/1.x"
+    with pytest.raises(VerificationError, match="round 1 at HEAD .* on base 'release/1.x'"):
+        eng.step()
+    s = load_state(eng.paths.state_file)
+    assert s.review_round == 0 and s.phase == Phase.REVIEW
+    assert (s.reviewed_pr_url, s.reviewed_head_sha, s.reviewed_base_ref) == ("", "", "")
+    assert s.current_base_ref == "release/1.x"
+
+
+def test_review_entry_ignores_a_pre_base_comment_for_the_round(tmp_state_dir):
+    """A marker written before ``reviewed_base_ref`` existed reviewed a base
+    nobody recorded. It is not this round's comment (never adopted) and not
+    a defect either (a PR mid-flight carries one per earlier round)."""
+    gh = FakeGitHub()
+    gh.add_comment(PR, 90, review_comment_body(1, SHA_B, True, ["R1-F1"], base_ref=None))
+    gh.add_comment(PR, 91, review_comment_body(2, SHA_A, True, ["R2-F1"], base_ref=None))
+
+    def reviews(req):
+        gh.add_comment(PR, 100, review_comment_body(2, SHA_A, False))
+        return block(review_payload(2, SHA_A, []))
+
+    eng = _in_review(tmp_state_dir, gh, reviews, round_done=1)
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    prompt = eng.provider.calls[0].prompt
+    assert "THIS HEAD against THIS base (if\n  any): (none)" in prompt
+    assert comment_url(PR, 91) not in prompt
+    assert load_state(eng.paths.state_file).reviewed_base_ref == "main"
 
 
 def test_new_pr_clears_the_review_binding(tmp_state_dir, fake_github):

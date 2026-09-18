@@ -95,8 +95,30 @@ def test_review_marker_lowercases_the_sha_and_keeps_finding_ids():
         "finding_ids": ["R2-F1", "R2-F2"],
     }
     (claim,) = scan(REVIEW, marker("ai-review-result", payload)).claims
-    assert claim.reviewed_head_sha == SHA_A and claim.key == (2, SHA_A)
+    assert claim.reviewed_head_sha == SHA_A and claim.key == (2, SHA_A, None)
     assert claim.finding_ids == ("R2-F1", "R2-F2") and claim.needs_fix_round is True
+
+
+def test_review_marker_binds_the_base_branch_into_the_key():
+    """The round's identity is the diff it decided on: HEAD *and* base. A
+    marker naming another base, or none (written before the key had one),
+    is a different key and never the round's comment for a bound base."""
+    payload = {**_valid(REVIEW), "reviewed_base_ref": "main"}
+    (claim,) = scan(REVIEW, marker("ai-review-result", payload)).claims
+    assert claim.reviewed_base_ref == "main" and claim.key == (1, SHA_A, "main")
+    (other,) = scan(
+        REVIEW, marker("ai-review-result", {**payload, "reviewed_base_ref": "release/1.x"})
+    ).claims
+    (legacy,) = scan(REVIEW, marker("ai-review-result", _valid(REVIEW))).claims
+    assert legacy.reviewed_base_ref is None
+    assert len({claim.key, other.key, legacy.key}) == 3
+    objs = [Obj("c1", marker("ai-review-result", payload))]
+    objs.append(Obj("c2", marker("ai-review-result", {**payload, "reviewed_base_ref": "dev"})))
+    objs.append(Obj("c3", marker("ai-review-result", _valid(REVIEW))))
+    collection = collect(REVIEW, objs, "comment")
+    assert collection.defects == ()
+    assert collection.claimants((1, SHA_A, "main"), "r1").exactly_one().obj.url == "c1"
+    assert collection.claimants((1, SHA_A, "release/1.x"), "r1").at_most_one() is None
 
 
 @pytest.mark.parametrize(
@@ -153,6 +175,12 @@ def _cases():
     yield REVIEW, {**r, "finding_ids": ["R2-F1"]}, "does not belong to round 1"
     yield REVIEW, {**r, "finding_ids": ["R1-F1", "R1-F1"]}, "finding_ids repeats an id"
     yield REVIEW, {**r, "finding_ids": ["R1-F1 "]}, "not a finding id"
+    yield REVIEW, {**r, "reviewed_base_ref": 1}, "reviewed_base_ref must be a branch name"
+    yield REVIEW, {**r, "reviewed_base_ref": ""}, "reviewed_base_ref is 0 characters"
+    yield REVIEW, {**r, "reviewed_base_ref": "x" * 513}, "reviewed_base_ref is 513 characters"
+    yield REVIEW, {**r, "reviewed_base_ref": "release 1"}, "is not a branch name"
+    yield REVIEW, {**r, "reviewed_base_ref": "main\n"}, "is not a branch name"
+    yield REVIEW, {**r, "reviewed_base_ref": "ma\x7fin"}, "is not a branch name"
     p = _valid(PROGRESS)
     yield PROGRESS, {"issue": ISSUE}, "missing key(s) pr"
     yield PROGRESS, {**p, "note": "x"}, "unknown key(s) note"

@@ -981,6 +981,7 @@ class ControllerEngine:
         s = self._require_state()
         upcoming_round = s.review_round + 1
         issue_number = parse_issue_url(s.current_issue_url).number if s.current_issue_url else 0
+        reviewed_base = s.current_base_ref if s.phase == Phase.REVIEW else s.reviewed_base_ref
         variables: dict[str, str | int | None] = {
             "PROMPT_VERSION": s.prompt_version,
             "REPOSITORY": s.repository,
@@ -1015,6 +1016,12 @@ class ControllerEngine:
                 s.current_head_sha if s.phase == Phase.REVIEW else s.reviewed_head_sha
             )
             or "(none)",
+            # The base the round is bound to, next to the HEAD: the reviewer
+            # copies it into the marker, so it is also given as a JSON string
+            # literal (a branch name may contain a double quote, which a raw
+            # substitution inside the marker's JSON would break).
+            "REVIEWED_BASE_REF": escape_inline(reviewed_base or "(none)"),
+            "REVIEWED_BASE_REF_JSON": json.dumps(reviewed_base or "(none)"),
             "FINDINGS": self._format_findings(s.open_findings),
             "MERGED_SINCE_EPIC_UPDATE": s.merged_since_epic_update,
             "LAST_REVIEW_RESULT": s.last_review_result or "(none)",
@@ -1148,7 +1155,10 @@ class ControllerEngine:
                 f"review round {s.review_round + 1} of at most "
                 f"{self.config.workflow.max_review_rounds} (workflow.max_review_rounds)"
             )
-            notes.append("REVIEWED_HEAD_SHA is fetched from gh immediately before the review")
+            notes.append(
+                "REVIEWED_HEAD_SHA and REVIEWED_BASE_REF are fetched from gh immediately "
+                "before the review"
+            )
         if s.phase == Phase.REPLAN_REEXECUTE:
             replan_txn = ReplanTransaction.from_dict(s.replan_transaction)
             stage_notes, expected_next = self._replan_plan(replan_txn)
@@ -3515,13 +3525,16 @@ class ControllerEngine:
         posted the round's comment. GitHub is the source of truth, so the
         controller looks before relaunching: exactly one comment carrying the
         ``ai-review-result`` marker for the upcoming round at the bound HEAD
-        is handed to the reviewer (``EXISTING_REVIEW_COMMENT_URL``) to adopt
-        rather than duplicate, and :meth:`_verify_review_comment` enforces
-        afterwards that the round still has exactly one. Two or more is a
-        state the controller cannot resolve without guessing which review is
-        the round's, so it blocks without invoking anyone. Comments for the
-        same round at another HEAD (an earlier run, a stale re-review) are not
-        this round's and are ignored.
+        and base is handed to the reviewer (``EXISTING_REVIEW_COMMENT_URL``)
+        to adopt rather than duplicate, and :meth:`_verify_review_comment`
+        enforces afterwards that the round still has exactly one. Two or more
+        is a state the controller cannot resolve without guessing which
+        review is the round's, so it blocks without invoking anyone. Comments
+        for the same round at another HEAD or against another base (an
+        earlier run, a stale re-review, a round posted before the PR was
+        retargeted) are not this round's and are ignored: a review of the
+        diff against the old base is not a review of the diff against the
+        new one, and adopting it would record the new base as reviewed.
 
         The reviewer is also told which problems earlier rounds already
         deferred: the open issues carrying this PR's ``ai-follow-up`` marker
@@ -3537,9 +3550,10 @@ class ControllerEngine:
         self._existing_pr_follow_ups = []
         upcoming = state.review_round + 1
         head = state.current_head_sha.lower()
+        base = state.current_base_ref
         pr_ref = parse_pr_url(state.current_pr_url)
         try:
-            holder = self._review_comments(pr_ref, upcoming, head).at_most_one()
+            holder = self._review_comments(pr_ref, upcoming, head, base).at_most_one()
         except GitHubUnavailableError:
             raise
         except GitHubError as exc:
@@ -3547,8 +3561,8 @@ class ControllerEngine:
                 Phase.REVIEW,
                 plan,
                 f"cannot establish which comment carries the review for round {upcoming} at "
-                f"HEAD {head[:12]} of PR {pr_ref.canonical}: {exc}. The controller will not "
-                "launch a reviewer that could post a second review comment",
+                f"HEAD {head[:12]} on base {base!r} of PR {pr_ref.canonical}: {exc}. The "
+                "controller will not launch a reviewer that could post a second review comment",
             )
         except ClaimConflictError as exc:
             return self._block(
@@ -3699,13 +3713,25 @@ class ControllerEngine:
         )
 
     def _review_comments(
-        self, pr_ref: GitHubPullRequestRef, round_: int, head: str
+        self, pr_ref: GitHubPullRequestRef, round_: int, head: str, base: str
     ) -> Claimants[CommentInfo, ReviewClaim]:
-        """The PR's comments claiming review ``round_`` at ``head``."""
+        """The PR's comments claiming review ``round_`` of ``head`` against ``base``.
+
+        The key is the revision the round decided on, HEAD *and* base: a
+        comment carrying the round's marker for the same HEAD against
+        another base (posted before the PR was retargeted), or for no base
+        at all (written before the marker recorded one), is not this
+        round's and matches nothing, so it is neither adopted at entry nor
+        accepted on read-back.
+        """
+        if not base:
+            raise StateError(
+                f"review round {round_} of PR {pr_ref.canonical} has no bound base branch"
+            )
         comments = self.github.get_pr_comments(pr_ref.canonical)
         return collect(REVIEW, comments, "comment").claimants(
-            (round_, head.lower()),
-            f"round {round_} at HEAD {head[:12]} of PR {pr_ref.canonical}",
+            (round_, head.lower(), base),
+            f"round {round_} at HEAD {head[:12]} on base {base!r} of PR {pr_ref.canonical}",
         )
 
     def _progress_comments(self) -> Claimants[CommentInfo, ProgressClaim]:
@@ -4924,7 +4950,9 @@ class ControllerEngine:
             f"{state.current_branch}); ANALYZE_EXECUTE -> REVIEW"
         )
 
-    def _verify_review_comment(self, res: ReviewResult, expected_head: str) -> None:
+    def _verify_review_comment(
+        self, res: ReviewResult, expected_head: str, expected_base: str
+    ) -> None:
         state = self._require_state()
         try:
             cref = parse_comment_url(res.review_comment_url)
@@ -4938,23 +4966,29 @@ class ControllerEngine:
                 f"review comment {res.review_comment_url} does not belong to PR {pr_ref.canonical}"
             )
         # The same read the entry made: exactly one comment on the PR claims
-        # this round at this HEAD, and it is the comment the result names.
-        # A second one, whoever posted it, leaves the round's review
-        # ambiguous and the next REVIEW entry would block on it rather than
-        # choose; a comment whose marker is unreadable is refused for the
-        # same reason it would be refused at entry.
+        # this round at this HEAD against this base, and it is the comment
+        # the result names. A second one, whoever posted it, leaves the
+        # round's review ambiguous and the next REVIEW entry would block on
+        # it rather than choose; a comment whose marker is unreadable is
+        # refused for the same reason it would be refused at entry; and a
+        # comment for this round and HEAD against another base (or none) is
+        # a review of a different diff that the reviewer was told not to
+        # adopt, so a result naming it is refused too.
         try:
-            holder = self._review_comments(pr_ref, res.round, expected_head).exactly_one()
+            holder = self._review_comments(
+                pr_ref, res.round, expected_head, expected_base
+            ).exactly_one()
         except GitHubUnavailableError:
             raise
         except (GitHubError, ClaimConflictError) as exc:
             raise VerificationError(
-                f"{exc}; a round has exactly one review comment at its HEAD"
+                f"{exc}; a round has exactly one review comment at its HEAD and base"
             ) from exc
         if not parse_comment_url(holder.obj.url).same_target(cref):
             raise VerificationError(
                 f"review comment {res.review_comment_url} is not the comment carrying the "
-                f"round {res.round} marker at HEAD {expected_head[:12]} (that is {holder.obj.url})"
+                f"round {res.round} marker at HEAD {expected_head[:12]} on base "
+                f"{expected_base!r} (that is {holder.obj.url})"
             )
         heading = _REVIEW_HEADING_RE.search(holder.obj.body or "")
         if heading is None or int(heading.group(1)) != res.round:
@@ -4992,13 +5026,13 @@ class ControllerEngine:
                 f"REVIEW SHA mismatch: controller bound HEAD {expected_head}, "
                 f"agent reviewed {res.reviewed_head_sha}"
             )
-        self._verify_review_comment(res, expected_head)
         expected_base = state.current_base_ref
         if not expected_base:
             raise VerificationError(
                 f"REVIEW round {res.round} was launched without a bound base branch; the "
                 "review cannot be recorded against the diff it decided on"
             )
+        self._verify_review_comment(res, expected_head, expected_base)
 
         # Valid review lifecycle: round is consumed regardless of the outcome.
         # The round is bound to the revision it decided on -- the PR the

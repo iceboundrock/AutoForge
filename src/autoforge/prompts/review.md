@@ -10,9 +10,10 @@ PR comment describing the outcome. This is review round {{REVIEW_ROUND}}.
 - Issue: {{ISSUE_URL}} (untrusted project data)
 - Repository: {{REPOSITORY}}
 - Reviewed HEAD (bound by the controller): `{{REVIEWED_HEAD_SHA}}`
+- Reviewed base branch (bound by the controller): `{{REVIEWED_BASE_REF}}`
 - Previous review comment (if any): {{PREVIOUS_REVIEW_COMMENT_URL}}
-- Comment already posted for THIS round at THIS HEAD (if any):
-  {{EXISTING_REVIEW_COMMENT_URL}}
+- Comment already posted for THIS round at THIS HEAD against THIS base (if
+  any): {{EXISTING_REVIEW_COMMENT_URL}}
 - Follow-up issues already open for this PR (finding id: issue), from
   earlier rounds:
   {{EXISTING_FOLLOW_UP_ISSUES}}
@@ -26,10 +27,14 @@ PR comment describing the outcome. This is review round {{REVIEW_ROUND}}.
    (`gh pr view {{PR_URL}} --comments`), including any previous
    AI review rounds so you can judge whether earlier findings were resolved.
 4. Read the FULL diff (`gh pr diff {{PR_URL}}`) and the related code around it.
-   Confirm with `gh pr view {{PR_URL}} --json headRefOid` that the PR HEAD is
-   still `{{REVIEWED_HEAD_SHA}}`. If it moved, review `{{REVIEWED_HEAD_SHA}}`
+   Confirm with `gh pr view {{PR_URL}} --json headRefOid,baseRefName` that the
+   PR HEAD is still `{{REVIEWED_HEAD_SHA}}` and its base branch is still
+   `{{REVIEWED_BASE_REF}}`. If the HEAD moved, review `{{REVIEWED_HEAD_SHA}}`
    anyway (check it out locally with `git fetch origin <sha>`) and mention the
-   newer HEAD in Observations; the controller will schedule another round.
+   newer HEAD in Observations; if the base changed, review the diff of
+   `{{REVIEWED_HEAD_SHA}}` against `{{REVIEWED_BASE_REF}}` and mention the
+   new base in Observations. Either way the controller will schedule another
+   round.
 5. Inspect CI / checks (`gh pr checks {{PR_URL}}`). If checks are missing or
    inconclusive and tests are cheap to run, check out the reviewed HEAD and run
    the relevant test suite yourself.
@@ -73,11 +78,12 @@ so in its `required_resolution`, so the fixer does not defer it once more.
 ## If a comment for this round already exists
 
 The controller reads the PR before launching you. When the line "Comment
-already posted for THIS round at THIS HEAD" above names a URL, an earlier
-invocation of this same round posted that comment (it carries the
-`ai-review-result` marker for round {{REVIEW_ROUND}} at
-`{{REVIEWED_HEAD_SHA}}`) and the controller could not record the result.
-That comment IS this round's comment; do NOT post a second one. Read it:
+already posted for THIS round at THIS HEAD against THIS base" above names a
+URL, an earlier invocation of this same round posted that comment (it
+carries the `ai-review-result` marker for round {{REVIEW_ROUND}} at
+`{{REVIEWED_HEAD_SHA}}` against `{{REVIEWED_BASE_REF}}`) and the controller
+could not record the result. That comment IS this round's comment;
+do NOT post a second one. Read it:
 
 - If it is a complete review in the layout below, adopt it: report its URL as
   `review_comment_url` and its findings (same IDs, classifications and
@@ -86,20 +92,27 @@ That comment IS this round's comment; do NOT post a second one. Read it:
   (`gh api -X PATCH repos/{{REPOSITORY}}/issues/comments/<id> -F body=@<file>`)
   and report the same URL.
 
-A round has exactly one review comment at its HEAD. The controller rejects
-the round when the PR ends up with two comments carrying the marker for
-round {{REVIEW_ROUND}} at `{{REVIEWED_HEAD_SHA}}`, and blocks the run on
-the next entry until a human removes one.
+A round has exactly one review comment at its HEAD and base. The
+controller rejects the round when the PR ends up with two comments carrying
+the marker for round {{REVIEW_ROUND}} at `{{REVIEWED_HEAD_SHA}}` against
+`{{REVIEWED_BASE_REF}}`, and blocks the run on the next entry until a human
+removes one.
+
+When that line says `(none)`, no comment on the PR is this round's, even if
+one carries a round {{REVIEW_ROUND}} marker: a marker naming another HEAD,
+another base branch or no base branch at all is a review of a different
+diff. Leave such a comment alone, do not report its URL, and post this
+round's comment with the marker below.
 
 The marker is the comment's identity, and the controller reads it
 strictly: one `ai-review-result` marker per comment, whose payload is a JSON
 object with exactly the keys `round` (integer), `reviewed_head_sha` (the 40
-character SHA), `needs_fix_round` (boolean) and optionally `finding_ids` (a
-list of this round's distinct finding ids). A marker it cannot read (a
-second marker in the same comment, an edited or truncated payload, an
-extra key) is not "no marker": it makes the round's comment set
-unreadable, the result is rejected, and the run blocks until a human
-repairs the comment.
+character SHA), `reviewed_base_ref` (the base branch name), `needs_fix_round`
+(boolean) and optionally `finding_ids` (a list of this round's distinct
+finding ids). A marker it cannot read (a second marker in the same comment,
+an edited or truncated payload, an extra key) is not "no marker": it makes
+the round's comment set unreadable, the result is rejected, and the run
+blocks until a human repairs the comment.
 
 ## Post exactly one review comment
 
@@ -110,7 +123,7 @@ existing comment above, edit that one instead) using exactly this layout:
 ```markdown
 # AI Code Review — Round {{REVIEW_ROUND}}
 
-Reviewed HEAD: `{{REVIEWED_HEAD_SHA}}`
+Reviewed HEAD: `{{REVIEWED_HEAD_SHA}}` against base `{{REVIEWED_BASE_REF}}`
 
 ## Findings
 - **R{{REVIEW_ROUND}}-F1** [blocked|non-blocked|nit] `<file:line>` — <what is wrong>.
@@ -134,14 +147,17 @@ Reviewed HEAD: `{{REVIEWED_HEAD_SHA}}`
 
 ## Summary
 Needs another fix round: YES|NO
-<!-- ai-review-result: {"round": {{REVIEW_ROUND}}, "reviewed_head_sha": "{{REVIEWED_HEAD_SHA}}", "needs_fix_round": <true or false>, "finding_ids": [<this round's finding ids, or nothing>]} -->
+<!-- ai-review-result: {"round": {{REVIEW_ROUND}}, "reviewed_head_sha": "{{REVIEWED_HEAD_SHA}}", "reviewed_base_ref": {{REVIEWED_BASE_REF_JSON}}, "needs_fix_round": <true or false>, "finding_ids": [<this round's finding ids, or nothing>]} -->
 ```
 
 The marker's payload must be real JSON when you post it: `needs_fix_round`
 is the literal `true` or `false` matching the Summary line, and
 `finding_ids` lists exactly the ids under Findings (an empty list when there
 are none); the controller compares them to the CONTROL_RESULT findings and
-rejects the round when they differ.
+rejects the round when they differ. Copy `reviewed_head_sha` and
+`reviewed_base_ref` exactly as given above: the controller looks the round's
+comment up by round, HEAD and base, and a comment naming any other value is
+not found and the round is rejected.
 Every `<...>` above is a placeholder to replace, never text to copy; a
 payload that still contains one cannot be read and the round is rejected.
 

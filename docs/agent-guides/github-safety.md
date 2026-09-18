@@ -105,19 +105,25 @@ one, and every probe and read-back reads them through it:
 
 The reviewer is launched only after the controller has read the PR's
 comments for a comment already carrying the `ai-review-result` marker of the
-upcoming round at the bound HEAD (an earlier invocation of the same round
-whose result was never recorded):
+upcoming round at the bound HEAD and base (an earlier invocation of the
+same round whose result was never recorded):
 
 - exactly one: its URL is handed to the reviewer as
   `EXISTING_REVIEW_COMMENT_URL`, to adopt or edit in place, never duplicate
 - two or more: `BLOCKED` without launching the reviewer; the controller
   never chooses which review is the round's
-- a comment for the same round at another HEAD is not this round's
+- a comment for the same round at another HEAD, or against another base,
+  is not this round's: the round's identity is the diff it decided on, and
+  a review posted before the PR was retargeted decided on another diff
+- a marker that names no base was written before the marker recorded one;
+  it reviewed a base nobody recorded, so it matches no bound key and is
+  never adopted, but it is not a defect (a PR mid-flight carries one from
+  every earlier round, and a defect would block every later entry on it)
 - the marker is a JSON object with exactly an integer `round` (not a
   boolean, not a float), a 40-hex `reviewed_head_sha`, a boolean
-  `needs_fix_round` and optionally `finding_ids` (distinct ids of that
-  round); anything else is a defect that blocks the entry and rejects the
-  read-back, never "no marker"
+  `needs_fix_round` and optionally `reviewed_base_ref` (a branch name) and
+  `finding_ids` (distinct ids of that round); anything else is a defect
+  that blocks the entry and rejects the read-back, never "no marker"
 
 The same entry lists the repository's open issues (strictly, as before FIX)
 for every `ai-follow-up` marker naming this PR, whatever the finding id, and
@@ -137,9 +143,13 @@ Verify:
 - it belongs to the expected PR
 - review round marker is correct
 - reviewed HEAD is correct
-- it is the only comment carrying this round's marker at this HEAD, and it
-  is the comment the result names; a second one rejects the round (the
-  uniqueness rule is enforced on read-back, never trusted to the prompt)
+- it is the only comment carrying this round's marker at this HEAD against
+  the bound base, and it is the comment the result names; a second one
+  rejects the round (the uniqueness rule is enforced on read-back, never
+  trusted to the prompt), and so does a result naming a comment whose
+  marker is for another base or none: the entry would not have handed it
+  over, and the binding the round writes (`reviewed_base_ref`) must be the
+  base its comment claims
 - the marker's `needs_fix_round` equals the result's, and its
   `finding_ids`, when present, are exactly the ids of the result's findings
   as a set (order is presentation); the marker is the durable copy of the

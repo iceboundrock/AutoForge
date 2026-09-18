@@ -167,18 +167,25 @@ def follow_up_issue_body(finding_id: str, pr_url: str = PR) -> str:
 
 
 def review_comment_body(
-    round: int, sha: str, needs_fix: bool, finding_ids: list[str] | None = None
+    round: int,
+    sha: str,
+    needs_fix: bool,
+    finding_ids: list[str] | None = None,
+    *,
+    base_ref: str | None = "main",
 ) -> str:
-    marker = json.dumps(
-        {
-            "round": round,
-            "reviewed_head_sha": sha,
-            "needs_fix_round": needs_fix,
-            "finding_ids": finding_ids or [],
-        }
-    )
+    """A well-formed round comment; ``base_ref=None`` writes a pre-base marker."""
+    payload: dict[str, object] = {
+        "round": round,
+        "reviewed_head_sha": sha,
+        "needs_fix_round": needs_fix,
+        "finding_ids": finding_ids or [],
+    }
+    if base_ref is not None:
+        payload["reviewed_base_ref"] = base_ref
+    marker = json.dumps(payload)
     return (
-        f"# AI Code Review — Round {round}\n\nReviewed HEAD: `{sha}`\n\n"
+        f"# AI Code Review — Round {round}\n\nReviewed HEAD: `{sha}` against base `{base_ref}`\n\n"
         "## Findings\n...\n## Spec\n...\n## Standards\n...\n## Assessment\n...\n"
         "## Observations\n...\n## Verification\n...\n## Summary\n"
         f"Needs another fix round: {'YES' if needs_fix else 'NO'}\n"

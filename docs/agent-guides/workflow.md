@@ -132,7 +132,20 @@ Persist the reviewed revision with the review: the reviewed PR
 (`reviewed_pr_url`), the reviewed HEAD SHA (`reviewed_head_sha`) and the
 reviewed base branch (`reviewed_base_ref`). The controller reads all three
 from GitHub right before the reviewer is launched (`current_head_sha`,
-`current_base_ref`) and records them when the round is accepted.
+`current_base_ref`) and records them when the round is accepted. The
+round's comment carries the same revision in its `ai-review-result` marker
+(`reviewed_head_sha`, `reviewed_base_ref`), so the durable copy of the
+review on GitHub identifies the diff it decided on and a later entry can
+only ever adopt a comment for the base the PR targets now (see
+**Re-entering a phase**).
+
+The base is bound by name, not by the base branch's tip: the PR diff a
+reviewer reads is HEAD against the merge base, which ordinary commits on
+the base branch do not move, and the merge gate already defers to GitHub's
+own `mergeStateStatus` (`BEHIND` is refused) for the "must be up to date
+with the base" policy the repository configured. Pinning the merge-base
+commit as well would also catch a base branch rewritten under the same
+name; that is tracked as #96.
 
 Before accepting a clean review or allowing a future merge, verify:
 
@@ -202,15 +215,21 @@ next entry could not find again.
   same rule (github-safety.md, "Before ANALYZE_EXECUTE"), and so does the
   replan transaction for its replacement PR (replan-transaction.md).
 - `REVIEW` reads the PR comments for the `ai-review-result` marker of the
-  upcoming round at the bound HEAD. One such comment is handed to the
-  reviewer (`EXISTING_REVIEW_COMMENT_URL`) to adopt, or to edit in place,
-  instead of posting a second one. Two or more is a state the controller
-  cannot resolve without choosing which review is the round's, so it enters
-  `BLOCKED` without invoking anyone and names the comments. A comment for the
-  same round at another HEAD is not this round's and is ignored. After the
-  reviewer returns, verification enforces that the round still has exactly
-  one comment at its HEAD; a reviewer that posted a second one has its round
-  rejected, and the next entry blocks on the pair. The same entry lists the
+  upcoming round at the bound HEAD *and base* (both re-read from GitHub by
+  this entry). One such comment is handed to the reviewer
+  (`EXISTING_REVIEW_COMMENT_URL`) to adopt, or to edit in place, instead of
+  posting a second one. Two or more is a state the controller cannot
+  resolve without choosing which review is the round's, so it enters
+  `BLOCKED` without invoking anyone and names the comments. A comment for
+  the same round at another HEAD, or against another base, or whose marker
+  names no base (written before the marker recorded one), is not this
+  round's and is ignored: a review of the diff against the old base is not
+  a review of the diff against the one the PR targets now, and adopting it
+  would record the new base as reviewed. After the reviewer returns,
+  verification enforces that the round still has exactly one comment at
+  its HEAD and base; a reviewer that posted a second one, or that adopted
+  a comment for another base, has its round rejected, and the next entry
+  blocks on a pair. The same entry lists the
   open issues carrying this PR's `ai-follow-up` marker for any finding id
   (strictly; a listing that cannot be proven complete blocks) and hands
   them to the reviewer (`EXISTING_FOLLOW_UP_ISSUES`), so a problem an

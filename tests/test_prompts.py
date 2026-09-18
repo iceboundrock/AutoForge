@@ -97,7 +97,12 @@ def test_review_prompt_contract():
         "{{EXISTING_REVIEW_COMMENT_URL}}",
         "If a comment for this round already exists",
         "do NOT post a second one",
-        "exactly one review comment at its HEAD",
+        "exactly one review comment at its HEAD and base",
+        # PR #93 review: the round's comment is looked up by (round, HEAD,
+        # base); a comment against another base is never this round's.
+        "{{REVIEWED_BASE_REF}}",
+        '"reviewed_base_ref": {{REVIEWED_BASE_REF_JSON}}',
+        "another base branch or no base branch at all is a review of a different",
         # The marker layout holds placeholders that cannot be mistaken for
         # values: a copied `true|false` was invalid JSON that read as a
         # template to fill; `<...>` is the template's own placeholder form.
@@ -361,13 +366,22 @@ def test_engine_prompt_variables_review_and_fix(engine):
     engine.state.current_head_sha = SHA_B
     engine.state.reviewed_head_sha = SHA_A
     engine.state.review_round = 1
+    engine.state.current_base_ref = 'rel"1'
+    engine.state.reviewed_base_ref = "main"
     text = engine.render_prompt_for(Phase.REVIEW)
     assert "Round 2" in text and SHA_B in text  # reviews the *current* HEAD
+    # ... against the *current* base, given as a JSON literal inside the
+    # marker so a quote in the branch name cannot break the marker's JSON.
+    assert 'Reviewed base branch (bound by the controller): `rel"1`' in text
+    assert '"reviewed_base_ref": "rel\\"1", "needs_fix_round"' in text
     # Rendered outside a step, no PR was read: no existing comment is named.
-    assert "Comment already posted for THIS round at THIS HEAD (if any):\n  (none)" in text
+    assert (
+        "Comment already posted for THIS round at THIS HEAD against THIS base (if\n  any): (none)"
+        in text
+    )
     engine._existing_review_comment_url = f"{PR}#issuecomment-7"
     text = engine.render_prompt_for(Phase.REVIEW)
-    assert f"THIS HEAD (if any):\n  {PR}#issuecomment-7" in text
+    assert f"THIS HEAD against THIS base (if\n  any): {PR}#issuecomment-7" in text
     engine._existing_review_comment_url = ""
     engine.state.phase = Phase.FIX
     engine.state.open_findings = [
