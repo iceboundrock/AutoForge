@@ -1662,6 +1662,53 @@ def test_a_run_directory_refused_before_the_launch_is_not_charged_as_a_launch(
     assert launches == [1], "the first real launch is charged as the first"
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses file permissions")
+@pytest.mark.parametrize("phase", [Phase.ANALYZE_EXECUTE, Phase.FIX])
+def test_a_run_directory_that_cannot_be_published_into_is_refused_before_the_launch(
+    tmp_path, phase
+):
+    """PR #91 review with #57: the pre-launch gate covers the run directory.
+
+    An existing ``logs/<run>`` the controller cannot add an entry to passed
+    the gate while the journal was absent, so the agent was launched and
+    the step directory's ``mkdir`` failed after it had returned, with its
+    work done and unlogged. The logger open now probes the directory, so
+    the refusal lands before the launch, charges nothing, and the repaired
+    run launches for the first time.
+    """
+    from autoforge.safefs import UnreadableEntryError
+
+    root = local_repo(tmp_path)
+    eng = make_local_engine(root, "features/add-filter.md")
+    _run_to(eng, root, phase)
+    run_dir = Path(eng.paths.logs_dir) / eng.state.run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    before = sorted(p.name for p in run_dir.iterdir())
+    run_dir.chmod(0o500)
+    eng.provider._handler = lambda req: pytest.fail("no agent may be launched")
+    try:
+        for _ in range(3):
+            with pytest.raises(UnreadableEntryError, match="cannot publish into logs/"):
+                eng.step()
+            persisted = load_state(eng.paths.state_file)
+            assert persisted.phase is phase
+            assert persisted.local_pending_phase == ""
+            assert persisted.local_pending_attempts == 0
+    finally:
+        run_dir.chmod(0o700)
+    assert sorted(p.name for p in run_dir.iterdir()) == before, "the gate left something behind"
+    launches: list[int] = []
+
+    def implements(req):
+        launches.append(load_state(eng.paths.state_file).local_pending_attempts)
+        touch_impl(root, "repaired\n")
+        return impl_result() if phase is Phase.ANALYZE_EXECUTE else fix_result(["R1-F1"])
+
+    eng.provider._handler = implements
+    assert eng.step().next_phase == "REVIEW"
+    assert launches == [1], "the first real launch is charged as the first"
+
+
 @pytest.mark.parametrize("phase", [Phase.ANALYZE_EXECUTE, Phase.FIX])
 def test_a_profile_refused_before_the_launch_is_not_charged_as_a_launch(tmp_path, phase):
     """#57, the other pre-launch refusal: an unusable execution profile."""

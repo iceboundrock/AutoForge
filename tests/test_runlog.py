@@ -253,6 +253,42 @@ def test_a_read_only_journal_is_refused_before_the_launch_with_the_manual_step(t
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses file permissions")
+def test_a_run_directory_that_cannot_take_a_step_directory_is_refused_before_the_launch(
+    tmp_path,
+):
+    """PR #91 review: the pre-launch gate proves the *run directory*, not
+    only the journal. An existing ``logs/<run>`` the controller cannot add
+    an entry to (``0500``: the controller creates it ``0700``, so this is
+    someone else's directory or chmod) passed the gate while the journal was
+    absent, and the step directory's ``mkdir`` then failed after the agent
+    had returned. The logger open now creates and removes a probe entry in
+    the run directory, the way ``doctor`` probes the state directory, so the
+    refusal lands before the launch, keeps its access cause, names the
+    manual step, and leaves nothing behind."""
+    from autoforge.safefs import UnreadableEntryError
+
+    run_dir = tmp_path / "logs" / "run-1"
+    run_dir.mkdir(parents=True)
+    run_dir.chmod(0o500)
+    try:
+        with pytest.raises(UnreadableEntryError, match="Permission denied") as exc:
+            RunLogger(tmp_path / "logs", "run-1")
+        assert str(exc.value).startswith("cannot publish into logs/run-1/")
+        assert "make logs/run-1/ writable to resume" in str(exc.value)
+        assert "sequence continues from their names" in str(exc.value)
+        assert sorted(p.name for p in run_dir.iterdir()) == [], "the gate left something behind"
+    finally:
+        run_dir.chmod(0o700)
+    # Made writable again, the run starts at its first step, and the probe
+    # that proved the directory is not among the entries.
+    log = RunLogger(tmp_path / "logs", "run-1")
+    assert sorted(p.name for p in run_dir.iterdir()) == []
+    step = log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="REVIEW"))
+    assert step.name == "001-review-1"
+    assert sorted(p.name for p in run_dir.iterdir()) == ["001-review-1", "events.jsonl"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses file permissions")
 def test_a_journal_made_read_only_after_the_logger_opened_refuses_the_append(tmp_path):
     """#55 for the access cause: the append after the agent returned refuses,
     the artifacts are published, and the refusal names both the manual step

@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
@@ -176,6 +177,7 @@ class RunLogger:
         self.events_path = self.run_dir / "events.jsonl"
         with self._logs_root() as logs:
             logs.ensure_dir(self.run_id)
+            self._verify_publishable(logs)
             # Sequence counter resumes across process restarts.
             self._seq = self._recover_sequence(logs)
 
@@ -250,6 +252,55 @@ class RunLogger:
             f"logs/{self.run_id}/ to resume"
         )
 
+    def _verify_publishable(self, logs: SafeRoot) -> None:
+        """Prove, before the launch, what :meth:`log_execution` will need after it.
+
+        The logger is opened before the agent is launched so that a refusal
+        of the run log lands then, charging no launch (#57), rather than
+        after a write-capable agent has returned with work that would go
+        unlogged. That refusal is only as good as what is proved here, and
+        the post-agent record needs two things of the run directory: that
+        it takes a new entry (the step directory's ``mkdir``, then the
+        artifacts and, for a first invocation, the journal itself), and
+        that the journal at its name can be appended to.
+
+        The first is proved the way ``doctor`` proves the state directory:
+        an entry is created in the run directory through the same capability
+        and removed again. ``logs/<run>`` is created ``0700`` by this
+        controller, but an existing one is whatever is there -- a ``0500``
+        directory, a read-only mount, a filesystem without ``link(2)`` --
+        and it passes every other check while the journal is absent. The
+        second is proved by opening the journal exactly as the append will
+        open it, writing nothing: a link, a FIFO, a second name, a file the
+        controller may not write or one past ``MAX_EVENT_JOURNAL_BYTES``
+        refuses here. Neither proof outlives the launch, since the agent
+        runs as the same user and can undo either while it runs; they are
+        the refusals that can land before it does. A crash between the
+        probe's create and its unlink leaves one ``.af-probe-*`` entry,
+        which the sequence listing ignores like any other non-step name.
+        """
+        run_dir = f"logs/{self.run_id}/"
+        probe = f"{self.run_id}/.af-probe-{os.getpid():x}-{secrets.token_hex(8)}"
+        try:
+            logs.create_exclusive(probe, b"")
+            logs.unlink(probe)
+        except UnreadableEntryError as exc:
+            exc.args = (
+                f"cannot publish into {run_dir}: {exc}. A step directory and its artifacts "
+                f"are published there after every agent invocation, so make {run_dir} "
+                "writable to resume; the step directories are kept and the sequence "
+                "continues from their names",
+            )
+            raise
+        except StateError as exc:
+            exc.args = (
+                f"cannot publish into {run_dir}: {exc}. A step directory and its artifacts "
+                "are published there after every agent invocation",
+            )
+            raise
+        with self._refusing_journal():
+            logs.verify_appendable(f"{self.run_id}/events.jsonl", limit=MAX_EVENT_JOURNAL_BYTES)
+
     def _recover_sequence(self, logs: SafeRoot) -> int:
         """The highest step number this run has published, from the directory names.
 
@@ -257,16 +308,8 @@ class RunLogger:
         its journal line, so the directory names are never behind the
         journal, and they are what a crash between the two leaves behind;
         reading the journal as well would only add a cost that grows with
-        the run (#51). The journal *is* opened, exactly as the append after
-        the agent returns will open it, so that a journal the controller
-        would refuse to append to -- a link, a FIFO, a second name, a file
-        past ``MAX_EVENT_JOURNAL_BYTES`` -- refuses here, before a
-        write-capable agent has done work that would then go unlogged.
-        Nothing is read or written by that check.
+        the run (#51).
         """
-        with self._refusing_journal():
-            logs.verify_appendable(f"{self.run_id}/events.jsonl", limit=MAX_EVENT_JOURNAL_BYTES)
-
         # Only the run's own directory and its immediate children matter, so
         # the walk starts *at* the run directory (a sub-root, so sibling runs
         # under ``logs/`` are never listed -- #56) and descends no further:

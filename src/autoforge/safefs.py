@@ -53,8 +53,9 @@ The one write that is not a whole-file replacement is the append
 (``append_text``): a journal line is written through the opened inode with
 ``O_APPEND``, after the descriptor has been inspected as a regular file with
 exactly one name, so the cost of an append is the line rather than the file.
-The method docstring says why a second name acquired after that inspection
-cannot redirect the write.
+Nothing is published after the write, so there is no step a post-write
+inspection could withhold; what the append does and does not guarantee is
+stated below with the rest, and it is the same inode-level guarantee.
 
 What this does and does not guarantee
 -------------------------------------
@@ -65,10 +66,13 @@ directory descriptor that was opened as the root, or it fails; and a name the
 controller *publishes* -- the final rename or link -- names an inode that had
 exactly one name at the last inspection before the publish.  No sequence of
 symlink, hard link, FIFO, device, directory-replacement or rename operations
-performed by another process under the same user can move a controller write
-outside that root or onto an object the controller did not create.  This is a
-property of descriptor-relative addressing, not of a list of rejected shapes,
-so a shape nobody has thought of yet is covered too.
+performed by another process under the same user can make a controller write
+reach an inode other than that one: never an object the controller did not
+create or inspect, and never through a name it did not resolve descriptor by
+descriptor.  This is a property of descriptor-relative addressing, not of a
+list of rejected shapes, so a shape nobody has thought of yet is covered too.
+The guarantee is about the *inode*; where that inode's name is by the time
+the bytes land is the next paragraph.
 
 Not guaranteed: that a same-user process cannot *observe* a controller write
 through a name it planted.  A named temporary can be hard-linked out of the
@@ -78,9 +82,23 @@ refused and the inode emptied, but the other process may already have read
 it.  Every byte the controller writes is already readable by that process
 (same user, same files), so this discloses nothing, and it can never make a
 controller write *replace* anything: the inode was created by this process,
-empty, an instant earlier.  Linux could close even the observation window
-with an unnamed ``O_TMPFILE`` inode; that is not done because it does not
-exist on macOS and would make the guarantee platform-shaped.
+empty, an instant earlier.  The append has the same window, and there the
+other process keeps the bytes rather than an emptied file: between the
+inspection and the ``write(2)`` it can give the journal's inode a second
+name outside the root and drop this one, or rename it there outright, and
+the line then lands in that inode under its new name, with nothing
+published afterwards that a re-inspection could withhold, so the append
+reports success while the journal's name under the root is gone.  That is
+the controller's *own* journal moved by a process that could already read
+and copy every byte of it; it is not a write into a foreign file, because
+a foreign inode reaches the journal's name with one link only by being
+renamed there, at which point it is the journal.  No re-inspection closes
+the window, since the move can follow any check, so it is stated as the
+limit and pinned by a test rather than checked for.  Linux could close
+even the observation window with an unnamed ``O_TMPFILE`` inode for the
+temporary; that is not done because it does not exist on macOS and would
+make the guarantee platform-shaped, and it would not help the append,
+which must extend a named file.
 
 Also not guaranteed: the *initial* resolution of the root path itself.
 ``SafeRoot.open`` resolves an ordinary pathname, and a process that can
@@ -646,19 +664,29 @@ class SafeRoot:
         a regular file (no link, FIFO, device or directory) with exactly one
         name, or :class:`UnsafePathError`.
 
-        Why a second name planted *after* that inspection is harmless: the
-        write lands in the inode the descriptor holds, and at the inspection
-        that inode had exactly one name, this one, under this root. A second
-        name added later only lets the same-user process that added it
-        observe the bytes through another path, which it could already do
-        through this one; it cannot make the write reach an inode the
-        controller did not open. A foreign inode can carry this name with
-        one link only by having been *renamed* here, giving up its old name,
-        at which point it is the file at this name and nothing else. This is
-        the "opened as a regular file with one name" half of the module
-        guarantee, and it holds without a post-write inspection because
-        there is no publish step to withhold: the bytes are already where
-        they belong.
+        What that inspection proves: the write lands in the inode the
+        descriptor holds, and at the inspection that inode was a regular
+        file with exactly one name, this one, under this root. So the append
+        can never extend a *foreign* file through a planted name: a second
+        name for someone else's inode is refused on the descriptor, a
+        symbolic link is refused by the open, and a foreign inode reaches
+        this name with one link only by having been *renamed* here, giving
+        up its old name, at which point it is the file at this name and
+        nothing else. This is the "opened as a regular file with one name"
+        half of the module guarantee.
+
+        What it does not prove: where the inode's name is by the time the
+        bytes land. A same-user process can, after the inspection, give the
+        inode a second name outside the root and unlink this one, or rename
+        it there, and the line is then written into that inode under its new
+        name; the append reports success, because nothing is published
+        afterwards that a re-inspection could withhold. That moves the
+        controller's own journal, whose every byte that process could
+        already read and copy, and it is the same window the named
+        temporary has (module docstring, "Not guaranteed"). A post-write
+        re-inspection would not close it, since the move can follow any
+        check, so the limit is stated and pinned by a test rather than
+        checked for.
 
         With a ``limit`` a file that is already larger than it is refused
         with :class:`ReadLimitExceeded` before anything is written; nothing

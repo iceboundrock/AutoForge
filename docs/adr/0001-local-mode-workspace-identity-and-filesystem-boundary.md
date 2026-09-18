@@ -15,7 +15,11 @@
   journal is bounded, R11-F2); after review: §5.4 and §5.5 (the journal is
   write-only and appended in place, its size a sanity check rather than a
   read bound, #51; it subsumes #55 and #56), §5.5 (a torn line fuses with
-  the next, an unwritable journal is refused, PR #91 review)
+  the next, an unwritable journal is refused, PR #91 review), §5.4 and
+  §8.10 (the append's guarantee is the inode, not the name: a journal moved
+  out from under its name after the inspection receives the line, stated
+  as the limit), §5.5 (the pre-launch gate probes the run directory, PR #91
+  review, third round)
 - **Closes by design:** #46, #47, #48, #49, #50; #45 (see *Compatibility*)
 
 ## 1. Problem
@@ -433,16 +437,26 @@ contract rather than accident:
 The one artifact that must be opened in place is the append-only
 `events.jsonl`; there the open is `O_NOFOLLOW|O_NONBLOCK|O_NOCTTY|O_APPEND`
 and `st_nlink > 1` is refused on the descriptor (round 6 had replaced the
-in-place append with a read-then-rewrite; #51 restored it, see §5.5). A
-second name given to the journal's inode *after* that inspection is
-harmless to this guarantee: the bytes land in the inode the descriptor
-already holds, which had exactly one name, under the root, when it was
-inspected, and a later `link(2)` to it only lets the line be observed
-elsewhere -- nothing outside the root is modified. A foreign inode can only
-carry the journal's name with one link by being *renamed* there, and then it
-is the file the controller finds, with one name, at its next open; the
-refusals for that are the size check below and the operator's eyes, exactly
-as for any other planted file. The temporary gets the same
+in-place append with a read-then-rewrite; #51 restored it, see §5.5). What
+that inspection guarantees is the *inode*: the bytes land in the inode the
+descriptor already holds, which had exactly one name, under the root, when
+it was inspected, so the append can never extend a foreign file through a
+planted name. A foreign inode can only carry the journal's name with one
+link by being *renamed* there, and then it is the file the controller
+finds, with one name, at its next open; the refusals for that are the size
+check below and the operator's eyes, exactly as for any other planted file.
+What the inspection does not guarantee is where that inode's name is when
+the bytes land (§8.10): a same-user process can, after the inspection,
+`link(2)` the journal's inode to a name outside the root and unlink this
+one, or `rename(2)` it there, and the line is then written into the
+controller's own journal at its new name, with nothing published afterwards
+that a re-inspection could withhold, so the append reports success. That is
+a move of the controller's bytes by a process that could already read and
+copy every one of them, not a write into anything that process planted; no
+re-inspection closes it, because the move can follow any check, and a
+rename involves no link count at all. It is stated as the limit and pinned
+by a test (`test_an_append_follows_its_inode_when_the_name_is_moved_after_the_inspection`),
+as §2.3 states the root's. The temporary gets the same
 inspection on the same descriptor once its bytes are durable and before it
 is published (R10-F2, §8.10): the `O_EXCL` create proves the inode is the
 controller's, but the inode has a *name* for the length of the write, and a
@@ -520,7 +534,19 @@ which opens exactly as the append will and writes nothing, so a link, a
 FIFO, a second name or an oversized file refuses before a write-capable
 agent has done work that would go unlogged, and charges no launch, #57);
 and at the append after the agent returns, the one moment an agent has had
-to enlarge or replace the file (#55). The budget bounds what the controller
+to enlarge or replace the file (#55). The pre-launch gate proves the run
+directory as well as the journal (PR #91 review, third round): the
+post-agent record needs `logs/<run>/` to take a new entry (the step
+directory, its artifacts, and on a first invocation the journal itself),
+and an existing run directory the controller cannot add an entry to (a
+`0500` directory, a read-only mount, a filesystem without `link(2)`) passes
+the journal check while the journal is absent. So the logger open creates
+and removes a probe entry there through the same capability, exactly as
+`doctor` probes the state directory (§5.4, R10-F4), and refuses with the
+access cause and the manual step (make the run directory writable) before
+anything is launched. Neither proof outlives the launch, since the agent
+runs as the same user; they are the refusals that can land before it. The
+budget bounds what the controller
 is willing to extend, not the file's final size: a journal at exactly the
 budget is still appended to, and the file that results is refused by the
 next check. The refusal names the manual step (move `events.jsonl` aside;
@@ -917,4 +943,18 @@ an independent `os.walk` finds nothing the snapshot did not mention.
     (an unnamed inode published with `linkat(AT_EMPTY_PATH)`) would remove
     even the observation window; it is not used because it does not exist on
     macOS and the guarantee would then differ by platform. Tracked as a
-    follow-up, not a defect of the boundary.
+    follow-up, not a defect of the boundary. The in-place append of
+    `events.jsonl` has the same window with a different outcome (§5.4,
+    PR #91 review): the journal's inode is inspected as a single-named
+    regular file, but a same-user process can move that inode out from
+    under its name before the `write(2)` -- `link(2)` it outside the root
+    and unlink the root name, or simply `rename(2)` it, which no link
+    count sees -- and the line is then written into the controller's own
+    journal at its new name and the append reports success, since nothing
+    is published afterwards that a re-inspection could withhold. The
+    guarantee that holds is the inode-level one of §2.2: the controller
+    never extends a foreign inode, and a foreign inode reaches the
+    journal's name with one link only by being renamed there, at which
+    point it is the journal. `O_TMPFILE` would not help here either, since
+    an append must extend a named file. Stated and pinned by a test rather
+    than checked for, because the move can follow any check.

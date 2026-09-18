@@ -507,12 +507,21 @@ name, which means a symbolic link, hard link, FIFO or device planted at an
 artifact's name is *replaced*: it is never opened, so whatever it pointed at
 is provably untouched. The append-only `events.jsonl` is the one artifact that
 must be opened in place, and there the open is `O_NOFOLLOW|O_NONBLOCK|O_APPEND`
-and refuses a hard link outright. The controller never reads the journal:
+and refuses a hard link outright. What that guarantees is the inode: the
+line lands in the file that was inspected as a single-named regular file
+under the log directory, never in a foreign file reached through a planted
+name. It does not guarantee the name: a same-user agent can move the
+journal's inode out of the log directory (link it elsewhere and unlink it,
+or rename it) between the inspection and the write, and the line then lands
+in the controller's own journal at its new name; that agent could already
+read and copy every byte of the journal, so this is stated as the limit
+(ADR 0001 §8.10) rather than guarded. The controller never reads the journal:
 the step sequence is recovered from the step directory names, and each line
 is appended in place, so the cost of logging an invocation is the line
 rather than the journal. What the journal is checked for is its size, on
 the opened descriptor, before the agent is launched and again at the append
-after it returns; the run's log directory is listed under a budget of its
+after it returns; the run's log directory is probed for a new entry before
+the launch as well, and listed under a budget of its
 own. A same-user agent that plants an oversized journal or a million names
 there makes the controller refuse, not run out of memory or time.
 `run_id`, which names `logs/<run_id>`, is
@@ -623,8 +632,9 @@ three launches per phase entry, counting every launch (the entry's own, a
 correction retry after a malformed `CONTROL_RESULT`, a resumed attempt),
 each written to the state file immediately before the agent starts, then
 `BLOCKED`. Only a launch is counted: a step that is refused before the agent
-starts (a corrupted event journal, an unusable execution profile, a prompt
-template that cannot be rendered) charges nothing, so repairing the cause and
+starts (a corrupted event journal, a run log directory the controller cannot
+publish into, an unusable execution profile, a prompt template that cannot
+be rendered) charges nothing, so repairing the cause and
 resuming does not spend the bound. The checkpoint belongs to the phase that
 wrote it: a state file holding one
 under a different live phase is refused at load rather than closed by that

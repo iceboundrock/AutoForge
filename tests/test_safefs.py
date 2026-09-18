@@ -213,6 +213,70 @@ def test_append_refuses_a_hard_link_instead_of_writing_the_shared_inode(tmp_path
     assert sorted(p.name for p in root_dir.iterdir()) == ["events.jsonl"], "no temporary left"
 
 
+def _link_out_and_unlink(parent: int, name: str, outside) -> None:
+    os.link(name, outside, src_dir_fd=parent)
+    os.unlink(name, dir_fd=parent)
+
+
+def _rename_out(parent: int, name: str, outside) -> None:
+    os.rename(name, outside, src_dir_fd=parent)
+
+
+@pytest.mark.parametrize(
+    "move", [_link_out_and_unlink, _rename_out], ids=["link then unlink", "rename"]
+)
+def test_an_append_follows_its_inode_when_the_name_is_moved_after_the_inspection(
+    tmp_path, monkeypatch, move
+):
+    """The stated limit of the in-place append (PR #91 review, third round).
+
+    The inspection proves the *inode*: a regular file with one name under
+    the root. It cannot prove where that inode's name will be when the bytes
+    land, and a same-user process can move it between the inspection and
+    the ``write(2)`` -- a second name outside the root plus an unlink of
+    this one, or a plain rename, which no link count ever sees. The line
+    then lands in that inode under its new name and the append reports
+    success, because nothing is published afterwards that a re-inspection
+    could withhold. The race is made deterministic by moving the name inside
+    the open call itself, after the real inspection has passed.
+
+    What must hold, and is all the module promises: the bytes reach the
+    *same inode* the controller inspected (its own journal, now under a name
+    of the other process's choosing), a foreign file outside the root is
+    untouched, no other inode receives the line, and no temporary or
+    replacement appears under the root. What is deliberately not held:
+    that the root name still exists afterwards. A tool that wanted to close
+    this would have to make the move impossible, not check for it.
+    """
+    import autoforge.safefs as safefs
+
+    sentinel = Sentinel(tmp_path)
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    journal = root_dir / "events.jsonl"
+    journal.write_text("old\n", encoding="utf-8")
+    inode = journal.stat().st_ino
+    stolen = tmp_path / "stolen-journal"
+    real_open = safefs.open_regular_at
+
+    def open_then_move_the_name(parent, name, flags, **kwargs):
+        fd = real_open(parent, name, flags, **kwargs)
+        if name == "events.jsonl":
+            move(parent, name, stolen)
+        return fd
+
+    monkeypatch.setattr(safefs, "open_regular_at", open_then_move_the_name)
+
+    with SafeRoot.open(root_dir) as root:
+        root.append_text("events.jsonl", "controller\n")
+
+    sentinel.assert_untouched()
+    assert stolen.read_text(encoding="utf-8") == "old\ncontroller\n"
+    assert stolen.stat().st_ino == inode, "the line reached an inode that was not inspected"
+    assert stolen.stat().st_nlink == 1
+    assert [e.name for e in root_dir.iterdir()] == [], "a temporary or a replacement appeared"
+
+
 def test_a_temporary_hard_linked_out_during_the_write_is_never_published(tmp_path, monkeypatch):
     """R10-F2: the create-then-write window on the *named* temporary.
 
@@ -470,9 +534,10 @@ def test_verify_appendable_answers_for_the_file_not_for_its_directory(tmp_path):
     """The check's contract stops at the file: an absent journal is appendable
     even when its directory cannot take a new entry, because the check
     creates nothing and so has no ``O_CREAT`` to fail. The append discovers
-    the directory. (Unreachable through ``RunLogger``, which publishes the
-    step directory into the same run directory before it appends, so the
-    ``mkdir`` fails first; pinned so the docstring stays exact.)"""
+    the directory. ``RunLogger`` does not rely on this method for the
+    directory: it proves the run directory takes an entry with a probe of
+    its own before the launch (``test_runlog``), so the divergence pinned
+    here is the generic method's contract, not a gap in the gate."""
     root_dir = tmp_path / "root"
     root_dir.mkdir()
     run_dir = root_dir / "run-1"
