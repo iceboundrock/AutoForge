@@ -8,6 +8,7 @@ trust boundary is `git` itself) with scripted agents and an
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -1563,10 +1564,18 @@ def test_a_crash_between_corrections_resumes_under_the_remaining_bound(tmp_path,
 
 
 def _corrupt_journal(eng) -> Path:
-    """Plant an unparseable ``events.jsonl`` for the current run."""
+    """Plant an ``events.jsonl`` the controller refuses for the current run.
+
+    The controller never reads the journal (#51), so its content cannot be
+    corrupt; what it refuses is a journal larger than any it could have
+    written. The file is sparse, so planting it costs nothing.
+    """
+    from autoforge.runlog import MAX_EVENT_JOURNAL_BYTES
+
     journal = Path(eng.paths.logs_dir) / eng.state.run_id / "events.jsonl"
     journal.parent.mkdir(parents=True, exist_ok=True)
-    journal.write_text("not json\n")
+    journal.touch()
+    os.truncate(journal, MAX_EVENT_JOURNAL_BYTES + 1)
     return journal
 
 
@@ -1574,8 +1583,8 @@ def _corrupt_journal(eng) -> Path:
 def test_a_journal_refused_before_the_launch_is_not_charged_as_a_launch(tmp_path, phase):
     """#57: a refusal that happens before any agent starts charges nothing.
 
-    `_invoke_phase` opens the run logger (and so reads the event journal)
-    before it launches the agent. A journal it refuses used to land *after*
+    `_invoke_phase` opens the run logger (and so proves the event journal
+    appendable) before it launches the agent. A journal it refuses used to land *after*
     the launch had been charged to the durable per-phase bound, so three
     refused `resume`s spent the bound with zero launches, and the repaired
     run then blocked with "invoked 3 time(s)". The charge belongs at the
@@ -1641,6 +1650,117 @@ def test_a_run_directory_refused_before_the_launch_is_not_charged_as_a_launch(
 
     for path in planted:
         path.unlink()
+    launches: list[int] = []
+
+    def implements(req):
+        launches.append(load_state(eng.paths.state_file).local_pending_attempts)
+        touch_impl(root, "repaired\n")
+        return impl_result() if phase is Phase.ANALYZE_EXECUTE else fix_result(["R1-F1"])
+
+    eng.provider._handler = implements
+    assert eng.step().next_phase == "REVIEW"
+    assert launches == [1], "the first real launch is charged as the first"
+
+
+def _plant_step_shaped_file(run_dir: Path) -> Path:
+    planted = run_dir / "900-review-1"
+    planted.write_text("x")
+    return planted
+
+
+def _plant_step_past_the_bound(run_dir: Path) -> Path:
+    planted = run_dir / ("9" * 240 + "-review-1")
+    planted.mkdir()
+    return planted
+
+
+@pytest.mark.parametrize("phase", [Phase.ANALYZE_EXECUTE, Phase.FIX])
+@pytest.mark.parametrize(
+    "plant",
+    [_plant_step_shaped_file, _plant_step_past_the_bound],
+    ids=["a step-shaped regular file", "a step numbered past the bound"],
+)
+def test_a_planted_step_name_is_refused_before_the_launch_not_after_the_agent(
+    tmp_path, phase, plant
+):
+    """PR #91 review, fourth round, with #57: the step directory names are
+    the sequence's only input and a same-user agent can plant them. A
+    numeric prefix of a few hundred digits used to be believed as the
+    sequence, so the agent was launched and the step directory's ``mkdir``
+    failed on a name too long for the filesystem after it had returned,
+    with its work done and unlogged. A name of a step's exact shape that is
+    not what the controller publishes is now a corrupt run log at the
+    logger open: refused before the launch, charging nothing, and the
+    repaired run launches for the first time."""
+    root = local_repo(tmp_path)
+    eng = make_local_engine(root, "features/add-filter.md")
+    _run_to(eng, root, phase)
+    run_dir = Path(eng.paths.logs_dir) / eng.state.run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    before = sorted(p.name for p in run_dir.iterdir())
+    planted = plant(run_dir)
+    eng.provider._handler = lambda req: pytest.fail("no agent may be launched")
+
+    for _ in range(3):
+        with pytest.raises(StateError, match="corrupted run log directory"):
+            eng.step()
+        persisted = load_state(eng.paths.state_file)
+        assert persisted.phase is phase
+        assert persisted.local_pending_phase == ""
+        assert persisted.local_pending_attempts == 0
+    assert sorted(p.name for p in run_dir.iterdir()) == sorted([*before, planted.name])
+
+    planted.rmdir() if planted.is_dir() else planted.unlink()
+    launches: list[int] = []
+
+    def implements(req):
+        launches.append(load_state(eng.paths.state_file).local_pending_attempts)
+        touch_impl(root, "repaired\n")
+        return impl_result() if phase is Phase.ANALYZE_EXECUTE else fix_result(["R1-F1"])
+
+    eng.provider._handler = implements
+    assert eng.step().next_phase == "REVIEW"
+    assert launches == [1], "the first real launch is charged as the first"
+    # The step the agent's work was recorded under is the run's own next one.
+    steps = sorted(p.name for p in run_dir.iterdir() if p.is_dir())
+    assert steps[-1].startswith(f"{len(steps):03d}-")
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses file permissions")
+@pytest.mark.parametrize("phase", [Phase.ANALYZE_EXECUTE, Phase.FIX])
+def test_a_run_directory_that_cannot_be_published_into_is_refused_before_the_launch(
+    tmp_path, phase
+):
+    """PR #91 review with #57: the pre-launch gate covers the run directory.
+
+    An existing ``logs/<run>`` the controller cannot add an entry to passed
+    the gate while the journal was absent, so the agent was launched and
+    the step directory's ``mkdir`` failed after it had returned, with its
+    work done and unlogged. The logger open now probes the directory, so
+    the refusal lands before the launch, charges nothing, and the repaired
+    run launches for the first time.
+    """
+    from autoforge.safefs import UnreadableEntryError
+
+    root = local_repo(tmp_path)
+    eng = make_local_engine(root, "features/add-filter.md")
+    _run_to(eng, root, phase)
+    run_dir = Path(eng.paths.logs_dir) / eng.state.run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    before = sorted(p.name for p in run_dir.iterdir())
+    run_dir.chmod(0o500)
+    eng.provider._handler = lambda req: pytest.fail("no agent may be launched")
+    try:
+        for _ in range(3):
+            with pytest.raises(UnreadableEntryError, match="cannot publish into logs/"):
+                eng.step()
+            persisted = load_state(eng.paths.state_file)
+            assert persisted.phase is phase
+            assert persisted.local_pending_phase == ""
+            assert persisted.local_pending_attempts == 0
+    finally:
+        run_dir.chmod(0o700)
+    assert sorted(p.name for p in run_dir.iterdir()) == before, "the gate left something behind"
     launches: list[int] = []
 
     def implements(req):

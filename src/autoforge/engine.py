@@ -4414,14 +4414,18 @@ class ControllerEngine:
         # of it are launched from the same directory, and for a LOCAL run
         # that directory comes from the contract (see :meth:`_execution_cwd`).
         cwd = self._execution_cwd()
-        # The logger is opened -- and the event journal read -- *before* the
+        # The logger is opened -- and the run directory proved to take a
+        # new entry, the event journal proved appendable -- *before* the
         # agent is launched, not at the first write after it returns. The
-        # journal lives where the agents write, so its recovery read is
-        # bounded (see :data:`autoforge.runlog.MAX_EVENT_JOURNAL_BYTES`) and
-        # can refuse; a refusal must land before a write-capable agent has
-        # done work that would then go unlogged. One logger serves every
-        # attempt of this invocation; each write still re-verifies the
-        # state-directory capability it goes through.
+        # run log lives where the agents write, so opening it can refuse (a
+        # run directory the controller cannot publish into, a journal that
+        # is a link or a FIFO or past
+        # :data:`autoforge.runlog.MAX_EVENT_JOURNAL_BYTES`); a refusal must
+        # land before a write-capable agent has done work that would then go
+        # unlogged. The journal is never read: the step sequence comes from
+        # the run's step directories. One logger serves every attempt of this
+        # invocation; each write still re-verifies the state-directory
+        # capability it goes through.
         logger = self._logger()
         correction_error: str | None = None
         attempt = 0

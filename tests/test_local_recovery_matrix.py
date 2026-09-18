@@ -574,10 +574,11 @@ def test_a_fix_round_is_not_charged_twice_by_a_crash(tmp_path):
 def test_an_oversized_event_journal_left_by_an_agent_is_refused_not_materialised(
     tmp_path, monkeypatch
 ):
-    """R11-F2: the journal is where the agents can write. A resumed phase
-    opens the logger before it executes anything, and that open must be
-    bounded: a sparse journal is refused as corrupt after one byte past the
-    budget, with nothing persisted and nothing executed."""
+    """R11-F2, then #51: the journal is where the agents can write. A resumed
+    phase opens the logger before it executes anything, and that open must
+    not depend on what the journal holds: a sparse journal past the budget
+    is refused as corrupt on its size alone, without a byte of it being
+    read, with nothing persisted and nothing executed."""
     import os
 
     import autoforge.safefs as safefs
@@ -619,8 +620,11 @@ def test_an_oversized_event_journal_left_by_an_agent_is_refused_not_materialised
     again.provider._handler = lambda req: pytest.fail("the reviewer must not be launched")
     with pytest.raises(StateError, match="corrupted event journal.*larger than"):
         again.step()
-    assert MAX_EVENT_JOURNAL_BYTES + 1 in asked, asked
-    assert max(got) == MAX_EVENT_JOURNAL_BYTES + 1, "the sparse journal was materialised"
+    # The sparse journal was neither materialised nor read at all: the only
+    # bounded reads are state.json and the specification, each a few
+    # kilobytes, and no read came back anywhere near the journal budget.
+    assert asked and got, "the step's other reads still happen"
+    assert max(got) < 1024 * 1024, "the sparse journal was read"
     # The step charged its budget (persisted before any launch, as always)
     # and nothing else moved: same phase, same round, same bound tree.
     after = load_state(Path(eng.paths.state_dir) / "state.json")
@@ -632,10 +636,10 @@ def test_an_oversized_event_journal_left_by_an_agent_is_refused_not_materialised
 
 
 def test_a_journal_enlarged_by_the_agent_refuses_the_post_run_append_bounded(tmp_path, monkeypatch):
-    """#55: the append that records the invocation reads the journal *after*
-    the agent returned, so it is the one read an agent can enlarge the file
-    for. It is bounded like the recovery read: refused one byte past the
-    budget, with the invocation's artifacts already published and the launch
+    """#55, then #51: the append that records the invocation re-inspects the
+    journal *after* the agent returned, so it is the one check an agent can
+    enlarge the file for. It is refused on the file's size without reading
+    it, with the invocation's artifacts already published and the launch
     checkpoint already durable, so `resume` re-enters the phase as a retry
     judged against the baseline from before the agent -- it does not demand a
     second implementation on top of the first."""
@@ -676,7 +680,7 @@ def test_a_journal_enlarged_by_the_agent_refuses_the_post_run_append_bounded(tmp
     eng.provider._handler = implements_and_enlarges_the_journal
     with pytest.raises(StateError, match="corrupted event journal.*larger than"):
         eng.step()
-    assert max(got) == MAX_EVENT_JOURNAL_BYTES + 1, "the oversized journal was materialised"
+    assert not got or max(got) < 1024 * 1024, "the oversized journal was read"
     assert journal.stat().st_size == 2 * MAX_EVENT_JOURNAL_BYTES, "not carried forward"
     step_dirs = sorted(p.name for p in journal.parent.iterdir() if p.is_dir())
     assert step_dirs == ["001-analyze_execute-1"], "the invocation's artifacts were published"
@@ -706,6 +710,75 @@ def test_a_journal_enlarged_by_the_agent_refuses_the_post_run_append_bounded(tmp
     assert "A previous invocation of ANALYZE_EXECUTE" in prompts[0]
     steps = sorted(p.name for p in journal.parent.iterdir() if p.is_dir())
     assert len(steps) == 2 and steps[1].startswith("002-analyze_execute-"), steps
+    eng2.close()
+
+
+def test_a_foreign_file_the_agent_renamed_over_the_journal_receives_nothing(tmp_path):
+    """PR #91 review, fifth round, end to end: the agent renames a small
+    single-link regular file of the operator's over ``events.jsonl`` while
+    it runs. Every check an open of the *name* can make passes for that
+    file, and the controller used to append its record into it. The
+    journal is now opened before the launch and the descriptor is held
+    across the invocation, so the append after the agent returned finds a
+    different inode at the name and refuses: the operator's file is byte
+    for byte what it was, the invocation's artifacts are published, the
+    launch checkpoint is durable, and `resume` re-enters the phase as a
+    retry once the operator has moved the file aside."""
+    import os
+
+    from autoforge.safefs import UnsafePathError
+
+    root = local_repo(tmp_path)
+    eng = make_local_engine(root, FEATURE)
+    eng.step()  # INITIALIZING -> ANALYZE_EXECUTE
+    before = fingerprint(root)
+    journal = Path(eng.paths.logs_dir) / eng.state.run_id / "events.jsonl"
+    # The operator's file lives outside the working tree, so that it is not
+    # part of the workspace fingerprint the retry is judged against.
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    foreign = outside / "operator-notes.txt"
+    foreign.write_text("operator data\n", encoding="utf-8")
+    foreign_ino = foreign.stat().st_ino
+
+    def implements_and_replaces_the_journal(req):
+        touch_impl(root, "v1\n")
+        assert journal.is_file(), "the journal is opened, and so exists, before the launch"
+        os.rename(foreign, journal)
+        return impl_result()
+
+    eng.provider._handler = implements_and_replaces_the_journal
+    with pytest.raises(UnsafePathError, match="refusing to append to .*events.jsonl") as exc:
+        eng.step()
+    assert "different regular file now" in str(exc.value)
+    assert "journal line was not written" in str(exc.value)
+    assert journal.stat().st_ino == foreign_ino, "the operator's file keeps the name"
+    assert journal.read_text(encoding="utf-8") == "operator data\n", "and its content"
+    step_dirs = sorted(p.name for p in journal.parent.iterdir() if p.is_dir())
+    assert step_dirs == ["001-analyze_execute-1"], "the invocation's artifacts were published"
+    saved = load_state(eng.paths.state_file)
+    assert saved.phase == Phase.ANALYZE_EXECUTE
+    assert saved.local_pending_phase == "ANALYZE_EXECUTE"
+    assert saved.local_pending_fingerprint == before
+    assert saved.local_pending_attempts == 1
+    eng.close()
+
+    # The operator moves their file aside and resumes in a new process: a
+    # fresh journal is created, the retry is judged against the checkpoint.
+    journal.rename(foreign)
+    eng2 = fresh(root)
+    launches: list[int] = []
+
+    def continues(req):
+        launches.append(load_state(eng2.paths.state_file).local_pending_attempts)
+        return impl_result(changed=False)
+
+    eng2.provider._handler = continues
+    assert eng2.step().next_phase == "REVIEW"
+    assert launches == [2], "a retry of the same entry, not a fresh one"
+    assert journal.stat().st_ino != foreign_ino
+    assert journal.read_bytes().count(b"\n") == 1, "one line: the retry"
+    assert foreign.read_text(encoding="utf-8") == "operator data\n"
     eng2.close()
 
 

@@ -23,6 +23,8 @@ cell, that it is byte-for-byte and inode-for-inode what it was before.
 import errno
 import os
 import stat
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 import pytest
 
@@ -49,6 +51,12 @@ class Sentinel:
         assert st.st_mtime_ns == self.mtime, "written to in place"
 
 
+def _append(root: SafeRoot, rel: str, text: str, **kwargs) -> None:
+    """Open, append once and close: the append as a single controller write."""
+    with root.open_append(rel, **kwargs) as handle:
+        root.append_to(handle, text)
+
+
 # -- the operations under test -------------------------------------------------
 # Each takes an open root and a relative path, and is a *controller write* or
 # a controller read of its own artifact. Together they are every way this
@@ -57,7 +65,7 @@ OPERATIONS = {
     "write_bytes": lambda root, rel: root.write_bytes(rel, b"controller\n"),
     "write_text": lambda root, rel: root.write_text(rel, "controller\n"),
     "create_exclusive": lambda root, rel: root.create_exclusive(rel, b"controller\n"),
-    "append_text": lambda root, rel: root.append_text(rel, "controller\n"),
+    "append": lambda root, rel: _append(root, rel, "controller\n"),
     "read_bytes": lambda root, rel: root.read_bytes(rel),
     "read_text": lambda root, rel: root.read_text(rel),
     "unlink": lambda root, rel: root.unlink(rel),
@@ -183,18 +191,281 @@ def test_a_write_over_a_planted_entry_still_produces_the_controllers_own_file(tm
     sentinel.assert_untouched()
 
 
-def test_append_replaces_a_hard_link_instead_of_writing_the_shared_inode(tmp_path):
+def test_append_refuses_a_hard_link_instead_of_writing_the_shared_inode(tmp_path):
+    """#51 restored the in-place append, so a hard link at the journal's name
+    is refused on the descriptor -- the inode has two names, and appending
+    through it would extend a file the controller did not create -- and
+    nothing is written anywhere: not to the shared inode, not to a fresh
+    one. The name keeps both its content and its identity for the operator
+    to look at, as the refusal tells them to. The same holds for a second
+    name given to the journal's own inode *after* it was opened: the append
+    re-inspects the held descriptor and refuses on the link count."""
+    from autoforge.safefs import UnsafePathError
+
     sentinel = Sentinel(tmp_path)
     root_dir = tmp_path / "root"
     root_dir.mkdir()
     os.link(sentinel.path, root_dir / "events.jsonl")
+    before = (root_dir / "events.jsonl").stat()
 
+    # The refusal describes what an append would do to the shared inode
+    # (alter it through its other name), not the replacement it never does.
+    refusal = "hard link: 2 directory entries name this file, so writing here would alter"
     with SafeRoot.open(root_dir) as root:
-        root.append_text("events.jsonl", "controller\n")
+        with pytest.raises(UnsafePathError, match=refusal):
+            root.open_append("events.jsonl")
 
     sentinel.assert_untouched()
-    assert (root_dir / "events.jsonl").read_text(encoding="utf-8") == SENTINEL + "controller\n"
-    assert (root_dir / "events.jsonl").stat().st_nlink == 1
+    after = (root_dir / "events.jsonl").stat()
+    assert (after.st_ino, after.st_nlink, after.st_size) == (before.st_ino, 2, before.st_size)
+    assert sorted(p.name for p in root_dir.iterdir()) == ["events.jsonl"], "no temporary left"
+
+    # The controller's own journal, given a second name while it was held.
+    (root_dir / "events.jsonl").unlink()
+    (root_dir / "events.jsonl").write_text("old\n", encoding="utf-8")
+    with SafeRoot.open(root_dir) as root, root.open_append("events.jsonl") as journal:
+        os.link(root_dir / "events.jsonl", tmp_path / "second-name")
+        with pytest.raises(UnsafePathError, match=refusal):
+            root.append_to(journal, "controller\n")
+    assert (root_dir / "events.jsonl").read_text(encoding="utf-8") == "old\n"
+    assert (tmp_path / "second-name").stat().st_nlink == 2
+
+
+def _rename_a_foreign_file_over(root_dir, journal, foreign) -> None:
+    os.rename(foreign, journal)
+
+
+def _unlink_and_create_afresh(root_dir, journal, foreign) -> None:
+    journal.unlink()
+    journal.write_text("planted\n", encoding="utf-8")
+
+
+def _unlink_and_link_the_foreign_file(root_dir, journal, foreign) -> None:
+    journal.unlink()
+    os.link(foreign, journal)
+
+
+def _unlink_and_plant_a_symlink(root_dir, journal, foreign) -> None:
+    journal.unlink()
+    journal.symlink_to(foreign)
+
+
+def _link_out_and_unlink(root_dir, journal, foreign) -> None:
+    os.link(journal, root_dir.parent / "stolen-journal")
+    journal.unlink()
+
+
+def _rename_out(root_dir, journal, foreign) -> None:
+    os.rename(journal, root_dir.parent / "stolen-journal")
+
+
+def _unlink(root_dir, journal, foreign) -> None:
+    journal.unlink()
+
+
+def _replace_the_directory(root_dir, journal, foreign) -> None:
+    os.rename(journal.parent, root_dir.parent / "stolen-run")
+    journal.parent.mkdir()
+    os.rename(foreign, journal)
+
+
+def _remove_the_directory(root_dir, journal, foreign) -> None:
+    os.rename(journal.parent, root_dir.parent / "stolen-run")
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        _rename_a_foreign_file_over,
+        _unlink_and_create_afresh,
+        _unlink_and_link_the_foreign_file,
+        _unlink_and_plant_a_symlink,
+        _link_out_and_unlink,
+        _rename_out,
+        _unlink,
+        _replace_the_directory,
+        _remove_the_directory,
+    ],
+    ids=[
+        "foreign file renamed over",
+        "unlinked, fresh file created",
+        "unlinked, foreign file linked",
+        "unlinked, symlink planted",
+        "linked out and unlinked",
+        "renamed out",
+        "unlinked",
+        "directory replaced",
+        "directory removed",
+    ],
+)
+def test_an_append_refuses_a_name_that_no_longer_holds_the_opened_inode(tmp_path, tamper):
+    """PR #91 review, fifth round: the append is bound to the inode that was
+    inspected at the open, not to whatever is at the name later.
+
+    The handle is opened at one moment and appended through at another
+    (the run logger opens before the launch and appends after the agent
+    returned), and between the two a same-user process can put anything at
+    the name: rename a small single-link regular file of the operator's
+    over it -- which passes every per-open check, since it *is* a regular
+    file with one name -- create a fresh file after unlinking the journal,
+    link or symlink a foreign file there, move the journal out, or replace
+    the whole directory. The append must refuse every one of them, and the
+    refusal must cost nothing: no byte reaches the file now at the name, no
+    byte reaches the inode that was opened, the sentinel outside the root
+    is untouched, and the controller neither creates nor removes an entry.
+
+    What makes this possible is the held descriptor: the opened inode stays
+    allocated while it is held, so the fresh file cannot reuse its number
+    and an identity comparison of the name against the handle is exact.
+    """
+    sentinel = Sentinel(tmp_path)
+    root_dir = tmp_path / "root"
+    run_dir = root_dir / "run"
+    run_dir.mkdir(parents=True)
+    journal = run_dir / "events.jsonl"
+    journal.write_text("old\n", encoding="utf-8")
+    foreign = tmp_path / "operator-notes.txt"
+    foreign.write_text("operator data\n", encoding="utf-8")
+    foreign_before = foreign.stat()
+
+    with SafeRoot.open(root_dir) as root, root.open_append("run/events.jsonl") as handle:
+        opened = os.fstat(handle.fd)
+        tamper(root_dir, journal, foreign)
+        listing = sorted(os.listdir(run_dir)) if run_dir.exists() else None
+        with pytest.raises(UnsafePathError, match="refusing to append to") as exc:
+            root.append_to(handle, "controller\n")
+        assert os.fstat(handle.fd).st_size == opened.st_size, "the opened inode received the line"
+        assert "written" in str(exc.value), "the refusal says nothing was written"
+
+    sentinel.assert_untouched()
+    assert (sorted(os.listdir(run_dir)) if run_dir.exists() else None) == listing, (
+        "the controller created or removed an entry"
+    )
+    if journal.exists() or journal.is_symlink():
+        st = journal.lstat()
+        assert (st.st_ino, st.st_size) != (opened.st_ino, opened.st_size + len("controller\n"))
+    for planted in (journal, foreign, root_dir.parent / "stolen-journal"):
+        if planted.is_file() and not planted.is_symlink():
+            assert "controller" not in planted.read_text(encoding="utf-8"), planted
+    if foreign.exists():
+        assert foreign.read_text(encoding="utf-8") == "operator data\n"
+        assert foreign.stat().st_ino == foreign_before.st_ino
+    elif journal.is_file() and not journal.is_symlink():
+        # The operator's file now carries the journal's name: still theirs.
+        assert journal.read_text(encoding="utf-8") == "operator data\n"
+        assert journal.stat().st_ino == foreign_before.st_ino
+
+
+def _link_out_and_unlink_by_path(journal, stolen) -> None:
+    os.link(journal, stolen)
+    journal.unlink()
+
+
+def _rename_out_by_path(journal, stolen) -> None:
+    os.rename(journal, stolen)
+
+
+@pytest.mark.parametrize(
+    "move", [_link_out_and_unlink_by_path, _rename_out_by_path], ids=["link then unlink", "rename"]
+)
+def test_an_append_follows_its_inode_when_the_name_is_moved_after_the_re_inspection(
+    tmp_path, monkeypatch, move
+):
+    """The stated limit of the in-place append: the window is one syscall.
+
+    The append re-inspects the name and the held inode immediately before
+    the ``write(2)``, and a move that lands between the two is not seen: a
+    second name outside the root plus an unlink of this one, or a plain
+    rename, which no link count ever sees. The line then lands in the held
+    inode under its new name and the append reports success. The race is
+    made deterministic by moving the name inside the write call itself,
+    after the real re-inspection has passed.
+
+    What must hold, and is all the module promises: the bytes reach the
+    *same inode* the controller inspected (its own journal, now under a
+    name of the other process's choosing), a foreign file outside the root
+    is untouched, no other inode receives the line, and no temporary or
+    replacement appears under the root. A file the other process puts at
+    the name in that window receives nothing, because the write goes
+    through the held descriptor and not through the name.
+    """
+    import autoforge.safefs as safefs
+
+    sentinel = Sentinel(tmp_path)
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    journal = root_dir / "events.jsonl"
+    journal.write_text("old\n", encoding="utf-8")
+    inode = journal.stat().st_ino
+    stolen = tmp_path / "stolen-journal"
+    decoy = tmp_path / "decoy.txt"
+    decoy.write_text("decoy\n", encoding="utf-8")
+    real_write = safefs.os.write
+    moved: list[int] = []
+
+    def move_the_name_then_write(fd, data):
+        if os.fstat(fd).st_ino == inode and not moved:
+            moved.append(fd)
+            move(journal, stolen)
+            os.rename(decoy, journal)  # and something else takes the name
+        return real_write(fd, data)
+
+    monkeypatch.setattr(safefs.os, "write", move_the_name_then_write)
+
+    with SafeRoot.open(root_dir) as root:
+        _append(root, "events.jsonl", "controller\n")
+
+    assert moved, "the race point was never reached"
+    sentinel.assert_untouched()
+    assert stolen.read_text(encoding="utf-8") == "old\ncontroller\n"
+    assert stolen.stat().st_ino == inode, "the line reached an inode that was not inspected"
+    assert stolen.stat().st_nlink == 1
+    assert journal.read_text(encoding="utf-8") == "decoy\n", "the file at the name got the line"
+    assert [e.name for e in root_dir.iterdir()] == ["events.jsonl"]
+
+
+def test_an_append_refuses_an_inode_unlinked_before_the_inspection(tmp_path, monkeypatch):
+    """PR #91 review, fourth round: the inspection must find exactly one name.
+
+    A name unlinked between the ``open`` and the ``fstat`` leaves a
+    descriptor on an inode with ``st_nlink == 0``, and a write through it
+    would go into a file nothing names and report success, with no journal
+    left under the root to show for it. The race is made deterministic by
+    unlinking the name inside the open call, before the real inspection.
+
+    What must hold: the open is refused on the descriptor, no handle is
+    handed back, the bytes reach no inode at all (the unlinked one
+    included), the sentinel is untouched and nothing is created under the
+    root.
+    """
+    import autoforge.safefs as safefs
+
+    sentinel = Sentinel(tmp_path)
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    journal = root_dir / "events.jsonl"
+    journal.write_text("old\n", encoding="utf-8")
+    keep = os.open(journal, os.O_RDONLY)  # the unlinked inode, for inspection afterwards
+    real_open = os.open
+
+    def open_then_unlink_the_name(name, flags, *args, **kwargs):
+        fd = real_open(name, flags, *args, **kwargs)
+        if name == "events.jsonl":
+            os.unlink(name, dir_fd=kwargs["dir_fd"])
+        return fd
+
+    monkeypatch.setattr(safefs.os, "open", open_then_unlink_the_name)
+
+    try:
+        with SafeRoot.open(root_dir) as root:
+            with pytest.raises(UnsafePathError, match="no directory entry names"):
+                root.open_append("events.jsonl")
+        sentinel.assert_untouched()
+        assert os.fstat(keep).st_size == len("old\n"), "the unlinked inode received the line"
+        assert os.fstat(keep).st_nlink == 0
+    finally:
+        os.close(keep)
+    assert [e.name for e in root_dir.iterdir()] == [], "a journal or a temporary was created"
 
 
 def test_a_temporary_hard_linked_out_during_the_write_is_never_published(tmp_path, monkeypatch):
@@ -270,7 +541,7 @@ def test_a_directory_at_the_target_is_refused_while_a_special_entry_is_replaced(
 def test_a_fifo_never_blocks_the_controller(tmp_path):
     """O_NONBLOCK: an in-place open of a FIFO with no peer must fail, not hang.
 
-    `read_text` and `append_text` are the operations that must open the entry
+    `read_text` and `open_append` are the operations that must open the entry
     that is there (there is nothing to rename into place), so they are the
     ones a FIFO could stall. A whole-file write never opens it at all.
     """
@@ -278,7 +549,7 @@ def test_a_fifo_never_blocks_the_controller(tmp_path):
     root_dir.mkdir()
     os.mkfifo(root_dir / "pipe")
     with SafeRoot.open(root_dir) as root:
-        for op in ("read_text", "append_text"):
+        for op in ("read_text", "append"):
             with pytest.raises((StateError, OSError)):
                 OPERATIONS[op](root, "pipe")
 
@@ -309,10 +580,13 @@ def _reads_asked(monkeypatch) -> list[int]:
 def test_a_bounded_append_refuses_an_oversized_file_without_reading_or_touching_it(
     tmp_path, monkeypatch
 ):
-    """`append_text` is read-existing + publish-fresh-inode, so the read is the
-    cost. With a limit it asks for one byte past it and no more, and the
-    refusal lands before anything is written: the oversized file keeps its
-    name, its inode and its size, and is never carried into a fresh inode."""
+    """The append writes in place through the opened descriptor, so the
+    file's size is a single `fstat` and nothing is ever read. With a limit
+    the refusal lands at the open, before anything is written: the
+    oversized file keeps its name, its inode and its size, no handle is
+    handed back, and no temporary is created. A file that grows past the
+    limit while the handle is held is refused again at the append, on the
+    same descriptor."""
     from autoforge.safefs import ReadLimitExceeded
 
     root_dir = tmp_path / "root"
@@ -324,12 +598,20 @@ def test_a_bounded_append_refuses_an_oversized_file_without_reading_or_touching_
     asked = _reads_asked(monkeypatch)
     with SafeRoot.open(root_dir) as root:
         with pytest.raises(ReadLimitExceeded) as exc:
-            root.append_text("events.jsonl", "line\n", limit=100)
+            root.open_append("events.jsonl", limit=100)
     assert exc.value.relpath == "events.jsonl" and exc.value.limit == 100
-    assert asked == [101], asked
+    assert asked == [], asked
     after = target.stat()
     assert (after.st_ino, after.st_size) == (before.st_ino, before.st_size)
     assert sorted(p.name for p in root_dir.iterdir()) == ["events.jsonl"], "no temporary left"
+
+    # Enlarged while held: the append refuses on the descriptor.
+    os.truncate(target, 10)
+    with SafeRoot.open(root_dir) as root, root.open_append("events.jsonl", limit=100) as handle:
+        os.truncate(target, 1 << 20)
+        with pytest.raises(ReadLimitExceeded):
+            root.append_to(handle, "line\n")
+    assert asked == [] and target.stat().st_size == 1 << 20
 
 
 def test_a_bounded_append_at_exactly_the_limit_still_appends(tmp_path):
@@ -337,10 +619,282 @@ def test_a_bounded_append_at_exactly_the_limit_still_appends(tmp_path):
     root_dir.mkdir()
     (root_dir / "events.jsonl").write_bytes(b"x" * 100)
     with SafeRoot.open(root_dir) as root:
-        root.append_text("events.jsonl", "line\n", limit=100)
-        root.append_text("missing.jsonl", "first\n", limit=0)
+        _append(root, "events.jsonl", "line\n", limit=100)
+        _append(root, "missing.jsonl", "first\n", limit=0)
     assert (root_dir / "events.jsonl").read_bytes() == b"x" * 100 + b"line\n"
     assert (root_dir / "missing.jsonl").read_bytes() == b"first\n"
+
+
+def test_an_append_extends_the_inode_in_place_at_the_cost_of_the_line(tmp_path, monkeypatch):
+    """#51: the journal is appended to, not rewritten. Across many appends
+    the name keeps one inode, every byte written to it is a byte of a line
+    (no copy of the existing content), nothing is read, and no temporary is
+    published over the name. This holds whether each line has its own
+    open or many lines go through one held handle."""
+    import autoforge.safefs as safefs
+
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    target = root_dir / "events.jsonl"
+    written: list[int] = []
+    replaced: list[str] = []
+    real_write = safefs.os.write
+    real_replace = safefs.os.replace
+
+    def counted_write(fd, data):
+        n = real_write(fd, data)
+        written.append(n)
+        return n
+
+    def counted_replace(src, dst, **kwargs):
+        replaced.append(dst)
+        return real_replace(src, dst, **kwargs)
+
+    monkeypatch.setattr(safefs.os, "write", counted_write)
+    monkeypatch.setattr(safefs.os, "replace", counted_replace)
+    asked = _reads_asked(monkeypatch)
+    lines = [f"line {i} " + "x" * (1000 * i) + "\n" for i in range(1, 9)]
+    with SafeRoot.open(root_dir) as root:
+        _append(root, "events.jsonl", lines[0])
+        first = target.stat()
+        for line in lines[1:4]:
+            _append(root, "events.jsonl", line)
+        with root.open_append("events.jsonl") as handle:
+            for line in lines[4:]:
+                root.append_to(handle, line)
+    assert target.read_text(encoding="utf-8") == "".join(lines)
+    assert target.stat().st_ino == first.st_ino, "the same inode throughout"
+    assert sum(written) == sum(len(line.encode()) for line in lines), "only the lines were written"
+    assert replaced == [] and asked == []
+    assert sorted(p.name for p in root_dir.iterdir()) == ["events.jsonl"]
+
+
+def test_open_append_creates_the_file_and_its_parent_and_nothing_else(tmp_path):
+    """The open is the moment the journal comes to exist: an absent file is
+    created empty, its parent with it, and a second open finds the same
+    inode. The handle knows what it holds."""
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    with SafeRoot.open(root_dir) as root:
+        with root.open_append("run-1/events.jsonl") as handle:
+            created = (root_dir / "run-1" / "events.jsonl").stat()
+            assert created.st_size == 0
+            assert handle.identity == (created.st_dev, created.st_ino)
+            assert handle.relpath == "run-1/events.jsonl" and handle.limit is None
+            assert "run-1/events.jsonl" in repr(handle)
+            root.append_to(handle, "first\n")
+        with root.open_append("run-1/events.jsonl", limit=6) as again:
+            assert again.identity == handle.identity and again.limit == 6
+    assert sorted(p.name for p in (root_dir / "run-1").iterdir()) == ["events.jsonl"]
+    assert (root_dir / "run-1" / "events.jsonl").read_bytes() == b"first\n"
+
+
+def test_a_closed_append_handle_refuses_to_be_appended_through(tmp_path):
+    """Closing releases the descriptor and with it the binding; a later append
+    through the handle is a programming error, reported as such rather than
+    as a write to whatever number the kernel handed out since."""
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    with SafeRoot.open(root_dir) as root:
+        handle = root.open_append("events.jsonl")
+        handle.close()
+        handle.close()  # idempotent
+        with pytest.raises(StateError, match="already closed"):
+            root.append_to(handle, "late\n")
+        with pytest.raises(StateError, match="already closed"):
+            os.fstat(handle.fd)
+    assert (root_dir / "events.jsonl").read_bytes() == b""
+
+
+def test_open_append_refuses_every_entry_the_append_would_have_to_refuse(tmp_path):
+    """Whatever cannot be a journal is refused at the open, before the launch,
+    so the refusal lands before any work is done and no handle exists."""
+    from autoforge.safefs import UnsafePathError
+
+    sentinel = Sentinel(tmp_path)
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    for kind in ("symlink", "hardlink", "fifo", "directory"):
+        rel = f"{kind}.jsonl"
+        plant_final(root_dir, rel, kind, sentinel)
+        with SafeRoot.open(root_dir) as root:
+            with pytest.raises(UnsafePathError):
+                root.open_append(rel)
+    sentinel.assert_untouched()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses file permissions")
+def test_an_unwritable_file_is_refused_at_the_open(tmp_path):
+    """A regular file the controller may not open for writing is an access
+    fact, not an unsafe path: the open reports it as such and neither
+    writes, replaces nor creates anything. A file made unwritable *after*
+    the open is another matter: the held descriptor was granted write
+    access when it was opened and keeps it, as any descriptor does, so the
+    append still lands; the next open refuses."""
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    target = root_dir / "events.jsonl"
+    target.write_bytes(b"theirs\n")
+    target.chmod(0o444)
+    before = target.stat()
+    try:
+        with SafeRoot.open(root_dir) as root:
+            with pytest.raises(UnreadableEntryError) as by_open:
+                root.open_append("events.jsonl")
+    finally:
+        target.chmod(0o600)
+    assert by_open.value.path.endswith("events.jsonl")
+    assert "Permission denied" in str(by_open.value)
+    assert target.read_bytes() == b"theirs\n"
+    assert (target.stat().st_ino, target.stat().st_size) == (before.st_ino, before.st_size)
+    assert sorted(p.name for p in root_dir.iterdir()) == ["events.jsonl"], "no temporary left"
+
+    try:
+        with SafeRoot.open(root_dir) as root, root.open_append("events.jsonl") as handle:
+            target.chmod(0o444)
+            root.append_to(handle, "controller\n")
+            with pytest.raises(UnreadableEntryError):
+                root.open_append("events.jsonl")
+    finally:
+        target.chmod(0o600)
+    assert target.read_bytes() == b"theirs\ncontroller\n"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses file permissions")
+@contextmanager
+def _descriptors_left_open(monkeypatch) -> Iterator[list[int]]:
+    """Yield a list that, once the block has run, holds every descriptor the
+    block opened (or duplicated) and never closed -- whether it returned or
+    raised."""
+    real_open, real_dup, real_close = os.open, os.dup, os.close
+    opened: list[int] = []
+    closed: list[int] = []
+    left: list[int] = []
+
+    def counting_open(*args, **kwargs):
+        fd = real_open(*args, **kwargs)
+        opened.append(fd)
+        return fd
+
+    def counting_dup(fd):
+        fd = real_dup(fd)
+        opened.append(fd)
+        return fd
+
+    def counting_close(fd):
+        closed.append(fd)
+        real_close(fd)
+
+    monkeypatch.setattr(os, "open", counting_open)
+    monkeypatch.setattr(os, "dup", counting_dup)
+    monkeypatch.setattr(os, "close", counting_close)
+    try:
+        yield left
+    finally:
+        monkeypatch.setattr(os, "open", real_open)
+        monkeypatch.setattr(os, "dup", real_dup)
+        monkeypatch.setattr(os, "close", real_close)
+        left[:] = opened
+        for fd in closed:
+            left.remove(fd)
+
+
+def test_open_append_releases_the_descriptor_when_the_directory_fsync_fails(tmp_path, monkeypatch):
+    """PR #91 review, sixth round: a refused open owns nothing afterwards.
+
+    The directory ``fsync`` that makes a created name durable runs after
+    the journal is open and before the handle that would own it exists. A
+    fatal error there (``EIO``: the entry may not be durable, so the open
+    cannot report success) used to leave the journal descriptor open with
+    nothing to close it -- one leaked descriptor per refused open -- and
+    escaped as a raw ``OSError``, past the typed boundary every other
+    failure of this open reports through.
+
+    What must hold: every descriptor the call opened is closed by the time
+    it raises; the error is a ``StateError`` naming the file and the cause,
+    as an ``open`` failure is; the journal, which this open did not create,
+    is exactly what it was; and once the directory can be fsynced again the
+    same open succeeds and appends.
+    """
+    import autoforge.safefs as safefs
+
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    journal = root_dir / "events.jsonl"
+    journal.write_text("old\n", encoding="utf-8")
+    before = journal.stat()
+    real_fsync = os.fsync
+
+    def failing_directory_fsync(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(errno.EIO, "injected fsync failure")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(safefs.os, "fsync", failing_directory_fsync)
+    with SafeRoot.open(root_dir) as root:
+        with (
+            pytest.raises(StateError, match="cannot open .*events.jsonl.*injected fsync") as exc,
+            _descriptors_left_open(monkeypatch) as left,
+        ):
+            root.open_append("events.jsonl", limit=1 << 20)
+        assert left == [], "a refused open leaked a descriptor"
+        assert not isinstance(exc.value, (UnsafePathError, UnreadableEntryError))
+        assert isinstance(exc.value.__cause__, OSError)
+        after = journal.stat()
+        assert (after.st_ino, after.st_size, after.st_mtime_ns) == (
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        )
+        assert [e.name for e in root_dir.iterdir()] == ["events.jsonl"]
+
+        monkeypatch.setattr(safefs.os, "fsync", real_fsync)
+        with _descriptors_left_open(monkeypatch) as left:
+            _append(root, "events.jsonl", "new\n")
+        assert left == []
+    assert journal.read_bytes() == b"old\nnew\n"
+
+
+def test_open_append_treats_a_directory_that_cannot_be_fsynced_as_best_effort(
+    tmp_path, monkeypatch
+):
+    """The same tolerance every published name has: a filesystem that
+    rejects ``fsync`` on a directory (``EINVAL``) weakens durability and
+    does not refuse the open, so the handle comes back and appends."""
+    import autoforge.safefs as safefs
+
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    real_fsync = os.fsync
+
+    def refusing_directory_fsync(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "no directory fsync here")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(safefs.os, "fsync", refusing_directory_fsync)
+    with SafeRoot.open(root_dir) as root:
+        _append(root, "run-1/events.jsonl", "first\n")
+    assert (root_dir / "run-1" / "events.jsonl").read_bytes() == b"first\n"
+
+
+def test_open_append_discovers_a_directory_that_cannot_take_the_file(tmp_path):
+    """Creating the journal is part of the open, so a run directory that
+    cannot take a new entry is found at the open -- before the launch -- as
+    an access fact on the journal's path, and nothing is created."""
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    run_dir = root_dir / "run-1"
+    run_dir.mkdir()
+    run_dir.chmod(0o500)
+    try:
+        with SafeRoot.open(root_dir) as root:
+            with pytest.raises(UnreadableEntryError) as by_open:
+                root.open_append("run-1/events.jsonl")
+    finally:
+        run_dir.chmod(0o700)
+    assert "Permission denied" in str(by_open.value)
+    assert sorted(p.name for p in run_dir.iterdir()) == [], "nothing was created"
 
 
 # -- identity: a root is an inode, not a pathname ------------------------------
