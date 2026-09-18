@@ -52,12 +52,20 @@ that has acquired a second name is emptied through the still-open descriptor,
 unlinked and reported, never renamed over the target.
 
 The one write that is not a whole-file replacement is the append
-(``append_text``): a journal line is written through the opened inode with
-``O_APPEND``, after the descriptor has been inspected as a regular file with
-exactly one name, so the cost of an append is the line rather than the file.
-Nothing is published after the write, so there is no step a post-write
-inspection could withhold; what the append does and does not guarantee is
-stated below with the rest, and it is the same inode-level guarantee.
+(``open_append`` then ``append_to``): a journal line is written through an
+inode opened with ``O_APPEND`` and inspected as a regular file with exactly
+one name, so the cost of an append is the line rather than the file.  The
+descriptor is *held* between the open and the append, for as long as the
+caller likes (the run logger holds it across an agent invocation), and the
+bytes go through that descriptor and no other: a held descriptor keeps its
+inode allocated, so no rename, link, unlink or inode-number reuse by another
+process can make the append reach an inode other than the one that was
+inspected.  Immediately before the write the append proves again, without
+reading a byte, that the name still resolves under the root to that inode,
+that the inode still has one name, and that it is within the caller's size
+limit; a file renamed over the name, a link given to the inode, or the name
+unlinked or moved away in between is refused, and nothing is written to
+either file.
 
 What this does and does not guarantee
 -------------------------------------
@@ -84,28 +92,25 @@ refused and the inode emptied, but the other process may already have read
 it.  Every byte the controller writes is already readable by that process
 (same user, same files), so this discloses nothing, and it can never make a
 controller write *replace* anything: the inode was created by this process,
-empty, an instant earlier.  The append has the same window, and there the
-other process keeps the bytes rather than an emptied file: between the
-inspection and the ``write(2)`` it can give the journal's inode a second
-name outside the root and drop this one, or rename it there outright, and
-the line then lands in that inode under its new name, with nothing
-published afterwards that a re-inspection could withhold, so the append
-reports success while the journal's name under the root is gone; or it
-can unlink the name outright, and the line is then written into an inode
-nothing names and lost with it, the append again reporting success.  That
-is the controller's *own* journal moved or dropped by a process that could
-already read, copy or delete every byte of it; it is not a write into a
-foreign file, because a foreign inode reaches the journal's name with one
-link only by being renamed there, at which point it is the journal.  No
-re-inspection closes the window, since the move can follow any check, so
-it is stated as the limit and pinned by a test rather than checked for;
-the inspection itself does refuse an inode that is *already* unlinked
-when it looks (``st_nlink == 0``), so the window opens after the
-inspection, never before it.  Linux could close
-even the observation window with an unnamed ``O_TMPFILE`` inode for the
-temporary; that is not done because it does not exist on macOS and would
-make the guarantee platform-shaped, and it would not help the append,
-which must extend a named file.
+empty, an instant earlier.  The append's window is one syscall wide and has
+the same shape: between the re-inspection that immediately precedes the
+``write(2)`` and the write itself, the other process can still rename the
+journal's inode out of the root (or link it out and unlink the root name),
+and the line then lands in the controller's own journal under its new name
+with the append reporting success; or unlink the name outright, and the
+line is written into an inode nothing names and lost with it.  That is the
+controller's *own* bytes moved or dropped by a process that could already
+read, copy or delete every one of them.  What it can never be is a write
+into a foreign file: the bytes go through the descriptor that was
+inspected, so a file put at the journal's name -- renamed there, linked
+there, planted after an unlink -- receives nothing in any window, and is
+refused by the re-inspection in every window but that one syscall.  The
+move itself is not checked for beyond that, since it can follow any check;
+it is stated here and pinned by a test.  Linux could close even the
+observation window with an unnamed ``O_TMPFILE`` inode for the temporary;
+that is not done because it does not exist on macOS and would make the
+guarantee platform-shaped, and it would not help the append, which must
+extend a named file.
 
 Also not guaranteed: the *initial* resolution of the root path itself.
 ``SafeRoot.open`` resolves an ordinary pathname, and a process that can
@@ -187,9 +192,9 @@ class ReadLimitExceeded(StateError):
     """A bounded operation met a file larger than the limit the caller set.
 
     Raised by :meth:`SafeRoot.read_bytes` when a read would have to hold
-    more than the limit, and by :meth:`SafeRoot.append_text` and
-    :meth:`SafeRoot.verify_appendable` when the file is already larger than
-    it: in every case the file is refused before it is read or written.
+    more than the limit, and by :meth:`SafeRoot.open_append` and
+    :meth:`SafeRoot.append_to` when the file is already larger than it: in
+    every case the file is refused before it is read or written.
     """
 
     def __init__(self, relpath: str, limit: int) -> None:
@@ -224,6 +229,13 @@ class UnreadableEntryError(StateError):
     def __init__(self, path: str, message: str) -> None:
         super().__init__(message)
         self.path = path
+
+
+def _hard_link_text(nlink: int) -> str:
+    return (
+        f"a hard link: {nlink} directory entries name this file, so writing here would "
+        "alter a file AutoForge did not create"
+    )
 
 
 def _unsafe(where: str, what: str) -> UnsafePathError:
@@ -316,11 +328,7 @@ def open_regular_at(
         # filesystem reports no link count, in which case a second name can
         # never be ruled out; both are refused rather than written to.
         if writing and st.st_nlink > 1:
-            raise _unsafe(
-                label,
-                f"a hard link: {st.st_nlink} directory entries name this file, so writing "
-                "here would alter a file AutoForge did not create",
-            )
+            raise _unsafe(label, _hard_link_text(st.st_nlink))
         if writing and st.st_nlink < 1:
             raise _unsafe(
                 label,
@@ -368,6 +376,72 @@ class WalkEntry:
     @property
     def is_regular(self) -> bool:
         return stat.S_ISREG(self.st.st_mode)
+
+
+class AppendHandle:
+    """A regular file held open for appending, bound to the inode it was proved on.
+
+    Made by :meth:`SafeRoot.open_append` and written through by
+    :meth:`SafeRoot.append_to`.  The handle *is* the proof: when it was
+    opened, the descriptor was inspected as a single-named regular file at
+    ``relpath`` under its root, within ``limit``; holding it keeps that inode
+    allocated, so its number cannot be reused by a file another process
+    creates, and every append through it can reach that inode and no other.
+    The instance owns the descriptor and must be closed (it is a context
+    manager); dropping it closes it too, as descriptor hygiene rather than
+    as anything safety depends on.
+    """
+
+    __slots__ = ("_fd", "_relpath", "_dev", "_ino", "_limit", "_closed")
+
+    def __init__(self, fd: int, relpath: str, st: os.stat_result, limit: int | None) -> None:
+        self._fd = fd
+        self._relpath = relpath
+        self._dev = st.st_dev
+        self._ino = st.st_ino
+        self._limit = limit
+        self._closed = False
+
+    @property
+    def fd(self) -> int:
+        if self._closed:
+            raise StateError(f"append handle on {self._relpath} is already closed")
+        return self._fd
+
+    @property
+    def relpath(self) -> str:
+        """The root-relative name the file was opened at."""
+        return self._relpath
+
+    @property
+    def identity(self) -> tuple[int, int]:
+        """``(st_dev, st_ino)`` of the inode the handle holds."""
+        return (self._dev, self._ino)
+
+    @property
+    def limit(self) -> int | None:
+        """The size past which an append through this handle is refused."""
+        return self._limit
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            os.close(self._fd)
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:  # pragma: no cover - interpreter shutdown
+            pass
+
+    def __enter__(self) -> AppendHandle:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"AppendHandle({self._relpath!r})"
 
 
 class SafeRoot:
@@ -667,55 +741,29 @@ class SafeRoot:
         finally:
             os.close(parent)
 
-    def append_text(
-        self, relpath: str, text: str, *, mode: int = 0o600, limit: int | None = None
-    ) -> None:
-        """Append ``text`` to ``relpath`` in place, creating it if needed.
+    def open_append(
+        self, relpath: str, *, mode: int = 0o600, limit: int | None = None
+    ) -> AppendHandle:
+        """Open ``relpath`` for appending, creating it if needed, and hold it.
 
         The one write that is not a whole-file replacement. Replacing the
         name would mean reading the existing bytes and publishing them again
         with the new ones, which costs the whole file on every append; a
         journal appended to N times would be rewritten N times. The append
-        therefore goes through the opened inode: ``O_WRONLY | O_APPEND`` with
-        the same ``O_NOFOLLOW | O_NONBLOCK | O_NOCTTY`` open as every other
-        controller open, and the descriptor is inspected before the write --
-        a regular file (no link, FIFO, device or directory) with exactly one
-        name, or :class:`UnsafePathError`.
+        therefore goes through an opened inode: ``O_WRONLY | O_CREAT |
+        O_APPEND`` with the same ``O_NOFOLLOW | O_NONBLOCK | O_NOCTTY`` open
+        as every other controller open, and the descriptor is inspected
+        before it is handed back -- a regular file (no link, FIFO, device or
+        directory) with exactly one name, or :class:`UnsafePathError`; with
+        a ``limit``, one no larger than it, or :class:`ReadLimitExceeded`.
+        Nothing is read, so the cost is the open whatever the file's size.
 
-        What that inspection proves: the write lands in the inode the
-        descriptor holds, and at the inspection that inode was a regular
-        file with exactly one name, this one, under this root. So the append
-        can never extend a *foreign* file through a planted name: a second
-        name for someone else's inode is refused on the descriptor, a
-        symbolic link is refused by the open, and a foreign inode reaches
-        this name with one link only by having been *renamed* here, giving
-        up its old name, at which point it is the file at this name and
-        nothing else. This is the "opened as a regular file with one name"
-        half of the module guarantee.
-
-        What it does not prove: where the inode's name is by the time the
-        bytes land. A same-user process can, after the inspection, give the
-        inode a second name outside the root and unlink this one, or rename
-        it there, and the line is then written into that inode under its new
-        name; the append reports success, because nothing is published
-        afterwards that a re-inspection could withhold. That moves the
-        controller's own journal, whose every byte that process could
-        already read and copy, and it is the same window the named
-        temporary has (module docstring, "Not guaranteed"). The same process
-        can instead unlink the name outright after the inspection, and the
-        line is then written into an inode nothing names and is lost with
-        it, the append again reporting success. A post-write re-inspection
-        would not close either, since the move can follow any check, so the
-        limit is stated and pinned by a test rather than checked for. What
-        *is* checked is the inspection itself: an inode already unlinked
-        when it is inspected (``st_nlink == 0``) is refused, so a name
-        dropped between the open and the ``fstat`` is a refusal, not a
-        line written into nothing.
-
-        With a ``limit`` a file that is already larger than it is refused
-        with :class:`ReadLimitExceeded` before anything is written; nothing
-        is ever read, so the cost of the append is the line, whatever the
-        file's size.
+        The descriptor is returned rather than closed so that the proof
+        outlives this call: :meth:`append_to` writes through it, and only
+        through it, so a caller that opens the file at one moment (before an
+        agent is launched) and appends at another (after it returned) is
+        guaranteed that the bytes reach the inode inspected at the first
+        moment or no inode at all. The caller owns the handle and closes it.
         """
         parts = split_relpath(relpath)
         where = self._describe(parts)
@@ -725,54 +773,86 @@ class SafeRoot:
                 parent, parts[-1], os.O_WRONLY | os.O_CREAT | os.O_APPEND, mode=mode, where=where
             )
             try:
-                _refuse_past(fd, relpath, limit)
-                view = memoryview(text.encode("utf-8"))
-                while view:
-                    view = view[os.write(fd, view) :]
-                os.fsync(fd)
-            except OSError as exc:
-                raise StateError(f"cannot append to {where}: {exc}") from exc
-            finally:
+                st = os.fstat(fd)
+                if limit is not None and st.st_size > limit:
+                    raise ReadLimitExceeded(relpath, limit)
+            except BaseException:
                 os.close(fd)
+                raise
             # The name may have been created by this open; its directory
             # entry is made durable the way a published temporary's is.
             _fsync_fd(parent)
         finally:
             os.close(parent)
+        return AppendHandle(fd, relpath, st, limit)
 
-    def verify_appendable(self, relpath: str, *, limit: int | None = None) -> bool:
-        """Open ``relpath`` exactly as :meth:`append_text` would, and write nothing.
+    def append_to(self, handle: AppendHandle, text: str) -> None:
+        """Append ``text`` through ``handle``, once the file is proved still what was opened.
 
-        Every refusal the append would raise *for the file at that name* is
-        raised here -- a link, a FIFO, a device, a directory, a second name,
-        a file this process may not write, or with a ``limit`` a file
-        already larger than it -- so a caller can make the refusal land at a
-        time of its choosing (before an agent is launched, rather than when
-        its result is being recorded). Returns whether the file exists; an
-        absent file is appendable (the append creates it) and is not created
-        here. Whether the file *can* be created there -- the directory's
-        existence and writability -- is not checked: that is the append's
-        ``O_CREAT`` to discover, since this method creates nothing.
+        The bytes go through the held descriptor, so they can only ever land
+        in the inode :meth:`open_append` inspected; that is the guarantee,
+        and it holds whatever another process did to the name in between.
+        What is proved immediately before the write, each in O(1) and none
+        of it reading a byte, is that the file is still the one the caller
+        means: the name resolves, under *this* root (walked descriptor by
+        descriptor, so a root re-verified since the open is the one that
+        answers), to the held inode by ``lstat`` -- a file renamed over the
+        name, a symbolic link planted at it, or the name unlinked or moved
+        away is refused and nothing is written to whatever is there; the
+        inode still has exactly one name -- a hard link given to it since
+        the open is refused, as it would have been at the open; and the
+        inode is within the handle's limit. Then the line is written and
+        fsynced.
+
+        What remains is the window between that re-inspection and the
+        ``write(2)``: a move of the inode in it puts the line in the
+        caller's own file under its new name, an unlink loses the line with
+        the inode, and the append reports success either way. A file the
+        other process put at the name receives nothing in any window
+        (module docstring, "Not guaranteed").
         """
-        parts = split_relpath(relpath)
+        parts = split_relpath(handle.relpath)
+        where = self._describe(parts)
+        fd = handle.fd
+        gone = UnsafePathError(
+            f"refusing to append to {where}: no entry of that name is left, so the file that "
+            "was opened and inspected there was unlinked or moved away since. Nothing was "
+            "written to it."
+        )
         try:
             parent = self._parent_of(parts, create=False)
         except FileNotFoundError:
-            return False
+            raise gone from None
         try:
             try:
-                fd = open_regular_at(
-                    parent, parts[-1], os.O_WRONLY | os.O_APPEND, where=self._describe(parts)
-                )
+                now = os.lstat(parts[-1], dir_fd=parent)
             except FileNotFoundError:
-                return False
-            try:
-                _refuse_past(fd, relpath, limit)
-            finally:
-                os.close(fd)
+                raise gone from None
+            except OSError as exc:
+                raise StateError(f"cannot inspect {where}: {exc}") from exc
         finally:
             os.close(parent)
-        return True
+        if (now.st_dev, now.st_ino) != handle.identity:
+            kind = entry_kind(now.st_mode) or "regular file"
+            raise UnsafePathError(
+                f"refusing to append to {where}: the entry at that name is a different {kind} "
+                "now, not the file that was opened and inspected there, so it was replaced "
+                "since. Neither file was written to; move the entry aside and re-run."
+            )
+        st = os.fstat(fd)
+        if st.st_nlink > 1:
+            raise _unsafe(where, _hard_link_text(st.st_nlink))
+        if st.st_nlink < 1:  # pragma: no cover - the name resolved to it an instant ago
+            raise gone
+        if handle.limit is not None and st.st_size > handle.limit:
+            raise ReadLimitExceeded(handle.relpath, handle.limit)
+        try:
+            view = memoryview(text.encode("utf-8"))
+            while view:
+                view = view[os.write(fd, view) :]
+            os.fsync(fd)
+        except OSError as exc:
+            raise StateError(f"cannot append to {where}: {exc}") from exc
 
     def unlink(self, relpath: str) -> None:
         parts = split_relpath(relpath)
@@ -1027,18 +1107,6 @@ class SafeRoot:
             raise StateError(f"cannot list {where}: {exc}") from exc
         names.sort(reverse=True)
         return names
-
-
-def _refuse_past(fd: int, relpath: str, limit: int | None) -> None:
-    """Raise :class:`ReadLimitExceeded` when the open file is larger than ``limit``.
-
-    ``st_size`` is trusted here because nothing is read: the check bounds
-    what an append is willing to extend, not what a read would hold, so a
-    sparse file that claims a size it does not occupy is refused for the
-    size it claims, which is the size an operator's tools would pay for.
-    """
-    if limit is not None and os.fstat(fd).st_size > limit:
-        raise ReadLimitExceeded(relpath, limit)
 
 
 def _read_within(fh: BinaryIO, relpath: str, limit: int | None) -> bytes:

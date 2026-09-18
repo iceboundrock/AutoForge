@@ -23,7 +23,12 @@
   name, so an inode unlinked before the inspection is refused rather than
   written into), §5.5 (only a name of the step directory's exact shape,
   a directory numbered within `MAX_STEP_SEQ`, is a sequence record; PR #91
-  review, fourth round)
+  review, fourth round), §5.4, §5.5 and §8.10 (the journal descriptor is
+  held across the invocation and the append is bound to the inode that was
+  inspected before the launch: a foreign single-link file renamed over the
+  name is refused and receives nothing, and the stated limit narrows from
+  "after the inspection" to the one syscall between the re-inspection and
+  the write; PR #91 review, fifth round)
 - **Closes by design:** #46, #47, #48, #49, #50; #45 (see *Compatibility*)
 
 ## 1. Problem
@@ -446,30 +451,60 @@ open and the inspection, which a write would reach and report success on
 while no journal remained under the root (PR #91 review, fourth round; every
 write open in the module holds to `st_nlink == 1`, as `locking` always has).
 Round 6 had replaced the in-place append with a read-then-rewrite; #51
-restored it, see §5.5. What
-that inspection guarantees is the *inode*: the bytes land in the inode the
-descriptor already holds, which had exactly one name, under the root, when
-it was inspected, so the append can never extend a foreign file through a
-planted name. A foreign inode can only carry the journal's name with one
-link by being *renamed* there, and then it is the file the controller
-finds, with one name, at its next open; the refusals for that are the size
-check below and the operator's eyes, exactly as for any other planted file.
-What the inspection does not guarantee is where that inode's name is when
-the bytes land (§8.10): a same-user process can, after the inspection,
-`link(2)` the journal's inode to a name outside the root and unlink this
-one, or `rename(2)` it there, and the line is then written into the
-controller's own journal at its new name, with nothing published afterwards
-that a re-inspection could withhold, so the append reports success; or it
-can unlink the name outright, and the line is then written into an inode
-nothing names and lost with it, the append again reporting success. That is
-a move or a deletion of the controller's bytes by a process that could
+restored it, see §5.5.
+
+The open and the append are two moments, not one (PR #91 review, fifth
+round). The run logger opens the journal before the agent is launched and
+appends the invocation's record after the agent returned, and in between a
+same-user agent has had the run of the directory. An append that reopened
+the *name* at the second moment accepted whatever regular single-link file
+it found there, and a small file of the operator's renamed over the name
+is exactly that: it passes every check an open can make, and the
+controller's record went into it. Nothing bound the second moment to the
+first. So the descriptor from the first moment is now *held* across the
+invocation (`SafeRoot.open_append` returns an `AppendHandle`, the logger
+keeps it, `SafeRoot.append_to` writes through it) and the append proves,
+immediately before the `write(2)`, that the name still denotes the inode
+it holds: an `lstat` of the name under the freshly re-verified root must
+give the handle's `(st_dev, st_ino)`, and an `fstat` of the descriptor
+must still show one name and a size within the budget. A different inode
+at the name (a foreign file renamed or linked there, a fresh file created
+after an unlink, a symlink, a replaced directory) is refused with what was
+found; an empty name (the journal unlinked or moved away) is refused
+rather than silently recreated as a second journal. Neither file receives
+a byte. The held descriptor is what makes the comparison exact: the opened
+inode stays allocated while it is held, so its number cannot be reused by
+a file created since, which is why recording `(st_dev, st_ino)` at the
+open and reopening by name was rejected (an `rm` of the journal followed
+by a create readily gets the same number back on ext4). The descriptor is
+`O_CLOEXEC`, so the agent subprocess does not inherit it, and it goes with
+the logger: one logger per invocation, closed or collected with it.
+
+What that inspection guarantees is the *inode*: the bytes land in the inode
+the descriptor already holds, which had exactly one name, under the root,
+at the open and again at the re-inspection, so the append can never extend
+a foreign file through a planted name, at any moment. What it does not
+guarantee is where that inode's name is when the bytes land (§8.10), and
+that window is now one syscall wide: a same-user process can, between the
+re-inspection and the `write(2)`, `link(2)` the journal's inode to a name
+outside the root and unlink this one, or `rename(2)` it there, and the
+line is then written into the controller's own journal at its new name,
+the append reporting success; or it can unlink the name outright, and the
+line is written into an inode nothing names and lost with it. That is a
+move or a deletion of the controller's bytes by a process that could
 already read, copy or delete every one of them, not a write into anything
-that process planted; no re-inspection closes it, because the move can
-follow any check, and a rename involves no link count at all. It is stated
-as the limit and pinned by tests
-(`test_an_append_follows_its_inode_when_the_name_is_moved_after_the_inspection`
-for the move, `test_an_append_refuses_an_inode_unlinked_before_the_inspection`
-for where the window begins), as §2.3 states the root's. The temporary gets the same
+that process planted, and a file that process puts at the name in that
+window receives nothing, because the write goes through the descriptor
+and not through the name. It is stated as the limit and pinned by tests
+(`test_an_append_refuses_a_name_that_no_longer_holds_the_opened_inode` for
+every replacement and removal the re-inspection sees,
+`test_an_append_follows_its_inode_when_the_name_is_moved_after_the_re_inspection`
+for the window, `test_an_append_refuses_an_inode_unlinked_before_the_inspection`
+for where the open's own window begins), as §2.3 states the root's. Between
+two invocations the journal is owned by name like every other artifact: a
+regular single-link file at the name when the next logger opens is the
+journal that open finds, and the refusals for a planted one are the size
+check of §5.5 and the operator's eyes. The temporary gets the same
 inspection on the same descriptor once its bytes are durable and before it
 is published (R10-F2, §8.10): the `O_EXCL` create proves the inode is the
 controller's, but the inode has a *name* for the length of the write, and a
@@ -543,36 +578,41 @@ joined by a second, post-agent read (#55). Together those made the cost of
 one invocation's logging proportional to the journal, and of a run's to the
 square of its length, for a file that is append-only by construction.
 
-The append is in place: `append_text` opens the name `O_WRONLY|O_APPEND`
-with the flags of §5.4, inspects the descriptor (a regular file with one
-name, or `UnsafePathError`), writes the line through it and `fsync`s. The
-cost of recording an invocation is the line, however long the run. What
-remains of the byte budget is a **size sanity check** on that descriptor:
+The append is in place, through a descriptor held across the invocation
+(§5.4, fifth round): when the logger is opened, *before* the agent is
+launched, `SafeRoot.open_append` opens the name `O_WRONLY|O_CREAT|O_APPEND`
+with the flags of §5.4 -- creating the journal empty on a first invocation
+-- and inspects the descriptor (a regular file with one name, or
+`UnsafePathError`); after the agent returns, `SafeRoot.append_to` proves
+on that same descriptor that the name still denotes it and that it still
+has one name, writes the line through it and `fsync`s. The cost of
+recording an invocation is the line, however long the run. What remains of
+the byte budget is a **size sanity check** on that descriptor:
 `os.fstat(fd).st_size > MAX_EVENT_JOURNAL_BYTES` (64 MiB) is refused with
 the same `corrupted event journal ... larger than` error as before, because
 a real journal -- one line per invocation, each carrying the redacted argv
 with the rendered prompt and the capped `CONTROL_RESULT` -- cannot reach it,
 so a file that has is not one the controller wrote. The check is O(1)
 whatever the file holds, so a sparse journal costs nothing to refuse. It
-runs twice per invocation, both times without reading a byte: when the
-logger is opened, *before* the agent is launched (`verify_appendable`,
-which opens exactly as the append will and writes nothing, so a link, a
-FIFO, a second name or an oversized file refuses before a write-capable
-agent has done work that would go unlogged, and charges no launch, #57);
-and at the append after the agent returns, the one moment an agent has had
-to enlarge or replace the file (#55). The pre-launch gate proves the run
+runs twice per invocation, both times without reading a byte: at the open
+before the launch, so a link, a FIFO, a second name or an oversized file
+refuses before a write-capable agent has done work that would go unlogged,
+and charges no launch (#57); and at the append after the agent returns,
+the one moment an agent has had to enlarge or replace the file (#55).
+The pre-launch gate proves the run
 directory as well as the journal (PR #91 review, third round): the
 post-agent record needs `logs/<run>/` to take a new entry (the step
-directory, its artifacts, and on a first invocation the journal itself),
-and an existing run directory the controller cannot add an entry to (a
-`0500` directory, a read-only mount, a filesystem without `link(2)`) passes
-the journal check while the journal is absent. So the logger open creates
-and removes a probe entry there through the same capability, exactly as
-`doctor` probes the state directory (§5.4, R10-F4), and refuses with the
-access cause and the manual step (make the run directory writable) before
-anything is launched. Neither proof outlives the launch, since the agent
-runs as the same user; they are the refusals that can land before it. The
-budget bounds what the controller
+directory and its artifacts), and an existing run directory the
+controller cannot add an entry to (a `0500` directory, a read-only mount,
+a filesystem without `link(2)`) is not proved by the journal alone. So the
+logger open creates and removes a probe entry there through the same
+capability, exactly as `doctor` probes the state directory (§5.4, R10-F4),
+and refuses with the access cause and the manual step (make the run
+directory writable) before anything is launched; the journal is opened
+last, so that nothing else in the open can fail with the descriptor held.
+The directory proof does not outlive the launch, since the agent runs as
+the same user; the journal proof does, to the extent §5.4 states, because
+the descriptor does. The budget bounds what the controller
 is willing to extend, not the file's final size: a journal at exactly the
 budget is still appended to, and the file that results is refused by the
 next check. The refusal names the manual step (move `events.jsonl` aside;
@@ -582,8 +622,8 @@ run.
 The invocation is not lost to a refused append: its step directory and
 artifacts are published before the journal line, the refusal says where
 they are (whatever its filesystem cause: the oversized-journal error, the
-`UnsafePathError` for a planted link and the `UnreadableEntryError` for a
-journal made unwritable all carry that note), and the
+`UnsafePathError` for a second name given to the journal or for a journal
+replaced or removed while the agent ran, all carry that note), and the
 launch checkpoint was persisted before the agent started, so `resume`
 re-enters the phase as a retry judged against the baseline from before the
 first launch. A REMOTE run has no tree checkpoint; there the refusal lands
@@ -622,6 +662,9 @@ design needed a writable *directory*, the in-place append needs a writable
 logger open, before the launch, with the access cause kept
 (`UnreadableEntryError`) and the same manual step the size refusal names:
 make it writable or move it aside; the step directories keep the sequence.
+A `chmod` *after* the open does not reach the invocation's record: the
+held descriptor was granted write access at the open and keeps it, as any
+descriptor does, so the line lands and it is the next open that refuses.
 
 The crash guard that continues the sequence from step-directory names lists
 only the run's own directory, opened as a sub-root, and lists it under a
@@ -972,21 +1015,28 @@ an independent `os.walk` finds nothing the snapshot did not mention.
     follow-up, not a defect of the boundary. The in-place append of
     `events.jsonl` has the same window with a different outcome (§5.4,
     PR #91 review): the journal's inode is inspected as a single-named
-    regular file, but a same-user process can move that inode out from
-    under its name before the `write(2)` -- `link(2)` it outside the root
-    and unlink the root name, or simply `rename(2)` it, which no link
-    count sees -- and the line is then written into the controller's own
-    journal at its new name and the append reports success, since nothing
-    is published afterwards that a re-inspection could withhold; or unlink
-    it outright, and the line is written into an inode nothing names and
-    lost with it. The window opens *after* the inspection, never before
-    it: an inode already unlinked when it is inspected (`st_nlink == 0`)
-    is refused like a hard link, so a name dropped between the open and
-    the `fstat` is a refusal, not a line written into nothing (PR #91
-    review, fourth round). The
-    guarantee that holds is the inode-level one of §2.2: the controller
-    never extends a foreign inode, and a foreign inode reaches the
-    journal's name with one link only by being renamed there, at which
-    point it is the journal. `O_TMPFILE` would not help here either, since
-    an append must extend a named file. Stated and pinned by a test rather
-    than checked for, because the move can follow any check.
+    regular file, on a descriptor opened before the launch and held until
+    the append, and re-inspected immediately before the `write(2)` -- the
+    name must still denote the held inode and the inode must still have
+    one name. In the one syscall between that re-inspection and the write
+    a same-user process can still move the inode out from under its name
+    -- `link(2)` it outside the root and unlink the root name, or simply
+    `rename(2)` it, which no link count sees -- and the line is then
+    written into the controller's own journal at its new name and the
+    append reports success, since nothing is published afterwards that a
+    re-inspection could withhold; or unlink it outright, and the line is
+    written into an inode nothing names and lost with it. The window
+    opens *after* the re-inspection, never before it: an inode already
+    unlinked when it is inspected (`st_nlink == 0`) is refused like a hard
+    link (PR #91 review, fourth round), and a name that no longer denotes
+    the held inode when it is re-inspected -- a foreign file renamed or
+    linked there, a fresh file, a symlink, an emptied name -- is refused
+    with nothing written to either file (PR #91 review, fifth round). The
+    guarantee that holds is the inode-level one of §2.2, at every moment:
+    the controller never extends a foreign inode, because the bytes go
+    through the held descriptor and a file placed at the name is never
+    opened; a foreign file becomes the journal only between invocations,
+    when the next logger opens the name as it opens any artifact it owns
+    by name. `O_TMPFILE` would not help here either, since an append must
+    extend a named file. The residual move is stated and pinned by a test
+    rather than checked for, because the move can follow any check.

@@ -4,6 +4,7 @@ The log tree lives inside the operator's checkout, where the agents the
 controller launches also write, so nothing under it is trusted by name.
 """
 
+import gc
 import json
 import os
 
@@ -398,47 +399,51 @@ def test_a_run_directory_that_cannot_take_a_step_directory_is_refused_before_the
         assert sorted(p.name for p in run_dir.iterdir()) == [], "the gate left something behind"
     finally:
         run_dir.chmod(0o700)
-    # Made writable again, the run starts at its first step, and the probe
-    # that proved the directory is not among the entries.
+    # Made writable again, the run starts at its first step; the probe that
+    # proved the directory is not among the entries, the journal the open
+    # created (empty, to be held until the append) is.
     log = RunLogger(tmp_path / "logs", "run-1")
-    assert sorted(p.name for p in run_dir.iterdir()) == []
+    assert sorted(p.name for p in run_dir.iterdir()) == ["events.jsonl"]
+    assert log.events_path.stat().st_size == 0
     step = log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="REVIEW"))
     assert step.name == "001-review-1"
     assert sorted(p.name for p in run_dir.iterdir()) == ["001-review-1", "events.jsonl"]
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses file permissions")
-def test_a_journal_made_read_only_after_the_logger_opened_refuses_the_append(tmp_path):
-    """#55 for the access cause: the append after the agent returned refuses,
-    the artifacts are published, and the refusal names both the manual step
-    and where the invocation's record is."""
+def test_a_journal_made_read_only_after_the_logger_opened_is_still_appended_through(tmp_path):
+    """The descriptor held since the open was granted write access then, and
+    keeps it as any descriptor does, so a ``chmod`` while the agent ran
+    does not cost the invocation its record: the line lands in the held
+    inode. The *next* open is what the mode governs, and it refuses with
+    the manual step (``test_a_read_only_journal_is_refused_before_the_launch
+    _with_the_manual_step``)."""
     from autoforge.safefs import UnreadableEntryError
 
     log = RunLogger(tmp_path / "logs", "run-1")
     log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="REVIEW"))
-    before = log.events_path.read_bytes()
     # The agent runs here, and leaves the journal read-only.
     log.events_path.chmod(0o444)
     try:
-        with pytest.raises(UnreadableEntryError, match="Permission denied") as exc:
-            log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="FIX"), stdout="work")
-        assert log.events_path.read_bytes() == before, "neither appended to nor replaced"
+        step = log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="FIX"), stdout="work")
+        assert step.name == "002-fix-1"
+        lines = log.events_path.read_bytes().splitlines()
+        assert [json.loads(line)["seq"] for line in lines] == [1, 2]
+        with pytest.raises(UnreadableEntryError, match="make logs/run-1/events.jsonl writable"):
+            RunLogger(tmp_path / "logs", "run-1")
     finally:
         log.events_path.chmod(0o600)
-    assert (log.run_dir / "002-fix-1" / "stdout.log").read_text(encoding="utf-8") == "work"
-    message = str(exc.value)
-    assert "make logs/run-1/events.jsonl writable, or move it aside" in message
-    assert "logs/run-1/002-fix-1/" in message
-    assert "journal line was not written" in message
 
 
-# -- #55: the post-agent append is the other open of the journal ----------------
+# -- #55, then PR #91 round five: the append is bound to the opened journal ----
 #
 # R11-F2 bounded the recovery read and moved it before the launch. The
-# append that records the invocation opens the journal again *after* the
-# agent returned, which is exactly when an agent has had the chance to
-# enlarge or replace it. That open proves the file again and refuses on its
-# size the same way, still without reading it (#51).
+# append that records the invocation happens *after* the agent returned,
+# which is exactly when an agent has had the chance to enlarge or replace
+# the journal. The descriptor opened before the launch is held across the
+# invocation, and the append proves the name and the inode again on it:
+# what is at the name must be the inode that was inspected, and that inode
+# must still have one name and a sane size. Nothing else receives a byte.
 
 
 def test_a_journal_enlarged_after_the_logger_opened_refuses_the_append_not_the_machine(
@@ -476,30 +481,158 @@ def test_a_journal_enlarged_after_the_logger_opened_refuses_the_append_not_the_m
     )
 
 
-def test_a_journal_replaced_by_a_hard_link_after_the_logger_opened_refuses_the_append(
+def test_a_journal_given_a_second_name_after_the_logger_opened_refuses_the_append(
     tmp_path,
 ):
-    """A second name for the journal's inode planted between the open and
-    the append is refused on the descriptor (the inode has two names when
-    it is inspected), the artifacts are published, and the refusal keeps
-    its filesystem cause while saying where the record is."""
+    """A second name for the journal's own inode planted between the open
+    and the append is refused on the held descriptor (the inode has two
+    names when it is inspected again), the artifacts are published, and
+    the refusal keeps its filesystem cause while saying where the record
+    is."""
     from autoforge.safefs import UnsafePathError
 
-    outside = tmp_path / "notes.txt"
-    outside.write_text("mine\n", encoding="utf-8")
     log = RunLogger(tmp_path / "logs", "run-1")
     log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="REVIEW"))
-    # The agent runs here, and puts the operator's file at the journal's name.
-    log.events_path.unlink()
-    os.link(outside, log.events_path)
+    before = log.events_path.read_bytes()
+    # The agent runs here, and gives the journal a second name outside.
+    os.link(log.events_path, tmp_path / "second-name")
 
     with pytest.raises(UnsafePathError, match="hard link: 2 directory entries") as exc:
         log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="FIX"), stdout="work")
-    assert outside.read_text(encoding="utf-8") == "mine\n"
-    assert log.events_path.stat().st_nlink == 2, "neither appended to nor replaced"
+    assert log.events_path.read_bytes() == before, "neither appended to nor replaced"
+    assert log.events_path.stat().st_nlink == 2
     assert (log.run_dir / "002-fix-1" / "stdout.log").read_text(encoding="utf-8") == "work"
     assert "logs/run-1/002-fix-1/" in str(exc.value)
     assert "journal line was not written" in str(exc.value)
+
+
+def _rename_a_foreign_file_over(journal, foreign) -> None:
+    os.rename(foreign, journal)
+
+
+def _unlink_and_link_the_foreign_file(journal, foreign) -> None:
+    journal.unlink()
+    os.link(foreign, journal)
+
+
+def _unlink_and_create_afresh(journal, foreign) -> None:
+    journal.unlink()
+    journal.write_text("planted\n", encoding="utf-8")
+
+
+def _rename_out(journal, foreign) -> None:
+    os.rename(journal, journal.with_suffix(".moved"))
+
+
+def _unlink(journal, foreign) -> None:
+    journal.unlink()
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        _rename_a_foreign_file_over,
+        _unlink_and_link_the_foreign_file,
+        _unlink_and_create_afresh,
+        _rename_out,
+        _unlink,
+    ],
+    ids=[
+        "foreign file renamed over",
+        "unlinked, foreign file linked",
+        "unlinked, fresh file created",
+        "renamed out",
+        "unlinked",
+    ],
+)
+def test_a_journal_replaced_or_removed_while_the_agent_ran_refuses_the_append(tmp_path, tamper):
+    """PR #91 review, fifth round: the append goes to the journal that was
+    inspected before the launch, or nowhere.
+
+    A same-user agent can rename a small single-link regular file of the
+    operator's over ``events.jsonl`` while it runs. Such a file passes
+    every check an open of the *name* can make -- it is a regular file
+    with one name and a sane size -- so an append that reopened the name
+    after the agent returned wrote the controller's record into the
+    operator's file. The logger now holds the descriptor it opened before
+    the launch and appends through that, after proving that the name still
+    denotes the inode it holds: a foreign file at the name is refused and
+    receives nothing, and so is an emptied name (the journal unlinked or
+    moved away, where a recreate would silently start a second journal).
+    The invocation's artifacts are published first and the refusal says
+    where they are and what happened.
+
+    Recovery: the next logger open finds whatever is at the name (a
+    regular single-link file there *is* the journal, as for any artifact
+    the controller owns by name between invocations) or creates a fresh
+    journal, and the sequence continues from the step directories.
+    """
+    from autoforge.safefs import UnsafePathError
+
+    foreign = tmp_path / "operator-notes.txt"
+    foreign.write_text("operator data\n", encoding="utf-8")
+    foreign_ino = foreign.stat().st_ino
+    log = RunLogger(tmp_path / "logs", "run-1")
+    log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="REVIEW"))
+    journal_ino = log.events_path.stat().st_ino
+    journal_before = log.events_path.read_bytes()
+    # The agent runs here.
+    tamper(log.events_path, foreign)
+    listing = sorted(p.name for p in log.run_dir.iterdir())
+
+    with pytest.raises(UnsafePathError, match="refusing to append to") as exc:
+        log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="FIX"), stdout="work")
+    message = str(exc.value)
+    assert "replaced" in message or "unlinked or moved away" in message
+    assert "logs/run-1/002-fix-1/" in message and "journal line was not written" in message
+    assert (log.run_dir / "002-fix-1" / "stdout.log").read_text(encoding="utf-8") == "work"
+    # Nothing was written anywhere: not to the file now at the name, not to
+    # the operator's file under its own name, not to the journal's inode
+    # under whatever name it has now; and nothing was created or removed.
+    assert sorted(p.name for p in log.run_dir.iterdir()) == sorted([*listing, "002-fix-1"])
+    for path in (foreign, log.events_path, log.events_path.with_suffix(".moved")):
+        if path.is_file():
+            assert b"FIX" not in path.read_bytes(), path
+    if foreign.exists():
+        assert foreign.read_text(encoding="utf-8") == "operator data\n"
+    if log.events_path.exists() and log.events_path.stat().st_ino == foreign_ino:
+        assert log.events_path.read_text(encoding="utf-8") == "operator data\n"
+    if log.events_path.with_suffix(".moved").exists():
+        assert log.events_path.with_suffix(".moved").read_bytes() == journal_before
+        assert log.events_path.with_suffix(".moved").stat().st_ino == journal_ino
+
+    # The next open: a regular single-link file at the name is the journal
+    # (moved aside, a fresh one is created), the sequence goes on from the
+    # step directories either way, and the line lands where it opened.
+    if log.events_path.exists():
+        log.events_path.rename(tmp_path / "aside")
+    again = RunLogger(tmp_path / "logs", "run-1")
+    assert again.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="REVIEW")).name == (
+        "003-review-1"
+    )
+    assert json.loads(again.events_path.read_bytes())["seq"] == 3
+    if foreign.exists():
+        assert foreign.read_text(encoding="utf-8") == "operator data\n"
+
+
+def test_the_journal_handle_is_released_with_the_logger(tmp_path):
+    """One logger per invocation (the engine builds it in ``_invoke_phase``
+    and drops it): the held descriptor must go with the logger, whether it
+    is closed explicitly, used as a context manager, or merely dropped, so
+    a long run does not accumulate one open descriptor per invocation."""
+    with RunLogger(tmp_path / "logs", "run-1") as log:
+        fd = log._journal.fd
+        os.fstat(fd)
+    with pytest.raises(StateError, match="already closed"):
+        os.fstat(log._journal.fd)
+    log.close()  # idempotent
+
+    log = RunLogger(tmp_path / "logs", "run-1")
+    fd = log._journal.fd
+    del log
+    gc.collect()
+    with pytest.raises(OSError, match="Bad file descriptor"):
+        os.fstat(fd)
 
 
 # -- #56: the crash guard lists the run's own directory, bounded ------------------
@@ -608,9 +741,9 @@ def test_a_logs_symlink_never_redirects_controller_writes(tmp_path):
 def test_a_fifo_event_log_fails_instead_of_hanging_the_controller(tmp_path):
     """`open()` on a FIFO with no writer blocks forever; the controller must not.
 
-    `_recover_sequence` opens `events.jsonl` to prove it appendable before
-    the first agent runs, so a FIFO left at that path would stall every
-    invocation before that agent ran, with no error and no timeout.
+    `_open_journal` opens `events.jsonl` for the append before the agent
+    runs, so a FIFO left at that path would stall every invocation before
+    that agent ran, with no error and no timeout.
     """
     run_dir = tmp_path / "logs" / "run-1"
     run_dir.mkdir(parents=True)

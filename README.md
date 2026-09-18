@@ -304,7 +304,7 @@ checkpointed in the same durable per-phase bound as the launch before it (see
 **Recovery** under LOCAL mode); the setting can never multiply that bound.
 Non-zero exits, timeouts, verification failures and a refused run-log write
 after the agent returned (an `events.jsonl` an agent enlarged past its
-budget, replaced with a link or made read-only, see Security) are not
+budget, gave a second name, replaced or removed, see Security) are not
 retried automatically; they leave the phase unchanged for `resume`. The launch itself is persisted before the agent
 starts, so every one of these is on disk as a used attempt, and a refused
 run-log write names the outcome it interrupted (the timeout, the exit code,
@@ -507,17 +507,26 @@ name, which means a symbolic link, hard link, FIFO or device planted at an
 artifact's name is *replaced*: it is never opened, so whatever it pointed at
 is provably untouched. The append-only `events.jsonl` is the one artifact that
 must be opened in place, and there the open is `O_NOFOLLOW|O_NONBLOCK|O_APPEND`
-and refuses a hard link outright. What that guarantees is the inode: the
-line lands in the file that was inspected as a single-named regular file
-under the log directory, never in a foreign file reached through a planted
-name. It does not guarantee the name: a same-user agent can move the
-journal's inode out of the log directory (link it elsewhere and unlink it,
-or rename it) between the inspection and the write, and the line then lands
-in the controller's own journal at its new name, or unlink it outright and
-the line is lost with the file; that agent could already read, copy and
-delete every byte of the journal, so this is stated as the limit
-(ADR 0001 §8.10) rather than guarded. The inspection itself refuses an inode
-that is already unlinked when it looks, so the window opens only after it.
+and refuses a hard link outright. The descriptor is opened before the agent
+is launched and held until the invocation's line is appended after it
+returns, and immediately before the write the controller checks that the
+name still denotes the inode it holds and that the inode still has one
+name. What that guarantees is the inode: the line lands in the file that
+was inspected as a single-named regular file under the log directory,
+never in a foreign file reached through a planted name -- a file the agent
+renamed or linked over `events.jsonl` while it ran, however ordinary it
+looks, is refused and receives nothing, and so is a journal the agent
+unlinked or moved away (the line is not written into a silently recreated
+second journal). It does not guarantee the name in the one syscall between
+that check and the write: a same-user agent can move the journal's inode
+out of the log directory there (link it elsewhere and unlink it, or rename
+it), and the line then lands in the controller's own journal at its new
+name, or unlink it outright and the line is lost with the file; that agent
+could already read, copy and delete every byte of the journal, so this is
+stated as the limit (ADR 0001 §8.10) rather than guarded. Between two
+invocations the journal is owned by name like every other artifact: a
+regular file at `events.jsonl` when the next invocation opens it is the
+journal, subject to the size check below.
 The controller never reads the journal:
 the step sequence is recovered from the step directory names, and each line
 is appended in place, so the cost of logging an invocation is the line
@@ -526,7 +535,7 @@ exactly the shape the controller publishes counts, and one of that shape
 that is not a directory, or numbers a step past what a run can make, is
 refused as a corrupt run log before the launch rather than turned into the
 next step's path. What the journal is checked for is its size, on
-the opened descriptor, before the agent is launched and again at the append
+the held descriptor, before the agent is launched and again at the append
 after it returns; the run's log directory is probed for a new entry before
 the launch as well, and listed under a budget of its
 own. A same-user agent that plants an oversized journal or a million names
