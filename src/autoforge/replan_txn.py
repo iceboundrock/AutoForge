@@ -489,6 +489,11 @@ CLOSE_BEGUN_STAGES: frozenset[ReplanStage] = frozenset(
 _PRE_WRITE_STAGES: frozenset[ReplanStage] = frozenset(
     {ReplanStage.PENDING, ReplanStage.PREPARED, ReplanStage.VERIFIED}
 )
+#: Stages from which the reducer may still launch the replan agent: no PR
+#: bound to the transaction exists yet. Binding and ``VERIFIED`` are saved
+#: together, so a persisted journal at any later stage is finished by the
+#: controller alone -- read, verify, close, activate, reopen or refuse.
+_AGENT_STAGES: frozenset[ReplanStage] = frozenset({ReplanStage.PENDING, ReplanStage.PREPARED})
 
 
 def _stages_reached(stage: ReplanStage) -> tuple[ReplanStage, ...]:
@@ -725,6 +730,20 @@ def budget_may_stop(txn: ReplanTransaction) -> bool:
     and the source PR's fate, which the budget text cannot.
     """
     return txn.stage in _PRE_WRITE_STAGES
+
+
+def may_invoke_agent(txn: ReplanTransaction) -> bool:
+    """Whether a REPLAN_REEXECUTE step from this journal may launch the replan agent.
+
+    True only at ``PENDING`` and ``PREPARED``, where no replacement PR is
+    bound to the transaction and the reducer falls through to the
+    invocation when it finds none. From ``VERIFIED`` on the reducer resolves
+    the step itself, and a ``REJECTED`` journal -- recorded, or coerced there
+    because it could not be read whole -- replays its refusal. The dry-run
+    plan follows this partition so it shows an agent command, template and
+    prompt only for a step that can launch one.
+    """
+    return txn.stage in _AGENT_STAGES
 
 
 # ---------------------------------------------------------------------------

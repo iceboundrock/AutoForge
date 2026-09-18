@@ -176,6 +176,7 @@ from .replan_txn import (
     budget_may_stop,
     find_non_open_claimant,
     has_close_receipt,
+    may_invoke_agent,
     new_transaction_id,
     render_close_receipt,
     select_bound_candidate,
@@ -1121,10 +1122,6 @@ class ControllerEngine:
                 ],
                 command=self._merge_plan_command(),
             )
-        profile = profile_for_phase(self.config, s.phase, s.review_round)
-        variables = self._prompt_variables()
-        prompt = self.render_prompt_for(s.phase)
-        command = self.providers.get(profile).build_command_for(profile, prompt)
         notes: list[str] = []
         expected_next = self._expected_next(s.phase)
         budget = step_budget_reason(s.step_count, self.config.workflow.max_total_steps)
@@ -1150,6 +1147,22 @@ class ControllerEngine:
             if replan_txn.escalation:
                 notes.append(f"replan policy: {json.dumps(replan_txn.escalation, sort_keys=True)}")
             notes.append(f"replan transaction stage: {replan_txn.stage.value}")
+            if not may_invoke_agent(replan_txn):
+                # The reducer resolves this step itself (`_drive_replan` never
+                # falls through to the invocation past PREPARED), so the plan
+                # carries no agent command, template or prompt: what it shows
+                # is what the step can do (PR #92 review).
+                return self._deterministic_plan(
+                    s,
+                    f"REPLAN_REEXECUTE at stage {replan_txn.stage.value} (controller finishes "
+                    "the persisted transaction; no agent, no prompt)",
+                    expected_next,
+                    notes=notes,
+                )
+        profile = profile_for_phase(self.config, s.phase, s.review_round)
+        variables = self._prompt_variables()
+        prompt = self.render_prompt_for(s.phase)
+        command = self.providers.get(profile).build_command_for(profile, prompt)
         return StepPlan(
             phase=s.phase.value,
             profile_name=profile.name,
@@ -2519,12 +2532,12 @@ class ControllerEngine:
         Returns the plan notes and the expected next phase. The reducer
         (:meth:`_drive_replan`) dispatches on the persisted stage, so the plan
         follows the same dispatch rather than describing the whole lifecycle
-        at every stage: the agent command in the plan is launched only while
-        no PR bound to this transaction exists, the close is reachable from
-        ``VERIFIED`` alone, and every later stage reads GitHub and then
-        activates, undoes or refuses -- which of the three is a GitHub fact
-        the plan cannot read, so it names all of them. Pure: reads the
-        journal and nothing else.
+        at every stage: the agent is launched only while no PR bound to this
+        transaction exists (:func:`may_invoke_agent`; the plan carries a
+        command only there), the close is reachable from ``VERIFIED`` alone,
+        and every later stage reads GitHub and then activates, undoes or
+        refuses -- which of the three is a GitHub fact the plan cannot read,
+        so it names all of them. Pure: reads the journal and nothing else.
         """
         source = txn.source_pr_url or txn.decision_pr_url or "(unknown)"
         replacement = txn.replacement_pr_url or "(none)"

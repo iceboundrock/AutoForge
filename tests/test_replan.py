@@ -38,6 +38,7 @@ from autoforge.replan_txn import (
     budget_may_stop,
     find_non_open_claimant,
     has_close_receipt,
+    may_invoke_agent,
     render_close_receipt,
     render_marker,
     scan_replan_markers,
@@ -49,7 +50,7 @@ from autoforge.result_parser import (
     parse_control_result,
 )
 from autoforge.state import load_state
-from autoforge.transitions import Phase
+from autoforge.transitions import Phase, WorkflowMode, edges_for
 from tests.conftest import (
     BRANCH,
     ISSUE,
@@ -2832,7 +2833,9 @@ def test_t3_a_dry_run_from_replan_reexecute_neither_writes_nor_invokes(tmp_state
 
     From every stage a crash can leave, a dry-run step renders the plan and
     nothing else: no agent, no `gh` call of any kind (so no close, reopen or
-    comment), no journal movement and no state write.
+    comment), no journal movement and no state write. The plan itself
+    carries the replan template and command only where the reducer could
+    launch the agent (`may_invoke_agent`).
     """
     gh = FakeGitHub()
     eng, txn = _seeded_engine(tmp_state_dir, gh, stage)
@@ -2843,7 +2846,7 @@ def test_t3_a_dry_run_from_replan_reexecute_neither_writes_nor_invokes(tmp_state
     calls_before = list(gh.calls)
     out = eng.step(dry_run=True)
     assert out.dry_run and out.plan is not None
-    assert out.plan.template == "replan_reexecute.md"
+    _assert_plan_metadata_follows(out.plan, may_invoke_agent(txn))
     assert eng.provider.calls == []
     assert gh.calls == calls_before
     assert gh.closed_prs == [] and gh.reopened_prs == [] and gh.commented_prs == []
@@ -5232,6 +5235,29 @@ def test_an_unreadable_journal_at_the_budget_is_refused_in_its_own_words(tmp_sta
     assert gh.closed_prs == [] and gh.reopened_prs == []
 
 
+def test_dry_run_plans_an_unreadable_journal_without_an_agent(tmp_state_dir):
+    """A journal that cannot be read whole plans a refusal, with no agent command.
+
+    The plan is the deterministic shape of the other controller-owned steps
+    and its notes say the source PR's fate cannot be determined locally; the
+    dry run reads nothing and writes nothing.
+    """
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.SUPERSEDED)
+    eng.state.replan_transaction["stage"] = "from_a_future_version"
+    before = json.dumps(eng.state.replan_transaction, sort_keys=True)
+    plan = eng.step(dry_run=True).plan
+    assert plan is not None
+    _assert_plan_metadata_follows(plan, may_launch=False)
+    notes = "\n".join(plan.notes)
+    assert "could not be read whole" in notes and PR in notes, notes
+    assert "replan transaction stage: rejected" in notes, notes
+    assert plan.expected_next.startswith("BLOCKED"), plan.expected_next
+    assert gh.calls == [] and eng.provider.calls == []
+    assert eng.state.phase == Phase.REPLAN_REEXECUTE
+    assert json.dumps(eng.state.replan_transaction, sort_keys=True) == before
+
+
 # What the plan may promise at each stage, mirroring the reducer's dispatch:
 # the agent is launched only while no bound replacement exists, the close is
 # reachable from VERIFIED alone, and every later stage reads and then
@@ -5256,6 +5282,7 @@ def _assert_plan_matches_the_stage(plan, stage: ReplanStage) -> str:
     may_launch, may_close = _STAGE_PLAN[stage]
     assert (_AGENT_NOTE in notes) is may_launch, notes
     assert (_CLOSE_NOTE in notes) is may_close, notes
+    _assert_plan_metadata_follows(plan, may_launch)
     assert f"replan transaction stage: {stage.value}" in notes
     assert PR in notes, notes
     if not may_launch:
@@ -5273,6 +5300,51 @@ def _assert_plan_matches_the_stage(plan, stage: ReplanStage) -> str:
     else:
         assert plan.expected_next.startswith("REVIEW"), plan.expected_next
     return notes
+
+
+def _assert_plan_metadata_follows(plan, may_launch: bool) -> None:
+    """The printed plan carries an agent only where the reducer can launch one.
+
+    `print_plan` shows the profile, template, command, timeout and prompt
+    preview whenever they are set, so a plan whose notes say "without
+    invoking an agent" must leave every one of them empty, in the same shape
+    as the other controller-owned steps (INITIALIZING, MERGE); otherwise the
+    operator reads an agent launch that the step will not perform (PR #92
+    review).
+    """
+    assert plan.phase == "REPLAN_REEXECUTE"
+    if may_launch:
+        assert plan.command and plan.template == "replan_reexecute.md", plan
+        assert plan.prompt_length == len(plan.prompt_full) > 0 and plan.prompt_preview, plan
+        assert plan.profile_name == "replan_reexecute" and plan.timeout_seconds > 0, plan
+        assert plan.routing == "REPLAN_REEXECUTE -> profile replan_reexecute", plan.routing
+        return
+    assert plan.command == [] and plan.template == "" and plan.timeout_seconds == 0, plan
+    assert plan.prompt_length == 0 and plan.prompt_full == "", plan
+    assert plan.prompt_preview == "(no agent prompt)", plan.prompt_preview
+    assert plan.profile_name == "(none — deterministic transition)", plan.profile_name
+    assert plan.provider == plan.model == plan.effort == "(none)", plan
+    assert plan.variables == {}, plan.variables
+    assert "no agent" in plan.routing and plan.routing.startswith("REPLAN_REEXECUTE"), plan.routing
+    assert plan.legal_next == sorted(
+        p.value for p in edges_for(WorkflowMode.REMOTE)[Phase.REPLAN_REEXECUTE]
+    )
+
+
+def test_the_replan_agent_may_be_launched_only_before_a_replacement_is_bound():
+    """The partition is total over the stages, so a new stage must choose a side.
+
+    Binding and VERIFIED are persisted together, so a journal at any later
+    stage is finished by the controller alone; a journal that cannot be read
+    is REJECTED and replays its refusal. `_STAGE_PLAN` pins the same
+    partition on the notes an operator reads.
+    """
+    launches = {stage for stage in ReplanStage if may_invoke_agent(_seed_txn(stage))}
+    assert launches == {ReplanStage.PENDING, ReplanStage.PREPARED}
+    assert launches == {stage for stage, (may_launch, _) in _STAGE_PLAN.items() if may_launch}
+    journal = {**_seed_txn(ReplanStage.PREPARED).to_dict(), "stage": 7}
+    unreadable = ReplanTransaction.from_dict(journal)
+    assert unreadable.journal_defects and not may_invoke_agent(unreadable)
 
 
 @pytest.mark.parametrize("stage", list(_STAGE_PLAN))
