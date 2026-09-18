@@ -152,7 +152,7 @@ The fixer is launched only while the PR HEAD read from GitHub equals the
 reviewed HEAD the open findings are bound to. A HEAD past it is an
 unverified push (an unrecorded fix, an operator); the review is stale and
 the phase goes to `REVIEW` of the actual HEAD without launching the fixer
-(workflow.md, "Bind reviews to PR HEAD SHA").
+(workflow.md, "Bind reviews to PR HEAD SHA and to the PR identity").
 
 A push is not the only write a fixer makes: a `follow_up_created`
 resolution creates an issue and moves no HEAD. With the HEAD unchanged the
@@ -254,11 +254,20 @@ Verify:
   the reviewed HEAD, run by the controller itself after the GitHub-side facts
   above; a hosted check runs the PR's own code and cannot say what the PR's
   tests still assert
-- latest clean review applies to current HEAD
+- latest clean review applies to current HEAD *of the reviewed PR*: the
+  review is bound to the PR it was posted on, its HEAD and its base
+  (workflow.md, "Bind reviews to PR HEAD SHA and to the PR identity");
+  `current_pr_url` and the PR GitHub returns for it must be that PR by
+  identity (`BLOCKED` otherwise, before any other read), and the PR's base
+  must still be the reviewed one (stale -> `REVIEW` otherwise, like a HEAD
+  move)
 
 ### After MERGE
 
-Verify actual GitHub PR state is `MERGED` before updating counters or closing dependent state.
+Verify actual GitHub PR state is `MERGED`, at the reviewed HEAD and into the
+reviewed base, before updating counters or closing dependent state. A PR
+merged at the reviewed HEAD into another branch is a change no review
+decided on: `BLOCKED`, not counted.
 
 Never advance the workflow solely because an LLM said an operation succeeded.
 

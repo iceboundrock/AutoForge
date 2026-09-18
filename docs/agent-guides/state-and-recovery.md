@@ -25,8 +25,10 @@ Expected state includes data such as:
 - current PR URL
 - phase
 - review round
-- reviewed HEAD SHA
-- current HEAD SHA
+- reviewed PR URL, reviewed HEAD SHA and reviewed base branch (the revision
+  the last review round decided on; the merge gate requires all three)
+- current HEAD SHA and current base branch (read from GitHub before the
+  review is launched)
 - latest review comment URL
 - latest review result
 - merged-since-EPIC-update count
@@ -46,7 +48,7 @@ atomic replace
 
 A corrupt existing state file must fail loudly. Never silently replace corrupted state with a fresh run.
 
-The `protocol_version` is the state file's schema, the nested replan journal included, and it is what tells an old-controller file from a corrupt one: a field a controller of *this* protocol always writes is corruption when absent, so a schema change that tightens what a stage requires must bump the protocol rather than let the old shape be diagnosed as corruption. Old-controller compatibility is decided at the state boundary by the version label, never by shape, and it is explicit and tested per stage: protocol 1 → 2 added the review decision's PR and issue binding to the replan journal, so a protocol-1 file with no replan in flight (an empty or `REJECTED` journal) is loaded and relabelled, while one with an in-flight journal is refused with its stage, PRs and the fate of the source PR named, and never migrated by filling the decision from the run's current PR and issue (that is the rebinding the fields exist to forbid), and never handed to the journal loader to be called corrupt. `run --force` moves such a file aside as it does any unreadable one; it is never overwritten in place.
+The `protocol_version` is the state file's schema, the nested replan journal included, and it is what tells an old-controller file from a corrupt one: a field a controller of *this* protocol always writes is corruption when absent, so a schema change that tightens what a stage requires must bump the protocol rather than let the old shape be diagnosed as corruption. Old-controller compatibility is decided at the state boundary by the version label, never by shape, and it is explicit and tested per stage: protocol 1 → 2 added the review decision's PR and issue binding to the replan journal, so a protocol-1 file with no replan in flight (an empty or `REJECTED` journal) is loaded and relabelled, while one with an in-flight journal is refused with its stage, PRs and the fate of the source PR named, and never migrated by filling the decision from the run's current PR and issue (that is the rebinding the fields exist to forbid), and never handed to the journal loader to be called corrupt. Protocol 2 → 3 added the reviewed PR and base branch to the review binding (`reviewed_pr_url`, `reviewed_base_ref`, `current_base_ref`): a protocol-2 (or protocol-1) file in any phase other than `READY_FOR_MERGE` / `MERGE` is loaded and relabelled, because the next review writes the binding, while one parked in those phases is refused with the PR and HEAD named, and never migrated by filling the binding from the run's current PR (the same rebinding rule). `run --force` moves such a file aside as it does any unreadable one; it is never overwritten in place.
 
 ---
 

@@ -2228,6 +2228,10 @@ def test_t1_superseded_activates_after_a_restart(tmp_state_dir):
     persisted = load_state(eng2.paths.state_file)
     assert persisted.replan_transaction == {}
     assert persisted.superseded_prs[0]["pr_url"] == PR
+    # The replacement has no review yet (#68): the binding of the source PR's
+    # reviews is cleared, and the current base is the verified base branch.
+    binding = (persisted.reviewed_pr_url, persisted.reviewed_head_sha, persisted.reviewed_base_ref)
+    assert binding == ("", "", "") and persisted.current_base_ref == "main"
 
 
 def test_w1_crash_before_prepare_still_prepares_and_invokes_once(tmp_state_dir):
@@ -4826,10 +4830,12 @@ def test_r7f1_an_in_flight_protocol_1_journal_is_refused_at_the_state_boundary(
     assert gh.prs[PR].state == "OPEN" and eng.provider.calls == []
 
 
-def test_r7f1_a_protocol_1_state_without_a_replan_in_flight_loads_as_protocol_2(tmp_state_dir):
-    """The one difference between the protocols is the journal, so a
-    protocol-1 file with an empty or terminal journal is a protocol-2 file
-    with an old label; the label is rewritten on the next save."""
+def test_r7f1_a_protocol_1_state_without_a_replan_in_flight_loads_as_current(tmp_state_dir):
+    """The one difference between protocols 1 and 2 is the journal, so a
+    protocol-1 file with an empty or terminal journal is a current file
+    with an old label (the 2 -> 3 rule of #68 only concerns a file parked
+    in READY_FOR_MERGE / MERGE, which these are not); the label is
+    rewritten on the next save."""
     gh = FakeGitHub()
     eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.VERIFIED)
     eng.save()
@@ -4842,10 +4848,10 @@ def test_r7f1_a_protocol_1_state_without_a_replan_in_flight_loads_as_protocol_2(
         data["phase"] = "REVIEW" if not journal else "BLOCKED"
         eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
         loaded = eng.load()
-        assert loaded.protocol_version == "2"
+        assert loaded.protocol_version == "3"
         assert loaded.replan_transaction == journal
         eng.save()
-        assert json.loads(eng.paths.state_file.read_text())["protocol_version"] == "2"
+        assert json.loads(eng.paths.state_file.read_text())["protocol_version"] == "3"
     # A protocol-1 file that predates the journal field altogether is the
     # same case: no replan in flight.
     data = json.loads(eng.paths.state_file.read_text())

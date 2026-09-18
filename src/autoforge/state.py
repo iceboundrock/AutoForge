@@ -34,7 +34,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from . import __prompt_version__, __protocol_version__, __version__
-from .errors import StateError
+from .errors import ConfigurationError, StateError
 from .loop_guard import validate_review_history
 from .replan_txn import LEGACY_JOURNAL_PROTOCOL, legacy_journal_refusal
 from .result_parser import FINDING_ID_RE, MAX_FINDING_ID_CHARS
@@ -42,6 +42,7 @@ from .run_contract import LocalRunContract
 from .runlog import validate_run_id
 from .safefs import ReadLimitExceeded, SafeRoot, entry_kind
 from .transitions import LOCAL_PHASES, LOCAL_WRITE_PHASES, Phase, WorkflowMode
+from .validation import parse_pr_url
 
 STATE_FILENAME = "state.json"
 LOGS_DIRNAME = "logs"
@@ -149,6 +150,54 @@ def _validate_local_pending(state: AutoForgeState) -> None:
         )
 
 
+# Protocol labels an older controller wrote that this one can still read,
+# each subject to the boundary rule its successor introduced (see
+# :meth:`AutoForgeState.from_dict`).
+_LEGACY_PROTOCOLS = frozenset({LEGACY_JOURNAL_PROTOCOL, "2"})
+# The phases in which the persisted clean review is consumed by the merge
+# gate, and so the phases a state without the review's PR and base binding
+# cannot be loaded in.
+_MERGE_PHASES = (Phase.READY_FOR_MERGE, Phase.MERGE)
+
+
+def _legacy_review_binding_refusal(
+    data: dict, phase: Phase, *, protocol: str, written_by: str
+) -> str:
+    """Why a pre-protocol-3 state cannot be loaded, or ``""`` when it can.
+
+    Protocol 3 added ``reviewed_pr_url`` and ``reviewed_base_ref`` next to
+    ``reviewed_head_sha``, and the merge gate refuses a clean review that
+    lacks them. A file in any phase but READY_FOR_MERGE or MERGE is loaded
+    as is: nothing in it consumes the binding before the next completed
+    review writes it. A file parked in one of the merge phases holds a clean
+    review that the gate could only accept by binding it, now, to the run's
+    current PR and base -- and a binding reconstructed from the very fields
+    it exists to check is no binding. It is refused at the boundary, with
+    the PR and HEAD named so the operator can decide on GitHub whether the
+    PR is done, and never read as corruption: it was written whole.
+
+    ``data`` is read defensively: this runs before any schema check.
+    """
+    if phase not in _MERGE_PHASES:
+        return ""
+
+    def _text(name: str) -> str:
+        value = data.get(name)
+        return value if isinstance(value, str) and value else "(none)"
+
+    return (
+        f"state file was written by controller {written_by or '(unknown)'} under "
+        f"protocol_version {protocol!r} and is in phase {phase.value} with a clean review of "
+        f"PR {_text('current_pr_url')} at HEAD {_text('reviewed_head_sha')}; protocol "
+        f"{protocol!r} did not record which PR and base branch that review was posted on, "
+        "and this controller does not bind it to the run's current PR and base after the "
+        "fact. Nothing was merged or counted by this controller. Check the PR on GitHub: if "
+        "it is already MERGED the issue is done and the run should continue from the next "
+        "issue; if it is OPEN, start a new run for the issue, which adopts the PR and "
+        "reviews it again. The state file was left unchanged"
+    )
+
+
 @dataclass
 class AutoForgeState:
     protocol_version: str = __protocol_version__
@@ -175,10 +224,24 @@ class AutoForgeState:
     # Completed review rounds for the current PR; the upcoming round is +1.
     review_round: int = 0
 
-    # SHA bound to the last completed review (what the reviewer actually saw).
+    # The revision the last completed review is bound to: the PR it was
+    # posted on (canonical URL), the HEAD the reviewer saw and the base branch
+    # the reviewed diff was against. The three are written together by the
+    # review and read together by the merge gate: a clean review is a
+    # decision about one PR's diff against one base at one commit, so before
+    # MERGE the run's ``current_pr_url`` must be this PR by identity and the
+    # PR GitHub returns for it must still have this HEAD and this base. A
+    # substituted ``current_pr_url`` (a same-repository PR at the same HEAD on
+    # the same branch against another base, say) or a retargeted base is
+    # therefore never merged on the strength of a review it did not receive.
+    reviewed_pr_url: str = ""
     reviewed_head_sha: str = ""
-    # Latest PR HEAD the controller observed through `gh`.
+    reviewed_base_ref: str = ""
+    # Latest PR HEAD and base branch the controller observed through `gh`;
+    # both are re-bound right before a review, and the post-review read must
+    # find them unchanged for the round to be current rather than stale.
     current_head_sha: str = ""
+    current_base_ref: str = ""
 
     last_review_comment_url: str = ""
     last_review_result: str = ""  # "needs_fix" | "clean" | "stale" | ""
@@ -333,21 +396,39 @@ class AutoForgeState:
         # controller must be reported as an unsupported protocol, not as a
         # pile of typos.
         #
-        # Protocol 1 -> 2 changed exactly one thing: the replan journal
-        # records the PR and issue its decision was made on. A protocol-1
-        # file with no replan in flight is therefore a protocol-2 file with
-        # an old label and is loaded as one (the label is rewritten on the
-        # next save); one with a replan in flight is refused *here*, at the
-        # boundary, with the transaction described -- never migrated by
-        # filling the decision from the run's current PR and issue, which is
-        # the rebinding the fields forbid, and never handed to the journal
-        # loader, which would call it corrupt. See
-        # :func:`replan_txn.legacy_journal_refusal`.
+        # Each protocol step added one binding, and an old file is loaded
+        # exactly when nothing in it depends on the binding it lacks:
+        #
+        # - 1 -> 2: the replan journal records the PR and issue its decision
+        #   was made on. A protocol-1 file with no replan in flight is a
+        #   protocol-2 file with an old label; one with a replan in flight is
+        #   refused with the transaction described, never migrated by filling
+        #   the decision from the run's current PR and issue (the rebinding
+        #   the fields forbid) and never handed to the journal loader, which
+        #   would call it corrupt (:func:`replan_txn.legacy_journal_refusal`).
+        # - 2 -> 3: the completed review records the PR it was posted on and
+        #   the base branch it was bound to, and the merge gate requires
+        #   both. A protocol-2 file parked in READY_FOR_MERGE or MERGE holds a
+        #   clean review the gate could only accept by binding it to the run's
+        #   current PR and base -- the substitution the fields exist to catch
+        #   -- so it is refused with the PR and HEAD named
+        #   (:func:`_legacy_review_binding_refusal`). In any other phase the
+        #   next review writes the binding, and the file is loaded as is.
+        #
+        # The label is rewritten on the next save. A file that is refused is
+        # left unchanged (``run --force`` moves it aside like any unreadable
+        # one).
         raw_protocol = data.get("protocol_version", __protocol_version__)
-        if raw_protocol == LEGACY_JOURNAL_PROTOCOL:
-            refusal = legacy_journal_refusal(
-                data.get("replan_transaction", {}),
-                written_by=str(data.get("controller_version", "")),
+        written_by = str(data.get("controller_version", ""))
+        if isinstance(raw_protocol, str) and raw_protocol in _LEGACY_PROTOCOLS:
+            if raw_protocol == LEGACY_JOURNAL_PROTOCOL:
+                refusal = legacy_journal_refusal(
+                    data.get("replan_transaction", {}), written_by=written_by
+                )
+                if refusal:
+                    raise StateError(refusal)
+            refusal = _legacy_review_binding_refusal(
+                data, phase, protocol=str(raw_protocol), written_by=written_by
             )
             if refusal:
                 raise StateError(refusal)
@@ -518,6 +599,21 @@ class AutoForgeState:
             state.last_review_needs_fix, bool
         ):
             raise StateError("state field 'last_review_needs_fix' must be a boolean or null")
+        # The reviewed PR is compared by GitHub identity at the merge gate,
+        # so it must parse as a PR URL of the run's repository whenever it is
+        # set; a value the gate could not parse would otherwise surface as a
+        # refusal to merge that names no cause. (Empty is "no review bound",
+        # which the gate refuses on its own, exactly as for the HEAD.)
+        if state.reviewed_pr_url:
+            try:
+                reviewed = parse_pr_url(state.reviewed_pr_url)
+            except ConfigurationError as exc:
+                raise StateError(f"state field 'reviewed_pr_url': {exc}") from None
+            if state.repository and not reviewed.same_repository(state.repository):
+                raise StateError(
+                    f"state field 'reviewed_pr_url' names PR {state.reviewed_pr_url}, which "
+                    f"is not in repository {state.repository!r}"
+                )
         return state
 
     def touch(self) -> None:
@@ -550,7 +646,10 @@ class AutoForgeState:
         self.current_pr_url = ""
         self.current_branch = ""
         self.current_head_sha = ""
+        self.current_base_ref = ""
+        self.reviewed_pr_url = ""
         self.reviewed_head_sha = ""
+        self.reviewed_base_ref = ""
         self.review_round = 0
         self.last_review_result = ""
         self.last_review_needs_fix = None

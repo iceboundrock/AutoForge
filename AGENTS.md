@@ -164,7 +164,7 @@ tests/AGENTS.md                        test scope: fakes, fixtures, what tests m
 docs/agent-guides/
   architecture.md                      engine / provider / executor / GitHub client / prompt boundaries
   workflow.md                          phases, legal transitions, review-round routing, loop bounds,
-                                       stagnation, replan policy, HEAD-SHA binding
+                                       stagnation, replan policy, HEAD-SHA and PR-identity binding
   replan-transaction.md                REPLAN_REEXECUTE transaction, provenance, close/compensate, recovery
   github-safety.md                     GitHub source of truth, per-phase read-back verification,
                                        merge safety, dry-run, EPIC updates

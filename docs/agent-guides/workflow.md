@@ -121,19 +121,39 @@ workflow:
 
 ---
 
-## Bind reviews to PR HEAD SHA
+## Bind reviews to PR HEAD SHA and to the PR identity
 
-A clean review is valid only for the exact commit it reviewed.
+A clean review is valid only for the exact change it reviewed: the commit,
+on the PR it was posted on, against that PR's base branch at the time. The
+same commit proposed as another PR (the same branch against another base)
+is a change no review decided on.
 
-Persist the reviewed HEAD SHA.
+Persist the reviewed revision with the review: the reviewed PR
+(`reviewed_pr_url`), the reviewed HEAD SHA (`reviewed_head_sha`) and the
+reviewed base branch (`reviewed_base_ref`). The controller reads all three
+from GitHub right before the reviewer is launched (`current_head_sha`,
+`current_base_ref`) and records them when the round is accepted.
 
 Before accepting a clean review or allowing a future merge, verify:
 
 ```text
+same_target(current_pr_url, reviewed_pr_url)   # repository + number, never string equality
+same_target(pr_returned_by_github, reviewed_pr_url)
 current_pr_head_sha == reviewed_head_sha
+current_pr_base_ref == reviewed_base_ref
 ```
 
-If the PR HEAD changes after review, the prior clean review is stale and the PR must return to `REVIEW`.
+The identity checks come first, from state alone, and fail closed: a
+`current_pr_url` that is not the reviewed PR, or a GitHub read that answers
+the URL with another PR, is `BLOCKED` before anything else is read from it.
+The binding is never moved to the current URL, and a protocol-2 state file
+parked in `READY_FOR_MERGE` / `MERGE` (written before the binding existed)
+is refused at load rather than bound after the fact.
+
+If the PR HEAD or base changes after the review, the prior clean review is
+stale and the PR must return to `REVIEW`, where the next round is bound to
+the actual revision. A PR that GitHub reports as `MERGED` at the reviewed
+HEAD but into another base is never counted (`BLOCKED`).
 
 Never merge code that has changed since the latest clean review.
 
