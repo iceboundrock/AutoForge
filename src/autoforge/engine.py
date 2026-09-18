@@ -56,7 +56,12 @@ Loop bounds (``workflow:`` config, enforced from persisted state so
   (``stagnation_unchanged_count_rounds``) -> BLOCKED. Rounds of all-new
   findings are progress and only meet the cap.
 - ``max_total_steps``: the run's cumulative ``step_count`` (all issues, all
-  phases, across ``resume``) -> BLOCKED before another step executes.
+  phases, across ``resume``) -> BLOCKED before another step executes. One
+  exception: a REPLAN_REEXECUTE journal past the destructive write
+  (SUPERSEDE_INTENT, COMPENSATING, SUPERSEDED) is finished first -- the
+  step counts, no agent runs, nothing is closed -- so the source PR the
+  controller closed is never stranded unrecorded; the budget ends the run
+  at the next phase boundary (``replan_txn.budget_may_stop``, #71).
 Failed invocations never consume a round or a history entry.
 
 Safety rules:
@@ -164,11 +169,14 @@ from .providers import AgentExecutionResult, AgentRequest, ProviderRegistry
 from .redaction import redact, redact_argv, redact_dict
 from .replan import HistoricalReviewCollector, ReplanDecision, evaluate_replan_policy
 from .replan_txn import (
+    CLOSE_BEGUN_STAGES,
     Disposition,
     ReplanStage,
     ReplanTransaction,
+    budget_may_stop,
     find_non_open_claimant,
     has_close_receipt,
+    may_invoke_agent,
     new_transaction_id,
     render_close_receipt,
     select_bound_candidate,
@@ -1114,13 +1122,12 @@ class ControllerEngine:
                 ],
                 command=self._merge_plan_command(),
             )
-        profile = profile_for_phase(self.config, s.phase, s.review_round)
-        variables = self._prompt_variables()
-        prompt = self.render_prompt_for(s.phase)
-        command = self.providers.get(profile).build_command_for(profile, prompt)
         notes: list[str] = []
+        expected_next = self._expected_next(s.phase)
         budget = step_budget_reason(s.step_count, self.config.workflow.max_total_steps)
-        if budget:
+        if budget and not self._budget_may_stop(s.phase):
+            notes.append(self._replan_finishes_under_budget_note(budget))
+        elif budget:
             notes.append(f"would enter BLOCKED without executing: {budget}")
         if s.phase == Phase.ANALYZE_EXECUTE:
             notes.append("would first check for an existing open PR (recovery -> REVIEW)")
@@ -1134,20 +1141,28 @@ class ControllerEngine:
             )
             notes.append("REVIEWED_HEAD_SHA is fetched from gh immediately before the review")
         if s.phase == Phase.REPLAN_REEXECUTE:
-            notes.append(
-                "would create and verify a new replacement PR from the verified default branch"
-            )
-            notes.append(
-                "would close the old PR without merging it only after replacement verification"
-            )
-            notes.append(
-                "would close the old PR only after the replacement carries this transaction's "
-                "marker and both checkpoints still hold"
-            )
             replan_txn = ReplanTransaction.from_dict(s.replan_transaction)
+            stage_notes, expected_next = self._replan_plan(replan_txn)
+            notes.extend(stage_notes)
             if replan_txn.escalation:
                 notes.append(f"replan policy: {json.dumps(replan_txn.escalation, sort_keys=True)}")
             notes.append(f"replan transaction stage: {replan_txn.stage.value}")
+            if not may_invoke_agent(replan_txn):
+                # The reducer resolves this step itself (`_drive_replan` never
+                # falls through to the invocation past PREPARED), so the plan
+                # carries no agent command, template or prompt: what it shows
+                # is what the step can do (PR #92 review).
+                return self._deterministic_plan(
+                    s,
+                    f"REPLAN_REEXECUTE at stage {replan_txn.stage.value} (controller finishes "
+                    "the persisted transaction; no agent, no prompt)",
+                    expected_next,
+                    notes=notes,
+                )
+        profile = profile_for_phase(self.config, s.phase, s.review_round)
+        variables = self._prompt_variables()
+        prompt = self.render_prompt_for(s.phase)
+        command = self.providers.get(profile).build_command_for(profile, prompt)
         return StepPlan(
             phase=s.phase.value,
             profile_name=profile.name,
@@ -1164,7 +1179,7 @@ class ControllerEngine:
             template=PHASE_TEMPLATE[s.phase] or "",
             review_round=s.review_round + 1 if s.phase == Phase.REVIEW else s.review_round,
             variables={k: str(v) for k, v in variables.items()},
-            expected_next=self._expected_next(s.phase),
+            expected_next=expected_next,
             legal_next=self._legal_next_for(s.phase, s.mode),
             notes=notes,
         )
@@ -1509,9 +1524,10 @@ class ControllerEngine:
             # checked there, from the persisted value.
             return self._local_step_once(previous, plan)
         # Cumulative step budget: measured on persisted state, so `resume`
-        # continues the same budget. Checked before anything executes.
+        # continues the same budget. Checked before anything executes -- except
+        # that a replan journal past the write is finished first (#71).
         budget = step_budget_reason(state.step_count, self.config.workflow.max_total_steps)
-        if budget:
+        if budget and self._budget_may_stop(previous):
             return self._block(previous, plan, self._budget_block_reason(budget))
         if previous == Phase.REVIEW:
             # Review-round cap, whatever path led here (FIX, stale re-review,
@@ -1521,6 +1537,12 @@ class ControllerEngine:
             if cap:
                 return self._block(previous, plan, self._loop_block_reason(cap))
 
+        # In memory until the step's first save: the launch checkpoint of an
+        # agent step (`_invoke_phase`), or the resolution of a step that needs
+        # none. An entry read that fails transiently before either persists
+        # nothing, so it is not a step and is not charged: `resume` re-reads
+        # with the same budget. The replan exemption above inherits this rule
+        # rather than adding one.
         state.step_count += 1
         if previous == Phase.INITIALIZING:
             return self._initialize(plan)
@@ -2463,6 +2485,128 @@ class ControllerEngine:
             "nothing was merged. Raise 'workflow.max_total_steps' in the config or start a "
             "new run."
         )
+
+    def _budget_may_stop(self, phase: Phase) -> bool:
+        """Whether the exhausted step budget blocks ``phase`` before it executes.
+
+        Every phase but one: a REPLAN_REEXECUTE journal that has begun
+        closing the source PR is a persisted decision the controller
+        finishes (:func:`budget_may_stop`). Blocking it would leave the
+        source closed by the controller with nothing in the run's state
+        saying so, and ``resume`` refuses BLOCKED, so raising the budget
+        could not repair it. The reducer at those stages invokes no agent and
+        never closes; the budget ends the run at the next step instead.
+        """
+        if phase is not Phase.REPLAN_REEXECUTE:
+            return True
+        journal = self._require_state().replan_transaction
+        return budget_may_stop(ReplanTransaction.from_dict(journal))
+
+    def _replan_finishes_under_budget_note(self, budget: str) -> str:
+        """Dry-run note for a replan step that runs although the budget is reached.
+
+        Says only *that* the step runs and how it is charged; *what* it does
+        is the stage's own note (:meth:`_replan_plan`), so the two cannot
+        describe different actions.
+        """
+        txn = ReplanTransaction.from_dict(self._require_state().replan_transaction)
+        if txn.stage in CLOSE_BEGUN_STAGES:
+            return (
+                f"step budget reached ({budget}), but the replan transaction has already begun "
+                f"closing the source PR {txn.source_pr_url} (stage {txn.stage.value}); would "
+                "finish it as described in the stage note below, without invoking an agent and "
+                "without closing anything; the step counts and the budget ends the run at the "
+                "next step"
+            )
+        return (
+            f"step budget reached ({budget}), but the replan transaction is "
+            f"{txn.stage.value}; would replay its refusal, which names the source PR "
+            f"{txn.source_pr_url or txn.decision_pr_url or '(unknown)'} and its fate, instead "
+            "of blocking with the plain budget text"
+        )
+
+    @staticmethod
+    def _replan_plan(txn: ReplanTransaction) -> tuple[list[str], str]:
+        """What a REPLAN_REEXECUTE step would do, from the journal's stage alone.
+
+        Returns the plan notes and the expected next phase. The reducer
+        (:meth:`_drive_replan`) dispatches on the persisted stage, so the plan
+        follows the same dispatch rather than describing the whole lifecycle
+        at every stage: the agent is launched only while no PR bound to this
+        transaction exists (:func:`may_invoke_agent`; the plan carries a
+        command only there), the close is reachable from ``VERIFIED`` alone,
+        and every later stage reads GitHub and then activates, undoes or
+        refuses -- which of the three is a GitHub fact the plan cannot read,
+        so it names all of them. Pure: reads the journal and nothing else.
+        """
+        source = txn.source_pr_url or txn.decision_pr_url or "(unknown)"
+        replacement = txn.replacement_pr_url or "(none)"
+        to_review = ControllerEngine._expected_next(Phase.REPLAN_REEXECUTE)
+        if txn.journal_defects:
+            return [
+                "the persisted replan transaction could not be read whole; would refuse "
+                f"without invoking an agent or touching GitHub, saying whether the source PR "
+                f"{source} was already closed cannot be determined from local state",
+            ], "BLOCKED (unreadable journal; no agent, no GitHub write)"
+        if txn.stage is ReplanStage.REJECTED:
+            return [
+                "would replay the recorded refusal and enter BLOCKED, without invoking an "
+                f"agent or touching GitHub; the refusal states what happened to the source PR "
+                f"{source}: {txn.rejection_reason or 'refused by verification'}",
+            ], "BLOCKED (recorded refusal replayed; no agent, no GitHub write)"
+        if txn.stage is ReplanStage.COMPENSATING:
+            return [
+                f"would undo the close of the source PR {source} (reopen it via gh if it is "
+                "still closed, then confirm the reopen), without invoking an agent and without "
+                f"closing anything; the replacement {replacement} is not activated",
+                "would then enter BLOCKED naming both PRs and the reason the close was undone",
+            ], "BLOCKED (close undone; no agent, no second close)"
+        if txn.stage is ReplanStage.SUPERSEDED:
+            return [
+                f"would re-read the replacement {replacement} and the source PR {source} via gh "
+                "and activate the replacement only if both checkpoints still hold, without "
+                "invoking an agent and without closing anything",
+                "if either checkpoint moved, would refuse and enter BLOCKED naming both PRs "
+                "(the close stays: it was confirmed correct when it was made)",
+            ], f"{to_review} | BLOCKED if a checkpoint moved"
+        if txn.stage is ReplanStage.SUPERSEDE_INTENT:
+            return [
+                f"would re-read the source PR {source} via gh; never closes it from here and "
+                "invokes no agent",
+                "source CLOSED and carrying this transaction's close receipt: would confirm both "
+                f"checkpoints, then activate the replacement {replacement} or undo the close "
+                "if a checkpoint moved",
+                "source OPEN, or closed without the receipt: would refuse and enter BLOCKED "
+                "naming both PRs, since local state cannot tell a close that never ran from "
+                "one that landed and was reopened",
+            ], f"{to_review} | BLOCKED (refused, or the close undone)"
+        # Before the write. PENDING and PREPARED may still launch the agent;
+        # VERIFIED never does.
+        agent: list[str]
+        if txn.stage is ReplanStage.PENDING:
+            agent = [
+                "would checkpoint the source PR, its HEAD, the verified default branch, the "
+                "review evidence and the PRs that already exist, then invoke the replan agent "
+                "(command above) to create the replacement PR",
+            ]
+        elif txn.stage is ReplanStage.PREPARED:
+            agent = [
+                "would look for a PR carrying this transaction's marker: none -> invoke the "
+                "replan agent (command above) to create the replacement PR from the verified "
+                "default branch; one -> verify it without an agent",
+            ]
+        else:
+            agent = [
+                f"the replacement {replacement} is already verified; would not invoke an agent",
+            ]
+        return [
+            *agent,
+            f"would close the old PR {source} without merging it only after the replacement "
+            "carries this transaction's marker, both checkpoints still hold on a fresh gh "
+            "read, and the close intent has been persisted",
+            "would refuse and enter BLOCKED, closing nothing, if the replacement cannot be "
+            "verified",
+        ], f"{to_review} | BLOCKED if the replacement cannot be verified"
 
     @staticmethod
     def _local_budget_block_reason(reason: str) -> str:
@@ -3559,11 +3703,6 @@ class ControllerEngine:
 
     def _replan_block_text(self, txn: ReplanTransaction, reason: str) -> str:
         """BLOCKED text that always says what happened to the source PR."""
-        began_closing = (
-            ReplanStage.SUPERSEDE_INTENT,
-            ReplanStage.COMPENSATING,
-            ReplanStage.SUPERSEDED,
-        )
         if txn.journal_defects:
             # The journal could not be read in full, so it cannot say whether
             # the close it may have recorded was performed. Never claim that
@@ -3575,7 +3714,7 @@ class ControllerEngine:
                 "by it cannot be "
                 "determined from local state; check GitHub before repairing the journal"
             )
-        elif txn.stage in began_closing or txn.superseded_at:
+        elif txn.stage in CLOSE_BEGUN_STAGES or txn.superseded_at:
             tail = (
                 f"This transaction had already begun closing the source PR {txn.source_pr_url}, "
                 f"and the replacement {txn.replacement_pr_url or '(none)'} was not activated"

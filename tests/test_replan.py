@@ -35,8 +35,10 @@ from autoforge.replan_txn import (
     ReplanAttestation,
     ReplanStage,
     ReplanTransaction,
+    budget_may_stop,
     find_non_open_claimant,
     has_close_receipt,
+    may_invoke_agent,
     render_close_receipt,
     render_marker,
     scan_replan_markers,
@@ -48,7 +50,7 @@ from autoforge.result_parser import (
     parse_control_result,
 )
 from autoforge.state import load_state
-from autoforge.transitions import Phase
+from autoforge.transitions import Phase, WorkflowMode, edges_for
 from tests.conftest import (
     BRANCH,
     ISSUE,
@@ -2831,7 +2833,9 @@ def test_t3_a_dry_run_from_replan_reexecute_neither_writes_nor_invokes(tmp_state
 
     From every stage a crash can leave, a dry-run step renders the plan and
     nothing else: no agent, no `gh` call of any kind (so no close, reopen or
-    comment), no journal movement and no state write.
+    comment), no journal movement and no state write. The plan itself
+    carries the replan template and command only where the reducer could
+    launch the agent (`may_invoke_agent`).
     """
     gh = FakeGitHub()
     eng, txn = _seeded_engine(tmp_state_dir, gh, stage)
@@ -2842,7 +2846,7 @@ def test_t3_a_dry_run_from_replan_reexecute_neither_writes_nor_invokes(tmp_state
     calls_before = list(gh.calls)
     out = eng.step(dry_run=True)
     assert out.dry_run and out.plan is not None
-    assert out.plan.template == "replan_reexecute.md"
+    _assert_plan_metadata_follows(out.plan, may_invoke_agent(txn))
     assert eng.provider.calls == []
     assert gh.calls == calls_before
     assert gh.closed_prs == [] and gh.reopened_prs == [] and gh.commented_prs == []
@@ -5014,6 +5018,406 @@ def test_t2_the_step_budget_blocks_replan_before_the_agent_or_the_journal_moves(
     assert journal.stage is ReplanStage.PENDING and journal.transaction_id == ""
     _assert_source_untouched(eng, gh)
     assert eng.state.review_round == 20 and len(eng.state.review_history) == 20
+
+
+# -- #71: the budget never blocks a journal past the write ---------------------------------
+
+
+def test_the_budget_may_stop_a_replan_only_before_the_write():
+    """#71: the partition is total over the stages, so a new stage must choose a side.
+
+    Before the write the controller has recorded nothing it would have to
+    account for; from the intent on, it has. A journal that cannot be read
+    cannot prove it is before the write, so it is handed to the reducer too.
+    """
+    may_stop = {stage for stage in ReplanStage if budget_may_stop(_seed_txn(stage))}
+    assert may_stop == {ReplanStage.PENDING, ReplanStage.PREPARED, ReplanStage.VERIFIED}
+    journal = {**_seed_txn(ReplanStage.VERIFIED).to_dict(), "stage": 7}
+    unreadable = ReplanTransaction.from_dict(journal)
+    assert unreadable.journal_defects and not budget_may_stop(unreadable)
+
+
+def _at_the_budget(eng) -> int:
+    """Persist ``step_count == max_total_steps``, as a run that spent its budget leaves it."""
+    steps = eng.config.workflow.max_total_steps
+    eng.state.step_count = steps
+    return steps
+
+
+@pytest.mark.parametrize("stage", [ReplanStage.SUPERSEDE_INTENT, ReplanStage.SUPERSEDED])
+def test_a_resume_at_the_budget_still_activates_a_replacement_past_the_write(tmp_state_dir, stage):
+    """#71: SUPERSEDE_INTENT (receipt posted) and SUPERSEDED finish under a spent budget.
+
+    The source was closed by this transaction; the only work left is to
+    read, confirm and install the replacement. The resumed step does exactly
+    that -- no agent, no second close -- and counts, so the *next* step is
+    the one the budget ends, with the state describing what happened.
+    """
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, stage)
+    _closed_by_controller(gh)
+    steps = _at_the_budget(eng)
+    eng2 = _restart(eng, gh)
+
+    out = eng2.step()
+    assert out.next_phase == "REVIEW", eng2.state.block_reason
+    assert eng2.provider.calls == []
+    assert gh.closed_prs == [] and gh.reopened_prs == []
+    assert gh.prs[PR].state == "CLOSED"
+    persisted = load_state(eng2.paths.state_file)
+    assert persisted.step_count == steps + 1  # the finishing step counted
+    assert persisted.current_pr_url == REPLACEMENT_PR
+    assert persisted.superseded_prs[0]["transaction_id"] == TXN_ID
+    assert persisted.superseded_prs[0]["pr_url"] == PR
+    assert persisted.escalation_count == 1 and persisted.replan_transaction == {}
+
+    # The budget ends the run at the phase boundary, and nothing else moves.
+    out = eng2.step()
+    assert out.next_phase == "BLOCKED"
+    assert f"workflow.max_total_steps={steps}" in eng2.state.block_reason
+    assert eng2.provider.calls == []
+    final = load_state(eng2.paths.state_file)
+    assert final.step_count == steps + 1 and final.current_pr_url == REPLACEMENT_PR
+    assert final.reviewed_head_sha == "" and final.review_round == 0
+
+
+def test_a_resume_at_the_budget_still_carries_out_a_decided_compensation(tmp_state_dir):
+    """#71: COMPENSATING finishes under a spent budget: the reopen it decided is performed.
+
+    The block that follows is the compensation's own, naming the transaction
+    and both PRs, not the budget's.
+    """
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.COMPENSATING)
+    _closed_by_controller(gh)
+    steps = _at_the_budget(eng)
+    eng2 = _restart(eng, gh)
+
+    out = eng2.step()
+    assert out.next_phase == "BLOCKED"
+    reason = eng2.state.block_reason
+    assert "the close was undone" in reason and "is open again" in reason
+    assert PR in reason and REPLACEMENT_PR in reason
+    assert "max_total_steps" not in reason
+    assert len(gh.reopened_prs) == 1 and gh.prs[PR].state == "OPEN"
+    assert gh.closed_prs == [] and eng2.provider.calls == []
+    persisted = load_state(eng2.paths.state_file)
+    assert persisted.step_count == steps + 1
+    journal = ReplanTransaction.from_dict(persisted.replan_transaction)
+    assert journal.stage is ReplanStage.REJECTED and journal.transaction_id == TXN_ID
+    assert persisted.current_pr_url == PR and persisted.superseded_prs == []
+
+
+def test_a_resume_at_the_budget_never_closes_from_a_recorded_intent(tmp_state_dir):
+    """#71: the exemption is keyed on the stage, and the reducer still never closes.
+
+    SUPERSEDE_INTENT over an OPEN source with no receipt is the refusal it
+    always was; the budget neither blocks it first nor licenses the close.
+    """
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.SUPERSEDE_INTENT)
+    steps = _at_the_budget(eng)
+    eng2 = _restart(eng, gh)
+    out = eng2.step()
+    assert out.next_phase == "BLOCKED"
+    assert "carries no close receipt" in eng2.state.block_reason
+    assert "max_total_steps" not in eng2.state.block_reason
+    assert gh.closed_prs == [] and gh.prs[PR].state == "OPEN"
+    assert _txn(eng2).stage is ReplanStage.REJECTED
+    assert load_state(eng2.paths.state_file).step_count == steps + 1
+
+
+def _fresh_process(eng, gh):
+    """A new controller process over what is *on disk*, without saving ``eng`` first.
+
+    ``_restart`` persists the in-memory state; this deliberately does not, so
+    a fresh engine sees exactly what an interrupted step left behind.
+    """
+    eng2 = make_engine(eng.paths.state_dir, ["the replan agent must not run"], github=gh)
+    eng2.load()
+    return eng2
+
+
+@pytest.mark.parametrize(
+    "stage", [ReplanStage.SUPERSEDE_INTENT, ReplanStage.SUPERSEDED, ReplanStage.COMPENSATING]
+)
+def test_a_transient_failure_while_finishing_at_the_budget_is_not_a_step(tmp_state_dir, stage):
+    """PR #92 review: an outage while finishing under a spent budget is not a step.
+
+    A step is charged when it first persists: the launch checkpoint of an
+    agent step, the resolution of a step that needs none. The finishing read
+    that fails transiently persists nothing, so the state file -- count,
+    phase and journal -- is byte-identical afterwards and the next ``resume``
+    re-reads, exactly as any phase does under an outage; the exemption admits
+    no more than that, and never a write. Once GitHub answers, the step
+    finishes, is counted once, and the budget ends the run at the next
+    boundary. An outage therefore defers the finish; it never repeats it.
+    """
+    gh = FakeGitHub()
+    eng, txn = _seeded_engine(tmp_state_dir, gh, stage)
+    _closed_by_controller(gh)
+    steps = _at_the_budget(eng)
+    eng2 = _restart(eng, gh)
+    before = eng2.paths.state_file.read_bytes()
+
+    gh.get_pr_failures = 1
+    with pytest.raises(GitHubUnavailableError):
+        eng2.step()
+    assert eng2.paths.state_file.read_bytes() == before
+    persisted = load_state(eng2.paths.state_file)
+    assert persisted.step_count == steps and persisted.phase == Phase.REPLAN_REEXECUTE
+    assert not persisted.block_reason
+    assert ReplanTransaction.from_dict(persisted.replan_transaction) == txn
+    assert gh.calls == [("get_pr", PR)]  # the one read that failed, and nothing else
+    assert gh.closed_prs == [] and gh.reopened_prs == [] and eng2.provider.calls == []
+
+    # The operator's `resume` once GitHub answers: the finishing step, counted once.
+    eng3 = _fresh_process(eng2, gh)
+    out = eng3.step()
+    persisted = load_state(eng3.paths.state_file)
+    assert persisted.step_count == steps + 1
+    assert eng3.provider.calls == [] and gh.closed_prs == []
+    if stage is ReplanStage.COMPENSATING:
+        assert out.next_phase == "BLOCKED"
+        assert "the close was undone" in persisted.block_reason
+        assert "max_total_steps" not in persisted.block_reason
+        assert len(gh.reopened_prs) == 1 and gh.prs[PR].state == "OPEN"
+        return
+    assert out.next_phase == "REVIEW", persisted.block_reason
+    assert persisted.current_pr_url == REPLACEMENT_PR and persisted.escalation_count == 1
+    assert gh.reopened_prs == [] and gh.prs[PR].state == "CLOSED"
+    # The budget ends the run at the phase boundary the finish reached.
+    out = _fresh_process(eng3, gh).step()
+    assert out.next_phase == "BLOCKED"
+    final = load_state(eng3.paths.state_file)
+    assert f"workflow.max_total_steps={steps}" in final.block_reason
+    assert final.step_count == steps + 1 and final.current_pr_url == REPLACEMENT_PR
+
+
+@pytest.mark.parametrize("stage", [ReplanStage.PREPARED, ReplanStage.VERIFIED])
+def test_the_budget_still_blocks_a_replan_before_the_write(tmp_state_dir, stage):
+    """#71: PREPARED and VERIFIED keep blocking exactly as PENDING does.
+
+    Nothing was closed, so blocking costs nothing: GitHub is not read, the
+    agent does not run, the step does not count and the journal is untouched.
+    """
+    gh = FakeGitHub()
+    eng, txn = _seeded_engine(tmp_state_dir, gh, stage)
+    steps = _at_the_budget(eng)
+    eng2 = _restart(eng, gh)
+    out = eng2.step()
+    assert out.next_phase == "BLOCKED"
+    assert f"workflow.max_total_steps={steps}" in eng2.state.block_reason
+    assert "not reset by 'resume'" in eng2.state.block_reason
+    assert gh.calls == [] and eng2.provider.calls == []
+    persisted = load_state(eng2.paths.state_file)
+    assert persisted.step_count == steps and persisted.phase == Phase.BLOCKED
+    assert ReplanTransaction.from_dict(persisted.replan_transaction) == txn
+    _assert_source_untouched(eng2, gh)
+
+
+def test_an_unreadable_journal_at_the_budget_is_refused_in_its_own_words(tmp_state_dir):
+    """#71: a journal that cannot prove it is before the write is not budget-blocked.
+
+    The reducer's refusal says the source PR's fate cannot be determined from
+    local state; the plain budget text would have claimed nothing about it.
+    """
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.SUPERSEDED)
+    _closed_by_controller(gh)
+    eng.state.replan_transaction["stage"] = "from_a_future_version"
+    _at_the_budget(eng)
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert "unknown stage" in eng.state.block_reason
+    assert "cannot be determined from local state" in eng.state.block_reason
+    assert "max_total_steps" not in eng.state.block_reason
+    assert gh.closed_prs == [] and gh.reopened_prs == []
+
+
+def test_dry_run_plans_an_unreadable_journal_without_an_agent(tmp_state_dir):
+    """A journal that cannot be read whole plans a refusal, with no agent command.
+
+    The plan is the deterministic shape of the other controller-owned steps
+    and its notes say the source PR's fate cannot be determined locally; the
+    dry run reads nothing and writes nothing.
+    """
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.SUPERSEDED)
+    eng.state.replan_transaction["stage"] = "from_a_future_version"
+    before = json.dumps(eng.state.replan_transaction, sort_keys=True)
+    plan = eng.step(dry_run=True).plan
+    assert plan is not None
+    _assert_plan_metadata_follows(plan, may_launch=False)
+    notes = "\n".join(plan.notes)
+    assert "could not be read whole" in notes and PR in notes, notes
+    assert "replan transaction stage: rejected" in notes, notes
+    assert plan.expected_next.startswith("BLOCKED"), plan.expected_next
+    assert gh.calls == [] and eng.provider.calls == []
+    assert eng.state.phase == Phase.REPLAN_REEXECUTE
+    assert json.dumps(eng.state.replan_transaction, sort_keys=True) == before
+
+
+# What the plan may promise at each stage, mirroring the reducer's dispatch:
+# the agent is launched only while no bound replacement exists, the close is
+# reachable from VERIFIED alone, and every later stage reads and then
+# activates, undoes or refuses. Asserted on the notes an operator reads.
+_AGENT_NOTE = "invoke the replan agent"
+_CLOSE_NOTE = "would close the old PR"
+_NO_AGENT_NOTES = ("without invoking an agent", "invokes no agent", "would not invoke an agent")
+_NO_CLOSE_NOTES = ("without closing anything", "never closes it", "touching GitHub")
+_STAGE_PLAN = {
+    ReplanStage.PENDING: (True, True),
+    ReplanStage.PREPARED: (True, True),
+    ReplanStage.VERIFIED: (False, True),
+    ReplanStage.SUPERSEDE_INTENT: (False, False),
+    ReplanStage.SUPERSEDED: (False, False),
+    ReplanStage.COMPENSATING: (False, False),
+    ReplanStage.REJECTED: (False, False),
+}
+
+
+def _assert_plan_matches_the_stage(plan, stage: ReplanStage) -> str:
+    notes = "\n".join(plan.notes)
+    may_launch, may_close = _STAGE_PLAN[stage]
+    assert (_AGENT_NOTE in notes) is may_launch, notes
+    assert (_CLOSE_NOTE in notes) is may_close, notes
+    _assert_plan_metadata_follows(plan, may_launch)
+    assert f"replan transaction stage: {stage.value}" in notes
+    assert PR in notes, notes
+    if not may_launch:
+        assert any(n in notes for n in _NO_AGENT_NOTES), notes
+    if not may_close:
+        # Past the write (or refused): the plan says the step reads GitHub and
+        # may end BLOCKED, never that it closes anything. The replacement is
+        # bound from VERIFIED on, and the plan names it.
+        assert any(n in notes for n in _NO_CLOSE_NOTES), notes
+        assert "BLOCKED" in notes, notes
+    if stage not in (ReplanStage.PENDING, ReplanStage.PREPARED, ReplanStage.REJECTED):
+        assert REPLACEMENT_PR in notes, notes
+    if stage in (ReplanStage.COMPENSATING, ReplanStage.REJECTED):
+        assert plan.expected_next.startswith("BLOCKED"), plan.expected_next
+    else:
+        assert plan.expected_next.startswith("REVIEW"), plan.expected_next
+    return notes
+
+
+def _assert_plan_metadata_follows(plan, may_launch: bool) -> None:
+    """The printed plan carries an agent only where the reducer can launch one.
+
+    `print_plan` shows the profile, template, command, timeout and prompt
+    preview whenever they are set, so a plan whose notes say "without
+    invoking an agent" must leave every one of them empty, in the same shape
+    as the other controller-owned steps (INITIALIZING, MERGE); otherwise the
+    operator reads an agent launch that the step will not perform (PR #92
+    review).
+    """
+    assert plan.phase == "REPLAN_REEXECUTE"
+    if may_launch:
+        assert plan.command and plan.template == "replan_reexecute.md", plan
+        assert plan.prompt_length == len(plan.prompt_full) > 0 and plan.prompt_preview, plan
+        assert plan.profile_name == "replan_reexecute" and plan.timeout_seconds > 0, plan
+        assert plan.routing == "REPLAN_REEXECUTE -> profile replan_reexecute", plan.routing
+        return
+    assert plan.command == [] and plan.template == "" and plan.timeout_seconds == 0, plan
+    assert plan.prompt_length == 0 and plan.prompt_full == "", plan
+    assert plan.prompt_preview == "(no agent prompt)", plan.prompt_preview
+    assert plan.profile_name == "(none — deterministic transition)", plan.profile_name
+    assert plan.provider == plan.model == plan.effort == "(none)", plan
+    assert plan.variables == {}, plan.variables
+    assert "no agent" in plan.routing and plan.routing.startswith("REPLAN_REEXECUTE"), plan.routing
+    assert plan.legal_next == sorted(
+        p.value for p in edges_for(WorkflowMode.REMOTE)[Phase.REPLAN_REEXECUTE]
+    )
+
+
+def test_the_replan_agent_may_be_launched_only_before_a_replacement_is_bound():
+    """The partition is total over the stages, so a new stage must choose a side.
+
+    Binding and VERIFIED are persisted together, so a journal at any later
+    stage is finished by the controller alone; a journal that cannot be read
+    is REJECTED and replays its refusal. `_STAGE_PLAN` pins the same
+    partition on the notes an operator reads.
+    """
+    launches = {stage for stage in ReplanStage if may_invoke_agent(_seed_txn(stage))}
+    assert launches == {ReplanStage.PENDING, ReplanStage.PREPARED}
+    assert launches == {stage for stage, (may_launch, _) in _STAGE_PLAN.items() if may_launch}
+    journal = {**_seed_txn(ReplanStage.PREPARED).to_dict(), "stage": 7}
+    unreadable = ReplanTransaction.from_dict(journal)
+    assert unreadable.journal_defects and not may_invoke_agent(unreadable)
+
+
+@pytest.mark.parametrize("stage", list(_STAGE_PLAN))
+def test_dry_run_notes_follow_the_journal_stage(tmp_state_dir, stage):
+    """The plan describes the stage's own step, not the whole replan lifecycle.
+
+    A journal past the write is finished by a read that activates, undoes or
+    refuses, and the plan says so instead of promising an agent launch and a
+    close the reducer will not perform (PR #92 review). The partition over the
+    stages is total, so a new stage must say what its plan may promise.
+    """
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, stage)
+    plan = eng.step(dry_run=True).plan
+    assert plan is not None
+    notes = _assert_plan_matches_the_stage(plan, stage)
+    if stage is ReplanStage.SUPERSEDE_INTENT:
+        # Both outcomes of the GitHub re-read, since the plan cannot read it.
+        assert "close receipt" in notes and "source OPEN" in notes
+        assert "never closes it from here" in notes
+    if stage is ReplanStage.REJECTED:
+        assert "refused by verification" in notes
+    assert gh.calls == [] and eng.provider.calls == []
+    assert eng.state.phase == Phase.REPLAN_REEXECUTE
+
+
+def test_dry_run_of_an_unreadable_journal_promises_only_a_refusal(tmp_state_dir):
+    """A journal that cannot be read whole plans a refusal that leaves the source's fate open."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.SUPERSEDED)
+    eng.state.replan_transaction["stage"] = "from_a_future_version"
+    plan = eng.step(dry_run=True).plan
+    assert plan is not None
+    notes = "\n".join(plan.notes)
+    assert _AGENT_NOTE not in notes and _CLOSE_NOTE not in notes
+    assert "could not be read whole" in notes and "touching GitHub" in notes
+    assert "cannot be determined from local state" in notes and PR in notes
+    assert plan.expected_next.startswith("BLOCKED")
+    assert gh.calls == [] and eng.provider.calls == []
+
+
+@pytest.mark.parametrize(
+    "stage,needle",
+    [
+        (ReplanStage.VERIFIED, "would enter BLOCKED without executing"),
+        (ReplanStage.SUPERSEDE_INTENT, "has already begun closing the source PR"),
+        (ReplanStage.SUPERSEDED, "has already begun closing the source PR"),
+        (ReplanStage.COMPENSATING, "has already begun closing the source PR"),
+        (ReplanStage.REJECTED, "would replay its refusal"),
+    ],
+)
+def test_dry_run_describes_what_the_budget_does_to_a_replan_step(tmp_state_dir, stage, needle):
+    """#71: the plan note says whether the budget blocks or the transaction finishes.
+
+    The budget note says only that the step runs and how it is charged; what
+    the step does is the stage note, so the plan never both says "without
+    invoking an agent and without closing anything" and promises a launch or
+    a close (PR #92 review).
+    """
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, stage)
+    steps = _at_the_budget(eng)
+    plan = eng.step(dry_run=True).plan
+    assert plan is not None
+    notes = _assert_plan_matches_the_stage(plan, stage)
+    assert needle in notes and f"max_total_steps={steps}" in notes
+    if stage is not ReplanStage.VERIFIED:
+        assert "would enter BLOCKED without executing" not in notes
+        assert "instead of blocking with the plain budget text" in notes or (
+            "the budget ends the run at the next step" in notes
+        )
+    assert gh.calls == [] and eng.provider.calls == []
+    assert eng.state.phase == Phase.REPLAN_REEXECUTE and eng.state.step_count == steps
 
 
 def _replan_agent_that_fails(gh, stdout):

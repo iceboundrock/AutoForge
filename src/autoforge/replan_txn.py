@@ -476,6 +476,26 @@ _PRESENT_AT_STAGE: dict[ReplanStage, tuple[str, ...]] = {
 }
 
 
+#: Stages at which the controller has committed to closing the source PR:
+#: the intent is durable, and the close may already have landed. From here
+#: the reducer only reads, confirms, and then activates the replacement or
+#: undoes the close; it invokes no agent and never closes from a resume.
+CLOSE_BEGUN_STAGES: frozenset[ReplanStage] = frozenset(
+    {ReplanStage.SUPERSEDE_INTENT, ReplanStage.COMPENSATING, ReplanStage.SUPERSEDED}
+)
+#: Stages at which the controller has performed no write the run would have to
+#: account for: refusing to go on costs nothing here, so this is where a loop
+#: bound may stop the phase before the reducer runs.
+_PRE_WRITE_STAGES: frozenset[ReplanStage] = frozenset(
+    {ReplanStage.PENDING, ReplanStage.PREPARED, ReplanStage.VERIFIED}
+)
+#: Stages from which the reducer may still launch the replan agent: no PR
+#: bound to the transaction exists yet. Binding and ``VERIFIED`` are saved
+#: together, so a persisted journal at any later stage is finished by the
+#: controller alone -- read, verify, close, activate, reopen or refuse.
+_AGENT_STAGES: frozenset[ReplanStage] = frozenset({ReplanStage.PENDING, ReplanStage.PREPARED})
+
+
 def _stages_reached(stage: ReplanStage) -> tuple[ReplanStage, ...]:
     if stage is ReplanStage.REJECTED:
         return ()
@@ -690,6 +710,40 @@ class ReplanTransaction:
                 tests_passed=True,
             )
         )
+
+
+def budget_may_stop(txn: ReplanTransaction) -> bool:
+    """Whether the run's step budget may stop the replan step before the reducer runs.
+
+    True only while the journal proves the controller has written nothing
+    (``PENDING``, ``PREPARED``, ``VERIFIED``): blocking there leaves the
+    source open with its findings and needs nothing recorded. From
+    ``SUPERSEDE_INTENT`` on, the persisted intent is a decision the
+    controller finishes -- what remains is read, confirm and activate, or
+    read, confirm and reopen, with no agent and no close from a resume -- so
+    the step counts and the budget ends the run at the next phase boundary
+    instead of inside the transaction, where a plain budget block would
+    strand a source the controller closed with nothing recorded about it
+    (#71). A journal the reducer will refuse anyway -- ``REJECTED``, or one
+    that could not be read whole and therefore cannot prove it is before the
+    write -- is handed to the reducer too: its refusal names the transaction
+    and the source PR's fate, which the budget text cannot.
+    """
+    return txn.stage in _PRE_WRITE_STAGES
+
+
+def may_invoke_agent(txn: ReplanTransaction) -> bool:
+    """Whether a REPLAN_REEXECUTE step from this journal may launch the replan agent.
+
+    True only at ``PENDING`` and ``PREPARED``, where no replacement PR is
+    bound to the transaction and the reducer falls through to the
+    invocation when it finds none. From ``VERIFIED`` on the reducer resolves
+    the step itself, and a ``REJECTED`` journal -- recorded, or coerced there
+    because it could not be read whole -- replays its refusal. The dry-run
+    plan follows this partition so it shows an agent command, template and
+    prompt only for a step that can launch one.
+    """
+    return txn.stage in _AGENT_STAGES
 
 
 # ---------------------------------------------------------------------------

@@ -184,9 +184,13 @@ Design points:
   count-only behaviour instead of being read as "nothing recurred".
   `workflow.max_total_steps` (default 300) is a cumulative budget for the whole
   run measured on the persisted `step_count`, so `resume` continues it rather
-  than resetting it (`--max-steps` bounds one invocation only). Failed agent
-  invocations consume neither a review round nor the history. Every bound
-  ends in `BLOCKED` with the reason; findings and the PR stay for a human.
+  than resetting it (`--max-steps` bounds one invocation only). A replan
+  transaction that has already begun closing the old PR is finished before
+  the budget stops the run (no agent runs, nothing else is closed), so the
+  run never ends with a PR the controller closed and no record of it. Failed
+  agent invocations consume neither a review round nor the history. Every
+  bound ends in `BLOCKED` with the reason; findings and the PR stay for a
+  human.
 - **Replanning is controller policy, not reviewer advice.** After a verified
   review with findings, `review.replan` defaults to a hard trigger at round 20,
   or from round 12 (`soft_threshold`) either three trailing review rounds each
