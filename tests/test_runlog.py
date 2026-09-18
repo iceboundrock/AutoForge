@@ -615,6 +615,67 @@ def test_a_journal_replaced_or_removed_while_the_agent_ran_refuses_the_append(tm
         assert foreign.read_text(encoding="utf-8") == "operator data\n"
 
 
+@pytest.mark.parametrize(
+    ("failing_fsync_ordinal", "refusal"),
+    [
+        # The run directory probe publishes its entry and fsyncs the directory.
+        (1, r"cannot publish into logs/run-1/: cannot durably publish .*\.af-probe-.*injected"),
+        # The journal open creates or finds events.jsonl and fsyncs the directory.
+        (2, r"cannot open .*run-1/events\.jsonl.*injected"),
+    ],
+)
+def test_a_run_directory_that_cannot_be_fsynced_is_refused_as_a_state_error(
+    tmp_path, monkeypatch, failing_fsync_ordinal, refusal
+):
+    """PR #91 review, sixth round: every step of the open fails typed.
+
+    Opening the logger fsyncs the run directory twice, after the probe
+    entry is published and after the journal is opened, so that what it
+    proved is durable before the launch. A fatal failure at either used to
+    escape as a raw ``OSError`` -- outside the controller taxonomy, so the
+    CLI printed a traceback instead of the redacted, typed refusal -- and
+    the journal's left its descriptor open with nothing to close it. Each
+    is refused as a ``StateError`` naming what could not be made durable
+    and the cause; nothing is left behind in the run directory (the probe
+    published before its fsync failed is removed, the descriptor is
+    released, ``tests/test_safefs.py``); and once the directory can be
+    fsynced the logger opens and the sequence continues.
+    """
+    import stat
+
+    import autoforge.safefs as safefs
+
+    log = RunLogger(tmp_path / "logs", "run-1")
+    log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="REVIEW"))
+    log.close()
+    real_fsync = os.fsync
+    directory_fsyncs = 0
+
+    def failing_directory_fsync(fd):
+        nonlocal directory_fsyncs
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            directory_fsyncs += 1
+            if directory_fsyncs == failing_fsync_ordinal:
+                raise OSError(5, "injected fsync failure")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(safefs.os, "fsync", failing_directory_fsync)
+    with pytest.raises(StateError, match=refusal) as exc:
+        RunLogger(tmp_path / "logs", "run-1")
+    assert not isinstance(exc.value, OSError)
+    assert directory_fsyncs == failing_fsync_ordinal, "the failure was not the last step taken"
+    assert sorted(p.name for p in (tmp_path / "logs" / "run-1").iterdir()) == [
+        "001-review-1",
+        "events.jsonl",
+    ], "a probe or a temporary survived the refusal"
+
+    monkeypatch.setattr(safefs.os, "fsync", real_fsync)
+    with RunLogger(tmp_path / "logs", "run-1") as again:
+        step = again.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="FIX"))
+    assert step.name == "002-fix-1"
+    assert (tmp_path / "logs" / "run-1" / "events.jsonl").read_text().count("\n") == 2
+
+
 def test_the_journal_handle_is_released_with_the_logger(tmp_path):
     """One logger per invocation (the engine builds it in ``_invoke_phase``
     and drops it): the held descriptor must go with the logger, whether it

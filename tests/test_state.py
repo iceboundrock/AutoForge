@@ -753,8 +753,11 @@ def test_save_state_does_not_swallow_fatal_directory_fsync(tmp_path, monkeypatch
         return real_fsync(fd)
 
     monkeypatch.setattr(os, "fsync", failing_fsync)
-    with pytest.raises(OSError, match="I/O error"):
+    # Not swallowed, and not raw either: reported through the controller's
+    # error type, as every other failure of the write is (PR #91 review).
+    with pytest.raises(StateError, match="cannot durably publish .*state.json.*I/O error") as exc:
         save_state(make_state(review_round=4), p)
+    assert isinstance(exc.value.__cause__, OSError)
 
 
 def test_the_engine_holds_its_state_root_and_refuses_a_replacement(tmp_path):

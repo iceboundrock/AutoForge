@@ -51,7 +51,7 @@ import os
 import re
 import secrets
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -337,7 +337,16 @@ class RunLogger:
         run_dir = f"logs/{self.run_id}/"
         probe = f"{self.run_id}/.af-probe-{os.getpid():x}-{secrets.token_hex(8)}"
         try:
-            logs.create_exclusive(probe, b"")
+            try:
+                logs.create_exclusive(probe, b"")
+            except StateError:
+                # The probe is published before its directory entry is
+                # fsynced, so a create that failed at that last step left
+                # the name behind; it is this controller's and empty, and
+                # removing it is best effort behind the refusal itself.
+                with suppress(StateError):
+                    logs.unlink(probe)
+                raise
             logs.unlink(probe)
         except UnreadableEntryError as exc:
             exc.args = (

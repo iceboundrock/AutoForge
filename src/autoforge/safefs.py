@@ -763,7 +763,14 @@ class SafeRoot:
         through it, so a caller that opens the file at one moment (before an
         agent is launched) and appends at another (after it returned) is
         guaranteed that the bytes reach the inode inspected at the first
-        moment or no inode at all. The caller owns the handle and closes it.
+        moment or no inode at all. The caller owns the handle and closes it;
+        until the handle exists, this call does, and a failure anywhere
+        after the open -- the size check, or the directory ``fsync`` that
+        makes a name this open created durable -- closes the descriptor
+        before it raises, so a refused open never leaks it. An ``OSError``
+        there is a :class:`~autoforge.errors.StateError`, as one at the
+        open itself is; the file, if the open created it, is left where it
+        is, since an empty journal is what the next open finds or makes.
         """
         parts = split_relpath(relpath)
         where = self._describe(parts)
@@ -776,12 +783,15 @@ class SafeRoot:
                 st = os.fstat(fd)
                 if limit is not None and st.st_size > limit:
                     raise ReadLimitExceeded(relpath, limit)
+                # The name may have been created by this open; its directory
+                # entry is made durable the way a published temporary's is.
+                _fsync_fd(parent)
+            except OSError as exc:
+                os.close(fd)
+                raise StateError(f"cannot open {where}: {exc}") from exc
             except BaseException:
                 os.close(fd)
                 raise
-            # The name may have been created by this open; its directory
-            # entry is made durable the way a published temporary's is.
-            _fsync_fd(parent)
         finally:
             os.close(parent)
         return AppendHandle(fd, relpath, st, limit)
@@ -983,7 +993,7 @@ class SafeRoot:
             if exc.errno == errno.EISDIR:
                 raise _unsafe(where, "a directory, not a regular file") from exc
             raise StateError(f"cannot write {where}: {exc}") from exc
-        _fsync_fd(parent)
+        self._fsync_published(parent, where)
 
     def _publish_new_at(
         self, parent: int, name: str, data: bytes, *, mode: int, where: str
@@ -997,7 +1007,25 @@ class SafeRoot:
                 raise FileExistsError(errno.EEXIST, f"{where} already exists") from exc
             raise StateError(f"cannot create {where}: {exc}") from exc
         _quiet_unlink(parent, tmp)
-        _fsync_fd(parent)
+        self._fsync_published(parent, where)
+
+    @staticmethod
+    def _fsync_published(parent: int, where: str) -> None:
+        """Make the directory entry just published at ``where`` durable.
+
+        The last step of every write that publishes a name. A filesystem
+        that cannot fsync a directory is tolerated (:func:`_fsync_fd`); a
+        fatal failure is reported through the controller's error type, as
+        every other failure of the write is, rather than as a raw
+        ``OSError`` that the CLI's error boundary does not catch. The name
+        is left in place: its bytes are whole and fsynced, and it is the
+        entry's durability across a crash, not its contents, that could not
+        be proved.
+        """
+        try:
+            _fsync_fd(parent)
+        except OSError as exc:
+            raise StateError(f"cannot durably publish {where}: {exc}") from exc
 
     # -- walking ------------------------------------------------------------
     def walk(self, *, max_entries: int | None = None) -> Iterator[WalkEntry]:

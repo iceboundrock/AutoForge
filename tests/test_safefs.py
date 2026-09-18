@@ -23,6 +23,8 @@ cell, that it is byte-for-byte and inode-for-inode what it was before.
 import errno
 import os
 import stat
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 import pytest
 
@@ -759,6 +761,123 @@ def test_an_unwritable_file_is_refused_at_the_open(tmp_path):
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses file permissions")
+@contextmanager
+def _descriptors_left_open(monkeypatch) -> Iterator[list[int]]:
+    """Yield a list that, once the block has run, holds every descriptor the
+    block opened (or duplicated) and never closed -- whether it returned or
+    raised."""
+    real_open, real_dup, real_close = os.open, os.dup, os.close
+    opened: list[int] = []
+    closed: list[int] = []
+    left: list[int] = []
+
+    def counting_open(*args, **kwargs):
+        fd = real_open(*args, **kwargs)
+        opened.append(fd)
+        return fd
+
+    def counting_dup(fd):
+        fd = real_dup(fd)
+        opened.append(fd)
+        return fd
+
+    def counting_close(fd):
+        closed.append(fd)
+        real_close(fd)
+
+    monkeypatch.setattr(os, "open", counting_open)
+    monkeypatch.setattr(os, "dup", counting_dup)
+    monkeypatch.setattr(os, "close", counting_close)
+    try:
+        yield left
+    finally:
+        monkeypatch.setattr(os, "open", real_open)
+        monkeypatch.setattr(os, "dup", real_dup)
+        monkeypatch.setattr(os, "close", real_close)
+        left[:] = opened
+        for fd in closed:
+            left.remove(fd)
+
+
+def test_open_append_releases_the_descriptor_when_the_directory_fsync_fails(tmp_path, monkeypatch):
+    """PR #91 review, sixth round: a refused open owns nothing afterwards.
+
+    The directory ``fsync`` that makes a created name durable runs after
+    the journal is open and before the handle that would own it exists. A
+    fatal error there (``EIO``: the entry may not be durable, so the open
+    cannot report success) used to leave the journal descriptor open with
+    nothing to close it -- one leaked descriptor per refused open -- and
+    escaped as a raw ``OSError``, past the typed boundary every other
+    failure of this open reports through.
+
+    What must hold: every descriptor the call opened is closed by the time
+    it raises; the error is a ``StateError`` naming the file and the cause,
+    as an ``open`` failure is; the journal, which this open did not create,
+    is exactly what it was; and once the directory can be fsynced again the
+    same open succeeds and appends.
+    """
+    import autoforge.safefs as safefs
+
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    journal = root_dir / "events.jsonl"
+    journal.write_text("old\n", encoding="utf-8")
+    before = journal.stat()
+    real_fsync = os.fsync
+
+    def failing_directory_fsync(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(errno.EIO, "injected fsync failure")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(safefs.os, "fsync", failing_directory_fsync)
+    with SafeRoot.open(root_dir) as root:
+        with (
+            pytest.raises(StateError, match="cannot open .*events.jsonl.*injected fsync") as exc,
+            _descriptors_left_open(monkeypatch) as left,
+        ):
+            root.open_append("events.jsonl", limit=1 << 20)
+        assert left == [], "a refused open leaked a descriptor"
+        assert not isinstance(exc.value, (UnsafePathError, UnreadableEntryError))
+        assert isinstance(exc.value.__cause__, OSError)
+        after = journal.stat()
+        assert (after.st_ino, after.st_size, after.st_mtime_ns) == (
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        )
+        assert [e.name for e in root_dir.iterdir()] == ["events.jsonl"]
+
+        monkeypatch.setattr(safefs.os, "fsync", real_fsync)
+        with _descriptors_left_open(monkeypatch) as left:
+            _append(root, "events.jsonl", "new\n")
+        assert left == []
+    assert journal.read_bytes() == b"old\nnew\n"
+
+
+def test_open_append_treats_a_directory_that_cannot_be_fsynced_as_best_effort(
+    tmp_path, monkeypatch
+):
+    """The same tolerance every published name has: a filesystem that
+    rejects ``fsync`` on a directory (``EINVAL``) weakens durability and
+    does not refuse the open, so the handle comes back and appends."""
+    import autoforge.safefs as safefs
+
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    real_fsync = os.fsync
+
+    def refusing_directory_fsync(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "no directory fsync here")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(safefs.os, "fsync", refusing_directory_fsync)
+    with SafeRoot.open(root_dir) as root:
+        _append(root, "run-1/events.jsonl", "first\n")
+    assert (root_dir / "run-1" / "events.jsonl").read_bytes() == b"first\n"
+
+
 def test_open_append_discovers_a_directory_that_cannot_take_the_file(tmp_path):
     """Creating the journal is part of the open, so a run directory that
     cannot take a new entry is found at the open -- before the launch -- as

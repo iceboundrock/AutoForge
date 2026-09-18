@@ -478,7 +478,22 @@ a file created since, which is why recording `(st_dev, st_ino)` at the
 open and reopening by name was rejected (an `rm` of the journal followed
 by a create readily gets the same number back on ext4). The descriptor is
 `O_CLOEXEC`, so the agent subprocess does not inherit it, and it goes with
-the logger: one logger per invocation, closed or collected with it.
+the logger: one logger per invocation, closed or collected with it. Until
+the handle exists the open owns the descriptor (PR #91 review, sixth
+round): the open ends with the directory `fsync` that makes a journal it
+created durable, and a fatal failure there used to raise past the
+descriptor with no handle to close it, one leaked descriptor per refused
+open, and raise it raw. Every failure after the `open(2)` now closes the
+descriptor before it raises, and a fatal directory `fsync` -- there, and
+at the end of every whole-file write that publishes a name (`write_bytes`,
+`create_exclusive`) -- is a `StateError` naming the entry, as every other
+failure of a controller write is; the CLI's error boundary catches the
+controller's types and nothing else, so a raw `OSError` was a traceback
+in place of the redacted, typed refusal. A filesystem that cannot fsync a
+directory at all is still tolerated as the weaker durability it is. The
+published name is left in place in both cases (its bytes are whole; it is
+the entry's durability across a crash that could not be proved), except
+the run logger's own pre-launch probe, which is removed behind the refusal.
 
 What that inspection guarantees is the *inode*: the bytes land in the inode
 the descriptor already holds, which had exactly one name, under the root,
