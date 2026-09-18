@@ -5232,6 +5232,88 @@ def test_an_unreadable_journal_at_the_budget_is_refused_in_its_own_words(tmp_sta
     assert gh.closed_prs == [] and gh.reopened_prs == []
 
 
+# What the plan may promise at each stage, mirroring the reducer's dispatch:
+# the agent is launched only while no bound replacement exists, the close is
+# reachable from VERIFIED alone, and every later stage reads and then
+# activates, undoes or refuses. Asserted on the notes an operator reads.
+_AGENT_NOTE = "invoke the replan agent"
+_CLOSE_NOTE = "would close the old PR"
+_NO_AGENT_NOTES = ("without invoking an agent", "invokes no agent", "would not invoke an agent")
+_NO_CLOSE_NOTES = ("without closing anything", "never closes it", "touching GitHub")
+_STAGE_PLAN = {
+    ReplanStage.PENDING: (True, True),
+    ReplanStage.PREPARED: (True, True),
+    ReplanStage.VERIFIED: (False, True),
+    ReplanStage.SUPERSEDE_INTENT: (False, False),
+    ReplanStage.SUPERSEDED: (False, False),
+    ReplanStage.COMPENSATING: (False, False),
+    ReplanStage.REJECTED: (False, False),
+}
+
+
+def _assert_plan_matches_the_stage(plan, stage: ReplanStage) -> str:
+    notes = "\n".join(plan.notes)
+    may_launch, may_close = _STAGE_PLAN[stage]
+    assert (_AGENT_NOTE in notes) is may_launch, notes
+    assert (_CLOSE_NOTE in notes) is may_close, notes
+    assert f"replan transaction stage: {stage.value}" in notes
+    assert PR in notes, notes
+    if not may_launch:
+        assert any(n in notes for n in _NO_AGENT_NOTES), notes
+    if not may_close:
+        # Past the write (or refused): the plan says the step reads GitHub and
+        # may end BLOCKED, never that it closes anything. The replacement is
+        # bound from VERIFIED on, and the plan names it.
+        assert any(n in notes for n in _NO_CLOSE_NOTES), notes
+        assert "BLOCKED" in notes, notes
+    if stage not in (ReplanStage.PENDING, ReplanStage.PREPARED, ReplanStage.REJECTED):
+        assert REPLACEMENT_PR in notes, notes
+    if stage in (ReplanStage.COMPENSATING, ReplanStage.REJECTED):
+        assert plan.expected_next.startswith("BLOCKED"), plan.expected_next
+    else:
+        assert plan.expected_next.startswith("REVIEW"), plan.expected_next
+    return notes
+
+
+@pytest.mark.parametrize("stage", list(_STAGE_PLAN))
+def test_dry_run_notes_follow_the_journal_stage(tmp_state_dir, stage):
+    """The plan describes the stage's own step, not the whole replan lifecycle.
+
+    A journal past the write is finished by a read that activates, undoes or
+    refuses, and the plan says so instead of promising an agent launch and a
+    close the reducer will not perform (PR #92 review). The partition over the
+    stages is total, so a new stage must say what its plan may promise.
+    """
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, stage)
+    plan = eng.step(dry_run=True).plan
+    assert plan is not None
+    notes = _assert_plan_matches_the_stage(plan, stage)
+    if stage is ReplanStage.SUPERSEDE_INTENT:
+        # Both outcomes of the GitHub re-read, since the plan cannot read it.
+        assert "close receipt" in notes and "source OPEN" in notes
+        assert "never closes it from here" in notes
+    if stage is ReplanStage.REJECTED:
+        assert "refused by verification" in notes
+    assert gh.calls == [] and eng.provider.calls == []
+    assert eng.state.phase == Phase.REPLAN_REEXECUTE
+
+
+def test_dry_run_of_an_unreadable_journal_promises_only_a_refusal(tmp_state_dir):
+    """A journal that cannot be read whole plans a refusal that leaves the source's fate open."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.SUPERSEDED)
+    eng.state.replan_transaction["stage"] = "from_a_future_version"
+    plan = eng.step(dry_run=True).plan
+    assert plan is not None
+    notes = "\n".join(plan.notes)
+    assert _AGENT_NOTE not in notes and _CLOSE_NOTE not in notes
+    assert "could not be read whole" in notes and "touching GitHub" in notes
+    assert "cannot be determined from local state" in notes and PR in notes
+    assert plan.expected_next.startswith("BLOCKED")
+    assert gh.calls == [] and eng.provider.calls == []
+
+
 @pytest.mark.parametrize(
     "stage,needle",
     [
@@ -5239,21 +5321,29 @@ def test_an_unreadable_journal_at_the_budget_is_refused_in_its_own_words(tmp_sta
         (ReplanStage.SUPERSEDE_INTENT, "has already begun closing the source PR"),
         (ReplanStage.SUPERSEDED, "has already begun closing the source PR"),
         (ReplanStage.COMPENSATING, "has already begun closing the source PR"),
+        (ReplanStage.REJECTED, "would replay its refusal"),
     ],
 )
 def test_dry_run_describes_what_the_budget_does_to_a_replan_step(tmp_state_dir, stage, needle):
-    """#71: the plan note says whether the budget blocks or the transaction finishes."""
+    """#71: the plan note says whether the budget blocks or the transaction finishes.
+
+    The budget note says only that the step runs and how it is charged; what
+    the step does is the stage note, so the plan never both says "without
+    invoking an agent and without closing anything" and promises a launch or
+    a close (PR #92 review).
+    """
     gh = FakeGitHub()
     eng, _ = _seeded_engine(tmp_state_dir, gh, stage)
     steps = _at_the_budget(eng)
     plan = eng.step(dry_run=True).plan
     assert plan is not None
-    notes = "\n".join(plan.notes)
+    notes = _assert_plan_matches_the_stage(plan, stage)
     assert needle in notes and f"max_total_steps={steps}" in notes
     if stage is not ReplanStage.VERIFIED:
         assert "would enter BLOCKED without executing" not in notes
-        assert PR in notes and REPLACEMENT_PR in notes and stage.value in notes
-        assert "the budget ends the run at the next step" in notes
+        assert "instead of blocking with the plain budget text" in notes or (
+            "the budget ends the run at the next step" in notes
+        )
     assert gh.calls == [] and eng.provider.calls == []
     assert eng.state.phase == Phase.REPLAN_REEXECUTE and eng.state.step_count == steps
 
