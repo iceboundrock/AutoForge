@@ -790,6 +790,25 @@ def test_list_open_prs_strict_refuses_a_possibly_truncated_listing():
     assert len(truncating.list_open_prs("o/r")) == STRICT_PR_LIST_LIMIT
 
 
+def test_list_open_prs_decodes_linked_issues_without_overwriting_the_pr_reference():
+    row = {
+        "url": "https://github.com/o/r/pull/1",
+        "number": 1,
+        "state": "OPEN",
+        "headRefOid": "a" * 40,
+        "headRefName": "feature/x",
+        "baseRefName": "main",
+        "body": "hello",
+        "closingIssuesReferences": [{"number": 9}],
+    }
+
+    [pr] = _client(lambda req: _res([row])).list_open_prs("o/r")
+
+    assert pr.url == "https://github.com/o/r/pull/1"
+    assert pr.repository == "o/r"
+    assert pr.linked_issue_numbers == [9]
+
+
 def test_list_all_prs_covers_every_state_and_refuses_truncation():
     """R8-F2: the closed-claimant check needs an exhaustive all-states listing."""
     rows = [
