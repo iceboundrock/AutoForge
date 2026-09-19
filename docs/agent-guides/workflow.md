@@ -368,7 +368,9 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   reason and the detail, redacted).
 - **Re-entry.** The chosen phase goes through `validate_transition(BLOCKED,
   target)` like any other step; the operator edges are declared in
-  `LEGAL_EDGES` (`UNBLOCK_TARGETS`), never coerced. `current_head_sha`,
+  `LEGAL_EDGES` (`UNBLOCK_TARGETS`), never coerced, and checked before the
+  run-log record is written, so an edge the topology refuses leaves neither
+  a state write nor a record claiming an applied unblock. `current_head_sha`,
   `current_base_ref` and `current_branch` are rebound from the live PR; the
   review binding (`reviewed_*`) is never rewritten by this path. The action is
   appended to `unblock_history` (timestamp, reason, cleared block reason,

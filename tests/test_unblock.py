@@ -581,7 +581,8 @@ def test_unblock_refuses_a_run_with_a_replan_journal(tmp_state_dir, fake_github)
 # -- the transition is the topology's, not the command's ------------------------------
 def test_unblock_goes_through_validate_transition(tmp_state_dir, fake_github, monkeypatch):
     """The chosen phase is applied only if `validate_transition(BLOCKED, it)`
-    passes; an edge the topology refuses is never coerced into state."""
+    passes; an edge the topology refuses is never coerced into state, and
+    the audit trail never claims an applied unblock into it either."""
     fake_github.add_pr(head_sha=SHA_A)
     eng = _blocked(tmp_state_dir, fake_github, pr_url=PR, **_reviewed())
     seen = []
@@ -596,6 +597,9 @@ def test_unblock_goes_through_validate_transition(tmp_state_dir, fake_github, mo
         eng.unblock(REASON)
     assert seen == [(Phase.BLOCKED, Phase.READY_FOR_MERGE)]
     assert eng.paths.state_file.read_text() == raw
+    # The check runs before the run-log write: no record claims `applied`.
+    assert [r for r in _unblock_records(eng) if r["metadata"]["applied"]] == []
+    assert not eng.paths.logs_dir.exists()
 
 
 def test_every_unblock_target_is_a_legal_operator_edge():

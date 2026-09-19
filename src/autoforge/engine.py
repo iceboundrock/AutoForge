@@ -2551,6 +2551,13 @@ class ControllerEngine:
                 dry_run=True,
             )
         cleared = state.block_reason
+        target = decision.target
+        if target is not None:
+            # A pure check on the decided target, made before anything is
+            # written: an edge the topology refuses leaves neither a state
+            # write nor a run-log record claiming an applied unblock into a
+            # phase the run never entered.
+            validate_transition(Phase.BLOCKED, target)
         # Logged before the state write: a refused log write leaves the run
         # BLOCKED exactly as it was, and an applied unblock is never on disk
         # without its record. The operator's text and the block reason reach
@@ -2563,9 +2570,7 @@ class ControllerEngine:
                 phase=state.phase.value,
                 message=f"stays BLOCKED: {decision.detail}",
             )
-        target = decision.target
         assert target is not None
-        validate_transition(Phase.BLOCKED, target)
         pr = decision.pr
         if pr is not None and pr.head_sha:
             state.current_head_sha = pr.head_sha
