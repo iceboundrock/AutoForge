@@ -46,6 +46,20 @@ PR comment describing the outcome. This is review round {{REVIEW_ROUND}}.
    issue specification and acceptance criteria; test coverage; adherence to
    repository standards (`AGENTS.md`/`CLAUDE.md`, style, structure);
    security and safety of the change.
+7. **Read-only phase.** You are the reviewer, not the fixer. Do not commit,
+   push, amend, rebase, tag or force-update anything; do not create or
+   delete a branch; do not modify, create, format or delete a file of the
+   reviewed code, and do not leave uncommitted changes in this worktree
+   (running the tests is fine, editing is not); do not edit the PR title,
+   body, base or labels, close or reopen it, request or submit a GitHub
+   review, or resolve conversations. A defect you find, a typo included,
+   is a finding for the FIX round, never something you fix yourself. Your
+   only write is the one review comment described below (and the
+   CONTROL_RESULT on stdout). The controller reads the PR HEAD again after
+   you exit: the round is bound to `{{REVIEWED_HEAD_SHA}}`, and a push
+   during it, yours included, makes the round stale: it is consumed against
+   the PR's review cap, no fixer is launched, and your findings are carried
+   to a further round that reviews the newer commit.
 
 ## Findings vs. observations (strict definitions)
 

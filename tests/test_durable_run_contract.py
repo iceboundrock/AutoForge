@@ -27,6 +27,7 @@ from pathlib import Path
 import pytest
 
 import autoforge
+from autoforge import __prompt_version__
 from autoforge.config import default_config
 from autoforge.errors import ConfigurationError, StateError, VerificationError
 from autoforge.run_contract import (
@@ -281,7 +282,11 @@ CONFIG_ROWS = [
         _cfg_validation,
         'local.validation_commands: run: [] current: [["true"]]',
     ),
-    ("prompt_version", _cfg_prompt_version, 'prompt_version: run: "v1" current: "v0"'),
+    (
+        "prompt_version",
+        _cfg_prompt_version,
+        f'prompt_version: run: "{__prompt_version__}" current: "v0"',
+    ),
     (
         "workflow.max_total_steps",
         _cfg_total_steps,

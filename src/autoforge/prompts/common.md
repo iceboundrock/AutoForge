@@ -72,9 +72,12 @@ with exactly one machine-readable block:
 
 - Emit exactly the fields the phase section requires; keep types exact
   (booleans are `true`/`false`, SHAs are the full 40-character strings that
-  `git rev-parse HEAD` / `gh pr view --json headRefOid` returned verbatim).
-- Emit the block only once, as the very last thing on stdout, and never
-  inside a Markdown code fence.
+  `git rev-parse HEAD` / `gh pr view --json headRefOid` returned verbatim;
+  the controller rejects an abbreviated SHA).
+- Emit the block only once, as the very last thing on stdout. The
+  `<<<CONTROL_RESULT>>>` / `<<<END_CONTROL_RESULT>>>` markers are what the
+  controller reads; a Markdown code fence around them, as in the schema
+  examples below, is neither required nor harmful.
 - Keep the block small: the controller accepts a block of at most
   {{MAX_CONTROL_RESULT_CHARS}} characters and rejects a larger one whole
   (it never clips it). Put logs, diffs and explanations before the block,

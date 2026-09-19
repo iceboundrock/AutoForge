@@ -47,7 +47,13 @@ BEGIN = "<<<CONTROL_RESULT>>>"
 END = "<<<END_CONTROL_RESULT>>>"
 
 _BLOCK_RE = re.compile(r"<<<CONTROL_RESULT>>>(.*?)<<<END_CONTROL_RESULT>>>", re.DOTALL)
-_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
+# A SHA field is the full 40-character object id, as the prompts require and
+# as GitHub reports it: every SHA the controller accepts is compared by
+# equality with one read from GitHub, so an abbreviated SHA could only pass
+# the schema and then fail that comparison with a misleading "mismatch"
+# instead of the schema error it is (#19). The same shape ``autoforge.claims``
+# reads back from a marker.
+_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 # The one finding-id rule: the parser applies it to CONTROL_RESULT ids and
 # ``autoforge.claims`` to the ids read back from follow-up markers, so a
 # marker can never carry an id the parser would have refused. ``\Z``, not
@@ -251,13 +257,14 @@ def _opt_str(payload: dict, key: str, phase: str) -> str:
 
 
 def _checked_sha(v: str, key: str, phase: str) -> str:
-    """``v`` as a lower-cased git SHA, or a rejection that quotes it only
-    when it is no longer than a SHA: an oversized value is reported by its
-    length, never echoed into the correction prompt or the run log."""
+    """``v`` as a lower-cased full git SHA, or a rejection that quotes it
+    only when it is no longer than a SHA: an oversized value is reported by
+    its length, never echoed into the correction prompt or the run log."""
     if not _SHA_RE.match(v):
         shown = repr(v) if len(v) <= 40 else f"{len(v)} characters"
         raise ControlResultValidationError(
-            f"{phase}: field {key!r} must be a git SHA (7-40 hex chars), got {shown}"
+            f"{phase}: field {key!r} must be a full git SHA (exactly 40 hex chars, as "
+            f"`git rev-parse HEAD` and `gh pr view --json headRefOid` report it), got {shown}"
         )
     return v.lower()
 
