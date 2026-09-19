@@ -335,7 +335,10 @@ def _finish(engine: ControllerEngine, outcomes: list[StepOutcome], allow_merge: 
         print_ready_banner(state, gate_open=engine.merge_gate_open(allow_merge))
         return 0
     if state.phase in (Phase.BLOCKED, Phase.FAILED):
-        print(f"\nrun {state.run_id} is {state.phase.value}: {redact(state.block_reason) or '-'}")
+        # The whole line is state-derived (`run_id` is a validated path
+        # component, not a checked-for-secrets value), so the line crosses
+        # the redaction boundary assembled, not field by field.
+        print(redact(f"\nrun {state.run_id} is {state.phase.value}: {state.block_reason or '-'}"))
         return 1
     return 0
 
@@ -375,9 +378,11 @@ def _existing_run_guard(
         return None, False
     if existing.phase not in TERMINAL_PHASES and not force:
         print(
-            f"autoforge: error: existing run {existing.run_id} "
-            f"in phase {existing.phase.value} — use 'resume' to continue "
-            f"or '{command} --force' to discard it",
+            redact(
+                f"autoforge: error: existing run {existing.run_id} "
+                f"in phase {existing.phase.value} — use 'resume' to continue "
+                f"or '{command} --force' to discard it"
+            ),
             file=sys.stderr,
         )
         return 2, False
@@ -546,12 +551,14 @@ def _resume_holding_state(
         return 0
     if state.phase in TERMINAL_PHASES:
         if state.phase == Phase.DONE:
-            print(f"workflow already DONE (run {state.run_id}) — nothing to do")
+            print(redact(f"workflow already DONE (run {state.run_id}) — nothing to do"))
             return 0
         print(
-            f"run {state.run_id} is in terminal phase {state.phase.value}: "
-            f"{redact(state.block_reason) or '-'} — inspect {engine.paths.logs_dir}/ "
-            "and start a new run"
+            redact(
+                f"run {state.run_id} is in terminal phase {state.phase.value}: "
+                f"{state.block_reason or '-'} — inspect {engine.paths.logs_dir}/ "
+                "and start a new run"
+            )
         )
         return 1
     return None
@@ -804,11 +811,13 @@ def print_plan(plan: StepPlan, full_prompt: bool = False) -> None:
 
 
 def print_step_outcome(o: StepOutcome) -> None:
-    print(f"[{o.run_id}] {o.previous_phase} -> {o.next_phase}: {redact(o.message)}")
+    # Every field here came out of state or an agent result, `run_id`
+    # included, so each line is redacted whole rather than per field.
+    print(redact(f"[{o.run_id}] {o.previous_phase} -> {o.next_phase}: {o.message}"))
     if o.plan is not None and o.plan.command:
         print(f"  profile={o.plan.profile_name} model={o.plan.model}")
     if o.result is not None:
-        print(f"  result={redact(json.dumps(o.result, sort_keys=True))}")
+        print(redact(f"  result={json.dumps(o.result, sort_keys=True)}"))
 
 
 if __name__ == "__main__":

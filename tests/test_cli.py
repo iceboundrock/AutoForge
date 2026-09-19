@@ -349,6 +349,110 @@ def test_ready_banner_redacts_state_derived_fields(tmp_path, capsys, monkeypatch
     assert FAKE_SECRET not in out and "?token=***REDACTED***" in out
 
 
+def test_state_derived_run_id_is_redacted_on_every_terminal_line(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """#6 (PR #97 review): `run_id` names the log directory, so its validation
+    checks path safety, not secret shapes -- a credential-shaped value is a
+    valid run id. Every line that prints it from state (the step outcome, the
+    existing-run refusal, the terminal-phase line of `run` / `step` /
+    `resume`) is redacted whole, not field by field."""
+    monkeypatch.chdir(tmp_path)
+    _drive_to_ready(fakes)
+    sd = str(tmp_path / ".autoforge")
+    run_argv = ["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"]
+    assert cli.main(run_argv) == 0
+    capsys.readouterr()
+    state_file = tmp_path / ".autoforge" / "state.json"
+    data = json.loads(state_file.read_text())
+    assert data["phase"] not in ("BLOCKED", "FAILED", "DONE")
+    data["run_id"] = FAKE_SECRET  # a valid single path component
+    state_file.write_text(json.dumps(data))
+
+    # `run` over a live run refuses on stderr, naming the run.
+    assert cli.main(run_argv) == 2
+    captured = capsys.readouterr()
+    assert FAKE_SECRET not in captured.out + captured.err
+    assert "existing run ***REDACTED*** in phase" in captured.err
+
+    # `step` prints the outcome line under the run id.
+    assert cli.main(["--state-dir", sd, "step"]) == 0
+    captured = capsys.readouterr()
+    assert FAKE_SECRET not in captured.out + captured.err
+    assert captured.out.startswith("[***REDACTED***] ") and " -> " in captured.out
+
+    data = json.loads(state_file.read_text())
+    data["phase"] = "BLOCKED"
+    data["block_reason"] = "stopped"
+    state_file.write_text(json.dumps(data))
+    assert cli.main(["--state-dir", sd, "resume"]) == 1
+    captured = capsys.readouterr()
+    assert FAKE_SECRET not in captured.out + captured.err
+    assert "run ***REDACTED*** is in terminal phase BLOCKED: stopped" in captured.out
+
+    data["phase"] = "DONE"
+    state_file.write_text(json.dumps(data))
+    assert cli.main(["--state-dir", sd, "resume"]) == 0
+    captured = capsys.readouterr()
+    assert FAKE_SECRET not in captured.out + captured.err
+    assert "workflow already DONE (run ***REDACTED***)" in captured.out
+
+
+def test_status_json_keeps_journal_entries_whose_redacted_keys_collide(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """#67 (PR #97 review): `status --json` redacts the whole document, and a
+    loadable journal's `escalation` is a free-form mapping, so two keys that
+    redact to the same text must both survive -- the raw journal is kept
+    beside its verdict as forensic evidence, and an entry silently dropped
+    from the rendering would contradict that while `state.json` still holds
+    it. The human summary renders the same mapping as text and keeps both."""
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    assert (
+        cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"])
+        == 0
+    )
+    capsys.readouterr()
+    second_secret = "ghp_AnotherFakeSecretForStatusTest9876543210"
+    state_file = tmp_path / ".autoforge" / "state.json"
+    data = json.loads(state_file.read_text())
+    data["phase"] = "REPLAN_REEXECUTE"
+    data["current_pr_url"] = PR
+    data["replan_transaction"] = {
+        "stage": "pending",
+        "issue_url": ISSUE,
+        "decision_pr_url": PR,
+        "decision_head_sha": SHA_A,
+        "decision_branch": BRANCH,
+        "decision_base_ref": "main",
+        "escalation": {
+            "trigger": "hard_review_round_threshold",
+            f"GITHUB_TOKEN={FAKE_SECRET}": "first",
+            f"GITHUB_TOKEN={second_secret}": "second",
+        },
+    }
+    raw = json.dumps(data)
+    state_file.write_text(raw)
+
+    assert cli.main(["--state-dir", sd, "status", "--json"]) == 0
+    printed_text = capsys.readouterr().out
+    assert FAKE_SECRET not in printed_text and second_secret not in printed_text
+    printed = json.loads(printed_text)
+    assert printed["replan_journal"] == {"readable": True, "stage": "pending", "defects": []}
+    assert printed["replan_transaction"]["escalation"] == {
+        "trigger": "hard_review_round_threshold",
+        "GITHUB_TOKEN=***REDACTED***": "first",
+        "GITHUB_TOKEN=***REDACTED***#2": "second",
+    }
+
+    assert cli.main(["--state-dir", sd, "status"]) == 0
+    out = capsys.readouterr().out
+    assert FAKE_SECRET not in out and second_secret not in out
+    assert '"first"' in out and '"second"' in out
+    assert state_file.read_text() == raw
+
+
 def test_status_and_resume_refuse_an_in_flight_protocol_1_replan(
     tmp_path, capsys, monkeypatch, fakes
 ):

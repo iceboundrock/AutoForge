@@ -88,13 +88,31 @@ def redact_obj(value: object) -> object:
     is as capable of carrying a token as a value. Non-string scalars are
     returned unchanged; anything exotic is stringified through `redact`, which
     never raises.
+
+    A mapping never loses an entry to redaction. Two distinct keys can
+    redact to the same text (``GITHUB_TOKEN=a`` and ``GITHUB_TOKEN=b`` both
+    become ``GITHUB_TOKEN=***REDACTED***``), and a hand-edited journal or a
+    free-form ``escalation`` mapping can carry such keys; letting the later
+    entry overwrite the earlier one would drop a value from the diagnostic
+    output while the file on disk still holds it. A colliding key is instead
+    suffixed ``#2``, ``#3``, ... in insertion order, so every value is kept,
+    every key stays redacted, and the collision is visible in the output.
     """
     if isinstance(value, str):
         return redact(value)
     if value is None or isinstance(value, (bool, int, float)):
         return value
     if isinstance(value, dict):
-        return {redact(str(k)): redact_obj(v) for k, v in value.items()}
+        result: dict = {}
+        for k, v in value.items():
+            key = redact(str(k))
+            if key in result:
+                n = 2
+                while f"{key}#{n}" in result:
+                    n += 1
+                key = f"{key}#{n}"
+            result[key] = redact_obj(v)
+        return result
     if isinstance(value, (list, tuple)):
         return [redact_obj(v) for v in value]
     return redact(str(value))

@@ -2,7 +2,7 @@
 
 import pytest
 
-from autoforge.redaction import _PATTERNS, MAX_GROWTH_FACTOR, redact
+from autoforge.redaction import _PATTERNS, MAX_GROWTH_FACTOR, redact, redact_obj
 
 
 def test_github_token_assignment():
@@ -35,6 +35,36 @@ def test_normal_text_untouched():
 def test_none_and_non_str_safe():
     assert redact(None) == ""
     assert isinstance(redact(123), str)
+
+
+def test_redact_obj_keeps_every_entry_when_redacted_keys_collide():
+    """Distinct keys that redact to the same text must not overwrite each
+    other: the value under the dropped key would vanish from the redacted
+    output while the source still holds it. Later collisions are suffixed in
+    insertion order, and a key that already reads like the marker takes part
+    in the same numbering rather than swallowing an earlier entry."""
+    out = redact_obj(
+        {
+            "GITHUB_TOKEN=firstsecret": 1,
+            "GITHUB_TOKEN=***REDACTED***": 2,
+            "GITHUB_TOKEN=secondsecret": 3,
+            "plain": {"ghp_aaaaaaaaaaaa": "x", "ghp_bbbbbbbbbbbb": "y"},
+        }
+    )
+    assert out == {
+        "GITHUB_TOKEN=***REDACTED***": 1,
+        "GITHUB_TOKEN=***REDACTED***#2": 2,
+        "GITHUB_TOKEN=***REDACTED***#3": 3,
+        "plain": {"***REDACTED***": "x", "***REDACTED***#2": "y"},
+    }
+    for secret in ("firstsecret", "secondsecret", "ghp_aaaaaaaaaaaa", "ghp_bbbbbbbbbbbb"):
+        assert secret not in repr(out)
+
+
+def test_redact_obj_leaves_distinct_keys_unsuffixed():
+    """The suffix appears only on a collision; ordinary mappings round-trip."""
+    value = {"a": 1, "b": [1, {"c": None}], "d": True}
+    assert redact_obj(value) == value
 
 
 # The shortest text each pattern recognises, with the separator that lets the
