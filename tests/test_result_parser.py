@@ -896,15 +896,28 @@ def test_update_epic_roadmap_section_is_optional_bounded_text():
     assert "xxxx" not in str(exc.value)  # size reported, text never echoed
     with pytest.raises(ControlResultValidationError, match="control character"):
         res(roadmap_section="a\x00b")
+    # The refusal matches the scanner's opening (``autoforge.claims``): any
+    # whitespace, none included, between ``<!--`` and ``ai-`` (R2-F1), so a
+    # section the controller writes verbatim can never plant a claim.
     for marker in (
         "<!-- ai-controller-roadmap:start -->",
         "<!-- ai-controller-roadmap:end -->",
         '<!-- ai-follow-up: {"pr": "x"} -->',
+        '<!--ai-follow-up: {"pr": "x", "finding_id": "R1-F1"} -->',
+        '<!--  ai-follow-up: {"pr": "x"} -->',
+        '<!--\nai-follow-up: {"pr": "x"} -->',
+        "<!--\t \n ai-epic-progress: {} -->",
+        "<!--ai-controller-roadmap:start -->",
     ):
         with pytest.raises(ControlResultValidationError, match="must not contain a controller"):
             res(roadmap_section=f"- a\n{marker}\n- b")
-    # An ordinary HTML comment is content, not a marker.
+    # An ordinary HTML comment is content, not a marker, whatever its spacing.
     assert res(roadmap_section="<!-- note -->\n- a").roadmap_section == "<!-- note -->\n- a"
+    assert res(roadmap_section="<!--note-->\n- a").roadmap_section == "<!--note-->\n- a"
+    assert res(roadmap_section="<!--\nnote\n-->\n- a").roadmap_section == "<!--\nnote\n-->\n- a"
+    assert res(roadmap_section="- ai-follow-up is a phrase").roadmap_section == (
+        "- ai-follow-up is a phrase"
+    )
 
 
 @pytest.mark.parametrize(

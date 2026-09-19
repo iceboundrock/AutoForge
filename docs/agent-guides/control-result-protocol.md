@@ -201,7 +201,11 @@ writes it verbatim into the EPIC body, so a truncated roadmap would be
 published), may contain newlines and tabs but no other control character,
 and must not contain any `<!-- ai-` controller marker (the roadmap markers
 are written by the controller around the section; any other marker would
-plant a durable claim in an open issue the controller scans). Whether a
+plant a durable claim in an open issue the controller scans). The refusal
+is the scanner's own opening, `CONTROLLER_MARKER_OPEN_RE` (`<!--`, any
+whitespace or none, `ai-`), on which every `autoforge.claims` marker
+pattern is built, so `<!--ai-` and `<!--\nai-` are refused exactly because
+the scanner would read them. Whether a
 section is *required* is the engine's decision from persisted state
 (`workflow.epic_update_every`, or the EPIC being reported complete), made
 after the result parses ([github-safety.md](github-safety.md), "EPIC

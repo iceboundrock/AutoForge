@@ -125,10 +125,18 @@ MAX_CONTROL_RESULT_CHARS = 1024 * 1024
 # published. GitHub bounds an issue body at 65536 characters; the section
 # leaves the operator's own text room.
 MAX_ROADMAP_SECTION_CHARS = 32768
+# The opening every controller marker shares: ``<!--``, any whitespace (none
+# included), ``ai-``. ``autoforge.claims`` builds each marker kind's scanner
+# pattern on this expression, and the roadmap-section refusal below matches
+# it, so what the section may not carry is exactly what the scanner would
+# later read. The whitespace run is possessive as in the scanner (the
+# expression runs over agent-supplied text; see ``MarkerKind.pattern``).
+CONTROLLER_MARKER_OPEN_RE = re.compile(r"<!--\s*+ai-")
 # A roadmap section may not carry a controller marker: the roadmap markers
 # would split the body into more than one managed section, and any other
 # ``<!-- ai-`` marker would plant a durable claim in an open issue that the
-# controller later scans and trusts (``autoforge.claims``).
+# controller later scans and trusts (``autoforge.claims``). The refusal uses
+# the scanner's own opening, so ``<!--ai-`` and ``<!--\nai-`` are refused too.
 _CONTROLLER_MARKER_PREFIX = "<!-- ai-"
 
 
@@ -752,7 +760,7 @@ class UpdateEpicResult:
                 section, "UPDATE_EPIC", "result", "roadmap_section", MAX_ROADMAP_SECTION_CHARS
             )
             section = _multi_line(section, "UPDATE_EPIC", "result", "roadmap_section")
-            if _CONTROLLER_MARKER_PREFIX in section:
+            if CONTROLLER_MARKER_OPEN_RE.search(section):
                 raise ControlResultValidationError(
                     "UPDATE_EPIC: field 'roadmap_section' must not contain a controller "
                     f"marker ({_CONTROLLER_MARKER_PREFIX}...): the controller writes "

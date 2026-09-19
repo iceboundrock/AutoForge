@@ -391,9 +391,10 @@ controller is the only party that writes the body (`autoforge.roadmap`,
   `gh issue edit`; the agent returns the section's new content as
   `roadmap_section` in its `CONTROL_RESULT` (bounded by
   `MAX_ROADMAP_SECTION_CHARS`, refused when it contains any `<!-- ai-`
-  marker, since the roadmap markers would split the body into more than one
-  section and any other marker would plant a durable claim in an open issue
-  the controller scans). A required section that is missing is rejected
+  marker in the spelling the claims scanner reads, whitespace after `<!--`
+  or none, since the roadmap markers would split the body into more than
+  one section and any other marker would plant a durable claim in an open
+  issue the controller scans). A required section that is missing is rejected
   (`VerificationError`, no reset, `resume` asks again).
 - **Only the section changes.** The controller re-reads the body, refuses
   to write when the bytes outside the markers differ from the body the entry

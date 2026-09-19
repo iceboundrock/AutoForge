@@ -23,6 +23,7 @@ from autoforge.claims import (
     Claimants,
     FollowUpClaim,
     ImplementationClaim,
+    MarkerKind,
     ProgressClaim,
     ReviewClaim,
     collect,
@@ -33,7 +34,11 @@ from autoforge.claims import (
     scan,
 )
 from autoforge.errors import ClaimConflictError, ConfigurationError
-from autoforge.result_parser import MAX_FINDING_ID_CHARS, MAX_URL_CHARS
+from autoforge.result_parser import (
+    CONTROLLER_MARKER_OPEN_RE,
+    MAX_FINDING_ID_CHARS,
+    MAX_URL_CHARS,
+)
 from autoforge.validation import parse_issue_url, parse_pr_url
 
 ISSUE = "https://github.com/owner/repo/issues/2"
@@ -136,6 +141,30 @@ def test_whitespace_around_the_name_and_payload_is_not_part_of_the_marker(text):
     body = text.format(json.dumps(_valid(IMPLEMENTATION)))
     result = scan(IMPLEMENTATION, body)
     assert result.defects == () and result.claims[0].key == parse_issue_url(ISSUE).identity
+
+
+@pytest.mark.parametrize("kind", [IMPLEMENTATION, REVIEW, PROGRESS, FOLLOW_UP])
+@pytest.mark.parametrize("gap", ["", " ", "  ", "\n", "\t \n "], ids=repr)
+def test_every_marker_the_scanner_reads_opens_as_the_shared_marker_opening(kind, gap):
+    """The result parser refuses ``CONTROLLER_MARKER_OPEN_RE`` in agent text it
+    lets the controller write into an issue body verbatim (the EPIC roadmap
+    section, #13). Every kind's scanner pattern is built on that opening, so
+    a marker the scanner would read is always one the parser refuses,
+    whatever whitespace the author put after ``<!--`` (R2-F1)."""
+    text = f"<!--{gap}{kind.name}: {json.dumps(_valid(kind))} -->"
+    result = scan(kind, f"prose {text} prose")
+    assert result.defects == () and len(result.claims) == 1
+    assert CONTROLLER_MARKER_OPEN_RE.search(text)
+    # ...and the opening is exactly the kind's own: nothing else is scanned.
+    assert kind.pattern.pattern.startswith(CONTROLLER_MARKER_OPEN_RE.pattern)
+    assert scan(kind, f"<!--{gap}x-{kind.name}: {{}} -->") == scan(kind, "")
+
+
+def test_a_marker_kind_outside_the_shared_opening_is_refused():
+    """A kind whose name does not start with ``ai-`` would be scanned for but
+    never refused by the result parser; it is a configuration error."""
+    with pytest.raises(ConfigurationError, match="must start with 'ai-'"):
+        MarkerKind("controller-note", lambda p: p, False)
 
 
 def test_a_marker_of_another_kind_is_neither_a_claim_nor_a_defect():
