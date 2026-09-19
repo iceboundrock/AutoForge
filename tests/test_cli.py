@@ -168,10 +168,134 @@ def test_status_describes_a_corrupt_replan_transaction_instead_of_crashing(
     assert "pr_number_watermark must be an integer" in out
     assert "escalation must be an object" in out
     assert "recorded stage 'supersede_intent'" in out
-    # --json prints the journal as persisted, corrupt values included.
+    # --json prints the journal as persisted, corrupt values included, and
+    # says beside it (#67) what status said above: unreadable, rejected, why.
     assert cli.main(["--state-dir", sd, "status", "--json"]) == 0
     printed = json.loads(capsys.readouterr().out)
-    assert printed["replan_transaction"]["pr_number_watermark"] == "12"
+    assert printed["replan_transaction"] == data["replan_transaction"]
+    assert printed["replan_journal"] == {
+        "readable": False,
+        "stage": "rejected",
+        "defects": [
+            "pr_number_watermark must be an integer >= 0, got '12'",
+            "escalation must be an object, got list",
+        ],
+    }
+    for defect in printed["replan_journal"]["defects"]:
+        assert defect in out
+
+
+def test_status_json_derives_the_replan_journal_beside_the_raw_one(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """#67: `replan_journal` says whether the persisted journal is usable, at
+    which stage, without a consumer re-implementing the validation; it is
+    `null` for a run without a journal and never merged into the raw one."""
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    assert (
+        cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"])
+        == 0
+    )
+    capsys.readouterr()
+    assert cli.main(["--state-dir", sd, "status", "--json"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["replan_transaction"] == {} and printed["replan_journal"] is None
+
+    state_file = tmp_path / ".autoforge" / "state.json"
+    data = json.loads(state_file.read_text())
+    data["phase"] = "REPLAN_REEXECUTE"
+    data["current_pr_url"] = PR
+    data["replan_transaction"] = {
+        "stage": "pending",
+        "issue_url": ISSUE,
+        "decision_pr_url": PR,
+        "decision_head_sha": SHA_A,
+        "decision_branch": BRANCH,
+        "decision_base_ref": "main",
+        "escalation": {"trigger": "hard_review_round_threshold"},
+    }
+    state_file.write_text(json.dumps(data))
+    assert cli.main(["--state-dir", sd, "status", "--json"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["replan_transaction"] == data["replan_transaction"]
+    assert "replan_journal" not in printed["replan_transaction"]
+    assert printed["replan_journal"] == {"readable": True, "stage": "pending", "defects": []}
+    assert cli.main(["--state-dir", sd, "status"]) == 0
+    out = capsys.readouterr().out
+    assert "stage:       pending" in out and "CORRUPT" not in out
+
+
+def test_status_json_refuses_a_non_object_replan_journal_like_status_does(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """#67: a journal `from_dict` cannot even begin to read fails both output
+    modes at the boundary; --json does not emit a partial document."""
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    assert (
+        cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"])
+        == 0
+    )
+    capsys.readouterr()
+    state_file = tmp_path / ".autoforge" / "state.json"
+    data = json.loads(state_file.read_text())
+    data["replan_transaction"] = ["not", "an", "object"]
+    state_file.write_text(json.dumps(data))
+    for argv in (["status"], ["status", "--json"]):
+        assert cli.main(["--state-dir", sd, *argv]) == 2
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "replan_transaction" in captured.err
+
+
+FAKE_SECRET = "ghp_FakeSecretForStatusTest0123456789"
+
+
+def test_status_redacts_agent_controlled_state_in_every_output(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """#6 (PR #1 O5): `block_reason` echoes agent text and a hand-edited
+    journal can carry anything, so what status prints -- human, --json and
+    the terminal-phase line of resume -- crosses the same redaction boundary
+    as the run log. The state file itself is left as written."""
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    assert (
+        cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"])
+        == 0
+    )
+    capsys.readouterr()
+    state_file = tmp_path / ".autoforge" / "state.json"
+    data = json.loads(state_file.read_text())
+    data["phase"] = "BLOCKED"
+    data["block_reason"] = f"agent said: GITHUB_TOKEN={FAKE_SECRET} leaked"
+    # A journal defect quotes the value it could not read.
+    data["replan_transaction"] = {"stage": "pending", "transaction_id": FAKE_SECRET}
+    raw = json.dumps(data)
+    state_file.write_text(raw)
+
+    assert cli.main(["--state-dir", sd, "status"]) == 0
+    out = capsys.readouterr().out
+    assert FAKE_SECRET not in out
+    assert "Reason:     agent said: GITHUB_TOKEN=***REDACTED*** leaked" in out
+    assert "journal:     CORRUPT (" in out and "***REDACTED***" in out
+
+    assert cli.main(["--state-dir", sd, "status", "--json"]) == 0
+    printed_text = capsys.readouterr().out
+    assert FAKE_SECRET not in printed_text
+    printed = json.loads(printed_text)
+    assert printed["block_reason"] == "agent said: GITHUB_TOKEN=***REDACTED*** leaked"
+    assert printed["replan_transaction"]["transaction_id"] == "***REDACTED***"
+    assert printed["replan_journal"]["readable"] is False
+    assert FAKE_SECRET not in json.dumps(printed["replan_journal"])
+
+    assert cli.main(["--state-dir", sd, "resume"]) == 1
+    captured = capsys.readouterr()
+    assert FAKE_SECRET not in captured.out + captured.err
+    assert "terminal phase BLOCKED" in captured.out
+    # Output-only: the persisted evidence is not rewritten.
+    assert state_file.read_text() == raw
 
 
 def test_status_and_resume_refuse_an_in_flight_protocol_1_replan(

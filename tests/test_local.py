@@ -925,6 +925,26 @@ def test_cli_local_status_hides_github_fields(tmp_path, monkeypatch, capsys):
     assert payload["feature_spec_path"] == "features/add-filter.md"
 
 
+def test_cli_local_status_redacts_the_block_reason(tmp_path, monkeypatch, capsys):
+    """#6: a LOCAL `block_reason` echoes an agent's FIX rationale verbatim, so
+    the local status output is redacted like the GitHub one."""
+    root = local_repo(tmp_path)
+    monkeypatch.chdir(root)
+    eng = make_local_engine(root, "features/add-filter.md")
+    eng.state.phase = Phase.BLOCKED
+    eng.state.block_reason = "unresolved: needs OPENAI_API_KEY=sk-fakekey1234567890 in CI"
+    save_state(eng.state, eng.paths.state_file)
+    capsys.readouterr()
+    assert main(["status"]) == 0
+    out = capsys.readouterr().out
+    assert "sk-fakekey1234567890" not in out
+    assert "Reason:     unresolved: needs OPENAI_API_KEY=***REDACTED*** in CI" in out
+    assert main(["status", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["block_reason"] == "unresolved: needs OPENAI_API_KEY=***REDACTED*** in CI"
+    assert payload["replan_journal"] is None
+
+
 # -- GitHub isolation ---------------------------------------------------------------------------
 def test_a_local_run_makes_zero_gh_invocations(tmp_path):
     """No `gh` argv, and no GitHubClient is ever constructed."""

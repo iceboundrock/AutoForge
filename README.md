@@ -361,7 +361,8 @@ uv run autoforge run --epic https://github.com/owner/repo/issues/1 \
                --issue https://github.com/owner/repo/issues/2
 
 uv run autoforge status            # human summary
-uv run autoforge status --json     # machine-readable
+uv run autoforge status --json     # machine-readable; `replan_journal` says whether the
+                                   # raw `replan_transaction` beside it is readable
 
 uv run autoforge step              # exactly one phase step
 uv run autoforge step --dry-run    # preview the next step
@@ -894,9 +895,11 @@ audit data rather than state payload.
   already-merged PR is recovered and counted once; an open one is re-verified),
   bounded by the same `merge.max_verification_attempts`, then `BLOCKED`.
 - Logs and CLI output pass through baseline secret redaction (`GITHUB_TOKEN`,
-  `GH_TOKEN`, `*_API_KEY`, `Authorization: Bearer`, `ghp_*`, `sk-*`, …). No
-  environment dump is ever written. Baseline only, with no claim of
-  completeness.
+  `GH_TOKEN`, `*_API_KEY`, `Authorization: Bearer`, `ghp_*`, `sk-*`, …),
+  state-derived output included: `status` and `status --json` redact what
+  they print (a `block_reason` echoes agent text; a journal can be
+  hand-edited) without rewriting `state.json`. No environment dump is ever
+  written. Baseline only, with no claim of completeness.
 - No `os.system` / `shell=True` anywhere; prompts travel as a single argv
   element so shell metacharacters in issue text cannot be interpreted.
   Agents run in a new session and the whole process group is killed on timeout,
