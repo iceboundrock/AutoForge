@@ -5053,6 +5053,37 @@ def test_review_reentry_after_a_retarget_does_not_adopt_the_old_base_comment(tmp
     assert s.last_review_comment_url == comment_url(PR, 101)
 
 
+@pytest.mark.parametrize("base", ["x-->y", "<!--x", "a--!>b"])
+def test_a_review_against_a_base_named_like_a_comment_delimiter_completes(tmp_state_dir, base):
+    """PR #93 review (Medium): ``x-->y`` is a valid refname. The reviewer
+    copies the base into the marker from the prompt, where it is given as
+    delimiter-free JSON, so the comment it posts scans as one marker; the
+    round binds and verifies like any other."""
+    gh = FakeGitHub()
+    prompts = []
+
+    def reviews(req):
+        prompts.append(req.prompt)
+        (marker_line,) = [
+            line for line in req.prompt.splitlines() if "<!-- ai-review-result:" in line
+        ]
+        literal = marker_line.split('"reviewed_base_ref": ', 1)[1].split(", ", 1)[0]
+        body = review_comment_body(1, SHA_A, False, base_ref=json.loads(literal))
+        # As the reviewer is told to: the literal exactly as given, not re-encoded.
+        body = body.replace(json.dumps(base), literal)
+        assert "-->" not in body.split("<!-- ai-review-result:", 1)[1].rsplit("-->", 1)[0]
+        gh.add_comment(PR, 101, body)
+        return block(review_payload(1, SHA_A, [], cid=101))
+
+    eng = _in_review(tmp_state_dir, gh, reviews)
+    gh.prs[PR].base_ref = base
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    assert f"Reviewed base branch (bound by the controller): `{base}`" in prompts[0]
+    s = load_state(eng.paths.state_file)
+    assert (s.reviewed_pr_url, s.reviewed_head_sha, s.reviewed_base_ref) == (PR, SHA_A, base)
+    assert s.last_review_comment_url == comment_url(PR, 101)
+
+
 @pytest.mark.parametrize("old_base", ["main", None], ids=["other-base", "no-base"])
 def test_review_result_naming_a_comment_for_another_base_is_rejected(tmp_state_dir, old_base):
     """A reviewer that adopts the old-base (or pre-base) comment anyway is

@@ -202,7 +202,9 @@ def _base_ref(value: object) -> str:
     Compared for equality with the ``baseRefName`` the controller bound
     right before the round, never interpreted, so the only shape rule is
     the one git imposes on every refname (non-empty, no whitespace, no
-    control character) plus a bound before the value can be quoted.
+    control character) plus a bound before the value can be quoted. A
+    comment delimiter inside the name is not refused here: git allows it,
+    and :func:`marker_json` keeps it out of the rendered marker text.
     """
     if not isinstance(value, str):
         raise ValueError("reviewed_base_ref must be a branch name string")
@@ -324,7 +326,31 @@ class MarkerKind(Generic[C]):
     def render(self, payload: dict) -> str:
         """The exact marker text for ``payload``; it round-trips through ``decode``."""
         self.decode(payload)  # a renderer that emits an undecodable marker is a bug
-        return f"<!-- {self.name}: {json.dumps(payload, sort_keys=True)} -->"
+        return f"<!-- {self.name}: {marker_json(payload)} -->"
+
+
+def marker_json(value: object) -> str:
+    """``value`` as JSON text that can live inside an HTML comment.
+
+    A marker payload is JSON between ``<!--`` and ``-->``, and :func:`scan`
+    ends the payload at the first comment delimiter it meets, as an HTML
+    parser does. A payload string that contains one (``x-->y`` and ``a<!--b``
+    are valid git branch names, so a ``reviewed_base_ref`` can) would
+    truncate the marker it is part of and leave the scanner an unterminated
+    JSON string: the object then carries a *defect*, and no review of that
+    PR can ever be read back. ``<`` and ``>`` are therefore emitted as the
+    JSON escapes ``\\u003c`` and ``\\u003e``, which every JSON decoder
+    reads back to the same characters; both delimiters (and the ``--!>``
+    an HTML parser also treats as a close) contain one of them, so no
+    payload rendered here can end its own comment. The replacement is
+    textual and safe: ``json.dumps`` escapes non-ASCII by default, so the
+    two characters occur only as themselves, and only inside a string
+    literal, since neither is JSON structure.
+
+    This is the one JSON encoder for marker text: the renderers use it,
+    and so does the prompt variable a reviewer copies into its marker.
+    """
+    return json.dumps(value, sort_keys=True).replace("<", "\\u003c").replace(">", "\\u003e")
 
 
 IMPLEMENTATION: MarkerKind[ImplementationClaim] = MarkerKind(

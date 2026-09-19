@@ -36,7 +36,7 @@ from pathlib import Path
 from . import __prompt_version__, __protocol_version__, __version__
 from .errors import ConfigurationError, StateError
 from .loop_guard import validate_review_history
-from .replan_txn import LEGACY_JOURNAL_PROTOCOL, legacy_journal_refusal
+from .replan_txn import LEGACY_JOURNAL_PROTOCOLS, legacy_journal_refusal
 from .result_parser import FINDING_ID_RE, MAX_FINDING_ID_CHARS
 from .run_contract import LocalRunContract
 from .runlog import validate_run_id
@@ -151,9 +151,10 @@ def _validate_local_pending(state: AutoForgeState) -> None:
 
 
 # Protocol labels an older controller wrote that this one can still read,
-# each subject to the boundary rule its successor introduced (see
-# :meth:`AutoForgeState.from_dict`).
-_LEGACY_PROTOCOLS = frozenset({LEGACY_JOURNAL_PROTOCOL, "2"})
+# each subject to the boundary rules its successors introduced (see
+# :meth:`AutoForgeState.from_dict`). Every step so far changed the replan
+# journal, so the set is the journal's.
+_LEGACY_PROTOCOLS = LEGACY_JOURNAL_PROTOCOLS
 # The phases in which the persisted clean review is consumed by the merge
 # gate, and so the phases a state without the review's PR and base binding
 # cannot be loaded in.
@@ -396,7 +397,7 @@ class AutoForgeState:
         # controller must be reported as an unsupported protocol, not as a
         # pile of typos.
         #
-        # Each protocol step added one binding, and an old file is loaded
+        # Each protocol step added bindings, and an old file is loaded
         # exactly when nothing in it depends on the binding it lacks:
         #
         # - 1 -> 2: the replan journal records the PR and issue its decision
@@ -408,8 +409,12 @@ class AutoForgeState:
         #   would call it corrupt (:func:`replan_txn.legacy_journal_refusal`).
         # - 2 -> 3: the completed review records the PR it was posted on and
         #   the base branch it was bound to, and the merge gate requires
-        #   both. A protocol-2 file parked in READY_FOR_MERGE or MERGE holds a
-        #   clean review the gate could only accept by binding it to the run's
+        #   both; the replan journal records the base its decision was bound
+        #   to and the base it checkpointed, and the supersede requires both.
+        #   A protocol-2 file with a replan in flight is refused exactly as a
+        #   protocol-1 one is, for the base instead of the PR and issue. A
+        #   protocol-2 file parked in READY_FOR_MERGE or MERGE holds a clean
+        #   review the gate could only accept by binding it to the run's
         #   current PR and base -- the substitution the fields exist to catch
         #   -- so it is refused with the PR and HEAD named
         #   (:func:`_legacy_review_binding_refusal`). In any other phase the
@@ -421,12 +426,11 @@ class AutoForgeState:
         raw_protocol = data.get("protocol_version", __protocol_version__)
         written_by = str(data.get("controller_version", ""))
         if isinstance(raw_protocol, str) and raw_protocol in _LEGACY_PROTOCOLS:
-            if raw_protocol == LEGACY_JOURNAL_PROTOCOL:
-                refusal = legacy_journal_refusal(
-                    data.get("replan_transaction", {}), written_by=written_by
-                )
-                if refusal:
-                    raise StateError(refusal)
+            refusal = legacy_journal_refusal(
+                data.get("replan_transaction", {}), protocol=raw_protocol, written_by=written_by
+            )
+            if refusal:
+                raise StateError(refusal)
             refusal = _legacy_review_binding_refusal(
                 data, phase, protocol=str(raw_protocol), written_by=written_by
             )

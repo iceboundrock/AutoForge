@@ -168,6 +168,19 @@ stale and the PR must return to `REVIEW`, where the next round is bound to
 the actual revision. A PR that GitHub reports as `MERGED` at the reviewed
 HEAD but into another base is never counted (`BLOCKED`).
 
+The same binding governs the other decision a review can make. A review
+that routes to `REPLAN_REEXECUTE` records the base it was bound to in the
+replan transaction, and the source PR may be checkpointed and later closed
+only while it still targets that base ([replan-transaction.md](replan-transaction.md),
+"The decision point is what may be closed").
+
+A branch name is compared as GitHub reports it and is never interpreted;
+where it is written into an HTML-comment marker (the prompt's
+`REVIEWED_BASE_REF_JSON`, every marker renderer) it goes through
+`claims.marker_json`, which escapes `<` and `>` as JSON does so that a valid
+refname such as `x-->y` cannot end the marker early and leave the round's
+comment unreadable.
+
 Never merge code that has changed since the latest clean review.
 
 The same rule covers a review with findings. The open findings are bound to

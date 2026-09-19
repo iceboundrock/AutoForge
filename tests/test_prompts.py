@@ -374,6 +374,14 @@ def test_engine_prompt_variables_review_and_fix(engine):
     # marker so a quote in the branch name cannot break the marker's JSON.
     assert 'Reviewed base branch (bound by the controller): `rel"1`' in text
     assert '"reviewed_base_ref": "rel\\"1", "needs_fix_round"' in text
+    # A comment delimiter in the branch name is escaped the same way (as the
+    # JSON escapes `\u003c` / `\u003e`), so the marker line the reviewer
+    # copies holds exactly one `-->`: the template's own.
+    engine.state.current_base_ref = "x-->y"
+    text = engine.render_prompt_for(Phase.REVIEW)
+    assert '"reviewed_base_ref": "x--\\u003ey", "needs_fix_round"' in text
+    (marker_line,) = [line for line in text.splitlines() if "<!-- ai-review-result:" in line]
+    assert marker_line.count("-->") == 1 and marker_line.endswith("-->")
     # Rendered outside a step, no PR was read: no existing comment is named.
     assert (
         "Comment already posted for THIS round at THIS HEAD against THIS base (if\n  any): (none)"

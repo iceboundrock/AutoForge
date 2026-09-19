@@ -361,9 +361,11 @@ def _seed_txn(stage: ReplanStage, **over) -> ReplanTransaction:
         decision_pr_url=PR,
         decision_head_sha=SHA_A,
         decision_branch=BRANCH,
+        decision_base_ref="main",
         source_pr_url=PR,
         source_branch=BRANCH,
         source_head_sha=SHA_A,
+        source_base_ref="main",
         source_review_round=20,
         base_branch="main",
         evidence_finding_count=3,
@@ -518,6 +520,7 @@ def test_hard_threshold_replaces_pr_and_starts_fresh_review(tmp_state_dir):
     assert state.replan_transaction == {}  # the transaction is retired on activation
     superseded = state.superseded_prs[0]
     assert superseded["pr_url"] == PR and superseded["head_sha"] == SHA_A
+    assert superseded["branch"] == BRANCH and superseded["base_ref"] == "main"
     assert superseded["replacement_pr_url"] == REPLACEMENT_PR
     assert len(superseded["transaction_id"]) == 32
     assert eng.provider.calls[-1].profile.name == "replan_reexecute"
@@ -779,6 +782,7 @@ def test_review_beyond_the_persisted_finding_bound_blocks_instead_of_replanning(
         decision_pr_url=PR,
         decision_head_sha=SHA_A,
         decision_branch=BRANCH,
+        decision_base_ref="main",
         escalation={"trigger": "hard_review_round_threshold"},
     ).to_dict()
     calls_before = len(eng.provider.calls)
@@ -1636,12 +1640,25 @@ def test_prompt_carries_the_transaction_id_and_the_exact_marker(tmp_state_dir):
             lambda gh: setattr(gh.prs[PR], "head_ref", "somebody/else"),
             "moved from the checkpointed branch",
         ),
+        (
+            lambda gh: setattr(gh.prs[PR], "base_ref", "release/1.x"),
+            "was retargeted from the checkpointed base 'main' to 'release/1.x'",
+        ),
+        (
+            lambda gh: setattr(gh.prs[PR], "base_ref", ""),
+            "was retargeted from the checkpointed base 'main' to ''",
+        ),
         (lambda gh: setattr(gh.prs[PR], "state", "CLOSED"), "expected OPEN at the checkpoint"),
         (lambda gh: setattr(gh.prs[PR], "state", "MERGED"), "already MERGED"),
     ],
 )
 def test_source_drift_refuses_to_close_the_source_pr(tmp_state_dir, mutate, needle):
-    """I3: the source must still be exactly the implementation that was rejected."""
+    """I3: the source must still be exactly the implementation that was rejected.
+
+    The base is part of "exactly": a PR's diff is HEAD against base, so a
+    source retargeted to another base at the same HEAD and branch is a
+    change the review that decided this replan never saw (#68).
+    """
     gh = FakeGitHub()
     eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.VERIFIED)
     mutate(gh)
@@ -1761,6 +1778,10 @@ def test_the_marker_is_revalidated_on_the_last_read_before_the_close(tmp_state_d
             lambda gh: setattr(gh.prs[PR], "head_ref", "somebody/else"),
             "moved from the checkpointed branch",
         ),
+        (
+            lambda gh: setattr(gh.prs[PR], "base_ref", "release/1.x"),
+            "retargeted from the checkpointed base 'main' to 'release/1.x' inside the close window",
+        ),
         (lambda gh: gh.set_head(SHA_C, REPLACEMENT_PR), "advanced from the verified HEAD"),
         (
             lambda gh: setattr(gh.prs[REPLACEMENT_PR], "body", _replacement("marker removed")),
@@ -1854,6 +1875,10 @@ def test_a_transient_failure_while_undoing_the_close_stays_resumable(tmp_state_d
         (
             lambda gh: setattr(gh.prs[PR], "head_ref", "somebody/else"),
             "moved from the checkpointed branch",
+        ),
+        (
+            lambda gh: setattr(gh.prs[PR], "base_ref", "release/1.x"),
+            "retargeted from the checkpointed base",
         ),
     ],
 )
@@ -2653,6 +2678,7 @@ def test_conclusive_failure_reading_the_source_at_prepare_blocks(tmp_state_dir):
         decision_pr_url=PR,
         decision_head_sha=SHA_A,
         decision_branch=BRANCH,
+        decision_base_ref="main",
         escalation={"trigger": "hard_review_round_threshold"},
     ).to_dict()
     gh.get_pr_error = GitHubError("HTTP 404: Not Found")
@@ -2675,6 +2701,7 @@ def _pending_at_the_source(tmp_state_dir, gh):
         decision_pr_url=PR,
         decision_head_sha=SHA_A,
         decision_branch=BRANCH,
+        decision_base_ref="main",
         escalation={"trigger": "hard_review_round_threshold"},
     ).to_dict()
     return eng
@@ -2719,12 +2746,13 @@ def test_a_source_pr_that_moved_before_prepare_is_refused(tmp_state_dir):
         decision_pr_url=PR,
         decision_head_sha=SHA_A,
         decision_branch=BRANCH,
+        decision_base_ref="main",
         escalation={"trigger": "hard_review_round_threshold"},
     ).to_dict()
     out = eng.step()
     assert out.next_phase == "BLOCKED"
-    assert (
-        "only an OPEN PR at a readable HEAD and branch can be superseded" in eng.state.block_reason
+    assert "only an OPEN PR at a readable HEAD, branch and base can be superseded" in (
+        eng.state.block_reason
     )
     assert eng.provider.calls == []
 
@@ -2734,14 +2762,26 @@ def test_a_source_pr_that_moved_before_prepare_is_refused(tmp_state_dir):
     [
         (lambda pr: setattr(pr, "head_sha", SHA_B), "never reviewed against this decision"),
         (lambda pr: setattr(pr, "head_ref", "autoforge/2-hand-edited"), "is on branch"),
+        (
+            lambda pr: setattr(pr, "base_ref", "release/1.x"),
+            "targets base 'release/1.x', but the review that decided this replan was bound to "
+            "base 'main'",
+        ),
+        (
+            lambda pr: setattr(pr, "base_ref", ""),
+            "against base (unreadable); only an OPEN PR at a readable HEAD, branch and base",
+        ),
     ],
+    ids=["head", "branch", "base", "unreadable-base"],
 )
 def test_source_moving_between_the_review_and_the_prepare_is_refused(tmp_state_dir, drift, needle):
     """I3 at the decision point: the checkpoint may only capture what was reviewed.
 
     Between the review that routed here and the REPLAN_REEXECUTE step, a human
-    can push to the source branch. Checkpointing the *current* HEAD would let
-    the controller close a revision this replan decision never saw.
+    can push to the source branch, or retarget the PR to another base
+    (``gh pr edit --base``). Checkpointing the *current* HEAD or base would
+    let the controller close a change this replan decision never saw: at an
+    unchanged HEAD, a new base is a new diff (#68).
     """
     gh = FakeGitHub()
     eng = _park_at_hard_threshold(tmp_state_dir, gh, _replan_agent(gh))
@@ -2750,6 +2790,7 @@ def test_source_moving_between_the_review_and_the_prepare_is_refused(tmp_state_d
     assert txn.stage is ReplanStage.PENDING
     assert txn.decision_pr_url == PR
     assert txn.decision_head_sha == SHA_A and txn.decision_branch == BRANCH
+    assert txn.decision_base_ref == "main"  # the base REVIEW bound the round to
 
     drift(gh.prs[PR])
     calls_before = len(eng.provider.calls)
@@ -2793,13 +2834,27 @@ def test_a_transaction_that_never_recorded_its_decision_point_is_refused(tmp_sta
     assert "does not record the reviewed HEAD" in verify_decision_point(source, txn)
 
 
-def test_a_checkpoint_that_disagrees_with_the_decision_point_never_closes(tmp_state_dir):
+@pytest.mark.parametrize(
+    "over,needle",
+    [
+        ({"decision_head_sha": SHA_C}, "is not the reviewed HEAD"),
+        (
+            {"decision_base_ref": "release/1.x"},
+            "checkpointed source base 'main' is not the base 'release/1.x' the review that "
+            "decided this replan was bound to",
+        ),
+    ],
+    ids=["head", "base"],
+)
+def test_a_checkpoint_that_disagrees_with_the_decision_point_never_closes(
+    tmp_state_dir, over, needle
+):
     """Defence in depth on the close itself, not only on the prepare."""
     gh = FakeGitHub()
-    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.VERIFIED, decision_head_sha=SHA_C)
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.VERIFIED, **over)
     out = eng.step()
     assert out.next_phase == "BLOCKED"
-    assert "is not the reviewed HEAD" in eng.state.block_reason
+    assert needle in eng.state.block_reason
     _assert_source_untouched(eng, gh)
 
 
@@ -3339,8 +3394,12 @@ def test_f3_a_replacement_that_drifted_before_activation_is_not_installed(
             lambda gh: setattr(gh.prs[PR], "head_ref", "somebody/else"),
             "moved from the checkpointed branch",
         ),
+        (
+            lambda gh: setattr(gh.prs[PR], "base_ref", "release/1.x"),
+            "retargeted from the checkpointed base",
+        ),
     ],
-    ids=["reopened", "head", "branch"],
+    ids=["reopened", "head", "branch", "base"],
 )
 def test_f3_a_source_that_drifted_before_activation_blocks(tmp_state_dir, drift, needle):
     """Both checkpoints are re-derived, not just the replacement's (issue #37 T4).
@@ -3616,18 +3675,72 @@ def test_f1_a_source_without_a_readable_branch_is_refused_at_prepare(tmp_state_d
         decision_pr_url=PR,
         decision_head_sha=SHA_A,
         decision_branch=BRANCH,
+        decision_base_ref="main",
         escalation={"trigger": "hard_review_round_threshold"},
     ).to_dict()
     out = eng.step()
     assert out.next_phase == "BLOCKED"
     assert "branch (unreadable)" in eng.state.block_reason
-    assert "only an OPEN PR at a readable HEAD and branch can be superseded" in (
+    assert "only an OPEN PR at a readable HEAD, branch and base can be superseded" in (
         eng.state.block_reason
     )
     assert _txn(eng).stage is ReplanStage.REJECTED
     assert _txn(eng).transaction_id == ""
     assert eng.provider.calls == []
     _assert_source_untouched(eng, gh)
+
+
+def test_a_source_without_a_readable_base_is_refused_at_prepare(tmp_state_dir):
+    """An empty base_ref would checkpoint source_base_ref="" and enforce nothing later."""
+    gh = FakeGitHub()
+    eng = make_engine(tmp_state_dir, ["must not run"], github=gh)
+    gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], base_ref="")
+    eng.state.phase = Phase.REPLAN_REEXECUTE
+    eng.state.current_pr_url = PR
+    eng.state.current_branch = BRANCH
+    eng.state.current_head_sha = SHA_A
+    eng.state.replan_transaction = ReplanTransaction(
+        stage=ReplanStage.PENDING,
+        issue_url=ISSUE,
+        decision_pr_url=PR,
+        decision_head_sha=SHA_A,
+        decision_branch=BRANCH,
+        decision_base_ref="main",
+        escalation={"trigger": "hard_review_round_threshold"},
+    ).to_dict()
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert "against base (unreadable)" in eng.state.block_reason
+    assert "only an OPEN PR at a readable HEAD, branch and base can be superseded" in (
+        eng.state.block_reason
+    )
+    assert _txn(eng).stage is ReplanStage.REJECTED
+    assert _txn(eng).transaction_id == ""
+    assert eng.provider.calls == []
+    _assert_source_untouched(eng, gh)
+
+
+def test_a_replan_against_a_non_default_base_is_checkpointed_and_superseded(tmp_state_dir):
+    """The binding is to the base the review saw, whatever it is: a source PR
+    targeting a release branch supersedes as long as it still targets it, and
+    the base is carried into the superseded record."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(
+        tmp_state_dir,
+        gh,
+        ReplanStage.VERIFIED,
+        decision_base_ref="release/1.x",
+        source_base_ref="release/1.x",
+    )
+    gh.prs[PR].base_ref = "release/1.x"
+    out = eng.step()
+    assert out.next_phase == "REVIEW"
+    assert gh.prs[PR].state == "CLOSED" and gh.reopened_prs == []
+    assert eng.state.current_pr_url == REPLACEMENT_PR
+    assert eng.state.superseded_prs[0]["base_ref"] == "release/1.x"
+    # The replacement is on the verified default branch, as the transaction
+    # records it, and the run's base follows the replacement.
+    assert eng.state.current_base_ref == "main"
 
 
 def test_n2_sha_comparison_is_case_insensitive_and_never_vacuous():
@@ -3642,13 +3755,22 @@ def test_n2_sha_comparison_is_case_insensitive_and_never_vacuous():
         source_pr_url=PR,
         source_branch=BRANCH,
         source_head_sha=SHA_A,
+        source_base_ref="main",
         base_branch="main",
     )
     upper = PRInfo(
-        url=PR, number=42, title="PR", state="OPEN", head_sha=SHA_A.upper(), head_ref=BRANCH
+        url=PR,
+        number=42,
+        title="PR",
+        state="OPEN",
+        head_sha=SHA_A.upper(),
+        head_ref=BRANCH,
+        base_ref="main",
     )
     assert verify_source_checkpoint(upper, txn) == ""
-    unreadable = PRInfo(url=PR, number=42, title="PR", state="CLOSED", head_sha="", head_ref=BRANCH)
+    unreadable = PRInfo(
+        url=PR, number=42, title="PR", state="CLOSED", head_sha="", head_ref=BRANCH, base_ref="main"
+    )
     txn.source_head_sha = ""
     assert "advanced from the checkpointed HEAD" in verify_closed_source(unreadable, txn)
 
@@ -3672,6 +3794,7 @@ def test_n3_a_malformed_pr_url_from_the_listing_is_a_refusal_not_a_crash(tmp_sta
         decision_pr_url=PR,
         decision_head_sha=SHA_A,
         decision_branch=BRANCH,
+        decision_base_ref="main",
         escalation={"trigger": "hard_review_round_threshold"},
     ).to_dict()
     out = eng.step()
@@ -3710,10 +3833,25 @@ def test_n3_verify_target_pr_reports_an_unusable_issue_url_instead_of_raising():
 # =============================================================================
 
 
-def _pr(url: str = PR, *, state: str = "OPEN", head_sha: str = SHA_A, head_ref: str = BRANCH):
+def _pr(
+    url: str = PR,
+    *,
+    state: str = "OPEN",
+    head_sha: str = SHA_A,
+    head_ref: str = BRANCH,
+    base_ref: str = "main",
+):
     from autoforge.github import PRInfo
 
-    return PRInfo(url=url, number=42, title="PR", state=state, head_sha=head_sha, head_ref=head_ref)
+    return PRInfo(
+        url=url,
+        number=42,
+        title="PR",
+        state=state,
+        head_sha=head_sha,
+        head_ref=head_ref,
+        base_ref=base_ref,
+    )
 
 
 def test_r2f1_required_fields_accumulate_along_the_lifecycle():
@@ -3741,10 +3879,12 @@ def test_r2f1_required_fields_accumulate_along_the_lifecycle():
         (ReplanStage.PENDING, "decision_pr_url"),
         (ReplanStage.PENDING, "decision_head_sha"),
         (ReplanStage.PENDING, "decision_branch"),
+        (ReplanStage.PENDING, "decision_base_ref"),
         (ReplanStage.PENDING, "escalation"),
         (ReplanStage.PREPARED, "transaction_id"),
         (ReplanStage.PREPARED, "source_branch"),
         (ReplanStage.PREPARED, "source_head_sha"),
+        (ReplanStage.PREPARED, "source_base_ref"),
         (ReplanStage.PREPARED, "source_review_round"),
         (ReplanStage.PREPARED, "base_branch"),
         (ReplanStage.PREPARED, "evidence_finding_count"),
@@ -3755,6 +3895,7 @@ def test_r2f1_required_fields_accumulate_along_the_lifecycle():
         (ReplanStage.PREPARED, "pr_number_watermark"),
         (ReplanStage.PREPARED, "expected_execution_attempt"),
         (ReplanStage.VERIFIED, "source_branch"),
+        (ReplanStage.VERIFIED, "source_base_ref"),
         (ReplanStage.VERIFIED, "evidence_finding_count"),
         (ReplanStage.VERIFIED, "replacement_pr_url"),
         (ReplanStage.VERIFIED, "replacement_branch"),
@@ -3855,6 +3996,28 @@ def test_r2f1_the_source_verifiers_refuse_an_empty_checkpointed_branch():
     )
 
 
+def test_the_source_verifiers_refuse_an_empty_checkpointed_base():
+    """The base half of the checkpoint follows the branch's rule: never vacuous,
+    and an unreadable base on the PR is drift, not a match (#68)."""
+    from autoforge.replan_txn import verify_closed_source, verify_source_checkpoint
+
+    txn = _seed_txn(ReplanStage.VERIFIED, source_base_ref="")
+    assert "records no base branch for source PR" in verify_source_checkpoint(_pr(), txn)
+    assert "records no base branch for source PR" in (
+        verify_closed_source(_pr(state="CLOSED"), txn)
+    )
+    txn.source_base_ref = "main"
+    assert verify_source_checkpoint(_pr(), txn) == ""
+    assert verify_closed_source(_pr(state="CLOSED"), txn) == ""
+    for retargeted in ("release/1.x", ""):
+        assert "retargeted from the checkpointed base 'main'" in (
+            verify_source_checkpoint(_pr(base_ref=retargeted), txn)
+        )
+        assert "inside the close window" in (
+            verify_closed_source(_pr(state="CLOSED", base_ref=retargeted), txn)
+        )
+
+
 def test_r2f1_the_target_verifier_requires_the_branch_once_it_is_a_checkpoint():
     from autoforge.github import PRInfo
     from autoforge.replan_txn import verify_target_pr
@@ -3904,6 +4067,7 @@ def test_r2f2_a_pending_journal_may_not_carry_a_transaction_id():
         decision_pr_url=PR,
         decision_head_sha=SHA_A,
         decision_branch=BRANCH,
+        decision_base_ref="main",
         escalation={"trigger": "hard_review_round_threshold"},
         transaction_id=TXN_ID,
     ).to_dict()
@@ -4177,6 +4341,7 @@ def test_r4f1_the_prepared_source_is_read_from_github_and_must_be_the_decision_p
         state="OPEN",
         head_sha=SHA_A,
         head_ref=BRANCH,
+        base_ref="main",
         repository="owner/repo",
     )
     out = eng.step()
@@ -4196,6 +4361,24 @@ def test_r3f2_the_decision_point_verifier_refuses_a_missing_branch():
     txn.decision_branch = BRANCH
     assert verify_decision_point(_pr(), txn) == ""
     assert "is on branch" in verify_decision_point(_pr(head_ref="other"), txn)
+
+
+def test_the_decision_point_verifier_refuses_a_missing_or_moved_base():
+    """Same rule as the branch: an unrecorded base is a refusal, and so is a
+    source that targets another base than the deciding review was bound to
+    -- an unreadable one included (#68)."""
+    from autoforge.replan_txn import verify_decision_point
+
+    txn = _seed_txn(ReplanStage.PENDING, decision_base_ref="")
+    assert "does not record the base branch the review that decided it was bound to" in (
+        verify_decision_point(_pr(), txn)
+    )
+    txn.decision_base_ref = "main"
+    assert verify_decision_point(_pr(), txn) == ""
+    for retargeted in ("release/1.x", ""):
+        drift = verify_decision_point(_pr(base_ref=retargeted), txn)
+        assert f"targets base {retargeted!r}, but the review that decided this replan" in drift
+        assert "bound to base 'main'" in drift
 
 
 def test_r3f2_review_does_not_decide_a_replan_it_cannot_bind_to_a_branch(tmp_state_dir):
@@ -4714,10 +4897,12 @@ def _protocol_1_journal(stage: ReplanStage) -> dict:
     """Exactly what the protocol-1 controller's ``to_dict`` wrote at ``stage``.
 
     The key set is the protocol-1 dataclass: every current field except
-    ``decision_pr_url``, which did not exist. ``issue_url`` was filled by the
-    prepare step, so a PENDING journal carries it *present and empty*. This is
-    a literal transcription of that controller's serialisation, so that a
-    change to the current schema cannot quietly rewrite what "old" means.
+    ``decision_pr_url`` (added by protocol 2) and ``decision_base_ref`` /
+    ``source_base_ref`` (added by protocol 3), which did not exist.
+    ``issue_url`` was filled by the prepare step, so a PENDING journal carries
+    it *present and empty*. This is a literal transcription of that
+    controller's serialisation, so that a change to the current schema cannot
+    quietly rewrite what "old" means.
     """
     prepared = stage is not ReplanStage.PENDING
     after_verified = stage in _PROTOCOL_1_STAGES[2:]
@@ -4757,13 +4942,30 @@ def _protocol_1_journal(stage: ReplanStage) -> dict:
         "escalation": {"trigger": "hard_review_round_threshold"},
     }
     assert "decision_pr_url" not in data
+    assert "decision_base_ref" not in data and "source_base_ref" not in data
     return data
 
 
-def _protocol_1_state_file(eng, journal: dict) -> dict:
-    """Rewrite the engine's state file as the protocol-1 controller left it."""
+def _protocol_2_journal(stage: ReplanStage) -> dict:
+    """Exactly what the protocol-2 controller's ``to_dict`` wrote at ``stage``.
+
+    Protocol 2 added ``decision_pr_url`` to protocol 1 and had REVIEW record
+    ``issue_url`` with the decision; protocol 3 then added the two base
+    fields. So the key set is the current one minus ``decision_base_ref``
+    and ``source_base_ref``, spelled out here as a literal for the same
+    reason as :func:`_protocol_1_journal`.
+    """
+    data = _protocol_1_journal(stage)
+    data["issue_url"] = ISSUE
+    data["decision_pr_url"] = PR
+    assert "decision_base_ref" not in data and "source_base_ref" not in data
+    return data
+
+
+def _protocol_1_state_file(eng, journal: dict, *, protocol: str = "1") -> dict:
+    """Rewrite the engine's state file as the ``protocol`` controller left it."""
     data = json.loads(eng.paths.state_file.read_text(encoding="utf-8"))
-    data["protocol_version"] = "1"
+    data["protocol_version"] = protocol
     data["phase"] = Phase.REPLAN_REEXECUTE.value
     data["current_issue_url"] = ISSUE
     data["current_pr_url"] = PR
@@ -4830,12 +5032,73 @@ def test_r7f1_an_in_flight_protocol_1_journal_is_refused_at_the_state_boundary(
     assert gh.prs[PR].state == "OPEN" and eng.provider.calls == []
 
 
-def test_r7f1_a_protocol_1_state_without_a_replan_in_flight_loads_as_current(tmp_state_dir):
-    """The one difference between protocols 1 and 2 is the journal, so a
-    protocol-1 file with an empty or terminal journal is a current file
-    with an old label (the 2 -> 3 rule of #68 only concerns a file parked
-    in READY_FOR_MERGE / MERGE, which these are not); the label is
-    rewritten on the next save."""
+@pytest.mark.parametrize("stage", _PROTOCOL_1_STAGES, ids=lambda s: s.value)
+def test_a_protocol_2_journal_is_refused_by_the_journal_loader_only_as_corruption(stage):
+    """The 2 -> 3 step is the 1 -> 2 step again, for the base (#68): the
+    journal loader can only call the protocol-2 shape corrupt, so it must
+    never be reached from a protocol-2 file."""
+    txn = ReplanTransaction.from_dict(_protocol_2_journal(stage))
+    assert txn.stage is ReplanStage.REJECTED
+    assert "persisted replan transaction is corrupt" in txn.rejection_reason
+    missing = f"decision_base_ref is required at stage {stage.value!r} but missing"
+    assert missing in txn.journal_defects
+
+
+@pytest.mark.parametrize("stage", _PROTOCOL_1_STAGES, ids=lambda s: s.value)
+def test_an_in_flight_protocol_2_journal_is_refused_at_the_state_boundary(tmp_state_dir, stage):
+    """Every in-flight stage written by the protocol-2 controller is refused
+    the way a protocol-1 one is, naming the binding it lacks -- the base --
+    rather than the PR and issue; nothing is read from or written to GitHub,
+    no agent runs, and the file is left byte-for-byte (#68)."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, stage)
+    eng.save()
+    data = _protocol_1_state_file(eng, _protocol_2_journal(stage), protocol="2")
+    before = eng.paths.state_file.read_bytes()
+    with pytest.raises(StateError) as info:
+        eng.load()
+    message = str(info.value)
+    assert "protocol_version '2'" in message and "replan in flight" in message
+    assert f"stage {stage.value!r}" in message
+    assert "did not record the base branch the review that decided the replan was bound to" in (
+        message
+    )
+    assert "does not reconstruct it from the source PR's current base" in message
+    assert "PR and issue" not in message  # protocol 2 recorded those
+    assert "Finish or undo the replan with the controller that wrote it" in message
+    assert "corrupt" not in message
+    if stage is ReplanStage.PENDING:
+        assert "source PR (none)" in message and "no PR was closed" in message
+    else:
+        assert f"transaction {TXN_ID}" in message and f"source PR {PR}" in message
+    assert eng.paths.state_file.read_bytes() == before
+    assert json.loads(before)["replan_transaction"] == data["replan_transaction"]
+    assert gh.closed_prs == [] and gh.reopened_prs == [] and gh.commented_prs == []
+    assert gh.prs[PR].state == "OPEN" and eng.provider.calls == []
+
+
+def test_the_legacy_journal_refusal_knows_only_the_legacy_protocols():
+    """The refusal describes a gap per protocol; asked about a label it has no
+    description for (the current one included) it fails loudly rather than
+    describe the wrong gap."""
+    from autoforge.replan_txn import LEGACY_JOURNAL_PROTOCOLS, legacy_journal_refusal
+
+    assert LEGACY_JOURNAL_PROTOCOLS == frozenset({"1", "2"})
+    journal = _seed_dict(ReplanStage.PREPARED)
+    for protocol in ("3", "0", ""):
+        with pytest.raises(ValueError, match="not a legacy journal protocol"):
+            legacy_journal_refusal(journal, protocol=protocol, written_by="0.1.0")
+    assert legacy_journal_refusal({}, protocol="2", written_by="0.1.0") == ""
+    assert legacy_journal_refusal(journal, protocol="2", written_by="0.1.0")
+
+
+@pytest.mark.parametrize("protocol", ["1", "2"])
+def test_r7f1_a_legacy_state_without_a_replan_in_flight_loads_as_current(tmp_state_dir, protocol):
+    """Every protocol step so far changed only the journal, so a legacy file
+    with an empty or terminal journal is a current file with an old label
+    (the 2 -> 3 review-binding rule of #68 only concerns a file parked in
+    READY_FOR_MERGE / MERGE, which these are not); the label is rewritten on
+    the next save."""
     gh = FakeGitHub()
     eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.VERIFIED)
     eng.save()
@@ -4844,7 +5107,7 @@ def test_r7f1_a_protocol_1_state_without_a_replan_in_flight_loads_as_current(tmp
         "rejection_reason": "the replacement attests tests_passed=false",
     }
     for journal in ({}, rejected):
-        data = _protocol_1_state_file(eng, journal)
+        data = _protocol_1_state_file(eng, journal, protocol=protocol)
         data["phase"] = "REVIEW" if not journal else "BLOCKED"
         eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
         loaded = eng.load()
@@ -4852,10 +5115,10 @@ def test_r7f1_a_protocol_1_state_without_a_replan_in_flight_loads_as_current(tmp
         assert loaded.replan_transaction == journal
         eng.save()
         assert json.loads(eng.paths.state_file.read_text())["protocol_version"] == "3"
-    # A protocol-1 file that predates the journal field altogether is the
-    # same case: no replan in flight.
+    # A legacy file that predates the journal field altogether is the same
+    # case: no replan in flight.
     data = json.loads(eng.paths.state_file.read_text())
-    data["protocol_version"] = "1"
+    data["protocol_version"] = protocol
     del data["replan_transaction"]
     eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
     assert eng.load().replan_transaction == {}
@@ -4879,18 +5142,23 @@ def test_r7f1_a_rejected_protocol_1_journal_replays_its_block_under_protocol_2(t
 
 
 def test_r7f1_the_version_label_decides_not_the_journal_shape(tmp_state_dir):
-    """A protocol-1 journal that happens to carry the protocol-2 fields is
-    still refused (an in-flight protocol-1 transaction is one whatever a hand
-    edit added), and a protocol-2 journal missing them is corruption, not a
+    """A legacy journal that happens to carry the current fields is still
+    refused (an in-flight legacy transaction is one whatever a hand edit
+    added), and a current-protocol journal missing them is corruption, not a
     legacy journal (the label says this controller wrote it)."""
     gh = FakeGitHub()
     eng, txn = _seeded_engine(tmp_state_dir, gh, ReplanStage.SUPERSEDE_INTENT)
     eng.save()
-    _protocol_1_state_file(eng, txn.to_dict())
-    with pytest.raises(StateError, match="replan in flight"):
-        eng.load()
+    for legacy in ("1", "2"):
+        data = _protocol_1_state_file(eng, txn.to_dict())
+        data["protocol_version"] = legacy
+        eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
+        with pytest.raises(
+            StateError, match=f"protocol_version {legacy!r} with a replan in flight"
+        ):
+            eng.load()
     data = json.loads(eng.paths.state_file.read_text())
-    data["protocol_version"] = "2"
+    data["protocol_version"] = "3"
     del data["replan_transaction"]["decision_pr_url"]
     eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
     eng.load()

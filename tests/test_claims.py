@@ -26,6 +26,7 @@ from autoforge.claims import (
     ProgressClaim,
     ReviewClaim,
     collect,
+    marker_json,
     render_follow_up_marker,
     render_implementation_marker,
     render_progress_marker,
@@ -476,6 +477,54 @@ def test_renderers_emit_canonical_urls_and_round_trip_through_the_decoders():
     fu = render_follow_up_marker(PR, "R2-F3")
     assert fu == f'<!-- ai-follow-up: {{"finding_id": "R2-F3", "pr": "{PR}"}} -->'
     assert scan(FOLLOW_UP, fu).claims[0].key == (parse_pr_url(PR).identity, "R2-F3")
+
+
+# Valid git branch names that contain an HTML comment delimiter (or would
+# form one with the marker's own `-->`), and one with a quote for good measure.
+_DELIMITER_BASES = ["x-->y", "<!--x", "a--!>b", "--", 'rel"1', "release/1.x"]
+
+
+@pytest.mark.parametrize("base", _DELIMITER_BASES)
+def test_marker_json_keeps_a_comment_delimiter_out_of_the_marker_and_round_trips(base):
+    """A reviewed base such as ``x-->y`` is a valid refname. Emitted raw inside
+    the HTML comment it would end the marker early (the scanner stops at the
+    first ``-->`` or ``<!--``, as an HTML parser does) and leave a defect no
+    later read of that PR's reviews could get past. The encoder escapes the
+    two characters as JSON does, so the text contains no delimiter and every
+    decoder reads the original value back."""
+    text = marker_json(base)
+    assert "<" not in text and ">" not in text
+    assert json.loads(text) == base
+    payload = {**_valid(REVIEW), "reviewed_base_ref": base}
+    rendered = REVIEW.render(payload)
+    assert rendered.startswith("<!-- ai-review-result: ") and rendered.endswith(" -->")
+    assert "-->" not in rendered[len("<!-- ai-review-result: ") : -len(" -->")]
+    result = scan(
+        REVIEW,
+        "before\n"
+        + rendered
+        + "\nafter "
+        + marker(IMPLEMENTATION.name, VALID[IMPLEMENTATION.name]),
+    )
+    assert result.defects == ()
+    (claim,) = result.claims
+    assert claim.reviewed_base_ref == base and claim.key == (1, SHA_A, base)
+    # And the same value pasted as the reviewer is told to, from the prompt
+    # variable, is one marker too: the template's own `-->` still ends it.
+    hand_written = (
+        f'<!-- ai-review-result: {{"round": 1, "reviewed_head_sha": "{SHA_A}", '
+        f'"reviewed_base_ref": {text}, "needs_fix_round": false, "finding_ids": []}} -->'
+    )
+    (claim,) = scan(REVIEW, hand_written).claims
+    assert claim.reviewed_base_ref == base
+
+
+def test_a_raw_json_base_with_a_delimiter_is_the_defect_marker_json_prevents():
+    """Documents the failure the encoder exists for: plain ``json.dumps`` of
+    ``x-->y`` truncates the marker at the base's ``-->``."""
+    raw = marker("ai-review-result", {**_valid(REVIEW), "reviewed_base_ref": "x-->y"})
+    result = scan(REVIEW, raw)
+    assert result.claims == () and len(result.defects) == 1
 
 
 def test_a_renderer_refuses_to_emit_a_marker_the_decoder_would_reject():

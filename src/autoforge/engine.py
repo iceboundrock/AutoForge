@@ -107,6 +107,7 @@ from .claims import (
     ProgressClaim,
     ReviewClaim,
     collect,
+    marker_json,
     render_follow_up_marker,
     render_implementation_marker,
     render_progress_marker,
@@ -1017,11 +1018,12 @@ class ControllerEngine:
             )
             or "(none)",
             # The base the round is bound to, next to the HEAD: the reviewer
-            # copies it into the marker, so it is also given as a JSON string
-            # literal (a branch name may contain a double quote, which a raw
-            # substitution inside the marker's JSON would break).
+            # copies it into the marker, so it is also given as marker-safe
+            # JSON (a branch name may contain a double quote, which a raw
+            # substitution inside the marker's JSON would break, or a comment
+            # delimiter such as `-->`, which would end the marker early).
             "REVIEWED_BASE_REF": escape_inline(reviewed_base or "(none)"),
-            "REVIEWED_BASE_REF_JSON": json.dumps(reviewed_base or "(none)"),
+            "REVIEWED_BASE_REF_JSON": marker_json(reviewed_base or "(none)"),
             "FINDINGS": self._format_findings(s.open_findings),
             "MERGED_SINCE_EPIC_UPDATE": s.merged_since_epic_update,
             "LAST_REVIEW_RESULT": s.last_review_result or "(none)",
@@ -4006,16 +4008,18 @@ class ControllerEngine:
             return self._reject_replan(
                 txn, f"PR {source_ref.canonical} is not in {state.repository}"
             )
-        if not source.is_open or not source.head_sha or not source.head_ref:
-            # The branch is checkpointed alongside the HEAD and enforced by
-            # every later source comparison; an empty one would enforce
-            # nothing, so it is refused exactly like an unreadable HEAD.
+        if not source.is_open or not source.head_sha or not source.head_ref or not source.base_ref:
+            # The branch and the base are checkpointed alongside the HEAD and
+            # enforced by every later source comparison; an empty one would
+            # enforce nothing, so it is refused exactly like an unreadable
+            # HEAD.
             return self._reject_replan(
                 txn,
                 f"PR {source_ref.canonical} is {source.state or '(unknown)'} with HEAD "
                 f"{source.head_sha or '(unreadable)'} on branch "
-                f"{source.head_ref or '(unreadable)'}; only an OPEN PR at a readable HEAD and "
-                "branch can be superseded",
+                f"{source.head_ref or '(unreadable)'} against base "
+                f"{source.base_ref or '(unreadable)'}; only an OPEN PR at a readable HEAD, "
+                "branch and base can be superseded",
             )
         if not repo.default_branch:
             return self._reject_replan(
@@ -4070,6 +4074,7 @@ class ControllerEngine:
         txn.source_pr_url = source_ref.canonical
         txn.source_branch = state.current_branch or source.head_ref
         txn.source_head_sha = source.head_sha
+        txn.source_base_ref = source.base_ref
         txn.source_review_round = state.review_round
         txn.base_branch = repo.default_branch
         txn.evidence_finding_count = history.recorded_finding_count
@@ -4603,6 +4608,7 @@ class ControllerEngine:
                     "pr_url": txn.source_pr_url,
                     "branch": txn.source_branch,
                     "head_sha": txn.source_head_sha,
+                    "base_ref": txn.source_base_ref,
                     "review_round": txn.source_review_round,
                     "replacement_pr_url": txn.replacement_pr_url,
                     "reason": txn.escalation.get("trigger", "replan"),
@@ -5110,15 +5116,18 @@ class ControllerEngine:
                         "intervention is required"
                     )
                 # Only the decision is recorded here, together with the issue,
-                # the PR and the revision it was made on. The checkpoint and
-                # the transaction id are created by `_prepare_replan`, inside
-                # the REPLAN_REEXECUTE step that owns them.
+                # the PR, the revision it was made on and the base that
+                # revision was reviewed against (bound at REVIEW entry and
+                # verified non-empty above). The checkpoint and the
+                # transaction id are created by `_prepare_replan`, inside the
+                # REPLAN_REEXECUTE step that owns them.
                 state.replan_transaction = ReplanTransaction(
                     stage=ReplanStage.PENDING,
                     issue_url=decision_issue,
                     decision_pr_url=decision_pr,
                     decision_head_sha=expected_head,
                     decision_branch=state.current_branch,
+                    decision_base_ref=expected_base,
                     escalation=decision.metadata or {"trigger": decision.reason},
                 ).to_dict()
                 return Phase.REPLAN_REEXECUTE, (
