@@ -158,3 +158,56 @@ def test_agent_result_carries_capture_truncation_and_tail():
     assert got.stdout_truncated and got.stderr_truncated
     assert got.stdout_tail == "tail"
     assert got.stdout == "head\n[marker]\ntail"
+
+
+# -- allow-listed environment (#10) -------------------------------------------------
+def _capture_runner(seen):
+    def runner(req):
+        from autoforge.executor import ExecutionResult
+
+        seen.append(req)
+        return ExecutionResult(req.command, req.cwd, 0, "ok", "", "t", "t")
+
+    return runner
+
+
+def test_provider_passes_no_allowlist_through_when_the_request_has_none():
+    seen = []
+    prov = ClaudeCodeProvider(runner=_capture_runner(seen))
+    prov.execute(AgentRequest("FIX", "prompt", "/tmp", default_config().profile("fix"), 7))
+    assert seen[0].env_allowlist is None
+
+
+def test_provider_adds_its_own_environment_names_to_the_request_allowlist():
+    seen = []
+    prov = ClaudeCodeProvider(runner=_capture_runner(seen))
+    req = AgentRequest(
+        "FIX", "prompt", "/tmp", default_config().profile("fix"), 7, env_allowlist=("PATH", "HOME")
+    )
+    prov.execute(req)
+    assert seen[0].env_allowlist == ("PATH", "HOME", "ANTHROPIC_*", "CLAUDE_*")
+    assert prov.environment_allowlist(req) == seen[0].env_allowlist
+
+
+def test_provider_environment_names_are_deduplicated_not_repeated():
+    prov = OpenCodeProvider()
+    req = AgentRequest(
+        "FIX",
+        "p",
+        "/tmp",
+        default_config().profile("fix"),
+        7,
+        env_allowlist=("ANTHROPIC_*", "PATH", "PATH"),
+    )
+    got = prov.environment_allowlist(req)
+    assert got is not None and len(got) == len(set(got))
+    assert got[:2] == ("ANTHROPIC_*", "PATH") and "OPENCODE_*" in got and "OPENAI_*" in got
+
+
+def test_every_real_provider_declares_only_valid_environment_patterns():
+    from autoforge.executor import is_env_pattern
+
+    for cls in (ClaudeCodeProvider, OpenCodeProvider):
+        assert cls.environment_names, cls
+        assert all(is_env_pattern(n) for n in cls.environment_names), cls.environment_names
+    assert ScriptedProvider.environment_names == ()

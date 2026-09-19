@@ -587,13 +587,27 @@ def test_the_dry_run_plan_names_the_frozen_execution_directory(tmp_path):
     eng.close()
 
 
-def test_a_remote_run_is_still_launched_from_the_invocation_directory(tmp_path):
-    """REMOTE has no contract and GitHub as its source of truth: unchanged."""
-    from .conftest import make_engine
+def test_a_remote_run_launches_agents_in_a_controller_owned_worktree(tmp_path):
+    """REMOTE has no contract and GitHub as its source of truth; its agents run
+    in a per-issue worktree under the git common dir, not in the operator's
+    checkout (#10)."""
+    import subprocess
 
+    from .conftest import git_repo, make_engine
+
+    git_repo(tmp_path)
     eng = make_engine(tmp_path / ".autoforge")
     assert eng.mode.value == "REMOTE"
-    assert eng._execution_cwd() == eng.workdir
+    cwd = Path(eng._execution_cwd())
+    assert cwd == tmp_path / ".git" / "autoforge" / "worktrees" / "2"
+    assert cwd != Path(eng.workdir)
+    listed = subprocess.run(
+        ["git", "-C", str(tmp_path), "worktree", "list", "--porcelain"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert f"worktree {cwd.resolve()}" in listed
 
 
 # =============================================================================

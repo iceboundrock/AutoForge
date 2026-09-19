@@ -36,6 +36,7 @@ from pathlib import Path
 
 from . import __prompt_version__
 from .errors import ConfigurationError
+from .executor import is_env_pattern
 from .local_workspace import (
     DEFAULT_MAX_BYTES,
     DEFAULT_MAX_ENTRIES,
@@ -94,7 +95,68 @@ PROFILE_KEYS = (
     "options",
 )
 
-EXECUTION_KEYS = ("default_timeout_seconds", "max_correction_attempts")
+EXECUTION_KEYS = (
+    "default_timeout_seconds",
+    "max_correction_attempts",
+    "env_allowlist",
+    "env_allowlist_extra",
+    "worktree_dir",
+)
+
+# The environment an agent, a pre-merge verification command and a LOCAL
+# validation command start from: these variables of the operator's
+# environment and nothing else (see ``autoforge.executor.select_environment``).
+# What a coding agent needs to find its tools, its home configuration, its
+# locale and its temporary directory; what ``git`` needs to identify the
+# author and reach a remote; what ``gh`` needs to authenticate; and what an
+# HTTPS client needs behind a corporate proxy or a private CA. The API keys
+# a provider's own CLI reads are contributed by the provider adapter
+# (``AgentProvider.environment_names``), not listed here, so an OpenCode
+# launch never carries an Anthropic key it has no use for. A trailing ``*``
+# is a prefix. Anything else the operator's shell holds -- a cloud
+# credential, a database password, another project's token -- is not
+# inherited; ``env_allowlist_extra`` adds a name without restating this list.
+DEFAULT_ENV_ALLOWLIST: tuple[str, ...] = (
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TERM",
+    "TMPDIR",
+    "TZ",
+    "LANG",
+    "LANGUAGE",
+    "LC_*",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_STATE_HOME",
+    "XDG_RUNTIME_DIR",
+    "SSH_AUTH_SOCK",
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_CONFIG_GLOBAL",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_HOST",
+    "GH_CONFIG_DIR",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "NODE_EXTRA_CA_CERTS",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+)
 
 
 @dataclass
@@ -103,6 +165,20 @@ class ExecutionConfig:
     # How many times a *malformed CONTROL_RESULT* (exit 0) triggers a
     # correction prompt before the step fails. 0 disables correction.
     max_correction_attempts: int = 1
+    # The environment agents and repository-defined commands start from
+    # (``env_allowlist`` replaces the default list; ``env_allowlist_extra``
+    # adds to whichever list is in force). See ``DEFAULT_ENV_ALLOWLIST``.
+    env_allowlist: list[str] = field(default_factory=lambda: list(DEFAULT_ENV_ALLOWLIST))
+    env_allowlist_extra: list[str] = field(default_factory=list)
+    # Where a REMOTE run's per-issue agent worktrees are created. Empty (the
+    # default): ``<git common dir>/autoforge/worktrees``, outside every
+    # working tree of the checkout; otherwise a directory, relative to the
+    # controller's working directory, that holds one worktree per issue.
+    worktree_dir: str = ""
+
+    def environment_names(self) -> tuple[str, ...]:
+        """The allow-list in force: the base list plus the additions, deduplicated."""
+        return tuple(dict.fromkeys([*self.env_allowlist, *self.env_allowlist_extra]))
 
 
 # Paths whose contents define what the hosted checks actually run. See
@@ -740,6 +816,33 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
         base.execution.max_correction_attempts = _as_int(
             exe["max_correction_attempts"], source, "execution.max_correction_attempts"
         )
+    for key in ("env_allowlist", "env_allowlist_extra"):
+        if key in exe:
+            names = _as_str_list(exe[key], source, f"execution.{key}")
+            for name in names:
+                if not is_env_pattern(name):
+                    raise ConfigurationError(
+                        f"{source}: 'execution.{key}' entry {name!r} is not an environment "
+                        "variable name or a name prefix followed by '*'"
+                    )
+            setattr(base.execution, key, names)
+    if "env_allowlist" in exe and not base.execution.env_allowlist:
+        # An empty environment cannot even find the agent CLI on PATH; the
+        # operator who wants a narrower list writes the narrower list.
+        raise ConfigurationError(
+            f"{source}: 'execution.env_allowlist' must name at least one variable "
+            "(remove the key to keep the default list, or use env_allowlist_extra to add)"
+        )
+    if "worktree_dir" in exe:
+        raw_dir = exe["worktree_dir"]
+        if raw_dir is None or raw_dir == "":
+            base.execution.worktree_dir = ""
+        elif not isinstance(raw_dir, str) or not raw_dir.strip():
+            raise ConfigurationError(
+                f"{source}: 'execution.worktree_dir' must be a path or null, got {raw_dir!r}"
+            )
+        else:
+            base.execution.worktree_dir = raw_dir.strip()
     safety = _section(data, "safety", source, SAFETY_KEYS)
     if "allow_merge" in safety:
         base.safety.allow_merge = _as_bool(safety["allow_merge"], source, "safety.allow_merge")

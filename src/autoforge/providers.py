@@ -32,8 +32,13 @@ OpenCode (``opencode 1.18.x``)::
     ``--auto`` is opt-in via ``options.auto_approve: true``.
   * exit code 0 on success; 1 on unknown model / server error.
 
-Both CLIs are launched with cwd = repository root, stdin = /dev/null, and a
-hard timeout (see executor.py).
+Both CLIs are launched with cwd = the directory the engine chose (a
+per-issue worktree for a REMOTE run, the contract's repository root for a
+LOCAL one), stdin = /dev/null, a hard timeout, and an allow-listed
+environment (see executor.py): the engine passes the configured allow-list
+in :attr:`AgentRequest.env_allowlist` and each adapter adds the variables
+its own CLI reads (:attr:`AgentProvider.environment_names`), so the key of
+one provider is never handed to another.
 """
 
 from __future__ import annotations
@@ -57,6 +62,10 @@ class AgentRequest:
     timeout_seconds: int
     attempt: int = 1
     correction: bool = False
+    # The controller's environment allow-list (``execution.env_allowlist``
+    # plus ``env_allowlist_extra``); the provider adds its own names. ``None``
+    # inherits the whole environment and is never what the engine sends.
+    env_allowlist: tuple[str, ...] | None = None
 
 
 @dataclass
@@ -126,6 +135,10 @@ class AgentProvider:
     """Base adapter. Subclasses implement ``build_command_for``."""
 
     name = "base"
+    # The environment variables this provider's CLI reads for its own
+    # authentication and configuration, added to the request's allow-list.
+    # Names, never values: the executor selects them from the environment.
+    environment_names: tuple[str, ...] = ()
 
     def __init__(self, runner: Runner | None = None) -> None:
         self._runner: Runner = runner or execute
@@ -141,10 +154,21 @@ class AgentProvider:
     def build_command(self, req: AgentRequest) -> list[str]:
         return self.build_command_for(req.profile, req.prompt)
 
+    def environment_allowlist(self, req: AgentRequest) -> tuple[str, ...] | None:
+        """The allow-list the CLI is launched with: the request's plus this provider's."""
+        if req.env_allowlist is None:
+            return None
+        return tuple(dict.fromkeys([*req.env_allowlist, *self.environment_names]))
+
     def execute(self, req: AgentRequest) -> AgentExecutionResult:
         command = self.build_command(req)
         res = self._runner(
-            ExecutionRequest(command=command, cwd=req.cwd, timeout_seconds=req.timeout_seconds)
+            ExecutionRequest(
+                command=command,
+                cwd=req.cwd,
+                timeout_seconds=req.timeout_seconds,
+                env_allowlist=self.environment_allowlist(req),
+            )
         )
         return AgentExecutionResult.from_execution(res, req.profile)
 
@@ -155,6 +179,10 @@ CLAUDE_PERMISSION_MODES = ("acceptEdits", "auto", "bypassPermissions", "manual",
 
 class ClaudeCodeProvider(AgentProvider):
     name = "claude"
+    # ``ANTHROPIC_API_KEY`` / ``ANTHROPIC_AUTH_TOKEN`` and the base URL and
+    # model overrides the CLI reads; ``CLAUDE_CONFIG_DIR`` and the
+    # ``CLAUDE_CODE_*`` feature switches.
+    environment_names = ("ANTHROPIC_*", "CLAUDE_*")
 
     def validate_profile(self, profile: ProfileConfig) -> None:
         if profile.effort and profile.effort not in CLAUDE_EFFORTS:
@@ -196,6 +224,10 @@ class ClaudeCodeProvider(AgentProvider):
 
 class OpenCodeProvider(AgentProvider):
     name = "opencode"
+    # OpenCode's own settings plus the API keys of the model providers it
+    # routes to; a provider not listed here is added through
+    # ``execution.env_allowlist_extra``.
+    environment_names = ("OPENCODE_*", "OPENAI_*", "ANTHROPIC_*", "GEMINI_*", "GOOGLE_*")
 
     def validate_profile(self, profile: ProfileConfig) -> None:
         if "/" not in profile.model:

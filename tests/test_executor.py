@@ -425,3 +425,79 @@ def test_bounded_buffer_memory_is_the_limit_plus_a_constant():
 def test_non_positive_bound_is_refused():
     with pytest.raises(ExecutionError, match="max_output_bytes"):
         execute(ExecutionRequest(command=[PY, "-c", "pass"], max_output_bytes=0))
+
+
+# -- allow-listed environment (#10) -------------------------------------------------
+def test_select_environment_takes_exact_names_and_prefixes_only():
+    source = {
+        "PATH": "/bin",
+        "HOME": "/h",
+        "ANTHROPIC_API_KEY": "k",
+        "ANTHROPIC_BASE_URL": "u",
+        "ANTHROPICS": "not a prefix match",
+        "AWS_SECRET_ACCESS_KEY": "s",
+    }
+    got = executor.select_environment(["PATH", "ANTHROPIC_*", "MISSING"], source=source)
+    assert got == {"PATH": "/bin", "ANTHROPIC_API_KEY": "k", "ANTHROPIC_BASE_URL": "u"}
+    assert list(got) == ["PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"]  # source order
+    assert executor.select_environment([], source=source) == {}
+    only = executor.select_environment(["ANTHROPICS"], source=source)
+    assert only == {"ANTHROPICS": "not a prefix match"}
+
+
+@pytest.mark.parametrize("bad", ["", "*", "A*B", "A-B", "1ABC", "A B", "A**"])
+def test_select_environment_refuses_an_invalid_entry(bad):
+    assert not executor.is_env_pattern(bad)
+    with pytest.raises(ExecutionError, match="invalid environment allow-list entry"):
+        executor.select_environment(["PATH", bad], source={"PATH": "/bin"})
+
+
+def test_select_environment_defaults_to_this_process(monkeypatch):
+    monkeypatch.setenv("AUTOFORGE_TEST_ONLY_X", "1")
+    assert executor.select_environment(["AUTOFORGE_TEST_ONLY_*"]) == {"AUTOFORGE_TEST_ONLY_X": "1"}
+
+
+_DUMP_ENV = "import json, os; print(json.dumps(dict(os.environ)))"
+
+
+def _child_env(**kw) -> dict:
+    import json
+
+    res = execute(ExecutionRequest(command=[PY, "-c", _DUMP_ENV], timeout_seconds=30, **kw))
+    assert res.ok, res.stderr
+    return json.loads(res.stdout)
+
+
+def test_execute_without_an_allowlist_inherits_the_whole_environment(monkeypatch):
+    monkeypatch.setenv("AUTOFORGE_TEST_SECRET", "s3cret")
+    assert _child_env()["AUTOFORGE_TEST_SECRET"] == "s3cret"
+
+
+def test_execute_with_an_allowlist_starts_the_child_from_only_those_names(monkeypatch):
+    monkeypatch.setenv("AUTOFORGE_TEST_SECRET", "s3cret")
+    monkeypatch.setenv("AUTOFORGE_TEST_KEEP_A", "a")
+    monkeypatch.setenv("AUTOFORGE_TEST_KEEP_B", "b")
+    child = _child_env(env_allowlist=("PATH", "AUTOFORGE_TEST_KEEP_*"))
+    assert "AUTOFORGE_TEST_SECRET" not in child
+    assert child["AUTOFORGE_TEST_KEEP_A"] == "a" and child["AUTOFORGE_TEST_KEEP_B"] == "b"
+    assert set(child) <= {"PATH", "AUTOFORGE_TEST_KEEP_A", "AUTOFORGE_TEST_KEEP_B"} | _PYTHON_OWN
+    # An empty tuple is a real (empty) allow-list, not "inherit everything".
+    assert set(_child_env(env_allowlist=())) <= _PYTHON_OWN
+
+
+# Variables the interpreter itself may add to a child that started from nothing.
+_PYTHON_OWN = {"LC_CTYPE", "PYTHONIOENCODING", "__CF_USER_TEXT_ENCODING"}
+
+
+def test_execute_layers_explicit_env_over_the_allowlist(monkeypatch):
+    monkeypatch.setenv("AUTOFORGE_TEST_KEEP_A", "a")
+    child = _child_env(
+        env_allowlist=("AUTOFORGE_TEST_KEEP_A",),
+        env={"AUTOFORGE_TEST_KEEP_A": "override", "AUTOFORGE_TEST_ADDED": "x"},
+    )
+    assert child["AUTOFORGE_TEST_KEEP_A"] == "override" and child["AUTOFORGE_TEST_ADDED"] == "x"
+
+
+def test_execute_refuses_to_launch_on_an_invalid_allowlist_entry():
+    with pytest.raises(ExecutionError, match="invalid environment allow-list entry"):
+        execute(ExecutionRequest(command=[PY, "-c", "pass"], env_allowlist=("not valid",)))

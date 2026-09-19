@@ -43,7 +43,9 @@ whichever issue it links.
    `git branch -a`. If a branch or open PR for this issue already exists,
    continue that work instead of creating a duplicate (and give the PR the
    marker, as above).
-5. Create (or check out) the branch `{{BRANCH}}` from the default branch.
+5. Create (or check out) the branch `{{BRANCH}}` in this worktree, based on
+   the fetched default branch (`origin/<default branch>`), never on whatever
+   the worktree happened to have checked out.
 6. Implement the change, including tests. Run the relevant test suite and
    lint/typecheck commands the repository defines. Fix what you break.
 7. Commit with a clear message referencing `#{{ISSUE_NUMBER}}`, then push the

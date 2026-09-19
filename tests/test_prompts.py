@@ -235,7 +235,7 @@ def test_replan_prompt_forbids_agent_owned_close_and_local_cleanup():
         "The controller, not you, owns the previous PR's lifecycle",
         "Do not run `gh pr close` on the previous PR",
         "Do not run `gh pr comment`",
-        "Local branches and\nworktrees are operator-owned",
+        "Local branches and the other worktrees are operator-owned",
         "Do not run `git worktree add`",
         "Leave the old local branch alone and report it",
     ):
@@ -457,3 +457,18 @@ def test_common_prompts_state_the_whole_block_bound(engine, tmp_path):
     local = make_local_engine(root, "features/add-filter.md")
     rendered = local.render_prompt_for(Phase.ANALYZE_EXECUTE)
     assert f"at most\n  {MAX_CONTROL_RESULT_CHARS} characters" in rendered
+
+
+def test_common_prompt_states_the_worktree_and_environment_isolation():
+    """The agent is told where it runs and what it must never touch (#10)."""
+    common = prompts.load_template("common.md")
+    for phrase in (
+        "git worktree",
+        "operator",
+        "never run `git worktree add`",
+        "allow-listed",
+    ):
+        assert phrase in common, phrase
+    assert "{{AGENT_WORKTREE}}" not in common
+    for template in ("analyze_execute.md", "fix.md", "review.md"):
+        assert "in this worktree" in prompts.load_template(template), template
