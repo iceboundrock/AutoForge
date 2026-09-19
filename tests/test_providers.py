@@ -28,6 +28,22 @@ def test_claude_argv_shape():
     assert argv[-2:] == ["--", "do it; rm -rf /"]  # prompt is one literal element
 
 
+def test_claude_rejects_non_text_output_format():
+    # Regression: a claude profile with opencode's `output_format: default`
+    # must fail at config validation, not at runtime with
+    # `option '--output-format <format>' argument 'default' is invalid`.
+    for bad in ("default", "json", "stream-json"):
+        p = ProfileConfig(
+            name="x",
+            provider="claude",
+            model="fable",
+            effort="high",
+            options={"output_format": bad},
+        )
+        with pytest.raises(ConfigurationError, match="output_format"):
+            ClaudeCodeProvider().validate_profile(p)
+
+
 def test_claude_rejects_bad_effort_and_mode():
     p = ProfileConfig(name="x", provider="claude", model="fable", effort="ultra")
     with pytest.raises(ConfigurationError, match="effort"):

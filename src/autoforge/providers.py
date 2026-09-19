@@ -162,6 +162,13 @@ class ClaudeCodeProvider(AgentProvider):
                 f"profile {profile.name!r}: claude --effort must be one of {CLAUDE_EFFORTS}, "
                 f"got {profile.effort!r}"
             )
+        output_format = profile.options.get("output_format", "text") or "text"
+        if output_format != "text":
+            raise ConfigurationError(
+                f"profile {profile.name!r}: claude output_format must be 'text' so the "
+                f"CONTROL_RESULT block reaches stdout verbatim (got {output_format!r}; "
+                "the claude CLI accepts text|json|stream-json, but json event streams escape it)"
+            )
         mode = profile.options.get("permission_mode", "bypassPermissions")
         if mode and mode not in CLAUDE_PERMISSION_MODES:
             raise ConfigurationError(
