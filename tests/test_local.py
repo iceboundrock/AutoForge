@@ -945,6 +945,34 @@ def test_cli_local_status_redacts_the_block_reason(tmp_path, monkeypatch, capsys
     assert payload["replan_journal"] is None
 
 
+def test_cli_local_status_describes_a_journal_the_state_carries(tmp_path, monkeypatch, capsys):
+    """#67: a LOCAL run never writes a replan journal, but a state file that
+    has one anyway is described by the human summary exactly as `--json`
+    judges it, so the two outputs cannot disagree in either mode."""
+    root = local_repo(tmp_path)
+    monkeypatch.chdir(root)
+    eng = make_local_engine(root, "features/add-filter.md")
+    save_state(eng.state, eng.paths.state_file)
+    data = json.loads(eng.paths.state_file.read_text())
+    data["replan_transaction"] = {"stage": "pending", "pr_number_watermark": "12"}
+    eng.paths.state_file.write_text(json.dumps(data))
+    capsys.readouterr()
+    assert main(["status", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["replan_transaction"] == data["replan_transaction"]
+    assert payload["replan_journal"] == {
+        "readable": False,
+        "stage": "rejected",
+        "defects": ["pr_number_watermark must be an integer >= 0, got '12'"],
+    }
+    assert main(["status"]) == 0
+    out = capsys.readouterr().out
+    assert "AutoForge (local mode)" in out
+    assert "stage:       rejected" in out
+    for defect in payload["replan_journal"]["defects"]:
+        assert defect in out
+
+
 # -- GitHub isolation ---------------------------------------------------------------------------
 def test_a_local_run_makes_zero_gh_invocations(tmp_path):
     """No `gh` argv, and no GitHubClient is ever constructed."""

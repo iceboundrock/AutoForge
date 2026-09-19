@@ -7,7 +7,7 @@ import pytest
 
 from autoforge import cli
 from autoforge.engine import ControllerEngine
-from autoforge.errors import LockError
+from autoforge.errors import GitHubError, LockError
 from autoforge.executor import ExecutionResult
 from autoforge.locking import ControllerLock, repository_lock_path
 from autoforge.providers import ProviderRegistry, ScriptedProvider
@@ -229,8 +229,10 @@ def test_status_json_derives_the_replan_journal_beside_the_raw_one(
 def test_status_json_refuses_a_non_object_replan_journal_like_status_does(
     tmp_path, capsys, monkeypatch, fakes
 ):
-    """#67: a journal `from_dict` cannot even begin to read fails both output
-    modes at the boundary; --json does not emit a partial document."""
+    """#67: a journal that is not an object is refused at the state-load
+    boundary (`AutoForgeState.from_dict`), the one place `status` and
+    `status --json` share before either prints, so --json never emits a
+    partial document around it."""
     monkeypatch.chdir(tmp_path)
     sd = str(tmp_path / ".autoforge")
     assert (
@@ -296,6 +298,55 @@ def test_status_redacts_agent_controlled_state_in_every_output(
     assert "terminal phase BLOCKED" in captured.out
     # Output-only: the persisted evidence is not rewritten.
     assert state_file.read_text() == raw
+
+
+def test_run_terminal_line_redacts_a_block_reason_the_engine_persisted_raw(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """#6: the terminal line of `run` / `resume` is the CLI's own boundary,
+    not a courtesy of the engine: a `_block` reason that quotes `gh` output
+    reaches `state.json` as written, and only the printed line is redacted."""
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    assert (
+        cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"])
+        == 0
+    )
+    capsys.readouterr()
+    state_file = tmp_path / ".autoforge" / "state.json"
+    data = json.loads(state_file.read_text())
+    data["current_pr_url"] = PR
+    state_file.write_text(json.dumps(data))
+    fakes["gh"].get_pr_error = GitHubError(
+        f"HTTP 401: Bad credentials (Authorization: Bearer {FAKE_SECRET})"
+    )
+    assert cli.main(["--state-dir", sd, "resume"]) == 1
+    captured = capsys.readouterr()
+    assert FAKE_SECRET not in captured.out + captured.err
+    assert "is BLOCKED: state references PR" in captured.out
+    assert "Authorization: Bearer ***REDACTED***" in captured.out
+    # The engine wrote the reason as `gh` reported it; the CLI did the redacting.
+    persisted = json.loads(state_file.read_text())
+    assert persisted["phase"] == "BLOCKED" and FAKE_SECRET in persisted["block_reason"]
+
+
+def test_ready_banner_redacts_state_derived_fields(tmp_path, capsys, monkeypatch, fakes):
+    """#6: the READY_FOR_MERGE banner prints state too, so it crosses the same
+    boundary as `status`; a hand-edited URL field cannot echo a secret."""
+    monkeypatch.chdir(tmp_path)
+    _drive_to_ready(fakes)
+    sd = str(tmp_path / ".autoforge")
+    assert cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE]) == 0
+    capsys.readouterr()
+    state_file = tmp_path / ".autoforge" / "state.json"
+    data = json.loads(state_file.read_text())
+    assert data["phase"] == "READY_FOR_MERGE"
+    data["last_review_comment_url"] = f"{comment_url(PR, 100)}?token={FAKE_SECRET}"
+    state_file.write_text(json.dumps(data))
+    assert cli.main(["--state-dir", sd, "resume"]) == 0
+    out = capsys.readouterr().out
+    assert "AutoForge workflow reached READY_FOR_MERGE." in out
+    assert FAKE_SECRET not in out and "?token=***REDACTED***" in out
 
 
 def test_status_and_resume_refuse_an_in_flight_protocol_1_replan(

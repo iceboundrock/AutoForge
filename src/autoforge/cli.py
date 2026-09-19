@@ -560,19 +560,16 @@ def _resume_holding_state(
 def _load_replan_journal(state: AutoForgeState) -> ReplanTransaction | None:
     """Read the persisted replan journal the way the engine reads it.
 
-    ``None`` when the run has no journal. A journal whose *fields* cannot be
+    ``None`` when the run has no journal. A journal whose fields cannot be
     read comes back ``REJECTED`` with ``journal_defects`` naming them, for
-    status to describe. One that is not a JSON object at all is the same loud
-    boundary failure ``load()`` gives an unreadable state file (exit 2, no
-    traceback), raised before either output mode prints anything, so
-    ``--json`` never emits a partial document around it.
+    status to describe rather than die on. The one shape ``from_dict``
+    refuses outright -- a journal that is not a JSON object -- never reaches
+    here: ``AutoForgeState.from_dict`` rejects it, so ``load()`` fails both
+    output modes at the state boundary (exit 2) before anything is printed.
     """
     if not state.replan_transaction:
         return None
-    try:
-        return ReplanTransaction.from_dict(state.replan_transaction)
-    except ValueError as exc:
-        raise StateError(f"state field 'replan_transaction' is unusable: {exc}") from None
+    return ReplanTransaction.from_dict(state.replan_transaction)
 
 
 def _replan_journal_summary(txn: ReplanTransaction | None) -> dict | None:
@@ -600,8 +597,8 @@ def cmd_status(args) -> int:
     if not args.state_dir:
         _bind_existing_run(engine)
     state = engine.load()  # StateError when missing/corrupt
-    # Read the journal before printing anything, so an unusable one fails
-    # both output modes the same way instead of leaving a partial document.
+    # One load of the journal feeds every output mode, so what `--json`
+    # derives and what the human summary prints cannot disagree.
     txn = _load_replan_journal(state)
     # Everything status shows is state-derived, and state carries text the
     # agents controlled (`block_reason`, findings, a hand-edited journal), so
@@ -614,10 +611,36 @@ def cmd_status(args) -> int:
         print(json.dumps(redact_dict(document), indent=2, sort_keys=True))
         return 0
     if state.mode == WorkflowMode.LOCAL:
-        print(redact(_render_local_status(state)))
+        print(redact(_render_local_status(state, txn)))
         return 0
     print(redact(_render_status(state, txn)))
     return 0
+
+
+def _render_replan_journal(txn: ReplanTransaction | None) -> list[str]:
+    """The human lines for a persisted replan journal; none without one.
+
+    Shared by both modes so a journal a state carries is described the same
+    way wherever it is found -- a LOCAL run never writes one, but a state
+    file that has one anyway is shown, not silently skipped, and the human
+    output then agrees with ``replan_journal`` in ``--json``.
+    """
+    if txn is None:
+        return []
+    lines = [
+        f"Replan transaction: {txn.transaction_id or '(not yet created)'}",
+        f"  stage:       {txn.stage.value}",
+    ]
+    if txn.journal_defects:
+        lines.append(f"  journal:     CORRUPT ({'; '.join(txn.journal_defects)})")
+    lines += [
+        f"  source PR:   {txn.source_pr_url or '-'}",
+        f"  replacement: {txn.replacement_pr_url or '-'}",
+        f"  escalation:  {json.dumps(txn.escalation, sort_keys=True)}",
+    ]
+    if txn.rejection_reason:
+        lines.append(f"  rejected:    {txn.rejection_reason}")
+    return lines
 
 
 def _render_status(state: AutoForgeState, txn: ReplanTransaction | None) -> str:
@@ -653,16 +676,7 @@ def _render_status(state: AutoForgeState, txn: ReplanTransaction | None) -> str:
         lines.append("Superseded PRs:")
         for item in state.superseded_prs:
             lines.append(f"  {item.get('pr_url', '-')} -> {item.get('replacement_pr_url', '-')}")
-    if txn is not None:
-        lines.append(f"Replan transaction: {txn.transaction_id or '(not yet created)'}")
-        lines.append(f"  stage:       {txn.stage.value}")
-        if txn.journal_defects:
-            lines.append(f"  journal:     CORRUPT ({'; '.join(txn.journal_defects)})")
-        lines.append(f"  source PR:   {txn.source_pr_url or '-'}")
-        lines.append(f"  replacement: {txn.replacement_pr_url or '-'}")
-        lines.append(f"  escalation:  {json.dumps(txn.escalation, sort_keys=True)}")
-        if txn.rejection_reason:
-            lines.append(f"  rejected:    {txn.rejection_reason}")
+    lines += _render_replan_journal(txn)
     if state.block_reason:
         lines.append(f"Reason:     {state.block_reason}")
     lines += [
@@ -676,11 +690,12 @@ def _render_status(state: AutoForgeState, txn: ReplanTransaction | None) -> str:
     return "\n".join(lines)
 
 
-def _render_local_status(state: AutoForgeState) -> str:
+def _render_local_status(state: AutoForgeState, txn: ReplanTransaction | None) -> str:
     """Human status for a LOCAL run (unredacted; the caller redacts).
 
     Deliberately omits Issue/PR/branch/merge fields: a local run has none, and
     printing empty ones would suggest the GitHub lifecycle is merely stalled.
+    A replan journal is shown only when the state carries one.
     """
     fix_budget = state.local_fix_rounds
 
@@ -715,6 +730,7 @@ def _render_local_status(state: AutoForgeState) -> str:
             lines.append(f"  {path}")
         if len(state.baseline_dirty_paths) > 20:
             lines.append(f"  ... and {len(state.baseline_dirty_paths) - 20} more")
+    lines += _render_replan_journal(txn)
     if state.block_reason:
         lines.append(f"Reason:     {state.block_reason}")
     lines += [
@@ -729,22 +745,30 @@ def _render_local_status(state: AutoForgeState) -> str:
 
 # -- pretty printing ----------------------------------------------------------
 def print_ready_banner(state: AutoForgeState, gate_open: bool = False) -> None:
-    print()
-    print("=" * 72)
-    print("AutoForge workflow reached READY_FOR_MERGE.")
-    print(f"  Issue:         {state.current_issue_url}")
-    print(f"  PR:            {state.current_pr_url}")
-    print(f"  Review round:  {state.review_round}")
-    print(f"  Reviewed HEAD: {state.reviewed_head_sha}")
-    print(f"  Reviewed base: {state.reviewed_base_ref or '-'}")
-    print(f"  Review:        {state.last_review_comment_url or '-'}")
+    lines = [
+        "",
+        "=" * 72,
+        "AutoForge workflow reached READY_FOR_MERGE.",
+        f"  Issue:         {state.current_issue_url}",
+        f"  PR:            {state.current_pr_url}",
+        f"  Review round:  {state.review_round}",
+        f"  Reviewed HEAD: {state.reviewed_head_sha}",
+        f"  Reviewed base: {state.reviewed_base_ref or '-'}",
+        f"  Review:        {state.last_review_comment_url or '-'}",
+    ]
     if gate_open:
-        print("Merge gate is open but the step budget (--max-steps) ran out before MERGE.")
-        print("'resume --allow-merge' continues with the controller-side pre-merge verification.")
+        lines += [
+            "Merge gate is open but the step budget (--max-steps) ran out before MERGE.",
+            "'resume --allow-merge' continues with the controller-side pre-merge verification.",
+        ]
     else:
-        print("Automatic merge is disabled in this milestone.")
-        print("A human must review and merge the PR.")
-    print("=" * 72)
+        lines += [
+            "Automatic merge is disabled in this milestone.",
+            "A human must review and merge the PR.",
+        ]
+    lines.append("=" * 72)
+    # State-derived like the status output: the same redaction boundary.
+    print(redact("\n".join(lines)))
 
 
 def print_plan(plan: StepPlan, full_prompt: bool = False) -> None:

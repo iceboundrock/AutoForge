@@ -1769,9 +1769,8 @@ class ControllerEngine:
         status = payload.get("status")
         if status in ("failure", "blocked"):
             nxt = Phase.FAILED if status == "failure" else Phase.BLOCKED
-            # The message is agent-supplied text; `state.json` is stored in the
-            # clear and the CLI prints this verbatim, so it passes the same
-            # redaction boundary as the run log.
+            # Agent-supplied text, persisted in a plain `state.json` and
+            # printed by the CLI: same redaction boundary as the run log.
             message = redact(str(payload.get("message", "") or f"agent reported {status}"))
             state.phase = nxt
             state.block_reason = message

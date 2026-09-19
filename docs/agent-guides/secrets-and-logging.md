@@ -41,11 +41,12 @@ Do not log the entire process environment.
 Persisted state is not a redaction boundary of its own: the engine redacts
 agent text before it writes `block_reason`, findings and resolutions, but
 `state.json` can also be hand-edited or written by an older controller, and a
-journal defect quotes the value it could not read. So anything the CLI prints
-*from* state (`status`, `status --json`, the terminal-phase line of `resume`)
-crosses `redact` / `redact_dict` on the way out, in one pass over the whole
-rendered text or document rather than per field, so a new state field is
-covered by construction. The file on disk is never rewritten by that pass.
+journal defect quotes the value it could not read, and a `BLOCKED` reason
+can quote `gh` output. So anything the CLI prints *from* state (`status`,
+`status --json`, the terminal line of `run` / `resume`, the `READY_FOR_MERGE`
+banner) crosses `redact` / `redact_dict` on the way out, in one pass over the
+whole rendered text or document rather than per field, so a new state field
+is covered by construction. The file on disk is never rewritten by that pass.
 
 `stdout.log` and `stderr.log` hold what the executor captured, which is
 bounded (`executor.DEFAULT_MAX_OUTPUT_BYTES` per stream): past the bound the
