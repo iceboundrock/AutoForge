@@ -4641,7 +4641,12 @@ class ControllerEngine:
         agent sees as ``CURRENT_ROADMAP_SECTION`` and re-composes. A body
         whose markers cannot be read unambiguously blocks before anyone is
         launched: the controller would not know which part of the operator's
-        document is its own.
+        document is its own. So does a body that cannot be read at all for a
+        conclusive reason (authentication, permissions, the EPIC gone,
+        malformed data): asking GitHub again would not help, and an agent
+        launched without the body would compose a section the controller
+        could never splice. Only an *unavailable* GitHub propagates, as the
+        transient failure it is.
         """
         state = self._require_state()
         self._existing_progress_comment_url = ""
@@ -4669,6 +4674,18 @@ class ControllerEngine:
             self._existing_progress_comment_url = holder.obj.url
         try:
             self._epic_roadmap_at_entry = self._read_epic_roadmap()
+        except GitHubUnavailableError:
+            raise
+        except GitHubError as exc:
+            return self._block(
+                Phase.UPDATE_EPIC,
+                plan,
+                f"the body of EPIC {state.epic_url} could not be read: {exc}. This is not a "
+                "transient GitHub failure (authentication, permissions, or malformed data), "
+                "so the controller will not launch an agent whose roadmap section it could "
+                "not splice into a body it has not read; nothing was written. Fix the cause, "
+                "then 'resume'",
+            )
         except RoadmapError as exc:
             return self._block(
                 Phase.UPDATE_EPIC,

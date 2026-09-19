@@ -242,7 +242,11 @@ roadmap update as `MERGED_PRS_SINCE_EPIC_UPDATE`, and whether an update is
 due as `ROADMAP_UPDATE_DUE`. A body whose markers are ambiguous (a marker
 repeated, an end before a start, one without the other) is `BLOCKED` without
 launching the agent: the controller edits only the text between the markers
-and never guesses which text that is.
+and never guesses which text that is. So is a body that cannot be read for a
+conclusive reason (authentication, permissions, the EPIC gone, malformed
+data): an agent launched without the body would compose a section the
+controller could never splice. Only `GitHubUnavailableError` propagates, so
+`resume` retries the read.
 
 ### After UPDATE_EPIC
 

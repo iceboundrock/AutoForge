@@ -16,6 +16,7 @@ from autoforge.errors import (
     ExecutionError,
     ExecutionTimeoutError,
     GitHubError,
+    GitHubNotFoundError,
     GitHubUnavailableError,
     StateError,
     StateTransitionError,
@@ -4292,6 +4293,52 @@ def test_update_epic_entry_blocks_on_ambiguous_markers_without_invoking(tmp_stat
     assert "will not guess" in s.block_reason
     assert s.merged_since_epic_update == 1 and fake_github.edited_issues == []
     assert fake_github.issues[EPIC].body == body
+
+
+def test_update_epic_entry_blocks_on_a_conclusive_failure_reading_the_body(
+    tmp_state_dir, fake_github
+):
+    """R1-F1 of PR #105: the entry's EPIC body read fails conclusively.
+    Fail closed like the progress-comment read beside it: durable BLOCKED,
+    no agent launched, nothing written, the merge counter kept."""
+    fake_github.get_issue_errors[EPIC] = GitHubError("`gh issue view` failed (exit 1): HTTP 403")
+    eng = _in_update_epic_with_body(tmp_state_dir, fake_github, ["never"], _epic_body())
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and eng.provider.calls == []
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.BLOCKED
+    assert f"the body of EPIC {EPIC} could not be read" in s.block_reason
+    assert "HTTP 403" in s.block_reason and "not a transient GitHub failure" in s.block_reason
+    assert s.current_issue_url == ISSUE and s.merged_since_epic_update == 1
+    assert fake_github.edited_issues == [] and fake_github.comments.get(EPIC, []) == []
+
+
+def test_update_epic_entry_blocks_when_the_epic_is_gone(tmp_state_dir, fake_github):
+    """A missing EPIC is a conclusive read failure, not a transient one."""
+    fake_github.get_issue_errors[EPIC] = GitHubNotFoundError("issue not found")
+    eng = _in_update_epic_with_body(tmp_state_dir, fake_github, ["never"], _epic_body())
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and eng.provider.calls == []
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.BLOCKED and "issue not found" in s.block_reason
+    assert s.merged_since_epic_update == 1 and fake_github.edited_issues == []
+
+
+def test_update_epic_entry_transient_failure_reading_the_body_propagates(
+    tmp_state_dir, fake_github
+):
+    """GitHub unavailable while reading the body: the entry is retried by
+    'resume', not blocked, and the phase, counter and attempt are untouched."""
+    fake_github.get_issue_errors[EPIC] = GitHubUnavailableError("gh: HTTP 502")
+    eng = _in_update_epic_with_body(tmp_state_dir, fake_github, [_epic_result(None)], _epic_body())
+    with pytest.raises(GitHubUnavailableError):
+        eng.step()
+    assert eng.provider.calls == []
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.UPDATE_EPIC and s.merged_since_epic_update == 1 and s.attempt == 0
+    del fake_github.get_issue_errors[EPIC]
+    assert eng.step().next_phase == "DONE"
+    assert load_state(eng.paths.state_file).merged_since_epic_update == 0
 
 
 def test_update_epic_conclusive_failure_writing_the_body_blocks(tmp_state_dir, fake_github):
