@@ -113,6 +113,11 @@ def test_review_prompt_contract():
         "{{EXISTING_FOLLOW_UP_ISSUES}}",
         "is not a finding of this round either",
         "Raise it as a finding only when the deferral is wrong",
+        # #14 item 2: a stale round's findings are carried to the next round
+        # to re-check, never dropped; each is re-raised or accounted for.
+        "{{PRIOR_FINDINGS}}",
+        "## Prior findings to re-check",
+        "Never drop a prior finding silently",
     ):
         assert phrase in text, phrase
 

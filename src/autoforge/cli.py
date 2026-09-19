@@ -683,6 +683,7 @@ def _render_status(state: AutoForgeState, txn: ReplanTransaction | None) -> str:
         f"Last review:   {state.last_review_result or '-'}",
         f"Review comment: {state.last_review_comment_url or '-'}",
         f"Open findings: {len(state.open_findings)}",
+        f"Prior findings to re-check: {len(state.prior_findings)}",
     ]
     if state.superseded_prs:
         lines.append("Superseded PRs:")

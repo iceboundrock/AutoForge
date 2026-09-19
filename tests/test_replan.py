@@ -516,6 +516,7 @@ def test_hard_threshold_replaces_pr_and_starts_fresh_review(tmp_state_dir):
     assert gh.merges == []  # a replan closes; it never merges anything
     assert state.review_round == 0  # next REVIEW is round 1 under persisted semantics
     assert state.review_history == [] and state.open_findings == []
+    assert state.prior_findings == []  # nothing carried from the superseded PR
     assert state.execution_attempt == 2 and state.escalation_count == 1
     assert state.replan_transaction == {}  # the transaction is retired on activation
     superseded = state.superseded_prs[0]

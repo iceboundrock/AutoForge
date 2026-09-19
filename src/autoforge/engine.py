@@ -915,6 +915,23 @@ class ControllerEngine:
             lines.append("  Required resolution: " + resolution.replace("\n", "\n    "))
         return fenced_untrusted_block("\n".join(lines), "text")
 
+    def _format_prior_findings(self) -> str:
+        """The findings carried from a stale review, for the next REVIEW prompt.
+
+        The provenance line is controller data (the round, the HEAD it was
+        bound to and the comment the round was verified to have posted); the
+        findings themselves are reviewer output and go through the same
+        untrusted block as the FIX prompt's findings.
+        """
+        s = self._require_state()
+        if not s.prior_findings:
+            return "(none)"
+        return (
+            f"Review round {s.review_round} at HEAD `{s.reviewed_head_sha}` "
+            f"({s.last_review_comment_url or 'comment URL not recorded'}) reported these "
+            "findings, and no FIX round resolved them:\n" + self._format_findings(s.prior_findings)
+        )
+
     def _validation_commands_text(self) -> str:
         cmds = self.local_contract().validation_commands
         if not cmds:
@@ -1025,6 +1042,7 @@ class ControllerEngine:
             "REVIEWED_BASE_REF": escape_inline(reviewed_base or "(none)"),
             "REVIEWED_BASE_REF_JSON": marker_json(reviewed_base or "(none)"),
             "FINDINGS": self._format_findings(s.open_findings),
+            "PRIOR_FINDINGS": self._format_prior_findings(),
             "MERGED_SINCE_EPIC_UPDATE": s.merged_since_epic_update,
             "LAST_REVIEW_RESULT": s.last_review_result or "(none)",
             "NEXT_ISSUE_REJECTION": (
@@ -2973,10 +2991,14 @@ class ControllerEngine:
         """The OPEN PR's revision (HEAD or base) is no longer the reviewed one.
 
         The last review is stale: persists the PR's current HEAD and base,
-        marks the review stale, drops its findings and routes back to REVIEW
-        (``phase -> REVIEW``), where the next round is bound to the actual
-        revision. Nothing has been merged or counted. ``message`` replaces
-        the default merge-path wording.
+        marks the review stale and routes back to REVIEW (``phase ->
+        REVIEW``), where the next round is bound to the actual revision. The
+        review's open findings, if any (the FIX entry case), stop being open
+        -- no fixer resolves findings of a commit that is no longer the PR --
+        and become the findings that review is told to re-check
+        (``prior_findings``), so an unrecorded push never makes a finding
+        disappear unexamined. Nothing has been merged or counted.
+        ``message`` replaces the default merge-path wording.
         """
         state = self._require_state()
         if pr.base_ref and pr.base_ref != state.reviewed_base_ref:
@@ -2987,7 +3009,14 @@ class ControllerEngine:
         if pr.base_ref:
             state.current_base_ref = pr.base_ref
         state.last_review_result = "stale"
+        state.prior_findings = state.open_findings
         state.open_findings = []
+        carried = (
+            f"; the {len(state.prior_findings)} finding(s) of round {state.review_round} are "
+            "carried to that review to re-check"
+            if state.prior_findings
+            else ""
+        )
         validate_transition(phase, Phase.REVIEW)
         state.phase = Phase.REVIEW
         state.attempt = 0
@@ -2995,8 +3024,11 @@ class ControllerEngine:
         return self._outcome(
             phase,
             plan=plan,
-            message=message
-            or (f"{what} after the clean review{detail}; {phase.value} -> REVIEW (not merged)"),
+            message=(
+                message
+                or (f"{what} after the clean review{detail}; {phase.value} -> REVIEW (not merged)")
+            )
+            + carried,
         )
 
     @staticmethod
@@ -4631,6 +4663,7 @@ class ControllerEngine:
         state.review_round = 0
         state.review_history = []
         state.open_findings = []
+        state.prior_findings = []
         state.last_fix_resolutions = []
         state.last_review_comment_url = ""
         state.last_review_result = ""
@@ -4945,6 +4978,7 @@ class ControllerEngine:
         state.current_branch = pr.head_ref or res.branch
         state.review_round = 0
         state.open_findings = []
+        state.prior_findings = []
         state.review_history = []
         state.last_review_result = ""
         state.reviewed_pr_url = ""
@@ -5065,11 +5099,28 @@ class ControllerEngine:
             state.current_base_ref = latest.base_ref
             state.last_review_result = "stale"
             state.open_findings = []
+            # The round is consumed (it is a completed review, and consuming
+            # it keeps the cap in force however often the revision moves),
+            # but its findings are not lost: no fixer will resolve them, so
+            # the next review is told to re-check them at the actual HEAD.
+            # The stale round's verdict replaces any earlier carry, because
+            # that reviewer was shown the earlier findings and re-raised
+            # the ones that still applied.
+            state.prior_findings = findings
             self._record_review(res.round, expected_head, RESULT_STALE, findings)
+            carried = (
+                f"; its {len(findings)} finding(s) are carried to that review to re-check"
+                if findings
+                else ""
+            )
             return Phase.REVIEW, (
                 f"review round {res.round} completed for {expected_head[:12]} but {moved} "
-                "during the review; re-reviewing the latest revision"
+                f"during the review; re-reviewing the latest revision{carried}"
             )
+        # A completed round of the actual revision decides about the carried
+        # findings: the reviewer was shown them and re-raised, under this
+        # round's ids, the ones that still apply.
+        state.prior_findings = []
         if res.needs_fix_round:
             state.last_review_result = "needs_fix"
             state.open_findings = findings

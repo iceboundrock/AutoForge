@@ -110,6 +110,11 @@ def test_load_rejects_non_list_next_issue_rejections(tmp_path):
         ("open_findings", [{"id": 1}]),
         ("open_findings", [{"id": "R1-F1\n"}]),
         ("open_findings", [{"id": "F1"}]),
+        ("prior_findings", [1]),
+        ("prior_findings", [{"classification": "nit"}]),
+        ("prior_findings", [{"id": 1}]),
+        ("prior_findings", [{"id": "R1-F1\n"}]),
+        ("prior_findings", [{"id": "F1"}]),
         ("last_fix_resolutions", [1]),
         ("next_issue_rejections", [1]),
         ("superseded_prs", [1]),
@@ -133,6 +138,22 @@ def test_state_without_next_issue_rejections_loads_with_empty_list(tmp_path):
     del d["next_issue_rejections"]
     p.write_text(json.dumps(d), encoding="utf-8")
     assert load_state(p).next_issue_rejections == []
+
+
+def test_state_without_prior_findings_loads_with_empty_list(tmp_path):
+    """A protocol-3 file written before the carry existed has nothing to
+    re-check; it loads with the old behaviour, not as corruption."""
+    p = tmp_path / "state.json"
+    d = make_state().to_dict()
+    del d["prior_findings"]
+    p.write_text(json.dumps(d), encoding="utf-8")
+    assert load_state(p).prior_findings == []
+
+
+def test_reset_for_new_issue_clears_the_carried_findings():
+    s = make_state(prior_findings=[{"id": "R1-F1", "required_resolution": "x"}])
+    s.reset_for_new_issue("https://github.com/owner/repo/issues/3")
+    assert s.prior_findings == [] and s.open_findings == []
 
 
 def test_reset_for_new_issue_clears_next_issue_rejections():

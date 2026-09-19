@@ -117,6 +117,7 @@ workflow:
 - The step budget is measured on the persisted cumulative `step_count`, which is never reset by `resume` or by switching issues. CLI `--max-steps` bounds a single invocation only. It is checked before a step executes, with one exception: a `REPLAN_REEXECUTE` journal past the destructive write (`SUPERSEDE_INTENT`, `COMPENSATING`, `SUPERSEDED`) is finished first. There the persisted intent is a decision the controller has committed to, the remaining work is read-verify-activate or read-verify-reopen, no agent is invoked and nothing is closed from a resume; blocking with the plain budget text would leave a source PR the controller closed with nothing in the run's state saying so, and `resume` refuses `BLOCKED`, so raising the budget could not repair it. The finishing step still counts, so the budget ends the run at the next phase boundary. Stages before the write (`PENDING`, `PREPARED`, `VERIFIED`) block as any other phase does: nothing was closed, so blocking costs nothing and the step does not count. A journal the reducer will refuse anyway (`REJECTED`, or one that cannot be read whole and so cannot prove it is before the write) is handed to the reducer too, whose refusal names the transaction and the source PR's fate. The partition is `replan_txn.budget_may_stop`; dry-run plan notes describe the same outcome. A step is charged when it first persists: the launch checkpoint of an agent step, or the resolution of a step that needs no agent. An entry read that fails transiently (`GitHubUnavailableError`) before either persists nothing -- the count, the phase and any journal are byte-identical on disk -- so it is not a step and is not charged, in every phase alike; the operator's next `resume` re-reads with the same budget. The exemption inherits this rule: a GitHub outage while finishing a post-write journal defers the finish to the next `resume` and never repeats or extends it (no agent, no write), and the finish is counted once when it lands.
 - Failed invocations consume neither a review round nor a `review_history` entry.
 - A `FIX` entry that finds the PR HEAD past the reviewed HEAD goes back to `REVIEW` without launching the fixer (see **Re-entering a phase** below). That review of the actual HEAD is an ordinary round: it counts against the cap, and if it reports the same findings as the previous round it counts towards stagnation like any other repeated round. This is intended: the loop guard measures whether the PR is converging, and an unrecorded push that resolved nothing is not progress.
+- A stale round (the HEAD or base moved while the reviewer worked) is a completed round too: it is consumed, recorded in `review_history` and breaks the stagnation streak, but its findings are not discarded (see **Stale rounds keep their findings** below). Consuming the round is what keeps the cap in force however often the revision moves; a round that was not consumed could be repeated without bound by pushes alone.
 - Hitting any bound is `BLOCKED` (terminal). The open findings and the PR stay for a human; nothing is merged.
 
 ---
@@ -189,7 +190,38 @@ The same rule covers a review with findings. The open findings are bound to
 commit that is no longer the PR. Which of them the push resolved is not
 knowable from controller state and is never inferred, so `FIX` is entered
 only while `current_pr_head_sha == reviewed_head_sha`; otherwise the review
-is marked stale and the actual HEAD is reviewed (`FIX -> REVIEW`).
+is marked stale and the actual HEAD is reviewed (`FIX -> REVIEW`), with the
+findings carried to it as prior findings to re-check.
+
+### Stale rounds keep their findings
+
+A round goes stale in two places: the post-review read finds the HEAD or
+base moved while the reviewer worked (`REVIEW -> REVIEW`), or the `FIX`
+entry finds the HEAD past the reviewed one (`FIX -> REVIEW`). In both, a
+verified review reported findings that no fixer ever resolved, and the
+controller cannot tell which of them the newer commits resolved. Dropping
+them would let the next reviewer, a different profile with no memory of
+the round, return a clean verdict on a PR that never received a FIX for
+them (#14). So the round is consumed, but its findings move from
+`open_findings` (which a fixer must resolve, bound to `reviewed_head_sha`)
+to `prior_findings`, which no fixer is launched against and which the next
+`REVIEW` entry renders into the prompt (`PRIOR_FINDINGS`, with the round,
+HEAD and comment URL they came from) as findings to re-check at the actual
+HEAD. The reviewer is told to re-raise each one that still applies under
+this round's ids and to account for each one that no longer does under
+Observations; whether it did is a semantic judgement the controller does
+not verify, the same as any other finding the reviewer chooses to raise or
+not.
+
+The carry is replaced, never accumulated: a later stale round's findings
+replace the earlier ones (that reviewer was shown them and re-raised the
+ones that still applied; a stale clean round therefore leaves none), and
+the next completed round of the actual revision, clean or with findings,
+clears them. Like `open_findings` they are per PR: a replacement PR and a
+new issue start with none. The alternative, not consuming a stale round,
+was rejected: it would relaunch the same round profile against a PR that
+may move again, and it would let pushes alone repeat a round without the
+cap ever counting it.
 
 ### Re-entering a phase
 
@@ -248,9 +280,11 @@ next entry could not find again.
   them to the reviewer (`EXISTING_FOLLOW_UP_ISSUES`), so a problem an
   earlier round deferred is not raised again under this round's ids.
 - `FIX` re-reads the PR HEAD. Past the reviewed HEAD: `FIX -> REVIEW` of the
-  actual HEAD, no fixer launched (the rule above); a fixer whose push landed
+  actual HEAD, no fixer launched (the rule above), the open findings carried
+  to that review as prior findings to re-check; a fixer whose push landed
   but whose result was never recorded is therefore never relaunched against
-  findings its push may have resolved. Equal to it: the repository's open
+  findings its push may have resolved, and the findings its push did not
+  resolve are not lost either. Equal to it: the repository's open
   issues are listed for the `ai-follow-up` marker of (this PR, an open
   finding), because a `follow_up_created` resolution creates an issue and
   moves no HEAD. One per finding is handed to the fixer (`FOLLOW_UP_ISSUES`)

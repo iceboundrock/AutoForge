@@ -74,6 +74,29 @@ def utcnow_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _validate_findings_field(name: str, findings: object) -> None:
+    """Refuse a persisted findings list (open or prior) that is not one.
+
+    A persisted finding's id is rendered into controller syntax (the
+    follow-up marker of the FIX prompt, the prior-findings block of the
+    REVIEW prompt), so the id is held to the parser's rule on load rather
+    than crashing the renderer.
+    """
+    if not isinstance(findings, list) or not all(isinstance(f, dict) for f in findings):
+        raise StateError(f"state field {name!r} must be a list of objects")
+    for finding in findings:
+        fid = finding.get("id")
+        if (
+            not isinstance(fid, str)
+            or len(fid) > MAX_FINDING_ID_CHARS
+            or FINDING_ID_RE.match(fid) is None
+        ):
+            raise StateError(
+                f"state field {name!r} holds an entry whose 'id' is not a finding id "
+                "of the form R<round>-F<n>"
+            )
+
+
 def _validate_local_pending(state: AutoForgeState) -> None:
     """Check the LOCAL pending-invocation checkpoint is internally consistent.
 
@@ -250,6 +273,17 @@ class AutoForgeState:
     # Findings from the last review that still require a FIX round
     # (each: {"id","classification","required_resolution",...}).
     open_findings: list[dict] = field(default_factory=list)
+    # Findings of the latest review of this PR that no FIX round resolved
+    # because the PR's revision moved out from under them: the round went
+    # stale while the reviewer worked, or the HEAD was already past the
+    # reviewed one when FIX was entered. Same shape as `open_findings`, but
+    # no fixer is asked to resolve them; they are handed to the next REVIEW
+    # as findings to re-check at the actual HEAD (`PRIOR_FINDINGS`). When
+    # non-empty they are the findings of round `review_round` at
+    # `reviewed_head_sha`, published in `last_review_comment_url`. Replaced
+    # by every later stale round (a stale clean round leaves none), cleared
+    # by the next completed round of the actual revision, and per PR.
+    prior_findings: list[dict] = field(default_factory=list)
     # Resolutions reported by the last FIX round (verified by the controller).
     last_fix_resolutions: list[dict] = field(default_factory=list)
     # One entry per completed review round of the current PR (see
@@ -556,24 +590,8 @@ class AutoForgeState:
             raise StateError(
                 "state field 'premerge_verified_commands' must be a list of string lists"
             )
-        if not isinstance(state.open_findings, list) or not all(
-            isinstance(finding, dict) for finding in state.open_findings
-        ):
-            raise StateError("state field 'open_findings' must be a list of objects")
-        for finding in state.open_findings:
-            # An open finding's id is rendered into controller syntax (the
-            # follow-up marker of the FIX prompt), so the persisted id is held
-            # to the parser's rule on load rather than crashing the renderer.
-            fid = finding.get("id")
-            if (
-                not isinstance(fid, str)
-                or len(fid) > MAX_FINDING_ID_CHARS
-                or FINDING_ID_RE.match(fid) is None
-            ):
-                raise StateError(
-                    "state field 'open_findings' holds an entry whose 'id' is not a finding id "
-                    "of the form R<round>-F<n>"
-                )
+        _validate_findings_field("open_findings", state.open_findings)
+        _validate_findings_field("prior_findings", state.prior_findings)
         if not isinstance(state.last_fix_resolutions, list) or not all(
             isinstance(resolution, dict) for resolution in state.last_fix_resolutions
         ):
@@ -659,6 +677,7 @@ class AutoForgeState:
         self.last_review_needs_fix = None
         self.last_review_comment_url = ""
         self.open_findings = []
+        self.prior_findings = []
         self.last_fix_resolutions = []
         self.review_history = []
         self.verification_failures = []

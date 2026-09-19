@@ -161,8 +161,10 @@ Verify:
 The fixer is launched only while the PR HEAD read from GitHub equals the
 reviewed HEAD the open findings are bound to. A HEAD past it is an
 unverified push (an unrecorded fix, an operator); the review is stale and
-the phase goes to `REVIEW` of the actual HEAD without launching the fixer
-(workflow.md, "Bind reviews to PR HEAD SHA and to the PR identity").
+the phase goes to `REVIEW` of the actual HEAD without launching the fixer,
+with the open findings carried to that review as prior findings to re-check
+(workflow.md, "Bind reviews to PR HEAD SHA and to the PR identity" and
+"Stale rounds keep their findings").
 
 A push is not the only write a fixer makes: a `follow_up_created`
 resolution creates an issue and moves no HEAD. With the HEAD unchanged the
