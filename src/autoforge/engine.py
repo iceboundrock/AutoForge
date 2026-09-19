@@ -418,9 +418,9 @@ class UnblockDecision:
     says why, in either case. ``pr`` is the live PR when one is bound, and
     ``carry_findings`` marks a REVIEW target that the persisted review
     evidence does not describe (the revision moved, or no review of this
-    PR at this revision is bound): the last result is marked stale and the
-    open findings, if any, become the findings that review is told to
-    re-check.
+    PR at this revision is bound): the last result, if any, is marked stale
+    and the open findings, if any, become the findings that review is told
+    to re-check; a carry an earlier stale round already made is preserved.
     """
 
     target: Phase | None
@@ -2585,16 +2585,27 @@ class ControllerEngine:
             # evidence describes a revision that is no longer the PR, so its
             # result is stale whatever it was -- a clean verdict included,
             # which must not stay recorded as current while the actual
-            # revision is reviewed. Its findings are not dropped but handed
-            # to that round to re-check, and they *replace* an earlier
-            # carry, an empty list included (a stale clean round leaves none).
-            state.last_review_result = RESULT_STALE
-            state.prior_findings = state.open_findings
-            state.open_findings = []
-            if state.prior_findings:
+            # revision is reviewed. A PR never reviewed has no result to
+            # mark. Its open findings are not dropped but handed to that
+            # round to re-check. A carry already performed by a stale round
+            # (`prior_findings` set, `open_findings` empty) is preserved
+            # untouched: an unblock is not a review round, so no reviewer has
+            # examined those findings yet, and the "replace, never
+            # accumulate" rule only applies once one has (R3-F1 of PR #101).
+            if state.last_review_result:
+                state.last_review_result = RESULT_STALE
+            if state.open_findings:
+                state.prior_findings = state.open_findings
+                state.open_findings = []
                 carried = (
                     f"; the {len(state.prior_findings)} open finding(s) of round "
                     f"{state.review_round} are carried to that review to re-check"
+                )
+            elif state.prior_findings:
+                carried = (
+                    f"; the {len(state.prior_findings)} finding(s) already carried from "
+                    f"the stale round {state.review_round} stay carried to that review to "
+                    "re-check"
                 )
         state.unblock_history.append(
             {

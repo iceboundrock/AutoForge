@@ -343,18 +343,44 @@ def test_unblock_open_pr_whose_base_changed_reenters_review(tmp_state_dir, fake_
     assert s.prior_findings == [] and s.open_findings == []  # a clean review carries nothing
 
 
-def test_unblock_stale_clean_review_replaces_an_earlier_carry(tmp_state_dir, fake_github):
-    """A clean round of the actual revision would have cleared the earlier
-    carry; a clean round that went stale replaces it with nothing. The
-    carry is replaced, never accumulated, exactly as HEAD drift does."""
-    earlier = {"id": "R1-F1", "classification": "bug", "required_resolution": "older"}
+def test_unblock_after_a_stale_round_preserves_the_carried_findings(tmp_state_dir, fake_github):
+    """Round 2 at A reported a finding, the post-review read found HEAD B
+    (REVIEW -> REVIEW, the finding carried to `prior_findings`, round
+    consumed), and the next REVIEW entry blocked on the round cap. The
+    operator raised the cap and unblocks. No reviewer has examined the carry
+    in between (an unblock is not a review round), so it is not replaced by
+    the empty `open_findings` (R3-F1 of PR #101): the next REVIEW entry must
+    still render it, or the #14 failure mode the carry exists to prevent is
+    back."""
+    carried = {"id": "R2-F1", "classification": "bug", "required_resolution": "older"}
     fake_github.add_pr(head_sha=SHA_B)
     eng = _blocked(
-        tmp_state_dir, fake_github, pr_url=PR, **_reviewed(head=SHA_A), prior_findings=[earlier]
+        tmp_state_dir,
+        fake_github,
+        pr_url=PR,
+        reason="review round 3 would exceed max_review_rounds=2",
+        **_reviewed(head=SHA_A, result="stale", findings=[]),
+        prior_findings=[carried],
     )
+    eng.config.workflow.max_review_rounds = 3
     out = eng.unblock(REASON)
     assert out.unblocked and out.phase == "REVIEW" and "revision moved" in out.message
-    assert "carried to that review" not in out.message
+    assert "1 finding(s) already carried from the stale round 2 stay carried" in out.message
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.REVIEW and s.current_head_sha == SHA_B
+    assert s.last_review_result == "stale"
+    assert s.prior_findings == [carried] and s.open_findings == []
+    assert s.reviewed_head_sha == SHA_A and s.reviewed_pr_url == PR
+
+
+def test_unblock_stale_clean_review_carries_nothing(tmp_state_dir, fake_github):
+    """A clean review of A with no earlier carry (a completed round clears
+    one), PR now at B: the verdict is stale and there is nothing to carry."""
+    fake_github.add_pr(head_sha=SHA_B)
+    eng = _blocked(tmp_state_dir, fake_github, pr_url=PR, **_reviewed(head=SHA_A))
+    out = eng.unblock(REASON)
+    assert out.unblocked and out.phase == "REVIEW" and "revision moved" in out.message
+    assert "carried" not in out.message
     s = load_state(eng.paths.state_file)
     assert s.last_review_result == "stale"
     assert s.prior_findings == [] and s.open_findings == []
@@ -362,6 +388,9 @@ def test_unblock_stale_clean_review_replaces_an_earlier_carry(tmp_state_dir, fak
 
 
 def test_unblock_head_drift_with_findings_replaces_an_earlier_carry(tmp_state_dir, fake_github):
+    """Open findings of the reviewed revision replace an earlier carry, as
+    HEAD drift does (a completed round clears the carry, so this shape is
+    defensive); the preserve rule applies only when there is nothing open."""
     earlier = {"id": "R1-F1", "classification": "bug", "required_resolution": "older"}
     fake_github.add_pr(head_sha=SHA_B)
     eng = _blocked(
@@ -430,6 +459,8 @@ def test_unblock_open_pr_without_a_review_reenters_review(tmp_state_dir, fake_gi
     assert out.unblocked and out.phase == "REVIEW" and "no completed review" in out.message
     s = load_state(eng.paths.state_file)
     assert s.current_head_sha == SHA_A and s.current_branch == BRANCH and s.review_round == 0
+    # A PR never reviewed has no result to mark stale.
+    assert s.last_review_result == "" and s.prior_findings == [] and s.open_findings == []
 
 
 def test_unblock_refuses_review_past_the_round_cap(tmp_state_dir, fake_github):

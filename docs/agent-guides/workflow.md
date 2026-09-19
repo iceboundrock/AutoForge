@@ -229,11 +229,13 @@ The carry is replaced, never accumulated: a later stale round's findings
 replace the earlier ones (that reviewer was shown them and re-raised the
 ones that still applied; a stale clean round therefore leaves none), and
 the next completed round of the actual revision, clean or with findings,
-clears them. Like `open_findings` they are per PR: a replacement PR and a
-new issue start with none. The alternative, not consuming a stale round,
-was rejected: it would relaunch the same round profile against a PR that
-may move again, and it would let pushes alone repeat a round without the
-cap ever counting it.
+clears them. Only a completed round replaces or clears the carry: an
+operator `unblock` into `REVIEW` after a stale round (see **Leaving
+BLOCKED**) is not a round and leaves it as it is. Like `open_findings` they
+are per PR: a replacement PR and a new issue start with none. The
+alternative, not consuming a stale round, was rejected: it would relaunch
+the same round profile against a PR that may move again, and it would let
+pushes alone repeat a round without the cap ever counting it.
 
 ### Re-entering a phase
 
@@ -351,10 +353,14 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   open, unless the next review round is past `workflow.max_review_rounds`,
   which refuses; any other revision, or no completed review -> `REVIEW`
   (past the cap: refuse), where the persisted review evidence does not
-  describe the revision that round will bind: the last result is marked
-  `stale` whatever it was (a clean verdict included), and the open findings
-  replace `prior_findings` (an empty list included) exactly as HEAD drift
-  does. `MERGED` and already counted -> `UPDATE_EPIC`; `MERGED`, not counted,
+  describe the revision that round will bind: the last result, if there is
+  one, is marked `stale` whatever it was (a clean verdict included), and the
+  open findings, if any, replace `prior_findings` exactly as HEAD drift
+  does. A carry an earlier stale round already made (`prior_findings` set,
+  `open_findings` empty) is preserved untouched: an unblock is not a review
+  round, so no reviewer has examined it yet and the "replace, never
+  accumulate" rule of **Stale rounds keep their findings** does not apply.
+  `MERGED` and already counted -> `UPDATE_EPIC`; `MERGED`, not counted,
   at the clean-reviewed HEAD into the reviewed base -> `READY_FOR_MERGE`, so
   `resume --allow-merge` reconciles and counts it once; `MERGED` at any
   other revision, or with no clean review, refuses (the controller will not
