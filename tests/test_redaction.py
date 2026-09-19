@@ -1,8 +1,10 @@
 """Redaction: common token patterns are masked, normal text untouched."""
 
+import time
+
 import pytest
 
-from autoforge.redaction import _PATTERNS, MAX_GROWTH_FACTOR, redact
+from autoforge.redaction import _PATTERNS, MAX_GROWTH_FACTOR, redact, redact_obj
 
 
 def test_github_token_assignment():
@@ -35,6 +37,77 @@ def test_normal_text_untouched():
 def test_none_and_non_str_safe():
     assert redact(None) == ""
     assert isinstance(redact(123), str)
+
+
+def test_redact_obj_keeps_every_entry_when_redacted_keys_collide():
+    """Distinct keys that redact to the same text must not overwrite each
+    other: the value under the dropped key would vanish from the redacted
+    output while the source still holds it. Later collisions are suffixed in
+    insertion order, and a key that already reads like the marker takes part
+    in the same numbering rather than swallowing an earlier entry."""
+    out = redact_obj(
+        {
+            "GITHUB_TOKEN=firstsecret": 1,
+            "GITHUB_TOKEN=***REDACTED***": 2,
+            "GITHUB_TOKEN=secondsecret": 3,
+            "plain": {"ghp_aaaaaaaaaaaa": "x", "ghp_bbbbbbbbbbbb": "y"},
+        }
+    )
+    assert out == {
+        "GITHUB_TOKEN=***REDACTED***": 1,
+        "GITHUB_TOKEN=***REDACTED***#2": 2,
+        "GITHUB_TOKEN=***REDACTED***#3": 3,
+        "plain": {"***REDACTED***": "x", "***REDACTED***#2": "y"},
+    }
+    for secret in ("firstsecret", "secondsecret", "ghp_aaaaaaaaaaaa", "ghp_bbbbbbbbbbbb"):
+        assert secret not in repr(out)
+
+
+def test_redact_obj_leaves_distinct_keys_unsuffixed():
+    """The suffix appears only on a collision; ordinary mappings round-trip."""
+    value = {"a": 1, "b": [1, {"c": None}], "d": True}
+    assert redact_obj(value) == value
+
+
+def test_redact_obj_steps_over_a_suffix_the_input_already_carries():
+    """A key that already reads ``text#n`` is not overwritten by the n-th
+    collision and does not restart the numbering: the allocator skips the
+    taken suffix once and keeps counting up from there. The reverse order,
+    where the literal ``#2`` arrives after the suffix was handed out,
+    collides on that text and is suffixed in turn, so no entry is lost."""
+    out = redact_obj(
+        {
+            "ghp_aaaaaaaaaaaa": 1,
+            "***REDACTED***#2": 2,
+            "ghp_bbbbbbbbbbbb": 3,
+            "ghp_cccccccccccc": 4,
+        }
+    )
+    assert out == {
+        "***REDACTED***": 1,
+        "***REDACTED***#2": 2,
+        "***REDACTED***#3": 3,
+        "***REDACTED***#4": 4,
+    }
+    out = redact_obj({"ghp_aaaaaaaaaaaa": 1, "ghp_bbbbbbbbbbbb": 2, "***REDACTED***#2": 3})
+    assert out == {"***REDACTED***": 1, "***REDACTED***#2": 2, "***REDACTED***#2#2": 3}
+
+
+def test_redact_obj_suffix_allocation_is_linear_in_the_colliding_keys():
+    """A journal's ``escalation`` mapping is free-form and the state loader
+    admits files of tens of megabytes, so `status --json` must not turn a
+    mapping whose keys all redact to one text into a quadratic scan of the
+    taken suffixes. Rescanning from ``#2`` per entry took seconds at 10,000
+    keys; a per-text counter keeps the whole pass well under the budget."""
+    count = 20_000
+    value = {f"GITHUB_TOKEN=secret{i}": i for i in range(count)}
+    started = time.perf_counter()
+    out = redact_obj(value)
+    assert time.perf_counter() - started < 3.0
+    assert isinstance(out, dict) and len(out) == count
+    assert list(out.values()) == list(range(count))
+    assert all(key.startswith("GITHUB_TOKEN=***REDACTED***") for key in out)
+    assert "secret" not in "".join(out)
 
 
 # The shortest text each pattern recognises, with the separator that lets the

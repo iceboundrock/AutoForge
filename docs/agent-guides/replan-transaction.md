@@ -42,5 +42,17 @@ laundered decision.
 - The journal is part of the persisted state file; its schema validation on
   load, the `protocol_version` rule and the old-controller compatibility
   policy are in [state-and-recovery.md](state-and-recovery.md).
+- `status` reads the journal through the same `from_dict` as the engine and
+  prints its `stage` and, for a corrupt one, `journal: CORRUPT (...)` with
+  the defects. `status --json` prints `replan_transaction` *as persisted*
+  (the forensic evidence is never rewritten) and derives `replan_journal`
+  (`readable`, `stage`, `defects`) beside it from that same load, so a
+  consumer can tell a usable journal from a corrupt one without
+  re-implementing the validation and the two outputs cannot disagree. That
+  holds in LOCAL mode too: a LOCAL run never writes a journal, but a state
+  file carrying one is described by both outputs, not skipped by one. A
+  journal that is not an object is refused by the state load itself
+  (`StateError`, exit 2), so neither mode prints a partial document. Both
+  outputs are redacted (`secrets-and-logging.md`).
 - The `CONTROL_RESULT` fields a replan invocation must return are validated
   under [control-result-protocol.md](control-result-protocol.md).

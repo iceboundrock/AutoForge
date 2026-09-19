@@ -30,7 +30,7 @@ from .errors import (
     StateTransitionError,
 )
 from .local_workspace import init_feature_file
-from .redaction import redact, redact_argv
+from .redaction import redact, redact_argv, redact_dict
 from .replan_txn import ReplanTransaction
 from .state import AutoForgeState
 from .transitions import TERMINAL_PHASES, Phase, WorkflowMode
@@ -335,7 +335,10 @@ def _finish(engine: ControllerEngine, outcomes: list[StepOutcome], allow_merge: 
         print_ready_banner(state, gate_open=engine.merge_gate_open(allow_merge))
         return 0
     if state.phase in (Phase.BLOCKED, Phase.FAILED):
-        print(f"\nrun {state.run_id} is {state.phase.value}: {state.block_reason or '-'}")
+        # The whole line is state-derived (`run_id` is a validated path
+        # component, not a checked-for-secrets value), so the line crosses
+        # the redaction boundary assembled, not field by field.
+        print(redact(f"\nrun {state.run_id} is {state.phase.value}: {state.block_reason or '-'}"))
         return 1
     return 0
 
@@ -362,11 +365,16 @@ def _existing_run_guard(
         # Unreadable / foreign-protocol state is fatal: a fresh run must
         # never silently replace it (merge counters etc. would be lost).
         if not force:
+            # The error quotes the field it could not read (an unknown phase
+            # is echoed verbatim), so the refusal is state-derived output
+            # like the terminal lines and crosses the boundary assembled.
             print(
-                f"autoforge: error: {exc}\n"
-                "autoforge: error: refusing to start a new run over an unreadable "
-                f"state file — repair it, or use '{command} --force' to move it aside as "
-                f"{paths.state_file.name}.corrupt-<timestamp> and start over",
+                redact(
+                    f"autoforge: error: {exc}\n"
+                    "autoforge: error: refusing to start a new run over an unreadable "
+                    f"state file — repair it, or use '{command} --force' to move it "
+                    f"aside as {paths.state_file.name}.corrupt-<timestamp> and start over"
+                ),
                 file=sys.stderr,
             )
             return 2, False
@@ -375,9 +383,11 @@ def _existing_run_guard(
         return None, False
     if existing.phase not in TERMINAL_PHASES and not force:
         print(
-            f"autoforge: error: existing run {existing.run_id} "
-            f"in phase {existing.phase.value} — use 'resume' to continue "
-            f"or '{command} --force' to discard it",
+            redact(
+                f"autoforge: error: existing run {existing.run_id} "
+                f"in phase {existing.phase.value} — use 'resume' to continue "
+                f"or '{command} --force' to discard it"
+            ),
             file=sys.stderr,
         )
         return 2, False
@@ -546,15 +556,52 @@ def _resume_holding_state(
         return 0
     if state.phase in TERMINAL_PHASES:
         if state.phase == Phase.DONE:
-            print(f"workflow already DONE (run {state.run_id}) — nothing to do")
+            print(redact(f"workflow already DONE (run {state.run_id}) — nothing to do"))
             return 0
         print(
-            f"run {state.run_id} is in terminal phase {state.phase.value}: "
-            f"{state.block_reason or '-'} — inspect {engine.paths.logs_dir}/ "
-            "and start a new run"
+            redact(
+                f"run {state.run_id} is in terminal phase {state.phase.value}: "
+                f"{state.block_reason or '-'} — inspect {engine.paths.logs_dir}/ "
+                "and start a new run"
+            )
         )
         return 1
     return None
+
+
+def _load_replan_journal(state: AutoForgeState) -> ReplanTransaction | None:
+    """Read the persisted replan journal the way the engine reads it.
+
+    ``None`` when the run has no journal. A journal whose fields cannot be
+    read comes back ``REJECTED`` with ``journal_defects`` naming them, for
+    status to describe rather than die on. The one shape ``from_dict``
+    refuses outright -- a journal that is not a JSON object -- never reaches
+    here: ``AutoForgeState.from_dict`` rejects it, so ``load()`` fails both
+    output modes at the state boundary (exit 2) before anything is printed.
+    """
+    if not state.replan_transaction:
+        return None
+    return ReplanTransaction.from_dict(state.replan_transaction)
+
+
+def _replan_journal_summary(txn: ReplanTransaction | None) -> dict | None:
+    """The derived ``replan_journal`` field of ``status --json``.
+
+    ``status --json`` prints ``replan_transaction`` as persisted, so the
+    forensic evidence of a corrupt journal is never rewritten -- which leaves
+    a consumer no way to tell a usable journal from a corrupt one without
+    reimplementing the validation. This sibling field answers that from the
+    same ``ReplanTransaction`` the human ``status`` prints its ``stage`` and
+    ``journal`` lines from, so the two outputs cannot disagree. It is never
+    merged into the raw journal.
+    """
+    if txn is None:
+        return None
+    return {
+        "readable": not txn.journal_defects,
+        "stage": txn.stage.value,
+        "defects": list(txn.journal_defects),
+    }
 
 
 def cmd_status(args) -> int:
@@ -562,132 +609,178 @@ def cmd_status(args) -> int:
     if not args.state_dir:
         _bind_existing_run(engine)
     state = engine.load()  # StateError when missing/corrupt
+    # One load of the journal feeds every output mode, so what `--json`
+    # derives and what the human summary prints cannot disagree.
+    txn = _load_replan_journal(state)
+    # Everything status shows is state-derived, and state carries text the
+    # agents controlled (`block_reason`, findings, a hand-edited journal), so
+    # both output modes cross the same redaction boundary as the run log.
     if args.as_json:
         # to_dict() already carries "mode" plus the local fields, so the JSON
-        # shape stays additive for remote consumers.
-        print(json.dumps(state.to_dict(), indent=2, sort_keys=True))
+        # shape stays additive for remote consumers; `replan_journal` is
+        # derived beside the raw journal, never merged into it.
+        document = {**state.to_dict(), "replan_journal": _replan_journal_summary(txn)}
+        print(json.dumps(redact_dict(document), indent=2, sort_keys=True))
         return 0
     if state.mode == WorkflowMode.LOCAL:
-        return _print_local_status(state)
+        print(redact(_render_local_status(state, txn)))
+        return 0
+    print(redact(_render_status(state, txn)))
+    return 0
+
+
+def _render_replan_journal(txn: ReplanTransaction | None) -> list[str]:
+    """The human lines for a persisted replan journal; none without one.
+
+    Shared by both modes so a journal a state carries is described the same
+    way wherever it is found -- a LOCAL run never writes one, but a state
+    file that has one anyway is shown, not silently skipped, and the human
+    output then agrees with ``replan_journal`` in ``--json``.
+    """
+    if txn is None:
+        return []
+    lines = [
+        f"Replan transaction: {txn.transaction_id or '(not yet created)'}",
+        f"  stage:       {txn.stage.value}",
+    ]
+    if txn.journal_defects:
+        lines.append(f"  journal:     CORRUPT ({'; '.join(txn.journal_defects)})")
+    lines += [
+        f"  source PR:   {txn.source_pr_url or '-'}",
+        f"  replacement: {txn.replacement_pr_url or '-'}",
+        f"  escalation:  {json.dumps(txn.escalation, sort_keys=True)}",
+    ]
+    if txn.rejection_reason:
+        lines.append(f"  rejected:    {txn.rejection_reason}")
+    return lines
+
+
+def _render_status(state: AutoForgeState, txn: ReplanTransaction | None) -> str:
+    """Human status for a GitHub run (unredacted; the caller redacts)."""
 
     def _num(url: str) -> str:
         return url.rstrip("/").rsplit("/", 1)[-1] if url else "-"
 
-    print("AutoForge")
-    print()
-    print(f"Run:        {state.run_id}")
-    print(f"Repository: {state.repository}")
-    print(f"EPIC:       #{_num(state.epic_url)} {state.epic_url}")
-    print(f"Issue:      #{_num(state.current_issue_url)} {state.current_issue_url or '-'}")
-    print(f"PR:         #{_num(state.current_pr_url)} {state.current_pr_url or '-'}")
-    print(f"Branch:     {state.current_branch or '-'}")
-    print()
-    print(f"Phase:      {state.phase.value}")
-    print(f"Review rounds completed: {state.review_round}")
-    print(f"Execution attempt: {state.execution_attempt}")
-    print(f"Replan count: {state.escalation_count}")
-    print(f"Current HEAD:  {state.current_head_sha or '-'}")
-    print(f"Current base:  {state.current_base_ref or '-'}")
-    print(f"Reviewed PR:   {state.reviewed_pr_url or '-'}")
-    print(f"Reviewed HEAD: {state.reviewed_head_sha or '-'}")
-    print(f"Reviewed base: {state.reviewed_base_ref or '-'}")
-    print(f"Last review:   {state.last_review_result or '-'}")
-    print(f"Review comment: {state.last_review_comment_url or '-'}")
-    print(f"Open findings: {len(state.open_findings)}")
+    lines = [
+        "AutoForge",
+        "",
+        f"Run:        {state.run_id}",
+        f"Repository: {state.repository}",
+        f"EPIC:       #{_num(state.epic_url)} {state.epic_url}",
+        f"Issue:      #{_num(state.current_issue_url)} {state.current_issue_url or '-'}",
+        f"PR:         #{_num(state.current_pr_url)} {state.current_pr_url or '-'}",
+        f"Branch:     {state.current_branch or '-'}",
+        "",
+        f"Phase:      {state.phase.value}",
+        f"Review rounds completed: {state.review_round}",
+        f"Execution attempt: {state.execution_attempt}",
+        f"Replan count: {state.escalation_count}",
+        f"Current HEAD:  {state.current_head_sha or '-'}",
+        f"Current base:  {state.current_base_ref or '-'}",
+        f"Reviewed PR:   {state.reviewed_pr_url or '-'}",
+        f"Reviewed HEAD: {state.reviewed_head_sha or '-'}",
+        f"Reviewed base: {state.reviewed_base_ref or '-'}",
+        f"Last review:   {state.last_review_result or '-'}",
+        f"Review comment: {state.last_review_comment_url or '-'}",
+        f"Open findings: {len(state.open_findings)}",
+    ]
     if state.superseded_prs:
-        print("Superseded PRs:")
+        lines.append("Superseded PRs:")
         for item in state.superseded_prs:
-            print(f"  {item.get('pr_url', '-')} -> {item.get('replacement_pr_url', '-')}")
-    if state.replan_transaction:
-        try:
-            txn = ReplanTransaction.from_dict(state.replan_transaction)
-        except ValueError as exc:
-            # The same loud failure `load()` gives an unreadable state file:
-            # status must describe a corrupt journal, never die on it.
-            raise StateError(f"state field 'replan_transaction' is unusable: {exc}") from None
-        print(f"Replan transaction: {txn.transaction_id or '(not yet created)'}")
-        print(f"  stage:       {txn.stage.value}")
-        if txn.journal_defects:
-            print(f"  journal:     CORRUPT ({'; '.join(txn.journal_defects)})")
-        print(f"  source PR:   {txn.source_pr_url or '-'}")
-        print(f"  replacement: {txn.replacement_pr_url or '-'}")
-        print(f"  escalation:  {json.dumps(txn.escalation, sort_keys=True)}")
-        if txn.rejection_reason:
-            print(f"  rejected:    {txn.rejection_reason}")
+            lines.append(f"  {item.get('pr_url', '-')} -> {item.get('replacement_pr_url', '-')}")
+    lines += _render_replan_journal(txn)
     if state.block_reason:
-        print(f"Reason:     {state.block_reason}")
-    print()
-    print(f"Steps executed: {state.step_count}")
-    print(f"Merged since EPIC update: {state.merged_since_epic_update}")
-    print()
-    print(f"Created:    {state.created_at}")
-    print(f"Updated:    {state.updated_at}")
-    return 0
+        lines.append(f"Reason:     {state.block_reason}")
+    lines += [
+        "",
+        f"Steps executed: {state.step_count}",
+        f"Merged since EPIC update: {state.merged_since_epic_update}",
+        "",
+        f"Created:    {state.created_at}",
+        f"Updated:    {state.updated_at}",
+    ]
+    return "\n".join(lines)
 
 
-def _print_local_status(state: AutoForgeState) -> int:
-    """Human status for a LOCAL run.
+def _render_local_status(state: AutoForgeState, txn: ReplanTransaction | None) -> str:
+    """Human status for a LOCAL run (unredacted; the caller redacts).
 
     Deliberately omits Issue/PR/branch/merge fields: a local run has none, and
     printing empty ones would suggest the GitHub lifecycle is merely stalled.
+    A replan journal is shown only when the state carries one.
     """
     fix_budget = state.local_fix_rounds
 
-    print("AutoForge (local mode)")
-    print()
-    print(f"Run:        {state.run_id}")
-    print(f"Mode:       {state.mode.value} (no GitHub: no issue, no PR, no push, no merge)")
-    print(f"Feature:    {state.feature_spec_path or '-'}")
-    print(f"Frozen SHA: {state.feature_spec_sha256 or '-'}")
-    print()
-    print(f"Phase:      {state.phase.value}")
-    print(f"Review rounds completed: {state.review_round}")
-    print(f"Fix rounds completed:    {fix_budget}")
-    print(f"Last review:   {state.last_review_result or '-'}")
-    print(f"Open findings: {len(state.open_findings)}")
+    lines = [
+        "AutoForge (local mode)",
+        "",
+        f"Run:        {state.run_id}",
+        f"Mode:       {state.mode.value} (no GitHub: no issue, no PR, no push, no merge)",
+        f"Feature:    {state.feature_spec_path or '-'}",
+        f"Frozen SHA: {state.feature_spec_sha256 or '-'}",
+        "",
+        f"Phase:      {state.phase.value}",
+        f"Review rounds completed: {state.review_round}",
+        f"Fix rounds completed:    {fix_budget}",
+        f"Last review:   {state.last_review_result or '-'}",
+        f"Open findings: {len(state.open_findings)}",
+    ]
     for finding in state.open_findings:
-        print(
+        lines.append(
             f"  {finding.get('id', '?')} [{finding.get('severity', '?')}] "
             f"{str(finding.get('title', '')).strip()[:80]}"
         )
-    print()
-    print(f"Base HEAD:   {state.base_head_sha or '(unborn)'}")
-    print(f"Workspace fingerprint: {state.workspace_fingerprint or '-'}")
-    print(f"Reviewed fingerprint:  {state.reviewed_workspace_fingerprint or '-'}")
+    lines += [
+        "",
+        f"Base HEAD:   {state.base_head_sha or '(unborn)'}",
+        f"Workspace fingerprint: {state.workspace_fingerprint or '-'}",
+        f"Reviewed fingerprint:  {state.reviewed_workspace_fingerprint or '-'}",
+    ]
     if state.baseline_dirty_paths:
-        print("Pre-existing working-tree changes at run creation (--allow-dirty):")
+        lines.append("Pre-existing working-tree changes at run creation (--allow-dirty):")
         for path in state.baseline_dirty_paths[:20]:
-            print(f"  {path}")
+            lines.append(f"  {path}")
         if len(state.baseline_dirty_paths) > 20:
-            print(f"  ... and {len(state.baseline_dirty_paths) - 20} more")
+            lines.append(f"  ... and {len(state.baseline_dirty_paths) - 20} more")
+    lines += _render_replan_journal(txn)
     if state.block_reason:
-        print(f"Reason:     {state.block_reason}")
-    print()
-    print(f"Steps executed: {state.step_count}")
-    print()
-    print(f"Created:    {state.created_at}")
-    print(f"Updated:    {state.updated_at}")
-    return 0
+        lines.append(f"Reason:     {state.block_reason}")
+    lines += [
+        "",
+        f"Steps executed: {state.step_count}",
+        "",
+        f"Created:    {state.created_at}",
+        f"Updated:    {state.updated_at}",
+    ]
+    return "\n".join(lines)
 
 
 # -- pretty printing ----------------------------------------------------------
 def print_ready_banner(state: AutoForgeState, gate_open: bool = False) -> None:
-    print()
-    print("=" * 72)
-    print("AutoForge workflow reached READY_FOR_MERGE.")
-    print(f"  Issue:         {state.current_issue_url}")
-    print(f"  PR:            {state.current_pr_url}")
-    print(f"  Review round:  {state.review_round}")
-    print(f"  Reviewed HEAD: {state.reviewed_head_sha}")
-    print(f"  Reviewed base: {state.reviewed_base_ref or '-'}")
-    print(f"  Review:        {state.last_review_comment_url or '-'}")
+    lines = [
+        "",
+        "=" * 72,
+        "AutoForge workflow reached READY_FOR_MERGE.",
+        f"  Issue:         {state.current_issue_url}",
+        f"  PR:            {state.current_pr_url}",
+        f"  Review round:  {state.review_round}",
+        f"  Reviewed HEAD: {state.reviewed_head_sha}",
+        f"  Reviewed base: {state.reviewed_base_ref or '-'}",
+        f"  Review:        {state.last_review_comment_url or '-'}",
+    ]
     if gate_open:
-        print("Merge gate is open but the step budget (--max-steps) ran out before MERGE.")
-        print("'resume --allow-merge' continues with the controller-side pre-merge verification.")
+        lines += [
+            "Merge gate is open but the step budget (--max-steps) ran out before MERGE.",
+            "'resume --allow-merge' continues with the controller-side pre-merge verification.",
+        ]
     else:
-        print("Automatic merge is disabled in this milestone.")
-        print("A human must review and merge the PR.")
-    print("=" * 72)
+        lines += [
+            "Automatic merge is disabled in this milestone.",
+            "A human must review and merge the PR.",
+        ]
+    lines.append("=" * 72)
+    # State-derived like the status output: the same redaction boundary.
+    print(redact("\n".join(lines)))
 
 
 def print_plan(plan: StepPlan, full_prompt: bool = False) -> None:
@@ -723,11 +816,13 @@ def print_plan(plan: StepPlan, full_prompt: bool = False) -> None:
 
 
 def print_step_outcome(o: StepOutcome) -> None:
-    print(f"[{o.run_id}] {o.previous_phase} -> {o.next_phase}: {redact(o.message)}")
+    # Every field here came out of state or an agent result, `run_id`
+    # included, so each line is redacted whole rather than per field.
+    print(redact(f"[{o.run_id}] {o.previous_phase} -> {o.next_phase}: {o.message}"))
     if o.plan is not None and o.plan.command:
         print(f"  profile={o.plan.profile_name} model={o.plan.model}")
     if o.result is not None:
-        print(f"  result={redact(json.dumps(o.result, sort_keys=True))}")
+        print(redact(f"  result={json.dumps(o.result, sort_keys=True)}"))
 
 
 if __name__ == "__main__":

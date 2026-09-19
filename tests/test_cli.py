@@ -7,7 +7,7 @@ import pytest
 
 from autoforge import cli
 from autoforge.engine import ControllerEngine
-from autoforge.errors import LockError
+from autoforge.errors import GitHubError, LockError
 from autoforge.executor import ExecutionResult
 from autoforge.locking import ControllerLock, repository_lock_path
 from autoforge.providers import ProviderRegistry, ScriptedProvider
@@ -168,10 +168,319 @@ def test_status_describes_a_corrupt_replan_transaction_instead_of_crashing(
     assert "pr_number_watermark must be an integer" in out
     assert "escalation must be an object" in out
     assert "recorded stage 'supersede_intent'" in out
-    # --json prints the journal as persisted, corrupt values included.
+    # --json prints the journal as persisted, corrupt values included, and
+    # says beside it (#67) what status said above: unreadable, rejected, why.
     assert cli.main(["--state-dir", sd, "status", "--json"]) == 0
     printed = json.loads(capsys.readouterr().out)
-    assert printed["replan_transaction"]["pr_number_watermark"] == "12"
+    assert printed["replan_transaction"] == data["replan_transaction"]
+    assert printed["replan_journal"] == {
+        "readable": False,
+        "stage": "rejected",
+        "defects": [
+            "pr_number_watermark must be an integer >= 0, got '12'",
+            "escalation must be an object, got list",
+        ],
+    }
+    for defect in printed["replan_journal"]["defects"]:
+        assert defect in out
+
+
+def test_status_json_derives_the_replan_journal_beside_the_raw_one(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """#67: `replan_journal` says whether the persisted journal is usable, at
+    which stage, without a consumer re-implementing the validation; it is
+    `null` for a run without a journal and never merged into the raw one."""
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    assert (
+        cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"])
+        == 0
+    )
+    capsys.readouterr()
+    assert cli.main(["--state-dir", sd, "status", "--json"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["replan_transaction"] == {} and printed["replan_journal"] is None
+
+    state_file = tmp_path / ".autoforge" / "state.json"
+    data = json.loads(state_file.read_text())
+    data["phase"] = "REPLAN_REEXECUTE"
+    data["current_pr_url"] = PR
+    data["replan_transaction"] = {
+        "stage": "pending",
+        "issue_url": ISSUE,
+        "decision_pr_url": PR,
+        "decision_head_sha": SHA_A,
+        "decision_branch": BRANCH,
+        "decision_base_ref": "main",
+        "escalation": {"trigger": "hard_review_round_threshold"},
+    }
+    state_file.write_text(json.dumps(data))
+    assert cli.main(["--state-dir", sd, "status", "--json"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["replan_transaction"] == data["replan_transaction"]
+    assert "replan_journal" not in printed["replan_transaction"]
+    assert printed["replan_journal"] == {"readable": True, "stage": "pending", "defects": []}
+    assert cli.main(["--state-dir", sd, "status"]) == 0
+    out = capsys.readouterr().out
+    assert "stage:       pending" in out and "CORRUPT" not in out
+
+
+def test_status_json_refuses_a_non_object_replan_journal_like_status_does(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """#67: a journal that is not an object is refused at the state-load
+    boundary (`AutoForgeState.from_dict`), the one place `status` and
+    `status --json` share before either prints, so --json never emits a
+    partial document around it."""
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    assert (
+        cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"])
+        == 0
+    )
+    capsys.readouterr()
+    state_file = tmp_path / ".autoforge" / "state.json"
+    data = json.loads(state_file.read_text())
+    data["replan_transaction"] = ["not", "an", "object"]
+    state_file.write_text(json.dumps(data))
+    for argv in (["status"], ["status", "--json"]):
+        assert cli.main(["--state-dir", sd, *argv]) == 2
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "replan_transaction" in captured.err
+
+
+FAKE_SECRET = "ghp_FakeSecretForStatusTest0123456789"
+
+
+def test_status_redacts_agent_controlled_state_in_every_output(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """#6 (PR #1 O5): `block_reason` echoes agent text and a hand-edited
+    journal can carry anything, so what status prints -- human, --json and
+    the terminal-phase line of resume -- crosses the same redaction boundary
+    as the run log. The state file itself is left as written."""
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    assert (
+        cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"])
+        == 0
+    )
+    capsys.readouterr()
+    state_file = tmp_path / ".autoforge" / "state.json"
+    data = json.loads(state_file.read_text())
+    data["phase"] = "BLOCKED"
+    data["block_reason"] = f"agent said: GITHUB_TOKEN={FAKE_SECRET} leaked"
+    # A journal defect quotes the value it could not read.
+    data["replan_transaction"] = {"stage": "pending", "transaction_id": FAKE_SECRET}
+    raw = json.dumps(data)
+    state_file.write_text(raw)
+
+    assert cli.main(["--state-dir", sd, "status"]) == 0
+    out = capsys.readouterr().out
+    assert FAKE_SECRET not in out
+    assert "Reason:     agent said: GITHUB_TOKEN=***REDACTED*** leaked" in out
+    assert "journal:     CORRUPT (" in out and "***REDACTED***" in out
+
+    assert cli.main(["--state-dir", sd, "status", "--json"]) == 0
+    printed_text = capsys.readouterr().out
+    assert FAKE_SECRET not in printed_text
+    printed = json.loads(printed_text)
+    assert printed["block_reason"] == "agent said: GITHUB_TOKEN=***REDACTED*** leaked"
+    assert printed["replan_transaction"]["transaction_id"] == "***REDACTED***"
+    assert printed["replan_journal"]["readable"] is False
+    assert FAKE_SECRET not in json.dumps(printed["replan_journal"])
+
+    assert cli.main(["--state-dir", sd, "resume"]) == 1
+    captured = capsys.readouterr()
+    assert FAKE_SECRET not in captured.out + captured.err
+    assert "terminal phase BLOCKED" in captured.out
+    # Output-only: the persisted evidence is not rewritten.
+    assert state_file.read_text() == raw
+
+
+def test_existing_run_refusal_redacts_the_corrupt_state_error(tmp_path, capsys, monkeypatch, fakes):
+    """#6: the refusal to start over an unreadable state file quotes the
+    `StateError`, and a state error quotes the field it could not read, so a
+    hand-edited file can put a credential-shaped value in the message. The
+    refusal is printed before `main`'s own handler, so it redacts the line
+    itself; the file is neither rewritten nor quarantined."""
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    assert (
+        cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"])
+        == 0
+    )
+    capsys.readouterr()
+    state_file = tmp_path / ".autoforge" / "state.json"
+    data = json.loads(state_file.read_text())
+    data["phase"] = FAKE_SECRET
+    raw = json.dumps(data)
+    state_file.write_text(raw)
+
+    rc = cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"])
+    captured = capsys.readouterr()
+    assert rc == 2 and captured.out == ""
+    assert FAKE_SECRET not in captured.err
+    assert "unknown phase '***REDACTED***'" in captured.err
+    assert "refusing to start a new run over an unreadable state file" in captured.err
+    assert "'run --force'" in captured.err
+    assert state_file.read_text() == raw
+    assert sorted(p.name for p in (tmp_path / ".autoforge").iterdir()) == ["state.json"]
+
+
+def test_run_terminal_line_redacts_a_block_reason_the_engine_persisted_raw(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """#6: the terminal line of `run` / `resume` is the CLI's own boundary,
+    not a courtesy of the engine: a `_block` reason that quotes `gh` output
+    reaches `state.json` as written, and only the printed line is redacted."""
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    assert (
+        cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"])
+        == 0
+    )
+    capsys.readouterr()
+    state_file = tmp_path / ".autoforge" / "state.json"
+    data = json.loads(state_file.read_text())
+    data["current_pr_url"] = PR
+    state_file.write_text(json.dumps(data))
+    fakes["gh"].get_pr_error = GitHubError(
+        f"HTTP 401: Bad credentials (Authorization: Bearer {FAKE_SECRET})"
+    )
+    assert cli.main(["--state-dir", sd, "resume"]) == 1
+    captured = capsys.readouterr()
+    assert FAKE_SECRET not in captured.out + captured.err
+    assert "is BLOCKED: state references PR" in captured.out
+    assert "Authorization: Bearer ***REDACTED***" in captured.out
+    # The engine wrote the reason as `gh` reported it; the CLI did the redacting.
+    persisted = json.loads(state_file.read_text())
+    assert persisted["phase"] == "BLOCKED" and FAKE_SECRET in persisted["block_reason"]
+
+
+def test_ready_banner_redacts_state_derived_fields(tmp_path, capsys, monkeypatch, fakes):
+    """#6: the READY_FOR_MERGE banner prints state too, so it crosses the same
+    boundary as `status`; a hand-edited URL field cannot echo a secret."""
+    monkeypatch.chdir(tmp_path)
+    _drive_to_ready(fakes)
+    sd = str(tmp_path / ".autoforge")
+    assert cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE]) == 0
+    capsys.readouterr()
+    state_file = tmp_path / ".autoforge" / "state.json"
+    data = json.loads(state_file.read_text())
+    assert data["phase"] == "READY_FOR_MERGE"
+    data["last_review_comment_url"] = f"{comment_url(PR, 100)}?token={FAKE_SECRET}"
+    state_file.write_text(json.dumps(data))
+    assert cli.main(["--state-dir", sd, "resume"]) == 0
+    out = capsys.readouterr().out
+    assert "AutoForge workflow reached READY_FOR_MERGE." in out
+    assert FAKE_SECRET not in out and "?token=***REDACTED***" in out
+
+
+def test_state_derived_run_id_is_redacted_on_every_terminal_line(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """#6 (PR #97 review): `run_id` names the log directory, so its validation
+    checks path safety, not secret shapes -- a credential-shaped value is a
+    valid run id. Every line that prints it from state (the step outcome, the
+    existing-run refusal, the terminal-phase line of `run` / `step` /
+    `resume`) is redacted whole, not field by field."""
+    monkeypatch.chdir(tmp_path)
+    _drive_to_ready(fakes)
+    sd = str(tmp_path / ".autoforge")
+    run_argv = ["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"]
+    assert cli.main(run_argv) == 0
+    capsys.readouterr()
+    state_file = tmp_path / ".autoforge" / "state.json"
+    data = json.loads(state_file.read_text())
+    assert data["phase"] not in ("BLOCKED", "FAILED", "DONE")
+    data["run_id"] = FAKE_SECRET  # a valid single path component
+    state_file.write_text(json.dumps(data))
+
+    # `run` over a live run refuses on stderr, naming the run.
+    assert cli.main(run_argv) == 2
+    captured = capsys.readouterr()
+    assert FAKE_SECRET not in captured.out + captured.err
+    assert "existing run ***REDACTED*** in phase" in captured.err
+
+    # `step` prints the outcome line under the run id.
+    assert cli.main(["--state-dir", sd, "step"]) == 0
+    captured = capsys.readouterr()
+    assert FAKE_SECRET not in captured.out + captured.err
+    assert captured.out.startswith("[***REDACTED***] ") and " -> " in captured.out
+
+    data = json.loads(state_file.read_text())
+    data["phase"] = "BLOCKED"
+    data["block_reason"] = "stopped"
+    state_file.write_text(json.dumps(data))
+    assert cli.main(["--state-dir", sd, "resume"]) == 1
+    captured = capsys.readouterr()
+    assert FAKE_SECRET not in captured.out + captured.err
+    assert "run ***REDACTED*** is in terminal phase BLOCKED: stopped" in captured.out
+
+    data["phase"] = "DONE"
+    state_file.write_text(json.dumps(data))
+    assert cli.main(["--state-dir", sd, "resume"]) == 0
+    captured = capsys.readouterr()
+    assert FAKE_SECRET not in captured.out + captured.err
+    assert "workflow already DONE (run ***REDACTED***)" in captured.out
+
+
+def test_status_json_keeps_journal_entries_whose_redacted_keys_collide(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """#67 (PR #97 review): `status --json` redacts the whole document, and a
+    loadable journal's `escalation` is a free-form mapping, so two keys that
+    redact to the same text must both survive -- the raw journal is kept
+    beside its verdict as forensic evidence, and an entry silently dropped
+    from the rendering would contradict that while `state.json` still holds
+    it. The human summary renders the same mapping as text and keeps both."""
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    assert (
+        cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"])
+        == 0
+    )
+    capsys.readouterr()
+    second_secret = "ghp_AnotherFakeSecretForStatusTest9876543210"
+    state_file = tmp_path / ".autoforge" / "state.json"
+    data = json.loads(state_file.read_text())
+    data["phase"] = "REPLAN_REEXECUTE"
+    data["current_pr_url"] = PR
+    data["replan_transaction"] = {
+        "stage": "pending",
+        "issue_url": ISSUE,
+        "decision_pr_url": PR,
+        "decision_head_sha": SHA_A,
+        "decision_branch": BRANCH,
+        "decision_base_ref": "main",
+        "escalation": {
+            "trigger": "hard_review_round_threshold",
+            f"GITHUB_TOKEN={FAKE_SECRET}": "first",
+            f"GITHUB_TOKEN={second_secret}": "second",
+        },
+    }
+    raw = json.dumps(data)
+    state_file.write_text(raw)
+
+    assert cli.main(["--state-dir", sd, "status", "--json"]) == 0
+    printed_text = capsys.readouterr().out
+    assert FAKE_SECRET not in printed_text and second_secret not in printed_text
+    printed = json.loads(printed_text)
+    assert printed["replan_journal"] == {"readable": True, "stage": "pending", "defects": []}
+    assert printed["replan_transaction"]["escalation"] == {
+        "trigger": "hard_review_round_threshold",
+        "GITHUB_TOKEN=***REDACTED***": "first",
+        "GITHUB_TOKEN=***REDACTED***#2": "second",
+    }
+
+    assert cli.main(["--state-dir", sd, "status"]) == 0
+    out = capsys.readouterr().out
+    assert FAKE_SECRET not in out and second_secret not in out
+    assert '"first"' in out and '"second"' in out
+    assert state_file.read_text() == raw
 
 
 def test_status_and_resume_refuse_an_in_flight_protocol_1_replan(
