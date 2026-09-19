@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from autoforge import __prompt_version__
 from autoforge.config import default_config
 from autoforge.errors import (
     ControlResultValidationError,
@@ -2359,7 +2360,7 @@ def test_run_logs_are_redacted_and_structured(tmp_state_dir, fake_github):
         assert (d / name).exists(), name
     assert "ghp_abcdefghijklmnopqrstuvwxyz0123456789" not in (d / "stdout.log").read_text()
     req = json.loads((d / "request.json").read_text())
-    assert req["provider"] == "claude" and req["prompt_version"] == "v1"
+    assert req["provider"] == "claude" and req["prompt_version"] == __prompt_version__
     assert "environ" not in req and req["timeout_seconds"] > 0
     events = (run_dir / "events.jsonl").read_text().strip().splitlines()
     assert len(events) == 1

@@ -117,10 +117,10 @@ two markers is the follow-up of both findings.
   which is the most findings a review round can carry).
 - Bounds: a `rationale` is between {{MIN_RATIONALE_CHARS}} and
   {{MAX_FIX_RATIONALE_CHARS}} characters and may contain newlines and tabs but
-  no other control character; `commit_sha`, when given, is a git SHA;
-  `follow_up_issue_url` is the real issue URL. A result outside these
-  bounds is rejected as a whole and you are asked to re-emit it; the
-  controller never clips a resolution.
+  no other control character; `commit_sha`, when given, is a full
+  40-character git SHA; `follow_up_issue_url` is the real issue URL. A
+  result outside these bounds is rejected as a whole and you are asked to
+  re-emit it; the controller never clips a resolution.
 - The controller verifies `new_head_sha` against the real PR HEAD and each
   follow-up issue URL against GitHub (it exists, is OPEN, is in this
   repository, and is the one open issue carrying the finding's marker);

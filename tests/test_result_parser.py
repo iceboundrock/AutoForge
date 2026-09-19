@@ -786,15 +786,124 @@ def _remote_fix_result(**resolution) -> FixResult:
     )
 
 
-def test_fix_commit_sha_must_be_a_sha_when_present():
-    for sha in (SHA_B, SHA_B[:7], SHA_B.upper()):
+def test_fix_commit_sha_must_be_a_full_sha_when_present():
+    for sha in (SHA_B, SHA_B.upper()):
         assert _remote_fix_result(commit_sha=sha).resolutions[0].commit_sha == sha.lower()
     for absent in ({}, {"commit_sha": None}, {"commit_sha": ""}, {"commit_sha": "  "}):
         assert _remote_fix_result(**absent).resolutions[0].commit_sha == ""
-    with pytest.raises(ControlResultValidationError, match="'commit_sha' must be a git SHA"):
-        _remote_fix_result(commit_sha="not-a-sha")
-    with pytest.raises(ControlResultValidationError, match="'commit_sha' must be a git SHA"):
-        _remote_fix_result(commit_sha=SHA_B + "0")  # 41 hex characters is not a SHA
+    for bad in ("not-a-sha", SHA_B[:7], SHA_B[:39], SHA_B + "0"):
+        with pytest.raises(ControlResultValidationError, match="'commit_sha' must be a full git"):
+            _remote_fix_result(commit_sha=bad)
+
+
+_REPLAN_REST = {
+    "issue_url": ISSUE,
+    "previous_pr_url": PR,
+    "replacement_pr_url": "https://github.com/owner/repo/pull/8",
+    "previous_branch": BRANCH,
+    "replacement_branch": BRANCH + "-r2",
+    "execution_attempt": 2,
+    "historical_findings_considered": 1,
+    "unique_failure_constraints": 1,
+    "previous_pr_disposition": "superseded",
+    "fresh_review_round": 1,
+    "verification": {"tests_run": ["pytest"], "tests_passed": True},
+}
+
+_SHA_FIELDS = [
+    pytest.param(
+        Phase.ANALYZE_EXECUTE,
+        WorkflowMode.REMOTE,
+        {"issue_url": ISSUE, "pr_url": PR, "branch": BRANCH},
+        "head_sha",
+        id="ANALYZE_EXECUTE.head_sha",
+    ),
+    pytest.param(
+        Phase.REVIEW,
+        WorkflowMode.REMOTE,
+        {
+            "round": 1,
+            "review_comment_url": comment_url(PR, 1),
+            "needs_fix_round": False,
+            "findings": [],
+        },
+        "reviewed_head_sha",
+        id="REVIEW.reviewed_head_sha",
+    ),
+    pytest.param(
+        Phase.FIX,
+        WorkflowMode.REMOTE,
+        {"new_head_sha": SHA_B, "resolutions": []},
+        "previous_head_sha",
+        id="FIX.previous_head_sha",
+    ),
+    pytest.param(
+        Phase.FIX,
+        WorkflowMode.REMOTE,
+        {"previous_head_sha": SHA_A, "resolutions": []},
+        "new_head_sha",
+        id="FIX.new_head_sha",
+    ),
+    pytest.param(
+        Phase.REPLAN_REEXECUTE,
+        WorkflowMode.REMOTE,
+        dict(_REPLAN_REST, replacement_head_sha=SHA_B),
+        "previous_head_sha",
+        id="REPLAN_REEXECUTE.previous_head_sha",
+    ),
+    pytest.param(
+        Phase.REPLAN_REEXECUTE,
+        WorkflowMode.REMOTE,
+        dict(_REPLAN_REST, previous_head_sha=SHA_B),
+        "replacement_head_sha",
+        id="REPLAN_REEXECUTE.replacement_head_sha",
+    ),
+]
+
+
+@pytest.mark.parametrize("phase,mode,rest,key", _SHA_FIELDS)
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(SHA_A[:7], id="abbreviated-7"),
+        pytest.param(SHA_A[:12], id="abbreviated-12"),
+        pytest.param(SHA_A[:39], id="one-short"),
+        pytest.param(SHA_A + "a", id="one-long"),
+        pytest.param("g" * 40, id="not-hex"),
+    ],
+)
+def test_every_sha_field_requires_the_full_40_character_sha(phase, mode, rest, key, value):
+    """#19: the prompts require the full SHA `git rev-parse HEAD` / `gh pr view
+    --json headRefOid` report, and the engine compares every accepted SHA by
+    equality with one read from GitHub. An abbreviated SHA must therefore be
+    the schema error it is, at parse time, not a later "SHA mismatch" whose
+    message blames the comparison rather than the shape."""
+    payload = {"phase": phase.value, "status": "success", key: value, **rest}
+    with pytest.raises(
+        ControlResultValidationError, match=rf"{key!r} must be a full git SHA \(exactly 40"
+    ):
+        parse_control_result(block(payload), phase, mode)
+    # The same payload with the full SHA is the accepted shape.
+    parse_control_result(block(dict(payload, **{key: SHA_A})), phase, mode)
+
+
+def test_sha_rejection_quotes_a_short_value_and_measures_a_long_one():
+    with pytest.raises(ControlResultValidationError, match=repr(SHA_A[:7])):
+        _remote_fix_result(commit_sha=SHA_A[:7])
+    with pytest.raises(ControlResultValidationError, match="41 characters") as info:
+        _remote_fix_result(commit_sha=SHA_A + "a")
+    assert SHA_A + "a" not in str(info.value)
+
+
+def test_a_fenced_control_result_block_is_accepted():
+    """The prompts show every schema example inside a Markdown code fence and
+    say a fence around the block is harmless (#19); the parser reads the
+    block by its markers alone, so that promise is pinned here."""
+    payload = {"phase": "UPDATE_EPIC", "status": "success", "next_issue_url": None}
+    stdout = "progress log\n```text\n" + block(payload) + "\n```\n"
+    assert parse_control_result(stdout, Phase.UPDATE_EPIC) == payload
+    stdout = "```\n" + block(payload) + "```"
+    assert parse_control_result(stdout, Phase.UPDATE_EPIC) == payload
 
 
 @pytest.mark.parametrize(

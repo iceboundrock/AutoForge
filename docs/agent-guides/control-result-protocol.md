@@ -43,6 +43,31 @@ looks good
 merged successfully
 ```
 
+### Block markers, not fences
+
+The parser locates the block by its `<<<CONTROL_RESULT>>>` /
+`<<<END_CONTROL_RESULT>>>` markers alone (`_BLOCK_RE`), so a Markdown code
+fence around the block is neither required nor harmful: the schema examples
+in every phase prompt are shown inside a fence, and an agent that copies
+that shape emits a block the parser reads. The common prompts say so rather
+than forbid the fence (#19); `tests/test_result_parser.py` pins that a
+fenced block is accepted, so the prompt and the parser cannot drift on it
+again.
+
+### SHA fields
+
+Every SHA field (`head_sha`, `reviewed_head_sha`, `previous_head_sha`,
+`new_head_sha`, `replacement_head_sha`, a FIX resolution's optional
+`commit_sha`) must be the **full 40-character** hexadecimal object id, and
+is lower-cased on acceptance (`_SHA_RE`). The parser holds the agent to the
+same rule the prompts state and `autoforge.claims` applies to a marker: the
+controller compares each accepted SHA by equality with one read from GitHub
+(`git rev-parse HEAD`, `gh pr view --json headRefOid`), so an abbreviated
+SHA could only pass the schema and then fail that comparison as a
+"SHA mismatch", which is a verification error about the wrong thing. It is
+refused at parse time instead, as the schema error it is, through the
+ordinary correction retry.
+
 ### Review required fields
 
 A `REVIEW` result carries, besides `phase` and `status`:
@@ -175,8 +200,9 @@ persisted `MAX_REQUIRED_RESOLUTION_CHARS` through `redaction.MAX_GROWTH_FACTOR`
 in the same test that pins the review bounds, so a redacted rationale is
 never larger than a redacted resolution. A `commit_sha`, when present, must
 have the shape of a git SHA (`_SHA_RE`, the same rule as every required SHA
-field); a SHA rejection quotes the value only when it is short enough to be
-one and otherwise states its length. Every URL field (`follow_up_issue_url`,
+field; see "SHA fields" above); a SHA rejection quotes the value only when
+it is short enough to be one and otherwise states its length. Every URL
+field (`follow_up_issue_url`,
 `issue_url`, `pr_url`, `review_comment_url`, `next_issue_url`) is bounded by
 length before `validation.parse_*` sees it, because those parsers quote the
 URL in their error and that error reaches the correction prompt and the run

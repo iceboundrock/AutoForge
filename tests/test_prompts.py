@@ -486,3 +486,70 @@ def test_common_prompt_states_the_worktree_and_environment_isolation():
     assert "{{AGENT_WORKTREE}}" not in common
     for template in ("analyze_execute.md", "fix.md", "review.md"):
         assert "in this worktree" in prompts.load_template(template), template
+
+
+def test_common_prompts_do_not_forbid_a_fence_the_parser_accepts():
+    """#19 item 2: the common prompts said the block must never be inside a
+    Markdown code fence while every schema example was shown inside one and
+    the parser reads the block by its markers alone. The rule is gone and
+    the prompt says the fence is harmless; the parser side is pinned in
+    ``tests/test_result_parser.py``."""
+    for template in ("common.md", "local_common.md"):
+        text = prompts.load_template(template)
+        assert "never\n  inside a Markdown code fence" not in text, template
+        assert "never inside a Markdown code fence" not in text, template
+        assert "neither required nor harmful" in text, template
+        assert "as the very last thing on stdout" in text, template
+
+
+def test_common_prompt_requires_the_full_sha_the_parser_requires():
+    """#19 item 1: the prompt's "full 40-character" SHA is the parser's rule."""
+    from autoforge.result_parser import _SHA_RE
+
+    common = prompts.load_template("common.md")
+    assert "full 40-character strings" in common
+    assert "the controller rejects an abbreviated SHA" in common
+    assert "full\n  40-character git SHA" in prompts.load_template("fix.md")
+    assert "40 hex chars" in prompts.load_template("analyze_execute.md")
+    assert _SHA_RE.match("a" * 40) and not _SHA_RE.match("a" * 39) and not _SHA_RE.match("a" * 7)
+
+
+def test_review_prompt_makes_the_phase_read_only(engine):
+    """#19 item 4: the reviewer is a full coding agent, so the prompt says its
+    only write is the review comment. LOCAL review already had the rule."""
+    from tests.conftest import PR, SHA_A
+
+    review = prompts.load_template("review.md")
+    read_only = review.split("**Read-only phase.**", 1)[1].split("\n\n", 1)[0]
+    for phrase in (
+        "Do not commit,\n   push",
+        "do not create or\n   delete a branch",
+        "do not modify, create, format or delete a file",
+        "do not edit the PR title",
+        "is a finding for the FIX round, never something you fix yourself",
+        "only write is the one review comment",
+        "makes the round stale",
+        "no fixer is launched",
+    ):
+        assert phrase in read_only, phrase
+    assert "**Read-only phase.**" in prompts.load_template("local_review.md")
+
+    engine.state.phase = Phase.REVIEW
+    engine.state.current_pr_url = PR
+    engine.state.current_head_sha = SHA_A
+    engine.state.current_base_ref = "main"
+    rendered = engine.render_prompt_for(Phase.REVIEW)
+    assert "**Read-only phase.**" in rendered
+    assert f"the round is bound to `{SHA_A}`" in rendered
+
+
+def test_prompt_version_is_rendered_and_was_bumped_for_the_prompt_changes(engine):
+    """#19: the prompt contract changed (SHA rule, fence rule, read-only
+    review), so the version every prompt and run log carries moved past v1."""
+    from autoforge import __prompt_version__
+
+    assert __prompt_version__ != "v1"
+    engine.state.phase = Phase.ANALYZE_EXECUTE
+    rendered = engine.render_prompt_for(Phase.ANALYZE_EXECUTE)
+    header = f"# AutoForge controller instructions (trusted): {__prompt_version__}"
+    assert rendered.startswith(header)

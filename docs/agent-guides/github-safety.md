@@ -176,6 +176,19 @@ worked) records its comment URL in its history entry and in
 `PREVIOUS_REVIEW_COMMENT_URL`, but launches no fixer, so a stale comment never
 becomes a FIX handoff.
 
+The reviewer is a full coding agent launched in the issue's worktree, and
+the REVIEW prompt makes the phase read-only: the one review comment is its
+only write; it commits, pushes and edits nothing, and a defect it finds is a
+finding for the fixer, never its own fix (#19). That is a prompt rule; what
+the controller enforces is the binding above. A reviewer that pushes anyway
+moves the HEAD its own round was bound to, and the controller treats that
+exactly as any other push during the round: the round is stale, consumed
+against the cap, its findings carried, and the next round reviews the
+reviewer's commit. It is not made a hard error because the post-review
+read cannot tell the reviewer's push from an operator's or a fixer's, and
+blocking on every push during a round would turn ordinary concurrent work
+on the PR into a human decision.
+
 ### Before FIX
 
 The fixer is launched only while the PR HEAD read from GitHub equals the
