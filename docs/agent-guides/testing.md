@@ -62,6 +62,25 @@ High-priority coverage includes:
 - non-UTF-8 output is replaced, not raised; a multi-byte character across
   the internal head/tail split is intact when nothing was omitted
 - arguments containing shell metacharacters
+- the allow-listed environment: an exact name and a `PREFIX*` select from
+  the controller's environment, an absent name adds no placeholder, an
+  invalid entry refuses to launch, no allow-list inherits everything, and
+  an explicit `env` is layered over the selection
+
+### Agent isolation (REMOTE)
+
+- the agent's cwd is the per-issue worktree under the git common dir (or
+  `execution.worktree_dir`), detached at the checkout's HEAD, without the
+  operator's uncommitted work or `.autoforge/`; it is reused across phases
+  as the agent left it
+- a path that exists but is not a worktree root of this repository, or a
+  location inside the operator's working tree, is refused, not adopted
+- a dry run creates no worktree and runs no git
+- the agent request and the run log carry the configured allow-list; pre-merge
+  and validation commands run under the same one
+- HEAD or branch of the operator's checkout changing while the agent ran
+  enters BLOCKED (also when the invocation itself failed); agent commits in
+  its own worktree are not drift
 
 ### GitHub verification
 

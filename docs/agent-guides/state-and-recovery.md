@@ -112,6 +112,24 @@ __pycache__/
 
 Do not commit generated controller state, logs, lock files, credentials, or local virtual environments.
 
+The controller also keeps runtime artifacts inside the repository's git
+common dir, which git never tracks: the controller lock
+(`.git/autoforge/controller.lock`), a LOCAL run's default state directory
+(`.git/autoforge/state`) and, in REMOTE mode, one detached agent worktree
+per issue (`.git/autoforge/worktrees/<issue-number>`, unless
+`execution.worktree_dir` points elsewhere). A worktree is created at the
+first agent launch for its issue, reused by every later phase of that issue
+across `resume`, and never deleted, moved or pruned by the controller; the
+operator removes it with `git worktree remove` when the issue is done. A
+path that exists there but is not a worktree of this repository is refused,
+never adopted: a symbolic link at the path is refused on the entry itself,
+whatever it points to (a link to the operator's checkout or to another
+worktree would otherwise answer git as that tree), a directory is
+reused only when `git worktree list` registers it as a worktree root, and a
+path reached through a symbolic link above it (`.git/autoforge/worktrees`
+linked into the working tree, say) is refused before anything is created,
+so a worktree only ever appears at the literal derived path.
+
 ---
 
 ## Error handling

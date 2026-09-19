@@ -84,6 +84,7 @@ Safety rules:
 from __future__ import annotations
 
 import json
+import os
 import re
 import secrets
 from collections.abc import Callable, Hashable, Iterator
@@ -114,6 +115,7 @@ from .claims import (
 )
 from .config import DEFAULT_STATE_DIR, AutoForgeConfig, validate_required_profiles
 from .errors import (
+    CheckoutDriftError,
     ClaimConflictError,
     ConfigurationError,
     ControlResultError,
@@ -138,6 +140,7 @@ from .github import (
     build_merge_argv,
 )
 from .local_workspace import (
+    GIT_TIMEOUT_SECONDS,
     FeatureSpec,
     LocalWorkspace,
     WorkspaceSnapshot,
@@ -532,6 +535,9 @@ class ControllerEngine:
         self._github = github
         self._runner = runner
         self._workspace: LocalWorkspace | None = None
+        # The per-issue agent worktree paths already derived (a git read
+        # each), keyed by the worktree's name; see :meth:`agent_worktree_path`.
+        self._agent_worktrees: dict[str, Path] = {}
         # The workspace snapshot bound immediately before a LOCAL agent
         # phase. The prompt is rendered from it, so the fingerprint the
         # reviewer is told to report is exactly the one persisted in state.
@@ -683,12 +689,327 @@ class ControllerEngine:
         invocation's cwd genuinely DYNAMIC (see :mod:`autoforge.run_contract`):
         it decides where the repository is *found*, and nothing else.
 
-        A REMOTE run has no contract and is launched from ``workdir`` as
-        before; GitHub, not a working-tree verifier, is its source of truth.
+        A REMOTE run has no contract; its agents are launched in the
+        per-issue worktree (:meth:`_ensure_agent_worktree`), never in the
+        checkout the controller is run from. GitHub, not a working-tree
+        verifier, is its source of truth.
         """
         if self.mode is WorkflowMode.LOCAL:
             return self.local_contract().repository_root
-        return self.workdir
+        return str(self._ensure_agent_worktree())
+
+    # -- REMOTE agent isolation ---------------------------------------------
+    def _agent_worktree_name(self) -> str:
+        """One worktree per issue: its number, or the EPIC's between issues."""
+        s = self._require_state()
+        if s.current_issue_url:
+            return str(parse_issue_url(s.current_issue_url).number)
+        return f"epic-{parse_issue_url(s.epic_url).number}"
+
+    def agent_worktree_description(self) -> str:
+        """The worktree path for messages and plans, without touching git.
+
+        A dry run runs no ``git`` (it may be planned outside any repository),
+        so until :meth:`agent_worktree_path` has resolved the path in this
+        engine the default location is described rather than resolved.
+        """
+        name = self._agent_worktree_name()
+        cached = self._agent_worktrees.get(name)
+        if cached is not None:
+            return str(cached)
+        configured = self.config.execution.worktree_dir
+        if configured:
+            return str(Path(os.path.realpath(Path(self.workdir) / configured)) / name)
+        return f"<git common dir>/autoforge/worktrees/{name}"
+
+    def agent_worktree_path(self) -> Path:
+        """Where this issue's agents work. Derives the path (one git read), creates nothing.
+
+        Under ``execution.worktree_dir`` when configured (relative to the
+        controller's working directory), otherwise under
+        ``<git common dir>/autoforge/worktrees``, next to the controller lock
+        and a LOCAL run's state: inside the repository's git directory,
+        which is outside every working tree of the checkout, so the
+        operator's tree never contains it and the agent's never contains
+        ``.autoforge/``, the lock or the operator's uncommitted work. The
+        common dir (not the per-worktree git dir) keys it, so a controller
+        run from a linked worktree of the checkout uses the same place.
+        """
+        name = self._agent_worktree_name()
+        cached = self._agent_worktrees.get(name)
+        if cached is not None:
+            return cached
+        configured = self.config.execution.worktree_dir
+        if configured:
+            base = Path(os.path.realpath(Path(self.workdir) / configured))
+        else:
+            base = self.workspace().git_dirs()[-1] / "autoforge" / "worktrees"
+        path = base / name
+        self._agent_worktrees[name] = path
+        return path
+
+    def _worktree_identity(self, path: Path) -> tuple[Path, Path] | None:
+        """``(working-tree root, git common dir)`` of ``path``, or ``None`` outside git.
+
+        Both are needed to recognise a worktree the controller created: a
+        plain directory under ``.git/`` answers ``--git-common-dir`` as the
+        repository itself (git treats the inside of a git directory as that
+        repository) but has no working tree, and a subdirectory of some
+        worktree has that worktree's root, not its own.
+        """
+        res = (self._runner or execute)(
+            ExecutionRequest(
+                command=[
+                    "git",
+                    "-C",
+                    str(path),
+                    "rev-parse",
+                    "--show-toplevel",
+                    "--git-common-dir",
+                ],
+                timeout_seconds=GIT_TIMEOUT_SECONDS,
+            )
+        )
+        if res.timed_out or res.truncated or res.exit_code != 0:
+            return None
+        lines = [line.strip() for line in res.stdout.splitlines() if line.strip()]
+        if len(lines) != 2:
+            return None
+        root = Path(os.path.realpath(lines[0]))
+        common = Path(os.path.realpath(path / lines[1]))
+        return root, common
+
+    def _registered_worktree_roots(self) -> set[Path]:
+        """The working-tree roots ``git worktree list`` registers for this repository.
+
+        Read from the controller's own checkout, so the answer comes from
+        the repository's registry (the common dir's ``worktrees/``), not
+        from whatever the candidate path leads to. Git reports the paths
+        resolved; a linked worktree whose tree is gone is listed as
+        ``prunable`` and left out, since nothing at its path is a worktree.
+        """
+        res = (self._runner or execute)(
+            ExecutionRequest(
+                command=["git", "worktree", "list", "--porcelain"],
+                cwd=self.workdir,
+                timeout_seconds=GIT_TIMEOUT_SECONDS,
+            )
+        )
+        if res.timed_out or res.truncated or res.exit_code != 0:
+            detail = (res.stderr or res.stdout).strip().splitlines()
+            raise VerificationError(
+                "cannot list the repository's worktrees (`git worktree list` "
+                f"{'timed out' if res.timed_out else f'exited {res.exit_code}'}"
+                f"{f': {detail[-1]}' if detail else ''}); the controller will not reuse "
+                "an agent worktree it cannot confirm is registered"
+            )
+        roots: set[Path] = set()
+        for entry in res.stdout.split("\n\n"):
+            lines = [line.strip() for line in entry.splitlines() if line.strip()]
+            if not lines or not lines[0].startswith("worktree "):
+                continue
+            if any(line == "prunable" or line.startswith("prunable ") for line in lines[1:]):
+                continue
+            roots.add(Path(os.path.realpath(lines[0][len("worktree ") :])))
+        return roots
+
+    def _ensure_agent_worktree(self) -> Path:
+        """The issue's agent worktree, created on first use and never deleted.
+
+        A new worktree is added detached at the checkout's current HEAD:
+        the agent fetches and checks out the branch its phase needs (the
+        prompts say so), and no branch is created or moved here. An
+        existing one is reused as the agent left it -- on the PR branch,
+        with whatever it committed -- which is what the next phase of the
+        same issue wants. A path that exists but is not a worktree root of
+        this repository (a stale directory, a foreign checkout, a
+        subdirectory of some tree) is refused, not adopted: the controller
+        never launches an agent somewhere it did not create. So is a
+        symbolic link at the path, whatever it points to, decided on the
+        entry itself before anything follows it; and reuse requires the
+        directory to be registered in this repository's worktree list, not
+        merely to answer git as some worktree. Nor is one
+        created inside the operator's working tree (the git directory,
+        which git never walks as content, excepted), where it would sit in
+        their ``git status`` and the agent's tree would contain the
+        operator's -- and, since ``mkdir`` and ``git worktree add`` would
+        follow it there, nor at a path a symbolic link above it leads
+        elsewhere: a worktree is created only at the literal derived path.
+        Only :meth:`_invoke_phase` reaches this, so a dry run
+        never creates one; the operator removes worktrees
+        (``git worktree remove``), the controller does not.
+        """
+        path = self.agent_worktree_path()
+        ws = self.workspace()
+        common = ws.git_dirs()[-1]
+        if path.is_symlink():
+            # Decided on the entry itself (lstat), before anything follows the
+            # link: `git -C` and realpath both answer for the *target*, so a
+            # link to the operator's checkout or to another worktree of this
+            # repository would otherwise pass every check below as that tree.
+            target = os.readlink(path)
+            raise VerificationError(
+                f"the agent worktree path {path} is a symbolic link (to {target}), not a "
+                f"worktree of the repository at {common}; the controller launches agents "
+                "only in a directory it created itself, never through a link -- remove "
+                "the link or configure execution.worktree_dir elsewhere"
+            )
+        if path.exists():
+            found = self._worktree_identity(path)
+            real = Path(os.path.realpath(path))
+            if real != path:
+                # `path` is not a link, so a component above it is: the base was
+                # resolved when the path was derived and has changed since.
+                what = f"reached through a symbolic link ({real})"
+            elif found is None:
+                what = "not a git worktree"
+            elif found[1] != common:
+                what = f"part of the repository at {found[1]}"
+            elif found[0] != path:
+                what = f"inside the worktree rooted at {found[0]}, not a worktree of its own"
+            elif path == ws.root():
+                what = "the checkout the controller is run from"
+            elif path not in self._registered_worktree_roots():
+                what = "not registered in the repository's worktree list"
+            else:
+                return path
+            raise VerificationError(
+                f"the agent worktree path {path} exists but is not a worktree of the "
+                f"repository at {common} (it is {what}); move it aside or configure "
+                "execution.worktree_dir elsewhere"
+            )
+        real = Path(os.path.realpath(path))
+        if real != path:
+            # The path does not exist, so a component above it is a link (the
+            # base was resolved when the path was derived; `.git/autoforge` or
+            # `worktrees` below it was not). `mkdir` and `git worktree add`
+            # would follow it, and the guard below compares the literal path,
+            # so a link into the operator's working tree would be followed
+            # there unnoticed.
+            raise VerificationError(
+                f"cannot create the agent worktree {path}: it is reached through a "
+                f"symbolic link ({real}); the controller creates a worktree only at the "
+                "derived path itself, never through a link -- remove the link or "
+                "configure execution.worktree_dir elsewhere"
+            )
+        operator_root = ws.root()
+        inside_git_dir = any(d == path or d in path.parents for d in ws.git_dirs())
+        if not inside_git_dir and (path == operator_root or operator_root in path.parents):
+            raise VerificationError(
+                f"cannot create the agent worktree {path} inside the checkout's working "
+                f"tree {operator_root}; configure execution.worktree_dir outside it"
+            )
+        if not ws.head_sha():
+            raise VerificationError(
+                f"cannot create the agent worktree {path}: the checkout at "
+                f"{Path(self.workdir).resolve()} has no commit yet, and a worktree needs a "
+                "commit to start from"
+            )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        res = (self._runner or execute)(
+            ExecutionRequest(
+                command=["git", "worktree", "add", "--detach", str(path), "HEAD"],
+                cwd=self.workdir,
+                timeout_seconds=GIT_TIMEOUT_SECONDS,
+            )
+        )
+        if res.timed_out or res.truncated or res.exit_code != 0:
+            detail = (res.stderr or res.stdout).strip().splitlines()
+            raise VerificationError(
+                f"cannot create the agent worktree {path}: `git worktree add` "
+                f"{'timed out' if res.timed_out else f'exited {res.exit_code}'}"
+                f"{f' ({detail[-1]})' if detail else ''}"
+            )
+        return path
+
+    def _checkout_anchor(self) -> tuple[str, str]:
+        """HEAD and branch of the checkout the controller is run from."""
+        ws = self.workspace()
+        return ws.head_sha(), ws.branch()
+
+    def _checkout_drift(self, anchor: tuple[str, str]) -> str:
+        """How the operator's checkout moved since ``anchor`` was read, or ""."""
+        head, branch = anchor
+        now_head, now_branch = self._checkout_anchor()
+        drift: list[str] = []
+        if now_head != head:
+            drift.append(
+                f"HEAD moved from {head[:12] or '(unborn)'} to {now_head[:12] or '(unborn)'}"
+            )
+        if now_branch != branch:
+            drift.append(
+                f"the checked-out branch changed from {branch or '(detached HEAD)'} to "
+                f"{now_branch or '(detached HEAD)'}"
+            )
+        return " and ".join(drift)
+
+    def _invoke_phase_anchored(
+        self, phase: Phase, reconcile: Callable[[], StepOutcome | None]
+    ) -> dict | StepOutcome:
+        """:meth:`_invoke_phase`, with the operator's checkout pinned around it.
+
+        The LOCAL anchor check (:meth:`_git_anchor_drift`), reused for a
+        REMOTE run: HEAD and the checked-out branch of the checkout the
+        controller is run from are read before the launch and again after
+        it returns -- however it returns -- and a change is a
+        :class:`CheckoutDriftError`, which the step turns into BLOCKED. The
+        agents are launched in the per-issue worktree and told to work only
+        there, so the checkout moving means an agent (or someone else) did
+        what the prompts forbid, and the controller cannot tell which;
+        nothing is rolled back. The read itself failing is a
+        VerificationError as in LOCAL mode: not evidence of no drift.
+        """
+        anchor = self._checkout_anchor()
+        try:
+            result = self._invoke_phase(phase, reconcile)
+        except Exception as exc:
+            drift = self._checkout_drift(anchor)
+            if drift:
+                outcome = f"The invocation itself ended with {type(exc).__name__}: {exc}"
+                raise CheckoutDriftError(
+                    self._checkout_drift_reason(phase, drift, outcome)
+                ) from exc
+            raise
+        drift = self._checkout_drift(anchor)
+        if drift:
+            raise CheckoutDriftError(
+                self._checkout_drift_reason(
+                    phase,
+                    drift,
+                    "The agent returned; its claims were not verified and nothing was applied"
+                    if isinstance(result, dict)
+                    else "The phase was resolved from GitHub without applying the agent's claims",
+                )
+            )
+        return result
+
+    def _checkout_drift_reason(self, phase: Phase, drift: str, outcome: str) -> str:
+        return (
+            f"the checkout the controller is run from ({Path(self.workdir).resolve()}) moved "
+            f"while {phase.value} ran: {drift}. Agents work only in the per-issue worktree "
+            f"({self.agent_worktree_description()}); the controller never commits to, checks out, "
+            "resets or switches branches in the checkout it is run from and requires the "
+            "same of the agents it launches, because it cannot tell an agent's commit from "
+            f"an operator's. Nothing was rolled back -- the controller never undoes a git "
+            f"operation it did not perform. {outcome}. Inspect the checkout and the agent's "
+            "GitHub work, then 'unblock'"
+        )
+
+    def _isolation_plan_notes(self) -> list[str]:
+        """What a REMOTE agent step's isolation would be, for the plan / dry run.
+
+        No git runs here: a dry run may be planned outside any repository.
+        """
+        names = self.config.execution.environment_names()
+        return [
+            f"agent working directory: {self.agent_worktree_description()} (a detached git "
+            "worktree of this checkout, one per issue, created at the first agent launch "
+            "for the issue and reused afterwards; the controller never deletes it)",
+            f"agent environment: {len(names)} allow-listed name(s) from execution.env_allowlist "
+            "plus the provider's own; nothing else is inherited",
+            f"HEAD and branch of {Path(self.workdir).resolve()} are read before and after the "
+            "invocation; a change enters BLOCKED",
+        ]
 
     def bind_local_state_dir(self, explicit: str | Path | None = None) -> None:
         """Point :attr:`paths` at where this LOCAL run keeps its runtime state.
@@ -1242,6 +1563,7 @@ class ControllerEngine:
         variables = self._prompt_variables()
         prompt = self.render_prompt_for(s.phase)
         command = self.providers.get(profile).build_command_for(profile, prompt)
+        notes.extend(self._isolation_plan_notes())
         return StepPlan(
             phase=s.phase.value,
             profile_name=profile.name,
@@ -1633,7 +1955,14 @@ class ControllerEngine:
         if resolved is not None:
             return resolved
 
-        invoked = self._invoke_phase(previous, lambda: self._remote_entry(previous, plan))
+        try:
+            invoked = self._invoke_phase_anchored(
+                previous, lambda: self._remote_entry(previous, plan)
+            )
+        except CheckoutDriftError as exc:
+            # The operator's checkout moved under the agent (the prompts
+            # forbid it; this is the controller enforcing it, as LOCAL does).
+            return self._block(previous, plan, str(exc))
         if isinstance(invoked, StepOutcome):
             # A correction relaunch was pre-empted by the entry reconciliation:
             # the malformed attempt's GitHub work resolved the phase.
@@ -2255,10 +2584,14 @@ class ControllerEngine:
         cwd = self._execution_cwd()
         logger = self._logger()
         for argv in commands:
+            # The commands are the repository's (a Makefile target, a test
+            # runner the tree defines): allow-listed environment, as for an
+            # agent, not the operator's whole shell.
             req = ExecutionRequest(
                 command=list(argv),
                 cwd=cwd,
                 timeout_seconds=self.config.execution.default_timeout_seconds,
+                env_allowlist=self.config.execution.environment_names(),
             )
             result = (self._runner or execute)(req)
             record = ExecutionRecord(
@@ -3356,10 +3689,13 @@ class ControllerEngine:
     def _run_premerge_command(self, phase: Phase, pr: PRInfo, argv: list[str], cwd: str) -> str:
         """One ``merge.verification_commands`` entry in the exported tree; "" on exit 0."""
         state = self._require_state()
+        # Repository-defined commands run under the same allow-listed
+        # environment as an agent: they are the PR's code, not the operator's.
         req = ExecutionRequest(
             command=list(argv),
             cwd=cwd,
             timeout_seconds=self.config.execution.default_timeout_seconds,
+            env_allowlist=self.config.execution.environment_names(),
         )
         result = (self._runner or execute)(req)
         record = ExecutionRecord(
@@ -5153,6 +5489,9 @@ class ControllerEngine:
         # of it are launched from the same directory, and for a LOCAL run
         # that directory comes from the contract (see :meth:`_execution_cwd`).
         cwd = self._execution_cwd()
+        # Names only, never values: what the agent may inherit from the
+        # controller's environment (the provider adds its own CLI's names).
+        env_allowlist = self.config.execution.environment_names()
         # The logger is opened -- and the run directory proved to take a
         # new entry, the event journal proved appendable -- *before* the
         # agent is launched, not at the first write after it returns. The
@@ -5205,6 +5544,7 @@ class ControllerEngine:
                 timeout_seconds=timeout,
                 attempt=state.attempt,
                 correction=correction_error is not None,
+                env_allowlist=env_allowlist,
             )
             record = ExecutionRecord(
                 run_id=state.run_id,
@@ -5223,7 +5563,10 @@ class ControllerEngine:
                 command=provider.build_command_for(profile, prompt),
                 cwd=cwd,
                 timeout_seconds=timeout,
-                metadata=self._log_metadata(phase),
+                metadata={
+                    **self._log_metadata(phase),
+                    "env_allowlist": list(provider.environment_allowlist(req) or ()),
+                },
             )
             result: AgentExecutionResult | None = None
             try:

@@ -70,9 +70,9 @@ two markers is the follow-up of both findings.
 1. Read the repository's `AGENTS.md` / `CLAUDE.md` if present.
 2. Read the verified review comment ({{REVIEW_COMMENT_URL}}) for the full
    text of the findings below, and the issue for context.
-3. Check out the PR branch (`gh pr checkout {{PR_URL}}`), `git pull`, and
-   confirm `git rev-parse HEAD` equals `{{HEAD_SHA}}`. If it does not, stop and
-   report `"status": "failure"`.
+3. Check out the PR branch in this worktree (`gh pr checkout {{PR_URL}}`),
+   `git pull`, and confirm `git rev-parse HEAD` equals `{{HEAD_SHA}}`. If it
+   does not, stop and report `"status": "failure"`.
 4. Address EVERY finding ID listed above. For each finding choose exactly one
    resolution:
    - `fixed`: you changed code/tests/docs in this PR to resolve it.

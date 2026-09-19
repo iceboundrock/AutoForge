@@ -221,10 +221,12 @@ def test_fetch_pr_head_brings_the_commit_without_creating_a_local_ref(tmp_path):
     assert commit_is_local(execute, str(local), base)
     assert not commit_is_local(execute, str(local), pr_head)
 
+    refs_before = _git(local, "for-each-ref", "--format=%(refname)")
     fetch_pr_head(execute, str(local), 7)
     assert commit_is_local(execute, str(local), pr_head)
     refs = _git(local, "for-each-ref", "--format=%(refname)")
-    assert "refs/pull" not in refs and "refs/heads" not in refs  # objects only
+    assert refs == refs_before  # objects only: no refs/pull, no new refs/heads
+    assert "refs/pull" not in refs
     with export_commit_tree(execute, str(local), pr_head) as exported:
         assert (exported.root / "b.txt").read_text() == "y"
 

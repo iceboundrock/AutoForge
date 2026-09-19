@@ -58,11 +58,17 @@ runtime state belonging to one operator.
 - Every implementation, fix, and replacement lifecycle happens on a dedicated
   feature branch (for example `autoforge/<issue-number>-<slug>`); a replan's
   replacement PR is based on the independently verified default branch.
-  Running the controller in a per-issue `git worktree` is the preferred
-  isolation.
-- AutoForge does not create, clean up, or delete local branches or worktrees.
-  Leaving local work untouched is safer than inferring ownership or
-  discarding uncommitted changes; the operator owns that lifecycle.
+- In REMOTE mode the controller launches every agent in a per-issue
+  `git worktree` it creates itself (`<git common dir>/autoforge/worktrees/<n>`
+  by default), never in the checkout it is run from; the agent inherits an
+  allow-listed environment (`execution.env_allowlist`), not the operator's
+  whole shell; and the controller reads HEAD and branch of its own checkout
+  before and after each invocation and enters `BLOCKED` if they moved. A
+  dry run creates no worktree.
+- AutoForge creates that worktree once and never deletes, moves or prunes
+  it, and it creates, cleans up or deletes no local branch and no other
+  worktree. Leaving local work untouched is safer than inferring ownership
+  or discarding uncommitted changes; the operator owns that lifecycle.
 - **Never commit to, push to, reset, or force-update the default branch.**
   Changes reach it only through a reviewed PR merged behind the merge safety
   gate.

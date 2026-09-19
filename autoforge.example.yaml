@@ -31,6 +31,32 @@ execution:
   # A malformed CONTROL_RESULT with exit code 0 triggers at most this many
   # correction prompts before the step fails (0 disables correction).
   max_correction_attempts: 1
+  # The environment agents, `merge.verification_commands` and
+  # `local.validation_commands` start from: only these variables of the
+  # operator's environment are inherited (a trailing `*` is a prefix), and
+  # each provider adapter adds the names its own CLI reads (claude:
+  # ANTHROPIC_*, CLAUDE_*; opencode: OPENCODE_*, OPENAI_*, ANTHROPIC_*,
+  # GEMINI_*, GOOGLE_*). `env_allowlist` replaces the built-in default list
+  # (PATH, HOME, USER, LOGNAME, SHELL, TERM, TMPDIR, TZ, LANG, LANGUAGE,
+  # LC_*, XDG_*_HOME, XDG_RUNTIME_DIR, SSH_AUTH_SOCK, GIT_AUTHOR_* /
+  # GIT_COMMITTER_*, GIT_SSH, GIT_SSH_COMMAND, GIT_CONFIG_GLOBAL, GH_TOKEN,
+  # GITHUB_TOKEN, GH_HOST, GH_CONFIG_DIR, the proxy and CA-bundle
+  # variables) and must not be empty; `env_allowlist_extra` adds to
+  # whichever list is in force. The controller's own `git` / `gh` plumbing
+  # keeps the full environment.
+  # env_allowlist: [PATH, HOME, LANG, "LC_*", SSH_AUTH_SOCK, GH_TOKEN]
+  env_allowlist_extra: []
+  #  - HTTPS_PROXY
+  #  - OPENROUTER_API_KEY
+  # Where a REMOTE run's per-issue agent worktrees live: one detached
+  # `git worktree` per issue, created at the first agent launch for that
+  # issue, reused by every later phase of it and never deleted by the
+  # controller. Null / empty (the default) is `<git common dir>/autoforge/
+  # worktrees/<issue-number>`, inside the repository's `.git`, outside every
+  # working tree; a path is resolved relative to the controller's working
+  # directory and must lie outside the checkout's working tree. A path that
+  # already exists but is not a worktree of this repository is refused.
+  worktree_dir: null
   # There is no `execution.allow_merge`: older configs that set the merge
   # gate here are rejected on load (the key lives under `safety` only).
 
@@ -118,8 +144,9 @@ merge:
   # inconclusive. A pass is persisted per (HEAD, command list) so `resume`
   # does not repeat it, and is cleared when the run moves to another issue.
   # Dry-run runs nothing and lists the commands in the plan. The commands
-  # inherit the operator's environment. Empty (the default): nothing runs
-  # locally before a merge.
+  # run under the allow-listed environment (`execution.env_allowlist`), not
+  # the operator's whole shell. Empty (the default): nothing runs locally
+  # before a merge.
   verification_commands: []
   #  - ["uv", "run", "--frozen", "pytest", "-q"]
   #  - ["uv", "run", "ruff", "check", "src", "tests"]

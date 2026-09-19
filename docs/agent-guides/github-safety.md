@@ -327,7 +327,8 @@ It must not:
 - add comments
 - merge
 - delete branches
-- delete worktrees
+- create or delete worktrees (the plan names the per-issue worktree that
+  execution would create)
 
 Never rely only on telling an LLM "do not modify anything".
 

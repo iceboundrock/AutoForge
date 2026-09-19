@@ -33,14 +33,15 @@ PR comment describing the outcome. This is review round {{REVIEW_ROUND}}.
    Confirm with `gh pr view {{PR_URL}} --json headRefOid,baseRefName` that the
    PR HEAD is still `{{REVIEWED_HEAD_SHA}}` and its base branch is still
    `{{REVIEWED_BASE_REF}}`. If the HEAD moved, review `{{REVIEWED_HEAD_SHA}}`
-   anyway (check it out locally with `git fetch origin <sha>`) and mention the
+   anyway (fetch and check it out in this worktree with
+   `git fetch origin <sha>`) and mention the
    newer HEAD in Observations; if the base changed, review the diff of
    `{{REVIEWED_HEAD_SHA}}` against `{{REVIEWED_BASE_REF}}` and mention the
    new base in Observations. Either way the controller will schedule another
    round.
 5. Inspect CI / checks (`gh pr checks {{PR_URL}}`). If checks are missing or
-   inconclusive and tests are cheap to run, check out the reviewed HEAD and run
-   the relevant test suite yourself.
+   inconclusive and tests are cheap to run, check out the reviewed HEAD in
+   this worktree and run the relevant test suite yourself.
 6. Review for: correctness and bugs; whether the implementation satisfies the
    issue specification and acceptance criteria; test coverage; adherence to
    repository standards (`AGENTS.md`/`CLAUDE.md`, style, structure);

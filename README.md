@@ -72,9 +72,14 @@ OS-level repository lock instead of any coordinator. The expected failure modes
 are a `Ctrl-C`, a killed process, and a reboot, which is why side effects are
 checkpointed before they are performed. What *is* remote and concurrent is
 GitHub and the humans acting on it, which is why nothing GitHub-side is
-believed without being read back. Work happens on a dedicated feature branch,
-ideally in a per-issue `git worktree`; AutoForge never commits to the default
-branch and never creates or cleans up local branches or worktrees itself.
+believed without being read back. Work happens on a dedicated feature branch
+in a per-issue `git worktree` the controller creates for its agents, under
+the repository's `.git` and outside the checkout it is run from; the agents
+inherit an allow-listed environment rather than the operator's shell, and
+the controller blocks if its own checkout's HEAD or branch moved while an
+agent ran. AutoForge never commits to the default branch, never deletes a
+worktree it created, and never creates or cleans up local branches or any
+other worktree.
 
 ## Architecture
 
@@ -253,8 +258,9 @@ Design points:
   for human intervention. This retains failure knowledge while intentionally
   discarding implementation anchoring; it does not guarantee convergence.
   AutoForge deliberately performs no local branch or worktree cleanup during
-  this lifecycle: leaving old local work untouched is safer than trying to
-  infer ownership or discard uncommitted user changes.
+  this lifecycle (the per-issue agent worktree included): leaving old local
+  work untouched is safer than trying to infer ownership or discard
+  uncommitted user changes.
 
 ## Workflow details
 
@@ -724,6 +730,19 @@ subdirectory and every linked `git worktree` of one checkout. `run`, `step`
 and `resume` therefore require the working directory to be inside a git
 repository (dry-run does not).
 
+Next to the lock, a REMOTE run keeps one agent worktree per issue,
+`<repo>/.git/autoforge/worktrees/<issue-number>` (or under
+`execution.worktree_dir`). It is added detached at the checkout's HEAD the
+first time an agent is launched for the issue, reused as the agent left it
+by every later phase of that issue, and never deleted by the controller:
+remove it with `git worktree remove` once the issue is done. A configured
+location must lie outside the checkout's working tree, and a path that
+already exists but is not a worktree of this repository is refused rather
+than adopted: a symbolic link there is refused whatever it points to, a
+directory is reused only when `git worktree list` registers it, and a path
+reached through a link above it is refused before anything is created.
+Dry-run creates none.
+
 State records `current_pr_url`, `current_branch`, `current_head_sha`,
 `current_base_ref`, `reviewed_pr_url`, `reviewed_head_sha`,
 `reviewed_base_ref` (the PR, HEAD and base branch the last review round
@@ -911,8 +930,28 @@ audit data rather than state payload.
   to the next issue. Each run is logged like an agent invocation. Dry-run
   runs nothing and lists the commands in the plan; `autoforge doctor`
   reports what is configured without running it. Submodules are not
-  populated in the export and the commands inherit the operator's
-  environment (environment allow-listing remains a separate task).
+  populated in the export, and the commands run under the same allow-listed
+  environment as an agent (`execution.env_allowlist`), not the operator's
+  whole shell.
+- **Agents are isolated from the operator's checkout and shell.** Every
+  REMOTE agent runs in a per-issue `git worktree` the controller creates
+  (see "State directory"), so its working directory contains neither
+  `.autoforge/`, the lock, nor the operator's uncommitted work, and a
+  `git clean -fdx` there cannot reach controller state. It starts from an
+  allow-listed environment: `execution.env_allowlist` (a documented default
+  of PATH, HOME, locale, temporary directory, XDG directories,
+  `SSH_AUTH_SOCK`, git author and SSH settings, `GH_TOKEN` / `GITHUB_TOKEN`
+  and the proxy and CA variables) plus `env_allowlist_extra`, plus the
+  names the provider adapter declares for its own CLI (`ANTHROPIC_*` and
+  `CLAUDE_*` for Claude Code; `OPENCODE_*`, `OPENAI_*`, `ANTHROPIC_*`,
+  `GEMINI_*`, `GOOGLE_*` for OpenCode); nothing else in the operator's
+  environment is inherited, and the names (never the values) are recorded
+  in the invocation's `request.json`. Before and after each invocation the
+  controller reads HEAD and the checked-out branch of its own checkout; a
+  change enters `BLOCKED` with the drift in the reason, nothing is rolled
+  back, and `unblock` reconciles the agent's GitHub work. This is process
+  and filesystem-level separation, not a sandbox: the agent still runs as
+  the operator with network access and the allow-listed credentials.
 - **Post-merge is reconciled from GitHub.** The merge is counted only after
   GitHub reports `MERGED` at the reviewed HEAD into the reviewed base
   (idempotently, across crashes; a merge into another base is `BLOCKED`,

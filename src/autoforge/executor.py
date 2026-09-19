@@ -24,17 +24,26 @@ Safety properties:
   output, however it chunks it. The tail is kept because the CONTROL_RESULT
   block is the last thing on stdout; :attr:`ExecutionResult.stdout_tail` is
   the part known to be contiguous up to EOF, so a caller that parses a
-  truncated stream never sees text that spans the cut.
+  truncated stream never sees text that spans the cut;
+- the environment is allow-listed on request: a request carrying
+  ``env_allowlist`` starts the child from only the named variables of the
+  controller's environment (:func:`select_environment`) instead of a copy
+  of all of it, so an agent or a repository-defined command never sees a
+  credential that was in the operator's shell but has nothing to do with
+  the run. Which names are allowed is policy and belongs to the caller; the
+  executor only applies the selection.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import selectors
 import signal
 import subprocess
 import threading
 import time
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import IO
@@ -52,14 +61,63 @@ _READ_CHUNK_BYTES = 64 * 1024
 # nothing legitimate should reach it.
 DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024 * 1024
 
+# An environment allow-list entry: a variable name, or a name prefix followed
+# by ``*`` (``LC_*``, ``ANTHROPIC_*``). Nothing else -- no other glob
+# characters, no empty prefix -- so an entry cannot quietly widen into
+# "everything".
+ENV_PATTERN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\*?$")
+
+
+def is_env_pattern(name: str) -> bool:
+    """Whether ``name`` is a valid environment allow-list entry."""
+    return bool(ENV_PATTERN_RE.match(name))
+
+
+def select_environment(
+    names: Iterable[str], source: Mapping[str, str] | None = None
+) -> dict[str, str]:
+    """The variables of ``source`` (default: this process's environment) named by ``names``.
+
+    An entry is an exact variable name or a prefix ending in ``*``; the
+    result is the subset of ``source`` some entry names, in ``source``'s
+    order, and a name that is absent from ``source`` is simply not there
+    (the child gets no empty placeholder). An entry that is not a valid
+    pattern raises :class:`ExecutionError`, so a typo in a configured list
+    is a refusal to launch, never a silently narrower or wider environment.
+    """
+    env = os.environ if source is None else source
+    exact: set[str] = set()
+    prefixes: list[str] = []
+    for name in names:
+        if not is_env_pattern(name):
+            raise ExecutionError(
+                f"invalid environment allow-list entry {name!r}: expected a variable name "
+                "or a name prefix followed by '*'"
+            )
+        if name.endswith("*"):
+            prefixes.append(name[:-1])
+        else:
+            exact.add(name)
+    return {
+        key: value
+        for key, value in env.items()
+        if key in exact or any(key.startswith(prefix) for prefix in prefixes)
+    }
+
 
 @dataclass
 class ExecutionRequest:
     command: list[str]
     cwd: str | None = None
-    env: dict[str, str] | None = None  # merged over os.environ when given
+    # Layered over the inherited (or allow-listed) environment when given.
+    env: dict[str, str] | None = None
     timeout_seconds: int = 1800
     max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES
+    # ``None``: the child inherits the controller's whole environment (the
+    # controller's own git/gh plumbing). A tuple of names/prefixes: the child
+    # starts from only those variables (see :func:`select_environment`); an
+    # empty tuple is an empty environment.
+    env_allowlist: tuple[str, ...] | None = None
 
 
 @dataclass
@@ -363,7 +421,7 @@ def execute(req: ExecutionRequest) -> ExecutionResult:
     if req.max_output_bytes <= 0:
         raise ExecutionError(f"max_output_bytes must be > 0, got {req.max_output_bytes}")
     started = _now()
-    env = dict(os.environ)
+    env = dict(os.environ) if req.env_allowlist is None else select_environment(req.env_allowlist)
     if req.env:
         env.update(req.env)
     timeout = req.timeout_seconds if req.timeout_seconds > 0 else None

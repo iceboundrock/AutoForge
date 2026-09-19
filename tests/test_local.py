@@ -2576,7 +2576,10 @@ def test_a_failed_anchor_read_is_not_evidence_that_nothing_moved(tmp_path):
     plain = LocalWorkspace(workdir=root)
     assert plain.branch() == ""
     assert plain.head_sha()
-    empty = LocalWorkspace(workdir=git_repo(tmp_path / "empty"))
+    unborn = tmp_path / "empty"
+    unborn.mkdir()
+    subprocess.run(["git", "init", "-q", str(unborn)], check=True)
+    empty = LocalWorkspace(workdir=unborn)
     assert empty.head_sha() == ""
 
 

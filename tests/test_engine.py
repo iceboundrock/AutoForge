@@ -3,12 +3,14 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+from autoforge.config import default_config
 from autoforge.errors import (
     ControlResultValidationError,
     ExecutionError,
@@ -19,7 +21,7 @@ from autoforge.errors import (
     StateTransitionError,
     VerificationError,
 )
-from autoforge.executor import ExecutionResult
+from autoforge.executor import ExecutionResult, execute
 from autoforge.github import (
     ChangedFile,
     CheckInfo,
@@ -5457,3 +5459,416 @@ def test_new_pr_clears_the_review_binding(tmp_state_dir, fake_github):
     s = load_state(eng.paths.state_file)
     assert (s.reviewed_pr_url, s.reviewed_head_sha, s.reviewed_base_ref) == ("", "", "")
     assert s.current_base_ref == "main" and s.current_pr_url == PR
+
+
+# -- REMOTE agent isolation: worktree, environment, checkout anchor (#10) ------------
+def _worktrees(repo) -> list[str]:
+    out = _git(repo, "worktree", "list", "--porcelain")
+    return [line.split(" ", 1)[1] for line in out.splitlines() if line.startswith("worktree ")]
+
+
+def _analyze_with(tmp_state_dir, fake_github, handler):
+    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    eng.step()  # INITIALIZING
+
+    def on_call(req):
+        handler(req)
+        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
+        return block(ANALYZE_OK)
+
+    eng.provider._handler = on_call
+    return eng
+
+
+def test_remote_agent_runs_in_a_per_issue_worktree_under_the_git_common_dir(
+    tmp_state_dir, fake_github
+):
+    """The agent's cwd is a detached worktree the controller created, not the checkout."""
+    repo = git_repo(tmp_state_dir.parent)
+    base = _commit(repo, "a.txt", "1", "base")
+    (repo / "uncommitted.txt").write_text("operator's work in progress")
+    seen = {}
+
+    def handler(req):
+        seen["cwd"] = Path(req.cwd)
+        seen["exists"] = (Path(req.cwd) / "a.txt").exists()
+        seen["sees_uncommitted"] = (Path(req.cwd) / "uncommitted.txt").exists()
+        seen["sees_state"] = (Path(req.cwd) / ".autoforge").exists()
+
+    eng = _analyze_with(tmp_state_dir, fake_github, handler)
+    assert eng.step().next_phase == "REVIEW"
+    expected = repo / ".git" / "autoforge" / "worktrees" / "2"
+    assert seen["cwd"] == expected and seen["exists"]
+    assert not seen["sees_uncommitted"] and not seen["sees_state"]
+    assert str(expected.resolve()) in _worktrees(repo)
+    assert _git(expected, "rev-parse", "HEAD") == base
+    assert _git(expected, "rev-parse", "--abbrev-ref", "HEAD") == "HEAD"  # detached
+    # The operator's checkout is untouched.
+    assert _git(repo, "rev-parse", "HEAD") == base
+    assert _git(repo, "rev-parse", "--abbrev-ref", "HEAD") == "main"
+    assert (repo / "uncommitted.txt").exists()
+
+
+def test_the_issue_worktree_is_reused_across_phases_as_the_agent_left_it(
+    tmp_state_dir, fake_github
+):
+    repo = git_repo(tmp_state_dir.parent)
+    _commit(repo, "a.txt", "1", "base")
+    eng = _analyze_with(tmp_state_dir, fake_github, lambda req: None)
+    assert eng.step().next_phase == "REVIEW"
+    wt = Path(eng.provider.calls[0].cwd)
+    _git(wt, "checkout", "-q", "-b", BRANCH)  # the agent's branch, left checked out
+    (wt / "agent.txt").write_text("agent's work")
+
+    # The same engine, and a fresh engine over the same state, both land in it.
+    fake_github.add_pr()
+    eng.state.phase = Phase.REVIEW
+    eng.state.current_pr_url = PR
+    eng.state.current_head_sha = SHA_A
+    eng.state.reviewed_head_sha = ""
+    eng.provider._handler = lambda req: ""
+    try:
+        eng.step()
+    except Exception:
+        pass
+    assert Path(eng.provider.calls[-1].cwd) == wt
+    assert (wt / "agent.txt").exists()
+    assert _git(wt, "rev-parse", "--abbrev-ref", "HEAD") == BRANCH
+    assert _worktrees(repo).count(str(wt.resolve())) == 1
+
+
+def test_a_path_that_is_not_a_worktree_of_this_repository_is_refused_not_adopted(
+    tmp_state_dir, fake_github
+):
+    repo = git_repo(tmp_state_dir.parent)
+    _commit(repo, "a.txt", "1", "base")
+    stale = repo / ".git" / "autoforge" / "worktrees" / "2"
+    stale.mkdir(parents=True)
+    (stale / "leftover.txt").write_text("not ours")
+    eng = _analyze_with(tmp_state_dir, fake_github, lambda req: None)
+    with pytest.raises(VerificationError, match="exists but is not a worktree"):
+        eng.step()
+    assert eng.provider.calls == [] and (stale / "leftover.txt").exists()
+
+    # A worktree of *another* repository is refused too.
+    other = git_repo(tmp_state_dir.parent.parent / f"{tmp_state_dir.parent.name}-other")
+    (stale / "leftover.txt").unlink()
+    stale.rmdir()
+    _git(other, "worktree", "add", "-q", "--detach", str(stale), "HEAD")
+    with pytest.raises(VerificationError, match="part of the repository at"):
+        eng.step()
+    assert eng.provider.calls == []
+
+
+def test_a_subdirectory_of_an_existing_tree_is_not_adopted_as_a_worktree(
+    tmp_state_dir, fake_github
+):
+    """`worktree_dir` pointing into the operator's checkout: an existing directory
+    there answers git as *that* tree, and a new one would nest inside it."""
+    repo = git_repo(tmp_state_dir.parent)
+    _commit(repo, "a.txt", "1", "base")
+    cfg = default_config()
+    cfg.execution.worktree_dir = "agents"
+    (repo / "agents" / "2").mkdir(parents=True)
+    eng = make_engine(tmp_state_dir, [], github=fake_github, cfg=cfg)
+    eng.step()
+    with pytest.raises(VerificationError, match="inside the worktree rooted at"):
+        eng.step()
+    (repo / "agents" / "2").rmdir()
+    with pytest.raises(VerificationError, match="inside the checkout's working tree"):
+        eng.step()
+    assert eng.provider.calls == [] and _worktrees(repo) == [str(repo.resolve())]
+
+
+def test_a_symlink_at_the_worktree_path_is_refused_whatever_it_points_to(
+    tmp_state_dir, fake_github
+):
+    """A link at the expected path answers `git -C` and realpath as its *target*;
+    a link to the operator's checkout or to another worktree of this repository
+    would otherwise be adopted and the agent launched in operator-owned files."""
+    repo = git_repo(tmp_state_dir.parent)
+    base = _commit(repo, "a.txt", "1", "base")
+    (repo / "uncommitted.txt").write_text("operator's work in progress")
+    expected = repo / ".git" / "autoforge" / "worktrees" / "2"
+    expected.parent.mkdir(parents=True)
+    eng = _analyze_with(tmp_state_dir, fake_github, lambda req: None)
+
+    def refused():
+        with pytest.raises(VerificationError, match="is a symbolic link") as info:
+            eng.step()
+        assert "never through a link" in str(info.value)
+        assert eng.provider.calls == []
+        assert expected.is_symlink()  # left alone, not removed or replaced
+        expected.unlink()
+
+    # To the operator's checkout.
+    expected.symlink_to(repo)
+    refused()
+    # To another worktree of the same repository (the operator's own).
+    other = repo.parent / f"{repo.name}-operator-tree"
+    _git(repo, "worktree", "add", "-q", "--detach", str(other), "HEAD")
+    expected.symlink_to(other)
+    refused()
+    # A relative link, and a dangling one, are no better.
+    expected.symlink_to(Path("..") / ".." / "..")
+    refused()
+    expected.symlink_to(repo / "gone")
+    refused()
+
+    # Nothing was adopted or created: the registry and the checkout are as they were.
+    assert sorted(_worktrees(repo)) == sorted([str(repo.resolve()), str(other.resolve())])
+    assert _git(repo, "rev-parse", "HEAD") == base
+    assert _git(repo, "rev-parse", "--abbrev-ref", "HEAD") == "main"
+    assert (repo / "uncommitted.txt").exists()
+
+
+def test_a_symlinked_parent_of_the_worktree_path_is_refused_before_creation(
+    tmp_state_dir, fake_github
+):
+    """The path itself does not exist, but a component above it (below the
+    resolved common dir) is a link into the operator's working tree: `mkdir`
+    and `git worktree add` would follow it and create the worktree there, in
+    the operator's `git status`, unnoticed by the literal-path guard. (A link
+    at `.git/autoforge` itself never gets this far: the controller lock opens
+    that directory with O_NOFOLLOW and refuses it first.)"""
+    repo = git_repo(tmp_state_dir.parent)
+    base = _commit(repo, "a.txt", "1", "base")
+    (repo / "src").mkdir()
+    _commit(repo, "src/lib.txt", "code", "src")
+    (repo / "uncommitted.txt").write_text("operator's work in progress")
+    link = repo / ".git" / "autoforge" / "worktrees"
+    eng = _analyze_with(tmp_state_dir, fake_github, lambda req: None)
+    status_before = _git(repo, "status", "--porcelain")  # after INITIALIZING made .autoforge/
+
+    def refused():
+        with pytest.raises(VerificationError, match="reached through a symbolic link") as info:
+            eng.step()
+        assert "never through a link" in str(info.value)
+        assert eng.provider.calls == []
+        assert link.is_symlink()  # left alone, not removed or replaced
+        assert not (repo / "src" / "2").exists() and not (repo / "2").exists()
+        assert _worktrees(repo) == [str(repo.resolve())]
+        assert _git(repo, "status", "--porcelain") == status_before
+
+    # `.git/autoforge/worktrees` -> `<checkout>/src` (the round-2 reproduction).
+    link.symlink_to(repo / "src")
+    refused()
+    refused()  # a second launch refuses the same way; nothing was stranded
+    link.unlink()
+    # ... -> the working tree root itself, and a relative link there.
+    link.symlink_to(repo)
+    refused()
+    link.unlink()
+    link.symlink_to(Path("..") / "..")
+    refused()
+    link.unlink()
+
+    # With the link gone the worktree is created at the literal path as usual.
+    assert eng.step().next_phase == "REVIEW"
+    expected = link / "2"
+    assert Path(eng.provider.calls[0].cwd) == expected and not link.is_symlink()
+    assert str(expected.resolve()) in _worktrees(repo)
+    assert _git(repo, "status", "--porcelain") == status_before
+    assert _git(repo, "rev-parse", "--abbrev-ref", "HEAD") == "main"
+    assert base in _git(repo, "rev-list", "HEAD")
+
+
+def test_an_existing_worktree_is_reused_only_when_the_repository_registers_it(
+    tmp_state_dir, fake_github
+):
+    """The directory answering git as a worktree of this repository is not
+    enough: the entry itself must be in `git worktree list`."""
+    repo = git_repo(tmp_state_dir.parent)
+    _commit(repo, "a.txt", "1", "base")
+    expected = repo / ".git" / "autoforge" / "worktrees" / "2"
+    other = repo.parent / f"{repo.name}-operator-tree"
+    _git(repo, "worktree", "add", "-q", "--detach", str(other), "HEAD")
+    # A copy of a real worktree of this repository: its `.git` file points at the
+    # registry entry of the *other* tree, so git answers the copy as that tree.
+    shutil.copytree(other, expected, symlinks=True)
+    eng = _analyze_with(tmp_state_dir, fake_github, lambda req: None)
+    with pytest.raises(VerificationError, match="not a worktree of its own|not registered"):
+        eng.step()
+    assert eng.provider.calls == []
+    shutil.rmtree(expected)
+
+    # A registered worktree at the path is reused; the same one, once
+    # registered, remains the agent's cwd.
+    _git(repo, "worktree", "add", "-q", "--detach", str(expected), "HEAD")
+    assert eng.step().next_phase == "REVIEW"
+    assert Path(eng.provider.calls[0].cwd) == expected
+
+
+def test_the_worktree_registry_read_failing_refuses_reuse(tmp_state_dir, fake_github):
+    repo = git_repo(tmp_state_dir.parent)
+    _commit(repo, "a.txt", "1", "base")
+    expected = repo / ".git" / "autoforge" / "worktrees" / "2"
+    _git(repo, "worktree", "add", "-q", "--detach", str(expected), "HEAD")
+    eng = _analyze_with(tmp_state_dir, fake_github, lambda req: None)
+    real = eng._runner
+
+    def failing(req):
+        if req.command[:3] == ["git", "worktree", "list"]:
+            return ExecutionResult(req.command, req.cwd, 128, "", "fatal: cannot read", "t", "t")
+        return (real or execute)(req)
+
+    eng._runner = failing
+    with pytest.raises(VerificationError, match="cannot list the repository's worktrees"):
+        eng.step()
+    assert eng.provider.calls == []
+
+
+def test_execution_worktree_dir_relocates_the_agent_worktrees(tmp_state_dir, fake_github):
+    repo = git_repo(tmp_state_dir.parent)
+    _commit(repo, "a.txt", "1", "base")
+    cfg = default_config()
+    cfg.execution.worktree_dir = "../agent-trees"
+    eng = make_engine(tmp_state_dir, [], github=fake_github, cfg=cfg)
+    eng.step()
+
+    def on_call(req):
+        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
+        return block(ANALYZE_OK)
+
+    eng.provider._handler = on_call
+    assert eng.step().next_phase == "REVIEW"
+    expected = (repo.parent / "agent-trees" / "2").resolve()
+    assert Path(eng.provider.calls[0].cwd) == expected
+    assert str(expected) in _worktrees(repo)
+    assert eng.agent_worktree_description() == str(expected)
+
+
+def test_dry_run_creates_no_worktree_and_describes_the_isolation(tmp_state_dir, fake_github):
+    repo = git_repo(tmp_state_dir.parent)
+    _commit(repo, "a.txt", "1", "base")
+    eng = make_engine(tmp_state_dir, ["never"], github=fake_github)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    plan = eng.step(dry_run=True).plan
+    assert plan is not None
+    notes = "\n".join(plan.notes)
+    assert "<git common dir>/autoforge/worktrees/2" in notes
+    assert "allow-listed name(s) from execution.env_allowlist" in notes
+    assert "read before and after the invocation; a change enters BLOCKED" in notes
+    assert _worktrees(repo) == [str(repo.resolve())]
+    assert not (repo / ".git" / "autoforge" / "worktrees").exists()
+    assert eng.provider.calls == []
+
+
+def test_agent_launch_carries_the_configured_environment_allowlist(tmp_state_dir, fake_github):
+    cfg = default_config()
+    cfg.execution.env_allowlist_extra = ["MY_TOOL_*"]
+    repo = git_repo(tmp_state_dir.parent)
+    _commit(repo, "a.txt", "1", "base")
+    eng = make_engine(tmp_state_dir, [], github=fake_github, cfg=cfg)
+    eng.step()
+
+    def on_call(req):
+        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
+        return block(ANALYZE_OK)
+
+    eng.provider._handler = on_call
+    assert eng.step().next_phase == "REVIEW"
+    req = eng.provider.calls[0]
+    assert req.env_allowlist == cfg.execution.environment_names()
+    assert "MY_TOOL_*" in req.env_allowlist and "PATH" in req.env_allowlist
+    run_dir = eng.paths.logs_dir / eng.state.run_id
+    step_dir = max(p for p in run_dir.iterdir() if p.is_dir())
+    recorded = json.loads((step_dir / "request.json").read_text())
+    assert recorded["metadata"]["env_allowlist"] == list(req.env_allowlist)
+    assert "environ" not in recorded
+
+
+def test_validation_and_premerge_commands_run_under_the_allowlist(tmp_state_dir, fake_github):
+    """Repository-defined commands get the agent's environment, not the operator's shell."""
+    fake_github.add_pr()
+    eng = _in_merge(tmp_state_dir, fake_github)
+    eng.config.execution.env_allowlist_extra = ["MY_TOOL_*"]
+    eng.config.merge.verification_commands = [["true"]]
+    seen = []
+
+    def runner(req):
+        seen.append(req)
+        return ExecutionResult(req.command, req.cwd, 0, "", "", "t", "t")
+
+    eng._runner = runner
+    assert eng.step(allow_merge=True).next_phase == "UPDATE_EPIC"
+    commands = [r for r in seen if r.command == ["true"]]
+    names = eng.config.execution.environment_names()
+    assert commands and all(r.env_allowlist == names for r in commands)
+    assert all("MY_TOOL_*" in r.env_allowlist for r in commands)
+
+
+def _drift_engine(tmp_state_dir, fake_github, mutate, fail=False):
+    """ANALYZE_EXECUTE whose agent moves the *operator's* checkout while it runs."""
+    repo = git_repo(tmp_state_dir.parent)
+    _commit(repo, "a.txt", "1", "base")
+    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    eng.step()
+
+    def on_call(req):
+        mutate(repo)
+        if fail:
+            raise RuntimeError("agent exploded")
+        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
+        return block(ANALYZE_OK)
+
+    eng.provider._handler = on_call
+    return eng
+
+
+def test_a_commit_to_the_operators_checkout_during_the_agent_run_blocks(tmp_state_dir, fake_github):
+    eng = _drift_engine(
+        tmp_state_dir, fake_github, lambda repo: _commit(repo, "b.txt", "2", "sneaky")
+    )
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    reason = eng.state.block_reason
+    assert "moved while ANALYZE_EXECUTE ran" in reason and "HEAD moved from" in reason
+    assert "Nothing was rolled back" in reason and "'unblock'" in reason
+    assert "claims were not verified and nothing was applied" in reason
+    s = load_state(eng.paths.state_file)
+    assert s.phase is Phase.BLOCKED and s.current_pr_url == ""
+    assert (tmp_state_dir.parent / "b.txt").exists()  # not undone
+
+
+def test_a_branch_switch_in_the_operators_checkout_during_the_agent_run_blocks(
+    tmp_state_dir, fake_github
+):
+    eng = _drift_engine(
+        tmp_state_dir, fake_github, lambda repo: _git(repo, "checkout", "-q", "-b", "elsewhere")
+    )
+    assert eng.step().next_phase == "BLOCKED"
+    reason = eng.state.block_reason
+    assert "the checked-out branch changed from main to elsewhere" in reason
+    assert "HEAD moved" not in reason
+
+
+def test_drift_is_reported_even_when_the_invocation_itself_failed(tmp_state_dir, fake_github):
+    eng = _drift_engine(
+        tmp_state_dir,
+        fake_github,
+        lambda repo: _commit(repo, "b.txt", "2", "sneaky"),
+        fail=True,
+    )
+    assert eng.step().next_phase == "BLOCKED"
+    reason = eng.state.block_reason
+    assert "moved while ANALYZE_EXECUTE ran" in reason
+    assert "ended with RuntimeError: agent exploded" in reason
+
+
+def test_an_unchanged_checkout_is_not_drift(tmp_state_dir, fake_github):
+    """Agent work in its worktree (commits, branches) is not a change of the checkout."""
+
+    def work_in_worktree(repo):
+        wt = repo / ".git" / "autoforge" / "worktrees" / "2"
+        _git(wt, "checkout", "-q", "-b", BRANCH)
+        _commit(wt, "agent.txt", "x", "agent commit")
+
+    eng = _drift_engine(tmp_state_dir, fake_github, work_in_worktree)
+    assert eng.step().next_phase == "REVIEW"
+
+
+def test_the_invocation_failure_propagates_when_nothing_moved(tmp_state_dir, fake_github):
+    eng = _drift_engine(tmp_state_dir, fake_github, lambda repo: None, fail=True)
+    with pytest.raises(RuntimeError, match="agent exploded"):
+        eng.step()

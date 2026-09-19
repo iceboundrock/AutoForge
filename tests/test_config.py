@@ -902,6 +902,67 @@ def test_a_positive_default_timeout_is_still_accepted(tmp_path):
     assert load_config_file(p).execution.default_timeout_seconds == 1
 
 
+# -- agent environment allow-list and worktree location (#10) --------------------
+def _execution_cfg(tmp_path, execution: dict):
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps({"version": 1, "execution": execution}), encoding="utf-8")
+    return load_config_file(p)
+
+
+def test_default_environment_names_are_the_documented_allowlist():
+    exe = default_config().execution
+    assert exe.env_allowlist == list(config.DEFAULT_ENV_ALLOWLIST)
+    assert exe.env_allowlist_extra == [] and exe.worktree_dir == ""
+    names = exe.environment_names()
+    assert names == tuple(config.DEFAULT_ENV_ALLOWLIST)
+    assert len(names) == len(set(names))
+    for required in ("PATH", "HOME", "GH_TOKEN", "GITHUB_TOKEN", "SSH_AUTH_SOCK", "LC_*"):
+        assert required in names, required
+    # Provider keys are contributed by the provider, not the controller default.
+    assert not any(n.startswith(("ANTHROPIC", "OPENAI", "OPENCODE")) for n in names)
+
+
+def test_env_allowlist_replaces_the_default_and_extra_adds_to_it(tmp_path):
+    cfg = _execution_cfg(tmp_path, {"env_allowlist": ["PATH", "MY_*"]})
+    assert cfg.execution.environment_names() == ("PATH", "MY_*")
+    cfg = _execution_cfg(tmp_path, {"env_allowlist_extra": ["MY_TOOL_HOME", "PATH"]})
+    names = cfg.execution.environment_names()
+    assert names[: len(config.DEFAULT_ENV_ALLOWLIST)] == tuple(config.DEFAULT_ENV_ALLOWLIST)
+    assert names[-1] == "MY_TOOL_HOME" and names.count("PATH") == 1
+
+
+@pytest.mark.parametrize("key", ["env_allowlist", "env_allowlist_extra"])
+@pytest.mark.parametrize("bad", ["A*B", "A-B", "1ABC", "A B", "*"])
+def test_an_invalid_environment_pattern_is_a_configuration_error(tmp_path, key, bad):
+    with pytest.raises(ConfigurationError, match=f"{key}.*not an environment variable name"):
+        _execution_cfg(tmp_path, {key: ["PATH", bad]})
+
+
+@pytest.mark.parametrize("key", ["env_allowlist", "env_allowlist_extra"])
+@pytest.mark.parametrize("value", ["PATH", 1, {"a": 1}, ["PATH", 2], ["PATH", ""]])
+def test_an_environment_list_must_be_a_list_of_strings(tmp_path, key, value):
+    with pytest.raises(ConfigurationError, match=key):
+        _execution_cfg(tmp_path, {key: value})
+
+
+def test_an_empty_env_allowlist_is_rejected_not_an_empty_environment(tmp_path):
+    with pytest.raises(ConfigurationError, match="env_allowlist.*at least one variable"):
+        _execution_cfg(tmp_path, {"env_allowlist": []})
+    # ...while an empty *extra* list is the default and fine.
+    assert _execution_cfg(tmp_path, {"env_allowlist_extra": []}).execution.environment_names()
+
+
+def test_worktree_dir_is_optional_and_a_string(tmp_path):
+    assert _execution_cfg(tmp_path, {"worktree_dir": None}).execution.worktree_dir == ""
+    assert _execution_cfg(tmp_path, {"worktree_dir": ""}).execution.worktree_dir == ""
+    assert (
+        _execution_cfg(tmp_path, {"worktree_dir": " ../af-worktrees "}).execution.worktree_dir
+        == "../af-worktrees"
+    )
+    with pytest.raises(ConfigurationError, match="worktree_dir"):
+        _execution_cfg(tmp_path, {"worktree_dir": 3})
+
+
 # -- the `local:` block ---------------------------------------------------------
 def _local_cfg(tmp_path, local: dict):
     p = tmp_path / "cfg.json"

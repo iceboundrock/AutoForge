@@ -526,14 +526,16 @@ Do not:
 * cherry-pick its implementation commits
 * copy its diff wholesale
 
-Do not touch the old local branch or any worktree. Local branches and
-worktrees are operator-owned: the operator's checkout, uncommitted work, and
-existing branches must be left exactly as found.
+Do not touch the old local branch or any worktree other than the one you
+were launched in. Local branches and the other worktrees are operator-owned:
+the operator's checkout, uncommitted work, and existing branches must be left
+exactly as found.
 
 * Do not run `git branch -D`, `git branch -d`, `git push --delete`, or any
   equivalent that deletes the previous branch.
 * Do not run `git worktree add`, `git worktree remove`, `git worktree move`,
-  or otherwise create, clean up, move, or delete any worktree.
+  `git worktree prune`, or otherwise create, clean up, move, or delete any
+  worktree (yours included: the controller owns its lifecycle).
 * Do not delete unrelated branches, unrelated worktrees, or uncommitted user
   work.
 

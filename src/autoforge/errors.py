@@ -92,3 +92,12 @@ class VerificationError(AutoForgeError):
 
     Also used for Phase-1 safety gates (e.g. merge not explicitly allowed).
     """
+
+
+class CheckoutDriftError(VerificationError):
+    """The operator's checkout (HEAD or branch) moved while an agent ran.
+
+    Raised by the engine around a REMOTE agent invocation; the step enters
+    BLOCKED with the message as its reason. The invocation's own outcome, if
+    it failed, is the ``__cause__`` and is quoted in the message.
+    """

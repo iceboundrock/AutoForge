@@ -685,16 +685,35 @@ def scripted_config():
 
 
 def git_repo(path) -> Path:
-    """Make ``path`` a git repository (``git init``) unless it already is one.
+    """Make ``path`` a git repository with one commit unless it already is one.
 
     The controller lock is keyed by the repository containing the engine's
     working directory, so every engine / CLI test that may take the lock
-    needs a real (empty) repository; ``git init`` costs a few milliseconds.
+    needs a real repository, and a REMOTE agent launch adds a per-issue
+    worktree detached at HEAD, which needs a commit to start from; ``git
+    init`` plus an empty commit costs a few milliseconds.
     """
     root = Path(path)
     root.mkdir(parents=True, exist_ok=True)
     if not (root / ".git").exists():
-        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        subprocess.run(["git", "init", "-q", "-b", "main", str(root)], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "-c",
+                "user.name=AutoForge tests",
+                "-c",
+                "user.email=tests@example.invalid",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+            check=True,
+        )
     return root
 
 

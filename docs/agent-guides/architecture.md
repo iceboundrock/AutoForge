@@ -52,6 +52,9 @@ Provider adapters own:
 - reasoning / effort mapping
 - non-interactive execution details
 - provider-specific compatibility handling
+- the names of the environment variables its CLI reads
+  (`AgentProvider.environment_names`, added to the engine's allow-list so a
+  provider's key is never handed to another provider's CLI)
 
 ### Executor
 
@@ -63,8 +66,20 @@ The process executor owns:
 - exit status
 - process termination
 - timestamps
+- environment selection: a request carrying `env_allowlist` starts the
+  child from only the named variables (exact names or `PREFIX*`) of the
+  controller's environment, never from a copy of all of it
 
-It should remain independent of workflow semantics.
+It should remain independent of workflow semantics. Which names are
+allowed is policy: the engine reads it from `execution.env_allowlist` (plus
+`env_allowlist_extra`) and applies it to every agent launch,
+`merge.verification_commands` entry and `local.validation_commands` entry;
+the controller's own `git` / `gh` plumbing inherits the full environment.
+The engine also owns *where* an agent runs: in REMOTE mode a per-issue
+`git worktree` it creates under `<git common dir>/autoforge/worktrees/<n>`
+(or `execution.worktree_dir`) at the first launch and never deletes, and it
+reads HEAD and branch of its own checkout before and after each invocation,
+entering `BLOCKED` on a change.
 
 The timeout bounds the whole invocation, not only the child's exit: an
 invocation is complete when the child has exited *and* both pipes reached
