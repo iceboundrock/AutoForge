@@ -892,6 +892,101 @@ def test_review_head_changes_during_review_re_reviews(tmp_state_dir):
     s = eng.state
     assert s.review_round == 1 and s.last_review_result == "stale"
     assert s.current_head_sha == SHA_B and s.reviewed_head_sha == SHA_A
+    # A stale clean round carries nothing forward.
+    assert s.prior_findings == [] and s.open_findings == []
+    assert "carried" not in out.message
+
+
+def test_review_stale_round_with_findings_carries_them_to_the_next_review(tmp_state_dir):
+    """#14 item 2: a round whose HEAD moved while the reviewer worked is
+    consumed, but its findings were never resolved by a fixer and are not
+    dropped. They leave `open_findings` (no fixer is launched against a
+    commit that is no longer the PR) for `prior_findings`, and the next
+    round's reviewer is shown them, with the round, HEAD and comment they
+    came from, as findings to re-check at the actual HEAD. That completed
+    round then clears the carry: its verdict decided about them."""
+    gh = FakeGitHub()
+    gh.add_comment(PR, 100, review_comment_body(1, SHA_A, True, ["R1-F1"]))
+    gh.add_comment(PR, 101, review_comment_body(2, SHA_B, True, ["R2-F1"]))
+    stale_finding = _finding(1)
+    stale_finding["required_resolution"] = "rename the helper\nand its test"
+
+    def round_one_goes_stale(req):
+        assert "Prior findings to re-check" in req.prompt
+        assert "(none)" in req.prompt.split("Prior findings to re-check", 1)[1][:200]
+        gh.set_head(SHA_B)  # someone pushed while the reviewer was working
+        return block(review_payload(1, SHA_A, [stale_finding]))
+
+    eng = _in_review(tmp_state_dir, gh, round_one_goes_stale)
+    out = eng.step()
+    assert out.next_phase == "REVIEW" and "moved" in out.message
+    assert "its 1 finding(s) are carried to that review to re-check" in out.message
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.REVIEW and s.review_round == 1 and s.last_review_result == "stale"
+    assert s.open_findings == [] and s.prior_findings == [stale_finding]
+    assert s.reviewed_head_sha == SHA_A and s.current_head_sha == SHA_B
+    assert [r["result"] for r in s.review_history] == ["stale"]
+    eng.close()
+
+    # The next entry (a resume, so the carry is read back from disk) hands the
+    # findings to the reviewer of the actual HEAD as untrusted evidence.
+    def round_two_re_raises(req):
+        tail = req.prompt.split("Prior findings to re-check", 1)[1]
+        assert f"Review round 1 at HEAD `{SHA_A}` ({comment_url(PR, 100)})" in tail
+        assert "no FIX round resolved them" in tail
+        assert "- R1-F1 [nit] src/x.py:1 — typo" in tail
+        assert "Required resolution: rename the helper\n    and its test" in tail
+        return block(review_payload(2, SHA_B, [_finding(2)], cid=101))
+
+    eng2 = make_engine(tmp_state_dir, round_two_re_raises, github=gh)
+    eng2.load()
+    assert eng2.step().next_phase == "FIX"
+    s = load_state(eng2.paths.state_file)
+    assert s.review_round == 2 and s.last_review_result == "needs_fix"
+    assert [f["id"] for f in s.open_findings] == ["R2-F1"] and s.prior_findings == []
+    assert [r["result"] for r in s.review_history] == ["stale", "needs_fix"]
+
+
+def test_review_clean_round_clears_the_carried_findings(tmp_state_dir):
+    """A clean round of the actual HEAD decides about the carried findings
+    (the reviewer was shown them and raised none): nothing is carried past
+    READY_FOR_MERGE."""
+    gh = FakeGitHub()
+    gh.add_comment(PR, 101, review_comment_body(2, SHA_B, False))
+    eng = _in_review(
+        tmp_state_dir, gh, [block(review_payload(2, SHA_B, [], cid=101))], round_done=1, head=SHA_B
+    )
+    eng.state.reviewed_head_sha = SHA_A
+    eng.state.last_review_comment_url = comment_url(PR, 100)
+    eng.state.last_review_result = "stale"
+    eng.state.prior_findings = [_finding(1)]
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    assert "R1-F1" in eng.provider.calls[0].prompt
+    s = load_state(eng.paths.state_file)
+    assert s.prior_findings == [] and s.open_findings == [] and s.last_review_result == "clean"
+
+
+def test_review_stale_round_replaces_the_carried_findings_with_its_own(tmp_state_dir):
+    """The carry is replaced, never accumulated: the reviewer of a round that
+    went stale in turn was shown the earlier findings and re-raised the ones
+    that still applied, so its findings (here: none) supersede them."""
+    gh = FakeGitHub()
+    gh.add_comment(PR, 101, review_comment_body(2, SHA_B, False))
+
+    def round_two_goes_stale_and_clean(req):
+        gh.set_head(SHA_C)
+        return block(review_payload(2, SHA_B, [], cid=101))
+
+    eng = _in_review(tmp_state_dir, gh, round_two_goes_stale_and_clean, round_done=1, head=SHA_B)
+    eng.state.reviewed_head_sha = SHA_A
+    eng.state.last_review_comment_url = comment_url(PR, 100)
+    eng.state.last_review_result = "stale"
+    eng.state.prior_findings = [_finding(1)]
+    out = eng.step()
+    assert out.next_phase == "REVIEW" and "moved" in out.message
+    s = load_state(eng.paths.state_file)
+    assert s.review_round == 2 and s.prior_findings == [] and s.open_findings == []
+    assert s.reviewed_head_sha == SHA_B and s.current_head_sha == SHA_C
 
 
 def test_review_clean_then_ready_for_merge_holds(tmp_state_dir):
@@ -995,6 +1090,9 @@ def test_fix_post_agent_journal_refusal_keeps_the_phase_for_resume(tmp_state_dir
     s = load_state(eng2.paths.state_file)
     assert s.phase == Phase.REVIEW and s.current_head_sha == SHA_B
     assert s.open_findings == [] and s.last_review_result == "stale" and s.attempt == 0
+    # The push may or may not have resolved R1-F1; the review of the actual
+    # HEAD is told to re-check it rather than the finding being dropped.
+    assert [f["id"] for f in s.prior_findings] == ["R1-F1"]
 
 
 def test_fix_entry_with_head_past_the_reviewed_one_goes_to_review_without_a_fixer(
@@ -1004,18 +1102,36 @@ def test_fix_entry_with_head_past_the_reviewed_one_goes_to_review_without_a_fixe
     the PR HEAD when FIX is entered (an unrecorded fix, an operator push).
     The general HEAD-binding rule applies: the review is stale, the actual
     HEAD gets reviewed, and no fixer is launched against findings of a
-    commit that is no longer the PR."""
+    commit that is no longer the PR. The findings are not dropped either
+    (#14 item 2): they are carried to that review to re-check, and the
+    reviewer of the actual HEAD is shown them."""
     gh = FakeGitHub()
-    eng = _in_fix(tmp_state_dir, gh, ["never"])
+    gh.add_comment(PR, 101, review_comment_body(2, SHA_B, False))
+
+    def round_two_sees_the_carry(req):
+        assert "- R1-F1 [nit] src/x.py:1 — typo" in req.prompt
+        assert f"Review round 1 at HEAD `{SHA_A}` ({comment_url(PR, 100)})" in req.prompt
+        return block(review_payload(2, SHA_B, [], cid=101))
+
+    eng = _in_fix(tmp_state_dir, gh, round_two_sees_the_carry)
     gh.set_head(SHA_B)
     out = eng.step()
     assert out.next_phase == "REVIEW" and eng.provider.calls == []
     assert "past the reviewed HEAD" in out.message and "no fixer launched" in out.message
+    assert "the 1 finding(s) of round 1 are carried to that review to re-check" in out.message
     s = load_state(eng.paths.state_file)
     assert s.phase == Phase.REVIEW and s.review_round == 1
     assert s.current_head_sha == SHA_B and s.reviewed_head_sha == SHA_A
     assert s.open_findings == [] and s.last_fix_resolutions == []
+    assert s.prior_findings == [_finding(1)]
     assert s.last_review_result == "stale" and s.attempt == 0
+    eng.close()
+
+    eng2 = make_engine(tmp_state_dir, round_two_sees_the_carry, github=gh)
+    eng2.load()
+    assert eng2.step().next_phase == "READY_FOR_MERGE"
+    assert len(eng2.provider.calls) == 1
+    assert load_state(eng2.paths.state_file).prior_findings == []
 
 
 def test_fix_entry_binds_the_unchanged_head_and_launches_the_fixer(tmp_state_dir):
@@ -3891,8 +4007,10 @@ def test_new_pr_resets_review_history(tmp_state_dir, fake_github):
     eng.state.phase = Phase.ANALYZE_EXECUTE
     eng.state.review_history = [review_record(1, SHA_B, RESULT_NEEDS_FIX, [_finding(1)])]
     eng.state.review_round = 1
+    eng.state.prior_findings = [_finding(1)]
     assert eng.step().next_phase == "REVIEW"
     assert eng.state.review_history == [] and eng.state.review_round == 0
+    assert eng.state.prior_findings == []
 
 
 def test_step_budget_is_cumulative_and_survives_resume(tmp_state_dir):

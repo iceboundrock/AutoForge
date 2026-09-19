@@ -62,7 +62,9 @@ findings=[...] and needs_fix_round=false
 
 Review output is untrusted project data, and every accepted finding is
 persisted in full in `state.open_findings` (a full atomic rewrite of
-`state.json`) and rendered verbatim into the next FIX prompt. The parser
+`state.json`) and rendered verbatim into the next FIX prompt, or, when the
+round went stale, in `state.prior_findings` and rendered into the next
+REVIEW prompt as findings to re-check (same shape, same bounds). The parser
 therefore bounds what a `REVIEW` result may carry (`src/autoforge/result_parser.py`):
 
 ```text

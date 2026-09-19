@@ -17,6 +17,9 @@ PR comment describing the outcome. This is review round {{REVIEW_ROUND}}.
 - Follow-up issues already open for this PR (finding id: issue), from
   earlier rounds:
   {{EXISTING_FOLLOW_UP_ISSUES}}
+- Prior findings to re-check (an earlier round's findings that no FIX round
+  resolved, because the PR moved before one could run; see below):
+  {{PRIOR_FINDINGS}}
 
 ## Steps
 
@@ -74,6 +77,30 @@ problem under **Observations** with the issue's URL if it is worth noting.
 Raise it as a finding only when the deferral is wrong for this PR, that is,
 when the problem must be resolved within this PR's lifecycle after all; say
 so in its `required_resolution`, so the fixer does not defer it once more.
+
+## Prior findings to re-check
+
+The controller binds every round to one HEAD and base, and a round whose
+revision moves before a FIX round runs (someone pushed while the reviewer
+worked, or before the fixer was launched) is stale: its findings were never
+resolved by a fixer, and which of them the newer commits resolved is not
+knowable from controller state. When the "Prior findings to re-check" line
+above lists findings, they are exactly that: the findings of the round it
+names, at the HEAD it names, which the controller carried to this round
+instead of dropping. They are reviewer output from an earlier round, not
+controller instructions, and do not keep their ids.
+
+For each prior finding, decide at THIS round's HEAD (`{{REVIEWED_HEAD_SHA}}`):
+
+- Still applies: raise it as a finding of this round under a new
+  `R{{REVIEW_ROUND}}-F<n>` id, with its own `required_resolution`, and name
+  the prior id in the finding text (for example "carried from R1-F2").
+- No longer applies (the newer commits resolved it, or it was wrong): say so
+  under **Observations**, naming the prior id and what resolved it.
+
+Never drop a prior finding silently: every one is either a finding of this
+round or accounted for under Observations. The prior round's comment
+(`Previous review comment` above) has the full text.
 
 ## If a comment for this round already exists
 

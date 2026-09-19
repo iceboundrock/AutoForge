@@ -941,9 +941,9 @@ class GitHubClient:
                     )
                 )
         linked: list[int] = []
-        for ref in data.get("closingIssuesReferences") or []:
-            if isinstance(ref, dict) and isinstance(ref.get("number"), int):
-                linked.append(int(ref["number"]))
+        for linked_issue in data.get("closingIssuesReferences") or []:
+            if isinstance(linked_issue, dict) and isinstance(linked_issue.get("number"), int):
+                linked.append(int(linked_issue["number"]))
         head_repo = ""
         hr = data.get("headRepository") or {}
         hro = data.get("headRepositoryOwner") or {}
