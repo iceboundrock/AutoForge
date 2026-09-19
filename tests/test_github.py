@@ -901,7 +901,15 @@ def test_list_open_prs_keeps_a_pr_seen_on_two_pages_once():
 @pytest.mark.parametrize(
     "page, needle",
     [
-        ({"data": {"repository": None}}, "page 1 is not a pull-request connection"),
+        ({}, "page 1: GraphQL response has no data object"),
+        ({"data": None}, "page 1: GraphQL response has no data object"),
+        ({"data": "yes"}, "page 1: GraphQL response has no data object"),
+        ({"data": []}, "page 1: GraphQL response has no data object"),
+        ({"data": {}}, "page 1: repository is not readable"),
+        ({"data": {"repository": None}}, "page 1: repository is not readable"),
+        ({"data": {"repository": "o/r"}}, "page 1: repository is not readable"),
+        ({"data": {"repository": {}}}, "page 1 is not a pull-request connection"),
+        ({"data": {"repository": {"pullRequests": []}}}, "page 1 is not a pull-request connection"),
         ({"data": {"repository": {"pullRequests": {"nodes": []}}}}, "no usable nodes or pageInfo"),
         (
             {"data": {"repository": {"pullRequests": {"nodes": {}, "pageInfo": {}}}}},
@@ -921,7 +929,15 @@ def test_list_open_prs_keeps_a_pr_seen_on_two_pages_once():
         ),
     ],
     ids=[
+        "no-data",
+        "null-data",
+        "string-data",
+        "list-data",
         "no-repository",
+        "null-repository",
+        "string-repository",
+        "no-connection",
+        "list-connection",
         "no-pageinfo",
         "wrong-types",
         "null-cursor",
@@ -931,9 +947,46 @@ def test_list_open_prs_keeps_a_pr_seen_on_two_pages_once():
 )
 def test_list_open_prs_refuses_a_page_it_cannot_walk_past(page, needle):
     """ "No PR exists" is decided on this listing, so a walk that cannot reach
-    its end is an error, never the pages it did read."""
+    its end is an error, never the pages it did read. Every nested container
+    is checked before it is read (R1-F3): a truthy value of the wrong type is
+    a GitHubError, not an AttributeError."""
     with pytest.raises(GitHubError, match=needle):
         _client(lambda req: _res(page)).list_open_prs("o/r")
+
+
+def _partial_page(nodes: list, errors: object) -> dict:
+    """A GraphQL response that resolved part of the query and reports the rest
+    under ``errors``: ``data`` is present and looks complete."""
+    return dict(_pr_page(nodes), errors=errors)
+
+
+@pytest.mark.parametrize(
+    "errors",
+    [
+        [{"message": "Something went wrong while executing your query.", "path": ["repository"]}],
+        [],
+        None,
+    ],
+    ids=["resolver-error", "empty-errors", "null-errors"],
+)
+def test_list_open_prs_refuses_a_page_answered_with_errors(errors):
+    """R1-F1: GraphQL answers a partially failed query with ``data`` *and*
+    ``errors``, the unresolved part nulled or missing. Such a page is not a
+    complete listing, whatever ``gh`` exited with, and a missing PR node
+    would prove "no PR exists" and launch a duplicate implementation."""
+    with pytest.raises(GitHubError, match="page 1: GraphQL reported errors"):
+        _client(lambda req: _res(_partial_page([_PR_ROW], errors))).list_open_prs("o/r")
+
+
+def test_list_open_prs_refuses_errors_on_a_later_page_too():
+    pages = iter(
+        [
+            _pr_page([_PR_ROW], has_next=True, cursor="c1"),
+            _partial_page([], [{"message": "timedout"}]),
+        ]
+    )
+    with pytest.raises(GitHubError, match="page 2: GraphQL reported errors"):
+        _client(lambda req: _res(next(pages))).list_open_prs("o/r")
 
 
 def test_list_open_prs_refuses_a_cursor_that_does_not_advance():
@@ -944,8 +997,27 @@ def test_list_open_prs_refuses_a_cursor_that_does_not_advance():
             _pr_page([_PR_ROW], has_next=True, cursor="same"),
         ]
     )
-    with pytest.raises(GitHubError, match="page 2 announces a next page but no cursor"):
+    with pytest.raises(GitHubError, match="page 2 announces a next page behind a cursor"):
         _client(lambda req: _res(next(pages))).list_open_prs("o/r")
+
+
+def test_list_open_prs_refuses_a_cursor_cycle():
+    """R1-F2: a cycle longer than one page (A -> B -> A) is caught by the set
+    of every cursor already used, not only by the previous one; the walk
+    stops with an error after a bounded number of pages instead of looping."""
+    calls = 0
+
+    def handler(req):
+        nonlocal calls
+        calls += 1
+        cursors = [arg.removeprefix("after=") for arg in req.command if arg.startswith("after=")]
+        after = cursors[0] if cursors else None
+        cursor = {None: "A", "A": "B", "B": "A"}[after]
+        return _res(_pr_page([_PR_ROW], has_next=True, cursor=cursor))
+
+    with pytest.raises(GitHubError, match="page 3 announces a next page behind a cursor .*'A'"):
+        _client(handler).list_open_prs("o/r")
+    assert calls == 3
 
 
 def test_list_open_prs_failure_classification_is_the_usual_one():
@@ -984,6 +1056,54 @@ def test_list_open_prs_decodes_linked_issues_without_overwriting_the_pr_referenc
     assert pr.url == "https://github.com/o/r/pull/1"
     assert pr.repository == "o/r"
     assert pr.linked_issue_numbers == [9]
+
+
+@pytest.mark.parametrize(
+    "references, needle",
+    [
+        ("9", "closingIssuesReferences is not a connection"),
+        ([{"number": 9}], "closingIssuesReferences is not a connection"),
+        ({"nodes": "9"}, "closingIssuesReferences.nodes is not a list"),
+        ({"nodes": {"number": 9}}, "closingIssuesReferences.nodes is not a list"),
+        ({"nodes": [9]}, "a linked issue has no issue number"),
+        ({"nodes": [{"number": "9"}]}, "a linked issue has no issue number"),
+        ({"nodes": [{"number": True}]}, "a linked issue has no issue number"),
+        ({"nodes": [{"number": 0}]}, "a linked issue has no issue number"),
+        ({"nodes": [{"number": 9}, {}]}, "a linked issue has no issue number"),
+        ({"nodes": [{"number": 9}, None]}, "a linked issue has no issue number"),
+    ],
+    ids=[
+        "string-connection",
+        "flattened",
+        "string-nodes",
+        "object-nodes",
+        "bare-number",
+        "string-number",
+        "bool-number",
+        "zero-number",
+        "empty-node",
+        "null-node",
+    ],
+)
+def test_list_open_prs_refuses_malformed_linked_issues(references, needle):
+    """R1-F3: a linked-issue connection that is not the shape the query asked
+    for is a GitHubError, not "this PR closes no issue"; that silent reading
+    would make the PR of an issue invisible to the issue's recovery."""
+    row = dict(_PR_ROW, closingIssuesReferences=references)
+    with pytest.raises(GitHubError, match=needle):
+        _client(lambda req: _res(_pr_page([row]))).list_open_prs("o/r")
+
+
+@pytest.mark.parametrize(
+    "references",
+    [None, {}, {"nodes": None}, {"nodes": []}],
+    ids=["null", "empty", "null-nodes", "no-nodes"],
+)
+def test_list_open_prs_reads_an_absent_linked_issue_connection_as_no_linked_issue(references):
+    """Like every other field, ``null``/absent is empty, not malformed."""
+    row = dict(_PR_ROW, closingIssuesReferences=references)
+    [pr] = _client(lambda req: _res(_pr_page([row]))).list_open_prs("o/r")
+    assert pr.linked_issue_numbers == []
 
 
 def test_list_all_prs_covers_every_state_and_refuses_truncation():

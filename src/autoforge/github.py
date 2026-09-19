@@ -540,6 +540,34 @@ def _row_object(row: object, what: str) -> dict:
     return row
 
 
+def _linked_issue_nodes(connection: object, what: str) -> list[dict]:
+    """The ``nodes`` of a GraphQL ``closingIssuesReferences`` connection.
+
+    Read like every other field: ``null``/absent is "no linked issue", any
+    other type than the connection object, its ``nodes`` list and a node
+    carrying an issue ``number`` is a conclusive GitHubError. Silently
+    dropping such a node would make a PR that closes an issue look unlinked
+    to it. (GitHub nulls the connection only alongside ``errors``, which the
+    page reader rejects first.)
+    """
+    if connection is None:
+        return []
+    if not isinstance(connection, dict):
+        raise GitHubError(
+            f"{what}: closingIssuesReferences is not a connection: {connection!r:.200}"
+        )
+    nodes = connection.get("nodes")
+    if nodes is None:
+        return []
+    if not isinstance(nodes, list):
+        raise GitHubError(f"{what}: closingIssuesReferences.nodes is not a list: {nodes!r:.200}")
+    for node in nodes:
+        number = node.get("number") if isinstance(node, dict) else None
+        if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
+            raise GitHubError(f"{what}: a linked issue has no issue number: {node!r:.200}")
+    return nodes
+
+
 def _text_field(row: dict, key: str, what: str) -> str:
     """A string field, ``null``/absent read as empty; any other type is malformed."""
     value = row.get(key)
@@ -765,6 +793,24 @@ class GitHubClient:
         data = self._json(args)
         if not isinstance(data, list):
             raise GitHubError("`gh` returned a non-array JSON payload")
+        return data
+
+    def _graphql_data(self, args: list[str], what: str) -> dict:
+        """The ``data`` object of one GraphQL response, only when it is complete.
+
+        GraphQL answers a partially failed query with ``data`` *and*
+        ``errors``: the fields it could not resolve are ``null`` or missing
+        and the rest is present. Such a response must never be consumed as a
+        complete answer (a missing PR node would prove "no PR exists"), so
+        any ``errors`` entry is a conclusive GitHubError, whatever ``gh``'s
+        exit status was, and ``data`` must be an object.
+        """
+        page = self._api_json(args)
+        if "errors" in page:
+            raise GitHubError(f"{what}: GraphQL reported errors: {page.get('errors')!r:.500}")
+        data = page.get("data")
+        if not isinstance(data, dict):
+            raise GitHubError(f"{what}: GraphQL response has no data object: {page!r:.200}")
         return data
 
     def _api_pages(self, endpoint: str) -> list:
@@ -1260,9 +1306,10 @@ class GitHubClient:
         implementer, a replan concluding no replacement was created), and
         "the candidate was past a limit" must never be reported as absence
         (issue #20). Pages are walked by cursor until GitHub says there is no
-        next one; a page that is not a PR connection, a next page GitHub
-        announces without a cursor to reach it, or a cursor that does not
-        advance is a conclusive GitHubError, never a shorter list. A PR seen
+        next one; a page GitHub answered with errors (so possibly partial),
+        a page that is not a PR connection, a next page GitHub announces
+        without a cursor to reach it, or a cursor the walk already used (a
+        cycle) is a conclusive GitHubError, never a shorter list. A PR seen
         twice (the listing moved under the walk) is kept once.
         """
         what = f"open PR listing of {repo}"
@@ -1270,6 +1317,10 @@ class GitHubClient:
         prs: list[PRInfo] = []
         seen: set[int] = set()
         after: str | None = None
+        # Every cursor the walk has already asked for. A cursor that comes
+        # back a second time, however many pages later, would walk a cycle
+        # forever; the walk terminates only because each page's cursor is new.
+        used_cursors: set[str] = set()
         page_number = 0
         while True:
             page_number += 1
@@ -1285,27 +1336,30 @@ class GitHubClient:
             ]
             if after is not None:
                 args += ["-f", f"after={after}"]
-            page = self._api_json(args)
-            connection = ((page.get("data") or {}).get("repository") or {}).get("pullRequests")
+            page_what = f"{what}, page {page_number}"
+            data = self._graphql_data(args, page_what)
+            repository = data.get("repository")
+            if not isinstance(repository, dict):
+                raise GitHubError(f"{page_what}: repository is not readable: {repository!r:.200}")
+            connection = repository.get("pullRequests")
             if not isinstance(connection, dict):
                 raise GitHubError(
-                    f"{what}: page {page_number} is not a pull-request connection: {page!r:.200}"
+                    f"{page_what} is not a pull-request connection: {connection!r:.200}"
                 )
             nodes = connection.get("nodes")
             info = connection.get("pageInfo")
             if not isinstance(nodes, list) or not isinstance(info, dict):
                 raise GitHubError(
-                    f"{what}: page {page_number} has no usable nodes or pageInfo: "
-                    f"{connection!r:.200}"
+                    f"{page_what} has no usable nodes or pageInfo: {connection!r:.200}"
                 )
             for node in nodes:
                 row = _row_object(node, what)
                 # `gh pr list --json` flattens this connection to its nodes;
-                # the decoder reads that shape.
-                references = row.get("closingIssuesReferences")
-                if isinstance(references, dict):
-                    row = dict(row, closingIssuesReferences=references.get("nodes") or [])
-                pr = self._pr_from_data(row, what)
+                # the decoder reads that shape. The connection is validated
+                # here, before flattening: a malformed one must not read as
+                # "this PR closes no issue".
+                linked = _linked_issue_nodes(row.get("closingIssuesReferences"), what)
+                pr = self._pr_from_data(dict(row, closingIssuesReferences=linked), what)
                 if pr.number in seen:
                     continue
                 seen.add(pr.number)
@@ -1313,17 +1367,22 @@ class GitHubClient:
             has_next = info.get("hasNextPage")
             if not isinstance(has_next, bool):
                 raise GitHubError(
-                    f"{what}: page {page_number} does not say whether a next page exists: "
-                    f"{info!r:.200}"
+                    f"{page_what} does not say whether a next page exists: {info!r:.200}"
                 )
             if not has_next:
                 return prs
             cursor = info.get("endCursor")
-            if not isinstance(cursor, str) or not cursor or cursor == after:
+            if not isinstance(cursor, str) or not cursor:
                 raise GitHubError(
                     f"{what} cannot be read to its end: page {page_number} announces a "
                     f"next page but no cursor that reaches it ({cursor!r})"
                 )
+            if cursor in used_cursors:
+                raise GitHubError(
+                    f"{what} cannot be read to its end: page {page_number} announces a "
+                    f"next page behind a cursor the walk already used ({cursor!r})"
+                )
+            used_cursors.add(cursor)
             after = cursor
 
     def list_all_prs(self, repo: str, *, strict: bool = False) -> list[PRInfo]:
