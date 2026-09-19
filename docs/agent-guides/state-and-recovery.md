@@ -31,8 +31,11 @@ Expected state includes data such as:
   review is launched)
 - latest review comment URL
 - latest review result
-- merged-since-EPIC-update count
-- already-counted merged PRs
+- merged-since-EPIC-update count (merges not yet reflected in the EPIC's
+  roadmap section; drives `workflow.epic_update_every` and is reset only
+  after the controller's roadmap write is read back)
+- already-counted merged PRs (in merge order; the last
+  merged-since-EPIC-update entries are the batch handed to the agent)
 - attempt number
 - block reason, and the operator unblock history (one entry per applied
   `autoforge unblock`: timestamp, reason, the block reason it cleared, the

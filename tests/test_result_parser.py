@@ -20,6 +20,7 @@ from autoforge.result_parser import (
     MAX_FINDINGS_PER_REVIEW,
     MAX_FIX_RATIONALE_CHARS,
     MAX_RESOLUTIONS_PER_FIX,
+    MAX_ROADMAP_SECTION_CHARS,
     MAX_URL_CHARS,
     AnalyzeExecuteResult,
     Finding,
@@ -146,6 +147,8 @@ def test_per_phase_schemas():
         parse_control_result(BEGIN + json.dumps(merge) + END, Phase.MERGE)
 
     epic = {"phase": "UPDATE_EPIC", "status": "success", "next_issue_url": None}
+    assert parse_control_result(BEGIN + json.dumps(epic) + END, Phase.UPDATE_EPIC) == epic
+    epic["roadmap_section"] = "- [x] #1"
     assert parse_control_result(BEGIN + json.dumps(epic) + END, Phase.UPDATE_EPIC) == epic
 
 
@@ -862,6 +865,46 @@ def test_update_epic_next_issue_url_is_shape_checked_at_parse_time():
             ControlResultValidationError, match="'next_issue_url' must be a GitHub issue URL"
         ):
             nxt(bad)
+
+
+def test_update_epic_roadmap_section_is_optional_bounded_text():
+    """The managed roadmap section the controller will write into the EPIC
+    body (#13): absent, ``null`` or blank is "none returned" (whether one
+    was required is the engine's decision); a present one is a bounded
+    multi-line string without a controller marker."""
+
+    def res(**fields):
+        return UpdateEpicResult.from_payload(
+            {"phase": "UPDATE_EPIC", "status": "success", "next_issue_url": None, **fields}
+        )
+
+    assert res().roadmap_section is None
+    assert res(roadmap_section=None).roadmap_section is None
+    assert res(roadmap_section="  \n").roadmap_section is None
+    assert res(roadmap_section="\n## Roadmap\n- [x] #1\n\t- note\n").roadmap_section == (
+        "## Roadmap\n- [x] #1\n\t- note"
+    )
+    assert res(roadmap_section="x" * MAX_ROADMAP_SECTION_CHARS).roadmap_section == (
+        "x" * MAX_ROADMAP_SECTION_CHARS
+    )
+    with pytest.raises(ControlResultValidationError, match="must be a string when present"):
+        res(roadmap_section=["- a"])
+    over = "x" * (MAX_ROADMAP_SECTION_CHARS + 1)
+    with pytest.raises(ControlResultValidationError) as exc:
+        res(roadmap_section=over)
+    assert f"{MAX_ROADMAP_SECTION_CHARS + 1} characters" in str(exc.value)
+    assert "xxxx" not in str(exc.value)  # size reported, text never echoed
+    with pytest.raises(ControlResultValidationError, match="control character"):
+        res(roadmap_section="a\x00b")
+    for marker in (
+        "<!-- ai-controller-roadmap:start -->",
+        "<!-- ai-controller-roadmap:end -->",
+        '<!-- ai-follow-up: {"pr": "x"} -->',
+    ):
+        with pytest.raises(ControlResultValidationError, match="must not contain a controller"):
+            res(roadmap_section=f"- a\n{marker}\n- b")
+    # An ordinary HTML comment is content, not a marker.
+    assert res(roadmap_section="<!-- note -->\n- a").roadmap_section == "<!-- note -->\n- a"
 
 
 @pytest.mark.parametrize(

@@ -13,8 +13,8 @@ Legal transitions::
     READY_FOR_MERGE  -> REVIEW            (PR HEAD moved after the clean review)
     MERGE            -> UPDATE_EPIC       (controller merged; GitHub confirms MERGED)
     MERGE            -> REVIEW            (PR HEAD changed after last clean review)
-    MERGE            -> ANALYZE_EXECUTE   (reserved: controller-owned batching, #13)
-    MERGE            -> DONE              (reserved: controller-owned batching, #13)
+    MERGE            -> ANALYZE_EXECUTE   (reserved; unused: batching is decided inside
+    MERGE            -> DONE               UPDATE_EPIC, which runs after every merge)
     UPDATE_EPIC      -> ANALYZE_EXECUTE   (next_issue_url != null)
     UPDATE_EPIC      -> DONE              (next_issue_url == null)
 

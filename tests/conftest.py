@@ -263,6 +263,17 @@ class FakeGitHub:
         self.get_pr_failures: int = 0  # next N get_pr calls raise GitHubUnavailableError
         self.get_pr_error: GitHubError | None = None  # every get_pr call raises this
         self.get_issue_error: GitHubError | None = None  # every get_issue call raises this
+        # get_issue calls for these URLs (canonical) raise; others answer.
+        self.get_issue_errors: dict[str, GitHubError] = {}
+        # Controller-owned EPIC body write (edit_issue_body): every write is
+        # recorded as (canonical url, body). ``edit_issue_error`` raises like
+        # close_error; ``edit_issue_race`` is called before the write lands (a
+        # human edit racing the splice); ``edit_issue_leaves_body`` makes gh
+        # exit 0 without the body changing.
+        self.edited_issues: list[tuple[str, str]] = []
+        self.edit_issue_error: str | GitHubError = ""
+        self.edit_issue_race = None
+        self.edit_issue_leaves_body: bool = False
         self.latest_pr_error: GitHubError | None = None  # every latest_pr_number call raises this
         self.pr_listing_truncated: bool = False  # a strict PR listing cannot be completed
         self.issue_listing_truncated: bool = False  # a strict issue listing cannot be completed
@@ -360,6 +371,8 @@ class FakeGitHub:
         if self.get_issue_error is not None:
             raise self.get_issue_error
         ref = parse_issue_url(url)
+        if ref.canonical in self.get_issue_errors:
+            raise self.get_issue_errors[ref.canonical]
         # Like GitHub, resolve owner/repo case-insensitively (identity = repo + number).
         for known, info in self.issues.items():
             if parse_issue_url(known).same_target(ref):
@@ -368,6 +381,20 @@ class FakeGitHub:
 
     def get_issue_state(self, url: str) -> str:
         return self.get_issue(url).state
+
+    def edit_issue_body(self, url: str, body: str) -> None:
+        canonical = parse_issue_url(url).canonical
+        self.calls.append(("edit_issue_body", canonical, body))
+        self.edited_issues.append((canonical, body))
+        if self.edit_issue_race is not None:
+            self.edit_issue_race(self)
+        if isinstance(self.edit_issue_error, GitHubError):
+            raise self.edit_issue_error
+        if self.edit_issue_error:
+            raise GitHubError(self.edit_issue_error)
+        issue = self.get_issue(canonical)  # fails closed on an unknown issue, like `gh`
+        if not self.edit_issue_leaves_body:
+            issue.body = body
 
     def list_open_issues(self, repo: str, *, strict: bool = False) -> list[IssueInfo]:
         self.calls.append(("list_open_issues", repo, strict))

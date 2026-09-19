@@ -177,6 +177,16 @@ workflow:
   # measured on the persisted `step_count`, so `resume` continues the same
   # budget; `--max-steps` only bounds a single invocation.
   max_total_steps: 300
+  # Merged PRs per EPIC roadmap update. UPDATE_EPIC runs after every merge
+  # (progress comment, next-issue selection), but the controller only writes
+  # the EPIC body's managed roadmap section -- the text between
+  # `<!-- ai-controller-roadmap:start -->` and `<!-- ai-controller-roadmap:end -->`,
+  # spliced by the controller from the agent's `roadmap_section`, read back,
+  # everything outside the markers required unchanged -- once this many merges
+  # have accumulated since the last verified write (or when the agent reports
+  # the EPIC complete). `merged_since_epic_update` resets only after that
+  # read-back. 1 updates after every merge.
+  epic_update_every: 1
 
 review:
   # After a review with findings, the controller (never an agent) may abandon

@@ -28,8 +28,11 @@ Issue → ANALYZE_EXECUTE (Claude Code) → PR → REVIEW (OpenCode)
                                        ├─ merge gate closed (default): stops here; human merges
                                        └─ gate open: controller verifies on GitHub
                                           → MERGE (gh pr merge by the controller, no agent)
-                                          → UPDATE_EPIC (agent picks the next issue;
-                                             controller verifies it on GitHub, or DONE)
+                                          → UPDATE_EPIC (agent posts progress, returns the
+                                             roadmap section, picks the next issue; the
+                                             controller splices the section into the EPIC
+                                             body every N merges, reads it back, and
+                                             verifies the next issue on GitHub, or DONE)
 ```
 
 There is a second, explicit workflow for when there is no GitHub to
@@ -198,6 +201,25 @@ Design points:
   agent invocations consume neither a review round nor the history. Every
   bound ends in `BLOCKED` with the reason; findings and the PR stay for a
   human.
+- **EPIC updates are batched and written by the controller.** `UPDATE_EPIC`
+  runs after every merge (progress comment, next-issue selection), but the
+  EPIC body is written by the controller, never by the agent: the agent
+  returns the new content of the body's managed roadmap section in its
+  `CONTROL_RESULT` (`roadmap_section`), and the controller replaces only the
+  text between `<!-- ai-controller-roadmap:start -->` and
+  `<!-- ai-controller-roadmap:end -->` (appending the block when the EPIC has
+  none), writes it with `gh issue edit --body-file`, reads the body back and
+  requires every byte outside the markers unchanged. A body whose markers are
+  ambiguous (two sections, an end before a start, one marker without the
+  other) blocks before any agent is launched. `workflow.epic_update_every`
+  (default 1) is how many merges accumulate before such a write is due; the
+  persisted `merged_since_epic_update` counter drives the decision and is
+  reset only after the read-back, never before, so a crash between the write
+  and the state save re-enters, finds the section already in place, writes
+  nothing, and then resets. An agent that reports the EPIC complete
+  (`next_issue_url: null`) must return the final section whether or not the
+  batch is full. The PRs merged since the last update are handed to the
+  agent in its prompt.
 - **Replanning is controller policy, not reviewer advice.** After a verified
   review with findings, `review.replan` defaults to a hard trigger at round 20,
   or from round 12 (`soft_threshold`) either three trailing review rounds each
@@ -273,7 +295,7 @@ Design points:
 | `REPLAN_REEXECUTE` | OpenCode (`replan_reexecute`, default `openai/gpt-5.6-terra`, effort high) | One durable transaction. `PREPARED` (written before the agent runs) checkpoints the source PR at its exact HEAD, branch and base branch (the base the deciding review was bound to; a source retargeted to another base since the review, at any point up to the close, is refused), the verified default branch, the complete historical findings, the identities of the already-open PRs, and a random transaction id; a round whose findings could not be persisted in full refuses the replan here and keeps the old PR. The replacement is found **only** by the transaction marker in its PR body, never by shape, never from the CONTROL_RESULT, and never among the pre-existing PRs; several claimants, a copied marker or an unusable one all block. It must also be a distinct OPEN PR of this repository, linked to the issue, on a distinct branch based on the verified default branch, its marker must attest this transaction id, this execution attempt, passing tests and at least the preserved historical finding count, and it must be the only open PR carrying the issue's `ai-implementation` marker once the superseded PR is set aside (a second claimant, or an unreadable marker on any open PR, refuses the replan exactly as it would block the next `ANALYZE_EXECUTE` entry). `VERIFIED` records its HEAD; immediately before the destructive write both sides are re-read and must still match the checkpoint exactly. `SUPERSEDE_INTENT` is persisted *before* `gh pr close` so a crash resumes into disposition, and a separate `gh pr comment` posts an `<!-- autoforge-replan-close: … -->` receipt only after the controller observed its own close landing (never inside `gh pr close --comment`); the receipt is what proves afterwards that the close was the controller's and not a human's; the close outcome is re-read from GitHub rather than inferred from the exit status, a conclusive close failure is never adopted, and an open source under a recorded intent is never closed from a resume, with or without the receipt. A checkpoint that moved inside the close window is undone under a durable `COMPENSATING` record written before the reopen, and the replacement is re-verified once more before it is installed into controller state. Only then does the controller close the old PR without merge and reset the replacement lifecycle so its next review is round 1. Every refusal is persisted as `REJECTED` and replayed by `resume`; a transient GitHub failure is left resumable instead. |
 | `READY_FOR_MERGE` | nobody | holding state; `step`/`resume` refuse to continue unless the merge gate is open (`resume` only re-prints the banner). With the gate open (`step --allow-merge` / `resume --allow-merge`) it runs the full pre-merge verification below against GitHub *before* entering `MERGE`: closed / conflicting / failing / draft / queued PRs, a required check whose job/step structure differs from the base branch's own run, and a failing `merge.verification_commands` command on the exported reviewed HEAD go to `BLOCKED` without ever reaching `MERGE`, as does a `current_pr_url` that is not the PR the clean review was posted on (by identity, before any GitHub read); HEAD or base drift -> `REVIEW`, an already-merged PR -> `MERGE` to reconcile; inconclusive data (checks running, the base branch's own run still running, mergeability unknown, GitHub unreachable / transient read failure, reviewed commit not fetchable) keeps the phase for `resume --allow-merge`, at most `merge.max_verification_attempts` times, then `BLOCKED`; a read that fails conclusively (bad credentials, permissions, unresolvable PR) -> `BLOCKED` at once |
 | `MERGE` (gated) | controller, never an agent | last review clean and bound to this PR (`current_pr_url` and the PR GitHub returns are the reviewed PR by identity, else `BLOCKED`), PR HEAD == reviewed HEAD and PR base == reviewed base; GitHub says PR is OPEN, not draft, every check succeeded, `mergeable=MERGEABLE`, `mergeStateStatus` `CLEAN`/`HAS_HOOKS`, no auto-merge armed, base branch has no merge queue, every `safety.required_checks` run has the same jobs and steps as the base branch's own run of that workflow (`safety.verify_check_definition`); then every `merge.verification_commands` command passes in a temporary export of the reviewed HEAD (persisted per HEAD + command list, so a resume does not repeat it); then `gh pr merge --<method> --match-head-commit <reviewed HEAD>`; counted only once GitHub reports `MERGED` at that HEAD into the reviewed base (another base -> `BLOCKED`, not counted). Conclusive negatives (a failing local command included) and conclusive read failures (bad credentials, permissions) -> `BLOCKED`; inconclusive data (checks running, base run still running, mergeability unknown, transient read failure, unfetchable reviewed commit, post-merge re-read failed) stays in `MERGE` for `resume --allow-merge`, at most `merge.max_verification_attempts` times, then `BLOCKED`; HEAD or base drift -> `REVIEW` |
-| `UPDATE_EPIC` | OpenCode (`update_epic` profile) | before the agent runs, the EPIC's comments are read for the progress comment of this issue and PR (the `ai-epic-progress` marker): one is handed to the agent to adopt instead of posting a second, two block the run without launching anyone. Afterwards the EPIC must carry exactly one such comment (none: the phase's write was not done and the result is rejected; two: rejected, and the next entry blocks on the pair). Then `next_issue_url` gets the `INITIALIZING` checks before the controller switches issues: parses as an issue URL of this repo (a foreign URL is never even queried; a string that is not an issue URL at all is refused as a malformed result through the ordinary correction retry, before it can count as a selection), is neither the EPIC nor the just-finished issue (compared case-insensitively by repository + number, never by URL string), exists on GitHub and is OPEN. A rejected selection, or a transient GitHub failure while checking it, keeps the phase and `resume` asks the agent once more with the reason in its prompt; a second rejection -> `BLOCKED`. A conclusive GitHub failure (authentication, permissions, malformed data) -> `BLOCKED` immediately, without invoking the agent again. Only a verified issue reaches `ANALYZE_EXECUTE`; `null` -> `DONE` |
+| `UPDATE_EPIC` | OpenCode (`update_epic` profile) | before the agent runs, the EPIC's comments are read for the progress comment of this issue and PR (the `ai-epic-progress` marker): one is handed to the agent to adopt instead of posting a second, two block the run without launching anyone; the EPIC body is read and its managed roadmap section located (ambiguous markers block without launching). Afterwards the EPIC must carry exactly one such comment (none: the phase's write was not done and the result is rejected; two: rejected, and the next entry blocks on the pair). When a roadmap update is due (`merged_since_epic_update >= workflow.epic_update_every`, or the agent reports the EPIC complete), the controller splices the agent's `roadmap_section` between the markers of the body it re-reads (a body that changed outside the markers during the invocation is not written over), writes it with `gh issue edit --body-file`, reads it back, requires the bytes outside the markers unchanged and the section as written, and only then resets the merge counter (a missing section or a failed read-back is rejected without a reset; a conclusive GitHub failure -> `BLOCKED`); when not due, nothing is written and the counter is kept. Then `next_issue_url` gets the `INITIALIZING` checks before the controller switches issues: parses as an issue URL of this repo (a foreign URL is never even queried; a string that is not an issue URL at all is refused as a malformed result through the ordinary correction retry, before it can count as a selection), is neither the EPIC nor the just-finished issue (compared case-insensitively by repository + number, never by URL string), exists on GitHub and is OPEN. A rejected selection, or a transient GitHub failure while checking it, keeps the phase and `resume` asks the agent once more with the reason in its prompt; a second rejection -> `BLOCKED`. A conclusive GitHub failure (authentication, permissions, malformed data) -> `BLOCKED` immediately, without invoking the agent again. Only a verified issue reaches `ANALYZE_EXECUTE`; `null` -> `DONE` |
 
 Recovery rules: if a step crashes after the agent created a PR, `resume`
 re-enters `ANALYZE_EXECUTE`, finds the open PR carrying the issue's
@@ -293,7 +315,8 @@ without running the fixer, because which findings the push resolved is not
 inferred, and otherwise finds a follow-up issue the interrupted fixer already
 created and hands it to the fixer to report; `UPDATE_EPIC` finds the
 progress comment the interrupted agent already posted and hands it to the
-agent to adopt (two → `BLOCKED`).
+agent to adopt (two → `BLOCKED`), and a roadmap section the interrupted
+controller already wrote is found in the re-read body and not written again.
 `REPLAN_REEXECUTE` has no separate recovery path at all: a fresh step and a
 `resume` both call the same reducer over the persisted transaction, so the
 normal and crash paths cannot drift apart about what is acceptable. Because
@@ -1125,7 +1148,6 @@ retry for malformed results; `doctor`; redacted per-invocation logs.
 **Explicitly not yet:** automatic merge (gated off; when opened, the
 controller-owned `MERGE` step, including its pre-merge mergeability / check
 verification, and `UPDATE_EPIC` are exercised only against the in-memory
-fake, never against real services), controller-owned EPIC batching (#13),
-unattended production operation, CI checks as a review input, dequeuing a PR
+fake, never against real services), unattended production operation, CI checks as a review input, dequeuing a PR
 from a merge queue (the controller refuses to merge into queue-protected
 branches instead).
