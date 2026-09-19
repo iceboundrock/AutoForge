@@ -545,8 +545,10 @@ Runtime writes go through one capability boundary (`safefs.py`): the state
 directory is opened once as a descriptor, and every name below it is resolved
 with `dir_fd=` and `O_NOFOLLOW`, so no path component can be redirected
 between the check and the use. Whole-file artifacts are written as a fresh
-`O_CREAT|O_EXCL` temporary in the target's own directory and renamed over the
-name, which means a symbolic link, hard link, FIFO or device planted at an
+temporary in the target's own directory and renamed over the name (on Linux
+an unnamed `O_TMPFILE` inode that has no directory entry while it is
+written; elsewhere an `O_CREAT|O_EXCL` file, re-inspected before it is
+published), which means a symbolic link, hard link, FIFO or device planted at an
 artifact's name is *replaced*: it is never opened, so whatever it pointed at
 is provably untouched. The append-only `events.jsonl` is the one artifact that
 must be opened in place, and there the open is `O_NOFOLLOW|O_NONBLOCK|O_APPEND`

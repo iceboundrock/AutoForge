@@ -38,18 +38,24 @@ to the target one component at a time with ``O_DIRECTORY | O_NOFOLLOW`` and
   opened intact, validated, and only then truncated through ``ftruncate`` on
   the very descriptor that was validated.
 
-Whole-file writes do not truncate at all: they create a fresh temporary
-with ``O_CREAT | O_EXCL`` in the target's own directory, write and fsync it,
-and ``os.replace`` it over the target with both sides named by descriptor.
-That replaces a *name*, never an inode, so a hard link planted at the target
-survives untouched, and a reader either sees the whole old file or the whole
-new one.  The temporary is an inode this process created, so the bytes can
-only ever land on something the controller made -- but it has a name in a
-directory another process can list, and that process can give the inode a
-second name (``link(2)``) between the create and the write.  The descriptor
-is therefore re-inspected after the write and before the publish: an inode
-that has acquired a second name is emptied through the still-open descriptor,
-unlinked and reported, never renamed over the target.
+Whole-file writes do not truncate at all: they write and fsync a fresh
+temporary inode in the target's own directory and ``os.replace`` it over the
+target (or, for an exclusive create, ``link(2)`` it to the final name) with
+both sides named by descriptor.  That replaces a *name*, never an inode, so
+a hard link planted at the target survives untouched, and a reader either
+sees the whole old file or the whole new one.  On Linux the temporary is an
+``O_TMPFILE`` inode: it has *no name at all* while the bytes are written and
+receives its first one when it is published, through the process's own
+``/proc/self/fd`` entry.  Where that is unavailable (macOS, a filesystem
+without ``O_TMPFILE``, no procfs) the temporary is created with
+``O_CREAT | O_EXCL`` instead.  Either way the inode is one this process
+created, so the bytes can only ever land on something the controller made --
+but a named temporary sits in a directory another process can list, and that
+process can give the inode a second name (``link(2)``) between the create and
+the write.  The descriptor is therefore re-inspected after the write and
+before the publish, on both paths: an inode that has acquired a name it was
+not given by the controller is emptied through the still-open descriptor,
+unlinked and reported, never renamed or linked over the target.
 
 The one write that is not a whole-file replacement is the append
 (``open_append`` then ``append_to``): a journal line is written through an
@@ -84,15 +90,29 @@ list of rejected shapes, so a shape nobody has thought of yet is covered too.
 The guarantee is about the *inode*; where that inode's name is by the time
 the bytes land is the next paragraph.
 
-Not guaranteed: that a same-user process cannot *observe* a controller write
-through a name it planted.  A named temporary can be hard-linked out of the
-root in the window between its creation and the write, and the bytes reach
-that link before the post-write inspection detects it; the write is then
-refused and the inode emptied, but the other process may already have read
-it.  Every byte the controller writes is already readable by that process
-(same user, same files), so this discloses nothing, and it can never make a
-controller write *replace* anything: the inode was created by this process,
-empty, an instant earlier.  The append's window is one syscall wide and has
+Not guaranteed everywhere: that a same-user process cannot *observe* a
+controller write through a name it planted.  On the named-temporary path a
+temporary can be hard-linked out of the root in the window between its
+creation and the write, and the bytes reach that link before the post-write
+inspection detects it; the write is then refused and the inode emptied, but
+the other process may already have read it.  Every byte the controller
+writes is already readable by that process (same user, same files), so this
+discloses nothing, and it can never make a controller write *replace*
+anything: the inode was created by this process, empty, an instant earlier.
+On the Linux path there is no name to link while the bytes are written.  An
+exclusive create has no window at all: the inode's first name is the final
+one.  A whole-file replacement must still pass through a temporary name,
+because ``linkat`` cannot replace, and holds it for the two syscalls between
+the link and the rename with the re-inspection in between; a link planted
+there finds the bytes complete and is detected before the rename, which is
+the same observe-but-never-replace outcome as the named path in a window
+that no longer spans the write.  What remains on every platform, and is
+inherent, is that a same-user process which can open this process's
+``/proc/<pid>/fd`` (that is a ptrace-scope question, not a filesystem one)
+can name the unnamed inode the way the controller itself does; that is why
+the pre-publish inspection requires *zero* names on the Linux path, and why
+such a temporary is emptied and refused exactly like a named one.  The
+append's window is one syscall wide and has
 the same shape: between the re-inspection that immediately precedes the
 ``write(2)`` and the write itself, the other process can still rename the
 journal's inode out of the root (or link it out and unlink the root name),
@@ -106,11 +126,8 @@ inspected, so a file put at the journal's name -- renamed there, linked
 there, planted after an unlink -- receives nothing in any window, and is
 refused by the re-inspection in every window but that one syscall.  The
 move itself is not checked for beyond that, since it can follow any check;
-it is stated here and pinned by a test.  Linux could close even the
-observation window with an unnamed ``O_TMPFILE`` inode for the temporary;
-that is not done because it does not exist on macOS and would make the
-guarantee platform-shaped, and it would not help the append, which must
-extend a named file.
+it is stated here and pinned by a test.  ``O_TMPFILE`` does not help the
+append, which must extend a named file.
 
 Also not guaranteed: the *initial* resolution of the root path itself.
 ``SafeRoot.open`` resolves an ordinary pathname, and a process that can
@@ -143,6 +160,11 @@ _O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 _O_ACCMODE = getattr(os, "O_ACCMODE", 3)
 
 _DIR_OPEN_FLAGS = os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW | _O_CLOEXEC
+
+#: Linux only: an inode created with no directory entry, which receives its
+#: first name when it is published (``SafeRoot._unnamed_tmp_at``).  0 where
+#: the platform has no such thing, and the named temporary is used instead.
+_O_TMPFILE = getattr(os, "O_TMPFILE", 0)
 
 #: Directory-relative syscalls this module cannot work without.  They exist on
 #: Linux and modern BSD/macOS; refusing early beats silently degrading to
@@ -935,8 +957,127 @@ class SafeRoot:
         finally:
             os.close(src_parent)
 
+    def _unnamed_tmp_at(self, parent: int, data: bytes, *, mode: int, where: str) -> int | None:
+        """Write ``data``, fsynced, into an inode of ``parent``'s filesystem
+        that has no name (Linux ``O_TMPFILE``).
+
+        Returns a descriptor the caller owns and publishes through
+        :meth:`_link_unnamed_at`, or ``None`` where the mechanism is not
+        available, in which case the caller falls back to
+        :meth:`_durable_tmp_at`.  Unavailable means: the platform has no
+        ``O_TMPFILE`` (macOS); the kernel refuses the open (a filesystem
+        without it reports ``EOPNOTSUPP``, a kernel too old to know the flag
+        sees the ``O_DIRECTORY`` bit it is built on and reports ``EISDIR``,
+        an emulation layer may say ``EINVAL``); or the process's own
+        ``/proc/self/fd`` entry does not name the inode just opened (no
+        procfs, or something else mounted there).  *Every* failure of the
+        open falls back rather than being classified, because the fallback
+        opens with ``O_CREAT | O_EXCL`` in the same directory an instant
+        later: a real refusal -- permission, space, a read-only mount --
+        recurs there and is reported by the path that has always reported
+        it, so nothing is hidden and the fallback costs one syscall.
+
+        A write failure *after* the open is this write's failure and is
+        raised; the inode has no name, so closing the descriptor is the whole
+        cleanup.
+        """
+        if not _O_TMPFILE:
+            return None
+        try:
+            fd = os.open(".", os.O_WRONLY | _O_TMPFILE | _O_CLOEXEC, mode, dir_fd=parent)
+        except OSError:
+            return None
+        try:
+            st = os.fstat(fd)
+            try:
+                seen = os.stat(_proc_fd_path(fd))
+            except OSError:
+                seen = None
+            if (
+                seen is None
+                or (seen.st_dev, seen.st_ino) != (st.st_dev, st.st_ino)
+                or entry_kind(st.st_mode) is not None
+                or st.st_nlink != 0
+            ):
+                # The publish below needs the procfs entry to denote exactly
+                # this inode; without that proof the named path is used.
+                os.close(fd)
+                return None
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view) :]
+            os.fsync(fd)
+        except OSError as exc:
+            os.close(fd)
+            raise StateError(f"cannot write {where}: {exc}") from exc
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
+
+    def _link_unnamed_at(self, fd: int, parent: int, name: str, *, where: str) -> None:
+        """Give the unnamed inode behind ``fd`` its first name, ``name`` under
+        ``parent``, through the process's own ``/proc/self/fd`` entry.
+
+        The inode is inspected immediately before: it must still have *no*
+        name.  A same-user process that can open this process's
+        ``/proc/<pid>/fd`` can name the inode the same way the controller is
+        about to, so an inode found with any name is emptied through this
+        descriptor and refused rather than published -- the same treatment a
+        named temporary gets for a second name.  ``linkat`` never replaces,
+        so ``EEXIST`` on any existing entry (a symbolic link included) is
+        surfaced as :class:`FileExistsError` for the caller to interpret.
+        """
+        nlink = os.fstat(fd).st_nlink
+        if nlink != 0:
+            os.ftruncate(fd, 0)
+            raise _unsafe(
+                where,
+                f"being written through a temporary that acquired {nlink} directory "
+                "entr(ies) before it was published; another process linked the "
+                "controller's temporary file elsewhere",
+            )
+        try:
+            os.link(_proc_fd_path(fd), name, dst_dir_fd=parent, follow_symlinks=True)
+        except OSError as exc:
+            if exc.errno == errno.EEXIST:
+                raise FileExistsError(errno.EEXIST, f"{where} already exists") from exc
+            raise StateError(f"cannot create {where}: {exc}") from exc
+
+    def _name_unnamed_tmp_at(self, fd: int, parent: int, *, where: str) -> str:
+        """Give the unnamed inode behind ``fd`` a temporary name so that a
+        rename can publish it, and return that name.
+
+        ``linkat`` cannot replace an existing entry, so a whole-file
+        replacement needs a named step after all: link, then rename.  The
+        name exists for exactly those two syscalls, with the bytes already
+        complete, and the inode is re-inspected between them: it must have
+        exactly the one name the controller just gave it.  One that gained
+        another is emptied through this descriptor, unlinked and refused.
+        """
+        tmp = _tmp_name()
+        try:
+            self._link_unnamed_at(fd, parent, tmp, where=where)
+        except FileExistsError as exc:
+            # The random name collided; a fact about the directory, not the
+            # target, so it is a plain failure of this write.
+            raise StateError(f"cannot write {where}: temporary name {tmp} is taken") from exc
+        nlink = os.fstat(fd).st_nlink
+        if nlink != 1:
+            os.ftruncate(fd, 0)
+            _quiet_unlink(parent, tmp)
+            raise _unsafe(
+                where,
+                f"being written through a temporary that acquired {nlink - 1} extra "
+                "directory entr(ies) before it was published; another process linked "
+                "the controller's temporary file elsewhere",
+            )
+        return tmp
+
     def _durable_tmp_at(self, parent: int, data: bytes, *, mode: int, where: str) -> str:
-        """Write ``data`` into a fresh, fsynced temporary beside ``where``.
+        """Write ``data`` into a fresh, fsynced *named* temporary beside
+        ``where`` -- the path taken where :meth:`_unnamed_tmp_at` is not
+        available.
 
         Returns the temporary's name; the caller publishes it under the final
         name (or unlinks it).  The name carries the pid and a random token, so
@@ -951,7 +1092,7 @@ class SafeRoot:
         refused (see the module docstring for exactly what that closes and
         what it cannot).
         """
-        tmp = f".af-tmp-{os.getpid():x}-{secrets.token_hex(8)}"
+        tmp = _tmp_name()
         fd = open_regular_at(
             parent, tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode=mode, where=where
         )
@@ -985,7 +1126,14 @@ class SafeRoot:
         return tmp
 
     def _replace_at(self, parent: int, name: str, data: bytes, *, mode: int, where: str) -> None:
-        tmp = self._durable_tmp_at(parent, data, mode=mode, where=where)
+        fd = self._unnamed_tmp_at(parent, data, mode=mode, where=where)
+        if fd is None:
+            tmp = self._durable_tmp_at(parent, data, mode=mode, where=where)
+        else:
+            try:
+                tmp = self._name_unnamed_tmp_at(fd, parent, where=where)
+            finally:
+                os.close(fd)
         try:
             os.replace(tmp, name, src_dir_fd=parent, dst_dir_fd=parent)
         except OSError as exc:
@@ -998,6 +1146,16 @@ class SafeRoot:
     def _publish_new_at(
         self, parent: int, name: str, data: bytes, *, mode: int, where: str
     ) -> None:
+        fd = self._unnamed_tmp_at(parent, data, mode=mode, where=where)
+        if fd is not None:
+            # The inode's first name is the final one: no temporary name at
+            # any point, so nothing to unlink and nothing to observe.
+            try:
+                self._link_unnamed_at(fd, parent, name, where=where)
+            finally:
+                os.close(fd)
+            self._fsync_published(parent, where)
+            return
         tmp = self._durable_tmp_at(parent, data, mode=mode, where=where)
         try:
             os.link(tmp, name, src_dir_fd=parent, dst_dir_fd=parent, follow_symlinks=False)
@@ -1226,6 +1384,18 @@ def _fsync_fd(fd: int) -> None:
         if exc.errno in unsupported:
             return
         raise
+
+
+def _tmp_name() -> str:
+    """A temporary name that two controllers, and two attempts by one, never share."""
+    return f".af-tmp-{os.getpid():x}-{secrets.token_hex(8)}"
+
+
+def _proc_fd_path(fd: int) -> str:
+    """The procfs name of this process's descriptor ``fd``: the only pathname
+    that can denote an unnamed inode, and one only this process (and whatever
+    may open its ``/proc/<pid>/fd``) can resolve."""
+    return f"/proc/self/fd/{fd}"
 
 
 def _quiet_unlink(dir_fd: int, name: str) -> None:

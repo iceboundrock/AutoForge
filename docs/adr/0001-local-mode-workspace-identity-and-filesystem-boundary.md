@@ -28,7 +28,10 @@
   inspected before the launch: a foreign single-link file renamed over the
   name is refused and receives nothing, and the stated limit narrows from
   "after the inspection" to the one syscall between the re-inspection and
-  the write; PR #91 review, fifth round)
+  the write; PR #91 review, fifth round), §5.4 and §8.10 (on Linux the
+  whole-file temporary is an unnamed `O_TMPFILE` inode published through
+  `/proc/self/fd`, so the R10-F2 observation window no longer spans the
+  write; the named temporary remains the fallback everywhere else, #52)
 - **Closes by design:** #46, #47, #48, #49, #50; #45 (see *Compatibility*)
 
 ## 1. Problem
@@ -430,8 +433,9 @@ inode is a `StateError`, not a write. The root is now an identity like every
 name below it, so "no pathname is load-bearing in the write path" is true of
 the whole chain rather than of all of it but the first link.
 
-Whole-file artifacts are written as a fresh `O_CREAT|O_EXCL` temporary **in
-the target's own directory**, fsynced, then `os.replace(src_dir_fd=,
+Whole-file artifacts are written as a fresh temporary inode **in the
+target's own directory** -- on Linux an unnamed `O_TMPFILE` inode, elsewhere
+an `O_CREAT|O_EXCL` file (#52, below) -- fsynced, then `os.replace(src_dir_fd=,
 dst_dir_fd=)` over the name. Two consequences follow, and both are stated as
 contract rather than accident:
 
@@ -521,13 +525,31 @@ regular single-link file at the name when the next logger opens is the
 journal that open finds, and the refusals for a planted one are the size
 check of §5.5 and the operator's eyes. The temporary gets the same
 inspection on the same descriptor once its bytes are durable and before it
-is published (R10-F2, §8.10): the `O_EXCL` create proves the inode is the
-controller's, but the inode has a *name* for the length of the write, and a
-same-user process can give it a second one. A temporary found with more
-than one name is emptied through the controller's descriptor, unlinked and
-refused; it is never renamed or linked over the target. That is the complete
-set of refusals in the write path, and it is small because the *mechanism*,
-not a list, is doing the work.
+is published (R10-F2, §8.10): the create proves the inode is the
+controller's, and the inspection proves nobody else has named it since. On
+Linux the temporary is an unnamed `O_TMPFILE` inode (#52): it has no
+directory entry while the bytes are written, and it is published through
+the process's own `/proc/self/fd` entry -- `linkat` straight to the final
+name for `create_exclusive`, whose exclusivity is `linkat`'s own `EEXIST`;
+`linkat` to a temporary name and then `rename` for `write_bytes`, because
+`linkat` cannot replace. The inspection requires *zero* names before the
+link and exactly the one the controller gave it before the rename, because
+a same-user process that may open this process's `/proc/<pid>/fd` (a
+ptrace-scope question, not a filesystem one) can name the inode the same
+way. Where the unnamed inode is unavailable -- macOS, a filesystem that
+refuses `O_TMPFILE`, no procfs, or a `/proc` that does not name the inode
+just opened -- the temporary is an `O_CREAT|O_EXCL` file, which has a
+*name* for the length of the write that a same-user process can give a
+second one; the inspection there requires exactly one. The choice is made
+per write, from the kernel's answer, never from a platform table, and any
+refusal of the unnamed open falls back: a real one (permission, space, a
+read-only mount) recurs in the named create an instant later and is
+reported by the path that has always reported it. On either path a
+temporary found with a name the controller did not give it is emptied
+through the controller's descriptor, unlinked and refused; it is never
+renamed or linked over the target. That is the complete set of refusals
+in the write path, and it is small because the *mechanism*, not a list,
+is doing the work.
 
 The `doctor` command is held to the same boundary (R10-F4). Its writability
 probe used to be a pathname `mkdir` + `mkstemp` after a *resolved-pathname*
@@ -1014,20 +1036,36 @@ an independent `os.walk` finds nothing the snapshot did not mention.
    unchanged; LOCAL prompts use the two primitives of §5.8 (`escape_inline`
    for one-line fields, the unclosable fence for blocks) exclusively.
 10. **A controller write can be *observed* through a planted hard link,
-    never redirected by one.** §5.4, R10-F2. The whole-file temporary is
-    created `O_CREAT|O_EXCL` (an inode this process made, empty), but it has
-    a name in a directory a same-user process can list, and that process can
-    `link(2)` the name elsewhere before the bytes are written. The descriptor
-    is re-inspected after the write and before the publish, so such a
-    temporary is emptied, unlinked and refused rather than published; what
-    remains is that the other process may have *read* the bytes through its
-    link first. Within §2.2 that is nothing: every byte the controller writes
-    is already readable by that process, and it can never make a controller
-    write land on an inode the controller did not create. Linux `O_TMPFILE`
-    (an unnamed inode published with `linkat(AT_EMPTY_PATH)`) would remove
-    even the observation window; it is not used because it does not exist on
-    macOS and the guarantee would then differ by platform. Tracked as a
-    follow-up, not a defect of the boundary. The in-place append of
+    never redirected by one.** §5.4, R10-F2, #52. On the named-temporary
+    path (macOS, and any Linux filesystem or mount without `O_TMPFILE` or
+    procfs) the whole-file temporary is created `O_CREAT|O_EXCL` (an inode
+    this process made, empty), but it has a name in a directory a same-user
+    process can list, and that process can `link(2)` the name elsewhere
+    before the bytes are written. The descriptor is re-inspected after the
+    write and before the publish, so such a temporary is emptied, unlinked
+    and refused rather than published; what remains is that the other
+    process may have *read* the bytes through its link first. Within §2.2
+    that is nothing: every byte the controller writes is already readable
+    by that process, and it can never make a controller write land on an
+    inode the controller did not create. On Linux the temporary is an
+    unnamed `O_TMPFILE` inode published through `/proc/self/fd` (#52), and
+    the window no longer spans the write: there is no name to link while
+    the bytes are written. For `create_exclusive` it is closed outright, the
+    inode's first name being the final one. For `write_bytes` it shrinks to
+    the two syscalls between the `linkat` to a temporary name and the
+    `rename`, because `linkat` cannot replace; a link planted there finds
+    the bytes already complete, and the re-inspection between the two
+    empties and refuses it exactly as on the named path. What is inherent
+    on Linux and stated rather than guarded is the `/proc/<pid>/fd` route:
+    a same-user process the kernel's ptrace scope lets open this process's
+    descriptor table can name the unnamed inode as the controller does,
+    which is why the pre-publish inspection there requires zero names, and
+    why such an inode is emptied and refused like a named one. The
+    guarantee is the same on every platform -- a published name denotes an
+    inode that had only the names the controller gave it at the last
+    inspection before the publish -- and the choice of temporary is made
+    per write from the kernel's answer, so the boundary stays one mechanism
+    with a fallback rather than a platform table. The in-place append of
     `events.jsonl` has the same window with a different outcome (§5.4,
     PR #91 review): the journal's inode is inspected as a single-named
     regular file, on a descriptor opened before the launch and held until
