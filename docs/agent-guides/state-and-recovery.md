@@ -34,6 +34,11 @@ Expected state includes data such as:
 - merged-since-EPIC-update count
 - already-counted merged PRs
 - attempt number
+- block reason, and the operator unblock history (one entry per applied
+  `autoforge unblock`: timestamp, reason, the block reason it cleared, the
+  phase re-entered and the controller's detail; refused unblocks are only in
+  the run log; the list is kept across issue switches, redacted before it is
+  written, and validated on load like every other list field)
 - timestamps
 
 State writes must be atomic.
@@ -66,6 +71,13 @@ Examples:
 Resume logic must inspect actual Git/GitHub state before repeating destructive or duplicative actions.
 
 If recovery cannot determine the safe state with sufficient confidence, enter `BLOCKED` rather than guessing.
+
+`BLOCKED` is left only by `autoforge unblock`, which re-runs the same
+recovery inspection against live GitHub and re-enters the one phase it
+supports through `validate_transition`, or refuses and leaves the state file
+untouched when the safe state still cannot be determined (`workflow.md`,
+"Leaving BLOCKED"). The operator's reason is recorded; it is never the
+evidence the decision rests on.
 
 Merge counters must be idempotent. Track which PRs have already contributed to the counter so a resumed workflow cannot count the same merge twice.
 

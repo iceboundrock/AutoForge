@@ -1787,3 +1787,139 @@ def test_dry_run_needs_no_repository_and_spawns_no_git(tmp_path, capsys, monkeyp
     assert cli.main(["--state-dir", str(sd), "step", "--dry-run"]) == 0
     assert cli.main(["--state-dir", str(sd), "resume", "--dry-run"]) == 0
     assert fakes["provider"].calls == []
+
+
+# -- unblock (issue #5) -------------------------------------------------------------
+def _block_run(tmp_path, capsys, fakes, sd: str) -> None:
+    """A run BLOCKED by ANALYZE_EXECUTE's agent, with nothing on GitHub yet."""
+    fakes["handler"] = lambda req: block(
+        {"phase": "ANALYZE_EXECUTE", "status": "blocked", "message": "spec unclear"}
+    )
+    assert cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE]) == 1
+    capsys.readouterr()
+    fakes["handler"] = lambda req: ""
+
+
+def test_help_lists_unblock(capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["--help"])
+    assert "unblock" in capsys.readouterr().out
+    with pytest.raises(SystemExit) as e:
+        cli.main(["unblock", "--help"])
+    assert e.value.code == 0
+    out = capsys.readouterr().out
+    assert "--reason" in out and "--dry-run" in out and "BLOCKED" in out
+
+
+def test_unblock_requires_a_reason_argument(tmp_path, capsys, monkeypatch, fakes):
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["--state-dir", str(tmp_path / ".autoforge"), "unblock"])
+    assert e.value.code == 2
+    assert "--reason" in capsys.readouterr().err
+
+
+def test_unblock_without_state_errors(tmp_path, capsys, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    rc = cli.main(["--state-dir", str(tmp_path / ".autoforge"), "unblock", "--reason", "x"])
+    assert rc == 2
+    assert "no state" in capsys.readouterr().err.lower()
+
+
+def test_unblock_reenters_a_phase_and_resume_continues(tmp_path, capsys, monkeypatch, fakes):
+    """The operator clarified the spec: unblock re-inspects GitHub (issue open,
+    no PR yet), re-enters ANALYZE_EXECUTE, and only `resume` runs an agent."""
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    _block_run(tmp_path, capsys, fakes, sd)
+    n_calls = len(fakes["provider"].calls)
+    assert cli.main(["--state-dir", sd, "resume"]) == 1
+    assert "autoforge unblock --reason" in capsys.readouterr().out
+    rc = cli.main(["--state-dir", sd, "unblock", "--reason", "spec clarified in issue #2"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "BLOCKED -> ANALYZE_EXECUTE" in out and "run 'autoforge resume' to continue" in out
+    assert len(fakes["provider"].calls) == n_calls  # no agent ran
+    state = load_state(tmp_path / ".autoforge" / "state.json")
+    assert state.phase == Phase.ANALYZE_EXECUTE and state.block_reason == ""
+    assert state.unblock_history[-1]["reason"] == "spec clarified in issue #2"
+    assert cli.main(["--state-dir", sd, "status"]) == 0
+    status = capsys.readouterr().out
+    assert "Unblocked:  1 time(s)" in status and "-> ANALYZE_EXECUTE: spec clarified" in status
+    assert "Reason:" not in status
+    # And the run continues from the re-entered phase.
+    fakes["handler"] = lambda req: block(
+        {"phase": "ANALYZE_EXECUTE", "status": "blocked", "message": "still unclear"}
+    )
+    assert cli.main(["--state-dir", sd, "resume"]) == 1
+    assert len(fakes["provider"].calls) == n_calls + 1
+    assert "still unclear" in capsys.readouterr().out
+
+
+def test_unblock_refusal_leaves_the_run_blocked_and_exits_1(tmp_path, capsys, monkeypatch, fakes):
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    _block_run(tmp_path, capsys, fakes, sd)
+    fakes["gh"].add_issue(ISSUE, "Feature", state="CLOSED")
+    state_file = tmp_path / ".autoforge" / "state.json"
+    raw = state_file.read_text()
+    rc = cli.main(["--state-dir", sd, "unblock", "--reason", "trying anyway"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "stays BLOCKED" in out and "CLOSED" in out
+    assert "run 'autoforge resume'" not in out
+    assert state_file.read_text() == raw
+
+
+def test_unblock_of_a_run_that_is_not_blocked_exits_2(tmp_path, capsys, monkeypatch, fakes):
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    assert (
+        cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"])
+        == 0
+    )
+    capsys.readouterr()
+    assert cli.main(["--state-dir", sd, "unblock", "--reason", "x"]) == 2
+    err = capsys.readouterr().err
+    assert "not BLOCKED" in err
+
+
+def test_unblock_dry_run_previews_and_writes_nothing(tmp_path, capsys, monkeypatch, fakes):
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    _block_run(tmp_path, capsys, fakes, sd)
+    state_file = tmp_path / ".autoforge" / "state.json"
+    raw = state_file.read_text()
+    logs = sorted(p.name for p in (tmp_path / ".autoforge" / "logs").rglob("*"))
+    rc = cli.main(["--state-dir", sd, "unblock", "--reason", "preview", "--dry-run"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "[dry-run] would re-enter ANALYZE_EXECUTE" in out
+    assert state_file.read_text() == raw
+    assert sorted(p.name for p in (tmp_path / ".autoforge" / "logs").rglob("*")) == logs
+    assert ("get_issue", ISSUE) in fakes["gh"].calls
+
+
+def test_unblock_output_is_redacted(tmp_path, capsys, monkeypatch, fakes):
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    _block_run(tmp_path, capsys, fakes, sd)
+    secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+    rc = cli.main(["--state-dir", sd, "unblock", "--reason", f"used {secret}"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert secret not in out
+    assert secret not in (tmp_path / ".autoforge" / "state.json").read_text()
+    assert cli.main(["--state-dir", sd, "status", "--json"]) == 0
+    assert secret not in capsys.readouterr().out
+
+
+def test_unblock_is_refused_while_the_repository_is_locked(tmp_path, capsys, monkeypatch, fakes):
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    _block_run(tmp_path, capsys, fakes, sd)
+    with ControllerLock(repository_lock_path(tmp_path)):
+        rc = cli.main(["--state-dir", sd, "unblock", "--reason", "x"])
+    assert rc == 2
+    assert "lock" in capsys.readouterr().err.lower()
+    assert load_state(tmp_path / ".autoforge" / "state.json").phase == Phase.BLOCKED

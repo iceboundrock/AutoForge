@@ -80,8 +80,8 @@ branch and never creates or cleans up local branches or worktrees itself.
 
 ```text
 src/autoforge/
-    cli.py            argparse CLI: doctor / run / step / resume / status /
-                      local (init, run, doctor)
+    cli.py            argparse CLI: doctor / run / step / resume / unblock /
+                      status / local (init, run, doctor)
     engine.py         ControllerEngine — step() primitive, run() loops step(),
                       per-phase verification via gh, recovery, correction retry
     transitions.py    Phase enum + legal edges + decide_next_phase (pure)
@@ -377,6 +377,11 @@ uv run autoforge resume            # continue until a stop phase / --max-steps
 # GitHub and merges itself (agents never merge); re-run to re-check
 # inconclusive GitHub data (bounded by merge.max_verification_attempts)
 uv run autoforge resume --allow-merge
+
+# leave BLOCKED explicitly: the controller re-inspects GitHub and re-enters
+# the one phase that inspection supports, or refuses and stays BLOCKED;
+# then `resume`. --dry-run previews the decision without writing anything
+uv run autoforge unblock --reason "reran the flaky check; it is green"
 ```
 
 When the loop reaches `READY_FOR_MERGE` with the merge gate closed (the
@@ -385,6 +390,19 @@ HEAD, and states that automatic merge is disabled: a human merges the PR.
 `resume` without the gate open re-prints the banner and runs nothing. With the
 gate open (`resume --allow-merge` / `step --allow-merge`) the controller
 continues through its own pre-merge verification, `MERGE` and `UPDATE_EPIC`.
+
+A run in `BLOCKED` is terminal for `step` and `resume`. After fixing the
+cause on GitHub (closing a duplicate PR, rerunning a check, raising a bound
+in the config), `autoforge unblock --reason "..."` asks the controller to
+decide again from live GitHub: it re-runs the recovery inspection of the
+phase it would re-enter and either re-enters it (`ANALYZE_EXECUTE`, `REVIEW`,
+`FIX`, `READY_FOR_MERGE` or `UPDATE_EPIC`, through the same transition
+validation as any other step) or refuses and leaves the run `BLOCKED`, exit
+code 1, when the safe state still cannot be determined (two candidate PRs, a
+closed PR, a merge no review decided on, a replan in flight, an exhausted
+bound). The reason is recorded in the state file and the run log, `status`
+shows the last one, and no agent runs until `resume`. A LOCAL run cannot be
+unblocked.
 
 URLs must be HTTPS GitHub issue URLs, and EPIC + issue must be in the same
 repository as the current working directory (cross-repo runs are rejected).

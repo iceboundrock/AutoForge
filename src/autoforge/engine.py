@@ -404,6 +404,46 @@ class StepOutcome:
     message: str = ""
 
 
+# Bound on the operator's ``unblock --reason`` text: it is persisted in
+# ``state.json`` and in the run log, so it is kept to a note, not a document.
+MAX_UNBLOCK_REASON_CHARS = 1000
+
+
+@dataclass(frozen=True)
+class UnblockDecision:
+    """What an unblock would do, decided from state plus live GitHub reads.
+
+    ``target`` is the phase to re-enter, or ``None`` when the controller
+    still cannot determine a safe one (the run stays BLOCKED). ``detail``
+    says why, in either case. ``pr`` is the live PR when one is bound, and
+    ``carry_findings`` marks a REVIEW target that the persisted review
+    evidence does not describe (the revision moved, or no review of this
+    PR at this revision is bound): the last result, if any, is marked stale
+    and the open findings, if any, become the findings that review is told
+    to re-check; a carry an earlier stale round already made is preserved.
+    """
+
+    target: Phase | None
+    detail: str
+    pr: PRInfo | None = None
+    carry_findings: bool = False
+
+    @property
+    def refused(self) -> bool:
+        return self.target is None
+
+
+@dataclass
+class UnblockOutcome:
+    """Result of :meth:`ControllerEngine.unblock` for the CLI."""
+
+    run_id: str
+    unblocked: bool
+    phase: str  # the run's phase after the command: the target, or BLOCKED
+    message: str
+    dry_run: bool = False
+
+
 def local_state_paths(
     workspace: LocalWorkspace,
     *,
@@ -2365,66 +2405,12 @@ class ControllerEngine:
         marker or not: it is the controller's own verified record.
         """
         state = self._require_state()
-        issue = parse_issue_url(state.current_issue_url)
-        candidates: dict[str, PRInfo] = {}
-        if state.current_pr_url:
-            try:
-                pr = self.github.get_pr(state.current_pr_url)
-            except GitHubUnavailableError:
-                raise
-            except GitHubError as exc:
-                return self._block(
-                    Phase.ANALYZE_EXECUTE,
-                    None,
-                    f"state references PR {state.current_pr_url} but it cannot be read: {exc}",
-                )
-            if pr.is_open:
-                candidates[parse_pr_url(pr.url).canonical] = pr
-        try:
-            holder = self._implementation_prs(issue).at_most_one()
-        except GitHubUnavailableError:
-            raise
-        except GitHubError as exc:
-            return self._block(
-                Phase.ANALYZE_EXECUTE,
-                None,
-                f"cannot establish whether an open PR already implements issue "
-                f"#{issue.number}: {exc}. The controller will not launch an agent that "
-                "could create a second one",
-            )
-        except ClaimConflictError as exc:
-            return self._block(
-                Phase.ANALYZE_EXECUTE,
-                None,
-                f"{exc}. The controller will not launch an agent that could create a second "
-                "implementation and never guesses which PR is the issue's: close the stale "
-                "PR(s) or repair the unreadable marker, then resume",
-            )
-        if holder is not None:
-            candidates.setdefault(parse_pr_url(holder.obj.url).canonical, holder.obj)
-        if not candidates:
+        pr, problem = self._implementation_pr_candidate()
+        if problem:
+            return self._block(Phase.ANALYZE_EXECUTE, None, problem)
+        if pr is None:
             return None
-        if len(candidates) > 1:
-            return self._block(
-                Phase.ANALYZE_EXECUTE,
-                None,
-                f"{len(candidates)} open PRs claim to implement issue #{issue.number}: "
-                f"{', '.join(sorted(candidates))}. Close the stale ones and resume; the "
-                "controller never guesses.",
-            )
-        url, pr = next(iter(candidates.items()))
-        if parse_pr_url(url).repository.lower() != state.repository.lower():
-            return self._block(
-                Phase.ANALYZE_EXECUTE,
-                None,
-                f"open PR {url} is not in repository {state.repository}",
-            )
-        if not pr.head_sha:
-            return self._block(
-                Phase.ANALYZE_EXECUTE,
-                None,
-                f"open PR {url} has no readable head SHA; cannot recover",
-            )
+        url = parse_pr_url(pr.url).canonical
         state.current_pr_url = url
         state.current_head_sha = pr.head_sha
         state.current_base_ref = pr.base_ref
@@ -2439,6 +2425,445 @@ class ControllerEngine:
                 f"recovered existing open PR {url} (HEAD {pr.head_sha[:12]}, "
                 f"branch {pr.head_ref}); ANALYZE_EXECUTE -> REVIEW without invoking the agent"
             ),
+        )
+
+    def _implementation_pr_candidate(self) -> tuple[PRInfo | None, str]:
+        """The one open PR that implements the current issue, if it is knowable.
+
+        The probe behind :meth:`_try_recover_pr` (and behind ``unblock`` for
+        a run with no PR bound): the persisted PR if it is still open, plus
+        the open PR carrying the issue's ``ai-implementation`` marker from a
+        strict listing. Returns ``(pr, "")`` for exactly one usable
+        candidate, ``(None, "")`` for none, and ``(None, reason)`` when the
+        answer is not knowable -- an unreadable persisted PR, a listing that
+        cannot be proven complete, a marker defect, two candidates, a PR of
+        another repository or one without a readable HEAD. ``reason`` is the
+        text the caller blocks (or refuses) with; the controller never
+        guesses. A transient GitHub failure propagates unchanged.
+        """
+        state = self._require_state()
+        issue = parse_issue_url(state.current_issue_url)
+        candidates: dict[str, PRInfo] = {}
+        if state.current_pr_url:
+            try:
+                pr = self.github.get_pr(state.current_pr_url)
+            except GitHubUnavailableError:
+                raise
+            except GitHubError as exc:
+                return None, (
+                    f"state references PR {state.current_pr_url} but it cannot be read: {exc}"
+                )
+            if pr.is_open:
+                candidates[parse_pr_url(pr.url).canonical] = pr
+        try:
+            holder = self._implementation_prs(issue).at_most_one()
+        except GitHubUnavailableError:
+            raise
+        except GitHubError as exc:
+            return None, (
+                f"cannot establish whether an open PR already implements issue "
+                f"#{issue.number}: {exc}. The controller will not launch an agent that "
+                "could create a second one"
+            )
+        except ClaimConflictError as exc:
+            return None, (
+                f"{exc}. The controller will not launch an agent that could create a second "
+                "implementation and never guesses which PR is the issue's: close the stale "
+                "PR(s) or repair the unreadable marker, then resume"
+            )
+        if holder is not None:
+            candidates.setdefault(parse_pr_url(holder.obj.url).canonical, holder.obj)
+        if not candidates:
+            return None, ""
+        if len(candidates) > 1:
+            return None, (
+                f"{len(candidates)} open PRs claim to implement issue #{issue.number}: "
+                f"{', '.join(sorted(candidates))}. Close the stale ones and resume; the "
+                "controller never guesses."
+            )
+        url, pr = next(iter(candidates.items()))
+        if parse_pr_url(url).repository.lower() != state.repository.lower():
+            return None, f"open PR {url} is not in repository {state.repository}"
+        if not pr.head_sha:
+            return None, f"open PR {url} has no readable head SHA; cannot recover"
+        return pr, ""
+
+    # -- operator unblock (issue #5) -------------------------------------------
+    def unblock(self, reason: str, *, dry_run: bool = False) -> UnblockOutcome:
+        """The operator's explicit exit from BLOCKED.
+
+        BLOCKED is where the controller stops when it cannot determine the
+        safe next state on its own; nothing leaves it automatically (`resume`
+        refuses terminal phases and an agent never routes out of one). This
+        is the one supported way out, and it is the controller's decision,
+        not the operator's: the operator supplies ``reason`` (recorded, never
+        interpreted), and the controller re-inspects live GitHub state
+        exactly as its entry probes do, then either re-enters a phase through
+        :func:`validate_transition` -- BLOCKED has operator edges to the
+        phases in :data:`transitions.UNBLOCK_TARGETS` and to nothing else --
+        or refuses and leaves the run BLOCKED, state untouched, when it still
+        cannot tell a safe phase from a guess (a closed PR, two candidate
+        PRs, a review bound to another PR, a merge no review decided on, a
+        replan journal, an exhausted bound). A refusal names what the
+        operator must change.
+
+        Every applied unblock is recorded in ``state.unblock_history`` and in
+        the run log; a refusal only in the run log. The step budget is not
+        charged: no agent runs here. ``dry_run`` performs the same GitHub
+        reads and reports the decision without writing state or the log.
+        """
+        reason = reason.strip()
+        if not reason:
+            raise ConfigurationError("unblock requires a non-empty --reason")
+        if len(reason) > MAX_UNBLOCK_REASON_CHARS:
+            raise ConfigurationError(
+                f"unblock --reason must be at most {MAX_UNBLOCK_REASON_CHARS} characters "
+                f"({len(reason)} given)"
+            )
+        if dry_run:
+            return self._unblock_once(reason, dry_run=True)
+        with self._execution_lock():
+            return self._unblock_once(reason, dry_run=False)
+
+    def _unblock_once(self, reason: str, *, dry_run: bool) -> UnblockOutcome:
+        state = self._require_state()
+        if state.mode == WorkflowMode.LOCAL:
+            raise StateTransitionError(
+                "unblock applies to GitHub runs only: a LOCAL run has no GitHub state to "
+                "re-inspect, so a BLOCKED local run is finished (start a new local run)"
+            )
+        if state.phase != Phase.BLOCKED:
+            raise StateTransitionError(
+                f"run {state.run_id} is in phase {state.phase.value}, not BLOCKED; unblock "
+                "applies only to BLOCKED runs"
+            )
+        decision = self._unblock_decision()
+        if dry_run:
+            if decision.target is None:
+                message = f"[dry-run] would stay BLOCKED: {decision.detail}"
+            else:
+                message = f"[dry-run] would re-enter {decision.target.value}: {decision.detail}"
+            return UnblockOutcome(
+                run_id=state.run_id,
+                unblocked=False,
+                phase=state.phase.value,
+                message=message,
+                dry_run=True,
+            )
+        cleared = state.block_reason
+        target = decision.target
+        if target is not None:
+            # A pure check on the decided target, made before anything is
+            # written: an edge the topology refuses leaves neither a state
+            # write nor a run-log record claiming an applied unblock into a
+            # phase the run never entered.
+            validate_transition(Phase.BLOCKED, target)
+        # Logged before the state write: a refused log write leaves the run
+        # BLOCKED exactly as it was, and an applied unblock is never on disk
+        # without its record. The operator's text and the block reason reach
+        # both `state.json` and the log, so both cross the redaction boundary.
+        self._log_unblock(reason, decision)
+        if decision.refused:
+            return UnblockOutcome(
+                run_id=state.run_id,
+                unblocked=False,
+                phase=state.phase.value,
+                message=f"stays BLOCKED: {decision.detail}",
+            )
+        assert target is not None
+        pr = decision.pr
+        if pr is not None and pr.head_sha:
+            state.current_head_sha = pr.head_sha
+            if pr.base_ref:
+                state.current_base_ref = pr.base_ref
+            if pr.head_ref:
+                state.current_branch = pr.head_ref
+        carried = ""
+        if decision.carry_findings:
+            # Same rule as a HEAD that moved under a review
+            # (:meth:`_revision_drift_to_review`): the persisted review
+            # evidence describes a revision that is no longer the PR, so its
+            # result is stale whatever it was -- a clean verdict included,
+            # which must not stay recorded as current while the actual
+            # revision is reviewed. A PR never reviewed has no result to
+            # mark. Its open findings are not dropped but handed to that
+            # round to re-check. A carry already performed by a stale round
+            # (`prior_findings` set, `open_findings` empty) is preserved
+            # untouched: an unblock is not a review round, so no reviewer has
+            # examined those findings yet, and the "replace, never
+            # accumulate" rule only applies once one has (R3-F1 of PR #101).
+            if state.last_review_result:
+                state.last_review_result = RESULT_STALE
+            if state.open_findings:
+                state.prior_findings = state.open_findings
+                state.open_findings = []
+                carried = (
+                    f"; the {len(state.prior_findings)} open finding(s) of round "
+                    f"{state.review_round} are carried to that review to re-check"
+                )
+            elif state.prior_findings:
+                carried = (
+                    f"; the {len(state.prior_findings)} finding(s) already carried from "
+                    f"the stale round {state.review_round} stay carried to that review to "
+                    "re-check"
+                )
+        state.unblock_history.append(
+            {
+                "at": utcnow_iso(),
+                "reason": redact(reason),
+                "block_reason": redact(cleared),
+                "phase": target.value,
+                "detail": redact(decision.detail),
+            }
+        )
+        state.block_reason = ""
+        state.phase = target
+        state.attempt = 0
+        self._save()
+        return UnblockOutcome(
+            run_id=state.run_id,
+            unblocked=True,
+            phase=target.value,
+            message=f"BLOCKED -> {target.value}: {decision.detail}{carried}",
+        )
+
+    def _log_unblock(self, reason: str, decision: UnblockDecision) -> None:
+        """One controller-only run-log record per unblock attempt (applied or refused)."""
+        state = self._require_state()
+        now = utcnow_iso()
+        record = ExecutionRecord(
+            run_id=state.run_id,
+            seq=0,
+            phase="BLOCKED-unblock",
+            attempt=1,
+            issue_url=state.current_issue_url,
+            pr_url=state.current_pr_url,
+            review_round=state.review_round,
+            profile="(operator unblock; no agent)",
+            prompt_version=state.prompt_version,
+            started_at=now,
+            finished_at=now,
+            metadata={
+                "operator_reason": reason,
+                "block_reason": state.block_reason,
+                "applied": not decision.refused,
+                "target_phase": decision.target.value if decision.target else "",
+                "detail": decision.detail,
+                "live_pr_state": decision.pr.state if decision.pr else "",
+                "live_head_sha": decision.pr.head_sha if decision.pr else "",
+            },
+        )
+        if decision.refused:
+            record.error = f"unblock refused: {decision.detail}"
+        self._logger().log_execution(record)
+
+    def _unblock_decision(self) -> UnblockDecision:
+        """Re-run the recovery inspection against live GitHub and choose the phase.
+
+        Refuses (``target=None``) whenever the safe phase is not knowable
+        from state plus GitHub, in this order: a replan journal (REVIEW is
+        that transaction's only entry), an exhausted step budget (the very
+        next step would block again), then per the PR. A transient GitHub
+        failure propagates unchanged: nothing is decided on a read that may
+        succeed next time.
+        """
+        state = self._require_state()
+        if state.replan_transaction:
+            stage = state.replan_transaction.get("stage", "(unknown)")
+            return UnblockDecision(
+                None,
+                f"a REPLAN_REEXECUTE journal is recorded for this run (stage {stage!r}); "
+                "REVIEW is that transaction's only entry, so unblock cannot re-enter it. "
+                "Inspect the journal ('autoforge status') and the PRs it names; this run "
+                "cannot continue automatically",
+            )
+        budget = step_budget_reason(state.step_count, self.config.workflow.max_total_steps)
+        if budget:
+            return UnblockDecision(
+                None,
+                f"{budget}. Raise 'workflow.max_total_steps' in the config, then unblock again",
+            )
+        if not state.current_pr_url:
+            return self._unblock_without_pr()
+        return self._unblock_with_pr()
+
+    def _unblock_without_pr(self) -> UnblockDecision:
+        """No PR bound: ANALYZE_EXECUTE, once its entry probe is known to succeed."""
+        state = self._require_state()
+        try:
+            issue = self._verify_issue_selectable(state.current_issue_url, switching=False)
+        except VerificationError as exc:
+            return UnblockDecision(None, f"the issue cannot be worked on: {exc}")
+        except GitHubUnavailableError:
+            raise
+        except GitHubError as exc:
+            # The same classification as the bound-PR path: a conclusive
+            # failure (authentication, permissions, malformed data) is a
+            # decision -- the entry probe is known to fail -- so it is a
+            # logged refusal, not an error that escapes the audit record.
+            return UnblockDecision(
+                None,
+                f"issue {state.current_issue_url} cannot be verified: {exc}. This is not a "
+                "transient GitHub failure, so re-checking would not help; fix the cause first",
+            )
+        pr, problem = self._implementation_pr_candidate()
+        if problem:
+            return UnblockDecision(None, problem)
+        if pr is None:
+            detail = (
+                f"issue #{issue.number} is OPEN and no open PR implements it; ANALYZE_EXECUTE "
+                "will launch the implementation agent"
+            )
+        else:
+            detail = (
+                f"issue #{issue.number} is OPEN and open PR {parse_pr_url(pr.url).canonical} "
+                f"implements it (HEAD {pr.head_sha[:12]}); ANALYZE_EXECUTE will adopt it "
+                "without launching the agent"
+            )
+        return UnblockDecision(Phase.ANALYZE_EXECUTE, detail)
+
+    def _unblock_with_pr(self) -> UnblockDecision:
+        """A PR is bound: decide from its live state and the review bound to it."""
+        state = self._require_state()
+        url = state.current_pr_url
+        try:
+            pr = self.github.get_pr(url)
+        except GitHubUnavailableError:
+            raise
+        except GitHubError as exc:
+            return UnblockDecision(
+                None,
+                f"PR {url} cannot be read: {exc}. This is not a transient GitHub failure, so "
+                "re-checking would not help; fix the cause first",
+            )
+        ref = parse_pr_url(pr.url or url)
+        canonical = ref.canonical
+        if ref.repository.lower() != state.repository.lower():
+            return UnblockDecision(None, f"PR {canonical} is not in repository {state.repository}")
+        if pr.url and not ref.same_target(parse_pr_url(url)):
+            return UnblockDecision(
+                None, f"GitHub answered {url} with PR {canonical}, which is another PR"
+            )
+        reviewed = (state.reviewed_head_sha or "").lower()
+        review_is_this_pr = bool(state.reviewed_pr_url)
+        if review_is_this_pr and not parse_pr_url(state.reviewed_pr_url).same_target(ref):
+            # The review binding is a decision about one PR. Read against
+            # another PR it is neither a clean verdict to merge on nor
+            # findings to carry into that PR's review: review evidence never
+            # crosses a PR identity boundary, so this is not knowable-safe
+            # and is refused before the live state is even considered (the
+            # merge gate refuses the same state, from state alone).
+            return UnblockDecision(
+                None,
+                f"the review bound in state is of PR {state.reviewed_pr_url}, not of the "
+                f"current PR {canonical}; the controller will not re-enter a phase on "
+                "review evidence of another PR. Inspect the state file and both PRs "
+                "manually; this run cannot continue automatically",
+                pr=pr,
+            )
+        at_reviewed_revision = (
+            review_is_this_pr
+            and bool(reviewed)
+            and (pr.head_sha or "").lower() == reviewed
+            and bool(state.reviewed_base_ref)
+            and pr.base_ref == state.reviewed_base_ref
+        )
+        clean = state.last_review_result == RESULT_CLEAN
+        if pr.state == "MERGED":
+            if canonical in state.counted_merged_prs:
+                return UnblockDecision(
+                    Phase.UPDATE_EPIC,
+                    f"PR {canonical} is MERGED and already counted; UPDATE_EPIC will "
+                    "reconcile the EPIC progress comment before launching its agent",
+                    pr=pr,
+                )
+            if not (review_is_this_pr and clean and reviewed):
+                return UnblockDecision(
+                    None,
+                    f"PR {canonical} is MERGED, but no clean review of it is bound in state "
+                    f"(last_review_result={state.last_review_result!r}); the controller will "
+                    "not count a merge no review decided on. Start a new run for the next "
+                    "issue and update the EPIC manually",
+                    pr=pr,
+                )
+            problem = self._merged_revision_problem(pr, reviewed, state.reviewed_base_ref)
+            if problem:
+                return UnblockDecision(
+                    None,
+                    f"PR {canonical} is MERGED but {problem}; the controller will not count a "
+                    "merge no review decided on. Start a new run for the next issue and "
+                    "update the EPIC manually",
+                    pr=pr,
+                )
+            return UnblockDecision(
+                Phase.READY_FOR_MERGE,
+                f"PR {canonical} is MERGED at the clean-reviewed HEAD {reviewed[:12]} into "
+                f"{state.reviewed_base_ref!r} but not yet counted; READY_FOR_MERGE with the "
+                "merge gate open ('resume --allow-merge') reconciles and counts it once",
+                pr=pr,
+            )
+        if pr.state != "OPEN":
+            return UnblockDecision(
+                None,
+                f"PR {canonical} is {pr.state}; the controller will not choose between "
+                "reopening it and reimplementing the issue. Reopen the PR, or start a new "
+                "run",
+                pr=pr,
+            )
+        if not pr.head_sha:
+            return UnblockDecision(None, f"open PR {canonical} has no readable head SHA", pr=pr)
+        if not pr.base_ref:
+            return UnblockDecision(None, f"open PR {canonical} has no readable base branch", pr=pr)
+        cap = next_round_cap_reason(state.review_round, self.config.workflow.max_review_rounds)
+        if at_reviewed_revision and clean:
+            return UnblockDecision(
+                Phase.READY_FOR_MERGE,
+                f"PR {canonical} is OPEN at the clean-reviewed HEAD {reviewed[:12]} on "
+                f"{state.reviewed_base_ref!r}; READY_FOR_MERGE re-verifies it on GitHub before "
+                "any merge",
+                pr=pr,
+            )
+        if (
+            at_reviewed_revision
+            and state.last_review_result == RESULT_NEEDS_FIX
+            and (state.open_findings)
+        ):
+            if cap:
+                return UnblockDecision(
+                    None,
+                    f"{cap}, so a FIX round now could never be reviewed. Raise "
+                    "'workflow.max_review_rounds' in the config, then unblock again",
+                    pr=pr,
+                )
+            return UnblockDecision(
+                Phase.FIX,
+                f"PR {canonical} is OPEN at the reviewed HEAD {reviewed[:12]} with "
+                f"{len(state.open_findings)} open finding(s) from round {state.review_round}; "
+                "FIX re-reads the HEAD before launching the fixer",
+                pr=pr,
+            )
+        if cap:
+            return UnblockDecision(
+                None,
+                f"{cap}. Raise 'workflow.max_review_rounds' in the config, then unblock again",
+                pr=pr,
+            )
+        if not review_is_this_pr or not reviewed:
+            why = "no completed review of it is bound in state"
+        elif not at_reviewed_revision:
+            why = (
+                f"its revision moved after review round {state.review_round} (HEAD "
+                f"{pr.head_sha[:12]} on {pr.base_ref!r}, reviewed {reviewed[:12]} on "
+                f"{state.reviewed_base_ref!r})"
+            )
+        else:
+            why = f"its last review is {state.last_review_result or 'unrecorded'!r}"
+        return UnblockDecision(
+            Phase.REVIEW,
+            f"PR {canonical} is OPEN and {why}; REVIEW round {state.review_round + 1} "
+            "binds the actual revision",
+            pr=pr,
+            carry_findings=not at_reviewed_revision,
         )
 
     def _premerge_plan_notes(self) -> list[str]:
