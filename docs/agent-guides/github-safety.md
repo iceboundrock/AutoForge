@@ -156,6 +156,26 @@ Verify:
   round that a later entry, the fixer and a human read, so it may not tell
   a different story from the findings the controller persists
 
+The verified comment's URL is the REVIEW -> FIX handoff artifact (#80). The
+round persists GitHub's URL of the comment the controller located
+(`last_review_comment_url`, also recorded in `review_history`), never the
+reviewer's spelling of it: the result's `review_comment_url` is matched to the
+located comment by identity (owner and repository case-folded, number,
+comment id), so a case-variant spelling of the PR, or the `issues/<n>` path
+GitHub also serves a PR comment under, is accepted as naming the comment
+(a comment on another number or repository is not), and the URL the FIX
+prompt renders as `REVIEW_COMMENT_URL` is the one GitHub reported, in its
+`pull/<n>` form. The FIX prompt names that comment as the authoritative review for
+the round at the reviewed HEAD and tells the fixer not to substitute another
+PR comment or round; a human comment, an earlier or stale round, or an
+unrelated bot comment on the same PR is never the handoff because only the
+comment carrying the round's marker at the bound HEAD and base can be
+verified. A round that went stale (HEAD or base moved while the reviewer
+worked) records its comment URL in its history entry and in
+`last_review_comment_url` for the next REVIEW prompt's
+`PREVIOUS_REVIEW_COMMENT_URL`, but launches no fixer, so a stale comment never
+becomes a FIX handoff.
+
 ### Before FIX
 
 The fixer is launched only while the PR HEAD read from GitHub equals the

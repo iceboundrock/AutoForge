@@ -298,6 +298,39 @@ def test_update_epic_prompt_contract():
         assert phrase in text, phrase
 
 
+def test_fix_prompt_names_the_verified_review_comment_as_authoritative():
+    """#80: the linked comment is the controller-verified review for the round
+    at the reviewed HEAD, and the fixer may not substitute another PR comment
+    or round. The PR URL stays, for context only."""
+    text = prompts.load_template("fix.md")
+    for phrase in (
+        "- Verified review comment: {{REVIEW_COMMENT_URL}}",
+        "authoritative review for round {{REVIEW_ROUND}} at HEAD\n`{{REVIEWED_HEAD_SHA}}`",
+        "Do not substitute a different PR comment or\nreview round",
+        "The PR URL is given for context only",
+        "Read the verified review comment ({{REVIEW_COMMENT_URL}})",
+    ):
+        assert phrase in text, phrase
+    assert "- PR: {{PR_URL}}" in text
+
+
+def test_engine_fix_prompt_renders_the_persisted_review_comment_url(engine):
+    from tests.conftest import PR, SHA_A, comment_url
+
+    engine.state.phase = Phase.FIX
+    engine.state.current_pr_url = PR
+    engine.state.review_round = 2
+    engine.state.reviewed_head_sha = SHA_A
+    engine.state.last_review_comment_url = comment_url(PR, 101)
+    engine.state.open_findings = [
+        {"id": "R2-F1", "classification": "nit", "title": "t", "location": "l"}
+    ]
+    text = engine.render_prompt_for(Phase.FIX)
+    assert f"- Verified review comment: {comment_url(PR, 101)}" in text
+    assert f"authoritative review for round 2 at HEAD\n`{SHA_A}`" in text
+    assert f"Read the verified review comment ({comment_url(PR, 101)})" in text
+
+
 def test_fix_prompt_hands_over_existing_follow_up_issues():
     """PR #89 F3: a follow-up issue an earlier fixer created is reported, not recreated."""
     text = prompts.load_template("fix.md")

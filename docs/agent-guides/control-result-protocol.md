@@ -43,6 +43,25 @@ looks good
 merged successfully
 ```
 
+### Review required fields
+
+A `REVIEW` result carries, besides `phase` and `status`:
+
+```text
+round                 integer; must equal the round the controller launched
+reviewed_head_sha     40-hex SHA; must equal the HEAD the controller bound
+review_comment_url    URL of the one PR comment the reviewer posted for the
+                      round (`.../pull/<n>#issuecomment-<id>`); a missing or
+                      non-comment URL fails the result at parse time
+needs_fix_round       boolean; see the review invariant
+findings              list of findings (bounded; see below)
+```
+
+`review_comment_url` is a claim like every other field: the engine locates
+the comment on the PR, verifies it ([github-safety.md](github-safety.md),
+"After REVIEW"), and persists GitHub's URL of the verified comment as the
+REVIEW -> FIX handoff, never the string the reviewer emitted.
+
 ### Review invariant
 
 For `REVIEW`:

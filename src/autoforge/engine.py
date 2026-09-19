@@ -4991,7 +4991,18 @@ class ControllerEngine:
 
     def _verify_review_comment(
         self, res: ReviewResult, expected_head: str, expected_base: str
-    ) -> None:
+    ) -> CommentInfo:
+        """Verify the review comment the result names and return it as GitHub read it.
+
+        The returned :class:`CommentInfo` is the comment the controller
+        located on the PR (the one carrying the round's marker at the bound
+        HEAD and base), matched to the result's ``review_comment_url`` by
+        identity. Its ``url`` is GitHub's URL of that comment, which is what
+        the round persists and hands to the fixer: the reviewer's spelling of
+        the URL (``Owner/REPO`` for ``owner/repo``, or the ``issues/<n>`` path
+        GitHub also serves a PR comment under) is accepted as naming the same
+        comment but is never the handoff artifact.
+        """
         state = self._require_state()
         try:
             cref = parse_comment_url(res.review_comment_url)
@@ -5000,7 +5011,7 @@ class ControllerEngine:
                 f"review_comment_url is not a GitHub PR comment URL: {exc}"
             ) from exc
         pr_ref = parse_pr_url(state.current_pr_url)
-        if not cref.parent.same_target(pr_ref):
+        if not cref.on(pr_ref):
             raise VerificationError(
                 f"review comment {res.review_comment_url} does not belong to PR {pr_ref.canonical}"
             )
@@ -5051,6 +5062,7 @@ class ControllerEngine:
                     f"review comment marker finding_ids {marked} disagree with the "
                     f"CONTROL_RESULT findings {reported}"
                 )
+        return holder.obj
 
     def _apply_review(self, res: ReviewResult) -> tuple[Phase, str]:
         state = self._require_state()
@@ -5071,7 +5083,13 @@ class ControllerEngine:
                 f"REVIEW round {res.round} was launched without a bound base branch; the "
                 "review cannot be recorded against the diff it decided on"
             )
-        self._verify_review_comment(res, expected_head, expected_base)
+        verified = self._verify_review_comment(res, expected_head, expected_base)
+        # The handoff artifact is GitHub's URL of the comment the controller
+        # verified, never the reviewer's spelling of it (#80): the FIX prompt,
+        # `state.json` and the review history all name the comment as the
+        # GitHub object that was read. The parsed canonical form is the
+        # fallback for a client that reported no URL for the comment.
+        verified_comment_url = verified.url or parse_comment_url(res.review_comment_url).canonical
 
         # Valid review lifecycle: round is consumed regardless of the outcome.
         # The round is bound to the revision it decided on -- the PR the
@@ -5081,7 +5099,7 @@ class ControllerEngine:
         state.reviewed_pr_url = parse_pr_url(state.current_pr_url).canonical
         state.reviewed_head_sha = expected_head
         state.reviewed_base_ref = expected_base
-        state.last_review_comment_url = res.review_comment_url
+        state.last_review_comment_url = verified_comment_url
         state.last_review_needs_fix = res.needs_fix_round
         # Findings are agent-authored text persisted in plain `state.json` and
         # rendered into the next FIX prompt, so they cross the same redaction
