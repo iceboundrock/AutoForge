@@ -15,6 +15,7 @@ from tests.conftest import (
     PR,
     SHA_A,
     SHA_B,
+    SHA_C,
     FakeGitHub,
     block,
     comment_url,
@@ -119,6 +120,130 @@ def test_full_loop_to_ready_for_merge(tmp_state_dir):
     assert [
         json.loads(line)["phase"] for line in (run_dir / "events.jsonl").read_text().splitlines()
     ] == ["ANALYZE_EXECUTE", "REVIEW", "FIX", "REVIEW"]
+
+
+def test_each_fix_round_receives_its_own_verified_review_comment(tmp_state_dir):
+    """#80: round 1 -> FIX prompt carries comment A; round 2 -> FIX prompt
+    carries comment B and not A. The handoff is the URL of the comment the
+    controller verified for the round, so two fix rounds on one PR never
+    share or confuse their review artifacts. State is reloaded from disk
+    after every step."""
+    gh = FakeGitHub()
+    fix_prompts: list[str] = []
+    comment_a, comment_b = comment_url(PR, 100), comment_url(PR, 101)
+
+    def finding(rnd: int) -> dict:
+        return {
+            "id": f"R{rnd}-F1",
+            "classification": "nit",
+            "title": f"round {rnd} finding",
+            "location": "src/x.py:1",
+            "required_resolution": f"resolve the round {rnd} finding",
+        }
+
+    def agent(req):
+        if req.phase == "ANALYZE_EXECUTE":
+            gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
+            return block(
+                {
+                    "phase": "ANALYZE_EXECUTE",
+                    "status": "success",
+                    "issue_url": ISSUE,
+                    "pr_url": PR,
+                    "head_sha": SHA_A,
+                    "branch": BRANCH,
+                }
+            )
+        if req.phase == "REVIEW" and "Round 1" in req.prompt:
+            gh.add_comment(PR, 100, review_comment_body(1, SHA_A, True, ["R1-F1"]))
+            return block(
+                {
+                    "phase": "REVIEW",
+                    "status": "success",
+                    "round": 1,
+                    "reviewed_head_sha": SHA_A,
+                    "review_comment_url": comment_a,
+                    "needs_fix_round": True,
+                    "findings": [finding(1)],
+                }
+            )
+        if req.phase == "FIX" and "R1-F1" in req.prompt:
+            fix_prompts.append(req.prompt)
+            gh.set_head(SHA_B)
+            return block(
+                {
+                    "phase": "FIX",
+                    "status": "success",
+                    "previous_head_sha": SHA_A,
+                    "new_head_sha": SHA_B,
+                    "resolutions": [{"finding_id": "R1-F1", "resolution": "fixed"}],
+                }
+            )
+        if req.phase == "REVIEW" and "Round 2" in req.prompt:
+            gh.add_comment(PR, 101, review_comment_body(2, SHA_B, True, ["R2-F1"]))
+            return block(
+                {
+                    "phase": "REVIEW",
+                    "status": "success",
+                    "round": 2,
+                    "reviewed_head_sha": SHA_B,
+                    "review_comment_url": comment_b,
+                    "needs_fix_round": True,
+                    "findings": [finding(2)],
+                }
+            )
+        if req.phase == "FIX" and "R2-F1" in req.prompt:
+            fix_prompts.append(req.prompt)
+            gh.set_head(SHA_C)
+            return block(
+                {
+                    "phase": "FIX",
+                    "status": "success",
+                    "previous_head_sha": SHA_B,
+                    "new_head_sha": SHA_C,
+                    "resolutions": [{"finding_id": "R2-F1", "resolution": "fixed"}],
+                }
+            )
+        if req.phase == "REVIEW" and "Round 3" in req.prompt:
+            gh.add_comment(PR, 102, review_comment_body(3, SHA_C, False))
+            return block(
+                {
+                    "phase": "REVIEW",
+                    "status": "success",
+                    "round": 3,
+                    "reviewed_head_sha": SHA_C,
+                    "review_comment_url": comment_url(PR, 102),
+                    "needs_fix_round": False,
+                    "findings": [],
+                }
+            )
+        raise AssertionError(f"unexpected call {req.phase}")
+
+    eng = make_engine(tmp_state_dir, agent, github=gh)
+    eng._save()
+    expected = ["ANALYZE_EXECUTE", "REVIEW", "FIX", "REVIEW", "FIX", "REVIEW", "READY_FOR_MERGE"]
+    handoffs = []
+    for exp in expected:
+        out = eng.step()
+        assert out.next_phase == exp, out.message
+        persisted = load_state(eng.paths.state_file)
+        assert persisted.phase.value == exp
+        if exp == "FIX":
+            handoffs.append(persisted.last_review_comment_url)
+    assert handoffs == [comment_a, comment_b]
+    assert len(fix_prompts) == 2
+    first, second = fix_prompts
+    assert f"Verified review comment: {comment_a}" in first and comment_b not in first
+    assert f"Verified review comment: {comment_b}" in second and comment_a not in second
+    assert "Review round: 1" in first and "Review round: 2" in second
+    assert SHA_A in first and SHA_B in second
+    s = load_state(eng.paths.state_file)
+    assert s.last_review_comment_url == comment_url(PR, 102)
+    assert [r["review_comment_url"] for r in s.review_history] == [
+        comment_a,
+        comment_b,
+        comment_url(PR, 102),
+    ]
 
 
 def test_run_loops_until_ready_for_merge(tmp_state_dir):
