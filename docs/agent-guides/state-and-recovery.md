@@ -122,7 +122,10 @@ first agent launch for its issue, reused by every later phase of that issue
 across `resume`, and never deleted, moved or pruned by the controller; the
 operator removes it with `git worktree remove` when the issue is done. A
 path that exists there but is not a worktree of this repository is refused,
-never adopted.
+never adopted: a symbolic link at the path is refused on the entry itself,
+whatever it points to (a link to the operator's checkout or to another
+worktree would otherwise answer git as that tree), and a directory is
+reused only when `git worktree list` registers it as a worktree root.
 
 ---
 

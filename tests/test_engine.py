@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -20,7 +21,7 @@ from autoforge.errors import (
     StateTransitionError,
     VerificationError,
 )
-from autoforge.executor import ExecutionResult
+from autoforge.executor import ExecutionResult, execute
 from autoforge.github import (
     ChangedFile,
     CheckInfo,
@@ -5577,6 +5578,93 @@ def test_a_subdirectory_of_an_existing_tree_is_not_adopted_as_a_worktree(
     with pytest.raises(VerificationError, match="inside the checkout's working tree"):
         eng.step()
     assert eng.provider.calls == [] and _worktrees(repo) == [str(repo.resolve())]
+
+
+def test_a_symlink_at_the_worktree_path_is_refused_whatever_it_points_to(
+    tmp_state_dir, fake_github
+):
+    """A link at the expected path answers `git -C` and realpath as its *target*;
+    a link to the operator's checkout or to another worktree of this repository
+    would otherwise be adopted and the agent launched in operator-owned files."""
+    repo = git_repo(tmp_state_dir.parent)
+    base = _commit(repo, "a.txt", "1", "base")
+    (repo / "uncommitted.txt").write_text("operator's work in progress")
+    expected = repo / ".git" / "autoforge" / "worktrees" / "2"
+    expected.parent.mkdir(parents=True)
+    eng = _analyze_with(tmp_state_dir, fake_github, lambda req: None)
+
+    def refused():
+        with pytest.raises(VerificationError, match="is a symbolic link") as info:
+            eng.step()
+        assert "never through a link" in str(info.value)
+        assert eng.provider.calls == []
+        assert expected.is_symlink()  # left alone, not removed or replaced
+        expected.unlink()
+
+    # To the operator's checkout.
+    expected.symlink_to(repo)
+    refused()
+    # To another worktree of the same repository (the operator's own).
+    other = repo.parent / f"{repo.name}-operator-tree"
+    _git(repo, "worktree", "add", "-q", "--detach", str(other), "HEAD")
+    expected.symlink_to(other)
+    refused()
+    # A relative link, and a dangling one, are no better.
+    expected.symlink_to(Path("..") / ".." / "..")
+    refused()
+    expected.symlink_to(repo / "gone")
+    refused()
+
+    # Nothing was adopted or created: the registry and the checkout are as they were.
+    assert sorted(_worktrees(repo)) == sorted([str(repo.resolve()), str(other.resolve())])
+    assert _git(repo, "rev-parse", "HEAD") == base
+    assert _git(repo, "rev-parse", "--abbrev-ref", "HEAD") == "main"
+    assert (repo / "uncommitted.txt").exists()
+
+
+def test_an_existing_worktree_is_reused_only_when_the_repository_registers_it(
+    tmp_state_dir, fake_github
+):
+    """The directory answering git as a worktree of this repository is not
+    enough: the entry itself must be in `git worktree list`."""
+    repo = git_repo(tmp_state_dir.parent)
+    _commit(repo, "a.txt", "1", "base")
+    expected = repo / ".git" / "autoforge" / "worktrees" / "2"
+    other = repo.parent / f"{repo.name}-operator-tree"
+    _git(repo, "worktree", "add", "-q", "--detach", str(other), "HEAD")
+    # A copy of a real worktree of this repository: its `.git` file points at the
+    # registry entry of the *other* tree, so git answers the copy as that tree.
+    shutil.copytree(other, expected, symlinks=True)
+    eng = _analyze_with(tmp_state_dir, fake_github, lambda req: None)
+    with pytest.raises(VerificationError, match="not a worktree of its own|not registered"):
+        eng.step()
+    assert eng.provider.calls == []
+    shutil.rmtree(expected)
+
+    # A registered worktree at the path is reused; the same one, once
+    # registered, remains the agent's cwd.
+    _git(repo, "worktree", "add", "-q", "--detach", str(expected), "HEAD")
+    assert eng.step().next_phase == "REVIEW"
+    assert Path(eng.provider.calls[0].cwd) == expected
+
+
+def test_the_worktree_registry_read_failing_refuses_reuse(tmp_state_dir, fake_github):
+    repo = git_repo(tmp_state_dir.parent)
+    _commit(repo, "a.txt", "1", "base")
+    expected = repo / ".git" / "autoforge" / "worktrees" / "2"
+    _git(repo, "worktree", "add", "-q", "--detach", str(expected), "HEAD")
+    eng = _analyze_with(tmp_state_dir, fake_github, lambda req: None)
+    real = eng._runner
+
+    def failing(req):
+        if req.command[:3] == ["git", "worktree", "list"]:
+            return ExecutionResult(req.command, req.cwd, 128, "", "fatal: cannot read", "t", "t")
+        return (real or execute)(req)
+
+    eng._runner = failing
+    with pytest.raises(VerificationError, match="cannot list the repository's worktrees"):
+        eng.step()
+    assert eng.provider.calls == []
 
 
 def test_execution_worktree_dir_relocates_the_agent_worktrees(tmp_state_dir, fake_github):

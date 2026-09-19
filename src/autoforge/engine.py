@@ -779,6 +779,40 @@ class ControllerEngine:
         common = Path(os.path.realpath(path / lines[1]))
         return root, common
 
+    def _registered_worktree_roots(self) -> set[Path]:
+        """The working-tree roots ``git worktree list`` registers for this repository.
+
+        Read from the controller's own checkout, so the answer comes from
+        the repository's registry (the common dir's ``worktrees/``), not
+        from whatever the candidate path leads to. Git reports the paths
+        resolved; a linked worktree whose tree is gone is listed as
+        ``prunable`` and left out, since nothing at its path is a worktree.
+        """
+        res = (self._runner or execute)(
+            ExecutionRequest(
+                command=["git", "worktree", "list", "--porcelain"],
+                cwd=self.workdir,
+                timeout_seconds=GIT_TIMEOUT_SECONDS,
+            )
+        )
+        if res.timed_out or res.truncated or res.exit_code != 0:
+            detail = (res.stderr or res.stdout).strip().splitlines()
+            raise VerificationError(
+                "cannot list the repository's worktrees (`git worktree list` "
+                f"{'timed out' if res.timed_out else f'exited {res.exit_code}'}"
+                f"{f': {detail[-1]}' if detail else ''}); the controller will not reuse "
+                "an agent worktree it cannot confirm is registered"
+            )
+        roots: set[Path] = set()
+        for entry in res.stdout.split("\n\n"):
+            lines = [line.strip() for line in entry.splitlines() if line.strip()]
+            if not lines or not lines[0].startswith("worktree "):
+                continue
+            if any(line == "prunable" or line.startswith("prunable ") for line in lines[1:]):
+                continue
+            roots.add(Path(os.path.realpath(lines[0][len("worktree ") :])))
+        return roots
+
     def _ensure_agent_worktree(self) -> Path:
         """The issue's agent worktree, created on first use and never deleted.
 
@@ -790,7 +824,11 @@ class ControllerEngine:
         same issue wants. A path that exists but is not a worktree root of
         this repository (a stale directory, a foreign checkout, a
         subdirectory of some tree) is refused, not adopted: the controller
-        never launches an agent somewhere it did not create. Nor is one
+        never launches an agent somewhere it did not create. So is a
+        symbolic link at the path, whatever it points to, decided on the
+        entry itself before anything follows it; and reuse requires the
+        directory to be registered in this repository's worktree list, not
+        merely to answer git as some worktree. Nor is one
         created inside the operator's working tree (the git directory,
         which git never walks as content, excepted), where it would sit in
         their ``git status`` and the agent's tree would contain the
@@ -801,15 +839,35 @@ class ControllerEngine:
         path = self.agent_worktree_path()
         ws = self.workspace()
         common = ws.git_dirs()[-1]
+        if path.is_symlink():
+            # Decided on the entry itself (lstat), before anything follows the
+            # link: `git -C` and realpath both answer for the *target*, so a
+            # link to the operator's checkout or to another worktree of this
+            # repository would otherwise pass every check below as that tree.
+            target = os.readlink(path)
+            raise VerificationError(
+                f"the agent worktree path {path} is a symbolic link (to {target}), not a "
+                f"worktree of the repository at {common}; the controller launches agents "
+                "only in a directory it created itself, never through a link -- remove "
+                "the link or configure execution.worktree_dir elsewhere"
+            )
         if path.exists():
             found = self._worktree_identity(path)
             real = Path(os.path.realpath(path))
-            if found is None:
+            if real != path:
+                # `path` is not a link, so a component above it is: the base was
+                # resolved when the path was derived and has changed since.
+                what = f"reached through a symbolic link ({real})"
+            elif found is None:
                 what = "not a git worktree"
             elif found[1] != common:
                 what = f"part of the repository at {found[1]}"
-            elif found[0] != real:
+            elif found[0] != path:
                 what = f"inside the worktree rooted at {found[0]}, not a worktree of its own"
+            elif path == ws.root():
+                what = "the checkout the controller is run from"
+            elif path not in self._registered_worktree_roots():
+                what = "not registered in the repository's worktree list"
             else:
                 return path
             raise VerificationError(
