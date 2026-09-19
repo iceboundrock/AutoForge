@@ -294,8 +294,22 @@ def test_update_epic_prompt_contract():
         "{{EXISTING_PROGRESS_COMMENT_URL}}",
         "do NOT post a second one",
         "exactly one",
+        # #13 / #4: the EPIC body is the controller's to write. The agent
+        # returns the managed section's content; the controller splices it
+        # between the markers and reads the body back.
+        "roadmap_section",
+        "{{CURRENT_ROADMAP_SECTION}}",
+        "{{ROADMAP_START_MARKER}}",
+        "{{ROADMAP_END_MARKER}}",
+        "{{ROADMAP_UPDATE_DUE}}",
+        "{{MERGED_PRS_SINCE_EPIC_UPDATE}}",
+        "{{MAX_ROADMAP_SECTION_CHARS}}",
+        "Do NOT run `gh issue edit`",
+        "Do NOT include the marker lines",
     ):
         assert phrase in text, phrase
+    # The body-editing step is gone: the agent has no instruction to edit the body.
+    assert "Check off completed tasks" not in text
 
 
 def test_fix_prompt_names_the_verified_review_comment_as_authoritative():

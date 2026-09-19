@@ -39,6 +39,7 @@ from dataclasses import dataclass, field
 
 from .errors import ConfigurationError, ControlResultError, ControlResultValidationError
 from .prompts import CONTROL_CHAR_RE, CONTROL_CHARS
+from .roadmap import ROADMAP_END_MARKER, ROADMAP_START_MARKER
 from .transitions import Phase, WorkflowMode
 from .validation import parse_comment_url, parse_issue_url, parse_pr_url
 
@@ -116,6 +117,27 @@ MAX_URL_CHARS = 512
 # not this one, are what a reviewer is held to. Any stdout the parser sees is
 # itself bounded by the executor's capture bound.
 MAX_CONTROL_RESULT_CHARS = 1024 * 1024
+# Bound on the EPIC's managed roadmap section an UPDATE_EPIC result may
+# carry. The controller writes it into the EPIC body itself (between the
+# roadmap markers, nothing else), so the section is the one piece of agent
+# text that reaches a GitHub issue body verbatim; it is bounded where it is
+# accepted and rejected, never clipped, so a truncated roadmap is never
+# published. GitHub bounds an issue body at 65536 characters; the section
+# leaves the operator's own text room.
+MAX_ROADMAP_SECTION_CHARS = 32768
+# The opening every controller marker shares: ``<!--``, any whitespace (none
+# included), ``ai-``. ``autoforge.claims`` builds each marker kind's scanner
+# pattern on this expression, and the roadmap-section refusal below matches
+# it, so what the section may not carry is exactly what the scanner would
+# later read. The whitespace run is possessive as in the scanner (the
+# expression runs over agent-supplied text; see ``MarkerKind.pattern``).
+CONTROLLER_MARKER_OPEN_RE = re.compile(r"<!--\s*+ai-")
+# A roadmap section may not carry a controller marker: the roadmap markers
+# would split the body into more than one managed section, and any other
+# ``<!-- ai-`` marker would plant a durable claim in an open issue that the
+# controller later scans and trusts (``autoforge.claims``). The refusal uses
+# the scanner's own opening, so ``<!--ai-`` and ``<!--\nai-`` are refused too.
+_CONTROLLER_MARKER_PREFIX = "<!-- ai-"
 
 
 def extract_last_block(stdout: str) -> str:
@@ -723,9 +745,28 @@ NON_AGENT_PHASES = frozenset(
 @dataclass
 class UpdateEpicResult:
     next_issue_url: str | None
+    # The new content of the EPIC's managed roadmap section, or ``None`` when
+    # the agent returned none (absent, ``null`` or blank). Whether one is
+    # required is the engine's decision (``workflow.epic_update_every``);
+    # the parser only bounds and shapes it. It is the *content between* the
+    # markers: the markers themselves are written by the controller.
+    roadmap_section: str | None = None
 
     @classmethod
     def from_payload(cls, p: dict) -> UpdateEpicResult:
+        section: str | None = _opt_str(p, "roadmap_section", "UPDATE_EPIC") or None
+        if section is not None:
+            section = _bounded(
+                section, "UPDATE_EPIC", "result", "roadmap_section", MAX_ROADMAP_SECTION_CHARS
+            )
+            section = _multi_line(section, "UPDATE_EPIC", "result", "roadmap_section")
+            if CONTROLLER_MARKER_OPEN_RE.search(section):
+                raise ControlResultValidationError(
+                    "UPDATE_EPIC: field 'roadmap_section' must not contain a controller "
+                    f"marker ({_CONTROLLER_MARKER_PREFIX}...): the controller writes "
+                    f"{ROADMAP_START_MARKER!r} and {ROADMAP_END_MARKER!r} around the section "
+                    "itself. Return only the section's content and re-emit the CONTROL_RESULT."
+                )
         if "next_issue_url" not in p:
             raise ControlResultValidationError(
                 "CONTROL_RESULT for UPDATE_EPIC missing required field "
@@ -745,7 +786,7 @@ class UpdateEpicResult:
             # oversized value is never quoted into ``next_issue_rejections``,
             # the re-selection prompt or the run log.
             nxt = _checked_url(nxt, "next_issue_url", "UPDATE_EPIC", "issue")
-        return cls(next_issue_url=nxt)
+        return cls(next_issue_url=nxt, roadmap_section=section)
 
 
 # -- LOCAL-mode typed models ----------------------------------------------

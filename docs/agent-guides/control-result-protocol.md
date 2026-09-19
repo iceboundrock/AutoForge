@@ -191,6 +191,26 @@ oversized value is never quoted into `next_issue_rejections`, the
 re-selection prompt or the run log. The fix prompts state the bounds
 through template variables filled from the same constants.
 
+### UPDATE_EPIC fields
+
+`next_issue_url` is required (`null` when the EPIC is complete) and shaped
+as above. `roadmap_section` is optional at parse time: absent, `null` or
+blank is "none returned"; a present value must be a string, is bounded by
+`MAX_ROADMAP_SECTION_CHARS` (rejected by size, never clipped: the controller
+writes it verbatim into the EPIC body, so a truncated roadmap would be
+published), may contain newlines and tabs but no other control character,
+and must not contain any `<!-- ai-` controller marker (the roadmap markers
+are written by the controller around the section; any other marker would
+plant a durable claim in an open issue the controller scans). The refusal
+is the scanner's own opening, `CONTROLLER_MARKER_OPEN_RE` (`<!--`, any
+whitespace or none, `ai-`), on which every `autoforge.claims` marker
+pattern is built, so `<!--ai-` and `<!--\nai-` are refused exactly because
+the scanner would read them. Whether a
+section is *required* is the engine's decision from persisted state
+(`workflow.epic_update_every`, or the EPIC being reported complete), made
+after the result parses ([github-safety.md](github-safety.md), "EPIC
+updates").
+
 ### Whole-block bound and truncated stdout
 
 The accepted payload is persisted whole (`control-result.json` and one

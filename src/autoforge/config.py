@@ -359,6 +359,7 @@ WORKFLOW_KEYS = (
     "stagnation_identical_rounds",
     "stagnation_unchanged_count_rounds",
     "max_total_steps",
+    "epic_update_every",
 )
 
 
@@ -392,6 +393,12 @@ class WorkflowConfig:
     # across `resume`). Persisted as ``step_count``; the CLI's ``--max-steps``
     # is only a per-invocation slice of this budget.
     max_total_steps: int = 300
+    # Merged PRs per EPIC roadmap update. UPDATE_EPIC still runs after every
+    # MERGE (it is where the next issue is chosen), but the controller only
+    # asks for, writes and reads back the EPIC's managed roadmap section, and
+    # resets ``merged_since_epic_update``, once that many merges have
+    # accumulated since the last verified write. 1 updates after every merge.
+    epic_update_every: int = 1
 
 
 LOCAL_KEYS = (
@@ -913,7 +920,11 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
             f"{source}: 'review.replan.hard_threshold' must be >= 'review.replan.soft_threshold'"
         )
     workflow = _section(data, "workflow", source, WORKFLOW_KEYS)
-    for key, minimum in (("max_review_rounds", 1), ("max_total_steps", 1)):
+    for key, minimum in (
+        ("max_review_rounds", 1),
+        ("max_total_steps", 1),
+        ("epic_update_every", 1),
+    ):
         if key in workflow:
             value = _as_int(workflow[key], source, f"workflow.{key}")
             if value < minimum:

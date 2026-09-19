@@ -16,6 +16,7 @@ from autoforge.errors import (
     ExecutionError,
     ExecutionTimeoutError,
     GitHubError,
+    GitHubNotFoundError,
     GitHubUnavailableError,
     StateError,
     StateTransitionError,
@@ -3585,8 +3586,18 @@ ISSUE999 = "https://github.com/owner/repo/issues/999"
 FOREIGN_ISSUE = "https://github.com/other/repo/issues/1"
 
 
-def _epic_result(next_issue_url) -> str:
-    return block({"phase": "UPDATE_EPIC", "status": "success", "next_issue_url": next_issue_url})
+ROADMAP = "## Roadmap\n- [x] #1 (PR #42)\n- [ ] #3"
+
+
+def _epic_result(next_issue_url, roadmap_section: str | None = ROADMAP) -> str:
+    return block(
+        {
+            "phase": "UPDATE_EPIC",
+            "status": "success",
+            "roadmap_section": roadmap_section,
+            "next_issue_url": next_issue_url,
+        }
+    )
 
 
 def _in_update_epic(tmp_state_dir, gh, script, posts_progress: bool = True):
@@ -3639,7 +3650,7 @@ def test_update_epic_null_completes_the_run(tmp_state_dir, fake_github):
     assert out.next_phase == "DONE"
     s = load_state(eng.paths.state_file)
     assert s.current_issue_url == ISSUE and s.merged_since_epic_update == 0
-    assert [c for c in fake_github.calls if c[0] == "get_issue"] == []
+    assert [c for c in fake_github.calls if c[0] == "get_issue" and c[1] != EPIC] == []
 
 
 # -- UPDATE_EPIC entry and read-back: the progress comment (PR #89 review, F2) -------------
@@ -3702,7 +3713,8 @@ def test_update_epic_without_the_progress_comment_is_rejected(tmp_state_dir, fak
     s = load_state(eng.paths.state_file)
     assert s.phase == Phase.UPDATE_EPIC and s.current_issue_url == ISSUE and s.attempt == 1
     assert s.next_issue_rejections == []  # not a selection rejection
-    assert [c for c in fake_github.calls if c[0] == "get_issue"] == []
+    assert [c for c in fake_github.calls if c[0] == "get_issue" and c[1] != EPIC] == []
+    assert s.merged_since_epic_update == 1 and fake_github.edited_issues == []
 
 
 def test_update_epic_posting_a_second_progress_comment_is_rejected_then_blocked(
@@ -3729,10 +3741,12 @@ def _assert_not_switched(eng, gh, url_queried: str | None):
     s = load_state(eng.paths.state_file)
     assert s.phase == Phase.UPDATE_EPIC and s.current_issue_url == ISSUE
     assert s.current_pr_url == PR and s.review_round == 2  # bookkeeping not reset
-    assert s.merged_since_epic_update == 1  # the EPIC batch is not closed yet
+    # The roadmap write was read back before the selection was checked, so
+    # the batch is closed (#13); the rejection concerns the selection only.
+    assert s.merged_since_epic_update == 0
     assert s.attempt == 1  # the agent invocation is persisted for resume
     assert len(s.next_issue_rejections) == 1
-    queried = [c[1] for c in gh.calls if c[0] == "get_issue"]
+    queried = [c[1] for c in gh.calls if c[0] == "get_issue" and c[1] != EPIC]
     assert queried == ([url_queried] if url_queried else [])
 
 
@@ -3836,7 +3850,7 @@ def test_update_epic_malformed_next_issue_url_is_refused_at_parse_time_and_corre
     second = eng.provider.calls[1]
     assert second.correction is True
     assert "'next_issue_url' must be a GitHub issue URL" in second.prompt
-    assert [c for c in fake_github.calls if c[0] == "get_issue"] == []
+    assert [c for c in fake_github.calls if c[0] == "get_issue" and c[1] != EPIC] == []
     assert load_state(eng.paths.state_file).next_issue_rejections == []
 
 
@@ -3904,7 +3918,10 @@ def test_update_epic_rejection_is_retried_once_with_the_reason_then_blocked(
     s = load_state(eng.paths.state_file)
     assert s.phase == Phase.BLOCKED and "2 time(s)" in s.block_reason
     assert "issues/999" in s.block_reason
-    assert s.current_issue_url == ISSUE and s.merged_since_epic_update == 1
+    assert s.current_issue_url == ISSUE
+    # The first invocation's roadmap write verified and closed the batch; the
+    # second found the section already in place and wrote nothing (#13).
+    assert s.merged_since_epic_update == 0 and len(fake_github.edited_issues) == 1
     assert len(s.next_issue_rejections) == 2
 
 
@@ -3935,7 +3952,7 @@ def test_update_epic_transient_github_failure_is_a_rejection_not_a_switch(
 ):
     """R1-F2: only a *transient* failure takes the bounded re-selection path."""
     fake_github.add_issue(ISSUE3, "Next")
-    fake_github.get_issue_error = GitHubUnavailableError("gh: HTTP 502")
+    fake_github.get_issue_errors[ISSUE3] = GitHubUnavailableError("gh: HTTP 502")
     eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(ISSUE3)])
     with pytest.raises(VerificationError, match="GitHub unavailable: gh: HTTP 502"):
         eng.step()
@@ -3944,7 +3961,7 @@ def test_update_epic_transient_github_failure_is_a_rejection_not_a_switch(
 
 def test_update_epic_transient_github_failure_twice_is_blocked(tmp_state_dir, fake_github):
     fake_github.add_issue(ISSUE3, "Next")
-    fake_github.get_issue_error = GitHubUnavailableError("gh: HTTP 502")
+    fake_github.get_issue_errors[ISSUE3] = GitHubUnavailableError("gh: HTTP 502")
     eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(ISSUE3), _epic_result(ISSUE3)])
     with pytest.raises(VerificationError, match="selection 1/2"):
         eng.step()
@@ -3952,7 +3969,7 @@ def test_update_epic_transient_github_failure_twice_is_blocked(tmp_state_dir, fa
     assert out.next_phase == "BLOCKED" and len(eng.provider.calls) == 2
     s = load_state(eng.paths.state_file)
     assert s.phase == Phase.BLOCKED and "HTTP 502" in s.block_reason
-    assert s.current_issue_url == ISSUE and s.merged_since_epic_update == 1
+    assert s.current_issue_url == ISSUE and s.merged_since_epic_update == 0
 
 
 @pytest.mark.parametrize(
@@ -3973,7 +3990,7 @@ def test_update_epic_conclusive_github_failure_blocks_without_reinvoking_agent(
     controller still could not verify anything, so the run blocks at once.
     """
     fake_github.add_issue(ISSUE3, "Next")
-    fake_github.get_issue_error = error
+    fake_github.get_issue_errors[ISSUE3] = error
     eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(ISSUE3), _epic_result(ISSUE3)])
     out = eng.step()
     assert out.next_phase == "BLOCKED"
@@ -3983,9 +4000,384 @@ def test_update_epic_conclusive_github_failure_blocks_without_reinvoking_agent(
     assert str(error) in s.block_reason and "not a transient GitHub failure" in s.block_reason
     assert s.next_issue_rejections == []  # not a rejection of the selection
     assert s.current_issue_url == ISSUE and s.current_pr_url == PR
-    assert s.merged_since_epic_update == 1  # the EPIC batch is not closed
+    assert s.merged_since_epic_update == 0  # the roadmap write verified before the selection
     with pytest.raises(StateTransitionError):
         eng.step()  # BLOCKED is terminal for `step`; nothing else runs
+
+
+# -- UPDATE_EPIC: controller-owned roadmap splice and merge batching (#13, #4) -----------------
+ROADMAP_START = "<!-- ai-controller-roadmap:start -->"
+ROADMAP_END = "<!-- ai-controller-roadmap:end -->"
+OPERATOR_BODY = "# EPIC\n\nOperator text.\n\n- [ ] #2 feature\n- [ ] #3 next\n"
+PR41 = "https://github.com/owner/repo/pull/41"
+
+
+def _epic_body(section: str | None = None, trailing: str = "") -> str:
+    if section is None:
+        return OPERATOR_BODY
+    return f"{OPERATOR_BODY}\n{ROADMAP_START}\n{section}\n{ROADMAP_END}\n{trailing}"
+
+
+def _in_update_epic_with_body(tmp_state_dir, gh, script, body: str, every: int = 1):
+    gh.issues[EPIC].body = body
+    cfg = default_config()
+    cfg.workflow.epic_update_every = every
+    if isinstance(script, list):
+        queue = list(script)
+
+        def scripted(req):
+            post_progress_comment(gh)
+            return queue.pop(0)
+
+        script = scripted
+    eng = make_engine(tmp_state_dir, script, github=gh, cfg=cfg)
+    gh.add_pr(head_sha=SHA_A, state="MERGED")
+    eng.state.phase = Phase.UPDATE_EPIC
+    eng.state.current_pr_url = PR
+    eng.state.current_branch = BRANCH
+    eng.state.current_head_sha = SHA_A
+    eng.state.reviewed_head_sha = SHA_A
+    eng.state.last_review_result = "clean"
+    eng.state.record_merge(PR)
+    eng._save()
+    return eng
+
+
+def test_update_epic_appends_the_roadmap_section_when_the_epic_has_none(tmp_state_dir, fake_github):
+    """The agent returns the section; the controller writes it. An EPIC
+    without markers gets the block appended after the operator's text, which
+    stays byte-identical, and the merge counter resets only after the body
+    is read back."""
+    eng = _in_update_epic_with_body(tmp_state_dir, fake_github, [_epic_result(None)], _epic_body())
+    out = eng.step()
+    assert out.next_phase == "DONE" and "appended the managed roadmap section" in out.message
+    assert "merge counter reset" in out.message
+    body = fake_github.issues[EPIC].body
+    assert body == f"{OPERATOR_BODY}\n{ROADMAP_START}\n{ROADMAP}\n{ROADMAP_END}\n"
+    assert body.startswith(OPERATOR_BODY)
+    assert fake_github.edited_issues == [(EPIC, body)]
+    calls = fake_github.calls
+    write = calls.index(("edit_issue_body", EPIC, body))
+    assert ("get_issue", EPIC) in calls[write + 1 :]  # read back after the write
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.DONE and s.merged_since_epic_update == 0
+
+
+def test_update_epic_replaces_only_the_managed_section(tmp_state_dir, fake_github):
+    fake_github.add_issue(ISSUE3, "Next")
+    before = _epic_body("old roadmap", trailing="\nOperator note after the section.\n")
+    eng = _in_update_epic_with_body(tmp_state_dir, fake_github, [_epic_result(ISSUE3)], before)
+    out = eng.step()
+    assert out.next_phase == "ANALYZE_EXECUTE" and "replaced the managed" in out.message
+    after = fake_github.issues[EPIC].body
+    assert after == before.replace("old roadmap", ROADMAP)
+    assert after.startswith(OPERATOR_BODY) and after.endswith("Operator note after the section.\n")
+    s = load_state(eng.paths.state_file)
+    assert s.current_issue_url == ISSUE3 and s.merged_since_epic_update == 0
+
+
+def test_update_epic_prompt_carries_the_batch_and_the_current_section(tmp_state_dir, fake_github):
+    seen = []
+
+    def agent(req):
+        seen.append(req.prompt)
+        post_progress_comment(fake_github)
+        return _epic_result(None)
+
+    eng = _in_update_epic_with_body(
+        tmp_state_dir, fake_github, agent, _epic_body("- [x] #1 ```old```")
+    )
+    eng.state.record_merge(PR41)
+    eng._save()
+    assert eng.step().next_phase == "DONE"
+    (prompt,) = seen
+    assert "Roadmap update due now: yes" in prompt
+    assert f"  - {PR}\n  - {PR41}" in prompt  # the batch, in merge order
+    assert "(merged: 2; the controller updates the roadmap\n  every 1):" in prompt
+    assert f"`{ROADMAP_START}`\n   `{ROADMAP_END}`" in prompt
+    assert "````markdown\n- [x] #1 ```old```\n````" in prompt  # fenced, longer than its content
+    assert "Do NOT run `gh issue edit`" in prompt
+
+
+def test_update_epic_prompt_says_when_the_epic_has_no_section_yet(tmp_state_dir, fake_github):
+    seen = []
+
+    def agent(req):
+        seen.append(req.prompt)
+        post_progress_comment(fake_github)
+        return _epic_result(None)
+
+    eng = _in_update_epic_with_body(tmp_state_dir, fake_github, agent, _epic_body())
+    assert eng.step().next_phase == "DONE"
+    assert "(none: the EPIC has no managed section yet" in seen[0]
+
+
+def test_update_epic_roadmap_not_due_keeps_the_counter_and_writes_nothing(
+    tmp_state_dir, fake_github
+):
+    """workflow.epic_update_every = 2 with one merge: UPDATE_EPIC still runs
+    (progress comment, next issue) but the body is not written, the counter
+    is kept, and a section the agent returned anyway is ignored."""
+    fake_github.add_issue(ISSUE3, "Next")
+    seen = []
+
+    def agent(req):
+        seen.append(req.prompt)
+        post_progress_comment(fake_github)
+        return _epic_result(ISSUE3, roadmap_section="unsolicited")
+
+    eng = _in_update_epic_with_body(tmp_state_dir, fake_github, agent, _epic_body("keep"), every=2)
+    out = eng.step()
+    assert out.next_phase == "ANALYZE_EXECUTE"
+    assert "roadmap update not due (1 merge(s)" in out.message
+    assert "returned roadmap_section was ignored" in out.message
+    assert "Roadmap update due now: no" in seen[0]
+    assert fake_github.edited_issues == [] and fake_github.issues[EPIC].body == _epic_body("keep")
+    s = load_state(eng.paths.state_file)
+    assert s.current_issue_url == ISSUE3 and s.merged_since_epic_update == 1
+    assert s.counted_merged_prs == [PR]
+
+
+def test_update_epic_roadmap_due_once_the_batch_is_full(tmp_state_dir, fake_github):
+    fake_github.add_issue(ISSUE3, "Next")
+    eng = _in_update_epic_with_body(
+        tmp_state_dir, fake_github, [_epic_result(ISSUE3)], _epic_body(), every=2
+    )
+    eng.state.record_merge(PR41)
+    eng._save()
+    out = eng.step()
+    assert out.next_phase == "ANALYZE_EXECUTE" and "roadmap update due (2 merge(s)" in out.message
+    assert len(fake_github.edited_issues) == 1
+    s = load_state(eng.paths.state_file)
+    assert s.merged_since_epic_update == 0 and s.counted_merged_prs == [PR, PR41]
+
+
+def test_update_epic_epic_complete_requires_the_final_roadmap_even_when_not_due(
+    tmp_state_dir, fake_github
+):
+    eng = _in_update_epic_with_body(
+        tmp_state_dir,
+        fake_github,
+        [_epic_result(None, roadmap_section=None), _epic_result(None)],
+        _epic_body(),
+        every=3,
+    )
+    with pytest.raises(VerificationError, match="must return 'roadmap_section'.*reported complete"):
+        eng.step()
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.UPDATE_EPIC and s.merged_since_epic_update == 1
+    assert fake_github.edited_issues == []
+    out = eng.step()
+    assert out.next_phase == "DONE" and len(fake_github.edited_issues) == 1
+    assert load_state(eng.paths.state_file).merged_since_epic_update == 0
+
+
+def test_update_epic_missing_roadmap_section_when_due_is_rejected_without_reset(
+    tmp_state_dir, fake_github
+):
+    fake_github.add_issue(ISSUE3, "Next")
+    eng = _in_update_epic_with_body(
+        tmp_state_dir, fake_github, [_epic_result(ISSUE3, roadmap_section=None)], _epic_body()
+    )
+    with pytest.raises(VerificationError, match="must return 'roadmap_section' \\(1 merge"):
+        eng.step()
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.UPDATE_EPIC and s.merged_since_epic_update == 1 and s.attempt == 1
+    assert s.current_issue_url == ISSUE and s.next_issue_rejections == []
+    assert fake_github.edited_issues == []
+    assert ("get_issue", ISSUE3) not in fake_github.calls  # the selection is not reached
+
+
+def test_update_epic_counter_resets_only_after_the_write_is_read_back(tmp_state_dir, fake_github):
+    """gh exits 0 but the body read back does not carry the section: no reset."""
+    fake_github.edit_issue_leaves_body = True
+    eng = _in_update_epic_with_body(
+        tmp_state_dir, fake_github, [_epic_result(None)], _epic_body("old")
+    )
+    with pytest.raises(VerificationError, match="does not carry the section that was written"):
+        eng.step()
+    assert len(fake_github.edited_issues) == 1
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.UPDATE_EPIC and s.merged_since_epic_update == 1
+
+
+def test_update_epic_read_back_that_differs_outside_the_markers_is_rejected(
+    tmp_state_dir, fake_github
+):
+    """A concurrent edit landing between the write and the read-back shows
+    up outside the markers: rejected, counter kept."""
+
+    def concurrent_edit(gh):
+        gh.edit_issue_leaves_body = True
+        gh.issues[EPIC].body = _epic_body(ROADMAP) + "\nhuman line\n"
+
+    fake_github.edit_issue_race = concurrent_edit
+    eng = _in_update_epic_with_body(
+        tmp_state_dir, fake_github, [_epic_result(None)], _epic_body("old")
+    )
+    with pytest.raises(VerificationError, match="differs outside the roadmap markers"):
+        eng.step()
+    assert load_state(eng.paths.state_file).merged_since_epic_update == 1
+
+
+def test_update_epic_body_changed_outside_the_markers_while_the_agent_ran_is_not_overwritten(
+    tmp_state_dir, fake_github
+):
+    """The agent (or a human) edited the EPIC body during the invocation: the
+    section was composed against a stale view, so nothing is written and
+    the next entry re-reads the body."""
+    calls = 0
+
+    def agent(req):
+        nonlocal calls
+        calls += 1
+        post_progress_comment(fake_github)
+        if calls == 1:
+            fake_github.issues[EPIC].body = OPERATOR_BODY.replace("- [ ] #2", "- [x] #2")
+        return _epic_result(None)
+
+    eng = _in_update_epic_with_body(tmp_state_dir, fake_github, agent, _epic_body())
+    with pytest.raises(VerificationError, match="changed outside the roadmap markers while"):
+        eng.step()
+    assert fake_github.edited_issues == []
+    assert load_state(eng.paths.state_file).merged_since_epic_update == 1
+    out = eng.step()  # resume: the entry re-reads, the write lands on the current body
+    assert out.next_phase == "DONE" and len(fake_github.edited_issues) == 1
+    assert fake_github.issues[EPIC].body.startswith(OPERATOR_BODY.replace("- [ ] #2", "- [x] #2"))
+    assert load_state(eng.paths.state_file).merged_since_epic_update == 0
+
+
+def test_update_epic_crash_after_the_write_does_not_double_apply(tmp_state_dir, fake_github):
+    """Crash after `gh issue edit` landed but before state was saved: the
+    re-entry finds the section already in place, writes nothing, and only
+    then resets the counter. One section, never two."""
+    fake_github.add_issue(ISSUE3, "Next")
+    eng = _in_update_epic_with_body(
+        tmp_state_dir, fake_github, [_epic_result(ISSUE3), _epic_result(ISSUE3)], _epic_body()
+    )
+    landed = fake_github.edit_issue_body
+
+    def crash_after_write(url, body):
+        landed(url, body)
+        raise RuntimeError("power loss")
+
+    fake_github.edit_issue_body = crash_after_write
+    with pytest.raises(RuntimeError, match="power loss"):
+        eng.step()
+    written = fake_github.issues[EPIC].body
+    assert written.count(ROADMAP_START) == 1
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.UPDATE_EPIC and s.merged_since_epic_update == 1 and s.attempt == 1
+
+    fake_github.edit_issue_body = landed
+    eng.load()  # a fresh process resumes from disk
+    out = eng.step()
+    assert out.next_phase == "ANALYZE_EXECUTE"
+    assert "already carries this section (no write needed)" in out.message
+    assert len(fake_github.edited_issues) == 1  # the crashed attempt's write only
+    assert fake_github.issues[EPIC].body == written
+    assert written.count(ROADMAP_START) == 1 and written.count(ROADMAP_END) == 1
+    s = load_state(eng.paths.state_file)
+    assert s.current_issue_url == ISSUE3 and s.merged_since_epic_update == 0
+
+
+def test_update_epic_entry_blocks_on_ambiguous_markers_without_invoking(tmp_state_dir, fake_github):
+    body = (
+        f"{OPERATOR_BODY}\n{ROADMAP_START}\na\n{ROADMAP_END}\n{ROADMAP_START}\nb\n{ROADMAP_END}\n"
+    )
+    eng = _in_update_epic_with_body(tmp_state_dir, fake_github, ["never"], body)
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and eng.provider.calls == []
+    s = load_state(eng.paths.state_file)
+    assert "2 start and 2 end roadmap marker(s)" in s.block_reason
+    assert "will not guess" in s.block_reason
+    assert s.merged_since_epic_update == 1 and fake_github.edited_issues == []
+    assert fake_github.issues[EPIC].body == body
+
+
+def test_update_epic_entry_blocks_on_a_conclusive_failure_reading_the_body(
+    tmp_state_dir, fake_github
+):
+    """R1-F1 of PR #105: the entry's EPIC body read fails conclusively.
+    Fail closed like the progress-comment read beside it: durable BLOCKED,
+    no agent launched, nothing written, the merge counter kept."""
+    fake_github.get_issue_errors[EPIC] = GitHubError("`gh issue view` failed (exit 1): HTTP 403")
+    eng = _in_update_epic_with_body(tmp_state_dir, fake_github, ["never"], _epic_body())
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and eng.provider.calls == []
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.BLOCKED
+    assert f"the body of EPIC {EPIC} could not be read" in s.block_reason
+    assert "HTTP 403" in s.block_reason and "not a transient GitHub failure" in s.block_reason
+    assert s.current_issue_url == ISSUE and s.merged_since_epic_update == 1
+    assert fake_github.edited_issues == [] and fake_github.comments.get(EPIC, []) == []
+
+
+def test_update_epic_entry_blocks_when_the_epic_is_gone(tmp_state_dir, fake_github):
+    """A missing EPIC is a conclusive read failure, not a transient one."""
+    fake_github.get_issue_errors[EPIC] = GitHubNotFoundError("issue not found")
+    eng = _in_update_epic_with_body(tmp_state_dir, fake_github, ["never"], _epic_body())
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and eng.provider.calls == []
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.BLOCKED and "issue not found" in s.block_reason
+    assert s.merged_since_epic_update == 1 and fake_github.edited_issues == []
+
+
+def test_update_epic_entry_transient_failure_reading_the_body_propagates(
+    tmp_state_dir, fake_github
+):
+    """GitHub unavailable while reading the body: the entry is retried by
+    'resume', not blocked, and the phase, counter and attempt are untouched."""
+    fake_github.get_issue_errors[EPIC] = GitHubUnavailableError("gh: HTTP 502")
+    eng = _in_update_epic_with_body(tmp_state_dir, fake_github, [_epic_result(None)], _epic_body())
+    with pytest.raises(GitHubUnavailableError):
+        eng.step()
+    assert eng.provider.calls == []
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.UPDATE_EPIC and s.merged_since_epic_update == 1 and s.attempt == 0
+    del fake_github.get_issue_errors[EPIC]
+    assert eng.step().next_phase == "DONE"
+    assert load_state(eng.paths.state_file).merged_since_epic_update == 0
+
+
+def test_update_epic_conclusive_failure_writing_the_body_blocks(tmp_state_dir, fake_github):
+    fake_github.edit_issue_error = "`gh issue edit` failed (exit 1): HTTP 403: forbidden"
+    eng = _in_update_epic_with_body(
+        tmp_state_dir, fake_github, [_epic_result(None), _epic_result(None)], _epic_body()
+    )
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and len(eng.provider.calls) == 1
+    s = load_state(eng.paths.state_file)
+    assert "HTTP 403" in s.block_reason and "merge counter was not reset" in s.block_reason
+    assert s.merged_since_epic_update == 1 and s.phase == Phase.BLOCKED
+
+
+def test_update_epic_transient_failure_writing_the_body_propagates(tmp_state_dir, fake_github):
+    fake_github.edit_issue_error = GitHubUnavailableError("gh: HTTP 502")
+    eng = _in_update_epic_with_body(
+        tmp_state_dir, fake_github, [_epic_result(None), _epic_result(None)], _epic_body()
+    )
+    with pytest.raises(GitHubUnavailableError):
+        eng.step()
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.UPDATE_EPIC and s.merged_since_epic_update == 1 and s.attempt == 1
+    fake_github.edit_issue_error = ""
+    assert eng.step().next_phase == "DONE"
+    assert load_state(eng.paths.state_file).merged_since_epic_update == 0
+
+
+def test_update_epic_dry_run_plan_names_the_batching_decision(tmp_state_dir, fake_github):
+    eng = _in_update_epic_with_body(tmp_state_dir, fake_github, ["never"], _epic_body(), every=2)
+    calls_before = list(fake_github.calls)
+    out = eng.step(dry_run=True)
+    assert any("roadmap update not due: 1 merge(s)" in n for n in out.plan.notes)
+    assert "(read from the EPIC body immediately before the agent runs)" in out.plan.prompt_full
+    assert fake_github.calls == calls_before and eng.provider.calls == []
+    eng.state.record_merge(PR41)
+    out = eng.step(dry_run=True)
+    assert any("roadmap update due: 2 merge(s)" in n for n in out.plan.notes)
+    assert fake_github.calls == calls_before and fake_github.edited_issues == []
 
 
 # -- loop bounds: review-round cap, stagnation, step budget (#9) ------------------------------

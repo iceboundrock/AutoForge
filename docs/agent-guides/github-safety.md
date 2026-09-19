@@ -221,8 +221,9 @@ Verify:
 
 ### Before UPDATE_EPIC
 
-The phase's writes are a progress comment on the EPIC and its task-list
-edits. The comment carries the `ai-epic-progress` marker of
+The agent's one write in the phase is a progress comment on the EPIC; the
+EPIC body is written by the controller (below), never by the agent. The
+comment carries the `ai-epic-progress` marker of
 `{"issue", "pr"}` (the finished issue and the merged PR, rendered into the
 prompt as `PROGRESS_MARKER`); before the agent is launched the EPIC's
 comments are read for it:
@@ -234,8 +235,18 @@ comments are read for it:
 - two or more: `BLOCKED` without launching the agent
 - a comment for another issue or PR on the same EPIC is not this entry's
 
-The task-list edits are idempotent by nature (a checked box stays checked)
-and are not read back; confining them to a managed section is #4 and #13.
+The EPIC body is read too, and its managed roadmap section located (see
+"EPIC updates" below): its current content is rendered into the prompt as
+`CURRENT_ROADMAP_SECTION` (fenced, untrusted), the PRs merged since the last
+roadmap update as `MERGED_PRS_SINCE_EPIC_UPDATE`, and whether an update is
+due as `ROADMAP_UPDATE_DUE`. A body whose markers are ambiguous (a marker
+repeated, an end before a start, one without the other) is `BLOCKED` without
+launching the agent: the controller edits only the text between the markers
+and never guesses which text that is. So is a body that cannot be read for a
+conclusive reason (authentication, permissions, the EPIC gone, malformed
+data): an agent launched without the body would compose a section the
+controller could never splice. Only `GitHubUnavailableError` propagates, so
+`resume` retries the read.
 
 ### After UPDATE_EPIC
 
@@ -243,8 +254,9 @@ First read the EPIC back: exactly one comment carrying this entry's marker.
 None means the agent did not do the phase's write (the result is rejected
 and the next entry finds nothing and launches again); two means it
 duplicated the one it was handed (rejected; the next entry blocks on the
-pair). Only then verify `next_issue_url` exactly like the first issue in
-`INITIALIZING` before switching issues:
+pair). Then perform the roadmap write when one is due, and only then verify
+`next_issue_url` exactly like the first issue in `INITIALIZING` before
+switching issues:
 
 - it parses as an issue URL of the configured repository
 - it is neither the EPIC nor the issue just finished
@@ -268,8 +280,10 @@ while checking the selection takes the same bounded retry. Any other GitHub
 failure (authentication, permissions, malformed data) is conclusive and
 enters `BLOCKED` immediately without invoking the agent again. Never switch
 to an unverified issue. A rejected selection has no effect the controller
-did not already verify: the progress comment is adopted on the retry, the
-task-list edits are idempotent, and no issue was switched.
+did not already verify: the progress comment is adopted on the retry, a
+roadmap section already written was read back and closed its batch (the
+retry finds it in place and does not write it again), and no issue was
+switched.
 
 ### Before MERGE
 
@@ -355,9 +369,10 @@ Tests must never merge real PRs.
 
 ## EPIC updates
 
-When EPIC maintenance is implemented, AutoForge must preserve manually maintained EPIC content.
-
-Only update a managed section:
+The EPIC body is the operator's document. AutoForge owns exactly one part
+of it, the managed roadmap section between two marker lines, and the
+controller is the only party that writes the body (`autoforge.roadmap`,
+`ControllerEngine._apply_roadmap_section`):
 
 ```text
 <!-- ai-controller-roadmap:start -->
@@ -365,9 +380,43 @@ Only update a managed section:
 <!-- ai-controller-roadmap:end -->
 ```
 
-If it exists, replace only the managed section. If absent, append it.
+- **Batching is the controller's decision.** `UPDATE_EPIC` runs after every
+  merge, but the roadmap is written only when
+  `merged_since_epic_update >= workflow.epic_update_every` (default 1), or
+  when the agent reports the EPIC complete (`next_issue_url: null`) with
+  merges still uncounted. The agent is told whether an update is due; it is
+  never asked to decide. When not due, nothing is written, the counter is
+  kept, and a `roadmap_section` the agent returned anyway is ignored.
+- **The agent returns content, the controller edits.** The prompt forbids
+  `gh issue edit`; the agent returns the section's new content as
+  `roadmap_section` in its `CONTROL_RESULT` (bounded by
+  `MAX_ROADMAP_SECTION_CHARS`, refused when it contains any `<!-- ai-`
+  marker in the spelling the claims scanner reads, whitespace after `<!--`
+  or none, since the roadmap markers would split the body into more than
+  one section and any other marker would plant a durable claim in an open
+  issue the controller scans). A required section that is missing is rejected
+  (`VerificationError`, no reset, `resume` asks again).
+- **Only the section changes.** The controller re-reads the body, refuses
+  to write when the bytes outside the markers differ from the body the entry
+  read (the section was composed against a stale view; the next entry
+  re-reads), replaces the text between the markers or appends the block
+  after the existing text when there is none, and writes the whole body
+  with `gh issue edit --body-file` (the body never travels in argv).
+- **The write is read back.** After the write the body is read again: every
+  byte outside the markers must equal the body read before the write (plus
+  the two marker lines when the section was appended), and the section must
+  be the one written. A mismatch is rejected without resetting the counter;
+  a conclusive GitHub failure or a body whose markers can no longer be read
+  is `BLOCKED`; an unavailable GitHub propagates and `resume` re-enters.
+- **The counter resets after the read-back, never before.** A crash between
+  the write and the state save re-enters `UPDATE_EPIC`: the entry reads the
+  body with the section in place, the agent (adopting its progress comment)
+  returns the section again, the controller finds the spliced body equal to
+  the current one, writes nothing, and resets. The splice replaces in place
+  and never appends a second block, so a retry cannot double-apply.
 
-Do not rewrite the whole EPIC body.
+Do not rewrite the whole EPIC body, and never edit the EPIC body from a
+prompt.
 
 ---
 

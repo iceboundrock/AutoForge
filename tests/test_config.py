@@ -675,6 +675,7 @@ def test_workflow_defaults_and_parsing(tmp_path):
     assert cfg.workflow.stagnation_identical_rounds == 2
     assert cfg.workflow.stagnation_unchanged_count_rounds == 3
     assert cfg.workflow.max_total_steps == 300
+    assert cfg.workflow.epic_update_every == 1
     assert cfg.review.replan.soft_threshold == 12
     assert cfg.review.replan.hard_threshold == 20
     p = tmp_path / "cfg.json"
@@ -687,6 +688,7 @@ def test_workflow_defaults_and_parsing(tmp_path):
                     "stagnation_identical_rounds": 0,
                     "stagnation_unchanged_count_rounds": 0,
                     "max_total_steps": 12,
+                    "epic_update_every": 3,
                 },
                 "review": {"replan": {"soft_threshold": 2, "hard_threshold": 3}},
             }
@@ -695,6 +697,7 @@ def test_workflow_defaults_and_parsing(tmp_path):
     )
     wf = load_config_file(p).workflow
     assert (wf.max_review_rounds, wf.max_total_steps) == (3, 12)
+    assert wf.epic_update_every == 3
     assert (wf.stagnation_identical_rounds, wf.stagnation_unchanged_count_rounds) == (0, 0)
     # 2 is the smallest window either rule can act on (see the rejection of 1).
     p.write_text(
@@ -725,6 +728,7 @@ def test_workflow_defaults_and_parsing(tmp_path):
     [
         ('{"version": 1, "workflow": {"max_review_rounds": 0}}', "max_review_rounds.*>= 1"),
         ('{"version": 1, "workflow": {"max_total_steps": 0}}', "max_total_steps.*>= 1"),
+        ('{"version": 1, "workflow": {"epic_update_every": 0}}', "epic_update_every.*>= 1"),
         (
             '{"version": 1, "workflow": {"stagnation_identical_rounds": -1}}',
             "stagnation_identical_rounds.*0 .rule disabled. or >= 2",

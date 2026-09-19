@@ -323,7 +323,14 @@ def test_gate_open_loop_merges_via_controller_then_update_epic_to_done(tmp_state
             assert "Never merge a pull request" in req.prompt
             assert "gh pr merge" not in req.prompt.replace("no `gh pr merge`", "")
             post_progress_comment(gh)
-            return block({"phase": "UPDATE_EPIC", "status": "success", "next_issue_url": None})
+            return block(
+                {
+                    "phase": "UPDATE_EPIC",
+                    "status": "success",
+                    "roadmap_section": "- [x] done",
+                    "next_issue_url": None,
+                }
+            )
         raise AssertionError(f"unexpected call {req.phase}")
 
     eng = make_engine(tmp_state_dir, agent, github=gh)

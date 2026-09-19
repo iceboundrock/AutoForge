@@ -1,6 +1,7 @@
 """GitHub client with injected fake `gh` runner (no network)."""
 
 import json
+import os
 from dataclasses import replace
 
 import pytest
@@ -733,6 +734,61 @@ def test_latest_pr_number_is_a_proven_numeric_maximum_and_fails_closed():
     )
     with pytest.raises(GitHubError, match="cannot be established"):
         truncating.latest_pr_number("o/r")
+
+
+def test_edit_issue_body_argv_and_body_file():
+    """The EPIC body write (#13): ``gh issue edit <issue> --body-file <file>``
+    with the body in a private temporary file (never in argv), removed once
+    ``gh`` returns, whether or not it succeeded."""
+    from autoforge.github import build_edit_issue_body_argv
+
+    url = "https://github.com/o/r/issues/1"
+    assert build_edit_issue_body_argv(url, "/tmp/x") == [
+        "issue",
+        "edit",
+        url,
+        "--body-file",
+        "/tmp/x",
+    ]
+    seen = []
+
+    def runner(req):
+        seen.append(req.command)
+        path = req.command[-1]
+        seen.append(open(path, encoding="utf-8", newline="").read())
+        return ExecutionResult(
+            command=req.command,
+            cwd=None,
+            exit_code=0,
+            stdout="",
+            stderr="",
+            started_at="t",
+            finished_at="t",
+        )
+
+    body = (
+        "# EPIC\n\n<!-- ai-controller-roadmap:start -->\n- a\n<!-- ai-controller-roadmap:end -->\n"
+    )
+    _client(runner).edit_issue_body(url, body)
+    assert seen[0][:5] == ["gh", "issue", "edit", url, "--body-file"]
+    assert seen[1] == body and body not in " ".join(seen[0])
+    assert not os.path.exists(seen[0][-1])
+
+    def failing(req):
+        seen.append(req.command[-1])
+        return ExecutionResult(
+            command=req.command,
+            cwd=None,
+            exit_code=1,
+            stdout="",
+            stderr="HTTP 403",
+            started_at="t",
+            finished_at="t",
+        )
+
+    with pytest.raises(GitHubError, match="HTTP 403"):
+        _client(failing).edit_issue_body(url, body)
+    assert not os.path.exists(seen[-1])
 
 
 def test_disable_auto_merge_argv():

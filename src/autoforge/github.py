@@ -13,7 +13,9 @@ is always behind the safety gate and bound to the reviewed HEAD via
 from __future__ import annotations
 
 import json
+import os
 import re
+import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -618,6 +620,16 @@ def build_disable_auto_merge_argv(pr_url: str) -> list[str]:
     return ["pr", "merge", parse_pr_url(pr_url).canonical, "--disable-auto"]
 
 
+def build_edit_issue_body_argv(issue_url: str, body_file: str) -> list[str]:
+    """``gh issue edit <issue> --body-file <file>``: replace an issue's body.
+
+    The body travels through a file, never through ``--body``: an issue body
+    is arbitrary multi-line text that the executor's argv would otherwise
+    expose in process listings, and the executor gives ``gh`` no stdin.
+    """
+    return ["issue", "edit", parse_issue_url(issue_url).canonical, "--body-file", body_file]
+
+
 def _as_int(value: object, what: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise GitHubError(f"`gh` returned a non-integer {what}: {value!r}")
@@ -874,6 +886,28 @@ class GitHubClient:
 
     def get_issue_state(self, url: str) -> str:
         return self.get_issue(url).state
+
+    def edit_issue_body(self, url: str, body: str) -> None:
+        """Replace the whole body of an issue (``gh issue edit --body-file``).
+
+        The only controller-owned issue-body write: UPDATE_EPIC splices the
+        EPIC's managed roadmap section into a body it read moments before.
+        ``gh issue edit`` has no precondition, so the caller proves the write
+        did what it meant by reading the body back and comparing every byte
+        outside the managed section (``engine._apply_update_epic``); the exit
+        status alone is no evidence. The body is handed over in a private
+        temporary file that is removed whether or not ``gh`` succeeds.
+        """
+        fd, path = tempfile.mkstemp(prefix="autoforge-issue-body-", suffix=".md")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+                handle.write(body)
+            self._run_gh(build_edit_issue_body_argv(url, path))
+        finally:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
 
     def list_open_issues(self, repo: str, *, strict: bool = False) -> list[IssueInfo]:
         """Every open issue in ``repo`` (bodies included), pull requests excluded.
@@ -1427,5 +1461,6 @@ __all__ = [
     "PRInfo",
     "RepoInfo",
     "build_disable_auto_merge_argv",
+    "build_edit_issue_body_argv",
     "build_merge_argv",
 ]

@@ -313,9 +313,13 @@ next entry could not find again.
 - `UPDATE_EPIC` reads the EPIC's comments for the `ai-epic-progress` marker
   of (finished issue, merged PR). One is handed to the agent
   (`EXISTING_PROGRESS_COMMENT_URL`) to adopt instead of posting a second;
-  two or more block. The bounded re-selection after a rejected
-  `next_issue_url` is a re-entry and adopts the comment the same way. After
-  the agent returns, the EPIC must carry exactly one such comment.
+  two or more block. It also reads the EPIC body and locates the managed
+  roadmap section (ambiguous markers, or a conclusive failure to read the
+  body, block without launching; an unavailable GitHub propagates). The bounded
+  re-selection after a rejected `next_issue_url` is a re-entry and adopts
+  the comment the same way. After the agent returns, the EPIC must carry
+  exactly one such comment; the roadmap section is written by the
+  controller when due (github-safety.md, "EPIC updates").
 
 No probe consumes a review round, a `review_history` entry, or an attempt.
 
