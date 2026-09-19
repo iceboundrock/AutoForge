@@ -633,21 +633,86 @@ def test_review_to_fix_handoff_is_githubs_url_of_the_verified_comment(tmp_state_
     assert spelling not in prompt
 
 
-def test_review_comment_named_by_the_issues_form_of_the_pr_is_rejected(tmp_state_dir):
-    """#80: a PR comment is a PR comment. The ``issues/<n>#issuecomment-<id>``
-    spelling GitHub also serves names an issue as the parent, not this PR,
-    and the existing identity check (kind, owner, repository, number)
-    refuses it; the verified comment's URL is never derived from it."""
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        comment_url("https://github.com/owner/repo/issues/42", 100),
+        comment_url("https://github.com/Owner/REPO/issues/42", 100),
+    ],
+)
+def test_review_comment_named_by_the_issues_form_of_the_pr_is_the_verified_comment(
+    tmp_state_dir, spelling
+):
+    """#80: GitHub serves a PR comment under both ``pull/<n>#issuecomment-<id>``
+    and ``issues/<n>#issuecomment-<id>`` (a PR is an issue to the comments
+    API). A reviewer naming the verified comment by the ``issues/`` path names
+    this PR's comment: it is matched to the comment carrying the round's marker
+    at the bound HEAD and base by repository, number and comment id, and the
+    URL persisted and handed to the fixer is GitHub's ``pull/`` URL of that
+    comment, never the reviewer's spelling."""
     gh = FakeGitHub()
     gh.add_comment(PR, 100, review_comment_body(1, SHA_A, True, ["R1-F1"]))
     payload = review_payload(1, SHA_A, [_finding(1)])
-    payload["review_comment_url"] = comment_url("https://github.com/owner/repo/issues/42", 100)
+    payload["review_comment_url"] = spelling
+
+    def agent(req):
+        if req.phase == "REVIEW":
+            return block(payload)
+        gh.set_head(SHA_B)
+        return block(fix_payload(SHA_A, SHA_B, [{"finding_id": "R1-F1", "resolution": "fixed"}]))
+
+    eng = _in_review(tmp_state_dir, gh, agent)
+    assert eng.step().next_phase == "FIX"
+    s = load_state(eng.paths.state_file)
+    assert s.last_review_comment_url == comment_url(PR, 100)
+    assert "/issues/" not in s.last_review_comment_url
+    assert s.review_history[-1]["review_comment_url"] == comment_url(PR, 100)
+    assert eng.step().next_phase == "REVIEW"
+    prompt = eng.provider.calls[1].prompt
+    assert f"Verified review comment: {comment_url(PR, 100)}" in prompt
+    assert spelling not in prompt
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        comment_url("https://github.com/owner/repo/issues/43", 100),
+        comment_url("https://github.com/other/repo/issues/42", 100),
+        comment_url("https://github.com/owner/repo/pull/43", 100),
+    ],
+)
+def test_review_comment_on_another_number_or_repository_is_rejected(tmp_state_dir, spelling):
+    """#80: accepting the ``issues/`` path does not loosen the parent check.
+    The comment named must be on this PR's number in this repository under
+    either path; another number (an issue or PR) or another repository is
+    refused before any GitHub read, and the round is not consumed."""
+    gh = FakeGitHub()
+    gh.add_comment(PR, 100, review_comment_body(1, SHA_A, True, ["R1-F1"]))
+    payload = review_payload(1, SHA_A, [_finding(1)])
+    payload["review_comment_url"] = spelling
     eng = _in_review(tmp_state_dir, gh, [block(payload)])
     with pytest.raises(VerificationError, match="does not belong to PR"):
         eng.step()
     s = load_state(eng.paths.state_file)
     assert s.phase == Phase.REVIEW and s.review_round == 0
     assert s.last_review_comment_url == "" and s.open_findings == []
+
+
+def test_issues_form_of_a_comment_that_is_not_the_rounds_review_is_rejected(tmp_state_dir):
+    """#80: the ``issues/`` spelling is matched against the comment the
+    controller located, not trusted: naming a human comment on the same PR by
+    that path is refused exactly as its ``pull/`` spelling would be."""
+    gh = FakeGitHub()
+    gh.add_comment(PR, 90, "Human: please also look at the docs.")
+    gh.add_comment(PR, 100, review_comment_body(1, SHA_A, True, ["R1-F1"]))
+    payload = review_payload(1, SHA_A, [_finding(1)])
+    payload["review_comment_url"] = comment_url("https://github.com/owner/repo/issues/42", 90)
+    eng = _in_review(tmp_state_dir, gh, [block(payload)])
+    with pytest.raises(VerificationError, match="is not the comment carrying the round 1 marker"):
+        eng.step()
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.REVIEW and s.review_round == 0
+    assert s.last_review_comment_url == ""
 
 
 def test_fix_handoff_survives_a_restart_between_review_and_fix(tmp_state_dir):

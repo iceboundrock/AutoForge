@@ -4999,8 +4999,9 @@ class ControllerEngine:
         HEAD and base), matched to the result's ``review_comment_url`` by
         identity. Its ``url`` is GitHub's URL of that comment, which is what
         the round persists and hands to the fixer: the reviewer's spelling of
-        the URL (``Owner/REPO`` for ``owner/repo``) is accepted as naming the
-        same comment but is never the handoff artifact.
+        the URL (``Owner/REPO`` for ``owner/repo``, or the ``issues/<n>`` path
+        GitHub also serves a PR comment under) is accepted as naming the same
+        comment but is never the handoff artifact.
         """
         state = self._require_state()
         try:
@@ -5010,7 +5011,7 @@ class ControllerEngine:
                 f"review_comment_url is not a GitHub PR comment URL: {exc}"
             ) from exc
         pr_ref = parse_pr_url(state.current_pr_url)
-        if not cref.parent.same_target(pr_ref):
+        if not cref.on(pr_ref):
             raise VerificationError(
                 f"review comment {res.review_comment_url} does not belong to PR {pr_ref.canonical}"
             )

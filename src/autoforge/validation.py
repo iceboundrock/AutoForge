@@ -89,7 +89,19 @@ class GitHubPullRequestRef(GitHubRef):
 
 @dataclass(frozen=True)
 class GitHubCommentRef:
-    """An issue-style comment (``#issuecomment-<id>``) on an issue or PR."""
+    """An issue-style comment (``#issuecomment-<id>``) on an issue or PR.
+
+    GitHub serves one such comment under both paths of its parent: a pull
+    request is an issue to the comments API, issues and pull requests share
+    one number space, and ``.../issues/<n>#issuecomment-<id>`` and
+    ``.../pull/<n>#issuecomment-<id>`` open the same comment. The parent's
+    path kind is therefore part of the spelling, not of the comment's
+    identity: :attr:`identity` and :meth:`same_target` compare the
+    repository (case-folded), the parent number and the comment id, and
+    :meth:`on` says whether the comment is on a given issue or PR under
+    either spelling. The kind the URL used is still kept in :attr:`parent`
+    and rendered by :attr:`canonical`.
+    """
 
     parent: GitHubIssueRef | GitHubPullRequestRef
     comment_id: int
@@ -103,12 +115,26 @@ class GitHubCommentRef:
         return f"{self.parent.canonical}#issuecomment-{self.comment_id}"
 
     @property
-    def identity(self) -> tuple:
-        return (*self.parent.identity, self.comment_id)
+    def identity(self) -> tuple[str, str, int, int]:
+        """The comment as GitHub identifies it: owner, repo, parent number, comment id."""
+        return (
+            self.parent.owner.lower(),
+            self.parent.repo.lower(),
+            self.parent.number,
+            self.comment_id,
+        )
 
     def same_target(self, other: GitHubCommentRef) -> bool:
-        """Same comment as GitHub sees it: same parent identity, same comment id."""
+        """Same comment as GitHub sees it, whichever parent path either URL used."""
         return self.identity == other.identity
+
+    def on(self, target: GitHubRef) -> bool:
+        """Whether this comment is on ``target``, under either of GitHub's paths.
+
+        A reviewer naming a PR comment by its ``issues/<n>`` URL names this
+        PR's comment; a comment on another number or repository does not.
+        """
+        return self.parent.same_repository(target) and self.parent.number == target.number
 
 
 # Backwards-compatible alias used by Phase-1 callers/tests.

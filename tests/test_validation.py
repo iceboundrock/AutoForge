@@ -87,6 +87,34 @@ def test_comment_url():
         parse_comment_url("https://github.com/o/r/pull/42")
 
 
+def test_comment_identity_ignores_the_parent_path_kind_and_casing():
+    """GitHub serves one comment under ``pull/<n>`` and ``issues/<n>``; the
+    path kind is spelling, so both name the same comment, as does a
+    case-variant repository. Another number, repository or comment id does
+    not. ``canonical`` keeps the spelling that was parsed."""
+    pr_form = parse_comment_url("https://github.com/o/r/pull/42#issuecomment-1")
+    issue_form = parse_comment_url("https://github.com/O/R/issues/42#issuecomment-1")
+    assert pr_form.same_target(issue_form) and issue_form.same_target(pr_form)
+    assert pr_form.identity == issue_form.identity == ("o", "r", 42, 1)
+    assert issue_form.canonical == "https://github.com/O/R/issues/42#issuecomment-1"
+    for other in (
+        "https://github.com/o/r/issues/43#issuecomment-1",
+        "https://github.com/x/r/pull/42#issuecomment-1",
+        "https://github.com/o/r/pull/42#issuecomment-2",
+    ):
+        assert not pr_form.same_target(parse_comment_url(other))
+
+
+def test_comment_on_names_the_parent_under_either_path():
+    pr = parse_pr_url("https://github.com/owner/repo/pull/42")
+    assert parse_comment_url("https://github.com/owner/repo/pull/42#issuecomment-1").on(pr)
+    assert parse_comment_url("https://github.com/OWNER/repo/issues/42#issuecomment-1").on(pr)
+    assert not parse_comment_url("https://github.com/owner/repo/issues/43#issuecomment-1").on(pr)
+    assert not parse_comment_url("https://github.com/other/repo/pull/42#issuecomment-1").on(pr)
+    issue = parse_issue_url("https://github.com/owner/repo/issues/7")
+    assert parse_comment_url("https://github.com/owner/repo/pull/7#issuecomment-1").on(issue)
+
+
 def test_remote_parsing():
     assert parse_remote_repository("https://github.com/o/r.git") == "o/r"
     assert parse_remote_repository("git@github.com:o/r.git") == "o/r"
