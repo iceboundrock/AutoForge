@@ -97,6 +97,10 @@ def redact_obj(value: object) -> object:
     output while the file on disk still holds it. A colliding key is instead
     suffixed ``#2``, ``#3``, ... in insertion order, so every value is kept,
     every key stays redacted, and the collision is visible in the output.
+    The next suffix is remembered per colliding text, so a mapping whose keys
+    all collide (an ``escalation`` mapping is free-form and the state file can
+    be tens of megabytes) is redacted in time linear in its size rather than
+    rescanning the taken suffixes from ``#2`` for every entry.
     """
     if isinstance(value, str):
         return redact(value)
@@ -104,12 +108,17 @@ def redact_obj(value: object) -> object:
         return value
     if isinstance(value, dict):
         result: dict = {}
+        # Suffixes are handed out in increasing order per colliding text, so
+        # each taken suffix is stepped over at most once: an input key that
+        # already reads ``text#n`` is skipped, never rescanned.
+        next_suffix: dict[str, int] = {}
         for k, v in value.items():
             key = redact(str(k))
             if key in result:
-                n = 2
+                n = next_suffix.get(key, 2)
                 while f"{key}#{n}" in result:
                     n += 1
+                next_suffix[key] = n + 1
                 key = f"{key}#{n}"
             result[key] = redact_obj(v)
         return result

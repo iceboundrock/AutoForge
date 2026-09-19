@@ -365,11 +365,16 @@ def _existing_run_guard(
         # Unreadable / foreign-protocol state is fatal: a fresh run must
         # never silently replace it (merge counters etc. would be lost).
         if not force:
+            # The error quotes the field it could not read (an unknown phase
+            # is echoed verbatim), so the refusal is state-derived output
+            # like the terminal lines and crosses the boundary assembled.
             print(
-                f"autoforge: error: {exc}\n"
-                "autoforge: error: refusing to start a new run over an unreadable "
-                f"state file — repair it, or use '{command} --force' to move it aside as "
-                f"{paths.state_file.name}.corrupt-<timestamp> and start over",
+                redact(
+                    f"autoforge: error: {exc}\n"
+                    "autoforge: error: refusing to start a new run over an unreadable "
+                    f"state file — repair it, or use '{command} --force' to move it "
+                    f"aside as {paths.state_file.name}.corrupt-<timestamp> and start over"
+                ),
                 file=sys.stderr,
             )
             return 2, False

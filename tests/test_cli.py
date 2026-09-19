@@ -300,6 +300,36 @@ def test_status_redacts_agent_controlled_state_in_every_output(
     assert state_file.read_text() == raw
 
 
+def test_existing_run_refusal_redacts_the_corrupt_state_error(tmp_path, capsys, monkeypatch, fakes):
+    """#6: the refusal to start over an unreadable state file quotes the
+    `StateError`, and a state error quotes the field it could not read, so a
+    hand-edited file can put a credential-shaped value in the message. The
+    refusal is printed before `main`'s own handler, so it redacts the line
+    itself; the file is neither rewritten nor quarantined."""
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    assert (
+        cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"])
+        == 0
+    )
+    capsys.readouterr()
+    state_file = tmp_path / ".autoforge" / "state.json"
+    data = json.loads(state_file.read_text())
+    data["phase"] = FAKE_SECRET
+    raw = json.dumps(data)
+    state_file.write_text(raw)
+
+    rc = cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"])
+    captured = capsys.readouterr()
+    assert rc == 2 and captured.out == ""
+    assert FAKE_SECRET not in captured.err
+    assert "unknown phase '***REDACTED***'" in captured.err
+    assert "refusing to start a new run over an unreadable state file" in captured.err
+    assert "'run --force'" in captured.err
+    assert state_file.read_text() == raw
+    assert sorted(p.name for p in (tmp_path / ".autoforge").iterdir()) == ["state.json"]
+
+
 def test_run_terminal_line_redacts_a_block_reason_the_engine_persisted_raw(
     tmp_path, capsys, monkeypatch, fakes
 ):

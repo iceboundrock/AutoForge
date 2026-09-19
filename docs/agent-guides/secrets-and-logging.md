@@ -57,7 +57,10 @@ mapping never loses an entry to that: two distinct keys that redact to the
 same text (`GITHUB_TOKEN=a`, `GITHUB_TOKEN=b`) are kept apart with a `#2`,
 `#3`, ... suffix in insertion order rather than the later value overwriting
 the earlier one, so a redacted rendering of a free-form mapping (a journal's
-`escalation`, log metadata) is still complete.
+`escalation`, log metadata) is still complete. The next suffix is remembered
+per colliding text, so a mapping whose keys all collide is redacted in time
+linear in its size; a change to the allocator must keep that, and
+`tests/test_redaction.py` pins it against a large colliding mapping.
 
 `stdout.log` and `stderr.log` hold what the executor captured, which is
 bounded (`executor.DEFAULT_MAX_OUTPUT_BYTES` per stream): past the bound the
