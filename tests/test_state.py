@@ -262,19 +262,21 @@ def test_protocol_1_is_migrated_only_without_a_replan_in_flight(tmp_path):
     """#66 R7-F1: the 1 -> 2 protocol change is confined to the replan journal.
 
     A protocol-1 file with an empty or terminal journal loads and is
-    relabelled; one with a replan in flight is refused at the boundary with
-    the transaction described; any other label is unsupported as before.
+    relabelled (to the current protocol; the 2 -> 3 rule of #68 is
+    checked by ``test_protocol_2_is_migrated_only_outside_the_merge_phases``);
+    one with a replan in flight is refused at the boundary with the
+    transaction described; any other label is unsupported as before.
     """
     path = tmp_path / "state.json"
     base = make_state().to_dict()
-    assert base["protocol_version"] == "2"
+    assert base["protocol_version"] == "3"
     for journal in ({}, {"stage": "rejected", "rejection_reason": "refused by verification"}):
         data = dict(base, protocol_version="1", replan_transaction=journal)
         path.write_text(json.dumps(data), encoding="utf-8")
         loaded = load_state(path)
-        assert loaded.protocol_version == "2" and loaded.replan_transaction == journal
+        assert loaded.protocol_version == "3" and loaded.replan_transaction == journal
         save_state(loaded, path)
-        assert json.loads(path.read_text())["protocol_version"] == "2"
+        assert json.loads(path.read_text())["protocol_version"] == "3"
     in_flight = {
         "stage": "prepared",
         "transaction_id": "a" * 32,
@@ -292,9 +294,9 @@ def test_protocol_1_is_migrated_only_without_a_replan_in_flight(tmp_path):
     assert "replacement PR (none)" in message
     assert "corrupt" not in message
     assert path.read_text(encoding="utf-8") == raw
-    data["protocol_version"] = "3"
+    data["protocol_version"] = "4"
     path.write_text(json.dumps(data), encoding="utf-8")
-    with pytest.raises(StateError, match="unsupported protocol_version '3'"):
+    with pytest.raises(StateError, match="unsupported protocol_version '4'"):
         load_state(path)
     # The type check still owns a journal that is not an object, whatever
     # the label says.
@@ -303,6 +305,112 @@ def test_protocol_1_is_migrated_only_without_a_replan_in_flight(tmp_path):
     path.write_text(json.dumps(data), encoding="utf-8")
     with pytest.raises(StateError, match="'replan_transaction' must be an object"):
         load_state(path)
+
+
+PR42 = "https://github.com/owner/repo/pull/42"
+
+
+def _clean_review_state(**kw):
+    """A state whose clean review is bound the way the engine binds it (#68)."""
+    return make_state(
+        current_pr_url=PR42,
+        current_head_sha="a" * 40,
+        current_base_ref="main",
+        reviewed_pr_url=PR42,
+        reviewed_head_sha="a" * 40,
+        reviewed_base_ref="main",
+        last_review_result="clean",
+        review_round=2,
+        **kw,
+    )
+
+
+@pytest.mark.parametrize("phase", [Phase.READY_FOR_MERGE, Phase.MERGE])
+def test_protocol_2_is_refused_in_the_merge_phases(tmp_path, phase):
+    """#68: protocol 2 did not record which PR and base the clean review was
+    posted on. A file parked before MERGE cannot be bound after the fact --
+    filling the binding from ``current_pr_url`` would be exactly the trust
+    the binding exists to remove -- so it is refused at the boundary, left
+    unchanged, with the PR and HEAD named so the operator can look."""
+    path = tmp_path / "state.json"
+    data = _clean_review_state(phase=phase).to_dict()
+    data["protocol_version"] = "2"
+    data["controller_version"] = "0.2.0"
+    for missing in ("reviewed_pr_url", "reviewed_base_ref", "current_base_ref"):
+        del data[missing]
+    raw = json.dumps(data)
+    path.write_text(raw, encoding="utf-8")
+    with pytest.raises(StateError) as info:
+        load_state(path)
+    message = str(info.value)
+    assert "written by controller 0.2.0 under protocol_version '2'" in message
+    assert f"phase {phase.value}" in message and "pull/42" in message
+    assert ("a" * 40) in message and "did not record which PR and base branch" in message
+    assert "Nothing was merged or counted" in message and "corrupt" not in message
+    assert path.read_text(encoding="utf-8") == raw
+    # The same rule when the label is 1 (a 1 -> 3 jump): the journal rule
+    # first, then the binding rule.
+    data["protocol_version"] = "1"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(StateError, match="did not record which PR and base branch"):
+        load_state(path)
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [p for p in Phase if p not in (Phase.READY_FOR_MERGE, Phase.MERGE)],
+)
+def test_protocol_2_is_relabelled_outside_the_merge_phases(tmp_path, phase):
+    """Everywhere else the next review writes the binding, so a protocol-2
+    file is a protocol-3 file with an old label and an empty binding."""
+    path = tmp_path / "state.json"
+    data = _clean_review_state(phase=phase).to_dict()
+    data["protocol_version"] = "2"
+    for missing in ("reviewed_pr_url", "reviewed_base_ref", "current_base_ref"):
+        del data[missing]
+    path.write_text(json.dumps(data), encoding="utf-8")
+    loaded = load_state(path)
+    assert loaded.protocol_version == "3" and loaded.phase == phase
+    assert (loaded.reviewed_pr_url, loaded.reviewed_base_ref, loaded.current_base_ref) == (
+        "",
+        "",
+        "",
+    )
+    assert loaded.reviewed_head_sha == "a" * 40  # what protocol 2 did record is kept
+    save_state(loaded, path)
+    assert json.loads(path.read_text())["protocol_version"] == "3"
+
+
+def test_review_binding_round_trips_and_is_validated_on_load(tmp_path):
+    path = tmp_path / "state.json"
+    s = _clean_review_state(phase=Phase.READY_FOR_MERGE)
+    save_state(s, path)
+    assert load_state(path) == s
+    data = s.to_dict()
+    for bad, needle in (
+        ("https://github.com/owner/repo/issues/42", "reviewed_pr_url"),
+        ("not a url", "reviewed_pr_url"),
+        (42, "must be str"),
+        ("https://github.com/other/repo/pull/42", "is not in repository 'owner/repo'"),
+    ):
+        path.write_text(json.dumps(dict(data, reviewed_pr_url=bad)), encoding="utf-8")
+        with pytest.raises(StateError, match=needle):
+            load_state(path)
+    for field in ("reviewed_base_ref", "current_base_ref"):
+        path.write_text(json.dumps(dict(data, **{field: ["main"]})), encoding="utf-8")
+        with pytest.raises(StateError, match=f"state field '{field}' must be str"):
+            load_state(path)
+    # An equivalent spelling is the same PR; the repository check is by identity.
+    spelled = dict(data, reviewed_pr_url="https://github.com/Owner/Repo/pull/42/")
+    path.write_text(json.dumps(spelled), encoding="utf-8")
+    assert load_state(path).reviewed_pr_url == "https://github.com/Owner/Repo/pull/42/"
+
+
+def test_reset_for_new_issue_clears_the_review_binding():
+    s = _clean_review_state(phase=Phase.UPDATE_EPIC)
+    s.reset_for_new_issue("https://github.com/owner/repo/issues/3")
+    assert (s.reviewed_pr_url, s.reviewed_head_sha, s.reviewed_base_ref) == ("", "", "")
+    assert (s.current_pr_url, s.current_head_sha, s.current_base_ref) == ("", "", "")
 
 
 def test_quarantine_state_file_renames_without_overwriting(tmp_path, monkeypatch):

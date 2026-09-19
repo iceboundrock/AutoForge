@@ -26,6 +26,7 @@ from autoforge.claims import (
     ProgressClaim,
     ReviewClaim,
     collect,
+    marker_json,
     render_follow_up_marker,
     render_implementation_marker,
     render_progress_marker,
@@ -95,8 +96,30 @@ def test_review_marker_lowercases_the_sha_and_keeps_finding_ids():
         "finding_ids": ["R2-F1", "R2-F2"],
     }
     (claim,) = scan(REVIEW, marker("ai-review-result", payload)).claims
-    assert claim.reviewed_head_sha == SHA_A and claim.key == (2, SHA_A)
+    assert claim.reviewed_head_sha == SHA_A and claim.key == (2, SHA_A, None)
     assert claim.finding_ids == ("R2-F1", "R2-F2") and claim.needs_fix_round is True
+
+
+def test_review_marker_binds_the_base_branch_into_the_key():
+    """The round's identity is the diff it decided on: HEAD *and* base. A
+    marker naming another base, or none (written before the key had one),
+    is a different key and never the round's comment for a bound base."""
+    payload = {**_valid(REVIEW), "reviewed_base_ref": "main"}
+    (claim,) = scan(REVIEW, marker("ai-review-result", payload)).claims
+    assert claim.reviewed_base_ref == "main" and claim.key == (1, SHA_A, "main")
+    (other,) = scan(
+        REVIEW, marker("ai-review-result", {**payload, "reviewed_base_ref": "release/1.x"})
+    ).claims
+    (legacy,) = scan(REVIEW, marker("ai-review-result", _valid(REVIEW))).claims
+    assert legacy.reviewed_base_ref is None
+    assert len({claim.key, other.key, legacy.key}) == 3
+    objs = [Obj("c1", marker("ai-review-result", payload))]
+    objs.append(Obj("c2", marker("ai-review-result", {**payload, "reviewed_base_ref": "dev"})))
+    objs.append(Obj("c3", marker("ai-review-result", _valid(REVIEW))))
+    collection = collect(REVIEW, objs, "comment")
+    assert collection.defects == ()
+    assert collection.claimants((1, SHA_A, "main"), "r1").exactly_one().obj.url == "c1"
+    assert collection.claimants((1, SHA_A, "release/1.x"), "r1").at_most_one() is None
 
 
 @pytest.mark.parametrize(
@@ -153,6 +176,12 @@ def _cases():
     yield REVIEW, {**r, "finding_ids": ["R2-F1"]}, "does not belong to round 1"
     yield REVIEW, {**r, "finding_ids": ["R1-F1", "R1-F1"]}, "finding_ids repeats an id"
     yield REVIEW, {**r, "finding_ids": ["R1-F1 "]}, "not a finding id"
+    yield REVIEW, {**r, "reviewed_base_ref": 1}, "reviewed_base_ref must be a branch name"
+    yield REVIEW, {**r, "reviewed_base_ref": ""}, "reviewed_base_ref is 0 characters"
+    yield REVIEW, {**r, "reviewed_base_ref": "x" * 513}, "reviewed_base_ref is 513 characters"
+    yield REVIEW, {**r, "reviewed_base_ref": "release 1"}, "is not a branch name"
+    yield REVIEW, {**r, "reviewed_base_ref": "main\n"}, "is not a branch name"
+    yield REVIEW, {**r, "reviewed_base_ref": "ma\x7fin"}, "is not a branch name"
     p = _valid(PROGRESS)
     yield PROGRESS, {"issue": ISSUE}, "missing key(s) pr"
     yield PROGRESS, {**p, "note": "x"}, "unknown key(s) note"
@@ -448,6 +477,54 @@ def test_renderers_emit_canonical_urls_and_round_trip_through_the_decoders():
     fu = render_follow_up_marker(PR, "R2-F3")
     assert fu == f'<!-- ai-follow-up: {{"finding_id": "R2-F3", "pr": "{PR}"}} -->'
     assert scan(FOLLOW_UP, fu).claims[0].key == (parse_pr_url(PR).identity, "R2-F3")
+
+
+# Valid git branch names that contain an HTML comment delimiter (or would
+# form one with the marker's own `-->`), and one with a quote for good measure.
+_DELIMITER_BASES = ["x-->y", "<!--x", "a--!>b", "--", 'rel"1', "release/1.x"]
+
+
+@pytest.mark.parametrize("base", _DELIMITER_BASES)
+def test_marker_json_keeps_a_comment_delimiter_out_of_the_marker_and_round_trips(base):
+    """A reviewed base such as ``x-->y`` is a valid refname. Emitted raw inside
+    the HTML comment it would end the marker early (the scanner stops at the
+    first ``-->`` or ``<!--``, as an HTML parser does) and leave a defect no
+    later read of that PR's reviews could get past. The encoder escapes the
+    two characters as JSON does, so the text contains no delimiter and every
+    decoder reads the original value back."""
+    text = marker_json(base)
+    assert "<" not in text and ">" not in text
+    assert json.loads(text) == base
+    payload = {**_valid(REVIEW), "reviewed_base_ref": base}
+    rendered = REVIEW.render(payload)
+    assert rendered.startswith("<!-- ai-review-result: ") and rendered.endswith(" -->")
+    assert "-->" not in rendered[len("<!-- ai-review-result: ") : -len(" -->")]
+    result = scan(
+        REVIEW,
+        "before\n"
+        + rendered
+        + "\nafter "
+        + marker(IMPLEMENTATION.name, VALID[IMPLEMENTATION.name]),
+    )
+    assert result.defects == ()
+    (claim,) = result.claims
+    assert claim.reviewed_base_ref == base and claim.key == (1, SHA_A, base)
+    # And the same value pasted as the reviewer is told to, from the prompt
+    # variable, is one marker too: the template's own `-->` still ends it.
+    hand_written = (
+        f'<!-- ai-review-result: {{"round": 1, "reviewed_head_sha": "{SHA_A}", '
+        f'"reviewed_base_ref": {text}, "needs_fix_round": false, "finding_ids": []}} -->'
+    )
+    (claim,) = scan(REVIEW, hand_written).claims
+    assert claim.reviewed_base_ref == base
+
+
+def test_a_raw_json_base_with_a_delimiter_is_the_defect_marker_json_prevents():
+    """Documents the failure the encoder exists for: plain ``json.dumps`` of
+    ``x-->y`` truncates the marker at the base's ``-->``."""
+    raw = marker("ai-review-result", {**_valid(REVIEW), "reviewed_base_ref": "x-->y"})
+    result = scan(REVIEW, raw)
+    assert result.claims == () and len(result.defects) == 1
 
 
 def test_a_renderer_refuses_to_emit_a_marker_the_decoder_would_reject():

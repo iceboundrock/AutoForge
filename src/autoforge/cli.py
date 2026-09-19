@@ -587,7 +587,10 @@ def cmd_status(args) -> int:
     print(f"Execution attempt: {state.execution_attempt}")
     print(f"Replan count: {state.escalation_count}")
     print(f"Current HEAD:  {state.current_head_sha or '-'}")
+    print(f"Current base:  {state.current_base_ref or '-'}")
+    print(f"Reviewed PR:   {state.reviewed_pr_url or '-'}")
     print(f"Reviewed HEAD: {state.reviewed_head_sha or '-'}")
+    print(f"Reviewed base: {state.reviewed_base_ref or '-'}")
     print(f"Last review:   {state.last_review_result or '-'}")
     print(f"Review comment: {state.last_review_comment_url or '-'}")
     print(f"Open findings: {len(state.open_findings)}")
@@ -676,6 +679,7 @@ def print_ready_banner(state: AutoForgeState, gate_open: bool = False) -> None:
     print(f"  PR:            {state.current_pr_url}")
     print(f"  Review round:  {state.review_round}")
     print(f"  Reviewed HEAD: {state.reviewed_head_sha}")
+    print(f"  Reviewed base: {state.reviewed_base_ref or '-'}")
     print(f"  Review:        {state.last_review_comment_url or '-'}")
     if gate_open:
         print("Merge gate is open but the step budget (--max-steps) ran out before MERGE.")

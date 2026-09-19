@@ -29,13 +29,20 @@ agent claim against GitHub** before acting on it:
   merge queue. Only then, because it executes the PR's code, the reviewed
   commit is exported into a private temporary directory (never the
   operator's checkout, never a worktree) and ``merge.verification_commands``
-  run there; any failure -> BLOCKED. Conclusive negatives -> BLOCKED; HEAD drift -> REVIEW;
-  inconclusive data raises and keeps the phase, re-checked on ``resume``
-  at most ``merge.max_verification_attempts`` times, then BLOCKED. MERGE
-  then runs ``gh pr merge`` bound to the reviewed HEAD
+  run there; any failure -> BLOCKED. Conclusive negatives -> BLOCKED; HEAD
+  or base drift -> REVIEW; inconclusive data raises and keeps the phase,
+  re-checked on ``resume`` at most ``merge.max_verification_attempts``
+  times, then BLOCKED. Before any of that, the clean review must be bound
+  to the PR being merged: the review records the PR it was posted on
+  (``reviewed_pr_url``), the HEAD and the base branch, and both phases
+  require ``current_pr_url`` -- and the PR GitHub returns for it -- to be
+  that PR by identity (same repository and number), else BLOCKED; the
+  binding is never moved to another PR, not even one at the reviewed HEAD.
+  MERGE then runs ``gh pr merge`` bound to the reviewed HEAD
   (``--match-head-commit``) and counts the merge only after GitHub reports
-  the PR as ``MERGED``. If that call left auto-merge armed, the controller
-  disarms it. No prompt is rendered and no provider is invoked.
+  the PR as ``MERGED`` at that HEAD into the reviewed base. If that call
+  left auto-merge armed, the controller disarms it. No prompt is rendered
+  and no provider is invoked.
 - UPDATE_EPIC: ``next_issue_url`` is verified exactly like the first issue
   in INITIALIZING before the controller switches issues: it parses as an
   issue URL of this repository, is neither the EPIC nor the issue just
@@ -100,6 +107,7 @@ from .claims import (
     ProgressClaim,
     ReviewClaim,
     collect,
+    marker_json,
     render_follow_up_marker,
     render_implementation_marker,
     render_progress_marker,
@@ -974,6 +982,7 @@ class ControllerEngine:
         s = self._require_state()
         upcoming_round = s.review_round + 1
         issue_number = parse_issue_url(s.current_issue_url).number if s.current_issue_url else 0
+        reviewed_base = s.current_base_ref if s.phase == Phase.REVIEW else s.reviewed_base_ref
         variables: dict[str, str | int | None] = {
             "PROMPT_VERSION": s.prompt_version,
             "REPOSITORY": s.repository,
@@ -1008,6 +1017,13 @@ class ControllerEngine:
                 s.current_head_sha if s.phase == Phase.REVIEW else s.reviewed_head_sha
             )
             or "(none)",
+            # The base the round is bound to, next to the HEAD: the reviewer
+            # copies it into the marker, so it is also given as marker-safe
+            # JSON (a branch name may contain a double quote, which a raw
+            # substitution inside the marker's JSON would break, or a comment
+            # delimiter such as `-->`, which would end the marker early).
+            "REVIEWED_BASE_REF": escape_inline(reviewed_base or "(none)"),
+            "REVIEWED_BASE_REF_JSON": marker_json(reviewed_base or "(none)"),
             "FINDINGS": self._format_findings(s.open_findings),
             "MERGED_SINCE_EPIC_UPDATE": s.merged_since_epic_update,
             "LAST_REVIEW_RESULT": s.last_review_result or "(none)",
@@ -1100,7 +1116,8 @@ class ControllerEngine:
                 notes=[
                     MERGE_GATE_MESSAGE,
                     "with the gate open, would verify via gh before entering MERGE: last "
-                    "review clean, PR open at the reviewed HEAD, not draft, no change to "
+                    "review clean and bound to this PR, PR open at the reviewed HEAD and "
+                    "base, not draft, no change to "
                     "safety.protected_merge_paths, all checks succeeded, mergeable, no "
                     "auto-merge / merge queue (fail closed)",
                     *self._premerge_plan_notes(),
@@ -1113,8 +1130,9 @@ class ControllerEngine:
                 "UPDATE_EPIC (only after gh reports the PR as MERGED)",
                 notes=[
                     MERGE_GATE_MESSAGE,
-                    "would verify: last review clean, PR open at the reviewed HEAD, not "
-                    "draft, no change to safety.protected_merge_paths, all checks "
+                    "would verify: last review clean and bound to this PR, PR open at the "
+                    "reviewed HEAD and base, not draft, no change to "
+                    "safety.protected_merge_paths, all checks "
                     "succeeded, mergeable, no auto-merge / merge queue",
                     *self._premerge_plan_notes(),
                     "would run the command below (bound to the reviewed HEAD via "
@@ -1139,7 +1157,10 @@ class ControllerEngine:
                 f"review round {s.review_round + 1} of at most "
                 f"{self.config.workflow.max_review_rounds} (workflow.max_review_rounds)"
             )
-            notes.append("REVIEWED_HEAD_SHA is fetched from gh immediately before the review")
+            notes.append(
+                "REVIEWED_HEAD_SHA and REVIEWED_BASE_REF are fetched from gh immediately "
+                "before the review"
+            )
         if s.phase == Phase.REPLAN_REEXECUTE:
             replan_txn = ReplanTransaction.from_dict(s.replan_transaction)
             stage_notes, expected_next = self._replan_plan(replan_txn)
@@ -2389,6 +2410,7 @@ class ControllerEngine:
             )
         state.current_pr_url = url
         state.current_head_sha = pr.head_sha
+        state.current_base_ref = pr.base_ref
         state.current_branch = pr.head_ref
         validate_transition(Phase.ANALYZE_EXECUTE, Phase.REVIEW)
         state.phase = Phase.REVIEW
@@ -2449,7 +2471,8 @@ class ControllerEngine:
             plan=plan,
             message=(
                 f"merge gate open and GitHub confirms PR {verified.url} is mergeable at the "
-                f"reviewed HEAD {verified.head_sha[:12]}; READY_FOR_MERGE -> MERGE"
+                f"reviewed HEAD {verified.head_sha[:12]} on {verified.base_ref!r}; "
+                "READY_FOR_MERGE -> MERGE"
             ),
         )
 
@@ -2695,14 +2718,19 @@ class ControllerEngine:
         reviewed HEAD can be merged synchronously right now. Otherwise the
         transition has already been applied and its outcome is returned:
 
-        - merge gate closed / no clean review bound to a HEAD -> raises,
-          nothing changes
+        - merge gate closed / no clean review bound to a PR, HEAD and base
+          -> raises, nothing changes
+        - ``current_pr_url`` is not the reviewed PR by identity, or GitHub
+          answers the reviewed URL with a different PR -> BLOCKED before
+          anything else is read from it: the review is never re-bound to
+          another PR, whatever its HEAD
         - PR already MERGED: from MERGE this is crash recovery (counted once
-          if it merged at the reviewed HEAD, else BLOCKED); from
+          if it merged at the reviewed HEAD *and* base, else BLOCKED); from
           READY_FOR_MERGE -> MERGE so that phase reconciles
         - PR CLOSED, draft, conflicting, failing check, branch protection,
           auto-merge armed, merge queue -> BLOCKED (conclusive; no retry)
-        - PR HEAD != reviewed HEAD -> REVIEW (clean review is stale)
+        - PR HEAD != reviewed HEAD, or PR base != reviewed base -> REVIEW
+          (clean review is stale)
         - inconclusive (mergeability UNKNOWN, checks running, GitHub read
           failed transiently) -> raises and keeps the phase, bounded by
           ``merge.max_verification_attempts``
@@ -2715,11 +2743,34 @@ class ControllerEngine:
             raise StateError(f"phase {phase.value} requires current_pr_url in state")
         url = state.current_pr_url
         reviewed = (state.reviewed_head_sha or "").lower()
-        if state.last_review_result != "clean" or not reviewed:
+        reviewed_base = state.reviewed_base_ref
+        if (
+            state.last_review_result != "clean"
+            or not reviewed
+            or not state.reviewed_pr_url
+            or not reviewed_base
+        ):
             raise VerificationError(
-                f"{phase.value} requires a clean review bound to a HEAD in state "
-                f"(last_review_result={state.last_review_result!r}, "
-                f"reviewed_head_sha={state.reviewed_head_sha!r}); refusing to merge"
+                f"{phase.value} requires a clean review bound to a PR, a HEAD and a base "
+                f"branch in state (last_review_result={state.last_review_result!r}, "
+                f"reviewed_pr_url={state.reviewed_pr_url!r}, "
+                f"reviewed_head_sha={state.reviewed_head_sha!r}, "
+                f"reviewed_base_ref={reviewed_base!r}); refusing to merge"
+            )
+        # The clean review is a decision about one PR. A `current_pr_url`
+        # that names another PR -- even one at the reviewed HEAD, i.e. the
+        # same branch proposed against another base -- is not what the
+        # review decided on and is refused before GitHub is even asked
+        # about it; the binding is never moved to the current URL.
+        reviewed_ref = parse_pr_url(state.reviewed_pr_url)
+        if not parse_pr_url(url).same_target(reviewed_ref):
+            return self._block(
+                phase,
+                plan,
+                f"current_pr_url {url} is not the PR the clean review was posted on "
+                f"({state.reviewed_pr_url}); the review is bound to that PR at HEAD "
+                f"{reviewed[:12]} on base {reviewed_base!r} and is not re-bound. Nothing "
+                "was merged or counted; inspect the state file and the PR manually.",
             )
         try:
             pr = self.github.get_pr(url)
@@ -2727,6 +2778,14 @@ class ControllerEngine:
             return self._github_read_failed(phase, plan, f"PR {url} could not be read", exc)
         if parse_pr_url(pr.url or url).repository.lower() != state.repository.lower():
             raise VerificationError(f"PR {url} is not in {state.repository}")
+        if pr.url and not parse_pr_url(pr.url).same_target(reviewed_ref):
+            return self._block(
+                phase,
+                plan,
+                f"GitHub answered {url} with PR {pr.url}, which is not the reviewed PR "
+                f"{state.reviewed_pr_url}; refusing to merge a PR no review decided on. "
+                "Nothing was merged or counted.",
+            )
         if pr.state == "MERGED":
             if phase == Phase.READY_FOR_MERGE:
                 validate_transition(Phase.READY_FOR_MERGE, Phase.MERGE)
@@ -2742,13 +2801,13 @@ class ControllerEngine:
                     ),
                 )
             # Crash recovery: the merge happened but state was not persisted.
-            if pr.head_sha != reviewed:
+            unreviewed = self._merged_revision_problem(pr, reviewed, reviewed_base)
+            if unreviewed:
                 return self._block(
                     phase,
                     plan,
-                    f"PR {url} is already MERGED at HEAD {pr.head_sha} but the last clean "
-                    f"review covered {reviewed}; the controller never reviewed the merged "
-                    "code. Inspect manually.",
+                    f"PR {url} is already MERGED {unreviewed}; the controller never "
+                    "reviewed the merged change. Inspect manually.",
                 )
             return self._complete_merge(pr, plan, recovered=True)
         if not pr.is_open:
@@ -2757,8 +2816,16 @@ class ControllerEngine:
             )
         if not pr.head_sha:
             raise VerificationError(f"PR {url} has no readable head SHA")
-        if pr.head_sha != reviewed:
-            return self._head_drift_to_review(phase, plan, pr)
+        if not pr.base_ref:
+            return self._block(
+                phase,
+                plan,
+                f"PR {url} reports no base branch, so the reviewed change against "
+                f"{reviewed_base!r} cannot be confirmed as this PR's diff. Nothing was "
+                "merged or counted.",
+            )
+        if pr.head_sha != reviewed or pr.base_ref != reviewed_base:
+            return self._revision_drift_to_review(phase, plan, pr)
         try:
             not_ready = self._merge_readiness_problem(pr)
         except VerificationError as exc:
@@ -2901,17 +2968,25 @@ class ControllerEngine:
             )
         return ""
 
-    def _head_drift_to_review(
+    def _revision_drift_to_review(
         self, phase: Phase, plan: StepPlan, pr: PRInfo, detail: str = "", message: str = ""
     ) -> StepOutcome:
-        """The OPEN PR's HEAD is no longer the reviewed one: the last review is stale.
+        """The OPEN PR's revision (HEAD or base) is no longer the reviewed one.
 
-        Persists the new HEAD, marks the review stale, drops its findings and
-        routes back to REVIEW (``phase -> REVIEW``). Nothing has been merged or
-        counted. ``message`` replaces the default merge-path wording.
+        The last review is stale: persists the PR's current HEAD and base,
+        marks the review stale, drops its findings and routes back to REVIEW
+        (``phase -> REVIEW``), where the next round is bound to the actual
+        revision. Nothing has been merged or counted. ``message`` replaces
+        the default merge-path wording.
         """
         state = self._require_state()
+        if pr.base_ref and pr.base_ref != state.reviewed_base_ref:
+            what = f"PR base changed to {pr.base_ref!r}"
+        else:
+            what = "PR HEAD moved"
         state.current_head_sha = pr.head_sha
+        if pr.base_ref:
+            state.current_base_ref = pr.base_ref
         state.last_review_result = "stale"
         state.open_findings = []
         validate_transition(phase, Phase.REVIEW)
@@ -2922,11 +2997,25 @@ class ControllerEngine:
             phase,
             plan=plan,
             message=message
-            or (
-                f"PR HEAD moved after the clean review{detail}; {phase.value} -> REVIEW "
-                "(not merged)"
-            ),
+            or (f"{what} after the clean review{detail}; {phase.value} -> REVIEW (not merged)"),
         )
+
+    @staticmethod
+    def _merged_revision_problem(pr: PRInfo, reviewed: str, reviewed_base: str) -> str:
+        """Why a MERGED PR is not the reviewed revision, or "" when it is.
+
+        A merge is counted only when GitHub says the PR merged at the
+        reviewed HEAD *into* the reviewed base: the same commits merged into
+        another branch are a change no review decided on.
+        """
+        if pr.head_sha != reviewed:
+            return f"at HEAD {pr.head_sha} but the last clean review covered {reviewed}"
+        if pr.base_ref != reviewed_base:
+            return (
+                f"into {pr.base_ref!r} but the last clean review covered the change "
+                f"against {reviewed_base!r}"
+            )
+        return ""
 
     # -- MERGE: controller-owned, no agent ------------------------------------------
     def _merge_step(self, plan: StepPlan, allow_merge: bool) -> StepOutcome:
@@ -2934,10 +3023,13 @@ class ControllerEngine:
 
         Order of checks (all before any write):
         1. merge gate (config AND CLI flag)
-        2. state carries a clean review bound to a HEAD
-        3. PR belongs to this repository; already MERGED -> crash recovery
-        4. PR is OPEN and its HEAD equals the reviewed HEAD (else -> REVIEW)
-        5. GitHub says the PR is mergeable *now*: not a draft, ``mergeable``
+        2. state carries a clean review bound to a PR, a HEAD and a base
+        3. ``current_pr_url`` is that PR by identity, and so is the PR GitHub
+           returns for it (else BLOCKED; the review is never re-bound)
+        4. PR belongs to this repository; already MERGED -> crash recovery
+        5. PR is OPEN, its HEAD equals the reviewed HEAD and its base is the
+           reviewed base (else -> REVIEW)
+        6. GitHub says the PR is mergeable *now*: not a draft, ``mergeable``
            is MERGEABLE, ``mergeStateStatus`` is CLEAN/HAS_HOOKS, every check
            in the status rollup succeeded, no auto-merge is armed and the
            base branch does not use a merge queue (``gh pr merge`` would
@@ -2949,20 +3041,24 @@ class ControllerEngine:
            ``merge.max_verification_attempts`` times, then BLOCKED. A read
            that failed conclusively (auth, permissions, unresolvable PR) is
            BLOCKED at once. Never guessed.
-        Steps 1-5 are :meth:`_verify_pr_for_merge`, shared with READY_FOR_MERGE.
+        Steps 1-6 are :meth:`_verify_pr_for_merge`, shared with READY_FOR_MERGE.
         Then ``gh pr merge --<method> --match-head-commit <reviewed>``; the PR
-        is re-read and the merge is counted only when GitHub says MERGED.
+        is re-read and the merge is counted only when GitHub says MERGED at
+        the reviewed HEAD into the reviewed base.
         If the re-read itself fails the outcome is *uncertain*: the run stays
         in MERGE (not BLOCKED, until the same bound is reached) and ``resume``
         reconciles from real GitHub state (already MERGED -> recovered and
         counted once; still OPEN -> re-verified and re-attempted). If the
         re-read finds the PR still OPEN at a *different* HEAD (pushed between
-        the verification and the write; ``--match-head-commit`` refused it),
-        nothing unreviewed was merged and the HEAD-drift rule applies:
-        MERGE -> REVIEW, unless that call left an asynchronous merge pending
-        (auto-merge / merge queue) that could still land the new HEAD, in
-        which case BLOCKED. Any other conclusive non-merge is BLOCKED; merge
-        failures are never blindly retried.
+        the verification and the write; ``--match-head-commit`` refused it)
+        or against a different base (retargeted in that window; nothing
+        guards the base on the write, so this is only reachable when the
+        merge itself did not happen), nothing unreviewed was merged and the
+        revision-drift rule applies: MERGE -> REVIEW, unless that call left
+        an asynchronous merge pending (auto-merge / merge queue) that could
+        still land the new revision, in which case BLOCKED. Any other
+        conclusive non-merge is BLOCKED; merge failures are never blindly
+        retried.
         """
         state = self._require_state()
         verified = self._verify_pr_for_merge(Phase.MERGE, plan, allow_merge)
@@ -2970,6 +3066,7 @@ class ControllerEngine:
             return verified
         url = state.current_pr_url
         reviewed = (state.reviewed_head_sha or "").lower()
+        reviewed_base = state.reviewed_base_ref
 
         merge_error = ""
         try:
@@ -3006,17 +3103,23 @@ class ControllerEngine:
                     "(auto-merge armed or merge queue?)"
                 )
             note, pending = self._disarm_async_merge(url, after)
-            if after.is_open and after.head_sha and after.head_sha != reviewed and not pending:
-                # Post-verification race: the HEAD moved between the controller's
-                # verification and the write, so `--match-head-commit <reviewed>`
-                # refused it. Nothing unreviewed merged; the clean review is
-                # stale -> REVIEW (same rule as pre-write HEAD drift).
-                return self._head_drift_to_review(
+            drifted = after.is_open and (
+                (after.head_sha and after.head_sha != reviewed)
+                or (after.base_ref and after.base_ref != reviewed_base)
+            )
+            if drifted and not pending:
+                # Post-verification race: the revision moved between the
+                # controller's verification and the write (a push, which
+                # `--match-head-commit <reviewed>` refused, or a retarget).
+                # Nothing unreviewed merged; the clean review is stale ->
+                # REVIEW (same rule as pre-write drift).
+                return self._revision_drift_to_review(
                     Phase.MERGE,
                     plan,
                     after,
                     detail=(
-                        f" (HEAD {after.head_sha[:12]} != reviewed {reviewed[:12]}; {reason}{note})"
+                        f" (HEAD {after.head_sha[:12]} on {after.base_ref!r} != reviewed "
+                        f"{reviewed[:12]} on {reviewed_base!r}; {reason}{note})"
                     ),
                 )
             return self._block(
@@ -3024,12 +3127,13 @@ class ControllerEngine:
                 plan,
                 f"{reason}{note}. Nothing was counted; resolve on GitHub manually.",
             )
-        if after.head_sha != reviewed:
+        unreviewed = self._merged_revision_problem(after, reviewed, reviewed_base)
+        if unreviewed:
             return self._block(
                 Phase.MERGE,
                 plan,
-                f"PR {url} is MERGED at HEAD {after.head_sha}, not the reviewed HEAD "
-                f"{reviewed}; refusing to count an unreviewed merge. Inspect manually.",
+                f"PR {url} is MERGED {unreviewed}; refusing to count an unreviewed merge. "
+                "Inspect manually.",
             )
         return self._complete_merge(after, plan, recovered=False)
 
@@ -3394,10 +3498,24 @@ class ControllerEngine:
         return pr
 
     def _bind_review_head(self) -> None:
-        """Fetch the real PR HEAD right before the review and persist it."""
+        """Fetch the real PR HEAD and base right before the review and persist them.
+
+        The review is a decision about the PR's diff, and the diff is the
+        HEAD against the base, so both are bound here and both are re-read
+        after the review (:meth:`_apply_review`): a round whose HEAD or base
+        moved while the reviewer worked is stale, not current. A PR whose
+        base cannot be read cannot be bound and is refused before anyone is
+        launched.
+        """
         state = self._require_state()
         pr = self._require_open_pr()
+        if not pr.base_ref:
+            raise VerificationError(
+                f"PR {state.current_pr_url} has no readable base branch; the review cannot "
+                "be bound to the diff it would decide on"
+            )
         state.current_head_sha = pr.head_sha
+        state.current_base_ref = pr.base_ref
         state.current_branch = pr.head_ref or state.current_branch
         self._save()
 
@@ -3409,13 +3527,16 @@ class ControllerEngine:
         posted the round's comment. GitHub is the source of truth, so the
         controller looks before relaunching: exactly one comment carrying the
         ``ai-review-result`` marker for the upcoming round at the bound HEAD
-        is handed to the reviewer (``EXISTING_REVIEW_COMMENT_URL``) to adopt
-        rather than duplicate, and :meth:`_verify_review_comment` enforces
-        afterwards that the round still has exactly one. Two or more is a
-        state the controller cannot resolve without guessing which review is
-        the round's, so it blocks without invoking anyone. Comments for the
-        same round at another HEAD (an earlier run, a stale re-review) are not
-        this round's and are ignored.
+        and base is handed to the reviewer (``EXISTING_REVIEW_COMMENT_URL``)
+        to adopt rather than duplicate, and :meth:`_verify_review_comment`
+        enforces afterwards that the round still has exactly one. Two or more
+        is a state the controller cannot resolve without guessing which
+        review is the round's, so it blocks without invoking anyone. Comments
+        for the same round at another HEAD or against another base (an
+        earlier run, a stale re-review, a round posted before the PR was
+        retargeted) are not this round's and are ignored: a review of the
+        diff against the old base is not a review of the diff against the
+        new one, and adopting it would record the new base as reviewed.
 
         The reviewer is also told which problems earlier rounds already
         deferred: the open issues carrying this PR's ``ai-follow-up`` marker
@@ -3431,9 +3552,10 @@ class ControllerEngine:
         self._existing_pr_follow_ups = []
         upcoming = state.review_round + 1
         head = state.current_head_sha.lower()
+        base = state.current_base_ref
         pr_ref = parse_pr_url(state.current_pr_url)
         try:
-            holder = self._review_comments(pr_ref, upcoming, head).at_most_one()
+            holder = self._review_comments(pr_ref, upcoming, head, base).at_most_one()
         except GitHubUnavailableError:
             raise
         except GitHubError as exc:
@@ -3441,8 +3563,8 @@ class ControllerEngine:
                 Phase.REVIEW,
                 plan,
                 f"cannot establish which comment carries the review for round {upcoming} at "
-                f"HEAD {head[:12]} of PR {pr_ref.canonical}: {exc}. The controller will not "
-                "launch a reviewer that could post a second review comment",
+                f"HEAD {head[:12]} on base {base!r} of PR {pr_ref.canonical}: {exc}. The "
+                "controller will not launch a reviewer that could post a second review comment",
             )
         except ClaimConflictError as exc:
             return self._block(
@@ -3506,7 +3628,7 @@ class ControllerEngine:
         reviewed = state.reviewed_head_sha.lower()
         if pr.head_sha.lower() != reviewed:
             state.last_fix_resolutions = []
-            return self._head_drift_to_review(
+            return self._revision_drift_to_review(
                 Phase.FIX,
                 plan,
                 pr,
@@ -3593,13 +3715,25 @@ class ControllerEngine:
         )
 
     def _review_comments(
-        self, pr_ref: GitHubPullRequestRef, round_: int, head: str
+        self, pr_ref: GitHubPullRequestRef, round_: int, head: str, base: str
     ) -> Claimants[CommentInfo, ReviewClaim]:
-        """The PR's comments claiming review ``round_`` at ``head``."""
+        """The PR's comments claiming review ``round_`` of ``head`` against ``base``.
+
+        The key is the revision the round decided on, HEAD *and* base: a
+        comment carrying the round's marker for the same HEAD against
+        another base (posted before the PR was retargeted), or for no base
+        at all (written before the marker recorded one), is not this
+        round's and matches nothing, so it is neither adopted at entry nor
+        accepted on read-back.
+        """
+        if not base:
+            raise StateError(
+                f"review round {round_} of PR {pr_ref.canonical} has no bound base branch"
+            )
         comments = self.github.get_pr_comments(pr_ref.canonical)
         return collect(REVIEW, comments, "comment").claimants(
-            (round_, head.lower()),
-            f"round {round_} at HEAD {head[:12]} of PR {pr_ref.canonical}",
+            (round_, head.lower(), base),
+            f"round {round_} at HEAD {head[:12]} on base {base!r} of PR {pr_ref.canonical}",
         )
 
     def _progress_comments(self) -> Claimants[CommentInfo, ProgressClaim]:
@@ -3874,16 +4008,18 @@ class ControllerEngine:
             return self._reject_replan(
                 txn, f"PR {source_ref.canonical} is not in {state.repository}"
             )
-        if not source.is_open or not source.head_sha or not source.head_ref:
-            # The branch is checkpointed alongside the HEAD and enforced by
-            # every later source comparison; an empty one would enforce
-            # nothing, so it is refused exactly like an unreadable HEAD.
+        if not source.is_open or not source.head_sha or not source.head_ref or not source.base_ref:
+            # The branch and the base are checkpointed alongside the HEAD and
+            # enforced by every later source comparison; an empty one would
+            # enforce nothing, so it is refused exactly like an unreadable
+            # HEAD.
             return self._reject_replan(
                 txn,
                 f"PR {source_ref.canonical} is {source.state or '(unknown)'} with HEAD "
                 f"{source.head_sha or '(unreadable)'} on branch "
-                f"{source.head_ref or '(unreadable)'}; only an OPEN PR at a readable HEAD and "
-                "branch can be superseded",
+                f"{source.head_ref or '(unreadable)'} against base "
+                f"{source.base_ref or '(unreadable)'}; only an OPEN PR at a readable HEAD, "
+                "branch and base can be superseded",
             )
         if not repo.default_branch:
             return self._reject_replan(
@@ -3938,6 +4074,7 @@ class ControllerEngine:
         txn.source_pr_url = source_ref.canonical
         txn.source_branch = state.current_branch or source.head_ref
         txn.source_head_sha = source.head_sha
+        txn.source_base_ref = source.base_ref
         txn.source_review_round = state.review_round
         txn.base_branch = repo.default_branch
         txn.evidence_finding_count = history.recorded_finding_count
@@ -4471,6 +4608,7 @@ class ControllerEngine:
                     "pr_url": txn.source_pr_url,
                     "branch": txn.source_branch,
                     "head_sha": txn.source_head_sha,
+                    "base_ref": txn.source_base_ref,
                     "review_round": txn.source_review_round,
                     "replacement_pr_url": txn.replacement_pr_url,
                     "reason": txn.escalation.get("trigger", "replan"),
@@ -4483,7 +4621,12 @@ class ControllerEngine:
         state.current_pr_url = txn.replacement_pr_url
         state.current_branch = txn.replacement_branch
         state.current_head_sha = txn.replacement_head_sha
+        # The activation predicate verified the replacement's base is the
+        # branch the transaction was based on (replan_txn.verify_activation).
+        state.current_base_ref = txn.base_branch
+        state.reviewed_pr_url = ""
         state.reviewed_head_sha = ""
+        state.reviewed_base_ref = ""
         # review_round counts completed rounds; 0 means the next replacement
         # review is the required fresh round 1.
         state.review_round = 0
@@ -4799,18 +4942,23 @@ class ControllerEngine:
             )
         state.current_pr_url = pr_ref.canonical
         state.current_head_sha = pr.head_sha
+        state.current_base_ref = pr.base_ref
         state.current_branch = pr.head_ref or res.branch
         state.review_round = 0
         state.open_findings = []
         state.review_history = []
         state.last_review_result = ""
+        state.reviewed_pr_url = ""
         state.reviewed_head_sha = ""
+        state.reviewed_base_ref = ""
         return Phase.REVIEW, (
             f"PR {pr_ref.canonical} verified (HEAD {pr.head_sha[:12]}, branch "
             f"{state.current_branch}); ANALYZE_EXECUTE -> REVIEW"
         )
 
-    def _verify_review_comment(self, res: ReviewResult, expected_head: str) -> None:
+    def _verify_review_comment(
+        self, res: ReviewResult, expected_head: str, expected_base: str
+    ) -> None:
         state = self._require_state()
         try:
             cref = parse_comment_url(res.review_comment_url)
@@ -4824,23 +4972,29 @@ class ControllerEngine:
                 f"review comment {res.review_comment_url} does not belong to PR {pr_ref.canonical}"
             )
         # The same read the entry made: exactly one comment on the PR claims
-        # this round at this HEAD, and it is the comment the result names.
-        # A second one, whoever posted it, leaves the round's review
-        # ambiguous and the next REVIEW entry would block on it rather than
-        # choose; a comment whose marker is unreadable is refused for the
-        # same reason it would be refused at entry.
+        # this round at this HEAD against this base, and it is the comment
+        # the result names. A second one, whoever posted it, leaves the
+        # round's review ambiguous and the next REVIEW entry would block on
+        # it rather than choose; a comment whose marker is unreadable is
+        # refused for the same reason it would be refused at entry; and a
+        # comment for this round and HEAD against another base (or none) is
+        # a review of a different diff that the reviewer was told not to
+        # adopt, so a result naming it is refused too.
         try:
-            holder = self._review_comments(pr_ref, res.round, expected_head).exactly_one()
+            holder = self._review_comments(
+                pr_ref, res.round, expected_head, expected_base
+            ).exactly_one()
         except GitHubUnavailableError:
             raise
         except (GitHubError, ClaimConflictError) as exc:
             raise VerificationError(
-                f"{exc}; a round has exactly one review comment at its HEAD"
+                f"{exc}; a round has exactly one review comment at its HEAD and base"
             ) from exc
         if not parse_comment_url(holder.obj.url).same_target(cref):
             raise VerificationError(
                 f"review comment {res.review_comment_url} is not the comment carrying the "
-                f"round {res.round} marker at HEAD {expected_head[:12]} (that is {holder.obj.url})"
+                f"round {res.round} marker at HEAD {expected_head[:12]} on base "
+                f"{expected_base!r} (that is {holder.obj.url})"
             )
         heading = _REVIEW_HEADING_RE.search(holder.obj.body or "")
         if heading is None or int(heading.group(1)) != res.round:
@@ -4878,11 +5032,22 @@ class ControllerEngine:
                 f"REVIEW SHA mismatch: controller bound HEAD {expected_head}, "
                 f"agent reviewed {res.reviewed_head_sha}"
             )
-        self._verify_review_comment(res, expected_head)
+        expected_base = state.current_base_ref
+        if not expected_base:
+            raise VerificationError(
+                f"REVIEW round {res.round} was launched without a bound base branch; the "
+                "review cannot be recorded against the diff it decided on"
+            )
+        self._verify_review_comment(res, expected_head, expected_base)
 
         # Valid review lifecycle: round is consumed regardless of the outcome.
+        # The round is bound to the revision it decided on -- the PR the
+        # comment was verified to belong to, the HEAD and the base -- and the
+        # merge gate later requires all three, not the HEAD alone.
         state.review_round = res.round
+        state.reviewed_pr_url = parse_pr_url(state.current_pr_url).canonical
         state.reviewed_head_sha = expected_head
+        state.reviewed_base_ref = expected_base
         state.last_review_comment_url = res.review_comment_url
         state.last_review_needs_fix = res.needs_fix_round
         # Findings are agent-authored text persisted in plain `state.json` and
@@ -4891,14 +5056,20 @@ class ControllerEngine:
         findings = [redact_dict(f.to_dict()) for f in res.findings]
 
         latest = self._require_open_pr()
+        moved = ""
         if latest.head_sha != expected_head:
+            moved = f"PR HEAD moved to {latest.head_sha[:12]}"
+        elif latest.base_ref != expected_base:
+            moved = f"PR base changed from {expected_base!r} to {latest.base_ref!r}"
+        if moved:
             state.current_head_sha = latest.head_sha
+            state.current_base_ref = latest.base_ref
             state.last_review_result = "stale"
             state.open_findings = []
             self._record_review(res.round, expected_head, RESULT_STALE, findings)
             return Phase.REVIEW, (
-                f"review round {res.round} completed for {expected_head[:12]} but PR HEAD moved "
-                f"to {latest.head_sha[:12]} during the review; re-reviewing the latest HEAD"
+                f"review round {res.round} completed for {expected_head[:12]} but {moved} "
+                "during the review; re-reviewing the latest revision"
             )
         if res.needs_fix_round:
             state.last_review_result = "needs_fix"
@@ -4945,15 +5116,18 @@ class ControllerEngine:
                         "intervention is required"
                     )
                 # Only the decision is recorded here, together with the issue,
-                # the PR and the revision it was made on. The checkpoint and
-                # the transaction id are created by `_prepare_replan`, inside
-                # the REPLAN_REEXECUTE step that owns them.
+                # the PR, the revision it was made on and the base that
+                # revision was reviewed against (bound at REVIEW entry and
+                # verified non-empty above). The checkpoint and the
+                # transaction id are created by `_prepare_replan`, inside the
+                # REPLAN_REEXECUTE step that owns them.
                 state.replan_transaction = ReplanTransaction(
                     stage=ReplanStage.PENDING,
                     issue_url=decision_issue,
                     decision_pr_url=decision_pr,
                     decision_head_sha=expected_head,
                     decision_branch=state.current_branch,
+                    decision_base_ref=expected_base,
                     escalation=decision.metadata or {"trigger": decision.reason},
                 ).to_dict()
                 return Phase.REPLAN_REEXECUTE, (

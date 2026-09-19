@@ -427,18 +427,22 @@ _STAGE_ORDER: tuple[ReplanStage, ...] = (
 )
 _REQUIRED_AT_STAGE: dict[ReplanStage, tuple[str, ...]] = {
     # REVIEW records the issue whose lifecycle it was reviewing, the PR it
-    # decided on and both halves of the revision it reviewed there; a
-    # branch-less decision could only be compared vacuously (#35 R3-F2), a
-    # PR-less one would let the prepare step take its source from whatever
-    # the run happens to hold (#35 R4-F1), and an issue-less one would let it
-    # take the issue the replacement must be linked to from whatever the run
-    # happens to hold (#35 R6-F1). The policy metadata is recorded with the
-    # decision and always names its trigger.
+    # decided on, both halves of the revision it reviewed there and the base
+    # it reviewed that revision against; a branch-less decision could only be
+    # compared vacuously (#35 R3-F2), a PR-less one would let the prepare
+    # step take its source from whatever the run happens to hold (#35
+    # R4-F1), an issue-less one would let it take the issue the replacement
+    # must be linked to from whatever the run happens to hold (#35 R6-F1),
+    # and a base-less one would let a source retargeted to another base --
+    # a different diff, which the findings never described -- be superseded
+    # on the strength of the reviewed one (#68). The policy metadata is
+    # recorded with the decision and always names its trigger.
     ReplanStage.PENDING: (
         "issue_url",
         "decision_pr_url",
         "decision_head_sha",
         "decision_branch",
+        "decision_base_ref",
         "escalation",
     ),
     ReplanStage.PREPARED: (
@@ -446,6 +450,7 @@ _REQUIRED_AT_STAGE: dict[ReplanStage, tuple[str, ...]] = {
         "source_pr_url",
         "source_branch",
         "source_head_sha",
+        "source_base_ref",
         "source_review_round",
         "base_branch",
         "evidence_finding_count",
@@ -562,16 +567,21 @@ class ReplanTransaction:
     # one the replacement must be linked to, and the prepare step would
     # otherwise take it from ``state.current_issue_url``. It is never
     # re-derived later; :func:`verify_run_binding` binds it to the run's
-    # active issue at every stage instead.
+    # active issue at every stage instead. The base branch the review was
+    # bound to completes the revision: a PR's diff is HEAD against base, so
+    # the same HEAD on the same branch retargeted to another base is a
+    # different change from the one the findings describe.
     issue_url: str = ""
     decision_pr_url: str = ""
     decision_head_sha: str = ""
     decision_branch: str = ""
+    decision_base_ref: str = ""
 
     # -- source checkpoint: exactly what may be superseded -----------------
     source_pr_url: str = ""
     source_branch: str = ""
     source_head_sha: str = ""
+    source_base_ref: str = ""
     source_review_round: int = 0
 
     # -- base: independently verified default branch ----------------------
@@ -748,19 +758,39 @@ def may_invoke_agent(txn: ReplanTransaction) -> bool:
 
 # ---------------------------------------------------------------------------
 # State-protocol migration. The journal's schema is part of the state
-# protocol, and the protocol went from 1 to 2 when REVIEW started recording
-# the PR and the issue its replan decision was made on (``decision_pr_url``;
-# ``issue_url`` at PENDING) so that every later stage could be bound to that
-# decision rather than to whatever the run happened to hold. A protocol-1
-# journal was written whole by the controller of its day and is not corrupt;
-# it simply never recorded the decision, and there is nothing to reconstruct
-# it from: "missing field -> fill from the run's current PR and issue" is
-# precisely the rebinding the decision fields exist to forbid (#35 R4-F1,
-# R6-F1), and #66 R7-F1 is where an in-flight protocol-1 journal was found
-# to be refused as *corruption* under a protocol that still called itself 1.
+# protocol, and each protocol step so far added one binding to it: 1 -> 2
+# when REVIEW started recording the PR and the issue its replan decision was
+# made on (``decision_pr_url``; ``issue_url`` at PENDING) so that every later
+# stage could be bound to that decision rather than to whatever the run
+# happened to hold, and 2 -> 3 when it started recording the base branch the
+# deciding review was bound to (``decision_base_ref`` at PENDING,
+# ``source_base_ref`` at PREPARED) so that a source retargeted to another
+# base could not be superseded on the strength of a review of a different
+# diff (#68). A journal written under an older protocol was written whole by
+# the controller of its day and is not corrupt; it simply never recorded the
+# binding, and there is nothing to reconstruct it from: "missing field ->
+# fill from the run's current PR and issue" or "-> fill from the source PR's
+# current base" is precisely the rebinding the fields exist to forbid (#35
+# R4-F1, R6-F1), and #66 R7-F1 is where an in-flight protocol-1 journal was
+# found to be refused as *corruption* under a protocol that still called
+# itself 1.
 # ---------------------------------------------------------------------------
 
-LEGACY_JOURNAL_PROTOCOL = "1"
+#: The binding each legacy protocol's journal lacks, as the refusal states
+#: it: what was not recorded, and what this controller will not fill it from.
+_LEGACY_JOURNAL_GAPS: dict[str, str] = {
+    "1": (
+        "did not record the PR and issue the replan decision was made on, and this controller "
+        "does not reconstruct them from the run's current PR and issue"
+    ),
+    "2": (
+        "did not record the base branch the review that decided the replan was bound to, and "
+        "this controller does not reconstruct it from the source PR's current base"
+    ),
+}
+#: Protocol labels whose journal schema this controller can still describe
+#: (and so refuse in flight) but cannot load.
+LEGACY_JOURNAL_PROTOCOLS: frozenset[str] = frozenset(_LEGACY_JOURNAL_GAPS)
 
 _LEGACY_STAGE_FATES: dict[str, str] = {
     ReplanStage.PENDING.value: (
@@ -791,25 +821,28 @@ _LEGACY_STAGE_FATES: dict[str, str] = {
 }
 
 
-def legacy_journal_refusal(raw: object, *, written_by: str) -> str:
-    """Why a protocol-1 state cannot be loaded as protocol 2, or ``""`` when it can.
+def legacy_journal_refusal(raw: object, *, protocol: str, written_by: str) -> str:
+    """Why a state's journal under legacy ``protocol`` cannot be loaded, or ``""``.
 
-    The only difference between the two protocols is the replan journal, so a
-    protocol-1 state whose journal is empty -- no replan in flight -- or
-    terminal (``REJECTED``, of which both protocols read nothing but the
-    recorded reason) *is* a protocol-2 state and is loaded as one. A journal
-    at any other stage is in flight under a schema that never bound the
-    decision, and it is refused at the state boundary: never migrated, since
-    the binding cannot be reconstructed without re-deciding the replan, and
-    never read as corruption, since it was written whole. The refusal names
-    the stage, the PRs, what that stage implies about the source PR, and the
-    two ways out -- finish or undo the transaction with the controller that
-    wrote it, or resolve it by hand on GitHub and start a new run.
+    As far as the journal is concerned, a legacy state whose journal is
+    empty -- no replan in flight -- or terminal (``REJECTED``, of which every
+    protocol reads nothing but the recorded reason) *is* a current state and
+    is loaded as one. A journal at any other stage is in flight under a
+    schema that never bound what the current one binds, and it is refused at
+    the state boundary: never migrated, since the binding cannot be
+    reconstructed without re-deciding the replan, and never read as
+    corruption, since it was written whole. The refusal names the stage, the
+    PRs, the binding the protocol lacks, what that stage implies about the
+    source PR, and the two ways out -- finish or undo the transaction with
+    the controller that wrote it, or resolve it by hand on GitHub and start a
+    new run.
 
     ``raw`` is read defensively: this runs before any schema check, so a
     non-object journal is left for the state's own type check, and an
     unreadable stage or PR is reported as such rather than trusted.
     """
+    if protocol not in _LEGACY_JOURNAL_GAPS:
+        raise ValueError(f"protocol {protocol!r} is not a legacy journal protocol")
     if not isinstance(raw, dict) or not raw:
         return ""
     stage = raw.get("stage")
@@ -828,11 +861,10 @@ def legacy_journal_refusal(raw: object, *, written_by: str) -> str:
         )
     return (
         f"state file was written by controller {written_by or '(unknown)'} under "
-        f"protocol_version {LEGACY_JOURNAL_PROTOCOL!r} with a replan in flight (stage "
+        f"protocol_version {protocol!r} with a replan in flight (stage "
         f"{stage!r}, transaction {_text('transaction_id')}, source PR {_text('source_pr_url')}, "
-        f"replacement PR {_text('replacement_pr_url')}); protocol {LEGACY_JOURNAL_PROTOCOL!r} "
-        "did not record the PR and issue the replan decision was made on, and this controller "
-        "does not reconstruct them from the run's current PR and issue. At that stage "
+        f"replacement PR {_text('replacement_pr_url')}); protocol {protocol!r} "
+        f"{_LEGACY_JOURNAL_GAPS[protocol]}. At that stage "
         f"{fate}. Finish or undo the replan with the controller that wrote it, then upgrade; "
         "or resolve it by hand on GitHub and start a new run. The state file was left unchanged"
     )
@@ -904,6 +936,29 @@ def _source_branch_drift(pr: PRInfo, txn: ReplanTransaction, when: str = "") -> 
         return (
             f"source PR {txn.source_pr_url} moved from the checkpointed branch "
             f"{txn.source_branch!r} to {pr.head_ref!r}{when}"
+        )
+    return ""
+
+
+def _source_base_drift(pr: PRInfo, txn: ReplanTransaction, when: str = "") -> str:
+    """The source base comparison, shared by the pre- and post-close reads.
+
+    The third half of the checkpointed revision, next to the HEAD and the
+    branch: a PR's diff is its HEAD against its base, so a source retargeted
+    to another base (``gh pr edit --base``) carries a change no review of
+    this transaction ever saw, at an unchanged HEAD. Never vacuous, for the
+    same reason as :func:`_source_branch_drift`, and an unreadable base on
+    the PR is drift too: it is not "the same" as anything.
+    """
+    if not txn.source_base_ref:
+        return (
+            f"the replan transaction records no base branch for source PR {txn.source_pr_url}, "
+            "so the checkpoint cannot prove which change it decided to supersede"
+        )
+    if pr.base_ref != txn.source_base_ref:
+        return (
+            f"source PR {txn.source_pr_url} was retargeted from the checkpointed base "
+            f"{txn.source_base_ref!r} to {pr.base_ref!r}{when}"
         )
     return ""
 
@@ -1040,11 +1095,15 @@ def verify_decision_point(pr: PRInfo, txn: ReplanTransaction) -> str:
     has bound that to the decision, but the identity GitHub reports is the
     fact, so it is compared here rather than assumed.
 
-    An empty ``decision_pr_url``, ``decision_head_sha`` or ``decision_branch``
-    is itself a refusal: without all three there is no proof the checkpoint
-    is the decision point. :meth:`ReplanTransaction.from_dict` refuses such a
-    journal at every stage; this is the same rule at the point of use, never
-    vacuous.
+    The base branch is compared with the HEAD and the branch: the diff the
+    review saw is HEAD against base, and retargeting the PR changes it at
+    an unchanged HEAD (#68).
+
+    An empty ``decision_pr_url``, ``decision_head_sha``, ``decision_branch``
+    or ``decision_base_ref`` is itself a refusal: without all four there is
+    no proof the checkpoint is the decision point.
+    :meth:`ReplanTransaction.from_dict` refuses such a journal at every
+    stage; this is the same rule at the point of use, never vacuous.
     """
     if not txn.decision_pr_url:
         return (
@@ -1067,6 +1126,12 @@ def verify_decision_point(pr: PRInfo, txn: ReplanTransaction) -> str:
             "the replan transaction does not record the reviewed branch that decided it, so the "
             "source cannot be proven to be the revision the findings belong to"
         )
+    if not txn.decision_base_ref:
+        return (
+            "the replan transaction does not record the base branch the review that decided it "
+            "was bound to, so the source cannot be proven to be the change the findings "
+            "belong to"
+        )
     if not _same_sha(pr.head_sha, txn.decision_head_sha):
         return (
             f"source PR {txn.source_pr_url} is at HEAD {pr.head_sha or '(unreadable)'}, but the "
@@ -1078,6 +1143,12 @@ def verify_decision_point(pr: PRInfo, txn: ReplanTransaction) -> str:
             f"source PR {txn.source_pr_url} is on branch {pr.head_ref!r}, but the review that "
             f"decided this replan ran on {txn.decision_branch!r}"
         )
+    if pr.base_ref != txn.decision_base_ref:
+        return (
+            f"source PR {txn.source_pr_url} targets base {pr.base_ref!r}, but the review that "
+            f"decided this replan was bound to base {txn.decision_base_ref!r}; the current "
+            "change was never reviewed against this decision"
+        )
     return ""
 
 
@@ -1086,10 +1157,10 @@ def verify_source_checkpoint(pr: PRInfo, txn: ReplanTransaction) -> str:
 
     Closing a PR is irreversible for the review evidence it carries, so this
     is the compare half of a compare-and-swap: identity, OPEN state, branch,
-    and the exact checkpointed HEAD. Any drift — including a push that landed
-    after the checkpoint, and a close performed by someone else — means the
-    controller is no longer looking at the implementation it decided to
-    replace, and must not close it.
+    base, and the exact checkpointed HEAD. Any drift — including a push that
+    landed after the checkpoint, a retarget to another base, and a close
+    performed by someone else — means the controller is no longer looking at
+    the implementation it decided to replace, and must not close it.
     """
     if not same_pr_url(pr.url, txn.source_pr_url):
         return (
@@ -1103,7 +1174,7 @@ def verify_source_checkpoint(pr: PRInfo, txn: ReplanTransaction) -> str:
             f"source PR {txn.source_pr_url} is {pr.state or '(unknown)'}, expected OPEN at the "
             "checkpoint; it was not closed by this transaction"
         )
-    drift = _source_branch_drift(pr, txn)
+    drift = _source_branch_drift(pr, txn) or _source_base_drift(pr, txn)
     if drift:
         return drift
     if not _same_sha(pr.head_sha, txn.source_head_sha):
@@ -1118,6 +1189,11 @@ def verify_source_checkpoint(pr: PRInfo, txn: ReplanTransaction) -> str:
         return (
             f"checkpointed source HEAD {txn.source_head_sha} is not the reviewed HEAD "
             f"{txn.decision_head_sha} that decided this replan"
+        )
+    if txn.decision_base_ref and txn.source_base_ref != txn.decision_base_ref:
+        return (
+            f"checkpointed source base {txn.source_base_ref!r} is not the base "
+            f"{txn.decision_base_ref!r} the review that decided this replan was bound to"
         )
     return ""
 
@@ -1309,8 +1385,9 @@ def verify_closed_source(pr: PRInfo, txn: ReplanTransaction) -> str:
     compare-and-swap is completed here instead: everything the pre-close read
     established must still be true of the PR that is now closed, except the
     state itself. A HEAD or branch that moved means a push landed inside the
-    write window, i.e. the close destroyed the visibility of work that no
-    review ever saw -- the caller undoes the close rather than accepting it.
+    write window, and a base that moved means a retarget did, i.e. the close
+    destroyed the visibility of a change that no review ever saw -- the
+    caller undoes the close rather than accepting it.
     """
     if not same_pr_url(pr.url, txn.source_pr_url):
         return (
@@ -1322,7 +1399,8 @@ def verify_closed_source(pr: PRInfo, txn: ReplanTransaction) -> str:
             f"source PR {txn.source_pr_url} is {pr.state or '(unknown)'} after this "
             "transaction's close attempt; expected CLOSED"
         )
-    drift = _source_branch_drift(pr, txn, " inside the close window")
+    when = " inside the close window"
+    drift = _source_branch_drift(pr, txn, when) or _source_base_drift(pr, txn, when)
     if drift:
         return drift
     if not _same_sha(pr.head_sha, txn.source_head_sha):

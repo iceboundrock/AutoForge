@@ -284,6 +284,7 @@ def test_full_run_prints_ready_banner(tmp_path, capsys, monkeypatch, fakes):
     assert "AutoForge workflow reached READY_FOR_MERGE." in out
     assert "Automatic merge is disabled in this milestone." in out
     assert PR in out and ISSUE in out and SHA_A in out and "Review round:  1" in out
+    assert "Reviewed base: main" in out
     # resume on a held state re-prints the banner and does nothing else
     n_calls = len(fakes["provider"].calls)
     assert cli.main(["--state-dir", sd, "resume"]) == 0
@@ -294,7 +295,13 @@ def test_full_run_prints_ready_banner(tmp_path, capsys, monkeypatch, fakes):
     assert "merge is disabled" in capsys.readouterr().err
     assert cli.main(["--state-dir", sd, "step", "--allow-merge"]) == 1
     assert cli.main(["--state-dir", sd, "status", "--json"]) == 0
-    assert json.loads(capsys.readouterr().out)["phase"] == "READY_FOR_MERGE"
+    status = json.loads(capsys.readouterr().out)
+    assert status["phase"] == "READY_FOR_MERGE"
+    assert (status["reviewed_pr_url"], status["reviewed_base_ref"]) == (PR, "main")
+    assert cli.main(["--state-dir", sd, "status"]) == 0
+    out = capsys.readouterr().out
+    assert f"Reviewed PR:   {PR}" in out and "Reviewed base: main" in out
+    assert "Current base:  main" in out
 
 
 def _drive_to_ready(fakes):
