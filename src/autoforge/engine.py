@@ -832,7 +832,10 @@ class ControllerEngine:
         created inside the operator's working tree (the git directory,
         which git never walks as content, excepted), where it would sit in
         their ``git status`` and the agent's tree would contain the
-        operator's. Only :meth:`_invoke_phase` reaches this, so a dry run
+        operator's -- and, since ``mkdir`` and ``git worktree add`` would
+        follow it there, nor at a path a symbolic link above it leads
+        elsewhere: a worktree is created only at the literal derived path.
+        Only :meth:`_invoke_phase` reaches this, so a dry run
         never creates one; the operator removes worktrees
         (``git worktree remove``), the controller does not.
         """
@@ -874,6 +877,20 @@ class ControllerEngine:
                 f"the agent worktree path {path} exists but is not a worktree of the "
                 f"repository at {common} (it is {what}); move it aside or configure "
                 "execution.worktree_dir elsewhere"
+            )
+        real = Path(os.path.realpath(path))
+        if real != path:
+            # The path does not exist, so a component above it is a link (the
+            # base was resolved when the path was derived; `.git/autoforge` or
+            # `worktrees` below it was not). `mkdir` and `git worktree add`
+            # would follow it, and the guard below compares the literal path,
+            # so a link into the operator's working tree would be followed
+            # there unnoticed.
+            raise VerificationError(
+                f"cannot create the agent worktree {path}: it is reached through a "
+                f"symbolic link ({real}); the controller creates a worktree only at the "
+                "derived path itself, never through a link -- remove the link or "
+                "configure execution.worktree_dir elsewhere"
             )
         operator_root = ws.root()
         inside_git_dir = any(d == path or d in path.parents for d in ws.git_dirs())

@@ -5622,6 +5622,57 @@ def test_a_symlink_at_the_worktree_path_is_refused_whatever_it_points_to(
     assert (repo / "uncommitted.txt").exists()
 
 
+def test_a_symlinked_parent_of_the_worktree_path_is_refused_before_creation(
+    tmp_state_dir, fake_github
+):
+    """The path itself does not exist, but a component above it (below the
+    resolved common dir) is a link into the operator's working tree: `mkdir`
+    and `git worktree add` would follow it and create the worktree there, in
+    the operator's `git status`, unnoticed by the literal-path guard. (A link
+    at `.git/autoforge` itself never gets this far: the controller lock opens
+    that directory with O_NOFOLLOW and refuses it first.)"""
+    repo = git_repo(tmp_state_dir.parent)
+    base = _commit(repo, "a.txt", "1", "base")
+    (repo / "src").mkdir()
+    _commit(repo, "src/lib.txt", "code", "src")
+    (repo / "uncommitted.txt").write_text("operator's work in progress")
+    link = repo / ".git" / "autoforge" / "worktrees"
+    eng = _analyze_with(tmp_state_dir, fake_github, lambda req: None)
+    status_before = _git(repo, "status", "--porcelain")  # after INITIALIZING made .autoforge/
+
+    def refused():
+        with pytest.raises(VerificationError, match="reached through a symbolic link") as info:
+            eng.step()
+        assert "never through a link" in str(info.value)
+        assert eng.provider.calls == []
+        assert link.is_symlink()  # left alone, not removed or replaced
+        assert not (repo / "src" / "2").exists() and not (repo / "2").exists()
+        assert _worktrees(repo) == [str(repo.resolve())]
+        assert _git(repo, "status", "--porcelain") == status_before
+
+    # `.git/autoforge/worktrees` -> `<checkout>/src` (the round-2 reproduction).
+    link.symlink_to(repo / "src")
+    refused()
+    refused()  # a second launch refuses the same way; nothing was stranded
+    link.unlink()
+    # ... -> the working tree root itself, and a relative link there.
+    link.symlink_to(repo)
+    refused()
+    link.unlink()
+    link.symlink_to(Path("..") / "..")
+    refused()
+    link.unlink()
+
+    # With the link gone the worktree is created at the literal path as usual.
+    assert eng.step().next_phase == "REVIEW"
+    expected = link / "2"
+    assert Path(eng.provider.calls[0].cwd) == expected and not link.is_symlink()
+    assert str(expected.resolve()) in _worktrees(repo)
+    assert _git(repo, "status", "--porcelain") == status_before
+    assert _git(repo, "rev-parse", "--abbrev-ref", "HEAD") == "main"
+    assert base in _git(repo, "rev-list", "HEAD")
+
+
 def test_an_existing_worktree_is_reused_only_when_the_repository_registers_it(
     tmp_state_dir, fake_github
 ):

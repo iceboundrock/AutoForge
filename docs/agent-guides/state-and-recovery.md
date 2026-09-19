@@ -124,8 +124,11 @@ operator removes it with `git worktree remove` when the issue is done. A
 path that exists there but is not a worktree of this repository is refused,
 never adopted: a symbolic link at the path is refused on the entry itself,
 whatever it points to (a link to the operator's checkout or to another
-worktree would otherwise answer git as that tree), and a directory is
-reused only when `git worktree list` registers it as a worktree root.
+worktree would otherwise answer git as that tree), a directory is
+reused only when `git worktree list` registers it as a worktree root, and a
+path reached through a symbolic link above it (`.git/autoforge/worktrees`
+linked into the working tree, say) is refused before anything is created,
+so a worktree only ever appears at the literal derived path.
 
 ---
 

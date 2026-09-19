@@ -738,9 +738,10 @@ by every later phase of that issue, and never deleted by the controller:
 remove it with `git worktree remove` once the issue is done. A configured
 location must lie outside the checkout's working tree, and a path that
 already exists but is not a worktree of this repository is refused rather
-than adopted: a symbolic link there is refused whatever it points to, and a
-directory is reused only when `git worktree list` registers it. Dry-run
-creates none.
+than adopted: a symbolic link there is refused whatever it points to, a
+directory is reused only when `git worktree list` registers it, and a path
+reached through a link above it is refused before anything is created.
+Dry-run creates none.
 
 State records `current_pr_url`, `current_branch`, `current_head_sha`,
 `current_base_ref`, `reviewed_pr_url`, `reviewed_head_sha`,
