@@ -718,6 +718,53 @@ def test_a_temporary_name_linked_out_between_the_link_and_the_rename_is_refused(
     sentinel.assert_untouched()
 
 
+@pytest.mark.usefixtures("unnamed_only")
+def test_a_temporary_name_removed_between_the_link_and_the_rename_is_a_typed_failure(
+    tmp_path, monkeypatch
+):
+    """#52 R2-F1: the other thing that can happen to the temporary name in
+    the link-to-rename window is that it is *removed*. The re-inspection
+    then sees no name at all, which is not a planted link: the write fails
+    as a ``StateError`` that says the controller's name disappeared, not as
+    the refusal that would count ``-1 extra`` entries and send the operator
+    to move aside an entry that does not exist. The named path meets the
+    same event as the rename's ``ENOENT`` and reports it the same way. The
+    target is untouched and the directory is as it was."""
+    import autoforge.safefs as safefs
+
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    target = root_dir / "state.json"
+    target.write_bytes(b"old\n")
+    old = target.stat()
+    real_link = os.link
+    removed: list[str] = []
+
+    def link_then_remove(src, dst, **kwargs):
+        real_link(src, dst, **kwargs)
+        if isinstance(dst, str) and dst.startswith(".af-tmp-"):
+            os.unlink(dst, dir_fd=kwargs["dst_dir_fd"])
+            removed.append(dst)
+
+    monkeypatch.setattr(safefs.os, "link", link_then_remove)
+    with SafeRoot.open(root_dir) as root:
+        with _descriptors_left_open(monkeypatch) as left, pytest.raises(StateError) as info:
+            root.write_bytes("state.json", STATE)
+    monkeypatch.setattr(safefs.os, "link", real_link)
+
+    assert removed, "the test did not model the race"
+    _assert_not_a_refusal(info.value)
+    assert f"temporary name {removed[0]} disappeared before it could be published" in str(
+        info.value
+    )
+    assert "extra" not in str(info.value)
+    assert "linked" not in str(info.value)
+    assert left == [], "the failed write leaked a descriptor"
+    assert target.read_bytes() == b"old\n"
+    assert target.stat().st_ino == old.st_ino
+    assert [e.name for e in root_dir.iterdir()] == ["state.json"], "a temporary was left"
+
+
 def _fail_next(monkeypatch, name: str, *, err: int) -> Callable[[], None]:
     """Return an ``arm()`` that makes the next call of ``os.<name>`` from the
     module under test raise ``OSError(err)`` -- once; every later call is the

@@ -1080,6 +1080,11 @@ class SafeRoot:
         complete, and the inode is re-inspected between them: it must have
         exactly the one name the controller just gave it.  One that gained
         another is emptied through this descriptor, unlinked and refused.
+        One that lost it -- the name removed from under the controller in
+        that window -- is the same event the named path meets as the
+        rename's ``ENOENT`` and is reported the same way, as a
+        :class:`StateError`: nothing was planted, so there is nothing to
+        refuse and nothing to move aside.
 
         Once the name exists, every way out of this method other than
         returning it unlinks it: the re-inspection failing, the emptying
@@ -1095,7 +1100,12 @@ class SafeRoot:
             raise StateError(f"cannot write {where}: temporary name {tmp} is taken") from exc
         try:
             nlink = os.fstat(fd).st_nlink
-            if nlink != 1:
+            if nlink == 0:
+                raise StateError(
+                    f"cannot write {where}: the controller's temporary name {tmp} "
+                    "disappeared before it could be published"
+                )
+            if nlink > 1:
                 raise _empty_and_refuse(
                     fd,
                     where,
