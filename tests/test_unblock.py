@@ -155,7 +155,7 @@ def test_unblock_without_a_pr_reenters_analyze_execute(tmp_state_dir, fake_githu
     assert record["metadata"]["operator_reason"] == REASON
     # The live inspection is the ANALYZE_EXECUTE probe: issue + strict listing.
     assert ("get_issue", ISSUE) in fake_github.calls
-    assert ("list_open_prs", "owner/repo", True) in fake_github.calls
+    assert ("list_open_prs", "owner/repo") in fake_github.calls
     # And the entry adopts the PR the unblock saw, without an agent.
     nxt = eng.step()
     assert nxt.next_phase == "REVIEW" and "recovered existing open PR" in nxt.message
@@ -187,8 +187,10 @@ def test_unblock_without_a_pr_refuses_while_the_probe_still_cannot_decide(
     assert (eng.paths.logs_dir / eng.state.run_id / "001-blocked-unblock-1" / "error.txt").exists()
 
 
-def test_unblock_without_a_pr_refuses_a_listing_that_may_be_truncated(tmp_state_dir, fake_github):
-    fake_github.pr_listing_truncated = True
+def test_unblock_without_a_pr_refuses_a_listing_that_cannot_be_completed(
+    tmp_state_dir, fake_github
+):
+    fake_github.open_pr_listing_incomplete = True
     eng = _blocked(tmp_state_dir, fake_github)
     raw = eng.paths.state_file.read_text()
     out = eng.unblock(REASON)
@@ -216,7 +218,7 @@ def test_unblock_without_a_pr_refuses_when_the_issue_cannot_be_read_conclusively
     assert record["metadata"]["applied"] is False and record["metadata"]["target_phase"] == ""
     assert record["metadata"]["operator_reason"] == REASON
     assert (eng.paths.logs_dir / eng.state.run_id / "001-blocked-unblock-1" / "error.txt").exists()
-    assert ("list_open_prs", "owner/repo", True) not in fake_github.calls
+    assert ("list_open_prs", "owner/repo") not in fake_github.calls
 
 
 def test_unblock_without_a_pr_propagates_a_transient_issue_read_failure(tmp_state_dir, fake_github):
@@ -239,7 +241,7 @@ def test_unblock_without_a_pr_refuses_a_closed_issue(tmp_state_dir, fake_github)
     assert not out.unblocked and "issue cannot be worked on" in out.message
     assert "CLOSED" in out.message
     _assert_untouched(eng, raw)
-    assert ("list_open_prs", "owner/repo", True) not in fake_github.calls
+    assert ("list_open_prs", "owner/repo") not in fake_github.calls
 
 
 # -- an OPEN PR is bound -----------------------------------------------------------

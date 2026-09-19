@@ -1314,8 +1314,8 @@ def verify_sole_implementation_claimant(
     second marked PR is ambiguity and an unreadable marker anywhere is
     inconclusive, exactly as at entry.
 
-    ``open_prs`` must be a *strict* listing (one that may be truncated is
-    refused by the client before it reaches here), because "nothing else
+    ``open_prs`` must be a *complete* listing (one the client could not read
+    to the end is refused before it reaches here), because "nothing else
     claims the issue" is not knowable from a partial set.
     """
     try:

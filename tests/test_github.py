@@ -808,42 +808,163 @@ def test_disable_auto_merge_argv():
         _client(lambda req: _res({}, exit_code=1, stderr="denied")).disable_auto_merge(url)
 
 
-def test_list_open_prs_strict_refuses_a_possibly_truncated_listing():
-    """A repository-wide candidate lookup must not report a limit as "none"."""
-    one = [
-        {
-            "url": "https://github.com/o/r/pull/1",
-            "number": 1,
-            "state": "OPEN",
-            "headRefOid": "a" * 40,
-            "headRefName": "feature/x",
-            "baseRefName": "main",
-            "body": "hello",
+def _pr_page(nodes: list, *, has_next: bool = False, cursor: str | None = None) -> dict:
+    """One page of the open-PR cursor walk, shaped as `gh api graphql` returns it."""
+    return {
+        "data": {
+            "repository": {
+                "pullRequests": {
+                    "pageInfo": {"hasNextPage": has_next, "endCursor": cursor},
+                    "nodes": nodes,
+                }
+            }
         }
-    ]
-    seen = []
+    }
+
+
+def _open_pr_pages(rows: list, page_size: int):
+    """A runner serving ``rows`` page by page, keyed by the ``after`` cursor it
+    is asked for, and recording every command it saw."""
+    seen: list[list[str]] = []
+    pages = [rows[i : i + page_size] for i in range(0, len(rows), page_size)] or [[]]
 
     def handler(req):
         seen.append(req.command)
-        return ExecutionResult(req.command, None, 0, json.dumps(one), "", "t", "t")
+        cursors = [arg for arg in req.command if arg.startswith("after=")]
+        index = int(cursors[0].removeprefix("after=cursor-")) if cursors else 0
+        last = index == len(pages) - 1
+        cursor = None if last else f"cursor-{index + 1}"
+        return _res(_pr_page(pages[index], has_next=not last, cursor=cursor))
 
-    gh = _client(handler)
-    # Repository-wide: no issue linkage or branch-name filter is applied.
-    assert [p.number for p in gh.list_open_prs("o/r")] == [1]
-    assert seen[0][seen[0].index("--limit") + 1] == "100"
-    assert [p.body for p in gh.list_open_prs("o/r", strict=True)] == ["hello"]
-    assert seen[1][seen[1].index("--limit") + 1] == str(STRICT_PR_LIST_LIMIT)
+    return handler, seen
 
-    full = [
-        dict(one[0], number=n, url=f"https://github.com/o/r/pull/{n}")
-        for n in range(1, STRICT_PR_LIST_LIMIT + 1)
+
+def test_list_open_prs_walks_every_page_to_the_end():
+    """Issue #20: the open-PR listing is complete, whatever the repository's
+    size. `gh pr list --limit N` stops at N and says nothing about the rest;
+    the cursor walk asks for the next page until GitHub reports none."""
+    rows = [
+        {
+            "url": f"https://github.com/o/r/pull/{n}",
+            "number": n,
+            "title": f"PR {n}",
+            "state": "OPEN",
+            "headRefOid": "a" * 40,
+            "headRefName": f"feature/{n}",
+            "baseRefName": "main",
+            "isDraft": False,
+            "body": f"body {n}",
+            "headRepository": {"name": "r"},
+            "headRepositoryOwner": {"login": "o"},
+            "closingIssuesReferences": {"nodes": [{"number": n + 1000}]},
+        }
+        for n in range(1, 251)
     ]
-    truncating = _client(
-        lambda req: ExecutionResult(req.command, None, 0, json.dumps(full), "", "t", "t")
+    handler, seen = _open_pr_pages(rows, 100)
+
+    prs = _client(handler).list_open_prs("o/r")
+
+    assert [p.number for p in prs] == list(range(1, 251))
+    assert prs[249].body == "body 250" and prs[249].head_ref == "feature/250"
+    assert prs[0].repository == "o/r" and prs[0].head_repository == "o/r"
+    assert prs[0].linked_issue_numbers == [1001]  # the connection is flattened for the decoder
+    assert len(seen) == 3
+    for command in seen:
+        assert command[:3] == ["gh", "api", "graphql"]
+        assert "owner=o" in command and "name=r" in command
+        assert "pullRequests(first: 100, states: [OPEN], after: $after" in command[4]
+    assert "after=" not in " ".join(seen[0])
+    assert seen[1][-2:] == ["-f", "after=cursor-1"]
+    assert seen[2][-2:] == ["-f", "after=cursor-2"]
+
+
+def test_list_open_prs_of_an_empty_repository_is_one_page():
+    handler, seen = _open_pr_pages([], 100)
+    assert _client(handler).list_open_prs("o/r") == []
+    assert len(seen) == 1
+
+
+def test_list_open_prs_keeps_a_pr_seen_on_two_pages_once():
+    """A PR that moved between pages while the walk ran is one PR, not two
+    claimants for the same marker."""
+    row = dict(_PR_ROW, number=7, url="https://github.com/o/r/pull/7")
+    pages = iter(
+        [
+            _pr_page([_PR_ROW, row], has_next=True, cursor="c1"),
+            _pr_page([row, dict(_PR_ROW, number=9, url="https://github.com/o/r/pull/9")]),
+        ]
     )
-    with pytest.raises(GitHubError, match="truncated"):
-        truncating.list_open_prs("o/r", strict=True)
-    assert len(truncating.list_open_prs("o/r")) == STRICT_PR_LIST_LIMIT
+    prs = _client(lambda req: _res(next(pages))).list_open_prs("o/r")
+    assert [p.number for p in prs] == [1, 7, 9]
+
+
+@pytest.mark.parametrize(
+    "page, needle",
+    [
+        ({"data": {"repository": None}}, "page 1 is not a pull-request connection"),
+        ({"data": {"repository": {"pullRequests": {"nodes": []}}}}, "no usable nodes or pageInfo"),
+        (
+            {"data": {"repository": {"pullRequests": {"nodes": {}, "pageInfo": {}}}}},
+            "no usable nodes or pageInfo",
+        ),
+        (
+            _pr_page([], has_next=True, cursor=None),
+            "cannot be read to its end: page 1 announces a next page but no cursor",
+        ),
+        (
+            _pr_page([], has_next=True, cursor=""),
+            "cannot be read to its end: page 1 announces a next page but no cursor",
+        ),
+        (
+            {"data": {"repository": {"pullRequests": {"nodes": [], "pageInfo": {"endCursor": 1}}}}},
+            "page 1 does not say whether a next page exists",
+        ),
+    ],
+    ids=[
+        "no-repository",
+        "no-pageinfo",
+        "wrong-types",
+        "null-cursor",
+        "empty-cursor",
+        "no-hasnext",
+    ],
+)
+def test_list_open_prs_refuses_a_page_it_cannot_walk_past(page, needle):
+    """ "No PR exists" is decided on this listing, so a walk that cannot reach
+    its end is an error, never the pages it did read."""
+    with pytest.raises(GitHubError, match=needle):
+        _client(lambda req: _res(page)).list_open_prs("o/r")
+
+
+def test_list_open_prs_refuses_a_cursor_that_does_not_advance():
+    """A cursor equal to the one just used would walk the same page forever."""
+    pages = iter(
+        [
+            _pr_page([_PR_ROW], has_next=True, cursor="same"),
+            _pr_page([_PR_ROW], has_next=True, cursor="same"),
+        ]
+    )
+    with pytest.raises(GitHubError, match="page 2 announces a next page but no cursor"):
+        _client(lambda req: _res(next(pages))).list_open_prs("o/r")
+
+
+def test_list_open_prs_failure_classification_is_the_usual_one():
+    """A failed page is a `gh` failure like any other: transient when the
+    text says so, conclusive otherwise; never a shorter listing."""
+    pages = iter([_pr_page([_PR_ROW], has_next=True, cursor="c1")])
+
+    def flaky(req):
+        try:
+            return _res(next(pages))
+        except StopIteration:
+            return _res({}, exit_code=1, stderr="HTTP 502: Bad Gateway")
+
+    with pytest.raises(GitHubUnavailableError, match="502"):
+        _client(flaky).list_open_prs("o/r")
+    with pytest.raises(GitHubError, match="INVALID_CURSOR_ARGUMENTS"):
+        _client(
+            lambda req: _res({}, exit_code=1, stderr="INVALID_CURSOR_ARGUMENTS: bad cursor")
+        ).list_open_prs("o/r")
 
 
 def test_list_open_prs_decodes_linked_issues_without_overwriting_the_pr_reference():
@@ -855,10 +976,10 @@ def test_list_open_prs_decodes_linked_issues_without_overwriting_the_pr_referenc
         "headRefName": "feature/x",
         "baseRefName": "main",
         "body": "hello",
-        "closingIssuesReferences": [{"number": 9}],
+        "closingIssuesReferences": {"nodes": [{"number": 9}]},
     }
 
-    [pr] = _client(lambda req: _res([row])).list_open_prs("o/r")
+    [pr] = _client(lambda req: _res(_pr_page([row]))).list_open_prs("o/r")
 
     assert pr.url == "https://github.com/o/r/pull/1"
     assert pr.repository == "o/r"
@@ -1436,10 +1557,10 @@ def test_a_malformed_issue_row_is_a_github_error_in_every_listing_and_view(row, 
     ],
 )
 def test_a_malformed_pr_row_is_a_github_error_in_every_listing_and_view(row, needle):
+    with pytest.raises(GitHubError, match=needle):
+        _client(lambda req: _res(_pr_page([_PR_ROW, row]))).list_open_prs("o/r")
     gh = _client(lambda req: _res([_PR_ROW, row]))
     for strict in (False, True):
-        with pytest.raises(GitHubError, match=needle):
-            gh.list_open_prs("o/r", strict=strict)
         with pytest.raises(GitHubError, match=needle):
             gh.list_all_prs("o/r", strict=strict)
     single = _client(lambda req: _res(row))
@@ -1470,8 +1591,6 @@ def test_truncation_is_judged_on_the_raw_row_count_before_any_row_is_decoded():
         for n in range(1, STRICT_PR_LIST_LIMIT + 1)
     ]
     prs[-1] = "garbage"
-    with pytest.raises(GitHubError, match="truncated"):
-        _client(lambda req: _res(prs)).list_open_prs("o/r", strict=True)
     with pytest.raises(GitHubError, match="truncated"):
         _client(lambda req: _res(prs)).list_all_prs("o/r", strict=True)
     issues = [

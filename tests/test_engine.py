@@ -342,23 +342,53 @@ def test_recovery_adopts_the_marked_pr_whatever_its_branch_or_linkage(tmp_state_
     assert eng.provider.calls == []
     assert eng.state.current_pr_url == PR and eng.state.current_head_sha == SHA_B
     assert eng.state.current_branch == "feature/anything"
-    assert ("list_open_prs", "owner/repo", True) in fake_github.calls
+    assert ("list_open_prs", "owner/repo") in fake_github.calls
 
 
-def test_recovery_blocks_when_the_open_pr_listing_cannot_be_proven_complete(
+def test_recovery_finds_the_marked_pr_behind_more_than_a_hundred_open_prs(
+    tmp_state_dir, fake_github
+):
+    """Issue #20: the recovery lookup used to inspect the first 100 open PRs
+    and treat the rest as absent, so a busy repository re-implemented an
+    issue whose PR already existed. The listing is read to the end now;
+    the marked PR is found whatever its position, and the agent is not
+    launched. (The fake never paginates; the client's cursor walk is
+    tested in test_github.py.)"""
+    for n in range(100, 350):  # 250 unrelated open PRs, opened before the issue's
+        fake_github.add_pr(
+            url=f"https://github.com/owner/repo/pull/{n}",
+            head_sha=SHA_A,
+            branch=f"feature/{n}",
+            body=f"unrelated PR {n}",
+        )
+    fake_github.add_pr(
+        url="https://github.com/owner/repo/pull/350", head_sha=SHA_B, body=implementation_pr_body()
+    )
+    eng = make_engine(tmp_state_dir, ["never"], github=fake_github)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    out = eng.step()
+    assert out.next_phase == "REVIEW" and "recovered" in out.message
+    assert eng.provider.calls == []
+    assert eng.state.current_pr_url == "https://github.com/owner/repo/pull/350"
+    assert eng.state.current_head_sha == SHA_B
+    assert ("list_open_prs", "owner/repo") in fake_github.calls
+
+
+def test_recovery_blocks_when_the_open_pr_listing_cannot_be_read_to_its_end(
     tmp_state_dir, fake_github
 ):
     """ "No PR implements this issue yet" is a claim about every open PR; a
-    listing that may be truncated cannot make it, and an agent launched on
-    it would create a second implementation. BLOCKED, nobody launched."""
-    fake_github.pr_listing_truncated = True
+    listing that stopped before its end cannot make it, and an agent
+    launched on it would create a second implementation. BLOCKED, nobody
+    launched."""
+    fake_github.open_pr_listing_incomplete = True
     eng = make_engine(tmp_state_dir, ["never"], github=fake_github)
     eng.state.phase = Phase.ANALYZE_EXECUTE
     out = eng.step()
     assert out.next_phase == "BLOCKED" and eng.provider.calls == []
     reason = load_state(eng.paths.state_file).block_reason
     assert "cannot establish whether an open PR already implements issue #2" in reason
-    assert "may be truncated" in reason and "will not launch an agent" in reason
+    assert "cannot be read to its end" in reason and "will not launch an agent" in reason
 
 
 def test_recovery_ignores_a_pr_marked_for_another_issue(tmp_state_dir, fake_github):
@@ -5135,20 +5165,20 @@ def test_analyze_read_back_rejects_when_the_marked_pr_is_not_the_reported_one(
     assert eng.state.current_pr_url == ""
 
 
-def test_analyze_read_back_rejects_when_the_open_pr_listing_cannot_be_proven_complete(
+def test_analyze_read_back_rejects_when_the_open_pr_listing_cannot_be_read_to_its_end(
     tmp_state_dir, fake_github
 ):
     """The read-back's "exactly one" is a claim about every open PR, like the
-    entry's "at most one": a listing that may be truncated cannot make it."""
+    entry's "at most one": a listing that stopped before its end cannot make it."""
 
     def agent(req):
         fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, body=implementation_pr_body())
-        fake_github.pr_listing_truncated = True
+        fake_github.open_pr_listing_incomplete = True
         return block(ANALYZE_OK)
 
     eng = make_engine(tmp_state_dir, agent, github=fake_github)
     eng.state.phase = Phase.ANALYZE_EXECUTE
-    with pytest.raises(VerificationError, match="cannot accept PR .* may be truncated"):
+    with pytest.raises(VerificationError, match="cannot accept PR .* cannot be read to its end"):
         eng.step()
     assert eng.state.current_pr_url == "" and eng.state.phase == Phase.ANALYZE_EXECUTE
 
@@ -5160,10 +5190,10 @@ def test_analyze_read_back_lets_an_unavailable_github_through_as_transient(tmp_s
     class Flaky(FakeGitHub):
         outage = False
 
-        def list_open_prs(self, repo, limit=100, *, strict=False):
+        def list_open_prs(self, repo):
             if self.outage:
-                raise GitHubUnavailableError("`gh pr list` failed (exit 1): HTTP 503")
-            return super().list_open_prs(repo, limit, strict=strict)
+                raise GitHubUnavailableError("`gh api graphql` failed (exit 1): HTTP 503")
+            return super().list_open_prs(repo)
 
     gh = Flaky()
 

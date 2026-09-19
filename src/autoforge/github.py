@@ -501,6 +501,26 @@ _PR_LIST_FIELDS = (
     "url,number,title,state,headRefOid,baseRefName,headRefName,isDraft,body,"
     "headRepository,headRepositoryOwner,closingIssuesReferences"
 )
+# One page of the open-PR listing, read by cursor until GitHub reports no
+# further page (issue #20). `gh pr list --limit N` reads at most N rows and
+# says nothing about the rest, so a strict caller had to refuse a listing
+# that reached its ceiling; a cursor walk has no ceiling to reach. The node
+# fields are the ones `gh pr list --json` would return under the same names,
+# so the same decoder reads both; ``closingIssuesReferences`` is the one
+# connection `gh` flattens, and :meth:`GitHubClient.list_open_prs` flattens
+# it the same way. Creation order, ascending, keeps the walk stable: a PR
+# opened while it runs lands at the end, not inside a page already read.
+_PR_PAGE_SIZE = 100
+_OPEN_PR_PAGE_QUERY = (
+    "query($owner: String!, $name: String!, $after: String) {"
+    " repository(owner: $owner, name: $name) {"
+    f" pullRequests(first: {_PR_PAGE_SIZE}, states: [OPEN], after: $after,"
+    " orderBy: {field: CREATED_AT, direction: ASC}) {"
+    " pageInfo { hasNextPage endCursor }"
+    " nodes { url number title state headRefOid baseRefName headRefName isDraft body"
+    " headRepository { name } headRepositoryOwner { login }"
+    " closingIssuesReferences(first: 100) { nodes { number } } } } } }"
+)
 
 
 # -- strict row decoding ----------------------------------------------------------
@@ -577,7 +597,9 @@ def _decode_comment(row: object, parent_url: str) -> CommentInfo:
 
 
 # `gh pr list` paginates internally to satisfy --limit; this is the ceiling a
-# strict caller is willing to read before declaring the set unknowable.
+# strict caller is willing to read before declaring the set unknowable. The
+# open-PR listing walks cursors instead and has no ceiling (issue #20); the
+# all-states listing and the PR-number watermark still read up to this many.
 STRICT_PR_LIST_LIMIT = 1000
 # The same ceiling for `gh issue list`: a FIX entry reads every open issue to
 # find the follow-up issues an earlier fixer created.
@@ -1230,36 +1252,79 @@ class GitHubClient:
         except GitHubError:
             return False
 
-    def list_open_prs(self, repo: str, limit: int = 100, *, strict: bool = False) -> list[PRInfo]:
-        """Every open PR in ``repo`` (bodies included), as far as the listing goes.
+    def list_open_prs(self, repo: str) -> list[PRInfo]:
+        """Every open PR in ``repo`` (bodies included), read to the end.
 
-        ``strict`` raises GitHubError instead of returning a set that may be
-        incomplete: the underlying listing is bounded, and a caller deciding a
-        destructive action on "no candidate exists" must not confuse that with
-        "the candidate was past the limit".
+        The listing is complete or it raises: every caller decides "no
+        candidate exists" on it (an ANALYZE_EXECUTE entry launching an
+        implementer, a replan concluding no replacement was created), and
+        "the candidate was past a limit" must never be reported as absence
+        (issue #20). Pages are walked by cursor until GitHub says there is no
+        next one; a page that is not a PR connection, a next page GitHub
+        announces without a cursor to reach it, or a cursor that does not
+        advance is a conclusive GitHubError, never a shorter list. A PR seen
+        twice (the listing moved under the walk) is kept once.
         """
-        if strict:
-            limit = STRICT_PR_LIST_LIMIT
-        data = self._api_list(
-            [
-                "pr",
-                "list",
-                "--repo",
-                repo,
-                "--state",
-                "open",
-                "--limit",
-                str(limit),
-                "--json",
-                _PR_LIST_FIELDS,
+        what = f"open PR listing of {repo}"
+        owner, _, name = repo.partition("/")
+        prs: list[PRInfo] = []
+        seen: set[int] = set()
+        after: str | None = None
+        page_number = 0
+        while True:
+            page_number += 1
+            args = [
+                "api",
+                "graphql",
+                "-f",
+                f"query={_OPEN_PR_PAGE_QUERY}",
+                "-F",
+                f"owner={owner}",
+                "-F",
+                f"name={name}",
             ]
-        )
-        if strict and len(data) >= limit:
-            raise GitHubError(
-                f"{repo} has at least {limit} open pull requests, so the listing may be "
-                "truncated and the set of candidates cannot be established"
-            )
-        return [self._pr_from_data(d, f"open PR listing of {repo}") for d in data]
+            if after is not None:
+                args += ["-f", f"after={after}"]
+            page = self._api_json(args)
+            connection = ((page.get("data") or {}).get("repository") or {}).get("pullRequests")
+            if not isinstance(connection, dict):
+                raise GitHubError(
+                    f"{what}: page {page_number} is not a pull-request connection: {page!r:.200}"
+                )
+            nodes = connection.get("nodes")
+            info = connection.get("pageInfo")
+            if not isinstance(nodes, list) or not isinstance(info, dict):
+                raise GitHubError(
+                    f"{what}: page {page_number} has no usable nodes or pageInfo: "
+                    f"{connection!r:.200}"
+                )
+            for node in nodes:
+                row = _row_object(node, what)
+                # `gh pr list --json` flattens this connection to its nodes;
+                # the decoder reads that shape.
+                references = row.get("closingIssuesReferences")
+                if isinstance(references, dict):
+                    row = dict(row, closingIssuesReferences=references.get("nodes") or [])
+                pr = self._pr_from_data(row, what)
+                if pr.number in seen:
+                    continue
+                seen.add(pr.number)
+                prs.append(pr)
+            has_next = info.get("hasNextPage")
+            if not isinstance(has_next, bool):
+                raise GitHubError(
+                    f"{what}: page {page_number} does not say whether a next page exists: "
+                    f"{info!r:.200}"
+                )
+            if not has_next:
+                return prs
+            cursor = info.get("endCursor")
+            if not isinstance(cursor, str) or not cursor or cursor == after:
+                raise GitHubError(
+                    f"{what} cannot be read to its end: page {page_number} announces a "
+                    f"next page but no cursor that reaches it ({cursor!r})"
+                )
+            after = cursor
 
     def list_all_prs(self, repo: str, *, strict: bool = False) -> list[PRInfo]:
         """Every PR in ``repo`` across all states (bodies included).

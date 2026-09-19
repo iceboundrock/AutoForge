@@ -275,7 +275,10 @@ class FakeGitHub:
         self.edit_issue_race = None
         self.edit_issue_leaves_body: bool = False
         self.latest_pr_error: GitHubError | None = None  # every latest_pr_number call raises this
-        self.pr_listing_truncated: bool = False  # a strict PR listing cannot be completed
+        # The open-PR cursor walk cannot reach its end (issue #20): the real
+        # client raises instead of returning the pages it did read.
+        self.open_pr_listing_incomplete: bool = False
+        self.pr_listing_truncated: bool = False  # a strict all-states PR listing hit its ceiling
         self.issue_listing_truncated: bool = False  # a strict issue listing cannot be completed
         # every get_pr_comments / get_issue_comments call raises this
         self.comments_error: GitHubError | None = None
@@ -539,12 +542,12 @@ class FakeGitHub:
         except GitHubError:
             return False
 
-    def list_open_prs(self, repo: str, limit: int = 100, *, strict: bool = False) -> list[PRInfo]:
-        self.calls.append(("list_open_prs", repo, strict))
-        if strict and self.pr_listing_truncated:
+    def list_open_prs(self, repo: str) -> list[PRInfo]:
+        self.calls.append(("list_open_prs", repo))
+        if self.open_pr_listing_incomplete:
             raise GitHubError(
-                f"{repo} has at least 1000 open pull requests, so the listing may be "
-                "truncated and the set of candidates cannot be established"
+                f"open PR listing of {repo} cannot be read to its end: page 2 announces a "
+                "next page but no cursor that reaches it (None)"
             )
         return [
             replace(p)
