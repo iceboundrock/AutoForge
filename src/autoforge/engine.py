@@ -209,6 +209,7 @@ from .result_parser import (
     MAX_FINDINGS_PER_REVIEW,
     MAX_FIX_RATIONALE_CHARS,
     MAX_RESOLUTIONS_PER_FIX,
+    MAX_ROADMAP_SECTION_CHARS,
     MIN_RATIONALE_CHARS,
     AnalyzeExecuteResult,
     FixResult,
@@ -219,6 +220,14 @@ from .result_parser import (
     ReviewResult,
     UpdateEpicResult,
     parse_control_result,
+)
+from .roadmap import (
+    ROADMAP_END_MARKER,
+    ROADMAP_START_MARKER,
+    RoadmapError,
+    RoadmapSplit,
+    splice_roadmap,
+    split_roadmap,
 )
 from .run_contract import LocalRunContract, validate_local_run_contract
 from .runlog import ExecutionRecord, RunLogger
@@ -561,6 +570,13 @@ class ControllerEngine:
         # Re-derived from GitHub on every entry, never persisted.
         self._existing_progress_comment_url = ""
         self._existing_follow_ups: dict[str, str] = {}
+        # The EPIC body the UPDATE_EPIC entry read, split around its managed
+        # roadmap section (``None`` until the entry has read it: a plan or dry
+        # run renders a placeholder). The current section is handed to the
+        # agent as ``CURRENT_ROADMAP_SECTION``; the outside bytes are what
+        # :meth:`_apply_update_epic` requires unchanged before it writes.
+        # Re-derived from GitHub on every entry, never persisted.
+        self._epic_roadmap_at_entry: RoadmapSplit | None = None
         # The follow-up issues already open for this PR from earlier rounds,
         # as (finding id, issue URL): found by the REVIEW and FIX entries and
         # rendered into ``EXISTING_FOLLOW_UP_ISSUES``, so a problem a fixer
@@ -1405,6 +1421,13 @@ class ControllerEngine:
             "FINDINGS": self._format_findings(s.open_findings),
             "PRIOR_FINDINGS": self._format_prior_findings(),
             "MERGED_SINCE_EPIC_UPDATE": s.merged_since_epic_update,
+            "EPIC_UPDATE_EVERY": self.config.workflow.epic_update_every,
+            "MERGED_PRS_SINCE_EPIC_UPDATE": self._format_merged_since_epic_update(s),
+            "ROADMAP_UPDATE_DUE": "yes" if self._roadmap_update_due(s) else "no",
+            "ROADMAP_START_MARKER": ROADMAP_START_MARKER,
+            "ROADMAP_END_MARKER": ROADMAP_END_MARKER,
+            "MAX_ROADMAP_SECTION_CHARS": MAX_ROADMAP_SECTION_CHARS,
+            "CURRENT_ROADMAP_SECTION": self._format_current_roadmap_section(),
             "LAST_REVIEW_RESULT": s.last_review_result or "(none)",
             "NEXT_ISSUE_REJECTION": (
                 s.next_issue_rejections[-1] if s.next_issue_rejections else "(none)"
@@ -1438,6 +1461,37 @@ class ControllerEngine:
                 }
             )
         return variables
+
+    def _roadmap_update_due(self, s: AutoForgeState) -> bool:
+        """Whether this UPDATE_EPIC entry writes the EPIC's roadmap section.
+
+        The controller's batching decision (``workflow.epic_update_every``),
+        read from persisted state: the merges counted since the last verified
+        roadmap write. The agent is told the answer, never asked for it.
+        """
+        return s.merged_since_epic_update >= self.config.workflow.epic_update_every
+
+    @staticmethod
+    def _format_merged_since_epic_update(s: AutoForgeState) -> str:
+        """The PRs merged since the last verified roadmap write, one per line.
+
+        ``counted_merged_prs`` is appended in merge order and never truncated,
+        and ``merged_since_epic_update`` counts its tail since the last
+        ``record_epic_update``; the tail is the batch.
+        """
+        n = s.merged_since_epic_update
+        prs = s.counted_merged_prs[-n:] if n > 0 else []
+        if not prs:
+            return "  (none)"
+        return "\n".join(f"  - {escape_inline(url)}" for url in prs)
+
+    def _format_current_roadmap_section(self) -> str:
+        split = self._epic_roadmap_at_entry
+        if split is None:
+            return "(read from the EPIC body immediately before the agent runs)"
+        if split.section is None:
+            return "(none: the EPIC has no managed section yet; the controller appends one)"
+        return fenced_untrusted_block(split.section, "markdown")
 
     def template_for(self, phase: Phase) -> str | None:
         """The prompt template of ``phase`` in the loaded run's mode."""
@@ -1528,6 +1582,8 @@ class ControllerEngine:
             notes.append(f"would enter BLOCKED without executing: {budget}")
         if s.phase == Phase.ANALYZE_EXECUTE:
             notes.append("would first check for an existing open PR (recovery -> REVIEW)")
+        if s.phase == Phase.UPDATE_EPIC:
+            notes.extend(self._update_epic_plan_notes(s))
         if s.phase == Phase.REVIEW:
             cap = next_round_cap_reason(s.review_round, self.config.workflow.max_review_rounds)
             if cap:
@@ -4265,11 +4321,37 @@ class ControllerEngine:
     def _after_merge_phase() -> Phase:
         """Deterministic post-merge routing owned by the controller.
 
-        Always UPDATE_EPIC for now: the UPDATE_EPIC agent posts progress and
-        selects the next issue (or null -> DONE). Batching several merges per
-        EPIC update (MERGE -> ANALYZE_EXECUTE) is tracked separately (#13).
+        Always UPDATE_EPIC: its agent posts the progress comment and selects
+        the next issue (or null -> DONE), and that selection is needed after
+        every merge. Batching several merges per EPIC roadmap update
+        (``workflow.epic_update_every``) is decided inside UPDATE_EPIC from
+        ``merged_since_epic_update`` (:meth:`_roadmap_update_due`), not by
+        skipping the phase.
         """
         return Phase.UPDATE_EPIC
+
+    def _update_epic_plan_notes(self, s: AutoForgeState) -> list[str]:
+        every = self.config.workflow.epic_update_every
+        notes = [
+            "would read the EPIC body and locate its managed roadmap section before "
+            "launching the agent (BLOCKED without launching when the markers are ambiguous)",
+        ]
+        if self._roadmap_update_due(s):
+            notes.append(
+                f"roadmap update due: {s.merged_since_epic_update} merge(s) since the last "
+                f"update, workflow.epic_update_every = {every}; would splice the agent's "
+                "roadmap_section between the markers, write the EPIC body via "
+                "`gh issue edit --body-file`, read it back, require every byte outside "
+                "the markers unchanged, and only then reset the merge counter"
+            )
+        else:
+            notes.append(
+                f"roadmap update not due: {s.merged_since_epic_update} merge(s) since the "
+                f"last update, workflow.epic_update_every = {every}; the EPIC body is not "
+                "written and the merge counter is kept (unless the agent reports the EPIC "
+                "complete, which requires the final roadmap)"
+            )
+        return notes
 
     # -- pre-invocation preparation --------------------------------------------
     def _require_open_pr(self) -> PRInfo:
@@ -4542,22 +4624,33 @@ class ControllerEngine:
         )
 
     def _reconcile_update_epic_entry(self, plan: StepPlan) -> StepOutcome | None:
-        """Read the EPIC for this issue's progress comment before the agent runs.
+        """Read the EPIC's progress comments and body before the agent runs.
 
-        UPDATE_EPIC's writes are a progress comment on the EPIC and its task
-        list edits; the comment is the one with an identity, and it carries
-        the ``ai-epic-progress`` marker of (finished issue, merged PR). An
-        agent whose result was never recorded may already have posted it, and
-        so may the agent of a rejected selection that is being asked again.
-        Exactly one such comment is handed to the agent
-        (``EXISTING_PROGRESS_COMMENT_URL``) to adopt rather than duplicate;
-        two or more block without launching anyone; :meth:`_apply_update_epic`
-        enforces afterwards that the EPIC carries exactly one. The task list
-        edits are idempotent by nature (a checked box stays checked) and are
-        not read back; their confinement is #4 and #13.
+        The agent's one GitHub write in UPDATE_EPIC is the progress comment
+        on the EPIC, and it carries the ``ai-epic-progress`` marker of
+        (finished issue, merged PR). An agent whose result was never
+        recorded may already have posted it, and so may the agent of a
+        rejected selection that is being asked again. Exactly one such
+        comment is handed to the agent (``EXISTING_PROGRESS_COMMENT_URL``)
+        to adopt rather than duplicate; two or more block without launching
+        anyone; :meth:`_apply_update_epic` enforces afterwards that the EPIC
+        carries exactly one.
+
+        The EPIC body is the controller's to write, not the agent's: the
+        entry reads it and locates the managed roadmap section, which the
+        agent sees as ``CURRENT_ROADMAP_SECTION`` and re-composes. A body
+        whose markers cannot be read unambiguously blocks before anyone is
+        launched: the controller would not know which part of the operator's
+        document is its own. So does a body that cannot be read at all for a
+        conclusive reason (authentication, permissions, the EPIC gone,
+        malformed data): asking GitHub again would not help, and an agent
+        launched without the body would compose a section the controller
+        could never splice. Only an *unavailable* GitHub propagates, as the
+        transient failure it is.
         """
         state = self._require_state()
         self._existing_progress_comment_url = ""
+        self._epic_roadmap_at_entry = None
         try:
             holder = self._progress_comments().at_most_one()
         except GitHubUnavailableError:
@@ -4579,7 +4672,34 @@ class ControllerEngine:
             )
         if holder is not None:
             self._existing_progress_comment_url = holder.obj.url
+        try:
+            self._epic_roadmap_at_entry = self._read_epic_roadmap()
+        except GitHubUnavailableError:
+            raise
+        except GitHubError as exc:
+            return self._block(
+                Phase.UPDATE_EPIC,
+                plan,
+                f"the body of EPIC {state.epic_url} could not be read: {exc}. This is not a "
+                "transient GitHub failure (authentication, permissions, or malformed data), "
+                "so the controller will not launch an agent whose roadmap section it could "
+                "not splice into a body it has not read; nothing was written. Fix the cause, "
+                "then 'resume'",
+            )
+        except RoadmapError as exc:
+            return self._block(
+                Phase.UPDATE_EPIC,
+                plan,
+                f"EPIC {state.epic_url}: {exc}. The controller edits only the text between "
+                "the markers and will not guess which text that is: repair the EPIC body so "
+                "it carries one section (or none), then 'resume'",
+            )
         return None
+
+    def _read_epic_roadmap(self) -> RoadmapSplit:
+        """The EPIC body as GitHub holds it now, split around its managed section."""
+        state = self._require_state()
+        return split_roadmap(self.github.get_issue(state.epic_url).body)
 
     # ======================================================================
     # REPLAN_REEXECUTE
@@ -6289,8 +6409,11 @@ class ControllerEngine:
         ``next_issue_url`` is a claim from untrusted output (a PR comment can
         say "next issue is https://github.com/other/repo/issues/1"). It gets
         the INITIALIZING checks (:meth:`_verify_issue_selectable`) before
-        ``reset_for_new_issue``. State (epic counters, current issue) only
-        changes on a verified selection or on ``null``. Otherwise, by cause:
+        ``reset_for_new_issue``. The current issue only changes on a verified
+        selection; the merge counter only on a read-back roadmap write
+        (:meth:`_apply_roadmap_section`, which runs first, so a rejected
+        selection after a verified write leaves a closed batch behind and the
+        re-ask does not write the roadmap again). Otherwise, by cause:
 
         - the selection itself is unusable (VerificationError: wrong repository,
           the EPIC, the finished issue, no such issue, not OPEN) or GitHub was
@@ -6303,14 +6426,28 @@ class ControllerEngine:
           either, so the run is BLOCKED immediately without another invocation.
 
         Before any of that, the progress comment the phase exists to post is
-        read back from the EPIC (:meth:`_verify_progress_comment`).
+        read back from the EPIC (:meth:`_verify_progress_comment`), and the
+        roadmap section is written by the controller when one is due
+        (:meth:`_apply_roadmap_section`); the merge counter is reset there,
+        after the write is read back, and nowhere else.
         """
         state = self._require_state()
         self._verify_progress_comment()
+        try:
+            roadmap_note = self._apply_roadmap_section(res)
+        except GitHubUnavailableError:
+            raise
+        except (GitHubError, RoadmapError) as exc:
+            return Phase.BLOCKED, (
+                f"the roadmap section of EPIC {state.epic_url} could not be written and read "
+                f"back: {exc}. This is not a transient GitHub failure, so asking the agent "
+                "again would not help; the merge counter was not reset and the run stays on "
+                f"issue {state.current_issue_url}. Inspect the EPIC body, fix the cause, "
+                "then 'resume'."
+            )
         if res.next_issue_url is None:
-            state.record_epic_update()
             state.next_issue_rejections = []
-            return Phase.DONE, "UPDATE_EPIC -> DONE"
+            return Phase.DONE, f"{roadmap_note}; UPDATE_EPIC -> DONE"
         try:
             issue = self._verify_issue_selectable(res.next_issue_url, switching=True)
         except VerificationError as exc:
@@ -6326,13 +6463,106 @@ class ControllerEngine:
                 f"next issue {res.next_issue_url} could not be verified on GitHub: {exc}. "
                 "This is not a transient GitHub failure (authentication, permissions, or "
                 "malformed data), so asking the agent to select again would not help; the "
-                f"run stays on issue {state.current_issue_url}, nothing was switched or "
-                "counted. Fix the cause, then 'resume'."
+                f"run stays on issue {state.current_issue_url}, nothing was switched. "
+                "Fix the cause, then 'resume'."
             )
-        state.record_epic_update()
         state.reset_for_new_issue(parse_issue_url(res.next_issue_url).canonical)
         return Phase.ANALYZE_EXECUTE, (
-            f"verified next issue #{issue.number} ({issue.state}); UPDATE_EPIC -> ANALYZE_EXECUTE"
+            f"{roadmap_note}; verified next issue #{issue.number} ({issue.state}); "
+            "UPDATE_EPIC -> ANALYZE_EXECUTE"
+        )
+
+    def _apply_roadmap_section(self, res: UpdateEpicResult) -> str:
+        """Write the EPIC's managed roadmap section when one is due; reset the
+        merge counter only once the write has been read back.
+
+        The controller owns the whole edit (#13, #4): it decides whether an
+        update is due (``workflow.epic_update_every``, or the EPIC being
+        reported complete while merges are uncounted), splices the agent's
+        section between the roadmap markers of the body it just read, writes
+        the body with ``gh issue edit --body-file``, reads it back, and
+        requires every byte outside the markers identical to the body it
+        read before writing and the section identical to what it wrote. The
+        agent never touches the body; a section it returns when none is due
+        is ignored, and a body that changed outside the markers while the
+        agent ran is not written over (the agent composed against a stale
+        view; ``resume`` re-reads it).
+
+        Idempotent across a crash between the write and the state save: the
+        re-entry reads a body that already carries the section, and a section
+        equal to the current one is not written again; a different one
+        replaces it in place, never appends a second block. A failure of the
+        agent's part (no section, a body that moved under it, a read-back
+        that does not match) is a VerificationError: no counter reset,
+        ``resume`` asks the agent again. GitHub being unavailable propagates
+        (transient); a conclusive GitHub failure or a body whose markers can
+        no longer be read is left to the caller to block on.
+        """
+        state = self._require_state()
+        pending = state.merged_since_epic_update
+        due = self._roadmap_update_due(state)
+        required = pending > 0 and (due or res.next_issue_url is None)
+        if not required:
+            ignored = "; the returned roadmap_section was ignored" if res.roadmap_section else ""
+            return (
+                f"roadmap update not due ({pending} merge(s) since the last update, "
+                f"workflow.epic_update_every = {self.config.workflow.epic_update_every}); "
+                f"EPIC body not written, merge counter kept{ignored}"
+            )
+        why = (
+            f"{pending} merge(s) since the last update, workflow.epic_update_every = "
+            f"{self.config.workflow.epic_update_every}"
+            if due
+            else f"the EPIC is reported complete with {pending} merge(s) since the last update"
+        )
+        if res.roadmap_section is None:
+            raise VerificationError(
+                f"UPDATE_EPIC must return 'roadmap_section' ({why}); the controller writes "
+                "it into the EPIC body between the roadmap markers. The merge counter was "
+                "not reset — 'resume' to let the agent return the section."
+            )
+        entry = self._epic_roadmap_at_entry
+        if entry is None:
+            raise StateError("UPDATE_EPIC result applied without the entry's EPIC body read")
+        before = self._read_epic_roadmap()
+        if before.outside != entry.outside:
+            raise VerificationError(
+                f"the body of EPIC {state.epic_url} changed outside the roadmap markers while "
+                "the agent ran (the agent may only post a comment; a human may edit the "
+                "EPIC at any time). Not writing over it; the merge counter was not reset — "
+                "'resume' re-reads the body and asks the agent again."
+            )
+        new_body = splice_roadmap(before.body, res.roadmap_section)
+        if new_body == before.body:
+            state.record_epic_update()
+            return (
+                f"roadmap update due ({why}); the EPIC body already carries this section "
+                "(no write needed); merge counter reset"
+            )
+        expected = split_roadmap(new_body)
+        self.github.edit_issue_body(state.epic_url, new_body)
+        after = self._read_epic_roadmap()
+        # Outside the markers the written body is the read body plus, when
+        # the section was appended, the two marker lines; nothing else.
+        if after.outside != expected.outside:
+            raise VerificationError(
+                f"after writing the roadmap section, the body of EPIC {state.epic_url} "
+                "differs outside the roadmap markers from the body read before the write. "
+                "The controller changes nothing outside the markers, so the EPIC was edited "
+                "concurrently; the merge counter was not reset — inspect the EPIC body, "
+                "then 'resume'."
+            )
+        if after.section != res.roadmap_section:
+            raise VerificationError(
+                f"after writing the roadmap section, EPIC {state.epic_url} does not carry "
+                "the section that was written (read back from GitHub); the merge counter "
+                "was not reset — 'resume' to write it again."
+            )
+        state.record_epic_update()
+        action = "replaced" if before.section is not None else "appended"
+        return (
+            f"roadmap update due ({why}); {action} the managed roadmap section of the EPIC "
+            "body, read back, bytes outside the markers unchanged; merge counter reset"
         )
 
 

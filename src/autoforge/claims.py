@@ -53,7 +53,12 @@ from dataclasses import dataclass
 from typing import Generic, Protocol, TypeVar
 
 from .errors import ClaimConflictError, ConfigurationError
-from .result_parser import FINDING_ID_RE, MAX_FINDING_ID_CHARS, MAX_URL_CHARS
+from .result_parser import (
+    CONTROLLER_MARKER_OPEN_RE,
+    FINDING_ID_RE,
+    MAX_FINDING_ID_CHARS,
+    MAX_URL_CHARS,
+)
 from .validation import GitHubIssueRef, GitHubPullRequestRef, parse_issue_url, parse_pr_url
 
 _FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
@@ -294,6 +299,10 @@ def _decode_follow_up(payload: dict) -> FollowUpClaim:
 
 # -- kinds ----------------------------------------------------------------------------
 
+# The name prefix ``CONTROLLER_MARKER_OPEN_RE`` ends with; a kind's pattern
+# is that opening followed by the rest of its name.
+_NAME_PREFIX = "ai-"
+
 
 @dataclass(frozen=True)
 class MarkerKind(Generic[C]):
@@ -303,6 +312,14 @@ class MarkerKind(Generic[C]):
     decode: Callable[[dict], C]
     several_per_object: bool  # distinct keys may share one object (follow-ups)
 
+    def __post_init__(self) -> None:
+        # Every kind opens as ``CONTROLLER_MARKER_OPEN_RE``: that shared
+        # opening is what the result parser refuses in agent text that the
+        # controller writes into an issue body verbatim, so a kind outside it
+        # would be scanned but not refused.
+        if not self.name.startswith(_NAME_PREFIX):
+            raise ConfigurationError(f"marker kind {self.name!r} must start with {_NAME_PREFIX!r}")
+
     @property
     def pattern(self) -> re.Pattern[str]:
         # Every *complete* comment bearing the name, whatever the payload
@@ -310,6 +327,8 @@ class MarkerKind(Generic[C]):
         # over. The payload may not contain a comment delimiter: an
         # unterminated marker is not a complete comment and must not swallow
         # the body up to a later ``-->`` and hide a valid marker in the match.
+        # The opening is ``CONTROLLER_MARKER_OPEN_RE`` itself (not a copy of
+        # it) so the scanner and the result parser's refusal cannot drift.
         #
         # Cost is part of the contract: this pattern runs over every open
         # issue body and every PR body the controller lists, which is text
@@ -319,8 +338,10 @@ class MarkerKind(Generic[C]):
         # followed by a long run of blanks is one failed pass, not a
         # quadratic-or-worse search for a split between payload and blanks.
         # :func:`scan` strips the payload instead.
+        rest = re.escape(self.name.removeprefix(_NAME_PREFIX))
         return re.compile(
-            rf"<!--\s*+{re.escape(self.name)}\s*+:(?P<payload>(?:(?!-->|<!--)[\s\S])*?)-->"
+            rf"{CONTROLLER_MARKER_OPEN_RE.pattern}{rest}\s*+:"
+            rf"(?P<payload>(?:(?!-->|<!--)[\s\S])*?)-->"
         )
 
     def render(self, payload: dict) -> str:

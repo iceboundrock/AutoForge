@@ -632,7 +632,14 @@ def _drive_to_ready(fakes):
             )
         if req.phase == "UPDATE_EPIC":
             post_progress_comment(gh)
-            return block({"phase": "UPDATE_EPIC", "status": "success", "next_issue_url": None})
+            return block(
+                {
+                    "phase": "UPDATE_EPIC",
+                    "status": "success",
+                    "roadmap_section": "- [x] done",
+                    "next_issue_url": None,
+                }
+            )
         gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
         return block(
             {
