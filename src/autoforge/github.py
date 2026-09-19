@@ -1324,14 +1324,18 @@ class GitHubClient:
         page_number = 0
         while True:
             page_number += 1
+            # `-f` sends each variable as a string. `-F` would type-coerce
+            # it: an all-digit owner login would become an integer and a
+            # repository named `null`, `true` or `false` a null or boolean,
+            # which GitHub refuses for a `String!` variable.
             args = [
                 "api",
                 "graphql",
                 "-f",
                 f"query={_OPEN_PR_PAGE_QUERY}",
-                "-F",
+                "-f",
                 f"owner={owner}",
-                "-F",
+                "-f",
                 f"name={name}",
             ]
             if after is not None:

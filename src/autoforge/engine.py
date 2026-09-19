@@ -2786,12 +2786,13 @@ class ControllerEngine:
         found in a complete listing of the repository's open PRs, read to
         the end (issue #20): a listing the client cannot read to the end
         blocks, because "no PR exists" is then not knowable and launching an
-        agent on that guess is how a second implementation gets created. The marker is the identity
-        :meth:`_apply_analyze` requires of the PR the agent claims, so a PR
-        the read-back would accept is a PR every later entry finds, whatever
-        its branch is called and whether or not GitHub links it to the
-        issue. A PR the controller already persisted is a candidate as well,
-        marker or not: it is the controller's own verified record.
+        agent on that guess is how a second implementation gets created.
+        The marker is the identity :meth:`_apply_analyze` requires of the PR
+        the agent claims, so a PR the read-back would accept is a PR every
+        later entry finds, whatever its branch is called and whether or not
+        GitHub links it to the issue. A PR the controller already persisted
+        is a candidate as well, marker or not: it is the controller's own
+        verified record.
         """
         state = self._require_state()
         pr, problem = self._implementation_pr_candidate()

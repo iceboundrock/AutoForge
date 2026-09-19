@@ -871,7 +871,10 @@ def test_list_open_prs_walks_every_page_to_the_end():
     assert len(seen) == 3
     for command in seen:
         assert command[:3] == ["gh", "api", "graphql"]
-        assert "owner=o" in command and "name=r" in command
+        # Raw string fields: `-F` would coerce an all-digit owner or a
+        # repository named null/true/false into a non-string GitHub refuses.
+        assert command[5:9] == ["-f", "owner=o", "-f", "name=r"]
+        assert "-F" not in command
         assert "pullRequests(first: 100, states: [OPEN], after: $after" in command[4]
     assert "after=" not in " ".join(seen[0])
     assert seen[1][-2:] == ["-f", "after=cursor-1"]
