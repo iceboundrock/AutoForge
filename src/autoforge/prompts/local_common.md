@@ -59,11 +59,17 @@ merge**. Do NOT:
 - `git reset`, `git checkout -- <path>`, `git stash`, or otherwise discard
   work you did not create in this phase
 
-The controller enforces this: it reads HEAD and the checked-out branch before
-and after every phase and compares them with the anchor the run was pinned to
-(`{{BASE_HEAD_SHA}}` on `{{BASE_BRANCH}}`). A commit, reset, checkout or
-branch switch blocks the run for a human. The controller never rolls any of it
-back, so someone has to clean it up by hand.
+The items that move HEAD or the checked-out branch are enforced by the
+controller: it reads both before and after every phase and compares them with
+the anchor the run was pinned to (`{{BASE_HEAD_SHA}}` on `{{BASE_BRANCH}}`).
+A commit, reset, checkout or branch switch blocks the run for a human. The
+controller never rolls any of it back, so someone has to clean it up by hand.
+
+The GitHub items (`gh`, Issues, pull requests, `git push`) and a discard that
+leaves HEAD in place (`git stash`, `git checkout -- <path>`) are policy the
+controller cannot check: none of them moves HEAD or the branch, and the
+controller does not observe your commands or your network use. They are
+forbidden all the same. Do not read "not detected" as "allowed".
 
 Leave your work as **changes in the working tree** on the current checkout.
 New files may stay untracked; the controller sees them. The human operator

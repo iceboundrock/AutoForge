@@ -422,10 +422,22 @@ features/<slug>.md  →  INITIALIZING → ANALYZE_EXECUTE → REVIEW
                                          → findings after the fix budget ─▶ BLOCKED
 ```
 
-A local run never touches GitHub: no `gh` invocation, no Issue, no PR, no
-comment, no push, no branch, no merge, no EPIC update, no follow-up issue, and
-no replan. The `GitHubClient` is not even constructed. Nothing is faked
-either: there are no placeholder PR URLs in local state or local prompts.
+The *controller* never touches GitHub in a local run: no `gh` invocation,
+no Issue, no PR, no comment, no push, no branch, no merge, no EPIC update, no
+follow-up issue, and no replan. The `GitHubClient` is not even constructed.
+Nothing is faked either: there are no placeholder PR URLs in local state or
+local prompts.
+
+That is a property of the controller, not of the agents it launches. An agent
+is a same-UID subprocess with `gh` on `PATH` and network access; it is
+instructed not to use them, and the controller can neither prevent nor detect
+a `gh` write, a `git push` or a network request made by the agent. What the
+controller *does* detect is a moved git anchor: HEAD and the checked-out branch
+are compared with the values the run was pinned to before and after every
+phase, so a commit, reset, checkout or branch switch blocks the run. It detects
+nothing else. Real containment is a sandbox, which LOCAL v1 does not provide
+([ADR 0001](docs/adr/0001-local-mode-workspace-identity-and-filesystem-boundary.md)
+§2.2 and §8.1; isolation is tracked in #10).
 
 ### The interview-sized example
 
@@ -932,14 +944,18 @@ audit data rather than state payload.
   and the cumulative step budget (`workflow:` in the config) are controller
   invariants checked before an agent is invoked; hitting one is `BLOCKED`, a
   terminal phase that `resume` does not re-enter.
-- **A local run is GitHub-free by construction, not by convention.** The
-  `GitHubClient` is built on first *use* and a `LOCAL` run never has one, so
-  there is no path from local mode to `gh` at all: no authentication is
-  needed and none is consulted. The local prompt templates are separate files
-  that never mention creating a PR, reading an Issue, posting a comment,
-  pushing, merging, or opening a follow-up Issue, and the local result
-  protocol rejects a `follow_up_created` resolution outright. Tests drive a
-  full local run with a GitHub double that raises on any attribute access.
+- **The controller's local run is GitHub-free by construction, not by
+  convention.** The `GitHubClient` is built on first *use* and a `LOCAL` run
+  never has one, so there is no path from the controller to `gh` at all: no
+  authentication is needed and none is consulted. The local prompt templates
+  are separate files that never mention creating a PR, reading an Issue,
+  posting a comment, pushing, merging, or opening a follow-up Issue, and the
+  local result protocol rejects a `follow_up_created` resolution outright.
+  Tests drive a full local run with a GitHub double that raises on any
+  attribute access. The agent is outside that construction: it is asked not
+  to touch GitHub, and only a moved git anchor (a commit, reset, checkout or
+  branch switch) is detected; a `gh` write or a push from the agent is not
+  (see [Local mode](#local-mode-no-github)).
 - **The local feature specification is frozen and untrusted.** Its SHA-256 is
   recorded when the run is created and re-checked before and after every agent
   phase: an agent that rewrites its own acceptance criteria fails the run. It
