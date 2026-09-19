@@ -121,6 +121,21 @@ def test_load_rejects_non_list_next_issue_rejections(tmp_path):
         ("premerge_verified_commands", ["make check"]),
         ("premerge_verified_commands", [["make", 1]]),
         ("premerge_verified_commands", "make check"),
+        ("unblock_history", "no"),
+        ("unblock_history", [1]),
+        ("unblock_history", [{"at": "x"}]),
+        (
+            "unblock_history",
+            [{"at": "", "reason": "r", "block_reason": "b", "phase": "REVIEW", "detail": "d"}],
+        ),
+        (
+            "unblock_history",
+            [{"at": "t", "reason": 1, "block_reason": "b", "phase": "REVIEW", "detail": "d"}],
+        ),
+        (
+            "unblock_history",
+            [{"at": "t", "reason": "r", "block_reason": "b", "phase": "NOPE", "detail": "d"}],
+        ),
     ],
 )
 def test_load_rejects_wrong_list_element_types(tmp_path, field, bad):
@@ -148,6 +163,31 @@ def test_state_without_prior_findings_loads_with_empty_list(tmp_path):
     del d["prior_findings"]
     p.write_text(json.dumps(d), encoding="utf-8")
     assert load_state(p).prior_findings == []
+
+
+def test_state_without_unblock_history_loads_with_empty_list(tmp_path):
+    """A file written before `unblock` existed was never unblocked."""
+    p = tmp_path / "state.json"
+    d = make_state().to_dict()
+    del d["unblock_history"]
+    p.write_text(json.dumps(d), encoding="utf-8")
+    assert load_state(p).unblock_history == []
+
+
+def test_unblock_history_roundtrips_and_survives_an_issue_switch(tmp_path):
+    entry = {
+        "at": "2026-09-19T10:00:00+00:00",
+        "reason": "operator reran the flaky check",
+        "block_reason": "check ci failed",
+        "phase": "READY_FOR_MERGE",
+        "detail": "PR at the clean-reviewed HEAD",
+    }
+    s = make_state(unblock_history=[entry])
+    p = tmp_path / "state.json"
+    save_state(s, p)
+    assert load_state(p).unblock_history == [entry]
+    s.reset_for_new_issue("https://github.com/owner/repo/issues/3")
+    assert s.unblock_history == [entry]
 
 
 def test_reset_for_new_issue_clears_the_carried_findings():

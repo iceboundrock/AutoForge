@@ -5,7 +5,9 @@ import pytest
 from autoforge.errors import ControlResultValidationError, StateTransitionError
 from autoforge.transitions import (
     LEGAL_EDGES,
+    LOCAL_LEGAL_EDGES,
     TERMINAL_PHASES,
+    UNBLOCK_TARGETS,
     Phase,
     WorkflowMode,
     decide_next_phase,
@@ -35,6 +37,12 @@ EXPECTED_LEGAL_EDGES = {
     (Phase.MERGE, Phase.REVIEW),
     (Phase.UPDATE_EPIC, Phase.ANALYZE_EXECUTE),
     (Phase.UPDATE_EPIC, Phase.DONE),
+    # Operator edges: taken only by `unblock` after a live GitHub inspection (#5).
+    (Phase.BLOCKED, Phase.ANALYZE_EXECUTE),
+    (Phase.BLOCKED, Phase.REVIEW),
+    (Phase.BLOCKED, Phase.FIX),
+    (Phase.BLOCKED, Phase.READY_FOR_MERGE),
+    (Phase.BLOCKED, Phase.UPDATE_EPIC),
 }
 
 
@@ -67,9 +75,21 @@ def test_replan_reexecute_has_exactly_one_exit_and_one_entry():
     assert not is_legal(Phase.REPLAN_REEXECUTE, Phase.FAILED)
 
 
-def test_terminal_phases_have_no_outgoing_edges():
+def test_terminal_phases_have_no_outgoing_edges_except_the_operators_unblock():
+    """DONE and FAILED are final. BLOCKED's edges are the operator's, and only
+    the operator's: `decide_next_phase` still refuses it, so no agent result
+    can route out of it, and the LOCAL topology has no way out at all."""
+    assert LEGAL_EDGES[Phase.DONE] == frozenset()
+    assert LEGAL_EDGES[Phase.FAILED] == frozenset()
+    assert LEGAL_EDGES[Phase.BLOCKED] == UNBLOCK_TARGETS
+    assert UNBLOCK_TARGETS == {to for frm, to in EXPECTED_LEGAL_EDGES if frm is Phase.BLOCKED}
+    assert Phase.REPLAN_REEXECUTE not in UNBLOCK_TARGETS
+    assert not (UNBLOCK_TARGETS & TERMINAL_PHASES)
     for phase in TERMINAL_PHASES:
-        assert LEGAL_EDGES[phase] == frozenset()
+        assert LOCAL_LEGAL_EDGES[phase] == frozenset()
+        assert not is_legal(phase, Phase.REVIEW, WorkflowMode.LOCAL)
+    with pytest.raises(StateTransitionError, match="terminal"):
+        decide_next_phase(Phase.BLOCKED, {"needs_fix_round": False})
 
 
 def test_every_phase_appears_in_the_topology():

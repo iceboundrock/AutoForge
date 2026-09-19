@@ -6,6 +6,9 @@ Commands:
   run     create a run (Issue -> ...) and advance it until READY_FOR_MERGE/DONE/BLOCKED/FAILED
   step    execute exactly one phase step from persisted state
   resume  continue a persisted run until a stop phase / max-steps
+  unblock the operator's explicit exit from BLOCKED: the controller re-inspects
+          live GitHub state, re-enters a phase through validate_transition or
+          refuses and stays BLOCKED; the reason is recorded in state and the log
   status  show the persisted run summary (--json for machine output)
   local   LOCAL mode: feature Markdown -> implement -> review -> fix -> DONE,
           with no GitHub involved at any point (init / run / doctor)
@@ -21,7 +24,7 @@ import sys
 from . import __version__
 from .config import AutoForgeConfig, load_config_file
 from .doctor import CheckResult, run_doctor, run_local_doctor
-from .engine import ControllerEngine, StepOutcome, StepPlan
+from .engine import ControllerEngine, StepOutcome, StepPlan, UnblockOutcome
 from .errors import (
     AutoForgeError,
     ConfigurationError,
@@ -111,6 +114,30 @@ def build_parser() -> argparse.ArgumentParser:
     re_.add_argument("--allow-merge", action="store_true")
     re_.add_argument("--full-prompt", action="store_true")
 
+    ub = sub.add_parser(
+        "unblock",
+        help=(
+            "leave BLOCKED explicitly: re-inspect GitHub, re-enter a phase or refuse; then 'resume'"
+        ),
+        description=(
+            "Requires a BLOCKED run. The controller re-runs its recovery inspection "
+            "against live GitHub and either re-enters the one phase that inspection "
+            "supports (through the same transition validation as any other step) or "
+            "refuses and stays BLOCKED. No agent runs; the operator action is recorded "
+            "in state and in the run log."
+        ),
+    )
+    ub.add_argument(
+        "--reason",
+        required=True,
+        help="why the operator is unblocking (recorded in state and in the run log)",
+    )
+    ub.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="read GitHub and report the decision without writing state or the log",
+    )
+
     st = sub.add_parser("status", help="show persisted run status")
     st.add_argument("--json", action="store_true", dest="as_json")
 
@@ -197,6 +224,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_step(args)
         if args.command == "resume":
             return cmd_resume(args)
+        if args.command == "unblock":
+            return cmd_unblock(args)
         if args.command == "status":
             return cmd_status(args)
         if args.command == "local":
@@ -543,6 +572,39 @@ def cmd_resume(args) -> int:
     return _finish(engine, outcomes, args.allow_merge)
 
 
+def cmd_unblock(args) -> int:
+    """``autoforge unblock --reason ...``: exit 0 when a phase was re-entered.
+
+    The decision is the engine's (:meth:`ControllerEngine.unblock`): a
+    refusal leaves the run BLOCKED, prints why, and exits 1; a run that is
+    not BLOCKED is a StateTransitionError (exit 2). The run is not resumed
+    here: the operator reviews the outcome and runs ``resume``.
+    """
+    engine = _engine_for(args)
+    if not args.state_dir:
+        _bind_existing_run(engine)
+    if args.dry_run:
+        # Reads GitHub; writes nothing (no state, no run log, no lock).
+        engine.load()
+        outcome = engine.unblock(args.reason, dry_run=True)
+        print_unblock_outcome(outcome)
+        return 0
+    # Load, decide and write under one lock, like `step`.
+    with engine.locked():
+        engine.load()
+        outcome = engine.unblock(args.reason)
+    print_unblock_outcome(outcome)
+    if not outcome.unblocked:
+        return 1
+    print("run 'autoforge resume' to continue")
+    return 0
+
+
+def print_unblock_outcome(o: UnblockOutcome) -> None:
+    # State-derived and operator-supplied text; redacted whole like a step outcome.
+    print(redact(f"[{o.run_id}] {o.message}"))
+
+
 def _resume_holding_state(
     engine: ControllerEngine, state: AutoForgeState, allow_merge: bool
 ) -> int | None:
@@ -558,11 +620,16 @@ def _resume_holding_state(
         if state.phase == Phase.DONE:
             print(redact(f"workflow already DONE (run {state.run_id}) — nothing to do"))
             return 0
+        how = (
+            "and run 'autoforge unblock --reason ...' to have the controller re-inspect "
+            "GitHub and re-enter a phase, or start a new run"
+            if state.phase == Phase.BLOCKED and state.mode != WorkflowMode.LOCAL
+            else "and start a new run"
+        )
         print(
             redact(
                 f"run {state.run_id} is in terminal phase {state.phase.value}: "
-                f"{state.block_reason or '-'} — inspect {engine.paths.logs_dir}/ "
-                "and start a new run"
+                f"{state.block_reason or '-'} — inspect {engine.paths.logs_dir}/ {how}"
             )
         )
         return 1
@@ -692,6 +759,12 @@ def _render_status(state: AutoForgeState, txn: ReplanTransaction | None) -> str:
     lines += _render_replan_journal(txn)
     if state.block_reason:
         lines.append(f"Reason:     {state.block_reason}")
+    if state.unblock_history:
+        last = state.unblock_history[-1]
+        lines.append(
+            f"Unblocked:  {len(state.unblock_history)} time(s); last at {last.get('at', '-')} "
+            f"-> {last.get('phase', '-')}: {last.get('reason', '-')}"
+        )
     lines += [
         "",
         f"Steps executed: {state.step_count}",

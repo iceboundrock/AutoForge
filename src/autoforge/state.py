@@ -384,6 +384,14 @@ class AutoForgeState:
     step_count: int = 0
     # Human-readable reason when phase is BLOCKED/FAILED.
     block_reason: str = ""
+    # The operator's explicit exits from BLOCKED (``autoforge unblock``), oldest
+    # first, one object per unblock that was applied: ``at`` (UTC timestamp),
+    # ``reason`` (the operator's text), ``block_reason`` (the reason that was
+    # cleared), ``phase`` (the phase re-entered) and ``detail`` (why the
+    # controller chose it). A refused unblock is not recorded here -- nothing
+    # changed -- but in the run log. Kept across issues: it is the run's audit
+    # trail, not per-PR bookkeeping.
+    unblock_history: list[dict] = field(default_factory=list)
 
     created_at: str = ""
     updated_at: str = ""
@@ -614,6 +622,7 @@ class AutoForgeState:
             raise StateError("state field 'superseded_prs' must be a list of objects")
         if not isinstance(state.replan_transaction, dict):
             raise StateError("state field 'replan_transaction' must be an object")
+        _validate_unblock_history(state.unblock_history)
         for name in _MINIMUM_ONE_FIELDS:
             if getattr(state, name) < 1:
                 raise StateError(f"state field {name!r} must be a valid integer")
@@ -693,6 +702,36 @@ class AutoForgeState:
     @property
     def last_review_round(self) -> int:
         return self.review_round
+
+
+_UNBLOCK_ENTRY_FIELDS = ("at", "reason", "block_reason", "phase", "detail")
+
+
+def _validate_unblock_history(history: object) -> None:
+    """``unblock_history`` is a list of complete, string-valued entries.
+
+    Each entry names the phase the operator re-entered, so a value that is
+    not a phase (or an entry missing a field) is corruption: the trail would
+    otherwise claim a transition the topology has no name for.
+    """
+    if not isinstance(history, list):
+        raise StateError("state field 'unblock_history' must be a list of objects")
+    for entry in history:
+        if not isinstance(entry, dict):
+            raise StateError("state field 'unblock_history' must be a list of objects")
+        for key in _UNBLOCK_ENTRY_FIELDS:
+            if not isinstance(entry.get(key), str):
+                raise StateError(
+                    f"state field 'unblock_history': every entry needs a string {key!r}"
+                )
+        if not entry["at"] or not entry["phase"]:
+            raise StateError("state field 'unblock_history': 'at' and 'phase' must be non-empty")
+        try:
+            Phase(entry["phase"])
+        except ValueError:
+            raise StateError(
+                f"state field 'unblock_history': {entry['phase']!r} is not a phase"
+            ) from None
 
 
 # Every field the dataclass declares as a plain `str` or `int`, derived from

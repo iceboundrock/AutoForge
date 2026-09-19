@@ -64,6 +64,18 @@ UPDATE_EPIC -> ANALYZE_EXECUTE
 UPDATE_EPIC -> DONE
 ```
 
+Operator edges, taken only by `autoforge unblock` (never by
+`decide_next_phase`, `step` or `resume`, which still treat `BLOCKED` as
+terminal):
+
+```text
+BLOCKED -> ANALYZE_EXECUTE | REVIEW | FIX | READY_FOR_MERGE | UPDATE_EPIC
+```
+
+`BLOCKED -> REPLAN_REEXECUTE` is deliberately absent (see the edge rule
+above); `DONE` and `FAILED` have no outgoing edges; the LOCAL table has no
+unblock edge. See **Leaving BLOCKED** below.
+
 Illegal transitions must fail explicitly. Do not silently coerce an invalid state into a valid one.
 
 ---
@@ -304,6 +316,58 @@ next entry could not find again.
   the agent returns, the EPIC must carry exactly one such comment.
 
 No probe consumes a review round, a `review_history` entry, or an attempt.
+
+### Leaving BLOCKED: the operator's unblock
+
+`BLOCKED` is where the controller parks a run whose safe state it could not
+determine (two candidate PRs, a closed PR, an exhausted bound, a failing
+check, ...). `autoforge unblock --reason ...` is the only exit that is not a
+new run (issue #5). It is a controller decision, not an operator override:
+the operator supplies the reason, the controller chooses the phase, and it
+chooses from live GitHub, never from the operator's claim of what was fixed.
+
+- **Precondition.** The run must be `BLOCKED` (any other phase is a
+  `StateTransitionError`) and REMOTE; a LOCAL run has no unblock edge. The
+  reason is required, non-empty and bounded (`MAX_UNBLOCK_REASON_CHARS`).
+- **Inspection.** Before GitHub is asked, a persisted replan journal (in
+  flight or `REJECTED`) refuses, because `REVIEW` is `REPLAN_REEXECUTE`'s
+  only entry and the operator path never replays that transaction; an
+  exhausted `workflow.max_total_steps` refuses, naming the setting to raise.
+  Then the recovery inspection of the phase being re-entered runs against
+  GitHub: with no PR bound, the issue must be selectable and the strict
+  marker listing of `ANALYZE_EXECUTE`'s entry must resolve (one adoptable PR
+  or none); with a PR bound, the PR is re-read and its state, HEAD and base
+  are compared with the persisted review binding.
+- **Decision table** (PR bound). `OPEN` at the reviewed HEAD and base with a
+  clean review -> `READY_FOR_MERGE` (the merge gate re-verifies from there);
+  at the reviewed HEAD and base with open findings -> `FIX` with the findings
+  open, unless the next review round is past `workflow.max_review_rounds`,
+  which refuses; any other revision, or no completed review -> `REVIEW`
+  (past the cap: refuse), with the open findings of a moved revision carried
+  as prior findings and the last result marked `stale`, exactly as HEAD drift
+  does. `MERGED` and already counted -> `UPDATE_EPIC`; `MERGED`, not counted,
+  at the clean-reviewed HEAD into the reviewed base -> `READY_FOR_MERGE`, so
+  `resume --allow-merge` reconciles and counts it once; `MERGED` at any
+  other revision, or with no clean review, refuses (the controller will not
+  count a merge no review decided on). `CLOSED` refuses (reopen or
+  reimplement is the operator's decision). A PR that another PR answers
+  for, or that cannot be read conclusively, refuses; a transient GitHub
+  failure propagates and decides nothing.
+- **Refusal.** A refusal leaves the state file byte-identical: the run stays
+  `BLOCKED` with its reason, and only the run log records the attempt
+  (`<run_id>/NNN-blocked-unblock-1/`, with the operator's reason, the block
+  reason and the detail, redacted).
+- **Re-entry.** The chosen phase goes through `validate_transition(BLOCKED,
+  target)` like any other step; the operator edges are declared in
+  `LEGAL_EDGES` (`UNBLOCK_TARGETS`), never coerced. `current_head_sha`,
+  `current_base_ref` and `current_branch` are rebound from the live PR; the
+  review binding (`reviewed_*`) is never rewritten by this path. The action is
+  appended to `unblock_history` (timestamp, reason, cleared block reason,
+  phase, detail) and to the run log, `block_reason` is cleared and `attempt`
+  reset. No agent runs and no step is charged: the operator reviews the
+  outcome and runs `resume`, whose entry probe for that phase runs again.
+- **Dry-run** reads GitHub, reports the phase it would re-enter or the
+  refusal, and writes nothing (no state, no log, no lock).
 
 ---
 

@@ -10,11 +10,11 @@ Read the module docstring before changing a module; this map only says where
 a concern lives so the routing rules can be applied.
 
 ```text
-cli.py              subcommands run / step / resume / status / doctor / local, dry-run flags
+cli.py              subcommands run / step / resume / unblock / status / doctor / local, dry-run flags
 config.py           configuration loading and validation; owns config defaults and keys
 doctor.py           read-only environment checks
 engine.py           ControllerEngine: phase orchestration, verification calls, recovery
-transitions.py      Phase enum, LEGAL_EDGES / LOCAL_LEGAL_EDGES, next_phase
+transitions.py      Phase enum, LEGAL_EDGES / LOCAL_LEGAL_EDGES / UNBLOCK_TARGETS, next_phase
 profiles.py         execution-profile routing (which provider/model/effort per phase/round)
 loop_guard.py       REVIEW/FIX loop bounds and stagnation (pure logic)
 replan.py           replan policy and review-history collection (pure logic)

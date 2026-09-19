@@ -38,6 +38,21 @@ BLOCKED / FAILED are exceptional holding states reachable from any agent
 phase (agent reports blocked/failure, or the controller cannot verify
 GitHub state deterministically); they are outside the happy-path topology.
 
+BLOCKED has *operator* edges out of it (``UNBLOCK_TARGETS``), taken only by
+the explicit ``unblock`` command after the controller has re-inspected live
+GitHub state and chosen the phase to re-enter; no agent result and no
+``resume`` ever leaves BLOCKED on its own::
+
+    BLOCKED          -> ANALYZE_EXECUTE   (no PR bound; the entry adopts or launches)
+    BLOCKED          -> REVIEW            (open PR; no current review of its revision)
+    BLOCKED          -> FIX               (open PR at the reviewed HEAD with open findings)
+    BLOCKED          -> READY_FOR_MERGE   (open or merged PR at the clean-reviewed revision)
+    BLOCKED          -> UPDATE_EPIC       (PR merged and already counted)
+
+``BLOCKED -> REPLAN_REEXECUTE`` is deliberately absent: REVIEW stays that
+transaction's only entry. FAILED and DONE keep no outgoing edge, and the
+LOCAL topology has no unblock edge at all.
+
 All transition logic lives here — never scattered across CLI handlers.
 """
 
@@ -111,9 +126,25 @@ LEGAL_EDGES: dict[Phase, frozenset[Phase]] = {
     Phase.MERGE: frozenset({Phase.ANALYZE_EXECUTE, Phase.UPDATE_EPIC, Phase.DONE, Phase.REVIEW}),
     Phase.UPDATE_EPIC: frozenset({Phase.ANALYZE_EXECUTE, Phase.DONE}),
     Phase.DONE: frozenset(),
-    Phase.BLOCKED: frozenset(),
+    # Operator edges only: see UNBLOCK_TARGETS below and ControllerEngine.unblock.
+    Phase.BLOCKED: frozenset(
+        {
+            Phase.ANALYZE_EXECUTE,
+            Phase.REVIEW,
+            Phase.FIX,
+            Phase.READY_FOR_MERGE,
+            Phase.UPDATE_EPIC,
+        }
+    ),
     Phase.FAILED: frozenset(),
 }
+
+# The phases an explicit `unblock` may re-enter from BLOCKED (REMOTE only).
+# `validate_transition(Phase.BLOCKED, target)` is the check the unblock path
+# goes through, exactly like every other transition; this name exists so the
+# engine, the docs and the tests refer to one decision rather than to a
+# literal set repeated in each. REPLAN_REEXECUTE is never a target.
+UNBLOCK_TARGETS: frozenset[Phase] = LEGAL_EDGES[Phase.BLOCKED]
 
 
 # LOCAL topology: no PR, no merge, no replan, no EPIC. A clean review is the
