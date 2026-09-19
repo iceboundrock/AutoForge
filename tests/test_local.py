@@ -2926,3 +2926,78 @@ def test_local_workspace_refuses_truncated_git_output(tmp_path):
 
     with pytest.raises(VerificationError, match="truncated"):
         LocalWorkspace(root, runner=truncated).root()
+
+
+# -- the documented no-GitHub promise is the controller's, not the run's (#54) -------------------
+def test_the_local_prompt_scopes_enforcement_to_the_git_anchor():
+    """Issue #54: "enforced by the controller" must name only what the anchor check sees.
+
+    The anchor comparison (`ControllerEngine._git_anchor_drift`) reads HEAD and
+    the checked-out branch, so it detects a commit, reset, checkout or branch
+    switch and nothing else. The prompt lists `gh`, Issues, PRs and `git push`
+    in the same prohibition; those never move HEAD, so a sentence claiming the
+    controller "enforces this" directly under that list promises more than the
+    controller delivers (ADR 0001 §2.2, §8.1). Pin the narrowed wording so a
+    later edit cannot re-widen the claim by adjacency.
+    """
+    from autoforge.prompts import load_template
+
+    text = load_template("local_common.md")
+    # Paragraph granularity, with hard wraps flattened so a phrase can be matched
+    # wherever the line break falls.
+    paragraphs = [para.replace("\n", " ") for para in text.split("\n\n")]
+
+    # The paragraph that speaks of enforcement names the anchor items and only those.
+    enforcing = [para for para in paragraphs if "enforced by the controller" in para]
+    assert len(enforcing) == 1, enforcing
+    (enforced,) = enforcing
+    assert enforced.startswith("The items that move HEAD or the checked-out branch are enforced")
+    assert "commit, reset, checkout or branch switch" in enforced
+    for github_item in ("gh", "issue", "pull request", "git push"):
+        assert github_item not in enforced.lower(), (github_item, enforced)
+
+    # The GitHub items are called out as policy the controller cannot check.
+    unchecked = [para for para in paragraphs if "policy the controller cannot check" in para]
+    assert len(unchecked) == 1, unchecked
+    (policy,) = unchecked
+    for unchecked_item in ("`gh`", "Issues", "pull requests", "`git push`", "`git stash`"):
+        assert unchecked_item in policy, (unchecked_item, policy)
+    assert "forbidden all the same" in policy
+
+    # The wording the finding objected to does not come back.
+    assert "The controller enforces this" not in text
+    assert "enforced by the controller, not just asked" not in text
+
+
+def test_the_readme_no_github_promise_is_the_controllers_not_the_runs():
+    """Issue #54: README's LOCAL section must not promise that the *run* never touches GitHub.
+
+    The controller never constructs a `GitHubClient` in LOCAL mode; the agent
+    is a same-UID subprocess with `gh` on `PATH`, and the controller neither
+    prevents nor detects a `gh` write, a push or network access from it. Both
+    README passages that describe the promise have to keep the controller as
+    the subject and say what is detected (a moved git anchor) and what is not.
+    """
+    from pathlib import Path
+
+    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+    flat = readme.replace("\n", " ")
+
+    assert "A local run never touches GitHub" not in flat
+    assert "A local run is GitHub-free by construction" not in flat
+    assert "The *controller* never touches GitHub in a local run" in flat
+    assert "The controller's local run is GitHub-free by construction" in flat
+
+    # What the controller detects, and the explicit statement that it detects nothing else.
+    assert (
+        "the controller can neither prevent nor detect a `gh` write, a `git push` or "
+        "a network request made by the agent"
+    ) in flat
+    assert "a commit, reset, checkout or branch switch blocks the run" in flat
+    assert "It detects nothing else." in flat
+    assert "a `gh` write or a push from the agent is not" in flat
+
+    # The honest answer for real containment points at the ADR and the isolation track.
+    assert "docs/adr/0001-local-mode-workspace-identity-and-filesystem-boundary.md" in flat
+    assert "§2.2" in flat and "§8.1" in flat
+    assert "tracked in #10" in flat
