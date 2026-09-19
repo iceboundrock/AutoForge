@@ -269,6 +269,29 @@ def _unsafe(where: str, what: str) -> UnsafePathError:
     )
 
 
+def _empty_and_refuse(fd: int, where: str, what: str) -> UnsafePathError:
+    """Empty the controller's own temporary through ``fd`` and return the
+    refusal to publish it, for the caller to raise.
+
+    Every temporary is inspected once its bytes are complete, and one that
+    another process has given a name of its own is not published: it is
+    emptied first, so that the other name keeps an empty file and not the
+    controller's bytes, and then refused.  The emptying is a syscall that can
+    fail too, and a failure of it is *this write's* failure -- the bytes
+    still sit behind the foreign name -- reported through the controller's
+    error type with both facts in it, never as a raw ``OSError`` that the
+    CLI's error boundary does not catch.
+    """
+    try:
+        os.ftruncate(fd, 0)
+    except OSError as exc:
+        raise StateError(
+            f"cannot write {where}: it is {what}, and the controller's bytes could not "
+            f"be emptied from that temporary: {exc}"
+        ) from exc
+    return _unsafe(where, what)
+
+
 def split_relpath(relpath: str) -> tuple[str, ...]:
     """Validate ``relpath`` as a root-relative path and return its components.
 
@@ -1028,10 +1051,13 @@ class SafeRoot:
         so ``EEXIST`` on any existing entry (a symbolic link included) is
         surfaced as :class:`FileExistsError` for the caller to interpret.
         """
-        nlink = os.fstat(fd).st_nlink
+        try:
+            nlink = os.fstat(fd).st_nlink
+        except OSError as exc:
+            raise StateError(f"cannot write {where}: {exc}") from exc
         if nlink != 0:
-            os.ftruncate(fd, 0)
-            raise _unsafe(
+            raise _empty_and_refuse(
+                fd,
                 where,
                 f"being written through a temporary that acquired {nlink} directory "
                 "entr(ies) before it was published; another process linked the "
@@ -1054,6 +1080,11 @@ class SafeRoot:
         complete, and the inode is re-inspected between them: it must have
         exactly the one name the controller just gave it.  One that gained
         another is emptied through this descriptor, unlinked and refused.
+
+        Once the name exists, every way out of this method other than
+        returning it unlinks it: the re-inspection failing, the emptying
+        failing, and the refusal itself.  The caller never sees a name it
+        does not receive, so a failure here leaves no ``.af-tmp-*`` behind.
         """
         tmp = _tmp_name()
         try:
@@ -1062,16 +1093,22 @@ class SafeRoot:
             # The random name collided; a fact about the directory, not the
             # target, so it is a plain failure of this write.
             raise StateError(f"cannot write {where}: temporary name {tmp} is taken") from exc
-        nlink = os.fstat(fd).st_nlink
-        if nlink != 1:
-            os.ftruncate(fd, 0)
+        try:
+            nlink = os.fstat(fd).st_nlink
+            if nlink != 1:
+                raise _empty_and_refuse(
+                    fd,
+                    where,
+                    f"being written through a temporary that acquired {nlink - 1} extra "
+                    "directory entr(ies) before it was published; another process linked "
+                    "the controller's temporary file elsewhere",
+                )
+        except OSError as exc:
             _quiet_unlink(parent, tmp)
-            raise _unsafe(
-                where,
-                f"being written through a temporary that acquired {nlink - 1} extra "
-                "directory entr(ies) before it was published; another process linked "
-                "the controller's temporary file elsewhere",
-            )
+            raise StateError(f"cannot write {where}: {exc}") from exc
+        except BaseException:
+            _quiet_unlink(parent, tmp)
+            raise
         return tmp
 
     def _durable_tmp_at(self, parent: int, data: bytes, *, mode: int, where: str) -> str:
@@ -1105,22 +1142,21 @@ class SafeRoot:
                 if nlink > 1:
                     # Our inode, emptied through our descriptor: the second
                     # name keeps an empty file, and nothing is published.
-                    os.ftruncate(fh.fileno(), 0)
-                    _quiet_unlink(parent, tmp)
-                    raise _unsafe(
+                    raise _empty_and_refuse(
+                        fh.fileno(),
                         where,
                         f"being written through a temporary that acquired {nlink - 1} extra "
                         "directory entr(ies) while it was being written; another process "
                         "linked the controller's temporary file elsewhere",
                     )
-        except UnsafePathError:
-            raise
         except OSError as exc:
             # The temporary is never published, so a failed write leaves
             # neither a partial final name nor a stray temporary behind.
             _quiet_unlink(parent, tmp)
             raise StateError(f"cannot write {where}: {exc}") from exc
         except BaseException:
+            # A refusal, a failed emptying, or an interrupt: the name goes
+            # the same way.
             _quiet_unlink(parent, tmp)
             raise
         return tmp

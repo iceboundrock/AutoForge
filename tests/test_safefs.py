@@ -23,7 +23,7 @@ cell, that it is byte-for-byte and inode-for-inode what it was before.
 import errno
 import os
 import stat
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 
 import pytest
@@ -718,6 +718,225 @@ def test_a_temporary_name_linked_out_between_the_link_and_the_rename_is_refused(
     sentinel.assert_untouched()
 
 
+def _fail_next(monkeypatch, name: str, *, err: int) -> Callable[[], None]:
+    """Return an ``arm()`` that makes the next call of ``os.<name>`` from the
+    module under test raise ``OSError(err)`` -- once; every later call is the
+    real one again. The failing syscall is not on the test's own path, so a
+    global patch of ``os`` is precise enough."""
+    import autoforge.safefs as safefs
+
+    real = getattr(os, name)
+    armed = [False]
+
+    def failing_once(*args, **kwargs):
+        if armed[0]:
+            armed[0] = False
+            raise OSError(err, os.strerror(err))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(safefs.os, name, failing_once)
+
+    def arm() -> None:
+        armed[0] = True
+
+    return arm
+
+
+def _assert_not_a_refusal(exc: StateError) -> None:
+    """The write failed for an I/O reason, through the controller's error
+    type: ``StateError``, and not the refusal subclass that would send the
+    operator looking for a planted entry that is not there."""
+    assert type(exc) is StateError, f"raised {type(exc).__name__}: {exc}"
+    assert "cannot write" in str(exc)
+
+
+@pytest.mark.parametrize("op", WHOLE_FILE_WRITES)
+def test_a_failed_inspection_of_the_temporary_is_a_typed_error_that_leaves_nothing(
+    tmp_path, monkeypatch, temporary_path, op
+):
+    """#52 R1-F1: the inspection that decides whether the temporary may be
+    published is a syscall, and a syscall can fail. A failure of it is
+    reported the way every other failure of the write is -- through
+    ``StateError``, not a raw ``OSError`` past the CLI's error boundary --
+    and leaves what every failed write leaves: nothing. No temporary in the
+    directory, no descriptor open, and an existing target exactly what it
+    was. Modelled on both temporaries: the ``fstat`` that follows the data
+    ``fsync`` is the nlink check on each of them."""
+    import autoforge.safefs as safefs
+
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    arm = _fail_next(monkeypatch, "fstat", err=errno.EIO)
+
+    with _during_the_write(monkeypatch, lambda fd: arm()), SafeRoot.open(root_dir) as root:
+        if op == "write_bytes_over":
+            (root_dir / "state.json").write_bytes(b"old\n")
+            old = (root_dir / "state.json").stat()
+        with _descriptors_left_open(monkeypatch) as left, pytest.raises(StateError) as info:
+            _whole_file_write(root, root_dir, op)
+    monkeypatch.setattr(safefs.os, "fstat", os.fstat)
+
+    _assert_not_a_refusal(info.value)
+    assert isinstance(info.value.__cause__, OSError)
+    assert info.value.__cause__.errno == errno.EIO
+    assert left == [], "the failed write leaked a descriptor"
+    if op == "write_bytes_over":
+        assert (root_dir / "state.json").read_bytes() == b"old\n"
+        assert (root_dir / "state.json").stat().st_ino == old.st_ino
+        assert [e.name for e in root_dir.iterdir()] == ["state.json"]
+    else:
+        assert [e.name for e in root_dir.iterdir()] == [], "published or left a temporary"
+
+
+@pytest.mark.usefixtures("unnamed_only")
+def test_a_failed_reinspection_after_the_temporary_is_named_unlinks_the_name(tmp_path, monkeypatch):
+    """The replacement path's second inspection runs *after* the unnamed
+    inode has been given its temporary name. If that ``fstat`` fails, the
+    name has already been created and nobody else knows it: the failure is
+    a typed error and the ``.af-tmp-*`` entry is unlinked before it is
+    raised, so the failed write leaves the directory as it found it."""
+    import autoforge.safefs as safefs
+
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    target = root_dir / "state.json"
+    target.write_bytes(b"old\n")
+    old = target.stat()
+    arm = _fail_next(monkeypatch, "fstat", err=errno.EIO)
+    real_link = os.link
+    named: list[str] = []
+
+    def link_then_arm(src, dst, **kwargs):
+        real_link(src, dst, **kwargs)
+        if isinstance(dst, str) and dst.startswith(".af-tmp-"):
+            named.append(dst)
+            arm()
+
+    monkeypatch.setattr(safefs.os, "link", link_then_arm)
+    with SafeRoot.open(root_dir) as root:
+        with _descriptors_left_open(monkeypatch) as left, pytest.raises(StateError) as info:
+            root.write_bytes("state.json", STATE)
+    monkeypatch.setattr(safefs.os, "link", real_link)
+    monkeypatch.setattr(safefs.os, "fstat", os.fstat)
+
+    assert named, "the test did not reach the named step"
+    _assert_not_a_refusal(info.value)
+    assert left == [], "the failed write leaked a descriptor"
+    assert target.read_bytes() == b"old\n"
+    assert target.stat().st_ino == old.st_ino
+    assert [e.name for e in root_dir.iterdir()] == ["state.json"], "a temporary was left"
+
+
+def _plant_a_name_during_the_write(monkeypatch, outside_fd: int, planted_name: str):
+    """The race both temporaries guard against: a second name for the
+    controller's inode appears before the pre-publish inspection."""
+
+    def name_it(fd):
+        os.link(f"/proc/self/fd/{fd}", planted_name, dst_dir_fd=outside_fd, follow_symlinks=True)
+
+    return _during_the_write(monkeypatch, name_it)
+
+
+@contextmanager
+def _plant_a_name_after_the_link(monkeypatch, outside_fd: int, planted_name: str):
+    """The race the replacement path's named step guards against: a second
+    name for the temporary name, planted between the link and the rename."""
+    import autoforge.safefs as safefs
+
+    real_link = os.link
+
+    def link_then_plant(src, dst, **kwargs):
+        real_link(src, dst, **kwargs)
+        if isinstance(dst, str) and dst.startswith(".af-tmp-"):
+            real_link(dst, planted_name, src_dir_fd=kwargs["dst_dir_fd"], dst_dir_fd=outside_fd)
+
+    monkeypatch.setattr(safefs.os, "link", link_then_plant)
+    try:
+        yield
+    finally:
+        monkeypatch.setattr(safefs.os, "link", real_link)
+
+
+@pytest.mark.parametrize(
+    ("temporary", "op", "race"),
+    [
+        ("unnamed", "create_exclusive", "during the write"),
+        ("unnamed", "write_bytes", "during the write"),
+        ("unnamed", "write_bytes_over", "during the write"),
+        ("unnamed", "write_bytes_over", "after the link"),
+        ("named", "create_exclusive", "during the write"),
+        ("named", "write_bytes_over", "during the write"),
+    ],
+    ids=lambda v: str(v),
+)
+def test_a_refused_temporary_that_cannot_be_emptied_is_a_typed_error_that_leaves_nothing(
+    tmp_path, monkeypatch, temporary, op, race
+):
+    """A temporary found with a name the controller did not give it is
+    emptied through the controller's descriptor and refused. The emptying
+    is a syscall too, and when it fails the write must still fail *the
+    controller's way*: through ``StateError`` carrying both facts (the
+    foreign name, and that the bytes could not be emptied from it), never
+    as a raw ``OSError``; nothing published, an existing target untouched,
+    and -- on the replacement path, where the failure lands after the
+    temporary name was created -- no ``.af-tmp-*`` left behind. The bytes
+    honestly remain behind the planted name: that is what the message
+    says, and what the refusal could not undo."""
+    import autoforge.safefs as safefs
+
+    if temporary == "named":
+        monkeypatch.setattr(safefs, "_O_TMPFILE", 0)
+    elif not _unnamed_temporaries_available(tmp_path):
+        pytest.skip("O_TMPFILE with procfs is not available on this filesystem")
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_fd = os.open(outside, os.O_RDONLY | os.O_DIRECTORY)
+    planted = outside / "stolen-tmp"
+    truncated: list[int] = []
+
+    def refusing_ftruncate(fd, length):
+        truncated.append(fd)
+        raise OSError(errno.EIO, os.strerror(errno.EIO))
+
+    monkeypatch.setattr(safefs.os, "ftruncate", refusing_ftruncate)
+    if race == "during the write":
+        model = _plant_a_name_during_the_write(monkeypatch, outside_fd, "stolen-tmp")
+    else:
+        model = _plant_a_name_after_the_link(monkeypatch, outside_fd, "stolen-tmp")
+    try:
+        with SafeRoot.open(root_dir) as root:
+            if op == "write_bytes_over":
+                (root_dir / "state.json").write_bytes(b"old\n")
+                old = (root_dir / "state.json").stat()
+            with (
+                model,
+                _descriptors_left_open(monkeypatch) as left,
+                pytest.raises(StateError) as info,
+            ):
+                _whole_file_write(root, root_dir, op)
+    finally:
+        os.close(outside_fd)
+    monkeypatch.setattr(safefs.os, "ftruncate", os.ftruncate)
+
+    assert truncated, "the test did not reach the emptying"
+    _assert_not_a_refusal(info.value)
+    assert "linked the controller's temporary" in str(info.value)
+    assert "could not be emptied" in str(info.value)
+    assert isinstance(info.value.__cause__, OSError)
+    assert left == [], "the failed write leaked a descriptor"
+    if op == "write_bytes_over":
+        assert (root_dir / "state.json").read_bytes() == b"old\n"
+        assert (root_dir / "state.json").stat().st_ino == old.st_ino
+        assert [e.name for e in root_dir.iterdir()] == ["state.json"], "a temporary was left"
+    else:
+        assert [e.name for e in root_dir.iterdir()] == [], "published or left a temporary"
+    assert planted.exists(), "the test did not model the race"
+    assert planted.stat().st_nlink == 1, "the controller's name still exists"
+    assert planted.read_bytes() == STATE, "the emptying failed, so the bytes remain"
+
+
 @pytest.mark.parametrize(
     "reason",
     ["no flag", "filesystem refuses", "old kernel", "no procfs", "procfs names another inode"],
@@ -1110,7 +1329,9 @@ def test_an_unwritable_file_is_refused_at_the_open(tmp_path):
 def _descriptors_left_open(monkeypatch) -> Iterator[list[int]]:
     """Yield a list that, once the block has run, holds every descriptor the
     block opened (or duplicated) and never closed -- whether it returned or
-    raised."""
+    raised. A descriptor the block closed some other way than ``os.close``
+    (the named temporary's is closed by its file object) is not a leak, so
+    each candidate is confirmed to still be open before it is reported."""
     real_open, real_dup, real_close = os.open, os.dup, os.close
     opened: list[int] = []
     closed: list[int] = []
@@ -1142,6 +1363,15 @@ def _descriptors_left_open(monkeypatch) -> Iterator[list[int]]:
         left[:] = opened
         for fd in closed:
             left.remove(fd)
+        left[:] = [fd for fd in left if _is_open(fd)]
+
+
+def _is_open(fd: int) -> bool:
+    try:
+        os.fstat(fd)
+    except OSError:
+        return False
+    return True
 
 
 def test_open_append_releases_the_descriptor_when_the_directory_fsync_fails(tmp_path, monkeypatch):
