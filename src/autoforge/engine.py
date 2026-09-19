@@ -416,8 +416,11 @@ class UnblockDecision:
     ``target`` is the phase to re-enter, or ``None`` when the controller
     still cannot determine a safe one (the run stays BLOCKED). ``detail``
     says why, in either case. ``pr`` is the live PR when one is bound, and
-    ``carry_findings`` marks a REVIEW target whose open findings become the
-    findings that review is told to re-check (the revision moved).
+    ``carry_findings`` marks a REVIEW target that the persisted review
+    evidence does not describe (the revision moved, or no review of this
+    PR at this revision is bound): the last result is marked stale and the
+    open findings, if any, become the findings that review is told to
+    re-check.
     """
 
     target: Phase | None
@@ -2500,8 +2503,9 @@ class ControllerEngine:
         phases in :data:`transitions.UNBLOCK_TARGETS` and to nothing else --
         or refuses and leaves the run BLOCKED, state untouched, when it still
         cannot tell a safe phase from a guess (a closed PR, two candidate
-        PRs, a merge no review decided on, a replan journal, an exhausted
-        bound). A refusal names what the operator must change.
+        PRs, a review bound to another PR, a merge no review decided on, a
+        replan journal, an exhausted bound). A refusal names what the
+        operator must change.
 
         Every applied unblock is recorded in ``state.unblock_history`` and in
         the run log; a refusal only in the run log. The step budget is not
@@ -2570,16 +2574,23 @@ class ControllerEngine:
             if pr.head_ref:
                 state.current_branch = pr.head_ref
         carried = ""
-        if decision.carry_findings and state.open_findings:
-            # Same rule as a HEAD that moved under a review: the findings
-            # are not dropped, they are handed to the next round to re-check.
+        if decision.carry_findings:
+            # Same rule as a HEAD that moved under a review
+            # (:meth:`_revision_drift_to_review`): the persisted review
+            # evidence describes a revision that is no longer the PR, so its
+            # result is stale whatever it was -- a clean verdict included,
+            # which must not stay recorded as current while the actual
+            # revision is reviewed. Its findings are not dropped but handed
+            # to that round to re-check, and they *replace* an earlier
+            # carry, an empty list included (a stale clean round leaves none).
             state.last_review_result = RESULT_STALE
             state.prior_findings = state.open_findings
             state.open_findings = []
-            carried = (
-                f"; the {len(state.prior_findings)} open finding(s) of round "
-                f"{state.review_round} are carried to that review to re-check"
-            )
+            if state.prior_findings:
+                carried = (
+                    f"; the {len(state.prior_findings)} open finding(s) of round "
+                    f"{state.review_round} are carried to that review to re-check"
+                )
         state.unblock_history.append(
             {
                 "at": utcnow_iso(),
@@ -2667,6 +2678,18 @@ class ControllerEngine:
             issue = self._verify_issue_selectable(state.current_issue_url, switching=False)
         except VerificationError as exc:
             return UnblockDecision(None, f"the issue cannot be worked on: {exc}")
+        except GitHubUnavailableError:
+            raise
+        except GitHubError as exc:
+            # The same classification as the bound-PR path: a conclusive
+            # failure (authentication, permissions, malformed data) is a
+            # decision -- the entry probe is known to fail -- so it is a
+            # logged refusal, not an error that escapes the audit record.
+            return UnblockDecision(
+                None,
+                f"issue {state.current_issue_url} cannot be verified: {exc}. This is not a "
+                "transient GitHub failure, so re-checking would not help; fix the cause first",
+            )
         pr, problem = self._implementation_pr_candidate()
         if problem:
             return UnblockDecision(None, problem)
@@ -2706,9 +2729,22 @@ class ControllerEngine:
                 None, f"GitHub answered {url} with PR {canonical}, which is another PR"
             )
         reviewed = (state.reviewed_head_sha or "").lower()
-        review_is_this_pr = bool(state.reviewed_pr_url) and parse_pr_url(
-            state.reviewed_pr_url
-        ).same_target(ref)
+        review_is_this_pr = bool(state.reviewed_pr_url)
+        if review_is_this_pr and not parse_pr_url(state.reviewed_pr_url).same_target(ref):
+            # The review binding is a decision about one PR. Read against
+            # another PR it is neither a clean verdict to merge on nor
+            # findings to carry into that PR's review: review evidence never
+            # crosses a PR identity boundary, so this is not knowable-safe
+            # and is refused before the live state is even considered (the
+            # merge gate refuses the same state, from state alone).
+            return UnblockDecision(
+                None,
+                f"the review bound in state is of PR {state.reviewed_pr_url}, not of the "
+                f"current PR {canonical}; the controller will not re-enter a phase on "
+                "review evidence of another PR. Inspect the state file and both PRs "
+                "manually; this run cannot continue automatically",
+                pr=pr,
+            )
         at_reviewed_revision = (
             review_is_this_pr
             and bool(reviewed)

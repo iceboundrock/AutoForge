@@ -196,6 +196,41 @@ def test_unblock_without_a_pr_refuses_a_listing_that_may_be_truncated(tmp_state_
     _assert_untouched(eng, raw)
 
 
+def test_unblock_without_a_pr_refuses_when_the_issue_cannot_be_read_conclusively(
+    tmp_state_dir, fake_github
+):
+    """A conclusive GitHub failure of the issue read (R1-F3 of PR #101) is a
+    decision -- the ANALYZE_EXECUTE entry probe is known to fail -- so it is
+    a logged refusal with the audit record, as in the bound-PR path, not an
+    error that escapes before the record is written."""
+    fake_github.get_issue_error = GitHubError("HTTP 403: forbidden")
+    eng = _blocked(tmp_state_dir, fake_github, reason="agent reported blocked")
+    raw = eng.paths.state_file.read_text()
+    out = eng.unblock(REASON)
+    assert not out.unblocked and out.phase == "BLOCKED"
+    assert out.message.startswith("stays BLOCKED: ")
+    assert "cannot be verified" in out.message and "403" in out.message
+    assert "not a transient GitHub failure" in out.message
+    _assert_untouched(eng, raw)
+    (record,) = _unblock_records(eng)
+    assert record["metadata"]["applied"] is False and record["metadata"]["target_phase"] == ""
+    assert record["metadata"]["operator_reason"] == REASON
+    assert (eng.paths.logs_dir / eng.state.run_id / "001-blocked-unblock-1" / "error.txt").exists()
+    assert ("list_open_prs", "owner/repo", True) not in fake_github.calls
+
+
+def test_unblock_without_a_pr_propagates_a_transient_issue_read_failure(tmp_state_dir, fake_github):
+    """A read that may succeed next time decides nothing: no refusal, no
+    record, no state write -- the same rule as the bound-PR path."""
+    fake_github.get_issue_error = GitHubUnavailableError("HTTP 502: bad gateway")
+    eng = _blocked(tmp_state_dir, fake_github)
+    raw = eng.paths.state_file.read_text()
+    with pytest.raises(GitHubUnavailableError):
+        eng.unblock(REASON)
+    _assert_untouched(eng, raw)
+    assert _unblock_records(eng) == []
+
+
 def test_unblock_without_a_pr_refuses_a_closed_issue(tmp_state_dir, fake_github):
     fake_github.add_issue(ISSUE, state="CLOSED")
     eng = _blocked(tmp_state_dir, fake_github)
@@ -295,13 +330,95 @@ def test_unblock_open_pr_whose_head_moved_reenters_review_and_carries_findings(
 
 
 def test_unblock_open_pr_whose_base_changed_reenters_review(tmp_state_dir, fake_github):
+    """The clean review was of the PR against 'main'; retargeted, it is
+    stale like any other drift (R1-F1 of PR #101): a clean verdict must not
+    stay recorded as current while the actual revision is reviewed."""
     fake_github.add_pr(head_sha=SHA_A, base_ref="release/1.x")
     eng = _blocked(tmp_state_dir, fake_github, pr_url=PR, **_reviewed())
     out = eng.unblock(REASON)
     assert out.unblocked and out.phase == "REVIEW" and "'release/1.x'" in out.message
+    assert "carried to that review" not in out.message
     s = load_state(eng.paths.state_file)
-    assert s.current_base_ref == "release/1.x" and s.last_review_result == "clean"
-    assert s.prior_findings == []  # a clean review has nothing to carry
+    assert s.current_base_ref == "release/1.x" and s.last_review_result == "stale"
+    assert s.prior_findings == [] and s.open_findings == []  # a clean review carries nothing
+
+
+def test_unblock_stale_clean_review_replaces_an_earlier_carry(tmp_state_dir, fake_github):
+    """A clean round of the actual revision would have cleared the earlier
+    carry; a clean round that went stale replaces it with nothing. The
+    carry is replaced, never accumulated, exactly as HEAD drift does."""
+    earlier = {"id": "R1-F1", "classification": "bug", "required_resolution": "older"}
+    fake_github.add_pr(head_sha=SHA_B)
+    eng = _blocked(
+        tmp_state_dir, fake_github, pr_url=PR, **_reviewed(head=SHA_A), prior_findings=[earlier]
+    )
+    out = eng.unblock(REASON)
+    assert out.unblocked and out.phase == "REVIEW" and "revision moved" in out.message
+    assert "carried to that review" not in out.message
+    s = load_state(eng.paths.state_file)
+    assert s.last_review_result == "stale"
+    assert s.prior_findings == [] and s.open_findings == []
+    assert s.reviewed_head_sha == SHA_A and s.reviewed_pr_url == PR
+
+
+def test_unblock_head_drift_with_findings_replaces_an_earlier_carry(tmp_state_dir, fake_github):
+    earlier = {"id": "R1-F1", "classification": "bug", "required_resolution": "older"}
+    fake_github.add_pr(head_sha=SHA_B)
+    eng = _blocked(
+        tmp_state_dir,
+        fake_github,
+        pr_url=PR,
+        **_reviewed(head=SHA_A, result="needs_fix", findings=[FINDING]),
+        prior_findings=[earlier],
+    )
+    out = eng.unblock(REASON)
+    assert out.unblocked and "1 open finding(s) of round 2 are carried" in out.message
+    s = load_state(eng.paths.state_file)
+    assert s.last_review_result == "stale"
+    assert s.prior_findings == [FINDING] and s.open_findings == []
+
+
+@pytest.mark.parametrize(
+    "live_state, live_head",
+    [("OPEN", SHA_A), ("OPEN", SHA_B), ("MERGED", SHA_A)],
+)
+def test_unblock_refuses_a_review_bound_to_another_pr(
+    tmp_state_dir, fake_github, live_state, live_head
+):
+    """The review binding names PR 43 but the run is on PR 42 (R1-F2 of PR
+    #101). Whatever PR 42's live state, the persisted verdict and findings
+    are about another PR: they are neither a clean review to merge on nor
+    findings to carry into PR 42's review. Refused, state untouched."""
+    fake_github.add_pr(head_sha=live_head, state=live_state)
+    fields = _reviewed(head=SHA_A, result="needs_fix", findings=[FINDING]) | {
+        "reviewed_pr_url": PR_B
+    }
+    eng = _blocked(tmp_state_dir, fake_github, pr_url=PR, **fields)
+    raw = eng.paths.state_file.read_text()
+    out = eng.unblock(REASON)
+    assert not out.unblocked and out.phase == "BLOCKED"
+    assert "review bound in state is of PR " + PR_B in out.message
+    assert "not of the current PR " + PR in out.message
+    assert "another PR" in out.message
+    _assert_untouched(eng, raw)
+    s = load_state(eng.paths.state_file)
+    assert s.open_findings == [FINDING] and s.prior_findings == []
+    assert s.last_review_result == "needs_fix" and s.reviewed_pr_url == PR_B
+    (record,) = _unblock_records(eng)
+    assert record["metadata"]["applied"] is False and record["metadata"]["target_phase"] == ""
+
+
+def test_unblock_refuses_a_clean_review_of_another_pr_at_the_same_head(tmp_state_dir, fake_github):
+    """Same branch, same HEAD, proposed as another PR: the clean review is
+    bound to PR 43 and is not moved to PR 42 (the merge gate refuses the
+    same state). Not READY_FOR_MERGE and not REVIEW either."""
+    fake_github.add_pr(head_sha=SHA_A)
+    fields = _reviewed() | {"reviewed_pr_url": PR_B}
+    eng = _blocked(tmp_state_dir, fake_github, pr_url=PR, **fields)
+    raw = eng.paths.state_file.read_text()
+    out = eng.unblock(REASON)
+    assert not out.unblocked and "review bound in state is of PR " + PR_B in out.message
+    _assert_untouched(eng, raw)
 
 
 def test_unblock_open_pr_without_a_review_reenters_review(tmp_state_dir, fake_github):

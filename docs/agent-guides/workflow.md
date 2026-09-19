@@ -336,15 +336,24 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   Then the recovery inspection of the phase being re-entered runs against
   GitHub: with no PR bound, the issue must be selectable and the strict
   marker listing of `ANALYZE_EXECUTE`'s entry must resolve (one adoptable PR
-  or none); with a PR bound, the PR is re-read and its state, HEAD and base
-  are compared with the persisted review binding.
+  or none), and a conclusive GitHub failure of either read refuses exactly
+  as it does with a PR bound; with a PR bound, the PR is re-read and its
+  state, HEAD and base are compared with the persisted review binding.
+- **Identity first.** A review binding (`reviewed_pr_url`) that names a PR
+  other than `current_pr_url` refuses before the live PR state is even
+  considered, as the merge gate does from state alone: review evidence is
+  a decision about one PR and is neither a verdict to merge on nor findings
+  to carry into another PR's review. An empty binding is "no completed
+  review" and decides as below.
 - **Decision table** (PR bound). `OPEN` at the reviewed HEAD and base with a
   clean review -> `READY_FOR_MERGE` (the merge gate re-verifies from there);
   at the reviewed HEAD and base with open findings -> `FIX` with the findings
   open, unless the next review round is past `workflow.max_review_rounds`,
   which refuses; any other revision, or no completed review -> `REVIEW`
-  (past the cap: refuse), with the open findings of a moved revision carried
-  as prior findings and the last result marked `stale`, exactly as HEAD drift
+  (past the cap: refuse), where the persisted review evidence does not
+  describe the revision that round will bind: the last result is marked
+  `stale` whatever it was (a clean verdict included), and the open findings
+  replace `prior_findings` (an empty list included) exactly as HEAD drift
   does. `MERGED` and already counted -> `UPDATE_EPIC`; `MERGED`, not counted,
   at the clean-reviewed HEAD into the reviewed base -> `READY_FOR_MERGE`, so
   `resume --allow-merge` reconciles and counts it once; `MERGED` at any
