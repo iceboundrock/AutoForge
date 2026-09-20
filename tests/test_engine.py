@@ -1372,6 +1372,88 @@ def test_fix_entry_with_head_past_the_reviewed_one_goes_to_review_without_a_fixe
     assert load_state(eng2.paths.state_file).prior_findings == []
 
 
+def test_fix_entry_with_the_pr_retargeted_goes_to_review_without_a_fixer(tmp_state_dir):
+    """#95: the findings are bound to the base as well as the HEAD. A PR
+    retargeted to another base since the review (same commits) proposes a
+    diff the findings were not raised on, so the FIX entry treats it exactly
+    like a HEAD past the reviewed one: the review is stale, the actual
+    revision is reviewed, no fixer is launched, and the findings are carried
+    to that review to re-check rather than dropped."""
+    gh = FakeGitHub()
+    gh.add_comment(PR, 101, review_comment_body(2, SHA_A, False, base_ref="release/1.x"))
+
+    def round_two_sees_the_carry(req):
+        assert "- R1-F1 [nit] src/x.py:1 — typo" in req.prompt
+        return block(review_payload(2, SHA_A, [], cid=101))
+
+    eng = _in_fix(tmp_state_dir, gh, round_two_sees_the_carry)
+    eng.state.reviewed_base_ref = "main"
+    eng.state.current_base_ref = "main"
+    eng.state.last_fix_resolutions = [{"finding_id": "R0-F1", "resolution": "fixed"}]
+    gh.prs[PR].base_ref = "release/1.x"
+    out = eng.step()
+    assert out.next_phase == "REVIEW" and eng.provider.calls == []
+    assert "base changed to 'release/1.x' from the reviewed base 'main'" in out.message
+    assert "no fixer launched" in out.message
+    assert "the 1 finding(s) of round 1 are carried to that review to re-check" in out.message
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.REVIEW and s.review_round == 1
+    assert s.current_base_ref == "release/1.x" and s.reviewed_base_ref == "main"
+    assert s.current_head_sha == SHA_A and s.reviewed_head_sha == SHA_A
+    assert s.open_findings == [] and s.last_fix_resolutions == []
+    assert s.prior_findings == [_finding(1)]
+    assert s.last_review_result == "stale" and s.attempt == 0
+    eng.close()
+
+    # The next review binds the new base; a clean round on it proceeds.
+    eng2 = make_engine(tmp_state_dir, round_two_sees_the_carry, github=gh)
+    eng2.load()
+    assert eng2.step().next_phase == "READY_FOR_MERGE"
+    assert len(eng2.provider.calls) == 1
+    s = load_state(eng2.paths.state_file)
+    assert s.reviewed_base_ref == "release/1.x" and s.prior_findings == []
+
+
+def test_fix_entry_without_a_reviewed_base_still_launches_the_fixer(tmp_state_dir):
+    """#95: a protocol-2 state file loaded in FIX has an empty
+    `reviewed_base_ref` (written before the base was bound). There is no
+    base to compare, so the fixer is launched whatever the PR's base is;
+    the next completed review writes the binding."""
+    gh = FakeGitHub()
+
+    def on_call(req):
+        gh.set_head(SHA_B)
+        return block(fix_payload(SHA_A, SHA_B, [{"finding_id": "R1-F1", "resolution": "fixed"}]))
+
+    eng = _in_fix(tmp_state_dir, gh, on_call)
+    assert eng.state.reviewed_base_ref == ""
+    gh.prs[PR].base_ref = "release/1.x"
+    out = eng.step()
+    assert out.next_phase == "REVIEW" and len(eng.provider.calls) == 1
+    s = load_state(eng.paths.state_file)
+    assert s.current_head_sha == SHA_B and s.open_findings == []
+    assert s.last_fix_resolutions[0]["resolution"] == "fixed"
+    assert s.reviewed_base_ref == ""
+
+
+def test_fix_entry_with_an_unreadable_base_is_a_verification_failure(tmp_state_dir):
+    """#95: a PR whose base GitHub does not report is not a retargeted PR;
+    it is a read the controller cannot decide on, refused the same way the
+    review and merge entries refuse it, with the fixer not launched and the
+    findings kept open."""
+    gh = FakeGitHub()
+    eng = _in_fix(tmp_state_dir, gh, ["never"])
+    eng.state.reviewed_base_ref = "main"
+    eng.state.current_base_ref = "main"
+    gh.prs[PR].base_ref = ""
+    with pytest.raises(VerificationError, match="no readable base branch.*bound to base 'main'"):
+        eng.step()
+    assert eng.provider.calls == []
+    s = eng.state
+    assert s.phase == Phase.FIX and [f["id"] for f in s.open_findings] == ["R1-F1"]
+    assert s.last_review_result != "stale" and s.current_base_ref == "main"
+
+
 def test_fix_entry_binds_the_unchanged_head_and_launches_the_fixer(tmp_state_dir):
     """HEAD still equals the reviewed HEAD at FIX entry: the fixer runs."""
     gh = FakeGitHub()

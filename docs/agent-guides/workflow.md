@@ -128,7 +128,7 @@ workflow:
   touching anything `REPLAN_REEXECUTE` does after the policy has decided.
 - The step budget is measured on the persisted cumulative `step_count`, which is never reset by `resume` or by switching issues. CLI `--max-steps` bounds a single invocation only. It is checked before a step executes, with one exception: a `REPLAN_REEXECUTE` journal past the destructive write (`SUPERSEDE_INTENT`, `COMPENSATING`, `SUPERSEDED`) is finished first. There the persisted intent is a decision the controller has committed to, the remaining work is read-verify-activate or read-verify-reopen, no agent is invoked and nothing is closed from a resume; blocking with the plain budget text would leave a source PR the controller closed with nothing in the run's state saying so, and `resume` refuses `BLOCKED`, so raising the budget could not repair it. The finishing step still counts, so the budget ends the run at the next phase boundary. Stages before the write (`PENDING`, `PREPARED`, `VERIFIED`) block as any other phase does: nothing was closed, so blocking costs nothing and the step does not count. A journal the reducer will refuse anyway (`REJECTED`, or one that cannot be read whole and so cannot prove it is before the write) is handed to the reducer too, whose refusal names the transaction and the source PR's fate. The partition is `replan_txn.budget_may_stop`; dry-run plan notes describe the same outcome. A step is charged when it first persists: the launch checkpoint of an agent step, or the resolution of a step that needs no agent. An entry read that fails transiently (`GitHubUnavailableError`) before either persists nothing -- the count, the phase and any journal are byte-identical on disk -- so it is not a step and is not charged, in every phase alike; the operator's next `resume` re-reads with the same budget. The exemption inherits this rule: a GitHub outage while finishing a post-write journal defers the finish to the next `resume` and never repeats or extends it (no agent, no write), and the finish is counted once when it lands.
 - Failed invocations consume neither a review round nor a `review_history` entry.
-- A `FIX` entry that finds the PR HEAD past the reviewed HEAD goes back to `REVIEW` without launching the fixer (see **Re-entering a phase** below). That review of the actual HEAD is an ordinary round: it counts against the cap, and if it reports the same findings as the previous round it counts towards stagnation like any other repeated round. This is intended: the loop guard measures whether the PR is converging, and an unrecorded push that resolved nothing is not progress.
+- A `FIX` entry that finds the PR HEAD past the reviewed HEAD, or the PR retargeted to another base, goes back to `REVIEW` without launching the fixer (see **Re-entering a phase** below). That review of the actual revision is an ordinary round: it counts against the cap, and if it reports the same findings as the previous round it counts towards stagnation like any other repeated round. This is intended: the loop guard measures whether the PR is converging, and an unrecorded push that resolved nothing is not progress.
 - A stale round (the HEAD or base moved while the reviewer worked) is a completed round too: it is consumed, recorded in `review_history` and breaks the stagnation streak, but its findings are not discarded (see **Stale rounds keep their findings** below). Consuming the round is what keeps the cap in force however often the revision moves; a round that was not consumed could be repeated without bound by pushes alone.
 - Hitting any bound is `BLOCKED` (terminal). The open findings and the PR stay for a human; nothing is merged.
 
@@ -204,19 +204,25 @@ comment unreadable.
 Never merge code that has changed since the latest clean review.
 
 The same rule covers a review with findings. The open findings are bound to
-`reviewed_head_sha`; a PR HEAD past it that the controller did not verify
-(an unrecorded fix, an operator push) makes those findings findings of a
-commit that is no longer the PR. Which of them the push resolved is not
-knowable from controller state and is never inferred, so `FIX` is entered
-only while `current_pr_head_sha == reviewed_head_sha`; otherwise the review
-is marked stale and the actual HEAD is reviewed (`FIX -> REVIEW`), with the
-findings carried to it as prior findings to re-check.
+`reviewed_head_sha` and `reviewed_base_ref`; a PR HEAD past it that the
+controller did not verify (an unrecorded fix, an operator push) makes those
+findings findings of a commit that is no longer the PR, and a PR retargeted
+to another base makes them findings of a diff the PR no longer proposes.
+Which of them the push resolved is not knowable from controller state and
+is never inferred, so `FIX` is entered only while
+`current_pr_head_sha == reviewed_head_sha` and
+`current_pr_base_ref == reviewed_base_ref` (the base is compared only when
+`reviewed_base_ref` is set; a protocol-2 file loaded in `FIX` has none and
+the next review writes it); otherwise the review is marked stale and the
+actual revision is reviewed (`FIX -> REVIEW`), with the findings carried to
+it as prior findings to re-check (#95).
 
 ### Stale rounds keep their findings
 
 A round goes stale in two places: the post-review read finds the HEAD or
 base moved while the reviewer worked (`REVIEW -> REVIEW`), or the `FIX`
-entry finds the HEAD past the reviewed one (`FIX -> REVIEW`). In both, a
+entry finds the HEAD past the reviewed one or the PR retargeted to another
+base (`FIX -> REVIEW`). In both, a
 verified review reported findings that no fixer ever resolved, and the
 controller cannot tell which of them the newer commits resolved. Dropping
 them would let the next reviewer, a different profile with no memory of
@@ -301,12 +307,14 @@ next entry could not find again.
   (strictly; a listing that cannot be proven complete blocks) and hands
   them to the reviewer (`EXISTING_FOLLOW_UP_ISSUES`), so a problem an
   earlier round deferred is not raised again under this round's ids.
-- `FIX` re-reads the PR HEAD. Past the reviewed HEAD: `FIX -> REVIEW` of the
-  actual HEAD, no fixer launched (the rule above), the open findings carried
-  to that review as prior findings to re-check; a fixer whose push landed
-  but whose result was never recorded is therefore never relaunched against
-  findings its push may have resolved, and the findings its push did not
-  resolve are not lost either. Equal to it: the repository's open
+- `FIX` re-reads the PR HEAD and base. Past the reviewed HEAD, or
+  retargeted to another base (compared only when `reviewed_base_ref` is
+  set): `FIX -> REVIEW` of the actual revision, no fixer launched (the rule
+  above), the open findings carried to that review as prior findings to
+  re-check; a fixer whose push landed but whose result was never recorded
+  is therefore never relaunched against findings its push may have
+  resolved, and the findings its push did not resolve are not lost either.
+  Equal to both: the repository's open
   issues are listed for the `ai-follow-up` marker of (this PR, an open
   finding), because a `follow_up_created` resolution creates an issue and
   moves no HEAD. One per finding is handed to the fixer (`FOLLOW_UP_ISSUES`)
