@@ -5123,6 +5123,27 @@ class ControllerEngine:
             return self._reject_replan(txn, reason)
         return None
 
+    def _source_merge_base(self, pr: PRInfo) -> tuple[str, str]:
+        """The source PR's merge base as GitHub reports it now, or why it could not be read.
+
+        The merge base is not a fact of the PR object: it is a second read,
+        for the PR's base and HEAD as just read (#96). ``("", "")`` when the
+        PR has no readable base or HEAD, because there is no pair to ask
+        about and the source verifier refuses the missing half first with
+        the better message. A conclusive read failure is returned as text
+        for the caller to classify at its stage -- a refusal before the
+        close, a compensated drift after it, a terminal block at activation
+        -- and a transient one propagates, so the stage stays resumable.
+        """
+        if not pr.base_ref or not pr.head_sha:
+            return "", ""
+        try:
+            return self._merge_base_of(pr), ""
+        except GitHubUnavailableError:
+            raise
+        except GitHubError as exc:
+            return "", str(exc)
+
     def _prepare_replan(self, txn: ReplanTransaction) -> StepOutcome | None:
         """Checkpoint every fact the replan decision rests on, before invoking.
 
@@ -5213,7 +5234,15 @@ class ControllerEngine:
                 f"pull-request listing of {state.repository}; the source moved between reads "
                 "and cannot be checkpointed",
             )
-        drift = verify_decision_point(source, txn)
+        # The merge base is the last part of the diff the decision was made
+        # on (#96): read for the base and HEAD just read, checkpointed with
+        # them, and enforced by every later source comparison. An unreadable
+        # one is refused like an unreadable HEAD: a checkpoint that cannot
+        # prove which diff it holds must not be written.
+        merge_base, unread = self._source_merge_base(source)
+        if unread:
+            return self._reject_replan(txn, f"cannot checkpoint the replan source: {unread}")
+        drift = verify_decision_point(source, txn, merge_base)
         if drift:
             return self._reject_replan(txn, drift)
         try:
@@ -5245,6 +5274,7 @@ class ControllerEngine:
         txn.source_branch = state.current_branch or source.head_ref
         txn.source_head_sha = source.head_sha
         txn.source_base_ref = source.base_ref
+        txn.source_merge_base_sha = merge_base
         txn.source_review_round = state.review_round
         txn.base_branch = repo.default_branch
         txn.evidence_finding_count = history.recorded_finding_count
@@ -5477,7 +5507,14 @@ class ControllerEngine:
         drift = self._target_drift(target, open_prs, txn)
         if drift:
             return self._reject_replan(txn, drift, txn.replacement_pr_url)
-        drift = verify_source_checkpoint(source, txn)
+        merge_base, unread = self._source_merge_base(source)
+        if unread:
+            return self._reject_replan(
+                txn,
+                f"the merge base of source PR {txn.source_pr_url} could not be read "
+                f"({unread}), so the checkpoint cannot be confirmed before the close",
+            )
+        drift = verify_source_checkpoint(source, txn, merge_base)
         if drift:
             return self._reject_replan(txn, drift)
         txn.stage = ReplanStage.SUPERSEDE_INTENT
@@ -5572,6 +5609,7 @@ class ControllerEngine:
             return self._reject_replan(txn, unowned)
         try:
             source = self.github.get_pr(txn.source_pr_url)
+            merge_base, unread = self._source_merge_base(source)
         except GitHubUnavailableError:
             raise
         except GitHubError as exc:
@@ -5580,7 +5618,12 @@ class ControllerEngine:
                 f"({exc}), so the close cannot be confirmed against its checkpoint"
             )
         else:
-            drift = verify_closed_source(source, txn)
+            drift = (
+                f"the merge base of source PR {txn.source_pr_url} could not be re-read after "
+                f"the close ({unread}), so the close cannot be confirmed against its checkpoint"
+                if unread
+                else verify_closed_source(source, txn, merge_base)
+            )
         if not drift:
             try:
                 target = self.github.get_pr(txn.replacement_pr_url)
@@ -5733,18 +5776,26 @@ class ControllerEngine:
         state = self._require_state()
         try:
             source = self.github.get_pr(txn.source_pr_url)
+            merge_base, unread = self._source_merge_base(source)
             target = self.github.get_pr(txn.replacement_pr_url)
             open_prs = self.github.list_open_prs(state.repository)
         except GitHubUnavailableError:
             raise  # unknown, not refused: `resume` re-reads and re-verifies
         except GitHubError as exc:
+            unread = str(exc)
+        if unread:
+            # The merge base is read beside the PRs and a conclusive failure
+            # of that read is the same refusal as one of theirs: a checkpoint
+            # that cannot be re-derived is not confirmed.
             return self._reject_replan(
                 txn,
                 f"the source PR was closed, but the replan checkpoints could not be re-read "
-                f"before activating the replacement ({exc})",
+                f"before activating the replacement ({unread})",
                 txn.replacement_pr_url,
             )
-        drift = verify_closed_source(source, txn) or self._target_drift(target, open_prs, txn)
+        drift = verify_closed_source(source, txn, merge_base) or self._target_drift(
+            target, open_prs, txn
+        )
         if drift:
             return self._reject_replan(
                 txn,
@@ -5779,6 +5830,7 @@ class ControllerEngine:
                     "branch": txn.source_branch,
                     "head_sha": txn.source_head_sha,
                     "base_ref": txn.source_base_ref,
+                    "merge_base_sha": txn.source_merge_base_sha,
                     "review_round": txn.source_review_round,
                     "replacement_pr_url": txn.replacement_pr_url,
                     "reason": txn.escalation.get("trigger", "replan"),
@@ -6360,11 +6412,12 @@ class ControllerEngine:
                         "intervention is required"
                     )
                 # Only the decision is recorded here, together with the issue,
-                # the PR, the revision it was made on and the base that
-                # revision was reviewed against (bound at REVIEW entry and
-                # verified non-empty above). The checkpoint and the
-                # transaction id are created by `_prepare_replan`, inside the
-                # REPLAN_REEXECUTE step that owns them.
+                # the PR, the revision it was made on, the base that revision
+                # was reviewed against and the merge base the reviewed diff
+                # was computed from (all bound at REVIEW entry and verified
+                # non-empty above). The checkpoint and the transaction id are
+                # created by `_prepare_replan`, inside the REPLAN_REEXECUTE
+                # step that owns them.
                 state.replan_transaction = ReplanTransaction(
                     stage=ReplanStage.PENDING,
                     issue_url=decision_issue,
@@ -6372,6 +6425,7 @@ class ControllerEngine:
                     decision_head_sha=expected_head,
                     decision_branch=state.current_branch,
                     decision_base_ref=expected_base,
+                    decision_merge_base_sha=expected_merge_base,
                     escalation=decision.metadata or {"trigger": decision.reason},
                 ).to_dict()
                 return Phase.REPLAN_REEXECUTE, (

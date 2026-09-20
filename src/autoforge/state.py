@@ -176,10 +176,10 @@ def _validate_local_pending(state: AutoForgeState) -> None:
 
 # Protocol labels an older controller wrote that this one can still read,
 # each subject to the boundary rules its successors introduced (see
-# :meth:`AutoForgeState.from_dict`). Protocols 1 and 2 predate the current
-# replan journal; protocol 3 has the journal but not the review's merge
-# base.
-_LEGACY_PROTOCOLS = LEGACY_JOURNAL_PROTOCOLS | {"3"}
+# :meth:`AutoForgeState.from_dict`). Every step so far changed the replan
+# journal, so the set is the journal's; protocols 2 and 3 also changed the
+# review binding (``_REVIEW_BINDING_GAPS``).
+_LEGACY_PROTOCOLS = LEGACY_JOURNAL_PROTOCOLS
 # The phases in which the persisted clean review is consumed by the merge
 # gate, and so the phases a state without the review's full binding cannot
 # be loaded in.
@@ -193,7 +193,8 @@ _REVIEW_BINDING_GAPS = {
     "3": "which merge base that review's diff was computed from",
 }
 # A persisted commit id is a full lower-case SHA or empty (nothing bound).
-_SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
+# Matched with ``fullmatch``: ``$`` alone would accept a trailing newline.
+_SHA40_RE = re.compile(r"[0-9a-f]{40}")
 
 
 def _legacy_review_binding_refusal(
@@ -474,14 +475,6 @@ class AutoForgeState:
         #   the base branch it was bound to, and the merge gate requires
         #   both; the replan journal records the base its decision was bound
         #   to and the base it checkpointed, and the supersede requires both.
-        # - 3 -> 4: the completed review records the merge base its diff was
-        #   computed from, and the merge gate requires it (#96). The replan
-        #   journal is unchanged, so a protocol-3 file is never handed to
-        #   the journal's legacy check. A protocol-3 file parked in
-        #   READY_FOR_MERGE or MERGE is refused exactly as a protocol-2 one
-        #   is, for the merge base instead of the PR and base; in any other
-        #   phase the next review writes the binding and the file is loaded
-        #   as is.
         #   A protocol-2 file with a replan in flight is refused exactly as a
         #   protocol-1 one is, for the base instead of the PR and issue. A
         #   protocol-2 file parked in READY_FOR_MERGE or MERGE holds a clean
@@ -490,6 +483,18 @@ class AutoForgeState:
         #   -- so it is refused with the PR and HEAD named
         #   (:func:`_legacy_review_binding_refusal`). In any other phase the
         #   next review writes the binding, and the file is loaded as is.
+        # - 3 -> 4: the completed review records the merge base its diff was
+        #   computed from, and the merge gate requires it; the replan journal
+        #   records the merge base its decision was bound to and the one it
+        #   checkpointed, and the supersede requires both (#96). A protocol-3
+        #   file with a replan in flight is refused exactly as a protocol-2
+        #   one is, for the merge base instead of the base, and never
+        #   migrated by reading the merge base GitHub reports now (the base
+        #   may have been rewritten since, which is what the field detects);
+        #   one parked in READY_FOR_MERGE or MERGE is refused exactly as a
+        #   protocol-2 one is, for the merge base instead of the PR and base;
+        #   in any other phase the next review writes the binding and the
+        #   file is loaded as is.
         #
         # The label is rewritten on the next save. A file that is refused is
         # left unchanged (``run --force`` moves it aside like any unreadable
@@ -497,14 +502,11 @@ class AutoForgeState:
         raw_protocol = data.get("protocol_version", __protocol_version__)
         written_by = str(data.get("controller_version", ""))
         if isinstance(raw_protocol, str) and raw_protocol in _LEGACY_PROTOCOLS:
-            if raw_protocol in LEGACY_JOURNAL_PROTOCOLS:
-                refusal = legacy_journal_refusal(
-                    data.get("replan_transaction", {}),
-                    protocol=raw_protocol,
-                    written_by=written_by,
-                )
-                if refusal:
-                    raise StateError(refusal)
+            refusal = legacy_journal_refusal(
+                data.get("replan_transaction", {}), protocol=raw_protocol, written_by=written_by
+            )
+            if refusal:
+                raise StateError(refusal)
             refusal = _legacy_review_binding_refusal(
                 data, phase, protocol=str(raw_protocol), written_by=written_by
             )
@@ -683,7 +685,7 @@ class AutoForgeState:
         # REVIEW without naming a cause. (Empty is "nothing bound".)
         for name in ("reviewed_merge_base_sha", "current_merge_base_sha"):
             value = getattr(state, name)
-            if value and not _SHA40_RE.match(value):
+            if value and not _SHA40_RE.fullmatch(value):
                 raise StateError(
                     f"state field {name!r} must be a full lower-case commit SHA or empty, "
                     f"got {value!r:.60}"

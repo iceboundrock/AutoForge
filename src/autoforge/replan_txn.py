@@ -435,14 +435,19 @@ _REQUIRED_AT_STAGE: dict[ReplanStage, tuple[str, ...]] = {
     # must be linked to from whatever the run happens to hold (#35 R6-F1),
     # and a base-less one would let a source retargeted to another base --
     # a different diff, which the findings never described -- be superseded
-    # on the strength of the reviewed one (#68). The policy metadata is
-    # recorded with the decision and always names its trigger.
+    # on the strength of the reviewed one (#68). The merge base completes
+    # the diff: a base rewritten under its name moves it while the HEAD,
+    # the branch and the base name all stay put (#96), so a decision without
+    # it would let the source be superseded for a diff no review saw. The
+    # policy metadata is recorded with the decision and always names its
+    # trigger.
     ReplanStage.PENDING: (
         "issue_url",
         "decision_pr_url",
         "decision_head_sha",
         "decision_branch",
         "decision_base_ref",
+        "decision_merge_base_sha",
         "escalation",
     ),
     ReplanStage.PREPARED: (
@@ -451,6 +456,7 @@ _REQUIRED_AT_STAGE: dict[ReplanStage, tuple[str, ...]] = {
         "source_branch",
         "source_head_sha",
         "source_base_ref",
+        "source_merge_base_sha",
         "source_review_round",
         "base_branch",
         "evidence_finding_count",
@@ -570,18 +576,25 @@ class ReplanTransaction:
     # active issue at every stage instead. The base branch the review was
     # bound to completes the revision: a PR's diff is HEAD against base, so
     # the same HEAD on the same branch retargeted to another base is a
-    # different change from the one the findings describe.
+    # different change from the one the findings describe. The merge base
+    # is the commit that diff was computed from: a base rewritten under its
+    # name (force-push, reset) moves it while the HEAD, the branch and the
+    # base name stay equal, so it is bound with them (#96). It is the SHA the
+    # review bound (``state.current_merge_base_sha`` at REVIEW entry), never
+    # re-read from GitHub after the decision.
     issue_url: str = ""
     decision_pr_url: str = ""
     decision_head_sha: str = ""
     decision_branch: str = ""
     decision_base_ref: str = ""
+    decision_merge_base_sha: str = ""
 
     # -- source checkpoint: exactly what may be superseded -----------------
     source_pr_url: str = ""
     source_branch: str = ""
     source_head_sha: str = ""
     source_base_ref: str = ""
+    source_merge_base_sha: str = ""
     source_review_round: int = 0
 
     # -- base: independently verified default branch ----------------------
@@ -773,9 +786,15 @@ def may_invoke_agent(txn: ReplanTransaction) -> bool:
 # current base" is precisely the rebinding the fields exist to forbid (#35
 # R4-F1, R6-F1), and #66 R7-F1 is where an in-flight protocol-1 journal was
 # found to be refused as *corruption* under a protocol that still called
-# itself 1. Protocol 3 -> 4 changed only the review binding (the reviewed
-# merge base, #96), not the journal, so a protocol-3 journal is read as a
-# current one and "3" is not a legacy journal protocol here.
+# itself 1. 3 -> 4 added the merge base the deciding review's diff was
+# computed from (``decision_merge_base_sha`` at PENDING,
+# ``source_merge_base_sha`` at PREPARED), so that a base rewritten under its
+# name between the review and the close -- same HEAD, same branch, same
+# base name, another diff -- could not be superseded on the strength of a
+# review of the diff it used to show (#96). Filling it from the merge base
+# GitHub reports *now* would bind the decision to exactly the rewrite the
+# field exists to detect, so a protocol-3 journal in flight is refused like
+# the others.
 # ---------------------------------------------------------------------------
 
 #: The binding each legacy protocol's journal lacks, as the refusal states
@@ -788,6 +807,10 @@ _LEGACY_JOURNAL_GAPS: dict[str, str] = {
     "2": (
         "did not record the base branch the review that decided the replan was bound to, and "
         "this controller does not reconstruct it from the source PR's current base"
+    ),
+    "3": (
+        "did not record the merge base the review that decided the replan was bound to, and "
+        "this controller does not reconstruct it from the merge base GitHub reports now"
     ),
 }
 #: Protocol labels whose journal schema this controller can still describe
@@ -965,6 +988,33 @@ def _source_base_drift(pr: PRInfo, txn: ReplanTransaction, when: str = "") -> st
     return ""
 
 
+def _source_merge_base_drift(merge_base_sha: str, txn: ReplanTransaction, when: str = "") -> str:
+    """The source merge-base comparison, shared by the pre- and post-close reads.
+
+    The last part of the checkpointed revision: the diff is HEAD against base
+    *from their merge base*, and a base branch rewritten under its name
+    (force-push, reset) moves that commit while the HEAD, the branch and the
+    base name all read back equal (#96). ``merge_base_sha`` is what GitHub
+    reports for the checkpointed base and the observed HEAD right now, read
+    by the caller beside the PR; it is never on the PR object itself. Never
+    vacuous, for the reason :func:`_source_branch_drift` gives, and an
+    unreadable merge base is drift too: it is not "the same" as anything.
+    """
+    if not txn.source_merge_base_sha:
+        return (
+            f"the replan transaction records no merge base for source PR {txn.source_pr_url}, "
+            "so the checkpoint cannot prove which diff it decided to supersede"
+        )
+    if not _same_sha(merge_base_sha, txn.source_merge_base_sha):
+        return (
+            f"source PR {txn.source_pr_url} moved from the checkpointed merge base "
+            f"{txn.source_merge_base_sha} to {merge_base_sha or '(unreadable)'}{when}; base "
+            f"{txn.source_base_ref!r} was rewritten under its name, so the PR's diff is no "
+            "longer the one the review that decided this replan saw"
+        )
+    return ""
+
+
 def verify_run_binding(
     txn: ReplanTransaction, repository: str, current_pr_url: str, current_issue_url: str
 ) -> str:
@@ -1082,7 +1132,7 @@ def _bind_to_run(what: str, url: str, repository: str, held: GitHubPullRequestRe
     return ""
 
 
-def verify_decision_point(pr: PRInfo, txn: ReplanTransaction) -> str:
+def verify_decision_point(pr: PRInfo, txn: ReplanTransaction, merge_base_sha: str) -> str:
     """The source must still be the revision whose review decided the replan.
 
     Checked once, before the transaction is prepared. ``REVIEW`` records the
@@ -1099,13 +1149,17 @@ def verify_decision_point(pr: PRInfo, txn: ReplanTransaction) -> str:
 
     The base branch is compared with the HEAD and the branch: the diff the
     review saw is HEAD against base, and retargeting the PR changes it at
-    an unchanged HEAD (#68).
+    an unchanged HEAD (#68). The merge base is compared with all three:
+    ``merge_base_sha`` is what GitHub reports for the PR's base and HEAD
+    now, and a base rewritten under its name moves it while the other three
+    read back equal, which is the same new diff by another route (#96).
 
-    An empty ``decision_pr_url``, ``decision_head_sha``, ``decision_branch``
-    or ``decision_base_ref`` is itself a refusal: without all four there is
-    no proof the checkpoint is the decision point.
-    :meth:`ReplanTransaction.from_dict` refuses such a journal at every
-    stage; this is the same rule at the point of use, never vacuous.
+    An empty ``decision_pr_url``, ``decision_head_sha``, ``decision_branch``,
+    ``decision_base_ref`` or ``decision_merge_base_sha`` is itself a
+    refusal: without all five there is no proof the checkpoint is the
+    decision point. :meth:`ReplanTransaction.from_dict` refuses such a
+    journal at every stage; this is the same rule at the point of use, never
+    vacuous.
     """
     if not txn.decision_pr_url:
         return (
@@ -1134,6 +1188,11 @@ def verify_decision_point(pr: PRInfo, txn: ReplanTransaction) -> str:
             "was bound to, so the source cannot be proven to be the change the findings "
             "belong to"
         )
+    if not txn.decision_merge_base_sha:
+        return (
+            "the replan transaction does not record the merge base the review that decided it "
+            "was bound to, so the source cannot be proven to be the diff the findings belong to"
+        )
     if not _same_sha(pr.head_sha, txn.decision_head_sha):
         return (
             f"source PR {txn.source_pr_url} is at HEAD {pr.head_sha or '(unreadable)'}, but the "
@@ -1151,16 +1210,25 @@ def verify_decision_point(pr: PRInfo, txn: ReplanTransaction) -> str:
             f"decided this replan was bound to base {txn.decision_base_ref!r}; the current "
             "change was never reviewed against this decision"
         )
+    if not _same_sha(merge_base_sha, txn.decision_merge_base_sha):
+        return (
+            f"source PR {txn.source_pr_url} has merge base {merge_base_sha or '(unreadable)'} "
+            f"with base {pr.base_ref!r}, but the review that decided this replan was bound to "
+            f"merge base {txn.decision_merge_base_sha}; base {pr.base_ref!r} was rewritten "
+            "under its name and the current diff was never reviewed against this decision"
+        )
     return ""
 
 
-def verify_source_checkpoint(pr: PRInfo, txn: ReplanTransaction) -> str:
+def verify_source_checkpoint(pr: PRInfo, txn: ReplanTransaction, merge_base_sha: str) -> str:
     """The source PR must still be *exactly* what the transaction checkpointed.
 
     Closing a PR is irreversible for the review evidence it carries, so this
     is the compare half of a compare-and-swap: identity, OPEN state, branch,
-    base, and the exact checkpointed HEAD. Any drift — including a push that
-    landed after the checkpoint, a retarget to another base, and a close
+    base, the exact checkpointed HEAD and the merge base GitHub reports for
+    that base and HEAD now (``merge_base_sha``, read by the caller beside the
+    PR). Any drift — including a push that landed after the checkpoint, a
+    retarget to another base, a base rewritten under its name, and a close
     performed by someone else — means the controller is no longer looking at
     the implementation it decided to replace, and must not close it.
     """
@@ -1185,6 +1253,9 @@ def verify_source_checkpoint(pr: PRInfo, txn: ReplanTransaction) -> str:
             f"{txn.source_head_sha} to {pr.head_sha or '(unreadable)'}; the newer work was never "
             "reviewed against this replan decision"
         )
+    drift = _source_merge_base_drift(merge_base_sha, txn)
+    if drift:
+        return drift
     # Defence in depth: the checkpoint is only allowed to hold the revision the
     # review decided on, so a journal in which the two disagree is unusable.
     if txn.decision_head_sha and not _same_sha(txn.source_head_sha, txn.decision_head_sha):
@@ -1196,6 +1267,13 @@ def verify_source_checkpoint(pr: PRInfo, txn: ReplanTransaction) -> str:
         return (
             f"checkpointed source base {txn.source_base_ref!r} is not the base "
             f"{txn.decision_base_ref!r} the review that decided this replan was bound to"
+        )
+    if txn.decision_merge_base_sha and not _same_sha(
+        txn.source_merge_base_sha, txn.decision_merge_base_sha
+    ):
+        return (
+            f"checkpointed source merge base {txn.source_merge_base_sha} is not the merge base "
+            f"{txn.decision_merge_base_sha} the review that decided this replan was bound to"
         )
     return ""
 
@@ -1380,15 +1458,17 @@ def verify_attestation(attestation: ReplanAttestation, txn: ReplanTransaction) -
     return ""
 
 
-def verify_closed_source(pr: PRInfo, txn: ReplanTransaction) -> str:
+def verify_closed_source(pr: PRInfo, txn: ReplanTransaction, merge_base_sha: str) -> str:
     """The source, re-read *after* the controller's close, is still the one it closed.
 
     ``gh pr close`` carries no precondition, so the swap half of the
     compare-and-swap is completed here instead: everything the pre-close read
     established must still be true of the PR that is now closed, except the
     state itself. A HEAD or branch that moved means a push landed inside the
-    write window, and a base that moved means a retarget did, i.e. the close
-    destroyed the visibility of a change that no review ever saw -- the
+    write window, a base that moved means a retarget did, and a merge base
+    that moved (``merge_base_sha``, read by the caller for the closed PR's
+    base and HEAD) means the base was rewritten under its name, i.e. the
+    close destroyed the visibility of a change that no review ever saw -- the
     caller undoes the close rather than accepting it.
     """
     if not same_pr_url(pr.url, txn.source_pr_url):
@@ -1411,7 +1491,7 @@ def verify_closed_source(pr: PRInfo, txn: ReplanTransaction) -> str:
             f"{txn.source_head_sha} to {pr.head_sha or '(unreadable)'} inside the close window; "
             "the newer work was never reviewed against this replan decision"
         )
-    return ""
+    return _source_merge_base_drift(merge_base_sha, txn, when)
 
 
 def verify_target_marker(pr: PRInfo, txn: ReplanTransaction) -> str:

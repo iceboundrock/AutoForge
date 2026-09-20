@@ -214,6 +214,7 @@ def test_status_json_derives_the_replan_journal_beside_the_raw_one(
         "decision_head_sha": SHA_A,
         "decision_branch": BRANCH,
         "decision_base_ref": "main",
+        "decision_merge_base_sha": "d" * 40,
         "escalation": {"trigger": "hard_review_round_threshold"},
     }
     state_file.write_text(json.dumps(data))
@@ -457,6 +458,7 @@ def test_status_json_keeps_journal_entries_whose_redacted_keys_collide(
         "decision_head_sha": SHA_A,
         "decision_branch": BRANCH,
         "decision_base_ref": "main",
+        "decision_merge_base_sha": "d" * 40,
         "escalation": {
             "trigger": "hard_review_round_threshold",
             f"GITHUB_TOKEN={FAKE_SECRET}": "first",

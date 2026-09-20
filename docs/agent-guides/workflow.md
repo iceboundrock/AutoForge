@@ -205,9 +205,10 @@ window takes the same path. A PR that GitHub reports as `MERGED` at the
 reviewed HEAD but into another base is never counted (`BLOCKED`).
 
 The same binding governs the other decision a review can make. A review
-that routes to `REPLAN_REEXECUTE` records the base it was bound to in the
-replan transaction, and the source PR may be checkpointed and later closed
-only while it still targets that base ([replan-transaction.md](replan-transaction.md),
+that routes to `REPLAN_REEXECUTE` records the base and the merge base it
+was bound to in the replan transaction, and the source PR may be
+checkpointed and later closed only while it still targets that base at
+that merge base ([replan-transaction.md](replan-transaction.md),
 "The decision point is what may be closed").
 
 A branch name is compared as GitHub reports it and is never interpreted;

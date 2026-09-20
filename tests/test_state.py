@@ -457,9 +457,9 @@ def test_protocol_3_is_refused_in_the_merge_phases(tmp_path, phase):
     MERGE cannot be bound after the fact -- reading the merge base now would
     bind the review to whatever the base is now, the rewrite the field
     exists to catch -- so it is refused at the boundary, left unchanged,
-    with the PR and HEAD named. The journal rule does not apply: 3 -> 4 did
-    not change the replan journal, and a protocol-3 journal that the
-    journal loader would call legacy must not be handed to it."""
+    with the PR and HEAD named. The journal rule applies first, as for
+    every earlier protocol: a protocol-3 journal that is empty or rejected
+    is not in flight, so the binding rule decides."""
     path = tmp_path / "state.json"
     data = _clean_review_state(phase=phase).to_dict()
     data["protocol_version"] = "3"
@@ -476,6 +476,10 @@ def test_protocol_3_is_refused_in_the_merge_phases(tmp_path, phase):
     assert ("a" * 40) in message and "did not record which merge base" in message
     assert "Nothing was merged or counted" in message and "corrupt" not in message
     assert path.read_text(encoding="utf-8") == raw
+    data["replan_transaction"] = {"stage": "rejected", "rejection_reason": "refused"}
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(StateError, match="did not record which merge base"):
+        load_state(path)
 
 
 @pytest.mark.parametrize(
@@ -484,9 +488,33 @@ def test_protocol_3_is_refused_in_the_merge_phases(tmp_path, phase):
 )
 def test_protocol_3_is_relabelled_outside_the_merge_phases(tmp_path, phase):
     """#96: everywhere else the next review writes the merge base, so a
-    protocol-3 file is a protocol-4 file with an old label, an empty merge
-    base and the rest of the binding kept -- including a replan journal in
-    flight, which protocol 3 recorded completely."""
+    protocol-3 file with no replan in flight is a protocol-4 file with an
+    old label, an empty merge base and the rest of the binding kept."""
+    path = tmp_path / "state.json"
+    rejected = {"stage": "rejected", "rejection_reason": "refused by verification"}
+    for journal in ({}, rejected):
+        data = _clean_review_state(phase=phase, replan_transaction=journal).to_dict()
+        data["protocol_version"] = "3"
+        for missing in ("reviewed_merge_base_sha", "current_merge_base_sha"):
+            del data[missing]
+        path.write_text(json.dumps(data), encoding="utf-8")
+        loaded = load_state(path)
+        assert loaded.protocol_version == "4" and loaded.phase == phase
+        assert (loaded.reviewed_merge_base_sha, loaded.current_merge_base_sha) == ("", "")
+        assert loaded.reviewed_pr_url == PR42 and loaded.reviewed_base_ref == "main"
+        assert loaded.replan_transaction == journal
+        save_state(loaded, path)
+        assert json.loads(path.read_text())["protocol_version"] == "4"
+
+
+@pytest.mark.parametrize("phase", list(Phase))
+def test_protocol_3_is_refused_with_a_replan_in_flight(tmp_path, phase):
+    """#96: protocol 3 did not record the merge base the replan decision was
+    bound to, so a protocol-3 file with a replan in flight is refused in
+    every phase the way a protocol-1 or protocol-2 one is -- never migrated
+    by reading the merge base GitHub reports now, and never handed to the
+    journal loader to be called corrupt. The journal rule runs before the
+    review-binding rule, so it decides even in the merge phases."""
     path = tmp_path / "state.json"
     in_flight = {
         "stage": "prepared",
@@ -495,16 +523,24 @@ def test_protocol_3_is_relabelled_outside_the_merge_phases(tmp_path, phase):
     }
     data = _clean_review_state(phase=phase, replan_transaction=in_flight).to_dict()
     data["protocol_version"] = "3"
+    data["controller_version"] = "0.3.0"
     for missing in ("reviewed_merge_base_sha", "current_merge_base_sha"):
         del data[missing]
-    path.write_text(json.dumps(data), encoding="utf-8")
-    loaded = load_state(path)
-    assert loaded.protocol_version == "4" and loaded.phase == phase
-    assert (loaded.reviewed_merge_base_sha, loaded.current_merge_base_sha) == ("", "")
-    assert loaded.reviewed_pr_url == PR42 and loaded.reviewed_base_ref == "main"
-    assert loaded.replan_transaction == in_flight
-    save_state(loaded, path)
-    assert json.loads(path.read_text())["protocol_version"] == "4"
+    raw = json.dumps(data)
+    path.write_text(raw, encoding="utf-8")
+    with pytest.raises(StateError) as info:
+        load_state(path)
+    message = str(info.value)
+    assert "written by controller 0.3.0 under protocol_version '3'" in message
+    assert "replan in flight" in message and "stage 'prepared'" in message
+    assert "pull/42" in message and "replacement PR (none)" in message
+    assert "did not record the merge base the review that decided the replan was bound to" in (
+        message
+    )
+    assert "does not reconstruct it from the merge base GitHub reports now" in message
+    assert "did not record which merge base" not in message
+    assert "corrupt" not in message
+    assert path.read_text(encoding="utf-8") == raw
 
 
 def test_review_binding_round_trips_and_is_validated_on_load(tmp_path):
@@ -532,7 +568,17 @@ def test_review_binding_round_trips_and_is_validated_on_load(tmp_path):
         path.write_text(json.dumps(dict(data, **{field: ["d" * 40]})), encoding="utf-8")
         with pytest.raises(StateError, match=f"state field '{field}' must be str"):
             load_state(path)
-        for bad in ("D" * 40, "d" * 39, "d" * 41, "g" * 40, "abc"):
+        # R1-F2 of #111: a trailing control character is not "a full SHA"
+        # either; ``re.match`` with ``$`` would have let the newline through.
+        for bad in (
+            "D" * 40,
+            "d" * 39,
+            "d" * 41,
+            "g" * 40,
+            "abc",
+            "d" * 40 + "\n",
+            "\n" + "d" * 40,
+        ):
             path.write_text(json.dumps(dict(data, **{field: bad})), encoding="utf-8")
             with pytest.raises(StateError, match=f"state field '{field}' must be a full"):
                 load_state(path)
