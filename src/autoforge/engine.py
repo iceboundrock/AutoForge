@@ -3235,7 +3235,7 @@ class ControllerEngine:
                 Phase.FIX,
                 f"PR {canonical} is OPEN at the reviewed HEAD {reviewed[:12]} with "
                 f"{len(state.open_findings)} open finding(s) from round {state.review_round}; "
-                "FIX re-reads the HEAD before launching the fixer",
+                "FIX re-reads the HEAD and base before launching the fixer",
                 pr=pr,
             )
         if cap:
@@ -4593,6 +4593,16 @@ class ControllerEngine:
         of a commit that is no longer the PR. The cost is one review round;
         the review of the actual HEAD is what says what remains.
 
+        The findings are bound to the base too: the diff a reviewer reads is
+        the HEAD against the PR's base, so a PR retargeted to another base
+        since the review has findings raised on a diff the PR no longer
+        proposes. A base other than ``reviewed_base_ref`` is treated exactly
+        like a HEAD past the reviewed one (``FIX -> REVIEW`` of the actual
+        revision, no fixer launched, the findings carried to that review);
+        an empty ``reviewed_base_ref`` (a protocol-2 state file loaded in
+        FIX, written before the base was bound) has no base to compare and
+        launches the fixer; the next completed review writes the binding.
+
         A push is not the only write a fixer makes: a ``follow_up_created``
         resolution creates an issue and moves no HEAD. So with the HEAD
         still the reviewed one, the open issues of the repository are read
@@ -4612,6 +4622,7 @@ class ControllerEngine:
             raise StateError("FIX phase entered without open findings in state")
         pr = self._require_open_pr()
         reviewed = state.reviewed_head_sha.lower()
+        reviewed_base = state.reviewed_base_ref
         if pr.head_sha.lower() != reviewed:
             state.last_fix_resolutions = []
             return self._revision_drift_to_review(
@@ -4624,6 +4635,29 @@ class ControllerEngine:
                     "(an unrecorded fix or an operator push; the controller does not infer "
                     "which findings it resolved); FIX -> REVIEW of the actual HEAD, no fixer "
                     "launched"
+                ),
+            )
+        if reviewed_base and not pr.base_ref:
+            # Unreadable, not retargeted: the same refusal as the review and
+            # merge entries, never a guess either way.
+            raise VerificationError(
+                f"PR {state.current_pr_url} has no readable base branch, so the open findings "
+                f"of round {state.review_round} (bound to base {reviewed_base!r}) cannot be "
+                "confirmed as findings of this PR's diff"
+            )
+        if reviewed_base and pr.base_ref != reviewed_base:
+            # Same commits, another base: the findings describe a diff the PR
+            # no longer proposes. Same rule as HEAD drift (#95).
+            state.last_fix_resolutions = []
+            return self._revision_drift_to_review(
+                Phase.FIX,
+                plan,
+                pr,
+                message=(
+                    f"PR base changed to {pr.base_ref!r} from the reviewed base "
+                    f"{reviewed_base!r} that the open findings of round {state.review_round} "
+                    "are bound to (the findings describe the diff against the old base); "
+                    "FIX -> REVIEW of the actual revision, no fixer launched"
                 ),
             )
         pr_ref = parse_pr_url(state.current_pr_url)

@@ -195,13 +195,20 @@ on the PR into a human decision.
 
 ### Before FIX
 
-The fixer is launched only while the PR HEAD read from GitHub equals the
-reviewed HEAD the open findings are bound to. A HEAD past it is an
-unverified push (an unrecorded fix, an operator); the review is stale and
-the phase goes to `REVIEW` of the actual HEAD without launching the fixer,
-with the open findings carried to that review as prior findings to re-check
-(workflow.md, "Bind reviews to PR HEAD SHA and to the PR identity" and
-"Stale rounds keep their findings").
+The fixer is launched only while the PR HEAD and base read from GitHub
+equal the reviewed HEAD and base the open findings are bound to. A HEAD
+past it is an unverified push (an unrecorded fix, an operator); a base
+other than `reviewed_base_ref` is a retargeted PR whose findings were
+raised on a diff against another base (#95). Either way the review is
+stale and the phase goes to `REVIEW` of the actual revision without
+launching the fixer, with the open findings carried to that review as
+prior findings to re-check (workflow.md, "Bind reviews to PR HEAD SHA and
+to the PR identity" and "Stale rounds keep their findings"). A PR whose
+base cannot be read is refused as a verification failure, as the review
+and merge entries refuse it, never read as a retarget. The base is
+compared only when `reviewed_base_ref` is set: a protocol-2 state file
+loaded in `FIX` has no reviewed base, so its fixer is launched and the
+next completed review writes the binding.
 
 A push is not the only write a fixer makes: a `follow_up_created`
 resolution creates an issue and moves no HEAD. With the HEAD unchanged the
