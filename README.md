@@ -770,10 +770,13 @@ reached through a link above it is refused before anything is created.
 Dry-run creates none.
 
 State records `current_pr_url`, `current_branch`, `current_head_sha`,
-`current_base_ref`, `reviewed_pr_url`, `reviewed_head_sha`,
-`reviewed_base_ref` (the PR, HEAD and base branch the last review round
-decided on; MERGE requires `current_pr_url` to be that PR by identity and
-the PR to still be at that HEAD on that base), `review_round`,
+`current_base_ref`, `current_merge_base_sha`, `reviewed_pr_url`,
+`reviewed_head_sha`, `reviewed_base_ref`, `reviewed_merge_base_sha` (the
+PR, HEAD, base branch and merge base the last review round decided on;
+MERGE requires `current_pr_url` to be that PR by identity and the PR to
+still be at that HEAD on that base from that merge base, so a base branch
+rewritten under its name sends the PR back to review while ordinary
+commits landing on the base do not), `review_round`,
 `last_review_comment_url`,
 `last_review_needs_fix`, `open_findings`, `prior_findings` (a stale
 round's findings, carried to the next review to re-check), `last_fix_resolutions`,

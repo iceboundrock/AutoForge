@@ -56,6 +56,11 @@ BRANCH = "autoforge/2-feature"
 # gate reads: the PR's own `pull_request` run (the one its `ci` check names)
 # and the base branch's `push` run at its tip (the reference definition).
 MAIN_SHA = "e" * 40
+# The merge base the fake reports for any (base branch, HEAD) unless a test
+# rewrites the base (`FakeGitHub.merge_base`) or pins one pair
+# (`FakeGitHub.merge_bases`): the commit the PR diff is computed from (#96).
+MERGE_BASE = "d" * 40
+MERGE_BASE_B = "f" * 40
 CI_WORKFLOW_ID = 77
 CI_WORKFLOW_PATH = ".github/workflows/ci.yml"
 BASE_RUN_ID = 1000
@@ -173,8 +178,13 @@ def review_comment_body(
     finding_ids: list[str] | None = None,
     *,
     base_ref: str | None = "main",
+    merge_base_sha: str | None = MERGE_BASE,
 ) -> str:
-    """A well-formed round comment; ``base_ref=None`` writes a pre-base marker."""
+    """A well-formed round comment.
+
+    ``base_ref=None`` writes a pre-base (protocol-2) marker and
+    ``merge_base_sha=None`` a pre-merge-base (protocol-3) one.
+    """
     payload: dict[str, object] = {
         "round": round,
         "reviewed_head_sha": sha,
@@ -183,9 +193,12 @@ def review_comment_body(
     }
     if base_ref is not None:
         payload["reviewed_base_ref"] = base_ref
+    if merge_base_sha is not None:
+        payload["reviewed_merge_base_sha"] = merge_base_sha
     marker = json.dumps(payload)
     return (
-        f"# AI Code Review — Round {round}\n\nReviewed HEAD: `{sha}` against base `{base_ref}`\n\n"
+        f"# AI Code Review — Round {round}\n\nReviewed HEAD: `{sha}` against base `{base_ref}` "
+        f"(merge base `{merge_base_sha}`)\n\n"
         "## Findings\n...\n## Spec\n...\n## Standards\n...\n## Assessment\n...\n"
         "## Observations\n...\n## Verification\n...\n## Summary\n"
         f"Needs another fix round: {'YES' if needs_fix else 'NO'}\n"
@@ -292,6 +305,14 @@ class FakeGitHub:
         }
         self.workflow_jobs: dict[int, WorkflowRunJobs] = {BASE_RUN_ID: ci_jobs()}
         self.branch_heads: dict[str, str] = {"main": MAIN_SHA}
+        # The merge base of any base branch and HEAD (#96). A base rewritten
+        # under its name is simulated by changing ``merge_base``; a pinned
+        # ``merge_bases[(base_ref, head_sha)]`` answers one pair only.
+        # ``merge_base_error`` raises on every read (same convention as
+        # get_pr_error).
+        self.merge_base: str = MERGE_BASE
+        self.merge_bases: dict[tuple[str, str], str] = {}
+        self.merge_base_error: GitHubError | None = None
         # GitHub claims this many more runs than find_workflow_runs lists: a
         # listing the controller could not complete.
         self.workflow_runs_unlisted: int = 0
@@ -519,6 +540,12 @@ class FakeGitHub:
             return self.branch_heads[branch]
         except KeyError:
             raise GitHubNotFoundError(f"branch not found: {branch}") from None
+
+    def get_merge_base_sha(self, repository: str, base_ref: str, head_sha: str) -> str:
+        self.calls.append(("get_merge_base_sha", repository, base_ref, head_sha))
+        if self.merge_base_error is not None:
+            raise self.merge_base_error
+        return self.merge_bases.get((base_ref, head_sha.lower()), self.merge_base)
 
     def find_workflow_runs(
         self, repository: str, workflow_id: int, *, branch: str, event: str, head_sha: str

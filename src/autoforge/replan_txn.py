@@ -773,7 +773,9 @@ def may_invoke_agent(txn: ReplanTransaction) -> bool:
 # current base" is precisely the rebinding the fields exist to forbid (#35
 # R4-F1, R6-F1), and #66 R7-F1 is where an in-flight protocol-1 journal was
 # found to be refused as *corruption* under a protocol that still called
-# itself 1.
+# itself 1. Protocol 3 -> 4 changed only the review binding (the reviewed
+# merge base, #96), not the journal, so a protocol-3 journal is read as a
+# current one and "3" is not a legacy journal protocol here.
 # ---------------------------------------------------------------------------
 
 #: The binding each legacy protocol's journal lacks, as the refusal states

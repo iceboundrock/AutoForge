@@ -5093,13 +5093,12 @@ def test_the_legacy_journal_refusal_knows_only_the_legacy_protocols():
     assert legacy_journal_refusal(journal, protocol="2", written_by="0.1.0")
 
 
-@pytest.mark.parametrize("protocol", ["1", "2"])
+@pytest.mark.parametrize("protocol", ["1", "2", "3"])
 def test_r7f1_a_legacy_state_without_a_replan_in_flight_loads_as_current(tmp_state_dir, protocol):
-    """Every protocol step so far changed only the journal, so a legacy file
-    with an empty or terminal journal is a current file with an old label
-    (the 2 -> 3 review-binding rule of #68 only concerns a file parked in
-    READY_FOR_MERGE / MERGE, which these are not); the label is rewritten on
-    the next save."""
+    """A legacy file with an empty or terminal journal is a current file with
+    an old label (the 2 -> 3 review-binding rule of #68 and the 3 -> 4 rule
+    of #96 only concern a file parked in READY_FOR_MERGE / MERGE, which
+    these are not); the label is rewritten on the next save."""
     gh = FakeGitHub()
     eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.VERIFIED)
     eng.save()
@@ -5112,10 +5111,10 @@ def test_r7f1_a_legacy_state_without_a_replan_in_flight_loads_as_current(tmp_sta
         data["phase"] = "REVIEW" if not journal else "BLOCKED"
         eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
         loaded = eng.load()
-        assert loaded.protocol_version == "3"
+        assert loaded.protocol_version == "4"
         assert loaded.replan_transaction == journal
         eng.save()
-        assert json.loads(eng.paths.state_file.read_text())["protocol_version"] == "3"
+        assert json.loads(eng.paths.state_file.read_text())["protocol_version"] == "4"
     # A legacy file that predates the journal field altogether is the same
     # case: no replan in flight.
     data = json.loads(eng.paths.state_file.read_text())
@@ -5158,17 +5157,24 @@ def test_r7f1_the_version_label_decides_not_the_journal_shape(tmp_state_dir):
             StateError, match=f"protocol_version {legacy!r} with a replan in flight"
         ):
             eng.load()
-    data = json.loads(eng.paths.state_file.read_text())
-    data["protocol_version"] = "3"
-    del data["replan_transaction"]["decision_pr_url"]
-    eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
-    eng.load()
-    out = eng.step()
-    assert out.next_phase == "BLOCKED"
-    assert "persisted replan transaction is corrupt" in eng.state.block_reason
-    assert "decision_pr_url is required at stage 'supersede_intent' but missing" in (
-        eng.state.block_reason
-    )
+    # Under a protocol whose journal has the current shape (3 -> 4 changed
+    # only the review binding, #96) the same gap is corruption, from a
+    # protocol-3 file exactly as from a current one.
+    for current in ("3", "4"):
+        data = json.loads(eng.paths.state_file.read_text())
+        data["protocol_version"] = current
+        data["phase"] = Phase.REPLAN_REEXECUTE.value
+        data["block_reason"] = ""
+        data["replan_transaction"] = txn.to_dict()
+        del data["replan_transaction"]["decision_pr_url"]
+        eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
+        eng.load()
+        out = eng.step()
+        assert out.next_phase == "BLOCKED"
+        assert "persisted replan transaction is corrupt" in eng.state.block_reason
+        assert "decision_pr_url is required at stage 'supersede_intent' but missing" in (
+            eng.state.block_reason
+        )
     assert gh.closed_prs == [] and eng.provider.calls == []
 
 

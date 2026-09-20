@@ -1576,6 +1576,52 @@ def test_get_branch_head_sha():
         _client(lambda req: _res({"name": "main", "commit": {}})).get_branch_head_sha("o/r", "main")
 
 
+def test_get_merge_base_sha():
+    """#96: the merge base is read through the compare endpoint, projected
+    with --jq (the full compare answer carries every commit and file of the
+    diff), the base percent-encoded so a slash in its name stays one path
+    segment, and the answer lower-cased."""
+    seen = []
+
+    def handler(req):
+        seen.append(req.command)
+        return _res({"merge_base_sha": "ABC" + "0" * 37})
+
+    head = "f" * 40
+    assert _client(handler).get_merge_base_sha("o/r", "release/1.x", head.upper()) == (
+        "abc" + "0" * 37
+    )
+    assert seen == [
+        [
+            "gh",
+            "api",
+            f"repos/o/r/compare/release%2F1.x...{head}",
+            "--jq",
+            "{merge_base_sha: .merge_base_commit.sha}",
+        ]
+    ]
+
+
+@pytest.mark.parametrize("answer", [{}, {"merge_base_sha": None}, {"merge_base_sha": "abc"}])
+def test_get_merge_base_sha_refuses_an_unreadable_answer(answer):
+    with pytest.raises(GitHubError, match="merge base of 'main' and ffffffffffff of o/r is unread"):
+        _client(lambda req: _res(answer)).get_merge_base_sha("o/r", "main", "f" * 40)
+
+
+def test_get_merge_base_sha_refuses_a_partial_head():
+    """A short or malformed head would make GitHub resolve *something*; the
+    controller only ever asks about the full SHA it bound."""
+    seen = []
+
+    def handler(req):
+        seen.append(req.command)
+        return _res({"merge_base_sha": "a" * 40})
+
+    with pytest.raises(GitHubError, match="head 'abc' is not a full SHA"):
+        _client(handler).get_merge_base_sha("o/r", "main", "abc")
+    assert seen == []
+
+
 def test_find_workflow_runs_filters_through_the_query_string_and_reads_every_page():
     seen = []
     first = {**_RUN, "id": 99, "event": "push", "head_branch": "main"}

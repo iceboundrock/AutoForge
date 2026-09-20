@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 from dataclasses import asdict, dataclass, field, fields
 from datetime import UTC, datetime
@@ -175,30 +176,43 @@ def _validate_local_pending(state: AutoForgeState) -> None:
 
 # Protocol labels an older controller wrote that this one can still read,
 # each subject to the boundary rules its successors introduced (see
-# :meth:`AutoForgeState.from_dict`). Every step so far changed the replan
-# journal, so the set is the journal's.
-_LEGACY_PROTOCOLS = LEGACY_JOURNAL_PROTOCOLS
+# :meth:`AutoForgeState.from_dict`). Protocols 1 and 2 predate the current
+# replan journal; protocol 3 has the journal but not the review's merge
+# base.
+_LEGACY_PROTOCOLS = LEGACY_JOURNAL_PROTOCOLS | {"3"}
 # The phases in which the persisted clean review is consumed by the merge
-# gate, and so the phases a state without the review's PR and base binding
-# cannot be loaded in.
+# gate, and so the phases a state without the review's full binding cannot
+# be loaded in.
 _MERGE_PHASES = (Phase.READY_FOR_MERGE, Phase.MERGE)
+# What each pre-protocol-4 label failed to record about the completed
+# review, for the refusal text: the binding the merge gate requires that
+# the file cannot supply.
+_REVIEW_BINDING_GAPS = {
+    "1": "which PR and base branch that review was posted on",
+    "2": "which PR and base branch that review was posted on",
+    "3": "which merge base that review's diff was computed from",
+}
+# A persisted commit id is a full lower-case SHA or empty (nothing bound).
+_SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 def _legacy_review_binding_refusal(
     data: dict, phase: Phase, *, protocol: str, written_by: str
 ) -> str:
-    """Why a pre-protocol-3 state cannot be loaded, or ``""`` when it can.
+    """Why a pre-protocol-4 state cannot be loaded, or ``""`` when it can.
 
     Protocol 3 added ``reviewed_pr_url`` and ``reviewed_base_ref`` next to
-    ``reviewed_head_sha``, and the merge gate refuses a clean review that
-    lacks them. A file in any phase but READY_FOR_MERGE or MERGE is loaded
-    as is: nothing in it consumes the binding before the next completed
-    review writes it. A file parked in one of the merge phases holds a clean
+    ``reviewed_head_sha``, protocol 4 added ``reviewed_merge_base_sha``
+    (#96), and the merge gate refuses a clean review that lacks any of
+    them. A file in any phase but READY_FOR_MERGE or MERGE is loaded as is:
+    nothing in it consumes the binding before the next completed review
+    writes it. A file parked in one of the merge phases holds a clean
     review that the gate could only accept by binding it, now, to the run's
-    current PR and base -- and a binding reconstructed from the very fields
-    it exists to check is no binding. It is refused at the boundary, with
-    the PR and HEAD named so the operator can decide on GitHub whether the
-    PR is done, and never read as corruption: it was written whole.
+    current PR, base and merge base -- and a binding reconstructed from the
+    very fields it exists to check is no binding. It is refused at the
+    boundary, with the PR and HEAD named so the operator can decide on
+    GitHub whether the PR is done, and never read as corruption: it was
+    written whole.
 
     ``data`` is read defensively: this runs before any schema check.
     """
@@ -213,9 +227,9 @@ def _legacy_review_binding_refusal(
         f"state file was written by controller {written_by or '(unknown)'} under "
         f"protocol_version {protocol!r} and is in phase {phase.value} with a clean review of "
         f"PR {_text('current_pr_url')} at HEAD {_text('reviewed_head_sha')}; protocol "
-        f"{protocol!r} did not record which PR and base branch that review was posted on, "
-        "and this controller does not bind it to the run's current PR and base after the "
-        "fact. Nothing was merged or counted by this controller. Check the PR on GitHub: if "
+        f"{protocol!r} did not record {_REVIEW_BINDING_GAPS[protocol]}, and this controller "
+        "does not bind it to the run's current PR, base and merge base after the fact. "
+        "Nothing was merged or counted by this controller. Check the PR on GitHub: if "
         "it is already MERGED the issue is done and the run should continue from the next "
         "issue; if it is OPEN, start a new run for the issue, which adopts the PR and "
         "reviews it again. The state file was left unchanged"
@@ -249,23 +263,30 @@ class AutoForgeState:
     review_round: int = 0
 
     # The revision the last completed review is bound to: the PR it was
-    # posted on (canonical URL), the HEAD the reviewer saw and the base branch
-    # the reviewed diff was against. The three are written together by the
-    # review and read together by the merge gate: a clean review is a
-    # decision about one PR's diff against one base at one commit, so before
-    # MERGE the run's ``current_pr_url`` must be this PR by identity and the
-    # PR GitHub returns for it must still have this HEAD and this base. A
-    # substituted ``current_pr_url`` (a same-repository PR at the same HEAD on
-    # the same branch against another base, say) or a retargeted base is
-    # therefore never merged on the strength of a review it did not receive.
+    # posted on (canonical URL), the HEAD the reviewer saw, the base branch
+    # the reviewed diff was against and the merge base that diff was
+    # computed from. The four are written together by the review and read
+    # together by the merge gate: a clean review is a decision about one
+    # PR's diff against one base at one commit, so before MERGE the run's
+    # ``current_pr_url`` must be this PR by identity and the PR GitHub
+    # returns for it must still have this HEAD, this base and this merge
+    # base. A substituted ``current_pr_url`` (a same-repository PR at the
+    # same HEAD on the same branch against another base, say), a retargeted
+    # base, or a base rewritten under the same name (force-push, reset; the
+    # merge base moves, the name and HEAD do not, #96) is therefore never
+    # merged on the strength of a review it did not receive. Ordinary
+    # commits landing on the base leave the merge base where it was.
     reviewed_pr_url: str = ""
     reviewed_head_sha: str = ""
     reviewed_base_ref: str = ""
-    # Latest PR HEAD and base branch the controller observed through `gh`;
-    # both are re-bound right before a review, and the post-review read must
-    # find them unchanged for the round to be current rather than stale.
+    reviewed_merge_base_sha: str = ""
+    # Latest PR HEAD, base branch and merge base the controller observed
+    # through `gh`; all are re-bound right before a review, and the
+    # post-review read must find them unchanged for the round to be current
+    # rather than stale.
     current_head_sha: str = ""
     current_base_ref: str = ""
+    current_merge_base_sha: str = ""
 
     last_review_comment_url: str = ""
     last_review_result: str = ""  # "needs_fix" | "clean" | "stale" | ""
@@ -453,6 +474,14 @@ class AutoForgeState:
         #   the base branch it was bound to, and the merge gate requires
         #   both; the replan journal records the base its decision was bound
         #   to and the base it checkpointed, and the supersede requires both.
+        # - 3 -> 4: the completed review records the merge base its diff was
+        #   computed from, and the merge gate requires it (#96). The replan
+        #   journal is unchanged, so a protocol-3 file is never handed to
+        #   the journal's legacy check. A protocol-3 file parked in
+        #   READY_FOR_MERGE or MERGE is refused exactly as a protocol-2 one
+        #   is, for the merge base instead of the PR and base; in any other
+        #   phase the next review writes the binding and the file is loaded
+        #   as is.
         #   A protocol-2 file with a replan in flight is refused exactly as a
         #   protocol-1 one is, for the base instead of the PR and issue. A
         #   protocol-2 file parked in READY_FOR_MERGE or MERGE holds a clean
@@ -468,11 +497,14 @@ class AutoForgeState:
         raw_protocol = data.get("protocol_version", __protocol_version__)
         written_by = str(data.get("controller_version", ""))
         if isinstance(raw_protocol, str) and raw_protocol in _LEGACY_PROTOCOLS:
-            refusal = legacy_journal_refusal(
-                data.get("replan_transaction", {}), protocol=raw_protocol, written_by=written_by
-            )
-            if refusal:
-                raise StateError(refusal)
+            if raw_protocol in LEGACY_JOURNAL_PROTOCOLS:
+                refusal = legacy_journal_refusal(
+                    data.get("replan_transaction", {}),
+                    protocol=raw_protocol,
+                    written_by=written_by,
+                )
+                if refusal:
+                    raise StateError(refusal)
             refusal = _legacy_review_binding_refusal(
                 data, phase, protocol=str(raw_protocol), written_by=written_by
             )
@@ -645,6 +677,17 @@ class AutoForgeState:
                     f"state field 'reviewed_pr_url' names PR {state.reviewed_pr_url}, which "
                     f"is not in repository {state.repository!r}"
                 )
+        # The merge bases are compared for equality with the one GitHub
+        # reports (a lower-case full SHA), so a value of any other shape
+        # could only ever differ from it and would send every merge back to
+        # REVIEW without naming a cause. (Empty is "nothing bound".)
+        for name in ("reviewed_merge_base_sha", "current_merge_base_sha"):
+            value = getattr(state, name)
+            if value and not _SHA40_RE.match(value):
+                raise StateError(
+                    f"state field {name!r} must be a full lower-case commit SHA or empty, "
+                    f"got {value!r:.60}"
+                )
         return state
 
     def touch(self) -> None:
@@ -678,9 +721,11 @@ class AutoForgeState:
         self.current_branch = ""
         self.current_head_sha = ""
         self.current_base_ref = ""
+        self.current_merge_base_sha = ""
         self.reviewed_pr_url = ""
         self.reviewed_head_sha = ""
         self.reviewed_base_ref = ""
+        self.reviewed_merge_base_sha = ""
         self.review_round = 0
         self.last_review_result = ""
         self.last_review_needs_fix = None

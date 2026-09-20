@@ -17,6 +17,7 @@ from tests.conftest import (
     BRANCH,
     EPIC,
     ISSUE,
+    MERGE_BASE,
     PR,
     SHA_A,
     FakeGitHub,
@@ -594,6 +595,7 @@ def test_full_run_prints_ready_banner(tmp_path, capsys, monkeypatch, fakes):
     assert "Automatic merge is disabled in this milestone." in out
     assert PR in out and ISSUE in out and SHA_A in out and "Review round:  1" in out
     assert "Reviewed base: main" in out
+    assert f"Reviewed merge base: {MERGE_BASE}" in out
     # resume on a held state re-prints the banner and does nothing else
     n_calls = len(fakes["provider"].calls)
     assert cli.main(["--state-dir", sd, "resume"]) == 0
@@ -607,10 +609,14 @@ def test_full_run_prints_ready_banner(tmp_path, capsys, monkeypatch, fakes):
     status = json.loads(capsys.readouterr().out)
     assert status["phase"] == "READY_FOR_MERGE"
     assert (status["reviewed_pr_url"], status["reviewed_base_ref"]) == (PR, "main")
+    assert status["reviewed_merge_base_sha"] == MERGE_BASE
+    assert status["current_merge_base_sha"] == MERGE_BASE
     assert cli.main(["--state-dir", sd, "status"]) == 0
     out = capsys.readouterr().out
     assert f"Reviewed PR:   {PR}" in out and "Reviewed base: main" in out
     assert "Current base:  main" in out
+    assert f"Current merge base:  {MERGE_BASE}" in out
+    assert f"Reviewed merge base: {MERGE_BASE}" in out
 
 
 def _drive_to_ready(fakes):

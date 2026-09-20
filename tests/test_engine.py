@@ -54,6 +54,8 @@ from tests.conftest import (
     ISSUE,
     ISSUE3,
     MAIN_SHA,
+    MERGE_BASE,
+    MERGE_BASE_B,
     PR,
     SHA_A,
     SHA_B,
@@ -112,6 +114,7 @@ def _in_review(tmp_state_dir, gh: FakeGitHub, script, round_done: int = 0, head:
     eng.state.current_branch = BRANCH
     eng.state.current_head_sha = head
     eng.state.current_base_ref = "main"
+    eng.state.current_merge_base_sha = MERGE_BASE
     eng.state.review_round = round_done
     return eng
 
@@ -1389,6 +1392,7 @@ def test_fix_entry_with_the_pr_retargeted_goes_to_review_without_a_fixer(tmp_sta
     eng = _in_fix(tmp_state_dir, gh, round_two_sees_the_carry)
     eng.state.reviewed_base_ref = "main"
     eng.state.current_base_ref = "main"
+    eng.state.reviewed_merge_base_sha = MERGE_BASE
     eng.state.last_fix_resolutions = [{"finding_id": "R0-F1", "resolution": "fixed"}]
     gh.prs[PR].base_ref = "release/1.x"
     out = eng.step()
@@ -1445,6 +1449,7 @@ def test_fix_entry_with_an_unreadable_base_is_a_verification_failure(tmp_state_d
     eng = _in_fix(tmp_state_dir, gh, ["never"])
     eng.state.reviewed_base_ref = "main"
     eng.state.current_base_ref = "main"
+    eng.state.reviewed_merge_base_sha = MERGE_BASE
     gh.prs[PR].base_ref = ""
     with pytest.raises(VerificationError, match="no readable base branch.*bound to base 'main'"):
         eng.step()
@@ -1452,6 +1457,91 @@ def test_fix_entry_with_an_unreadable_base_is_a_verification_failure(tmp_state_d
     s = eng.state
     assert s.phase == Phase.FIX and [f["id"] for f in s.open_findings] == ["R1-F1"]
     assert s.last_review_result != "stale" and s.current_base_ref == "main"
+
+
+def test_fix_entry_with_the_base_rewritten_goes_to_review_without_a_fixer(tmp_state_dir):
+    """#96 at the FIX entry: same commits, same base name, but the base was
+    rewritten under its name since the review, so the findings describe a
+    diff the PR no longer shows. Treated like a retarget (#95): the review
+    is stale, no fixer is launched, the findings are carried."""
+    gh = FakeGitHub()
+    gh.add_comment(PR, 101, review_comment_body(2, SHA_A, False, merge_base_sha=MERGE_BASE_B))
+
+    def round_two_sees_the_carry(req):
+        assert "- R1-F1 [nit] src/x.py:1 — typo" in req.prompt
+        return block(review_payload(2, SHA_A, [], cid=101))
+
+    eng = _in_fix(tmp_state_dir, gh, round_two_sees_the_carry)
+    eng.state.reviewed_base_ref = "main"
+    eng.state.current_base_ref = "main"
+    eng.state.reviewed_merge_base_sha = MERGE_BASE
+    eng.state.last_fix_resolutions = [{"finding_id": "R0-F1", "resolution": "fixed"}]
+    gh.merge_base = MERGE_BASE_B
+    out = eng.step()
+    assert out.next_phase == "REVIEW" and eng.provider.calls == []
+    assert f"PR merge base moved to {MERGE_BASE_B[:12]} from the reviewed merge base" in (
+        out.message
+    )
+    assert "base 'main' was rewritten under its name" in out.message
+    assert "no fixer launched" in out.message
+    assert "the 1 finding(s) of round 1 are carried to that review to re-check" in out.message
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.REVIEW and s.review_round == 1
+    assert s.current_merge_base_sha == MERGE_BASE_B and s.reviewed_merge_base_sha == MERGE_BASE
+    assert s.current_head_sha == SHA_A and s.current_base_ref == "main"
+    assert s.open_findings == [] and s.last_fix_resolutions == []
+    assert s.prior_findings == [_finding(1)]
+    assert s.last_review_result == "stale" and s.attempt == 0
+    eng.close()
+
+    # The next review binds the new merge base; a clean round on it proceeds.
+    eng2 = make_engine(tmp_state_dir, round_two_sees_the_carry, github=gh)
+    eng2.load()
+    assert eng2.step().next_phase == "READY_FOR_MERGE"
+    assert len(eng2.provider.calls) == 1
+    s = load_state(eng2.paths.state_file)
+    assert s.reviewed_merge_base_sha == MERGE_BASE_B and s.prior_findings == []
+
+
+def test_fix_entry_without_a_reviewed_merge_base_still_launches_the_fixer(tmp_state_dir):
+    """#96: a protocol-3 state file loaded in FIX has an empty
+    `reviewed_merge_base_sha`. There is no merge base to compare, so the
+    merge base is not read and the fixer is launched; the next completed
+    review writes the binding."""
+    gh = FakeGitHub()
+
+    def on_call(req):
+        gh.set_head(SHA_B)
+        return block(fix_payload(SHA_A, SHA_B, [{"finding_id": "R1-F1", "resolution": "fixed"}]))
+
+    eng = _in_fix(tmp_state_dir, gh, on_call)
+    eng.state.reviewed_base_ref = "main"
+    eng.state.current_base_ref = "main"
+    assert eng.state.reviewed_merge_base_sha == ""
+    gh.merge_base = MERGE_BASE_B
+    out = eng.step()
+    assert out.next_phase == "REVIEW" and len(eng.provider.calls) == 1
+    assert not [c for c in gh.calls if c[0] == "get_merge_base_sha"]
+    s = load_state(eng.paths.state_file)
+    assert s.current_head_sha == SHA_B and s.reviewed_merge_base_sha == ""
+
+
+def test_fix_entry_with_the_unchanged_merge_base_launches_the_fixer(tmp_state_dir):
+    gh = FakeGitHub()
+
+    def on_call(req):
+        gh.set_head(SHA_B)
+        return block(fix_payload(SHA_A, SHA_B, [{"finding_id": "R1-F1", "resolution": "fixed"}]))
+
+    eng = _in_fix(tmp_state_dir, gh, on_call)
+    eng.state.reviewed_base_ref = "main"
+    eng.state.current_base_ref = "main"
+    eng.state.reviewed_merge_base_sha = MERGE_BASE
+    gh.branch_heads["main"] = SHA_B  # main advanced; the merge base did not move
+    out = eng.step()
+    assert out.next_phase == "REVIEW" and len(eng.provider.calls) == 1
+    assert ("get_merge_base_sha", "owner/repo", "main", SHA_A) in gh.calls
+    assert load_state(eng.paths.state_file).open_findings == []
 
 
 def test_fix_entry_binds_the_unchanged_head_and_launches_the_fixer(tmp_state_dir):
@@ -2185,9 +2275,9 @@ def _in_merge(tmp_state_dir, gh, script=None, reviewed=SHA_A, clean=True, phase=
     """Engine parked in MERGE with the gate open and a clean review bound to ``reviewed``.
 
     The review is bound the way ``_apply_review`` binds it: round 2 at
-    ``reviewed`` on ``main`` of ``PR``, decided by a comment on the fake
-    that carries that round's marker (``REVIEW_CID``), which the gate
-    re-reads (#94).
+    ``reviewed`` on ``main`` from merge base ``MERGE_BASE`` of ``PR``,
+    decided by a comment on the fake that carries that round's marker
+    (``REVIEW_CID``), which the gate re-reads (#94).
     """
     eng = make_engine(tmp_state_dir, script or [], github=gh)
     eng.config.safety.allow_merge = True
@@ -2195,9 +2285,11 @@ def _in_merge(tmp_state_dir, gh, script=None, reviewed=SHA_A, clean=True, phase=
     eng.state.current_pr_url = PR
     eng.state.current_head_sha = reviewed
     eng.state.current_base_ref = "main"
+    eng.state.current_merge_base_sha = MERGE_BASE
     eng.state.reviewed_pr_url = PR
     eng.state.reviewed_head_sha = reviewed
     eng.state.reviewed_base_ref = "main"
+    eng.state.reviewed_merge_base_sha = MERGE_BASE
     eng.state.last_review_result = "clean" if clean else "needs_fix"
     eng.state.review_round = 2
     if isinstance(gh, FakeGitHub):  # a scripted real client answers the read itself
@@ -2229,9 +2321,11 @@ def test_merge_when_explicitly_enabled_is_done_by_controller(tmp_state_dir, fake
     eng.state.current_pr_url = PR
     eng.state.current_head_sha = SHA_A
     eng.state.current_base_ref = "main"
+    eng.state.current_merge_base_sha = MERGE_BASE
     eng.state.reviewed_pr_url = PR
     eng.state.reviewed_head_sha = SHA_A
     eng.state.reviewed_base_ref = "main"
+    eng.state.reviewed_merge_base_sha = MERGE_BASE
     eng.state.last_review_result = "clean"
     eng.state.review_round = 2
     fake_github.add_comment(PR, 100, review_comment_body(2, SHA_A, False))
@@ -5854,7 +5948,12 @@ def test_merge_refuses_when_github_answers_with_another_pr(tmp_state_dir, fake_g
 
 @pytest.mark.parametrize(
     ("field", "value"),
-    [("reviewed_pr_url", ""), ("reviewed_base_ref", ""), ("reviewed_head_sha", "")],
+    [
+        ("reviewed_pr_url", ""),
+        ("reviewed_base_ref", ""),
+        ("reviewed_head_sha", ""),
+        ("reviewed_merge_base_sha", ""),
+    ],
 )
 @pytest.mark.parametrize("phase", [Phase.READY_FOR_MERGE, Phase.MERGE])
 def test_merge_requires_the_whole_review_binding(tmp_state_dir, fake_github, phase, field, value):
@@ -5862,7 +5961,10 @@ def test_merge_requires_the_whole_review_binding(tmp_state_dir, fake_github, pha
     eng = _in_merge(tmp_state_dir, fake_github, phase=phase)
     setattr(eng.state, field, value)
     before = list(fake_github.calls)
-    with pytest.raises(VerificationError, match="clean review bound to a PR, a HEAD and a base"):
+    with pytest.raises(
+        VerificationError,
+        match="clean review bound to a PR, a HEAD, a base branch and a merge base",
+    ):
         eng.step(allow_merge=True)
     assert fake_github.calls == before and fake_github.merges == []
     assert eng.state.phase == phase
@@ -5931,6 +6033,130 @@ def test_merge_base_retargeted_between_verification_and_write_goes_back_to_revie
     s = load_state(eng.paths.state_file)
     assert s.phase == Phase.REVIEW and s.last_review_result == "stale"
     assert s.current_base_ref == "release/1.x" and s.counted_merged_prs == []
+
+
+@pytest.mark.parametrize("phase", [Phase.READY_FOR_MERGE, Phase.MERGE])
+def test_merge_base_branch_rewritten_after_clean_review_goes_back_to_review(
+    tmp_state_dir, fake_github, phase
+):
+    """#96: same HEAD, same base *name*, but the base was rewritten under
+    that name (force-push, reset) so the merge base moved and with it the
+    diff the review decided on. The review is stale, exactly as for a HEAD
+    move or a retarget; nothing is merged or counted, and the merge base
+    the PR now shows is bound for the re-review."""
+    fake_github.add_pr(head_sha=SHA_A)
+    fake_github.merge_base = MERGE_BASE_B
+    eng = _in_merge(tmp_state_dir, fake_github, phase=phase)
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "REVIEW" and "not merged" in out.message
+    assert f"PR merge base moved to {MERGE_BASE_B[:12]} from the reviewed {MERGE_BASE[:12]}" in (
+        out.message
+    )
+    assert "base 'main' was rewritten under its name" in out.message
+    assert fake_github.merges == [] and eng.state.counted_merged_prs == []
+    assert ("get_merge_base_sha", "owner/repo", "main", SHA_A) in fake_github.calls
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.REVIEW and s.last_review_result == "stale"
+    assert s.current_merge_base_sha == MERGE_BASE_B and s.reviewed_merge_base_sha == MERGE_BASE
+    assert s.current_head_sha == SHA_A and s.current_base_ref == "main"
+    assert s.reviewed_head_sha == SHA_A and s.reviewed_base_ref == "main"
+    assert s.open_findings == []
+
+
+def test_merge_proceeds_when_the_base_tip_moved_but_the_merge_base_did_not(
+    tmp_state_dir, fake_github
+):
+    """#96 binds the merge base, not the base branch's tip: ordinary commits
+    landing on the base leave the reviewed diff intact, so a clean review
+    still merges (a PR that fell BEHIND is the readiness check's business,
+    unchanged by this)."""
+    fake_github.add_pr(head_sha=SHA_A)
+    # main advanced since the review, with its own green push run for the
+    # definition gate; the merge base of main and the PR HEAD is unchanged.
+    fake_github.branch_heads["main"] = SHA_C
+    fake_github.workflow_runs[BASE_RUN_ID] = replace(
+        fake_github.workflow_runs[BASE_RUN_ID], head_sha=SHA_C
+    )
+    eng = _in_merge(tmp_state_dir, fake_github)
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "UPDATE_EPIC" and eng.state.counted_merged_prs == [PR]
+    assert ("get_merge_base_sha", "owner/repo", "main", SHA_A) in fake_github.calls
+    assert load_state(eng.paths.state_file).reviewed_merge_base_sha == MERGE_BASE
+
+
+def test_merge_with_an_unreadable_merge_base_blocks_without_merging(tmp_state_dir, fake_github):
+    """A merge base GitHub does not answer for is not a moved merge base; the
+    gate cannot decide, so it refuses conclusively rather than guessing."""
+    fake_github.add_pr(head_sha=SHA_A)
+    fake_github.merge_base_error = GitHubError("HTTP 404: Not Found")
+    eng = _in_merge(tmp_state_dir, fake_github)
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "BLOCKED" and fake_github.merges == []
+    assert "pre-merge merge-base read" in eng.state.block_reason
+    assert "merge base of 'main' and HEAD" in eng.state.block_reason
+    assert "HTTP 404" in eng.state.block_reason
+    assert load_state(eng.paths.state_file).reviewed_merge_base_sha == MERGE_BASE
+
+
+def test_merge_with_a_transiently_unreadable_merge_base_rechecks(tmp_state_dir, fake_github):
+    fake_github.add_pr(head_sha=SHA_A)
+    fake_github.merge_base_error = GitHubUnavailableError("HTTP 502")
+    eng = _in_merge(tmp_state_dir, fake_github)
+    with pytest.raises(VerificationError, match="merge-base read .* failed .* HTTP 502"):
+        eng.step(allow_merge=True)
+    assert fake_github.merges == [] and eng.state.attempt == 1
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.MERGE and s.reviewed_merge_base_sha == MERGE_BASE
+
+
+def test_merge_base_branch_rewritten_between_verification_and_write_goes_back_to_review(
+    tmp_state_dir, fake_github
+):
+    """#96 on the post-write read: the merge did not happen and the PR is
+    OPEN at the reviewed HEAD on the reviewed base name, but the base was
+    rewritten in the window. Same rule as a retarget in that window."""
+    fake_github.add_pr(head_sha=SHA_A)
+    fake_github.merge_error = "`gh pr merge` failed (exit 1): base branch was modified"
+    eng = _in_merge(tmp_state_dir, fake_github)
+    orig_merge = fake_github.merge_pr
+
+    def rewrite_base_then_merge(*a, **kw):
+        fake_github.merge_base = MERGE_BASE_B
+        orig_merge(*a, **kw)
+
+    fake_github.merge_pr = rewrite_base_then_merge
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "REVIEW" and "not merged" in out.message
+    assert f"PR merge base moved to {MERGE_BASE_B[:12]} from the reviewed {MERGE_BASE[:12]}" in (
+        out.message
+    )
+    assert f"from merge base {MERGE_BASE_B[:12]} != reviewed {SHA_A[:12]}" in out.message
+    assert f"on 'main' from {MERGE_BASE[:12]}" in out.message
+    assert len(fake_github.merges) == 1 and fake_github.prs[PR].state == "OPEN"
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.REVIEW and s.last_review_result == "stale"
+    assert s.current_merge_base_sha == MERGE_BASE_B and s.counted_merged_prs == []
+
+
+def test_merge_base_unreadable_after_a_failed_write_blocks(tmp_state_dir, fake_github):
+    """The post-write read cannot tell whether the base was rewritten: the
+    failed merge is reported as before, with the read failure noted, and
+    the run is BLOCKED rather than sent to REVIEW on a guess."""
+    fake_github.add_pr(head_sha=SHA_A)
+    fake_github.merge_error = "`gh pr merge` failed (exit 1): base branch was modified"
+    eng = _in_merge(tmp_state_dir, fake_github)
+    orig_merge = fake_github.merge_pr
+
+    def break_read_then_merge(*a, **kw):
+        fake_github.merge_base_error = GitHubError("HTTP 404: Not Found")
+        orig_merge(*a, **kw)
+
+    fake_github.merge_pr = break_read_then_merge
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "BLOCKED" and eng.state.counted_merged_prs == []
+    assert "base branch was modified" in eng.state.block_reason
+    assert "merge base of 'main' and HEAD" in eng.state.block_reason
+    assert load_state(eng.paths.state_file).phase == Phase.BLOCKED
 
 
 def test_merge_base_retargeted_after_write_with_pending_async_merge_blocks(
@@ -6123,6 +6349,154 @@ def test_review_entry_ignores_a_pre_base_comment_for_the_round(tmp_state_dir):
     assert "THIS HEAD against THIS base (if\n  any): (none)" in prompt
     assert comment_url(PR, 91) not in prompt
     assert load_state(eng.paths.state_file).reviewed_base_ref == "main"
+
+
+def test_review_records_the_merge_base_it_decided_on(tmp_state_dir):
+    """#96: the REVIEW entry reads the merge base from GitHub and binds it;
+    the completed round records it next to the HEAD and base."""
+    gh = FakeGitHub()
+    gh.merge_base = MERGE_BASE_B
+    gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False, merge_base_sha=MERGE_BASE_B))
+    prompts = []
+
+    def reviews(req):
+        prompts.append(req.prompt)
+        return block(review_payload(1, SHA_A, []))
+
+    eng = _in_review(tmp_state_dir, gh, reviews)
+    eng.state.current_merge_base_sha = ""  # bound by the controller right before the review
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    assert ("get_merge_base_sha", "owner/repo", "main", SHA_A) in gh.calls
+    assert f"computed from): `{MERGE_BASE_B}`" in prompts[0]
+    assert f'"reviewed_merge_base_sha": "{MERGE_BASE_B}"' in prompts[0]
+    s = load_state(eng.paths.state_file)
+    assert s.reviewed_merge_base_sha == MERGE_BASE_B and s.current_merge_base_sha == MERGE_BASE_B
+    assert (s.reviewed_pr_url, s.reviewed_head_sha, s.reviewed_base_ref) == (PR, SHA_A, "main")
+
+
+def test_review_entry_with_an_unreadable_merge_base_launches_nothing(tmp_state_dir):
+    gh = FakeGitHub()
+    gh.merge_base_error = GitHubError("HTTP 404: Not Found")
+    eng = _in_review(tmp_state_dir, gh, [block(review_payload(1, SHA_A, []))])
+    eng._save()
+    with pytest.raises(GitHubError, match="merge base of 'main' and HEAD .* could not be read"):
+        eng.step()
+    assert eng.provider.calls == []
+    s = load_state(eng.paths.state_file)
+    assert s.review_round == 0 and s.phase == Phase.REVIEW and s.reviewed_merge_base_sha == ""
+
+
+def test_review_merge_base_moved_during_the_review_is_stale(tmp_state_dir):
+    """#96: the base was rewritten under its name while the reviewer worked
+    (same HEAD, same base name). The round is a review of a diff the PR no
+    longer shows: stale, round consumed, the new merge base bound for the
+    re-review, and the findings carried."""
+    gh = FakeGitHub()
+    gh.add_comment(PR, 100, review_comment_body(1, SHA_A, True, ["R1-F1"]))
+
+    def on_call(req):
+        gh.merge_base = MERGE_BASE_B  # main rewritten while the reviewer worked
+        return block(review_payload(1, SHA_A, [_finding(1)]))
+
+    eng = _in_review(tmp_state_dir, gh, on_call)
+    out = eng.step()
+    assert out.next_phase == "REVIEW"
+    assert f"PR merge base moved from {MERGE_BASE[:12]} to {MERGE_BASE_B[:12]}" in out.message
+    assert "base 'main' was rewritten under its name" in out.message
+    assert "1 finding(s) are carried to that review to re-check" in out.message
+    s = load_state(eng.paths.state_file)
+    assert s.last_review_result == "stale" and s.review_round == 1
+    assert s.reviewed_merge_base_sha == MERGE_BASE and s.current_merge_base_sha == MERGE_BASE_B
+    assert s.reviewed_head_sha == SHA_A and s.reviewed_base_ref == "main"
+    assert s.open_findings == [] and [f["id"] for f in s.prior_findings] == ["R1-F1"]
+    assert [r["result"] for r in s.review_history] == ["stale"]
+
+
+def test_review_base_tip_moved_during_the_review_is_not_stale(tmp_state_dir):
+    """Commits landing on the base while the reviewer worked do not move the
+    merge base: the round binds and completes."""
+    gh = FakeGitHub()
+    gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
+
+    def on_call(req):
+        gh.branch_heads["main"] = SHA_B
+        return block(review_payload(1, SHA_A, []))
+
+    eng = _in_review(tmp_state_dir, gh, on_call)
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    s = load_state(eng.paths.state_file)
+    assert s.last_review_result == "clean" and s.reviewed_merge_base_sha == MERGE_BASE
+
+
+def test_review_reentry_after_a_base_rewrite_does_not_adopt_the_old_merge_base_comment(
+    tmp_state_dir,
+):
+    """#96, the #93 rule applied to the merge base: round 1 was posted from
+    the old merge base and the result was lost; the base was then rewritten
+    under its name at the same HEAD. The re-entry binds the new merge base
+    and must not hand the old comment to the reviewer as this round's."""
+    gh = FakeGitHub()
+    gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False, merge_base_sha=MERGE_BASE))
+    prompts = []
+
+    def reviews(req):
+        prompts.append(req.prompt)
+        gh.add_comment(PR, 101, review_comment_body(1, SHA_A, False, merge_base_sha=MERGE_BASE_B))
+        return block(review_payload(1, SHA_A, [], cid=101))
+
+    eng = _in_review(tmp_state_dir, gh, reviews)
+    gh.merge_base = MERGE_BASE_B
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    assert "THIS HEAD against THIS base (if\n  any): (none)" in prompts[0]
+    assert comment_url(PR, 100) not in prompts[0]
+    assert f'"reviewed_merge_base_sha": "{MERGE_BASE_B}"' in prompts[0]
+    s = load_state(eng.paths.state_file)
+    assert s.reviewed_merge_base_sha == MERGE_BASE_B
+    assert s.last_review_comment_url == comment_url(PR, 101)
+
+
+@pytest.mark.parametrize(
+    "old_merge_base", [MERGE_BASE, None], ids=["other-merge-base", "no-merge-base"]
+)
+def test_review_result_naming_a_comment_for_another_merge_base_is_rejected(
+    tmp_state_dir, old_merge_base
+):
+    """A reviewer that adopts the old-merge-base (or pre-merge-base) comment
+    anyway is held to the key the entry used: rejected, nothing bound, no
+    round consumed."""
+    gh = FakeGitHub()
+    gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False, merge_base_sha=old_merge_base))
+    eng = _in_review(tmp_state_dir, gh, [block(review_payload(1, SHA_A, [], cid=100))])
+    gh.merge_base = MERGE_BASE_B
+    with pytest.raises(
+        VerificationError,
+        match=f"round 1 at HEAD .* on base 'main' from merge base {MERGE_BASE_B[:12]}",
+    ):
+        eng.step()
+    s = load_state(eng.paths.state_file)
+    assert s.review_round == 0 and s.phase == Phase.REVIEW
+    assert (s.reviewed_head_sha, s.reviewed_base_ref, s.reviewed_merge_base_sha) == ("", "", "")
+    assert s.current_merge_base_sha == MERGE_BASE_B
+
+
+def test_review_entry_ignores_a_pre_merge_base_comment_for_the_round(tmp_state_dir):
+    """A marker written before ``reviewed_merge_base_sha`` existed (#96)
+    reviewed a diff from a merge base nobody recorded. It is not this
+    round's comment (never adopted) and not a defect either."""
+    gh = FakeGitHub()
+    gh.add_comment(PR, 90, review_comment_body(1, SHA_B, True, ["R1-F1"], merge_base_sha=None))
+    gh.add_comment(PR, 91, review_comment_body(2, SHA_A, True, ["R2-F1"], merge_base_sha=None))
+
+    def reviews(req):
+        gh.add_comment(PR, 100, review_comment_body(2, SHA_A, False))
+        return block(review_payload(2, SHA_A, []))
+
+    eng = _in_review(tmp_state_dir, gh, reviews, round_done=1)
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    prompt = eng.provider.calls[0].prompt
+    assert "THIS HEAD against THIS base (if\n  any): (none)" in prompt
+    assert comment_url(PR, 91) not in prompt
+    assert load_state(eng.paths.state_file).reviewed_merge_base_sha == MERGE_BASE
 
 
 def test_new_pr_clears_the_review_binding(tmp_state_dir, fake_github):
