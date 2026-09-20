@@ -1,8 +1,10 @@
 """Secret redaction for anything that lands in logs.
 
 Baseline protection only — no detector claims to catch every secret shape.
-Covers common env-var assignments and bearer-style tokens before stdout /
-stderr / commands are persisted by the run logger.
+Covers common env-var assignments, ``Authorization`` headers, well-known
+token shapes (GitHub PATs, OpenAI / Anthropic keys, JWTs) and credentials
+embedded in URLs before stdout / stderr / commands are persisted by the run
+logger.
 """
 
 from __future__ import annotations
@@ -19,12 +21,36 @@ _PATTERNS: list[tuple[re.Pattern[str], str]] = [
         ),
         r"\1\2\3***REDACTED***\5",
     ),
-    # Authorization: Bearer <token> / Token <token>
+    # Authorization: Bearer <token> / Token <token> / Basic <base64>
     (
-        re.compile(r"(?i)\b(Authorization\s*:\s*(?:Bearer|Token)\s+)([^\s\"';]+)"),
+        re.compile(r"(?i)\b(Authorization\s*:\s*(?:Bearer|Token|Basic)\s+)([^\s\"';]+)"),
         r"\1***REDACTED***",
     ),
-    # GitHub PATs
+    # Credentials embedded in a URL: everything between ``scheme://`` and
+    # ``@`` (``https://x-access-token:<token>@github.com/...``,
+    # ``https://<token>@...``, ``postgresql://user:password@...``). The whole
+    # userinfo goes, username included: a bare userinfo is as often a token
+    # as a name, and the host and path that follow keep the line readable.
+    # The scheme is bounded and the userinfo class excludes ``/``, so a
+    # candidate never scans past the ``://`` of the next one: the pass stays
+    # linear over the 16 MiB an executor capture can be.
+    (
+        re.compile(r"(?i)\b([a-z][a-z0-9+.-]{1,31}://)[^\s/@]+@"),
+        r"\1***REDACTED***@",
+    ),
+    # JWTs: three base64url segments, the first a ``{"`` JSON header. A
+    # lookbehind rather than ``\b`` so a ``-eyJ`` inside a segment is not a
+    # fresh candidate that rescans the run (base64url admits ``-``); each
+    # run is then scanned by at most three candidates and the pass stays
+    # linear. Placed before the shorter token shapes so one of them cannot
+    # replace a slice of the token and leave the rest unrecognised.
+    (
+        re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"),
+        "***REDACTED***",
+    ),
+    # GitHub fine-grained PATs
+    (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{8,}"), "***REDACTED***"),
+    # GitHub classic PATs and app / OAuth tokens
     (re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{8,}"), "***REDACTED***"),
     # OpenAI-style sk- keys (incl. project variant sk-proj-...)
     (re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{8,}"), "***REDACTED***"),
@@ -45,21 +71,24 @@ _REDACTED = "***REDACTED***"
 # :func:`redact` never returns more than this many times its input's length.
 # Every pattern replaces a run of at least one character with the 14-character
 # marker, so a text can *grow* under redaction; the worst shape is a one
-# character secret behind the shortest recognised name: ``HF_TOKEN=x`` is 10
-# characters and becomes 23, a factor of 2.3, and repeating it needs a
-# separator (``HF_TOKEN=x;``, 11 to 24), so no longer text reaches that
-# ratio. Growth does not compound
-# across patterns: a later pattern can only lengthen the text by matching a
-# run *shorter* than the marker, and a marker is never part of such a run.
-# The value classes that admit ``*`` (the named-assignment and bearer values)
-# can only take a marker in whole, so a match containing one is already at
-# least as long as its replacement and shrinks or keeps the length; every
-# other value class excludes ``*``, so a marker is never part of those
-# matches at all. The characters around a replaced run are untouched, so no
-# new short match appears beside it. ``tests/test_redaction.py`` pins the
-# factor against the worst-case shape of every pattern and the wrapping case;
-# a new pattern must keep it, or raise it together with the persisted bound
-# in :mod:`autoforge.loop_guard` that depends on it.
+# character credential in the shortest URL that carries one: ``ab://x@`` is 7
+# characters and becomes 20, a factor of 2.86, and it repeats without a
+# separator (``@`` ends a word), so a text of that shape and no other reaches
+# the ratio and no text exceeds it. The next worst is a one character secret
+# behind the shortest recognised name: ``HF_TOKEN=x``, 10 to 23. Growth does
+# not compound across patterns: a later pattern can only lengthen the text by
+# matching a run *shorter* than the marker, and a marker is never part of
+# such a run. The value classes that admit ``*`` (the named-assignment,
+# header and URL-userinfo values) can only take a marker in whole, since none
+# of the characters that end such a run occurs in the marker, so a match
+# containing one is already at least as long as its replacement and shrinks
+# or keeps the length; every other value class excludes ``*``, so a marker is
+# never part of those matches at all. The characters around a replaced run
+# are untouched, so no new short match appears beside it.
+# ``tests/test_redaction.py`` pins the factor against the worst-case shape of
+# every pattern and the wrapping case; a new pattern must keep it, or raise
+# it together with the persisted bound in :mod:`autoforge.loop_guard` that
+# depends on it.
 MAX_GROWTH_FACTOR = 3
 
 

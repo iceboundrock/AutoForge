@@ -25,8 +25,12 @@ GITHUB_TOKEN
 GH_TOKEN
 OPENAI_API_KEY
 ANTHROPIC_API_KEY
-Authorization: Bearer ...
+Authorization: Bearer ... / Token ... / Basic ...
 ```
+
+and the well-known token shapes on their own (`ghp_*` and the other classic
+GitHub prefixes, `github_pat_*`, `sk-*`, `sk-ant-*`, three-segment `eyJ...`
+JWTs) and the whole userinfo of a URL (`https://x-access-token:...@github.com/...`).
 
 Redaction is defense in depth; do not claim it detects every possible secret.
 
