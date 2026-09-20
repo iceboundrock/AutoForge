@@ -2511,11 +2511,11 @@ def test_transient_github_failure_while_listing_candidates_stays_resumable(tmp_s
     real = gh.list_open_prs
     calls = {"n": 0}
 
-    def flaky(repo, limit=100, *, strict=False):
+    def flaky(repo):
         calls["n"] += 1
         if calls["n"] == 1:
             raise GitHubUnavailableError("gh: connection reset")
-        return real(repo, limit, strict=strict)
+        return real(repo)
 
     gh.list_open_prs = flaky
     with pytest.raises(GitHubUnavailableError):
@@ -2564,7 +2564,7 @@ def test_conclusive_github_failure_while_listing_candidates_blocks(tmp_state_dir
     gh = FakeGitHub()
     eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.PREPARED)
 
-    def denied(repo, limit=100, *, strict=False):
+    def denied(repo):
         raise GitHubError("HTTP 403: Resource not accessible by integration")
 
     gh.list_open_prs = denied
@@ -2574,20 +2574,20 @@ def test_conclusive_github_failure_while_listing_candidates_blocks(tmp_state_dir
     _assert_source_untouched(eng, gh)
 
 
-def test_a_truncated_candidate_listing_blocks_instead_of_replanning_again(tmp_state_dir):
+def test_an_incomplete_candidate_listing_blocks_instead_of_replanning_again(tmp_state_dir):
     """ "No candidate" decides whether the agent runs again, so it must be complete.
 
-    A listing that hit its limit cannot distinguish "the replacement does not
-    exist" from "it was past the limit"; adopting the former would start a
-    second implementation attempt on top of the first.
+    A listing that stopped before its end cannot distinguish "the replacement
+    does not exist" from "it was on a page never read"; adopting the former
+    would start a second implementation attempt on top of the first.
     """
     gh = FakeGitHub()
     eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.PREPARED)
-    gh.pr_listing_truncated = True
+    gh.open_pr_listing_incomplete = True
     out = eng.step()
     assert out.next_phase == "BLOCKED"
     assert "cannot list replacement PR candidates" in eng.state.block_reason
-    assert "truncated" in eng.state.block_reason
+    assert "cannot be read to its end" in eng.state.block_reason
     assert eng.provider.calls == []
     _assert_source_untouched(eng, gh)
 
@@ -2627,16 +2627,16 @@ def test_t6_a_truncated_all_states_listing_refuses_instead_of_reinvoking(tmp_sta
     assert "cannot list replacement PR candidates" in eng.state.block_reason
     assert "truncated" in eng.state.block_reason
     assert strict_seen == [True]  # the exhaustive listing was read strictly, once
-    assert ("list_open_prs", "owner/repo", True) in gh.calls
+    assert ("list_open_prs", "owner/repo") in gh.calls
     assert eng.provider.calls == []  # no second implementation attempt
     assert _txn(eng).stage is ReplanStage.REJECTED
     _assert_source_untouched(eng, gh)
 
 
-def test_a_truncated_listing_at_prepare_blocks_before_any_agent_runs(tmp_state_dir):
+def test_an_incomplete_listing_at_prepare_blocks_before_any_agent_runs(tmp_state_dir):
     gh = FakeGitHub()
     eng = _pending_at_the_source(tmp_state_dir, gh)
-    gh.pr_listing_truncated = True
+    gh.open_pr_listing_incomplete = True
     out = eng.step()
     assert out.next_phase == "BLOCKED"
     assert "cannot checkpoint the replan source" in eng.state.block_reason
@@ -4587,7 +4587,7 @@ def test_r5f1_the_prepare_step_refuses_a_listing_that_lost_the_source(tmp_state_
     gh = FakeGitHub()
     eng = make_engine(tmp_state_dir, ["must not run"], github=gh)
     gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2])
-    gh.list_open_prs = lambda repo, limit=100, *, strict=False: []  # type: ignore[method-assign]
+    gh.list_open_prs = lambda repo: []  # type: ignore[method-assign]
     eng.state.phase = Phase.REPLAN_REEXECUTE
     eng.state.current_issue_url = ISSUE
     eng.state.current_pr_url = PR

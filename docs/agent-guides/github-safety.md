@@ -21,9 +21,11 @@ Examples:
 
 The implementer is launched only after the controller has established that
 no open PR already implements the issue. The PR the controller persisted is
-read first; then the repository's open PRs are listed (strictly: a listing
-that may be truncated blocks, because "none exists" is then not knowable)
-for the `ai-implementation` marker of `{"issue"}`, which the controller
+read first; then the repository's open PRs are listed, to the end (the
+client walks GitHub's pages by cursor until it reports no next page, so
+the listing has no ceiling to fall past, #20; a listing the client cannot
+read to its end blocks, because "none exists" is then not knowable) for
+the `ai-implementation` marker of `{"issue"}`, which the controller
 renders into the implementer's prompt (`IMPLEMENTATION_MARKER`) and the
 agent must put in the PR body verbatim:
 
@@ -51,11 +53,11 @@ Verify:
 - its body carries the issue's `ai-implementation` marker, and it is the
   only open PR that does: a PR without the marker is one no later entry
   could find again, and one of two is a choice the entry never makes. The
-  read-back uses the same strict listing the entry uses (one snapshot: the
+  read-back uses the same complete listing the entry uses (one snapshot: the
   marked PR's state, HEAD and branch are read from it), so the two cannot
   disagree about which PR is the issue's. A replan's replacement PR is held
   to the same rule, marker and sole-claimant alike, by the transaction's
-  target predicates on one strict listing at binding, on the final read
+  target predicates on one complete listing at binding, on the final read
   before the close, at the confirmation after it and at activation, with
   the PR being superseded excluded by identity
   ([replan-transaction.md](replan-transaction.md)), so the PR the
@@ -94,8 +96,10 @@ one, and every probe and read-back reads them through it:
   listing or view returns is decoded by one strict decoder per kind
   (`github.py`); a row without a usable URL of the right kind, or whose
   `number` disagrees with its URL, is a conclusive `GitHubError`, never an
-  object with an empty identity that no comparison could match. Truncation
-  is judged on the raw row count before decoding
+  object with an empty identity that no comparison could match. Where a
+  listing still has a ceiling (open issues, all-states PRs), truncation is
+  judged on the raw row count before decoding; the open-PR listing has none
+  and is read to its end or refused
 - **the prompt trust boundary**: finding ids and URLs recovered from
   markers are validated by the same rules as `CONTROL_RESULT` fields and
   escaped before they are rendered into a prompt; a marker's text never

@@ -2783,15 +2783,16 @@ class ControllerEngine:
 
         The issue's implementation PR is the open PR carrying the
         ``ai-implementation`` marker for it (:func:`render_implementation_marker`),
-        found in a strict listing of the repository's open PRs: a listing the
-        client cannot prove complete blocks, because "no PR exists" is then
-        not knowable and launching an agent on that guess is how a second
-        implementation gets created. The marker is the identity
-        :meth:`_apply_analyze` requires of the PR the agent claims, so a PR
-        the read-back would accept is a PR every later entry finds, whatever
-        its branch is called and whether or not GitHub links it to the
-        issue. A PR the controller already persisted is a candidate as well,
-        marker or not: it is the controller's own verified record.
+        found in a complete listing of the repository's open PRs, read to
+        the end (issue #20): a listing the client cannot read to the end
+        blocks, because "no PR exists" is then not knowable and launching an
+        agent on that guess is how a second implementation gets created.
+        The marker is the identity :meth:`_apply_analyze` requires of the PR
+        the agent claims, so a PR the read-back would accept is a PR every
+        later entry finds, whatever its branch is called and whether or not
+        GitHub links it to the issue. A PR the controller already persisted
+        is a candidate as well, marker or not: it is the controller's own
+        verified record.
         """
         state = self._require_state()
         pr, problem = self._implementation_pr_candidate()
@@ -2822,10 +2823,10 @@ class ControllerEngine:
         The probe behind :meth:`_try_recover_pr` (and behind ``unblock`` for
         a run with no PR bound): the persisted PR if it is still open, plus
         the open PR carrying the issue's ``ai-implementation`` marker from a
-        strict listing. Returns ``(pr, "")`` for exactly one usable
+        complete listing. Returns ``(pr, "")`` for exactly one usable
         candidate, ``(None, "")`` for none, and ``(None, reason)`` when the
         answer is not knowable -- an unreadable persisted PR, a listing that
-        cannot be proven complete, a marker defect, two candidates, a PR of
+        cannot be read to the end, a marker defect, two candidates, a PR of
         another repository or one without a readable HEAD. ``reason`` is the
         text the caller blocks (or refuses) with; the controller never
         guesses. A transient GitHub failure propagates unchanged.
@@ -4581,9 +4582,9 @@ class ControllerEngine:
         return Collection(whole.kind, whole.noun, mine, whole.defects)
 
     def _implementation_prs(self, issue: GitHubIssueRef) -> Claimants[PRInfo, ImplementationClaim]:
-        """The open PRs claiming to implement ``issue``, from one strict listing."""
+        """The open PRs claiming to implement ``issue``, from one complete listing."""
         state = self._require_state()
-        prs = self.github.list_open_prs(state.repository, strict=True)
+        prs = self.github.list_open_prs(state.repository)
         return collect(IMPLEMENTATION, prs, "open PR").claimants(
             issue.identity, f"issue {issue.canonical}"
         )
@@ -4896,10 +4897,10 @@ class ControllerEngine:
         try:
             source = self.github.get_pr(state.current_pr_url)
             repo = self.github.get_repo(state.repository)
-            # Repository-wide and strict, for the same reason the candidate
+            # Repository-wide and complete, for the same reason the candidate
             # lookup is: an issue-shaped filter cannot see a PR that is not
             # (yet) linked to the issue.
-            preexisting = self.github.list_open_prs(state.repository, strict=True)
+            preexisting = self.github.list_open_prs(state.repository)
             # Read *before* the transaction id is generated below, so every PR
             # that could already be carrying a copied marker is under it.
             watermark = self.github.latest_pr_number(state.repository)
@@ -5012,13 +5013,13 @@ class ControllerEngine:
         """
         state = self._require_state()
         try:
-            # Every open PR in the repository, strictly: "no candidate exists"
+            # Every open PR in the repository, to the end: "no candidate exists"
             # decides whether the agent runs again, so it must be neither a
             # truncated listing in disguise nor a filtered one. A replacement
             # the agent created but had not yet linked to the issue is exactly
             # what an issue-shaped filter drops, and re-running the agent on it
             # is the one outcome crash idempotency forbids.
-            open_prs = self.github.list_open_prs(state.repository, strict=True)
+            open_prs = self.github.list_open_prs(state.repository)
         except GitHubUnavailableError:
             raise  # the candidate set is unknown, not ambiguous: stay resumable
         except GitHubError as exc:
@@ -5207,7 +5208,7 @@ class ControllerEngine:
         # earlier attempt at it was ever recorded. Revalidate both sides now.
         try:
             target = self.github.get_pr(txn.replacement_pr_url)
-            open_prs = self.github.list_open_prs(state.repository, strict=True)
+            open_prs = self.github.list_open_prs(state.repository)
         except GitHubUnavailableError:
             raise
         except GitHubError as exc:
@@ -5326,7 +5327,7 @@ class ControllerEngine:
         if not drift:
             try:
                 target = self.github.get_pr(txn.replacement_pr_url)
-                open_prs = self.github.list_open_prs(state.repository, strict=True)
+                open_prs = self.github.list_open_prs(state.repository)
             except GitHubUnavailableError:
                 raise
             except GitHubError as exc:
@@ -5476,7 +5477,7 @@ class ControllerEngine:
         try:
             source = self.github.get_pr(txn.source_pr_url)
             target = self.github.get_pr(txn.replacement_pr_url)
-            open_prs = self.github.list_open_prs(state.repository, strict=True)
+            open_prs = self.github.list_open_prs(state.repository)
         except GitHubUnavailableError:
             raise  # unknown, not refused: `resume` re-reads and re-verifies
         except GitHubError as exc:
@@ -5826,7 +5827,7 @@ class ControllerEngine:
                 f"agent reported PR {pr_ref.canonical} outside repository {state.repository}"
             )
         # The identity the next entry will look for, read the way the entry
-        # reads it: one strict listing of the open PRs, in which exactly one
+        # reads it: one complete listing of the open PRs, in which exactly one
         # carries this issue's implementation marker, and it is the PR the
         # agent reported. Accepting a PR without the marker would persist a
         # PR no re-entry after a lost state file could find again; accepting

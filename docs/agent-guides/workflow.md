@@ -266,9 +266,10 @@ next entry could not find again.
 
 - `ANALYZE_EXECUTE` adopts the open PR carrying the issue's
   `ai-implementation` marker (the persisted PR, or the one found by a
-  strict listing of the repository's open PRs), if one exists, without
-  launching the agent; two candidates block, and so does a listing that
-  cannot be proven complete, since "none exists" is then not knowable. A
+  complete listing of the repository's open PRs, read to the end), if one
+  exists, without launching the agent; two candidates block, and so does a
+  listing that cannot be read to its end, since "none exists" is then not
+  knowable. A
   PR is identified by that marker alone, never by its branch name or a
   linked issue; the read-back after the agent holds the reported PR to the
   same rule (github-safety.md, "Before ANALYZE_EXECUTE"), and so does the
