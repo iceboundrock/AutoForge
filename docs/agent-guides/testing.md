@@ -51,11 +51,18 @@ High-priority coverage includes:
 
 - success
 - non-zero exit
-- timeout, including a descendant that holds the inherited pipes after the
-  child has exited (inside the process group, and outside it via `setsid`),
-  a same-group descendant that closed its stdio and ignores SIGTERM, and a
-  direct child that survives SIGKILL (the kill neutered), which is abandoned
-  after the grace rather than waited for
+- timeout, including a same-group descendant that closed its stdio and
+  ignores SIGTERM (escalated to SIGKILL, gone before `execute()` returns),
+  a writer outside the group via `setsid` (the capture abandoned after the
+  grace and reported as such), and a direct child that survives SIGKILL
+  (the kill neutered), which is abandoned after the grace rather than waited
+  for and reported as a group that survived the kill
+- leftovers after a normal exit (#85): a descendant holding the inherited
+  pipes and one with closed stdio are each killed after the exit grace with
+  the child's own exit status (0 and non-zero) and output kept and
+  `descendants_killed` set; a helper that exits within the grace is neither
+  killed nor reported; a `setsid` escapee holding the pipes is reported as an
+  abandoned capture; a clean exit and a clean kill report nothing
 - bounded capture: a stream past the bound keeps its head and tail, the
   retained size honours a bound smaller than one pipe read, and memory stays
   at the bound plus a constant under one-byte reads

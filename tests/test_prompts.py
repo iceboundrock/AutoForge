@@ -495,6 +495,16 @@ def test_common_prompts_state_the_whole_block_bound(engine, tmp_path):
     assert f"at most\n  {MAX_CONTROL_RESULT_CHARS} characters" in rendered
 
 
+def test_common_prompts_state_that_nothing_outlives_the_invocation():
+    """#85: every agent is told that its process group is terminated when it
+    exits, so a server it meant to leave for a later phase is a mistake it
+    was warned about, not a surprise in the run log."""
+    for template in ("common.md", "local_common.md"):
+        text = prompts.load_template(template)
+        assert "Nothing you start outlives your invocation" in text, template
+        assert "never rely on a\n  background process for a later phase" in text, template
+
+
 def test_common_prompt_states_the_worktree_and_environment_isolation():
     """The agent is told where it runs and what it must never touch (#10)."""
     common = prompts.load_template("common.md")
@@ -567,10 +577,11 @@ def test_review_prompt_makes_the_phase_read_only(engine):
 
 def test_prompt_version_is_rendered_and_was_bumped_for_the_prompt_changes(engine):
     """#19: the prompt contract changed (SHA rule, fence rule, read-only
-    review), so the version every prompt and run log carries moved past v1."""
+    review), so the version every prompt and run log carries moved past v1;
+    #85 (nothing an agent starts outlives its invocation) moved it past v2."""
     from autoforge import __prompt_version__
 
-    assert __prompt_version__ != "v1"
+    assert __prompt_version__ not in ("v1", "v2")
     engine.state.phase = Phase.ANALYZE_EXECUTE
     rendered = engine.render_prompt_for(Phase.ANALYZE_EXECUTE)
     header = f"# AutoForge controller instructions (trusted): {__prompt_version__}"

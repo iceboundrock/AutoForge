@@ -48,7 +48,7 @@ from dataclasses import dataclass
 
 from .config import ProfileConfig
 from .errors import ConfigurationError
-from .executor import ExecutionRequest, ExecutionResult, execute
+from .executor import ExecutionRequest, ExecutionResult, describe_leftovers, execute
 
 Runner = Callable[[ExecutionRequest], ExecutionResult]
 
@@ -85,11 +85,26 @@ class AgentExecutionResult:
     stdout_truncated: bool = False
     stderr_truncated: bool = False
     stdout_tail_offset: int = 0
+    # What the invocation left behind (see :class:`ExecutionResult`): the
+    # engine records these in the run log; none of them changes whether the
+    # child's own result is read.
+    descendants_killed: bool = False
+    group_survived_kill: bool = False
+    capture_abandoned: bool = False
 
     @property
     def stdout_tail(self) -> str:
         """The part of stdout captured contiguously up to EOF."""
         return self.stdout[self.stdout_tail_offset :]
+
+    @property
+    def leftovers(self) -> str:
+        """What the invocation left behind, for a log line; empty when nothing."""
+        return describe_leftovers(
+            descendants_killed=self.descendants_killed,
+            group_survived_kill=self.group_survived_kill,
+            capture_abandoned=self.capture_abandoned,
+        )
 
     @property
     def ok(self) -> bool:
@@ -119,6 +134,9 @@ class AgentExecutionResult:
             stdout_truncated=res.stdout_truncated,
             stderr_truncated=res.stderr_truncated,
             stdout_tail_offset=res.stdout_tail_offset,
+            descendants_killed=res.descendants_killed,
+            group_survived_kill=res.group_survived_kill,
+            capture_abandoned=res.capture_abandoned,
             provider=profile.provider,
             model=profile.model,
             effort=profile.effort,

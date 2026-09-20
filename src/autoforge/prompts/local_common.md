@@ -79,6 +79,12 @@ owns committing, branching and history.
 
 - Work non-interactively: never wait for human input.
 - Use `git` for read-only inspection (`git status`, `git diff`, `git log`).
+- Nothing you start outlives your invocation: once you exit, every process
+  still in your process group (a dev server, a watcher, anything started
+  with `&`) is terminated by the controller after a short grace, whether or
+  not it still holds your stdout/stderr, and the run log records that it
+  had to be. Stop what you start before you exit, and never rely on a
+  background process for a later phase.
 - Do not modify AutoForge controller state (`.autoforge/`), and do not commit it.
 - Read `AGENTS.md` / `CLAUDE.md` first when they exist; their build, test,
   style and workflow rules outrank the feature specification's wording on

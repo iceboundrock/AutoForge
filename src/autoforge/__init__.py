@@ -2,4 +2,4 @@
 
 __version__ = "0.1.0"
 __protocol_version__ = "4"
-__prompt_version__ = "v2"
+__prompt_version__ = "v3"

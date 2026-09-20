@@ -9,8 +9,10 @@ Layout::
             request.json      # phase, profile, provider, model, effort, prompt version,
                               # cwd, timeout, redacted argv (no environment dump)
             prompt.md         # rendered prompt sent to the agent (redacted)
-            execution.json    # timestamps, exit code, timed_out, stdout/stderr sizes
-                              # and whether either stream was truncated at the capture bound
+            execution.json    # timestamps, exit code, timed_out, stdout/stderr sizes,
+                              # whether either stream was truncated at the capture bound
+                              # and what the invocation left behind (descendants killed,
+                              # a group member that survived SIGKILL, an abandoned capture)
             stdout.log        # redacted stdout (head + omission marker + tail when truncated)
             stderr.log        # redacted stderr (same)
             control-result.json   # parsed CONTROL_RESULT when one was accepted
@@ -171,6 +173,13 @@ class ExecutionRecord:
     # ``executor.DEFAULT_MAX_OUTPUT_BYTES``); ``stdout.log`` shows the cut.
     stdout_truncated: bool = False
     stderr_truncated: bool = False
+    # What the invocation left behind (see ``executor.ExecutionResult``):
+    # the child exited but its leftovers had to be killed; a process was
+    # still in its group after SIGKILL; a pipe never reached EOF. All False
+    # for a clean exit or a clean kill.
+    descendants_killed: bool = False
+    group_survived_kill: bool = False
+    capture_abandoned: bool = False
     dry_run: bool = False
     parsed_result: dict | None = None
     error: str = ""
@@ -497,6 +506,9 @@ class RunLogger:
             "timed_out": record.timed_out,
             "stdout_truncated": record.stdout_truncated,
             "stderr_truncated": record.stderr_truncated,
+            "descendants_killed": record.descendants_killed,
+            "group_survived_kill": record.group_survived_kill,
+            "capture_abandoned": record.capture_abandoned,
             "stdout_chars": len(stdout or ""),
             "stderr_chars": len(stderr or ""),
             "error": record.error,
