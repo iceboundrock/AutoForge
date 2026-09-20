@@ -54,6 +54,11 @@ has to remember to. The writers that redact before persistence are:
   text and `_block` redacts it at the sink.
 - the two agent-message writers (`status: failure` / `blocked` in the
   REMOTE and LOCAL step paths): `block_reason` from the agent's `message`.
+  These three writers also bound the reason to `state.MAX_BLOCK_REASON_CHARS`
+  (`state.bound_block_reason`, #88), *after* redacting it: the bound clips
+  by character count and knows nothing about secrets, so a secret cut by
+  the clip would no longer match its pattern if the order were reversed.
+  `tests/test_engine.py` pins the order with a secret on each clip boundary.
 - `_record_verification_failure`: each `verification_failures` entry, which
   quotes a `VerificationError` (a validation command's output, a PR body,
   `gh` output). `REPLAN_REEXECUTE` renders that list into its prompt, so the

@@ -180,7 +180,10 @@ that are not rendered on one line of a prompt (`summary`, `message`,
 A `FIX` result is untrusted in the same way and is persisted the same way:
 every accepted resolution is stored whole (after redaction) in
 `state.last_fix_resolutions`, and in LOCAL mode an `unresolved` rationale is
-echoed into the persisted `block_reason` that `status` shows the operator.
+echoed into the persisted `block_reason` that `status` shows the operator
+(the echo of every unresolved rationale together is bounded again at the
+sink, by `state.MAX_BLOCK_REASON_CHARS`, since the parser bounds each
+rationale but not their join; `last_fix_resolutions` keeps them whole).
 The parser therefore bounds the `FIX` payload with the same policy
 (rejection, never clipping; the message states the size and the limit,
 never the text; the count is checked before any element is parsed):
