@@ -28,6 +28,7 @@ from .errors import (
     GitHubUnavailableError,
 )
 from .executor import ExecutionRequest, ExecutionResult, execute
+from .redaction import redact
 from .validation import (
     GitHubCommentRef,
     GitHubIssueRef,
@@ -790,8 +791,12 @@ class GitHubClient:
                     "bound and cannot be parsed"
                 )
             elif res.exit_code != 0:
+                # `gh` stderr can echo the request it made, including an
+                # ``Authorization`` header or a token in a URL, and this
+                # message ends up in `block_reason`, `verification_failures`
+                # and the run log. Classify the raw tail, quote it redacted.
                 tail = res.stderr.strip()[-1000:]
-                last_error = f"`gh {' '.join(args)}` failed (exit {res.exit_code}): {tail}"
+                last_error = f"`gh {' '.join(args)}` failed (exit {res.exit_code}): {redact(tail)}"
                 transient = is_transient_gh_failure(tail)
             else:
                 return res

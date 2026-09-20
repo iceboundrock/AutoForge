@@ -332,12 +332,13 @@ def test_existing_run_refusal_redacts_the_corrupt_state_error(tmp_path, capsys, 
     assert sorted(p.name for p in (tmp_path / ".autoforge").iterdir()) == ["state.json"]
 
 
-def test_run_terminal_line_redacts_a_block_reason_the_engine_persisted_raw(
+def test_run_terminal_line_and_state_file_both_redact_a_block_reason(
     tmp_path, capsys, monkeypatch, fakes
 ):
-    """#6: the terminal line of `run` / `resume` is the CLI's own boundary,
-    not a courtesy of the engine: a `_block` reason that quotes `gh` output
-    reaches `state.json` as written, and only the printed line is redacted."""
+    """#6 / #98: the terminal line of `run` / `resume` is the CLI's own
+    boundary and stays in place, but it is no longer the only one: a `_block`
+    reason that quotes `gh` output is also redacted by the engine before it
+    reaches `state.json`."""
     monkeypatch.chdir(tmp_path)
     sd = str(tmp_path / ".autoforge")
     assert (
@@ -357,9 +358,13 @@ def test_run_terminal_line_redacts_a_block_reason_the_engine_persisted_raw(
     assert FAKE_SECRET not in captured.out + captured.err
     assert "is BLOCKED: state references PR" in captured.out
     assert "Authorization: Bearer ***REDACTED***" in captured.out
-    # The engine wrote the reason as `gh` reported it; the CLI did the redacting.
+    # The engine redacted the reason before persisting it (#98); the CLI's
+    # output-side pass is defense in depth on top of that, not the only guard.
     persisted = json.loads(state_file.read_text())
-    assert persisted["phase"] == "BLOCKED" and FAKE_SECRET in persisted["block_reason"]
+    assert persisted["phase"] == "BLOCKED"
+    assert FAKE_SECRET not in persisted["block_reason"]
+    assert "Authorization: Bearer ***REDACTED***" in persisted["block_reason"]
+    assert FAKE_SECRET not in state_file.read_text()
 
 
 def test_ready_banner_redacts_state_derived_fields(tmp_path, capsys, monkeypatch, fakes):
