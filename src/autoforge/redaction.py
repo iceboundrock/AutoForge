@@ -31,21 +31,30 @@ _PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # ``https://<token>@...``, ``postgresql://user:password@...``). The whole
     # userinfo goes, username included: a bare userinfo is as often a token
     # as a name, and the host and path that follow keep the line readable.
-    # The scheme is bounded and the userinfo class excludes ``/``, so a
+    # The userinfo class stops at the characters that end a URL's authority
+    # (``/``, ``?``, ``#``; RFC 3986 §3.2), so an ``@`` in a path, query or
+    # fragment (``https://host?to=a@b``) is not mistaken for a credential
+    # delimiter. The scheme is bounded and the class excludes ``/``, so a
     # candidate never scans past the ``://`` of the next one: the pass stays
     # linear over the 16 MiB an executor capture can be.
     (
-        re.compile(r"(?i)\b([a-z][a-z0-9+.-]{1,31}://)[^\s/@]+@"),
+        re.compile(r"(?i)\b([a-z][a-z0-9+.-]{1,31}://)[^\s/?#@]+@"),
         r"\1***REDACTED***@",
     ),
-    # JWTs: three base64url segments, the first a ``{"`` JSON header. A
-    # lookbehind rather than ``\b`` so a ``-eyJ`` inside a segment is not a
-    # fresh candidate that rescans the run (base64url admits ``-``); each
-    # run is then scanned by at most three candidates and the pass stays
-    # linear. Placed before the shorter token shapes so one of them cannot
-    # replace a slice of the token and leave the rest unrecognised.
+    # JWTs: three base64url segments, the first a ``{"`` JSON header. Only
+    # the header has a floor: ``eyJ`` is ``{"`` plus the first key character,
+    # and the smallest such object (``{"a":0}``) encodes to ten characters.
+    # The payload and signature may be short or empty, as the compact
+    # serialization permits: ``{}`` is ``e30``, an unsecured ``alg: none``
+    # token (RFC 7519 §6) has an empty signature, and detached content
+    # (RFC 7515 App. F) an empty payload. A lookbehind rather than ``\b``
+    # so a ``-eyJ`` inside a segment is not a fresh candidate that rescans
+    # the run (base64url admits ``-``); each run is then scanned by at most
+    # three candidates and the pass stays linear. Placed before the shorter
+    # token shapes so one of them cannot replace a slice of the token and
+    # leave the rest unrecognised.
     (
-        re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"),
+        re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{7,}\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*"),
         "***REDACTED***",
     ),
     # GitHub fine-grained PATs
