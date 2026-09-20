@@ -929,10 +929,11 @@ def test_review_entry_hands_an_existing_round_comment_to_the_reviewer(tmp_state_
     assert eng.step().next_phase == "READY_FOR_MERGE"
     prompt = eng.provider.calls[0].prompt
     assert (
-        "Comment already posted for THIS round at THIS HEAD against THIS base (if\n  any): "
+        "Comment already posted for THIS round at THIS HEAD against THIS base and\n"
+        "  THIS merge base (if any): "
         f"{comment_url(PR, 100)}" in prompt
     )
-    assert "THIS HEAD against THIS base (if\n  any): (none)" not in prompt
+    assert "THIS HEAD against THIS base and\n  THIS merge base (if any): (none)" not in prompt
     assert len(gh.comments[PR]) == 1
 
 
@@ -950,8 +951,8 @@ def test_review_entry_ignores_a_comment_for_the_round_at_another_head(tmp_state_
     assert eng.step().next_phase == "READY_FOR_MERGE"
     prompt = eng.provider.calls[0].prompt
     assert (
-        "Comment already posted for THIS round at THIS HEAD against THIS base (if\n  any): (none)"
-        in prompt
+        "Comment already posted for THIS round at THIS HEAD against THIS base and\n"
+        "  THIS merge base (if any): (none)" in prompt
     )
     assert comment_url(PR, 90) not in prompt
 
@@ -2027,7 +2028,10 @@ def test_correction_after_the_review_comment_was_posted_adopts_it(tmp_state_dir)
         if not req.correction:
             gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
             return "junk\n"
-        assert f"THIS HEAD against THIS base (if\n  any): {comment_url(PR, 100)}" in req.prompt
+        assert (
+            f"THIS HEAD against THIS base and\n  THIS merge base (if any): {comment_url(PR, 100)}"
+            in req.prompt
+        )
         return block(review_payload(1, SHA_A, []))
 
     eng = _in_review(tmp_state_dir, gh, reviews)
@@ -6270,7 +6274,7 @@ def test_review_reentry_after_a_retarget_does_not_adopt_the_old_base_comment(tmp
     eng = _in_review(tmp_state_dir, gh, reviews)
     gh.prs[PR].base_ref = "release/1.x"
     assert eng.step().next_phase == "READY_FOR_MERGE"
-    assert "THIS HEAD against THIS base (if\n  any): (none)" in prompts[0]
+    assert "THIS HEAD against THIS base and\n  THIS merge base (if any): (none)" in prompts[0]
     assert comment_url(PR, 100) not in prompts[0]
     assert "Reviewed base branch (bound by the controller): `release/1.x`" in prompts[0]
     assert '"reviewed_base_ref": "release/1.x"' in prompts[0]
@@ -6346,7 +6350,7 @@ def test_review_entry_ignores_a_pre_base_comment_for_the_round(tmp_state_dir):
     eng = _in_review(tmp_state_dir, gh, reviews, round_done=1)
     assert eng.step().next_phase == "READY_FOR_MERGE"
     prompt = eng.provider.calls[0].prompt
-    assert "THIS HEAD against THIS base (if\n  any): (none)" in prompt
+    assert "THIS HEAD against THIS base and\n  THIS merge base (if any): (none)" in prompt
     assert comment_url(PR, 91) not in prompt
     assert load_state(eng.paths.state_file).reviewed_base_ref == "main"
 
@@ -6447,7 +6451,7 @@ def test_review_reentry_after_a_base_rewrite_does_not_adopt_the_old_merge_base_c
     eng = _in_review(tmp_state_dir, gh, reviews)
     gh.merge_base = MERGE_BASE_B
     assert eng.step().next_phase == "READY_FOR_MERGE"
-    assert "THIS HEAD against THIS base (if\n  any): (none)" in prompts[0]
+    assert "THIS HEAD against THIS base and\n  THIS merge base (if any): (none)" in prompts[0]
     assert comment_url(PR, 100) not in prompts[0]
     assert f'"reviewed_merge_base_sha": "{MERGE_BASE_B}"' in prompts[0]
     s = load_state(eng.paths.state_file)
@@ -6494,7 +6498,7 @@ def test_review_entry_ignores_a_pre_merge_base_comment_for_the_round(tmp_state_d
     eng = _in_review(tmp_state_dir, gh, reviews, round_done=1)
     assert eng.step().next_phase == "READY_FOR_MERGE"
     prompt = eng.provider.calls[0].prompt
-    assert "THIS HEAD against THIS base (if\n  any): (none)" in prompt
+    assert "THIS HEAD against THIS base and\n  THIS merge base (if any): (none)" in prompt
     assert comment_url(PR, 91) not in prompt
     assert load_state(eng.paths.state_file).reviewed_merge_base_sha == MERGE_BASE
 

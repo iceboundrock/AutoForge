@@ -14,8 +14,8 @@ PR comment describing the outcome. This is review round {{REVIEW_ROUND}}.
 - Reviewed merge base (bound by the controller; the commit the diff is
   computed from): `{{REVIEWED_MERGE_BASE_SHA}}`
 - Previous review comment (if any): {{PREVIOUS_REVIEW_COMMENT_URL}}
-- Comment already posted for THIS round at THIS HEAD against THIS base (if
-  any): {{EXISTING_REVIEW_COMMENT_URL}}
+- Comment already posted for THIS round at THIS HEAD against THIS base and
+  THIS merge base (if any): {{EXISTING_REVIEW_COMMENT_URL}}
 - Follow-up issues already open for this PR (finding id: issue), from
   earlier rounds:
   {{EXISTING_FOLLOW_UP_ISSUES}}
@@ -124,11 +124,12 @@ round or accounted for under Observations. The prior round's comment
 ## If a comment for this round already exists
 
 The controller reads the PR before launching you. When the line "Comment
-already posted for THIS round at THIS HEAD against THIS base" above names a
-URL, an earlier invocation of this same round posted that comment (it
-carries the `ai-review-result` marker for round {{REVIEW_ROUND}} at
-`{{REVIEWED_HEAD_SHA}}` against `{{REVIEWED_BASE_REF}}`) and the controller
-could not record the result. That comment IS this round's comment;
+already posted for THIS round at THIS HEAD against THIS base and THIS merge
+base" above names a URL, an earlier invocation of this same round posted
+that comment (it carries the `ai-review-result` marker for round
+{{REVIEW_ROUND}} at `{{REVIEWED_HEAD_SHA}}` against `{{REVIEWED_BASE_REF}}`
+at merge base `{{REVIEWED_MERGE_BASE_SHA}}`) and the controller could not
+record the result. That comment IS this round's comment;
 do NOT post a second one. Read it:
 
 - If it is a complete review in the layout below, adopt it: report its URL as
@@ -138,11 +139,11 @@ do NOT post a second one. Read it:
   (`gh api -X PATCH repos/{{REPOSITORY}}/issues/comments/<id> -F body=@<file>`)
   and report the same URL.
 
-A round has exactly one review comment at its HEAD and base. The
-controller rejects the round when the PR ends up with two comments carrying
-the marker for round {{REVIEW_ROUND}} at `{{REVIEWED_HEAD_SHA}}` against
-`{{REVIEWED_BASE_REF}}`, and blocks the run on the next entry until a human
-removes one.
+A round has exactly one review comment at its HEAD, base and merge base.
+The controller rejects the round when the PR ends up with two comments
+carrying the marker for round {{REVIEW_ROUND}} at `{{REVIEWED_HEAD_SHA}}`
+against `{{REVIEWED_BASE_REF}}` at merge base `{{REVIEWED_MERGE_BASE_SHA}}`,
+and blocks the run on the next entry until a human removes one.
 
 When that line says `(none)`, no comment on the PR is this round's, even if
 one carries a round {{REVIEW_ROUND}} marker: a marker naming another HEAD,

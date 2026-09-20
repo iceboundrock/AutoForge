@@ -97,7 +97,10 @@ def test_review_prompt_contract():
         "{{EXISTING_REVIEW_COMMENT_URL}}",
         "If a comment for this round already exists",
         "do NOT post a second one",
-        "exactly one review comment at its HEAD and base",
+        # #96 R2-F1: the uniqueness rule names the full four-part key.
+        "exactly one review comment at its HEAD, base and merge base",
+        "against THIS base and\n  THIS merge base",
+        "at merge base `{{REVIEWED_MERGE_BASE_SHA}}`",
         # PR #93 review: the round's comment is looked up by (round, HEAD,
         # base); a comment against another base is never this round's.
         "{{REVIEWED_BASE_REF}}",
@@ -448,12 +451,14 @@ def test_engine_prompt_variables_review_and_fix(engine):
     assert marker_line.count("-->") == 1 and marker_line.endswith("-->")
     # Rendered outside a step, no PR was read: no existing comment is named.
     assert (
-        "Comment already posted for THIS round at THIS HEAD against THIS base (if\n  any): (none)"
-        in text
+        "Comment already posted for THIS round at THIS HEAD against THIS base and\n"
+        "  THIS merge base (if any): (none)" in text
     )
     engine._existing_review_comment_url = f"{PR}#issuecomment-7"
     text = engine.render_prompt_for(Phase.REVIEW)
-    assert f"THIS HEAD against THIS base (if\n  any): {PR}#issuecomment-7" in text
+    assert (
+        f"THIS HEAD against THIS base and\n  THIS merge base (if any): {PR}#issuecomment-7" in text
+    )
     engine._existing_review_comment_url = ""
     engine.state.phase = Phase.FIX
     engine.state.open_findings = [
