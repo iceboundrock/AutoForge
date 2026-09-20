@@ -183,9 +183,9 @@ prompt renders as `REVIEW_COMMENT_URL` is the one GitHub reported, in its
 the round at the reviewed HEAD and tells the fixer not to substitute another
 PR comment or round; a human comment, an earlier or stale round, or an
 unrelated bot comment on the same PR is never the handoff because only the
-comment carrying the round's marker at the bound HEAD and base can be
-verified. A round that went stale (HEAD or base moved while the reviewer
-worked) records its comment URL in its history entry and in
+comment carrying the round's marker at the bound HEAD, base and merge base
+can be verified. A round that went stale (HEAD, base or merge base moved while
+the reviewer worked) records its comment URL in its history entry and in
 `last_review_comment_url` for the next REVIEW prompt's
 `PREVIOUS_REVIEW_COMMENT_URL`, but launches no fixer, so a stale comment never
 becomes a FIX handoff.

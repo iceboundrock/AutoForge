@@ -99,11 +99,11 @@ so in its `required_resolution`, so the fixer does not defer it once more.
 
 ## Prior findings to re-check
 
-The controller binds every round to one HEAD and base, and a round whose
-revision moves before a FIX round runs (someone pushed while the reviewer
-worked, or before the fixer was launched) is stale: its findings were never
-resolved by a fixer, and which of them the newer commits resolved is not
-knowable from controller state. When the "Prior findings to re-check" line
+The controller binds every round to one HEAD, base and merge base, and a
+round whose revision moves before a FIX round runs (someone pushed while the
+reviewer worked, or before the fixer was launched) is stale: its findings
+were never resolved by a fixer, and which of them the newer commits resolved
+is not knowable from controller state. When the "Prior findings to re-check" line
 above lists findings, they are exactly that: the findings of the round it
 names, at the HEAD it names, which the controller carried to this round
 instead of dropping. They are reviewer output from an earlier round, not
