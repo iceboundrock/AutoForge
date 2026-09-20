@@ -26,8 +26,12 @@ agent claim against GitHub** before acting on it:
   a green check produced by a different definition is not the check the
   gate trusts), ``mergeable`` is MERGEABLE, ``mergeStateStatus``
   is CLEAN/HAS_HOOKS, no auto-merge is armed and the base branch has no
-  merge queue. Only then, because it executes the PR's code, the reviewed
-  commit is exported into a private temporary directory (never the
+  merge queue, and the review comment the state names is re-read from
+  GitHub and must still be this round's ``ai-review-result`` marker at
+  that HEAD and base on that PR saying ``needs_fix_round: false`` (the
+  clean review is the one fact the gate would otherwise take from the
+  state file alone, #94). Only then, because it executes the PR's code,
+  the reviewed commit is exported into a private temporary directory (never the
   operator's checkout, never a worktree) and ``merge.verification_commands``
   run there; any failure -> BLOCKED. Conclusive negatives -> BLOCKED; HEAD
   or base drift -> REVIEW; inconclusive data raises and keeps the phase,
@@ -1550,7 +1554,8 @@ class ControllerEngine:
                     MERGE_GATE_MESSAGE,
                     "with the gate open, would verify via gh before entering MERGE: last "
                     "review clean and bound to this PR, PR open at the reviewed HEAD and "
-                    "base, not draft, no change to "
+                    "base, the recorded review comment re-read and still this round's "
+                    "clean review of that revision, not draft, no change to "
                     "safety.protected_merge_paths, all checks succeeded, mergeable, no "
                     "auto-merge / merge queue (fail closed)",
                     *self._premerge_plan_notes(),
@@ -1564,7 +1569,8 @@ class ControllerEngine:
                 notes=[
                     MERGE_GATE_MESSAGE,
                     "would verify: last review clean and bound to this PR, PR open at the "
-                    "reviewed HEAD and base, not draft, no change to "
+                    "reviewed HEAD and base, the recorded review comment re-read and still "
+                    "this round's clean review of that revision, not draft, no change to "
                     "safety.protected_merge_paths, all checks "
                     "succeeded, mergeable, no auto-merge / merge queue",
                     *self._premerge_plan_notes(),
@@ -3563,11 +3569,16 @@ class ControllerEngine:
           auto-merge armed, merge queue -> BLOCKED (conclusive; no retry)
         - PR HEAD != reviewed HEAD, or PR base != reviewed base -> REVIEW
           (clean review is stale)
+        - the review comment the state names, re-read from GitHub, is not
+          the clean review of this round at this revision (gone, on another
+          PR, marker for another round / HEAD / base, unreadable marker,
+          or ``needs_fix_round`` true) -> BLOCKED (conclusive; the state's
+          claim of a clean review is not backed by GitHub, #94)
         - inconclusive (mergeability UNKNOWN, checks running, GitHub read
           failed transiently) -> raises and keeps the phase, bounded by
           ``merge.max_verification_attempts``
         - GitHub read failed conclusively (auth, permissions, unresolvable
-          PR) -> BLOCKED
+          PR or comment) -> BLOCKED
         """
         state = self._require_state()
         self._check_merge_gate(allow_merge)
@@ -3581,13 +3592,17 @@ class ControllerEngine:
             or not reviewed
             or not state.reviewed_pr_url
             or not reviewed_base
+            or not state.last_review_comment_url
         ):
             raise VerificationError(
                 f"{phase.value} requires a clean review bound to a PR, a HEAD and a base "
-                f"branch in state (last_review_result={state.last_review_result!r}, "
+                f"branch, and its review comment, in state "
+                f"(last_review_result={state.last_review_result!r}, "
                 f"reviewed_pr_url={state.reviewed_pr_url!r}, "
                 f"reviewed_head_sha={state.reviewed_head_sha!r}, "
-                f"reviewed_base_ref={reviewed_base!r}); refusing to merge"
+                f"reviewed_base_ref={reviewed_base!r}, "
+                f"last_review_comment_url={state.last_review_comment_url!r}); "
+                "refusing to merge"
             )
         # The clean review is a decision about one PR. A `current_pr_url`
         # that names another PR -- even one at the reviewed HEAD, i.e. the
@@ -3658,6 +3673,27 @@ class ControllerEngine:
             )
         if pr.head_sha != reviewed or pr.base_ref != reviewed_base:
             return self._revision_drift_to_review(phase, plan, pr)
+        # The PR is at the reviewed revision; now the review itself. Every
+        # other fact the gate relies on was just read from GitHub, and the
+        # clean review must be too (#94): the comment the state names is
+        # re-read and must still be this round's review of this revision,
+        # saying clean, on this PR. A state whose review fields were edited
+        # after the round -- by hand or by a controller bug -- is refused
+        # here, before the PR's own code is run or anything is written.
+        try:
+            unbacked = self._clean_review_problem(reviewed_ref)
+        except GitHubError as exc:
+            return self._github_read_failed(
+                phase, plan, f"the pre-merge review-comment read for PR {url} failed", exc
+            )
+        if unbacked:
+            return self._block(
+                phase,
+                plan,
+                f"{unbacked}. The clean review recorded in state is not backed by GitHub, "
+                "so re-checking would not help; nothing was merged or counted. Inspect the "
+                "state file and the PR's review comments manually.",
+            )
         try:
             not_ready = self._merge_readiness_problem(pr)
         except VerificationError as exc:
@@ -3677,6 +3713,81 @@ class ControllerEngine:
         if unverified:
             return self._block(phase, plan, f"{unverified}. Nothing was merged or counted.")
         return pr
+
+    def _clean_review_problem(self, reviewed_ref: GitHubPullRequestRef) -> str:
+        """Re-read the clean review's comment from GitHub; "" when it backs the state.
+
+        The state says round ``review_round`` reviewed ``reviewed_head_sha``
+        against ``reviewed_base_ref`` on ``reviewed_pr_url`` and found it
+        clean, and names the comment that decided so
+        (``last_review_comment_url``). :meth:`_apply_review` verified all of
+        that when the round ended, but the file is plain JSON on a laptop
+        and the merge gate is the one place the review is consumed, so the
+        comment is read again here, once per gate pass, and must still say
+        what the state says:
+
+        - the URL in state parses as a comment URL on the reviewed PR, and
+          GitHub answers it with that comment on that PR (the comments API
+          addresses a comment by id alone, so the parent GitHub reports is
+          the one that counts);
+        - the comment carries exactly one readable ``ai-review-result``
+          marker, and its key is this round at this HEAD against this base
+          (the same key the round's read-back matched, through the same
+          scanner: :mod:`autoforge.claims`);
+        - the marker says ``needs_fix_round: false``.
+
+        Returns the reason the review is *not* backed (the caller BLOCKS:
+        conclusive, a re-read would say the same). Raises the GitHubError of
+        the read for the caller to classify (transient -> bounded re-check,
+        anything else, including a comment GitHub no longer has -> BLOCKED).
+        Uniqueness of the marker across the PR's comments is not re-asked:
+        the round's read-back established it, and a second comment appearing
+        later cannot make the recorded one say something else.
+        """
+        state = self._require_state()
+        url = state.last_review_comment_url
+        try:
+            cref = parse_comment_url(url)
+        except ConfigurationError as exc:
+            return f"last_review_comment_url {url!r} is not a GitHub PR comment URL ({exc})"
+        if not cref.on(reviewed_ref):
+            return (
+                f"the review comment recorded in state ({cref.canonical}) is not on the "
+                f"reviewed PR {reviewed_ref.canonical}"
+            )
+        with self._reading(f"review comment {cref.canonical}"):
+            comment = self.github.get_comment(cref.canonical)
+        try:
+            located = parse_comment_url(comment.url)
+        except ConfigurationError as exc:
+            raise GitHubError(
+                f"GitHub answered {cref.canonical} with a comment whose URL cannot be read ({exc})"
+            ) from exc
+        if not located.same_target(cref) or not located.on(reviewed_ref):
+            return (
+                f"GitHub answered {cref.canonical} with comment {located.canonical}, which is "
+                f"not that comment on the reviewed PR {reviewed_ref.canonical}"
+            )
+        reviewed = (state.reviewed_head_sha or "").lower()
+        base = state.reviewed_base_ref
+        what = (
+            f"round {state.review_round} at HEAD {reviewed[:12]} on base {base!r} of PR "
+            f"{reviewed_ref.canonical}"
+        )
+        try:
+            holder = (
+                collect(REVIEW, [comment], "comment")
+                .claimants((state.review_round, reviewed, base), what)
+                .exactly_one()
+            )
+        except ClaimConflictError as exc:
+            return f"review comment {located.canonical} is not the clean review in state: {exc}"
+        if holder.claim.needs_fix_round:
+            return (
+                f"review comment {located.canonical} for {what} says needs_fix_round: true, "
+                "but the state records the round as clean"
+            )
+        return ""
 
     def _local_verification_problem(self, phase: Phase, pr: PRInfo) -> str:
         """Run ``merge.verification_commands`` on the reviewed commit, exported privately.

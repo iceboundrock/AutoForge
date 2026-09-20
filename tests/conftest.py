@@ -282,6 +282,7 @@ class FakeGitHub:
         self.issue_listing_truncated: bool = False  # a strict issue listing cannot be completed
         # every get_pr_comments / get_issue_comments call raises this
         self.comments_error: GitHubError | None = None
+        self.get_comment_error: GitHubError | None = None  # every get_comment call raises this
         # GitHub Actions read model behind `safety.verify_check_definition`:
         # runs by id, their jobs, and where each branch points. `add_pr`
         # registers the PR's own run at its HEAD; the base branch has one
@@ -601,11 +602,27 @@ class FakeGitHub:
         ]
 
     def get_comment(self, url: str) -> CommentInfo:
+        """One comment by id, as the REST API answers: whatever parent it is on.
+
+        The real client addresses the comment by its id alone, so a URL
+        naming the wrong parent still returns the comment with GitHub's own
+        URL; the engine compares. A comment nobody posted is a conclusive
+        GitHubNotFoundError, like a 404.
+        """
+        from autoforge.validation import parse_comment_url
+
+        self.calls.append(("get_comment", url))
+        if self.get_comment_error is not None:
+            raise self.get_comment_error
+        wanted = parse_comment_url(url)
         for cs in self.comments.values():
             for c in cs:
-                if c.url == url:
-                    return c
-        raise GitHubError(f"comment not found: {url}")
+                posted = parse_comment_url(c.url)
+                if posted.comment_id == wanted.comment_id and posted.parent.same_repository(
+                    wanted.parent
+                ):
+                    return replace(c)
+        raise GitHubNotFoundError(f"`gh api` failed (exit 1): comment not found: {url}")
 
     def merge_pr(
         self,

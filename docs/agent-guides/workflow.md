@@ -176,6 +176,13 @@ The binding is never moved to the current URL, and a protocol-2 state file
 parked in `READY_FOR_MERGE` / `MERGE` (written before the binding existed)
 is refused at load rather than bound after the fact.
 
+The binding names the evidence, and the merge gate re-reads it: with the
+PR at the reviewed revision, the comment `last_review_comment_url` names
+is fetched from GitHub and must still be this round's `ai-review-result`
+marker at that HEAD and base on that PR, saying `needs_fix_round: false`;
+otherwise `BLOCKED` (github-safety.md, "Before MERGE"). The clean review
+is never consumed from the state file alone (#94).
+
 If the PR HEAD or base changes after the review, the prior clean review is
 stale and the PR must return to `REVIEW`, where the next round is bound to
 the actual revision. A PR that GitHub reports as `MERGED` at the reviewed

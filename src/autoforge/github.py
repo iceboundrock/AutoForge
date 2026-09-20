@@ -604,6 +604,36 @@ def _decode_issue(row: object, what: str) -> IssueInfo:
     )
 
 
+def _decode_rest_comment(row: object, requested: GitHubCommentRef) -> CommentInfo:
+    """One issue-style comment as the REST API returns it (``gh api``).
+
+    The REST row spells its fields differently from the ``gh pr view``
+    rows (``html_url``, ``user.login``, ``created_at``) but is held to the
+    same rule: the URL must parse as a comment URL and its ``id`` must be the
+    comment the URL names. The merge gate re-reads the round's review
+    comment through this, so a row whose identity cannot be read is a
+    conclusive GitHubError, never a comment with a borrowed URL that the
+    gate could mistake for the one it asked about.
+    """
+    what = f"comment {requested.canonical}"
+    data = _row_object(row, what)
+    url = _text_field(data, "html_url", what)
+    try:
+        ref = parse_comment_url(url)
+    except ConfigurationError as exc:
+        raise GitHubError(f"{what}: html_url {url!r} is not a GitHub comment URL ({exc})") from exc
+    user = data.get("user")
+    login = _text_field(user, "login", what) if isinstance(user, dict) else ""
+    return CommentInfo(
+        id=_number_field(data, "id", what, ref.comment_id),
+        url=ref.canonical,
+        body=_text_field(data, "body", what),
+        author=login,
+        created_at=_text_field(data, "created_at", what),
+        parent_url=ref.parent.canonical,
+    )
+
+
 def _decode_comment(row: object, parent_url: str) -> CommentInfo:
     what = f"comment on {parent_url}"
     data = _row_object(row, what)
@@ -1555,26 +1585,19 @@ class GitHubClient:
         return [_decode_comment(c, parent_url) for c in rows]
 
     def get_comment(self, comment_url: str) -> CommentInfo:
-        """Fetch one issue-style comment by its HTML URL (``#issuecomment-<id>``)."""
+        """Fetch one issue-style comment by its HTML URL (``#issuecomment-<id>``).
+
+        The comment is addressed by its id alone (GitHub's comments API has
+        no per-issue path), so the returned ``url`` and ``parent_url`` are
+        what GitHub says the comment is on, which need not be the parent the
+        requested URL named; the caller compares. A comment that no longer
+        exists is a :class:`GitHubNotFoundError` (conclusive).
+        """
         ref: GitHubCommentRef = parse_comment_url(comment_url)
         data = self._api_json(
             ["api", f"repos/{ref.parent.owner}/{ref.parent.repo}/issues/comments/{ref.comment_id}"]
         )
-        html_url = str(data.get("html_url", "") or "")
-        parent_url = ""
-        try:
-            parent_url = parse_comment_url(html_url).parent.canonical
-        except Exception:
-            pass
-        user = data.get("user") or {}
-        return CommentInfo(
-            id=int(data.get("id", ref.comment_id)),
-            url=html_url or ref.canonical,
-            body=data.get("body", "") or "",
-            author=str(user.get("login", "")) if isinstance(user, dict) else "",
-            created_at=str(data.get("created_at", "") or ""),
-            parent_url=parent_url,
-        )
+        return _decode_rest_comment(data, ref)
 
 
 __all__ = [
