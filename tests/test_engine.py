@@ -3935,6 +3935,70 @@ def test_block_reason_quoting_gh_output_is_redacted_before_persistence(
     assert fake_github.merges == []
 
 
+def test_block_reason_is_redacted_and_then_bounded_at_the_sink(tmp_state_dir, fake_github):
+    """#88: `_block` bounds the reason to ``MAX_BLOCK_REASON_CHARS`` after
+    redacting it, whichever call site composed it. The order matters: the
+    clip is by character count, so a secret sitting exactly on the clip
+    boundary would be cut into fragments no pattern matches if it ran first."""
+    from autoforge.state import BLOCK_REASON_TAIL_CHARS, MAX_BLOCK_REASON_CHARS
+
+    fake_github.add_pr(head_sha=SHA_A)
+    head_len = MAX_BLOCK_REASON_CHARS - BLOCK_REASON_TAIL_CHARS - 200
+    # Two bands of back-to-back secrets, one around where the head ends and
+    # one around where the tail begins, each wider than the controller text
+    # the call site puts before and after the `gh` output, so a secret
+    # straddles each clip boundary wherever exactly it falls.
+    band = (_LEAKY_SECRET + " ") * 60
+    filler = "gh: request failed; " * 1000
+    stderr = filler[: head_len - 1000] + band + filler[:10_000] + band + filler[:500]
+    assert len(stderr) > 2 * MAX_BLOCK_REASON_CHARS
+    fake_github.get_pr_error = GitHubError(f"`gh pr view` failed (exit 1): {stderr}")
+    eng = _in_merge(tmp_state_dir, fake_github, phase=Phase.MERGE)
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "BLOCKED"
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.BLOCKED and s.block_reason == out.message
+    assert len(s.block_reason) <= MAX_BLOCK_REASON_CHARS
+    assert s.block_reason.startswith("PR https://github.com/owner/repo/pull/42 could not be read")
+    assert " characters of the block reason omitted; " in s.block_reason
+    assert s.block_reason.endswith("Fix the cause and inspect the PR on GitHub manually.")
+    assert "***REDACTED*** ***REDACTED***" in s.block_reason
+    # Both clips landed inside a band (the text either side of the marker is
+    # a redaction marker or a cut one), and no fragment of the secret
+    # survives either side of either clip.
+    marker_start = s.block_reason.index(" [autoforge: ")
+    marker_end = s.block_reason.index(" were kept] ") + len(" were kept] ")
+    assert "REDACTED" in s.block_reason[marker_start - 40 : marker_start]
+    assert "REDACTED" in s.block_reason[marker_end : marker_end + 40]
+    for n in range(4, len(_LEAKY_SECRET)):
+        assert _LEAKY_SECRET[:n] not in s.block_reason
+        assert _LEAKY_SECRET[-n:] not in s.block_reason
+    assert _LEAKY_SECRET not in eng.paths.state_file.read_text()
+    assert fake_github.merges == []
+
+
+@pytest.mark.parametrize("status", ["failure", "blocked"])
+def test_agent_message_is_bounded_before_it_reaches_state(tmp_state_dir, fake_github, status):
+    """#88: the agent's ``message`` is bounded by the parser only through the
+    whole CONTROL_RESULT block (1 MiB); the REMOTE writer bounds it like every
+    other block reason, after redacting it."""
+    from autoforge.state import MAX_BLOCK_REASON_CHARS
+
+    message = "tests red: " + ("FAILED tests/test_x.py::test_y; " * 5000) + "see the run log"
+    assert len(message) > MAX_BLOCK_REASON_CHARS
+    payload = {"phase": "ANALYZE_EXECUTE", "status": status, "message": message}
+    eng = make_engine(tmp_state_dir, [block(payload)], github=fake_github)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    out = eng.step()
+    assert out.next_phase == ("FAILED" if status == "failure" else "BLOCKED")
+    s = load_state(eng.paths.state_file)
+    assert len(s.block_reason) <= MAX_BLOCK_REASON_CHARS
+    assert s.block_reason.startswith("tests red: FAILED tests/test_x.py::test_y; ")
+    assert s.block_reason.endswith("see the run log")
+    assert " characters of the block reason omitted; " in s.block_reason
+    assert out.message == f"agent reported {status}: {s.block_reason}"
+
+
 @pytest.mark.parametrize("phase", [Phase.READY_FOR_MERGE, Phase.MERGE])
 def test_conclusive_read_failure_via_resume_blocks_without_retry(tmp_state_dir, fake_github, phase):
     fake_github.add_pr(head_sha=SHA_A)

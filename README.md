@@ -800,7 +800,12 @@ recorded, only state written by an older controller or edited by hand can
 carry that mark.
 Relevant controller verification failures are retained as a bounded per-issue
 list and supplied to the replan prompt; all PR comment text remains GitHub
-audit data rather than state payload.
+audit data rather than state payload. The `block_reason` is bounded too
+(8000 characters, after redaction): a longer one keeps its head and its
+last 1000 characters around a marker naming how much was omitted, so what
+happened and what to do about it both survive in `status`, and the text that
+was clipped is still whole in `last_fix_resolutions` (a LOCAL fix round's
+unresolved rationales) or the run log (an agent's `message`).
 
 ## Security model
 

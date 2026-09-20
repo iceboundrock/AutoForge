@@ -41,7 +41,17 @@ Expected state includes data such as:
 - already-counted merged PRs (in merge order; the last
   merged-since-EPIC-update entries are the batch handed to the agent)
 - attempt number
-- block reason, and the operator unblock history (one entry per applied
+- block reason (redacted and then bounded to `state.MAX_BLOCK_REASON_CHARS`
+  by every engine writer, through `state.bound_block_reason`: `_block` and
+  the two agent-message writers; a longer reason keeps its head, an
+  omission marker naming the count dropped, and its last
+  `BLOCK_REASON_TAIL_CHARS`, so what happened and what the operator must do
+  both survive. It is operator diagnostics, not work a later phase acts on,
+  which is why it may be clipped where a finding or resolution is rejected
+  instead; what is clipped is still whole in `last_fix_resolutions` or the
+  run log. The bound is a writer's rule, not a loader's: a longer value in a
+  file, written by an older controller, loads and is not rewritten), and the
+  operator unblock history (one entry per applied
   `autoforge unblock`: timestamp, reason, the block reason it cleared, the
   phase re-entered and the controller's detail; refused unblocks are only in
   the run log; the list is kept across issue switches, redacted before it is

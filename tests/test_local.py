@@ -1358,6 +1358,142 @@ def test_an_oversized_unresolved_rationale_never_reaches_the_block_reason(tmp_pa
     assert "needs a human" not in eng.paths.state_file.read_text(encoding="utf-8")
 
 
+def test_fifty_unresolved_rationales_at_the_bound_produce_a_bounded_block_reason(tmp_path):
+    """#88: the LOCAL ``unresolved`` block reason concatenates every unresolved
+    rationale, each bounded by the parser but the join bounded only by their
+    product (50 x 2000, up to 50 x 6000 after redaction). The persisted
+    ``block_reason`` is clipped to ``MAX_BLOCK_REASON_CHARS`` at the sink,
+    keeping the sentence that says what happened and the one that says what
+    the operator must do; nothing is lost, because every resolution is still
+    persisted whole in ``last_fix_resolutions``; and the state file loads."""
+    from autoforge.result_parser import (
+        MAX_FIX_RATIONALE_CHARS,
+        MAX_RESOLUTIONS_PER_FIX,
+        MIN_RATIONALE_CHARS,
+    )
+    from autoforge.state import MAX_BLOCK_REASON_CHARS
+
+    root = local_repo(tmp_path)
+    eng = make_local_engine(root, "features/add-filter.md")
+    count = MAX_RESOLUTIONS_PER_FIX
+    ids = [f"R1-F{n}" for n in range(1, count + 1)]
+
+    def rationale(n: int) -> str:
+        # Whole sentences up to the parser bound (after stripping); distinct
+        # per finding, and with a token shape in each so redaction lengthens
+        # it, as it can in production.
+        text = f"finding {n}: needs a human decision, token ghp_{'A' * 36} was seen; "
+        return (text * (MAX_FIX_RATIONALE_CHARS // len(text))).strip()
+
+    rationales = {fid: rationale(n) for n, fid in enumerate(ids, start=1)}
+    assert all(
+        MIN_RATIONALE_CHARS <= len(r) <= MAX_FIX_RATIONALE_CHARS for r in rationales.values()
+    )
+
+    def fifty_findings(e):
+        return review_result(
+            e.state.workspace_fingerprint, 1, [finding(1, n) for n in range(1, count + 1)]
+        )
+
+    def all_unresolved(e):
+        return block(
+            {
+                "phase": "FIX",
+                "status": "success",
+                "changed_workspace": False,
+                "resolutions": [
+                    {"finding_id": fid, "resolution": "unresolved", "rationale": rationales[fid]}
+                    for fid in ids
+                ],
+            }
+        )
+
+    eng.provider._handler = scripted(
+        eng,
+        root,
+        [
+            (lambda r: touch_impl(r, "v1\n"), lambda e: impl_result()),
+            (None, fifty_findings),
+            (None, all_unresolved),
+        ],
+    )
+    outcomes = eng.run(max_steps=8)
+    assert eng.state.phase == Phase.BLOCKED
+    assert outcomes[-1].next_phase == "BLOCKED"
+
+    reason = eng.state.block_reason
+    assert len(reason) <= MAX_BLOCK_REASON_CHARS
+    # The head still says what happened, and the tail what to do about it.
+    assert reason.startswith(
+        f"local fix round 1 left {count} of {count} finding(s) explicitly unresolved"
+    )
+    assert "R1-F1: finding 1: needs a human decision, token ***REDACTED*** was seen" in reason
+    assert " [autoforge: " in reason and " characters of the block reason omitted; " in reason
+    assert reason.endswith("or raise 'local.max_fix_rounds' in the config and start a new run.")
+    assert "The validation commands were not run" in reason
+    assert "ghp_" not in reason
+    # The step outcome carries the same bounded text, not the whole join.
+    assert outcomes[-1].message == reason
+
+    # Nothing is lost: the resolutions are persisted whole (redacted), and the
+    # open findings are the unresolved ones by id.
+    assert [r["finding_id"] for r in eng.state.last_fix_resolutions] == ids
+    for r in eng.state.last_fix_resolutions:
+        assert r["resolution"] == "unresolved"
+        assert r["rationale"] == rationales[r["finding_id"]].replace(
+            "ghp_" + "A" * 36, "***REDACTED***"
+        )
+    assert [f["id"] for f in eng.state.open_findings] == ids
+    assert eng.state.last_review_result == "unresolved"
+    assert eng.state.local_fix_rounds == 1
+
+    reloaded = load_state(eng.paths.state_file)
+    assert reloaded.phase == Phase.BLOCKED
+    assert reloaded.block_reason == reason
+    assert len(reloaded.last_fix_resolutions) == count
+    assert "ghp_" not in eng.paths.state_file.read_text(encoding="utf-8")
+
+
+def test_a_local_agent_message_is_bounded_before_it_reaches_state(tmp_path):
+    """#88: the agent's ``status: blocked`` ``message`` is bounded by the parser
+    only through the whole CONTROL_RESULT block (1 MiB); the LOCAL writer
+    bounds it like every other block reason, after redacting it."""
+    from autoforge.state import MAX_BLOCK_REASON_CHARS
+
+    root = local_repo(tmp_path)
+    eng = make_local_engine(root, "features/add-filter.md")
+    secret = "ghp_" + "B" * 36
+    message = (
+        "toolchain is unavailable: "
+        + ("log line; " * 10_000)
+        + secret
+        + "; a human must install it"
+    )
+    assert len(message) > MAX_BLOCK_REASON_CHARS
+    eng.provider._handler = scripted(
+        eng,
+        root,
+        [
+            (
+                None,
+                lambda e: block(
+                    {"phase": "ANALYZE_EXECUTE", "status": "blocked", "message": message}
+                ),
+            )
+        ],
+    )
+    eng.step()
+    outcome = eng.step()
+    assert eng.state.phase == Phase.BLOCKED
+    reason = eng.state.block_reason
+    assert len(reason) <= MAX_BLOCK_REASON_CHARS
+    assert reason.startswith("toolchain is unavailable: log line; ")
+    assert reason.endswith("***REDACTED***; a human must install it")
+    assert secret not in reason and " characters of the block reason omitted; " in reason
+    assert outcome.message == f"agent reported blocked: {reason}"
+    assert load_state(eng.paths.state_file).block_reason == reason
+
+
 def test_a_no_change_with_rationale_resolution_still_advances(tmp_path):
     """The other non-`fixed` disposition is a *resolution* and must not block.
 

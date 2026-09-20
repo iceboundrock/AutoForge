@@ -1106,3 +1106,82 @@ def test_premerge_verification_pass_round_trips_and_is_optional(tmp_path):
     p.write_text(json.dumps(d), encoding="utf-8")
     loaded = load_state(p)
     assert loaded.premerge_verified_head_sha == "" and loaded.premerge_verified_commands == []
+
+
+# -- block_reason bound (#88) --------------------------------------------------------------------
+def test_bound_block_reason_leaves_a_reason_within_the_bound_alone():
+    from autoforge.state import MAX_BLOCK_REASON_CHARS, bound_block_reason
+
+    assert bound_block_reason("") == ""
+    short = "merge gate closed. Nothing was merged."
+    assert bound_block_reason(short) is short
+    exact = "x" * MAX_BLOCK_REASON_CHARS
+    assert bound_block_reason(exact) == exact
+
+
+@pytest.mark.parametrize(
+    "length",
+    [
+        8001,  # one over the bound
+        50 * 6000 + 500,  # 50 LOCAL 'unresolved' rationales at the redacted bound (#88)
+        1024 * 1024,  # an agent 'message' at the CONTROL_RESULT block bound
+        64 * 1024 * 1024,  # the state file's own byte bound: the marker's widest count
+    ],
+)
+def test_bound_block_reason_keeps_the_head_and_the_tail_under_the_bound(length):
+    """The head says what happened and the tail says what the operator must
+    do; the middle (the concatenated detail) is what is dropped, and the
+    result is never over the bound whatever the omitted count's width."""
+    from autoforge.state import BLOCK_REASON_TAIL_CHARS, MAX_BLOCK_REASON_CHARS, bound_block_reason
+
+    head_text = "local fix round 1 left 50 of 50 finding(s) explicitly unresolved ("
+    tail_text = "). A human must inspect the open findings and start a new run."
+    filler = "R" * (length - len(head_text) - len(tail_text))
+    reason = head_text + filler + tail_text
+    assert len(reason) == length
+
+    bounded = bound_block_reason(reason)
+    assert len(bounded) <= MAX_BLOCK_REASON_CHARS
+    assert bounded.startswith(head_text)
+    assert bounded.endswith(tail_text)
+    assert bounded.endswith(reason[-BLOCK_REASON_TAIL_CHARS:])
+    marker_start = bounded.index(" [autoforge: ")
+    marker_end = bounded.index(" were kept] ") + len(" were kept] ")
+    head, marker, tail = (
+        bounded[:marker_start],
+        bounded[marker_start:marker_end],
+        bounded[marker_end:],
+    )
+    assert reason.startswith(head) and reason.endswith(tail)
+    assert len(tail) == BLOCK_REASON_TAIL_CHARS
+    omitted = len(reason) - len(head) - len(tail)
+    assert marker == (
+        f" [autoforge: {omitted} characters of the block reason omitted; the bound is "
+        f"{MAX_BLOCK_REASON_CHARS} characters, the first {len(head)} and last {len(tail)} "
+        "were kept] "
+    )
+    # Nothing is dropped twice: what was kept plus what was omitted is the input.
+    assert len(head) + omitted + len(tail) == length
+
+
+def test_bound_block_reason_is_idempotent():
+    from autoforge.state import bound_block_reason
+
+    once = bound_block_reason("y" * 20_000)
+    assert bound_block_reason(once) == once
+
+
+def test_a_state_file_with_an_over_long_block_reason_still_loads(tmp_path):
+    """The bound is applied by the writers, not the loader: a file an older
+    controller wrote with a longer reason is not corrupt, and the load does
+    not rewrite it."""
+    from autoforge.state import MAX_BLOCK_REASON_CHARS
+
+    p = tmp_path / "state.json"
+    long_reason = "z" * (MAX_BLOCK_REASON_CHARS * 3)
+    s = make_state(phase=Phase.BLOCKED, block_reason=long_reason)
+    save_state(s, p)
+    before = p.read_bytes()
+    loaded = load_state(p)
+    assert loaded.block_reason == long_reason
+    assert p.read_bytes() == before

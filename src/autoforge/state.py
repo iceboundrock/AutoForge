@@ -59,6 +59,33 @@ TMP_SUFFIX = ".tmp"
 # ``state.json`` -- a same-user process can plant either -- is refused
 # rather than materialised into memory.
 MAX_STATE_FILE_BYTES = 64 * 1024 * 1024
+# Bound on the persisted ``block_reason`` (#88), applied by
+# :func:`bound_block_reason` at every engine writer of the field, after
+# redaction.  The reason is operator diagnostics -- what ``status`` prints and
+# what a human reads before deciding -- not work a later phase acts on, so it
+# may be clipped, unlike a finding or a resolution (rejected at the parser,
+# never clipped).  Without a bound it was the one agent-derived field with no
+# bound of its own: a LOCAL FIX that leaves every finding ``unresolved``
+# concatenates up to ``MAX_RESOLUTIONS_PER_FIX`` rationales of up to
+# ``MAX_REQUIRED_RESOLUTION_CHARS`` each (~300 000 characters), and an agent's
+# ``status: blocked`` ``message`` is bounded only by the whole CONTROL_RESULT
+# block (1 MiB); either would be carried by every later load and rewrite of
+# ``state.json`` and printed whole by ``status``.  The bound keeps a couple of
+# full rationales and their surrounding text; what it drops is still in
+# ``last_fix_resolutions`` (persisted whole) or the run log's ``stdout.log``.
+MAX_BLOCK_REASON_CHARS = 8000
+# What :func:`bound_block_reason` keeps from the *end* of an over-long reason:
+# the controller composes its reasons as ``<what happened> (<detail>). <what
+# stays where, what a human must do>``, and the detail is the part that
+# grows, so the head and the tail are the parts that tell the operator what
+# to do and the middle is what is dropped.
+BLOCK_REASON_TAIL_CHARS = 1000
+# Room reserved for the omission marker between the head and the tail.  The
+# marker names the count omitted, so its length varies; the reserve covers
+# the longest rendering (a count of at most the state file's own byte bound)
+# and :func:`bound_block_reason` keeps the total at or under
+# ``MAX_BLOCK_REASON_CHARS`` whatever the input.
+_BLOCK_REASON_MARKER_RESERVE = 200
 
 
 # Names AutoForge gives the entries it writes into a state directory.  They
@@ -73,6 +100,43 @@ MAX_STATE_FILE_BYTES = 64 * 1024 * 1024
 
 def utcnow_iso() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def bound_block_reason(reason: str) -> str:
+    """``reason`` at or under :data:`MAX_BLOCK_REASON_CHARS`, head and tail kept.
+
+    A reason within the bound is returned unchanged.  A longer one keeps its
+    head, then a marker naming how many characters were omitted, then its
+    last :data:`BLOCK_REASON_TAIL_CHARS` characters, so the sentence that
+    says what happened and the sentence that says what the operator must do
+    both survive and only the middle -- the concatenated detail -- is
+    dropped.  Call it on *redacted* text: it clips by character count and
+    knows nothing about secrets, so a secret cut in half by the clip would
+    no longer match its redaction pattern.  The engine's writers redact
+    first, then bound (:meth:`autoforge.engine.ControllerEngine._block` and
+    the two agent-message writers); ``status`` redacts what it prints on top
+    of that, as it does for every state field.
+    """
+    if len(reason) <= MAX_BLOCK_REASON_CHARS:
+        return reason
+    head_len = MAX_BLOCK_REASON_CHARS - BLOCK_REASON_TAIL_CHARS - _BLOCK_REASON_MARKER_RESERVE
+    head = reason[:head_len]
+    tail = reason[-BLOCK_REASON_TAIL_CHARS:]
+    omitted = len(reason) - len(head) - len(tail)
+    marker = (
+        f" [autoforge: {omitted} characters of the block reason omitted; the bound is "
+        f"{MAX_BLOCK_REASON_CHARS} characters, the first {len(head)} and last {len(tail)} "
+        "were kept] "
+    )
+    bounded = head + marker + tail
+    if len(bounded) > MAX_BLOCK_REASON_CHARS:
+        # Unreachable while the reserve covers the marker; fail loudly rather
+        # than persist an over-long reason if a wording change outgrows it.
+        raise StateError(
+            f"bounded block reason is {len(bounded)} characters, over the "
+            f"{MAX_BLOCK_REASON_CHARS} bound: the omission marker outgrew its reserve"
+        )
+    return bounded
 
 
 def _validate_findings_field(name: str, findings: object) -> None:
@@ -404,7 +468,10 @@ class AutoForgeState:
     attempt: int = 0
     # Total executed steps across the run (never reset).
     step_count: int = 0
-    # Human-readable reason when phase is BLOCKED/FAILED.
+    # Human-readable reason when phase is BLOCKED/FAILED. Redacted and then
+    # bounded to ``MAX_BLOCK_REASON_CHARS`` by every engine writer (#88); a
+    # longer value in a file is accepted on load (an older controller wrote
+    # it) and is never rewritten by the load.
     block_reason: str = ""
     # The operator's explicit exits from BLOCKED (``autoforge unblock``), oldest
     # first, one object per unblock that was applied: ``at`` (UTC timestamp),

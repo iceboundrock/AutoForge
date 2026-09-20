@@ -241,6 +241,7 @@ from .state import (
     STATE_FILENAME,
     AutoForgeState,
     StatePaths,
+    bound_block_reason,
     load_state,
     no_state_error,
     quarantine_state_file,
@@ -2041,8 +2042,12 @@ class ControllerEngine:
         if status in ("failure", "blocked"):
             nxt = Phase.FAILED if status == "failure" else Phase.BLOCKED
             # Agent-supplied text, persisted in a plain `state.json` and
-            # printed by the CLI: same redaction boundary as the run log.
-            message = redact(str(payload.get("message", "") or f"agent reported {status}"))
+            # printed by the CLI: same redaction boundary as the run log, and
+            # the same bound as every other block reason (#88); the parser
+            # bounds this `message` only through the whole block's size.
+            message = bound_block_reason(
+                redact(str(payload.get("message", "") or f"agent reported {status}"))
+            )
             state.phase = nxt
             state.block_reason = message
             self._save()
@@ -2226,8 +2231,12 @@ class ControllerEngine:
         if status in ("failure", "blocked"):
             nxt = Phase.FAILED if status == "failure" else Phase.BLOCKED
             # Agent-supplied text, persisted in a plain `state.json` and
-            # printed by the CLI: same redaction boundary as the run log.
-            message = redact(str(payload.get("message", "") or f"agent reported {status}"))
+            # printed by the CLI: same redaction boundary as the run log, and
+            # the same bound as every other block reason (#88); the parser
+            # bounds this `message` only through the whole block's size.
+            message = bound_block_reason(
+                redact(str(payload.get("message", "") or f"agent reported {status}"))
+            )
             state.phase = nxt
             state.block_reason = message
             self._clear_local_invocation()
@@ -3342,10 +3351,13 @@ class ControllerEngine:
         `state.json` is stored in the clear. Redacting at the sink covers a
         new call site by construction and is the same boundary the
         agent-message writers apply; the CLI redacts what it prints from
-        state on top of this.
+        state on top of this. It is then bounded, after the redaction and
+        for the same reason at the same sink (#88): a call site can
+        concatenate agent text (the LOCAL ``unresolved`` rationales), and
+        the reason is persisted on every save and printed by ``status``.
         """
         state = self._require_state()
-        reason = redact(reason)
+        reason = bound_block_reason(redact(reason))
         state.phase = Phase.BLOCKED
         state.block_reason = reason
         self._save()
