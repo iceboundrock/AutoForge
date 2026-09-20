@@ -28,15 +28,16 @@ agent claim against GitHub** before acting on it:
   is CLEAN/HAS_HOOKS, no auto-merge is armed and the base branch has no
   merge queue, and the review comment the state names is re-read from
   GitHub and must still be this round's ``ai-review-result`` marker at
-  that HEAD and base on that PR saying ``needs_fix_round: false`` (the
-  clean review is the one fact the gate would otherwise take from the
-  state file alone, #94). Only then, because it executes the PR's code,
-  the reviewed commit is exported into a private temporary directory (never the
-  operator's checkout, never a worktree) and ``merge.verification_commands``
-  run there; any failure -> BLOCKED. Conclusive negatives -> BLOCKED; HEAD
-  or base drift -> REVIEW; inconclusive data raises and keeps the phase,
-  re-checked on ``resume`` at most ``merge.max_verification_attempts``
-  times, then BLOCKED. Before any of that, the clean review must be bound
+  that HEAD, base and merge base on that PR saying ``needs_fix_round:
+  false`` (the clean review is the one fact the gate would otherwise take
+  from the state file alone, #94). Only then, because it executes the PR's
+  code, the reviewed commit is exported into a private temporary directory
+  (never the operator's checkout, never a worktree) and
+  ``merge.verification_commands`` run there; any failure -> BLOCKED.
+  Conclusive negatives -> BLOCKED; HEAD, base or merge-base drift ->
+  REVIEW; inconclusive data raises and keeps the phase, re-checked on
+  ``resume`` at most ``merge.max_verification_attempts`` times, then
+  BLOCKED. Before any of that, the clean review must be bound
   to the PR being merged: the review records the PR it was posted on
   (``reviewed_pr_url``), the HEAD and the base branch, and both phases
   require ``current_pr_url`` -- and the PR GitHub returns for it -- to be
@@ -1575,9 +1576,9 @@ class ControllerEngine:
                 notes=[
                     MERGE_GATE_MESSAGE,
                     "would verify: last review clean and bound to this PR, PR open at the "
-                    "reviewed HEAD and base, the recorded review comment re-read and still "
-                    "this round's clean review of that revision, not draft, no change to "
-                    "safety.protected_merge_paths, all checks "
+                    "reviewed HEAD, base and merge base, the recorded review comment "
+                    "re-read and still this round's clean review of that revision, not "
+                    "draft, no change to safety.protected_merge_paths, all checks "
                     "succeeded, mergeable, no auto-merge / merge queue",
                     *self._premerge_plan_notes(),
                     "would run the command below (bound to the reviewed HEAD via "
@@ -3566,8 +3567,8 @@ class ControllerEngine:
         reviewed HEAD can be merged synchronously right now. Otherwise the
         transition has already been applied and its outcome is returned:
 
-        - merge gate closed / no clean review bound to a PR, HEAD and base
-          -> raises, nothing changes
+        - merge gate closed / no clean review bound to a PR, HEAD, base and
+          merge base -> raises, nothing changes
         - ``current_pr_url`` is not the reviewed PR by identity, or GitHub
           answers the reviewed URL with a different PR -> BLOCKED before
           anything else is read from it: the review is never re-bound to
@@ -3582,7 +3583,7 @@ class ControllerEngine:
           rewritten under its name, #96) -> REVIEW (clean review is stale)
         - the review comment the state names, re-read from GitHub, is not
           the clean review of this round at this revision (gone, on another
-          PR, marker for another round / HEAD / base, unreadable marker,
+          PR, marker for another round / HEAD / base / merge base, unreadable marker,
           or ``needs_fix_round`` true) -> BLOCKED (conclusive; the state's
           claim of a clean review is not backed by GitHub, #94)
         - inconclusive (mergeability UNKNOWN, checks running, GitHub read

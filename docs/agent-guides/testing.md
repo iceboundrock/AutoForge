@@ -90,7 +90,7 @@ High-priority coverage includes:
 - comment verification
 - the merge gate re-reading the clean review's comment (#94): a state
   parked in `READY_FOR_MERGE` / `MERGE` whose comment is gone, on another
-  PR, names another round, HEAD or base, or says `needs_fix_round: true`
+  PR, names another round, HEAD, base or merge base, or says `needs_fix_round: true`
   blocks without a merge; the happy path reads it exactly once per pass
 - follow-up issue verification
 
