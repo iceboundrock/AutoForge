@@ -2096,8 +2096,17 @@ def test_dry_run_review_shows_round_and_model(tmp_state_dir):
 
 
 # -- MERGE: controller-owned, gated (issue #8) -----------------------------------------------------
+REVIEW_CID = 100  # the comment id of the round-2 review `_in_merge` binds
+
+
 def _in_merge(tmp_state_dir, gh, script=None, reviewed=SHA_A, clean=True, phase=Phase.MERGE):
-    """Engine parked in MERGE with the gate open and a clean review bound to ``reviewed``."""
+    """Engine parked in MERGE with the gate open and a clean review bound to ``reviewed``.
+
+    The review is bound the way ``_apply_review`` binds it: round 2 at
+    ``reviewed`` on ``main`` of ``PR``, decided by a comment on the fake
+    that carries that round's marker (``REVIEW_CID``), which the gate
+    re-reads (#94).
+    """
     eng = make_engine(tmp_state_dir, script or [], github=gh)
     eng.config.safety.allow_merge = True
     eng.state.phase = phase
@@ -2109,6 +2118,9 @@ def _in_merge(tmp_state_dir, gh, script=None, reviewed=SHA_A, clean=True, phase=
     eng.state.reviewed_base_ref = "main"
     eng.state.last_review_result = "clean" if clean else "needs_fix"
     eng.state.review_round = 2
+    if isinstance(gh, FakeGitHub):  # a scripted real client answers the read itself
+        gh.add_comment(PR, REVIEW_CID, review_comment_body(2, reviewed, not clean))
+    eng.state.last_review_comment_url = comment_url(PR, REVIEW_CID)
     eng._save()
     return eng
 
@@ -2140,6 +2152,8 @@ def test_merge_when_explicitly_enabled_is_done_by_controller(tmp_state_dir, fake
     eng.state.reviewed_base_ref = "main"
     eng.state.last_review_result = "clean"
     eng.state.review_round = 2
+    fake_github.add_comment(PR, 100, review_comment_body(2, SHA_A, False))
+    eng.state.last_review_comment_url = comment_url(PR, 100)
     assert eng.step(allow_merge=True).next_phase == "MERGE"
     out = eng.step(allow_merge=True)
     assert out.next_phase == "UPDATE_EPIC", out.message
@@ -2279,6 +2293,162 @@ def test_merge_refuses_without_clean_review(tmp_state_dir, fake_github):
     eng2.state.reviewed_head_sha = ""
     with pytest.raises(VerificationError, match="clean review"):
         eng2.step(allow_merge=True)
+    assert fake_github.merges == []
+
+
+# -- the clean review is re-read from GitHub before MERGE (#94) ----------------------
+# `_apply_review` verified the round's comment when it wrote the binding, but
+# the binding then lives in a plain JSON file. The gate re-reads the comment
+# the state names and requires it to still be this round's clean review of
+# the reviewed revision on the reviewed PR; anything else is conclusive.
+
+
+def _gate_blocks_on_review_comment(eng, gh, expect: str) -> None:
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "BLOCKED", out.message
+    reason = eng.state.block_reason
+    assert expect in reason, reason
+    assert "not backed by GitHub" in reason or "not a transient GitHub failure" in reason
+    assert "nothing was merged or counted" in reason.lower()
+    assert gh.merges == [] and eng.state.counted_merged_prs == []
+    assert eng.state.attempt == 0  # conclusive: no verification attempt was consumed
+    assert load_state(eng.paths.state_file).phase == Phase.BLOCKED
+
+
+@pytest.mark.parametrize("phase", [Phase.READY_FOR_MERGE, Phase.MERGE])
+def test_gate_requires_the_review_comment_url_in_state(tmp_state_dir, fake_github, phase):
+    """A clean review without the comment that decided it is not a binding
+    the gate can re-verify, so it is refused with the other missing fields."""
+    fake_github.add_pr(head_sha=SHA_A)
+    eng = _in_merge(tmp_state_dir, fake_github, phase=phase)
+    eng.state.last_review_comment_url = ""
+    with pytest.raises(VerificationError, match="review comment.*refusing to merge"):
+        eng.step(allow_merge=True)
+    assert fake_github.merges == [] and fake_github.calls == []
+
+
+@pytest.mark.parametrize("phase", [Phase.READY_FOR_MERGE, Phase.MERGE])
+def test_gate_blocks_when_the_review_comment_is_gone(tmp_state_dir, fake_github, phase):
+    """The comment the state names no longer exists on GitHub (deleted, or
+    never posted: a hand-written state). Conclusive: BLOCKED, no merge."""
+    fake_github.add_pr(head_sha=SHA_A)
+    eng = _in_merge(tmp_state_dir, fake_github, phase=phase)
+    fake_github.comments.clear()
+    _gate_blocks_on_review_comment(eng, fake_github, "comment not found")
+    assert ("get_comment", comment_url(PR, REVIEW_CID)) in fake_github.calls
+
+
+@pytest.mark.parametrize("phase", [Phase.READY_FOR_MERGE, Phase.MERGE])
+def test_gate_blocks_when_the_state_names_a_comment_on_another_pr(
+    tmp_state_dir, fake_github, phase
+):
+    """`last_review_comment_url` on PR 43 while the review is bound to PR 42:
+    refused from state alone, before the comment is even read."""
+    other = "https://github.com/owner/repo/pull/43"
+    fake_github.add_pr(head_sha=SHA_A)
+    eng = _in_merge(tmp_state_dir, fake_github, phase=phase)
+    fake_github.add_comment(other, 200, review_comment_body(2, SHA_A, False))
+    eng.state.last_review_comment_url = comment_url(other, 200)
+    _gate_blocks_on_review_comment(eng, fake_github, "is not on the reviewed PR")
+    assert not any(c[0] == "get_comment" for c in fake_github.calls)
+
+
+@pytest.mark.parametrize("phase", [Phase.READY_FOR_MERGE, Phase.MERGE])
+def test_gate_blocks_when_github_answers_with_a_comment_on_another_pr(
+    tmp_state_dir, fake_github, phase
+):
+    """The comments API addresses a comment by id alone: a state URL spelling
+    the reviewed PR over a comment that is really on PR 43 is answered with
+    that comment, and GitHub's parent is the one that counts."""
+    other = "https://github.com/owner/repo/pull/43"
+    fake_github.add_pr(head_sha=SHA_A)
+    eng = _in_merge(tmp_state_dir, fake_github, phase=phase)
+    fake_github.comments.clear()
+    fake_github.add_comment(other, REVIEW_CID, review_comment_body(2, SHA_A, False))
+    _gate_blocks_on_review_comment(eng, fake_github, "not that comment on the reviewed PR")
+    assert "pull/43" in eng.state.block_reason
+
+
+@pytest.mark.parametrize("phase", [Phase.READY_FOR_MERGE, Phase.MERGE])
+@pytest.mark.parametrize(
+    ("body", "expect"),
+    [
+        pytest.param(review_comment_body(1, SHA_A, False), "no comment carries", id="other-round"),
+        pytest.param(review_comment_body(2, SHA_B, False), "no comment carries", id="other-head"),
+        pytest.param(
+            review_comment_body(2, SHA_A, False, base_ref="release/1.x"),
+            "no comment carries",
+            id="other-base",
+        ),
+        pytest.param(
+            review_comment_body(2, SHA_A, False, base_ref=None), "no comment carries", id="no-base"
+        ),
+        pytest.param(
+            review_comment_body(2, SHA_A, True, ["R2-F1"]), "needs_fix_round: true", id="needs-fix"
+        ),
+        pytest.param("# AI Code Review — Round 2\n\nLGTM\n", "no comment carries", id="no-marker"),
+        pytest.param(
+            '# Round 2\n<!-- ai-review-result: {"round": 2} -->\n',
+            "cannot establish",
+            id="unreadable-marker",
+        ),
+        pytest.param(
+            review_comment_body(2, SHA_A, False) + review_comment_body(2, SHA_A, False),
+            "cannot establish",
+            id="two-markers",
+        ),
+    ],
+)
+def test_gate_blocks_when_the_review_comment_does_not_say_what_the_state_says(
+    tmp_state_dir, fake_github, phase, body, expect
+):
+    """The comment exists on the reviewed PR but is not this round's clean
+    review of the reviewed revision: its marker names another round, HEAD or
+    base (or none), says a fix round is needed, is missing, is unreadable,
+    or is doubled. Prose such as "LGTM" is never evidence."""
+    fake_github.add_pr(head_sha=SHA_A)
+    eng = _in_merge(tmp_state_dir, fake_github, phase=phase)
+    fake_github.comments.clear()
+    fake_github.add_comment(PR, REVIEW_CID, body)
+    _gate_blocks_on_review_comment(eng, fake_github, expect)
+
+
+@pytest.mark.parametrize("phase", [Phase.READY_FOR_MERGE, Phase.MERGE])
+def test_gate_reads_the_review_comment_before_running_the_prs_code(
+    tmp_state_dir, fake_github, phase
+):
+    """A GitHub-side fact: an unbacked review blocks before
+    `merge.verification_commands` ever run the PR's code locally."""
+    marker = tmp_state_dir.parent / "ran.txt"
+    eng, _sha = _in_merge_on_commit(tmp_state_dir, fake_github, [_record_cwd(marker)], phase=phase)
+    fake_github.comments.clear()
+    _gate_blocks_on_review_comment(eng, fake_github, "comment not found")
+    assert not marker.exists()
+
+
+def test_gate_reads_the_review_comment_exactly_once_per_pass(tmp_state_dir, fake_github):
+    """Happy path: READY_FOR_MERGE and MERGE each re-read the comment once;
+    the merge itself and the post-merge read-back add no comment read."""
+    fake_github.add_pr(head_sha=SHA_A)
+    eng = _in_merge(tmp_state_dir, fake_github, phase=Phase.READY_FOR_MERGE)
+    assert eng.step(allow_merge=True).next_phase == "MERGE"
+    reads = [c for c in fake_github.calls if c[0] == "get_comment"]
+    assert reads == [("get_comment", comment_url(PR, REVIEW_CID))]
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "UPDATE_EPIC", out.message
+    reads = [c for c in fake_github.calls if c[0] == "get_comment"]
+    assert reads == [("get_comment", comment_url(PR, REVIEW_CID))] * 2
+    assert fake_github.merges == [(PR, "squash", SHA_A, False)]
+
+
+@pytest.mark.parametrize("phase", [Phase.READY_FOR_MERGE, Phase.MERGE])
+def test_gate_does_not_read_the_review_comment_of_a_drifted_pr(tmp_state_dir, fake_github, phase):
+    """A PR past the reviewed revision goes back to REVIEW whatever its old
+    review says; the stale comment is not read."""
+    fake_github.add_pr(head_sha=SHA_B)
+    eng = _in_merge(tmp_state_dir, fake_github, phase=phase)
+    assert eng.step(allow_merge=True).next_phase == "REVIEW"
+    assert not any(c[0] == "get_comment" for c in fake_github.calls)
     assert fake_github.merges == []
 
 
@@ -3425,10 +3595,15 @@ def _break_files_read(gh, exc):
     gh.changed_files_error = exc
 
 
+def _break_comment_read(gh, exc):
+    gh.get_comment_error = exc
+
+
 _READ_FAILURES = [
     pytest.param(_break_pr_read, "could not be read", id="pr-read"),
     pytest.param(_break_files_read, "changed-file listing", id="files-read"),
     pytest.param(_break_queue_read, "merge-queue status", id="queue-read"),
+    pytest.param(_break_comment_read, "review comment", id="comment-read"),
 ]
 
 

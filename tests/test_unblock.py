@@ -26,8 +26,10 @@ from tests.conftest import (
     PR,
     SHA_A,
     SHA_B,
+    comment_url,
     implementation_pr_body,
     make_engine,
+    review_comment_body,
 )
 
 PR_B = "https://github.com/owner/repo/pull/43"
@@ -48,8 +50,16 @@ def _blocked(tmp_state_dir, gh, *, reason="stuck", pr_url: str = "", **fields):
     return eng
 
 
+REVIEW_CID = 100  # the comment id of the review `_reviewed` names
+
+
 def _reviewed(head=SHA_A, result="clean", findings=None, round_=2):
-    """State fields of a completed review of PR at ``head`` on main."""
+    """State fields of a completed review of PR at ``head`` on main.
+
+    The review comment named is ``REVIEW_CID``; a test that steps through
+    the merge gate afterwards posts it on the fake (``_review_comment``),
+    because the gate re-reads it (#94).
+    """
     return dict(
         current_head_sha=head,
         current_base_ref="main",
@@ -58,9 +68,15 @@ def _reviewed(head=SHA_A, result="clean", findings=None, round_=2):
         reviewed_head_sha=head,
         reviewed_base_ref="main",
         last_review_result=result,
+        last_review_comment_url=comment_url(PR, REVIEW_CID),
         open_findings=list(findings or []),
         review_round=round_,
     )
+
+
+def _review_comment(gh, head=SHA_A, needs_fix=False, round_=2):
+    """The comment ``_reviewed`` names, on the fake PR."""
+    gh.add_comment(PR, REVIEW_CID, review_comment_body(round_, head, needs_fix))
 
 
 def _unblock_records(eng):
@@ -252,6 +268,7 @@ def test_unblock_open_pr_at_clean_reviewed_revision_reenters_ready_for_merge(
     The clean review is still bound to this PR at this HEAD and base, so the
     holding state is re-entered and the merge gate re-verifies from there."""
     fake_github.add_pr(head_sha=SHA_A)
+    _review_comment(fake_github)
     eng = _blocked(tmp_state_dir, fake_github, pr_url=PR, reason="check ci failed", **_reviewed())
     out = eng.unblock(REASON)
     assert out.unblocked and out.phase == "READY_FOR_MERGE"

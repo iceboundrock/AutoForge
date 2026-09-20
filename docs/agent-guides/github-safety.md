@@ -324,6 +324,27 @@ Verify:
   identity (`BLOCKED` otherwise, before any other read), and the PR's base
   must still be the reviewed one (stale -> `REVIEW` otherwise, like a HEAD
   move)
+- the clean review itself is re-read from GitHub, not taken from the state
+  file (#94): once the PR is at the reviewed revision, the comment
+  `last_review_comment_url` names is fetched (one read per gate pass,
+  `GitHubClient.get_comment`, decoded strictly) and must be a comment on
+  the reviewed PR as GitHub reports its parent (the comments API addresses
+  a comment by id alone, so the URL's spelling of the parent proves
+  nothing), carrying exactly one readable `ai-review-result` marker whose
+  key is `(review_round, reviewed_head_sha, reviewed_base_ref)`, read
+  through `claims.py` exactly as the round's read-back read it, with
+  `needs_fix_round: false`. Anything else (the comment gone, on another PR,
+  a marker for another round, HEAD or base, none, unreadable or doubled, a
+  marker saying a fix round is needed, or no comment URL in state at all)
+  is conclusive: `BLOCKED`, or a refusal from state alone for the missing
+  URL, never a merge; a transient failure of the read takes the bounded
+  inconclusive path above. The check runs after the identity and revision
+  checks (a drifted PR goes to `REVIEW` without it) and before the
+  readiness reads and `merge.verification_commands`, so an unbacked review
+  never runs the PR's code locally. A state whose review fields were
+  edited after the round, by hand or by a controller bug, is caught here;
+  `_apply_review` verified the same comment when it wrote the binding, and
+  the gate no longer trusts that the file still says what it wrote
 
 ### After MERGE
 

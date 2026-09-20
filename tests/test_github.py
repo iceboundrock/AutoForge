@@ -131,7 +131,66 @@ def test_get_pr_comments_and_get_comment():
     assert comments[0].id == 5 and comments[0].author == "bot"
     c = gh.get_comment("https://github.com/o/r/pull/42#issuecomment-5")
     assert c.id == 5 and "Round 1" in c.body
+    assert c.url == "https://github.com/o/r/pull/42#issuecomment-5"
+    assert c.parent_url == "https://github.com/o/r/pull/42"
     assert seen[-1][:2] == ["gh", "api"] and "repos/o/r/issues/comments/5" in seen[-1][2]
+
+
+def _rest_comment(**overrides) -> dict:
+    row = {
+        "id": 5,
+        "html_url": "https://github.com/o/r/pull/42#issuecomment-5",
+        "body": "hello",
+        "user": {"login": "bot"},
+        "created_at": "2026-01-01T00:00:00Z",
+    }
+    row.update(overrides)
+    return row
+
+
+def test_get_comment_reports_the_parent_github_says_not_the_one_asked_for():
+    """#94: the comments API addresses a comment by id alone, so a URL naming
+    the wrong PR is answered with the comment on its real parent, and the
+    client hands that identity back rather than echoing the request."""
+    gh = _client(
+        lambda req: _res(_rest_comment(html_url="https://github.com/o/r/pull/7#issuecomment-5"))
+    )
+    c = gh.get_comment("https://github.com/o/r/pull/42#issuecomment-5")
+    assert c.url == "https://github.com/o/r/pull/7#issuecomment-5"
+    assert c.parent_url == "https://github.com/o/r/pull/7"
+
+
+@pytest.mark.parametrize(
+    ("row", "expect"),
+    [
+        pytest.param(_rest_comment(html_url=None), "not a GitHub comment URL", id="no-html-url"),
+        pytest.param(
+            _rest_comment(html_url="https://github.com/o/r/pull/42"),
+            "not a GitHub comment URL",
+            id="parent-url-only",
+        ),
+        pytest.param(_rest_comment(id=6), "is 6 but the url names #5", id="id-disagrees"),
+        pytest.param(_rest_comment(id="5"), "not an integer", id="id-not-int"),
+        pytest.param(_rest_comment(body=["x"]), "expected a string", id="body-not-text"),
+        pytest.param([], "non-object", id="not-an-object"),
+    ],
+)
+def test_get_comment_refuses_a_row_whose_identity_cannot_be_read(row, expect):
+    """The merge gate re-reads the round's review comment through this read
+    (#94); a row without a usable URL, or whose id disagrees with it, is a
+    conclusive GitHubError, never a comment with a borrowed identity."""
+    gh = _client(lambda req: _res(row))
+    with pytest.raises(GitHubError, match=expect):
+        gh.get_comment("https://github.com/o/r/pull/42#issuecomment-5")
+
+
+def test_get_comment_of_a_deleted_comment_is_not_found():
+    stderr = "HTTP 404: Not Found (https://api.github.com/repos/o/r/issues/comments/5)"
+    gh = GitHubClient(
+        runner=lambda req: _res({}, exit_code=1, stderr=stderr), retry_delay_seconds=0
+    )
+    with pytest.raises(GitHubNotFoundError):
+        gh.get_comment("https://github.com/o/r/pull/42#issuecomment-5")
 
 
 def test_get_issue_comments_reads_the_issue_not_a_pr():
