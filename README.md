@@ -993,7 +993,8 @@ audit data rather than state payload.
   already-merged PR is recovered and counted once; an open one is re-verified),
   bounded by the same `merge.max_verification_attempts`, then `BLOCKED`.
 - Logs and CLI output pass through baseline secret redaction (`GITHUB_TOKEN`,
-  `GH_TOKEN`, `*_API_KEY`, `Authorization: Bearer`, `ghp_*`, `sk-*`, …),
+  `GH_TOKEN`, `*_API_KEY`, `Authorization: Bearer` / `Basic`, `ghp_*`,
+  `github_pat_*`, `sk-*`, JWTs, the `user:password@` part of a URL, …),
   state-derived output included: `status` and `status --json` redact what
   they print (a `block_reason` echoes agent text; a journal can be
   hand-edited) without rewriting `state.json`. No environment dump is ever

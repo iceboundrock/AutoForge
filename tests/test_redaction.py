@@ -29,6 +29,147 @@ def test_github_pat_and_sk_shapes():
     assert "sk-proj-abcdef123456" not in redact("key=sk-proj-abcdef123456")
 
 
+_FINE_GRAINED_PAT = (
+    "github_pat_11ABCDEFG0abcdefghijklmn_"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+)
+
+
+def test_github_fine_grained_pat():
+    """``github_pat_...`` is not a ``gh?_`` shape and needs its own pattern."""
+    assert redact(f"cloning with {_FINE_GRAINED_PAT} done") == "cloning with ***REDACTED*** done"
+    assert _FINE_GRAINED_PAT[11:] not in redact(f"GH_TOKEN={_FINE_GRAINED_PAT}")
+    assert _FINE_GRAINED_PAT[11:] not in redact(f"https://{_FINE_GRAINED_PAT}@github.com/o/r")
+
+
+def test_basic_auth_header():
+    out = redact("Authorization: Basic dXNlcjpwYXNzd29yZA==")
+    assert out == "Authorization: Basic ***REDACTED***"
+    assert redact("authorization:basic dXNlcjpwYXNz") == "authorization:basic ***REDACTED***"
+
+
+_JWT = (
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+    ".eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIn0"
+    ".SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"Bearer {_JWT}",
+        f"Cookie: session={_JWT}; Path=/",
+        f'{{"id_token": "{_JWT}"}}',
+        f"gh api -H 'Authorization: Bearer {_JWT}' /user",
+    ],
+    ids=["bare", "cookie", "json", "argv"],
+)
+def test_jwt_is_redacted_whole(text):
+    """Every segment goes, not only the signature: header and payload carry
+    claims (subject, email, scopes) that are as sensitive as the signature is
+    reusable."""
+    out = redact(text)
+    for segment in _JWT.split("."):
+        assert segment not in out
+    assert "***REDACTED***" in out
+    assert "Path=/" in out or "Path=/" not in text
+
+
+def test_jwt_needs_three_segments():
+    """Two base64url runs around one dot are a version string or a file name
+    as often as a token; only the three-segment shape is a JWT."""
+    text = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0"
+    assert redact(text) == text
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        # ``{}`` payload: ``e30`` is three characters.
+        "eyJhbGciOiJIUzI1NiJ9.e30.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+        # Unsecured ``alg: none`` token (RFC 7519 §6): empty signature.
+        "eyJhbGciOiJub25lIn0.eyJzdWIiOiIxMjM0NTY3ODkwIn0.",
+        # Detached content (RFC 7515 App. F): empty payload.
+        "eyJhbGciOiJIUzI1NiJ9..SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+        # The smallest header the shape admits, ``{"a":0}``.
+        "eyJhIjowfQ.e30.c2ln",
+    ],
+    ids=["short-payload", "empty-signature", "empty-payload", "shortest-header"],
+)
+def test_jwt_short_and_empty_segments_are_redacted(token):
+    """Only the header has a length floor. A payload is as short as ``e30``
+    and, for detached content, empty; an unsecured token has no signature.
+    Those are valid compact serializations and carry the same claims."""
+    for text in (f"Bearer {token}", f"id_token={token}&state=1"):
+        out = redact(text)
+        assert "***REDACTED***" in out
+        for segment in token.split("."):
+            assert not segment or segment not in out
+        assert "state=1" in out or "state=1" not in text
+
+
+def test_jwt_header_shorter_than_a_json_object_is_not_a_token():
+    """``eyJ`` decodes to ``{"`` plus a key character, so a real header is at
+    least the ten characters of ``{"a":0}``; a shorter first run is base64
+    that happens to start ``eyJ``, not a JWT, whatever follows its dots."""
+    text = "eyJhIjow.e30.c2ln"
+    assert redact(text) == text
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (
+            "git remote add origin https://x-access-token:ghs_abcdefghijklmnop@github.com/o/r.git",
+            "git remote add origin https://***REDACTED***@github.com/o/r.git",
+        ),
+        (
+            "https://oauth2:glpat-abcdef123456@gitlab.example.com/o/r.git",
+            "https://***REDACTED***@gitlab.example.com/o/r.git",
+        ),
+        (
+            "postgresql://app:s3cr3t@db.internal:5432/app",
+            "postgresql://***REDACTED***@db.internal:5432/app",
+        ),
+        ("HTTPS://TOKEN@GITHUB.COM/O/R", "HTTPS://***REDACTED***@GITHUB.COM/O/R"),
+        (
+            "fatal: could not read from 'https://u:p@h/r'",
+            "fatal: could not read from 'https://***REDACTED***@h/r'",
+        ),
+        (
+            "https://u:p@h?to=a@b#c@d",
+            "https://***REDACTED***@h?to=a@b#c@d",
+        ),
+    ],
+    ids=["x-access-token", "oauth2", "dsn", "bare-userinfo", "quoted", "query-after"],
+)
+def test_url_credentials(text, expected):
+    """Everything between ``scheme://`` and ``@`` is the credential; the
+    host and path after it stay so the line still says which remote."""
+    assert redact(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "https://github.com/o/r/pull/3",
+        "see https://example.com and mail admin@example.com",
+        "git@github.com:o/r.git",
+        "https://host/path?to=a@b",
+        # ``?`` and ``#`` end the authority as ``/`` does (RFC 3986 §3.2):
+        # an ``@`` in the query or fragment is not a credential delimiter.
+        "https://host?to=a@b",
+        "https://host:8443?u=a@b&v=c@d",
+        "https://host#frag@x",
+        "https://host?q=1#frag@x",
+    ],
+    ids=["path", "mail", "scp", "path-query", "query", "port-query", "fragment", "query-fragment"],
+)
+def test_url_without_userinfo_untouched(text):
+    assert redact(text) == text
+
+
 def test_normal_text_untouched():
     text = "review round 3 passed, PR #42 merged cleanly"
     assert redact(text) == text
@@ -112,12 +253,19 @@ def test_redact_obj_suffix_allocation_is_linear_in_the_colliding_keys():
 
 # The shortest text each pattern recognises, with the separator that lets the
 # shape repeat, so the filled case below is meaningful. The bare shape without
-# the separator has a marginally higher ratio (``HF_TOKEN=x``, 10 to 23, is the
-# worst text of all and is pinned by the wrapping test); no text grows past it.
+# the separator has a marginally higher ratio (``HF_TOKEN=x``, 10 to 23, is
+# pinned by the wrapping test); the URL shape needs no separator (``@`` ends a
+# word) and is the worst text of all, 7 to 20; no text grows past it.
 _WORST_CASE_UNITS = {
     "named_assignment": "HF_TOKEN=x;",
     "named_assignment_quoted": 'HF_TOKEN="x"',
     "bearer_header": "Authorization:Token x ",
+    "basic_header": "Authorization:Basic x ",
+    "url_credential": "ab://x@",
+    # Header at its ten-character floor, empty payload and signature; ``.``
+    # ends the shape, so it repeats without a separator.
+    "jwt": "eyJaaaaaaa..",
+    "github_fine_grained_pat": "github_pat_aaaaaaaa ",
     "github_pat": "ghp_aaaaaaaa ",
     "sk_key": "sk-aaaaaaaa ",
     # Matched by the ``sk-`` pattern before its own; listed so a narrower
@@ -172,12 +320,19 @@ def test_redaction_growth_does_not_compound_across_patterns():
 
 
 def test_redaction_marker_wrapped_by_a_later_pattern_never_grows():
-    """The bearer value class admits ``*``, so it can match a marker the
-    assignment pattern wrote; that match holds the whole marker, so it is at
-    least as long as its replacement and the second pass cannot grow it."""
+    """The header and URL-userinfo value classes admit ``*``, so they can
+    match a marker the assignment pattern wrote; that match holds the whole
+    marker, so it is at least as long as its replacement and the second pass
+    cannot grow it."""
     grown = redact("HF_TOKEN=x")  # 10 -> 23, the first pass grew it
     assert grown == "HF_TOKEN=***REDACTED***"
     text = "Authorization: Bearer HF_TOKEN=x"
     out = redact(text)
     assert out == "Authorization: Bearer ***REDACTED***"
     assert len(out) < len("Authorization: Bearer ") + len(grown)
+    grown = redact('HF_TOKEN="x"')  # 12 -> 25; the quote ends the value before ``@``
+    assert grown == 'HF_TOKEN="***REDACTED***"'
+    text = 'https://HF_TOKEN="x"@h'
+    out = redact(text)
+    assert out == "https://***REDACTED***@h"
+    assert len(out) < len("https://") + len(grown) + len("@h")
