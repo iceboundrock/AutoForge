@@ -128,8 +128,8 @@ workflow:
   touching anything `REPLAN_REEXECUTE` does after the policy has decided.
 - The step budget is measured on the persisted cumulative `step_count`, which is never reset by `resume` or by switching issues. CLI `--max-steps` bounds a single invocation only. It is checked before a step executes, with one exception: a `REPLAN_REEXECUTE` journal past the destructive write (`SUPERSEDE_INTENT`, `COMPENSATING`, `SUPERSEDED`) is finished first. There the persisted intent is a decision the controller has committed to, the remaining work is read-verify-activate or read-verify-reopen, no agent is invoked and nothing is closed from a resume; blocking with the plain budget text would leave a source PR the controller closed with nothing in the run's state saying so, and `resume` refuses `BLOCKED`, so raising the budget could not repair it. The finishing step still counts, so the budget ends the run at the next phase boundary. Stages before the write (`PENDING`, `PREPARED`, `VERIFIED`) block as any other phase does: nothing was closed, so blocking costs nothing and the step does not count. A journal the reducer will refuse anyway (`REJECTED`, or one that cannot be read whole and so cannot prove it is before the write) is handed to the reducer too, whose refusal names the transaction and the source PR's fate. The partition is `replan_txn.budget_may_stop`; dry-run plan notes describe the same outcome. A step is charged when it first persists: the launch checkpoint of an agent step, or the resolution of a step that needs no agent. An entry read that fails transiently (`GitHubUnavailableError`) before either persists nothing -- the count, the phase and any journal are byte-identical on disk -- so it is not a step and is not charged, in every phase alike; the operator's next `resume` re-reads with the same budget. The exemption inherits this rule: a GitHub outage while finishing a post-write journal defers the finish to the next `resume` and never repeats or extends it (no agent, no write), and the finish is counted once when it lands.
 - Failed invocations consume neither a review round nor a `review_history` entry.
-- A `FIX` entry that finds the PR HEAD past the reviewed HEAD, or the PR retargeted to another base, goes back to `REVIEW` without launching the fixer (see **Re-entering a phase** below). That review of the actual revision is an ordinary round: it counts against the cap, and if it reports the same findings as the previous round it counts towards stagnation like any other repeated round. This is intended: the loop guard measures whether the PR is converging, and an unrecorded push that resolved nothing is not progress.
-- A stale round (the HEAD or base moved while the reviewer worked) is a completed round too: it is consumed, recorded in `review_history` and breaks the stagnation streak, but its findings are not discarded (see **Stale rounds keep their findings** below). Consuming the round is what keeps the cap in force however often the revision moves; a round that was not consumed could be repeated without bound by pushes alone.
+- A `FIX` entry that finds the PR HEAD past the reviewed HEAD, the PR retargeted to another base, or the base rewritten under its name (the merge base moved), goes back to `REVIEW` without launching the fixer (see **Re-entering a phase** below). That review of the actual revision is an ordinary round: it counts against the cap, and if it reports the same findings as the previous round it counts towards stagnation like any other repeated round. This is intended: the loop guard measures whether the PR is converging, and an unrecorded push that resolved nothing is not progress.
+- A stale round (the HEAD, base or merge base moved while the reviewer worked) is a completed round too: it is consumed, recorded in `review_history` and breaks the stagnation streak, but its findings are not discarded (see **Stale rounds keep their findings** below). Consuming the round is what keeps the cap in force however often the revision moves; a round that was not consumed could be repeated without bound by pushes alone.
 - Hitting any bound is `BLOCKED` (terminal). The open findings and the PR stay for a human; nothing is merged.
 
 ---
@@ -137,28 +137,38 @@ workflow:
 ## Bind reviews to PR HEAD SHA and to the PR identity
 
 A clean review is valid only for the exact change it reviewed: the commit,
-on the PR it was posted on, against that PR's base branch at the time. The
-same commit proposed as another PR (the same branch against another base)
-is a change no review decided on.
+on the PR it was posted on, against that PR's base branch at the time,
+from the merge base the diff was computed from. The same commit proposed
+as another PR (the same branch against another base) is a change no review
+decided on, and so is the same commit against the same base name after the
+base was rewritten under that name.
 
 Persist the reviewed revision with the review: the reviewed PR
-(`reviewed_pr_url`), the reviewed HEAD SHA (`reviewed_head_sha`) and the
-reviewed base branch (`reviewed_base_ref`). The controller reads all three
-from GitHub right before the reviewer is launched (`current_head_sha`,
-`current_base_ref`) and records them when the round is accepted. The
-round's comment carries the same revision in its `ai-review-result` marker
-(`reviewed_head_sha`, `reviewed_base_ref`), so the durable copy of the
-review on GitHub identifies the diff it decided on and a later entry can
-only ever adopt a comment for the base the PR targets now (see
-**Re-entering a phase**).
+(`reviewed_pr_url`), the reviewed HEAD SHA (`reviewed_head_sha`), the
+reviewed base branch (`reviewed_base_ref`) and the reviewed merge base
+(`reviewed_merge_base_sha`). The controller reads all of them from GitHub
+right before the reviewer is launched (`current_head_sha`,
+`current_base_ref`, `current_merge_base_sha`) and records them when the
+round is accepted. The round's comment carries the same revision in its
+`ai-review-result` marker (`reviewed_head_sha`, `reviewed_base_ref`,
+`reviewed_merge_base_sha`), so the durable copy of the review on GitHub
+identifies the diff it decided on and a later entry can only ever adopt a
+comment for the base and merge base the PR has now (see **Re-entering a
+phase**).
 
-The base is bound by name, not by the base branch's tip: the PR diff a
-reviewer reads is HEAD against the merge base, which ordinary commits on
-the base branch do not move, and the merge gate already defers to GitHub's
-own `mergeStateStatus` (`BEHIND` is refused) for the "must be up to date
-with the base" policy the repository configured. Pinning the merge-base
-commit as well would also catch a base branch rewritten under the same
-name; that is tracked as #96.
+The base is bound by name *and* by the merge base, not by the base
+branch's tip: the PR diff a reviewer reads is HEAD against the merge base
+of HEAD and the base branch. Ordinary commits landing on the base branch
+do not move that merge base, so they do not invalidate the review, and the
+merge gate defers to GitHub's own `mergeStateStatus` (`BEHIND` is refused)
+for the "must be up to date with the base" policy the repository
+configured. A base branch rewritten under the same name (a force-push, a
+reset) does move the merge base, and with it the diff, without changing
+the base name or the PR HEAD; that is what the merge base is pinned for
+(#96). The merge base is read from GitHub
+(`repos/{owner}/{repo}/compare/{base}...{head}`, `merge_base_commit`),
+never derived from the base tip, and a read that fails refuses the entry
+it was made for instead of guessing.
 
 Before accepting a clean review or allowing a future merge, verify:
 
@@ -167,31 +177,38 @@ same_target(current_pr_url, reviewed_pr_url)   # repository + number, never stri
 same_target(pr_returned_by_github, reviewed_pr_url)
 current_pr_head_sha == reviewed_head_sha
 current_pr_base_ref == reviewed_base_ref
+merge_base(current_pr_base_ref, current_pr_head_sha) == reviewed_merge_base_sha
 ```
 
 The identity checks come first, from state alone, and fail closed: a
 `current_pr_url` that is not the reviewed PR, or a GitHub read that answers
 the URL with another PR, is `BLOCKED` before anything else is read from it.
-The binding is never moved to the current URL, and a protocol-2 state file
-parked in `READY_FOR_MERGE` / `MERGE` (written before the binding existed)
-is refused at load rather than bound after the fact.
+The binding is never moved to the current URL, and a protocol-2 or
+protocol-3 state file parked in `READY_FOR_MERGE` / `MERGE` (written before
+the whole binding existed) is refused at load rather than bound after the
+fact.
 
 The binding names the evidence, and the merge gate re-reads it: with the
 PR at the reviewed revision, the comment `last_review_comment_url` names
 is fetched from GitHub and must still be this round's `ai-review-result`
-marker at that HEAD and base on that PR, saying `needs_fix_round: false`;
-otherwise `BLOCKED` (github-safety.md, "Before MERGE"). The clean review
-is never consumed from the state file alone (#94).
+marker at that HEAD, base and merge base on that PR, saying
+`needs_fix_round: false`; otherwise `BLOCKED` (github-safety.md, "Before
+MERGE"). The clean review is never consumed from the state file alone
+(#94).
 
-If the PR HEAD or base changes after the review, the prior clean review is
-stale and the PR must return to `REVIEW`, where the next round is bound to
-the actual revision. A PR that GitHub reports as `MERGED` at the reviewed
-HEAD but into another base is never counted (`BLOCKED`).
+If the PR HEAD, base or merge base changes after the review, the prior
+clean review is stale and the PR must return to `REVIEW`, where the next
+round is bound to the actual revision. The merge base is compared again on
+the post-write read when the merge did not happen and the PR is still
+`OPEN` at the reviewed HEAD and base name, so a base rewritten in that
+window takes the same path. A PR that GitHub reports as `MERGED` at the
+reviewed HEAD but into another base is never counted (`BLOCKED`).
 
 The same binding governs the other decision a review can make. A review
-that routes to `REPLAN_REEXECUTE` records the base it was bound to in the
-replan transaction, and the source PR may be checkpointed and later closed
-only while it still targets that base ([replan-transaction.md](replan-transaction.md),
+that routes to `REPLAN_REEXECUTE` records the base and the merge base it
+was bound to in the replan transaction, and the source PR may be
+checkpointed and later closed only while it still targets that base at
+that merge base ([replan-transaction.md](replan-transaction.md),
 "The decision point is what may be closed").
 
 A branch name is compared as GitHub reports it and is never interpreted;
@@ -204,25 +221,29 @@ comment unreadable.
 Never merge code that has changed since the latest clean review.
 
 The same rule covers a review with findings. The open findings are bound to
-`reviewed_head_sha` and `reviewed_base_ref`; a PR HEAD past it that the
-controller did not verify (an unrecorded fix, an operator push) makes those
-findings findings of a commit that is no longer the PR, and a PR retargeted
-to another base makes them findings of a diff the PR no longer proposes.
+`reviewed_head_sha`, `reviewed_base_ref` and `reviewed_merge_base_sha`; a
+PR HEAD past it that the controller did not verify (an unrecorded fix, an
+operator push) makes those findings findings of a commit that is no longer
+the PR, and a PR retargeted to another base, or whose base was rewritten
+under its name, makes them findings of a diff the PR no longer proposes.
 Which of them the push resolved is not knowable from controller state and
 is never inferred, so `FIX` is entered only while
-`current_pr_head_sha == reviewed_head_sha` and
-`current_pr_base_ref == reviewed_base_ref` (the base is compared only when
-`reviewed_base_ref` is set; a protocol-2 file loaded in `FIX` has none and
-the next review writes it); otherwise the review is marked stale and the
-actual revision is reviewed (`FIX -> REVIEW`), with the findings carried to
-it as prior findings to re-check (#95).
+`current_pr_head_sha == reviewed_head_sha`,
+`current_pr_base_ref == reviewed_base_ref` and the merge base GitHub reports
+equals `reviewed_merge_base_sha` (the base is compared only when
+`reviewed_base_ref` is set and the merge base only when
+`reviewed_merge_base_sha` is set; a protocol-2 or protocol-3 file loaded in
+`FIX` lacks them and the next review writes them); otherwise the review is
+marked stale and the actual revision is reviewed (`FIX -> REVIEW`), with
+the findings carried to it as prior findings to re-check (#95, #96).
 
 ### Stale rounds keep their findings
 
-A round goes stale in two places: the post-review read finds the HEAD or
-base moved while the reviewer worked (`REVIEW -> REVIEW`), or the `FIX`
-entry finds the HEAD past the reviewed one or the PR retargeted to another
-base (`FIX -> REVIEW`). In both, a
+A round goes stale in two places: the post-review read finds the HEAD,
+base or merge base moved while the reviewer worked (`REVIEW -> REVIEW`),
+or the `FIX` entry finds the HEAD past the reviewed one, the PR retargeted
+to another base, or the base rewritten under its name (`FIX -> REVIEW`).
+In both, a
 verified review reported findings that no fixer ever resolved, and the
 controller cannot tell which of them the newer commits resolved. Dropping
 them would let the next reviewer, a different profile with no memory of
@@ -288,33 +309,35 @@ next entry could not find again.
   same rule (github-safety.md, "Before ANALYZE_EXECUTE"), and so does the
   replan transaction for its replacement PR (replan-transaction.md).
 - `REVIEW` reads the PR comments for the `ai-review-result` marker of the
-  upcoming round at the bound HEAD *and base* (both re-read from GitHub by
-  this entry). One such comment is handed to the reviewer
+  upcoming round at the bound HEAD, base *and merge base* (all re-read
+  from GitHub by this entry). One such comment is handed to the reviewer
   (`EXISTING_REVIEW_COMMENT_URL`) to adopt, or to edit in place, instead of
   posting a second one. Two or more is a state the controller cannot
   resolve without choosing which review is the round's, so it enters
   `BLOCKED` without invoking anyone and names the comments. A comment for
-  the same round at another HEAD, or against another base, or whose marker
-  names no base (written before the marker recorded one), is not this
-  round's and is ignored: a review of the diff against the old base is not
-  a review of the diff against the one the PR targets now, and adopting it
-  would record the new base as reviewed. After the reviewer returns,
-  verification enforces that the round still has exactly one comment at
-  its HEAD and base; a reviewer that posted a second one, or that adopted
-  a comment for another base, has its round rejected, and the next entry
-  blocks on a pair. The same entry lists the
+  the same round at another HEAD, against another base, from another merge
+  base, or whose marker names no base or no merge base (written before the
+  marker recorded one), is not this round's and is ignored: a review of the
+  diff against the old base, or from the old merge base, is not a review
+  of the diff the PR shows now, and adopting it would record the new base
+  or merge base as reviewed. After the reviewer returns, verification
+  enforces that the round still has exactly one comment at its HEAD, base
+  and merge base; a reviewer that posted a second one, or that adopted a
+  comment for another base or merge base, has its round rejected, and the
+  next entry blocks on a pair. The same entry lists the
   open issues carrying this PR's `ai-follow-up` marker for any finding id
   (strictly; a listing that cannot be proven complete blocks) and hands
   them to the reviewer (`EXISTING_FOLLOW_UP_ISSUES`), so a problem an
   earlier round deferred is not raised again under this round's ids.
-- `FIX` re-reads the PR HEAD and base. Past the reviewed HEAD, or
+- `FIX` re-reads the PR HEAD, base and merge base. Past the reviewed HEAD,
   retargeted to another base (compared only when `reviewed_base_ref` is
-  set): `FIX -> REVIEW` of the actual revision, no fixer launched (the rule
+  set), or with the merge base moved (compared only when
+  `reviewed_merge_base_sha` is set): `FIX -> REVIEW` of the actual revision, no fixer launched (the rule
   above), the open findings carried to that review as prior findings to
   re-check; a fixer whose push landed but whose result was never recorded
   is therefore never relaunched against findings its push may have
   resolved, and the findings its push did not resolve are not lost either.
-  Equal to both: the repository's open
+  Equal on all of them: the repository's open
   issues are listed for the `ai-follow-up` marker of (this PR, an open
   finding), because a `follow_up_created` resolution creates an issue and
   moves no HEAD. One per finding is handed to the fixer (`FOLLOW_UP_ISSUES`)
@@ -397,8 +420,9 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   `LEGAL_EDGES` (`UNBLOCK_TARGETS`), never coerced, and checked before the
   run-log record is written, so an edge the topology refuses leaves neither
   a state write nor a record claiming an applied unblock. `current_head_sha`,
-  `current_base_ref` and `current_branch` are rebound from the live PR; the
-  review binding (`reviewed_*`) is never rewritten by this path. The action is
+  `current_base_ref` and `current_branch` are rebound from the live PR and
+  `current_merge_base_sha` is cleared for the next `REVIEW` entry to read;
+  the review binding (`reviewed_*`) is never rewritten by this path. The action is
   appended to `unblock_history` (timestamp, reason, cleared block reason,
   phase, detail) and to the run log, `block_reason` is cleared and `attempt`
   reset. No agent runs and no step is charged: the operator reviews the

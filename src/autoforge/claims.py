@@ -106,16 +106,20 @@ class ReviewClaim:
     """``ai-review-result``: a review comment names the revision its round decided on.
 
     The revision is the PR diff: the reviewed HEAD against the base branch
-    the PR targeted when the round was bound. Both are part of the key, so
-    a comment posted while the PR targeted another base is not this
-    round's, exactly as one posted at another HEAD is not, and is never
-    adopted by a later entry as a review of the base the PR targets now.
+    the PR targeted when the round was bound, from the merge base the two
+    had at that moment. All three are part of the key, so a comment posted
+    while the PR targeted another base, or while the base branch was
+    another history under the same name (#96), is not this round's,
+    exactly as one posted at another HEAD is not, and is never adopted by
+    a later entry as a review of the diff the PR shows now.
 
     ``reviewed_base_ref`` is ``None`` for a marker written before the base
-    was part of the schema. Such a comment reviewed a base nobody recorded,
-    so it matches no bound key and is never adopted; it is not a defect
-    either, because a mid-flight PR carries one from every earlier round
-    and a defect anywhere would block every later entry on that PR.
+    was part of the schema, and ``reviewed_merge_base_sha`` is ``None`` for
+    one written before the merge base was. Such a comment reviewed a diff
+    nobody recorded, so it matches no bound key and is never adopted; it
+    is not a defect either, because a mid-flight PR carries one from every
+    earlier round and a defect anywhere would block every later entry on
+    that PR.
     """
 
     round: int
@@ -123,10 +127,16 @@ class ReviewClaim:
     needs_fix_round: bool
     finding_ids: tuple[str, ...] | None = None
     reviewed_base_ref: str | None = None
+    reviewed_merge_base_sha: str | None = None  # lowercased
 
     @property
     def key(self) -> Hashable:
-        return (self.round, self.reviewed_head_sha, self.reviewed_base_ref)
+        return (
+            self.round,
+            self.reviewed_head_sha,
+            self.reviewed_base_ref,
+            self.reviewed_merge_base_sha,
+        )
 
 
 @dataclass(frozen=True)
@@ -253,7 +263,7 @@ def _decode_review(payload: dict) -> ReviewClaim:
     _exact_keys(
         payload,
         ("round", "reviewed_head_sha", "needs_fix_round"),
-        ("finding_ids", "reviewed_base_ref"),
+        ("finding_ids", "reviewed_base_ref", "reviewed_merge_base_sha"),
     )
     round_ = payload["round"]
     if not isinstance(round_, int) or isinstance(round_, bool) or round_ < 1:
@@ -276,12 +286,21 @@ def _decode_review(payload: dict) -> ReviewClaim:
     base_ref: str | None = None
     if "reviewed_base_ref" in payload:
         base_ref = _base_ref(payload["reviewed_base_ref"])
+    merge_base: str | None = None
+    if "reviewed_merge_base_sha" in payload:
+        raw_base = payload["reviewed_merge_base_sha"]
+        if not isinstance(raw_base, str) or not _FULL_SHA_RE.match(raw_base):
+            raise ValueError(
+                f"reviewed_merge_base_sha must be a 40-character git SHA, got {raw_base!r}"
+            )
+        merge_base = raw_base.lower()
     return ReviewClaim(
         round=round_,
         reviewed_head_sha=sha.lower(),
         needs_fix_round=needs_fix,
         finding_ids=finding_ids,
         reviewed_base_ref=base_ref,
+        reviewed_merge_base_sha=merge_base,
     )
 
 

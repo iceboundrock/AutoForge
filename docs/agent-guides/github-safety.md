@@ -107,27 +107,36 @@ one, and every probe and read-back reads them through it:
 
 ### Before REVIEW
 
-The reviewer is launched only after the controller has read the PR's
-comments for a comment already carrying the `ai-review-result` marker of the
-upcoming round at the bound HEAD and base (an earlier invocation of the
-same round whose result was never recorded):
+The reviewer is launched only after the controller has bound the revision
+it is to review, all read from GitHub: the PR HEAD, its base branch, and
+the merge base of the two (`repos/{owner}/{repo}/compare/{base}...{head}`,
+`merge_base_commit.sha`, the commit the PR diff is computed from; a base
+rewritten under its name moves it, ordinary commits on the base do not,
+#96). A read that fails refuses the entry; nothing is launched against a
+revision the controller could not name. It has then read the PR's
+comments for a comment already carrying the `ai-review-result` marker of
+the upcoming round at the bound HEAD, base and merge base (an earlier
+invocation of the same round whose result was never recorded):
 
 - exactly one: its URL is handed to the reviewer as
   `EXISTING_REVIEW_COMMENT_URL`, to adopt or edit in place, never duplicate
 - two or more: `BLOCKED` without launching the reviewer; the controller
   never chooses which review is the round's
-- a comment for the same round at another HEAD, or against another base,
-  is not this round's: the round's identity is the diff it decided on, and
-  a review posted before the PR was retargeted decided on another diff
-- a marker that names no base was written before the marker recorded one;
-  it reviewed a base nobody recorded, so it matches no bound key and is
-  never adopted, but it is not a defect (a PR mid-flight carries one from
-  every earlier round, and a defect would block every later entry on it)
+- a comment for the same round at another HEAD, against another base, or
+  from another merge base is not this round's: the round's identity is the
+  diff it decided on, and a review posted before the PR was retargeted, or
+  before its base was rewritten under its name, decided on another diff
+- a marker that names no base, or no merge base, was written before the
+  marker recorded one; it reviewed a diff nobody recorded, so it matches
+  no bound key and is never adopted, but it is not a defect (a PR
+  mid-flight carries one from every earlier round, and a defect would
+  block every later entry on it)
 - the marker is a JSON object with exactly an integer `round` (not a
   boolean, not a float), a 40-hex `reviewed_head_sha`, a boolean
-  `needs_fix_round` and optionally `reviewed_base_ref` (a branch name) and
-  `finding_ids` (distinct ids of that round); anything else is a defect
-  that blocks the entry and rejects the read-back, never "no marker"
+  `needs_fix_round` and optionally `reviewed_base_ref` (a branch name),
+  `reviewed_merge_base_sha` (a 40-hex SHA) and `finding_ids` (distinct ids
+  of that round); anything else is a defect that blocks the entry and
+  rejects the read-back, never "no marker"
 
 The same entry lists the repository's open issues (strictly, as before FIX)
 for every `ai-follow-up` marker naming this PR, whatever the finding id, and
@@ -148,12 +157,13 @@ Verify:
 - review round marker is correct
 - reviewed HEAD is correct
 - it is the only comment carrying this round's marker at this HEAD against
-  the bound base, and it is the comment the result names; a second one
-  rejects the round (the uniqueness rule is enforced on read-back, never
-  trusted to the prompt), and so does a result naming a comment whose
-  marker is for another base or none: the entry would not have handed it
-  over, and the binding the round writes (`reviewed_base_ref`) must be the
-  base its comment claims
+  the bound base from the bound merge base, and it is the comment the
+  result names; a second one rejects the round (the uniqueness rule is
+  enforced on read-back, never trusted to the prompt), and so does a result
+  naming a comment whose marker is for another base or merge base, or
+  names none: the entry would not have handed it over, and the binding the
+  round writes (`reviewed_base_ref`, `reviewed_merge_base_sha`) must be the
+  base and merge base its comment claims
 - the marker's `needs_fix_round` equals the result's, and its
   `finding_ids`, when present, are exactly the ids of the result's findings
   as a set (order is presentation); the marker is the durable copy of the
@@ -173,9 +183,9 @@ prompt renders as `REVIEW_COMMENT_URL` is the one GitHub reported, in its
 the round at the reviewed HEAD and tells the fixer not to substitute another
 PR comment or round; a human comment, an earlier or stale round, or an
 unrelated bot comment on the same PR is never the handoff because only the
-comment carrying the round's marker at the bound HEAD and base can be
-verified. A round that went stale (HEAD or base moved while the reviewer
-worked) records its comment URL in its history entry and in
+comment carrying the round's marker at the bound HEAD, base and merge base
+can be verified. A round that went stale (HEAD, base or merge base moved while
+the reviewer worked) records its comment URL in its history entry and in
 `last_review_comment_url` for the next REVIEW prompt's
 `PREVIOUS_REVIEW_COMMENT_URL`, but launches no fixer, so a stale comment never
 becomes a FIX handoff.
@@ -195,20 +205,24 @@ on the PR into a human decision.
 
 ### Before FIX
 
-The fixer is launched only while the PR HEAD and base read from GitHub
-equal the reviewed HEAD and base the open findings are bound to. A HEAD
-past it is an unverified push (an unrecorded fix, an operator); a base
-other than `reviewed_base_ref` is a retargeted PR whose findings were
-raised on a diff against another base (#95). Either way the review is
-stale and the phase goes to `REVIEW` of the actual revision without
-launching the fixer, with the open findings carried to that review as
-prior findings to re-check (workflow.md, "Bind reviews to PR HEAD SHA and
-to the PR identity" and "Stale rounds keep their findings"). A PR whose
-base cannot be read is refused as a verification failure, as the review
-and merge entries refuse it, never read as a retarget. The base is
-compared only when `reviewed_base_ref` is set: a protocol-2 state file
-loaded in `FIX` has no reviewed base, so its fixer is launched and the
-next completed review writes the binding.
+The fixer is launched only while the PR HEAD, base and merge base read
+from GitHub equal the reviewed HEAD, base and merge base the open findings
+are bound to. A HEAD past it is an unverified push (an unrecorded fix, an
+operator); a base other than `reviewed_base_ref` is a retargeted PR whose
+findings were raised on a diff against another base (#95); a merge base
+other than `reviewed_merge_base_sha` under the same base name is a base
+rewritten under its name, whose findings were raised on the diff from the
+old merge base (#96). In every case the review is stale and the phase goes
+to `REVIEW` of the actual revision without launching the fixer, with the
+open findings carried to that review as prior findings to re-check
+(workflow.md, "Bind reviews to PR HEAD SHA and to the PR identity" and
+"Stale rounds keep their findings"). A PR whose base or merge base cannot
+be read is refused as a verification failure, as the review and merge
+entries refuse it, never read as a retarget or a rewrite. The base is
+compared only when `reviewed_base_ref` is set and the merge base only when
+`reviewed_merge_base_sha` is set: a protocol-2 or protocol-3 state file
+loaded in `FIX` lacks them, so its fixer is launched and the next completed
+review writes the binding.
 
 A push is not the only write a fixer makes: a `follow_up_created`
 resolution creates an issue and moves no HEAD. With the HEAD unchanged the
@@ -325,12 +339,21 @@ Verify:
   above; a hosted check runs the PR's own code and cannot say what the PR's
   tests still assert
 - latest clean review applies to current HEAD *of the reviewed PR*: the
-  review is bound to the PR it was posted on, its HEAD and its base
-  (workflow.md, "Bind reviews to PR HEAD SHA and to the PR identity");
-  `current_pr_url` and the PR GitHub returns for it must be that PR by
-  identity (`BLOCKED` otherwise, before any other read), and the PR's base
-  must still be the reviewed one (stale -> `REVIEW` otherwise, like a HEAD
-  move)
+  review is bound to the PR it was posted on, its HEAD, its base and the
+  merge base its diff was computed from (workflow.md, "Bind reviews to PR
+  HEAD SHA and to the PR identity"); `current_pr_url` and the PR GitHub
+  returns for it must be that PR by identity (`BLOCKED` otherwise, before
+  any other read), the PR's base must still be the reviewed one, and the
+  merge base of that base and the HEAD, read from GitHub here, must still
+  be `reviewed_merge_base_sha` (stale -> `REVIEW` otherwise, like a HEAD
+  move; a base rewritten under its name is caught by this read, ordinary
+  commits on the base do not move the merge base and leave `BEHIND` to the
+  readiness check). The merge-base read failing is classified like every
+  other pre-merge read: transient -> bounded re-check, conclusive ->
+  `BLOCKED`. The same comparison is made on the post-write read when the
+  merge did not happen and the PR is still `OPEN` at the reviewed HEAD and
+  base name, so a base rewritten in the write window goes to `REVIEW`
+  rather than being retried as reviewed
 - the clean review itself is re-read from GitHub, not taken from the state
   file (#94): once the PR is at the reviewed revision, the comment
   `last_review_comment_url` names is fetched (one read per gate pass,
@@ -338,10 +361,11 @@ Verify:
   the reviewed PR as GitHub reports its parent (the comments API addresses
   a comment by id alone, so the URL's spelling of the parent proves
   nothing), carrying exactly one readable `ai-review-result` marker whose
-  key is `(review_round, reviewed_head_sha, reviewed_base_ref)`, read
-  through `claims.py` exactly as the round's read-back read it, with
-  `needs_fix_round: false`. Anything else (the comment gone, on another PR,
-  a marker for another round, HEAD or base, none, unreadable or doubled, a
+  key is `(review_round, reviewed_head_sha, reviewed_base_ref,
+  reviewed_merge_base_sha)`, read through `claims.py` exactly as the
+  round's read-back read it, with `needs_fix_round: false`. Anything else
+  (the comment gone, on another PR, a marker for another round, HEAD, base
+  or merge base, none, unreadable or doubled, a
   marker saying a fix round is needed, or no comment URL in state at all)
   is conclusive: `BLOCKED`, or a refusal from state alone for the missing
   URL, never a merge; a transient failure of the read takes the bounded

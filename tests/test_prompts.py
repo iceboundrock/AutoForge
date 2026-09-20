@@ -97,12 +97,21 @@ def test_review_prompt_contract():
         "{{EXISTING_REVIEW_COMMENT_URL}}",
         "If a comment for this round already exists",
         "do NOT post a second one",
-        "exactly one review comment at its HEAD and base",
+        # #96 R2-F1: the uniqueness rule names the full four-part key.
+        "exactly one review comment at its HEAD, base and merge base",
+        "against THIS base and\n  THIS merge base",
+        "at merge base `{{REVIEWED_MERGE_BASE_SHA}}`",
         # PR #93 review: the round's comment is looked up by (round, HEAD,
         # base); a comment against another base is never this round's.
         "{{REVIEWED_BASE_REF}}",
         '"reviewed_base_ref": {{REVIEWED_BASE_REF_JSON}}',
-        "another base branch or no base branch at all is a review of a different",
+        "another base branch, another merge base, or no base branch or merge base at",
+        # #96: ... and by the merge base the diff is computed from, so a base
+        # branch rewritten under its name is a different diff.
+        "{{REVIEWED_MERGE_BASE_SHA}}",
+        '"reviewed_merge_base_sha": "{{REVIEWED_MERGE_BASE_SHA}}"',
+        "`reviewed_merge_base_sha` (the 40 character SHA of the merge base)",
+        "re-reads the merge base",
         # The marker layout holds placeholders that cannot be mistaken for
         # values: a copied `true|false` was invalid JSON that read as a
         # template to fill; `<...>` is the template's own placeholder form.
@@ -411,7 +420,7 @@ def test_correction_prompt_exact_text():
 
 
 def test_engine_prompt_variables_review_and_fix(engine):
-    from tests.conftest import PR, SHA_A, SHA_B
+    from tests.conftest import MERGE_BASE, MERGE_BASE_B, PR, SHA_A, SHA_B
 
     engine.state.phase = Phase.REVIEW
     engine.state.current_pr_url = PR
@@ -420,28 +429,36 @@ def test_engine_prompt_variables_review_and_fix(engine):
     engine.state.review_round = 1
     engine.state.current_base_ref = 'rel"1'
     engine.state.reviewed_base_ref = "main"
+    engine.state.current_merge_base_sha = MERGE_BASE_B
+    engine.state.reviewed_merge_base_sha = MERGE_BASE
     text = engine.render_prompt_for(Phase.REVIEW)
     assert "Round 2" in text and SHA_B in text  # reviews the *current* HEAD
     # ... against the *current* base, given as a JSON literal inside the
     # marker so a quote in the branch name cannot break the marker's JSON.
     assert 'Reviewed base branch (bound by the controller): `rel"1`' in text
-    assert '"reviewed_base_ref": "rel\\"1", "needs_fix_round"' in text
+    assert '"reviewed_base_ref": "rel\\"1", "reviewed_merge_base_sha": ' in text
+    # ... from the *current* merge base (#96), the one bound for this round.
+    assert f"computed from): `{MERGE_BASE_B}`" in text
+    assert f'"reviewed_merge_base_sha": "{MERGE_BASE_B}", "needs_fix_round"' in text
+    assert MERGE_BASE not in text
     # A comment delimiter in the branch name is escaped the same way (as the
     # JSON escapes `\u003c` / `\u003e`), so the marker line the reviewer
     # copies holds exactly one `-->`: the template's own.
     engine.state.current_base_ref = "x-->y"
     text = engine.render_prompt_for(Phase.REVIEW)
-    assert '"reviewed_base_ref": "x--\\u003ey", "needs_fix_round"' in text
+    assert '"reviewed_base_ref": "x--\\u003ey", "reviewed_merge_base_sha"' in text
     (marker_line,) = [line for line in text.splitlines() if "<!-- ai-review-result:" in line]
     assert marker_line.count("-->") == 1 and marker_line.endswith("-->")
     # Rendered outside a step, no PR was read: no existing comment is named.
     assert (
-        "Comment already posted for THIS round at THIS HEAD against THIS base (if\n  any): (none)"
-        in text
+        "Comment already posted for THIS round at THIS HEAD against THIS base and\n"
+        "  THIS merge base (if any): (none)" in text
     )
     engine._existing_review_comment_url = f"{PR}#issuecomment-7"
     text = engine.render_prompt_for(Phase.REVIEW)
-    assert f"THIS HEAD against THIS base (if\n  any): {PR}#issuecomment-7" in text
+    assert (
+        f"THIS HEAD against THIS base and\n  THIS merge base (if any): {PR}#issuecomment-7" in text
+    )
     engine._existing_review_comment_url = ""
     engine.state.phase = Phase.FIX
     engine.state.open_findings = [
@@ -449,6 +466,11 @@ def test_engine_prompt_variables_review_and_fix(engine):
     ]
     text = engine.render_prompt_for(Phase.FIX)
     assert "R1-F1" in text and SHA_A in text and "do x" in text
+    # Outside REVIEW the *reviewed* binding is what the prompt names.
+    engine.state.phase = Phase.READY_FOR_MERGE
+    assert engine._prompt_variables()["REVIEWED_MERGE_BASE_SHA"] == MERGE_BASE
+    engine.state.reviewed_merge_base_sha = ""
+    assert engine._prompt_variables()["REVIEWED_MERGE_BASE_SHA"] == "(none)"
     corr = engine.render_prompt_for(Phase.FIX, correction_error="boom")
     assert "did not return a valid CONTROL_RESULT" in corr and "boom" in corr
 

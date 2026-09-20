@@ -47,6 +47,7 @@ PR = "https://github.com/owner/repo/pull/42"
 PR41 = "https://github.com/owner/repo/pull/41"
 SHA_A = "a" * 40
 SHA_B = "b" * 40
+MB = "d" * 40  # a reviewed merge base
 
 
 @dataclass(frozen=True)
@@ -101,7 +102,7 @@ def test_review_marker_lowercases_the_sha_and_keeps_finding_ids():
         "finding_ids": ["R2-F1", "R2-F2"],
     }
     (claim,) = scan(REVIEW, marker("ai-review-result", payload)).claims
-    assert claim.reviewed_head_sha == SHA_A and claim.key == (2, SHA_A, None)
+    assert claim.reviewed_head_sha == SHA_A and claim.key == (2, SHA_A, None, None)
     assert claim.finding_ids == ("R2-F1", "R2-F2") and claim.needs_fix_round is True
 
 
@@ -111,7 +112,7 @@ def test_review_marker_binds_the_base_branch_into_the_key():
     is a different key and never the round's comment for a bound base."""
     payload = {**_valid(REVIEW), "reviewed_base_ref": "main"}
     (claim,) = scan(REVIEW, marker("ai-review-result", payload)).claims
-    assert claim.reviewed_base_ref == "main" and claim.key == (1, SHA_A, "main")
+    assert claim.reviewed_base_ref == "main" and claim.key == (1, SHA_A, "main", None)
     (other,) = scan(
         REVIEW, marker("ai-review-result", {**payload, "reviewed_base_ref": "release/1.x"})
     ).claims
@@ -123,8 +124,40 @@ def test_review_marker_binds_the_base_branch_into_the_key():
     objs.append(Obj("c3", marker("ai-review-result", _valid(REVIEW))))
     collection = collect(REVIEW, objs, "comment")
     assert collection.defects == ()
-    assert collection.claimants((1, SHA_A, "main"), "r1").exactly_one().obj.url == "c1"
-    assert collection.claimants((1, SHA_A, "release/1.x"), "r1").at_most_one() is None
+    assert collection.claimants((1, SHA_A, "main", None), "r1").exactly_one().obj.url == "c1"
+    assert collection.claimants((1, SHA_A, "release/1.x", None), "r1").at_most_one() is None
+
+
+def test_review_marker_binds_the_merge_base_into_the_key():
+    """#96: the diff a round decided on is computed from a merge base, and a
+    base branch rewritten under its name moves it while the HEAD and the
+    base name stay. The merge base is therefore part of the key, lowercased
+    like the HEAD; a marker naming another one, or none (written before the
+    key had one), is a different key and never the round's comment for a
+    bound merge base -- and not a defect either."""
+    payload = {**_valid(REVIEW), "reviewed_base_ref": "main", "reviewed_merge_base_sha": MB}
+    (claim,) = scan(REVIEW, marker("ai-review-result", payload)).claims
+    assert claim.reviewed_merge_base_sha == MB and claim.key == (1, SHA_A, "main", MB)
+    (upper,) = scan(
+        REVIEW, marker("ai-review-result", {**payload, "reviewed_merge_base_sha": MB.upper()})
+    ).claims
+    assert upper.key == claim.key
+    other_base = {**payload, "reviewed_merge_base_sha": "f" * 40}
+    (other,) = scan(REVIEW, marker("ai-review-result", other_base)).claims
+    (legacy,) = scan(
+        REVIEW, marker("ai-review-result", {**_valid(REVIEW), "reviewed_base_ref": "main"})
+    ).claims
+    assert legacy.reviewed_merge_base_sha is None
+    assert len({claim.key, other.key, legacy.key}) == 3
+    objs = [
+        Obj("c1", marker("ai-review-result", payload)),
+        Obj("c2", marker("ai-review-result", other_base)),
+        Obj("c3", marker("ai-review-result", {**_valid(REVIEW), "reviewed_base_ref": "main"})),
+    ]
+    collection = collect(REVIEW, objs, "comment")
+    assert collection.defects == ()
+    assert collection.claimants((1, SHA_A, "main", MB), "r1").exactly_one().obj.url == "c1"
+    assert collection.claimants((1, SHA_A, "main", "e" * 40), "r1").at_most_one() is None
 
 
 @pytest.mark.parametrize(
@@ -211,6 +244,9 @@ def _cases():
     yield REVIEW, {**r, "reviewed_base_ref": "release 1"}, "is not a branch name"
     yield REVIEW, {**r, "reviewed_base_ref": "main\n"}, "is not a branch name"
     yield REVIEW, {**r, "reviewed_base_ref": "ma\x7fin"}, "is not a branch name"
+    yield REVIEW, {**r, "reviewed_merge_base_sha": 1}, "reviewed_merge_base_sha must be a 40"
+    yield REVIEW, {**r, "reviewed_merge_base_sha": "d" * 39}, "reviewed_merge_base_sha must be"
+    yield REVIEW, {**r, "reviewed_merge_base_sha": "g" * 40}, "reviewed_merge_base_sha must be"
     p = _valid(PROGRESS)
     yield PROGRESS, {"issue": ISSUE}, "missing key(s) pr"
     yield PROGRESS, {**p, "note": "x"}, "unknown key(s) note"
@@ -537,7 +573,7 @@ def test_marker_json_keeps_a_comment_delimiter_out_of_the_marker_and_round_trips
     )
     assert result.defects == ()
     (claim,) = result.claims
-    assert claim.reviewed_base_ref == base and claim.key == (1, SHA_A, base)
+    assert claim.reviewed_base_ref == base and claim.key == (1, SHA_A, base, None)
     # And the same value pasted as the reviewer is told to, from the prompt
     # variable, is one marker too: the template's own `-->` still ends it.
     hand_written = (

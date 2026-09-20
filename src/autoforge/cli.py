@@ -744,9 +744,11 @@ def _render_status(state: AutoForgeState, txn: ReplanTransaction | None) -> str:
         f"Replan count: {state.escalation_count}",
         f"Current HEAD:  {state.current_head_sha or '-'}",
         f"Current base:  {state.current_base_ref or '-'}",
+        f"Current merge base:  {state.current_merge_base_sha or '-'}",
         f"Reviewed PR:   {state.reviewed_pr_url or '-'}",
         f"Reviewed HEAD: {state.reviewed_head_sha or '-'}",
         f"Reviewed base: {state.reviewed_base_ref or '-'}",
+        f"Reviewed merge base: {state.reviewed_merge_base_sha or '-'}",
         f"Last review:   {state.last_review_result or '-'}",
         f"Review comment: {state.last_review_comment_url or '-'}",
         f"Open findings: {len(state.open_findings)}",
@@ -840,6 +842,7 @@ def print_ready_banner(state: AutoForgeState, gate_open: bool = False) -> None:
         f"  Review round:  {state.review_round}",
         f"  Reviewed HEAD: {state.reviewed_head_sha}",
         f"  Reviewed base: {state.reviewed_base_ref or '-'}",
+        f"  Reviewed merge base: {state.reviewed_merge_base_sha or '-'}",
         f"  Review:        {state.last_review_comment_url or '-'}",
     ]
     if gate_open:

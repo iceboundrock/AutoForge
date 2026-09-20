@@ -19,7 +19,7 @@ import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 from .errors import (
     ConfigurationError,
@@ -1285,6 +1285,41 @@ class GitHubClient:
         sha = commit.get("sha") if isinstance(commit, dict) else None
         if not isinstance(sha, str) or not sha:
             raise GitHubError(f"branch {branch!r} of {repository} has no readable head SHA")
+        return sha.lower()
+
+    def get_merge_base_sha(self, repository: str, base_ref: str, head_sha: str) -> str:
+        """The merge base of a base branch and a commit (lower-case SHA).
+
+        This is the commit a PR diff is computed against, so it is what a
+        review is bound to (#96): a base branch rewritten under the same
+        name (force-push, reset) moves it while the base *name* and the PR
+        HEAD stay put; ordinary commits landing on the base do not move it.
+
+        Read through the compare endpoint, projected with ``--jq`` before it
+        reaches the controller: the full response carries every commit and
+        every file patch between the two revisions, which for a long-lived
+        base can exceed the executor's output bound, and truncated `gh`
+        output is refused rather than parsed. The base is percent-encoded
+        (git allows ``#`` and ``%`` in a ref name) and the head is the
+        reviewed commit itself, never a branch name, so the answer cannot
+        change under the read.
+        """
+        if not _SHA40_RE.fullmatch(head_sha.lower()):
+            raise GitHubError(f"merge base of {base_ref!r}: head {head_sha!r} is not a full SHA")
+        data = self._api_json(
+            [
+                "api",
+                f"repos/{repository}/compare/{quote(base_ref, safe='')}...{head_sha.lower()}",
+                "--jq",
+                "{merge_base_sha: .merge_base_commit.sha}",
+            ]
+        )
+        sha = data.get("merge_base_sha")
+        if not isinstance(sha, str) or not _SHA40_RE.fullmatch(sha.lower()):
+            raise GitHubError(
+                f"merge base of {base_ref!r} and {head_sha[:12]} of {repository} is unreadable:"
+                f" {sha!r:.100}"
+            )
         return sha.lower()
 
     def find_workflow_runs(

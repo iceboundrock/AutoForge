@@ -54,6 +54,8 @@ from autoforge.transitions import Phase, WorkflowMode, edges_for
 from tests.conftest import (
     BRANCH,
     ISSUE,
+    MERGE_BASE,
+    MERGE_BASE_B,
     PR,
     SHA_A,
     SHA_B,
@@ -362,10 +364,12 @@ def _seed_txn(stage: ReplanStage, **over) -> ReplanTransaction:
         decision_head_sha=SHA_A,
         decision_branch=BRANCH,
         decision_base_ref="main",
+        decision_merge_base_sha=MERGE_BASE,
         source_pr_url=PR,
         source_branch=BRANCH,
         source_head_sha=SHA_A,
         source_base_ref="main",
+        source_merge_base_sha=MERGE_BASE,
         source_review_round=20,
         base_branch="main",
         evidence_finding_count=3,
@@ -522,6 +526,7 @@ def test_hard_threshold_replaces_pr_and_starts_fresh_review(tmp_state_dir):
     superseded = state.superseded_prs[0]
     assert superseded["pr_url"] == PR and superseded["head_sha"] == SHA_A
     assert superseded["branch"] == BRANCH and superseded["base_ref"] == "main"
+    assert superseded["merge_base_sha"] == MERGE_BASE
     assert superseded["replacement_pr_url"] == REPLACEMENT_PR
     assert len(superseded["transaction_id"]) == 32
     assert eng.provider.calls[-1].profile.name == "replan_reexecute"
@@ -784,6 +789,7 @@ def test_review_beyond_the_persisted_finding_bound_blocks_instead_of_replanning(
         decision_head_sha=SHA_A,
         decision_branch=BRANCH,
         decision_base_ref="main",
+        decision_merge_base_sha=MERGE_BASE,
         escalation={"trigger": "hard_review_round_threshold"},
     ).to_dict()
     calls_before = len(eng.provider.calls)
@@ -2680,6 +2686,7 @@ def test_conclusive_failure_reading_the_source_at_prepare_blocks(tmp_state_dir):
         decision_head_sha=SHA_A,
         decision_branch=BRANCH,
         decision_base_ref="main",
+        decision_merge_base_sha=MERGE_BASE,
         escalation={"trigger": "hard_review_round_threshold"},
     ).to_dict()
     gh.get_pr_error = GitHubError("HTTP 404: Not Found")
@@ -2703,6 +2710,7 @@ def _pending_at_the_source(tmp_state_dir, gh):
         decision_head_sha=SHA_A,
         decision_branch=BRANCH,
         decision_base_ref="main",
+        decision_merge_base_sha=MERGE_BASE,
         escalation={"trigger": "hard_review_round_threshold"},
     ).to_dict()
     return eng
@@ -2748,6 +2756,7 @@ def test_a_source_pr_that_moved_before_prepare_is_refused(tmp_state_dir):
         decision_head_sha=SHA_A,
         decision_branch=BRANCH,
         decision_base_ref="main",
+        decision_merge_base_sha=MERGE_BASE,
         escalation={"trigger": "hard_review_round_threshold"},
     ).to_dict()
     out = eng.step()
@@ -2792,6 +2801,7 @@ def test_source_moving_between_the_review_and_the_prepare_is_refused(tmp_state_d
     assert txn.decision_pr_url == PR
     assert txn.decision_head_sha == SHA_A and txn.decision_branch == BRANCH
     assert txn.decision_base_ref == "main"  # the base REVIEW bound the round to
+    assert txn.decision_merge_base_sha == MERGE_BASE  # and the merge base (#96)
 
     drift(gh.prs[PR])
     calls_before = len(eng.provider.calls)
@@ -2830,9 +2840,11 @@ def test_a_transaction_that_never_recorded_its_decision_point_is_refused(tmp_sta
     assert eng.provider.calls == []
     _assert_source_untouched(eng, gh)
     source = PRInfo(url=PR, number=42, title="PR", state="OPEN", head_sha=SHA_A, head_ref=BRANCH)
-    assert "does not record the PR whose review decided it" in verify_decision_point(source, txn)
+    assert "does not record the PR whose review decided it" in verify_decision_point(
+        source, txn, MERGE_BASE
+    )
     txn.decision_pr_url = PR
-    assert "does not record the reviewed HEAD" in verify_decision_point(source, txn)
+    assert "does not record the reviewed HEAD" in verify_decision_point(source, txn, MERGE_BASE)
 
 
 @pytest.mark.parametrize(
@@ -2844,8 +2856,13 @@ def test_a_transaction_that_never_recorded_its_decision_point_is_refused(tmp_sta
             "checkpointed source base 'main' is not the base 'release/1.x' the review that "
             "decided this replan was bound to",
         ),
+        (
+            {"decision_merge_base_sha": MERGE_BASE_B},
+            f"checkpointed source merge base {MERGE_BASE} is not the merge base {MERGE_BASE_B} "
+            "the review that decided this replan was bound to",
+        ),
     ],
-    ids=["head", "base"],
+    ids=["head", "base", "merge-base"],
 )
 def test_a_checkpoint_that_disagrees_with_the_decision_point_never_closes(
     tmp_state_dir, over, needle
@@ -2857,6 +2874,281 @@ def test_a_checkpoint_that_disagrees_with_the_decision_point_never_closes(
     assert out.next_phase == "BLOCKED"
     assert needle in eng.state.block_reason
     _assert_source_untouched(eng, gh)
+
+
+# =============================================================================
+# Issue #96: the merge base is bound at the decision, checkpointed at the
+# prepare and re-verified at every point the transaction compares the source
+# -- a base rewritten under its name moves the merge base while the HEAD,
+# branch and base name stay equal, and is a diff the deciding review never saw
+# =============================================================================
+
+
+def test_a_base_rewritten_between_the_review_and_the_prepare_is_refused(tmp_state_dir):
+    """The decision point binds the merge base, not only the base's name."""
+    gh = FakeGitHub()
+    eng = _park_at_hard_threshold(tmp_state_dir, gh, _replan_agent(gh))
+    assert eng.step().next_phase == "REPLAN_REEXECUTE"
+    assert _txn(eng).decision_merge_base_sha == MERGE_BASE
+    gh.merge_base = MERGE_BASE_B  # HEAD, branch and base name are all unchanged
+    calls_before = len(eng.provider.calls)
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    reason = eng.state.block_reason
+    assert f"has merge base {MERGE_BASE_B} with base 'main'" in reason
+    assert f"was bound to merge base {MERGE_BASE}" in reason
+    assert "was rewritten under its name and the current diff was never reviewed" in reason
+    assert len(eng.provider.calls) == calls_before  # no replacement was attempted
+    assert _txn(eng).stage is ReplanStage.REJECTED
+    assert _txn(eng).transaction_id == ""
+    _assert_source_untouched(eng, gh)
+
+
+def test_the_prepared_checkpoint_records_the_merge_base_it_was_taken_at(tmp_state_dir):
+    """The prepare reads the merge base from GitHub and checkpoints it next to
+    the HEAD, branch and base; the replan agent sees a PREPARED journal that
+    carries it."""
+    gh = FakeGitHub()
+    seen = {}
+
+    def agent(req):
+        if req.phase == "REVIEW":
+            return _replan_agent(gh)(req)
+        seen["journal"] = json.loads(eng.paths.state_file.read_text())["replan_transaction"]
+        return _replan_agent(gh)(req)
+
+    eng = _park_at_hard_threshold(tmp_state_dir, gh, agent)
+    assert eng.step().next_phase == "REPLAN_REEXECUTE"
+    assert eng.step().next_phase == "REVIEW"
+    assert seen["journal"]["stage"] == ReplanStage.PREPARED.value
+    assert seen["journal"]["source_merge_base_sha"] == MERGE_BASE
+    assert seen["journal"]["decision_merge_base_sha"] == MERGE_BASE
+    assert eng.state.superseded_prs[0]["merge_base_sha"] == MERGE_BASE
+
+
+def test_a_base_rewritten_before_the_close_is_refused_without_closing(tmp_state_dir):
+    """The pre-close check re-reads the merge base against the checkpoint."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.VERIFIED)
+    gh.merge_base = MERGE_BASE_B
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    reason = eng.state.block_reason
+    assert f"moved from the checkpointed merge base {MERGE_BASE} to {MERGE_BASE_B}" in reason
+    assert "was rewritten under its name" in reason
+    assert _txn(eng).stage is ReplanStage.REJECTED
+    _assert_source_untouched(eng, gh)
+
+
+@pytest.mark.parametrize("window", ["close", "receipt"])
+def test_a_base_rewritten_inside_the_close_window_is_undone(tmp_state_dir, window):
+    """A rewrite landing between the last read and the close, or while the
+    receipt is being published, is compensated like a HEAD or base move:
+    the close was wrong, so it is undone and the run stops."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.VERIFIED)
+    race = lambda g: setattr(g, "merge_base", MERGE_BASE_B)  # noqa: E731
+    if window == "close":
+        gh.close_race = race
+    else:
+        gh.comment_race = race
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    reason = eng.state.block_reason
+    assert f"moved from the checkpointed merge base {MERGE_BASE} to {MERGE_BASE_B}" in reason
+    assert "inside the close window" in reason and "the close was undone" in reason
+    assert [url for url, _ in gh.closed_prs] == [PR]
+    assert [url for url, _ in gh.reopened_prs] == [PR]
+    assert gh.prs[PR].state == "OPEN"
+    assert _txn(eng).stage is ReplanStage.REJECTED
+    assert eng.state.current_pr_url == PR and eng.state.current_head_sha == SHA_A
+    assert eng.state.superseded_prs == [] and eng.state.escalation_count == 0
+
+
+def test_a_base_rewritten_before_activation_blocks_terminally(tmp_state_dir):
+    """After SUPERSEDED the close was confirmed correct, so merge-base drift
+    in the activation window is terminal like every other source drift:
+    nothing is reopened, nothing is installed."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(
+        tmp_state_dir, gh, ReplanStage.SUPERSEDED, superseded_at="2026-01-01T00:00:00+00:00"
+    )
+    _closed_by_controller(gh)
+    gh.merge_base = MERGE_BASE_B
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    reason = eng.state.block_reason
+    assert "can no longer be activated" in reason
+    assert f"moved from the checkpointed merge base {MERGE_BASE} to {MERGE_BASE_B}" in reason
+    assert PR in reason and REPLACEMENT_PR in reason
+    assert eng.state.superseded_prs == [] and eng.state.current_pr_url == PR
+    assert gh.reopened_prs == [] and gh.closed_prs == []
+    assert _txn(eng).stage is ReplanStage.REJECTED
+
+
+def test_an_unreadable_merge_base_at_prepare_is_a_refusal(tmp_state_dir):
+    """A merge base that cannot be read is not a merge base that matched."""
+    gh = FakeGitHub()
+    eng = _pending_at_the_source(tmp_state_dir, gh)
+    gh.merge_base_error = GitHubError("HTTP 404: Not Found")
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert "cannot checkpoint the replan source" in eng.state.block_reason
+    assert "HTTP 404" in eng.state.block_reason
+    assert _txn(eng).stage is ReplanStage.REJECTED
+    assert _txn(eng).transaction_id == ""
+    assert eng.provider.calls == []
+    _assert_source_untouched(eng, gh)
+
+
+def test_a_transient_merge_base_read_at_prepare_stays_resumable(tmp_state_dir):
+    gh = FakeGitHub()
+    eng = _pending_at_the_source(tmp_state_dir, gh)
+    gh.merge_base_error = GitHubUnavailableError("gh: connection reset")
+    with pytest.raises(GitHubUnavailableError):
+        eng.step()
+    assert eng.state.phase == Phase.REPLAN_REEXECUTE and not eng.state.block_reason
+    assert _txn(eng).stage is ReplanStage.PENDING
+    assert eng.provider.calls == []
+    _assert_source_untouched(eng, gh)
+
+
+def test_an_unreadable_merge_base_before_the_close_is_a_refusal(tmp_state_dir):
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.VERIFIED)
+    gh.merge_base_error = GitHubError("HTTP 451: refused")
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    reason = eng.state.block_reason
+    assert f"the merge base of source PR {PR} could not be read" in reason
+    assert "cannot be confirmed before the close" in reason
+    assert _txn(eng).stage is ReplanStage.REJECTED
+    _assert_source_untouched(eng, gh)
+
+
+def test_a_transient_merge_base_read_before_the_close_stays_resumable(tmp_state_dir):
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.VERIFIED)
+    gh.merge_base_error = GitHubUnavailableError("HTTP 502: bad gateway")
+    with pytest.raises(GitHubUnavailableError):
+        eng.step()
+    assert _txn(eng).stage is ReplanStage.VERIFIED  # nothing was decided
+    _assert_source_untouched(eng, gh)
+    gh.merge_base_error = None
+    assert eng.step().next_phase == "REVIEW"
+    assert eng.state.superseded_prs[0]["merge_base_sha"] == MERGE_BASE
+
+
+def test_an_unreadable_merge_base_after_the_close_is_undone_not_adopted(tmp_state_dir):
+    """The confirmation's own merge-base read follows the source read's rule:
+    a checkpoint that cannot be confirmed is not one that held."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.VERIFIED)
+    gh.comment_race = lambda g: setattr(g, "merge_base_error", GitHubError("HTTP 451: refused"))
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    reason = eng.state.block_reason
+    assert f"the merge base of source PR {PR} could not be re-read after the close" in reason
+    assert "the close was undone" in reason
+    assert [url for url, _ in gh.reopened_prs] == [PR] and gh.prs[PR].state == "OPEN"
+    assert _txn(eng).stage is ReplanStage.REJECTED
+    assert eng.state.superseded_prs == []
+
+
+def test_a_transient_merge_base_read_after_the_close_stays_resumable(tmp_state_dir):
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.VERIFIED)
+    gh.comment_race = lambda g: setattr(
+        g, "merge_base_error", GitHubUnavailableError("HTTP 502: bad gateway")
+    )
+    with pytest.raises(GitHubUnavailableError):
+        eng.step()
+    assert _txn(eng).stage is ReplanStage.SUPERSEDE_INTENT  # nothing was decided
+    assert gh.reopened_prs == [] and gh.prs[PR].state == "CLOSED"
+    gh.merge_base_error = None
+    assert eng.step().next_phase == "REVIEW"
+    assert len(gh.closed_prs) == 1 and gh.reopened_prs == []
+    assert eng.state.superseded_prs[0]["merge_base_sha"] == MERGE_BASE
+
+
+def test_an_unreadable_merge_base_before_activation_blocks_terminally(tmp_state_dir):
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(
+        tmp_state_dir, gh, ReplanStage.SUPERSEDED, superseded_at="2026-01-01T00:00:00+00:00"
+    )
+    _closed_by_controller(gh)
+    gh.merge_base_error = GitHubError("HTTP 451: refused")
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    reason = eng.state.block_reason
+    assert "the replan checkpoints could not be re-read before activating the replacement" in (
+        reason
+    )
+    assert "HTTP 451" in reason
+    assert eng.state.superseded_prs == [] and eng.state.current_pr_url == PR
+    assert gh.reopened_prs == [] and gh.closed_prs == []
+    assert _txn(eng).stage is ReplanStage.REJECTED
+
+
+def test_a_transient_merge_base_read_before_activation_stays_resumable(tmp_state_dir):
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(
+        tmp_state_dir, gh, ReplanStage.SUPERSEDED, superseded_at="2026-01-01T00:00:00+00:00"
+    )
+    _closed_by_controller(gh)
+    gh.merge_base_error = GitHubUnavailableError("HTTP 502: bad gateway")
+    with pytest.raises(GitHubUnavailableError):
+        eng.step()
+    assert _txn(eng).stage is ReplanStage.SUPERSEDED  # nothing was decided
+    gh.merge_base_error = None
+    assert eng.step().next_phase == "REVIEW"
+    assert eng.state.current_pr_url == REPLACEMENT_PR
+    assert eng.state.superseded_prs[0]["merge_base_sha"] == MERGE_BASE
+
+
+def test_the_decision_point_verifier_refuses_a_missing_or_moved_merge_base():
+    """Same rule as the base: an unrecorded merge base is a refusal, and so
+    is a source whose merge base is not the one the deciding review was
+    bound to -- an unreadable one included (#96)."""
+    from autoforge.replan_txn import verify_decision_point
+
+    txn = _seed_txn(ReplanStage.PENDING, decision_merge_base_sha="")
+    assert "does not record the merge base the review that decided it was bound to" in (
+        verify_decision_point(_pr(), txn, MERGE_BASE)
+    )
+    txn.decision_merge_base_sha = MERGE_BASE
+    assert verify_decision_point(_pr(), txn, MERGE_BASE) == ""
+    assert verify_decision_point(_pr(), txn, MERGE_BASE.upper()) == ""
+    for moved in (MERGE_BASE_B, ""):
+        drift = verify_decision_point(_pr(), txn, moved)
+        assert f"has merge base {moved or '(unreadable)'} with base 'main'" in drift
+        assert f"was bound to merge base {MERGE_BASE}" in drift
+    # The base name is compared first: a retargeted PR is reported as such
+    # even though its merge base differs too.
+    drift = verify_decision_point(_pr(base_ref="release/1.x"), txn, MERGE_BASE_B)
+    assert "targets base 'release/1.x'" in drift and "merge base" not in drift
+
+
+def test_the_source_verifiers_refuse_an_empty_checkpointed_merge_base():
+    """The merge-base half of the checkpoint follows the base's rule: never
+    vacuous, and an unreadable merge base is drift, not a match (#96)."""
+    from autoforge.replan_txn import verify_closed_source, verify_source_checkpoint
+
+    txn = _seed_txn(ReplanStage.VERIFIED, source_merge_base_sha="")
+    assert "records no merge base for source PR" in verify_source_checkpoint(_pr(), txn, MERGE_BASE)
+    assert "records no merge base for source PR" in (
+        verify_closed_source(_pr(state="CLOSED"), txn, MERGE_BASE)
+    )
+    txn.source_merge_base_sha = MERGE_BASE
+    assert verify_source_checkpoint(_pr(), txn, MERGE_BASE) == ""
+    assert verify_closed_source(_pr(state="CLOSED"), txn, MERGE_BASE) == ""
+    for moved in (MERGE_BASE_B, ""):
+        drift = verify_source_checkpoint(_pr(), txn, moved)
+        assert f"moved from the checkpointed merge base {MERGE_BASE}" in drift
+        assert f"to {moved or '(unreadable)'}" in drift and "close window" not in drift
+        drift = verify_closed_source(_pr(state="CLOSED"), txn, moved)
+        assert f"moved from the checkpointed merge base {MERGE_BASE}" in drift
+        assert "inside the close window" in drift
 
 
 # =============================================================================
@@ -3677,6 +3969,7 @@ def test_f1_a_source_without_a_readable_branch_is_refused_at_prepare(tmp_state_d
         decision_head_sha=SHA_A,
         decision_branch=BRANCH,
         decision_base_ref="main",
+        decision_merge_base_sha=MERGE_BASE,
         escalation={"trigger": "hard_review_round_threshold"},
     ).to_dict()
     out = eng.step()
@@ -3707,6 +4000,7 @@ def test_a_source_without_a_readable_base_is_refused_at_prepare(tmp_state_dir):
         decision_head_sha=SHA_A,
         decision_branch=BRANCH,
         decision_base_ref="main",
+        decision_merge_base_sha=MERGE_BASE,
         escalation={"trigger": "hard_review_round_threshold"},
     ).to_dict()
     out = eng.step()
@@ -3753,10 +4047,12 @@ def test_n2_sha_comparison_is_case_insensitive_and_never_vacuous():
         stage=ReplanStage.VERIFIED,
         issue_url=ISSUE,
         decision_head_sha=SHA_A.upper(),
+        decision_merge_base_sha=MERGE_BASE.upper(),
         source_pr_url=PR,
         source_branch=BRANCH,
         source_head_sha=SHA_A,
         source_base_ref="main",
+        source_merge_base_sha=MERGE_BASE,
         base_branch="main",
     )
     upper = PRInfo(
@@ -3768,12 +4064,29 @@ def test_n2_sha_comparison_is_case_insensitive_and_never_vacuous():
         head_ref=BRANCH,
         base_ref="main",
     )
-    assert verify_source_checkpoint(upper, txn) == ""
+    assert verify_source_checkpoint(upper, txn, MERGE_BASE.upper()) == ""
     unreadable = PRInfo(
         url=PR, number=42, title="PR", state="CLOSED", head_sha="", head_ref=BRANCH, base_ref="main"
     )
     txn.source_head_sha = ""
-    assert "advanced from the checkpointed HEAD" in verify_closed_source(unreadable, txn)
+    assert "advanced from the checkpointed HEAD" in verify_closed_source(
+        unreadable, txn, MERGE_BASE
+    )
+    # The merge base is compared the same way: never vacuously, and an
+    # unreadable one is not "equal" to an empty checkpoint (#96).
+    txn.source_head_sha = SHA_A
+    still_open = PRInfo(
+        url=PR,
+        number=42,
+        title="PR",
+        state="OPEN",
+        head_sha=SHA_A,
+        head_ref=BRANCH,
+        base_ref="main",
+    )
+    assert verify_source_checkpoint(still_open, txn, "") != ""
+    txn.source_merge_base_sha = ""
+    assert "records no merge base" in verify_source_checkpoint(still_open, txn, "")
 
 
 def test_n3_a_malformed_pr_url_from_the_listing_is_a_refusal_not_a_crash(tmp_state_dir):
@@ -3796,6 +4109,7 @@ def test_n3_a_malformed_pr_url_from_the_listing_is_a_refusal_not_a_crash(tmp_sta
         decision_head_sha=SHA_A,
         decision_branch=BRANCH,
         decision_base_ref="main",
+        decision_merge_base_sha=MERGE_BASE,
         escalation={"trigger": "hard_review_round_threshold"},
     ).to_dict()
     out = eng.step()
@@ -3985,15 +4299,15 @@ def test_r2f1_the_source_verifiers_refuse_an_empty_checkpointed_branch():
     from autoforge.replan_txn import verify_closed_source, verify_source_checkpoint
 
     txn = _seed_txn(ReplanStage.VERIFIED, source_branch="")
-    drift = verify_source_checkpoint(_pr(), txn)
+    drift = verify_source_checkpoint(_pr(), txn, MERGE_BASE)
     assert "records no branch for source PR" in drift
-    drift = verify_closed_source(_pr(state="CLOSED"), txn)
+    drift = verify_closed_source(_pr(state="CLOSED"), txn, MERGE_BASE)
     assert "records no branch for source PR" in drift
     txn.source_branch = BRANCH
-    assert verify_source_checkpoint(_pr(), txn) == ""
-    assert verify_closed_source(_pr(state="CLOSED"), txn) == ""
+    assert verify_source_checkpoint(_pr(), txn, MERGE_BASE) == ""
+    assert verify_closed_source(_pr(state="CLOSED"), txn, MERGE_BASE) == ""
     assert "moved from the checkpointed branch" in (
-        verify_closed_source(_pr(state="CLOSED", head_ref="other"), txn)
+        verify_closed_source(_pr(state="CLOSED", head_ref="other"), txn, MERGE_BASE)
     )
 
 
@@ -4003,19 +4317,21 @@ def test_the_source_verifiers_refuse_an_empty_checkpointed_base():
     from autoforge.replan_txn import verify_closed_source, verify_source_checkpoint
 
     txn = _seed_txn(ReplanStage.VERIFIED, source_base_ref="")
-    assert "records no base branch for source PR" in verify_source_checkpoint(_pr(), txn)
+    assert "records no base branch for source PR" in verify_source_checkpoint(
+        _pr(), txn, MERGE_BASE
+    )
     assert "records no base branch for source PR" in (
-        verify_closed_source(_pr(state="CLOSED"), txn)
+        verify_closed_source(_pr(state="CLOSED"), txn, MERGE_BASE)
     )
     txn.source_base_ref = "main"
-    assert verify_source_checkpoint(_pr(), txn) == ""
-    assert verify_closed_source(_pr(state="CLOSED"), txn) == ""
+    assert verify_source_checkpoint(_pr(), txn, MERGE_BASE) == ""
+    assert verify_closed_source(_pr(state="CLOSED"), txn, MERGE_BASE) == ""
     for retargeted in ("release/1.x", ""):
         assert "retargeted from the checkpointed base 'main'" in (
-            verify_source_checkpoint(_pr(base_ref=retargeted), txn)
+            verify_source_checkpoint(_pr(base_ref=retargeted), txn, MERGE_BASE)
         )
         assert "inside the close window" in (
-            verify_closed_source(_pr(state="CLOSED", base_ref=retargeted), txn)
+            verify_closed_source(_pr(state="CLOSED", base_ref=retargeted), txn, MERGE_BASE)
         )
 
 
@@ -4069,6 +4385,7 @@ def test_r2f2_a_pending_journal_may_not_carry_a_transaction_id():
         decision_head_sha=SHA_A,
         decision_branch=BRANCH,
         decision_base_ref="main",
+        decision_merge_base_sha=MERGE_BASE,
         escalation={"trigger": "hard_review_round_threshold"},
         transaction_id=TXN_ID,
     ).to_dict()
@@ -4268,12 +4585,19 @@ def test_r4f1_the_decision_point_verifier_binds_the_pr_it_reads():
     from autoforge.replan_txn import verify_decision_point
 
     txn = _seed_txn(ReplanStage.PENDING, source_pr_url="")
-    assert verify_decision_point(_pr(), txn) == ""
-    assert verify_decision_point(_pr(url="https://github.com/Owner/REPO/pull/42"), txn) == ""
-    assert "never reviewed against this decision" in verify_decision_point(_pr(url=EARLIER_PR), txn)
-    assert "read back as (none)" in verify_decision_point(_pr(url=""), txn)
+    assert verify_decision_point(_pr(), txn, MERGE_BASE) == ""
+    assert (
+        verify_decision_point(_pr(url="https://github.com/Owner/REPO/pull/42"), txn, MERGE_BASE)
+        == ""
+    )
+    assert "never reviewed against this decision" in verify_decision_point(
+        _pr(url=EARLIER_PR), txn, MERGE_BASE
+    )
+    assert "read back as (none)" in verify_decision_point(_pr(url=""), txn, MERGE_BASE)
     txn.decision_pr_url = ""
-    assert "does not record the PR whose review decided it" in verify_decision_point(_pr(), txn)
+    assert "does not record the PR whose review decided it" in verify_decision_point(
+        _pr(), txn, MERGE_BASE
+    )
 
 
 def test_r4f1_a_pending_decision_for_another_pr_never_prepares_the_run_s_current_pr(
@@ -4358,10 +4682,10 @@ def test_r3f2_the_decision_point_verifier_refuses_a_missing_branch():
     from autoforge.replan_txn import verify_decision_point
 
     txn = _seed_txn(ReplanStage.PENDING, decision_branch="")
-    assert "does not record the reviewed branch" in verify_decision_point(_pr(), txn)
+    assert "does not record the reviewed branch" in verify_decision_point(_pr(), txn, MERGE_BASE)
     txn.decision_branch = BRANCH
-    assert verify_decision_point(_pr(), txn) == ""
-    assert "is on branch" in verify_decision_point(_pr(head_ref="other"), txn)
+    assert verify_decision_point(_pr(), txn, MERGE_BASE) == ""
+    assert "is on branch" in verify_decision_point(_pr(head_ref="other"), txn, MERGE_BASE)
 
 
 def test_the_decision_point_verifier_refuses_a_missing_or_moved_base():
@@ -4372,12 +4696,12 @@ def test_the_decision_point_verifier_refuses_a_missing_or_moved_base():
 
     txn = _seed_txn(ReplanStage.PENDING, decision_base_ref="")
     assert "does not record the base branch the review that decided it was bound to" in (
-        verify_decision_point(_pr(), txn)
+        verify_decision_point(_pr(), txn, MERGE_BASE)
     )
     txn.decision_base_ref = "main"
-    assert verify_decision_point(_pr(), txn) == ""
+    assert verify_decision_point(_pr(), txn, MERGE_BASE) == ""
     for retargeted in ("release/1.x", ""):
-        drift = verify_decision_point(_pr(base_ref=retargeted), txn)
+        drift = verify_decision_point(_pr(base_ref=retargeted), txn, MERGE_BASE)
         assert f"targets base {retargeted!r}, but the review that decided this replan" in drift
         assert "bound to base 'main'" in drift
 
@@ -4898,8 +5222,9 @@ def _protocol_1_journal(stage: ReplanStage) -> dict:
     """Exactly what the protocol-1 controller's ``to_dict`` wrote at ``stage``.
 
     The key set is the protocol-1 dataclass: every current field except
-    ``decision_pr_url`` (added by protocol 2) and ``decision_base_ref`` /
-    ``source_base_ref`` (added by protocol 3), which did not exist.
+    ``decision_pr_url`` (added by protocol 2), ``decision_base_ref`` /
+    ``source_base_ref`` (added by protocol 3) and ``decision_merge_base_sha``
+    / ``source_merge_base_sha`` (added by protocol 4), which did not exist.
     ``issue_url`` was filled by the prepare step, so a PENDING journal carries
     it *present and empty*. This is a literal transcription of that
     controller's serialisation, so that a change to the current schema cannot
@@ -4944,6 +5269,7 @@ def _protocol_1_journal(stage: ReplanStage) -> dict:
     }
     assert "decision_pr_url" not in data
     assert "decision_base_ref" not in data and "source_base_ref" not in data
+    assert "decision_merge_base_sha" not in data and "source_merge_base_sha" not in data
     return data
 
 
@@ -4952,14 +5278,32 @@ def _protocol_2_journal(stage: ReplanStage) -> dict:
 
     Protocol 2 added ``decision_pr_url`` to protocol 1 and had REVIEW record
     ``issue_url`` with the decision; protocol 3 then added the two base
-    fields. So the key set is the current one minus ``decision_base_ref``
-    and ``source_base_ref``, spelled out here as a literal for the same
+    fields and protocol 4 the two merge-base fields. So the key set is the
+    current one minus those four, spelled out here as a literal for the same
     reason as :func:`_protocol_1_journal`.
     """
     data = _protocol_1_journal(stage)
     data["issue_url"] = ISSUE
     data["decision_pr_url"] = PR
     assert "decision_base_ref" not in data and "source_base_ref" not in data
+    assert "decision_merge_base_sha" not in data and "source_merge_base_sha" not in data
+    return data
+
+
+def _protocol_3_journal(stage: ReplanStage) -> dict:
+    """Exactly what the protocol-3 controller's ``to_dict`` wrote at ``stage``.
+
+    Protocol 3 added ``decision_base_ref`` (recorded by REVIEW) and
+    ``source_base_ref`` (checkpointed by the prepare step) to protocol 2;
+    protocol 4 then added ``decision_merge_base_sha`` and
+    ``source_merge_base_sha`` the same way (#96). So the key set is the
+    current one minus the two merge-base fields.
+    """
+    prepared = stage is not ReplanStage.PENDING
+    data = _protocol_2_journal(stage)
+    data["decision_base_ref"] = "main"
+    data["source_base_ref"] = "main" if prepared else ""
+    assert "decision_merge_base_sha" not in data and "source_merge_base_sha" not in data
     return data
 
 
@@ -5078,28 +5422,76 @@ def test_an_in_flight_protocol_2_journal_is_refused_at_the_state_boundary(tmp_st
     assert gh.prs[PR].state == "OPEN" and eng.provider.calls == []
 
 
+@pytest.mark.parametrize("stage", _PROTOCOL_1_STAGES, ids=lambda s: s.value)
+def test_a_protocol_3_journal_is_refused_by_the_journal_loader_only_as_corruption(stage):
+    """The 3 -> 4 step is the 2 -> 3 step again, for the merge base (#96):
+    the journal loader can only call the protocol-3 shape corrupt, so it
+    must never be reached from a protocol-3 file."""
+    txn = ReplanTransaction.from_dict(_protocol_3_journal(stage))
+    assert txn.stage is ReplanStage.REJECTED
+    assert "persisted replan transaction is corrupt" in txn.rejection_reason
+    missing = f"decision_merge_base_sha is required at stage {stage.value!r} but missing"
+    assert missing in txn.journal_defects
+    if stage is not ReplanStage.PENDING:
+        assert f"source_merge_base_sha is required at stage {stage.value!r} but missing" in (
+            txn.journal_defects
+        )
+
+
+@pytest.mark.parametrize("stage", _PROTOCOL_1_STAGES, ids=lambda s: s.value)
+def test_an_in_flight_protocol_3_journal_is_refused_at_the_state_boundary(tmp_state_dir, stage):
+    """Every in-flight stage written by the protocol-3 controller is refused
+    the way a protocol-2 one is, naming the binding it lacks -- the merge
+    base -- and never migrated by reading the merge base GitHub reports now
+    (the base may have been rewritten since, which is what the field exists
+    to detect); nothing is read from or written to GitHub, no agent runs,
+    and the file is left byte-for-byte (#96)."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, stage)
+    eng.save()
+    data = _protocol_1_state_file(eng, _protocol_3_journal(stage), protocol="3")
+    before = eng.paths.state_file.read_bytes()
+    with pytest.raises(StateError) as info:
+        eng.load()
+    message = str(info.value)
+    assert "protocol_version '3'" in message and "replan in flight" in message
+    assert f"stage {stage.value!r}" in message
+    assert "did not record the merge base the review that decided the replan was bound to" in (
+        message
+    )
+    assert "does not reconstruct it from the merge base GitHub reports now" in message
+    assert "PR and issue" not in message and "base branch" not in message
+    assert "Finish or undo the replan with the controller that wrote it" in message
+    assert "corrupt" not in message
+    assert eng.paths.state_file.read_bytes() == before
+    assert json.loads(before)["replan_transaction"] == data["replan_transaction"]
+    assert gh.closed_prs == [] and gh.reopened_prs == [] and gh.commented_prs == []
+    assert not [call for call in gh.calls if call[0] == "get_merge_base_sha"]
+    assert gh.prs[PR].state == "OPEN" and eng.provider.calls == []
+
+
 def test_the_legacy_journal_refusal_knows_only_the_legacy_protocols():
     """The refusal describes a gap per protocol; asked about a label it has no
     description for (the current one included) it fails loudly rather than
     describe the wrong gap."""
     from autoforge.replan_txn import LEGACY_JOURNAL_PROTOCOLS, legacy_journal_refusal
 
-    assert LEGACY_JOURNAL_PROTOCOLS == frozenset({"1", "2"})
+    assert LEGACY_JOURNAL_PROTOCOLS == frozenset({"1", "2", "3"})
     journal = _seed_dict(ReplanStage.PREPARED)
-    for protocol in ("3", "0", ""):
+    for protocol in ("4", "0", ""):
         with pytest.raises(ValueError, match="not a legacy journal protocol"):
             legacy_journal_refusal(journal, protocol=protocol, written_by="0.1.0")
-    assert legacy_journal_refusal({}, protocol="2", written_by="0.1.0") == ""
-    assert legacy_journal_refusal(journal, protocol="2", written_by="0.1.0")
+    for protocol in ("1", "2", "3"):
+        assert legacy_journal_refusal({}, protocol=protocol, written_by="0.1.0") == ""
+        assert legacy_journal_refusal(journal, protocol=protocol, written_by="0.1.0")
 
 
-@pytest.mark.parametrize("protocol", ["1", "2"])
+@pytest.mark.parametrize("protocol", ["1", "2", "3"])
 def test_r7f1_a_legacy_state_without_a_replan_in_flight_loads_as_current(tmp_state_dir, protocol):
-    """Every protocol step so far changed only the journal, so a legacy file
-    with an empty or terminal journal is a current file with an old label
-    (the 2 -> 3 review-binding rule of #68 only concerns a file parked in
-    READY_FOR_MERGE / MERGE, which these are not); the label is rewritten on
-    the next save."""
+    """A legacy file with an empty or terminal journal is a current file with
+    an old label (the 2 -> 3 review-binding rule of #68 and the 3 -> 4 rule
+    of #96 only concern a file parked in READY_FOR_MERGE / MERGE, which
+    these are not); the label is rewritten on the next save."""
     gh = FakeGitHub()
     eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.VERIFIED)
     eng.save()
@@ -5112,10 +5504,10 @@ def test_r7f1_a_legacy_state_without_a_replan_in_flight_loads_as_current(tmp_sta
         data["phase"] = "REVIEW" if not journal else "BLOCKED"
         eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
         loaded = eng.load()
-        assert loaded.protocol_version == "3"
+        assert loaded.protocol_version == "4"
         assert loaded.replan_transaction == journal
         eng.save()
-        assert json.loads(eng.paths.state_file.read_text())["protocol_version"] == "3"
+        assert json.loads(eng.paths.state_file.read_text())["protocol_version"] == "4"
     # A legacy file that predates the journal field altogether is the same
     # case: no replan in flight.
     data = json.loads(eng.paths.state_file.read_text())
@@ -5150,7 +5542,7 @@ def test_r7f1_the_version_label_decides_not_the_journal_shape(tmp_state_dir):
     gh = FakeGitHub()
     eng, txn = _seeded_engine(tmp_state_dir, gh, ReplanStage.SUPERSEDE_INTENT)
     eng.save()
-    for legacy in ("1", "2"):
+    for legacy in ("1", "2", "3"):
         data = _protocol_1_state_file(eng, txn.to_dict())
         data["protocol_version"] = legacy
         eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
@@ -5158,17 +5550,24 @@ def test_r7f1_the_version_label_decides_not_the_journal_shape(tmp_state_dir):
             StateError, match=f"protocol_version {legacy!r} with a replan in flight"
         ):
             eng.load()
+    # Under the current protocol the same gap is corruption: the label says
+    # this controller wrote the journal, so a missing field is a missing
+    # field, whichever protocol step introduced it.
     data = json.loads(eng.paths.state_file.read_text())
-    data["protocol_version"] = "3"
-    del data["replan_transaction"]["decision_pr_url"]
-    eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
-    eng.load()
-    out = eng.step()
-    assert out.next_phase == "BLOCKED"
-    assert "persisted replan transaction is corrupt" in eng.state.block_reason
-    assert "decision_pr_url is required at stage 'supersede_intent' but missing" in (
-        eng.state.block_reason
-    )
+    data["protocol_version"] = "4"
+    data["phase"] = Phase.REPLAN_REEXECUTE.value
+    data["block_reason"] = ""
+    for missing in ("decision_pr_url", "decision_merge_base_sha", "source_merge_base_sha"):
+        data["replan_transaction"] = txn.to_dict()
+        del data["replan_transaction"][missing]
+        eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
+        eng.load()
+        out = eng.step()
+        assert out.next_phase == "BLOCKED"
+        assert "persisted replan transaction is corrupt" in eng.state.block_reason
+        assert f"{missing} is required at stage 'supersede_intent' but missing" in (
+            eng.state.block_reason
+        )
     assert gh.closed_prs == [] and eng.provider.calls == []
 
 
@@ -5777,19 +6176,21 @@ def test_r10f1_the_source_verifiers_compare_identity_not_spelling():
     from autoforge.replan_txn import verify_closed_source, verify_source_checkpoint
 
     txn = _seed_txn(ReplanStage.VERIFIED)
-    assert verify_source_checkpoint(_pr(url=PR_VARIANT), txn) == ""
-    assert verify_closed_source(_pr(url=PR_VARIANT, state="CLOSED"), txn) == ""
+    assert verify_source_checkpoint(_pr(url=PR_VARIANT), txn, MERGE_BASE) == ""
+    assert verify_closed_source(_pr(url=PR_VARIANT, state="CLOSED"), txn, MERGE_BASE) == ""
     # Identity is repository *and* number, and never vacuous.
-    assert "source PR identity mismatch" in verify_source_checkpoint(_pr(url=EARLIER_PR), txn)
-    assert "identity mismatch after the close" in verify_closed_source(
-        _pr(url="https://github.com/other/repo/pull/42", state="CLOSED"), txn
+    assert "source PR identity mismatch" in verify_source_checkpoint(
+        _pr(url=EARLIER_PR), txn, MERGE_BASE
     )
-    assert "source PR identity mismatch" in verify_source_checkpoint(_pr(url=""), txn)
+    assert "identity mismatch after the close" in verify_closed_source(
+        _pr(url="https://github.com/other/repo/pull/42", state="CLOSED"), txn, MERGE_BASE
+    )
+    assert "source PR identity mismatch" in verify_source_checkpoint(_pr(url=""), txn, MERGE_BASE)
     txn.source_pr_url = ""
     # Two unusable sides are not "the same": an empty checkpoint matches nothing.
-    assert "source PR identity mismatch" in verify_source_checkpoint(_pr(url=""), txn)
+    assert "source PR identity mismatch" in verify_source_checkpoint(_pr(url=""), txn, MERGE_BASE)
     assert "identity mismatch after the close" in verify_closed_source(
-        _pr(url="", state="CLOSED"), txn
+        _pr(url="", state="CLOSED"), txn, MERGE_BASE
     )
 
 
