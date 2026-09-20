@@ -3903,6 +3903,38 @@ def test_conclusive_read_failure_blocks_immediately(
     assert fake_github.merges == []
 
 
+_LEAKY_SECRET = "ghp_FakeSecretForBlockReasonTest0123456789"
+_LEAKY_GH_STDERR = (
+    f"HTTP 401: Bad credentials (Authorization: Bearer {_LEAKY_SECRET}) "
+    f"(https://x-access-token:{_LEAKY_SECRET}@api.github.com/graphql)"
+)
+
+
+@pytest.mark.parametrize(("breaker", "expected"), _READ_FAILURES)
+def test_block_reason_quoting_gh_output_is_redacted_before_persistence(
+    tmp_state_dir, fake_github, breaker, expected
+):
+    """#98: `_block` redacts once, at the sink. A `GitHubError` that echoes an
+    ``Authorization`` header reaches `state.json`, the step outcome and the
+    run log redacted, whichever of the ~40 call sites composed the reason."""
+    fake_github.add_pr(head_sha=SHA_A)
+    breaker(fake_github, GitHubError(f"`gh pr view` failed (exit 1): {_LEAKY_GH_STDERR}"))
+    eng = _in_merge(tmp_state_dir, fake_github, phase=Phase.MERGE)
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "BLOCKED"
+    assert expected in out.message and _LEAKY_SECRET not in out.message
+    assert "Authorization: Bearer ***REDACTED***" in out.message
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.BLOCKED and s.block_reason == out.message
+    assert _LEAKY_SECRET not in eng.paths.state_file.read_text()
+    assert "Authorization: Bearer ***REDACTED***" in s.block_reason
+    assert "https://***REDACTED***@api.github.com" in s.block_reason
+    for path in (eng.paths.logs_dir / s.run_id).rglob("*"):
+        if path.is_file():
+            assert _LEAKY_SECRET not in path.read_text(), path
+    assert fake_github.merges == []
+
+
 @pytest.mark.parametrize("phase", [Phase.READY_FOR_MERGE, Phase.MERGE])
 def test_conclusive_read_failure_via_resume_blocks_without_retry(tmp_state_dir, fake_github, phase):
     fake_github.add_pr(head_sha=SHA_A)
@@ -4343,6 +4375,33 @@ def test_update_epic_transient_github_failure_is_a_rejection_not_a_switch(
     with pytest.raises(VerificationError, match="GitHub unavailable: gh: HTTP 502"):
         eng.step()
     _assert_not_switched(eng, fake_github, ISSUE3)
+
+
+def test_update_epic_rejection_quoting_gh_output_is_redacted_before_persistence(
+    tmp_state_dir, fake_github
+):
+    """#98: a next-issue rejection quotes the failed read, is persisted in
+    `next_issue_rejections`, rendered into the correction prompt and, once
+    the bound is hit, becomes the BLOCKED reason: redacted at every step."""
+    fake_github.add_issue(ISSUE3, "Next")
+    fake_github.get_issue_errors[ISSUE3] = GitHubUnavailableError(
+        f"`gh issue view` failed (exit 1): HTTP 502 {_LEAKY_GH_STDERR}"
+    )
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(ISSUE3), _epic_result(ISSUE3)])
+    with pytest.raises(VerificationError, match="selection 1/2") as info:
+        eng.step()
+    assert _LEAKY_SECRET not in str(info.value)
+    s = load_state(eng.paths.state_file)
+    assert len(s.next_issue_rejections) == 1
+    assert _LEAKY_SECRET not in s.next_issue_rejections[0]
+    assert "Authorization: Bearer ***REDACTED***" in s.next_issue_rejections[0]
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert _LEAKY_SECRET not in eng.provider.calls[1].prompt
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.BLOCKED and "HTTP 502" in s.block_reason
+    assert _LEAKY_SECRET not in eng.paths.state_file.read_text()
+    assert _LEAKY_SECRET not in out.message
 
 
 def test_update_epic_transient_github_failure_twice_is_blocked(tmp_state_dir, fake_github):

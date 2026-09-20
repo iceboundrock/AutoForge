@@ -42,11 +42,44 @@ must keep it, or raise it together with those bounds and their tests.
 
 Do not log the entire process environment.
 
-Persisted state is not a redaction boundary of its own: the engine redacts
-agent text before it writes `block_reason`, findings and resolutions, but
-`state.json` can also be hand-edited or written by an older controller, and a
-journal defect quotes the value it could not read, and a `BLOCKED` reason
-can quote `gh` output. So anything the CLI prints *from* state (`status`,
+## What is redacted before it is persisted
+
+`state.json` is stored in the clear, so the engine redacts at the writer,
+once, wherever a persisted string can quote external text; a call site never
+has to remember to. The writers that redact before persistence are:
+
+- `ControllerEngine._block`: every controller-composed `block_reason`, and
+  the `StepOutcome.message` it returns. Its call sites embed `GitHubError`
+  messages (`gh` stderr), PR bodies and command output; they pass the raw
+  text and `_block` redacts it at the sink.
+- the two agent-message writers (`status: failure` / `blocked` in the
+  REMOTE and LOCAL step paths): `block_reason` from the agent's `message`.
+- `_record_verification_failure`: each `verification_failures` entry, which
+  quotes a `VerificationError` (a validation command's output, a PR body,
+  `gh` output). `REPLAN_REEXECUTE` renders that list into its prompt, so the
+  prompt inherits the redaction.
+- `_reject_next_issue`: each `next_issue_rejections` entry (rendered into
+  the correction prompt and, once the bound is hit, into `block_reason`).
+- the REVIEW and FIX appliers (REMOTE and LOCAL): each agent finding and
+  resolution crosses `redact_dict` before it reaches `open_findings`,
+  `review_history` or `last_fix_resolutions`.
+- the LOCAL validation and pre-merge verification paths: the output tail of
+  a command they quote.
+
+`GitHubClient._run_gh` additionally redacts the `gh` stderr tail where it
+builds a `GitHubError` / `GitHubNotFoundError` / `GitHubUnavailableError`
+message, because `gh` can echo the request it made (an `Authorization`
+header, a credentialed URL). The failure is classified (transient, not
+found, access denied) on the raw tail and only quoted redacted, so the
+message is safe in whatever it reaches (`block_reason`,
+`verification_failures`, the run log's `error.txt`) without each consumer
+redacting it again.
+
+That list is the engine's boundary; it is defense in depth, not a promise
+about the file. `state.json` can also be hand-edited or written by an older
+controller, a journal defect quotes the value it could not read, and a
+`BLOCKED` reason written before this boundary existed can quote `gh`
+output raw. So anything the CLI prints *from* state (`status`,
 `status --json`, the step outcome line, the terminal line of `run` / `step` /
 `resume`, the existing-run refusal, the `READY_FOR_MERGE` banner) crosses
 `redact` / `redact_dict` on the way out, in one pass over the whole rendered

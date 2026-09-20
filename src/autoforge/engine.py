@@ -3334,8 +3334,18 @@ class ControllerEngine:
             raise VerificationError(MERGE_GATE_MESSAGE)
 
     def _block(self, previous: Phase, plan: StepPlan | None, reason: str) -> StepOutcome:
-        """Enter BLOCKED with a human-readable reason (never guess)."""
+        """Enter BLOCKED with a human-readable reason (never guess).
+
+        The reason is redacted here, once, not at the call sites: many of
+        them quote a `GitHubError` (`gh` stderr, which can echo an
+        ``Authorization`` header), a PR body or a command's output, and
+        `state.json` is stored in the clear. Redacting at the sink covers a
+        new call site by construction and is the same boundary the
+        agent-message writers apply; the CLI redacts what it prints from
+        state on top of this.
+        """
         state = self._require_state()
+        reason = redact(reason)
         state.phase = Phase.BLOCKED
         state.block_reason = reason
         self._save()
@@ -6712,6 +6722,9 @@ class ControllerEngine:
         conclusive GitHub failures — see :meth:`_apply_update_epic`.
         """
         state = self._require_state()
+        # The reason quotes the verification failure (an issue title, `gh`
+        # stderr) and is persisted and rendered into the next prompt.
+        reason = redact(reason)
         state.next_issue_rejections.append(reason)
         n = len(state.next_issue_rejections)
         if n >= MAX_NEXT_ISSUE_SELECTIONS:

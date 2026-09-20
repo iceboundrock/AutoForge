@@ -369,6 +369,35 @@ def test_conclusive_failure_is_plain_github_error(stderr):
     assert len(calls) == 1  # never retried
 
 
+_SECRET = "ghp_FakeSecretForGhStderrTest0123456789abcd"
+
+
+@pytest.mark.parametrize(
+    ("stderr", "expected_type"),
+    [
+        (f"HTTP 401: Bad credentials (Authorization: Bearer {_SECRET})", GitHubError),
+        (
+            f"HTTP 404: Not Found (https://x-access-token:{_SECRET}@api.github.com/x)",
+            GitHubNotFoundError,
+        ),
+        (f"HTTP 502: Bad Gateway (Authorization: token {_SECRET})", GitHubUnavailableError),
+    ],
+)
+def test_failed_gh_stderr_is_redacted_where_the_error_is_built(stderr, expected_type):
+    """#98: `gh` stderr can echo the request's ``Authorization`` header or a
+    credentialed URL, and the error text reaches `block_reason`,
+    `verification_failures` and the run log. It is redacted once, where the
+    error is built; the failure is still classified on the raw text."""
+    gh = GitHubClient(
+        runner=lambda req: _res({}, exit_code=1, stderr=stderr), retry_delay_seconds=0
+    )
+    with pytest.raises(expected_type) as info:
+        gh.get_issue("https://github.com/o/r/issues/999")
+    text = str(info.value)
+    assert _SECRET not in text and "***REDACTED***" in text
+    assert "failed (exit 1)" in text
+
+
 @pytest.mark.parametrize(
     "stderr",
     [
