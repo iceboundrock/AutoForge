@@ -1078,7 +1078,9 @@ edit the file to change model identifiers, effort, timeouts and provider
 options without touching controller source. Provider-specific flags are built
 by the adapters in `providers.py`; the engine never hard-codes CLI syntax.
 YAML (`uv sync --extra yaml` for PyYAML, else a minimal built-in subset
-parser), TOML (stdlib), and JSON (stdlib) are accepted.
+parser), TOML (stdlib), and JSON (stdlib) are accepted. A file that does not
+parse is reported as `cannot parse config <path>: ...` whichever parser read
+it, the built-in subset parser included.
 
 Every key in the file must be one the controller reads. An unknown key,
 whether at the top level, in any section (`execution`, `safety`, `github`,

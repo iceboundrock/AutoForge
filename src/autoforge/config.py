@@ -1084,18 +1084,26 @@ def _load_yaml(path: Path) -> object:
     return {} if data is None else data
 
 
-def _minimal_yaml_parse(text: str) -> dict:
+def _minimal_yaml_parse(text: str) -> object:
     """Minimal YAML-subset parser for our config shape.
 
     Supports: nested maps via 2-space indentation, lists via "- " items,
     inline scalars (int/float/bool/null/quoted strings). Anything fancier
-    raises ConfigurationError telling the user to install PyYAML.
+    raises ValueError telling the user to install PyYAML; like PyYAML's own
+    errors it reaches the operator as ``cannot parse config <path>: ...``,
+    and like PyYAML the root is returned as parsed for ``load_config_file``
+    to check.
     """
     return _parse_yaml_subset(text)
 
 
-def _parse_yaml_subset(text: str) -> dict:
-    """Small recursive indentation-based parser for the documented subset."""
+def _parse_yaml_subset(text: str) -> object:
+    """Small recursive indentation-based parser for the documented subset.
+
+    Raises only ``ValueError``: this parser is one backend among four and
+    knows nothing about the file it is reading, so the path that makes the
+    message actionable is added by ``load_config_file`` for all of them.
+    """
     lines = [
         (len(line) - len(line.lstrip(" ")), line.strip())
         for line in text.splitlines()
@@ -1146,14 +1154,14 @@ def _parse_yaml_subset(text: str) -> dict:
             ind, content = cleaned[pos]
             if ind != min_indent:
                 # Over-indented stray line (mapping keys must align).
-                raise ConfigurationError(
+                raise ValueError(
                     f"YAML subset parser: bad indentation at: {content!r} — "
                     "install PyYAML for full YAML support"
                 )
             if content.startswith("-"):
                 break
             if ":" not in content:
-                raise ConfigurationError(
+                raise ValueError(
                     f"YAML subset parser: cannot parse line: {content!r} — "
                     "install PyYAML for full YAML support"
                 )
@@ -1173,10 +1181,7 @@ def _parse_yaml_subset(text: str) -> dict:
                 mapping[key] = _scalar(rest)
         return mapping
 
-    result = parse_block(0)
-    if not isinstance(result, dict):
-        raise ConfigurationError("config must contain a mapping at top level")
-    return result
+    return parse_block(0)
 
 
 def _scalar(text: str) -> object:
