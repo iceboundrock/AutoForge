@@ -61,7 +61,8 @@ AutoForge itself never writes business code. It:
 - parses the machine-readable `CONTROL_RESULT` protocol from agent stdout,
 - verifies every claim (PR exists / is OPEN / HEAD SHA / branch, review
   comment exists on the right PR for the right round and SHA, follow-up issue
-  exists, fix actually moved HEAD) before advancing state atomically,
+  exists, fix actually moved HEAD, EPIC progress comment exists, next issue
+  exists and is OPEN) before advancing state atomically,
 - merges only itself, only when told to, and only what was reviewed: with
   the safety gate open it re-verifies the PR on GitHub (open, at the reviewed
   HEAD, checks green, mergeable, no auto-merge / merge queue), merges bound to
@@ -1165,12 +1166,21 @@ executor tests use real local Python subprocesses only.
 **Supported now (Phase 2):** GitHub issue → Claude Code implementation → PR
 verification via `gh` → OpenCode review with round-based model routing →
 Claude Code remediation of finding IDs → repeated review with SHA binding →
-`READY_FOR_MERGE`; recovery of an already-created PR; bounded correction
-retry for malformed results; `doctor`; redacted per-invocation logs.
+`READY_FOR_MERGE`; the bounded REVIEW/FIX loop with stagnation detection and
+the `REPLAN_REEXECUTE` transaction; recovery of an already-created PR;
+bounded correction retry for malformed results; `doctor`; redacted
+per-invocation logs; LOCAL mode against a feature Markdown file.
 
-**Explicitly not yet:** automatic merge (gated off; when opened, the
-controller-owned `MERGE` step, including its pre-merge mergeability / check
-verification, and `UPDATE_EPIC` are exercised only against the in-memory
-fake, never against real services), unattended production operation, CI checks as a review input, dequeuing a PR
-from a merge queue (the controller refuses to merge into queue-protected
+**Implemented and verified, but exercised only against the in-memory fake:**
+the controller-owned `MERGE` step behind the merge safety gate (off by
+default), including its pre-merge verification, and `UPDATE_EPIC`. Every
+claim these phases depend on is re-read from GitHub before state advances,
+but no automated test has ever merged a real PR or edited a real EPIC, so
+treat an opened gate as unproven against real services.
+
+**Explicitly not yet:** unattended production operation; the controller
+feeding CI results into the review prompt (the reviewer is asked to inspect
+`gh pr checks` itself, and the merge gate reads the checks); the merge gate
+consulting branch rules (`doctor` reads them, the gate does not); dequeuing a
+PR from a merge queue (the controller refuses to merge into queue-protected
 branches instead).

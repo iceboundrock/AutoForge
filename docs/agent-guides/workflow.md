@@ -26,7 +26,7 @@ Configuration keys quoted here are defined in `src/autoforge/config.py` and
 
 ## Core state machine
 
-AutoForge phases currently include or are expected to include:
+AutoForge phases are:
 
 ```text
 INITIALIZING
@@ -64,16 +64,21 @@ REVIEW -> READY_FOR_MERGE     when needs_fix_round == false
 phase where the controller closes an open PR, so a second edge in or out would
 be a second way into that destructive step.
 
-Later milestones may enable:
+Behind the merge safety gate (`safety.allow_merge` plus `--allow-merge`;
+without it `READY_FOR_MERGE` is a stop phase):
 
 ```text
-READY_FOR_MERGE -> MERGE
-MERGE -> ANALYZE_EXECUTE
-MERGE -> UPDATE_EPIC
-MERGE -> DONE
-UPDATE_EPIC -> ANALYZE_EXECUTE
-UPDATE_EPIC -> DONE
+READY_FOR_MERGE -> MERGE      after controller-side pre-merge verification
+READY_FOR_MERGE -> REVIEW     reviewed revision drifted
+MERGE -> UPDATE_EPIC          only after gh reports the PR as MERGED
+MERGE -> REVIEW               reviewed revision drifted
+UPDATE_EPIC -> ANALYZE_EXECUTE  next issue verified
+UPDATE_EPIC -> DONE           agent reports no next issue (null)
 ```
+
+`MERGE -> ANALYZE_EXECUTE` and `MERGE -> DONE` are declared in `LEGAL_EDGES`
+but reserved: `decide_next_phase` never chooses them, because EPIC batching
+is decided inside `UPDATE_EPIC`, which every merge passes through.
 
 Operator edges, taken only by `autoforge unblock` (never by
 `decide_next_phase`, `step` or `resume`, which still treat `BLOCKED` as
