@@ -179,8 +179,11 @@ Design points:
   archive name is reserved with `link(2)`, which never replaces an existing
   archive; on a filesystem without hard links (vfat/exFAT, some FUSE, SMB
   and overlay mounts) the entry is copied into an exclusively created name
-  instead, with the source's permission bits regardless of the umask (a
-  FIFO or device cannot be copied and is refused there); a copy that fails
+  instead, with the source's permission bits regardless of the umask where
+  the filesystem holds any (where it holds none and refuses `chmod` as it
+  refuses `link`, the copy is made anyway and is at most as permissive as
+  the source, never more; a FIFO, socket or device cannot be copied and is
+  refused there); a copy that fails
   at any point after its name exists removes that name again, so a failed
   archive never sits beside an untouched original. The
   original is unlinked only after the archive exists, so a crash in between

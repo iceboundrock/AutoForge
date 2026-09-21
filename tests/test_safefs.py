@@ -1244,9 +1244,9 @@ def _fail_fsync_of(monkeypatch, *, directory: bool) -> None:
     monkeypatch.setattr(os, "fsync", fsync)
 
 
-def _fail_fchmod(monkeypatch) -> None:
+def _fail_fchmod(monkeypatch, err: int = errno.EIO) -> None:
     def fchmod(fd, mode):
-        raise OSError(errno.EPERM, os.strerror(errno.EPERM))
+        raise OSError(err, os.strerror(err))
 
     monkeypatch.setattr(os, "fchmod", fchmod)
 
@@ -1254,7 +1254,7 @@ def _fail_fchmod(monkeypatch) -> None:
 @pytest.mark.parametrize(
     ("source", "inject", "message"),
     [
-        ("file", _fail_fchmod, "cannot copy .*Operation not permitted"),
+        ("file", _fail_fchmod, "cannot copy .*Input/output error"),
         (
             "file",
             functools.partial(_fail_fsync_of, directory=False),
@@ -1277,8 +1277,10 @@ def test_a_copy_that_fails_removes_the_name_it_created(
     tmp_path, monkeypatch, source, inject, message
 ):
     """The name exists before the bytes do, so every failure after it is
-    created -- restoring the permission bits, fsyncing the bytes, fsyncing
-    the directory that publishes the name (for a symbolic link too) -- takes
+    created -- restoring the permission bits (an EIO, not the refusal of a
+    filesystem that holds no bits; see the test after next), fsyncing the
+    bytes, fsyncing the directory that publishes the name (for a symbolic
+    link too) -- takes
     it away again: a failed reservation leaves the directory as it was found
     and the source untouched, so the caller never removes a source on the
     strength of an archive that is not there."""
@@ -1346,6 +1348,44 @@ def test_the_copy_carries_the_source_permission_bits_through_a_restrictive_umask
     assert stat.S_IMODE((root_dir / "file.copy").lstat().st_mode) == 0o664
     assert stat.S_IMODE((root_dir / "file.json").lstat().st_mode) == 0o664
     assert (root_dir / "file.copy").read_bytes() == b"corrupt\n"
+
+
+@pytest.mark.parametrize(
+    "err",
+    sorted({errno.EPERM, errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP}),
+    ids=errno.errorcode.__getitem__,
+)
+def test_the_copy_completes_where_the_filesystem_holds_no_permission_bits(
+    tmp_path, monkeypatch, err
+):
+    """The filesystems this copy exists for (no link(2)) tend to refuse
+    fchmod(2) the same way and for the same reason: they hold no mode bits,
+    source and copy alike are shown synthesized ones.  That refusal must not
+    fail the copy, or the fallback is unavailable exactly where it is needed
+    (a FUSE daemon implementing neither link nor chmod says ENOSYS to both).
+    The copy then carries whatever O_CREAT under the umask gave it -- a
+    subset of the source's bits, never more -- and the bytes, which are the
+    point.  Any other fchmod errno stays fatal (the EIO case of
+    test_a_copy_that_fails_removes_the_name_it_created)."""
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    (root_dir / "file.json").write_bytes(b"corrupt\n")
+    (root_dir / "file.json").chmod(0o664)
+    _fail_fchmod(monkeypatch, err)
+    previous = os.umask(0o077)
+    try:
+        with SafeRoot.open(root_dir) as root:
+            root.copy_entry_exclusive("file.json", "file.copy")
+    finally:
+        os.umask(previous)
+    copied = (root_dir / "file.copy").lstat()
+    assert stat.S_ISREG(copied.st_mode) and copied.st_nlink == 1
+    assert (root_dir / "file.copy").read_bytes() == b"corrupt\n"
+    # No bits the source lacks; here the umask took group and other away.
+    assert stat.S_IMODE(copied.st_mode) & ~0o664 == 0
+    assert stat.S_IMODE(copied.st_mode) == 0o600
+    assert stat.S_IMODE((root_dir / "file.json").lstat().st_mode) == 0o664
+    assert sorted(e.name for e in root_dir.iterdir()) == ["file.copy", "file.json"]
 
 
 @pytest.mark.parametrize(

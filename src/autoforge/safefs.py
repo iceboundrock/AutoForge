@@ -186,6 +186,16 @@ _NO_HARD_LINKS = frozenset(
     }
 )
 
+#: What ``fchmod(2)`` reports on a filesystem that holds no permission bits
+#: of its own -- the same filesystems, refusing for the same reason, with
+#: the same errnos: vfat/exFAT and SMB say ``EPERM``, a FUSE daemon without
+#: the operation ``ENOSYS``, others ``ENOTSUP`` / ``EOPNOTSUPP``.  There
+#: the bits of source and copy alike are synthesized by the mount, so the
+#: refusal carries nothing the copy's caller can act on; on a filesystem
+#: that *does* hold mode bits, ``fchmod`` of a file this process just
+#: created and still holds open does not fail with any of these.
+_NO_MODE_BITS = _NO_HARD_LINKS
+
 #: Chunk of a streamed copy (:meth:`SafeRoot.copy_entry_exclusive`).
 _COPY_CHUNK = 1 << 20
 
@@ -1021,8 +1031,14 @@ class SafeRoot:
 
         The entry itself is reproduced, never what it points at: a regular
         file's bytes are streamed into ``dst`` opened ``O_CREAT | O_EXCL``
-        with the source's permission bits and fsynced; a symbolic link is
-        recreated by ``symlink(2)`` with its target text and never followed.
+        and fsynced, with the source's permission bits restored where the
+        filesystem holds any -- where it holds none and ``fchmod(2)`` says
+        so (``EPERM``, ``ENOSYS``, ``ENOTSUP``/``EOPNOTSUPP``, the same
+        refusals as :meth:`link`'s, :data:`_NO_MODE_BITS`), the copy is
+        made anyway and carries the umask-filtered subset of the source's
+        bits, so it is at most as permissive as the source, never more; a
+        symbolic link is recreated by ``symlink(2)`` with its target text
+        and never followed.
         Both fail with :class:`FileExistsError` on any existing entry at
         ``dst`` (a symbolic link included), exactly as :meth:`link` does.  A
         FIFO, socket or device has no bytes to copy and is refused; the
@@ -1031,7 +1047,8 @@ class SafeRoot:
 
         Unlike a hard link this is not one syscall: the bytes reach ``dst``
         after its name exists.  Every failure after the name is created --
-        the fresh entry failing inspection, the permission bits, the bytes,
+        the fresh entry failing inspection, the permission bits (for any
+        other errno than the ones above), the bytes,
         their fsync, or the fsync of the directory that publishes the name
         -- removes that name again and nothing else, so a failed reservation
         leaves the directory as it was found.  That differs from the
@@ -1139,8 +1156,17 @@ class SafeRoot:
             try:
                 _check_regular_fd(out_fd, flags, label=where_dst)
                 # O_CREAT applied the umask to ``mode``; the source's bits
-                # are what a hard link would have carried, so restore them.
-                os.fchmod(out_fd, mode)
+                # are what a hard link would have carried, so restore them
+                # where the filesystem holds any.  Where it holds none
+                # (_NO_MODE_BITS: the same mounts that have no link(2), which
+                # is why this copy is running at all) the copy carries the
+                # umask-filtered subset of the source's bits, never more,
+                # and the bytes are what the caller came for.
+                try:
+                    os.fchmod(out_fd, mode)
+                except OSError as exc:
+                    if exc.errno not in _NO_MODE_BITS:
+                        raise
                 while chunk := os.read(in_fd, _COPY_CHUNK):
                     view = memoryview(chunk)
                     while view:

@@ -879,6 +879,42 @@ def test_quarantine_copies_the_file_where_hard_links_are_unavailable(tmp_path, m
     assert moved.read_bytes() == raw
 
 
+@pytest.mark.parametrize("err", [errno.ENOSYS, errno.EPERM], ids=errno.errorcode.__getitem__)
+def test_quarantine_copies_the_file_where_chmod_is_unsupported_too(tmp_path, monkeypatch, err):
+    """A filesystem without link(2) commonly has no chmod(2) either (a FUSE
+    daemon implementing neither says ENOSYS to both; vfat says EPERM): the
+    copy must still be made there, or 'run --force' fails closed on exactly
+    the class of filesystem the fallback was written for.  The archive then
+    holds the bytes and no bits the source lacked."""
+    import os
+    import stat
+
+    from autoforge.state import quarantine_state_file
+
+    p = tmp_path / "state.json"
+    raw = b"{not json \xff\x00" + b"x" * (3 * 1024 * 1024)
+    p.write_bytes(raw)
+    p.chmod(0o664)
+    _without_hard_links(monkeypatch, err)
+
+    def no_fchmod(fd, mode):
+        raise OSError(err, os.strerror(err))
+
+    monkeypatch.setattr(os, "fchmod", no_fchmod)
+    previous = os.umask(0o077)
+    try:
+        moved = quarantine_state_file(p)
+    finally:
+        os.umask(previous)
+
+    assert not os.path.lexists(p)
+    assert [q.name for q in tmp_path.iterdir()] == [moved.name]
+    st = moved.lstat()
+    assert stat.S_ISREG(st.st_mode) and st.st_nlink == 1
+    assert stat.S_IMODE(st.st_mode) & ~0o664 == 0
+    assert moved.read_bytes() == raw
+
+
 def test_quarantine_fallback_recreates_a_symlink_without_following_it(tmp_path, monkeypatch):
     import os
 
