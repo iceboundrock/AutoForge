@@ -3413,7 +3413,9 @@ class ControllerEngine:
         source closed by the controller with nothing in the run's state
         saying so, and ``resume`` refuses BLOCKED, so raising the budget
         could not repair it. The reducer at those stages invokes no agent and
-        never closes; the budget ends the run at the next step instead.
+        writes nothing but the one bounded retry of a close the source's
+        issue events prove never ran (#69); the budget ends the run at the
+        next step instead.
         """
         if phase is not Phase.REPLAN_REEXECUTE:
             return True
@@ -3425,16 +3427,29 @@ class ControllerEngine:
 
         Says only *that* the step runs and how it is charged; *what* it does
         is the stage's own note (:meth:`_replan_plan`), so the two cannot
-        describe different actions.
+        describe different actions. The one write finishing may still perform
+        is the bounded close retry at ``SUPERSEDE_INTENT`` (#69), and the note
+        says so only where the stage note promises it, so it never claims
+        "without closing anything" above a note that may close.
         """
         txn = ReplanTransaction.from_dict(self._require_state().replan_transaction)
         if txn.stage in CLOSE_BEGUN_STAGES:
+            if (
+                txn.stage is ReplanStage.SUPERSEDE_INTENT
+                and txn.close_attempts < MAX_CLOSE_ATTEMPTS
+            ):
+                writes = (
+                    "without invoking an agent; the one write it may still perform is the "
+                    "bounded retry of the close, and only if the source's closed issue events "
+                    "prove the first close never ran"
+                )
+            else:
+                writes = "without invoking an agent and without closing anything"
             return (
                 f"step budget reached ({budget}), but the replan transaction has already begun "
                 f"closing the source PR {txn.source_pr_url} (stage {txn.stage.value}); would "
-                "finish it as described in the stage note below, without invoking an agent and "
-                "without closing anything; the step counts and the budget ends the run at the "
-                "next step"
+                f"finish it as described in the stage note below, {writes}; the step counts "
+                "and the budget ends the run at the next step"
             )
         return (
             f"step budget reached ({budget}), but the replan transaction is "

@@ -6369,7 +6369,8 @@ _STAGE_PLAN = {
 }
 
 
-def _assert_plan_matches_the_stage(plan, stage: ReplanStage) -> str:
+def _assert_plan_matches_the_stage(plan, stage: ReplanStage, *, may_retry: bool = True) -> str:
+    """``may_retry``: at SUPERSEDE_INTENT, whether an attempt is left (#69)."""
     notes = "\n".join(plan.notes)
     may_launch, may_close = _STAGE_PLAN[stage]
     assert (_AGENT_NOTE in notes) is may_launch, notes
@@ -6381,8 +6382,10 @@ def _assert_plan_matches_the_stage(plan, stage: ReplanStage) -> str:
         assert any(n in notes for n in _NO_AGENT_NOTES), notes
     if may_close is None:
         # The one write a resume may still perform, and only as a retry the
-        # timeline licenses; every other outcome is a read that ends BLOCKED.
-        assert _RETRY_NOTE in notes, notes
+        # timeline licenses while an attempt is left; every other outcome is
+        # a read that ends BLOCKED.
+        assert (_RETRY_NOTE in notes) is may_retry, notes
+        assert ("retried at most once" in notes) is not may_retry, notes
         assert "closed issue events" in notes and "BLOCKED" in notes, notes
     elif not may_close:
         # Past the write (or refused): the plan says the step reads GitHub and
@@ -6513,6 +6516,40 @@ def test_dry_run_describes_what_the_budget_does_to_a_replan_step(tmp_state_dir, 
         assert "instead of blocking with the plain budget text" in notes or (
             "the budget ends the run at the next step" in notes
         )
+    # The budget note never denies a close the stage note may still perform.
+    if _RETRY_NOTE in notes:
+        assert "without closing anything" not in notes, notes
+    assert gh.calls == [] and eng.provider.calls == []
+    assert eng.state.phase == Phase.REPLAN_REEXECUTE and eng.state.step_count == steps
+
+
+@pytest.mark.parametrize("close_attempts,may_retry", [(1, True), (MAX_CLOSE_ATTEMPTS, False)])
+def test_dry_run_at_the_budget_says_whether_the_intent_may_still_close(
+    tmp_state_dir, close_attempts, may_retry
+):
+    """PR #115 review R1-F1: the budget note names the one write finishing may perform.
+
+    From ``SUPERSEDE_INTENT`` the exempted step is not read-only: with an
+    attempt left, it may retry the close once when the source's closed issue
+    events prove the first never ran (#69). The budget note says so there,
+    and says "without closing anything" only once the attempts are spent and
+    every disposition path is a read that activates or refuses.
+    """
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(
+        tmp_state_dir, gh, ReplanStage.SUPERSEDE_INTENT, close_attempts=close_attempts
+    )
+    steps = _at_the_budget(eng)
+    plan = eng.step(dry_run=True).plan
+    assert plan is not None
+    _assert_plan_matches_the_stage(plan, ReplanStage.SUPERSEDE_INTENT, may_retry=may_retry)
+    budget_note = next(n for n in plan.notes if "has already begun closing the source PR" in n)
+    assert f"max_total_steps={steps}" in budget_note and "without invoking an agent" in budget_note
+    assert (
+        "the one write it may still perform is the bounded retry of the close" in budget_note
+    ) is may_retry
+    assert ("prove the first close never ran" in budget_note) is may_retry
+    assert ("without closing anything" in budget_note) is not may_retry
     assert gh.calls == [] and eng.provider.calls == []
     assert eng.state.phase == Phase.REPLAN_REEXECUTE and eng.state.step_count == steps
 
