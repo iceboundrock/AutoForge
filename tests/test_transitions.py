@@ -102,6 +102,49 @@ def test_decide_review_routing():
     assert decide_next_phase(Phase.REVIEW, {"needs_fix_round": False}) == Phase.READY_FOR_MERGE
 
 
+@pytest.mark.parametrize("needs_fix", [True, False], ids=["findings", "clean"])
+def test_decide_review_stale_round_re_reviews_the_actual_revision(needs_fix):
+    """REVIEW -> REVIEW: the reviewed revision moved while the reviewer worked.
+
+    ``head_changed_after_review`` is the controller's observation (HEAD, base
+    or merge base), never a reviewer field. The round's verdict describes a
+    revision the PR no longer has, so it decides nothing about the next phase
+    (a clean stale round does not reach READY_FOR_MERGE) and the actual
+    revision is reviewed; the engine consumes the round and carries the
+    findings itself.
+    """
+    result = {"needs_fix_round": needs_fix, "head_changed_after_review": True}
+    assert decide_next_phase(Phase.REVIEW, result) == Phase.REVIEW
+    assert is_legal(Phase.REVIEW, Phase.REVIEW)
+    # An explicit ``False`` routes exactly like an absent one.
+    result = {"needs_fix_round": needs_fix, "head_changed_after_review": False}
+    expected = Phase.FIX if needs_fix else Phase.READY_FOR_MERGE
+    assert decide_next_phase(Phase.REVIEW, result) == expected
+
+
+def test_decide_review_refuses_a_replan_on_a_stale_round():
+    """The replan policy escalates the findings of the reviewed revision; a
+    round whose revision moved is not one it may have decided on."""
+    result = {"needs_fix_round": True, "head_changed_after_review": True, "replan": True}
+    with pytest.raises(ControlResultValidationError, match="stale review round"):
+        decide_next_phase(Phase.REVIEW, result)
+    result = {"needs_fix_round": True, "head_changed_after_review": "moved"}
+    with pytest.raises(ControlResultValidationError, match="must be a boolean"):
+        decide_next_phase(Phase.REVIEW, result)
+
+
+def test_local_review_has_no_stale_edge():
+    """A LOCAL review is bound to a workspace fingerprint the reviewer may not
+    change (the engine rejects a reviewer that did), so the observation is
+    never consulted there -- and never validated either, like ``replan``."""
+    assert not is_legal(Phase.REVIEW, Phase.REVIEW, WorkflowMode.LOCAL)
+    for observed in (True, "moved"):
+        result = {"needs_fix_round": True, "head_changed_after_review": observed}
+        assert decide_next_phase(Phase.REVIEW, result, WorkflowMode.LOCAL) == Phase.FIX
+        result = {"needs_fix_round": False, "head_changed_after_review": observed}
+        assert decide_next_phase(Phase.REVIEW, result, WorkflowMode.LOCAL) == Phase.DONE
+
+
 def test_decide_review_can_express_the_controllers_replan_decision():
     """REVIEW -> REPLAN_REEXECUTE is a legal edge, so the router must know it.
 
@@ -146,12 +189,33 @@ def test_local_review_ignores_replan_silently(result):
     assert decide_next_phase(Phase.REVIEW, result, WorkflowMode.LOCAL) == Phase.FIX
 
 
+def test_decide_ready_for_merge_is_controller_owned():
+    """No agent runs in READY_FOR_MERGE: the PR at the reviewed revision goes
+    to MERGE (the gate itself is the engine's), a moved one back to REVIEW."""
+    assert decide_next_phase(Phase.READY_FOR_MERGE, {}) == Phase.MERGE
+    assert (
+        decide_next_phase(Phase.READY_FOR_MERGE, {"head_changed_after_review": False})
+        == Phase.MERGE
+    )
+    assert (
+        decide_next_phase(Phase.READY_FOR_MERGE, {"head_changed_after_review": True})
+        == Phase.REVIEW
+    )
+    with pytest.raises(ControlResultValidationError, match="must be a boolean"):
+        decide_next_phase(Phase.READY_FOR_MERGE, {"head_changed_after_review": 1})
+
+
 def test_decide_merge_is_controller_owned():
     # No agent decides anything in MERGE: a verified controller merge routes to
-    # UPDATE_EPIC; a stale HEAD after the clean review goes back to REVIEW.
+    # UPDATE_EPIC (always: batching roadmap updates is decided inside it, so
+    # the reserved MERGE -> ANALYZE_EXECUTE / DONE edges are never chosen); a
+    # stale revision after the clean review goes back to REVIEW.
     assert decide_next_phase(Phase.MERGE, {}) == Phase.UPDATE_EPIC
     assert decide_next_phase(Phase.MERGE, {"next_action": "DONE"}) == Phase.UPDATE_EPIC
+    assert decide_next_phase(Phase.MERGE, {"head_changed_after_review": False}) == Phase.UPDATE_EPIC
     assert decide_next_phase(Phase.MERGE, {"head_changed_after_review": True}) == Phase.REVIEW
+    with pytest.raises(ControlResultValidationError, match="must be a boolean"):
+        decide_next_phase(Phase.MERGE, {"head_changed_after_review": "yes"})
 
 
 def test_decide_update_epic():
@@ -166,3 +230,64 @@ def test_decide_update_epic():
 def test_decide_terminal_raises():
     with pytest.raises(StateTransitionError, match="terminal"):
         decide_next_phase(Phase.DONE, {})
+
+
+# Every decision input the engine hands to ``decide_next_phase``, per phase and
+# mode, with the edge it must choose. The engine's tests prove it consults
+# the function; this table proves the function never chooses an edge the
+# topology of that mode does not have.
+REMOTE_DECISIONS = [
+    (Phase.INITIALIZING, {}, Phase.ANALYZE_EXECUTE),
+    (Phase.ANALYZE_EXECUTE, {}, Phase.REVIEW),
+    (Phase.REVIEW, {"needs_fix_round": False}, Phase.READY_FOR_MERGE),
+    (Phase.REVIEW, {"needs_fix_round": True, "replan": False}, Phase.FIX),
+    (Phase.REVIEW, {"needs_fix_round": True, "replan": True}, Phase.REPLAN_REEXECUTE),
+    (Phase.REVIEW, {"needs_fix_round": True, "head_changed_after_review": True}, Phase.REVIEW),
+    (Phase.REVIEW, {"needs_fix_round": False, "head_changed_after_review": True}, Phase.REVIEW),
+    (Phase.FIX, {}, Phase.REVIEW),
+    (Phase.REPLAN_REEXECUTE, {}, Phase.REVIEW),
+    (Phase.READY_FOR_MERGE, {"head_changed_after_review": False}, Phase.MERGE),
+    (Phase.READY_FOR_MERGE, {"head_changed_after_review": True}, Phase.REVIEW),
+    (Phase.MERGE, {"head_changed_after_review": False}, Phase.UPDATE_EPIC),
+    (Phase.MERGE, {"head_changed_after_review": True}, Phase.REVIEW),
+    (Phase.UPDATE_EPIC, {"next_issue_url": None}, Phase.DONE),
+    (
+        Phase.UPDATE_EPIC,
+        {"next_issue_url": "https://github.com/o/r/issues/3"},
+        Phase.ANALYZE_EXECUTE,
+    ),
+]
+LOCAL_DECISIONS = [
+    (Phase.INITIALIZING, {}, Phase.ANALYZE_EXECUTE),
+    (Phase.ANALYZE_EXECUTE, {}, Phase.REVIEW),
+    (Phase.REVIEW, {"needs_fix_round": True}, Phase.FIX),
+    (Phase.REVIEW, {"needs_fix_round": False}, Phase.DONE),
+    (Phase.FIX, {}, Phase.REVIEW),
+]
+
+
+@pytest.mark.parametrize(
+    ("mode", "current", "result", "expected"),
+    [(WorkflowMode.REMOTE, *row) for row in REMOTE_DECISIONS]
+    + [(WorkflowMode.LOCAL, *row) for row in LOCAL_DECISIONS],
+    ids=lambda v: v.value if isinstance(v, (Phase, WorkflowMode)) else None,
+)
+def test_every_decision_is_a_legal_edge_of_its_mode(mode, current, result, expected):
+    nxt = decide_next_phase(current, result, mode)
+    assert nxt == expected
+    validate_transition(current, nxt, mode)  # must not raise
+
+
+@pytest.mark.parametrize("mode", list(WorkflowMode), ids=lambda m: m.value)
+def test_decisions_cover_every_non_operator_edge_of_the_mode(mode):
+    """The decision table above reaches every edge the topology declares,
+    except the operator's unblock edges (taken by ``unblock`` alone) and the
+    reserved post-merge edges (MERGE -> ANALYZE_EXECUTE / DONE, never chosen:
+    UPDATE_EPIC runs after every merge). A new edge in the table without a
+    decision that chooses it is dead topology; a decision that reaches no
+    declared edge is refused by ``validate_transition`` in the test above."""
+    table = REMOTE_DECISIONS if mode is WorkflowMode.REMOTE else LOCAL_DECISIONS
+    edges = LEGAL_EDGES if mode is WorkflowMode.REMOTE else LOCAL_LEGAL_EDGES
+    reserved = {(Phase.MERGE, Phase.ANALYZE_EXECUTE), (Phase.MERGE, Phase.DONE)}
+    declared = {(frm, to) for frm, tos in edges.items() for to in tos if frm is not Phase.BLOCKED}
+    assert {(frm, expected) for frm, _, expected in table} == declared - reserved

@@ -7,8 +7,12 @@ reloaded from disk after every step to prove persistence.
 
 import json
 
+import pytest
+
+import autoforge.engine as engine_mod
+from autoforge.errors import StateTransitionError
 from autoforge.state import load_state
-from autoforge.transitions import Phase
+from autoforge.transitions import Phase, decide_next_phase
 from tests.conftest import (
     BRANCH,
     ISSUE,
@@ -436,3 +440,155 @@ def test_runaway_review_fix_loop_is_bounded(tmp_state_dir):
     assert eng.run(max_steps=50) == []
     assert load_state(eng.paths.state_file).step_count == s.step_count
     assert gh.merges == [] and gh.prs[PR].state == "OPEN"
+
+
+def _full_lifecycle_agent(gh: FakeGitHub):
+    """One implementation, a review with a finding, a fix, a clean review, and
+    the EPIC update that ends the run: every agent-driven lifecycle edge."""
+
+    def agent(req):
+        if req.phase == "ANALYZE_EXECUTE":
+            gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
+            return block(
+                {
+                    "phase": "ANALYZE_EXECUTE",
+                    "status": "success",
+                    "issue_url": ISSUE,
+                    "pr_url": PR,
+                    "head_sha": SHA_A,
+                    "branch": BRANCH,
+                }
+            )
+        if req.phase == "REVIEW" and "Round 1" in req.prompt:
+            gh.add_comment(PR, 100, review_comment_body(1, SHA_A, True, ["R1-F1"]))
+            return block(
+                {
+                    "phase": "REVIEW",
+                    "status": "success",
+                    "round": 1,
+                    "reviewed_head_sha": SHA_A,
+                    "review_comment_url": comment_url(PR, 100),
+                    "needs_fix_round": True,
+                    "findings": [
+                        {
+                            "id": "R1-F1",
+                            "classification": "non-blocked",
+                            "title": "missing test",
+                            "location": "tests/",
+                            "required_resolution": "add a regression test",
+                        }
+                    ],
+                }
+            )
+        if req.phase == "FIX":
+            gh.set_head(SHA_B)
+            return block(
+                {
+                    "phase": "FIX",
+                    "status": "success",
+                    "previous_head_sha": SHA_A,
+                    "new_head_sha": SHA_B,
+                    "resolutions": [
+                        {"finding_id": "R1-F1", "resolution": "fixed", "commit_sha": SHA_B}
+                    ],
+                }
+            )
+        if req.phase == "REVIEW" and "Round 2" in req.prompt:
+            gh.add_comment(PR, 101, review_comment_body(2, SHA_B, False))
+            return block(
+                {
+                    "phase": "REVIEW",
+                    "status": "success",
+                    "round": 2,
+                    "reviewed_head_sha": SHA_B,
+                    "review_comment_url": comment_url(PR, 101),
+                    "needs_fix_round": False,
+                    "findings": [],
+                }
+            )
+        if req.phase == "UPDATE_EPIC":
+            post_progress_comment(gh)
+            return block(
+                {
+                    "phase": "UPDATE_EPIC",
+                    "status": "success",
+                    "roadmap_section": "- [x] done",
+                    "next_issue_url": None,
+                }
+            )
+        raise AssertionError(f"unexpected call {req.phase}")
+
+    return agent
+
+
+def test_every_lifecycle_transition_is_decided_by_decide_next_phase(tmp_state_dir, monkeypatch):
+    """Issue #2: the engine verifies and applies; ``transitions.decide_next_phase``
+    is the one function that chooses the next phase.
+
+    The decision function is wrapped, never replaced: the run below is the
+    real lifecycle, and each step's transition must be exactly the decision
+    the function returned for that step, from the inputs the engine verified
+    (the reviewer's ``needs_fix_round``, the controller's own
+    ``head_changed_after_review`` / ``replan`` observations, the verified
+    ``next_issue_url``). A step that named its target phase itself would
+    advance without a matching decision and fail here.
+    """
+    decisions: list[tuple[Phase, dict, Phase]] = []
+
+    def recording(current, result, mode):
+        nxt = decide_next_phase(current, result, mode)
+        decisions.append((current, dict(result), nxt))
+        return nxt
+
+    monkeypatch.setattr(engine_mod, "decide_next_phase", recording)
+    gh = FakeGitHub()
+    eng = make_engine(tmp_state_dir, _full_lifecycle_agent(gh), github=gh)
+    eng.config.safety.allow_merge = True
+    eng._save()
+
+    outcomes = eng.run(max_steps=50, allow_merge=True)
+    transitions = [(Phase(o.previous_phase), Phase(o.next_phase)) for o in outcomes]
+    assert transitions == [
+        (Phase.INITIALIZING, Phase.ANALYZE_EXECUTE),
+        (Phase.ANALYZE_EXECUTE, Phase.REVIEW),
+        (Phase.REVIEW, Phase.FIX),
+        (Phase.FIX, Phase.REVIEW),
+        (Phase.REVIEW, Phase.READY_FOR_MERGE),
+        (Phase.READY_FOR_MERGE, Phase.MERGE),
+        (Phase.MERGE, Phase.UPDATE_EPIC),
+        (Phase.UPDATE_EPIC, Phase.DONE),
+    ]
+    assert [(frm, nxt) for frm, _, nxt in decisions] == transitions
+    assert [result for _, result, _ in decisions] == [
+        {},
+        {},
+        {"needs_fix_round": True, "replan": False},
+        {},
+        {"needs_fix_round": False},
+        {"head_changed_after_review": False},
+        {"head_changed_after_review": False},
+        {"next_issue_url": None},
+    ]
+    assert load_state(eng.paths.state_file).phase == Phase.DONE
+    assert gh.merges == [(PR, "squash", SHA_B, False)]
+
+
+def test_a_decision_outside_the_topology_is_refused_before_it_is_applied(
+    tmp_state_dir, monkeypatch
+):
+    """The decision is still validated where it is applied: an edge the
+    topology does not declare raises and leaves the persisted phase alone."""
+
+    def rogue(current, result, mode):
+        if current is Phase.REVIEW:
+            return Phase.DONE  # legal LOCAL edge, illegal REMOTE edge
+        return decide_next_phase(current, result, mode)
+
+    monkeypatch.setattr(engine_mod, "decide_next_phase", rogue)
+    gh = FakeGitHub()
+    eng = make_engine(tmp_state_dir, _full_lifecycle_agent(gh), github=gh)
+    eng._save()
+    assert [o.next_phase for o in (eng.step(), eng.step())] == ["ANALYZE_EXECUTE", "REVIEW"]
+    with pytest.raises(StateTransitionError, match="REVIEW -> DONE"):
+        eng.step()
+    assert load_state(eng.paths.state_file).phase == Phase.REVIEW
