@@ -7,13 +7,20 @@ routing, the REVIEW/FIX loop bounds, stagnation detection, replan *policy*
 [replan-transaction.md](replan-transaction.md).
 
 Owning code: `src/autoforge/transitions.py` (phases, `LEGAL_EDGES`,
-`LOCAL_LEGAL_EDGES`, `next_phase`), `src/autoforge/engine.py` (phase
+`LOCAL_LEGAL_EDGES`, `decide_next_phase`), `src/autoforge/engine.py` (phase
 orchestration), `src/autoforge/profiles.py` (routing), `src/autoforge/loop_guard.py`
 (loop bounds and stagnation), `src/autoforge/replan.py` (replan policy). The
 edge tables in `transitions.py` are the authoritative list of legal edges,
 including the re-review edges taken when a PR's HEAD drifts after a review;
-the flow below is the policy those tables implement. Configuration keys quoted
-here are defined in `src/autoforge/config.py` and `autoforge.example.yaml`.
+the flow below is the policy those tables implement. `decide_next_phase` is
+the one function that chooses the next phase of a lifecycle step: the engine
+verifies the agent's claims and makes its own observations (the reviewed
+revision moved, the replan policy escalated, the next issue verified), hands
+them to it, and applies the edge it returns behind `validate_transition`.
+The engine names no lifecycle target phase itself; the only phases it enters
+directly are `BLOCKED` and `FAILED`, holding states outside the topology.
+Configuration keys quoted here are defined in `src/autoforge/config.py` and
+`autoforge.example.yaml`.
 
 ---
 
@@ -35,7 +42,11 @@ BLOCKED
 FAILED
 ```
 
-Keep transition rules centralized and testable.
+Keep transition rules centralized and testable: a new edge is declared in
+the edge table, chosen by `decide_next_phase`, and covered in
+`tests/test_transitions.py`, which holds the table and the decisions
+together (every decision is a declared edge; every non-operator edge but
+the reserved post-merge ones is chosen by some decision).
 
 Expected flow:
 

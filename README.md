@@ -126,7 +126,11 @@ src/autoforge/
 
 Design points:
 
-- **Transition logic lives only in `transitions.py`**, never in CLI handlers.
+- **Transition logic lives only in `transitions.py`**, never in CLI handlers
+  or the engine: `decide_next_phase` chooses every lifecycle edge from the
+  verified result and the controller's observations, and the engine applies
+  it behind `validate_transition`. `BLOCKED` / `FAILED` are holding states
+  outside that topology and the only phases the engine enters on its own.
 - **`step()` is the core primitive**; `run()`/`resume` just loop it until a
   stop phase (`READY_FOR_MERGE`, `DONE`, `BLOCKED`, `FAILED`). With the merge
   gate open (`safety.allow_merge: true` **and** `--allow-merge`)

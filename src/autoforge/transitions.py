@@ -4,17 +4,21 @@ Legal transitions::
 
     INITIALIZING     -> ANALYZE_EXECUTE
     ANALYZE_EXECUTE  -> REVIEW
+    REVIEW           -> REVIEW            (the reviewed revision moved during the review:
+                                           the round is consumed, then re-reviewed)
     REVIEW           -> FIX               (needs_fix_round=true)
     REVIEW           -> REPLAN_REEXECUTE  (controller policy; findings remain)
     REPLAN_REEXECUTE -> REVIEW             (replacement PR, fresh round 1)
-    REVIEW           -> READY_FOR_MERGE   (needs_fix_round=false, HEAD unchanged)
+    REVIEW           -> READY_FOR_MERGE   (needs_fix_round=false, revision unchanged)
     FIX              -> REVIEW
     READY_FOR_MERGE  -> MERGE             (only behind the merge safety gate)
-    READY_FOR_MERGE  -> REVIEW            (PR HEAD moved after the clean review)
+    READY_FOR_MERGE  -> REVIEW            (the revision moved after the clean review)
     MERGE            -> UPDATE_EPIC       (controller merged; GitHub confirms MERGED)
-    MERGE            -> REVIEW            (PR HEAD changed after last clean review)
-    MERGE            -> ANALYZE_EXECUTE   (reserved; unused: batching is decided inside
-    MERGE            -> DONE               UPDATE_EPIC, which runs after every merge)
+    MERGE            -> REVIEW            (the revision moved after the clean review)
+    MERGE            -> ANALYZE_EXECUTE   (reserved; unused)
+    MERGE            -> DONE              (reserved; unused)
+                                          Both are reserved edges: batching is decided
+                                          inside UPDATE_EPIC, which runs after every merge.
     UPDATE_EPIC      -> ANALYZE_EXECUTE   (next_issue_url != null)
     UPDATE_EPIC      -> DONE              (next_issue_url == null)
 
@@ -53,7 +57,11 @@ GitHub state and chosen the phase to re-enter; no agent result and no
 transaction's only entry. FAILED and DONE keep no outgoing edge, and the
 LOCAL topology has no unblock edge at all.
 
-All transition logic lives here — never scattered across CLI handlers.
+All transition logic lives here — never scattered across CLI handlers or
+the engine. ``decide_next_phase`` is the one function that chooses the next
+phase of a lifecycle step; the engine verifies the agent's claims against
+GitHub, makes its own observations, and hands both to it. The engine only
+ever names BLOCKED and FAILED itself, which are not edges of this topology.
 """
 
 from __future__ import annotations
@@ -204,14 +212,28 @@ def validate_transition(frm: Phase, to: Phase, mode: WorkflowMode = WorkflowMode
 def decide_next_phase(
     current: Phase, result: dict, mode: WorkflowMode = WorkflowMode.REMOTE
 ) -> Phase:
-    """Pure function: current phase + validated CONTROL_RESULT -> next phase.
+    """Pure function: current phase + the controller's decision inputs -> next phase.
 
-    ``result`` is the parsed CONTROL_RESULT payload whose ``phase`` field
-    must equal ``current.value`` (checked by the result parser beforehand),
-    possibly extended with the controller's own observations and decisions
-    (``head_changed_after_review`` in READY_FOR_MERGE/MERGE, ``replan`` in
-    REVIEW). Missing/invalid decision fields raise
-    ControlResultValidationError; terminal phases raise StateTransitionError.
+    This is the single place that chooses the next phase of a lifecycle step;
+    the engine calls it wherever it advances a run and only verifies and
+    applies the outcome (``validate_transition`` is still run on it; BLOCKED
+    and FAILED are holding states outside the topology that the engine
+    enters on its own, never through this function).
+
+    ``result`` carries the fields the decision is made on: the validated
+    CONTROL_RESULT fields the topology depends on (``needs_fix_round`` in
+    REVIEW, ``next_issue_url`` in UPDATE_EPIC, already verified by the
+    engine where verification applies) extended with the controller's own
+    observations and decisions:
+
+    - ``head_changed_after_review`` (REVIEW, READY_FOR_MERGE, MERGE): the
+      reviewed revision -- HEAD, base branch or merge base -- is no longer
+      the PR's. The review is stale and the actual revision is reviewed.
+    - ``replan`` (REVIEW): the controller's replan policy escalated this
+      round to REPLAN_REEXECUTE. Never a reviewer field.
+
+    Missing/invalid decision fields raise ControlResultValidationError;
+    terminal phases raise StateTransitionError.
     """
     from .errors import ControlResultValidationError
 
@@ -221,6 +243,12 @@ def decide_next_phase(
                 f"CONTROL_RESULT for phase {current.value} missing decision field {key!r}"
             )
         return result[key]
+
+    def flag(key: str) -> bool:
+        value = result.get(key, False)
+        if not isinstance(value, bool):
+            raise ControlResultValidationError(f"{key!r} must be a boolean")
+        return value
 
     if current == Phase.INITIALIZING:
         return Phase.ANALYZE_EXECUTE
@@ -235,7 +263,8 @@ def decide_next_phase(
                 raise ControlResultValidationError("'needs_fix_round' must be a boolean")
             # Whether the fix budget still allows a FIX is a controller policy
             # decision (see engine._local_review_stop_reason); the topology only
-            # says both edges exist.
+            # says both edges exist. A LOCAL review is bound to a workspace
+            # fingerprint the reviewer may not change, so it has no stale edge.
             return Phase.FIX if needs_fix else Phase.DONE
         raise StateTransitionError(f"phase {current.value} is not part of the LOCAL workflow")
     if current == Phase.REPLAN_REEXECUTE:
@@ -249,9 +278,18 @@ def decide_next_phase(
         # whether its PR is replaced. It is only meaningful over findings --
         # REVIEW -> REPLAN_REEXECUTE without a fix round to escalate is not a
         # route this topology has.
-        replan = result.get("replan", False)
-        if not isinstance(replan, bool):
-            raise ControlResultValidationError("'replan' must be a boolean")
+        replan = flag("replan")
+        if flag("head_changed_after_review"):
+            # The round is consumed either way, but its verdict describes a
+            # revision the PR no longer has: the actual one is reviewed next.
+            # A replan escalates the findings of the reviewed revision, so a
+            # stale round is not one the policy may have decided on.
+            if replan:
+                raise ControlResultValidationError(
+                    "a replan decision cannot be made on a stale review round: "
+                    "the revision moved, so the actual one is reviewed first"
+                )
+            return Phase.REVIEW
         if replan:
             if not needs_fix:
                 raise ControlResultValidationError(
@@ -261,14 +299,20 @@ def decide_next_phase(
             return Phase.REPLAN_REEXECUTE
         return Phase.FIX if needs_fix else Phase.READY_FOR_MERGE
     if current == Phase.READY_FOR_MERGE:
-        if result.get("head_changed_after_review") is True:
+        if flag("head_changed_after_review"):
             return Phase.REVIEW
         return Phase.MERGE
     if current == Phase.MERGE:
         # MERGE is controller-executed (no agent CONTROL_RESULT). ``result``
-        # here is the controller's own observation: HEAD moved -> REVIEW,
-        # otherwise the verified merge routes to UPDATE_EPIC.
-        if result.get("head_changed_after_review") is True:
+        # here is the controller's own observation: the revision moved ->
+        # REVIEW, otherwise the verified merge always routes to UPDATE_EPIC,
+        # whose agent posts the progress comment and selects the next issue
+        # (or null -> DONE), and that selection is needed after every merge.
+        # Batching several merges per EPIC roadmap update
+        # (``workflow.epic_update_every``) is decided inside UPDATE_EPIC from
+        # ``merged_since_epic_update``, not by skipping the phase; the
+        # MERGE -> ANALYZE_EXECUTE and MERGE -> DONE edges stay reserved.
+        if flag("head_changed_after_review"):
             return Phase.REVIEW
         return Phase.UPDATE_EPIC
     if current == Phase.UPDATE_EPIC:

@@ -32,7 +32,7 @@ from autoforge.local_workspace import (
 )
 from autoforge.safefs import UnsafePathError
 from autoforge.state import AutoForgeState, StatePaths, load_state, save_state
-from autoforge.transitions import Phase, WorkflowMode
+from autoforge.transitions import Phase, WorkflowMode, decide_next_phase
 
 from .conftest import (
     FEATURE_MD,
@@ -361,6 +361,51 @@ def test_findings_route_through_fix_and_back_to_review(tmp_path):
     ]
     assert eng.state.local_fix_rounds == 1
     assert eng.state.open_findings == []
+
+
+def test_every_local_transition_is_decided_by_decide_next_phase(tmp_path, monkeypatch):
+    """Issue #2, LOCAL topology: the same one decision function, in LOCAL
+    mode, chooses every edge of a local run (no PR, no merge, REVIEW -> DONE)."""
+    import autoforge.engine as engine_mod
+
+    decisions: list[tuple[Phase, dict, WorkflowMode, Phase]] = []
+
+    def recording(current, result, mode):
+        nxt = decide_next_phase(current, result, mode)
+        decisions.append((current, dict(result), mode, nxt))
+        return nxt
+
+    monkeypatch.setattr(engine_mod, "decide_next_phase", recording)
+    root = local_repo(tmp_path)
+    eng = make_local_engine(root, "features/add-filter.md")
+    eng.provider._handler = scripted(
+        eng,
+        root,
+        [
+            (lambda r: touch_impl(r, "v1\n"), lambda e: impl_result()),
+            (None, lambda e: review_result(e.state.workspace_fingerprint, 1, [finding(1)])),
+            (lambda r: touch_impl(r, "v2\n"), lambda e: fix_result(["R1-F1"])),
+            (None, lambda e: review_result(e.state.workspace_fingerprint, 2)),
+        ],
+    )
+    outcomes = eng.run(max_steps=8)
+    transitions = [(Phase(o.previous_phase), Phase(o.next_phase)) for o in outcomes]
+    assert transitions == [
+        (Phase.INITIALIZING, Phase.ANALYZE_EXECUTE),
+        (Phase.ANALYZE_EXECUTE, Phase.REVIEW),
+        (Phase.REVIEW, Phase.FIX),
+        (Phase.FIX, Phase.REVIEW),
+        (Phase.REVIEW, Phase.DONE),
+    ]
+    assert [(frm, nxt) for frm, _, _, nxt in decisions] == transitions
+    assert all(mode is WorkflowMode.LOCAL for _, _, mode, _ in decisions)
+    assert [result for _, result, _, _ in decisions] == [
+        {},
+        {},
+        {"needs_fix_round": True},
+        {},
+        {"needs_fix_round": False},
+    ]
 
 
 def test_findings_after_the_fix_budget_block(tmp_path):

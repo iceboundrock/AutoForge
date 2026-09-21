@@ -256,6 +256,7 @@ from .transitions import (
     TERMINAL_PHASES,
     Phase,
     WorkflowMode,
+    decide_next_phase,
     edges_for,
     stop_phases_for,
     validate_transition,
@@ -1853,6 +1854,20 @@ class ControllerEngine:
     def _legal_next_for(phase: Phase, mode: WorkflowMode = WorkflowMode.REMOTE) -> list[str]:
         return sorted(p.value for p in edges_for(mode).get(phase, frozenset()))
 
+    def _next_phase(self, current: Phase, decision: dict) -> Phase:
+        """The lifecycle edge out of ``current`` for the controller's ``decision``.
+
+        Every transition that is not into a holding state is chosen by
+        :func:`transitions.decide_next_phase`, the one decision function,
+        from the verified result fields and the controller's own
+        observations in ``decision``; the engine verifies and applies, it
+        never picks a target phase itself. BLOCKED and FAILED are outside the
+        topology and are entered by the engine directly, never through here.
+        The chosen edge still goes through :func:`validate_transition` at the
+        site that applies it.
+        """
+        return decide_next_phase(current, decision, self.mode)
+
     @staticmethod
     def _routing_info(state: AutoForgeState, profile_name: str) -> str:
         if state.phase == Phase.REVIEW:
@@ -1952,7 +1967,7 @@ class ControllerEngine:
             assert self.state is not None
             if self.state.phase == Phase.INITIALIZING and max_steps > 1:
                 saved_phase = self.state.phase
-                self.state.phase = Phase.ANALYZE_EXECUTE
+                self.state.phase = self._next_phase(Phase.INITIALIZING, {})
                 try:
                     outcomes.append(self._step_once(dry_run=True, allow_merge=allow_merge))
                 finally:
@@ -2407,8 +2422,9 @@ class ControllerEngine:
             return self._block(Phase.INITIALIZING, plan, self._local_anchor_block_reason(drift))
         snapshot = ws.snapshot()
         state.workspace_fingerprint = snapshot.fingerprint
-        validate_transition(Phase.INITIALIZING, Phase.ANALYZE_EXECUTE, WorkflowMode.LOCAL)
-        state.phase = Phase.ANALYZE_EXECUTE
+        nxt = self._next_phase(Phase.INITIALIZING, {})
+        validate_transition(Phase.INITIALIZING, nxt, WorkflowMode.LOCAL)
+        state.phase = nxt
         self._save()
         return self._outcome(
             Phase.INITIALIZING,
@@ -2416,7 +2432,7 @@ class ControllerEngine:
             message=(
                 f"froze feature specification {spec.relative_path} "
                 f"(sha256 {spec.sha256[:16]}...) at {snapshot.anchor}; "
-                "INITIALIZING -> ANALYZE_EXECUTE"
+                f"INITIALIZING -> {nxt.value}"
             ),
         )
 
@@ -2492,10 +2508,11 @@ class ControllerEngine:
         tests = (
             f", tests attempted: {', '.join(res.tests_attempted)}" if res.tests_attempted else ""
         )
-        return Phase.REVIEW, (
+        nxt = self._next_phase(Phase.ANALYZE_EXECUTE, {})
+        return nxt, (
             f"implementation verified: working tree now holds {verified.describe()}, "
             f"fingerprint {verified.fingerprint[:16]}...{tests}; "
-            "ANALYZE_EXECUTE -> REVIEW"
+            f"ANALYZE_EXECUTE -> {nxt.value}"
         )
 
     def _verified_snapshot(self, phase: Phase, after: WorkspaceSnapshot) -> WorkspaceSnapshot:
@@ -2559,6 +2576,7 @@ class ControllerEngine:
         self._record_review(
             res.round, bound, RESULT_NEEDS_FIX if res.needs_fix_round else RESULT_CLEAN, findings
         )
+        nxt = self._next_phase(Phase.REVIEW, {"needs_fix_round": res.needs_fix_round})
         if res.needs_fix_round:
             state.last_review_result = "needs_fix"
             state.open_findings = findings
@@ -2569,16 +2587,16 @@ class ControllerEngine:
                     f"{state.local_fix_rounds} fix round(s), which is the configured local "
                     f"budget (local.max_fix_rounds={budget})"
                 )
-            return Phase.FIX, (
-                f"local review round {res.round}: {len(findings)} finding(s); REVIEW -> FIX "
-                f"(fix round {state.local_fix_rounds + 1} of {budget})"
+            return nxt, (
+                f"local review round {res.round}: {len(findings)} finding(s); REVIEW -> "
+                f"{nxt.value} (fix round {state.local_fix_rounds + 1} of {budget})"
             )
         state.last_review_result = "clean"
         state.open_findings = []
-        return Phase.DONE, (
+        return nxt, (
             f"local review round {res.round} clean for workspace {bound[:16]}...; "
-            "REVIEW -> DONE. The implementation is in the working tree; committing it is "
-            "yours to do."
+            f"REVIEW -> {nxt.value}. The implementation is in the working tree; committing "
+            "it is yours to do."
         )
 
     def _apply_local_fix(
@@ -2650,9 +2668,10 @@ class ControllerEngine:
             if no_change
             else ""
         )
-        return Phase.REVIEW, (
+        nxt = self._next_phase(Phase.FIX, {})
+        return nxt, (
             f"local fix round {round_no} verified: {len(res.resolutions)} "
-            f"resolution(s){note}; FIX -> REVIEW (round {state.review_round + 1})"
+            f"resolution(s){note}; FIX -> {nxt.value} (round {state.review_round + 1})"
         )
 
     def _run_validation_commands(self, phase: Phase) -> bool:
@@ -2754,15 +2773,16 @@ class ControllerEngine:
                 f"but the issue/epic belong to {state.repository!r}"
             )
         issue = self._verify_issue_selectable(state.current_issue_url, switching=False)
-        validate_transition(Phase.INITIALIZING, Phase.ANALYZE_EXECUTE)
-        state.phase = Phase.ANALYZE_EXECUTE
+        nxt = self._next_phase(Phase.INITIALIZING, {})
+        validate_transition(Phase.INITIALIZING, nxt)
+        state.phase = nxt
         state.current_branch = ""
         self._save()
         return self._outcome(
             Phase.INITIALIZING,
             plan=plan,
             message=(
-                f"verified issue #{issue.number} ({issue.state}); INITIALIZING -> ANALYZE_EXECUTE"
+                f"verified issue #{issue.number} ({issue.state}); INITIALIZING -> {nxt.value}"
             ),
         )
 
@@ -2852,15 +2872,17 @@ class ControllerEngine:
         state.current_base_ref = pr.base_ref
         state.current_merge_base_sha = ""  # bound at REVIEW entry
         state.current_branch = pr.head_ref
-        validate_transition(Phase.ANALYZE_EXECUTE, Phase.REVIEW)
-        state.phase = Phase.REVIEW
+        nxt = self._next_phase(Phase.ANALYZE_EXECUTE, {})
+        validate_transition(Phase.ANALYZE_EXECUTE, nxt)
+        state.phase = nxt
         state.attempt = 0
         self._save()
         return self._outcome(
             Phase.ANALYZE_EXECUTE,
             message=(
                 f"recovered existing open PR {url} (HEAD {pr.head_sha[:12]}, "
-                f"branch {pr.head_ref}); ANALYZE_EXECUTE -> REVIEW without invoking the agent"
+                f"branch {pr.head_ref}); ANALYZE_EXECUTE -> {nxt.value} without invoking "
+                "the agent"
             ),
         )
 
@@ -3344,8 +3366,10 @@ class ControllerEngine:
         verified = self._verify_pr_for_merge(Phase.READY_FOR_MERGE, plan, allow_merge)
         if isinstance(verified, StepOutcome):
             return verified
-        validate_transition(Phase.READY_FOR_MERGE, Phase.MERGE)
-        state.phase = Phase.MERGE
+        # The PR was just verified to be at the reviewed revision.
+        nxt = self._next_phase(Phase.READY_FOR_MERGE, {"head_changed_after_review": False})
+        validate_transition(Phase.READY_FOR_MERGE, nxt)
+        state.phase = nxt
         state.attempt = 0
         self._save()
         return self._outcome(
@@ -3354,7 +3378,7 @@ class ControllerEngine:
             message=(
                 f"merge gate open and GitHub confirms PR {verified.url} is mergeable at the "
                 f"reviewed HEAD {verified.head_sha[:12]} on {verified.base_ref!r}; "
-                "READY_FOR_MERGE -> MERGE"
+                f"READY_FOR_MERGE -> {nxt.value}"
             ),
         )
 
@@ -3731,16 +3755,19 @@ class ControllerEngine:
             )
         if pr.state == "MERGED":
             if phase == Phase.READY_FOR_MERGE:
-                validate_transition(Phase.READY_FOR_MERGE, Phase.MERGE)
-                state.phase = Phase.MERGE
+                # Whether it merged at the reviewed revision is MERGE's own
+                # verification; this step only hands the reconciliation over.
+                nxt = self._next_phase(Phase.READY_FOR_MERGE, {"head_changed_after_review": False})
+                validate_transition(Phase.READY_FOR_MERGE, nxt)
+                state.phase = nxt
                 state.attempt = 0
                 self._save()
                 return self._outcome(
                     phase,
                     plan=plan,
                     message=(
-                        f"PR {url} is already MERGED on GitHub; READY_FOR_MERGE -> MERGE to "
-                        "reconcile (nothing counted yet)"
+                        f"PR {url} is already MERGED on GitHub; READY_FOR_MERGE -> {nxt.value} "
+                        "to reconcile (nothing counted yet)"
                     ),
                 )
             # Crash recovery: the merge happened but state was not persisted.
@@ -4081,8 +4108,11 @@ class ControllerEngine:
             if state.prior_findings
             else ""
         )
-        validate_transition(phase, Phase.REVIEW)
-        state.phase = Phase.REVIEW
+        # FIX's only edge is REVIEW; READY_FOR_MERGE and MERGE route there on
+        # the observation that the reviewed revision is no longer the PR's.
+        nxt = self._next_phase(phase, {"head_changed_after_review": True})
+        validate_transition(phase, nxt)
+        state.phase = nxt
         state.attempt = 0
         self._save()
         return self._outcome(
@@ -4090,7 +4120,10 @@ class ControllerEngine:
             plan=plan,
             message=(
                 message
-                or (f"{what} after the clean review{detail}; {phase.value} -> REVIEW (not merged)")
+                or (
+                    f"{what} after the clean review{detail}; {phase.value} -> {nxt.value} "
+                    "(not merged)"
+                )
             )
             + carried,
         )
@@ -4565,7 +4598,9 @@ class ControllerEngine:
         url = parse_pr_url(pr.url or state.current_pr_url).canonical
         newly = state.record_merge(url)  # idempotent across crash/resume
         state.current_head_sha = pr.head_sha
-        nxt = self._after_merge_phase()
+        # The merge was verified at the reviewed revision (the drift case
+        # left through _revision_drift_to_review before anything was counted).
+        nxt = self._next_phase(Phase.MERGE, {"head_changed_after_review": False})
         validate_transition(Phase.MERGE, nxt)
         state.phase = nxt
         state.attempt = 0
@@ -4580,19 +4615,6 @@ class ControllerEngine:
                 f"({state.merged_since_epic_update} since last EPIC update); MERGE -> {nxt.value}"
             ),
         )
-
-    @staticmethod
-    def _after_merge_phase() -> Phase:
-        """Deterministic post-merge routing owned by the controller.
-
-        Always UPDATE_EPIC: its agent posts the progress comment and selects
-        the next issue (or null -> DONE), and that selection is needed after
-        every merge. Batching several merges per EPIC roadmap update
-        (``workflow.epic_update_every``) is decided inside UPDATE_EPIC from
-        ``merged_since_epic_update`` (:meth:`_roadmap_update_due`), not by
-        skipping the phase.
-        """
-        return Phase.UPDATE_EPIC
 
     def _update_epic_plan_notes(self, s: AutoForgeState) -> list[str]:
         every = self.config.workflow.epic_update_every
@@ -5994,8 +6016,9 @@ class ControllerEngine:
         state.last_review_result = ""
         state.last_review_needs_fix = None
         state.replan_transaction = {}
-        validate_transition(Phase.REPLAN_REEXECUTE, Phase.REVIEW)
-        state.phase = Phase.REVIEW
+        nxt = self._next_phase(Phase.REPLAN_REEXECUTE, {})
+        validate_transition(Phase.REPLAN_REEXECUTE, nxt)
+        state.phase = nxt
         state.attempt = 0
         self._save()
         return self._outcome(
@@ -6003,7 +6026,7 @@ class ControllerEngine:
             message=(
                 f"replacement PR {txn.replacement_pr_url} verified (replan transaction "
                 f"{txn.transaction_id}); source PR {txn.source_pr_url} closed without merge; "
-                "REPLAN_REEXECUTE -> REVIEW (fresh round 1)"
+                f"REPLAN_REEXECUTE -> {nxt.value} (fresh round 1)"
             ),
         )
 
@@ -6330,9 +6353,10 @@ class ControllerEngine:
         state.reviewed_head_sha = ""
         state.reviewed_base_ref = ""
         state.reviewed_merge_base_sha = ""
-        return Phase.REVIEW, (
+        nxt = self._next_phase(Phase.ANALYZE_EXECUTE, {})
+        return nxt, (
             f"PR {pr_ref.canonical} verified (HEAD {pr.head_sha[:12]}, branch "
-            f"{state.current_branch}); ANALYZE_EXECUTE -> REVIEW"
+            f"{state.current_branch}); ANALYZE_EXECUTE -> {nxt.value}"
         )
 
     def _verify_review_comment(
@@ -6503,9 +6527,13 @@ class ControllerEngine:
                 if findings
                 else ""
             )
-            return Phase.REVIEW, (
+            nxt = self._next_phase(
+                Phase.REVIEW,
+                {"needs_fix_round": res.needs_fix_round, "head_changed_after_review": True},
+            )
+            return nxt, (
                 f"review round {res.round} completed for {expected_head[:12]} but {moved} "
-                f"during the review; re-reviewing the latest revision{carried}"
+                f"during the review; REVIEW -> {nxt.value} of the latest revision{carried}"
             )
         # A completed round of the actual revision decides about the carried
         # findings: the reviewer was shown them and re-raised, under this
@@ -6532,7 +6560,9 @@ class ControllerEngine:
                 return Phase.BLOCKED, self._loop_block_reason(
                     self._replan_refusal(decision) + ". Human intervention is required"
                 )
-            if decision.action == "replan":
+            replan = decision.action == "replan"
+            nxt = self._next_phase(Phase.REVIEW, {"needs_fix_round": True, "replan": replan})
+            if replan:
                 # The decision binds the PR and the branch as well as the HEAD,
                 # and a journal missing any of them is refused on load; refuse
                 # here, where nothing has been recorded yet, rather than
@@ -6572,9 +6602,9 @@ class ControllerEngine:
                     decision_merge_base_sha=expected_merge_base,
                     escalation=decision.metadata or {"trigger": decision.reason},
                 ).to_dict()
-                return Phase.REPLAN_REEXECUTE, (
+                return nxt, (
                     f"review round {res.round}: {len(findings)} finding(s); controller policy "
-                    f"triggered REPLAN_REEXECUTE ({decision.reason})"
+                    f"triggered {nxt.value} ({decision.reason})"
                 )
             stop = self._review_loop_stop_reason(res.round)
             if stop:
@@ -6582,15 +6612,15 @@ class ControllerEngine:
                 return Phase.BLOCKED, self._loop_block_reason(
                     f"review round {res.round}: {len(findings)} finding(s), but {stop}"
                 )
-            return Phase.FIX, (
-                f"review round {res.round}: {len(findings)} finding(s); REVIEW -> FIX"
+            return nxt, (
+                f"review round {res.round}: {len(findings)} finding(s); REVIEW -> {nxt.value}"
             )
         state.last_review_result = "clean"
         state.open_findings = []
         self._record_review(res.round, expected_head, RESULT_CLEAN, findings)
-        return Phase.READY_FOR_MERGE, (
-            f"review round {res.round} clean for HEAD {expected_head[:12]}; "
-            "REVIEW -> READY_FOR_MERGE"
+        nxt = self._next_phase(Phase.REVIEW, {"needs_fix_round": False})
+        return nxt, (
+            f"review round {res.round} clean for HEAD {expected_head[:12]}; REVIEW -> {nxt.value}"
         )
 
     @staticmethod
@@ -6727,9 +6757,11 @@ class ControllerEngine:
         state.last_fix_resolutions = [redact_dict(r.to_dict()) for r in res.resolutions]
         state.open_findings = []
         state.last_review_result = "fixed"
-        return Phase.REVIEW, (
+        nxt = self._next_phase(Phase.FIX, {})
+        return nxt, (
             f"FIX verified: HEAD {expected_prev[:12]} -> {pr.head_sha[:12]}, "
-            f"{len(res.resolutions)} resolution(s); FIX -> REVIEW (round {state.review_round + 1})"
+            f"{len(res.resolutions)} resolution(s); FIX -> {nxt.value} "
+            f"(round {state.review_round + 1})"
         )
 
     def _apply_replan(self, res: ReplanReexecuteResult) -> tuple[Phase, str]:
@@ -6840,7 +6872,9 @@ class ControllerEngine:
         outcome = self._supersede_source(txn)
         if state.phase == Phase.BLOCKED:
             return Phase.BLOCKED, outcome.message
-        return Phase.REVIEW, outcome.message
+        # ``_supersede_source`` activated the replacement and already applied
+        # REPLAN_REEXECUTE's one edge; the same decision is returned here.
+        return self._next_phase(Phase.REPLAN_REEXECUTE, {}), outcome.message
 
     @staticmethod
     def _blocked_replan(outcome: StepOutcome) -> tuple[Phase, str]:
@@ -6936,7 +6970,8 @@ class ControllerEngine:
             )
         if res.next_issue_url is None:
             state.next_issue_rejections = []
-            return Phase.DONE, f"{roadmap_note}; UPDATE_EPIC -> DONE"
+            nxt = self._next_phase(Phase.UPDATE_EPIC, {"next_issue_url": None})
+            return nxt, f"{roadmap_note}; UPDATE_EPIC -> {nxt.value}"
         try:
             issue = self._verify_issue_selectable(res.next_issue_url, switching=True)
         except VerificationError as exc:
@@ -6956,9 +6991,10 @@ class ControllerEngine:
                 "Fix the cause, then 'resume'."
             )
         state.reset_for_new_issue(parse_issue_url(res.next_issue_url).canonical)
-        return Phase.ANALYZE_EXECUTE, (
+        nxt = self._next_phase(Phase.UPDATE_EPIC, {"next_issue_url": res.next_issue_url})
+        return nxt, (
             f"{roadmap_note}; verified next issue #{issue.number} ({issue.state}); "
-            "UPDATE_EPIC -> ANALYZE_EXECUTE"
+            f"UPDATE_EPIC -> {nxt.value}"
         )
 
     def _apply_roadmap_section(self, res: UpdateEpicResult) -> str:
