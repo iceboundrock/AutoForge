@@ -169,7 +169,35 @@ _O_TMPFILE = getattr(os, "O_TMPFILE", 0)
 #: Directory-relative syscalls this module cannot work without.  They exist on
 #: Linux and modern BSD/macOS; refusing early beats silently degrading to
 #: pathname operations that do not hold the invariant.
-_REQUIRED_DIR_FD = ("open", "mkdir", "rename", "unlink", "stat", "link", "readlink")
+_REQUIRED_DIR_FD = ("open", "mkdir", "rename", "unlink", "stat", "link", "readlink", "symlink")
+
+#: What ``link(2)`` reports where no hard link can be made to the entry: vfat
+#: and exFAT say ``EPERM`` (as does ``fs.protected_hardlinks`` for a file the
+#: caller neither owns nor may write), several FUSE, SMB/CIFS and overlay
+#: filesystems ``ENOTSUP`` / ``EOPNOTSUPP``, and a FUSE daemon without the
+#: operation ``ENOSYS``.  Every one is the same fact for the caller: this
+#: reservation cannot be made here, and another kind must be.
+_NO_HARD_LINKS = frozenset(
+    {
+        errno.EPERM,
+        errno.ENOSYS,
+        getattr(errno, "ENOTSUP", errno.EPERM),
+        getattr(errno, "EOPNOTSUPP", errno.EPERM),
+    }
+)
+
+#: What ``fchmod(2)`` reports on a filesystem that holds no permission bits
+#: of its own -- the same filesystems, refusing for the same reason, with
+#: the same errnos: vfat/exFAT and SMB say ``EPERM``, a FUSE daemon without
+#: the operation ``ENOSYS``, others ``ENOTSUP`` / ``EOPNOTSUPP``.  There
+#: the bits of source and copy alike are synthesized by the mount, so the
+#: refusal carries nothing the copy's caller can act on; on a filesystem
+#: that *does* hold mode bits, ``fchmod`` of a file this process just
+#: created and still holds open does not fail with any of these.
+_NO_MODE_BITS = _NO_HARD_LINKS
+
+#: Chunk of a streamed copy (:meth:`SafeRoot.copy_entry_exclusive`).
+_COPY_CHUNK = 1 << 20
 
 
 def entry_kind(mode: int) -> str | None:
@@ -208,6 +236,18 @@ def _denied(exc: OSError) -> bool:
 def _denied_text(exc: OSError) -> str:
     """The kernel's own wording, without the filename it repeats back."""
     return exc.strerror or os.strerror(exc.errno or errno.EACCES)
+
+
+class HardLinksUnavailable(StateError):
+    """:meth:`SafeRoot.link` was refused because the filesystem, or the
+    kernel's policy for this entry, makes no hard links here.
+
+    Not a failure of the caller's operation but of one way of performing it:
+    a caller that used ``link(2)`` to reserve a name without replacing an
+    entry can make the same reservation with
+    :meth:`SafeRoot.copy_entry_exclusive` instead.  Any other refusal of a
+    link stays a plain :class:`~autoforge.errors.StateError`.
+    """
 
 
 class ReadLimitExceeded(StateError):
@@ -335,11 +375,28 @@ def open_regular_at(
     the open, and why a write open insists on a link count of one.
     """
     label = where or name
-    truncate = bool(flags & os.O_TRUNC)
-    writing = (flags & _O_ACCMODE) in (os.O_WRONLY, os.O_RDWR)
+    fd = _open_at(dir_fd, name, flags, mode=mode, label=label)
+    try:
+        _check_regular_fd(fd, flags, label=label)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _open_at(dir_fd: int, name: str, flags: int, *, mode: int, label: str) -> int:
+    """The open half of :func:`open_regular_at`: the descriptor it returns
+    has not been inspected yet.
+
+    Kept apart so a caller that creates the name (``O_CREAT | O_EXCL``) can
+    tell a failed open, which created nothing, from a failed inspection of
+    the entry it just created, which it must remove again.  A refusal here
+    is classified from the errno alone; the ones the kernel can only report
+    after the open live in :func:`_check_regular_fd`.
+    """
     open_flags = (flags & ~os.O_TRUNC) | _O_NOFOLLOW | _O_NONBLOCK | _O_NOCTTY | _O_CLOEXEC
     try:
-        fd = os.open(name, open_flags, mode, dir_fd=dir_fd)
+        return os.open(name, open_flags, mode, dir_fd=dir_fd)
     except FileNotFoundError:
         # Absence is the caller's business (see SafeRoot.read_bytes).
         raise
@@ -358,35 +415,39 @@ def open_regular_at(
         if _denied(exc):
             raise UnreadableEntryError(label, f"cannot open {label}: {_denied_text(exc)}") from exc
         raise StateError(f"cannot open {label}: {exc}") from exc
-    try:
-        st = os.fstat(fd)
-        kind = entry_kind(st.st_mode)
-        if kind is not None:
-            raise _unsafe(label, f"a {kind}, not a regular file")
-        # A write open requires exactly one name. More than one is a hard
-        # link, and the wording is mode-neutral: a truncating open would
-        # replace the shared inode's contents, an appending one would extend
-        # them, and either way the change shows at the other name. None at
-        # all means the name was unlinked between the open and this
-        # inspection (the descriptor still holds the inode, so a write would
-        # go into a file nothing names and report success), or that the
-        # filesystem reports no link count, in which case a second name can
-        # never be ruled out; both are refused rather than written to.
-        if writing and st.st_nlink > 1:
-            raise _unsafe(label, _hard_link_text(st.st_nlink))
-        if writing and st.st_nlink < 1:
-            raise _unsafe(
-                label,
-                "a file no directory entry names: it was unlinked after it was opened, or "
-                "this filesystem reports no link count, so a write here could not be "
-                "proved to reach a single-named file",
-            )
-        if truncate:
-            os.ftruncate(fd, 0)
-    except BaseException:
-        os.close(fd)
-        raise
-    return fd
+
+
+def _check_regular_fd(fd: int, flags: int, *, label: str) -> None:
+    """The inspection half of :func:`open_regular_at`: refuse ``fd`` unless
+    it is a regular file that a write open of ``flags`` may use, and apply
+    the deferred ``O_TRUNC``.  Raises without closing ``fd``; the caller
+    owns the descriptor and whatever cleanup its failure calls for."""
+    truncate = bool(flags & os.O_TRUNC)
+    writing = (flags & _O_ACCMODE) in (os.O_WRONLY, os.O_RDWR)
+    st = os.fstat(fd)
+    kind = entry_kind(st.st_mode)
+    if kind is not None:
+        raise _unsafe(label, f"a {kind}, not a regular file")
+    # A write open requires exactly one name. More than one is a hard
+    # link, and the wording is mode-neutral: a truncating open would
+    # replace the shared inode's contents, an appending one would extend
+    # them, and either way the change shows at the other name. None at
+    # all means the name was unlinked between the open and this
+    # inspection (the descriptor still holds the inode, so a write would
+    # go into a file nothing names and report success), or that the
+    # filesystem reports no link count, in which case a second name can
+    # never be ruled out; both are refused rather than written to.
+    if writing and st.st_nlink > 1:
+        raise _unsafe(label, _hard_link_text(st.st_nlink))
+    if writing and st.st_nlink < 1:
+        raise _unsafe(
+            label,
+            "a file no directory entry names: it was unlinked after it was opened, or "
+            "this filesystem reports no link count, so a write here could not be "
+            "proved to reach a single-named file",
+        )
+    if truncate:
+        os.ftruncate(fd, 0)
 
 
 def readlink_at(dir_fd: int, name: str) -> str:
@@ -930,7 +991,10 @@ class SafeRoot:
         Used to *reserve* a destination name: ``link`` fails atomically with
         ``EEXIST`` when the name is taken, which a rename would not.
         ``follow_symlinks=False`` links the directory entry itself, so a
-        symbolic link is archived as a link rather than resolved.
+        symbolic link is archived as a link rather than resolved.  Where the
+        filesystem makes no hard links (:data:`_NO_HARD_LINKS`) the refusal
+        is :class:`HardLinksUnavailable`, so the caller can make the same
+        reservation with :meth:`copy_entry_exclusive` instead.
         """
         src_parts = split_relpath(src)
         dst_parts = split_relpath(dst)
@@ -948,13 +1012,174 @@ class SafeRoot:
             except FileExistsError:
                 raise
             except OSError as exc:
-                raise StateError(
-                    f"cannot link {self._describe(src_parts)} to {self._describe(dst_parts)}: {exc}"
-                ) from exc
+                where = f"{self._describe(src_parts)} to {self._describe(dst_parts)}"
+                if exc.errno in _NO_HARD_LINKS:
+                    raise HardLinksUnavailable(
+                        f"cannot link {where}: this filesystem makes no hard link here ({exc})"
+                    ) from exc
+                raise StateError(f"cannot link {where}: {exc}") from exc
             finally:
                 os.close(dst_parent)
         finally:
             os.close(src_parent)
+
+    def copy_entry_exclusive(self, src: str, dst: str) -> None:
+        """Reproduce the directory entry ``src`` under the new name ``dst``
+        within this root, or fail because an entry of that name already
+        exists: the reservation :meth:`link` makes, for a filesystem where
+        :meth:`link` raises :class:`HardLinksUnavailable`.
+
+        The entry itself is reproduced, never what it points at: a regular
+        file's bytes are streamed into ``dst`` opened ``O_CREAT | O_EXCL``
+        and fsynced, with the source's permission bits restored where the
+        filesystem holds any -- where it holds none and ``fchmod(2)`` says
+        so (``EPERM``, ``ENOSYS``, ``ENOTSUP``/``EOPNOTSUPP``, the same
+        refusals as :meth:`link`'s, :data:`_NO_MODE_BITS`), the copy is
+        made anyway and carries the umask-filtered subset of the source's
+        bits, so it is at most as permissive as the source, never more; a
+        symbolic link is recreated by ``symlink(2)`` with its target text
+        and never followed.
+        Both fail with :class:`FileExistsError` on any existing entry at
+        ``dst`` (a symbolic link included), exactly as :meth:`link` does.  A
+        FIFO, socket or device has no bytes to copy and is refused; the
+        caller is told to move it by hand.  Nothing is ever read through a
+        symbolic link or written anywhere but the fresh entry.
+
+        Unlike a hard link this is not one syscall: the bytes reach ``dst``
+        after its name exists.  Every failure after the name is created --
+        the fresh entry failing inspection, the permission bits (for any
+        other errno than the ones above), the bytes,
+        their fsync, or the fsync of the directory that publishes the name
+        -- removes that name again and nothing else, so a failed reservation
+        leaves the directory as it was found.  That differs from the
+        controller's own writes, which keep a name whose directory fsync
+        failed (:meth:`_fsync_published`): those bytes are the product,
+        whereas here the source is still in place and a copy whose
+        durability could not be proved is worth nothing to the caller, who
+        must not remove the source on the strength of it.  A *crash*
+        mid-copy leaves a partial file under ``dst``, which later exclusive
+        creates will not replace and which the source, still in place, does
+        not depend on.
+        """
+        src_parts = split_relpath(src)
+        dst_parts = split_relpath(dst)
+        src_parent = self._parent_of(src_parts, create=False)
+        try:
+            dst_parent = self._parent_of(dst_parts, create=True)
+            try:
+                self._copy_entry_at(
+                    src_parent,
+                    src_parts[-1],
+                    dst_parent,
+                    dst_parts[-1],
+                    where_src=self._describe(src_parts),
+                    where_dst=self._describe(dst_parts),
+                )
+            finally:
+                os.close(dst_parent)
+        finally:
+            os.close(src_parent)
+
+    def _copy_entry_at(
+        self,
+        src_parent: int,
+        src_name: str,
+        dst_parent: int,
+        dst_name: str,
+        *,
+        where_src: str,
+        where_dst: str,
+    ) -> None:
+        where = f"{where_src} to {where_dst}"
+        try:
+            st = os.lstat(src_name, dir_fd=src_parent)
+        except OSError as exc:
+            raise StateError(f"cannot copy {where}: {exc}") from exc
+        if stat.S_ISLNK(st.st_mode):
+            try:
+                target = os.readlink(src_name, dir_fd=src_parent)
+                os.symlink(target, dst_name, dir_fd=dst_parent)
+            except FileExistsError:
+                raise
+            except OSError as exc:
+                raise StateError(f"cannot copy {where}: {exc}") from exc
+            # From here on the name is this process's; see _copy_bytes_at.
+            try:
+                self._fsync_published(dst_parent, where_dst)
+            except BaseException:
+                _quiet_unlink(dst_parent, dst_name)
+                raise
+            return
+        kind = entry_kind(st.st_mode)
+        if kind is not None:
+            raise StateError(
+                f"cannot copy {where}: it is a {kind}, not a regular file or a symbolic "
+                "link, and has no bytes to copy; move it by hand"
+            )
+        in_fd = open_regular_at(src_parent, src_name, os.O_RDONLY, where=where_src)
+        try:
+            self._copy_bytes_at(
+                in_fd,
+                dst_parent,
+                dst_name,
+                mode=stat.S_IMODE(st.st_mode),
+                where=where,
+                where_dst=where_dst,
+            )
+        finally:
+            os.close(in_fd)
+
+    def _copy_bytes_at(
+        self,
+        in_fd: int,
+        dst_parent: int,
+        dst_name: str,
+        *,
+        mode: int,
+        where: str,
+        where_dst: str,
+    ) -> None:
+        """Create ``dst_name`` exclusively and fill it from ``in_fd``.
+
+        The open is split in two so that a failure *creating* the name,
+        which leaves nothing behind, is told apart from every failure
+        *after* it: the name is this process's from the moment ``O_EXCL``
+        succeeds, and any of those later failures removes it again (and
+        only it: a second name someone else gave the inode meanwhile is
+        theirs) so the directory is left as it was found.
+        """
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        # FileExistsError from O_EXCL is the caller's business, as in
+        # open_regular_at; every other refusal is already a StateError.
+        out_fd = _open_at(dst_parent, dst_name, flags, mode=mode, label=where_dst)
+        try:
+            try:
+                _check_regular_fd(out_fd, flags, label=where_dst)
+                # O_CREAT applied the umask to ``mode``; the source's bits
+                # are what a hard link would have carried, so restore them
+                # where the filesystem holds any.  Where it holds none
+                # (_NO_MODE_BITS: the same mounts that have no link(2), which
+                # is why this copy is running at all) the copy carries the
+                # umask-filtered subset of the source's bits, never more,
+                # and the bytes are what the caller came for.
+                try:
+                    os.fchmod(out_fd, mode)
+                except OSError as exc:
+                    if exc.errno not in _NO_MODE_BITS:
+                        raise
+                while chunk := os.read(in_fd, _COPY_CHUNK):
+                    view = memoryview(chunk)
+                    while view:
+                        view = view[os.write(out_fd, view) :]
+                os.fsync(out_fd)
+            except OSError as exc:
+                raise StateError(f"cannot copy {where}: {exc}") from exc
+            finally:
+                os.close(out_fd)
+            self._fsync_published(dst_parent, where_dst)
+        except BaseException:
+            _quiet_unlink(dst_parent, dst_name)
+            raise
 
     def rename(self, src: str, dst: str) -> None:
         """Rename within this root, both sides named relative to a descriptor."""

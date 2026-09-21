@@ -14,7 +14,12 @@ a fresh state: ``run`` refuses (exit 2) unless ``--force`` is given, and
 even then the unreadable entry is moved aside as
 ``state.json.corrupt-<timestamp>`` by :func:`quarantine_state_file` rather
 than deleted (a directory entry cannot be archived automatically and stays
-put with an error).  The entry is inspected with ``lstat``/``fstat`` and
+put with an error).  The archive name is reserved by ``link(2)``, or by an
+exclusive create / ``symlink(2)`` where the filesystem has no hard links,
+and the original is unlinked only afterwards; a crash between the two
+leaves ``state.json`` in place beside its archive, and the next
+``run --force`` archives it again under a new name -- a duplicate copy,
+never a lost one.  The entry is inspected with ``lstat``/``fstat`` and
 opened non-blocking before it is read, so a FIFO without a writer fails
 loudly instead of hanging the command.  ``run`` inspects, decides, quarantines, writes the first
 state and executes it under one continuous controller lock (``step`` and
@@ -41,7 +46,7 @@ from .replan_txn import LEGACY_JOURNAL_PROTOCOLS, legacy_journal_refusal
 from .result_parser import FINDING_ID_RE, MAX_FINDING_ID_CHARS
 from .run_contract import LocalRunContract
 from .runlog import validate_run_id
-from .safefs import ReadLimitExceeded, SafeRoot, entry_kind
+from .safefs import HardLinksUnavailable, ReadLimitExceeded, SafeRoot, entry_kind
 from .transitions import LOCAL_PHASES, LOCAL_WRITE_PHASES, Phase, WorkflowMode
 from .validation import parse_pr_url
 
@@ -1103,9 +1108,24 @@ def quarantine_state_file(path: str | Path, *, root: SafeRoot | None = None) -> 
     it stays untouched and must be moved aside by hand.  Raises StateError
     when the move fails; the original entry is left untouched in that case.
 
-    The caller must hold the controller lock (the CLI does, via
-    ``ControllerEngine.locked()``): link and unlink are two syscalls, and a
-    writer replacing ``path`` in between would see the replacement removed.
+    Where the filesystem makes no hard links (vfat/exFAT, some FUSE, SMB and
+    overlay mounts; :class:`~autoforge.safefs.HardLinksUnavailable`) the
+    name is reserved with
+    :meth:`~autoforge.safefs.SafeRoot.copy_entry_exclusive` instead, which
+    keeps the no-replace guarantee: a regular file is copied into a name
+    created ``O_CREAT | O_EXCL`` and fsynced, a symbolic link is recreated
+    with ``symlink(2)``.  A FIFO, socket or device cannot be reproduced that
+    way and is refused there, untouched, like a directory is everywhere.
+
+    Reservation and removal of the source are two syscalls on either path.
+    A crash between them leaves ``path`` in place beside a complete archive
+    of it; the next ``run --force`` archives it again under a new name, so
+    the outcome is a duplicate copy and never a lost one.  (On the copy path
+    a crash *during* the copy leaves a partial archive under a name later
+    reservations will not reuse, beside the untouched source.)  The caller
+    must hold the controller lock (the CLI does, via
+    ``ControllerEngine.locked()``): a writer replacing ``path`` between the
+    two syscalls would see the replacement removed.
     """
     src = Path(path)
     fs, name, owned = _root_for(src, root)
@@ -1122,12 +1142,30 @@ def quarantine_state_file(path: str | Path, *, root: SafeRoot | None = None) -> 
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         base = f"{name}{CORRUPT_SUFFIX}{stamp}"
         candidate = base
+        hard_links = True
+
+        def reserve(candidate: str) -> None:
+            # link(2) reserves the name and the bytes in one syscall.  Where
+            # the filesystem has none, the entry is reproduced under a name
+            # created O_EXCL (or by symlink(2)), which is equally no-replace;
+            # once that has been learned, later attempts skip the link.
+            nonlocal hard_links
+            if hard_links:
+                try:
+                    fs.link(name, candidate)
+                    return
+                except HardLinksUnavailable:
+                    hard_links = False
+            fs.copy_entry_exclusive(name, candidate)
+
         for n in range(1, _QUARANTINE_MAX_ATTEMPTS + 1):
             try:
-                fs.link(name, candidate)
+                reserve(candidate)
             except FileExistsError:
                 candidate = f"{base}.{n}"
                 continue
+            except StateError as exc:
+                raise StateError(f"cannot move corrupted state file {src} aside: {exc}") from exc
             current = fs.lstat(name)
             current_identity = (
                 None if current is None else (current.st_dev, current.st_ino, current.st_mode)

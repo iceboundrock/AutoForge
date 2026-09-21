@@ -1,5 +1,6 @@
 """State: serialize/deserialize, atomic save/load, corruption, idempotency."""
 
+import errno
 import json
 
 import pytest
@@ -824,6 +825,255 @@ def test_quarantine_refuses_a_source_replaced_after_reservation(tmp_path, monkey
     with pytest.raises(StateError, match="changed while being quarantined"):
         quarantine_state_file(p)
     assert p.read_text(encoding="utf-8") == "fresh state"
+    assert [q.name for q in tmp_path.iterdir()] == ["state.json"]
+
+
+# -- no hard links: the copy fallback (#30) ------------------------------------
+def _without_hard_links(monkeypatch, err: int):
+    """Make ``os.link`` report what a filesystem without hard links reports."""
+    import os
+
+    calls: list[str] = []
+
+    def no_link(src, dst, *args, **kwargs):
+        calls.append(os.fspath(dst))
+        raise OSError(err, os.strerror(err), os.fspath(dst))
+
+    monkeypatch.setattr(os, "link", no_link)
+    return calls
+
+
+@pytest.mark.parametrize(
+    "err",
+    sorted({errno.EPERM, errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP}),
+    ids=errno.errorcode.__getitem__,
+)
+def test_quarantine_copies_the_file_where_hard_links_are_unavailable(tmp_path, monkeypatch, err):
+    """#30: vfat/exFAT, some FUSE, SMB and overlay mounts have no link(2).
+
+    The archive is then a byte-for-byte copy under a name created O_EXCL, the
+    original is removed afterwards, and 'run --force' works there too instead
+    of failing closed with a link error and leaving the operator to move the
+    file by hand.
+    """
+    import os
+    import stat
+
+    from autoforge.state import quarantine_state_file
+
+    p = tmp_path / "state.json"
+    raw = b"{not json \xff\x00" + b"x" * (3 * 1024 * 1024)  # spans several copy chunks
+    p.write_bytes(raw)
+    p.chmod(0o640)
+    calls = _without_hard_links(monkeypatch, err)
+
+    moved = quarantine_state_file(p)
+
+    assert len(calls) == 1  # one link attempt taught the fallback; no retry per name
+    assert not os.path.lexists(p)
+    assert [q.name for q in tmp_path.iterdir()] == [moved.name]
+    assert moved.name.startswith("state.json.corrupt-")
+    st = moved.lstat()
+    assert stat.S_ISREG(st.st_mode) and st.st_nlink == 1
+    assert stat.S_IMODE(st.st_mode) == 0o640
+    assert moved.read_bytes() == raw
+
+
+@pytest.mark.parametrize("err", [errno.ENOSYS, errno.EPERM], ids=errno.errorcode.__getitem__)
+def test_quarantine_copies_the_file_where_chmod_is_unsupported_too(tmp_path, monkeypatch, err):
+    """A filesystem without link(2) commonly has no chmod(2) either (a FUSE
+    daemon implementing neither says ENOSYS to both; vfat says EPERM): the
+    copy must still be made there, or 'run --force' fails closed on exactly
+    the class of filesystem the fallback was written for.  The archive then
+    holds the bytes and no bits the source lacked."""
+    import os
+    import stat
+
+    from autoforge.state import quarantine_state_file
+
+    p = tmp_path / "state.json"
+    raw = b"{not json \xff\x00" + b"x" * (3 * 1024 * 1024)
+    p.write_bytes(raw)
+    p.chmod(0o664)
+    _without_hard_links(monkeypatch, err)
+
+    def no_fchmod(fd, mode):
+        raise OSError(err, os.strerror(err))
+
+    monkeypatch.setattr(os, "fchmod", no_fchmod)
+    previous = os.umask(0o077)
+    try:
+        moved = quarantine_state_file(p)
+    finally:
+        os.umask(previous)
+
+    assert not os.path.lexists(p)
+    assert [q.name for q in tmp_path.iterdir()] == [moved.name]
+    st = moved.lstat()
+    assert stat.S_ISREG(st.st_mode) and st.st_nlink == 1
+    assert stat.S_IMODE(st.st_mode) & ~0o664 == 0
+    assert moved.read_bytes() == raw
+
+
+def test_quarantine_fallback_recreates_a_symlink_without_following_it(tmp_path, monkeypatch):
+    import os
+
+    from autoforge.state import quarantine_state_file
+
+    target = tmp_path / "elsewhere.json"
+    target.write_text("{not json", encoding="utf-8")
+    p = tmp_path / "state.json"
+    p.symlink_to(target.name)
+    _without_hard_links(monkeypatch, errno.ENOTSUP)
+
+    moved = quarantine_state_file(p)
+
+    assert not os.path.lexists(p)
+    assert moved.is_symlink() and os.readlink(moved) == target.name
+    assert not target.is_symlink() and target.read_text(encoding="utf-8") == "{not json"
+    assert sorted(x.name for x in tmp_path.iterdir()) == ["elsewhere.json", moved.name]
+
+    # A dangling link is archived as the same dangling link.
+    p.symlink_to("missing-target.json")
+    moved2 = quarantine_state_file(p)
+    assert not os.path.lexists(p)
+    assert moved2.is_symlink() and os.readlink(moved2) == "missing-target.json"
+
+
+def test_quarantine_fallback_never_replaces_an_existing_archive(tmp_path, monkeypatch):
+    """The copy keeps link(2)'s no-replace guarantee: an archive already at
+    the selected name (here: the same second) is left intact and the move
+    retries with the next numeric suffix, up to the same bound."""
+    from datetime import datetime
+
+    from autoforge import state as state_mod
+    from autoforge.state import quarantine_state_file
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 9, 6, 12, 0, 0, tzinfo=tz)
+
+    monkeypatch.setattr(state_mod, "datetime", FrozenDatetime)
+    monkeypatch.setattr(state_mod, "_QUARANTINE_MAX_ATTEMPTS", 3)
+    _without_hard_links(monkeypatch, errno.EPERM)
+    p = tmp_path / "state.json"
+    taken = tmp_path / "state.json.corrupt-20260906T120000Z"
+    taken.write_text("earlier archive", encoding="utf-8")
+    (tmp_path / "state.json.corrupt-20260906T120000Z.1").symlink_to("earlier link")
+
+    p.write_text("garbage-1", encoding="utf-8")
+    first = quarantine_state_file(p)
+    assert first == tmp_path / "state.json.corrupt-20260906T120000Z.2"
+    assert first.read_text(encoding="utf-8") == "garbage-1"
+
+    # base, .1 and now .2 are taken: the bounded retry gives up, and nothing
+    # already archived is touched.
+    p.write_text("garbage-2", encoding="utf-8")
+    with pytest.raises(StateError, match="no free name after 3 attempts"):
+        quarantine_state_file(p)
+    assert p.read_text(encoding="utf-8") == "garbage-2"  # original untouched
+    assert taken.read_text(encoding="utf-8") == "earlier archive"
+    assert first.read_text(encoding="utf-8") == "garbage-1"
+    assert sorted(q.name for q in tmp_path.iterdir()) == [
+        "state.json",
+        "state.json.corrupt-20260906T120000Z",
+        "state.json.corrupt-20260906T120000Z.1",
+        "state.json.corrupt-20260906T120000Z.2",
+    ]
+
+
+def test_quarantine_fallback_refuses_a_fifo_and_leaves_it_untouched(tmp_path, monkeypatch):
+    """A FIFO has no bytes to copy: without hard links it stays put with an
+    error naming what to do, like a directory does everywhere."""
+    import os
+    import stat
+
+    from autoforge.state import quarantine_state_file
+
+    p = tmp_path / "state.json"
+    os.mkfifo(p)
+    _without_hard_links(monkeypatch, errno.EPERM)
+    with pytest.raises(StateError, match="cannot move corrupted state file.*FIFO.*move it by hand"):
+        _call_with_timeout(lambda: quarantine_state_file(p))
+    assert [q.name for q in tmp_path.iterdir()] == ["state.json"]
+    assert stat.S_ISFIFO(os.lstat(p).st_mode)
+
+
+def _fail_fsync_of_regular_files(monkeypatch, err: int, hook=None):
+    """Fail ``os.fsync`` on a regular file (the copy's data fsync), not on a
+    directory, and run ``hook`` first when given."""
+    import os
+    import stat
+
+    real_fsync = os.fsync
+
+    def fsync(fd):
+        if stat.S_ISREG(os.fstat(fd).st_mode):
+            if hook is not None:
+                hook()
+            if err:
+                raise OSError(err, os.strerror(err))
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+
+
+def test_quarantine_fallback_copy_failure_leaves_original_and_no_partial_archive(
+    tmp_path, monkeypatch
+):
+    from autoforge.state import quarantine_state_file
+
+    p = tmp_path / "state.json"
+    p.write_text("garbage", encoding="utf-8")
+    _without_hard_links(monkeypatch, errno.EPERM)
+    _fail_fsync_of_regular_files(monkeypatch, errno.ENOSPC)
+
+    with pytest.raises(StateError, match="cannot move corrupted state file.*No space left"):
+        quarantine_state_file(p)
+    assert p.read_text(encoding="utf-8") == "garbage"
+    assert [q.name for q in tmp_path.iterdir()] == ["state.json"]
+
+
+def test_quarantine_fallback_refuses_a_source_replaced_during_the_copy(tmp_path, monkeypatch):
+    """The copy path keeps the identity check: a state.json replaced while the
+    archive was being written is never unlinked, and the archive (a copy of
+    whichever bytes were read) is dropped rather than left as a false record."""
+    from autoforge.state import quarantine_state_file
+
+    p = tmp_path / "state.json"
+    p.write_text("corrupt", encoding="utf-8")
+    _without_hard_links(monkeypatch, errno.EPERM)
+
+    def replace_source():
+        p.unlink()
+        p.write_text("fresh state", encoding="utf-8")
+
+    _fail_fsync_of_regular_files(monkeypatch, 0, hook=replace_source)
+    with pytest.raises(StateError, match="changed while being quarantined"):
+        quarantine_state_file(p)
+    assert p.read_text(encoding="utf-8") == "fresh state"
+    assert [q.name for q in tmp_path.iterdir()] == ["state.json"]
+
+
+def test_quarantine_other_link_failures_are_not_retried_as_copies(tmp_path, monkeypatch):
+    """Only 'no hard links here' selects the fallback. An I/O error from
+    link(2) is this move's failure, reported as such with nothing copied."""
+    import os
+
+    from autoforge.state import quarantine_state_file
+
+    p = tmp_path / "state.json"
+    p.write_text("garbage", encoding="utf-8")
+
+    def failing_link(src, dst, *args, **kwargs):
+        raise OSError(errno.EIO, os.strerror(errno.EIO), os.fspath(dst))
+
+    monkeypatch.setattr(os, "link", failing_link)
+    with pytest.raises(StateError, match="cannot move corrupted state file.*cannot link") as info:
+        quarantine_state_file(p)
+    assert "Input/output error" in str(info.value)
+    assert p.read_text(encoding="utf-8") == "garbage"
     assert [q.name for q in tmp_path.iterdir()] == ["state.json"]
 
 

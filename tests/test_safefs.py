@@ -21,6 +21,7 @@ cell, that it is byte-for-byte and inode-for-inode what it was before.
 """
 
 import errno
+import functools
 import os
 import stat
 from collections.abc import Callable, Iterator
@@ -109,6 +110,8 @@ OPERATIONS = {
     "unlink": lambda root, rel: root.unlink(rel),
     "rename_from": lambda root, rel: root.rename(rel, "moved.txt"),
     "rename_to": lambda root, rel: root.rename("source.txt", rel),
+    "copy_from": lambda root, rel: root.copy_entry_exclusive(rel, "copied.txt"),
+    "copy_to": lambda root, rel: root.copy_entry_exclusive("source.txt", rel),
     "ensure_dir": lambda root, rel: root.ensure_dir(rel),
     "lstat": lambda root, rel: root.lstat(rel),
     "subroot": lambda root, rel: root.subroot(rel, create=True).close(),
@@ -1163,6 +1166,256 @@ def test_a_fifo_never_blocks_the_controller(tmp_path):
         for op in ("read_text", "append"):
             with pytest.raises((StateError, OSError)):
                 OPERATIONS[op](root, "pipe")
+
+
+# -- #30: the no-replace reservation where link(2) is unavailable ---------------
+def test_copy_entry_exclusive_reproduces_the_entry_itself_and_refuses_every_taken_name(
+    tmp_path,
+):
+    """A regular file becomes a fresh single-named regular file with the same
+    bytes and permission bits; a symbolic link becomes a symbolic link with the
+    same target text, never followed; a FIFO is refused. Every existing entry
+    at the destination -- a symbolic link included -- is refused as *existence*
+    with the directory left exactly as it was."""
+    from autoforge.safefs import entry_kind
+
+    sentinel = Sentinel(tmp_path)
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    (root_dir / "file.json").write_bytes(b"corrupt\n")
+    (root_dir / "file.json").chmod(0o640)
+    (root_dir / "link.json").symlink_to(sentinel.path)
+    os.mkfifo(root_dir / "pipe")
+    with SafeRoot.open(root_dir) as root:
+        root.copy_entry_exclusive("file.json", "sub/file.copy")
+        root.copy_entry_exclusive("link.json", "link.copy")
+        with pytest.raises(StateError, match="FIFO.*move it by hand"):
+            root.copy_entry_exclusive("pipe", "pipe.copy")
+        for taken in ("file.json", "link.json", "pipe", "sub", "link.copy", "sub/file.copy"):
+            with pytest.raises(FileExistsError):
+                root.copy_entry_exclusive("file.json", taken)
+            with pytest.raises(FileExistsError):
+                root.copy_entry_exclusive("link.json", taken)
+    copied = (root_dir / "sub" / "file.copy").lstat()
+    assert entry_kind(copied.st_mode) is None and copied.st_nlink == 1
+    assert stat.S_IMODE(copied.st_mode) == 0o640
+    assert (root_dir / "sub" / "file.copy").read_bytes() == b"corrupt\n"
+    assert os.readlink(root_dir / "link.copy") == str(sentinel.path)
+    assert (root_dir / "file.json").read_bytes() == b"corrupt\n"
+    assert os.readlink(root_dir / "link.json") == str(sentinel.path)
+    assert stat.S_ISFIFO((root_dir / "pipe").lstat().st_mode)
+    assert sorted(e.name for e in root_dir.iterdir()) == [
+        "file.json",
+        "link.copy",
+        "link.json",
+        "pipe",
+        "sub",
+    ]
+    assert [e.name for e in (root_dir / "sub").iterdir()] == ["file.copy"]
+    sentinel.assert_untouched()
+
+
+def test_copy_entry_exclusive_reads_a_hard_linked_source_without_altering_it(tmp_path):
+    """The source may be a second name of a file the controller did not
+    create: it is *read* through that name (the copy is a copy), and neither
+    the shared inode nor its other name changes."""
+    sentinel = Sentinel(tmp_path)
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    os.link(sentinel.path, root_dir / "shared.json")
+    with SafeRoot.open(root_dir) as root:
+        root.copy_entry_exclusive("shared.json", "shared.copy")
+    assert (root_dir / "shared.copy").read_text(encoding="utf-8") == SENTINEL
+    assert (root_dir / "shared.copy").lstat().st_nlink == 1
+    assert (root_dir / "shared.json").lstat().st_nlink == 2
+    sentinel.assert_untouched()
+
+
+def _fail_fsync_of(monkeypatch, *, directory: bool) -> None:
+    """Make ``os.fsync`` fail with EIO on a directory (the publication of a
+    name) or on a regular file (the bytes), leaving the other kind alone."""
+    real_fsync = os.fsync
+
+    def fsync(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode) == directory:
+            raise OSError(errno.EIO, os.strerror(errno.EIO))
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+
+
+def _fail_fchmod(monkeypatch, err: int = errno.EIO) -> None:
+    def fchmod(fd, mode):
+        raise OSError(err, os.strerror(err))
+
+    monkeypatch.setattr(os, "fchmod", fchmod)
+
+
+@pytest.mark.parametrize(
+    ("source", "inject", "message"),
+    [
+        ("file", _fail_fchmod, "cannot copy .*Input/output error"),
+        (
+            "file",
+            functools.partial(_fail_fsync_of, directory=False),
+            "cannot copy .*Input/output error",
+        ),
+        (
+            "file",
+            functools.partial(_fail_fsync_of, directory=True),
+            "cannot durably publish .*Input/output error",
+        ),
+        (
+            "symlink",
+            functools.partial(_fail_fsync_of, directory=True),
+            "cannot durably publish .*Input/output error",
+        ),
+    ],
+    ids=["fchmod", "fsync-bytes", "fsync-directory", "fsync-directory-symlink"],
+)
+def test_a_copy_that_fails_removes_the_name_it_created(
+    tmp_path, monkeypatch, source, inject, message
+):
+    """The name exists before the bytes do, so every failure after it is
+    created -- restoring the permission bits (an EIO, not the refusal of a
+    filesystem that holds no bits; see the test after next), fsyncing the
+    bytes, fsyncing the directory that publishes the name (for a symbolic
+    link too) -- takes
+    it away again: a failed reservation leaves the directory as it was found
+    and the source untouched, so the caller never removes a source on the
+    strength of an archive that is not there."""
+    sentinel = Sentinel(tmp_path)
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    if source == "file":
+        (root_dir / "entry").write_bytes(b"corrupt\n")
+    else:
+        (root_dir / "entry").symlink_to(sentinel.path)
+    inject(monkeypatch)
+    with SafeRoot.open(root_dir) as root:
+        with pytest.raises(StateError, match=message):
+            root.copy_entry_exclusive("entry", "entry.copy")
+    assert [e.name for e in root_dir.iterdir()] == ["entry"]
+    if source == "file":
+        assert (root_dir / "entry").read_bytes() == b"corrupt\n"
+    else:
+        assert os.readlink(root_dir / "entry") == str(sentinel.path)
+    sentinel.assert_untouched()
+
+
+def test_a_fresh_name_that_fails_inspection_is_removed_and_nothing_else_is(tmp_path, monkeypatch):
+    """Between creating the destination and inspecting it, another name for
+    the new inode can appear (a concurrent hard link).  The write-side rule
+    that refuses a multiply-named file applies to the fresh destination too;
+    the refusal removes the name this process created and leaves the other
+    name, which is not its to remove, in place."""
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    (root_dir / "file.json").write_bytes(b"corrupt\n")
+    real_open = os.open
+
+    def open_then_link(name, flags, mode=0o777, *, dir_fd=None):
+        fd = real_open(name, flags, mode, dir_fd=dir_fd)
+        if flags & os.O_EXCL:
+            os.link(name, f"{name}.other", src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        return fd
+
+    monkeypatch.setattr(os, "open", open_then_link)
+    with SafeRoot.open(root_dir) as root:
+        with pytest.raises(UnsafePathError, match="hard link"):
+            root.copy_entry_exclusive("file.json", "file.copy")
+    assert sorted(e.name for e in root_dir.iterdir()) == ["file.copy.other", "file.json"]
+    assert (root_dir / "file.copy.other").lstat().st_nlink == 1
+    assert (root_dir / "file.copy.other").read_bytes() == b""
+    assert (root_dir / "file.json").read_bytes() == b"corrupt\n"
+
+
+def test_the_copy_carries_the_source_permission_bits_through_a_restrictive_umask(tmp_path):
+    """A hard link shares the source's mode; the copy must match it.  The
+    ``O_CREAT`` mode is filtered by the umask, so the bits are restored on
+    the open descriptor afterwards, and a umask that would strip group and
+    other access leaves the copy readable exactly as the source was."""
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    (root_dir / "file.json").write_bytes(b"corrupt\n")
+    (root_dir / "file.json").chmod(0o664)
+    previous = os.umask(0o077)
+    try:
+        with SafeRoot.open(root_dir) as root:
+            root.copy_entry_exclusive("file.json", "file.copy")
+    finally:
+        os.umask(previous)
+    assert stat.S_IMODE((root_dir / "file.copy").lstat().st_mode) == 0o664
+    assert stat.S_IMODE((root_dir / "file.json").lstat().st_mode) == 0o664
+    assert (root_dir / "file.copy").read_bytes() == b"corrupt\n"
+
+
+@pytest.mark.parametrize(
+    "err",
+    sorted({errno.EPERM, errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP}),
+    ids=errno.errorcode.__getitem__,
+)
+def test_the_copy_completes_where_the_filesystem_holds_no_permission_bits(
+    tmp_path, monkeypatch, err
+):
+    """The filesystems this copy exists for (no link(2)) tend to refuse
+    fchmod(2) the same way and for the same reason: they hold no mode bits,
+    source and copy alike are shown synthesized ones.  That refusal must not
+    fail the copy, or the fallback is unavailable exactly where it is needed
+    (a FUSE daemon implementing neither link nor chmod says ENOSYS to both).
+    The copy then carries whatever O_CREAT under the umask gave it -- a
+    subset of the source's bits, never more -- and the bytes, which are the
+    point.  Any other fchmod errno stays fatal (the EIO case of
+    test_a_copy_that_fails_removes_the_name_it_created)."""
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    (root_dir / "file.json").write_bytes(b"corrupt\n")
+    (root_dir / "file.json").chmod(0o664)
+    _fail_fchmod(monkeypatch, err)
+    previous = os.umask(0o077)
+    try:
+        with SafeRoot.open(root_dir) as root:
+            root.copy_entry_exclusive("file.json", "file.copy")
+    finally:
+        os.umask(previous)
+    copied = (root_dir / "file.copy").lstat()
+    assert stat.S_ISREG(copied.st_mode) and copied.st_nlink == 1
+    assert (root_dir / "file.copy").read_bytes() == b"corrupt\n"
+    # No bits the source lacks; here the umask took group and other away.
+    assert stat.S_IMODE(copied.st_mode) & ~0o664 == 0
+    assert stat.S_IMODE(copied.st_mode) == 0o600
+    assert stat.S_IMODE((root_dir / "file.json").lstat().st_mode) == 0o664
+    assert sorted(e.name for e in root_dir.iterdir()) == ["file.copy", "file.json"]
+
+
+@pytest.mark.parametrize(
+    "err",
+    sorted({errno.EPERM, errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP}),
+    ids=errno.errorcode.__getitem__,
+)
+def test_link_reports_a_filesystem_without_hard_links_as_its_own_fact(tmp_path, monkeypatch, err):
+    """What vfat/exFAT, FUSE, SMB and overlay mounts (and protected_hardlinks)
+    report is the typed refusal a caller can fall back from; any other failure
+    of the link stays a plain StateError."""
+    from autoforge.safefs import HardLinksUnavailable
+
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    (root_dir / "file.json").write_bytes(b"x")
+    failures = iter([err, errno.EIO])
+
+    def failing_link(src, dst, *args, **kwargs):
+        code = next(failures)
+        raise OSError(code, os.strerror(code), os.fspath(dst))
+
+    monkeypatch.setattr(os, "link", failing_link)
+    with SafeRoot.open(root_dir) as root:
+        with pytest.raises(HardLinksUnavailable, match="makes no hard link here"):
+            root.link("file.json", "file.link")
+        with pytest.raises(StateError, match="Input/output error") as info:
+            root.link("file.json", "file.link")
+        assert not isinstance(info.value, HardLinksUnavailable)
+    assert [e.name for e in root_dir.iterdir()] == ["file.json"]
 
 
 # -- #55: the append reads the file, so the read is bounded like any other ------
