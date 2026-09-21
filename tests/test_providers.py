@@ -67,7 +67,17 @@ def test_opencode_argv_shape():
     assert argv[argv.index("--variant") + 1] == "high"
     assert argv[argv.index("--format") + 1] == "default"
     assert "--auto" not in argv
-    assert argv[-1] == "review $(id)"
+    assert argv[-2:] == ["--", "review $(id)"]  # prompt is one literal element
+
+
+def test_opencode_prompt_starting_with_a_dash_is_not_a_flag():
+    """#7 (item 5): `--` ends option parsing, so a prompt beginning with `-`
+    reaches opencode as the message instead of being parsed as an option."""
+    p = default_config().profile("review_round_1")
+    argv = OpenCodeProvider().build_command_for(p, "--help")
+    assert argv[-2:] == ["--", "--help"]
+    # Every option precedes the separator; nothing follows it but the prompt.
+    assert argv.index("--") > argv.index("--format")
 
 
 def test_opencode_auto_flag_and_extra_args():
@@ -80,7 +90,7 @@ def test_opencode_auto_flag_and_extra_args():
         options={"auto_approve": "true"},
     )
     argv = OpenCodeProvider().build_command_for(p, "x")
-    assert "--auto" in argv and argv[-3:] == ["--agent", "reviewer", "x"]
+    assert "--auto" in argv and argv[-4:] == ["--agent", "reviewer", "--", "x"]
 
 
 def test_opencode_requires_provider_slash_model():

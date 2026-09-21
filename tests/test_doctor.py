@@ -197,6 +197,22 @@ def test_bad_config_reported(tmp_path):
     assert not results["config"].ok and "effort" in results["config"].detail
 
 
+def test_doctor_requires_the_same_profiles_as_a_remote_run(tmp_path):
+    """#7 (item 3): `doctor` and the engine share one REQUIRED_PROFILES.
+
+    The two copies had drifted: `doctor` did not require `replan_reexecute`,
+    so it passed a config that `ControllerEngine.validate_config` refuses.
+    """
+    from autoforge.profiles import REQUIRED_PROFILES
+
+    assert "replan_reexecute" in REQUIRED_PROFILES
+    cfg = tmp_path / "c.json"
+    cfg.write_text('{"version": 1, "profiles": {"replan_reexecute": {"model": ""}}}')
+    d = Doctor(config_path=str(cfg), cwd=str(tmp_path), runner=_runner_factory())
+    results = {r.name: r for r in d.run_all()}
+    assert not results["config"].ok and "replan_reexecute" in results["config"].detail
+
+
 def test_merge_gate_reported_with_its_source(tmp_path):
     """AF-SEC-001: doctor shows the effective gate state and which line set it."""
     d = Doctor(cwd=str(tmp_path), runner=_runner_factory())

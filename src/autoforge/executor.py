@@ -49,7 +49,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import IO
 
@@ -590,15 +590,3 @@ def execute(req: ExecutionRequest) -> ExecutionResult:
         group_survived_kill=left.group_survived,
         capture_abandoned=left.capture_abandoned,
     )
-
-
-@dataclass
-class AgentInvocation:
-    """A single agent (Claude Code / OpenCode) invocation plan."""
-
-    profile_name: str
-    provider: str
-    model: str
-    effort: str
-    command: list[str] = field(default_factory=list)
-    timeout_seconds: int = 1800

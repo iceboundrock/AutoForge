@@ -170,7 +170,7 @@ from .premerge import (
     export_commit_tree,
     fetch_pr_head,
 )
-from .profiles import local_required_profiles, profile_for_phase
+from .profiles import REQUIRED_PROFILES, local_required_profiles, profile_for_phase
 from .prompts import (
     COMMON_TEMPLATE,
     LOCAL_COMMON_TEMPLATE,
@@ -303,15 +303,6 @@ FIX_BOUND_VARIABLES: dict[str, str | int | None] = {
 # ``resume`` forever.
 MAX_LOCAL_PHASE_ATTEMPTS = 3
 
-
-REQUIRED_PROFILES = [
-    "analyze_execute",
-    "fix",
-    "review_round_1",
-    "review_round_2_5",
-    "review_round_6_plus",
-    "replan_reexecute",
-]
 
 MERGE_GATE_MESSAGE = (
     "Automatic merge is disabled in this milestone: MERGE requires BOTH config "
