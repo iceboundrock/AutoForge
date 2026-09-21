@@ -414,6 +414,45 @@ def test_non_mapping_yaml_root_rejected_on_both_backends(tmp_path, yaml_backend,
         load_config_file(p)
 
 
+# The subset parser used to raise ConfigurationError itself, so its errors
+# skipped the `cannot parse config <path>:` wrapper every other backend's
+# parse error goes through and never said which file was at fault.
+@pytest.mark.parametrize(
+    "text, detail",
+    [
+        ("version: 1\n  safety:\n    allow_merge: false\n", "bad indentation at: 'safety:'"),
+        ("version: 1\nsafety\n", "cannot parse line: 'safety'"),
+        ("version: 1\nsafety:\n  allow_merge false\n", "cannot parse line: 'allow_merge false'"),
+    ],
+)
+def test_yaml_subset_parse_errors_name_the_config_path(tmp_path, no_pyyaml, text, detail):
+    p = tmp_path / "cfg.yaml"
+    p.write_text(text, encoding="utf-8")
+    with pytest.raises(ConfigurationError) as excinfo:
+        load_config_file(p)
+    message = str(excinfo.value)
+    assert message.startswith(f"cannot parse config {p}: YAML subset parser: {detail}")
+    assert message.endswith("install PyYAML for full YAML support")
+
+
+def test_yaml_subset_non_mapping_root_names_the_config_path(tmp_path, no_pyyaml):
+    """A list root is refused by the same root check, and message, as under PyYAML."""
+    p = tmp_path / "cfg.yaml"
+    p.write_text("- item\n", encoding="utf-8")
+    with pytest.raises(ConfigurationError) as excinfo:
+        load_config_file(p)
+    assert str(excinfo.value) == f"config {p} must contain a mapping at top level"
+
+
+def test_yaml_parse_errors_name_the_config_path_on_both_backends(tmp_path, yaml_backend):
+    """Whichever backend read the file, a malformed document is reported with its path."""
+    p = tmp_path / "cfg.yaml"
+    p.write_text("version: 1\n  safety:\n    allow_merge: false\n", encoding="utf-8")
+    with pytest.raises(ConfigurationError) as excinfo:
+        load_config_file(p)
+    assert str(excinfo.value).startswith(f"cannot parse config {p}: ")
+
+
 @pytest.mark.parametrize("text", ["", "# nothing but a comment\n", "\n\n"])
 def test_empty_yaml_document_is_the_defaults(tmp_path, yaml_backend, text):
     """No content is the one non-mapping root that means "all defaults"."""
