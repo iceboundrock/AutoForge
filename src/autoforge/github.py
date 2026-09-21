@@ -482,6 +482,8 @@ _PR_FIELDS = (
 # merge gate fails closed on it, which is the honest answer for a PR too
 # large for the controller to prove anything about.
 _PR_FILES_PAGE_SIZE = 100
+# Page size of the issue-event listing behind the replan close watermark.
+_EVENTS_PAGE_SIZE = 100
 # Page sizes of the Actions listings behind the check-definition gate.
 _JOBS_PAGE_SIZE = 100
 _RUNS_PAGE_SIZE = 100
@@ -1164,6 +1166,39 @@ class GitHubClient:
         if isinstance(total, bool) or not isinstance(total, int) or total < 0:
             raise GitHubError(f"changedFiles of {ref.canonical} is not a count: {total!r}")
         return ChangedFiles(files=tuple(files), total=total)
+
+    def get_pr_close_event_count(self, url: str) -> int:
+        """How many times the PR has been closed so far, from its issue events.
+
+        The replan transaction records this immediately before it persists
+        its close intent (#69). Issue events are append-only: GitHub writes a
+        ``closed`` event for every close (a merge included) and no actor can
+        delete one, so a count that is higher on a later read proves a close
+        happened in between, and an equal count proves none did -- whoever
+        would have performed it. That is what lets a resume that finds the
+        source OPEN under a recorded intent distinguish "the close never
+        ran" from "it landed, lost its receipt to a crash, and a human
+        reopened the PR" without comparing clocks and without turning the
+        absence of a comment into a licence to close.
+
+        Read through the REST issue-events endpoint (a PR is an issue there),
+        every page (``gh api --paginate --slurp``), and counted strictly: an
+        entry without a string ``event`` name is a malformed answer, refused
+        rather than skipped, because a skipped event would lower the count
+        and a lower count is what licenses the retry.
+        """
+        ref = parse_pr_url(url)
+        endpoint = f"repos/{ref.repository}/issues/{ref.number}/events"
+        count = 0
+        for entry in self._api_pages(f"{endpoint}?per_page={_EVENTS_PAGE_SIZE}"):
+            kind = entry.get("event") if isinstance(entry, dict) else None
+            if not isinstance(kind, str) or not kind:
+                raise GitHubError(
+                    f"issue events of {ref.canonical} contain an unusable entry: {entry!r:.200}"
+                )
+            if kind == "closed":
+                count += 1
+        return count
 
     def get_pr_merge_queue_status(self, url: str) -> MergeQueueStatus:
         """Whether the PR's base branch requires a merge queue / the PR is enqueued.

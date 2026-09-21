@@ -330,14 +330,14 @@ def test_protocol_1_is_migrated_only_without_a_replan_in_flight(tmp_path):
     """
     path = tmp_path / "state.json"
     base = make_state().to_dict()
-    assert base["protocol_version"] == "4"
+    assert base["protocol_version"] == "5"
     for journal in ({}, {"stage": "rejected", "rejection_reason": "refused by verification"}):
         data = dict(base, protocol_version="1", replan_transaction=journal)
         path.write_text(json.dumps(data), encoding="utf-8")
         loaded = load_state(path)
-        assert loaded.protocol_version == "4" and loaded.replan_transaction == journal
+        assert loaded.protocol_version == "5" and loaded.replan_transaction == journal
         save_state(loaded, path)
-        assert json.loads(path.read_text())["protocol_version"] == "4"
+        assert json.loads(path.read_text())["protocol_version"] == "5"
     in_flight = {
         "stage": "prepared",
         "transaction_id": "a" * 32,
@@ -355,9 +355,9 @@ def test_protocol_1_is_migrated_only_without_a_replan_in_flight(tmp_path):
     assert "replacement PR (none)" in message
     assert "corrupt" not in message
     assert path.read_text(encoding="utf-8") == raw
-    data["protocol_version"] = "5"
+    data["protocol_version"] = "6"
     path.write_text(json.dumps(data), encoding="utf-8")
-    with pytest.raises(StateError, match="unsupported protocol_version '5'"):
+    with pytest.raises(StateError, match="unsupported protocol_version '6'"):
         load_state(path)
     # The type check still owns a journal that is not an object, whatever
     # the label says.
@@ -438,7 +438,7 @@ def test_protocol_2_is_relabelled_outside_the_merge_phases(tmp_path, phase):
         del data[missing]
     path.write_text(json.dumps(data), encoding="utf-8")
     loaded = load_state(path)
-    assert loaded.protocol_version == "4" and loaded.phase == phase
+    assert loaded.protocol_version == "5" and loaded.phase == phase
     assert (loaded.reviewed_pr_url, loaded.reviewed_base_ref, loaded.current_base_ref) == (
         "",
         "",
@@ -447,7 +447,7 @@ def test_protocol_2_is_relabelled_outside_the_merge_phases(tmp_path, phase):
     assert (loaded.reviewed_merge_base_sha, loaded.current_merge_base_sha) == ("", "")
     assert loaded.reviewed_head_sha == "a" * 40  # what protocol 2 did record is kept
     save_state(loaded, path)
-    assert json.loads(path.read_text())["protocol_version"] == "4"
+    assert json.loads(path.read_text())["protocol_version"] == "5"
 
 
 @pytest.mark.parametrize("phase", [Phase.READY_FOR_MERGE, Phase.MERGE])
@@ -488,7 +488,7 @@ def test_protocol_3_is_refused_in_the_merge_phases(tmp_path, phase):
 )
 def test_protocol_3_is_relabelled_outside_the_merge_phases(tmp_path, phase):
     """#96: everywhere else the next review writes the merge base, so a
-    protocol-3 file with no replan in flight is a protocol-4 file with an
+    protocol-3 file with no replan in flight is a current file with an
     old label, an empty merge base and the rest of the binding kept."""
     path = tmp_path / "state.json"
     rejected = {"stage": "rejected", "rejection_reason": "refused by verification"}
@@ -499,12 +499,12 @@ def test_protocol_3_is_relabelled_outside_the_merge_phases(tmp_path, phase):
             del data[missing]
         path.write_text(json.dumps(data), encoding="utf-8")
         loaded = load_state(path)
-        assert loaded.protocol_version == "4" and loaded.phase == phase
+        assert loaded.protocol_version == "5" and loaded.phase == phase
         assert (loaded.reviewed_merge_base_sha, loaded.current_merge_base_sha) == ("", "")
         assert loaded.reviewed_pr_url == PR42 and loaded.reviewed_base_ref == "main"
         assert loaded.replan_transaction == journal
         save_state(loaded, path)
-        assert json.loads(path.read_text())["protocol_version"] == "4"
+        assert json.loads(path.read_text())["protocol_version"] == "5"
 
 
 @pytest.mark.parametrize("phase", list(Phase))
@@ -540,6 +540,88 @@ def test_protocol_3_is_refused_with_a_replan_in_flight(tmp_path, phase):
     assert "does not reconstruct it from the merge base GitHub reports now" in message
     assert "did not record which merge base" not in message
     assert "corrupt" not in message
+    assert path.read_text(encoding="utf-8") == raw
+
+
+@pytest.mark.parametrize("phase", list(Phase))
+def test_protocol_4_is_relabelled_in_every_phase_without_a_replan_past_the_write(tmp_path, phase):
+    """#69: the 4 -> 5 step added the closed-event watermark and the attempt
+    count to the replan close intent and changed nothing about the review
+    binding, so a protocol-4 file is loaded in every phase -- the merge
+    phases included -- when its journal is empty, terminal, or still before
+    the write (a protocol-4 journal at PENDING, PREPARED or VERIFIED is
+    byte-for-byte what protocol 5 writes there). The label is rewritten on
+    the next save."""
+    path = tmp_path / "state.json"
+    rejected = {"stage": "rejected", "rejection_reason": "refused by verification"}
+    in_flight_before_the_write = {
+        "stage": "prepared",
+        "transaction_id": "a" * 32,
+        "issue_url": "https://github.com/owner/repo/issues/7",
+        "decision_pr_url": PR42,
+        "decision_head_sha": "a" * 40,
+        "decision_branch": "autoforge/7",
+        "decision_base_ref": "main",
+        "decision_merge_base_sha": "b" * 40,
+        "source_pr_url": PR42,
+        "source_branch": "autoforge/7",
+        "source_head_sha": "a" * 40,
+        "source_base_ref": "main",
+        "source_merge_base_sha": "b" * 40,
+        "base_branch": "main",
+        "evidence_finding_count": 1,
+        "rendered_findings": "- R1-F1",
+        "rendered_observations": "(none)",
+        "rendered_verification_failures": "(none)",
+        "preexisting_pr_urls": [PR42],
+        "pr_number_watermark": 42,
+        "expected_execution_attempt": 2,
+        "escalation": {"trigger": "hard_review_round_threshold"},
+    }
+    for journal in ({}, rejected, in_flight_before_the_write):
+        data = _clean_review_state(phase=phase, replan_transaction=journal).to_dict()
+        data["protocol_version"] = "4"
+        data["controller_version"] = "0.4.0"
+        path.write_text(json.dumps(data), encoding="utf-8")
+        loaded = load_state(path)
+        assert loaded.protocol_version == "5" and loaded.phase == phase
+        assert loaded.replan_transaction == journal
+        assert loaded.reviewed_merge_base_sha == "d" * 40  # the binding is kept whole
+        save_state(loaded, path)
+        assert json.loads(path.read_text())["protocol_version"] == "5"
+
+
+@pytest.mark.parametrize("phase", list(Phase))
+@pytest.mark.parametrize("stage", ["supersede_intent", "compensating", "superseded"])
+def test_protocol_4_is_refused_with_a_replan_past_the_write(tmp_path, phase, stage):
+    """#69: protocol 4 did not record, with the close intent, the source PR's
+    closed-event count or the number of close attempts, so a protocol-4 file
+    whose replan has reached the write is refused in every phase -- never
+    migrated by reading the count GitHub reports now (that would record the
+    very close the watermark exists to detect as if it predated the intent),
+    and never handed to the journal loader to be called corrupt."""
+    path = tmp_path / "state.json"
+    in_flight = {
+        "stage": stage,
+        "transaction_id": "a" * 32,
+        "source_pr_url": PR42,
+        "replacement_pr_url": "https://github.com/owner/repo/pull/43",
+        "close_intent_at": "2026-01-01T00:00:00+00:00",
+    }
+    data = _clean_review_state(phase=phase, replan_transaction=in_flight).to_dict()
+    data["protocol_version"] = "4"
+    data["controller_version"] = "0.4.0"
+    raw = json.dumps(data)
+    path.write_text(raw, encoding="utf-8")
+    with pytest.raises(StateError) as info:
+        load_state(path)
+    message = str(info.value)
+    assert "written by controller 0.4.0 under protocol_version '4'" in message
+    assert "replan in flight" in message and f"stage {stage!r}" in message
+    assert "pull/42" in message and "pull/43" in message
+    assert "did not record the source PR's closed-event count and the number of close" in message
+    assert "does not reconstruct them from the events GitHub reports now" in message
+    assert "merge base" not in message and "corrupt" not in message
     assert path.read_text(encoding="utf-8") == raw
 
 

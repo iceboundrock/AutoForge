@@ -242,7 +242,7 @@ def _validate_local_pending(state: AutoForgeState) -> None:
 # each subject to the boundary rules its successors introduced (see
 # :meth:`AutoForgeState.from_dict`). Every step so far changed the replan
 # journal, so the set is the journal's; protocols 2 and 3 also changed the
-# review binding (``_REVIEW_BINDING_GAPS``).
+# review binding (``_REVIEW_BINDING_GAPS``), protocol 4 only the journal.
 _LEGACY_PROTOCOLS = LEGACY_JOURNAL_PROTOCOLS
 # The phases in which the persisted clean review is consumed by the merge
 # gate, and so the phases a state without the review's full binding cannot
@@ -250,7 +250,8 @@ _LEGACY_PROTOCOLS = LEGACY_JOURNAL_PROTOCOLS
 _MERGE_PHASES = (Phase.READY_FOR_MERGE, Phase.MERGE)
 # What each pre-protocol-4 label failed to record about the completed
 # review, for the refusal text: the binding the merge gate requires that
-# the file cannot supply.
+# the file cannot supply. A legacy label absent here (protocol 4) recorded
+# the review whole; only its replan journal is subject to a boundary rule.
 _REVIEW_BINDING_GAPS = {
     "1": "which PR and base branch that review was posted on",
     "2": "which PR and base branch that review was posted on",
@@ -281,7 +282,7 @@ def _legacy_review_binding_refusal(
 
     ``data`` is read defensively: this runs before any schema check.
     """
-    if phase not in _MERGE_PHASES:
+    if phase not in _MERGE_PHASES or protocol not in _REVIEW_BINDING_GAPS:
         return ""
 
     def _text(name: str) -> str:
@@ -562,6 +563,16 @@ class AutoForgeState:
         #   protocol-2 one is, for the merge base instead of the PR and base;
         #   in any other phase the next review writes the binding and the
         #   file is loaded as is.
+        # - 4 -> 5: the replan journal records, with the close intent, the
+        #   source PR's closed issue-event count and the number of close
+        #   attempts, which is what lets a resume that finds the source OPEN
+        #   prove the close never ran and retry it once (#69). The review
+        #   binding did not change, so a protocol-4 file is loaded in every
+        #   phase; only a replan journal at SUPERSEDE_INTENT or later is
+        #   refused, and never migrated by reading the count GitHub reports
+        #   now (which would record the close the field exists to detect as
+        #   if it predated the intent). A journal before the write is written
+        #   exactly as protocol 5 writes it and is loaded as such.
         #
         # The label is rewritten on the next save. A file that is refused is
         # left unchanged (``run --force`` moves it aside like any unreadable

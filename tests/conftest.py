@@ -267,6 +267,14 @@ class FakeGitHub:
         # (GitHubUnavailableError for a transient failure), a str is conclusive.
         self.close_error: str | GitHubError = ""
         self.close_leaves_open: bool = False  # gh exits 0 but the PR stays OPEN
+        # The `closed` issue events of each PR, keyed as `_stored` resolves a
+        # URL; appended by every close that lands (the fake's `close_pr`, or
+        # `add_close_event` for a human's) and never removed, as GitHub's
+        # timeline is append-only. Read by `get_pr_close_event_count`, the
+        # replan close watermark (#69). ``close_events_error`` makes that read
+        # raise instead (GitHubUnavailableError for a transient failure).
+        self.close_events: dict[tuple[str, int], int] = {}
+        self.close_events_error: GitHubError | None = None
         self.comment_error: str | GitHubError = ""  # non-empty -> comment_pr raises
         # Called at the start of comment_pr: a mutation racing a comment write.
         # The replan's post-close receipt is the interesting one -- it lands
@@ -459,6 +467,25 @@ class FakeGitHub:
 
     def _same_repo(self, repository: str, repo: str) -> bool:
         return repository.lower() == repo.lower()
+
+    def _events_key(self, url: str) -> tuple[str, int]:
+        pr = self._stored(url)  # fails closed on unknown PR, like `gh api`
+        return (pr.repository.lower(), pr.number)
+
+    def add_close_event(self, url: str) -> None:
+        """Record a close that landed outside the fake's `close_pr` (a human's).
+
+        Tests that set a PR's state to CLOSED by hand call this too, so the
+        PR's timeline says what its state says.
+        """
+        key = self._events_key(url)
+        self.close_events[key] = self.close_events.get(key, 0) + 1
+
+    def get_pr_close_event_count(self, url: str) -> int:
+        self.calls.append(("get_pr_close_event_count", url))
+        if self.close_events_error is not None:
+            raise self.close_events_error
+        return self.close_events.get(self._events_key(url), 0)
 
     def get_pr(self, url: str) -> PRInfo:
         self.calls.append(("get_pr", url))
@@ -710,6 +737,7 @@ class FakeGitHub:
             raise GitHubError(f"cannot close PR {canonical}: it is {pr.state}")
         if not self.close_leaves_open:
             pr.state = "CLOSED"
+            self.add_close_event(canonical)
 
     def comment_pr(self, url: str, body: str) -> None:
         from autoforge.validation import parse_pr_url

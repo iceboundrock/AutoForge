@@ -25,6 +25,13 @@ Lifecycle (monotonic; ``REJECTED`` is terminal)::
 moved; it is persisted *before* the reopen, so a crash after a successful
 reopen resumes into "finish undoing", never into "close again".
 
+``SUPERSEDE_INTENT`` is written *before* ``gh pr close``, together with the
+source PR's ``closed`` issue-event count. Issue events are append-only, so a
+resume that finds the source still OPEN can prove from that count whether any
+close landed after the intent: none did, and the close is retried once
+(:func:`verify_close_never_ran`); one did, and the reopen that followed is a
+human decision the controller never overrides.
+
 ``PREPARED`` is written *before* the agent is invoked, and carries the
 transaction id. Because that id cannot exist anywhere before it is persisted,
 "crashed before invoking the agent" and "crashed while the agent ran" are the
@@ -124,10 +131,12 @@ def render_close_receipt(transaction_id: str) -> str:
     transaction was closed by this transaction, and one found CLOSED without it
     cannot be attributed to it -- a human may have closed it, or the controller
     may have crashed between its close and the receipt -- which is a refusal,
-    not an adoption. The same gap is why a source found OPEN under a recorded
-    intent is never closed from a resume: without the receipt, "the close never
-    ran" and "it landed, lost its receipt to a crash, and a human reopened the
-    PR" are the same evidence, and only a refusal is safe against both.
+    not an adoption. The same gap is why the receipt alone never licenses a
+    resume to close a source found OPEN under a recorded intent: without it,
+    "the close never ran" and "it landed, lost its receipt to a crash, and a
+    human reopened the PR" are the same evidence. What tells them apart is the
+    source's ``closed`` issue-event count, recorded with the intent and
+    compared by :func:`verify_close_never_ran` (#69).
 
     This is crash-recovery attribution, not authentication: the transaction id
     is published in the replacement PR body, so a human who wanted to could
@@ -146,6 +155,14 @@ def has_close_receipt(comment_bodies: Iterable[str], transaction_id: str) -> boo
         for body in comment_bodies
         for match in CLOSE_RECEIPT_RE.finditer(body or "")
     )
+
+
+#: How many times the controller may call ``gh pr close`` on one source PR
+#: under one transaction: the write itself, and one retry from a resume that
+#: proved the write never landed (#69). Every retry is safe on the evidence,
+#: but a close that keeps failing to land is a fault a human should look at,
+#: not one to keep retrying; the bound is what "retries exactly once" means.
+MAX_CLOSE_ATTEMPTS = 2
 
 
 class ReplanStage(StrEnum):
@@ -476,7 +493,13 @@ _REQUIRED_AT_STAGE: dict[ReplanStage, tuple[str, ...]] = {
         "replacement_head_sha",
         "attested_findings_considered",
     ),
-    ReplanStage.SUPERSEDE_INTENT: ("close_intent_at",),
+    # The intent is written with the time, the number of close attempts it
+    # covers (1 for the write, 2 once a resume retried it) and the source
+    # PR's ``closed`` event count read just before it (#69). The count is
+    # what a resume compares GitHub against before it may retry, so an
+    # intent without it can only be refused; it is 0 for a source that was
+    # never closed before, so it is required present, not non-zero.
+    ReplanStage.SUPERSEDE_INTENT: ("close_intent_at", "close_attempts"),
     # Both follow SUPERSEDE_INTENT and are alternatives to each other.
     ReplanStage.COMPENSATING: ("compensating_at", "compensation_reason"),
     ReplanStage.SUPERSEDED: ("superseded_at",),
@@ -484,13 +507,17 @@ _REQUIRED_AT_STAGE: dict[ReplanStage, tuple[str, ...]] = {
 # Written together with the stage, but 0 is an honest value: present-or-corrupt.
 _PRESENT_AT_STAGE: dict[ReplanStage, tuple[str, ...]] = {
     ReplanStage.VERIFIED: ("attested_unique_constraints",),
+    ReplanStage.SUPERSEDE_INTENT: ("source_closed_event_count",),
 }
 
 
 #: Stages at which the controller has committed to closing the source PR:
 #: the intent is durable, and the close may already have landed. From here
 #: the reducer only reads, confirms, and then activates the replacement or
-#: undoes the close; it invokes no agent and never closes from a resume.
+#: undoes the close; it invokes no agent. The one write it may still perform
+#: is the bounded retry of the close at ``SUPERSEDE_INTENT``, and only once
+#: the source's issue events have proven the first attempt never landed
+#: (:func:`verify_close_never_ran`).
 CLOSE_BEGUN_STAGES: frozenset[ReplanStage] = frozenset(
     {ReplanStage.SUPERSEDE_INTENT, ReplanStage.COMPENSATING, ReplanStage.SUPERSEDED}
 )
@@ -627,6 +654,19 @@ class ReplanTransaction:
 
     # -- destructive write ------------------------------------------------
     close_intent_at: str = ""
+    # The source PR's ``closed`` issue-event count, read from GitHub after
+    # the pre-close checkpoint held and immediately before the intent was
+    # persisted (#69). Issue events are append-only and undeletable, so a
+    # resume that finds the source OPEN can compare: a higher count proves a
+    # close landed after the intent (this transaction's, or a human's; either
+    # way the reopen that followed is the last word) and refuses; an equal
+    # count proves no close has happened since and licenses the one retry.
+    # Absence of a comment never decides a write; this count does.
+    source_closed_event_count: int = 0
+    # How many times ``gh pr close`` has been called under this intent: 1 by
+    # the write, 2 by the retry a resume performed. Bounded by
+    # ``MAX_CLOSE_ATTEMPTS``.
+    close_attempts: int = 0
     superseded_at: str = ""
 
     # -- compensation -----------------------------------------------------
@@ -742,8 +782,9 @@ def budget_may_stop(txn: ReplanTransaction) -> bool:
     (``PENDING``, ``PREPARED``, ``VERIFIED``): blocking there leaves the
     source open with its findings and needs nothing recorded. From
     ``SUPERSEDE_INTENT`` on, the persisted intent is a decision the
-    controller finishes -- what remains is read, confirm and activate, or
-    read, confirm and reopen, with no agent and no close from a resume -- so
+    controller finishes -- what remains is read, confirm and activate, read,
+    confirm and reopen, or the one retry of a close GitHub proves never ran,
+    with no agent -- so
     the step counts and the budget ends the run at the next phase boundary
     instead of inside the transaction, where a plain budget block would
     strand a source the controller closed with nothing recorded about it
@@ -794,7 +835,17 @@ def may_invoke_agent(txn: ReplanTransaction) -> bool:
 # review of the diff it used to show (#96). Filling it from the merge base
 # GitHub reports *now* would bind the decision to exactly the rewrite the
 # field exists to detect, so a protocol-3 journal in flight is refused like
-# the others.
+# the others. 4 -> 5 added the source PR's ``closed`` issue-event count and
+# the close attempt count to the intent (``source_closed_event_count`` and
+# ``close_attempts`` at SUPERSEDE_INTENT), so that a resume finding the
+# source OPEN under an intent could prove the close never ran and retry it
+# once instead of blocking (#69). This step touched no stage before the
+# write: a protocol-4 journal at PENDING, PREPARED or VERIFIED is exactly
+# what protocol 5 writes there and is loaded as such. One at
+# SUPERSEDE_INTENT, COMPENSATING or SUPERSEDED is refused like the others:
+# reading the count *now* would record the very close it exists to detect
+# as if it predated the intent, and would license the retry the field was
+# added to forbid in that case.
 # ---------------------------------------------------------------------------
 
 #: The binding each legacy protocol's journal lacks, as the refusal states
@@ -812,9 +863,23 @@ _LEGACY_JOURNAL_GAPS: dict[str, str] = {
         "did not record the merge base the review that decided the replan was bound to, and "
         "this controller does not reconstruct it from the merge base GitHub reports now"
     ),
+    "4": (
+        "did not record the source PR's closed-event count and the number of close attempts "
+        "with the close intent, and this controller does not reconstruct them from the events "
+        "GitHub reports now"
+    ),
 }
+#: The in-flight stages at which each legacy protocol's gap matters. A
+#: protocol whose step changed a field written at ``PENDING`` lacks it at
+#: every later stage, so every in-flight stage is refused; a step that only
+#: added to a later stage's record leaves the earlier stages' journals
+#: identical to the current schema, and those load as current.
+_LEGACY_GAP_STAGES: dict[str, frozenset[str]] = {
+    "4": frozenset(stage.value for stage in CLOSE_BEGUN_STAGES),
+}
+_STAGE_VALUES: frozenset[str] = frozenset(stage.value for stage in ReplanStage)
 #: Protocol labels whose journal schema this controller can still describe
-#: (and so refuse in flight) but cannot load.
+#: (and so refuse in flight) but cannot load whole.
 LEGACY_JOURNAL_PROTOCOLS: frozenset[str] = frozenset(_LEGACY_JOURNAL_GAPS)
 
 _LEGACY_STAGE_FATES: dict[str, str] = {
@@ -860,7 +925,9 @@ def legacy_journal_refusal(raw: object, *, protocol: str, written_by: str) -> st
     PRs, the binding the protocol lacks, what that stage implies about the
     source PR, and the two ways out -- finish or undo the transaction with
     the controller that wrote it, or resolve it by hand on GitHub and start a
-    new run.
+    new run. Where the protocol step only added to a later stage's record
+    (``_LEGACY_GAP_STAGES``), a journal at an earlier stage is written
+    exactly as the current schema writes it and loads as current.
 
     ``raw`` is read defensively: this runs before any schema check, so a
     non-object journal is left for the state's own type check, and an
@@ -872,6 +939,9 @@ def legacy_journal_refusal(raw: object, *, protocol: str, written_by: str) -> st
         return ""
     stage = raw.get("stage")
     if stage == ReplanStage.REJECTED.value:
+        return ""
+    scoped = _LEGACY_GAP_STAGES.get(protocol)
+    if scoped is not None and stage in _STAGE_VALUES and stage not in scoped:
         return ""
 
     def _text(name: str) -> str:
@@ -1492,6 +1562,65 @@ def verify_closed_source(pr: PRInfo, txn: ReplanTransaction, merge_base_sha: str
             "the newer work was never reviewed against this replan decision"
         )
     return _source_merge_base_drift(merge_base_sha, txn, when)
+
+
+def verify_close_never_ran(closed_event_count: int, txn: ReplanTransaction) -> str:
+    """Why a source found OPEN under a recorded intent may not be closed now, or ``""``.
+
+    ``SUPERSEDE_INTENT`` proves an intended write, never a performed one, and
+    the receipt proves a performed one only when it was published: a crash
+    between ``gh pr close`` landing and the receipt, followed by a human
+    reopen, leaves an OPEN source with no receipt -- the same evidence a crash
+    *before* the close leaves -- and only the first of those is a human
+    decision a retry would override (R11-F1). Absence of a comment therefore
+    never licenses the write. What does is GitHub's own timeline: the intent
+    records the source's ``closed`` issue-event count, read immediately
+    before it was persisted, and issue events are append-only and cannot be
+    deleted by anyone, so ``closed_event_count`` -- the same count read now
+    -- is proof-grade either way (#69):
+
+    - higher than the watermark: a close landed after the intent, this
+      transaction's or a human's, and the PR is OPEN again, so a reopen
+      followed it and is the last word. Refused; never closed again.
+    - lower: impossible for an append-only log, so the watermark is not this
+      PR's (a substituted journal) or the listing was not read whole. Refused.
+    - equal: no close of any kind has happened since the intent. The write
+      never ran, and the caller may perform it -- through the same pre-close
+      revalidation as the first attempt, and at most ``MAX_CLOSE_ATTEMPTS``
+      times in total, so a close that keeps failing to land is handed to a
+      human rather than retried indefinitely.
+
+    Pure: the caller reads the count and persists the incremented attempt
+    before the write, exactly as the first intent was persisted.
+    """
+    if txn.stage is not ReplanStage.SUPERSEDE_INTENT:
+        return (
+            f"the replan transaction is at stage {txn.stage.value!r}, not under a recorded "
+            "close intent, so there is no close to retry"
+        )
+    if closed_event_count > txn.source_closed_event_count:
+        return (
+            f"source PR {txn.source_pr_url} is open under a recorded close intent for replan "
+            f"transaction {txn.transaction_id}, and its closed-event count rose from "
+            f"{txn.source_closed_event_count} at the intent to {closed_event_count}: a close "
+            "landed after the intent (this transaction's, or a human's) and the PR was reopened "
+            "afterwards, so the reopen is the last word and the controller will not close it "
+            "again"
+        )
+    if closed_event_count < txn.source_closed_event_count:
+        return (
+            f"source PR {txn.source_pr_url} reports {closed_event_count} closed event(s), fewer "
+            f"than the {txn.source_closed_event_count} the close intent recorded; issue events "
+            "cannot be deleted, so the recorded count is not this PR's or the listing was not "
+            "read whole, and the controller will not close on it"
+        )
+    if txn.close_attempts >= MAX_CLOSE_ATTEMPTS:
+        return (
+            f"source PR {txn.source_pr_url} is still open after {txn.close_attempts} close "
+            f"attempt(s) under replan transaction {txn.transaction_id}, none of which landed; "
+            "the close is retried at most once, so a human must look at why it does not land"
+        )
+    return ""
 
 
 def verify_target_marker(pr: PRInfo, txn: ReplanTransaction) -> str:
