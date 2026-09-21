@@ -109,6 +109,8 @@ OPERATIONS = {
     "unlink": lambda root, rel: root.unlink(rel),
     "rename_from": lambda root, rel: root.rename(rel, "moved.txt"),
     "rename_to": lambda root, rel: root.rename("source.txt", rel),
+    "copy_from": lambda root, rel: root.copy_entry_exclusive(rel, "copied.txt"),
+    "copy_to": lambda root, rel: root.copy_entry_exclusive("source.txt", rel),
     "ensure_dir": lambda root, rel: root.ensure_dir(rel),
     "lstat": lambda root, rel: root.lstat(rel),
     "subroot": lambda root, rel: root.subroot(rel, create=True).close(),
@@ -1163,6 +1165,120 @@ def test_a_fifo_never_blocks_the_controller(tmp_path):
         for op in ("read_text", "append"):
             with pytest.raises((StateError, OSError)):
                 OPERATIONS[op](root, "pipe")
+
+
+# -- #30: the no-replace reservation where link(2) is unavailable ---------------
+def test_copy_entry_exclusive_reproduces_the_entry_itself_and_refuses_every_taken_name(
+    tmp_path,
+):
+    """A regular file becomes a fresh single-named regular file with the same
+    bytes and permission bits; a symbolic link becomes a symbolic link with the
+    same target text, never followed; a FIFO is refused. Every existing entry
+    at the destination -- a symbolic link included -- is refused as *existence*
+    with the directory left exactly as it was."""
+    from autoforge.safefs import entry_kind
+
+    sentinel = Sentinel(tmp_path)
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    (root_dir / "file.json").write_bytes(b"corrupt\n")
+    (root_dir / "file.json").chmod(0o640)
+    (root_dir / "link.json").symlink_to(sentinel.path)
+    os.mkfifo(root_dir / "pipe")
+    with SafeRoot.open(root_dir) as root:
+        root.copy_entry_exclusive("file.json", "sub/file.copy")
+        root.copy_entry_exclusive("link.json", "link.copy")
+        with pytest.raises(StateError, match="FIFO.*move it by hand"):
+            root.copy_entry_exclusive("pipe", "pipe.copy")
+        for taken in ("file.json", "link.json", "pipe", "sub", "link.copy", "sub/file.copy"):
+            with pytest.raises(FileExistsError):
+                root.copy_entry_exclusive("file.json", taken)
+            with pytest.raises(FileExistsError):
+                root.copy_entry_exclusive("link.json", taken)
+    copied = (root_dir / "sub" / "file.copy").lstat()
+    assert entry_kind(copied.st_mode) is None and copied.st_nlink == 1
+    assert stat.S_IMODE(copied.st_mode) == 0o640
+    assert (root_dir / "sub" / "file.copy").read_bytes() == b"corrupt\n"
+    assert os.readlink(root_dir / "link.copy") == str(sentinel.path)
+    assert (root_dir / "file.json").read_bytes() == b"corrupt\n"
+    assert os.readlink(root_dir / "link.json") == str(sentinel.path)
+    assert stat.S_ISFIFO((root_dir / "pipe").lstat().st_mode)
+    assert sorted(e.name for e in root_dir.iterdir()) == [
+        "file.json",
+        "link.copy",
+        "link.json",
+        "pipe",
+        "sub",
+    ]
+    assert [e.name for e in (root_dir / "sub").iterdir()] == ["file.copy"]
+    sentinel.assert_untouched()
+
+
+def test_copy_entry_exclusive_reads_a_hard_linked_source_without_altering_it(tmp_path):
+    """The source may be a second name of a file the controller did not
+    create: it is *read* through that name (the copy is a copy), and neither
+    the shared inode nor its other name changes."""
+    sentinel = Sentinel(tmp_path)
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    os.link(sentinel.path, root_dir / "shared.json")
+    with SafeRoot.open(root_dir) as root:
+        root.copy_entry_exclusive("shared.json", "shared.copy")
+    assert (root_dir / "shared.copy").read_text(encoding="utf-8") == SENTINEL
+    assert (root_dir / "shared.copy").lstat().st_nlink == 1
+    assert (root_dir / "shared.json").lstat().st_nlink == 2
+    sentinel.assert_untouched()
+
+
+def test_a_copy_that_fails_removes_the_name_it_created(tmp_path, monkeypatch):
+    """The name exists before the bytes do, so a failed copy takes it away
+    again: a failed reservation leaves the directory as it was found."""
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    (root_dir / "file.json").write_bytes(b"corrupt\n")
+    real_fsync = os.fsync
+
+    def fsync(fd):
+        if stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EIO, os.strerror(errno.EIO))
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    with SafeRoot.open(root_dir) as root:
+        with pytest.raises(StateError, match="cannot copy .*Input/output error"):
+            root.copy_entry_exclusive("file.json", "file.copy")
+    assert [e.name for e in root_dir.iterdir()] == ["file.json"]
+    assert (root_dir / "file.json").read_bytes() == b"corrupt\n"
+
+
+@pytest.mark.parametrize(
+    "err",
+    sorted({errno.EPERM, errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP}),
+    ids=errno.errorcode.__getitem__,
+)
+def test_link_reports_a_filesystem_without_hard_links_as_its_own_fact(tmp_path, monkeypatch, err):
+    """What vfat/exFAT, FUSE, SMB and overlay mounts (and protected_hardlinks)
+    report is the typed refusal a caller can fall back from; any other failure
+    of the link stays a plain StateError."""
+    from autoforge.safefs import HardLinksUnavailable
+
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    (root_dir / "file.json").write_bytes(b"x")
+    failures = iter([err, errno.EIO])
+
+    def failing_link(src, dst, *args, **kwargs):
+        code = next(failures)
+        raise OSError(code, os.strerror(code), os.fspath(dst))
+
+    monkeypatch.setattr(os, "link", failing_link)
+    with SafeRoot.open(root_dir) as root:
+        with pytest.raises(HardLinksUnavailable, match="makes no hard link here"):
+            root.link("file.json", "file.link")
+        with pytest.raises(StateError, match="Input/output error") as info:
+            root.link("file.json", "file.link")
+        assert not isinstance(info.value, HardLinksUnavailable)
+    assert [e.name for e in root_dir.iterdir()] == ["file.json"]
 
 
 # -- #55: the append reads the file, so the read is bounded like any other ------

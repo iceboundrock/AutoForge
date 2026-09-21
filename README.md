@@ -175,7 +175,14 @@ Design points:
   is inspected and opened non-blocking, so a FIFO never hangs the command),
   and `run --force` moves the entry aside as `state.json.corrupt-<timestamp>`
   instead of deleting it (a symlink is archived as a link; its target is
-  never touched; a directory cannot be archived and is refused).
+  never touched; a directory cannot be archived and is refused). The
+  archive name is reserved with `link(2)`, which never replaces an existing
+  archive; on a filesystem without hard links (vfat/exFAT, some FUSE, SMB
+  and overlay mounts) the entry is copied into an exclusively created name
+  instead (a FIFO or device cannot be copied and is refused there). The
+  original is unlinked only after the archive exists, so a crash in between
+  leaves both, and the next `run --force` archives the leftover again under
+  a new name: a duplicate copy, never a lost one.
   `run` inspects, decides, quarantines, writes the first
   state and executes it under one continuous controller lock, so a
   concurrent controller can never be quarantined or overwritten on a stale

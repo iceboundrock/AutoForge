@@ -169,7 +169,25 @@ _O_TMPFILE = getattr(os, "O_TMPFILE", 0)
 #: Directory-relative syscalls this module cannot work without.  They exist on
 #: Linux and modern BSD/macOS; refusing early beats silently degrading to
 #: pathname operations that do not hold the invariant.
-_REQUIRED_DIR_FD = ("open", "mkdir", "rename", "unlink", "stat", "link", "readlink")
+_REQUIRED_DIR_FD = ("open", "mkdir", "rename", "unlink", "stat", "link", "readlink", "symlink")
+
+#: What ``link(2)`` reports where no hard link can be made to the entry: vfat
+#: and exFAT say ``EPERM`` (as does ``fs.protected_hardlinks`` for a file the
+#: caller neither owns nor may write), several FUSE, SMB/CIFS and overlay
+#: filesystems ``ENOTSUP`` / ``EOPNOTSUPP``, and a FUSE daemon without the
+#: operation ``ENOSYS``.  Every one is the same fact for the caller: this
+#: reservation cannot be made here, and another kind must be.
+_NO_HARD_LINKS = frozenset(
+    {
+        errno.EPERM,
+        errno.ENOSYS,
+        getattr(errno, "ENOTSUP", errno.EPERM),
+        getattr(errno, "EOPNOTSUPP", errno.EPERM),
+    }
+)
+
+#: Chunk of a streamed copy (:meth:`SafeRoot.copy_entry_exclusive`).
+_COPY_CHUNK = 1 << 20
 
 
 def entry_kind(mode: int) -> str | None:
@@ -208,6 +226,18 @@ def _denied(exc: OSError) -> bool:
 def _denied_text(exc: OSError) -> str:
     """The kernel's own wording, without the filename it repeats back."""
     return exc.strerror or os.strerror(exc.errno or errno.EACCES)
+
+
+class HardLinksUnavailable(StateError):
+    """:meth:`SafeRoot.link` was refused because the filesystem, or the
+    kernel's policy for this entry, makes no hard links here.
+
+    Not a failure of the caller's operation but of one way of performing it:
+    a caller that used ``link(2)`` to reserve a name without replacing an
+    entry can make the same reservation with
+    :meth:`SafeRoot.copy_entry_exclusive` instead.  Any other refusal of a
+    link stays a plain :class:`~autoforge.errors.StateError`.
+    """
 
 
 class ReadLimitExceeded(StateError):
@@ -930,7 +960,10 @@ class SafeRoot:
         Used to *reserve* a destination name: ``link`` fails atomically with
         ``EEXIST`` when the name is taken, which a rename would not.
         ``follow_symlinks=False`` links the directory entry itself, so a
-        symbolic link is archived as a link rather than resolved.
+        symbolic link is archived as a link rather than resolved.  Where the
+        filesystem makes no hard links (:data:`_NO_HARD_LINKS`) the refusal
+        is :class:`HardLinksUnavailable`, so the caller can make the same
+        reservation with :meth:`copy_entry_exclusive` instead.
         """
         src_parts = split_relpath(src)
         dst_parts = split_relpath(dst)
@@ -948,13 +981,120 @@ class SafeRoot:
             except FileExistsError:
                 raise
             except OSError as exc:
-                raise StateError(
-                    f"cannot link {self._describe(src_parts)} to {self._describe(dst_parts)}: {exc}"
-                ) from exc
+                where = f"{self._describe(src_parts)} to {self._describe(dst_parts)}"
+                if exc.errno in _NO_HARD_LINKS:
+                    raise HardLinksUnavailable(
+                        f"cannot link {where}: this filesystem makes no hard link here ({exc})"
+                    ) from exc
+                raise StateError(f"cannot link {where}: {exc}") from exc
             finally:
                 os.close(dst_parent)
         finally:
             os.close(src_parent)
+
+    def copy_entry_exclusive(self, src: str, dst: str) -> None:
+        """Reproduce the directory entry ``src`` under the new name ``dst``
+        within this root, or fail because an entry of that name already
+        exists: the reservation :meth:`link` makes, for a filesystem where
+        :meth:`link` raises :class:`HardLinksUnavailable`.
+
+        The entry itself is reproduced, never what it points at: a regular
+        file's bytes are streamed into ``dst`` opened ``O_CREAT | O_EXCL``
+        with the source's permission bits and fsynced; a symbolic link is
+        recreated by ``symlink(2)`` with its target text and never followed.
+        Both fail with :class:`FileExistsError` on any existing entry at
+        ``dst`` (a symbolic link included), exactly as :meth:`link` does.  A
+        FIFO, socket or device has no bytes to copy and is refused; the
+        caller is told to move it by hand.  Nothing is ever read through a
+        symbolic link or written anywhere but the fresh entry.
+
+        Unlike a hard link this is not one syscall: the bytes reach ``dst``
+        after its name exists.  A copy that *fails* removes the name again,
+        so a failed reservation leaves nothing behind; a *crash* mid-copy
+        leaves a partial file under ``dst``, which later exclusive creates
+        will not replace and which the source, still in place, does not
+        depend on.
+        """
+        src_parts = split_relpath(src)
+        dst_parts = split_relpath(dst)
+        src_parent = self._parent_of(src_parts, create=False)
+        try:
+            dst_parent = self._parent_of(dst_parts, create=True)
+            try:
+                self._copy_entry_at(
+                    src_parent,
+                    src_parts[-1],
+                    dst_parent,
+                    dst_parts[-1],
+                    where_src=self._describe(src_parts),
+                    where_dst=self._describe(dst_parts),
+                )
+            finally:
+                os.close(dst_parent)
+        finally:
+            os.close(src_parent)
+
+    def _copy_entry_at(
+        self,
+        src_parent: int,
+        src_name: str,
+        dst_parent: int,
+        dst_name: str,
+        *,
+        where_src: str,
+        where_dst: str,
+    ) -> None:
+        where = f"{where_src} to {where_dst}"
+        try:
+            st = os.lstat(src_name, dir_fd=src_parent)
+        except OSError as exc:
+            raise StateError(f"cannot copy {where}: {exc}") from exc
+        if stat.S_ISLNK(st.st_mode):
+            try:
+                target = os.readlink(src_name, dir_fd=src_parent)
+                os.symlink(target, dst_name, dir_fd=dst_parent)
+            except FileExistsError:
+                raise
+            except OSError as exc:
+                raise StateError(f"cannot copy {where}: {exc}") from exc
+            self._fsync_published(dst_parent, where_dst)
+            return
+        kind = entry_kind(st.st_mode)
+        if kind is not None:
+            raise StateError(
+                f"cannot copy {where}: it is a {kind}, not a regular file or a symbolic "
+                "link, and has no bytes to copy; move it by hand"
+            )
+        in_fd = open_regular_at(src_parent, src_name, os.O_RDONLY, where=where_src)
+        try:
+            # FileExistsError from O_EXCL is the caller's business, as in
+            # open_regular_at; every other refusal is already a StateError.
+            out_fd = open_regular_at(
+                dst_parent,
+                dst_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                mode=stat.S_IMODE(st.st_mode),
+                where=where_dst,
+            )
+            try:
+                while chunk := os.read(in_fd, _COPY_CHUNK):
+                    view = memoryview(chunk)
+                    while view:
+                        view = view[os.write(out_fd, view) :]
+                os.fsync(out_fd)
+            except OSError as exc:
+                # The name is this process's, created empty an instant ago:
+                # removing it leaves the directory as it was found.
+                _quiet_unlink(dst_parent, dst_name)
+                raise StateError(f"cannot copy {where}: {exc}") from exc
+            except BaseException:
+                _quiet_unlink(dst_parent, dst_name)
+                raise
+            finally:
+                os.close(out_fd)
+        finally:
+            os.close(in_fd)
+        self._fsync_published(dst_parent, where_dst)
 
     def rename(self, src: str, dst: str) -> None:
         """Rename within this root, both sides named relative to a descriptor."""

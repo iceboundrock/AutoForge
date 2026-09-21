@@ -1082,6 +1082,53 @@ def test_run_force_moves_corrupt_state_aside(tmp_path, capsys, monkeypatch, fake
     assert json.loads(capsys.readouterr().out)["phase"] == "ANALYZE_EXECUTE"
 
 
+def test_run_force_moves_corrupt_state_aside_where_it_cannot_be_hard_linked(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """#30: where link(2) refuses the state file (a filesystem without hard
+    links, or protected_hardlinks on a file the operator cannot write) the
+    recovery path still works: the archive is a copy under an exclusively
+    created name, the original is removed, and the run starts fresh."""
+    import errno
+
+    monkeypatch.chdir(tmp_path)
+    sd = tmp_path / ".autoforge"
+    sd.mkdir()
+    raw = '{"phase": "REVIEW", "run_id": '
+    (sd / "state.json").write_text(raw, encoding="utf-8")
+    real_link = os.link
+
+    def link(src, dst, *args, **kwargs):
+        if os.fspath(src) == "state.json":
+            raise PermissionError(errno.EPERM, "Operation not permitted", os.fspath(dst))
+        return real_link(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "link", link)
+    rc = cli.main(
+        [
+            "--state-dir",
+            str(sd),
+            "run",
+            "--epic",
+            EPIC,
+            "--issue",
+            ISSUE,
+            "--max-steps",
+            "1",
+            "--force",
+        ]
+    )
+    assert rc == 0
+    err = capsys.readouterr().err
+    quarantined = [p for p in sd.iterdir() if p.name.startswith("state.json.corrupt-")]
+    assert len(quarantined) == 1
+    assert quarantined[0].read_text(encoding="utf-8") == raw
+    assert quarantined[0].lstat().st_nlink == 1
+    assert str(quarantined[0]) in err
+    assert cli.main(["--state-dir", str(sd), "status", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["phase"] == "ANALYZE_EXECUTE"
+
+
 def test_run_force_moves_invalid_utf8_state_aside(tmp_path, capsys, monkeypatch, fakes):
     """run --force quarantines an invalid-UTF-8 state.json and keeps the original bytes (R1-F1)."""
     monkeypatch.chdir(tmp_path)
