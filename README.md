@@ -743,7 +743,7 @@ either way:
         <seq>-<phase>-<attempt>/
             request.json                   # profile, model, effort, command, timeout
             prompt.md                      # rendered prompt (redacted)
-            execution.json                 # exit code, timing, timed_out, truncation, error
+            execution.json                 # exit code, timing, timed_out, truncation, leftovers, error
             stdout.log / stderr.log        # redacted; head + marker + tail past the capture bound
             control-result.json            # parsed CONTROL_RESULT (when valid)
 ```
@@ -1011,11 +1011,15 @@ unresolved rationales) or the run log (an agent's `message`).
   written. Baseline only, with no claim of completeness.
 - No `os.system` / `shell=True` anywhere; prompts travel as a single argv
   element so shell metacharacters in issue text cannot be interpreted.
-  Agents run in a new session and the whole process group is killed on timeout,
-  and the kill is complete only once no process is left in the group; the
-  timeout also covers a descendant that keeps the agent's output pipes open
-  after the agent itself has exited. Every wait in the kill is bounded, so
-  whatever survives it is abandoned and the controller still gets its result.
+  Agents run in a new session and nothing they start outlives the
+  invocation: the whole process group is killed on timeout, and a process
+  the agent left behind after a normal exit (a server holding its output
+  pipes, a watcher with its stdio redirected) is killed after a short grace
+  with the agent's own exit status and result kept. The kill is complete
+  only once no process is left in the group, every wait in it is bounded,
+  and what it could not remove (a member that survived SIGKILL, a `setsid`
+  escapee still holding the pipes) is named in the run log and the error
+  rather than presented as a clean kill.
 - **Runs cannot loop forever.** The review-round cap, stagnation detection
   and the cumulative step budget (`workflow:` in the config) are controller
   invariants checked before an agent is invoked; hitting one is `BLOCKED`, a

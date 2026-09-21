@@ -179,7 +179,8 @@ docs/agent-guides/
   control-result-protocol.md           CONTROL_RESULT parsing/validation, review invariant, findings
   secrets-and-logging.md               redaction and what may never be logged or committed
   testing.md                           testing requirements and high-priority coverage
-docs/adr/                              accepted design records (LOCAL mode workspace boundary)
+docs/adr/                              accepted design records (LOCAL mode workspace boundary,
+                                       executor: nothing an agent starts outlives its invocation)
 README.md                              operator-facing overview, configuration, security model
 ```
 

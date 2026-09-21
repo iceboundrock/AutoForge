@@ -477,6 +477,46 @@ def test_failing_validation_command_prevents_advancement(tmp_path):
     assert eng.state.phase == Phase.ANALYZE_EXECUTE
 
 
+def test_failing_validation_command_names_what_it_left_behind(tmp_path, monkeypatch):
+    """PR #114 R1-F1: a validation command that fails and leaves a process
+    holding its pipes is reported with both facts in the raised error, the
+    same sentence a timeout carries, so "exit 3" is not read as "is gone"."""
+    from autoforge import executor
+
+    monkeypatch.setattr(executor, "_EXIT_GRACE_SECONDS", 0.5)
+    root = local_repo(tmp_path)
+    cfg = default_config()
+    cfg.local.validation_commands = [
+        [
+            sys.executable,
+            "-c",
+            "import subprocess, sys; "
+            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+            "print('lint failed'); sys.exit(3)",
+        ]
+    ]
+    cfg.execution.default_timeout_seconds = 30
+    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
+    eng.provider._handler = scripted(
+        eng, root, [(lambda r: touch_impl(r, "v1\n"), lambda e: impl_result())]
+    )
+    with pytest.raises(VerificationError) as excinfo:
+        eng.run(max_steps=3)
+    message = str(excinfo.value)
+    assert "validation command" in message and "failed with exit 3" in message
+    assert "failed with exit 3 (the child exited but left processes behind" in message, message
+    assert (
+        "so the group was killed); ANALYZE_EXECUTE is not verified and the run stays in "
+        "ANALYZE_EXECUTE. Output tail: lint failed"
+    ) in message
+    assert eng.state.phase == Phase.ANALYZE_EXECUTE
+    run_dir = eng.paths.logs_dir / eng.state.run_id
+    step = next(p for p in run_dir.iterdir() if "validation" in p.name)
+    execution = json.loads((step / "execution.json").read_text(encoding="utf-8"))
+    assert execution["exit_code"] == 3 and execution["descendants_killed"] is True
+    assert execution["error"].startswith("exit 3 (the child exited but left processes behind")
+
+
 def test_passing_validation_command_allows_advancement(tmp_path):
     root = local_repo(tmp_path)
     cfg = default_config()

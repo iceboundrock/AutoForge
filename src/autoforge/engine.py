@@ -354,6 +354,18 @@ def _finding_what(pr_ref: GitHubPullRequestRef, finding_id: str) -> str:
     return f"finding {finding_id} of PR {pr_ref.canonical}"
 
 
+def _with_leftovers(message: str, leftovers: str) -> str:
+    """``message`` followed by what the invocation left behind, when anything.
+
+    ``leftovers`` is the executor's sentence (``ExecutionResult.leftovers``):
+    empty for a clean exit or a clean kill, otherwise the fact an operator
+    needs next to a timeout or a failed exit -- that a member of the process
+    group survived SIGKILL, or that a writer beyond the kill's reach still
+    holds the pipes -- so "was killed" is never read as "is gone" (#85).
+    """
+    return f"{message} ({leftovers})" if leftovers else message
+
+
 _REVIEW_HEADING_RE = re.compile(r"^#\s*AI Code Review\s*[—–-]+\s*Round\s+(\d+)\s*$", re.MULTILINE)
 
 
@@ -2689,13 +2701,17 @@ class ControllerEngine:
                 timed_out=result.timed_out,
                 stdout_truncated=result.stdout_truncated,
                 stderr_truncated=result.stderr_truncated,
+                descendants_killed=result.descendants_killed,
+                group_survived_kill=result.group_survived_kill,
+                capture_abandoned=result.capture_abandoned,
                 metadata={"validation_command": list(argv), "feature": state.feature_spec_path},
             )
             if result.timed_out or result.exit_code != 0:
-                record.error = (
+                record.error = _with_leftovers(
                     f"timed out after {req.timeout_seconds}s"
                     if result.timed_out
-                    else f"exit {result.exit_code}"
+                    else f"exit {result.exit_code}",
+                    result.leftovers,
                 )
             logger.log_execution(record, "", result.stdout or "", result.stderr or "")
             # Both the command line and its output can carry a secret into
@@ -2706,14 +2722,20 @@ class ControllerEngine:
             shown = " ".join(redact_argv(list(argv)))
             if result.timed_out:
                 raise VerificationError(
-                    f"validation command {shown!r} timed out after "
-                    f"{req.timeout_seconds}s; {phase.value} is not verified."
+                    _with_leftovers(
+                        f"validation command {shown!r} timed out after {req.timeout_seconds}s",
+                        result.leftovers,
+                    )
+                    + f"; {phase.value} is not verified."
                 )
             if result.exit_code != 0:
                 tail = redact((result.stderr or result.stdout or "").strip())[-2000:]
                 raise VerificationError(
-                    f"validation command {shown!r} failed with exit "
-                    f"{result.exit_code}; {phase.value} is not verified and the run stays in "
+                    _with_leftovers(
+                        f"validation command {shown!r} failed with exit {result.exit_code}",
+                        result.leftovers,
+                    )
+                    + f"; {phase.value} is not verified and the run stays in "
                     f"{phase.value}. Output tail: {tail}"
                 )
         return True
@@ -3935,6 +3957,9 @@ class ControllerEngine:
             timed_out=result.timed_out,
             stdout_truncated=result.stdout_truncated,
             stderr_truncated=result.stderr_truncated,
+            descendants_killed=result.descendants_killed,
+            group_survived_kill=result.group_survived_kill,
+            capture_abandoned=result.capture_abandoned,
             metadata={
                 "verification_command": list(argv),
                 "pr_url": pr.url,
@@ -3942,27 +3967,33 @@ class ControllerEngine:
             },
         )
         if result.timed_out or result.exit_code != 0:
-            record.error = (
+            record.error = _with_leftovers(
                 f"timed out after {req.timeout_seconds}s"
                 if result.timed_out
-                else f"exit {result.exit_code}"
+                else f"exit {result.exit_code}",
+                result.leftovers,
             )
         self._logger().log_execution(record, "", result.stdout or "", result.stderr or "")
         # The command line and its output both reach `block_reason` in plain
         # `state.json`, so both are redacted here as well as on the log path.
         shown = " ".join(redact_argv(list(argv)))
         if result.timed_out:
-            return (
+            return _with_leftovers(
                 f"pre-merge verification command {shown!r} timed out after "
                 f"{req.timeout_seconds}s on the reviewed HEAD {pr.head_sha[:12]} of PR "
-                f"{pr.url}; the green check is not corroborated locally"
+                f"{pr.url}; the green check is not corroborated locally",
+                result.leftovers,
             )
         if result.exit_code != 0:
             tail = redact((result.stderr or result.stdout or "").strip())[-2000:]
             return (
-                f"pre-merge verification command {shown!r} failed with exit "
-                f"{result.exit_code} on the reviewed HEAD {pr.head_sha[:12]} of PR {pr.url}; "
-                f"the green check is not corroborated locally. Output tail: {tail}"
+                _with_leftovers(
+                    f"pre-merge verification command {shown!r} failed with exit "
+                    f"{result.exit_code} on the reviewed HEAD {pr.head_sha[:12]} of PR {pr.url}; "
+                    "the green check is not corroborated locally",
+                    result.leftovers,
+                )
+                + f". Output tail: {tail}"
             )
         return ""
 
@@ -6036,20 +6067,32 @@ class ControllerEngine:
             record.timed_out = result.timed_out
             record.stdout_truncated = result.stdout_truncated
             record.stderr_truncated = result.stderr_truncated
+            # What the invocation left behind is recorded whatever its
+            # outcome, so the log names a leftover process (a server the
+            # agent started, a member the kill could not remove) rather
+            # than presenting a slow agent or a clean kill (#85).
+            record.descendants_killed = result.descendants_killed
+            record.group_survived_kill = result.group_survived_kill
+            record.capture_abandoned = result.capture_abandoned
             stdout, stderr = result.stdout or "", result.stderr or ""
             if result.timed_out:
-                record.error = f"timed out after {timeout}s"
+                record.error = _with_leftovers(f"timed out after {timeout}s", result.leftovers)
                 self._record_invocation(logger, record, prompt, stdout, stderr, phase)
                 raise ExecutionTimeoutError(
-                    f"agent '{profile.name}' timed out after {timeout}s and was killed. "
-                    "State unchanged — inspect the real Git/GitHub state, then 'resume'."
+                    _with_leftovers(
+                        f"agent '{profile.name}' timed out after {timeout}s and was killed",
+                        result.leftovers,
+                    )
+                    + ". State unchanged — inspect the real Git/GitHub state, then 'resume'."
                 )
             if result.exit_code != 0:
-                record.error = f"exit {result.exit_code}"
+                record.error = _with_leftovers(f"exit {result.exit_code}", result.leftovers)
                 self._record_invocation(logger, record, prompt, stdout, stderr, phase)
                 raise ExecutionError(
-                    f"agent '{profile.name}' exited {result.exit_code}. "
-                    f"stderr tail: {stderr[-2000:]} "
+                    _with_leftovers(
+                        f"agent '{profile.name}' exited {result.exit_code}", result.leftovers
+                    )
+                    + f". stderr tail: {stderr[-2000:]} "
                     "State unchanged — inspect logs, then 'resume'."
                 )
             try:

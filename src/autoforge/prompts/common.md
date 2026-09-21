@@ -54,6 +54,12 @@ Concretely:
 - Your environment is allow-listed: you inherit only the variables the
   controller passes on (tools, locale, git and gh credentials, provider
   keys), not the operator's whole shell. Do not try to recover others.
+- Nothing you start outlives your invocation: once you exit, every process
+  still in your process group (a dev server, a watcher, anything started
+  with `&`) is terminated by the controller after a short grace, whether or
+  not it still holds your stdout/stderr, and the run log records that it
+  had to be. Stop what you start before you exit, and never rely on a
+  background process for a later phase.
 - Do not modify AutoForge controller state (`.autoforge/`), and do not commit it.
 - Before performing a GitHub or git operation that may already have happened
   (branch push, PR creation, comment, follow-up issue), first inspect the real

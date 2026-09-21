@@ -81,23 +81,43 @@ The engine also owns *where* an agent runs: in REMOTE mode a per-issue
 reads HEAD and branch of its own checkout before and after each invocation,
 entering `BLOCKED` on a change.
 
-The timeout bounds the whole invocation, not only the child's exit: an
-invocation is complete when the child has exited *and* both pipes reached
-EOF. A descendant that inherited the pipes (a server the agent left running)
-keeps them open past the child's exit, so the wait for EOF runs under the
-same deadline, and at the deadline the child's whole process group is
-killed and the result is a timeout, exactly as when the child itself
-overruns. The kill is complete only when no process is left in the group,
-not merely when the child is reaped and its pipes closed: a descendant that
-closed its inherited stdio and ignores SIGTERM is caught by that check and
-escalated to SIGKILL. Every wait in that kill is bounded by the kill grace
-period, and nothing is waited for past the SIGKILL grace: not a writer the
-group kill cannot reach (a descendant that also called `setsid`), and not a
-member that survives SIGKILL itself (uninterruptible in the kernel), the
-direct child included. The capture is then abandoned, an unreaped child is
-left to the `subprocess` module, and the result is the timeout, so
-`execute()` returns within the timeout plus two grace periods whatever the
-child left behind.
+Nothing an agent starts outlives its invocation
+([ADR 0002](../adr/0002-executor-nothing-outlives-the-invocation.md)). An
+invocation is complete when the child has exited, both pipes reached EOF
+*and* no process is left in the child's process group. The child's exit is
+bounded by the timeout; past it the whole group is killed and the result is
+a timeout. Once the child has exited on its own, the other two conditions
+are given a short exit grace (`_EXIT_GRACE_SECONDS`): a child that left
+nothing behind clears them at once, a helper it is shutting down as it
+exits clears them within the grace, and a descendant still there past it
+(a server holding the inherited pipes, or one with its stdio redirected
+that only a group liveness check can see) is killed with the rest of the
+group. The child's own exit status and output are then returned, so a valid
+`CONTROL_RESULT` is not lost to a leftover and the phase does not cost the
+whole timeout, and `ExecutionResult.descendants_killed` records the kill.
+The two flags are exclusive: `timed_out` means the child itself overran,
+`descendants_killed` that it exited and its leftovers were removed.
+
+The kill is complete only when no process is left in the group, not merely
+when the child is reaped and its pipes closed: a descendant that closed its
+inherited stdio and ignores SIGTERM is caught by that check and escalated
+to SIGKILL. Every wait in the kill is bounded by the kill grace period, and
+nothing is waited for past the SIGKILL grace: not a writer the group kill
+cannot reach (a descendant that also called `setsid`), and not a member that
+survives SIGKILL itself (uninterruptible in the kernel), the direct child
+included. The capture is then abandoned and an unreaped child is left to the
+`subprocess` module, so `execute()` returns within the timeout plus the exit
+grace plus two kill grace periods whatever the child left behind. What the
+kill could not remove is reported rather than presented as a clean kill:
+`group_survived_kill` (a member was still in the group after the SIGKILL
+grace) and `capture_abandoned` (a pipe never reached EOF, so a writer
+outside the group still holds it). `ExecutionResult.leftovers` renders the
+three facts as one sentence; the engine records all three in
+`execution.json` / `events.jsonl` for every invocation and appends the
+sentence to a timeout's or a failed exit's error, so the operator looks for
+the leftover process instead of a slow agent. None of them changes how the
+child's own result is read: they are facts for the log, not workflow
+semantics.
 
 Capture is bounded and lossless in encoding terms: each stream is read as
 bytes and decoded as UTF-8 with replacement (a stray byte in agent output is

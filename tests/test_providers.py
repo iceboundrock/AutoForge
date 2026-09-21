@@ -152,12 +152,19 @@ def test_agent_result_carries_capture_truncation_and_tail():
         stdout_truncated=True,
         stderr_truncated=True,
         stdout_tail_offset=len("head\n[marker]\n"),
+        descendants_killed=True,
+        group_survived_kill=True,
+        capture_abandoned=True,
     )
     p = default_config().profile("analyze_execute")
     got = AgentExecutionResult.from_execution(res, p)
     assert got.stdout_truncated and got.stderr_truncated
     assert got.stdout_tail == "tail"
     assert got.stdout == "head\n[marker]\ntail"
+    # What the invocation left behind crosses the boundary too (#85), and
+    # is described by the executor's sentence.
+    assert got.descendants_killed and got.group_survived_kill and got.capture_abandoned
+    assert got.leftovers == res.leftovers != ""
 
 
 # -- allow-listed environment (#10) -------------------------------------------------

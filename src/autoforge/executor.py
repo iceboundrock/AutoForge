@@ -8,15 +8,20 @@ Safety properties:
   ``$``, ``;``, ``|`` or ``$(...)`` is passed as one opaque argument;
 - stdin is ``/dev/null`` so a CLI that expects an interactive TTY cannot
   hang waiting for input;
-- the child runs in its own session/process group; on timeout the whole
-  group is terminated (SIGTERM, then SIGKILL) and the kill is complete only
-  when no process is left in the group, so grandchildren spawned by an agent
-  (test runners, editors, servers) do not linger, whether or not they still
-  hold the agent's pipes. The timeout bounds the whole invocation: the
-  child's exit *and* EOF on its pipes. A descendant that inherited them (a
-  server the agent left running) keeps them open past the child's exit, and
-  one that also left the process group cannot be killed from here, so the
-  capture is abandoned rather than waited for;
+- the child runs in its own session/process group, and nothing in that
+  group outlives the invocation: on timeout the whole group is terminated
+  (SIGTERM, then SIGKILL), and after a normal exit a group that still has
+  members or pipes still open past a short grace is terminated the same
+  way, so grandchildren spawned by an agent (test runners, editors, servers)
+  do not linger into the next phase, whether or not they hold the agent's
+  pipes. The child's own exit status and output are kept in the second
+  case; the result records that descendants were killed. The kill is
+  complete only when no process is left in the group, and every wait in it
+  is bounded: what survives SIGKILL, or left the group (``setsid``) and so
+  holds the pipes out of reach, is abandoned rather than waited for, and the
+  result says so (:attr:`ExecutionResult.group_survived_kill`,
+  :attr:`ExecutionResult.capture_abandoned`) so an operator looks for the
+  leftover instead of assuming the kill was clean;
 - capture is bounded: each stream keeps at most ``max_output_bytes`` (the
   first half and the last half of what the child wrote) in a buffer whose
   memory is that bound plus a constant, so a runaway or adversarial child
@@ -51,6 +56,11 @@ from typing import IO
 from .errors import ExecutionError, ExecutionTimeoutError
 
 _KILL_GRACE_SECONDS = 5.0
+# After the child has exited on its own, how long its pipes may stay open
+# and its group may keep a member before the group is killed. A child that
+# left nothing behind clears both at once; the grace is for a helper the
+# child is shutting down as it exits, not for a server it meant to leave.
+_EXIT_GRACE_SECONDS = 2.0
 _GROUP_POLL_SECONDS = 0.02
 _READ_CHUNK_BYTES = 64 * 1024
 
@@ -137,6 +147,19 @@ class ExecutionResult:
     # Index into ``stdout`` where the contiguous-to-EOF tail begins (0 when
     # nothing was omitted, so ``stdout_tail`` is then the whole stream).
     stdout_tail_offset: int = 0
+    # The child exited on its own but left processes behind (its pipes were
+    # still open or its group still had a member past the exit grace), so
+    # the group was killed; ``exit_code`` and the streams are the child's own.
+    # Never set together with ``timed_out``.
+    descendants_killed: bool = False
+    # A process was still in the group after the SIGKILL grace (stuck in the
+    # kernel, or not signallable from here): the kill was not clean and a
+    # leftover may still be running.
+    group_survived_kill: bool = False
+    # A pipe never reached EOF: a writer the group kill could not reach
+    # (one that left the group) still holds it; what was read before the
+    # capture was abandoned is what the streams contain.
+    capture_abandoned: bool = False
 
     @property
     def stdout_tail(self) -> str:
@@ -151,6 +174,15 @@ class ExecutionResult:
     @property
     def truncated(self) -> bool:
         return self.stdout_truncated or self.stderr_truncated
+
+    @property
+    def leftovers(self) -> str:
+        """What the invocation left behind, for a log line; empty when nothing."""
+        return describe_leftovers(
+            descendants_killed=self.descendants_killed,
+            group_survived_kill=self.group_survived_kill,
+            capture_abandoned=self.capture_abandoned,
+        )
 
     @property
     def ok(self) -> bool:
@@ -169,6 +201,34 @@ class ExecutionResult:
                 f"command output was truncated at the capture bound: {' '.join(self.command)}"
             )
         return self
+
+
+def describe_leftovers(
+    *, descendants_killed: bool, group_survived_kill: bool, capture_abandoned: bool
+) -> str:
+    """One sentence naming what an invocation left behind; empty when nothing.
+
+    The three facts are the executor's (see :class:`ExecutionResult`); the
+    sentence is for a run log or an error, so an operator is pointed at a
+    leftover process rather than at a slow agent or a clean kill.
+    """
+    parts: list[str] = []
+    if descendants_killed:
+        parts.append(
+            "the child exited but left processes behind (its output pipes stayed open or "
+            "its process group still had a member past the exit grace), so the group was killed"
+        )
+    if group_survived_kill:
+        parts.append(
+            "its process group still had a member after SIGKILL, so a leftover process "
+            "may still be running"
+        )
+    if capture_abandoned:
+        parts.append(
+            "its output pipes never reached EOF, so a process outside its group (one that "
+            "called setsid) still holds them and may still be running"
+        )
+    return "; ".join(parts)
 
 
 @dataclass
@@ -365,9 +425,19 @@ def _group_gone(pgid: int, deadline: float) -> bool:
     return True
 
 
+@dataclass(frozen=True)
+class _Termination:
+    """What a group kill left behind: nothing, when both are False."""
+
+    # A process was still in the group after the SIGKILL grace.
+    group_survived: bool
+    # A pipe never reached EOF and the capture was abandoned.
+    capture_abandoned: bool
+
+
 def _terminate_group(
     pgid: int, proc: subprocess.Popen, readers: tuple[_BoundedReader, ...]
-) -> None:
+) -> _Termination:
     """SIGTERM the child's process group, escalate to SIGKILL, and stop reading.
 
     ``pgid`` is signalled rather than ``proc``: the child leads its own group
@@ -384,8 +454,9 @@ def _terminate_group(
     the direct child included, and a writer that left the group (``setsid``)
     and so was never reached. The capture is then abandoned, and a child
     still unreaped is left to the ``subprocess`` module, which reaps it when
-    it finally dies; ``execute()`` reports the timeout either way, and never
-    a stale exit status, since a timed-out result carries no exit code.
+    it finally dies. The return value names what was left: a member still
+    in the group, and a capture that had to be abandoned, so the caller can
+    report an unclean kill instead of a clean one.
     """
     deadline = time.monotonic() + _KILL_GRACE_SECONDS
     for sig in (signal.SIGTERM, signal.SIGKILL):
@@ -393,23 +464,36 @@ def _terminate_group(
             break
         deadline = time.monotonic() + _KILL_GRACE_SECONDS
         if _reaped(proc, deadline) and _eof(readers, deadline) and _group_gone(pgid, deadline):
-            return
+            return _Termination(group_survived=False, capture_abandoned=False)
     # The group is empty (the signal found nobody) or its remains are past
     # help; the remaining EOF wait runs out the deadline already in hand,
     # never a fresh one, so the bound above holds.
-    if not _eof(readers, deadline):
+    abandoned = not _eof(readers, deadline)
+    if abandoned:
         for reader in readers:
             reader.abandon()
+    return _Termination(group_survived=_group_alive(pgid), capture_abandoned=abandoned)
 
 
 def execute(req: ExecutionRequest) -> ExecutionResult:
     """Run one subprocess to completion, capturing output.
 
-    Completion is the child's exit *and* EOF on both pipes, bounded together
-    by ``timeout_seconds``: a descendant that inherited the pipes and outlives
-    the child keeps the invocation open, and past the timeout the whole group
-    is killed and the result is a timeout, as it is when the child itself
-    overruns.
+    Completion is the child's exit, EOF on both pipes and an empty process
+    group. The child's exit is bounded by ``timeout_seconds``; past it the
+    whole group is killed and the result is a timeout. Once the child has
+    exited on its own, the other two are given ``_EXIT_GRACE_SECONDS``: a
+    descendant that outlives the child (a server it left running, holding
+    the inherited pipes or with its stdio redirected) is then killed with
+    the rest of the group, the child's own exit status and output are
+    returned, and ``descendants_killed`` records the kill. Nothing an agent
+    starts outlives its invocation; the next invocation begins with no
+    process of the previous one holding a port or writing into the tree.
+
+    Every wait past the child's exit is bounded, so what a kill cannot
+    remove is reported (``group_survived_kill``, ``capture_abandoned``)
+    rather than waited for, and ``execute()`` returns within the timeout
+    plus the exit grace plus two kill grace periods whatever the child left
+    behind.
 
     Timeouts, non-zero exits and truncated output are *returned* (not
     raised) so callers can log stdout/stderr first; use ``raise_if_failed()``
@@ -441,7 +525,6 @@ def execute(req: ExecutionRequest) -> ExecutionResult:
         raise ExecutionError(f"failed to spawn {' '.join(req.command)}: {exc}") from exc
     assert proc.stdout is not None and proc.stderr is not None
     pgid = proc.pid  # start_new_session: the child leads a group of its own
-    deadline = None if timeout is None else time.monotonic() + timeout
     # Output is read as bytes and decoded with replacement: agent output is
     # untrusted (a dumped binary, a mis-encoded file the agent cats), and a
     # decode error is not an AutoForgeError, so it would leave the
@@ -453,18 +536,29 @@ def execute(req: ExecutionRequest) -> ExecutionResult:
     for reader in readers:
         reader.start()
     timed_out = False
+    descendants_killed = False
+    left = _Termination(group_survived=False, capture_abandoned=False)
     try:
         try:
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             timed_out = True
-        # The child has exited, but the invocation is over only at EOF, which
-        # a descendant holding the inherited pipes can delay indefinitely;
-        # the wait for it runs under the same deadline.
-        if not timed_out and not _eof(readers, deadline):
-            timed_out = True
         if timed_out:
-            _terminate_group(pgid, proc, readers)
+            left = _terminate_group(pgid, proc, readers)
+        else:
+            # The child has exited, but the invocation is over only at EOF
+            # and once no process is left in its group. A child that left
+            # nothing behind clears both at once; a descendant that holds
+            # the inherited pipes or merely stays in the group is given the
+            # exit grace and then killed with the group, the child's own
+            # result kept. The group id cannot name an unrelated process
+            # while a member lives; once the group is empty the id is free
+            # for reuse, which only a pid wrap-around inside this window
+            # could bring about.
+            grace = time.monotonic() + _EXIT_GRACE_SECONDS
+            if not (_eof(readers, grace) and _group_gone(pgid, grace)):
+                descendants_killed = True
+                left = _terminate_group(pgid, proc, readers)
     except BaseException:
         _terminate_group(pgid, proc, readers)
         raise
@@ -492,6 +586,9 @@ def execute(req: ExecutionRequest) -> ExecutionResult:
         stdout_truncated=out.truncated,
         stderr_truncated=err.truncated,
         stdout_tail_offset=out.tail_offset,
+        descendants_killed=descendants_killed,
+        group_survived_kill=left.group_survived,
+        capture_abandoned=left.capture_abandoned,
     )
 
 
