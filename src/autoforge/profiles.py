@@ -27,6 +27,21 @@ def review_profile_name(round: int) -> str:
     return REVIEW_ROUND_6_PLUS
 
 
+# Every profile a REMOTE run can reach, so a missing or unusable one is a
+# config-time failure (`ControllerEngine.validate_config`) rather than one
+# discovered mid-run. `doctor` checks the same list, so what it reports as
+# runnable is exactly what a run accepts. `update_epic` is not listed: that
+# phase is still gated (see `config.py`). Keep this in step with the
+# `profile_for_phase` mapping below and `review_profile_name` above.
+REQUIRED_PROFILES = [
+    "analyze_execute",
+    "fix",
+    REVIEW_ROUND_1,
+    REVIEW_ROUND_2_5,
+    REVIEW_ROUND_6_PLUS,
+    "replan_reexecute",
+]
+
 # The only profile every LOCAL run reaches whatever its bound is. `fix` and
 # the reviewer profiles are conditional (see `local_required_profiles`).
 LOCAL_BASE_PROFILES = ["analyze_execute"]

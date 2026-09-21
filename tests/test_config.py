@@ -561,7 +561,7 @@ def test_empty_safety_section_header_is_the_default(tmp_path):
 
 def test_required_profiles_validation(tmp_path):
     from autoforge.config import validate_required_profiles
-    from autoforge.engine import REQUIRED_PROFILES
+    from autoforge.profiles import REQUIRED_PROFILES
 
     validate_required_profiles(default_config(), REQUIRED_PROFILES)
     p = tmp_path / "cfg.json"
@@ -574,7 +574,7 @@ def test_opencode_command_shape():
     p = default_config().profile("review_round_1")
     argv = p.build_command("review this")
     assert argv[:2] == ["opencode", "run"] and "-m" in argv and "--variant" in argv
-    assert argv[-1] == "review this"
+    assert argv[-2:] == ["--", "review this"]
 
 
 def test_url_validation():

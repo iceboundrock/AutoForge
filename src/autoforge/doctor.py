@@ -34,7 +34,7 @@ from .github import (
     parse_gh_version,
 )
 from .local_workspace import DEFAULT_MAX_BYTES, DEFAULT_MAX_ENTRIES
-from .profiles import local_required_profiles
+from .profiles import REQUIRED_PROFILES, local_required_profiles
 from .safefs import SafeRoot
 from .validation import parse_remote_repository
 
@@ -48,14 +48,6 @@ DEFAULT_AGENT_COMMANDS = {"claude": "claude", "opencode": "opencode"}
 
 # Name of the `doctor` row that verifies the default branch's required checks.
 REQUIRED_CHECKS_ROW = "default branch requires checks"
-
-REQUIRED_PROFILES = [
-    "analyze_execute",
-    "fix",
-    "review_round_1",
-    "review_round_2_5",
-    "review_round_6_plus",
-]
 
 
 @dataclass

@@ -21,9 +21,12 @@ Claude Code (``claude 2.1.x``)::
 OpenCode (``opencode 1.18.x``)::
 
     opencode run -m <provider/model> --variant <effort> --format default [--auto]
-                 [extra_args] <message>
+                 [extra_args] -- <message>
 
   * model ids are ``provider/model`` (``openai/gpt-5.6-luna``).
+  * ``--`` ends option parsing (yargs), so a message that starts with ``-``
+    is the message and not a flag (checked against 1.18.31: after ``--``,
+    ``--help`` is sent as the message rather than printing the help).
   * ``--variant`` carries the provider-specific reasoning effort.
   * ``--format default`` prints only the final assistant text to stdout
     (tool traces go to stderr); ``--format json`` would emit an event
@@ -270,7 +273,9 @@ class OpenCodeProvider(AgentProvider):
         if _truthy(profile.options.get("auto_approve"), default=False):
             argv.append("--auto")
         argv += list(profile.extra_args)
-        argv.append(prompt)
+        # `--` ends option parsing: the prompt is one literal positional
+        # even when it begins with `-`.
+        argv += ["--", prompt]
         return argv
 
 
