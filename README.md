@@ -179,7 +179,10 @@ Design points:
   archive name is reserved with `link(2)`, which never replaces an existing
   archive; on a filesystem without hard links (vfat/exFAT, some FUSE, SMB
   and overlay mounts) the entry is copied into an exclusively created name
-  instead (a FIFO or device cannot be copied and is refused there). The
+  instead, with the source's permission bits regardless of the umask (a
+  FIFO or device cannot be copied and is refused there); a copy that fails
+  at any point after its name exists removes that name again, so a failed
+  archive never sits beside an untouched original. The
   original is unlinked only after the archive exists, so a crash in between
   leaves both, and the next `run --force` archives the leftover again under
   a new name: a duplicate copy, never a lost one.

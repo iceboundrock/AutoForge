@@ -365,11 +365,28 @@ def open_regular_at(
     the open, and why a write open insists on a link count of one.
     """
     label = where or name
-    truncate = bool(flags & os.O_TRUNC)
-    writing = (flags & _O_ACCMODE) in (os.O_WRONLY, os.O_RDWR)
+    fd = _open_at(dir_fd, name, flags, mode=mode, label=label)
+    try:
+        _check_regular_fd(fd, flags, label=label)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _open_at(dir_fd: int, name: str, flags: int, *, mode: int, label: str) -> int:
+    """The open half of :func:`open_regular_at`: the descriptor it returns
+    has not been inspected yet.
+
+    Kept apart so a caller that creates the name (``O_CREAT | O_EXCL``) can
+    tell a failed open, which created nothing, from a failed inspection of
+    the entry it just created, which it must remove again.  A refusal here
+    is classified from the errno alone; the ones the kernel can only report
+    after the open live in :func:`_check_regular_fd`.
+    """
     open_flags = (flags & ~os.O_TRUNC) | _O_NOFOLLOW | _O_NONBLOCK | _O_NOCTTY | _O_CLOEXEC
     try:
-        fd = os.open(name, open_flags, mode, dir_fd=dir_fd)
+        return os.open(name, open_flags, mode, dir_fd=dir_fd)
     except FileNotFoundError:
         # Absence is the caller's business (see SafeRoot.read_bytes).
         raise
@@ -388,35 +405,39 @@ def open_regular_at(
         if _denied(exc):
             raise UnreadableEntryError(label, f"cannot open {label}: {_denied_text(exc)}") from exc
         raise StateError(f"cannot open {label}: {exc}") from exc
-    try:
-        st = os.fstat(fd)
-        kind = entry_kind(st.st_mode)
-        if kind is not None:
-            raise _unsafe(label, f"a {kind}, not a regular file")
-        # A write open requires exactly one name. More than one is a hard
-        # link, and the wording is mode-neutral: a truncating open would
-        # replace the shared inode's contents, an appending one would extend
-        # them, and either way the change shows at the other name. None at
-        # all means the name was unlinked between the open and this
-        # inspection (the descriptor still holds the inode, so a write would
-        # go into a file nothing names and report success), or that the
-        # filesystem reports no link count, in which case a second name can
-        # never be ruled out; both are refused rather than written to.
-        if writing and st.st_nlink > 1:
-            raise _unsafe(label, _hard_link_text(st.st_nlink))
-        if writing and st.st_nlink < 1:
-            raise _unsafe(
-                label,
-                "a file no directory entry names: it was unlinked after it was opened, or "
-                "this filesystem reports no link count, so a write here could not be "
-                "proved to reach a single-named file",
-            )
-        if truncate:
-            os.ftruncate(fd, 0)
-    except BaseException:
-        os.close(fd)
-        raise
-    return fd
+
+
+def _check_regular_fd(fd: int, flags: int, *, label: str) -> None:
+    """The inspection half of :func:`open_regular_at`: refuse ``fd`` unless
+    it is a regular file that a write open of ``flags`` may use, and apply
+    the deferred ``O_TRUNC``.  Raises without closing ``fd``; the caller
+    owns the descriptor and whatever cleanup its failure calls for."""
+    truncate = bool(flags & os.O_TRUNC)
+    writing = (flags & _O_ACCMODE) in (os.O_WRONLY, os.O_RDWR)
+    st = os.fstat(fd)
+    kind = entry_kind(st.st_mode)
+    if kind is not None:
+        raise _unsafe(label, f"a {kind}, not a regular file")
+    # A write open requires exactly one name. More than one is a hard
+    # link, and the wording is mode-neutral: a truncating open would
+    # replace the shared inode's contents, an appending one would extend
+    # them, and either way the change shows at the other name. None at
+    # all means the name was unlinked between the open and this
+    # inspection (the descriptor still holds the inode, so a write would
+    # go into a file nothing names and report success), or that the
+    # filesystem reports no link count, in which case a second name can
+    # never be ruled out; both are refused rather than written to.
+    if writing and st.st_nlink > 1:
+        raise _unsafe(label, _hard_link_text(st.st_nlink))
+    if writing and st.st_nlink < 1:
+        raise _unsafe(
+            label,
+            "a file no directory entry names: it was unlinked after it was opened, or "
+            "this filesystem reports no link count, so a write here could not be "
+            "proved to reach a single-named file",
+        )
+    if truncate:
+        os.ftruncate(fd, 0)
 
 
 def readlink_at(dir_fd: int, name: str) -> str:
@@ -1009,11 +1030,19 @@ class SafeRoot:
         symbolic link or written anywhere but the fresh entry.
 
         Unlike a hard link this is not one syscall: the bytes reach ``dst``
-        after its name exists.  A copy that *fails* removes the name again,
-        so a failed reservation leaves nothing behind; a *crash* mid-copy
-        leaves a partial file under ``dst``, which later exclusive creates
-        will not replace and which the source, still in place, does not
-        depend on.
+        after its name exists.  Every failure after the name is created --
+        the fresh entry failing inspection, the permission bits, the bytes,
+        their fsync, or the fsync of the directory that publishes the name
+        -- removes that name again and nothing else, so a failed reservation
+        leaves the directory as it was found.  That differs from the
+        controller's own writes, which keep a name whose directory fsync
+        failed (:meth:`_fsync_published`): those bytes are the product,
+        whereas here the source is still in place and a copy whose
+        durability could not be proved is worth nothing to the caller, who
+        must not remove the source on the strength of it.  A *crash*
+        mid-copy leaves a partial file under ``dst``, which later exclusive
+        creates will not replace and which the source, still in place, does
+        not depend on.
         """
         src_parts = split_relpath(src)
         dst_parts = split_relpath(dst)
@@ -1057,7 +1086,12 @@ class SafeRoot:
                 raise
             except OSError as exc:
                 raise StateError(f"cannot copy {where}: {exc}") from exc
-            self._fsync_published(dst_parent, where_dst)
+            # From here on the name is this process's; see _copy_bytes_at.
+            try:
+                self._fsync_published(dst_parent, where_dst)
+            except BaseException:
+                _quiet_unlink(dst_parent, dst_name)
+                raise
             return
         kind = entry_kind(st.st_mode)
         if kind is not None:
@@ -1067,34 +1101,59 @@ class SafeRoot:
             )
         in_fd = open_regular_at(src_parent, src_name, os.O_RDONLY, where=where_src)
         try:
-            # FileExistsError from O_EXCL is the caller's business, as in
-            # open_regular_at; every other refusal is already a StateError.
-            out_fd = open_regular_at(
+            self._copy_bytes_at(
+                in_fd,
                 dst_parent,
                 dst_name,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
                 mode=stat.S_IMODE(st.st_mode),
-                where=where_dst,
+                where=where,
+                where_dst=where_dst,
             )
+        finally:
+            os.close(in_fd)
+
+    def _copy_bytes_at(
+        self,
+        in_fd: int,
+        dst_parent: int,
+        dst_name: str,
+        *,
+        mode: int,
+        where: str,
+        where_dst: str,
+    ) -> None:
+        """Create ``dst_name`` exclusively and fill it from ``in_fd``.
+
+        The open is split in two so that a failure *creating* the name,
+        which leaves nothing behind, is told apart from every failure
+        *after* it: the name is this process's from the moment ``O_EXCL``
+        succeeds, and any of those later failures removes it again (and
+        only it: a second name someone else gave the inode meanwhile is
+        theirs) so the directory is left as it was found.
+        """
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        # FileExistsError from O_EXCL is the caller's business, as in
+        # open_regular_at; every other refusal is already a StateError.
+        out_fd = _open_at(dst_parent, dst_name, flags, mode=mode, label=where_dst)
+        try:
             try:
+                _check_regular_fd(out_fd, flags, label=where_dst)
+                # O_CREAT applied the umask to ``mode``; the source's bits
+                # are what a hard link would have carried, so restore them.
+                os.fchmod(out_fd, mode)
                 while chunk := os.read(in_fd, _COPY_CHUNK):
                     view = memoryview(chunk)
                     while view:
                         view = view[os.write(out_fd, view) :]
                 os.fsync(out_fd)
             except OSError as exc:
-                # The name is this process's, created empty an instant ago:
-                # removing it leaves the directory as it was found.
-                _quiet_unlink(dst_parent, dst_name)
                 raise StateError(f"cannot copy {where}: {exc}") from exc
-            except BaseException:
-                _quiet_unlink(dst_parent, dst_name)
-                raise
             finally:
                 os.close(out_fd)
-        finally:
-            os.close(in_fd)
-        self._fsync_published(dst_parent, where_dst)
+            self._fsync_published(dst_parent, where_dst)
+        except BaseException:
+            _quiet_unlink(dst_parent, dst_name)
+            raise
 
     def rename(self, src: str, dst: str) -> None:
         """Rename within this root, both sides named relative to a descriptor."""

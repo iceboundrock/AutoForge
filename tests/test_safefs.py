@@ -21,6 +21,7 @@ cell, that it is byte-for-byte and inode-for-inode what it was before.
 """
 
 import errno
+import functools
 import os
 import stat
 from collections.abc import Callable, Iterator
@@ -1230,25 +1231,121 @@ def test_copy_entry_exclusive_reads_a_hard_linked_source_without_altering_it(tmp
     sentinel.assert_untouched()
 
 
-def test_a_copy_that_fails_removes_the_name_it_created(tmp_path, monkeypatch):
-    """The name exists before the bytes do, so a failed copy takes it away
-    again: a failed reservation leaves the directory as it was found."""
-    root_dir = tmp_path / "root"
-    root_dir.mkdir()
-    (root_dir / "file.json").write_bytes(b"corrupt\n")
+def _fail_fsync_of(monkeypatch, *, directory: bool) -> None:
+    """Make ``os.fsync`` fail with EIO on a directory (the publication of a
+    name) or on a regular file (the bytes), leaving the other kind alone."""
     real_fsync = os.fsync
 
     def fsync(fd):
-        if stat.S_ISREG(os.fstat(fd).st_mode):
+        if stat.S_ISDIR(os.fstat(fd).st_mode) == directory:
             raise OSError(errno.EIO, os.strerror(errno.EIO))
         return real_fsync(fd)
 
     monkeypatch.setattr(os, "fsync", fsync)
+
+
+def _fail_fchmod(monkeypatch) -> None:
+    def fchmod(fd, mode):
+        raise OSError(errno.EPERM, os.strerror(errno.EPERM))
+
+    monkeypatch.setattr(os, "fchmod", fchmod)
+
+
+@pytest.mark.parametrize(
+    ("source", "inject", "message"),
+    [
+        ("file", _fail_fchmod, "cannot copy .*Operation not permitted"),
+        (
+            "file",
+            functools.partial(_fail_fsync_of, directory=False),
+            "cannot copy .*Input/output error",
+        ),
+        (
+            "file",
+            functools.partial(_fail_fsync_of, directory=True),
+            "cannot durably publish .*Input/output error",
+        ),
+        (
+            "symlink",
+            functools.partial(_fail_fsync_of, directory=True),
+            "cannot durably publish .*Input/output error",
+        ),
+    ],
+    ids=["fchmod", "fsync-bytes", "fsync-directory", "fsync-directory-symlink"],
+)
+def test_a_copy_that_fails_removes_the_name_it_created(
+    tmp_path, monkeypatch, source, inject, message
+):
+    """The name exists before the bytes do, so every failure after it is
+    created -- restoring the permission bits, fsyncing the bytes, fsyncing
+    the directory that publishes the name (for a symbolic link too) -- takes
+    it away again: a failed reservation leaves the directory as it was found
+    and the source untouched, so the caller never removes a source on the
+    strength of an archive that is not there."""
+    sentinel = Sentinel(tmp_path)
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    if source == "file":
+        (root_dir / "entry").write_bytes(b"corrupt\n")
+    else:
+        (root_dir / "entry").symlink_to(sentinel.path)
+    inject(monkeypatch)
     with SafeRoot.open(root_dir) as root:
-        with pytest.raises(StateError, match="cannot copy .*Input/output error"):
+        with pytest.raises(StateError, match=message):
+            root.copy_entry_exclusive("entry", "entry.copy")
+    assert [e.name for e in root_dir.iterdir()] == ["entry"]
+    if source == "file":
+        assert (root_dir / "entry").read_bytes() == b"corrupt\n"
+    else:
+        assert os.readlink(root_dir / "entry") == str(sentinel.path)
+    sentinel.assert_untouched()
+
+
+def test_a_fresh_name_that_fails_inspection_is_removed_and_nothing_else_is(tmp_path, monkeypatch):
+    """Between creating the destination and inspecting it, another name for
+    the new inode can appear (a concurrent hard link).  The write-side rule
+    that refuses a multiply-named file applies to the fresh destination too;
+    the refusal removes the name this process created and leaves the other
+    name, which is not its to remove, in place."""
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    (root_dir / "file.json").write_bytes(b"corrupt\n")
+    real_open = os.open
+
+    def open_then_link(name, flags, mode=0o777, *, dir_fd=None):
+        fd = real_open(name, flags, mode, dir_fd=dir_fd)
+        if flags & os.O_EXCL:
+            os.link(name, f"{name}.other", src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        return fd
+
+    monkeypatch.setattr(os, "open", open_then_link)
+    with SafeRoot.open(root_dir) as root:
+        with pytest.raises(UnsafePathError, match="hard link"):
             root.copy_entry_exclusive("file.json", "file.copy")
-    assert [e.name for e in root_dir.iterdir()] == ["file.json"]
+    assert sorted(e.name for e in root_dir.iterdir()) == ["file.copy.other", "file.json"]
+    assert (root_dir / "file.copy.other").lstat().st_nlink == 1
+    assert (root_dir / "file.copy.other").read_bytes() == b""
     assert (root_dir / "file.json").read_bytes() == b"corrupt\n"
+
+
+def test_the_copy_carries_the_source_permission_bits_through_a_restrictive_umask(tmp_path):
+    """A hard link shares the source's mode; the copy must match it.  The
+    ``O_CREAT`` mode is filtered by the umask, so the bits are restored on
+    the open descriptor afterwards, and a umask that would strip group and
+    other access leaves the copy readable exactly as the source was."""
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    (root_dir / "file.json").write_bytes(b"corrupt\n")
+    (root_dir / "file.json").chmod(0o664)
+    previous = os.umask(0o077)
+    try:
+        with SafeRoot.open(root_dir) as root:
+            root.copy_entry_exclusive("file.json", "file.copy")
+    finally:
+        os.umask(previous)
+    assert stat.S_IMODE((root_dir / "file.copy").lstat().st_mode) == 0o664
+    assert stat.S_IMODE((root_dir / "file.json").lstat().st_mode) == 0o664
+    assert (root_dir / "file.copy").read_bytes() == b"corrupt\n"
 
 
 @pytest.mark.parametrize(
