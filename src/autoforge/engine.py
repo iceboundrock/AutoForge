@@ -2731,8 +2731,11 @@ class ControllerEngine:
             if result.exit_code != 0:
                 tail = redact((result.stderr or result.stdout or "").strip())[-2000:]
                 raise VerificationError(
-                    f"validation command {shown!r} failed with exit "
-                    f"{result.exit_code}; {phase.value} is not verified and the run stays in "
+                    _with_leftovers(
+                        f"validation command {shown!r} failed with exit {result.exit_code}",
+                        result.leftovers,
+                    )
+                    + f"; {phase.value} is not verified and the run stays in "
                     f"{phase.value}. Output tail: {tail}"
                 )
         return True
@@ -3984,9 +3987,13 @@ class ControllerEngine:
         if result.exit_code != 0:
             tail = redact((result.stderr or result.stdout or "").strip())[-2000:]
             return (
-                f"pre-merge verification command {shown!r} failed with exit "
-                f"{result.exit_code} on the reviewed HEAD {pr.head_sha[:12]} of PR {pr.url}; "
-                f"the green check is not corroborated locally. Output tail: {tail}"
+                _with_leftovers(
+                    f"pre-merge verification command {shown!r} failed with exit "
+                    f"{result.exit_code} on the reviewed HEAD {pr.head_sha[:12]} of PR {pr.url}; "
+                    "the green check is not corroborated locally",
+                    result.leftovers,
+                )
+                + f". Output tail: {tail}"
             )
         return ""
 
@@ -6082,8 +6089,10 @@ class ControllerEngine:
                 record.error = _with_leftovers(f"exit {result.exit_code}", result.leftovers)
                 self._record_invocation(logger, record, prompt, stdout, stderr, phase)
                 raise ExecutionError(
-                    f"agent '{profile.name}' exited {result.exit_code}. "
-                    f"stderr tail: {stderr[-2000:]} "
+                    _with_leftovers(
+                        f"agent '{profile.name}' exited {result.exit_code}", result.leftovers
+                    )
+                    + f". stderr tail: {stderr[-2000:]} "
                     "State unchanged — inspect logs, then 'resume'."
                 )
             try:

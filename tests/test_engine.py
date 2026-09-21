@@ -3307,12 +3307,14 @@ def test_verification_command_timeout_blocks_the_merge(tmp_state_dir, fake_githu
     assert fake_github.merges == []
 
 
-# A verification command that exits 0 at once but leaves a descendant holding
-# its stdout/stderr open for far longer than the timeout.
+# A verification command that exits at once (0, or the status given as its
+# argument) but leaves a descendant holding its stdout/stderr open for far
+# longer than the timeout.
 _LEAVES_A_SERVER = (
     "import subprocess, sys; "
     "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
-    "print('checks passed')"
+    "print('checks ran'); "
+    "sys.exit(int(sys.argv[1]) if len(sys.argv) > 1 else 0)"
 )
 
 
@@ -3342,6 +3344,33 @@ def test_verification_command_leftover_is_killed_and_its_result_kept(
     event = json.loads((run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()[-1])
     assert event["descendants_killed"] is True and event["timed_out"] is False
     assert not (step / "error.txt").exists()
+
+
+def test_failing_verification_command_names_its_leftover_in_the_block_reason(
+    tmp_state_dir, fake_github, monkeypatch
+):
+    """PR #114 R1-F1: when the command fails *and* left a process behind,
+    the durable block reason names both, not only the exit status; the
+    output tail still follows so the reason reads like the clean case."""
+    from autoforge import executor
+
+    monkeypatch.setattr(executor, "_EXIT_GRACE_SECONDS", 0.5)
+    commands = [["python3", "-c", _LEAVES_A_SERVER, "3"]]
+    eng, sha = _in_merge_on_commit(tmp_state_dir, fake_github, commands)
+    eng.config.execution.default_timeout_seconds = 30
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "BLOCKED" and fake_github.merges == []
+    reason = eng.state.block_reason
+    assert "pre-merge verification command" in reason and "failed with exit 3" in reason
+    assert f"reviewed HEAD {sha[:12]}" in reason
+    assert "not corroborated locally (the child exited but left processes behind" in reason, reason
+    assert "so the group was killed). Output tail: checks ran" in reason
+    assert eng.state.premerge_verified_head_sha == ""
+    run_dir = eng.paths.logs_dir / eng.state.run_id
+    step = next(p for p in run_dir.iterdir() if "premerge-verification" in p.name)
+    execution = json.loads((step / "execution.json").read_text(encoding="utf-8"))
+    assert execution["exit_code"] == 3 and execution["descendants_killed"] is True
+    assert execution["error"].startswith("exit 3 (the child exited but left processes behind")
 
 
 def test_verification_commands_never_run_before_github_accepts_the_pr(tmp_state_dir, fake_github):
@@ -5511,9 +5540,10 @@ class _LeftoverProvider(ScriptedProvider):
     """Returns what the executor returns for an agent that left processes
     behind (killed after its exit) or whose kill was not clean."""
 
-    def __init__(self, stdout: str, on_call=None, **facts) -> None:
+    def __init__(self, stdout: str, on_call=None, exit_code=0, **facts) -> None:
         super().__init__()
         self.stdout, self.on_call, self.facts = stdout, on_call, facts
+        self.exit_code = -1 if facts.get("timed_out") else exit_code
 
     def execute(self, req):
         self.calls.append(req)
@@ -5521,9 +5551,9 @@ class _LeftoverProvider(ScriptedProvider):
             self.on_call()
         return AgentExecutionResult(
             command=["x"],
-            exit_code=-1 if self.facts.get("timed_out") else 0,
+            exit_code=self.exit_code,
             stdout=self.stdout,
-            stderr="",
+            stderr="boom",
             started_at="t",
             finished_at="t",
             **self.facts,
@@ -5580,6 +5610,36 @@ def test_timeout_names_a_group_member_that_survived_the_kill(tmp_state_dir, fake
     assert "still had a member after SIGKILL" in (step / "error.txt").read_text(encoding="utf-8")
     event = json.loads((run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()[-1])
     assert event["group_survived_kill"] is True
+
+
+def test_failed_exit_names_what_the_agent_left_behind(tmp_state_dir, fake_github):
+    """PR #114 R1-F1: a non-zero exit carries the same leftover facts as a
+    timeout. The immediate error, the journal and the run log all name the
+    writer that still holds the pipes, so the operator does not read
+    "exited 2" as "is gone" before resuming."""
+    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    provider = _LeftoverProvider("", exit_code=2, capture_abandoned=True)
+    _install(eng, provider)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    with pytest.raises(ExecutionError) as excinfo:
+        eng.step()
+    message = str(excinfo.value)
+    assert message.startswith(
+        "agent 'analyze_execute' exited 2 (its output pipes never reached EOF"
+    )
+    assert "may still be running). stderr tail: boom State unchanged" in message
+    assert eng.state.phase == Phase.ANALYZE_EXECUTE
+    run_dir = eng.paths.logs_dir / eng.state.run_id
+    step = next(p for p in run_dir.iterdir() if p.is_dir())
+    execution = json.loads((step / "execution.json").read_text(encoding="utf-8"))
+    assert execution["exit_code"] == 2 and execution["capture_abandoned"] is True
+    assert execution["error"] == (
+        "exit 2 (its output pipes never reached EOF, so a process outside its group "
+        "(one that called setsid) still holds them and may still be running)"
+    )
+    assert "never reached EOF" in (step / "error.txt").read_text(encoding="utf-8")
+    event = json.loads((run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+    assert event["capture_abandoned"] is True
 
 
 def test_truncated_stdout_never_accepts_a_block_from_the_head(tmp_state_dir, fake_github):
