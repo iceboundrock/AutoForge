@@ -15,8 +15,10 @@ Legal transitions::
     READY_FOR_MERGE  -> REVIEW            (the revision moved after the clean review)
     MERGE            -> UPDATE_EPIC       (controller merged; GitHub confirms MERGED)
     MERGE            -> REVIEW            (the revision moved after the clean review)
-    MERGE            -> ANALYZE_EXECUTE   (reserved; unused: batching is decided inside
-    MERGE            -> DONE               UPDATE_EPIC, which runs after every merge)
+    MERGE            -> ANALYZE_EXECUTE   (reserved; unused)
+    MERGE            -> DONE              (reserved; unused)
+                                          Both are reserved edges: batching is decided
+                                          inside UPDATE_EPIC, which runs after every merge.
     UPDATE_EPIC      -> ANALYZE_EXECUTE   (next_issue_url != null)
     UPDATE_EPIC      -> DONE              (next_issue_url == null)
 
