@@ -30,6 +30,7 @@ from autoforge.replan import (
 )
 from autoforge.replan_txn import (
     MARKER_NAME,
+    MAX_CLOSE_ATTEMPTS,
     Disposition,
     MarkerScan,
     ReplanAttestation,
@@ -43,6 +44,7 @@ from autoforge.replan_txn import (
     render_marker,
     scan_replan_markers,
     select_bound_candidate,
+    verify_close_never_ran,
 )
 from autoforge.result_parser import (
     MAX_FINDING_RESOLUTION_CHARS,
@@ -332,12 +334,14 @@ def _txn(eng) -> ReplanTransaction:
 def _closed_by_controller(gh, pr_url: str = PR, txn_id: str = TXN_ID) -> None:
     """A source PR as this transaction's own close leaves it: CLOSED + receipt."""
     gh.prs[pr_url].state = "CLOSED"
+    gh.add_close_event(pr_url)
     gh.add_comment(pr_url, 900, f"Superseded.\n\n{render_close_receipt(txn_id)}")
 
 
 def _closed_by_a_human(gh, pr_url: str = PR) -> None:
     """A source PR someone else closed: CLOSED, and no receipt anywhere."""
     gh.prs[pr_url].state = "CLOSED"
+    gh.add_close_event(pr_url)
     gh.add_comment(pr_url, 901, "Closing this, we are going a different way.")
 
 
@@ -394,7 +398,11 @@ def _seed_txn(stage: ReplanStage, **over) -> ReplanTransaction:
         txn.attested_findings_considered = 4
         txn.attested_unique_constraints = 2
     if stage in after_verified[1:]:
+        # The intent as the write persists it: one attempt covered, and the
+        # source never closed before (the fake's PRs start with no events).
         txn.close_intent_at = "2026-01-01T00:00:00+00:00"
+        txn.close_attempts = 1
+        txn.source_closed_event_count = 0
     if stage is ReplanStage.COMPENSATING:
         txn.compensating_at = "2026-01-01T00:00:01+00:00"
         txn.compensation_reason = "the replan checkpoint no longer held at the close"
@@ -2212,19 +2220,43 @@ def test_t1_supersede_intent_with_the_receipt_adopts_the_close_after_a_restart(t
     assert eng2.state.superseded_prs[0]["transaction_id"] == TXN_ID
 
 
-def test_t1_supersede_intent_over_an_open_source_refuses_after_a_restart(tmp_state_dir):
-    """The reload must not turn a recorded intent into a licence to close."""
+def test_t1_supersede_intent_over_a_reopened_source_refuses_after_a_restart(tmp_state_dir):
+    """The reload must not turn a recorded intent into a licence to close.
+
+    The source is OPEN and its timeline shows a close after the intent's
+    watermark: a close landed and a human reopened it (#69).
+    """
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(
+        tmp_state_dir, gh, ReplanStage.SUPERSEDE_INTENT, close_intent_at="2026-01-01T00:00:00+00:00"
+    )
+    gh.add_close_event(PR)
+    eng2 = _restart(eng, gh)
+    assert eng2.step().next_phase == "BLOCKED"
+    assert "closed-event count rose from 0 at the intent to 1" in eng2.state.block_reason
+    assert gh.closed_prs == [] and gh.prs[PR].state == "OPEN"
+    assert _txn(eng2).stage is ReplanStage.REJECTED
+    persisted = load_state(eng2.paths.state_file).replan_transaction
+    assert persisted["stage"] == ReplanStage.REJECTED.value
+
+
+def test_t1_supersede_intent_over_a_never_closed_source_retries_once_after_a_restart(
+    tmp_state_dir,
+):
+    """The journal round trip carries the watermark and the attempt count: a
+    fresh process proves from GitHub that the close never ran, retries it
+    once, and adopts (#69)."""
     gh = FakeGitHub()
     eng, _ = _seeded_engine(
         tmp_state_dir, gh, ReplanStage.SUPERSEDE_INTENT, close_intent_at="2026-01-01T00:00:00+00:00"
     )
     eng2 = _restart(eng, gh)
-    assert eng2.step().next_phase == "BLOCKED"
-    assert "carries no close receipt" in eng2.state.block_reason
-    assert gh.closed_prs == [] and gh.prs[PR].state == "OPEN"
-    assert _txn(eng2).stage is ReplanStage.REJECTED
-    persisted = load_state(eng2.paths.state_file).replan_transaction
-    assert persisted["stage"] == ReplanStage.REJECTED.value
+    assert _txn(eng2).source_closed_event_count == 0 and _txn(eng2).close_attempts == 1
+    assert eng2.step().next_phase == "REVIEW"
+    assert len(gh.closed_prs) == 1 and gh.prs[PR].state == "CLOSED"
+    assert eng2.provider.calls == []
+    assert eng2.state.current_pr_url == REPLACEMENT_PR
+    assert eng2.state.superseded_prs[0]["transaction_id"] == TXN_ID
 
 
 def test_t1_compensating_replays_the_reopen_after_a_restart(tmp_state_dir):
@@ -2366,27 +2398,67 @@ def test_w5_crash_after_verification_completes_the_supersede(tmp_state_dir):
 
 
 def test_w6_crash_after_intent_but_before_the_close_landed(tmp_state_dir):
-    """Window 6: intent recorded, source OPEN, no receipt -> refused, never retried.
+    """Window 6: intent recorded, source OPEN, no receipt -> the close is retried once.
 
-    From local state this is the same evidence as "the close landed, the
-    receipt was lost to a crash, and a human reopened the PR" (R11-F1), so
-    the write is never repeated from a resume; the refusal is durable and the
-    source is left exactly as found.
+    From the comments alone this is the same evidence as "the close landed,
+    the receipt was lost to a crash, and a human reopened the PR" (R11-F1).
+    The source's timeline tells them apart: its ``closed`` event count is the
+    one the intent recorded, so no close of any kind happened since, and the
+    resume performs the write it was about to perform -- persisting the
+    second attempt first, so a further crash cannot retry again -- and
+    adopts. The PR is closed exactly once (#69).
     """
     gh = FakeGitHub()
     eng, _ = _seeded_engine(
         tmp_state_dir, gh, ReplanStage.SUPERSEDE_INTENT, close_intent_at="2026-01-01T00:00:00+00:00"
     )
+    attempts_at_close: list[int] = []
+    gh.close_race = lambda g: attempts_at_close.append(_txn(eng).close_attempts)
+    out = eng.step()
+    assert out.next_phase == "REVIEW"
+    assert attempts_at_close == [2]  # the retry was journalled before the write
+    assert len(gh.closed_prs) == 1 and gh.prs[PR].state == "CLOSED"
+    assert gh.close_events == {(gh.prs[PR].repository.lower(), 42): 1}  # exactly one close
+    assert gh.reopened_prs == []
+    assert [c[0] for c in gh.commented_prs] == [PR]  # the retry posts the receipt
+    assert has_close_receipt([c.body for c in gh.get_pr_comments(PR)], TXN_ID)
+    assert eng.state.current_pr_url == REPLACEMENT_PR
+    assert eng.state.superseded_prs[0]["pr_url"] == PR
+    assert eng.provider.calls == []
+
+
+def test_w6_a_second_crash_before_the_close_is_not_retried_again(tmp_state_dir):
+    """The retry is bounded: an intent that already covers ``MAX_CLOSE_ATTEMPTS``
+    attempts over a source that is still OPEN and still never closed is handed
+    to a human, not closed a third time (#69)."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(
+        tmp_state_dir, gh, ReplanStage.SUPERSEDE_INTENT, close_attempts=MAX_CLOSE_ATTEMPTS
+    )
     out = eng.step()
     assert out.next_phase == "BLOCKED"
-    assert "carries no close receipt" in eng.state.block_reason
-    assert "cannot tell the two apart" in eng.state.block_reason
+    assert f"still open after {MAX_CLOSE_ATTEMPTS} close attempt(s)" in eng.state.block_reason
+    assert "retried at most once" in eng.state.block_reason
     assert "had already begun closing" in eng.state.block_reason
     assert _txn(eng).stage is ReplanStage.REJECTED
-    assert gh.closed_prs == [] and gh.reopened_prs == [] and gh.commented_prs == []
-    assert gh.prs[PR].state == "OPEN"
-    assert eng.state.current_pr_url == PR
-    assert eng.state.superseded_prs == []
+    _assert_source_untouched(eng, gh)
+    assert gh.reopened_prs == [] and gh.commented_prs == []
+    assert eng.state.current_pr_url == PR and eng.state.superseded_prs == []
+
+
+def test_w6_the_retry_revalidates_both_checkpoints_before_the_close(tmp_state_dir):
+    """The retry is the write again, not a shortcut past its guards: a source
+    whose HEAD moved since the checkpoint is refused before ``gh pr close``,
+    exactly as the first attempt would refuse it."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.SUPERSEDE_INTENT)
+    gh.set_head(SHA_C, PR)
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert SHA_C in eng.state.block_reason
+    assert _txn(eng).stage is ReplanStage.REJECTED
+    _assert_source_untouched(eng, gh)
+    assert ("get_pr_close_event_count", PR) in gh.calls  # the proof was read first
     # Replayed, not re-derived: a second resume neither closes nor re-decides.
     eng.state.phase = Phase.REPLAN_REEXECUTE
     calls_before = len(gh.calls)
@@ -2554,14 +2626,37 @@ def test_transient_failure_during_the_close_leaves_recorded_intent(tmp_state_dir
         eng.step()
     assert _txn(eng).stage is ReplanStage.SUPERSEDE_INTENT
     assert _txn(eng).close_intent_at
+    assert _txn(eng).close_attempts == 1 and _txn(eng).source_closed_event_count == 0
     assert eng.state.phase == Phase.REPLAN_REEXECUTE
-    # The close never landed, but the journal cannot know that: an OPEN source
-    # under a recorded intent is refused, never retried (R11-F1).
+    # The close never landed, and the source's timeline proves it (no closed
+    # event since the watermark), so the resume retries the write once and
+    # adopts (#69). The PR is closed exactly once: the failed attempt landed
+    # nothing, and no attempt follows the one that landed.
+    gh.close_error = ""
+    assert eng.step().next_phase == "REVIEW"
+    assert gh.prs[PR].state == "CLOSED"
+    assert len(gh.closed_prs) == 2  # the failed attempt and the one retry
+    assert gh.close_events == {(gh.prs[PR].repository.lower(), 42): 1}
+    assert eng.state.current_pr_url == REPLACEMENT_PR
+    assert eng.state.superseded_prs[0]["pr_url"] == PR
+
+
+def test_a_transient_failure_during_the_retried_close_is_not_retried_again(tmp_state_dir):
+    """Both attempts fail transiently without landing: the intent records two
+    attempts, and the next resume refuses instead of closing a third time."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.VERIFIED)
+    gh.close_error = GitHubUnavailableError("gh: 502 Bad Gateway")
+    with pytest.raises(GitHubUnavailableError):
+        eng.step()
+    with pytest.raises(GitHubUnavailableError):
+        eng.step()
+    assert _txn(eng).stage is ReplanStage.SUPERSEDE_INTENT
+    assert _txn(eng).close_attempts == MAX_CLOSE_ATTEMPTS
     gh.close_error = ""
     assert eng.step().next_phase == "BLOCKED"
-    assert "carries no close receipt" in eng.state.block_reason
-    assert gh.prs[PR].state == "OPEN"
-    assert len(gh.closed_prs) == 1  # the one failed attempt; never a second
+    assert "retried at most once" in eng.state.block_reason
+    assert len(gh.closed_prs) == 2 and gh.prs[PR].state == "OPEN"
     assert _txn(eng).stage is ReplanStage.REJECTED
 
 
@@ -3494,7 +3589,9 @@ def test_r11f1_a_close_that_lost_its_receipt_to_a_crash_is_never_repeated(tmp_st
     would leave it. The old resume treated that as an unattempted write and
     closed again, overriding the human's reopen. It must block instead: no
     second close, no activation, no reopen, and a refusal that survives a
-    further resume.
+    further resume. What proves the close landed is the source's ``closed``
+    event count, one above the watermark the intent recorded (#69); the
+    comments alone could not (the receipt was never posted).
     """
     gh = FakeGitHub()
     eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.VERIFIED)
@@ -3517,10 +3614,11 @@ def test_r11f1_a_close_that_lost_its_receipt_to_a_crash_is_never_repeated(tmp_st
     resumed.state.current_issue_url = ISSUE
     resumed.state.current_pr_url = PR
     resumed.state.replan_transaction = crashed.to_dict()
+    assert crashed.source_closed_event_count == 0 and crashed.close_attempts == 1
     out = resumed.step()
     assert out.next_phase == "BLOCKED"
-    assert "carries no close receipt" in resumed.state.block_reason
-    assert "reopened by a human" in resumed.state.block_reason
+    assert "closed-event count rose from 0 at the intent to 1" in resumed.state.block_reason
+    assert "the reopen is the last word" in resumed.state.block_reason
     assert _txn(resumed).stage is ReplanStage.REJECTED
     assert len(gh.closed_prs) == 1  # never a second close
     assert gh.prs[PR].state == "OPEN"  # the human's reopen stands
@@ -3538,7 +3636,7 @@ def test_r11f1_a_close_that_lost_its_receipt_to_a_crash_is_never_repeated(tmp_st
 def test_r11f1_an_unreadable_comment_list_over_an_open_source_is_unknown_then_refused(
     tmp_state_dir,
 ):
-    """The OPEN-at-intent refusal keeps the transient/conclusive split."""
+    """The OPEN-at-intent decision keeps the transient/conclusive split."""
     gh = FakeGitHub()
     eng, _ = _seeded_engine(
         tmp_state_dir, gh, ReplanStage.SUPERSEDE_INTENT, close_intent_at="2026-01-01T00:00:00+00:00"
@@ -3549,9 +3647,180 @@ def test_r11f1_an_unreadable_comment_list_over_an_open_source_is_unknown_then_re
     assert _txn(eng).stage is ReplanStage.SUPERSEDE_INTENT  # still resumable
     gh.comments_error = GitHubError("gh: not found")
     assert eng.step().next_phase == "BLOCKED"
+    assert "its comments could not be read" in eng.state.block_reason
     assert "a prior close cannot be ruled out" in eng.state.block_reason
     assert _txn(eng).stage is ReplanStage.REJECTED
     assert gh.closed_prs == [] and gh.prs[PR].state == "OPEN"
+    assert not [call for call in gh.calls if call[0] == "get_pr_close_event_count"]
+
+
+def test_r11f1_a_receipt_over_an_open_source_refuses_before_the_events_are_read(tmp_state_dir):
+    """A receipt on an OPEN source already proves a close landed and was
+    reopened; the timeline is not consulted, and nothing is closed."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.SUPERSEDE_INTENT)
+    gh.add_comment(PR, 900, f"Superseded.\n\n{render_close_receipt(TXN_ID)}")
+    assert eng.step().next_phase == "BLOCKED"
+    assert "already carries the close receipt" in eng.state.block_reason
+    assert _txn(eng).stage is ReplanStage.REJECTED
+    _assert_source_untouched(eng, gh)
+    assert not [call for call in gh.calls if call[0] == "get_pr_close_event_count"]
+
+
+def test_unreadable_close_events_over_an_open_source_are_unknown_then_refused(tmp_state_dir):
+    """The watermark read keeps the transient/conclusive split: a transient
+    failure leaves the intent resumable, a conclusive one refuses without
+    closing, since a prior close cannot be ruled out (#69)."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.SUPERSEDE_INTENT)
+    gh.close_events_error = GitHubUnavailableError("gh: 502 Bad Gateway")
+    with pytest.raises(GitHubUnavailableError):
+        eng.step()
+    assert _txn(eng).stage is ReplanStage.SUPERSEDE_INTENT  # still resumable
+    assert _txn(eng).close_attempts == 1  # no attempt was journalled
+    gh.close_events_error = GitHubError("gh: HTTP 404")
+    assert eng.step().next_phase == "BLOCKED"
+    assert "its issue events could not be read" in eng.state.block_reason
+    assert "a prior close cannot be ruled out" in eng.state.block_reason
+    assert _txn(eng).stage is ReplanStage.REJECTED
+    _assert_source_untouched(eng, gh)
+
+
+def test_a_closed_event_count_below_the_watermark_is_refused(tmp_state_dir):
+    """Events cannot disappear, so a count below the intent's watermark means
+    the watermark is not this PR's or the listing was not read whole; neither
+    licenses a close."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(
+        tmp_state_dir, gh, ReplanStage.SUPERSEDE_INTENT, source_closed_event_count=2
+    )
+    gh.add_close_event(PR)  # 1 < 2
+    assert eng.step().next_phase == "BLOCKED"
+    assert "reports 1 closed event(s), fewer than the 2 the close intent recorded" in (
+        eng.state.block_reason
+    )
+    assert _txn(eng).stage is ReplanStage.REJECTED
+    _assert_source_untouched(eng, gh)
+
+
+def test_the_intent_records_the_watermark_read_after_the_checkpoint_held(tmp_state_dir):
+    """A source that was closed and reopened *before* the replan carries
+    closed events already; the intent records that count, not zero, so a
+    resume compares against the timeline as it stood at the intent (#69).
+    The watermark is read after the pre-close checks pass and before the
+    intent is persisted, and the write follows it."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.VERIFIED)
+    gh.add_close_event(PR)
+    gh.add_close_event(PR)  # closed and reopened twice in its earlier life
+
+    def die(*_args, **_kwargs):
+        raise RuntimeError("process died before `gh pr close` ran")
+
+    eng.github.close_pr = die  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError):
+        eng.step()
+    crashed = _txn(eng)
+    assert crashed.stage is ReplanStage.SUPERSEDE_INTENT
+    assert crashed.source_closed_event_count == 2 and crashed.close_attempts == 1
+    kinds = [call[0] for call in gh.calls]
+    assert kinds.index("get_merge_base_sha") < kinds.index("get_pr_close_event_count")
+    assert gh.prs[PR].state == "OPEN" and gh.closed_prs == []
+
+    # Resume: the timeline still reads 2, so the close never ran; retry once.
+    del gh.close_pr  # the fake closes again
+    resumed = _restart(eng, gh)
+    assert resumed.step().next_phase == "REVIEW"
+    assert len(gh.closed_prs) == 1 and gh.prs[PR].state == "CLOSED"
+    assert resumed.state.current_pr_url == REPLACEMENT_PR
+
+
+def test_a_human_close_and_reopen_before_the_resume_is_never_overridden(tmp_state_dir):
+    """Crash before `gh pr close`, then a human closes *and reopens* the
+    source before the resume. No receipt exists and the comments cannot say
+    what happened; the timeline can, and the human's last word stands."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.SUPERSEDE_INTENT)
+    _closed_by_a_human(gh)
+    gh.prs[PR].state = "OPEN"
+    assert eng.step().next_phase == "BLOCKED"
+    assert "closed-event count rose from 0 at the intent to 1" in eng.state.block_reason
+    assert _txn(eng).stage is ReplanStage.REJECTED
+    assert gh.closed_prs == [] and gh.prs[PR].state == "OPEN"
+    assert eng.state.current_pr_url == PR and eng.state.superseded_prs == []
+
+
+def test_unreadable_close_events_before_the_intent_leave_the_source_open(tmp_state_dir):
+    """The first write reads the watermark before persisting the intent: a
+    transient failure leaves the transaction at VERIFIED, a conclusive one
+    refuses; neither records an intent it cannot make comparable, and nothing
+    is closed."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.VERIFIED)
+    gh.close_events_error = GitHubUnavailableError("gh: 502 Bad Gateway")
+    with pytest.raises(GitHubUnavailableError):
+        eng.step()
+    assert _txn(eng).stage is ReplanStage.VERIFIED
+    assert _txn(eng).close_intent_at == "" and _txn(eng).close_attempts == 0
+    gh.close_events_error = GitHubError("gh: HTTP 404")
+    assert eng.step().next_phase == "BLOCKED"
+    assert "the close intent cannot record the closed-event count" in eng.state.block_reason
+    assert _txn(eng).stage is ReplanStage.REJECTED
+    _assert_source_untouched(eng, gh)
+
+
+def test_verify_close_never_ran_is_a_pure_function_of_the_count_and_the_intent():
+    txn = _seed_txn(ReplanStage.SUPERSEDE_INTENT, source_closed_event_count=3, close_attempts=1)
+    assert verify_close_never_ran(3, txn) == ""
+    assert "rose from 3 at the intent to 4" in verify_close_never_ran(4, txn)
+    assert "fewer than the 3 the close intent recorded" in verify_close_never_ran(2, txn)
+    exhausted = _seed_txn(
+        ReplanStage.SUPERSEDE_INTENT, source_closed_event_count=3, close_attempts=MAX_CLOSE_ATTEMPTS
+    )
+    assert "retried at most once" in verify_close_never_ran(3, exhausted)
+    # A landed close outranks an exhausted budget in the explanation.
+    assert "rose from 3" in verify_close_never_ran(4, exhausted)
+    verified = _seed_txn(ReplanStage.VERIFIED)
+    assert "not under a recorded close intent" in verify_close_never_ran(0, verified)
+
+
+@pytest.mark.parametrize("field", ["close_attempts", "source_closed_event_count"])
+def test_an_intent_without_its_watermark_fields_is_corrupt_under_the_current_protocol(field):
+    """The new fields follow the persisted-field rule: missing or malformed at
+    SUPERSEDE_INTENT is corruption the loader refuses whole, never a default
+    that would license (or forbid) a retry on nothing."""
+    journal = _seed_dict(ReplanStage.SUPERSEDE_INTENT)
+    del journal[field]
+    txn = ReplanTransaction.from_dict(journal)
+    assert txn.stage is ReplanStage.REJECTED
+    assert f"{field} is required at stage 'supersede_intent' but missing" in txn.journal_defects
+    journal = _seed_dict(ReplanStage.SUPERSEDE_INTENT)
+    journal[field] = -1
+    txn = ReplanTransaction.from_dict(journal)
+    assert txn.stage is ReplanStage.REJECTED
+    assert f"{field} must be an integer >= 0, got -1" in txn.journal_defects
+    journal = _seed_dict(ReplanStage.SUPERSEDE_INTENT)
+    journal[field] = "1"
+    assert ReplanTransaction.from_dict(journal).stage is ReplanStage.REJECTED
+    # Before the write the fields are absent by design.
+    journal = _seed_dict(ReplanStage.VERIFIED)
+    del journal[field]
+    assert ReplanTransaction.from_dict(journal).stage is ReplanStage.VERIFIED
+
+
+def test_a_zero_close_attempt_count_at_the_intent_is_corrupt():
+    """The intent is written together with its first attempt; an intent
+    covering zero attempts was not written by this controller."""
+    journal = _seed_dict(ReplanStage.SUPERSEDE_INTENT)
+    journal["close_attempts"] = 0
+    txn = ReplanTransaction.from_dict(journal)
+    assert txn.stage is ReplanStage.REJECTED
+    assert "close_attempts is required at stage 'supersede_intent' but" in "".join(
+        txn.journal_defects
+    )
+    journal["close_attempts"] = 1
+    journal["source_closed_event_count"] = 0  # zero is honest here
+    assert ReplanTransaction.from_dict(journal).stage is ReplanStage.SUPERSEDE_INTENT
 
 
 def test_f2_a_crash_after_the_reopen_lands_resumes_into_the_undo(tmp_state_dir):
@@ -5307,6 +5576,30 @@ def _protocol_3_journal(stage: ReplanStage) -> dict:
     return data
 
 
+def _protocol_4_journal(stage: ReplanStage) -> dict:
+    """Exactly what the protocol-4 controller's ``to_dict`` wrote at ``stage``.
+
+    Protocol 4 added the two merge-base fields to protocol 3; protocol 5 then
+    added ``source_closed_event_count`` and ``close_attempts``, written with
+    the close intent (#69). So the key set is the current one minus those two
+    -- and at every stage before SUPERSEDE_INTENT the values are the current
+    controller's too, since both fields are zero until the intent is written.
+    """
+    data = _protocol_3_journal(stage)
+    data["decision_merge_base_sha"] = MERGE_BASE
+    data["source_merge_base_sha"] = MERGE_BASE if stage is not ReplanStage.PENDING else ""
+    assert "source_closed_event_count" not in data and "close_attempts" not in data
+    return data
+
+
+_PROTOCOL_4_REFUSED_STAGES = (
+    ReplanStage.SUPERSEDE_INTENT,
+    ReplanStage.COMPENSATING,
+    ReplanStage.SUPERSEDED,
+)
+_PROTOCOL_4_LOADED_STAGES = (ReplanStage.PENDING, ReplanStage.PREPARED, ReplanStage.VERIFIED)
+
+
 def _protocol_1_state_file(eng, journal: dict, *, protocol: str = "1") -> dict:
     """Rewrite the engine's state file as the ``protocol`` controller left it."""
     data = json.loads(eng.paths.state_file.read_text(encoding="utf-8"))
@@ -5470,23 +5763,123 @@ def test_an_in_flight_protocol_3_journal_is_refused_at_the_state_boundary(tmp_st
     assert gh.prs[PR].state == "OPEN" and eng.provider.calls == []
 
 
+@pytest.mark.parametrize("stage", _PROTOCOL_4_REFUSED_STAGES, ids=lambda s: s.value)
+def test_a_protocol_4_journal_past_the_write_is_refused_by_the_loader_only_as_corruption(stage):
+    """The journal loader can only call a protocol-4 intent corrupt (it lacks
+    the fields the intent must carry), so it must never be reached from a
+    protocol-4 file at these stages."""
+    txn = ReplanTransaction.from_dict(_protocol_4_journal(stage))
+    assert txn.stage is ReplanStage.REJECTED
+    assert "persisted replan transaction is corrupt" in txn.rejection_reason
+    assert f"close_attempts is required at stage {stage.value!r} but missing" in (
+        txn.journal_defects
+    )
+    assert f"source_closed_event_count is required at stage {stage.value!r} but missing" in (
+        txn.journal_defects
+    )
+
+
+@pytest.mark.parametrize("stage", _PROTOCOL_4_REFUSED_STAGES, ids=lambda s: s.value)
+def test_an_in_flight_protocol_4_journal_past_the_write_is_refused_at_the_state_boundary(
+    tmp_state_dir, stage
+):
+    """A protocol-4 journal at or after SUPERSEDE_INTENT is refused the way
+    the earlier protocols' are, naming the binding it lacks -- the closed-event
+    watermark and attempt count -- and never migrated by reading the count
+    GitHub reports now (that would record the very close the watermark exists
+    to detect as if it predated the intent); nothing is read from or written
+    to GitHub, no agent runs, and the file is left byte-for-byte (#69)."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, stage)
+    eng.save()
+    data = _protocol_1_state_file(eng, _protocol_4_journal(stage), protocol="4")
+    before = eng.paths.state_file.read_bytes()
+    with pytest.raises(StateError) as info:
+        eng.load()
+    message = str(info.value)
+    assert "protocol_version '4'" in message and "replan in flight" in message
+    assert f"stage {stage.value!r}" in message
+    assert "did not record the source PR's closed-event count and the number of close" in message
+    assert "does not reconstruct them from the events GitHub reports now" in message
+    assert "merge base" not in message and "PR and issue" not in message
+    assert "Finish or undo the replan with the controller that wrote it" in message
+    assert "corrupt" not in message
+    assert eng.paths.state_file.read_bytes() == before
+    assert json.loads(before)["replan_transaction"] == data["replan_transaction"]
+    assert gh.calls == [] and eng.provider.calls == []
+    assert gh.closed_prs == [] and gh.prs[PR].state == "OPEN"
+
+
+@pytest.mark.parametrize("stage", _PROTOCOL_4_LOADED_STAGES, ids=lambda s: s.value)
+def test_a_protocol_4_journal_before_the_write_loads_and_relabels(tmp_state_dir, stage):
+    """The 4 -> 5 step touched only the intent's record, so a protocol-4
+    journal before the write is byte-for-byte what protocol 5 writes there:
+    it loads as current, the label is rewritten on the next save, and the
+    reducer continues from it -- the watermark it needs is read at the intent,
+    from the timeline as it stands then, not reconstructed on load."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, stage)
+    eng.save()
+    _protocol_1_state_file(eng, _protocol_4_journal(stage), protocol="4")
+    loaded = eng.load()
+    assert loaded.protocol_version == "5"
+    txn = _txn(eng)
+    assert txn.stage is stage and not txn.journal_defects
+    assert txn.source_closed_event_count == 0 and txn.close_attempts == 0
+    eng.save()
+    assert json.loads(eng.paths.state_file.read_text())["protocol_version"] == "5"
+    if stage is ReplanStage.VERIFIED:
+        # The write proceeds from the relabelled journal and records the
+        # watermark the protocol-4 controller never did.
+        gh.add_close_event(PR)  # a close-and-reopen in the source's earlier life
+        attempts: list[tuple[int, int]] = []
+        gh.close_race = lambda g: attempts.append(
+            (_txn(eng).source_closed_event_count, _txn(eng).close_attempts)
+        )
+        assert eng.step().next_phase == "REVIEW"
+        assert attempts == [(1, 1)]
+        assert len(gh.closed_prs) == 1
+
+
+def test_an_unreadable_stage_in_a_protocol_4_journal_is_still_a_refusal(tmp_state_dir):
+    """The stage scoping of the protocol-4 gap applies to stages this
+    controller knows; a stage it cannot read is refused as in-flight legacy,
+    never handed to the loader as corruption."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.PENDING)
+    eng.save()
+    journal = _protocol_4_journal(ReplanStage.PREPARED)
+    journal["stage"] = "from_a_future_version"
+    _protocol_1_state_file(eng, journal, protocol="4")
+    with pytest.raises(StateError) as info:
+        eng.load()
+    assert "protocol_version '4' with a replan in flight" in str(info.value)
+    assert "corrupt" not in str(info.value)
+    assert eng.provider.calls == [] and gh.closed_prs == []
+
+
 def test_the_legacy_journal_refusal_knows_only_the_legacy_protocols():
     """The refusal describes a gap per protocol; asked about a label it has no
     description for (the current one included) it fails loudly rather than
     describe the wrong gap."""
     from autoforge.replan_txn import LEGACY_JOURNAL_PROTOCOLS, legacy_journal_refusal
 
-    assert LEGACY_JOURNAL_PROTOCOLS == frozenset({"1", "2", "3"})
+    assert LEGACY_JOURNAL_PROTOCOLS == frozenset({"1", "2", "3", "4"})
     journal = _seed_dict(ReplanStage.PREPARED)
-    for protocol in ("4", "0", ""):
+    for protocol in ("5", "0", ""):
         with pytest.raises(ValueError, match="not a legacy journal protocol"):
             legacy_journal_refusal(journal, protocol=protocol, written_by="0.1.0")
     for protocol in ("1", "2", "3"):
         assert legacy_journal_refusal({}, protocol=protocol, written_by="0.1.0") == ""
         assert legacy_journal_refusal(journal, protocol=protocol, written_by="0.1.0")
+    # Protocol 4's gap is scoped to the stages whose record changed.
+    assert legacy_journal_refusal({}, protocol="4", written_by="0.1.0") == ""
+    assert legacy_journal_refusal(journal, protocol="4", written_by="0.1.0") == ""
+    intent = _seed_dict(ReplanStage.SUPERSEDE_INTENT)
+    assert legacy_journal_refusal(intent, protocol="4", written_by="0.1.0")
 
 
-@pytest.mark.parametrize("protocol", ["1", "2", "3"])
+@pytest.mark.parametrize("protocol", ["1", "2", "3", "4"])
 def test_r7f1_a_legacy_state_without_a_replan_in_flight_loads_as_current(tmp_state_dir, protocol):
     """A legacy file with an empty or terminal journal is a current file with
     an old label (the 2 -> 3 review-binding rule of #68 and the 3 -> 4 rule
@@ -5504,10 +5897,10 @@ def test_r7f1_a_legacy_state_without_a_replan_in_flight_loads_as_current(tmp_sta
         data["phase"] = "REVIEW" if not journal else "BLOCKED"
         eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
         loaded = eng.load()
-        assert loaded.protocol_version == "4"
+        assert loaded.protocol_version == "5"
         assert loaded.replan_transaction == journal
         eng.save()
-        assert json.loads(eng.paths.state_file.read_text())["protocol_version"] == "4"
+        assert json.loads(eng.paths.state_file.read_text())["protocol_version"] == "5"
     # A legacy file that predates the journal field altogether is the same
     # case: no replan in flight.
     data = json.loads(eng.paths.state_file.read_text())
@@ -5542,7 +5935,7 @@ def test_r7f1_the_version_label_decides_not_the_journal_shape(tmp_state_dir):
     gh = FakeGitHub()
     eng, txn = _seeded_engine(tmp_state_dir, gh, ReplanStage.SUPERSEDE_INTENT)
     eng.save()
-    for legacy in ("1", "2", "3"):
+    for legacy in ("1", "2", "3", "4"):
         data = _protocol_1_state_file(eng, txn.to_dict())
         data["protocol_version"] = legacy
         eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
@@ -5554,10 +5947,15 @@ def test_r7f1_the_version_label_decides_not_the_journal_shape(tmp_state_dir):
     # this controller wrote the journal, so a missing field is a missing
     # field, whichever protocol step introduced it.
     data = json.loads(eng.paths.state_file.read_text())
-    data["protocol_version"] = "4"
+    data["protocol_version"] = "5"
     data["phase"] = Phase.REPLAN_REEXECUTE.value
     data["block_reason"] = ""
-    for missing in ("decision_pr_url", "decision_merge_base_sha", "source_merge_base_sha"):
+    for missing in (
+        "decision_pr_url",
+        "decision_merge_base_sha",
+        "source_merge_base_sha",
+        "close_attempts",
+    ):
         data["replan_transaction"] = txn.to_dict()
         del data["replan_transaction"][missing]
         eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
@@ -5782,22 +6180,39 @@ def test_a_resume_at_the_budget_still_carries_out_a_decided_compensation(tmp_sta
     assert persisted.current_pr_url == PR and persisted.superseded_prs == []
 
 
-def test_a_resume_at_the_budget_never_closes_from_a_recorded_intent(tmp_state_dir):
-    """#71: the exemption is keyed on the stage, and the reducer still never closes.
+def test_a_resume_at_the_budget_never_closes_over_a_reopened_source(tmp_state_dir):
+    """#71: the exemption is keyed on the stage, and the reducer decides on
+    GitHub's evidence as it always did.
 
-    SUPERSEDE_INTENT over an OPEN source with no receipt is the refusal it
-    always was; the budget neither blocks it first nor licenses the close.
+    SUPERSEDE_INTENT over an OPEN source whose timeline shows a close after
+    the intent is the refusal it always was; the budget neither blocks it
+    first nor licenses the close.
     """
     gh = FakeGitHub()
     eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.SUPERSEDE_INTENT)
+    gh.add_close_event(PR)
     steps = _at_the_budget(eng)
     eng2 = _restart(eng, gh)
     out = eng2.step()
     assert out.next_phase == "BLOCKED"
-    assert "carries no close receipt" in eng2.state.block_reason
+    assert "closed-event count rose" in eng2.state.block_reason
     assert "max_total_steps" not in eng2.state.block_reason
     assert gh.closed_prs == [] and gh.prs[PR].state == "OPEN"
     assert _txn(eng2).stage is ReplanStage.REJECTED
+    assert load_state(eng2.paths.state_file).step_count == steps + 1
+
+
+def test_a_resume_at_the_budget_still_finishes_a_close_that_never_ran(tmp_state_dir):
+    """#71 with #69: the exemption lets the controller finish the decision it
+    persisted, and the retry of a close GitHub proves never ran is part of
+    finishing it."""
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.SUPERSEDE_INTENT)
+    steps = _at_the_budget(eng)
+    eng2 = _restart(eng, gh)
+    assert eng2.step().next_phase == "REVIEW"
+    assert len(gh.closed_prs) == 1 and gh.prs[PR].state == "CLOSED"
+    assert eng2.state.current_pr_url == REPLACEMENT_PR
     assert load_state(eng2.paths.state_file).step_count == steps + 1
 
 
@@ -5940,11 +6355,14 @@ _AGENT_NOTE = "invoke the replan agent"
 _CLOSE_NOTE = "would close the old PR"
 _NO_AGENT_NOTES = ("without invoking an agent", "invokes no agent", "would not invoke an agent")
 _NO_CLOSE_NOTES = ("without closing anything", "never closes it", "touching GitHub")
+_RETRY_NOTE = "would retry the close once"
+# (may launch the agent, may close): ``None`` for the close means the plan
+# promises at most the bounded retry of a close GitHub proves never ran (#69).
 _STAGE_PLAN = {
     ReplanStage.PENDING: (True, True),
     ReplanStage.PREPARED: (True, True),
     ReplanStage.VERIFIED: (False, True),
-    ReplanStage.SUPERSEDE_INTENT: (False, False),
+    ReplanStage.SUPERSEDE_INTENT: (False, None),
     ReplanStage.SUPERSEDED: (False, False),
     ReplanStage.COMPENSATING: (False, False),
     ReplanStage.REJECTED: (False, False),
@@ -5955,13 +6373,18 @@ def _assert_plan_matches_the_stage(plan, stage: ReplanStage) -> str:
     notes = "\n".join(plan.notes)
     may_launch, may_close = _STAGE_PLAN[stage]
     assert (_AGENT_NOTE in notes) is may_launch, notes
-    assert (_CLOSE_NOTE in notes) is may_close, notes
+    assert (_CLOSE_NOTE in notes) is bool(may_close), notes
     _assert_plan_metadata_follows(plan, may_launch)
     assert f"replan transaction stage: {stage.value}" in notes
     assert PR in notes, notes
     if not may_launch:
         assert any(n in notes for n in _NO_AGENT_NOTES), notes
-    if not may_close:
+    if may_close is None:
+        # The one write a resume may still perform, and only as a retry the
+        # timeline licenses; every other outcome is a read that ends BLOCKED.
+        assert _RETRY_NOTE in notes, notes
+        assert "closed issue events" in notes and "BLOCKED" in notes, notes
+    elif not may_close:
         # Past the write (or refused): the plan says the step reads GitHub and
         # may end BLOCKED, never that it closes anything. The replacement is
         # bound from VERIFIED on, and the plan names it.
@@ -6036,9 +6459,9 @@ def test_dry_run_notes_follow_the_journal_stage(tmp_state_dir, stage):
     assert plan is not None
     notes = _assert_plan_matches_the_stage(plan, stage)
     if stage is ReplanStage.SUPERSEDE_INTENT:
-        # Both outcomes of the GitHub re-read, since the plan cannot read it.
+        # Every outcome of the GitHub re-read, since the plan cannot read it.
         assert "close receipt" in notes and "source OPEN" in notes
-        assert "never closes it from here" in notes
+        assert "attempt 2 of 2" in notes and "risen -> a close landed" in notes
     if stage is ReplanStage.REJECTED:
         assert "refused by verification" in notes
     assert gh.calls == [] and eng.provider.calls == []

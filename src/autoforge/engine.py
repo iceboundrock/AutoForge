@@ -186,6 +186,7 @@ from .redaction import redact, redact_argv, redact_dict
 from .replan import HistoricalReviewCollector, ReplanDecision, evaluate_replan_policy
 from .replan_txn import (
     CLOSE_BEGUN_STAGES,
+    MAX_CLOSE_ATTEMPTS,
     Disposition,
     ReplanStage,
     ReplanTransaction,
@@ -197,6 +198,7 @@ from .replan_txn import (
     render_close_receipt,
     select_bound_candidate,
     verify_attestation,
+    verify_close_never_ran,
     verify_closed_source,
     verify_decision_point,
     verify_run_binding,
@@ -3450,10 +3452,12 @@ class ControllerEngine:
         follows the same dispatch rather than describing the whole lifecycle
         at every stage: the agent is launched only while no PR bound to this
         transaction exists (:func:`may_invoke_agent`; the plan carries a
-        command only there), the close is reachable from ``VERIFIED`` alone,
-        and every later stage reads GitHub and then activates, undoes or
-        refuses -- which of the three is a GitHub fact the plan cannot read,
-        so it names all of them. Pure: reads the journal and nothing else.
+        command only there), the close is performed from ``VERIFIED`` and
+        retried at most once from ``SUPERSEDE_INTENT`` when the source's issue
+        events prove the first attempt never landed, and every later stage
+        reads GitHub and then activates, undoes or refuses -- which of those is
+        a GitHub fact the plan cannot read, so it names all of them. Pure:
+        reads the journal and nothing else.
         """
         source = txn.source_pr_url or txn.decision_pr_url or "(unknown)"
         replacement = txn.replacement_pr_url or "(none)"
@@ -3486,15 +3490,33 @@ class ControllerEngine:
                 "(the close stays: it was confirmed correct when it was made)",
             ], f"{to_review} | BLOCKED if a checkpoint moved"
         if txn.stage is ReplanStage.SUPERSEDE_INTENT:
+            retry = (
+                "source OPEN without the receipt: would re-read its closed issue events via "
+                f"gh and compare them with the {txn.source_closed_event_count} recorded at the "
+                "close intent; "
+            )
+            if txn.close_attempts < MAX_CLOSE_ATTEMPTS:
+                retry += (
+                    "unchanged -> no close has happened since the intent, would retry the "
+                    f"close once (attempt {txn.close_attempts + 1} of {MAX_CLOSE_ATTEMPTS}) "
+                    "after both checkpoints hold on a fresh gh read and the attempt has been "
+                    "persisted; risen -> a close landed and was reopened, would refuse and "
+                    "enter BLOCKED naming both PRs"
+                )
+            else:
+                retry += (
+                    f"would refuse and enter BLOCKED either way, since {txn.close_attempts} "
+                    "attempts are already recorded and the close is retried at most once"
+                )
             return [
-                f"would re-read the source PR {source} via gh; never closes it from here and "
-                "invokes no agent",
+                f"would re-read the source PR {source} via gh; invokes no agent",
                 "source CLOSED and carrying this transaction's close receipt: would confirm both "
                 f"checkpoints, then activate the replacement {replacement} or undo the close "
                 "if a checkpoint moved",
-                "source OPEN, or closed without the receipt: would refuse and enter BLOCKED "
-                "naming both PRs, since local state cannot tell a close that never ran from "
-                "one that landed and was reopened",
+                "source OPEN and carrying the receipt, or closed without it: would refuse and "
+                "enter BLOCKED naming both PRs, since a prior close landed and was reopened, "
+                "or the close is not this transaction's",
+                retry,
             ], f"{to_review} | BLOCKED (refused, or the close undone)"
         # Before the write. PENDING and PREPARED may still launch the agent;
         # VERIFIED never does.
@@ -5478,12 +5500,24 @@ class ControllerEngine:
         *after* the close is observed (:meth:`comment_pr`, checked by
         :meth:`_close_not_ours`): ``gh pr close --comment`` posts its comment
         before the close lands, so a receipt in it can predate the close and
-        must never count as proof. A resume never posts a receipt and never
-        performs the close: the write is reachable from ``VERIFIED`` only. A
-        CLOSED source without the receipt is refused, and so is an OPEN one
-        under a recorded intent -- with or without the receipt -- because the
-        journal cannot tell a close that never ran from one that landed, lost
-        its receipt to a crash, and was then reopened by a human (R11-F1).
+        must never count as proof. A CLOSED source without the receipt is
+        refused, and so is an OPEN one that carries it: a prior close landed
+        and a human reopened the PR.
+
+        An OPEN source *without* the receipt is where the receipt runs out:
+        "the close never ran" and "it landed, lost its receipt to a crash, and
+        a human reopened the PR" leave the same comments, and only the second
+        is a decision a retry would override (R11-F1). The intent therefore
+        also records the source's ``closed`` issue-event count, read just
+        before it is persisted. Issue events are append-only and undeletable,
+        so on resume the same count read again is proof either way
+        (:func:`verify_close_never_ran`, #69): risen, and a close landed after
+        the intent, so the reopen stands and nothing is closed; unchanged, and
+        no close of any kind happened, so the write is retried -- once, through
+        the same pre-close revalidation, with the attempt persisted before it
+        -- and the receipt is posted by whichever attempt observes its own
+        close. Absence of a comment never decides the write; the event count
+        does.
         """
         state = self._require_state()
         unbound = self._replan_unbound(txn)
@@ -5509,16 +5543,17 @@ class ControllerEngine:
             # round trip old by the time the comparison runs.
             return self._confirm_supersede(txn)
         if txn.stage is ReplanStage.SUPERSEDE_INTENT:
-            # An OPEN source under a durable intent is never closed from here.
-            # The intent proves a close was *about* to be attempted, not
-            # whether it was: "crashed before `gh pr close` ran" and "closed,
-            # crashed before the receipt was published, then reopened by a
-            # human" leave the same OPEN source with no receipt, and only the
-            # second is a decision a retry would override (R11-F1). The
-            # receipt can make the second story certain; its absence never
-            # makes the first one so. Both refuse, naming the story the
-            # evidence supports, and the write below stays reachable from
-            # VERIFIED alone.
+            # An OPEN source under a durable intent. The intent proves a close
+            # was *about* to be attempted, not whether it was: "crashed before
+            # `gh pr close` ran" and "closed, crashed before the receipt was
+            # published, then reopened by a human" leave the same OPEN source
+            # with no receipt, and only the second is a decision a retry
+            # would override (R11-F1). The receipt can make the second story
+            # certain; its absence never makes the first one so. What does is
+            # the source's `closed` issue-event count against the one the
+            # intent recorded (#69): unchanged proves no close happened since
+            # the intent and the write below is retried once; anything else
+            # refuses, naming the story the evidence supports.
             try:
                 prior_comments = self.github.get_pr_comments(txn.source_pr_url)
             except GitHubUnavailableError:
@@ -5537,16 +5572,25 @@ class ControllerEngine:
                     f"for replan transaction {txn.transaction_id}; a prior close landed and was "
                     "then reopened, so the controller will not close it again",
                 )
-            return self._reject_replan(
-                txn,
-                f"source PR {txn.source_pr_url} is open under a recorded close intent for replan "
-                f"transaction {txn.transaction_id} but carries no close receipt; the close may "
-                "never have run, or it may have landed and been reopened by a human before the "
-                "receipt was published, and local state cannot tell the two apart, so the "
-                "controller will not close it",
-            )
-        # Reached from VERIFIED only: the destructive write is ahead, and no
-        # earlier attempt at it was ever recorded. Revalidate both sides now.
+            try:
+                closed_events = self.github.get_pr_close_event_count(txn.source_pr_url)
+            except GitHubUnavailableError:
+                raise
+            except GitHubError as exc:
+                return self._reject_replan(
+                    txn,
+                    f"source PR {txn.source_pr_url} is open under a recorded close intent, but "
+                    f"its issue events could not be read ({exc}), so a prior close cannot be "
+                    "ruled out and the controller will not close it",
+                )
+            refusal = verify_close_never_ran(closed_events, txn)
+            if refusal:
+                return self._reject_replan(txn, refusal)
+            # No close has happened since the intent: the write below runs
+            # again, as the retry the journal will record before it.
+        # The destructive write is ahead: either no attempt at it was ever
+        # recorded (VERIFIED), or GitHub just proved the recorded one never
+        # landed (SUPERSEDE_INTENT). Both revalidate both sides now.
         try:
             target = self.github.get_pr(txn.replacement_pr_url)
             open_prs = self.github.list_open_prs(state.repository)
@@ -5571,8 +5615,27 @@ class ControllerEngine:
         drift = verify_source_checkpoint(source, txn, merge_base)
         if drift:
             return self._reject_replan(txn, drift)
-        txn.stage = ReplanStage.SUPERSEDE_INTENT
-        txn.close_intent_at = utcnow_iso()
+        if txn.stage is ReplanStage.VERIFIED:
+            # The watermark a resume compares against. Read after the source
+            # checkpoint held and immediately before the intent is persisted:
+            # a count that lags GitHub can only be lower than the truth, and a
+            # lower watermark only makes the resume refuse where it could
+            # have retried, never the reverse.
+            try:
+                closed_events = self.github.get_pr_close_event_count(txn.source_pr_url)
+            except GitHubUnavailableError:
+                raise
+            except GitHubError as exc:
+                return self._reject_replan(
+                    txn,
+                    f"the issue events of source PR {txn.source_pr_url} could not be read "
+                    f"({exc}), so the close intent cannot record the closed-event count a "
+                    "resume would need, and the controller will not close it",
+                )
+            txn.stage = ReplanStage.SUPERSEDE_INTENT
+            txn.close_intent_at = utcnow_iso()
+            txn.source_closed_event_count = closed_events
+        txn.close_attempts += 1
         self._save_replan_txn(txn)
         try:
             # No receipt here: `gh pr close --comment` posts before the close
@@ -5610,7 +5673,7 @@ class ControllerEngine:
             )
         # The close landed under this transaction: publish the ownership
         # receipt now, so a resume can tell this close from a human's. Posted
-        # only by the step that observed its own close; a resume never posts.
+        # only by the attempt that observed its own close.
         try:
             self.github.comment_pr(txn.source_pr_url, render_close_receipt(txn.transaction_id))
         except GitHubUnavailableError:

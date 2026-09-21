@@ -1651,6 +1651,78 @@ def test_get_merge_base_sha_refuses_a_partial_head():
     assert seen == []
 
 
+def test_get_pr_close_event_count_reads_every_page_of_the_issue_events():
+    """#69: the replan close watermark is the number of ``closed`` events on
+    the PR's issue timeline, read whole through the paginated events listing
+    (a PR is an issue to that endpoint), counting nothing else."""
+    seen = []
+
+    def handler(req):
+        seen.append(req.command)
+        return _paged(
+            [
+                {"id": 1, "event": "referenced"},
+                {"id": 2, "event": "closed"},
+                {"id": 3, "event": "reopened"},
+            ],
+            [
+                {"id": 4, "event": "head_ref_deleted"},
+                {"id": 5, "event": "closed"},
+                {"id": 6, "event": "merged"},
+            ],
+        )
+
+    count = _client(handler).get_pr_close_event_count("https://github.com/O/R/pull/42")
+    assert count == 2
+    assert seen == [
+        ["gh", "api", "--paginate", "--slurp", "repos/O/R/issues/42/events?per_page=100"]
+    ]
+
+
+def test_get_pr_close_event_count_of_a_pr_never_closed_is_zero():
+    url = "https://github.com/o/r/pull/1"
+    assert _client(lambda req: _paged([])).get_pr_close_event_count(url) == 0
+    handler = lambda req: _paged([{"id": 1, "event": "referenced"}])  # noqa: E731
+    assert _client(handler).get_pr_close_event_count(url) == 0
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [{"id": 2}, {"id": 2, "event": ""}, {"id": 2, "event": 7}, "closed", None],
+)
+def test_get_pr_close_event_count_refuses_an_unusable_event(entry):
+    """An entry whose kind cannot be read is not silently "not a close": the
+    count licenses a destructive write, so a listing that cannot be read whole
+    is refused."""
+    handler = lambda req: _paged([{"id": 1, "event": "closed"}, entry])  # noqa: E731
+    with pytest.raises(GitHubError, match="issue events of https://github.com/o/r/pull/1 contain"):
+        _client(handler).get_pr_close_event_count("https://github.com/o/r/pull/1")
+
+
+def test_get_pr_close_event_count_refuses_a_non_paginated_answer():
+    with pytest.raises(GitHubError, match="non-paginated"):
+        _client(lambda req: _res([{"id": 1, "event": "closed"}])).get_pr_close_event_count(
+            "https://github.com/o/r/pull/1"
+        )
+    with pytest.raises(GitHubError, match="non-paginated"):
+        _client(lambda req: _res({"id": 1, "event": "closed"})).get_pr_close_event_count(
+            "https://github.com/o/r/pull/1"
+        )
+
+
+def test_get_pr_close_event_count_keeps_the_transient_conclusive_split():
+    gh = GitHubClient(
+        runner=lambda req: _res({}, exit_code=1, stderr="error connecting to api.github.com"),
+        retry_delay_seconds=0,
+    )
+    with pytest.raises(GitHubUnavailableError):
+        gh.get_pr_close_event_count("https://github.com/o/r/pull/1")
+    with pytest.raises(GitHubError, match="failed"):
+        _client(lambda req: _res({}, exit_code=1, stderr="HTTP 404")).get_pr_close_event_count(
+            "https://github.com/o/r/pull/1"
+        )
+
+
 def test_find_workflow_runs_filters_through_the_query_string_and_reads_every_page():
     seen = []
     first = {**_RUN, "id": 99, "event": "push", "head_branch": "main"}
