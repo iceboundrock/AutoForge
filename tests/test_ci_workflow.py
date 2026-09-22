@@ -3,24 +3,32 @@
 The workflow itself is only really verified by running on GitHub. What these
 tests protect is the part that can rot silently: the matrix must keep
 covering the Python floor the project declares, the hosted commands must stay
-the same ones `make` runs locally, and the one check name marked required on
-`main` must keep aggregating every job. If they diverge, a green CI run stops
-meaning "the local checks pass", and the controller's MERGE gate — which
-requires every check on the PR to have succeeded — would be verifying
-something weaker than it looks.
+the same ones `make check` runs locally (and vice versa), the local
+`check-matrix` must cover the same interpreters as the hosted matrix, and the
+one check name marked required on `main` must keep aggregating every job. If
+they diverge, a green CI run stops meaning "the local checks pass", and the
+controller's MERGE gate — which requires every check on the PR to have
+succeeded — would be verifying something weaker than it looks.
 
 These are text guards, not a YAML parser (the project has no YAML dependency
 outside the optional `yaml` extra). They read the workflow with whole-line
 comments removed and address individual blocks, so prose in a comment cannot
-satisfy them; ``test_comments_cannot_satisfy_the_guards`` pins that.
+satisfy them; ``test_comments_cannot_satisfy_the_guards`` pins that. The one
+exception is the Makefile's matrix target, whose expansion is read from
+``make --dry-run`` (which executes no recipe) rather than re-implemented here.
 """
 
 from __future__ import annotations
 
 import re
+import shutil
+import subprocess
 import sys
 import tomllib
+from dataclasses import dataclass, field
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
@@ -30,8 +38,13 @@ if str(REPO_ROOT / "src") not in sys.path:
 
 from autoforge.config import default_config  # noqa: E402
 
-# Local recipes whose command lines must also run in CI.
+# Local recipes whose command lines must also run in CI. Together with
+# `lock-check` (the local form of CI's `uv sync --locked`) they are exactly
+# what `make check` runs.
 MIRRORED_MAKE_TARGETS = ("test", "lint", "fmt-check", "typecheck")
+LOCKFILE_MAKE_TARGET = "lock-check"
+# The Makefile variable that mirrors the workflow's `python-version:` matrix.
+MATRIX_MAKE_VARIABLE = "CI_PYTHON_VERSIONS"
 
 
 def _workflow_text() -> str:
@@ -80,19 +93,63 @@ def _requires_python_floor() -> str:
     return match.group(1)
 
 
-def _make_recipes() -> dict[str, list[str]]:
-    recipes: dict[str, list[str]] = {}
+@dataclass
+class _MakeRule:
+    prerequisites: list[str] = field(default_factory=list)
+    recipe: list[str] = field(default_factory=list)
+
+
+_MAKE_ASSIGNMENT = re.compile(r"^([A-Za-z_]\w*)\s*[:+?]?=\s*(.*)$")
+
+
+def _make_text() -> str:
+    return (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
+
+
+def _make_rules() -> dict[str, _MakeRule]:
+    """Explicit rules only: a pattern rule like ``test-py%`` is a target too, unexpanded."""
+    rules: dict[str, _MakeRule] = {}
     target: str | None = None
-    for line in (REPO_ROOT / "Makefile").read_text(encoding="utf-8").splitlines():
+    for line in _make_text().splitlines():
         if line.startswith("\t"):
             if target is not None:
-                recipes[target].append(line.strip())
+                rules[target].recipe.append(line.strip())
+        elif _MAKE_ASSIGNMENT.match(line):
+            target = None
         elif ":" in line and not line.startswith((".", "#", " ")):
-            target = line.split(":", 1)[0].strip()
-            recipes.setdefault(target, [])
+            name, prerequisites = line.split(":", 1)
+            target = name.strip()
+            rules.setdefault(target, _MakeRule()).prerequisites.extend(prerequisites.split())
         elif not line.strip():
             target = None
-    return recipes
+    return rules
+
+
+def _make_recipes() -> dict[str, list[str]]:
+    return {target: rule.recipe for target, rule in _make_rules().items()}
+
+
+def _make_variable(name: str) -> list[str]:
+    for line in _make_text().splitlines():
+        match = _MAKE_ASSIGNMENT.match(line)
+        if match and match.group(1) == name:
+            return match.group(2).split()
+    raise AssertionError(f"Makefile defines no {name} variable")
+
+
+def _make_dry_run(target: str) -> list[str]:
+    """The commands ``make <target>`` would run, with variables and pattern rules expanded."""
+    make = shutil.which("make")
+    if make is None:
+        pytest.skip("GNU make is not installed; the Makefile cannot be expanded here")
+    result = subprocess.run(
+        [make, "--dry-run", "--silent", "-C", str(REPO_ROOT), target],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, f"make -n {target} failed:\n{result.stderr}"
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 
 def test_ci_workflow_exists():
@@ -129,9 +186,67 @@ def test_ci_runs_the_same_commands_as_the_local_make_targets():
             )
 
 
+def test_make_check_runs_exactly_what_ci_runs():
+    """The other direction (issue #75): `make check` neither drops nor adds a CI step.
+
+    Every `run:` in the workflow is either the locked install, mirrored locally
+    by `lock-check`, or a command of a mirrored target; and `check` depends on
+    exactly those targets, so a new local step that CI does not run (or a CI
+    step no local target runs) fails here.
+    """
+    rules = _make_rules()
+    assert "check" in rules, "Makefile has no 'check' target"
+    assert sorted(rules["check"].prerequisites) == sorted(
+        (*MIRRORED_MAKE_TARGETS, LOCKFILE_MAKE_TARGET)
+    ), "`make check` must run the lockfile check plus the mirrored targets and nothing else"
+    mirrored = {command for target in MIRRORED_MAKE_TARGETS for command in rules[target].recipe}
+    for command in re.findall(r"^\s*(?:-\s*)?run:\s*(.+?)\s*$", _code(), flags=re.MULTILINE):
+        if command in ("|", ">"):
+            continue  # a block scalar: the aggregate job's `exit 1`, not a check command
+        assert command.startswith("uv sync --locked") or command in mirrored, (
+            f"CI runs {command!r} but no target of `make check` does"
+        )
+
+
 def test_ci_installs_from_the_lockfile():
     """A stale uv.lock must fail CI rather than be silently re-resolved."""
     assert "uv sync --locked" in _code()
+
+
+def test_make_check_verifies_the_lockfile_like_ci():
+    """`uv lock --check` is the local form of `uv sync --locked` (issue #75).
+
+    Without it a stale lockfile passes `make check` and fails only once pushed.
+    """
+    rules = _make_rules()
+    assert LOCKFILE_MAKE_TARGET in rules, f"Makefile has no '{LOCKFILE_MAKE_TARGET}' target"
+    assert rules[LOCKFILE_MAKE_TARGET].recipe == ["uv lock --check"]
+    assert LOCKFILE_MAKE_TARGET in rules["check"].prerequisites, (
+        "`make check` does not verify uv.lock, so a stale lock passes locally and fails in CI"
+    )
+
+
+def test_make_check_matrix_runs_pytest_on_every_ci_python():
+    """The CI matrix is maintained once (issue #75).
+
+    The Makefile's CI_PYTHON_VERSIONS must equal the workflow's matrix, and
+    `make check-matrix` must actually run `pytest` on each of them. The
+    expansion is read from `make --dry-run`, so this pins what would run, not
+    how the Makefile spells it. Isolated, so the matrix never replaces the
+    project's own .venv.
+    """
+    versions = _matrix_python_versions(_code())
+    assert _make_variable(MATRIX_MAKE_VARIABLE) == versions, (
+        f"Makefile {MATRIX_MAKE_VARIABLE} and the CI python-version matrix differ"
+    )
+    commands = _make_dry_run("check-matrix")
+    assert len(commands) == len(versions), f"check-matrix expands to {commands}"
+    for version, command in zip(versions, commands, strict=True):
+        assert re.fullmatch(rf"uv run (--\S+ )*--python {re.escape(version)} pytest", command), (
+            f"check-matrix does not run pytest on Python {version}: {command!r}"
+        )
+        assert "--isolated" in command.split(), f"{command!r} would replace the project's .venv"
+        assert "--locked" in command.split(), f"{command!r} does not install from the lockfile"
 
 
 def test_the_required_check_aggregates_every_other_job():

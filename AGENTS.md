@@ -237,11 +237,12 @@ leaving several partially implemented abstractions.
 ## Validation before declaring work complete
 
 Run the repository's configured verification commands. `make check` runs
-the same four commands as the hosted CI workflow (`pytest`, `ruff check`,
-`ruff format --check`, `mypy src`) in the local environment on one
-interpreter; CI also installs from the lockfile (`uv sync --locked`) and runs
-`pytest` on every Python in its matrix (`.github/workflows/ci.yml`). See
-`Makefile` and README "Development". Also inspect
+the same commands as the hosted CI workflow (`uv lock --check` for its
+locked install, then `pytest`, `ruff check`, `ruff format --check`,
+`mypy src`) in the local environment on one interpreter; CI runs `pytest` on
+every Python in its matrix (`.github/workflows/ci.yml`), which
+`make check-matrix` reproduces locally when a change could be
+interpreter-sensitive. See `Makefile` and README "Development". Also inspect
 `git status --short` and `git diff --stat`. Do not claim tests, lint, type
 checking, GitHub operations, or agent invocations succeeded unless they were
 actually executed and verified.

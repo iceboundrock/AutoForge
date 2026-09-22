@@ -47,6 +47,7 @@ config, CLI, doctor, CI drift guards  test_config.py, test_cli.py, test_doctor.p
 
 Add a new test next to the behaviour's existing file; create a new file only
 for a new subsystem. Run `make test` (or `uv run pytest tests/<file>`) and
-`make lint`; `make check` runs the same commands as CI on one local
-interpreter. The locked install and the full Python matrix run only in
-`.github/workflows/ci.yml`.
+`make lint`; `make check` runs the same commands as CI (including the
+lockfile check) on one local interpreter, and `make check-matrix` runs
+`pytest` on every CI Python. `test_ci_workflow.py` keeps the Makefile and
+`.github/workflows/ci.yml` matching in both directions.
