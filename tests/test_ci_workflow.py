@@ -137,13 +137,18 @@ def _make_variable(name: str) -> list[str]:
     raise AssertionError(f"Makefile defines no {name} variable")
 
 
-def _make_dry_run(target: str) -> list[str]:
-    """The commands ``make <target>`` would run, with variables and pattern rules expanded."""
+def _make_dry_run(target: str, directory: Path = REPO_ROOT) -> list[str]:
+    """The commands ``make <target>`` would run, with variables and pattern rules expanded.
+
+    ``directory`` is where make runs (and reads its Makefile from); ``--silent``
+    also drops the "Nothing to be done" notice, so a target that expands to
+    nothing yields an empty list rather than prose.
+    """
     make = shutil.which("make")
     if make is None:
         pytest.skip("GNU make is not installed; the Makefile cannot be expanded here")
     result = subprocess.run(
-        [make, "--dry-run", "--silent", "-C", str(REPO_ROOT), target],
+        [make, "--dry-run", "--silent", "-C", str(directory), target],
         capture_output=True,
         text=True,
         check=False,
@@ -247,6 +252,31 @@ def test_make_check_matrix_runs_pytest_on_every_ci_python():
         )
         assert "--isolated" in command.split(), f"{command!r} would replace the project's .venv"
         assert "--locked" in command.split(), f"{command!r} does not install from the lockfile"
+
+
+def test_make_check_matrix_runs_every_interpreter_despite_a_colliding_file(tmp_path: Path):
+    """The matrix targets are phony (PR #122 review R1-F1).
+
+    A file named like a matrix target (``test-py3.11``) must not let make
+    consider that interpreter's run up to date and skip it, or `check-matrix`
+    reports success having tested fewer interpreters than CI does. A phony
+    target is also never matched against a pattern rule, so the naive
+    ``.PHONY: test-py3.11`` with a ``test-py%`` recipe expands to nothing at
+    all; the length check below catches that too. Run in a copy of the
+    Makefile so the colliding files never touch the checkout.
+    """
+    versions = _make_variable(MATRIX_MAKE_VARIABLE)
+    (tmp_path / "Makefile").write_text(_make_text(), encoding="utf-8")
+    for version in versions:
+        (tmp_path / f"test-py{version}").touch()
+    commands = _make_dry_run("check-matrix", directory=tmp_path)
+    assert len(commands) == len(versions), (
+        f"with a file per matrix target present, check-matrix expands to {commands}"
+    )
+    for version, command in zip(versions, commands, strict=True):
+        assert f"--python {version} pytest" in command, (
+            f"a file named test-py{version} made check-matrix skip that interpreter: {command!r}"
+        )
 
 
 def test_the_required_check_aggregates_every_other_job():

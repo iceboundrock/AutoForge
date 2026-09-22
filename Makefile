@@ -4,6 +4,13 @@
 # in .github/workflows/ci.yml). tests/test_ci_workflow.py fails when the two
 # lists differ, so the matrix is maintained here and checked there.
 CI_PYTHON_VERSIONS = 3.11 3.12
+# The matrix targets are phony like every other target here: a stray file
+# named test-py3.11 must not let make treat that interpreter's run as up to
+# date and skip it. .PHONY takes no pattern, and a phony target is never
+# matched against a pattern rule, so the targets are listed expanded and
+# their recipe below is a static pattern rule (an explicit rule per target).
+MATRIX_TARGETS = $(addprefix test-py,$(CI_PYTHON_VERSIONS))
+.PHONY: $(MATRIX_TARGETS)
 
 sync:
 	uv sync
@@ -38,7 +45,7 @@ check: lock-check test lint fmt-check typecheck
 # `pytest` on every CI interpreter, from a locked install like CI's.
 # --isolated gives each run its own cached environment: without it
 # `uv run --python X` replaces the project's .venv with an X environment.
-check-matrix: $(addprefix test-py,$(CI_PYTHON_VERSIONS))
+check-matrix: $(MATRIX_TARGETS)
 
-test-py%:
+$(MATRIX_TARGETS): test-py%:
 	uv run --isolated --locked --python $* pytest
