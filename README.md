@@ -1126,19 +1126,27 @@ the remote lifecycle only.
 ## Development
 
 ```bash
-make sync       # uv sync (.venv + dev tools)
-make test       # uv run pytest
-make lint       # uv run ruff check src tests
-make fmt        # uv run ruff format src tests
-make fmt-check  # uv run ruff format --check src tests
-make typecheck  # uv run mypy src
-make check      # the four CI commands, in the local environment
+make sync         # uv sync (.venv + dev tools)
+make test         # uv run pytest
+make lint         # uv run ruff check src tests
+make fmt          # uv run ruff format src tests
+make fmt-check    # uv run ruff format --check src tests
+make typecheck    # uv run mypy src
+make lock-check   # uv lock --check (what CI's `uv sync --locked` enforces)
+make check        # lock-check + the four CI commands, on the local interpreter
+make check-matrix # pytest on every CI Python (3.11, 3.12), opt-in
 ```
 
-The same four checks run hosted on every pull request and every push to
+The same checks run hosted on every pull request and every push to
 `main` (`.github/workflows/ci.yml`), each after a locked install
 (`uv sync --locked`): `pytest` on Python 3.11 and 3.12, and `ruff check` /
-`ruff format --check` / `mypy` once. The workflow needs no
+`ruff format --check` / `mypy` once. `make check` runs the same commands
+plus the lockfile check, but only on the interpreter the local environment
+resolves (`.python-version`); `make check-matrix` runs `pytest` on each CI
+interpreter in its own isolated environment (`uv run --isolated --locked
+--python <v>`), leaving `.venv` alone. The versions live in the Makefile's
+`CI_PYTHON_VERSIONS`; `tests/test_ci_workflow.py` fails when that list, the
+workflow's matrix, or the mirrored commands drift apart. The workflow needs no
 secrets and is granted none. Its aggregate `ci` job is a single stable check
 name that survives adding or renaming a matrix entry, and it is required on
 `main` by a repository ruleset. That is what gives the controller's
