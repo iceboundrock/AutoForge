@@ -1095,6 +1095,18 @@ parser), TOML (stdlib), and JSON (stdlib) are accepted. A file that does not
 parse is reported as `cannot parse config <path>: ...` whichever parser read
 it, the built-in subset parser included.
 
+The two YAML backends never read the same file differently. Whatever the
+subset parser accepts, it resolves exactly as PyYAML's YAML 1.1 implicit
+resolvers do -- so `safety.allow_merge: on` is `true` either way, `0600` is
+octal (384) either way, `1:30` is sexagesimal (90) either way, and `1e3` is
+the string `1e3` either way -- and anything it cannot resolve that way it
+refuses outright with `install PyYAML for full YAML support` rather than
+keeping it as the string it looks like. Refused, among others: anchors,
+aliases, tags, block scalars (`|`, `>`), flow mappings (`{a: 1}`), nested
+flow sequences, escape sequences inside quoted scalars, and timestamps.
+Installing the extra therefore widens what parses; it never changes what an
+already-parsing file means.
+
 Every key in the file must be one the controller reads. An unknown key,
 whether at the top level, in any section (`execution`, `safety`, `github`,
 `merge`, `review`, `review.replan`, `workflow`, `local`) or in a profile

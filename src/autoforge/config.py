@@ -26,11 +26,17 @@ Supported config file formats:
   .yaml/.yml — PyYAML if installed, else a minimal built-in subset parser
                sufficient for the documented example file (nested maps with
                2-space indent, lists with "- ", scalars, quoted strings).
+
+The two YAML backends must never read the same file differently: what the
+subset parser accepts it resolves exactly as PyYAML's YAML 1.1 implicit
+resolvers do, and what it cannot resolve that way it refuses outright rather
+than keeping as the string it looks like. See the note above ``_scalar``.
 """
 
 from __future__ import annotations
 
 import fnmatch
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -1088,13 +1094,79 @@ def _minimal_yaml_parse(text: str) -> object:
     """Minimal YAML-subset parser for our config shape.
 
     Supports: nested maps via 2-space indentation, lists via "- " items,
-    inline scalars (int/float/bool/null/quoted strings). Anything fancier
-    raises ValueError telling the user to install PyYAML; like PyYAML's own
-    errors it reaches the operator as ``cannot parse config <path>: ...``,
-    and like PyYAML the root is returned as parsed for ``load_config_file``
-    to check.
+    inline scalars (int/float/bool/null/quoted strings), each resolved
+    exactly as PyYAML resolves it. Anything fancier raises ValueError telling
+    the user to install PyYAML rather than reading it as the string it looks
+    like (see the note below); like PyYAML's own errors it reaches the
+    operator as ``cannot parse config <path>: ...``, and like PyYAML the root
+    is returned as parsed for ``load_config_file`` to check.
     """
     return _parse_yaml_subset(text)
+
+
+# -- the YAML subset parser ------------------------------------------------
+#
+# Two backends read the same `.yaml` file: PyYAML for an operator who
+# installed `autoforge[yaml]`, this parser for one who did not. A scalar the
+# two resolve *differently* is the failure mode the parser below is built
+# against (#40). The file it feeds decides routing, loop bounds, timeouts and
+# `safety.allow_merge`, and nothing downstream can tell that `on` was read as
+# a string here and as `True` there, or `0600` as 600 here and 384 there.
+#
+# The rule is therefore: resolve exactly what PyYAML's YAML 1.1 implicit
+# resolvers resolve, to exactly the same value, and refuse everything else
+# outright. A refusal reaches the operator as `cannot parse config <path>`;
+# a quietly different value reaches them as a different controller. Whatever
+# this parser accepts is proven equal to PyYAML's reading of it, scalar by
+# scalar and document by document, in `tests/test_config.py`.
+
+# PyYAML's implicit resolvers (`yaml/resolver.py`), reproduced. Anything a
+# resolver claims that this parser does not implement -- a timestamp -- is
+# refused rather than kept as the string it looks like.
+_YAML_NULL = frozenset({"", "~", "null", "Null", "NULL"})
+_YAML_TRUE = frozenset({"yes", "Yes", "YES", "true", "True", "TRUE", "on", "On", "ON"})
+_YAML_FALSE = frozenset({"no", "No", "NO", "false", "False", "FALSE", "off", "Off", "OFF"})
+
+_YAML_INT_RE = re.compile(
+    r"""^(?:[-+]?0b[0-1_]+
+        |[-+]?0[0-7_]+
+        |[-+]?(?:0|[1-9][0-9_]*)
+        |[-+]?0x[0-9a-fA-F_]+
+        |[-+]?[1-9][0-9_]*(?::[0-5]?[0-9])+)$""",
+    re.X,
+)
+
+_YAML_FLOAT_RE = re.compile(
+    r"""^(?:[-+]?(?:[0-9][0-9_]*)\.[0-9_]*(?:[eE][-+][0-9]+)?
+        |\.[0-9][0-9_]*(?:[eE][-+][0-9]+)?
+        |[-+]?[0-9][0-9_]*(?::[0-5]?[0-9])+\.[0-9_]*
+        |[-+]?\.(?:inf|Inf|INF)
+        |\.(?:nan|NaN|NAN))$""",
+    re.X,
+)
+
+_YAML_TIMESTAMP_RE = re.compile(
+    r"""^(?:[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]
+        |[0-9][0-9][0-9][0-9] -[0-9][0-9]? -[0-9][0-9]?
+         (?:[Tt]|[ \t]+)[0-9][0-9]?
+         :[0-9][0-9] :[0-9][0-9] (?:\.[0-9]*)?
+         (?:[ \t]*(?:Z|[-+][0-9][0-9]?(?::[0-9][0-9])?))?)$""",
+    re.X,
+)
+
+# A plain scalar never starts with one of these: each introduces YAML this
+# parser does not implement (anchor, alias, tag, block scalar, flow mapping,
+# directive, reserved indicator) or is a syntax error under PyYAML. Reading
+# any of them as the string it looks like is exactly the silent disagreement
+# to avoid, so they are refused.
+_UNSUPPORTED_FIRST_CHARS = "&*!|>{}],%@`"
+
+
+def _unsupported(what: str, text: str) -> ValueError:
+    """The parser's one error shape: what it could not read, and the way out."""
+    return ValueError(
+        f"YAML subset parser: {what}: {text!r} — install PyYAML for full YAML support"
+    )
 
 
 def _parse_yaml_subset(text: str) -> object:
@@ -1104,42 +1176,28 @@ def _parse_yaml_subset(text: str) -> object:
     knows nothing about the file it is reading, so the path that makes the
     message actionable is added by ``load_config_file`` for all of them.
     """
-    lines = [
-        (len(line) - len(line.lstrip(" ")), line.strip())
+    cleaned = [
+        (len(line) - len(line.lstrip(" ")), _strip_inline_comment(line.strip()))
         for line in text.splitlines()
         if line.strip() and not line.strip().startswith("#")
     ]
-    # strip inline comments
-    cleaned: list[tuple[int, str]] = []
-    for indent, content in lines:
-        # remove trailing comment
-        out: list[str] = []
-        in_s = in_d = False
-        i = 0
-        while i < len(content):
-            ch = content[i]
-            if ch == "'" and not in_d:
-                in_s = not in_s
-            elif ch == '"' and not in_s:
-                in_d = not in_d
-            elif ch == "#" and not in_s and not in_d and i > 0 and content[i - 1] == " ":
-                break
-            out.append(ch)
-            i += 1
-        cleaned.append((indent, "".join(out).rstrip()))
+    cleaned = [(indent, content) for indent, content in cleaned if content]
     pos = 0
+
+    def is_list_item(content: str) -> bool:
+        return content == "-" or content.startswith("- ")
 
     def parse_block(min_indent: int) -> object:
         nonlocal pos
         # decide dict vs list by first line
         if pos >= len(cleaned) or cleaned[pos][0] < min_indent:
             return {}
-        if cleaned[pos][1].startswith("- ") or cleaned[pos][1] == "-":
+        if is_list_item(cleaned[pos][1]):
             items: list[object] = []
             while (
                 pos < len(cleaned)
                 and cleaned[pos][0] >= min_indent
-                and (cleaned[pos][1].startswith("- ") or cleaned[pos][1] == "-")
+                and is_list_item(cleaned[pos][1])
             ):
                 ind, content = cleaned[pos]
                 item_text = content[1:].strip()
@@ -1149,27 +1207,30 @@ def _parse_yaml_subset(text: str) -> object:
                 else:
                     items.append(_scalar(item_text))
             return items
-        mapping: dict[str, object] = {}
+        # Keys are resolved like any other scalar, because PyYAML resolves
+        # them too: `1:` is the integer 1 and `~:` is None there, and the
+        # loader's "profile names must be non-empty strings" check is written
+        # for exactly that. A key kept as the string it looks like would pass
+        # the check on this backend and fail it on the other.
+        mapping: dict[object, object] = {}
         while pos < len(cleaned) and cleaned[pos][0] >= min_indent:
             ind, content = cleaned[pos]
             if ind != min_indent:
                 # Over-indented stray line (mapping keys must align).
-                raise ValueError(
-                    f"YAML subset parser: bad indentation at: {content!r} — "
-                    "install PyYAML for full YAML support"
-                )
-            if content.startswith("-"):
+                raise _unsupported("bad indentation at", content)
+            if is_list_item(content):
                 break
-            if ":" not in content:
-                raise ValueError(
-                    f"YAML subset parser: cannot parse line: {content!r} — "
-                    "install PyYAML for full YAML support"
-                )
-            key, _, rest = content.partition(":")
-            key = key.strip().strip('"').strip("'")
-            if key in mapping:
+            split = _split_key(content)
+            if split is None:
+                raise _unsupported("cannot parse line", content)
+            raw_key, rest = split
+            key = _scalar(raw_key)
+            try:
+                repeated = key in mapping
+            except TypeError:
+                raise _unsupported("unhashable key at", content) from None
+            if repeated:
                 raise ValueError(f"duplicate key {key!r} at: {content!r}")
-            rest = rest.strip()
             pos += 1
             if rest == "":
                 # look ahead: deeper indent -> nested block, else None
@@ -1184,46 +1245,183 @@ def _parse_yaml_subset(text: str) -> object:
     return parse_block(0)
 
 
+def _strip_inline_comment(content: str) -> str:
+    """Drop a trailing ``#`` comment, ignoring one inside a quoted scalar.
+
+    A quote *opens* a quoted scalar only where a token may begin -- the start
+    of the line, or after a space, a comma or a flow-sequence bracket -- which
+    is how PyYAML reads it: the apostrophe in ``model: don't # why`` does not
+    make the rest of the line quoted and swallow its comment.
+    """
+    out: list[str] = []
+    quote = ""
+    for i, ch in enumerate(content):
+        if quote:
+            if ch == quote:
+                quote = ""
+        elif ch in "'\"" and (i == 0 or content[i - 1] in " \t,[{"):
+            quote = ch
+        elif ch == "#" and i > 0 and content[i - 1] == " ":
+            break
+        out.append(ch)
+    return "".join(out).rstrip()
+
+
+def _split_key(content: str) -> tuple[str, str] | None:
+    """Split ``key: value`` at the colon that ends the key, or ``None``.
+
+    In block context a plain ``:`` ends a key only when a space or the end of
+    the line follows it, so ``model: gpt`` is a mapping while ``url:port`` is
+    one plain scalar and ``a:b: 1`` is the key ``a:b``. Splitting on the first
+    colon instead read ``a:b: 1`` as the key ``a`` with the value ``b: 1``,
+    which PyYAML never agreed with. A quoted key is scanned to its closing
+    quote first, so ``"a: b": 1`` is one key too.
+    """
+    i = 0
+    if content[:1] in ("'", '"'):
+        end = content.find(content[0], 1)
+        if end < 0:
+            return None
+        i = end + 1
+    while i < len(content):
+        if content[i] == ":" and (i + 1 == len(content) or content[i + 1] == " "):
+            return content[:i].strip(), content[i + 1 :].strip()
+        i += 1
+    return None
+
+
 def _scalar(text: str) -> object:
+    """One YAML scalar, resolved exactly as PyYAML's implicit resolvers do.
+
+    Anything whose PyYAML reading this parser cannot reproduce is refused
+    rather than guessed at (see the note above the resolvers).
+    """
     t = text.strip()
-    if t in ("", "~", "null", "Null", "NULL"):
+    if t[:1] in ("'", '"'):
+        return _quoted_scalar(t)
+    if t.startswith("["):
+        return _flow_sequence(t)
+    if t[:1] and (t[0] in _UNSUPPORTED_FIRST_CHARS or t in ("=", "<<")):
+        raise _unsupported("unsupported YAML at", t)
+    if t in _YAML_NULL:
         return None
-    if (t.startswith('"') and t.endswith('"')) or (t.startswith("'") and t.endswith("'")):
-        return t[1:-1]
-    if t.startswith("[") and t.endswith("]"):
-        inner = t[1:-1].strip()
-        if not inner:
-            return []
-        return [_scalar(part) for part in _split_inline(inner)]
-    low = t.lower()
-    if low in ("true", "yes"):
+    if t in _YAML_TRUE:
         return True
-    if low in ("false", "no"):
+    if t in _YAML_FALSE:
         return False
-    try:
-        return int(t)
-    except ValueError:
-        pass
-    try:
-        return float(t)
-    except ValueError:
-        pass
+    if _YAML_INT_RE.match(t):
+        return _yaml_int(t)
+    if _YAML_FLOAT_RE.match(t):
+        return _yaml_float(t)
+    if _YAML_TIMESTAMP_RE.match(t):
+        raise _unsupported("YAML timestamps are not supported at", t)
     return t
 
 
+def _quoted_scalar(text: str) -> str:
+    """A single- or double-quoted scalar, without decoding any escape.
+
+    ``''`` inside a single-quoted scalar and ``\\n`` inside a double-quoted one
+    mean something to PyYAML that this parser would keep verbatim, so a quoted
+    scalar containing either is refused instead of being read differently.
+    """
+    quote = text[0]
+    if len(text) < 2 or not text.endswith(quote):
+        raise _unsupported("unterminated quoted string at", text)
+    inner = text[1:-1]
+    if quote in inner:
+        raise _unsupported("quoted string with an embedded quote at", text)
+    if quote == '"' and "\\" in inner:
+        raise _unsupported("escape sequence in a double-quoted string at", text)
+    return inner
+
+
+def _flow_sequence(text: str) -> list[object]:
+    """An inline ``[a, b]`` list; its items are scalars like any other."""
+    if not text.endswith("]"):
+        raise _unsupported("unterminated flow sequence at", text)
+    inner = text[1:-1].strip()
+    if not inner:
+        return []
+    return [_scalar(part) for part in _split_inline(inner)]
+
+
+def _yaml_int(text: str) -> int:
+    """``yaml.constructor.SafeConstructor.construct_yaml_int``, reproduced.
+
+    YAML 1.1 has binary, octal (a leading ``0``), hexadecimal and sexagesimal
+    integers, so ``0600`` is 384 and ``1:30`` is 90. Python's ``int()`` reads
+    neither, which is where the two backends used to part ways.
+    """
+    value = text.replace("_", "")
+    sign = -1 if value[0] == "-" else 1
+    if value[0] in "+-":
+        value = value[1:]
+    if value == "0":
+        return 0
+    if value.startswith("0b"):
+        return sign * int(value[2:], 2)
+    if value.startswith("0x"):
+        return sign * int(value[2:], 16)
+    if value[0] == "0":
+        return sign * int(value, 8)
+    if ":" in value:
+        digits = [int(part) for part in value.split(":")]
+        digits.reverse()
+        total, base = 0, 1
+        for digit in digits:
+            total += digit * base
+            base *= 60
+        return sign * total
+    return sign * int(value)
+
+
+def _yaml_float(text: str) -> float:
+    """``yaml.constructor.SafeConstructor.construct_yaml_float``, reproduced."""
+    value = text.replace("_", "").lower()
+    sign = -1 if value[0] == "-" else 1
+    if value[0] in "+-":
+        value = value[1:]
+    if value == ".inf":
+        return sign * float("inf")
+    if value == ".nan":
+        return float("nan")
+    if ":" in value:
+        digits = [float(part) for part in value.split(":")]
+        digits.reverse()
+        total, base = 0.0, 1
+        for digit in digits:
+            total += digit * base
+            base *= 60
+        return sign * total
+    return sign * float(value)
+
+
 def _split_inline(inner: str) -> list[str]:
-    parts, cur = [], ""
+    """Split a flow sequence's items on the commas outside its quoted scalars.
+
+    A nested flow collection is refused rather than split on the wrong comma:
+    ``[[1, 2]]`` is two malformed items to this split and one list to PyYAML.
+    """
+    parts: list[str] = []
+    cur = ""
     in_s = in_d = False
     for ch in inner:
         if ch == "'" and not in_d:
             in_s = not in_s
         elif ch == '"' and not in_s:
             in_d = not in_d
+        elif ch in "[]{}" and not in_s and not in_d:
+            raise _unsupported("nested flow collection at", inner)
         if ch == "," and not in_s and not in_d:
             parts.append(cur.strip())
             cur = ""
         else:
             cur += ch
+    if in_s or in_d:
+        raise _unsupported("unterminated quoted string at", inner)
     if cur.strip():
         parts.append(cur.strip())
+    if not all(parts):
+        raise _unsupported("empty item in a flow sequence at", inner)
     return parts

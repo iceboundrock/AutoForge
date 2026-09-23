@@ -1,6 +1,11 @@
 """Config: defaults, example YAML loads, command building, validation URLs."""
 
+import builtins
 import json
+import sys
+import tomllib
+from contextlib import contextmanager
+from pathlib import Path
 
 import pytest
 
@@ -58,21 +63,27 @@ def test_unknown_profile_raises():
         default_config().profile("nope")
 
 
+@contextmanager
+def pyyaml_hidden(monkeypatch):
+    """``import yaml`` raises inside the block, as it does without the extra."""
+    with monkeypatch.context() as m:
+        m.setitem(sys.modules, "yaml", None)
+        real_import = builtins.__import__
+
+        def fake_import(name, *a, **k):
+            if name == "yaml":
+                raise ImportError("blocked for test")
+            return real_import(name, *a, **k)
+
+        m.setattr(builtins, "__import__", fake_import)
+        yield
+
+
 @pytest.fixture
 def no_pyyaml(monkeypatch):
     """Force the built-in YAML subset parser even though PyYAML is installed."""
-    import builtins
-    import sys
-
-    monkeypatch.setitem(sys.modules, "yaml", None)
-    real_import = builtins.__import__
-
-    def fake_import(name, *a, **k):
-        if name == "yaml":
-            raise ImportError("blocked for test")
-        return real_import(name, *a, **k)
-
-    monkeypatch.setattr(builtins, "__import__", fake_import)
+    with pyyaml_hidden(monkeypatch):
+        yield
 
 
 @pytest.fixture(params=["pyyaml", "subset"])
@@ -92,8 +103,6 @@ def yaml_backend(request):
 
 
 def test_example_yaml_loads_without_pyyaml(tmp_path, no_pyyaml):
-    from pathlib import Path
-
     import autoforge
 
     repo_example = Path(autoforge.__file__).parents[2] / "autoforge.example.yaml"
@@ -1136,3 +1145,252 @@ def test_premerge_verification_keys_reject_bad_shapes(tmp_path, section, body, k
     p.write_text(json.dumps({"version": 1, section: body}), "utf-8")
     with pytest.raises(ConfigurationError, match=key):
         load_config_file(p)
+
+
+# -- the two YAML backends must read the same file the same way (#40) -------
+#
+# An operator who installed `autoforge[yaml]` reads every `.yaml` config
+# through PyYAML; one who did not reads it through the built-in subset
+# parser. The file decides routing, loop bounds, timeouts and
+# `safety.allow_merge`, and nothing downstream can notice that `on` was read
+# as the string "on" on one backend and as `True` on the other, or `0600` as
+# 600 here and 384 there. So the contract is not "both parse the example
+# file": it is that whatever the subset parser accepts, PyYAML reads
+# identically -- and what it cannot read that way it refuses outright, which
+# reaches the operator as `cannot parse config <path>`.
+#
+# `subset accepted` => `PyYAML accepted, and the two Configs are equal`
+#
+# is the whole rule, in that one direction: the contrapositive also forbids
+# the subset parser from quietly accepting a document PyYAML rejects.
+
+
+def load_both_yaml_backends(path, monkeypatch):
+    """``(pyyaml, subset)`` outcomes, each ``("ok", cfg)`` or ``("error", msg)``."""
+
+    def outcome():
+        try:
+            return ("ok", load_config_file(path))
+        except ConfigurationError as exc:
+            return ("error", str(exc))
+
+    with pyyaml_hidden(monkeypatch):
+        subset = outcome()
+    return outcome(), subset
+
+
+def assert_backends_agree(path, monkeypatch):
+    """The rule above, with the disagreement named when it is violated."""
+    pyyaml, subset = load_both_yaml_backends(path, monkeypatch)
+    text = path.read_text(encoding="utf-8")
+    if subset[0] == "error":
+        return  # refusing outright is the sanctioned way out
+    assert pyyaml[0] == "ok", (
+        f"the subset parser accepted a document PyYAML rejects:\n{text}\n{pyyaml[1]}"
+    )
+    assert subset[1] == pyyaml[1], (
+        f"the two YAML backends read the same document differently:\n{text}"
+    )
+
+
+# Scalars the two backends used to resolve differently, grouped by why.
+# `_scalar` is compared with PyYAML directly rather than through a Config,
+# because a Config stringifies most of what it stores and would hide `1.0`
+# (float) reading as `"1.0"` (string) on the other backend.
+AMBIGUOUS_SCALARS = [
+    # YAML 1.1 spells booleans in more ways than `true`/`false`, and only in
+    # these casings: `on`/`off` are booleans, `TrUe` is a string.
+    "yes", "no", "on", "off", "On", "OFF", "Yes", "NO",
+    "true", "false", "True", "FALSE", "TrUe", "yEs", "y", "n",
+    # Nulls, and the empty value a section header with everything commented
+    # out produces.
+    "null", "Null", "NULL", "~", "", "Nul",
+    # Integers: binary, a leading zero (octal), hexadecimal, sexagesimal and
+    # digit separators. `0600` is 384, `1:30` is 90 -- `int()` reads neither.
+    "1", "0", "012", "0600", "-012", "+12", "1_000", "0_1",
+    "0b101", "+0b11", "0b1_1", "0x1f", "-0x1f", "0x_1f", "0o17",
+    "1:30", "-1:30", "12:00:00", "1:2:3", "60:00", "1_0:30", "1:60",
+    # Floats: a dot is required, so `1e3` is a *string* in YAML 1.1.
+    "1.0", "1.5", "-0.5", ".5", "1.", "1_0.5",
+    "1e3", "1E3", "1.0e3", "1.0e+3", ".5e+3", "5.e+3",
+    ".inf", "-.inf", ".nan", ".Inf", "1:30.5",
+    # Timestamps: PyYAML builds a `datetime.date`, a type no config field
+    # accepts, so the subset parser refuses rather than keeping the string.
+    "2026-09-23", "2026-9-3", "20260923", "2026-09-23 10:00:00",
+    # Quoted scalars, and the escapes the subset parser does not decode.
+    "'1.0'", '"1.0"', "'yes'", '"on"', "''", '""', "'a''b'", '"a\\nb"', '"a" "b"', "'abc",
+    # Plain scalars that merely look like something else.
+    "hello", "hello world", "a:b", "?x", "-foo", "a,b", "a[b]", "a#b", "---", "0o17",
+    # Flow sequences, including the nesting a comma split gets wrong.
+    "[a, b]", "[1, 2]", "[]", "[a]", "[a, ]", "[a,,b]", '["x, y", z]',
+    "[[1,2]]", "[a, [b, c]]", "{a: 1}", "{}",
+    # Indicators that introduce YAML this parser does not implement.
+    "&anchor", "*alias", "!!str 1", "!tag", "|", ">", "|-", "=", "<<",
+    "}", "]", ",a", "%v", "@v", "`v",
+]  # fmt: skip
+
+
+@pytest.mark.parametrize("text", AMBIGUOUS_SCALARS)
+def test_subset_scalar_agrees_with_pyyaml_or_refuses(text):
+    """Every scalar the subset parser resolves, PyYAML resolves to the same value."""
+    pyyaml = pytest.importorskip("yaml")
+    try:
+        ours = config._scalar(text)
+    except ValueError as exc:
+        assert "install PyYAML for full YAML support" in str(exc)
+        return  # refusing outright is the sanctioned way out
+    theirs = pyyaml.safe_load(f"k: {text}\n")["k"]
+    # repr, not ==: it distinguishes 1 from True and 1.0, and NaN from itself.
+    assert repr(ours) == repr(theirs), f"{text!r} reads as {ours!r} here and {theirs!r} there"
+
+
+# Whole documents, so the comparison covers the parsed *Config* -- key typing,
+# duplicate detection and section shape included -- not only one scalar.
+AMBIGUOUS_DOCUMENTS = [
+    # The merge gate written the four ways YAML 1.1 spells a boolean. `on`
+    # used to open a gate under PyYAML and be the string "on" here.
+    "version: 1\nsafety:\n  allow_merge: on\n",
+    "version: 1\nsafety:\n  allow_merge: off\n",
+    "version: 1\nsafety:\n  allow_merge: yes\n",
+    "version: 1\nsafety:\n  allow_merge: TrUe\n",
+    'version: 1\nsafety:\n  allow_merge: "false"\n',
+    # Integers in the bases YAML 1.1 reads and Python does not.
+    "version: 1\ngithub:\n  timeout_seconds: 0600\n",
+    "version: 1\ngithub:\n  timeout_seconds: 0x1f\n",
+    "version: 1\ngithub:\n  timeout_seconds: 1:30\n",
+    "version: 1\ngithub:\n  timeout_seconds: 1_000\n",
+    "version: 1\nworkflow:\n  max_review_rounds: 012\n",
+    # `1.0` and `"1.0"` into a string field, plus the scalars that only look
+    # numeric, and a timestamp (a `datetime.date` under PyYAML).
+    "version: 1\nprofiles:\n  fix:\n    model: 1.0\n",
+    'version: 1\nprofiles:\n  fix:\n    model: "1.0"\n',
+    "version: 1\nprofiles:\n  fix:\n    model: 1e3\n",
+    "version: 1\nprofiles:\n  fix:\n    model: .inf\n",
+    "version: 1\nprofiles:\n  fix:\n    model: 2026-09-23\n",
+    # An apostrophe in a plain scalar must not quote the rest of the line and
+    # swallow the comment after it.
+    "version: 1\nprofiles:\n  fix:\n    model: don't # the vendor spells it so\n",
+    # Empty values: the omitted section, the explicit null, the empty string.
+    "version: 1\nexecution:\n  worktree_dir:\n",
+    "version: 1\nexecution:\n  worktree_dir: ~\n",
+    'version: 1\nexecution:\n  worktree_dir: ""\n',
+    "version: 1\nsafety:\n",
+    "version: 1\nsafety:\n  # allow_merge: true\nmerge:\n",
+    # A key repeated in one mapping: both backends keep the last value, so
+    # both must refuse instead.
+    "version: 1\nsafety:\n  allow_merge: false\n  allow_merge: true\n",
+    "version: 1\nworkflow:\n  max_review_round: 3\nworkflow:\n  max_review_rounds: 20\n",
+    # Keys are resolved too: `1:` is the integer 1 and `~:` is None in YAML,
+    # and a profile name must be a non-empty string on either backend.
+    "version: 1\nprofiles:\n  1:\n    provider: scripted\n",
+    "version: 1\nprofiles:\n  ~:\n    provider: scripted\n",
+    "version: 1\nprofiles:\n  true:\n    provider: scripted\n",
+    'version: 1\nprofiles:\n  "1":\n    provider: scripted\n',
+    # A colon inside a key or a value: `:` ends a key only before a space.
+    "version: 1\nprofiles:\n  fix:\n    command: /usr/local/bin/claude\n",
+    "version: 1\nprofiles:\n  fix:\n    model: openai/gpt-5.6-luna\n",
+    "version: 1\nexecution:\n  worktree_dir: C:/tmp/worktrees\n",
+    # Lists, block and flow, including the nesting a comma split gets wrong.
+    'version: 1\nsafety:\n  required_checks: ["ci", "build"]\n',
+    "version: 1\nsafety:\n  required_checks: []\n",
+    "version: 1\nsafety:\n  required_checks:\n    - ci\n    - build\n",
+    'version: 1\nmerge:\n  verification_commands: [["pytest", "-q"]]\n',
+    "version: 1\nmerge:\n  verification_commands:\n    - - pytest\n      - -q\n",
+    # Roots that are not a mapping, and the empty document that means defaults.
+    "false\n",
+    "- item\n",
+    "42\n",
+    "",
+    "# only a comment\n",
+]
+
+
+@pytest.mark.parametrize("text", AMBIGUOUS_DOCUMENTS)
+def test_yaml_backends_read_the_same_document_the_same_way(tmp_path, monkeypatch, text):
+    pytest.importorskip("yaml")
+    p = tmp_path / "cfg.yaml"
+    p.write_text(text, encoding="utf-8")
+    assert_backends_agree(p, monkeypatch)
+
+
+def test_example_config_is_the_same_on_both_yaml_backends(monkeypatch):
+    """The repository's own example file, the one config every operator starts from."""
+    pytest.importorskip("yaml")
+    example = Path(__file__).resolve().parents[1] / "autoforge.example.yaml"
+    assert example.exists(), f"example config missing: {example}"
+    assert_backends_agree(example, monkeypatch)
+    pyyaml, subset = load_both_yaml_backends(example, monkeypatch)
+    # Not vacuously true: the example must load, not merely fail on both.
+    assert pyyaml[0] == "ok" and subset[0] == "ok"
+
+
+def test_dev_group_keeps_pyyaml_so_ci_exercises_the_pyyaml_branch():
+    """The extra is a supported config path, so something must install it.
+
+    `_load_yaml` branches on whether PyYAML imports, and the tests above skip
+    their PyYAML half when it does not. CI installs `--group dev` and nothing
+    else, so dropping PyYAML from that group would retire this whole file's
+    PyYAML coverage silently, leaving the branch an operator gets from
+    `pip install autoforge[yaml]` exercised by no environment (#40).
+    """
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    dev = [str(d).lower() for d in data["dependency-groups"]["dev"]]
+    assert any(d.startswith("pyyaml") for d in dev), (
+        f"pyyaml must stay in the dev dependency group, got {dev}"
+    )
+    assert "yaml" in data["project"]["optional-dependencies"], (
+        "the `yaml` extra is what the PyYAML branch exists for"
+    )
+
+
+# The three classes above, spelled out against the keys they actually decide,
+# so what changed is legible without reconstructing it from a corpus entry.
+@pytest.mark.parametrize(
+    "written, expected",
+    [
+        ("on", True), ("On", True), ("ON", True), ("yes", True), ("true", True),
+        ("off", False), ("OFF", False), ("no", False), ("false", False),
+    ],
+)  # fmt: skip
+def test_yaml_booleans_decide_the_merge_gate_alike_on_both_backends(
+    tmp_path, yaml_backend, written, expected
+):
+    """``safety.allow_merge: on`` is a boolean in YAML 1.1 -- on either backend.
+
+    The subset parser used to keep `on`/`off` as the strings they look like,
+    which `_as_bool` then refused: the same file opened the merge gate with
+    the `yaml` extra installed and failed to load without it.
+    """
+    p = tmp_path / "cfg.yaml"
+    p.write_text(f"version: 1\nsafety:\n  allow_merge: {written}\n", encoding="utf-8")
+    assert load_config_file(p).safety.allow_merge is expected
+
+
+@pytest.mark.parametrize("written", ["TrUe", "yEs", "oN", "nO", "y", "n"])
+def test_miscased_yaml_booleans_are_strings_on_both_backends(tmp_path, yaml_backend, written):
+    """Only the casings YAML 1.1 lists are booleans; the rest stay strings.
+
+    `_as_bool` refuses a string, so the gate stays closed on both backends
+    rather than opening on the one that lower-cased before comparing.
+    """
+    p = tmp_path / "cfg.yaml"
+    p.write_text(f"version: 1\nsafety:\n  allow_merge: {written}\n", encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="safety.allow_merge"):
+        load_config_file(p)
+
+
+@pytest.mark.parametrize(
+    "written, expected",
+    [("600", 600), ("0600", 384), ("0x1f", 31), ("0b101", 5), ("1:30", 90), ("1_000", 1000)],
+)
+def test_yaml_integer_bases_read_alike_on_both_backends(tmp_path, yaml_backend, written, expected):
+    """A leading zero is octal in YAML 1.1, and `1:30` is sexagesimal.
+
+    Surprising, but it is what an operator with the extra already gets, so
+    the subset parser reads them the same way instead of calling `0600` six
+    hundred and handing the controller a different timeout.
+    """
+    p = tmp_path / "cfg.yaml"
+    p.write_text(f"version: 1\ngithub:\n  timeout_seconds: {written}\n", encoding="utf-8")
+    assert load_config_file(p).github.timeout_seconds == expected
