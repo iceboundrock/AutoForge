@@ -1236,6 +1236,13 @@ AMBIGUOUS_SCALARS = [
     # Indicators that introduce YAML this parser does not implement.
     "&anchor", "*alias", "!!str 1", "!tag", "|", ">", "|-", "=", "<<",
     "}", "]", ",a", "%v", "@v", "`v",
+    # Unicode spaces are not YAML whitespace -- only a space and a tab are --
+    # so each of these is an ordinary character of the plain scalar around it.
+    # `str.strip()` dropped them, which is how `<NBSP>true` used to resolve to
+    # True and `<NBSP>600` to 600 while PyYAML read the string.
+    "\xa0true", "true\xa0", "\u3000fable", "fable\u3000", "\xa0600", "a\xa0b",
+    "\xa0", "\u2000", "\u202f", "\xa0'a'", "\xa0[a, b]", "a\xa0#b", "\xa0# c",
+    "\xa0x: y", "[\xa0a, b]", "[a\xa0, b]", "-\xa0a", "\xa0-", "\xa0~", "\xa0null",
 ]  # fmt: skip
 
 
@@ -1369,6 +1376,42 @@ AMBIGUOUS_DOCUMENTS = [
     "version: 1\nprofiles:\n  fix:\n    model: foo # spelled\tso\n",
     "# a\tcomment\nversion: 1\nsafety:\n  allow_merge: true\n",
     'version: 1\nsafety:\n  required_checks: ["a\tb", ci]\n',
+    # Unicode spaces. Python strips them and YAML does not, so each one used
+    # to vanish at a line, key, value or item boundary while PyYAML kept it as
+    # a character of the scalar: the first opened the merge gate against a
+    # file the other backend refuses to load.
+    "version: 1\nsafety:\n  allow_merge: \xa0true\n",
+    "version: 1\nsafety:\n  allow_merge: true\xa0\n",
+    "version: 1\ngithub:\n  timeout_seconds: \xa0600\n",
+    "version: 1\nprofiles:\n  fix:\n    model: \xa0fable\n",
+    "version: 1\nprofiles:\n  fix:\n    model: fable\u3000\n",
+    "version: 1\nprofiles:\n  fix:\n    model: fable\xa0 # c\n",
+    "version: 1\nprofiles:\n  fix:\n    model: \xa0[a, b]\n",
+    "version: 1\nexecution:\n  worktree_dir: /tmp/wt\xa0\n",
+    "version: 1\nprofiles:\n  fix\xa0:\n    provider: scripted\n",
+    "version: 1\nsafety:\n  required_checks: [\xa0a, b]\n",
+    "version: 1\nsafety:\n  required_checks:\n    - a\xa0\n",
+    "version: 1\n\xa0\n",
+    # Non-printable characters, which PyYAML's *reader* refuses before its
+    # scanner runs. The first five are the ones `str.splitlines()` breaks on
+    # and YAML does not, so `version: 1<U+000C>safety:` was two lines here --
+    # another way to open the merge gate on a file PyYAML cannot read.
+    "version: 1\x0bsafety:\n  allow_merge: true\n",
+    "version: 1\x0csafety:\n  allow_merge: true\n",
+    "version: 1\x1csafety:\n  allow_merge: true\n",
+    "version: 1\x1dsafety:\n  allow_merge: true\n",
+    "version: 1\x1esafety:\n  allow_merge: true\n",
+    "version: 1\nprofiles:\n  fix:\n    model: a\x1fb\n",
+    'version: 1\nprofiles:\n  fix:\n    model: "a\x00b"\n',
+    "version: 1 # a\x7fb\n",
+    # ... and the line breaks YAML *does* have beyond `\n`: here the two
+    # backends must agree that the document continues on a new line, gate and
+    # all, rather than refuse it.
+    "version: 1\x85safety:\n  allow_merge: true\n",
+    "version: 1\u2028safety:\n  allow_merge: true\n",
+    "version: 1\u2029safety:\n  allow_merge: true\n",
+    "version: 1\r\nsafety:\r\n  allow_merge: true\r\n",
+    "version: 1\rsafety:\r  allow_merge: true\r",
     # Roots that are not a mapping, and the empty document that means defaults.
     "false\n",
     "- item\n",
@@ -1422,6 +1465,23 @@ def test_yaml_backends_read_the_same_document_the_same_way(tmp_path, monkeypatch
         (
             "version: 1\nprofiles:\n  fix:\n    model: ? x\n",
             "mapping keys are not allowed in a plain scalar at: '? x'",
+        ),
+        # Non-printable characters: PyYAML's reader refuses them before its
+        # scanner runs, and `str.splitlines()` used to read the first of these
+        # as two lines and open the merge gate.
+        (
+            "version: 1\x0csafety:\n  allow_merge: true\n",
+            "unacceptable character #x000c at: 'version: 1\\x0csafety:'",
+        ),
+        (
+            "version: 1\nprofiles:\n  fix:\n    model: a\x1fb\n",
+            "unacceptable character #x001f at: '    model: a\\x1fb'",
+        ),
+        # Not even inside a quoted scalar, unlike a tab: no quoting makes a
+        # non-printable character legal under PyYAML.
+        (
+            'version: 1\nprofiles:\n  fix:\n    model: "a\x00b"\n',
+            "unacceptable character #x0000 at: '    model: \"a\\x00b\"'",
         ),
     ],
 )
@@ -1498,6 +1558,44 @@ def test_tab_inside_a_quoted_scalar_still_loads_on_both_backends(tmp_path, monke
     pyyaml, subset = load_both_yaml_backends(p, monkeypatch)
     assert pyyaml[0] == "ok" and subset[0] == "ok", (pyyaml, subset)
     assert subset[1].profile("fix").model == "a\tb"
+    assert subset[1] == pyyaml[1]
+
+
+def test_a_unicode_space_does_not_open_the_merge_gate_on_either_backend(tmp_path, monkeypatch):
+    """R3-F1: an invisible NBSP is a plain-scalar character, not whitespace.
+
+    YAML's whitespace is a space and a tab; Python's `str.strip()` also strips
+    U+00A0, U+1680, U+2000-U+200A, U+202F, U+205F and U+3000. Stripping a
+    value with it resolved `allow_merge: <NBSP>true` to True and opened the
+    merge gate on the subset backend, while PyYAML read the string
+    '\xa0true' and the loader refused the file -- the same fail-open the tab
+    rule closed, through the character next to the one it covers. Both
+    backends must now refuse it, and for the same reason.
+    """
+    pytest.importorskip("yaml")
+    p = tmp_path / "cfg.yaml"
+    p.write_text("version: 1\nsafety:\n  allow_merge: \xa0true\n", encoding="utf-8")
+    pyyaml, subset = load_both_yaml_backends(p, monkeypatch)
+    assert pyyaml[0] == "error" and subset[0] == "error", (pyyaml, subset)
+    for backend, outcome in (("pyyaml", pyyaml), ("subset", subset)):
+        assert "'safety.allow_merge' must be a boolean" in outcome[1], (backend, outcome)
+
+
+def test_a_unicode_space_is_kept_in_a_scalar_on_both_backends(tmp_path, monkeypatch):
+    """R3-F1, the other direction: the NBSP survives where PyYAML keeps it.
+
+    Not covered by the corpus alone, which a refusal satisfies: here both
+    backends accept, so the agreed *value* is what has to be named. A model
+    identifier read as `fable` on one backend and `'fable\xa0'` on the other
+    launches a different agent, so the subset parser keeps the character
+    rather than tidying it away.
+    """
+    pytest.importorskip("yaml")
+    p = tmp_path / "cfg.yaml"
+    p.write_text("version: 1\nprofiles:\n  fix:\n    model: \xa0fable\u3000\n", encoding="utf-8")
+    pyyaml, subset = load_both_yaml_backends(p, monkeypatch)
+    assert pyyaml[0] == "ok" and subset[0] == "ok", (pyyaml, subset)
+    assert subset[1].profile("fix").model == "\xa0fable\u3000"
     assert subset[1] == pyyaml[1]
 
 

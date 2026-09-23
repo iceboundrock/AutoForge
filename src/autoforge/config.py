@@ -1162,6 +1162,43 @@ _YAML_TIMESTAMP_RE = re.compile(
 # to avoid, so they are refused.
 _UNSUPPORTED_FIRST_CHARS = "&*!|>{}],%@`"
 
+# YAML's whitespace, line breaks and printable set -- none of which is
+# Python's. Between tokens PyYAML's scanner skips a space or a tab and nothing
+# else, so every *other* character `str.strip()` treats as whitespace (U+00A0,
+# U+1680, U+2000-U+200A, U+202F, U+205F, U+3000) is an ordinary character of
+# the plain scalar it sits in. Stripping lines, keys, values and items with
+# `str.strip()` dropped them silently: `safety.allow_merge: <NBSP>true`
+# resolved to True and opened the merge gate here, while PyYAML read the
+# string '\xa0true' and the loader refused the file. `str.splitlines()` is the
+# same mistake one layer down -- it breaks on U+000B, U+000C, U+001C, U+001D
+# and U+001E, which are not line breaks in YAML but characters PyYAML's
+# *reader* refuses outright, so `version: 1<U+000C>safety:` was read here as
+# two lines and opened the gate against a file the other backend cannot load.
+_YAML_WHITESPACE = " \t"
+
+# `\n`, `\r\n`, `\r`, U+0085, U+2028 and U+2029 -- `yaml.scanner.scan_line_break`.
+_YAML_LINE_BREAK_RE = re.compile("\r\n|[\n\r\x85\u2028\u2029]")
+
+# `yaml.reader.Reader.NON_PRINTABLE`, reproduced.
+_YAML_NON_PRINTABLE_RE = re.compile(
+    "[^\t\n\r\x20-\x7e\x85\xa0-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]"
+)
+
+
+def _yaml_strip(text: str) -> str:
+    """Strip YAML's whitespace -- a space or a tab -- and nothing else.
+
+    A Unicode space is kept because PyYAML keeps it: it is a character of the
+    scalar, and dropping it made the two backends read the same file
+    differently (see the note above).
+    """
+    return text.strip(_YAML_WHITESPACE)
+
+
+def _yaml_lines(text: str) -> list[str]:
+    """Split a document on YAML's line breaks, not on Python's wider set."""
+    return _YAML_LINE_BREAK_RE.split(text)
+
 
 def _unsupported(what: str, text: str) -> ValueError:
     """The parser's one error shape: what it could not read, and the way out."""
@@ -1177,15 +1214,23 @@ def _parse_yaml_subset(text: str) -> object:
     knows nothing about the file it is reading, so the path that makes the
     message actionable is added by ``load_config_file`` for all of them.
     """
-    for line in text.splitlines():
+    lines = _yaml_lines(text)
+    for line in lines:
+        _reject_non_printable(line)
         if "\t" in line:
             _reject_tab(line)
-    cleaned = [
-        (len(line) - len(line.lstrip(" ")), _strip_inline_comment(line.strip()))
-        for line in text.splitlines()
-        if line.strip() and not line.strip().startswith("#")
-    ]
-    cleaned = [(indent, content) for indent, content in cleaned if content]
+    cleaned: list[tuple[int, str]] = []
+    for line in lines:
+        # Indentation is spaces alone: a tab cannot indent under PyYAML and
+        # the pass above has already refused every bare one, and a Unicode
+        # space is a character of the scalar rather than indentation.
+        indent = len(line) - len(line.lstrip(" "))
+        stripped = _yaml_strip(line)
+        if not stripped or stripped.startswith("#"):
+            continue
+        content = _strip_inline_comment(stripped)
+        if content:
+            cleaned.append((indent, content))
     for _, content in cleaned:
         # `---` and `...` open and close a *document*; a file with more than
         # one is a PyYAML error, and this parser reads a single document, so
@@ -1215,7 +1260,7 @@ def _parse_yaml_subset(text: str) -> object:
                 and is_list_item(cleaned[pos][1])
             ):
                 ind, content = cleaned[pos]
-                item_text = content[1:].strip()
+                item_text = _yaml_strip(content[1:])
                 pos += 1
                 if item_text == "":
                     # An item with nothing after the dash is a nested block,
@@ -1345,7 +1390,28 @@ def _scan_line(content: str) -> Iterator[tuple[str, bool]]:
 
 def _strip_inline_comment(content: str) -> str:
     """Drop a trailing ``#`` comment, ignoring one inside a quoted scalar."""
-    return "".join(ch for ch, _ in _scan_line(content)).rstrip()
+    return "".join(ch for ch, _ in _scan_line(content)).rstrip(_YAML_WHITESPACE)
+
+
+def _reject_non_printable(line: str) -> None:
+    r"""Refuse the characters ``yaml.reader.Reader`` refuses, as it does.
+
+    PyYAML validates its raw stream before the scanner ever runs, so a
+    non-printable character is an ``unacceptable character`` reader error
+    wherever it sits -- in a comment, inside a quoted scalar, or in the middle
+    of a plain one. Nothing below would have refused one: ``model: ab``
+    was read here as the ordinary plain scalar ``ab``, and the five
+    characters ``str.splitlines()`` breaks on but YAML does not (U+000B,
+    U+000C, U+001C, U+001D, U+001E) turned one line into two, which is how
+    ``version: 1<U+000C>safety:\n  allow_merge: true`` opened the merge gate
+    on this backend against a file PyYAML refuses to load.
+
+    This is the reader's rule, which is why it is checked over the raw line
+    and not through ``_scan_line``: unlike a tab, no quoting makes it legal.
+    """
+    found = _YAML_NON_PRINTABLE_RE.search(line)
+    if found is not None:
+        raise _unsupported(f"unacceptable character #x{ord(found.group()):04x} at", line)
 
 
 def _reject_tab(line: str) -> None:
@@ -1386,7 +1452,7 @@ def _split_key(content: str) -> tuple[str, str] | None:
         i = end + 1
     while i < len(content):
         if content[i] == ":" and (i + 1 == len(content) or content[i + 1] == " "):
-            return content[:i].strip(), content[i + 1 :].strip()
+            return _yaml_strip(content[:i]), _yaml_strip(content[i + 1 :])
         i += 1
     return None
 
@@ -1424,7 +1490,7 @@ def _scalar(text: str, flow: bool = False) -> object:
     whether the scalar is an item of a flow sequence, where PyYAML ends a
     plain scalar at more characters than in block context.
     """
-    t = text.strip()
+    t = _yaml_strip(text)
     if t[:1] in ("'", '"'):
         return _quoted_scalar(t)
     if t.startswith("["):
@@ -1469,7 +1535,7 @@ def _flow_sequence(text: str) -> list[object]:
     """An inline ``[a, b]`` list; its items are scalars like any other."""
     if not text.endswith("]"):
         raise _unsupported("unterminated flow sequence at", text)
-    inner = text[1:-1].strip()
+    inner = _yaml_strip(text[1:-1])
     if not inner:
         return []
     return [_scalar(part, flow=True) for part in _split_inline(inner)]
@@ -1555,7 +1621,7 @@ def _split_inline(inner: str) -> list[str]:
         if ch in "[]{}":
             raise _unsupported("nested flow collection at", inner)
         if ch == ",":
-            parts.append(cur.strip())
+            parts.append(_yaml_strip(cur))
             cur = ""
             at_start = True
             continue
@@ -1564,8 +1630,8 @@ def _split_inline(inner: str) -> list[str]:
         cur += ch
     if quote:
         raise _unsupported("unterminated quoted string at", inner)
-    if cur.strip():
-        parts.append(cur.strip())
+    if _yaml_strip(cur):
+        parts.append(_yaml_strip(cur))
     if not all(parts):
         raise _unsupported("empty item in a flow sequence at", inner)
     return parts

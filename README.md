@@ -1108,9 +1108,11 @@ mapping inside a sequence item (`- key: value`, which is a mapping to PyYAML
 and never the string it looks like), a plain scalar holding what PyYAML's
 scanner reads as an indicator rather than text (`model: x: y`, `model: - x`,
 `model: ? x`), document markers (`---`), tabs outside a quoted scalar or a
-comment (PyYAML's scanner refuses those too), and a document with a line the
+comment (PyYAML's scanner refuses those too), the non-printable characters
+PyYAML's reader refuses anywhere in a file, comments and quoted scalars
+included (a stray `U+000C` or `U+001F`, say), and a document with a line the
 top-level block does not contain, such as a mapping followed by a sequence
-item. The last two matter because the alternative is not a different value
+item. The last one matters because the alternative is not a different value
 but a *partial* file: the parser would otherwise read the lines it
 understood and drop the rest, and the dropped line could be the one that
 closes the merge gate.
@@ -1118,9 +1120,19 @@ closes the merge gate.
 A quote is read as a quoted scalar only where a scalar may *begin* -- the
 start of a value or an item, or after a `,`, `[` or `{` -- exactly as PyYAML
 reads one, so `model: don't # why` keeps its comment and `model: a 'b # c'`
-is the plain scalar `a 'b` on both backends.
+is the plain scalar `a 'b` on both backends. Whitespace is YAML's, not
+Python's: only a space and a tab separate tokens, so a Unicode space such as
+`U+00A0` is an ordinary character of the scalar it sits in on both backends
+rather than something either one trims away -- `safety.allow_merge:` written
+with an invisible non-breaking space before `true` is a string, and the
+configuration error it causes is the same one on both.
 Installing the extra therefore widens what parses; it never changes what an
 already-parsing file means.
+
+One ordinary YAML shape the subset parser refuses is a block sequence
+indented to its key's own column (`required_checks:` at indent 2 followed by
+`- ci` at indent 2). Indent the items one level deeper than the key, or
+install the extra.
 
 Every key in the file must be one the controller reads. An unknown key,
 whether at the top level, in any section (`execution`, `safety`, `github`,
