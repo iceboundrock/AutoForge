@@ -1103,7 +1103,13 @@ the string `1e3` either way -- and anything it cannot resolve that way it
 refuses outright with `install PyYAML for full YAML support` rather than
 keeping it as the string it looks like. Refused, among others: anchors,
 aliases, tags, block scalars (`|`, `>`), flow mappings (`{a: 1}`), nested
-flow sequences, escape sequences inside quoted scalars, and timestamps.
+flow sequences, escape sequences inside quoted scalars, timestamps, tabs
+outside a quoted scalar or a comment (PyYAML's scanner refuses those too),
+and a document with a line the top-level block does not contain, such as a
+mapping followed by a sequence item. The last two matter because the
+alternative is not a different value but a *partial* file: the parser would
+otherwise read the lines it understood and drop the rest, and the dropped
+line could be the one that closes the merge gate.
 Installing the extra therefore widens what parses; it never changes what an
 already-parsing file means.
 

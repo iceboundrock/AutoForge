@@ -1296,6 +1296,31 @@ AMBIGUOUS_DOCUMENTS = [
     "version: 1\nsafety:\n  required_checks:\n    - ci\n    - build\n",
     'version: 1\nmerge:\n  verification_commands: [["pytest", "-q"]]\n',
     "version: 1\nmerge:\n  verification_commands:\n    - - pytest\n      - -q\n",
+    # A stray line the top-level block does not contain: the subset parser
+    # used to return the part it had read and drop the rest, so a document
+    # PyYAML rejects outright opened the merge gate on the other backend.
+    "version: 1\nsafety:\n  allow_merge: true\n- ignored\n",
+    "version: 1\nsafety:\n  allow_merge: true\nmore: 1\n- ignored\n",
+    "- ignored\nversion: 1\nsafety:\n  allow_merge: true\n",
+    "version: 1\n- ignored\n",
+    # Tabs. PyYAML's scanner skips only spaces between tokens and ends a plain
+    # scalar at a tab, so all of these are scanner errors there while the
+    # subset parser's strip-and-split used to read them as plain scalars.
+    "version: 1\nprofiles:\n  fix:\n    model: foo\t# the vendor spells it so\n",
+    "version: 1\nprofiles:\n  fix:\n    model: foo\tbar\n",
+    "version: 1\nprofiles:\n  fix:\n    model: foo\t\n",
+    "version: 1\nprofiles:\n  fix:\n\tmodel: foo\n",
+    "version:\t1\n",
+    "version: 1\n\t\n",
+    "version: 1\nsafety:\n  required_checks: [ci,\tbuild]\n",
+    "version: 1\nsafety:\n  required_checks:\n    -\tci\n",
+    # A tab *inside* a quoted scalar or a comment is legal under PyYAML, so
+    # these must still load, and load to the same Config.
+    'version: 1\nprofiles:\n  fix:\n    model: "a\tb"\n',
+    "version: 1\nprofiles:\n  fix:\n    model: 'a\tb'\n",
+    "version: 1\nprofiles:\n  fix:\n    model: foo # spelled\tso\n",
+    "# a\tcomment\nversion: 1\nsafety:\n  allow_merge: true\n",
+    'version: 1\nsafety:\n  required_checks: ["a\tb", ci]\n',
     # Roots that are not a mapping, and the empty document that means defaults.
     "false\n",
     "- item\n",
@@ -1311,6 +1336,46 @@ def test_yaml_backends_read_the_same_document_the_same_way(tmp_path, monkeypatch
     p = tmp_path / "cfg.yaml"
     p.write_text(text, encoding="utf-8")
     assert_backends_agree(p, monkeypatch)
+
+
+# `assert_backends_agree` is satisfied by a refusal, so the two cases the
+# subset parser used to accept get an explicit test that it now refuses them
+# *and* that PyYAML refuses them too -- the differential pair, named.
+@pytest.mark.parametrize(
+    "text, detail",
+    [
+        (
+            "version: 1\nsafety:\n  allow_merge: true\n- ignored\n",
+            "unexpected content after the document at: '- ignored'",
+        ),
+        (
+            "version: 1\nprofiles:\n  fix:\n    model: foo\t# c\n",
+            "tab outside a quoted scalar at: '    model: foo\\t# c'",
+        ),
+    ],
+)
+def test_subset_backend_refuses_what_pyyaml_refuses(tmp_path, monkeypatch, text, detail):
+    """Neither a partial document nor a tabbed plain scalar may load here."""
+    pyyaml_module = pytest.importorskip("yaml")
+    with pytest.raises(pyyaml_module.YAMLError):
+        pyyaml_module.safe_load(text)  # the behaviour the subset parser must match
+    p = tmp_path / "cfg.yaml"
+    p.write_text(text, encoding="utf-8")
+    pyyaml, subset = load_both_yaml_backends(p, monkeypatch)
+    assert subset[0] == "error", f"the subset parser accepted {text!r}: {subset[1]}"
+    assert subset[1].startswith(f"cannot parse config {p}: YAML subset parser: {detail}")
+    assert pyyaml[0] == "error"
+
+
+def test_tab_inside_a_quoted_scalar_still_loads_on_both_backends(tmp_path, monkeypatch):
+    """The tab rule is PyYAML's, not a blanket ban: a quoted tab is legal there."""
+    pytest.importorskip("yaml")
+    p = tmp_path / "cfg.yaml"
+    p.write_text('version: 1\nprofiles:\n  fix:\n    model: "a\tb"\n', encoding="utf-8")
+    pyyaml, subset = load_both_yaml_backends(p, monkeypatch)
+    assert pyyaml[0] == "ok" and subset[0] == "ok", (pyyaml, subset)
+    assert subset[1].profile("fix").model == "a\tb"
+    assert subset[1] == pyyaml[1]
 
 
 def test_example_config_is_the_same_on_both_yaml_backends(monkeypatch):

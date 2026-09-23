@@ -1176,6 +1176,9 @@ def _parse_yaml_subset(text: str) -> object:
     knows nothing about the file it is reading, so the path that makes the
     message actionable is added by ``load_config_file`` for all of them.
     """
+    for line in text.splitlines():
+        if "\t" in line:
+            _reject_tab(line)
     cleaned = [
         (len(line) - len(line.lstrip(" ")), _strip_inline_comment(line.strip()))
         for line in text.splitlines()
@@ -1242,7 +1245,18 @@ def _parse_yaml_subset(text: str) -> object:
                 mapping[key] = _scalar(rest)
         return mapping
 
-    return parse_block(0)
+    root = parse_block(0)
+    # `parse_block` returns at the first line that does not belong to the
+    # block it is reading: a nested one leaves that line to its caller, which
+    # refuses it, but the top-level call has no caller. So a document that
+    # mixes a mapping and a sequence at the root -- `safety:\n  allow_merge:
+    # true\n- x\n` -- used to be returned as the part read before the stray
+    # line, silently dropping content PyYAML rejects outright. Reading *part*
+    # of a malformed file is the one outcome this parser must never produce:
+    # the dropped line could be the one that closes the merge gate.
+    if pos != len(cleaned):
+        raise _unsupported("unexpected content after the document at", cleaned[pos][1])
+    return root
 
 
 def _strip_inline_comment(content: str) -> str:
@@ -1265,6 +1279,37 @@ def _strip_inline_comment(content: str) -> str:
             break
         out.append(ch)
     return "".join(out).rstrip()
+
+
+def _reject_tab(line: str) -> None:
+    r"""Refuse a tab anywhere PyYAML's scanner refuses one.
+
+    PyYAML skips only *spaces* between tokens and ends a plain scalar at a
+    tab, so a tab that is neither inside a quoted scalar nor inside a comment
+    reaches its scanner as a character that "cannot start any token" -- tab
+    indentation, ``model: foo\tbar`` and even a trailing ``model: foo\t`` are
+    all scanner errors there. The line cleaning above strips and splits on
+    spaces alone, so it would read every one of them as an ordinary plain
+    scalar. A tab inside a quoted scalar or a comment is legal under PyYAML
+    and read identically here, so only the rest is refused.
+
+    The quote and comment rules are ``_strip_inline_comment``'s, applied to
+    the raw line: a quote opens a scalar only where a token may begin, and
+    ``#`` starts a comment only after a space.
+    """
+    quote = ""
+    prev = " "  # a line begins where a token may begin
+    for ch in line:
+        if quote:
+            if ch == quote:
+                quote = ""
+        elif ch in "'\"" and prev in " \t,[{":
+            quote = ch
+        elif ch == "#" and prev == " ":
+            return  # the rest of the line is a comment; PyYAML allows tabs there
+        elif ch == "\t":
+            raise _unsupported("tab outside a quoted scalar at", line)
+        prev = ch
 
 
 def _split_key(content: str) -> tuple[str, str] | None:
