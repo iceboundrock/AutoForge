@@ -1221,6 +1221,15 @@ AMBIGUOUS_SCALARS = [
     "'1.0'", '"1.0"', "'yes'", '"on"', "''", '""', "'a''b'", '"a\\nb"', '"a" "b"', "'abc",
     # Plain scalars that merely look like something else.
     "hello", "hello world", "a:b", "?x", "-foo", "a,b", "a[b]", "a#b", "---", "0o17",
+    # A quote inside a plain scalar is an ordinary character: a scalar starts
+    # where a scalar may *begin*, not after every space.
+    "a 'b'", 'a "b"', "a 'b", "a ' b", "don't", "a'b",
+    # Plain scalars PyYAML's scanner refuses in block context, so that the
+    # string each one looks like is never invented here.
+    "x: y", "x:", "- x", "? x", "-", "?", ": x", ":x", "a - b", "a ? b", "a:: b",
+    # ... and the ones its *flow* scanner refuses, where `?` also ends a
+    # plain scalar and a leading `:` opens a mapping value.
+    "[x: y]", "[a?b]", "[:x]", "[a:]", "[- a]", "[a'b]", "[a 'b, c']", '["a" b]',
     # Flow sequences, including the nesting a comma split gets wrong.
     "[a, b]", "[1, 2]", "[]", "[a]", "[a, ]", "[a,,b]", '["x, y", z]',
     "[[1,2]]", "[a, [b, c]]", "{a: 1}", "{}",
@@ -1268,8 +1277,48 @@ AMBIGUOUS_DOCUMENTS = [
     "version: 1\nprofiles:\n  fix:\n    model: .inf\n",
     "version: 1\nprofiles:\n  fix:\n    model: 2026-09-23\n",
     # An apostrophe in a plain scalar must not quote the rest of the line and
-    # swallow the comment after it.
+    # swallow the comment after it -- neither at the start of the scalar nor,
+    # which is the same rule one space to the left, in the middle of it: a
+    # quote opens a quoted scalar only where a scalar may *begin*. The last
+    # one is that bug reaching the tab rule: `a 'b<TAB>c'` was read as a
+    # quoted scalar, whose tab is legal, and PyYAML refuses the file.
     "version: 1\nprofiles:\n  fix:\n    model: don't # the vendor spells it so\n",
+    "version: 1\nprofiles:\n  fix:\n    model: a 'b # c'\n",
+    'version: 1\nprofiles:\n  fix:\n    model: a "b # c"\n',
+    "version: 1\nprofiles:\n  fix:\n    model: a 'b\tc'\n",
+    "version: 1\nexecution:\n  worktree_dir: /tmp/a 'b # c'\n",
+    "version: 1\nsafety:\n  required_checks: [a 'b, c']\n",
+    "version: 1\nsafety:\n  required_checks:\n    - a 'b # c'\n",
+    # A `key: value` sequence item is the mapping PyYAML builds from it, so
+    # the subset parser must not install the check named "x: y" instead.
+    "version: 1\nsafety:\n  required_checks:\n    - x: y\n",
+    "version: 1\nsafety:\n  required_checks: [x: y]\n",
+    "version: 1\nsafety:\n  required_checks:\n    - x: y\n      z: w\n",
+    'version: 1\nsafety:\n  required_checks:\n    - "x: y"\n',
+    # Plain scalars PyYAML's scanner refuses where they appear: `model: x: y`
+    # is `mapping values are not allowed here` there, not the string "x: y".
+    "version: 1\nprofiles:\n  fix:\n    model: x: y\n",
+    "version: 1\nprofiles:\n  fix:\n    model: x:\n",
+    "version: 1\nprofiles:\n  fix:\n    model: - x\n",
+    "version: 1\nprofiles:\n  fix:\n    model: ? x\n",
+    "version: 1\nprofiles:\n  fix:\n    model: :x\n",
+    "version: 1\nexecution:\n  worktree_dir: /tmp/x: y\n",
+    "version: 1\nprofiles:\n  fix:\n    options:\n      permission_mode: a: b\n",
+    "version: 1\nsafety:\n  required_checks: [a?b]\n",
+    "version: 1\nsafety:\n  required_checks: [:x]\n",
+    "version: 1\nsafety:\n  required_checks: [a:]\n",
+    # Shapes no config key reaches today (every list field refuses both
+    # readings), kept so the parser is measured where a list of mappings
+    # would first make them visible.
+    "version: 1\nsafety:\n  required_checks:\n    -\n",
+    "version: 1\nsafety:\n  required_checks:\n    - a\n      - b\n",
+    "version: 1\nmerge:\n  verification_commands:\n    - - pytest\n      - -q\n",
+    "version: 1\n: 1\n",
+    'version: 1\n"": 1\n',
+    # Document markers: more than one document is a PyYAML error.
+    "version: 1\n--- a: 1\n",
+    "version: 1\n---\nsafety:\n  allow_merge: true\n",
+    "---\nversion: 1\n",
     # Empty values: the omitted section, the explicit null, the empty string.
     "version: 1\nexecution:\n  worktree_dir:\n",
     "version: 1\nexecution:\n  worktree_dir: ~\n",
@@ -1295,7 +1344,6 @@ AMBIGUOUS_DOCUMENTS = [
     "version: 1\nsafety:\n  required_checks: []\n",
     "version: 1\nsafety:\n  required_checks:\n    - ci\n    - build\n",
     'version: 1\nmerge:\n  verification_commands: [["pytest", "-q"]]\n',
-    "version: 1\nmerge:\n  verification_commands:\n    - - pytest\n      - -q\n",
     # A stray line the top-level block does not contain: the subset parser
     # used to return the part it had read and drop the rest, so a document
     # PyYAML rejects outright opened the merge gate on the other backend.
@@ -1352,6 +1400,29 @@ def test_yaml_backends_read_the_same_document_the_same_way(tmp_path, monkeypatch
             "version: 1\nprofiles:\n  fix:\n    model: foo\t# c\n",
             "tab outside a quoted scalar at: '    model: foo\\t# c'",
         ),
+        # The same tab, behind the quote that used to hide it: a quote after
+        # a space does not open a quoted scalar, so the tab is still bare.
+        (
+            "version: 1\nprofiles:\n  fix:\n    model: a 'b\tc'\n",
+            "tab outside a quoted scalar at: \"    model: a 'b\\tc'\"",
+        ),
+        # Plain scalars PyYAML's scanner refuses in block context.
+        (
+            "version: 1\nprofiles:\n  fix:\n    model: x: y\n",
+            "mapping values are not allowed in a plain scalar at: 'x: y'",
+        ),
+        (
+            "version: 1\nprofiles:\n  fix:\n    model: x:\n    effort: high\n",
+            "mapping values are not allowed in a plain scalar at: 'x:'",
+        ),
+        (
+            "version: 1\nprofiles:\n  fix:\n    model: - x\n",
+            "sequence entries are not allowed in a plain scalar at: '- x'",
+        ),
+        (
+            "version: 1\nprofiles:\n  fix:\n    model: ? x\n",
+            "mapping keys are not allowed in a plain scalar at: '? x'",
+        ),
     ],
 )
 def test_subset_backend_refuses_what_pyyaml_refuses(tmp_path, monkeypatch, text, detail):
@@ -1365,6 +1436,58 @@ def test_subset_backend_refuses_what_pyyaml_refuses(tmp_path, monkeypatch, text,
     assert subset[0] == "error", f"the subset parser accepted {text!r}: {subset[1]}"
     assert subset[1].startswith(f"cannot parse config {p}: YAML subset parser: {detail}")
     assert pyyaml[0] == "error"
+
+
+def test_a_quote_after_a_space_does_not_start_a_quoted_scalar(tmp_path, monkeypatch):
+    """R2-F1: both backends read `a \'b # c\'` as the plain scalar `a \'b`.
+
+    Not covered by the corpus alone: `assert_backends_agree` is satisfied by
+    a refusal, and here neither backend refuses -- they used to *accept* the
+    file with different values, which is the divergence #40 exists to
+    prevent, so the agreed value itself is named.
+    """
+    pytest.importorskip("yaml")
+    p = tmp_path / "cfg.yaml"
+    p.write_text("version: 1\nprofiles:\n  fix:\n    model: a 'b # c'\n", encoding="utf-8")
+    pyyaml, subset = load_both_yaml_backends(p, monkeypatch)
+    assert pyyaml[0] == "ok" and subset[0] == "ok", (pyyaml, subset)
+    assert subset[1].profile("fix").model == "a 'b"
+    assert subset[1] == pyyaml[1]
+
+
+@pytest.mark.parametrize(
+    "text, detail",
+    [
+        (
+            "version: 1\nsafety:\n  required_checks:\n    - x: y\n",
+            "a mapping inside a sequence item at: '- x: y'",
+        ),
+        (
+            "version: 1\nsafety:\n  required_checks: [x: y]\n",
+            "mapping values are not allowed in a plain scalar at: 'x: y'",
+        ),
+    ],
+)
+def test_a_mapping_sequence_item_is_refused_rather_than_read_as_a_string(
+    tmp_path, monkeypatch, text, detail
+):
+    """R2-F2: `- x: y` is a *mapping* to PyYAML, so it is never a check name.
+
+    Here PyYAML parses the file and the loader refuses what it built, which
+    is still a refusal reaching the operator -- but the subset parser used to
+    install the check "x: y", a check no commit can ever satisfy, and the two
+    backends disagreed about the merge gate's evidence. The subset parser
+    implements no mapping inside a sequence, so it refuses the item.
+    """
+    pyyaml_module = pytest.importorskip("yaml")
+    assert pyyaml_module.safe_load(text)["safety"]["required_checks"] == [{"x": "y"}]
+    p = tmp_path / "cfg.yaml"
+    p.write_text(text, encoding="utf-8")
+    pyyaml, subset = load_both_yaml_backends(p, monkeypatch)
+    assert subset[0] == "error", f"the subset parser accepted {text!r}: {subset[1]}"
+    assert subset[1].startswith(f"cannot parse config {p}: YAML subset parser: {detail}")
+    assert pyyaml[0] == "error"
+    assert "required_checks must contain non-empty strings" in pyyaml[1]
 
 
 def test_tab_inside_a_quoted_scalar_still_loads_on_both_backends(tmp_path, monkeypatch):

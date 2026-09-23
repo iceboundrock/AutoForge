@@ -1103,13 +1103,22 @@ the string `1e3` either way -- and anything it cannot resolve that way it
 refuses outright with `install PyYAML for full YAML support` rather than
 keeping it as the string it looks like. Refused, among others: anchors,
 aliases, tags, block scalars (`|`, `>`), flow mappings (`{a: 1}`), nested
-flow sequences, escape sequences inside quoted scalars, timestamps, tabs
-outside a quoted scalar or a comment (PyYAML's scanner refuses those too),
-and a document with a line the top-level block does not contain, such as a
-mapping followed by a sequence item. The last two matter because the
-alternative is not a different value but a *partial* file: the parser would
-otherwise read the lines it understood and drop the rest, and the dropped
-line could be the one that closes the merge gate.
+flow sequences, escape sequences inside quoted scalars, timestamps, a
+mapping inside a sequence item (`- key: value`, which is a mapping to PyYAML
+and never the string it looks like), a plain scalar holding what PyYAML's
+scanner reads as an indicator rather than text (`model: x: y`, `model: - x`,
+`model: ? x`), document markers (`---`), tabs outside a quoted scalar or a
+comment (PyYAML's scanner refuses those too), and a document with a line the
+top-level block does not contain, such as a mapping followed by a sequence
+item. The last two matter because the alternative is not a different value
+but a *partial* file: the parser would otherwise read the lines it
+understood and drop the rest, and the dropped line could be the one that
+closes the merge gate.
+
+A quote is read as a quoted scalar only where a scalar may *begin* -- the
+start of a value or an item, or after a `,`, `[` or `{` -- exactly as PyYAML
+reads one, so `model: don't # why` keeps its comment and `model: a 'b # c'`
+is the plain scalar `a 'b` on both backends.
 Installing the extra therefore widens what parses; it never changes what an
 already-parsing file means.
 

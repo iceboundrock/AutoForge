@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import fnmatch
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -1185,6 +1186,12 @@ def _parse_yaml_subset(text: str) -> object:
         if line.strip() and not line.strip().startswith("#")
     ]
     cleaned = [(indent, content) for indent, content in cleaned if content]
+    for _, content in cleaned:
+        # `---` and `...` open and close a *document*; a file with more than
+        # one is a PyYAML error, and this parser reads a single document, so
+        # it never treats either marker as the content it looks like.
+        if content in ("---", "...") or content[:4] in ("--- ", "... "):
+            raise _unsupported("YAML document markers are not supported at", content)
     pos = 0
 
     def is_list_item(content: str) -> bool:
@@ -1197,16 +1204,36 @@ def _parse_yaml_subset(text: str) -> object:
             return {}
         if is_list_item(cleaned[pos][1]):
             items: list[object] = []
+            # Items of one sequence align exactly. A *deeper* `- x` line is
+            # not a sibling to PyYAML but the continuation of the multi-line
+            # plain scalar above it (`- a` then `  - b` is the one item
+            # "a - b" there), so leave it to the caller, which refuses it.
+            item_indent = cleaned[pos][0]
             while (
                 pos < len(cleaned)
-                and cleaned[pos][0] >= min_indent
+                and cleaned[pos][0] == item_indent
                 and is_list_item(cleaned[pos][1])
             ):
                 ind, content = cleaned[pos]
                 item_text = content[1:].strip()
                 pos += 1
                 if item_text == "":
-                    items.append(parse_block(ind + 1))
+                    # An item with nothing after the dash is a nested block,
+                    # or -- with nothing indented under it -- null, which is
+                    # what PyYAML builds for it; an empty mapping is not.
+                    if pos < len(cleaned) and cleaned[pos][0] > ind:
+                        items.append(parse_block(ind + 1))
+                    else:
+                        items.append(None)
+                elif _split_key(item_text) is not None:
+                    # `- key: value` is a one-key *mapping* to PyYAML, and
+                    # `- key: value` + an aligned second key is a two-key one.
+                    # Resolving the item as a scalar kept it as the string it
+                    # looks like, so `required_checks:\n  - x: y` installed the
+                    # check "x: y" here while PyYAML built {"x": "y"} and the
+                    # loader refused the file. This parser implements no
+                    # mapping inside a sequence, so it refuses the item.
+                    raise _unsupported("a mapping inside a sequence item at", content)
                 else:
                     items.append(_scalar(item_text))
             return items
@@ -1227,6 +1254,10 @@ def _parse_yaml_subset(text: str) -> object:
             if split is None:
                 raise _unsupported("cannot parse line", content)
             raw_key, rest = split
+            if raw_key == "":
+                # `: 1` is an explicit-key mapping to PyYAML, which refuses
+                # it in block context; only a *quoted* empty key is one.
+                raise _unsupported("a mapping key is missing at", content)
             key = _scalar(raw_key)
             try:
                 repeated = key in mapping
@@ -1259,26 +1290,62 @@ def _parse_yaml_subset(text: str) -> object:
     return root
 
 
-def _strip_inline_comment(content: str) -> str:
-    """Drop a trailing ``#`` comment, ignoring one inside a quoted scalar.
+def _scan_line(content: str) -> Iterator[tuple[str, bool]]:
+    r"""Yield ``(char, quoted)`` for the part of a line that is not a comment.
 
-    A quote *opens* a quoted scalar only where a token may begin -- the start
-    of the line, or after a space, a comma or a flow-sequence bracket -- which
-    is how PyYAML reads it: the apostrophe in ``model: don't # why`` does not
-    make the rest of the line quoted and swallow its comment.
+    One scan serves both callers below, because both need PyYAML's two
+    boundary rules and must not disagree about them:
+
+    * A quote *opens* a quoted scalar only where a scalar may **begin** -- at
+      the start of the line, after the ``: `` or ``- `` that introduces a
+      value or a block sequence item, or after a ``,``, ``[`` or ``{`` inside
+      a flow collection. A quote anywhere else is an ordinary character of
+      the plain scalar already being read, which is why ``model: don't # why``
+      keeps its comment and ``model: a 'b # c'`` is the plain scalar ``a 'b``
+      rather than a quoted scalar swallowing the ``#``. Treating *any* space
+      as a scalar start read the first as PyYAML does and the second as a
+      quoted scalar, and let ``model: a 'b\tc'`` past the tab rule below.
+    * A ``#`` starts a comment only after whitespace (or at the start of the
+      line), and everything from there on is comment, so the scan stops.
     """
-    out: list[str] = []
     quote = ""
+    at_start = True  # a scalar may begin at the start of a line
+    depth = 0  # open flow collections: `,` separates items only inside one
+    prev = " "
     for i, ch in enumerate(content):
         if quote:
+            yield ch, True
             if ch == quote:
                 quote = ""
-        elif ch in "'\"" and (i == 0 or content[i - 1] in " \t,[{"):
+                at_start = False
+        elif ch in "'\"" and at_start:
             quote = ch
-        elif ch == "#" and i > 0 and content[i - 1] == " ":
-            break
-        out.append(ch)
-    return "".join(out).rstrip()
+            yield ch, True
+        elif ch == "#" and (at_start or prev in " \t"):
+            return
+        else:
+            yield ch, False
+            if ch in " \t":
+                pass  # whitespace separates tokens; it does not end a scalar
+            elif ch in "[{" and at_start:
+                depth += 1  # a flow collection, whose first item begins next
+            elif ch in "]}" and depth:
+                depth -= 1
+                at_start = False
+            elif ch == "," and depth:
+                at_start = True  # the next item of that flow collection
+            elif ch == ":" and content[i + 1 : i + 2] in ("", " "):
+                at_start = True  # a mapping value begins after the colon
+            elif ch == "-" and at_start and content[i + 1 : i + 2] == " ":
+                pass  # a block sequence indicator: the item begins after it
+            else:
+                at_start = False
+        prev = ch
+
+
+def _strip_inline_comment(content: str) -> str:
+    """Drop a trailing ``#`` comment, ignoring one inside a quoted scalar."""
+    return "".join(ch for ch, _ in _scan_line(content)).rstrip()
 
 
 def _reject_tab(line: str) -> None:
@@ -1293,23 +1360,12 @@ def _reject_tab(line: str) -> None:
     scalar. A tab inside a quoted scalar or a comment is legal under PyYAML
     and read identically here, so only the rest is refused.
 
-    The quote and comment rules are ``_strip_inline_comment``'s, applied to
-    the raw line: a quote opens a scalar only where a token may begin, and
-    ``#`` starts a comment only after a space.
+    Which tab is inside a quoted scalar is ``_scan_line``'s decision, the
+    same one ``_strip_inline_comment`` uses.
     """
-    quote = ""
-    prev = " "  # a line begins where a token may begin
-    for ch in line:
-        if quote:
-            if ch == quote:
-                quote = ""
-        elif ch in "'\"" and prev in " \t,[{":
-            quote = ch
-        elif ch == "#" and prev == " ":
-            return  # the rest of the line is a comment; PyYAML allows tabs there
-        elif ch == "\t":
+    for ch, quoted in _scan_line(line):
+        if ch == "\t" and not quoted:
             raise _unsupported("tab outside a quoted scalar at", line)
-        prev = ch
 
 
 def _split_key(content: str) -> tuple[str, str] | None:
@@ -1335,11 +1391,38 @@ def _split_key(content: str) -> tuple[str, str] | None:
     return None
 
 
-def _scalar(text: str) -> object:
+def _reject_plain_indicators(t: str, flow: bool) -> None:
+    """Refuse the plain scalars PyYAML's scanner refuses in this context.
+
+    PyYAML ends a plain scalar at a ``:`` that a space or the end of the line
+    follows, and reads a leading ``- ``, ``? `` or ``: `` as the block
+    indicator each one is, so it never builds the string these look like:
+    ``model: x: y`` is `mapping values are not allowed here` there, ``model:
+    - x`` is `sequence entries are not allowed here` and ``model: ? x`` is
+    `mapping keys are not allowed here`. ``_split_key`` already encodes the
+    colon half of that rule for keys; this is the same rule for what remains
+    as a value, so the string a plain scalar looks like is never invented
+    where PyYAML refuses the file outright.
+
+    Inside a flow collection PyYAML also ends a plain scalar at ``?``
+    wherever it appears (``[a?b]`` is a parser error there, while the block
+    scalar ``a?b`` is an ordinary string).
+    """
+    if t == "-" or t.startswith("- "):
+        raise _unsupported("sequence entries are not allowed in a plain scalar at", t)
+    if t == "?" or t.startswith("? ") or (flow and "?" in t):
+        raise _unsupported("mapping keys are not allowed in a plain scalar at", t)
+    if t.endswith(":") or ": " in t or (flow and t.startswith(":")):
+        raise _unsupported("mapping values are not allowed in a plain scalar at", t)
+
+
+def _scalar(text: str, flow: bool = False) -> object:
     """One YAML scalar, resolved exactly as PyYAML's implicit resolvers do.
 
     Anything whose PyYAML reading this parser cannot reproduce is refused
-    rather than guessed at (see the note above the resolvers).
+    rather than guessed at (see the note above the resolvers). ``flow`` says
+    whether the scalar is an item of a flow sequence, where PyYAML ends a
+    plain scalar at more characters than in block context.
     """
     t = text.strip()
     if t[:1] in ("'", '"'):
@@ -1348,6 +1431,7 @@ def _scalar(text: str) -> object:
         return _flow_sequence(t)
     if t[:1] and (t[0] in _UNSUPPORTED_FIRST_CHARS or t in ("=", "<<")):
         raise _unsupported("unsupported YAML at", t)
+    _reject_plain_indicators(t, flow)
     if t in _YAML_NULL:
         return None
     if t in _YAML_TRUE:
@@ -1388,7 +1472,7 @@ def _flow_sequence(text: str) -> list[object]:
     inner = text[1:-1].strip()
     if not inner:
         return []
-    return [_scalar(part) for part in _split_inline(inner)]
+    return [_scalar(part, flow=True) for part in _split_inline(inner)]
 
 
 def _yaml_int(text: str) -> int:
@@ -1447,23 +1531,38 @@ def _split_inline(inner: str) -> list[str]:
 
     A nested flow collection is refused rather than split on the wrong comma:
     ``[[1, 2]]`` is two malformed items to this split and one list to PyYAML.
+
+    A quote opens a quoted scalar only where an item may begin, which is
+    ``_scan_line``'s rule one level down: ``[a 'b, c']`` is the two plain
+    scalars ``a 'b`` and ``c'`` to PyYAML, not one quoted item, and a quote
+    inside a plain item must not hide the ``]`` after it either.
     """
     parts: list[str] = []
     cur = ""
-    in_s = in_d = False
+    quote = ""
+    at_start = True
     for ch in inner:
-        if ch == "'" and not in_d:
-            in_s = not in_s
-        elif ch == '"' and not in_s:
-            in_d = not in_d
-        elif ch in "[]{}" and not in_s and not in_d:
+        if quote:
+            if ch == quote:
+                quote = ""
+                at_start = False
+            cur += ch
+            continue
+        if ch in "'\"" and at_start:
+            quote = ch
+            cur += ch
+            continue
+        if ch in "[]{}":
             raise _unsupported("nested flow collection at", inner)
-        if ch == "," and not in_s and not in_d:
+        if ch == ",":
             parts.append(cur.strip())
             cur = ""
-        else:
-            cur += ch
-    if in_s or in_d:
+            at_start = True
+            continue
+        if ch not in " \t":
+            at_start = False
+        cur += ch
+    if quote:
         raise _unsupported("unterminated quoted string at", inner)
     if cur.strip():
         parts.append(cur.strip())
