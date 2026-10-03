@@ -4,4 +4,4 @@
 
 ## Sub agent rules
 
-When dispatching sub agents, do not use `Sonnet 5`. For tasks where `Haiku` is not enough, go straight to `Opus 4.8`.
+When dispatching sub agents, do not use `Sonnet`. For tasks where `Haiku` is not enough, go straight to `Opus`.
