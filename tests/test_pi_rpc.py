@@ -310,10 +310,13 @@ def test_stop_reason_aborted_is_a_provider_failure():
     assert run.failure() == "pi: the run was aborted, not by AutoForge"
 
 
-def test_stop_reason_length_passes_the_text_through_and_is_recorded():
+def test_stop_reason_length_is_a_provider_failure_and_is_recorded():
+    # Pi 1.0.1 drops a cut-off answer from its context, so the text cannot be
+    # read back; get_last_assistant_text is never asked.
     run = Run().started().settle(assistant(stop="length"))
-    run.respond("get_last_assistant_text", {"text": FINAL})
-    assert run.c.text == FINAL and run.c.summary()["stop_reason"] == "length"
+    assert run.failure() == "pi: the model hit its output limit (stopReason length)"
+    assert run.c.summary()["stop_reason"] == "length"
+    assert "get_last_assistant_text" not in run.types()
 
 
 @pytest.mark.parametrize("stop", ["toolUse", "deferred", "pending", "later", None])
@@ -480,11 +483,24 @@ def test_a_record_that_is_not_a_typed_json_object_is_a_protocol_failure(data):
     assert "protocol violation" in run.failure()
 
 
+def test_system_and_user_message_ends_are_not_the_answer():
+    # Pi 1.0.1 emits the system prompt and the user prompt as message_end
+    # records of their own before the assistant's.
+    run = Run().started()
+    run.feed({"type": "message_end", "message": {"role": "system", "content": ""}})
+    user = {"role": "user", "content": [{"type": "text", "text": "do the work"}]}
+    run.feed({"type": "message_end", "message": user})
+    run.settle()
+    run.respond("get_last_assistant_text", {"text": FINAL})
+    assert run.c.text == FINAL
+
+
 def test_unknown_events_are_ignored_and_counted():
     run = Run().started()
     run.feed({"type": "brand_new_event", "payload": {"x": 1}})
     run.feed({"type": "another_one"})
     run.feed({"type": "turn_end"})  # known, deliberately ignored
+    run.feed({"type": "entry_appended", "entry": {"type": "context_edit"}})  # known too
     run.settle()
     run.respond("get_last_assistant_text", {"text": FINAL})
     assert run.c.text == FINAL and run.c.summary()["unknown_events"] == 2
@@ -511,6 +527,16 @@ def test_an_unknown_extension_ui_method_fails_closed():
     run = Run().started()
     assert run.feed({"type": "extension_ui_request", "id": "u", "method": "teleport"}) == []
     assert "cannot answer ('teleport')" in run.failure()
+
+
+@pytest.mark.parametrize("method", [["confirm"], {"m": "confirm"}, None, 7])
+def test_a_non_string_extension_ui_method_fails_closed(method):
+    run = Run().started()
+    record = {"type": "extension_ui_request", "id": "u", "method": method}
+    assert run.feed(record) == []
+    assert run.failure() == (
+        "pi: protocol violation: an extension UI request without a string 'method'"
+    )
 
 
 # -- bounds and lifecycle --------------------------------------------------------------------
@@ -829,6 +855,20 @@ def test_provider_extension_dialog_is_cancelled_with_the_exact_record(tmp_path):
     )
     assert fake.commands()[-1] == "abort"
     assert res.provider_summary["ui_dialogs_cancelled"] == 1
+
+
+def test_provider_a_malformed_extension_ui_method_is_a_provider_failure(tmp_path):
+    scenario = _happy()
+    scenario["on"]["prompt"] = [
+        {"respond": "prompt", "data": {"disposition": "started"}},
+        {"emit": {"type": "extension_ui_request", "id": "ui-9", "method": ["confirm"]}},
+    ]
+    res, fake = _execute(tmp_path, scenario)
+    assert res.provider_failure == (
+        "pi: protocol violation: an extension UI request without a string 'method'"
+    )
+    assert not any('"ui-9"' in line for line in fake.stdin())
+    assert fake.commands()[-1] == "abort"
 
 
 def test_provider_deadline_mid_stream_aborts_then_closes_stdin(tmp_path):

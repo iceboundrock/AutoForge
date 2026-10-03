@@ -21,7 +21,7 @@ The conversation, in order (ADR 0003 §2.1 to §2.8):
    with ``disposition: "started"``; ``success: false`` is a rejection
    before acceptance, and any other disposition is a protocol failure.
 3. Events until ``agent_settled``. ``agent_end`` is never terminal. The
-   last assistant ``message_end`` decides: ``stop`` and ``length`` go on,
+   last assistant ``message_end`` decides: ``stop`` goes on, ``length``,
    ``error`` and ``aborted`` are provider failures, anything else is a
    protocol failure. An extension dialog is answered at once with
    ``cancelled: true`` and fails the run. Unknown event types are counted
@@ -52,7 +52,7 @@ from .redaction import redact
 # timeout and would wait forever), and the fire-and-forget ones.
 DIALOG_METHODS = frozenset({"select", "confirm", "input", "editor"})
 NOTIFY_METHODS = frozenset({"notify", "setStatus", "setWidget", "setTitle", "set_editor_text"})
-SUCCESS_STOP_REASONS = ("stop", "length")
+SUCCESS_STOP_REASONS = ("stop",)
 # Events the reducer reads, and known events it deliberately ignores. Any
 # other type is counted as unknown (forward compatibility); the count is a
 # diagnostic only.
@@ -80,6 +80,9 @@ _IGNORED_EVENTS = frozenset(
         "auto_compaction_end",
         "queue_update",
         "extension_error",
+        # Pi 1.0.1 emits it after a `length` stop or a retried error, when it
+        # drops the abandoned message from the context.
+        "entry_appended",
     }
 )
 # What Pi reports when a ChatGPT subscription has run out of usage.
@@ -465,7 +468,11 @@ class PiConversation:
         self._stop_reason = stop if isinstance(stop, str) else ""
         if stop in SUCCESS_STOP_REASONS:
             return True
-        if stop == "error":
+        if stop == "length":
+            # Pi drops a cut-off answer from its context (verified on Pi 1.0.1),
+            # so get_last_assistant_text cannot return it.
+            self._fail("pi: the model hit its output limit (stopReason length)")
+        elif stop == "error":
             self._fail(_model_error("model error after acceptance", message.get("errorMessage")))
         elif stop == "aborted":
             self._fail("pi: the run was aborted, not by AutoForge")
@@ -475,6 +482,10 @@ class PiConversation:
 
     def _ui_request(self, record: dict) -> list[bytes]:
         method = record.get("method")
+        if not isinstance(method, str):
+            # An array or object is unhashable: test the type before membership.
+            self._protocol("an extension UI request without a string 'method'")
+            return []
         if method in NOTIFY_METHODS:
             self._notifications_ignored += 1
             return []

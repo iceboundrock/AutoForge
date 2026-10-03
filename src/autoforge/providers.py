@@ -390,10 +390,11 @@ PI_ROUND_TRIP_SECONDS = 15.0
 # closed; taken from the end of the invocation's timeout (at most a quarter
 # of it), so the abort and the group kill both land within the timeout.
 PI_ABORT_SECONDS = 5.0
-# One stdout record carries at most one message (`message_update` repeats
-# the partial message so far, `get_last_assistant_text` the final text), and
-# JSON escaping can double a text; a final text past the stdout bound must
-# still arrive whole so that its tail can be kept.
+# A final text past the stdout bound must still arrive whole in one
+# `get_last_assistant_text` record so that its tail can be kept, and JSON
+# escaping can double a text. Pi's `agent_end` is not bounded by this: it
+# repeats every message of the run (verified on Pi 1.0.1), so a very long run
+# can overflow the bound and fail closed as a protocol violation (#144).
 PI_MAX_RECORD_BYTES = 2 * DEFAULT_MAX_OUTPUT_BYTES + 1024 * 1024
 PI_MAX_PENDING_BYTES = 2 * PI_MAX_RECORD_BYTES
 
