@@ -5069,11 +5069,16 @@ def test_review_entry_at_cap_blocks_without_binding_head_or_invoking_reviewer(tm
 
 
 def test_review_stagnation_identical_resolutions_blocks(tmp_state_dir):
-    """Two consecutive rounds requesting the same resolution (ids differ) -> BLOCKED."""
+    """A FIX that moves the PR HEAD is not progress. Round 2 reviews the new
+    HEAD and asks for the same resolution again (new finding id, different case
+    and spacing) -> BLOCKED on the open PR, and no second FIX is launched."""
     gh = FakeGitHub()
     seen: list[str] = []
-    agent = _loop_agent(gh, lambda rnd: _one_finding_per_round(rnd, "Add a regression test"), seen)
+    texts = {1: "Add a regression test", 2: "  add   A REGRESSION test  "}
+    agent = _loop_agent(gh, lambda rnd: _one_finding_per_round(rnd, texts[rnd]), seen)
     eng = make_engine(tmp_state_dir, agent, github=gh)
+    # Below the replan soft threshold the verdict is the loop guard's to act on.
+    assert eng.config.review.replan.soft_threshold > 2
     outcomes = eng.run(max_steps=50)
     assert [o.next_phase for o in outcomes] == [
         "ANALYZE_EXECUTE",
@@ -5084,10 +5089,21 @@ def test_review_stagnation_identical_resolutions_blocks(tmp_state_dir):
     ]
     assert seen == ["ANALYZE_EXECUTE", "REVIEW", "FIX", "REVIEW"]
     s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.BLOCKED
     assert s.review_round == 2 and "identical resolutions" in s.block_reason
     assert "stagnation_identical_rounds=2" in s.block_reason
+    # The FIX really moved the PR, and each round is recorded at the HEAD it reviewed ...
+    assert gh.prs[PR].head_sha == _sha(1) and _sha(1) != SHA_A
+    assert [r["reviewed_head_sha"] for r in s.review_history] == [SHA_A, _sha(1)]
+    assert [r["result"] for r in s.review_history] == ["needs_fix", "needs_fix"]
+    # ... while the demand, once normalised, is the one round 1 already made.
     assert s.review_history[0]["fingerprint"] == s.review_history[1]["fingerprint"]
-    assert s.open_findings[0]["id"] == "R2-F1"
+    # The PR and the finding are kept for the human: nothing closed, merged or replaced.
+    assert [(f["id"], f["required_resolution"]) for f in s.open_findings] == [
+        ("R2-F1", "add   A REGRESSION test")
+    ]
+    assert gh.prs[PR].state == "OPEN" and gh.closed_prs == [] and gh.merges == []
+    assert s.replan_transaction == {}
 
 
 def test_review_stagnation_unchanged_count_blocks_a_ping_pong(tmp_state_dir):
@@ -5143,13 +5159,18 @@ def test_review_progress_is_not_stagnation(tmp_state_dir):
 
 
 def test_review_stale_round_is_recorded_and_breaks_the_stagnation_streak(tmp_state_dir):
+    """needs_fix(A) -> stale(A) -> needs_fix(A): no fixer ever saw the stale
+    round's demand, so it ends the streak instead of extending it and the
+    round after it goes to FIX."""
     gh = FakeGitHub()
     gh.add_comment(PR, 100, review_comment_body(2, SHA_A, True, ["R2-F1"]))
-    same = _one_finding_per_round(2, "same text")
+    gh.add_comment(PR, 101, review_comment_body(3, SHA_B, True, ["R3-F1"]))
 
     def on_call(req):
-        gh.set_head(SHA_B)  # someone pushed while the reviewer was working
-        return block(review_payload(2, SHA_A, same))
+        if gh.prs[PR].head_sha == SHA_A:
+            gh.set_head(SHA_B)  # someone pushed while the reviewer was working
+            return block(review_payload(2, SHA_A, _one_finding_per_round(2, "same text")))
+        return block(review_payload(3, SHA_B, _one_finding_per_round(3, "same text"), cid=101))
 
     eng = _in_review(tmp_state_dir, gh, on_call, round_done=1)
     eng.state.review_history = [
@@ -5161,6 +5182,13 @@ def test_review_stale_round_is_recorded_and_breaks_the_stagnation_streak(tmp_sta
     assert [r["result"] for r in s.review_history] == ["needs_fix", "stale"]
     assert s.review_history[1]["reviewed_head_sha"] == SHA_A and s.open_findings == []
 
+    # The same demand at the HEAD that replaced the reviewed one. Had the stale
+    # round counted, this would be the second identical needs-fix round in a row.
+    assert eng.step().next_phase == "FIX"
+    s = load_state(eng.paths.state_file)
+    assert [r["result"] for r in s.review_history] == ["needs_fix", "stale", "needs_fix"]
+    assert len({r["fingerprint"] for r in s.review_history}) == 1
+
 
 def test_failed_review_invocation_consumes_neither_round_nor_history(tmp_state_dir):
     gh = FakeGitHub()
@@ -5169,6 +5197,39 @@ def test_failed_review_invocation_consumes_neither_round_nor_history(tmp_state_d
         eng.step()
     s = load_state(eng.paths.state_file)
     assert s.review_round == 0 and s.review_history == [] and s.phase == Phase.REVIEW
+
+
+def test_review_refused_by_the_post_review_pr_read_consumes_neither_round_nor_history(
+    tmp_state_dir,
+):
+    """The round's comment verifies, but the PR was closed under the reviewer and
+    the controller's re-read refuses it. That failed verification is persisted,
+    so nothing of the round may be: once the PR is open again, round 1 is still
+    the round to complete, and it enters the history exactly once."""
+    gh = FakeGitHub()
+    payload = block(review_payload(1, SHA_A, [_finding(1)]))
+
+    def closed_under_the_reviewer(req):
+        gh.add_comment(PR, 100, review_comment_body(1, SHA_A, True, ["R1-F1"]))
+        gh.prs[PR].state = "CLOSED"
+        return payload
+
+    eng = _in_review(tmp_state_dir, gh, closed_under_the_reviewer)
+    with pytest.raises(VerificationError, match="is CLOSED"):
+        eng.step()
+    s = load_state(eng.paths.state_file)
+    assert s.review_round == 0 and s.review_history == [] and s.phase == Phase.REVIEW
+    assert s.reviewed_head_sha == "" and s.last_review_comment_url == ""
+    assert s.last_review_needs_fix is None and s.open_findings == []
+    assert len(s.verification_failures) == 1  # the attempt itself stays on record
+    eng.close()
+
+    gh.prs[PR].state = "OPEN"  # a human reopened it
+    resumed = make_engine(tmp_state_dir, [payload], github=gh)
+    resumed.load()
+    assert resumed.step().next_phase == "FIX"
+    s = load_state(resumed.paths.state_file)
+    assert s.review_round == 1 and [r["round"] for r in s.review_history] == [1]
 
 
 def test_new_pr_resets_review_history(tmp_state_dir, fake_github):
@@ -5180,10 +5241,13 @@ def test_new_pr_resets_review_history(tmp_state_dir, fake_github):
     eng.state.phase = Phase.ANALYZE_EXECUTE
     eng.state.review_history = [review_record(1, SHA_B, RESULT_NEEDS_FIX, [_finding(1)])]
     eng.state.review_round = 1
+    eng.state.open_findings = [_finding(1)]
     eng.state.prior_findings = [_finding(1)]
+    eng.state.last_review_result = "needs_fix"
     assert eng.step().next_phase == "REVIEW"
     assert eng.state.review_history == [] and eng.state.review_round == 0
-    assert eng.state.prior_findings == []
+    assert eng.state.open_findings == [] and eng.state.prior_findings == []
+    assert eng.state.last_review_result == ""
 
 
 def test_step_budget_is_cumulative_and_survives_resume(tmp_state_dir):
