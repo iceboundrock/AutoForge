@@ -122,8 +122,9 @@ def test_all_checks_pass(tmp_path):
         "git available",
         "gh available",
         "gh authenticated",
-        "claude available",
-        "opencode available",
+        "agent 'claude' available (analyze_execute, fix)",
+        "agent 'opencode' available (review_round_1, review_round_2_5, review_round_6_plus, "
+        "replan_reexecute, update_epic)",
         "cwd is a git repository",
         "GitHub remote",
         "default branch requires checks",
@@ -140,7 +141,11 @@ def test_failures_are_reported_not_raised(tmp_path):
     d = Doctor(cwd=str(tmp_path), runner=_runner_factory(fail=("gh auth", "opencode")))
     results = {r.name: r for r in d.run_all()}
     assert not results["gh authenticated"].ok
-    assert not results["opencode available"].ok
+    opencode = (
+        "agent 'opencode' available (review_round_1, review_round_2_5, review_round_6_plus, "
+        "replan_reexecute, update_epic)"
+    )
+    assert not results[opencode].ok
     assert results["git available"].ok
 
 
@@ -604,3 +609,303 @@ def test_state_dir_on_a_filesystem_without_hard_links_names_the_requirement(tmp_
         result.detail
     )
     assert list((tmp_path / ".autoforge").iterdir()) == []
+
+
+# -- agent rows derived from the reachable profiles; Pi checks (#129) ---------------
+PI_LABEL = "agent 'pi' available (review_round_2_5)"
+PI_AUTH = "agent 'pi' auth ready (review_round_2_5)"
+OAUTH_READY = '{"status":"ready","provider":"openai","authType":"oauth"}'
+# A planted "secret" Pi might print on stderr; no row may ever quote it.
+PLANTED = "sk-planted-SECRET-0123456789abcdef"
+
+
+def _write_config(tmp_path, profiles, extra=None):
+    data = {"version": 1, "profiles": profiles}
+    data.update(extra or {})
+    path = tmp_path / "c.json"
+    path.write_text(json.dumps(data))
+    return str(path)
+
+
+def _pi_profile(**kwargs):
+    profile = {"provider": "pi", "model": "openai/gpt-5.6-terra", "effort": "high"}
+    profile.update(kwargs)
+    return profile
+
+
+def _pi_runner(version="1.0.0", auth=(0, OAUTH_READY), requests=None, version_code=0):
+    """The healthy fake, plus a scripted `pi`; ``requests`` records every Pi probe."""
+    base = _runner_factory()
+
+    def runner(req):
+        argv = req.command
+        if argv[0] != "pi":
+            return base(req)
+        if requests is not None:
+            requests.append(req)
+        if argv[1:] == ["--version"]:
+            if version is None:
+                raise FileNotFoundError("pi")
+            return ExecutionResult(argv, req.cwd, version_code, version + "\n", PLANTED, "t", "t")
+        code, stdout = auth
+        return ExecutionResult(argv, req.cwd, code, stdout, PLANTED, "t", "t")
+
+    return runner
+
+
+def _pi_doctor(tmp_path, profile=None, **kwargs):
+    config = _write_config(tmp_path, {"review_round_2_5": profile or _pi_profile()})
+    d = Doctor(config_path=config, cwd=str(tmp_path), runner=_pi_runner(**kwargs))
+    results = d.run_all()
+    for r in results:
+        assert PLANTED not in r.name and PLANTED not in r.detail, r
+    return {r.name: r for r in results}
+
+
+def test_remote_rows_name_only_the_reachable_clis(tmp_path):
+    """A REMOTE run routed entirely through OpenCode never needs `claude`."""
+    oc = {"provider": "opencode", "model": "openai/gpt-5.6-luna"}
+    config = _write_config(tmp_path, {"analyze_execute": oc, "fix": oc})
+    calls = []
+    d = Doctor(config_path=config, cwd=str(tmp_path), runner=_runner_factory(calls=calls))
+    names = [r.name for r in d.run_all()]
+    assert not any("claude" in n for n in names), names
+    assert not any(argv[0] == "claude" for argv in calls), calls
+    assert any(n.startswith("agent 'opencode' available (analyze_execute, fix,") for n in names)
+
+
+def test_remote_rows_include_update_epic(tmp_path):
+    config = _write_config(tmp_path, {"update_epic": {"command": "epic-oc"}})
+    d = Doctor(config_path=config, cwd=str(tmp_path), runner=_runner_factory())
+    results = {r.name: r for r in d.run_all()}
+    assert results["agent 'epic-oc' available (update_epic)"].ok
+
+
+def test_an_all_scripted_config_requires_no_agent_cli(tmp_path):
+    from autoforge.profiles import REQUIRED_PROFILES
+
+    scripted = {"provider": "scripted", "command": "/bin/true"}
+    profiles = {name: scripted for name in REQUIRED_PROFILES + ["update_epic"]}
+    calls = []
+    d = Doctor(
+        config_path=_write_config(tmp_path, profiles),
+        cwd=str(tmp_path),
+        runner=_runner_factory(calls=calls),
+    )
+    results = {r.name: r for r in d.run_all()}
+    row = results["agent CLI available"]
+    assert row.ok and not row.required
+    assert not any(argv[0] in ("claude", "opencode", "/bin/true") for argv in calls), calls
+
+
+def test_no_agent_rows_when_the_config_fails(tmp_path):
+    config = _write_config(tmp_path, {"fix": {"effort": "ultra"}})
+    d = Doctor(config_path=config, cwd=str(tmp_path), runner=_runner_factory())
+    names = [r.name for r in d.run_all()]
+    assert not any(n.startswith("agent ") for n in names), names
+
+
+def test_a_healthy_pi_profile_passes_and_bounds_its_claim(tmp_path):
+    results = _pi_doctor(tmp_path)
+    assert results[PI_LABEL].ok and results[PI_LABEL].detail == "pi 1.0.0"
+    auth = results[PI_AUTH]
+    assert auth.ok and auth.required
+    assert auth.detail.startswith("openai/gpt-5.6-terra: ")
+    # `ready` proves a credential exists for the provider, not that the model is usable.
+    assert "provider 'openai' only" in auth.detail
+    assert "cannot be checked" in auth.detail
+    assert all(r.ok for r in results.values()), [r for r in results.values() if not r.ok]
+
+
+@pytest.mark.parametrize("version", ["1.0.0", "1.0.1", "1.12.0", "2.0.0", "10.0.0"])
+def test_pi_at_or_above_the_minimum_passes(tmp_path, version):
+    assert _pi_doctor(tmp_path, version=version)[PI_LABEL].ok
+
+
+@pytest.mark.parametrize("version", ["0.99.0", "0.9.9", "1.0.0-rc.1", "1.0.0-alpha"])
+def test_pi_below_the_minimum_fails_and_names_it(tmp_path, version):
+    row = _pi_doctor(tmp_path, version=version)[PI_LABEL]
+    assert not row.ok and ">= 1.0.0" in row.detail
+
+
+@pytest.mark.parametrize("version", ["", "pi 1.0.0", "1.0", "unknown"])
+def test_an_unreadable_pi_version_fails_rather_than_passes(tmp_path, version):
+    row = _pi_doctor(tmp_path, version=version)[PI_LABEL]
+    assert not row.ok and "cannot read the pi version" in row.detail
+
+
+def test_a_failing_pi_version_does_not_quote_its_output(tmp_path):
+    results = _pi_doctor(tmp_path, version_code=3)
+    assert not results[PI_LABEL].ok and "exited 3" in results[PI_LABEL].detail
+    assert results[PI_AUTH].skipped and not results[PI_AUTH].required
+
+
+def test_a_missing_pi_fails_and_skips_the_auth_probe(tmp_path):
+    requests = []
+    results = _pi_doctor(tmp_path, version=None, requests=requests)
+    assert not results[PI_LABEL].ok and "FileNotFoundError" in results[PI_LABEL].detail
+    assert results[PI_AUTH].skipped
+    assert [r.command[1:] for r in requests] == [["--version"]]
+
+
+def test_the_auth_probe_is_read_only(tmp_path):
+    requests = []
+    _pi_doctor(tmp_path, requests=requests)
+    argv = requests[-1].command
+    assert argv == [
+        "pi",
+        "auth",
+        "check",
+        "--model",
+        "openai/gpt-5.6-terra",
+        "--json",
+        "--no-refresh",
+    ]
+    for req in requests:
+        assert "--credentials" not in req.command
+        assert not any(a.startswith("print-") for a in req.command)
+        assert "login" not in req.command
+
+
+def test_the_auth_probe_runs_under_the_launch_allowlist(tmp_path, monkeypatch):
+    """An `OPENAI_API_KEY` only the operator's shell holds must not make Pi report ready."""
+    from autoforge.executor import select_environment
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-shell-only")
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", "/tmp/pi-agent")
+    requests = []
+    _pi_doctor(tmp_path, requests=requests)
+    for req in requests:
+        env = select_environment(req.env_allowlist)
+        assert "OPENAI_API_KEY" not in env
+        assert env.get("PI_CODING_AGENT_DIR") == "/tmp/pi-agent"
+
+    # ... unless the operator deliberately forwards it.
+    requests.clear()
+    config = _write_config(
+        tmp_path,
+        {"review_round_2_5": _pi_profile()},
+        {"execution": {"env_allowlist_extra": ["OPENAI_API_KEY"]}},
+    )
+    Doctor(config_path=config, cwd=str(tmp_path), runner=_pi_runner(requests=requests)).run_all()
+    assert requests
+    for req in requests:
+        assert select_environment(req.env_allowlist)["OPENAI_API_KEY"] == "sk-shell-only"
+
+
+@pytest.mark.parametrize(
+    "auth, needle",
+    [
+        (
+            (1, '{"status":"not_ready","provider":"openai","reason":"credentials_not_configured"}'),
+            "/login openai",
+        ),
+        (
+            (1, '{"status":"not_ready","provider":"openai","reason":"provider_not_found"}'),
+            "provider_not_found",
+        ),
+        (
+            (1, '{"status":"not_ready","provider":"openai","reason":"credential_not_available"}'),
+            "credential_not_available",
+        ),
+        ((2, '{"status":"invalid","provider":"openai","reason":"invalid_state"}'), "invalid"),
+        ((2, '{"status":"invalid","provider":"openai/gpt-5.6-terra"}'), "invalid"),
+    ],
+)
+def test_a_pi_that_is_not_ready_fails_with_a_remedy(tmp_path, auth, needle):
+    row = _pi_doctor(tmp_path, auth=auth)[PI_AUTH]
+    assert not row.ok and row.required
+    assert needle in row.detail, row.detail
+
+
+def test_the_login_remedy_names_the_configured_provider(tmp_path):
+    profile = _pi_profile(model="openai-codex/gpt-5.6")
+    auth = (
+        1,
+        '{"status":"not_ready","provider":"openai-codex","reason":"credentials_not_configured"}',
+    )
+    row = _pi_doctor(tmp_path, profile=profile, auth=auth)[PI_AUTH]
+    assert not row.ok and "/login openai-codex" in row.detail
+    assert "never logs in for you" in row.detail
+
+
+@pytest.mark.parametrize(
+    "auth",
+    [
+        (0, ""),
+        (2, ""),  # an AuthCommandError: stderr only
+        (0, "not json"),
+        (0, OAUTH_READY + "\n" + OAUTH_READY),
+        (1, OAUTH_READY),  # exit code disagrees with the status
+        (
+            0,
+            '{"status":"ready","provider":"openai","authType":"oauth","credentials":"'
+            + PLANTED
+            + '"}',
+        ),
+        (0, '{"status":"ready","provider":"openai","authType":"oauth","' + PLANTED + '":1}'),
+        (0, '{"status":"ready","provider":"' + PLANTED + ' x","authType":"oauth"}'),
+    ],
+)
+def test_unreadable_pi_auth_output_is_a_failure_not_a_crash(tmp_path, auth):
+    row = _pi_doctor(tmp_path, auth=auth)[PI_AUTH]
+    assert not row.ok and row.required
+    assert "without a result AutoForge can read" in row.detail, row.detail
+
+
+def test_a_provider_mismatch_fails(tmp_path):
+    auth = (0, '{"status":"ready","provider":"anthropic","authType":"oauth"}')
+    row = _pi_doctor(tmp_path, auth=auth)[PI_AUTH]
+    assert not row.ok and "anthropic" in row.detail and "openai" in row.detail
+
+
+@pytest.mark.parametrize(
+    "require_oauth, auth_type, ok",
+    [
+        ("true", "oauth", True),
+        ("true", "api_key", False),
+        ("false", "oauth", True),
+        ("false", "api_key", True),
+        (None, "api_key", False),  # require_oauth defaults to true
+    ],
+)
+def test_require_oauth_decides_whether_an_api_key_is_acceptable(
+    tmp_path, require_oauth, auth_type, ok
+):
+    options = {} if require_oauth is None else {"require_oauth": require_oauth}
+    auth = (0, f'{{"status":"ready","provider":"openai","authType":"{auth_type}"}}')
+    row = _pi_doctor(tmp_path, profile=_pi_profile(options=options), auth=auth)[PI_AUTH]
+    assert row.ok is ok, row.detail
+    if not ok:
+        assert "require_oauth: false" in row.detail
+
+
+def test_pi_profiles_sharing_a_model_share_one_probe(tmp_path):
+    pi = _pi_profile()
+    config = _write_config(tmp_path, {"review_round_2_5": pi, "review_round_6_plus": pi})
+    requests = []
+    d = Doctor(config_path=config, cwd=str(tmp_path), runner=_pi_runner(requests=requests))
+    results = {r.name: r for r in d.run_all()}
+    assert results["agent 'pi' auth ready (review_round_2_5, review_round_6_plus)"].ok
+    assert [r.command[1] for r in requests] == ["--version", "auth"]
+
+
+def test_local_doctor_checks_a_pi_reviewer(tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    config = _write_config(
+        tmp_path,
+        {"review_round_1": _pi_profile()},
+        {"local": {"max_fix_rounds": 0}},
+    )
+    base = _pi_runner()
+
+    def runner(req):
+        if req.command[:2] == ["git", "rev-parse"]:
+            return ExecutionResult(req.command, req.cwd, 0, str(root) + "\n", "", "t", "t")
+        return base(req)
+
+    d = Doctor(config_path=config, cwd=str(root), state_dir=str(tmp_path / "state"), runner=runner)
+    results = {r.name: r for r in d.run_local()}
+    assert results["agent 'pi' available (review_round_1)"].ok
+    assert results["agent 'pi' auth ready (review_round_1)"].ok

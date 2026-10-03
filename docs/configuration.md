@@ -85,8 +85,13 @@ several of these keys are loop bounds or merge behaviour, where "ignored"
 means a looser bound than the operator wrote while `autoforge doctor` calls
 the file valid.
 
-- Provider-specific `options` under a profile are the one free mapping; the
-  adapter in `providers.py` validates what it reads there.
+- Provider-specific `options` under a profile are checked by the profile's
+  provider adapter in `providers.py`, against the keys that adapter reads:
+  `claude` accepts `permission_mode`, `output_format`, `session_persistence`;
+  `opencode` accepts `output_format`, `auto_approve`; `pi` accepts
+  `require_oauth`. Any other key is an error naming the profile and the
+  accepted keys, so an option meant for another provider is refused rather
+  than silently ignored.
 - The same contract covers what a parser would otherwise settle before the
   controller looks: a key written twice in one mapping is a parse error on
   every format (PyYAML and `json.loads` would keep the last copy and drop the
@@ -144,6 +149,47 @@ each. The built-in defaults are:
 | `review_round_6_plus` | `REVIEW`, round 6 up to `workflow.max_review_rounds` (default 20) | OpenCode | `openai/gpt-5.6-sol` | medium |
 | `replan_reexecute` | `REPLAN_REEXECUTE` | OpenCode | `openai/gpt-5.6-terra` | high |
 | `update_epic` | `UPDATE_EPIC` | OpenCode | `openai/gpt-5.6-sol` | high |
+
+### Overriding a profile
+
+A profile in your file is merged over the built-in default of the same name,
+field by field, as long as it keeps the default's provider. If it names a
+*different* `provider`, it is a different CLI, so it is built from your
+mapping alone: `command` falls back to that provider's binary (`claude`,
+`opencode`, `pi`), `effort` to `high`, `timeout_seconds` to
+`execution.default_timeout_seconds`, and nothing is inherited from the
+default's `options` or `extra_args` (an OpenCode `auto_approve` on a Claude
+profile, or a Claude flag in a Pi argv, would be wrong). Before #129 a
+provider switch kept the default's `command`, `options` and `extra_args`;
+restate any of them you relied on.
+
+### Pi profiles
+
+`provider: pi` runs [Pi](adr/0003-pi-agent-provider.md) (`pi` 1.0.0 or
+newer). The profile's fields map as follows:
+
+- `model` is `<pi-provider>/<model-id>`, for example
+  `openai/gpt-5.6-terra` or `openai-codex/gpt-5.6`: exactly one `/`, a
+  lowercase provider name, and no `:<thinking>` suffix (the thinking level
+  comes from `effort`).
+- `effort` is required and is one of `off`, `minimal`, `low`, `medium`,
+  `high`, `xhigh`, `max` (`pi --thinking`).
+- `extra_args` must be empty: AutoForge owns the whole Pi argv
+  (`pi --mode rpc --no-session --model M --thinking E`), and the prompt
+  travels on stdin, never in argv.
+- `options.require_oauth` (`true` by default) makes `doctor` fail when Pi
+  would authenticate with an API key instead of the ChatGPT sign-in.
+
+`autoforge doctor` checks the Pi version and runs
+`pi auth check --model M --json --no-refresh` under the same environment
+allow-list an agent launch gets. Pi's own `OPENAI_API_KEY` therefore counts
+only if `execution.env_allowlist_extra` forwards it. "Ready" means Pi holds a
+credential for the model's provider. It does not prove that this model is
+available to that credential; the first real run does. To sign in, run `pi`
+and `/login openai` yourself; AutoForge never starts a login. Running a Pi
+phase lands with #131; until then a real run refuses a Pi profile, while
+`doctor` and dry runs accept it. The example file carries a commented Pi
+block for `review_round_2_5`.
 
 ## Local mode configuration
 

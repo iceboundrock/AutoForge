@@ -35,7 +35,25 @@ OpenCode (``opencode 1.18.x``)::
     ``--auto`` is opt-in via ``options.auto_approve: true``.
   * exit code 0 on success; 1 on unknown model / server error.
 
-Both CLIs are launched with cwd = the directory the engine chose (a
+Pi (``pi 1.0.x``, ADR 0003; read from the v1.0.0 source and docs, not yet
+run against an installed Pi)::
+
+    pi --mode rpc --no-session --model <pi-provider>/<model-id> --thinking <effort>
+
+  * the prompt never travels in argv: it is one JSON ``prompt`` record on
+    stdin. Running that RPC conversation is #131; until it lands
+    :meth:`PiProvider.execute` refuses with a typed error, and a dry run
+    renders the argv above.
+  * ``--thinking`` takes ``off|minimal|low|medium|high|xhigh|max``; the model
+    is ``provider/id`` with no ``:<thinking>`` suffix (ADR 0003 §2.2, §2.3).
+  * no ``extra_args``: every flag that matters is the adapter's or #132's
+    policy's, and a pass-through could undo it (``--approve``,
+    ``--api-key``, ``--session-id``, ``--system-prompt``, ``--mode``, ...).
+  * ``pi --version`` prints the bare version; ``pi auth check --model <m>
+    --json --no-refresh`` reports, read-only, whether Pi holds a credential
+    for the model's provider (``autoforge doctor``).
+
+The CLIs are launched with cwd = the directory the engine chose (a
 per-issue worktree for a REMOTE run, the contract's repository root for a
 LOCAL one), stdin = /dev/null, a hard timeout, and an allow-listed
 environment (see executor.py): the engine passes the configured allow-list
@@ -46,11 +64,13 @@ one provider is never handed to another.
 
 from __future__ import annotations
 
+import json
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 
 from .config import ProfileConfig
-from .errors import ConfigurationError
+from .errors import ConfigurationError, ExecutionError
 from .executor import ExecutionRequest, ExecutionResult, describe_leftovers, execute
 
 Runner = Callable[[ExecutionRequest], ExecutionResult]
@@ -160,6 +180,11 @@ class AgentProvider:
     # authentication and configuration, added to the request's allow-list.
     # Names, never values: the executor selects them from the environment.
     environment_names: tuple[str, ...] = ()
+    # The profile ``options`` keys this adapter reads. Any other key is a
+    # configuration error naming the profile and this set, so a misspelled
+    # knob cannot be a silent no-op. ``None`` leaves the keys unchecked; only
+    # the scripted test provider, which launches no real CLI, uses it.
+    option_keys: tuple[str, ...] | None = None
 
     def __init__(self, runner: Runner | None = None) -> None:
         self._runner: Runner = runner or execute
@@ -169,17 +194,32 @@ class AgentProvider:
         raise NotImplementedError
 
     def validate_profile(self, profile: ProfileConfig) -> None:
-        """Raise ConfigurationError for values this CLI cannot accept."""
+        """Raise ConfigurationError for values this CLI cannot accept.
+
+        An override calls this first: it checks the ``options`` keys.
+        """
+        if self.option_keys is None:
+            return
+        unknown = sorted(set(profile.options) - set(self.option_keys))
+        if unknown:
+            raise ConfigurationError(
+                f"profile {profile.name!r}: unknown {self.name} option(s) "
+                f"{', '.join(unknown)} (accepted: {', '.join(self.option_keys) or 'none'})"
+            )
 
     # -- shared behaviour -------------------------------------------------
     def build_command(self, req: AgentRequest) -> list[str]:
         return self.build_command_for(req.profile, req.prompt)
 
+    def launch_allowlist(self, base: tuple[str, ...]) -> tuple[str, ...]:
+        """``base`` (the configured allow-list) plus this provider's own names."""
+        return tuple(dict.fromkeys([*base, *self.environment_names]))
+
     def environment_allowlist(self, req: AgentRequest) -> tuple[str, ...] | None:
         """The allow-list the CLI is launched with: the request's plus this provider's."""
         if req.env_allowlist is None:
             return None
-        return tuple(dict.fromkeys([*req.env_allowlist, *self.environment_names]))
+        return self.launch_allowlist(req.env_allowlist)
 
     def execute(self, req: AgentRequest) -> AgentExecutionResult:
         command = self.build_command(req)
@@ -204,8 +244,10 @@ class ClaudeCodeProvider(AgentProvider):
     # model overrides the CLI reads; ``CLAUDE_CONFIG_DIR`` and the
     # ``CLAUDE_CODE_*`` feature switches.
     environment_names = ("ANTHROPIC_*", "CLAUDE_*")
+    option_keys = ("permission_mode", "output_format", "session_persistence")
 
     def validate_profile(self, profile: ProfileConfig) -> None:
+        super().validate_profile(profile)
         if profile.effort and profile.effort not in CLAUDE_EFFORTS:
             raise ConfigurationError(
                 f"profile {profile.name!r}: claude --effort must be one of {CLAUDE_EFFORTS}, "
@@ -249,8 +291,10 @@ class OpenCodeProvider(AgentProvider):
     # routes to; a provider not listed here is added through
     # ``execution.env_allowlist_extra``.
     environment_names = ("OPENCODE_*", "OPENAI_*", "ANTHROPIC_*", "GEMINI_*", "GOOGLE_*")
+    option_keys = ("output_format", "auto_approve")
 
     def validate_profile(self, profile: ProfileConfig) -> None:
+        super().validate_profile(profile)
         if "/" not in profile.model:
             raise ConfigurationError(
                 f"profile {profile.name!r}: opencode model must be 'provider/model' "
@@ -277,6 +321,285 @@ class OpenCodeProvider(AgentProvider):
         # even when it begins with `-`.
         argv += ["--", prompt]
         return argv
+
+
+PI_EFFORTS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
+# ADR 0003 §2.8: the release its RPC, model and auth facts were read from.
+# No upper bound.
+PI_MIN_VERSION = (1, 0, 0)
+PI_MODEL_PROVIDER_RE = re.compile(r"[a-z0-9-]+")
+# What `pi --version` prints: the bare version, optionally a pre-release.
+_PI_VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?")
+
+
+def parse_pi_version(text: str) -> tuple[int, int, int] | None:
+    """``(major, minor, patch)`` from ``pi --version`` output, or None when unreadable.
+
+    A pre-release sorts below its release: ``1.0.0-rc.1`` reads as
+    ``(1, 0, -1)``, which is below the 1.0.0 minimum, and ``1.1.0-rc.1`` as
+    ``(1, 1, -1)``, which is above it.
+    """
+    lines = text.strip().splitlines()
+    match = _PI_VERSION_RE.fullmatch(lines[0].strip()) if len(lines) == 1 else None
+    if match is None:
+        return None
+    major, minor, patch = (int(part) for part in match.group(1, 2, 3))
+    if match.group(4):
+        patch -= 1
+    return major, minor, patch
+
+
+PI_AUTH_STATUSES = ("ready", "not_ready", "invalid")
+PI_AUTH_REASONS = (
+    "provider_not_found",
+    "credentials_not_configured",
+    "credential_not_available",
+    "invalid_state",
+)
+PI_AUTH_TYPES = ("api_key", "oauth")
+# `pi auth check` exits 0 for ready, 1 for not_ready, 2 for invalid.
+_PI_AUTH_EXIT_CODES = {"ready": 0, "not_ready": 1, "invalid": 2}
+# The `provider` field is quoted back to the operator: a bounded run of
+# printable ASCII (a provider id, or the model string on `invalid`).
+_PI_AUTH_PROVIDER_RE = re.compile(r"[\x21-\x7e]{1,200}")
+
+
+@dataclass(frozen=True)
+class PiAuthCheck:
+    """The parsed ``pi auth check --json`` result: these four fields, nothing else."""
+
+    status: str
+    provider: str
+    reason: str = ""
+    auth_type: str = ""
+
+
+def parse_pi_auth_check(stdout: str, exit_code: int) -> PiAuthCheck:
+    """Parse ``pi auth check --json`` strictly, or raise :class:`ValueError`.
+
+    The output is one JSON object ``{status, provider, reason?, authType?}``
+    and the exit code agrees with ``status``. Anything else is contract
+    drift and fails closed. The error text never quotes the output: with
+    the wrong flags it could hold a credential (``--credentials`` adds one).
+    """
+    lines = stdout.strip().splitlines()
+    if len(lines) != 1:
+        raise ValueError(f"expected one JSON line on stdout, got {len(lines)} line(s)")
+    try:
+        data = json.loads(lines[0])
+    except json.JSONDecodeError:
+        raise ValueError("stdout is not JSON") from None
+    if not isinstance(data, dict):
+        raise ValueError("stdout is not a JSON object")
+    unknown = sorted(set(data) - {"status", "provider", "reason", "authType"})
+    if unknown:
+        # Counted, not named: a key is Pi output too, and may carry a secret.
+        raise ValueError(f"{len(unknown)} unexpected field(s)")
+    status = data.get("status")
+    provider = data.get("provider")
+    reason = data.get("reason", "")
+    auth_type = data.get("authType", "")
+    if status not in PI_AUTH_STATUSES:
+        raise ValueError("unknown or missing 'status'")
+    if not isinstance(provider, str) or not _PI_AUTH_PROVIDER_RE.fullmatch(provider):
+        raise ValueError("missing or unreadable 'provider'")
+    if status == "ready":
+        if reason != "" or auth_type not in PI_AUTH_TYPES:
+            raise ValueError("'ready' without a known 'authType', or with a 'reason'")
+    elif auth_type != "" or reason not in PI_AUTH_REASONS:
+        raise ValueError(f"{status!r} without a known 'reason', or with an 'authType'")
+    if exit_code != _PI_AUTH_EXIT_CODES[status]:
+        raise ValueError(f"exit code {exit_code} does not match status {status!r}")
+    return PiAuthCheck(status=status, provider=provider, reason=reason, auth_type=auth_type)
+
+
+class PiProvider(AgentProvider):
+    """Pi (``@earendil-works/pi-coding-agent``) over its stdio RPC mode (ADR 0003).
+
+    This class carries Pi's static surface: profile validation, the argv,
+    the environment names and the read-only ``doctor`` probes. Running the
+    RPC conversation is #131; until then :meth:`execute` refuses.
+    """
+
+    name = "pi"
+    # Pi's own process settings (docs/environment-variables.md at v1.0.0):
+    # where its config and credential store live, a Nix-style package
+    # directory, and the network, version-check, telemetry and prompt-cache
+    # switches. Explicit names, never a prefix: Pi exports `PI_SESSION_*`,
+    # `PI_PROVIDER`, `PI_MODEL` to its tool children, and a provider API key
+    # (`OPENAI_API_KEY`, ...) reaches Pi only through
+    # `execution.env_allowlist_extra`, never by default.
+    environment_names = (
+        "PI_CODING_AGENT_DIR",
+        "PI_PACKAGE_DIR",
+        "PI_OFFLINE",
+        "PI_SKIP_VERSION_CHECK",
+        "PI_TELEMETRY",
+        "PI_CACHE_RETENTION",
+    )
+    option_keys = ("require_oauth",)
+
+    def validate_profile(self, profile: ProfileConfig) -> None:
+        super().validate_profile(profile)
+        where = f"profile {profile.name!r}"
+        if profile.effort not in PI_EFFORTS:
+            raise ConfigurationError(
+                f"{where}: pi effort (--thinking) is required and must be one of "
+                f"{', '.join(PI_EFFORTS)}, got {profile.effort!r}"
+            )
+        problem = _pi_model_problem(profile.model)
+        if problem:
+            raise ConfigurationError(
+                f"{where}: pi model must be '<pi-provider>/<model-id>' "
+                f"(e.g. openai/gpt-5.6-terra): {problem}, got {profile.model!r}"
+            )
+        if profile.extra_args:
+            raise ConfigurationError(
+                f"{where}: pi takes no extra_args (got {profile.extra_args!r}); every Pi "
+                "flag that matters is set by the adapter, and a pass-through could re-enable "
+                "project trust, put an API key in argv, load code or prompts, or keep a session"
+            )
+        if profile.options.get("require_oauth", "true") not in ("true", "false"):
+            raise ConfigurationError(
+                f"{where}: pi option require_oauth must be true or false, "
+                f"got {profile.options['require_oauth']!r}"
+            )
+
+    def build_command_for(self, profile: ProfileConfig, prompt: str) -> list[str]:
+        # The prompt is deliberately absent: it reaches Pi as a JSON `prompt`
+        # record on stdin (ADR 0003 §2.7), never in argv.
+        return [
+            self.command(profile),
+            "--mode",
+            "rpc",
+            "--no-session",
+            "--model",
+            profile.model,
+            "--thinking",
+            profile.effort,
+        ]
+
+    def execute(self, req: AgentRequest) -> AgentExecutionResult:
+        raise ExecutionError(
+            f"profile {req.profile.name!r}: pi execution is not implemented yet "
+            "(the RPC adapter is #131); route this phase to another provider"
+        )
+
+    # -- read-only probes for `autoforge doctor` ---------------------------
+    @staticmethod
+    def command(profile: ProfileConfig) -> str:
+        return profile.command or "pi"
+
+    @staticmethod
+    def require_oauth(profile: ProfileConfig) -> bool:
+        return profile.options.get("require_oauth", "true") != "false"
+
+    @staticmethod
+    def model_provider(profile: ProfileConfig) -> str:
+        return profile.model.split("/", 1)[0]
+
+    def version_command(self, profile: ProfileConfig) -> list[str]:
+        return [self.command(profile), "--version"]
+
+    def auth_check_command(self, profile: ProfileConfig) -> list[str]:
+        """Whether Pi holds a credential for the model's provider, read-only.
+
+        ``--no-refresh`` makes Pi open its credential store read-only (no
+        OAuth refresh is written), and ``--credentials``, which would print
+        the credential, is never passed.
+        """
+        return [
+            self.command(profile),
+            "auth",
+            "check",
+            "--model",
+            profile.model,
+            "--json",
+            "--no-refresh",
+        ]
+
+    def auth_verdict(self, profile: ProfileConfig, exit_code: int, stdout: str) -> tuple[bool, str]:
+        """``(ok, detail)`` for the result of :meth:`auth_check_command`.
+
+        The detail quotes only the four fields of the result, never stdout
+        or stderr. ``ready`` shows that Pi holds a credential for the
+        provider, not that the model exists or that the credential may use
+        it: Pi builds a placeholder for an id outside its catalog and still
+        reports ``ready`` (ADR 0003 §4 item 2).
+        """
+        command = " ".join(self.auth_check_command(profile))
+        try:
+            check = parse_pi_auth_check(stdout, exit_code)
+        except ValueError as exc:
+            return False, (
+                f"`pi auth check` exited {exit_code} without a result AutoForge can read "
+                f"({exc}); Pi's output is not shown, run `{command}` yourself to see it"
+            )
+        configured = self.model_provider(profile)
+        fields = f"status {check.status}, provider {check.provider!r}"
+        if check.reason:
+            fields += f", reason {check.reason}"
+        if check.auth_type:
+            fields += f", authType {check.auth_type}"
+        # An `invalid` result names what was asked for (the model, when Pi
+        # failed before resolving it), so only the others name a provider.
+        if check.status != "invalid" and check.provider != configured:
+            return False, (
+                f"{fields}: Pi resolved model {profile.model!r} to provider "
+                f"{check.provider!r}, not the configured {configured!r}"
+            )
+        if check.status == "ready":
+            if check.auth_type == "api_key" and self.require_oauth(profile):
+                return False, (
+                    f"{fields}: this profile requires Pi's ChatGPT sign-in; Pi resolved an "
+                    "API key (set options.require_oauth: false to run on an API key)"
+                )
+            return True, (
+                f"{fields}: authenticated for provider {configured!r} only; whether this "
+                f"credential may use {profile.model!r} cannot be checked read-only (doctor "
+                "neither refreshes nor uses it), the first real run is the proof"
+            )
+        if check.reason == "credentials_not_configured":
+            if configured in ("openai", "openai-codex"):
+                remedy = (
+                    f"run `pi`, then `/login {configured}` (an operator step; AutoForge "
+                    "never logs in for you)"
+                )
+            else:
+                remedy = (
+                    f"give Pi a credential for {configured!r}; an API key reaches Pi only "
+                    "through execution.env_allowlist_extra"
+                )
+            return False, f"{fields}: Pi has no credential for {configured!r}; {remedy}"
+        if check.reason == "provider_not_found":
+            return False, (
+                f"{fields}: Pi does not know the provider {configured!r} named by "
+                f"model {profile.model!r}"
+            )
+        if check.reason == "credential_not_available":
+            return False, f"{fields}: Pi could not produce a usable credential for {configured!r}"
+        return False, (
+            f"{fields}: Pi's model or credential configuration is invalid; run `{command}` "
+            "yourself to see why"
+        )
+
+
+def _pi_model_problem(model: str) -> str:
+    """Why ``model`` is not a valid Pi ``provider/id`` (ADR 0003 §2.2), or ''."""
+    if not model:
+        return "it is empty"
+    if any(ch.isspace() for ch in model):
+        return "it contains whitespace"
+    if model.count("/") != 1:
+        return "it must contain exactly one '/'"
+    provider, model_id = model.split("/")
+    if not PI_MODEL_PROVIDER_RE.fullmatch(provider):
+        return "the provider part must be non-empty and use only a-z, 0-9 and '-'"
+    if not model_id:
+        return "the model id is empty"
+    if ":" in model and model.rsplit(":", 1)[1] in PI_EFFORTS:
+        return "a ':<thinking>' suffix is not allowed; set the level with 'effort'"
+    return ""
 
 
 ScriptHandler = Callable[[AgentRequest], str]
@@ -332,6 +655,7 @@ class ScriptedProvider(AgentProvider):
 _REGISTRY: dict[str, type[AgentProvider]] = {
     "claude": ClaudeCodeProvider,
     "opencode": OpenCodeProvider,
+    "pi": PiProvider,
     "scripted": ScriptedProvider,
 }
 

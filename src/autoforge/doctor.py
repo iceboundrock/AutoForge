@@ -1,8 +1,15 @@
 """`autoforge doctor`: read-only environment checks.
 
 Every check is non-destructive: version queries, `gh auth status`,
-`git rev-parse`, reading the config, and creating/removing one temp file in
-the state directory to prove it is writable.
+`git rev-parse`, `pi auth check --no-refresh`, reading the config, and
+creating/removing one temp file in the state directory to prove it is
+writable.
+
+The agent CLIs checked are the ones the run can reach: each distinct
+command named by a reachable profile, once, labelled with those profiles.
+A Pi profile adds a version floor and a read-only credential probe, run
+under the same environment allow-list as the agent launch (never the
+operator's whole environment) and reported without Pi's raw output.
 
 ``autoforge local doctor`` runs the LOCAL subset: no `gh`, no `gh auth
 status`, no `origin` remote. A machine with no GitHub CLI and no GitHub
@@ -18,7 +25,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from .config import AutoForgeConfig, load_config_file, validate_required_profiles
+from .config import AutoForgeConfig, ProfileConfig, load_config_file, validate_required_profiles
 from .errors import (
     ConfigurationError,
     GitHubError,
@@ -35,6 +42,7 @@ from .github import (
 )
 from .local_workspace import DEFAULT_MAX_BYTES, DEFAULT_MAX_ENTRIES
 from .profiles import REQUIRED_PROFILES, local_required_profiles
+from .providers import PI_MIN_VERSION, PiProvider, parse_pi_version
 from .safefs import STATE_DIR_NEEDS_HARD_LINKS, HardLinksUnavailable, SafeRoot
 from .validation import parse_remote_repository
 
@@ -44,7 +52,11 @@ RequiredProfiles = list[str] | Callable[[AutoForgeConfig], list[str]]
 
 # Fallback executable for a provider whose profile does not set `command`,
 # matching the provider adapters' own defaults.
-DEFAULT_AGENT_COMMANDS = {"claude": "claude", "opencode": "opencode"}
+DEFAULT_AGENT_COMMANDS = {"claude": "claude", "opencode": "opencode", "pi": "pi"}
+
+# The profile a REMOTE run reaches only after a merge, on top of
+# `REQUIRED_PROFILES`; checked when it is configured.
+REMOTE_POST_MERGE_PROFILES = ["update_epic"]
 
 # Name of the `doctor` row that verifies the default branch's required checks.
 REQUIRED_CHECKS_ROW = "default branch requires checks"
@@ -453,17 +465,14 @@ class Doctor:
         return results
 
     def _local_agent_checks(self, cfg: AutoForgeConfig | None) -> list[CheckResult]:
-        """One `--version` check per external CLI a LOCAL run can actually reach.
+        """The agent CLIs a LOCAL run can actually reach.
 
         Derived from `local_required_profiles`, not from every configured
         profile: a machine only needs the binaries the *reachable* local
         profiles name. A local configuration that routes everything through
         OpenCode must not fail because an unrelated remote profile mentions
         `claude`, and one that uses only `scripted` profiles must not require
-        an external CLI at all — `scripted` spawns the configured argv
-        directly rather than an agent CLI, so there is no version to query.
-        Each distinct command is checked once, labelled with the profiles that
-        reach it.
+        an external CLI at all.
         """
         if cfg is None:
             return []
@@ -471,7 +480,21 @@ class Doctor:
             reachable = local_required_profiles(cfg)
         except ConfigurationError:
             return []
+        return self._agent_checks(cfg, reachable, "this local configuration")
+
+    def _agent_checks(
+        self, cfg: AutoForgeConfig, reachable: list[str], scope: str
+    ) -> list[CheckResult]:
+        """One availability check per external CLI the ``reachable`` profiles name.
+
+        Each distinct command is checked once, labelled with the profiles
+        that reach it. `scripted` spawns the configured argv directly rather
+        than an agent CLI, so there is no version to query. A command a Pi
+        profile names gets Pi's version floor instead of a bare `--version`,
+        and each Pi profile a read-only credential probe.
+        """
         commands: dict[str, list[str]] = {}
+        pi_profiles: dict[str, list[ProfileConfig]] = {}
         for name in reachable:
             profile = cfg.profiles.get(name)
             if profile is None or profile.provider == "scripted":
@@ -480,21 +503,112 @@ class Doctor:
             if not command:
                 continue
             commands.setdefault(command, []).append(name)
+            if profile.provider == "pi":
+                pi_profiles.setdefault(command, []).append(profile)
         if not commands:
             return [
                 CheckResult(
                     "agent CLI available",
                     True,
-                    "(no external agent CLI is reachable for this local configuration)",
+                    f"(no external agent CLI is reachable for {scope})",
                     required=False,
                 )
             ]
-        return [
-            self._version_check(
-                f"agent '{command}' available ({', '.join(names)})", [command, "--version"]
+        results: list[CheckResult] = []
+        for command, names in commands.items():
+            label = f"agent '{command}' available ({', '.join(names)})"
+            if command not in pi_profiles:
+                results.append(self._version_check(label, [command, "--version"]))
+                continue
+            available = self.check_pi_version(label, pi_profiles[command][0])
+            results.append(available)
+            results.extend(self.check_pi_auth(command, pi_profiles[command], available.ok))
+        return results
+
+    def _pi_allowlist(self) -> tuple[str, ...]:
+        """The environment a Pi agent is launched with, so the probes see what it would."""
+        cfg = self.config if self.config is not None else AutoForgeConfig()
+        return PiProvider().launch_allowlist(cfg.execution.environment_names())
+
+    def _pi_probe(self, argv: list[str]) -> ExecutionResult | str:
+        """Run one Pi probe under the launch allow-list; the result, or why it did not run."""
+        try:
+            res = self._runner(
+                ExecutionRequest(
+                    command=argv,
+                    cwd=self.cwd,
+                    timeout_seconds=self.timeout,
+                    env_allowlist=self._pi_allowlist(),
+                )
             )
-            for command, names in commands.items()
-        ]
+        except Exception as exc:  # spawn failure / missing binary
+            return f"{type(exc).__name__}: {exc}"
+        return "timed out" if res.timed_out else res
+
+    def check_pi_version(self, name: str, profile: ProfileConfig) -> CheckResult:
+        """`pi` runs and is at least :data:`PI_MIN_VERSION` (ADR 0003 §2.8).
+
+        A version line the check cannot parse is a FAIL, as for `gh`: an
+        unknown version is not a known-good one. Pi's stderr is not quoted.
+        """
+        argv = PiProvider().version_command(profile)
+        res = self._pi_probe(argv)
+        if isinstance(res, str):
+            return CheckResult(name, False, res)
+        if res.exit_code != 0:
+            return CheckResult(
+                name,
+                False,
+                f"`{' '.join(argv)}` exited {res.exit_code} (output not shown; run it yourself)",
+            )
+        minimum = ".".join(str(part) for part in PI_MIN_VERSION)
+        text = (res.stdout or "").strip()
+        found = parse_pi_version(text)
+        if found is None:
+            return CheckResult(
+                name,
+                False,
+                f"cannot read the pi version from {text[:80]!r} (need >= {minimum})",
+            )
+        if found < PI_MIN_VERSION:
+            return CheckResult(
+                name,
+                False,
+                f"pi {text}: pi >= {minimum} is required (the RPC and auth contract "
+                "AutoForge relies on, ADR 0003)",
+            )
+        return CheckResult(name, True, f"pi {text}")
+
+    def check_pi_auth(
+        self, command: str, profiles: list[ProfileConfig], available: bool
+    ) -> list[CheckResult]:
+        """``pi auth check --no-refresh`` for each distinct (model, OAuth policy) pair.
+
+        Run under the agent launch's allow-list, so a key only the
+        operator's shell holds (an `OPENAI_API_KEY` the launch would not
+        see) cannot make it report "ready". Pi's stdout and stderr are never
+        quoted: the verdict names the four fields of its JSON result only.
+        """
+        provider = PiProvider()
+        groups: dict[tuple[str, bool], list[ProfileConfig]] = {}
+        for profile in profiles:
+            groups.setdefault((profile.model, provider.require_oauth(profile)), []).append(profile)
+        results: list[CheckResult] = []
+        for members in groups.values():
+            profile = members[0]
+            name = f"agent '{command}' auth ready ({', '.join(p.name for p in members)})"
+            if not available:
+                results.append(CheckResult.skip(name, f"(agent '{command}' is not available)"))
+                continue
+            results.append(self._pi_auth(name, provider, profile))
+        return results
+
+    def _pi_auth(self, name: str, provider: PiProvider, profile: ProfileConfig) -> CheckResult:
+        res = self._pi_probe(provider.auth_check_command(profile))
+        if isinstance(res, str):
+            return CheckResult(name, False, res)
+        ok, detail = provider.auth_verdict(profile, res.exit_code, res.stdout or "")
+        return CheckResult(name, ok, f"{profile.model}: {detail}")
 
     def _workspace(self):
         """A LocalWorkspace over the doctor's cwd, configured like a real run."""
@@ -562,27 +676,28 @@ class Doctor:
             return str(exc)
         return None
 
-    @staticmethod
-    def _agent_commands(cfg: AutoForgeConfig | None) -> tuple[str, str]:
-        claude_cmd, opencode_cmd = "claude", "opencode"
-        if cfg:
-            for p in cfg.profiles.values():
-                if p.provider == "claude" and p.command:
-                    claude_cmd = p.command
-                if p.provider == "opencode" and p.command:
-                    opencode_cmd = p.command
-        return claude_cmd, opencode_cmd
+    def _remote_agent_checks(self, cfg: AutoForgeConfig | None) -> list[CheckResult]:
+        """The agent CLIs a REMOTE run can reach: `REQUIRED_PROFILES`, plus
+        `update_epic` (reachable after a merge) when it is configured.
+
+        Nothing is checked when the config failed: that row already fails
+        `doctor`, and a guess at the routing would check the wrong binaries.
+        """
+        if cfg is None:
+            return []
+        reachable = REQUIRED_PROFILES + [
+            name for name in REMOTE_POST_MERGE_PROFILES if name in cfg.profiles
+        ]
+        return self._agent_checks(cfg, reachable, "this configuration")
 
     def run_all(self) -> list[CheckResult]:
         results = [self.check_config(), self.check_merge_gate(), self.check_premerge_verification()]
         cfg = self.config
         gh = cfg.github.command if cfg else "gh"
-        claude_cmd, opencode_cmd = self._agent_commands(cfg)
         results.append(self._version_check("git available", ["git", "--version"]))
         results.append(self.check_gh_version(gh))
         results.append(self.check_gh_auth(gh))
-        results.append(self._version_check("claude available", [claude_cmd, "--version"]))
-        results.append(self._version_check("opencode available", [opencode_cmd, "--version"]))
+        results.extend(self._remote_agent_checks(cfg))
         results.append(self.check_git_repo())
         results.append(self.check_remote())
         results.append(self.check_required_checks(gh))
