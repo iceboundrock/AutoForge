@@ -321,23 +321,25 @@ class _BoundedBuffer:
         return _Captured(head_text + marker + tail_text, True, len(head_text) + len(marker))
 
 
-class _BoundedReader(threading.Thread):
-    """Drain one pipe into a :class:`_BoundedBuffer` until EOF or abandoned.
+class _PipeDrain(threading.Thread):
+    """Drain one pipe until EOF or abandoned, handing each chunk to :meth:`_feed`.
 
     The pipe is drained whatever the child writes, so the child never blocks
     on a full pipe the way it would if the controller stopped reading. EOF
     arrives only once every writer is gone; :meth:`abandon` ends the read
-    without it, for a writer nothing here can kill.
+    without it, for a writer nothing here can kill. What a chunk becomes
+    (bounded capture here, LF-framed records in ``executor_duplex``) is the
+    subclass's.
     """
 
-    def __init__(self, stream: IO[bytes], limit: int, name: str) -> None:
+    def __init__(self, stream: IO[bytes], name: str) -> None:
         super().__init__(name=f"autoforge-capture-{name}", daemon=True)
         self._fd = stream.fileno()
-        self.buffer = _BoundedBuffer(limit, name)
         self._wake_r, self._wake_w = os.pipe()
         self.error: OSError | None = None
 
     def run(self) -> None:
+        eof = False
         try:
             with selectors.DefaultSelector() as sel:
                 sel.register(self._fd, selectors.EVENT_READ)
@@ -348,10 +350,20 @@ class _BoundedReader(threading.Thread):
                         return
                     chunk = os.read(self._fd, _READ_CHUNK_BYTES)
                     if not chunk:
+                        eof = True
                         return
-                    self.buffer.feed(chunk)
+                    self._feed(chunk)
         except OSError as exc:
             self.error = exc
+        finally:
+            self._ended(eof)
+
+    def _feed(self, chunk: bytes) -> None:
+        raise NotImplementedError
+
+    def _ended(self, eof: bool) -> None:
+        """Called once on the reader thread when the read ends; ``eof`` is
+        False when it was abandoned or failed."""
 
     def wait(self, deadline: float | None) -> bool:
         """Join until EOF or ``deadline`` (``time.monotonic()``); True on EOF."""
@@ -369,6 +381,17 @@ class _BoundedReader(threading.Thread):
                 os.close(fd)
             except OSError:
                 pass
+
+
+class _BoundedReader(_PipeDrain):
+    """Drain one pipe into a :class:`_BoundedBuffer` until EOF or abandoned."""
+
+    def __init__(self, stream: IO[bytes], limit: int, name: str) -> None:
+        super().__init__(stream, name)
+        self.buffer = _BoundedBuffer(limit, name)
+
+    def _feed(self, chunk: bytes) -> None:
+        self.buffer.feed(chunk)
 
     def captured(self) -> _Captured:
         """Decode what was kept; call only once the thread has ended."""
@@ -396,7 +419,7 @@ def _reaped(proc: subprocess.Popen, deadline: float) -> bool:
     return True
 
 
-def _eof(readers: tuple[_BoundedReader, ...], deadline: float | None) -> bool:
+def _eof(readers: tuple[_PipeDrain, ...], deadline: float | None) -> bool:
     return all(reader.wait(deadline) for reader in readers)
 
 
@@ -436,7 +459,7 @@ class _Termination:
 
 
 def _terminate_group(
-    pgid: int, proc: subprocess.Popen, readers: tuple[_BoundedReader, ...]
+    pgid: int, proc: subprocess.Popen, readers: tuple[_PipeDrain, ...]
 ) -> _Termination:
     """SIGTERM the child's process group, escalate to SIGKILL, and stop reading.
 
@@ -475,6 +498,42 @@ def _terminate_group(
     return _Termination(group_survived=_group_alive(pgid), capture_abandoned=abandoned)
 
 
+def _child_environment(
+    env_allowlist: tuple[str, ...] | None, env: Mapping[str, str] | None
+) -> dict[str, str]:
+    """The child's environment: the whole of this process's, or only the
+    allow-listed names (:func:`select_environment`), with ``env`` layered over."""
+    child = dict(os.environ) if env_allowlist is None else select_environment(env_allowlist)
+    if env:
+        child.update(env)
+    return child
+
+
+def _spawn(
+    command: list[str], *, cwd: str | None, env: dict[str, str], stdin: int
+) -> subprocess.Popen[bytes]:
+    """Start ``command`` in a session of its own with stdout and stderr piped.
+
+    ``start_new_session`` makes the child lead a process group the executor
+    can reach and kill after the child itself is gone; the terminal is never
+    inherited. A spawn failure is an :class:`ExecutionError`.
+    """
+    try:
+        return subprocess.Popen(  # noqa: S603 - argv list, no shell
+            command,
+            cwd=cwd,
+            env=env,
+            stdin=stdin,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+    except FileNotFoundError as exc:
+        raise ExecutionError(f"executable not found: {command[0]} ({exc})") from exc
+    except OSError as exc:
+        raise ExecutionError(f"failed to spawn {' '.join(command)}: {exc}") from exc
+
+
 def execute(req: ExecutionRequest) -> ExecutionResult:
     """Run one subprocess to completion, capturing output.
 
@@ -505,24 +564,13 @@ def execute(req: ExecutionRequest) -> ExecutionResult:
     if req.max_output_bytes <= 0:
         raise ExecutionError(f"max_output_bytes must be > 0, got {req.max_output_bytes}")
     started = _now()
-    env = dict(os.environ) if req.env_allowlist is None else select_environment(req.env_allowlist)
-    if req.env:
-        env.update(req.env)
     timeout = req.timeout_seconds if req.timeout_seconds > 0 else None
-    try:
-        proc = subprocess.Popen(  # noqa: S603 - argv list, no shell
-            req.command,
-            cwd=req.cwd,
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
-    except FileNotFoundError as exc:
-        raise ExecutionError(f"executable not found: {req.command[0]} ({exc})") from exc
-    except OSError as exc:
-        raise ExecutionError(f"failed to spawn {' '.join(req.command)}: {exc}") from exc
+    proc = _spawn(
+        req.command,
+        cwd=req.cwd,
+        env=_child_environment(req.env_allowlist, req.env),
+        stdin=subprocess.DEVNULL,
+    )
     assert proc.stdout is not None and proc.stderr is not None
     pgid = proc.pid  # start_new_session: the child leads a group of its own
     # Output is read as bytes and decoded with replacement: agent output is

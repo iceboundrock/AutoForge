@@ -22,8 +22,9 @@ replan_txn.py       REPLAN_REEXECUTE durable transaction state and verifiers
 providers.py        provider adapters: the only place that knows real CLI flags
 pi_rpc.py           (planned, #131) Pi RPC wire protocol: JSONL codec, request ids, event
                     reducer; provider layer, no flags and no processes (ADR 0003)
-executor.py         subprocess lifecycle, timeouts, capture (no workflow semantics);
-                    the planned duplex child handle for RPC transports (#130)
+executor.py         subprocess lifecycle, timeouts, capture (no workflow semantics)
+executor_duplex.py  duplex child handle for RPC transports: stdin records out, LF-framed
+                    stdout records in, one deadline, ADR 0002 teardown; bytes only (#130)
 github.py           GitHubClient over `gh`: verification reads + controller-owned merge
 claims.py           durable GitHub claims: marker schemas, renderers, scan, cardinality
 validation.py       typed GitHub URL parsing and run-argument validation
@@ -49,8 +50,9 @@ prompts/            file-based templates ({{VAR}}): common.md (trust boundary), 
 - Keep the boundaries: no CLI flags outside `providers.py`, and no
   provider wire-protocol names outside the provider layer (`providers.py`
   plus the protocol modules it owns, such as `pi_rpc.py`); no workflow
-  semantics or JSON in `executor.py`; no raw `gh --json` dictionaries crossing out of
-  `github.py`; no large prompt text in Python string literals.
+  semantics or JSON in `executor.py` or `executor_duplex.py`; no raw
+  `gh --json` dictionaries crossing out of `github.py`; no large prompt
+  text in Python string literals.
 - The outcome of a GitHub write is read back from GitHub, never inferred
   from an exit status or an agent claim, and a destructive write is
   checkpointed in persisted state before it is performed. Persisted state is
@@ -79,7 +81,7 @@ dry-run), prompts/update_epic.md                  -> docs/agent-guides/github-sa
 state.py, run_contract.py, safefs.py, locking.py,
 errors.py, engine.py (recovery, retry)            -> docs/agent-guides/state-and-recovery.md
 providers.py, pi_rpc.py, executor.py,
-prompts/__init__.py                               -> docs/agent-guides/architecture.md
+executor_duplex.py, prompts/__init__.py           -> docs/agent-guides/architecture.md
                                                      (+ docs/adr/0003-pi-agent-provider.md for Pi)
 result_parser.py, prompts/*.md                    -> docs/agent-guides/control-result-protocol.md
 redaction.py, runlog.py, error messages           -> docs/agent-guides/secrets-and-logging.md
