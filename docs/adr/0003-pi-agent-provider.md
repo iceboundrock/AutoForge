@@ -44,8 +44,11 @@ command, login or model call was run, and no credential file was read.
 Every decision below that depends on Pi is therefore marked **verified
 from docs/source only**. #131 must re-verify each one against an installed
 Pi before relying on it, and record the result there. No decision is marked
-"verified against installed Pi". Decisions 2.9 and 2.10 do not depend on
-Pi behaviour and say so where they are made.
+"verified against installed Pi". Decisions 2.7 and 2.9 are AutoForge
+module-boundary and coordination choices that do not themselves depend on
+Pi behaviour; the Pi facts they restate keep the status of the decision
+that establishes them. Decision 2.10 does not depend on Pi at all. Each of
+the three says so where it is made.
 
 Pi 1.0.1 (2026-10-03) was compared against 1.0.0. Its changelog and diff
 touch none of the RPC commands, events, flags or print-mode behaviour this
@@ -418,6 +421,26 @@ calls `shutdown()`, exit code 0). Verified from docs/source only.
 and is tested on its own. A Pi module in the executor layer, because it
 would put protocol semantics in a module whose contract is "no workflow
 semantics".
+
+Evidence: AutoForge `src/autoforge/AGENTS.md` ("Rules for production
+code": the boundary rule, already widened to the provider layer by this
+change), `src/autoforge/executor.py` (`execute` starts the child with
+`stdin=subprocess.DEVNULL`), `tests/test_executor.py`
+(`test_stdin_is_closed_not_interactive`), `docs/agent-guides/architecture.md`
+(engine, provider and executor responsibilities), #126's issue text (the
+proposed `opencode_session.py` sibling). Pi: `docs/rpc.md` ("Framing",
+"Protocol records"), `docs/rpc-commands.md` (`prompt`: the message travels
+as a field of a JSON command on stdin), `docs/json.md` and
+`src/modes/rpc/rpc-types.ts` (the command and event names `pi_rpc.py`
+reduces).
+
+Verification status: the placement itself is an AutoForge
+module-boundary decision and does not depend on Pi behaviour; its
+evidence is the AutoForge sources above, checked in this repository. The
+Pi-dependent parts are the prompt delivered as one JSON-encoded `prompt`
+record on stdin and the command and event names the reducer is driven
+by. They restate decisions 2.1 to 2.5 and 2.8 and keep their status:
+verified from docs/source only, to be re-verified in #131.
 
 ### 2.8 Upstream compatibility
 
