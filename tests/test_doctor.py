@@ -577,3 +577,30 @@ def test_premerge_verification_reported_and_never_run(tmp_path):
     d = Doctor(config_path=str(cfg), cwd=str(tmp_path), runner=_runner_factory())
     check = {r.name: r for r in d.run_all()}["pre-merge verification"]
     assert check.detail == "(config check failed)" and not check.ok and not check.required
+
+
+def test_state_dir_on_a_filesystem_without_hard_links_names_the_requirement(tmp_path, monkeypatch):
+    """#120: the state-directory probe is an exclusive create, published by
+    link(2) like every run artifact, so ``doctor`` fails it where a run's
+    run-log probe would fail. The detail names the missing hard links and
+    the remedy instead of only a refused write, and the probe is not left
+    behind."""
+    import errno
+    import os
+
+    import autoforge.safefs as safefs
+
+    def no_hard_links(src, dst, *args, **kwargs):
+        raise OSError(errno.EPERM, os.strerror(errno.EPERM), os.fspath(dst))
+
+    monkeypatch.setattr(safefs, "_O_TMPFILE", 0)
+    monkeypatch.setattr(safefs.os, "link", no_hard_links)
+    d = Doctor(cwd=str(tmp_path), runner=_runner_factory())
+    result = d.check_state_dir()
+    assert not result.ok
+    assert result.detail.startswith(f"{tmp_path / '.autoforge'}: cannot create ")
+    assert "makes no hard link here" in result.detail
+    assert "state directory, run logs included, needs a filesystem with hard links" in (
+        result.detail
+    )
+    assert list((tmp_path / ".autoforge").iterdir()) == []

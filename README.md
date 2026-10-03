@@ -147,6 +147,12 @@ Each line is a summary; the linked document is the precise statement.
 - `claude` (Claude Code CLI) for `analyze_execute` / `fix` profiles
 - `opencode` (OpenCode CLI) for the `review_*`, `replan_reexecute` and
   `update_epic` profiles
+- a state directory (`.autoforge/` by default; `--state-dir` or
+  `state_dir` in config) on a filesystem with hard links: run logs and
+  other controller files are published by `link(2)` so that a crash never
+  leaves one half-written, and there is no non-atomic fallback. vfat/exFAT
+  and some FUSE, SMB/CIFS and overlay mounts have no hard links; a run, and
+  `autoforge doctor`, refuse such a state directory and say why
 
 Run `autoforge doctor` to check all of the above (read-only apart from
 creating the state directory if it is missing and a probe file it removes),

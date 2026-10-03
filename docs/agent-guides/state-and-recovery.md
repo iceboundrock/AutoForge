@@ -233,7 +233,13 @@ The state directory defaults to `.autoforge/` in the working directory for
 a REMOTE run (overridable via `--state-dir` or `state_dir` in config) and to
 `<git dir>/autoforge/state` for a LOCAL run, outside the tree it
 fingerprints, since its own writes would otherwise keep invalidating its own
-review. Same layout either way:
+review. Either way it must be on a filesystem with hard links:
+`SafeRoot.create_exclusive` publishes a complete, fsynced temporary by
+`link(2)` and deliberately has no fallback that writes the final name
+directly (ADR 0001, known limitation 8), so on vfat/exFAT and some FUSE,
+SMB/CIFS and overlay mounts it raises `HardLinksUnavailable`, and the
+run-log probe (before every launch) and `doctor` refuse with the
+requirement named (#120). Same layout either way:
 
 ```text
 <state dir>/

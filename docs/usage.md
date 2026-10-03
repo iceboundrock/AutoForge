@@ -177,6 +177,10 @@ redacted. What it reads depends on the command:
   directory per run with the redacted prompt, output, and parsed result of
   every agent invocation. Layout:
   [State and recovery: runtime artifacts](agent-guides/state-and-recovery.md#runtime-artifacts).
+  The directory must be on a filesystem with hard links: run logs are
+  published by `link(2)`, so vfat/exFAT and some FUSE, SMB/CIFS and overlay
+  mounts are refused before the first launch (and by `doctor`) with an
+  error that says so; point `--state-dir` at another filesystem.
 - **Repository lock:** `<repo>/.git/autoforge/controller.lock`, the same
   file for every `--state-dir`, subdirectory and linked worktree of one
   checkout. A second controller exits with `LockError`.

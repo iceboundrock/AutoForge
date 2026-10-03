@@ -239,15 +239,52 @@ def _denied_text(exc: OSError) -> str:
 
 
 class HardLinksUnavailable(StateError):
-    """:meth:`SafeRoot.link` was refused because the filesystem, or the
-    kernel's policy for this entry, makes no hard links here.
+    """A ``link(2)`` was refused because the filesystem, or the kernel's
+    policy for this entry, makes no hard links here.
 
-    Not a failure of the caller's operation but of one way of performing it:
-    a caller that used ``link(2)`` to reserve a name without replacing an
-    entry can make the same reservation with
-    :meth:`SafeRoot.copy_entry_exclusive` instead.  Any other refusal of a
-    link stays a plain :class:`~autoforge.errors.StateError`.
+    From :meth:`SafeRoot.link` it is not a failure of the caller's operation
+    but of one way of performing it: a caller that used ``link(2)`` to
+    reserve a name without replacing an entry can make the same reservation
+    with :meth:`SafeRoot.copy_entry_exclusive` instead.
+
+    From :meth:`SafeRoot.create_exclusive` it is final.  The new file is
+    published by linking a complete, fsynced temporary to its name, and
+    there is deliberately no fallback that writes the name directly, since
+    that is the half-written file the link exists to exclude (ADR 0001,
+    known limitation 8; #120).  The type lets the caller say what the
+    filesystem lacks instead of reporting a generic failed write.
+
+    Any other refusal of a link stays a plain
+    :class:`~autoforge.errors.StateError`.
     """
+
+
+#: The one statement of what a filesystem without hard links means for the
+#: controller's own directory, appended by the callers that probe it (the
+#: run-log probe and ``doctor``) to a :class:`HardLinksUnavailable` from
+#: :meth:`SafeRoot.create_exclusive`.
+STATE_DIR_NEEDS_HARD_LINKS = (
+    "AutoForge's state directory, run logs included, needs a filesystem with hard links "
+    "(vfat/exFAT and some FUSE, SMB/CIFS and overlay mounts have none); point --state-dir "
+    "or state_dir in the configuration at a directory on one that has them"
+)
+
+
+def _create_refusal(exc: OSError, where: str) -> StateError:
+    """What a refused ``link(2)`` that gives a new file its name is reported as.
+
+    A filesystem without hard links (:data:`_NO_HARD_LINKS`) is
+    :class:`HardLinksUnavailable` with the reason no other way is tried;
+    anything else is the plain failure it always was.
+    """
+    if exc.errno in _NO_HARD_LINKS:
+        return HardLinksUnavailable(
+            f"cannot create {where}: this filesystem makes no hard link here ({exc}). A new "
+            "file is given its name only by link(2), once its bytes are complete and "
+            "fsynced, so that a crash can never leave it half-written under that name; it is "
+            "never written there directly instead"
+        )
+    return StateError(f"cannot create {where}: {exc}")
 
 
 class ReadLimitExceeded(StateError):
@@ -839,6 +876,10 @@ class SafeRoot:
         the same as ``O_CREAT | O_EXCL`` would give, but a crash can no longer
         leave a half-written file behind under the final name for a later
         invocation to find and trust.
+
+        That makes hard links a requirement: where the filesystem makes none
+        the create is refused with :class:`HardLinksUnavailable`, and nothing
+        is left under ``relpath`` or as a temporary.
         """
         parts = split_relpath(relpath)
         parent = self._parent_of(parts, create=True)
@@ -1293,7 +1334,7 @@ class SafeRoot:
         except OSError as exc:
             if exc.errno == errno.EEXIST:
                 raise FileExistsError(errno.EEXIST, f"{where} already exists") from exc
-            raise StateError(f"cannot create {where}: {exc}") from exc
+            raise _create_refusal(exc, where) from exc
 
     def _name_unnamed_tmp_at(self, fd: int, parent: int, *, where: str) -> str:
         """Give the unnamed inode behind ``fd`` a temporary name so that a
@@ -1434,7 +1475,7 @@ class SafeRoot:
             _quiet_unlink(parent, tmp)
             if exc.errno == errno.EEXIST:
                 raise FileExistsError(errno.EEXIST, f"{where} already exists") from exc
-            raise StateError(f"cannot create {where}: {exc}") from exc
+            raise _create_refusal(exc, where) from exc
         _quiet_unlink(parent, tmp)
         self._fsync_published(parent, where)
 

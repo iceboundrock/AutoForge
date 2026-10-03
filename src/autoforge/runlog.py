@@ -60,7 +60,9 @@ from pathlib import Path
 from .errors import StateError
 from .redaction import redact, redact_argv, redact_dict
 from .safefs import (
+    STATE_DIR_NEEDS_HARD_LINKS,
     AppendHandle,
+    HardLinksUnavailable,
     ReadLimitExceeded,
     SafeRoot,
     UnreadableEntryError,
@@ -334,6 +336,10 @@ class RunLogger:
         is created ``0700`` by this controller, but an existing one is
         whatever is there -- a ``0500`` directory, a read-only mount, a
         filesystem without ``link(2)`` -- and it passes every other check.
+        The last is refused on purpose, not worked around: every artifact is
+        published by ``link(2)`` (``SafeRoot.create_exclusive``), and the
+        refusal says so (:data:`~autoforge.safefs.STATE_DIR_NEEDS_HARD_LINKS`)
+        rather than leaving a generic failed write to explain it (#120).
         So it is proved the way ``doctor`` proves the state directory: an
         entry is created there through the same capability and removed
         again. The proof does not outlive the launch, since the agent runs
@@ -363,6 +369,13 @@ class RunLogger:
                 f"are published there after every agent invocation, so make {run_dir} "
                 "writable to resume; the step directories are kept and the sequence "
                 "continues from their names",
+            )
+            raise
+        except HardLinksUnavailable as exc:
+            exc.args = (
+                f"cannot publish into {run_dir}: {exc}. A step directory and its artifacts "
+                "are published there after every agent invocation, and "
+                f"{STATE_DIR_NEEDS_HARD_LINKS}",
             )
             raise
         except StateError as exc:

@@ -1030,7 +1030,10 @@ an independent `os.walk` finds nothing the snapshot did not mention.
 8. **Artifacts are published by `link(2)`.** `create_exclusive` needs hard
    links in the state directory's filesystem; one without them (some FAT
    and network mounts) refuses the bootstrap with a `StateError` naming the
-   artifact rather than falling back to a non-atomic write.
+   artifact rather than falling back to a non-atomic write. #120 kept that
+   refusal and typed it: `create_exclusive` raises `HardLinksUnavailable`,
+   and the run-log probe and `doctor` add that the state directory needs a
+   filesystem with hard links.
 9. **REMOTE replan evidence keeps its tilde fence.** The `~~~~untrusted`
    quoting of replan evidence predates `fenced_untrusted_block` and is
    unchanged; LOCAL prompts use the two primitives of §5.8 (`escape_inline`

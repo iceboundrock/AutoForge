@@ -615,6 +615,37 @@ def test_a_journal_replaced_or_removed_while_the_agent_ran_refuses_the_append(tm
         assert foreign.read_text(encoding="utf-8") == "operator data\n"
 
 
+def test_a_run_directory_without_hard_links_is_refused_naming_the_requirement(
+    tmp_path, monkeypatch
+):
+    """#120: every run-log artifact is published by link(2), so a state
+    directory on a filesystem without hard links (vfat/exFAT, some FUSE,
+    SMB/CIFS and overlay mounts) is refused by the pre-launch probe. That is
+    the intended outcome, not a gap to work around, and the refusal says so:
+    it names the missing hard links and the way out (another state
+    directory) instead of a generic failed write, and leaves no probe behind.
+    The filesystem is simulated the way vfat behaves: no ``O_TMPFILE``, and
+    ``link(2)`` refused with ``EPERM``."""
+    import errno
+
+    import autoforge.safefs as safefs
+    from autoforge.safefs import HardLinksUnavailable
+
+    def no_hard_links(src, dst, *args, **kwargs):
+        raise OSError(errno.EPERM, os.strerror(errno.EPERM), os.fspath(dst))
+
+    monkeypatch.setattr(safefs, "_O_TMPFILE", 0)
+    monkeypatch.setattr(safefs.os, "link", no_hard_links)
+    with pytest.raises(HardLinksUnavailable) as exc:
+        RunLogger(tmp_path / "logs", "run-1")
+    message = str(exc.value)
+    assert message.startswith("cannot publish into logs/run-1/: cannot create ")
+    assert "makes no hard link here" in message
+    assert "state directory, run logs included, needs a filesystem with hard links" in message
+    assert "--state-dir" in message
+    assert list((tmp_path / "logs" / "run-1").iterdir()) == [], "the probe was left behind"
+
+
 @pytest.mark.parametrize(
     ("failing_fsync_ordinal", "refusal"),
     [
