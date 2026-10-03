@@ -390,10 +390,9 @@ Evidence: `src/main.ts:358-366` (`createSessionManager`),
   Claude Code text mode.
 - Reconstructing text from `message_update` deltas: the deltas are partial
   and do not carry the final message.
-- Treating `length` as a failure (the original decision, amended in #131
-  because Pi 1.0.1 does not return the cut text; see §1.1): it hides a
-  usable block. The parser is
-  the authority on whether the text contains one.
+- Treating `length` as a success (the original decision, superseded in
+  #131): Pi 1.0.1 drops the cut-off message from its context, so
+  `get_last_assistant_text` cannot return it; see §1.1.
 
 Evidence: `docs/rpc-commands.md` (`get_last_assistant_text`, which says
 `null`); `src/modes/rpc/rpc-mode.ts:654-657` and
