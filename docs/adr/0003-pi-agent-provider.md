@@ -1,12 +1,13 @@
 # ADR 0003. Pi agent provider: RPC boundary, model mapping, failure channel
 
 - **Status:** accepted for implementation. #129 (Pi profile validation, the
-  argv, the doctor version and read-only auth checks) is implemented; the
+  argv, the doctor version and read-only auth checks) and #130 (the duplex
+  child handle, `src/autoforge/executor_duplex.py`) are implemented; the
   rest is not yet. Decided in #128 for EPIC #127. Implemented by #129 (config, doctor),
   #130 (duplex child primitive), #131 (adapter), #132 (resource policy).
 - **Where (planned):** `src/autoforge/providers.py` (`PiProvider`),
-  `src/autoforge/pi_rpc.py` (Pi wire protocol), `src/autoforge/executor.py`
-  (duplex child handle), `src/autoforge/engine.py` (`_invoke_phase`, one
+  `src/autoforge/pi_rpc.py` (Pi wire protocol),
+  `src/autoforge/executor_duplex.py` (duplex child handle, implemented), `src/autoforge/engine.py` (`_invoke_phase`, one
   provider-neutral check), `docs/agent-guides/architecture.md`
 - **Related:** ADR 0001 (LOCAL workspace boundary), ADR 0002 (nothing an
   agent starts outlives its invocation), #126 (OpenCode interactive handoff;

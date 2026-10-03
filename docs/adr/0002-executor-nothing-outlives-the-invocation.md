@@ -123,6 +123,23 @@ process the previous agent left behind.
   a knob here would be option D by another name. Easy to expose later if an
   operator hits it.
 
+## 4a. Note: the duplex child handle (#130)
+
+The duplex child handle (`src/autoforge/executor_duplex.py`, ADR 0003 §2.7)
+is held to this decision unchanged. That clarifies the decision's scope; it
+does not change the decision. An invocation through the handle is complete
+when the child has exited, both pipes reached EOF and the group is empty.
+Its one deadline plays the role of `timeout_seconds`. Closing the child's
+stdin is the orderly-shutdown request: a child that exits after it has made
+a normal exit and gets the exit grace, and its own status is kept. The same
+`_terminate_group` does the kill, starting with SIGTERM. The same three
+facts are reported for the same leftovers, and the same bound holds:
+deadline plus exit grace plus two kill graces. When an exception (or
+`KeyboardInterrupt`) leaves the `with` block, stdin is still closed first
+and the child gets at most the exit grace to exit before the group is
+killed. `tests/test_executor_duplex.py` runs the leftover scenarios of §5
+through both `execute()` and the handle and asserts that the facts match.
+
 ## 5. Tests
 
 `tests/test_executor.py`: a pipe-holding descendant after exit 0 and after

@@ -39,6 +39,10 @@ class ExecutionTimeoutError(ExecutionError):
     """Subprocess exceeded its timeout and was terminated."""
 
 
+class ChildStdinClosedError(ExecutionError):
+    """A duplex child closed its stdin while a record was being written (EPIPE)."""
+
+
 class ControlResultError(AutoForgeError):
     """CONTROL_RESULT block missing, ambiguous, or not valid JSON."""
 

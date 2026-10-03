@@ -130,12 +130,45 @@ whole timeout, and `ExecutionResult.descendants_killed` records the kill.
 The two flags are exclusive: `timed_out` means the child itself overran,
 `descendants_killed` that it exited and its leftovers were removed.
 
-A duplex child handle for RPC transports (#130, ADR 0003 §2.7) is planned
-in the executor layer. It provides stdin and stdout pipes with LF-only
-record framing, bounded queues and buffers, one deadline, and teardown on
-every exit path. It carries no JSON and no workflow semantics, and it is
-held to the same contract. `execute()` itself stays one-shot with
-`stdin=DEVNULL`.
+`execute()` itself stays one-shot with `stdin=DEVNULL`. A child the
+controller must write to while it runs (an RPC transport such as Pi's, ADR
+0003 §2.7) uses the duplex child handle in `src/autoforge/executor_duplex.py`
+instead: `with start_duplex(DuplexRequest(...)) as child:` then
+`send_line`, `read_line`, `close_stdin` and `finish`. It reuses the
+executor's spawn, environment selection, pipe draining and group kill, and
+it is held to the same contract:
+
+- stdout is split into records on LF (0x0A) only, one trailing CR stripped
+  per record; U+2028/U+2029, NUL and every other byte are record content.
+  Records are bytes and decoding them is the caller's. A record over
+  `max_record_bytes` is reported as `Oversize` and dropped through its LF;
+  an unterminated fragment at EOF is reported as `Fragment`, never as a
+  record;
+- both pipes are drained continuously whether or not the caller reads.
+  Records wait in a queue bounded by `max_pending_records` and
+  `max_pending_bytes`, and exceeding it is `Overflow`, which ends the
+  invocation (a child still running is killed at `finish()`). stderr goes
+  to the same head/tail capture as `execute()` and is never a record;
+- `send_line` writes one whole record under one lock with non-blocking
+  writes and a selector, so a child that stops reading stdin cannot hold
+  the controller past the deadline. A child that closed its stdin raises
+  `ChildStdinClosedError`;
+- one absolute deadline bounds every `send_line`, `read_line` and `finish`.
+  Past it the group is killed exactly as on `execute()`'s timeout, and the
+  result is `timed_out` with `exit_code = -1`;
+- the `with` tears down on every exit, an exception or `KeyboardInterrupt`
+  included: stdin is closed (an orderly-shutdown request), the child gets a
+  bounded wait to exit (the deadline from `finish()`, at most the exit grace
+  on an exception), then the exit grace and empty-group check, then the
+  group kill (SIGTERM first, then SIGKILL). `DuplexResult` reports
+  `descendants_killed`, `group_survived_kill` and `capture_abandoned`
+  exactly as `ExecutionResult` does for the same leftovers, and the
+  invocation takes at most the deadline plus the exit grace plus two kill
+  graces.
+
+The handle knows no JSON, no provider and no workflow. A server child that
+takes no input (#126) uses it with `stdin_pipe=False` and
+`stdout_mode=StdoutMode.CAPTURE`.
 
 The kill is complete only when no process is left in the group, not merely
 when the child is reaped and its pipes closed: a descendant that closed its
