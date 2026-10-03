@@ -734,6 +734,21 @@ def test_an_unreadable_pi_version_fails_rather_than_passes(tmp_path, version):
     assert not row.ok and "cannot read the pi version" in row.detail
 
 
+@pytest.mark.parametrize(
+    "version", [f"token {PLANTED}", f"1.0.0\nOPENAI_API_KEY={PLANTED}", PLANTED]
+)
+def test_an_unreadable_pi_version_is_not_quoted(tmp_path, version):
+    # `_pi_doctor` asserts PLANTED is absent from every row.
+    row = _pi_doctor(tmp_path, version=version)[PI_LABEL]
+    assert not row.ok and "cannot read the pi version" in row.detail
+    assert "output not shown" in row.detail and ">= 1.0.0" in row.detail
+
+
+def test_a_pi_pre_release_suffix_is_not_quoted(tmp_path):
+    row = _pi_doctor(tmp_path, version=f"1.0.0-{PLANTED}")[PI_LABEL]
+    assert not row.ok and row.detail.startswith("pi 1.0.0 (pre-release): ")
+
+
 def test_a_failing_pi_version_does_not_quote_its_output(tmp_path):
     results = _pi_doctor(tmp_path, version_code=3)
     assert not results[PI_LABEL].ok and "exited 3" in results[PI_LABEL].detail

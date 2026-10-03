@@ -549,7 +549,9 @@ class Doctor:
         """`pi` runs and is at least :data:`PI_MIN_VERSION` (ADR 0003 §2.8).
 
         A version line the check cannot parse is a FAIL, as for `gh`: an
-        unknown version is not a known-good one. Pi's stderr is not quoted.
+        unknown version is not a known-good one. Pi's output is never quoted:
+        a detail names only the parsed release number, so whatever a wrapper
+        prints there (or appends as a pre-release suffix) stays out of it.
         """
         argv = PiProvider().version_command(profile)
         res = self._pi_probe(argv)
@@ -568,16 +570,19 @@ class Doctor:
             return CheckResult(
                 name,
                 False,
-                f"cannot read the pi version from {text[:80]!r} (need >= {minimum})",
+                f"cannot read the pi version from `{' '.join(argv)}` (output not shown; "
+                f"need >= {minimum})",
             )
+        release, _, suffix = text.partition("-")
+        shown = f"pi {release} (pre-release)" if suffix else f"pi {release}"
         if found < PI_MIN_VERSION:
             return CheckResult(
                 name,
                 False,
-                f"pi {text}: pi >= {minimum} is required (the RPC and auth contract "
+                f"{shown}: pi >= {minimum} is required (the RPC and auth contract "
                 "AutoForge relies on, ADR 0003)",
             )
-        return CheckResult(name, True, f"pi {text}")
+        return CheckResult(name, True, shown)
 
     def check_pi_auth(
         self, command: str, profiles: list[ProfileConfig], available: bool
