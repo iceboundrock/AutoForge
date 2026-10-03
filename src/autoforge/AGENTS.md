@@ -34,7 +34,8 @@ locking.py          repository lock keyed by the git common dir
 redaction.py        secret redaction for anything that reaches logs
 runlog.py           per-invocation run logs, redacted
 errors.py           typed error taxonomy
-prompts/            file-based templates ({{VAR}}); renderer in prompts/__init__.py
+prompts/            file-based templates ({{VAR}}): common.md (trust boundary), phase
+                    templates, local_*.md, correction.md; renderer in prompts/__init__.py
 ```
 
 ## Rules for production code

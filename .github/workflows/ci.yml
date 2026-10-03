@@ -16,8 +16,8 @@
 # close that — the required check is defined by the branch it gates. The
 # controller closes it instead: `safety.protected_merge_paths` (default
 # `.github/workflows/`) makes any PR that touches these files BLOCK in
-# READY_FOR_MERGE / MERGE for a human to review and merge. See README,
-# "What a green `ci` does and does not prove".
+# READY_FOR_MERGE / MERGE for a human to review and merge. See
+# docs/development.md, "What a green `ci` does and does not prove".
 name: CI
 
 on:

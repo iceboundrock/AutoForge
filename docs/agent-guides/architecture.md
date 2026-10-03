@@ -33,6 +33,13 @@ Responsible for:
 
 The engine must not contain Claude Code or OpenCode CLI-specific flag logic.
 
+`step()` is the core primitive; `run()`/`resume` just loop it until a stop
+phase (`READY_FOR_MERGE`, `DONE`, `BLOCKED`, `FAILED`). With the merge gate
+open (`safety.allow_merge: true` **and** `--allow-merge`) `READY_FOR_MERGE`
+is no longer a stop phase: the loop continues through the controller-side
+verification, `MERGE` and `UPDATE_EPIC`. Which module owns which concern is
+listed in the module map in `src/autoforge/AGENTS.md`.
+
 ### Provider adapters
 
 Provider-specific code translates an abstract agent request into a real CLI invocation.
@@ -55,6 +62,10 @@ Provider adapters own:
 - the names of the environment variables its CLI reads
   (`AgentProvider.environment_names`, added to the engine's allow-list so a
   provider's key is never handed to another provider's CLI)
+
+Every invocation is an argv list: there is no `os.system` / `shell=True`
+anywhere, and prompts travel as a single argv element so shell
+metacharacters in issue text cannot be interpreted.
 
 ### Executor
 
@@ -82,7 +93,9 @@ reads HEAD and branch of its own checkout before and after each invocation,
 entering `BLOCKED` on a change.
 
 Nothing an agent starts outlives its invocation
-([ADR 0002](../adr/0002-executor-nothing-outlives-the-invocation.md)). An
+([ADR 0002](../adr/0002-executor-nothing-outlives-the-invocation.md)). The
+child is started in a new session (`start_new_session`), so it leads a
+process group of its own that the executor can reach and kill. An
 invocation is complete when the child has exited, both pipes reached EOF
 *and* no process is left in the child's process group. The child's exit is
 bounded by the timeout; past it the whole group is killed and the result is
@@ -160,3 +173,10 @@ last rule: rendering fails when a required variable is missing and when a
 placeholder is left unrendered. The agent-facing result contract those
 templates must produce is in
 [control-result-protocol.md](control-result-protocol.md).
+
+The trust boundary is part of every prompt: `prompts/common.md` declares
+GitHub issues/PRs/comments, source, tests, and logs untrusted data, and
+controller instructions and the repository's `AGENTS.md`/`CLAUDE.md` outrank
+them. LOCAL mode uses `local_common.md` and the `local_*` phase templates, which
+tell the agent the run has no Issue, PR or remote branch and not to use
+GitHub.

@@ -181,7 +181,13 @@ docs/agent-guides/
   testing.md                           testing requirements and high-priority coverage
 docs/adr/                              accepted design records (LOCAL mode workspace boundary,
                                        executor: nothing an agent starts outlives its invocation)
-README.md                              operator-facing overview, configuration, security model
+docs/README.md                         human-oriented documentation index, by intent
+docs/usage.md                          operator guide: remote commands, stop phases, unblock, recovery
+docs/local-mode.md                     operator guide: LOCAL mode (no GitHub)
+docs/configuration.md                  config files, formats, strict key validation, profiles
+docs/development.md                    make targets, CI, what a green `ci` does and does not prove
+README.md                              operator-facing landing page: overview, key properties,
+                                       install, quick start, maturity
 ```
 
 ## Routing rules
@@ -242,7 +248,7 @@ locked install, then `pytest`, `ruff check`, `ruff format --check`,
 `mypy src`) in the local environment on one interpreter; CI runs `pytest` on
 every Python in its matrix (`.github/workflows/ci.yml`), which
 `make check-matrix` reproduces locally when a change could be
-interpreter-sensitive. See `Makefile` and README "Development". Also inspect
+interpreter-sensitive. See `Makefile` and `docs/development.md`. Also inspect
 `git status --short` and `git diff --stat`. Do not claim tests, lint, type
 checking, GitHub operations, or agent invocations succeeded unless they were
 actually executed and verified.

@@ -1,0 +1,129 @@
+# Configuration
+
+[`autoforge.example.yaml`](../autoforge.example.yaml) is the authoritative,
+exhaustive reference: it lists every key the controller reads, with its
+default and a comment on what it enforces. This page explains how a config
+file is created, loaded and validated, and gives an overview of the
+sections. It does not repeat every option.
+
+## Creating and passing a config file
+
+```bash
+cp autoforge.example.yaml autoforge.yaml     # git-ignored: local to one checkout
+uv run autoforge --config autoforge.yaml doctor
+uv run autoforge --config autoforge.yaml run --epic <EPIC URL> --issue <issue URL>
+```
+
+`--config` and `--state-dir` are options of the `autoforge` command itself,
+so they go before the subcommand. Without `--config` the controller uses its
+built-in defaults. `autoforge.yaml` and `autoforge.local.*` files are
+git-ignored; do not commit a config that names credentials or local paths.
+
+Edit the file to change model identifiers, effort, timeouts and provider
+options without touching controller source. Provider-specific flags are
+built by the adapters in `src/autoforge/providers.py`; the engine never
+hard-codes CLI syntax. The CLI flag syntax in `autoforge.example.yaml` was
+checked against the locally installed CLIs (Claude Code 2.1.263, OpenCode
+1.18.20, gh 2.100.0).
+
+## Formats
+
+YAML (`uv sync --extra yaml` for PyYAML, else a minimal built-in subset
+parser), TOML (stdlib), and JSON (stdlib) are accepted; the file extension
+(`.yaml` / `.yml`, `.toml`, `.json`) selects the parser. A file that does not
+parse is reported as `cannot parse config <path>: ...` whichever parser read
+it, the built-in subset parser included.
+
+## Validation: every key must be one the controller reads
+
+An unknown key, whether at the top level, in any section (`execution`,
+`safety`, `github`, `merge`, `review`, `review.replan`, `workflow`, `local`)
+or in a profile mapping, is a configuration error naming the section, the
+offending key and the keys that section knows, e.g.
+`unknown key(s) under 'workflow': max_review_round (known: max_review_rounds, ...)`.
+A typo cannot be a silent no-op that leaves the built-in default in force:
+several of these keys are loop bounds or merge behaviour, where "ignored"
+means a looser bound than the operator wrote while `autoforge doctor` calls
+the file valid.
+
+- Provider-specific `options` under a profile are the one free mapping; the
+  adapter in `providers.py` validates what it reads there.
+- The same contract covers what a parser would otherwise settle before the
+  controller looks: a key written twice in one mapping is a parse error on
+  every format (PyYAML and `json.loads` would keep the last copy and drop the
+  first, typo included).
+- A YAML document whose root is not a mapping is refused on both YAML
+  backends (only an empty or comment-only file means "all defaults").
+- A profile name must be a non-empty string (PyYAML types unquoted `1:` as
+  an integer).
+- `safety.allow_merge` is the *only* key that opens the merge gate. The
+  historical `execution.allow_merge` is rejected on load rather than read,
+  and an unknown key under `safety` (a typo such as `allow_merges`) is a
+  configuration error, so the gate can never be "disabled" in one place while
+  still open in another. `autoforge doctor` prints the effective gate state
+  and the file that set it.
+- Both `workflow.stagnation_*` settings are `0` (rule disabled) or `>= 2`:
+  they compare consecutive rounds, so a window of `1` is rejected by the
+  config loader rather than silently disabling the rule.
+- `safety.protected_merge_paths: []` disables that gate; leaving the key
+  empty (`null`) is a configuration error rather than a silent opt-out.
+
+`autoforge doctor` (and `autoforge local doctor`) reports whether the file
+loads and validates. Doctor is read-only apart from creating the state
+directory if it is missing and a probe file it creates and removes there.
+
+## Sections at a glance
+
+| Section | What it controls | Where the behaviour is specified |
+|---|---|---|
+| top level | `version`, `state_dir` (default `.autoforge`), `prompt_version` | [State and recovery](agent-guides/state-and-recovery.md) |
+| `execution` | default timeout, `max_correction_attempts` (default 1), the agent environment allow-list (`env_allowlist`, `env_allowlist_extra`), the per-issue agent worktree location (`worktree_dir`) | [Architecture](agent-guides/architecture.md), [Running the remote workflow](usage.md) |
+| `safety` | the merge gate (`allow_merge`, default `false`), `protected_merge_paths` (default `.github/workflows/`), `required_checks` (default `ci`), `verify_check_definition` (default `true`) | [GitHub safety](agent-guides/github-safety.md#merge-safety) |
+| `merge` | how the controller merges once the gate is open: `method` (default `squash`), `delete_branch`, `max_verification_attempts` (default 5), `verification_commands` (argv lists, empty by default) | [GitHub safety](agent-guides/github-safety.md#merge-safety) |
+| `workflow` | loop bounds: `max_review_rounds` (20), `stagnation_identical_rounds` (2), `stagnation_unchanged_count_rounds` (3), `max_total_steps` (300); `epic_update_every` (1) | [Workflow](agent-guides/workflow.md#loop-bounds) |
+| `review.replan` | replan policy: `enabled`, `soft_threshold` (12), `hard_threshold` (20), `stagnation_window` (3), `max_findings_per_round` (2), `max_replans_per_issue` (2) | [Workflow](agent-guides/workflow.md#loop-bounds), [Replan transaction](agent-guides/replan-transaction.md) |
+| `profiles` | provider, model, effort, command, timeout and provider options per logical profile | [Profiles](#profiles) below |
+| `github` | the `gh` binary and its timeout | [GitHub safety](agent-guides/github-safety.md) |
+| `local` | Local Mode: `feature_dir`, `max_fix_rounds`, `validation_commands`, `exclude`, `max_workspace_entries`, `max_workspace_bytes` | [Local mode configuration](#local-mode-configuration) below |
+
+## Profiles
+
+Logical profile names (`analyze_execute`, `fix`, `review_round_1`,
+`review_round_2_5`, `review_round_6_plus`, `replan_reexecute`, `update_epic`)
+are stable. There is no `merge` profile: the controller merges, see `merge:`
+in the example file. Which profile serves which phase and review round is
+specified in [workflow.md](agent-guides/workflow.md#review-round-routing);
+the example file carries the default provider, model, effort and timeout for
+each. The built-in defaults are:
+
+| Profile | Phase | Provider | Model | Effort |
+|---|---|---|---|---|
+| `analyze_execute` | `ANALYZE_EXECUTE` | Claude Code | `fable` | high |
+| `fix` | `FIX` | Claude Code | `fable` | high |
+| `review_round_1` | `REVIEW`, round 1 | OpenCode | `openai/gpt-5.6-luna` | high |
+| `review_round_2_5` | `REVIEW`, rounds 2 to 5 | OpenCode | `openai/gpt-5.6-terra` | high |
+| `review_round_6_plus` | `REVIEW`, round 6 up to `workflow.max_review_rounds` (default 20) | OpenCode | `openai/gpt-5.6-sol` | medium |
+| `replan_reexecute` | `REPLAN_REEXECUTE` | OpenCode | `openai/gpt-5.6-terra` | high |
+| `update_epic` | `UPDATE_EPIC` | OpenCode | `openai/gpt-5.6-sol` | high |
+
+## Local mode configuration
+
+The `local:` block configures [Local mode](local-mode.md): `feature_dir`,
+`max_fix_rounds` and the argv-array `validation_commands`, plus the
+workspace policy (`exclude`, `max_workspace_entries`, `max_workspace_bytes`)
+that decides what the workspace fingerprint covers and when a tree is too
+large to bind.
+
+A local run needs only the profiles its configured bound can reach: with the
+default `max_fix_rounds: 1` that is `analyze_execute`, `fix`,
+`review_round_1` and `review_round_2_5`. Local review rounds are routed
+exactly like remote ones, so `max_fix_rounds: 5` or more also requires
+`review_round_6_plus`. `local doctor` and the start of a `local run` check
+that, rather than leaving it to fail five fix rounds in. `replan_reexecute`
+and `update_epic` belong to the remote lifecycle only.
+
+A local run freezes part of its configuration as its run contract when it
+starts (`local.exclude`, both cost bounds, `local.validation_commands`,
+`local.max_fix_rounds`, `workflow.max_total_steps`, the prompt version); a
+resumed run refuses a changed value rather than adopting it. See
+[Local mode](local-mode.md#the-run-contract).
