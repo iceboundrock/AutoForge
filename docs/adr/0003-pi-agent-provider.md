@@ -41,10 +41,11 @@ are under `packages/coding-agent/docs/`, and the same pages are on
 
 **Pi is not installed on the machine this ADR was written on.** No `pi`
 command, login or model call was run, and no credential file was read.
-Every decision below is therefore marked **verified from docs/source
-only**. #131 must re-verify each one against an installed Pi before relying
-on it, and record the result there. No decision is marked "verified against
-installed Pi".
+Every decision below that depends on Pi is therefore marked **verified
+from docs/source only**. #131 must re-verify each one against an installed
+Pi before relying on it, and record the result there. No decision is marked
+"verified against installed Pi". Decisions 2.9 and 2.10 do not depend on
+Pi behaviour and say so where they are made.
 
 Pi 1.0.1 (2026-10-03) was compared against 1.0.0. Its changelog and diff
 touch none of the RPC commands, events, flags or print-mode behaviour this
@@ -490,6 +491,42 @@ is a new process. #126 is therefore **off the MVP critical path**.
 | `provider_failure` / `provider_summary` on `AgentExecutionResult` | Shared foundation | #131 adds them. #126's server adapter can use the same fields for a server-side failure |
 | Generic `ProviderSession`, `PendingInteraction`, state protocol 5→6, pending/answer/approve/reject commands, interaction policy, crash recovery and locking for a paused run | Shared foundation, **owned by #126** | #126. Pi consumes it post-MVP in #134 |
 
+**Rejected.**
+
+- **Making #126 a prerequisite of the Pi MVP** (#129 to #132 wait for it).
+  The MVP uses none of what #126 adds: no durable session, no paused run,
+  no answer or approve command, no state protocol 6. Waiting would tie an
+  independent provider to an open design it does not consume.
+- **Building the generic session and interaction layer in the Pi MVP.**
+  The MVP has no use case for it, so it would be a speculative abstraction
+  shaped by one provider that never pauses. #126 has the use case: OpenCode
+  permission and question requests. Pi adopts the layer after it exists,
+  in #134.
+- **Pi building its own child primitive, failure channel and options
+  mechanism without regard to #126.** The executor layer would get two
+  invocation-lifetime primitives with overlapping contracts, ADR 0002 two
+  unrelated amendments, and the profile schema two ways to validate
+  per-provider options. The "whichever lands second extends the first"
+  rule keeps one of each.
+- **Editing #126 in this work to record the split there.** #126 is open
+  under its own scope, and this issue excludes changing it. The split is
+  recorded here, and the dependent Pi issues (#129 to #132) carry the parts
+  they own.
+
+Evidence: #126's issue text (read in full, not modified) for the
+OpenCode-specific and #126-owned rows; ADR 0002 and
+`src/autoforge/executor.py` (`execute` is one-shot with `stdin=DEVNULL`)
+for the shared executor rows; `src/autoforge/providers.py`
+(`AgentExecutionResult`) for the failure-channel row. Verification status:
+the classification is a project-coordination decision and does not depend
+on Pi behaviour, so Pi evidence is not applicable to it. The Pi-specific
+row does depend on Pi. Its protocol, session, model, thinking and
+event-reduction parts restate decisions 2.1 to 2.5 and 2.8 and keep their
+status: verified from docs/source only, to be re-verified in #131. Its
+trust and resource flags, `pi auth check` preflight and `PI_*` names are
+only assigned here; #129 and #132 decide them and verify them against an
+installed Pi.
+
 ### 2.10 Why an ADR
 
 The provider boundary gains three things a later provider will reuse:
@@ -503,6 +540,11 @@ than an accident of the adapter. Those warrant a record. A section in
 `docs/agent-guides/architecture.md` alone would describe the boundary but
 not why the alternatives were rejected. The guide summarises the placement
 and links here.
+
+Verification status: whether to write an ADR is a documentation decision
+and does not depend on Pi behaviour, so Pi evidence is not applicable. The
+three additions it lists come from decisions 2.1, 2.6 and 2.7, which carry
+their own status.
 
 ## 3. Consequences
 
