@@ -6462,23 +6462,11 @@ class ControllerEngine:
         # fallback for a client that reported no URL for the comment.
         verified_comment_url = verified.url or parse_comment_url(res.review_comment_url).canonical
 
-        # Valid review lifecycle: round is consumed regardless of the outcome.
-        # The round is bound to the revision it decided on -- the PR the
-        # comment was verified to belong to, the HEAD, the base and the
-        # merge base -- and the merge gate later requires all four, not the
-        # HEAD alone.
-        state.review_round = res.round
-        state.reviewed_pr_url = parse_pr_url(state.current_pr_url).canonical
-        state.reviewed_head_sha = expected_head
-        state.reviewed_base_ref = expected_base
-        state.reviewed_merge_base_sha = expected_merge_base
-        state.last_review_comment_url = verified_comment_url
-        state.last_review_needs_fix = res.needs_fix_round
-        # Findings are agent-authored text persisted in plain `state.json` and
-        # rendered into the next FIX prompt, so they cross the same redaction
-        # boundary as the run log.
-        findings = [redact_dict(f.to_dict()) for f in res.findings]
-
+        # The post-review re-read comes before anything is recorded. It can
+        # still refuse the round (the PR closed or merged under the reviewer),
+        # and a refused round consumes neither `review_round` nor a
+        # `review_history` entry: the step persists a failed verification
+        # together with whatever this method had changed by then.
         latest = self._require_open_pr()
         moved = ""
         latest_merge_base = ""
@@ -6498,6 +6486,23 @@ class ControllerEngine:
                     f"{latest_merge_base[:12]} (base {expected_base!r} was rewritten under "
                     "its name)"
                 )
+
+        # Valid review lifecycle: round is consumed regardless of the outcome.
+        # The round is bound to the revision it decided on -- the PR the
+        # comment was verified to belong to, the HEAD, the base and the
+        # merge base -- and the merge gate later requires all four, not the
+        # HEAD alone.
+        state.review_round = res.round
+        state.reviewed_pr_url = parse_pr_url(state.current_pr_url).canonical
+        state.reviewed_head_sha = expected_head
+        state.reviewed_base_ref = expected_base
+        state.reviewed_merge_base_sha = expected_merge_base
+        state.last_review_comment_url = verified_comment_url
+        state.last_review_needs_fix = res.needs_fix_round
+        # Findings are agent-authored text persisted in plain `state.json` and
+        # rendered into the next FIX prompt, so they cross the same redaction
+        # boundary as the run log.
+        findings = [redact_dict(f.to_dict()) for f in res.findings]
         if moved:
             state.current_head_sha = latest.head_sha
             state.current_base_ref = latest.base_ref

@@ -177,6 +177,8 @@ def test_stagnation_below_soft_threshold_does_not_replan():
     # At the threshold it escalates even though the finding counts are far
     # above max_findings_per_round, which the window rule alone would reject.
     assert decision.action == "replan" and decision.reason == "workflow_stagnation"
+    assert decision.metadata["trigger"] == "workflow_stagnation"
+    assert decision.metadata["workflow_stagnation_reason"] == reason
 
 
 # =============================================================================
@@ -600,6 +602,14 @@ def test_default_stagnation_routes_to_replan_through_engine(tmp_state_dir):
     out = eng.step()
     assert out.next_phase == "REPLAN_REEXECUTE"
     assert "workflow_stagnation" in out.message
+    # The stagnant round was answered with the replan decision, not with
+    # another FIX, and the decision records the loop guard's verdict.
+    assert [call.phase for call in eng.provider.calls] == ["REVIEW", "FIX", "REVIEW"]
+    txn = ReplanTransaction.from_dict(load_state(eng.paths.state_file).replan_transaction)
+    assert txn.stage is ReplanStage.PENDING
+    assert txn.escalation["trigger"] == "workflow_stagnation"
+    assert "identical resolutions" in txn.escalation["workflow_stagnation_reason"]
+    assert gh.prs[PR].state == "OPEN"  # closing the source PR belongs to the replan step
 
 
 def test_replan_limit_blocks_through_engine(tmp_state_dir):
