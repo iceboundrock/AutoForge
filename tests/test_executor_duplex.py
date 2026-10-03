@@ -19,6 +19,7 @@ from autoforge import executor, executor_duplex
 from autoforge.errors import ChildStdinClosedError, ExecutionError, ExecutionTimeoutError
 from autoforge.executor import ExecutionRequest, execute
 from autoforge.executor_duplex import (
+    MAX_DEADLINE_SECONDS,
     DuplexRequest,
     Eof,
     Fragment,
@@ -647,6 +648,12 @@ def test_missing_binary_raises_execution_error():
     [
         ("command", []),
         ("deadline_seconds", 0),
+        ("deadline_seconds", -1),
+        ("deadline_seconds", float("nan")),
+        ("deadline_seconds", float("inf")),
+        ("deadline_seconds", float("-inf")),
+        ("deadline_seconds", MAX_DEADLINE_SECONDS + 1),
+        ("deadline_seconds", 1e10),
         ("max_record_bytes", 0),
         ("max_pending_records", 0),
         ("max_pending_bytes", 0),
@@ -655,11 +662,25 @@ def test_missing_binary_raises_execution_error():
         ("max_record_bytes", DuplexRequest.max_pending_bytes + 1),
     ],
 )
-def test_invalid_request_is_refused_before_spawning(field, value):
+def test_invalid_request_is_refused_before_spawning(field, value, monkeypatch):
+    def no_spawn(*args, **kwargs):
+        raise AssertionError("an invalid request must not spawn")
+
+    monkeypatch.setattr(executor_duplex, "_spawn", no_spawn)
     req = DuplexRequest(command=[PY, "-c", "pass"])
     setattr(req, field, value)
-    with pytest.raises(ExecutionError):
+    with pytest.raises(ExecutionError, match=field if field != "command" else "empty"):
         start_duplex(req)
+
+
+def test_the_largest_accepted_deadline_is_one_every_wait_can_take():
+    """An unbounded read and a write both wait on the whole remaining deadline."""
+    req = DuplexRequest(command=[PY, "-c", _ECHO, "0"], deadline_seconds=MAX_DEADLINE_SECONDS)
+    with start_duplex(req) as child:
+        child.send_line(b"ping")
+        record = child.read_line()
+        assert isinstance(record, Record) and record.data.startswith(b"4:")
+        assert child.finish().exit_code == 0
 
 
 def test_server_mode_has_devnull_stdin_and_captured_stdout():

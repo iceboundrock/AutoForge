@@ -50,6 +50,7 @@ uses the same handle with ``stdin_pipe=False`` and
 from __future__ import annotations
 
 import enum
+import math
 import os
 import selectors
 import subprocess
@@ -82,6 +83,10 @@ from .executor import (
 DEFAULT_MAX_RECORD_BYTES = 4 * 1024 * 1024
 DEFAULT_MAX_PENDING_RECORDS = 1024
 DEFAULT_MAX_PENDING_BYTES = 16 * 1024 * 1024
+# Every wait on the handle is bounded by the remaining deadline, and the wait
+# primitives cannot take an arbitrarily large timeout (epoll's is an int of
+# milliseconds, about 24.8 days); a week is far above any agent timeout.
+MAX_DEADLINE_SECONDS = 7 * 24 * 3600
 
 
 class StdoutMode(enum.Enum):
@@ -343,8 +348,11 @@ class _RecordReader(_PipeDrain):
 def _validate(req: DuplexRequest) -> None:
     if not req.command:
         raise ExecutionError("empty command")
-    if not req.deadline_seconds > 0:
-        raise ExecutionError(f"deadline_seconds must be > 0, got {req.deadline_seconds}")
+    deadline = req.deadline_seconds
+    if not (math.isfinite(deadline) and 0 < deadline <= MAX_DEADLINE_SECONDS):
+        raise ExecutionError(
+            f"deadline_seconds must be finite, > 0 and <= {MAX_DEADLINE_SECONDS}, got {deadline}"
+        )
     for name in (
         "max_record_bytes",
         "max_pending_records",

@@ -155,7 +155,10 @@ it is held to the same contract:
   `ChildStdinClosedError`;
 - one absolute deadline bounds every `send_line`, `read_line` and `finish`.
   Past it the group is killed exactly as on `execute()`'s timeout, and the
-  result is `timed_out` with `exit_code = -1`;
+  result is `timed_out` with `exit_code = -1`. A deadline that is not
+  finite, not positive or above `MAX_DEADLINE_SECONDS` (a week, within what
+  every wait primitive can take) is refused with `ExecutionError` before
+  anything is spawned;
 - the `with` tears down on every exit, an exception or `KeyboardInterrupt`
   included: stdin is closed (an orderly-shutdown request), the child gets a
   bounded wait to exit (the deadline from `finish()`, at most the exit grace
