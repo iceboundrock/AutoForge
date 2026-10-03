@@ -42,11 +42,13 @@ strictly validated prompts from file templates, invokes `claude` /
 lists only, never a shell), parses the machine-readable `CONTROL_RESULT`
 block from agent output, and verifies every claim on GitHub before it
 advances state. Every invocation is logged, redacted, under
-`.autoforge/logs/<run-id>/`.
+`<state dir>/logs/<run-id>/`; the state directory defaults to `.autoforge/`
+for a remote run and to `<git dir>/autoforge/state` for a
+[local run](docs/local-mode.md#resume-and-recovery).
 
 It is a single-machine client tool, not a distributed service: one process
 on your own machine, driving your `git`, `gh`, and agent CLIs under your
-credentials, with local per-checkout state in `.autoforge/` and a single
+credentials, with local per-checkout state and a single
 OS-level repository lock instead of any coordinator. The expected failure
 modes are a `Ctrl-C`, a killed process, and a reboot, which is why side
 effects are checkpointed before they are performed. What *is* remote and

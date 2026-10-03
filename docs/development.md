@@ -36,7 +36,12 @@ interpreter in its own isolated environment (`uv run --isolated --locked
 `CI_PYTHON_VERSIONS`; `tests/test_ci_workflow.py` fails when that list, the
 workflow's matrix, or the mirrored commands drift apart.
 
-The workflow needs no secrets and is granted none. Its aggregate `ci` job is
+The workflow uses no repository or organization secrets, but its jobs are
+not credential-free: GitHub gives every run an automatic `GITHUB_TOKEN`, and
+the workflow's `permissions: contents: read` limits it to reading the
+repository. `actions/checkout` and `setup-uv` use that token by default
+(checkout also leaves it in the checkout's git config for the rest of the
+job); the tests themselves need no credential. The aggregate `ci` job is
 a single stable check name that survives adding or renaming a matrix entry,
 and it is required on `main` by a repository ruleset. That is what gives the
 controller's pre-merge gate ("every check on the PR succeeded") something

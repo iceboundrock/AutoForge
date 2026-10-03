@@ -287,7 +287,12 @@ A local run is durable and resumable exactly like a remote one: state lives in
 `<git dir>/autoforge/state/state.json`, is written atomically, and holds the
 mode, feature path, frozen hash, base HEAD, bound and reviewed fingerprints,
 review/fix rounds and open findings. `Ctrl-C` then `autoforge resume` continues
-from the persisted phase, re-reading the real working tree.
+from the persisted phase, re-reading the real working tree. Each agent
+invocation is logged, redacted, beside it under
+`<git dir>/autoforge/state/logs/<run-id>/`, not under `.autoforge/` as in a
+remote run. `--state-dir`, or a non-default `state_dir` in config, moves
+both; a directory inside the working tree is refused. Layout:
+[State and recovery: runtime artifacts](agent-guides/state-and-recovery.md#runtime-artifacts).
 
 ### The run contract
 
