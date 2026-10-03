@@ -384,15 +384,18 @@ def test_pi_require_oauth_rejects_a_non_boolean(value):
         PiProvider().validate_profile(_pi(options={"require_oauth": value}))
 
 
-def test_pi_execution_is_refused_until_the_rpc_adapter_lands():
+def test_pi_execution_never_goes_through_the_one_shot_runner(tmp_path):
+    """Pi runs over the duplex handle (#131); the injected runner is unused,
+    and a missing executable is a spawn failure, not a fallback."""
     from autoforge.errors import ExecutionError
 
     seen = []
     prov = PiProvider(runner=_capture_runner(seen))
-    req = AgentRequest("REVIEW", "p", "/tmp", _pi(), 7, env_allowlist=("PATH",))
-    with pytest.raises(ExecutionError, match="not implemented"):
+    profile = _pi(command=str(tmp_path / "no-such-pi"))
+    req = AgentRequest("REVIEW", "p", str(tmp_path), profile, 7, env_allowlist=("PATH",))
+    with pytest.raises(ExecutionError, match="no-such-pi"):
         prov.execute(req)
-    assert seen == []  # nothing was launched
+    assert seen == []  # the one-shot runner was never called
 
 
 def test_pi_environment_names_are_explicit_and_carry_no_provider_key():

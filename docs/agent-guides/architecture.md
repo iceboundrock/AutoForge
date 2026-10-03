@@ -51,7 +51,7 @@ AgentProvider
   -> ClaudeCodeProvider
   -> OpenCodeProvider
   -> PiProvider          (EPIC #127, ADR 0003: config, argv and doctor checks
-                          in #129; execution over RPC is #131)
+                          in #129; execution over RPC in #131)
 ```
 
 Provider adapters own:
@@ -74,15 +74,18 @@ through a shell.
 
 The provider layer is `providers.py` plus the protocol modules an adapter
 owns. Pi's wire protocol (JSON encoding and decoding, request ids, the event
-reducer, outcome classification) is planned in `pi_rpc.py`. It knows Pi's
+reducer, outcome classification) lives in `pi_rpc.py`, a pure reducer that
+`PiProvider` drives over the duplex child handle (`executor_duplex.py`). It knows Pi's
 command and event names, but no CLI flags and no processes. No CLI flag and
 no provider wire-protocol name appears outside the provider layer.
 
 A provider can report that a run failed inside its protocol even though the
 process exited 0. It does so through a provider-neutral optional
-`AgentExecutionResult.provider_failure` (planned with #131, ADR 0003 §2.6),
-which the engine treats like a non-zero exit: `ExecutionError`, state
-unchanged, stdout and stderr recorded. The engine names no provider in that
+`AgentExecutionResult.provider_failure` (ADR 0003 §2.6), which the engine
+treats like a non-zero exit: `ExecutionError`, state unchanged, stdout and
+stderr recorded. The engine checks `timed_out` first, then
+`provider_failure`, then the exit code, then the parser. A flat, bounded,
+redacted `provider_summary` (scalars only) goes to `execution.json`. The engine names no provider in that
 check. The adapter returns the text the parser reads as `stdout`, which for
 Pi is the final assistant message, never raw protocol records.
 

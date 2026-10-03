@@ -6166,6 +6166,9 @@ class ControllerEngine:
             record.descendants_killed = result.descendants_killed
             record.group_survived_kill = result.group_survived_kill
             record.capture_abandoned = result.capture_abandoned
+            # The adapter's own summary of the run (bounded, redacted, flat);
+            # recorded as given and never interpreted here.
+            record.provider_summary = dict(result.provider_summary)
             stdout, stderr = result.stdout or "", result.stderr or ""
             if result.timed_out:
                 record.error = _with_leftovers(f"timed out after {timeout}s", result.leftovers)
@@ -6176,6 +6179,20 @@ class ControllerEngine:
                         result.leftovers,
                     )
                     + ". State unchanged — inspect the real Git/GitHub state, then 'resume'."
+                )
+            if result.provider_failure:
+                # The run failed inside the provider's protocol, whatever the
+                # exit status: handled exactly like a failed exit, and checked
+                # before it because the reason says more (ADR 0003 §2.6).
+                record.error = _with_leftovers(result.provider_failure, result.leftovers)
+                self._record_invocation(logger, record, prompt, stdout, stderr, phase)
+                raise ExecutionError(
+                    _with_leftovers(
+                        f"agent '{profile.name}' failed: {result.provider_failure}",
+                        result.leftovers,
+                    )
+                    + f". stderr tail: {stderr[-2000:]} "
+                    "State unchanged — inspect logs, then 'resume'."
                 )
             if result.exit_code != 0:
                 record.error = _with_leftovers(f"exit {result.exit_code}", result.leftovers)

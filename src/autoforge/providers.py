@@ -41,9 +41,12 @@ run against an installed Pi)::
     pi --mode rpc --no-session --model <pi-provider>/<model-id> --thinking <effort>
 
   * the prompt never travels in argv: it is one JSON ``prompt`` record on
-    stdin. Running that RPC conversation is #131; until it lands
-    :meth:`PiProvider.execute` refuses with a typed error, and a dry run
-    renders the argv above.
+    stdin. The child runs under the duplex handle (executor_duplex.py) and
+    the conversation (``get_state``, ``get_available_models``, ``prompt``,
+    events until ``agent_settled``, ``get_last_assistant_text``) is the
+    reducer in pi_rpc.py; ``stdout`` of the result is the final assistant
+    text, never a protocol record, and an in-protocol failure is reported
+    in :attr:`AgentExecutionResult.provider_failure`.
   * ``--thinking`` takes ``off|minimal|low|medium|high|xhigh|max``; the model
     is ``provider/id`` with no ``:<thinking>`` suffix (ADR 0003 §2.2, §2.3).
   * no ``extra_args``: every flag that matters is the adapter's or #132's
@@ -66,12 +69,31 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .config import ProfileConfig
-from .errors import ConfigurationError, ExecutionError
-from .executor import ExecutionRequest, ExecutionResult, describe_leftovers, execute
+from .errors import ChildStdinClosedError, ConfigurationError, ExecutionTimeoutError
+from .executor import (
+    DEFAULT_MAX_OUTPUT_BYTES,
+    ExecutionRequest,
+    ExecutionResult,
+    describe_leftovers,
+    execute,
+)
+from .executor_duplex import (
+    DuplexChild,
+    DuplexRequest,
+    Eof,
+    Fragment,
+    Overflow,
+    Oversize,
+    Record,
+    Timeout,
+    start_duplex,
+)
+from .pi_rpc import PiConversation, encodable
 
 Runner = Callable[[ExecutionRequest], ExecutionResult]
 
@@ -114,6 +136,16 @@ class AgentExecutionResult:
     descendants_killed: bool = False
     group_survived_kill: bool = False
     capture_abandoned: bool = False
+    # A run that failed inside the provider's protocol although the process
+    # may have exited 0 (Pi shuts down in order whether its run failed or
+    # not): a short, bounded, already-redacted reason. The engine treats it
+    # like a non-zero exit (ADR 0003 §2.6). The one-shot CLI adapters never
+    # set it.
+    provider_failure: str | None = None
+    # A small flat mapping of scalars, bounded and redacted by the adapter,
+    # that the engine writes to ``execution.json`` under this key without
+    # interpreting it. Never raw protocol records or message contents.
+    provider_summary: dict[str, str | int | bool] = field(default_factory=dict)
 
     @property
     def stdout_tail(self) -> str:
@@ -349,6 +381,23 @@ def parse_pi_version(text: str) -> tuple[int, int, int] | None:
     return major, minor, patch
 
 
+# ADR 0003 §3: each stdio round trip around the prompt (`get_state`,
+# `get_available_models`, `get_last_assistant_text`) is bounded inside the
+# invocation's timeout. The first two also cover Pi's start-up (Node, its
+# settings and its model catalog), hence more than a bare round trip needs.
+PI_ROUND_TRIP_SECONDS = 15.0
+# How long an `abort` is given to settle a running prompt before stdin is
+# closed; taken from the end of the invocation's timeout (at most a quarter
+# of it), so the abort and the group kill both land within the timeout.
+PI_ABORT_SECONDS = 5.0
+# One stdout record carries at most one message (`message_update` repeats
+# the partial message so far, `get_last_assistant_text` the final text), and
+# JSON escaping can double a text; a final text past the stdout bound must
+# still arrive whole so that its tail can be kept.
+PI_MAX_RECORD_BYTES = 2 * DEFAULT_MAX_OUTPUT_BYTES + 1024 * 1024
+PI_MAX_PENDING_BYTES = 2 * PI_MAX_RECORD_BYTES
+
+
 PI_AUTH_STATUSES = ("ready", "not_ready", "invalid")
 PI_AUTH_REASONS = (
     "provider_not_found",
@@ -416,9 +465,11 @@ def parse_pi_auth_check(stdout: str, exit_code: int) -> PiAuthCheck:
 class PiProvider(AgentProvider):
     """Pi (``@earendil-works/pi-coding-agent``) over its stdio RPC mode (ADR 0003).
 
-    This class carries Pi's static surface: profile validation, the argv,
-    the environment names and the read-only ``doctor`` probes. Running the
-    RPC conversation is #131; until then :meth:`execute` refuses.
+    This class carries Pi's static surface (profile validation, the argv,
+    the environment names, the read-only ``doctor`` probes) and the driver
+    that couples the conversation in :mod:`autoforge.pi_rpc` to the duplex
+    child handle. The driver owns time and the process; the reducer owns
+    every Pi command and event name.
     """
 
     name = "pi"
@@ -479,11 +530,154 @@ class PiProvider(AgentProvider):
             profile.effort,
         ]
 
+    def __init__(
+        self,
+        runner: Runner | None = None,
+        *,
+        round_trip_seconds: float = PI_ROUND_TRIP_SECONDS,
+        abort_seconds: float = PI_ABORT_SECONDS,
+        max_text_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
+    ) -> None:
+        super().__init__(runner)
+        self.round_trip_seconds = round_trip_seconds
+        self.abort_seconds = abort_seconds
+        self.max_text_bytes = max_text_bytes
+
     def execute(self, req: AgentRequest) -> AgentExecutionResult:
-        raise ExecutionError(
-            f"profile {req.profile.name!r}: pi execution is not implemented yet "
-            "(the RPC adapter is #131); route this phase to another provider"
+        """One ``pi --mode rpc`` child, one prompt, one final text (ADR 0003).
+
+        The child gets ``req.timeout_seconds`` as its deadline. The last
+        ``abort_seconds`` of it (at most a quarter) are kept for the abort:
+        when the conversation is still running at that point it is cut
+        short, ``abort`` is sent, stdin is closed, and the duplex handle kills
+        the group if Pi has not exited by the deadline. The result is then
+        ``timed_out`` whatever Pi's exit status. A failure inside the
+        protocol is ``provider_failure``; ``exit_code`` is always the real
+        process status. A spawn failure raises :class:`ExecutionError`.
+        """
+        timeout = float(req.timeout_seconds)
+        abort_window = min(self.abort_seconds, timeout / 4)
+        conversation = PiConversation(
+            model=req.profile.model,
+            thinking=req.profile.effort,
+            prompt=req.prompt,
+            round_trip_seconds=self.round_trip_seconds,
         )
+        duplex = DuplexRequest(
+            command=self.build_command(req),
+            cwd=req.cwd,
+            env_allowlist=self.environment_allowlist(req),
+            deadline_seconds=timeout,
+            max_record_bytes=PI_MAX_RECORD_BYTES,
+            max_pending_bytes=PI_MAX_PENDING_BYTES,
+        )
+        with start_duplex(duplex) as child:
+            soft_deadline = time.monotonic() + timeout - abort_window
+            cut_short = self._converse(child, conversation, soft_deadline)
+            if cut_short:
+                conversation.deadline_reached()
+            if conversation.failure is not None:
+                self._abort(child, conversation, abort_window)
+            child.close_stdin()
+            res = child.finish()
+        timed_out = cut_short or res.timed_out
+        failure = conversation.failure
+        if conversation.exited_early:
+            failure = f"{failure} (exit {res.exit_code})"
+        elif res.records_overflowed and failure is None:
+            failure = "pi: protocol violation: stdout records arrived faster than they were read"
+        summary = conversation.summary()
+        if failure is not None:
+            summary["failure"] = failure
+        text = conversation.text if failure is None else None
+        stdout, truncated = _keep_tail(encodable(text or ""), self.max_text_bytes)
+        return AgentExecutionResult(
+            command=list(res.command),
+            exit_code=res.exit_code,
+            stdout=stdout,
+            stderr=res.stderr,
+            started_at=res.started_at,
+            finished_at=res.finished_at,
+            timed_out=timed_out,
+            provider=req.profile.provider,
+            model=req.profile.model,
+            effort=req.profile.effort,
+            stdout_truncated=truncated,
+            stderr_truncated=res.stderr_truncated,
+            stdout_tail_offset=0,
+            descendants_killed=res.descendants_killed,
+            group_survived_kill=res.group_survived_kill,
+            capture_abandoned=res.capture_abandoned,
+            # A timeout wins over whatever the protocol said (ADR 0003 §2.6).
+            provider_failure=None if timed_out else failure,
+            provider_summary=summary,
+        )
+
+    @staticmethod
+    def _send(child: DuplexChild, conversation: PiConversation, lines: list[bytes]) -> None:
+        for line in lines:
+            try:
+                child.send_line(line)
+            except ChildStdinClosedError:
+                conversation.stdin_closed()
+                return
+
+    def _converse(
+        self, child: DuplexChild, conversation: PiConversation, soft_deadline: float
+    ) -> bool:
+        """Drive the conversation to its outcome; True when the deadline cut it short."""
+        try:
+            self._send(child, conversation, conversation.start(time.monotonic()))
+            while not conversation.done:
+                now = time.monotonic()
+                if now >= soft_deadline:
+                    return True
+                conversation.tick(now)
+                if conversation.done:
+                    break
+                wake = conversation.next_wakeup
+                until = soft_deadline if wake is None else min(soft_deadline, wake)
+                item = child.read_line(timeout=max(0.0, until - now))
+                if isinstance(item, Record):
+                    replies = conversation.feed(item.data, time.monotonic())
+                    self._send(child, conversation, replies)
+                elif isinstance(item, Oversize):
+                    conversation.framing_error(f"a stdout record exceeded {item.limit} bytes")
+                elif isinstance(item, Fragment):
+                    conversation.framing_error("stdout ended inside an unterminated record")
+                elif isinstance(item, Overflow):
+                    conversation.framing_error("stdout records arrived faster than they were read")
+                elif isinstance(item, Eof):
+                    conversation.stream_ended()
+                elif item.deadline_exceeded:
+                    return True
+        except ExecutionTimeoutError:
+            return True  # a write overran the deadline; the group is gone
+        return False
+
+    def _abort(self, child: DuplexChild, conversation: PiConversation, window: float) -> None:
+        """Ask Pi to abort a running prompt and give it ``window`` seconds to settle.
+
+        Never SIGINT: Pi has no SIGINT handler in RPC mode (ADR 0003 §2.8).
+        Dialogs that arrive meanwhile are still answered.
+        """
+        end = time.monotonic() + window
+        try:
+            self._send(child, conversation, conversation.begin_abort(time.monotonic()))
+            while not conversation.abort_settled:
+                now = time.monotonic()
+                if now >= end:
+                    return
+                item = child.read_line(timeout=end - now)
+                if isinstance(item, Record):
+                    replies = conversation.feed(item.data, time.monotonic())
+                    self._send(child, conversation, replies)
+                elif isinstance(item, Eof | Overflow):
+                    return
+                elif isinstance(item, Timeout) and item.deadline_exceeded:
+                    return
+        except ExecutionTimeoutError:
+            return
 
     # -- read-only probes for `autoforge doctor` ---------------------------
     @staticmethod
@@ -582,6 +776,18 @@ class PiProvider(AgentProvider):
             f"{fields}: Pi's model or credential configuration is invalid; run `{command}` "
             "yourself to see why"
         )
+
+
+def _keep_tail(text: str, limit: int) -> tuple[str, bool]:
+    """``text``, or its last ``limit`` UTF-8 bytes and True when it is longer.
+
+    A character the cut splits decodes to U+FFFD, as the executor's capture
+    does at its bound.
+    """
+    data = text.encode("utf-8")
+    if len(data) <= limit:
+        return text, False
+    return data[-limit:].decode("utf-8", errors="replace"), True
 
 
 def _pi_model_problem(model: str) -> str:

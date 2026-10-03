@@ -40,6 +40,7 @@ replan policy and transaction         test_replan.py
 GitHub client, pre-merge evidence     test_github.py, test_premerge.py
 state, contract, filesystem boundary  test_state.py, test_durable_run_contract.py, test_safefs.py
 CONTROL_RESULT, prompts, providers    test_result_parser.py, test_prompts.py, test_providers.py
+Pi RPC reducer and adapter (fake pi)  test_pi_rpc.py
 executor, lock, redaction, run logs   test_executor.py, test_executor_duplex.py, test_lock.py,
                                       test_redaction.py, test_runlog.py
 LOCAL mode                            test_local*.py
