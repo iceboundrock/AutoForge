@@ -1,0 +1,924 @@
+"""Pi RPC adapter (#131, ADR 0003): the reducer, and the provider over a fake ``pi``.
+
+Deterministic only: no network, no real Pi, no credentials. The reducer
+tests feed :class:`PiConversation` synthetic records with no process; the
+provider tests run :class:`PiProvider` against a small Python script that
+plays a scripted RPC conversation. Every fixture is synthetic.
+"""
+
+from __future__ import annotations
+
+import itertools
+import json
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+from autoforge import executor, providers
+from autoforge.config import ProfileConfig
+from autoforge.errors import ExecutionError
+from autoforge.pi_rpc import PiConversation, js_trim
+from autoforge.providers import AgentRequest, PiProvider
+from autoforge.result_parser import parse_control_result
+from autoforge.transitions import Phase
+from tests.conftest import BRANCH, ISSUE, PR, SHA_A, block
+
+MODEL = "openai/gpt-5.6-terra"
+STATE = {
+    "model": {"provider": "openai", "id": "gpt-5.6-terra", "name": "GPT", "contextWindow": 1},
+    "thinkingLevel": "high",
+    "isStreaming": False,
+}
+MODELS = {
+    "models": [
+        {"provider": "openai", "id": "gpt-5.6-luna"},
+        {"provider": "openai", "id": "gpt-5.6-terra"},
+    ]
+}
+ANALYZE_OK = {
+    "phase": "ANALYZE_EXECUTE",
+    "status": "success",
+    "issue_url": ISSUE,
+    "pr_url": PR,
+    "head_sha": SHA_A,
+    "branch": BRANCH,
+}
+# What Pi returns: the text blocks of the last assistant message, trimmed.
+FINAL = js_trim(block(ANALYZE_OK))
+
+
+def assistant(text: str = FINAL, stop: str = "stop", **fields) -> dict:
+    """An assistant message whose text blocks join (then trim) to ``text``."""
+    half = len(text) // 2
+    content = [
+        {"type": "thinking", "thinking": "let me think"},
+        {"type": "text", "text": "\n" + text[:half]},
+        {"type": "toolCall", "id": "t1", "name": "bash", "arguments": {}},
+        {"type": "text", "text": text[half:] + "\n\n"},
+    ]
+    return {"role": "assistant", "content": content, "stopReason": stop, **fields}
+
+
+# -- the reducer, without a process ---------------------------------------------
+class Run:
+    """A conversation plus every record it asked to write, decoded."""
+
+    def __init__(self, thinking: str = "high", prompt: str = "do the work", **kw) -> None:
+        ids = (f"id-{n}" for n in itertools.count(1))
+        self.c = PiConversation(
+            model=MODEL,
+            thinking=thinking,
+            prompt=prompt,
+            round_trip_seconds=5,
+            new_id=lambda: next(ids),
+            **kw,
+        )
+        self.now = 100.0
+        self.raw: list[bytes] = list(self.c.start(self.now))
+
+    @property
+    def sent(self) -> list[dict]:
+        return [json.loads(line) for line in self.raw]
+
+    def types(self) -> list[str]:
+        return [s["type"] for s in self.sent]
+
+    def feed(self, record: dict | bytes) -> list[bytes]:
+        data = record if isinstance(record, bytes) else json.dumps(record).encode()
+        out = self.c.feed(data, self.now)
+        self.raw += out
+        return out
+
+    def id_of(self, command: str) -> str:
+        return [s["id"] for s in self.sent if s["type"] == command][-1]
+
+    def respond(self, command: str, data=None, success: bool = True, **extra) -> list[bytes]:
+        record = {"type": "response", "id": self.id_of(command), "command": command}
+        record["success"] = success
+        if data is not None:
+            record["data"] = data
+        record.update(extra)
+        return self.feed(record)
+
+    def verified(self) -> Run:
+        self.respond("get_state", STATE)
+        self.respond("get_available_models", MODELS)
+        return self
+
+    def started(self) -> Run:
+        self.verified().respond("prompt", {"disposition": "started"})
+        return self
+
+    def settle(self, message: dict | None = None) -> Run:
+        self.feed({"type": "message_end", "message": message or assistant()})
+        self.feed({"type": "agent_end", "messages": [], "willRetry": False})
+        self.feed({"type": "agent_settled"})
+        return self
+
+    def failure(self) -> str:
+        assert self.c.done and self.c.text is None, self.c.summary()
+        assert self.c.failure is not None
+        return self.c.failure
+
+
+def test_happy_path_returns_the_final_text_and_the_parser_accepts_it():
+    run = Run()
+    assert run.types() == ["get_state", "get_available_models"]
+    run.verified()
+    assert run.types()[-1] == "prompt"
+    assert run.sent[-1] == {"id": "id-3", "type": "prompt", "message": "do the work"}
+    run.respond("prompt", {"disposition": "started"})
+    run.feed({"type": "agent_start"})
+    run.feed({"type": "message_start", "message": {"role": "user", "content": "do the work"}})
+    partial = {"role": "assistant", "content": [{"type": "text", "text": "some"}]}
+    run.feed({"type": "message_update", "message": partial, "assistantMessageEvent": {}})
+    run.feed({"type": "tool_execution_start", "toolCallId": "t1", "toolName": "bash"})
+    run.feed({"type": "tool_execution_end", "toolCallId": "t1", "toolName": "bash"})
+    run.feed({"type": "message_end", "message": {"role": "toolResult", "content": []}})
+    run.feed({"type": "message_end", "message": assistant()})
+    run.feed({"type": "agent_end", "messages": [], "willRetry": False})
+    assert run.types()[-1] == "prompt"  # agent_end is never terminal
+    run.feed({"type": "agent_settled"})
+    assert run.types()[-1] == "get_last_assistant_text"
+    run.respond("get_last_assistant_text", {"text": FINAL})
+    assert run.c.done and run.c.failure is None
+    assert run.c.text == FINAL
+    assert parse_control_result(run.c.text, Phase.ANALYZE_EXECUTE) == ANALYZE_OK
+    summary = run.c.summary()
+    assert summary == {
+        "resolved_provider": "openai",
+        "resolved_model_id": "gpt-5.6-terra",
+        "resolved_thinking": "high",
+        "prompt_disposition": "started",
+        "stop_reason": "stop",
+        "agent_ends": 1,
+        "will_retry": 0,
+        "auto_retries": 0,
+        "auto_retry_failed": False,
+        "tool_executions": 1,
+        "ui_dialogs_cancelled": 0,
+        "ui_notifications_ignored": 0,
+        "unknown_events": 0,
+        "abort_sent": False,
+        "failure": "",
+    }
+    # One prompt, never steer/follow_up, never an abort on success.
+    assert run.types().count("prompt") == 1 and "abort" not in run.types()
+
+
+def test_commands_are_ascii_json_records_with_no_line_break():
+    run = Run(prompt="line one\nline two     \ud800 /template")
+    run.verified()
+    prompt_line = run.raw[-1]
+    assert b"\n" not in prompt_line and prompt_line.isascii()
+    assert json.loads(prompt_line)["message"].startswith("line one\nline two  ")
+    # A prompt that begins with `/` is sent as is; the disposition is the backstop.
+    assert Run(prompt="/review").verified().sent[-1]["message"] == "/review"
+
+
+# -- id correlation --------------------------------------------------------------
+def test_responses_out_of_order_are_correlated_by_id():
+    run = Run()
+    run.respond("get_available_models", MODELS)
+    assert run.types() == ["get_state", "get_available_models"]  # not yet
+    run.feed({"type": "some_future_event"})
+    run.respond("get_state", STATE)
+    assert run.types()[-1] == "prompt"
+
+
+def test_events_before_the_prompt_response_are_reduced():
+    run = Run().verified()
+    run.feed({"type": "agent_start"})
+    run.settle()
+    assert run.types()[-1] == "prompt"  # the prompt is not yet accepted
+    run.respond("prompt", {"disposition": "started"})
+    assert run.types()[-1] == "get_last_assistant_text"
+    run.respond("get_last_assistant_text", {"text": FINAL})
+    assert run.c.text == FINAL
+
+
+def test_a_response_to_an_unknown_id_is_a_protocol_failure():
+    run = Run()
+    run.feed({"type": "response", "id": "never-sent", "command": "get_state", "success": True})
+    assert "protocol violation" in run.failure() and "never sent" in run.failure()
+
+
+def test_a_second_response_to_the_same_id_is_a_protocol_failure():
+    run = Run()
+    run.respond("get_state", STATE)
+    run.respond("get_state", STATE)
+    assert "already answered" in run.failure()
+
+
+def test_a_response_naming_another_command_is_a_protocol_failure():
+    run = Run()
+    run.feed(
+        {"type": "response", "id": run.id_of("get_state"), "command": "prompt", "success": True}
+    )
+    assert "names command 'prompt'" in run.failure()
+
+
+def test_a_response_without_success_is_a_protocol_failure():
+    run = Run()
+    run.feed({"type": "response", "id": run.id_of("get_state"), "command": "get_state"})
+    assert "no boolean 'success'" in run.failure()
+
+
+# -- settlement --------------------------------------------------------------------
+def test_a_retry_after_agent_end_does_not_end_the_run_early():
+    run = Run().started()
+    run.feed({"type": "message_end", "message": assistant("", stop="error", errorMessage="503")})
+    run.feed({"type": "agent_end", "messages": [], "willRetry": True})
+    run.feed({"type": "auto_retry_start", "attempt": 1, "maxAttempts": 3, "delayMs": 10})
+    run.feed({"type": "auto_retry_end", "success": True, "attempt": 1})
+    assert "get_last_assistant_text" not in run.types()
+    run.settle()
+    assert run.types()[-1] == "get_last_assistant_text"
+    run.respond("get_last_assistant_text", {"text": FINAL})
+    assert run.c.text == FINAL
+    summary = run.c.summary()
+    assert summary["agent_ends"] == 2 and summary["will_retry"] == 1
+    assert summary["auto_retries"] == 1 and summary["auto_retry_failed"] is False
+
+
+def test_exhausted_retries_are_a_failure_with_the_final_error():
+    run = Run().started()
+    run.feed({"type": "message_end", "message": assistant("", stop="error", errorMessage="x")})
+    run.feed({"type": "agent_end", "messages": [], "willRetry": True})
+    run.feed({"type": "auto_retry_start", "attempt": 3})
+    run.feed({"type": "auto_retry_end", "success": False, "finalError": "model is at capacity"})
+    run.feed({"type": "agent_settled"})
+    assert run.failure() == "pi: automatic retries failed: model is at capacity"
+    assert "get_last_assistant_text" not in run.types()
+    assert run.c.summary()["auto_retry_failed"] is True
+
+
+def test_agent_settled_before_the_prompt_is_sent_is_not_the_end():
+    run = Run()
+    run.feed({"type": "agent_settled"})
+    run.verified().respond("prompt", {"disposition": "started"})
+    assert run.types()[-1] == "prompt" and not run.c.done
+
+
+# -- prompt outcomes ------------------------------------------------------------------
+def test_a_rejected_prompt_is_a_failure_with_its_bounded_error():
+    run = Run().verified()
+    run.respond("prompt", success=False, error="No API key found for openai.\nLog in first.")
+    assert run.failure() == (
+        "pi: prompt rejected before acceptance: No API key found for openai. Log in first."
+    )
+
+
+@pytest.mark.parametrize("disposition", ["queued", "handled", "deferred-ish", None])
+def test_a_prompt_disposition_other_than_started_is_a_protocol_failure(disposition):
+    run = Run().verified()
+    run.respond("prompt", {} if disposition is None else {"disposition": disposition})
+    failure = run.failure()
+    assert "protocol violation" in failure
+    if disposition is not None:
+        assert f"disposition '{disposition}'" in failure
+    assert "get_last_assistant_text" not in run.types()
+
+
+# -- after acceptance ------------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        (
+            "Token refresh failed: invalid_grant (OAuth refresh)",
+            "pi: model error after acceptance: Token refresh failed: invalid_grant (OAuth refresh)",
+        ),
+        (
+            '429 {"error":{"code":"subscription_sharing_usage_limit_exceeded"}}',
+            "pi: subscription usage limit reached",
+        ),
+        (None, "pi: model error after acceptance: no error message"),
+    ],
+)
+def test_stop_reason_error_is_a_provider_failure(message, expected):
+    run = Run().started()
+    fields = {} if message is None else {"errorMessage": message}
+    run.settle(assistant("partial", stop="error", **fields))
+    assert run.failure() == expected
+    assert run.c.summary()["stop_reason"] == "error"
+
+
+def test_stop_reason_aborted_is_a_provider_failure():
+    run = Run().started().settle(assistant("partial", stop="aborted"))
+    assert run.failure() == "pi: the run was aborted, not by AutoForge"
+
+
+def test_stop_reason_length_is_a_provider_failure_and_is_recorded():
+    # Pi 1.0.1 drops a cut-off answer from its context, so the text cannot be
+    # read back; get_last_assistant_text is never asked.
+    run = Run().started().settle(assistant(stop="length"))
+    assert run.failure() == "pi: the model hit its output limit (stopReason length)"
+    assert run.c.summary()["stop_reason"] == "length"
+    assert "get_last_assistant_text" not in run.types()
+
+
+@pytest.mark.parametrize("stop", ["toolUse", "deferred", "pending", "later", None])
+def test_any_other_final_stop_reason_is_a_protocol_failure(stop):
+    message = assistant()
+    if stop is None:
+        del message["stopReason"]
+    else:
+        message["stopReason"] = stop
+    run = Run().started().settle(message)
+    assert "protocol violation: final stopReason" in run.failure()
+
+
+def test_a_run_with_no_assistant_message_is_no_assistant_text():
+    run = Run().started()
+    run.feed({"type": "agent_end", "messages": []})
+    run.feed({"type": "agent_settled"})
+    assert run.failure().startswith("pi: no assistant text")
+
+
+def test_secrets_in_pi_errors_are_redacted_and_bounded():
+    run = Run().started()
+    secret = "sk-proj-" + "a" * 40
+    run.settle(assistant("x", stop="error", errorMessage=f"bad key {secret} " + "y" * 5000))
+    failure = run.failure()
+    assert secret not in failure and "***REDACTED***" in failure
+    assert len(failure) <= 400
+    assert secret not in json.dumps(run.c.summary())
+
+
+# -- model and thinking verification -------------------------------------------------
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        (
+            {"provider": "openai-codex", "id": "gpt-5.6-terra"},
+            "Pi resolved openai-codex/gpt-5.6-terra",
+        ),
+        (
+            {"provider": "openai", "id": "gpt-5.6-terra-mini"},
+            "Pi resolved openai/gpt-5.6-terra-mini",
+        ),
+        ({"provider": "openai", "id": "GPT-5.6-Terra"}, "Pi resolved openai/GPT-5.6-Terra"),
+    ],
+)
+def test_a_model_mismatch_fails_before_the_prompt(model, expected):
+    run = Run()
+    run.respond("get_state", {**STATE, "model": model})
+    run.respond("get_available_models", MODELS)
+    assert run.failure() == f"pi: model mismatch: configured {MODEL}, {expected}"
+    assert "prompt" not in run.types()
+    assert run.c.summary()["resolved_model_id"] == model["id"]
+
+
+def test_a_thinking_clamp_fails_before_the_prompt():
+    run = Run(thinking="minimal")
+    run.respond("get_state", {**STATE, "thinkingLevel": "low"})
+    run.respond("get_available_models", MODELS)
+    assert run.failure().startswith("pi: thinking mismatch: configured minimal, Pi resolved low")
+    assert "prompt" not in run.types()
+
+
+def test_a_missing_model_is_model_unavailable():
+    run = Run()
+    run.respond("get_state", {"thinkingLevel": "high"})
+    assert run.failure() == f"pi: model unavailable: Pi resolved no model for {MODEL}"
+
+
+def test_a_placeholder_model_outside_the_available_list_is_model_unavailable():
+    """Pi starts with a placeholder whose id equals the configured string, so
+    get_state matches; only get_available_models shows it does not exist."""
+    run = Run()
+    run.respond("get_available_models", {"models": [{"provider": "openai", "id": "gpt-5.6-luna"}]})
+    run.respond("get_state", STATE)
+    assert run.failure().startswith(f"pi: model unavailable: {MODEL} is not among")
+    assert "prompt" not in run.types()
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        None,
+        {"model": "openai/gpt-5.6-terra", "thinkingLevel": "high"},
+        {"model": {"provider": "openai"}, "thinkingLevel": "high"},
+        {"model": STATE["model"]},
+    ],
+)
+def test_a_get_state_missing_a_required_field_fails_closed(data):
+    run = Run()
+    run.respond("get_state", data)
+    assert "protocol violation" in run.failure()
+
+
+def test_get_available_models_without_a_list_fails_closed():
+    run = Run()
+    run.respond("get_available_models", {"models": "openai/gpt-5.6-terra"})
+    assert "no 'models' list" in run.failure()
+
+
+# -- final text ---------------------------------------------------------------------------
+@pytest.mark.parametrize("data", [{}, {"text": None}, {"text": 7}, {"text": " \n﻿"}])
+def test_no_assistant_text_is_a_provider_failure(data):
+    """Pi sends ``data: {}`` (the key absent) although its docs say ``null``."""
+    run = Run().started().settle()
+    run.respond("get_last_assistant_text", data)
+    assert run.failure() == "pi: no assistant text: the run ended without a final answer"
+
+
+def test_a_final_text_that_differs_from_the_last_message_end_is_a_protocol_failure():
+    run = Run().started().settle()
+    run.respond("get_last_assistant_text", {"text": FINAL + " and one more line"})
+    assert "differs from the text of the last assistant message_end" in run.failure()
+
+
+def test_the_cross_check_trims_as_javascript_does():
+    """U+FEFF is trimmed by JS and not by Python; U+001C the other way round."""
+    text = "\x1cfinal answer   kept"
+    run = Run().started()
+    run.settle(assistant("﻿" + text + "　"))
+    run.respond("get_last_assistant_text", {"text": text})
+    assert run.c.text == text
+    assert js_trim("﻿\x1c x \x85") == "\x1c x \x85"
+
+
+def test_an_aborted_empty_message_is_skipped_like_pi_skips_it():
+    run = Run().started()
+    run.feed({"type": "message_end", "message": assistant()})
+    run.feed(
+        {"type": "message_end", "message": {**assistant(), "content": [], "stopReason": "aborted"}}
+    )
+    run.feed({"type": "message_end", "message": assistant()})
+    run.feed({"type": "agent_settled"})
+    run.respond("get_last_assistant_text", {"text": FINAL})
+    assert run.c.text == FINAL
+
+
+# -- framing hazards and malformed records ----------------------------------------------
+def test_u2028_and_u2029_inside_a_json_string_are_content():
+    run = Run().started()
+    text = "before middle after"
+    record = json.dumps({"type": "message_end", "message": assistant(text)}, ensure_ascii=False)
+    run.feed(record.encode("utf-8"))
+    run.feed({"type": "agent_settled"})
+    run.respond("get_last_assistant_text", {"text": text})
+    assert run.c.text == text
+
+
+def test_a_parse_error_response_is_a_protocol_failure():
+    run = Run()
+    run.feed(
+        {"type": "response", "command": "parse", "success": False, "error": "Unexpected token"}
+    )
+    assert run.failure() == (
+        "pi: protocol violation: Pi could not parse a command: Unexpected token"
+    )
+
+
+@pytest.mark.parametrize(
+    "data", [b"not json", b"\xff\xfe{}", b"[1, 2]", b'{"no": "type"}', b'{"type": 3}']
+)
+def test_a_record_that_is_not_a_typed_json_object_is_a_protocol_failure(data):
+    run = Run()
+    run.feed(data)
+    assert "protocol violation" in run.failure()
+
+
+def test_system_and_user_message_ends_are_not_the_answer():
+    # Pi 1.0.1 emits the system prompt and the user prompt as message_end
+    # records of their own before the assistant's.
+    run = Run().started()
+    run.feed({"type": "message_end", "message": {"role": "system", "content": ""}})
+    user = {"role": "user", "content": [{"type": "text", "text": "do the work"}]}
+    run.feed({"type": "message_end", "message": user})
+    run.settle()
+    run.respond("get_last_assistant_text", {"text": FINAL})
+    assert run.c.text == FINAL
+
+
+def test_unknown_events_are_ignored_and_counted():
+    run = Run().started()
+    run.feed({"type": "brand_new_event", "payload": {"x": 1}})
+    run.feed({"type": "another_one"})
+    run.feed({"type": "turn_end"})  # known, deliberately ignored
+    run.feed({"type": "entry_appended", "entry": {"type": "context_edit"}})  # known too
+    run.settle()
+    run.respond("get_last_assistant_text", {"text": FINAL})
+    assert run.c.text == FINAL and run.c.summary()["unknown_events"] == 2
+
+
+# -- extension UI ---------------------------------------------------------------------------
+def test_a_dialog_is_cancelled_at_once_and_fails_the_run():
+    run = Run().started()
+    notify = {"type": "extension_ui_request", "id": "ui-1", "method": "notify", "message": "hi"}
+    assert run.feed(notify) == [] and not run.c.done
+    out = run.feed(
+        {"type": "extension_ui_request", "id": "ui-2", "method": "confirm", "title": "Run rm?"}
+    )
+    assert out == [b'{"type":"extension_ui_response","id":"ui-2","cancelled":true}']
+    assert run.failure() == "pi: an extension asked for input (confirm); the dialog was cancelled"
+    # Later dialogs are still answered, so an `editor` can never wait forever.
+    later = run.feed({"type": "extension_ui_request", "id": "ui-3", "method": "editor"})
+    assert later == [b'{"type":"extension_ui_response","id":"ui-3","cancelled":true}']
+    summary = run.c.summary()
+    assert summary["ui_dialogs_cancelled"] == 2 and summary["ui_notifications_ignored"] == 1
+
+
+def test_an_unknown_extension_ui_method_fails_closed():
+    run = Run().started()
+    assert run.feed({"type": "extension_ui_request", "id": "u", "method": "teleport"}) == []
+    assert "cannot answer ('teleport')" in run.failure()
+
+
+@pytest.mark.parametrize("method", [["confirm"], {"m": "confirm"}, None, 7])
+def test_a_non_string_extension_ui_method_fails_closed(method):
+    run = Run().started()
+    record = {"type": "extension_ui_request", "id": "u", "method": method}
+    assert run.feed(record) == []
+    assert run.failure() == (
+        "pi: protocol violation: an extension UI request without a string 'method'"
+    )
+
+
+# -- bounds and lifecycle --------------------------------------------------------------------
+def test_an_unanswered_round_trip_fails_at_its_bound():
+    run = Run()
+    assert run.c.next_wakeup == 105.0
+    run.c.tick(104.9)
+    assert not run.c.done
+    run.c.tick(105.0)
+    assert run.failure() == "pi: no response to get_state within 5s"
+
+
+def test_the_prompt_round_trip_is_not_bounded_but_the_text_round_trip_is():
+    run = Run().verified()
+    assert run.c.next_wakeup is None
+    run.respond("prompt", {"disposition": "started"})
+    run.now = 500.0
+    run.settle()
+    assert run.c.next_wakeup == 505.0
+
+
+@pytest.mark.parametrize(
+    ("steps", "stage"),
+    [
+        (0, "before answering get_state and get_available_models"),
+        (1, "before answering the prompt"),
+        (2, "before agent_settled"),
+        (3, "before answering get_last_assistant_text"),
+    ],
+)
+def test_an_early_end_of_stdout_names_the_stage(steps, stage):
+    run = Run()
+    if steps >= 1:
+        run.verified()
+    if steps >= 2:
+        run.respond("prompt", {"disposition": "started"})
+    if steps >= 3:
+        run.settle()
+    run.c.stream_ended()
+    assert run.failure() == f"pi: exited {stage}" and run.c.exited_early
+
+
+def test_abort_is_offered_only_for_a_running_prompt():
+    run = Run()
+    assert run.c.begin_abort(run.now) == [] and run.c.abort_settled
+    run.started()
+    run.c.deadline_reached()
+    [line] = run.c.begin_abort(run.now)
+    assert json.loads(line)["type"] == "abort" and not run.c.abort_settled
+    assert run.c.begin_abort(run.now) == []  # once
+    run.feed(
+        {"type": "response", "id": json.loads(line)["id"], "command": "abort", "success": True}
+    )
+    run.feed({"type": "agent_settled"})
+    assert run.c.abort_settled and run.c.summary()["abort_sent"] is True
+    assert run.c.failure.startswith("pi: the deadline was reached")
+
+
+# -- the provider over a fake `pi` ------------------------------------------------------------
+_FAKE_PI = r"""
+import json, subprocess, sys, time
+scenario = json.load(open(sys.argv[1]))
+log = open(scenario["log"], "a")
+log.write(json.dumps({"argv": sys.argv[2:]}) + "\n")
+log.flush()
+out = sys.stdout.buffer
+eol = b"\r\n" if scenario.get("crlf") else b"\n"
+ids = {}
+
+def emit(obj):
+    out.write(json.dumps(obj, ensure_ascii=False).encode("utf-8") + eol)
+    out.flush()
+
+def run(actions):
+    for a in actions:
+        if "respond" in a:
+            command = a["respond"]
+            r = {"type": "response", "id": a.get("id", ids.get(command)), "command": command,
+                 "success": a.get("success", True)}
+            for key in ("data", "error"):
+                if key in a:
+                    r[key] = a[key]
+            emit(r)
+        elif "emit" in a:
+            emit(a["emit"])
+        elif "raw" in a:
+            out.write(a["raw"].encode("utf-8"))
+            out.flush()
+        elif "stderr" in a:
+            sys.stderr.write(a["stderr"])
+            sys.stderr.flush()
+        elif "sleep" in a:
+            time.sleep(a["sleep"])
+        elif "spawn_holder" in a:
+            holder = "import time; time.sleep(%d)" % a["spawn_holder"]
+            subprocess.Popen([sys.executable, "-c", holder])
+        elif "exit" in a:
+            sys.exit(a["exit"])
+
+run(scenario.get("start", []))
+for line in sys.stdin.buffer:
+    log.write(json.dumps({"stdin": line.decode("utf-8")}) + "\n")
+    log.flush()
+    command = json.loads(line)
+    ids[command["type"]] = command.get("id")
+    run(scenario["on"].get(command["type"], []))
+run(scenario.get("eof", [{"exit": 0}]))
+"""
+
+
+def _happy(text: str = FINAL, events: list[dict] | None = None) -> dict:
+    stream = events or [
+        {"type": "agent_start"},
+        {"type": "message_update", "message": {"role": "assistant", "content": []}},
+        {"type": "message_end", "message": assistant(text)},
+        {"type": "agent_end", "messages": [], "willRetry": False},
+        {"type": "agent_settled"},
+    ]
+    return {
+        "on": {
+            "get_state": [{"respond": "get_state", "data": STATE}],
+            "get_available_models": [{"respond": "get_available_models", "data": MODELS}],
+            "prompt": [{"respond": "prompt", "data": {"disposition": "started"}}]
+            + [{"emit": e} for e in stream],
+            "get_last_assistant_text": [
+                {"respond": "get_last_assistant_text", "data": {"text": text}}
+            ],
+            "abort": [{"respond": "abort"}, {"emit": {"type": "agent_settled"}}],
+        }
+    }
+
+
+class FakePi:
+    def __init__(self, tmp_path: Path, scenario: dict) -> None:
+        self.log = tmp_path / "fake-pi.log"
+        scenario = {**scenario, "log": str(self.log)}
+        script = tmp_path / "fake_pi.py"
+        script.write_text(_FAKE_PI, encoding="utf-8")
+        spec = tmp_path / "scenario.json"
+        spec.write_text(json.dumps(scenario), encoding="utf-8")
+        self.command = tmp_path / "pi"
+        self.command.write_text(
+            f'#!/bin/sh\nexec "{sys.executable}" "{script}" "{spec}" "$@"\n', encoding="utf-8"
+        )
+        self.command.chmod(0o755)
+
+    def entries(self) -> list[dict]:
+        return [json.loads(line) for line in self.log.read_text(encoding="utf-8").splitlines()]
+
+    def stdin(self) -> list[str]:
+        return [e["stdin"] for e in self.entries() if "stdin" in e]
+
+    def commands(self) -> list[str]:
+        return [json.loads(line)["type"] for line in self.stdin()]
+
+    def argv(self) -> list[str]:
+        return next(e["argv"] for e in self.entries() if "argv" in e)
+
+
+def _profile(command: Path, effort: str = "high") -> ProfileConfig:
+    return ProfileConfig(
+        name="analyze_execute", provider="pi", model=MODEL, effort=effort, command=str(command)
+    )
+
+
+def _execute(tmp_path, scenario, timeout=20, prompt="implement #131", **kw):
+    fake = FakePi(tmp_path, scenario)
+    provider = PiProvider(round_trip_seconds=5, abort_seconds=1, **kw)
+    req = AgentRequest(
+        phase="ANALYZE_EXECUTE",
+        prompt=prompt,
+        cwd=str(tmp_path),
+        profile=_profile(fake.command),
+        timeout_seconds=timeout,
+        env_allowlist=("PATH",),
+    )
+    return provider.execute(req), fake
+
+
+def test_provider_happy_path_returns_the_final_text_byte_for_byte(tmp_path):
+    res, fake = _execute(tmp_path, _happy())
+    assert res.provider_failure is None and not res.timed_out and res.exit_code == 0
+    assert res.stdout == FINAL and res.stdout_tail_offset == 0 and not res.stdout_truncated
+    assert parse_control_result(res.stdout_tail, Phase.ANALYZE_EXECUTE) == ANALYZE_OK
+    assert fake.commands() == [
+        "get_state",
+        "get_available_models",
+        "prompt",
+        "get_last_assistant_text",
+    ]
+    assert json.loads(fake.stdin()[2])["message"] == "implement #131"
+    # The prompt is never in argv: it travelled as the stdin record above.
+    assert fake.argv() == ["--mode", "rpc", "--no-session", "--model", MODEL, "--thinking", "high"]
+    assert "implement #131" not in " ".join(res.command)
+    assert (res.provider, res.model, res.effort) == ("pi", MODEL, "high")
+    assert res.provider_summary["stop_reason"] == "stop"
+    assert res.provider_summary["resolved_model_id"] == "gpt-5.6-terra"
+    assert not (res.descendants_killed or res.group_survived_kill or res.capture_abandoned)
+
+
+def test_provider_crlf_records_and_raw_u2028_in_strings(tmp_path):
+    text = js_trim(block(ANALYZE_OK)) + "\n  tail   end"
+    scenario = {**_happy(text), "crlf": True}
+    res, _ = _execute(tmp_path, scenario)
+    assert res.provider_failure is None and res.stdout == text
+
+
+def test_provider_stderr_is_never_parsed(tmp_path):
+    fake_block = block({**ANALYZE_OK, "branch": "from-stderr"})
+    noise = '{"type":"response","id":"x","success":true}\n' + fake_block
+    scenario = _happy()
+    scenario["start"] = [{"stderr": noise}]
+    scenario["on"]["prompt"].insert(1, {"stderr": '{"type":"agent_settled"}\n'})
+    res, _ = _execute(tmp_path, scenario)
+    assert res.provider_failure is None and res.stdout == FINAL
+    assert parse_control_result(res.stdout, Phase.ANALYZE_EXECUTE)["branch"] == BRANCH
+    assert "from-stderr" in res.stderr and "from-stderr" not in res.stdout
+
+
+def test_provider_a_non_json_stdout_line_is_a_protocol_failure(tmp_path):
+    scenario = _happy()
+    scenario["on"]["prompt"].insert(1, {"raw": "Loading extensions...\n"})
+    res, fake = _execute(tmp_path, scenario)
+    assert res.provider_failure == "pi: protocol violation: a stdout record is not JSON"
+    assert res.exit_code == 0 and not res.timed_out and res.stdout == ""
+    # The running prompt was aborted, then stdin closed (Pi exited on EOF).
+    assert fake.commands()[-1] == "abort"
+    assert res.provider_summary["failure"] == res.provider_failure
+
+
+def test_provider_a_parse_error_response_is_a_protocol_failure(tmp_path):
+    scenario = _happy()
+    scenario["on"]["get_state"] = [
+        {"emit": {"type": "response", "command": "parse", "success": False, "error": "bad"}}
+    ]
+    res, fake = _execute(tmp_path, scenario)
+    assert res.provider_failure == "pi: protocol violation: Pi could not parse a command: bad"
+    assert "prompt" not in fake.commands()
+
+
+def test_provider_an_oversize_record_is_a_protocol_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(providers, "PI_MAX_RECORD_BYTES", 1024)
+    monkeypatch.setattr(providers, "PI_MAX_PENDING_BYTES", 4096)
+    scenario = _happy()
+    scenario["on"]["prompt"].insert(
+        1, {"raw": '{"type":"message_update","x":"' + "a" * 5000 + '"}\n'}
+    )
+    res, _ = _execute(tmp_path, scenario)
+    assert res.provider_failure == "pi: protocol violation: a stdout record exceeded 1024 bytes"
+
+
+def test_provider_a_response_to_an_unknown_id_is_a_protocol_failure(tmp_path):
+    scenario = _happy()
+    scenario["on"]["get_state"] = [{"respond": "get_state", "data": STATE, "id": "bogus"}]
+    res, _ = _execute(tmp_path, scenario)
+    assert "a response to an id AutoForge never sent" in res.provider_failure
+
+
+def test_provider_out_of_order_responses_interleaved_with_events(tmp_path):
+    scenario = _happy()
+    scenario["on"]["get_state"] = [{"emit": {"type": "queue_update"}}]
+    scenario["on"]["get_available_models"] = [
+        {"respond": "get_available_models", "data": MODELS},
+        {"emit": {"type": "unrelated_event"}},
+        {"respond": "get_state", "data": STATE},
+    ]
+    res, _ = _execute(tmp_path, scenario)
+    assert res.provider_failure is None and res.stdout == FINAL
+    assert res.provider_summary["unknown_events"] == 1
+
+
+@pytest.mark.parametrize("code", [0, 1])
+def test_provider_an_exit_before_settling_names_the_real_exit_code(tmp_path, code):
+    scenario = _happy()
+    scenario["on"]["prompt"] = [
+        {"respond": "prompt", "data": {"disposition": "started"}},
+        {"stderr": "fatal: out of memory\n"},
+        {"exit": code},
+    ]
+    res, _ = _execute(tmp_path, scenario)
+    assert res.provider_failure == f"pi: exited before agent_settled (exit {code})"
+    assert res.exit_code == code and not res.timed_out
+    assert "out of memory" in res.stderr
+
+
+def test_provider_a_model_mismatch_never_sends_the_prompt(tmp_path):
+    scenario = _happy()
+    scenario["on"]["get_state"] = [
+        {"respond": "get_state", "data": {**STATE, "thinkingLevel": "medium"}}
+    ]
+    res, fake = _execute(tmp_path, scenario)
+    assert res.provider_failure.startswith("pi: thinking mismatch: configured high")
+    assert "prompt" not in fake.commands() and "abort" not in fake.commands()
+    assert res.exit_code == 0
+
+
+def test_provider_extension_dialog_is_cancelled_with_the_exact_record(tmp_path):
+    scenario = _happy()
+    scenario["on"]["prompt"] = [
+        {"respond": "prompt", "data": {"disposition": "started"}},
+        {
+            "emit": {
+                "type": "extension_ui_request",
+                "id": "ui-7",
+                "method": "notify",
+                "message": "x",
+            }
+        },
+        {"emit": {"type": "extension_ui_request", "id": "ui-8", "method": "confirm", "title": "?"}},
+    ]
+    res, fake = _execute(tmp_path, scenario)
+    assert '{"type":"extension_ui_response","id":"ui-8","cancelled":true}\n' in fake.stdin()
+    assert not any('"ui-7"' in line for line in fake.stdin())  # notify is not answered
+    assert res.provider_failure == (
+        "pi: an extension asked for input (confirm); the dialog was cancelled"
+    )
+    assert fake.commands()[-1] == "abort"
+    assert res.provider_summary["ui_dialogs_cancelled"] == 1
+
+
+def test_provider_a_malformed_extension_ui_method_is_a_provider_failure(tmp_path):
+    scenario = _happy()
+    scenario["on"]["prompt"] = [
+        {"respond": "prompt", "data": {"disposition": "started"}},
+        {"emit": {"type": "extension_ui_request", "id": "ui-9", "method": ["confirm"]}},
+    ]
+    res, fake = _execute(tmp_path, scenario)
+    assert res.provider_failure == (
+        "pi: protocol violation: an extension UI request without a string 'method'"
+    )
+    assert not any('"ui-9"' in line for line in fake.stdin())
+    assert fake.commands()[-1] == "abort"
+
+
+def test_provider_deadline_mid_stream_aborts_then_closes_stdin(tmp_path):
+    scenario = _happy()
+    scenario["on"]["prompt"] = [
+        {"respond": "prompt", "data": {"disposition": "started"}},
+        {"emit": {"type": "agent_start"}},
+    ]
+    started = time.monotonic()
+    res, fake = _execute(tmp_path, scenario, timeout=2)
+    assert time.monotonic() - started < 10
+    assert res.timed_out and res.provider_failure is None and res.stdout == ""
+    assert res.exit_code == 0  # Pi settled the abort and exited on stdin EOF
+    assert fake.commands()[-1] == "abort"
+    assert res.provider_summary["abort_sent"] is True
+    assert res.provider_summary["failure"].startswith("pi: the deadline was reached")
+
+
+def test_provider_a_pi_that_ignores_abort_and_stdin_close_is_killed(tmp_path):
+    scenario = _happy()
+    scenario["on"]["prompt"] = [{"respond": "prompt", "data": {"disposition": "started"}}]
+    scenario["on"]["abort"] = []
+    scenario["eof"] = [{"sleep": 60}]
+    started = time.monotonic()
+    res, fake = _execute(tmp_path, scenario, timeout=2)
+    assert time.monotonic() - started < 2 + executor._KILL_GRACE_SECONDS + 5
+    assert res.timed_out and res.exit_code == -1
+    assert "abort" in fake.commands()
+
+
+def test_provider_a_pipe_holding_child_is_killed_and_reported(tmp_path, monkeypatch):
+    monkeypatch.setattr(executor, "_EXIT_GRACE_SECONDS", 0.5)
+    scenario = {**_happy(), "start": [{"spawn_holder": 30}]}
+    res, _ = _execute(tmp_path, scenario)
+    assert res.provider_failure is None and res.stdout == FINAL and res.exit_code == 0
+    assert res.descendants_killed and not res.timed_out
+
+
+def test_provider_keeps_the_tail_of_a_text_past_the_bound(tmp_path):
+    text = "x" * 300 + "é" + FINAL
+    res, _ = _execute(tmp_path, _happy(text), max_text_bytes=len(FINAL.encode()) + 1)
+    assert res.stdout_truncated and res.stdout_tail_offset == 0
+    assert res.stdout == "�" + FINAL  # the cut split the two-byte character
+    assert parse_control_result(res.stdout_tail, Phase.ANALYZE_EXECUTE) == ANALYZE_OK
+
+
+def test_provider_a_spawn_failure_raises_execution_error(tmp_path):
+    provider = PiProvider()
+    req = AgentRequest(
+        "REVIEW", "p", str(tmp_path), _profile(tmp_path / "no-such-pi"), 5, env_allowlist=("PATH",)
+    )
+    with pytest.raises(ExecutionError):
+        provider.execute(req)

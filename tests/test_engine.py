@@ -5706,6 +5706,129 @@ def test_failed_exit_names_what_the_agent_left_behind(tmp_state_dir, fake_github
     assert event["capture_abandoned"] is True
 
 
+def _step_dir(eng):
+    run_dir = eng.paths.logs_dir / eng.state.run_id
+    return run_dir, next(p for p in run_dir.iterdir() if p.is_dir())
+
+
+def test_a_provider_failure_raises_before_the_parser_and_is_journaled(tmp_state_dir, fake_github):
+    """#131: a protocol-level failure (here: Pi rejected the prompt) is its own
+    error, even with a well-formed block on stdout and exit 0; the run log
+    keeps the reason and the provider summary, and state does not move."""
+    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    reason = "pi: prompt rejected before acceptance: No API key found for openai."
+    summary = {"resolved_model_id": "gpt-5.6-terra", "agent_ends": 0, "abort_sent": False}
+    provider = _LeftoverProvider(
+        block(ANALYZE_OK), provider_failure=reason, provider_summary=summary
+    )
+    _install(eng, provider)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    with pytest.raises(ExecutionError) as excinfo:
+        eng.step()
+    message = str(excinfo.value)
+    assert message.startswith(f"agent 'analyze_execute' failed: {reason}. stderr tail: boom")
+    assert message.endswith("then 'resume'.")
+    assert eng.state.phase == Phase.ANALYZE_EXECUTE and len(provider.calls) == 1
+    assert load_state(eng.paths.state_file).phase == Phase.ANALYZE_EXECUTE
+    run_dir, step = _step_dir(eng)
+    execution = json.loads((step / "execution.json").read_text(encoding="utf-8"))
+    assert execution["error"] == reason and execution["exit_code"] == 0
+    assert execution["provider_summary"] == summary
+    assert reason in (step / "error.txt").read_text(encoding="utf-8")
+    assert (step / "stderr.log").read_text(encoding="utf-8") == "boom"
+    assert not (step / "control-result.json").exists()
+    event = json.loads((run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+    assert event["provider_summary"] == summary
+
+
+def test_a_timeout_wins_over_a_provider_failure(tmp_state_dir, fake_github):
+    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    provider = _LeftoverProvider("", timed_out=True, provider_failure="pi: exited early")
+    _install(eng, provider)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    with pytest.raises(ExecutionTimeoutError):
+        eng.step()
+    assert eng.state.phase == Phase.ANALYZE_EXECUTE
+
+
+def test_a_provider_failure_names_what_the_agent_left_behind(tmp_state_dir, fake_github):
+    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    provider = _LeftoverProvider(
+        "", provider_failure="pi: exited before agent_settled (exit 1)", capture_abandoned=True
+    )
+    _install(eng, provider)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    with pytest.raises(ExecutionError, match="never reached EOF"):
+        eng.step()
+
+
+def test_a_one_shot_provider_writes_no_provider_summary(tmp_state_dir, fake_github):
+    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    provider = _LeftoverProvider(
+        block(ANALYZE_OK),
+        on_call=lambda: fake_github.add_pr(
+            head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body()
+        ),
+    )
+    _install(eng, provider)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    assert eng.step().next_phase == "REVIEW"
+    _, step = _step_dir(eng)
+    execution = json.loads((step / "execution.json").read_text(encoding="utf-8"))
+    assert "provider_summary" not in execution
+
+
+def test_a_pi_phase_runs_end_to_end_over_rpc(tmp_state_dir, fake_github, tmp_path):
+    """#131 end to end: the real PiProvider against a scripted fake `pi`. The
+    final assistant text is stdout, the parser and GitHub verification
+    accept it, and neither argv nor request.json carries the prompt."""
+    from autoforge.pi_rpc import js_trim
+    from autoforge.providers import PiProvider
+    from tests.test_pi_rpc import MODEL, FakePi, _happy
+
+    (tmp_path / "fake").mkdir()
+    fake = FakePi(tmp_path / "fake", _happy())
+
+    class _Pi(PiProvider):
+        def execute(self, req):
+            res = super().execute(req)
+            fake_github.add_pr(
+                head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body()
+            )
+            return res
+
+    cfg = default_config()
+    cfg.profiles["analyze_execute"] = replace(
+        cfg.profile("analyze_execute"),
+        provider="pi",
+        model=MODEL,
+        effort="high",
+        command=str(fake.command),
+        extra_args=[],
+        options={},
+    )
+    eng = make_engine(tmp_state_dir, [], github=fake_github, cfg=cfg)
+    eng.providers._overrides["pi"] = _Pi(round_trip_seconds=5, abort_seconds=1)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    assert eng.step().next_phase == "REVIEW"
+    assert fake.commands() == [
+        "get_state",
+        "get_available_models",
+        "prompt",
+        "get_last_assistant_text",
+    ]
+    prompt = json.loads(fake.stdin()[2])["message"]
+    assert "CONTROL_RESULT" in prompt
+    _, step = _step_dir(eng)
+    assert (step / "stdout.log").read_text(encoding="utf-8") == js_trim(block(ANALYZE_OK))
+    execution = json.loads((step / "execution.json").read_text(encoding="utf-8"))
+    assert execution["provider_summary"]["stop_reason"] == "stop"
+    assert execution["provider_summary"]["failure"] == ""
+    request = (step / "request.json").read_text(encoding="utf-8")
+    assert prompt not in request and prompt not in " ".join(fake.argv())
+    assert "--mode" in request
+
+
 def test_truncated_stdout_never_accepts_a_block_from_the_head(tmp_state_dir, fake_github):
     """A block before the cut is stale (the agent wrote more after it) or
     spans the cut; either way it is not the agent's final result. The

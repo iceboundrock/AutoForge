@@ -12,7 +12,8 @@ Layout::
             execution.json    # timestamps, exit code, timed_out, stdout/stderr sizes,
                               # whether either stream was truncated at the capture bound
                               # and what the invocation left behind (descendants killed,
-                              # a group member that survived SIGKILL, an abandoned capture)
+                              # a group member that survived SIGKILL, an abandoned capture);
+                              # the provider's own summary (provider_summary) when it gave one
             stdout.log        # redacted stdout (head + omission marker + tail when truncated)
             stderr.log        # redacted stderr (same)
             control-result.json   # parsed CONTROL_RESULT when one was accepted
@@ -187,6 +188,9 @@ class ExecutionRecord:
     error: str = ""
     log_dir: str = ""
     metadata: dict[str, object] = field(default_factory=dict)
+    # A provider's own summary of the run (``AgentExecutionResult.provider_summary``),
+    # written to ``execution.json`` only when the provider gave one.
+    provider_summary: dict[str, object] = field(default_factory=dict)
 
 
 class RunLogger:
@@ -484,6 +488,9 @@ class RunLogger:
         # request.json and events.jsonl, so it passes the same boundary the
         # command and the parsed result do.
         record.metadata = redact_dict(record.metadata)
+        # The adapter bounds and redacts its summary already; it is redacted
+        # again here because it is written twice, like the metadata.
+        record.provider_summary = redact_dict(record.provider_summary)
         # Redacted on the record itself, not at each write site: `error` is
         # persisted three times (execution.json, error.txt and the whole
         # record in events.jsonl) and a controller-side error quotes agent
@@ -526,6 +533,8 @@ class RunLogger:
             "stderr_chars": len(stderr or ""),
             "error": record.error,
         }
+        if record.provider_summary:
+            execution["provider_summary"] = record.provider_summary
         base = f"{self.run_id}/{step}"
         with self._logs_root() as logs:
             logs.ensure_dir(base)

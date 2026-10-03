@@ -186,10 +186,15 @@ allow-list an agent launch gets. Pi's own `OPENAI_API_KEY` therefore counts
 only if `execution.env_allowlist_extra` forwards it. "Ready" means Pi holds a
 credential for the model's provider. It does not prove that this model is
 available to that credential; the first real run does. To sign in, run `pi`
-and `/login openai` yourself; AutoForge never starts a login. Running a Pi
-phase lands with #131; until then a real run refuses a Pi profile, while
-`doctor` and dry runs accept it. The example file carries a commented Pi
-block for `review_round_2_5`.
+and `/login openai` yourself; AutoForge never starts a login. A real Pi
+phase runs `pi --mode rpc --no-session` and sends the prompt as a JSON
+record on stdin. Before the prompt it checks that Pi resolved exactly the
+configured model and thinking level, and it fails the phase otherwise.
+A dry run shows the argv and launches nothing. A Pi failure inside the
+protocol (a rejected prompt, a model error, an extension asking for input)
+fails the phase with state unchanged; the reason and a short summary are in
+the step's `execution.json`. The example file carries a commented Pi block
+for `review_round_2_5`.
 
 ## Local mode configuration
 

@@ -20,8 +20,8 @@ loop_guard.py       REVIEW/FIX loop bounds and stagnation (pure logic)
 replan.py           replan policy and review-history collection (pure logic)
 replan_txn.py       REPLAN_REEXECUTE durable transaction state and verifiers
 providers.py        provider adapters: the only place that knows real CLI flags
-pi_rpc.py           (planned, #131) Pi RPC wire protocol: JSONL codec, request ids, event
-                    reducer; provider layer, no flags and no processes (ADR 0003)
+pi_rpc.py           Pi RPC wire protocol: JSONL codec, request ids, event reducer,
+                    outcome classification; provider layer, no flags and no processes (#131)
 executor.py         subprocess lifecycle, timeouts, capture (no workflow semantics)
 executor_duplex.py  duplex child handle for RPC transports: stdin records out, LF-framed
                     stdout records in, one deadline, ADR 0002 teardown; bytes only (#130)

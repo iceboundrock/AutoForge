@@ -1,11 +1,16 @@
 # ADR 0003. Pi agent provider: RPC boundary, model mapping, failure channel
 
-- **Status:** accepted for implementation. #129 (Pi profile validation, the
-  argv, the doctor version and read-only auth checks) and #130 (the duplex
-  child handle, `src/autoforge/executor_duplex.py`) are implemented; the
-  rest is not yet. Decided in #128 for EPIC #127. Implemented by #129 (config, doctor),
-  #130 (duplex child primitive), #131 (adapter), #132 (resource policy).
-- **Where (planned):** `src/autoforge/providers.py` (`PiProvider`),
+- **Status:** accepted for implementation. #129 (Pi profile validation,
+  the argv, the doctor version and read-only auth checks) and #130 (the
+  duplex child handle, `src/autoforge/executor_duplex.py`) are
+  implemented, and #131 (the RPC adapter, `src/autoforge/pi_rpc.py` and
+  `PiProvider.execute`, and the `provider_failure` / `provider_summary`
+  channel) is implemented against fake-`pi` fixtures; #132 is not yet.
+  #131 re-verified the Pi-dependent decisions against an installed Pi
+  1.0.1 and amended two of them (§1.1). Decided
+  in #128 for EPIC #127. Implemented by #129 (config, doctor), #130
+  (duplex child primitive), #131 (adapter), #132 (resource policy).
+- **Where:** `src/autoforge/providers.py` (`PiProvider`),
   `src/autoforge/pi_rpc.py` (Pi wire protocol),
   `src/autoforge/executor_duplex.py` (duplex child handle, implemented), `src/autoforge/engine.py` (`_invoke_phase`, one
   provider-neutral check), `docs/agent-guides/architecture.md`
@@ -43,10 +48,10 @@ are under `packages/coding-agent/docs/`, and the same pages are on
 
 **Pi is not installed on the machine this ADR was written on.** No `pi`
 command, login or model call was run, and no credential file was read.
-Every decision below that depends on Pi is therefore marked **verified
-from docs/source only**. #131 must re-verify each one against an installed
-Pi before relying on it, and record the result there. No decision is marked
-"verified against installed Pi". Decisions 2.7 and 2.9 are AutoForge
+Every decision below that depends on Pi was therefore first marked
+**verified from docs/source only**, and #131 was to re-verify each one
+against an installed Pi before relying on it. It did, and §1.1 records the
+result; each decision's status line points there. Decisions 2.7 and 2.9 are AutoForge
 module-boundary and coordination choices that do not themselves depend on
 Pi behaviour; the Pi facts they restate keep the status of the decision
 that establishes them. Decision 2.10 does not depend on Pi at all. Each of
@@ -57,6 +62,77 @@ touch none of the RPC commands, events, flags or print-mode behaviour this
 ADR depends on. Its one nearby change is that "model is at capacity" became
 a retryable error, which only means `willRetry` and `auto_retry_*` events
 occur more often.
+
+### 1.1 Verification against installed Pi 1.0.1 (#131)
+
+The paragraph above records how this ADR was written. #131 then
+re-verified the Pi-dependent decisions against an installed Pi:
+`@earendil-works/pi-coding-agent@1.0.1` from npm (`pi --version` prints
+`1.0.1`), Node 24, Linux, on 2026-10-03.
+
+**Setup.** Pi was installed into a scratch prefix and ran with its own
+empty `PI_CODING_AGENT_DIR` and `HOME`, so no operator configuration or
+credential was read. Model calls went to a local stand-in for an
+OpenAI-compatible chat-completions endpoint, declared as a custom provider
+in that agent dir's `models.json` (`api: openai-completions`, a dummy key).
+The model id selected the scenario. Every run went through AutoForge's real
+`PiProvider.execute`, with the argv, allowlisted environment, duplex handle
+and reducer of this PR. Raw stdin/stdout probes were used only to read
+record shapes. No real model, no ChatGPT sign-in, no network model call and
+no credential was used.
+
+**Confirmed as decided:**
+
+| Decision | Observed on Pi 1.0.1 |
+|---|---|
+| 2.1 RPC lifecycle | `get_state` and `get_available_models` answer by id. `prompt` answers `success: true, disposition: "started"`. Events run to `agent_end` and then `agent_settled`, and `get_last_assistant_text` returns the final text. Pi exits 0 on stdin EOF. The adapter's `stdout` was byte-for-byte the endpoint's text, including U+2028/U+2029 and `\r\n` inside it. A run with a `read` tool call counted one tool execution. |
+| 2.1 retry path | A 500 from the endpoint gave `agent_end(willRetry: true)`, `auto_retry_start`/`auto_retry_end(success: false, finalError)`, a second `agent_end` and `agent_settled`. The adapter reported "automatic retries failed" with the bounded error. |
+| 2.1 abort | When the invocation deadline cut a slow stream short, `abort` settled the run, Pi exited 0 on stdin EOF, and the result was `timed_out`. |
+| 2.2 model checks | `get_state.model` carries `provider` and `id`. `afake/stop` resolved fuzzily to `afake/fake-stop`, which is a mismatch. A misspelled id started with a placeholder (stderr: "Using custom model id") that `get_state` reports under the configured id but `get_available_models` omits, so the model is unavailable. A known provider with no credential (`openai/...`) is absent from `get_available_models`. |
+| 2.3 thinking clamp | `--thinking high` on a non-reasoning model resolved to `off` in `get_state`, a thinking mismatch. A reasoning model kept `high`. |
+| 2.4 `--no-session` | `get_state` has no `sessionFile`, and no session file was written under the agent dir. |
+| 2.5 final text | `get_last_assistant_text` answers `data: {}` (key absent) when there is no text, as decided, not `null`. Its text is the trimmed join of the last assistant message's text blocks, and the cross-check held on every successful run. |
+| 2.5 `error` | A 400 gave `stopReason: "error"` with `errorMessage`. It was bounded and redacted, and a key-shaped string in it became `***REDACTED***`. An error naming `subscription_sharing_usage_limit_exceeded` mapped to "subscription usage limit reached". |
+| 2.6 prompt rejection | With no credential for the model's provider, `prompt` answers `success: false` with "No API key found for openai.". |
+| 2.8 protocol | A non-JSON command line gives a `response` with `command: "parse"`, `success: false` and no `id`. An unknown command gives `success: false`. An extension `confirm` dialog arrived as `extension_ui_request` and was answered with `cancelled: true`, which failed the run. A `notify` was ignored. |
+| 2.8 / #129 doctor | `pi --version` prints the bare version. `pi auth check --model <m> --json --no-refresh` prints `{"status","provider","authType"}` with exit 0 when ready, and `{"status":"not_ready",...,"reason":"credentials_not_configured"}` with exit 1. It reports `ready` for a misspelled id (delta 4.2). |
+
+**Discrepancies, and what changed:**
+
+1. **`stopReason: "length"` is not readable.** Since 0.87.0 ("final
+   length/overflow recovery"), Pi drops a cut-off assistant message from
+   its context after the run (an `entry_appended` record with a
+   `context_edit` whose `replacement` is `null`). `get_last_assistant_text`
+   then returns `{}`, or an earlier assistant message's text. So `length`
+   cannot reach the parser, and the adapter now makes it a provider failure
+   ("the model hit its output limit"), §2.5 and §2.6.
+2. **`agent_end` repeats every message of the run.** Its `messages` field
+   holds the system prompt, the user prompt, every assistant message and
+   every tool result: 207 KB for a 200 KB prompt. A very long run can
+   therefore exceed the duplex record bound and fail closed as a protocol
+   violation. The bound's comment now says so, and tolerating an oversize
+   `agent_end` is #144.
+3. **`entry_appended`** (documented in `docs/json.md`) is emitted after a
+   `length` stop or a retried error. It is now a known, ignored event
+   instead of being counted as unknown.
+4. **The `get_state` open question in #131 is answered.** An unknown
+   upstream provider (`nosuch/model-x`) makes Pi exit 1 at startup
+   (stderr: `Model "nosuch/model-x" not found`), which the adapter reports
+   as an exit before answering `get_state`. A known provider with an
+   unknown id starts with a placeholder (above). `model` was never seen
+   omitted.
+5. Pi also emits the system prompt and the user prompt as `message_end`
+   records of their own (`role: "system"`, `role: "user"`). The reducer
+   reads only `role: "assistant"`, so nothing changed.
+
+**Not verified here.** ChatGPT sign-in and a real OpenAI or Codex model
+(#135's smoke run). The wire shape of a real
+`subscription_sharing_usage_limit_exceeded` or OAuth-refresh failure (only
+the adapter's mapping of such a message was exercised). `stopReason`
+`deferred` and `pending` as final reasons. Whether SIGTERM kills detached
+tool children (#132). The resource and extension flags: with the current
+argv, an extension in the agent dir's `extensions/` loads, which is what
+#132 must close.
 
 ## 2. Decisions
 
@@ -137,7 +213,7 @@ exit status"); `src/modes/print-mode.ts:139-161`; `docs/rpc.md` ("Protocol
 records", "Run lifecycle"); `docs/rpc-commands.md` (`prompt`, `abort`,
 `get_state`); `docs/json.md` ("Agent and turn events"),
 `src/core/agent-session.ts:1796-1803` (`agent_settled` in `finally`).
-Verified from docs/source only.
+Verified from docs/source; re-verified against installed Pi 1.0.1 in #131 (§1.1).
 
 ### 2.2 Naming: `provider: pi`, `model: <pi-provider>/<model-id>`
 
@@ -212,7 +288,7 @@ match. It accepts `provider/id` and an optional `:<thinking>` suffix");
 providers); `packages/ai/src/providers/openai.ts:14-17`
 (`loginLabel: "Sign in with ChatGPT"`),
 `packages/ai/src/providers/openai-codex.ts:10`; `CHANGELOG.md` 0.99.0
-entry. Verified from docs/source only.
+entry. Verified from docs/source; re-verified against installed Pi 1.0.1 in #131 (§1.1).
 
 ### 2.3 Reasoning: `effort` → `--thinking`, a clamp is a hard failure
 
@@ -242,7 +318,7 @@ only a warning); `docs/cli.md` (`--thinking` "is clamped to the model's
 capabilities"); `packages/ai/src/models.ts:1228-1247`
 (`clampThinkingLevel`); `src/core/agent-session.ts:2565-2567`,
 `:2636-2637`; `src/main.ts:488-494` (explicit `--thinking` beats a
-`:suffix`). Verified from docs/source only.
+`:suffix`). Verified from docs/source; re-verified against installed Pi 1.0.1 in #131 (§1.1).
 
 ### 2.4 Session policy: `--no-session`, corrections are fresh processes
 
@@ -270,7 +346,7 @@ sessions are #134's question.
 
 Evidence: `src/main.ts:358-366` (`createSessionManager`),
 `src/core/session-manager.ts:1803-1806` (`inMemory` sets `persist=false`);
-`docs/sessions.md`. Verified from docs/source only.
+`docs/sessions.md`. Verified from docs/source; re-verified against installed Pi 1.0.1 in #131 (§1.1).
 
 ### 2.5 Final text: the last assistant message, never raw JSONL
 
@@ -297,7 +373,7 @@ Evidence: `src/main.ts:358-366` (`createSessionManager`),
   | `stopReason` | Outcome |
   |---|---|
   | `stop` | Success: the text goes to the parser. |
-  | `length` | Success: the text goes to the parser and `length` is recorded. A cut block fails parsing and enters the correction loop, which is the right outcome for a model that ran out of tokens. |
+  | `length` | Provider failure ("the model hit its output limit"), with `length` recorded. Amended in #131: Pi drops a cut-off message from its context, so `get_last_assistant_text` cannot return it (§1.1). |
   | `error` | Provider failure, with a bounded, redacted `errorMessage`. |
   | `aborted` | Provider failure, unless the abort came from the deadline, which is a timeout. |
   | `toolUse`, `deferred`, `pending`, anything unknown | Protocol failure. After `agent_settled` the last message should be a completed answer. `deferred` responses (provider-side asynchronous retrieval) are not supported in the MVP. |
@@ -314,8 +390,9 @@ Evidence: `src/main.ts:358-366` (`createSessionManager`),
   Claude Code text mode.
 - Reconstructing text from `message_update` deltas: the deltas are partial
   and do not carry the final message.
-- Treating `length` as a failure: it hides a usable block. The parser is
-  the authority on whether the text contains one.
+- Treating `length` as a success (the original decision, superseded in
+  #131): Pi 1.0.1 drops the cut-off message from its context, so
+  `get_last_assistant_text` cannot return it; see §1.1.
 
 Evidence: `docs/rpc-commands.md` (`get_last_assistant_text`, which says
 `null`); `src/modes/rpc/rpc-mode.ts:654-657` and
@@ -324,7 +401,7 @@ absent; joins text blocks and trims; skips an aborted empty message);
 `packages/ai/src/types.ts:450` (`StopReason`); `docs/message-types.md`
 (assistant message, `pending`, `deferred`); `docs/rpc.md` ("Stdout is
 reserved for protocol records; diagnostics and application logging go to
-stderr"). Verified from docs/source only.
+stderr"). Verified from docs/source; re-verified against installed Pi 1.0.1 in #131 (§1.1).
 
 ### 2.6 Failure channel: an optional `provider_failure` field
 
@@ -362,8 +439,8 @@ stderr"). Verified from docs/source only.
 - **What counts as a Pi provider failure (#131):**
   - prompt rejected (`success: false`);
   - a disposition other than `started`;
-  - final `stopReason` `error` or `aborted`, or `auto_retry_end` with
-    `success: false`;
+  - final `stopReason` `length`, `error` or `aborted`, or
+    `auto_retry_end` with `success: false`;
   - a model or thinking mismatch (§2.2, §2.3);
   - a protocol violation: an unknown response id, a `parse` error, a
     non-JSON stdout record, an oversize record, or a missing required
@@ -392,7 +469,7 @@ Evidence: AutoForge `src/autoforge/engine.py` (`_invoke_phase`: the
 `exit_code` checks), `src/autoforge/providers.py` (`AgentExecutionResult`),
 `src/autoforge/runlog.py` (`record.error` is redacted before it is
 written). Pi: `src/modes/rpc/rpc-mode.ts:726-743`, `:802-805` (stdin EOF
-calls `shutdown()`, exit code 0). Verified from docs/source only.
+calls `shutdown()`, exit code 0). Verified from docs/source; re-verified against installed Pi 1.0.1 in #131 (§1.1).
 
 ### 2.7 Module placement
 
@@ -442,7 +519,8 @@ evidence is the AutoForge sources above, checked in this repository. The
 Pi-dependent parts are the prompt delivered as one JSON-encoded `prompt`
 record on stdin and the command and event names the reducer is driven
 by. They restate decisions 2.1 to 2.5 and 2.8 and keep their status:
-verified from docs/source only, to be re-verified in #131.
+verified from docs/source, re-verified against installed Pi 1.0.1 in
+#131 (§1.1).
 
 ### 2.8 Upstream compatibility
 
@@ -497,7 +575,7 @@ responses"), `src/modes/rpc/jsonl.ts`, `src/modes/rpc/rpc-mode.ts:750-764`
 (parse error without id), `:366-380` (SIGTERM/SIGHUP handlers),
 `docs/rpc-extension-ui.md`, `src/modes/rpc/rpc-types.ts:263` (`editor` has
 no `timeout`), `src/core/tools/bash.ts:114-160` (detached tool children).
-Verified from docs/source only.
+Verified from docs/source; re-verified against installed Pi 1.0.1 in #131 (§1.1).
 
 ### 2.9 Coordination with #126
 
@@ -547,7 +625,8 @@ the classification is a project-coordination decision and does not depend
 on Pi behaviour, so Pi evidence is not applicable to it. The Pi-specific
 row does depend on Pi. Its protocol, session, model, thinking and
 event-reduction parts restate decisions 2.1 to 2.5 and 2.8 and keep their
-status: verified from docs/source only, to be re-verified in #131. Its
+status: verified from docs/source, re-verified against installed Pi 1.0.1
+in #131 (§1.1). Its
 trust and resource flags, `pi auth check` preflight and `PI_*` names are
 only assigned here; #129 and #132 decide them and verify them against an
 installed Pi.
@@ -606,7 +685,8 @@ They are decided here, and the child issues are updated to match.
 3. `effort` is required for Pi profiles, and an empty effort is a config
    error (§2.3, #129).
 4. `stopReason` has two more values, `pending` and `deferred`. Only `stop`
-   and `length` are successes (§2.5, #131).
+   and `length` are successes (§2.5, #131). Amended by #131's installed-Pi
+   verification: only `stop` is (§1.1).
 5. A cancelled extension dialog is a provider failure, not only a recorded
    fact (§2.8, #131).
 6. `AgentExecutionResult` gains `provider_summary` next to
