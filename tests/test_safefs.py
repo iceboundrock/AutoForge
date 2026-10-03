@@ -1418,6 +1418,43 @@ def test_link_reports_a_filesystem_without_hard_links_as_its_own_fact(tmp_path, 
     assert [e.name for e in root_dir.iterdir()] == ["file.json"]
 
 
+@pytest.mark.usefixtures("temporary_path")
+@pytest.mark.parametrize(
+    "err",
+    sorted({errno.EPERM, errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP}),
+    ids=errno.errorcode.__getitem__,
+)
+def test_create_exclusive_refuses_a_filesystem_without_hard_links_by_name(
+    tmp_path, monkeypatch, err
+):
+    """#120: an exclusive create is published by link(2) on both
+    temporaries, and there is no fallback that writes the final name
+    directly (ADR 0001, known limitation 8). Where the filesystem makes no
+    hard links the refusal is the typed fact, saying why no other way is
+    tried, and it leaves neither the final name nor a temporary behind; any
+    other failure of the publishing link stays a plain StateError."""
+    from autoforge.safefs import HardLinksUnavailable
+
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    failures = iter([err, errno.EIO])
+
+    def failing_link(src, dst, *args, **kwargs):
+        code = next(failures)
+        raise OSError(code, os.strerror(code), os.fspath(dst))
+
+    monkeypatch.setattr(os, "link", failing_link)
+    with SafeRoot.open(root_dir) as root:
+        with pytest.raises(HardLinksUnavailable, match="makes no hard link here") as info:
+            root.create_exclusive("new.json", STATE)
+        assert "new.json" in str(info.value)
+        assert "never written there directly" in str(info.value)
+        with pytest.raises(StateError, match="Input/output error") as other:
+            root.create_exclusive("new.json", STATE)
+        assert not isinstance(other.value, HardLinksUnavailable)
+    assert list(root_dir.iterdir()) == []
+
+
 # -- #55: the append reads the file, so the read is bounded like any other ------
 def _reads_asked(monkeypatch) -> list[int]:
     """Every ``read(n)`` a ``SafeRoot`` file object is asked for."""

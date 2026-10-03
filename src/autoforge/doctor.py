@@ -35,7 +35,7 @@ from .github import (
 )
 from .local_workspace import DEFAULT_MAX_BYTES, DEFAULT_MAX_ENTRIES
 from .profiles import REQUIRED_PROFILES, local_required_profiles
-from .safefs import SafeRoot
+from .safefs import STATE_DIR_NEEDS_HARD_LINKS, HardLinksUnavailable, SafeRoot
 from .validation import parse_remote_repository
 
 Runner = Callable[[ExecutionRequest], ExecutionResult]
@@ -547,13 +547,17 @@ class Doctor:
 
         The probe is a controller write like any other: it is created and
         removed through the opened root, never by pathname, so the check
-        exercises exactly the boundary a run's writes would go through.
+        exercises exactly the boundary a run's writes would go through. A
+        filesystem without hard links fails it as it fails every run's
+        run-log probe, and the reason names that requirement (#120).
         """
         probe = f".doctor-probe-{secrets.token_hex(8)}"
         try:
             with open_root() as root:
                 root.create_exclusive(probe, b"")
                 root.unlink(probe)
+        except HardLinksUnavailable as exc:
+            return f"{exc}. {STATE_DIR_NEEDS_HARD_LINKS}"
         except (OSError, StateError) as exc:
             return str(exc)
         return None
