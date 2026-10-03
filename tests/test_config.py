@@ -12,6 +12,7 @@ import pytest
 from autoforge import config
 from autoforge.config import default_config, load_config_file, validate_required_profiles
 from autoforge.errors import ConfigurationError
+from autoforge.profiles import REQUIRED_PROFILES
 from autoforge.validation import parse_github_url, validate_epic_and_issue
 
 
@@ -1680,3 +1681,101 @@ def test_yaml_integer_bases_read_alike_on_both_backends(tmp_path, yaml_backend, 
     p = tmp_path / "cfg.yaml"
     p.write_text(f"version: 1\ngithub:\n  timeout_seconds: {written}\n", encoding="utf-8")
     assert load_config_file(p).github.timeout_seconds == expected
+
+
+# -- provider-switching overrides and strict option keys (#129) ---------------------
+def _load(tmp_path, profiles):
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps({"version": 1, "profiles": profiles}), encoding="utf-8")
+    return load_config_file(p)
+
+
+@pytest.mark.parametrize(
+    "name, provider, model, effort, command",
+    [
+        ("analyze_execute", "opencode", "openai/gpt-5.6-luna", "high", "opencode"),  # claude->
+        ("review_round_1", "claude", "fable", "high", "claude"),  # opencode->claude
+        ("review_round_2_5", "pi", "openai/gpt-5.6-terra", "high", "pi"),  # opencode->pi
+        ("fix", "pi", "openai-codex/gpt-5.6", "medium", "pi"),  # claude->pi
+    ],
+)
+def test_an_override_that_changes_the_provider_inherits_nothing(
+    tmp_path, name, provider, model, effort, command
+):
+    """A different provider is a different CLI: no inherited options, extra_args or command."""
+    default = default_config().profile(name)
+    assert default.provider != provider and default.options
+    cfg = _load(tmp_path, {name: {"provider": provider, "model": model, "effort": effort}})
+    p = cfg.profile(name)
+    assert (p.provider, p.model, p.effort) == (provider, model, effort)
+    assert p.options == {} and p.extra_args == []
+    assert p.build_command("x")[0] == command
+    validate_required_profiles(cfg, REQUIRED_PROFILES)
+
+
+def test_a_provider_switch_without_effort_gets_the_default_effort(tmp_path):
+    cfg = _load(tmp_path, {"review_round_1": {"provider": "pi", "model": "openai/gpt-5.6"}})
+    assert cfg.profile("review_round_1").effort == "high"
+    validate_required_profiles(cfg, REQUIRED_PROFILES)
+
+
+@pytest.mark.parametrize("name", ["analyze_execute", "review_round_1", "update_epic"])
+def test_a_same_provider_override_keeps_the_default_argv(tmp_path, name):
+    default = default_config().profile(name)
+    cfg = _load(tmp_path, {name: {"provider": default.provider, "model": default.model}})
+    assert cfg.profile(name) == default
+    assert cfg.profile(name).build_command("p") == default.build_command("p")
+
+
+def test_a_same_provider_override_still_merges_its_fields(tmp_path):
+    cfg = _load(tmp_path, {"analyze_execute": {"provider": "claude", "effort": "low"}})
+    p = cfg.profile("analyze_execute")
+    assert p.effort == "low"
+    assert p.options == default_config().profile("analyze_execute").options
+
+
+@pytest.mark.parametrize(
+    "profile, key",
+    [
+        ({"options": {"permision_mode": "plan"}}, "permision_mode"),
+        (
+            {"provider": "opencode", "model": "o/m", "options": {"permission_mode": "x"}},
+            "permission_mode",
+        ),
+        (
+            {"provider": "pi", "model": "openai/m", "options": {"require_oath": "true"}},
+            "require_oath",
+        ),
+    ],
+)
+def test_an_unknown_option_key_fails_validation(tmp_path, profile, key):
+    cfg = _load(tmp_path, {"analyze_execute": profile})
+    with pytest.raises(ConfigurationError, match=f"analyze_execute.*{key}"):
+        validate_required_profiles(cfg, REQUIRED_PROFILES)
+
+
+def test_example_yaml_with_the_pi_block_enabled_loads_and_validates(tmp_path, yaml_backend):
+    """The commented Pi example is a working profile on both YAML backends."""
+    import autoforge
+
+    example = Path(autoforge.__file__).parents[2] / "autoforge.example.yaml"
+    lines = example.read_text(encoding="utf-8").splitlines()
+    start = lines.index("  # pi-example-start")
+    end = lines.index("  # pi-example-end")
+    active = next(i for i, line in enumerate(lines) if line == "  review_round_2_5:")
+    stop = next(i for i in range(active + 1, start) if lines[i] == "")
+    pi_block = ["  " + line[len("  # ") :] for line in lines[start + 1 : end]]
+    assert all(line.startswith("  # ") for line in lines[start + 1 : end])
+    edited = lines[:active] + lines[stop:start] + pi_block + lines[end + 1 :]
+    target = tmp_path / "autoforge.yaml"
+    target.write_text("\n".join(edited) + "\n", encoding="utf-8")
+    cfg = load_config_file(target)
+    p = cfg.profile("review_round_2_5")
+    assert (p.provider, p.model, p.effort, p.command) == (
+        "pi",
+        "openai/gpt-5.6-terra",
+        "high",
+        "pi",
+    )
+    assert p.timeout_seconds == 1800 and p.options == {"require_oauth": "true"}
+    validate_required_profiles(cfg, REQUIRED_PROFILES)

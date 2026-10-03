@@ -147,6 +147,9 @@ Each line is a summary; the linked document is the precise statement.
 - `claude` (Claude Code CLI) for `analyze_execute` / `fix` profiles
 - `opencode` (OpenCode CLI) for the `review_*`, `replan_reexecute` and
   `update_epic` profiles
+- `pi` 1.0.0 or newer, only if a profile you route to uses `provider: pi`
+  (see [Pi profiles](docs/configuration.md#pi-profiles)). `doctor` checks
+  only the agent CLIs your configured profiles actually reach
 - a state directory (`.autoforge/` by default; `--state-dir` or
   `state_dir` in config) on a filesystem with hard links: run logs and
   other controller files are published by `link(2)` so that a crash never

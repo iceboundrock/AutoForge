@@ -7290,3 +7290,28 @@ def test_the_invocation_failure_propagates_when_nothing_moved(tmp_state_dir, fak
     eng = _drift_engine(tmp_state_dir, fake_github, lambda repo: None, fail=True)
     with pytest.raises(RuntimeError, match="agent exploded"):
         eng.step()
+
+
+def test_dry_run_renders_a_pi_profile_without_launching_it(tmp_state_dir):
+    """#129: a Pi reviewer shows its exact argv; the prompt is not in it (stdin RPC, #131)."""
+    cfg = default_config()
+    cfg.profiles["review_round_2_5"] = replace(
+        cfg.profile("review_round_2_5"), provider="pi", command="pi", options={}
+    )
+    gh = FakeGitHub()
+    eng = _in_review(tmp_state_dir, gh, [], round_done=1)
+    eng.config = cfg
+    plan = eng.step(dry_run=True).plan
+    assert plan.command == [
+        "pi",
+        "--mode",
+        "rpc",
+        "--no-session",
+        "--model",
+        "openai/gpt-5.6-terra",
+        "--thinking",
+        "high",
+    ]
+    assert plan.prompt_full not in plan.command
+    assert eng.provider.calls == []
+    assert not eng.paths.state_file.exists()

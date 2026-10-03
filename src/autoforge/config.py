@@ -54,7 +54,7 @@ CONFIG_VERSION = 1
 
 DEFAULT_TIMEOUT_SECONDS = 1800
 
-KNOWN_PROVIDERS = ("claude", "opencode", "scripted")
+KNOWN_PROVIDERS = ("claude", "opencode", "pi", "scripted")
 
 
 # Where a REMOTE run keeps its state, relative to the invocation directory.
@@ -70,11 +70,13 @@ class ProfileConfig:
 
     ``options`` carries provider-specific knobs the adapter understands
     (e.g. ``permission_mode`` for Claude Code, ``auto_approve`` for
-    OpenCode). ``extra_args`` are appended verbatim before the prompt.
+    OpenCode, ``require_oauth`` for Pi); each real adapter names the keys it
+    accepts and rejects any other. ``extra_args`` are appended verbatim
+    before the prompt (Pi accepts none).
     """
 
     name: str
-    provider: str  # "claude" | "opencode" | "scripted"
+    provider: str  # "claude" | "opencode" | "pi" | "scripted"
     model: str = ""
     effort: str = "high"
     command: str = ""
@@ -90,8 +92,9 @@ class ProfileConfig:
 
 
 # The keys a profile mapping under `profiles:` may contain. `options` is
-# itself a free mapping of provider-specific knobs; its *contents* are the
-# provider adapter's to validate, its presence is checked here.
+# itself a mapping of provider-specific knobs; its *contents* are the
+# provider adapter's to validate (each real adapter declares the keys it
+# accepts, ``AgentProvider.option_keys``), its presence is checked here.
 PROFILE_KEYS = (
     "provider",
     "model",
@@ -1011,10 +1014,14 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
         if not isinstance(p, dict):
             raise ConfigurationError(f"{source}: profile {name!r} must be a mapping")
         _reject_unknown_keys(p, PROFILE_KEYS, source, f"profiles.{name}")
-        if name in base.profiles:
-            cur = base.profiles[name]
-            if "provider" in p:
-                cur.provider = str(p["provider"])
+        cur = base.profiles.get(name)
+        if cur is not None and "provider" in p and str(p["provider"]) != cur.provider:
+            # A different provider is a different CLI: nothing the default
+            # profile carried for the old one (its `command`, its options,
+            # its extra arguments) may survive into the new one, or the
+            # override would launch the old binary with the new model.
+            cur = None
+        if cur is not None:
             if "model" in p:
                 cur.model = str(p["model"])
             if "effort" in p:
@@ -1030,6 +1037,8 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
             if "options" in p:
                 cur.options.update(_as_options(p["options"], source, name))
         else:
+            # A profile the defaults do not have, or one whose provider the
+            # override changes: built from the override alone.
             base.profiles[name] = ProfileConfig(
                 name=name,
                 provider=str(p.get("provider", "opencode")),

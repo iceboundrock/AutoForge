@@ -50,7 +50,8 @@ Examples:
 AgentProvider
   -> ClaudeCodeProvider
   -> OpenCodeProvider
-  -> PiProvider          (planned, EPIC #127; decided in ADR 0003)
+  -> PiProvider          (EPIC #127, ADR 0003: config, argv and doctor checks
+                          in #129; execution over RPC is #131)
 ```
 
 Provider adapters own:

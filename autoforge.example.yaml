@@ -271,6 +271,25 @@ profiles:
       output_format: default
       auto_approve: false
 
+  # Pi (`provider: pi`, ADR 0003) instead: replace the block above with this
+  # one. Running a Pi phase lands with #131; until then `autoforge doctor`
+  # and dry runs accept the profile and a real run refuses to launch it.
+  # Prerequisite, an operator step AutoForge never performs for you: run
+  # `pi`, then `/login openai` (ChatGPT sign-in). `autoforge doctor` checks
+  # the Pi version and, read-only, that Pi holds a credential for the
+  # provider (not that this model is usable with it).
+  # A Pi profile takes no extra_args.
+  # pi-example-start
+  # review_round_2_5:
+  #   provider: pi
+  #   model: openai/gpt-5.6-terra   # `pi --model` (<pi-provider>/<model-id>, no `:<thinking>`)
+  #   effort: high                  # `pi --thinking` (off|minimal|low|medium|high|xhigh|max), required
+  #   command: pi
+  #   timeout_seconds: 1800
+  #   options:
+  #     require_oauth: true         # fail `doctor` when Pi would use an API key instead
+  # pi-example-end
+
   review_round_6_plus:
     provider: opencode
     model: openai/gpt-5.6-sol

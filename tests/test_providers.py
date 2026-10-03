@@ -9,6 +9,7 @@ from autoforge.providers import (
     AgentRequest,
     ClaudeCodeProvider,
     OpenCodeProvider,
+    PiProvider,
     ProviderRegistry,
     ScriptedProvider,
     provider_for,
@@ -224,7 +225,273 @@ def test_provider_environment_names_are_deduplicated_not_repeated():
 def test_every_real_provider_declares_only_valid_environment_patterns():
     from autoforge.executor import is_env_pattern
 
-    for cls in (ClaudeCodeProvider, OpenCodeProvider):
+    for cls in (ClaudeCodeProvider, OpenCodeProvider, PiProvider):
         assert cls.environment_names, cls
         assert all(is_env_pattern(n) for n in cls.environment_names), cls.environment_names
     assert ScriptedProvider.environment_names == ()
+
+
+# -- strict per-provider option keys (#129) ---------------------------------------
+@pytest.mark.parametrize(
+    "provider, model, key",
+    [
+        ("claude", "fable", "permision_mode"),
+        ("claude", "fable", "auto_approve"),  # an OpenCode knob on a Claude profile
+        ("opencode", "openai/gpt-5.6-luna", "permission_mode"),
+        ("opencode", "openai/gpt-5.6-luna", "autoapprove"),
+        ("pi", "openai/gpt-5.6-terra", "require_oath"),
+        ("pi", "openai/gpt-5.6-terra", "tools"),  # #132 adds it; not accepted yet
+    ],
+)
+def test_an_unknown_option_key_is_rejected_with_the_profile_and_accepted_set(provider, model, key):
+    p = ProfileConfig(name="r2", provider=provider, model=model, options={key: "x"})
+    accepted = provider_for(p).option_keys
+    assert accepted is not None
+    with pytest.raises(ConfigurationError) as err:
+        provider_for(p).validate_profile(p)
+    message = str(err.value)
+    assert "'r2'" in message and key in message
+    assert all(k in message for k in accepted), message
+
+
+def test_the_shipped_option_keys_are_accepted():
+    for name in ("analyze_execute", "fix", "review_round_1", "update_epic"):
+        p = default_config().profile(name)
+        provider_for(p).validate_profile(p)
+    claude = ProfileConfig(
+        name="x", provider="claude", model="fable", options={"session_persistence": "true"}
+    )
+    ClaudeCodeProvider().validate_profile(claude)
+
+
+def test_the_scripted_test_provider_leaves_option_keys_unchecked():
+    p = ProfileConfig(name="x", provider="scripted", model="m", options={"anything": "1"})
+    assert ScriptedProvider.option_keys is None
+    ScriptedProvider().validate_profile(p)
+
+
+# -- Pi (#129, ADR 0003) -----------------------------------------------------------
+def _pi(**kwargs):
+    fields = {"name": "review_round_2_5", "provider": "pi", "model": "openai/gpt-5.6-terra"}
+    fields.update(kwargs)
+    return ProfileConfig(**fields)
+
+
+def test_pi_argv_shape():
+    p = _pi(effort="high")
+    argv = PiProvider().build_command_for(p, "review $(id); --approve")
+    assert argv == [
+        "pi",
+        "--mode",
+        "rpc",
+        "--no-session",
+        "--model",
+        "openai/gpt-5.6-terra",
+        "--thinking",
+        "high",
+    ]
+    # The prompt travels on stdin as an RPC record (#131), never in argv.
+    assert not any("review" in a for a in argv)
+    assert PiProvider().build_command_for(_pi(command="/opt/pi/bin/pi"), "x")[0] == "/opt/pi/bin/pi"
+
+
+def test_pi_is_registered_and_known_to_config():
+    from autoforge.config import KNOWN_PROVIDERS
+
+    assert "pi" in KNOWN_PROVIDERS
+    assert isinstance(provider_for(_pi()), PiProvider)
+    assert _pi().build_command("prompt")[:2] == ["pi", "--mode"]
+
+
+@pytest.mark.parametrize("effort", ["off", "minimal", "low", "medium", "high", "xhigh", "max"])
+def test_pi_accepts_every_thinking_level(effort):
+    PiProvider().validate_profile(_pi(effort=effort))
+
+
+@pytest.mark.parametrize("effort", ["", "none", "HIGH", "ultra", " high"])
+def test_pi_rejects_a_missing_or_unknown_effort(effort):
+    with pytest.raises(ConfigurationError, match="'review_round_2_5'.*effort"):
+        PiProvider().validate_profile(_pi(effort=effort))
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "openai/gpt-5.6-terra",
+        "openai-codex/gpt-5.6",
+        "openrouter/vendor:model-id",  # a colon that is not a thinking level is part of the id
+        "openai/gpt-5.6:latest",
+        "a1-b2/x",
+    ],
+)
+def test_pi_accepts_a_provider_slash_id_model(model):
+    PiProvider().validate_profile(_pi(model=model))
+
+
+@pytest.mark.parametrize(
+    "model, problem",
+    [
+        ("", "empty"),
+        ("gpt-5.6-terra", "exactly one '/'"),
+        ("openai/vendor/model", "exactly one '/'"),
+        ("/gpt-5.6", "provider part"),
+        ("OpenAI/gpt-5.6", "provider part"),
+        ("open_ai/gpt-5.6", "provider part"),
+        ("openai/", "model id is empty"),
+        ("openai/gpt 5.6", "whitespace"),
+        ("openai/gpt-5.6\t", "whitespace"),
+        ("openai/gpt-5.6-terra:high", "':<thinking>'"),
+        ("openai/vendor:model:off", "':<thinking>'"),
+    ],
+)
+def test_pi_rejects_a_malformed_model(model, problem):
+    with pytest.raises(ConfigurationError) as err:
+        PiProvider().validate_profile(_pi(model=model))
+    assert "'review_round_2_5'" in str(err.value) and problem in str(err.value)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--approve"],
+        ["-a"],
+        ["--api-key", "sk-test"],
+        ["--session-id", "abc"],
+        ["--system-prompt", "x"],
+        ["--mode", "json"],
+        ["@notes.md"],
+        ["--verbose"],  # harmless-looking flags are refused too: no pass-through at all
+    ],
+)
+def test_pi_rejects_any_extra_args(extra):
+    with pytest.raises(ConfigurationError) as err:
+        PiProvider().validate_profile(_pi(extra_args=extra))
+    message = str(err.value)
+    assert "'review_round_2_5'" in message and "extra_args" in message
+
+
+@pytest.mark.parametrize("value", ["true", "false"])
+def test_pi_require_oauth_is_a_boolean(value):
+    p = _pi(options={"require_oauth": value})
+    PiProvider().validate_profile(p)
+    assert PiProvider.require_oauth(p) is (value == "true")
+    assert PiProvider.require_oauth(_pi()) is True  # the default
+
+
+@pytest.mark.parametrize("value", ["", "yes", "1", "False"])
+def test_pi_require_oauth_rejects_a_non_boolean(value):
+    with pytest.raises(ConfigurationError, match="require_oauth"):
+        PiProvider().validate_profile(_pi(options={"require_oauth": value}))
+
+
+def test_pi_execution_is_refused_until_the_rpc_adapter_lands():
+    from autoforge.errors import ExecutionError
+
+    seen = []
+    prov = PiProvider(runner=_capture_runner(seen))
+    req = AgentRequest("REVIEW", "p", "/tmp", _pi(), 7, env_allowlist=("PATH",))
+    with pytest.raises(ExecutionError, match="not implemented"):
+        prov.execute(req)
+    assert seen == []  # nothing was launched
+
+
+def test_pi_environment_names_are_explicit_and_carry_no_provider_key():
+    import fnmatch
+
+    names = PiProvider.environment_names
+    assert names and all(not n.endswith("*") for n in names), names
+    for pattern in ("OPENAI_*", "ANTHROPIC_*"):
+        assert not fnmatch.filter(names, pattern), names
+    assert "PI_CODING_AGENT_DIR" in names
+
+
+def test_pi_probe_commands_are_read_only():
+    p = _pi(command="pi")
+    assert PiProvider().version_command(p) == ["pi", "--version"]
+    argv = PiProvider().auth_check_command(p)
+    assert argv[:3] == ["pi", "auth", "check"]
+    assert argv[argv.index("--model") + 1] == "openai/gpt-5.6-terra"
+    assert "--json" in argv and "--no-refresh" in argv
+    assert "--credentials" not in argv
+    assert not any(a.startswith("print-") for a in argv)
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("1.0.0", (1, 0, 0)),
+        ("1.0.1\n", (1, 0, 1)),
+        ("12.34.56", (12, 34, 56)),
+        ("1.0.0-rc.1", (1, 0, -1)),
+        ("1.1.0-beta", (1, 1, -1)),
+        ("", None),
+        ("pi 1.0.0", None),
+        ("v1.0.0", None),
+        ("1.0", None),
+        ("1.0.0\nextra", None),
+        ("one.two.three", None),
+    ],
+)
+def test_parse_pi_version(text, expected):
+    from autoforge.providers import PI_MIN_VERSION, parse_pi_version
+
+    assert parse_pi_version(text) == expected
+    if text == "1.0.0-rc.1":
+        assert parse_pi_version(text) < PI_MIN_VERSION
+
+
+@pytest.mark.parametrize(
+    "stdout, code, expected",
+    [
+        ('{"status":"ready","provider":"openai","authType":"oauth"}', 0, ("ready", "", "oauth")),
+        (
+            '{"status":"ready","provider":"openai","authType":"api_key"}\n',
+            0,
+            ("ready", "", "api_key"),
+        ),
+        (
+            '{"status":"not_ready","provider":"openai","reason":"credentials_not_configured"}',
+            1,
+            ("not_ready", "credentials_not_configured", ""),
+        ),
+        (
+            '{"status":"invalid","provider":"openai/gpt-5.6","reason":"invalid_state"}',
+            2,
+            ("invalid", "invalid_state", ""),
+        ),
+    ],
+)
+def test_parse_pi_auth_check_accepts_the_documented_shapes(stdout, code, expected):
+    from autoforge.providers import parse_pi_auth_check
+
+    got = parse_pi_auth_check(stdout, code)
+    assert (got.status, got.reason, got.auth_type) == expected
+
+
+@pytest.mark.parametrize(
+    "stdout, code",
+    [
+        ("", 2),
+        ("ready", 0),
+        ("[]", 0),
+        ('{"status":"ready","provider":"openai","authType":"oauth"}\n{}', 0),
+        ('{"status":"ready","provider":"openai","authType":"oauth"}', 1),  # exit disagrees
+        ('{"status":"not_ready","provider":"openai","reason":"credentials_not_configured"}', 0),
+        ('{"status":"ready","provider":"openai"}', 0),  # ready without authType
+        ('{"status":"ready","provider":"openai","authType":"token"}', 0),
+        ('{"status":"ready","provider":"openai","authType":"oauth","reason":"x"}', 0),
+        ('{"status":"not_ready","provider":"openai"}', 1),
+        ('{"status":"not_ready","provider":"openai","reason":"expired"}', 1),
+        ('{"status":"maybe","provider":"openai"}', 1),
+        ('{"status":"ready","authType":"oauth"}', 0),
+        ('{"status":"ready","provider":"","authType":"oauth"}', 0),
+        ('{"status":"ready","provider":"open ai","authType":"oauth"}', 0),
+        ('{"status":"ready","provider":"openai","authType":"oauth","credentials":"sk-x"}', 0),
+    ],
+)
+def test_parse_pi_auth_check_fails_closed_on_drift(stdout, code):
+    from autoforge.providers import parse_pi_auth_check
+
+    with pytest.raises(ValueError) as err:
+        parse_pi_auth_check(stdout, code)
+    assert "sk-x" not in str(err.value)
