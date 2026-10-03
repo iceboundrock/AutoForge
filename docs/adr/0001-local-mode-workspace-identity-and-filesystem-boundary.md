@@ -665,9 +665,9 @@ launch checkpoint was persisted before the agent started, so `resume`
 re-enters the phase as a retry judged against the baseline from before the
 first launch. A REMOTE run has no tree checkpoint; there the refusal lands
 in the same window as a timeout, a non-zero exit or a verification failure
-(README "Recovery rules"): the launch is persisted as a used attempt, the
-phase is left unchanged, the error says that the agent's GitHub side effects
-may already exist, and `resume` re-enters the phase, which reconciles with
+(`docs/agent-guides/workflow.md`, "Re-entering a phase"): the launch is
+persisted as a used attempt, the phase is left unchanged, the error says
+that the agent's GitHub side effects may already exist, and `resume` re-enters the phase, which reconciles with
 GitHub before launching anyone (an existing open PR, a review comment
 already posted for the round at its HEAD, a HEAD already pushed past the
 reviewed one). That reconciliation is what closes the window for every

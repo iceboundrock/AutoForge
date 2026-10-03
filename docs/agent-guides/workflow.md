@@ -136,6 +136,7 @@ workflow:
 ```
 
 - After a review with findings, the controller evaluates replan policy before blocking for the per-PR cap or stagnation. An eligible replan, including one caused by workflow stagnation or the cap, enters `REPLAN_REEXECUTE`; an exhausted replan limit enters `BLOCKED`. Otherwise a review round at the cap enters `BLOCKED` with a clear `block_reason`; no further FIX round is started because its result could never be reviewed. A clean round at the cap proceeds normally. Entering `REVIEW` beyond the cap (stale re-review, HEAD drift, resume) is refused before the reviewer runs.
+- The replan triggers (`review.replan`, `src/autoforge/replan.py`), checked after a verified review with findings, in this order: a `workflow.stagnation_*` verdict at or after `soft_threshold` (default 12); any round at or after `hard_threshold` (default 20), whatever the findings; and, from `soft_threshold`, `stagnation_window` (default 3) trailing rounds each holding at most `max_findings_per_round` (default 2) findings. The config loader requires `soft_threshold` <= `hard_threshold` <= `workflow.max_review_rounds`.
 - Stagnation is judged on the persisted per-PR `review_history` (round, reviewed SHA, result, finding count, fingerprint of the normalised `required_resolution` texts, per-finding digests of those texts). Only trailing consecutive rounds that ended with findings count; a clean or stale round breaks the streak. The unchanged-count rule also requires a `required_resolution` that recurs within the window (A/B/A ping-pong): rounds of entirely new findings, each earlier one resolved, are progress bounded by the round cap only. A value of 0 disables a rule and 1 is rejected by the config loader: both rules compare consecutive rounds, so a one-round window would silently disable the unchanged-count rule instead of bounding it. The per-round digest list is bounded (`MAX_PERSISTED_RESOLUTION_DIGESTS`) and a clipped round is marked; incomplete evidence can still prove a recurrence but never its absence, so such a window keeps the count-only behaviour. A `required_resolution` that normalises to nothing gets no digest and can never form a recurrence. Persisted `review_history` is validated on load: only a *missing* `resolutions` key is old-controller compatibility; a present malformed field is corruption and fails loudly. A detected stagnation is an eligible replan trigger only from `review.replan.soft_threshold` onwards; below that round it is an immediate block, because a short identical-resolution streak is usually one FIX round that missed a finding and is not worth discarding the PR for. `review.replan.soft_threshold` is authoritative over `workflow.stagnation_*`. The "entirely new findings are progress" scoping belongs to the `workflow.stagnation_*` rules alone: the replan window rule (`review.replan.stagnation_window` trailing rounds with findings, each holding at most `review.replan.max_findings_per_round`, at or after `soft_threshold`) deliberately counts rounds of entirely new findings too. Recurrence is what the workflow rules already detect and hand to the policy, so a recurrence requirement would leave the window rule nothing of its own; it exists for the long tail of small, fresh findings that never ends, and the threshold is what protects a productive loop from it. There is no separate recovery policy to be authoritative over: a fresh `REPLAN_REEXECUTE` step and a `resume` run the same reducer over the same persisted transaction, and a refusal is persisted as a terminal `REJECTED` stage that `resume` replays. Recovery may replay a decision, never launder one.
 - The replan transaction itself (evidence completeness, causal provenance,
   the checkpointed close with compensation, ownership of the side effect,
@@ -377,6 +378,31 @@ next entry could not find again.
   controller when due (github-safety.md, "EPIC updates").
 
 No probe consumes a review round, a `review_history` entry, or an attempt.
+
+**Correction retry and the failures that are not retried.** When an agent
+exits 0 but its `CONTROL_RESULT` is missing or invalid, the controller
+re-invokes it (`execution.max_correction_attempts`, default once) with a
+correction prompt that tells it to inspect real Git/GitHub state first and
+not repeat completed operations. The correction is a re-entry like `resume`:
+the same GitHub reconciliation above runs before the relaunch, so an agent
+that created the PR, pushed the fix, or posted the comment before losing its
+result block is reconciled with (the PR adopted, the pushed HEAD reviewed,
+the comment handed over) rather than relaunched. In LOCAL mode a correction
+is one more write-capable launch, so it is charged against and checkpointed
+in the same durable per-phase bound (three launches per phase entry) as the
+launch before it; the setting can never multiply that bound. Non-zero exits,
+timeouts, verification failures and a refused run-log write after the agent
+returned (an `events.jsonl` an agent enlarged past its budget, gave a second
+name, replaced or removed) are not retried automatically; they leave the
+phase unchanged for `resume`. The launch itself is persisted before the
+agent starts, so every one of these is on disk as a used attempt, and a
+refused run-log write names the outcome it interrupted (the timeout, the
+exit code, the malformed result, or an accepted result) rather than masking
+it, and refuses further launches until the log directory is repaired. In
+every one of these the agent may already have posted a comment, pushed or
+opened a PR that the controller state does not record; `resume` re-enters
+the phase and reconciles with GitHub first, and the resumed agent is told to
+inspect the real Git/GitHub state in its prompt.
 
 ### Leaving BLOCKED: the operator's unblock
 

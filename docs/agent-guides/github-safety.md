@@ -154,6 +154,7 @@ Verify:
 
 - review comment exists
 - it belongs to the expected PR
+- it carries the `# AI Code Review — Round N` heading for this round
 - review round marker is correct
 - reviewed HEAD is correct
 - it is the only comment carrying this round's marker at this HEAD against
@@ -250,7 +251,12 @@ be truncated blocks, because "none exists" is then not knowable) for the
 
 Verify:
 
+- the result's `previous_head_sha` is the HEAD the controller bound the
+  findings to
+- the resolutions cover exactly the open finding IDs, each one `fixed`,
+  `follow_up_created` or `no_change_with_rationale`
 - current PR HEAD matches the returned new HEAD
+- a `fixed` resolution moved HEAD
 - a claimed follow-up issue exists in this repository, is `OPEN`, is not the
   current issue, and is the one open issue carrying its finding's marker
 - a finding resolved any other way has no open issue carrying its marker;
@@ -329,7 +335,8 @@ Verify:
 
 - PR remains open
 - PR is mergeable
-- required checks pass
+- every check in the status rollup passes (all checks, not only the
+  required ones)
 - each required check's run has the same jobs and steps as the base branch's
   own run of that workflow (`safety.verify_check_definition`): a green check
   is produced by the PR's copy of the workflow, so its name alone proves only
@@ -433,6 +440,189 @@ Unless the current milestone/task explicitly enables and validates real merge be
 Do not weaken merge safety to make an integration test easier.
 
 Tests must never merge real PRs.
+
+The rest of this section is the operator-facing description of the gate as
+it is implemented; "Before MERGE" and "After MERGE" above are the
+verification contract it implements.
+
+### Opening the gate
+
+The `MERGE` phase is reachable only from `READY_FOR_MERGE` and only when
+both `safety.allow_merge: true` is set in config and `--allow-merge` is
+passed on the CLI. With the gate closed `run`/`resume` stop at
+`READY_FOR_MERGE` and a human merges: the CLI prints a banner with the
+issue, PR, review round and reviewed HEAD and states that automatic merge is
+disabled, and `resume` without the gate open re-prints the banner and runs
+nothing. `step` without the gate open refuses to advance `READY_FOR_MERGE`
+or `MERGE` with an error naming both halves of the gate, before anything is
+read from GitHub. `safety.allow_merge` is the *only* config key that opens the gate:
+the historical `execution.allow_merge` is rejected on load rather than read,
+and an unknown key under `safety` (a typo such as `allow_merges`) is a
+configuration error, so the gate can never be "disabled" in one place while
+still open in another. `autoforge doctor` prints the effective gate state
+and the file that set it.
+
+When the gate is open, the *controller* performs the merge itself:
+`gh pr merge --<merge.method> --match-head-commit <reviewed HEAD>` through
+`GitHubClient`, with no prompt and no agent invocation.
+
+### Pre-merge verification and its failure classes
+
+Pre-merge verification is controller-side and fails closed. It runs in
+`READY_FOR_MERGE` (before `MERGE` is entered) and again in `MERGE` (before
+the write), reading only controller state and GitHub, never an agent claim.
+
+- The clean review is bound to the PR it was posted on, its HEAD, its base
+  branch and its merge base; `current_pr_url` and the PR GitHub returns for
+  it must be that PR by identity (repository and number), else `BLOCKED`
+  before anything else is read (the same commits proposed as another PR
+  against another base are a change no review decided on).
+- GitHub must then report: that PR open at the reviewed HEAD and base from
+  the reviewed merge base (a base rewritten under its name goes back to
+  `REVIEW`; ordinary commits landing on the base do not move it), not a
+  draft, no change to any `safety.protected_merge_paths` entry, every check
+  in the status rollup succeeded (all checks, not only required ones),
+  `mergeable = MERGEABLE`, `mergeStateStatus` in `CLEAN`/`HAS_HOOKS`, no
+  auto-merge armed, and no merge queue on the base branch (`gh pr merge`
+  would otherwise arm auto-merge or enqueue instead of merging, leaving an
+  asynchronous merge the controller does not own). Every required check must
+  also pass the definition comparison, and every
+  `merge.verification_commands` command must pass (both below).
+- Conclusive negatives (closed PR, conflict, failing check, branch
+  protection, queue, a recorded review comment GitHub no longer backs, a
+  failing local command) -> `BLOCKED`.
+- Inconclusive data (checks still running, the base branch's own run still
+  running, `mergeable = UNKNOWN`, an unfetchable reviewed commit, or the
+  PR / changed-file / merge-queue read itself failing transiently: timeout,
+  connection error, 5xx, rate limit) raises and keeps the phase so
+  `resume --allow-merge` (or `step --allow-merge`) re-checks, one attempt per
+  invocation, at most `merge.max_verification_attempts` times (default 5),
+  then `BLOCKED`.
+- A read that fails conclusively (bad credentials, missing permissions, a
+  PR that no longer resolves) is `BLOCKED` immediately: re-running would not
+  change it.
+- HEAD, base or merge-base drift -> `REVIEW`; a PR found already merged in
+  `READY_FOR_MERGE` -> `MERGE`, to reconcile and count it once.
+
+In every one of these cases nothing is merged.
+
+### Protected merge paths
+
+A PR is never merged unattended if it redefines its own checks. The hosted
+`ci` result the gate trusts is produced by the workflow files *in the PR*:
+GitHub runs the PR's copy of `.github/workflows/` and reports it under the
+same check name, and a branch ruleset cannot help, because the required
+check is defined by the branch it gates. So the controller reads the PR's
+changed files and `BLOCK`s when any of them matches
+`safety.protected_merge_paths` (default `.github/workflows/`), naming the
+paths; a human reviews and merges that PR themselves. Both ends of a rename
+count, so moving a protected file *out* of the protected range is refused
+like an edit to it. The listing is read in full
+(`gh api --paginate --slurp`, every page), so a PR is judged on all of its
+files rather than on the first hundred; GitHub itself stops the endpoint at
+3,000 files, and a listing that stays short of GitHub's own `changedFiles`
+count is refused: a short listing cannot prove a protected path was left
+alone, and a PR that large is not one to merge unattended anyway. Setting
+the list to `[]` disables the gate; leaving the key empty (`null`) is a
+configuration error rather than a silent opt-out.
+
+What this gates is the *definition* of the checks, not the trustworthiness
+of a green run: the commands still execute the PR's own code, so a PR can
+weaken what its tests assert without touching a protected path. The two
+gates below narrow that gap; what remains is why merge stays behind
+`safety.allow_merge` + `--allow-merge`.
+
+### Check definitions
+
+A required check is trusted only if it ran the base branch's definition.
+With `safety.verify_check_definition` (default `true`) the controller
+resolves every `safety.required_checks` context in the PR's status rollup to
+its GitHub Actions run through the check's details URL and requires the run
+to be in this repository, at the reviewed HEAD and completed; a context that
+appears zero or several times, or that is not an Actions run, is refused. It
+then reads the run's jobs and their steps (every page, a short listing is
+refused) and compares that structure with the base branch's own `push` run
+of the same workflow at the branch's current tip: same job names, same step
+names in the same order, job order ignored. The first difference (a job or
+step missing, added or renamed) is `BLOCKED` with the difference named. The
+reference must be a completed, successful run; a base branch without one at
+its tip is `BLOCKED` (make it green first), and a reference still running is
+inconclusive. This catches a PR that rewrites what the check *is* through an
+untouched workflow file (a reusable action, a `Makefile` target the workflow
+calls by a different job or step name) but it is structural: a step whose
+name stayed the same while its command changed passes. Setting the key to
+`false`, or leaving `required_checks` empty, skips the comparison.
+
+### Controller-run verification commands
+
+`merge.verification_commands` (argv lists, empty by default) run on the
+operator's machine after every GitHub-side fact above has passed, in a fresh
+temporary export of the reviewed HEAD: `git read-tree` +
+`git checkout-index` into `autoforge-premerge-*`, so no worktree or branch is
+created, the operator's checkout is untouched and there is no `.git` for a
+command to reach; the export is deleted afterwards. That also means a command
+that needs git metadata (`git describe`, `setuptools-scm` and other version
+stamping) or populated submodules fails in the export, so keep those out of
+the list or make them tolerate a plain tree. A commit that is not local yet
+is fetched from `origin` as `refs/pull/<n>/head`, objects only, without
+creating a local ref. A non-zero exit or a timeout
+(`execution.default_timeout_seconds`) is `BLOCKED` with the redacted output
+tail; an unfetchable or unexportable commit is inconclusive and re-checked by
+`resume --allow-merge`. A pass is persisted with the HEAD and the command
+list, so a resume at the same HEAD does not rerun it and a changed command
+list or a new HEAD does; it is cleared when the run moves to the next issue.
+Each run is logged like an agent invocation. Dry-run runs nothing and lists
+the commands in the plan; `autoforge doctor` reports what is configured
+without running it. Submodules are not populated in the export, and the
+commands run under the same allow-listed environment as an agent
+(`execution.env_allowlist`), not the operator's whole shell.
+
+### Post-merge reconciliation
+
+The merge is counted only after GitHub reports `MERGED` at the reviewed HEAD
+into the reviewed base (idempotently, across crashes; a merge into another
+base is `BLOCKED`, never counted). If `gh pr merge` returns but the PR is
+still open, any auto-merge that call armed is disabled again
+(`gh pr merge --disable-auto`) and the run is `BLOCKED`, unless the PR is
+open at a *different* HEAD (pushed between the verification and the write,
+so `--match-head-commit` refused it) or against a different base
+(retargeted in that window) and no asynchronous merge is pending: then
+nothing unreviewed merged, the clean review is stale and the run goes back
+to `REVIEW`. If the post-merge re-read fails, the outcome is treated as
+unknown: the run stays in `MERGE` and `resume --allow-merge` re-inspects
+GitHub (an already-merged PR is recovered and counted once; an open one is
+re-verified), bounded by the same `merge.max_verification_attempts`, then
+`BLOCKED`.
+
+### Doctor's branch-rule check
+
+`doctor` verifies that the default branch still requires the CI check. The
+pre-merge gate trusts "every check on the PR succeeded", which says nothing
+about whether any check *had* to exist: with the branch ruleset gone, a PR
+with no check runs at all is vacuously green. That ruleset lives in
+repository settings, outside version control, so `autoforge doctor` reads
+the effective rules of the default branch
+(`gh api repos/{owner}/{repo}/rules/branches/{branch}`, every page) and
+reports which contexts a `required_status_checks` rule names, whether each of
+`safety.required_checks` (default `ci`) is among them, whether the ruleset's
+enforcement is `active`, and whether it has bypass actors. Any of those
+missing is a `FAIL` with the settings URL and the rule to add. A repository
+still on classic branch protection is checked through that instead
+(`enforce_admins` standing in for "no bypass actors"). A read the token is
+not allowed to make (no credentials, a plan that hides rulesets, a non-admin
+token and no ruleset) or a transient GitHub failure is `SKIP`, never a false
+alarm; so is a *partial* read: GitHub returns a ruleset's `bypass_actors`
+only to a token with write access to it, and a rule this token can see but
+whose bypass list it cannot is `SKIP` rather than `OK` (a token that GitHub
+says may itself bypass the rule is a `FAIL` either way). `doctor --json`
+carries a skip as `"skipped": true`. The check is read-only and runs in
+`doctor` only: the `READY_FOR_MERGE` gate itself does not yet consult branch
+rules.
+
+`doctor` as a whole is read-only apart from creating the state directory
+if it is missing and a probe file it creates and removes there; its GitHub
+reads (`gh repo view`, `gh api`
+GETs of the default branch's rules) never write.
 
 ---
 
