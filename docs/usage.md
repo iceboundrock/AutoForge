@@ -141,10 +141,10 @@ re-enter and either re-enters it (`ANALYZE_EXECUTE`, `REVIEW`, `FIX`,
 `READY_FOR_MERGE` or `UPDATE_EPIC`, through the same transition validation as
 any other step) or refuses and leaves the run `BLOCKED`, exit code 1, when
 the safe state still cannot be determined (two candidate PRs, a closed PR, a
-merge no review decided on, a replan in flight, an exhausted bound). The
-reason is recorded in the state file and the run log, `status` shows the last
-one, and no agent runs until `resume`. A LOCAL run cannot be unblocked. The
-decision table is in
+merge no review decided on, a replan transaction on record, an exhausted
+bound). The reason is recorded in the state file and the run log, `status`
+shows the last one, and no agent runs until `resume`. A LOCAL run cannot be
+unblocked. The decision table is in
 [Workflow: leaving BLOCKED](agent-guides/workflow.md#leaving-blocked-the-operators-unblock).
 
 ### DONE and FAILED
@@ -154,11 +154,21 @@ decision table is in
 
 ## Dry run
 
-Dry-run is side-effect-free: no subprocess, no `gh` call, no state write, no
-lock, and no agent worktree. It only prints the plan (phase, provider,
+A dry run invokes no agent, runs no verification command, writes nothing to
+GitHub, git or the state directory (no state, no log), takes no lock and
+creates no agent worktree. It prints the plan (phase, provider,
 model/effort, round, template, variables, command, expected transition),
-redacted. `unblock --dry-run` is different: it reads GitHub to report the
-decision it would make, and writes nothing (no state, no log, no lock).
+redacted. What it reads depends on the command:
+
+- `run --dry-run` previews a new run and launches no subprocess: no `git`,
+  no `gh`.
+- `step --dry-run` and `resume --dry-run` preview the existing run and make
+  no `gh` call. Without `--state-dir` they first run two read-only
+  `git rev-parse` calls to find which run is meant, a remote one under
+  `.autoforge/` or a local one in the git directory; `--state-dir` skips
+  that lookup.
+- `unblock --dry-run` does the same lookup, then reads GitHub to report the
+  decision it would make.
 
 ## Where things live
 
@@ -228,10 +238,22 @@ ownership or discard uncommitted user changes.
 - **`LockError`:** another controller holds the repository lock, or the lock
   entry under `.git/autoforge/` is not a regular file with a single name; see
   [State and recovery: locking](agent-guides/state-and-recovery.md#locking).
-- **A replan is in flight or was rejected:** `autoforge status` prints the
-  transaction id, stage and both PRs; `resume` replays the transaction, and
-  `unblock` refuses while a replan journal exists. See
-  [Replan transaction](agent-guides/replan-transaction.md).
+- **A replan was interrupted:** the phase is still `REPLAN_REEXECUTE`.
+  `autoforge status` prints the transaction id, stage and both PRs, and
+  `resume` continues the transaction from its persisted stage. A transient
+  GitHub failure inside the transaction leaves it resumable the same way.
+- **The run is `BLOCKED` with a replan transaction on record** (a rejected
+  replacement or source, or a journal the controller could not read): this
+  run is over. `resume` exits 1 as for any `BLOCKED` run, `unblock` refuses
+  while the journal exists, and repairing the replacement PR does not reopen
+  a rejection. `autoforge status` shows the block reason and the journal's
+  stage and both PRs; a rejection's reason also says what the transaction
+  did to the source PR. Inspect those PRs on GitHub and decide by hand
+  which one, if either, carries the issue forward. To continue, start a new
+  run; it replaces `state.json`, journal included, so read `status` first.
+  Its `ANALYZE_EXECUTE` adopts the one open PR carrying the issue's
+  `ai-implementation` marker and blocks on two, so close the PR you do not
+  keep. See [Replan transaction](agent-guides/replan-transaction.md).
 
 ## Logging and redaction
 

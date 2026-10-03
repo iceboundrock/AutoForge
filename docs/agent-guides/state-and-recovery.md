@@ -179,10 +179,16 @@ As implemented (`flock(2)`, `src/autoforge/locking.py`):
 - `run`, `step` and `resume` take the lock **before** `state.json` is read
   or created and keep it until their last step has been persisted, so a
   state snapshot loaded before the lock is never executed and no second
-  controller can take over the repository mid-command. Dry-run takes no lock.
-  A REMOTE dry-run runs no `git`; `local run --dry-run` needs a git
-  repository and reads it (HEAD, branch and the workspace walk) to build
-  its plan, and writes nothing.
+  controller can take over the repository mid-command. Dry-run takes no lock
+  and writes nothing. A REMOTE `run --dry-run` runs no `git`. `step`,
+  `resume`, `unblock` and `status` without `--state-dir`, dry runs
+  included, first run two read-only `git rev-parse` calls (`--git-dir`,
+  `--git-common-dir`) to find which run is meant (`cli._bind_existing_run`:
+  a remote one under `state_dir` or a local one in the git directory);
+  `--state-dir` skips that lookup. A LOCAL dry run needs a git repository
+  and reads it: `local run --dry-run` reads HEAD, branch and the workspace
+  walk to build its plan, and a dry run of an existing local run reads the
+  repository to check its run contract and current fingerprint.
 - Below the git common dir no path component is followed through a symlink:
   the `autoforge` directory is created with `mkdir` and opened relative to
   the git directory's descriptor with `O_DIRECTORY | O_NOFOLLOW`, so a
