@@ -266,7 +266,7 @@ most common entry points:
 | know how state, locking and crash recovery work | [State and recovery](docs/agent-guides/state-and-recovery.md) |
 | see how the code is divided | [Architecture](docs/agent-guides/architecture.md), [module map](src/autoforge/AGENTS.md) |
 | contribute, run the checks, write tests | [Development](docs/development.md), [Testing](docs/agent-guides/testing.md) |
-| read the design records | [ADR 0001](docs/adr/0001-local-mode-workspace-identity-and-filesystem-boundary.md), [ADR 0002](docs/adr/0002-executor-nothing-outlives-the-invocation.md) |
+| read the design records | [ADR 0001](docs/adr/0001-local-mode-workspace-identity-and-filesystem-boundary.md), [ADR 0002](docs/adr/0002-executor-nothing-outlives-the-invocation.md), [ADR 0003](docs/adr/0003-pi-agent-provider.md) |
 
 Coding agents working on this repository start at [AGENTS.md](AGENTS.md).
 
