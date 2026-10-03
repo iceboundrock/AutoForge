@@ -48,3 +48,4 @@ description of how AutoForge behaves.
 |---|---|
 | [ADR 0001](adr/0001-local-mode-workspace-identity-and-filesystem-boundary.md) | Local mode: workspace identity (a controller walk, not `git status`), the filesystem capability boundary, the durable run contract, threat model and known limitations |
 | [ADR 0002](adr/0002-executor-nothing-outlives-the-invocation.md) | Executor: nothing an agent starts outlives its invocation |
+| [ADR 0003](adr/0003-pi-agent-provider.md) | Pi agent provider (planned): RPC over stdio, `provider/model` naming and read-back verification, `--no-session` with fresh-process corrections, a provider-neutral failure channel, coordination with #126 |

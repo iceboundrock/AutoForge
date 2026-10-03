@@ -50,6 +50,7 @@ Examples:
 AgentProvider
   -> ClaudeCodeProvider
   -> OpenCodeProvider
+  -> PiProvider          (planned, EPIC #127; decided in ADR 0003)
 ```
 
 Provider adapters own:
@@ -65,7 +66,24 @@ Provider adapters own:
 
 Every invocation is an argv list: there is no `os.system` / `shell=True`
 anywhere, and prompts travel as a single argv element so shell
-metacharacters in issue text cannot be interpreted.
+metacharacters in issue text cannot be interpreted. A provider that speaks
+a stdio protocol (Pi over RPC, ADR 0003) sends the prompt as one encoded
+record on the child's stdin instead, which is never in argv and never goes
+through a shell.
+
+The provider layer is `providers.py` plus the protocol modules an adapter
+owns. Pi's wire protocol (JSON encoding and decoding, request ids, the event
+reducer, outcome classification) is planned in `pi_rpc.py`. It knows Pi's
+command and event names, but no CLI flags and no processes. No CLI flag and
+no provider wire-protocol name appears outside the provider layer.
+
+A provider can report that a run failed inside its protocol even though the
+process exited 0. It does so through a provider-neutral optional
+`AgentExecutionResult.provider_failure` (planned with #131, ADR 0003 §2.6),
+which the engine treats like a non-zero exit: `ExecutionError`, state
+unchanged, stdout and stderr recorded. The engine names no provider in that
+check. The adapter returns the text the parser reads as `stdout`, which for
+Pi is the final assistant message, never raw protocol records.
 
 ### Executor
 
@@ -110,6 +128,13 @@ group. The child's own exit status and output are then returned, so a valid
 whole timeout, and `ExecutionResult.descendants_killed` records the kill.
 The two flags are exclusive: `timed_out` means the child itself overran,
 `descendants_killed` that it exited and its leftovers were removed.
+
+A duplex child handle for RPC transports (#130, ADR 0003 §2.7) is planned
+in the executor layer. It provides stdin and stdout pipes with LF-only
+record framing, bounded queues and buffers, one deadline, and teardown on
+every exit path. It carries no JSON and no workflow semantics, and it is
+held to the same contract. `execute()` itself stays one-shot with
+`stdin=DEVNULL`.
 
 The kill is complete only when no process is left in the group, not merely
 when the child is reaped and its pipes closed: a descendant that closed its
