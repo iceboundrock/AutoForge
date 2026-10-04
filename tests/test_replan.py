@@ -6902,3 +6902,93 @@ def test_r10f1_the_prepare_step_finds_the_source_in_a_listing_that_spells_it_dif
     assert PR_VARIANT in prepared["preexisting_pr_urls"]  # the listing's spelling
     assert eng.state.current_pr_url == REPLACEMENT_PR
     assert eng.state.superseded_prs[0]["pr_url"] == PR
+
+
+# -- Pi parity (#133) ----------------------------------------------------------------
+def _replan_on_pi(state_dir, gh, agent, tmp_path_factory):
+    """``_park_at_hard_threshold`` with every profile on Pi, driven by ``agent``."""
+    from tests.pi_fake import PiFake, ScriptedPi, route_to_pi
+
+    eng = _park_at_hard_threshold(state_dir, gh, agent)
+    fake = PiFake(tmp_path_factory.mktemp("pi"))
+    route_to_pi(eng.config, fake)
+    eng.pi = ScriptedPi(fake, agent)
+    eng.providers._overrides["pi"] = eng.pi
+    return eng, fake
+
+
+def test_a_pi_replan_runs_the_same_transaction(tmp_state_dir, tmp_path_factory):
+    """REPLAN_REEXECUTE on Pi: the transaction, the replacement markers, the
+    controller's close of the superseded PR and the activation of the
+    verified replacement are those of a ScriptedProvider replan, and the
+    launch is routed through ``replan_reexecute``."""
+    from tests.pi_fake import PI_PROFILES, flag
+
+    gh = FakeGitHub()
+    eng, fake = _replan_on_pi(tmp_state_dir, gh, _replan_agent(gh), tmp_path_factory)
+    assert eng.step().next_phase == "REPLAN_REEXECUTE"
+    assert _txn(eng).stage is ReplanStage.PENDING
+    assert eng.step().next_phase == "REVIEW"
+
+    assert [req.profile.name for req in eng.pi.calls] == ["review_round_6_plus", "replan_reexecute"]
+    assert eng.provider.calls == []
+    replan = fake.launches()[-1]
+    assert (flag(replan["argv"], "--model"), flag(replan["argv"], "--thinking")) == PI_PROFILES[
+        "replan_reexecute"
+    ]
+    # The prompt that travelled over RPC carries the transaction the marker binds.
+    assert MARKER_NAME in fake.prompts()[-1]
+    state = eng.state
+    assert gh.prs[PR].state == "CLOSED" and gh.merges == []
+    assert gh.closed_prs and REPLACEMENT_PR in gh.closed_prs[0][1]
+    assert state.current_pr_url == REPLACEMENT_PR
+    assert state.current_branch == REPLACEMENT_BRANCH and state.current_head_sha == SHA_B
+    assert state.review_round == 0 and state.review_history == [] and state.open_findings == []
+    assert state.execution_attempt == 2 and state.escalation_count == 1
+    assert state.replan_transaction == {}
+    superseded = state.superseded_prs[0]
+    assert superseded["pr_url"] == PR and superseded["replacement_pr_url"] == REPLACEMENT_PR
+    assert len(superseded["transaction_id"]) == 32
+
+
+def test_a_pi_replan_claim_github_does_not_back_is_refused_as_a_scripted_one(tmp_path_factory):
+    """A Pi REPLAN_REEXECUTE result naming a replacement PR that FakeGitHub
+    does not have ends exactly as the same claim from ScriptedProvider: same
+    outcome, same transaction stage, and the superseded PR is not closed."""
+
+    def no_replacement(gh):
+        inner = _replan_agent(gh)
+
+        def agent(req):
+            if req.phase == "REVIEW":
+                return inner(req)
+            return block(_replan_payload())  # claims a PR it never created
+
+        return agent
+
+    seen = []
+    for on_pi in (False, True):
+        gh = FakeGitHub()
+        state_dir = tmp_path_factory.mktemp("pi-run" if on_pi else "scripted") / ".autoforge"
+        if on_pi:
+            eng, _ = _replan_on_pi(state_dir, gh, no_replacement(gh), tmp_path_factory)
+        else:
+            eng = _park_at_hard_threshold(state_dir, gh, no_replacement(gh))
+        assert eng.step().next_phase == "REPLAN_REEXECUTE"
+        assert eng.step().next_phase == "BLOCKED"
+        s = load_state(eng.paths.state_file)
+        seen.append(
+            (
+                re.sub(r"[0-9a-f]{32}", "<txn>", s.block_reason),
+                ReplanTransaction.from_dict(s.replan_transaction).stage,
+                gh.prs[PR].state,
+                s.current_pr_url,
+                gh.closed_prs,
+                gh.merges,
+            )
+        )
+    assert seen[0] == seen[1]
+    reason, stage, source_state, current, closed, merges = seen[1]
+    assert f"replacement PR {REPLACEMENT_PR}, but no open PR" in reason
+    assert stage is ReplanStage.REJECTED and source_state == "OPEN" and current == PR
+    assert closed == [] and merges == []

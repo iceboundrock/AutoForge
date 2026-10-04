@@ -5,11 +5,13 @@ way the real agent would (create PR, post comment, push fix). State is
 reloaded from disk after every step to prove persistence.
 """
 
+import dataclasses
 import json
 
 import pytest
 
 import autoforge.engine as engine_mod
+from autoforge.config import default_config
 from autoforge.errors import StateTransitionError
 from autoforge.state import load_state
 from autoforge.transitions import Phase, decide_next_phase
@@ -592,3 +594,180 @@ def test_a_decision_outside_the_topology_is_refused_before_it_is_applied(
     with pytest.raises(StateTransitionError, match="REVIEW -> DONE"):
         eng.step()
     assert load_state(eng.paths.state_file).phase == Phase.REVIEW
+
+
+# --- Pi provider parity at the engine boundary (#133) -----------------------
+
+
+def _six_round_agent(gh: FakeGitHub, clean_round: int = 6):
+    """An implementation, ``clean_round - 1`` review rounds that each raise one
+    genuinely new finding (a distinct required resolution, so no stagnation),
+    a fix after each, a clean review in ``clean_round`` and the EPIC update.
+
+    Six rounds reach every review profile: round 1, rounds 2-5 and 6+.
+    """
+
+    def agent(req):
+        if req.phase == "ANALYZE_EXECUTE":
+            gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
+            return block(
+                {
+                    "phase": "ANALYZE_EXECUTE",
+                    "status": "success",
+                    "issue_url": ISSUE,
+                    "pr_url": PR,
+                    "head_sha": SHA_A,
+                    "branch": BRANCH,
+                }
+            )
+        if req.phase == "REVIEW":
+            rnd = len(gh.comments.get(PR, [])) + 1
+            sha = gh.prs[PR].head_sha
+            ids = [] if rnd == clean_round else [f"R{rnd}-F1"]
+            gh.add_comment(PR, 100 + rnd, review_comment_body(rnd, sha, bool(ids), ids))
+            return block(
+                {
+                    "phase": "REVIEW",
+                    "status": "success",
+                    "round": rnd,
+                    "reviewed_head_sha": sha,
+                    "review_comment_url": comment_url(PR, 100 + rnd),
+                    "needs_fix_round": bool(ids),
+                    "findings": [
+                        {
+                            "id": i,
+                            "classification": "non-blocked",
+                            "title": f"gap {rnd}",
+                            "location": f"src/x{rnd}.py:1",
+                            "required_resolution": f"cover case {rnd}",
+                        }
+                        for i in ids
+                    ],
+                }
+            )
+        if req.phase == "FIX":
+            rnd = len(gh.comments.get(PR, []))
+            prev = gh.prs[PR].head_sha
+            new = f"{rnd:040x}"
+            gh.set_head(new)
+            return block(
+                {
+                    "phase": "FIX",
+                    "status": "success",
+                    "previous_head_sha": prev,
+                    "new_head_sha": new,
+                    "resolutions": [
+                        {"finding_id": f"R{rnd}-F1", "resolution": "fixed", "commit_sha": new}
+                    ],
+                }
+            )
+        if req.phase == "UPDATE_EPIC":
+            post_progress_comment(gh)
+            return block(
+                {
+                    "phase": "UPDATE_EPIC",
+                    "status": "success",
+                    "roadmap_section": "- [x] done",
+                    "next_issue_url": None,
+                }
+            )
+        raise AssertionError(f"unexpected call {req.phase}")
+
+    return agent
+
+
+def test_an_all_pi_run_routes_every_launch_through_its_profile(tmp_state_dir, tmp_path_factory):
+    """Every profile on ``provider: pi``: ANALYZE -> REVIEW r1 -> FIX -> REVIEW
+    rounds 2-5 and 6 -> READY_FOR_MERGE -> MERGE -> UPDATE_EPIC -> DONE.
+
+    Each RPC child's ``--model`` / ``--thinking`` names the profile the engine
+    routed that launch through, every launch runs in the per-issue worktree,
+    nothing reaches the Claude Code provider, and the controller (never the
+    agent) merges once the gate is open in this test's config.
+    """
+    from tests.pi_fake import PI_PROFILES, PiFake, flag, make_pi_engine
+
+    fake = PiFake(tmp_path_factory.mktemp("pi"))
+    gh = FakeGitHub()
+    eng = make_pi_engine(tmp_state_dir, fake, _six_round_agent(gh), github=gh)
+    eng.config.safety.allow_merge = True
+    eng._save()
+
+    outcomes = eng.run(max_steps=50, allow_merge=True)
+
+    assert [o.next_phase for o in outcomes] == [
+        "ANALYZE_EXECUTE",
+        *["REVIEW", "FIX"] * 5,
+        "REVIEW",
+        "READY_FOR_MERGE",
+        "MERGE",
+        "UPDATE_EPIC",
+        "DONE",
+    ]
+    expected = [
+        "analyze_execute",
+        "review_round_1",
+        "fix",
+        *["review_round_2_5", "fix"] * 4,
+        "review_round_6_plus",
+        "update_epic",
+    ]
+    assert [req.profile.name for req in eng.pi.calls] == expected
+    launches = fake.launches()
+    assert [(flag(e["argv"], "--model"), flag(e["argv"], "--thinking")) for e in launches] == [
+        PI_PROFILES[name] for name in expected
+    ]
+    worktree = str(eng.agent_worktree_path())
+    assert {e["cwd"] for e in launches} == {worktree}
+    assert len(fake.auth_checks()) == len(expected)  # one OAuth preflight per launch
+    assert eng.provider.calls == []
+    assert gh.merges == [(PR, "squash", f"{5:040x}", False)]
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.DONE and s.counted_merged_prs == [PR]
+
+
+@pytest.mark.parametrize(
+    "pi_profiles",
+    [
+        ["review_round_1", "review_round_2_5", "review_round_6_plus"],
+        ["analyze_execute", "fix", "update_epic"],
+    ],
+    ids=["claude-writers-pi-reviewers", "pi-writers-claude-reviewers"],
+)
+def test_a_mixed_config_routes_each_profile_to_its_own_provider(
+    tmp_state_dir, tmp_path_factory, pi_profiles
+):
+    """Claude Code and Pi profiles in one run: each launch goes to the provider
+    its profile names, and the run's phases are those of an all-Claude run."""
+    from tests.pi_fake import PI_PROFILES, PiFake, flag, make_pi_engine
+
+    fake = PiFake(tmp_path_factory.mktemp("pi"))
+    gh = FakeGitHub()
+    cfg = default_config()
+    for name in set(PI_PROFILES) - set(pi_profiles):  # everything else on Claude Code
+        cfg.profiles[name] = dataclasses.replace(cfg.profile("analyze_execute"), name=name)
+    eng = make_pi_engine(
+        tmp_state_dir, fake, _full_lifecycle_agent(gh), github=gh, cfg=cfg, names=pi_profiles
+    )
+    eng.config.safety.allow_merge = True
+    eng._save()
+
+    outcomes = eng.run(max_steps=50, allow_merge=True)
+
+    assert [o.next_phase for o in outcomes][-4:] == [
+        "READY_FOR_MERGE",
+        "MERGE",
+        "UPDATE_EPIC",
+        "DONE",
+    ]
+    order = ["analyze_execute", "review_round_1", "fix", "review_round_2_5", "update_epic"]
+    on_pi = [name for name in order if name in pi_profiles]
+    assert [req.profile.name for req in eng.pi.calls] == on_pi
+    assert [req.profile.name for req in eng.provider.calls] == [
+        name for name in order if name not in pi_profiles
+    ]
+    assert [
+        (flag(e["argv"], "--model"), flag(e["argv"], "--thinking")) for e in fake.launches()
+    ] == [PI_PROFILES[name] for name in on_pi]
+    assert all(req.profile.provider == "claude" for req in eng.provider.calls)
+    assert gh.merges == [(PR, "squash", SHA_B, False)]
