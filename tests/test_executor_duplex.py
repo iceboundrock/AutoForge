@@ -5,6 +5,7 @@ path, held to ADR 0002 exactly as ``execute()`` is.
 """
 
 import ast
+import ctypes
 import hashlib
 import json
 import os
@@ -583,6 +584,58 @@ def test_contained_orphan_is_killed_when_the_with_block_raises(monkeypatch):
             assert again.finish().leftovers == ""
     finally:
         _kill_quietly(pid)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux-only subreaper")
+def test_contained_orphan_is_killed_when_finish_is_interrupted(monkeypatch):
+    """A Ctrl-C inside ``finish()``'s wait for the child kills the still-running
+    child and its detached process while the subreaper still catches the
+    latter, and only then restores the subreaper setting (#132)."""
+    monkeypatch.setattr(executor, "_EXIT_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    real_reaped = executor_duplex._reaped
+    interrupted = []
+
+    def interrupting_reaped(proc, deadline):
+        if not interrupted:
+            interrupted.append(True)
+            raise KeyboardInterrupt
+        return real_reaped(proc, deadline)
+
+    monkeypatch.setattr(executor_duplex, "_reaped", interrupting_reaped)
+    # Starts a detached process the way Pi's bash tool does, then keeps
+    # running past stdin EOF, so finish() has to wait for it.
+    detacher = (
+        "import subprocess, sys, time\n"
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'],\n"
+        "                     start_new_session=True, stdin=subprocess.DEVNULL,\n"
+        "                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        "print(p.pid, flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    previous = _subreaper()
+    pid = None
+    with pytest.raises(KeyboardInterrupt):
+        with start_duplex(
+            DuplexRequest(command=[PY, "-c", detacher], deadline_seconds=30, contain_orphans=True)
+        ) as child:
+            item = child.read_line(timeout=10)
+            assert isinstance(item, Record)
+            pid = int(item.data)
+            child.finish()
+    assert interrupted and pid is not None
+    try:
+        assert not executor._group_alive(child.pid)
+        assert _gone(pid, within=1)
+        assert _subreaper() == previous, "the subreaper setting was not restored"
+    finally:
+        _kill_quietly(pid)
+
+
+def _subreaper() -> int:
+    value = ctypes.c_int(0)
+    ctypes.CDLL(None, use_errno=True).prctl(37, ctypes.byref(value), 0, 0, 0)
+    return value.value
 
 
 def test_setsid_escapee_gives_capture_abandoned(monkeypatch):

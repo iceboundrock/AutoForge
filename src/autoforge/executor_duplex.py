@@ -622,8 +622,15 @@ class DuplexChild:
             try:
                 self._settle(exit_by)
             except BaseException:
-                if self._contained is not None:
-                    self._contained.release()
+                # Interrupted (Ctrl-C) before the group was dealt with: kill it
+                # and the orphans while the subreaper still catches them, as
+                # ``execute()`` does, and only then restore the setting.
+                try:
+                    if self._left is None:
+                        self._kill()
+                finally:
+                    if self._contained is not None:
+                        self._contained.release()
                 raise
             if self._closed:
                 return
