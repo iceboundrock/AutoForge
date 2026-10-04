@@ -7504,3 +7504,309 @@ def test_dry_run_renders_a_pi_profile_without_launching_it(tmp_state_dir):
     assert plan.prompt_full not in plan.command
     assert eng.provider.calls == []
     assert not eng.paths.state_file.exists()
+
+
+# =====================================================================================
+# Pi parity at the engine boundary (#133): the real PiProvider over RPC against a
+# fake `pi` (tests/pi_fake.py) is held to what ScriptedProvider is held to.
+# =====================================================================================
+PI_STDERR = "fake pi: diagnostics on stderr\n"
+
+
+def _to_pi(eng, tmp_path_factory, script):
+    """Route every profile of ``eng`` to Pi, driven by ``script``; return the fake."""
+    from tests.pi_fake import PiFake, ScriptedPi, route_to_pi
+
+    fake = PiFake(tmp_path_factory.mktemp("pi"))
+    route_to_pi(eng.config, fake)
+    eng.pi = ScriptedPi(fake, script)
+    eng.providers._overrides["pi"] = eng.pi
+    return fake
+
+
+def _analyze_writes_pr(gh):
+    def agent(req):
+        gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
+        return block(ANALYZE_OK)
+
+    return agent
+
+
+@pytest.mark.parametrize("claim", ["pull-request", "review-comment"])
+def test_a_pi_claim_github_does_not_back_fails_as_a_scripted_one_does(tmp_path_factory, claim):
+    """A Pi CONTROL_RESULT naming a PR (or review comment) FakeGitHub does not
+    have is refused by the same verification, with the same error, and state
+    stays where it was, exactly as for ScriptedProvider."""
+    if claim == "pull-request":
+        script = [block(ANALYZE_OK)]
+    else:
+        script = [block(review_payload(1, SHA_A, []))]
+    seen = []
+    for on_pi in (False, True):
+        gh = FakeGitHub()
+        state_dir = tmp_path_factory.mktemp("pi-run" if on_pi else "scripted") / ".autoforge"
+        if claim == "pull-request":
+            eng = make_engine(state_dir, list(script), github=gh)
+            eng.state.phase = Phase.ANALYZE_EXECUTE
+        else:
+            eng = _in_review(state_dir, gh, list(script))
+        if on_pi:
+            fake = _to_pi(eng, tmp_path_factory, list(script))
+        with pytest.raises(VerificationError) as excinfo:
+            eng.step()
+        s = load_state(eng.paths.state_file)
+        seen.append((str(excinfo.value), s.phase, s.current_pr_url, s.review_round))
+    assert seen[0] == seen[1]
+    assert eng.provider.calls == [] and len(fake.launches()) == 1
+
+
+def test_a_pi_correction_is_a_second_separate_pi_process(
+    tmp_state_dir, fake_github, tmp_path_factory
+):
+    """A malformed Pi result is corrected by a second, separate Pi process:
+    two spawns with identical argv and nothing that resumes a session, the
+    correction prompt (sent over RPC) carries the parse error, the entry
+    reconciliation runs again before the relaunch, and the valid second
+    result advances the phase."""
+    from tests.pi_fake import PiTurn
+
+    def agent(req):
+        if not req.correction:
+            return PiTurn(text="I am done, no block here", stderr=PI_STDERR)
+        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
+        return block(ANALYZE_OK)
+
+    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    fake = _to_pi(eng, tmp_path_factory, agent)
+    reconciled = []
+    recover = eng._try_recover_pr
+
+    def spy():
+        reconciled.append(len(fake.launches()))
+        return recover()
+
+    eng._try_recover_pr = spy
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+
+    assert eng.step().next_phase == "REVIEW"
+
+    first, second = fake.launches()
+    assert first["argv"] == second["argv"]
+    assert not {"--session", "--continue", "--fork", "--resume"} & set(first["argv"])
+    assert "--no-session" in first["argv"]
+    assert reconciled == [0, 1]  # before the first launch and again before the relaunch
+    prompts = fake.prompts()
+    assert len(prompts) == 2 and "did not return a valid CONTROL_RESULT" not in prompts[0]
+    assert "did not return a valid CONTROL_RESULT" in prompts[1]
+    assert "no CONTROL_RESULT block found" in prompts[1]
+    assert [req.correction for req in eng.pi.calls] == [False, True]
+    s = load_state(eng.paths.state_file)
+    assert s.current_pr_url == PR and s.attempt == 0
+    run_dir = eng.paths.logs_dir / eng.state.run_id
+    dirs = sorted(p for p in run_dir.iterdir() if p.is_dir())
+    assert [d.name[-2:] for d in dirs] == ["-1", "-2"]
+    assert (dirs[0] / "error.txt").exists() and (dirs[1] / "control-result.json").exists()
+
+
+@pytest.mark.parametrize("corrections", [0, 2])
+def test_pi_corrections_are_bounded_as_scripted_ones_are(
+    tmp_path_factory, fake_github, corrections
+):
+    """``max_correction_attempts`` bounds Pi launches exactly as it bounds
+    ScriptedProvider ones: the same error after the same number of spawns."""
+    seen = []
+    for on_pi in (False, True):
+        state_dir = tmp_path_factory.mktemp("pi-run" if on_pi else "scripted") / ".autoforge"
+        eng = make_engine(state_dir, ["junk"] * 5, github=FakeGitHub())
+        eng.config.execution.max_correction_attempts = corrections
+        if on_pi:
+            fake = _to_pi(eng, tmp_path_factory, ["junk"] * 5)
+        eng.state.phase = Phase.ANALYZE_EXECUTE
+        with pytest.raises((ControlResultValidationError,)) as excinfo:
+            eng.step()
+        launched = len(fake.launches()) if on_pi else len(eng.provider.calls)
+        seen.append((type(excinfo.value), str(excinfo.value), launched))
+        assert load_state(eng.paths.state_file).phase == Phase.ANALYZE_EXECUTE
+    assert seen[0] == seen[1] and seen[1][2] == corrections + 1
+
+
+_PI_FAILURES = [
+    pytest.param(
+        {
+            "auth": {
+                "status": "not_ready",
+                "provider": "openai",
+                "reason": "credentials_not_configured",
+            },
+            "auth_exit": 1,
+        },
+        "pi: the auth preflight refused the launch: status not_ready",
+        id="credential-preflight-refused",
+    ),
+    pytest.param(
+        {"outcome": "reject", "error": "No API key found for openai."},
+        "pi: prompt rejected before acceptance: No API key found for openai.",
+        id="prompt-rejected",
+    ),
+    pytest.param(
+        {"outcome": "stop_error", "error": "upstream overloaded"},
+        "pi: model error after acceptance: upstream overloaded",
+        id="stop-reason-error",
+    ),
+    pytest.param(
+        {"outcome": "exit_early", "exit_code": 3},
+        "pi: exited before agent_settled (exit 3)",
+        id="exit-before-settled",
+    ),
+    pytest.param(
+        {"outcome": "model_mismatch"},
+        "pi: model mismatch: configured openai/pi-analyze",
+        id="model-mismatch",
+    ),
+]
+
+
+@pytest.mark.parametrize("turn,reason", _PI_FAILURES)
+def test_a_pi_failure_leaves_state_unchanged_and_resume_relaunches(
+    tmp_state_dir, fake_github, tmp_path_factory, turn, reason
+):
+    """Each Pi failure is an ExecutionError naming Pi's reason; stdout and
+    stderr are recorded, controller state does not move, and `resume`
+    relaunches the phase, which then advances on a valid result."""
+    from tests.pi_fake import PiTurn
+
+    script = [PiTurn(stderr=PI_STDERR, **turn), _analyze_writes_pr(fake_github)]
+
+    def agent(req):
+        step = script.pop(0)
+        return step if isinstance(step, PiTurn) else step(req)
+
+    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    fake = _to_pi(eng, tmp_path_factory, agent)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    with pytest.raises(ExecutionError) as excinfo:
+        eng.step()
+    message = str(excinfo.value)
+    assert message.startswith(f"agent 'analyze_execute' failed: {reason}")
+    assert "State unchanged" in message and message.endswith("then 'resume'.")
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.ANALYZE_EXECUTE and s.current_pr_url == "" and s.current_head_sha == ""
+    _, step = _step_dir(eng)
+    execution = json.loads((step / "execution.json").read_text(encoding="utf-8"))
+    assert execution["error"].startswith(reason) and execution["provider_summary"]
+    assert (step / "stdout.log").read_text(encoding="utf-8") == ""
+    stderr = (step / "stderr.log").read_text(encoding="utf-8")
+    if "auth" in turn:
+        assert fake.launches() == [] and stderr == ""  # refused before the RPC child
+    else:
+        assert stderr == PI_STDERR
+    assert reason in (step / "error.txt").read_text(encoding="utf-8")
+    assert not (step / "control-result.json").exists()
+
+    eng.load()  # what `resume` does
+    assert eng.step().next_phase == "REVIEW"
+    assert load_state(eng.paths.state_file).current_pr_url == PR
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="orphan sweep is Linux-only")
+def test_a_pi_deadline_is_a_timeout_naming_what_it_left_behind(
+    tmp_state_dir, fake_github, tmp_path_factory
+):
+    """Pi accepts the prompt and goes silent: the profile deadline ends the
+    launch with ExecutionTimeoutError; the detached process its tool started
+    is swept and named; state does not move and `resume` relaunches."""
+    from tests.pi_fake import PiTurn
+
+    script = [PiTurn(outcome="hang", detach=60, stderr=PI_STDERR), _analyze_writes_pr(fake_github)]
+
+    def agent(req):
+        step = script.pop(0)
+        return step if isinstance(step, PiTurn) else step(req)
+
+    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    _to_pi(eng, tmp_path_factory, agent)
+    eng.config.profiles["analyze_execute"] = replace(
+        eng.config.profile("analyze_execute"), timeout_seconds=2
+    )
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    with pytest.raises(ExecutionTimeoutError) as excinfo:
+        eng.step()
+    message = str(excinfo.value)
+    assert message.startswith("agent 'analyze_execute' timed out after 2s")
+    assert "outside its process group" in message
+    assert message.endswith("then 'resume'.")
+    assert load_state(eng.paths.state_file).phase == Phase.ANALYZE_EXECUTE
+    _, step = _step_dir(eng)
+    execution = json.loads((step / "execution.json").read_text(encoding="utf-8"))
+    assert execution["timed_out"] is True and execution["orphans_killed"] is True
+    assert (step / "stderr.log").read_text(encoding="utf-8") == PI_STDERR
+
+    eng.load()
+    assert eng.step().next_phase == "REVIEW"
+
+
+def test_a_pi_run_log_records_argv_env_and_summary_and_redacts_secrets(
+    tmp_state_dir, fake_github, tmp_path_factory, monkeypatch
+):
+    """request.json holds the argv (no prompt) and the env allowlist (Pi's
+    names, no OPENAI_*), execution.json the Pi summary, stdout.log only the
+    final assistant text (never the JSONL stream), stderr.log Pi's stderr;
+    a credential-shaped string on stderr and in the final text is redacted
+    in every file of the run's logs."""
+    from autoforge.pi_rpc import js_trim
+    from tests.pi_fake import PiTurn
+
+    secret = "sk-proj-" + "Z9" * 12
+    monkeypatch.setenv("OPENAI_API_KEY", secret)  # never reaches Pi: not allow-listed
+    text = f"Used {secret} while working.\n\n" + block(ANALYZE_OK)
+
+    def agent(req):
+        _analyze_writes_pr(fake_github)(req)
+        return PiTurn(text=text, stderr=f"warning: token {secret} rejected\n")
+
+    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    fake = _to_pi(eng, tmp_path_factory, agent)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    assert eng.step().next_phase == "REVIEW"
+
+    (launch,) = fake.launches()
+    assert "OPENAI_API_KEY" not in launch["env"]
+    run_dir, step = _step_dir(eng)
+    request = json.loads((step / "request.json").read_text(encoding="utf-8"))
+    prompt = fake.prompts()[0]
+    assert request["command"][1:] == launch["argv"]
+    assert prompt not in json.dumps(request["command"])
+    allowlist = request["metadata"]["env_allowlist"]
+    assert {"PI_CODING_AGENT_DIR", "PI_OFFLINE", "PI_TELEMETRY"} <= set(allowlist)
+    assert not [name for name in allowlist if name.startswith("OPENAI")]
+    execution = json.loads((step / "execution.json").read_text(encoding="utf-8"))
+    assert execution["provider_summary"]["stop_reason"] == "stop"
+    assert execution["provider_summary"]["failure"] == ""
+    stdout = (step / "stdout.log").read_text(encoding="utf-8")
+    assert stdout == js_trim(text).replace(secret, "***REDACTED***")
+    assert '"agent_settled"' not in stdout and '"type"' not in stdout
+    stderr = (step / "stderr.log").read_text(encoding="utf-8")
+    assert stderr == "warning: token ***REDACTED*** rejected\n"
+    files = [p for p in run_dir.rglob("*") if p.is_file()]
+    assert len(files) > 3
+    assert not [p for p in files if secret in p.read_text(encoding="utf-8")]
+
+
+def test_a_pi_dry_run_prints_the_pi_argv_and_spawns_nothing(
+    tmp_state_dir, fake_github, tmp_path_factory
+):
+    """Dry-run renders the Pi argv for the routed profile (no prompt in it)
+    and never starts the fake: not the RPC child, not the auth preflight."""
+    from tests.pi_fake import PI_PROFILES, flag
+
+    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    fake = _to_pi(eng, tmp_path_factory, [])
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    plan = eng.step(dry_run=True).plan
+    assert plan.command[:3] == [str(fake.command), "--mode", "rpc"]
+    assert (flag(plan.command, "--model"), flag(plan.command, "--thinking")) == PI_PROFILES[
+        "analyze_execute"
+    ]
+    assert plan.prompt_full not in plan.command
+    assert not fake.spawned() and eng.pi.calls == []
+    assert not eng.paths.state_file.exists() and fake_github.calls == []

@@ -871,7 +871,14 @@ def print_plan(plan: StepPlan, full_prompt: bool = False) -> None:
     if plan.template:
         print(f"Template: {plan.template}")
     if plan.command:
-        print(f"Command:  {' '.join(redact_argv(plan.command)[:-1])} <prompt>")
+        # The prompt is previewed below, so the argument that carries it is
+        # shown as a placeholder. Only that argument: a provider that sends
+        # the prompt on stdin has none, and its last argument is a flag value.
+        shown = [
+            "<prompt>" if plan.prompt_full and arg == plan.prompt_full else arg
+            for arg in plan.command
+        ]
+        print(f"Command:  {' '.join(redact_argv(shown))}")
         print(f"Timeout:  {plan.timeout_seconds}s")
     print(f"Routing:  {plan.routing}")
     print(f"Expected next: {plan.expected_next or '-'}")

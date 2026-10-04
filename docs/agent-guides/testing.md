@@ -12,7 +12,7 @@ contract.
 
 Every behavioral change should include or update automated tests.
 
-Do not call real Claude Code/OpenCode/GitHub write APIs from unit tests.
+Do not call real Claude Code/OpenCode/Pi/GitHub write APIs from unit tests.
 
 Use mocks, fakes, fixtures, and scripted providers.
 
@@ -120,3 +120,37 @@ INITIALIZING
 ```
 
 without external writes.
+
+### Provider parity (Pi, #133)
+
+Pi is held to what the scripted provider is held to, at the engine
+boundary: the real `PiProvider` and the real duplex child run against the
+fake `pi` in `tests/pi_fake.py` (`PiFake`, `ScriptedPi`), whose agent work
+is scripted with the same handlers `ScriptedProvider` takes. Keep covered:
+
+- REMOTE routing with every profile on Pi through review rounds 1, 2-5 and
+  6+, MERGE (gate open in the test config only) and UPDATE_EPIC: each RPC
+  child's `--model` / `--thinking` is that of the routed profile, its cwd
+  is the per-issue worktree; and the mixed configurations (Claude Code
+  writers with Pi reviewers, and the reverse)
+- REPLAN_REEXECUTE on Pi: the same transaction, markers, close and
+  activation; a replacement PR the fake GitHub lacks is refused identically
+- a Pi claim the fake GitHub does not back fails with the same error and
+  state as the same claim from `ScriptedProvider`
+- LOCAL on Pi: cwd is the repository root, no GitHub access, LOCAL prompts
+  over RPC, every write-capable launch (corrections included) charged to
+  the durable checkpoint, and a Pi process writing into the tree during
+  REVIEW refused by the existing drift check
+- a correction is a second, separate Pi process with identical argv and no
+  session reuse, its RPC prompt carries the parse error, the entry
+  reconciliation runs before it, and `max_correction_attempts` bounds it
+- failures leave state unchanged and `resume` relaunches: the deadline
+  (`ExecutionTimeoutError`, with the leftover sentence), the credential
+  preflight, a rejected prompt, `stopReason: error`, an exit before
+  `agent_settled` and a model mismatch (`ExecutionError`, stdout and stderr
+  recorded)
+- run logs: argv without the prompt and the env allow-list (Pi's names, no
+  `OPENAI_*`) in `request.json`, the Pi summary in `execution.json`, only
+  the final text in `stdout.log`, stderr separate, and a credential-shaped
+  string redacted in every file
+- dry-run with Pi profiles prints the Pi argv and starts nothing

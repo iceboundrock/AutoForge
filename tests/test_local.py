@@ -3225,3 +3225,127 @@ def test_the_readme_no_github_promise_is_the_controllers_not_the_runs():
     assert "docs/adr/0001-local-mode-workspace-identity-and-filesystem-boundary.md" in flat
     assert "§2.2" in flat and "§8.1" in flat
     assert "tracked in #10" in flat
+
+
+# -- Pi parity (#133) --------------------------------------------------------------
+def _local_on_pi(root: Path, tmp_path_factory, cfg=None):
+    """A LOCAL engine with every profile on Pi; the fake lives outside ``root``.
+
+    The handler is installed later (``eng.pi._handler``), as the tests above
+    install ``eng.provider._handler``.
+    """
+    from tests.pi_fake import PiFake, ScriptedPi, route_to_pi
+
+    cfg = cfg or default_config()
+    fake = PiFake(tmp_path_factory.mktemp("pi"))
+    route_to_pi(cfg, fake)
+    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
+    eng.pi = ScriptedPi(fake)
+    eng.providers._overrides["pi"] = eng.pi
+    return eng, fake
+
+
+def test_a_local_pi_run_reaches_done_in_the_repository_without_github(tmp_path, tmp_path_factory):
+    """LOCAL on Pi: implement, review with a finding, fix, clean review, DONE.
+    Every RPC child starts in the repository root, receives the LOCAL prompt
+    over RPC and is routed through its own profile; ``ExplodingGitHub``
+    proves nothing reached for GitHub, and the review fingerprint the
+    controller binds is the one the reviewers echo (the fake lives outside
+    the tree, so nothing it writes moves the fingerprint)."""
+    from tests.pi_fake import PI_PROFILES, flag
+
+    root = local_repo(tmp_path)
+    eng, fake = _local_on_pi(root, tmp_path_factory)
+    eng.pi._handler = scripted(
+        eng,
+        root,
+        [
+            (lambda r: touch_impl(r, "v1\n"), lambda e: impl_result()),
+            (None, lambda e: review_result(e.state.workspace_fingerprint, 1, [finding(1)])),
+            (lambda r: touch_impl(r, "v2\n"), lambda e: fix_result(["R1-F1"])),
+            (None, lambda e: review_result(e.state.workspace_fingerprint, 2)),
+        ],
+    )
+    eng.run(max_steps=10)
+
+    assert eng.state.phase == Phase.DONE
+    expected = ["analyze_execute", "review_round_1", "fix", "review_round_2_5"]
+    assert [req.profile.name for req in eng.pi.calls] == expected
+    launches = fake.launches()
+    assert [(flag(e["argv"], "--model"), flag(e["argv"], "--thinking")) for e in launches] == [
+        PI_PROFILES[name] for name in expected
+    ]
+    assert {os.path.realpath(e["cwd"]) for e in launches} == {os.path.realpath(root)}
+    prompts = fake.prompts()
+    assert prompts == [req.prompt for req in eng.pi.calls]
+    assert all("running in **LOCAL mode**" in p for p in prompts)
+    assert eng.provider.calls == []
+
+
+@pytest.mark.parametrize("phase", [Phase.ANALYZE_EXECUTE, Phase.FIX])
+def test_pi_correction_retries_are_charged_as_scripted_ones_are(tmp_path, tmp_path_factory, phase):
+    """Every write-capable Pi launch, corrections included, is charged to the
+    durable LOCAL checkpoint before it starts, exactly as for ScriptedProvider
+    (`test_correction_retries_are_charged_against_the_same_durable_bound`)."""
+    root = local_repo(tmp_path)
+    cfg = default_config()
+    cfg.execution.max_correction_attempts = 5
+    eng, fake = _local_on_pi(root, tmp_path_factory, cfg=cfg)
+    eng.step()  # INITIALIZING -> ANALYZE_EXECUTE
+    if phase is Phase.FIX:
+        eng.pi._handler = scripted(
+            eng,
+            root,
+            [
+                (lambda r: touch_impl(r, "v1\n"), lambda e: impl_result()),
+                (None, lambda e: review_result(e.state.workspace_fingerprint, 1, [finding(1)])),
+            ],
+        )
+        eng.step()
+        eng.step()
+    assert eng.state.phase is phase
+    before = len(fake.launches())
+
+    seen: list[int] = []
+
+    def malformed(req):
+        seen.append(load_state(eng.paths.state_file).local_pending_attempts)
+        touch_impl(root, f"garbage {len(seen)}\n")
+        return "I did some work but forgot the control block.\n"
+
+    eng.pi._handler = malformed
+    with pytest.raises(ControlResultValidationError, match="Not re-invoked"):
+        eng.step()
+    assert seen == [1, 2, 3], "every launch is checkpointed before it starts"
+    assert len(fake.launches()) - before == 3
+    assert load_state(eng.paths.state_file).local_pending_attempts == 3
+    assert eng.step().next_phase == "BLOCKED"
+    assert len(fake.launches()) - before == 3, "a blocked phase must not launch Pi"
+
+
+def test_a_pi_reviewer_that_writes_into_the_tree_is_refused(tmp_path, tmp_path_factory):
+    """The Pi process itself writes into its working directory during REVIEW
+    (as its edit tool would) while echoing the bound fingerprint: the
+    existing drift check refuses the review and the phase does not advance."""
+    from tests.pi_fake import PiTurn
+
+    root = local_repo(tmp_path)
+    eng, _ = _local_on_pi(root, tmp_path_factory)
+    eng.pi._handler = scripted(
+        eng,
+        root,
+        [
+            (lambda r: touch_impl(r, "v1\n"), lambda e: impl_result()),
+            (
+                None,
+                lambda e: PiTurn(
+                    text=review_result(e.state.workspace_fingerprint),
+                    writes={IMPL_FILE: "reviewer sneaked this in\n"},
+                ),
+            ),
+        ],
+    )
+    with pytest.raises(VerificationError, match="must not change what it reviews"):
+        eng.run(max_steps=5)
+    assert eng.state.phase == Phase.REVIEW
+    assert (root / IMPL_FILE).read_text(encoding="utf-8") == "reviewer sneaked this in\n"

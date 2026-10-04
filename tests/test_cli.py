@@ -1990,3 +1990,74 @@ def test_unblock_is_refused_while_the_repository_is_locked(tmp_path, capsys, mon
     assert rc == 2
     assert "lock" in capsys.readouterr().err.lower()
     assert load_state(tmp_path / ".autoforge" / "state.json").phase == Phase.BLOCKED
+
+
+def test_dry_run_with_pi_profiles_prints_the_pi_argv_and_spawns_nothing(
+    tmp_path, tmp_path_factory, capsys, monkeypatch, fakes
+):
+    """#133: `run --dry-run` and `step --dry-run` with every profile on Pi
+    print the Pi argv of the routed profile and never start `pi`: the fake
+    logs every start (RPC child or auth preflight) to a marker file, and the
+    real PiProvider is the one routed here (only Claude Code and OpenCode
+    are scripted by `fakes`)."""
+    from tests.pi_fake import PI_PROFILES, PiFake
+
+    fake = PiFake(tmp_path_factory.mktemp("pi"))
+    cfg = tmp_path_factory.mktemp("cfg") / "cfg.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "profiles": {
+                    name: {
+                        "provider": "pi",
+                        "model": model,
+                        "effort": effort,
+                        "command": str(fake.command),
+                        "extra_args": [],
+                        "options": {},
+                    }
+                    for name, (model, effort) in PI_PROFILES.items()
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    base = ["--config", str(cfg), "--state-dir", sd]
+    pi_argv = f"{fake.command} --mode rpc --no-session"
+    analyze = "--model openai/pi-analyze --thinking high"
+
+    assert cli.main([*base, "run", "--epic", EPIC, "--issue", ISSUE, "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    (command,) = [line for line in out.splitlines() if line.startswith("Command:")]
+    # Pi takes the prompt on stdin: no argument is the prompt, so none is
+    # replaced by the placeholder and the thinking level is shown.
+    assert pi_argv in command and command.endswith(analyze)
+    assert not os.path.exists(sd)
+
+    assert cli.main([*base, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"]) == 0
+    capsys.readouterr()
+    assert cli.main([*base, "step", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert pi_argv in out and analyze in out
+    assert not fake.spawned()
+    assert fakes["provider"].calls == []
+
+
+def test_dry_run_shows_the_prompt_argument_as_a_placeholder(tmp_path, capsys, monkeypatch, fakes):
+    """A provider that passes the prompt as an argument (here the scripted
+    stand-in for Claude Code) shows that argument as `<prompt>`; the prompt
+    itself is previewed below the command."""
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    assert (
+        cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"])
+        == 0
+    )
+    capsys.readouterr()
+    assert cli.main(["--state-dir", sd, "step", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    (command,) = [line for line in out.splitlines() if line.startswith("Command:")]
+    assert command == "Command:  scripted-agent --profile=analyze_execute -- <prompt>"

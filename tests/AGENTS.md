@@ -8,9 +8,10 @@ read it before adding tests for a listed area.
 
 ## What a test may never do
 
-- Never call real Claude Code, OpenCode, or GitHub write APIs. Agents are
-  replaced by scripted providers and GitHub by an in-memory fake; the
-  executor tests use real local Python subprocesses only.
+- Never call real Claude Code, OpenCode, or Pi, and never call GitHub write
+  APIs. Agents are replaced by scripted providers (Pi by the fake `pi` of
+  `tests/pi_fake.py`) and GitHub by an in-memory fake; the executor tests
+  use real local Python subprocesses only.
 - Never merge a real PR, push to a real remote, or touch a checkout outside
   `tmp_path`.
 - Never weaken an assertion, a safety gate, or a verification step to make an
@@ -27,6 +28,12 @@ read it before adding tests for a listed area.
   `make_local_engine` build a controller against those fakes; `block(...)`
   and `review_comment_body(...)` build well-formed `CONTROL_RESULT` blocks and
   review comments. Reuse these rather than hand-rolling fakes.
+- `tests/pi_fake.py` holds the engine-level Pi harness: `PiFake` (a fake
+  `pi` executable outside the repository that logs every start, argv, cwd,
+  environment name and RPC record) and `ScriptedPi` (the real
+  `PiProvider`, preceded by a `ScriptedProvider`-style handler that may
+  return a `PiTurn` to script a failure); `make_pi_engine` / `route_to_pi`
+  route profiles to it.
 - Recovery tests reload state from disk after each step; a crash-recovery
   test performs the external side effect first and only then interrupts,
   because that is the window the controller must survive.
