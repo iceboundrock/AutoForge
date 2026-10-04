@@ -36,19 +36,31 @@ Safety properties:
   of all of it, so an agent or a repository-defined command never sees a
   credential that was in the operator's shell but has nothing to do with
   the run. Which names are allowed is policy and belongs to the caller; the
-  executor only applies the selection.
+  executor only applies the selection;
+- on request (``contain_orphans``), what left the group is caught too: on
+  Linux the controller is a child subreaper for the invocation
+  (``prctl(PR_SET_CHILD_SUBREAPER)``), so a process that called ``setsid``
+  (or was started detached) and whose parent then died is re-parented to the
+  controller instead of to init; at teardown every such orphan is killed
+  (SIGTERM, then SIGKILL, its own process group with it) and reported
+  (:attr:`ExecutionResult.orphans_killed`,
+  :attr:`ExecutionResult.orphan_survived_kill`). Where no subreaper exists
+  the result says the check could not be made
+  (:attr:`ExecutionResult.orphans_unchecked`). See the ADR 0002 amendment.
 """
 
 from __future__ import annotations
 
+import ctypes
 import os
 import re
 import selectors
 import signal
 import subprocess
+import sys
 import threading
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import IO
@@ -128,6 +140,11 @@ class ExecutionRequest:
     # starts from only those variables (see :func:`select_environment`); an
     # empty tuple is an empty environment.
     env_allowlist: tuple[str, ...] | None = None
+    # Catch and kill what the child started outside its process group (see
+    # :class:`_Containment`). For agents and repository-defined commands; the
+    # controller's own git/gh plumbing leaves it off, so a ``git gc --auto``
+    # that git daemonized on purpose is left alone.
+    contain_orphans: bool = False
 
 
 @dataclass
@@ -160,6 +177,15 @@ class ExecutionResult:
     # (one that left the group) still holds it; what was read before the
     # capture was abandoned is what the streams contain.
     capture_abandoned: bool = False
+    # ``contain_orphans`` only. A process the invocation started had left the
+    # group and outlived its parent (re-parented to the controller), so it
+    # was killed; set on any path, a timeout included.
+    orphans_killed: bool = False
+    # Such an orphan was still alive after the SIGKILL grace.
+    orphan_survived_kill: bool = False
+    # Containment was requested but this platform has no child subreaper, so
+    # a process that left the group was neither seen nor killed.
+    orphans_unchecked: bool = False
 
     @property
     def stdout_tail(self) -> str:
@@ -182,6 +208,9 @@ class ExecutionResult:
             descendants_killed=self.descendants_killed,
             group_survived_kill=self.group_survived_kill,
             capture_abandoned=self.capture_abandoned,
+            orphans_killed=self.orphans_killed,
+            orphan_survived_kill=self.orphan_survived_kill,
+            orphans_unchecked=self.orphans_unchecked,
         )
 
     @property
@@ -204,11 +233,17 @@ class ExecutionResult:
 
 
 def describe_leftovers(
-    *, descendants_killed: bool, group_survived_kill: bool, capture_abandoned: bool
+    *,
+    descendants_killed: bool,
+    group_survived_kill: bool,
+    capture_abandoned: bool,
+    orphans_killed: bool = False,
+    orphan_survived_kill: bool = False,
+    orphans_unchecked: bool = False,
 ) -> str:
     """One sentence naming what an invocation left behind; empty when nothing.
 
-    The three facts are the executor's (see :class:`ExecutionResult`); the
+    The facts are the executor's (see :class:`ExecutionResult`); the
     sentence is for a run log or an error, so an operator is pointed at a
     leftover process rather than at a slow agent or a clean kill.
     """
@@ -227,6 +262,21 @@ def describe_leftovers(
         parts.append(
             "its output pipes never reached EOF, so a process outside its group (one that "
             "called setsid) still holds them and may still be running"
+        )
+    if orphans_killed:
+        parts.append(
+            "it left processes outside its process group (re-parented to the controller), "
+            "so they were killed"
+        )
+    if orphan_survived_kill:
+        parts.append(
+            "a process it left outside its process group was still alive after SIGKILL, so "
+            "it may still be running"
+        )
+    if orphans_unchecked:
+        parts.append(
+            "processes it may have left outside its process group could not be checked on "
+            "this platform (no child subreaper), so one may still be running"
         )
     return "; ".join(parts)
 
@@ -448,6 +498,206 @@ def _group_gone(pgid: int, deadline: float) -> bool:
     return True
 
 
+# prctl(2) options; Linux only.
+_PR_SET_CHILD_SUBREAPER = 36
+_PR_GET_CHILD_SUBREAPER = 37
+
+# One contained invocation at a time per controller process: the orphans of
+# an invocation are told apart from the controller's other children by being
+# new, which holds only while nothing else spawns meanwhile. The engine runs
+# its invocations one after another, so this never waits; a second one is a
+# refusal, not a queue.
+_CONTAINMENT_LOCK = threading.Lock()
+
+
+def _prctl() -> Callable[..., int] | None:
+    """libc's ``prctl``, or None where there is none (not Linux)."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        return ctypes.CDLL(None, use_errno=True).prctl  # type: ignore[no-any-return]
+    except (OSError, AttributeError):
+        return None
+
+
+def _children() -> dict[tuple[int, int], bool]:
+    """This process's children as ``(pid, start time) -> is a zombie``.
+
+    The start time (``/proc/<pid>/stat`` field 22) makes the key unique across
+    a pid reuse. Children are listed through ``/proc/self/task/*/children``
+    when the kernel provides it and by a scan of ``/proc`` otherwise; a
+    process that is gone by the time it is read is simply not listed.
+    """
+    own = os.getpid()
+    pids: set[int] = set()
+    try:
+        for task in os.scandir(f"/proc/{own}/task"):
+            with open(f"{task.path}/children") as fh:
+                pids.update(int(pid) for pid in fh.read().split())
+        scan = False
+    except OSError:
+        scan = True
+    if scan:
+        pids = {int(entry.name) for entry in os.scandir("/proc") if entry.name.isdigit()}
+    found: dict[tuple[int, int], bool] = {}
+    for pid in pids:
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as fh:
+                stat = fh.read()
+        except OSError:
+            continue
+        # ``pid (comm) state ppid ...``: comm may hold spaces and parentheses,
+        # so the fields are counted from the last ``)``.
+        fields = stat[stat.rfind(b")") + 2 :].split()
+        if len(fields) < 20 or int(fields[1]) != own:
+            continue
+        found[(pid, int(fields[19]))] = fields[0] == b"Z"
+    return found
+
+
+class _Containment:
+    """Catch the orphans of one invocation (the ADR 0002 amendment, #132).
+
+    A process that calls ``setsid`` (or is spawned detached, as Pi's bash tool
+    spawns every command) leaves the child's process group, and the group kill
+    cannot reach it. On Linux the controller marks itself a child subreaper
+    for the invocation, so when such a process's parent dies it is
+    re-parented to the controller rather than to init: the orphans are then
+    exactly the controller's children that were not there before the
+    invocation and are not the child itself. Being the controller's unreaped
+    children, their pids cannot be reused, so signalling them is safe.
+
+    Each orphan is signalled with its process group (unless that is the
+    controller's own), which reaches what it started in turn; whatever is
+    re-parented as its parents die is signalled when it appears. Dead orphans
+    are reaped here, since nothing else waits for them. :meth:`release`
+    restores the previous subreaper setting; an orphan still alive then
+    stays the controller's child, and is reported, not hidden.
+    """
+
+    def __init__(self, prctl: Callable[..., int], previous: int) -> None:
+        self._prctl = prctl
+        self._previous = previous
+        self._before = frozenset(_children())
+        self.child: int | None = None
+        self.found = False
+        self._signalled: dict[signal.Signals, set[tuple[int, int]]] = {}
+        self._released = False
+
+    @classmethod
+    def begin(cls) -> _Containment | None:
+        """Start containing; None when this platform has no child subreaper.
+
+        Raises :class:`ExecutionError` when another contained invocation is
+        running in this process.
+        """
+        prctl = _prctl()
+        if prctl is None:
+            return None
+        if not _CONTAINMENT_LOCK.acquire(blocking=False):
+            raise ExecutionError(
+                "another orphan-contained invocation is already running in this process"
+            )
+        try:
+            previous = ctypes.c_int(0)
+            if prctl(_PR_GET_CHILD_SUBREAPER, ctypes.byref(previous), 0, 0, 0) != 0:
+                _CONTAINMENT_LOCK.release()
+                return None
+            contained = cls(prctl, previous.value)
+            if prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+                _CONTAINMENT_LOCK.release()
+                return None
+        except BaseException:
+            _CONTAINMENT_LOCK.release()
+            raise
+        return contained
+
+    def _live(self) -> set[tuple[int, int]]:
+        """The orphans still alive; the dead ones are reaped on the way.
+
+        A process still in the child's group was re-parented here too when
+        its parent died, but it is the group kill's, not an orphan: it is
+        reaped once dead and otherwise left to the group checks.
+        """
+        live: set[tuple[int, int]] = set()
+        for key, zombie in _children().items():
+            pid = key[0]
+            if key in self._before or pid == self.child:
+                continue
+            if zombie:
+                try:
+                    os.waitpid(pid, os.WNOHANG)
+                except ChildProcessError:
+                    pass
+                for sent in self._signalled.values():
+                    sent.discard(key)
+                continue
+            try:
+                in_group = os.getpgid(pid) == self.child
+            except OSError:
+                continue  # gone meanwhile; reaped on the next look
+            if not in_group:
+                live.add(key)
+        return live
+
+    def _send(self, key: tuple[int, int], sig: signal.Signals) -> None:
+        pid = key[0]
+        self._signalled.setdefault(sig, set()).add(key)
+        self.found = True
+        try:
+            pgid = os.getpgid(pid)
+            if pgid != os.getpgrp():
+                os.killpg(pgid, sig)
+            os.kill(pid, sig)
+        except OSError:
+            pass  # exited meanwhile; it is reaped on the next look
+
+    def send_all(self, sig: signal.Signals) -> bool:
+        """Send ``sig`` to every live orphan; False when there is none."""
+        live = self._live()
+        for key in live:
+            self._send(key, sig)
+        return bool(live)
+
+    def gone(self, deadline: float, sig: signal.Signals) -> bool:
+        """Poll until no orphan is alive or ``deadline``; True when none is.
+
+        An orphan that appears meanwhile (re-parented as its parent died) is
+        sent ``sig`` too.
+        """
+        while True:
+            live = self._live()
+            for key in live - self._signalled.get(sig, set()):
+                self._send(key, sig)
+            if not live:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(_GROUP_POLL_SECONDS)
+
+    def settled(self, deadline: float) -> bool:
+        """Poll until no orphan is alive or ``deadline``, signalling nothing."""
+        while self._live():
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(_GROUP_POLL_SECONDS)
+        return True
+
+    def alive(self) -> bool:
+        return bool(self._live())
+
+    def release(self) -> None:
+        """Restore the previous subreaper setting and reap what has died. Idempotent."""
+        if self._released:
+            return
+        self._released = True
+        try:
+            self._live()
+        finally:
+            self._prctl(_PR_SET_CHILD_SUBREAPER, self._previous, 0, 0, 0)
+            _CONTAINMENT_LOCK.release()
+
+
 @dataclass(frozen=True)
 class _Termination:
     """What a group kill left behind: nothing, when both are False."""
@@ -456,10 +706,15 @@ class _Termination:
     group_survived: bool
     # A pipe never reached EOF and the capture was abandoned.
     capture_abandoned: bool
+    # An orphan (see :class:`_Containment`) was still alive after SIGKILL.
+    orphan_survived: bool = False
 
 
 def _terminate_group(
-    pgid: int, proc: subprocess.Popen, readers: tuple[_PipeDrain, ...]
+    pgid: int,
+    proc: subprocess.Popen,
+    readers: tuple[_PipeDrain, ...],
+    contained: _Containment | None = None,
 ) -> _Termination:
     """SIGTERM the child's process group, escalate to SIGKILL, and stop reading.
 
@@ -480,13 +735,26 @@ def _terminate_group(
     it finally dies. The return value names what was left: a member still
     in the group, and a capture that had to be abandoned, so the caller can
     report an unclean kill instead of a clean one.
+
+    With ``contained``, the invocation's orphans get each signal with the
+    group, and the kill is complete only once none is alive either; a
+    ``setsid`` writer is then one of them, so its pipes reach EOF instead of
+    being abandoned.
     """
     deadline = time.monotonic() + _KILL_GRACE_SECONDS
     for sig in (signal.SIGTERM, signal.SIGKILL):
-        if not _signal_group(pgid, sig):
+        signalled = _signal_group(pgid, sig)
+        if contained is not None and contained.send_all(sig):
+            signalled = True
+        if not signalled:
             break
         deadline = time.monotonic() + _KILL_GRACE_SECONDS
-        if _reaped(proc, deadline) and _eof(readers, deadline) and _group_gone(pgid, deadline):
+        if (
+            _reaped(proc, deadline)
+            and _eof(readers, deadline)
+            and _group_gone(pgid, deadline)
+            and (contained is None or contained.gone(deadline, sig))
+        ):
             return _Termination(group_survived=False, capture_abandoned=False)
     # The group is empty (the signal found nobody) or its remains are past
     # help; the remaining EOF wait runs out the deadline already in hand,
@@ -495,7 +763,11 @@ def _terminate_group(
     if abandoned:
         for reader in readers:
             reader.abandon()
-    return _Termination(group_survived=_group_alive(pgid), capture_abandoned=abandoned)
+    return _Termination(
+        group_survived=_group_alive(pgid),
+        capture_abandoned=abandoned,
+        orphan_survived=contained is not None and contained.alive(),
+    )
 
 
 def _child_environment(
@@ -558,11 +830,24 @@ def execute(req: ExecutionRequest) -> ExecutionResult:
     raised) so callers can log stdout/stderr first; use ``raise_if_failed()``
     to convert. ExecutionError is raised only when the process cannot be
     spawned or its output cannot be read.
+
+    With ``contain_orphans`` the invocation's orphans (:class:`_Containment`)
+    count as part of what must be gone: they get the exit grace and the kill
+    the group gets, within the same bounds.
     """
     if not req.command:
         raise ExecutionError("empty command")
     if req.max_output_bytes <= 0:
         raise ExecutionError(f"max_output_bytes must be > 0, got {req.max_output_bytes}")
+    contained = _Containment.begin() if req.contain_orphans else None
+    try:
+        return _execute(req, contained)
+    finally:
+        if contained is not None:
+            contained.release()
+
+
+def _execute(req: ExecutionRequest, contained: _Containment | None) -> ExecutionResult:
     started = _now()
     timeout = req.timeout_seconds if req.timeout_seconds > 0 else None
     proc = _spawn(
@@ -572,6 +857,8 @@ def execute(req: ExecutionRequest) -> ExecutionResult:
         stdin=subprocess.DEVNULL,
     )
     assert proc.stdout is not None and proc.stderr is not None
+    if contained is not None:
+        contained.child = proc.pid
     pgid = proc.pid  # start_new_session: the child leads a group of its own
     # Output is read as bytes and decoded with replacement: agent output is
     # untrusted (a dumped binary, a mis-encoded file the agent cats), and a
@@ -592,7 +879,7 @@ def execute(req: ExecutionRequest) -> ExecutionResult:
         except subprocess.TimeoutExpired:
             timed_out = True
         if timed_out:
-            left = _terminate_group(pgid, proc, readers)
+            left = _terminate_group(pgid, proc, readers, contained)
         else:
             # The child has exited, but the invocation is over only at EOF
             # and once no process is left in its group. A child that left
@@ -603,12 +890,15 @@ def execute(req: ExecutionRequest) -> ExecutionResult:
             # while a member lives; once the group is empty the id is free
             # for reuse, which only a pid wrap-around inside this window
             # could bring about.
+            # An orphan still alive past the same grace is killed with
+            # them, and reported as an orphan, not as a group member.
             grace = time.monotonic() + _EXIT_GRACE_SECONDS
-            if not (_eof(readers, grace) and _group_gone(pgid, grace)):
-                descendants_killed = True
-                left = _terminate_group(pgid, proc, readers)
+            group_settled = _eof(readers, grace) and _group_gone(pgid, grace)
+            if not (group_settled and (contained is None or contained.settled(grace))):
+                descendants_killed = not group_settled
+                left = _terminate_group(pgid, proc, readers, contained)
     except BaseException:
-        _terminate_group(pgid, proc, readers)
+        _terminate_group(pgid, proc, readers, contained)
         raise
     finally:
         for reader in readers:
@@ -637,4 +927,7 @@ def execute(req: ExecutionRequest) -> ExecutionResult:
         descendants_killed=descendants_killed,
         group_survived_kill=left.group_survived,
         capture_abandoned=left.capture_abandoned,
+        orphans_killed=contained is not None and contained.found,
+        orphan_survived_kill=left.orphan_survived,
+        orphans_unchecked=req.contain_orphans and contained is None,
     )

@@ -32,6 +32,7 @@ description of how AutoForge behaves.
 | [CONTROL_RESULT protocol](agent-guides/control-result-protocol.md) | the machine-readable result block, per-phase required fields, payload bounds, findings versus observations |
 | [Replan transaction](agent-guides/replan-transaction.md) | the durable `REPLAN_REEXECUTE` transaction: provenance, the checkpointed close, compensation and recovery |
 | [Secrets and logging](agent-guides/secrets-and-logging.md) | what is redacted, and what may never be logged or committed |
+| [Pi policy](pi-policy.md) | what an unattended Pi run may load (project trust, extensions, packages, MCP, context files, tools), its credentials, and the evidence for each decision |
 
 ## Contributing
 

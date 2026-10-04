@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -602,6 +603,13 @@ scenario = json.load(open(sys.argv[1]))
 log = open(scenario["log"], "a")
 log.write(json.dumps({"argv": sys.argv[2:]}) + "\n")
 log.flush()
+if sys.argv[2:4] == ["auth", "check"]:
+    # The per-launch preflight; `env` lets a test see what reached it.
+    log.write(json.dumps({"auth_env": sorted(k for k in __import__("os").environ)}) + "\n")
+    log.flush()
+    auth = scenario.get("auth", {"status": "ready", "provider": "openai", "authType": "oauth"})
+    print(json.dumps(auth))
+    sys.exit(scenario.get("auth_exit", 0))
 out = sys.stdout.buffer
 eol = b"\r\n" if scenario.get("crlf") else b"\n"
 ids = {}
@@ -633,6 +641,16 @@ def run(actions):
         elif "spawn_holder" in a:
             holder = "import time; time.sleep(%d)" % a["spawn_holder"]
             subprocess.Popen([sys.executable, "-c", holder])
+        elif "spawn_detached" in a:
+            # As Pi's bash tool starts a command: in a session of its own,
+            # holding none of Pi's pipes.
+            detached = "import time; time.sleep(%d)" % a["spawn_detached"]
+            child = subprocess.Popen(
+                [sys.executable, "-c", detached], start_new_session=True,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            log.write(json.dumps({"detached": child.pid}) + "\n")
+            log.flush()
         elif "exit" in a:
             sys.exit(a["exit"])
 
@@ -693,25 +711,50 @@ class FakePi:
         return [json.loads(line)["type"] for line in self.stdin()]
 
     def argv(self) -> list[str]:
-        return next(e["argv"] for e in self.entries() if "argv" in e)
+        """The RPC launch's argv (the auth preflight's is :meth:`auth_argvs`)."""
+        return next(e["argv"] for e in self.entries() if e.get("argv", [""])[0] == "--mode")
+
+    def launched(self) -> bool:
+        return any(e.get("argv", [""])[0] == "--mode" for e in self.entries())
+
+    def auth_argvs(self) -> list[list[str]]:
+        return [e["argv"] for e in self.entries() if e.get("argv", [""])[:2] == ["auth", "check"]]
+
+    def auth_env(self) -> list[str]:
+        return next(e["auth_env"] for e in self.entries() if "auth_env" in e)
 
 
-def _profile(command: Path, effort: str = "high") -> ProfileConfig:
+def _profile(
+    command: Path, effort: str = "high", name: str = "analyze_execute", **options: str
+) -> ProfileConfig:
     return ProfileConfig(
-        name="analyze_execute", provider="pi", model=MODEL, effort=effort, command=str(command)
+        name=name,
+        provider="pi",
+        model=MODEL,
+        effort=effort,
+        command=str(command),
+        options=options,
     )
 
 
-def _execute(tmp_path, scenario, timeout=20, prompt="implement #131", **kw):
+def _execute(
+    tmp_path,
+    scenario,
+    timeout=20,
+    prompt="implement #131",
+    options=None,
+    env_allowlist=("PATH",),
+    **kw,
+):
     fake = FakePi(tmp_path, scenario)
     provider = PiProvider(round_trip_seconds=5, abort_seconds=1, **kw)
     req = AgentRequest(
         phase="ANALYZE_EXECUTE",
         prompt=prompt,
         cwd=str(tmp_path),
-        profile=_profile(fake.command),
+        profile=_profile(fake.command, **(options or {})),
         timeout_seconds=timeout,
-        env_allowlist=("PATH",),
+        env_allowlist=env_allowlist,
     )
     return provider.execute(req), fake
 
@@ -729,12 +772,45 @@ def test_provider_happy_path_returns_the_final_text_byte_for_byte(tmp_path):
     ]
     assert json.loads(fake.stdin()[2])["message"] == "implement #131"
     # The prompt is never in argv: it travelled as the stdin record above.
-    assert fake.argv() == ["--mode", "rpc", "--no-session", "--model", MODEL, "--thinking", "high"]
+    assert fake.argv() == [
+        "--mode",
+        "rpc",
+        "--no-session",
+        "--no-approve",
+        "--no-extensions",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-themes",
+        "--offline",
+        "--tools",
+        "read,bash,edit,write",
+        "--model",
+        MODEL,
+        "--thinking",
+        "high",
+    ]
+    # The launch was preceded by one read-only auth check for the same model.
+    assert fake.auth_argvs() == [["auth", "check", "--model", MODEL, "--json", "--no-refresh"]]
     assert "implement #131" not in " ".join(res.command)
     assert (res.provider, res.model, res.effort) == ("pi", MODEL, "high")
     assert res.provider_summary["stop_reason"] == "stop"
     assert res.provider_summary["resolved_model_id"] == "gpt-5.6-terra"
     assert not (res.descendants_killed or res.group_survived_kill or res.capture_abandoned)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux-only subreaper")
+def test_provider_a_detached_tool_process_is_killed_and_reported(tmp_path):
+    """Pi's bash tool detaches every command; what one leaves running after
+    Pi exits is caught and killed, and the result is kept (ADR 0002 §4b)."""
+    scenario = _happy()
+    scenario["on"]["prompt"].insert(1, {"spawn_detached": 60})
+    res, fake = _execute(tmp_path, scenario)
+    assert res.provider_failure is None and res.stdout == FINAL and res.exit_code == 0
+    assert res.orphans_killed and not res.orphan_survived_kill and not res.orphans_unchecked
+    assert not res.descendants_killed
+    pid = next(e["detached"] for e in fake.entries() if "detached" in e)
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
 
 
 def test_provider_crlf_records_and_raw_u2028_in_strings(tmp_path):
@@ -915,10 +991,276 @@ def test_provider_keeps_the_tail_of_a_text_past_the_bound(tmp_path):
     assert parse_control_result(res.stdout_tail, Phase.ANALYZE_EXECUTE) == ANALYZE_OK
 
 
-def test_provider_a_spawn_failure_raises_execution_error(tmp_path):
+@pytest.mark.parametrize("require_oauth", ["true", "false"])
+def test_provider_a_spawn_failure_raises_execution_error(tmp_path, require_oauth):
     provider = PiProvider()
-    req = AgentRequest(
-        "REVIEW", "p", str(tmp_path), _profile(tmp_path / "no-such-pi"), 5, env_allowlist=("PATH",)
-    )
+    profile = _profile(tmp_path / "no-such-pi", require_oauth=require_oauth)
+    req = AgentRequest("REVIEW", "p", str(tmp_path), profile, 5, env_allowlist=("PATH",))
     with pytest.raises(ExecutionError):
         provider.execute(req)
+
+
+# -- the unattended loading policy (docs/pi-policy.md) ------------------------------------------
+_ALWAYS = [
+    "--no-approve",
+    "--no-extensions",
+    "--no-skills",
+    "--no-prompt-templates",
+    "--no-themes",
+    "--offline",
+]
+
+
+@pytest.mark.parametrize(
+    ("name", "options", "tools"),
+    [
+        ("analyze_execute", {}, "read,bash,edit,write"),
+        ("fix", {}, "read,bash,edit,write"),
+        ("replan_reexecute", {}, "read,bash,edit,write"),
+        ("review_round_1", {}, "read,bash"),
+        ("review_round_6_plus", {}, "read,bash"),
+        ("update_epic", {}, "read,bash"),
+        ("default", {}, "read,bash"),
+        ("review_round_1", {"tools": "read,bash,grep,find,ls"}, "read,bash,grep,find,ls"),
+        ("analyze_execute", {"tools": "read"}, "read"),
+    ],
+)
+def test_argv_always_disables_project_resources_and_names_the_tools(name, options, tools):
+    profile = _profile(Path("/opt/pi"), name=name, **options)
+    PiProvider().validate_profile(profile)
+    argv = PiProvider().build_command_for(profile, "prompt")
+    assert argv[:4] == ["/opt/pi", "--mode", "rpc", "--no-session"]
+    assert argv[4:10] == _ALWAYS
+    assert argv[10:12] == ["--tools", tools]
+    assert argv[12:] == ["--model", MODEL, "--thinking", "high"]
+    # Nothing that would turn trust or approvals on, or put a key in argv.
+    assert not {"--approve", "-a", "--api-key", "--no-context-files"} & set(argv)
+
+
+def test_context_files_false_adds_no_context_files():
+    profile = _profile(Path("/opt/pi"), context_files="false")
+    PiProvider().validate_profile(profile)
+    argv = PiProvider().build_command_for(profile, "prompt")
+    assert argv[4:10] == _ALWAYS and argv[12] == "--no-context-files"
+    assert argv[13:] == ["--model", MODEL, "--thinking", "high"]
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"tools": ""}, "no empty entry"),
+        ({"tools": "read, bash"}, "no spaces"),
+        ({"tools": "read,,bash"}, "no empty entry"),
+        ({"tools": "read,bash,"}, "no empty entry"),
+        ({"tools": "Read"}, "no spaces"),
+        ({"tools": "read,bogus"}, "unknown tool(s) bogus"),
+        ({"tools": "read,read"}, "listed twice"),
+        ({"context_files": "no"}, "context_files must be true or false"),
+    ],
+)
+def test_invalid_loading_options_are_refused(options, message):
+    from autoforge.errors import ConfigurationError
+
+    with pytest.raises(ConfigurationError, match=message.replace("(", r"\(").replace(")", r"\)")):
+        PiProvider().validate_profile(_profile(Path("/opt/pi"), **options))
+
+
+def test_pi_environment_names_exclude_provider_keys_and_unknown_pi_names(tmp_path, monkeypatch):
+    for name, value in [
+        ("OPENAI_API_KEY", "fake-openai"),
+        ("ANTHROPIC_API_KEY", "fake-anthropic"),
+        ("PI_FOO", "x"),
+        ("PI_PACKAGE_DIR", "/elsewhere"),
+        ("PI_CODING_AGENT_DIR", str(tmp_path / "agent")),
+    ]:
+        monkeypatch.setenv(name, value)
+    res, fake = _execute(tmp_path, _happy())
+    assert res.provider_failure is None
+    seen = set(fake.auth_env())
+    assert "PI_CODING_AGENT_DIR" in seen
+    assert not {"OPENAI_API_KEY", "ANTHROPIC_API_KEY", "PI_FOO", "PI_PACKAGE_DIR"} & seen
+
+
+def test_an_allow_listed_api_key_refuses_an_oauth_profile_before_any_spawn(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "fake-openai")
+    with pytest.raises(ExecutionError, match="OPENAI_API_KEY is set") as caught:
+        _execute(tmp_path, _happy(), env_allowlist=("PATH", "OPENAI_API_KEY"))
+    assert "fake-openai" not in str(caught.value)
+    assert not (tmp_path / "fake-pi.log").exists()
+
+
+def test_an_allow_listed_api_key_is_allowed_without_require_oauth(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "fake-openai")
+    res, fake = _execute(
+        tmp_path,
+        _happy(),
+        options={"require_oauth": "false"},
+        env_allowlist=("PATH", "OPENAI_API_KEY"),
+    )
+    assert res.provider_failure is None and fake.auth_argvs() == []
+
+
+@pytest.mark.parametrize(
+    ("auth", "auth_exit", "expected"),
+    [
+        (
+            {"status": "ready", "provider": "openai", "authType": "api_key"},
+            0,
+            "requires Pi's ChatGPT sign-in",
+        ),
+        (
+            {"status": "not_ready", "provider": "openai", "reason": "credentials_not_configured"},
+            1,
+            "Pi has no credential",
+        ),
+        (
+            {"status": "ready", "provider": "anthropic", "authType": "oauth"},
+            0,
+            "not the configured 'openai'",
+        ),
+        ("not json", 1, "without a result AutoForge can read"),
+    ],
+)
+def test_a_refused_auth_preflight_never_launches_pi(tmp_path, auth, auth_exit, expected):
+    res, fake = _execute(tmp_path, {**_happy(), "auth": auth, "auth_exit": auth_exit})
+    assert res.provider_failure.startswith("pi: the auth preflight refused the launch: ")
+    assert expected in res.provider_failure
+    assert res.command[1:3] == ["auth", "check"] and res.exit_code == auth_exit
+    assert res.stdout == "" and res.provider_summary == {"auth_preflight": "refused"}
+    assert not fake.launched()
+
+
+# -- an installed Pi honours the policy (opt-in) ------------------------------------------------
+_PI_E2E_BIN = "AUTOFORGE_PI_E2E_BIN"
+_MARKER_EXTENSION = """import { writeFileSync } from "node:fs";
+writeFileSync(%s, "loaded");
+export default function (pi: any) {
+  pi.registerCommand(%s, { description: "probe", handler: async () => {} });
+}
+"""
+
+
+def _hostile_project(root: Path) -> dict[str, Path]:
+    """A repository that loads everything Pi can load, already trusted, and a
+    global agent dir that does the same: every load writes a marker file."""
+    paths = {name: root / name for name in ("home", "agent", "repo", "marks", "pkg")}
+    for path in paths.values():
+        path.mkdir(parents=True)
+    agent, repo, marks, pkg = paths["agent"], paths["repo"], paths["marks"], paths["pkg"]
+    for directory in (
+        ".pi/extensions",
+        ".pi/skills/probe-skill",
+        ".pi/prompts",
+        ".agents/skills/x",
+    ):
+        (repo / directory).mkdir(parents=True)
+    (pkg / "extensions").mkdir()
+    (agent / "extensions").mkdir()
+
+    def extension(marker: str, command: str) -> str:
+        return _MARKER_EXTENSION % (json.dumps(str(marks / marker)), json.dumps(command))
+
+    def mcp(marker: str) -> str:
+        write = f"open({str(marks / marker)!r}, 'w').write('started')"
+        return json.dumps(
+            {"mcpServers": {marker: {"command": sys.executable, "args": ["-c", write]}}}
+        )
+
+    (repo / ".pi/extensions/marker.ts").write_text(extension("project-extension", "probe-cmd"))
+    (agent / "extensions/global.ts").write_text(extension("global-extension", "global-cmd"))
+    (pkg / "extensions/pkg.ts").write_text(extension("package-extension", "pkg-cmd"))
+    (pkg / "package.json").write_text(
+        json.dumps(
+            {"name": "probe-pkg", "version": "0.0.0", "pi": {"extensions": ["./extensions"]}}
+        )
+    )
+    skill = "---\nname: {0}\ndescription: probe\n---\nbody\n"
+    (repo / ".pi/skills/probe-skill/SKILL.md").write_text(skill.format("probe-skill"))
+    (repo / ".agents/skills/x/SKILL.md").write_text(skill.format("x"))
+    (repo / ".pi/prompts/probe-prompt.md").write_text("---\ndescription: probe\n---\nhello\n")
+    (repo / ".pi/settings.json").write_text(json.dumps({"packages": [str(pkg)]}))
+    (repo / ".pi/mcp.json").write_text(mcp("project-mcp"))
+    (agent / "mcp.json").write_text(mcp("global-mcp"))
+    (repo / ".pi/SYSTEM.md").write_text("project system prompt\n")
+    # The operator once answered "trust" for this path.
+    (agent / "trust.json").write_text(json.dumps({str(repo): True}))
+    return paths
+
+
+_ALL_MARKERS = [
+    "global-extension",
+    "global-mcp",
+    "package-extension",
+    "project-extension",
+    "project-mcp",
+]
+
+
+def _commands_and_markers(
+    argv: list[str], paths: dict[str, Path], settle: float
+) -> tuple[list[str], list[str]]:
+    """Start Pi, ask ``get_commands`` and ``get_state``, then wait up to
+    ``settle`` seconds for every marker (MCP servers connect in the
+    background) before closing stdin."""
+    import subprocess
+
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": str(paths["home"]),
+        "PI_CODING_AGENT_DIR": str(paths["agent"]),
+        "LANG": "C.UTF-8",
+    }
+    proc = subprocess.Popen(
+        argv,
+        cwd=paths["repo"],
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        assert proc.stdin is not None and proc.stdout is not None
+        for request in ({"id": "c", "type": "get_commands"}, {"id": "s", "type": "get_state"}):
+            proc.stdin.write((json.dumps(request) + "\n").encode())
+        proc.stdin.flush()
+        responses: dict[str, dict] = {}
+        while len(responses) < 2:
+            line = proc.stdout.readline()
+            assert line, "pi exited before answering"
+            record = json.loads(line)
+            if record.get("type") == "response":
+                assert record["success"], record
+                responses[record["id"]] = record
+        assert responses["s"]["data"]["model"]["id"] == MODEL.split("/", 1)[1]
+        deadline = time.monotonic() + settle
+        while time.monotonic() < deadline and len(list(paths["marks"].iterdir())) < 5:
+            time.sleep(0.1)
+        proc.stdin.close()
+        assert proc.wait(timeout=60) == 0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    names = sorted(c["name"] for c in responses["c"]["data"]["commands"])
+    return names, sorted(p.name for p in paths["marks"].iterdir())
+
+
+@pytest.mark.skipif(not os.environ.get(_PI_E2E_BIN), reason=f"set {_PI_E2E_BIN} to a pi binary")
+def test_an_installed_pi_loads_nothing_from_a_trusted_hostile_project(tmp_path):
+    """Real Pi, temp HOME and agent dir, no credential and no model call.
+
+    The same setup first runs under Pi's bare RPC argv, which must load its
+    extensions, package, MCP servers, skill and prompt template (otherwise
+    this fixture proves nothing), then under the adapter's argv, which must
+    load none of them.
+    """
+    pi = os.environ[_PI_E2E_BIN]
+    control = _hostile_project(tmp_path / "control")
+    bare = [pi, "--mode", "rpc", "--no-session", "--model", MODEL, "--thinking", "high"]
+    names, marks = _commands_and_markers(bare, control, settle=20)
+    assert {"probe-cmd", "global-cmd", "pkg-cmd", "probe-prompt", "skill:probe-skill"} <= set(names)
+    assert marks == _ALL_MARKERS
+
+    policy = _hostile_project(tmp_path / "policy")
+    argv = PiProvider().build_command_for(_profile(Path(pi)), "prompt")
+    assert _commands_and_markers(argv, policy, settle=3) == ([], [])

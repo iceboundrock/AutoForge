@@ -634,3 +634,216 @@ def test_execute_layers_explicit_env_over_the_allowlist(monkeypatch):
 def test_execute_refuses_to_launch_on_an_invalid_allowlist_entry():
     with pytest.raises(ExecutionError, match="invalid environment allow-list entry"):
         execute(ExecutionRequest(command=[PY, "-c", "pass"], env_allowlist=("not valid",)))
+
+
+# -- orphan containment (ADR 0002 amendment, #132) ----------------------------
+
+_linux_only = pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="the child subreaper is Linux-only"
+)
+
+# A child that starts a process the way Pi's bash tool starts every command
+# (detached: a session of its own) with its stdio on /dev/null, so it holds
+# none of the child's pipes, prints its pid, and exits (or lingers). Neither
+# the group kill nor the pipe EOF can see it.
+_DETACHED = (
+    "import subprocess, sys, time\n"
+    "p = subprocess.Popen([sys.executable, '-c', 'import signal, time; '\n"
+    "                      + ('signal.signal(signal.SIGTERM, signal.SIG_IGN); '\n"
+    "                         if 'deaf' in sys.argv[1:] else '')\n"
+    "                      + 'time.sleep(60)'],\n"
+    "                     start_new_session=True, stdin=subprocess.DEVNULL,\n"
+    "                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+    "print('child done', p.pid, flush=True)\n"
+    "if 'linger' in sys.argv[1:]:\n"
+    "    time.sleep(60)\n"
+)
+
+# A detached intermediary (a bash-tool command) that backgrounds a process
+# (``server &``) into its own group, writes the pid to a file and returns:
+# the backgrounded process outlives a parent that the agent had detached.
+_BACKGROUNDED = (
+    "import subprocess, sys, time\n"
+    "inner = (\n"
+    "    'import subprocess, sys; '\n"
+    '    \'p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], \'\n'
+    "    'stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); '\n"
+    "    'open(sys.argv[1], \"w\").write(str(p.pid))'\n"
+    ")\n"
+    "d = subprocess.Popen([sys.executable, '-c', inner, sys.argv[1]], start_new_session=True,\n"
+    "                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,\n"
+    "                     stderr=subprocess.DEVNULL)\n"
+    "d.wait()\n"
+    "print('child done', flush=True)\n"
+)
+
+
+def _subreaper() -> int:
+    import ctypes
+
+    value = ctypes.c_int(-1)
+    ctypes.CDLL(None, use_errno=True).prctl(37, ctypes.byref(value), 0, 0, 0)
+    return value.value
+
+
+def test_detached_orphan_outlives_an_uncontained_invocation_unreported(monkeypatch):
+    """The gap the amendment closes: a detached process that holds none of
+    the pipes is invisible to the group check and the pipe EOF, so without
+    containment ``execute`` reports a clean exit and the process lives on."""
+    monkeypatch.setattr(executor, "_EXIT_GRACE_SECONDS", 0.5)
+    res = execute(ExecutionRequest(command=[PY, "-c", _DETACHED], timeout_seconds=30))
+    pid = _orphan_pid(res)
+    try:
+        assert res.ok and res.leftovers == ""
+        assert not (res.orphans_killed or res.orphan_survived_kill or res.orphans_unchecked)
+        assert not _gone(pid, within=0.1)
+    finally:
+        _kill_quietly(pid)
+
+
+@_linux_only
+def test_contained_detached_orphan_is_killed_after_a_normal_exit(monkeypatch):
+    monkeypatch.setattr(executor, "_EXIT_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    started = time.monotonic()
+    res = execute(
+        ExecutionRequest(command=[PY, "-c", _DETACHED], timeout_seconds=30, contain_orphans=True)
+    )
+    elapsed = time.monotonic() - started
+    pid = _orphan_pid(res)
+    try:
+        assert res.ok and res.exit_code == 0 and res.stdout.startswith("child done ")
+        assert res.orphans_killed and not (res.orphan_survived_kill or res.orphans_unchecked)
+        # Its group was empty and its pipes closed: only the orphan is reported.
+        assert not (res.descendants_killed or res.group_survived_kill or res.capture_abandoned)
+        assert "outside its process group" in res.leftovers
+        assert "left processes behind" not in res.leftovers
+        assert elapsed < 5, elapsed
+        assert _gone(pid, within=0.5), "the detached orphan outlived execute()"
+        assert _subreaper() == 0, "the subreaper setting was not restored"
+    finally:
+        _kill_quietly(pid)
+
+
+@_linux_only
+def test_contained_setsid_writer_is_killed_and_the_capture_completes(monkeypatch):
+    """The ``setsid`` writer that holds the pipes, which an uncontained
+    invocation must abandon (see above), is an orphan here: it is killed,
+    the pipes reach EOF and nothing is abandoned."""
+    monkeypatch.setattr(executor, "_EXIT_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    res = execute(
+        ExecutionRequest(
+            command=[PY, "-c", _ORPHAN, "setsid", "0"], timeout_seconds=30, contain_orphans=True
+        )
+    )
+    pid = _orphan_pid(res)
+    try:
+        assert res.ok and res.orphans_killed and res.descendants_killed
+        assert not (res.capture_abandoned or res.group_survived_kill or res.orphan_survived_kill)
+        assert _gone(pid, within=0.5)
+    finally:
+        _kill_quietly(pid)
+
+
+@_linux_only
+def test_contained_process_backgrounded_by_a_detached_child_is_killed(monkeypatch, tmp_path):
+    """A detached command that backgrounds a process and returns: the
+    backgrounded process is re-parented to the controller and killed."""
+    monkeypatch.setattr(executor, "_EXIT_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    pid_file = tmp_path / "pid"
+    res = execute(
+        ExecutionRequest(
+            command=[PY, "-c", _BACKGROUNDED, str(pid_file)],
+            timeout_seconds=30,
+            contain_orphans=True,
+        )
+    )
+    pid = int(pid_file.read_text())
+    try:
+        assert res.ok and res.stdout == "child done\n"
+        assert res.orphans_killed and not res.orphan_survived_kill
+        assert _gone(pid, within=0.5), "the backgrounded process outlived execute()"
+    finally:
+        _kill_quietly(pid)
+
+
+@_linux_only
+def test_contained_orphan_is_killed_on_timeout_and_sigterm_escalates(monkeypatch):
+    """On the timeout path the orphans get the group's SIGTERM and, when one
+    ignores it, the SIGKILL; the result is a timeout with the orphans named."""
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    started = time.monotonic()
+    res = execute(
+        ExecutionRequest(
+            command=[PY, "-c", _DETACHED, "deaf", "linger"],
+            timeout_seconds=1,
+            contain_orphans=True,
+        )
+    )
+    elapsed = time.monotonic() - started
+    pid = _orphan_pid(res)
+    try:
+        assert res.timed_out and res.exit_code == -1
+        assert res.orphans_killed and not res.orphan_survived_kill
+        assert not res.descendants_killed
+        assert elapsed < 5, elapsed  # the timeout plus the two kill graces
+        assert _gone(pid, within=0.5)
+    finally:
+        _kill_quietly(pid)
+
+
+@_linux_only
+def test_contained_clean_run_reports_nothing_and_leaves_other_children_alone():
+    """A command that leaves nothing reports nothing, and a child the
+    controller already had (an earlier invocation's survivor, say) is not
+    mistaken for an orphan of this one."""
+    import subprocess
+
+    before = subprocess.Popen([PY, "-c", "import time; time.sleep(60)"], start_new_session=True)
+    try:
+        res = execute(
+            ExecutionRequest(
+                command=[PY, "-c", "print('hi')"], timeout_seconds=30, contain_orphans=True
+            )
+        )
+        assert res.ok and res.stdout == "hi\n" and res.leftovers == ""
+        assert not (res.orphans_killed or res.orphan_survived_kill or res.orphans_unchecked)
+        assert before.poll() is None, "a pre-existing child was killed as an orphan"
+        assert _subreaper() == 0
+    finally:
+        before.kill()
+        before.wait()
+
+
+@_linux_only
+def test_a_second_contained_invocation_at_once_is_refused():
+    first = executor._Containment.begin()
+    assert first is not None
+    try:
+        with pytest.raises(ExecutionError, match="already running"):
+            execute(ExecutionRequest(command=[PY, "-c", "pass"], contain_orphans=True))
+    finally:
+        first.release()
+    assert _subreaper() == 0
+    assert execute(ExecutionRequest(command=[PY, "-c", "pass"], contain_orphans=True)).ok
+
+
+def test_without_a_subreaper_the_limit_is_reported(monkeypatch):
+    """Where the platform has no child subreaper the orphan is neither seen
+    nor killed, and the result says the check could not be made."""
+    monkeypatch.setattr(executor.sys, "platform", "darwin")
+    assert executor._prctl() is None
+    monkeypatch.setattr(executor, "_EXIT_GRACE_SECONDS", 0.5)
+    res = execute(
+        ExecutionRequest(command=[PY, "-c", _DETACHED], timeout_seconds=30, contain_orphans=True)
+    )
+    pid = _orphan_pid(res)
+    try:
+        assert res.ok and res.orphans_unchecked
+        assert not (res.orphans_killed or res.orphan_survived_kill)
+        assert "could not be checked on this platform" in res.leftovers
+        assert not _gone(pid, within=0.1)
+    finally:
+        _kill_quietly(pid)

@@ -2,9 +2,10 @@
 
 Baseline protection only — no detector claims to catch every secret shape.
 Covers common env-var assignments, ``Authorization`` headers, well-known
-token shapes (GitHub PATs, OpenAI / Anthropic keys, JWTs) and credentials
-embedded in URLs before stdout / stderr / commands are persisted by the run
-logger.
+token shapes (GitHub PATs, OpenAI / Anthropic keys, JWTs), OAuth credential
+fields (``refresh`` / ``access`` / ``id_token`` / ``chatgpt-account-id``) and
+credentials embedded in URLs before stdout / stderr / commands are persisted
+by the run logger.
 """
 
 from __future__ import annotations
@@ -73,6 +74,39 @@ _PATTERNS: list[tuple[re.Pattern[str], str]] = [
         ),
         r"\1\2\3***REDACTED***\5",
     ),
+    # OAuth credential fields as a quoted key and value, the shape of an OAuth
+    # token response, Pi's ``auth.json`` and a Python mapping's repr:
+    # ``"refresh": "..."``, ``'access_token': '...'``, ``"id_token": "..."``,
+    # ``"chatgpt_account_id": "..."``. Only a quoted key followed by a quoted
+    # value matches, so prose ("refresh the page", "access: denied") is
+    # untouched. The same escaping before both quotes (``\"refresh\": \"...``)
+    # covers JSON carried inside a JSON string; the bound on it keeps a run of
+    # backslashes from being rescanned from every position.
+    (
+        re.compile(
+            r"(?i)(\\{0,7})([\"'])(refresh|access|(?:refresh|access|id)_token|"
+            r"chatgpt[-_]account[-_]id)\1\2(\s*:\s*\\{0,7}[\"'])[^\"'\s\\]+"
+        ),
+        r"\1\2\3\1\2\4***REDACTED***",
+    ),
+    # The same credentials as an assignment or header: ``refresh_token=...``
+    # (a query string, a form body, a shell variable), ``id_token: ...`` and
+    # the ``chatgpt-account-id: ...`` request header. A lookbehind rather than
+    # ``\b`` so a prefixed name (``oauth_refresh_token=``) is caught too.
+    (
+        re.compile(
+            r"(?i)(?<![A-Za-z0-9])((?:refresh|access|id)_token|chatgpt[-_]account[-_]id)"
+            r"(\s*[:=]\s*)([\"']?)[^\s\"';,&]+"
+        ),
+        r"\1\2\3***REDACTED***",
+    ),
+    # Bare ``refresh=`` / ``access=`` with a token-length value. Those words
+    # are ordinary prose, so only an ``=`` assignment of at least 16
+    # characters counts; ``access: denied`` and ``refresh=true`` stay.
+    (
+        re.compile(r"(?i)(?<![A-Za-z0-9_])(refresh|access)(=)([\"']?)[^\s\"';,&]{16,}"),
+        r"\1\2\3***REDACTED***",
+    ),
 ]
 
 _REDACTED = "***REDACTED***"
@@ -84,16 +118,16 @@ _REDACTED = "***REDACTED***"
 # characters and becomes 20, a factor of 2.86, and it repeats without a
 # separator (``@`` ends a word), so a text of that shape and no other reaches
 # the ratio and no text exceeds it. The next worst is a one character secret
-# behind the shortest recognised name: ``HF_TOKEN=x``, 10 to 23. Growth does
-# not compound across patterns: a later pattern can only lengthen the text by
-# matching a run *shorter* than the marker, and a marker is never part of
-# such a run. The value classes that admit ``*`` (the named-assignment,
-# header and URL-userinfo values) can only take a marker in whole, since none
-# of the characters that end such a run occurs in the marker, so a match
-# containing one is already at least as long as its replacement and shrinks
-# or keeps the length; every other value class excludes ``*``, so a marker is
-# never part of those matches at all. The characters around a replaced run
-# are untouched, so no new short match appears beside it.
+# behind the shortest recognised name: ``HF_TOKEN=x``, 10 to 23 (``id_token=x``
+# is the same). Growth does not compound across patterns: a later pattern can
+# only lengthen the text by matching a run *shorter* than the marker, and a
+# marker is never part of such a run. The value classes that admit ``*`` (the
+# named-assignment, header, URL-userinfo and OAuth-field values) can only take
+# a marker in whole, since none of the characters that end such a run occurs
+# in the marker, so a match containing one is already at least as long as its
+# replacement and shrinks or keeps the length; every other value class excludes
+# ``*``, so a marker is never part of those matches at all. The characters
+# around a replaced run are untouched, so no new short match appears beside it.
 # ``tests/test_redaction.py`` pins the factor against the worst-case shape of
 # every pattern and the wrapping case; a new pattern must keep it, or raise
 # it together with the persisted bound in :mod:`autoforge.loop_guard` that

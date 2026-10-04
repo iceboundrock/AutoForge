@@ -89,7 +89,7 @@ the file valid.
   provider adapter in `providers.py`, against the keys that adapter reads:
   `claude` accepts `permission_mode`, `output_format`, `session_persistence`;
   `opencode` accepts `output_format`, `auto_approve`; `pi` accepts
-  `require_oauth`. Any other key is an error naming the profile and the
+  `require_oauth`, `tools`, `context_files`. Any other key is an error naming the profile and the
   accepted keys, so an option meant for another provider is refused rather
   than silently ignored.
 - The same contract covers what a parser would otherwise settle before the
@@ -174,11 +174,33 @@ newer). The profile's fields map as follows:
   comes from `effort`).
 - `effort` is required and is one of `off`, `minimal`, `low`, `medium`,
   `high`, `xhigh`, `max` (`pi --thinking`).
-- `extra_args` must be empty: AutoForge owns the whole Pi argv
-  (`pi --mode rpc --no-session --model M --thinking E`), and the prompt
-  travels on stdin, never in argv.
-- `options.require_oauth` (`true` by default) makes `doctor` fail when Pi
-  would authenticate with an API key instead of the ChatGPT sign-in.
+- `extra_args` must be empty: AutoForge owns the whole Pi argv, and the
+  prompt travels on stdin, never in argv:
+
+  ```text
+  pi --mode rpc --no-session --no-approve --no-extensions --no-skills
+     --no-prompt-templates --no-themes --offline --tools <list>
+     [--no-context-files] --model M --thinking E
+  ```
+
+  No project trust decision, extension, package, MCP server, skill,
+  prompt template or theme is loaded, and nothing is installed at startup.
+  [Pi policy](pi-policy.md) gives the reasons and the evidence.
+- `options.tools` is the comma-separated list of Pi built-in tools the
+  agent gets (`read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`,
+  `powershell`; no spaces, no duplicates). Without it, `analyze_execute`,
+  `fix` and `replan_reexecute` get `read,bash,edit,write`, and every other
+  profile `read,bash`. This is defence in depth, not a write barrier:
+  `bash` can still write.
+- `options.context_files` (`true` by default) lets Pi read `AGENTS.md` /
+  `CLAUDE.md` from the agent directory and from every directory from `/`
+  down to the worktree; `false` turns all of them off
+  (`--no-context-files`).
+- `options.require_oauth` (`true` by default) requires the ChatGPT sign-in.
+  `doctor` fails, and a launch is refused before anything starts, when
+  `OPENAI_API_KEY` would reach Pi through the allow-list. Every launch first
+  runs `pi auth check` (below), and Pi is started only when it reports a
+  ready OAuth sign-in for the model's provider.
 
 `autoforge doctor` checks the Pi version and runs
 `pi auth check --model M --json --no-refresh` under the same environment
@@ -195,6 +217,15 @@ protocol (a rejected prompt, a model error, an extension asking for input)
 fails the phase with state unchanged; the reason and a short summary are in
 the step's `execution.json`. The example file carries a commented Pi block
 for `review_round_2_5`.
+
+`doctor` also warns (it never fails) when Pi would follow instructions
+from outside the checkout on every run: `SYSTEM.md` or `APPEND_SYSTEM.md`
+in Pi's agent directory (no flag turns those off), or, unless every Pi
+profile sets `context_files: false`, a context file there or in a directory
+above the checkout. With the default `execution.worktree_dir` that includes
+the operator's own checkout. Pi has no approval layer: run unattended Pi
+phases in a container, a VM or under a dedicated user
+([Pi policy](pi-policy.md) §7).
 
 ## Local mode configuration
 

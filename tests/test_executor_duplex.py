@@ -473,19 +473,28 @@ def test_exception_lets_a_child_that_exits_on_stdin_eof_exit_by_itself(monkeypat
 # A child that waits for stdin EOF, then starts a descendant that inherits its
 # stdout/stderr (``setsid`` also leaves the group), prints the descendant's
 # pid and exits with ``argv[2]``.
+# ``group``: a descendant in the child's group holding its pipes; ``setsid``:
+# the same outside the group; ``detached``: outside the group holding nothing,
+# the way Pi's bash tool starts a command.
 _ORPHAN = (
     "import subprocess, sys\n"
     "sys.stdin.buffer.read()\n"
+    "quiet = {'stdout': subprocess.DEVNULL, 'stderr': subprocess.DEVNULL}\n"
     "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'],\n"
-    "                     stdin=subprocess.DEVNULL, start_new_session=sys.argv[1] == 'setsid')\n"
+    "                     stdin=subprocess.DEVNULL, start_new_session=sys.argv[1] != 'group',\n"
+    "                     **(quiet if sys.argv[1] == 'detached' else {}))\n"
     "print(p.pid, flush=True)\n"
     "sys.exit(int(sys.argv[2]))\n"
 )
 
 
-def _orphan(mode: str, status: int):
+def _orphan(mode: str, status: int, contain: bool = False):
     with start_duplex(
-        DuplexRequest(command=[PY, "-c", _ORPHAN, mode, str(status)], deadline_seconds=30)
+        DuplexRequest(
+            command=[PY, "-c", _ORPHAN, mode, str(status)],
+            deadline_seconds=30,
+            contain_orphans=contain,
+        )
     ) as child:
         child.close_stdin()
         item = child.read_line(timeout=10)
@@ -506,6 +515,72 @@ def test_pipe_holding_descendant_after_exit_is_killed_and_reported(monkeypatch, 
         assert "left processes behind" in res.leftovers
         assert 0.5 <= elapsed < 6, elapsed
         assert _gone(pid, within=5)
+    finally:
+        _kill_quietly(pid)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux-only subreaper")
+def test_contained_detached_orphan_is_reported_as_an_orphan_only(monkeypatch):
+    """A detached process holding none of the pipes is the orphan alone: the
+    group was empty and the pipes closed, so no group kill is reported."""
+    monkeypatch.setattr(executor, "_EXIT_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    res, pid = _orphan("detached", 0, contain=True)
+    try:
+        assert res.exit_code == 0 and res.orphans_killed
+        assert not (res.descendants_killed or res.capture_abandoned or res.group_survived_kill)
+        assert "left processes behind" not in res.leftovers
+        assert _gone(pid, within=1)
+    finally:
+        _kill_quietly(pid)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux-only subreaper")
+def test_contained_setsid_escapee_is_killed_and_reported(monkeypatch):
+    """With ``contain_orphans`` the same escapee is re-parented to the
+    controller once the child exits, killed, and reported; the pipes reach
+    EOF, so nothing is abandoned (ADR 0002 amendment, #132)."""
+    monkeypatch.setattr(executor, "_EXIT_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    res, pid = _orphan("setsid", 0, contain=True)
+    try:
+        assert not res.timed_out and res.exit_code == 0
+        assert res.orphans_killed and res.descendants_killed
+        assert not (res.capture_abandoned or res.group_survived_kill or res.orphan_survived_kill)
+        assert not res.orphans_unchecked
+        assert "outside its process group" in res.leftovers
+        assert _gone(pid, within=1)
+    finally:
+        _kill_quietly(pid)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux-only subreaper")
+def test_contained_orphan_is_killed_when_the_with_block_raises(monkeypatch):
+    """Teardown on an exception sweeps the orphans too and releases the
+    subreaper, so the next contained invocation can start."""
+    monkeypatch.setattr(executor, "_EXIT_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    pid = None
+    with pytest.raises(RuntimeError, match="boom"):
+        with start_duplex(
+            DuplexRequest(
+                command=[PY, "-c", _ORPHAN, "setsid", "0"],
+                deadline_seconds=30,
+                contain_orphans=True,
+            )
+        ) as child:
+            child.close_stdin()
+            item = child.read_line(timeout=10)
+            assert isinstance(item, Record)
+            pid = int(item.data)
+            raise RuntimeError("boom")
+    assert pid is not None
+    try:
+        assert _gone(pid, within=1)
+        with start_duplex(
+            DuplexRequest(command=[PY, "-c", "pass"], deadline_seconds=30, contain_orphans=True)
+        ) as again:
+            assert again.finish().leftovers == ""
     finally:
         _kill_quietly(pid)
 

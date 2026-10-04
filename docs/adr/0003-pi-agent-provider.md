@@ -5,7 +5,9 @@
   duplex child handle, `src/autoforge/executor_duplex.py`) are
   implemented, and #131 (the RPC adapter, `src/autoforge/pi_rpc.py` and
   `PiProvider.execute`, and the `provider_failure` / `provider_summary`
-  channel) is implemented against fake-`pi` fixtures; #132 is not yet.
+  channel) is implemented against fake-`pi` fixtures, and #132 (the
+  unattended resource and tool-loading policy, `docs/pi-policy.md`, and
+  orphan containment, ADR 0002 §4b) is implemented.
   #131 re-verified the Pi-dependent decisions against an installed Pi
   1.0.1 and amended two of them (§1.1). Decided
   in #128 for EPIC #127. Implemented by #129 (config, doctor), #130
@@ -129,10 +131,12 @@ no credential was used.
 (#135's smoke run). The wire shape of a real
 `subscription_sharing_usage_limit_exceeded` or OAuth-refresh failure (only
 the adapter's mapping of such a message was exercised). `stopReason`
-`deferred` and `pending` as final reasons. Whether SIGTERM kills detached
-tool children (#132). The resource and extension flags: with the current
-argv, an extension in the agent dir's `extensions/` loads, which is what
-#132 must close.
+`deferred` and `pending` as final reasons. #132 has since settled the two
+items this paragraph left open. SIGTERM does not kill a process that a
+detached tool command left behind, so it is now caught by ADR 0002 §4b's
+containment. The argv's resource flags now load no extension, package,
+MCP server, skill or prompt template, verified on installed Pi 1.0.1
+(`docs/pi-policy.md`).
 
 ## 2. Decisions
 
@@ -548,8 +552,8 @@ verified from docs/source, re-verified against installed Pi 1.0.1 in
     `editor`) is answered at once with
     `{"type": "extension_ui_response", "id": <same>, "cancelled": true}`
     and makes the run a provider failure ("an extension asked for input").
-    Under #132's policy no extension should be loaded, so a dialog means
-    the policy did not hold. `editor` has no Pi-side timeout and would
+    Under #132's policy (`docs/pi-policy.md`) no extension is loaded, so a
+    dialog means the policy did not hold. `editor` has no Pi-side timeout and would
     block forever unanswered. Fire-and-forget methods (`notify`,
     `setStatus`, `setWidget`, `setTitle`, `set_editor_text`) are ignored.
 - **Framing** (owned by #130, required here): records are split on LF
@@ -567,7 +571,9 @@ verified from docs/source, re-verified against installed Pi 1.0.1 in
   - AutoForge never sends SIGINT: Pi has no SIGINT handler in RPC mode, so
     SIGINT would skip that cleanup. `clear_queue` is not needed, because
     AutoForge never queues a message.
-  - The detached-tool-children gap against ADR 0002 is #132's to close.
+  - The detached-tool-children gap against ADR 0002 is closed by #132's
+    orphan containment (ADR 0002 §4b; Linux only, elsewhere reported as
+    `orphans_unchecked`).
 
 Evidence: `src/main.ts:632-635` (`--version`), `src/modes/rpc/rpc-types.ts`
 (no version field), `docs/rpc.md` ("Framing", "Correlate commands and

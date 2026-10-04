@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -3346,6 +3347,42 @@ def test_verification_command_leftover_is_killed_and_its_result_kept(
     assert not (step / "error.txt").exists()
 
 
+# A verification command that starts a detached process (its own session,
+# none of the command's pipes) and exits at once.
+_DETACHES_A_SERVER = (
+    "import subprocess, sys; "
+    "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], "
+    "start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+    "stderr=subprocess.DEVNULL); "
+    "print('checks ran')"
+)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux-only subreaper")
+def test_verification_command_detached_leftover_is_killed_and_journaled(
+    tmp_state_dir, fake_github, monkeypatch
+):
+    """#132: a repository-defined command is contained like an agent (ADR
+    0002 §4b). A process it detached from its group is killed after the exit
+    grace, the merge proceeds, and the journal names the orphan."""
+    from autoforge import executor
+
+    monkeypatch.setattr(executor, "_EXIT_GRACE_SECONDS", 0.5)
+    commands = [["python3", "-c", _DETACHES_A_SERVER]]
+    eng, _ = _in_merge_on_commit(tmp_state_dir, fake_github, commands)
+    eng.config.execution.default_timeout_seconds = 30
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "UPDATE_EPIC" and len(fake_github.merges) == 1
+    run_dir = eng.paths.logs_dir / eng.state.run_id
+    step = next(p for p in run_dir.iterdir() if "premerge-verification" in p.name)
+    execution = json.loads((step / "execution.json").read_text(encoding="utf-8"))
+    assert execution["exit_code"] == 0 and execution["orphans_killed"] is True
+    assert execution["descendants_killed"] is False
+    assert execution["orphan_survived_kill"] is False and execution["orphans_unchecked"] is False
+    event = json.loads((run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+    assert event["orphans_killed"] is True
+
+
 def test_failing_verification_command_names_its_leftover_in_the_block_reason(
     tmp_state_dir, fake_github, monkeypatch
 ):
@@ -5652,6 +5689,27 @@ def test_descendants_killed_after_a_clean_exit_keeps_the_result_and_is_journaled
     assert event["descendants_killed"] is True and event["group_survived_kill"] is False
 
 
+def test_agent_orphan_facts_are_journaled_and_named(tmp_state_dir, fake_github):
+    """#132: what the agent left outside its group is recorded with the
+    other leftover facts, and its sentence follows a failed exit."""
+    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    provider = _LeftoverProvider(
+        "", exit_code=2, orphans_killed=True, orphan_survived_kill=True, orphans_unchecked=False
+    )
+    _install(eng, provider)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    with pytest.raises(ExecutionError, match="still alive after SIGKILL"):
+        eng.step()
+    run_dir = eng.paths.logs_dir / eng.state.run_id
+    step = next(p for p in run_dir.iterdir() if p.is_dir())
+    execution = json.loads((step / "execution.json").read_text(encoding="utf-8"))
+    assert execution["orphans_killed"] is True and execution["orphan_survived_kill"] is True
+    assert execution["orphans_unchecked"] is False
+    assert "outside its process group" in execution["error"]
+    event = json.loads((run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+    assert event["orphans_killed"] is True and event["orphan_survived_kill"] is True
+
+
 def test_timeout_names_a_group_member_that_survived_the_kill(tmp_state_dir, fake_github):
     """#85 addendum: 'was killed' must not read as 'is gone'. A member still
     in the group after SIGKILL is named in the error, the journal and the
@@ -7430,6 +7488,14 @@ def test_dry_run_renders_a_pi_profile_without_launching_it(tmp_state_dir):
         "--mode",
         "rpc",
         "--no-session",
+        "--no-approve",
+        "--no-extensions",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-themes",
+        "--offline",
+        "--tools",
+        "read,bash",
         "--model",
         "openai/gpt-5.6-terra",
         "--thinking",

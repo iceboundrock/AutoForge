@@ -147,6 +147,18 @@ def test_provider_execute_uses_injected_runner():
     assert seen[0].command[-1] == "prompt"
 
 
+@pytest.mark.parametrize(
+    ("provider", "profile"), [(ClaudeCodeProvider, "fix"), (OpenCodeProvider, "review_round_1")]
+)
+def test_one_shot_agent_launch_asks_for_orphan_containment(provider, profile):
+    """What an agent detaches from its process group is caught too
+    (ADR 0002 §4b, #132), whichever provider launches it."""
+    seen = []
+    p = default_config().profile(profile)
+    provider(runner=_capture_runner(seen)).execute(AgentRequest("FIX", "prompt", "/tmp", p, 7))
+    assert seen[0].contain_orphans
+
+
 def test_agent_result_carries_capture_truncation_and_tail():
     """The engine parses ``stdout_tail``, so the executor's truncation facts
     must survive the provider boundary unchanged (#53)."""
@@ -166,6 +178,9 @@ def test_agent_result_carries_capture_truncation_and_tail():
         descendants_killed=True,
         group_survived_kill=True,
         capture_abandoned=True,
+        orphans_killed=True,
+        orphan_survived_kill=True,
+        orphans_unchecked=True,
     )
     p = default_config().profile("analyze_execute")
     got = AgentExecutionResult.from_execution(res, p)
@@ -175,6 +190,7 @@ def test_agent_result_carries_capture_truncation_and_tail():
     # What the invocation left behind crosses the boundary too (#85), and
     # is described by the executor's sentence.
     assert got.descendants_killed and got.group_survived_kill and got.capture_abandoned
+    assert got.orphans_killed and got.orphan_survived_kill and got.orphans_unchecked
     assert got.leftovers == res.leftovers != ""
 
 
@@ -240,7 +256,8 @@ def test_every_real_provider_declares_only_valid_environment_patterns():
         ("opencode", "openai/gpt-5.6-luna", "permission_mode"),
         ("opencode", "openai/gpt-5.6-luna", "autoapprove"),
         ("pi", "openai/gpt-5.6-terra", "require_oath"),
-        ("pi", "openai/gpt-5.6-terra", "tools"),  # #132 adds it; not accepted yet
+        ("pi", "openai/gpt-5.6-terra", "tool"),
+        ("pi", "openai/gpt-5.6-terra", "extensions"),  # #132: no knob re-enables them
     ],
 )
 def test_an_unknown_option_key_is_rejected_with_the_profile_and_accepted_set(provider, model, key):
@@ -285,6 +302,14 @@ def test_pi_argv_shape():
         "--mode",
         "rpc",
         "--no-session",
+        "--no-approve",
+        "--no-extensions",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-themes",
+        "--offline",
+        "--tools",
+        "read,bash",
         "--model",
         "openai/gpt-5.6-terra",
         "--thinking",
@@ -385,17 +410,30 @@ def test_pi_require_oauth_rejects_a_non_boolean(value):
 
 
 def test_pi_execution_never_goes_through_the_one_shot_runner(tmp_path):
-    """Pi runs over the duplex handle (#131); the injected runner is unused,
-    and a missing executable is a spawn failure, not a fallback."""
+    """Pi runs over the duplex handle (#131); the injected runner carries
+    only the read-only auth preflight (#132), and a missing executable is a
+    spawn failure, not a fallback."""
     from autoforge.errors import ExecutionError
 
     seen = []
     prov = PiProvider(runner=_capture_runner(seen))
-    profile = _pi(command=str(tmp_path / "no-such-pi"))
+    profile = _pi(command=str(tmp_path / "no-such-pi"), options={"require_oauth": "false"})
     req = AgentRequest("REVIEW", "p", str(tmp_path), profile, 7, env_allowlist=("PATH",))
     with pytest.raises(ExecutionError, match="no-such-pi"):
         prov.execute(req)
     assert seen == []  # the one-shot runner was never called
+
+
+def test_pi_auth_preflight_runs_in_the_launch_environment_through_the_runner(tmp_path):
+    seen = []
+    prov = PiProvider(runner=_capture_runner(seen))
+    profile = _pi(command="pi")
+    req = AgentRequest("REVIEW", "p", str(tmp_path), profile, 7, env_allowlist=("PATH",))
+    res = prov.execute(req)  # the captured runner prints "ok": not a result Pi would give
+    [check] = seen
+    assert check.command == prov.auth_check_command(profile) and check.cwd == str(tmp_path)
+    assert check.env_allowlist == prov.environment_allowlist(req) and check.contain_orphans
+    assert res.provider_failure.startswith("pi: the auth preflight refused the launch: ")
 
 
 def test_pi_environment_names_are_explicit_and_carry_no_provider_key():

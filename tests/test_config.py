@@ -1777,5 +1777,6 @@ def test_example_yaml_with_the_pi_block_enabled_loads_and_validates(tmp_path, ya
         "high",
         "pi",
     )
-    assert p.timeout_seconds == 1800 and p.options == {"require_oauth": "true"}
+    assert p.timeout_seconds == 1800
+    assert p.options == {"require_oauth": "true", "tools": "read,bash", "context_files": "true"}
     validate_required_profiles(cfg, REQUIRED_PROFILES)
