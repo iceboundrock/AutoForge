@@ -9,7 +9,9 @@ The agent CLIs checked are the ones the run can reach: each distinct
 command named by a reachable profile, once, labelled with those profiles.
 A Pi profile adds a version floor and a read-only credential probe, run
 under the same environment allow-list as the agent launch (never the
-operator's whole environment) and reported without Pi's raw output.
+operator's whole environment) and reported without Pi's raw output, and a
+warning naming the instruction files Pi would load from outside the
+checkout (docs/pi-policy.md §4-5); those are found by path, never read.
 
 ``autoforge local doctor`` runs the LOCAL subset: no `gh`, no `gh auth
 status`, no `origin` remote. A machine with no GitHub CLI and no GitHub
@@ -42,7 +44,14 @@ from .github import (
 )
 from .local_workspace import DEFAULT_MAX_BYTES, DEFAULT_MAX_ENTRIES
 from .profiles import REQUIRED_PROFILES, local_required_profiles
-from .providers import PI_MIN_VERSION, PiProvider, parse_pi_version
+from .providers import (
+    PI_CONTEXT_FILES,
+    PI_DEFAULT_AGENT_DIR,
+    PI_MIN_VERSION,
+    PI_SYSTEM_PROMPT_FILES,
+    PiProvider,
+    parse_pi_version,
+)
 from .safefs import STATE_DIR_NEEDS_HARD_LINKS, HardLinksUnavailable, SafeRoot
 from .validation import parse_remote_repository
 
@@ -523,7 +532,45 @@ class Doctor:
             available = self.check_pi_version(label, pi_profiles[command][0])
             results.append(available)
             results.extend(self.check_pi_auth(command, pi_profiles[command], available.ok))
+        if pi_profiles:
+            profiles = [p for members in pi_profiles.values() for p in members]
+            results.append(self.check_pi_outside_instructions(profiles))
         return results
+
+    def check_pi_outside_instructions(self, profiles: list[ProfileConfig]) -> CheckResult:
+        """WARN when Pi would load instruction files from outside the checkout.
+
+        Pi always appends its agent directory's ``SYSTEM.md`` /
+        ``APPEND_SYSTEM.md`` (no flag turns them off), and, unless every Pi
+        profile sets ``context_files: false``, the agent directory's context
+        file and one from each directory above the checkout. None of them is
+        project data under review, and none is visible in the PR. Only
+        whether each path exists is checked; no file is read.
+        """
+        names = ", ".join(p.name for p in profiles)
+        name = f"pi loads no instructions from outside the checkout ({names})"
+        env = os.environ.get("PI_CODING_AGENT_DIR", "") if self._pi_passes_agent_dir() else ""
+        agent_dir = Path(env or PI_DEFAULT_AGENT_DIR).expanduser()
+        found = [agent_dir / f for f in PI_SYSTEM_PROMPT_FILES if (agent_dir / f).is_file()]
+        if any(PiProvider.context_files(p) for p in profiles):
+            for directory in [agent_dir, *Path(self.cwd).resolve().parents]:
+                first = next((f for f in PI_CONTEXT_FILES if (directory / f).is_file()), None)
+                if first is not None:
+                    found.append(directory / first)
+        if not found:
+            return CheckResult(name, True, "(none found)", required=False)
+        return CheckResult(
+            name,
+            False,
+            f"every Pi run will also follow {', '.join(str(p) for p in found)}; remove "
+            "or move them, or set options.context_files: false for context files "
+            "(docs/pi-policy.md)",
+            required=False,
+        )
+
+    def _pi_passes_agent_dir(self) -> bool:
+        """Whether the launch allow-list hands ``PI_CODING_AGENT_DIR`` to Pi."""
+        return "PI_CODING_AGENT_DIR" in self._pi_allowlist()
 
     def _pi_allowlist(self) -> tuple[str, ...]:
         """The environment a Pi agent is launched with, so the probes see what it would."""
@@ -609,6 +656,9 @@ class Doctor:
         return results
 
     def _pi_auth(self, name: str, provider: PiProvider, profile: ProfileConfig) -> CheckResult:
+        refused = provider.api_key_problem(profile, self._pi_allowlist())
+        if refused:
+            return CheckResult(name, False, refused)
         res = self._pi_probe(provider.auth_check_command(profile))
         if isinstance(res, str):
             return CheckResult(name, False, res)

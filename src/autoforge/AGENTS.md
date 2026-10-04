@@ -82,7 +82,8 @@ state.py, run_contract.py, safefs.py, locking.py,
 errors.py, engine.py (recovery, retry)            -> docs/agent-guides/state-and-recovery.md
 providers.py, pi_rpc.py, executor.py,
 executor_duplex.py, prompts/__init__.py           -> docs/agent-guides/architecture.md
-                                                     (+ docs/adr/0003-pi-agent-provider.md for Pi)
+                                                     (+ docs/adr/0003-pi-agent-provider.md and
+                                                     docs/pi-policy.md for Pi)
 result_parser.py, prompts/*.md                    -> docs/agent-guides/control-result-protocol.md
 redaction.py, runlog.py, error messages           -> docs/agent-guides/secrets-and-logging.md
 ```

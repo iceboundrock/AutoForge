@@ -68,19 +68,26 @@ one provider is never handed to another.
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from .config import ProfileConfig
-from .errors import ChildStdinClosedError, ConfigurationError, ExecutionTimeoutError
+from .errors import (
+    ChildStdinClosedError,
+    ConfigurationError,
+    ExecutionError,
+    ExecutionTimeoutError,
+)
 from .executor import (
     DEFAULT_MAX_OUTPUT_BYTES,
     ExecutionRequest,
     ExecutionResult,
     describe_leftovers,
     execute,
+    select_environment,
 )
 from .executor_duplex import (
     DuplexChild,
@@ -136,6 +143,9 @@ class AgentExecutionResult:
     descendants_killed: bool = False
     group_survived_kill: bool = False
     capture_abandoned: bool = False
+    orphans_killed: bool = False
+    orphan_survived_kill: bool = False
+    orphans_unchecked: bool = False
     # A run that failed inside the provider's protocol although the process
     # may have exited 0 (Pi shuts down in order whether its run failed or
     # not): a short, bounded, already-redacted reason. The engine treats it
@@ -159,6 +169,9 @@ class AgentExecutionResult:
             descendants_killed=self.descendants_killed,
             group_survived_kill=self.group_survived_kill,
             capture_abandoned=self.capture_abandoned,
+            orphans_killed=self.orphans_killed,
+            orphan_survived_kill=self.orphan_survived_kill,
+            orphans_unchecked=self.orphans_unchecked,
         )
 
     @property
@@ -192,6 +205,9 @@ class AgentExecutionResult:
             descendants_killed=res.descendants_killed,
             group_survived_kill=res.group_survived_kill,
             capture_abandoned=res.capture_abandoned,
+            orphans_killed=res.orphans_killed,
+            orphan_survived_kill=res.orphan_survived_kill,
+            orphans_unchecked=res.orphans_unchecked,
             provider=profile.provider,
             model=profile.model,
             effort=profile.effort,
@@ -261,6 +277,9 @@ class AgentProvider:
                 cwd=req.cwd,
                 timeout_seconds=req.timeout_seconds,
                 env_allowlist=self.environment_allowlist(req),
+                # Nothing an agent starts outlives its invocation (ADR 0002),
+                # including what it detached from its process group.
+                contain_orphans=True,
             )
         )
         return AgentExecutionResult.from_execution(res, req.profile)
@@ -399,6 +418,33 @@ PI_MAX_RECORD_BYTES = 2 * DEFAULT_MAX_OUTPUT_BYTES + 1024 * 1024
 PI_MAX_PENDING_BYTES = 2 * PI_MAX_RECORD_BYTES
 
 
+# Pi's built-in tools (dist/core/tools/index.js at 1.0.1). Pi drops a name
+# it does not know without a word, so a profile's `tools` is checked here.
+PI_TOOLS = ("read", "bash", "edit", "write", "grep", "find", "ls", "powershell")
+# The tool set a profile gets when it names none: the implementation phases
+# write the tree, review and EPIC maintenance read it. `bash` stays in both
+# (an agent needs `git` and `gh`), so the read set is defence in depth, not a
+# write barrier (docs/pi-policy.md §6).
+PI_WRITE_PROFILES = ("analyze_execute", "fix", "replan_reexecute")
+PI_WRITE_TOOLS = "read,bash,edit,write"
+PI_READ_TOOLS = "read,bash"
+_PI_TOOLS_RE = re.compile(r"[a-z]+(,[a-z]+)*")
+# Provider API keys Pi would use (or hand to its tools) in place of a
+# stored ChatGPT sign-in. A profile with `require_oauth` refuses to launch
+# when one of them would reach Pi (docs/pi-policy.md §8).
+PI_API_KEY_NAMES = ("OPENAI_API_KEY",)
+# What Pi loads from its agent directory and from every directory between
+# `/` and the cwd whatever the resource flags say (docs/pi-policy.md §4-5):
+# the first context file name found in each directory (none with
+# `--no-context-files`), and the agent directory's system prompt files
+# (always; no flag turns them off). `doctor` reports their presence only.
+PI_CONTEXT_FILES = ("AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD")
+PI_SYSTEM_PROMPT_FILES = ("SYSTEM.md", "APPEND_SYSTEM.md")
+PI_DEFAULT_AGENT_DIR = "~/.pi/agent"
+# The per-launch `pi auth check` reads one file and prints one line.
+PI_AUTH_CHECK_SECONDS = 60
+PI_AUTH_CHECK_MAX_OUTPUT_BYTES = 64 * 1024
+
 PI_AUTH_STATUSES = ("ready", "not_ready", "invalid")
 PI_AUTH_REASONS = (
     "provider_not_found",
@@ -475,21 +521,19 @@ class PiProvider(AgentProvider):
 
     name = "pi"
     # Pi's own process settings (docs/environment-variables.md at v1.0.0):
-    # where its config and credential store live, a Nix-style package
-    # directory, and the network, version-check, telemetry and prompt-cache
-    # switches. Explicit names, never a prefix: Pi exports `PI_SESSION_*`,
-    # `PI_PROVIDER`, `PI_MODEL` to its tool children, and a provider API key
+    # where its config and credential store live, and the network,
+    # version-check and telemetry switches (docs/pi-policy.md §8). Explicit
+    # names, never a prefix: Pi exports `PI_SESSION_*`, `PI_PROVIDER`,
+    # `PI_MODEL` to its tool children, and a provider API key
     # (`OPENAI_API_KEY`, ...) reaches Pi only through
     # `execution.env_allowlist_extra`, never by default.
     environment_names = (
         "PI_CODING_AGENT_DIR",
-        "PI_PACKAGE_DIR",
         "PI_OFFLINE",
         "PI_SKIP_VERSION_CHECK",
         "PI_TELEMETRY",
-        "PI_CACHE_RETENTION",
     )
-    option_keys = ("require_oauth",)
+    option_keys = ("require_oauth", "tools", "context_files")
 
     def validate_profile(self, profile: ProfileConfig) -> None:
         super().validate_profile(profile)
@@ -511,25 +555,49 @@ class PiProvider(AgentProvider):
                 "flag that matters is set by the adapter, and a pass-through could re-enable "
                 "project trust, put an API key in argv, load code or prompts, or keep a session"
             )
-        if profile.options.get("require_oauth", "true") not in ("true", "false"):
-            raise ConfigurationError(
-                f"{where}: pi option require_oauth must be true or false, "
-                f"got {profile.options['require_oauth']!r}"
-            )
+        for key in ("require_oauth", "context_files"):
+            if profile.options.get(key, "true") not in ("true", "false"):
+                raise ConfigurationError(
+                    f"{where}: pi option {key} must be true or false, got {profile.options[key]!r}"
+                )
+        if "tools" in profile.options:
+            problem = _pi_tools_problem(profile.options["tools"])
+            if problem:
+                raise ConfigurationError(
+                    f"{where}: pi option tools must be a comma-separated list of Pi's "
+                    f"built-in tools ({', '.join(PI_TOOLS)}): {problem}, "
+                    f"got {profile.options['tools']!r}"
+                )
 
     def build_command_for(self, profile: ProfileConfig, prompt: str) -> list[str]:
         # The prompt is deliberately absent: it reaches Pi as a JSON `prompt`
-        # record on stdin (ADR 0003 §2.7), never in argv.
-        return [
+        # record on stdin (ADR 0003 §2.7), never in argv. Every flag before
+        # `--tools` is unconditional; no option and no `extra_args` (which a
+        # Pi profile cannot have) removes one (docs/pi-policy.md §1-3).
+        command = [
             self.command(profile),
             "--mode",
             "rpc",
             "--no-session",
-            "--model",
-            profile.model,
-            "--thinking",
-            profile.effort,
+            # Project trust off, whatever `trust.json` saved for the path:
+            # without it a trusted project's `.pi/SYSTEM.md` and packages load
+            # even with every resource flag below.
+            "--no-approve",
+            # No executable resource from the project, the agent dir or Pi's
+            # built-in extensions (native MCP included).
+            "--no-extensions",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-themes",
+            # No package install or update at startup (npm or git, from the
+            # global settings), no catalog refresh; model calls still go out.
+            "--offline",
+            "--tools",
+            self.tools(profile),
         ]
+        if not self.context_files(profile):
+            command.append("--no-context-files")
+        return [*command, "--model", profile.model, "--thinking", profile.effort]
 
     def __init__(
         self,
@@ -555,7 +623,19 @@ class PiProvider(AgentProvider):
         ``timed_out`` whatever Pi's exit status. A failure inside the
         protocol is ``provider_failure``; ``exit_code`` is always the real
         process status. A spawn failure raises :class:`ExecutionError`.
+
+        With ``require_oauth`` (the default) the launch is refused before
+        anything is spawned when a provider API key would reach Pi, and a
+        ``pi auth check`` in the same environment must report a ChatGPT
+        sign-in first; a refused check is a ``provider_failure`` naming it,
+        and Pi is never started (docs/pi-policy.md §8).
         """
+        allowlist = self.environment_allowlist(req)
+        if self.require_oauth(req.profile):
+            self._refuse_api_keys(req, allowlist)
+            refused = self._auth_preflight(req, allowlist)
+            if refused is not None:
+                return refused
         timeout = float(req.timeout_seconds)
         abort_window = min(self.abort_seconds, timeout / 4)
         conversation = PiConversation(
@@ -567,10 +647,12 @@ class PiProvider(AgentProvider):
         duplex = DuplexRequest(
             command=self.build_command(req),
             cwd=req.cwd,
-            env_allowlist=self.environment_allowlist(req),
+            env_allowlist=allowlist,
             deadline_seconds=timeout,
             max_record_bytes=PI_MAX_RECORD_BYTES,
             max_pending_bytes=PI_MAX_PENDING_BYTES,
+            # Pi's bash tool starts every command detached (ADR 0003 §6).
+            contain_orphans=True,
         )
         with start_duplex(duplex) as child:
             soft_deadline = time.monotonic() + timeout - abort_window
@@ -609,9 +691,90 @@ class PiProvider(AgentProvider):
             descendants_killed=res.descendants_killed,
             group_survived_kill=res.group_survived_kill,
             capture_abandoned=res.capture_abandoned,
+            orphans_killed=res.orphans_killed,
+            orphan_survived_kill=res.orphan_survived_kill,
+            orphans_unchecked=res.orphans_unchecked,
             # A timeout wins over whatever the protocol said (ADR 0003 §2.6).
             provider_failure=None if timed_out else failure,
             provider_summary=summary,
+        )
+
+    def _refuse_api_keys(self, req: AgentRequest, allowlist: tuple[str, ...] | None) -> None:
+        """Raise :class:`ExecutionError` when a set provider API key would reach Pi."""
+        problem = self.api_key_problem(req.profile, allowlist)
+        if problem:
+            raise ExecutionError(problem)
+
+    @staticmethod
+    def api_key_problem(profile: ProfileConfig, allowlist: tuple[str, ...] | None) -> str:
+        """Why ``profile`` may not launch with ``allowlist``'s API keys, or ''.
+
+        A profile with ``require_oauth`` must not hand Pi (and through it
+        every command Pi's `bash` tool runs) a provider API key: Pi would
+        prefer a stored sign-in, so the key would sit in the tools'
+        environment for nothing, or bill the run when the sign-in lapses.
+        Only the names are checked and named, never a value.
+        """
+        if not PiProvider.require_oauth(profile):
+            return ""
+        env = os.environ if allowlist is None else select_environment(allowlist)
+        present = [name for name in PI_API_KEY_NAMES if env.get(name)]
+        if not present:
+            return ""
+        return (
+            f"profile {profile.name!r} requires Pi's ChatGPT sign-in (options.require_oauth), "
+            f"but {', '.join(present)} is set and would reach Pi through the environment "
+            "allow-list; remove it from execution.env_allowlist_extra (or unset it), or set "
+            "options.require_oauth: false to run on an API key"
+        )
+
+    def _auth_preflight(
+        self, req: AgentRequest, allowlist: tuple[str, ...] | None
+    ) -> AgentExecutionResult | None:
+        """Run ``pi auth check`` as the launch would; None when it allows the launch.
+
+        Read-only (``--no-refresh``), in the cwd and environment the launch
+        uses, judged by :meth:`auth_verdict`: ``ready`` with authType
+        ``oauth`` for the configured provider. A refusal is returned as a
+        result whose ``provider_failure`` quotes only the check's fields;
+        its output is never kept.
+        """
+        res = self._runner(
+            ExecutionRequest(
+                command=self.auth_check_command(req.profile),
+                cwd=req.cwd,
+                timeout_seconds=PI_AUTH_CHECK_SECONDS,
+                max_output_bytes=PI_AUTH_CHECK_MAX_OUTPUT_BYTES,
+                env_allowlist=allowlist,
+                contain_orphans=True,
+            )
+        )
+        if res.timed_out:
+            detail = f"`pi auth check` did not answer within {PI_AUTH_CHECK_SECONDS}s"
+        elif res.stdout_truncated:
+            detail = "`pi auth check` printed more than a result"
+        else:
+            ok, detail = self.auth_verdict(req.profile, res.exit_code, res.stdout)
+            if ok:
+                return None
+        return AgentExecutionResult(
+            command=list(res.command),
+            exit_code=res.exit_code,
+            stdout="",
+            stderr="",
+            started_at=res.started_at,
+            finished_at=res.finished_at,
+            provider=req.profile.provider,
+            model=req.profile.model,
+            effort=req.profile.effort,
+            descendants_killed=res.descendants_killed,
+            group_survived_kill=res.group_survived_kill,
+            capture_abandoned=res.capture_abandoned,
+            orphans_killed=res.orphans_killed,
+            orphan_survived_kill=res.orphan_survived_kill,
+            orphans_unchecked=res.orphans_unchecked,
+            provider_failure=f"pi: the auth preflight refused the launch: {detail}",
+            provider_summary={"auth_preflight": "refused"},
         )
 
     @staticmethod
@@ -688,6 +851,18 @@ class PiProvider(AgentProvider):
     @staticmethod
     def require_oauth(profile: ProfileConfig) -> bool:
         return profile.options.get("require_oauth", "true") != "false"
+
+    @staticmethod
+    def context_files(profile: ProfileConfig) -> bool:
+        return profile.options.get("context_files", "true") != "false"
+
+    @staticmethod
+    def tools(profile: ProfileConfig) -> str:
+        """The ``--tools`` list: the profile's ``tools``, or its phase's default."""
+        configured = profile.options.get("tools")
+        if configured:
+            return configured
+        return PI_WRITE_TOOLS if profile.name in PI_WRITE_PROFILES else PI_READ_TOOLS
 
     @staticmethod
     def model_provider(profile: ProfileConfig) -> str:
@@ -789,6 +964,19 @@ def _keep_tail(text: str, limit: int) -> tuple[str, bool]:
     if len(data) <= limit:
         return text, False
     return data[-limit:].decode("utf-8", errors="replace"), True
+
+
+def _pi_tools_problem(value: str) -> str:
+    """Why ``value`` is not a valid ``tools`` option, or ''."""
+    if not _PI_TOOLS_RE.fullmatch(value):
+        return "expected names separated by ',' with no spaces and no empty entry"
+    names = value.split(",")
+    unknown = [name for name in names if name not in PI_TOOLS]
+    if unknown:
+        return f"unknown tool(s) {', '.join(unknown)}"
+    if len(set(names)) != len(names):
+        return "a tool is listed twice"
+    return ""
 
 
 def _pi_model_problem(model: str) -> str:

@@ -1,8 +1,9 @@
 # ADR 0002. Executor: nothing an agent starts outlives its invocation
 
-- **Status:** accepted, implemented for #85
+- **Status:** accepted, implemented for #85; amended by #132 (§4b)
 - **Decides:** #85 (follow-up of PR #84's review and #53)
-- **Where:** `src/autoforge/executor.py` (`execute()`, `_terminate_group()`),
+- **Where:** `src/autoforge/executor.py` (`execute()`, `_terminate_group()`,
+  `_Containment`), `src/autoforge/executor_duplex.py`,
   `docs/agent-guides/architecture.md` (executor section), the common prompt
   templates
 
@@ -140,6 +141,61 @@ and the child gets at most the exit grace to exit before the group is
 killed. `tests/test_executor_duplex.py` runs the leftover scenarios of §5
 through both `execute()` and the handle and asserts that the facts match.
 
+## 4b. Amendment: processes that leave the group (#132)
+
+**Problem.** §3 removes what is in the child's process group. A process
+that called `setsid`, or was started detached, is not in it. If it does not
+hold the child's pipes either, no check of §3 sees it: it survives the
+invocation and nothing is reported. Before #132 that was an accepted gap
+for a misbehaving command. Pi's `bash` tool makes it the normal case: every
+tool command is started detached, so whatever a command backgrounds
+(`server &`) outlives Pi's normal exit (`docs/pi-policy.md` §10).
+
+**Decision.** Containment in the executor layer, provider-neutral and on
+request (`ExecutionRequest.contain_orphans`, `DuplexRequest.contain_orphans`):
+
+- For the invocation, the controller marks itself a Linux child subreaper
+  (`prctl(PR_SET_CHILD_SUBREAPER)`, restored afterwards). A process whose
+  parent dies is then re-parented to the controller rather than to init.
+- The invocation's orphans are the controller's children that were not
+  there when it began and are not the child itself. They are listed from
+  `/proc/self/task/*/children` (a `/proc` scan where that file is missing),
+  keyed by pid and start time. A child still in the child's group is left
+  to the group checks. Unreaped children keep their pids, so signalling
+  them cannot hit an unrelated process.
+- An orphan counts as part of what must be gone, within §3's bounds: it gets
+  the exit grace, then each signal of the kill (SIGTERM, then SIGKILL)
+  together with its own process group, and one that appears as its parent
+  dies is signalled when it appears. Dead orphans are reaped.
+- Reported as three more facts, recorded with the others in
+  `execution.json` and `events.jsonl` and rendered by `describe_leftovers`:
+  `orphans_killed`, `orphan_survived_kill`, and `orphans_unchecked` (the
+  platform has no subreaper). An orphan alone does not set
+  `descendants_killed`, which stays a fact about the group. As in §3, none
+  of them changes whether the child's result is accepted.
+- **Who is contained.** Every agent launch (Claude Code, OpenCode, Pi and
+  Pi's auth preflight) and every repository-defined command (validation,
+  pre-merge verification). The controller's own `git`/`gh` plumbing is
+  not, so a `git gc --auto` that git daemonized on purpose is left alone.
+
+**Limits.**
+
+- **Linux only.** Elsewhere a contained request runs uncontained and the
+  result carries `orphans_unchecked`. The prompt rule of §3 is then the
+  only mitigation. #135 gates unattended Pi use on this.
+- **One contained invocation per controller process.** Orphans are told
+  apart from the controller's other children by being new, so a second
+  contained invocation while one runs raises `ExecutionError` instead of
+  waiting. The engine runs invocations one after another, so this does not
+  happen in practice.
+- **What still escapes:** a descendant that makes itself a subreaper (its
+  orphans go to it, not to the controller), and anything handed to a
+  service manager or another session's process (`systemd-run`, `at`, a
+  container runtime, an SSH host).
+- An orphan that survives SIGKILL stays the controller's unreaped child
+  until the controller exits. It is reported (`orphan_survived_kill`), not
+  hidden.
+
 ## 5. Tests
 
 `tests/test_executor.py`: a pipe-holding descendant after exit 0 and after
@@ -158,3 +214,19 @@ were killed advances the phase and is journaled; a timeout with a survivor
 names it in the error, `execution.json`, `error.txt` and `events.jsonl`.
 `tests/test_prompts.py`: both common templates carry the rule; the prompt
 version moved past `v2`.
+
+#132 (§4b): `tests/test_executor.py` shows a detached orphan surviving an
+uncontained invocation unreported; it is killed and reported after a
+normal exit, as a `setsid` pipe writer (the capture then completes), as a
+process backgrounded by a detached child, and on the timeout path with
+SIGTERM escalating to SIGKILL. A clean contained run reports nothing and
+leaves the controller's other children alone. A second contained
+invocation at once is refused, and without a subreaper the limit is
+reported. `tests/test_executor_duplex.py` does the same through the
+handle, including when the `with` block raises.
+`tests/test_providers.py`: every agent launch asks for containment and
+the facts cross the provider boundary. `tests/test_pi_rpc.py`: a process a
+fake Pi's tool detached is killed after Pi exits, the result kept.
+`tests/test_engine.py`: a pre-merge verification command's detached
+process is killed and journaled and the merge proceeds; an agent's orphan
+facts are journaled and named in a failed exit's error.

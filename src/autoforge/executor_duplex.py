@@ -40,7 +40,10 @@ Guarantees:
   (``descendants_killed``, ``group_survived_kill``, ``capture_abandoned``)
   mean what they mean in :class:`autoforge.executor.ExecutionResult`. With a
   hostile child the whole invocation takes at most the deadline plus the
-  exit grace plus two kill graces, the bound ``execute()`` has.
+  exit grace plus two kill graces, the bound ``execute()`` has;
+- ``contain_orphans`` catches what left the group exactly as in
+  ``execute()`` (the subreaper is held from before the spawn to the end of
+  the teardown), with the same three orphan facts.
 
 A server child that takes no input and is not spoken to over stdout (#126)
 uses the same handle with ``stdin_pipe=False`` and
@@ -67,6 +70,7 @@ from .executor import (
     DEFAULT_MAX_OUTPUT_BYTES,
     _BoundedReader,
     _child_environment,
+    _Containment,
     _eof,
     _group_gone,
     _now,
@@ -161,6 +165,8 @@ class DuplexRequest:
     stdout_mode: StdoutMode = StdoutMode.RECORDS
     # The capture bound in ``StdoutMode.CAPTURE``; unused for records.
     max_stdout_bytes: int = DEFAULT_MAX_OUTPUT_BYTES
+    # As :attr:`autoforge.executor.ExecutionRequest.contain_orphans`.
+    contain_orphans: bool = False
 
 
 @dataclass
@@ -185,6 +191,9 @@ class DuplexResult:
     descendants_killed: bool = False
     group_survived_kill: bool = False
     capture_abandoned: bool = False
+    orphans_killed: bool = False
+    orphan_survived_kill: bool = False
+    orphans_unchecked: bool = False
 
     @property
     def leftovers(self) -> str:
@@ -193,6 +202,9 @@ class DuplexResult:
             descendants_killed=self.descendants_killed,
             group_survived_kill=self.group_survived_kill,
             capture_abandoned=self.capture_abandoned,
+            orphans_killed=self.orphans_killed,
+            orphan_survived_kill=self.orphan_survived_kill,
+            orphans_unchecked=self.orphans_unchecked,
         )
 
 
@@ -378,13 +390,21 @@ def start_duplex(req: DuplexRequest) -> DuplexChild:
     """
     _validate(req)
     started = _now()
-    proc = _spawn(
-        req.command,
-        cwd=req.cwd,
-        env=_child_environment(req.env_allowlist, req.env),
-        stdin=subprocess.PIPE if req.stdin_pipe else subprocess.DEVNULL,
-    )
-    return DuplexChild(req, proc, started)
+    contained = _Containment.begin() if req.contain_orphans else None
+    try:
+        proc = _spawn(
+            req.command,
+            cwd=req.cwd,
+            env=_child_environment(req.env_allowlist, req.env),
+            stdin=subprocess.PIPE if req.stdin_pipe else subprocess.DEVNULL,
+        )
+    except BaseException:
+        if contained is not None:
+            contained.release()
+        raise
+    if contained is not None:
+        contained.child = proc.pid
+    return DuplexChild(req, proc, started, contained)
 
 
 class DuplexChild:
@@ -395,9 +415,16 @@ class DuplexChild:
     Every call is bounded by the request's deadline.
     """
 
-    def __init__(self, req: DuplexRequest, proc: subprocess.Popen[bytes], started: str) -> None:
+    def __init__(
+        self,
+        req: DuplexRequest,
+        proc: subprocess.Popen[bytes],
+        started: str,
+        contained: _Containment | None = None,
+    ) -> None:
         assert proc.stdout is not None and proc.stderr is not None
         self._req = req
+        self._contained = contained
         self._proc = proc
         self._started = started
         self._deadline = time.monotonic() + req.deadline_seconds
@@ -562,6 +589,9 @@ class DuplexChild:
             descendants_killed=self._descendants_killed,
             group_survived_kill=self._left.group_survived,
             capture_abandoned=self._left.capture_abandoned,
+            orphans_killed=self._contained is not None and self._contained.found,
+            orphan_survived_kill=self._left.orphan_survived,
+            orphans_unchecked=self._req.contain_orphans and self._contained is None,
         )
         return self._result
 
@@ -574,7 +604,7 @@ class DuplexChild:
     def _kill(self) -> None:
         """Kill the group before the child exited on its own; caller holds the lock."""
         self._child_killed = self._proc.poll() is None
-        self._left = _terminate_group(self._pgid, self._proc, self._readers)
+        self._left = _terminate_group(self._pgid, self._proc, self._readers, self._contained)
 
     def _expire(self) -> None:
         """The deadline passed: kill the group as ``execute()`` does on timeout."""
@@ -589,28 +619,49 @@ class DuplexChild:
         grace or kill the group, and release the pipes. Idempotent."""
         self.close_stdin()
         with self._lifecycle_lock:
-            if self._left is None:
-                overflowed = self._queue is not None and self._queue.overflowed
-                if overflowed and self._proc.poll() is None:
-                    self._kill()
-                elif not _reaped(self._proc, exit_by):
-                    self._timed_out = time.monotonic() >= self._deadline
-                    self._kill()
-                else:
-                    # The child exited on its own: ADR 0002's exit grace, then
-                    # whatever is still in the group (or holds the pipes) is
-                    # killed and the child's own status kept.
-                    grace = time.monotonic() + executor._EXIT_GRACE_SECONDS
-                    if _eof(self._readers, grace) and _group_gone(self._pgid, grace):
-                        self._left = _Termination(group_survived=False, capture_abandoned=False)
-                    else:
-                        self._descendants_killed = True
-                        self._left = _terminate_group(self._pgid, self._proc, self._readers)
+            try:
+                self._settle(exit_by)
+            except BaseException:
+                # Interrupted (Ctrl-C) before the group was dealt with: kill it
+                # and the orphans while the subreaper still catches them, as
+                # ``execute()`` does, and only then restore the setting.
+                try:
+                    if self._left is None:
+                        self._kill()
+                finally:
+                    if self._contained is not None:
+                        self._contained.release()
+                raise
             if self._closed:
                 return
             self._closed = True
+            if self._contained is not None:
+                self._contained.release()
             for reader in self._readers:
                 reader.close()
             assert self._proc.stdout is not None and self._proc.stderr is not None
             self._proc.stdout.close()
             self._proc.stderr.close()
+
+    def _settle(self, exit_by: float) -> None:
+        """Deal with the group once: the exit grace, or the kill; caller holds the lock."""
+        if self._left is None:
+            overflowed = self._queue is not None and self._queue.overflowed
+            if overflowed and self._proc.poll() is None:
+                self._kill()
+            elif not _reaped(self._proc, exit_by):
+                self._timed_out = time.monotonic() >= self._deadline
+                self._kill()
+            else:
+                # The child exited on its own: ADR 0002's exit grace, then
+                # whatever is still in the group (or holds the pipes) is
+                # killed and the child's own status kept.
+                grace = time.monotonic() + executor._EXIT_GRACE_SECONDS
+                contained = self._contained
+                group_settled = _eof(self._readers, grace) and _group_gone(self._pgid, grace)
+                if group_settled and (contained is None or contained.settled(grace)):
+                    self._left = _Termination(group_survived=False, capture_abandoned=False)
+                else:
+                    # Only an orphan left over is an orphan kill, not a group one.
+                    self._descendants_killed = not group_settled
+                    self._left = _terminate_group(self._pgid, self._proc, self._readers, contained)

@@ -2694,6 +2694,7 @@ class ControllerEngine:
                 cwd=cwd,
                 timeout_seconds=self.config.execution.default_timeout_seconds,
                 env_allowlist=self.config.execution.environment_names(),
+                contain_orphans=True,
             )
             result = (self._runner or execute)(req)
             record = ExecutionRecord(
@@ -2716,6 +2717,9 @@ class ControllerEngine:
                 descendants_killed=result.descendants_killed,
                 group_survived_kill=result.group_survived_kill,
                 capture_abandoned=result.capture_abandoned,
+                orphans_killed=result.orphans_killed,
+                orphan_survived_kill=result.orphan_survived_kill,
+                orphans_unchecked=result.orphans_unchecked,
                 metadata={"validation_command": list(argv), "feature": state.feature_spec_path},
             )
             if result.timed_out or result.exit_code != 0:
@@ -3993,6 +3997,7 @@ class ControllerEngine:
             cwd=cwd,
             timeout_seconds=self.config.execution.default_timeout_seconds,
             env_allowlist=self.config.execution.environment_names(),
+            contain_orphans=True,
         )
         result = (self._runner or execute)(req)
         record = ExecutionRecord(
@@ -4015,6 +4020,9 @@ class ControllerEngine:
             descendants_killed=result.descendants_killed,
             group_survived_kill=result.group_survived_kill,
             capture_abandoned=result.capture_abandoned,
+            orphans_killed=result.orphans_killed,
+            orphan_survived_kill=result.orphan_survived_kill,
+            orphans_unchecked=result.orphans_unchecked,
             metadata={
                 "verification_command": list(argv),
                 "pr_url": pr.url,
@@ -6166,6 +6174,9 @@ class ControllerEngine:
             record.descendants_killed = result.descendants_killed
             record.group_survived_kill = result.group_survived_kill
             record.capture_abandoned = result.capture_abandoned
+            record.orphans_killed = result.orphans_killed
+            record.orphan_survived_kill = result.orphan_survived_kill
+            record.orphans_unchecked = result.orphans_unchecked
             # The adapter's own summary of the run (bounded, redacted, flat);
             # recorded as given and never interpreted here.
             record.provider_summary = dict(result.provider_summary)

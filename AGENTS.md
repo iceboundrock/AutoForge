@@ -184,6 +184,7 @@ docs/adr/                              accepted design records (LOCAL mode works
 docs/README.md                         human-oriented documentation index, by intent
 docs/usage.md                          operator guide: remote commands, stop phases, unblock, recovery
 docs/local-mode.md                     operator guide: LOCAL mode (no GitHub)
+docs/pi-policy.md                      Pi: what an unattended run may load, tools, credentials
 docs/configuration.md                  config files, formats, strict key validation, profiles
 docs/development.md                    make targets, CI, what a green `ci` does and does not prove
 README.md                              operator-facing landing page: overview, key properties,

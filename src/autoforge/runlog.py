@@ -183,6 +183,12 @@ class ExecutionRecord:
     descendants_killed: bool = False
     group_survived_kill: bool = False
     capture_abandoned: bool = False
+    # Processes it left outside its group (re-parented to the controller)
+    # were killed; one survived SIGKILL; the platform could not check (see
+    # ``executor._Containment``).
+    orphans_killed: bool = False
+    orphan_survived_kill: bool = False
+    orphans_unchecked: bool = False
     dry_run: bool = False
     parsed_result: dict | None = None
     error: str = ""
@@ -529,6 +535,9 @@ class RunLogger:
             "descendants_killed": record.descendants_killed,
             "group_survived_kill": record.group_survived_kill,
             "capture_abandoned": record.capture_abandoned,
+            "orphans_killed": record.orphans_killed,
+            "orphan_survived_kill": record.orphan_survived_kill,
+            "orphans_unchecked": record.orphans_unchecked,
             "stdout_chars": len(stdout or ""),
             "stderr_chars": len(stderr or ""),
             "error": record.error,

@@ -175,6 +175,46 @@ def test_normal_text_untouched():
     assert redact(text) == text
 
 
+# Every value below is an obviously fake placeholder.
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (
+            '{"refresh": "rt_FAKE-not-a-real-token", "access": "at_FAKE-not-real", '
+            '"expires": 1700000000}',
+            '{"refresh": "***REDACTED***", "access": "***REDACTED***", "expires": 1700000000}',
+        ),
+        ('{"refresh_token": "FAKE-refresh"}', '{"refresh_token": "***REDACTED***"}'),
+        ("{'access_token': 'FAKE-access'}", "{'access_token': '***REDACTED***'}"),
+        ('"id_token": "FAKE.ID.TOKEN"', '"id_token": "***REDACTED***"'),
+        ('"chatgpt_account_id":"fake-account"', '"chatgpt_account_id":"***REDACTED***"'),
+        # JSON inside a JSON string keeps its escaping.
+        ('{\\"refresh\\": \\"rt_FAKE\\"}', '{\\"refresh\\": \\"***REDACTED***\\"}'),
+        ("refresh_token=FAKE_REFRESH_TOKEN", "refresh_token=***REDACTED***"),
+        ("?oauth_refresh_token=FAKE&next=1", "?oauth_refresh_token=***REDACTED***&next=1"),
+        ("ACCESS_TOKEN: 'FAKE-access'", "ACCESS_TOKEN: '***REDACTED***'"),
+        ("chatgpt-account-id: 00000000-fake-0000", "chatgpt-account-id: ***REDACTED***"),
+        ("access=FAKE_ACCESS_VALUE_0000", "access=***REDACTED***"),
+    ],
+)
+def test_oauth_credential_fields(text, expected):
+    assert redact(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "refresh the page and check access to the repo",
+        "access: denied; refresh: on demand",
+        "refresh=true access=read",
+        "the token refresh failed; see the access log",
+        '{"refreshed": "yes", "accessible": "no"}',
+    ],
+)
+def test_oauth_words_in_prose_untouched(text):
+    assert redact(text) == text
+
+
 def test_none_and_non_str_safe():
     assert redact(None) == ""
     assert isinstance(redact(123), str)
@@ -272,6 +312,9 @@ _WORST_CASE_UNITS = {
     # ``sk-`` pattern could not leave it unpinned.
     "sk_ant_key": "sk-ant-aaaaaaaa ",
     "generic_assignment": "token=aaaaaaaaaaaa ",
+    "oauth_json_field": '"access":"x"',
+    "oauth_assignment": "id_token=x;",
+    "oauth_bare_assignment": "access=aaaaaaaaaaaaaaaa ",
 }
 
 

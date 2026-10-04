@@ -272,13 +272,14 @@ profiles:
       auto_approve: false
 
   # Pi (`provider: pi`, ADR 0003) instead: replace the block above with this
-  # one. Running a Pi phase lands with #131; until then `autoforge doctor`
-  # and dry runs accept the profile and a real run refuses to launch it.
-  # Prerequisite, an operator step AutoForge never performs for you: run
-  # `pi`, then `/login openai` (ChatGPT sign-in). `autoforge doctor` checks
-  # the Pi version and, read-only, that Pi holds a credential for the
+  # one. Prerequisite, an operator step AutoForge never performs for you:
+  # run `pi`, then `/login openai` (ChatGPT sign-in). `autoforge doctor`
+  # checks the Pi version and, read-only, that Pi holds a credential for the
   # provider (not that this model is usable with it).
-  # A Pi profile takes no extra_args.
+  # A Pi profile takes no extra_args: AutoForge loads no Pi extension,
+  # package, MCP server, skill or prompt template and ignores project trust
+  # (docs/pi-policy.md). Pi has no approval layer; run it in a container, a
+  # VM or under a dedicated user.
   # pi-example-start
   # review_round_2_5:
   #   provider: pi
@@ -287,7 +288,9 @@ profiles:
   #   command: pi
   #   timeout_seconds: 1800
   #   options:
-  #     require_oauth: true         # fail `doctor` when Pi would use an API key instead
+  #     require_oauth: true         # refuse to run on an API key instead of the sign-in
+  #     tools: read,bash            # Pi built-in tools; default read,bash for a reviewer
+  #     context_files: true         # false: no AGENTS.md / CLAUDE.md at all (--no-context-files)
   # pi-example-end
 
   review_round_6_plus:

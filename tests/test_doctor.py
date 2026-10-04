@@ -619,6 +619,13 @@ OAUTH_READY = '{"status":"ready","provider":"openai","authType":"oauth"}'
 PLANTED = "sk-planted-SECRET-0123456789abcdef"
 
 
+@pytest.fixture(autouse=True)
+def _no_real_pi_home(tmp_path, monkeypatch):
+    """Pi's agent directory is a temp one: a test never looks at the operator's ``~/.pi``."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path / "pi-agent"))
+
+
 def _write_config(tmp_path, profiles, extra=None):
     data = {"version": 1, "profiles": profiles}
     data.update(extra or {})
@@ -924,3 +931,88 @@ def test_local_doctor_checks_a_pi_reviewer(tmp_path):
     results = {r.name: r for r in d.run_local()}
     assert results["agent 'pi' available (review_round_1)"].ok
     assert results["agent 'pi' auth ready (review_round_1)"].ok
+
+
+# -- instructions Pi loads from outside the checkout (#132) -----------------------
+PI_OUTSIDE = "pi loads no instructions from outside the checkout (review_round_2_5)"
+
+
+def _pi_outside_row(tmp_path, profile=None):
+    repo = tmp_path / "work" / "repo"
+    repo.mkdir(parents=True, exist_ok=True)
+    config = _write_config(tmp_path, {"review_round_2_5": profile or _pi_profile()})
+    d = Doctor(config_path=config, cwd=str(repo), runner=_pi_runner())
+    return {r.name: r for r in d.run_all()}[PI_OUTSIDE]
+
+
+def test_no_outside_instructions_is_ok(tmp_path):
+    row = _pi_outside_row(tmp_path)
+    assert row.ok and not row.required and row.detail == "(none found)"
+
+
+@pytest.mark.parametrize("name", ["SYSTEM.md", "APPEND_SYSTEM.md", "AGENTS.md", "CLAUDE.md"])
+def test_agent_dir_instructions_are_a_warning_naming_the_path(tmp_path, name):
+    agent = tmp_path / "pi-agent"
+    agent.mkdir()
+    (agent / name).write_text("SECRET-INSTRUCTION")
+    row = _pi_outside_row(tmp_path)
+    assert row.label == "WARN" and str(agent / name) in row.detail
+    assert "SECRET-INSTRUCTION" not in row.detail
+
+
+def test_a_context_file_above_the_checkout_is_a_warning_and_the_first_name_wins(tmp_path):
+    (tmp_path / "work" / "AGENTS.md").parent.mkdir(parents=True)
+    (tmp_path / "work" / "AGENTS.md").write_text("x")
+    (tmp_path / "work" / "CLAUDE.md").write_text("x")
+    row = _pi_outside_row(tmp_path)
+    assert row.label == "WARN" and str(tmp_path / "work" / "AGENTS.md") in row.detail
+    assert "CLAUDE.md" not in row.detail
+    # The checkout's own file is project data under review, not an outside one.
+    (tmp_path / "work" / "AGENTS.md").unlink()
+    (tmp_path / "work" / "CLAUDE.md").unlink()
+    (tmp_path / "work" / "repo" / "AGENTS.md").write_text("x")
+    assert _pi_outside_row(tmp_path).ok
+
+
+def test_context_files_false_leaves_only_the_system_prompt_files(tmp_path):
+    agent = tmp_path / "pi-agent"
+    agent.mkdir()
+    (agent / "AGENTS.md").write_text("x")
+    (tmp_path / "work").mkdir()
+    (tmp_path / "work" / "AGENTS.md").write_text("x")
+    profile = _pi_profile(options={"context_files": "false"})
+    assert _pi_outside_row(tmp_path, profile).ok
+    (agent / "SYSTEM.md").write_text("x")
+    row = _pi_outside_row(tmp_path, profile)
+    assert row.label == "WARN" and str(agent / "SYSTEM.md") in row.detail
+
+
+def test_the_default_agent_dir_is_used_when_the_launch_does_not_pass_one(tmp_path, monkeypatch):
+    monkeypatch.delenv("PI_CODING_AGENT_DIR")
+    default = tmp_path / "home" / ".pi" / "agent"
+    default.mkdir(parents=True)
+    (default / "APPEND_SYSTEM.md").write_text("x")
+    row = _pi_outside_row(tmp_path)
+    assert row.label == "WARN" and str(default / "APPEND_SYSTEM.md") in row.detail
+
+
+def test_no_outside_instructions_row_without_a_pi_profile(tmp_path):
+    config = _write_config(tmp_path, {"analyze_execute": {"provider": "opencode"}})
+    d = Doctor(config_path=config, cwd=str(tmp_path), runner=_runner_factory())
+    assert not any("instructions" in r.name for r in d.run_all())
+
+
+def test_a_forwarded_api_key_fails_an_oauth_profile_without_probing(tmp_path, monkeypatch):
+    """The launch would refuse it (#132), so `doctor` does too; the value is never shown."""
+    monkeypatch.setenv("OPENAI_API_KEY", PLANTED)
+    requests = []
+    config = _write_config(
+        tmp_path,
+        {"review_round_2_5": _pi_profile()},
+        {"execution": {"env_allowlist_extra": ["OPENAI_API_KEY"]}},
+    )
+    d = Doctor(config_path=config, cwd=str(tmp_path), runner=_pi_runner(requests=requests))
+    row = {r.name: r for r in d.run_all()}[PI_AUTH]
+    assert not row.ok and row.required and "OPENAI_API_KEY is set" in row.detail
+    assert PLANTED not in row.detail
+    assert [r.command[1] for r in requests] == ["--version"]

@@ -51,7 +51,8 @@ AgentProvider
   -> ClaudeCodeProvider
   -> OpenCodeProvider
   -> PiProvider          (EPIC #127, ADR 0003: config, argv and doctor checks
-                          in #129; execution over RPC in #131)
+                          in #129; execution over RPC in #131; the resource,
+                          tool and credential policy in #132, docs/pi-policy.md)
 ```
 
 Provider adapters own:
@@ -132,6 +133,15 @@ group. The child's own exit status and output are then returned, so a valid
 whole timeout, and `ExecutionResult.descendants_killed` records the kill.
 The two flags are exclusive: `timed_out` means the child itself overran,
 `descendants_killed` that it exited and its leftovers were removed.
+
+A request with `contain_orphans` (every agent launch and every
+repository-defined command; not the controller's own `git`/`gh` plumbing)
+also catches what left the group (ADR 0002 §4b). On Linux the controller is
+a child subreaper for the invocation, so a detached process whose parent
+died is re-parented to it. Such orphans get the same grace and kill, and
+are reported as `orphans_killed` / `orphan_survived_kill`. Without a
+subreaper the result says `orphans_unchecked`. One contained invocation
+runs per controller process.
 
 `execute()` itself stays one-shot with `stdin=DEVNULL`. A child the
 controller must write to while it runs (an RPC transport such as Pi's, ADR
