@@ -57,6 +57,10 @@ HEALTHY_GITHUB = {
 
 # What a recent enough `gh --version` prints (first line).
 GH_VERSION_LINE = "gh version 2.48.0 (2024-04-09)"
+# What `opencode --version` prints on a supported CLI (#186).
+OPENCODE_VERSION_LINE = "opencode v2.0.23"
+# The OpenCode commands the configs below name.
+OPENCODE_COMMANDS = ("opencode", "epic-oc")
 
 
 def _runner_factory(
@@ -66,10 +70,14 @@ def _runner_factory(
     default_branch="main",
     calls=None,
     gh_version=GH_VERSION_LINE,
+    opencode_version=OPENCODE_VERSION_LINE,
+    opencode_code=0,
 ):
     """Fake runner. ``github`` maps a `gh api` endpoint to its JSON payload, or to
     an ``(exit_code, stderr)`` pair for a failed read; ``--paginate --slurp``
-    listings are wrapped in one page the way `gh` does."""
+    listings are wrapped in one page the way `gh` does. ``opencode_version``
+    is what an OpenCode command's ``--version`` prints (``None``: the binary
+    is missing), with exit status ``opencode_code``."""
     responses = dict(HEALTHY_GITHUB)
     responses.update(github or {})
 
@@ -100,6 +108,12 @@ def _runner_factory(
             out = json.dumps([payload] if paginated else payload)
         elif argv == ["gh", "--version"]:
             out = gh_version + "\nhttps://github.com/cli/cli/releases/tag/v2.48.0"
+        elif argv[0] in OPENCODE_COMMANDS and argv[1:] == ["--version"]:
+            if opencode_version is None:
+                raise FileNotFoundError(2, "No such file or directory", argv[0])
+            return ExecutionResult(
+                argv, req.cwd, opencode_code, opencode_version + "\n", "", "t", "t"
+            )
         else:
             out = f"{argv[0]} version 1.0"
         return ExecutionResult(argv, req.cwd, 0, out + "\n", "", "t", "t")
@@ -667,6 +681,76 @@ def _pi_doctor(tmp_path, profile=None, **kwargs):
     for r in results:
         assert PLANTED not in r.name and PLANTED not in r.detail, r
     return {r.name: r for r in results}
+
+
+OPENCODE_LABEL = (
+    "agent 'opencode' available (review_round_1, review_round_2_5, review_round_6_plus, "
+    "replan_reexecute, update_epic)"
+)
+
+
+def _opencode_row(tmp_path, **kwargs):
+    d = Doctor(cwd=str(tmp_path), runner=_runner_factory(**kwargs))
+    results = d.run_all()
+    for r in results:
+        assert PLANTED not in r.name and PLANTED not in r.detail, r
+    return {r.name: r for r in results}[OPENCODE_LABEL]
+
+
+@pytest.mark.parametrize(
+    ("version", "shown"),
+    [
+        ("opencode v2.0.23", "opencode 2.0.23"),
+        ("opencode v2.0.0", "opencode 2.0.0"),
+        ("v2.1.0", "opencode 2.1.0"),
+        ("2.0.23", "opencode 2.0.23"),
+        ("opencode v3.0.0", "opencode 3.0.0"),
+    ],
+)
+def test_opencode_at_or_above_the_minimum_passes(tmp_path, version, shown):
+    row = _opencode_row(tmp_path, opencode_version=version)
+    assert row.ok and row.detail == shown
+
+
+@pytest.mark.parametrize("version", ["1.18.34", "opencode v1.99.0", "opencode v2.0.0-beta.1"])
+def test_opencode_below_the_minimum_fails_and_names_it(tmp_path, version):
+    row = _opencode_row(tmp_path, opencode_version=version)
+    assert not row.ok and "opencode >= 2.0.0 is required" in row.detail
+
+
+def test_an_opencode_1x_names_the_release_it_found(tmp_path):
+    row = _opencode_row(tmp_path, opencode_version="1.18.34")
+    assert row.detail.startswith("opencode 1.18.34: ")
+
+
+@pytest.mark.parametrize("version", ["", "opencode", "opencode v2.0", "opencode version 1.0"])
+def test_an_unreadable_opencode_version_fails_rather_than_passes(tmp_path, version):
+    row = _opencode_row(tmp_path, opencode_version=version)
+    assert not row.ok and "cannot read the opencode version" in row.detail
+
+
+@pytest.mark.parametrize(
+    "version", [f"token {PLANTED}", f"opencode v2.0.23\nOPENAI_API_KEY={PLANTED}", PLANTED]
+)
+def test_an_unreadable_opencode_version_is_not_quoted(tmp_path, version):
+    # `_opencode_row` asserts PLANTED is absent from every row.
+    row = _opencode_row(tmp_path, opencode_version=version)
+    assert not row.ok and "output not shown" in row.detail and ">= 2.0.0" in row.detail
+
+
+def test_an_opencode_pre_release_suffix_is_not_quoted(tmp_path):
+    row = _opencode_row(tmp_path, opencode_version=f"opencode v2.0.0-{PLANTED}")
+    assert not row.ok and row.detail.startswith("opencode 2.0.0 (pre-release): ")
+
+
+def test_a_failing_opencode_version_does_not_quote_its_output(tmp_path):
+    row = _opencode_row(tmp_path, opencode_version=PLANTED, opencode_code=3)
+    assert not row.ok and "exited 3" in row.detail and "output not shown" in row.detail
+
+
+def test_a_missing_opencode_fails(tmp_path):
+    row = _opencode_row(tmp_path, opencode_version=None)
+    assert not row.ok and "FileNotFoundError" in row.detail
 
 
 def test_remote_rows_name_only_the_reachable_clis(tmp_path):

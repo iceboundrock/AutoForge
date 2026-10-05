@@ -1,9 +1,11 @@
 """Executor: real subprocesses (python -c) — argv safety, timeout, exit codes."""
 
+import hashlib
 import os
 import random
 import signal
 import sys
+import threading
 import time
 import tracemalloc
 from pathlib import Path
@@ -347,6 +349,75 @@ def test_stdin_is_closed_not_interactive():
         )
     )
     assert res.ok and res.stdout.strip() == "''"
+    assert not res.stdin_incomplete
+
+
+# Reads its stdin to EOF and prints the length and digest of what arrived.
+_DIGEST_STDIN = (
+    "import hashlib, sys\n"
+    "data = sys.stdin.buffer.read()\n"
+    "print(len(data), hashlib.sha256(data).hexdigest())\n"
+)
+
+
+def _digest(data: bytes) -> str:
+    return f"{len(data)} {hashlib.sha256(data).hexdigest()}"
+
+
+def test_stdin_data_arrives_verbatim_and_then_eof():
+    """The payload reaches the child byte for byte, past one pipe buffer, and
+    stdin is closed after it: the child's read-to-EOF returns."""
+    head = '-x --help\r\n# "q" \'q\' `id` $(id) \\ ; | &\n{"phase": "REVIEW"}\né中\U0001f600\n'
+    data = (head * 20_000).encode()  # ~1.4 MB, far past a 64 KiB pipe buffer
+    res = execute(
+        ExecutionRequest(command=[PY, "-c", _DIGEST_STDIN], stdin_data=data, timeout_seconds=30)
+    )
+    assert res.ok, res.stderr
+    assert res.stdout.strip() == _digest(data)
+    assert not res.stdin_incomplete
+
+
+def test_empty_stdin_data_is_an_immediate_eof():
+    res = execute(
+        ExecutionRequest(command=[PY, "-c", _DIGEST_STDIN], stdin_data=b"", timeout_seconds=30)
+    )
+    assert res.ok and res.stdout.strip() == _digest(b"")
+    assert not res.stdin_incomplete
+
+
+def test_child_that_never_reads_its_stdin_times_out_and_the_feed_ends():
+    """A payload larger than the pipe and a child that never reads it: the
+    timeout still kills the group on time, the feed is reported incomplete,
+    and no feeder thread outlives ``execute()``."""
+    started = time.monotonic()
+    res = execute(
+        ExecutionRequest(
+            command=[PY, "-c", "import time; time.sleep(30)"],
+            stdin_data=b"x" * (4 * 1024 * 1024),
+            timeout_seconds=1,
+        )
+    )
+    assert res.timed_out and res.exit_code == -1
+    assert res.stdin_incomplete
+    assert time.monotonic() - started < 10
+    assert not [t for t in threading.enumerate() if t.name == "autoforge-feed-stdin"]
+
+
+def test_child_that_exits_without_reading_its_stdin_reports_it():
+    """The child exits 0 at once and leaves most of the payload unwritten: its
+    own status is returned, promptly, with ``stdin_incomplete`` set."""
+    started = time.monotonic()
+    res = execute(
+        ExecutionRequest(
+            command=[PY, "-c", "print('bye')"],
+            stdin_data=b"x" * (4 * 1024 * 1024),
+            timeout_seconds=30,
+        )
+    )
+    assert not res.timed_out and res.exit_code == 0 and res.stdout == "bye\n"
+    assert res.stdin_incomplete
+    assert time.monotonic() - started < 10
+    assert not [t for t in threading.enumerate() if t.name == "autoforge-feed-stdin"]
 
 
 def test_cwd_is_applied(tmp_path):

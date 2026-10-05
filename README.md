@@ -145,8 +145,9 @@ Each line is a summary; the linked document is the precise statement.
   refuses an older `gh` up front. `gh` is **not** needed for
   [local mode](#local-mode-no-github)
 - `claude` (Claude Code CLI) for `analyze_execute` / `fix` profiles
-- `opencode` (OpenCode CLI) for the `review_*`, `replan_reexecute` and
-  `update_epic` profiles
+- `opencode` (OpenCode CLI) 2.0.0 or newer for the `review_*`,
+  `replan_reexecute` and `update_epic` profiles; 1.x is refused by `doctor`
+  (see [OpenCode profiles](docs/configuration.md#opencode-profiles))
 - `pi` 1.0.0 or newer, only if a profile you route to uses `provider: pi`
   (see [Pi profiles](docs/configuration.md#pi-profiles)). `doctor` checks
   only the agent CLIs your configured profiles actually reach
@@ -164,7 +165,7 @@ or
 authentication, no `origin` remote).
 
 CLI flag syntax in `autoforge.example.yaml` was checked against the locally
-installed CLIs (Claude Code 2.1.263, OpenCode 1.18.20, gh 2.100.0).
+installed CLIs (Claude Code 2.1.263, OpenCode 2.0.23, gh 2.100.0).
 
 ## Installation
 

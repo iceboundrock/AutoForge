@@ -828,6 +828,8 @@ def test_local_doctor_checks_only_the_reachable_providers(tmp_path):
         from autoforge.executor import ExecutionResult
 
         stdout = str(root) if "rev-parse" in req.command else "ok"
+        if req.command == ["oc", "--version"]:
+            stdout = "opencode v2.0.23"  # #186: the floor `doctor` enforces
         return ExecutionResult(
             command=list(req.command),
             cwd=req.cwd,

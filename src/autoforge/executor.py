@@ -7,7 +7,10 @@ Safety properties:
 - argv lists only, never ``shell=True`` — prompt text containing quotes,
   ``$``, ``;``, ``|`` or ``$(...)`` is passed as one opaque argument;
 - stdin is ``/dev/null`` so a CLI that expects an interactive TTY cannot
-  hang waiting for input;
+  hang waiting for input, unless the request carries ``stdin_data``: that
+  is written in full by a non-blocking feeder and stdin is then closed, so
+  the child sees EOF and a child that never reads costs the controller
+  nothing past the invocation (:class:`_StdinFeeder`);
 - the child runs in its own session/process group, and nothing in that
   group outlives the invocation: on timeout the whole group is terminated
   (SIGTERM, then SIGKILL), and after a normal exit a group that still has
@@ -145,6 +148,10 @@ class ExecutionRequest:
     # controller's own git/gh plumbing leaves it off, so a ``git gc --auto``
     # that git daemonized on purpose is left alone.
     contain_orphans: bool = False
+    # Written to the child's stdin, which is then closed; ``None`` keeps
+    # stdin on ``/dev/null``. For a CLI whose argv cannot carry a payload
+    # verbatim (the OpenCode v2 message). Bounded by the timeout, not by size.
+    stdin_data: bytes | None = None
 
 
 @dataclass
@@ -186,6 +193,11 @@ class ExecutionResult:
     # Containment was requested but this platform has no child subreaper, so
     # a process that left the group was neither seen nor killed.
     orphans_unchecked: bool = False
+    # ``stdin_data`` was given and not all of it was written: the child (or
+    # whatever held its stdin) closed it first, or the invocation ended
+    # before it was taken. Written is not read: what fit in the pipe counts
+    # as written whether or not the child read it.
+    stdin_incomplete: bool = False
 
     @property
     def stdout_tail(self) -> str:
@@ -446,6 +458,63 @@ class _BoundedReader(_PipeDrain):
     def captured(self) -> _Captured:
         """Decode what was kept; call only once the thread has ended."""
         return self.buffer.captured()
+
+
+class _StdinFeeder(threading.Thread):
+    """Write ``data`` to the child's stdin, then close it so the child sees EOF.
+
+    The write end is non-blocking and the thread waits on it and on a wake
+    pipe, so a child that never reads its stdin (or a descendant that holds
+    the pipe and never reads) costs a parked thread that :meth:`stop` ends
+    at once, never a hung invocation. A child that closes its stdin first
+    ends the feed (EPIPE). :attr:`complete` says whether every byte was
+    written.
+    """
+
+    def __init__(self, stream: IO[bytes], data: bytes) -> None:
+        super().__init__(name="autoforge-feed-stdin", daemon=True)
+        self._stream = stream
+        self._data = data
+        self._wake_r, self._wake_w = os.pipe()
+        self.complete = False
+        self.error: OSError | None = None
+
+    def run(self) -> None:
+        fd = self._stream.fileno()
+        view = memoryview(self._data)
+        try:
+            os.set_blocking(fd, False)
+            with selectors.DefaultSelector() as sel:
+                sel.register(fd, selectors.EVENT_WRITE)
+                sel.register(self._wake_r, selectors.EVENT_READ)
+                while view:
+                    ready = {key.fd for key, _ in sel.select()}
+                    if self._wake_r in ready:
+                        return
+                    try:
+                        view = view[os.write(fd, view) :]
+                    except BlockingIOError:
+                        continue
+            self.complete = True
+        except BrokenPipeError:
+            pass  # the child closed its stdin first: ``complete`` stays False
+        except OSError as exc:
+            self.error = exc
+        finally:
+            try:
+                self._stream.close()
+            except OSError:
+                pass  # nothing was buffered; the fd is closed either way
+
+    def stop(self) -> None:
+        """End the feed if it is still writing, and wait for the thread."""
+        os.write(self._wake_w, b"\0")
+        self.join()
+        for fd in (self._wake_r, self._wake_w):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 def _now() -> str:
@@ -854,11 +923,16 @@ def _execute(req: ExecutionRequest, contained: _Containment | None) -> Execution
         req.command,
         cwd=req.cwd,
         env=_child_environment(req.env_allowlist, req.env),
-        stdin=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL if req.stdin_data is None else subprocess.PIPE,
     )
     assert proc.stdout is not None and proc.stderr is not None
     if contained is not None:
         contained.child = proc.pid
+    feeder = None
+    if req.stdin_data is not None:
+        assert proc.stdin is not None
+        feeder = _StdinFeeder(proc.stdin, req.stdin_data)
+        feeder.start()
     pgid = proc.pid  # start_new_session: the child leads a group of its own
     # Output is read as bytes and decoded with replacement: agent output is
     # untrusted (a dumped binary, a mis-encoded file the agent cats), and a
@@ -901,6 +975,8 @@ def _execute(req: ExecutionRequest, contained: _Containment | None) -> Execution
         _terminate_group(pgid, proc, readers, contained)
         raise
     finally:
+        if feeder is not None:
+            feeder.stop()
         for reader in readers:
             reader.close()
     proc.stdout.close()
@@ -911,6 +987,10 @@ def _execute(req: ExecutionRequest, contained: _Containment | None) -> Execution
                 f"failed to read {reader.name.removeprefix('autoforge-capture-')} of "
                 f"{' '.join(req.command)}: {reader.error}"
             ) from reader.error
+    if feeder is not None and feeder.error is not None:
+        raise ExecutionError(
+            f"failed to write the stdin of {' '.join(req.command)}: {feeder.error}"
+        ) from feeder.error
     out, err = (reader.captured() for reader in readers)
     return ExecutionResult(
         command=list(req.command),
@@ -930,4 +1010,5 @@ def _execute(req: ExecutionRequest, contained: _Containment | None) -> Execution
         orphans_killed=contained is not None and contained.found,
         orphan_survived_kill=left.orphan_survived,
         orphans_unchecked=req.contain_orphans and contained is None,
+        stdin_incomplete=feeder is not None and not feeder.complete,
     )

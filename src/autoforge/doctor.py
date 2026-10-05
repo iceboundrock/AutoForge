@@ -45,11 +45,13 @@ from .github import (
 from .local_workspace import DEFAULT_MAX_BYTES, DEFAULT_MAX_ENTRIES
 from .profiles import REQUIRED_PROFILES, local_required_profiles
 from .providers import (
+    OPENCODE_MIN_VERSION,
     PI_CONTEXT_FILES,
     PI_DEFAULT_AGENT_DIR,
     PI_MIN_VERSION,
     PI_SYSTEM_PROMPT_FILES,
     PiProvider,
+    parse_opencode_version,
     parse_pi_version,
 )
 from .safefs import STATE_DIR_NEEDS_HARD_LINKS, HardLinksUnavailable, SafeRoot
@@ -500,10 +502,12 @@ class Doctor:
         that reach it. `scripted` spawns the configured argv directly rather
         than an agent CLI, so there is no version to query. A command a Pi
         profile names gets Pi's version floor instead of a bare `--version`,
-        and each Pi profile a read-only credential probe.
+        and each Pi profile a read-only credential probe; one an OpenCode
+        profile names gets OpenCode's floor.
         """
         commands: dict[str, list[str]] = {}
         pi_profiles: dict[str, list[ProfileConfig]] = {}
+        opencode_commands: set[str] = set()
         for name in reachable:
             profile = cfg.profiles.get(name)
             if profile is None or profile.provider == "scripted":
@@ -514,6 +518,8 @@ class Doctor:
             commands.setdefault(command, []).append(name)
             if profile.provider == "pi":
                 pi_profiles.setdefault(command, []).append(profile)
+            elif profile.provider == "opencode":
+                opencode_commands.add(command)
         if not commands:
             return [
                 CheckResult(
@@ -526,6 +532,9 @@ class Doctor:
         results: list[CheckResult] = []
         for command, names in commands.items():
             label = f"agent '{command}' available ({', '.join(names)})"
+            if command in opencode_commands and command not in pi_profiles:
+                results.append(self.check_opencode_version(label, command))
+                continue
             if command not in pi_profiles:
                 results.append(self._version_check(label, [command, "--version"]))
                 continue
@@ -628,6 +637,52 @@ class Doctor:
                 False,
                 f"{shown}: pi >= {minimum} is required (the RPC and auth contract "
                 "AutoForge relies on, ADR 0003)",
+            )
+        return CheckResult(name, True, shown)
+
+    def check_opencode_version(self, name: str, command: str) -> CheckResult:
+        """`opencode` runs and is at least :data:`OPENCODE_MIN_VERSION` (#186).
+
+        The adapter speaks v2's argv (``--standalone``, ``-m model#variant``)
+        and hands the prompt over on stdin; 1.x rejects that argv. As for Pi,
+        an unreadable version is a FAIL and the CLI's output is never quoted.
+        """
+        argv = [command, "--version"]
+        try:
+            res = self._runner(
+                ExecutionRequest(command=argv, cwd=self.cwd, timeout_seconds=self.timeout)
+            )
+        except Exception as exc:  # spawn failure / missing binary
+            return CheckResult(name, False, f"{type(exc).__name__}: {exc}")
+        if res.timed_out:
+            return CheckResult(name, False, "timed out")
+        if res.exit_code != 0:
+            return CheckResult(
+                name,
+                False,
+                f"`{' '.join(argv)}` exited {res.exit_code} (output not shown; run it yourself)",
+            )
+        minimum = ".".join(str(part) for part in OPENCODE_MIN_VERSION)
+        text = (res.stdout or "").strip()
+        found = parse_opencode_version(text)
+        if found is None:
+            return CheckResult(
+                name,
+                False,
+                f"cannot read the opencode version from `{' '.join(argv)}` (output not "
+                f"shown; need >= {minimum})",
+            )
+        # The text matched the version pattern whole, so its only `-` opens a
+        # pre-release suffix.
+        head, _, suffix = text.partition("-")
+        release = head.removeprefix("opencode ").removeprefix("v")
+        shown = f"opencode {release} (pre-release)" if suffix else f"opencode {release}"
+        if found < OPENCODE_MIN_VERSION:
+            return CheckResult(
+                name,
+                False,
+                f"{shown}: opencode >= {minimum} is required (the argv and stdin "
+                "delivery the adapter speaks, #186)",
             )
         return CheckResult(name, True, shown)
 

@@ -18,22 +18,33 @@ Claude Code (``claude 2.1.x``)::
     deny anything that prompts. Configure via profile ``options``.
   * exit code 0 on success; 1 on model/auth errors (message on stdout).
 
-OpenCode (``opencode 1.18.x``)::
+OpenCode (``opencode 2.0.x``, #186; run against 2.0.23)::
 
-    opencode run -m <provider/model> --variant <effort> --format default [--auto]
-                 [extra_args] -- <message>
+    opencode run --standalone -m <provider/model>[#<effort>] --format default [--auto]
+                 [extra_args]                                   (message on stdin)
 
-  * model ids are ``provider/model`` (``openai/gpt-5.6-luna``).
-  * ``--`` ends option parsing (yargs), so a message that starts with ``-``
-    is the message and not a flag (checked against 1.18.31: after ``--``,
-    ``--help`` is sent as the message rather than printing the help).
-  * ``--variant`` carries the provider-specific reasoning effort.
+  * the message travels on stdin, written whole and then closed: in argv,
+    v2 duplicates a message given after ``--`` and wraps one given without
+    it in quotes with ``"`` and backslashes escaped, and takes one that starts
+    with ``-`` for a flag (it prints the help and exits 0). stdin arrives
+    verbatim. A CLI that closes stdin before taking all of it, and still
+    exits 0, is a :attr:`AgentExecutionResult.provider_failure`.
+  * ``--standalone`` runs the agent on a private server that is the
+    client's own child; without it the run goes to a shared background
+    service (``opencode serve --service``) whose tools run outside this
+    invocation's process group, cwd and environment, and outlive it.
+  * model ids are ``provider/model`` (``openai/gpt-5.6-luna``); the
+    reasoning effort is the ``#<variant>`` suffix (v2 removed
+    ``--variant``), so a configured model carries no ``#`` of its own. An
+    unknown model or variant exits 1 with nothing on stdout.
   * ``--format default`` prints only the final assistant text to stdout
     (tool traces go to stderr); ``--format json`` would emit an event
     stream where the CONTROL_RESULT is JSON-escaped, so it is NOT used.
   * bash/edit tools run without ``--auto`` under the default agent;
     ``--auto`` is opt-in via ``options.auto_approve: true``.
-  * exit code 0 on success; 1 on unknown model / server error.
+  * ``opencode --version`` prints ``opencode v2.0.23``; 1.x printed the
+    bare version and rejects this argv, so ``autoforge doctor`` requires
+    :data:`OPENCODE_MIN_VERSION`.
 
 Pi (``pi 1.0.x``, ADR 0003; read from the v1.0.0 source and docs, not yet
 run against an installed Pi)::
@@ -58,7 +69,8 @@ run against an installed Pi)::
 
 The CLIs are launched with cwd = the directory the engine chose (a
 per-issue worktree for a REMOTE run, the contract's repository root for a
-LOCAL one), stdin = /dev/null, a hard timeout, and an allow-listed
+LOCAL one), stdin = /dev/null or the adapter's payload
+(:meth:`AgentProvider.stdin_payload`), a hard timeout, and an allow-listed
 environment (see executor.py): the engine passes the configured allow-list
 in :attr:`AgentRequest.env_allowlist` and each adapter adds the variables
 its own CLI reads (:attr:`AgentProvider.environment_names`), so the key of
@@ -149,8 +161,8 @@ class AgentExecutionResult:
     # A run that failed inside the provider's protocol although the process
     # may have exited 0 (Pi shuts down in order whether its run failed or
     # not): a short, bounded, already-redacted reason. The engine treats it
-    # like a non-zero exit (ADR 0003 §2.6). The one-shot CLI adapters never
-    # set it.
+    # like a non-zero exit (ADR 0003 §2.6). A one-shot CLI adapter sets it
+    # only when the CLI closed its stdin before taking the whole prompt.
     provider_failure: str | None = None
     # A small flat mapping of scalars, bounded and redacted by the adapter,
     # that the engine writes to ``execution.json`` under this key without
@@ -221,7 +233,8 @@ def _truthy(value: str | None, default: bool) -> bool:
 
 
 class AgentProvider:
-    """Base adapter. Subclasses implement ``build_command_for``."""
+    """Base adapter. Subclasses implement ``build_command_for``, and
+    ``stdin_payload`` when the prompt does not travel in argv."""
 
     name = "base"
     # The environment variables this provider's CLI reads for its own
@@ -240,6 +253,10 @@ class AgentProvider:
     # -- to override -----------------------------------------------------
     def build_command_for(self, profile: ProfileConfig, prompt: str) -> list[str]:
         raise NotImplementedError
+
+    def stdin_payload(self, req: AgentRequest) -> bytes | None:
+        """What :meth:`execute` writes to the CLI's stdin; ``None`` is ``/dev/null``."""
+        return None
 
     def validate_profile(self, profile: ProfileConfig) -> None:
         """Raise ConfigurationError for values this CLI cannot accept.
@@ -280,9 +297,18 @@ class AgentProvider:
                 # Nothing an agent starts outlives its invocation (ADR 0002),
                 # including what it detached from its process group.
                 contain_orphans=True,
+                stdin_data=self.stdin_payload(req),
             )
         )
-        return AgentExecutionResult.from_execution(res, req.profile)
+        result = AgentExecutionResult.from_execution(res, req.profile)
+        if res.stdin_incomplete and res.exit_code == 0 and not res.timed_out:
+            # A clean exit would otherwise be read as an answer to the whole
+            # prompt; a timeout or a failed exit already says more.
+            result.provider_failure = (
+                f"{self.name}: the prompt was not delivered: the CLI closed its stdin "
+                "before all of it was written"
+            )
+        return result
 
 
 CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
@@ -351,6 +377,11 @@ class OpenCodeProvider(AgentProvider):
                 f"profile {profile.name!r}: opencode model must be 'provider/model' "
                 f"(e.g. openai/gpt-5.6-luna), got {profile.model!r}"
             )
+        if "#" in profile.model:
+            raise ConfigurationError(
+                f"profile {profile.name!r}: opencode model must not carry a '#variant' "
+                f"suffix (got {profile.model!r}); set the variant as the profile's effort"
+            )
         fmt = profile.options.get("output_format", "default") or "default"
         if fmt != "default":
             raise ConfigurationError(
@@ -359,19 +390,33 @@ class OpenCodeProvider(AgentProvider):
             )
 
     def build_command_for(self, profile: ProfileConfig, prompt: str) -> list[str]:
-        argv = [profile.command or "opencode", "run"]
+        """The argv, without the prompt: it goes on stdin (:meth:`stdin_payload`)."""
+        argv = [profile.command or "opencode", "run", "--standalone"]
         if profile.model:
-            argv += ["-m", profile.model]
-        if profile.effort:
-            argv += ["--variant", profile.effort]
+            variant = f"#{profile.effort}" if profile.effort else ""
+            argv += ["-m", profile.model + variant]
         argv += ["--format", profile.options.get("output_format", "default") or "default"]
         if _truthy(profile.options.get("auto_approve"), default=False):
             argv.append("--auto")
         argv += list(profile.extra_args)
-        # `--` ends option parsing: the prompt is one literal positional
-        # even when it begins with `-`.
-        argv += ["--", prompt]
         return argv
+
+    def stdin_payload(self, req: AgentRequest) -> bytes:
+        # A lone surrogate (legal in the JSON GitHub returns, not in UTF-8)
+        # becomes U+FFFD rather than failing the launch.
+        return encodable(req.prompt).encode("utf-8")
+
+
+# #186: the CLI whose argv and stdin delivery the adapter speaks. No upper bound.
+OPENCODE_MIN_VERSION = (2, 0, 0)
+# What `opencode --version` prints: `opencode v2.0.23`; 1.x printed `1.18.34`.
+_OPENCODE_VERSION_RE = re.compile(r"(?:opencode )?v?(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?")
+
+
+def parse_opencode_version(text: str) -> tuple[int, int, int] | None:
+    """``(major, minor, patch)`` from ``opencode --version`` output, or None
+    when unreadable; a pre-release sorts below its release, as for Pi."""
+    return _parse_version(text, _OPENCODE_VERSION_RE)
 
 
 PI_EFFORTS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
@@ -390,8 +435,12 @@ def parse_pi_version(text: str) -> tuple[int, int, int] | None:
     ``(1, 0, -1)``, which is below the 1.0.0 minimum, and ``1.1.0-rc.1`` as
     ``(1, 1, -1)``, which is above it.
     """
+    return _parse_version(text, _PI_VERSION_RE)
+
+
+def _parse_version(text: str, pattern: re.Pattern[str]) -> tuple[int, int, int] | None:
     lines = text.strip().splitlines()
-    match = _PI_VERSION_RE.fullmatch(lines[0].strip()) if len(lines) == 1 else None
+    match = pattern.fullmatch(lines[0].strip()) if len(lines) == 1 else None
     if match is None:
         return None
     major, minor, patch = (int(part) for part in match.group(1, 2, 3))

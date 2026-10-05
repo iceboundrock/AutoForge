@@ -73,6 +73,12 @@ High-priority coverage includes:
   the controller's environment, an absent name adds no placeholder, an
   invalid entry refuses to launch, no allow-list inherits everything, and
   an explicit `env` is layered over the selection
+- stdin (#186): without `stdin_data` it is `/dev/null`; `stdin_data` larger
+  than a pipe buffer arrives byte for byte and is followed by EOF; a child
+  that never reads it still times out at the deadline with no feeder left
+  behind, and one that exits without reading it is reported
+  (`stdin_incomplete`), which the OpenCode adapter turns into a
+  `provider_failure` when the exit would otherwise read as success
 
 ### Agent isolation (REMOTE)
 
