@@ -5148,6 +5148,106 @@ def test_k8_intent_saved_and_write_never_issued_posts_once_without_a_relaunch(
     assert [c.body for c in fake_github.comments[EPIC]] == [_controller_progress_body()]
 
 
+def _crash_with_the_progress_comment_intended(eng) -> dict:
+    """Interrupt the step after the intent save, before the comment is posted;
+    return the state file's JSON for the test to corrupt."""
+    eng._persist_effect = _crash_on_first_call(eng._persist_effect)
+    with pytest.raises(RuntimeError, match="power loss"):
+        eng.step()
+    [record] = _k8_records(eng)
+    assert record["stage"] == "intended" and record["attempts"] == 0
+    return json.loads(eng.paths.state_file.read_text(encoding="utf-8"))
+
+
+def _assert_nothing_published_and_left_unchanged(eng, gh, before: bytes) -> None:
+    assert gh.effect_writes == [] and gh.edited_issues == [] and EPIC not in gh.comments
+    assert len(eng.provider.calls) == 1  # the interrupted launch only, no relaunch
+    assert eng.paths.state_file.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "missing", ["effect_records", "entry_observation", "completion_context", "launch_label"]
+)
+def test_k8_a_pending_progress_comment_is_never_skipped_by_dropping_an_effect_field(
+    tmp_state_dir, fake_github, missing
+):
+    """The record is ``intended`` and the file then loses one effect field (a
+    truncation or a hand edit). Read as its empty default, a missing
+    ``effect_records`` is an empty plan, and the phase would complete from its
+    context -- roadmap written, DONE -- with the progress comment never posted.
+    The protocol-7 file is refused instead: nothing is posted or written, the
+    agent is not relaunched, and the file is left for the operator."""
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(None)] * 2)
+    data = _crash_with_the_progress_comment_intended(eng)
+    del data[missing]
+    eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
+    before = eng.paths.state_file.read_bytes()
+
+    with pytest.raises(StateError, match=rf"missing required field\(s\) '{missing}'"):
+        eng.load()
+    _assert_nothing_published_and_left_unchanged(eng, fake_github, before)
+
+
+@pytest.mark.parametrize(
+    ("section", "rule"),
+    [
+        ("- [x] #2 thanks @octocat", "an @-mention"),
+        ("- [x] #2\n\nCloses #99", "a closing keyword"),
+        ("- [x] bad\x01text", "a control character"),
+        ("- [x] #2\n<!-- ai-controller-roadmap:end -->", "a controller marker"),
+    ],
+)
+def test_update_epic_a_stored_section_the_parser_refuses_is_never_published_on_recovery(
+    tmp_state_dir, fake_github, section, rule
+):
+    """The persisted completion context is consumed with no agent result in
+    between, so its roadmap section gets the parser's rules again on load
+    (ADR 0004 D4.6). A section the result path would have refused is refused
+    before any GitHub write: no progress comment, no EPIC body edit."""
+    eng = _in_update_epic_with_body(
+        tmp_state_dir, fake_github, [_epic_result(None)] * 2, _epic_body()
+    )
+    data = _crash_with_the_progress_comment_intended(eng)
+    assert data["completion_context"]["roadmap_section"] == ROADMAP
+    data["completion_context"]["roadmap_section"] = section
+    eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
+    before = eng.paths.state_file.read_bytes()
+
+    with pytest.raises(StateError, match="roadmap_section is invalid") as exc:
+        eng.load()
+    assert rule in str(exc.value)
+    _assert_nothing_published_and_left_unchanged(eng, fake_github, before)
+    assert fake_github.issues[EPIC].body == _epic_body()
+
+
+@pytest.mark.parametrize(
+    ("progress", "rule"),
+    [
+        ("Merged, thanks @octocat", "an @-mention"),
+        ("Merged.\nCloses #99", "a closing keyword"),
+        ("see https://example.com", "a URL"),
+    ],
+)
+def test_k8_a_stored_progress_text_the_parser_refuses_is_never_posted_on_recovery(
+    tmp_state_dir, fake_github, progress, rule
+):
+    """The intended record's payload is the progress text and the marker; a
+    resumed write would post it with no agent result in between, so the text
+    gets the parser's rules again on load and a refused one is never posted."""
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(None)] * 2)
+    data = _crash_with_the_progress_comment_intended(eng)
+    payload = data["effect_records"][0]["payload"]
+    assert payload["body"] == _controller_progress_body()
+    payload["body"] = _controller_progress_body(progress)
+    eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
+    before = eng.paths.state_file.read_bytes()
+
+    with pytest.raises(StateError, match="has an invalid progress text") as exc:
+        eng.load()
+    assert rule in str(exc.value)
+    _assert_nothing_published_and_left_unchanged(eng, fake_github, before)
+
+
 def test_k8_write_lost_in_flight_is_reconciled_then_issued_once_more(tmp_state_dir, fake_github):
     """Attempt persisted, outcome unknown, and the write did not land: never a blind
     re-send in the same step; the next entry reads, finds nothing, posts once more."""

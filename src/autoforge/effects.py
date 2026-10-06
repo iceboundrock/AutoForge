@@ -65,6 +65,8 @@ from .result_parser import (
     MAX_ROADMAP_SECTION_CHARS,
     MAX_URL_CHARS,
     Finding,
+    validate_progress_text,
+    validate_roadmap_section,
 )
 from .transitions import Phase
 from .validation import parse_comment_url, parse_issue_url, parse_pr_url
@@ -950,6 +952,16 @@ def _cross_progress_comment(record: EffectRecord, what: str) -> None:
     _same(record, what, (record.identity["epic_url"], record.target["epic_url"], "EPIC"))
     _check_owner_issue_marker(record, PROGRESS, what)
     _check_body_ends_with_marker(record, record.identity["marker"], what)
+    # The payload is the progress text the parser accepted and the marker
+    # (``progress_comment_body``); the text gets the parser's rules again,
+    # because a resumed write publishes it with no agent result in between.
+    tail = APPEND_SEPARATOR + record.identity["marker"]
+    if not record.body.endswith(tail):
+        _fail(what, "has a payload body that is not its progress text, a blank line and its marker")
+    try:
+        validate_progress_text(record.body[: len(record.body) - len(tail)])
+    except ControlResultValidationError as exc:
+        _fail(what, f"has an invalid progress text: {exc}")
     if record.observed is not None and not parse_comment_url(record.observed["url"]).on(
         parse_issue_url(record.target["epic_url"])
     ):
@@ -1416,6 +1428,13 @@ class UpdateEpicContext:
                 _fail(f"{what}.roadmap_section", "must be non-empty when present")
             if redact(section) != section:
                 _fail(f"{what}.roadmap_section", "is not redaction-invariant")
+            # A parsed-form value gets its parser's rules again (D4.6): the
+            # recovery that completes from this context writes the section
+            # into the EPIC body with no agent result in between.
+            try:
+                validate_roadmap_section(section)
+            except ControlResultValidationError as exc:
+                _fail(f"{what}.roadmap_section", f"is invalid: {exc}")
         _opt_issue_url(data["next_issue_url"], f"{what}.next_issue_url")
         _opt_digest(data["entry_outside_sha256"], f"{what}.entry_outside_sha256")
         _opt_digest(data["spliced_outside_sha256"], f"{what}.spliced_outside_sha256")

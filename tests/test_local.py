@@ -3053,6 +3053,11 @@ def test_a_local_state_cannot_hold_a_github_only_phase(tmp_path):
         "feature_spec_sha256": "a" * 64,
         "local_run_contract": sample_contract(),
         "phase": "REVIEW",
+        # Written by every current-protocol save, LOCAL included, empty here.
+        "effect_records": [],
+        "entry_observation": {},
+        "completion_context": {},
+        "launch_label": "",
     }
     assert load_state_from(path, good).phase == Phase.REVIEW
     for phase in ("READY_FOR_MERGE", "MERGE", "UPDATE_EPIC", "REPLAN_REEXECUTE"):

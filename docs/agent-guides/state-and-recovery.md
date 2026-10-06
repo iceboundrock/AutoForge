@@ -107,9 +107,18 @@ phase drops it, except `BLOCKED` and `FAILED`, which keep it for the
 operator and for `unblock` back into the phase (which reconciles a
 `conflict` record again, with its attempt count kept). The fields are
 validated on load against the run's issue, PR and phase, and a corrupt or
-incomplete value fails loudly, never replaced by a default. LOCAL state
-carrying any of them is refused as corrupt: a LOCAL run performs no external
-effect.
+incomplete value fails loudly, never replaced by a default. Every protocol-7
+save writes all four fields, so a protocol-7 file missing one is refused:
+an absent `effect_records` read as its empty default would be an empty plan,
+and the phase would complete from its context without the write it had
+planned. Text the recovery path publishes with no agent result in between
+is validated again under the parser's rules for its field, not only for its
+bounds and redaction invariance: the `UPDATE_EPIC` roadmap section in the
+completion context (`validate_roadmap_section`) and the progress text of a
+progress-comment record (`validate_progress_text`). A stored value the
+result path would have refused is a `StateError`, never rewritten. LOCAL
+state carrying any of them is refused as corrupt: a LOCAL run performs no
+external effect.
 
 State keeps compact finding summaries and review comment URLs, rather than
 copying unbounded PR discussion bodies. Those summaries are bounded

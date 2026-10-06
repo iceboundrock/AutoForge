@@ -110,7 +110,14 @@ def test_load_unknown_phase_raises(tmp_path):
 
 def test_load_missing_required_field_raises(tmp_path):
     p = tmp_path / "state.json"
-    p.write_text(json.dumps({"phase": "REVIEW"}), encoding="utf-8")
+    # The effect fields every current-protocol save writes, at their empty values.
+    effects = {
+        "effect_records": [],
+        "entry_observation": {},
+        "completion_context": {},
+        "launch_label": "",
+    }
+    p.write_text(json.dumps({"phase": "REVIEW", **effects}), encoding="utf-8")
     with pytest.raises(StateError, match="run_id"):
         load_state(p)
 
@@ -2026,6 +2033,35 @@ R0 = ("effect_records", 0)
             _set((*R0, "payload", "body"), f"nul \x00 byte\n\n{_progress_marker()}"),
             "carries a NUL or DEL character",
         ),
+        (
+            _set((*R0, "payload", "body"), f"Merged PR #42.{_progress_marker()}"),
+            "has a payload body that is not its progress text, a blank line and its marker",
+        ),
+        # The progress text gets the parser's rules again: a resumed write
+        # publishes it with no agent result in between.
+        (
+            _set((*R0, "payload", "body"), f"\n\n{_progress_marker()}"),
+            "has an invalid progress text: CONTROL_RESULT for UPDATE_EPIC missing required "
+            "field 'progress'",
+        ),
+        (
+            _set((*R0, "payload", "body"), f"Merged, thanks @octocat\n\n{_progress_marker()}"),
+            "has an invalid progress text: UPDATE_EPIC: field 'progress' contains an @-mention",
+        ),
+        (
+            _set((*R0, "payload", "body"), f"Merged.\nCloses #99\n\n{_progress_marker()}"),
+            "has an invalid progress text: UPDATE_EPIC: field 'progress' contains a closing "
+            "keyword",
+        ),
+        (
+            _set((*R0, "payload", "body"), f"bad\x01text\n\n{_progress_marker()}"),
+            "has an invalid progress text: UPDATE_EPIC: result field 'progress' contains a "
+            "control character (U+0001",
+        ),
+        (
+            _set((*R0, "payload", "body"), f"see https://example.com\n\n{_progress_marker()}"),
+            "has an invalid progress text: UPDATE_EPIC: field 'progress' contains a URL",
+        ),
     ],
 )
 def test_a_corrupt_effect_record_fails_loudly(tmp_path, mutate, needle):
@@ -2126,6 +2162,32 @@ CTX = ("completion_context",)
             "roadmap_section is not redaction-invariant",
         ),
         (_set((*CTX, "roadmap_section"), "   "), "must be non-empty when present"),
+        # The parser's rules for the field, applied again to its stored form (D4.6).
+        (
+            _set((*CTX, "roadmap_section"), "- [x] #2 thanks @octocat"),
+            "roadmap_section is invalid: UPDATE_EPIC: field 'roadmap_section' contains an "
+            "@-mention",
+        ),
+        (
+            _set((*CTX, "roadmap_section"), "- [x] #2\n\nCloses #99"),
+            "roadmap_section is invalid: UPDATE_EPIC: field 'roadmap_section' contains a "
+            "closing keyword",
+        ),
+        (
+            _set((*CTX, "roadmap_section"), "- [x] bad\x01text"),
+            "roadmap_section is invalid: UPDATE_EPIC: result field 'roadmap_section' contains "
+            "a control character (U+0001",
+        ),
+        (
+            _set((*CTX, "roadmap_section"), "- [x] #2\n<!-- ai-controller-roadmap:end -->"),
+            "roadmap_section is invalid: UPDATE_EPIC: field 'roadmap_section' must not contain "
+            "a controller marker",
+        ),
+        (
+            _set((*CTX, "roadmap_section"), "- [x] #2\n<!-- autoforge-replan -->"),
+            "roadmap_section is invalid: UPDATE_EPIC: field 'roadmap_section' contains a "
+            "controller marker opener",
+        ),
         (_set((*CTX, "selection_void"), True), "voids its selection but still holds one"),
         (_set((*CTX, "section_void"), True), "voids its roadmap section but still holds one"),
     ],
@@ -2474,6 +2536,52 @@ def test_a_legacy_file_carrying_effect_state_is_refused_and_left_unchanged(
         load_state(p)
     assert f"labelled protocol_version {protocol!r}, which never wrote {field!r}" in str(exc.value)
     assert p.read_bytes() == before
+
+
+@pytest.mark.parametrize("missing", _EFFECT_KEYS)
+@pytest.mark.parametrize("stage", [Stage.INTENDED, Stage.ATTEMPTED])
+def test_a_protocol_7_file_missing_an_effect_field_is_refused_and_left_unchanged(
+    tmp_path, missing, stage
+):
+    """D13.2 loads only a legacy label with no effect state. A protocol-7 save
+    writes all four fields, so one that is absent is corruption: read as its
+    empty default, a missing ``effect_records`` would turn a pending progress
+    comment into no plan at all, and the phase would complete from its context
+    without publishing it."""
+    d = _update_epic_state(stage).to_dict()
+    assert d["protocol_version"] == "7"
+    del d[missing]
+    p = _write(tmp_path / "state.json", d)
+    before = p.read_bytes()
+    with pytest.raises(StateError) as exc:
+        load_state(p)
+    needle = f"labelled protocol_version '7' but is missing required field(s) {missing!r}"
+    assert needle in str(exc.value)
+    assert p.read_bytes() == before
+
+
+def test_an_unlabelled_file_missing_an_effect_field_is_refused(tmp_path):
+    """Every controller has written ``protocol_version``; a file without one is
+    read as the current protocol, so deleting the label as well as
+    ``effect_records`` does not turn a pending progress comment into no plan."""
+    d = _update_epic_state(Stage.INTENDED).to_dict()
+    del d["protocol_version"], d["effect_records"]
+    p = _write(tmp_path / "state.json", d)
+    with pytest.raises(StateError) as exc:
+        load_state(p)
+    assert "is missing required field(s) 'effect_records'" in str(exc.value)
+
+
+@pytest.mark.parametrize("missing", _EFFECT_KEYS)
+def test_a_protocol_7_local_file_missing_an_effect_field_is_refused(tmp_path, missing):
+    """LOCAL carries no effect state, but every protocol-7 LOCAL save still writes
+    the four fields at their empty values; one that is absent is not that save."""
+    d = _local_state().to_dict()
+    del d[missing]
+    p = _write(tmp_path / "state.json", d)
+    with pytest.raises(StateError) as exc:
+        load_state(p)
+    assert f"is missing required field(s) {missing!r}" in str(exc.value)
 
 
 def test_a_legacy_file_with_effect_fields_at_their_empty_values_loads(tmp_path):

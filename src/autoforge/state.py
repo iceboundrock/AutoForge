@@ -673,6 +673,26 @@ class AutoForgeState:
                 f"unsupported protocol_version {raw_protocol!r} "
                 f"(controller speaks {__protocol_version__!r})"
             )
+        else:
+            # Only a legacy label loads with no effect state (D13.2). Every
+            # protocol-7 save writes all four fields, so one that is absent
+            # is a truncation or a hand edit, never "nothing planned": a
+            # missing ``effect_records`` read as the empty default would let
+            # the phase complete from its context with a pending effect never
+            # performed.
+            missing = [name for name in _EFFECT_FIELDS if name not in data]
+            if missing:
+                label = (
+                    f"is labelled protocol_version {raw_protocol!r}"
+                    if "protocol_version" in data
+                    else f"has no protocol_version label (read as {raw_protocol!r})"
+                )
+                raise StateError(
+                    f"state file {label} but is missing "
+                    f"required field(s) {', '.join(repr(n) for n in missing)}; refusing to "
+                    "load -- every save of this protocol writes the effect state, so an absent "
+                    "field is corruption, not an empty plan"
+                )
         # A LOCAL state written before the run contract existed has no
         # persisted definition of what it reviewed under. It is not migrated:
         # the only source a migration could fill the contract from is the
