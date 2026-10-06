@@ -142,8 +142,8 @@ the operator's checkout and every other worktree share (`git help worktree`,
     nothing. The controller names every revision by a SHA it read from the
     worktree's `HEAD` or recorded in its own state (D6.4). It reads that SHA
     as the SHA's own bytes: it honours no replacement ref, graft, shallow
-    boundary or commit-graph, and it re-hashes every commit a decision reads
-    (D7.5).
+    boundary or commit-graph, it re-hashes every commit a decision reads,
+    and it proves a published range instead of taking it from git (D7.5).
   - The candidate is the worktree's `HEAD`. Verification and recovery address
     it as that plus the controller-named *remote* branch, never through a
     local ref.
@@ -504,13 +504,14 @@ protocol bump; this is why the set is closed now.
 - **Precondition:** the ref's expected old value from the entry observation,
   either absent or a full SHA. In addition:
   - the candidate descends from that value and from the recorded base, and
-    differs from the base, all checked locally against controller-fetched
-    objects;
+    differs from the base, all proven by D7.5's range walk over
+    controller-fetched objects;
   - the ref is never the default branch.
 - **Payload:** the candidate SHA, which the controller reads from the
   worktree. The agent's reported SHA is only a cross-check. The commit
-  messages in the published range (base..candidate) pass the content policy
-  for commit messages (D8.5).
+  messages in the published range (base..candidate, as D7.5's walk proves
+  it, never as git enumerates it) pass the content policy for commit
+  messages (D8.5).
 - **Completion read-back:** the remote ref, read through the GitHub client,
   equals the candidate. When the ref is a PR's head, the consumer also reads
   the PR's head SHA.
@@ -829,12 +830,14 @@ its own rules:
   last observed head, through the push lease;
 - never the default branch;
 - never a non-fast-forward in Wave 1;
-- ancestry checked against revisions the controller fetched.
+- ancestry and the published range proven from re-hashed
+  controller-fetched objects, with GitHub deciding where the range ends
+  (D7.5).
 
 **D6.2 (#160).** **The lease is not the fast-forward check.** A lease that
-holds still permits a non-fast-forward update. The controller checks locally,
-before the push, that the candidate descends from the expected old value.
-It refuses the push otherwise, and the refusal names both SHAs.
+holds still permits a non-fast-forward update. The controller proves,
+before the push, that the candidate descends from the expected old value
+(D7.5). It refuses the push otherwise, and the refusal names both SHAs.
 
 **D6.3 (#160).** **There is no force, no delete and no history rewrite.** No
 kind deletes or rewinds a ref.
@@ -858,11 +861,12 @@ Each phase child fetches, before launch, the revisions its prompt names:
 - #164: the verified default branch.
 
 *Rationale.* A push differs from an API write. Its identity is a ref value,
-its precondition is a lease, and its safety depends on ancestry, which the
-API layer cannot check. Objects-only fetches keep AutoForge from owning any
-ref lifecycle that the operator would have to clean up (AGENTS.md "Runtime
-model"). They also compose with Wave 2A's strict object import (#168),
-because nothing ever trusts a ref.
+its precondition is a lease, and its safety depends on the ancestry of
+commits GitHub does not hold yet, which no API write can check.
+Objects-only fetches keep AutoForge from owning any ref lifecycle that the
+operator would have to clean up (AGENTS.md "Runtime model"). They also
+compose with Wave 2A's strict object import (#168), because nothing ever
+trusts a ref.
 
 *Rejected.*
 
@@ -965,10 +969,10 @@ mechanisms:
 - **Every process that reads parents** runs in a per-operation
   controller-owned git directory, as D7.1 defines it, with
   `GIT_OBJECT_DIRECTORY` pointing at the shared store. That directory has
-  no refs and no graft or shallow file. These processes are the ancestry
-  checks and the range enumeration, plus the network fetch and push, which
-  run there already (D7.1). The network operations hold the credential and
-  the local reads do not.
+  no refs and no graft or shallow file. These processes are the commit
+  reads of the range walk below, which proves ancestry and the published
+  range, plus the network fetch and push, which run there already (D7.1).
+  The network operations hold the credential and the local reads do not.
 - **Tree reads** (the pre-merge export and `worktree add`) keep the
   repository they use today. Graft and shallow state change parents only,
   never a tree. The configuration-driven conversions of the export are
@@ -979,16 +983,51 @@ reads, and in Wave 1 an agent can rewrite the object store's files
 directly. A decision therefore reads only commits whose ids the controller
 recomputes from the bytes git returned, in the object format of the
 recorded SHA (40 or 64 hexadecimal digits), never in a format read from
-agent-writable configuration.
+agent-writable configuration. A commit whose bytes hash to its id is
+*authenticated*, and so are the parent links those bytes name.
 
-- **Ancestry.** "X descends from Y" holds only when a chain of parent links
-  leads from X to Y through commits that were re-hashed against their ids.
-  The chain is sought among the commits of the range Y..X that git
-  enumerates under the rule above. #160 fixes a bound on that range. A
-  range over the bound, an id mismatch, or no chain fails closed and is
-  never read as "allowed".
-- **Messages.** D8.5 reads each commit message from the same re-hashed
-  bytes.
+- **The range is proven, not enumerated.** Git decides which commits Y..X
+  holds by also reading Y's ancestors, which lie outside the range, and a
+  re-hash of what git returns never sees them. Measured with git 2.55.0
+  and every switch above applied: base B has parent A, and the candidate C
+  merges B with a side commit H. When A's loose object is rewritten to
+  claim H as a parent, `rev-list B..C` returns C alone. C re-hashes
+  correctly and names B as a parent, yet the authentic B..C holds H as
+  well. The controller therefore computes the range itself and takes no
+  range from git:
+  - **Inclusion follows authenticated links only.** The controller walks
+    from X through the parent links of authenticated commits. Every commit
+    the walk reaches is in the range unless the next rule stops it there.
+  - **Exclusion is GitHub's word only.** The walk stops at a commit, and
+    leaves it out of the range, only when it is Y itself or GitHub reports
+    it in Y's history. GitHub holds Y's authentic history, and it
+    re-hashed every object it holds. The controller asks through
+    `github.py` with the repository named (D7.4), comparing Y as the base
+    with the commit as the head. The commit is in Y's history exactly when
+    it is ahead of Y by no commit, which GitHub reports as `behind` or
+    `identical`; measured against the live API, any other commit is
+    `ahead` or `diverged`. A commit GitHub does not hold, such as one the
+    agent made since the fetch, is "not found" (HTTP 404). That is no
+    transient failure, and it counts as "not in Y's history".
+  - **Nothing below the range is read.** The walk never reads the parent
+    links of a commit it excluded, so no rewritten ancestor of Y can shrink
+    the range. A withheld or rewritten object can only enlarge the range or
+    fail the walk, never hide a commit from it.
+- **Ancestry.** "X descends from Y" holds only when the walk for Y..X
+  reaches Y. On a path from X that leads to Y, every commit before Y has Y
+  as an ancestor, so GitHub cannot report it in Y's history, and the walk
+  cannot stop on that path before Y. D6.2's fast-forward check is the same
+  walk with the expected old value as Y.
+- **Bounds and failure.** #160 fixes a bound on the commits the walk
+  reads, and each GitHub read keeps `_run_gh`'s bounded transient retry
+  (D4.3). Each of these fails closed and is never read as "allowed":
+  - a walk over the bound;
+  - an id mismatch;
+  - a commit the walk needs that is still missing after D6.4's re-fetch;
+  - an ancestry answer GitHub has not given when the read retries run out;
+  - a walk that never reaches Y.
+- **Messages.** D8.5 reads the message of every commit in the proven range
+  from the same authenticated bytes.
 - **Trees.** A tree id the controller derives from a commit comes from that
   commit's re-hashed bytes. The bytes of the trees and blobs the pre-merge
   export writes are proven by #171's hash-back (Wave 2B), which already uses
@@ -1007,19 +1046,26 @@ credential helpers). A private git directory with no global or system
 configuration is an allow list by construction. Creating it for each
 operation leaves no persistent private state to drift or to plant into.
 
-D7.5 has two layers, because hardening configuration does not cover object
-interpretation:
+D7.5 has three layers, because hardening configuration does not cover
+object interpretation:
 
-- **Re-hashing makes each decision a proof.** An ancestry chain and a
-  commit message are read from bytes that hash to the ids the controller
-  holds. A substituted or rewritten commit fails the comparison, whichever
-  mechanism supplied it.
-- **No substitution keeps the rest honest.** Which commits the range holds,
-  and every tree read, are git's answers, and no re-hash checks them. The
-  substitution switches are what keep those answers about the named SHAs.
+- **Re-hashing makes each decision a proof.** An ancestry chain, every
+  parent link that puts a commit in the published range, and every commit
+  message are read from bytes that hash to the ids the controller holds. A
+  substituted or rewritten commit fails the comparison, whichever mechanism
+  supplied it.
+- **GitHub's history decides where the range ends.** Leaving a commit out
+  is the one decision a local re-hash cannot prove, because it rests on
+  Y's ancestors, which the range does not contain. GitHub holds them
+  authentically, so a rewritten ancestor in the shared store is never
+  consulted.
+- **No substitution keeps the rest honest.** Every tree read is git's
+  answer, and no re-hash checks it; the substitution switches keep that
+  answer about the named SHA. For the walk, they keep an operator's own
+  replacement refs from failing it on an id mismatch.
 
-The re-hash is cheap: the commits it reads are the published range, which
-the push sends anyway.
+The proof is cheap: the walk reads only the commits of the published range,
+and it asks GitHub one question for each commit it reaches other than Y.
 
 *Rejected.*
 
@@ -1039,6 +1085,17 @@ the push sends anyway.
   refuse it, and a check followed by a use leaves a window.
 - **Trusting git to verify object ids.** Git re-hashes only some of the
   objects it reads, and which ones depends on the command and its version.
+- **Re-hashing the commits git enumerates in the range.** Git chooses what
+  to omit by reading Y's ancestors, which that re-hash never sees, so one
+  rewritten ancestor hides a commit (above).
+- **Walking Y's history locally to decide exclusion.** A re-hash would
+  authenticate every link, but proving that a commit is *not* in Y's
+  history needs all of that history or generation numbers. The
+  commit-graph that would supply generation numbers is agent-writable, and
+  commit dates are no proof: the agent writes its own commits' dates.
+- **Stopping the walk at commits the remote already holds.** A side commit
+  on another branch is on the remote but not in Y's history, and merging
+  the candidate still brings its message onto the default branch (D8.5).
 
 ### 2.8 `CONTROL_RESULT` evolution (item 8)
 
@@ -1098,6 +1155,13 @@ these:
 - names any issue other than the run's own with a closing keyword. On
   merge, GitHub closes issues named that way in commits;
 - contains a credential-shaped string.
+
+The published range is the one D7.5 proves, never git's enumeration. It
+holds a commit the remote already has under another ref, such as a side
+branch the candidate merges, unless GitHub reports that commit in the
+base's history: merging the candidate brings its message onto the default
+branch all the same. A range the controller cannot prove within D7.5's
+bounds fails closed, and is never read as passing.
 
 The agent rewrites its local commits through the correction path. The
 committed tree is the work product: it is not filtered, and `REVIEW` and the
@@ -1295,9 +1359,11 @@ keeps the reviewed tree clean, and Wave 2A can project it read-only.
    run code, by repository state the agent can write. That state covers
    repository and worktree configuration, hooks, `origin`, and include
    directives. The controller's local git processes hold no credential
-   (D7.3). Nor can that state change what a SHA the controller reads means:
-   replacement refs, grafts, shallow boundaries and the commit-graph are
-   ignored, and every commit a decision reads is re-hashed (D7.5).
+   (D7.3). Nor can that state, or a rewritten object file, change what a
+   SHA the controller reads means or which commits a published range
+   holds: replacement refs, grafts, shallow boundaries and the
+   commit-graph are ignored, every commit a decision reads is re-hashed,
+   and the range ends only where GitHub's history says it does (D7.5).
 3. **Every write is accounted for.** Every Wave 1 externally visible write
    is a typed controller effect with a durable record. Anything else that
    appears with a Wave 1 identity is detected and blocks; it is never
@@ -1332,11 +1398,14 @@ the first four):
 - **The committed tree.** Its content is not filtered; `REVIEW` and the
   merge gate own it.
 - **Integrity of the shared object store.** An agent can rewrite the
-  store's files. D7.5 re-hashes the commits behind every K1 decision, and
-  GitHub re-hashes every object a push sends. Which commits git enumerates
-  in a range, and the bytes of the trees and blobs the pre-merge export
-  writes, still come from the store; #171's hash-back covers the export in
-  Wave 2B, and a store the agent cannot write is Wave 2A's (#166, #168).
+  store's files. That cannot turn a K1 decision into "allowed". D7.5
+  re-hashes every commit a K1 decision reads, proves the published range
+  against GitHub's history instead of taking it from git, and fails closed
+  on what it cannot prove; GitHub re-hashes every object a push sends. A
+  rewrite can still make a K1 decision fail closed. The bytes of the trees
+  and blobs the pre-merge export writes still come from the store; #171's
+  hash-back covers the export in Wave 2B, and a store the agent cannot
+  write is Wave 2A's (#166, #168).
 
 **Tool permission is not the boundary.** Provider permission modes and
 approvals are defence in depth at most (D1.3).
@@ -1380,7 +1449,8 @@ This record names modules, not classes or functions.
   `premerge.py`. It owns:
   - the per-operation git context (D7.1);
   - the credential plumbing;
-  - lease and ancestry checks;
+  - lease checks and the range walk (D7.5), which takes GitHub's ancestry
+    answers through a typed read in `github.py`;
   - typed results.
 
   Every process runs through `executor.py`. `premerge.py`'s fetch moves onto
@@ -1613,7 +1683,7 @@ interrupts the step after each persisted stage and resumes.
 
 | Kind | Crash-window tests (W1–W5) | Conflict tests | Owner(s) |
 |---|---|---|---|
-| K1 push | intent saved, no push; push landed, save lost; timeout landed and not landed; read-back drift | default branch refused; non-fast-forward refused; lease mismatch (a human push); an ancestor missing after the fetch fails closed; a planted `pushurl`, `insteadOf`, `core.sshCommand`, `core.hooksPath`, `pre-push` or `pre-auto-gc` hook neither redirects nor runs; a commit message with another issue's closing keyword refused; planted substitution state or a rewritten commit object passes neither the ancestry check nor the message check (D7.5, below) | #160; #161, #163, #164 |
+| K1 push | intent saved, no push; push landed, save lost; timeout landed and not landed; read-back drift | default branch refused; non-fast-forward refused; lease mismatch (a human push); an ancestor missing after the fetch fails closed; a planted `pushurl`, `insteadOf`, `core.sshCommand`, `core.hooksPath`, `pre-push` or `pre-auto-gc` hook neither redirects nor runs; a commit message with another issue's closing keyword refused; planted substitution state or a rewritten commit object passes neither the ancestry check nor the message check; a rewritten ancestor of the base does not shrink the published range (D7.5, below) | #160; #161, #163, #164 |
 | K2 implementation PR | create landed, save lost; timeout landed and not landed; duplicate invocation after a restart | a PR on the branch already closed; two marker-bearing PRs; a marker-bearing PR that appeared during the agent run (unexplained) | #160; #161 |
 | K3 adopt PR | append landed, save lost; a body edited before the first issue is rebased, checkpointed, then issued; a crash after the rebase save and before the write, and after the write and before the next save, reconciles against the rebased payload with no second write; a body edited after an issue, payload not present, is `BLOCKED` | a fork-head PR refused; a closed PR on the branch; a body that carries the block but has otherwise drifted; a payload over the body limit refused before the plan is persisted | #160; #161 |
 | K4 review comment | create landed, save lost (round completes with no relaunch); timeout | a second matching comment; a pre-existing round comment refused; an oversized rendered body refused before any effect; a stale round still gets its comment | #160; #162 |
@@ -1637,6 +1707,20 @@ In addition:
     `worktree add` checkout all see the named commit's own tree;
   - a rewritten loose commit object in the range fails closed on its id,
     for both the ancestry and the message check.
+- **Range completeness (#160, D7.5).** A local bare repository serves as
+  the remote, and `FakeGitHub` answers ancestry from that repository's
+  authentic history:
+  - the base B has parent A, and a valid merge candidate C has parents B
+    and H. H is already on the remote under another ref, and its message
+    carries another issue's closing keyword. A's loose object in the shared
+    store is rewritten to claim H as a parent. K1 still puts H in the range
+    and refuses C on H's message, and it never reads A;
+  - with H's message clean, the same graph publishes C. A commit of the
+    base's history whose message carries a closing keyword is left out of
+    the range without being read, and refuses nothing;
+  - a walk over the bound, an ancestry read that still fails when its
+    retries run out, and a commit the walk needs that is still missing
+    after the re-fetch each fail closed, with no push.
 - **Transport and dry-run (#160):**
   - a create is never re-sent after a transient failure, while a read is
     retried;
