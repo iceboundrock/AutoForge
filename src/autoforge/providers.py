@@ -27,8 +27,8 @@ OpenCode (``opencode 2.0.x``, #186; run against 2.0.23)::
     v2 duplicates a message given after ``--`` and wraps one given without
     it in quotes with ``"`` and backslashes escaped, and takes one that starts
     with ``-`` for a flag (it prints the help and exits 0). stdin arrives
-    verbatim. A CLI that closes stdin before taking all of it, and still
-    exits 0, is a :attr:`AgentExecutionResult.provider_failure`.
+    verbatim. A CLI that exits 0 without having read all of it is a
+    :attr:`AgentExecutionResult.provider_failure`.
   * ``--standalone`` runs the agent on a private server that is the
     client's own child; without it the run goes to a shared background
     service (``opencode serve --service``) whose tools run outside this
@@ -162,7 +162,7 @@ class AgentExecutionResult:
     # may have exited 0 (Pi shuts down in order whether its run failed or
     # not): a short, bounded, already-redacted reason. The engine treats it
     # like a non-zero exit (ADR 0003 §2.6). A one-shot CLI adapter sets it
-    # only when the CLI closed its stdin before taking the whole prompt.
+    # only when the CLI exited 0 without reading the whole prompt from stdin.
     provider_failure: str | None = None
     # A small flat mapping of scalars, bounded and redacted by the adapter,
     # that the engine writes to ``execution.json`` under this key without
@@ -301,12 +301,12 @@ class AgentProvider:
             )
         )
         result = AgentExecutionResult.from_execution(res, req.profile)
-        if res.stdin_incomplete and res.exit_code == 0 and not res.timed_out:
+        if res.stdin_unread and res.exit_code == 0 and not res.timed_out:
             # A clean exit would otherwise be read as an answer to the whole
             # prompt; a timeout or a failed exit already says more.
             result.provider_failure = (
-                f"{self.name}: the prompt was not delivered: the CLI closed its stdin "
-                "before all of it was written"
+                f"{self.name}: the prompt was not delivered: the CLI exited without "
+                f"reading the last {res.stdin_unread} bytes of it"
             )
         return result
 

@@ -150,8 +150,8 @@ def test_claude_keeps_stdin_on_dev_null():
     [(0, False, True), (1, False, False), (-9, True, False)],
 )
 def test_a_prompt_the_cli_did_not_take_whole_is_a_provider_failure(exit_code, timed_out, failure):
-    """A clean exit after closing stdin early must not read as an answer to
-    the whole prompt; a failed exit or a timeout already reports itself."""
+    """A clean exit with part of the prompt unread must not read as an answer
+    to the whole prompt; a failed exit or a timeout already reports itself."""
     from autoforge.executor import ExecutionResult
 
     def runner(req):
@@ -164,14 +164,17 @@ def test_a_prompt_the_cli_did_not_take_whole_is_a_provider_failure(exit_code, ti
             "t",
             "t",
             timed_out=timed_out,
-            stdin_incomplete=True,
+            stdin_unread=10,
         )
 
     p = default_config().profile("review_round_1")
-    res = OpenCodeProvider(runner=runner).execute(AgentRequest("REVIEW", "p", "/tmp", p, 7))
+    res = OpenCodeProvider(runner=runner).execute(AgentRequest("REVIEW", "p" * 11, "/tmp", p, 7))
     assert bool(res.provider_failure) is failure
     if failure:
-        assert "prompt was not delivered" in res.provider_failure
+        assert res.provider_failure == (
+            "opencode: the prompt was not delivered: the CLI exited without reading "
+            "the last 10 bytes of it"
+        )
 
 
 # -- a fake `opencode` behind the real executor (#186) -------------------------------
@@ -182,7 +185,12 @@ home = sys.argv[1]
 argv = sys.argv[2:]
 with open(os.path.join(home, "mode"), encoding="utf-8") as f:
     mode = f.read()
-data = b"" if mode == "skip-stdin" else sys.stdin.buffer.read()
+if mode == "skip-stdin":
+    data = b""
+elif mode == "read-one-byte":
+    data = os.read(0, 1)
+else:
+    data = sys.stdin.buffer.read()
 with open(os.path.join(home, "log.json"), "w", encoding="utf-8") as f:
     json.dump({"argv": argv, "sha256": hashlib.sha256(data).hexdigest(), "len": len(data)}, f)
 sys.stderr.write("> build \u00b7 tool traces go to stderr\n")
@@ -248,12 +256,41 @@ def test_a_fake_opencode_receives_the_prompt_verbatim_and_answers_on_stdout(tmp_
     assert parse_control_result(res.stdout_tail, Phase.REVIEW) == review
 
 
-def test_a_fake_opencode_that_exits_without_reading_its_prompt_fails(tmp_path):
-    _, profile = _fake_opencode(tmp_path, mode="skip-stdin")
-    prompt = "x" * (4 * 1024 * 1024)  # more than any pipe buffer holds
+@pytest.mark.parametrize(
+    ("mode", "prompt"),
+    [
+        ("skip-stdin", "x" * (4 * 1024 * 1024)),  # more than any pipe buffer holds
+        ("skip-stdin", "Review PR #1."),  # fits in the pipe: written, never read
+        ("read-one-byte", "Review PR #1."),  # a prefix read, then a clean exit
+    ],
+    ids=["no-read-large", "no-read-short", "prefix-short"],
+)
+def test_a_fake_opencode_that_exits_without_reading_its_whole_prompt_fails(tmp_path, mode, prompt):
+    """An exit 0 whose answer parses is still a failed run when the CLI did
+    not read the whole prompt, however short the prompt is: the answer
+    cannot be to a prompt the CLI never saw (the PR #188 review)."""
+    from autoforge.result_parser import parse_control_result
+    from autoforge.transitions import Phase
+    from tests.conftest import PR, SHA_A, block, comment_url
+
+    review = {
+        "phase": "REVIEW",
+        "status": "success",
+        "round": 1,
+        "reviewed_head_sha": SHA_A,
+        "review_comment_url": comment_url(PR, 1),
+        "needs_fix_round": False,
+        "findings": [],
+    }
+    _, profile = _fake_opencode(tmp_path, mode=mode, answer=block(review))
     res = OpenCodeProvider().execute(AgentRequest("REVIEW", prompt, str(tmp_path), profile, 30))
     assert res.exit_code == 0 and not res.timed_out
-    assert res.provider_failure and "prompt was not delivered" in res.provider_failure
+    assert parse_control_result(res.stdout_tail, Phase.REVIEW) == review
+    taken = 1 if mode == "read-one-byte" else 0
+    assert res.provider_failure == (
+        "opencode: the prompt was not delivered: the CLI exited without reading "
+        f"the last {len(prompt) - taken} bytes of it"
+    )
 
 
 @pytest.mark.parametrize(

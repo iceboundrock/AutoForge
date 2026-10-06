@@ -9,8 +9,9 @@ Safety properties:
 - stdin is ``/dev/null`` so a CLI that expects an interactive TTY cannot
   hang waiting for input, unless the request carries ``stdin_data``: that
   is written in full by a non-blocking feeder and stdin is then closed, so
-  the child sees EOF and a child that never reads costs the controller
-  nothing past the invocation (:class:`_StdinFeeder`);
+  the child sees EOF, a child that never reads costs the controller
+  nothing past the invocation, and what the child did not read is counted
+  (:class:`_StdinFeeder`, :attr:`ExecutionResult.stdin_unread`);
 - the child runs in its own session/process group, and nothing in that
   group outlives the invocation: on timeout the whole group is terminated
   (SIGTERM, then SIGKILL), and after a normal exit a group that still has
@@ -193,11 +194,12 @@ class ExecutionResult:
     # Containment was requested but this platform has no child subreaper, so
     # a process that left the group was neither seen nor killed.
     orphans_unchecked: bool = False
-    # ``stdin_data`` was given and not all of it was written: the child (or
-    # whatever held its stdin) closed it first, or the invocation ended
-    # before it was taken. Written is not read: what fit in the pipe counts
-    # as written whether or not the child read it.
-    stdin_incomplete: bool = False
+    # Bytes of ``stdin_data`` the child never read: never written because
+    # the invocation ended first, or written and still in the pipe when it
+    # ended. Always the payload's tail, since the child reads a prefix. Read
+    # by any process holding the child's stdin counts as read; whether the
+    # child then used what it read is beyond what the executor can see.
+    stdin_unread: int = 0
 
     @property
     def stdout_tail(self) -> str:
@@ -461,60 +463,96 @@ class _BoundedReader(_PipeDrain):
 
 
 class _StdinFeeder(threading.Thread):
-    """Write ``data`` to the child's stdin, then close it so the child sees EOF.
+    """Write ``data`` to the child's stdin, close it so the child sees EOF,
+    and count what the child never read.
+
+    The child's stdin is :attr:`child_end`, the read end of a pipe the
+    feeder owns. The feeder holds that read end too, until :meth:`stop`:
+    written is not read, and a pipe discards what is in it once its last
+    reader is gone, so only a read end kept past the child's exit can show
+    that the child left part of the payload unread (:attr:`unread`). With a
+    reader always present a write never fails with EPIPE: a child that
+    stops reading leaves the pipe full and the thread parked.
 
     The write end is non-blocking and the thread waits on it and on a wake
     pipe, so a child that never reads its stdin (or a descendant that holds
     the pipe and never reads) costs a parked thread that :meth:`stop` ends
-    at once, never a hung invocation. A child that closes its stdin first
-    ends the feed (EPIPE). :attr:`complete` says whether every byte was
-    written.
+    at once, never a hung invocation.
     """
 
-    def __init__(self, stream: IO[bytes], data: bytes) -> None:
+    def __init__(self, data: bytes) -> None:
         super().__init__(name="autoforge-feed-stdin", daemon=True)
-        self._stream = stream
         self._data = data
-        self._wake_r, self._wake_w = os.pipe()
-        self.complete = False
+        self.child_end, self._write_end = os.pipe()
+        try:
+            self._wake_r, self._wake_w = os.pipe()
+        except BaseException:
+            os.close(self.child_end)
+            os.close(self._write_end)
+            raise
+        self._unwritten = len(data)
+        # Final once :meth:`stop` has returned.
+        self.unread = len(data)
         self.error: OSError | None = None
 
     def run(self) -> None:
-        fd = self._stream.fileno()
         view = memoryview(self._data)
         try:
-            os.set_blocking(fd, False)
+            os.set_blocking(self._write_end, False)
             with selectors.DefaultSelector() as sel:
-                sel.register(fd, selectors.EVENT_WRITE)
+                sel.register(self._write_end, selectors.EVENT_WRITE)
                 sel.register(self._wake_r, selectors.EVENT_READ)
                 while view:
                     ready = {key.fd for key, _ in sel.select()}
                     if self._wake_r in ready:
                         return
                     try:
-                        view = view[os.write(fd, view) :]
+                        view = view[os.write(self._write_end, view) :]
                     except BlockingIOError:
                         continue
-            self.complete = True
-        except BrokenPipeError:
-            pass  # the child closed its stdin first: ``complete`` stays False
         except OSError as exc:
             self.error = exc
         finally:
-            try:
-                self._stream.close()
-            except OSError:
-                pass  # nothing was buffered; the fd is closed either way
+            self._unwritten = len(view)
+            os.close(self._write_end)
 
     def stop(self) -> None:
-        """End the feed if it is still writing, and wait for the thread."""
-        os.write(self._wake_w, b"\0")
-        self.join()
-        for fd in (self._wake_r, self._wake_w):
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+        """End the feed if it is still writing, wait for the thread, count
+        what was left unread and release the pipes.
+
+        Called once the invocation is over (or its spawn failed, in which
+        case the thread never started and nothing was written).
+        """
+        if self.ident is None:
+            os.close(self._write_end)
+        else:
+            os.write(self._wake_w, b"\0")
+            self.join()
+        written = len(self._data) - self._unwritten
+        self.unread = self._unwritten + _drain(self.child_end, written)
+        for fd in (self.child_end, self._wake_r, self._wake_w):
+            os.close(fd)
+
+
+def _drain(fd: int, limit: int) -> int:
+    """Read and count what is left in the pipe ``fd`` reads from, at most
+    ``limit`` bytes (all that was ever written to it).
+
+    Every write end is closed by then, so the pipe reads to EOF; the
+    descriptor is non-blocking anyway, so a writer that is somehow still
+    there ends the count rather than hanging it.
+    """
+    os.set_blocking(fd, False)
+    count = 0
+    while count < limit:
+        try:
+            chunk = os.read(fd, min(limit - count, 1 << 16))
+        except BlockingIOError:
+            break
+        if not chunk:
+            break
+        count += len(chunk)
+    return count
 
 
 def _now() -> str:
@@ -919,19 +957,25 @@ def execute(req: ExecutionRequest) -> ExecutionResult:
 def _execute(req: ExecutionRequest, contained: _Containment | None) -> ExecutionResult:
     started = _now()
     timeout = req.timeout_seconds if req.timeout_seconds > 0 else None
-    proc = _spawn(
-        req.command,
-        cwd=req.cwd,
-        env=_child_environment(req.env_allowlist, req.env),
-        stdin=subprocess.DEVNULL if req.stdin_data is None else subprocess.PIPE,
-    )
+    try:
+        feeder = None if req.stdin_data is None else _StdinFeeder(req.stdin_data)
+    except OSError as exc:
+        raise ExecutionError(f"failed to spawn {' '.join(req.command)}: {exc}") from exc
+    try:
+        proc = _spawn(
+            req.command,
+            cwd=req.cwd,
+            env=_child_environment(req.env_allowlist, req.env),
+            stdin=subprocess.DEVNULL if feeder is None else feeder.child_end,
+        )
+    except BaseException:
+        if feeder is not None:
+            feeder.stop()
+        raise
     assert proc.stdout is not None and proc.stderr is not None
     if contained is not None:
         contained.child = proc.pid
-    feeder = None
-    if req.stdin_data is not None:
-        assert proc.stdin is not None
-        feeder = _StdinFeeder(proc.stdin, req.stdin_data)
+    if feeder is not None:
         feeder.start()
     pgid = proc.pid  # start_new_session: the child leads a group of its own
     # Output is read as bytes and decoded with replacement: agent output is
@@ -1010,5 +1054,5 @@ def _execute(req: ExecutionRequest, contained: _Containment | None) -> Execution
         orphans_killed=contained is not None and contained.found,
         orphan_survived_kill=left.orphan_survived,
         orphans_unchecked=req.contain_orphans and contained is None,
-        stdin_incomplete=feeder is not None and not feeder.complete,
+        stdin_unread=0 if feeder is None else feeder.unread,
     )

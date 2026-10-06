@@ -76,9 +76,11 @@ High-priority coverage includes:
 - stdin (#186): without `stdin_data` it is `/dev/null`; `stdin_data` larger
   than a pipe buffer arrives byte for byte and is followed by EOF; a child
   that never reads it still times out at the deadline with no feeder left
-  behind, and one that exits without reading it is reported
-  (`stdin_incomplete`), which the OpenCode adapter turns into a
-  `provider_failure` when the exit would otherwise read as success
+  behind; what a child left unread is counted exactly (`stdin_unread`),
+  including a short payload that fit in the pipe and was only partly read,
+  which the OpenCode adapter turns into a `provider_failure` when the exit
+  would otherwise read as success; and no descriptor of the stdin pipe
+  outlives the invocation, a failed spawn included
 
 ### Agent isolation (REMOTE)
 

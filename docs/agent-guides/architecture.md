@@ -67,11 +67,24 @@ Provider adapters own:
   provider's key is never handed to another provider's CLI)
 
 Every invocation is an argv list: there is no `os.system` / `shell=True`
-anywhere, and prompts travel as a single argv element so shell
-metacharacters in issue text cannot be interpreted. A provider that speaks
-a stdio protocol (Pi over RPC, ADR 0003) sends the prompt as one encoded
-record on the child's stdin instead, which is never in argv and never goes
-through a shell.
+anywhere, so shell metacharacters in issue text cannot be interpreted. The
+adapter decides how the prompt reaches its CLI, and it never goes through a
+shell:
+
+- **One argv element** (Claude Code). The adapter's `build_command_for`
+  puts it after `--`.
+- **Raw bytes on stdin, then EOF** (OpenCode 2, #186, whose argv corrupts a
+  message). The adapter's `stdin_payload` returns the bytes and the
+  executor writes them (`ExecutionRequest.stdin_data`). The executor
+  counts what the child left unread (`ExecutionResult.stdin_unread`), and
+  the base `AgentProvider.execute` turns an exit 0 with any of the prompt
+  unread into a `provider_failure`.
+- **One record of a stdio protocol** (Pi over RPC, ADR 0003). The prompt is
+  a JSON `prompt` record that the adapter writes through the duplex child
+  handle (`executor_duplex.py`). Pi's protocol, not the executor, reports
+  whether it was taken.
+
+The two stdin paths keep the prompt out of argv, and so out of `ps`.
 
 The provider layer is `providers.py` plus the protocol modules an adapter
 owns. Pi's wire protocol (JSON encoding and decoding, request ids, the event

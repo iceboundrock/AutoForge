@@ -181,8 +181,8 @@ CLI's output. The profile's fields map as follows:
 
 The prompt travels on stdin, never in argv: OpenCode 2 duplicates or
 re-quotes a message given in argv, and reads one that starts with `-` as a
-flag. A CLI that closes its stdin before taking the whole prompt and still
-exits 0 is reported as a failed run, not read as an answer.
+flag. A CLI that exits 0 without having read the whole prompt from its
+stdin is reported as a failed run, not read as an answer.
 `--standalone` is always passed, so the agent runs on a private server that
 is the CLI's own child rather than on a shared background service whose
 tools would outlive the invocation:
