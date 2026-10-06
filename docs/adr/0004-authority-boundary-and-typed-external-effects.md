@@ -347,7 +347,9 @@ follows:
   `MAX_STATE_FILE_BYTES`. It counts each context value at its stored bound
   (D4.6).
 
-Only bounded, redacted values are persisted, and no credential, header or
+Only bounded values are persisted, and each is either redacted or
+redaction-invariant. Every payload is redaction-invariant (D8.3), a body
+append's preserved base included (D5.5). No credential, header or
 environment value is ever stored.
 
 *Rationale.* Each of the six fields closes one ambiguity. The identity makes
@@ -417,7 +419,8 @@ written it (D4.4), and the end state is exactly the one intended.
 
 Body appends (K3, K6) refine the second case. An append that was never
 issued, and whose target body has changed since its base was recorded, is
-rebased, and the rebased payload is checkpointed before it is issued
+rebased, and the rebased payload is checkpointed before it is issued. A
+rebased payload that fails D5.5's credential check is a `conflict` instead
 (D5.5).
 
 **D4.3 (#160).** **No blind retry of a create.** An ambiguous outcome (a
@@ -682,7 +685,7 @@ concrete reads.
 | Window | Record on disk | Resolution |
 |---|---|---|
 | **W1** before the plan and context are persisted | none | Nothing was published: no write is issued before `attempted` is saved. The step re-runs. Neither the result nor its context was persisted, so the agent is relaunched under the existing attempt accounting, and its local commit is still in the worktree. Entry reconciliation runs first, and any phase identity that differs from the entry observation is unexplained (§2.9). |
-| **W2** intent persisted, write not issued | `intended` | Reconcile (D4.2). Intended end state: `observed`. Precondition holds: save `attempted`, then issue once. A body append whose target body changed is rebased in that same save (D5.5). Otherwise `BLOCKED`, naming the object. |
+| **W2** intent persisted, write not issued | `intended` | Reconcile (D4.2). Intended end state: `observed`. Precondition holds: save `attempted`, then issue once. A body append whose target body changed is rebased in that same save, if the rebased payload passes D5.5's credential check. Otherwise `BLOCKED`, naming the object. |
 | **W3** write issued, outcome unknown | `attempted` | Reconcile by identity before anything else. Intended end state: `observed`. Precondition still holds and fewer than 2 issues made: save the incremented count, then re-issue. Bound exhausted: `BLOCKED`, naming the effect and the manual step. Otherwise `BLOCKED`. |
 | **W4** write landed, state not saved | `attempted` | The W3 reconciliation finds the intended end state: `observed`, with no second write. Once every record of the plan is `observed`, the phase completes from its context (D4.6). |
 | **W5** read-back mismatch | `attempted` → `conflict` | The identity resolves to an object whose target, payload or state differs, or to two objects. The record becomes `conflict`, which is `BLOCKED` naming every object found. Never repaired in place, never duplicated. |
@@ -840,7 +843,8 @@ protocol bump; this is why the set is closed now.
   - its body equals the recorded base and carries no implementation marker
     for the issue (D5.5).
 - **Payload:** a body append (D5.5). The block is `Closes #n` and the
-  implementation marker, and the base is the PR body.
+  implementation marker, and the base is the PR body. D5.5's credential
+  check judges the whole payload, base included.
 - **Completion read-back:**
   - the body equals the payload, byte for byte;
   - the marker resolves `exactly_one`.
@@ -927,7 +931,8 @@ protocol bump; this is why the set is closed now.
 - **Payload:** a body append (D5.5). The block is the markers, one per line
   in plan order, and the base is the issue body. Markers already in the base
   are kept: an earlier round's, and a reused finding's when the target is
-  that finding's own follow-up.
+  that finding's own follow-up. D5.5's credential check judges the whole
+  payload, base included.
 - **Completion read-back:**
   - the body equals the payload, byte for byte;
   - each marker resolves to one open issue per finding.
@@ -1040,6 +1045,31 @@ not render: the target's existing body. Both follow one rule.
   the block. The record holds the full payload, the block, and a SHA-256
   digest of the base. A payload over the target's body limit (D2.4) is
   refused before the plan is persisted, as `BLOCKED` naming the object.
+- **Credential check.** The base holds bytes no agent wrote, so D8.3's
+  field checks never judge them. The whole payload (base, separator and
+  block together) must be redaction-invariant: `redact` returns it
+  unchanged. The check runs on the composition, never on the parts one by
+  one, because a pattern can span the separator (D8.3). It runs before the
+  plan is persisted, and again on every rebase, before that rebase's save.
+  A payload that fails it is never persisted, issued or logged. No reason
+  or event line quotes the matched text or the body it was found in,
+  redacted or not: the refusal names the object and the redactor's pattern
+  class only.
+  - **Before the plan:** `BLOCKED`, naming the object, as for an oversized
+    payload. No plan, record or completion context is saved.
+  - **On a rebase:** the rebase is not allowed. The record becomes
+    `conflict` (below), still holding its earlier payload, which passed
+    this check when it was saved.
+
+  The refusal is neither a correction nor a redaction. The agent did not
+  write the base and cannot change it. The operator removes the string
+  from the body, and treats the credential as exposed.
+- **Only the credential check judges the base.** D8.2's marker-opener
+  refusal and D8.3's closing-keyword and mention rules judge agent text,
+  never the base. The base legitimately carries controller markers, such as
+  an earlier round's `ai-follow-up` markers or a reused finding's (D4.6).
+  Its other bytes are already published on the target, and the append
+  sends them unchanged.
 - **Precondition:** the target's body equals the base, by digest, and
   carries none of the block's markers. The kind adds its own conditions
   (K3, K6).
@@ -1052,13 +1082,17 @@ these two kinds:
 |---|---|---|
 | `intended` or `attempted` | equals the payload | `observed` |
 | `intended` or `attempted` | equals the base, attempt bound not exhausted | save `attempted` with the count incremented, then issue the persisted payload |
-| `intended` | equals neither; the target still meets the kind's other conditions and carries none of the block's markers | **rebase**, then issue (below) |
+| `intended` | equals neither; the target still meets the kind's other conditions and carries none of the block's markers; the rebased payload passes the credential check | **rebase**, then issue (below) |
 | any | anything else | `conflict`, naming the object |
 
 - **A rebase** is one atomic save. It replaces the payload with the body
   just read followed by the persisted separator and block, replaces the
   base digest with that body's, and moves the record to `attempted` with its
   count incremented. The new payload is issued only after that save.
+- **A rebased payload that fails the credential check** falls to the last
+  row. The `conflict` save keeps the record's earlier payload and base
+  digest. It saves nothing taken from the body just read, and its reason
+  names the object and the pattern class.
 - **A rebase is allowed only from `intended`.** No write has been issued
   then (D4.1), so the record still describes everything sent, which is
   nothing. After the save, the journal holds the exact bytes of the one
@@ -1085,6 +1119,11 @@ For body appends (D5.5):
 - **One effect per target** removes ordering between effects. Each write
   replaces the whole body, so two effects on one body would either drop a
   marker or make one effect's base depend on another's completion.
+- **The base is checked, not trusted.** Its bytes are already public, but
+  the payload that holds them is persisted, and D2.4 stores no credential.
+  Recovery also compares the target against the payload byte for byte.
+  Only a refusal keeps both: the state holds no credential, and the stored
+  payload stays exactly the bytes sent.
 
 *Rejected.*
 
@@ -1106,6 +1145,17 @@ For body appends (D5.5):
 - **One effect per finding, chained on one issue.** Each effect's base
   would be its predecessor's payload. That adds ordering and a dependency
   between records for no gain over one effect per target.
+- **Redacting a credential-shaped string in the base.** Either the
+  controller publishes a human's body altered under the operator's
+  identity, or it stores a payload that differs from the bytes it sends,
+  and recovery can no longer compare the target with them.
+- **Refusing the base through the correction path.** The agent did not
+  write the base and cannot change it, so the correction would cost
+  attempts and end in the same block.
+- **Applying the agent-text policies to the base.** The marker-opener
+  refusal would refuse every base that carries an earlier round's marker,
+  which K6 must keep. The closing-keyword rule would refuse a human's PR
+  body that already says `Closes #n`, which K3 adopts as it is.
 
 ### 2.6 The Git publication layer (item 6)
 
@@ -1413,10 +1463,26 @@ covers only the `ai-` prefix.
   when the run-log redactor (`redaction.py`) would change it. The agent is
   asked through the existing correction path, bounded by
   `max_correction_attempts`. A refusal message names the field and the
-  pattern class, never the matched text. Because accepted text is exactly
-  text the redactor leaves unchanged, the persisted payload, the published
-  body and the logs are byte-identical, and redaction stays defence in
-  depth.
+  pattern class, never the matched text.
+  - **Each payload is also judged whole,** once it is rendered and before
+    the plan is persisted. Fields that pass one by one do not make a
+    payload that passes, because a pattern can span a field's end and the
+    text rendered after it. An agent body that ends in `GITHUB_TOKEN=`
+    passes alone, but in a K2 payload the redactor takes `Closes`, the
+    first word of the line rendered after it, for the token's value.
+  - **A payload of agent text and controller rendering** (K2, K4, K5, K7,
+    K8) that fails is refused through the same correction path, naming the
+    payload and the pattern class. The one exception is a payload whose
+    controller rendering fails alone, with every agent field empty, for
+    example one that names a repository the redactor matches. No correction
+    can fix that, so it is `BLOCKED`, naming the payload.
+  - **A body append** (K3, K6) also holds the target's existing body, which
+    no agent wrote. D5.5 refuses it instead, at composition and at every
+    rebase.
+
+  Every persisted payload is therefore text the redactor leaves unchanged.
+  The persisted payload, the published body and the logs are
+  byte-identical, and redaction stays defence in depth.
 - **Closing keywords: refuse.** A closing keyword (`close`, `fix` or
   `resolve`, in any form and case) followed by an issue reference is
   refused in agent text. The reference may be `#n`, `owner/repo#n` or an
@@ -1434,9 +1500,10 @@ completes without relaunching the agent: the read-back compares against the
 stored bytes, and the phase's remaining work reads its completion context
 (D4.6). A body append (K3, K6) persists its rendered block once.
 If the body it was composed over changes before any write is issued, the
-controller composes the persisted block onto the new body and checkpoints
-that payload before issuing it (D5.5). Nothing is re-rendered from a
-template, and every byte issued is in the record first.
+controller composes the persisted block onto the new body. It checkpoints
+that payload, once it passes D5.5's credential check, before issuing it.
+Nothing is re-rendered from a template, and every byte issued is in the
+record first.
 
 **D8.5 (#160).** **Commit messages are published content too.** K1 refuses a
 candidate when a commit message in the published range does either of
@@ -1917,9 +1984,9 @@ is.
   transition may append a line, but no recovery path reads it. Completion
   inputs come from the completion context only (D4.6).
 - **State and logs stay bounded and redacted.** Effect records are bounded
-  (D2.4). The published payload is redaction-invariant (D8.3), and record
-  errors and the stored `FIX` rationale are redacted within
-  `MAX_GROWTH_FACTOR` (D4.6).
+  (D2.4). Every persisted payload is redaction-invariant as a whole (D8.3),
+  a body append's preserved base included (D5.5). Record errors and the
+  stored `FIX` rationale are redacted within `MAX_GROWTH_FACTOR` (D4.6).
 - **Marker schemas and cardinality** (`at_most_one` at entry, `exactly_one`
   on read-back), review-round routing, loop bounds, stagnation and the replan
   policy.
@@ -1991,10 +2058,10 @@ interrupts the step after each persisted stage and resumes.
 |---|---|---|---|
 | K1 push | intent saved, no push; push landed, save lost; timeout landed and not landed; read-back drift | default branch refused; non-fast-forward refused; lease mismatch (a human push); an ancestor missing after the fetch fails closed; a planted `pushurl`, `insteadOf`, `core.sshCommand`, `core.hooksPath`, `pre-push` or `pre-auto-gc` hook neither redirects nor runs; a commit message with another issue's closing keyword refused; planted substitution state or a rewritten commit object passes neither the ancestry check nor the message check; a rewritten ancestor of the base does not shrink the published range (D7.5, below) | #160; #161, #163, #164 |
 | K2 implementation PR | create landed, save lost; timeout landed and not landed; duplicate invocation after a restart | a PR on the branch already closed; two marker-bearing PRs; a marker-bearing PR that appeared during the agent run (unexplained) | #160; #161 |
-| K3 adopt PR | append landed, save lost; a body edited before the first issue is rebased, checkpointed, then issued; a crash after the rebase save and before the write, and after the write and before the next save, reconciles against the rebased payload with no second write; a body edited after an issue, payload not present, is `BLOCKED` | a fork-head PR refused; a closed PR on the branch; a body that carries the block but has otherwise drifted; a payload over the body limit refused before the plan is persisted | #160; #161 |
+| K3 adopt PR | append landed, save lost; a body edited before the first issue is rebased, checkpointed, then issued; a crash after the rebase save and before the write, and after the write and before the next save, reconciles against the rebased payload with no second write; a body edited after an issue, payload not present, is `BLOCKED` | a fork-head PR refused; a closed PR on the branch; a body that carries the block but has otherwise drifted; a payload over the body limit refused before the plan is persisted; a credential-shaped string in the PR body refused before the plan is persisted, and one edited into the body before a rebase makes the record `conflict` (D5.5, below) | #160; #161 |
 | K4 review comment | create landed, save lost (round completes with no relaunch); timeout | a second matching comment; a pre-existing round comment refused; an oversized rendered body refused before any effect; a stale round still gets its comment | #160; #162 |
 | K5 follow-up issue | create landed, save lost; timeout | created then closed by a human; two issues for one finding; a human-created marker-bearing issue that appeared during the agent run (unexplained); a finding whose own follow-up existed at entry is reused, and no K5 is planned for it (D4.6) | #160; #163 |
-| K6 marker append | append landed, save lost; a human body edit before the first issue is rebased, checkpointed, then issued; a crash after the rebase save and before the write reconciles against the rebased payload; a body edited after an issue, payload not present, is `BLOCKED`; two findings deferred to one issue are one effect, and both markers survive, across a crash after the write as well; a later round's append keeps every earlier round's marker | a body already equal to the payload (`observed`); a block marker in a body that is not the payload; an issue the controller did not hand over refused; a payload over the body limit refused before the plan is persisted; no block carries the marker of a finding whose own follow-up existed at entry (D4.6) | #160; #163 |
+| K6 marker append | append landed, save lost; a human body edit before the first issue is rebased, checkpointed, then issued; a crash after the rebase save and before the write reconciles against the rebased payload; a body edited after an issue, payload not present, is `BLOCKED`; two findings deferred to one issue are one effect, and both markers survive, across a crash after the write as well; a later round's append keeps every earlier round's marker | a body already equal to the payload (`observed`); a block marker in a body that is not the payload; an issue the controller did not hand over refused; a payload over the body limit refused before the plan is persisted; a credential-shaped string in the issue body refused before the plan is persisted, and one edited into the body before a rebase makes the record `conflict` (D5.5, below); no block carries the marker of a finding whose own follow-up existed at entry (D4.6) | #160; #163 |
 | K7 replacement PR | push landed with no PR; create landed, save lost; no second agent run | a branch with the derived name at another SHA; a human push before binding; a human close before binding; a marker-bearing PR created during the agent run | #160; #164 |
 | K8 progress comment | create landed, save lost; timeout | an unjournaled comment refused; two comments block before launch | #160 |
 
@@ -2102,8 +2169,35 @@ In addition:
 - **Content policy:** a marker opener (both prefixes), an `@`-mention, a
   closing keyword or a credential-shaped string in any agent text field is
   refused before any effect, and the correction carries no secret.
-  - #160 tests the policy itself.
+  - #160 tests the policy itself. That includes the whole-payload check
+    (D8.3): a K2 body ending in `GITHUB_TOKEN=` passes as a field and is
+    refused as a payload, through the correction path. A rendering that
+    fails with every agent field empty is `BLOCKED`.
   - Each phase child tests its own fields.
+- **Body-append credential safety (D5.5).**
+  - **#160, the shared rule, at the operation level:**
+    - the check judges the composed payload, never its parts;
+    - a base with a credential-shaped string is refused before the plan is
+      persisted;
+    - one edited into the body while the record is `intended` makes the
+      record `conflict`, with no rebase save, and the record keeps its
+      earlier payload and base digest;
+    - in both cases, the reason names the object and the pattern class,
+      no state, record, event or log line contains the string or a
+      redacted copy of the body, and no body write is issued;
+    - a base that carries controller markers (an earlier round's
+      `ai-follow-up` markers, a reused finding's), a closing keyword or an
+      `@`-mention passes, and keeps them byte for byte.
+  - **#161 (K3) and #163 (K6), each at the phase level:**
+    - **an unsafe initial base:** the target's body holds a
+      credential-shaped string at the precondition read. The phase is
+      `BLOCKED`, naming the object, with no plan, record or context saved;
+    - **a credential introduced before the rebase:** the plan is saved over
+      a clean base, the step crashes in W2, a human edits a
+      credential-shaped string into the body, and `resume` reconciles. The
+      record becomes `conflict`, with no rebase save;
+    - both assert that the state file does not contain the string, and
+      that no body write is issued.
 - **State (#160):**
   - records and completion contexts round-trip;
   - corrupt records fail loudly;
