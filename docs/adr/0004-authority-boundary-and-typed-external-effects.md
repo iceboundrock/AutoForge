@@ -118,16 +118,38 @@ decisions and name no child.
 
 ### 2.1 Operation classification (item 1)
 
-**D1.1 (#165).** Every REMOTE operation falls into exactly one of three classes:
+**D1.1 (#165).** Every REMOTE operation falls into exactly one of four
+classes. The first two divide the local repository where git divides it. A
+linked worktree's private git directory (`<git common dir>/worktrees/<id>/`)
+holds its index, its `HEAD` and that reflog, and the per-worktree refs under
+`refs/worktree/`, `refs/bisect/` and `refs/rewritten/`. Every other ref, the
+object store, the configuration and the hooks live in the common dir, which
+the operator's checkout and every other worktree share (`git help worktree`,
+"REFS").
 
 - **Agent-local.** Anything confined to the agent's worktree and its
-  per-worktree git data: edits, builds, tests, local commits, local branches,
-  and git commands that read local objects and refs (`git rev-parse`,
-  `git log`, `git diff`, `git branch -a`).
-  - A local branch is allowed but never load-bearing. Verification and
-    recovery address the candidate as "the worktree's HEAD" plus the
-    controller-named *remote* branch. Wave 2A may make the common dir
-    read-only to agents.
+  private git directory: edits, builds, tests, staging, local commits on the
+  worktree's `HEAD`, and git commands that only read objects and refs
+  (`git rev-parse`, `git log`, `git diff`, `git branch -a`).
+  - A local commit also adds objects to the shared object store. That is the
+    one shared write an agent makes, and it grants nothing. An object is
+    content-addressed and names nothing, and the controller names every
+    revision by a SHA it read from the worktree's `HEAD` or recorded in its
+    own state (D6.4).
+  - The candidate is the worktree's `HEAD`. Verification and recovery address
+    it as that plus the controller-named *remote* branch, never through a
+    local ref.
+- **Operator-owned local.** Every other write to the common dir:
+  - creating, moving or deleting a shared ref (`refs/heads/*`, `refs/tags/*`,
+    `refs/remotes/*`, `refs/stash`), local branch creation included;
+  - editing the repository configuration or hooks;
+  - worktree administration (`git worktree add`, `move`, `remove`, `prune`).
+
+  None of it is externally visible, so it is not controller-only. The
+  operator's checkout sees it at once, though, and the operator owns local
+  branches and worktrees (AGENTS.md "Runtime model"). Agents perform none of
+  it. The controller's only write there is its one detached `worktree add`;
+  its fetches write objects only (D6.4).
 - **Agent read-only external.** Reads of the issue, the PR, the diff,
   comments and checks, and of revisions the controller fetched. How an agent
   performs these reads after credential removal is §2.10.
@@ -142,6 +164,33 @@ decisions and name no child.
 
   A controller-only operation is performed by the controller as a typed
   effect (§2.5) or by one of its existing mechanisms (D5.4), or by nobody.
+
+**No phase needs a shared ref.** The controller adds the worktree detached
+and fetches objects only (D6.4), and K1 pushes the candidate SHA to an
+explicit remote ref. An agent therefore commits on the worktree's detached
+`HEAD`. That `HEAD` keeps its commits reachable, `git gc` included, as a
+branch would. #161, #163 and #164 remove the prompt steps that create a local
+branch (the D1.2 rows). A phase that ever needs to name a local revision for
+an agent uses `refs/worktree/*`, which git keeps in the worktree's private
+git directory. No Wave 1 phase needs one.
+
+**Enforcement, in Wave 1 and after.**
+
+- **Wave 1 enforces the operator-owned class by instruction only.** An agent
+  can still write shared refs, configuration and hooks (§2.11). What Wave 1
+  guarantees is narrower. No controller verification or recovery reads a
+  shared ref (D6.4). The controller's network git reads no shared
+  configuration or hook (§2.7), and its local git runs whatever that state
+  can make it run with no more authority than the agent (D7.3). A shared ref
+  an agent writes anyway therefore grants nothing, and a moved `HEAD` or
+  branch of the operator's checkout still blocks the run.
+- **A read-only common dir changes the enforcement, not the classes.** If
+  Wave 2A (#166) makes the common dir read-only to agents, operator-owned
+  writes become impossible, and no phase loses anything it needs. #166 must
+  still give an agent what the agent-local class uses: a writable private
+  git directory, which lives under the common dir, and somewhere to write
+  objects, such as the private object directory and strict import that §4
+  names.
 
 **D1.2 (#165).** The classification is provider-neutral: it names
 operations, not tools. #165 records it in `docs/agent-guides/github-safety.md`,
@@ -171,8 +220,8 @@ prompts make no GitHub call and are out of scope.
 | `gh pr close`, `gh pr comment`, `gh pr edit` on the source PR | `replan_reexecute.md` :503–504, :807 (forbidden) | controller-only | forbidden today; impossible for the agent once its credential is gone | #165 |
 | `git push --delete` | `replan_reexecute.md` :534 (forbidden) | controller-only | forbidden to agents; no kind, so the controller never does it either | #165 |
 | labels, assignees, milestones, any other REST or GraphQL mutation | no prompt | controller-only | no kind, so nobody performs them in Wave 1 | #165 |
-| `git branch -D`, `git branch -d` | `replan_reexecute.md` :534 (forbidden) | agent-local, but the operator owns local branches (AGENTS.md "Runtime model") | unchanged prohibition | — |
-| `git worktree add/move/remove/prune` | `common.md` :50–51, `replan_reexecute.md` :536–537 (forbidden) | operator-owned | unchanged prohibition; the controller's single `worktree add` is unchanged | — |
+| `git branch -D`, `git branch -d` | `replan_reexecute.md` :534 (forbidden) | operator-owned local | unchanged prohibition | — |
+| `git worktree add/move/remove/prune` | `common.md` :50–51, `replan_reexecute.md` :536–537 (forbidden) | operator-owned local | unchanged prohibition; the controller's single `worktree add` is unchanged | — |
 | `gh issue view … --comments`, `gh issue view <url>` | `analyze_execute.md` :38, `review.md` :29, :94 | read-only external | controller-supplied read context (§2.10) | #165 |
 | `gh issue view <url> --json url,state` | `update_epic.md` :88 | read-only external | read context: states of the EPIC's referenced issues | #165 |
 | `gh pr view … --comments`, `gh pr view --json headRefOid,baseRefName` | `review.md` :32, :35 | read-only external | read context; the binding is already in the prompt | #165 |
@@ -184,9 +233,11 @@ prompts make no GitHub call and are out of scope.
 | `gh pr list --state open` (prior work) | `analyze_execute.md` :42 | read-only external | the controller's own pre-launch reads | #161 |
 | `git fetch` | `analyze_execute.md` :42 | network read | controller pre-launch fetch, objects only (D6.4) | #161 |
 | `git fetch origin <sha>` | `review.md` :39 | network read | controller pre-launch fetch of the bound HEAD and merge base | #162 |
-| `gh pr checkout`, `git pull` | `fix.md` :73–74 | network read | controller pre-launch fetch of the reviewed HEAD; the agent positions its worktree locally | #163 |
+| `gh pr checkout`, `git pull` | `fix.md` :73–74 | network read, and a local branch (operator-owned local) | controller pre-launch fetch of the reviewed HEAD; the agent checks it out detached and creates no local branch | #163 |
 | "Fetch the remote repository" | `replan_reexecute.md` §15 | network read | controller pre-launch fetch of the verified default branch | #164 |
-| `git branch -a`, `git rev-parse HEAD`, local commit, local branch creation | `analyze_execute.md` :43, :46–51; `fix.md` :74, :89; `replan_reexecute.md` §15 | agent-local | unchanged; never load-bearing | — |
+| `git branch -a`, `git rev-parse HEAD`, local commit | `analyze_execute.md` :43, :51; `fix.md` :74, :89 | agent-local | unchanged; the commit lands on the worktree's detached `HEAD`; never load-bearing | — |
+| create or check out the local branch `{{BRANCH}}` | `analyze_execute.md` :46–48 | operator-owned local | removed: the agent commits on the detached `HEAD`, from the controller-fetched default branch or prior-work head; K1 creates the remote branch | #161 |
+| create the replacement branch | `replan_reexecute.md` :542, §15 :565 | operator-owned local | removed: the agent commits on the detached `HEAD`, from the controller-fetched verified default branch; K1 creates the remote replacement branch | #164 |
 | "Use the `gh` CLI for GitHub reads/writes"; "git and gh credentials"; "inspect the real current state … (branch push, PR creation, comment, follow-up issue)" | `common.md` :45, :55, :64–66 | — | reworded once every write has moved | #165 |
 
 **D1.3 (#165).** **A provider interaction approval never grants a
@@ -1073,7 +1124,7 @@ keeps the reviewed tree clean, and Wave 2A can project it read-only.
    - carry a credential-shaped string.
 
 **What Wave 1 does not guarantee** (the outer-sandbox wave, Wave 2A, owns
-the first three):
+the first four):
 
 - **Absolute-path reads.** A same-UID process that deliberately reads
   credential files, keychains or sockets by absolute path. Examples are
@@ -1084,6 +1135,10 @@ the first three):
   controller's own `gh` reads that configuration. After #165, an agent's
   ordinary `gh` and `git config --global` writes land in controller-supplied
   locations, not the operator's.
+- **Shared local repository state.** An agent can still create, move or
+  delete shared refs and edit the configuration and hooks of the common dir,
+  which the operator's checkout shares. D1.1 forbids it by instruction only;
+  §2.7, D6.4 and D7.3 bound what that state can do to the controller.
 - **Network egress.** An agent can send whatever it can read.
 - **Exposure outside the boundary.** Credentials the operator exposes
   outside AutoForge's controlled execution boundary, for example a token in
@@ -1333,8 +1388,11 @@ is.
   deny rules as defence in depth.
 - **Wave 2A (#166–#169).** #166 decides the outer sandbox's git surface. A
   read-only common dir, a private object directory and a strict import
-  compose with this record, because nothing here depends on an agent-written
-  ref or on agent write access to shared state. The controller's own runtime
+  compose with this record. Nothing here depends on an agent-written shared
+  ref, and the only shared state an agent writes is objects (D1.1), which a
+  private object directory and a strict import take over. D1.1 states what
+  #166 must keep writable for agents: the worktree's private git directory,
+  which lives under the common dir. The controller's own runtime
   directories, the per-operation git contexts and the read-context
   directories are never projected writable to agents.
 
