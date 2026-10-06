@@ -67,11 +67,24 @@ Provider adapters own:
   provider's key is never handed to another provider's CLI)
 
 Every invocation is an argv list: there is no `os.system` / `shell=True`
-anywhere, and prompts travel as a single argv element so shell
-metacharacters in issue text cannot be interpreted. A provider that speaks
-a stdio protocol (Pi over RPC, ADR 0003) sends the prompt as one encoded
-record on the child's stdin instead, which is never in argv and never goes
-through a shell.
+anywhere, so shell metacharacters in issue text cannot be interpreted. The
+adapter decides how the prompt reaches its CLI, and it never goes through a
+shell:
+
+- **One argv element** (Claude Code). The adapter's `build_command_for`
+  puts it after `--`.
+- **Raw bytes on stdin, then EOF** (OpenCode 2, #186, whose argv corrupts a
+  message). The adapter's `stdin_payload` returns the bytes and the
+  executor writes them (`ExecutionRequest.stdin_data`). The executor
+  counts what the child left unread (`ExecutionResult.stdin_unread`), and
+  the base `AgentProvider.execute` turns an exit 0 with any of the prompt
+  unread into a `provider_failure`.
+- **One record of a stdio protocol** (Pi over RPC, ADR 0003). The prompt is
+  a JSON `prompt` record that the adapter writes through the duplex child
+  handle (`executor_duplex.py`). Pi's protocol, not the executor, reports
+  whether it was taken.
+
+The two stdin paths keep the prompt out of argv, and so out of `ps`.
 
 The provider layer is `providers.py` plus the protocol modules an adapter
 owns. Pi's wire protocol (JSON encoding and decoding, request ids, the event
@@ -143,10 +156,22 @@ are reported as `orphans_killed` / `orphan_survived_kill`. Without a
 subreaper the result says `orphans_unchecked`. One contained invocation
 runs per controller process.
 
-`execute()` itself stays one-shot with `stdin=DEVNULL`. A child the
-controller must write to while it runs (an RPC transport such as Pi's, ADR
-0003 §2.7) uses the duplex child handle in `src/autoforge/executor_duplex.py`
-instead: `with start_duplex(DuplexRequest(...)) as child:` then
+`execute()` itself stays one-shot: what the child gets on stdin is fixed
+before the spawn, and nothing the child writes back changes it. By
+default (`ExecutionRequest.stdin_data` is `None`) its stdin is
+`/dev/null`, so a CLI that waits for interactive input cannot hang. With
+`stdin_data`, stdin is a pipe that a feeder thread fills with those bytes
+and then closes, so the child reads the payload and then EOF (the
+OpenCode prompt, above). The feeder writes non-blocking and the teardown
+wakes and joins it, so a child that never reads its stdin still ends at
+the deadline. It keeps the pipe's read end until the invocation is over,
+so `ExecutionResult.stdin_unread` counts what the child left unread, not
+only what was never written.
+
+A child the controller must keep writing to while it runs, in step with
+what it reads back (an RPC transport such as Pi's, ADR 0003 §2.7), uses
+the duplex child handle in `src/autoforge/executor_duplex.py` instead:
+`with start_duplex(DuplexRequest(...)) as child:` then
 `send_line`, `read_line`, `close_stdin` and `finish`. It reuses the
 executor's spawn, environment selection, pipe draining and group kill, and
 it is held to the same contract:

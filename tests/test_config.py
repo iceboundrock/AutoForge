@@ -622,8 +622,9 @@ def test_required_profiles_validation(tmp_path):
 def test_opencode_command_shape():
     p = default_config().profile("review_round_1")
     argv = p.build_command("review this")
-    assert argv[:2] == ["opencode", "run"] and "-m" in argv and "--variant" in argv
-    assert argv[-2:] == ["--", "review this"]
+    assert argv[:3] == ["opencode", "run", "--standalone"]
+    assert argv[argv.index("-m") + 1].endswith("#high") and "--variant" not in argv
+    assert "review this" not in argv  # the prompt travels on stdin (#186)
 
 
 def test_url_validation():

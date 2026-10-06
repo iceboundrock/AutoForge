@@ -73,6 +73,17 @@ High-priority coverage includes:
   the controller's environment, an absent name adds no placeholder, an
   invalid entry refuses to launch, no allow-list inherits everything, and
   an explicit `env` is layered over the selection
+- stdin (#186): without `stdin_data` it is `/dev/null`; `stdin_data` larger
+  than a pipe buffer arrives byte for byte and is followed by EOF; a child
+  that never reads it still times out at the deadline with no feeder left
+  behind; what a child left unread is counted exactly (`stdin_unread`),
+  including a short payload that fit in the pipe and was only partly read,
+  which the OpenCode adapter turns into a `provider_failure` when the exit
+  would otherwise read as success; and no descriptor of the stdin pipe
+  outlives the invocation, a failed spawn included
+- setup after the spawn: a feeder or capture thread the system refuses to
+  start (or a capture pipe it refuses to open) kills and reaps the child
+  before the `ExecutionError`, and leaves no thread or descriptor behind
 
 ### Agent isolation (REMOTE)
 

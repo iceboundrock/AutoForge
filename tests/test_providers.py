@@ -1,5 +1,9 @@
 """Provider adapters: exact CLI argv shapes, validation, scripted fake."""
 
+import hashlib
+import json
+import sys
+
 import pytest
 
 from autoforge.config import ProfileConfig, default_config
@@ -61,24 +65,38 @@ def test_claude_rejects_bad_effort_and_mode():
 
 
 def test_opencode_argv_shape():
+    """#186: v2's argv. The variant rides on the model, the private server
+    keeps the agent inside this invocation, and the prompt is not in argv."""
     p = default_config().profile("review_round_1")
     argv = OpenCodeProvider().build_command_for(p, "review $(id)")
-    assert argv[:2] == ["opencode", "run"]
-    assert argv[argv.index("-m") + 1] == "openai/gpt-5.6-luna"
-    assert argv[argv.index("--variant") + 1] == "high"
-    assert argv[argv.index("--format") + 1] == "default"
-    assert "--auto" not in argv
-    assert argv[-2:] == ["--", "review $(id)"]  # prompt is one literal element
+    assert argv == [
+        "opencode",
+        "run",
+        "--standalone",
+        "-m",
+        "openai/gpt-5.6-luna#high",
+        "--format",
+        "default",
+    ]
+    assert "--variant" not in argv and "--" not in argv
 
 
-def test_opencode_prompt_starting_with_a_dash_is_not_a_flag():
-    """#7 (item 5): `--` ends option parsing, so a prompt beginning with `-`
-    reaches opencode as the message instead of being parsed as an option."""
+@pytest.mark.parametrize("prompt", ["--help", "-x", "review $(id)", "", "#heading"])
+def test_opencode_prompt_never_reaches_argv(prompt):
+    """v2 duplicates a message after `--`, re-quotes one without it, and
+    takes one that starts with `-` for a flag: the prompt goes on stdin."""
     p = default_config().profile("review_round_1")
-    argv = OpenCodeProvider().build_command_for(p, "--help")
-    assert argv[-2:] == ["--", "--help"]
-    # Every option precedes the separator; nothing follows it but the prompt.
-    assert argv.index("--") > argv.index("--format")
+    prov = OpenCodeProvider()
+    argv = prov.build_command_for(p, prompt)
+    assert argv == prov.build_command_for(p, "anything else")
+    assert prov.stdin_payload(AgentRequest("REVIEW", prompt, ".", p, 5)) == prompt.encode()
+
+
+def test_opencode_without_an_effort_sends_no_variant():
+    p = ProfileConfig(name="r", provider="opencode", model="openai/gpt-5.6-luna", effort="")
+    argv = OpenCodeProvider().build_command_for(p, "x")
+    assert argv[argv.index("-m") + 1] == "openai/gpt-5.6-luna"
+    assert not any("#" in a for a in argv)
 
 
 def test_opencode_auto_flag_and_extra_args():
@@ -91,13 +109,214 @@ def test_opencode_auto_flag_and_extra_args():
         options={"auto_approve": "true"},
     )
     argv = OpenCodeProvider().build_command_for(p, "x")
-    assert "--auto" in argv and argv[-4:] == ["--agent", "reviewer", "--", "x"]
+    assert argv[argv.index("-m") + 1] == "openai/gpt-5.6-sol#medium"
+    assert argv[-3:] == ["--auto", "--agent", "reviewer"]
+
+
+def test_opencode_rejects_a_variant_in_the_model():
+    p = ProfileConfig(name="r", provider="opencode", model="openai/gpt-5.6-luna#high", effort="")
+    with pytest.raises(ConfigurationError, match="effort") as err:
+        OpenCodeProvider().validate_profile(p)
+    assert "'r'" in str(err.value) and "#variant" in str(err.value)
 
 
 def test_opencode_requires_provider_slash_model():
     p = ProfileConfig(name="r", provider="opencode", model="gpt-5.6-luna", effort="high")
     with pytest.raises(ConfigurationError, match="provider/model"):
         OpenCodeProvider().validate_profile(p)
+
+
+def test_opencode_hands_the_prompt_to_the_runner_as_stdin():
+    seen = []
+    p = default_config().profile("review_round_1")
+    prompt = 'review \ud800 \u00e9 "q"'
+    OpenCodeProvider(runner=_capture_runner(seen)).execute(
+        AgentRequest("REVIEW", prompt, "/tmp", p, 7)
+    )
+    # A lone surrogate cannot be UTF-8; it becomes U+FFFD rather than failing.
+    assert seen[0].stdin_data == 'review \ufffd \u00e9 "q"'.encode()
+    assert prompt not in seen[0].command
+
+
+def test_claude_keeps_stdin_on_dev_null():
+    seen = []
+    p = default_config().profile("fix")
+    ClaudeCodeProvider(runner=_capture_runner(seen)).execute(AgentRequest("FIX", "p", "/tmp", p, 7))
+    assert seen[0].stdin_data is None
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "timed_out", "failure"),
+    [(0, False, True), (1, False, False), (-9, True, False)],
+)
+def test_a_prompt_the_cli_did_not_take_whole_is_a_provider_failure(exit_code, timed_out, failure):
+    """A clean exit with part of the prompt unread must not read as an answer
+    to the whole prompt; a failed exit or a timeout already reports itself."""
+    from autoforge.executor import ExecutionResult
+
+    def runner(req):
+        return ExecutionResult(
+            req.command,
+            req.cwd,
+            exit_code,
+            "ok",
+            "",
+            "t",
+            "t",
+            timed_out=timed_out,
+            stdin_unread=10,
+        )
+
+    p = default_config().profile("review_round_1")
+    res = OpenCodeProvider(runner=runner).execute(AgentRequest("REVIEW", "p" * 11, "/tmp", p, 7))
+    assert bool(res.provider_failure) is failure
+    if failure:
+        assert res.provider_failure == (
+            "opencode: the prompt was not delivered: the CLI exited without reading "
+            "the last 10 bytes of it"
+        )
+
+
+# -- a fake `opencode` behind the real executor (#186) -------------------------------
+_FAKE_OPENCODE = r"""
+import hashlib, json, os, sys
+
+home = sys.argv[1]
+argv = sys.argv[2:]
+with open(os.path.join(home, "mode"), encoding="utf-8") as f:
+    mode = f.read()
+if mode == "skip-stdin":
+    data = b""
+elif mode == "read-one-byte":
+    data = os.read(0, 1)
+else:
+    data = sys.stdin.buffer.read()
+with open(os.path.join(home, "log.json"), "w", encoding="utf-8") as f:
+    json.dump({"argv": argv, "sha256": hashlib.sha256(data).hexdigest(), "len": len(data)}, f)
+sys.stderr.write("> build \u00b7 tool traces go to stderr\n")
+with open(os.path.join(home, "answer"), encoding="utf-8") as f:
+    sys.stdout.write(f.read())
+"""
+
+
+def _fake_opencode(tmp_path, mode="read", answer="done\n"):
+    home = tmp_path / "fake-opencode"
+    home.mkdir()
+    (home / "fake.py").write_text(_FAKE_OPENCODE, encoding="utf-8")
+    (home / "mode").write_text(mode, encoding="utf-8")
+    (home / "answer").write_text(answer, encoding="utf-8")
+    command = home / "opencode"
+    command.write_text(
+        f'#!/bin/sh\nexec "{sys.executable}" "{home / "fake.py"}" "{home}" "$@"\n',
+        encoding="utf-8",
+    )
+    command.chmod(0o755)
+    profile = ProfileConfig(
+        name="review_round_1",
+        provider="opencode",
+        model="openai/gpt-5.6-luna",
+        effort="high",
+        command=str(command),
+        options={"output_format": "default"},
+    )
+    return home, profile
+
+
+def test_a_fake_opencode_receives_the_prompt_verbatim_and_answers_on_stdout(tmp_path):
+    from autoforge.result_parser import parse_control_result
+    from autoforge.transitions import Phase
+    from tests.conftest import PR, SHA_A, block, comment_url
+
+    review = {
+        "phase": "REVIEW",
+        "status": "success",
+        "round": 1,
+        "reviewed_head_sha": SHA_A,
+        "review_comment_url": comment_url(PR, 1),
+        "needs_fix_round": False,
+        "findings": [],
+    }
+    home, profile = _fake_opencode(tmp_path, answer=block(review))
+    head = '-x --help\r\n# Review "PR" `code` $(id) \\ back\n{"k": "v"}\n\u00e9\u4e2d\n'
+    prompt = head + "filler line\n" * 20_000  # well over one pipe buffer
+    res = OpenCodeProvider().execute(AgentRequest("REVIEW", prompt, str(tmp_path), profile, 30))
+    assert res.ok and not res.provider_failure, (res.exit_code, res.stderr)
+    log = json.loads((home / "log.json").read_text(encoding="utf-8"))
+    sent = prompt.encode("utf-8")
+    assert log["len"] == len(sent) and log["sha256"] == hashlib.sha256(sent).hexdigest()
+    assert log["argv"] == [
+        "run",
+        "--standalone",
+        "-m",
+        "openai/gpt-5.6-luna#high",
+        "--format",
+        "default",
+    ]
+    assert "tool traces" in res.stderr and "tool traces" not in res.stdout
+    assert parse_control_result(res.stdout_tail, Phase.REVIEW) == review
+
+
+@pytest.mark.parametrize(
+    ("mode", "prompt"),
+    [
+        ("skip-stdin", "x" * (4 * 1024 * 1024)),  # more than any pipe buffer holds
+        ("skip-stdin", "Review PR #1."),  # fits in the pipe: written, never read
+        ("read-one-byte", "Review PR #1."),  # a prefix read, then a clean exit
+    ],
+    ids=["no-read-large", "no-read-short", "prefix-short"],
+)
+def test_a_fake_opencode_that_exits_without_reading_its_whole_prompt_fails(tmp_path, mode, prompt):
+    """An exit 0 whose answer parses is still a failed run when the CLI did
+    not read the whole prompt, however short the prompt is: the answer
+    cannot be to a prompt the CLI never saw (the PR #188 review)."""
+    from autoforge.result_parser import parse_control_result
+    from autoforge.transitions import Phase
+    from tests.conftest import PR, SHA_A, block, comment_url
+
+    review = {
+        "phase": "REVIEW",
+        "status": "success",
+        "round": 1,
+        "reviewed_head_sha": SHA_A,
+        "review_comment_url": comment_url(PR, 1),
+        "needs_fix_round": False,
+        "findings": [],
+    }
+    _, profile = _fake_opencode(tmp_path, mode=mode, answer=block(review))
+    res = OpenCodeProvider().execute(AgentRequest("REVIEW", prompt, str(tmp_path), profile, 30))
+    assert res.exit_code == 0 and not res.timed_out
+    assert parse_control_result(res.stdout_tail, Phase.REVIEW) == review
+    taken = 1 if mode == "read-one-byte" else 0
+    assert res.provider_failure == (
+        "opencode: the prompt was not delivered: the CLI exited without reading "
+        f"the last {len(prompt) - taken} bytes of it"
+    )
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("opencode v2.0.23", (2, 0, 23)),
+        ("opencode v2.0.23\n", (2, 0, 23)),
+        ("v2.1.0", (2, 1, 0)),
+        ("1.18.34", (1, 18, 34)),
+        ("opencode v2.0.0-beta.1", (2, 0, -1)),
+        ("", None),
+        ("opencode", None),
+        ("opencode version 2.0.0", None),
+        ("opencode v2.0", None),
+        ("opencode v2.0.23\nextra", None),
+        ("pi 2.0.0", None),
+    ],
+)
+def test_parse_opencode_version(text, expected):
+    from autoforge.providers import OPENCODE_MIN_VERSION, parse_opencode_version
+
+    assert parse_opencode_version(text) == expected
+    if expected is not None:
+        assert (expected >= OPENCODE_MIN_VERSION) is (
+            text.strip() in ("opencode v2.0.23", "v2.1.0")
+        )
 
 
 def test_unknown_provider_rejected():

@@ -1,9 +1,11 @@
 """Executor: real subprocesses (python -c) — argv safety, timeout, exit codes."""
 
+import hashlib
 import os
 import random
 import signal
 import sys
+import threading
 import time
 import tracemalloc
 from pathlib import Path
@@ -347,6 +349,219 @@ def test_stdin_is_closed_not_interactive():
         )
     )
     assert res.ok and res.stdout.strip() == "''"
+    assert res.stdin_unread == 0
+
+
+# Reads its stdin to EOF and prints the length and digest of what arrived.
+_DIGEST_STDIN = (
+    "import hashlib, sys\n"
+    "data = sys.stdin.buffer.read()\n"
+    "print(len(data), hashlib.sha256(data).hexdigest())\n"
+)
+
+
+def _digest(data: bytes) -> str:
+    return f"{len(data)} {hashlib.sha256(data).hexdigest()}"
+
+
+def test_stdin_data_arrives_verbatim_and_then_eof():
+    """The payload reaches the child byte for byte, past one pipe buffer, and
+    stdin is closed after it: the child's read-to-EOF returns."""
+    head = '-x --help\r\n# "q" \'q\' `id` $(id) \\ ; | &\n{"phase": "REVIEW"}\né中\U0001f600\n'
+    data = (head * 20_000).encode()  # ~1.4 MB, far past a 64 KiB pipe buffer
+    res = execute(
+        ExecutionRequest(command=[PY, "-c", _DIGEST_STDIN], stdin_data=data, timeout_seconds=30)
+    )
+    assert res.ok, res.stderr
+    assert res.stdout.strip() == _digest(data)
+    assert res.stdin_unread == 0
+
+
+def test_empty_stdin_data_is_an_immediate_eof():
+    res = execute(
+        ExecutionRequest(command=[PY, "-c", _DIGEST_STDIN], stdin_data=b"", timeout_seconds=30)
+    )
+    assert res.ok and res.stdout.strip() == _digest(b"")
+    assert res.stdin_unread == 0
+
+
+def test_child_that_never_reads_its_stdin_times_out_and_the_feed_ends():
+    """A payload larger than the pipe and a child that never reads it: the
+    timeout still kills the group on time, the whole payload is reported
+    unread, and no feeder thread outlives ``execute()``."""
+    started = time.monotonic()
+    res = execute(
+        ExecutionRequest(
+            command=[PY, "-c", "import time; time.sleep(30)"],
+            stdin_data=b"x" * (4 * 1024 * 1024),
+            timeout_seconds=1,
+        )
+    )
+    assert res.timed_out and res.exit_code == -1
+    assert res.stdin_unread == 4 * 1024 * 1024
+    assert time.monotonic() - started < 10
+    assert not [t for t in threading.enumerate() if t.name == "autoforge-feed-stdin"]
+
+
+def test_child_that_exits_without_reading_its_stdin_reports_it():
+    """The child exits 0 at once and leaves most of the payload unwritten: its
+    own status is returned, promptly, with the whole payload unread."""
+    started = time.monotonic()
+    res = execute(
+        ExecutionRequest(
+            command=[PY, "-c", "print('bye')"],
+            stdin_data=b"x" * (4 * 1024 * 1024),
+            timeout_seconds=30,
+        )
+    )
+    assert not res.timed_out and res.exit_code == 0 and res.stdout == "bye\n"
+    assert res.stdin_unread == 4 * 1024 * 1024
+    assert time.monotonic() - started < 10
+    assert not [t for t in threading.enumerate() if t.name == "autoforge-feed-stdin"]
+
+
+@pytest.mark.parametrize(
+    ("size", "taken"),
+    [
+        (11, 0),  # the whole payload fits in the pipe: written, never read
+        (11, 1),  # the PR #188 review: one byte of an 11-byte prompt, then exit 0
+        (11, 10),
+        (1024 * 1024, 100_000),  # unread both in the pipe and never written
+    ],
+)
+def test_bytes_the_child_left_unread_are_counted_not_taken_as_delivered(size, taken):
+    """Written is not read: a child that takes a prefix and exits 0 leaves the
+    rest in the pipe, and that rest is reported exactly, whether or not the
+    payload fit in the pipe buffer."""
+    read_prefix = (
+        "import os, sys\n"
+        f"left = {taken}\n"
+        "while left:\n"
+        "    left -= len(os.read(0, left))\n"
+        "print('read')\n"
+    )
+    res = execute(
+        ExecutionRequest(
+            command=[PY, "-c", read_prefix], stdin_data=b"y" * size, timeout_seconds=30
+        )
+    )
+    assert res.exit_code == 0 and not res.timed_out and res.stdout == "read\n"
+    assert res.stdin_unread == size - taken
+
+
+def _open_fds() -> set[str]:
+    return set(os.listdir("/dev/fd"))
+
+
+def test_stdin_data_leaves_no_descriptor_behind():
+    """The feeder holds a read end of the child's stdin past the child's
+    exit; it is released with the rest, whether the child read everything,
+    read nothing or the spawn failed."""
+    before = _open_fds()
+    for command in ([PY, "-c", _DIGEST_STDIN], [PY, "-c", "pass"]):
+        execute(ExecutionRequest(command=command, stdin_data=b"z" * 200_000, timeout_seconds=30))
+    with pytest.raises(ExecutionError, match="not found"):
+        execute(
+            ExecutionRequest(
+                command=["autoforge-definitely-missing-binary-xyz"],
+                stdin_data=b"z",
+                timeout_seconds=5,
+            )
+        )
+    assert _open_fds() == before
+
+
+@pytest.mark.parametrize("failing_call", [1, 2], ids=["stdin-pipe", "wake-pipe"])
+def test_a_stdin_pipe_that_cannot_be_opened_is_a_launch_failure(monkeypatch, failing_call):
+    """The feeder opens its own pipes before the spawn. One that cannot be
+    opened (here EMFILE) fails the launch as an ExecutionError, like a
+    failed spawn, and the pipe already opened is closed again."""
+    real_pipe = os.pipe
+    calls = 0
+
+    def pipe() -> tuple[int, int]:
+        nonlocal calls
+        calls += 1
+        if calls == failing_call:
+            raise OSError(24, "Too many open files")
+        return real_pipe()
+
+    before = _open_fds()
+    monkeypatch.setattr(executor.os, "pipe", pipe)
+    with pytest.raises(ExecutionError, match="failed to spawn .*Too many open files"):
+        execute(ExecutionRequest(command=[PY, "-c", "pass"], stdin_data=b"z", timeout_seconds=5))
+    monkeypatch.undo()
+    assert calls == failing_call
+    assert _open_fds() == before
+
+
+@pytest.mark.parametrize(
+    ("step", "nth", "error"),
+    [
+        ("feeder-start", 1, RuntimeError("can't start new thread")),
+        ("reader-start", 1, RuntimeError("can't start new thread")),
+        ("reader-start", 2, RuntimeError("can't start new thread")),
+        ("reader-init", 2, OSError(24, "Too many open files")),
+    ],
+    ids=["stdin-feeder", "stdout-reader", "stderr-reader", "stderr-reader-pipe"],
+)
+def test_a_setup_failure_after_the_spawn_kills_the_child(monkeypatch, step, nth, error):
+    """The PR #188 review: the threads that feed and read the child start
+    after it is spawned. One the system refuses (a thread or descriptor
+    limit) fails the launch as an ExecutionError, and the child, which would
+    otherwise sleep on, is killed and reaped first; what did start is ended
+    and nothing is left open."""
+    calls = 0
+
+    def refuse_nth(real):
+        def call(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == nth:
+                raise error
+            return real(*args, **kwargs)
+
+        return call
+
+    target = {
+        "feeder-start": (executor._StdinFeeder, "start", threading.Thread.start),
+        "reader-start": (executor._BoundedReader, "start", threading.Thread.start),
+        "reader-init": (executor._BoundedReader, "__init__", executor._BoundedReader.__init__),
+    }[step]
+    spawned = []
+    real_spawn = executor._spawn
+
+    def spawn(*args, **kwargs):
+        spawned.append(real_spawn(*args, **kwargs))
+        return spawned[-1]
+
+    fds, threads = _open_fds(), set(threading.enumerate())
+    monkeypatch.setattr(executor, "_spawn", spawn)
+    monkeypatch.setattr(target[0], target[1], refuse_nth(target[2]))
+    started = time.monotonic()
+    try:
+        with pytest.raises(ExecutionError, match=f"failed to start .*{error.args[-1]}"):
+            execute(
+                ExecutionRequest(
+                    command=[PY, "-c", "import time; time.sleep(60)"],
+                    stdin_data=b"z" * 200_000,
+                    timeout_seconds=30,
+                )
+            )
+        (proc,) = spawned
+        assert proc.returncode is not None
+        with pytest.raises(ProcessLookupError):
+            os.killpg(proc.pid, 0)
+    finally:
+        for proc in spawned:
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+    assert time.monotonic() - started < 10
+    monkeypatch.undo()
+    assert calls == nth
+    assert set(threading.enumerate()) == threads
+    assert _open_fds() == fds
 
 
 def test_cwd_is_applied(tmp_path):

@@ -24,7 +24,7 @@ options without touching controller source. Provider-specific flags are
 built by the adapters in `src/autoforge/providers.py`; the engine never
 hard-codes CLI syntax. The CLI flag syntax in `autoforge.example.yaml` was
 checked against the locally installed CLIs (Claude Code 2.1.263, OpenCode
-1.18.20, gh 2.100.0).
+2.0.23, gh 2.100.0).
 
 ## Formats
 
@@ -162,6 +162,37 @@ default's `options` or `extra_args` (an OpenCode `auto_approve` on a Claude
 profile, or a Claude flag in a Pi argv, would be wrong). Before #129 a
 provider switch kept the default's `command`, `options` and `extra_args`;
 restate any of them you relied on.
+
+### OpenCode profiles
+
+`provider: opencode` runs the OpenCode CLI, 2.0.0 or newer (#186); `autoforge
+doctor` fails a 1.x CLI, or a version it cannot read, without quoting the
+CLI's output. It checks every `command` an OpenCode profile names, a wrapper
+that profiles of another provider also name included: that command then has
+to pass each provider's check. The profile's fields map as follows:
+
+- `model` is `provider/model`, for example `openai/gpt-5.6-luna`, and carries
+  no `#variant` suffix of its own.
+- `effort`, when set, is sent as the model's `#<variant>` suffix
+  (`-m openai/gpt-5.6-luna#high`); OpenCode 2 has no `--variant` flag. An
+  effort the model does not offer makes OpenCode exit 1.
+- `options.output_format` must be `default` (the final assistant text on
+  stdout, tool traces on stderr), and `options.auto_approve: true` adds
+  `--auto`.
+- `extra_args` are appended after the adapter's own flags.
+
+The prompt travels on stdin, never in argv: OpenCode 2 duplicates or
+re-quotes a message given in argv, and reads one that starts with `-` as a
+flag. A CLI that exits 0 without having read the whole prompt from its
+stdin is reported as a failed run, not read as an answer.
+`--standalone` is always passed, so the agent runs on a private server that
+is the CLI's own child rather than on a shared background service whose
+tools would outlive the invocation:
+
+```text
+opencode run --standalone -m <provider/model>[#<effort>] --format default
+   [--auto] [extra_args]                                  (prompt on stdin)
+```
 
 ### Pi profiles
 

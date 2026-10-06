@@ -57,6 +57,10 @@ HEALTHY_GITHUB = {
 
 # What a recent enough `gh --version` prints (first line).
 GH_VERSION_LINE = "gh version 2.48.0 (2024-04-09)"
+# What `opencode --version` prints on a supported CLI (#186).
+OPENCODE_VERSION_LINE = "opencode v2.0.23"
+# The OpenCode commands the configs below name.
+OPENCODE_COMMANDS = ("opencode", "epic-oc")
 
 
 def _runner_factory(
@@ -66,10 +70,14 @@ def _runner_factory(
     default_branch="main",
     calls=None,
     gh_version=GH_VERSION_LINE,
+    opencode_version=OPENCODE_VERSION_LINE,
+    opencode_code=0,
 ):
     """Fake runner. ``github`` maps a `gh api` endpoint to its JSON payload, or to
     an ``(exit_code, stderr)`` pair for a failed read; ``--paginate --slurp``
-    listings are wrapped in one page the way `gh` does."""
+    listings are wrapped in one page the way `gh` does. ``opencode_version``
+    is what an OpenCode command's ``--version`` prints (``None``: the binary
+    is missing), with exit status ``opencode_code``."""
     responses = dict(HEALTHY_GITHUB)
     responses.update(github or {})
 
@@ -100,6 +108,12 @@ def _runner_factory(
             out = json.dumps([payload] if paginated else payload)
         elif argv == ["gh", "--version"]:
             out = gh_version + "\nhttps://github.com/cli/cli/releases/tag/v2.48.0"
+        elif argv[0] in OPENCODE_COMMANDS and argv[1:] == ["--version"]:
+            if opencode_version is None:
+                raise FileNotFoundError(2, "No such file or directory", argv[0])
+            return ExecutionResult(
+                argv, req.cwd, opencode_code, opencode_version + "\n", "", "t", "t"
+            )
         else:
             out = f"{argv[0]} version 1.0"
         return ExecutionResult(argv, req.cwd, 0, out + "\n", "", "t", "t")
@@ -669,6 +683,76 @@ def _pi_doctor(tmp_path, profile=None, **kwargs):
     return {r.name: r for r in results}
 
 
+OPENCODE_LABEL = (
+    "agent 'opencode' available (review_round_1, review_round_2_5, review_round_6_plus, "
+    "replan_reexecute, update_epic)"
+)
+
+
+def _opencode_row(tmp_path, **kwargs):
+    d = Doctor(cwd=str(tmp_path), runner=_runner_factory(**kwargs))
+    results = d.run_all()
+    for r in results:
+        assert PLANTED not in r.name and PLANTED not in r.detail, r
+    return {r.name: r for r in results}[OPENCODE_LABEL]
+
+
+@pytest.mark.parametrize(
+    ("version", "shown"),
+    [
+        ("opencode v2.0.23", "opencode 2.0.23"),
+        ("opencode v2.0.0", "opencode 2.0.0"),
+        ("v2.1.0", "opencode 2.1.0"),
+        ("2.0.23", "opencode 2.0.23"),
+        ("opencode v3.0.0", "opencode 3.0.0"),
+    ],
+)
+def test_opencode_at_or_above_the_minimum_passes(tmp_path, version, shown):
+    row = _opencode_row(tmp_path, opencode_version=version)
+    assert row.ok and row.detail == shown
+
+
+@pytest.mark.parametrize("version", ["1.18.34", "opencode v1.99.0", "opencode v2.0.0-beta.1"])
+def test_opencode_below_the_minimum_fails_and_names_it(tmp_path, version):
+    row = _opencode_row(tmp_path, opencode_version=version)
+    assert not row.ok and "opencode >= 2.0.0 is required" in row.detail
+
+
+def test_an_opencode_1x_names_the_release_it_found(tmp_path):
+    row = _opencode_row(tmp_path, opencode_version="1.18.34")
+    assert row.detail.startswith("opencode 1.18.34: ")
+
+
+@pytest.mark.parametrize("version", ["", "opencode", "opencode v2.0", "opencode version 1.0"])
+def test_an_unreadable_opencode_version_fails_rather_than_passes(tmp_path, version):
+    row = _opencode_row(tmp_path, opencode_version=version)
+    assert not row.ok and "cannot read the opencode version" in row.detail
+
+
+@pytest.mark.parametrize(
+    "version", [f"token {PLANTED}", f"opencode v2.0.23\nOPENAI_API_KEY={PLANTED}", PLANTED]
+)
+def test_an_unreadable_opencode_version_is_not_quoted(tmp_path, version):
+    # `_opencode_row` asserts PLANTED is absent from every row.
+    row = _opencode_row(tmp_path, opencode_version=version)
+    assert not row.ok and "output not shown" in row.detail and ">= 2.0.0" in row.detail
+
+
+def test_an_opencode_pre_release_suffix_is_not_quoted(tmp_path):
+    row = _opencode_row(tmp_path, opencode_version=f"opencode v2.0.0-{PLANTED}")
+    assert not row.ok and row.detail.startswith("opencode 2.0.0 (pre-release): ")
+
+
+def test_a_failing_opencode_version_does_not_quote_its_output(tmp_path):
+    row = _opencode_row(tmp_path, opencode_version=PLANTED, opencode_code=3)
+    assert not row.ok and "exited 3" in row.detail and "output not shown" in row.detail
+
+
+def test_a_missing_opencode_fails(tmp_path):
+    row = _opencode_row(tmp_path, opencode_version=None)
+    assert not row.ok and "FileNotFoundError" in row.detail
+
+
 def test_remote_rows_name_only_the_reachable_clis(tmp_path):
     """A REMOTE run routed entirely through OpenCode never needs `claude`."""
     oc = {"provider": "opencode", "model": "openai/gpt-5.6-luna"}
@@ -910,6 +994,39 @@ def test_pi_profiles_sharing_a_model_share_one_probe(tmp_path):
     results = {r.name: r for r in d.run_all()}
     assert results["agent 'pi' auth ready (review_round_2_5, review_round_6_plus)"].ok
     assert [r.command[1] for r in requests] == ["--version", "auth"]
+
+
+@pytest.mark.parametrize(("version", "opencode_ok"), [("1.18.34", False), ("2.0.23", True)])
+def test_a_command_shared_by_pi_and_opencode_must_pass_both_floors(tmp_path, version, opencode_ok):
+    """The PR #188 review: a wrapper that a Pi and an OpenCode profile both
+    name is launched by both adapters, so it gets both providers' checks,
+    each labelled with its own profiles; Pi's floor passing does not stand
+    in for OpenCode's."""
+    wrapper = {"command": "agent-wrapper"}
+    config = _write_config(
+        tmp_path, {"review_round_1": wrapper, "review_round_2_5": _pi_profile(**wrapper)}
+    )
+    base = _runner_factory()
+    probes = []
+
+    def runner(req):
+        argv = req.command
+        if argv[0] != "agent-wrapper":
+            return base(req)
+        probes.append(argv[1])
+        out = version if argv[1:] == ["--version"] else OAUTH_READY
+        return ExecutionResult(argv, req.cwd, 0, out + "\n", "", "t", "t")
+
+    d = Doctor(config_path=config, cwd=str(tmp_path), runner=runner)
+    results = {r.name: r for r in d.run_all()}
+    pi_row = results["agent 'agent-wrapper' available (review_round_2_5)"]
+    assert pi_row.ok and pi_row.detail == f"pi {version}"
+    assert results["agent 'agent-wrapper' auth ready (review_round_2_5)"].ok
+    opencode_row = results["agent 'agent-wrapper' available (review_round_1)"]
+    assert opencode_row.ok is opencode_ok
+    if not opencode_ok:
+        assert "opencode >= 2.0.0 is required" in opencode_row.detail
+    assert sorted(probes) == ["--version", "--version", "auth"]
 
 
 def test_local_doctor_checks_a_pi_reviewer(tmp_path):
