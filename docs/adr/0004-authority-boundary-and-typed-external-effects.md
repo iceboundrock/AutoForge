@@ -108,6 +108,9 @@ repository-defined validation commands and to pre-merge commands.
 - **Entry observation:** the remote values a phase's effects will take as
   their preconditions. The controller observes them before the phase's
   first agent launch and persists them with that launch's charge (§2.4).
+- **Completion context:** the validated result data and entry values a
+  phase applies after its effects are observed. It is saved with the effect
+  plan, and recovery finishes the phase from it (D4.6).
 - **Logical isolation:** what AutoForge *hands* a child process: its
   environment and configuration (#165).
 - **Outer sandbox:** what a child can *reach* when it tries (Wave 2A, #166).
@@ -308,6 +311,12 @@ The record is written through the existing atomic persistence and validated
 on load like every persisted field. A corrupt or incomplete record fails
 loudly and is never replaced by defaults.
 
+A record holds what one write needs, and nothing the phase does after its
+writes. The result data the consuming phase applies once its effects are
+observed, such as a review's verdict and findings or `UPDATE_EPIC`'s roadmap
+section and next-issue selection, is the phase's completion context (D4.6).
+That context is saved with the plan.
+
 **D2.3 (#160).** The stage values form a closed set:
 
 | Stage | Meaning |
@@ -320,18 +329,22 @@ loudly and is never replaced by defaults.
 Only `observed` lets the consuming phase advance.
 
 **D2.4 (#160).** A record's lifetime is one phase entry. The atomic save that
-commits the consuming state drops the phase's records in the same write that
-folds their observed results into the existing state fields. That save is
-the phase transition, or `VERIFIED` for `REPLAN_REEXECUTE`. State therefore
-holds at most one phase's records. Each record is bounded as follows:
+commits the consuming state drops the phase's records and its completion
+context (D4.6) in the same write that folds their observed results and the
+context's data into the existing state fields. That save is the phase
+transition, or `VERIFIED` for `REPLAN_REEXECUTE`. A re-request (D4.7) happens
+inside the phase entry and keeps both. State therefore holds at most one
+phase's records and one completion context. Each record is bounded as
+follows:
 
 - **Count.** The largest plan is `FIX`: one push plus at most one follow-up
   effect per open finding (`MAX_FINDINGS_PER_REVIEW = 50`).
 - **Payload.** The payload of each field is bounded by GitHub's limit for
   that field. That limit is 65,536 characters for a body or comment at the
   time of writing; #160 re-checks it against the live API.
-- **Total.** #160 fixes a total payload bound that keeps the state file far
-  below `MAX_STATE_FILE_BYTES`.
+- **Total.** #160 fixes a total bound, over the payloads and the completion
+  context together, that keeps the state file far below
+  `MAX_STATE_FILE_BYTES`.
 
 Only bounded, redacted values are persisted, and no credential, header or
 environment value is ever stored.
@@ -362,7 +375,8 @@ and keeps a later phase's recovery free of earlier phases' records.
    bounded text and structured data.
 2. **Intent.** The controller turns validated content into *effect intents*.
    It persists all of a phase's intents in one atomic save (the effect plan)
-   before the first write.
+   before the first write. The same save persists the phase's completion
+   context (D4.6).
 3. **Execution.** Each intent is executed as one write.
 4. **Observation.** The *observed result* is what the read-back returns.
 
@@ -428,7 +442,8 @@ effects will need as preconditions:
 It persists them in the same save that charges the launch (the existing
 `attempt` save). Values already persisted are reused, not copied: the review
 binding, and the replan `PREPARED` checkpoint. #160 persists the observation
-in a kind-neutral shape, so #161–#164 add no persisted field.
+in a kind-neutral shape, and defines every phase's completion context
+(D4.6), so #161–#164 add no persisted field.
 
 When the agent returns, ADR 0002 guarantees that nothing it started still
 runs. The precondition read made before the intents are persisted therefore
@@ -446,21 +461,160 @@ published, and §2.9 applies to it.
 
 A listing that cannot be read to the end is `BLOCKED`, as today.
 
+**D4.6 (#160).** **The completion context.** Once its effects are observed,
+a phase still has work to do: `_apply_review` consumes the round and applies
+the replan policy, `_apply_fix` records the resolutions, and
+`_apply_update_epic` writes the roadmap section and switches issues. That
+work reads validated result data, and entry values the result was checked
+against. Neither is in an effect record, and the rendered payloads do not
+carry them all. A K8 payload, for example, is the progress text and the
+marker only: two results with the same progress text but different roadmap
+sections or next issues publish byte-identical comments. The controller
+therefore persists a **completion context** in the same atomic save as the
+effect plan (D3.1). Its properties:
+
+- **Phase-bound.** It names its phase, the run's issue, and, where they
+  exist, the PR, the review round (`REVIEW`, `FIX`) and the replan
+  transaction id. On load, a context whose binding differs from the state
+  it is loaded with is corrupt. It is never carried into another phase,
+  because the save that commits the phase drops it (D2.4).
+- **Closed and strictly validated.** #160 defines one closed schema per
+  phase in its one protocol bump (D13.1). On load, an unknown key, a
+  missing key or a wrong type is refused. Every value is validated again
+  under the rules the parser applied to the field it came from:
+  - text bounds and control characters;
+  - the finding-id shape and round;
+  - `needs_fix_round == (findings > 0)`;
+  - one resolution per open finding;
+  - the shape of an issue URL.
+
+  A context that fails is corrupt (`StateError`). It is never defaulted and
+  never repaired from GitHub.
+- **Bounded.** Each value keeps its field's parser bound
+  (`MAX_FINDINGS_PER_REVIEW`, `MAX_RESOLUTIONS_PER_FIX`,
+  `MAX_ROADMAP_SECTION_CHARS` and the per-field caps). The whole context
+  counts toward D2.4's total bound.
+- **Stored as the uninterrupted path stores it.** Published text is
+  redaction-invariant (D8.3). Text that is not published, a `FIX`
+  rationale, is stored redacted, as `last_fix_resolutions` is today. A
+  completion after a crash therefore persists exactly what an uninterrupted
+  completion persists.
+- **The only source.** Recovery reads the context and the records. It never
+  parses a rendered payload or a remote object's Markdown, and it never
+  reads `events.jsonl` or the run log.
+- **Saved even with an empty plan.** A `FIX` that pushes and defers nothing,
+  or a legacy `UPDATE_EPIC` whose progress comment was adopted (D13.7),
+  still saves its context before it completes. The context, not a record,
+  is what makes resume journal-first.
+
+What each phase's context holds. The entry values already in state are
+referenced, not copied (D4.4):
+
+| Phase | Validated result data | Entry values the completion checks against |
+|---|---|---|
+| `ANALYZE_EXECUTE` | none: the PR, HEAD, base and branch that completion persists are K1's and K2's or K3's observed results | the entry observation |
+| `REVIEW` | the round, `needs_fix_round` and the structured findings, in result order | the review binding in state (PR, HEAD, base ref, merge base) |
+| `FIX` | one resolution per open finding: the finding id, the resolution, the rationale and the reported `commit_sha`. A deferred finding names the plan position of the K5 or K6 effect that carries its marker, and never a URL | the reviewed HEAD the fix started from (`current_head_sha`), `open_findings`, and the follow-ups handed over at entry |
+| `REPLAN_REEXECUTE` | the validated `historical_findings_considered` and `unique_failure_constraints` that the K7 marker renders | the `PREPARED` checkpoint |
+| `UPDATE_EPIC` | the roadmap section when one is required, or none (a section that is not required is ignored, as today); the selection, either `null` (the EPIC is complete) or the validated next-issue URL | two SHA-256 digests of the EPIC body outside the roadmap markers: as the entry read before the result's launch saw it (today an in-memory value, `_epic_roadmap_at_entry`), and as the splice of the context's section into that body leaves it |
+
+How each phase completes from its context, once every record is
+`observed`:
+
+- **`ANALYZE_EXECUTE`** persists the PR, HEAD, base and branch from the
+  observed results, as `_apply_analyze` does today.
+- **`REVIEW`** runs `_apply_review`'s post-review re-read, round
+  consumption, carry-forward, stagnation check and replan policy on the
+  context's verdict and findings. The comment's URL is K4's observed result.
+- **`FIX`** folds the resolutions into `last_fix_resolutions`. Each
+  follow-up URL is the observed result of the effect the resolution names.
+  The new HEAD is K1's observed result, or the reviewed HEAD when the plan
+  pushes nothing.
+- **`REPLAN_REEXECUTE`** binds the replacement under the existing
+  predicates. It compares the marker's attestation with the context, not
+  with the agent's stdout. Supersede and activation then run from the
+  transaction journal, unchanged.
+- **`UPDATE_EPIC`** runs the roadmap splice (D5.4), and then the
+  next-issue verification, on the context's section and selection. Whether
+  a section is required is decided before the plan, from the existing rule
+  (merges pending, and an update due or the EPIC complete). A missing
+  required section is refused through the correction path, before any
+  effect. The splice reads the body and compares its outside bytes with the
+  two digests. The digests differ only when the splice appends a new
+  section:
+  - equal to either: the splice proceeds as today. A body that already
+    carries the section is not written again, so a splice that landed
+    before a crash is never written twice;
+  - equal to neither, before the write or on its read-back: the body
+    changed outside the markers since the agent composed against it. As
+    today, it is not written over, and the section is re-requested (D4.7).
+
+  A read-back that shows another section is not a rejection of the input:
+  `resume` runs the splice again from the context. The merge counter is
+  reset only after the read-back, as today.
+
+**D4.7 (#160).** **Re-requests after publication.** A phase's publication is
+complete once every record in its plan is `observed`. An `observed` record
+is terminal: no step reconciles it into another write. A controller step
+after publication can still reject an input of the context. In Wave 1, two
+existing rejections in `UPDATE_EPIC` do:
+
+- the next-issue verification (bounded re-selection);
+- the roadmap splice, on a body changed outside the markers (D4.6).
+
+Either can lead to a new agent launch, a **re-request**. A re-request is not
+recovery, and these rules keep the two apart:
+
+- **It starts only from a persisted rejection.** The save that records the
+  rejection also voids the rejected input in the context, and keeps every
+  `observed` record. A selection's rejection is also recorded, as today, in
+  `next_issue_rejections`. A re-request launches only when the context
+  names a void input and every record of the plan is `observed`. A crash,
+  an `intended` or `attempted` record, or a missing value never launches
+  one: recovery finishes from what is persisted (D4.6).
+- **It asks only for the void input.** Its prompt names the published
+  objects as done, and its result is validated against a re-request schema:
+  - a selection re-request carries the selection, plus a roadmap section
+    whenever merges are still pending, because a `null` selection can make
+    one due;
+  - a roadmap re-request carries the section.
+
+  A re-request result never carries progress text, findings or
+  resolutions. A field outside its schema is refused through the
+  correction path, so a re-request cannot plan an effect.
+- **It republishes nothing.** The validated inputs replace the void ones in
+  the context in one atomic save, and the controller step runs again from
+  there. When the re-request's result carries a roadmap section, the same
+  save replaces both digests, computed from the body read before its
+  launch.
+- **It keeps the existing bounds.** A rejected selection counts against
+  `MAX_NEXT_ISSUE_SELECTIONS`, and reaching it is `BLOCKED` with nothing
+  switched, as today. Which verification outcomes count as a rejection is
+  unchanged. Both re-requests are made, as today, only on the operator's
+  `resume`. A re-request whose result was never saved is made again under
+  the existing attempt accounting.
+- **No other phase re-requests.** `ANALYZE_EXECUTE`, `REVIEW`, `FIX` and
+  `REPLAN_REEXECUTE` complete from their context or block. None asks the
+  agent again after its effects are observed.
+
 **The crash windows,** common to every kind. §2.5 gives each kind's
 concrete reads.
 
 | Window | Record on disk | Resolution |
 |---|---|---|
-| **W1** before the intent is persisted | none | Nothing was published: no write is issued before `attempted` is saved. The step re-runs. The result was never persisted, so the agent is relaunched under the existing attempt accounting, and its local commit is still in the worktree. Entry reconciliation runs first, and any phase identity that differs from the entry observation is unexplained (§2.9). |
+| **W1** before the plan and context are persisted | none | Nothing was published: no write is issued before `attempted` is saved. The step re-runs. Neither the result nor its context was persisted, so the agent is relaunched under the existing attempt accounting, and its local commit is still in the worktree. Entry reconciliation runs first, and any phase identity that differs from the entry observation is unexplained (§2.9). |
 | **W2** intent persisted, write not issued | `intended` | Reconcile (D4.2). Intended end state: `observed`. Precondition holds: save `attempted`, then issue once. A body append whose target body changed is rebased in that same save (D5.5). Otherwise `BLOCKED`, naming the object. |
 | **W3** write issued, outcome unknown | `attempted` | Reconcile by identity before anything else. Intended end state: `observed`. Precondition still holds and fewer than 2 issues made: save the incremented count, then re-issue. Bound exhausted: `BLOCKED`, naming the effect and the manual step. Otherwise `BLOCKED`. |
-| **W4** write landed, state not saved | `attempted` | The W3 reconciliation finds the intended end state: `observed`, with no second write. |
+| **W4** write landed, state not saved | `attempted` | The W3 reconciliation finds the intended end state: `observed`, with no second write. Once every record of the plan is `observed`, the phase completes from its context (D4.6). |
 | **W5** read-back mismatch | `attempted` → `conflict` | The identity resolves to an object whose target, payload or state differs, or to two objects. The record becomes `conflict`, which is `BLOCKED` naming every object found. Never repaired in place, never duplicated. |
 
 Two rules apply in every window:
 
-- A record never makes the controller relaunch the agent. A phase with
-  effect records completes from the records (journal-first resume).
+- A record or a completion context never makes the controller relaunch the
+  agent. A phase whose plan and context are saved completes from them
+  (journal-first resume, D4.6). The one later launch a phase may make is a
+  re-request (D4.7), which starts from a persisted rejection, never from a
+  crash.
 - Dry-run executes no effect and runs no network git. Its plan names the
   effects it would perform and any recorded effect it would reconcile.
 
@@ -468,6 +622,17 @@ Two rules apply in every window:
 attempt count, reconcile before retry), made common to every kind. Without
 the entry observation, a value the agent changed during its run would become
 the precondition and be adopted as the baseline.
+
+The completion context (D4.6) is what makes journal-first resume complete.
+The effect records prove what was published, but the consuming phase also
+needs what was decided. A roadmap section, a next-issue selection, a review
+verdict or a resolution is not recoverable from the published bytes: K8
+renders none of the first two, and a rendering is not a schema. Saving the
+context with the plan makes the decision exactly as durable as the writes
+it leads to. A re-request (D4.7) keeps the two existing reasons to ask the
+agent again, a rejected selection and a roadmap section composed against a
+body that has since changed, without turning a crash into a second agent
+decision.
 
 *Rejected.*
 
@@ -479,6 +644,22 @@ the precondition and be adopted as the baseline.
 - **Reading the event journal for recovery.** It is audit-only by contract.
 - **An outbox table, queue or worker.** This is a single process under a
   local lock; the effects run inside the existing step.
+- **Recovering completion inputs from the published objects.** A review
+  comment's findings or a progress comment would have to be parsed back from
+  Markdown. A rendering is not a schema, a template can change across an
+  upgrade (D8.4), and K8's payload holds neither the roadmap section nor the
+  selection at all.
+- **Persisting the raw `CONTROL_RESULT` and parsing it again on recovery.**
+  A parser changed by an upgrade would judge again a result whose effects
+  had already landed, and the raw result carries unbounded and target-naming
+  fields that the context leaves out.
+- **Putting the result data into the effect records.** The data belongs to
+  the phase, not to one write: `FIX`'s resolutions span several effects, and
+  a plan with no records still needs it.
+- **Relaunching the agent to regenerate the inputs.** A new result can
+  disagree with what was already published, for example the same progress
+  comment followed by another roadmap section or next issue, and a review
+  comment whose findings no longer match the round's verdict.
 
 ### 2.5 The closed Wave 1 effect-kind set (item 5)
 
@@ -602,7 +783,9 @@ protocol bump; this is why the set is closed now.
   round's marker at the bound revision, and its body equals the payload.
   Its URL is persisted as `last_review_comment_url`, the #80 handoff. Then
   `_apply_review`'s post-review re-read runs unchanged: stale detection,
-  round consumption and carry-forward.
+  round consumption and carry-forward. It runs on the completion context's
+  round, verdict and structured findings (D4.6), never on the comment's
+  text.
 - **Windows:** the generic ones. A second matching comment is `BLOCKED`,
   naming both.
 
@@ -692,8 +875,14 @@ protocol bump; this is why the set is closed now.
 - **Payload:** the agent's validated progress text followed by the marker.
 - **Completion read-back:** exactly one comment carries the marker (the
   existing `exactly_one`), and its body equals the payload. The roadmap
-  splice, the `next_issue_url` verification and EPIC batching are unchanged.
+  splice, the `next_issue_url` verification and EPIC batching are unchanged,
+  and take their inputs from the completion context (D4.6). The comment
+  carries neither the section nor the selection, so two results with the
+  same progress text publish the same comment and still complete
+  differently, each from its own context.
 - **Windows:** the generic ones. Two comments block before launch, as today.
+  A rejected selection or roadmap section is re-requested (D4.7). The
+  `observed` comment is never posted again.
 
 **D5.2 (#160).** **Correcting a controller-authored object in place is not a
 kind.** Every payload is rendered from persisted bytes (D8.4), so the
@@ -1141,8 +1330,9 @@ covers only the `ai-` prefix.
 **D8.4 (#160).** **A phase persists the rendered payload.** It does not
 re-render on recovery. The exact bytes to publish are stored in the effect
 record (D2.2). A write that landed while the state save did not then
-completes without relaunching the agent, and the read-back compares against
-the stored bytes. A body append (K3, K6) persists its rendered block once.
+completes without relaunching the agent: the read-back compares against the
+stored bytes, and the phase's remaining work reads its completion context
+(D4.6). A body append (K3, K6) persists its rendered block once.
 If the body it was composed over changes before any write is issued, the
 controller composes the persisted block onto the new body and checkpoints
 that payload before issuing it (D5.5). Nothing is re-rendered from a
@@ -1433,6 +1623,8 @@ This record names modules, not classes or functions.
 - **D12.1 (#160) Effect records and pure verifiers** live in a new module in
   the engine layer. It holds:
   - the record type and its validation on load;
+  - the per-phase completion context types and their validation on load
+    (D4.6);
   - the stage rules;
   - reconciliation decisions as pure functions of (record, observed remote
     values).
@@ -1469,7 +1661,7 @@ This record names modules, not classes or functions.
   replan side. The wiring is:
   - pre-launch fetches;
   - the entry observation;
-  - the effect plan;
+  - the effect plan and the completion context;
   - the read-back;
   - dry-run plan text.
 
@@ -1519,12 +1711,13 @@ loads with three settings:
 
 - no effect records;
 - no entry observation;
+- no completion context;
 - if `attempt >= 1`, its in-flight launch labelled as launched under the
   *agent-publishing* contract.
 
 That is exactly what the previous version meant, so nothing is inferred
-from GitHub and nothing is rebound. LOCAL state that carries effect records
-or an entry observation is refused as corrupt.
+from GitHub and nothing is rebound. LOCAL state that carries effect records,
+an entry observation or a completion context is refused as corrupt.
 
 **D13.3 (#160).** **The launch label and the one-shot legacy re-entry.**
 
@@ -1563,7 +1756,10 @@ is.
   - Exactly one legacy progress comment is adopted as the phase's observed
     progress comment, named in the step message and the run log.
   - The agent is relaunched under the new prompt for the roadmap section and
-    the next issue only. Its progress text is not published.
+    the next issue only, with D4.7's selection re-request schema. Its
+    result carries no progress text, so nothing of it is published as a
+    comment. The validated result is saved as the completion context, with
+    no record, and the phase completes from it (D4.6).
   - Two comments: the existing refusal.
 - **D13.8 (#164) `REPLAN_REEXECUTE` at `PREPARED`.**
   - A replacement found by the transaction marker above the watermark is
@@ -1610,7 +1806,8 @@ is.
 - **ADR 0002:** every controller git process, network operations included,
   runs through the executor, and nothing it starts outlives it.
 - **The event journal (`events.jsonl`) stays audit-only.** An effect
-  transition may append a line, but no recovery path reads it.
+  transition may append a line, but no recovery path reads it. Completion
+  inputs come from the completion context only (D4.6).
 - **State and logs stay bounded and redacted.** Effect records are bounded
   (D2.4). The published payload is redaction-invariant (D8.3), and record
   errors are redacted within `MAX_GROWTH_FACTOR`.
@@ -1625,8 +1822,8 @@ is.
 ## 4. Composition with other decisions
 
 - **ADR 0001 (LOCAL workspace boundary).** Unchanged. LOCAL has no effects,
-  no entry observation and no read context, and its state is refused if it
-  carries them. LOCAL agents receive #165's environment policy, which the
+  no entry observation, no completion context and no read context, and its
+  state is refused if it carries them. LOCAL agents receive #165's environment policy, which the
   LOCAL run contract does not record, so the contract is unchanged.
 - **ADR 0002 (executor).** Unchanged, and relied on. Controller git runs
   through the executor. The entry observation (D4.4) is a sound launch fence
@@ -1666,7 +1863,7 @@ mechanisms are unchanged and has no child.
 
 | Child | Decisions |
 |---|---|
-| #160 | D2.1–D2.4, D3.1, D4.1–D4.5, D5.1, D5.2, D5.5, D6.1–D6.4, D7.1–D7.5, D8.1–D8.5, D9.1–D9.3, D9.7, D12.1–D12.5, D13.1–D13.3, D13.7; the K8 wiring |
+| #160 | D2.1–D2.4, D3.1, D4.1–D4.7, D5.1, D5.2, D5.5, D6.1–D6.4, D7.1–D7.5, D8.1–D8.5, D9.1–D9.3, D9.7, D12.1–D12.5, D13.1–D13.3, D13.7; the K8 wiring |
 | #161 | D9.4, D13.4; the K1, K2 and K3 wiring; the D1.2 rows it owns |
 | #162 | D8.6, D9.6, D13.5; the K4 wiring; the D1.2 rows it owns |
 | #163 | D5.3, D9.5, D13.6; the K1, K5 and K6 wiring; the D1.2 rows it owns |
@@ -1694,6 +1891,42 @@ interrupts the step after each persisted stage and resumes.
 
 In addition:
 
+- **Completion context and journal-first resume (D4.6, D4.7), phase level.**
+  Each test saves the plan and the context, crashes in W2, in W3 (the write
+  landed, and it did not) and in W4, and resumes. It asserts that no agent
+  is launched, and that the consuming state equals an uninterrupted run's.
+  - **#160 (`UPDATE_EPIC`).**
+    - Two validated results have the same progress text, so their K8
+      payloads are byte-identical. One carries roadmap section R1 and next
+      issue A; the other carries section R2 and `null`. After each window,
+      resume splices exactly its own context's section, then switches to A
+      or finishes the EPIC, and never posts a second comment.
+    - A crash after an appending splice landed completes with no second
+      body write.
+    - A body edited outside the markers voids the section, which is
+      re-requested.
+    - A rejected selection keeps K8 `observed`, and its re-request asks only
+      for the selection (and the section while merges are pending). A
+      progress text in the re-request's result is refused, and reaching
+      `MAX_NEXT_ISSUE_SELECTIONS` blocks with nothing switched.
+    - A crash after the rejection save launches the re-request again,
+      never a full relaunch, and a crash with any record not yet `observed`
+      launches nothing.
+  - **#162 (`REVIEW`).** The round completes from the context's verdict and
+    structured findings. `open_findings`, `prior_findings` on the stale
+    path, `review_history`, the replan policy decision and the `FIX`
+    handoff all equal an uninterrupted run's, and no step parses the
+    comment.
+  - **#163 (`FIX`).** `last_fix_resolutions` equals the context's
+    resolutions, each follow-up URL taken from the observed result of the
+    effect it names. Two findings deferred to one existing issue both map
+    to that issue's K6. The new HEAD is K1's observed result, or the
+    reviewed HEAD with no push.
+  - **#161 (`ANALYZE_EXECUTE`).** The PR, HEAD, base and branch come from
+    the observed results of K1 and K2, or K1 and K3.
+  - **#164 (`REPLAN_REEXECUTE`).** Binding compares the attestation with
+    the context's counts, and a mismatch is a rejection through the
+    transaction's existing path.
 - **Object interpretation (#160, D7.5).** Each case plants one of a
   replacement ref, a graft entry, a shallow entry or a forged commit-graph,
   for the candidate, a commit of its range or the base:
@@ -1733,9 +1966,13 @@ In addition:
   - #160 tests the policy itself.
   - Each phase child tests its own fields.
 - **State (#160):**
-  - records round-trip;
+  - records and completion contexts round-trip;
   - corrupt records fail loudly;
-  - LOCAL state with records or an entry observation is refused;
+  - a context that is corrupt, out of bounds, carries an unknown key, or is
+    bound to another phase, issue, PR, round or transaction fails loudly;
+  - the transition save drops the records and the context together;
+  - LOCAL state with records, an entry observation or a completion context
+    is refused;
   - a previous-protocol file loads under D13.2;
   - each legacy re-entry outcome is tested, by its owner (D13.4–D13.8).
 
