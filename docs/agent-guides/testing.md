@@ -101,6 +101,12 @@ High-priority coverage includes:
 - a path that exists but is not a worktree root of this repository, or a
   location inside the operator's working tree, is refused, not adopted
 - a dry run creates no worktree and runs no git
+- worktree creation, its identity and registry reads, and the workspace
+  reader are hardened (ADR 0004 D7.3): a planted `post-checkout` or
+  `reference-transaction` hook (in `hooks/` or a configured `core.hooksPath`)
+  and a configured `core.fsmonitor` do not run, a filter driver sees no
+  token and no operator `GIT_*`, and an operator `GIT_DIR` redirects neither
+  the worktree, the workspace reads nor the lock
 - the agent request and the run log carry the configured allow-list; pre-merge
   and validation commands run under the same one
 - HEAD or branch of the operator's checkout changing while the agent ran
@@ -137,7 +143,12 @@ High-priority coverage includes:
 - resume without duplicating work
 - the `UPDATE_EPIC` progress comment across every crash window of the
   effect lifecycle (`test_k8_*` in `tests/test_engine.py`), the one-shot
-  legacy re-entry (D13.7), and an unjournaled comment blocking (D9.7)
+  legacy re-entry (D13.7) including a crash after its adoption was saved,
+  and an unjournaled comment blocking (D9.7)
+- an `UPDATE_EPIC` completion context persisted with an empty plan and no
+  adopted comment (or a plan beside an adoption, or no entry observation)
+  is refused on load, with nothing published, and completion without a
+  posted or adopted comment writes no roadmap and switches no issue
 - dry-run executing no effect: the `UPDATE_EPIC` plan is built with a
   GitHub client that fails the test on any use
 

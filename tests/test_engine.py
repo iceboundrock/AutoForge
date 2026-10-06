@@ -26,7 +26,7 @@ from autoforge.errors import (
     VerificationError,
 )
 from autoforge.executor import ExecutionResult, execute
-from autoforge.git_transport import GitRemote
+from autoforge.git_transport import LOCAL_GIT_ENV_ALLOWLIST, LOCAL_GIT_SWITCHES, GitRemote
 from autoforge.github import (
     ChangedFile,
     CheckInfo,
@@ -5248,6 +5248,74 @@ def test_k8_a_stored_progress_text_the_parser_refuses_is_never_posted_on_recover
     _assert_nothing_published_and_left_unchanged(eng, fake_github, before)
 
 
+def _empty_the_plan(data: dict) -> None:
+    data["effect_records"] = []
+
+
+def _empty_the_plan_and_observation(data: dict) -> None:
+    data["effect_records"] = []
+    data["entry_observation"] = {}
+
+
+def _empty_the_plan_and_its_marker(data: dict) -> None:
+    data["effect_records"] = []
+    data["entry_observation"]["objects"] = {}
+
+
+def _adopt_beside_the_plan(data: dict) -> None:
+    data["entry_observation"]["objects"] = {
+        render_progress_marker(ISSUE, PR): comment_url(EPIC, 300)
+    }
+
+
+@pytest.mark.parametrize(
+    ("corrupt", "needle"),
+    [
+        (_empty_the_plan, "must be saved with the one progress-comment record of its marker"),
+        (_empty_the_plan_and_observation, "is persisted without the entry observation"),
+        (_empty_the_plan_and_its_marker, "does not record its progress marker"),
+        (_adopt_beside_the_plan, "plans a progress comment beside the adopted"),
+    ],
+)
+def test_k8_a_plan_that_does_not_match_its_entry_is_refused_before_any_write(
+    tmp_state_dir, fake_github, corrupt, needle
+):
+    """The record is ``intended`` and the file is then edited so that the plan
+    is explicitly empty (``effect_records: []``), or plans the comment beside an
+    adoption. Accepted, an empty plan reads as "every record observed": the
+    phase would splice the roadmap, switch to DONE and drop the context with
+    no progress comment ever posted. The context is loaded only beside the K8
+    record of its marker or the one legacy comment its entry adopted (D13.7);
+    anything else is refused before any write and the file is left as is."""
+    eng = _in_update_epic_with_body(
+        tmp_state_dir, fake_github, [_epic_result(None)] * 2, _epic_body()
+    )
+    data = _crash_with_the_progress_comment_intended(eng)
+    corrupt(data)
+    eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
+    before = eng.paths.state_file.read_bytes()
+
+    with pytest.raises(StateError, match=needle):
+        eng.load()
+    _assert_nothing_published_and_left_unchanged(eng, fake_github, before)
+    assert fake_github.issues[EPIC].body == _epic_body()
+
+
+def test_k8_completion_with_no_published_comment_writes_no_roadmap_and_switches_nothing(
+    tmp_state_dir, fake_github
+):
+    """The load refuses a context that has neither its K8 record nor an adopted
+    comment. Completion checks again before its own writes: with no posted or
+    adopted comment it raises before the roadmap splice and the issue switch."""
+    eng = _in_update_epic_with_body(tmp_state_dir, fake_github, [_epic_result(None)], _epic_body())
+    eng._published_progress_comment_url = lambda: ""
+    with pytest.raises(StateError, match="no progress comment posted or adopted"):
+        eng.step()
+    assert fake_github.edited_issues == [] and fake_github.issues[EPIC].body == _epic_body()
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.UPDATE_EPIC and s.merged_since_epic_update == 1
+
+
 def test_k8_write_lost_in_flight_is_reconciled_then_issued_once_more(tmp_state_dir, fake_github):
     """Attempt persisted, outcome unknown, and the write did not land: never a blind
     re-send in the same step; the next entry reads, finds nothing, posts once more."""
@@ -5442,6 +5510,36 @@ def test_update_epic_legacy_reentry_adopts_the_agents_comment_and_asks_for_the_s
     s = load_state(eng.paths.state_file)
     assert s.current_issue_url == ISSUE3 and s.protocol_version == "7"
     assert s.effect_records == []  # adopted with no record (D13.7)
+
+
+def test_update_epic_legacy_adoption_saved_with_no_record_completes_on_resume(
+    tmp_state_dir, fake_github
+):
+    """The adopted comment's context is saved with an empty plan beside the
+    entry observation that adopted it, and the process dies before completion.
+    That empty plan is the legitimate one (D13.7): it loads, and the next entry
+    completes from it with nothing posted and no agent relaunched."""
+    fake_github.add_issue(ISSUE3, "Next")
+    eng = _in_update_epic(
+        tmp_state_dir, fake_github, [_epic_reselect(ISSUE3, roadmap_section=ROADMAP)]
+    )
+    _as_protocol_5(eng, attempt=1)
+    post_progress_comment(fake_github)
+    eng.load()
+    eng._complete_update_epic = _crash_on_first_call(eng._complete_update_epic)
+    with pytest.raises(RuntimeError, match="power loss"):
+        eng.step()
+    s = load_state(eng.paths.state_file)
+    assert s.effect_records == [] and s.completion_context["next_issue_url"] == ISSUE3
+    marker = render_progress_marker(ISSUE, PR)
+    assert s.entry_observation["objects"] == {marker: comment_url(EPIC, 300)}
+
+    eng.load()
+    out = eng.step()
+    assert out.next_phase == "ANALYZE_EXECUTE" and "no agent launched" in out.message
+    assert comment_url(EPIC, 300) in out.message
+    assert len(eng.provider.calls) == 1 and _progress_posts(fake_github) == []
+    assert load_state(eng.paths.state_file).current_issue_url == ISSUE3
 
 
 def test_update_epic_legacy_state_before_any_launch_does_not_adopt_a_comment(
@@ -7639,6 +7737,88 @@ def test_remote_agent_runs_in_a_per_issue_worktree_under_the_git_common_dir(
     assert (repo / "uncommitted.txt").exists()
 
 
+@pytest.mark.parametrize("hooks_from", ["hooks-dir", "core.hooksPath"])
+def test_worktree_creation_runs_no_repository_hook_and_holds_no_credential(
+    tmp_state_dir, fake_github, tmp_path_factory, monkeypatch, hooks_from
+):
+    """ADR 0004 D7.3/D7.5 (PR #195 R3-F2): `git worktree add` is a controller process.
+
+    It ran with the controller's whole environment and with the repository's
+    hooks and file-system monitor, all agent-writable: a `post-checkout`
+    hook planted in the shared repository ran on worktree creation holding
+    the controller's GitHub token. Every git process the engine runs to
+    create, identify and reuse the worktree is now hardened like the
+    pre-merge export, and the worktree is still created detached, with no
+    branch.
+    """
+    repo = git_repo(tmp_state_dir.parent)
+    base = _commit(repo, "a.txt", "1", "base")
+    planted = tmp_path_factory.mktemp("planted")
+    hooks = repo / ".git" / "hooks"
+    if hooks_from == "core.hooksPath":
+        hooks = planted / "hooks"
+        _git(repo, "config", "core.hooksPath", str(hooks))
+    hooks.mkdir(exist_ok=True)
+    for hook in ("post-checkout", "reference-transaction"):
+        (hooks / hook).write_text(f'#!/bin/sh\nenv > "{planted}/hook-{hook}"\n')
+        (hooks / hook).chmod(0o755)
+    monitor = planted / "fsmonitor"
+    monitor.write_text(f'#!/bin/sh\nenv > "{planted}/fsmonitor-ran"\n')
+    monitor.chmod(0o755)
+    _git(repo, "config", "core.fsmonitor", str(monitor))
+    # A filter driver is configuration git still runs (D7.3 accepts that):
+    # what it sees is what the checkout's process holds.
+    (repo / ".git" / "info").mkdir(exist_ok=True)
+    (repo / ".git" / "info" / "attributes").write_text("* filter=leak\n")
+    _git(repo, "config", "filter.leak.smudge", f'env > "{planted}/filter-env"; cat')
+    decoy = git_repo(planted / "decoy")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_controllertokenvalue")
+    monkeypatch.setenv("GH_TOKEN", "ghp_controllertokenvalue")
+    monkeypatch.setenv("GIT_DIR", str(decoy / ".git"))
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.hooksPath")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", str(hooks))
+
+    eng = _analyze_with(tmp_state_dir, fake_github, lambda req: None)
+    real = eng._runner
+    requests = []
+
+    def recording(req):
+        requests.append(req)
+        return (real or execute)(req)
+
+    eng._runner = recording
+    assert eng.step().next_phase == "REVIEW"
+    expected = repo / ".git" / "autoforge" / "worktrees" / "2"
+    assert eng._ensure_agent_worktree() == expected  # the reuse path: identity, registry
+    for name in ("GIT_DIR", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"):
+        monkeypatch.delenv(name)
+
+    assert sorted(p.name for p in planted.iterdir()) == ["decoy", "filter-env", "fsmonitor"] + (
+        ["hooks"] if hooks_from == "core.hooksPath" else []
+    ), "a repository hook or the file-system monitor ran"
+    seen = (planted / "filter-env").read_text()
+    assert "ghp_controllertokenvalue" not in seen
+    assert str(decoy) not in seen and "GIT_CONFIG_COUNT" not in seen
+    # Still detached at HEAD, beside an untouched checkout, with no branch made.
+    assert _git(expected, "rev-parse", "HEAD") == base
+    assert _git(expected, "rev-parse", "--abbrev-ref", "HEAD") == "HEAD"
+    assert _git(repo, "rev-parse", "--abbrev-ref", "HEAD") == "main"
+    assert _git(repo, "for-each-ref", "--format=%(refname)", "refs/heads") == "refs/heads/main"
+    assert _git(decoy, "worktree", "list", "--porcelain").count("worktree ") == 1
+
+    run = [r.command[1 + len(LOCAL_GIT_SWITCHES) :] for r in requests if r.command[0] == "git"]
+    assert ["worktree", "add", "--detach", str(expected), "HEAD"] in run
+    assert ["worktree", "list", "--porcelain"] in run
+    assert ["-C", str(expected), "rev-parse", "--show-toplevel", "--git-common-dir"] in run
+    for req in requests:
+        if req.command[0] != "git":
+            continue
+        assert req.command[: 1 + len(LOCAL_GIT_SWITCHES)] == ["git", *LOCAL_GIT_SWITCHES]
+        assert req.env_allowlist == LOCAL_GIT_ENV_ALLOWLIST
+        assert (req.env or {})["GIT_NO_REPLACE_OBJECTS"] == "1"
+
+
 def test_the_issue_worktree_is_reused_across_phases_as_the_agent_left_it(
     tmp_state_dir, fake_github
 ):
@@ -7838,7 +8018,7 @@ def test_the_worktree_registry_read_failing_refuses_reuse(tmp_state_dir, fake_gi
     real = eng._runner
 
     def failing(req):
-        if req.command[:3] == ["git", "worktree", "list"]:
+        if req.command[1 + len(LOCAL_GIT_SWITCHES) :][:2] == ["worktree", "list"]:
             return ExecutionResult(req.command, req.cwd, 128, "", "fatal: cannot read", "t", "t")
         return (real or execute)(req)
 

@@ -511,6 +511,21 @@ them.
   (re-hashed). Fetches write objects only and create or move no ref. The
   pre-merge evidence fetch runs on it, and every git process goes through
   the executor.
+- **Every other controller git process** runs in the operator's repository
+  through `git_transport.local_git_request` (ADR 0004 D7.3, D7.5): the
+  per-issue worktree's `git worktree add` and its identity and registry
+  reads, the workspace reader (`rev-parse`, `symbolic-ref`, `status`), the
+  lock's common-dir read and the pre-merge export. Hooks and the file-system
+  monitor are off at command-line precedence, and so are replacement
+  objects and the commit-graph. The child starts from
+  `LOCAL_GIT_ENV_ALLOWLIST`, with no token and no `GIT_*` variable of the
+  operator's shell, so nothing a hook, monitor or `GIT_CONFIG_*` planted in
+  the shared repository or the shell could start runs with the controller's
+  credential. A filter driver still runs during a checkout or export, with
+  no more authority than the agent. `autoforge doctor` is an operator
+  diagnostic outside any run and keeps its own requests: it runs only
+  `git --version`, `rev-parse --show-toplevel` and `remote get-url`, none
+  of which starts a hook, the monitor or a filter.
 
 ### Published content
 

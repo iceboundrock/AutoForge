@@ -45,7 +45,7 @@ from pathlib import Path
 
 from .errors import GitTransportError, VerificationError
 from .executor import ExecutionRequest, ExecutionResult
-from .git_transport import LOCAL_GIT_ENV_ALLOWLIST, LOCAL_GIT_SWITCHES, GitTransport
+from .git_transport import GitTransport, local_git_request
 from .github import WorkflowRunJobs
 from .redaction import redact
 
@@ -56,22 +56,12 @@ Runner = Callable[[ExecutionRequest], ExecutionResult]
 # index, HEAD, working tree and stash are not read or written.
 _GIT_TIMEOUT_SECONDS = 600
 
-# Layered over :data:`LOCAL_GIT_ENV_ALLOWLIST`, which passes no ``GIT_*``
-# variable: replacement objects are off by environment as well as by switch,
-# so a nested git process (one a filter driver starts) inherits it too.
-_LOCAL_GIT_ENV = {"GIT_NO_REPLACE_OBJECTS": "1"}
-
 
 def _local_request(
     repo: str, args: list[str], env: dict[str, str] | None = None
 ) -> ExecutionRequest:
     """One hardened git process in the operator's repository ``repo``."""
-    return ExecutionRequest(
-        command=["git", *LOCAL_GIT_SWITCHES, "-C", repo, *args],
-        env={**_LOCAL_GIT_ENV, **(env or {})},
-        env_allowlist=LOCAL_GIT_ENV_ALLOWLIST,
-        timeout_seconds=_GIT_TIMEOUT_SECONDS,
-    )
+    return local_git_request(["-C", repo, *args], env=env, timeout_seconds=_GIT_TIMEOUT_SECONDS)
 
 
 def describe_definition_difference(pr_jobs: WorkflowRunJobs, base_jobs: WorkflowRunJobs) -> str:

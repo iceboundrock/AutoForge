@@ -50,7 +50,15 @@ from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any, NoReturn
 
-from .claims import FOLLOW_UP, IMPLEMENTATION, PROGRESS, REVIEW, MarkerKind, scan
+from .claims import (
+    FOLLOW_UP,
+    IMPLEMENTATION,
+    PROGRESS,
+    REVIEW,
+    MarkerKind,
+    render_progress_marker,
+    scan,
+)
 from .errors import ConfigurationError, ControlResultValidationError, StateError
 from .redaction import MAX_GROWTH_FACTOR, redact
 from .replan_txn import MARKER_RE as REPLAN_MARKER_RE
@@ -1414,7 +1422,15 @@ class UpdateEpicContext:
     STORED_BOUND = MAX_ROADMAP_SECTION_CHARS + 3 * MAX_URL_CHARS + 2 * 64 + 9 * _KEY_OVERHEAD
 
     @classmethod
-    def from_dict(cls, raw: object, binding: Binding, **_: object) -> UpdateEpicContext:
+    def from_dict(
+        cls,
+        raw: object,
+        binding: Binding,
+        *,
+        records: Sequence[EffectRecord] = (),
+        observation: EntryObservation | None = None,
+        **_: object,
+    ) -> UpdateEpicContext:
         what = "UPDATE_EPIC completion context"
         data = _context_header(raw, cls._KEYS, binding, cls.PHASE)
         _issue_url(data["issue_url"], f"{what}.issue_url")
@@ -1449,6 +1465,7 @@ class UpdateEpicContext:
             _fail(what, "voids its selection but still holds one")
         if section_void and section is not None:
             _fail(what, "voids its roadmap section but still holds one")
+        cls._check_publication(data["issue_url"], data["pr_url"], records, observation, what)
         return cls(
             data["issue_url"],
             data["pr_url"],
@@ -1459,6 +1476,44 @@ class UpdateEpicContext:
             selection_void,
             section_void,
         )
+
+    @staticmethod
+    def _check_publication(
+        issue_url: str,
+        pr_url: str,
+        records: Sequence[EffectRecord],
+        observation: EntryObservation | None,
+        what: str,
+    ) -> None:
+        """The progress comment is planned or adopted, never neither (D2.2, D4.6, D13.7).
+
+        Completion publishes only what the plan holds, so an empty plan beside
+        this context would finish the phase with no progress comment. The
+        entry observation decides which plan is consistent: no comment
+        carried the marker of (issue, PR) at entry, and the plan is exactly
+        that comment's K8 record; or one did, the entry adopted it (a legacy
+        re-entry, D13.7), and the plan is empty.
+        """
+        if observation is None:
+            _fail(what, "is persisted without the entry observation read before its launch")
+        marker = render_progress_marker(issue_url, pr_url)
+        if marker not in observation.objects:
+            _fail(what, "has an entry observation that does not record its progress marker")
+        adopted = observation.objects[marker]
+        if adopted is not None:
+            if records:
+                _fail(what, f"plans a progress comment beside the adopted {adopted}")
+            return
+        if (
+            len(records) != 1
+            or records[0].kind != EffectKind.PROGRESS_COMMENT
+            or records[0].identity["marker"] != marker
+        ):
+            _fail(
+                what,
+                "must be saved with the one progress-comment record of its marker: the entry "
+                "observation records no comment to adopt",
+            )
 
     def to_dict(self) -> dict:
         return {
@@ -1489,6 +1544,12 @@ _CONTEXT_TYPES: Mapping[str, Any] = {
 }
 
 
+def _context_type(raw: dict) -> Any:
+    """The context class of the publishing phase ``raw`` names, or ``None``."""
+    phase = raw.get("phase")
+    return _CONTEXT_TYPES.get(phase) if isinstance(phase, str) else None
+
+
 def load_context(
     raw: object,
     binding: Binding,
@@ -1499,7 +1560,7 @@ def load_context(
     """The persisted completion context of the phase it names, strictly validated."""
     if not isinstance(raw, dict):
         _fail("completion_context", f"must be an object, got {type(raw).__name__}")
-    context_type = _CONTEXT_TYPES.get(raw.get("phase"))  # type: ignore[arg-type]
+    context_type = _context_type(raw)
     if context_type is None:
         _fail("completion_context.phase", "must name a publishing phase")
     context: CompletionContext = context_type.from_dict(
@@ -1556,14 +1617,13 @@ def load_phase_effects(
         observation = EntryObservation.from_dict(observation_raw, binding)
     if not isinstance(context_raw, dict):
         _fail("completion_context", f"must be an object, got {type(context_raw).__name__}")
-    context = None
-    if context_raw:
-        context = load_context(context_raw, binding, records=records, observation=observation)
-    effects = PhaseEffects(records, observation, context)
+    # One phase first: a context is validated against the plan and the
+    # observation of its own phase, never against another phase's.
+    context_type = _context_type(context_raw)
     phases = {
         p
         for p in (
-            context.PHASE if context is not None else None,
+            context_type.PHASE if context_type is not None else None,
             observation.phase if observation is not None else None,
             records[0].owner.phase if records else None,
         )
@@ -1571,6 +1631,10 @@ def load_phase_effects(
     }
     if len(phases) > 1:
         _fail("effect state", "names more than one phase across records, observation and context")
+    context = None
+    if context_raw:
+        context = load_context(context_raw, binding, records=records, observation=observation)
+    effects = PhaseEffects(records, observation, context)
     if records and context is None:
         _fail("effect_records", "are persisted without the completion context saved with them")
     problem = plan_size_problem(records, context)

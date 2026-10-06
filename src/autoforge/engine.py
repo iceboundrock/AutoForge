@@ -150,7 +150,7 @@ from .errors import (
     VerificationError,
 )
 from .executor import DEFAULT_MAX_OUTPUT_BYTES, ExecutionRequest, execute
-from .git_transport import GitRemote, GitTransport
+from .git_transport import GitRemote, GitTransport, local_git_request
 from .github import (
     CommentInfo,
     GitHubClient,
@@ -817,15 +817,8 @@ class ControllerEngine:
         worktree has that worktree's root, not its own.
         """
         res = (self._runner or execute)(
-            ExecutionRequest(
-                command=[
-                    "git",
-                    "-C",
-                    str(path),
-                    "rev-parse",
-                    "--show-toplevel",
-                    "--git-common-dir",
-                ],
+            local_git_request(
+                ["-C", str(path), "rev-parse", "--show-toplevel", "--git-common-dir"],
                 timeout_seconds=GIT_TIMEOUT_SECONDS,
             )
         )
@@ -848,8 +841,8 @@ class ControllerEngine:
         ``prunable`` and left out, since nothing at its path is a worktree.
         """
         res = (self._runner or execute)(
-            ExecutionRequest(
-                command=["git", "worktree", "list", "--porcelain"],
+            local_git_request(
+                ["worktree", "list", "--porcelain"],
                 cwd=self.workdir,
                 timeout_seconds=GIT_TIMEOUT_SECONDS,
             )
@@ -965,9 +958,14 @@ class ControllerEngine:
                 "commit to start from"
             )
         path.parent.mkdir(parents=True, exist_ok=True)
+        # Hardened like every controller git process (ADR 0004 D7.3, D7.5):
+        # the checkout would otherwise run the repository's `post-checkout`
+        # hook and its file-system monitor, both agent-writable, with the
+        # controller's whole environment, and could check out a replacement
+        # object's tree instead of HEAD's.
         res = (self._runner or execute)(
-            ExecutionRequest(
-                command=["git", "worktree", "add", "--detach", str(path), "HEAD"],
+            local_git_request(
+                ["worktree", "add", "--detach", str(path), "HEAD"],
                 cwd=self.workdir,
                 timeout_seconds=GIT_TIMEOUT_SECONDS,
             )
@@ -7533,6 +7531,15 @@ class ControllerEngine:
         if context is None or context.void:
             raise StateError("UPDATE_EPIC completion reached without a complete context")
         published = self._published_progress_comment_url()
+        if not published:
+            # The load refuses a context with neither a K8 record nor an
+            # adopted comment; this keeps completion closed if one ever got
+            # here, before the roadmap write and the issue switch.
+            raise StateError(
+                f"UPDATE_EPIC completion for issue {state.current_issue_url} reached with no "
+                "progress comment posted or adopted; the roadmap section was not written and "
+                "the issue was not switched"
+            )
         try:
             roadmap_note = self._splice_roadmap_section(context)
         except GitHubUnavailableError:

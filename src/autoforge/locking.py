@@ -59,12 +59,13 @@ from types import TracebackType
 
 from .errors import ExecutionError, LockError
 from .executor import ExecutionRequest, ExecutionResult, execute
+from .git_transport import local_git_request
 from .safefs import entry_kind
 
 LOCK_DIRNAME = "autoforge"  # inside the git common dir
 LOCK_FILENAME = "controller.lock"
 
-_GIT_COMMON_DIR_ARGV = ["git", "rev-parse", "--git-common-dir"]
+_GIT_COMMON_DIR_ARGS = ["rev-parse", "--git-common-dir"]
 _GIT_TIMEOUT_SECONDS = 30
 
 Runner = Callable[[ExecutionRequest], ExecutionResult]
@@ -94,11 +95,13 @@ def repository_lock_path(workdir: str | Path, runner: Runner = execute) -> Path:
     base = Path(workdir)
     shown = base.resolve()  # messages only: "." tells the operator nothing
     try:
+        # Hardened like every controller git process (ADR 0004 D7.3), and
+        # from the same environment as the workspace reader, so an operator's
+        # `GIT_DIR` cannot key the lock to one repository and the run to
+        # another.
         res = runner(
-            ExecutionRequest(
-                command=list(_GIT_COMMON_DIR_ARGV),
-                cwd=str(base),
-                timeout_seconds=_GIT_TIMEOUT_SECONDS,
+            local_git_request(
+                _GIT_COMMON_DIR_ARGS, cwd=str(base), timeout_seconds=_GIT_TIMEOUT_SECONDS
             )
         )
     except ExecutionError as exc:

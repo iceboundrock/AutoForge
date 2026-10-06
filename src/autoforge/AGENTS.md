@@ -31,7 +31,8 @@ github.py           GitHubClient over `gh`: verification reads, typed controller
 effects.py          ADR 0004 effect records: kinds, stages, attempt bound, drive/reconcile,
                     entry observation, UPDATE_EPIC completion context (#160)
 effect_ops.py       per-kind effect operations: identity read, precondition, write (#160)
-git_transport.py    controller git push: sanitized config, explicit URL, lease, no hooks (#160)
+git_transport.py    controller git push: sanitized config, explicit URL, lease, no hooks;
+                    the hardened request every local controller git process uses (#160)
 claims.py           durable GitHub claims: marker schemas, renderers, scan, cardinality
 validation.py       typed GitHub URL parsing and run-argument validation
 premerge.py         controller-produced pre-merge evidence (check definitions, tree export)

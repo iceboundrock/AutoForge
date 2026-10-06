@@ -94,9 +94,10 @@ LOCAL_TIMEOUT_SECONDS = 120
 
 # Hooks and the file-system monitor are off at command-line precedence for
 # every controller git process (D7.3); replacement objects and the
-# commit-graph too, so an object read by SHA reads that SHA (D7.5).
-# ``premerge.py`` applies the same switches to its processes in the
-# operator's repository.
+# commit-graph too, so an object read by SHA reads that SHA (D7.5). The
+# processes that run in the operator's repository (the engine's worktree
+# creation and identity reads, the workspace reader, the lock's common-dir
+# read, the pre-merge export) take them through :func:`local_git_request`.
 LOCAL_GIT_SWITCHES: tuple[str, ...] = (
     "--no-replace-objects",
     "-c",
@@ -123,6 +124,37 @@ LOCAL_GIT_ENV_ALLOWLIST: tuple[str, ...] = (
     "HOME",
     "XDG_CONFIG_HOME",
 )
+
+# Layered over :data:`LOCAL_GIT_ENV_ALLOWLIST`: replacement objects are off
+# by environment as well as by switch, so a nested git process (one a hook
+# or filter driver starts) inherits it too.
+LOCAL_GIT_ENV: dict[str, str] = {"GIT_NO_REPLACE_OBJECTS": "1"}
+
+
+def local_git_request(
+    args: Sequence[str],
+    *,
+    cwd: str | None = None,
+    env: dict[str, str] | None = None,
+    timeout_seconds: int = LOCAL_TIMEOUT_SECONDS,
+) -> ExecutionRequest:
+    """One controller git process in the operator's repository (D7.3, D7.5).
+
+    Hooks, the file-system monitor, replacement objects and the commit-graph
+    are off at command-line precedence, and the child starts from
+    :data:`LOCAL_GIT_ENV_ALLOWLIST`: no token and no ``GIT_*`` variable of
+    the operator's shell reaches it or anything it starts. The repository
+    itself is still the one ``cwd`` (or a ``-C`` in ``args``) names, so a
+    tree read or a ``worktree add`` reads the operator's objects and refs.
+    """
+    return ExecutionRequest(
+        command=["git", *LOCAL_GIT_SWITCHES, *args],
+        cwd=cwd,
+        env={**LOCAL_GIT_ENV, **(env or {})},
+        env_allowlist=LOCAL_GIT_ENV_ALLOWLIST,
+        timeout_seconds=timeout_seconds,
+    )
+
 
 # The environment of a network operation (D7.1): ``PATH`` and the locale;
 # the standard proxy variables (curl honours both spellings) and CA

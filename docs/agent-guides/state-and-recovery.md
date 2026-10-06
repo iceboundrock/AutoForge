@@ -111,9 +111,16 @@ incomplete value fails loudly, never replaced by a default. Every protocol-7
 save writes all four fields, so a protocol-7 file missing one is refused:
 an absent `effect_records` read as its empty default would be an empty plan,
 and the phase would complete from its context without the write it had
-planned. Text the recovery path publishes with no agent result in between
-is validated again under the parser's rules for its field, not only for its
-bounds and redaction invariance: the `UPDATE_EPIC` roadmap section in the
+planned. An `UPDATE_EPIC` completion context is checked against the plan and
+the entry observation of its own phase for the same reason: it loads with
+the one `progress_comment` record of its own (issue, PR) marker, or with no
+record only when the entry observation records that marker's comment as
+adopted (the D13.7 legacy re-entry). Neither, both, or no entry observation
+is refused, and completion itself refuses to splice the roadmap section or
+switch issues without a posted or adopted comment. Text the recovery path
+publishes with no agent result in between is validated again under the
+parser's rules for its field, not only for its bounds and redaction
+invariance: the `UPDATE_EPIC` roadmap section in the
 completion context (`validate_roadmap_section`) and the progress text of a
 progress-comment record (`validate_progress_text`). A stored value the
 result path would have refused is a `StateError`, never rewritten. LOCAL

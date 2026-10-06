@@ -2138,6 +2138,7 @@ CTX = ("completion_context",)
     [
         (_set(CTX, []), "completion_context must be an object, got list"),
         (_set((*CTX, "phase"), "MERGE"), "completion_context.phase must name a publishing phase"),
+        (_set((*CTX, "phase"), ["UPDATE_EPIC"]), "completion_context.phase must name a publishing"),
         (_pop((*CTX, "section_void")), "is missing key(s) ['section_void']"),
         (_set((*CTX, "extra"), 1), "has unknown key(s) ['extra']"),
         (_set((*CTX, "selection_void"), "no"), "selection_void must be a boolean, got str"),
@@ -2315,6 +2316,89 @@ def test_effect_state_naming_two_phases_is_refused_even_when_blocked(tmp_path):
     save_state(s, p)
     with pytest.raises(StateError, match="names more than one phase"):
         load_state(p)
+
+
+_NO_OBSERVATION: dict = {}
+
+
+@pytest.mark.parametrize("phase", [Phase.UPDATE_EPIC, Phase.BLOCKED])
+@pytest.mark.parametrize(
+    ("records", "observation", "needle"),
+    [
+        # The entry saw no comment, so the context was saved with its K8 record.
+        (
+            [],
+            _observation(Phase.UPDATE_EPIC, objects={_progress_marker(): None}),
+            "must be saved with the one progress-comment record of its marker",
+        ),
+        (
+            [],
+            _NO_OBSERVATION,
+            "is persisted without the entry observation read before its launch",
+        ),
+        (
+            [],
+            _observation(Phase.UPDATE_EPIC),
+            "has an entry observation that does not record its progress marker",
+        ),
+        (
+            [],
+            _observation(
+                Phase.UPDATE_EPIC,
+                objects={
+                    render_progress_marker(
+                        EFFECT_ISSUE, "https://github.com/owner/repo/pull/41"
+                    ): EPIC_COMMENT
+                },
+            ),
+            "has an entry observation that does not record its progress marker",
+        ),
+        # The entry adopted a legacy comment, so it plans none of its own.
+        (
+            [_progress_record(Stage.INTENDED).to_dict()],
+            _observation(Phase.UPDATE_EPIC, objects={_progress_marker(): EPIC_COMMENT}),
+            f"plans a progress comment beside the adopted {EPIC_COMMENT}",
+        ),
+    ],
+    ids=["empty-plan", "no-observation", "no-marker", "another-pr-marker", "plan-and-adoption"],
+)
+def test_update_epic_context_without_its_progress_comment_is_refused(
+    tmp_path, phase, records, observation, needle
+):
+    """D2.2, D4.6, D13.7: UPDATE_EPIC completes from its context and publishes
+    only what its plan holds, so the context is loaded only beside the K8
+    record of its marker (the entry saw no comment) or an empty plan whose
+    entry observation adopted the one legacy comment. An emptied plan is not
+    "nothing left to publish": it is refused, and the file left unchanged."""
+    s = _update_epic_state(
+        Stage.INTENDED, phase=phase, effect_records=records, entry_observation=observation
+    )
+    p = _write(tmp_path / "state.json", s.to_dict())
+    before = p.read_bytes()
+    with pytest.raises(StateError) as exc:
+        load_state(p)
+    assert f"UPDATE_EPIC completion context {needle}" in str(exc.value)
+    assert p.read_bytes() == before
+
+
+@pytest.mark.parametrize("phase", [Phase.UPDATE_EPIC, Phase.BLOCKED])
+def test_update_epic_context_of_an_adopted_legacy_comment_loads_with_no_record(tmp_path, phase):
+    """D13.7: the one legacy progress comment the entry observation adopted is
+    the phase's publication; its context is saved with no record and loads."""
+    s = _update_epic_state(
+        phase=phase,
+        effect_records=[],
+        entry_observation=_observation(
+            Phase.UPDATE_EPIC, objects={_progress_marker(): EPIC_COMMENT}
+        ),
+    )
+    p = tmp_path / "state.json"
+    save_state(s, p)
+    effects = load_state(p).phase_effects()
+    assert effects.records == () and effects.published
+    assert effects.observation is not None
+    assert effects.observation.objects == {_progress_marker(): EPIC_COMMENT}
+    assert isinstance(effects.context, UpdateEpicContext)
 
 
 def test_records_persisted_without_their_completion_context_are_refused(tmp_path):

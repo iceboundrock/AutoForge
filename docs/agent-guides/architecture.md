@@ -282,7 +282,10 @@ The effect layer sits between the engine and the GitHub client (ADR 0004):
   compare-and-swap, fast-forward-only pushes and objects-only fetches, in a
   private git directory over the shared object store, with an explicit
   remote and the credential from `gh auth git-credential`. Every process
-  goes through the executor; the module has no workflow semantics.
+  goes through the executor; the module has no workflow semantics. Its
+  `local_git_request` is how every other controller git process in the
+  operator's repository (worktree creation, the workspace reader, the lock,
+  the pre-merge export) gets the same hooks-off, credential-free shape.
 
 The engine decides *which* effects a phase plans and when it drives them; it
 never issues a write around them. Provider adapters and the executor know
