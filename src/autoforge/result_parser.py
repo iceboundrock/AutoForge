@@ -404,6 +404,13 @@ _CLOSING_REFERENCE_RE = re.compile(
 # the ``@`` counts as punctuation, which fails closed), followed by a name
 # character. ``@org/team`` starts the same way.
 _MENTION_RE = re.compile(r"(?<![A-Za-z0-9_])@[A-Za-z0-9]")
+# A URL in UPDATE_EPIC ``progress`` (#160: the agent's progress text carries
+# no URL; the controller's marker names the issue and the PR). A scheme
+# separator ``://``, or a ``www.`` host not inside a word: the two forms
+# GitHub autolinks, the first widened to any scheme so the rule errs toward
+# refusing. Matched anywhere, code included, and in ``progress`` only:
+# ``roadmap_section`` may link the EPIC's PRs.
+_PROGRESS_URL_RE = re.compile(r"://|(?<![A-Za-z0-9])www\.", re.IGNORECASE)
 # Raw HTML (a tag, a comment, an autolink): GitHub reads backticks and fences
 # inside an HTML block or tag as text, so wherever raw HTML sits outside code
 # the code exemption for mentions is not trusted at all.
@@ -1097,8 +1104,9 @@ def validate_progress_text(text: str) -> str:
     """``text`` as an UPDATE_EPIC ``progress`` field, or a rejection.
 
     Non-blank, at most :data:`MAX_PROGRESS_CHARS`, multi-line text with no
-    other control character, and publishable (:func:`published_text_problem`):
-    the controller posts it as the EPIC progress comment. The checks
+    other control character, publishable (:func:`published_text_problem`),
+    and with no URL (:data:`_PROGRESS_URL_RE`): the controller posts it as
+    the EPIC progress comment. The checks
     :meth:`UpdateEpicResult.from_payload` applies, with the same messages,
     so a persisted value can be re-validated under the parser's rules.
     """
@@ -1110,7 +1118,16 @@ def validate_progress_text(text: str) -> str:
         )
     text = _bounded(text, "UPDATE_EPIC", "result", "progress", MAX_PROGRESS_CHARS)
     text = _multi_line(text, "UPDATE_EPIC", "result", "progress")
-    return _published_field(text, "progress")
+    text = _published_field(text, "progress")
+    m = _PROGRESS_URL_RE.search(text)
+    if m is not None:
+        raise ControlResultValidationError(
+            f"UPDATE_EPIC: field 'progress' contains a URL at index {m.start()} ('://' or "
+            "'www.'), even inside code; the progress comment carries no URL, and the "
+            "controller's marker names the issue and PR. Refer to them as '#n' instead, and "
+            "re-emit the CONTROL_RESULT."
+        )
+    return text
 
 
 def validate_roadmap_section(text: str) -> str:

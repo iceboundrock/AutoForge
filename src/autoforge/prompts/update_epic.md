@@ -19,11 +19,12 @@ roadmap section into the EPIC body, and verifies your selection.
 
 ## Steps
 
-1. Write a concise progress report for the EPIC: what was implemented, the
-   PR link, the test evidence. Return it in the CONTROL_RESULT as
-   `progress` (Markdown, at most {{MAX_PROGRESS_CHARS}} characters). The
-   controller posts it on the EPIC exactly once, followed by the marker
-   that identifies it as this issue's progress comment, and reads it back.
+1. Write a concise progress report for the EPIC: what was implemented and
+   the test evidence. Return it in the CONTROL_RESULT as `progress`
+   (Markdown, at most {{MAX_PROGRESS_CHARS}} characters, with no URL: refer
+   to an issue or PR as `#n`). The controller posts it on the EPIC exactly
+   once, followed by the marker that identifies it as this issue's progress
+   comment and names the issue and PR, and reads it back.
 2. Compose the roadmap section (only when it is needed, see below). The
    EPIC body has one controller-managed section, delimited by these two
    marker lines:
@@ -82,6 +83,9 @@ Either is rejected, and you are asked to correct it, when it contains:
   act on it;
 - an `@` that would mention a user or team outside a code span or a fenced
   block. Put such tokens in a code span (`` `@name` ``).
+
+`progress` alone is also rejected when it contains a URL: `://` (any
+scheme) or a `www.` host, even inside code. `roadmap_section` may link PRs.
 
 ## Constraints on `next_issue_url`
 

@@ -32,7 +32,7 @@ import os
 import re
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import NoReturn
@@ -560,6 +560,32 @@ _OPEN_PR_PAGE_QUERY = (
     " headRepository { name } headRepositoryOwner { login }"
     " closingIssuesReferences(first: 100) { nodes { number } } } } } }"
 )
+# One page of an issue's or a PR's conversation comments, read by cursor until
+# GitHub reports no further page. `gh issue view --json comments` and `gh pr
+# view --json comments` read `comments(first: 100)` and never a second page,
+# so a comment past the hundredth was reported as absent to every identity
+# read built on them (K4, K8, the replan close receipt). The node fields are
+# the ones those views returned under the same names, so the same decoder
+# reads both. The connection is in creation order and a cursor names a
+# comment (its database id), not an offset: a comment posted while the walk
+# runs lands at the end, and one deleted does not shift the pages after it.
+_COMMENT_PAGE_SIZE = 100
+
+
+def _comment_page_query(parent: str) -> str:
+    """The comment-page query of ``parent``, ``issue`` or ``pullRequest``."""
+    return (
+        "query($owner: String!, $name: String!, $number: Int!, $after: String) {"
+        " repository(owner: $owner, name: $name) {"
+        f" {parent}(number: $number) {{"
+        f" comments(first: {_COMMENT_PAGE_SIZE}, after: $after) {{"
+        " pageInfo { hasNextPage endCursor }"
+        " nodes { url body createdAt author { login } } } } } }"
+    )
+
+
+_ISSUE_COMMENT_PAGE_QUERY = _comment_page_query("issue")
+_PR_COMMENT_PAGE_QUERY = _comment_page_query("pullRequest")
 
 
 # -- strict row decoding ----------------------------------------------------------
@@ -1707,24 +1733,26 @@ class GitHubClient:
         except GitHubError:
             return False
 
-    def list_open_prs(self, repo: str) -> list[PRInfo]:
-        """Every open PR in ``repo`` (bodies included), read to the end.
+    def _walk_connection(
+        self,
+        query: str,
+        variables: list[str],
+        connection_of: Callable[[dict, str], dict],
+        what: str,
+    ) -> Iterator[object]:
+        """Every node of one GraphQL connection, read by cursor to its end.
 
-        The listing is complete or it raises: every caller decides "no
-        candidate exists" on it (an ANALYZE_EXECUTE entry launching an
-        implementer, a replan concluding no replacement was created), and
-        "the candidate was past a limit" must never be reported as absence
-        (issue #20). Pages are walked by cursor until GitHub says there is no
-        next one; a page GitHub answered with errors (so possibly partial),
-        a page that is not a PR connection, a next page GitHub announces
-        without a cursor to reach it, or a cursor the walk already used (a
-        cycle) is a conclusive GitHubError, never a shorter list. A PR seen
-        twice (the listing moved under the walk) is kept once.
+        ``variables`` are the query's ``-f``/``-F`` arguments; the walk adds
+        ``after``. ``connection_of`` picks the connection out of a page's
+        ``data``, raising (its message led by the page's name) when the page
+        does not hold one. Nodes are yielded page by page, as read and
+        undecoded. Pages are walked until GitHub says there is no next one;
+        a page GitHub answered with errors (so possibly partial), a
+        connection without usable ``nodes`` and ``pageInfo``, a next page
+        GitHub announces without a cursor to reach it, or a cursor the walk
+        already used (a cycle) is a conclusive GitHubError, never a shorter
+        listing.
         """
-        what = f"open PR listing of {repo}"
-        owner, _, name = repo.partition("/")
-        prs: list[PRInfo] = []
-        seen: set[int] = set()
         after: str | None = None
         # Every cursor the walk has already asked for. A cursor that comes
         # back a second time, however many pages later, would walk a cycle
@@ -1733,57 +1761,25 @@ class GitHubClient:
         page_number = 0
         while True:
             page_number += 1
-            # `-f` sends each variable as a string. `-F` would type-coerce
-            # it: an all-digit owner login would become an integer and a
-            # repository named `null`, `true` or `false` a null or boolean,
-            # which GitHub refuses for a `String!` variable.
-            args = [
-                "api",
-                "graphql",
-                "-f",
-                f"query={_OPEN_PR_PAGE_QUERY}",
-                "-f",
-                f"owner={owner}",
-                "-f",
-                f"name={name}",
-            ]
+            args = ["api", "graphql", "-f", f"query={query}", *variables]
             if after is not None:
                 args += ["-f", f"after={after}"]
             page_what = f"{what}, page {page_number}"
-            data = self._graphql_data(args, page_what)
-            repository = data.get("repository")
-            if not isinstance(repository, dict):
-                raise GitHubError(f"{page_what}: repository is not readable: {repository!r:.200}")
-            connection = repository.get("pullRequests")
-            if not isinstance(connection, dict):
-                raise GitHubError(
-                    f"{page_what} is not a pull-request connection: {connection!r:.200}"
-                )
+            connection = connection_of(self._graphql_data(args, page_what), page_what)
             nodes = connection.get("nodes")
             info = connection.get("pageInfo")
             if not isinstance(nodes, list) or not isinstance(info, dict):
                 raise GitHubError(
                     f"{page_what} has no usable nodes or pageInfo: {connection!r:.200}"
                 )
-            for node in nodes:
-                row = _row_object(node, what)
-                # `gh pr list --json` flattens this connection to its nodes;
-                # the decoder reads that shape. The connection is validated
-                # here, before flattening: a malformed one must not read as
-                # "this PR closes no issue".
-                linked = _linked_issue_nodes(row.get("closingIssuesReferences"), what)
-                pr = self._pr_from_data(dict(row, closingIssuesReferences=linked), what)
-                if pr.number in seen:
-                    continue
-                seen.add(pr.number)
-                prs.append(pr)
+            yield from nodes
             has_next = info.get("hasNextPage")
             if not isinstance(has_next, bool):
                 raise GitHubError(
                     f"{page_what} does not say whether a next page exists: {info!r:.200}"
                 )
             if not has_next:
-                return prs
+                return
             cursor = info.get("endCursor")
             if not isinstance(cursor, str) or not cursor:
                 raise GitHubError(
@@ -1797,6 +1793,53 @@ class GitHubClient:
                 )
             used_cursors.add(cursor)
             after = cursor
+
+    def list_open_prs(self, repo: str) -> list[PRInfo]:
+        """Every open PR in ``repo`` (bodies included), read to the end.
+
+        The listing is complete or it raises: every caller decides "no
+        candidate exists" on it (an ANALYZE_EXECUTE entry launching an
+        implementer, a replan concluding no replacement was created), and
+        "the candidate was past a limit" must never be reported as absence
+        (issue #20). The pages are walked by cursor
+        (:meth:`_walk_connection`), so a page that cannot be read or walked
+        past is a conclusive GitHubError, never a shorter list. A PR seen
+        twice (the listing moved under the walk) is kept once.
+        """
+        what = f"open PR listing of {repo}"
+        owner, _, name = repo.partition("/")
+
+        def pull_requests(data: dict, page_what: str) -> dict:
+            repository = data.get("repository")
+            if not isinstance(repository, dict):
+                raise GitHubError(f"{page_what}: repository is not readable: {repository!r:.200}")
+            connection = repository.get("pullRequests")
+            if not isinstance(connection, dict):
+                raise GitHubError(
+                    f"{page_what} is not a pull-request connection: {connection!r:.200}"
+                )
+            return connection
+
+        # `-f` sends each variable as a string. `-F` would type-coerce it: an
+        # all-digit owner login would become an integer and a repository
+        # named `null`, `true` or `false` a null or boolean, which GitHub
+        # refuses for a `String!` variable.
+        variables = ["-f", f"owner={owner}", "-f", f"name={name}"]
+        prs: list[PRInfo] = []
+        seen: set[int] = set()
+        for node in self._walk_connection(_OPEN_PR_PAGE_QUERY, variables, pull_requests, what):
+            row = _row_object(node, what)
+            # `gh pr list --json` flattens this connection to its nodes; the
+            # decoder reads that shape. The connection is validated here,
+            # before flattening: a malformed one must not read as "this PR
+            # closes no issue".
+            linked = _linked_issue_nodes(row.get("closingIssuesReferences"), what)
+            pr = self._pr_from_data(dict(row, closingIssuesReferences=linked), what)
+            if pr.number in seen:
+                continue
+            seen.add(pr.number)
+            prs.append(pr)
+        return prs
 
     def list_all_prs(self, repo: str, *, strict: bool = False) -> list[PRInfo]:
         """Every PR in ``repo`` across all states (bodies included).
@@ -2186,24 +2229,54 @@ class GitHubClient:
 
     # -- comments -----------------------------------------------------------
     def get_pr_comments(self, url: str) -> list[CommentInfo]:
+        """Every conversation comment of a PR, oldest first (:meth:`_comments`)."""
         ref = parse_pr_url(url)
-        data = self._api_json(["pr", "view", ref.canonical, "--json", "comments"])
-        return self._comments_from_data(data, ref.canonical)
+        return self._comments(_PR_COMMENT_PAGE_QUERY, "pullRequest", ref)
 
     def get_issue_comments(self, url: str) -> list[CommentInfo]:
-        """The issue-style comments of an issue (an EPIC's progress comments)."""
+        """Every comment of an issue (an EPIC's progress comments), oldest first."""
         ref = parse_issue_url(url)
-        data = self._api_json(["issue", "view", ref.canonical, "--json", "comments"])
-        return self._comments_from_data(data, ref.canonical)
+        return self._comments(_ISSUE_COMMENT_PAGE_QUERY, "issue", ref)
 
-    @staticmethod
-    def _comments_from_data(data: dict, parent_url: str) -> list[CommentInfo]:
-        rows = data.get("comments")
-        if rows is None:
-            rows = []
-        if not isinstance(rows, list):
-            raise GitHubError(f"comments of {parent_url}: `gh` returned a non-array field")
-        return [_decode_comment(c, parent_url) for c in rows]
+    def _comments(self, query: str, parent: str, ref: GitHubRef) -> list[CommentInfo]:
+        """The complete comment listing of ``ref`` (ADR 0004 D4.5), or a GitHubError.
+
+        Every identity read of a comment marker decides "absent" on this
+        listing (a review comment, a progress comment, a replan close
+        receipt), so it is read by cursor to its end
+        (:meth:`_walk_connection`) and a listing that cannot be is an error,
+        never the comments it did read. A missing issue or PR is
+        GitHubNotFoundError, as GitHub's "Could not resolve" is classified.
+        A comment seen twice is kept once.
+        """
+        parent_url = ref.canonical
+        what = f"comments of {parent_url}"
+        owner, _, name = ref.repository.partition("/")
+
+        def comments(data: dict, page_what: str) -> dict:
+            repository = data.get("repository")
+            if not isinstance(repository, dict):
+                raise GitHubError(f"{page_what}: repository is not readable: {repository!r:.200}")
+            holder = repository.get(parent)
+            if not isinstance(holder, dict):
+                raise GitHubError(f"{page_what}: {parent} is not readable: {holder!r:.200}")
+            connection = holder.get("comments")
+            if not isinstance(connection, dict):
+                raise GitHubError(f"{page_what} is not a comment connection: {connection!r:.200}")
+            return connection
+
+        # Strings as `-f`, like the open-PR walk; the number as `-F`, which
+        # sends it as the integer the `Int!` variable needs.
+        variables = ["-f", f"owner={owner}", "-f", f"name={name}", "-F", f"number={ref.number}"]
+        found: list[CommentInfo] = []
+        seen: set[int] = set()
+        for node in self._walk_connection(query, variables, comments, what):
+            comment = _decode_comment(node, parent_url)
+            if comment.id in seen:
+                continue
+            seen.add(comment.id)
+            found.append(comment)
+        return found
 
     def get_comment(self, comment_url: str) -> CommentInfo:
         """Fetch one issue-style comment by its HTML URL (``#issuecomment-<id>``).

@@ -317,8 +317,13 @@ def test_update_epic_prompt_contract():
         "## What published text may contain",
         "`<!-- autoforge-`",
         "a closing keyword followed by an issue reference",
+        # #160: progress carries no URL; the controller's marker names the PR.
+        "with no URL: refer\n   to an issue or PR as `#n`",
+        "`progress` alone is also rejected when it contains a URL",
     ):
         assert phrase in text, phrase
+    # The agent is not asked for the link the progress text may not carry.
+    assert "PR link" not in text
     # The body-editing step is gone: the agent has no instruction to edit the body.
     assert "Check off completed tasks" not in text
     # The agent no longer posts the comment, so it is handed no marker for one.

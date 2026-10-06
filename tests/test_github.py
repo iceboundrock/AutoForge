@@ -103,28 +103,15 @@ def test_get_pr_comments_and_get_comment():
 
     def handler(req):
         seen.append(req.command)
-        if "api" in req.command:
-            return _res(
-                {
-                    "id": 5,
-                    "html_url": "https://github.com/o/r/pull/42#issuecomment-5",
-                    "body": "# AI Code Review — Round 1",
-                    "user": {"login": "bot"},
-                    "created_at": "2026-01-01T00:00:00Z",
-                }
-            )
+        if "graphql" in req.command:
+            return _res(_comment_page([_comment_node("https://github.com/o/r/pull/42", 5)]))
         return _res(
             {
-                "url": "https://github.com/o/r/pull/42",
-                "comments": [
-                    {
-                        "id": 5,
-                        "url": "https://github.com/o/r/pull/42#issuecomment-5",
-                        "body": "hello",
-                        "author": {"login": "bot"},
-                        "createdAt": "2026-01-01T00:00:00Z",
-                    }
-                ],
+                "id": 5,
+                "html_url": "https://github.com/o/r/pull/42#issuecomment-5",
+                "body": "# AI Code Review — Round 1",
+                "user": {"login": "bot"},
+                "created_at": "2026-01-01T00:00:00Z",
             }
         )
 
@@ -136,6 +123,34 @@ def test_get_pr_comments_and_get_comment():
     assert c.url == "https://github.com/o/r/pull/42#issuecomment-5"
     assert c.parent_url == "https://github.com/o/r/pull/42"
     assert seen[-1][:2] == ["gh", "api"] and "repos/o/r/issues/comments/5" in seen[-1][2]
+
+
+def _comment_node(parent_url: str, cid: int, body: str = "hello") -> dict:
+    """One comment node of a comment page, as GraphQL returns it."""
+    return {
+        "url": f"{parent_url}#issuecomment-{cid}",
+        "body": body,
+        "author": {"login": "bot"},
+        "createdAt": "2026-01-01T00:00:00Z",
+    }
+
+
+def _comment_page(
+    nodes: list, *, parent: str = "pullRequest", has_next: bool = False, cursor: str | None = None
+) -> dict:
+    """One page of a comment listing's cursor walk, shaped as `gh api graphql` returns it."""
+    return {
+        "data": {
+            "repository": {
+                parent: {
+                    "comments": {
+                        "pageInfo": {"hasNextPage": has_next, "endCursor": cursor},
+                        "nodes": nodes,
+                    }
+                }
+            }
+        }
+    }
 
 
 def _rest_comment(**overrides) -> dict:
@@ -196,33 +211,22 @@ def test_get_comment_of_a_deleted_comment_is_not_found():
 
 
 def test_get_issue_comments_reads_the_issue_not_a_pr():
-    """PR #89 F2: the EPIC's progress comments are read with `gh issue view`."""
+    """PR #89 F2: the EPIC's progress comments are read from the issue, never a PR."""
     seen = []
 
     def handler(req):
         seen.append(req.command)
-        return _res(
-            {
-                "url": "https://github.com/o/r/issues/1",
-                "comments": [
-                    {
-                        "id": 7,
-                        "url": "https://github.com/o/r/issues/1#issuecomment-7",
-                        "body": "progress",
-                        "author": {"login": "bot"},
-                        "createdAt": "2026-01-01T00:00:00Z",
-                    }
-                ],
-            }
-        )
+        node = _comment_node("https://github.com/o/r/issues/1", 7, "progress")
+        return _res(_comment_page([node], parent="issue"))
 
     gh = _client(handler)
     comments = gh.get_issue_comments("https://github.com/o/r/issues/1")
     assert [(c.id, c.body, c.author) for c in comments] == [(7, "progress", "bot")]
     assert comments[0].parent_url == "https://github.com/o/r/issues/1"
-    assert seen == [
-        ["gh", "issue", "view", "https://github.com/o/r/issues/1", "--json", "comments"]
-    ]
+    (command,) = seen
+    assert command[:3] == ["gh", "api", "graphql"]
+    assert "repository(owner: $owner, name: $name) { issue(number: $number) {" in command[4]
+    assert command[5:] == ["-f", "owner=o", "-f", "name=r", "-F", "number=1"]
     with pytest.raises(ConfigurationError):
         gh.get_issue_comments("https://github.com/o/r/pull/42")
 
@@ -912,9 +916,10 @@ def _pr_page(nodes: list, *, has_next: bool = False, cursor: str | None = None) 
     }
 
 
-def _open_pr_pages(rows: list, page_size: int):
+def _open_pr_pages(rows: list, page_size: int, page=_pr_page):
     """A runner serving ``rows`` page by page, keyed by the ``after`` cursor it
-    is asked for, and recording every command it saw."""
+    is asked for, and recording every command it saw. ``page`` shapes one
+    page of the connection walked (the open PRs by default)."""
     seen: list[list[str]] = []
     pages = [rows[i : i + page_size] for i in range(0, len(rows), page_size)] or [[]]
 
@@ -924,7 +929,7 @@ def _open_pr_pages(rows: list, page_size: int):
         index = int(cursors[0].removeprefix("after=cursor-")) if cursors else 0
         last = index == len(pages) - 1
         cursor = None if last else f"cursor-{index + 1}"
-        return _res(_pr_page(pages[index], has_next=not last, cursor=cursor))
+        return _res(page(pages[index], has_next=not last, cursor=cursor))
 
     return handler, seen
 
@@ -1952,14 +1957,14 @@ def test_truncation_is_judged_on_the_raw_row_count_before_any_row_is_decoded():
 )
 def test_a_malformed_comment_row_is_a_github_error(row, needle):
     good = {"id": 5, "url": "https://github.com/o/r/pull/42#issuecomment-5", "body": "ok"}
-    gh = _client(
-        lambda req: _res({"url": "https://github.com/o/r/pull/42", "comments": [good, row]})
-    )
+    gh = _client(lambda req: _res(_comment_page([good, row])))
     with pytest.raises(GitHubError, match=needle) as exc:
         gh.get_pr_comments("https://github.com/o/r/pull/42")
     assert "comment on https://github.com/o/r/pull/42" in str(exc.value)
-    gh = _client(lambda req: _res({"url": "https://github.com/o/r/pull/42", "comments": "none"}))
-    with pytest.raises(GitHubError, match="non-array"):
+    page = _comment_page([])
+    page["data"]["repository"]["pullRequest"]["comments"]["nodes"] = "none"
+    gh = _client(lambda req: _res(page))
+    with pytest.raises(GitHubError, match="no usable nodes or pageInfo"):
         gh.get_pr_comments("https://github.com/o/r/pull/42")
 
 
@@ -1970,10 +1975,169 @@ def test_a_comment_row_identity_is_its_url_and_its_author_may_be_absent():
         "body": "ok",
         "author": None,
     }
-    gh = _client(lambda req: _res({"url": "https://github.com/o/r/pull/42", "comments": [row]}))
+    gh = _client(lambda req: _res(_comment_page([row])))
     (c,) = gh.get_pr_comments("https://github.com/o/r/pull/42")
     assert c.id == 5 and c.url == "https://github.com/O/R/pull/42#issuecomment-5"
     assert c.author == "" and c.parent_url == "https://github.com/o/r/pull/42"
+
+
+_COMMENT_READS = [
+    pytest.param("get_pr_comments", "pullRequest", "https://github.com/o/r/pull/42", id="pr"),
+    pytest.param("get_issue_comments", "issue", "https://github.com/o/r/issues/1", id="issue"),
+]
+
+
+@pytest.mark.parametrize(("read", "parent", "parent_url"), _COMMENT_READS)
+def test_comment_listings_walk_every_page_to_the_end(read, parent, parent_url):
+    """#160 R1-F1: `gh pr view` / `gh issue view --json comments` read the first
+    100 comments and never a second page, so every identity read built on them
+    (K4, K8, the replan close receipt) reported a marker comment past the
+    hundredth as absent. The listing walks GitHub's pages by cursor until it
+    reports none."""
+    rows = [_comment_node(parent_url, n, f"comment {n}") for n in range(1, 251)]
+    handler, seen = _open_pr_pages(
+        rows, 100, page=lambda nodes, **info: _comment_page(nodes, parent=parent, **info)
+    )
+
+    comments = getattr(_client(handler), read)(parent_url)
+
+    assert [c.id for c in comments] == list(range(1, 251))
+    assert comments[249].body == "comment 250" and comments[249].parent_url == parent_url
+    assert len(seen) == 3
+    number = parent_url.rsplit("/", 1)[1]
+    for command in seen:
+        assert command[:3] == ["gh", "api", "graphql"]
+        assert f"{{ {parent}(number: $number) {{" in command[4]
+        assert "comments(first: 100, after: $after)" in command[4]
+        assert command[5:11] == ["-f", "owner=o", "-f", "name=r", "-F", f"number={number}"]
+    assert "after=" not in " ".join(seen[0])
+    assert seen[1][-2:] == ["-f", "after=cursor-1"]
+    assert seen[2][-2:] == ["-f", "after=cursor-2"]
+
+
+def test_a_comment_listing_keeps_a_comment_seen_on_two_pages_once():
+    """A comment that moved between pages while the walk ran is one comment, not
+    two claimants for the same marker."""
+    url = "https://github.com/o/r/issues/1"
+    pages = iter(
+        [
+            _comment_page(
+                [_comment_node(url, 1), _comment_node(url, 2)],
+                parent="issue",
+                has_next=True,
+                cursor="c1",
+            ),
+            _comment_page([_comment_node(url, 2), _comment_node(url, 3)], parent="issue"),
+        ]
+    )
+    comments = _client(lambda req: _res(next(pages))).get_issue_comments(url)
+    assert [c.id for c in comments] == [1, 2, 3]
+
+
+def _issue_comments_payload(comments: object) -> dict:
+    return {"data": {"repository": {"issue": comments}}}
+
+
+@pytest.mark.parametrize(
+    "pages, needle",
+    [
+        ([{"data": {"repository": None}}], "page 1: repository is not readable"),
+        ([{"data": {"repository": {}}}], "page 1: issue is not readable"),
+        ([_issue_comments_payload("x")], "page 1: issue is not readable"),
+        ([_issue_comments_payload({})], "page 1 is not a comment connection"),
+        ([_issue_comments_payload({"comments": []})], "page 1 is not a comment connection"),
+        (
+            [_issue_comments_payload({"comments": {"nodes": []}})],
+            "page 1 has no usable nodes or pageInfo",
+        ),
+        (
+            [_issue_comments_payload({"comments": {"nodes": [], "pageInfo": {}}})],
+            "page 1 does not say whether a next page exists",
+        ),
+        (
+            [_comment_page([], parent="issue", has_next=True, cursor=None)],
+            "cannot be read to its end: page 1 announces a next page but no cursor",
+        ),
+        (
+            [dict(_comment_page([], parent="issue"), errors=[{"message": "timedout"}])],
+            "page 1: GraphQL reported errors",
+        ),
+        (
+            [
+                _comment_page(
+                    [_comment_node("https://github.com/o/r/issues/1", 1)],
+                    parent="issue",
+                    has_next=True,
+                    cursor="c1",
+                ),
+                _comment_page([], parent="issue", has_next=True, cursor="c1"),
+            ],
+            "page 2 announces a next page behind a cursor the walk already used",
+        ),
+        (
+            [
+                _comment_page(
+                    [_comment_node("https://github.com/o/r/issues/1", 1)],
+                    parent="issue",
+                    has_next=True,
+                    cursor="c1",
+                ),
+                dict(_comment_page([], parent="issue"), errors=[{"message": "timedout"}]),
+            ],
+            "page 2: GraphQL reported errors",
+        ),
+    ],
+    ids=[
+        "null-repository",
+        "no-issue",
+        "string-issue",
+        "no-connection",
+        "list-connection",
+        "no-pageinfo",
+        "no-hasnext",
+        "null-cursor",
+        "errors",
+        "cursor-reused",
+        "errors-on-page-2",
+    ],
+)
+def test_a_comment_listing_that_cannot_be_read_to_its_end_is_an_error(pages, needle):
+    """#160 R1-F1: an identity read decides "no comment carries the marker" on
+    this listing, so a page that cannot be read or walked past is a
+    conclusive GitHubError naming the listing, never the comments it did
+    read."""
+    replies = iter(pages)
+    with pytest.raises(GitHubError, match=needle) as exc:
+        _client(lambda req: _res(next(replies))).get_issue_comments(
+            "https://github.com/o/r/issues/1"
+        )
+    assert "comments of https://github.com/o/r/issues/1" in str(exc.value)
+
+
+def test_a_comment_listing_failure_is_classified_as_usual():
+    """A page `gh` could not fetch is transient or conclusive by its text, as
+    every read is; a parent GitHub cannot resolve is not found. Never a
+    shorter listing."""
+    url = "https://github.com/o/r/issues/1"
+    pages = iter(
+        [_comment_page([_comment_node(url, 1)], parent="issue", has_next=True, cursor="c1")]
+    )
+
+    def flaky(req):
+        try:
+            return _res(next(pages))
+        except StopIteration:
+            return _res({}, exit_code=1, stderr="HTTP 502: Bad Gateway")
+
+    with pytest.raises(GitHubUnavailableError, match="502"):
+        GitHubClient(runner=flaky, retry_delay_seconds=0).get_issue_comments(url)
+    missing = _res(
+        _issue_comments_payload(None),
+        exit_code=1,
+        stderr="gh: Could not resolve to an Issue with the number of 1.",
+    )
+    with pytest.raises(GitHubNotFoundError):
+        _client(lambda req: missing).get_issue_comments(url)
 
 
 # -- typed effect writes (ADR 0004 D12.2) ----------------------------------------

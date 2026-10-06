@@ -230,8 +230,11 @@ operator's identity.
 `progress` is required in the phase's launch result (the `FULL` request of
 `result_parser.UpdateEpicRequest`): non-blank, multi-line text with no other
 control character, at most `MAX_PROGRESS_CHARS` (16384, rejected by size,
-never clipped), with no marker and no URL of the comment it becomes. The
-controller appends the `ai-epic-progress` marker itself.
+never clipped), with no marker and no URL at all: `://` of any scheme or a
+`www.` host, refused even inside code (`_PROGRESS_URL_RE`, #160). The
+controller appends the `ai-epic-progress` marker itself, and the marker
+names the issue and the PR; the prompt asks for `#n` references instead of
+links. `roadmap_section` is not under this rule and may link PRs.
 
 `progress` and `roadmap_section` both pass the published-content policy
 (`published_text_problem`; [github-safety.md](github-safety.md),

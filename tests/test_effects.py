@@ -83,6 +83,7 @@ from autoforge.errors import (
 )
 from autoforge.executor import ExecutionRequest, ExecutionResult, execute
 from autoforge.git_transport import GitRemote, GitTransport
+from autoforge.github import GitHubClient
 from autoforge.replan_txn import ReplanAttestation, render_marker
 from autoforge.result_parser import MAX_FINDINGS_PER_REVIEW
 from autoforge.transitions import Phase
@@ -1638,6 +1639,193 @@ def test_a_created_object_a_human_closed_before_the_save_is_a_conflict(case):
     assert saves.stages == [(Stage.CONFLICT, 1, 1)]
     assert created in driven.record.reason and not driven.issued
     assert len(fake.effect_writes) == 1 and case.landed(fake, record) == [created]
+
+
+# -- complete comment listings behind the real client (K4, K8) -------------------------
+
+
+class CommentConversation:
+    """`gh` for one issue's or PR's conversation, behind the real ``GitHubClient``.
+
+    Serves the GraphQL comment walk at most 100 comments a page, by cursor,
+    and the REST comment create, which appends a comment. ``lose_reply``
+    makes the next create land and then fail as `gh` does on a lost reply
+    (HTTP 502), an unknown outcome. Every other `gh` call fails the test.
+    """
+
+    PAGE = 100
+
+    def __init__(self, parent_url: str, bodies: list[str]) -> None:
+        self.parent_url = parent_url
+        self.parent = "issue" if "/issues/" in parent_url else "pullRequest"
+        self.comments: list[tuple[int, str]] = []
+        self.pages_read = 0
+        self.creates = 0
+        self.lose_reply = False
+        for body in bodies:
+            self.add(body)
+
+    def add(self, body: str) -> str:
+        cid = 5000 + len(self.comments)
+        self.comments.append((cid, body))
+        return comment_url(self.parent_url, cid)
+
+    def holding(self, body: str) -> list[str]:
+        return [comment_url(self.parent_url, cid) for cid, b in self.comments if b == body]
+
+    def __call__(self, req: ExecutionRequest) -> ExecutionResult:
+        command = req.command
+        if command[1:3] == ["api", "graphql"]:
+            return self._page(command)
+        if command[1:4] == ["api", "--method", "POST"]:
+            assert req.stdin_data is not None
+            self.creates += 1
+            url = self.add(json.loads(req.stdin_data)["body"])
+            if self.lose_reply:
+                self.lose_reply = False
+                return self._reply("", exit_code=1, stderr="HTTP 502: Bad Gateway")
+            cid = int(url.rsplit("-", 1)[1])
+            return self._reply(json.dumps({"id": cid, "html_url": url}))
+        raise AssertionError(f"unexpected gh call: {command}")
+
+    def _page(self, command: list[str]) -> ExecutionResult:
+        self.pages_read += 1
+        after = [a.removeprefix("after=") for a in command if a.startswith("after=")]
+        start = int(after[0]) if after else 0
+        rows = self.comments[start : start + self.PAGE]
+        end = start + len(rows)
+        has_next = end < len(self.comments)
+        nodes = [
+            {
+                "url": comment_url(self.parent_url, cid),
+                "body": body,
+                "author": {"login": "someone"},
+                "createdAt": "2026-01-01T00:00:00Z",
+            }
+            for cid, body in rows
+        ]
+        connection = {
+            "pageInfo": {"hasNextPage": has_next, "endCursor": str(end) if has_next else None},
+            "nodes": nodes,
+        }
+        data = {"data": {"repository": {self.parent: {"comments": connection}}}}
+        return self._reply(json.dumps(data))
+
+    @staticmethod
+    def _reply(stdout: str, *, exit_code: int = 0, stderr: str = "") -> ExecutionResult:
+        return ExecutionResult(
+            command=["gh"],
+            cwd=None,
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            started_at="t",
+            finished_at="t",
+        )
+
+
+# The comment kinds: the record, and the conversation its identity read lists.
+COMMENT_KINDS = [
+    pytest.param(review_record, PR, REVIEW_MARKER, id="K4-review-comment"),
+    pytest.param(progress_record, EPIC, PROGRESS_MARKER, id="K8-progress-comment"),
+]
+FILLER = [f"Comment {n}, carrying no marker." for n in range(150)]
+
+
+def conversation_client(parent_url: str, bodies: list[str]):
+    conversation = CommentConversation(parent_url, bodies)
+    return conversation, GitHubClient(runner=conversation, retry_delay_seconds=0)
+
+
+def count_saves(log: list[EffectRecord]) -> Callable[[EffectRecord], None]:
+    def persist(record: EffectRecord) -> None:
+        assert EffectRecord.from_dict(json.loads(json.dumps(record.to_dict()))) == record
+        log.append(record)
+
+    return persist
+
+
+@pytest.mark.parametrize(("build", "parent_url", "marker"), COMMENT_KINDS)
+def test_a_comment_that_landed_past_the_first_hundred_is_reconciled_without_a_second_post(
+    build, parent_url, marker
+):
+    """#160 R1-F1, post-write recovery: the create landed, the process died before
+    the save, and the conversation had grown past one page. The comment is the
+    151st; the identity read walks every page and adopts it, no second post."""
+    record = build()
+    conversation, github = conversation_client(parent_url, FILLER)
+    landed = conversation.add(record.body)
+    conversation.add("A later comment.")
+    attempted = record.attempting()  # the save that preceded the lost write
+
+    saves: list[EffectRecord] = []
+    driven = drive(attempted, operation_for(attempted, github), count_saves(saves))
+
+    assert not driven.issued and conversation.creates == 0
+    assert [(r.stage, r.attempts) for r in saves] == [(Stage.OBSERVED, 1)]
+    assert driven.record.observed == {"url": landed}
+    assert conversation.pages_read == 2
+
+
+@pytest.mark.parametrize(("build", "parent_url", "marker"), COMMENT_KINDS)
+def test_a_lost_reply_is_read_back_past_the_first_hundred_comments(build, parent_url, marker):
+    """#160 R1-F1: the controller's create lands as the 151st comment and its reply
+    is lost. The read-back that decides the unknown outcome walks every page,
+    so it observes the comment: one post, never a second."""
+    record = build()
+    conversation, github = conversation_client(parent_url, FILLER)
+    conversation.lose_reply = True
+
+    saves: list[EffectRecord] = []
+    driven = drive(record, operation_for(record, github), count_saves(saves))
+
+    assert driven.issued and conversation.creates == 1
+    assert [(r.stage, r.attempts) for r in saves] == [(Stage.ATTEMPTED, 1), (Stage.OBSERVED, 1)]
+    (landed,) = conversation.holding(record.body)
+    assert driven.record.observed == {"url": landed}
+    assert landed == comment_url(parent_url, 5150)
+
+
+@pytest.mark.parametrize(("build", "parent_url", "marker"), COMMENT_KINDS)
+def test_a_marker_comment_past_the_first_hundred_is_seen_before_the_first_post(
+    build, parent_url, marker
+):
+    """#160 R1-F1: the precondition (no comment carries the identity) is judged on the
+    whole conversation. A comment carrying the marker past the first page is
+    a conflict naming it, and nothing is posted."""
+    record = build()
+    conversation, github = conversation_client(parent_url, FILLER)
+    other = conversation.add(f"Someone else's comment.\n\n{marker}")
+
+    saves: list[EffectRecord] = []
+    driven = drive(record, operation_for(record, github), count_saves(saves))
+
+    assert not driven.issued and conversation.creates == 0
+    assert [r.stage for r in saves] == [Stage.CONFLICT]
+    assert other in driven.record.reason
+
+
+@pytest.mark.parametrize(("build", "parent_url", "marker"), COMMENT_KINDS)
+def test_a_comment_listing_that_cannot_reach_its_end_never_reads_as_absent(
+    build, parent_url, marker
+):
+    """#160 R1-F1: a conversation whose second page cannot be read is not a
+    conversation without the marker: the identity read raises, nothing is
+    saved, charged or posted."""
+    record = build()
+    conversation, github = conversation_client(parent_url, FILLER)
+    serve = conversation.__call__
+
+    def second_page_fails(req: ExecutionRequest) -> ExecutionResult:
+        if any(a.startswith("after=") for a in req.command):
+            return CommentConversation._reply("", exit_code=1, stderr="HTTP 502: Bad Gateway")
+        return serve(req)
+
+    github = GitHubClient(runner=second_page_fails, retry_delay_seconds=0)
+    saves: list[EffectRecord] = []
+    with pytest.raises(GitHubUnavailableError, match="502"):
+        drive(record, operation_for(record, github), count_saves(saves))
+    assert saves == [] and conversation.creates == 0
 
 
 # -- K1: push, against a local bare repository -----------------------------------------

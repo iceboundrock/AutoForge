@@ -1638,6 +1638,54 @@ def test_progress_is_bounded_multi_line_text():
     assert 4 * MAX_PROGRESS_CHARS <= 65536
 
 
+@pytest.mark.parametrize(
+    "text,index",
+    [
+        ("Merged in https://github.com/owner/repo/pull/42.", 15),
+        ("See http://example.test/x", 8),
+        ("HTTPS://GITHUB.COM/owner/repo/pull/42", 5),
+        ("Docs at www.example.test", 8),
+        ("Docs at WWW.example.test", 8),
+        ("Logs: ftp://host/path", 9),
+        ("Run `git clone ssh://host/repo`", 18),
+        ("```\nhttps://github.com/owner/repo/pull/42\n```", 9),
+        ("(www.example.test)", 1),
+        ("- _www.example.test_", 3),
+    ],
+)
+def test_progress_with_a_url_is_refused_without_quoting_it(text, index):
+    """#160: the progress text carries no URL, code included; the
+    controller's marker names the issue and the PR."""
+    msg = _refusal(lambda: _full(progress=text))
+    assert f"field 'progress' contains a URL at index {index}" in msg
+    assert "'#n'" in msg
+    assert "example.test" not in msg and "github.com" not in msg
+    # The field validator refuses it with the parser's message (D4.6).
+    assert _refusal(lambda: validate_progress_text(text)) == msg
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Issue #2 done in PR #42; `pytest` passes.",
+        "Updated awww.ts and the www_root setting.",
+        "Mail a@b.example about owner/repo#42.",
+        "A ratio of 1:2, a path //srv/data, a scheme-less github.com/owner/repo.",
+    ],
+)
+def test_progress_without_a_url_passes(text):
+    assert _full(progress=text).progress == text
+
+
+def test_only_progress_is_refused_for_a_url():
+    """The roadmap section may link the EPIC's PRs; the URL rule is the
+    progress comment's alone, and it runs after the shared rules."""
+    linked = "## Roadmap\n- [x] #1 (https://github.com/owner/repo/pull/42)"
+    assert _full(roadmap_section=linked).roadmap_section == linked
+    msg = _refusal(lambda: _full(progress="Done, @octocat: https://example.test"))
+    assert "@-mention" in msg and "URL" not in msg
+
+
 _RE_REQUESTS = [
     # request, a payload of its own schema, a key outside it
     (UpdateEpicRequest.SELECTION, {"next_issue_url": ISSUE}, "roadmap_section"),
@@ -1717,6 +1765,7 @@ def test_update_epic_request_is_threaded_through_the_parser():
         (validate_progress_text, "progress", "@octocat"),
         (validate_progress_text, "progress", "x" * (MAX_PROGRESS_CHARS + 1)),
         (validate_progress_text, "progress", "  "),
+        (validate_progress_text, "progress", "See https://example.test"),
         (validate_roadmap_section, "roadmap_section", "<!-- ai-x -->"),
         (validate_roadmap_section, "roadmap_section", "<!-- autoforge-x -->"),
         (validate_roadmap_section, "roadmap_section", "a\x00b"),

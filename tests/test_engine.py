@@ -4348,6 +4348,35 @@ def test_update_epic_result_without_progress_text_is_corrected_before_anything_i
     assert _progress_posts(fake_github) == []
 
 
+def test_update_epic_progress_with_a_url_is_corrected_before_anything_is_posted(
+    tmp_state_dir, fake_github
+):
+    """#160: the progress text carries no URL. A result whose progress links
+    the PR takes the correction path: nothing is posted, journaled or
+    written while the correction is asked for, and the one comment posted
+    afterwards carries the corrected text."""
+    linked = "Implemented issue 2 in https://github.com/owner/repo/pull/42; tests pass."
+    seen_at_correction: list[tuple] = []
+
+    def agent(req):
+        if not req.correction:
+            return _epic_result(None, progress=linked)
+        s = load_state(eng.paths.state_file)
+        seen_at_correction.append(
+            (_progress_posts(fake_github), s.effect_records, list(fake_github.edited_issues))
+        )
+        return _epic_result(None)
+
+    eng = _in_update_epic(tmp_state_dir, fake_github, agent)
+    assert eng.step().next_phase == "DONE"
+    assert len(eng.provider.calls) == 2
+    assert "field 'progress' contains a URL at index 28" in eng.provider.calls[1].prompt
+    assert seen_at_correction == [([], [], [])]
+    assert _progress_posts(fake_github) == [
+        ("create_issue_comment", EPIC, _controller_progress_body())
+    ]
+
+
 def test_update_epic_agent_that_posts_its_own_progress_comment_blocks_before_the_controller_posts(
     tmp_state_dir, fake_github
 ):

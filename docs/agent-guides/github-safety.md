@@ -479,7 +479,13 @@ them.
 - **Identity reads are complete.** Each kind is found by its marker or
   identity in a complete listing that also sees objects no longer open
   (`list_prs_for_head`, `list_issues_above` bounded by a watermark taken
-  before the create, the full comment listing), never the search API.
+  before the create, the full comment listing), never the search API. An
+  issue's or PR's comments (K4, K8, the replan close receipt) are read by
+  GraphQL cursor, 100 a page, until GitHub reports no next page;
+  `gh issue view` / `gh pr view --json comments` stop at the first 100 and
+  are not used. A listing that cannot be read to its end (a failed page,
+  a page with no next cursor, a cursor seen twice) is an error, never an
+  absent comment.
 - **Records before writes.** A record (`src/autoforge/effects.py`) holds
   the kind, the identity, the exact target, the precondition, the payload,
   the attempt count, the stage and the observed result. It moves from
