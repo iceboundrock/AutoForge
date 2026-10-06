@@ -1,13 +1,28 @@
-"""GitHub abstraction over the `gh` CLI (verification + controller-owned merge).
+"""GitHub abstraction over the `gh` CLI (verification reads + controller-owned writes).
 
 Business logic must use these typed objects, never parse raw `gh` JSON
-inline. Agents perform content writes (branches, PRs, comments, issues)
-under controller prompts, and the controller only *verifies* what they
-claim through this client. Controller-owned exceptions are
-:meth:`GitHubClient.merge_pr`, :meth:`GitHubClient.disable_auto_merge`, and
-:meth:`GitHubClient.close_pr` for a verified replacement lifecycle. Merging
-is always behind the safety gate and bound to the reviewed HEAD via
-``--match-head-commit``; closing a superseded PR never deletes its branch.
+inline. The controller reads GitHub through this client to verify what an
+agent claims, and it performs every GitHub write itself through it:
+
+- the typed effect writes of ADR 0004 (D12.2), one method per GitHub effect
+  kind: :meth:`GitHubClient.create_pull_request` (K2, K7),
+  :meth:`GitHubClient.write_pr_body` (K3),
+  :meth:`GitHubClient.create_pr_comment` (K4),
+  :meth:`GitHubClient.create_issue` (K5),
+  :meth:`GitHubClient.write_issue_body` (K6) and
+  :meth:`GitHubClient.create_issue_comment` (K8). Each is issued exactly
+  once, outside the transient-retry loop that reads keep (D4.3): an
+  ambiguous outcome is never re-sent, the caller reconciles it by reading
+  the target back by its identity. The payload travels on stdin, never in
+  argv, and the repository is named in the API path (D7.4). What a write
+  returns is informational; the caller's read-back is the evidence;
+- the writes that keep their own mechanisms (D5.4):
+  :meth:`GitHubClient.merge_pr`, always behind the safety gate and bound to
+  the reviewed HEAD via ``--match-head-commit``;
+  :meth:`GitHubClient.disable_auto_merge`; :meth:`GitHubClient.close_pr`,
+  its receipt and the compensating :meth:`GitHubClient.reopen_pr` for a
+  verified replacement lifecycle, never deleting a branch; and the EPIC
+  roadmap splice, :meth:`GitHubClient.edit_issue_body`.
 """
 
 from __future__ import annotations
@@ -17,8 +32,10 @@ import os
 import re
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
+from datetime import datetime
+from typing import NoReturn
 from urllib.parse import quote, urlencode
 
 from .errors import (
@@ -33,7 +50,9 @@ from .validation import (
     GitHubCommentRef,
     GitHubIssueRef,
     GitHubPullRequestRef,
+    GitHubRef,
     parse_comment_url,
+    parse_github_url,
     parse_issue_url,
     parse_pr_url,
 )
@@ -352,6 +371,23 @@ class PRInfo:
 
 
 @dataclass(frozen=True)
+class CreatedObject:
+    """What GitHub's reply to a controller write says it wrote (ADR 0004 D12.2).
+
+    Informational only: a caller never treats it as evidence. The effect's
+    completion is the caller's read-back of the target by its identity
+    (D2.1), exactly as when the reply was lost.
+
+    ``url`` is canonical: an issue or PR URL, or for a comment the
+    ``...#issuecomment-<id>`` URL. ``number`` is the issue or PR number, and
+    ``None`` for a comment (its id is in the URL).
+    """
+
+    url: str
+    number: int | None
+
+
+@dataclass(frozen=True)
 class ChangedFile:
     """One file a PR changes, with the path it had before a rename or copy.
 
@@ -524,6 +560,32 @@ _OPEN_PR_PAGE_QUERY = (
     " headRepository { name } headRepositoryOwner { login }"
     " closingIssuesReferences(first: 100) { nodes { number } } } } } }"
 )
+# One page of an issue's or a PR's conversation comments, read by cursor until
+# GitHub reports no further page. `gh issue view --json comments` and `gh pr
+# view --json comments` read `comments(first: 100)` and never a second page,
+# so a comment past the hundredth was reported as absent to every identity
+# read built on them (K4, K8, the replan close receipt). The node fields are
+# the ones those views returned under the same names, so the same decoder
+# reads both. The connection is in creation order and a cursor names a
+# comment (its database id), not an offset: a comment posted while the walk
+# runs lands at the end, and one deleted does not shift the pages after it.
+_COMMENT_PAGE_SIZE = 100
+
+
+def _comment_page_query(parent: str) -> str:
+    """The comment-page query of ``parent``, ``issue`` or ``pullRequest``."""
+    return (
+        "query($owner: String!, $name: String!, $number: Int!, $after: String) {"
+        " repository(owner: $owner, name: $name) {"
+        f" {parent}(number: $number) {{"
+        f" comments(first: {_COMMENT_PAGE_SIZE}, after: $after) {{"
+        " pageInfo { hasNextPage endCursor }"
+        " nodes { url body createdAt author { login } } } } } }"
+    )
+
+
+_ISSUE_COMMENT_PAGE_QUERY = _comment_page_query("issue")
+_PR_COMMENT_PAGE_QUERY = _comment_page_query("pullRequest")
 
 
 # -- strict row decoding ----------------------------------------------------------
@@ -669,6 +731,207 @@ _ISSUE_LIST_FIELDS = "url,number,title,state,body"
 
 MERGE_METHODS = ("squash", "merge", "rebase")
 _SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
+# A full object id in either object format (SHA-1 or SHA-256), lower case.
+_FULL_SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+
+# GitHub's own limits on what a typed write may publish (ADR 0004 D2.4): an
+# issue or PR body and a comment are refused above 65,536 characters (HTTP
+# 422, "body is too long"), a title above 256. A payload past either is
+# refused before any process runs, never sent to collect the 422.
+MAX_BODY_CHARS = 65536
+MAX_TITLE_CHARS = 256
+
+# The newest-first all-states issue listing read down to the K5 number
+# watermark (:meth:`GitHubClient.list_issues_above`): one page per read, and a
+# bound on how many pages one walk may read, so a listing that cannot be read
+# down to the watermark is refused rather than read forever.
+_ISSUE_PAGE_SIZE = 100
+_ISSUE_WALK_MAX_PAGES = 100
+# Page size of the head-filtered PR listing (:meth:`GitHubClient.list_prs_for_head`).
+_HEAD_PR_PAGE_SIZE = 100
+
+# The answers of the compare endpoint (base...commit) that put the commit in
+# the base's history: it is ahead of the base by no commit (D7.5).
+_IN_HISTORY_STATUSES = frozenset({"behind", "identical"})
+_NOT_IN_HISTORY_STATUSES = frozenset({"ahead", "diverged"})
+
+_GITHUB_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def _repository_path(repository: str) -> str:
+    """``owner/repo`` as it goes into a REST path (ADR 0004 D7.4).
+
+    Exactly two GitHub name segments, neither made of dots alone: the path
+    must name the repository and nothing else, so no ``..`` segment, no
+    third segment and no ``{owner}`` placeholder `gh` would fill in from a
+    git remote.
+    """
+    owner, sep, name = (repository if isinstance(repository, str) else "").partition("/")
+    for part in (owner, name):
+        if not sep or not _GITHUB_NAME_RE.fullmatch(part) or not part.strip("."):
+            raise GitHubError(f"{repository!r} is not an owner/repo repository name")
+    return f"{owner}/{name}"
+
+
+def _check_write_bounds(what: str, *, body: str, title: str | None = None) -> None:
+    """Refuse a payload GitHub would refuse, before any process runs."""
+    if not isinstance(body, str):
+        raise GitHubError(f"{what}: the body is {type(body).__name__}, not text")
+    if len(body) > MAX_BODY_CHARS:
+        raise GitHubError(
+            f"{what}: the body is {len(body)} characters, over GitHub's limit of "
+            f"{MAX_BODY_CHARS}; nothing was sent"
+        )
+    if title is None:
+        return
+    if not isinstance(title, str):
+        raise GitHubError(f"{what}: the title is {type(title).__name__}, not text")
+    if len(title) > MAX_TITLE_CHARS:
+        raise GitHubError(
+            f"{what}: the title is {len(title)} characters, over GitHub's limit of "
+            f"{MAX_TITLE_CHARS}; nothing was sent"
+        )
+
+
+def _full_sha(value: str, role: str, what: str) -> str:
+    sha = value.lower() if isinstance(value, str) else ""
+    if not _FULL_SHA_RE.fullmatch(sha):
+        raise GitHubError(f"{what}: {role} {value!r:.80} is not a full commit SHA")
+    return sha
+
+
+def _write_unknown(what: str, problem: str) -> NoReturn:
+    """A write `gh` reported as done whose reply cannot be read (D4.3).
+
+    The write may well have landed; only a read-back by the effect's
+    identity can tell, so this is an ambiguous outcome, never a refusal.
+    The reply itself is not quoted: it echoes the payload.
+    """
+    raise GitHubUnavailableError(f"{what}: {problem}; the outcome is unknown")
+
+
+def _created_comment(reply: dict, target: GitHubRef, what: str) -> CreatedObject:
+    """The comment a create reply names, which must be on ``target``."""
+    try:
+        ref = parse_comment_url(str(reply.get("html_url") or ""))
+    except ConfigurationError:
+        _write_unknown(what, "the reply's html_url is not a GitHub comment URL")
+    comment_id = reply.get("id")
+    if isinstance(comment_id, bool) or comment_id != ref.comment_id:
+        _write_unknown(what, "the reply's id does not match its html_url")
+    if not ref.on(target):
+        _write_unknown(what, f"the reply names a comment on another object ({ref.canonical})")
+    return CreatedObject(url=ref.canonical, number=None)
+
+
+def _replied_object(
+    reply: dict, what: str, *, repository: str, expect: str | None, number: int | None = None
+) -> CreatedObject:
+    """The issue or PR a write reply names: in ``repository``, of kind ``expect``."""
+    try:
+        ref = parse_github_url(str(reply.get("html_url") or ""), expect=expect)
+    except ConfigurationError:
+        _write_unknown(what, f"the reply's html_url is not a GitHub {expect or 'issue/PR'} URL")
+    replied = reply.get("number")
+    if isinstance(replied, bool) or replied != ref.number:
+        _write_unknown(what, "the reply's number does not match its html_url")
+    if not ref.same_repository(repository) or (number is not None and ref.number != number):
+        _write_unknown(what, f"the reply names another object ({ref.canonical})")
+    return CreatedObject(url=ref.canonical, number=ref.number)
+
+
+@dataclass(frozen=True)
+class _ListedIssue:
+    """One row of the newest-first REST issue listing (issues and PRs alike)."""
+
+    number: int
+    created_at: datetime
+    is_pull_request: bool
+    row: dict
+
+
+def _listed_issue(row: object, what: str) -> _ListedIssue:
+    """The number, creation time and kind of one REST issue-listing row, strictly.
+
+    The REST issues listing returns pull requests too (a PR is an issue
+    there), marked by a ``pull_request`` key; they share one number
+    sequence with issues. A row without a usable number or creation time
+    is a conclusive GitHubError, never skipped: the watermark walk decides
+    where to stop from these two values.
+    """
+    data = _row_object(row, what)
+    number = data.get("number")
+    if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+        raise GitHubError(f"{what}: a row has no usable number: {number!r:.40}")
+    text = data.get("created_at")
+    try:
+        created = datetime.fromisoformat(text) if isinstance(text, str) else None
+    except ValueError:
+        created = None
+    if created is None or created.tzinfo is None:
+        raise GitHubError(f"{what}: #{number} has no usable created_at: {text!r:.40}")
+    return _ListedIssue(
+        number=number,
+        created_at=created,
+        is_pull_request="pull_request" in data,
+        row=data,
+    )
+
+
+def _rest_issue_row(data: dict) -> dict:
+    """A REST issue row in the ``gh issue view --json`` shape :func:`_decode_issue` reads.
+
+    REST names the HTML URL ``html_url`` (its ``url`` is the API URL) and
+    spells the state in lower case; the decoder upper-cases it.
+    """
+    return {
+        "url": data.get("html_url"),
+        "number": data.get("number"),
+        "title": data.get("title"),
+        "state": data.get("state"),
+        "body": data.get("body"),
+    }
+
+
+def _rest_pr_row(row: object, what: str) -> dict:
+    """A REST pull-request row in the ``gh pr view --json`` shape ``_pr_from_data`` reads.
+
+    One decoder reads every PR, so the REST row is translated, never decoded
+    separately: ``html_url`` is the PR URL, ``head``/``base`` carry the refs
+    and the head commit, a closed PR with a ``merged_at`` is ``MERGED`` (REST
+    has no merged state), and ``auto_merge`` is the armed auto-merge.
+    Closing-issue references, mergeability and checks are not in the REST
+    listing; a caller that needs them reads the PR with ``get_pr``.
+    """
+    data = _row_object(row, what)
+    head = data.get("head")
+    base = data.get("base")
+    if not isinstance(head, dict) or not isinstance(base, dict):
+        raise GitHubError(f"{what}: a row has no head or base object")
+    state = data.get("state")
+    if isinstance(state, str) and state.lower() == "closed" and data.get("merged_at"):
+        state = "MERGED"
+    head_repo = head.get("repo")
+    repo_name: object = None
+    owner_login: object = None
+    if isinstance(head_repo, dict):
+        repo_name = head_repo.get("name")
+        owner = head_repo.get("owner")
+        owner_login = owner.get("login") if isinstance(owner, dict) else None
+    return {
+        "url": data.get("html_url"),
+        "number": data.get("number"),
+        "title": data.get("title"),
+        "state": state,
+        "headRefOid": head.get("sha"),
+        "headRefName": head.get("ref"),
+        "baseRefName": base.get("ref"),
+        "isDraft": data.get("draft", False),
+        "body": data.get("body"),
+        "headRepository": {"name": repo_name} if repo_name else None,
+        "headRepositoryOwner": {"login": owner_login} if owner_login else None,
+        "autoMergeRequest": data.get("auto_merge"),
+    }
 
 
 def build_merge_argv(
@@ -770,19 +1033,46 @@ class GitHubClient:
         self.retry_delay_seconds = retry_delay_seconds
 
     # -- low level ------------------------------------------------------
+    def _invoke(self, args: list[str], stdin: bytes | None = None) -> ExecutionResult:
+        return self._runner(
+            ExecutionRequest(
+                command=[self.gh_command, *args],
+                timeout_seconds=self.timeout_seconds,
+                stdin_data=stdin,
+            )
+        )
+
+    def _timeout_message(self, args: list[str]) -> str:
+        return f"`gh {' '.join(args)}` timed out after {self.timeout_seconds}s"
+
+    @staticmethod
+    def _exit_failure(args: list[str], res: ExecutionResult) -> tuple[str, bool]:
+        """The message of a non-zero `gh` exit, and whether it is transient.
+
+        `gh` stderr can echo the request it made, including an
+        ``Authorization`` header or a token in a URL, and this message ends
+        up in `block_reason`, `verification_failures` and the run log.
+        Classify the raw tail, quote it redacted.
+        """
+        tail = res.stderr.strip()[-1000:]
+        message = f"`gh {' '.join(args)}` failed (exit {res.exit_code}): {redact(tail)}"
+        return message, is_transient_gh_failure(tail)
+
+    @staticmethod
+    def _conclusive(message: str) -> GitHubError:
+        """A non-transient failure: not found, or any other conclusive refusal."""
+        if is_not_found_gh_failure(message):
+            return GitHubNotFoundError(message)
+        return GitHubError(message)
+
     def _run_gh(self, args: list[str], allow_fail: bool = False) -> ExecutionResult:
         attempts = self.transient_retries + 1
         last_error = ""
         transient = False
         for i in range(attempts):
-            res = self._runner(
-                ExecutionRequest(
-                    command=[self.gh_command, *args],
-                    timeout_seconds=self.timeout_seconds,
-                )
-            )
+            res = self._invoke(args)
             if res.timed_out:
-                last_error = f"`gh {' '.join(args)}` timed out after {self.timeout_seconds}s"
+                last_error = self._timeout_message(args)
                 transient = True
             elif res.truncated:
                 # Head + marker + tail of a reply is not the reply: parsing it
@@ -793,13 +1083,7 @@ class GitHubClient:
                     "bound and cannot be parsed"
                 )
             elif res.exit_code != 0:
-                # `gh` stderr can echo the request it made, including an
-                # ``Authorization`` header or a token in a URL, and this
-                # message ends up in `block_reason`, `verification_failures`
-                # and the run log. Classify the raw tail, quote it redacted.
-                tail = res.stderr.strip()[-1000:]
-                last_error = f"`gh {' '.join(args)}` failed (exit {res.exit_code}): {redact(tail)}"
-                transient = is_transient_gh_failure(tail)
+                last_error, transient = self._exit_failure(args, res)
             else:
                 return res
             if allow_fail and not transient:
@@ -809,9 +1093,55 @@ class GitHubClient:
             time.sleep(self.retry_delay_seconds)
         if transient:
             raise GitHubUnavailableError(last_error)
-        if is_not_found_gh_failure(last_error):
-            raise GitHubNotFoundError(last_error)
-        raise GitHubError(last_error)
+        raise self._conclusive(last_error)
+
+    def _run_gh_once(self, args: list[str], *, stdin: bytes | None = None) -> ExecutionResult:
+        """Run `gh` exactly once: the transport of a write (ADR 0004 D4.3).
+
+        A write is never re-sent on an ambiguous outcome, because the first
+        attempt may have landed: a timeout, a transient failure and a reply
+        that cannot be read are GitHubUnavailableError, "outcome unknown",
+        and the caller reconciles by reading the target back. A 404 is
+        GitHubNotFoundError and any other conclusive failure (a 422, a 403)
+        GitHubError, classified exactly as :meth:`_run_gh` classifies them.
+        ``stdin`` is the payload, so it never appears in argv, a process
+        listing or an error message.
+        """
+        res = self._invoke(args, stdin)
+        if res.timed_out:
+            raise GitHubUnavailableError(f"{self._timeout_message(args)}; the outcome is unknown")
+        if res.exit_code != 0:
+            message, transient = self._exit_failure(args, res)
+            if transient:
+                raise GitHubUnavailableError(f"{message}; the outcome is unknown")
+            raise self._conclusive(message)
+        if res.truncated:
+            # The write was accepted (exit 0) but its reply is not readable:
+            # unlike a read, this is not a conclusive failure, the write may
+            # have landed.
+            raise GitHubUnavailableError(
+                f"`gh {' '.join(args)}` reply was truncated at the executor's capture "
+                "bound; the outcome is unknown"
+            )
+        return res
+
+    def _write(self, method: str, path: str, payload: dict[str, str], what: str) -> dict:
+        """One REST write: ``gh api --method <method> <path> --input -``, payload on stdin.
+
+        The reply is parsed whole in Python (no ``--jq``): a reply that is
+        not a JSON object is an unknown outcome, not a refusal.
+        """
+        res = self._run_gh_once(
+            ["api", "--method", method, path, "--input", "-"],
+            stdin=json.dumps(payload).encode("utf-8"),
+        )
+        try:
+            reply = json.loads(res.stdout)
+        except json.JSONDecodeError:
+            _write_unknown(what, "`gh` returned a reply that is not JSON")
+        if not isinstance(reply, dict):
+            _write_unknown(what, "`gh` returned a reply that is not a JSON object")
+        return reply
 
     def _json(self, args: list[str]) -> object:
         res = self._run_gh(args)
@@ -1403,24 +1733,26 @@ class GitHubClient:
         except GitHubError:
             return False
 
-    def list_open_prs(self, repo: str) -> list[PRInfo]:
-        """Every open PR in ``repo`` (bodies included), read to the end.
+    def _walk_connection(
+        self,
+        query: str,
+        variables: list[str],
+        connection_of: Callable[[dict, str], dict],
+        what: str,
+    ) -> Iterator[object]:
+        """Every node of one GraphQL connection, read by cursor to its end.
 
-        The listing is complete or it raises: every caller decides "no
-        candidate exists" on it (an ANALYZE_EXECUTE entry launching an
-        implementer, a replan concluding no replacement was created), and
-        "the candidate was past a limit" must never be reported as absence
-        (issue #20). Pages are walked by cursor until GitHub says there is no
-        next one; a page GitHub answered with errors (so possibly partial),
-        a page that is not a PR connection, a next page GitHub announces
-        without a cursor to reach it, or a cursor the walk already used (a
-        cycle) is a conclusive GitHubError, never a shorter list. A PR seen
-        twice (the listing moved under the walk) is kept once.
+        ``variables`` are the query's ``-f``/``-F`` arguments; the walk adds
+        ``after``. ``connection_of`` picks the connection out of a page's
+        ``data``, raising (its message led by the page's name) when the page
+        does not hold one. Nodes are yielded page by page, as read and
+        undecoded. Pages are walked until GitHub says there is no next one;
+        a page GitHub answered with errors (so possibly partial), a
+        connection without usable ``nodes`` and ``pageInfo``, a next page
+        GitHub announces without a cursor to reach it, or a cursor the walk
+        already used (a cycle) is a conclusive GitHubError, never a shorter
+        listing.
         """
-        what = f"open PR listing of {repo}"
-        owner, _, name = repo.partition("/")
-        prs: list[PRInfo] = []
-        seen: set[int] = set()
         after: str | None = None
         # Every cursor the walk has already asked for. A cursor that comes
         # back a second time, however many pages later, would walk a cycle
@@ -1429,57 +1761,25 @@ class GitHubClient:
         page_number = 0
         while True:
             page_number += 1
-            # `-f` sends each variable as a string. `-F` would type-coerce
-            # it: an all-digit owner login would become an integer and a
-            # repository named `null`, `true` or `false` a null or boolean,
-            # which GitHub refuses for a `String!` variable.
-            args = [
-                "api",
-                "graphql",
-                "-f",
-                f"query={_OPEN_PR_PAGE_QUERY}",
-                "-f",
-                f"owner={owner}",
-                "-f",
-                f"name={name}",
-            ]
+            args = ["api", "graphql", "-f", f"query={query}", *variables]
             if after is not None:
                 args += ["-f", f"after={after}"]
             page_what = f"{what}, page {page_number}"
-            data = self._graphql_data(args, page_what)
-            repository = data.get("repository")
-            if not isinstance(repository, dict):
-                raise GitHubError(f"{page_what}: repository is not readable: {repository!r:.200}")
-            connection = repository.get("pullRequests")
-            if not isinstance(connection, dict):
-                raise GitHubError(
-                    f"{page_what} is not a pull-request connection: {connection!r:.200}"
-                )
+            connection = connection_of(self._graphql_data(args, page_what), page_what)
             nodes = connection.get("nodes")
             info = connection.get("pageInfo")
             if not isinstance(nodes, list) or not isinstance(info, dict):
                 raise GitHubError(
                     f"{page_what} has no usable nodes or pageInfo: {connection!r:.200}"
                 )
-            for node in nodes:
-                row = _row_object(node, what)
-                # `gh pr list --json` flattens this connection to its nodes;
-                # the decoder reads that shape. The connection is validated
-                # here, before flattening: a malformed one must not read as
-                # "this PR closes no issue".
-                linked = _linked_issue_nodes(row.get("closingIssuesReferences"), what)
-                pr = self._pr_from_data(dict(row, closingIssuesReferences=linked), what)
-                if pr.number in seen:
-                    continue
-                seen.add(pr.number)
-                prs.append(pr)
+            yield from nodes
             has_next = info.get("hasNextPage")
             if not isinstance(has_next, bool):
                 raise GitHubError(
                     f"{page_what} does not say whether a next page exists: {info!r:.200}"
                 )
             if not has_next:
-                return prs
+                return
             cursor = info.get("endCursor")
             if not isinstance(cursor, str) or not cursor:
                 raise GitHubError(
@@ -1493,6 +1793,53 @@ class GitHubClient:
                 )
             used_cursors.add(cursor)
             after = cursor
+
+    def list_open_prs(self, repo: str) -> list[PRInfo]:
+        """Every open PR in ``repo`` (bodies included), read to the end.
+
+        The listing is complete or it raises: every caller decides "no
+        candidate exists" on it (an ANALYZE_EXECUTE entry launching an
+        implementer, a replan concluding no replacement was created), and
+        "the candidate was past a limit" must never be reported as absence
+        (issue #20). The pages are walked by cursor
+        (:meth:`_walk_connection`), so a page that cannot be read or walked
+        past is a conclusive GitHubError, never a shorter list. A PR seen
+        twice (the listing moved under the walk) is kept once.
+        """
+        what = f"open PR listing of {repo}"
+        owner, _, name = repo.partition("/")
+
+        def pull_requests(data: dict, page_what: str) -> dict:
+            repository = data.get("repository")
+            if not isinstance(repository, dict):
+                raise GitHubError(f"{page_what}: repository is not readable: {repository!r:.200}")
+            connection = repository.get("pullRequests")
+            if not isinstance(connection, dict):
+                raise GitHubError(
+                    f"{page_what} is not a pull-request connection: {connection!r:.200}"
+                )
+            return connection
+
+        # `-f` sends each variable as a string. `-F` would type-coerce it: an
+        # all-digit owner login would become an integer and a repository
+        # named `null`, `true` or `false` a null or boolean, which GitHub
+        # refuses for a `String!` variable.
+        variables = ["-f", f"owner={owner}", "-f", f"name={name}"]
+        prs: list[PRInfo] = []
+        seen: set[int] = set()
+        for node in self._walk_connection(_OPEN_PR_PAGE_QUERY, variables, pull_requests, what):
+            row = _row_object(node, what)
+            # `gh pr list --json` flattens this connection to its nodes; the
+            # decoder reads that shape. The connection is validated here,
+            # before flattening: a malformed one must not read as "this PR
+            # closes no issue".
+            linked = _linked_issue_nodes(row.get("closingIssuesReferences"), what)
+            pr = self._pr_from_data(dict(row, closingIssuesReferences=linked), what)
+            if pr.number in seen:
+                continue
+            seen.add(pr.number)
+            prs.append(pr)
+        return prs
 
     def list_all_prs(self, repo: str, *, strict: bool = False) -> list[PRInfo]:
         """Every PR in ``repo`` across all states (bodies included).
@@ -1573,6 +1920,248 @@ class GitHubClient:
             highest = max(highest, number)
         return highest
 
+    # -- effect identity reads (ADR 0004 D4.5, D7.5) -----------------------------
+    def commit_in_history(self, repository: str, base_sha: str, commit_sha: str) -> bool:
+        """Whether ``commit_sha`` is in the history of ``base_sha``, in GitHub's word (D7.5).
+
+        Read through the compare endpoint with ``base_sha`` as the base and
+        the commit as the head, projected to its ``status`` with ``--jq``
+        (the full answer carries every commit and patch between the two):
+        ``behind`` or ``identical`` means the commit is an ancestor of, or
+        equal to, the base; ``ahead`` or ``diverged`` means it is not. A 404
+        means GitHub does not know the commit as part of this repository, so
+        it is not in the history: that is a definitive answer, not a
+        transient one. (GitHub also answers 404 for an unknown base or a
+        repository it does not show; reading that as "not in the history"
+        only widens what the caller has to publish.) Any other status is a
+        conclusive GitHubError, never guessed.
+
+        Both SHAs must be full object ids (40 or 64 hex digits), checked
+        before any process runs: a branch name or a short SHA could resolve
+        differently between the read and its use.
+        """
+        what = f"history of {base_sha!r:.80} in {repository!r:.120}"
+        base = _full_sha(base_sha, "base", what)
+        commit = _full_sha(commit_sha, "commit", what)
+        repo = _repository_path(repository)
+        try:
+            res = self._run_gh(
+                ["api", f"repos/{repo}/compare/{base}...{commit}", "--jq", ".status"]
+            )
+        except GitHubNotFoundError:
+            return False
+        status = res.stdout.strip()
+        if status in _IN_HISTORY_STATUSES:
+            return True
+        if status in _NOT_IN_HISTORY_STATUSES:
+            return False
+        raise GitHubError(
+            f"{what}: the compare of {commit[:12]} answered an unknown status {status!r:.40}"
+        )
+
+    def latest_issue_number(self, repository: str) -> int:
+        """The largest issue *or pull-request* number in ``repository`` (0 if none).
+
+        The K5 provenance watermark, mirroring :meth:`latest_pr_number`: an
+        issue whose number is <= the value read before a create cannot be
+        the issue that create made. Issues and pull requests share one
+        number sequence, and the REST issues listing returns both (a pull
+        request is an issue there), so the maximum is taken over both: it is
+        the last number GitHub handed out, whichever kind took it.
+
+        A proven numeric maximum over the all-states listing read to its
+        end (``--paginate``, which, unlike ``gh pr list --limit``, has no
+        ceiling that could cut it short), projected to the numbers with
+        ``--jq`` so a large repository's bodies never reach the executor's
+        output bound. Never inferred from creation order. A row without a
+        positive integer number raises GitHubError (fail closed), as does a
+        listing that cannot be read to its end.
+        """
+        repo = _repository_path(repository)
+        endpoint = f"repos/{repo}/issues?" + urlencode({"state": "all", "per_page": 100})
+        res = self._run_gh(["api", "--paginate", endpoint, "--jq", ".[].number"])
+        highest = 0
+        for line in res.stdout.splitlines():
+            text = line.strip()
+            if not text:
+                continue
+            if not text.isdigit() or not text.isascii() or int(text) < 1:
+                raise GitHubError(
+                    f"latest issue number for {repo}: a listed number is not a positive "
+                    f"integer: {text!r:.40}"
+                )
+            highest = max(highest, int(text))
+        return highest
+
+    def list_issues_above(self, repository: str, watermark: int) -> list[IssueInfo]:
+        """Every issue of ``repository`` numbered above ``watermark``, in any state.
+
+        The K5 identity read (D4.5): the all-states listing read newest
+        first (``sort=created``, ``direction=desc``) down to the watermark,
+        never the search API. Pull requests, which the REST issues listing
+        also returns (marked by a ``pull_request`` key), are not issues and
+        are left out; they still mark where the walk is, since they share
+        the number sequence.
+
+        GitHub orders by creation time to the second, so rows created in
+        the same second may come in any order: the walk does not stop at
+        the first row at or below the watermark, but reads on while the
+        listing is still in that row's second, and keeps every issue above
+        the watermark it meets. A listing that ends first is read to its
+        end. The result is newest first. (An issue transferred in keeps its
+        old creation time under a new number, so it may sort below the
+        watermark's second and not be listed; it is not an issue the
+        caller created.)
+
+        A malformed row, or a listing that cannot be read down to the
+        watermark within ``_ISSUE_WALK_MAX_PAGES`` pages, raises GitHubError.
+        """
+        if isinstance(watermark, bool) or not isinstance(watermark, int) or watermark < 0:
+            raise GitHubError(f"issues above {watermark!r:.40}: the watermark is not a number")
+        repo = _repository_path(repository)
+        what = f"issues of {repo} above #{watermark}"
+        found: dict[int, IssueInfo] = {}
+        boundary: datetime | None = None
+        for page in range(1, _ISSUE_WALK_MAX_PAGES + 1):
+            endpoint = f"repos/{repo}/issues?" + urlencode(
+                {
+                    "state": "all",
+                    "sort": "created",
+                    "direction": "desc",
+                    "per_page": _ISSUE_PAGE_SIZE,
+                    "page": page,
+                }
+            )
+            rows = [_listed_issue(row, what) for row in self._api_list(["api", endpoint])]
+            for row in rows:
+                if row.number <= watermark:
+                    if boundary is None:
+                        boundary = row.created_at
+                    continue
+                if row.is_pull_request or row.number in found:
+                    continue
+                issue = _decode_issue(_rest_issue_row(row.row), what)
+                if issue.repository.lower() != repo.lower():
+                    raise GitHubError(f"{what}: the listing returned {issue.url}")
+                found[row.number] = issue
+            if len(rows) < _ISSUE_PAGE_SIZE:
+                break
+            if boundary is not None and rows[-1].created_at < boundary:
+                break
+        else:
+            raise GitHubError(
+                f"{what}: the listing cannot be read down to the watermark within "
+                f"{_ISSUE_WALK_MAX_PAGES * _ISSUE_PAGE_SIZE} rows"
+            )
+        return sorted(found.values(), key=lambda issue: issue.number, reverse=True)
+
+    def list_prs_for_head(self, repository: str, branch: str) -> list[PRInfo]:
+        """Every PR of ``repository`` headed at ``branch`` of the same repository, any state.
+
+        The K2/K7 identity read (D4.5): the REST pulls listing filtered by
+        ``head=<owner>:<branch>`` and ``state=all``, read to the end, so it
+        sees closed and merged PRs too; never the search API. A row the
+        filter returns that is not headed at ``branch`` of this repository
+        (a fork's PR, or a PR whose head repository is gone) is left out.
+
+        The rows go through the one PR decoder; the REST listing carries
+        neither closing-issue references, mergeability nor checks, so those
+        are empty: a caller that needs them reads the PR with :meth:`get_pr`.
+        """
+        repo = _repository_path(repository)
+        if not isinstance(branch, str) or not branch.strip() or ":" in branch:
+            raise GitHubError(f"PRs of {repo}: head branch {branch!r:.120} is not a branch name")
+        owner = repo.split("/", 1)[0]
+        what = f"PRs of {repo} headed at {branch!r:.120}"
+        endpoint = f"repos/{repo}/pulls?" + urlencode(
+            {"state": "all", "head": f"{owner}:{branch}", "per_page": _HEAD_PR_PAGE_SIZE}
+        )
+        prs: list[PRInfo] = []
+        for row in self._api_pages(endpoint):
+            pr = self._pr_from_data(_rest_pr_row(row, what), what)
+            if pr.repository.lower() != repo.lower():
+                raise GitHubError(f"{what}: the listing returned {pr.url}")
+            if pr.head_ref == branch and pr.head_repository.lower() == repo.lower():
+                prs.append(pr)
+        return sorted(prs, key=lambda pr: pr.number, reverse=True)
+
+    # -- typed effect writes (ADR 0004 D12.2) ------------------------------------
+    # One method per effect kind, each issued once outside the retry loop
+    # (D4.3, :meth:`_run_gh_once`), its payload on stdin, the repository in
+    # the API path (D7.4). The typed result is what GitHub's reply says it
+    # wrote: informational, never the evidence; the caller reads it back.
+    def create_issue_comment(self, issue_url: str, body: str) -> CreatedObject:
+        """Post ``body`` as a new comment on an issue (K8)."""
+        ref = parse_issue_url(issue_url)
+        what = f"comment on {ref.canonical}"
+        _check_write_bounds(what, body=body)
+        path = f"repos/{_repository_path(ref.repository)}/issues/{ref.number}/comments"
+        return _created_comment(self._write("POST", path, {"body": body}, what), ref, what)
+
+    def create_pr_comment(self, pr_url: str, body: str) -> CreatedObject:
+        """Post ``body`` as a new comment on a pull request (K4).
+
+        A PR's conversation comments are issue comments to the REST API, so
+        this is the issues comments endpoint with the PR's number.
+        """
+        ref = parse_pr_url(pr_url)
+        what = f"comment on {ref.canonical}"
+        _check_write_bounds(what, body=body)
+        path = f"repos/{_repository_path(ref.repository)}/issues/{ref.number}/comments"
+        return _created_comment(self._write("POST", path, {"body": body}, what), ref, what)
+
+    def create_pull_request(
+        self, repository: str, *, base: str, head: str, title: str, body: str
+    ) -> CreatedObject:
+        """Open a PR from ``head`` onto ``base``, both branches of ``repository`` (K2, K7).
+
+        ``head`` is a branch of the same repository: an ``owner:branch``
+        head would open a PR from another repository, so a ``:`` in it is
+        refused (git forbids it in a branch name anyway). A 422 such as
+        "a pull request already exists" is a conclusive GitHubError.
+        """
+        repo = _repository_path(repository)
+        what = f"pull request {head!r:.120} -> {base!r:.120} in {repo}"
+        for role, name in (("base", base), ("head", head)):
+            if not isinstance(name, str) or not name.strip() or ":" in name:
+                raise GitHubError(f"{what}: {role} {name!r:.120} is not a branch name")
+        _check_write_bounds(what, body=body, title=title)
+        payload = {"title": title, "head": head, "base": base, "body": body}
+        reply = self._write("POST", f"repos/{repo}/pulls", payload, what)
+        return _replied_object(reply, what, repository=repo, expect="pr")
+
+    def write_pr_body(self, pr_url: str, body: str) -> None:
+        """Replace the whole body of a pull request (K3)."""
+        ref = parse_pr_url(pr_url)
+        what = f"body of {ref.canonical}"
+        _check_write_bounds(what, body=body)
+        path = f"repos/{_repository_path(ref.repository)}/pulls/{ref.number}"
+        reply = self._write("PATCH", path, {"body": body}, what)
+        _replied_object(reply, what, repository=ref.repository, expect="pr", number=ref.number)
+
+    def create_issue(self, repository: str, *, title: str, body: str) -> CreatedObject:
+        """Open a new issue in ``repository`` (K5)."""
+        repo = _repository_path(repository)
+        what = f"new issue in {repo}"
+        _check_write_bounds(what, body=body, title=title)
+        reply = self._write("POST", f"repos/{repo}/issues", {"title": title, "body": body}, what)
+        return _replied_object(reply, what, repository=repo, expect="issue")
+
+    def write_issue_body(self, issue_url: str, body: str) -> None:
+        """Replace the whole body of an issue (K6).
+
+        Unlike :meth:`edit_issue_body`, the EPIC roadmap splice that keeps
+        its own mechanism (D5.4), this is the typed effect write: issued
+        once, payload on stdin, reply checked to name the issue.
+        """
+        ref = parse_issue_url(issue_url)
+        what = f"body of {ref.canonical}"
+        _check_write_bounds(what, body=body)
+        path = f"repos/{_repository_path(ref.repository)}/issues/{ref.number}"
+        reply = self._write("PATCH", path, {"body": body}, what)
+        # A PR is an issue to this endpoint: the reply may name it by either path.
+        _replied_object(reply, what, repository=ref.repository, expect=None, number=ref.number)
+
     # -- merge (the only write; controller-owned, engine-gated) ------------------
     def merge_pr(
         self,
@@ -1640,24 +2229,54 @@ class GitHubClient:
 
     # -- comments -----------------------------------------------------------
     def get_pr_comments(self, url: str) -> list[CommentInfo]:
+        """Every conversation comment of a PR, oldest first (:meth:`_comments`)."""
         ref = parse_pr_url(url)
-        data = self._api_json(["pr", "view", ref.canonical, "--json", "comments"])
-        return self._comments_from_data(data, ref.canonical)
+        return self._comments(_PR_COMMENT_PAGE_QUERY, "pullRequest", ref)
 
     def get_issue_comments(self, url: str) -> list[CommentInfo]:
-        """The issue-style comments of an issue (an EPIC's progress comments)."""
+        """Every comment of an issue (an EPIC's progress comments), oldest first."""
         ref = parse_issue_url(url)
-        data = self._api_json(["issue", "view", ref.canonical, "--json", "comments"])
-        return self._comments_from_data(data, ref.canonical)
+        return self._comments(_ISSUE_COMMENT_PAGE_QUERY, "issue", ref)
 
-    @staticmethod
-    def _comments_from_data(data: dict, parent_url: str) -> list[CommentInfo]:
-        rows = data.get("comments")
-        if rows is None:
-            rows = []
-        if not isinstance(rows, list):
-            raise GitHubError(f"comments of {parent_url}: `gh` returned a non-array field")
-        return [_decode_comment(c, parent_url) for c in rows]
+    def _comments(self, query: str, parent: str, ref: GitHubRef) -> list[CommentInfo]:
+        """The complete comment listing of ``ref`` (ADR 0004 D4.5), or a GitHubError.
+
+        Every identity read of a comment marker decides "absent" on this
+        listing (a review comment, a progress comment, a replan close
+        receipt), so it is read by cursor to its end
+        (:meth:`_walk_connection`) and a listing that cannot be is an error,
+        never the comments it did read. A missing issue or PR is
+        GitHubNotFoundError, as GitHub's "Could not resolve" is classified.
+        A comment seen twice is kept once.
+        """
+        parent_url = ref.canonical
+        what = f"comments of {parent_url}"
+        owner, _, name = ref.repository.partition("/")
+
+        def comments(data: dict, page_what: str) -> dict:
+            repository = data.get("repository")
+            if not isinstance(repository, dict):
+                raise GitHubError(f"{page_what}: repository is not readable: {repository!r:.200}")
+            holder = repository.get(parent)
+            if not isinstance(holder, dict):
+                raise GitHubError(f"{page_what}: {parent} is not readable: {holder!r:.200}")
+            connection = holder.get("comments")
+            if not isinstance(connection, dict):
+                raise GitHubError(f"{page_what} is not a comment connection: {connection!r:.200}")
+            return connection
+
+        # Strings as `-f`, like the open-PR walk; the number as `-F`, which
+        # sends it as the integer the `Int!` variable needs.
+        variables = ["-f", f"owner={owner}", "-f", f"name={name}", "-F", f"number={ref.number}"]
+        found: list[CommentInfo] = []
+        seen: set[int] = set()
+        for node in self._walk_connection(query, variables, comments, what):
+            comment = _decode_comment(node, parent_url)
+            if comment.id in seen:
+                continue
+            seen.add(comment.id)
+            found.append(comment)
+        return found
 
     def get_comment(self, comment_url: str) -> CommentInfo:
         """Fetch one issue-style comment by its HTML URL (``#issuecomment-<id>``).
@@ -1676,9 +2295,12 @@ class GitHubClient:
 
 
 __all__ = [
+    "MAX_BODY_CHARS",
+    "MAX_TITLE_CHARS",
     "MERGE_METHODS",
     "CheckInfo",
     "CommentInfo",
+    "CreatedObject",
     "GitHubClient",
     "GitHubIssueRef",
     "GitHubPullRequestRef",

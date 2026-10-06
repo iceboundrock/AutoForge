@@ -77,7 +77,7 @@ never advances the state machine. In brief:
 | `REPLAN_REEXECUTE` | OpenCode (`replan_reexecute`) | one durable transaction; the replacement PR is found only by the controller's transaction marker, and the old PR is closed by the controller only while both PRs still match their checkpoints |
 | `READY_FOR_MERGE` | nobody | holding state; with the merge gate open, the full pre-merge verification runs before `MERGE` is entered |
 | `MERGE` (gated) | controller, never an agent | `gh pr merge --match-head-commit <reviewed HEAD>`, counted only once GitHub reports `MERGED` at that HEAD into the reviewed base |
-| `UPDATE_EPIC` | OpenCode (`update_epic`) | exactly one progress comment on the EPIC; the controller (not the agent) writes the roadmap section and reads it back; the next issue gets the `INITIALIZING` checks; `null` -> `DONE` |
+| `UPDATE_EPIC` | OpenCode (`update_epic`), which makes no GitHub write | the controller (not the agent) posts the progress comment and writes the roadmap section, journals each write before performing it and reads it back, so a crash or `resume` never posts a second comment; a marker comment it did not post blocks; the next issue gets the `INITIALIZING` checks; `null` -> `DONE` |
 
 The complete per-phase verification, including what each phase reads
 *before* it launches an agent so a re-entry never duplicates work, is in
@@ -143,7 +143,12 @@ any other step) or refuses and leaves the run `BLOCKED`, exit code 1, when
 the safe state still cannot be determined (two candidate PRs, a closed PR, a
 merge no review decided on, a replan transaction on record, an exhausted
 bound). The reason is recorded in the state file and the run log, `status`
-shows the last one, and no agent runs until `resume`. A LOCAL run cannot be
+shows the last one, and no agent runs until `resume`. A controller write
+that blocked as a conflict (for example the `UPDATE_EPIC` progress comment
+after its two attempts, or a marker comment the controller did not post)
+names the effect in the reason: perform the write by hand or remove the
+conflicting object, then `unblock`; the controller reconciles the write
+against GitHub again before it issues anything. A LOCAL run cannot be
 unblocked. The decision table is in
 [Workflow: leaving BLOCKED](agent-guides/workflow.md#leaving-blocked-the-operators-unblock).
 

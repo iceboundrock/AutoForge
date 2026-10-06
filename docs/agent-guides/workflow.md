@@ -366,16 +366,22 @@ next entry could not find again.
   issue that exists (a second marker in its body) rather than in a second
   issue.
 - `REPLAN_REEXECUTE` replays its durable transaction (replan-transaction.md).
-- `UPDATE_EPIC` reads the EPIC's comments for the `ai-epic-progress` marker
-  of (finished issue, merged PR). One is handed to the agent
-  (`EXISTING_PROGRESS_COMMENT_URL`) to adopt instead of posting a second;
-  two or more block. It also reads the EPIC body and locates the managed
-  roadmap section (ambiguous markers, or a conclusive failure to read the
-  body, block without launching; an unavailable GitHub propagates). The bounded
-  re-selection after a rejected `next_issue_url` is a re-entry and adopts
-  the comment the same way. After the agent returns, the EPIC must carry
-  exactly one such comment; the roadmap section is written by the
-  controller when due (github-safety.md, "EPIC updates").
+- `UPDATE_EPIC` reads its journal first: a persisted completion context
+  means the agent's result was already accepted, so the phase is completed
+  from it with no launch (or with a re-request for the one input a
+  persisted rejection voided). Otherwise it reads the EPIC's comments for
+  the `ai-epic-progress` marker of (finished issue, merged PR): none is the
+  normal case; one that no record of this phase explains, two or more, or
+  an unreadable marker block without launching. The controller, not the
+  agent, posts the progress comment, as an effect record (ADR 0004); the
+  one-shot re-entry of a run persisted by the previous protocol adopts the
+  comment its agent posted (D13.7). It also reads the EPIC body and locates
+  the managed roadmap section (ambiguous markers, or a conclusive failure
+  to read the body, block without launching; an unavailable GitHub
+  propagates). The bounded re-selection after a rejected `next_issue_url`
+  is a re-request for the selection alone, against the comment already
+  posted; the roadmap section is written by the controller when due
+  (github-safety.md, "Before UPDATE_EPIC" and "EPIC updates").
 
 No probe consumes a review round, a `review_history` entry, or an attempt.
 

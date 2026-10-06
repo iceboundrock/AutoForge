@@ -106,6 +106,7 @@ from pathlib import Path
 
 from .errors import ConfigurationError, VerificationError
 from .executor import ExecutionRequest, ExecutionResult, execute
+from .git_transport import local_git_request
 from .prompts import escape_inline
 from .run_contract import WorkspacePolicy
 from .safefs import (
@@ -372,11 +373,15 @@ class LocalWorkspace:
     # -- git plumbing -----------------------------------------------------
     def _git(self, argv: list[str], *, allow_failure: bool = False) -> ExecutionResult:
         res = self._runner(
-            ExecutionRequest(
-                # --no-optional-locks: every call here is a read, and a
-                # `git status` that refreshes the index would write
-                # `.git/index` — a side effect a `--dry-run` must not have.
-                command=["git", "--no-optional-locks", *argv],
+            # --no-optional-locks: every call here is a read, and a
+            # `git status` that refreshes the index would write
+            # `.git/index` — a side effect a `--dry-run` must not have.
+            # Hardened like every controller git process (ADR 0004 D7.3):
+            # the repository's hooks and file-system monitor are the agent's
+            # to write, so neither runs, and nothing git starts holds a
+            # credential. None of this changes what a read reports.
+            local_git_request(
+                ["--no-optional-locks", *argv],
                 cwd=str(self.workdir),
                 timeout_seconds=self.timeout,
             )

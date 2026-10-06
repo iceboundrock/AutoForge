@@ -260,6 +260,37 @@ Centralize GitHub integration behind a `GitHubClient` or equivalent abstraction.
 
 Prefer typed return values rather than passing raw `gh --json` dictionaries throughout business logic.
 
+The client's verification reads keep their transient retry. Its typed effect
+writes (ADR 0004: `create_issue_comment`, `create_pr_comment`,
+`create_pull_request`, `write_pr_body`, `create_issue`, `write_issue_body`)
+run outside that retry and return the created object's identity: an
+ambiguous outcome is reported as unknown, never re-sent, and the effect layer
+decides by reading. There is no generic passthrough of `gh` arguments.
+
+### Controller effects and git transport
+
+The effect layer sits between the engine and the GitHub client (ADR 0004):
+
+- `effects.py` owns the persisted records, completion contexts and entry
+  observations, their validation on load and their bounds, and the pure
+  reconciliation decisions. No I/O.
+- `effect_ops.py` owns one operation per Wave 1 effect kind (the identity
+  read, the precondition, the single write, the completion read-back) and
+  `drive`, the reconcile-before-re-issue lifecycle. Each operation uses the
+  typed client methods or the git transport; nothing else.
+- `git_transport.py` is the controller's own git: exact-SHA,
+  compare-and-swap, fast-forward-only pushes and objects-only fetches, in a
+  private git directory over the shared object store, with an explicit
+  remote and the credential from `gh auth git-credential`. Every process
+  goes through the executor; the module has no workflow semantics. Its
+  `local_git_request` is how every other controller git process in the
+  operator's repository (worktree creation, the workspace reader, the lock,
+  the pre-merge export) gets the same hooks-off, credential-free shape.
+
+The engine decides *which* effects a phase plans and when it drives them; it
+never issues a write around them. Provider adapters and the executor know
+nothing about effects.
+
 ### Prompt system
 
 Large prompts belong in template files under `src/autoforge/prompts/`, not in long Python string literals.

@@ -1,6 +1,7 @@
 """CONTROL_RESULT parser boundary cases (§13)."""
 
 import json
+import time
 
 import pytest
 
@@ -9,7 +10,10 @@ from autoforge.errors import ControlResultError, ControlResultValidationError
 from autoforge.prompts import CONTROL_CHAR_RE, escape_inline
 from autoforge.redaction import MAX_GROWTH_FACTOR, redact_dict
 from autoforge.result_parser import (
+    _CLOSING_REFERENCE_RE,
+    AGENT_MARKER_OPEN_RE,
     BEGIN,
+    CONTROLLER_MARKER_OPEN_RE,
     END,
     FINDING_ID_RE,
     MAX_CONTROL_RESULT_CHARS,
@@ -19,6 +23,7 @@ from autoforge.result_parser import (
     MAX_FINDING_TITLE_CHARS,
     MAX_FINDINGS_PER_REVIEW,
     MAX_FIX_RATIONALE_CHARS,
+    MAX_PROGRESS_CHARS,
     MAX_RESOLUTIONS_PER_FIX,
     MAX_ROADMAP_SECTION_CHARS,
     MAX_URL_CHARS,
@@ -27,8 +32,17 @@ from autoforge.result_parser import (
     FixResult,
     LocalFixResult,
     ReviewResult,
+    UpdateEpicRequest,
     UpdateEpicResult,
+    _mention_problem,
+    commit_message_problem,
     parse_control_result,
+    published_payload_problem,
+    published_text_problem,
+    validate_for_phase,
+    validate_next_issue_url,
+    validate_progress_text,
+    validate_roadmap_section,
 )
 from autoforge.transitions import Phase, WorkflowMode
 from tests.conftest import BRANCH, ISSUE, PR, SHA_A, SHA_B, block, comment_url
@@ -146,7 +160,12 @@ def test_per_phase_schemas():
     with pytest.raises(ControlResultValidationError, match="executed by the controller"):
         parse_control_result(BEGIN + json.dumps(merge) + END, Phase.MERGE)
 
-    epic = {"phase": "UPDATE_EPIC", "status": "success", "next_issue_url": None}
+    epic = {
+        "phase": "UPDATE_EPIC",
+        "status": "success",
+        "next_issue_url": None,
+        "progress": "Issue #2 merged.",
+    }
     assert parse_control_result(BEGIN + json.dumps(epic) + END, Phase.UPDATE_EPIC) == epic
     epic["roadmap_section"] = "- [x] #1"
     assert parse_control_result(BEGIN + json.dumps(epic) + END, Phase.UPDATE_EPIC) == epic
@@ -396,7 +415,14 @@ OPTIONAL_STRING_FIELDS = [
         "UPDATE_EPIC.next_issue_url",
         Phase.UPDATE_EPIC,
         "REMOTE",
-        lambda v: block({"phase": "UPDATE_EPIC", "status": "success", "next_issue_url": v}),
+        lambda v: block(
+            {
+                "phase": "UPDATE_EPIC",
+                "status": "success",
+                "next_issue_url": v,
+                "progress": "Issue #2 merged.",
+            }
+        ),
     ),
     (
         "<any>.message (status blocked)",
@@ -899,7 +925,12 @@ def test_a_fenced_control_result_block_is_accepted():
     """The prompts show every schema example inside a Markdown code fence and
     say a fence around the block is harmless (#19); the parser reads the
     block by its markers alone, so that promise is pinned here."""
-    payload = {"phase": "UPDATE_EPIC", "status": "success", "next_issue_url": None}
+    payload = {
+        "phase": "UPDATE_EPIC",
+        "status": "success",
+        "next_issue_url": None,
+        "progress": "Issue #2 merged.",
+    }
     stdout = "progress log\n```text\n" + block(payload) + "\n```\n"
     assert parse_control_result(stdout, Phase.UPDATE_EPIC) == payload
     stdout = "```\n" + block(payload) + "```"
@@ -963,7 +994,12 @@ def test_update_epic_next_issue_url_is_shape_checked_at_parse_time():
 
     def nxt(url):
         return UpdateEpicResult.from_payload(
-            {"phase": "UPDATE_EPIC", "status": "success", "next_issue_url": url}
+            {
+                "phase": "UPDATE_EPIC",
+                "status": "success",
+                "next_issue_url": url,
+                "progress": "Issue #2 merged.",
+            }
         )
 
     assert nxt(ISSUE).next_issue_url == ISSUE
@@ -984,7 +1020,13 @@ def test_update_epic_roadmap_section_is_optional_bounded_text():
 
     def res(**fields):
         return UpdateEpicResult.from_payload(
-            {"phase": "UPDATE_EPIC", "status": "success", "next_issue_url": None, **fields}
+            {
+                "phase": "UPDATE_EPIC",
+                "status": "success",
+                "next_issue_url": None,
+                "progress": "Issue #2 merged.",
+                **fields,
+            }
         )
 
     assert res().roadmap_section is None
@@ -1060,7 +1102,12 @@ def test_update_epic_roadmap_section_is_optional_bounded_text():
         (
             "UPDATE_EPIC.next_issue_url",
             lambda v: UpdateEpicResult.from_payload(
-                {"phase": "UPDATE_EPIC", "status": "success", "next_issue_url": v}
+                {
+                    "phase": "UPDATE_EPIC",
+                    "status": "success",
+                    "next_issue_url": v,
+                    "progress": "Issue #2 merged.",
+                }
             ),
         ),
     ],
@@ -1266,3 +1313,476 @@ def test_largest_review_the_field_bounds_accept_fits_the_block_bound(mode):
     assert len(raw) <= MAX_CONTROL_RESULT_CHARS
     payload = parse_control_result(stdout, Phase.REVIEW, wf_mode)
     assert len(payload["findings"]) == MAX_FINDINGS_PER_REVIEW
+
+
+# -- published-content policy (ADR 0004 D8.2, D8.3, D8.5) -------------------
+# Every value below that looks like a credential is an obviously fake
+# placeholder.
+
+_PROGRESS = "Issue #2 merged."
+_ROADMAP = "## Roadmap\n- [x] #1 (PR #42)\n- [ ] #3"
+
+
+def _epic(request=UpdateEpicRequest.FULL, **fields):
+    return UpdateEpicResult.from_payload(
+        {"phase": "UPDATE_EPIC", "status": "success", **fields}, request
+    )
+
+
+def _full(**fields):
+    return _epic(**{"next_issue_url": None, "progress": _PROGRESS, **fields})
+
+
+def _refusal(build) -> str:
+    with pytest.raises(ControlResultValidationError) as excinfo:
+        build()
+    return str(excinfo.value)
+
+
+_MARKER_OPENERS = [
+    "<!-- ai-follow-up: {} -->",
+    "<!--ai-x-->",
+    "<!--\n\tai-x -->",
+    "<!-- AI-x -->",
+    "<!--Ai-epic-progress-->",
+    "<!-- autoforge-replan-transaction: {} -->",
+    "<!--autoforge-replan-close-->",
+    "<!--  AutoForge-x -->",
+    "<!--\nAUTOFORGE-x-->",
+]
+
+
+def test_agent_marker_opener_covers_both_prefixes_and_the_scanner_opener_is_unchanged():
+    """D8.2: agent text may carry neither the controller's ``ai-`` claims
+    nor the replan transaction's ``autoforge-`` markers. The scanner's own
+    opening (``autoforge.claims`` builds on it) stays the ``ai-`` one."""
+    for opener in _MARKER_OPENERS:
+        assert AGENT_MARKER_OPEN_RE.search(opener), opener
+    for text in ("<!-- note -->", "<!-- aim -->", "<!-- autoforged -->", "ai-follow-up", "<- ai-"):
+        assert not AGENT_MARKER_OPEN_RE.search(text), text
+    assert CONTROLLER_MARKER_OPEN_RE.pattern == r"<!--\s*+ai-"
+    assert not CONTROLLER_MARKER_OPEN_RE.search("<!-- autoforge-replan-close -->")
+
+
+@pytest.mark.parametrize("opener", _MARKER_OPENERS)
+@pytest.mark.parametrize("key", ["progress", "roadmap_section"])
+def test_marker_openers_are_refused_in_progress_and_roadmap_section(key, opener):
+    msg = _refusal(lambda: _full(**{key: f"- a\n{opener}\n- b"}))
+    assert "controller marker" in msg
+    assert key in msg
+    assert "follow-up" not in msg and "replan" not in msg  # never quoted
+
+
+_CREDENTIALS = [
+    ("env-assignment", "GH_TOKEN=FAKEtoken123", "FAKEtoken123"),
+    ("authorization-header", "Authorization: Bearer FAKEbearer123", "FAKEbearer123"),
+    ("url-userinfo", "https://user:FAKEpass123@example.com/x", "FAKEpass123"),
+    ("jwt", "eyJhIjowfQ.e30.c2ln", "eyJhIjowfQ"),
+    ("github-fine-grained-pat", "github_pat_FAKE0000000000", "FAKE0000000000"),
+    ("github-token", "ghp_FAKE00000000", "FAKE00000000"),
+    ("openai-key", "sk-proj-FAKE00000000", "FAKE00000000"),
+    # ``sk-ant-`` keys are caught by the ``sk-`` pattern first.
+    ("openai-key", "sk-ant-FAKE00000000", "FAKE00000000"),
+    ("secret-assignment", "password=FAKEpassword00", "FAKEpassword00"),
+    ("oauth-field", '"refresh": "FAKErefresh"', "FAKErefresh"),
+    ("oauth-assignment", "refresh_token=FAKErefresh", "FAKErefresh"),
+    ("oauth-bare-assignment", "access=FAKEaccess0000000000", "FAKEaccess0000000000"),
+]
+
+
+@pytest.mark.parametrize("cls,text,secret", _CREDENTIALS, ids=[c[1] for c in _CREDENTIALS])
+def test_each_credential_class_is_refused_by_name_and_never_quoted(cls, text, secret):
+    """D8.3: refuse, never redact; the refusal names the field and the
+    pattern class, never the matched text."""
+    for msg in (
+        published_text_problem("progress", f"Done. {text} end"),
+        _refusal(lambda: _full(progress=f"Done. {text} end")),
+        _refusal(lambda: _full(roadmap_section=f"- [x] #1 {text}")),
+    ):
+        assert msg is not None
+        assert cls in msg
+        assert "never redacted" in msg
+        assert secret not in msg
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Fixes #3",
+        "closes: owner/repo#3",
+        "RESOLVED https://github.com/o/r/issues/3",
+        "close #3",
+        "Closed #3",
+        "fix: #3",
+        "FIXED o/r#3",
+        "resolve https://github.com/o/r/pull/3",
+        "resolves GH-3",
+        "Merged.\nThis fixes #3 too.",
+        # Fail closed: a code span or fence does not exempt a closing keyword.
+        "`fixes #3`",
+        "```\ncloses #3\n```",
+    ],
+)
+def test_closing_keywords_are_refused_in_every_form(text):
+    msg = published_text_problem("progress", text)
+    assert msg is not None and "closing keyword" in msg
+    assert "#3" not in msg and "GH-3" not in msg and "o/r" not in msg
+    assert "closing keyword" in _refusal(lambda: _full(progress=text))
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["hotfix #3", "fixing #3", "closes the gap", "see #3", "resolved in review", _ROADMAP],
+)
+def test_text_without_a_closing_reference_passes(text):
+    assert published_text_problem("progress", text) is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "@octocat",
+        "(@octocat)",
+        "@octo-org/team",
+        "thanks @octocat",
+        "line\n@octocat",
+        "x,@octocat",
+        # Fail closed where CommonMark could read the backticks otherwise:
+        "`a\n@octocat`",  # a multi-line span is never exempt
+        "\\`@octocat`",  # an escaped opener
+        "| `a|@octocat` |",  # a GFM table splits cells before code spans
+        "x `a\nb` @octocat `c`",  # an unpaired backtick on an earlier line
+        # An indented fence may sit in a list item or quote. (A field is
+        # judged after stripping, as stored, so the fence follows a line.)
+        "done\n  ```\n@octocat\n  ```",
+        "```\nx\n```\n@octocat",  # after a closed fence
+    ],
+)
+def test_mentions_outside_code_are_refused(text):
+    msg = published_text_problem("progress", text)
+    assert msg is not None and "@-mention" in msg
+    assert "code spans" in msg
+    assert "octocat" not in msg
+    assert "@-mention" in _refusal(lambda: _full(progress=text))
+
+
+def test_crlf_line_breaks_open_and_close_fences():
+    """UPDATE_EPIC fields refuse CR outright; other published text may carry it."""
+    assert published_text_problem("body", "```\r\n@octocat\r\n```") is None
+    assert published_text_problem("body", "```\r\nx\r\n```\r\n@octocat") is not None
+    assert published_text_problem("body", "```\rx\r```\r@octocat") is not None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "a@b.com",
+        "mail admin@example.com",
+        "`@octocat`",
+        "use ``@octocat`` and `@octo-org/team`",
+        "```\n@octocat\n```",
+        "~~~\n@octocat\n~~~",
+        "```python\nx = '@octocat'\n```",
+        "````\n```\n@octocat\n````",  # a shorter fence does not close a longer one
+        "```\n~~~\n@octocat",  # nor a different character; unclosed runs to the end
+        "```\n@octocat",
+        "`Vec<T>` and `@octocat`",  # HTML-looking text inside a span is code
+        "@",
+        "@ octocat",
+    ],
+)
+def test_mentions_in_code_and_non_mentions_pass(text):
+    assert published_text_problem("progress", text) is None
+    assert _full(progress=text).progress == text
+
+
+def test_raw_html_outside_code_turns_the_code_exemption_off():
+    """GitHub reads backticks and fences inside an HTML block as text."""
+    for text in ("<div>\n`@octocat`\n</div>", "<div>\n```\n@octocat\n```\n</div>"):
+        msg = published_text_problem("progress", text)
+        assert msg is not None and "raw HTML" in msg and "octocat" not in msg
+    # Raw HTML without a mention is fine, and so is HTML inside a fence.
+    assert published_text_problem("roadmap_section", "<!-- note -->\n- a") is None
+    assert published_text_problem("progress", "```html\n<b>@octocat</b>\n```") is None
+
+
+def test_rules_apply_in_order_marker_credential_closing_mention():
+    marker, cred, closing, mention = "<!-- ai-x -->", "GH_TOKEN=FAKEtoken123", "fixes #3", "@o"
+    assert "marker" in published_text_problem("f", f"{mention} {closing} {cred} {marker}")
+    assert "credential" in published_text_problem("f", f"{mention} {closing} {cred}")
+    assert "closing keyword" in published_text_problem("f", f"{mention} {closing}")
+
+
+def test_payload_is_judged_whole_for_credentials():
+    """D8.3: a field ending in ``GITHUB_TOKEN=`` passes alone, but in the
+    rendered payload the redactor takes the next rendered word as its value."""
+    field = "Implemented the parser. Set GITHUB_TOKEN="
+    assert published_text_problem("body", field) is None
+    assert published_payload_problem("PR body", field) is None
+    msg = published_payload_problem("PR body", field + "\n\nCloses #5")
+    assert msg is not None
+    assert "PR body" in msg and "env-assignment" in msg
+    assert "Closes" not in msg and "parser" not in msg
+    # The payload check is the credential check only: the controller renders
+    # the run's own closing keyword itself.
+    assert published_payload_problem("PR body", "Body.\n\nCloses #5") is None
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Fix the parser\n\nFixes #2",
+        "closes: owner/repo#2",
+        "Resolves Owner/Repo#2",
+        "fixes https://github.com/owner/repo/issues/2",
+        "Fixes GH-2",
+        "See #3 and #4 for context.",
+        "fixes #2; refs #3",
+    ],
+)
+def test_commit_message_may_close_the_runs_own_issue(message):
+    assert commit_message_problem(message, repository="owner/repo", issue_number=2) is None
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Fixes #3",
+        "Fixes #2, fixes #3",
+        "closes other/repo#2",
+        "resolved owner/repo#3",
+        "Fixes https://github.com/owner/repo/issues/3",
+        "Fixes https://github.com/other/repo/issues/2",
+        # Fail closed: the run's own issue is named by its issue URL only.
+        "Fixes https://github.com/owner/repo/pull/2",
+        "Fixes #02",
+    ],
+)
+def test_commit_message_closing_another_issue_is_refused(message):
+    msg = commit_message_problem(message, repository="owner/repo", issue_number=2)
+    assert msg is not None and "other than this run's own #2" in msg
+    assert "#3" not in msg and "other/repo" not in msg and "#02" not in msg
+
+
+def test_commit_message_with_a_credential_is_refused():
+    msg = commit_message_problem(
+        "Add CI\n\nexport GH_TOKEN=FAKEtoken123", repository="owner/repo", issue_number=2
+    )
+    assert msg is not None and "env-assignment" in msg and "FAKEtoken123" not in msg
+
+
+def _mib(unit: str) -> str:
+    return (unit * ((1 << 20) // len(unit) + 1))[: 1 << 20]
+
+
+_ADVERSARIAL_SHAPES = {
+    "every backtick run length once, unpaired": " ".join("`" * k for k in range(1, 1450)),
+    "one long run, then single backticks": "`" * 1000 + " " + _mib("` "),
+    "escaped backticks": _mib("\\` "),
+    "fence after fence": _mib("```\n`a`\n"),
+    "mentions in code spans": _mib("`@a` "),
+    "raw HTML with code spans": _mib("<b> `@a` "),
+    "carried backtick over spans": "`\n" + _mib("x `a` @b\n"),
+    "keyword then whitespace": "fix" + " " * (1 << 20),
+    "keyword then a long name": "Fixes " + "a" * (1 << 19) + "/" + "b" * (1 << 19),
+    "keyword then URL prefixes": _mib("fixes https://github.com/"),
+    "marker openers without a prefix": _mib("<!--" + " " * 100),
+}
+
+
+@pytest.mark.parametrize("text", _ADVERSARIAL_SHAPES.values(), ids=_ADVERSARIAL_SHAPES.keys())
+def test_policy_scanners_are_linear_in_the_text(text):
+    """Agent text is untrusted: no shape of a 1 MiB input may make a rule
+    slow. A quadratic backtick pairing or a backtracking reference pattern
+    would take minutes here; each scanner takes well under a second."""
+    started = time.perf_counter()
+    AGENT_MARKER_OPEN_RE.search(text)
+    for _ in _CLOSING_REFERENCE_RE.finditer(text):
+        pass
+    _mention_problem("progress", text)
+    assert time.perf_counter() - started < 3.0
+
+
+def test_published_text_problem_is_linear_on_a_mixed_mebibyte():
+    """The whole rule chain, credential scan included, on one 1 MiB input
+    that reaches the last rule and passes it."""
+    text = _mib("Done `@a` see #3, fix it ``x`` a@b.c\n```\n@b\n```\n")
+    started = time.perf_counter()
+    assert published_text_problem("progress", text) is None
+    assert commit_message_problem(text, repository="owner/repo", issue_number=2) is None
+    assert time.perf_counter() - started < 6.0
+
+
+# -- UPDATE_EPIC request schemas (ADR 0004 D4.7, D8.1) -----------------------
+
+
+def test_full_update_epic_requires_progress():
+    res = _full(roadmap_section=_ROADMAP, next_issue_url=ISSUE)
+    assert (res.progress, res.roadmap_section, res.next_issue_url) == (_PROGRESS, _ROADMAP, ISSUE)
+    for absent in ({}, {"progress": None}, {"progress": ""}, {"progress": " \n "}):
+        msg = _refusal(lambda absent=absent: _epic(next_issue_url=None, **absent))
+        assert "missing required field 'progress'" in msg
+    assert "must be a string" in _refusal(lambda: _full(progress=["x"]))
+    # FULL ignores unknown keys, as every phase schema does.
+    assert _full(extra="x").progress == _PROGRESS
+
+
+def test_progress_is_bounded_multi_line_text():
+    assert _full(progress="x" * MAX_PROGRESS_CHARS).progress == "x" * MAX_PROGRESS_CHARS
+    msg = _refusal(lambda: _full(progress="x" * (MAX_PROGRESS_CHARS + 1)))
+    assert f"{MAX_PROGRESS_CHARS + 1} characters" in msg and "xxxx" not in msg
+    assert "control character" in _refusal(lambda: _full(progress="a\x00b"))
+    assert _full(progress="a\n\tb").progress == "a\n\tb"
+    # The progress comment, with the controller's marker, stays far under
+    # GitHub's comment limit.
+    assert 4 * MAX_PROGRESS_CHARS <= 65536
+
+
+@pytest.mark.parametrize(
+    "text,index",
+    [
+        ("Merged in https://github.com/owner/repo/pull/42.", 15),
+        ("See http://example.test/x", 8),
+        ("HTTPS://GITHUB.COM/owner/repo/pull/42", 5),
+        ("Docs at www.example.test", 8),
+        ("Docs at WWW.example.test", 8),
+        ("Logs: ftp://host/path", 9),
+        ("Run `git clone ssh://host/repo`", 18),
+        ("```\nhttps://github.com/owner/repo/pull/42\n```", 9),
+        ("(www.example.test)", 1),
+        ("- _www.example.test_", 3),
+    ],
+)
+def test_progress_with_a_url_is_refused_without_quoting_it(text, index):
+    """#160: the progress text carries no URL, code included; the
+    controller's marker names the issue and the PR."""
+    msg = _refusal(lambda: _full(progress=text))
+    assert f"field 'progress' contains a URL at index {index}" in msg
+    assert "'#n'" in msg
+    assert "example.test" not in msg and "github.com" not in msg
+    # The field validator refuses it with the parser's message (D4.6).
+    assert _refusal(lambda: validate_progress_text(text)) == msg
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Issue #2 done in PR #42; `pytest` passes.",
+        "Updated awww.ts and the www_root setting.",
+        "Mail a@b.example about owner/repo#42.",
+        "A ratio of 1:2, a path //srv/data, a scheme-less github.com/owner/repo.",
+    ],
+)
+def test_progress_without_a_url_passes(text):
+    assert _full(progress=text).progress == text
+
+
+def test_only_progress_is_refused_for_a_url():
+    """The roadmap section may link the EPIC's PRs; the URL rule is the
+    progress comment's alone, and it runs after the shared rules."""
+    linked = "## Roadmap\n- [x] #1 (https://github.com/owner/repo/pull/42)"
+    assert _full(roadmap_section=linked).roadmap_section == linked
+    msg = _refusal(lambda: _full(progress="Done, @octocat: https://example.test"))
+    assert "@-mention" in msg and "URL" not in msg
+
+
+_RE_REQUESTS = [
+    # request, a payload of its own schema, a key outside it
+    (UpdateEpicRequest.SELECTION, {"next_issue_url": ISSUE}, "roadmap_section"),
+    (
+        UpdateEpicRequest.SELECTION_WITH_ROADMAP,
+        {"next_issue_url": None, "roadmap_section": _ROADMAP},
+        "progress",
+    ),
+    (UpdateEpicRequest.ROADMAP, {"roadmap_section": _ROADMAP}, "next_issue_url"),
+]
+
+
+@pytest.mark.parametrize("request_, own, outside", _RE_REQUESTS, ids=lambda v: str(v)[:24])
+def test_each_re_request_accepts_its_schema_and_refuses_any_other_key(request_, own, outside):
+    res = _epic(request_, message="re-selected", **own)
+    assert res.progress is None
+    assert res.next_issue_url == own.get("next_issue_url")
+    assert res.roadmap_section == own.get("roadmap_section")
+    for extra in ({outside: None}, {"progress": None}, {"progress": _PROGRESS}):
+        msg = _refusal(lambda extra=extra: _epic(request_, **own, **extra))
+        for key in extra:
+            assert repr(key) in msg
+        assert "published progress comment is already done" in msg
+        assert "asks only for" in msg
+        assert _PROGRESS not in msg
+
+
+def test_re_request_counts_unknown_keys_without_quoting_them():
+    msg = _refusal(
+        lambda: _epic(
+            UpdateEpicRequest.SELECTION,
+            next_issue_url=None,
+            progress=None,
+            **{"GH_TOKEN=FAKEtoken123": 1, "other": 2},
+        )
+    )
+    assert "'progress'" in msg and "2 other keys" in msg
+    assert "FAKEtoken123" not in msg and "'other'" not in msg
+
+
+def test_re_request_required_fields():
+    for request_ in (UpdateEpicRequest.SELECTION, UpdateEpicRequest.SELECTION_WITH_ROADMAP):
+        assert "'next_issue_url'" in _refusal(lambda request_=request_: _epic(request_))
+        assert _epic(request_, next_issue_url="").next_issue_url is None  # epic complete
+        assert _epic(request_, next_issue_url=None).next_issue_url is None
+    assert (
+        _epic(UpdateEpicRequest.SELECTION_WITH_ROADMAP, next_issue_url=None).roadmap_section is None
+    )
+    for blank in ({}, {"roadmap_section": None}, {"roadmap_section": " \n"}):
+        msg = _refusal(lambda blank=blank: _epic(UpdateEpicRequest.ROADMAP, **blank))
+        assert "missing required field 'roadmap_section'" in msg
+    # The section's own rules hold in every mode.
+    msg = _refusal(lambda: _epic(UpdateEpicRequest.ROADMAP, roadmap_section="- @octocat"))
+    assert "@-mention" in msg
+
+
+def test_update_epic_request_is_threaded_through_the_parser():
+    payload = {"phase": "UPDATE_EPIC", "status": "success", "next_issue_url": None}
+    with pytest.raises(ControlResultValidationError, match="'progress'"):
+        parse_control_result(block(payload), Phase.UPDATE_EPIC)
+    sel = UpdateEpicRequest.SELECTION
+    assert parse_control_result(block(payload), Phase.UPDATE_EPIC, update_epic_request=sel) == (
+        payload
+    )
+    validate_for_phase(Phase.UPDATE_EPIC, payload, update_epic_request=sel)
+    with_progress = dict(payload, progress=_PROGRESS)
+    with pytest.raises(ControlResultValidationError, match="already done"):
+        parse_control_result(block(with_progress), Phase.UPDATE_EPIC, update_epic_request=sel)
+    with pytest.raises(ControlResultValidationError, match="already done"):
+        validate_for_phase(Phase.UPDATE_EPIC, with_progress, update_epic_request=sel)
+    validate_for_phase(Phase.UPDATE_EPIC, with_progress)  # FULL by default
+
+
+@pytest.mark.parametrize(
+    "validator,key,bad",
+    [
+        (validate_progress_text, "progress", "@octocat"),
+        (validate_progress_text, "progress", "x" * (MAX_PROGRESS_CHARS + 1)),
+        (validate_progress_text, "progress", "  "),
+        (validate_progress_text, "progress", "See https://example.test"),
+        (validate_roadmap_section, "roadmap_section", "<!-- ai-x -->"),
+        (validate_roadmap_section, "roadmap_section", "<!-- autoforge-x -->"),
+        (validate_roadmap_section, "roadmap_section", "a\x00b"),
+        (validate_next_issue_url, "next_issue_url", "not a url"),
+        (validate_next_issue_url, "next_issue_url", PR),
+    ],
+)
+def test_field_validators_apply_the_parsers_rules_with_its_messages(validator, key, bad):
+    """D4.6: a persisted value is re-validated under the parser's rules."""
+    with pytest.raises(ControlResultValidationError) as from_validator:
+        validator(bad)
+    with pytest.raises(ControlResultValidationError) as from_payload:
+        _full(**{key: bad})
+    assert str(from_validator.value) == str(from_payload.value)
+
+
+def test_field_validators_return_accepted_text():
+    assert validate_progress_text(_PROGRESS) == _PROGRESS
+    assert validate_roadmap_section(_ROADMAP) == _ROADMAP
+    assert validate_next_issue_url(ISSUE) == ISSUE

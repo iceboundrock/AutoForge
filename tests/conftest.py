@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 
@@ -31,6 +32,7 @@ from autoforge.github import (  # noqa: E402
     ChangedFiles,
     CheckInfo,
     CommentInfo,
+    CreatedObject,
     IssueInfo,
     MergeQueueStatus,
     PRInfo,
@@ -143,10 +145,11 @@ def progress_comment_body(issue_url: str = ISSUE, pr_url: str = PR) -> str:
 
 
 def post_progress_comment(gh: FakeGitHub, cid: int = 300) -> None:
-    """What a well-behaved UPDATE_EPIC agent does: post the progress comment once.
+    """What an UPDATE_EPIC agent did before ADR 0004: post the progress comment.
 
-    An agent asked again (a rejected selection, a correction) adopts the one
-    it already posted, so a second call posts nothing.
+    The controller now posts it (D9.7), so this mimics either a misbehaving
+    agent or the comment a previous-protocol run left behind (D13.7). A
+    second call posts nothing.
     """
     from autoforge.engine import render_progress_marker
 
@@ -229,7 +232,13 @@ class FakeAgent:
 
 
 class FakeGitHub:
-    """In-memory GitHub read model. Tests mutate it to simulate agent actions."""
+    """In-memory GitHub read model. Tests mutate it to simulate agent actions.
+
+    The ``create_*`` / ``write_*_body`` methods are the controller's own typed
+    effect writes (ADR 0004 D12.2), as opposed to helpers such as
+    ``post_progress_comment`` or a scripted handler calling ``add_pr``, which
+    mimic what an agent publishes.
+    """
 
     def __init__(self, repo: str = "owner/repo"):
         self.repo = repo
@@ -326,6 +335,24 @@ class FakeGitHub:
         self.workflow_runs_unlisted: int = 0
         # non-empty -> every Actions read raises (same convention as merge_queue_error)
         self.actions_error: str | GitHubError = ""
+        # The controller's typed effect writes (ADR 0004 D12.2): every attempt
+        # that passes the client's own bound checks is recorded as
+        # (method name, target, body), landed or not; the target is the
+        # canonical issue/PR URL, or the repository for create_issue and
+        # create_pull_request.
+        self.effect_writes: list[tuple] = []
+        # Failure injection for those writes: (method name, error, lands).
+        # Each write pops the first entry naming it: ``lands=False`` raises
+        # without writing (W3, the write never reached GitHub), ``lands=True``
+        # performs the write and then raises (W4, it landed but the reply was
+        # lost). A GitHubUnavailableError models the ambiguous outcome.
+        self.write_failures: list[tuple[str, BaseException, bool]] = []
+        # commit_in_history(repository, base_sha, commit_sha) answers from this;
+        # a test that reaches it without setting it fails (AssertionError).
+        self.history: Callable[[str, str, str], bool] | None = None
+        # Every call of the named effect identity read (commit_in_history,
+        # latest_issue_number, list_issues_above, list_prs_for_head) raises this.
+        self.effect_read_errors: dict[str, BaseException] = {}
         self.add_issue(EPIC, "EPIC")
         self.add_issue(ISSUE, "Feature")
 
@@ -773,6 +800,211 @@ class FakeGitHub:
             raise GitHubError(f"cannot reopen PR {canonical}: it is MERGED")
         if not self.reopen_leaves_closed:
             pr.state = "OPEN"
+
+    # -- controller effect writes (ADR 0004 D12.2) -----------------------------
+    def _injected_failure(self, name: str) -> tuple[BaseException, bool] | None:
+        """Pop the first ``write_failures`` entry for ``name``: (error, lands)."""
+        for i, (method, error, lands) in enumerate(self.write_failures):
+            if method == name:
+                del self.write_failures[i]
+                return error, lands
+        return None
+
+    def _effect_write(self, name: str, target: str, body: str, perform: Callable[[], object]):
+        """Record one write attempt, then fail or land it as ``write_failures`` says."""
+        self.effect_writes.append((name, target, body))
+        injected = self._injected_failure(name)
+        if injected is not None and not injected[1]:
+            raise injected[0]
+        result = perform()
+        if injected is not None:
+            raise injected[0]
+        return result
+
+    @staticmethod
+    def _write_bounds(name: str, body: str, title: str | None = None) -> None:
+        """The real client's refusals before any process (no attempt recorded)."""
+        from autoforge.github import MAX_BODY_CHARS, MAX_TITLE_CHARS
+
+        if len(body) > MAX_BODY_CHARS:
+            raise GitHubError(f"{name}: the body is over {MAX_BODY_CHARS} characters")
+        if title is not None and len(title) > MAX_TITLE_CHARS:
+            raise GitHubError(f"{name}: the title is over {MAX_TITLE_CHARS} characters")
+
+    def _stored_issue(self, url: str) -> IssueInfo:
+        ref = parse_issue_url(url)
+        for known, info in self.issues.items():
+            if parse_issue_url(known).same_target(ref):
+                return info
+        raise GitHubNotFoundError(f"`gh api` failed (exit 1): gh: Not Found (HTTP 404): {url}")
+
+    def _next_number(self, repository: str) -> int:
+        """Issues and PRs share one number sequence, as on GitHub."""
+        numbers = [
+            i.number for i in self.issues.values() if self._same_repo(i.repository, repository)
+        ]
+        numbers += [
+            p.number for p in self.prs.values() if self._same_repo(p.repository, repository)
+        ]
+        return max(numbers, default=0) + 1
+
+    def _new_comment(self, parent_url: str, body: str) -> CreatedObject:
+        cid = 950_000 + len(self.effect_writes)
+        c = self.add_comment(parent_url, cid, body)
+        return CreatedObject(url=c.url, number=None)
+
+    def create_issue_comment(self, issue_url: str, body: str) -> CreatedObject:
+        canonical = parse_issue_url(issue_url).canonical
+        self.calls.append(("create_issue_comment", canonical, body))
+        self._write_bounds("create_issue_comment", body)
+
+        def perform() -> CreatedObject:
+            self._stored_issue(canonical)  # a 404 on an unknown issue, like GitHub
+            return self._new_comment(canonical, body)
+
+        return self._effect_write("create_issue_comment", canonical, body, perform)
+
+    def create_pr_comment(self, pr_url: str, body: str) -> CreatedObject:
+        from autoforge.validation import parse_pr_url
+
+        canonical = parse_pr_url(pr_url).canonical
+        self.calls.append(("create_pr_comment", canonical, body))
+        self._write_bounds("create_pr_comment", body)
+
+        def perform() -> CreatedObject:
+            self._stored(canonical)  # fails closed on an unknown PR, like `gh`
+            return self._new_comment(canonical, body)
+
+        return self._effect_write("create_pr_comment", canonical, body, perform)
+
+    def create_pull_request(
+        self, repository: str, *, base: str, head: str, title: str, body: str
+    ) -> CreatedObject:
+        """Open a PR from ``head`` (a branch in ``branch_heads``) onto ``base``.
+
+        As on GitHub: an unknown head branch, or an open PR already headed at
+        it onto the same base, is a conclusive 422; ``Closes #n`` style
+        keywords in the body link the issue.
+        """
+        import re
+
+        self.calls.append(("create_pull_request", repository, base, head, title, body))
+        if ":" in head or not head or not base:
+            raise GitHubError(f"create_pull_request: {head!r} is not a branch name")
+        self._write_bounds("create_pull_request", body, title)
+
+        def perform() -> CreatedObject:
+            if head not in self.branch_heads:
+                raise GitHubError("gh: Validation Failed (HTTP 422): head invalid")
+            for p in self.prs.values():
+                if (
+                    p.is_open
+                    and self._same_repo(p.repository, repository)
+                    and p.head_ref == head
+                    and p.base_ref == base
+                ):
+                    raise GitHubError(
+                        "gh: Validation Failed (HTTP 422): A pull request already exists "
+                        f"for {head}"
+                    )
+            number = self._next_number(repository)
+            linked = [
+                int(n)
+                for n in re.findall(
+                    r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)\b", body
+                )
+            ]
+            info = self.add_pr(
+                f"https://github.com/{repository}/pull/{number}",
+                head_sha=self.branch_heads[head],
+                branch=head,
+                body=body,
+                base_ref=base,
+                linked=linked,
+            )
+            info.title = title
+            info.head_repository = info.repository
+            return CreatedObject(url=info.url, number=number)
+
+        return self._effect_write("create_pull_request", repository, body, perform)
+
+    def write_pr_body(self, pr_url: str, body: str) -> None:
+        from autoforge.validation import parse_pr_url
+
+        canonical = parse_pr_url(pr_url).canonical
+        self.calls.append(("write_pr_body", canonical, body))
+        self._write_bounds("write_pr_body", body)
+
+        def perform() -> None:
+            self._stored(canonical).body = body
+
+        self._effect_write("write_pr_body", canonical, body, perform)
+
+    def create_issue(self, repository: str, *, title: str, body: str) -> CreatedObject:
+        self.calls.append(("create_issue", repository, title, body))
+        self._write_bounds("create_issue", body, title)
+
+        def perform() -> CreatedObject:
+            number = self._next_number(repository)
+            info = self.add_issue(
+                f"https://github.com/{repository}/issues/{number}", title=title, body=body
+            )
+            return CreatedObject(url=info.url, number=number)
+
+        return self._effect_write("create_issue", repository, body, perform)
+
+    def write_issue_body(self, issue_url: str, body: str) -> None:
+        canonical = parse_issue_url(issue_url).canonical
+        self.calls.append(("write_issue_body", canonical, body))
+        self._write_bounds("write_issue_body", body)
+
+        def perform() -> None:
+            self._stored_issue(canonical).body = body
+
+        self._effect_write("write_issue_body", canonical, body, perform)
+
+    # -- effect identity reads (ADR 0004 D4.5, D7.5) ---------------------------
+    def _effect_read(self, name: str, *args) -> None:
+        self.calls.append((name, *args))
+        if name in self.effect_read_errors:
+            raise self.effect_read_errors[name]
+
+    def commit_in_history(self, repository: str, base_sha: str, commit_sha: str) -> bool:
+        import re
+
+        self._effect_read("commit_in_history", repository, base_sha, commit_sha)
+        for sha in (base_sha, commit_sha):
+            if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha.lower()):
+                raise GitHubError(f"commit_in_history: {sha!r} is not a full commit SHA")
+        assert self.history is not None, "FakeGitHub.history is not set"
+        return self.history(repository, base_sha.lower(), commit_sha.lower())
+
+    def latest_issue_number(self, repository: str) -> int:
+        """Highest issue or PR number in the repo (the K5 watermark)."""
+        self._effect_read("latest_issue_number", repository)
+        return self._next_number(repository) - 1
+
+    def list_issues_above(self, repository: str, watermark: int) -> list[IssueInfo]:
+        self._effect_read("list_issues_above", repository, watermark)
+        if isinstance(watermark, bool) or not isinstance(watermark, int) or watermark < 0:
+            raise GitHubError(f"list_issues_above: watermark {watermark!r} is not a number")
+        issues = [
+            replace(i)
+            for i in self.issues.values()
+            if self._same_repo(i.repository, repository) and i.number > watermark
+        ]
+        return sorted(issues, key=lambda i: i.number, reverse=True)
+
+    def list_prs_for_head(self, repository: str, branch: str) -> list[PRInfo]:
+        self._effect_read("list_prs_for_head", repository, branch)
+        prs = [
+            replace(p)
+            for p in self.prs.values()
+            if self._same_repo(p.repository, repository)
+            and p.head_ref == branch
+            and (not p.head_repository or self._same_repo(p.head_repository, repository))
+        ]
+        return sorted(prs, key=lambda p: p.number, reverse=True)
 
 
 def scripted_config():

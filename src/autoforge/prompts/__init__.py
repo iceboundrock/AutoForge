@@ -30,6 +30,9 @@ TEMPLATE_FILES = (
     "fix.md",
     "replan_reexecute.md",
     "update_epic.md",
+    # UPDATE_EPIC after its progress comment is published: asks only for the
+    # input a later controller step rejected (ADR 0004 D4.7, D13.7).
+    "update_epic_rerequest.md",
     "correction.md",
     # LOCAL mode: separate templates rather than the GitHub ones fed fake
     # Issue/PR values. Nothing here may mention gh, PRs or merging.

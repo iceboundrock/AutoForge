@@ -4,7 +4,13 @@ import time
 
 import pytest
 
-from autoforge.redaction import _PATTERNS, MAX_GROWTH_FACTOR, redact, redact_obj
+from autoforge.redaction import (
+    _PATTERNS,
+    MAX_GROWTH_FACTOR,
+    credential_classes,
+    redact,
+    redact_obj,
+)
 
 
 def test_github_token_assignment():
@@ -55,16 +61,15 @@ _JWT = (
 )
 
 
-@pytest.mark.parametrize(
-    "text",
-    [
-        f"Bearer {_JWT}",
-        f"Cookie: session={_JWT}; Path=/",
-        f'{{"id_token": "{_JWT}"}}',
-        f"gh api -H 'Authorization: Bearer {_JWT}' /user",
-    ],
-    ids=["bare", "cookie", "json", "argv"],
-)
+_JWT_TEXTS = [
+    f"Bearer {_JWT}",
+    f"Cookie: session={_JWT}; Path=/",
+    f'{{"id_token": "{_JWT}"}}',
+    f"gh api -H 'Authorization: Bearer {_JWT}' /user",
+]
+
+
+@pytest.mark.parametrize("text", _JWT_TEXTS, ids=["bare", "cookie", "json", "argv"])
 def test_jwt_is_redacted_whole(text):
     """Every segment goes, not only the signature: header and payload carry
     claims (subject, email, scopes) that are as sensitive as the signature is
@@ -83,18 +88,21 @@ def test_jwt_needs_three_segments():
     assert redact(text) == text
 
 
+_SHORT_JWTS = [
+    # ``{}`` payload: ``e30`` is three characters.
+    "eyJhbGciOiJIUzI1NiJ9.e30.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+    # Unsecured ``alg: none`` token (RFC 7519 §6): empty signature.
+    "eyJhbGciOiJub25lIn0.eyJzdWIiOiIxMjM0NTY3ODkwIn0.",
+    # Detached content (RFC 7515 App. F): empty payload.
+    "eyJhbGciOiJIUzI1NiJ9..SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+    # The smallest header the shape admits, ``{"a":0}``.
+    "eyJhIjowfQ.e30.c2ln",
+]
+
+
 @pytest.mark.parametrize(
     "token",
-    [
-        # ``{}`` payload: ``e30`` is three characters.
-        "eyJhbGciOiJIUzI1NiJ9.e30.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
-        # Unsecured ``alg: none`` token (RFC 7519 §6): empty signature.
-        "eyJhbGciOiJub25lIn0.eyJzdWIiOiIxMjM0NTY3ODkwIn0.",
-        # Detached content (RFC 7515 App. F): empty payload.
-        "eyJhbGciOiJIUzI1NiJ9..SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
-        # The smallest header the shape admits, ``{"a":0}``.
-        "eyJhIjowfQ.e30.c2ln",
-    ],
+    _SHORT_JWTS,
     ids=["short-payload", "empty-signature", "empty-payload", "shortest-header"],
 )
 def test_jwt_short_and_empty_segments_are_redacted(token):
@@ -117,31 +125,34 @@ def test_jwt_header_shorter_than_a_json_object_is_not_a_token():
     assert redact(text) == text
 
 
+_URL_CREDENTIAL_CASES = [
+    (
+        "git remote add origin https://x-access-token:ghs_abcdefghijklmnop@github.com/o/r.git",
+        "git remote add origin https://***REDACTED***@github.com/o/r.git",
+    ),
+    (
+        "https://oauth2:glpat-abcdef123456@gitlab.example.com/o/r.git",
+        "https://***REDACTED***@gitlab.example.com/o/r.git",
+    ),
+    (
+        "postgresql://app:s3cr3t@db.internal:5432/app",
+        "postgresql://***REDACTED***@db.internal:5432/app",
+    ),
+    ("HTTPS://TOKEN@GITHUB.COM/O/R", "HTTPS://***REDACTED***@GITHUB.COM/O/R"),
+    (
+        "fatal: could not read from 'https://u:p@h/r'",
+        "fatal: could not read from 'https://***REDACTED***@h/r'",
+    ),
+    (
+        "https://u:p@h?to=a@b#c@d",
+        "https://***REDACTED***@h?to=a@b#c@d",
+    ),
+]
+
+
 @pytest.mark.parametrize(
     ("text", "expected"),
-    [
-        (
-            "git remote add origin https://x-access-token:ghs_abcdefghijklmnop@github.com/o/r.git",
-            "git remote add origin https://***REDACTED***@github.com/o/r.git",
-        ),
-        (
-            "https://oauth2:glpat-abcdef123456@gitlab.example.com/o/r.git",
-            "https://***REDACTED***@gitlab.example.com/o/r.git",
-        ),
-        (
-            "postgresql://app:s3cr3t@db.internal:5432/app",
-            "postgresql://***REDACTED***@db.internal:5432/app",
-        ),
-        ("HTTPS://TOKEN@GITHUB.COM/O/R", "HTTPS://***REDACTED***@GITHUB.COM/O/R"),
-        (
-            "fatal: could not read from 'https://u:p@h/r'",
-            "fatal: could not read from 'https://***REDACTED***@h/r'",
-        ),
-        (
-            "https://u:p@h?to=a@b#c@d",
-            "https://***REDACTED***@h?to=a@b#c@d",
-        ),
-    ],
+    _URL_CREDENTIAL_CASES,
     ids=["x-access-token", "oauth2", "dsn", "bare-userinfo", "quoted", "query-after"],
 )
 def test_url_credentials(text, expected):
@@ -150,67 +161,72 @@ def test_url_credentials(text, expected):
     assert redact(text) == expected
 
 
+_URLS_WITHOUT_USERINFO = [
+    "https://github.com/o/r/pull/3",
+    "see https://example.com and mail admin@example.com",
+    "git@github.com:o/r.git",
+    "https://host/path?to=a@b",
+    # ``?`` and ``#`` end the authority as ``/`` does (RFC 3986 §3.2):
+    # an ``@`` in the query or fragment is not a credential delimiter.
+    "https://host?to=a@b",
+    "https://host:8443?u=a@b&v=c@d",
+    "https://host#frag@x",
+    "https://host?q=1#frag@x",
+]
+
+
 @pytest.mark.parametrize(
     "text",
-    [
-        "https://github.com/o/r/pull/3",
-        "see https://example.com and mail admin@example.com",
-        "git@github.com:o/r.git",
-        "https://host/path?to=a@b",
-        # ``?`` and ``#`` end the authority as ``/`` does (RFC 3986 §3.2):
-        # an ``@`` in the query or fragment is not a credential delimiter.
-        "https://host?to=a@b",
-        "https://host:8443?u=a@b&v=c@d",
-        "https://host#frag@x",
-        "https://host?q=1#frag@x",
-    ],
+    _URLS_WITHOUT_USERINFO,
     ids=["path", "mail", "scp", "path-query", "query", "port-query", "fragment", "query-fragment"],
 )
 def test_url_without_userinfo_untouched(text):
     assert redact(text) == text
 
 
+_NORMAL_TEXT = "review round 3 passed, PR #42 merged cleanly"
+
+
 def test_normal_text_untouched():
-    text = "review round 3 passed, PR #42 merged cleanly"
-    assert redact(text) == text
+    assert redact(_NORMAL_TEXT) == _NORMAL_TEXT
 
 
 # Every value below is an obviously fake placeholder.
-@pytest.mark.parametrize(
-    ("text", "expected"),
-    [
-        (
-            '{"refresh": "rt_FAKE-not-a-real-token", "access": "at_FAKE-not-real", '
-            '"expires": 1700000000}',
-            '{"refresh": "***REDACTED***", "access": "***REDACTED***", "expires": 1700000000}',
-        ),
-        ('{"refresh_token": "FAKE-refresh"}', '{"refresh_token": "***REDACTED***"}'),
-        ("{'access_token': 'FAKE-access'}", "{'access_token': '***REDACTED***'}"),
-        ('"id_token": "FAKE.ID.TOKEN"', '"id_token": "***REDACTED***"'),
-        ('"chatgpt_account_id":"fake-account"', '"chatgpt_account_id":"***REDACTED***"'),
-        # JSON inside a JSON string keeps its escaping.
-        ('{\\"refresh\\": \\"rt_FAKE\\"}', '{\\"refresh\\": \\"***REDACTED***\\"}'),
-        ("refresh_token=FAKE_REFRESH_TOKEN", "refresh_token=***REDACTED***"),
-        ("?oauth_refresh_token=FAKE&next=1", "?oauth_refresh_token=***REDACTED***&next=1"),
-        ("ACCESS_TOKEN: 'FAKE-access'", "ACCESS_TOKEN: '***REDACTED***'"),
-        ("chatgpt-account-id: 00000000-fake-0000", "chatgpt-account-id: ***REDACTED***"),
-        ("access=FAKE_ACCESS_VALUE_0000", "access=***REDACTED***"),
-    ],
-)
+_OAUTH_FIELD_CASES = [
+    (
+        '{"refresh": "rt_FAKE-not-a-real-token", "access": "at_FAKE-not-real", '
+        '"expires": 1700000000}',
+        '{"refresh": "***REDACTED***", "access": "***REDACTED***", "expires": 1700000000}',
+    ),
+    ('{"refresh_token": "FAKE-refresh"}', '{"refresh_token": "***REDACTED***"}'),
+    ("{'access_token': 'FAKE-access'}", "{'access_token': '***REDACTED***'}"),
+    ('"id_token": "FAKE.ID.TOKEN"', '"id_token": "***REDACTED***"'),
+    ('"chatgpt_account_id":"fake-account"', '"chatgpt_account_id":"***REDACTED***"'),
+    # JSON inside a JSON string keeps its escaping.
+    ('{\\"refresh\\": \\"rt_FAKE\\"}', '{\\"refresh\\": \\"***REDACTED***\\"}'),
+    ("refresh_token=FAKE_REFRESH_TOKEN", "refresh_token=***REDACTED***"),
+    ("?oauth_refresh_token=FAKE&next=1", "?oauth_refresh_token=***REDACTED***&next=1"),
+    ("ACCESS_TOKEN: 'FAKE-access'", "ACCESS_TOKEN: '***REDACTED***'"),
+    ("chatgpt-account-id: 00000000-fake-0000", "chatgpt-account-id: ***REDACTED***"),
+    ("access=FAKE_ACCESS_VALUE_0000", "access=***REDACTED***"),
+]
+
+
+@pytest.mark.parametrize(("text", "expected"), _OAUTH_FIELD_CASES)
 def test_oauth_credential_fields(text, expected):
     assert redact(text) == expected
 
 
-@pytest.mark.parametrize(
-    "text",
-    [
-        "refresh the page and check access to the repo",
-        "access: denied; refresh: on demand",
-        "refresh=true access=read",
-        "the token refresh failed; see the access log",
-        '{"refreshed": "yes", "accessible": "no"}',
-    ],
-)
+_OAUTH_PROSE = [
+    "refresh the page and check access to the repo",
+    "access: denied; refresh: on demand",
+    "refresh=true access=read",
+    "the token refresh failed; see the access log",
+    '{"refreshed": "yes", "accessible": "no"}',
+]
+
+
+@pytest.mark.parametrize("text", _OAUTH_PROSE)
 def test_oauth_words_in_prose_untouched(text):
     assert redact(text) == text
 
@@ -346,11 +362,7 @@ def test_every_redaction_pattern_has_a_growth_pin():
     marker ``redact`` leaves.
     """
     units = list(_WORST_CASE_UNITS.values())
-    unpinned = [
-        pattern.pattern
-        for pattern, _ in _PATTERNS
-        if not any(pattern.search(unit) for unit in units)
-    ]
+    unpinned = [entry.name for entry in _PATTERNS if not any(entry.regex.search(u) for u in units)]
     assert unpinned == []
 
 
@@ -379,3 +391,116 @@ def test_redaction_marker_wrapped_by_a_later_pattern_never_grows():
     out = redact(text)
     assert out == "https://***REDACTED***@h"
     assert len(out) < len("https://") + len(grown) + len("@h")
+
+
+def test_every_redaction_pattern_has_its_stable_class_name():
+    """The names are part of the contract: a content-policy refusal names
+    the class, so a rename changes what an agent is told to remove."""
+    assert [entry.name for entry in _PATTERNS] == [
+        "env-assignment",
+        "authorization-header",
+        "url-userinfo",
+        "jwt",
+        "github-fine-grained-pat",
+        "github-token",
+        "openai-key",
+        "anthropic-key",
+        "secret-assignment",
+        "oauth-field",
+        "oauth-assignment",
+        "oauth-bare-assignment",
+    ]
+
+
+# Every secret-bearing and every clean text the tests above use, plus each
+# worst-case unit alone and repeated.
+_CREDENTIAL_CORPUS = [
+    "export GITHUB_TOKEN=ghp_secretvalue123",
+    "GH_TOKEN=abc123XYZ",
+    "OPENAI_API_KEY=sk-abcdefghij123456",
+    "ANTHROPIC_API_KEY=sk-ant-abcdefghij123",
+    "Authorization: Bearer abcdef123456",
+    "Authorization: Basic dXNlcjpwYXNzd29yZA==",
+    "authorization:basic dXNlcjpwYXNz",
+    "token ghp_abcdefghijklmnop",
+    "key=sk-proj-abcdef123456",
+    f"cloning with {_FINE_GRAINED_PAT} done",
+    _JWT,
+    *_JWT_TEXTS,
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0",
+    *_SHORT_JWTS,
+    "eyJhIjow.e30.c2ln",
+    *(text for text, _ in _URL_CREDENTIAL_CASES),
+    *_URLS_WITHOUT_USERINFO,
+    _NORMAL_TEXT,
+    *(text for text, _ in _OAUTH_FIELD_CASES),
+    *_OAUTH_PROSE,
+    *_WORST_CASE_UNITS.values(),
+    *(unit * 50 for unit in _WORST_CASE_UNITS.values()),
+    "Authorization: Bearer HF_TOKEN=x GH_TOKEN=ghp_aaaaaaaa token=sk-aaaaaaaaaaaa",
+    'https://HF_TOKEN="x"@h',
+    # Already redacted text is clean: no pattern changes it again.
+    "HF_TOKEN=***REDACTED***",
+    "Authorization: Bearer ***REDACTED***",
+    "https://***REDACTED***@github.com/o/r.git",
+    "",
+]
+
+
+@pytest.mark.parametrize("text", _CREDENTIAL_CORPUS)
+def test_credential_classes_is_empty_exactly_when_redact_changes_nothing(text):
+    classes = credential_classes(text)
+    assert (classes == ()) == (redact(text) == text)
+
+
+def test_credential_classes_corpus_has_both_sides():
+    """The equivalence above is meaningful only if the corpus holds both."""
+    flagged = [text for text in _CREDENTIAL_CORPUS if credential_classes(text)]
+    assert flagged and len(flagged) < len(_CREDENTIAL_CORPUS)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("GH_TOKEN=abc123XYZ", ("env-assignment",)),
+        ("Authorization: Bearer abcdef123456", ("authorization-header",)),
+        ("postgresql://app:s3cr3t@db.internal:5432/app", ("url-userinfo",)),
+        (_JWT, ("jwt",)),
+        (_FINE_GRAINED_PAT, ("github-fine-grained-pat",)),
+        ("ghp_abcdefghijklmnop", ("github-token",)),
+        ("sk-proj-abcdef123456", ("openai-key",)),
+        # ``sk-ant-`` keys are replaced by the earlier ``sk-`` pattern.
+        ("sk-ant-abcdefghij123", ("openai-key",)),
+        ("password=hunter2hunter2", ("secret-assignment",)),
+        ('{"access_token": "FAKE-access"}', ("oauth-field",)),
+        ("refresh_token=FAKE_REFRESH_TOKEN", ("oauth-assignment",)),
+        ("access=FAKE_ACCESS_VALUE_0000", ("oauth-bare-assignment",)),
+    ],
+    ids=str,
+)
+def test_credential_classes_names_the_pattern(text, expected):
+    assert credential_classes(text) == expected
+
+
+def test_credential_classes_are_in_pattern_order_each_once():
+    """Order is the pattern order, not the order in the text, and a class
+    found many times is named once."""
+    text = (
+        "access=FAKE_ACCESS_VALUE_0000 ghp_abcdefghijklmnop "
+        "GH_TOKEN=abc123XYZ ghp_zyxwvutsrqponmlk GITHUB_TOKEN=other "
+        "access=FAKE_ACCESS_VALUE_1111"
+    )
+    assert credential_classes(text) == (
+        "env-assignment",
+        "github-token",
+        "oauth-bare-assignment",
+    )
+
+
+def test_credential_classes_records_a_pattern_that_rewrites_a_marker():
+    """A later pattern that replaces an earlier pattern's marker (and the
+    text around it) changed the text too, so it is named as well."""
+    assert credential_classes("Authorization: Bearer HF_TOKEN=x") == (
+        "env-assignment",
+        "authorization-header",
+    )

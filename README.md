@@ -28,11 +28,12 @@ Issue → ANALYZE_EXECUTE (Claude Code) → PR → REVIEW (OpenCode)
                                        ├─ merge gate closed (default): stops here; human merges
                                        └─ gate open: controller verifies on GitHub
                                           → MERGE (gh pr merge by the controller, no agent)
-                                          → UPDATE_EPIC (agent posts progress, returns the
-                                             roadmap section, picks the next issue; the
-                                             controller splices the section into the EPIC
-                                             body every N merges, reads it back, and
-                                             verifies the next issue on GitHub, or DONE)
+                                          → UPDATE_EPIC (agent returns the progress text
+                                             and the roadmap section and picks the next
+                                             issue; the controller posts the progress comment,
+                                             splices the section into the EPIC body every N
+                                             merges, reads both back, and verifies the next
+                                             issue on GitHub, or DONE)
 ```
 
 AutoForge itself never writes business code. It holds the workflow state

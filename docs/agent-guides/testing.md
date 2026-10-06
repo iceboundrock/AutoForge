@@ -24,6 +24,10 @@ High-priority coverage includes:
 - atomic persistence
 - corrupt-state handling
 - idempotent merge counting
+- effect state (ADR 0004): records round-trip in every stage; a corrupt or
+  incomplete record fails loudly; LOCAL state carrying effect state is
+  refused; a previous-protocol file loads with no effect state, and one
+  that carries effect fields is refused
 
 ### Transitions
 
@@ -46,6 +50,9 @@ High-priority coverage includes:
 - wrong phase
 - missing fields
 - review invariant mismatch
+- the published-content policy on agent text the controller publishes
+  (marker openers, credential classes, closing references, mentions), and
+  each `UPDATE_EPIC` re-request accepting only its own keys
 
 ### Execution
 
@@ -94,6 +101,12 @@ High-priority coverage includes:
 - a path that exists but is not a worktree root of this repository, or a
   location inside the operator's working tree, is refused, not adopted
 - a dry run creates no worktree and runs no git
+- worktree creation, its identity and registry reads, and the workspace
+  reader are hardened (ADR 0004 D7.3): a planted `post-checkout` or
+  `reference-transaction` hook (in `hooks/` or a configured `core.hooksPath`)
+  and a configured `core.fsmonitor` do not run, a filter driver sees no
+  token and no operator `GIT_*`, and an operator `GIT_DIR` redirects neither
+  the worktree, the workspace reads nor the lock
 - the agent request and the run log carry the configured allow-list; pre-merge
   and validation commands run under the same one
 - HEAD or branch of the operator's checkout changing while the agent ran
@@ -111,11 +124,33 @@ High-priority coverage includes:
   PR, names another round, HEAD, base or merge base, or says `needs_fix_round: true`
   blocks without a merge; the happy path reads it exactly once per pass
 - follow-up issue verification
+- typed effect writes are never retried on an ambiguous outcome, while reads
+  keep their transient retry (`tests/test_github.py`)
+- every Wave 1 effect kind at the operation level, against `FakeGitHub` and
+  a local bare repository (`tests/test_effects.py`): success, already
+  exists, conflicting identity, duplicate markers, a precondition violated
+  between intent and write, a write lost or landed with its reply lost, a
+  crash after the write before the save, a duplicate invocation after
+  restart, and the attempt bound
+- the controller git transport (`tests/test_git_transport.py`): the default
+  branch, a non-fast-forward and a lease mismatch are refused, and a
+  `pushurl`, `insteadOf`, `core.sshCommand`, `core.hooksPath` or `pre-push`
+  hook planted in the shared repository neither redirects a push nor runs
 
 ### Recovery
 
 - external side effect completed before state write
 - resume without duplicating work
+- the `UPDATE_EPIC` progress comment across every crash window of the
+  effect lifecycle (`test_k8_*` in `tests/test_engine.py`), the one-shot
+  legacy re-entry (D13.7) including a crash after its adoption was saved,
+  and an unjournaled comment blocking (D9.7)
+- an `UPDATE_EPIC` completion context persisted with an empty plan and no
+  adopted comment (or a plan beside an adoption, or no entry observation)
+  is refused on load, with nothing published, and completion without a
+  posted or adopted comment writes no roadmap and switches no issue
+- dry-run executing no effect: the `UPDATE_EPIC` plan is built with a
+  GitHub client that fails the test on any use
 
 ### Integration
 

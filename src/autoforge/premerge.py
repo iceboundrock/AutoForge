@@ -18,6 +18,19 @@ merge gate adds on top of the hosted check:
 
 Both are pure with respect to workflow state; the engine decides what a
 difference or a failing command means for the phase.
+
+The git processes here run in the operator's repository, whose refs,
+configuration and hooks an agent could have written (ADR 0004 §2.11). Each
+one therefore reads a commit as itself (ADR 0004 D7.5): replacement objects
+and the commit-graph are off, so a ``refs/replace/*`` entry or a forged
+``objects/info/commit-graph`` can neither make a missing commit present nor
+swap the tree the export writes. Hooks and the file-system monitor are off
+too (D7.3), and each process starts from an allow-listed environment that
+holds no credential and no operator ``GIT_*`` variable, so what git runs on
+the repository's behalf (a filter driver during the export) gets no token.
+Fetching the reviewed commit is not done here: it is the controller's own
+network operation, :meth:`autoforge.git_transport.GitTransport.fetch`, which
+reads no repository configuration at all (D7.1).
 """
 
 from __future__ import annotations
@@ -30,9 +43,11 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from .errors import VerificationError
+from .errors import GitTransportError, VerificationError
 from .executor import ExecutionRequest, ExecutionResult
+from .git_transport import GitTransport, local_git_request
 from .github import WorkflowRunJobs
+from .redaction import redact
 
 Runner = Callable[[ExecutionRequest], ExecutionResult]
 
@@ -40,6 +55,13 @@ Runner = Callable[[ExecutionRequest], ExecutionResult]
 # from the commit's tree and written out with a path prefix. The operator's
 # index, HEAD, working tree and stash are not read or written.
 _GIT_TIMEOUT_SECONDS = 600
+
+
+def _local_request(
+    repo: str, args: list[str], env: dict[str, str] | None = None
+) -> ExecutionRequest:
+    """One hardened git process in the operator's repository ``repo``."""
+    return local_git_request(["-C", repo, *args], env=env, timeout_seconds=_GIT_TIMEOUT_SECONDS)
 
 
 def describe_definition_difference(pr_jobs: WorkflowRunJobs, base_jobs: WorkflowRunJobs) -> str:
@@ -106,17 +128,12 @@ class ExportedTree:
 
 def _git(runner: Runner, repo: str, args: list[str], env: dict[str, str] | None = None) -> str:
     """Run one git plumbing command against ``repo``; non-zero exit is a failure."""
-    req = ExecutionRequest(
-        command=["git", "-C", repo, *args],
-        env=env,
-        timeout_seconds=_GIT_TIMEOUT_SECONDS,
-    )
-    res = runner(req)
+    res = runner(_local_request(repo, args, env))
     shown = " ".join(["git", *args])
     if res.timed_out:
         raise VerificationError(f"`{shown}` timed out after {_GIT_TIMEOUT_SECONDS}s")
     if res.exit_code != 0:
-        tail = (res.stderr or res.stdout or "").strip()[-500:]
+        tail = redact((res.stderr or res.stdout or "").strip()[-500:])
         raise VerificationError(f"`{shown}` failed (exit {res.exit_code}): {tail}")
     if res.truncated:
         raise VerificationError(f"`{shown}` output was truncated at the executor's capture bound")
@@ -124,22 +141,28 @@ def _git(runner: Runner, repo: str, args: list[str], env: dict[str, str] | None 
 
 
 def commit_is_local(runner: Runner, repo: str, sha: str) -> bool:
-    res = runner(
-        ExecutionRequest(
-            command=["git", "-C", repo, "cat-file", "-e", f"{sha}^{{commit}}"],
-            timeout_seconds=_GIT_TIMEOUT_SECONDS,
-        )
-    )
+    """Whether ``repo``'s object store holds a commit named ``sha``.
+
+    A missing commit is missing even when a replacement ref or the
+    commit-graph names it: neither is consulted. Existence only; the bytes
+    are not authenticated here.
+    """
+    res = runner(_local_request(repo, ["cat-file", "-e", f"{sha}^{{commit}}"]))
     return not res.timed_out and res.exit_code == 0
 
 
-def fetch_pr_head(runner: Runner, repo: str, pr_number: int) -> None:
-    """Fetch ``refs/pull/<n>/head`` from ``origin`` so the reviewed commit is local.
+def fetch_pr_head(transport: GitTransport, pr_number: int) -> None:
+    """Fetch the objects of ``refs/pull/<n>/head`` so the reviewed commit is local.
 
-    Only objects are fetched: no local ref is created or moved (``--no-tags``,
-    no destination refspec), so the operator's branches are untouched.
+    The controller's own fetch (ADR 0004 D6.4, D7.1): an explicit URL, no
+    repository configuration, objects only. No ref is created or moved, so
+    the operator's branches are untouched. A failure is a
+    :class:`VerificationError`, which the caller reads as inconclusive.
     """
-    _git(runner, repo, ["fetch", "--quiet", "--no-tags", "origin", f"refs/pull/{pr_number}/head"])
+    try:
+        transport.fetch([f"refs/pull/{pr_number}/head"])
+    except GitTransportError as exc:
+        raise VerificationError(f"fetching refs/pull/{pr_number}/head failed: {exc}") from exc
 
 
 @contextmanager

@@ -7,6 +7,7 @@ import stat
 import pytest
 
 from autoforge.errors import LockError
+from autoforge.git_transport import LOCAL_GIT_ENV_ALLOWLIST, LOCAL_GIT_SWITCHES
 from autoforge.locking import ControllerLock
 
 
@@ -373,8 +374,32 @@ def test_repository_lock_path_runs_git_in_the_workdir_and_joins_relative_output(
     sub.mkdir()
     path = repository_lock_path(sub, runner=fake_git)
     assert path == (tmp_path / ".git" / "autoforge" / "controller.lock").resolve()
-    assert seen[0].command == ["git", "rev-parse", "--git-common-dir"]
+    assert seen[0].command == ["git", *LOCAL_GIT_SWITCHES, "rev-parse", "--git-common-dir"]
     assert seen[0].cwd == str(sub)
+    # ADR 0004 D7.3: no hook, no fsmonitor, no credential and no GIT_* of the
+    # operator's shell, the same as the workspace reader the run keys on.
+    assert seen[0].env_allowlist == LOCAL_GIT_ENV_ALLOWLIST
+    assert seen[0].env == {"GIT_NO_REPLACE_OBJECTS": "1"}
+
+
+def test_repository_lock_path_ignores_a_git_dir_in_the_operators_environment(tmp_path, monkeypatch):
+    """An inherited `GIT_DIR` cannot key the lock to another repository.
+
+    The workspace reader ignores it (ADR 0004 D7.3), so a lock that followed
+    it would serialise runs of one checkout against a different repository's
+    lock while the run itself worked on the checkout.
+    """
+    import subprocess
+
+    from autoforge.locking import repository_lock_path
+
+    repo = tmp_path / "repo"
+    decoy = tmp_path / "decoy"
+    for path in (repo, decoy):
+        subprocess.run(["git", "init", "-q", str(path)], check=True)
+    monkeypatch.setenv("GIT_DIR", str(decoy / ".git"))
+    path = repository_lock_path(repo)
+    assert path == (repo / ".git" / "autoforge" / "controller.lock").resolve()
 
 
 def test_repository_lock_path_refuses_truncated_git_output(tmp_path):

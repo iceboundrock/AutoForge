@@ -24,6 +24,8 @@ from autoforge.errors import (
     StateError,
     VerificationError,
 )
+from autoforge.executor import execute
+from autoforge.git_transport import LOCAL_GIT_ENV_ALLOWLIST, LOCAL_GIT_SWITCHES
 from autoforge.local_workspace import (
     LocalWorkspace,
     init_feature_file,
@@ -45,6 +47,9 @@ from .conftest import (
 )
 
 IMPL_FILE = "src/app.py"
+# Every git read of the workspace reader: hardened (ADR 0004 D7.3, D7.5) and
+# never taking the optional index lock.
+_GIT_READ = ["git", *LOCAL_GIT_SWITCHES, "--no-optional-locks"]
 
 
 # -- helpers ------------------------------------------------------------------
@@ -2405,8 +2410,50 @@ def test_workspace_git_reads_do_not_take_the_optional_index_lock(tmp_path):
     ws.snapshot()
     assert seen, "no git command was run"
     for cmd in seen:
-        assert cmd[0] == "git"
-        assert cmd[1] == "--no-optional-locks", cmd
+        assert cmd[: len(_GIT_READ)] == _GIT_READ, cmd
+
+
+def test_workspace_git_reads_run_no_fsmonitor_and_hold_no_credential(
+    tmp_path, tmp_path_factory, monkeypatch
+):
+    """ADR 0004 D7.3 (PR #195 R3-F2): the workspace reader is a controller git process.
+
+    `git status` ran the repository's configured file-system monitor, which
+    the agent can set, with the controller's whole environment, GitHub
+    token included; and an operator's `GIT_DIR` redirected every read to
+    another repository. The reads report the same paths and anchor either
+    way: the hardening changes what runs, not what is read.
+    """
+    root = local_repo(tmp_path)
+    (root / IMPL_FILE).write_text("def main():\n    return 1\n", encoding="utf-8")
+    planted = tmp_path_factory.mktemp("planted")  # outside the working tree
+    monitor = planted / "fsmonitor"
+    monitor.write_text(f'#!/bin/sh\nenv > "{planted}/fsmonitor-ran"\n')
+    monitor.chmod(0o755)
+    subprocess.run(["git", "-C", str(root), "config", "core.fsmonitor", str(monitor)], check=True)
+    decoy = git_repo(planted / "decoy")
+    head = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    monkeypatch.setenv("GH_TOKEN", "ghp_controllertokenvalue")
+    monkeypatch.setenv("GIT_DIR", str(decoy / ".git"))
+    requests = []
+
+    def runner(req):
+        requests.append(req)
+        return execute(req)
+
+    ws = LocalWorkspace(workdir=root, runner=runner)
+    assert ws.dirty_paths() == [IMPL_FILE]
+    assert ws.root() == Path(os.path.realpath(root))
+    assert ws.head_sha() == head and ws.branch() == "main"
+    assert ws.git_dirs()[-1] == Path(os.path.realpath(root / ".git"))
+    assert not (planted / "fsmonitor-ran").exists(), "the repository's fsmonitor ran"
+    assert requests
+    for req in requests:
+        assert req.command[: len(_GIT_READ)] == _GIT_READ
+        assert req.env_allowlist == LOCAL_GIT_ENV_ALLOWLIST
+        assert (req.env or {})["GIT_NO_REPLACE_OBJECTS"] == "1"
 
 
 # -- redaction at the persistence boundary --------------------------------------------
@@ -2776,7 +2823,7 @@ def test_a_failed_anchor_read_is_not_evidence_that_nothing_moved(tmp_path):
         """Real git, except that the two anchor reads fail with git's own 128."""
 
         def runner(req):
-            if req.command[2:] == argv:
+            if req.command[len(_GIT_READ) :] == argv:
                 return _failed_git(
                     req, "fatal: not a git repository (or any of the parent directories)"
                 )
@@ -2823,7 +2870,7 @@ def test_a_failed_anchor_read_blocks_before_the_agent_is_invoked(tmp_path):
     eng.provider._handler = handler
 
     def runner(req):
-        if req.command[2:] == ["rev-parse", "--verify", "--quiet", "HEAD"]:
+        if req.command[len(_GIT_READ) :] == ["rev-parse", "--verify", "--quiet", "HEAD"]:
             return _failed_git(req, "fatal: bad object HEAD")
         return execute(req)
 
@@ -3053,6 +3100,11 @@ def test_a_local_state_cannot_hold_a_github_only_phase(tmp_path):
         "feature_spec_sha256": "a" * 64,
         "local_run_contract": sample_contract(),
         "phase": "REVIEW",
+        # Written by every current-protocol save, LOCAL included, empty here.
+        "effect_records": [],
+        "entry_observation": {},
+        "completion_context": {},
+        "launch_label": "",
     }
     assert load_state_from(path, good).phase == Phase.REVIEW
     for phase in ("READY_FOR_MERGE", "MERGE", "UPDATE_EPIC", "REPLAN_REEXECUTE"):

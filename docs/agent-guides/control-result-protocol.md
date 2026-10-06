@@ -222,6 +222,42 @@ through template variables filled from the same constants.
 
 ### UPDATE_EPIC fields
 
+The agent publishes nothing in `UPDATE_EPIC` (ADR 0004): the controller posts
+`progress` as the EPIC progress comment and writes `roadmap_section` into the
+EPIC body, so both are validated as text that will be published under the
+operator's identity.
+
+`progress` is required in the phase's launch result (the `FULL` request of
+`result_parser.UpdateEpicRequest`): non-blank, multi-line text with no other
+control character, at most `MAX_PROGRESS_CHARS` (16384, rejected by size,
+never clipped), with no marker and no URL at all: `://` of any scheme or a
+`www.` host, refused even inside code (`_PROGRESS_URL_RE`, #160). The
+controller appends the `ai-epic-progress` marker itself, and the marker
+names the issue and the PR; the prompt asks for `#n` references instead of
+links. `roadmap_section` is not under this rule and may link PRs.
+
+`progress` and `roadmap_section` both pass the published-content policy
+(`published_text_problem`; [github-safety.md](github-safety.md),
+"Published content"): no controller marker opener (`<!-- ai-` or
+`<!-- autoforge-`, any spacing or case, `AGENT_MARKER_OPEN_RE`), no
+credential class (named, never quoted), no closing keyword followed by an
+issue reference, and no `@`-mention outside code. The engine also judges the
+comment exactly as it would be posted (the text, a blank line, the marker)
+with `published_payload_problem` before anything is saved or posted, and a
+refusal is an ordinary correction.
+
+A re-request (D4.7, `prompts/update_epic_rerequest.md`) is launched only
+after the progress comment is published, for an input a persisted rejection
+voided. Its result carries exactly the keys of its request, and any other
+key is refused, `progress` included, even as `null`. The refusal counts the
+unknown keys without quoting them:
+
+| Request | Keys |
+|---|---|
+| `SELECTION` | `next_issue_url` (required key) |
+| `SELECTION_WITH_ROADMAP` | `next_issue_url` (required key), `roadmap_section` (optional) |
+| `ROADMAP` | `roadmap_section` (required, non-blank) |
+
 `next_issue_url` is required (`null` when the EPIC is complete) and shaped
 as above. `roadmap_section` is optional at parse time: absent, `null` or
 blank is "none returned"; a present value must be a string, is bounded by
@@ -238,7 +274,9 @@ the scanner would read them. Whether a
 section is *required* is the engine's decision from persisted state
 (`workflow.epic_update_every`, or the EPIC being reported complete), made
 after the result parses ([github-safety.md](github-safety.md), "EPIC
-updates").
+updates"). A required section that is missing is a
+`ControlResultValidationError` ("missing required field 'roadmap_section'"),
+so it takes the correction path before anything is posted.
 
 ### Whole-block bound and truncated stdout
 
