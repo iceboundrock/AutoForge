@@ -344,7 +344,8 @@ follows:
   time of writing; #160 re-checks it against the live API.
 - **Total.** #160 fixes a total bound, over the payloads and the completion
   context together, that keeps the state file far below
-  `MAX_STATE_FILE_BYTES`.
+  `MAX_STATE_FILE_BYTES`. It counts each context value at its stored bound
+  (D4.6).
 
 Only bounded, redacted values are persisted, and no credential, header or
 environment value is ever stored.
@@ -478,34 +479,63 @@ effect plan (D3.1). Its properties:
   transaction id. On load, a context whose binding differs from the state
   it is loaded with is corrupt. It is never carried into another phase,
   because the save that commits the phase drops it (D2.4).
+- **Stored as the consuming state stores it.** Each value is stored in the
+  form its state field takes, and both paths complete from that stored
+  form: an uninterrupted step completes from the context it has just
+  saved, as recovery does, never from the in-memory result. A completion
+  after a crash therefore persists exactly what an uninterrupted completion
+  persists. A value has one of two forms:
+  - **Parsed form.** Published text is redaction-invariant (D8.3), so its
+    parsed bytes are its stored bytes. Shape-checked values (ids, enums,
+    SHAs, the next-issue URL) are stored as parsed too.
+  - **Redacted form.** Text that is not published, in Wave 1 only the `FIX`
+    rationale, is stored as `redact` returns it, the bytes
+    `last_fix_resolutions` holds today. Completion copies it unchanged and
+    never redacts it again. Redaction changes its length in both
+    directions: it can lengthen an accepted rationale past
+    `MAX_FIX_RATIONALE_CHARS`, and shorten one below `MIN_RATIONALE_CHARS`.
 - **Closed and strictly validated.** #160 defines one closed schema per
-  phase in its one protocol bump (D13.1). On load, an unknown key, a
-  missing key or a wrong type is refused. Every value is validated again
-  under the rules the parser applied to the field it came from:
-  - text bounds and control characters;
-  - the finding-id shape and round;
-  - `needs_fix_round == (findings > 0)`;
-  - one resolution per open finding;
-  - the shape of an issue URL.
+  phase in its one protocol bump (D13.1), and the schema names each text
+  field's form. On load, an unknown key, a missing key or a wrong type is
+  refused, and every value is validated again under the rules of its
+  stored form:
+  - **A parsed-form value** gets the rules the parser applied to its field:
+    - text bounds and control characters;
+    - the finding-id shape and round;
+    - `needs_fix_round == (findings > 0)`;
+    - one resolution per open finding;
+    - the shape of an issue URL;
+    - the follow-up source rules of `FIX` (below).
+  - **A redacted-form value** gets rules of its own, never the parser's
+    rules for the raw text. A stored `FIX` rationale is a string:
+    - of at most `MAX_FIX_RATIONALE_CHARS × MAX_GROWTH_FACTOR` characters.
+      `redact` never returns more than `MAX_GROWTH_FACTOR` times its input
+      (`redaction.py`, pinned by `tests/test_redaction.py`), and
+      `tests/test_result_parser.py` already pins that product at or below
+      `loop_guard.MAX_REQUIRED_RESOLUTION_CHARS`;
+    - with no minimum length. `MIN_RATIONALE_CHARS` judged the agent's raw
+      text when the parser accepted it, and the stored text is not that
+      text;
+    - with no control character other than a newline or a tab, as for the
+      raw text. Redaction inserts only its fixed marker, so it introduces
+      none.
 
-  A context that fails is corrupt (`StateError`). It is never defaulted and
-  never repaired from GitHub.
-- **Bounded.** Each value keeps its field's parser bound
+  A context that fails is corrupt (`StateError`). It is never defaulted,
+  never clipped and never repaired from GitHub.
+- **Bounded.** A parsed-form value keeps its field's parser bound
   (`MAX_FINDINGS_PER_REVIEW`, `MAX_RESOLUTIONS_PER_FIX`,
-  `MAX_ROADMAP_SECTION_CHARS` and the per-field caps). The whole context
-  counts toward D2.4's total bound.
-- **Stored as the uninterrupted path stores it.** Published text is
-  redaction-invariant (D8.3). Text that is not published, a `FIX`
-  rationale, is stored redacted, as `last_fix_resolutions` is today. A
-  completion after a crash therefore persists exactly what an uninterrupted
-  completion persists.
+  `MAX_ROADMAP_SECTION_CHARS` and the per-field caps). A redacted-form value
+  has the bound above. D2.4's total bound counts every value at its stored
+  bound, so it holds `MAX_RESOLUTIONS_PER_FIX` rationales of
+  `MAX_FIX_RATIONALE_CHARS × MAX_GROWTH_FACTOR` characters each.
 - **The only source.** Recovery reads the context and the records. It never
   parses a rendered payload or a remote object's Markdown, and it never
   reads `events.jsonl` or the run log.
-- **Saved even with an empty plan.** A `FIX` that pushes and defers nothing,
-  or a legacy `UPDATE_EPIC` whose progress comment was adopted (D13.7),
-  still saves its context before it completes. The context, not a record,
-  is what makes resume journal-first.
+- **Saved even with an empty plan.** A `FIX` that pushes nothing and defers
+  nothing, or defers only to follow-ups it reuses (below), and a legacy
+  `UPDATE_EPIC` whose progress comment was adopted (D13.7), still save
+  their context before they complete. The context, not a record, is what
+  makes resume journal-first.
 
 What each phase's context holds. The entry values already in state are
 referenced, not copied (D4.4):
@@ -514,9 +544,56 @@ referenced, not copied (D4.4):
 |---|---|---|
 | `ANALYZE_EXECUTE` | none: the PR, HEAD, base and branch that completion persists are K1's and K2's or K3's observed results | the entry observation |
 | `REVIEW` | the round, `needs_fix_round` and the structured findings, in result order | the review binding in state (PR, HEAD, base ref, merge base) |
-| `FIX` | one resolution per open finding: the finding id, the resolution, the rationale and the reported `commit_sha`. A deferred finding names the plan position of the K5 or K6 effect that carries its marker, and never a URL | the reviewed HEAD the fix started from (`current_head_sha`), `open_findings`, and the follow-ups handed over at entry |
+| `FIX` | one resolution per open finding: the finding id, the resolution, the rationale (redacted form) and the reported `commit_sha`. A deferred finding names its follow-up's source, and never a URL: the plan position of the K5 or K6 effect that carries its marker, or `entry` for a follow-up the entry observation already holds (below) | the reviewed HEAD the fix started from (`current_head_sha`), `open_findings`, and the follow-ups handed over at entry: each open finding's own follow-up or none, and the earlier rounds' deferrals |
 | `REPLAN_REEXECUTE` | the validated `historical_findings_considered` and `unique_failure_constraints` that the K7 marker renders | the `PREPARED` checkpoint |
 | `UPDATE_EPIC` | the roadmap section when one is required, or none (a section that is not required is ignored, as today); the selection, either `null` (the EPIC is complete) or the validated next-issue URL | two SHA-256 digests of the EPIC body outside the roadmap markers: as the entry read before the result's launch saw it (today an in-memory value, `_epic_roadmap_at_entry`), and as the splice of the context's section into that body leaves it |
+
+**The source of a `FIX` follow-up.** The entry observation (D4.4) records,
+for each open finding, the one open issue that carries its marker, or none.
+It comes from the complete open-issue listing read with `at_most_one`, as
+the entry reads it today, and two such issues block before launch. Such an
+issue already *is* the finding's follow-up: for example a human created it,
+an older fixer created it without pushing (D13.6), or `unblock` made it
+pre-existing (D9.2). Neither publishing kind can produce it again. K5
+requires that no open issue carries the marker, K6 requires that the body
+carries none of its block's markers, and a second copy of a marker makes
+the issue unreadable to the marker scanner. A deferred finding therefore
+has exactly one source, fixed when the plan is derived:
+
+| The entry observation holds, for the finding | Source | Effect |
+|---|---|---|
+| its own follow-up | `entry` | none: the issue is reused as it is |
+| none, and the result asks for a new issue | its K5's plan position | K5 creates the issue with the marker |
+| none, and the result names a handed-over issue | that issue's K6's plan position | K6 appends the marker to that issue |
+
+- **Reuse publishes nothing.** It has no effect record, and no block
+  carries the reused marker. Another finding may still be deferred to the
+  same issue: its K6 appends only that finding's marker, over a base that
+  already holds the reused one (D5.5).
+- **A finding with its own follow-up is resolved by reuse only.** Wave 1
+  has no kind that closes an issue (D1.2). A result that resolves such a
+  finding another way, or defers it to another issue, is refused through
+  the correction path before any effect. The URL is the entry
+  observation's. A URL in the result is at most a cross-check (D8.1), and
+  never the source. An operator who wants the finding resolved otherwise
+  closes the issue. The re-verification below then blocks, and the entry
+  after `unblock` observes no follow-up for the finding.
+- **Reuse is re-verified, never trusted.** The precondition read before the
+  plan (D4.4) and the completion, once every record is `observed`, both
+  read the complete open-issue listing again. The finding's marker must
+  still resolve `exactly_one` to the recorded issue, which must be open, in
+  this repository and not the current issue. Anything else is `BLOCKED`,
+  naming the issue. It is never a write, and never another issue's URL.
+  The check is a read with no record, so a crash before or after it
+  repeats it, on the uninterrupted path and on resume alike.
+- **Strictly validated on load.** A `FIX` context is corrupt when:
+  - an `entry` source names a finding the entry observation holds no
+    follow-up for;
+  - a K5 or K6 source names a finding it holds one for;
+  - the named record is not a K5 for that finding, or a K6 whose block
+    carries that finding's marker;
+  - a finding with its own follow-up is not resolved through `entry`;
+  - a block carries the marker of a finding with its own follow-up.
 
 How each phase completes from its context, once every record is
 `observed`:
@@ -526,10 +603,12 @@ How each phase completes from its context, once every record is
 - **`REVIEW`** runs `_apply_review`'s post-review re-read, round
   consumption, carry-forward, stagnation check and replan policy on the
   context's verdict and findings. The comment's URL is K4's observed result.
-- **`FIX`** folds the resolutions into `last_fix_resolutions`. Each
-  follow-up URL is the observed result of the effect the resolution names.
-  The new HEAD is K1's observed result, or the reviewed HEAD when the plan
-  pushes nothing.
+- **`FIX`** folds the resolutions into `last_fix_resolutions`, each
+  rationale in its stored form. Each follow-up URL comes from the
+  resolution's source: the observed result of the K5 or K6 effect it names,
+  or, for `entry`, the entry observation's issue once the completion has
+  re-verified it. The new HEAD is K1's observed result, or the reviewed
+  HEAD when the plan pushes nothing.
 - **`REPLAN_REEXECUTE`** binds the replacement under the existing
   predicates. It compares the marker's attestation with the context, not
   with the agent's stdout. Supersede and activation then run from the
@@ -660,6 +739,20 @@ decision.
   disagree with what was already published, for example the same progress
   comment followed by another roadmap section or next issue, and a review
   comment whose findings no longer match the round's verdict.
+- **Validating a stored rationale under the parser's bounds.** Redaction
+  lengthens or shortens accepted text, so the controller would refuse, on
+  resume, a context it saved legitimately, after its effects had landed.
+- **Storing the raw rationale and redacting it at completion.** That
+  persists a secret in the state file for as long as the phase is open.
+- **Refusing credential-shaped strings in a rationale,** to make its stored
+  form its parsed form. The rationale is not published (D5.3), and the
+  refusal would cost the agent a correction for text no one publishes.
+- **Planning a K6 for a finding whose own follow-up exists.** The marker is
+  already in the issue's body, so K6's precondition fails, and appending it
+  again makes the issue unreadable to the marker scanner.
+- **Taking a reused follow-up's URL from the result.** That makes the
+  target agent-chosen (D2.1). The entry observation names the issue, and
+  the controller re-verifies it.
 
 ### 2.5 The closed Wave 1 effect-kind set (item 5)
 
@@ -795,6 +888,8 @@ protocol bump; this is why the set is closed now.
 - **Identity:** the `ai-follow-up` marker for the PR and finding id.
 - **Target:** the verified repository's issues.
 - **Precondition:**
+  - the entry observation holds no follow-up for the finding. A finding
+    that has one is reused, never created again (D4.6);
   - no open issue carries the marker;
   - no issue created after a number watermark carries it. The watermark is
     persisted with the plan, and the all-states listing is read newest-first
@@ -823,11 +918,16 @@ protocol bump; this is why the set is closed now.
   (`FOLLOW_UP_ISSUES` or `EXISTING_FOLLOW_UP_ISSUES`) that is open, in this
   repository and not the current issue. A K5 issue is created in this phase,
   so it is never a K6 target in the same phase.
-- **Precondition:** the issue is open, and its body equals the recorded base
-  and carries none of the effect's markers (D5.5).
+- **Precondition:**
+  - the issue is open, and its body equals the recorded base and carries
+    none of the effect's markers (D5.5);
+  - the entry observation holds no follow-up for any finding of the block.
+    A finding that has one is reused (D4.6), so its marker is never in a
+    block.
 - **Payload:** a body append (D5.5). The block is the markers, one per line
-  in plan order, and the base is the issue body. Markers an earlier round
-  appended are part of the base and are kept.
+  in plan order, and the base is the issue body. Markers already in the base
+  are kept: an earlier round's, and a reused finding's when the target is
+  that finding's own follow-up.
 - **Completion read-back:**
   - the body equals the payload, byte for byte;
   - each marker resolves to one open issue per finding.
@@ -934,8 +1034,8 @@ not render: the target's existing body. Both follow one rule.
   two markers. They are never two effects composed over the same body,
   where the second write would drop the first marker.
 - **The base** is the target's body as read in the precondition read
-  before the plan is persisted (D4.4). Markers already in it, from earlier
-  rounds, stay in it.
+  before the plan is persisted (D4.4). Markers already in it stay in it:
+  an earlier round's, and a reused finding's (D4.6).
 - **The payload** is the base, a fixed separator that #160 defines, and
   the block. The record holds the full payload, the block, and a SHA-256
   digest of the base. A payload over the target's body limit (D2.4) is
@@ -1432,8 +1532,11 @@ its author. Only the effect records and the entry observation prove origin.
   - A remote branch with no PR is prior work: its head becomes K1's expected
     old value, and it is fetched so that the agent continues from it.
 - **D9.5 (#163) `FIX`.** Marker-bearing follow-ups found at entry are handed
-  over and are referenceable through K6. They are never republished, as with
-  #90's `EXISTING_FOLLOW_UP_ISSUES` today.
+  over and are never republished, as with #90's `EXISTING_FOLLOW_UP_ISSUES`
+  today. An open finding's own follow-up is that finding's follow-up: it is
+  reused, re-verified and never written (D4.6). Every handed-over issue,
+  such a follow-up included, is referenceable through K6 for another
+  finding.
 - **D9.6 (#162) `REVIEW`.** A round comment for this round at the bound
   revision is refused, even when pre-existing. It cannot be completed without
   the validated result it would need, and adopting it would let any author
@@ -1751,7 +1854,12 @@ is.
   - A PR head past the reviewed HEAD takes the existing drift route
     (`FIX -> REVIEW`), so the old agent's push is reviewed.
   - Marker-bearing follow-ups are pre-existing, handed over and
-    referenceable.
+    referenceable. The re-entry's pre-launch save records them in the
+    entry observation. A follow-up an old fixer created for an open finding
+    without pushing (today's
+    `test_fix_entry_hands_an_existing_follow_up_issue_to_the_fixer`) is
+    that finding's own follow-up: the new fixer's deferral reuses it with
+    no write (D4.6).
 - **D13.7 (#160) `UPDATE_EPIC`.**
   - Exactly one legacy progress comment is adopted as the phase's observed
     progress comment, named in the step message and the run log.
@@ -1810,7 +1918,8 @@ is.
   inputs come from the completion context only (D4.6).
 - **State and logs stay bounded and redacted.** Effect records are bounded
   (D2.4). The published payload is redaction-invariant (D8.3), and record
-  errors are redacted within `MAX_GROWTH_FACTOR`.
+  errors and the stored `FIX` rationale are redacted within
+  `MAX_GROWTH_FACTOR` (D4.6).
 - **Marker schemas and cardinality** (`at_most_one` at entry, `exactly_one`
   on read-back), review-round routing, loop bounds, stagnation and the replan
   policy.
@@ -1884,8 +1993,8 @@ interrupts the step after each persisted stage and resumes.
 | K2 implementation PR | create landed, save lost; timeout landed and not landed; duplicate invocation after a restart | a PR on the branch already closed; two marker-bearing PRs; a marker-bearing PR that appeared during the agent run (unexplained) | #160; #161 |
 | K3 adopt PR | append landed, save lost; a body edited before the first issue is rebased, checkpointed, then issued; a crash after the rebase save and before the write, and after the write and before the next save, reconciles against the rebased payload with no second write; a body edited after an issue, payload not present, is `BLOCKED` | a fork-head PR refused; a closed PR on the branch; a body that carries the block but has otherwise drifted; a payload over the body limit refused before the plan is persisted | #160; #161 |
 | K4 review comment | create landed, save lost (round completes with no relaunch); timeout | a second matching comment; a pre-existing round comment refused; an oversized rendered body refused before any effect; a stale round still gets its comment | #160; #162 |
-| K5 follow-up issue | create landed, save lost; timeout | created then closed by a human; two issues for one finding; a human-created marker-bearing issue | #160; #163 |
-| K6 marker append | append landed, save lost; a human body edit before the first issue is rebased, checkpointed, then issued; a crash after the rebase save and before the write reconciles against the rebased payload; a body edited after an issue, payload not present, is `BLOCKED`; two findings deferred to one issue are one effect, and both markers survive, across a crash after the write as well; a later round's append keeps every earlier round's marker | a body already equal to the payload (`observed`); a block marker in a body that is not the payload; an issue the controller did not hand over refused; a payload over the body limit refused before the plan is persisted | #160; #163 |
+| K5 follow-up issue | create landed, save lost; timeout | created then closed by a human; two issues for one finding; a human-created marker-bearing issue that appeared during the agent run (unexplained); a finding whose own follow-up existed at entry is reused, and no K5 is planned for it (D4.6) | #160; #163 |
+| K6 marker append | append landed, save lost; a human body edit before the first issue is rebased, checkpointed, then issued; a crash after the rebase save and before the write reconciles against the rebased payload; a body edited after an issue, payload not present, is `BLOCKED`; two findings deferred to one issue are one effect, and both markers survive, across a crash after the write as well; a later round's append keeps every earlier round's marker | a body already equal to the payload (`observed`); a block marker in a body that is not the payload; an issue the controller did not hand over refused; a payload over the body limit refused before the plan is persisted; no block carries the marker of a finding whose own follow-up existed at entry (D4.6) | #160; #163 |
 | K7 replacement PR | push landed with no PR; create landed, save lost; no second agent run | a branch with the derived name at another SHA; a human push before binding; a human close before binding; a marker-bearing PR created during the agent run | #160; #164 |
 | K8 progress comment | create landed, save lost; timeout | an unjournaled comment refused; two comments block before launch | #160 |
 
@@ -1918,10 +2027,40 @@ In addition:
     handoff all equal an uninterrupted run's, and no step parses the
     comment.
   - **#163 (`FIX`).** `last_fix_resolutions` equals the context's
-    resolutions, each follow-up URL taken from the observed result of the
-    effect it names. Two findings deferred to one existing issue both map
-    to that issue's K6. The new HEAD is K1's observed result, or the
-    reviewed HEAD with no push.
+    resolutions, each follow-up URL taken from its source: the observed
+    result of the effect it names, or the re-verified entry observation.
+    Two findings deferred to one existing issue both map to that issue's
+    K6. The new HEAD is K1's observed result, or the reviewed HEAD with no
+    push. In addition:
+    - **Redaction growth and shrinkage.** The result pushes a fix and
+      resolves two more findings as `no_change_with_rationale`. One
+      rationale is `MAX_FIX_RATIONALE_CHARS` long, and redaction lengthens
+      it past that bound. The other is accepted, and redaction shortens it
+      below `MIN_RATIONALE_CHARS`. After each window, resume completes with
+      the uninterrupted run's `last_fix_resolutions`: both rationales
+      whole, unclipped and redacted, and no secret in the state file.
+    - **Reuse with an empty plan.** An open finding's own follow-up exists
+      before the entry (a human created it), and the result defers only
+      that finding. The plan is empty and the context is saved. Uninterrupted,
+      and after a crash between that save and the transition save, the
+      phase completes with that issue's URL, no agent launch on resume, no
+      write, and no second issue.
+    - **Legacy reuse.** The interrupted old fixer that created its
+      finding's issue without pushing
+      (`test_fix_entry_hands_an_existing_follow_up_issue_to_the_fixer`)
+      re-enters under D13.6, and the new fixer's deferral completes the
+      same way, with an empty plan.
+    - **Reuse beside an append.** Finding A's own follow-up exists at
+      entry, and the result defers finding B to the same issue. The plan
+      holds one K6 whose block carries B's marker only, over a base that
+      carries A's. After each window, the body carries each marker exactly
+      once, no issue is created, and A maps to the issue through `entry`
+      and B through the K6.
+    - **Refusals.** A result that resolves a finding with its own
+      follow-up as `fixed` or `no_change_with_rationale`, or defers it to
+      another issue, is refused before any effect. A reused issue that is
+      closed, or that a second marked issue joins, before the plan or at
+      completion, is `BLOCKED`, naming it, with no write.
   - **#161 (`ANALYZE_EXECUTE`).** The PR, HEAD, base and branch come from
     the observed results of K1 and K2, or K1 and K3.
   - **#164 (`REPLAN_REEXECUTE`).** Binding compares the attestation with
@@ -1970,6 +2109,14 @@ In addition:
   - corrupt records fail loudly;
   - a context that is corrupt, out of bounds, carries an unknown key, or is
     bound to another phase, issue, PR, round or transaction fails loudly;
+  - a `FIX` context round-trips unchanged when redaction has lengthened a
+    stored rationale past `MAX_FIX_RATIONALE_CHARS` and shortened another
+    below `MIN_RATIONALE_CHARS`. A stored rationale over
+    `MAX_FIX_RATIONALE_CHARS × MAX_GROWTH_FACTOR` fails loudly, and the
+    total bound holds a context of `MAX_RESOLUTIONS_PER_FIX` rationales at
+    that bound;
+  - a `FIX` context with an `entry` source round-trips, and one that
+    breaks any follow-up source rule of D4.6 fails loudly;
   - the transition save drops the records and the context together;
   - LOCAL state with records, an entry observation or a completion context
     is refused;
