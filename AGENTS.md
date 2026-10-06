@@ -180,7 +180,8 @@ docs/agent-guides/
   secrets-and-logging.md               redaction and what may never be logged or committed
   testing.md                           testing requirements and high-priority coverage
 docs/adr/                              accepted design records (LOCAL mode workspace boundary,
-                                       executor: nothing an agent starts outlives its invocation)
+                                       executor: nothing an agent starts outlives its invocation,
+                                       Pi provider, authority boundary and typed external effects)
 docs/README.md                         human-oriented documentation index, by intent
 docs/usage.md                          operator guide: remote commands, stop phases, unblock, recovery
 docs/local-mode.md                     operator guide: LOCAL mode (no GitHub)
