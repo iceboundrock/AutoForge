@@ -1,12 +1,14 @@
 """Duplex child handle: a subprocess the controller writes to while it runs.
 
-:func:`autoforge.executor.execute` is one-shot: the child gets ``/dev/null``
-for stdin and the controller only reads. An RPC transport needs a child it
-can keep writing records to while reading records back. This module is the
-narrowest primitive that does that and keeps every guarantee ``execute()``
-gives (ADR 0002: nothing the child starts outlives the invocation). It deals
-in bytes and LF-framed records only: nothing here knows an encoding, a
-provider, a phase or controller state; decoding a record is the caller's.
+:func:`autoforge.executor.execute` is one-shot: the child's stdin is
+``/dev/null``, or a payload fixed before the spawn followed by EOF
+(``ExecutionRequest.stdin_data``), and nothing the child writes back changes
+what it is sent. An RPC transport needs a child it can keep writing records
+to while reading records back. This module is the narrowest primitive that
+does that and keeps every guarantee ``execute()`` gives (ADR 0002: nothing
+the child starts outlives the invocation). It deals in bytes and LF-framed
+records only: nothing here knows an encoding, a provider, a phase or
+controller state; decoding a record is the caller's.
 
 Guarantees:
 

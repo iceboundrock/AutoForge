@@ -156,10 +156,22 @@ are reported as `orphans_killed` / `orphan_survived_kill`. Without a
 subreaper the result says `orphans_unchecked`. One contained invocation
 runs per controller process.
 
-`execute()` itself stays one-shot with `stdin=DEVNULL`. A child the
-controller must write to while it runs (an RPC transport such as Pi's, ADR
-0003 §2.7) uses the duplex child handle in `src/autoforge/executor_duplex.py`
-instead: `with start_duplex(DuplexRequest(...)) as child:` then
+`execute()` itself stays one-shot: what the child gets on stdin is fixed
+before the spawn, and nothing the child writes back changes it. By
+default (`ExecutionRequest.stdin_data` is `None`) its stdin is
+`/dev/null`, so a CLI that waits for interactive input cannot hang. With
+`stdin_data`, stdin is a pipe that a feeder thread fills with those bytes
+and then closes, so the child reads the payload and then EOF (the
+OpenCode prompt, above). The feeder writes non-blocking and the teardown
+wakes and joins it, so a child that never reads its stdin still ends at
+the deadline. It keeps the pipe's read end until the invocation is over,
+so `ExecutionResult.stdin_unread` counts what the child left unread, not
+only what was never written.
+
+A child the controller must keep writing to while it runs, in step with
+what it reads back (an RPC transport such as Pi's, ADR 0003 §2.7), uses
+the duplex child handle in `src/autoforge/executor_duplex.py` instead:
+`with start_duplex(DuplexRequest(...)) as child:` then
 `send_line`, `read_line`, `close_stdin` and `finish`. It reuses the
 executor's spawn, environment selection, pipe draining and group kill, and
 it is held to the same contract:
