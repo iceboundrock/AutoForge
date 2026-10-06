@@ -84,6 +84,11 @@ repository-defined validation commands and to pre-merge commands.
   can write its `config` and hooks. `fetch_pr_head` resolves `origin`, its
   transport settings and its hooks from that config. A network `git fetch`
   can also start automatic maintenance, which runs the `pre-auto-gc` hook.
+- **Agent-writable object interpretation.** The common dir also holds
+  replacement refs and the graft and shallow files, and the shared object
+  store holds the commit-graph. Git honours all four when it reads an
+  object, so a controller check that names a commit by SHA can read a
+  substitute: other parents, another message or another tree.
 - **Credentials are not bounded by tool policy.** Claude Code runs with
   `bypassPermissions` by default, and Pi has no approval layer
   (`docs/pi-policy.md`). While an agent holds the operator's credentials,
@@ -131,18 +136,23 @@ the operator's checkout and every other worktree share (`git help worktree`,
   private git directory: edits, builds, tests, staging, local commits on the
   worktree's `HEAD`, and git commands that only read objects and refs
   (`git rev-parse`, `git log`, `git diff`, `git branch -a`).
-  - A local commit also adds objects to the shared object store. That is the
-    one shared write an agent makes, and it grants nothing. An object is
-    content-addressed and names nothing, and the controller names every
-    revision by a SHA it read from the worktree's `HEAD` or recorded in its
-    own state (D6.4).
+  - A local commit also writes to the shared object store: objects, and the
+    packs, indexes and commit-graph that git's own maintenance derives from
+    them. That is the one shared write an agent's work needs, and it grants
+    nothing. The controller names every revision by a SHA it read from the
+    worktree's `HEAD` or recorded in its own state (D6.4). It reads that SHA
+    as the SHA's own bytes: it honours no replacement ref, graft, shallow
+    boundary or commit-graph, and it re-hashes every commit a decision reads
+    (D7.5).
   - The candidate is the worktree's `HEAD`. Verification and recovery address
     it as that plus the controller-named *remote* branch, never through a
     local ref.
 - **Operator-owned local.** Every other write to the common dir:
   - creating, moving or deleting a shared ref (`refs/heads/*`, `refs/tags/*`,
-    `refs/remotes/*`, `refs/stash`), local branch creation included;
-  - editing the repository configuration or hooks;
+    `refs/remotes/*`, `refs/replace/*`, `refs/stash`), local branch creation
+    included;
+  - editing the repository configuration or hooks, or the graft and shallow
+    files;
   - worktree administration (`git worktree add`, `move`, `remove`, `prune`).
 
   None of it is externally visible, so it is not controller-only. The
@@ -179,11 +189,13 @@ git directory. No Wave 1 phase needs one.
 - **Wave 1 enforces the operator-owned class by instruction only.** An agent
   can still write shared refs, configuration and hooks (§2.11). What Wave 1
   guarantees is narrower. No controller verification or recovery reads a
-  shared ref (D6.4). The controller's network git reads no shared
-  configuration or hook (§2.7), and its local git runs whatever that state
-  can make it run with no more authority than the agent (D7.3). A shared ref
-  an agent writes anyway therefore grants nothing, and a moved `HEAD` or
-  branch of the operator's checkout still blocks the run.
+  shared ref (D6.4), and no controller git process lets a replacement ref,
+  graft, shallow boundary or commit-graph change what a SHA reads as
+  (D7.5). The controller's network git reads no shared configuration or
+  hook (§2.7), and its local git runs whatever that state can make it run
+  with no more authority than the agent (D7.3). A shared ref an agent
+  writes anyway therefore grants nothing, and a moved `HEAD` or branch of
+  the operator's checkout still blocks the run.
 - **A read-only common dir changes the enforcement, not the classes.** If
   Wave 2A (#166) makes the common dir read-only to agents, operator-owned
   writes become impossible, and no phase loses anything it needs. #166 must
@@ -277,8 +289,8 @@ remote object. It is defined by six things:
 - **an exact target:** a repository, plus a PR or issue number or a ref;
 - **a precondition:** the expected old value of the target, taken from the
   entry observation (§2.4). Examples are "no object with this identity", a
-  ref that is absent or at a recorded SHA, and "this body carries no marker
-  for this identity";
+  ref that is absent or at a recorded SHA, and "this body equals a recorded
+  base and carries no marker for this identity" (D5.5);
 - **a payload:** the exact bytes to publish (title and body), or the exact
   candidate SHA;
 - **a completion criterion:** a specific read-back, defined per kind in §2.5.
@@ -388,6 +400,11 @@ A target already in the intended end state at `intended` is accepted as
 observed. Since the agent exited, only the controller and humans can have
 written it (D4.4), and the end state is exactly the one intended.
 
+Body appends (K3, K6) refine the second case. An append that was never
+issued, and whose target body has changed since its base was recorded, is
+rebased, and the rebased payload is checkpointed before it is issued
+(D5.5).
+
 **D4.3 (#160).** **No blind retry of a create.** An ambiguous outcome (a
 timeout, a transient error or an unparsable reply) is never re-sent at the
 transport level; it is reconciled instead. The rules around it:
@@ -435,7 +452,7 @@ concrete reads.
 | Window | Record on disk | Resolution |
 |---|---|---|
 | **W1** before the intent is persisted | none | Nothing was published: no write is issued before `attempted` is saved. The step re-runs. The result was never persisted, so the agent is relaunched under the existing attempt accounting, and its local commit is still in the worktree. Entry reconciliation runs first, and any phase identity that differs from the entry observation is unexplained (§2.9). |
-| **W2** intent persisted, write not issued | `intended` | Reconcile (D4.2). Intended end state: `observed`. Precondition holds: save `attempted`, then issue once. Otherwise `BLOCKED`, naming the object. |
+| **W2** intent persisted, write not issued | `intended` | Reconcile (D4.2). Intended end state: `observed`. Precondition holds: save `attempted`, then issue once. A body append whose target body changed is rebased in that same save (D5.5). Otherwise `BLOCKED`, naming the object. |
 | **W3** write issued, outcome unknown | `attempted` | Reconcile by identity before anything else. Intended end state: `observed`. Precondition still holds and fewer than 2 issues made: save the incremented count, then re-issue. Bound exhausted: `BLOCKED`, naming the effect and the manual step. Otherwise `BLOCKED`. |
 | **W4** write landed, state not saved | `attempted` | The W3 reconciliation finds the intended end state: `observed`, with no second write. |
 | **W5** read-back mismatch | `attempted` → `conflict` | The identity resolves to an object whose target, payload or state differs, or to two objects. The record becomes `conflict`, which is `BLOCKED` naming every object found. Never repaired in place, never duplicated. |
@@ -545,21 +562,22 @@ protocol bump; this is why the set is closed now.
 - **Precondition:**
   - the PR is still open;
   - its head equals the K1 candidate (K1 is `observed` first);
-  - its body carries no implementation marker for the issue.
-- **Payload:** a controller block (`Closes #n` and the implementation
-  marker), appended to the body that is read immediately before the write.
+  - its body equals the recorded base and carries no implementation marker
+    for the issue (D5.5).
+- **Payload:** a body append (D5.5). The block is `Closes #n` and the
+  implementation marker, and the base is the PR body.
 - **Completion read-back:**
-  - the body ends with the block exactly once;
-  - the rest of the body equals the pre-write read;
+  - the body equals the payload, byte for byte;
   - the marker resolves `exactly_one`.
-- **Windows:**
-  - W2 and W3: the block is already present → `observed`; the body was
-    edited by a human → re-read and append once.
-  - W5: a body that carries the block but has otherwise drifted is a
-    conflict.
+- **Windows:** D5.5's reconciliation.
+  - A body edited before the first issue is rebased and checkpointed, then
+    issued.
+  - A body that differs from both the payload and the base after an issue
+    is a conflict, including one that carries the block but has otherwise
+    drifted.
 - **Residual:** GitHub offers no conditional body update. A human edit that
-  lands between the pre-write read and the write is overwritten. The
-  roadmap splice accepts the same window, and the record states it.
+  lands between the last read and the write is overwritten. The roadmap
+  splice accepts the same window, and the record states it.
 
 #### K4. Create the review round comment
 
@@ -614,23 +632,22 @@ protocol bump; this is why the set is closed now.
 #### K6. Append a follow-up marker to an existing issue
 
 - **Consumer:** #163.
-- **Identity:** the referenced issue number and the `ai-follow-up` marker
-  for the PR and finding.
+- **Identity:** the referenced issue number and the `ai-follow-up` markers
+  it receives in this phase, one per finding. All of a phase's markers for
+  one issue form one effect (D5.5).
 - **Target:** an issue the controller handed over at entry
   (`FOLLOW_UP_ISSUES` or `EXISTING_FOLLOW_UP_ISSUES`) that is open, in this
-  repository and not the current issue.
-- **Precondition:** the issue is open and carries no marker for this PR and
-  finding.
-- **Payload:** the marker line, appended to the body read immediately before
-  the write.
+  repository and not the current issue. A K5 issue is created in this phase,
+  so it is never a K6 target in the same phase.
+- **Precondition:** the issue is open, and its body equals the recorded base
+  and carries none of the effect's markers (D5.5).
+- **Payload:** a body append (D5.5). The block is the markers, one per line
+  in plan order, and the base is the issue body. Markers an earlier round
+  appended are part of the base and are kept.
 - **Completion read-back:**
-  - the body ends with the marker exactly once;
-  - the rest equals the pre-write read;
-  - one open issue per finding.
-- **Windows:**
-  - W2 and W3: the marker is already present → `observed`; a human edited
-    the body → re-read and append once.
-  - W5: a conflict.
+  - the body equals the payload, byte for byte;
+  - each marker resolves to one open issue per finding.
+- **Windows:** D5.5's reconciliation, as for K3.
 - **Residual:** the same as K3.
 
 #### K7. Create the replacement PR
@@ -715,11 +732,69 @@ Migrating them into effect records would add risk with no new safety.
 #160 only pins with a test that the close receipt is presence-checked
 (`has_close_receipt`), so a duplicate receipt is harmless.
 
+**D5.5 (#160).** **A body append is a frozen block over a recorded base.**
+K3 and K6 are the two kinds whose payload contains bytes the controller did
+not render: the target's existing body. Both follow one rule.
+
+- **The block** is the controller-rendered text the kind appends. It is
+  rendered once, persisted, and never re-rendered (D8.4).
+- **One effect per target.** All of a phase's appends to one object form
+  one effect, whose block carries every marker for that object in plan
+  order. Two findings deferred to one existing issue are one K6 effect with
+  two markers. They are never two effects composed over the same body,
+  where the second write would drop the first marker.
+- **The base** is the target's body as read in the precondition read
+  before the plan is persisted (D4.4). Markers already in it, from earlier
+  rounds, stay in it.
+- **The payload** is the base, a fixed separator that #160 defines, and
+  the block. The record holds the full payload, the block, and a SHA-256
+  digest of the base. A payload over the target's body limit (D2.4) is
+  refused before the plan is persisted, as `BLOCKED` naming the object.
+- **Precondition:** the target's body equals the base, by digest, and
+  carries none of the block's markers. The kind adds its own conditions
+  (K3, K6).
+- **Completion:** the body equals the payload, byte for byte.
+
+Reconciliation reads the body and decides as follows. It refines W2–W5 for
+these two kinds:
+
+| Record | Body read now | Decision |
+|---|---|---|
+| `intended` or `attempted` | equals the payload | `observed` |
+| `intended` or `attempted` | equals the base, attempt bound not exhausted | save `attempted` with the count incremented, then issue the persisted payload |
+| `intended` | equals neither; the target still meets the kind's other conditions and carries none of the block's markers | **rebase**, then issue (below) |
+| any | anything else | `conflict`, naming the object |
+
+- **A rebase** is one atomic save. It replaces the payload with the body
+  just read followed by the persisted separator and block, replaces the
+  base digest with that body's, and moves the record to `attempted` with its
+  count incremented. The new payload is issued only after that save.
+- **A rebase is allowed only from `intended`.** No write has been issued
+  then (D4.1), so the record still describes everything sent, which is
+  nothing. After the save, the journal holds the exact bytes of the one
+  write that follows, and a crash at any point reconciles against them.
+- **From `attempted`, a body that equals neither the payload nor the base
+  is a conflict.** The controller cannot tell a write that landed and was
+  then edited from one that never landed, and it does not guess.
+- The rebase consumes an attempt, so the bound of D4.3 also bounds rebases.
+
 *Rationale.* The eight kinds are exactly the agent writes that must move;
 the inventory has no others. A closed set keeps the effect layer from
 becoming a general write channel. Dropping step 6 and in-place correction
 removes two places where agent text could be republished under the
 operator's identity.
+
+For body appends (D5.5):
+
+- **The journal must hold every byte sent.** Recovery compares the target
+  against the bytes actually issued, so a composition over a new base is
+  checkpointed before it is issued, and never reconstructed afterwards.
+- **A rebase only from `intended`** is the one case where the controller
+  knows that nothing was sent. It turns a benign human edit made while the
+  run was stopped into a normal write instead of a block.
+- **One effect per target** removes ordering between effects. Each write
+  replaces the whole body, so two effects on one body would either drop a
+  marker or make one effect's base depend on another's completion.
 
 *Rejected.*
 
@@ -732,6 +807,15 @@ operator's identity.
   case that rendering from persisted bytes removes.
 - **Migrating the existing writes now.** That is churn with no new safety,
   and #160's non-goals exclude it.
+- **Re-reading the body and appending at write time without a checkpoint.**
+  The published bytes would then differ from the journal, and a crash after
+  the write could not be reconciled.
+- **Freezing the payload and blocking on any body change.** It blocks a run
+  on a benign edit made while no write was in flight, which is the case a
+  rebase handles safely.
+- **One effect per finding, chained on one issue.** Each effect's base
+  would be its predecessor's payload. That adds ordering and a dependency
+  between records for no gain over one effect per target.
 
 ### 2.6 The Git publication layer (item 6)
 
@@ -759,7 +843,7 @@ kind deletes or rewinds a ref.
 fetches into the shared object store and creates or moves no local ref:
 the `premerge.py` precedent, now through the hardened transport. The
 authority for a fetched revision is the SHA the controller recorded in its
-own state.
+own state, read as that SHA's own bytes (D7.5).
 
 - An object that is missing when the controller needs it (pruned by
   `git gc`, for example) is fetched again immediately before the check.
@@ -836,11 +920,85 @@ This covers `rev-parse`, `merge-base`, the one-time `worktree add`, and the
 configuration can still make such a process run, such as a filter driver
 during the export, therefore runs with no more authority than the agent
 itself. The export's byte fidelity under filters is #171's (Wave 2B) and is
-not decided here.
+not decided here. Every one of these processes that reads an object by SHA
+also follows D7.5.
 
 **D7.4 (#160).** The controller's `gh` invocations name the repository
 explicitly (`--repo`, or an API path) and never resolve it from a git
 remote. `gh` is invoked with no working directory inside a worktree.
+
+**D7.5 (#160).** **A SHA reads as its own bytes.** Every controller git
+process that reads an object by SHA reads the object stored under that
+SHA, never a substitute that agent-writable state supplies. The rule
+covers:
+
+- object existence checks (today's `commit_is_local`);
+- K1's ancestry and fast-forward checks (D6.2) and its published range and
+  commit messages (D8.5);
+- every tree the controller derives from a commit, the pre-merge export
+  (D7.2) and the one-time `worktree add` checkout;
+- the network fetch and push of D7.1.
+
+Reads of a ref, such as the worktree's `HEAD` for the candidate or the
+operator checkout's `HEAD` and branch for the anchor check, read no object
+and are unchanged.
+
+**No substitution.** Git honours four kinds of substitution state. In Wave 1
+an agent can write all four, and each changes what a SHA reads as without
+changing the SHA:
+
+| State | Where | What it substitutes | Excluded by |
+|---|---|---|---|
+| replacement refs (`refs/replace/*`) | common dir | a whole object: parents, message or tree | `--no-replace-objects` and `GIT_NO_REPLACE_OBJECTS=1` |
+| the graft file (`info/grafts`) | common dir | a commit's parents | a controller-owned git directory, which has none |
+| the shallow file (`shallow`) | common dir | a commit's parents, cut off | a controller-owned git directory, which has none |
+| the commit-graph (`info/commit-graph`, `info/commit-graphs/`) | shared object store | parents and root tree, read without the commit | `core.commitGraph=false` at command-line precedence |
+
+No one switch is enough. Measured with git 2.55.0 in an isolated
+repository: `--no-replace-objects` still honours a graft file and a forged
+commit-graph, and a private git directory still reads a forged
+commit-graph from the shared object store. So the rule needs all three
+mechanisms:
+
+- **Every such process** runs with replacement objects disabled and the
+  commit-graph off, both at command-line precedence.
+- **Every process that reads parents** runs in a per-operation
+  controller-owned git directory, as D7.1 defines it, with
+  `GIT_OBJECT_DIRECTORY` pointing at the shared store. That directory has
+  no refs and no graft or shallow file. These processes are the ancestry
+  checks and the range enumeration, plus the network fetch and push, which
+  run there already (D7.1). The network operations hold the credential and
+  the local reads do not.
+- **Tree reads** (the pre-merge export and `worktree add`) keep the
+  repository they use today. Graft and shallow state change parents only,
+  never a tree. The configuration-driven conversions of the export are
+  #171's (D7.3).
+
+**Verified bytes for every decision.** Git does not re-hash every object it
+reads, and in Wave 1 an agent can rewrite the object store's files
+directly. A decision therefore reads only commits whose ids the controller
+recomputes from the bytes git returned, in the object format of the
+recorded SHA (40 or 64 hexadecimal digits), never in a format read from
+agent-writable configuration.
+
+- **Ancestry.** "X descends from Y" holds only when a chain of parent links
+  leads from X to Y through commits that were re-hashed against their ids.
+  The chain is sought among the commits of the range Y..X that git
+  enumerates under the rule above. #160 fixes a bound on that range. A
+  range over the bound, an id mismatch, or no chain fails closed and is
+  never read as "allowed".
+- **Messages.** D8.5 reads each commit message from the same re-hashed
+  bytes.
+- **Trees.** A tree id the controller derives from a commit comes from that
+  commit's re-hashed bytes. The bytes of the trees and blobs the pre-merge
+  export writes are proven by #171's hash-back (Wave 2B), which already uses
+  §2.7's hardening; until it lands, Wave 1 guarantees the export no
+  substitution, not byte integrity.
+
+Beyond these reads, the integrity of the shared store is not a Wave 1
+guarantee (§2.11). GitHub re-hashes every object a push sends, and a whole
+store the agent cannot write is Wave 2A's private object directory and
+strict import (#166, #168).
 
 *Rationale.* Neutralising the shared configuration key by key is a deny
 list: every key that is missed is a hole, and new git versions add keys
@@ -848,6 +1006,20 @@ list: every key that is missed is a hole, and new git versions add keys
 credential helpers). A private git directory with no global or system
 configuration is an allow list by construction. Creating it for each
 operation leaves no persistent private state to drift or to plant into.
+
+D7.5 has two layers, because hardening configuration does not cover object
+interpretation:
+
+- **Re-hashing makes each decision a proof.** An ancestry chain and a
+  commit message are read from bytes that hash to the ids the controller
+  holds. A substituted or rewritten commit fails the comparison, whichever
+  mechanism supplied it.
+- **No substitution keeps the rest honest.** Which commits the range holds,
+  and every tree read, are git's answers, and no re-hash checks them. The
+  substitution switches are what keep those answers about the named SHAs.
+
+The re-hash is cheap: the commits it reads are the published range, which
+the push sends anyway.
 
 *Rejected.*
 
@@ -859,6 +1031,14 @@ operation leaves no persistent private state to drift or to plant into.
   SSH agent and repository configuration.
 - **Exempting the pre-merge fetch** because it predates the effect layer.
   It has the same exposure.
+- **`--no-replace-objects` alone.** A graft file and a forged commit-graph
+  still change parents (D7.5).
+- **Blocking when substitution state exists.** The operator may keep
+  replacement refs or grafts of their own, and git's maintenance writes a
+  commit-graph by itself. The controller must ignore that state, not
+  refuse it, and a check followed by a use leaves a window.
+- **Trusting git to verify object ids.** Git re-hashes only some of the
+  objects it reads, and which ones depends on the command and its version.
 
 ### 2.8 `CONTROL_RESULT` evolution (item 8)
 
@@ -905,7 +1085,11 @@ covers only the `ai-` prefix.
 re-render on recovery. The exact bytes to publish are stored in the effect
 record (D2.2). A write that landed while the state save did not then
 completes without relaunching the agent, and the read-back compares against
-the stored bytes.
+the stored bytes. A body append (K3, K6) persists its rendered block once.
+If the body it was composed over changes before any write is issued, the
+controller composes the persisted block onto the new body and checkpoints
+that payload before issuing it (D5.5). Nothing is re-rendered from a
+template, and every byte issued is in the record first.
 
 **D8.5 (#160).** **Commit messages are published content too.** K1 refuses a
 candidate when a commit message in the published range does either of
@@ -1111,7 +1295,9 @@ keeps the reviewed tree clean, and Wave 2A can project it read-only.
    run code, by repository state the agent can write. That state covers
    repository and worktree configuration, hooks, `origin`, and include
    directives. The controller's local git processes hold no credential
-   (D7.3).
+   (D7.3). Nor can that state change what a SHA the controller reads means:
+   replacement refs, grafts, shallow boundaries and the commit-graph are
+   ignored, and every commit a decision reads is re-hashed (D7.5).
 3. **Every write is accounted for.** Every Wave 1 externally visible write
    is a typed controller effect with a durable record. Anything else that
    appears with a Wave 1 identity is detected and blocks; it is never
@@ -1138,13 +1324,19 @@ the first four):
 - **Shared local repository state.** An agent can still create, move or
   delete shared refs and edit the configuration and hooks of the common dir,
   which the operator's checkout shares. D1.1 forbids it by instruction only;
-  §2.7, D6.4 and D7.3 bound what that state can do to the controller.
+  §2.7, D6.4, D7.3 and D7.5 bound what that state can do to the controller.
 - **Network egress.** An agent can send whatever it can read.
 - **Exposure outside the boundary.** Credentials the operator exposes
   outside AutoForge's controlled execution boundary, for example a token in
   a worktree file or in a service the agent can reach.
 - **The committed tree.** Its content is not filtered; `REVIEW` and the
   merge gate own it.
+- **Integrity of the shared object store.** An agent can rewrite the
+  store's files. D7.5 re-hashes the commits behind every K1 decision, and
+  GitHub re-hashes every object a push sends. Which commits git enumerates
+  in a range, and the bytes of the trees and blobs the pre-merge export
+  writes, still come from the store; #171's hash-back covers the export in
+  Wave 2B, and a store the agent cannot write is Wave 2A's (#166, #168).
 
 **Tool permission is not the boundary.** Provider permission modes and
 approvals are defence in depth at most (D1.3).
@@ -1389,10 +1581,11 @@ is.
 - **Wave 2A (#166–#169).** #166 decides the outer sandbox's git surface. A
   read-only common dir, a private object directory and a strict import
   compose with this record. Nothing here depends on an agent-written shared
-  ref, and the only shared state an agent writes is objects (D1.1), which a
-  private object directory and a strict import take over. D1.1 states what
-  #166 must keep writable for agents: the worktree's private git directory,
-  which lives under the common dir. The controller's own runtime
+  ref, and the only shared state an agent's work writes is the object store
+  (D1.1), which a private object directory and a strict import take over.
+  Until then, D7.5 bounds what that store can do to the controller. D1.1
+  states what #166 must keep writable for agents: the worktree's private git
+  directory, which lives under the common dir. The controller's own runtime
   directories, the per-operation git contexts and the read-context
   directories are never projected writable to agents.
 
@@ -1403,7 +1596,7 @@ mechanisms are unchanged and has no child.
 
 | Child | Decisions |
 |---|---|
-| #160 | D2.1–D2.4, D3.1, D4.1–D4.5, D5.1, D5.2, D6.1–D6.4, D7.1–D7.4, D8.1–D8.5, D9.1–D9.3, D9.7, D12.1–D12.5, D13.1–D13.3, D13.7; the K8 wiring |
+| #160 | D2.1–D2.4, D3.1, D4.1–D4.5, D5.1, D5.2, D5.5, D6.1–D6.4, D7.1–D7.5, D8.1–D8.5, D9.1–D9.3, D9.7, D12.1–D12.5, D13.1–D13.3, D13.7; the K8 wiring |
 | #161 | D9.4, D13.4; the K1, K2 and K3 wiring; the D1.2 rows it owns |
 | #162 | D8.6, D9.6, D13.5; the K4 wiring; the D1.2 rows it owns |
 | #163 | D5.3, D9.5, D13.6; the K1, K5 and K6 wiring; the D1.2 rows it owns |
@@ -1420,17 +1613,30 @@ interrupts the step after each persisted stage and resumes.
 
 | Kind | Crash-window tests (W1–W5) | Conflict tests | Owner(s) |
 |---|---|---|---|
-| K1 push | intent saved, no push; push landed, save lost; timeout landed and not landed; read-back drift | default branch refused; non-fast-forward refused; lease mismatch (a human push); an ancestor missing after the fetch fails closed; a planted `pushurl`, `insteadOf`, `core.sshCommand`, `core.hooksPath`, `pre-push` or `pre-auto-gc` hook neither redirects nor runs; a commit message with another issue's closing keyword refused | #160; #161, #163, #164 |
+| K1 push | intent saved, no push; push landed, save lost; timeout landed and not landed; read-back drift | default branch refused; non-fast-forward refused; lease mismatch (a human push); an ancestor missing after the fetch fails closed; a planted `pushurl`, `insteadOf`, `core.sshCommand`, `core.hooksPath`, `pre-push` or `pre-auto-gc` hook neither redirects nor runs; a commit message with another issue's closing keyword refused; planted substitution state or a rewritten commit object passes neither the ancestry check nor the message check (D7.5, below) | #160; #161, #163, #164 |
 | K2 implementation PR | create landed, save lost; timeout landed and not landed; duplicate invocation after a restart | a PR on the branch already closed; two marker-bearing PRs; a marker-bearing PR that appeared during the agent run (unexplained) | #160; #161 |
-| K3 adopt PR | marker append landed, save lost; a body edit racing the append | a fork-head PR refused; a closed PR on the branch | #160; #161 |
+| K3 adopt PR | append landed, save lost; a body edited before the first issue is rebased, checkpointed, then issued; a crash after the rebase save and before the write, and after the write and before the next save, reconciles against the rebased payload with no second write; a body edited after an issue, payload not present, is `BLOCKED` | a fork-head PR refused; a closed PR on the branch; a body that carries the block but has otherwise drifted; a payload over the body limit refused before the plan is persisted | #160; #161 |
 | K4 review comment | create landed, save lost (round completes with no relaunch); timeout | a second matching comment; a pre-existing round comment refused; an oversized rendered body refused before any effect; a stale round still gets its comment | #160; #162 |
 | K5 follow-up issue | create landed, save lost; timeout | created then closed by a human; two issues for one finding; a human-created marker-bearing issue | #160; #163 |
-| K6 marker append | append landed, save lost; a human body edit before the append | marker already present (`observed`); an issue the controller did not hand over refused | #160; #163 |
+| K6 marker append | append landed, save lost; a human body edit before the first issue is rebased, checkpointed, then issued; a crash after the rebase save and before the write reconciles against the rebased payload; a body edited after an issue, payload not present, is `BLOCKED`; two findings deferred to one issue are one effect, and both markers survive, across a crash after the write as well; a later round's append keeps every earlier round's marker | a body already equal to the payload (`observed`); a block marker in a body that is not the payload; an issue the controller did not hand over refused; a payload over the body limit refused before the plan is persisted | #160; #163 |
 | K7 replacement PR | push landed with no PR; create landed, save lost; no second agent run | a branch with the derived name at another SHA; a human push before binding; a human close before binding; a marker-bearing PR created during the agent run | #160; #164 |
 | K8 progress comment | create landed, save lost; timeout | an unjournaled comment refused; two comments block before launch | #160 |
 
 In addition:
 
+- **Object interpretation (#160, D7.5).** Each case plants one of a
+  replacement ref, a graft entry, a shallow entry or a forged commit-graph,
+  for the candidate, a commit of its range or the base:
+  - an unrelated candidate fails the ancestry check, and a non-fast-forward
+    candidate fails the fast-forward check;
+  - a commit message with another issue's closing keyword is still read
+    and refused;
+  - the existence check reports a missing commit as missing, even when a
+    replacement for it exists;
+  - a tree derived from a commit, the pre-merge export and the
+    `worktree add` checkout all see the named commit's own tree;
+  - a rewritten loose commit object in the range fails closed on its id,
+    for both the ancestry and the message check.
 - **Transport and dry-run (#160):**
   - a create is never re-sent after a transient failure, while a read is
     retried;
