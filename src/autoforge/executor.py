@@ -936,7 +936,8 @@ def execute(req: ExecutionRequest) -> ExecutionResult:
     Timeouts, non-zero exits and truncated output are *returned* (not
     raised) so callers can log stdout/stderr first; use ``raise_if_failed()``
     to convert. ExecutionError is raised only when the process cannot be
-    spawned or its output cannot be read.
+    spawned, the threads that feed and read it cannot be started (the group
+    is killed first), or its output cannot be read.
 
     With ``contain_orphans`` the invocation's orphans (:class:`_Containment`)
     count as part of what must be gone: they get the exit grace and the kill
@@ -975,23 +976,28 @@ def _execute(req: ExecutionRequest, contained: _Containment | None) -> Execution
     assert proc.stdout is not None and proc.stderr is not None
     if contained is not None:
         contained.child = proc.pid
-    if feeder is not None:
-        feeder.start()
     pgid = proc.pid  # start_new_session: the child leads a group of its own
-    # Output is read as bytes and decoded with replacement: agent output is
-    # untrusted (a dumped binary, a mis-encoded file the agent cats), and a
-    # decode error is not an AutoForgeError, so it would leave the
-    # invocation unlogged (#17).
-    readers = (
-        _BoundedReader(proc.stdout, req.max_output_bytes, "stdout"),
-        _BoundedReader(proc.stderr, req.max_output_bytes, "stderr"),
-    )
-    for reader in readers:
-        reader.start()
+    readers: tuple[_BoundedReader, ...] = ()
     timed_out = False
     descendants_killed = False
     left = _Termination(group_survived=False, capture_abandoned=False)
     try:
+        # The child is running from here on, so the threads that serve it
+        # start under the same guard as the wait: one the system refuses (a
+        # thread or descriptor limit) kills the group and fails the launch as
+        # a refused spawn would, never leaving the child behind.
+        try:
+            if feeder is not None:
+                feeder.start()
+            # Output is read as bytes and decoded with replacement: agent
+            # output is untrusted (a dumped binary, a mis-encoded file the
+            # agent cats), and a decode error is not an AutoForgeError, so it
+            # would leave the invocation unlogged (#17).
+            for stream, name in ((proc.stdout, "stdout"), (proc.stderr, "stderr")):
+                readers += (_BoundedReader(stream, req.max_output_bytes, name),)
+                readers[-1].start()
+        except (OSError, RuntimeError) as exc:
+            raise ExecutionError(f"failed to start {' '.join(req.command)}: {exc}") from exc
         try:
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -1016,15 +1022,17 @@ def _execute(req: ExecutionRequest, contained: _Containment | None) -> Execution
                 descendants_killed = not group_settled
                 left = _terminate_group(pgid, proc, readers, contained)
     except BaseException:
-        _terminate_group(pgid, proc, readers, contained)
+        # A reader whose thread never started has nothing to stop.
+        started_readers = tuple(reader for reader in readers if reader.ident is not None)
+        _terminate_group(pgid, proc, started_readers, contained)
         raise
     finally:
         if feeder is not None:
             feeder.stop()
         for reader in readers:
             reader.close()
-    proc.stdout.close()
-    proc.stderr.close()
+        proc.stdout.close()
+        proc.stderr.close()
     for reader in readers:
         if reader.error is not None:
             raise ExecutionError(

@@ -167,7 +167,9 @@ restate any of them you relied on.
 
 `provider: opencode` runs the OpenCode CLI, 2.0.0 or newer (#186); `autoforge
 doctor` fails a 1.x CLI, or a version it cannot read, without quoting the
-CLI's output. The profile's fields map as follows:
+CLI's output. It checks every `command` an OpenCode profile names, a wrapper
+that profiles of another provider also name included: that command then has
+to pass each provider's check. The profile's fields map as follows:
 
 - `model` is `provider/model`, for example `openai/gpt-5.6-luna`, and carries
   no `#variant` suffix of its own.

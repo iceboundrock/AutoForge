@@ -996,6 +996,39 @@ def test_pi_profiles_sharing_a_model_share_one_probe(tmp_path):
     assert [r.command[1] for r in requests] == ["--version", "auth"]
 
 
+@pytest.mark.parametrize(("version", "opencode_ok"), [("1.18.34", False), ("2.0.23", True)])
+def test_a_command_shared_by_pi_and_opencode_must_pass_both_floors(tmp_path, version, opencode_ok):
+    """The PR #188 review: a wrapper that a Pi and an OpenCode profile both
+    name is launched by both adapters, so it gets both providers' checks,
+    each labelled with its own profiles; Pi's floor passing does not stand
+    in for OpenCode's."""
+    wrapper = {"command": "agent-wrapper"}
+    config = _write_config(
+        tmp_path, {"review_round_1": wrapper, "review_round_2_5": _pi_profile(**wrapper)}
+    )
+    base = _runner_factory()
+    probes = []
+
+    def runner(req):
+        argv = req.command
+        if argv[0] != "agent-wrapper":
+            return base(req)
+        probes.append(argv[1])
+        out = version if argv[1:] == ["--version"] else OAUTH_READY
+        return ExecutionResult(argv, req.cwd, 0, out + "\n", "", "t", "t")
+
+    d = Doctor(config_path=config, cwd=str(tmp_path), runner=runner)
+    results = {r.name: r for r in d.run_all()}
+    pi_row = results["agent 'agent-wrapper' available (review_round_2_5)"]
+    assert pi_row.ok and pi_row.detail == f"pi {version}"
+    assert results["agent 'agent-wrapper' auth ready (review_round_2_5)"].ok
+    opencode_row = results["agent 'agent-wrapper' available (review_round_1)"]
+    assert opencode_row.ok is opencode_ok
+    if not opencode_ok:
+        assert "opencode >= 2.0.0 is required" in opencode_row.detail
+    assert sorted(probes) == ["--version", "--version", "auth"]
+
+
 def test_local_doctor_checks_a_pi_reviewer(tmp_path):
     root = tmp_path / "repo"
     root.mkdir()

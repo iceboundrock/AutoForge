@@ -498,16 +498,17 @@ class Doctor:
     ) -> list[CheckResult]:
         """One availability check per external CLI the ``reachable`` profiles name.
 
-        Each distinct command is checked once, labelled with the profiles
-        that reach it. `scripted` spawns the configured argv directly rather
-        than an agent CLI, so there is no version to query. A command a Pi
-        profile names gets Pi's version floor instead of a bare `--version`,
-        and each Pi profile a read-only credential probe; one an OpenCode
-        profile names gets OpenCode's floor.
+        Each distinct command is checked once per provider that names it,
+        labelled with that provider's profiles: what a command must be
+        depends on the adapter that launches it, so a command that profiles of
+        two providers share (a wrapper) must pass both providers' checks.
+        `scripted` spawns the configured argv directly rather than an agent
+        CLI, so there is no version to query. A command a Pi profile names
+        gets Pi's version floor instead of a bare `--version`, and each Pi
+        profile a read-only credential probe; one an OpenCode profile names
+        gets OpenCode's floor.
         """
-        commands: dict[str, list[str]] = {}
-        pi_profiles: dict[str, list[ProfileConfig]] = {}
-        opencode_commands: set[str] = set()
+        groups: dict[tuple[str, str], list[ProfileConfig]] = {}
         for name in reachable:
             profile = cfg.profiles.get(name)
             if profile is None or profile.provider == "scripted":
@@ -515,12 +516,8 @@ class Doctor:
             command = profile.command or DEFAULT_AGENT_COMMANDS.get(profile.provider, "")
             if not command:
                 continue
-            commands.setdefault(command, []).append(name)
-            if profile.provider == "pi":
-                pi_profiles.setdefault(command, []).append(profile)
-            elif profile.provider == "opencode":
-                opencode_commands.add(command)
-        if not commands:
+            groups.setdefault((command, profile.provider), []).append(profile)
+        if not groups:
             return [
                 CheckResult(
                     "agent CLI available",
@@ -530,20 +527,19 @@ class Doctor:
                 )
             ]
         results: list[CheckResult] = []
-        for command, names in commands.items():
-            label = f"agent '{command}' available ({', '.join(names)})"
-            if command in opencode_commands and command not in pi_profiles:
+        for (command, provider), profiles in groups.items():
+            label = f"agent '{command}' available ({', '.join(p.name for p in profiles)})"
+            if provider == "pi":
+                available = self.check_pi_version(label, profiles[0])
+                results.append(available)
+                results.extend(self.check_pi_auth(command, profiles, available.ok))
+            elif provider == "opencode":
                 results.append(self.check_opencode_version(label, command))
-                continue
-            if command not in pi_profiles:
+            else:
                 results.append(self._version_check(label, [command, "--version"]))
-                continue
-            available = self.check_pi_version(label, pi_profiles[command][0])
-            results.append(available)
-            results.extend(self.check_pi_auth(command, pi_profiles[command], available.ok))
+        pi_profiles = [p for (_, provider), ps in groups.items() if provider == "pi" for p in ps]
         if pi_profiles:
-            profiles = [p for members in pi_profiles.values() for p in members]
-            results.append(self.check_pi_outside_instructions(profiles))
+            results.append(self.check_pi_outside_instructions(pi_profiles))
         return results
 
     def check_pi_outside_instructions(self, profiles: list[ProfileConfig]) -> CheckResult:

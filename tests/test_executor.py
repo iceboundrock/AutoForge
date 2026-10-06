@@ -495,6 +495,75 @@ def test_a_stdin_pipe_that_cannot_be_opened_is_a_launch_failure(monkeypatch, fai
     assert _open_fds() == before
 
 
+@pytest.mark.parametrize(
+    ("step", "nth", "error"),
+    [
+        ("feeder-start", 1, RuntimeError("can't start new thread")),
+        ("reader-start", 1, RuntimeError("can't start new thread")),
+        ("reader-start", 2, RuntimeError("can't start new thread")),
+        ("reader-init", 2, OSError(24, "Too many open files")),
+    ],
+    ids=["stdin-feeder", "stdout-reader", "stderr-reader", "stderr-reader-pipe"],
+)
+def test_a_setup_failure_after_the_spawn_kills_the_child(monkeypatch, step, nth, error):
+    """The PR #188 review: the threads that feed and read the child start
+    after it is spawned. One the system refuses (a thread or descriptor
+    limit) fails the launch as an ExecutionError, and the child, which would
+    otherwise sleep on, is killed and reaped first; what did start is ended
+    and nothing is left open."""
+    calls = 0
+
+    def refuse_nth(real):
+        def call(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == nth:
+                raise error
+            return real(*args, **kwargs)
+
+        return call
+
+    target = {
+        "feeder-start": (executor._StdinFeeder, "start", threading.Thread.start),
+        "reader-start": (executor._BoundedReader, "start", threading.Thread.start),
+        "reader-init": (executor._BoundedReader, "__init__", executor._BoundedReader.__init__),
+    }[step]
+    spawned = []
+    real_spawn = executor._spawn
+
+    def spawn(*args, **kwargs):
+        spawned.append(real_spawn(*args, **kwargs))
+        return spawned[-1]
+
+    fds, threads = _open_fds(), set(threading.enumerate())
+    monkeypatch.setattr(executor, "_spawn", spawn)
+    monkeypatch.setattr(target[0], target[1], refuse_nth(target[2]))
+    started = time.monotonic()
+    try:
+        with pytest.raises(ExecutionError, match=f"failed to start .*{error.args[-1]}"):
+            execute(
+                ExecutionRequest(
+                    command=[PY, "-c", "import time; time.sleep(60)"],
+                    stdin_data=b"z" * 200_000,
+                    timeout_seconds=30,
+                )
+            )
+        (proc,) = spawned
+        assert proc.returncode is not None
+        with pytest.raises(ProcessLookupError):
+            os.killpg(proc.pid, 0)
+    finally:
+        for proc in spawned:
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+    assert time.monotonic() - started < 10
+    monkeypatch.undo()
+    assert calls == nth
+    assert set(threading.enumerate()) == threads
+    assert _open_fds() == fds
+
+
 def test_cwd_is_applied(tmp_path):
     res = execute(
         ExecutionRequest(
