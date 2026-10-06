@@ -295,14 +295,13 @@ def test_update_epic_prompt_contract():
         "state OPEN",
         "never another repository",
         "neither the EPIC",
-        "{{NEXT_ISSUE_REJECTION}}",
-        "do not repeat",
-        # PR #89 F2: the progress comment carries a marker; one already posted
-        # is adopted, never duplicated; the controller reads back exactly one.
-        "{{PROGRESS_MARKER}}",
-        "{{EXISTING_PROGRESS_COMMENT_URL}}",
-        "do NOT post a second one",
-        "exactly one",
+        # ADR 0004 D9.7: the agent returns the progress text; the controller
+        # posts it with its marker, once, and refuses a comment it did not post.
+        '"progress": "<the progress report, Markdown>"',
+        "{{MAX_PROGRESS_CHARS}}",
+        "## You make no GitHub write",
+        "Do NOT run `gh issue comment`, `gh issue edit`",
+        "it is never adopted, and never duplicated",
         # #13 / #4: the EPIC body is the controller's to write. The agent
         # returns the managed section's content; the controller splices it
         # between the markers and reads the body back.
@@ -313,12 +312,37 @@ def test_update_epic_prompt_contract():
         "{{ROADMAP_UPDATE_DUE}}",
         "{{MERGED_PRS_SINCE_EPIC_UPDATE}}",
         "{{MAX_ROADMAP_SECTION_CHARS}}",
-        "Do NOT run `gh issue edit`",
         "Do NOT include the marker lines",
+        # D8.2: what published text may contain is stated before it is refused.
+        "## What published text may contain",
+        "`<!-- autoforge-`",
+        "a closing keyword followed by an issue reference",
     ):
         assert phrase in text, phrase
     # The body-editing step is gone: the agent has no instruction to edit the body.
     assert "Check off completed tasks" not in text
+    # The agent no longer posts the comment, so it is handed no marker for one.
+    for gone in ("{{PROGRESS_MARKER}}", "{{EXISTING_PROGRESS_COMMENT_URL}}"):
+        assert gone not in text, gone
+
+
+def test_update_epic_re_request_prompt_contract():
+    """ADR 0004 D4.7: a re-request names the published comment, asks only for
+    the voided input, and states that any other key (progress included) is refused."""
+    text = prompts.load_template("update_epic_rerequest.md")
+    for phrase in (
+        "# Phase: UPDATE_EPIC (re-request)",
+        "{{PROGRESS_COMMENT_URL}}",
+        "return no progress text: the controller refuses a result that carries one",
+        "{{RE_REQUEST_ASKS}} only, because:\n{{RE_REQUEST_REASON}}",
+        "## You make no GitHub write",
+        "{{RE_REQUEST_FIELDS}}",
+        "The result carries exactly these keys; any other key is refused.",
+        "{{MAX_ROADMAP_SECTION_CHARS}}",
+        "choose differently from a selection the controller rejected",
+    ):
+        assert phrase in text, phrase
+    assert '"progress"' not in text
 
 
 def test_fix_prompt_names_the_verified_review_comment_as_authoritative():
@@ -389,27 +413,39 @@ def test_engine_fix_prompt_lists_a_marker_and_the_existing_issue_per_finding(eng
     assert f"- R1-F2: marker `{m2}`; existing issue: {ISSUE3}" in text
 
 
-def test_engine_update_epic_prompt_carries_the_progress_marker_and_existing_comment(engine):
+def test_engine_update_epic_prompt_asks_for_the_full_result_and_no_write(engine):
     from autoforge.engine import render_progress_marker
-    from tests.conftest import EPIC, ISSUE, PR, comment_url
+    from autoforge.result_parser import MAX_PROGRESS_CHARS
+    from tests.conftest import ISSUE, PR
 
     engine.state.phase = Phase.UPDATE_EPIC
     engine.state.current_pr_url = PR
     text = engine.render_prompt_for(Phase.UPDATE_EPIC)
-    assert f"`{render_progress_marker(ISSUE, PR)}`" in text
-    assert "for this issue (if any):\n  (none)" in text
-    engine._existing_progress_comment_url = comment_url(EPIC, 300)
-    text = engine.render_prompt_for(Phase.UPDATE_EPIC)
-    assert f"for this issue (if any):\n  {comment_url(EPIC, 300)}" in text
+    assert "# Phase: UPDATE_EPIC\n" in text and "(re-request)" not in text
+    assert f"at most {MAX_PROGRESS_CHARS} characters" in text
+    assert "## You make no GitHub write" in text
+    # The controller appends the marker; the agent never sees one to copy.
+    assert render_progress_marker(ISSUE, PR) not in text
 
 
-def test_engine_prompt_carries_last_next_issue_rejection(engine):
+def test_engine_update_epic_prompt_after_adopting_a_legacy_comment_is_a_re_request(engine):
+    """D13.7: the comment a previous-protocol agent posted is adopted, and the
+    relaunch asks for the selection only, naming that comment."""
+    from tests.conftest import EPIC, PR, comment_url
+
     engine.state.phase = Phase.UPDATE_EPIC
-    assert "rejected by the controller: (none)" in engine.render_prompt_for(Phase.UPDATE_EPIC)
-    engine.state.next_issue_rejections = ["first reason", "next issue X is CLOSED"]
+    engine.state.current_pr_url = PR
+    engine._adopted_progress_comment_url = comment_url(EPIC, 300)
     text = engine.render_prompt_for(Phase.UPDATE_EPIC)
-    assert "rejected by the controller: next issue X is CLOSED" in text
-    assert "first reason" not in text
+    assert "# Phase: UPDATE_EPIC (re-request)" in text
+    assert f"already published on the EPIC:\n{comment_url(EPIC, 300)}" in text
+    assert "the next issue selection only, because:" in text
+    assert "posted by an agent under the previous contract" in text
+    assert '  "next_issue_url": "<next issue url or null>"' in text
+    assert '"roadmap_section"' not in text and '"progress"' not in text
+    engine.state.merged_since_epic_update = 1  # a null selection may need the section
+    text = engine.render_prompt_for(Phase.UPDATE_EPIC)
+    assert '  "roadmap_section": "<new content of the managed section, or null>",' in text
 
 
 def test_correction_prompt_exact_text():

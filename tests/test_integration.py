@@ -11,12 +11,14 @@ import json
 import pytest
 
 import autoforge.engine as engine_mod
+from autoforge.claims import render_progress_marker
 from autoforge.config import default_config
 from autoforge.errors import StateTransitionError
 from autoforge.state import load_state
 from autoforge.transitions import Phase, decide_next_phase
 from tests.conftest import (
     BRANCH,
+    EPIC,
     ISSUE,
     PR,
     SHA_A,
@@ -27,7 +29,6 @@ from tests.conftest import (
     comment_url,
     implementation_pr_body,
     make_engine,
-    post_progress_comment,
     review_comment_body,
 )
 
@@ -328,11 +329,11 @@ def test_gate_open_loop_merges_via_controller_then_update_epic_to_done(tmp_state
         if req.phase == "UPDATE_EPIC":
             assert "Never merge a pull request" in req.prompt
             assert "gh pr merge" not in req.prompt.replace("no `gh pr merge`", "")
-            post_progress_comment(gh)
             return block(
                 {
                     "phase": "UPDATE_EPIC",
                     "status": "success",
+                    "progress": "Issue done; the PR is merged.",
                     "roadmap_section": "- [x] done",
                     "next_issue_url": None,
                 }
@@ -509,11 +510,11 @@ def _full_lifecycle_agent(gh: FakeGitHub):
                 }
             )
         if req.phase == "UPDATE_EPIC":
-            post_progress_comment(gh)
             return block(
                 {
                     "phase": "UPDATE_EPIC",
                     "status": "success",
+                    "progress": "Issue done; the PR is merged.",
                     "roadmap_section": "- [x] done",
                     "next_issue_url": None,
                 }
@@ -662,11 +663,11 @@ def _six_round_agent(gh: FakeGitHub, clean_round: int = 6):
                 }
             )
         if req.phase == "UPDATE_EPIC":
-            post_progress_comment(gh)
             return block(
                 {
                     "phase": "UPDATE_EPIC",
                     "status": "success",
+                    "progress": "Issue done; the PR is merged.",
                     "roadmap_section": "- [x] done",
                     "next_issue_url": None,
                 }
@@ -722,6 +723,12 @@ def test_an_all_pi_run_routes_every_launch_through_its_profile(tmp_state_dir, tm
     assert len(fake.auth_checks()) == len(expected)  # one OAuth preflight per launch
     assert eng.provider.calls == []
     assert gh.merges == [(PR, "squash", f"{5:040x}", False)]
+    # ADR 0004 K8 parity: the Pi agent returned the progress text; the
+    # controller posted it on the EPIC with the marker, once.
+    marker = render_progress_marker(ISSUE, PR)
+    assert gh.effect_writes == [
+        ("create_issue_comment", EPIC, f"Issue done; the PR is merged.\n\n{marker}")
+    ]
     s = load_state(eng.paths.state_file)
     assert s.phase == Phase.DONE and s.counted_merged_prs == [PR]
 

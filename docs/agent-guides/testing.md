@@ -24,6 +24,10 @@ High-priority coverage includes:
 - atomic persistence
 - corrupt-state handling
 - idempotent merge counting
+- effect state (ADR 0004): records round-trip in every stage; a corrupt or
+  incomplete record fails loudly; LOCAL state carrying effect state is
+  refused; a previous-protocol file loads with no effect state, and one
+  that carries effect fields is refused
 
 ### Transitions
 
@@ -46,6 +50,9 @@ High-priority coverage includes:
 - wrong phase
 - missing fields
 - review invariant mismatch
+- the published-content policy on agent text the controller publishes
+  (marker openers, credential classes, closing references, mentions), and
+  each `UPDATE_EPIC` re-request accepting only its own keys
 
 ### Execution
 
@@ -111,11 +118,28 @@ High-priority coverage includes:
   PR, names another round, HEAD, base or merge base, or says `needs_fix_round: true`
   blocks without a merge; the happy path reads it exactly once per pass
 - follow-up issue verification
+- typed effect writes are never retried on an ambiguous outcome, while reads
+  keep their transient retry (`tests/test_github.py`)
+- every Wave 1 effect kind at the operation level, against `FakeGitHub` and
+  a local bare repository (`tests/test_effects.py`): success, already
+  exists, conflicting identity, duplicate markers, a precondition violated
+  between intent and write, a write lost or landed with its reply lost, a
+  crash after the write before the save, a duplicate invocation after
+  restart, and the attempt bound
+- the controller git transport (`tests/test_git_transport.py`): the default
+  branch, a non-fast-forward and a lease mismatch are refused, and a
+  `pushurl`, `insteadOf`, `core.sshCommand`, `core.hooksPath` or `pre-push`
+  hook planted in the shared repository neither redirects a push nor runs
 
 ### Recovery
 
 - external side effect completed before state write
 - resume without duplicating work
+- the `UPDATE_EPIC` progress comment across every crash window of the
+  effect lifecycle (`test_k8_*` in `tests/test_engine.py`), the one-shot
+  legacy re-entry (D13.7), and an unjournaled comment blocking (D9.7)
+- dry-run executing no effect: the `UPDATE_EPIC` plan is built with a
+  GitHub client that fails the test on any use
 
 ### Integration
 

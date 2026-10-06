@@ -45,6 +45,7 @@ transitions, routing, loop bounds     test_transitions.py, test_routing.py, test
 engine verification, gate, recovery   test_engine.py, test_engine_locking.py, test_integration.py
 replan policy and transaction         test_replan.py
 GitHub client, pre-merge evidence     test_github.py, test_premerge.py
+effect operations, git transport      test_effects.py, test_git_transport.py
 state, contract, filesystem boundary  test_state.py, test_durable_run_contract.py, test_safefs.py
 CONTROL_RESULT, prompts, providers    test_result_parser.py, test_prompts.py, test_providers.py
 Pi RPC reducer and adapter (fake pi)  test_pi_rpc.py

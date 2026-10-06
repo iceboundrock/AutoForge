@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from autoforge import __prompt_version__
+from autoforge.claims import render_progress_marker
 from autoforge.config import default_config
 from autoforge.errors import (
     ControlResultValidationError,
@@ -25,6 +26,7 @@ from autoforge.errors import (
     VerificationError,
 )
 from autoforge.executor import ExecutionResult, execute
+from autoforge.git_transport import GitRemote
 from autoforge.github import (
     ChangedFile,
     CheckInfo,
@@ -2060,20 +2062,23 @@ def test_correction_after_the_fix_was_pushed_goes_to_review_without_relaunching(
     assert s.current_head_sha == SHA_B and s.last_review_result == "stale" and s.attempt == 0
 
 
-def test_correction_after_the_progress_comment_was_posted_adopts_it(tmp_state_dir, fake_github):
-    """UPDATE_EPIC: the agent posted the progress comment, then returned junk.
-    The correction is told about the comment and does not post again."""
+def test_correction_after_the_agent_posted_a_progress_comment_blocks(tmp_state_dir, fake_github):
+    """UPDATE_EPIC: the agent posted a progress comment itself (the controller's
+    write, ADR 0004 D9.7), then returned junk. The correction relaunch is an
+    entry: it finds a comment the controller did not journal and blocks rather
+    than adopt or duplicate it."""
 
     def agent(req):
-        if not req.correction:
-            post_progress_comment(fake_github)
-            return "junk\n"
-        assert f"for this issue (if any):\n  {comment_url(EPIC, 300)}" in req.prompt
-        return _epic_result(None)
+        assert not req.correction, "a correction must not be launched"
+        post_progress_comment(fake_github)
+        return "junk\n"
 
     eng = _in_update_epic(tmp_state_dir, fake_github, agent)
-    assert eng.step().next_phase == "DONE"
-    assert len(eng.provider.calls) == 2 and len(fake_github.comments[EPIC]) == 1
+    assert eng.step().next_phase == "BLOCKED"
+    assert len(eng.provider.calls) == 1 and len(fake_github.comments[EPIC]) == 1
+    reason = load_state(eng.paths.state_file).block_reason
+    assert "that the controller did not post" in reason and "D9.7" in reason
+    assert _progress_posts(fake_github) == []
 
 
 def test_every_remote_agent_phase_reconciles_with_github_before_launching():
@@ -3467,10 +3472,15 @@ def test_verification_pass_does_not_survive_a_new_issue(tmp_state_dir, fake_gith
 
 
 def test_unreachable_reviewed_head_is_inconclusive_not_blocked(tmp_state_dir, fake_github):
-    """No local commit and no `origin`: bounded re-check, the code is never guessed at."""
+    """No local commit and a remote that does not have it: bounded re-check, the code is
+    never guessed at."""
     git_repo(tmp_state_dir.parent)
+    empty = tmp_state_dir.parent / "empty.git"
+    _git(tmp_state_dir.parent, "init", "-q", "--bare", str(empty))
     fake_github.add_pr(head_sha=SHA_A)
     eng = _in_merge(tmp_state_dir, fake_github)
+    eng._git_remote = GitRemote(url=f"file://{empty}")
+    eng.config.github.command = _fake_gh(tmp_state_dir.parent)
     eng.config.merge.verification_commands = [["true"]]
     with pytest.raises(VerificationError, match="not in the local repository") as info:
         eng.step(allow_merge=True)
@@ -3480,21 +3490,36 @@ def test_unreachable_reviewed_head_is_inconclusive_not_blocked(tmp_state_dir, fa
 
 
 def test_reviewed_head_is_fetched_from_the_pull_ref_when_not_local(tmp_state_dir, fake_github):
+    """The controller's own transport (ADR 0004 D7.1) fetches ``refs/pull/<n>/head`` from
+    an explicit URL into the shared object store; the checkout's ``origin`` (here a remote
+    that does not have the commit) is never consulted and no ref is created."""
     origin = git_repo(tmp_state_dir.parent / "origin")
     base = _commit(origin, "base.txt", "base\n")
     sha = _commit(origin, "proof.txt", "v1\n")
     _git(origin, "update-ref", "refs/pull/42/head", sha)
     _git(origin, "reset", "-q", "--hard", base)
     local = git_repo(tmp_state_dir.parent)
-    _git(local, "remote", "add", "origin", str(origin))
-    _git(local, "fetch", "-q", "origin", "HEAD")
+    decoy = tmp_state_dir.parent / "decoy.git"
+    _git(local, "init", "-q", "--bare", str(decoy))
+    _git(local, "remote", "add", "origin", str(decoy))
     marker = tmp_state_dir.parent / "cwd.txt"
     fake_github.add_pr(head_sha=sha)
     eng = _in_merge(tmp_state_dir, fake_github, reviewed=sha)
+    eng._git_remote = GitRemote(url=f"file://{origin}")
+    eng.config.github.command = _fake_gh(tmp_state_dir.parent)
     eng.config.merge.verification_commands = [_record_cwd(marker)]
     assert eng.step(allow_merge=True).next_phase == "UPDATE_EPIC"
     assert len(marker.read_text().splitlines()) == 1
     assert "refs/pull" not in _git(local, "for-each-ref", "--format=%(refname)")
+
+
+def _fake_gh(where) -> str:
+    """An executable ``gh`` stand-in: a ``file://`` remote never asks it for a credential,
+    but the transport requires one to exist before any network git runs."""
+    gh = where / "fake-gh"
+    gh.write_text("#!/bin/sh\nexit 1\n")
+    gh.chmod(0o755)
+    return str(gh)
 
 
 def test_no_verification_commands_means_no_git_plumbing(tmp_state_dir, fake_github):
@@ -4172,36 +4197,53 @@ FOREIGN_ISSUE = "https://github.com/other/repo/issues/1"
 
 
 ROADMAP = "## Roadmap\n- [x] #1 (PR #42)\n- [ ] #3"
+PROGRESS = "Implemented issue 2 in PR 42; the test suite passes."
+_ABSENT = object()
 
 
-def _epic_result(next_issue_url, roadmap_section: str | None = ROADMAP) -> str:
-    return block(
-        {
-            "phase": "UPDATE_EPIC",
-            "status": "success",
-            "roadmap_section": roadmap_section,
-            "next_issue_url": next_issue_url,
-        }
-    )
+def _epic_result(
+    next_issue_url, roadmap_section: str | None = ROADMAP, progress: str | None = PROGRESS
+) -> str:
+    """A FULL UPDATE_EPIC result: the agent hands over the progress text, the
+    controller posts it (ADR 0004 §2.5)."""
+    payload = {
+        "phase": "UPDATE_EPIC",
+        "status": "success",
+        "progress": progress,
+        "roadmap_section": roadmap_section,
+        "next_issue_url": next_issue_url,
+    }
+    if progress is None:
+        del payload["progress"]
+    return block(payload)
 
 
-def _in_update_epic(tmp_state_dir, gh, script, posts_progress: bool = True):
+def _epic_reselect(next_issue_url=_ABSENT, roadmap_section=_ABSENT) -> str:
+    """A re-request result (D4.7): only the keys the re-request asks for."""
+    payload: dict = {"phase": "UPDATE_EPIC", "status": "success"}
+    if next_issue_url is not _ABSENT:
+        payload["next_issue_url"] = next_issue_url
+    if roadmap_section is not _ABSENT:
+        payload["roadmap_section"] = roadmap_section
+    return block(payload)
+
+
+def _controller_progress_body(progress: str = PROGRESS, issue: str = ISSUE, pr: str = PR) -> str:
+    """The progress comment exactly as the controller posts it: text, blank line, marker."""
+    return f"{progress}\n\n{render_progress_marker(issue, pr)}"
+
+
+def _progress_posts(gh) -> list[tuple]:
+    """The controller's own progress-comment writes on the EPIC."""
+    return [w for w in gh.effect_writes if w[0] == "create_issue_comment" and w[1] == EPIC]
+
+
+def _in_update_epic(tmp_state_dir, gh, script):
     """Engine parked in UPDATE_EPIC right after the controller merged PR for ISSUE.
 
-    A list of scripted results stands for an agent that posts the progress
-    comment once (an invocation asked again adopts the one it posted) and
-    returns the results in turn; ``posts_progress=False`` is an agent that
-    skipped the phase's write.
+    A list of scripted results stands for an agent that returns them in
+    turn and publishes nothing: the controller posts the progress comment.
     """
-    if isinstance(script, list):
-        queue = list(script)
-
-        def scripted(req):
-            if posts_progress:
-                post_progress_comment(gh)
-            return queue.pop(0)
-
-        script = scripted
     eng = make_engine(tmp_state_dir, script, github=gh)
     gh.add_pr(head_sha=SHA_A, state="MERGED")
     eng.state.phase = Phase.UPDATE_EPIC
@@ -4222,6 +4264,11 @@ def test_update_epic_verified_next_issue_switches(tmp_state_dir, fake_github):
     out = eng.step()
     assert out.next_phase == "ANALYZE_EXECUTE" and "verified next issue #3" in out.message
     assert ("get_issue", ISSUE3) in fake_github.calls
+    # The controller posted the agent's text, followed by the marker, once.
+    assert _progress_posts(fake_github) == [
+        ("create_issue_comment", EPIC, _controller_progress_body())
+    ]
+    assert [c.body for c in fake_github.comments[EPIC]] == [_controller_progress_body()]
     s = load_state(eng.paths.state_file)
     assert s.phase == Phase.ANALYZE_EXECUTE and s.current_issue_url == ISSUE3
     assert s.current_pr_url == "" and s.review_round == 0 and s.reviewed_head_sha == ""
@@ -4239,21 +4286,21 @@ def test_update_epic_null_completes_the_run(tmp_state_dir, fake_github):
 
 
 # -- UPDATE_EPIC entry and read-back: the progress comment (PR #89 review, F2) -------------
-def test_update_epic_entry_hands_an_existing_progress_comment_to_the_agent(
+def test_update_epic_entry_blocks_on_a_progress_comment_it_did_not_journal(
     tmp_state_dir, fake_github
 ):
-    """An interrupted UPDATE_EPIC already posted the progress comment. The
-    entry reads the EPIC, names the comment, and the agent adopts it."""
+    """ADR 0004 D9.7: a progress comment for this (issue, PR) that no record
+    explains is never adopted and never duplicated. The entry blocks before
+    launching, names the comment, and posts nothing."""
     fake_github.add_comment(EPIC, 300, progress_comment_body())
-
-    def adopts(req):
-        assert f"for this issue (if any):\n  {comment_url(EPIC, 300)}" in req.prompt
-        return _epic_result(None)
-
-    eng = _in_update_epic(tmp_state_dir, fake_github, adopts)
-    assert eng.step().next_phase == "DONE"
-    assert len(fake_github.comments[EPIC]) == 1
-    assert ("get_issue_comments", EPIC) in fake_github.calls
+    eng = _in_update_epic(tmp_state_dir, fake_github, ["never"])
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and eng.provider.calls == []
+    s = load_state(eng.paths.state_file)
+    assert comment_url(EPIC, 300) in s.block_reason and "D9.7" in s.block_reason
+    assert "Nothing was posted" in s.block_reason
+    assert _progress_posts(fake_github) == [] and len(fake_github.comments[EPIC]) == 1
+    assert s.effect_records == [] and s.current_issue_url == ISSUE
 
 
 def test_update_epic_entry_ignores_a_progress_comment_for_another_pr(tmp_state_dir, fake_github):
@@ -4263,14 +4310,9 @@ def test_update_epic_entry_ignores_a_progress_comment_for_another_pr(tmp_state_d
     fake_github.add_comment(EPIC, 299, progress_comment_body(ISSUE, other_pr))
     fake_github.add_comment(EPIC, 298, progress_comment_body(ISSUE3, PR))
 
-    def posts(req):
-        assert "for this issue (if any):\n  (none)" in req.prompt
-        post_progress_comment(fake_github)
-        return _epic_result(None)
-
-    eng = _in_update_epic(tmp_state_dir, fake_github, posts)
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(None)])
     assert eng.step().next_phase == "DONE"
-    assert len(fake_github.comments[EPIC]) == 3
+    assert len(fake_github.comments[EPIC]) == 3 and len(_progress_posts(fake_github)) == 1
 
 
 def test_update_epic_entry_blocks_on_two_progress_comments_without_invoking(
@@ -4287,38 +4329,43 @@ def test_update_epic_entry_blocks_on_two_progress_comments_without_invoking(
     assert s.current_issue_url == ISSUE and s.merged_since_epic_update == 1
 
 
-def test_update_epic_without_the_progress_comment_is_rejected(tmp_state_dir, fake_github):
-    """The phase's write is read back, never inferred from the result: an
-    agent that selected the next issue but posted nothing has not done the
-    phase. No switch, no selection queried, the phase stays for `resume`."""
-    fake_github.add_issue(ISSUE3, "Next")
-    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(ISSUE3)], posts_progress=False)
-    with pytest.raises(VerificationError, match="no comment carries the ai-epic-progress marker"):
-        eng.step()
-    s = load_state(eng.paths.state_file)
-    assert s.phase == Phase.UPDATE_EPIC and s.current_issue_url == ISSUE and s.attempt == 1
-    assert s.next_issue_rejections == []  # not a selection rejection
-    assert [c for c in fake_github.calls if c[0] == "get_issue" and c[1] != EPIC] == []
-    assert s.merged_since_epic_update == 1 and fake_github.edited_issues == []
-
-
-def test_update_epic_posting_a_second_progress_comment_is_rejected_then_blocked(
+def test_update_epic_result_without_progress_text_is_corrected_before_anything_is_posted(
     tmp_state_dir, fake_github
 ):
-    fake_github.add_comment(EPIC, 300, progress_comment_body())
+    """The progress text is a required field of the FULL result: a result
+    without it is malformed, takes the correction path, and nothing is
+    posted, switched or written until a well-formed result arrives."""
+    fake_github.add_issue(ISSUE3, "Next")
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(ISSUE3, progress=None), "junk"])
+    with pytest.raises(ControlResultValidationError, match="after 2 attempt"):
+        eng.step()
+    assert "missing required field 'progress'" in eng.provider.calls[1].prompt
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.UPDATE_EPIC and s.current_issue_url == ISSUE and s.attempt == 2
+    assert s.next_issue_rejections == [] and s.effect_records == []
+    assert [c for c in fake_github.calls if c[0] == "get_issue" and c[1] != EPIC] == []
+    assert s.merged_since_epic_update == 1 and fake_github.edited_issues == []
+    assert _progress_posts(fake_github) == []
 
-    def posts_again(req):
+
+def test_update_epic_agent_that_posts_its_own_progress_comment_blocks_before_the_controller_posts(
+    tmp_state_dir, fake_github
+):
+    """The precondition read before the controller's post (D4.2) finds a comment
+    the entry observation does not explain (§2.9): BLOCKED, nothing posted, no
+    record planned."""
+
+    def posts(req):
         fake_github.add_comment(EPIC, 301, progress_comment_body())
         return _epic_result(None)
 
-    eng = _in_update_epic(tmp_state_dir, fake_github, posts_again)
-    with pytest.raises(
-        VerificationError, match="2 comments carry the ai-epic-progress marker.*one progress"
-    ):
-        eng.step()
-    assert load_state(eng.paths.state_file).phase == Phase.UPDATE_EPIC
-    assert eng.step().next_phase == "BLOCKED"
-    assert len(eng.provider.calls) == 1
+    eng = _in_update_epic(tmp_state_dir, fake_github, posts)
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and len(eng.provider.calls) == 1
+    s = load_state(eng.paths.state_file)
+    assert comment_url(EPIC, 301) in s.block_reason and "did not post" in s.block_reason
+    assert _progress_posts(fake_github) == [] and len(fake_github.comments[EPIC]) == 1
+    assert s.merged_since_epic_update == 1 and fake_github.edited_issues == []
 
 
 def _assert_not_switched(eng, gh, url_queried: str | None):
@@ -4484,21 +4531,23 @@ def test_update_epic_rejection_is_retried_once_with_the_reason_then_blocked(
     tmp_state_dir, fake_github
 ):
     eng = _in_update_epic(
-        tmp_state_dir, fake_github, [_epic_result(ISSUE999), _epic_result(ISSUE999)]
+        tmp_state_dir, fake_github, [_epic_result(ISSUE999), _epic_reselect(ISSUE999)]
     )
     with pytest.raises(VerificationError, match="selection 1/2"):
         eng.step()
     first_prompt = eng.provider.calls[0].prompt
-    assert "Previous selection rejected by the controller: (none)" in first_prompt
+    assert "# Phase: UPDATE_EPIC\n" in first_prompt and "re-request" not in first_prompt
+    posted = fake_github.comments[EPIC][0].url
 
     out = eng.step()  # resume: the agent is asked once more, with the reason
     assert len(eng.provider.calls) == 2
     retry_prompt = eng.provider.calls[1].prompt
     assert "issues/999 does not exist on GitHub" in retry_prompt
-    # PR #89 F2: the re-selection is a re-entry; the progress comment the
-    # first invocation posted is handed over, not posted again.
-    assert f"for this issue (if any):\n  {comment_url(EPIC, 300)}" in retry_prompt
-    assert len(fake_github.comments[EPIC]) == 1
+    # ADR 0004 D4.7: the re-request names the published comment and asks for
+    # the selection only; nothing is posted again.
+    assert "# Phase: UPDATE_EPIC (re-request)" in retry_prompt and posted in retry_prompt
+    assert '"progress"' not in retry_prompt
+    assert len(fake_github.comments[EPIC]) == 1 and len(_progress_posts(fake_github)) == 1
     assert out.next_phase == "BLOCKED"
     s = load_state(eng.paths.state_file)
     assert s.phase == Phase.BLOCKED and "2 time(s)" in s.block_reason
@@ -4513,7 +4562,7 @@ def test_update_epic_rejection_is_retried_once_with_the_reason_then_blocked(
 def test_update_epic_retry_with_a_valid_selection_switches(tmp_state_dir, fake_github):
     fake_github.add_issue(ISSUE3, "Next")
     eng = _in_update_epic(
-        tmp_state_dir, fake_github, [_epic_result(FOREIGN_ISSUE), _epic_result(ISSUE3)]
+        tmp_state_dir, fake_github, [_epic_result(FOREIGN_ISSUE), _epic_reselect(ISSUE3)]
     )
     with pytest.raises(VerificationError, match="selection 1/2"):
         eng.step()
@@ -4525,7 +4574,7 @@ def test_update_epic_retry_with_a_valid_selection_switches(tmp_state_dir, fake_g
 
 
 def test_update_epic_retry_with_null_completes(tmp_state_dir, fake_github):
-    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(EPIC), _epic_result(None)])
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(EPIC), _epic_reselect(None)])
     with pytest.raises(VerificationError, match="is the EPIC itself"):
         eng.step()
     assert eng.step().next_phase == "DONE"
@@ -4554,7 +4603,9 @@ def test_update_epic_rejection_quoting_gh_output_is_redacted_before_persistence(
     fake_github.get_issue_errors[ISSUE3] = GitHubUnavailableError(
         f"`gh issue view` failed (exit 1): HTTP 502 {_LEAKY_GH_STDERR}"
     )
-    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(ISSUE3), _epic_result(ISSUE3)])
+    eng = _in_update_epic(
+        tmp_state_dir, fake_github, [_epic_result(ISSUE3), _epic_reselect(ISSUE3)]
+    )
     with pytest.raises(VerificationError, match="selection 1/2") as info:
         eng.step()
     assert _LEAKY_SECRET not in str(info.value)
@@ -4574,7 +4625,9 @@ def test_update_epic_rejection_quoting_gh_output_is_redacted_before_persistence(
 def test_update_epic_transient_github_failure_twice_is_blocked(tmp_state_dir, fake_github):
     fake_github.add_issue(ISSUE3, "Next")
     fake_github.get_issue_errors[ISSUE3] = GitHubUnavailableError("gh: HTTP 502")
-    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(ISSUE3), _epic_result(ISSUE3)])
+    eng = _in_update_epic(
+        tmp_state_dir, fake_github, [_epic_result(ISSUE3), _epic_reselect(ISSUE3)]
+    )
     with pytest.raises(VerificationError, match="selection 1/2"):
         eng.step()
     out = eng.step()
@@ -4603,7 +4656,9 @@ def test_update_epic_conclusive_github_failure_blocks_without_reinvoking_agent(
     """
     fake_github.add_issue(ISSUE3, "Next")
     fake_github.get_issue_errors[ISSUE3] = error
-    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(ISSUE3), _epic_result(ISSUE3)])
+    eng = _in_update_epic(
+        tmp_state_dir, fake_github, [_epic_result(ISSUE3), _epic_reselect(ISSUE3)]
+    )
     out = eng.step()
     assert out.next_phase == "BLOCKED"
     assert len(eng.provider.calls) == 1  # never asked to select again
@@ -4634,14 +4689,6 @@ def _in_update_epic_with_body(tmp_state_dir, gh, script, body: str, every: int =
     gh.issues[EPIC].body = body
     cfg = default_config()
     cfg.workflow.epic_update_every = every
-    if isinstance(script, list):
-        queue = list(script)
-
-        def scripted(req):
-            post_progress_comment(gh)
-            return queue.pop(0)
-
-        script = scripted
     eng = make_engine(tmp_state_dir, script, github=gh, cfg=cfg)
     gh.add_pr(head_sha=SHA_A, state="MERGED")
     eng.state.phase = Phase.UPDATE_EPIC
@@ -4693,7 +4740,6 @@ def test_update_epic_prompt_carries_the_batch_and_the_current_section(tmp_state_
 
     def agent(req):
         seen.append(req.prompt)
-        post_progress_comment(fake_github)
         return _epic_result(None)
 
     eng = _in_update_epic_with_body(
@@ -4708,7 +4754,7 @@ def test_update_epic_prompt_carries_the_batch_and_the_current_section(tmp_state_
     assert "(merged: 2; the controller updates the roadmap\n  every 1):" in prompt
     assert f"`{ROADMAP_START}`\n   `{ROADMAP_END}`" in prompt
     assert "````markdown\n- [x] #1 ```old```\n````" in prompt  # fenced, longer than its content
-    assert "Do NOT run `gh issue edit`" in prompt
+    assert "## You make no GitHub write" in prompt and "`gh issue edit`" in prompt
 
 
 def test_update_epic_prompt_says_when_the_epic_has_no_section_yet(tmp_state_dir, fake_github):
@@ -4716,7 +4762,6 @@ def test_update_epic_prompt_says_when_the_epic_has_no_section_yet(tmp_state_dir,
 
     def agent(req):
         seen.append(req.prompt)
-        post_progress_comment(fake_github)
         return _epic_result(None)
 
     eng = _in_update_epic_with_body(tmp_state_dir, fake_github, agent, _epic_body())
@@ -4735,14 +4780,12 @@ def test_update_epic_roadmap_not_due_keeps_the_counter_and_writes_nothing(
 
     def agent(req):
         seen.append(req.prompt)
-        post_progress_comment(fake_github)
         return _epic_result(ISSUE3, roadmap_section="unsolicited")
 
     eng = _in_update_epic_with_body(tmp_state_dir, fake_github, agent, _epic_body("keep"), every=2)
     out = eng.step()
     assert out.next_phase == "ANALYZE_EXECUTE"
     assert "roadmap update not due (1 merge(s)" in out.message
-    assert "returned roadmap_section was ignored" in out.message
     assert "Roadmap update due now: no" in seen[0]
     assert fake_github.edited_issues == [] and fake_github.issues[EPIC].body == _epic_body("keep")
     s = load_state(eng.paths.state_file)
@@ -4767,20 +4810,23 @@ def test_update_epic_roadmap_due_once_the_batch_is_full(tmp_state_dir, fake_gith
 def test_update_epic_epic_complete_requires_the_final_roadmap_even_when_not_due(
     tmp_state_dir, fake_github
 ):
-    eng = _in_update_epic_with_body(
-        tmp_state_dir,
-        fake_github,
-        [_epic_result(None, roadmap_section=None), _epic_result(None)],
-        _epic_body(),
-        every=3,
-    )
-    with pytest.raises(VerificationError, match="must return 'roadmap_section'.*reported complete"):
-        eng.step()
-    s = load_state(eng.paths.state_file)
-    assert s.phase == Phase.UPDATE_EPIC and s.merged_since_epic_update == 1
-    assert fake_github.edited_issues == []
+    """A missing required section is the controller's half of the schema: the
+    result is corrected before anything is posted (no progress comment, no
+    body write), and the corrected result completes the phase."""
+    seen_posts = []
+
+    def agent(req):
+        seen_posts.append(len(_progress_posts(fake_github)))
+        if not req.correction:
+            return _epic_result(None, roadmap_section=None)
+        assert "missing required field 'roadmap_section'" in req.prompt
+        assert "reported complete" in req.prompt
+        return _epic_result(None)
+
+    eng = _in_update_epic_with_body(tmp_state_dir, fake_github, agent, _epic_body(), every=3)
     out = eng.step()
     assert out.next_phase == "DONE" and len(fake_github.edited_issues) == 1
+    assert seen_posts == [0, 0] and len(_progress_posts(fake_github)) == 1
     assert load_state(eng.paths.state_file).merged_since_epic_update == 0
 
 
@@ -4789,14 +4835,19 @@ def test_update_epic_missing_roadmap_section_when_due_is_rejected_without_reset(
 ):
     fake_github.add_issue(ISSUE3, "Next")
     eng = _in_update_epic_with_body(
-        tmp_state_dir, fake_github, [_epic_result(ISSUE3, roadmap_section=None)], _epic_body()
+        tmp_state_dir,
+        fake_github,
+        [_epic_result(ISSUE3, roadmap_section=None)] * 2,
+        _epic_body(),
     )
-    with pytest.raises(VerificationError, match="must return 'roadmap_section' \\(1 merge"):
+    with pytest.raises(ControlResultValidationError, match="after 2 attempt"):
         eng.step()
+    assert "missing required field 'roadmap_section' (1 merge" in eng.provider.calls[1].prompt
     s = load_state(eng.paths.state_file)
-    assert s.phase == Phase.UPDATE_EPIC and s.merged_since_epic_update == 1 and s.attempt == 1
+    assert s.phase == Phase.UPDATE_EPIC and s.merged_since_epic_update == 1 and s.attempt == 2
     assert s.current_issue_url == ISSUE and s.next_issue_rejections == []
-    assert fake_github.edited_issues == []
+    assert fake_github.edited_issues == [] and _progress_posts(fake_github) == []
+    assert s.effect_records == [] and s.completion_context == {}
     assert ("get_issue", ISSUE3) not in fake_github.calls  # the selection is not reached
 
 
@@ -4827,9 +4878,16 @@ def test_update_epic_read_back_that_differs_outside_the_markers_is_rejected(
     eng = _in_update_epic_with_body(
         tmp_state_dir, fake_github, [_epic_result(None)], _epic_body("old")
     )
-    with pytest.raises(VerificationError, match="differs outside the roadmap markers"):
+    with pytest.raises(
+        VerificationError, match="changed outside the roadmap markers while the section was"
+    ):
         eng.step()
-    assert load_state(eng.paths.state_file).merged_since_epic_update == 1
+    s = load_state(eng.paths.state_file)
+    assert s.merged_since_epic_update == 1
+    # D4.6: the section is voided and re-requested; the comment stays published.
+    assert s.completion_context["section_void"] is True
+    assert s.completion_context["roadmap_section"] is None
+    assert [r["stage"] for r in s.effect_records] == ["observed"]
 
 
 def test_update_epic_body_changed_outside_the_markers_while_the_agent_ran_is_not_overwritten(
@@ -4843,18 +4901,21 @@ def test_update_epic_body_changed_outside_the_markers_while_the_agent_ran_is_not
     def agent(req):
         nonlocal calls
         calls += 1
-        post_progress_comment(fake_github)
         if calls == 1:
             fake_github.issues[EPIC].body = OPERATOR_BODY.replace("- [ ] #2", "- [x] #2")
-        return _epic_result(None)
+            return _epic_result(None)
+        assert "# Phase: UPDATE_EPIC (re-request)" in req.prompt
+        assert "changed outside the roadmap markers" in req.prompt
+        return _epic_reselect(roadmap_section=ROADMAP)
 
     eng = _in_update_epic_with_body(tmp_state_dir, fake_github, agent, _epic_body())
-    with pytest.raises(VerificationError, match="changed outside the roadmap markers while"):
+    with pytest.raises(VerificationError, match="changed outside the roadmap markers since"):
         eng.step()
     assert fake_github.edited_issues == []
     assert load_state(eng.paths.state_file).merged_since_epic_update == 1
-    out = eng.step()  # resume: the entry re-reads, the write lands on the current body
+    out = eng.step()  # resume: the entry re-reads, asks for the section only, writes it
     assert out.next_phase == "DONE" and len(fake_github.edited_issues) == 1
+    assert len(_progress_posts(fake_github)) == 1  # the comment was posted once
     assert fake_github.issues[EPIC].body.startswith(OPERATOR_BODY.replace("- [ ] #2", "- [x] #2"))
     assert load_state(eng.paths.state_file).merged_since_epic_update == 0
 
@@ -4886,6 +4947,9 @@ def test_update_epic_crash_after_the_write_does_not_double_apply(tmp_state_dir, 
     out = eng.step()
     assert out.next_phase == "ANALYZE_EXECUTE"
     assert "already carries this section (no write needed)" in out.message
+    # Journal first (§2.10): completed from the persisted context, no relaunch.
+    assert "no agent launched" in out.message and len(eng.provider.calls) == 1
+    assert len(_progress_posts(fake_github)) == 1
     assert len(fake_github.edited_issues) == 1  # the crashed attempt's write only
     assert fake_github.issues[EPIC].body == written
     assert written.count(ROADMAP_START) == 1 and written.count(ROADMAP_END) == 1
@@ -4990,6 +5054,333 @@ def test_update_epic_dry_run_plan_names_the_batching_decision(tmp_state_dir, fak
     out = eng.step(dry_run=True)
     assert any("roadmap update due: 2 merge(s)" in n for n in out.plan.notes)
     assert fake_github.calls == calls_before and fake_github.edited_issues == []
+
+
+# -- UPDATE_EPIC: the controller-posted progress comment across crash windows (K8) ---------
+# ADR 0004 D4 and the crash table of issue #160, at the phase level: whatever
+# window a process dies in, the comment is posted at most once per attempt,
+# reconciled by its marker before anything is sent again, and a phase whose
+# write landed finishes without relaunching its agent.
+def _k8_records(eng) -> list[dict]:
+    return load_state(eng.paths.state_file).effect_records
+
+
+def _crash_on_first_call(fn):
+    """``fn`` that dies (a power loss) the first time it is called, then works."""
+    calls = {"n": 0}
+
+    def wrapper(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("power loss")
+        return fn(*args, **kwargs)
+
+    return wrapper
+
+
+def test_k8_crash_before_the_intent_is_saved_relaunches_and_posts_once(tmp_state_dir, fake_github):
+    """Nothing was journaled, nothing was sent: the step re-runs from the launch."""
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(None)] * 2)
+    eng._save_update_epic_context = _crash_on_first_call(eng._save_update_epic_context)
+    with pytest.raises(RuntimeError, match="power loss"):
+        eng.step()
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.UPDATE_EPIC and s.attempt == 1
+    assert s.launch_label == "controller_publishes"
+    assert s.effect_records == [] and s.completion_context == {}
+    assert fake_github.effect_writes == []
+
+    eng.load()
+    out = eng.step()
+    assert out.next_phase == "DONE" and len(eng.provider.calls) == 2
+    assert not eng.provider.calls[1].correction  # a fresh FULL launch, not a correction
+    assert _progress_posts(fake_github) == [
+        ("create_issue_comment", EPIC, _controller_progress_body())
+    ]
+
+
+def test_k8_intent_saved_and_write_never_issued_posts_once_without_a_relaunch(
+    tmp_state_dir, fake_github
+):
+    """The record is ``intended``: reconcile finds no comment and the precondition
+    holds, so the comment is posted once from the journal; the agent is not asked again."""
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(None)])
+    eng._persist_effect = _crash_on_first_call(eng._persist_effect)
+    with pytest.raises(RuntimeError, match="power loss"):
+        eng.step()
+    [record] = _k8_records(eng)
+    assert record["stage"] == "intended" and record["attempts"] == 0
+    assert fake_github.effect_writes == []
+
+    eng.load()
+    out = eng.step()
+    assert out.next_phase == "DONE" and "no agent launched" in out.message
+    assert len(eng.provider.calls) == 1 and len(_progress_posts(fake_github)) == 1
+    assert [c.body for c in fake_github.comments[EPIC]] == [_controller_progress_body()]
+
+
+def test_k8_write_lost_in_flight_is_reconciled_then_issued_once_more(tmp_state_dir, fake_github):
+    """Attempt persisted, outcome unknown, and the write did not land: never a blind
+    re-send in the same step; the next entry reads, finds nothing, posts once more."""
+    fake_github.write_failures = [
+        ("create_issue_comment", GitHubUnavailableError("gh: timed out"), False)
+    ]
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(None)])
+    with pytest.raises(GitHubUnavailableError, match="'resume' reconciles it"):
+        eng.step()
+    [record] = _k8_records(eng)
+    assert record["stage"] == "attempted" and record["attempts"] == 1
+    assert len(_progress_posts(fake_github)) == 1 and EPIC not in fake_github.comments
+
+    eng.load()
+    out = eng.step()
+    assert out.next_phase == "DONE" and len(eng.provider.calls) == 1
+    assert len(_progress_posts(fake_github)) == 2  # the lost one, then exactly one more
+    assert [c.body for c in fake_github.comments[EPIC]] == [_controller_progress_body()]
+
+
+def test_k8_write_landed_with_its_reply_lost_is_observed_by_the_read_back(
+    tmp_state_dir, fake_github
+):
+    """Attempt persisted, the comment landed, the reply was lost: the read-back in
+    the same step finds exactly one comment with the payload; nothing is sent again."""
+    fake_github.write_failures = [
+        ("create_issue_comment", GitHubUnavailableError("gh: timed out"), True)
+    ]
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(None)])
+    out = eng.step()
+    assert out.next_phase == "DONE"
+    assert len(_progress_posts(fake_github)) == 1 and len(fake_github.comments[EPIC]) == 1
+
+
+def test_k8_crash_after_the_write_before_the_save_is_observed_without_a_second_post(
+    tmp_state_dir, fake_github
+):
+    landed = fake_github.create_issue_comment
+
+    def crash_after_write(url, body):
+        landed(url, body)
+        raise RuntimeError("power loss")
+
+    fake_github.create_issue_comment = crash_after_write
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(None)])
+    with pytest.raises(RuntimeError, match="power loss"):
+        eng.step()
+    [record] = _k8_records(eng)
+    assert record["stage"] == "attempted" and len(fake_github.comments[EPIC]) == 1
+
+    fake_github.create_issue_comment = landed
+    eng.load()
+    out = eng.step()
+    assert out.next_phase == "DONE" and "no agent launched" in out.message
+    assert len(_progress_posts(fake_github)) == 1 and len(fake_github.comments[EPIC]) == 1
+    # A duplicate invocation after the restart finds nothing to do.
+    assert load_state(eng.paths.state_file).phase == Phase.DONE
+
+
+def test_k8_a_comment_posted_by_someone_else_between_intent_and_write_blocks(
+    tmp_state_dir, fake_github
+):
+    """The precondition (no comment carries the marker) no longer holds and the
+    comment found is not the payload: BLOCKED, naming it; nothing is posted."""
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(None)])
+    eng._persist_effect = _crash_on_first_call(eng._persist_effect)
+    with pytest.raises(RuntimeError, match="power loss"):
+        eng.step()
+    fake_github.add_comment(EPIC, 310, progress_comment_body())  # a human, meanwhile
+
+    eng.load()
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and len(eng.provider.calls) == 1
+    s = load_state(eng.paths.state_file)
+    assert comment_url(EPIC, 310) in s.block_reason and "'unblock'" in s.block_reason
+    assert _progress_posts(fake_github) == []
+    assert [r["stage"] for r in s.effect_records] == ["conflict"]
+    assert s.current_issue_url == ISSUE and s.merged_since_epic_update == 1
+
+
+def test_k8_a_duplicate_marker_comment_after_the_write_blocks(tmp_state_dir, fake_github):
+    landed = fake_github.create_issue_comment
+
+    def crash_after_write(url, body):
+        landed(url, body)
+        raise RuntimeError("power loss")
+
+    fake_github.create_issue_comment = crash_after_write
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(None)])
+    with pytest.raises(RuntimeError, match="power loss"):
+        eng.step()
+    fake_github.create_issue_comment = landed
+    fake_github.add_comment(EPIC, 320, _controller_progress_body())  # a second one
+
+    eng.load()
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    s = load_state(eng.paths.state_file)
+    assert comment_url(EPIC, 320) in s.block_reason
+    assert len(_progress_posts(fake_github)) == 1 and len(fake_github.comments[EPIC]) == 2
+
+
+def test_k8_the_attempt_bound_exhausted_blocks_naming_the_effect(tmp_state_dir, fake_github):
+    """Two attempts, neither landed: the third entry sends nothing and blocks,
+    naming the record and the manual step."""
+    lost = GitHubUnavailableError("gh: timed out")
+    fake_github.write_failures = [
+        ("create_issue_comment", lost, False),
+        ("create_issue_comment", lost, False),
+    ]
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(None)])
+    for _ in range(2):
+        with pytest.raises(GitHubUnavailableError, match="'resume' reconciles it"):
+            eng.step()
+        eng.load()
+    assert _k8_records(eng)[0]["attempts"] == 2
+
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and len(eng.provider.calls) == 1
+    s = load_state(eng.paths.state_file)
+    assert f"progress_comment effect 0 on {EPIC} has used its 2 attempts" in s.block_reason
+    assert "perform the write by hand" in s.block_reason and "'unblock'" in s.block_reason
+    assert [r["stage"] for r in s.effect_records] == ["conflict"]
+    assert len(_progress_posts(fake_github)) == 2 and EPIC not in fake_github.comments
+    assert s.current_issue_url == ISSUE and s.merged_since_epic_update == 1
+
+
+def test_k8_a_transient_failure_during_reconciliation_leaves_the_state_unchanged(
+    tmp_state_dir, fake_github
+):
+    landed = fake_github.create_issue_comment
+
+    def crash_after_write(url, body):
+        landed(url, body)
+        raise RuntimeError("power loss")
+
+    fake_github.create_issue_comment = crash_after_write
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(None)])
+    with pytest.raises(RuntimeError, match="power loss"):
+        eng.step()
+    fake_github.create_issue_comment = landed
+    before = load_state(eng.paths.state_file)
+
+    fake_github.comments_error = GitHubUnavailableError("gh: 502")
+    eng.load()
+    with pytest.raises(GitHubUnavailableError):
+        eng.step()
+    after = load_state(eng.paths.state_file)
+    assert after.effect_records == before.effect_records
+    assert after.completion_context == before.completion_context
+    assert after.step_count == before.step_count and after.phase == Phase.UPDATE_EPIC
+
+    fake_github.comments_error = None
+    eng.load()
+    assert eng.step().next_phase == "DONE"
+    assert len(_progress_posts(fake_github)) == 1
+
+
+# -- UPDATE_EPIC: a run upgraded while a previous-protocol agent was publishing (D13.7) ----
+def _as_protocol_5(eng, *, attempt: int) -> None:
+    """Rewrite the state file as the previous protocol left it: no effect state."""
+    data = json.loads(eng.paths.state_file.read_text())
+    data["protocol_version"] = "5"
+    data["attempt"] = attempt
+    for key in ("effect_records", "entry_observation", "completion_context", "launch_label"):
+        data.pop(key, None)
+    eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
+
+
+def test_update_epic_legacy_reentry_adopts_the_agents_comment_and_asks_for_the_selection(
+    tmp_state_dir, fake_github
+):
+    """Protocol 5, attempt 1: the agent ran under the contract in which it posted
+    the comment. Its comment is adopted once (D13.7), nothing is posted, and the
+    relaunch is a re-request for the selection that names the adopted comment."""
+    fake_github.add_issue(ISSUE3, "Next")
+    eng = _in_update_epic(
+        tmp_state_dir, fake_github, [_epic_reselect(ISSUE3, roadmap_section=ROADMAP)]
+    )
+    _as_protocol_5(eng, attempt=1)
+    post_progress_comment(fake_github)  # what the previous-protocol agent published
+    eng.load()
+    assert eng.state.launch_label == "agent_publishes"
+
+    out = eng.step()
+    assert out.next_phase == "ANALYZE_EXECUTE"
+    [call] = eng.provider.calls
+    assert "# Phase: UPDATE_EPIC (re-request)" in call.prompt
+    assert comment_url(EPIC, 300) in call.prompt
+    assert "posted by an agent under the previous contract" in call.prompt
+    assert _progress_posts(fake_github) == [] and len(fake_github.comments[EPIC]) == 1
+    s = load_state(eng.paths.state_file)
+    assert s.current_issue_url == ISSUE3 and s.protocol_version == "7"
+    assert s.effect_records == []  # adopted with no record (D13.7)
+
+
+def test_update_epic_legacy_state_before_any_launch_does_not_adopt_a_comment(
+    tmp_state_dir, fake_github
+):
+    """Protocol 5, attempt 0: no agent of the previous contract ran for this entry,
+    so a marker comment is unexplained and blocks (D9.7), as on any entry."""
+    eng = _in_update_epic(tmp_state_dir, fake_github, ["never"])
+    _as_protocol_5(eng, attempt=0)
+    post_progress_comment(fake_github)
+    eng.load()
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and eng.provider.calls == []
+    assert "D9.7" in load_state(eng.paths.state_file).block_reason
+
+
+def test_update_epic_legacy_reentry_is_one_shot(tmp_state_dir, fake_github):
+    """After the first entry of this version persisted its observation, a
+    marker comment found later is no longer the legacy one."""
+    eng = _in_update_epic(tmp_state_dir, fake_github, ["junk", "junk"])
+    _as_protocol_5(eng, attempt=1)
+    eng.load()
+    with pytest.raises(ControlResultValidationError):
+        eng.step()  # the entry saw no comment, launched, and the result was refused
+    post_progress_comment(fake_github, cid=330)
+    eng.load()
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and len(eng.provider.calls) == 2
+    reason = load_state(eng.paths.state_file).block_reason
+    assert comment_url(EPIC, 330) in reason and "D9.7" in reason
+
+
+# -- UPDATE_EPIC dry-run: no effect, no read, no git -----------------------------------
+class _NoGitHub:
+    """Fails the test on any use of the GitHub client (dry-run reads persisted state only)."""
+
+    def __getattr__(self, name: str):
+        raise AssertionError(f"dry-run touched GitHub: {name!r}")
+
+
+def test_update_epic_dry_run_executes_no_effect_and_names_the_planned_one(
+    tmp_state_dir, fake_github
+):
+    eng = _in_update_epic(tmp_state_dir, fake_github, ["never"])
+    eng._github = _NoGitHub()
+    before = eng.paths.state_file.read_bytes()
+    out = eng.step(dry_run=True)
+    notes = "\n".join(out.plan.notes)
+    assert "would post the agent's progress text on the EPIC itself" in notes
+    assert render_progress_marker(ISSUE, PR) in notes
+    assert eng.provider.calls == [] and eng.paths.state_file.read_bytes() == before
+
+
+def test_update_epic_dry_run_names_the_record_it_would_reconcile(tmp_state_dir, fake_github):
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(None)])
+    eng._persist_effect = _crash_on_first_call(eng._persist_effect)
+    with pytest.raises(RuntimeError, match="power loss"):
+        eng.step()
+    eng.load()
+    writes = list(fake_github.effect_writes)
+    eng._github = _NoGitHub()
+    before = eng.paths.state_file.read_bytes()
+    out = eng.step(dry_run=True)
+    notes = "\n".join(out.plan.notes)
+    assert "would reconcile" in notes and "(intended, 0 attempt(s))" in notes
+    assert "would complete from the persisted UPDATE_EPIC result without launching" in notes
+    assert eng.paths.state_file.read_bytes() == before
+    assert fake_github.effect_writes == writes and len(eng.provider.calls) == 1
 
 
 # -- loop bounds: review-round cap, stagnation, step budget (#9) ------------------------------
@@ -5421,11 +5812,16 @@ def test_oversized_resolution_never_reaches_state_or_a_prompt(tmp_state_dir, fak
     after = load_state(eng.paths.state_file)
     assert after.phase == Phase.REVIEW and after.review_round == 0
     assert after.open_findings == [] and after.review_history == []
-    # The only differences on disk are the counters of the refused launch.
+    # The only differences on disk are the counters and the launch label
+    # (ADR 0004 D13.3) of the refused launch.
     persisted = json.loads(eng.paths.state_file.read_bytes())
     for volatile in ("updated_at",):
         persisted.pop(volatile)
-    expected = json.loads(before) | {"attempt": 1, "step_count": 1}
+    expected = json.loads(before) | {
+        "attempt": 1,
+        "step_count": 1,
+        "launch_label": "agent_publishes",
+    }
     expected.pop("updated_at")
     assert persisted == expected
     assert "resolve everything" not in eng.paths.state_file.read_text()
@@ -6253,18 +6649,23 @@ def test_update_epic_entry_blocks_on_an_unreadable_progress_marker_without_invok
 
 
 @pytest.mark.parametrize("body", _UNREADABLE_PROGRESS_BODIES)
-def test_update_epic_read_back_rejects_an_unreadable_progress_marker(
+def test_update_epic_precondition_read_blocks_on_an_unreadable_progress_marker(
     tmp_state_dir, fake_github, body
 ):
+    """An agent that wrote a malformed marker while it ran: the precondition read
+    before the controller's post cannot be read unambiguously, so nothing is posted."""
+
     def agent(req):
         fake_github.add_comment(EPIC, 290, body)
         return _epic_result(None)
 
     eng = _in_update_epic(tmp_state_dir, fake_github, agent)
-    with pytest.raises(VerificationError, match="cannot establish which comment carries"):
-        eng.step()
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
     s = load_state(eng.paths.state_file)
-    assert s.phase == Phase.UPDATE_EPIC and s.current_issue_url == ISSUE
+    assert "cannot establish which comment carries" in s.block_reason
+    assert "Nothing was posted" in s.block_reason
+    assert s.current_issue_url == ISSUE and _progress_posts(fake_github) == []
 
 
 # -- the correction relaunch is an entry: a botched write blocks it, it does not relaunch --
@@ -6408,19 +6809,20 @@ def test_update_epic_entry_lets_an_unavailable_comment_listing_through_as_transi
     assert load_state(eng.paths.state_file).phase == Phase.UPDATE_EPIC
 
 
-def test_update_epic_read_back_rejects_when_the_comment_listing_cannot_be_decoded(
+def test_update_epic_precondition_read_blocks_when_the_comment_listing_cannot_be_decoded(
     tmp_state_dir, fake_github
 ):
     def agent(req):
-        post_progress_comment(fake_github)
         fake_github.comments_error = _MALFORMED_COMMENT_ROW
         return _epic_result(None)
 
     eng = _in_update_epic(tmp_state_dir, fake_github, agent)
-    with pytest.raises(VerificationError, match="not a GitHub comment URL.*identifies the issue"):
-        eng.step()
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
     s = load_state(eng.paths.state_file)
-    assert s.phase == Phase.UPDATE_EPIC and s.current_issue_url == ISSUE
+    assert "not a GitHub comment URL" in s.block_reason
+    assert "Nothing was posted" in s.block_reason
+    assert s.current_issue_url == ISSUE and _progress_posts(fake_github) == []
 
 
 # -- READY_FOR_MERGE / MERGE: the clean review is bound to the PR and base (issue #68) ---------

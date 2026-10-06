@@ -94,10 +94,10 @@ import re
 import secrets
 from collections.abc import Callable, Hashable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import overload
+from typing import NoReturn, overload
 
 from . import __prompt_version__
 from .claims import (
@@ -119,6 +119,19 @@ from .claims import (
     render_progress_marker,
 )
 from .config import DEFAULT_STATE_DIR, AutoForgeConfig, validate_required_profiles
+from .effect_ops import ProgressCommentOp, drive
+from .effects import (
+    EffectKind,
+    EffectOwner,
+    EffectRecord,
+    EntryObservation,
+    Stage,
+    UpdateEpicContext,
+    is_legacy_reentry,
+    launch_label_for,
+    progress_comment_body,
+    sha256_text,
+)
 from .errors import (
     CheckoutDriftError,
     ClaimConflictError,
@@ -130,12 +143,14 @@ from .errors import (
     GitHubError,
     GitHubNotFoundError,
     GitHubUnavailableError,
+    GitTransportError,
     LockError,
     StateError,
     StateTransitionError,
     VerificationError,
 )
 from .executor import DEFAULT_MAX_OUTPUT_BYTES, ExecutionRequest, execute
+from .git_transport import GitRemote, GitTransport
 from .github import (
     CommentInfo,
     GitHubClient,
@@ -215,6 +230,7 @@ from .result_parser import (
     MAX_FINDING_TITLE_CHARS,
     MAX_FINDINGS_PER_REVIEW,
     MAX_FIX_RATIONALE_CHARS,
+    MAX_PROGRESS_CHARS,
     MAX_RESOLUTIONS_PER_FIX,
     MAX_ROADMAP_SECTION_CHARS,
     MIN_RATIONALE_CHARS,
@@ -225,8 +241,10 @@ from .result_parser import (
     LocalReviewResult,
     ReplanReexecuteResult,
     ReviewResult,
+    UpdateEpicRequest,
     UpdateEpicResult,
     parse_control_result,
+    published_payload_problem,
 )
 from .roadmap import (
     ROADMAP_END_MARKER,
@@ -395,6 +413,10 @@ PHASE_TEMPLATE: dict[Phase, str | None] = {
     Phase.FAILED: None,
 }
 
+# The UPDATE_EPIC prompt once the progress comment is published (ADR 0004
+# D4.7, D13.7): it asks only for the input a later controller step rejected.
+UPDATE_EPIC_RE_REQUEST_TEMPLATE = "update_epic_rerequest.md"
+
 
 @dataclass
 class StepPlan:
@@ -523,8 +545,9 @@ _REMOTE_REENTRY_RECONCILIATION: dict[Phase, str] = {
     ),
     Phase.REPLAN_REEXECUTE: "replays the persisted replan transaction",
     Phase.UPDATE_EPIC: (
-        "hands a progress comment already posted on the EPIC for this issue to the "
-        "agent to adopt instead of posting a second one"
+        "completes from the persisted progress comment, roadmap section and selection "
+        "when they were saved, and otherwise refuses a progress comment it did not "
+        "journal, instead of relaunching the agent for a second one"
     ),
 }
 
@@ -555,6 +578,10 @@ class ControllerEngine:
         # An injected client (tests) is used as given.
         self._github = github
         self._runner = runner
+        # The remote the controller's own git transport talks to (ADR 0004
+        # D7.1): ``https://github.com/<repository>.git`` unless a test
+        # injects a ``file://`` one. Never ``origin``, never configuration.
+        self._git_remote: GitRemote | None = None
         self._workspace: LocalWorkspace | None = None
         # The per-issue agent worktree paths already derived (a git read
         # each), keyed by the worktree's name; see :meth:`agent_worktree_path`.
@@ -574,20 +601,24 @@ class ControllerEngine:
         # ``EXISTING_REVIEW_COMMENT_URL`` so it adopts it instead of posting a
         # second one. Re-derived from GitHub on every REVIEW entry.
         self._existing_review_comment_url = ""
-        # Likewise for the other phases whose agents write to GitHub: the EPIC
-        # progress comment the UPDATE_EPIC entry found already posted for the
-        # finished issue (``EXISTING_PROGRESS_COMMENT_URL``), and the open
-        # follow-up issues the FIX entry found already carrying a marker for
-        # one of the open findings (rendered into ``FOLLOW_UP_ISSUES``).
-        # Re-derived from GitHub on every entry, never persisted.
-        self._existing_progress_comment_url = ""
+        # Likewise for the FIX entry: the open follow-up issues it found
+        # already carrying a marker for one of the open findings (rendered
+        # into ``FOLLOW_UP_ISSUES``). Re-derived from GitHub on every entry,
+        # never persisted.
         self._existing_follow_ups: dict[str, str] = {}
+        # The progress comment an UPDATE_EPIC entry adopted without a record:
+        # posted by an agent under the previous contract (ADR 0004 D13.7), or
+        # recorded as pre-existing by the entry observation of that adoption.
+        # Set only by :meth:`_reconcile_update_epic_entry`; it makes the launch
+        # a selection re-request, which never carries progress text.
+        self._adopted_progress_comment_url = ""
         # The EPIC body the UPDATE_EPIC entry read, split around its managed
         # roadmap section (``None`` until the entry has read it: a plan or dry
         # run renders a placeholder). The current section is handed to the
-        # agent as ``CURRENT_ROADMAP_SECTION``; the outside bytes are what
-        # :meth:`_apply_update_epic` requires unchanged before it writes.
-        # Re-derived from GitHub on every entry, never persisted.
+        # agent as ``CURRENT_ROADMAP_SECTION``, and the completion context
+        # stores the digests of its outside bytes (D4.6), which the splice
+        # requires before it writes. Re-derived from GitHub before every
+        # launch, never persisted itself.
         self._epic_roadmap_at_entry: RoadmapSplit | None = None
         # The follow-up issues already open for this PR from earlier rounds,
         # as (finding id, issue URL): found by the REVIEW and FIX entries and
@@ -1200,6 +1231,7 @@ class ControllerEngine:
     def save(self) -> None:
         """Persist the current state through the held state root."""
         assert self.state is not None
+        self.state.settle_phase_effects()
         save_state(self.state, self.paths.state_file, root=self.state_root())
 
     _save = save
@@ -1405,12 +1437,6 @@ class ControllerEngine:
             "REVIEW_COMMENT_URL": s.last_review_comment_url or "(none)",
             "PREVIOUS_REVIEW_COMMENT_URL": s.last_review_comment_url or "(none)",
             "EXISTING_REVIEW_COMMENT_URL": self._existing_review_comment_url or "(none)",
-            "EXISTING_PROGRESS_COMMENT_URL": self._existing_progress_comment_url or "(none)",
-            "PROGRESS_MARKER": (
-                render_progress_marker(s.current_issue_url, s.current_pr_url)
-                if s.current_issue_url and s.current_pr_url
-                else "(none)"
-            ),
             "FOLLOW_UP_ISSUES": self._format_follow_ups(
                 s.current_pr_url, s.open_findings, self._existing_follow_ups
             ),
@@ -1447,12 +1473,12 @@ class ControllerEngine:
             "MAX_ROADMAP_SECTION_CHARS": MAX_ROADMAP_SECTION_CHARS,
             "CURRENT_ROADMAP_SECTION": self._format_current_roadmap_section(),
             "LAST_REVIEW_RESULT": s.last_review_result or "(none)",
-            "NEXT_ISSUE_REJECTION": (
-                s.next_issue_rejections[-1] if s.next_issue_rejections else "(none)"
-            ),
+            "MAX_PROGRESS_CHARS": MAX_PROGRESS_CHARS,
             **REVIEW_BOUND_VARIABLES,
             **FIX_BOUND_VARIABLES,
         }
+        if s.phase == Phase.UPDATE_EPIC and s.mode == WorkflowMode.REMOTE:
+            variables.update(self._update_epic_request_variables())
         if s.phase == Phase.REPLAN_REEXECUTE:
             # Before `_prepare_replan` has run (plan/dry-run rendering) the
             # checkpoint does not exist yet, so every field falls back to a
@@ -1503,6 +1529,58 @@ class ControllerEngine:
             return "  (none)"
         return "\n".join(f"  - {escape_inline(url)}" for url in prs)
 
+    def _update_epic_request_variables(self) -> dict[str, str | int | None]:
+        """What a re-request prompt (``update_epic_rerequest.md``) names (D4.7, D13.7).
+
+        Rendered for every UPDATE_EPIC prompt; only the re-request template
+        uses them. The reason quotes a persisted rejection (redacted when it
+        was persisted) and is escaped here, as every untrusted line is.
+        """
+        request = self._update_epic_request()
+        context = self._update_epic_context()
+        published = self._published_progress_comment_url()
+        if request == UpdateEpicRequest.ROADMAP:
+            asks = "the roadmap section"
+        elif request == UpdateEpicRequest.SELECTION_WITH_ROADMAP:
+            asks = "the next issue selection, with the roadmap section when one is required"
+        else:
+            asks = "the next issue selection"
+        state = self._require_state()
+        if context is not None and context.section_void:
+            reason = (
+                "the EPIC body changed outside the roadmap markers after the section was "
+                "composed, so the controller did not write that section; compose it again "
+                "from the current section below"
+            )
+        elif context is not None and context.selection_void and state.next_issue_rejections:
+            reason = (
+                "the controller rejected the previous selection: " + state.next_issue_rejections[-1]
+            )
+        elif context is None and self._adopted_progress_comment_url:
+            reason = (
+                "this run was upgraded while the phase was in progress: the progress comment "
+                "above was posted by an agent under the previous contract, and the controller "
+                "adopts it as this phase's publication"
+            )
+        else:
+            reason = "(none)"
+        fields = {
+            UpdateEpicRequest.SELECTION: ['  "next_issue_url": "<next issue url or null>"'],
+            UpdateEpicRequest.SELECTION_WITH_ROADMAP: [
+                '  "roadmap_section": "<new content of the managed section, or null>",',
+                '  "next_issue_url": "<next issue url or null>"',
+            ],
+            UpdateEpicRequest.ROADMAP: [
+                '  "roadmap_section": "<new content of the managed section>"'
+            ],
+        }.get(request, [])
+        return {
+            "PROGRESS_COMMENT_URL": published or "(none)",
+            "RE_REQUEST_ASKS": asks,
+            "RE_REQUEST_REASON": escape_inline(reason),
+            "RE_REQUEST_FIELDS": "\n".join(fields) or "(none)",
+        }
+
     def _format_current_roadmap_section(self) -> str:
         split = self._epic_roadmap_at_entry
         if split is None:
@@ -1521,9 +1599,25 @@ class ControllerEngine:
             )
         return table.get(phase)
 
+    def _launch_template(self, phase: Phase) -> str | None:
+        """The template the next launch of ``phase`` renders.
+
+        ``template_for``, except for an UPDATE_EPIC whose progress comment is
+        already published (ADR 0004 D4.7, D13.7): that launch asks only for
+        the input the controller still needs.
+        """
+        template = self.template_for(phase)
+        if (
+            self.mode == WorkflowMode.REMOTE
+            and phase == Phase.UPDATE_EPIC
+            and self._update_epic_request() != UpdateEpicRequest.FULL
+        ):
+            return UPDATE_EPIC_RE_REQUEST_TEMPLATE
+        return template
+
     def render_prompt_for(self, phase: Phase, correction_error: str | None = None) -> str:
         local = self.mode == WorkflowMode.LOCAL
-        template = self.template_for(phase)
+        template = self._launch_template(phase)
         if template is None:
             raise StateTransitionError(f"phase {phase.value} has no agent prompt")
         if template not in TEMPLATE_FILES:
@@ -1653,7 +1747,7 @@ class ControllerEngine:
             prompt_preview=prompt[:1200],
             prompt_full=prompt,
             routing=self._routing_info(s, profile.name),
-            template=PHASE_TEMPLATE[s.phase] or "",
+            template=self._launch_template(s.phase) or "",
             review_round=s.review_round + 1 if s.phase == Phase.REVIEW else s.review_round,
             variables={k: str(v) for k, v in variables.items()},
             expected_next=expected_next,
@@ -3073,6 +3167,13 @@ class ControllerEngine:
                 "detail": redact(decision.detail),
             }
         )
+        effects = state.phase_effects()
+        if effects.phase == target:
+            # D2.4: the records belong to the phase entry the block
+            # interrupted, and the unblock resumes it. A conflict the operator
+            # resolved is reconciled again, its attempt count kept; any other
+            # target drops them with the save below.
+            state.effect_records = [r.reopened().to_dict() for r in effects.records]
         state.block_reason = ""
         state.phase = target
         state.attempt = 0
@@ -3230,8 +3331,9 @@ class ControllerEngine:
             if canonical in state.counted_merged_prs:
                 return UnblockDecision(
                     Phase.UPDATE_EPIC,
-                    f"PR {canonical} is MERGED and already counted; UPDATE_EPIC will "
-                    "reconcile the EPIC progress comment before launching its agent",
+                    f"PR {canonical} is MERGED and already counted; UPDATE_EPIC completes "
+                    "from its persisted result when one was saved, and otherwise reads the "
+                    "EPIC's progress comments before launching its agent",
                     pr=pr,
                 )
             if not (review_is_this_pr and clean and reviewed):
@@ -3960,7 +4062,7 @@ class ControllerEngine:
         sha = pr.head_sha
         if not commit_is_local(runner, repo, sha):
             try:
-                fetch_pr_head(runner, repo, pr.number)
+                fetch_pr_head(self._git_transport(), pr.number)
             except VerificationError as exc:
                 raise VerificationError(
                     f"the reviewed HEAD {sha[:12]} of PR {pr.url} is not in the local "
@@ -3986,6 +4088,37 @@ class ControllerEngine:
         state.premerge_verified_commands = argvs
         self._save()
         return ""
+
+    def _git_transport(self) -> GitTransport:
+        """The controller's own git transport for this repository (ADR 0004 D7.1).
+
+        Objects land in the shared store of the checkout's git common dir;
+        the remote is an explicit URL and the credential comes from ``gh``,
+        so no repository configuration, hook or ``origin`` steers it.
+        GitHub's ancestry answers come through the typed compare read. A
+        checkout that is not a git repository is inconclusive
+        (:class:`VerificationError`), never guessed around.
+        """
+        identity = self._worktree_identity(Path(self.workdir))
+        if identity is None:
+            raise VerificationError(
+                f"{self.workdir} is not inside a git repository; the controller has no object "
+                "store to fetch into"
+            )
+        state = self._require_state()
+        repository = state.repository
+        github = self.github
+        try:
+            remote = self._git_remote or GitRemote.https(repository)
+        except GitTransportError as exc:
+            raise VerificationError(str(exc)) from exc
+        return GitTransport(
+            object_directory=identity[1] / "objects",
+            remote=remote,
+            gh_command=self.config.github.command,
+            in_base_history=lambda base, sha: github.commit_in_history(repository, base, sha),
+            runner=self._runner,
+        )
 
     def _run_premerge_command(self, phase: Phase, pr: PRInfo, argv: list[str], cwd: str) -> str:
         """One ``merge.verification_commands`` entry in the exported tree; "" on exit 0."""
@@ -4616,11 +4749,46 @@ class ControllerEngine:
         )
 
     def _update_epic_plan_notes(self, s: AutoForgeState) -> list[str]:
+        """What UPDATE_EPIC would do, from persisted state only (no read, no effect)."""
         every = self.config.workflow.epic_update_every
-        notes = [
+        effects = s.phase_effects()
+        notes: list[str] = []
+        for record in effects.records:
+            notes.append(
+                f"would reconcile {record.describe()} ({record.stage.value}, "
+                f"{record.attempts} attempt(s)) against the EPIC's comments before anything "
+                "else, and post it only if no comment carries its marker and its attempt "
+                "bound is left"
+            )
+        context = effects.context
+        if isinstance(context, UpdateEpicContext) and not context.void:
+            notes.append(
+                "would complete from the persisted UPDATE_EPIC result without launching the "
+                "agent: splice the stored roadmap section when merges are pending, then "
+                "verify the stored selection "
+                f"({context.next_issue_url or 'none: the EPIC is complete'})"
+            )
+            return notes
+        request = self._update_epic_request()
+        if request != UpdateEpicRequest.FULL:
+            notes.append(
+                f"the progress comment is published; the launch is a {request.value} "
+                "re-request, whose result may carry no progress text"
+            )
+        else:
+            notes.append(
+                "would read the EPIC's comments first: one carrying this issue's progress "
+                "marker that the controller did not journal, or two, block without launching"
+            )
+            notes.append(
+                "would post the agent's progress text on the EPIC itself, followed by the "
+                f"marker {self._progress_marker() if s.current_pr_url else '(none)'}, after "
+                "saving the planned comment, and read it back as the one comment carrying it"
+            )
+        notes.append(
             "would read the EPIC body and locate its managed roadmap section before "
-            "launching the agent (BLOCKED without launching when the markers are ambiguous)",
-        ]
+            "launching the agent (BLOCKED without launching when the markers are ambiguous)"
+        )
         if self._roadmap_update_due(s):
             notes.append(
                 f"roadmap update due: {s.merged_since_epic_update} merge(s) since the last "
@@ -4994,33 +5162,47 @@ class ControllerEngine:
         )
 
     def _reconcile_update_epic_entry(self, plan: StepPlan) -> StepOutcome | None:
-        """Read the EPIC's progress comments and body before the agent runs.
+        """Journal first, then GitHub, before any UPDATE_EPIC launch (ADR 0004 §2.10).
 
-        The agent's one GitHub write in UPDATE_EPIC is the progress comment
-        on the EPIC, and it carries the ``ai-epic-progress`` marker of
-        (finished issue, merged PR). An agent whose result was never
-        recorded may already have posted it, and so may the agent of a
-        rejected selection that is being asked again. Exactly one such
-        comment is handed to the agent (``EXISTING_PROGRESS_COMMENT_URL``)
-        to adopt rather than duplicate; two or more block without launching
-        anyone; :meth:`_apply_update_epic` enforces afterwards that the EPIC
-        carries exactly one.
+        The controller posts the phase's progress comment itself (K8) and
+        writes the EPIC's roadmap section; the agent publishes nothing. So:
 
-        The EPIC body is the controller's to write, not the agent's: the
-        entry reads it and locates the managed roadmap section, which the
-        agent sees as ``CURRENT_ROADMAP_SECTION`` and re-composes. A body
-        whose markers cannot be read unambiguously blocks before anyone is
-        launched: the controller would not know which part of the operator's
-        document is its own. So does a body that cannot be read at all for a
-        conclusive reason (authentication, permissions, the EPIC gone,
-        malformed data): asking GitHub again would not help, and an agent
-        launched without the body would compose a section the controller
-        could never splice. Only an *unavailable* GitHub propagates, as the
-        transient failure it is.
+        - A persisted completion context means the agent's result was
+          accepted. It is completed from the journal (the K8 record
+          reconciled, the section spliced, the selection verified) and the
+          agent is never relaunched for it, unless a persisted rejection
+          voided one of its inputs: then the entry reads the EPIC body and
+          the launch is a re-request for that input only (D4.7).
+        - Otherwise the EPIC's comments are read. None carrying the marker of
+          (finished issue, merged PR) is the normal case. One that the
+          controller did not journal blocks (D9.7): it is never adopted and
+          never duplicated. The two exceptions are a comment this entry
+          already adopted (its URL is in the persisted entry observation) and
+          the one-shot legacy re-entry of a run upgraded while an agent of the
+          previous contract was publishing (D13.3, D13.7), whose comment is
+          adopted and whose launch asks for the selection only. Two or more
+          block without launching anyone.
+
+        The EPIC body is read and split around its managed roadmap section
+        before every launch: the agent sees the section as
+        ``CURRENT_ROADMAP_SECTION``, and the completion context stores the
+        digests of the bytes outside it. A body whose markers cannot be read
+        unambiguously, or that cannot be read for a conclusive reason, blocks
+        before anyone is launched; only an *unavailable* GitHub propagates,
+        as the transient failure it is.
         """
         state = self._require_state()
-        self._existing_progress_comment_url = ""
+        self._adopted_progress_comment_url = ""
         self._epic_roadmap_at_entry = None
+        context = self._update_epic_context()
+        if context is not None:
+            if not context.void:
+                return self._finish_update_epic_entry(plan)
+            reason = self._drive_progress_records()
+            if reason:
+                return self._block(Phase.UPDATE_EPIC, plan, reason)
+            return self._read_entry_roadmap(plan)
+        marker = self._progress_marker()
         try:
             holder = self._progress_comments().at_most_one()
         except GitHubUnavailableError:
@@ -5031,17 +5213,67 @@ class ControllerEngine:
                 plan,
                 f"cannot establish which comment on EPIC {state.epic_url} is the progress "
                 f"comment for issue {state.current_issue_url}: {exc}. The controller will "
-                "not launch an agent that could post a second one",
+                "not launch an agent before it knows whether the comment exists",
             )
         except ClaimConflictError as exc:
             return self._block(
                 Phase.UPDATE_EPIC,
                 plan,
                 f"{exc}. The controller never chooses between them: remove or repair the "
-                "extra or unreadable comment(s) so exactly one remains, then start a new run",
+                "extra or unreadable comment(s) so that at most one remains, then start a new "
+                "run",
             )
+        observation = state.phase_effects().observation
+        observed = observation.objects.get(marker) if observation is not None else None
         if holder is not None:
-            self._existing_progress_comment_url = holder.obj.url
+            journaled = observed is not None and observed == holder.obj.url
+            legacy = observation is None and is_legacy_reentry(
+                Phase.UPDATE_EPIC, state.attempt, state.launch_label
+            )
+            if not (journaled or legacy):
+                return self._block(
+                    Phase.UPDATE_EPIC, plan, self._unjournaled_progress_text(holder.obj.url)
+                )
+            self._adopted_progress_comment_url = holder.obj.url
+        elif observed is not None:
+            return self._block(
+                Phase.UPDATE_EPIC,
+                plan,
+                f"the progress comment {observed} that this phase adopted is no longer on EPIC "
+                f"{state.epic_url}. The controller does not post a replacement for a comment it "
+                "did not write; restore it or post the progress report by hand, then start a "
+                "new run",
+            )
+        blocked = self._read_entry_roadmap(plan)
+        if blocked is not None:
+            return blocked
+        if observation is None:
+            # D4.4: persisted by the pre-launch save, so that a comment found
+            # by a later entry is explained by this read or not at all.
+            state.entry_observation = EntryObservation(
+                Phase.UPDATE_EPIC,
+                state.current_issue_url,
+                state.current_pr_url,
+                {},
+                None,
+                {marker: holder.obj.url if holder is not None else None},
+            ).to_dict()
+        return None
+
+    def _unjournaled_progress_text(self, url: str) -> str:
+        state = self._require_state()
+        return (
+            f"EPIC {state.epic_url} carries a progress comment for issue "
+            f"{state.current_issue_url} (PR {state.current_pr_url}) that the controller did "
+            f"not post: {url}. The controller posts this comment itself and journals it before "
+            "it is sent; it never adopts or duplicates one it did not journal (ADR 0004 "
+            "D9.7). Nothing was posted. Delete that comment (the controller then posts its "
+            "own), or finish the EPIC update by hand and start a new run"
+        )
+
+    def _read_entry_roadmap(self, plan: StepPlan) -> StepOutcome | None:
+        """Read the EPIC body before a launch; block on a conclusive failure."""
+        state = self._require_state()
         try:
             self._epic_roadmap_at_entry = self._read_epic_roadmap()
         except GitHubUnavailableError:
@@ -5065,6 +5297,29 @@ class ControllerEngine:
                 "it carries one section (or none), then 'resume'",
             )
         return None
+
+    def _finish_update_epic_entry(self, plan: StepPlan) -> StepOutcome:
+        """Complete UPDATE_EPIC from its persisted context, launching nothing (§2.10)."""
+        state = self._require_state()
+        try:
+            nxt, message = self._complete_update_epic()
+        except VerificationError:
+            # The rejection that voided an input is persisted before the
+            # step ends, so that 'resume' re-requests it (D4.7).
+            self._save()
+            raise
+        if nxt == Phase.BLOCKED:
+            return self._block(Phase.UPDATE_EPIC, plan, message)
+        validate_transition(Phase.UPDATE_EPIC, nxt)
+        state.phase = nxt
+        state.attempt = 0
+        self._save()
+        return self._outcome(
+            Phase.UPDATE_EPIC,
+            plan=plan,
+            message=f"{message} (completed from the persisted UPDATE_EPIC result; no agent "
+            "launched)",
+        )
 
     def _read_epic_roadmap(self) -> RoadmapSplit:
         """The EPIC body as GitHub holds it now, split around its managed section."""
@@ -6101,6 +6356,13 @@ class ControllerEngine:
                 resolved = reconcile()
                 if resolved is not None:
                     return resolved
+            # Which UPDATE_EPIC result this launch asks for (ADR 0004 D4.7):
+            # decided by the entry above, and the schema its result is held to.
+            request = (
+                self._update_epic_request()
+                if phase == Phase.UPDATE_EPIC
+                else UpdateEpicRequest.FULL
+            )
             prompt = self.render_prompt_for(phase, correction_error)
             # The launch is charged to the durable LOCAL bound here, after
             # every step that can refuse without launching and immediately
@@ -6115,12 +6377,18 @@ class ControllerEngine:
                 )
             attempt += 1
             state.attempt += 1
+            if state.mode == WorkflowMode.REMOTE:
+                # D13.3: which publication contract this launch runs under,
+                # so a later version can tell a launch of its own from one
+                # whose agent published under the previous contract.
+                state.launch_label = launch_label_for(phase)
             # The one write before the agent starts, in both modes: the
             # attempt counter and, for a LOCAL write phase, the checkpoint
-            # charged just above land together. A crash while the agent runs,
-            # or a refused run-log write after it returned, therefore never
-            # leaves controller state claiming the phase was not yet
-            # attempted (#55, PR #89).
+            # charged just above land together, and for a REMOTE phase the
+            # entry observation (D4.4) and the launch label. A crash while the
+            # agent runs, or a refused run-log write after it returned,
+            # therefore never leaves controller state claiming the phase was
+            # not yet attempted (#55, PR #89).
             self._save()
             req = AgentRequest(
                 phase=phase.value,
@@ -6219,7 +6487,18 @@ class ControllerEngine:
                 # Only the tail of a truncated stdout is searched: the block
                 # is the last thing the agent writes, so the kept tail holds
                 # a whole one; a block before the cut is stale or spans it.
-                payload = parse_control_result(result.stdout_tail, phase, state.mode)
+                payload = parse_control_result(
+                    result.stdout_tail, phase, state.mode, update_epic_request=request
+                )
+                if (
+                    phase == Phase.UPDATE_EPIC
+                    and state.mode == WorkflowMode.REMOTE
+                    and payload.get("status") == "success"
+                ):
+                    # The controller's half of the schema (a required roadmap
+                    # section, the publishable comment as a whole): refused
+                    # here, it is corrected before anything is posted.
+                    self._check_update_epic_result(payload, request)
             except (ControlResultError, ControlResultValidationError) as exc:
                 detail = str(exc)
                 if result.stdout_truncated:
@@ -6307,7 +6586,7 @@ class ControllerEngine:
         if phase == Phase.REPLAN_REEXECUTE:
             return self._apply_replan(ReplanReexecuteResult.from_payload(payload))
         if phase == Phase.UPDATE_EPIC:
-            return self._apply_update_epic(UpdateEpicResult.from_payload(payload))
+            return self._apply_update_epic(payload)
         raise StateTransitionError(f"phase {phase.value} does not accept agent results")
 
     def _apply_analyze(self, res: AnalyzeExecuteResult) -> tuple[Phase, str]:
@@ -6930,58 +7209,332 @@ class ControllerEngine:
             f"{n}/{MAX_NEXT_ISSUE_SELECTIONS}) — 'resume' to let the agent select again."
         ) from cause
 
-    def _verify_progress_comment(self) -> None:
-        """The EPIC carries exactly one progress comment for this entry.
+    # -- UPDATE_EPIC: the controller publishes (ADR 0004 §2.5, D4.6, D4.7, D13.7) --
 
-        Read back, never inferred from the result: a missing comment means
-        the agent did not do the phase's write (the next entry finds nothing
-        and relaunches), a second one means it duplicated the one it was
-        handed (the next entry blocks on the pair).
+    def _progress_marker(self) -> str:
+        state = self._require_state()
+        return render_progress_marker(state.current_issue_url, state.current_pr_url)
+
+    def _update_epic_context(self) -> UpdateEpicContext | None:
+        """The persisted UPDATE_EPIC completion context, or ``None``."""
+        context = self._require_state().phase_effects().context
+        return context if isinstance(context, UpdateEpicContext) else None
+
+    def _update_epic_request(self) -> UpdateEpicRequest:
+        """Which result the next UPDATE_EPIC launch asks for (D4.7, D13.7).
+
+        ``FULL`` until the progress comment is published. Afterwards the
+        agent is launched again only for an input a persisted rejection
+        voided, and asked for that input alone: the selection (with the
+        roadmap section while merges are uncounted, because a new selection
+        of ``null`` may require one) or the section. The selection asked
+        after adopting a legacy comment (D13.7) follows the same rule.
         """
         state = self._require_state()
+        if state.mode != WorkflowMode.REMOTE or state.phase != Phase.UPDATE_EPIC:
+            return UpdateEpicRequest.FULL
+        context = self._update_epic_context()
+        if context is not None and context.section_void and not context.selection_void:
+            return UpdateEpicRequest.ROADMAP
+        if (context is not None and context.selection_void) or (
+            context is None and self._adopted_progress_comment_url
+        ):
+            if state.merged_since_epic_update > 0:
+                return UpdateEpicRequest.SELECTION_WITH_ROADMAP
+            return UpdateEpicRequest.SELECTION
+        return UpdateEpicRequest.FULL
+
+    def _published_progress_comment_url(self) -> str:
+        """The progress comment this phase entry posted or adopted, or ``""``."""
+        effects = self._require_state().phase_effects()
+        for record in effects.records:
+            if record.kind == EffectKind.PROGRESS_COMMENT and record.observed:
+                return str(record.observed["url"])
+        if effects.observation is not None:
+            adopted = effects.observation.objects.get(self._progress_marker())
+            if adopted:
+                return adopted
+        return self._adopted_progress_comment_url
+
+    def _roadmap_section_required(self, next_issue_url: str | None) -> bool:
+        """Whether this entry writes the roadmap section: a batch is due, or the
+        EPIC is reported complete while merges are uncounted."""
+        state = self._require_state()
+        return state.merged_since_epic_update > 0 and (
+            self._roadmap_update_due(state) or next_issue_url is None
+        )
+
+    def _roadmap_requirement_reason(self) -> str:
+        state = self._require_state()
+        pending = state.merged_since_epic_update
+        if self._roadmap_update_due(state):
+            return (
+                f"{pending} merge(s) since the last update, workflow.epic_update_every = "
+                f"{self.config.workflow.epic_update_every}"
+            )
+        return f"the EPIC is reported complete with {pending} merge(s) since the last update"
+
+    def _check_update_epic_result(
+        self, payload: dict, request: UpdateEpicRequest
+    ) -> UpdateEpicResult:
+        """The controller's half of the UPDATE_EPIC schema, before any effect.
+
+        The parser validates each field; this adds what only the controller
+        knows: whether a roadmap section is required now, and whether the
+        progress comment as it would be posted (the text, a blank line, the
+        marker) is publishable as a whole (D8.3). Either refusal is a
+        :class:`ControlResultValidationError`, so it takes the correction
+        path with nothing posted.
+        """
+        res = UpdateEpicResult.from_payload(payload, request)
+        selection = res.next_issue_url
+        if request == UpdateEpicRequest.ROADMAP:
+            context = self._update_epic_context()
+            selection = context.next_issue_url if context is not None else None
+        if res.roadmap_section is None and self._roadmap_section_required(selection):
+            raise ControlResultValidationError(
+                "CONTROL_RESULT for UPDATE_EPIC missing required field 'roadmap_section' "
+                f"({self._roadmap_requirement_reason()}); the controller writes it into the "
+                "EPIC body between the roadmap markers. Nothing was posted."
+            )
+        if res.progress is not None:
+            problem = published_payload_problem(
+                "progress comment", progress_comment_body(res.progress, self._progress_marker())
+            )
+            if problem:
+                raise ControlResultValidationError(problem)
+        return res
+
+    def _section_digests(self, section: str | None) -> tuple[str | None, str | None]:
+        """D4.6: the outside-markers digests of the body read before the launch,
+        as read and as the splice of ``section`` leaves it."""
+        if section is None:
+            return None, None
+        entry = self._epic_roadmap_at_entry
+        if entry is None:
+            raise StateError("UPDATE_EPIC result applied without the entry's EPIC body read")
+        spliced = split_roadmap(splice_roadmap(entry.body, section))
+        return sha256_text(entry.outside), sha256_text(spliced.outside)
+
+    def _save_update_epic_context(
+        self, context: UpdateEpicContext, records: list[EffectRecord] | None = None
+    ) -> None:
+        """Validate and persist the context (and a new plan) in one save (D3.1)."""
+        state = self._require_state()
+        if records is not None:
+            state.effect_records = [r.to_dict() for r in records]
+        state.completion_context = context.to_dict()
+        # Strictly validated exactly as a later load will validate it: a
+        # value that fails is never written.
+        state.phase_effects()
+        self._save()
+
+    def _apply_update_epic(self, payload: dict) -> tuple[Phase, str]:
+        """Plan, publish and complete UPDATE_EPIC from the agent's result.
+
+        A ``FULL`` result plans the progress comment (K8) and saves it with
+        the completion context in one save, after a precondition read finds
+        the EPIC exactly as the entry observed it (no comment carries the
+        marker; anything else is unexplained and blocks, §2.9). A re-request
+        result replaces only the input a rejection voided (D4.7), and a
+        legacy adoption saves the context with no record (D13.7). Then
+        :meth:`_complete_update_epic` does the rest from what was saved, as a
+        later entry would.
+        """
+        state = self._require_state()
+        request = self._update_epic_request()
+        res = self._check_update_epic_result(payload, request)
+        context = self._update_epic_context()
+        if request == UpdateEpicRequest.FULL:
+            return self._plan_progress_comment(res)
+        if context is not None:
+            return self._apply_re_request(context, res, request)
+        if self._adopted_progress_comment_url:
+            return self._adopt_legacy_progress(res)
+        raise StateError(
+            f"an UPDATE_EPIC {request.value} result arrived for issue "
+            f"{state.current_issue_url} with no published progress comment to complete"
+        )
+
+    def _precondition_holder(self) -> tuple[str | None, str]:
+        """Re-read the EPIC's progress comments: (the one holder's URL, block text)."""
+        state = self._require_state()
         try:
-            self._progress_comments().exactly_one()
+            holder = self._progress_comments().at_most_one()
         except GitHubUnavailableError:
             raise
         except (GitHubError, ClaimConflictError) as exc:
-            raise VerificationError(
-                f"{exc}; the marker "
-                f"{render_progress_marker(state.current_issue_url, state.current_pr_url)!r} "
-                "identifies the issue's one progress comment on the EPIC"
-            ) from exc
+            return None, (
+                f"the progress comments of EPIC {state.epic_url} could not be read "
+                f"unambiguously before posting: {exc}. Nothing was posted"
+            )
+        return (holder.obj.url if holder is not None else None), ""
 
-    def _apply_update_epic(self, res: UpdateEpicResult) -> tuple[Phase, str]:
-        """Switch issues only after the agent's selection verified on GitHub.
+    def _plan_progress_comment(self, res: UpdateEpicResult) -> tuple[Phase, str]:
+        state = self._require_state()
+        assert res.progress is not None
+        url, problem = self._precondition_holder()
+        if problem:
+            return Phase.BLOCKED, problem
+        if url is not None:
+            return Phase.BLOCKED, self._unjournaled_progress_text(url)
+        section = (
+            res.roadmap_section if self._roadmap_section_required(res.next_issue_url) else None
+        )
+        entry_digest, spliced_digest = self._section_digests(section)
+        context = UpdateEpicContext(
+            issue_url=state.current_issue_url,
+            pr_url=state.current_pr_url,
+            roadmap_section=section,
+            next_issue_url=res.next_issue_url,
+            entry_outside_sha256=entry_digest,
+            spliced_outside_sha256=spliced_digest,
+        )
+        epic = parse_issue_url(state.epic_url).canonical
+        marker = self._progress_marker()
+        record = EffectRecord.plan(
+            0,
+            EffectKind.PROGRESS_COMMENT,
+            EffectOwner(
+                run_id=state.run_id,
+                phase=Phase.UPDATE_EPIC,
+                issue_url=state.current_issue_url,
+                pr_url=state.current_pr_url,
+                transaction_id="",
+            ),
+            identity={"epic_url": epic, "marker": marker},
+            target={"epic_url": epic},
+            precondition={"absent": True},
+            payload={"body": progress_comment_body(res.progress, marker)},
+        )
+        self._save_update_epic_context(context, [record])
+        return self._complete_update_epic()
 
-        ``next_issue_url`` is a claim from untrusted output (a PR comment can
-        say "next issue is https://github.com/other/repo/issues/1"). It gets
-        the INITIALIZING checks (:meth:`_verify_issue_selectable`) before
-        ``reset_for_new_issue``. The current issue only changes on a verified
-        selection; the merge counter only on a read-back roadmap write
-        (:meth:`_apply_roadmap_section`, which runs first, so a rejected
-        selection after a verified write leaves a closed batch behind and the
-        re-ask does not write the roadmap again). Otherwise, by cause:
+    def _apply_re_request(
+        self, context: UpdateEpicContext, res: UpdateEpicResult, request: UpdateEpicRequest
+    ) -> tuple[Phase, str]:
+        """D4.7: replace the voided input(s) of the saved context, nothing else."""
+        selection = context.next_issue_url
+        section = context.roadmap_section
+        digests = (context.entry_outside_sha256, context.spliced_outside_sha256)
+        if request != UpdateEpicRequest.ROADMAP:
+            selection = res.next_issue_url
+        if request == UpdateEpicRequest.ROADMAP or (
+            request == UpdateEpicRequest.SELECTION_WITH_ROADMAP
+            and self._roadmap_section_required(selection)
+        ):
+            # The section is composed against the body read before this
+            # launch, so its digests are taken from that read.
+            section = res.roadmap_section
+            digests = self._section_digests(section)
+        elif request == UpdateEpicRequest.SELECTION_WITH_ROADMAP:
+            section, digests = None, (None, None)
+        updated = replace(
+            context,
+            roadmap_section=section,
+            next_issue_url=selection,
+            entry_outside_sha256=digests[0],
+            spliced_outside_sha256=digests[1],
+            selection_void=False,
+            section_void=False,
+        )
+        self._save_update_epic_context(updated)
+        return self._complete_update_epic()
 
-        - the selection itself is unusable (VerificationError: wrong repository,
-          the EPIC, the finished issue, no such issue, not OPEN) or GitHub was
-          *unavailable* while checking it (GitHubUnavailableError): the
-          rejection is persisted and raised as VerificationError so ``resume``
-          asks the agent once more (with the reason in its prompt); reaching
-          ``MAX_NEXT_ISSUE_SELECTIONS`` rejections returns BLOCKED;
-        - any other GitHubError (authentication, permissions, malformed data)
-          is conclusive: asking the agent again could not verify anything
-          either, so the run is BLOCKED immediately without another invocation.
+    def _adopt_legacy_progress(self, res: UpdateEpicResult) -> tuple[Phase, str]:
+        """D13.7: complete around the one legacy progress comment, with no record."""
+        state = self._require_state()
+        adopted = self._adopted_progress_comment_url
+        url, problem = self._precondition_holder()
+        if problem:
+            return Phase.BLOCKED, problem
+        if url != adopted:
+            return Phase.BLOCKED, (
+                f"the progress comment {adopted} adopted for issue {state.current_issue_url} "
+                f"is no longer the one comment carrying its marker on EPIC {state.epic_url} "
+                f"(found: {url or 'none'}). Nothing was posted; inspect the EPIC's comments, "
+                "then 'unblock'"
+            )
+        section = (
+            res.roadmap_section if self._roadmap_section_required(res.next_issue_url) else None
+        )
+        entry_digest, spliced_digest = self._section_digests(section)
+        context = UpdateEpicContext(
+            issue_url=state.current_issue_url,
+            pr_url=state.current_pr_url,
+            roadmap_section=section,
+            next_issue_url=res.next_issue_url,
+            entry_outside_sha256=entry_digest,
+            spliced_outside_sha256=spliced_digest,
+        )
+        self._save_update_epic_context(context)
+        return self._complete_update_epic()
 
-        Before any of that, the progress comment the phase exists to post is
-        read back from the EPIC (:meth:`_verify_progress_comment`), and the
-        roadmap section is written by the controller when one is due
-        (:meth:`_apply_roadmap_section`); the merge counter is reset there,
-        after the write is read back, and nowhere else.
+    def _persist_effect(self, record: EffectRecord) -> None:
+        """D4.1: each stage change of a record is durable before the next step."""
+        state = self._require_state()
+        state.effect_records[record.position] = record.to_dict()
+        self._save()
+
+    def _drive_progress_records(self) -> str:
+        """Reconcile, and issue at most once, every pending record; "" or a block reason.
+
+        A conflict names the object and stops the phase. An unavailable
+        GitHub, or a write whose outcome is not readable yet
+        (:class:`EffectPending`), propagates with the record left as
+        persisted: the next entry reconciles it before anything is sent.
         """
         state = self._require_state()
-        self._verify_progress_comment()
+        for record in state.phase_effects().records:
+            if record.stage == Stage.CONFLICT:
+                return self._effect_conflict_text(record)
+            if not record.pending:
+                continue
+            try:
+                driven = drive(record, ProgressCommentOp(self.github), self._persist_effect)
+            except GitHubUnavailableError:
+                raise
+            except GitHubError as exc:
+                return (
+                    f"{record.describe()} could not be reconciled with GitHub: {exc}. This is "
+                    "not a transient failure (authentication, permissions, or malformed data); "
+                    "nothing was sent again. Fix the cause, then 'unblock'"
+                )
+            if driven.record.stage == Stage.CONFLICT:
+                return self._effect_conflict_text(driven.record)
+        return ""
+
+    def _effect_conflict_text(self, record: EffectRecord) -> str:
+        state = self._require_state()
+        return (
+            f"{record.reason}. The controller never repairs, duplicates or chooses between "
+            f"such objects; the run stays on issue {state.current_issue_url}, nothing was "
+            "switched. Inspect the EPIC, remove the object(s) named above that the "
+            "controller did not post, then 'unblock': the record is reconciled again within "
+            "its attempt bound"
+        )
+
+    def _complete_update_epic(self) -> tuple[Phase, str]:
+        """Finish UPDATE_EPIC from the persisted context: publish, splice, select.
+
+        The same code for the step that saved the context and for every
+        later entry (journal first, §2.10): the K8 record is reconciled and
+        issued at most once; the roadmap section is spliced when one is
+        stored and merges are pending, and the merge counter is reset only
+        after the read-back; then the selection is verified before the issue
+        switches. A rejected input is voided in the context and raised for
+        'resume' to re-request (D4.7); a conclusive GitHub failure blocks.
+        """
+        state = self._require_state()
+        reason = self._drive_progress_records()
+        if reason:
+            return Phase.BLOCKED, reason
+        context = self._update_epic_context()
+        if context is None or context.void:
+            raise StateError("UPDATE_EPIC completion reached without a complete context")
+        published = self._published_progress_comment_url()
         try:
-            roadmap_note = self._apply_roadmap_section(res)
+            roadmap_note = self._splice_roadmap_section(context)
         except GitHubUnavailableError:
             raise
         except (GitHubError, RoadmapError) as exc:
@@ -6992,120 +7545,110 @@ class ControllerEngine:
                 f"issue {state.current_issue_url}. Inspect the EPIC body, fix the cause, "
                 "then 'resume'."
             )
-        if res.next_issue_url is None:
+        done = f"progress comment {published} on the EPIC; {roadmap_note}"
+        selection = context.next_issue_url
+        if selection is None:
             state.next_issue_rejections = []
             nxt = self._next_phase(Phase.UPDATE_EPIC, {"next_issue_url": None})
-            return nxt, f"{roadmap_note}; UPDATE_EPIC -> {nxt.value}"
+            return nxt, f"{done}; UPDATE_EPIC -> {nxt.value}"
         try:
-            issue = self._verify_issue_selectable(res.next_issue_url, switching=True)
+            issue = self._verify_issue_selectable(selection, switching=True)
         except VerificationError as exc:
+            self._void_selection(context)
             return self._reject_next_issue(str(exc), cause=exc)
         except GitHubUnavailableError as exc:
+            self._void_selection(context)
             return self._reject_next_issue(
-                f"next issue {res.next_issue_url} could not be verified "
-                f"(GitHub unavailable: {exc})",
+                f"next issue {selection} could not be verified (GitHub unavailable: {exc})",
                 cause=exc,
             )
         except GitHubError as exc:
             return Phase.BLOCKED, (
-                f"next issue {res.next_issue_url} could not be verified on GitHub: {exc}. "
-                "This is not a transient GitHub failure (authentication, permissions, or "
-                "malformed data), so asking the agent to select again would not help; the "
-                f"run stays on issue {state.current_issue_url}, nothing was switched. "
-                "Fix the cause, then 'resume'."
+                f"next issue {selection} could not be verified on GitHub: {exc}. This is not "
+                "a transient GitHub failure (authentication, permissions, or malformed data), "
+                "so asking the agent to select again would not help; the run stays on issue "
+                f"{state.current_issue_url}, nothing was switched. Fix the cause, then "
+                "'resume'."
             )
-        state.reset_for_new_issue(parse_issue_url(res.next_issue_url).canonical)
-        nxt = self._next_phase(Phase.UPDATE_EPIC, {"next_issue_url": res.next_issue_url})
+        state.reset_for_new_issue(parse_issue_url(selection).canonical)
+        nxt = self._next_phase(Phase.UPDATE_EPIC, {"next_issue_url": selection})
         return nxt, (
-            f"{roadmap_note}; verified next issue #{issue.number} ({issue.state}); "
+            f"{done}; verified next issue #{issue.number} ({issue.state}); "
             f"UPDATE_EPIC -> {nxt.value}"
         )
 
-    def _apply_roadmap_section(self, res: UpdateEpicResult) -> str:
-        """Write the EPIC's managed roadmap section when one is due; reset the
-        merge counter only once the write has been read back.
+    def _void_selection(self, context: UpdateEpicContext) -> None:
+        """D4.7: the rejected selection leaves the context; the rest stays published."""
+        state = self._require_state()
+        voided = replace(context, next_issue_url=None, selection_void=True)
+        state.completion_context = voided.to_dict()
 
-        The controller owns the whole edit (#13, #4): it decides whether an
-        update is due (``workflow.epic_update_every``, or the EPIC being
-        reported complete while merges are uncounted), splices the agent's
-        section between the roadmap markers of the body it just read, writes
-        the body with ``gh issue edit --body-file``, reads it back, and
-        requires every byte outside the markers identical to the body it
-        read before writing and the section identical to what it wrote. The
-        agent never touches the body; a section it returns when none is due
-        is ignored, and a body that changed outside the markers while the
-        agent ran is not written over (the agent composed against a stale
-        view; ``resume`` re-reads it).
+    def _void_section(self, context: UpdateEpicContext, when: str) -> NoReturn:
+        """D4.6: an outside edit voids the stored section; persist, then re-request it."""
+        state = self._require_state()
+        voided = replace(
+            context,
+            roadmap_section=None,
+            entry_outside_sha256=None,
+            spliced_outside_sha256=None,
+            section_void=True,
+        )
+        state.completion_context = voided.to_dict()
+        self._save()
+        raise VerificationError(
+            f"the body of EPIC {state.epic_url} changed outside the roadmap markers {when} "
+            "(a human may edit the EPIC at any time). The controller did not write over it; "
+            "the progress comment stays published and the merge counter was not reset. "
+            "'resume' re-reads the body and asks the agent for the roadmap section only."
+        )
 
-        Idempotent across a crash between the write and the state save: the
-        re-entry reads a body that already carries the section, and a section
-        equal to the current one is not written again; a different one
-        replaces it in place, never appends a second block. A failure of the
-        agent's part (no section, a body that moved under it, a read-back
-        that does not match) is a VerificationError: no counter reset,
-        ``resume`` asks the agent again. GitHub being unavailable propagates
-        (transient); a conclusive GitHub failure or a body whose markers can
-        no longer be read is left to the caller to block on.
+    def _splice_roadmap_section(self, context: UpdateEpicContext) -> str:
+        """Write the stored roadmap section into the EPIC body; reset the merge
+        counter only once the write has been read back (D4.6).
+
+        The controller owns the whole edit: it splices the section between
+        the roadmap markers of the body it reads now, writes the body, reads
+        it back, and requires the section to be the one written. The bytes
+        outside the markers must equal one of the two digests the context
+        stored: the body the agent composed against, or that body with the
+        section appended. Anything else is an outside edit: the section is
+        voided and re-requested, never written over the edit. A body that
+        already carries the section is not written again, so a crash after
+        the write costs no second body write; a read-back that shows another
+        section is a VerificationError, and 'resume' splices the stored
+        section again. GitHub being unavailable propagates (transient); a
+        conclusive failure or unreadable markers are the caller's to block on.
         """
         state = self._require_state()
         pending = state.merged_since_epic_update
-        due = self._roadmap_update_due(state)
-        required = pending > 0 and (due or res.next_issue_url is None)
-        if not required:
-            ignored = "; the returned roadmap_section was ignored" if res.roadmap_section else ""
+        section = context.roadmap_section
+        if section is None or pending == 0:
             return (
                 f"roadmap update not due ({pending} merge(s) since the last update, "
                 f"workflow.epic_update_every = {self.config.workflow.epic_update_every}); "
-                f"EPIC body not written, merge counter kept{ignored}"
+                "EPIC body not written, merge counter kept"
             )
-        why = (
-            f"{pending} merge(s) since the last update, workflow.epic_update_every = "
-            f"{self.config.workflow.epic_update_every}"
-            if due
-            else f"the EPIC is reported complete with {pending} merge(s) since the last update"
-        )
-        if res.roadmap_section is None:
-            raise VerificationError(
-                f"UPDATE_EPIC must return 'roadmap_section' ({why}); the controller writes "
-                "it into the EPIC body between the roadmap markers. The merge counter was "
-                "not reset — 'resume' to let the agent return the section."
-            )
-        entry = self._epic_roadmap_at_entry
-        if entry is None:
-            raise StateError("UPDATE_EPIC result applied without the entry's EPIC body read")
+        why = self._roadmap_requirement_reason()
+        known = {context.entry_outside_sha256, context.spliced_outside_sha256}
         before = self._read_epic_roadmap()
-        if before.outside != entry.outside:
-            raise VerificationError(
-                f"the body of EPIC {state.epic_url} changed outside the roadmap markers while "
-                "the agent ran (the agent may only post a comment; a human may edit the "
-                "EPIC at any time). Not writing over it; the merge counter was not reset — "
-                "'resume' re-reads the body and asks the agent again."
-            )
-        new_body = splice_roadmap(before.body, res.roadmap_section)
+        if sha256_text(before.outside) not in known:
+            self._void_section(context, "since the agent composed the section")
+        new_body = splice_roadmap(before.body, section)
         if new_body == before.body:
             state.record_epic_update()
             return (
                 f"roadmap update due ({why}); the EPIC body already carries this section "
                 "(no write needed); merge counter reset"
             )
-        expected = split_roadmap(new_body)
         self.github.edit_issue_body(state.epic_url, new_body)
         after = self._read_epic_roadmap()
-        # Outside the markers the written body is the read body plus, when
-        # the section was appended, the two marker lines; nothing else.
-        if after.outside != expected.outside:
-            raise VerificationError(
-                f"after writing the roadmap section, the body of EPIC {state.epic_url} "
-                "differs outside the roadmap markers from the body read before the write. "
-                "The controller changes nothing outside the markers, so the EPIC was edited "
-                "concurrently; the merge counter was not reset — inspect the EPIC body, "
-                "then 'resume'."
-            )
-        if after.section != res.roadmap_section:
+        if sha256_text(after.outside) not in known:
+            self._void_section(context, "while the section was written")
+        if after.section != section:
             raise VerificationError(
                 f"after writing the roadmap section, EPIC {state.epic_url} does not carry "
                 "the section that was written (read back from GitHub); the merge counter "
-                "was not reset — 'resume' to write it again."
+                "was not reset — 'resume' writes the stored section again."
             )
         state.record_epic_update()
         action = "replaced" if before.section is not None else "appended"

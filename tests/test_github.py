@@ -14,6 +14,8 @@ from autoforge.errors import (
 )
 from autoforge.executor import ExecutionResult
 from autoforge.github import (
+    MAX_BODY_CHARS,
+    MAX_TITLE_CHARS,
     STRICT_ISSUE_LIST_LIMIT,
     STRICT_PR_LIST_LIMIT,
     ActionsRunRef,
@@ -1972,3 +1974,604 @@ def test_a_comment_row_identity_is_its_url_and_its_author_may_be_absent():
     (c,) = gh.get_pr_comments("https://github.com/o/r/pull/42")
     assert c.id == 5 and c.url == "https://github.com/O/R/pull/42#issuecomment-5"
     assert c.author == "" and c.parent_url == "https://github.com/o/r/pull/42"
+
+
+# -- typed effect writes (ADR 0004 D12.2) ----------------------------------------
+
+_W_ISSUE = "https://github.com/o/r/issues/2"
+_W_PR = "https://github.com/o/r/pull/42"
+# A body that would be dangerous in argv: a newline, an option-looking line, a quote.
+_W_BODY = "BODY-SENTINEL line one\n--jq .token\n'quoted'"
+_W_TITLE = "TITLE-SENTINEL follow-up"
+
+# name -> (call, method, path, the payload on stdin, a good reply, the typed result)
+_WRITES = {
+    "create_issue_comment": (
+        lambda gh, body: gh.create_issue_comment(_W_ISSUE, body),
+        "POST",
+        "repos/o/r/issues/2/comments",
+        {"body": _W_BODY},
+        {"id": 950001, "html_url": f"{_W_ISSUE}#issuecomment-950001", "body": _W_BODY},
+        ("https://github.com/o/r/issues/2#issuecomment-950001", None),
+    ),
+    "create_pr_comment": (
+        lambda gh, body: gh.create_pr_comment(_W_PR, body),
+        "POST",
+        "repos/o/r/issues/42/comments",
+        {"body": _W_BODY},
+        {"id": 950002, "html_url": f"{_W_PR}#issuecomment-950002"},
+        ("https://github.com/o/r/pull/42#issuecomment-950002", None),
+    ),
+    "create_pull_request": (
+        lambda gh, body: gh.create_pull_request(
+            "o/r", base="main", head="autoforge/2-feature", title=_W_TITLE, body=body
+        ),
+        "POST",
+        "repos/o/r/pulls",
+        {"title": _W_TITLE, "head": "autoforge/2-feature", "base": "main", "body": _W_BODY},
+        {"number": 43, "html_url": "https://github.com/o/r/pull/43"},
+        ("https://github.com/o/r/pull/43", 43),
+    ),
+    "write_pr_body": (
+        lambda gh, body: gh.write_pr_body(_W_PR, body),
+        "PATCH",
+        "repos/o/r/pulls/42",
+        {"body": _W_BODY},
+        {"number": 42, "html_url": _W_PR},
+        None,
+    ),
+    "create_issue": (
+        lambda gh, body: gh.create_issue("o/r", title=_W_TITLE, body=body),
+        "POST",
+        "repos/o/r/issues",
+        {"title": _W_TITLE, "body": _W_BODY},
+        {"number": 7, "html_url": "https://github.com/o/r/issues/7"},
+        ("https://github.com/o/r/issues/7", 7),
+    ),
+    "write_issue_body": (
+        lambda gh, body: gh.write_issue_body(_W_ISSUE, body),
+        "PATCH",
+        "repos/o/r/issues/2",
+        {"body": _W_BODY},
+        {"number": 2, "html_url": _W_ISSUE},
+        None,
+    ),
+}
+
+
+def _raw(stdout: str, exit_code: int = 0, stderr: str = "") -> ExecutionResult:
+    """A `gh` reply printed as-is (``--jq`` prints a string result unquoted)."""
+    return replace(_res(None, exit_code=exit_code, stderr=stderr), stdout=stdout)
+
+
+def _recording(reply_for):
+    seen = []
+
+    def handler(req):
+        seen.append(req)
+        return reply_for(req)
+
+    return seen, GitHubClient(runner=handler, retry_delay_seconds=0)
+
+
+@pytest.mark.parametrize("name", list(_WRITES))
+def test_write_sends_its_payload_on_stdin_to_the_named_repository(name):
+    call, method, path, payload, reply, result = _WRITES[name]
+    seen, gh = _recording(lambda req: _res(reply))
+    created = call(gh, _W_BODY)
+    (req,) = seen
+    assert req.command == ["gh", "api", "--method", method, path, "--input", "-"]
+    assert json.loads(req.stdin_data.decode("utf-8")) == payload
+    for arg in req.command:
+        assert "SENTINEL" not in arg
+    if result is None:
+        assert created is None
+    else:
+        assert (created.url, created.number) == result
+
+
+_TRANSIENT_WRITE_FAILURES = {
+    "http-502": lambda: _res({}, exit_code=1, stderr="HTTP 502: Bad Gateway"),
+    "connect": lambda: _res({}, exit_code=1, stderr="error connecting to api.github.com: timeout"),
+    "timeout": lambda: replace(_res({}, exit_code=-9), timed_out=True),
+}
+
+
+@pytest.mark.parametrize("failure", list(_TRANSIENT_WRITE_FAILURES))
+@pytest.mark.parametrize("name", list(_WRITES))
+def test_write_is_never_retried_on_an_ambiguous_failure(name, failure):
+    """D4.3: the first attempt may have landed, so a write is issued once and an
+    ambiguous outcome is GitHubUnavailableError; a read with the same failure is
+    retried."""
+    seen, gh = _recording(lambda req: _TRANSIENT_WRITE_FAILURES[failure]())
+    with pytest.raises(GitHubUnavailableError, match="outcome is unknown") as info:
+        _WRITES[name][0](gh, _W_BODY)
+    assert len(seen) == 1
+    assert "SENTINEL" not in str(info.value)
+
+    seen.clear()
+    with pytest.raises(GitHubUnavailableError):
+        gh.get_pr(_W_PR)
+    assert len(seen) == 2  # the read keeps its retry
+
+
+@pytest.mark.parametrize("name", list(_WRITES))
+def test_write_refused_with_422_is_a_plain_github_error(name):
+    stderr = "gh: Validation Failed (HTTP 422)"
+    seen, gh = _recording(lambda req: _res({}, exit_code=1, stderr=stderr))
+    with pytest.raises(GitHubError) as info:
+        _WRITES[name][0](gh, _W_BODY)
+    assert not isinstance(info.value, (GitHubUnavailableError, GitHubNotFoundError))
+    assert len(seen) == 1
+
+
+@pytest.mark.parametrize("name", list(_WRITES))
+def test_write_to_a_missing_object_is_not_found(name):
+    seen, gh = _recording(lambda req: _res({}, exit_code=1, stderr="gh: Not Found (HTTP 404)"))
+    with pytest.raises(GitHubNotFoundError):
+        _WRITES[name][0](gh, _W_BODY)
+    assert len(seen) == 1
+
+
+def test_write_failure_text_is_redacted_and_omits_the_payload():
+    stderr = f"HTTP 502: Bad Gateway (Authorization: token {_SECRET})"
+    seen, gh = _recording(lambda req: _res({}, exit_code=1, stderr=stderr))
+    with pytest.raises(GitHubUnavailableError) as info:
+        gh.create_issue_comment(_W_ISSUE, _W_BODY)
+    text = str(info.value)
+    assert _SECRET not in text and "***REDACTED***" in text
+    assert "SENTINEL" not in text
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        "",
+        "not json",
+        json.dumps([{"number": 7}]),
+        json.dumps({"message": "ok"}),
+        json.dumps({"number": 7, "html_url": 7}),
+    ],
+    ids=["empty", "not-json", "array", "no-url", "int-url"],
+)
+@pytest.mark.parametrize("name", list(_WRITES))
+def test_write_with_an_unparsable_reply_has_an_unknown_outcome(name, stdout):
+    seen, gh = _recording(lambda req: _raw(stdout))
+    with pytest.raises(GitHubUnavailableError, match="outcome is unknown") as info:
+        _WRITES[name][0](gh, _W_BODY)
+    assert len(seen) == 1
+    assert "SENTINEL" not in str(info.value)
+
+
+@pytest.mark.parametrize(
+    ("name", "reply"),
+    [
+        # A comment on another issue, or whose id is not the one its URL names.
+        (
+            "create_issue_comment",
+            {"id": 9, "html_url": "https://github.com/o/r/issues/3#issuecomment-9"},
+        ),
+        ("create_issue_comment", {"id": 8, "html_url": f"{_W_ISSUE}#issuecomment-9"}),
+        (
+            "create_pr_comment",
+            {"id": 9, "html_url": "https://github.com/o/x/pull/42#issuecomment-9"},
+        ),
+        # A PR where an issue was asked for, another repository, another number.
+        ("create_issue", {"number": 7, "html_url": "https://github.com/o/r/pull/7"}),
+        ("create_issue", {"number": 7, "html_url": "https://github.com/o/x/issues/7"}),
+        ("create_pull_request", {"number": 43, "html_url": "https://github.com/o/r/issues/43"}),
+        ("create_pull_request", {"number": 44, "html_url": "https://github.com/o/r/pull/43"}),
+        ("write_pr_body", {"number": 41, "html_url": "https://github.com/o/r/pull/41"}),
+        ("write_issue_body", {"number": 3, "html_url": "https://github.com/o/r/issues/3"}),
+    ],
+)
+def test_write_reply_naming_another_object_has_an_unknown_outcome(name, reply):
+    seen, gh = _recording(lambda req: _res(reply))
+    with pytest.raises(GitHubUnavailableError, match="outcome is unknown"):
+        _WRITES[name][0](gh, _W_BODY)
+    assert len(seen) == 1
+
+
+def test_write_reply_spelling_the_repository_differently_is_the_same_object():
+    seen, gh = _recording(
+        lambda req: _res({"id": 5, "html_url": "https://github.com/O/R/issues/2#issuecomment-5"})
+    )
+    created = gh.create_issue_comment(_W_ISSUE, "hi")
+    assert created.url == "https://github.com/O/R/issues/2#issuecomment-5"
+
+
+@pytest.mark.parametrize("name", list(_WRITES))
+def test_write_with_a_truncated_reply_has_an_unknown_outcome(name):
+    """Unlike a read, a write `gh` accepted is not refused for an unreadable reply."""
+    reply = _WRITES[name][4]
+    seen, gh = _recording(lambda req: replace(_res(reply), stdout_truncated=True))
+    with pytest.raises(GitHubUnavailableError, match="truncated"):
+        _WRITES[name][0](gh, _W_BODY)
+    assert len(seen) == 1
+
+
+@pytest.mark.parametrize("name", list(_WRITES))
+def test_write_bounds_refuse_an_oversize_body_before_any_process(name):
+    call, *_, reply, _result = _WRITES[name]
+    seen, gh = _recording(lambda req: _res(reply))
+    with pytest.raises(GitHubError, match="65536") as info:
+        call(gh, "x" * (MAX_BODY_CHARS + 1))
+    assert not isinstance(info.value, GitHubUnavailableError)
+    assert seen == []
+    call(gh, "é" * MAX_BODY_CHARS)  # the bound counts characters, not bytes
+    assert len(seen) == 1
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda gh, title: gh.create_issue("o/r", title=title, body="b"),
+        lambda gh, title: gh.create_pull_request(
+            "o/r", base="main", head="autoforge/2-feature", title=title, body="b"
+        ),
+    ],
+    ids=["create_issue", "create_pull_request"],
+)
+def test_write_bounds_refuse_an_oversize_title_before_any_process(call):
+    seen, gh = _recording(lambda req: _res({}))
+    with pytest.raises(GitHubError, match="256"):
+        call(gh, "t" * (MAX_TITLE_CHARS + 1))
+    assert seen == []
+
+
+@pytest.mark.parametrize(
+    ("base", "head"),
+    [("main", "fork-owner:feature"), ("main", ""), ("", "feature"), ("main", 5)],
+)
+def test_create_pull_request_refuses_a_head_outside_the_repository(base, head):
+    seen, gh = _recording(lambda req: _res({}))
+    with pytest.raises(GitHubError, match="not a branch name"):
+        gh.create_pull_request("o/r", base=base, head=head, title="t", body="b")
+    assert seen == []
+
+
+@pytest.mark.parametrize("repository", ["o", "o/r/x", "../r", "o/..", "{owner}/{repo}", "o/r?x=1"])
+def test_writes_and_reads_refuse_a_repository_that_is_not_owner_repo(repository):
+    seen, gh = _recording(lambda req: _res({}))
+    with pytest.raises(GitHubError, match="owner/repo"):
+        gh.create_issue(repository, title="t", body="b")
+    with pytest.raises(GitHubError, match="owner/repo"):
+        gh.list_prs_for_head(repository, "feature")
+    assert seen == []
+
+
+# -- effect identity reads (ADR 0004 D4.5, D7.5) ---------------------------------
+
+_BASE = "a" * 40
+_COMMIT = "b" * 40
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [("behind", True), ("identical", True), ("ahead", False), ("diverged", False)],
+)
+def test_commit_in_history_is_the_compare_status(status, expected):
+    seen, gh = _recording(lambda req: _raw(f"{status}\n"))
+    assert gh.commit_in_history("o/r", _BASE.upper(), _COMMIT) is expected
+    (req,) = seen
+    assert req.command == ["gh", "api", f"repos/o/r/compare/{_BASE}...{_COMMIT}", "--jq", ".status"]
+
+
+def test_commit_in_history_reads_404_as_not_in_history():
+    seen, gh = _recording(lambda req: _res({}, exit_code=1, stderr="gh: Not Found (HTTP 404)"))
+    assert gh.commit_in_history("o/r", _BASE, _COMMIT) is False
+    assert len(seen) == 1  # definitive: not retried
+
+
+@pytest.mark.parametrize("stdout", ["", "unknown\n", '"behind"\n', "null\n"])
+def test_commit_in_history_refuses_an_unknown_status(stdout):
+    gh = _client(lambda req: _raw(stdout))
+    with pytest.raises(GitHubError, match="unknown status") as info:
+        gh.commit_in_history("o/r", _BASE, _COMMIT)
+    assert not isinstance(info.value, GitHubUnavailableError)
+
+
+def test_commit_in_history_is_a_read_that_keeps_its_retry():
+    seen, gh = _recording(lambda req: _res({}, exit_code=1, stderr="HTTP 502: Bad Gateway"))
+    with pytest.raises(GitHubUnavailableError):
+        gh.commit_in_history("o/r", _BASE, _COMMIT)
+    assert len(seen) == 2
+
+
+@pytest.mark.parametrize(
+    ("base", "commit"),
+    [("main", _COMMIT), (_BASE, "b" * 12), (_BASE, "g" * 40), (_BASE, "b" * 41), (_BASE, None)],
+)
+def test_commit_in_history_requires_full_shas_before_any_process(base, commit):
+    seen, gh = _recording(lambda req: _raw("behind\n"))
+    with pytest.raises(GitHubError, match="full commit SHA"):
+        gh.commit_in_history("o/r", base, commit)
+    assert seen == []
+
+
+def test_commit_in_history_accepts_sha256_object_ids():
+    seen, gh = _recording(lambda req: _raw("behind\n"))
+    assert gh.commit_in_history("o/r", "c" * 64, "d" * 64) is True
+
+
+def test_latest_issue_number_is_the_numeric_maximum_over_issues_and_prs():
+    seen, gh = _recording(lambda req: _raw("5\n120\n\n7\n"))
+    assert gh.latest_issue_number("o/r") == 120
+    (req,) = seen
+    assert req.command == [
+        "gh",
+        "api",
+        "--paginate",
+        "repos/o/r/issues?state=all&per_page=100",
+        "--jq",
+        ".[].number",
+    ]
+    assert _client(lambda req: _raw("")).latest_issue_number("o/r") == 0
+
+
+@pytest.mark.parametrize("stdout", ["5\nnull\n", "0\n", "-3\n", "4.5\n", "abc\n"])
+def test_latest_issue_number_refuses_a_malformed_number(stdout):
+    with pytest.raises(GitHubError, match="not a positive integer"):
+        _client(lambda req: _raw(stdout)).latest_issue_number("o/r")
+
+
+def _listing_row(number: int, minute: int, *, pr: bool = False, second: int = 0) -> dict:
+    row = {
+        "number": number,
+        "html_url": f"https://github.com/o/r/issues/{number}",
+        "url": f"https://api.github.com/repos/o/r/issues/{number}",
+        "title": f"issue {number}",
+        "state": "closed" if number % 5 == 0 else "open",
+        "body": None,
+        "created_at": f"2026-01-01T{minute // 60:02d}:{minute % 60:02d}:{second:02d}Z",
+    }
+    if pr:
+        row["html_url"] = f"https://github.com/o/r/pull/{number}"
+        row["pull_request"] = {"url": f"https://api.github.com/repos/o/r/pulls/{number}"}
+    return row
+
+
+def _paged_listing(rows: list[dict]):
+    """A handler serving ``rows`` 100 per page by the endpoint's ``page`` parameter."""
+    from urllib.parse import parse_qs, urlsplit
+
+    def reply(req):
+        query = parse_qs(urlsplit(req.command[-1]).query)
+        page = int(query["page"][0])
+        return _res(rows[(page - 1) * 100 : page * 100])
+
+    return reply
+
+
+def test_list_issues_above_reads_newest_first_and_stops_at_the_watermark():
+    # #300 created last, one per minute; every third number is a PR.
+    rows = [_listing_row(n, n, pr=n % 3 == 0) for n in range(300, 0, -1)]
+    seen, gh = _recording(_paged_listing(rows))
+    issues = gh.list_issues_above("o/r", 150)
+    assert [i.number for i in issues] == [n for n in range(300, 150, -1) if n % 3]
+    assert issues[0].url == "https://github.com/o/r/issues/299"
+    assert {i.state for i in issues} == {"OPEN", "CLOSED"}
+    assert len(seen) == 2  # page 3 lies wholly below the watermark and is never read
+    endpoint = seen[0].command[-1]
+    assert seen[0].command[:2] == ["gh", "api"]
+    assert endpoint.startswith("repos/o/r/issues?")
+    for part in ("state=all", "sort=created", "direction=desc", "per_page=100", "page=1"):
+        assert part in endpoint
+
+
+def test_list_issues_above_reads_on_through_the_watermarks_second():
+    """GitHub orders by creation time to the second: a row above the watermark
+    created in the watermark row's second may come after it, even on the next page."""
+    rows = [_listing_row(n, n) for n in range(400, 301, -1)]  # 99 rows, page 1
+    rows.append(_listing_row(250, 200))  # the watermark row, last on page 1
+    rows.append(_listing_row(251, 200))  # same second, first on page 2
+    rows.append(_listing_row(249, 199))  # older: the walk ends on this page
+    rows.extend(_listing_row(n, 100, second=1) for n in range(248, 140, -1))
+    seen, gh = _recording(_paged_listing(rows))
+    numbers = [i.number for i in gh.list_issues_above("o/r", 250)]
+    assert numbers == [*range(400, 301, -1), 251]
+    assert len(seen) == 2
+
+
+def test_list_issues_above_reads_to_the_end_when_the_watermark_is_not_reached():
+    rows = [_listing_row(n, n) for n in range(130, 0, -1)]
+    seen, gh = _recording(_paged_listing(rows))
+    assert len(gh.list_issues_above("o/r", 0)) == 130
+    assert len(seen) == 2
+    seen, gh = _recording(lambda req: _res([]))
+    assert gh.list_issues_above("o/r", 0) == []
+
+
+def test_list_issues_above_refuses_a_listing_it_cannot_read_down_to_the_watermark(
+    monkeypatch,
+):
+    import autoforge.github as github_module
+
+    monkeypatch.setattr(github_module, "_ISSUE_WALK_MAX_PAGES", 3)
+    rows = [_listing_row(n, n) for n in range(1000, 0, -1)]
+    seen, gh = _recording(_paged_listing(rows))
+    with pytest.raises(GitHubError, match="cannot be read down to the watermark"):
+        gh.list_issues_above("o/r", 10)
+    assert len(seen) == 3
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"created_at": None},
+        {"created_at": "2026-01-01T00:00:00"},  # no time zone
+        {"created_at": "yesterday"},
+        {"number": True},
+        {"number": "7"},
+        {"html_url": "https://github.com/o/x/issues/7"},
+        {"title": 5},
+    ],
+)
+def test_list_issues_above_refuses_a_malformed_row(patch):
+    row = {**_listing_row(7, 7), **patch}
+    gh = _client(lambda req: _res([row]))
+    with pytest.raises(GitHubError) as info:
+        gh.list_issues_above("o/r", 1)
+    assert not isinstance(info.value, GitHubUnavailableError)
+
+
+@pytest.mark.parametrize("watermark", [-1, True, "5", None])
+def test_list_issues_above_refuses_a_watermark_that_is_not_a_number(watermark):
+    seen, gh = _recording(lambda req: _res([]))
+    with pytest.raises(GitHubError, match="watermark"):
+        gh.list_issues_above("o/r", watermark)
+    assert seen == []
+
+
+def _rest_pr(number: int, *, state: str = "open", merged: bool = False, **head) -> dict:
+    head_repo = head.pop("repo", {"name": "r", "owner": {"login": "o"}})
+    return {
+        "number": number,
+        "html_url": f"https://github.com/o/r/pull/{number}",
+        "title": f"PR {number}",
+        "state": state,
+        "merged_at": "2026-01-02T00:00:00Z" if merged else None,
+        "draft": False,
+        "body": "b",
+        "auto_merge": None,
+        "head": {
+            "ref": head.pop("ref", "autoforge/2-feature"),
+            "sha": "ABC" + "0" * 37,
+            "repo": head_repo,
+        },
+        "base": {"ref": "main"},
+    }
+
+
+def test_list_prs_for_head_filters_by_head_and_sees_every_state():
+    rows = [
+        _rest_pr(40, state="closed", merged=True),
+        _rest_pr(41, state="closed"),
+        _rest_pr(42),
+        # Not headed at this repository's branch: a fork, a deleted head
+        # repository, another branch.
+        _rest_pr(43, repo={"name": "r", "owner": {"login": "fork"}}),
+        _rest_pr(44, repo=None),
+        _rest_pr(45, ref="autoforge/2-feature-2"),
+    ]
+    seen, gh = _recording(lambda req: _res([rows[:3], rows[3:]]))
+    prs = gh.list_prs_for_head("o/r", "autoforge/2-feature")
+    assert [(p.number, p.state) for p in prs] == [(42, "OPEN"), (41, "CLOSED"), (40, "MERGED")]
+    pr = prs[0]
+    assert pr.head_sha == "abc" + "0" * 37 and pr.base_ref == "main"
+    assert pr.head_ref == "autoforge/2-feature" and pr.head_repository == "o/r"
+    assert pr.linked_issue_numbers == [] and pr.checks == []
+    (req,) = seen
+    assert req.command[:4] == ["gh", "api", "--paginate", "--slurp"]
+    from urllib.parse import parse_qs, urlsplit
+
+    endpoint = urlsplit(req.command[4])
+    assert endpoint.path == "repos/o/r/pulls"
+    assert parse_qs(endpoint.query) == {
+        "state": ["all"],
+        "head": ["o:autoforge/2-feature"],
+        "per_page": ["100"],
+    }
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        {**_rest_pr(42), "head": None},
+        {**_rest_pr(42), "base": "main"},
+        {**_rest_pr(42), "html_url": "https://github.com/o/r/issues/42"},
+        {**_rest_pr(42), "html_url": "https://github.com/o/x/pull/42"},
+        "not-an-object",
+    ],
+    ids=["no-head", "base-not-object", "issue-url", "other-repo", "non-object"],
+)
+def test_list_prs_for_head_refuses_a_malformed_row(row):
+    gh = _client(lambda req: _res([[row]]))
+    with pytest.raises(GitHubError):
+        gh.list_prs_for_head("o/r", "autoforge/2-feature")
+
+
+@pytest.mark.parametrize("branch", ["", "o:feature", None])
+def test_list_prs_for_head_refuses_a_branch_that_is_not_a_branch_name(branch):
+    seen, gh = _recording(lambda req: _res([]))
+    with pytest.raises(GitHubError, match="not a branch name"):
+        gh.list_prs_for_head("o/r", branch)
+    assert seen == []
+
+
+# -- FakeGitHub's typed effect writes (the in-memory model engine tests use) -----
+
+
+def _fake():
+    from tests.conftest import BRANCH, FakeGitHub
+
+    fake = FakeGitHub()
+    fake.branch_heads[BRANCH] = "a" * 40
+    return fake
+
+
+def test_fake_effect_writes_mutate_the_stores_and_are_recorded():
+    from tests.conftest import BRANCH, ISSUE
+
+    fake = _fake()
+    pr = fake.create_pull_request(
+        "owner/repo", base="main", head=BRANCH, title="Feature", body="Closes #2"
+    )
+    assert pr.url == "https://github.com/owner/repo/pull/3" and pr.number == 3
+    stored = fake.get_pr(pr.url)
+    assert stored.title == "Feature" and stored.linked_issue_numbers == [2]
+    assert stored.head_ref == BRANCH and stored.head_repository == "owner/repo"
+    issue = fake.create_issue("owner/repo", title="Follow-up", body="b")
+    assert issue.number == 4 and fake.get_issue(issue.url).body == "b"
+    comment = fake.create_issue_comment(ISSUE, "progress")
+    assert comment.url.startswith(f"{ISSUE}#issuecomment-95")
+    assert [c.url for c in fake.get_issue_comments(ISSUE)] == [comment.url]
+    fake.write_pr_body(pr.url, "new body")
+    fake.write_issue_body(ISSUE, "issue body")
+    assert fake.get_pr(pr.url).body == "new body" and fake.get_issue(ISSUE).body == "issue body"
+    assert [w[0] for w in fake.effect_writes] == [
+        "create_pull_request",
+        "create_issue",
+        "create_issue_comment",
+        "write_pr_body",
+        "write_issue_body",
+    ]
+    assert fake.effect_writes[2] == ("create_issue_comment", ISSUE, "progress")
+    assert fake.latest_issue_number("owner/repo") == 4
+    assert [i.number for i in fake.list_issues_above("owner/repo", 1)] == [4, 2]
+    assert [p.number for p in fake.list_prs_for_head("owner/repo", BRANCH)] == [3]
+    with pytest.raises(GitHubError, match="already exists"):
+        fake.create_pull_request("owner/repo", base="main", head=BRANCH, title="t", body="b")
+    with pytest.raises(GitHubNotFoundError):
+        fake.create_issue_comment("https://github.com/owner/repo/issues/99", "x")
+    with pytest.raises(GitHubError, match="not found"):
+        fake.create_pr_comment("https://github.com/owner/repo/pull/99", "x")
+    assert fake.create_pr_comment(pr.url, "review").url.startswith(f"{pr.url}#issuecomment-95")
+
+
+@pytest.mark.parametrize("lands", [False, True])
+def test_fake_write_failures_model_a_lost_write_and_a_lost_reply(lands):
+    from tests.conftest import ISSUE
+
+    fake = _fake()
+    error = GitHubUnavailableError("HTTP 502: Bad Gateway; the outcome is unknown")
+    fake.write_failures.append(("create_issue_comment", error, lands))
+    with pytest.raises(GitHubUnavailableError):
+        fake.create_issue_comment(ISSUE, "progress")
+    assert len(fake.get_issue_comments(ISSUE)) == (1 if lands else 0)
+    assert fake.write_failures == [] and len(fake.effect_writes) == 1
+    fake.create_issue_comment(ISSUE, "again")  # the entry was consumed
+    assert len(fake.get_issue_comments(ISSUE)) == (2 if lands else 1)
+
+
+def test_fake_write_bounds_refuse_before_any_attempt_and_history_must_be_set():
+    from tests.conftest import ISSUE
+
+    fake = _fake()
+    with pytest.raises(GitHubError):
+        fake.create_issue_comment(ISSUE, "x" * (MAX_BODY_CHARS + 1))
+    assert fake.effect_writes == []
+    with pytest.raises(AssertionError):
+        fake.commit_in_history("owner/repo", "a" * 40, "b" * 40)
+    fake.history = lambda repository, base, commit: commit == "b" * 40
+    assert fake.commit_in_history("owner/repo", "a" * 40, "B" * 40) is True

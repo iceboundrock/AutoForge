@@ -29,16 +29,31 @@ rewrite before it can show it is refused, not repaired. The same holds for
 the block as a whole
 (``MAX_CONTROL_RESULT_CHARS``): the accepted payload is persisted whole and
 is what the next phase acts on, so its size is checked before it is decoded.
+
+Agent text the controller publishes is held to one content policy (ADR 0004
+D8.2, D8.3, D8.5): no controller marker opener of either prefix, no
+credential-shaped string (refused by the redactor's pattern class, never
+redacted), no closing keyword followed by an issue reference, and no
+``@``-mention outside code. :func:`published_text_problem` judges one field,
+:func:`published_payload_problem` a whole rendered payload and
+:func:`commit_message_problem` a commit message; each names the subject and
+the rule, never the text. An UPDATE_EPIC result is validated against the
+schema of the request that launched the agent (:class:`UpdateEpicRequest`,
+D4.7): a re-request after publication carries only what it asks for.
 """
 
 from __future__ import annotations
 
 import json
 import re
+from collections import deque
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
+from enum import StrEnum
 
 from .errors import ConfigurationError, ControlResultError, ControlResultValidationError
 from .prompts import CONTROL_CHAR_RE, CONTROL_CHARS
+from .redaction import credential_classes
 from .roadmap import ROADMAP_END_MARKER, ROADMAP_START_MARKER
 from .transitions import Phase, WorkflowMode
 from .validation import parse_comment_url, parse_issue_url, parse_pr_url
@@ -131,6 +146,34 @@ MAX_CONTROL_RESULT_CHARS = 1024 * 1024
 # published. GitHub bounds an issue body at 65536 characters; the section
 # leaves the operator's own text room.
 MAX_ROADMAP_SECTION_CHARS = 32768
+# Bound on an UPDATE_EPIC result's ``progress`` text. The controller posts it
+# as the EPIC progress comment and appends its own marker, and the whole
+# comment must stay far under GitHub's 65,536-character comment limit.
+# Rejected, never clipped, like every other published field.
+MAX_PROGRESS_CHARS = 16384
+
+
+class UpdateEpicRequest(StrEnum):
+    """Which UPDATE_EPIC result the controller asked for (ADR 0004 D4.7).
+
+    ``FULL`` is the phase's launch: ``progress`` (required),
+    ``roadmap_section`` (optional) and ``next_issue_url`` (a required key,
+    ``null`` when the EPIC is complete). The others are re-requests after the
+    phase's publication is complete: each asks only for the input a later
+    controller step rejected, and a field outside its schema is refused.
+
+    - ``SELECTION``: ``next_issue_url`` only.
+    - ``SELECTION_WITH_ROADMAP``: ``next_issue_url`` and an optional
+      ``roadmap_section``.
+    - ``ROADMAP``: ``roadmap_section`` only, required and non-blank.
+    """
+
+    FULL = "full"
+    SELECTION = "selection"
+    SELECTION_WITH_ROADMAP = "selection_with_roadmap"
+    ROADMAP = "roadmap"
+
+
 # The opening every controller marker shares: ``<!--``, any whitespace (none
 # included), ``ai-``. ``autoforge.claims`` builds each marker kind's scanner
 # pattern on this expression, and the roadmap-section refusal below matches
@@ -144,6 +187,13 @@ CONTROLLER_MARKER_OPEN_RE = re.compile(r"<!--\s*+ai-")
 # controller later scans and trusts (``autoforge.claims``). The refusal uses
 # the scanner's own opening, so ``<!--ai-`` and ``<!--\nai-`` are refused too.
 _CONTROLLER_MARKER_PREFIX = "<!-- ai-"
+# The opening of every marker the controller writes or later trusts: its own
+# ``<!-- ai-`` claims (:data:`CONTROLLER_MARKER_OPEN_RE`) and the replan
+# transaction's ``<!-- autoforge-`` markers (``autoforge.replan_txn``).
+# Agent text may carry neither (ADR 0004 D8.2). Case-insensitive, unlike the
+# scanner's own opening: a refusal wider than the scanner fails closed.
+# Possessive like it, for the same reason.
+AGENT_MARKER_OPEN_RE = re.compile(r"<!--\s*+(?:ai|autoforge)-", re.IGNORECASE)
 
 
 def extract_last_block(stdout: str) -> str:
@@ -163,7 +213,11 @@ def extract_last_block(stdout: str) -> str:
 
 
 def parse_control_result(
-    stdout: str, expected_phase: Phase, mode: WorkflowMode = WorkflowMode.REMOTE
+    stdout: str,
+    expected_phase: Phase,
+    mode: WorkflowMode = WorkflowMode.REMOTE,
+    *,
+    update_epic_request: UpdateEpicRequest = UpdateEpicRequest.FULL,
 ) -> dict:
     """Extract + JSON-parse + validate the CONTROL_RESULT payload.
 
@@ -171,7 +225,8 @@ def parse_control_result(
     problems and ControlResultValidationError on schema/phase problems.
     ``mode`` selects the per-phase schema: a LOCAL phase reports semantic
     facts (a summary, a workspace fingerprint, finding resolutions) and never
-    a PR URL, a comment URL or a follow-up Issue.
+    a PR URL, a comment URL or a follow-up Issue. ``update_epic_request``
+    selects the UPDATE_EPIC schema (:class:`UpdateEpicRequest`).
     """
     raw = extract_last_block(stdout)
     if len(raw) > MAX_CONTROL_RESULT_CHARS:
@@ -201,7 +256,7 @@ def parse_control_result(
             f"unknown status {payload['status']!r} (expected one of {ALLOWED_STATUSES})"
         )
     if payload["status"] == "success":
-        validate_for_phase(expected_phase, payload, mode)
+        validate_for_phase(expected_phase, payload, mode, update_epic_request=update_epic_request)
     else:
         msg = payload.get("message")
         if not isinstance(msg, str) or not msg.strip():
@@ -320,6 +375,275 @@ def _req_bool(payload: dict, key: str, phase: str) -> bool:
     if not isinstance(v, bool):
         raise ControlResultValidationError(f"{phase}: field {key!r} must be a boolean")
     return v
+
+
+# -- published-content policy (ADR 0004 D8.2, D8.3, D8.5) ------------------
+# Every rule refuses; none rewrites. Where a rule approximates how GitHub
+# reads Markdown, the approximation errs toward refusing: a refusal costs a
+# correction, a miss publishes. A message names the subject and the rule,
+# and at most an index, never the text.
+
+# A closing keyword followed by an issue reference: ``#n``, ``owner/repo#n``,
+# an issue or pull URL, or ``GH-n``. Any case, an optional ``:`` after the
+# keyword. Matched anywhere, code spans included: GitHub's own reading of a
+# commit message has no code spans, and a wider refusal fails closed. Every
+# quantifier is possessive and each candidate starts at a keyword, so a
+# candidate scans only the run that follows its own keyword.
+_REF_NAME = r"[A-Za-z0-9_.-]++"
+_CLOSING_REFERENCE_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)(?::\s*+|\s++)(?:"
+    rf"https?://(?:www\.)?github\.com/(?P<url_repo>{_REF_NAME}/{_REF_NAME})"
+    r"/(?P<url_kind>issues|pull)/(?P<url_number>[0-9]++)"
+    rf"|(?P<repo>{_REF_NAME}/{_REF_NAME})#(?P<repo_number>[0-9]++)"
+    r"|#(?P<number>[0-9]++)"
+    r"|gh-(?P<gh_number>[0-9]++))",
+    re.IGNORECASE,
+)
+# An ``@`` that starts a GitHub mention: not after an ASCII word character
+# (so ``a@b.com`` is an address, not a mention; a non-ASCII letter before
+# the ``@`` counts as punctuation, which fails closed), followed by a name
+# character. ``@org/team`` starts the same way.
+_MENTION_RE = re.compile(r"(?<![A-Za-z0-9_])@[A-Za-z0-9]")
+# Raw HTML (a tag, a comment, an autolink): GitHub reads backticks and fences
+# inside an HTML block or tag as text, so wherever raw HTML sits outside code
+# the code exemption for mentions is not trusted at all.
+_RAW_HTML_RE = re.compile(r"<[A-Za-z/!?]")
+# CommonMark's line endings, and nothing else: ``str.splitlines`` would also
+# break at characters GitHub reads as text, and so find fences GitHub does
+# not.
+_LINE_BREAK_RE = re.compile(r"\r\n|\r|\n")
+# A fence opens at column 0 only. CommonMark allows three spaces of indent,
+# but an indented ``` may sit inside a list item or block quote, where it is
+# not the top-level fence it looks like; at column 0 it is one (or it is in
+# an HTML block, which the raw-HTML rule covers). A backtick fence's info
+# string has no backtick.
+_FENCE_OPEN_RE = re.compile(r"(`{3,}+|~{3,}+)(.*)")
+_FENCE_CLOSE_RE = re.compile(r" {0,3}(`{3,}+|~{3,}+)[ \t]*+\Z")
+_BACKTICK_RUN_RE = re.compile(r"`++")
+
+
+def _lines(text: str) -> Iterator[tuple[int, str]]:
+    """``(offset, line)`` for each line of ``text``, without its line ending."""
+    start = 0
+    for m in _LINE_BREAK_RE.finditer(text):
+        yield start, text[start : m.start()]
+        start = m.end()
+    yield start, text[start:]
+
+
+def _line_code_spans(line: str) -> tuple[list[tuple[int, int]], bool, bool]:
+    """The inline code spans of one line, by CommonMark's backtick matching.
+
+    A run of ``n`` backticks opens a span closed by the next run of exactly
+    ``n``; a run with no such closer is literal. Returns the spans' content
+    ranges, whether every run was paired (``balanced``: nothing can carry
+    into the next line) and whether the spans are ``trusted``. They are not
+    when an opener is escaped (``\\```), which CommonMark reads differently,
+    or a span holds a ``|``, which splits a GFM table cell before code spans
+    are parsed. Linear: the next run of each length is found through a
+    queue per length, each index dequeued once.
+    """
+    runs = [(m.start(), m.end()) for m in _BACKTICK_RUN_RE.finditer(line)]
+    by_length: dict[int, deque[int]] = {}
+    for index, (start, end) in enumerate(runs):
+        by_length.setdefault(end - start, deque()).append(index)
+    spans: list[tuple[int, int]] = []
+    balanced = trusted = True
+    k = 0
+    while k < len(runs):
+        start, end = runs[k]
+        if start and line[start - 1] == "\\":
+            balanced = trusted = False
+        later = by_length[end - start]
+        while later and later[0] <= k:
+            later.popleft()
+        if not later:
+            balanced = False
+            k += 1
+            continue
+        closer = later.popleft()
+        content_end = runs[closer][0]
+        if line.find("|", end, content_end) != -1:
+            trusted = False
+        spans.append((end, content_end))
+        k = closer + 1
+    return spans, balanced, trusted
+
+
+def _code_ranges(text: str) -> list[tuple[int, int]]:
+    """Ascending, disjoint ranges of ``text`` that are certainly code.
+
+    Fenced blocks (``` or ~~~, at least three, closed by the same character
+    at least as long; an unclosed fence runs to the end) and inline code
+    spans. Spans are paired per line, and a line's spans count only when
+    they are trusted and no earlier line of the same paragraph run (lines
+    since the last blank line or fence) left a backtick unpaired: such a
+    backtick may pair across the line break and shift every span after it.
+    A multi-line span is therefore never exempt; it fails closed.
+    """
+    ranges: list[tuple[int, int]] = []
+    fence: tuple[str, int] | None = None
+    carried = False
+    for start, line in _lines(text):
+        if fence is not None:
+            m = _FENCE_CLOSE_RE.match(line)
+            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= fence[1]:
+                fence = None
+            elif line:
+                ranges.append((start, start + len(line)))
+            continue
+        m = _FENCE_OPEN_RE.match(line)
+        if m and not (m.group(1)[0] == "`" and "`" in m.group(2)):
+            fence = (m.group(1)[0], len(m.group(1)))
+            carried = False
+            continue
+        if not line.strip(" \t"):
+            carried = False
+            continue
+        spans, balanced, trusted = _line_code_spans(line)
+        if trusted and not carried:
+            ranges.extend((start + s, start + e) for s, e in spans)
+        carried = carried or not balanced
+    return ranges
+
+
+def _outside(ranges: list[tuple[int, int]], positions: Iterable[int]) -> Iterator[int]:
+    """The ascending ``positions`` that no range of ascending, disjoint ``ranges`` holds."""
+    i = 0
+    for position in positions:
+        while i < len(ranges) and ranges[i][1] <= position:
+            i += 1
+        if i < len(ranges) and ranges[i][0] <= position:
+            continue
+        yield position
+
+
+def _mention_problem(subject: str, text: str) -> str | None:
+    """The refusal of the first ``@``-mention outside code in ``text``, if any."""
+    mentions = [m.start() for m in _MENTION_RE.finditer(text)]
+    if not mentions:
+        return None
+    ranges = _code_ranges(text)
+    outside = next(_outside(ranges, mentions), None)
+    raw_html = next(_outside(ranges, (m.start() for m in _RAW_HTML_RE.finditer(text))), None)
+    if raw_html is not None and outside != mentions[0]:
+        return (
+            f"{subject!r} contains an @-mention at index {mentions[0]} and raw HTML (a tag, "
+            f"comment or autolink) outside code at index {raw_html}; GitHub may read code "
+            "near raw HTML as text, so the code exemption does not apply. Remove the HTML or "
+            "the mention and re-emit the CONTROL_RESULT."
+        )
+    if outside is None:
+        return None
+    return (
+        f"{subject!r} contains an @-mention at index {outside} outside a code span or fenced "
+        "block; GitHub would notify that user or team. Put such tokens in code spans "
+        "(`@name`) and re-emit the CONTROL_RESULT."
+    )
+
+
+def published_text_problem(subject: str, text: str) -> str | None:
+    """Why agent text ``subject`` may not be published as is, or ``None``.
+
+    The rules, in order (ADR 0004 D8.2, D8.3): a controller marker opener of
+    either prefix (:data:`AGENT_MARKER_OPEN_RE`); a credential-shaped string,
+    named by its redaction pattern class (refused, never redacted); a closing
+    keyword followed by an issue reference, anywhere; an ``@``-mention
+    outside a code span or fenced block. The answer is one line naming
+    ``subject`` and the rule, never quoting ``text``. Roughly linear in the
+    length of ``text``.
+    """
+    m = AGENT_MARKER_OPEN_RE.search(text)
+    if m is not None:
+        return (
+            f"{subject!r} contains a controller marker opener at index {m.start()} ('<!--' "
+            "then 'ai-' or 'autoforge-', in any case or spacing); only the controller writes "
+            "markers. Remove it and re-emit the CONTROL_RESULT."
+        )
+    classes = credential_classes(text)
+    if classes:
+        return (
+            f"{subject!r} contains a credential-shaped string (pattern class: "
+            f"{', '.join(classes)}); published text is refused, never redacted. Remove it "
+            "and re-emit the CONTROL_RESULT."
+        )
+    m = _CLOSING_REFERENCE_RE.search(text)
+    if m is not None:
+        return (
+            f"{subject!r} contains a closing keyword followed by an issue reference at index "
+            f"{m.start()} ('close', 'fix' or 'resolve' in any form, then '#n', 'owner/repo#n' "
+            "or an issue URL), even inside code; GitHub closes issues named that way, and the "
+            "controller links the run's own issue itself. Reword it and re-emit the "
+            "CONTROL_RESULT."
+        )
+    return _mention_problem(subject, text)
+
+
+def published_payload_problem(subject: str, payload: str) -> str | None:
+    """Why the rendered ``payload`` ``subject`` may not be published, or ``None``.
+
+    Judges the credential rule alone, on the whole payload (ADR 0004 D8.3):
+    fields that pass one by one do not make a payload that passes, because a
+    pattern can span a field's end and the text rendered after it (a field
+    ending in ``GITHUB_TOKEN=`` takes the next rendered word as its value).
+    Names the payload and the pattern classes, never the text.
+    """
+    classes = credential_classes(payload)
+    if not classes:
+        return None
+    return (
+        f"the rendered {subject!r} contains a credential-shaped string (pattern class: "
+        f"{', '.join(classes)}), although each field may pass alone: a field's end can join "
+        "the text rendered after it. Published text is refused, never redacted; change the "
+        "fields so that no credential shape remains and re-emit the CONTROL_RESULT."
+    )
+
+
+def _names_issue(m: re.Match[str], repository: str, issue_number: int) -> bool:
+    """Whether closing reference ``m`` names issue ``issue_number`` of ``repository``.
+
+    Repository names compare case-insensitively, as GitHub treats them; the
+    number compares as digits, so a padded ``#07`` is another reference and
+    fails closed.
+    """
+    number = str(issue_number)
+    repo = repository.strip().lower()
+    if m.group("url_number") is not None:
+        return (
+            m.group("url_kind").lower() == "issues"
+            and m.group("url_repo").lower() == repo
+            and m.group("url_number") == number
+        )
+    if m.group("repo_number") is not None:
+        return m.group("repo").lower() == repo and m.group("repo_number") == number
+    return (m.group("number") or m.group("gh_number")) == number
+
+
+def commit_message_problem(message: str, *, repository: str, issue_number: int) -> str | None:
+    """Why commit ``message`` may not be published, or ``None`` (ADR 0004 D8.5).
+
+    Refuses a credential-shaped string, and a closing keyword that names any
+    issue other than the run's own: ``#<issue_number>``,
+    ``<repository>#<issue_number>`` (``owner/repo``, any case) or that
+    issue's URL. GitHub closes every issue named that way once the commit
+    reaches the default branch. Never quotes the message.
+    """
+    classes = credential_classes(message)
+    if classes:
+        return (
+            f"commit message contains a credential-shaped string (pattern class: "
+            f"{', '.join(classes)}); published text is refused, never redacted. Rewrite the "
+            "commit without it."
+        )
+    for m in _CLOSING_REFERENCE_RE.finditer(message):
+        if not _names_issue(m, repository, issue_number):
+            return (
+                "commit message names an issue other than this run's own "
+                f"#{issue_number} with a closing keyword at index {m.start()}; GitHub would "
+                "close that issue when the commit reaches the default branch. Reword the "
+                f"commit message so that a closing keyword names #{issue_number} only."
+            )
+    return None
 
 
 # -- typed per-phase models -----------------------------------------------
@@ -749,6 +1073,126 @@ NON_AGENT_PHASES = frozenset(
 )
 
 
+# The keys every re-request accepts besides the fields it asks for (D4.7).
+_RE_REQUEST_ENVELOPE = ("phase", "status", "message")
+_RE_REQUEST_FIELDS: dict[UpdateEpicRequest, tuple[str, ...]] = {
+    UpdateEpicRequest.SELECTION: ("next_issue_url",),
+    UpdateEpicRequest.SELECTION_WITH_ROADMAP: ("next_issue_url", "roadmap_section"),
+    UpdateEpicRequest.ROADMAP: ("roadmap_section",),
+}
+# The UPDATE_EPIC field names a refusal may quote: they are the controller's
+# own. Any other key is agent text and is only counted.
+_UPDATE_EPIC_FIELDS = ("progress", "roadmap_section", "next_issue_url")
+
+
+def _published_field(text: str, key: str) -> str:
+    """Refuse UPDATE_EPIC field ``key`` under the published-content policy."""
+    problem = published_text_problem(key, text)
+    if problem is not None:
+        raise ControlResultValidationError(f"UPDATE_EPIC: field {problem}")
+    return text
+
+
+def validate_progress_text(text: str) -> str:
+    """``text`` as an UPDATE_EPIC ``progress`` field, or a rejection.
+
+    Non-blank, at most :data:`MAX_PROGRESS_CHARS`, multi-line text with no
+    other control character, and publishable (:func:`published_text_problem`):
+    the controller posts it as the EPIC progress comment. The checks
+    :meth:`UpdateEpicResult.from_payload` applies, with the same messages,
+    so a persisted value can be re-validated under the parser's rules.
+    """
+    if not isinstance(text, str):
+        raise ControlResultValidationError("UPDATE_EPIC: field 'progress' must be a string")
+    if not text.strip():
+        raise ControlResultValidationError(
+            "CONTROL_RESULT for UPDATE_EPIC missing required field 'progress'"
+        )
+    text = _bounded(text, "UPDATE_EPIC", "result", "progress", MAX_PROGRESS_CHARS)
+    text = _multi_line(text, "UPDATE_EPIC", "result", "progress")
+    return _published_field(text, "progress")
+
+
+def validate_roadmap_section(text: str) -> str:
+    """``text`` as a present UPDATE_EPIC ``roadmap_section``, or a rejection.
+
+    Non-blank, at most :data:`MAX_ROADMAP_SECTION_CHARS`, multi-line text,
+    no ``<!-- ai-`` marker (the controller writes the roadmap markers around
+    the section itself), and publishable (:func:`published_text_problem`).
+    The checks :meth:`UpdateEpicResult.from_payload` applies, with the same
+    messages.
+    """
+    if not isinstance(text, str):
+        raise ControlResultValidationError(
+            "UPDATE_EPIC: optional field 'roadmap_section' must be a string when present, "
+            f"got {type(text).__name__}"
+        )
+    if not text.strip():
+        raise ControlResultValidationError(
+            "CONTROL_RESULT for UPDATE_EPIC missing required field 'roadmap_section'"
+        )
+    text = _bounded(text, "UPDATE_EPIC", "result", "roadmap_section", MAX_ROADMAP_SECTION_CHARS)
+    text = _multi_line(text, "UPDATE_EPIC", "result", "roadmap_section")
+    if CONTROLLER_MARKER_OPEN_RE.search(text):
+        raise ControlResultValidationError(
+            "UPDATE_EPIC: field 'roadmap_section' must not contain a controller "
+            f"marker ({_CONTROLLER_MARKER_PREFIX}...): the controller writes "
+            f"{ROADMAP_START_MARKER!r} and {ROADMAP_END_MARKER!r} around the section "
+            "itself. Return only the section's content and re-emit the CONTROL_RESULT."
+        )
+    return _published_field(text, "roadmap_section")
+
+
+def validate_next_issue_url(url: str) -> str:
+    """``url`` as a present UPDATE_EPIC ``next_issue_url``, or a rejection.
+
+    Shape and length at parse time (the ``next_issue_url`` half of #15).
+    Which issue the URL names is the engine's to verify (repository, EPIC,
+    finished issue, exists, OPEN); whether the string is an issue URL at all
+    is a malformed result, corrected like any other rather than spent as a
+    selection, and an oversized value is never quoted into
+    ``next_issue_rejections``, the re-selection prompt or the run log.
+    """
+    if not isinstance(url, str):
+        raise ControlResultValidationError("'next_issue_url' must be a string or null")
+    return _checked_url(url, "next_issue_url", "UPDATE_EPIC", "issue")
+
+
+def _refuse_outside_re_request(p: dict, request: UpdateEpicRequest) -> None:
+    """Refuse a re-request result carrying a key outside its schema (D4.7)."""
+    asked = _RE_REQUEST_FIELDS[request]
+    allowed = (*_RE_REQUEST_ENVELOPE, *asked)
+    extra = [key for key in p if key not in allowed]
+    if not extra:
+        return
+    named = [key for key in _UPDATE_EPIC_FIELDS if key in extra]
+    others = len(extra) - len(named)
+    carried = [repr(key) for key in named]
+    if others:
+        carried.append(f"{others} other key{'s' if others > 1 else ''}")
+    accepted = ", ".join(repr(key) for key in allowed)
+    asked_for = " and ".join(repr(key) for key in asked)
+    raise ControlResultValidationError(
+        f"UPDATE_EPIC: this re-request accepts only {accepted}, and the result also "
+        f"carries {', '.join(carried)}. The published progress comment is already done and "
+        f"this re-request asks only for {asked_for}. Remove the other keys and re-emit the "
+        "CONTROL_RESULT."
+    )
+
+
+def _next_issue_url(p: dict) -> str | None:
+    """The ``next_issue_url`` key, required; ``null`` or ``""`` is ``None``."""
+    if "next_issue_url" not in p:
+        raise ControlResultValidationError(
+            "CONTROL_RESULT for UPDATE_EPIC missing required field "
+            "'next_issue_url' (use null when the epic is complete)"
+        )
+    nxt = p["next_issue_url"]
+    if nxt is None or nxt == "":
+        return None
+    return validate_next_issue_url(nxt)
+
+
 @dataclass
 class UpdateEpicResult:
     next_issue_url: str | None
@@ -758,42 +1202,36 @@ class UpdateEpicResult:
     # the parser only bounds and shapes it. It is the *content between* the
     # markers: the markers themselves are written by the controller.
     roadmap_section: str | None = None
+    # The EPIC progress comment's text: required in a ``FULL`` result,
+    # ``None`` in a re-request, which never carries progress (D4.7).
+    progress: str | None = None
 
     @classmethod
-    def from_payload(cls, p: dict) -> UpdateEpicResult:
+    def from_payload(
+        cls, p: dict, request: UpdateEpicRequest = UpdateEpicRequest.FULL
+    ) -> UpdateEpicResult:
+        """Validate ``p`` against the schema of ``request``.
+
+        ``FULL`` ignores unknown keys, as every phase schema does; a
+        re-request refuses any key outside its own schema, a ``null`` one
+        included.
+        """
+        request = UpdateEpicRequest(request)
+        if request != UpdateEpicRequest.FULL:
+            _refuse_outside_re_request(p, request)
         section: str | None = _opt_str(p, "roadmap_section", "UPDATE_EPIC") or None
         if section is not None:
-            section = _bounded(
-                section, "UPDATE_EPIC", "result", "roadmap_section", MAX_ROADMAP_SECTION_CHARS
-            )
-            section = _multi_line(section, "UPDATE_EPIC", "result", "roadmap_section")
-            if CONTROLLER_MARKER_OPEN_RE.search(section):
-                raise ControlResultValidationError(
-                    "UPDATE_EPIC: field 'roadmap_section' must not contain a controller "
-                    f"marker ({_CONTROLLER_MARKER_PREFIX}...): the controller writes "
-                    f"{ROADMAP_START_MARKER!r} and {ROADMAP_END_MARKER!r} around the section "
-                    "itself. Return only the section's content and re-emit the CONTROL_RESULT."
-                )
-        if "next_issue_url" not in p:
+            section = validate_roadmap_section(section)
+        elif request == UpdateEpicRequest.ROADMAP:
             raise ControlResultValidationError(
-                "CONTROL_RESULT for UPDATE_EPIC missing required field "
-                "'next_issue_url' (use null when the epic is complete)"
+                "CONTROL_RESULT for UPDATE_EPIC missing required field 'roadmap_section' "
+                "(this re-request asks only for the roadmap section)"
             )
-        nxt = p["next_issue_url"]
-        if nxt is not None and not isinstance(nxt, str):
-            raise ControlResultValidationError("'next_issue_url' must be a string or null")
-        if isinstance(nxt, str) and nxt == "":
-            nxt = None
-        if nxt is not None:
-            # Shape and length at parse time (the ``next_issue_url`` half of
-            # #15). Which issue the URL names is the engine's to verify
-            # (repository, EPIC, finished issue, exists, OPEN); whether the
-            # string is an issue URL at all is a malformed result, corrected
-            # like any other rather than spent as a selection, and an
-            # oversized value is never quoted into ``next_issue_rejections``,
-            # the re-selection prompt or the run log.
-            nxt = _checked_url(nxt, "next_issue_url", "UPDATE_EPIC", "issue")
-        return cls(next_issue_url=nxt, roadmap_section=section)
+        nxt = None if request == UpdateEpicRequest.ROADMAP else _next_issue_url(p)
+        progress = None
+        if request == UpdateEpicRequest.FULL:
+            progress = validate_progress_text(_req_str(p, "progress", "UPDATE_EPIC"))
+        return cls(next_issue_url=nxt, roadmap_section=section, progress=progress)
 
 
 # -- LOCAL-mode typed models ----------------------------------------------
@@ -1002,9 +1440,17 @@ def _validate_local_phase(phase: Phase, payload: dict) -> None:
 
 
 def validate_for_phase(
-    phase: Phase, payload: dict, mode: WorkflowMode = WorkflowMode.REMOTE
+    phase: Phase,
+    payload: dict,
+    mode: WorkflowMode = WorkflowMode.REMOTE,
+    *,
+    update_epic_request: UpdateEpicRequest = UpdateEpicRequest.FULL,
 ) -> None:
-    """Enforce the per-phase required-fields schema (raises on violation)."""
+    """Enforce the per-phase required-fields schema (raises on violation).
+
+    ``update_epic_request`` selects the UPDATE_EPIC schema; other phases
+    ignore it.
+    """
     if mode == WorkflowMode.LOCAL:
         _validate_local_phase(phase, payload)
         return
@@ -1017,7 +1463,7 @@ def validate_for_phase(
     elif phase == Phase.REPLAN_REEXECUTE:
         ReplanReexecuteResult.from_payload(payload)
     elif phase == Phase.UPDATE_EPIC:
-        UpdateEpicResult.from_payload(payload)
+        UpdateEpicResult.from_payload(payload, update_epic_request)
     elif phase in NON_AGENT_PHASES:
         raise ControlResultValidationError(
             f"phase {phase.value} is executed by the controller and never accepts an "

@@ -6,15 +6,36 @@ token shapes (GitHub PATs, OpenAI / Anthropic keys, JWTs), OAuth credential
 fields (``refresh`` / ``access`` / ``id_token`` / ``chatgpt-account-id``) and
 credentials embedded in URLs before stdout / stderr / commands are persisted
 by the run logger.
+
+Every pattern has a stable class name. :func:`credential_classes` reports
+which classes a text carries without saying where, so a refusal of agent
+text that would be published (``result_parser``'s content policy) can name
+what to remove without quoting the secret.
 """
 
 from __future__ import annotations
 
 import re
+from typing import NamedTuple
 
-_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+
+class _Pattern(NamedTuple):
+    """One secret shape: its stable class name, the regex and its replacement."""
+
+    name: str
+    regex: re.Pattern[str]
+    replacement: str
+
+
+# Applied in this order, each to the previous one's output; the order is part
+# of :func:`redact`'s output and of the class :func:`credential_classes`
+# reports. An ``sk-ant-`` key with at least eight characters after ``sk-`` is
+# replaced by ``openai-key`` before ``anthropic-key`` sees it, so it is
+# reported under that class.
+_PATTERNS: tuple[_Pattern, ...] = (
     # VAR=secret / VAR: secret assignments for well-known names.
-    (
+    _Pattern(
+        "env-assignment",
         re.compile(
             r"(?i)\b(GITHUB_TOKEN|GH_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY|"
             r"OPENCODE_API_KEY|GITLAB_TOKEN|HF_TOKEN|SLACK_TOKEN|AWS_SECRET_ACCESS_KEY)"
@@ -23,7 +44,8 @@ _PATTERNS: list[tuple[re.Pattern[str], str]] = [
         r"\1\2\3***REDACTED***\5",
     ),
     # Authorization: Bearer <token> / Token <token> / Basic <base64>
-    (
+    _Pattern(
+        "authorization-header",
         re.compile(r"(?i)\b(Authorization\s*:\s*(?:Bearer|Token|Basic)\s+)([^\s\"';]+)"),
         r"\1***REDACTED***",
     ),
@@ -38,7 +60,8 @@ _PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # delimiter. The scheme is bounded and the class excludes ``/``, so a
     # candidate never scans past the ``://`` of the next one: the pass stays
     # linear over the 16 MiB an executor capture can be.
-    (
+    _Pattern(
+        "url-userinfo",
         re.compile(r"(?i)\b([a-z][a-z0-9+.-]{1,31}://)[^\s/?#@]+@"),
         r"\1***REDACTED***@",
     ),
@@ -54,20 +77,24 @@ _PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # three candidates and the pass stays linear. Placed before the shorter
     # token shapes so one of them cannot replace a slice of the token and
     # leave the rest unrecognised.
-    (
+    _Pattern(
+        "jwt",
         re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{7,}\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*"),
         "***REDACTED***",
     ),
     # GitHub fine-grained PATs
-    (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{8,}"), "***REDACTED***"),
+    _Pattern(
+        "github-fine-grained-pat", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{8,}"), "***REDACTED***"
+    ),
     # GitHub classic PATs and app / OAuth tokens
-    (re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{8,}"), "***REDACTED***"),
+    _Pattern("github-token", re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{8,}"), "***REDACTED***"),
     # OpenAI-style sk- keys (incl. project variant sk-proj-...)
-    (re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{8,}"), "***REDACTED***"),
+    _Pattern("openai-key", re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{8,}"), "***REDACTED***"),
     # Anthropic keys
-    (re.compile(r"\bsk-ant-[A-Za-z0-9_-]{8,}"), "***REDACTED***"),
+    _Pattern("anthropic-key", re.compile(r"\bsk-ant-[A-Za-z0-9_-]{8,}"), "***REDACTED***"),
     # Generic long bearer-ish assignments: token/password/secret = <value>
-    (
+    _Pattern(
+        "secret-assignment",
         re.compile(
             r"(?i)\b(token|passwd|password|secret|api[_-]?key)(\s*[:=]\s*)([\"']?)"
             r"([A-Za-z0-9_\-./+]{12,})([\"']?)"
@@ -82,7 +109,8 @@ _PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # untouched. The same escaping before both quotes (``\"refresh\": \"...``)
     # covers JSON carried inside a JSON string; the bound on it keeps a run of
     # backslashes from being rescanned from every position.
-    (
+    _Pattern(
+        "oauth-field",
         re.compile(
             r"(?i)(\\{0,7})([\"'])(refresh|access|(?:refresh|access|id)_token|"
             r"chatgpt[-_]account[-_]id)\1\2(\s*:\s*\\{0,7}[\"'])[^\"'\s\\]+"
@@ -93,7 +121,8 @@ _PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # (a query string, a form body, a shell variable), ``id_token: ...`` and
     # the ``chatgpt-account-id: ...`` request header. A lookbehind rather than
     # ``\b`` so a prefixed name (``oauth_refresh_token=``) is caught too.
-    (
+    _Pattern(
+        "oauth-assignment",
         re.compile(
             r"(?i)(?<![A-Za-z0-9])((?:refresh|access|id)_token|chatgpt[-_]account[-_]id)"
             r"(\s*[:=]\s*)([\"']?)[^\s\"';,&]+"
@@ -103,11 +132,12 @@ _PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # Bare ``refresh=`` / ``access=`` with a token-length value. Those words
     # are ordinary prose, so only an ``=`` assignment of at least 16
     # characters counts; ``access: denied`` and ``refresh=true`` stay.
-    (
+    _Pattern(
+        "oauth-bare-assignment",
         re.compile(r"(?i)(?<![A-Za-z0-9_])(refresh|access)(=)([\"']?)[^\s\"';,&]{16,}"),
         r"\1\2\3***REDACTED***",
     ),
-]
+)
 
 _REDACTED = "***REDACTED***"
 
@@ -141,9 +171,29 @@ def redact(text: str | None) -> str:
         return ""
     if not isinstance(text, str):
         text = str(text)
-    for pattern, replacement in _PATTERNS:
+    for _name, pattern, replacement in _PATTERNS:
         text = pattern.sub(replacement, text)
     return text
+
+
+def credential_classes(text: str) -> tuple[str, ...]:
+    """The class names of the patterns :func:`redact` would apply to ``text``.
+
+    Runs the same sequential substitution as :func:`redact` and records each
+    pattern that changed the text, in pattern order and each name once. The
+    result is empty exactly when ``redact(text) == text``: a text with a
+    credential shape is refused by name, never redacted and published.
+    """
+    found: list[str] = []
+    redacted = text
+    for name, pattern, replacement in _PATTERNS:
+        replaced = pattern.sub(replacement, redacted)
+        if replaced != redacted:
+            found.append(name)
+        redacted = replaced
+    # Exact by construction: should a later pattern ever restore what an
+    # earlier one changed, the text is still what ``redact`` returns.
+    return tuple(found) if redacted != text else ()
 
 
 def redact_argv(argv: list[str]) -> list[str]:

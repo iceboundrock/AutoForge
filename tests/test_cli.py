@@ -26,7 +26,6 @@ from tests.conftest import (
     comment_url,
     git_repo,
     implementation_pr_body,
-    post_progress_comment,
     review_comment_body,
 )
 
@@ -644,11 +643,11 @@ def _drive_to_ready(fakes):
                 }
             )
         if req.phase == "UPDATE_EPIC":
-            post_progress_comment(gh)
             return block(
                 {
                     "phase": "UPDATE_EPIC",
                     "status": "success",
+                    "progress": "Issue done; the PR is merged.",
                     "roadmap_section": "- [x] done",
                     "next_issue_url": None,
                 }

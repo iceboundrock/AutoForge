@@ -26,7 +26,12 @@ executor.py         subprocess lifecycle, timeouts, capture, optional stdin payl
                     (no workflow semantics)
 executor_duplex.py  duplex child handle for RPC transports: stdin records out, LF-framed
                     stdout records in, one deadline, ADR 0002 teardown; bytes only (#130)
-github.py           GitHubClient over `gh`: verification reads + controller-owned merge
+github.py           GitHubClient over `gh`: verification reads, typed controller writes
+                    (never retried on an ambiguous outcome) + controller-owned merge
+effects.py          ADR 0004 effect records: kinds, stages, attempt bound, drive/reconcile,
+                    entry observation, UPDATE_EPIC completion context (#160)
+effect_ops.py       per-kind effect operations: identity read, precondition, write (#160)
+git_transport.py    controller git push: sanitized config, explicit URL, lease, no hooks (#160)
 claims.py           durable GitHub claims: marker schemas, renderers, scan, cardinality
 validation.py       typed GitHub URL parsing and run-argument validation
 premerge.py         controller-produced pre-merge evidence (check definitions, tree export)
@@ -40,7 +45,8 @@ redaction.py        secret redaction for anything that reaches logs
 runlog.py           per-invocation run logs, redacted
 errors.py           typed error taxonomy
 prompts/            file-based templates ({{VAR}}): common.md (trust boundary), phase
-                    templates, local_*.md, correction.md; renderer in prompts/__init__.py
+                    templates, update_epic_rerequest.md, local_*.md, correction.md;
+                    renderer in prompts/__init__.py
 ```
 
 ## Rules for production code
@@ -77,10 +83,14 @@ engine.py (phase sequencing, resume)             -> docs/agent-guides/workflow.m
 replan_txn.py, engine.py (REPLAN_REEXECUTE),
 prompts/replan_reexecute.md                       -> docs/agent-guides/replan-transaction.md (+ workflow.md)
 github.py, claims.py, validation.py, premerge.py,
+effect_ops.py, git_transport.py,
 engine.py (post-phase verification, merge gate,
-dry-run), prompts/update_epic.md                  -> docs/agent-guides/github-safety.md
-state.py, run_contract.py, safefs.py, locking.py,
-errors.py, engine.py (recovery, retry)            -> docs/agent-guides/state-and-recovery.md
+dry-run), prompts/update_epic*.md                 -> docs/agent-guides/github-safety.md
+                                                     (+ docs/adr/0004-authority-boundary-and-
+                                                     typed-external-effects.md for effects)
+state.py, effects.py, run_contract.py, safefs.py,
+locking.py, errors.py, engine.py (recovery,
+retry)                                            -> docs/agent-guides/state-and-recovery.md
 providers.py, pi_rpc.py, executor.py,
 executor_duplex.py, prompts/__init__.py           -> docs/agent-guides/architecture.md
                                                      (+ docs/adr/0003-pi-agent-provider.md and

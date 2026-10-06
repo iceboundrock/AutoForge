@@ -40,6 +40,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from . import __prompt_version__, __protocol_version__, __version__
+from .effects import (
+    LABEL_AGENT_PUBLISHES,
+    LABEL_NONE,
+    LAUNCH_LABELS,
+    PUBLISHING_PHASES,
+    Binding,
+    PhaseEffects,
+    load_phase_effects,
+)
 from .errors import ConfigurationError, StateError
 from .loop_guard import validate_review_history
 from .replan_txn import LEGACY_JOURNAL_PROTOCOLS, legacy_journal_refusal
@@ -245,10 +254,18 @@ def _validate_local_pending(state: AutoForgeState) -> None:
 
 # Protocol labels an older controller wrote that this one can still read,
 # each subject to the boundary rules its successors introduced (see
-# :meth:`AutoForgeState.from_dict`). Every step so far changed the replan
-# journal, so the set is the journal's; protocols 2 and 3 also changed the
+# :meth:`AutoForgeState.from_dict`). Protocols 1-4 changed the replan
+# journal, so those are the journal's; protocols 2 and 3 also changed the
 # review binding (``_REVIEW_BINDING_GAPS``), protocol 4 only the journal.
-_LEGACY_PROTOCOLS = LEGACY_JOURNAL_PROTOCOLS
+# Protocol 5 is the last label before the controller owned external effects
+# (ADR 0004 D13.1, #160): it is the immediate predecessor of protocol 7 (6 is
+# reserved for #126) and is loaded under D13.2.
+_LEGACY_PROTOCOLS = LEGACY_JOURNAL_PROTOCOLS | {"5"}
+# The fields protocol 7 added (#160): the effect records, the entry
+# observation and the completion context of the current phase entry, and the
+# launch label. A legacy file never carries one; one that does is a hand edit
+# or a foreign file, not an older controller's state.
+_EFFECT_FIELDS = ("effect_records", "entry_observation", "completion_context", "launch_label")
 # The phases in which the persisted clean review is consumed by the merge
 # gate, and so the phases a state without the review's full binding cannot
 # be loaded in.
@@ -470,6 +487,32 @@ class AutoForgeState:
     # a next issue verified or the EPIC completed.
     next_issue_rejections: list[str] = field(default_factory=list)
 
+    # -- controller-owned external effects (ADR 0004, #160) ---------------
+    # The external writes of the current phase entry that the controller
+    # performs itself, one record each, in plan order (see
+    # :class:`autoforge.effects.EffectRecord`): written as ``intended`` in
+    # the same save as the completion context, before the first write, and
+    # advanced to ``attempted`` before each issue (D4.1) and to ``observed``
+    # or ``conflict`` after its read-back. The phase advances only when every
+    # record is observed.
+    effect_records: list[dict] = field(default_factory=list)
+    # What the phase read before its first launch (refs, base, the objects
+    # carrying its identities; D4.4), persisted in the pre-launch save. Empty
+    # until a phase records one.
+    entry_observation: dict = field(default_factory=dict)
+    # The validated result data the phase consumes once its records are
+    # observed (D4.6), in the closed schema of the phase it names. Recovery
+    # completes from it, never from a rendered payload or the run log.
+    # Records, observation and context belong to one phase entry: the save
+    # that commits the phase drops all three (D2.4).
+    completion_context: dict = field(default_factory=dict)
+    # The contract the current entry's last launch ran under (D13.3):
+    # ``agent_publishes`` when the agent was told to perform the phase's
+    # writes, ``controller_publishes`` when the controller performs them, ""
+    # before a launch. Every pre-launch save records it; it is read only while
+    # ``attempt >= 1``.
+    launch_label: str = ""
+
     # Agent invocations attempted for the current phase (reset on transition).
     attempt: int = 0
     # Total executed steps across the run (never reset).
@@ -582,19 +625,49 @@ class AutoForgeState:
         # The label is rewritten on the next save. A file that is refused is
         # left unchanged (``run --force`` moves it aside like any unreadable
         # one).
+        # - 5 -> 7: the controller performs a phase's external writes itself
+        #   and journals each one (effect records, the entry observation, the
+        #   completion context, the launch label; ADR 0004 D13.1). A legacy
+        #   file has none of them and is loaded with none (D13.2): there is
+        #   nothing to reconstruct, because an agent-performed write was never
+        #   journaled and is classified by the next entry from GitHub (D9).
+        #   Its launch label is ``agent_publishes`` when the file records a
+        #   launch of a publishing phase (``attempt >= 1``), which is what
+        #   lets the first re-entry of a phase this version publishes itself
+        #   adopt an agent-posted object once (D13.3, D13.7). A legacy file
+        #   that carries a non-empty value in any of the new fields is
+        #   refused, never merged.
         raw_protocol = data.get("protocol_version", __protocol_version__)
         written_by = str(data.get("controller_version", ""))
-        if isinstance(raw_protocol, str) and raw_protocol in _LEGACY_PROTOCOLS:
-            refusal = legacy_journal_refusal(
-                data.get("replan_transaction", {}), protocol=raw_protocol, written_by=written_by
-            )
-            if refusal:
-                raise StateError(refusal)
+        legacy = isinstance(raw_protocol, str) and raw_protocol in _LEGACY_PROTOCOLS
+        if legacy:
+            if raw_protocol in LEGACY_JOURNAL_PROTOCOLS:
+                refusal = legacy_journal_refusal(
+                    data.get("replan_transaction", {}),
+                    protocol=raw_protocol,
+                    written_by=written_by,
+                )
+                if refusal:
+                    raise StateError(refusal)
             refusal = _legacy_review_binding_refusal(
                 data, phase, protocol=str(raw_protocol), written_by=written_by
             )
             if refusal:
                 raise StateError(refusal)
+            # The label decides, not the shape: a field a later protocol
+            # added may sit in a legacy file at its empty value, but effect
+            # state the labelled controller could never have written is a
+            # hand edit or a foreign file, and is refused rather than merged.
+            planted = sorted(
+                name for name in _EFFECT_FIELDS if data.get(name, "") not in ([], {}, "")
+            )
+            if planted:
+                raise StateError(
+                    f"state file is labelled protocol_version {raw_protocol!r}, which never "
+                    f"wrote {', '.join(repr(n) for n in planted)}; refusing to load a "
+                    "legacy file that carries protocol-7 effect state -- it is a hand edit "
+                    "or a foreign file, not an older controller's state"
+                )
         elif raw_protocol != __protocol_version__:
             raise StateError(
                 f"unsupported protocol_version {raw_protocol!r} "
@@ -618,6 +691,12 @@ class AutoForgeState:
         kwargs["phase"] = phase
         kwargs["mode"] = mode
         kwargs["protocol_version"] = __protocol_version__
+        if legacy and mode == WorkflowMode.REMOTE:
+            attempt = data.get("attempt", 0)
+            if isinstance(attempt, int) and not isinstance(attempt, bool) and attempt >= 1:
+                kwargs["launch_label"] = (
+                    LABEL_AGENT_PUBLISHES if phase in PUBLISHING_PHASES else LABEL_NONE
+                )
         # Unknown fields are corruption, not forward compatibility: at this
         # protocol version the controller knows every field it writes, so an
         # unexpected key is a hand edit, a truncated merge or a foreign file.
@@ -773,7 +852,86 @@ class AutoForgeState:
                     f"state field {name!r} must be a full lower-case commit SHA or empty, "
                     f"got {value!r:.60}"
                 )
+        state.phase_effects()
         return state
+
+    # -- controller-owned effects (ADR 0004) -------------------------------
+    def effect_binding(self) -> Binding:
+        """What this state's effect records, observation and context must agree with."""
+        txn = self.replan_transaction.get("transaction_id", "")
+        return Binding(
+            run_id=self.run_id,
+            phase=self.phase,
+            issue_url=self.current_issue_url,
+            pr_url=self.current_pr_url,
+            review_round=self.review_round,
+            transaction_id=txn if isinstance(txn, str) else "",
+            open_finding_ids=tuple(
+                str(f.get("id", "")) for f in self.open_findings if isinstance(f, dict)
+            ),
+        )
+
+    def phase_effects(self) -> PhaseEffects:
+        """The persisted effect state of the current phase entry, strictly validated.
+
+        Every value is checked against the state it is loaded with (the
+        phase, issue, PR, round, open findings and replan transaction it is
+        bound to; D4.6) and against the others (one phase, the context saved
+        with the records, D2.4's bounds). A value that fails is corruption
+        and raises :class:`StateError`; a LOCAL run carries none (D13.2).
+        """
+        if not isinstance(self.launch_label, str) or self.launch_label not in LAUNCH_LABELS:
+            raise StateError(
+                f"state field 'launch_label' must be one of {sorted(LAUNCH_LABELS)}, got "
+                f"{self.launch_label!r:.60}"
+            )
+        if self.mode == WorkflowMode.LOCAL:
+            present = [name for name in _EFFECT_FIELDS if getattr(self, name) not in ([], {}, "")]
+            if present:
+                raise StateError(
+                    f"state field(s) {', '.join(repr(n) for n in present)} are set on a LOCAL "
+                    "run, which performs no external effects; refusing to load"
+                )
+            return PhaseEffects()
+        return load_phase_effects(
+            self.effect_records,
+            self.entry_observation,
+            self.completion_context,
+            self.effect_binding(),
+        )
+
+    def drop_phase_effects(self) -> None:
+        """Forget the current entry's effect state: the save that commits the phase (D2.4)."""
+        self.effect_records = []
+        self.entry_observation = {}
+        self.completion_context = {}
+        self.launch_label = LABEL_NONE
+
+    def settle_phase_effects(self) -> None:
+        """D2.4 at every save: a phase entry's effect state does not outlive it.
+
+        Records, observation and context name the phase they belong to; a
+        save in another phase (the transition out of it) drops them, unless
+        the run is ``BLOCKED`` or ``FAILED`` in that phase, which keeps them
+        for the operator and for ``unblock`` back into it. The launch label
+        describes the launches of the current entry, so it is dropped while
+        none has been made (``attempt`` is reset on every transition).
+        """
+        if self.phase in (Phase.BLOCKED, Phase.FAILED):
+            return
+        named = {
+            piece.get("phase")
+            for piece in (self.completion_context, self.entry_observation)
+            if isinstance(piece, dict) and piece
+        }
+        for record in self.effect_records if isinstance(self.effect_records, list) else ():
+            owner = record.get("owner") if isinstance(record, dict) else None
+            if isinstance(owner, dict):
+                named.add(owner.get("phase"))
+        if named and named != {self.phase.value}:
+            self.drop_phase_effects()
+        elif self.attempt == 0:
+            self.launch_label = LABEL_NONE
 
     def touch(self) -> None:
         self.updated_at = utcnow_iso()
@@ -827,6 +985,7 @@ class AutoForgeState:
         self.superseded_prs = []
         self.replan_transaction = {}
         self.next_issue_rejections = []
+        self.drop_phase_effects()
         self.attempt = 0
 
     @property

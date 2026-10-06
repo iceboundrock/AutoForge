@@ -5832,12 +5832,12 @@ def test_a_protocol_4_journal_before_the_write_loads_and_relabels(tmp_state_dir,
     eng.save()
     _protocol_1_state_file(eng, _protocol_4_journal(stage), protocol="4")
     loaded = eng.load()
-    assert loaded.protocol_version == "5"
+    assert loaded.protocol_version == "7"
     txn = _txn(eng)
     assert txn.stage is stage and not txn.journal_defects
     assert txn.source_closed_event_count == 0 and txn.close_attempts == 0
     eng.save()
-    assert json.loads(eng.paths.state_file.read_text())["protocol_version"] == "5"
+    assert json.loads(eng.paths.state_file.read_text())["protocol_version"] == "7"
     if stage is ReplanStage.VERIFIED:
         # The write proceeds from the relabelled journal and records the
         # watermark the protocol-4 controller never did.
@@ -5876,7 +5876,7 @@ def test_the_legacy_journal_refusal_knows_only_the_legacy_protocols():
 
     assert LEGACY_JOURNAL_PROTOCOLS == frozenset({"1", "2", "3", "4"})
     journal = _seed_dict(ReplanStage.PREPARED)
-    for protocol in ("5", "0", ""):
+    for protocol in ("5", "7", "0", ""):
         with pytest.raises(ValueError, match="not a legacy journal protocol"):
             legacy_journal_refusal(journal, protocol=protocol, written_by="0.1.0")
     for protocol in ("1", "2", "3"):
@@ -5907,10 +5907,10 @@ def test_r7f1_a_legacy_state_without_a_replan_in_flight_loads_as_current(tmp_sta
         data["phase"] = "REVIEW" if not journal else "BLOCKED"
         eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
         loaded = eng.load()
-        assert loaded.protocol_version == "5"
+        assert loaded.protocol_version == "7"
         assert loaded.replan_transaction == journal
         eng.save()
-        assert json.loads(eng.paths.state_file.read_text())["protocol_version"] == "5"
+        assert json.loads(eng.paths.state_file.read_text())["protocol_version"] == "7"
     # A legacy file that predates the journal field altogether is the same
     # case: no replan in flight.
     data = json.loads(eng.paths.state_file.read_text())
@@ -5957,7 +5957,7 @@ def test_r7f1_the_version_label_decides_not_the_journal_shape(tmp_state_dir):
     # this controller wrote the journal, so a missing field is a missing
     # field, whichever protocol step introduced it.
     data = json.loads(eng.paths.state_file.read_text())
-    data["protocol_version"] = "5"
+    data["protocol_version"] = "7"
     data["phase"] = Phase.REPLAN_REEXECUTE.value
     data["block_reason"] = ""
     for missing in (
@@ -6992,3 +6992,52 @@ def test_a_pi_replan_claim_github_does_not_back_is_refused_as_a_scripted_one(tmp
     assert f"replacement PR {REPLACEMENT_PR}, but no open PR" in reason
     assert stage is ReplanStage.REJECTED and source_state == "OPEN" and current == PR
     assert closed == [] and merges == []
+
+
+# =============================================================================
+# The close receipt is presence-checked (#160; ADR 0004 transport)
+# =============================================================================
+
+
+def _receipt_count(gh, pr_url: str = PR, txn_id: str = TXN_ID) -> int:
+    return sum(c.body.count(render_close_receipt(txn_id)) for c in gh.get_pr_comments(pr_url))
+
+
+def test_w7_a_duplicate_close_receipt_is_harmless_and_never_posted_again(tmp_state_dir):
+    """Window 7 with the receipt on the source twice: still this transaction's close.
+
+    The receipt is attribution by *presence* (``has_close_receipt``), not a
+    count: a source found CLOSED carrying this transaction's receipt was
+    closed by it, however many copies there are (a human quoting it, or an
+    operator re-posting it by hand, adds a second). So the resume, in a fresh
+    process over the persisted journal, adopts the close as its own and
+    supersedes: it does not block on the duplicate, does not close or reopen
+    the source, and posts no third receipt (a resume never posts one). Pinned
+    because a cardinality rule ("exactly one receipt") would turn a harmless
+    copy into a BLOCKED run.
+    """
+    gh = FakeGitHub()
+    eng, _ = _seeded_engine(
+        tmp_state_dir, gh, ReplanStage.SUPERSEDE_INTENT, close_intent_at="2026-01-01T00:00:00+00:00"
+    )
+    _closed_by_controller(gh)  # the close and its receipt landed before the crash
+    gh.add_comment(PR, 901, render_close_receipt(TXN_ID))  # and the receipt landed twice
+    assert _receipt_count(gh) == 2
+    assert has_close_receipt([c.body for c in gh.get_pr_comments(PR)], TXN_ID)
+
+    eng2 = _restart(eng, gh)
+    assert _txn(eng2).stage is ReplanStage.SUPERSEDE_INTENT
+    assert eng2.step().next_phase == "REVIEW"
+
+    assert gh.closed_prs == [] and gh.reopened_prs == []  # closed exactly once, by the crash
+    assert gh.commented_prs == []  # no third receipt
+    assert _receipt_count(gh) == 2
+    assert gh.prs[PR].state == "CLOSED"
+    assert eng2.state.current_pr_url == REPLACEMENT_PR
+    assert eng2.state.block_reason == ""
+    assert [s["pr_url"] for s in eng2.state.superseded_prs] == [PR]
+    assert eng2.state.superseded_prs[0]["transaction_id"] == TXN_ID
+    assert eng.provider.calls == [] and eng2.provider.calls == []
+    persisted = load_state(eng2.paths.state_file)
+    assert persisted.current_pr_url == REPLACEMENT_PR
+    assert persisted.superseded_prs == eng2.state.superseded_prs

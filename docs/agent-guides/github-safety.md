@@ -265,18 +265,32 @@ Verify:
 
 ### Before UPDATE_EPIC
 
-The agent's one write in the phase is a progress comment on the EPIC; the
-EPIC body is written by the controller (below), never by the agent. The
-comment carries the `ai-epic-progress` marker of
-`{"issue", "pr"}` (the finished issue and the merged PR, rendered into the
-prompt as `PROGRESS_MARKER`); before the agent is launched the EPIC's
-comments are read for it:
+The agent makes no GitHub write in this phase (ADR 0004). It returns the
+progress report as `progress`, and the controller posts it on the EPIC as
+the phase's progress comment: the text, a blank line, then the
+`ai-epic-progress` marker of `{"issue", "pr"}` (the finished issue and the
+merged PR). The comment is an effect record of kind `progress_comment`
+("Controller-owned effects" below). The EPIC body is written by the
+controller too (below), never by the agent.
 
-- exactly one: its URL is handed to the agent as
-  `EXISTING_PROGRESS_COMMENT_URL`, to adopt or edit in place, never
-  duplicate; this covers an interrupted step and the bounded re-selection
-  below equally, since both are re-entries
-- two or more: `BLOCKED` without launching the agent
+The journal is read first. A persisted completion context means the
+agent's result was already accepted: the phase is completed from it (the
+record reconciled, the section spliced, the selection verified) and no
+agent is launched, unless a persisted rejection voided one of its inputs,
+in which case the launch is a re-request for that input alone (After
+UPDATE_EPIC, below). Otherwise the EPIC's comments are read for the marker:
+
+- none: the normal case. The entry observation records that, so a comment
+  found by a later entry is explained by this read or not at all.
+- exactly one that no record of this phase explains: `BLOCKED` without
+  launching, naming the comment (D9.7). It is never adopted and never
+  duplicated: delete it (the controller then posts its own) or finish the
+  EPIC update by hand. The one exception is the one-shot re-entry of a run
+  persisted by the previous protocol whose agent had already been launched
+  under the contract in which it posted the comment (D13.7): that comment
+  is adopted with no record, and the launch asks for the selection only.
+- two or more, or one whose marker cannot be read: `BLOCKED` without
+  launching the agent
 - a comment for another issue or PR on the same EPIC is not this entry's
 
 The EPIC body is read too, and its managed roadmap section located (see
@@ -294,13 +308,25 @@ controller could never splice. Only `GitHubUnavailableError` propagates, so
 
 ### After UPDATE_EPIC
 
-First read the EPIC back: exactly one comment carrying this entry's marker.
-None means the agent did not do the phase's write (the result is rejected
-and the next entry finds nothing and launches again); two means it
-duplicated the one it was handed (rejected; the next entry blocks on the
-pair). Then perform the roadmap write when one is due, and only then verify
-`next_issue_url` exactly like the first issue in `INITIALIZING` before
-switching issues:
+The result is validated before anything is published: `progress` is
+required and bounded (`MAX_PROGRESS_CHARS`), both texts pass the
+published-content policy ("Published content" below), and a roadmap section
+the controller requires (EPIC updates, below) must be present. A failure is
+an ordinary correction retry, with nothing posted.
+
+Then, in order, all from one persisted completion context (D4.6):
+
+1. The precondition read: the EPIC's comments are read again, and a
+   comment for this (issue, PR) that appeared while the agent ran blocks,
+   naming it; nothing is posted. Otherwise the completion context (the
+   section, the selection, and the digests of the body outside the
+   markers) and the planned record are saved in one save.
+2. The record is driven: posted once, then read back by its marker as the
+   one comment carrying it, with exactly the planned body.
+3. The roadmap section is written when one is stored and merges are
+   pending (EPIC updates, below).
+4. `next_issue_url` is verified exactly like the first issue in
+   `INITIALIZING` before switching issues:
 
 - it parses as an issue URL of the configured repository
 - it is neither the EPIC nor the issue just finished
@@ -318,16 +344,20 @@ engine still parses the URL itself before any GitHub read: the same check
 serves `INITIALIZING`, whose URL comes from the operator, and it is the
 defence for a result that reached the engine some other way.
 
-A rejected selection is retried once (with the controller's reason in the
-prompt); a second rejection enters `BLOCKED`. A transient GitHub failure
-while checking the selection takes the same bounded retry. Any other GitHub
-failure (authentication, permissions, malformed data) is conclusive and
-enters `BLOCKED` immediately without invoking the agent again. Never switch
-to an unverified issue. A rejected selection has no effect the controller
-did not already verify: the progress comment is adopted on the retry, a
-roadmap section already written was read back and closed its batch (the
-retry finds it in place and does not write it again), and no issue was
-switched.
+A rejected selection is retried once; a second rejection enters `BLOCKED`.
+The rejection voids the selection in the persisted context, and the retry
+is a re-request (`prompts/update_epic_rerequest.md`, D4.7): it names the
+published progress comment, quotes the controller's reason, and asks for
+`next_issue_url` alone (with `roadmap_section` while merges are uncounted,
+because a new selection of `null` may require one). A re-request result
+that carries any other key, `progress` included, is refused. A transient
+GitHub failure while checking the selection takes the same bounded retry.
+Any other GitHub failure (authentication, permissions, malformed data) is
+conclusive and enters `BLOCKED` immediately without invoking the agent
+again. Never switch to an unverified issue. A rejected selection has no
+effect the controller did not already verify: the progress comment is
+posted once and never again, a roadmap section already written was read
+back and closed its batch, and no issue was switched.
 
 ### Before MERGE
 
@@ -419,10 +449,79 @@ It must not:
 - delete branches
 - create or delete worktrees (the plan names the per-issue worktree that
   execution would create)
+- execute an effect or run a network git operation. The plan names the
+  effects the step would perform and every recorded effect it would
+  reconcile first; the `UPDATE_EPIC` plan is computed from persisted state
+  alone and reads nothing from GitHub.
 
 Never rely only on telling an LLM "do not modify anything".
 
 ---
+
+## Controller-owned effects
+
+ADR 0004 (`docs/adr/0004-authority-boundary-and-typed-external-effects.md`)
+moves every externally visible write to the controller. #160 adds the
+mechanism and wires its first consumer, the `UPDATE_EPIC` progress comment;
+the other phases keep their current publication until #161 to #164 move
+them.
+
+- **Typed writes, never retried blind.** `GitHubClient` has one method per
+  write the effects need (`create_issue_comment`, `create_pr_comment`,
+  `create_pull_request`, `write_pr_body`, `create_issue`,
+  `write_issue_body`). Each sends its payload on stdin to the named
+  repository, returns the created object's identity, and runs outside the
+  transient retry loop: a timeout, a transient failure, or a reply that
+  cannot be parsed or names another object is an unknown outcome
+  (`GitHubUnavailableError`), which is reconciled by reading, never re-sent.
+  Reads keep their transient retry. Bounds are checked before any process
+  starts.
+- **Identity reads are complete.** Each kind is found by its marker or
+  identity in a complete listing that also sees objects no longer open
+  (`list_prs_for_head`, `list_issues_above` bounded by a watermark taken
+  before the create, the full comment listing), never the search API.
+- **Records before writes.** A record (`src/autoforge/effects.py`) holds
+  the kind, the identity, the exact target, the precondition, the payload,
+  the attempt count, the stage and the observed result. It moves from
+  `intended` through `attempted`, persisted before every write, to
+  `observed` (read back and matching) or `conflict` (`BLOCKED`, naming the
+  object). `effect_ops.drive` reconciles before anything is issued: exactly
+  one matching object is adopted as observed; none with the precondition
+  holding is issued, at most `MAX_EFFECT_ATTEMPTS` (2) times; anything else
+  is a conflict. An exhausted bound is a conflict that names the record and
+  the manual step. `unblock` back into the phase reconciles a conflict
+  again with its attempt count kept.
+- **The controller git transport** (`src/autoforge/git_transport.py`) pushes
+  an exact SHA to an exact controller-derived ref, compare-and-swap against
+  the expected old value, never to the default branch and never a
+  non-fast-forward. Every operation runs in a fresh private git directory
+  over the shared object store, with no system or global configuration, so
+  nothing the agent can write in the shared repository (`pushurl`,
+  `insteadOf`, `core.sshCommand`, `core.hooksPath`, `include.path`, hooks,
+  replacement refs, grafts, the commit-graph) is read. The remote is an
+  explicit URL derived from the verified repository identity, never
+  `origin`, and the credential comes from `gh auth git-credential`, never
+  from argv, a URL, a log or state. A commit is read back as its own bytes
+  (re-hashed). Fetches write objects only and create or move no ref. The
+  pre-merge evidence fetch runs on it, and every git process goes through
+  the executor.
+
+### Published content
+
+Agent text the controller publishes under the operator's identity
+(`progress`, `roadmap_section`, and the payloads of later kinds) is refused
+by `result_parser.published_text_problem`, and the agent is asked to correct
+it, when it contains:
+
+- an HTML comment opening a controller marker (`<!-- ai-` or
+  `<!-- autoforge-`, any spacing or case);
+- a credential class `redaction.credential_classes` recognises (named, never
+  quoted);
+- a closing keyword followed by an issue reference, even inside code;
+- an `@`-mention outside a code span or fenced block.
+
+`published_payload_problem` applies the credential rule to a whole payload,
+so a credential split across fields is refused too.
 
 ## Merge safety
 
@@ -653,14 +752,18 @@ controller is the only party that writes the body (`autoforge.roadmap`,
   marker in the spelling the claims scanner reads, whitespace after `<!--`
   or none, since the roadmap markers would split the body into more than
   one section and any other marker would plant a durable claim in an open
-  issue the controller scans). A required section that is missing is rejected
-  (`VerificationError`, no reset, `resume` asks again).
-- **Only the section changes.** The controller re-reads the body, refuses
-  to write when the bytes outside the markers differ from the body the entry
-  read (the section was composed against a stale view; the next entry
-  re-reads), replaces the text between the markers or appends the block
-  after the existing text when there is none, and writes the whole body
-  with `gh issue edit --body-file` (the body never travels in argv).
+  issue the controller scans). A required section that is missing is a
+  correction of the result before anything is posted
+  (`ControlResultValidationError`, no reset).
+- **Only the section changes.** The controller re-reads the body and
+  refuses to write when the bytes outside the markers differ from the body
+  the entry read: the completion context stores their digest, the section
+  was composed against a stale view, so it is voided and `resume` re-reads
+  the body and re-requests the section alone (the progress comment is not
+  posted again). Otherwise it replaces the text between the markers or
+  appends the block after the existing text when there is none, and writes
+  the whole body with `gh issue edit --body-file` (the body never travels in
+  argv).
 - **The write is read back.** After the write the body is read again: every
   byte outside the markers must equal the body read before the write (plus
   the two marker lines when the section was appended), and the section must
@@ -668,11 +771,11 @@ controller is the only party that writes the body (`autoforge.roadmap`,
   a conclusive GitHub failure or a body whose markers can no longer be read
   is `BLOCKED`; an unavailable GitHub propagates and `resume` re-enters.
 - **The counter resets after the read-back, never before.** A crash between
-  the write and the state save re-enters `UPDATE_EPIC`: the entry reads the
-  body with the section in place, the agent (adopting its progress comment)
-  returns the section again, the controller finds the spliced body equal to
-  the current one, writes nothing, and resets. The splice replaces in place
-  and never appends a second block, so a retry cannot double-apply.
+  the write and the state save re-enters `UPDATE_EPIC`, which completes from
+  the persisted context without launching the agent: the controller finds
+  the spliced body equal to the current one, writes nothing, and resets.
+  The splice replaces in place and never appends a second block, so a retry
+  cannot double-apply.
 
 Do not rewrite the whole EPIC body, and never edit the EPIC body from a
 prompt.

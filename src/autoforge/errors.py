@@ -105,3 +105,23 @@ class CheckoutDriftError(VerificationError):
     BLOCKED with the message as its reason. The invocation's own outcome, if
     it failed, is the ``__cause__`` and is quoted in the message.
     """
+
+
+class GitTransportError(AutoForgeError):
+    """A controller git operation could not establish what it needs (fails closed).
+
+    Raised by :mod:`autoforge.git_transport` when a fetch or push fails, a
+    commit's bytes do not hash to its id, a range walk exceeds its bound or
+    never reaches its base, or GitHub's ancestry answer is unavailable. It is
+    never read as "allowed" (ADR 0004 D7.5).
+    """
+
+
+class EffectConflictError(AutoForgeError):
+    """A controller-owned effect cannot be completed without guessing (ADR 0004 D4.2).
+
+    The effect's identity resolves to an object whose payload or state differs
+    from the record, to two objects, or the precondition no longer holds and
+    the attempt bound leaves no issue. The message names the object and the
+    rule, never the payload; the phase enters ``BLOCKED`` with it.
+    """
