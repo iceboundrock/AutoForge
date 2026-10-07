@@ -186,6 +186,7 @@ from .premerge import (
     fetch_pr_head,
 )
 from .profiles import REQUIRED_PROFILES, local_required_profiles, profile_for_phase
+from .progress import ProgressReporter
 from .prompts import (
     COMMON_TEMPLATE,
     LOCAL_COMMON_TEMPLATE,
@@ -255,7 +256,7 @@ from .roadmap import (
     split_roadmap,
 )
 from .run_contract import LocalRunContract, validate_local_run_contract
-from .runlog import ExecutionRecord, RunLogger
+from .runlog import ExecutionRecord, RunLogger, StepLog
 from .safefs import SafeRoot
 from .state import (
     STATE_FILENAME,
@@ -635,6 +636,11 @@ class ControllerEngine:
         # True while self.state is a snapshot of state.json taken by load();
         # such a snapshot is re-read under a self-acquired execution lock.
         self._state_from_disk = False
+        # Where an agent launch's live progress lines go besides the step's
+        # ``progress.log`` (#192): the CLI sets it to a stderr writer for a
+        # real run. ``None`` (a library caller, a test, a dry run) prints
+        # nothing; the log is written either way.
+        self.progress_output: Callable[[str], None] | None = None
 
     # -- the state directory as a held capability --------------------------
     @property
@@ -2029,6 +2035,7 @@ class ControllerEngine:
         max_steps: int = 50,
         dry_run: bool = False,
         allow_merge: bool = False,
+        on_outcome: Callable[[StepOutcome], None] | None = None,
     ) -> list[StepOutcome]:
         """Loop ``step()`` until a stop phase or ``max_steps``.
 
@@ -2037,6 +2044,11 @@ class ControllerEngine:
         through the controller-side pre-merge verification, MERGE and
         UPDATE_EPIC, so ``resume --allow-merge`` re-checks inconclusive
         GitHub data (bounded by ``merge.max_verification_attempts``).
+
+        ``on_outcome`` is called with each step's outcome as soon as the
+        step finished, before the next one starts (the CLI prints it, #192);
+        the list returned is the same outcomes. It is not called for a dry
+        run, whose plans are returned at once.
         """
         if max_steps < 1:
             raise ValueError("max_steps must be >= 1")
@@ -2062,7 +2074,10 @@ class ControllerEngine:
                 assert self.state is not None
                 if self.state.phase in stop_phases:
                     break
-                all_outcomes.append(self._step_once(dry_run=False, allow_merge=allow_merge))
+                outcome = self._step_once(dry_run=False, allow_merge=allow_merge)
+                all_outcomes.append(outcome)
+                if on_outcome is not None:
+                    on_outcome(outcome)
         return all_outcomes
 
     # -- single step ---------------------------------------------------------
@@ -6388,6 +6403,12 @@ class ControllerEngine:
             # therefore never leaves controller state claiming the phase was
             # not yet attempted (#55, PR #89).
             self._save()
+            # The step's log directory and its ``progress.log`` are published
+            # here, after the attempt is persisted and before the launch, so
+            # the progress lines can be followed while the agent runs and
+            # survive a kill. A refusal lands like a crash between the save
+            # and the launch: nothing was launched.
+            step_log = self._begin_step(logger, phase)
             req = AgentRequest(
                 phase=phase.value,
                 prompt=prompt,
@@ -6422,10 +6443,10 @@ class ControllerEngine:
             )
             result: AgentExecutionResult | None = None
             try:
-                result = provider.execute(req)
+                result = self._launch(provider, req, step_log, phase)
             except ExecutionError as exc:
                 record.error = f"{type(exc).__name__}: {exc}"
-                self._record_invocation(logger, record, prompt, "", "", phase)
+                self._record_invocation(logger, record, prompt, "", "", phase, step_log)
                 raise
             record.started_at = result.started_at
             record.finished_at = result.finished_at
@@ -6449,7 +6470,7 @@ class ControllerEngine:
             stdout, stderr = result.stdout or "", result.stderr or ""
             if result.timed_out:
                 record.error = _with_leftovers(f"timed out after {timeout}s", result.leftovers)
-                self._record_invocation(logger, record, prompt, stdout, stderr, phase)
+                self._record_invocation(logger, record, prompt, stdout, stderr, phase, step_log)
                 raise ExecutionTimeoutError(
                     _with_leftovers(
                         f"agent '{profile.name}' timed out after {timeout}s and was killed",
@@ -6462,7 +6483,7 @@ class ControllerEngine:
                 # exit status: handled exactly like a failed exit, and checked
                 # before it because the reason says more (ADR 0003 §2.6).
                 record.error = _with_leftovers(result.provider_failure, result.leftovers)
-                self._record_invocation(logger, record, prompt, stdout, stderr, phase)
+                self._record_invocation(logger, record, prompt, stdout, stderr, phase, step_log)
                 raise ExecutionError(
                     _with_leftovers(
                         f"agent '{profile.name}' failed: {result.provider_failure}",
@@ -6473,7 +6494,7 @@ class ControllerEngine:
                 )
             if result.exit_code != 0:
                 record.error = _with_leftovers(f"exit {result.exit_code}", result.leftovers)
-                self._record_invocation(logger, record, prompt, stdout, stderr, phase)
+                self._record_invocation(logger, record, prompt, stdout, stderr, phase, step_log)
                 raise ExecutionError(
                     _with_leftovers(
                         f"agent '{profile.name}' exited {result.exit_code}", result.leftovers
@@ -6506,7 +6527,7 @@ class ControllerEngine:
                         "and end it with the CONTROL_RESULT block)"
                     )
                 record.error = f"{type(exc).__name__}: {detail}"
-                self._record_invocation(logger, record, prompt, stdout, stderr, phase)
+                self._record_invocation(logger, record, prompt, stdout, stderr, phase, step_log)
                 if attempt <= max_corrections:
                     # A correction re-launches the same write-capable agent;
                     # the top of the loop charges it against the same durable
@@ -6518,8 +6539,74 @@ class ControllerEngine:
                     f"{attempt} attempt(s): {detail}"
                 ) from exc
             record.parsed_result = payload
-            self._record_invocation(logger, record, prompt, stdout, stderr, phase)
+            self._record_invocation(logger, record, prompt, stdout, stderr, phase, step_log)
             return payload
+
+    def _begin_step(self, logger: RunLogger, phase: Phase) -> StepLog:
+        """Publish the launch's step directory and open its ``progress.log``, or refuse."""
+        state = self._require_state()
+        try:
+            return logger.begin_step(phase.value, state.attempt)
+        except StateError as exc:
+            # Re-raised as the same object, as in :meth:`_record_invocation`;
+            # the attempt was persisted, so this is a crash before the launch.
+            exc.args = (
+                f"{exc} -- the run log refused the step directory of {phase.value} before "
+                "the agent was launched, so nothing was launched; repair the log directory, "
+                "then 'resume'",
+            )
+            raise
+
+    def _progress_label(self, phase: Phase) -> str:
+        """The prefix of a launch's progress lines: the phase, and the issue in REMOTE mode."""
+        state = self._require_state()
+        if state.mode == WorkflowMode.REMOTE and state.current_issue_url:
+            try:
+                return f"{phase.value} #{parse_issue_url(state.current_issue_url).number}"
+            except ConfigurationError:
+                pass
+        return phase.value
+
+    def _launch(
+        self, provider, req: AgentRequest, step_log: StepLog, phase: Phase
+    ) -> AgentExecutionResult:
+        """Run the agent with its live progress reported, then close the progress log.
+
+        The lines go to the step's ``progress.log`` and to
+        :attr:`progress_output` when set. One line before the launch names
+        what is launched, where, and where its log is; one after says how it
+        ended. The reporter's heartbeat thread is joined before this
+        returns, and progress never changes the outcome: an output that
+        fails is dropped (:class:`autoforge.progress.ProgressReporter`).
+        """
+        profile = req.profile
+        outputs: list[Callable[[str], None]] = [step_log.append]
+        if self.progress_output is not None:
+            outputs.append(self.progress_output)
+        try:
+            with ProgressReporter(self._progress_label(phase), outputs) as reporter:
+                reporter.line(
+                    f"launching {profile.name} ({profile.provider}, model "
+                    f"{profile.model or 'default'}, effort {profile.effort or 'default'}), "
+                    f"timeout {req.timeout_seconds}s, attempt {req.attempt}, "
+                    f"worktree {req.cwd}, log {step_log.path}"
+                )
+                req.progress = reporter.sink
+                try:
+                    result = provider.execute(req)
+                except ExecutionError as exc:
+                    reporter.line(f"agent could not be run: {type(exc).__name__}")
+                    raise
+                if result.timed_out:
+                    end = f"timed out after {req.timeout_seconds}s"
+                elif result.provider_failure:
+                    end = f"failed: {result.provider_failure}"
+                else:
+                    end = f"exited {result.exit_code}"
+                reporter.line(f"agent {end}, {reporter.events} progress events")
+                return result
+        finally:
+            step_log.close()
 
     def _record_invocation(
         self,
@@ -6529,6 +6616,7 @@ class ControllerEngine:
         stdout: str,
         stderr: str,
         phase: Phase,
+        step_log: StepLog | None = None,
     ) -> None:
         """Publish the invocation's artifacts and journal line, or refuse loudly.
 
@@ -6548,7 +6636,7 @@ class ControllerEngine:
         """
         state = self._require_state()
         try:
-            logger.log_execution(record, prompt, stdout, stderr)
+            logger.log_execution(record, prompt, stdout, stderr, step_log=step_log)
         except StateError as exc:
             # Re-raised as the same object: its type is the filesystem cause
             # (an oversized journal, an unsafe path) and callers distinguish

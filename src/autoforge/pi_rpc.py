@@ -36,6 +36,16 @@ Every string that leaves this module for a log (a failure reason, a summary
 value) is bounded, made encodable, redacted and put on one line here. Raw
 records, the ``get_state`` object, the model list and message contents
 other than the final text never leave it.
+
+Live progress (#192): with an ``emit`` sink, every event record becomes a
+:class:`~autoforge.progress.ProgressEvent`. ``tool_execution_start`` is a
+tool start whose detail is one allow-listed argument (:data:`TOOL_DETAILS`;
+never ``bash``'s command), ``tool_execution_end`` a finished or failed tool
+by its ``isError``, a ``message_update`` whose ``assistantMessageEvent`` is
+a thinking or text delta is thinking or assistant text (never its content),
+``auto_retry_start`` a provider retry with its attempt numbers, the
+accepted prompt the start, and anything else bare activity. The argument
+names are read from Pi's tool schemas at v1.0.x, not from a run.
 """
 
 from __future__ import annotations
@@ -46,6 +56,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from .progress import ProgressEvent, ProgressKind, ProgressSink, relative_path
 from .redaction import redact
 
 # Extension UI methods that wait for an answer (``editor`` has no Pi-side
@@ -93,6 +104,17 @@ _ROUND_TRIPS = frozenset({"get_state", "get_available_models", "get_last_assista
 
 MAX_REASON_CHARS = 400
 MAX_VALUE_CHARS = 200
+# The one argument shown per Pi tool in progress; ``bash`` has only its
+# command, which is never shown.
+TOOL_DETAILS: dict[str, str] = {
+    "read": "path",
+    "edit": "path",
+    "write": "path",
+    "ls": "path",
+    "grep": "pattern",
+    "find": "pattern",
+}
+_PATH_ARGS = frozenset({"path"})
 # JavaScript's ``String.prototype.trim`` set (WhiteSpace and LineTerminator,
 # ECMA-262): not Python's ``str.isspace``, which adds U+001C..U+001F and
 # U+0085 and lacks U+FEFF.
@@ -148,7 +170,11 @@ class PiConversation:
         prompt: str,
         round_trip_seconds: float,
         new_id: Callable[[], str] | None = None,
+        emit: ProgressSink | None = None,
+        cwd: str = "",
     ) -> None:
+        self._emit = emit
+        self._cwd = cwd
         self._model = model
         self._provider, _, self._model_id = model.partition("/")
         self._thinking = thinking
@@ -213,6 +239,12 @@ class PiConversation:
         except (UnicodeDecodeError, json.JSONDecodeError):
             self._protocol("a stdout record is not JSON")
             return []
+        except (ValueError, RecursionError):
+            # The decoder's integer-digit and nesting limits, which are not
+            # JSONDecodeError (as in ``claude_stream``); an interrupt still
+            # propagates.
+            self._protocol("a stdout record exceeds the JSON decoder's integer or nesting limit")
+            return []
         if not isinstance(record, dict) or not isinstance(record.get("type"), str):
             self._protocol("a stdout record is not a JSON object with a 'type'")
             return []
@@ -226,6 +258,7 @@ class PiConversation:
             if kind == "agent_settled":
                 self._settled = True
             return []
+        self._progress(kind, record)
         if kind in _REDUCED_EVENTS:
             return self._event(kind, record, now)
         if kind not in _IGNORED_EVENTS:
@@ -402,6 +435,7 @@ class PiConversation:
             self._protocol(f"prompt disposition {bounded(disposition)!r}, expected 'started'")
             return
         self._prompt_started = True
+        self._send(ProgressEvent(ProgressKind.STARTED, detail=self._model))
 
     def _check_text(self, data: object) -> None:
         if not isinstance(data, dict):
@@ -498,6 +532,56 @@ class PiConversation:
         self._dialogs_cancelled += 1
         self._fail(f"pi: an extension asked for input ({method}); the dialog was cancelled")
         return [_encode({"type": "extension_ui_response", "id": request_id, "cancelled": True})]
+
+    def _send(self, event: ProgressEvent) -> None:
+        if self._emit is not None:
+            self._emit(event)
+
+    def _progress(self, kind: str, record: dict) -> None:
+        """Report one event record as progress (module docstring)."""
+        if self._emit is None:
+            return
+        if kind == "tool_execution_start":
+            name = record.get("toolName")
+            name = name if isinstance(name, str) else ""
+            args = record.get("args")
+            detail = ""
+            arg = TOOL_DETAILS.get(name)
+            if arg is not None and isinstance(args, dict):
+                value = args.get(arg)
+                if arg in _PATH_ARGS:
+                    detail = relative_path(value, self._cwd)
+                elif isinstance(value, str):
+                    detail = value
+            self._send(ProgressEvent(ProgressKind.TOOL_STARTED, tool=name, detail=detail))
+        elif kind == "tool_execution_end":
+            name = record.get("toolName")
+            failed = record.get("isError") is True
+            self._send(
+                ProgressEvent(
+                    ProgressKind.TOOL_FAILED if failed else ProgressKind.TOOL_FINISHED,
+                    tool=name if isinstance(name, str) else "",
+                )
+            )
+        elif kind == "message_update":
+            update = record.get("assistantMessageEvent")
+            step = update.get("type") if isinstance(update, dict) else None
+            if isinstance(step, str) and step.startswith("thinking"):
+                self._send(ProgressEvent(ProgressKind.THINKING))
+            elif isinstance(step, str) and step.startswith("text"):
+                self._send(ProgressEvent(ProgressKind.ASSISTANT_TEXT))
+            else:
+                self._send(ProgressEvent(ProgressKind.ACTIVITY))
+        elif kind == "auto_retry_start":
+            attempt, limit = record.get("attempt"), record.get("maxAttempts")
+            detail = ""
+            if isinstance(attempt, int) and not isinstance(attempt, bool):
+                detail = f"attempt {attempt}"
+                if isinstance(limit, int) and not isinstance(limit, bool):
+                    detail += f" of {limit}"
+            self._send(ProgressEvent(ProgressKind.PROVIDER_RETRY, detail=detail))
+        else:
+            self._send(ProgressEvent(ProgressKind.ACTIVITY))
 
     def _event(self, kind: str, record: dict, now: float) -> list[bytes]:
         if kind == "agent_settled":

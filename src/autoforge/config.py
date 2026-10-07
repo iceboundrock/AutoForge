@@ -522,7 +522,7 @@ def _claude_profile(name: str) -> ProfileConfig:
         effort="high",
         command="claude",
         extra_args=[],
-        options={"permission_mode": "bypassPermissions", "output_format": "text"},
+        options={"permission_mode": "bypassPermissions", "output_format": "stream-json"},
     )
 
 

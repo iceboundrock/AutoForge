@@ -163,6 +163,36 @@ profile, or a Claude flag in a Pi argv, would be wrong). Before #129 a
 provider switch kept the default's `command`, `options` and `extra_args`;
 restate any of them you relied on.
 
+### Claude profiles
+
+`provider: claude` runs Claude Code non-interactively. `model` is a
+`claude --model` alias or id, `effort` is sent as `--effort`
+(`low|medium|high|xhigh|max`), `options.permission_mode` as
+`--permission-mode`, and `extra_args` are appended after the adapter's own
+flags:
+
+```text
+claude -p --output-format stream-json --verbose --model <model> --effort <effort>
+   --permission-mode <mode> --no-session-persistence [extra_args] -- <prompt>
+```
+
+`options.output_format` is `stream-json` (the default) or `text`:
+
+- `stream-json` makes the CLI print one JSON record per event while the agent
+  works. The adapter reads them as they arrive and turns them into the live
+  progress lines described in [usage.md](usage.md#watching-an-agent-run);
+  the final `result` record's text is what the controller parses for the
+  `CONTROL_RESULT` block, exactly as with `text`. An error result
+  (`is_error`, a subtype other than `success`), a line that is not JSON, or
+  no `result` record before the CLI exits fails the step as a provider
+  failure. A record larger than the per-line bound is counted and skipped
+  unless it is the `result` record, which must arrive whole.
+- `text` is the opt-out: the CLI prints the final text once, at exit, so
+  the run shows no progress and gives no sign of activity while it works
+  (the pre-launch line, the heartbeat and the end line still appear).
+
+Any other value is a configuration error.
+
 ### OpenCode profiles
 
 `provider: opencode` runs the OpenCode CLI, 2.0.0 or newer (#186); `autoforge

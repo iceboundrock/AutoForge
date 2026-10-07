@@ -1,5 +1,6 @@
 """Provider adapters: exact CLI argv shapes, validation, scripted fake."""
 
+import dataclasses
 import hashlib
 import json
 import sys
@@ -18,6 +19,12 @@ from autoforge.providers import (
     ScriptedProvider,
     provider_for,
 )
+from tests.conftest import DECODER_LIMIT_RECORDS
+
+
+def _text(profile: ProfileConfig) -> ProfileConfig:
+    """``profile`` with Claude's one-shot ``output_format: text`` opt-out (#192)."""
+    return dataclasses.replace(profile, options={**profile.options, "output_format": "text"})
 
 
 def test_claude_argv_shape():
@@ -25,7 +32,8 @@ def test_claude_argv_shape():
     argv = ClaudeCodeProvider().build_command_for(p, "do it; rm -rf /")
     assert argv[0] == "claude"
     assert argv[1] == "-p"
-    assert argv[argv.index("--output-format") + 1] == "text"
+    # stream-json is the default and the CLI refuses it under -p without --verbose.
+    assert argv[2:5] == ["--output-format", "stream-json", "--verbose"]
     assert argv[argv.index("--model") + 1] == "fable"
     assert argv[argv.index("--effort") + 1] == "high"
     assert argv[argv.index("--permission-mode") + 1] == "bypassPermissions"
@@ -33,11 +41,21 @@ def test_claude_argv_shape():
     assert argv[-2:] == ["--", "do it; rm -rf /"]  # prompt is one literal element
 
 
-def test_claude_rejects_non_text_output_format():
+def test_claude_text_opt_out_argv_has_no_verbose():
+    p = _text(default_config().profile("analyze_execute"))
+    ClaudeCodeProvider().validate_profile(p)
+    argv = ClaudeCodeProvider().build_command_for(p, "do it")
+    assert argv[2:4] == ["--output-format", "text"]
+    assert "--verbose" not in argv
+    assert argv[-2:] == ["--", "do it"]
+
+
+def test_claude_rejects_an_unknown_output_format():
     # Regression: a claude profile with opencode's `output_format: default`
     # must fail at config validation, not at runtime with
     # `option '--output-format <format>' argument 'default' is invalid`.
-    for bad in ("default", "json", "stream-json"):
+    # `json` prints one object at exit: no progress, so it is refused too.
+    for bad in ("default", "json", "stream_json", "TEXT"):
         p = ProfileConfig(
             name="x",
             provider="claude",
@@ -140,7 +158,7 @@ def test_opencode_hands_the_prompt_to_the_runner_as_stdin():
 
 def test_claude_keeps_stdin_on_dev_null():
     seen = []
-    p = default_config().profile("fix")
+    p = _text(default_config().profile("fix"))
     ClaudeCodeProvider(runner=_capture_runner(seen)).execute(AgentRequest("FIX", "p", "/tmp", p, 7))
     assert seen[0].stdin_data is None
 
@@ -175,6 +193,444 @@ def test_a_prompt_the_cli_did_not_take_whole_is_a_provider_failure(exit_code, ti
             "opencode: the prompt was not delivered: the CLI exited without reading "
             "the last 10 bytes of it"
         )
+
+
+# -- a fake `claude` streaming stream-json under the duplex handle (#192) ------------
+def _claude_run(tmp_path, lines, timeout=30, events=None, **kw):
+    from tests import claude_fake
+
+    home, profile = claude_fake.fake_claude(tmp_path, lines, **kw)
+    sink = None if events is None else events.append
+    req = AgentRequest("FIX", "fix it", str(tmp_path), profile, timeout, progress=sink)
+    return home, ClaudeCodeProvider().execute(req)
+
+
+def test_a_fake_claude_stream_is_reduced_to_the_result_text_verbatim(tmp_path):
+    from autoforge.progress import ProgressKind
+    from autoforge.result_parser import extract_last_block
+    from tests import claude_fake
+    from tests.conftest import block
+
+    payload = {"phase": "FIX", "status": "success", "message": 'quoted "x" \\ and 中'}
+    text = "Fixed it.\n" + block(payload)
+    events = []
+    home, res = _claude_run(
+        tmp_path,
+        [
+            claude_fake.init(),
+            claude_fake.thinking("let me think"),
+            claude_fake.tool_use("t1", "Read", file_path=str(tmp_path / "src" / "a.py")),
+            claude_fake.tool_result("t1", "contents"),
+            claude_fake.tool_use("t2", "Bash", command="make check", description="Run checks"),
+            claude_fake.tool_result("t2", "boom", is_error=True),
+            claude_fake.result(text),
+        ],
+        events=events,
+    )
+    assert res.ok and res.provider_failure is None, (res.exit_code, res.stderr)
+    assert res.stdout == text and res.stdout_tail == text
+    assert json.loads(extract_last_block(res.stdout_tail)) == payload
+    log = claude_fake.log(home)
+    assert log["argv"][:4] == ["-p", "--output-format", "stream-json", "--verbose"]
+    assert log["argv"][-2:] == ["--", "fix it"]
+    assert log["stdin_is_devnull"] is True
+    assert log["cwd"] == str(tmp_path)
+    shown = [(e.kind, e.tool, e.detail) for e in events if e.kind != ProgressKind.ACTIVITY]
+    assert shown == [
+        (ProgressKind.STARTED, "", "claude-fable-5-1"),
+        (ProgressKind.THINKING, "", ""),
+        (ProgressKind.TOOL_STARTED, "Read", "src/a.py"),
+        (ProgressKind.TOOL_FINISHED, "Read", ""),
+        (ProgressKind.TOOL_STARTED, "Bash", "Run checks"),
+        (ProgressKind.TOOL_FAILED, "Bash", ""),
+    ]
+    summary = res.provider_summary
+    assert summary["cost_micro_usd"] == 12_500 and summary["num_turns"] == 3
+    assert summary["tool_calls"] == 2 and summary["tool_errors"] == 1
+    assert summary["failure"] == "" and summary["records"] == 7
+    assert all(type(v) in (str, int, bool) for v in summary.values())
+
+
+@pytest.mark.parametrize(
+    ("lines", "exit_code", "failure"),
+    [
+        (
+            ["RESULT_OK_IS_ERROR"],
+            0,
+            "claude: the run ended in an error (subtype success, terminal_reason completed)",
+        ),
+        (["RESULT_MAX_TURNS"], 0, "claude: the run did not succeed (subtype error_max_turns)"),
+        (
+            ["not json", "RESULT_OK"],
+            0,
+            "claude: stream-json protocol violation: a stdout line is not JSON",
+        ),
+        ([], 0, "claude: exited without a result event (exit 0)"),
+        ([], 1, "claude: exited without a result event (exit 1)"),
+        *(
+            pytest.param(
+                [line.decode(), "RESULT_OK"],
+                0,
+                "claude: stream-json protocol violation: a stdout line exceeds the JSON "
+                "decoder's integer or nesting limit",
+                id=name,
+            )
+            for name, line in DECODER_LIMIT_RECORDS.items()
+        ),
+    ],
+)
+def test_a_fake_claude_failure_is_a_provider_failure_with_no_stdout(
+    tmp_path, lines, exit_code, failure
+):
+    from tests import claude_fake
+
+    expand = {
+        "RESULT_OK": claude_fake.result("done"),
+        "RESULT_OK_IS_ERROR": claude_fake.result("done", is_error=True),
+        "RESULT_MAX_TURNS": claude_fake.result("done", subtype="error_max_turns"),
+    }
+    _, res = _claude_run(
+        tmp_path, [claude_fake.init(), *(expand.get(x, x) for x in lines)], exit_code=exit_code
+    )
+    assert res.provider_failure is not None and res.provider_failure.startswith(failure)
+    assert res.provider_summary["failure"] == res.provider_failure
+    assert res.stdout == "" and res.exit_code == exit_code and not res.timed_out
+
+
+def test_a_fake_claude_that_overruns_its_timeout_is_killed_and_timed_out(tmp_path):
+    import time
+
+    from tests import claude_fake
+
+    started = time.monotonic()
+    _, res = _claude_run(tmp_path, [claude_fake.init(), {"sleep": 60}], timeout=1)
+    assert time.monotonic() - started < 30
+    assert res.timed_out and res.provider_failure is None and res.stdout == ""
+    assert res.exit_code != 0
+
+
+@pytest.mark.parametrize(
+    ("status", "lines", "failure"),
+    [
+        (0, ["RESULT"], None),
+        (3, [], "claude: exited without a result event (exit 3)"),
+    ],
+)
+def test_a_pipe_holding_leftover_after_the_cli_exits_is_killed_not_a_timeout(
+    tmp_path, monkeypatch, status, lines, failure
+):
+    """R3-F1, ADR 0002: the CLI exits while a helper it started still holds
+    its stdout. EOF never comes on its own, so the driver must watch the
+    CLI's exit, not EOF: the helper gets the exit grace, is killed with the
+    group, and the CLI's own status and outcome are kept. Before the fix the
+    driver waited for EOF until the deadline and reported a timeout."""
+    import time
+
+    from autoforge import executor
+    from tests import claude_fake
+    from tests.test_executor import _gone, _kill_quietly
+
+    monkeypatch.setattr(executor, "_EXIT_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    text = "Fixed.\n" + "done"
+    expand = {"RESULT": claude_fake.result(text)}
+    started = time.monotonic()
+    home, res = _claude_run(
+        tmp_path,
+        [claude_fake.init(), {"spawn_holder": 60}, *(expand[x] for x in lines)],
+        timeout=20,
+        exit_code=status,
+    )
+    elapsed = time.monotonic() - started
+    (pid,) = claude_fake.holders(home)
+    try:
+        assert not res.timed_out and res.exit_code == status
+        assert res.provider_failure == failure
+        assert res.stdout == ("" if failure else text)
+        assert res.descendants_killed and "left processes behind" in res.leftovers
+        assert not (res.group_survived_kill or res.capture_abandoned)
+        assert elapsed < 10, elapsed  # the grace and the kill, never the deadline
+        assert _gone(pid, within=5), "the pipe-holding helper outlived the invocation"
+    finally:
+        _kill_quietly(pid)
+
+
+def test_a_cli_that_exits_just_before_its_deadline_is_not_a_timeout(tmp_path, monkeypatch):
+    """R3-F1: the CLI exits in time, but a helper holding its stdout makes the
+    exit grace and the kill run past the deadline. The CLI did not overrun,
+    so the rest of stdout is still read and the result kept, as ``execute()``
+    keeps it; the deadline bounds the CLI's exit, not the cleanup after it."""
+    from autoforge import executor
+    from tests import claude_fake
+    from tests.test_executor import _kill_quietly
+
+    monkeypatch.setattr(executor, "_EXIT_GRACE_SECONDS", 1.5)
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    home, res = _claude_run(
+        tmp_path,
+        [claude_fake.init(), {"spawn_holder": 60}, {"sleep": 1.0}, claude_fake.result("done")],
+        timeout=2,
+    )
+    (pid,) = claude_fake.holders(home)
+    try:
+        assert not res.timed_out and res.exit_code == 0
+        assert res.provider_failure is None and res.stdout == "done"
+        assert res.descendants_killed
+    finally:
+        _kill_quietly(pid)
+
+
+def test_a_leftover_that_keeps_writing_does_not_hide_the_cli_exit(tmp_path, monkeypatch):
+    """R4-F1, ADR 0002: a helper the CLI left behind writes a valid line every
+    30 ms, so every read finds one and no read ever goes quiet. The CLI's exit
+    is still seen while the lines keep coming: the helper gets the exit
+    grace and is killed with the group, its lines are fed like the rest, and
+    the CLI's own status and result are kept. Before the fix the driver only
+    looked at the CLI after a quiet read and reported a timeout."""
+    import time
+
+    from autoforge import executor
+    from tests import claude_fake
+    from tests.test_executor import _gone, _kill_quietly
+
+    monkeypatch.setattr(executor, "_EXIT_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    hook = claude_fake.line({"type": "system", "subtype": "hook_response"}) + "\n"
+    started = time.monotonic()
+    home, res = _claude_run(
+        tmp_path,
+        [
+            claude_fake.init(),
+            {"spawn_holder": 60, "every": 0.03, "then": hook},
+            {"sleep": 0.3},
+            claude_fake.result("done"),
+        ],
+        timeout=10,
+    )
+    elapsed = time.monotonic() - started
+    (pid,) = claude_fake.holders(home)
+    try:
+        assert not res.timed_out and res.exit_code == 0
+        assert res.provider_failure is None and res.stdout == "done"
+        assert res.descendants_killed and not (res.group_survived_kill or res.capture_abandoned)
+        assert elapsed < 8, elapsed  # the grace and the kill, never the deadline
+        assert _gone(pid, within=5), "the chatty helper outlived the invocation"
+    finally:
+        _kill_quietly(pid)
+
+
+def test_a_cli_that_overruns_while_a_leftover_keeps_writing_is_timed_out(tmp_path, monkeypatch):
+    """R4-F1: lines that keep arriving never hide a genuine overrun. The CLI is
+    still running at its deadline, so the group is killed and the run is a
+    timeout, however busy its stdout was."""
+    import time
+
+    from autoforge import executor
+    from tests import claude_fake
+    from tests.test_executor import _kill_quietly
+
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    hook = claude_fake.line({"type": "system", "subtype": "hook_response"}) + "\n"
+    started = time.monotonic()
+    home, res = _claude_run(
+        tmp_path,
+        [claude_fake.init(), {"spawn_holder": 60, "every": 0.03, "then": hook}, {"sleep": 60}],
+        timeout=1,
+    )
+    elapsed = time.monotonic() - started
+    try:
+        assert res.timed_out and res.exit_code == -1
+        assert res.provider_failure is None
+        assert elapsed < 10, elapsed
+    finally:
+        for pid in claude_fake.holders(home):
+            _kill_quietly(pid)
+
+
+@pytest.mark.parametrize(("linger", "timed_out"), [(0.3, False), (60, True)])
+def test_the_deadline_ending_a_read_checks_the_cli_exit_first(
+    tmp_path, monkeypatch, linger, timed_out
+):
+    """R4-F1: the CLI writes its result, lingers ``linger`` seconds and
+    exits, while a silent helper holds its stdout, and the read waiting for
+    the next line runs into the deadline (the poll is longer than the whole
+    run here, so that read is the final polling interval). A CLI that exited
+    before the deadline did not overrun it, as ``execute()``'s last look at
+    the child is at the deadline: the helper gets the exit grace and the
+    kill and the CLI's status and result are kept. A CLI still running at
+    the deadline is a timeout, as before."""
+    from autoforge import executor, providers
+    from tests import claude_fake
+    from tests.test_executor import _kill_quietly
+
+    monkeypatch.setattr(providers, "CLAUDE_EXIT_POLL_SECONDS", 60.0)
+    monkeypatch.setattr(executor, "_EXIT_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    home, res = _claude_run(
+        tmp_path,
+        [
+            claude_fake.init(),
+            {"spawn_holder": 60},
+            claude_fake.result("done"),
+            {"sleep": linger},
+        ],
+        timeout=3,
+    )
+    (pid,) = claude_fake.holders(home)
+    try:
+        assert res.timed_out is timed_out and res.provider_failure is None
+        if timed_out:
+            assert res.exit_code == -1
+        else:
+            assert res.exit_code == 0 and res.stdout == "done"
+            assert res.descendants_killed
+    finally:
+        _kill_quietly(pid)
+
+
+def test_a_helper_that_exits_within_the_grace_is_neither_killed_nor_reported(tmp_path, monkeypatch):
+    """R3-F1, ADR 0002: a helper the CLI is shutting down as it exits holds
+    stdout briefly and leaves on its own within the exit grace. The result is
+    kept, nothing is killed or reported, and the wait is the helper's, not
+    the grace's."""
+    import time
+
+    from autoforge import executor
+    from tests import claude_fake
+
+    monkeypatch.setattr(executor, "_EXIT_GRACE_SECONDS", 5.0)
+    started = time.monotonic()
+    _, res = _claude_run(
+        tmp_path, [claude_fake.init(), {"spawn_holder": 0.3}, claude_fake.result("done")]
+    )
+    elapsed = time.monotonic() - started
+    assert res.ok and res.exit_code == 0 and not res.timed_out
+    assert res.provider_failure is None and res.stdout == "done"
+    assert res.leftovers == ""
+    assert elapsed < 5, elapsed
+
+
+@pytest.mark.parametrize(
+    ("then", "failure"),
+    [
+        ("SECOND_RESULT", "claude: stream-json protocol violation: a second result event"),
+        ("not json\n", "claude: stream-json protocol violation: a stdout line is not JSON"),
+        (
+            '{"type": "system"',
+            "claude: stream-json protocol violation: stdout ended inside an unterminated line",
+        ),
+        (
+            "HOOK_LINES",
+            "claude: stream-json protocol violation: stdout lines arrived faster than they "
+            "were read",
+        ),
+    ],
+)
+def test_what_stdout_carries_after_the_cli_exits_is_still_validated(
+    tmp_path, monkeypatch, then, failure
+):
+    """R3-F1: a helper that writes to the CLI's stdout after the CLI has exited
+    (within the exit grace) is held to the stream's rules: the lines are fed
+    to the reducer after the exit, so a second result, a malformed line, an
+    unterminated last line and an overflow of the pending queue still fail
+    the run, with the CLI's own exit status."""
+    from autoforge import providers
+    from tests import claude_fake
+
+    monkeypatch.setattr(providers, "CLAUDE_MAX_RECORD_BYTES", 4096)
+    monkeypatch.setattr(providers, "CLAUDE_MAX_PENDING_BYTES", 8192)
+    hook = claude_fake.line({"type": "system", "subtype": "hook_response"})
+    expand = {
+        "SECOND_RESULT": claude_fake.result("again") + "\n",
+        "HOOK_LINES": (hook + "\n") * 400,
+    }
+    _, res = _claude_run(
+        tmp_path,
+        [
+            claude_fake.init(),
+            {"spawn_holder": 0.5, "then": expand.get(then, then)},
+            claude_fake.result("done"),
+        ],
+    )
+    assert res.provider_failure == failure and res.stdout == ""
+    assert res.exit_code == 0 and not res.timed_out
+    assert res.leftovers == ""
+
+
+def test_an_oversize_tool_result_line_is_skipped_and_counted(tmp_path, monkeypatch):
+    from autoforge import providers
+    from tests import claude_fake
+
+    monkeypatch.setattr(providers, "CLAUDE_MAX_RECORD_BYTES", 4096)
+    monkeypatch.setattr(providers, "CLAUDE_MAX_PENDING_BYTES", 8192)
+    _, res = _claude_run(
+        tmp_path,
+        [
+            claude_fake.tool_use("t1", "Read", file_path="big.txt"),
+            claude_fake.tool_result("t1", "x" * 50_000),
+            claude_fake.result("done"),
+        ],
+    )
+    assert res.ok and res.provider_failure is None and res.stdout == "done"
+    assert res.provider_summary["oversize_records"] == 1
+
+
+def test_an_oversize_result_line_fails_the_run(tmp_path, monkeypatch):
+    from autoforge import providers
+    from tests import claude_fake
+
+    monkeypatch.setattr(providers, "CLAUDE_MAX_RECORD_BYTES", 4096)
+    monkeypatch.setattr(providers, "CLAUDE_MAX_PENDING_BYTES", 8192)
+    _, res = _claude_run(tmp_path, [claude_fake.result("y" * 50_000)])
+    assert res.stdout == ""
+    assert res.provider_failure == (
+        "claude: exited without a result event (1 line(s) past the per-line bound were "
+        "skipped; the result must arrive whole in one line) (exit 0)"
+    )
+
+
+def test_the_claude_stream_launch_contains_orphans_and_keeps_stdin_closed(tmp_path, monkeypatch):
+    from autoforge import providers
+    from tests import claude_fake
+
+    seen = []
+    real = providers.start_duplex
+
+    def spy(req):
+        seen.append(req)
+        return real(req)
+
+    monkeypatch.setattr(providers, "start_duplex", spy)
+    home, profile = claude_fake.fake_claude(tmp_path, [claude_fake.result("done")])
+    req = AgentRequest(
+        "FIX", "p", str(tmp_path), profile, 30, env_allowlist=("PATH", "HOME", "CLAUDE_*")
+    )
+    res = ClaudeCodeProvider().execute(req)
+    assert res.ok and res.stdout == "done"
+    (duplex,) = seen
+    assert duplex.contain_orphans and duplex.stdin_pipe is False
+    # The provider's names are added once, never duplicated.
+    assert duplex.env_allowlist == ("PATH", "HOME", "CLAUDE_*", "ANTHROPIC_*")
+    assert duplex.command == ClaudeCodeProvider().build_command(req)
+
+
+def test_a_progress_sink_that_raises_never_fails_the_claude_run(tmp_path):
+    from tests import claude_fake
+
+    calls = []
+
+    def sink(event):
+        calls.append(event)
+        raise RuntimeError("terminal gone")
+
+    home, profile = claude_fake.fake_claude(
+        tmp_path, [claude_fake.init(), claude_fake.thinking("x"), claude_fake.result("done")]
+    )
+    res = ClaudeCodeProvider().execute(
+        AgentRequest("FIX", "p", str(tmp_path), profile, 30, progress=sink)
+    )
+    assert res.ok and res.stdout == "done" and res.provider_failure is None
+    assert len(calls) == 1  # dropped after its first failure
 
 
 # -- a fake `opencode` behind the real executor (#186) -------------------------------
@@ -359,7 +815,7 @@ def test_provider_execute_uses_injected_runner():
         )
 
     prov = ClaudeCodeProvider(runner=runner)
-    p = default_config().profile("fix")
+    p = _text(default_config().profile("fix"))
     res = prov.execute(AgentRequest("FIX", "prompt", "/tmp", p, 7))
     assert res.ok and res.stdout == "ok" and res.model == "fable"
     assert seen[0].timeout_seconds == 7 and seen[0].cwd == "/tmp"
@@ -374,6 +830,8 @@ def test_one_shot_agent_launch_asks_for_orphan_containment(provider, profile):
     (ADR 0002 §4b, #132), whichever provider launches it."""
     seen = []
     p = default_config().profile(profile)
+    if provider is ClaudeCodeProvider:
+        p = _text(p)  # the one-shot path; the stream path is tested with the fake below
     provider(runner=_capture_runner(seen)).execute(AgentRequest("FIX", "prompt", "/tmp", p, 7))
     assert seen[0].contain_orphans
 
@@ -427,7 +885,7 @@ def _capture_runner(seen):
 def test_provider_passes_no_allowlist_through_when_the_request_has_none():
     seen = []
     prov = ClaudeCodeProvider(runner=_capture_runner(seen))
-    prov.execute(AgentRequest("FIX", "prompt", "/tmp", default_config().profile("fix"), 7))
+    prov.execute(AgentRequest("FIX", "prompt", "/tmp", _text(default_config().profile("fix")), 7))
     assert seen[0].env_allowlist is None
 
 
@@ -435,7 +893,12 @@ def test_provider_adds_its_own_environment_names_to_the_request_allowlist():
     seen = []
     prov = ClaudeCodeProvider(runner=_capture_runner(seen))
     req = AgentRequest(
-        "FIX", "prompt", "/tmp", default_config().profile("fix"), 7, env_allowlist=("PATH", "HOME")
+        "FIX",
+        "prompt",
+        "/tmp",
+        _text(default_config().profile("fix")),
+        7,
+        env_allowlist=("PATH", "HOME"),
     )
     prov.execute(req)
     assert seen[0].env_allowlist == ("PATH", "HOME", "ANTHROPIC_*", "CLAUDE_*")

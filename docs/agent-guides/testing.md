@@ -69,7 +69,13 @@ High-priority coverage includes:
   the child's own exit status (0 and non-zero) and output kept and
   `descendants_killed` set; a helper that exits within the grace is neither
   killed nor reported; a `setsid` escapee holding the pipes is reported as an
-  abandoned capture; a clean exit and a clean kill report nothing
+  abandoned capture; a clean exit and a clean kill report nothing. Through
+  the duplex handle, `exited()` reports the child's exit while a descendant
+  still holds stdout, `read_line` after `finish()` returns the rest of
+  stdout at once, never the deadline, and a `read_line` that meets the
+  deadline (waiting into it or starting past it) after the child's exit
+  settles the group with the exit grace and returns the rest, the child's
+  status kept and no timeout reported
 - bounded capture: a stream past the bound keeps its head and tail, the
   retained size honours a bound smaller than one pipe read, and memory stays
   at the bound plus a constant under one-byte reads
@@ -170,6 +176,46 @@ INITIALIZING
 ```
 
 without external writes.
+
+### Live progress (#192)
+
+Progress is observability, never part of an outcome. Keep covered:
+
+- the Claude `stream-json` reducer (`tests/test_claude_stream.py`): the
+  `result` text verbatim, `is_error` checked before the subtype, a
+  malformed line (including one the JSON decoder refuses for its integer or
+  nesting limit, which must not escape as an exception), a missing or
+  second result and an oversize result line each a `provider_failure`, an
+  oversize ordinary line counted and skipped,
+  a flat scalar summary, and no command, thinking, assistant text or tool
+  result in any event
+- the real `ClaudeCodeProvider` on the fake `claude` (`tests/claude_fake.py`):
+  argv, stdin on `/dev/null`, orphan containment, the timeout, and a sink
+  that raises never failing the run
+- the CLI's exit, not EOF, ends the stream (ADR 0002): a helper still
+  holding the CLI's stdout after it exits is killed after the exit grace,
+  the CLI's own status and outcome kept and no timeout reported, also when
+  the grace runs past the deadline, when the helper keeps writing lines so
+  that no read goes quiet, and when the CLI exits during the read that runs
+  into the deadline; a CLI still running at its deadline is a timeout
+  however busy its stdout; a helper that exits within the grace is
+  neither killed nor reported; and what stdout carries after the exit (a
+  second result, a malformed or unterminated line, an overflow) still fails
+  the run
+- cleaning (`tests/test_progress.py`): escapes and controls stripped
+  before redaction and redaction before the clip, so a token split by an
+  escape or cut by the bound is never shown
+- the acceptance test: a fake `claude` whose tool inputs carry a seeded
+  token, a token split by an escape, escape sequences and an environment
+  value runs through the engine, and none of them reaches a progress line,
+  `progress.log` or any file under the state directory; a terminal that
+  fails is dropped without changing the outcome
+- the step directory published before the launch, the bounded
+  `progress.log` and its omitted-lines note, a `progress.log` replaced
+  while the agent ran receiving nothing, and the sequence counting a step
+  whose launch never returned
+- the CLI: each outcome printed as its step ends, progress on stderr only,
+  nothing on a dry run
 
 ### Provider parity (Pi, #133)
 

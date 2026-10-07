@@ -1031,3 +1031,75 @@ def test_a_rewritten_artifact_never_keeps_a_tail_of_the_old_one(tmp_path):
         root.write_text("artifact.log", "a long first line that must not survive\n")
         root.write_text("artifact.log", "short\n")
         assert root.read_text("artifact.log") == "short\n"
+
+
+# -- the step directory published before a launch (#192) ----------------------
+def test_a_step_is_published_before_the_launch_and_its_record_lands_in_it(tmp_path):
+    log = RunLogger(tmp_path / "logs", "run-1")
+    step = log.begin_step("FIX", 2)
+    assert step.seq == 1 and step.name == "001-fix-2"
+    assert step.path == log.run_dir / "001-fix-2"
+    progress = step.path / "progress.log"
+    assert progress.is_file() and progress.read_bytes() == b""
+    step.append("[00:00:01 FIX #2] Read src/a.py")
+    step.append("two\nlines GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789")
+    # Written through as it happens, so it can be followed while the agent runs.
+    assert progress.read_text(encoding="utf-8") == (
+        "[00:00:01 FIX #2] Read src/a.py\ntwo lines GITHUB_TOKEN=***REDACTED***\n"
+    )
+    d = log.log_execution(
+        ExecutionRecord(run_id="run-1", seq=0, phase="FIX", attempt=2), stdout="out", step_log=step
+    )
+    assert d == step.path
+    assert json.loads((d / "request.json").read_text())["seq"] == 1
+    assert (d / "stdout.log").read_text() == "out"
+    assert [json.loads(x)["seq"] for x in log.events_path.read_text().splitlines()] == [1]
+    # Closed by log_execution: a late line is dropped, a second close is a no-op.
+    step.append("late")
+    step.close()
+    assert "late" not in progress.read_text(encoding="utf-8")
+    # The next step, with or without a step log, takes the next number.
+    assert log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="REVIEW")).name == (
+        "002-review-1"
+    )
+
+
+def test_a_step_published_by_a_launch_that_never_returned_is_never_reused(tmp_path):
+    log = RunLogger(tmp_path / "logs", "run-1")
+    step = log.begin_step("ANALYZE_EXECUTE", 1)
+    step.append("[00:00:00 ANALYZE_EXECUTE #2] launching")
+    step.close()
+    del log  # the controller was killed while the agent ran
+    again = RunLogger(tmp_path / "logs", "run-1")
+    assert again.begin_step("ANALYZE_EXECUTE", 1).name == "002-analyze_execute-1"
+    assert (again.run_dir / "001-analyze_execute-1" / "progress.log").read_text() == (
+        "[00:00:00 ANALYZE_EXECUTE #2] launching\n"
+    )
+
+
+def test_the_progress_log_is_bounded_and_says_how_many_lines_it_left_out(tmp_path, monkeypatch):
+    from autoforge import runlog
+
+    monkeypatch.setattr(runlog, "MAX_PROGRESS_LOG_BYTES", 32)
+    step = RunLogger(tmp_path / "logs", "run-1").begin_step("FIX", 1)
+    for n in range(5):
+        step.append(f"line {n} " + "x" * 6)  # 15 bytes with its LF
+    step.close()
+    assert (step.path / "progress.log").read_text(encoding="utf-8") == (
+        "line 0 xxxxxx\nline 1 xxxxxx\n[3 progress line(s) omitted past the 32-byte bound]\n"
+    )
+
+
+def test_a_progress_log_replaced_while_the_agent_ran_receives_nothing(tmp_path):
+    from autoforge.safefs import UnsafePathError
+
+    step = RunLogger(tmp_path / "logs", "run-1").begin_step("FIX", 1)
+    step.append("before")
+    foreign = tmp_path / "operator-notes.txt"
+    foreign.write_text("operator data\n", encoding="utf-8")
+    progress = step.path / "progress.log"
+    os.replace(foreign, progress)  # the agent renames a file over the name
+    with pytest.raises(UnsafePathError, match="refusing to append to"):
+        step.append("after")
+    step.close()
+    assert progress.read_text(encoding="utf-8") == "operator data\n"

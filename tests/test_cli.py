@@ -90,6 +90,73 @@ def test_run_dry_run_writes_nothing(tmp_path, capsys, monkeypatch, fakes):
     assert fakes["gh"].calls == [] and fakes["provider"].calls == []
 
 
+def _opens_the_pr(gh):
+    def agent(req):
+        gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
+        return block(
+            {
+                "phase": "ANALYZE_EXECUTE",
+                "status": "success",
+                "issue_url": ISSUE,
+                "pr_url": PR,
+                "head_sha": SHA_A,
+                "branch": BRANCH,
+            }
+        )
+
+    return agent
+
+
+def test_a_run_prints_each_outcome_as_its_step_ends_and_progress_on_stderr(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """#192: the operator sees a step's outcome when it ends, not after the
+    loop, and the agent's progress on stderr while it runs; stdout keeps the
+    outcomes alone."""
+    monkeypatch.chdir(tmp_path)
+    opens_the_pr = _opens_the_pr(fakes["gh"])
+    while_the_agent_ran = []
+
+    def agent(req):
+        while_the_agent_ran.append(capsys.readouterr())
+        return opens_the_pr(req)
+
+    fakes["handler"] = agent
+    sd = str(tmp_path / ".autoforge")
+    rc = cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "2"])
+    assert rc == 0
+    (before,) = while_the_agent_ran
+    assert "INITIALIZING -> ANALYZE_EXECUTE" in before.out
+    assert "] launching analyze_execute (claude, model fable, effort high)" in before.err
+    assert before.err.startswith("[00:00:00 ANALYZE_EXECUTE #2] launching ")
+    after = capsys.readouterr()
+    assert "ANALYZE_EXECUTE -> REVIEW" in after.out
+    assert "INITIALIZING -> ANALYZE_EXECUTE" not in after.out  # printed once, as it ended
+    assert "ANALYZE_EXECUTE #2] agent exited 0, 0 progress events" in after.err
+    assert "launching" not in before.out + after.out
+    assert "progress events" not in before.out + after.out
+
+
+def test_a_step_shows_progress_and_a_dry_run_shows_none(tmp_path, capsys, monkeypatch, fakes):
+    monkeypatch.chdir(tmp_path)
+    fakes["handler"] = _opens_the_pr(fakes["gh"])
+    sd = str(tmp_path / ".autoforge")
+    assert cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--dry-run"]) == 0
+    assert (
+        cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"])
+        == 0
+    )
+    capsys.readouterr()
+    assert cli.main(["--state-dir", sd, "step", "--dry-run"]) == 0
+    dry = capsys.readouterr()
+    assert "launching" not in dry.err and "progress events" not in dry.err
+    assert fakes["provider"].calls == []
+    assert cli.main(["--state-dir", sd, "step"]) == 0
+    real = capsys.readouterr()
+    assert "ANALYZE_EXECUTE #2] launching analyze_execute" in real.err
+    assert "ANALYZE_EXECUTE -> REVIEW" in real.out and "launching" not in real.out
+
+
 def test_run_bad_url_rejected(tmp_path, capsys, monkeypatch):
     monkeypatch.chdir(tmp_path)
     rc = cli.main(

@@ -6,6 +6,8 @@ Layout::
         events.jsonl                          # one JSON line per invocation, appended
                                               # in place; never read by the controller
         <seq>-<phase>-<attempt>/
+            progress.log      # agent steps only: the live progress lines, appended while
+                              # the agent runs (bounded, redacted; ``tail -f`` it)
             request.json      # phase, profile, provider, model, effort, prompt version,
                               # cwd, timeout, redacted argv (no environment dump)
             prompt.md         # rendered prompt sent to the agent (redacted)
@@ -20,6 +22,13 @@ Layout::
             error.txt         # controller-side error, when the step failed
 
 Logs never pollute state.json.
+
+An agent step's directory is published *before* the launch
+(:meth:`RunLogger.begin_step`), so that its ``progress.log`` can be followed
+while the agent runs and survives a kill; the rest of its artifacts are
+written after the agent returned, as for every other step. A crash in
+between leaves a step directory holding only ``progress.log``, which
+advances the sequence like any other step directory.
 
 The step sequence is recovered from the step directory names, not from the
 journal: a step directory is published (and fsynced) before its journal line
@@ -53,6 +62,7 @@ import json
 import os
 import re
 import secrets
+import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass, field
@@ -128,6 +138,11 @@ MAX_STEP_SEQ = MAX_RUN_LOG_ENTRIES
 # the pre-launch probe, and whatever an operator moved aside are not, and
 # are ignored rather than parsed for a number.
 STEP_DIR_RE = re.compile(r"^(\d+)-[a-z0-9._-]+-\d+$")
+# The most one step's ``progress.log`` may grow to. A line is at most a few
+# hundred bytes and thinking is coalesced, so an hour of a busy agent is
+# well under this; past it, lines are counted and a last line says how many
+# were left out.
+MAX_PROGRESS_LOG_BYTES = 1024 * 1024
 
 
 def validate_run_id(run_id: str) -> str:
@@ -148,6 +163,62 @@ def validate_run_id(run_id: str) -> str:
             "characters, not starting with '.'), never a path, an absolute name or '..'"
         )
     return run_id
+
+
+class StepLog:
+    """An agent step's directory, published before the launch, and its ``progress.log``.
+
+    Returned by :meth:`RunLogger.begin_step`. :meth:`append` is a progress
+    output (:class:`autoforge.progress.ProgressReporter`): each line is
+    redacted and written through the descriptor opened before the launch
+    (:meth:`~autoforge.safefs.SafeRoot.append_to`), so a file an agent put
+    at that name while it ran receives nothing and the append refuses. Past
+    :data:`MAX_PROGRESS_LOG_BYTES` lines are counted instead, and
+    :meth:`close` appends one line saying how many were left out.
+    """
+
+    def __init__(self, seq: int, name: str, path: Path, root: SafeRoot, handle: AppendHandle):
+        self.seq = seq
+        self.name = name
+        self.path = path
+        self._root = root
+        self._handle = handle
+        self._written = 0
+        self._omitted = 0
+        self._closed = False
+        self._lock = threading.Lock()
+
+    def append(self, line: str) -> None:
+        """Append one line (an LF is added), within the bound."""
+        data = redact(line).replace("\n", " ") + "\n"
+        size = len(data.encode("utf-8"))
+        with self._lock:
+            if self._closed:
+                return
+            if self._written + size > MAX_PROGRESS_LOG_BYTES:
+                self._omitted += 1
+                return
+            self._root.append_to(self._handle, data)
+            self._written += size
+
+    def close(self) -> None:
+        """Note the omitted lines, if any, and release the file. Idempotent."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                if self._omitted:
+                    # Past the budget by one bounded line at most.
+                    with suppress(StateError):
+                        self._root.append_to(
+                            self._handle,
+                            f"[{self._omitted} progress line(s) omitted past the "
+                            f"{MAX_PROGRESS_LOG_BYTES}-byte bound]\n",
+                        )
+            finally:
+                self._handle.close()
+                self._root.close()
 
 
 @dataclass
@@ -475,17 +546,53 @@ class RunLogger:
         safe_phase = re.sub(r"[^a-z0-9._-]", "-", phase.lower()) or "unknown"
         return f"{seq:03d}-{safe_phase}-{attempt}"
 
+    def begin_step(self, phase: str, attempt: int) -> StepLog:
+        """Publish the next step's directory and open its ``progress.log``, before a launch.
+
+        The step number is taken here, and the record written after the
+        agent returns (:meth:`log_execution` with ``step=``) lands in this
+        directory. Like the logger's own open, this runs before the agent is
+        launched, so a refusal (a name planted where the directory or the
+        file goes) lands while nothing has run. The directory is held as a
+        capability for the appends; the caller closes the returned log, and
+        :meth:`log_execution` closes it too.
+        """
+        seq = self._seq + 1
+        name = self._step_name(seq, phase, attempt)
+        with self._logs_root() as logs:
+            logs.ensure_dir(f"{self.run_id}/{name}")
+            root = logs.subroot(f"{self.run_id}/{name}")
+        try:
+            handle = root.open_append("progress.log", limit=MAX_PROGRESS_LOG_BYTES)
+        except BaseException:
+            root.close()
+            raise
+        self._seq = seq
+        return StepLog(seq, name, self.run_dir / name, root, handle)
+
     def log_execution(
         self,
         record: ExecutionRecord,
         prompt: str = "",
         stdout: str = "",
         stderr: str = "",
+        *,
+        step_log: StepLog | None = None,
     ) -> Path:
-        """Persist one execution record + artifacts. Returns the step dir."""
-        self._seq += 1
-        record.seq = self._seq
-        step = self._step_name(self._seq, record.phase, record.attempt)
+        """Persist one execution record + artifacts. Returns the step dir.
+
+        With ``step_log`` (an agent step, :meth:`begin_step`) the artifacts
+        go into the directory published before the launch, under its step
+        number, and the progress log is closed first.
+        """
+        if step_log is not None:
+            step_log.close()
+            record.seq = step_log.seq
+            step = step_log.name
+        else:
+            self._seq += 1
+            record.seq = self._seq
+            step = self._step_name(self._seq, record.phase, record.attempt)
         step_dir = self.run_dir / step
         record.log_dir = str(step_dir)
         record.command = redact_argv(record.command)

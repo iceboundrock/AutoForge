@@ -42,6 +42,65 @@ def test_nonzero_returned_not_raised():
         res.raise_if_failed()
 
 
+def test_on_output_is_told_which_stream_each_chunk_came_from():
+    seen: list[str] = []
+    lock = threading.Lock()
+
+    def on_output(name: str) -> None:
+        with lock:
+            seen.append(name)
+
+    code = "import sys; print('out', flush=True); print('err', file=sys.stderr, flush=True)"
+    res = execute(
+        ExecutionRequest(command=[PY, "-c", code], timeout_seconds=30, on_output=on_output)
+    )
+    assert res.ok and res.stdout == "out\n" and res.stderr == "err\n"
+    assert set(seen) == {"stdout", "stderr"}
+
+
+def test_a_failing_on_output_is_unhooked_and_the_drain_goes_on():
+    calls: list[str] = []
+
+    def on_output(name: str) -> None:
+        calls.append(name)
+        raise RuntimeError("observer gone")
+
+    code = "import sys, time\nfor n in range(5):\n    print(n, flush=True); time.sleep(0.01)\n"
+    res = execute(
+        ExecutionRequest(command=[PY, "-c", code], timeout_seconds=30, on_output=on_output)
+    )
+    assert res.ok and res.stdout == "0\n1\n2\n3\n4\n"
+    assert calls == ["stdout"]
+
+
+def test_a_failing_on_output_is_unhooked_for_both_streams():
+    """The first exception unhooks the observer for the other stream too,
+    even while that stream's reader is waiting to call it, and neither
+    drain stops."""
+    calls: list[str] = []
+    lock = threading.Lock()
+
+    def on_output(name: str) -> None:
+        with lock:
+            calls.append(name)
+        time.sleep(0.05)  # the other stream's chunk arrives while this one is in flight
+        raise RuntimeError("observer gone")
+
+    code = (
+        "import sys, time\n"
+        "for n in range(5):\n"
+        "    print('o%d' % n, flush=True); print('e%d' % n, file=sys.stderr, flush=True)\n"
+        "    time.sleep(0.01)\n"
+    )
+    res = execute(
+        ExecutionRequest(command=[PY, "-c", code], timeout_seconds=30, on_output=on_output)
+    )
+    assert res.ok
+    assert res.stdout == "".join(f"o{n}\n" for n in range(5))
+    assert res.stderr == "".join(f"e{n}\n" for n in range(5))
+    assert len(calls) == 1
+
+
 def test_shell_metacharacters_are_literal_argv():
     """A prompt full of shell syntax must arrive as ONE argv element, unevaluated."""
     tricky = "$(touch /tmp/pwned); `id`; rm -rf / && echo $HOME | cat > x; '\"; #"

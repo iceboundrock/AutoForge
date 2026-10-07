@@ -355,9 +355,38 @@ def _report_checks(results: list[CheckResult], as_json: bool, title: str) -> int
     return 0
 
 
-def _finish(engine: ControllerEngine, outcomes: list[StepOutcome], allow_merge: bool) -> int:
-    for o in outcomes:
-        print_step_outcome(o)
+def _progress_line(line: str) -> None:
+    """One live progress line (already bounded and redacted), on stderr at once."""
+    print(line, file=sys.stderr, flush=True)
+
+
+def _show_progress(engine: ControllerEngine) -> None:
+    """Stream a real run's agent progress to stderr (#192).
+
+    Only the non-dry paths call this: a dry run launches nothing. stdout is
+    left to the step outcomes, so nothing about progress reaches output a
+    script reads.
+    """
+    engine.progress_output = _progress_line
+
+
+def _print_outcome_now(o: StepOutcome) -> None:
+    """Print one step's outcome as soon as the step finished, not after the loop."""
+    print_step_outcome(o)
+    sys.stdout.flush()
+
+
+def _finish(
+    engine: ControllerEngine,
+    outcomes: list[StepOutcome],
+    allow_merge: bool,
+    *,
+    printed: bool = False,
+) -> int:
+    """Print the outcomes (unless ``printed`` already, step by step) and the run's end."""
+    if not printed:
+        for o in outcomes:
+            print_step_outcome(o)
     state = engine.state
     assert state is not None
     if state.phase == Phase.READY_FOR_MERGE:
@@ -454,8 +483,14 @@ def cmd_run(args) -> int:
             moved = engine.quarantine_state()
             print(f"autoforge: moved unreadable state file aside: {moved}", file=sys.stderr)
         engine.save()
-        outcomes = engine.run(max_steps=args.max_steps, dry_run=False, allow_merge=args.allow_merge)
-    return _finish(engine, outcomes, args.allow_merge)
+        _show_progress(engine)
+        outcomes = engine.run(
+            max_steps=args.max_steps,
+            dry_run=False,
+            allow_merge=args.allow_merge,
+            on_outcome=_print_outcome_now,
+        )
+    return _finish(engine, outcomes, args.allow_merge, printed=True)
 
 
 def cmd_local_init(args) -> int:
@@ -523,8 +558,11 @@ def cmd_local_run(args) -> int:
             moved = engine.quarantine_state()
             print(f"autoforge: moved unreadable state file aside: {moved}", file=sys.stderr)
         engine.save()
-        outcomes = engine.run(max_steps=args.max_steps, dry_run=False)
-    return _finish(engine, outcomes, allow_merge=False)
+        _show_progress(engine)
+        outcomes = engine.run(
+            max_steps=args.max_steps, dry_run=False, on_outcome=_print_outcome_now
+        )
+    return _finish(engine, outcomes, allow_merge=False, printed=True)
 
 
 def cmd_step(args) -> int:
@@ -542,6 +580,7 @@ def cmd_step(args) -> int:
     # could already have been replaced by another controller.
     with engine.locked():
         engine.load()
+        _show_progress(engine)
         outcome = engine.step(dry_run=False, allow_merge=args.allow_merge)
     return _finish(engine, [outcome], args.allow_merge)
 
@@ -568,8 +607,14 @@ def cmd_resume(args) -> int:
         rc = _resume_holding_state(engine, state, args.allow_merge)
         if rc is not None:
             return rc
-        outcomes = engine.run(max_steps=args.max_steps, dry_run=False, allow_merge=args.allow_merge)
-    return _finish(engine, outcomes, args.allow_merge)
+        _show_progress(engine)
+        outcomes = engine.run(
+            max_steps=args.max_steps,
+            dry_run=False,
+            allow_merge=args.allow_merge,
+            on_outcome=_print_outcome_now,
+        )
+    return _finish(engine, outcomes, args.allow_merge, printed=True)
 
 
 def cmd_unblock(args) -> int:

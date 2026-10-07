@@ -523,6 +523,105 @@ def test_pipe_holding_descendant_after_exit_is_killed_and_reported(monkeypatch, 
         _kill_quietly(pid)
 
 
+# Leaves a descendant in its group holding stdout, prints the descendant's
+# pid, and on stdin EOF prints one more record and exits 3.
+_HELD_STDOUT = (
+    "import subprocess, sys\n"
+    "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'],\n"
+    "                     stdin=subprocess.DEVNULL)\n"
+    "print(p.pid, flush=True)\n"
+    "sys.stdin.buffer.read()\n"
+    "print('bye', flush=True)\n"
+    "sys.exit(3)\n"
+)
+
+
+def test_exited_reports_the_exit_that_a_held_stdout_keeps_from_eof(monkeypatch):
+    """EOF is not the child's exit (R3-F1): while a descendant holds stdout no
+    EOF comes, but ``exited()`` reports the child's own exit without waiting,
+    so a reader of records can call ``finish()``, which kills the holder
+    after the exit grace and keeps the child's status."""
+    monkeypatch.setattr(executor, "_EXIT_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    with start_duplex(
+        DuplexRequest(command=[PY, "-c", _HELD_STDOUT], deadline_seconds=30)
+    ) as child:
+        item = child.read_line(timeout=10)
+        assert isinstance(item, Record)
+        pid = int(item.data)
+        try:
+            assert not child.exited()  # it waits on its stdin
+            child.close_stdin()
+            exit_by = time.monotonic() + 10
+            while not child.exited():
+                assert time.monotonic() < exit_by, "the child never exited"
+                time.sleep(0.01)
+            assert child.read_line(timeout=10) == Record(b"bye")
+            assert child.read_line(timeout=0.3) == Timeout(deadline_exceeded=False)
+            started = time.monotonic()
+            res = child.finish()
+            assert time.monotonic() - started < 6  # the grace and the kill
+            assert not res.timed_out and res.exit_code == 3
+            assert res.descendants_killed and not res.capture_abandoned
+            assert _gone(pid, within=5)
+            assert child.read_line() == Eof()
+        finally:
+            _kill_quietly(pid)
+
+
+@pytest.mark.parametrize("late", [False, True], ids=["read-waits-into-it", "read-starts-past-it"])
+def test_a_child_that_exited_before_the_deadline_is_not_timed_out_by_a_read(monkeypatch, late):
+    """R4-F1, ADR 0002: the child exits in time, a descendant still holds its
+    stdout, and the deadline comes while a read waits for a record, or
+    before the caller reads again. As ``execute()``'s last look at the child
+    is at the deadline, the exit is in time: the read settles the group as
+    ``finish()`` does (the exit grace, then the kill) and returns the rest of
+    stdout, never ``Timeout``, and the child's own status is kept."""
+    monkeypatch.setattr(executor, "_EXIT_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    deadline = 2.0
+    started = time.monotonic()
+    with start_duplex(
+        DuplexRequest(command=[PY, "-c", _ORPHAN, "group", "3"], deadline_seconds=deadline)
+    ) as child:
+        child.close_stdin()
+        while not child.exited():
+            assert time.monotonic() - started < deadline / 2, "the child exited late"
+            time.sleep(0.01)
+        if late:
+            time.sleep(max(0.0, started + deadline + 0.2 - time.monotonic()))
+        first = child.read_line(timeout=60)
+        rest = child.read_line(timeout=60)
+        elapsed = time.monotonic() - started
+        res = child.finish()
+    assert isinstance(first, Record)
+    pid = int(first.data)
+    try:
+        assert rest == Eof() and elapsed >= deadline
+        assert not res.timed_out and res.exit_code == 3
+        assert res.descendants_killed and not (res.group_survived_kill or res.capture_abandoned)
+        assert _gone(pid, within=5)
+    finally:
+        _kill_quietly(pid)
+
+
+def test_read_line_after_finish_returns_the_rest_without_waiting_past_the_deadline():
+    """After ``finish()`` every reader has ended, so ``read_line`` hands out
+    the records still queued and then the end item at once. It never waits
+    and never reports the deadline, even once the deadline has passed: the
+    child exited in time and its stdout is not a timeout."""
+    req = DuplexRequest(command=[PY, "-c", _WRITER, repr([b"1\n2\n3\n"]), "0"], deadline_seconds=1)
+    past_the_deadline = time.monotonic() + 1.2
+    with start_duplex(req) as child:
+        res = child.finish()
+        time.sleep(max(0.0, past_the_deadline - time.monotonic()))
+        started = time.monotonic()
+        rest = [child.read_line() for _ in range(5)]
+        assert time.monotonic() - started < 0.5
+    assert res.exit_code == 0 and not res.timed_out
+    assert rest == [Record(b"1"), Record(b"2"), Record(b"3"), Eof(), Eof()]
+
+
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux-only subreaper")
 def test_contained_detached_orphan_is_reported_as_an_orphan_only(monkeypatch):
     """A detached process holding none of the pipes is the orphan alone: the
