@@ -28,8 +28,9 @@ assistant text are coalesced to one line per :data:`THINKING_INTERVAL_SECONDS`;
 a finished tool and bare activity print nothing; and when nothing has been
 printed for :data:`HEARTBEAT_AFTER_SECONDS` a heartbeat line says how long
 ago the agent last did anything. The reporter never raises into the
-adapter: an output that fails is dropped, with one line saying so on the
-others.
+adapter or the engine: an output that fails is dropped and never called
+again, with one line saying so on the others; an output that fails while
+receiving that line is dropped in turn.
 """
 
 from __future__ import annotations
@@ -280,10 +281,14 @@ class ProgressReporter:
         """Print one controller line (the pre-launch facts, the end) with the prefix.
 
         The text is cleaned like an event's detail, since it can quote a
-        provider's failure reason or a path.
+        provider's failure reason or a path. Never raises: progress does not
+        decide whether an agent runs or what its result is.
         """
-        with self._lock:
-            self._emit(clean(text, MAX_LINE_CHARS), self._clock())
+        try:
+            with self._lock:
+                self._emit(clean(text, MAX_LINE_CHARS), self._clock())
+        except Exception:  # pragma: no cover - _emit already contains output failures
+            pass
 
     def sink(self, event: ProgressEvent) -> None:
         """Take one event from the adapter. Never raises."""
@@ -346,24 +351,32 @@ class ProgressReporter:
         # TOOL_FINISHED and ACTIVITY are liveness only: counted, not printed.
 
     def _emit(self, text: str, now: float) -> None:
-        line = redact(f"[{_clock_text(now - self._start)} {self._label}] {text}")
+        prefix = f"[{_clock_text(now - self._start)} {self._label}]"
+        line = redact(f"{prefix} {text}")
         if len(line) > MAX_LINE_CHARS:
             line = line[: MAX_LINE_CHARS - 1] + ELLIPSIS
         self._last_printed = now
-        failed: list[tuple[Output, Exception]] = []
+        failed = self._deliver(line)
+        # Each dropped output is noted on the ones still live; one that fails
+        # receiving a note is dropped and noted in turn, until none fails.
+        while failed:
+            error = failed.pop(0)
+            note = redact(
+                f"{prefix} progress output dropped: "
+                f"{type(error).__name__}: {clean(str(error), MAX_DETAIL_CHARS)}"
+            )
+            failed.extend(self._deliver(note))
+
+    def _deliver(self, line: str) -> list[Exception]:
+        """Write ``line`` to every live output; drop each that fails and return its errors."""
+        kept: list[Output] = []
+        failed: list[Exception] = []
         for output in self._outputs:
             try:
                 output(line)
             except Exception as exc:
-                failed.append((output, exc))
-        for output, error in failed:
-            self._outputs.remove(output)
-            note = redact(
-                f"[{_clock_text(now - self._start)} {self._label}] progress output dropped: "
-                f"{type(error).__name__}: {clean(str(error), MAX_DETAIL_CHARS)}"
-            )
-            for other in list(self._outputs):
-                try:
-                    other(note)
-                except Exception:
-                    self._outputs.remove(other)
+                failed.append(exc)
+            else:
+                kept.append(output)
+        self._outputs = kept
+        return failed

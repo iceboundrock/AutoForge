@@ -31,6 +31,7 @@ from autoforge.progress import (
     relative_path,
 )
 from autoforge.providers import ClaudeCodeProvider
+from autoforge.runlog import StepLog
 from autoforge.state import load_state
 from tests import claude_fake
 from tests.conftest import (
@@ -290,6 +291,73 @@ def test_the_sink_never_raises_even_when_every_output_fails():
     reporter.line("still fine")
 
 
+def _failing(calls, error, when=lambda line: True):
+    """An output that records each line and raises ``error`` on the lines ``when`` picks."""
+
+    def output(line):
+        calls.append(line)
+        if when(line):
+            raise error
+
+    return output
+
+
+def test_outputs_failing_on_the_same_line_are_each_dropped_once():
+    clock, good, disk_calls, terminal_calls = Clock(), [], [], []
+    disk = _failing(disk_calls, OSError("disk full"))
+    terminal = _failing(terminal_calls, BrokenPipeError("stderr closed"))
+    reporter = _reporter([disk, terminal, good.append], clock)
+    reporter.line("one")
+    reporter.line("two")
+    assert disk_calls == terminal_calls == ["[00:00:00 FIX #2] one"]
+    assert good == [
+        "[00:00:00 FIX #2] one",
+        "[00:00:00 FIX #2] progress output dropped: OSError: disk full",
+        "[00:00:00 FIX #2] progress output dropped: BrokenPipeError: stderr closed",
+        "[00:00:00 FIX #2] two",
+    ]
+
+
+def test_a_controller_line_never_raises_when_every_output_fails_on_it():
+    disk_calls, terminal_calls = [], []
+    disk = _failing(disk_calls, OSError("disk full"))
+    terminal = _failing(terminal_calls, BrokenPipeError("stderr closed"))
+    reporter = _reporter([disk, terminal], Clock())
+    reporter.line("one")
+    reporter.line("two")
+    reporter.sink(ProgressEvent(ProgressKind.STARTED))
+    reporter.poll()
+    assert disk_calls == terminal_calls == ["[00:00:00 FIX #2] one"]
+
+
+def test_an_output_failing_on_another_outputs_note_is_dropped_in_turn():
+    clock, good, disk_calls, terminal_calls = Clock(), [], [], []
+    disk = _failing(disk_calls, OSError("disk full"))
+    terminal = _failing(
+        terminal_calls, BrokenPipeError("stderr closed"), when=lambda line: "dropped" in line
+    )
+    reporter = _reporter([disk, terminal, good.append], clock)
+    reporter.line("one")
+    reporter.line("two")
+    assert disk_calls == ["[00:00:00 FIX #2] one"]
+    assert terminal_calls == [
+        "[00:00:00 FIX #2] one",
+        "[00:00:00 FIX #2] progress output dropped: OSError: disk full",
+    ]
+    assert good == [
+        "[00:00:00 FIX #2] one",
+        "[00:00:00 FIX #2] progress output dropped: OSError: disk full",
+        "[00:00:00 FIX #2] progress output dropped: BrokenPipeError: stderr closed",
+        "[00:00:00 FIX #2] two",
+    ]
+
+
+def test_a_controller_line_does_not_swallow_an_interrupt():
+    reporter = _reporter([_failing([], KeyboardInterrupt())], Clock())
+    with pytest.raises(KeyboardInterrupt):
+        reporter.line("one")
+
+
 def test_the_heartbeat_thread_runs_inside_the_with_and_is_joined_on_exit():
     out: list[str] = []
     with ProgressReporter("FIX", [out.append], heartbeat_after=0, poll_seconds=0.01) as reporter:
@@ -453,6 +521,58 @@ def test_a_failing_terminal_never_changes_the_outcome(tmp_path, fake_github):
         "Read src/a.py",
         "agent exited 0, 2 progress events",
     ]
+
+
+@pytest.mark.parametrize("failing_line", ["launching ", "agent exited "])
+def test_disk_and_terminal_failing_on_one_controller_line_never_change_the_outcome(
+    tmp_path, fake_github, monkeypatch, failing_line
+):
+    """Both outputs fail on the pre-launch line, or both on the end line (R5-F1)."""
+    eng, state_dir = _engine_on_fake_claude(
+        tmp_path,
+        fake_github,
+        [
+            claude_fake.init(),
+            claude_fake.tool_use("t1", "Read", file_path="$CWD/src/a.py"),
+            claude_fake.result(block(ANALYZE_OK)),
+        ],
+    )
+    disk_calls, terminal_calls = [], []
+    append = StepLog.append
+
+    def disk(self, line):
+        disk_calls.append(line)
+        if failing_line in line:
+            raise OSError("disk full")
+        append(self, line)
+
+    monkeypatch.setattr(StepLog, "append", disk)
+    eng.progress_output = _failing(
+        terminal_calls, BrokenPipeError("stderr closed"), when=lambda line: failing_line in line
+    )
+
+    assert eng.step().next_phase == "REVIEW"
+    assert load_state(eng.paths.state_file).current_pr_url == PR
+    for calls in (disk_calls, terminal_calls):
+        # The failing line was each output's last: no note, nothing after it.
+        assert failing_line in calls[-1]
+        assert sum(failing_line in line for line in calls) == 1
+        assert not any("dropped" in line for line in calls)
+    shown = [line.split("] ", 1)[1] for line in terminal_calls]
+    if failing_line == "launching ":
+        assert len(shown) == 1
+    else:
+        assert shown[1:] == [
+            "agent started (claude-fable-5-1)",
+            "Read src/a.py",
+            "agent exited 0, 2 progress events",
+        ]
+    (progress_log,) = state_dir.rglob("progress.log")
+    assert progress_log.read_text(encoding="utf-8").splitlines() == disk_calls[:-1]
+    execution = json.loads((progress_log.parent / "execution.json").read_text(encoding="utf-8"))
+    assert execution["exit_code"] == 0 and execution["error"] == ""
+    result = json.loads((progress_log.parent / "control-result.json").read_text(encoding="utf-8"))
+    assert result["pr_url"] == PR
 
 
 def test_a_failed_stream_ends_with_its_failure_and_logs_its_summary(tmp_path, fake_github):
