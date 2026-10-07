@@ -101,6 +101,83 @@ def test_a_failing_on_output_is_unhooked_for_both_streams():
     assert len(calls) == 1
 
 
+def test_on_chunk_sees_every_byte_with_its_stream_and_on_output_still_fires():
+    chunks: dict[str, bytearray] = {"stdout": bytearray(), "stderr": bytearray()}
+    seen: list[str] = []
+    lock = threading.Lock()
+
+    def on_chunk(name: str, chunk: bytes) -> None:
+        with lock:
+            chunks[name] += chunk
+
+    code = "import sys; print('out', flush=True); print('err', file=sys.stderr, flush=True)"
+    res = execute(
+        ExecutionRequest(
+            command=[PY, "-c", code], timeout_seconds=30, on_output=seen.append, on_chunk=on_chunk
+        )
+    )
+    assert res.ok and not res.stopped
+    assert chunks == {"stdout": bytearray(b"out\n"), "stderr": bytearray(b"err\n")}
+    assert set(seen) == {"stdout", "stderr"}
+
+
+def test_a_failing_on_chunk_is_unhooked_without_unhooking_on_output():
+    calls: list[str] = []
+    seen: list[str] = []
+
+    def on_chunk(name: str, chunk: bytes) -> None:
+        calls.append(name)
+        raise RuntimeError("detector gone")
+
+    code = "import sys, time\nfor n in range(5):\n    print(n, flush=True); time.sleep(0.01)\n"
+    res = execute(
+        ExecutionRequest(
+            command=[PY, "-c", code], timeout_seconds=30, on_output=seen.append, on_chunk=on_chunk
+        )
+    )
+    assert res.ok and res.stdout == "0\n1\n2\n3\n4\n"
+    assert calls == ["stdout"]
+    assert len(seen) >= 2  # every chunk after the failure still counts as activity
+
+
+def test_stop_set_from_on_chunk_kills_the_group_and_says_stopped_not_timed_out():
+    """The caller's stop (#194) ends the child on the timeout path: the whole
+    group is killed, the exit status is -1, and the result is ``stopped``."""
+    stop = threading.Event()
+
+    def on_chunk(name: str, chunk: bytes) -> None:
+        if b"loop" in chunk:
+            stop.set()
+
+    code = "import time\nwhile True:\n    print('loop', flush=True); time.sleep(0.05)\n"
+    started = time.monotonic()
+    res = execute(
+        ExecutionRequest(
+            command=[PY, "-c", code],
+            timeout_seconds=30,
+            idle_timeout_seconds=30,
+            on_chunk=on_chunk,
+            stop=stop,
+        )
+    )
+    assert time.monotonic() - started < 10
+    assert res.stopped and not res.timed_out and res.timeout_limit == ""
+    assert res.exit_code == -1 and not res.ok
+    assert res.stdout.startswith("loop\n")
+    with pytest.raises(ExecutionError, match="command was stopped"):
+        res.raise_if_failed()
+
+
+def test_stop_set_after_the_child_exited_is_not_a_stop():
+    stop = threading.Event()
+    stop.set()  # already set, but the child exits before the first look
+    res = execute(ExecutionRequest(command=[PY, "-c", "pass"], timeout_seconds=30, stop=stop))
+    # Either it was seen running and stopped, or it had exited: never both.
+    assert res.stopped == (res.exit_code == -1)
+    if not res.stopped:
+        assert res.ok and res.exit_code == 0
+
+
 def test_shell_metacharacters_are_literal_argv():
     """A prompt full of shell syntax must arrive as ONE argv element, unevaluated."""
     tricky = "$(touch /tmp/pwned); `id`; rm -rf / && echo $HOME | cat > x; '\"; #"

@@ -1447,3 +1447,116 @@ def test_an_installed_pi_loads_nothing_from_a_trusted_hostile_project(tmp_path):
     policy = _hostile_project(tmp_path / "policy")
     argv = PiProvider().build_command_for(_profile(Path(pi)), "prompt")
     assert _commands_and_markers(argv, policy, settle=3) == ([], [])
+
+
+# -- loop detection hooks (#194) --------------------------------------------------
+class _LoopRecorder:
+    """Records what the reducer reports to a loop monitor, with its clock."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    def action(self, name: str, fingerprint: bytes, now: float) -> None:
+        self.calls.append(("action", name, fingerprint, now))
+
+    def retry(self, now: float) -> None:
+        self.calls.append(("retry", now))
+
+    def turn(self, now: float) -> None:
+        self.calls.append(("turn", now))
+
+
+def _tool(run: Run, call_id: str, args: dict, result: object) -> None:
+    run.feed(
+        {"type": "tool_execution_start", "toolCallId": call_id, "toolName": "bash", "args": args}
+    )
+    run.feed(
+        {
+            "type": "tool_execution_end",
+            "toolCallId": call_id,
+            "toolName": "bash",
+            "result": result,
+            "isError": False,
+        }
+    )
+
+
+def test_a_tool_execution_is_one_action_fingerprinted_by_args_and_result_not_id():
+    loop = _LoopRecorder()
+    run = Run(loop=loop).started()
+    _tool(run, "c1", {"command": "make test"}, "ok")
+    _tool(run, "c2", {"command": "make test"}, "ok")
+    _tool(run, "c3", {"command": "make lint"}, "ok")
+    _tool(run, "c4", {"command": "make test"}, "failed")
+    actions = [call for call in loop.calls if call[0] == "action"]
+    assert [(name, now) for _, name, _, now in actions] == [("bash", 100.0)] * 4
+    first, same, other_args, other_result = (call[2] for call in actions)
+    assert first == same
+    assert len({first, other_args, other_result}) == 3
+
+
+def test_an_end_without_a_start_is_no_action_and_retries_and_turns_are_reported():
+    loop = _LoopRecorder()
+    run = Run(loop=loop).started()
+    run.feed({"type": "tool_execution_end", "toolCallId": "never", "toolName": "bash"})
+    run.feed({"type": "auto_retry_start", "attempt": 1, "maxAttempts": 3})
+    run.feed({"type": "message_end", "message": {"role": "user", "content": []}})
+    run.feed({"type": "message_end", "message": assistant()})
+    assert loop.calls == [("retry", 100.0), ("turn", 100.0)]
+
+
+def test_without_a_loop_monitor_no_tool_execution_is_remembered():
+    run = Run().started()
+    _tool(run, "c1", {"command": "make test"}, "ok")
+    run.feed({"type": "tool_execution_start", "toolCallId": "c2", "toolName": "bash"})
+    assert run.c._open_tools == {}
+
+
+def test_provider_a_looping_agent_is_killed_in_kill_mode_as_a_timeout(tmp_path):
+    """#194 over the fake ``pi``: the same tool execution (same args, same
+    result) eight times ends the invocation at once, before the agent's
+    long sleep; the outcome is a timeout with the ``loop`` limit."""
+    from autoforge.config import LoopDetectionConfig
+    from autoforge.loop_detect import LIMIT_LOOP
+
+    stream: list[dict] = [{"type": "agent_start"}]
+    for n in range(12):
+        args = {"command": "gh pr checks 5"}
+        stream += [
+            {
+                "type": "tool_execution_start",
+                "toolCallId": f"c{n}",
+                "toolName": "bash",
+                "args": args,
+            },
+            {
+                "type": "tool_execution_end",
+                "toolCallId": f"c{n}",
+                "toolName": "bash",
+                "result": {"content": [{"type": "text", "text": "pending"}]},
+                "isError": False,
+            },
+        ]
+    scenario = _happy(events=stream)
+    scenario["on"]["prompt"].append({"sleep": 30})
+    fake = FakePi(tmp_path, scenario)
+    req = AgentRequest(
+        phase="FIX",
+        prompt="fix it",
+        cwd=str(tmp_path),
+        profile=_profile(fake.command, name="fix"),
+        idle_timeout_seconds=None,
+        max_runtime_seconds=60,
+        env_allowlist=("PATH",),
+        loop_detection=LoopDetectionConfig(mode="kill"),
+    )
+    started = time.monotonic()
+    res = PiProvider(round_trip_seconds=5, abort_seconds=1).execute(req)
+    assert time.monotonic() - started < 20
+    assert res.timed_out and res.timeout_limit == LIMIT_LOOP and res.provider_failure is None
+    assert res.loop is not None and res.loop.action == "killed"
+    record = res.loop.record()
+    assert (record["signal"], record["period"], record["repeats"]) == ("action_cycle", 1, 8)
+    assert record["tools"] == ["bash"]
+    assert res.provider_summary["loop_max_cycle_repeats"] == 8
+    assert "abort" not in fake.commands()

@@ -113,6 +113,26 @@ A provider whose output says nothing structured (OpenCode) reports only
 `activity`, from the executor's `on_output` hook, which is told a chunk
 arrived on which stream and never sees its bytes.
 
+Loop detection (#194) lives in the provider layer too. `loop_detect.py` is
+pure and provider-neutral: a `LoopMonitor` is fed monotonic times with tool
+names and opaque digests, output bytes and provider retries, reads no
+clock, and keeps no tool input, result, output line or digest. The protocol
+reducers feed it each completed tool call as a fingerprint (tool name,
+digest of the full input, digest of the full result), plus their retries
+and turns (`claude_stream.py` through the `LoopObserver` protocol,
+`pi_rpc.py` directly). The base `AgentProvider.execute` feeds it the output
+bytes from the executor's `on_chunk` hook, for the repeated-lines signal.
+Warnings go out as `ProgressEvent(loop_suspected)`, which the reporter
+prints and never counts as the agent's activity. In `kill` mode a verdict
+makes the adapter stop the child (`ExecutionRequest.stop` or
+`DuplexChild.stop()`, ADR 0002 §4d). It then reports the outcome as a
+timeout, `timed_out` with `timeout_limit` `loop`, plus the
+`AgentExecutionResult.loop` report. The engine therefore handles a loop kill
+on its timeout path, adds the report's description to the error and writes
+the report to `execution.json`. In every mode the adapter merges the
+monitor's calibration figures into `provider_summary`. The executor never
+learns why it was stopped.
+
 A provider can report that a run failed inside its protocol even though the
 process exited 0. It does so through a provider-neutral optional
 `AgentExecutionResult.provider_failure` (ADR 0003 §2.6), which the engine
@@ -169,7 +189,13 @@ is not an agent has no idle timeout, only `timeout_seconds`
 (`execution.command_timeout_seconds`). Which limits a profile gets, and that
 a provider whose output is no progress signal (Claude in text mode,
 `reports_activity`) runs under its ceiling alone, is configuration
-(`AutoForgeConfig.agent_limits`), not executor policy. Once the child has
+(`AutoForgeConfig.agent_limits`), not executor policy. The caller may also
+end the invocation early (ADR 0002 §4d, #194): it sets
+`ExecutionRequest.stop` (or calls `DuplexChild.stop()`), and the group is
+killed through the same path; the result says `stopped`, never why.
+`ExecutionRequest.on_chunk` hands the caller every chunk read, after it is
+captured. The reason to stop, a loop, is the provider layer's
+(`loop_detect.py`, below). Once the child has
 exited on its own, the other two conditions
 are given a short exit grace (`_EXIT_GRACE_SECONDS`): a child that left
 nothing behind clears them at once, a helper it is shutting down as it

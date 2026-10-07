@@ -4,6 +4,7 @@ import dataclasses
 import hashlib
 import json
 import sys
+import time
 
 import pytest
 
@@ -254,6 +255,114 @@ def test_a_fake_claude_stream_is_reduced_to_the_result_text_verbatim(tmp_path):
     assert summary["tool_calls"] == 2 and summary["tool_errors"] == 1
     assert summary["failure"] == "" and summary["records"] == 7
     assert all(type(v) in (str, int, bool) for v in summary.values())
+
+
+def _looping(n: int, *, tail: list | None = None) -> list:
+    """``n`` copies of the same two tool calls (Bash then Read), each with
+    the same input and the same result: an agent going round in circles."""
+    from tests import claude_fake
+
+    lines: list = [claude_fake.init()]
+    for i in range(n):
+        lines += [
+            claude_fake.tool_use(f"b{i}", "Bash", command="make test"),
+            claude_fake.tool_result(f"b{i}", "1 failed"),
+            claude_fake.tool_use(f"r{i}", "Read", file_path="src/a.py"),
+            claude_fake.tool_result(f"r{i}", "contents"),
+        ]
+    return lines + (tail or [])
+
+
+def _loop_run(tmp_path, lines, mode, events=None, profile=None):
+    from autoforge.config import LoopDetectionConfig
+    from tests import claude_fake
+
+    home, fake = claude_fake.fake_claude(tmp_path, lines)
+    sink = None if events is None else events.append
+    req = AgentRequest(
+        "FIX",
+        "fix it",
+        str(tmp_path),
+        profile(fake) if profile else fake,
+        None,
+        60,
+        progress=sink,
+        loop_detection=LoopDetectionConfig(mode=mode),
+    )
+    started = time.monotonic()
+    res = ClaudeCodeProvider().execute(req)
+    return res, time.monotonic() - started
+
+
+def test_a_looping_claude_stream_is_killed_in_kill_mode_as_a_timeout(tmp_path):
+    """#194: eight copies of the same 2-step cycle end the invocation at
+    once, though the agent would otherwise have run on; the outcome is a
+    timeout with the ``loop`` limit, and the report names the cycle."""
+    from autoforge.loop_detect import LIMIT_LOOP
+    from autoforge.progress import ProgressKind
+
+    events = []
+    res, elapsed = _loop_run(tmp_path, _looping(12, tail=[{"sleep": 30}]), "kill", events)
+    assert elapsed < 20
+    assert res.timed_out and res.timeout_limit == LIMIT_LOOP and not res.ok
+    assert res.provider_failure is None
+    assert res.loop is not None and res.loop.action == "killed"
+    record = res.loop.record()
+    assert (record["signal"], record["period"], record["repeats"]) == ("action_cycle", 2, 8)
+    assert record["tools"] == ["Bash", "Read"]
+    assert res.loop.describe().startswith(
+        "the same 2-step action cycle (Bash, Read) repeated 8 times over "
+    )
+    warned = [e.detail for e in events if e.kind == ProgressKind.LOOP_SUSPECTED]
+    assert warned[0] == "possible loop: 2-step cycle (Bash, Read) repeated 4×"
+    summary = res.provider_summary
+    assert summary["loop_max_cycle_repeats"] == 8 and summary["loop_max_cycle_period"] == 2
+    assert summary["loop_actions"] >= 16
+
+
+def test_a_looping_claude_stream_is_not_killed_in_warn_mode(tmp_path):
+    from autoforge.progress import ProgressKind
+    from tests import claude_fake
+
+    events = []
+    lines = _looping(10, tail=[claude_fake.result("done")])
+    res, _ = _loop_run(tmp_path, lines, "warn", events)
+    assert res.ok and not res.timed_out and res.stdout == "done"
+    assert res.loop is not None and res.loop.action == "warned" and res.loop.warnings >= 1
+    warned = [e.detail for e in events if e.kind == ProgressKind.LOOP_SUSPECTED]
+    assert warned[0].startswith("possible loop: 2-step cycle (Bash, Read)")
+    assert any(w.startswith("loop detected, not killed (mode warn): ") for w in warned)
+    assert res.provider_summary["loop_max_cycle_repeats"] == 10
+
+
+def test_loop_calibration_is_recorded_with_detection_off(tmp_path):
+    from autoforge.progress import ProgressKind
+    from tests import claude_fake
+
+    events = []
+    lines = _looping(10, tail=[claude_fake.result("done")])
+    res, _ = _loop_run(tmp_path, lines, "off", events)
+    assert res.ok and res.loop is None
+    assert not [e for e in events if e.kind == ProgressKind.LOOP_SUSPECTED]
+    assert res.provider_summary["loop_max_cycle_repeats"] == 10
+    assert res.provider_summary["loop_actions"] == 20
+
+
+def test_repeated_output_lines_kill_a_text_mode_agent_in_kill_mode(tmp_path):
+    """Without a structured stream the repeated-lines signal stands in: the
+    same line (digits masked) 200 times ends the invocation through the
+    executor's stop."""
+    from autoforge.loop_detect import LIMIT_LOOP
+
+    lines: list = [f"waiting for lock (attempt {n})" for n in range(250)] + [{"sleep": 30}]
+    res, elapsed = _loop_run(tmp_path, lines, "kill", profile=_text)
+    assert elapsed < 20
+    assert res.timed_out and res.timeout_limit == LIMIT_LOOP
+    assert res.loop is not None and res.loop.action == "killed"
+    record = res.loop.record()
+    assert (record["signal"], record["stream"], record["period"]) == ("repeated_lines", "stdout", 1)
+    assert record["repeats"] == 200
+    assert res.provider_summary["loop_max_line_repeats"] >= 200
 
 
 @pytest.mark.parametrize(

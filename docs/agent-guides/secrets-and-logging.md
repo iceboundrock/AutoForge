@@ -121,6 +121,17 @@ nested `usage` is not copied. `tests/test_progress.py` seeds a token and
 escape sequences into tool inputs and checks that neither reaches the
 terminal, `progress.log`, `execution.json` or state.
 
+The loop detector (#194, `loop_detect.py`) compares tool inputs, results and
+output lines only as digests held in memory for one invocation; it
+never stores, logs or returns them. What it reports is the signal, a cycle
+period, a count, tool names, a stream name and times: the `loop` record in
+`execution.json`, the warning lines, the error text and the `loop_*`
+calibration counts in `provider_summary`. Those tool names are cleaned and
+redacted like a progress event's. `tests/test_loop_detect.py` seeds a token
+into a looping agent's commands, results and output lines and checks that
+neither it, the raw strings nor the digests reach any line or file the run
+writes.
+
 `stdout.log` and `stderr.log` hold what the executor captured, which is
 bounded (`executor.DEFAULT_MAX_OUTPUT_BYTES` per stream): past the bound the
 file is the head of the stream, a `[autoforge: N bytes of stdout omitted; ...]`

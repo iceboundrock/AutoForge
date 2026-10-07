@@ -160,6 +160,23 @@ def test_doctor_reports_the_limits_of_every_reachable_profile(tmp_path):
     assert "update_epic: idle timeout 900s, max runtime unset" in row.detail
 
 
+def test_doctor_shows_the_loop_detection_mode_and_thresholds(tmp_path):
+    """#194: informational; the default is warn."""
+    d = Doctor(cwd=str(tmp_path), runner=_runner_factory())
+    row = {r.name: r for r in d.run_all()}["loop detection"]
+    assert row.ok and not row.required
+    assert row.detail == (
+        "loop detection warn (cycles of up to 4 actions x8, no new action for 1800s, "
+        "repeated lines x200)"
+    )
+    cfg = tmp_path / "c.json"
+    cfg.write_text(json.dumps({"version": 1, "execution": {"loop_detection": {"mode": "kill"}}}))
+    d = Doctor(config_path=str(cfg), cwd=str(tmp_path), runner=_runner_factory())
+    assert {r.name: r for r in d.run_all()}["loop detection"].detail.startswith(
+        "loop detection kill ("
+    )
+
+
 def test_doctor_fails_a_post_merge_profile_a_run_would_refuse_to_launch(tmp_path):
     """`update_epic` is not a required profile, so the config check passes
     it; a text-mode Claude there with no ceiling would only fail after a
@@ -1085,6 +1102,7 @@ def test_local_doctor_checks_a_pi_reviewer(tmp_path):
     results = {r.name: r for r in d.run_local()}
     assert results["agent 'pi' available (review_round_1)"].ok
     assert results["agent 'pi' auth ready (review_round_1)"].ok
+    assert results["loop detection"].detail.startswith("loop detection warn (")
 
 
 # -- instructions Pi loads from outside the checkout (#132) -----------------------

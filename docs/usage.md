@@ -165,7 +165,7 @@ that step finishes, not after the whole loop. A progress line is prefixed
 with the time since the launch, the phase and, in a remote run, the issue:
 
 ```text
-[00:00:00 ANALYZE_EXECUTE #160] launching analyze_execute (claude, model fable, effort high), idle timeout 900s, max runtime unset, attempt 1, worktree /repo/.git/autoforge/worktrees/160, log .autoforge/logs/<run-id>/001-analyze_execute-1
+[00:00:00 ANALYZE_EXECUTE #160] launching analyze_execute (claude, model fable, effort high), idle timeout 900s, max runtime unset, loop detection warn, attempt 1, worktree /repo/.git/autoforge/worktrees/160, log .autoforge/logs/<run-id>/001-analyze_execute-1
 [00:00:04 ANALYZE_EXECUTE #160] agent started (claude-fable-5-1)
 [00:00:31 ANALYZE_EXECUTE #160] thinking… ~12k tokens
 [00:01:02 ANALYZE_EXECUTE #160] Read src/autoforge/engine.py
@@ -179,15 +179,17 @@ with the time since the launch, the phase and, in a remote run, the issue:
 
 - **Before the launch**, one line names the profile, provider, model and
   effort, both agent limits (the idle timeout and the maximum runtime, see
-  [Agent limits](#agent-limits)), the attempt, the working directory and the
-  step's log directory.
+  [Agent limits](#agent-limits)), the loop detection mode
+  ([Loop detection](#loop-detection)), the attempt, the working directory
+  and the step's log directory.
 - **While it runs**: one line per tool the agent starts, with one
   allow-listed input (the file of a read, edit or write, the pattern of a
   search, the *description* of a shell command, never the command itself,
   a tool's result, thinking or the agent's text); thinking and writing are
-  shown at most once every 30 s; a failed tool says so; and when nothing has
+  shown at most once every 30 s; a failed tool says so; when nothing has
   been printed for two minutes a heartbeat says how long ago the agent last
-  did anything.
+  did anything; and a `possible loop: …` line warns that the agent may be
+  repeating itself.
 - **After it returns**, one line says how it ended (exit status, the limit
   that killed it, or provider failure).
 
@@ -215,12 +217,14 @@ tool call Claude or Pi reports, and every line OpenCode prints, resets that
 timer, so a long task is not killed for being long. Configure it per
 profile; see [Configuration: Agent limits](configuration.md#agent-limits).
 
-- **`max_runtime_seconds` is the only hard bound on an active agent.** It is
-  unset by default. Without it, an agent that keeps producing output while
-  going in circles runs until the executor's one-week backstop. Loop
-  detection (#194) closes that gap only once it kills by default; until
-  then, set `max_runtime_seconds` on a profile when an unattended run must
-  end by a known time.
+- **`max_runtime_seconds` is the only hard bound on an active agent by
+  default.** It is unset by default. Without it, an agent that keeps
+  producing output while going in circles is warned about
+  ([Loop detection](#loop-detection)) but runs until the executor's
+  one-week backstop, unless loop detection is in `kill` mode. Until #199
+  makes `kill` the default, set `max_runtime_seconds` on a profile, or
+  `execution.loop_detection.mode: kill`, when an unattended run must end
+  by a known time.
 - **A silent tool call counts as no progress.** A test suite that runs for
   twenty minutes inside one shell command and prints nothing until it ends
   looks exactly like a hang. If your project has one, raise
@@ -238,13 +242,61 @@ was killed`. The state is unchanged, nothing is retried automatically, and
 the step's `execution.json` records `timeout_limit` (`idle` or
 `max_runtime`), both configured values and `last_activity_at`.
 
+## Loop detection
+
+An agent can keep producing output while it repeats itself: the same
+command, the same file read, the same answer, round and round. Its output
+resets the idle timer, so the idle timeout never fires. The controller
+watches what the agent does and reports a loop when the same actions, with
+the same inputs and the same results, keep coming back with nothing new in
+between ([Configuration: Loop detection](configuration.md#loop-detection)).
+
+From half a threshold the progress output warns:
+
+```text
+[00:06:40 FIX #160] possible loop: 2-step cycle (Bash, Read) repeated 4×
+[00:09:14 FIX #160] loop detected, not killed (mode warn): 2-step cycle (Bash, Read) repeated 8×
+```
+
+The warning repeats at most every two minutes while the loop goes on, and
+the step's `execution.json` records it (`loop`, `loop_warnings`).
+
+- **In `warn` mode (the default)** nothing else happens: the agent runs
+  on. Watch for these lines, and stop the run (`Ctrl-C`) if the agent is
+  stuck. #199 tracks making `kill` the default.
+- **In `kill` mode** the agent is killed at the threshold, exactly as on a
+  timeout: its whole process group is ended, the state is unchanged and
+  nothing is retried automatically. The error names the pattern:
+
+  ```text
+  agent 'fix' was killed: the same 2-step action cycle (Bash, Read) repeated 8 times over 9m14s with no new action. State unchanged — inspect the real Git/GitHub state, then 'resume'.
+  ```
+
+  The step's `execution.json` says `ended_by: loop` and `timeout_limit:
+  loop`, with a `loop` entry naming the signal (`action_cycle`,
+  `no_novelty`, `repeated_lines` or `retry_storm`), the cycle's period, its
+  repeat count, the tool names and when the loop started and was cut,
+  measured from the launch. It records no tool input, tool result or
+  output line.
+
+**After a loop kill**, look at the agent worktree and the PR the way you
+would after a timeout: the agent may have pushed part of its work. Then
+`resume` relaunches the same phase in the same worktree. A loop that comes
+back on every attempt usually means the task, or a flaky command it keeps
+re-running, needs a person: fix that before resuming. Raising the
+thresholds is the last resort.
+
+In every mode, `off` included, `provider_summary` in `execution.json`
+records the `loop_*` calibration fields: how close the invocation came to
+each threshold. Those fields are what #199 tunes the defaults from.
+
 ## Dry run
 
 A dry run invokes no agent, runs no verification command, writes nothing to
 GitHub, git or the state directory (no state, no log), takes no lock and
 creates no agent worktree. It prints the plan (phase, provider,
-model/effort, agent limits, round, template, variables, command, expected
-transition),
+model/effort, agent limits, loop detection, round, template, variables,
+command, expected transition),
 redacted. What it reads depends on the command:
 
 - `run --dry-run` previews a new run and launches no subprocess: no `git`,

@@ -234,6 +234,12 @@ def test_unknown_safety_key_rejected_in_yaml_too(tmp_path):
 SECTION_SCHEMAS = [
     ("the top level", (), ("state_dir", '".autoforge"'), config.TOP_LEVEL_KEYS),
     ("execution", ("execution",), ("max_correction_attempts", "1"), config.EXECUTION_KEYS),
+    (
+        "execution.loop_detection",
+        ("execution", "loop_detection"),
+        ("mode", '"kill"'),
+        config.LOOP_DETECTION_KEYS,
+    ),
     ("safety", ("safety",), ("allow_merge", "false"), config.SAFETY_KEYS),
     ("github", ("github",), ("timeout_seconds", "60"), config.GITHUB_KEYS),
     ("merge", ("merge",), ("method", '"squash"'), config.MERGE_KEYS),
@@ -1903,3 +1909,71 @@ def test_example_yaml_with_the_pi_block_enabled_loads_and_validates(tmp_path, ya
     assert cfg.agent_limits(p) == config.AgentLimits(900, None)
     assert p.options == {"require_oauth": "true", "tools": "read,bash", "context_files": "true"}
     validate_required_profiles(cfg, REQUIRED_PROFILES)
+
+
+# -- execution.loop_detection (#194) ---------------------------------------------
+def test_loop_detection_defaults_to_warn_with_the_issue_thresholds():
+    loop = default_config().execution.loop_detection
+    assert loop == config.LoopDetectionConfig("warn", 4, 8, 1800, 200)
+    assert loop.describe() == (
+        "loop detection warn (cycles of up to 4 actions x8, no new action for 1800s, "
+        "repeated lines x200)"
+    )
+
+
+def test_loop_detection_reads_every_key_from_yaml(tmp_path, yaml_backend):
+    p = tmp_path / "cfg.yaml"
+    p.write_text(
+        "version: 1\n"
+        "execution:\n"
+        "  loop_detection:\n"
+        "    mode: kill\n"
+        "    max_cycle_period: 3\n"
+        "    max_cycle_repeats: 10\n"
+        "    novelty_window_seconds: 600\n"
+        "    max_line_repeats: 500\n",
+        encoding="utf-8",
+    )
+    loop = load_config_file(p).execution.loop_detection
+    assert loop == config.LoopDetectionConfig("kill", 3, 10, 600, 500)
+
+
+def test_loop_detection_keeps_the_defaults_a_config_does_not_set(tmp_path):
+    p = tmp_path / "cfg.json"
+    p.write_text('{"version": 1, "execution": {"loop_detection": {"mode": "off"}}}')
+    assert load_config_file(p).execution.loop_detection == config.LoopDetectionConfig(mode="off")
+
+
+@pytest.mark.parametrize(
+    ("section", "message"),
+    [
+        ('{"mode": "kil"}', "'execution.loop_detection.mode' must be one of kill, warn, off"),
+        ('{"mode": true}', "'execution.loop_detection.mode' must be one of"),
+        ('{"max_cycle_period": 0}', "'execution.loop_detection.max_cycle_period' must be between"),
+        ('{"max_cycle_period": 17}', "'execution.loop_detection.max_cycle_period' must be between"),
+        (
+            '{"max_cycle_repeats": 1}',
+            "'execution.loop_detection.max_cycle_repeats' must be between",
+        ),
+        ('{"max_line_repeats": 1}', "'execution.loop_detection.max_line_repeats' must be between"),
+        (
+            '{"novelty_window_seconds": 0}',
+            "'execution.loop_detection.novelty_window_seconds' must be between",
+        ),
+        ('{"max_cycle_repeats": "8"}', "execution.loop_detection.max_cycle_repeats"),
+        ('"kill"', "execution.loop_detection"),
+    ],
+)
+def test_loop_detection_refuses_a_bad_value(tmp_path, section, message):
+    p = tmp_path / "cfg.json"
+    p.write_text(f'{{"version": 1, "execution": {{"loop_detection": {section}}}}}')
+    with pytest.raises(ConfigurationError, match=message.replace("(", r"\(")):
+        load_config_file(p)
+
+
+def test_the_example_config_shows_loop_detection_in_warn_mode(tmp_path, no_pyyaml):
+    import autoforge
+
+    example = Path(autoforge.__file__).parents[2] / "autoforge.example.yaml"
+    assert "  loop_detection:\n    mode: warn\n" in example.read_text(encoding="utf-8")
+    assert load_config_file(example).execution.loop_detection == config.LoopDetectionConfig()

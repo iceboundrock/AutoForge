@@ -296,3 +296,65 @@ def test_a_failing_sink_is_the_drivers_concern_not_the_reducers():
     stream = ClaudeStream(emit=boom)
     with pytest.raises(RuntimeError):
         stream.feed(_line({"type": "rate_limit_event"}))
+
+
+# -- loop detection hooks (#194) --------------------------------------------------
+class _Observer:
+    """Records what the reducer reports to a loop detector."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    def action(self, name: str, fingerprint: bytes) -> None:
+        self.calls.append(("action", name, fingerprint))
+
+    def retry(self) -> None:
+        self.calls.append(("retry",))
+
+    def turn(self) -> None:
+        self.calls.append(("turn",))
+
+
+def _observed(*records: dict) -> list[tuple]:
+    observer = _Observer()
+    stream = ClaudeStream(cwd=CWD, emit=lambda event: None, loop=observer)
+    for record in records:
+        stream.feed(_line(record))
+    return observer.calls
+
+
+def test_a_completed_call_is_one_action_fingerprinted_by_input_and_result_not_id():
+    calls = _observed(
+        _assistant(_tool_use("t1", "Bash", command="make test")),
+        _tool_result("t1"),
+        _assistant(_tool_use("t2", "Bash", command="make test")),
+        _tool_result("t2"),
+        _assistant(_tool_use("t3", "Bash", command="make lint")),
+        _tool_result("t3"),
+        _assistant(_tool_use("t4", "Bash", command="make test")),
+        _tool_result("t4", content="other output"),
+    )
+    actions = [call for call in calls if call[0] == "action"]
+    assert [name for _, name, _ in actions] == ["Bash"] * 4
+    first, same, other_input, other_result = (fingerprint for *_, fingerprint in actions)
+    assert first == same
+    assert len({first, other_input, other_result}) == 3
+    assert calls.count(("turn",)) == 4
+
+
+def test_a_result_for_an_unknown_call_is_no_action():
+    assert _observed(_tool_result("never-started")) == []
+
+
+def test_an_api_retry_is_reported_and_an_assistant_message_ends_a_turn():
+    calls = _observed(
+        {"type": "system", "subtype": "api_retry", "attempt": 1, "max_retries": 10},
+        _assistant({"type": "text", "text": "hi"}),
+    )
+    assert calls == [("retry",), ("turn",)]
+
+
+def test_without_a_loop_observer_inputs_are_not_digested():
+    stream = ClaudeStream(cwd=CWD, emit=lambda event: None)
+    stream.feed(_line(_assistant(_tool_use("t1", "Bash", command="make test"))))
+    assert stream._open_tools == {"t1": ("Bash", b"")}

@@ -46,6 +46,14 @@ a thinking or text delta is thinking or assistant text (never its content),
 ``auto_retry_start`` a provider retry with its attempt numbers, the
 accepted prompt the start, and anything else bare activity. The argument
 names are read from Pi's tool schemas at v1.0.x, not from a run.
+
+Loop detection (#194): given a :class:`~autoforge.loop_detect.LoopMonitor`,
+each ``tool_execution_end`` whose ``tool_execution_start`` was seen is one
+action, fingerprinted from its ``toolName``, the digest of the start's whole
+``args`` and the digest of the whole end record but its ``toolCallId``, at
+the time ``feed`` was given; ``auto_retry_start`` is a retry and an
+assistant ``message_end`` a completed turn. Only names and digests leave
+here.
 """
 
 from __future__ import annotations
@@ -56,6 +64,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from .loop_detect import LoopMonitor, action_fingerprint, digest
 from .progress import ProgressEvent, ProgressKind, ProgressSink, relative_path
 from .redaction import redact
 
@@ -73,6 +82,7 @@ _REDUCED_EVENTS = frozenset(
         "agent_settled",
         "message_end",
         "tool_execution_start",
+        "tool_execution_end",
         "auto_retry_start",
         "auto_retry_end",
         "extension_ui_request",
@@ -86,7 +96,6 @@ _IGNORED_EVENTS = frozenset(
         "message_start",
         "message_update",
         "tool_execution_update",
-        "tool_execution_end",
         "auto_compaction_start",
         "auto_compaction_end",
         "queue_update",
@@ -104,6 +113,9 @@ _ROUND_TRIPS = frozenset({"get_state", "get_available_models", "get_last_assista
 
 MAX_REASON_CHARS = 400
 MAX_VALUE_CHARS = 200
+# Tool executions whose end has not arrived yet, kept for the loop detector.
+# Past the bound an end is still counted, only not an action.
+MAX_OPEN_TOOLS = 1024
 # The one argument shown per Pi tool in progress; ``bash`` has only its
 # command, which is never shown.
 TOOL_DETAILS: dict[str, str] = {
@@ -172,9 +184,13 @@ class PiConversation:
         new_id: Callable[[], str] | None = None,
         emit: ProgressSink | None = None,
         cwd: str = "",
+        loop: LoopMonitor | None = None,
     ) -> None:
         self._emit = emit
         self._cwd = cwd
+        self._loop = loop
+        # Open tool executions by call id: their name and their args' digest.
+        self._open_tools: dict[str, tuple[str, bytes]] = {}
         self._model = model
         self._provider, _, self._model_id = model.partition("/")
         self._thinking = thinking
@@ -603,10 +619,17 @@ class PiConversation:
                     self._last_text_message = message
                 if stop in SUCCESS_STOP_REASONS:
                     self._retry_failure = None
+                if self._loop is not None:
+                    self._loop.turn(now)
         elif kind == "tool_execution_start":
             self._tool_executions += 1
+            self._tool_started(record)
+        elif kind == "tool_execution_end":
+            self._tool_ended(record, now)
         elif kind == "auto_retry_start":
             self._auto_retries += 1
+            if self._loop is not None:
+                self._loop.retry(now)
         elif kind == "auto_retry_end":
             if record.get("success") is False:
                 self._retry_failure = _model_error(
@@ -615,6 +638,29 @@ class PiConversation:
             else:
                 self._retry_failure = None
         return []
+
+    def _tool_started(self, record: dict) -> None:
+        call_id = record.get("toolCallId")
+        if self._loop is None or not isinstance(call_id, str):
+            return
+        if len(self._open_tools) < MAX_OPEN_TOOLS:
+            name = record.get("toolName")
+            self._open_tools[call_id] = (
+                name if isinstance(name, str) else "",
+                digest(record.get("args")),
+            )
+
+    def _tool_ended(self, record: dict, now: float) -> None:
+        call_id = record.get("toolCallId")
+        if self._loop is None or not isinstance(call_id, str):
+            return
+        call = self._open_tools.pop(call_id, None)
+        if call is None:
+            return
+        name, args = call
+        # The id differs on every call; everything else is the result.
+        result = {key: value for key, value in record.items() if key != "toolCallId"}
+        self._loop.action(name, action_fingerprint(name, args, digest(result)), now)
 
 
 def _model_error(what: str, message: object) -> str:

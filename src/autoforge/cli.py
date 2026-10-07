@@ -926,6 +926,8 @@ def print_plan(plan: StepPlan, full_prompt: bool = False) -> None:
         print(f"Command:  {' '.join(redact_argv(shown))}")
     if plan.limits is not None:
         print(f"Limits:   {plan.limits.describe()}")
+    if plan.loop_detection is not None:
+        print(f"Loops:    {plan.loop_detection.describe()}")
     print(f"Routing:  {plan.routing}")
     print(f"Expected next: {plan.expected_next or '-'}")
     if plan.legal_next:

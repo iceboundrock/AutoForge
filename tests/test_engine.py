@@ -6388,7 +6388,7 @@ def test_an_idle_timeout_names_the_limit_and_the_last_activity(tmp_state_dir, fa
     request = json.loads((step / "request.json").read_text(encoding="utf-8"))
     assert request["idle_timeout_seconds"] == 900 and request["max_runtime_seconds"] is None
     shown = [line.split("] ", 1)[1] for line in lines]
-    assert "idle timeout 900s, max runtime unset, attempt 1" in shown[0]
+    assert "idle timeout 900s, max runtime unset, loop detection warn, attempt 1" in shown[0]
     assert shown[-1].startswith("agent made no progress for 900s (last activity 08:31:02 UTC)")
 
 

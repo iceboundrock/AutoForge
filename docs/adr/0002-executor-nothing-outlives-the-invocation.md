@@ -1,6 +1,7 @@
 # ADR 0002. Executor: nothing an agent starts outlives its invocation
 
-- **Status:** accepted, implemented for #85; amended by #132 (§4b) and #193 (§4c)
+- **Status:** accepted, implemented for #85; amended by #132 (§4b), #193 (§4c) and
+  #194 (§4d)
 - **Decides:** #85 (follow-up of PR #84's review and #53)
 - **Where:** `src/autoforge/executor.py` (`execute()`, `_terminate_group()`,
   `_Containment`), `src/autoforge/executor_duplex.py`,
@@ -271,7 +272,7 @@ child's last output, or within `max_runtime_seconds` of the spawn when that
 is due first, plus the exit grace plus two kill graces. Without a ceiling
 the outer bound is the one-week backstop. That is deliberate: an agent that
 keeps producing output is working, or looping; the idle timeout does not
-tell those apart, and #194 is the issue that will.
+tell those apart, and #194 is the issue that will (§4d).
 
 **The handle.** The duplex handle applies the same two limits to every
 `send_line`, `read_line` and `finish`. Activity means a chunk read from the
@@ -314,6 +315,57 @@ carry the same cases through the Claude stream and a fake Pi.
 `tests/test_engine.py` checks the error text and `execution.json` for each
 limit and that a text-mode Claude profile without a ceiling is never
 launched.
+
+## 4d. Amendment: the caller may stop the invocation (#194)
+
+The decision above is unchanged, and so is every bound. An agent that keeps
+producing output while it repeats itself resets §4c's idle timer forever,
+so without a ceiling it runs to the one-week backstop. #194 adds a
+controller-side loop detector (`src/autoforge/loop_detect.py`); this
+amendment records only what the executor gives it.
+
+- **A stop, set by the caller.** `ExecutionRequest.stop` is a
+  `threading.Event` the caller may set from any thread; `execute()` waits
+  in slices of at most `_STOP_POLL_SECONDS` (0.1 s) while one is given,
+  and once it sees the event set while the child is still running it kills
+  the group through the same `_terminate_group`. The duplex handle has the
+  same as a method, `DuplexChild.stop()`. Containment, orphan reaping, the
+  exit grace, the kill graces and the three leftover facts are exactly
+  those of the timeout path. A child that has exited before the stop is
+  seen is not stopped: `stop()` returns False and changes nothing, and the
+  result is that of its own exit.
+- **What the caller sees.** `ExecutionRequest.on_chunk(stream, bytes)` is
+  handed every chunk either reader reads, after the chunk is captured, so a
+  detector of repeated lines sees the bytes; like `on_output`, a hook that
+  raises is unhooked and the drain goes on. The result says `stopped`
+  (exit status -1), never `timed_out`: why the caller stopped the child is
+  the caller's.
+
+**The bound.** A stop only ends the invocation sooner. `execute()` returns
+within `_STOP_POLL_SECONDS` of the stop plus the two kill graces, and
+within §4c's bound when nobody stops it.
+
+**Policy stays out of the executor.** The executor never sets the stop and
+knows nothing of loops. The detector is pure and provider-neutral: the
+provider adapters feed it the agent's completed tool calls as opaque
+fingerprints (`claude_stream.py`, `pi_rpc.py`) and their retries, and
+`on_chunk` feeds it output lines. The adapter that stops a child reports
+the outcome as a timeout (`timed_out`, `timeout_limit` `loop`), so the
+engine's existing timeout path handles it: state unchanged, a typed
+`ExecutionTimeoutError`, `resume` relaunches the phase. A Pi conversation
+stopped for a loop is not sent `abort` first: the run is discarded as on a
+timeout, and the abort window exists for an orderly wind-down that a run
+being discarded does not need. Whether to stop at all is configuration
+(`execution.loop_detection.mode`: `kill`, `warn` (the default) or `off`).
+
+Tests for §4d: `tests/test_executor.py` stops a child that keeps writing
+from its `on_chunk` hook (the result is `stopped`, not `timed_out`) and
+unhooks a raising `on_chunk` without unhooking `on_output`;
+`tests/test_executor_duplex.py` stops a running child and finds a stop
+after the child's own exit a no-op. `tests/test_providers.py`,
+`tests/test_pi_rpc.py` and `tests/test_loop_detect.py` carry a loop kill
+through the Claude stream, a text profile's output lines, a fake Pi and the
+engine.
 
 ## 5. Tests
 

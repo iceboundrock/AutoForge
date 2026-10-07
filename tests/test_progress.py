@@ -212,6 +212,22 @@ def test_the_reporter_renders_each_kind_and_counts_every_event():
     assert reporter.events == 10
 
 
+def test_a_loop_warning_is_printed_but_is_not_the_agents_activity():
+    """#194: the detector's warning is the controller's observation; it is
+    shown as it is, and neither counts as an agent event nor resets the
+    heartbeat's 'last activity'."""
+    clock, out = Clock(), []
+    reporter = _reporter([out.append], clock, heartbeat_after=120)
+    text = "possible loop: 2-step cycle (Bash, Read) repeated 4×"
+    reporter.sink(_event(ProgressKind.LOOP_SUSPECTED, clock, detail=text))
+    reporter.sink(_event(ProgressKind.LOOP_SUSPECTED, clock))
+    assert out == ["[00:00:00 FIX #2] " + text, "[00:00:00 FIX #2] possible loop"]
+    assert reporter.events == 0
+    clock.now += 120
+    reporter.poll()
+    assert out[-1] == "[00:02:00 FIX #2] still running, no activity yet"
+
+
 def test_thinking_and_writing_are_coalesced_to_one_line_per_interval():
     clock, out = Clock(), []
     reporter = _reporter([out.append], clock, thinking_interval=30)
@@ -460,7 +476,7 @@ def test_seeded_secrets_escapes_and_env_values_reach_no_line_and_no_file(
     shown = [line.split("] ", 1)[1] for line in lines]
     assert shown[0].startswith(
         "launching analyze_execute (claude, model fable, effort high), "
-        "idle timeout 900s, max runtime unset, attempt "
+        "idle timeout 900s, max runtime unset, loop detection warn, attempt "
     )
     assert shown[1:] == [
         "agent started (claude-fable-5-1)",

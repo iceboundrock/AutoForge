@@ -49,6 +49,13 @@ command line, a tool result, thinking or assistant text. The summary is
 flat bounded scalars from the ``result`` record (no nested ``usage`` or
 ``modelUsage``); the cost is integer micro-USD, and a value that is absent
 or unreadable is left out rather than reported as zero.
+
+Loop detection (#194): given a :class:`~autoforge.loop_detect.LoopObserver`,
+each completed tool call is reported as an action fingerprinted from its
+name, the digest of its whole ``input`` (kept from the ``tool_use`` until
+its ``tool_result`` arrives) and the digest of the whole ``tool_result``
+block but its ``tool_use_id``; ``system/api_retry`` is a retry and an
+``assistant`` record a completed turn. Only names and digests leave here.
 """
 
 from __future__ import annotations
@@ -57,6 +64,7 @@ import json
 import math
 from decimal import ROUND_HALF_UP, Decimal
 
+from .loop_detect import LoopObserver, action_fingerprint, digest
 from .progress import ProgressEvent, ProgressKind, ProgressSink, clean, relative_path
 
 # The one tool input shown per tool. A tool not listed shows its name only.
@@ -78,8 +86,9 @@ _PATH_INPUTS = frozenset({"file_path", "notebook_path"})
 # Record types that are activity only. Any other type is counted as unknown
 # (forward compatibility) and is activity too.
 _ACTIVITY_TYPES = frozenset({"rate_limit_event"})
-# Tool calls whose result has not arrived yet, kept to name a failed tool.
-# Past the bound a result is still counted, only not named.
+# Tool calls whose result has not arrived yet, kept to name a failed tool
+# and to fingerprint the call once it completes. Past the bound a result is
+# still counted, only not named, and is no action for the loop detector.
 MAX_OPEN_TOOLS = 1024
 MAX_REASON_CHARS = 400
 MAX_VALUE_CHARS = 120
@@ -113,15 +122,23 @@ class ClaudeStream:
     success and :attr:`failure` the bounded, redacted reason otherwise.
     """
 
-    def __init__(self, *, cwd: str = "", emit: ProgressSink | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        cwd: str = "",
+        emit: ProgressSink | None = None,
+        loop: LoopObserver | None = None,
+    ) -> None:
         self._cwd = cwd
         self._emit = emit
+        self._loop = loop
         self.text: str | None = None
         self.failure: str | None = None
         # stdout ended without a result; the driver names the exit code.
         self.exited_early = False
         self._result_seen = False
-        self._open_tools: dict[str, str] = {}
+        # Open tool calls: their name and, with a loop observer, their input's digest.
+        self._open_tools: dict[str, tuple[str, bytes]] = {}
         self._records = 0
         self._oversize = 0
         self._unknown = 0
@@ -279,6 +296,8 @@ class ClaudeStream:
             self._send(ProgressEvent(ProgressKind.THINKING, tokens=tokens))
         elif subtype == "api_retry":
             self._retries += 1
+            if self._loop is not None:
+                self._loop.retry()
             attempt, limit = _count(record.get("attempt")), _count(record.get("max_retries"))
             detail = ""
             if attempt is not None:
@@ -312,17 +331,22 @@ class ClaudeStream:
             sent = True
         if not sent:
             self._send(ProgressEvent(ProgressKind.ACTIVITY))
+        if self._loop is not None:
+            self._loop.turn()
 
     def _tool_use(self, block: dict) -> None:
         self._tool_calls += 1
         name = block.get("name")
         name = name if isinstance(name, str) else ""
         tool_id = block.get("id")
+        tool_input = block.get("input")
         if isinstance(tool_id, str) and len(self._open_tools) < MAX_OPEN_TOOLS:
-            self._open_tools[tool_id] = name
+            self._open_tools[tool_id] = (
+                name,
+                digest(tool_input) if self._loop is not None else b"",
+            )
         detail = ""
         field = TOOL_DETAILS.get(name)
-        tool_input = block.get("input")
         if field is not None and isinstance(tool_input, dict):
             value = tool_input.get(field)
             if field in _PATH_INPUTS:
@@ -337,12 +361,17 @@ class ClaudeStream:
             if block.get("type") != "tool_result":
                 continue
             tool_id = block.get("tool_use_id")
-            name = self._open_tools.pop(tool_id, "") if isinstance(tool_id, str) else ""
+            call = self._open_tools.pop(tool_id, None) if isinstance(tool_id, str) else None
+            name = call[0] if call is not None else ""
             if block.get("is_error") is True:
                 self._tool_errors += 1
                 self._send(ProgressEvent(ProgressKind.TOOL_FAILED, tool=name))
             else:
                 self._send(ProgressEvent(ProgressKind.TOOL_FINISHED, tool=name))
+            if self._loop is not None and call is not None:
+                # The id differs on every call; everything else is the result.
+                result = {key: value for key, value in block.items() if key != "tool_use_id"}
+                self._loop.action(name, action_fingerprint(name, call[1], digest(result)))
             sent = True
         if not sent:
             self._send(ProgressEvent(ProgressKind.ACTIVITY))

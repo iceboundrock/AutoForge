@@ -309,11 +309,16 @@ requirement named (#120). Same layout either way:
             progress.log                   # agent steps: live progress lines, appended while the
                                            # agent runs (published before the launch; bounded, redacted)
             request.json                   # profile, model, effort, command, limits (idle timeout,
-                                           # max runtime; the wall-clock timeout of a command)
+                                           # max runtime; the wall-clock timeout of a command),
+                                           # an agent's loop detection settings
             prompt.md                      # rendered prompt (redacted)
             execution.json                 # exit code, timing, timed_out, the limit that fired
-                                           # (idle / max_runtime), configured limits, last activity,
-                                           # truncation, leftovers, error
+                                           # (idle / max_runtime / loop), configured limits, last
+                                           # activity, truncation, leftovers, error; for an agent
+                                           # also ended_by (exit / idle / max_runtime / loop), loop
+                                           # detection settings, loop warnings and the loop report
+                                           # (names, counts and times only), provider_summary with
+                                           # the loop_* calibration fields
             stdout.log / stderr.log        # redacted; head + marker + tail past the capture bound
             control-result.json            # parsed CONTROL_RESULT (when valid)
 ```
