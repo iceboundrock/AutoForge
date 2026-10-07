@@ -95,6 +95,40 @@ High-priority coverage includes:
   profile without a ceiling is never launched, and configuration rejects
   the legacy `timeout_seconds` keys by name, out-of-range limits and that
   profile; dry-run and `doctor` show both values
+- loop detection (#194): the pure detector with explicit times
+  (`tests/test_loop_detect.py`) covers:
+  - cycles of period 1 to `max_cycle_period`, at the repeat threshold and
+    one short of it;
+  - irregular replay (no novelty) and its action floor;
+  - masked repeated lines, ended by LF, by a CRLF split across chunks or
+    by a bare CR (a retry message redrawn in place is a line; a redrawn
+    progress bar or spinner frame is not);
+  - a retry storm;
+  - each known legitimate repetition staying below every threshold: an
+    edit/test loop, `git status` between edits, a few CI polls, pytest dot
+    lines, `\r` progress bars and one long silent call;
+  - warnings from half a threshold at bounded intervals;
+  - calibration in every mode, `off` included;
+  - a report that holds names, counts and times only.
+
+  Other files cover each layer:
+  - The executor stops a child from `on_chunk` (`stopped`, not
+    `timed_out`).
+  - The duplex handle's `stop()` is a no-op once the child has exited.
+  - The Claude stream and Pi reducers fingerprint input and result, not
+    the call id.
+  - Pi's failed attempts, in its own order (`message_end` with `error`,
+    `agent_end` with `willRetry`, `auto_retry_start`), keep a retry streak
+    going until it is conclusive and counted in the calibration; a completed
+    response ends it.
+  - A loop kill crosses the fake `claude` (stream and text mode) and a fake
+    Pi as a timeout with the `loop` limit.
+  - End to end on the engine: kill mode leaves the phase unchanged, names
+    the cycle in the error and writes `ended_by: loop` and the `loop`
+    report to `execution.json`. The default `warn` mode never kills and
+    warns twice for forty copies of a cycle. A token-shaped string in the
+    looping tool's input and result, and its digests, reach no line and no
+    file.
 - bounded capture: a stream past the bound keeps its head and tail, the
   retained size honours a bound smaller than one pipe read, and memory stays
   at the bound plus a constant under one-byte reads

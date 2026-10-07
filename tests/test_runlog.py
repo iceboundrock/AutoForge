@@ -46,6 +46,41 @@ def test_runlog_layout_and_redaction(tmp_path):
     assert d2.name == "002-fix-2"
 
 
+def test_an_agent_record_says_how_it_ended_and_what_the_loop_detector_did(tmp_path):
+    """#194: ``ended_by``, the detector's settings, its warning count and its
+    report reach execution.json (the settings request.json too), redacted;
+    a record with no detector settings (a controller command) has none."""
+    token = "ghp_" + "Z9" * 18
+    settings = {"mode": "kill", "max_cycle_period": 4}
+    log = RunLogger(tmp_path / "logs", "run-1")
+    step = log.log_execution(
+        ExecutionRecord(
+            run_id="run-1",
+            seq=0,
+            phase="FIX",
+            timed_out=True,
+            timeout_limit="loop",
+            ended_by="loop",
+            loop_detection=settings,
+            loop={"signal": "action_cycle", "action": "killed", "tools": [f"mcp {token}"]},
+            loop_warnings=2,
+        )
+    )
+    execution = json.loads((step / "execution.json").read_text(encoding="utf-8"))
+    assert execution["ended_by"] == "loop" and execution["loop_warnings"] == 2
+    assert execution["loop_detection"] == settings
+    assert execution["loop"]["signal"] == "action_cycle"
+    request = json.loads((step / "request.json").read_text(encoding="utf-8"))
+    assert request["loop_detection"] == settings
+    for path in (tmp_path / "logs").rglob("*"):
+        if path.is_file():
+            assert token not in path.read_text(encoding="utf-8"), path
+
+    other = log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="MERGE"))
+    execution = json.loads((other / "execution.json").read_text(encoding="utf-8"))
+    assert not {"ended_by", "loop_detection", "loop_warnings", "loop"} & execution.keys()
+
+
 def test_runlog_recovers_sequence_from_step_names_never_from_the_journal(tmp_path):
     """#51: the journal is write-only for the controller. The step sequence
     comes from the directory names, which are published before the journal

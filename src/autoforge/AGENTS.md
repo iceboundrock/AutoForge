@@ -26,8 +26,11 @@ claude_stream.py    Claude stream-json reducer: result text, failure, summary, p
                     events; provider layer, no flags and no processes (#192)
 progress.py         provider-neutral ProgressEvent, cleaning, and the line renderer the
                     engine reports a launch through (#192)
-executor.py         subprocess lifecycle, timeouts, capture, optional stdin payload
-                    (no workflow semantics)
+loop_detect.py      provider-neutral loop detector: action fingerprints, line keys,
+                    cycle / novelty / repeated-line / retry signals, warnings,
+                    verdict and calibration; pure, reads no clock (#194)
+executor.py         subprocess lifecycle, timeouts, a caller's stop, capture, optional
+                    stdin payload (no workflow semantics)
 executor_duplex.py  duplex child handle for RPC transports: stdin records out, LF-framed
                     stdout records in, idle timeout and max runtime, ADR 0002 teardown;
                     bytes only (#130, #193)
@@ -98,7 +101,8 @@ state.py, effects.py, run_contract.py, safefs.py,
 locking.py, errors.py, engine.py (recovery,
 retry)                                            -> docs/agent-guides/state-and-recovery.md
 providers.py, pi_rpc.py, claude_stream.py,
-progress.py, executor.py, executor_duplex.py,
+progress.py, loop_detect.py, executor.py,
+executor_duplex.py,
 prompts/__init__.py                               -> docs/agent-guides/architecture.md
                                                      (+ docs/adr/0003-pi-agent-provider.md and
                                                      docs/pi-policy.md for Pi)

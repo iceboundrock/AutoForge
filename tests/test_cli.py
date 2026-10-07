@@ -2133,7 +2133,8 @@ def test_dry_run_shows_the_prompt_argument_as_a_placeholder(tmp_path, capsys, mo
 
 def test_dry_run_shows_both_agent_limits(tmp_path, capsys, monkeypatch, fakes):
     """#193: the plan names the idle timeout and the maximum runtime the
-    agent would run under, the ceiling as unset when it is."""
+    agent would run under, the ceiling as unset when it is, and how it is
+    watched for a loop (#194)."""
     monkeypatch.chdir(tmp_path)
     sd = str(tmp_path / ".autoforge")
     assert (
@@ -2146,3 +2147,8 @@ def test_dry_run_shows_both_agent_limits(tmp_path, capsys, monkeypatch, fakes):
     (limits,) = [line for line in out.splitlines() if line.startswith("Limits:")]
     assert limits == "Limits:   idle timeout 900s, max runtime unset"
     assert not any(line.startswith("Timeout:") for line in out.splitlines())
+    (loops,) = [line for line in out.splitlines() if line.startswith("Loops:")]
+    assert loops == (
+        "Loops:    loop detection warn (cycles of up to 4 actions x8, no new action for 1800s, "
+        "repeated lines x200)"
+    )

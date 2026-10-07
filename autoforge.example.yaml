@@ -36,11 +36,33 @@ execution:
   default_idle_timeout_seconds: 900
   # A wall-clock ceiling on every agent, however much it writes; a profile
   # overrides it with `max_runtime_seconds`. null (the default): none, so an
-  # agent that loops while producing output is never killed (only the
-  # executor's one-week backstop applies). This is the only hard bound on an
-  # active agent. Required for a Claude profile with `output_format: text`,
-  # which writes nothing until it exits and so runs under this limit alone.
+  # active agent is bounded only by `loop_detection` below (in `kill` mode)
+  # and the executor's one-week backstop. Required for a Claude profile with
+  # `output_format: text`, which writes nothing until it exits and so runs
+  # under this limit alone.
   default_max_runtime_seconds: null
+  # An agent that keeps producing output while it repeats itself resets the
+  # idle timer forever. Loop detection watches what it does instead: the
+  # same tool call (same input, same result) in a cycle of up to
+  # `max_cycle_period` calls repeated `max_cycle_repeats` times in a row; no
+  # tool call it had not made before for `novelty_window_seconds` (once
+  # `max_cycle_period * max_cycle_repeats` calls were replayed in that
+  # window); the same output line, or cycle of lines, repeated
+  # `max_line_repeats` times (digits and hex masked; a bare `\r` ends a line
+  # too, but a `\r` progress bar or spinner is not one); provider retries in
+  # a row. Polling CI a few times, the same test after each edit and
+  # `git status` between edits are not loops.
+  # `warn` (the default) reports a loop in the progress lines and in
+  # execution.json and lets the agent run on; `kill` also kills it as on a
+  # timeout (state unchanged, `resume` relaunches it); `off` reports
+  # nothing. Every mode records in `provider_summary` how close each run
+  # came to the thresholds.
+  loop_detection:
+    mode: warn
+    max_cycle_period: 4
+    max_cycle_repeats: 8
+    novelty_window_seconds: 1800
+    max_line_repeats: 200
   # Wall-clock limit of each `merge.verification_commands` and
   # `local.validation_commands` entry the controller runs itself.
   command_timeout_seconds: 1800

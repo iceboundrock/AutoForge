@@ -8,7 +8,10 @@ one allow-listed ``detail`` and a token estimate, and nothing else. The kinds
 are the subset of #154's shared lifecycle events that a CLI provider can
 report today (started, tool started/finished/failed, provider retry) plus
 the liveness kinds a stream adds (thinking, assistant text, activity); #154
-extends this set rather than defining a second one.
+extends this set rather than defining a second one. One kind is not the
+agent's: ``loop_suspected`` carries the controller's loop detector warning
+(#194, :mod:`autoforge.loop_detect`), is printed as it is and is never
+counted as the agent's activity.
 
 Every string an event carries is made safe when the event is built, not
 where it is printed: ANSI escape sequences, control, format and line
@@ -59,6 +62,9 @@ class ProgressKind(enum.StrEnum):
     PROVIDER_RETRY = "provider_retry"
     # Any other sign of life: a record that is none of the above.
     ACTIVITY = "activity"
+    # Not the agent's: the controller's loop detector (#194) warns that the
+    # agent may be repeating itself; ``detail`` is its short description.
+    LOOP_SUSPECTED = "loop_suspected"
 
 
 # A raw value longer than this is no path, pattern or description an
@@ -322,6 +328,10 @@ class ProgressReporter:
                 pass
 
     def _take(self, event: ProgressEvent, now: float) -> None:
+        if event.kind is ProgressKind.LOOP_SUSPECTED:
+            # The controller's own observation, not a sign of the agent's life.
+            self._emit(event.detail or "possible loop", now)
+            return
         self._events += 1
         self._last_event = now
         kind = event.kind

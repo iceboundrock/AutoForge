@@ -393,6 +393,36 @@ def test_child_death_mid_conversation_gives_eof_and_the_real_exit_code():
     assert res.exit_code == 7 and not res.timed_out and res.leftovers == ""
 
 
+def test_stop_kills_the_group_and_the_result_says_stopped_not_timed_out():
+    """The caller's stop (#194) ends a running child at once through the
+    timeout path; the result is ``stopped`` with exit status -1."""
+    started = time.monotonic()
+    with start_duplex(
+        DuplexRequest(command=[PY, "-c", _ECHO, "0"], max_runtime_seconds=30)
+    ) as child:
+        child.send_line(b"ping")
+        assert isinstance(child.read_line(timeout=10), Record)
+        assert child.stop() is True
+        assert child.stop() is False  # dealt with already
+        res = child.finish()
+    assert time.monotonic() - started < 10
+    assert res.stopped and not res.timed_out and res.exit_code == -1
+    assert not (res.descendants_killed or res.group_survived_kill or res.capture_abandoned)
+
+
+def test_stop_after_the_child_exited_is_a_no_op():
+    script = "import sys\nprint('bye', flush=True)\nsys.exit(7)\n"
+    with start_duplex(DuplexRequest(command=[PY, "-c", script], max_runtime_seconds=30)) as child:
+        assert child.read_line(timeout=10) == Record(b"bye")
+        assert child.read_line(timeout=10) == Eof()
+        deadline = time.monotonic() + 10
+        while child._proc.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert child.stop() is False
+        res = child.finish()
+    assert res.exit_code == 7 and not res.stopped and not res.timed_out
+
+
 def test_per_call_read_timeout_leaves_the_child_running():
     with start_duplex(
         DuplexRequest(command=[PY, "-c", _ECHO, "0"], max_runtime_seconds=30)

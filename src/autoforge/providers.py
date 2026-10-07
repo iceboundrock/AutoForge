@@ -98,6 +98,15 @@ environment (see executor.py): the engine passes the configured allow-list
 in :attr:`AgentRequest.env_allowlist` and each adapter adds the variables
 its own CLI reads (:attr:`AgentProvider.environment_names`), so the key of
 one provider is never handed to another.
+
+Every adapter runs a :class:`~autoforge.loop_detect.LoopMonitor` under
+:attr:`AgentRequest.loop_detection` (#194): Claude's stream and Pi's events
+report each completed tool call as an action, and a one-shot CLI's output
+(OpenCode's stderr trace, Claude's ``text`` output) is digested line by
+line as it arrives. A verdict in ``kill`` mode ends the invocation through
+the same group kill as a timeout, and the result is a timeout whose limit is
+``loop``; a warning is a ``loop_suspected`` progress event. The monitor's
+calibration figures join ``provider_summary`` in every mode.
 """
 
 from __future__ import annotations
@@ -105,12 +114,13 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from .claude_stream import ClaudeStream
-from .config import ProfileConfig
+from .config import LoopDetectionConfig, ProfileConfig
 from .errors import (
     ChildStdinClosedError,
     ConfigurationError,
@@ -137,6 +147,7 @@ from .executor_duplex import (
     Timeout,
     start_duplex,
 )
+from .loop_detect import LIMIT_LOOP, LoopMonitor, LoopReport
 from .pi_rpc import PiConversation, encodable
 from .progress import ProgressEvent, ProgressKind, ProgressSink, guarded
 
@@ -169,6 +180,9 @@ class AgentRequest:
     # the invocation (:func:`autoforge.progress.guarded`); progress never
     # changes an outcome.
     progress: ProgressSink | None = None
+    # How the adapter watches the invocation for a loop (#194): the engine
+    # passes ``execution.loop_detection``.
+    loop_detection: LoopDetectionConfig = field(default_factory=LoopDetectionConfig)
 
 
 @dataclass
@@ -207,11 +221,15 @@ class AgentExecutionResult:
     # that the engine writes to ``execution.json`` under this key without
     # interpreting it. Never raw protocol records or message contents.
     provider_summary: dict[str, str | int | bool] = field(default_factory=dict)
-    # Which limit killed the CLI when ``timed_out`` (``"idle"`` or
-    # ``"max_runtime"``), and when it last wrote anything (UTC, ISO 8601;
-    # ``None`` when it wrote nothing). See :class:`ExecutionResult`.
+    # Which limit killed the CLI when ``timed_out`` (``"idle"``,
+    # ``"max_runtime"``, or ``"loop"`` when the loop detector did, #194), and
+    # when it last wrote anything (UTC, ISO 8601; ``None`` when it wrote
+    # nothing). See :class:`ExecutionResult`.
     timeout_limit: str = ""
     last_activity_at: str | None = None
+    # What the loop detector found (#194): the finding it killed for, or the
+    # strongest it warned about; ``None`` when neither. Names and counts only.
+    loop: LoopReport | None = None
 
     @property
     def stdout_tail(self) -> str:
@@ -291,6 +309,52 @@ def _activity_hook(progress: ProgressSink | None) -> Callable[[str], None] | Non
     return on_output
 
 
+def _loop_monitor(req: AgentRequest, emit: ProgressSink | None) -> LoopMonitor:
+    """The invocation's loop detector (#194), warning through ``emit``."""
+
+    def warn(text: str) -> None:
+        if emit is not None:
+            emit(ProgressEvent(ProgressKind.LOOP_SUSPECTED, detail=text))
+
+    return LoopMonitor(req.loop_detection, time.monotonic(), warn)
+
+
+class _ClockedLoop:
+    """A :class:`LoopMonitor` as a clock-free reducer reports to it: each
+    event is timed as it is reduced, so the reducer reads no clock."""
+
+    def __init__(self, monitor: LoopMonitor) -> None:
+        self._monitor = monitor
+
+    def action(self, name: str, fingerprint: bytes) -> None:
+        self._monitor.action(name, fingerprint, time.monotonic())
+
+    def retry(self) -> None:
+        self._monitor.retry(time.monotonic())
+
+    def turn(self) -> None:
+        self._monitor.turn(time.monotonic())
+
+
+def _finish_loop(
+    result: AgentExecutionResult, monitor: LoopMonitor, *, killed: bool
+) -> AgentExecutionResult:
+    """Record the loop detector's outcome on ``result`` (#194).
+
+    ``killed``: the invocation was ended on the verdict. It is then a
+    timeout whose limit is ``loop``, which the engine and the run log treat
+    exactly as the other limits: whatever the protocol said is not read. The
+    calibration figures join ``provider_summary`` whatever the mode.
+    """
+    result.provider_summary.update(monitor.calibration())
+    result.loop = monitor.report(killed=killed)
+    if killed:
+        result.timed_out = True
+        result.timeout_limit = LIMIT_LOOP
+        result.provider_failure = None
+    return result
+
+
 def _truthy(value: str | None, default: bool) -> bool:
     if value is None or value == "":
         return default
@@ -362,6 +426,15 @@ class AgentProvider:
 
     def execute(self, req: AgentRequest) -> AgentExecutionResult:
         command = self.build_command(req)
+        monitor = _loop_monitor(req, guarded(req.progress))
+        stop = threading.Event()
+
+        def on_chunk(stream: str, chunk: bytes) -> None:
+            # The output is not a protocol: its lines are digested as they
+            # arrive and dropped (#194); the capture keeps its own copy.
+            if monitor.output(stream, chunk, time.monotonic()) is not None:
+                stop.set()
+
         res = self._runner(
             ExecutionRequest(
                 command=command,
@@ -374,17 +447,19 @@ class AgentProvider:
                 contain_orphans=True,
                 stdin_data=self.stdin_payload(req),
                 on_output=_activity_hook(req.progress),
+                on_chunk=on_chunk,
+                stop=stop,
             )
         )
         result = AgentExecutionResult.from_execution(res, req.profile)
-        if res.stdin_unread and res.exit_code == 0 and not res.timed_out:
+        if res.stdin_unread and res.exit_code == 0 and not res.timed_out and not res.stopped:
             # A clean exit would otherwise be read as an answer to the whole
             # prompt; a timeout or a failed exit already says more.
             result.provider_failure = (
                 f"{self.name}: the prompt was not delivered: the CLI exited without "
                 f"reading the last {res.stdin_unread} bytes of it"
             )
-        return result
+        return _finish_loop(result, monitor, killed=res.stopped)
 
 
 CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
@@ -486,7 +561,9 @@ class ClaudeCodeProvider(AgentProvider):
         """
         if self.output_format(req.profile) != "stream-json":
             return super().execute(req)
-        stream = ClaudeStream(cwd=req.cwd, emit=guarded(req.progress))
+        emit = guarded(req.progress)
+        monitor = _loop_monitor(req, emit)
+        stream = ClaudeStream(cwd=req.cwd, emit=emit, loop=_ClockedLoop(monitor))
         duplex = DuplexRequest(
             command=self.build_command(req),
             cwd=req.cwd,
@@ -502,9 +579,9 @@ class ClaudeCodeProvider(AgentProvider):
             contain_orphans=True,
         )
         with start_duplex(duplex) as child:
-            cut_short = _read_claude_stream(child, stream)
+            cut_short = _read_claude_stream(child, stream, monitor)
             res = child.finish()
-        timed_out = cut_short or res.timed_out
+        timed_out = cut_short or res.timed_out or res.stopped
         failure = stream.failure
         if stream.exited_early:
             failure = f"{failure} (exit {res.exit_code})"
@@ -514,7 +591,7 @@ class ClaudeCodeProvider(AgentProvider):
         summary["failure"] = failure or ""
         text = stream.text if failure is None else None
         stdout, truncated = _keep_tail(encodable(text or ""), DEFAULT_MAX_OUTPUT_BYTES)
-        return AgentExecutionResult(
+        result = AgentExecutionResult(
             command=list(res.command),
             exit_code=res.exit_code,
             stdout=stdout,
@@ -539,9 +616,12 @@ class ClaudeCodeProvider(AgentProvider):
             timeout_limit=res.timeout_limit,
             last_activity_at=res.last_activity_at,
         )
+        return _finish_loop(result, monitor, killed=res.stopped)
 
 
-def _read_claude_stream(child: DuplexChild, stream: ClaudeStream) -> bool:
+def _read_claude_stream(
+    child: DuplexChild, stream: ClaudeStream, loop: LoopMonitor | None = None
+) -> bool:
     """Feed every stdout outcome to ``stream`` through its end; True on the deadline.
 
     The CLI's exit, not EOF, ends the wait: a descendant still holding its
@@ -552,7 +632,9 @@ def _read_claude_stream(child: DuplexChild, stream: ClaudeStream) -> bool:
     queued up to its end by then, is fed and validated like every line
     before it. A read that meets the deadline after the CLI's exit does the
     same (``read_line`` looks at the CLI first), so only a CLI still running
-    at the deadline is a timeout.
+    at the deadline is a timeout. A verdict of ``loop`` (#194) on a CLI
+    still running stops it, and the caller's ``finish()`` reports
+    ``stopped``.
     """
     while True:
         item = child.read_line(timeout=CLAUDE_EXIT_POLL_SECONDS)
@@ -570,6 +652,8 @@ def _read_claude_stream(child: DuplexChild, stream: ClaudeStream) -> bool:
             return False
         elif item.deadline_exceeded:
             return True
+        if loop is not None and loop.verdict is not None and child.stop():
+            return False
         if child.exited():
             child.finish()
 
@@ -902,13 +986,16 @@ class PiProvider(AgentProvider):
             refused = self._auth_preflight(req, allowlist)
             if refused is not None:
                 return refused
+        emit = guarded(req.progress)
+        monitor = _loop_monitor(req, emit)
         conversation = PiConversation(
             model=req.profile.model,
             thinking=req.profile.effort,
             prompt=req.prompt,
             round_trip_seconds=self.round_trip_seconds,
-            emit=guarded(req.progress),
+            emit=emit,
             cwd=req.cwd,
+            loop=monitor,
         )
         duplex = DuplexRequest(
             command=self.build_command(req),
@@ -924,7 +1011,7 @@ class PiProvider(AgentProvider):
             contain_orphans=True,
         )
         with start_duplex(duplex) as child:
-            cut_short = self._converse(child, conversation)
+            cut_short = self._converse(child, conversation, monitor)
             # The limit that fell due when the conversation was cut short:
             # pinned by then, so Pi's own exit inside the abort keeps it.
             cut_limit = child.deadline_limit if cut_short else ""
@@ -937,7 +1024,7 @@ class PiProvider(AgentProvider):
                 self._abort(child, conversation, self.abort_seconds)
             child.close_stdin()
             res = child.finish()
-        timed_out = cut_short or res.timed_out
+        timed_out = cut_short or res.timed_out or res.stopped
         failure = conversation.failure
         if conversation.exited_early:
             failure = f"{failure} (exit {res.exit_code})"
@@ -948,7 +1035,7 @@ class PiProvider(AgentProvider):
             summary["failure"] = failure
         text = conversation.text if failure is None else None
         stdout, truncated = _keep_tail(encodable(text or ""), self.max_text_bytes)
-        return AgentExecutionResult(
+        result = AgentExecutionResult(
             command=list(res.command),
             exit_code=res.exit_code,
             stdout=stdout,
@@ -974,6 +1061,7 @@ class PiProvider(AgentProvider):
             timeout_limit=(res.timeout_limit or cut_limit) if timed_out else "",
             last_activity_at=res.last_activity_at,
         )
+        return _finish_loop(result, monitor, killed=res.stopped)
 
     def _refuse_api_keys(self, req: AgentRequest, allowlist: tuple[str, ...] | None) -> None:
         """Raise :class:`ExecutionError` when a set provider API key would reach Pi."""
@@ -1062,12 +1150,20 @@ class PiProvider(AgentProvider):
                 conversation.stdin_closed()
                 return
 
-    def _converse(self, child: DuplexChild, conversation: PiConversation) -> bool:
+    def _converse(
+        self,
+        child: DuplexChild,
+        conversation: PiConversation,
+        loop: LoopMonitor | None = None,
+    ) -> bool:
         """Drive the conversation to its outcome; True when a limit cut it short.
 
         The conversation is cut short as the child's limit falls due, which
         Pi's output keeps moving, so it is recomputed on every turn; once
         cut short the deadline is pinned, the abort window after the limit.
+        A verdict of ``loop`` (#194) stops a Pi still running at once, with
+        no ``abort``: the run is discarded, as on a timeout, and the caller's
+        ``finish()`` reports ``stopped``.
         """
         try:
             self._send(child, conversation, conversation.start(time.monotonic()))
@@ -1085,6 +1181,8 @@ class PiProvider(AgentProvider):
                 item = child.read_line(timeout=max(0.0, until - now))
                 if isinstance(item, Record):
                     replies = conversation.feed(item.data, time.monotonic())
+                    if loop is not None and loop.verdict is not None and child.stop():
+                        return False
                     self._send(child, conversation, replies)
                 elif isinstance(item, Oversize):
                     conversation.framing_error(f"a stdout record exceeded {item.limit} bytes")

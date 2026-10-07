@@ -259,6 +259,17 @@ class ExecutionRecord:
     # seen (UTC ISO 8601), ``None`` when it wrote nothing.
     timeout_limit: str = ""
     last_activity_at: str | None = None
+    # An agent's invocation (#194): how it ended (``exit``, or the limit that
+    # killed it: ``idle``, ``max_runtime`` or ``loop``; empty when it could
+    # not be run), the loop detector's settings
+    # (``LoopDetectionConfig.as_dict``), what the detector found
+    # (``LoopReport.record``: names, counts and times, never a tool input,
+    # result, output line or digest; ``None`` when nothing) and how many
+    # warnings it printed. All empty for a controller-run command.
+    ended_by: str = ""
+    loop_detection: dict[str, object] = field(default_factory=dict)
+    loop: dict[str, object] | None = None
+    loop_warnings: int = 0
     # The executor kept head + marker + tail of the stream (see
     # ``executor.DEFAULT_MAX_OUTPUT_BYTES``); ``stdout.log`` shows the cut.
     stdout_truncated: bool = False
@@ -620,6 +631,10 @@ class RunLogger:
         # The adapter bounds and redacts its summary already; it is redacted
         # again here because it is written twice, like the metadata.
         record.provider_summary = redact_dict(record.provider_summary)
+        if record.loop is not None:
+            # Built from cleaned tool names and counts; redacted again
+            # because it is written twice, like the summary.
+            record.loop = redact_dict(record.loop)
         # Redacted on the record itself, not at each write site: `error` is
         # persisted three times (execution.json, error.txt and the whole
         # record in events.jsonl) and a controller-side error quotes agent
@@ -650,6 +665,8 @@ class RunLogger:
             "command": record.command,
             "metadata": record.metadata,
         }
+        if record.loop_detection:
+            request["loop_detection"] = record.loop_detection
         execution = {
             "started_at": record.started_at,
             "finished_at": record.finished_at,
@@ -673,6 +690,12 @@ class RunLogger:
         }
         if record.provider_summary:
             execution["provider_summary"] = record.provider_summary
+        if record.loop_detection:
+            execution["ended_by"] = record.ended_by
+            execution["loop_detection"] = record.loop_detection
+            execution["loop_warnings"] = record.loop_warnings
+            if record.loop is not None:
+                execution["loop"] = record.loop
         base = f"{self.run_id}/{step}"
         with self._logs_root() as logs:
             logs.ensure_dir(base)

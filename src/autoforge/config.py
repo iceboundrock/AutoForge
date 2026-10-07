@@ -136,7 +136,28 @@ EXECUTION_KEYS = (
     "env_allowlist",
     "env_allowlist_extra",
     "worktree_dir",
+    "loop_detection",
 )
+
+# What the loop detector (#194, ``autoforge.loop_detect``) does once an agent
+# that keeps producing output repeats itself with nothing new: ``kill`` ends
+# the invocation like a timeout, ``warn`` only says so in the progress output
+# and ``execution.json``, ``off`` says nothing. Every mode records the
+# calibration figures in ``provider_summary``. The default is ``warn`` until
+# real runs have calibrated the thresholds.
+LOOP_DETECTION_MODES = ("kill", "warn", "off")
+LOOP_DETECTION_KEYS = (
+    "mode",
+    "max_cycle_period",
+    "max_cycle_repeats",
+    "novelty_window_seconds",
+    "max_line_repeats",
+)
+# Upper bounds that keep the detector's per-action work and memory small: a
+# cycle longer than this is not one an operator would call a loop, and a
+# repeat count past the cap is no threshold at all.
+MAX_LOOP_CYCLE_PERIOD = 16
+MAX_LOOP_REPEATS = 100_000
 
 # The environment an agent, a pre-merge verification command and a LOCAL
 # validation command start from: these variables of the operator's
@@ -195,6 +216,43 @@ DEFAULT_ENV_ALLOWLIST: tuple[str, ...] = (
 
 
 @dataclass
+class LoopDetectionConfig:
+    """``execution.loop_detection`` (#194): the mode and the thresholds.
+
+    A cycle of up to ``max_cycle_period`` tool calls (same name, input and
+    result) repeated ``max_cycle_repeats`` times in a row; no tool call the
+    invocation had not seen for ``novelty_window_seconds`` while at least
+    ``max_cycle_period * max_cycle_repeats`` of them were replayed; a line of
+    unstructured output, or a cycle of up to ``max_cycle_period`` lines,
+    repeated ``max_line_repeats`` times in a row. See ``autoforge.loop_detect``.
+    """
+
+    mode: str = "warn"
+    max_cycle_period: int = 4
+    max_cycle_repeats: int = 8
+    novelty_window_seconds: int = 1800
+    max_line_repeats: int = 200
+
+    def describe(self) -> str:
+        """The mode and thresholds, for the dry-run plan and ``doctor``."""
+        return (
+            f"loop detection {self.mode} (cycles of up to {self.max_cycle_period} actions "
+            f"x{self.max_cycle_repeats}, no new action for {self.novelty_window_seconds}s, "
+            f"repeated lines x{self.max_line_repeats})"
+        )
+
+    def as_dict(self) -> dict[str, object]:
+        """The same, for ``request.json`` and ``execution.json``."""
+        return {
+            "mode": self.mode,
+            "max_cycle_period": self.max_cycle_period,
+            "max_cycle_repeats": self.max_cycle_repeats,
+            "novelty_window_seconds": self.novelty_window_seconds,
+            "max_line_repeats": self.max_line_repeats,
+        }
+
+
+@dataclass
 class ExecutionConfig:
     # The limits of a profile that sets none of its own (#193): an agent is
     # killed once it has written nothing for ``default_idle_timeout_seconds``,
@@ -218,6 +276,8 @@ class ExecutionConfig:
     # working tree of the checkout; otherwise a directory, relative to the
     # controller's working directory, that holds one worktree per issue.
     worktree_dir: str = ""
+    # What an agent that keeps producing output but loops runs into (#194).
+    loop_detection: LoopDetectionConfig = field(default_factory=LoopDetectionConfig)
 
     def environment_names(self) -> tuple[str, ...]:
         """The allow-list in force: the base list plus the additions, deduplicated."""
@@ -921,6 +981,37 @@ REMOVED_EXECUTION_KEYS = {
 }
 
 
+def _merge_loop_detection(loop: LoopDetectionConfig, exe: dict, source: str) -> None:
+    section = _section(
+        exe, "loop_detection", source, LOOP_DETECTION_KEYS, label="execution.loop_detection"
+    )
+    if "mode" in section:
+        mode = section["mode"]
+        if not isinstance(mode, str) or mode not in LOOP_DETECTION_MODES:
+            raise ConfigurationError(
+                f"{source}: 'execution.loop_detection.mode' must be one of "
+                f"{', '.join(LOOP_DETECTION_MODES)}, got {mode!r}"
+            )
+        loop.mode = mode
+    # A repeat count of 1 is every action, and a period of 0 none: neither is
+    # a loop bound, so both are refused rather than read as "off" (that is
+    # what ``mode: off`` is for).
+    for key, low, high in (
+        ("max_cycle_period", 1, MAX_LOOP_CYCLE_PERIOD),
+        ("max_cycle_repeats", 2, MAX_LOOP_REPEATS),
+        ("max_line_repeats", 2, MAX_LOOP_REPEATS),
+        ("novelty_window_seconds", 1, MAX_DEADLINE_SECONDS),
+    ):
+        if key in section:
+            value = _as_int(section[key], source, f"execution.loop_detection.{key}")
+            if not low <= value <= high:
+                raise ConfigurationError(
+                    f"{source}: 'execution.loop_detection.{key}' must be between "
+                    f"{low} and {high}, got {value}"
+                )
+            setattr(loop, key, value)
+
+
 def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeConfig:
     _reject_unknown_keys(data, TOP_LEVEL_KEYS, source, "the top level")
     version = data.get("version", CONFIG_VERSION)
@@ -977,6 +1068,7 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
             )
         else:
             base.execution.worktree_dir = raw_dir.strip()
+    _merge_loop_detection(base.execution.loop_detection, exe, source)
     safety = _section(data, "safety", source, SAFETY_KEYS)
     if "allow_merge" in safety:
         base.safety.allow_merge = _as_bool(safety["allow_merge"], source, "safety.allow_merge")

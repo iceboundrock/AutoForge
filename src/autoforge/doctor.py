@@ -494,6 +494,7 @@ class Doctor:
         return [
             *self._agent_checks(cfg, reachable, "this local configuration"),
             self.check_agent_limits(cfg, reachable),
+            self.check_loop_detection(cfg),
         ]
 
     def check_agent_limits(self, cfg: AutoForgeConfig, reachable: list[str]) -> CheckResult:
@@ -518,6 +519,13 @@ class Doctor:
                 return CheckResult(name, False, str(exc))
             shown.append(f"{profile_name}: {limits.describe()}")
         return CheckResult(name, True, "; ".join(shown) or "(no profile)", required=False)
+
+    @staticmethod
+    def check_loop_detection(cfg: AutoForgeConfig) -> CheckResult:
+        """Report how every agent is watched for a loop (#194). Informational."""
+        return CheckResult(
+            "loop detection", True, cfg.execution.loop_detection.describe(), required=False
+        )
 
     def _agent_checks(
         self, cfg: AutoForgeConfig, reachable: list[str], scope: str
@@ -823,6 +831,7 @@ class Doctor:
         return [
             *self._agent_checks(cfg, reachable, "this configuration"),
             self.check_agent_limits(cfg, reachable),
+            self.check_loop_detection(cfg),
         ]
 
     def run_all(self) -> list[CheckResult]:

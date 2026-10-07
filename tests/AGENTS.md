@@ -58,6 +58,8 @@ CONTROL_RESULT, prompts, providers    test_result_parser.py, test_prompts.py, te
 Pi RPC reducer and adapter (fake pi)  test_pi_rpc.py
 Claude stream-json reducer            test_claude_stream.py (adapter on the fake: test_providers.py)
 live progress, its redaction          test_progress.py
+loop detector (unit and end to end)   test_loop_detect.py (adapters: test_providers.py,
+                                      test_pi_rpc.py, test_claude_stream.py)
 executor, lock, redaction, run logs   test_executor.py, test_executor_duplex.py, test_lock.py,
                                       test_redaction.py, test_runlog.py
 LOCAL mode                            test_local*.py

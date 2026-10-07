@@ -235,6 +235,9 @@ class DuplexResult:
     # and when it last wrote anything.
     timeout_limit: str = ""
     last_activity_at: str | None = None
+    # The caller ended the invocation with :meth:`DuplexChild.stop` before
+    # the child exited; ``exit_code`` is then -1. Never set with ``timed_out``.
+    stopped: bool = False
 
     @property
     def leftovers(self) -> str:
@@ -536,6 +539,7 @@ class DuplexChild:
         self._left: _Termination | None = None
         self._timed_out = False
         self._timeout_limit = ""
+        self._stopped = False
         self._child_killed = False
         self._descendants_killed = False
         self._closed = False
@@ -786,6 +790,7 @@ class DuplexChild:
             orphans_unchecked=self._req.contain_orphans and self._contained is None,
             timeout_limit=self._timeout_limit,
             last_activity_at=self._limits.last_activity_at(),
+            stopped=self._stopped,
         )
         return self._result
 
@@ -807,6 +812,20 @@ class DuplexChild:
         """Kill the group before the child exited on its own; caller holds the lock."""
         self._child_killed = self._proc.poll() is None
         self._left = _terminate_group(self._pgid, self._proc, self._readers, self._contained)
+
+    def stop(self) -> bool:
+        """End the invocation now, for a reason of the caller's (#194's loop
+        detector): the group is killed as on a timeout, through the same
+        path and within the same bounds, and the result says ``stopped``.
+        False, and nothing done, once the child has exited on its own or the
+        group has been dealt with (a limit fired first): the caller then
+        settles it as usual. The caller follows a stop with :meth:`finish`."""
+        with self._lifecycle_lock:
+            if self._left is not None or self._proc.poll() is not None:
+                return False
+            self._stopped = True
+            self._kill()
+            return True
 
     def _expire(self) -> None:
         """The deadline passed: kill the group as ``execute()`` does on timeout."""

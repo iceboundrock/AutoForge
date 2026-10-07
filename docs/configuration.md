@@ -121,7 +121,7 @@ directory if it is missing and a probe file it creates and removes there.
 | Section | What it controls | Where the behaviour is specified |
 |---|---|---|
 | top level | `version`, `state_dir` (default `.autoforge`), `prompt_version` | [State and recovery](agent-guides/state-and-recovery.md) |
-| `execution` | the default agent limits (`default_idle_timeout_seconds` 900, `default_max_runtime_seconds` unset), the wall-clock bound on controller-run commands (`command_timeout_seconds` 1800), `max_correction_attempts` (default 1), the agent environment allow-list (`env_allowlist`, `env_allowlist_extra`), the per-issue agent worktree location (`worktree_dir`) | [Architecture](agent-guides/architecture.md), [Running the remote workflow](usage.md) |
+| `execution` | the default agent limits (`default_idle_timeout_seconds` 900, `default_max_runtime_seconds` unset), loop detection (`loop_detection`, mode `warn`), the wall-clock bound on controller-run commands (`command_timeout_seconds` 1800), `max_correction_attempts` (default 1), the agent environment allow-list (`env_allowlist`, `env_allowlist_extra`), the per-issue agent worktree location (`worktree_dir`) | [Architecture](agent-guides/architecture.md), [Running the remote workflow](usage.md) |
 | `safety` | the merge gate (`allow_merge`, default `false`), `protected_merge_paths` (default `.github/workflows/`), `required_checks` (default `ci`), `verify_check_definition` (default `true`) | [GitHub safety](agent-guides/github-safety.md#merge-safety) |
 | `merge` | how the controller merges once the gate is open: `method` (default `squash`), `delete_branch`, `max_verification_attempts` (default 5), `verification_commands` (argv lists, empty by default) | [GitHub safety](agent-guides/github-safety.md#merge-safety) |
 | `workflow` | loop bounds: `max_review_rounds` (20), `stagnation_identical_rounds` (2), `stagnation_unchanged_count_rounds` (3), `max_total_steps` (300); `epic_update_every` (1) | [Workflow](agent-guides/workflow.md#loop-bounds) |
@@ -187,10 +187,11 @@ one-week backstop is the only wall-clock bound.
   OpenCode's text. A tool call that prints nothing for longer than the idle
   timeout, such as a long silent test run inside one shell command, is no
   progress and is killed; raise `idle_timeout_seconds` on that profile.
-- **The trade-off.** Without `max_runtime_seconds`, an agent that loops
-  while producing output is never killed: the idle timeout catches a silent
-  hang, not a busy one. Set a ceiling when that matters; #194 tracks
-  detecting a busy loop.
+- **The trade-off.** The idle timeout catches a silent hang, not a busy
+  one: output that keeps flowing resets it. [Loop detection](#loop-detection)
+  catches an agent that keeps repeating itself, and kills it in `kill` mode;
+  in the default `warn` mode it only warns, so set `max_runtime_seconds`
+  when an unattended run needs a hard bound on an active agent.
 - **Claude `output_format: text`** prints nothing until it exits, so the
   idle timeout cannot tell a working agent from a stuck one. Such a profile
   runs under its ceiling alone, and a ceiling is required: without
@@ -213,6 +214,90 @@ anything, and the step's `execution.json` records the same
 The keys are strict. A profile's `timeout_seconds` (the old wall-clock
 limit) and `execution.default_timeout_seconds` are load errors that name
 their replacements.
+
+### Loop detection
+
+An agent that keeps producing output while it repeats itself resets the
+idle timer forever. `execution.loop_detection` (#194) watches what the
+agent *does* instead: a loop is the same action, with the same input and
+the same result, repeated with no new action in between, never repeated
+text alone.
+
+```yaml
+execution:
+  loop_detection:
+    mode: warn                    # kill | warn | off
+    max_cycle_period: 4           # 1-16
+    max_cycle_repeats: 8          # 2-100000
+    novelty_window_seconds: 1800  # 1-604800
+    max_line_repeats: 200         # 2-100000
+```
+
+The detector looks for four signals:
+
+- **Action cycle.** A completed tool call is one action, fingerprinted by
+  its tool name, its full input and its full result. A cycle of up to
+  `max_cycle_period` actions repeated `max_cycle_repeats` times in a row is
+  a loop, for example `Bash, Read, Bash, Read, …` with the same command,
+  the same file and the same answers each time.
+- **No novelty.** No action the invocation had not already made for
+  `novelty_window_seconds`, while at least `max_cycle_period ×
+  max_cycle_repeats` replayed actions fell inside that window. Below that
+  floor the window is inconclusive, so one long silent tool call is never
+  a loop; the idle timeout handles that.
+- **Repeated lines.** Output that is not a structured stream (OpenCode's
+  stderr, a Claude `output_format: text` profile's stdout) is cut into
+  lines at `\n`, `\r\n` and a bare `\r`, with digits and hex masked and
+  whitespace collapsed. A line, or a cycle of up to `max_cycle_period`
+  lines, repeated `max_line_repeats` times in a row is a loop, so a retry
+  message redrawn in place with `\r` counts like any other line. A line
+  with no letters (a pytest dot line, a rule) is skipped, and so is a line
+  a bare `\r` ends that shows a progress mark (a percentage, a bar or
+  spinner glyph, an ASCII bar such as `[====>   ]`, or a `|`, `/`, `-` or
+  `\` spinner frame at either end): a `\r` progress bar or spinner redraws
+  one display rather than writing new lines.
+- **Retry storm.** `max_cycle_repeats` provider retries in a row over
+  `novelty_window_seconds` with no completed turn or tool call in between;
+  the failed attempt a provider reports before each retry is not a
+  completed turn. This needs a provider that reports its retries (Claude
+  stream-json, Pi).
+
+The action cycle, no-novelty and retry-storm signals come from the
+structured events of Claude's stream-json and Pi's RPC. OpenCode and a
+Claude text profile have no such events and get the repeated-lines signal
+only.
+
+The modes:
+
+| `mode` | From half a threshold | At a threshold |
+|---|---|---|
+| `warn` (default) | warns | warns that the loop is conclusive; the agent runs on |
+| `kill` | warns | kills the agent as on a timeout |
+| `off` | nothing | nothing |
+
+A warning is a progress line, such as `possible loop: 2-step cycle (Bash,
+Read) repeated 4×`. It repeats at most every two minutes while the loop
+goes on, plus once when the loop becomes conclusive. In every mode, `off`
+included, `provider_summary` in `execution.json` records how close the
+invocation came to each threshold. These are the `loop_*` calibration
+fields, and #199 sets the thresholds and switches the default to `kill`
+from them. What a kill looks like, and how to resume after one, is in
+[Running the remote workflow](usage.md#loop-detection).
+
+Work that repeats legitimately stays below every threshold:
+
+- polling CI a few times;
+- the same test after each edit (the edits differ);
+- `git status` / `git diff` between edits;
+- pytest progress output;
+- one long silent tool call.
+
+`autoforge doctor`, the dry-run plan (`Loops:`) and the launch line show
+the mode, and the doctor and dry-run also show the thresholds. The keys
+are strict, like everywhere else. An unknown key, an unknown mode or a
+value out of range is a load error. A repeat count of 1, or a period of
+0, is refused rather than read as "off"; `mode: off` is the way to turn
+detection off.
 
 ### Claude profiles
 

@@ -93,6 +93,11 @@ _KILL_GRACE_SECONDS = 5.0
 _EXIT_GRACE_SECONDS = 2.0
 _GROUP_POLL_SECONDS = 0.02
 _READ_CHUNK_BYTES = 64 * 1024
+# How often the wait for the child's exit looks at :attr:`ExecutionRequest.stop`,
+# and so how late after it is set the group kill can begin; and what the wait
+# returns when it was set.
+_STOP_POLL_SECONDS = 0.1
+_STOPPED = "stopped"
 
 # Per-stream capture bound. A Claude Code ``-p`` transcript is kilobytes and
 # an OpenCode ``run`` transcript at most a few megabytes, so the default is
@@ -189,6 +194,17 @@ class ExecutionRequest:
     # the two streams are serialized; one that raises is not called again
     # for this invocation, on either stream, and both drains go on.
     on_output: Callable[[str], None] | None = None
+    # Called the same way, under the same lock, with the stream's name and
+    # the chunk itself: for a caller that digests what it reads as it
+    # arrives (the loop detector's line repetition, #194) and keeps none of
+    # it. The capture is not affected; one that raises is unhooked like
+    # ``on_output``, independently of it.
+    on_chunk: Callable[[str, bytes], None] | None = None
+    # Set by the caller, from any thread (an ``on_chunk`` hook included), to
+    # end the invocation: the group is killed as on a timeout, through the
+    # same path and within the same bounds, and the result says ``stopped``.
+    # Why the caller stopped it is the caller's; the executor never sets it.
+    stop: threading.Event | None = None
 
 
 @dataclass
@@ -243,6 +259,10 @@ class ExecutionResult:
     # When the child last wrote anything on stdout or stderr (UTC, ISO
     # 8601); ``None`` when it wrote nothing at all.
     last_activity_at: str | None = None
+    # The caller set :attr:`ExecutionRequest.stop` before the child exited,
+    # so the group was killed; ``exit_code`` is then -1. Never set together
+    # with ``timed_out``.
+    stopped: bool = False
 
     @property
     def stdout_tail(self) -> str:
@@ -272,12 +292,16 @@ class ExecutionResult:
 
     @property
     def ok(self) -> bool:
-        return not self.timed_out and self.exit_code == 0 and not self.truncated
+        return (
+            not self.timed_out and not self.stopped and self.exit_code == 0 and not self.truncated
+        )
 
     def raise_if_failed(self) -> ExecutionResult:
         if self.timed_out:
             limit = f" ({self.timeout_limit} limit)" if self.timeout_limit else ""
             raise ExecutionTimeoutError(f"command timed out{limit}: {' '.join(self.command)}")
+        if self.stopped:
+            raise ExecutionError(f"command was stopped: {' '.join(self.command)}")
         if self.exit_code != 0:
             raise ExecutionError(
                 f"command exited {self.exit_code}: {' '.join(self.command)}\n"
@@ -502,22 +526,35 @@ class _Limits:
         return None if last is None else datetime.fromtimestamp(last[1], UTC).isoformat()
 
 
-def _wait_within(proc: subprocess.Popen, limits: _Limits) -> bool:
-    """Wait for the child's exit while it stays within ``limits``; False when one ran out.
+def _wait_within(
+    proc: subprocess.Popen, limits: _Limits, stop: threading.Event | None = None
+) -> str:
+    """Wait for the child's exit while it stays within ``limits`` and ``stop``
+    is unset.
 
-    Each slice waits until the deadline due at its start; one that ends
-    without the exit looks again, since output may have moved the deadline
-    meanwhile, and only a deadline still past when looked at ends the wait.
+    Returns ``""`` once the child has exited, the limit that ran out
+    (:data:`LIMIT_IDLE`, :data:`LIMIT_MAX_RUNTIME`), or :data:`_STOPPED` when
+    ``stop`` was set. Each slice waits until the deadline due at its start;
+    one that ends without the exit looks again, since output may have moved
+    the deadline meanwhile, and only a deadline still past when looked at
+    ends the wait. With ``stop`` no slice is longer than
+    :data:`_STOP_POLL_SECONDS`.
     """
     while True:
+        # A child that has exited on its own by then is not stopped.
+        if stop is not None and stop.is_set() and proc.poll() is None:
+            return _STOPPED
         deadline = limits.deadline()
+        timeout = None if deadline is None else max(0.0, deadline - time.monotonic())
+        if stop is not None:
+            timeout = _STOP_POLL_SECONDS if timeout is None else min(timeout, _STOP_POLL_SECONDS)
         try:
-            proc.wait(timeout=None if deadline is None else max(0.0, deadline - time.monotonic()))
+            proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             if limits.expired():
-                return False
+                return limits.limit()
             continue
-        return True
+        return ""
 
 
 class _PipeDrain(threading.Thread):
@@ -608,33 +645,43 @@ class _PipeDrain(threading.Thread):
 
 
 class _OutputObserver:
-    """:attr:`ExecutionRequest.on_output`, shared by both readers of one
-    invocation.
+    """:attr:`ExecutionRequest.on_output` and :attr:`~ExecutionRequest.on_chunk`,
+    shared by both readers of one invocation.
 
-    Calls are serialized, and the first exception the observer raises
-    unhooks it for both streams: a call the other reader was waiting to make
-    finds it gone, so a failing observer is called once and can never stop
-    either drain.
+    Calls are serialized, and the first exception a hook raises unhooks that
+    hook for both streams: a call the other reader was waiting to make finds
+    it gone, so a failing hook is called once and can never stop either
+    drain, nor the other hook.
     """
 
-    def __init__(self, on_output: Callable[[str], None]) -> None:
-        self._on_output: Callable[[str], None] | None = on_output
+    def __init__(
+        self,
+        on_output: Callable[[str], None] | None,
+        on_chunk: Callable[[str, bytes], None] | None = None,
+    ) -> None:
+        self._on_output = on_output
+        self._on_chunk = on_chunk
         self._lock = threading.Lock()
 
-    def __call__(self, stream: str) -> None:
+    def __call__(self, stream: str, chunk: bytes) -> None:
         with self._lock:
-            if self._on_output is None:
-                return
-            try:
-                self._on_output(stream)
-            except Exception:
-                self._on_output = None
+            if self._on_chunk is not None:
+                try:
+                    self._on_chunk(stream, chunk)
+                except Exception:
+                    self._on_chunk = None
+            if self._on_output is not None:
+                try:
+                    self._on_output(stream)
+                except Exception:
+                    self._on_output = None
 
 
 class _BoundedReader(_PipeDrain):
     """Drain one pipe into a :class:`_BoundedBuffer` until EOF or abandoned.
 
-    ``observer``, when given, is told the stream's name after each chunk.
+    ``observer``, when given, is handed the stream's name and the chunk
+    after each chunk is captured.
     """
 
     def __init__(
@@ -653,7 +700,7 @@ class _BoundedReader(_PipeDrain):
     def _feed(self, chunk: bytes) -> None:
         self.buffer.feed(chunk)
         if self._observer is not None:
-            self._observer(self._stream_name)
+            self._observer(self._stream_name, chunk)
 
     def captured(self) -> _Captured:
         """Decode what was kept; call only once the thread has ended."""
@@ -1177,7 +1224,8 @@ def execute(req: ExecutionRequest) -> ExecutionResult:
     and, with ``idle_timeout_seconds``, by that long after the last chunk
     the child wrote on either stream (see :class:`_Limits`); past either the
     whole group is killed and the result is a timeout naming the limit
-    (``timeout_limit``). Once the child has
+    (``timeout_limit``). A caller that sets ``stop`` ends it the same way,
+    and the result is then ``stopped``. Once the child has
     exited on its own, the other two are given ``_EXIT_GRACE_SECONDS``: a
     descendant that outlives the child (a server it left running, holding
     the inherited pipes or with its stdio redirected) is then killed with
@@ -1238,6 +1286,7 @@ def _execute(req: ExecutionRequest, contained: _Containment | None) -> Execution
         raise ExecutionError(f"failed to spawn {' '.join(req.command)}: {exc}") from exc
     readers: tuple[_BoundedReader, ...] = ()
     timed_out = False
+    stopped = False
     timeout_limit = ""
     descendants_killed = False
     left = _Termination(group_survived=False, capture_abandoned=False)
@@ -1270,16 +1319,21 @@ def _execute(req: ExecutionRequest, contained: _Containment | None) -> Execution
             # output is untrusted (a dumped binary, a mis-encoded file the
             # agent cats), and a decode error is not an AutoForgeError, so it
             # would leave the invocation unlogged (#17).
-            observer = None if req.on_output is None else _OutputObserver(req.on_output)
+            observer = (
+                None
+                if req.on_output is None and req.on_chunk is None
+                else _OutputObserver(req.on_output, req.on_chunk)
+            )
             for stream, name in ((proc.stdout, "stdout"), (proc.stderr, "stderr")):
                 readers += (_BoundedReader(stream, req.max_output_bytes, name, observer, limits),)
                 readers[-1].start()
         except (OSError, RuntimeError) as exc:
             raise ExecutionError(f"failed to start {' '.join(req.command)}: {exc}") from exc
-        if not _wait_within(proc, limits):
-            timed_out = True
-            timeout_limit = limits.limit()
-        if timed_out:
+        ended = _wait_within(proc, limits, req.stop)
+        stopped = ended == _STOPPED
+        timed_out = bool(ended) and not stopped
+        timeout_limit = ended if timed_out else ""
+        if timed_out or stopped:
             left = _terminate_group(pgid, proc, readers, contained)
         else:
             # The child has exited, but the invocation is over only at EOF
@@ -1324,7 +1378,7 @@ def _execute(req: ExecutionRequest, contained: _Containment | None) -> Execution
     return ExecutionResult(
         command=list(req.command),
         cwd=req.cwd,
-        exit_code=-1 if timed_out else proc.returncode,
+        exit_code=-1 if timed_out or stopped else proc.returncode,
         stdout=out.text,
         stderr=err.text,
         started_at=started,
@@ -1342,4 +1396,5 @@ def _execute(req: ExecutionRequest, contained: _Containment | None) -> Execution
         stdin_unread=0 if feeder is None else feeder.unread,
         timeout_limit=timeout_limit,
         last_activity_at=limits.last_activity_at(),
+        stopped=stopped,
     )

@@ -118,7 +118,13 @@ from .claims import (
     render_implementation_marker,
     render_progress_marker,
 )
-from .config import DEFAULT_STATE_DIR, AgentLimits, AutoForgeConfig, validate_required_profiles
+from .config import (
+    DEFAULT_STATE_DIR,
+    AgentLimits,
+    AutoForgeConfig,
+    LoopDetectionConfig,
+    validate_required_profiles,
+)
 from .effect_ops import ProgressCommentOp, drive
 from .effects import (
     EffectKind,
@@ -175,6 +181,7 @@ from .local_workspace import (
     verify_feature_spec_unchanged,
 )
 from .locking import ControllerLock, repository_lock_path
+from .loop_detect import LIMIT_LOOP
 from .loop_guard import (
     RESULT_CLEAN,
     RESULT_NEEDS_FIX,
@@ -409,6 +416,13 @@ def _limit_reached(limits: AgentLimits, result: AgentExecutionResult) -> str:
     return f"timed out ({limits.describe()})"
 
 
+def _loop_killed(result: AgentExecutionResult) -> str:
+    """What the loop detector killed a timed-out agent for (#194); '' when it did not."""
+    if result.timeout_limit != LIMIT_LOOP:
+        return ""
+    return result.loop.describe() if result.loop is not None else "it repeated itself"
+
+
 _REVIEW_HEADING_RE = re.compile(r"^#\s*AI Code Review\s*[—–-]+\s*Round\s+(\d+)\s*$", re.MULTILINE)
 
 
@@ -469,6 +483,8 @@ class StepPlan:
     expected_next: str = ""
     legal_next: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    # How the agent is watched for a loop (#194); ``None`` for a deterministic plan.
+    loop_detection: LoopDetectionConfig | None = None
 
 
 @dataclass
@@ -1777,6 +1793,7 @@ class ControllerEngine:
             effort=profile.effort,
             command=command,
             limits=self.config.agent_limits(profile),
+            loop_detection=self.config.execution.loop_detection,
             prompt_length=len(prompt),
             prompt_preview=prompt[:1200],
             prompt_full=prompt,
@@ -1888,6 +1905,7 @@ class ControllerEngine:
             effort=profile.effort,
             command=command,
             limits=self.config.agent_limits(profile),
+            loop_detection=self.config.execution.loop_detection,
             prompt_length=len(prompt),
             prompt_preview=prompt[:1200],
             prompt_full=prompt,
@@ -6448,6 +6466,7 @@ class ControllerEngine:
                 attempt=state.attempt,
                 correction=correction_error is not None,
                 env_allowlist=env_allowlist,
+                loop_detection=self.config.execution.loop_detection,
             )
             record = ExecutionRecord(
                 run_id=state.run_id,
@@ -6467,6 +6486,7 @@ class ControllerEngine:
                 cwd=cwd,
                 idle_timeout_seconds=limits.idle_timeout_seconds,
                 max_runtime_seconds=limits.max_runtime_seconds,
+                loop_detection=self.config.execution.loop_detection.as_dict(),
                 metadata={
                     **self._log_metadata(phase),
                     "env_allowlist": list(provider.environment_allowlist(req) or ()),
@@ -6485,6 +6505,10 @@ class ControllerEngine:
             record.timed_out = result.timed_out
             record.timeout_limit = result.timeout_limit
             record.last_activity_at = result.last_activity_at
+            record.ended_by = (result.timeout_limit or "timeout") if result.timed_out else "exit"
+            if result.loop is not None:
+                record.loop = result.loop.record()
+                record.loop_warnings = result.loop.warnings
             record.stdout_truncated = result.stdout_truncated
             record.stderr_truncated = result.stderr_truncated
             # What the invocation left behind is recorded whatever its
@@ -6502,13 +6526,14 @@ class ControllerEngine:
             record.provider_summary = dict(result.provider_summary)
             stdout, stderr = result.stdout or "", result.stderr or ""
             if result.timed_out:
-                reached = _limit_reached(limits, result)
+                # A loop kill (#194) is a timeout in every respect but its text.
+                loop = _loop_killed(result)
+                reached = f"killed: {loop}" if loop else _limit_reached(limits, result)
+                killed = f"was killed: {loop}" if loop else f"{reached} and was killed"
                 record.error = _with_leftovers(reached, result.leftovers)
                 self._record_invocation(logger, record, prompt, stdout, stderr, phase, step_log)
                 raise ExecutionTimeoutError(
-                    _with_leftovers(
-                        f"agent '{profile.name}' {reached} and was killed", result.leftovers
-                    )
+                    _with_leftovers(f"agent '{profile.name}' {killed}", result.leftovers)
                     + ". State unchanged — inspect the real Git/GitHub state, then 'resume'."
                 )
             if result.provider_failure:
@@ -6626,7 +6651,8 @@ class ControllerEngine:
                 reporter.line(
                     f"launching {profile.name} ({profile.provider}, model "
                     f"{profile.model or 'default'}, effort {profile.effort or 'default'}), "
-                    f"{limits.describe()}, attempt {req.attempt}, "
+                    f"{limits.describe()}, loop detection {req.loop_detection.mode}, "
+                    f"attempt {req.attempt}, "
                     f"worktree {req.cwd}, log {step_log.path}"
                 )
                 req.progress = reporter.sink
@@ -6635,7 +6661,10 @@ class ControllerEngine:
                 except ExecutionError as exc:
                     reporter.line(f"agent could not be run: {type(exc).__name__}")
                     raise
-                if result.timed_out:
+                loop = _loop_killed(result)
+                if loop:
+                    end = f"killed: {loop}"
+                elif result.timed_out:
                     end = f"{_limit_reached(limits, result)}, killed"
                 elif result.provider_failure:
                     end = f"failed: {result.provider_failure}"
