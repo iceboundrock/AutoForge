@@ -171,6 +171,34 @@ INITIALIZING
 
 without external writes.
 
+### Live progress (#192)
+
+Progress is observability, never part of an outcome. Keep covered:
+
+- the Claude `stream-json` reducer (`tests/test_claude_stream.py`): the
+  `result` text verbatim, `is_error` checked before the subtype, a
+  malformed line, a missing or second result and an oversize result line
+  each a `provider_failure`, an oversize ordinary line counted and skipped,
+  a flat scalar summary, and no command, thinking, assistant text or tool
+  result in any event
+- the real `ClaudeCodeProvider` on the fake `claude` (`tests/claude_fake.py`):
+  argv, stdin on `/dev/null`, orphan containment, the timeout, and a sink
+  that raises never failing the run
+- cleaning (`tests/test_progress.py`): escapes and controls stripped
+  before redaction and redaction before the clip, so a token split by an
+  escape or cut by the bound is never shown
+- the acceptance test: a fake `claude` whose tool inputs carry a seeded
+  token, a token split by an escape, escape sequences and an environment
+  value runs through the engine, and none of them reaches a progress line,
+  `progress.log` or any file under the state directory; a terminal that
+  fails is dropped without changing the outcome
+- the step directory published before the launch, the bounded
+  `progress.log` and its omitted-lines note, a `progress.log` replaced
+  while the agent ran receiving nothing, and the sequence counting a step
+  whose launch never returned
+- the CLI: each outcome printed as its step ends, progress on stderr only,
+  nothing on a dry run
+
 ### Provider parity (Pi, #133)
 
 Pi is held to what the scripted provider is held to, at the engine

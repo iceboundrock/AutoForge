@@ -90,8 +90,24 @@ The provider layer is `providers.py` plus the protocol modules an adapter
 owns. Pi's wire protocol (JSON encoding and decoding, request ids, the event
 reducer, outcome classification) lives in `pi_rpc.py`, a pure reducer that
 `PiProvider` drives over the duplex child handle (`executor_duplex.py`). It knows Pi's
-command and event names, but no CLI flags and no processes. No CLI flag and
-no provider wire-protocol name appears outside the provider layer.
+command and event names, but no CLI flags and no processes. Claude Code's
+`stream-json` output is reduced the same way by `claude_stream.py`, which
+`ClaudeCodeProvider` drives over the same handle with stdin on `/dev/null`
+(#192): the `result` record's text becomes `stdout`, and an error result, a
+malformed line or a missing result becomes `provider_failure`. No CLI flag
+and no provider wire-protocol name appears outside the provider layer.
+
+Live progress crosses the boundary in one provider-neutral shape. The engine
+puts a sink in `AgentRequest.progress`; the adapter maps its own records to
+`ProgressEvent`s (`progress.py`: a closed `kind`, a tool name, one
+allow-listed detail, a token estimate), already cleaned, redacted and
+bounded, and the engine's `ProgressReporter` renders them as lines for the
+step's `progress.log` and, when the CLI sets `progress_output`, stderr. The
+engine and the CLI never see a provider record, and a sink that raises is
+dropped for the rest of the invocation: progress never changes an outcome.
+A provider whose output says nothing structured (OpenCode) reports only
+`activity`, from the executor's `on_output` hook, which is told a chunk
+arrived on which stream and never sees its bytes.
 
 A provider can report that a run failed inside its protocol even though the
 process exited 0. It does so through a provider-neutral optional
@@ -116,6 +132,8 @@ The process executor owns:
 - environment selection: a request carrying `env_allowlist` starts the
   child from only the named variables (exact names or `PREFIX*`) of the
   controller's environment, never from a copy of all of it
+- an optional output observer (`on_output`), told which stream a chunk
+  arrived on and never its bytes, and unhooked the first time it raises
 
 It should remain independent of workflow semantics. Which names are
 allowed is policy: the engine reads it from `execution.env_allowlist` (plus

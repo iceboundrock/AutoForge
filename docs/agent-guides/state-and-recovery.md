@@ -306,6 +306,8 @@ requirement named (#120). Same layout either way:
     logs/<run-id>/
         events.jsonl                       # one line per agent invocation, append-only
         <seq>-<phase>-<attempt>/
+            progress.log                   # agent steps: live progress lines, appended while the
+                                           # agent runs (published before the launch; bounded, redacted)
             request.json                   # profile, model, effort, command, timeout
             prompt.md                      # rendered prompt (redacted)
             execution.json                 # exit code, timing, timed_out, truncation, leftovers, error

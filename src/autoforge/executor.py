@@ -155,6 +155,12 @@ class ExecutionRequest:
     # stdin on ``/dev/null``. For a CLI whose argv cannot carry a payload
     # verbatim (the OpenCode v2 message). Bounded by the timeout, not by size.
     stdin_data: bytes | None = None
+    # Called on the reader thread with the stream's name (``"stdout"`` or
+    # ``"stderr"``) each time a chunk of it arrives: a liveness signal for an
+    # agent that streams nothing parseable (#192). It never sees the bytes,
+    # so what the child wrote stays in the bounded capture alone. One that
+    # raises is not called again for this invocation; the drain goes on.
+    on_output: Callable[[str], None] | None = None
 
 
 @dataclass
@@ -470,14 +476,32 @@ class _PipeDrain(threading.Thread):
 
 
 class _BoundedReader(_PipeDrain):
-    """Drain one pipe into a :class:`_BoundedBuffer` until EOF or abandoned."""
+    """Drain one pipe into a :class:`_BoundedBuffer` until EOF or abandoned.
 
-    def __init__(self, stream: IO[bytes], limit: int, name: str) -> None:
+    ``on_output``, when given, is told the stream's name after each chunk
+    (:attr:`ExecutionRequest.on_output`); the first exception it raises
+    unhooks it, so a failing observer can never stop the drain.
+    """
+
+    def __init__(
+        self,
+        stream: IO[bytes],
+        limit: int,
+        name: str,
+        on_output: Callable[[str], None] | None = None,
+    ) -> None:
         super().__init__(stream, name)
         self.buffer = _BoundedBuffer(limit, name)
+        self._stream_name = name
+        self._on_output = on_output
 
     def _feed(self, chunk: bytes) -> None:
         self.buffer.feed(chunk)
+        if self._on_output is not None:
+            try:
+                self._on_output(self._stream_name)
+            except Exception:
+                self._on_output = None
 
     def captured(self) -> _Captured:
         """Decode what was kept; call only once the thread has ended."""
@@ -1077,7 +1101,7 @@ def _execute(req: ExecutionRequest, contained: _Containment | None) -> Execution
             # agent cats), and a decode error is not an AutoForgeError, so it
             # would leave the invocation unlogged (#17).
             for stream, name in ((proc.stdout, "stdout"), (proc.stderr, "stderr")):
-                readers += (_BoundedReader(stream, req.max_output_bytes, name),)
+                readers += (_BoundedReader(stream, req.max_output_bytes, name, req.on_output),)
                 readers[-1].start()
         except (OSError, RuntimeError) as exc:
             raise ExecutionError(f"failed to start {' '.join(req.command)}: {exc}") from exc

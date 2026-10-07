@@ -42,6 +42,37 @@ def test_nonzero_returned_not_raised():
         res.raise_if_failed()
 
 
+def test_on_output_is_told_which_stream_each_chunk_came_from():
+    seen: list[str] = []
+    lock = threading.Lock()
+
+    def on_output(name: str) -> None:
+        with lock:
+            seen.append(name)
+
+    code = "import sys; print('out', flush=True); print('err', file=sys.stderr, flush=True)"
+    res = execute(
+        ExecutionRequest(command=[PY, "-c", code], timeout_seconds=30, on_output=on_output)
+    )
+    assert res.ok and res.stdout == "out\n" and res.stderr == "err\n"
+    assert set(seen) == {"stdout", "stderr"}
+
+
+def test_a_failing_on_output_is_unhooked_and_the_drain_goes_on():
+    calls: list[str] = []
+
+    def on_output(name: str) -> None:
+        calls.append(name)
+        raise RuntimeError("observer gone")
+
+    code = "import sys, time\nfor n in range(5):\n    print(n, flush=True); time.sleep(0.01)\n"
+    res = execute(
+        ExecutionRequest(command=[PY, "-c", code], timeout_seconds=30, on_output=on_output)
+    )
+    assert res.ok and res.stdout == "0\n1\n2\n3\n4\n"
+    assert calls == ["stdout"]
+
+
 def test_shell_metacharacters_are_literal_argv():
     """A prompt full of shell syntax must arrive as ONE argv element, unevaluated."""
     tricky = "$(touch /tmp/pwned); `id`; rm -rf / && echo $HOME | cat > x; '\"; #"

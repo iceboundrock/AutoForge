@@ -10,9 +10,10 @@
 # names the section and its known keys, never a silently ignored typo (a
 # misspelled loop bound would otherwise keep the looser built-in default).
 #
-# CLI facts these defaults were checked against (claude, gh: 2026-09; opencode: 2026-10):
-#   claude   2.1.x   -> claude -p --output-format text --model <alias> --effort <e>
-#                       --permission-mode <mode> --no-session-persistence -- <prompt>
+# CLI facts these defaults were checked against (gh: 2026-09; claude, opencode: 2026-10):
+#   claude   2.1.x   -> claude -p --output-format stream-json --verbose --model <alias>
+#                       --effort <e> --permission-mode <mode> --no-session-persistence
+#                       -- <prompt>
 #   opencode 2.0.x   -> opencode run --standalone -m <provider/model>#<effort>
 #                       --format default [--auto]          (prompt on stdin; >= 2.0.0)
 #   gh       2.x     -> gh pr view --json ..., gh issue view --json ..., gh api ...
@@ -239,7 +240,7 @@ profiles:
     timeout_seconds: 1800
     options:
       permission_mode: bypassPermissions   # non-interactive; sandbox the working tree
-      output_format: text
+      output_format: stream-json  # live progress; `text` opts out (no progress, final text at exit)
 
   fix:
     provider: claude
@@ -249,7 +250,7 @@ profiles:
     timeout_seconds: 1800
     options:
       permission_mode: bypassPermissions
-      output_format: text
+      output_format: stream-json
 
   review_round_1:
     provider: opencode

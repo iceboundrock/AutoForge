@@ -104,6 +104,23 @@ per colliding text, so a mapping whose keys all collide is redacted in time
 linear in its size; a change to the allocator must keep that, and
 `tests/test_redaction.py` pins it against a large colliding mapping.
 
+Live progress (#192) is built to be safe where it is made, not where it is
+printed. A provider adapter maps its protocol to a `ProgressEvent`
+(`progress.py`) whose only strings are a tool name and one allow-listed
+tool input (a path, a search pattern, a shell command's *description*;
+never the command, a tool result, thinking or assistant text). Each string
+is stripped of ANSI escapes and control, format and separator characters
+first, so a secret split by an escape is whole again, then redacted, then
+clipped, so a clip cannot cut a secret below its pattern; a raw value past
+`MAX_RAW_CHARS` is not shown at all. The reporter redacts each assembled
+line again and bounds it before it reaches stderr or the step's
+`progress.log`, which is bounded too (`runlog.MAX_PROGRESS_LOG_BYTES`).
+A provider's own summary of the run (`provider_summary`) holds bounded
+scalars only: Claude's cost is integer micro-USD, never a float, and its
+nested `usage` is not copied. `tests/test_progress.py` seeds a token and
+escape sequences into tool inputs and checks that neither reaches the
+terminal, `progress.log`, `execution.json` or state.
+
 `stdout.log` and `stderr.log` hold what the executor captured, which is
 bounded (`executor.DEFAULT_MAX_OUTPUT_BYTES` per stream): past the bound the
 file is the head of the stream, a `[autoforge: N bytes of stdout omitted; ...]`

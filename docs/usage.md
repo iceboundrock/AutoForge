@@ -157,6 +157,55 @@ unblocked. The decision table is in
 `DONE` is reached when `UPDATE_EPIC` reports no next issue. `DONE` and
 `FAILED` have no outgoing edges; `autoforge run` starts a new run.
 
+## Watching an agent run
+
+While an agent runs, `run`, `step` and `resume` (and `local run`) print live
+progress lines to **stderr**, and each step's outcome to stdout as soon as
+that step finishes, not after the whole loop. A progress line is prefixed
+with the time since the launch, the phase and, in a remote run, the issue:
+
+```text
+[00:00:00 ANALYZE_EXECUTE #160] launching analyze_execute (claude, model fable, effort high), timeout 1800s, attempt 1, worktree /repo/.git/autoforge/worktrees/160, log .autoforge/logs/<run-id>/001-analyze_execute-1
+[00:00:04 ANALYZE_EXECUTE #160] agent started (claude-fable-5-1)
+[00:00:31 ANALYZE_EXECUTE #160] thinking… ~12k tokens
+[00:01:02 ANALYZE_EXECUTE #160] Read src/autoforge/engine.py
+[00:01:09 ANALYZE_EXECUTE #160] Grep def _invoke_phase
+[00:03:40 ANALYZE_EXECUTE #160] Edit src/autoforge/engine.py
+[00:04:12 ANALYZE_EXECUTE #160] Bash Run the test suite
+[00:06:12 ANALYZE_EXECUTE #160] still running, last activity 14s ago, 312 events
+[00:09:55 ANALYZE_EXECUTE #160] agent exited 0, 841 progress events
+[run-…] ANALYZE_EXECUTE -> REVIEW: PR https://github.com/…/pull/161 verified
+```
+
+- **Before the launch**, one line names the profile, provider, model and
+  effort, the timeout, the attempt, the working directory and the step's log
+  directory.
+- **While it runs**: one line per tool the agent starts, with one
+  allow-listed input (the file of a read, edit or write, the pattern of a
+  search, the *description* of a shell command, never the command itself,
+  a tool's result, thinking or the agent's text); thinking and writing are
+  shown at most once every 30 s; a failed tool says so; and when nothing has
+  been printed for two minutes a heartbeat says how long ago the agent last
+  did anything.
+- **After it returns**, one line says how it ended (exit status, timeout or
+  provider failure).
+
+What a provider can report differs. Claude Code (with the default
+`output_format: stream-json`) and Pi report each tool and their thinking;
+OpenCode reports only that it is active, so its run shows the pre-launch
+line, heartbeats that say when it last wrote output, and the end line. A
+Claude profile with `output_format: text` reports nothing while it runs
+([Configuration: Claude profiles](configuration.md#claude-profiles)).
+
+Every line is stripped of escape and control characters, redacted and
+bounded before it is printed. The same lines are appended to `progress.log`
+in the step's log directory, created before the launch, so
+`tail -f .autoforge/logs/<run-id>/<step>/progress.log` follows a step from
+another terminal and the record survives a killed run. Progress never goes
+to stdout and is never part of `status --json`; redirecting stderr
+(`2>/dev/null`) hides it without affecting the run. A dry run launches no
+agent and prints no progress.
+
 ## Dry run
 
 A dry run invokes no agent, runs no verification command, writes nothing to

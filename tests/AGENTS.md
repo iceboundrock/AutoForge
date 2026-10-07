@@ -10,7 +10,8 @@ read it before adding tests for a listed area.
 
 - Never call real Claude Code, OpenCode, or Pi, and never call GitHub write
   APIs. Agents are replaced by scripted providers (Pi by the fake `pi` of
-  `tests/pi_fake.py`) and GitHub by an in-memory fake; the executor tests
+  `tests/pi_fake.py`, Claude's stream by the fake `claude` of
+  `tests/claude_fake.py`) and GitHub by an in-memory fake; the executor tests
   use real local Python subprocesses only.
 - Never merge a real PR, push to a real remote, or touch a checkout outside
   `tmp_path`.
@@ -28,6 +29,10 @@ read it before adding tests for a listed area.
   `make_local_engine` build a controller against those fakes; `block(...)`
   and `review_comment_body(...)` build well-formed `CONTROL_RESULT` blocks and
   review comments. Reuse these rather than hand-rolling fakes.
+- `tests/claude_fake.py` holds a fake `claude` that prints a scripted
+  stream-json transcript (and logs its argv, cwd and stdin); the real
+  `ClaudeCodeProvider` launches it, so the stream path is tested end to end
+  without a real agent.
 - `tests/pi_fake.py` holds the engine-level Pi harness: `PiFake` (a fake
   `pi` executable outside the repository that logs every start, argv, cwd,
   environment name and RPC record) and `ScriptedPi` (the real
@@ -49,6 +54,8 @@ effect operations, git transport      test_effects.py, test_git_transport.py
 state, contract, filesystem boundary  test_state.py, test_durable_run_contract.py, test_safefs.py
 CONTROL_RESULT, prompts, providers    test_result_parser.py, test_prompts.py, test_providers.py
 Pi RPC reducer and adapter (fake pi)  test_pi_rpc.py
+Claude stream-json reducer            test_claude_stream.py (adapter on the fake: test_providers.py)
+live progress, its redaction          test_progress.py
 executor, lock, redaction, run logs   test_executor.py, test_executor_duplex.py, test_lock.py,
                                       test_redaction.py, test_runlog.py
 LOCAL mode                            test_local*.py

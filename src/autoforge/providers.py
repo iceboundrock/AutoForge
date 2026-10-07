@@ -6,13 +6,27 @@ effort, timeout, options) into a concrete non-interactive CLI invocation.
 
 Verified against locally installed CLIs (2026-09):
 
-Claude Code (``claude 2.1.x``)::
+Claude Code (``claude 2.1.x``; the stream run against 2.1.291 and 2.1.292)::
 
-    claude -p --output-format text --model <alias|id> --effort <low|medium|high|xhigh|max>
-           --permission-mode <mode> --no-session-persistence [extra_args] -- <prompt>
+    claude -p --output-format stream-json --verbose --model <alias|id>
+           --effort <low|medium|high|xhigh|max> --permission-mode <mode>
+           --no-session-persistence [extra_args] -- <prompt>
 
-  * ``-p/--print`` = non-interactive; final assistant text goes to stdout
-    verbatim (so the CONTROL_RESULT block survives untouched).
+  * ``-p/--print`` = non-interactive. With ``stream-json`` (the default,
+    #192) stdout is one JSON record per line while the agent runs
+    (``system`` init / thinking_tokens / api_retry, ``assistant`` content
+    blocks, ``user`` tool results, ``rate_limit_event``) and one final
+    ``result`` record whose ``result`` field is the final assistant text;
+    the CLI refuses ``stream-json`` under ``--print`` without
+    ``--verbose``. The child runs under the duplex handle and the stream is
+    reduced in claude_stream.py: ``stdout`` of the result is that text
+    verbatim (so the CONTROL_RESULT block survives untouched), the records
+    before it become live progress (:mod:`autoforge.progress`), and an
+    error result, a malformed line or a missing result is a
+    :attr:`AgentExecutionResult.provider_failure`.
+  * ``options.output_format: text`` is the opt-out: the final text is
+    printed once, at exit, and the run reports no progress and no activity
+    while it runs.
   * ``--permission-mode bypassPermissions`` is required for unattended
     edits / git / gh calls; ``--permission-prompts none`` would silently
     deny anything that prompts. Configure via profile ``options``.
@@ -38,8 +52,16 @@ OpenCode (``opencode 2.0.x``, #186; run against 2.0.23)::
     ``--variant``), so a configured model carries no ``#`` of its own. An
     unknown model or variant exits 1 with nothing on stdout.
   * ``--format default`` prints only the final assistant text to stdout
-    (tool traces go to stderr); ``--format json`` would emit an event
-    stream where the CONTROL_RESULT is JSON-escaped, so it is NOT used.
+    (tool traces go to stderr). ``--format json`` is NOT used: on 2.0.23 it
+    emits ``step_start``, ``text``, ``tool_use`` and ``step_finish``
+    records, but a ``tool_use`` record only once the tool has completed (no
+    record when it starts) and no terminal record carrying the final text
+    or the outcome, so it could neither show a tool as it starts nor be
+    reduced to the CONTROL_RESULT text the way Claude's stream is (#192).
+    Live progress is therefore liveness only: each chunk on stdout or
+    stderr is an ``activity`` event, which prints nothing but keeps the
+    heartbeat's "last activity" current; the trace itself reaches the
+    operator only in ``stderr.log``.
   * bash/edit tools run without ``--auto`` under the default agent;
     ``--auto`` is opt-in via ``options.auto_approve: true``.
   * ``opencode --version`` prints ``opencode v2.0.23``; 1.x printed the
@@ -86,6 +108,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from .claude_stream import ClaudeStream
 from .config import ProfileConfig
 from .errors import (
     ChildStdinClosedError,
@@ -113,6 +136,7 @@ from .executor_duplex import (
     start_duplex,
 )
 from .pi_rpc import PiConversation, encodable
+from .progress import ProgressEvent, ProgressKind, ProgressSink, guarded
 
 Runner = Callable[[ExecutionRequest], ExecutionResult]
 
@@ -130,6 +154,12 @@ class AgentRequest:
     # plus ``env_allowlist_extra``); the provider adds its own names. ``None``
     # inherits the whole environment and is never what the engine sends.
     env_allowlist: tuple[str, ...] | None = None
+    # Where the adapter reports live progress (#192): provider-neutral,
+    # already bounded and redacted events, never a raw provider record.
+    # ``None`` reports nothing. A sink that raises is dropped for the rest of
+    # the invocation (:func:`autoforge.progress.guarded`); progress never
+    # changes an outcome.
+    progress: ProgressSink | None = None
 
 
 @dataclass
@@ -226,6 +256,25 @@ class AgentExecutionResult:
         )
 
 
+def _activity_hook(progress: ProgressSink | None) -> Callable[[str], None] | None:
+    """An executor output hook that reports each chunk as bare activity.
+
+    For a one-shot CLI whose output is not a protocol the adapter reads
+    while it runs (OpenCode's ``--format default``, Claude's ``text``): a
+    chunk on either stream is a sign of life and nothing more. Its bytes
+    are never looked at, so nothing the CLI printed reaches the progress
+    output.
+    """
+    emit = guarded(progress)
+    if emit is None:
+        return None
+
+    def on_output(stream: str) -> None:
+        emit(ProgressEvent(ProgressKind.ACTIVITY))
+
+    return on_output
+
+
 def _truthy(value: str | None, default: bool) -> bool:
     if value is None or value == "":
         return default
@@ -298,6 +347,7 @@ class AgentProvider:
                 # including what it detached from its process group.
                 contain_orphans=True,
                 stdin_data=self.stdin_payload(req),
+                on_output=_activity_hook(req.progress),
             )
         )
         result = AgentExecutionResult.from_execution(res, req.profile)
@@ -313,6 +363,18 @@ class AgentProvider:
 
 CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 CLAUDE_PERMISSION_MODES = ("acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan")
+# `stream-json` (the default) reports progress while the agent runs and
+# carries the final text in its `result` line; `text` prints only the final
+# text, at exit, and is kept as an explicit opt-out. `json` prints one
+# object at exit: no progress, so nothing over `text`, and not accepted.
+CLAUDE_OUTPUT_FORMATS = ("stream-json", "text")
+CLAUDE_DEFAULT_OUTPUT_FORMAT = "stream-json"
+# One stream-json line is bounded like a Pi record: the `result` line must
+# arrive whole, and JSON escaping can double a final text that is itself
+# up to the stdout bound. A longer line (a `tool_result` quoting a large
+# file) is skipped and counted, and is never buffered whole.
+CLAUDE_MAX_RECORD_BYTES = 2 * DEFAULT_MAX_OUTPUT_BYTES + 1024 * 1024
+CLAUDE_MAX_PENDING_BYTES = 2 * CLAUDE_MAX_RECORD_BYTES
 
 
 class ClaudeCodeProvider(AgentProvider):
@@ -330,12 +392,13 @@ class ClaudeCodeProvider(AgentProvider):
                 f"profile {profile.name!r}: claude --effort must be one of {CLAUDE_EFFORTS}, "
                 f"got {profile.effort!r}"
             )
-        output_format = profile.options.get("output_format", "text") or "text"
-        if output_format != "text":
+        output_format = self.output_format(profile)
+        if output_format not in CLAUDE_OUTPUT_FORMATS:
             raise ConfigurationError(
-                f"profile {profile.name!r}: claude output_format must be 'text' so the "
-                f"CONTROL_RESULT block reaches stdout verbatim (got {output_format!r}; "
-                "the claude CLI accepts text|json|stream-json, but json event streams escape it)"
+                f"profile {profile.name!r}: claude output_format must be one of "
+                f"{', '.join(CLAUDE_OUTPUT_FORMATS)} (got {output_format!r}): stream-json "
+                "reports progress and is reduced to the final text, text is the final text "
+                "alone with no progress, and json gives neither"
             )
         mode = profile.options.get("permission_mode", "bypassPermissions")
         if mode and mode not in CLAUDE_PERMISSION_MODES:
@@ -343,10 +406,17 @@ class ClaudeCodeProvider(AgentProvider):
                 f"profile {profile.name!r}: unknown claude permission_mode {mode!r}"
             )
 
+    @staticmethod
+    def output_format(profile: ProfileConfig) -> str:
+        return profile.options.get("output_format") or CLAUDE_DEFAULT_OUTPUT_FORMAT
+
     def build_command_for(self, profile: ProfileConfig, prompt: str) -> list[str]:
         argv = [profile.command or "claude", "-p"]
-        output_format = profile.options.get("output_format", "text") or "text"
+        output_format = self.output_format(profile)
         argv += ["--output-format", output_format]
+        if output_format == "stream-json":
+            # The CLI refuses stream-json under --print without it.
+            argv.append("--verbose")
         if profile.model:
             argv += ["--model", profile.model]
         if profile.effort:
@@ -360,6 +430,95 @@ class ClaudeCodeProvider(AgentProvider):
         # ``--`` guarantees the prompt is never parsed as an option.
         argv += ["--", prompt]
         return argv
+
+    def execute(self, req: AgentRequest) -> AgentExecutionResult:
+        """Run the CLI; with stream-json, reduce its stream to the final text.
+
+        ``output_format: text`` is the one-shot path every adapter shares.
+        With ``stream-json`` the child runs under the duplex handle with its
+        stdin on ``/dev/null``: the handle already frames LF-terminated
+        records against a per-record bound and drops a longer one through
+        its LF without buffering it, which is exactly what this stream needs
+        (a ``tool_result`` line quotes whole files), so a line callback in
+        the one-shot executor would have duplicated that framer. Every line
+        goes to :class:`~autoforge.claude_stream.ClaudeStream`, which emits
+        progress and decides the outcome. ``stdout`` of the result is the
+        ``result`` text, tail-bounded as the executor's capture is; a failure
+        inside the stream is ``provider_failure`` and a timeout wins over it.
+        ``exit_code`` is always the real process status.
+        """
+        if self.output_format(req.profile) != "stream-json":
+            return super().execute(req)
+        stream = ClaudeStream(cwd=req.cwd, emit=guarded(req.progress))
+        duplex = DuplexRequest(
+            command=self.build_command(req),
+            cwd=req.cwd,
+            env_allowlist=self.environment_allowlist(req),
+            deadline_seconds=float(req.timeout_seconds),
+            max_record_bytes=CLAUDE_MAX_RECORD_BYTES,
+            max_pending_bytes=CLAUDE_MAX_PENDING_BYTES,
+            # The prompt travels in argv; stdin stays /dev/null so the CLI
+            # never waits on it.
+            stdin_pipe=False,
+            # Nothing an agent starts outlives its invocation (ADR 0002).
+            contain_orphans=True,
+        )
+        with start_duplex(duplex) as child:
+            cut_short = _read_claude_stream(child, stream)
+            res = child.finish()
+        timed_out = cut_short or res.timed_out
+        failure = stream.failure
+        if stream.exited_early:
+            failure = f"{failure} (exit {res.exit_code})"
+        elif res.records_overflowed and failure is None:
+            failure = "claude: stream-json lines arrived faster than they were read"
+        summary = stream.summary()
+        summary["failure"] = failure or ""
+        text = stream.text if failure is None else None
+        stdout, truncated = _keep_tail(encodable(text or ""), DEFAULT_MAX_OUTPUT_BYTES)
+        return AgentExecutionResult(
+            command=list(res.command),
+            exit_code=res.exit_code,
+            stdout=stdout,
+            stderr=res.stderr,
+            started_at=res.started_at,
+            finished_at=res.finished_at,
+            timed_out=timed_out,
+            provider=req.profile.provider,
+            model=req.profile.model,
+            effort=req.profile.effort,
+            stdout_truncated=truncated,
+            stderr_truncated=res.stderr_truncated,
+            stdout_tail_offset=0,
+            descendants_killed=res.descendants_killed,
+            group_survived_kill=res.group_survived_kill,
+            capture_abandoned=res.capture_abandoned,
+            orphans_killed=res.orphans_killed,
+            orphan_survived_kill=res.orphan_survived_kill,
+            orphans_unchecked=res.orphans_unchecked,
+            provider_failure=None if timed_out else failure,
+            provider_summary=summary,
+        )
+
+
+def _read_claude_stream(child: DuplexChild, stream: ClaudeStream) -> bool:
+    """Feed every stdout outcome to ``stream`` until EOF; True on the deadline."""
+    while True:
+        item = child.read_line()
+        if isinstance(item, Record):
+            stream.feed(item.data)
+        elif isinstance(item, Oversize):
+            stream.oversize(item.limit)
+        elif isinstance(item, Fragment):
+            stream.framing_error("stdout ended inside an unterminated line")
+        elif isinstance(item, Overflow):
+            stream.framing_error("stdout lines arrived faster than they were read")
+            return False
+        elif isinstance(item, Eof):
+            stream.stream_ended()
+            return False
+        elif item.deadline_exceeded:
+            return True
 
 
 class OpenCodeProvider(AgentProvider):
@@ -386,7 +545,8 @@ class OpenCodeProvider(AgentProvider):
         if fmt != "default":
             raise ConfigurationError(
                 f"profile {profile.name!r}: opencode output_format must be 'default' so the "
-                "CONTROL_RESULT block reaches stdout verbatim (json event streams escape it)"
+                "CONTROL_RESULT block reaches stdout verbatim (the json event stream escapes "
+                "it and has no final result record)"
             )
 
     def build_command_for(self, profile: ProfileConfig, prompt: str) -> list[str]:
@@ -692,6 +852,8 @@ class PiProvider(AgentProvider):
             thinking=req.profile.effort,
             prompt=req.prompt,
             round_trip_seconds=self.round_trip_seconds,
+            emit=guarded(req.progress),
+            cwd=req.cwd,
         )
         duplex = DuplexRequest(
             command=self.build_command(req),

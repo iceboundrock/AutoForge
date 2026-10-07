@@ -22,6 +22,10 @@ replan_txn.py       REPLAN_REEXECUTE durable transaction state and verifiers
 providers.py        provider adapters: the only place that knows real CLI flags
 pi_rpc.py           Pi RPC wire protocol: JSONL codec, request ids, event reducer,
                     outcome classification; provider layer, no flags and no processes (#131)
+claude_stream.py    Claude stream-json reducer: result text, failure, summary, progress
+                    events; provider layer, no flags and no processes (#192)
+progress.py         provider-neutral ProgressEvent, cleaning, and the line renderer the
+                    engine reports a launch through (#192)
 executor.py         subprocess lifecycle, timeouts, capture, optional stdin payload
                     (no workflow semantics)
 executor_duplex.py  duplex child handle for RPC transports: stdin records out, LF-framed
@@ -57,10 +61,10 @@ prompts/            file-based templates ({{VAR}}): common.md (trust boundary), 
   a safety gate as an incidental part of another change.
 - Keep the boundaries: no CLI flags outside `providers.py`, and no
   provider wire-protocol names outside the provider layer (`providers.py`
-  plus the protocol modules it owns, such as `pi_rpc.py`); no workflow
-  semantics or JSON in `executor.py` or `executor_duplex.py`; no raw
-  `gh --json` dictionaries crossing out of `github.py`; no large prompt
-  text in Python string literals.
+  plus the protocol modules it owns, `pi_rpc.py` and `claude_stream.py`);
+  no workflow semantics or JSON in `executor.py` or `executor_duplex.py`;
+  no raw `gh --json` dictionaries crossing out of `github.py`; no large
+  prompt text in Python string literals.
 - The outcome of a GitHub write is read back from GitHub, never inferred
   from an exit status or an agent claim, and a destructive write is
   checkpointed in persisted state before it is performed. Persisted state is
@@ -92,8 +96,9 @@ dry-run), prompts/update_epic*.md                 -> docs/agent-guides/github-sa
 state.py, effects.py, run_contract.py, safefs.py,
 locking.py, errors.py, engine.py (recovery,
 retry)                                            -> docs/agent-guides/state-and-recovery.md
-providers.py, pi_rpc.py, executor.py,
-executor_duplex.py, prompts/__init__.py           -> docs/agent-guides/architecture.md
+providers.py, pi_rpc.py, claude_stream.py,
+progress.py, executor.py, executor_duplex.py,
+prompts/__init__.py                               -> docs/agent-guides/architecture.md
                                                      (+ docs/adr/0003-pi-agent-provider.md and
                                                      docs/pi-policy.md for Pi)
 result_parser.py, prompts/*.md                    -> docs/agent-guides/control-result-protocol.md

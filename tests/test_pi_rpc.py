@@ -169,6 +169,70 @@ def test_happy_path_returns_the_final_text_and_the_parser_accepts_it():
     assert run.types().count("prompt") == 1 and "abort" not in run.types()
 
 
+def test_events_map_to_progress_with_one_allow_listed_argument():
+    """#192: the accepted prompt is the start, a tool start shows one
+    allow-listed argument (never bash's command), a delta is thinking or
+    writing (never its content), a retry its attempt numbers."""
+    from autoforge.progress import ProgressKind
+
+    events = []
+    run = Run(emit=events.append, cwd="/work/tree")
+    run.verified()
+    assert events == []  # nothing before the prompt is accepted
+    run.respond("prompt", {"disposition": "started"})
+    for record in [
+        {"type": "agent_start"},
+        {
+            "type": "message_update",
+            "assistantMessageEvent": {"type": "thinking_delta", "delta": "SECRET-PLAN"},
+        },
+        {
+            "type": "message_update",
+            "assistantMessageEvent": {"type": "text_delta", "delta": "SECRET-TEXT"},
+        },
+        {"type": "message_update", "assistantMessageEvent": {"type": "toolcall_delta"}},
+        {
+            "type": "tool_execution_start",
+            "toolName": "read",
+            "args": {"path": "/work/tree/src/a.py"},
+        },
+        {"type": "tool_execution_end", "toolName": "read", "isError": False},
+        {"type": "tool_execution_start", "toolName": "grep", "args": {"pattern": "def main"}},
+        {"type": "tool_execution_end", "toolName": "grep", "isError": True},
+        {
+            "type": "tool_execution_start",
+            "toolName": "bash",
+            "args": {"command": "echo SECRET-CMD"},
+        },
+        {"type": "tool_execution_start", "toolName": "edit", "args": {"path": 7}},
+        {"type": "auto_retry_start", "attempt": 2, "maxAttempts": 3, "errorMessage": "overloaded"},
+        {"type": "auto_retry_start", "attempt": True},
+    ]:
+        run.feed(record)
+    run.settle()
+    run.respond("get_last_assistant_text", {"text": FINAL})
+    assert run.c.text == FINAL
+    got = [(e.kind, e.tool, e.detail) for e in events]
+    assert got[:14] == [
+        (ProgressKind.STARTED, "", MODEL),
+        (ProgressKind.ACTIVITY, "", ""),
+        (ProgressKind.THINKING, "", ""),
+        (ProgressKind.ASSISTANT_TEXT, "", ""),
+        (ProgressKind.ACTIVITY, "", ""),
+        (ProgressKind.TOOL_STARTED, "read", "src/a.py"),
+        (ProgressKind.TOOL_FINISHED, "read", ""),
+        (ProgressKind.TOOL_STARTED, "grep", "def main"),
+        (ProgressKind.TOOL_FAILED, "grep", ""),
+        (ProgressKind.TOOL_STARTED, "bash", ""),
+        (ProgressKind.TOOL_STARTED, "edit", ""),
+        (ProgressKind.PROVIDER_RETRY, "", "attempt 2 of 3"),
+        (ProgressKind.PROVIDER_RETRY, "", ""),
+        (ProgressKind.ACTIVITY, "", ""),  # message_end
+    ]
+    assert all(kind is ProgressKind.ACTIVITY for kind, _, _ in got[14:])
+    assert "SECRET" not in " ".join(f"{e.tool} {e.detail}" for e in events)
+
+
 def test_commands_are_ascii_json_records_with_no_line_break():
     run = Run(prompt="line one\nline two     \ud800 /template")
     run.verified()
