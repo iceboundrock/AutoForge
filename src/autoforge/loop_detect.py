@@ -24,15 +24,18 @@ in between -- never over repeated text alone. Four signals:
   floor the window is inconclusive, so one long tool call (#193's concern,
   the idle limit) is never read as a loop.
 * ``repeated_lines`` (C). Unstructured output (OpenCode's stderr, a text
-  profile's stdout) is cut into lines at LF and at CR; each is normalized
-  (escape sequences dropped, hex and digit runs masked, whitespace collapsed)
-  and hashed. A line, or a cycle of up to ``max_cycle_period`` lines,
-  repeated ``max_line_repeats`` times consecutively is a loop. What a CR
-  alone ends is redrawn in place by what follows (a progress bar, a
-  spinner): a display, not a line, so it is dropped, while CRLF ends a line
-  like LF. A line with no letter left once pytest's progress marks are
-  dropped (blank, a rule, a pytest dot line) says nothing that could repeat
-  as an action and is skipped.
+  profile's stdout) is cut into lines at LF, at CRLF and at a CR alone;
+  each is normalized (escape sequences dropped, hex and digit runs masked,
+  whitespace collapsed) and hashed. A line, or a cycle of up to
+  ``max_cycle_period`` lines, repeated ``max_line_repeats`` times
+  consecutively is a loop. A line with no letter left once pytest's
+  progress marks are dropped (blank, a rule, a pytest dot line) says
+  nothing that could repeat as an action and is skipped. What a CR alone
+  ends is a redraw, drawn over in place by what follows: a retry message
+  redrawn that way is a line like any other, but a redraw that shows a
+  progress mark (a percentage, a bar or spinner glyph, an ASCII bar or
+  spinner frame) is a progress bar or a spinner, a display rather than a
+  line, and is skipped too.
 * ``retry_storm`` (D). At least ``max_cycle_repeats`` provider retries in a
   row, spanning ``novelty_window_seconds``, with no completed turn or action
   in between; only an adapter that can tell a retry reports one.
@@ -112,6 +115,18 @@ _LETTER = re.compile(r"[^\W\d_]")
 # A word of pytest's per-test status characters with a dot among them
 # (``..F..s..``): a progress mark, not text.
 _PYTEST_MARKS = re.compile(r"(?<!\S)[.FEsxX]*\.[.FEsxX]*(?!\S)")
+# What only a progress display shows, looked for in a normalized redraw: a
+# percentage (digits masked), a box-drawing, block, geometric or braille
+# glyph (a bar, a spinner), an ASCII bar (``[=====>    ]``), or an ASCII
+# spinner frame (one of | / - \ alone) at either end. A message is rarely
+# drawn with these, and one that is gets skipped: the test errs toward no
+# loop.
+_PROGRESS_MARK = re.compile(
+    r"#\s?%"
+    r"|[\u2500-\u25ff\u2800-\u28ff]"
+    r"|[\[|][=>#\- ]*[=>][=>#\- ]*[\]|]"
+    r"|^[-|/\\](?: |$)|(?:^| )[-|/\\]$"
+)
 
 
 def digest(value: object) -> bytes:
@@ -141,18 +156,22 @@ def action_fingerprint(name: str, input_digest: bytes, result_digest: bytes) -> 
     return h.digest()
 
 
-def line_key(raw: bytes) -> bytes | None:
-    """The digest of one normalized output line; ``None`` for a line with no letter.
+def line_key(raw: bytes, *, redraw: bool = False) -> bytes | None:
+    """The digest of one normalized output line; ``None`` for a line that cannot loop.
 
     Escape sequences are dropped, hex runs and then digit runs become ``#``
     and whitespace collapses, so ``retrying in 5s (attempt 37)`` and
-    ``retrying in 6s (attempt 38)`` are the same line. Whether it has a letter
-    is judged without pytest's progress marks.
+    ``retrying in 6s (attempt 38)`` are the same line. A line with no letter
+    once pytest's progress marks are dropped cannot loop, and neither can a
+    ``redraw`` (a line a CR alone ended) that shows a progress mark: that is
+    a progress bar or a spinner frame, not a message.
     """
     text = _ESCAPES.sub("", raw.decode("utf-8", "replace"))
     text = _DIGIT_RUN.sub("#", _HEX_RUN.sub("#", text))
     text = _SPACE_RUN.sub(" ", text).strip()
     if not _LETTER.search(_PYTEST_MARKS.sub("", text)):
+        return None
+    if redraw and _PROGRESS_MARK.search(text):
         return None
     return hashlib.blake2b(text.encode("utf-8"), digest_size=DIGEST_BYTES).digest()
 
@@ -318,33 +337,37 @@ class _CycleTracker:
 class _LineFramer:
     """Cut one stream's bytes into lines, keeping each line's head.
 
-    LF and CRLF end a line; what a CR alone ends is redrawn in place and is
-    dropped. A CR that ends a chunk is decided by the next one, so a CRLF
-    split across two reads still ends a line.
+    LF, CRLF and a CR alone end a line; a line a CR alone ended is flagged
+    as a redraw, since what follows draws over it in place. A CR that ends a
+    chunk is decided by the next one, so a CRLF split across two reads still
+    ends one line, not a redraw and then an empty line.
     """
 
     def __init__(self) -> None:
         self._head = bytearray()
         self._cr = False
 
-    def feed(self, data: bytes) -> list[bytes]:
-        lines: list[bytes] = []
+    def feed(self, data: bytes) -> list[tuple[bytes, bool]]:
+        """The lines ``data`` ends, each with whether a CR alone ended it."""
+        lines: list[tuple[bytes, bool]] = []
+        if not data:
+            return lines
         if self._cr:
             self._cr = False
-            if data.startswith(b"\n"):
-                lines.append(bytes(self._head))
-                data = data[1:]
+            crlf = data.startswith(b"\n")
+            lines.append((bytes(self._head), not crlf))
             self._head.clear()
+            if crlf:
+                data = data[1:]
         pos = 0
         for match in _LINE_END.finditer(data):
             self._take(data[pos : match.start()])
             pos = match.end()
-            if match.group() == b"\r":
-                if pos == len(data):
-                    self._cr = True
-                    return lines
-            else:
-                lines.append(bytes(self._head))
+            bare_cr = match.group() == b"\r"
+            if bare_cr and pos == len(data):
+                self._cr = True
+                return lines
+            lines.append((bytes(self._head), bare_cr))
             self._head.clear()
         self._take(data[pos:])
         return lines
@@ -485,8 +508,8 @@ class LoopMonitor:
                 stream, (_LineFramer(), _CycleTracker(self._period))
             )
             verdict = None
-            for raw in framer.feed(data):
-                key = line_key(raw)
+            for raw, redraw in framer.feed(data):
+                key = line_key(raw, redraw=redraw)
                 if key is None:
                     continue
                 run = lines.feed(key, stream, now)

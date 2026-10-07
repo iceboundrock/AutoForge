@@ -247,11 +247,15 @@ The detector looks for four signals:
   a loop; the idle timeout handles that.
 - **Repeated lines.** Output that is not a structured stream (OpenCode's
   stderr, a Claude `output_format: text` profile's stdout) is cut into
-  lines, with digits and hex masked and whitespace collapsed. A line, or a
-  cycle of up to `max_cycle_period` lines, repeated `max_line_repeats`
-  times in a row is a loop. A `\r` progress bar or spinner redraws one line
-  rather than writing new ones, and a line with no letters (a pytest dot
-  line, a rule) is skipped.
+  lines at `\n`, `\r\n` and a bare `\r`, with digits and hex masked and
+  whitespace collapsed. A line, or a cycle of up to `max_cycle_period`
+  lines, repeated `max_line_repeats` times in a row is a loop, so a retry
+  message redrawn in place with `\r` counts like any other line. A line
+  with no letters (a pytest dot line, a rule) is skipped, and so is a line
+  a bare `\r` ends that shows a progress mark (a percentage, a bar or
+  spinner glyph, an ASCII bar such as `[====>   ]`, or a `|`, `/`, `-` or
+  `\` spinner frame at either end): a `\r` progress bar or spinner redraws
+  one display rather than writing new lines.
 - **Retry storm.** `max_cycle_repeats` provider retries in a row over
   `novelty_window_seconds` with no completed turn. This needs a provider
   that reports its retries (Claude stream-json, Pi).

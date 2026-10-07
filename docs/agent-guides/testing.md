@@ -100,8 +100,9 @@ High-priority coverage includes:
   - cycles of period 1 to `max_cycle_period`, at the repeat threshold and
     one short of it;
   - irregular replay (no novelty) and its action floor;
-  - masked repeated lines, ended by LF or by a CRLF split across chunks;
-    a bare-CR redraw is not a line;
+  - masked repeated lines, ended by LF, by a CRLF split across chunks or
+    by a bare CR (a retry message redrawn in place is a line; a redrawn
+    progress bar or spinner frame is not);
   - a retry storm;
   - each known legitimate repetition staying below every threshold: an
     edit/test loop, `git status` between edits, a few CI polls, pytest dot

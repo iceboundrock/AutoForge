@@ -286,6 +286,93 @@ def test_pytest_dots_and_progress_bars_are_never_lines_that_loop():
     assert monitor.calibration()["loop_max_line_repeats"] == 0
 
 
+ASCII_SPINNER = "|/-\\"
+BRAILLE_SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+# Frame ``n`` (0 to 99) of a display a CLI draws over in place with a bare CR.
+REDRAWN_DISPLAYS = {
+    "tqdm": lambda n: (
+        f" {n}%|{'█' * (n // 10)}{'▏▎▍▌▋▊▉'[n % 7]}| {n}/100 [00:{n:02d}<00:12, 4.50it/s]"
+    ),
+    "tqdm-ascii": lambda n: f" {n}%|{'#' * (n // 10)}{n % 10}| {n}/100 [00:{n:02d}, 4.50it/s]",
+    "rich": lambda n: f"   {'━' * (n // 3)}╺{'━' * (33 - n // 3)} {n / 20:.1f}/5.0 MB eta 0:00:12",
+    "git": lambda n: f"Receiving objects:  {n}% ({n * 10}/1000), 1.20 MiB | 2.00 MiB/s",
+    "docker": lambda n: f"3f2a9c1d: Downloading [{'=' * (n // 5)}>{' ' * (20 - n // 5)}]  45.6MB",
+    "braille-spinner": lambda n: f"{BRAILLE_SPINNER[n % 10]} Thinking",
+    "geometric-spinner": lambda n: f"{'◐◓◑◒'[n % 4]} Waiting for the model",
+    "ascii-spinner-before": lambda n: f"{ASCII_SPINNER[n % 4]} Working",
+    "ascii-spinner-after": lambda n: f"Working... {ASCII_SPINNER[n % 4]}",
+}
+
+
+@pytest.mark.parametrize("display", REDRAWN_DISPLAYS.values(), ids=list(REDRAWN_DISPLAYS))
+def test_a_redrawn_progress_display_is_no_line_though_the_same_text_ended_by_lf_is(display):
+    for n in (0, 7, 45, 99):
+        frame = display(n).encode()
+        assert line_key(frame, redraw=True) is None
+        assert line_key(frame) is not None
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        b"retrying in 5s (attempt 37)",
+        b"Error: connection reset by peer; retrying",
+        b"rate limited - retrying",
+        b"API error 529 (overloaded) [attempt 3/10]",
+    ],
+)
+def test_a_redrawn_message_is_a_line_like_one_ended_by_lf(message):
+    assert line_key(message, redraw=True) == line_key(message) is not None
+
+
+@pytest.mark.parametrize("display", REDRAWN_DISPLAYS.values(), ids=list(REDRAWN_DISPLAYS))
+def test_a_progress_bar_or_spinner_redrawn_with_a_bare_cr_never_loops(display):
+    monitor, warnings = _monitor(max_line_repeats=10)
+    # Drawn and then ended by a CR, or a CR and a clear-line, then drawn.
+    for i in range(500):
+        assert _lines(monitor, f"{display(i % 100)}\r".encode(), float(i)) is None
+    for i in range(500):
+        data = f"\r\x1b[2K{display(i % 100)}".encode()
+        assert _lines(monitor, data, float(500 + i)) is None
+    assert monitor.verdict is None and warnings == []
+    assert monitor.calibration()["loop_max_line_repeats"] == 0
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        "retrying in {i}s (attempt {i})\r",
+        "\rretrying in {i}s (attempt {i})",
+        "\r⠋ waiting\r| waiting\rretrying in {i}s (attempt {i})",
+    ],
+    ids=["cr-after", "cr-before", "among-spinner-frames"],
+)
+def test_a_message_redrawn_with_a_bare_cr_repeated_to_the_threshold_is_a_loop(frame):
+    monitor, _ = _monitor()
+    verdicts = {}
+    for i in range(201):
+        verdict = _lines(monitor, frame.format(i=i).encode(), float(i))
+        if verdict is not None:
+            verdicts[i] = verdict
+    # What follows a CR decides it: the 200th message is ended by the 201st write.
+    assert list(verdicts) == [200]
+    verdict = verdicts[200]
+    assert verdict.signal == SIGNAL_REPEATED_LINES
+    assert (verdict.period, verdict.repeats, verdict.stream) == (1, 200, "stderr")
+    assert monitor.calibration()["loop_max_line_repeats"] == 200
+
+
+def test_a_crlf_split_across_reads_ends_a_line_not_a_redraw():
+    monitor, _ = _monitor(max_line_repeats=3)
+    verdict = None
+    for i in range(3):
+        assert verdict is None
+        # A progress mark on a line CRLF ends: a line, not a redraw.
+        _lines(monitor, f"Downloading wheels: {i}%\r".encode())
+        verdict = _lines(monitor, b"\n")
+    assert verdict is not None and (verdict.period, verdict.repeats) == (1, 3)
+
+
 def test_a_long_line_is_keyed_by_its_head():
     monitor, _ = _monitor(max_line_repeats=3)
     head = b"x" * MAX_LINE_BYTES
