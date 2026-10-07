@@ -52,8 +52,10 @@ each ``tool_execution_end`` whose ``tool_execution_start`` was seen is one
 action, fingerprinted from its ``toolName``, the digest of the start's whole
 ``args`` and the digest of the whole end record but its ``toolCallId``, at
 the time ``feed`` was given; ``auto_retry_start`` is a retry and an
-assistant ``message_end`` a completed turn. Only names and digests leave
-here.
+assistant ``message_end`` that completed (:data:`COMPLETED_STOP_REASONS`) a
+completed turn. A failed or aborted attempt is not one: Pi emits it before
+each ``agent_end(willRetry)`` and ``auto_retry_start``, and counting it would
+end every retry streak at one. Only names and digests leave here.
 """
 
 from __future__ import annotations
@@ -73,6 +75,10 @@ from .redaction import redact
 DIALOG_METHODS = frozenset({"select", "confirm", "input", "editor"})
 NOTIFY_METHODS = frozenset({"notify", "setStatus", "setWidget", "setTitle", "set_editor_text"})
 SUCCESS_STOP_REASONS = ("stop",)
+# Stop reasons of a response the model completed: a completed turn for the
+# loop detector. ``error`` and ``aborted`` are failed attempts; Pi emits an
+# ``error`` one before each automatic retry.
+COMPLETED_STOP_REASONS = ("stop", "toolUse", "length")
 # Events the reducer reads, and known events it deliberately ignores. Any
 # other type is counted as unknown (forward compatibility); the count is a
 # diagnostic only.
@@ -619,7 +625,7 @@ class PiConversation:
                     self._last_text_message = message
                 if stop in SUCCESS_STOP_REASONS:
                     self._retry_failure = None
-                if self._loop is not None:
+                if self._loop is not None and stop in COMPLETED_STOP_REASONS:
                     self._loop.turn(now)
         elif kind == "tool_execution_start":
             self._tool_executions += 1

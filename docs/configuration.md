@@ -257,8 +257,10 @@ The detector looks for four signals:
   `\` spinner frame at either end): a `\r` progress bar or spinner redraws
   one display rather than writing new lines.
 - **Retry storm.** `max_cycle_repeats` provider retries in a row over
-  `novelty_window_seconds` with no completed turn. This needs a provider
-  that reports its retries (Claude stream-json, Pi).
+  `novelty_window_seconds` with no completed turn or tool call in between;
+  the failed attempt a provider reports before each retry is not a
+  completed turn. This needs a provider that reports its retries (Claude
+  stream-json, Pi).
 
 The action cycle, no-novelty and retry-storm signals come from the
 structured events of Claude's stream-json and Pi's RPC. OpenCode and a

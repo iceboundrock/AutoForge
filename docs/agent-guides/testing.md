@@ -117,6 +117,10 @@ High-priority coverage includes:
   - The duplex handle's `stop()` is a no-op once the child has exited.
   - The Claude stream and Pi reducers fingerprint input and result, not
     the call id.
+  - Pi's failed attempts, in its own order (`message_end` with `error`,
+    `agent_end` with `willRetry`, `auto_retry_start`), keep a retry streak
+    going until it is conclusive and counted in the calibration; a completed
+    response ends it.
   - A loop kill crosses the fake `claude` (stream and text mode) and a fake
     Pi as a timeout with the `loop` limit.
   - End to end on the engine: kill mode leaves the phase unchanged, names

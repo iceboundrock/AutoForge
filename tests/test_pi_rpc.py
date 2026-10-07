@@ -1505,6 +1505,84 @@ def test_an_end_without_a_start_is_no_action_and_retries_and_turns_are_reported(
     assert loop.calls == [("retry", 100.0), ("turn", 100.0)]
 
 
+@pytest.mark.parametrize(
+    ("stop", "turn"),
+    [("stop", True), ("toolUse", True), ("length", True), ("error", False), ("aborted", False)],
+)
+def test_only_a_completed_assistant_message_is_a_turn(stop, turn):
+    """A failed or aborted attempt is no completed turn: Pi emits one before
+    each of its retries (R2-F1)."""
+    loop = _LoopRecorder()
+    run = Run(loop=loop).started()
+    run.feed({"type": "message_end", "message": assistant("", stop=stop)})
+    assert loop.calls == ([("turn", 100.0)] if turn else [])
+
+
+def _retry_monitor(mode: str = "kill"):
+    from autoforge.config import LoopDetectionConfig
+    from autoforge.loop_detect import LoopMonitor
+
+    config = LoopDetectionConfig(mode=mode, max_cycle_repeats=3, novelty_window_seconds=60)
+    return LoopMonitor(config, 100.0)
+
+
+def _failed_attempt(run: Run, attempt: int) -> None:
+    """One failed attempt in Pi's order (verified on Pi 1.0.1): the error
+    message, the agent end that will retry, then the retry."""
+    run.feed({"type": "message_end", "message": assistant("", stop="error", errorMessage="503")})
+    run.feed({"type": "agent_end", "messages": [], "willRetry": True})
+    run.feed(
+        {
+            "type": "auto_retry_start",
+            "attempt": attempt,
+            "maxAttempts": 10,
+            "delayMs": 30000,
+            "errorMessage": "503",
+        }
+    )
+
+
+def test_failed_attempts_between_retries_do_not_break_a_retry_storm():
+    from autoforge.loop_detect import SIGNAL_RETRY_STORM
+
+    monitor = _retry_monitor()
+    run = Run(loop=monitor).started()
+    for attempt in (1, 2):
+        _failed_attempt(run, attempt)
+        assert monitor.verdict is None
+        run.now += 30
+    _failed_attempt(run, 3)
+    verdict = monitor.verdict
+    assert verdict is not None and verdict.signal == SIGNAL_RETRY_STORM
+    assert (verdict.repeats, verdict.started, verdict.at) == (3, 100.0, 160.0)
+
+
+def test_calibration_counts_every_retry_of_a_failing_streak():
+    monitor = _retry_monitor(mode="warn")
+    run = Run(loop=monitor).started()
+    for attempt in range(1, 9):
+        _failed_attempt(run, attempt)
+        run.now += 30
+    assert monitor.verdict is None
+    assert monitor.calibration()["loop_max_retry_streak"] == 8
+
+
+def test_a_completed_response_between_retries_ends_the_streak():
+    monitor = _retry_monitor()
+    run = Run(loop=monitor).started()
+    for attempt in (1, 2):
+        _failed_attempt(run, attempt)
+        run.now += 30
+    # The retry succeeds: a completed response that calls a tool.
+    run.feed({"type": "message_end", "message": assistant(stop="toolUse")})
+    run.feed({"type": "auto_retry_end", "success": True, "attempt": 2})
+    for attempt in (1, 2):
+        run.now += 30
+        _failed_attempt(run, attempt)
+    assert monitor.verdict is None
+    assert monitor.calibration()["loop_max_retry_streak"] == 2
+
+
 def test_without_a_loop_monitor_no_tool_execution_is_remembered():
     run = Run().started()
     _tool(run, "c1", {"command": "make test"}, "ok")
