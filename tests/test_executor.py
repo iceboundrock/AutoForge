@@ -1,5 +1,6 @@
 """Executor: real subprocesses (python -c) — argv safety, timeout, exit codes."""
 
+import gc
 import hashlib
 import os
 import random
@@ -453,11 +454,23 @@ def _open_fds() -> set[str]:
     return set(os.listdir("/dev/fd"))
 
 
+def _baseline_fds() -> set[str]:
+    """The descriptors open before a test's work, earlier tests' garbage
+    freed first. Objects an earlier test left in reference cycles can hold
+    descriptors (an engine's state directory), and the cyclic collector frees
+    them at whatever allocation it next runs on: during the work, that closes
+    descriptors the baseline counted. The look after the work collects
+    nothing, so what the work leaves held by a cycle still counts as left
+    open."""
+    gc.collect()
+    return _open_fds()
+
+
 def test_stdin_data_leaves_no_descriptor_behind():
     """The feeder holds a read end of the child's stdin past the child's
     exit; it is released with the rest, whether the child read everything,
     read nothing or the spawn failed."""
-    before = _open_fds()
+    before = _baseline_fds()
     for command in ([PY, "-c", _DIGEST_STDIN], [PY, "-c", "pass"]):
         execute(ExecutionRequest(command=command, stdin_data=b"z" * 200_000, timeout_seconds=30))
     with pytest.raises(ExecutionError, match="not found"):
@@ -486,7 +499,7 @@ def test_a_stdin_pipe_that_cannot_be_opened_is_a_launch_failure(monkeypatch, fai
             raise OSError(24, "Too many open files")
         return real_pipe()
 
-    before = _open_fds()
+    before = _baseline_fds()
     monkeypatch.setattr(executor.os, "pipe", pipe)
     with pytest.raises(ExecutionError, match="failed to spawn .*Too many open files"):
         execute(ExecutionRequest(command=[PY, "-c", "pass"], stdin_data=b"z", timeout_seconds=5))
@@ -535,7 +548,7 @@ def test_a_setup_failure_after_the_spawn_kills_the_child(monkeypatch, step, nth,
         spawned.append(real_spawn(*args, **kwargs))
         return spawned[-1]
 
-    fds, threads = _open_fds(), set(threading.enumerate())
+    fds, threads = _baseline_fds(), set(threading.enumerate())
     monkeypatch.setattr(executor, "_spawn", spawn)
     monkeypatch.setattr(target[0], target[1], refuse_nth(target[2]))
     started = time.monotonic()
