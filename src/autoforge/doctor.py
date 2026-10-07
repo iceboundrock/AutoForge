@@ -491,7 +491,33 @@ class Doctor:
             reachable = local_required_profiles(cfg)
         except ConfigurationError:
             return []
-        return self._agent_checks(cfg, reachable, "this local configuration")
+        return [
+            *self._agent_checks(cfg, reachable, "this local configuration"),
+            self.check_agent_limits(cfg, reachable),
+        ]
+
+    def check_agent_limits(self, cfg: AutoForgeConfig, reachable: list[str]) -> CheckResult:
+        """Report the limits each reachable profile's agent runs under (#193).
+
+        Informational: an agent is killed after writing nothing for its idle
+        timeout, and once it has run for its max runtime when one is set.
+        Fails only for a profile a run would refuse to launch (a CLI that
+        reports no progress and has no wall-clock limit), which the config
+        check does not already cover for a profile reachable only after a
+        merge.
+        """
+        name = "profile limits"
+        shown: list[str] = []
+        for profile_name in reachable:
+            profile = cfg.profiles.get(profile_name)
+            if profile is None:
+                continue
+            try:
+                limits = cfg.agent_limits(profile)
+            except ConfigurationError as exc:
+                return CheckResult(name, False, str(exc))
+            shown.append(f"{profile_name}: {limits.describe()}")
+        return CheckResult(name, True, "; ".join(shown) or "(no profile)", required=False)
 
     def _agent_checks(
         self, cfg: AutoForgeConfig, reachable: list[str], scope: str
@@ -794,7 +820,10 @@ class Doctor:
         reachable = REQUIRED_PROFILES + [
             name for name in REMOTE_POST_MERGE_PROFILES if name in cfg.profiles
         ]
-        return self._agent_checks(cfg, reachable, "this configuration")
+        return [
+            *self._agent_checks(cfg, reachable, "this configuration"),
+            self.check_agent_limits(cfg, reachable),
+        ]
 
     def run_all(self) -> list[CheckResult]:
         results = [self.check_config(), self.check_merge_gate(), self.check_premerge_verification()]

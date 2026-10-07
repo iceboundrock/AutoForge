@@ -165,7 +165,7 @@ that step finishes, not after the whole loop. A progress line is prefixed
 with the time since the launch, the phase and, in a remote run, the issue:
 
 ```text
-[00:00:00 ANALYZE_EXECUTE #160] launching analyze_execute (claude, model fable, effort high), timeout 1800s, attempt 1, worktree /repo/.git/autoforge/worktrees/160, log .autoforge/logs/<run-id>/001-analyze_execute-1
+[00:00:00 ANALYZE_EXECUTE #160] launching analyze_execute (claude, model fable, effort high), idle timeout 900s, max runtime unset, attempt 1, worktree /repo/.git/autoforge/worktrees/160, log .autoforge/logs/<run-id>/001-analyze_execute-1
 [00:00:04 ANALYZE_EXECUTE #160] agent started (claude-fable-5-1)
 [00:00:31 ANALYZE_EXECUTE #160] thinking… ~12k tokens
 [00:01:02 ANALYZE_EXECUTE #160] Read src/autoforge/engine.py
@@ -178,8 +178,9 @@ with the time since the launch, the phase and, in a remote run, the issue:
 ```
 
 - **Before the launch**, one line names the profile, provider, model and
-  effort, the timeout, the attempt, the working directory and the step's log
-  directory.
+  effort, both agent limits (the idle timeout and the maximum runtime, see
+  [Agent limits](#agent-limits)), the attempt, the working directory and the
+  step's log directory.
 - **While it runs**: one line per tool the agent starts, with one
   allow-listed input (the file of a read, edit or write, the pattern of a
   search, the *description* of a shell command, never the command itself,
@@ -187,8 +188,8 @@ with the time since the launch, the phase and, in a remote run, the issue:
   shown at most once every 30 s; a failed tool says so; and when nothing has
   been printed for two minutes a heartbeat says how long ago the agent last
   did anything.
-- **After it returns**, one line says how it ended (exit status, timeout or
-  provider failure).
+- **After it returns**, one line says how it ended (exit status, the limit
+  that killed it, or provider failure).
 
 What a provider can report differs. Claude Code (with the default
 `output_format: stream-json`) and Pi report each tool and their thinking;
@@ -206,12 +207,44 @@ to stdout and is never part of `status --json`; redirecting stderr
 (`2>/dev/null`) hides it without affecting the run. A dry run launches no
 agent and prints no progress.
 
+## Agent limits
+
+An agent is killed when it has made no progress, meaning it wrote nothing
+to stdout or stderr, for its profile's idle timeout (default 900 s). Every
+tool call Claude or Pi reports, and every line OpenCode prints, resets that
+timer, so a long task is not killed for being long. Configure it per
+profile; see [Configuration: Agent limits](configuration.md#agent-limits).
+
+- **`max_runtime_seconds` is the only hard bound on an active agent.** It is
+  unset by default. Without it, an agent that keeps producing output while
+  going in circles runs until the executor's one-week backstop. Loop
+  detection (#194) closes that gap only once it kills by default; until
+  then, set `max_runtime_seconds` on a profile when an unattended run must
+  end by a known time.
+- **A silent tool call counts as no progress.** A test suite that runs for
+  twenty minutes inside one shell command and prints nothing until it ends
+  looks exactly like a hang. If your project has one, raise
+  `idle_timeout_seconds` on the profiles that run it.
+- **A Claude profile with `output_format: text`** writes nothing until it
+  exits, so it has no idle timeout and must set `max_runtime_seconds`.
+- **Only the agent's own output counts.** Nothing the controller does
+  resets the timer, and neither will a wait for a human answer once agents
+  can ask one (#126).
+
+When a limit fires, the error names it and the agent's last output, for
+example `agent 'analyze_execute' made no progress for 900s (last activity
+08:31:02 UTC) and was killed`, or `... reached its 7200s maximum runtime and
+was killed`. The state is unchanged, nothing is retried automatically, and
+the step's `execution.json` records `timeout_limit` (`idle` or
+`max_runtime`), both configured values and `last_activity_at`.
+
 ## Dry run
 
 A dry run invokes no agent, runs no verification command, writes nothing to
 GitHub, git or the state directory (no state, no log), takes no lock and
 creates no agent worktree. It prints the plan (phase, provider,
-model/effort, round, template, variables, command, expected transition),
+model/effort, agent limits, round, template, variables, command, expected
+transition),
 redacted. What it reads depends on the command:
 
 - `run --dry-run` previews a new run and launches no subprocess: no `git`,
@@ -282,7 +315,8 @@ ownership or discard uncommitted user changes.
   prompt (`execution.max_correction_attempts`, default once). A non-zero
   exit, a timeout or a verification failure is not retried automatically and
   leaves the phase unchanged for `resume`. Inspect the invocation under
-  `<state dir>/logs/<run-id>/`.
+  `<state dir>/logs/<run-id>/`. A timeout says which limit fired; see
+  [Agent limits](#agent-limits) before raising one.
 - **The run is `BLOCKED`:** read `autoforge status`, fix the cause, then
   `autoforge unblock --reason "..."` and `autoforge resume` (see above).
 - **Merge verification keeps saying "inconclusive":** checks still running,

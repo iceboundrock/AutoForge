@@ -9,6 +9,7 @@ import pytest
 
 from autoforge.config import ProfileConfig, default_config
 from autoforge.errors import ConfigurationError
+from autoforge.executor import MAX_DEADLINE_SECONDS
 from autoforge.providers import (
     AgentExecutionResult,
     AgentRequest,
@@ -107,7 +108,7 @@ def test_opencode_prompt_never_reaches_argv(prompt):
     prov = OpenCodeProvider()
     argv = prov.build_command_for(p, prompt)
     assert argv == prov.build_command_for(p, "anything else")
-    assert prov.stdin_payload(AgentRequest("REVIEW", prompt, ".", p, 5)) == prompt.encode()
+    assert prov.stdin_payload(AgentRequest("REVIEW", prompt, ".", p, None, 5)) == prompt.encode()
 
 
 def test_opencode_without_an_effort_sends_no_variant():
@@ -149,7 +150,7 @@ def test_opencode_hands_the_prompt_to_the_runner_as_stdin():
     p = default_config().profile("review_round_1")
     prompt = 'review \ud800 \u00e9 "q"'
     OpenCodeProvider(runner=_capture_runner(seen)).execute(
-        AgentRequest("REVIEW", prompt, "/tmp", p, 7)
+        AgentRequest("REVIEW", prompt, "/tmp", p, None, 7)
     )
     # A lone surrogate cannot be UTF-8; it becomes U+FFFD rather than failing.
     assert seen[0].stdin_data == 'review \ufffd \u00e9 "q"'.encode()
@@ -159,7 +160,9 @@ def test_opencode_hands_the_prompt_to_the_runner_as_stdin():
 def test_claude_keeps_stdin_on_dev_null():
     seen = []
     p = _text(default_config().profile("fix"))
-    ClaudeCodeProvider(runner=_capture_runner(seen)).execute(AgentRequest("FIX", "p", "/tmp", p, 7))
+    ClaudeCodeProvider(runner=_capture_runner(seen)).execute(
+        AgentRequest("FIX", "p", "/tmp", p, None, 7)
+    )
     assert seen[0].stdin_data is None
 
 
@@ -186,7 +189,9 @@ def test_a_prompt_the_cli_did_not_take_whole_is_a_provider_failure(exit_code, ti
         )
 
     p = default_config().profile("review_round_1")
-    res = OpenCodeProvider(runner=runner).execute(AgentRequest("REVIEW", "p" * 11, "/tmp", p, 7))
+    res = OpenCodeProvider(runner=runner).execute(
+        AgentRequest("REVIEW", "p" * 11, "/tmp", p, None, 7)
+    )
     assert bool(res.provider_failure) is failure
     if failure:
         assert res.provider_failure == (
@@ -196,12 +201,12 @@ def test_a_prompt_the_cli_did_not_take_whole_is_a_provider_failure(exit_code, ti
 
 
 # -- a fake `claude` streaming stream-json under the duplex handle (#192) ------------
-def _claude_run(tmp_path, lines, timeout=30, events=None, **kw):
+def _claude_run(tmp_path, lines, timeout=30, events=None, idle=None, **kw):
     from tests import claude_fake
 
     home, profile = claude_fake.fake_claude(tmp_path, lines, **kw)
     sink = None if events is None else events.append
-    req = AgentRequest("FIX", "fix it", str(tmp_path), profile, timeout, progress=sink)
+    req = AgentRequest("FIX", "fix it", str(tmp_path), profile, idle, timeout, progress=sink)
     return home, ClaudeCodeProvider().execute(req)
 
 
@@ -307,6 +312,44 @@ def test_a_fake_claude_that_overruns_its_timeout_is_killed_and_timed_out(tmp_pat
     assert time.monotonic() - started < 30
     assert res.timed_out and res.provider_failure is None and res.stdout == ""
     assert res.exit_code != 0
+
+
+def test_a_fake_claude_that_goes_silent_is_killed_at_its_idle_timeout(tmp_path):
+    """#193: the stream reports progress, so silence past the idle limit ends
+    the run, named as the idle limit with the time of the last event."""
+    import time
+
+    from tests import claude_fake
+
+    started = time.monotonic()
+    _, res = _claude_run(tmp_path, [claude_fake.init(), {"sleep": 60}], timeout=30, idle=1)
+    assert time.monotonic() - started < 15
+    assert res.timed_out and res.timeout_limit == "idle" and res.provider_failure is None
+    assert res.last_activity_at is not None
+
+
+def test_a_fake_claude_that_keeps_streaming_outlives_its_idle_timeout(tmp_path):
+    import time
+
+    from tests import claude_fake
+
+    lines = [claude_fake.init()]
+    for n in range(6):
+        lines += [{"sleep": 0.3}, claude_fake.tool_use(f"t{n}", "Bash", command=f"echo {n}")]
+    started = time.monotonic()
+    _, res = _claude_run(tmp_path, [*lines, claude_fake.result("done")], timeout=30, idle=1)
+    assert time.monotonic() - started >= 1.8
+    assert res.ok and res.stdout == "done" and not res.timed_out and res.timeout_limit == ""
+
+
+def test_a_fake_claude_that_keeps_streaming_is_killed_at_its_maximum_runtime(tmp_path):
+    from tests import claude_fake
+
+    lines = [claude_fake.init()]
+    for n in range(200):
+        lines += [{"sleep": 0.05}, claude_fake.tool_use(f"t{n}", "Bash", command=f"echo {n}")]
+    _, res = _claude_run(tmp_path, lines, timeout=1, idle=5)
+    assert res.timed_out and res.timeout_limit == "max_runtime"
 
 
 @pytest.mark.parametrize(
@@ -603,7 +646,7 @@ def test_the_claude_stream_launch_contains_orphans_and_keeps_stdin_closed(tmp_pa
     monkeypatch.setattr(providers, "start_duplex", spy)
     home, profile = claude_fake.fake_claude(tmp_path, [claude_fake.result("done")])
     req = AgentRequest(
-        "FIX", "p", str(tmp_path), profile, 30, env_allowlist=("PATH", "HOME", "CLAUDE_*")
+        "FIX", "p", str(tmp_path), profile, 900, 30, env_allowlist=("PATH", "HOME", "CLAUDE_*")
     )
     res = ClaudeCodeProvider().execute(req)
     assert res.ok and res.stdout == "done"
@@ -627,7 +670,7 @@ def test_a_progress_sink_that_raises_never_fails_the_claude_run(tmp_path):
         tmp_path, [claude_fake.init(), claude_fake.thinking("x"), claude_fake.result("done")]
     )
     res = ClaudeCodeProvider().execute(
-        AgentRequest("FIX", "p", str(tmp_path), profile, 30, progress=sink)
+        AgentRequest("FIX", "p", str(tmp_path), profile, None, 30, progress=sink)
     )
     assert res.ok and res.stdout == "done" and res.provider_failure is None
     assert len(calls) == 1  # dropped after its first failure
@@ -695,7 +738,9 @@ def test_a_fake_opencode_receives_the_prompt_verbatim_and_answers_on_stdout(tmp_
     home, profile = _fake_opencode(tmp_path, answer=block(review))
     head = '-x --help\r\n# Review "PR" `code` $(id) \\ back\n{"k": "v"}\n\u00e9\u4e2d\n'
     prompt = head + "filler line\n" * 20_000  # well over one pipe buffer
-    res = OpenCodeProvider().execute(AgentRequest("REVIEW", prompt, str(tmp_path), profile, 30))
+    res = OpenCodeProvider().execute(
+        AgentRequest("REVIEW", prompt, str(tmp_path), profile, None, 30)
+    )
     assert res.ok and not res.provider_failure, (res.exit_code, res.stderr)
     log = json.loads((home / "log.json").read_text(encoding="utf-8"))
     sent = prompt.encode("utf-8")
@@ -739,7 +784,9 @@ def test_a_fake_opencode_that_exits_without_reading_its_whole_prompt_fails(tmp_p
         "findings": [],
     }
     _, profile = _fake_opencode(tmp_path, mode=mode, answer=block(review))
-    res = OpenCodeProvider().execute(AgentRequest("REVIEW", prompt, str(tmp_path), profile, 30))
+    res = OpenCodeProvider().execute(
+        AgentRequest("REVIEW", prompt, str(tmp_path), profile, None, 30)
+    )
     assert res.exit_code == 0 and not res.timed_out
     assert parse_control_result(res.stdout_tail, Phase.REVIEW) == review
     taken = 1 if mode == "read-one-byte" else 0
@@ -783,7 +830,14 @@ def test_unknown_provider_rejected():
 def test_scripted_provider_records_calls():
     sp = ScriptedProvider(["one", "two"], exit_code=0)
     p = ProfileConfig(name="x", provider="scripted", model="m")
-    req = AgentRequest(phase="REVIEW", prompt="p", cwd=".", profile=p, timeout_seconds=5)
+    req = AgentRequest(
+        phase="REVIEW",
+        prompt="p",
+        cwd=".",
+        profile=p,
+        idle_timeout_seconds=None,
+        max_runtime_seconds=5,
+    )
     assert sp.execute(req).stdout == "one"
     assert sp.execute(req).stdout == "two"
     assert sp.execute(req).stdout == ""
@@ -816,7 +870,7 @@ def test_provider_execute_uses_injected_runner():
 
     prov = ClaudeCodeProvider(runner=runner)
     p = _text(default_config().profile("fix"))
-    res = prov.execute(AgentRequest("FIX", "prompt", "/tmp", p, 7))
+    res = prov.execute(AgentRequest("FIX", "prompt", "/tmp", p, None, 7))
     assert res.ok and res.stdout == "ok" and res.model == "fable"
     assert seen[0].timeout_seconds == 7 and seen[0].cwd == "/tmp"
     assert seen[0].command[-1] == "prompt"
@@ -832,7 +886,9 @@ def test_one_shot_agent_launch_asks_for_orphan_containment(provider, profile):
     p = default_config().profile(profile)
     if provider is ClaudeCodeProvider:
         p = _text(p)  # the one-shot path; the stream path is tested with the fake below
-    provider(runner=_capture_runner(seen)).execute(AgentRequest("FIX", "prompt", "/tmp", p, 7))
+    provider(runner=_capture_runner(seen)).execute(
+        AgentRequest("FIX", "prompt", "/tmp", p, None, 7)
+    )
     assert seen[0].contain_orphans
 
 
@@ -882,10 +938,57 @@ def _capture_runner(seen):
     return runner
 
 
+@pytest.mark.parametrize(("ceiling", "expected"), [(None, MAX_DEADLINE_SECONDS), (120, 120)])
+def test_a_one_shot_launch_carries_both_limits(ceiling, expected):
+    """#193: the idle limit reaches the executor as is; an unset ceiling is
+    the executor's one-week backstop, never 'no timeout'."""
+    seen = []
+    OpenCodeProvider(runner=_capture_runner(seen)).execute(
+        AgentRequest(
+            "REVIEW", "p", "/tmp", default_config().profile("review_round_1"), 300, ceiling
+        )
+    )
+    assert seen[0].idle_timeout_seconds == 300 and seen[0].timeout_seconds == expected
+
+
+def test_a_one_shot_result_names_the_limit_that_fired():
+    from autoforge.executor import ExecutionResult
+
+    def runner(req):
+        return ExecutionResult(
+            req.command,
+            req.cwd,
+            -1,
+            "",
+            "",
+            "t",
+            "t",
+            timed_out=True,
+            timeout_limit="idle",
+            last_activity_at="2026-10-07T08:31:02+00:00",
+        )
+
+    res = OpenCodeProvider(runner=runner).execute(
+        AgentRequest("REVIEW", "p", "/tmp", default_config().profile("review_round_1"), 300, None)
+    )
+    assert res.timed_out and res.timeout_limit == "idle"
+    assert res.last_activity_at == "2026-10-07T08:31:02+00:00"
+
+
+def test_only_claude_text_mode_reports_no_activity():
+    cfg = default_config()
+    fix = cfg.profile("fix")
+    assert ClaudeCodeProvider().reports_activity(fix)
+    assert not ClaudeCodeProvider().reports_activity(_text(fix))
+    assert OpenCodeProvider().reports_activity(cfg.profile("review_round_1"))
+
+
 def test_provider_passes_no_allowlist_through_when_the_request_has_none():
     seen = []
     prov = ClaudeCodeProvider(runner=_capture_runner(seen))
-    prov.execute(AgentRequest("FIX", "prompt", "/tmp", _text(default_config().profile("fix")), 7))
+    prov.execute(
+        AgentRequest("FIX", "prompt", "/tmp", _text(default_config().profile("fix")), None, 7)
+    )
     assert seen[0].env_allowlist is None
 
 
@@ -897,6 +1000,7 @@ def test_provider_adds_its_own_environment_names_to_the_request_allowlist():
         "prompt",
         "/tmp",
         _text(default_config().profile("fix")),
+        None,
         7,
         env_allowlist=("PATH", "HOME"),
     )
@@ -912,6 +1016,7 @@ def test_provider_environment_names_are_deduplicated_not_repeated():
         "p",
         "/tmp",
         default_config().profile("fix"),
+        None,
         7,
         env_allowlist=("ANTHROPIC_*", "PATH", "PATH"),
     )
@@ -1100,7 +1205,7 @@ def test_pi_execution_never_goes_through_the_one_shot_runner(tmp_path):
     seen = []
     prov = PiProvider(runner=_capture_runner(seen))
     profile = _pi(command=str(tmp_path / "no-such-pi"), options={"require_oauth": "false"})
-    req = AgentRequest("REVIEW", "p", str(tmp_path), profile, 7, env_allowlist=("PATH",))
+    req = AgentRequest("REVIEW", "p", str(tmp_path), profile, None, 7, env_allowlist=("PATH",))
     with pytest.raises(ExecutionError, match="no-such-pi"):
         prov.execute(req)
     assert seen == []  # the one-shot runner was never called
@@ -1110,7 +1215,7 @@ def test_pi_auth_preflight_runs_in_the_launch_environment_through_the_runner(tmp
     seen = []
     prov = PiProvider(runner=_capture_runner(seen))
     profile = _pi(command="pi")
-    req = AgentRequest("REVIEW", "p", str(tmp_path), profile, 7, env_allowlist=("PATH",))
+    req = AgentRequest("REVIEW", "p", str(tmp_path), profile, None, 7, env_allowlist=("PATH",))
     res = prov.execute(req)  # the captured runner prints "ok": not a result Pi would give
     [check] = seen
     assert check.command == prov.auth_check_command(profile) and check.cwd == str(tmp_path)

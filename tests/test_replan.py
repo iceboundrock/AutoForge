@@ -6426,10 +6426,10 @@ def _assert_plan_metadata_follows(plan, may_launch: bool) -> None:
     if may_launch:
         assert plan.command and plan.template == "replan_reexecute.md", plan
         assert plan.prompt_length == len(plan.prompt_full) > 0 and plan.prompt_preview, plan
-        assert plan.profile_name == "replan_reexecute" and plan.timeout_seconds > 0, plan
+        assert plan.profile_name == "replan_reexecute" and plan.limits is not None, plan
         assert plan.routing == "REPLAN_REEXECUTE -> profile replan_reexecute", plan.routing
         return
-    assert plan.command == [] and plan.template == "" and plan.timeout_seconds == 0, plan
+    assert plan.command == [] and plan.template == "" and plan.limits is None, plan
     assert plan.prompt_length == 0 and plan.prompt_full == "", plan
     assert plan.prompt_preview == "(no agent prompt)", plan.prompt_preview
     assert plan.profile_name == "(none — deterministic transition)", plan.profile_name

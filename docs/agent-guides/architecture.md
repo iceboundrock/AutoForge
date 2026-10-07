@@ -157,8 +157,20 @@ child is started in a new session (`start_new_session`), so it leads a
 process group of its own that the executor can reach and kill. An
 invocation is complete when the child has exited, both pipes reached EOF
 *and* no process is left in the child's process group. The child's exit is
-bounded by the timeout; past it the whole group is killed and the result is
-a timeout. Once the child has exited on its own, the other two conditions
+bounded by the request's limits; past one the whole group is killed and the
+result is a timeout. An agent launch has two (ADR 0002 §4c, #193): an idle
+timeout (`ExecutionRequest.idle_timeout_seconds`), counted from the spawn
+and then from the last chunk either reader saw, and a wall-clock ceiling
+(`timeout_seconds`, `MAX_DEADLINE_SECONDS` when the profile sets none).
+Whichever is due first fires, a tie goes to the ceiling, and
+`ExecutionResult.timeout_limit` (`idle` or `max_runtime`) and
+`last_activity_at` say which and when the child last wrote. A command that
+is not an agent has no idle timeout, only `timeout_seconds`
+(`execution.command_timeout_seconds`). Which limits a profile gets, and that
+a provider whose output is no progress signal (Claude in text mode,
+`reports_activity`) runs under its ceiling alone, is configuration
+(`AutoForgeConfig.agent_limits`), not executor policy. Once the child has
+exited on its own, the other two conditions
 are given a short exit grace (`_EXIT_GRACE_SECONDS`): a child that left
 nothing behind clears them at once, a helper it is shutting down as it
 exits clears them within the grace, and a descendant still there past it
@@ -216,14 +228,23 @@ it is held to the same contract:
   writes and a selector, so a child that stops reading stdin cannot hold
   the controller past the deadline. A child that closed its stdin raises
   `ChildStdinClosedError`;
-- one absolute deadline bounds every `send_line`, `read_line` and `finish`.
-  Past it the group is killed exactly as on `execute()`'s timeout, and the
-  result is `timed_out` with `exit_code = -1`. As in `execute()`, whose last
+- the same two limits (`DuplexRequest.idle_timeout_seconds` and
+  `max_runtime_seconds`) bound every `send_line`, `read_line` and `finish`;
+  only a chunk read from the child is activity, never a record sent to it.
+  `limit_due()` is when the one due first falls due and `deadline_limit`
+  names it; `deadline()` is that plus `wind_down_seconds` (0 unless a
+  caller winds the child down in order: Pi asks for its abort window, so
+  its `abort` goes out as the limit falls due, never before it, and the
+  kill follows the window later); `pin_deadline()` fixes both so later
+  output no longer moves them, which every Pi `abort` and the finish after
+  it use to stay inside a fixed budget. Past
+  the deadline the group is killed exactly as on `execute()`'s timeout, and
+  the result is `timed_out` with `exit_code = -1` and `timeout_limit`. As in `execute()`, whose last
   look at the child is at the deadline, the child is looked at first: a
   `read_line` or `finish()` that meets the deadline after the child has
   exited is not a timeout, and settles the group with the exit grace and the
   kill, the child's status kept (`read_line` then returns the rest of
-  stdout). A deadline that is not
+  stdout). A limit that is not
   finite, not positive or above `MAX_DEADLINE_SECONDS` (a week, within what
   every wait primitive can take) is refused with `ExecutionError` before
   anything is spawned;
@@ -242,8 +263,9 @@ it is held to the same contract:
   group kill (SIGTERM first, then SIGKILL). `DuplexResult` reports
   `descendants_killed`, `group_survived_kill` and `capture_abandoned`
   exactly as `ExecutionResult` does for the same leftovers, and the
-  invocation takes at most the deadline plus the exit grace plus two kill
-  graces.
+  invocation takes at most the deadline (one idle timeout after the child's
+  last output, or the ceiling, plus any wind-down) plus the exit grace plus
+  two kill graces.
 
 The handle knows no JSON, no provider and no workflow. A server child that
 takes no input (#126) uses it with `stdin_pipe=False` and
@@ -257,8 +279,10 @@ nothing is waited for past the SIGKILL grace: not a writer the group kill
 cannot reach (a descendant that also called `setsid`), and not a member that
 survives SIGKILL itself (uninterruptible in the kernel), the direct child
 included. The capture is then abandoned and an unreaped child is left to the
-`subprocess` module, so `execute()` returns within the timeout plus the exit
-grace plus two kill grace periods whatever the child left behind. What the
+`subprocess` module, so `execute()` returns within its deadline (one idle
+timeout after the child's last output, or the wall-clock limit, whichever is
+due first) plus the exit grace plus two kill grace periods whatever the
+child left behind. What the
 kill could not remove is reported rather than presented as a clean kill:
 `group_survived_kill` (a member was still in the group after the SIGKILL
 grace) and `capture_abandoned` (a pipe never reached EOF, so a writer

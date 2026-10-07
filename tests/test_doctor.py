@@ -151,6 +151,43 @@ def test_all_checks_pass(tmp_path):
     assert not any(p.name.startswith(".doctor-") for p in (tmp_path / ".autoforge").iterdir())
 
 
+def test_doctor_reports_the_limits_of_every_reachable_profile(tmp_path):
+    """#193: informational, both values for each profile a run can launch."""
+    d = Doctor(cwd=str(tmp_path), runner=_runner_factory())
+    row = {r.name: r for r in d.run_all()}["profile limits"]
+    assert row.ok and not row.required
+    assert "analyze_execute: idle timeout 900s, max runtime unset" in row.detail
+    assert "update_epic: idle timeout 900s, max runtime unset" in row.detail
+
+
+def test_doctor_fails_a_post_merge_profile_a_run_would_refuse_to_launch(tmp_path):
+    """`update_epic` is not a required profile, so the config check passes
+    it; a text-mode Claude there with no ceiling would only fail after a
+    merge, which is exactly what doctor exists to say beforehand."""
+    cfg = tmp_path / "c.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "profiles": {
+                    "update_epic": {
+                        "provider": "claude",
+                        "model": "fable",
+                        "effort": "high",
+                        "command": "claude",
+                        "options": {"output_format": "text"},
+                    }
+                },
+            }
+        )
+    )
+    d = Doctor(config_path=str(cfg), cwd=str(tmp_path), runner=_runner_factory())
+    results = {r.name: r for r in d.run_all()}
+    assert results["config"].ok
+    row = results["profile limits"]
+    assert not row.ok and row.required and "max_runtime_seconds" in row.detail
+
+
 def test_failures_are_reported_not_raised(tmp_path):
     d = Doctor(cwd=str(tmp_path), runner=_runner_factory(fail=("gh auth", "opencode")))
     results = {r.name: r for r in d.run_all()}

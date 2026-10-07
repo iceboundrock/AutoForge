@@ -15,6 +15,7 @@ from autoforge import __prompt_version__
 from autoforge.claims import render_progress_marker
 from autoforge.config import default_config
 from autoforge.errors import (
+    ConfigurationError,
     ControlResultValidationError,
     ExecutionError,
     ExecutionTimeoutError,
@@ -2168,7 +2169,7 @@ class _TimingOut(ScriptedProvider):
 @pytest.mark.parametrize(
     "outcome, expected",
     [
-        ("timeout", r"timed out after \d+s"),
+        ("timeout", r"timed out \(idle timeout 900s, max runtime unset\)"),
         ("exit", r"exit 3"),
         ("malformed", r"ControlResultError: "),
     ],
@@ -2747,7 +2748,8 @@ def test_run_logs_are_redacted_and_structured(tmp_state_dir, fake_github):
     assert "ghp_abcdefghijklmnopqrstuvwxyz0123456789" not in (d / "stdout.log").read_text()
     req = json.loads((d / "request.json").read_text())
     assert req["provider"] == "claude" and req["prompt_version"] == __prompt_version__
-    assert "environ" not in req and req["timeout_seconds"] > 0
+    assert "environ" not in req and req["idle_timeout_seconds"] == 900
+    assert req["max_runtime_seconds"] is None and req["timeout_seconds"] == 0
     events = (run_dir / "events.jsonl").read_text().strip().splitlines()
     assert len(events) == 1
 
@@ -3307,7 +3309,7 @@ def test_failing_verification_command_blocks_the_merge(tmp_state_dir, fake_githu
 def test_verification_command_timeout_blocks_the_merge(tmp_state_dir, fake_github):
     commands = [["python3", "-c", "import time; time.sleep(30)"]]
     eng, _ = _in_merge_on_commit(tmp_state_dir, fake_github, commands)
-    eng.config.execution.default_timeout_seconds = 1
+    eng.config.execution.command_timeout_seconds = 1
     out = eng.step(allow_merge=True)
     assert out.next_phase == "BLOCKED" and "timed out after 1s" in eng.state.block_reason
     assert fake_github.merges == []
@@ -3336,7 +3338,7 @@ def test_verification_command_leftover_is_killed_and_its_result_kept(
     monkeypatch.setattr(executor, "_EXIT_GRACE_SECONDS", 0.5)
     commands = [["python3", "-c", _LEAVES_A_SERVER]]
     eng, sha = _in_merge_on_commit(tmp_state_dir, fake_github, commands)
-    eng.config.execution.default_timeout_seconds = 30
+    eng.config.execution.command_timeout_seconds = 30
     out = eng.step(allow_merge=True)
     assert out.next_phase == "UPDATE_EPIC" and len(fake_github.merges) == 1
     assert eng.state.premerge_verified_head_sha == sha
@@ -3375,7 +3377,7 @@ def test_verification_command_detached_leftover_is_killed_and_journaled(
     monkeypatch.setattr(executor, "_EXIT_GRACE_SECONDS", 0.5)
     commands = [["python3", "-c", _DETACHES_A_SERVER]]
     eng, _ = _in_merge_on_commit(tmp_state_dir, fake_github, commands)
-    eng.config.execution.default_timeout_seconds = 30
+    eng.config.execution.command_timeout_seconds = 30
     out = eng.step(allow_merge=True)
     assert out.next_phase == "UPDATE_EPIC" and len(fake_github.merges) == 1
     run_dir = eng.paths.logs_dir / eng.state.run_id
@@ -3399,7 +3401,7 @@ def test_failing_verification_command_names_its_leftover_in_the_block_reason(
     monkeypatch.setattr(executor, "_EXIT_GRACE_SECONDS", 0.5)
     commands = [["python3", "-c", _LEAVES_A_SERVER, "3"]]
     eng, sha = _in_merge_on_commit(tmp_state_dir, fake_github, commands)
-    eng.config.execution.default_timeout_seconds = 30
+    eng.config.execution.command_timeout_seconds = 30
     out = eng.step(allow_merge=True)
     assert out.next_phase == "BLOCKED" and fake_github.merges == []
     reason = eng.state.block_reason
@@ -6357,6 +6359,90 @@ def test_timeout_names_a_group_member_that_survived_the_kill(tmp_state_dir, fake
     assert event["group_survived_kill"] is True
 
 
+def test_an_idle_timeout_names_the_limit_and_the_last_activity(tmp_state_dir, fake_github):
+    """#193: the error, the run log and the progress line say the agent made
+    no progress for its idle limit, and when it was last seen writing."""
+    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    provider = _LeftoverProvider(
+        "", timed_out=True, timeout_limit="idle", last_activity_at="2026-10-07T08:31:02+00:00"
+    )
+    _install(eng, provider)
+    lines: list[str] = []
+    eng.progress_output = lines.append
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    with pytest.raises(ExecutionTimeoutError) as excinfo:
+        eng.step()
+    assert str(excinfo.value) == (
+        "agent 'analyze_execute' made no progress for 900s (last activity 08:31:02 UTC) "
+        "and was killed. State unchanged — inspect the real Git/GitHub state, then 'resume'."
+    )
+    (req,) = provider.calls
+    assert (req.idle_timeout_seconds, req.max_runtime_seconds) == (900, None)
+    assert eng.state.phase == Phase.ANALYZE_EXECUTE
+    _, step = _step_dir(eng)
+    execution = json.loads((step / "execution.json").read_text(encoding="utf-8"))
+    assert execution["timed_out"] is True and execution["timeout_limit"] == "idle"
+    assert execution["idle_timeout_seconds"] == 900 and execution["max_runtime_seconds"] is None
+    assert execution["last_activity_at"] == "2026-10-07T08:31:02+00:00"
+    assert execution["error"] == "made no progress for 900s (last activity 08:31:02 UTC)"
+    request = json.loads((step / "request.json").read_text(encoding="utf-8"))
+    assert request["idle_timeout_seconds"] == 900 and request["max_runtime_seconds"] is None
+    shown = [line.split("] ", 1)[1] for line in lines]
+    assert "idle timeout 900s, max runtime unset, attempt 1" in shown[0]
+    assert shown[-1].startswith("agent made no progress for 900s (last activity 08:31:02 UTC)")
+
+
+def test_an_idle_timeout_before_any_output_says_so(tmp_state_dir, fake_github):
+    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    _install(eng, _LeftoverProvider("", timed_out=True, timeout_limit="idle"))
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    with pytest.raises(
+        ExecutionTimeoutError,
+        match=r"^agent 'analyze_execute' made no progress for 900s \(no output since launch\)",
+    ):
+        eng.step()
+
+
+@pytest.mark.parametrize(
+    ("ceiling", "expected"),
+    [
+        (3600, "reached its 3600s maximum runtime"),
+        (None, "reached the 604800s (one week) runtime backstop"),
+    ],
+)
+def test_a_maximum_runtime_timeout_names_the_ceiling(tmp_state_dir, fake_github, ceiling, expected):
+    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    eng.config.execution.default_max_runtime_seconds = ceiling
+    eng.config.profile("analyze_execute").idle_timeout_seconds = 120
+    provider = _LeftoverProvider(
+        "",
+        timed_out=True,
+        timeout_limit="max_runtime",
+        last_activity_at="2026-10-07T08:31:02+00:00",
+    )
+    _install(eng, provider)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    with pytest.raises(ExecutionTimeoutError) as excinfo:
+        eng.step()
+    assert str(excinfo.value).startswith(f"agent 'analyze_execute' {expected} and was killed.")
+    (req,) = provider.calls
+    assert (req.idle_timeout_seconds, req.max_runtime_seconds) == (120, ceiling)
+    _, step = _step_dir(eng)
+    execution = json.loads((step / "execution.json").read_text(encoding="utf-8"))
+    assert execution["timeout_limit"] == "max_runtime" and execution["error"] == expected
+    assert execution["max_runtime_seconds"] == ceiling
+
+
+def test_a_text_mode_claude_profile_without_a_ceiling_is_never_launched(tmp_state_dir, fake_github):
+    """#193: it would run under no limit at all but the one-week backstop."""
+    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    eng.config.profile("analyze_execute").options["output_format"] = "text"
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    with pytest.raises(ConfigurationError, match="max_runtime_seconds"):
+        eng.step()
+    assert eng.provider.calls == [] and eng.state.phase == Phase.ANALYZE_EXECUTE
+
+
 def test_failed_exit_names_what_the_agent_left_behind(tmp_state_dir, fake_github):
     """PR #114 R1-F1: a non-zero exit carries the same leftover facts as a
     timeout. The immediate error, the journal and the run log all name the
@@ -8437,19 +8523,27 @@ def test_a_pi_deadline_is_a_timeout_naming_what_it_left_behind(
     eng = make_engine(tmp_state_dir, [], github=fake_github)
     _to_pi(eng, tmp_path_factory, agent)
     eng.config.profiles["analyze_execute"] = replace(
-        eng.config.profile("analyze_execute"), timeout_seconds=2
+        eng.config.profile("analyze_execute"), idle_timeout_seconds=2
     )
     eng.state.phase = Phase.ANALYZE_EXECUTE
     with pytest.raises(ExecutionTimeoutError) as excinfo:
         eng.step()
     message = str(excinfo.value)
-    assert message.startswith("agent 'analyze_execute' timed out after 2s")
+    # Pi answered the controller's first requests, then went silent: the
+    # idle limit fired, counted from its last record (#193).
+    assert re.match(
+        r"agent 'analyze_execute' made no progress for 2s "
+        r"\(last activity \d\d:\d\d:\d\d UTC\) and was killed",
+        message,
+    ), message
     assert "outside its process group" in message
     assert message.endswith("then 'resume'.")
     assert load_state(eng.paths.state_file).phase == Phase.ANALYZE_EXECUTE
     _, step = _step_dir(eng)
     execution = json.loads((step / "execution.json").read_text(encoding="utf-8"))
     assert execution["timed_out"] is True and execution["orphans_killed"] is True
+    assert execution["timeout_limit"] == "idle" and execution["idle_timeout_seconds"] == 2
+    assert execution["max_runtime_seconds"] is None and execution["last_activity_at"]
     assert (step / "stderr.log").read_text(encoding="utf-8") == PI_STDERR
 
     eng.load()

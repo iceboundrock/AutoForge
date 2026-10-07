@@ -92,7 +92,8 @@ run against an installed Pi)::
 The CLIs are launched with cwd = the directory the engine chose (a
 per-issue worktree for a REMOTE run, the contract's repository root for a
 LOCAL one), stdin = /dev/null or the adapter's payload
-(:meth:`AgentProvider.stdin_payload`), a hard timeout, and an allow-listed
+(:meth:`AgentProvider.stdin_payload`), an idle limit and an optional
+wall-clock ceiling (:class:`AgentRequest`; #193), and an allow-listed
 environment (see executor.py): the engine passes the configured allow-list
 in :attr:`AgentRequest.env_allowlist` and each adapter adds the variables
 its own CLI reads (:attr:`AgentProvider.environment_names`), so the key of
@@ -118,6 +119,7 @@ from .errors import (
 )
 from .executor import (
     DEFAULT_MAX_OUTPUT_BYTES,
+    MAX_DEADLINE_SECONDS,
     ExecutionRequest,
     ExecutionResult,
     describe_leftovers,
@@ -147,7 +149,14 @@ class AgentRequest:
     prompt: str
     cwd: str
     profile: ProfileConfig
-    timeout_seconds: int
+    # The limits the invocation runs under (#193; the engine resolves them
+    # with ``AutoForgeConfig.agent_limits``): the CLI is killed once it has
+    # written nothing on stdout or stderr for ``idle_timeout_seconds``
+    # (``None``: no idle limit, for a CLI that reports no activity while it
+    # works), or once it has run ``max_runtime_seconds`` (``None``: only the
+    # executor's backstop, ``MAX_DEADLINE_SECONDS``).
+    idle_timeout_seconds: int | None
+    max_runtime_seconds: int | None
     attempt: int = 1
     correction: bool = False
     # The controller's environment allow-list (``execution.env_allowlist``
@@ -198,6 +207,11 @@ class AgentExecutionResult:
     # that the engine writes to ``execution.json`` under this key without
     # interpreting it. Never raw protocol records or message contents.
     provider_summary: dict[str, str | int | bool] = field(default_factory=dict)
+    # Which limit killed the CLI when ``timed_out`` (``"idle"`` or
+    # ``"max_runtime"``), and when it last wrote anything (UTC, ISO 8601;
+    # ``None`` when it wrote nothing). See :class:`ExecutionResult`.
+    timeout_limit: str = ""
+    last_activity_at: str | None = None
 
     @property
     def stdout_tail(self) -> str:
@@ -253,6 +267,8 @@ class AgentExecutionResult:
             provider=profile.provider,
             model=profile.model,
             effort=profile.effort,
+            timeout_limit=res.timeout_limit,
+            last_activity_at=res.last_activity_at,
         )
 
 
@@ -307,6 +323,15 @@ class AgentProvider:
         """What :meth:`execute` writes to the CLI's stdin; ``None`` is ``/dev/null``."""
         return None
 
+    def reports_activity(self, profile: ProfileConfig) -> bool:
+        """Whether the CLI, launched for ``profile``, writes output while it works.
+
+        A fact about the CLI, not a policy: the controller decides what to do
+        with a CLI that is silent until it exits (it cannot run under an idle
+        limit, see ``AutoForgeConfig.agent_limits``).
+        """
+        return True
+
     def validate_profile(self, profile: ProfileConfig) -> None:
         """Raise ConfigurationError for values this CLI cannot accept.
 
@@ -341,7 +366,8 @@ class AgentProvider:
             ExecutionRequest(
                 command=command,
                 cwd=req.cwd,
-                timeout_seconds=req.timeout_seconds,
+                timeout_seconds=req.max_runtime_seconds or MAX_DEADLINE_SECONDS,
+                idle_timeout_seconds=req.idle_timeout_seconds,
                 env_allowlist=self.environment_allowlist(req),
                 # Nothing an agent starts outlives its invocation (ADR 0002),
                 # including what it detached from its process group.
@@ -415,6 +441,10 @@ class ClaudeCodeProvider(AgentProvider):
     def output_format(profile: ProfileConfig) -> str:
         return profile.options.get("output_format") or CLAUDE_DEFAULT_OUTPUT_FORMAT
 
+    def reports_activity(self, profile: ProfileConfig) -> bool:
+        # `text` prints the final text once, at exit, and nothing before it.
+        return self.output_format(profile) == "stream-json"
+
     def build_command_for(self, profile: ProfileConfig, prompt: str) -> list[str]:
         argv = [profile.command or "claude", "-p"]
         output_format = self.output_format(profile)
@@ -461,7 +491,8 @@ class ClaudeCodeProvider(AgentProvider):
             command=self.build_command(req),
             cwd=req.cwd,
             env_allowlist=self.environment_allowlist(req),
-            deadline_seconds=float(req.timeout_seconds),
+            idle_timeout_seconds=req.idle_timeout_seconds,
+            max_runtime_seconds=req.max_runtime_seconds,
             max_record_bytes=CLAUDE_MAX_RECORD_BYTES,
             max_pending_bytes=CLAUDE_MAX_PENDING_BYTES,
             # The prompt travels in argv; stdin stays /dev/null so the CLI
@@ -505,6 +536,8 @@ class ClaudeCodeProvider(AgentProvider):
             orphans_unchecked=res.orphans_unchecked,
             provider_failure=None if timed_out else failure,
             provider_summary=summary,
+            timeout_limit=res.timeout_limit,
+            last_activity_at=res.last_activity_at,
         )
 
 
@@ -631,12 +664,12 @@ def _parse_version(text: str, pattern: re.Pattern[str]) -> tuple[int, int, int] 
 
 # ADR 0003 §3: each stdio round trip around the prompt (`get_state`,
 # `get_available_models`, `get_last_assistant_text`) is bounded inside the
-# invocation's timeout. The first two also cover Pi's start-up (Node, its
+# invocation's limits. The first two also cover Pi's start-up (Node, its
 # settings and its model catalog), hence more than a bare round trip needs.
 PI_ROUND_TRIP_SECONDS = 15.0
 # How long an `abort` is given to settle a running prompt before stdin is
-# closed; taken from the end of the invocation's timeout (at most a quarter
-# of it), so the abort and the group kill both land within the timeout.
+# closed. It follows a limit falling due and never shortens it (#193): the
+# group is killed this long after the limit, Pi's own exit included.
 PI_ABORT_SECONDS = 5.0
 # A final text past the stdout bound must still arrive whole in one
 # `get_last_assistant_text` record so that its tail can be kept, and JSON
@@ -844,14 +877,18 @@ class PiProvider(AgentProvider):
     def execute(self, req: AgentRequest) -> AgentExecutionResult:
         """One ``pi --mode rpc`` child, one prompt, one final text (ADR 0003).
 
-        The child gets ``req.timeout_seconds`` as its deadline. The last
-        ``abort_seconds`` of it (at most a quarter) are kept for the abort:
-        when the conversation is still running at that point it is cut
-        short, ``abort`` is sent, stdin is closed, and the duplex handle kills
-        the group if Pi has not exited by the deadline. The result is then
-        ``timed_out`` whatever Pi's exit status. A failure inside the
-        protocol is ``provider_failure``; ``exit_code`` is always the real
-        process status. A spawn failure raises :class:`ExecutionError`.
+        The child runs under the request's idle limit and ceiling, which
+        the duplex handle turns into one deadline that Pi's output keeps
+        moving (#193). When a limit falls due with the conversation still
+        running, and not before, it is cut short: the deadline is pinned
+        (so what Pi writes while it settles cannot stretch it), ``abort``
+        is sent, stdin is closed, and the duplex handle kills the group if
+        Pi has not exited ``abort_seconds`` after the limit. The result is
+        then ``timed_out`` whatever Pi's exit status, and names the limit
+        that fell due. A failure inside the protocol is
+        ``provider_failure``; its abort runs under the deadline pinned when
+        the failure is acted on. ``exit_code`` is always the real process
+        status. A spawn failure raises :class:`ExecutionError`.
 
         With ``require_oauth`` (the default) the launch is refused before
         anything is spawned when a provider API key would reach Pi, and a
@@ -865,8 +902,6 @@ class PiProvider(AgentProvider):
             refused = self._auth_preflight(req, allowlist)
             if refused is not None:
                 return refused
-        timeout = float(req.timeout_seconds)
-        abort_window = min(self.abort_seconds, timeout / 4)
         conversation = PiConversation(
             model=req.profile.model,
             thinking=req.profile.effort,
@@ -879,19 +914,27 @@ class PiProvider(AgentProvider):
             command=self.build_command(req),
             cwd=req.cwd,
             env_allowlist=allowlist,
-            deadline_seconds=timeout,
+            idle_timeout_seconds=req.idle_timeout_seconds,
+            max_runtime_seconds=req.max_runtime_seconds,
+            # The abort comes after a limit, so the kill waits for it.
+            wind_down_seconds=self.abort_seconds,
             max_record_bytes=PI_MAX_RECORD_BYTES,
             max_pending_bytes=PI_MAX_PENDING_BYTES,
             # Pi's bash tool starts every command detached (ADR 0003 §6).
             contain_orphans=True,
         )
         with start_duplex(duplex) as child:
-            soft_deadline = time.monotonic() + timeout - abort_window
-            cut_short = self._converse(child, conversation, soft_deadline)
+            cut_short = self._converse(child, conversation)
+            # The limit that fell due when the conversation was cut short:
+            # pinned by then, so Pi's own exit inside the abort keeps it.
+            cut_limit = child.deadline_limit if cut_short else ""
             if cut_short:
                 conversation.deadline_reached()
             if conversation.failure is not None:
-                self._abort(child, conversation, abort_window)
+                # Every abort ends by a fixed deadline: what Pi writes while
+                # it settles, or after, cannot stretch its shutdown.
+                child.pin_deadline()
+                self._abort(child, conversation, self.abort_seconds)
             child.close_stdin()
             res = child.finish()
         timed_out = cut_short or res.timed_out
@@ -928,6 +971,8 @@ class PiProvider(AgentProvider):
             # A timeout wins over whatever the protocol said (ADR 0003 §2.6).
             provider_failure=None if timed_out else failure,
             provider_summary=summary,
+            timeout_limit=(res.timeout_limit or cut_limit) if timed_out else "",
+            last_activity_at=res.last_activity_at,
         )
 
     def _refuse_api_keys(self, req: AgentRequest, allowlist: tuple[str, ...] | None) -> None:
@@ -1017,21 +1062,26 @@ class PiProvider(AgentProvider):
                 conversation.stdin_closed()
                 return
 
-    def _converse(
-        self, child: DuplexChild, conversation: PiConversation, soft_deadline: float
-    ) -> bool:
-        """Drive the conversation to its outcome; True when the deadline cut it short."""
+    def _converse(self, child: DuplexChild, conversation: PiConversation) -> bool:
+        """Drive the conversation to its outcome; True when a limit cut it short.
+
+        The conversation is cut short as the child's limit falls due, which
+        Pi's output keeps moving, so it is recomputed on every turn; once
+        cut short the deadline is pinned, the abort window after the limit.
+        """
         try:
             self._send(child, conversation, conversation.start(time.monotonic()))
             while not conversation.done:
                 now = time.monotonic()
-                if now >= soft_deadline:
+                due = child.limit_due()
+                if now >= due:
+                    child.pin_deadline()
                     return True
                 conversation.tick(now)
                 if conversation.done:
                     break
                 wake = conversation.next_wakeup
-                until = soft_deadline if wake is None else min(soft_deadline, wake)
+                until = due if wake is None else min(due, wake)
                 item = child.read_line(timeout=max(0.0, until - now))
                 if isinstance(item, Record):
                     replies = conversation.feed(item.data, time.monotonic())

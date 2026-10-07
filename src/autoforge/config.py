@@ -43,7 +43,7 @@ from pathlib import Path
 
 from . import __prompt_version__
 from .errors import ConfigurationError
-from .executor import is_env_pattern
+from .executor import MAX_DEADLINE_SECONDS, is_env_pattern
 from .local_workspace import (
     DEFAULT_MAX_BYTES,
     DEFAULT_MAX_ENTRIES,
@@ -52,7 +52,13 @@ from .local_workspace import (
 
 CONFIG_VERSION = 1
 
-DEFAULT_TIMEOUT_SECONDS = 1800
+# An agent is killed once it has written nothing for this long (#193): above
+# the longest silent stretch a working agent has, which is usually a tool
+# call that prints nothing until it returns (a long test run).
+DEFAULT_IDLE_TIMEOUT_SECONDS = 900
+# The wall-clock limit of each repository-defined command the controller
+# runs itself (pre-merge verification, LOCAL validation).
+DEFAULT_COMMAND_TIMEOUT_SECONDS = 1800
 
 KNOWN_PROVIDERS = ("claude", "opencode", "pi", "scripted")
 
@@ -81,7 +87,12 @@ class ProfileConfig:
     effort: str = "high"
     command: str = ""
     extra_args: list[str] = field(default_factory=list)
-    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
+    # The agent's limits (#193); ``None`` falls back to
+    # ``execution.default_idle_timeout_seconds`` /
+    # ``execution.default_max_runtime_seconds``. Resolved, together with what
+    # the provider can report, by :meth:`AutoForgeConfig.agent_limits`.
+    idle_timeout_seconds: int | None = None
+    max_runtime_seconds: int | None = None
     options: dict[str, str] = field(default_factory=dict)
 
     def build_command(self, prompt: str) -> list[str]:
@@ -101,12 +112,26 @@ PROFILE_KEYS = (
     "effort",
     "command",
     "extra_args",
-    "timeout_seconds",
+    "idle_timeout_seconds",
+    "max_runtime_seconds",
     "options",
 )
 
+# A profile key that used to be read, and where it went: rejected with that
+# message rather than reinterpreted (see ``REMOVED_EXECUTION_KEYS``).
+REMOVED_PROFILE_KEYS = {
+    "timeout_seconds": (
+        "'timeout_seconds' is no longer supported: an agent is now killed only after "
+        "making no progress (no output) for 'idle_timeout_seconds' (default: "
+        "execution.default_idle_timeout_seconds, {idle}s), with an optional wall-clock "
+        "ceiling in 'max_runtime_seconds'. Replace the key with one or both"
+    ),
+}
+
 EXECUTION_KEYS = (
-    "default_timeout_seconds",
+    "default_idle_timeout_seconds",
+    "default_max_runtime_seconds",
+    "command_timeout_seconds",
     "max_correction_attempts",
     "env_allowlist",
     "env_allowlist_extra",
@@ -171,7 +196,15 @@ DEFAULT_ENV_ALLOWLIST: tuple[str, ...] = (
 
 @dataclass
 class ExecutionConfig:
-    default_timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
+    # The limits of a profile that sets none of its own (#193): an agent is
+    # killed once it has written nothing for ``default_idle_timeout_seconds``,
+    # and, when ``default_max_runtime_seconds`` is set, once it has run that
+    # long whatever it writes. ``None``: no wall-clock ceiling.
+    default_idle_timeout_seconds: int = DEFAULT_IDLE_TIMEOUT_SECONDS
+    default_max_runtime_seconds: int | None = None
+    # The wall-clock limit of a pre-merge verification command and of a
+    # LOCAL validation command; agents never use it.
+    command_timeout_seconds: int = DEFAULT_COMMAND_TIMEOUT_SECONDS
     # How many times a *malformed CONTROL_RESULT* (exit 0) triggers a
     # correction prompt before the step fails. 0 disables correction.
     max_correction_attempts: int = 1
@@ -311,7 +344,7 @@ class MergeConfig:
     # passed, the exact reviewed commit is exported -- `git read-tree` +
     # `git checkout-index` into a private temporary directory, never the
     # operator's checkout, never a worktree or branch -- and each command
-    # runs there in order, under `execution.default_timeout_seconds`. Any
+    # runs there in order, under `execution.command_timeout_seconds`. Any
     # non-zero exit or timeout BLOCKS the merge for a human. A pass is
     # persisted against the HEAD and the command list, so MERGE does not
     # repeat it for the same commit. An empty list disables this
@@ -488,6 +521,31 @@ TOP_LEVEL_KEYS = (
 )
 
 
+@dataclass(frozen=True)
+class AgentLimits:
+    """The limits one agent invocation runs under (#193).
+
+    ``idle_timeout_seconds``: the agent is killed once it has written
+    nothing on stdout or stderr for that long; ``None`` when its CLI writes
+    nothing until it exits, so only the ceiling can apply.
+    ``max_runtime_seconds``: the wall-clock ceiling from the launch;
+    ``None``: unset, so only the executor's one-week backstop applies.
+    """
+
+    idle_timeout_seconds: int | None
+    max_runtime_seconds: int | None
+
+    def describe(self) -> str:
+        """Both values, for the dry-run plan, ``doctor`` and the launch line."""
+        idle = (
+            "off (no output until exit)"
+            if self.idle_timeout_seconds is None
+            else f"{self.idle_timeout_seconds}s"
+        )
+        ceiling = "unset" if self.max_runtime_seconds is None else f"{self.max_runtime_seconds}s"
+        return f"idle timeout {idle}, max runtime {ceiling}"
+
+
 @dataclass
 class AutoForgeConfig:
     version: int = CONFIG_VERSION
@@ -508,6 +566,43 @@ class AutoForgeConfig:
         except KeyError:
             raise ConfigurationError(f"unknown execution profile {name!r}") from None
 
+    def agent_limits(self, profile: ProfileConfig) -> AgentLimits:
+        """The limits ``profile``'s agent runs under, or ConfigurationError.
+
+        The profile's own values, else the ``execution.default_*`` ones. A
+        CLI that writes nothing until it exits (Claude with ``output_format:
+        text``) would look frozen for its whole run, so it cannot run under
+        an idle limit: it runs under its wall-clock ceiling alone, and a
+        ceiling is then required, never an unbounded run.
+        """
+        from .providers import provider_for  # local import: providers depends on config
+
+        for key in ("idle_timeout_seconds", "max_runtime_seconds"):
+            value = getattr(profile, key)
+            if value is not None:
+                _check_limit(value, f"profile {profile.name!r}", key)
+        idle = (
+            profile.idle_timeout_seconds
+            if profile.idle_timeout_seconds is not None
+            else self.execution.default_idle_timeout_seconds
+        )
+        ceiling = (
+            profile.max_runtime_seconds
+            if profile.max_runtime_seconds is not None
+            else self.execution.default_max_runtime_seconds
+        )
+        if provider_for(profile).reports_activity(profile):
+            return AgentLimits(idle_timeout_seconds=idle, max_runtime_seconds=ceiling)
+        if ceiling is None:
+            raise ConfigurationError(
+                f"profile {profile.name!r}: its {profile.provider} CLI writes nothing until it "
+                "exits with these options, so it cannot run under an idle timeout and needs a "
+                "wall-clock limit: set 'max_runtime_seconds' on the profile (or "
+                "'execution.default_max_runtime_seconds'), or use an output format that "
+                "reports progress (claude: output_format stream-json)"
+            )
+        return AgentLimits(idle_timeout_seconds=None, max_runtime_seconds=ceiling)
+
     @property
     def merge_allowed_by_config(self) -> bool:
         """The config half of the merge gate: `safety.allow_merge` and nothing else."""
@@ -526,7 +621,7 @@ def _claude_profile(name: str) -> ProfileConfig:
     )
 
 
-def _opencode_profile(name: str, model: str, effort: str, timeout: int = 1800) -> ProfileConfig:
+def _opencode_profile(name: str, model: str, effort: str) -> ProfileConfig:
     return ProfileConfig(
         name=name,
         provider="opencode",
@@ -534,7 +629,6 @@ def _opencode_profile(name: str, model: str, effort: str, timeout: int = 1800) -
         effort=effort,
         command="opencode",
         extra_args=[],
-        timeout_seconds=timeout,
         options={"output_format": "default", "auto_approve": "false"},
     )
 
@@ -547,12 +641,10 @@ def default_config() -> AutoForgeConfig:
         "review_round_1": _opencode_profile("review_round_1", "openai/gpt-5.6-luna", "high"),
         "review_round_2_5": _opencode_profile("review_round_2_5", "openai/gpt-5.6-terra", "high"),
         "review_round_6_plus": _opencode_profile(
-            "review_round_6_plus", "openai/gpt-5.6-sol", "medium", timeout=1200
+            "review_round_6_plus", "openai/gpt-5.6-sol", "medium"
         ),
-        "replan_reexecute": _opencode_profile(
-            "replan_reexecute", "openai/gpt-5.6-terra", "high", timeout=3600
-        ),
-        "update_epic": _opencode_profile("update_epic", "openai/gpt-5.6-sol", "high", timeout=1200),
+        "replan_reexecute": _opencode_profile("replan_reexecute", "openai/gpt-5.6-terra", "high"),
+        "update_epic": _opencode_profile("update_epic", "openai/gpt-5.6-sol", "high"),
     }
     return AutoForgeConfig(profiles=profiles)
 
@@ -567,8 +659,6 @@ def validate_profile(profile: ProfileConfig) -> None:
         )
     if profile.provider != "scripted" and not profile.model:
         raise ConfigurationError(f"profile {profile.name!r}: 'model' must be set")
-    if profile.timeout_seconds <= 0:
-        raise ConfigurationError(f"profile {profile.name!r}: timeout_seconds must be > 0")
     from .providers import provider_for
 
     provider_for(profile).validate_profile(profile)
@@ -584,6 +674,16 @@ def validate_required_profiles(cfg: AutoForgeConfig, names: list[str]) -> None:
         )
     for n in names:
         validate_profile(cfg.profiles[n])
+        cfg.agent_limits(cfg.profiles[n])
+
+
+def _check_limit(value: int, where: str, key: str) -> None:
+    """A limit in seconds is > 0 and within the executor's backstop."""
+    if not 0 < value <= MAX_DEADLINE_SECONDS:
+        raise ConfigurationError(
+            f"{where}: {key!r} must be > 0 and <= {MAX_DEADLINE_SECONDS} (one week), "
+            f"got {value} (a non-positive value would disable the limit entirely)"
+        )
 
 
 # -- file loading ----------------------------------------------------------
@@ -734,6 +834,15 @@ def _as_int(raw: object, source: str, key: str) -> int:
     raise ConfigurationError(f"{source}: {key!r} must be an integer, got {raw!r}")
 
 
+def _optional_limit(raw: object, source: str, key: str) -> int | None:
+    """A limit in seconds, or ``None`` for ``null``."""
+    if raw is None:
+        return None
+    value = _as_int(raw, source, key)
+    _check_limit(value, source, key)
+    return value
+
+
 def _reject_unknown_keys(mapping: dict, known: tuple[str, ...], source: str, label: str) -> None:
     """Fail on any key of ``mapping`` that the loader would not read.
 
@@ -799,6 +908,16 @@ REMOVED_EXECUTION_KEYS = {
         "'safety.allow_merge' only. Remove the key from 'execution' (moving it to "
         "'safety' if you meant to open the gate)"
     ),
+    # One wall-clock value used to cover agents and controller-run commands
+    # alike; agents now have an idle limit (#193) and commands keep theirs.
+    "default_timeout_seconds": (
+        "'execution.default_timeout_seconds' is no longer supported. Agents now run "
+        "under 'execution.default_idle_timeout_seconds' (killed only after making no "
+        "progress for that long; default 900) and an optional wall-clock ceiling "
+        "'execution.default_max_runtime_seconds'; pre-merge verification and LOCAL "
+        "validation commands run under 'execution.command_timeout_seconds' (default "
+        "1800). Replace the key with the ones you need"
+    ),
 }
 
 
@@ -814,21 +933,19 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
     if "prompt_version" in data:
         base.prompt_version = str(data["prompt_version"])
     exe = _section(data, "execution", source, EXECUTION_KEYS, removed=REMOVED_EXECUTION_KEYS)
-    if "default_timeout_seconds" in exe:
-        timeout = _as_int(
-            exe["default_timeout_seconds"], source, "execution.default_timeout_seconds"
+    # The executor treats a non-positive wall-clock timeout as "no timeout at
+    # all", and an unbounded subprocess would hold the repository lock
+    # forever, so every limit is > 0 (and within the executor's backstop).
+    # Only the agents' ceiling may be absent (null).
+    for key in ("default_idle_timeout_seconds", "command_timeout_seconds"):
+        if key in exe:
+            value = _as_int(exe[key], source, f"execution.{key}")
+            _check_limit(value, source, f"execution.{key}")
+            setattr(base.execution, key, value)
+    if "default_max_runtime_seconds" in exe:
+        base.execution.default_max_runtime_seconds = _optional_limit(
+            exe["default_max_runtime_seconds"], source, "execution.default_max_runtime_seconds"
         )
-        if timeout <= 0:
-            # The executor treats a non-positive timeout as "no timeout at
-            # all", and this value is what controller-owned work (a LOCAL
-            # validation command, a profile that does not override it) runs
-            # under. An unbounded subprocess would hold the repository lock
-            # forever, so the bound is required rather than optional.
-            raise ConfigurationError(
-                f"{source}: 'execution.default_timeout_seconds' must be > 0, got {timeout} "
-                "(a non-positive value would disable the timeout entirely)"
-            )
-        base.execution.default_timeout_seconds = timeout
     if "max_correction_attempts" in exe:
         base.execution.max_correction_attempts = _as_int(
             exe["max_correction_attempts"], source, "execution.max_correction_attempts"
@@ -1013,7 +1130,20 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
             )
         if not isinstance(p, dict):
             raise ConfigurationError(f"{source}: profile {name!r} must be a mapping")
+        for old_key, message in REMOVED_PROFILE_KEYS.items():
+            if old_key in p:
+                raise ConfigurationError(
+                    f"{source}: profiles.{name}: "
+                    + message.format(idle=base.execution.default_idle_timeout_seconds)
+                )
         _reject_unknown_keys(p, PROFILE_KEYS, source, f"profiles.{name}")
+        # Typed here, range-checked when the profile is validated: a config
+        # may carry profiles a given run never reaches (``validate_profile``).
+        limits = {
+            key: None if p[key] is None else _as_int(p[key], source, f"profiles.{name}.{key}")
+            for key in ("idle_timeout_seconds", "max_runtime_seconds")
+            if key in p
+        }
         cur = base.profiles.get(name)
         if cur is not None and "provider" in p and str(p["provider"]) != cur.provider:
             # A different provider is a different CLI: nothing the default
@@ -1030,10 +1160,8 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
                 cur.command = str(p["command"])
             if "extra_args" in p:
                 cur.extra_args = [str(a) for a in (p["extra_args"] or [])]
-            if "timeout_seconds" in p:
-                cur.timeout_seconds = _as_int(
-                    p["timeout_seconds"], source, f"profiles.{name}.timeout_seconds"
-                )
+            for key, limit in limits.items():
+                setattr(cur, key, limit)
             if "options" in p:
                 cur.options.update(_as_options(p["options"], source, name))
         else:
@@ -1046,11 +1174,8 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
                 effort=str(p.get("effort", "high")),
                 command=str(p.get("command", "")),
                 extra_args=[str(a) for a in (p.get("extra_args") or [])],
-                timeout_seconds=_as_int(
-                    p.get("timeout_seconds", base.execution.default_timeout_seconds),
-                    source,
-                    f"profiles.{name}.timeout_seconds",
-                ),
+                idle_timeout_seconds=limits.get("idle_timeout_seconds"),
+                max_runtime_seconds=limits.get("max_runtime_seconds"),
                 options=_as_options(p.get("options"), source, name),
             )
     return base

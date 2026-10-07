@@ -76,6 +76,25 @@ High-priority coverage includes:
   deadline (waiting into it or starting past it) after the child's exit
   settles the group with the exit grace and returns the rest, the child's
   status kept and no timeout reported
+- agent limits (#193), through `execute()` and the duplex handle with short
+  real subprocesses: a child that keeps writing, on stdout or on stderr, for
+  longer than the idle timeout is not killed; a silent child is killed at
+  the idle timeout with its whole group (`timeout_limit == "idle"`,
+  `last_activity_at` unset); a child that goes silent after writing is
+  killed one idle timeout after its last output; an active child is killed
+  at `max_runtime` when a ceiling is set; a limit out of range is refused
+  before the spawn; and the deadline arithmetic on a fake clock (first due
+  wins, a tie goes to the ceiling, a pinned deadline is not moved by
+  output); a wind-down lets a limit fall due without a kill and kills that
+  much later, and a child that exits within it is not a timeout. The same
+  cases cross the Claude stream and a fake Pi; Pi's `abort` goes out no
+  earlier than the limit, a Pi silent for most of its idle limit is not cut
+  short, and a protocol failure followed by continued output is still
+  killed by its pinned deadline. The engine names the limit and the last
+  activity in the error and in `execution.json`, a text-mode Claude
+  profile without a ceiling is never launched, and configuration rejects
+  the legacy `timeout_seconds` keys by name, out-of-range limits and that
+  profile; dry-run and `doctor` show both values
 - bounded capture: a stream past the bound keeps its head and tail, the
   retained size honours a bound smaller than one pipe read, and memory stays
   at the bound plus a constant under one-byte reads

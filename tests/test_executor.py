@@ -127,6 +127,175 @@ def test_timeout_kills_process_tree():
     assert res.leftovers == ""
 
 
+# -- idle timeout and maximum runtime (#193) ------------------------------------
+# Writes ``count`` lines ``period`` seconds apart on the named stream, then
+# exits 0: active for count * period seconds, never silent for longer than
+# ``period``.
+_TICKER = (
+    "import sys, time\n"
+    "stream = getattr(sys, sys.argv[1])\n"
+    "for n in range(int(sys.argv[2])):\n"
+    "    stream.write(f'{n}\\n'); stream.flush(); time.sleep(float(sys.argv[3]))\n"
+)
+
+
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+def test_a_child_that_keeps_writing_outlives_its_idle_timeout(stream):
+    """Output on either stream is progress: a child active for 1.6s under a
+    0.6s idle limit is never killed, and its last output is recorded."""
+    started = time.monotonic()
+    res = execute(
+        ExecutionRequest(
+            command=[PY, "-c", _TICKER, stream, "8", "0.2"],
+            timeout_seconds=30,
+            idle_timeout_seconds=0.6,
+        )
+    )
+    assert res.ok and not res.timed_out and res.timeout_limit == ""
+    assert time.monotonic() - started >= 1.6
+    assert getattr(res, stream) == "".join(f"{n}\n" for n in range(8))
+    assert res.last_activity_at is not None
+    assert res.started_at <= res.last_activity_at <= res.finished_at
+
+
+def test_a_silent_child_is_killed_at_its_idle_timeout():
+    started = time.monotonic()
+    res = execute(
+        ExecutionRequest(
+            command=[PY, "-c", "import time; time.sleep(30)"],
+            timeout_seconds=30,
+            idle_timeout_seconds=0.5,
+        )
+    )
+    elapsed = time.monotonic() - started
+    assert res.timed_out and res.exit_code == -1 and res.timeout_limit == executor.LIMIT_IDLE
+    assert res.last_activity_at is None  # it never wrote anything
+    assert 0.5 <= elapsed < 10
+    assert res.leftovers == ""
+    with pytest.raises(ExecutionError, match=r"command timed out \(idle limit\)"):
+        res.raise_if_failed()
+
+
+def test_the_idle_timeout_counts_from_the_last_output():
+    """A child that writes for a while and then goes silent is killed one
+    idle limit after its last output, not one idle limit after the spawn."""
+    code = (
+        "import time\n"
+        "for n in range(4):\n"
+        "    print(n, flush=True); time.sleep(0.3)\n"
+        "time.sleep(30)\n"
+    )
+    started = time.monotonic()
+    res = execute(
+        ExecutionRequest(command=[PY, "-c", code], timeout_seconds=30, idle_timeout_seconds=0.6)
+    )
+    assert res.timed_out and res.timeout_limit == executor.LIMIT_IDLE
+    assert time.monotonic() - started >= 0.9 + 0.6
+    assert res.stdout == "0\n1\n2\n3\n" and res.last_activity_at is not None
+
+
+def test_the_maximum_runtime_kills_a_child_that_keeps_writing():
+    started = time.monotonic()
+    res = execute(
+        ExecutionRequest(
+            command=[PY, "-c", _TICKER, "stdout", "1000", "0.05"],
+            timeout_seconds=1,
+            idle_timeout_seconds=5,
+        )
+    )
+    assert res.timed_out and res.timeout_limit == executor.LIMIT_MAX_RUNTIME
+    assert 1 <= time.monotonic() - started < 10
+    assert res.last_activity_at is not None
+    with pytest.raises(ExecutionError, match=r"command timed out \(max_runtime limit\)"):
+        res.raise_if_failed()
+
+
+def test_an_idle_timeout_kills_the_whole_group():
+    """The idle kill is the same group kill as a wall-clock one (ADR 0002)."""
+    code = (
+        "import subprocess, sys, time\n"
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        "time.sleep(60)\n"
+    )
+    res = execute(
+        ExecutionRequest(command=[PY, "-c", code], timeout_seconds=30, idle_timeout_seconds=0.5)
+    )
+    assert res.timed_out and res.timeout_limit == executor.LIMIT_IDLE
+    assert not (res.group_survived_kill or res.capture_abandoned)
+
+
+@pytest.mark.parametrize(
+    "value", [0, -1, float("nan"), float("inf"), executor.MAX_DEADLINE_SECONDS + 1]
+)
+def test_an_invalid_idle_timeout_is_refused_before_spawning(tmp_path, value):
+    marker = tmp_path / "ran"
+    with pytest.raises(ExecutionError, match="idle_timeout_seconds"):
+        execute(
+            ExecutionRequest(
+                command=[PY, "-c", f"open({str(marker)!r}, 'w').close()"],
+                timeout_seconds=30,
+                idle_timeout_seconds=value,
+            )
+        )
+    assert not marker.exists()
+
+
+class _FakeClock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def time(self) -> float:
+        return 1_700_000_000.0 + self.now
+
+
+def test_limits_take_whichever_deadline_is_due_first(monkeypatch):
+    clock = _FakeClock()
+    monkeypatch.setattr(executor, "time", clock)
+    limits = executor._Limits(idle=10, ceiling=25)
+    assert (limits.deadline(), limits.limit()) == (1010.0, executor.LIMIT_IDLE)
+    clock.now = 1008.0
+    limits.touch()  # output moves the idle deadline, never the ceiling
+    assert (limits.deadline(), limits.limit()) == (1018.0, executor.LIMIT_IDLE)
+    clock.now = 1017.0
+    limits.touch()
+    assert (limits.deadline(), limits.limit()) == (1025.0, executor.LIMIT_MAX_RUNTIME)
+    assert not limits.expired()
+    clock.now = 1025.0
+    assert limits.expired()
+    assert limits.last_activity_at() == "2023-11-14T22:30:17+00:00"
+
+
+def test_limits_on_a_tie_name_the_maximum_runtime(monkeypatch):
+    clock = _FakeClock()
+    monkeypatch.setattr(executor, "time", clock)
+    limits = executor._Limits(idle=10, ceiling=10)
+    assert (limits.deadline(), limits.limit()) == (1010.0, executor.LIMIT_MAX_RUNTIME)
+
+
+def test_limits_without_either_limit_have_no_deadline(monkeypatch):
+    clock = _FakeClock()
+    monkeypatch.setattr(executor, "time", clock)
+    limits = executor._Limits(idle=None, ceiling=None)
+    assert limits.deadline() is None and limits.limit() == "" and not limits.expired()
+    assert limits.last_activity_at() is None
+
+
+def test_a_pinned_deadline_ignores_later_output(monkeypatch):
+    clock = _FakeClock()
+    monkeypatch.setattr(executor, "time", clock)
+    limits = executor._Limits(idle=10, ceiling=None)
+    clock.now = 1005.0
+    limits.pin()
+    clock.now = 1009.0
+    limits.touch()
+    assert (limits.deadline(), limits.limit()) == (1010.0, executor.LIMIT_IDLE)
+    clock.now = 1010.0
+    assert limits.expired()
+
+
 # A child that spawns a descendant which inherits stdout/stderr, prints the
 # descendant's pid and exits with the requested status; the descendant sleeps
 # far past any timeout used here. ``setsid`` makes it leave the child's
