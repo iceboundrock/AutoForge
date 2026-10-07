@@ -1,5 +1,6 @@
 """Executor: real subprocesses (python -c) — argv safety, timeout, exit codes."""
 
+import gc
 import hashlib
 import os
 import random
@@ -453,11 +454,23 @@ def _open_fds() -> set[str]:
     return set(os.listdir("/dev/fd"))
 
 
+def _baseline_fds() -> set[str]:
+    """The descriptors open before a test's work, earlier tests' garbage
+    freed first. Objects an earlier test left in reference cycles can hold
+    descriptors (an engine's state directory), and the cyclic collector frees
+    them at whatever allocation it next runs on: during the work, that closes
+    descriptors the baseline counted. The look after the work collects
+    nothing, so what the work leaves held by a cycle still counts as left
+    open."""
+    gc.collect()
+    return _open_fds()
+
+
 def test_stdin_data_leaves_no_descriptor_behind():
     """The feeder holds a read end of the child's stdin past the child's
     exit; it is released with the rest, whether the child read everything,
     read nothing or the spawn failed."""
-    before = _open_fds()
+    before = _baseline_fds()
     for command in ([PY, "-c", _DIGEST_STDIN], [PY, "-c", "pass"]):
         execute(ExecutionRequest(command=command, stdin_data=b"z" * 200_000, timeout_seconds=30))
     with pytest.raises(ExecutionError, match="not found"):
@@ -486,7 +499,7 @@ def test_a_stdin_pipe_that_cannot_be_opened_is_a_launch_failure(monkeypatch, fai
             raise OSError(24, "Too many open files")
         return real_pipe()
 
-    before = _open_fds()
+    before = _baseline_fds()
     monkeypatch.setattr(executor.os, "pipe", pipe)
     with pytest.raises(ExecutionError, match="failed to spawn .*Too many open files"):
         execute(ExecutionRequest(command=[PY, "-c", "pass"], stdin_data=b"z", timeout_seconds=5))
@@ -495,39 +508,97 @@ def test_a_stdin_pipe_that_cannot_be_opened_is_a_launch_failure(monkeypatch, fai
     assert _open_fds() == before
 
 
+def _refuse_setup_step(monkeypatch, step: str, thread: str, error: BaseException) -> list[str]:
+    """Make one setup step of the executor thread named ``thread`` raise
+    ``error``, once; the returned list records the refusal.
+
+    ``start`` refuses the thread's start; ``pipe`` the wake pipe a capture
+    reader opens as it starts, before its thread; ``buffer`` the capture
+    buffer a reader allocates while it is built."""
+    refused: list[str] = []
+    real_thread_start, real_drain_start = threading.Thread.start, executor._PipeDrain.start
+    real_pipe, real_buffer = os.pipe, executor._BoundedBuffer.__init__
+    starting: list[str] = []
+
+    def refuse(name: str) -> None:
+        if name == thread and not refused:
+            refused.append(name)
+            raise error
+
+    def thread_start(self):
+        refuse(self.name)
+        return real_thread_start(self)
+
+    def drain_start(self):
+        starting.append(self.name)
+        try:
+            return real_drain_start(self)
+        finally:
+            starting.pop()
+
+    def pipe():
+        if starting:
+            refuse(starting[-1])
+        return real_pipe()
+
+    def buffer(self, limit, name):
+        refuse(f"autoforge-capture-{name}")
+        return real_buffer(self, limit, name)
+
+    if step == "start":
+        monkeypatch.setattr(threading.Thread, "start", thread_start)
+    elif step == "pipe":
+        monkeypatch.setattr(executor._PipeDrain, "start", drain_start)
+        monkeypatch.setattr(executor.os, "pipe", pipe)
+    elif step == "buffer":
+        monkeypatch.setattr(executor._BoundedBuffer, "__init__", buffer)
+    else:
+        raise AssertionError(f"unknown setup step {step!r}")
+    return refused
+
+
 @pytest.mark.parametrize(
-    ("step", "nth", "error"),
+    "contain",
     [
-        ("feeder-start", 1, RuntimeError("can't start new thread")),
-        ("reader-start", 1, RuntimeError("can't start new thread")),
-        ("reader-start", 2, RuntimeError("can't start new thread")),
-        ("reader-init", 2, OSError(24, "Too many open files")),
+        False,
+        pytest.param(
+            True,
+            marks=pytest.mark.skipif(
+                not sys.platform.startswith("linux"), reason="the child subreaper is Linux-only"
+            ),
+        ),
     ],
-    ids=["stdin-feeder", "stdout-reader", "stderr-reader", "stderr-reader-pipe"],
+    ids=["plain", "contained"],
 )
-def test_a_setup_failure_after_the_spawn_kills_the_child(monkeypatch, step, nth, error):
-    """The PR #188 review: the threads that feed and read the child start
-    after it is spawned. One the system refuses (a thread or descriptor
-    limit) fails the launch as an ExecutionError, and the child, which would
-    otherwise sleep on, is killed and reaped first; what did start is ended
-    and nothing is left open."""
-    calls = 0
-
-    def refuse_nth(real):
-        def call(*args, **kwargs):
-            nonlocal calls
-            calls += 1
-            if calls == nth:
-                raise error
-            return real(*args, **kwargs)
-
-        return call
-
-    target = {
-        "feeder-start": (executor._StdinFeeder, "start", threading.Thread.start),
-        "reader-start": (executor._BoundedReader, "start", threading.Thread.start),
-        "reader-init": (executor._BoundedReader, "__init__", executor._BoundedReader.__init__),
-    }[step]
+@pytest.mark.parametrize(
+    ("step", "thread", "error"),
+    [
+        ("start", "autoforge-feed-stdin", RuntimeError("can't start new thread")),
+        ("start", "autoforge-capture-stdout", RuntimeError("can't start new thread")),
+        ("start", "autoforge-capture-stderr", RuntimeError("can't start new thread")),
+        ("pipe", "autoforge-capture-stderr", OSError(24, "Too many open files")),
+        ("buffer", "autoforge-capture-stderr", MemoryError()),
+        ("start", "autoforge-capture-stdout", KeyboardInterrupt()),
+    ],
+    ids=[
+        "stdin-feeder",
+        "stdout-reader",
+        "stderr-reader",
+        "stderr-reader-pipe",
+        "stderr-reader-buffer",
+        "interrupted",
+    ],
+)
+def test_a_setup_failure_after_the_spawn_kills_the_child(monkeypatch, step, thread, error, contain):
+    """The PR #188 review: the threads that feed and read the child are set
+    up after it is spawned. A step the system refuses (a thread or
+    descriptor limit) fails the launch as an ExecutionError; Ctrl-C
+    meanwhile, or an allocation that fails while a reader is built, is
+    raised as itself. Either way the child, which would otherwise sleep on,
+    is killed and reaped first; what did start is ended and nothing is left
+    open, the stdout reader's wake pipe included when the stderr reader
+    fails. Contained, the containment is released with its reaper thread
+    (PR #196 reviews)."""
     spawned = []
     real_spawn = executor._spawn
 
@@ -535,17 +606,22 @@ def test_a_setup_failure_after_the_spawn_kills_the_child(monkeypatch, step, nth,
         spawned.append(real_spawn(*args, **kwargs))
         return spawned[-1]
 
-    fds, threads = _open_fds(), set(threading.enumerate())
+    fds, threads = _baseline_fds(), set(threading.enumerate())
     monkeypatch.setattr(executor, "_spawn", spawn)
-    monkeypatch.setattr(target[0], target[1], refuse_nth(target[2]))
+    refused = _refuse_setup_step(monkeypatch, step, thread, error)
+    if isinstance(error, (OSError, RuntimeError)):
+        raised = pytest.raises(ExecutionError, match=f"failed to start .*{error.args[-1]}")
+    else:
+        raised = pytest.raises(type(error))
     started = time.monotonic()
     try:
-        with pytest.raises(ExecutionError, match=f"failed to start .*{error.args[-1]}"):
+        with raised:
             execute(
                 ExecutionRequest(
                     command=[PY, "-c", "import time; time.sleep(60)"],
                     stdin_data=b"z" * 200_000,
                     timeout_seconds=30,
+                    contain_orphans=contain,
                 )
             )
         (proc,) = spawned
@@ -559,9 +635,12 @@ def test_a_setup_failure_after_the_spawn_kills_the_child(monkeypatch, step, nth,
                 proc.wait()
     assert time.monotonic() - started < 10
     monkeypatch.undo()
-    assert calls == nth
+    assert refused == [thread]
     assert set(threading.enumerate()) == threads
     assert _open_fds() == fds
+    assert not executor._CONTAINMENT_LOCK.locked()
+    if contain:
+        assert _subreaper() == 0
 
 
 def test_cwd_is_applied(tmp_path):
@@ -1030,6 +1109,172 @@ def test_contained_clean_run_reports_nothing_and_leaves_other_children_alone():
     finally:
         before.kill()
         before.wait()
+
+
+# A child that orphans ``argv[1]`` short-lived processes the way a test suite
+# run by an agent does: each is started by an intermediary that exits at once,
+# so it is re-parented to the controller and dies as the controller's child;
+# every other one leaves the child's group first (``setsid``). One more orphan
+# lives on, detached. The child writes that one's pid to ``argv[2]``, runs on
+# until ``argv[3]`` exists, and exits 7.
+_ORPHAN_FACTORY = (
+    "import os, sys, time\n"
+    "def orphan(seconds, detach):\n"
+    "    r, w = os.pipe()\n"
+    "    if os.fork() == 0:\n"
+    "        pid = os.fork()\n"
+    "        if pid == 0:\n"
+    "            os.close(r); os.close(w)\n"
+    "            if detach:\n"
+    "                os.setsid()\n"
+    "            null = os.open(os.devnull, os.O_RDWR)\n"
+    "            for fd in (0, 1, 2):\n"
+    "                os.dup2(null, fd)\n"
+    "            time.sleep(seconds)\n"
+    "            os._exit(0)\n"
+    "        os.write(w, str(pid).encode())\n"
+    "        os._exit(0)\n"
+    "    os.close(w)\n"
+    "    os.wait()\n"
+    "    pid = int(os.read(r, 32))\n"
+    "    os.close(r)\n"
+    "    return pid\n"
+    "for i in range(int(sys.argv[1])):\n"
+    "    orphan(0.01, detach=i % 2 == 1)\n"
+    "kept = orphan(60, detach=True)\n"
+    "with open(sys.argv[2] + '.tmp', 'w') as fh:\n"
+    "    fh.write(str(kept))\n"
+    "os.rename(sys.argv[2] + '.tmp', sys.argv[2])\n"
+    "deadline = time.monotonic() + 30\n"
+    "while not os.path.exists(sys.argv[3]) and time.monotonic() < deadline:\n"
+    "    time.sleep(0.02)\n"
+    "sys.exit(7)\n"
+)
+
+
+def _new_zombies(before: frozenset[tuple[int, int]]) -> int:
+    """This process's dead, unreaped children that were not there ``before``."""
+    return sum(1 for key, zombie in executor._children().items() if zombie and key not in before)
+
+
+def _running(pid: int) -> bool:
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
+    except OSError:
+        return False
+
+
+@_linux_only
+def test_contained_dead_orphans_are_reaped_while_the_child_runs(monkeypatch, tmp_path):
+    """The controller is the orphans' parent for the whole invocation, so it
+    reaps them as they die, not only once the child has exited (#191). A long
+    agent run whose tools orphan thousands of short-lived processes (a test
+    suite) otherwise piles up zombies, which count against the session's
+    pids.max until no fork succeeds and the agent itself aborts. Reaping
+    signals nothing: a live orphan is left alone until the teardown kills it.
+    The child's own exit status is never taken by the reaper, and the reaper
+    ends with the invocation."""
+    monkeypatch.setattr(executor, "_EXIT_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    kept_file, go = tmp_path / "kept", tmp_path / "go"
+    before = frozenset(executor._children())
+    seen: list[int] = []
+    kept: list[int] = []
+    kept_ran = []
+
+    def watch() -> None:
+        deadline = time.monotonic() + 20
+        while not kept_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if kept_file.exists():
+            kept.append(int(kept_file.read_text()))
+        # Every short-lived orphan has died and the child still runs (it
+        # waits for ``go``).
+        settle = time.monotonic() + 3
+        while True:
+            seen.append(_new_zombies(before))
+            if seen[-1] == 0 or time.monotonic() >= settle:
+                break
+            time.sleep(0.05)
+        kept_ran.extend(_running(pid) for pid in kept)
+        go.touch()
+
+    watcher = threading.Thread(target=watch)
+    watcher.start()
+    try:
+        res = execute(
+            ExecutionRequest(
+                command=[PY, "-c", _ORPHAN_FACTORY, "200", str(kept_file), str(go)],
+                timeout_seconds=30,
+                contain_orphans=True,
+            )
+        )
+    finally:
+        go.touch()
+        watcher.join()
+    try:
+        assert res.exit_code == 7 and not res.timed_out
+        assert seen and seen[-1] == 0, f"dead orphans left unreaped while the child ran: {seen}"
+        assert kept_ran == [True], "a live orphan was killed while the child ran"
+        # Only the orphan still alive at the end was killed.
+        assert res.orphans_killed and not res.orphan_survived_kill
+        assert not (res.descendants_killed or res.group_survived_kill or res.capture_abandoned)
+        assert _gone(kept[0], within=1)
+        assert _new_zombies(before) == 0
+        assert _subreaper() == 0
+        assert not any(thread.name == "autoforge-reaper" for thread in threading.enumerate())
+    finally:
+        for pid in kept:
+            _kill_quietly(pid)
+
+
+@_linux_only
+def test_contained_reaper_leaves_a_pre_existing_childs_status_to_its_owner():
+    """A child the controller already had when the invocation began is not
+    one of its orphans: when it dies meanwhile, its exit status is left for
+    whoever started it."""
+    import subprocess
+
+    before = subprocess.Popen([PY, "-c", "import time; time.sleep(0.2); raise SystemExit(5)"])
+    try:
+        res = execute(
+            ExecutionRequest(
+                command=[PY, "-c", "import time; time.sleep(1)"],
+                timeout_seconds=30,
+                contain_orphans=True,
+            )
+        )
+        assert res.ok and res.leftovers == ""
+        assert before.wait(timeout=10) == 5
+    finally:
+        before.kill()
+        before.wait()
+
+
+@_linux_only
+def test_a_reaper_that_cannot_start_refuses_the_launch_before_the_spawn(monkeypatch, tmp_path):
+    """A reaper thread the system refuses (a thread limit) fails the launch as
+    an ExecutionError before anything is spawned, with the subreaper setting
+    restored and the next contained invocation free to run."""
+    real_start = threading.Thread.start
+
+    def refuse_the_reaper(self):
+        if self.name == "autoforge-reaper":
+            raise RuntimeError("can't start new thread")
+        return real_start(self)
+
+    spawned = tmp_path / "spawned"
+    with monkeypatch.context() as patch:
+        patch.setattr(threading.Thread, "start", refuse_the_reaper)
+        with pytest.raises(ExecutionError, match="failed to start the orphan reaper"):
+            execute(
+                ExecutionRequest(
+                    command=[PY, "-c", f"open({str(spawned)!r}, 'w')"], contain_orphans=True
+                )
+            )
+    assert not spawned.exists(), "the command ran without its reaper"
+    assert _subreaper() == 0
+    assert execute(ExecutionRequest(command=[PY, "-c", "pass"], contain_orphans=True)).ok
 
 
 @_linux_only

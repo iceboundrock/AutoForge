@@ -11,6 +11,7 @@ import json
 import os
 import signal
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -32,6 +33,8 @@ from autoforge.executor_duplex import (
     _LineFramer,
     start_duplex,
 )
+
+from .test_executor import _baseline_fds, _open_fds, _refuse_setup_step
 
 PY = sys.executable
 
@@ -632,6 +635,60 @@ def test_contained_orphan_is_killed_when_finish_is_interrupted(monkeypatch):
         _kill_quietly(pid)
 
 
+# Orphans ``argv[1]`` short-lived processes (each started by an intermediary
+# that exits at once, so it dies as the controller's child; every other one
+# leaves the child's group first), says so, runs on until stdin EOF, and
+# exits 7.
+_ORPHAN_FACTORY = (
+    "import os, sys, time\n"
+    "for i in range(int(sys.argv[1])):\n"
+    "    if os.fork() == 0:\n"
+    "        if os.fork() == 0:\n"
+    "            if i % 2:\n"
+    "                os.setsid()\n"
+    "            time.sleep(0.01)\n"
+    "            os._exit(0)\n"
+    "        os._exit(0)\n"
+    "    os.wait()\n"
+    "print('forked', flush=True)\n"
+    "sys.stdin.buffer.read()\n"
+    "sys.exit(7)\n"
+)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux-only subreaper")
+def test_contained_dead_orphans_are_reaped_while_the_child_runs():
+    """Through the handle as through ``execute()`` (#191): what the child
+    orphans is reaped as it dies, while the child still runs, so zombies
+    cannot pile up against the session's pids.max over a long conversation;
+    the child's own exit status is kept."""
+    previous = _subreaper()
+    before = frozenset(executor._children())
+
+    def new_zombies() -> int:
+        return sum(
+            1 for key, zombie in executor._children().items() if zombie and key not in before
+        )
+
+    with start_duplex(
+        DuplexRequest(
+            command=[PY, "-c", _ORPHAN_FACTORY, "200"], deadline_seconds=30, contain_orphans=True
+        )
+    ) as child:
+        assert child.read_line(timeout=20) == Record(b"forked")
+        settle = time.monotonic() + 3
+        while new_zombies() and time.monotonic() < settle:
+            time.sleep(0.05)
+        left = new_zombies()
+        child.close_stdin()
+        res = child.finish()
+    assert left == 0, f"{left} dead orphans were left unreaped while the child ran"
+    assert res.exit_code == 7 and not res.timed_out
+    assert not (res.orphans_killed or res.orphan_survived_kill) and res.leftovers == ""
+    assert new_zombies() == 0
+    assert _subreaper() == previous
+
+
 def _subreaper() -> int:
     value = ctypes.c_int(0)
     ctypes.CDLL(None, use_errno=True).prctl(37, ctypes.byref(value), 0, 0, 0)
@@ -769,6 +826,113 @@ def test_cwd_is_applied(tmp_path):
 def test_missing_binary_raises_execution_error():
     with pytest.raises(ExecutionError, match="not found"):
         start_duplex(DuplexRequest(command=["autoforge-definitely-missing-binary-xyz"]))
+
+
+@pytest.mark.parametrize(
+    "contain",
+    [
+        False,
+        pytest.param(
+            True,
+            marks=pytest.mark.skipif(
+                not sys.platform.startswith("linux"), reason="Linux-only subreaper"
+            ),
+        ),
+    ],
+    ids=["plain", "contained"],
+)
+@pytest.mark.parametrize(
+    ("step", "name", "error"),
+    [
+        ("start", "stdout", RuntimeError("can't start new thread")),
+        ("start", "stderr", RuntimeError("can't start new thread")),
+        ("pipe", "stderr", OSError(24, "Too many open files")),
+        ("buffer", "stderr", MemoryError()),
+        ("lock", "handle", MemoryError()),
+        ("lock", "handle", KeyboardInterrupt()),
+    ],
+    ids=[
+        "stdout-reader",
+        "stderr-reader",
+        "stderr-reader-pipe",
+        "stderr-reader-buffer",
+        "handle",
+        "handle-interrupted",
+    ],
+)
+def test_a_setup_failure_after_the_spawn_leaves_nothing_behind(
+    monkeypatch, step, name, error, contain
+):
+    """#190 and the PR #196 reviews: the handle is built, its readers are
+    built, and their wake pipes open and threads start, after the child is
+    spawned and before the caller has a handle to tear down. A step the
+    system refuses (a thread or descriptor limit) fails the launch as an
+    ExecutionError; an allocation that fails, or Ctrl-C, while the handle or
+    a reader is still being built is raised as itself. Either way the child,
+    which would otherwise sleep on, is first killed and reaped; the
+    containment is released with its reaper thread, so the next contained
+    invocation runs; and no thread or descriptor is left open, a reader's
+    wake pipe included."""
+    real_rlock = threading.RLock
+
+    def rlock(*args, **kwargs):
+        # The first lock taken after the spawn is the handle's own.
+        if spawned and not refused:
+            refused.append(name)
+            raise error
+        return real_rlock(*args, **kwargs)
+
+    spawned = []
+    real_spawn = executor_duplex._spawn
+
+    def spawn(*args, **kwargs):
+        spawned.append(real_spawn(*args, **kwargs))
+        return spawned[-1]
+
+    previous = _subreaper() if contain else None
+    fds, threads = _baseline_fds(), set(threading.enumerate())
+    monkeypatch.setattr(executor_duplex, "_spawn", spawn)
+    if step == "lock":
+        refused = []
+        monkeypatch.setattr(threading, "RLock", rlock)
+    else:
+        refused = _refuse_setup_step(monkeypatch, step, f"autoforge-capture-{name}", error)
+    if isinstance(error, (OSError, RuntimeError)):
+        raised = pytest.raises(ExecutionError, match=f"failed to start .*{error.args[-1]}")
+    else:
+        raised = pytest.raises(type(error))
+    started = time.monotonic()
+    try:
+        with raised:
+            start_duplex(
+                DuplexRequest(
+                    command=[PY, "-c", "import time; time.sleep(60)"],
+                    deadline_seconds=30,
+                    contain_orphans=contain,
+                )
+            )
+        (proc,) = spawned
+        assert proc.returncode is not None
+        with pytest.raises(ProcessLookupError):
+            os.killpg(proc.pid, 0)
+    finally:
+        for proc in spawned:
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+    assert time.monotonic() - started < 10
+    monkeypatch.undo()
+    assert len(refused) == 1
+    assert set(threading.enumerate()) == threads
+    assert _open_fds() == fds
+    assert not executor._CONTAINMENT_LOCK.locked()
+    if contain:
+        assert _subreaper() == previous
+    with start_duplex(
+        DuplexRequest(command=[PY, "-c", "pass"], deadline_seconds=30, contain_orphans=contain)
+    ) as child:
+        res = child.finish()
+    assert res.exit_code == 0 and res.leftovers == ""
 
 
 @pytest.mark.parametrize(

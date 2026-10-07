@@ -154,7 +154,9 @@ a child subreaper for the invocation, so a detached process whose parent
 died is re-parented to it. Such orphans get the same grace and kill, and
 are reported as `orphans_killed` / `orphan_survived_kill`. Without a
 subreaper the result says `orphans_unchecked`. One contained invocation
-runs per controller process.
+runs per controller process. Orphans that die while the child runs are
+reaped as they die by a reaper thread. Otherwise their zombies would count
+against the session's process limit until no fork succeeds.
 
 `execute()` itself stays one-shot: what the child gets on stdin is fixed
 before the spawn, and nothing the child writes back changes it. By

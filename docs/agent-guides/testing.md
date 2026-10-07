@@ -88,9 +88,13 @@ High-priority coverage includes:
   which the OpenCode adapter turns into a `provider_failure` when the exit
   would otherwise read as success; and no descriptor of the stdin pipe
   outlives the invocation, a failed spawn included
-- setup after the spawn: a feeder or capture thread the system refuses to
-  start (or a capture pipe it refuses to open) kills and reaps the child
-  before the `ExecutionError`, and leaves no thread or descriptor behind
+- setup after the spawn, through `execute()` and the duplex handle: a
+  feeder or capture thread the system refuses to start (or a capture pipe
+  it refuses to open) kills and reaps the child before the
+  `ExecutionError`, and leaves no thread or descriptor behind; so does
+  Ctrl-C, or a failure while a capture reader or the duplex handle itself
+  is built, raised as itself; a contained invocation also releases the
+  containment, its reaper thread included
 
 ### Agent isolation (REMOTE)
 

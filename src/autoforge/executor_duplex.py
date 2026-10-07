@@ -14,7 +14,9 @@ Guarantees:
 
 - the spawn is ``execute()``'s: an argv list, ``cwd``, the allow-listed
   environment plus ``env``, a session (and so a process group) of its own,
-  the terminal never inherited, a spawn failure an :class:`ExecutionError`;
+  the terminal never inherited, a spawn failure an :class:`ExecutionError`,
+  and so is a setup failure after the spawn (the group is killed first and
+  nothing taken for the invocation is kept);
 - stdout is split into records on LF (0x0A) **only**, one trailing CR
   stripped per record; no other byte or Unicode line separator (U+2028,
   U+2029, NUL, VT, FF, NEL) is a boundary. A record longer than
@@ -388,7 +390,11 @@ def start_duplex(req: DuplexRequest) -> DuplexChild:
     """Spawn the child and start draining it; use the result as a context manager.
 
     ``with start_duplex(req) as child: ... result = child.finish()``. The
-    ``with`` guarantees the teardown whatever happens inside it.
+    ``with`` guarantees the teardown whatever happens inside it. A child
+    that cannot be spawned, or whose readers cannot be set up, raises
+    :class:`ExecutionError`; anything else that fails or interrupts the
+    launch after the spawn is raised as itself. Either way the group is
+    killed first.
     """
     _validate(req)
     started = _now()
@@ -406,7 +412,50 @@ def start_duplex(req: DuplexRequest) -> DuplexChild:
         raise
     if contained is not None:
         contained.child = proc.pid
-    return DuplexChild(req, proc, started, contained)
+    # The child is running from here on, and the caller has no handle to
+    # tear down until this returns, so every step from here to the return
+    # runs under one guard, as in ``execute()``: whatever fails or interrupts it
+    # (a thread or descriptor limit, an allocation, Ctrl-C) kills the group
+    # and releases the containment and the pipes before the launch fails,
+    # never leaving the child, the orphan reaper or the subreaper setting
+    # behind.
+    child: DuplexChild | None = None
+    try:
+        try:
+            child = DuplexChild(req, proc, started, contained)
+            child._start()
+        except (OSError, RuntimeError) as exc:
+            raise ExecutionError(f"failed to start {' '.join(req.command)}: {exc}") from exc
+    except BaseException:
+        _abort_start(proc, () if child is None else child._readers, contained)
+        raise
+    return child
+
+
+def _abort_start(
+    proc: subprocess.Popen[bytes],
+    readers: tuple[_PipeDrain, ...],
+    contained: _Containment | None,
+) -> None:
+    """The launch failed after the spawn: kill the group at once and release
+    everything taken so far, since no teardown will run."""
+    # A reader whose thread never started has nothing to stop.
+    started = tuple(reader for reader in readers if reader.ident is not None)
+    try:
+        _terminate_group(proc.pid, proc, started, contained)
+    finally:
+        if contained is not None:
+            contained.release()
+        if proc.stdin is not None:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass  # nothing was written; the fd is closed either way
+        for reader in readers:
+            reader.close()
+        assert proc.stdout is not None and proc.stderr is not None
+        proc.stdout.close()
+        proc.stderr.close()
 
 
 class DuplexChild:
@@ -414,7 +463,8 @@ class DuplexChild:
 
     ``send_line`` and ``read_line`` may be called from different threads;
     writes are serialized, so a record is never interleaved with another.
-    Every call is bounded by the request's deadline.
+    Every call is bounded by the request's deadline. Made by
+    :func:`start_duplex`, which starts it under its launch guard.
     """
 
     def __init__(
@@ -424,7 +474,6 @@ class DuplexChild:
         started: str,
         contained: _Containment | None = None,
     ) -> None:
-        assert proc.stdout is not None and proc.stderr is not None
         self._req = req
         self._contained = contained
         self._proc = proc
@@ -434,21 +483,9 @@ class DuplexChild:
         self._write_lock = threading.RLock()
         self._lifecycle_lock = threading.RLock()
         self._stdin_open = proc.stdin is not None
-        if proc.stdin is not None:
-            os.set_blocking(proc.stdin.fileno(), False)
         self._queue: _RecordQueue | None = None
         self._capture: _BoundedReader | None = None
-        stdout_reader: _PipeDrain
-        if req.stdout_mode is StdoutMode.RECORDS:
-            self._queue = _RecordQueue(req.max_pending_records, req.max_pending_bytes)
-            stdout_reader = _RecordReader(proc.stdout, req.max_record_bytes, self._queue)
-        else:
-            self._capture = _BoundedReader(proc.stdout, req.max_stdout_bytes, "stdout")
-            stdout_reader = self._capture
-        self._stderr = _BoundedReader(proc.stderr, req.max_stderr_bytes, "stderr")
-        self._readers: tuple[_PipeDrain, ...] = (stdout_reader, self._stderr)
-        for reader in self._readers:
-            reader.start()
+        self._readers: tuple[_PipeDrain, ...] = ()
         # Set once the group has been dealt with: killed, or found empty after
         # the child's own exit.
         self._left: _Termination | None = None
@@ -457,6 +494,28 @@ class DuplexChild:
         self._descendants_killed = False
         self._closed = False
         self._result: DuplexResult | None = None
+
+    def _start(self) -> None:
+        """Start draining the child's pipes. A reader takes its wake pipe
+        only as it starts, and each is in ``_readers`` before it starts, so
+        a failure part-way leaves everything taken where
+        :func:`start_duplex`'s guard releases it."""
+        proc, req = self._proc, self._req
+        assert proc.stdout is not None and proc.stderr is not None
+        if proc.stdin is not None:
+            os.set_blocking(proc.stdin.fileno(), False)
+        stdout_reader: _PipeDrain
+        if req.stdout_mode is StdoutMode.RECORDS:
+            self._queue = _RecordQueue(req.max_pending_records, req.max_pending_bytes)
+            stdout_reader = _RecordReader(proc.stdout, req.max_record_bytes, self._queue)
+        else:
+            self._capture = _BoundedReader(proc.stdout, req.max_stdout_bytes, "stdout")
+            stdout_reader = self._capture
+        self._readers = (stdout_reader,)
+        self._stderr = _BoundedReader(proc.stderr, req.max_stderr_bytes, "stderr")
+        self._readers += (self._stderr,)
+        for reader in self._readers:
+            reader.start()
 
     @property
     def pid(self) -> int:

@@ -45,8 +45,10 @@ Safety properties:
   Linux the controller is a child subreaper for the invocation
   (``prctl(PR_SET_CHILD_SUBREAPER)``), so a process that called ``setsid``
   (or was started detached) and whose parent then died is re-parented to the
-  controller instead of to init; at teardown every such orphan is killed
-  (SIGTERM, then SIGKILL, its own process group with it) and reported
+  controller instead of to init; the ones that die while the child runs are
+  reaped as they die, so they cannot pile up as zombies against the
+  session's process limit, and at teardown every orphan still alive is
+  killed (SIGTERM, then SIGKILL, its own process group with it) and reported
   (:attr:`ExecutionResult.orphans_killed`,
   :attr:`ExecutionResult.orphan_survived_kill`). Where no subreaper exists
   the result says the check could not be made
@@ -394,23 +396,38 @@ class _PipeDrain(threading.Thread):
     without it, for a writer nothing here can kill. What a chunk becomes
     (bounded capture here, LF-framed records in ``executor_duplex``) is the
     subclass's.
+
+    Building a reader takes nothing that must be given back: the wake pipe
+    is opened by :meth:`start` and released by :meth:`close`. A launch holds
+    each reader before it starts it, so its cleanup reaches every pipe
+    taken, and a reader that fails while it is built (its buffer cannot be
+    allocated, say) holds nothing for it to reach.
     """
 
     def __init__(self, stream: IO[bytes], name: str) -> None:
         super().__init__(name=f"autoforge-capture-{name}", daemon=True)
         self._fd = stream.fileno()
-        self._wake_r, self._wake_w = os.pipe()
+        # (read end, write end): opened by :meth:`start`, closed by :meth:`close`.
+        self._wake: tuple[int, int] | None = None
         self.error: OSError | None = None
 
+    def start(self) -> None:
+        """Open the wake pipe and start the thread. A thread that cannot be
+        started leaves the pipe open for :meth:`close`."""
+        self._wake = os.pipe()
+        super().start()
+
     def run(self) -> None:
+        assert self._wake is not None  # opened by start() before the thread began
+        wake_r = self._wake[0]
         eof = False
         try:
             with selectors.DefaultSelector() as sel:
                 sel.register(self._fd, selectors.EVENT_READ)
-                sel.register(self._wake_r, selectors.EVENT_READ)
+                sel.register(wake_r, selectors.EVENT_READ)
                 while True:
                     ready = {key.fd for key, _ in sel.select()}
-                    if self._wake_r in ready:
+                    if wake_r in ready:
                         return
                     chunk = os.read(self._fd, _READ_CHUNK_BYTES)
                     if not chunk:
@@ -436,15 +453,20 @@ class _PipeDrain(threading.Thread):
 
     def abandon(self) -> None:
         """Stop reading without EOF; what was read so far is what is captured."""
-        os.write(self._wake_w, b"\0")
+        assert self._wake is not None  # only a started reader is abandoned
+        os.write(self._wake[1], b"\0")
         self.join()
 
     def close(self) -> None:
-        for fd in (self._wake_r, self._wake_w):
+        """Release the wake pipe, if :meth:`start` opened one. Idempotent."""
+        if self._wake is None:
+            return
+        for fd in self._wake:
             try:
                 os.close(fd)
             except OSError:
                 pass
+        self._wake = None
 
 
 class _BoundedReader(_PipeDrain):
@@ -608,6 +630,11 @@ def _group_gone(pgid: int, deadline: float) -> bool:
 # prctl(2) options; Linux only.
 _PR_SET_CHILD_SUBREAPER = 36
 _PR_GET_CHILD_SUBREAPER = 37
+# How often a contained invocation reaps the orphans that died while its
+# child runs. Each zombie holds a pid against the session's pids.max until it
+# is reaped, so this bounds the backlog to what the child's tools can orphan
+# in one interval.
+_REAP_INTERVAL_SECONDS = 0.25
 
 # One contained invocation at a time per controller process: the orphans of
 # an invocation are told apart from the controller's other children by being
@@ -677,9 +704,19 @@ class _Containment:
     Each orphan is signalled with its process group (unless that is the
     controller's own), which reaches what it started in turn; whatever is
     re-parented as its parents die is signalled when it appears. Dead orphans
-    are reaped here, since nothing else waits for them. :meth:`release`
-    restores the previous subreaper setting; an orphan still alive then
-    stays the controller's child, and is reported, not hidden.
+    are reaped here, since nothing else waits for them, and from the start:
+    a reaper thread reaps them every ``_REAP_INTERVAL_SECONDS`` while the
+    child runs. An agent's tools orphan short-lived processes all along (a
+    test suite's helpers, a shell's background jobs), and every zombie
+    holds a pid against the session's ``pids.max``, so over an hour-long
+    run they pile up until no fork in the session succeeds and the agent
+    itself aborts. The reaper never reaps the child (its exit status
+    belongs to its ``Popen``) or a child the controller had before. The
+    first look at the orphans after the child's run (the exit grace, the
+    kill) stops it, so from there the caller's own polling reaps and
+    signals alone. :meth:`release` restores the previous subreaper setting;
+    an orphan still alive then stays the controller's child, and is
+    reported, not hidden.
     """
 
     def __init__(self, prctl: Callable[..., int], previous: int) -> None:
@@ -690,13 +727,18 @@ class _Containment:
         self.found = False
         self._signalled: dict[signal.Signals, set[tuple[int, int]]] = {}
         self._released = False
+        self._stop_reaper = threading.Event()
+        self._reaper = threading.Thread(
+            target=self._reap_until_stopped, name="autoforge-reaper", daemon=True
+        )
 
     @classmethod
     def begin(cls) -> _Containment | None:
         """Start containing; None when this platform has no child subreaper.
 
         Raises :class:`ExecutionError` when another contained invocation is
-        running in this process.
+        running in this process, or the reaper thread cannot be started
+        (nothing has been spawned yet, so nothing is left behind).
         """
         prctl = _prctl()
         if prctl is None:
@@ -717,15 +759,52 @@ class _Containment:
         except BaseException:
             _CONTAINMENT_LOCK.release()
             raise
+        try:
+            contained._reaper.start()
+        except BaseException as exc:
+            contained.release()
+            if isinstance(exc, RuntimeError):
+                raise ExecutionError(f"failed to start the orphan reaper: {exc}") from exc
+            raise
         return contained
+
+    def _reap_until_stopped(self) -> None:
+        """The reaper thread: reap the dead orphans until told to stop."""
+        while not self._stop_reaper.wait(_REAP_INTERVAL_SECONDS):
+            child = self.child
+            if child is None:
+                continue  # not spawned yet: a zombie now could be the child itself
+            try:
+                found = _children()
+            except OSError:
+                continue  # /proc unreadable for a moment; the next pass looks again
+            for key, zombie in found.items():
+                if zombie and key not in self._before and key[0] != child:
+                    try:
+                        os.waitpid(key[0], os.WNOHANG)
+                    except ChildProcessError:
+                        pass
+
+    def _stop_reaping(self) -> None:
+        """Stop the reaper thread and wait for it; from here the caller reaps.
+
+        Only the thread that signals the orphans reaps them from then on, so
+        an orphan it is about to signal cannot be reaped, and its pid reused,
+        in between.
+        """
+        self._stop_reaper.set()
+        if self._reaper.ident is not None:
+            self._reaper.join()
 
     def _live(self) -> set[tuple[int, int]]:
         """The orphans still alive; the dead ones are reaped on the way.
 
         A process still in the child's group was re-parented here too when
         its parent died, but it is the group kill's, not an orphan: it is
-        reaped once dead and otherwise left to the group checks.
+        reaped once dead and otherwise left to the group checks. The first
+        call stops the reaper thread.
         """
+        self._stop_reaping()
         live: set[tuple[int, int]] = set()
         for key, zombie in _children().items():
             pid = key[0]
@@ -794,7 +873,8 @@ class _Containment:
         return bool(self._live())
 
     def release(self) -> None:
-        """Restore the previous subreaper setting and reap what has died. Idempotent."""
+        """Stop the reaper, reap what has died and restore the previous
+        subreaper setting. Idempotent."""
         if self._released:
             return
         self._released = True
@@ -936,12 +1016,13 @@ def execute(req: ExecutionRequest) -> ExecutionResult:
     Timeouts, non-zero exits and truncated output are *returned* (not
     raised) so callers can log stdout/stderr first; use ``raise_if_failed()``
     to convert. ExecutionError is raised only when the process cannot be
-    spawned, the threads that feed and read it cannot be started (the group
-    is killed first), or its output cannot be read.
+    spawned, the threads that feed, read and reap for it cannot be started
+    (the group is killed first once it runs), or its output cannot be read.
 
     With ``contain_orphans`` the invocation's orphans (:class:`_Containment`)
     count as part of what must be gone: they get the exit grace and the kill
-    the group gets, within the same bounds.
+    the group gets, within the same bounds. Those that die while the child
+    runs are reaped meanwhile.
     """
     if not req.command:
         raise ExecutionError("empty command")
@@ -962,6 +1043,10 @@ def _execute(req: ExecutionRequest, contained: _Containment | None) -> Execution
         feeder = None if req.stdin_data is None else _StdinFeeder(req.stdin_data)
     except OSError as exc:
         raise ExecutionError(f"failed to spawn {' '.join(req.command)}: {exc}") from exc
+    readers: tuple[_BoundedReader, ...] = ()
+    timed_out = False
+    descendants_killed = False
+    left = _Termination(group_survived=False, capture_abandoned=False)
     try:
         proc = _spawn(
             req.command,
@@ -977,15 +1062,13 @@ def _execute(req: ExecutionRequest, contained: _Containment | None) -> Execution
     if contained is not None:
         contained.child = proc.pid
     pgid = proc.pid  # start_new_session: the child leads a group of its own
-    readers: tuple[_BoundedReader, ...] = ()
-    timed_out = False
-    descendants_killed = False
-    left = _Termination(group_survived=False, capture_abandoned=False)
     try:
-        # The child is running from here on, so the threads that serve it
-        # start under the same guard as the wait: one the system refuses (a
-        # thread or descriptor limit) kills the group and fails the launch as
-        # a refused spawn would, never leaving the child behind.
+        # The child is running from here on, so everything that serves it
+        # is set up under the same guard as the wait, and nothing that can
+        # fail runs before it: a thread the system refuses (a thread or
+        # descriptor limit) kills the group and fails the launch as a
+        # refused spawn would, and anything else (an allocation, Ctrl-C)
+        # kills it too, never leaving the child behind.
         try:
             if feeder is not None:
                 feeder.start()
