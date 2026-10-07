@@ -9,9 +9,10 @@ working directory, JSON-escaped), sleeps where
 the script says so, writes the scripted stderr and exits with the scripted
 status. A ``spawn_holder`` step starts a helper in its process group that
 inherits its stdout, the way a server an agent left running holds it: the
-helper sleeps, writes its ``then`` text (raw, so its LF is the caller's) and
-exits, and its pid is appended to ``holders`` in the fake's home. No real
-agent runs.
+helper sleeps ``spawn_holder`` seconds, writes its ``then`` text (raw, so
+its LF is the caller's) and exits, or with ``every`` writes ``then`` every
+``every`` seconds for as long, the way a chatty one keeps stdout busy; its
+pid is appended to ``holders`` in the fake's home. No real agent runs.
 """
 
 from __future__ import annotations
@@ -22,7 +23,15 @@ from pathlib import Path
 
 from autoforge.config import ProfileConfig
 
-_HOLDER = "import sys, time; time.sleep(float(sys.argv[1])); sys.stdout.write(sys.argv[2])"
+_HOLDER = (
+    "import sys, time\n"
+    "hold, then, every = float(sys.argv[1]), sys.argv[2], float(sys.argv[3])\n"
+    "end = time.monotonic() + hold\n"
+    "while every and time.monotonic() < end:\n"
+    "    sys.stdout.write(then); sys.stdout.flush(); time.sleep(every)\n"
+    "time.sleep(max(0.0, end - time.monotonic()))\n"
+    "sys.stdout.write('' if every else then)\n"
+)
 
 _SCRIPT = r"""
 import json, os, subprocess, sys, time
@@ -45,7 +54,7 @@ for step in script["lines"]:
     if isinstance(step, dict) and "spawn_holder" in step:
         holder = subprocess.Popen(
             [sys.executable, "-c", script["holder"], str(step["spawn_holder"]),
-             step.get("then", "")]
+             step.get("then", ""), str(step.get("every", 0))]
         )
         with open(os.path.join(home, "holders"), "a", encoding="utf-8") as f:
             f.write(f"{holder.pid}\n")

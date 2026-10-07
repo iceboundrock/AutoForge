@@ -36,14 +36,18 @@ Guarantees:
 - one absolute deadline bounds every :meth:`DuplexChild.send_line`,
   :meth:`DuplexChild.read_line` and :meth:`DuplexChild.finish`. Past it the
   whole group is killed exactly as ``execute()`` kills it on timeout, and
-  the result is ``timed_out``;
-- EOF is not the child's exit: a descendant holding stdout keeps EOF away.
+  the result is ``timed_out``; except that, as in ``execute()``, the child
+  is looked at first, and a ``read_line`` or ``finish()`` that meets the
+  deadline after the child has exited settles the group with the exit
+  grace instead, the child's status kept;
+- EOF is not the child's exit: a descendant holding stdout keeps EOF away,
+  and one that keeps writing keeps every read busy.
   :meth:`DuplexChild.exited` says whether the child itself has exited,
-  without waiting, so a caller reading records until EOF can call
-  :meth:`DuplexChild.finish` once it has (ADR 0002's exit grace, then the
-  kill, the child's status kept). After a ``finish()`` that did not time
-  out, :meth:`DuplexChild.read_line` returns the records still queued and
-  then the end item, never waiting;
+  without waiting, so a caller reading records until EOF asks it after
+  every read and calls :meth:`DuplexChild.finish` once it has (ADR 0002's
+  exit grace, then the kill, the child's status kept). After a
+  ``finish()`` that did not time out, :meth:`DuplexChild.read_line`
+  returns the records still queued and then the end item, never waiting;
 - teardown runs on every exit from the ``with`` block, an exception or
   ``KeyboardInterrupt`` included: stdin is closed, the child is given a
   bounded wait to exit, then the ADR 0002 exit grace and empty-group check,
@@ -592,11 +596,13 @@ class DuplexChild:
         """Whether the child itself has exited; never waits.
 
         Its group may live on and hold its stdout, so EOF can come long
-        after this, or never. A caller that reads records until EOF asks
-        this between reads and, once it is True, calls :meth:`finish`,
-        which gives what is left ADR 0002's exit grace and then kills it,
-        keeping the child's own status; :meth:`read_line` then returns what
-        stdout carried up to its end.
+        after this, or never; and a descendant that keeps writing keeps
+        every read busy, so no read going quiet says so either. A caller
+        that reads records until EOF asks this after every read, a record
+        included, and once it is True calls :meth:`finish`, which gives
+        what is left ADR 0002's exit grace and then kills it, keeping the
+        child's own status; :meth:`read_line` then returns what stdout
+        carried up to its end.
         """
         return self._proc.poll() is not None
 
@@ -604,30 +610,49 @@ class DuplexChild:
         """The next stdout outcome, waiting at most ``timeout`` seconds and
         never past the deadline (see :data:`ReadOutcome`). After a
         :meth:`finish` that did not time out it never waits: the records
-        still queued, then the end item, whatever the deadline."""
+        still queued, then the end item, whatever the deadline. When the
+        deadline comes, a child still running is an overrun; one that has
+        exited by then is not, and is settled as :meth:`finish` settles it
+        (see :meth:`_deadline_reached`)."""
         if self._queue is None:
             raise ExecutionError("stdout is captured, not framed into records")
         if self._timed_out:
             return Timeout(deadline_exceeded=True)
         if self._closed:
-            # Torn down: every reader has ended, so the rest of stdout is
-            # queued up to its end item, and there is nothing left to wait
-            # for and no deadline left to enforce.
-            rest = self._queue.get(time.monotonic())
-            assert rest is not None
-            return rest
+            return self._rest()
         now = time.monotonic()
         if now >= self._deadline:
-            self._expire()
-            return Timeout(deadline_exceeded=True)
+            return self._deadline_reached()
         until = self._deadline if timeout is None else min(self._deadline, now + max(0.0, timeout))
         item = self._queue.get(until)
         if item is not None:
             return item
         if time.monotonic() >= self._deadline:
+            return self._deadline_reached()
+        return Timeout(deadline_exceeded=False)
+
+    def _rest(self) -> ReadOutcome:
+        """Torn down: every reader has ended, so the rest of stdout is queued
+        up to its end item, and there is nothing left to wait for and no
+        deadline left to enforce."""
+        assert self._queue is not None
+        rest = self._queue.get(time.monotonic())
+        assert rest is not None
+        return rest
+
+    def _deadline_reached(self) -> ReadOutcome:
+        """A read met the deadline. The child is looked at first, as
+        ``execute()``'s last look at it is at the deadline: one
+        still running overran it, and the group is killed and the read is
+        ``Timeout``. One that has exited ran within it, whatever still
+        holds its stdout, so the group gets ADR 0002's exit grace and the
+        kill exactly as in :meth:`finish`, the child's status is kept, and
+        the read returns the rest of stdout."""
+        if not self.exited():
             self._expire()
             return Timeout(deadline_exceeded=True)
-        return Timeout(deadline_exceeded=False)
+        self._teardown(self._deadline)
+        return self._rest()
 
     def close_stdin(self) -> None:
         """Close the child's stdin (its orderly-shutdown request). Idempotent."""

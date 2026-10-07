@@ -376,8 +376,9 @@ CLAUDE_DEFAULT_OUTPUT_FORMAT = "stream-json"
 CLAUDE_MAX_RECORD_BYTES = 2 * DEFAULT_MAX_OUTPUT_BYTES + 1024 * 1024
 CLAUDE_MAX_PENDING_BYTES = 2 * CLAUDE_MAX_RECORD_BYTES
 # How long the stream driver waits for a line before it checks whether the
-# CLI has exited: a descendant holding stdout keeps EOF away, and this is
-# how late its exit grace (ADR 0002) can start.
+# CLI has exited (it also checks after every line): a descendant holding
+# stdout keeps EOF away, and this is how late its exit grace (ADR 0002) can
+# start.
 CLAUDE_EXIT_POLL_SECONDS = 0.25
 
 
@@ -511,11 +512,14 @@ def _read_claude_stream(child: DuplexChild, stream: ClaudeStream) -> bool:
     """Feed every stdout outcome to ``stream`` through its end; True on the deadline.
 
     The CLI's exit, not EOF, ends the wait: a descendant still holding its
-    stdout must not hold the invocation to the deadline (ADR 0002). Once a
-    read finds no new line and the CLI has exited, ``finish()`` gives what
-    is left the exit grace and kills it, keeping the CLI's own status, and
-    the rest of stdout, queued up to its end by then, is fed and validated
-    like every line before it.
+    stdout, silent or writing, must not hold the invocation to the deadline
+    (ADR 0002). After every read, a line included, the driver looks at the
+    CLI; once it has exited, ``finish()`` gives what is left the exit grace
+    and kills it, keeping the CLI's own status, and the rest of stdout,
+    queued up to its end by then, is fed and validated like every line
+    before it. A read that meets the deadline after the CLI's exit does the
+    same (``read_line`` looks at the CLI first), so only a CLI still running
+    at the deadline is a timeout.
     """
     while True:
         item = child.read_line(timeout=CLAUDE_EXIT_POLL_SECONDS)
@@ -533,7 +537,7 @@ def _read_claude_stream(child: DuplexChild, stream: ClaudeStream) -> bool:
             return False
         elif item.deadline_exceeded:
             return True
-        elif child.exited():
+        if child.exited():
             child.finish()
 
 

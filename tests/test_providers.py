@@ -380,6 +380,114 @@ def test_a_cli_that_exits_just_before_its_deadline_is_not_a_timeout(tmp_path, mo
         _kill_quietly(pid)
 
 
+def test_a_leftover_that_keeps_writing_does_not_hide_the_cli_exit(tmp_path, monkeypatch):
+    """R4-F1, ADR 0002: a helper the CLI left behind writes a valid line every
+    30 ms, so every read finds one and no read ever goes quiet. The CLI's exit
+    is still seen while the lines keep coming: the helper gets the exit
+    grace and is killed with the group, its lines are fed like the rest, and
+    the CLI's own status and result are kept. Before the fix the driver only
+    looked at the CLI after a quiet read and reported a timeout."""
+    import time
+
+    from autoforge import executor
+    from tests import claude_fake
+    from tests.test_executor import _gone, _kill_quietly
+
+    monkeypatch.setattr(executor, "_EXIT_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    hook = claude_fake.line({"type": "system", "subtype": "hook_response"}) + "\n"
+    started = time.monotonic()
+    home, res = _claude_run(
+        tmp_path,
+        [
+            claude_fake.init(),
+            {"spawn_holder": 60, "every": 0.03, "then": hook},
+            {"sleep": 0.3},
+            claude_fake.result("done"),
+        ],
+        timeout=10,
+    )
+    elapsed = time.monotonic() - started
+    (pid,) = claude_fake.holders(home)
+    try:
+        assert not res.timed_out and res.exit_code == 0
+        assert res.provider_failure is None and res.stdout == "done"
+        assert res.descendants_killed and not (res.group_survived_kill or res.capture_abandoned)
+        assert elapsed < 8, elapsed  # the grace and the kill, never the deadline
+        assert _gone(pid, within=5), "the chatty helper outlived the invocation"
+    finally:
+        _kill_quietly(pid)
+
+
+def test_a_cli_that_overruns_while_a_leftover_keeps_writing_is_timed_out(tmp_path, monkeypatch):
+    """R4-F1: lines that keep arriving never hide a genuine overrun. The CLI is
+    still running at its deadline, so the group is killed and the run is a
+    timeout, however busy its stdout was."""
+    import time
+
+    from autoforge import executor
+    from tests import claude_fake
+    from tests.test_executor import _kill_quietly
+
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    hook = claude_fake.line({"type": "system", "subtype": "hook_response"}) + "\n"
+    started = time.monotonic()
+    home, res = _claude_run(
+        tmp_path,
+        [claude_fake.init(), {"spawn_holder": 60, "every": 0.03, "then": hook}, {"sleep": 60}],
+        timeout=1,
+    )
+    elapsed = time.monotonic() - started
+    try:
+        assert res.timed_out and res.exit_code == -1
+        assert res.provider_failure is None
+        assert elapsed < 10, elapsed
+    finally:
+        for pid in claude_fake.holders(home):
+            _kill_quietly(pid)
+
+
+@pytest.mark.parametrize(("linger", "timed_out"), [(0.3, False), (60, True)])
+def test_the_deadline_ending_a_read_checks_the_cli_exit_first(
+    tmp_path, monkeypatch, linger, timed_out
+):
+    """R4-F1: the CLI writes its result, lingers ``linger`` seconds and
+    exits, while a silent helper holds its stdout, and the read waiting for
+    the next line runs into the deadline (the poll is longer than the whole
+    run here, so that read is the final polling interval). A CLI that exited
+    before the deadline did not overrun it, as ``execute()``'s last look at
+    the child is at the deadline: the helper gets the exit grace and the
+    kill and the CLI's status and result are kept. A CLI still running at
+    the deadline is a timeout, as before."""
+    from autoforge import executor, providers
+    from tests import claude_fake
+    from tests.test_executor import _kill_quietly
+
+    monkeypatch.setattr(providers, "CLAUDE_EXIT_POLL_SECONDS", 60.0)
+    monkeypatch.setattr(executor, "_EXIT_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    home, res = _claude_run(
+        tmp_path,
+        [
+            claude_fake.init(),
+            {"spawn_holder": 60},
+            claude_fake.result("done"),
+            {"sleep": linger},
+        ],
+        timeout=3,
+    )
+    (pid,) = claude_fake.holders(home)
+    try:
+        assert res.timed_out is timed_out and res.provider_failure is None
+        if timed_out:
+            assert res.exit_code == -1
+        else:
+            assert res.exit_code == 0 and res.stdout == "done"
+            assert res.descendants_killed
+    finally:
+        _kill_quietly(pid)
+
+
 def test_a_helper_that_exits_within_the_grace_is_neither_killed_nor_reported(tmp_path, monkeypatch):
     """R3-F1, ADR 0002: a helper the CLI is shutting down as it exits holds
     stdout briefly and leaves on its own within the exit grace. The result is

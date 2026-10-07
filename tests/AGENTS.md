@@ -31,7 +31,8 @@ read it before adding tests for a listed area.
   review comments. Reuse these rather than hand-rolling fakes.
 - `tests/claude_fake.py` holds a fake `claude` that prints a scripted
   stream-json transcript (and logs its argv, cwd and stdin), and can leave
-  a helper holding its stdout after it exits; the real
+  a helper holding its stdout after it exits, silent or writing lines on an
+  interval; the real
   `ClaudeCodeProvider` launches it, so the stream path is tested end to end
   without a real agent.
 - `tests/pi_fake.py` holds the engine-level Pi harness: `PiFake` (a fake

@@ -95,9 +95,10 @@ command and event names, but no CLI flags and no processes. Claude Code's
 `ClaudeCodeProvider` drives over the same handle with stdin on `/dev/null`
 (#192): the `result` record's text becomes `stdout`, and an error result, a
 malformed line or a missing result becomes `provider_failure`. The CLI's
-exit, not EOF, ends its wait for lines, so a leftover holding its stdout
-gets ADR 0002's exit grace and kill, never the deadline, and the lines it
-wrote meanwhile are validated like the rest. No CLI flag
+exit, not EOF, ends its wait for lines: the adapter looks at the CLI after
+every read, a line included, so a leftover holding its stdout, silent or
+still writing, gets ADR 0002's exit grace and kill, never the deadline,
+and the lines it wrote meanwhile are validated like the rest. No CLI flag
 and no provider wire-protocol name appears outside the provider layer.
 
 Live progress crosses the boundary in one provider-neutral shape. The engine
@@ -217,13 +218,19 @@ it is held to the same contract:
   `ChildStdinClosedError`;
 - one absolute deadline bounds every `send_line`, `read_line` and `finish`.
   Past it the group is killed exactly as on `execute()`'s timeout, and the
-  result is `timed_out` with `exit_code = -1`. A deadline that is not
+  result is `timed_out` with `exit_code = -1`. As in `execute()`, whose last
+  look at the child is at the deadline, the child is looked at first: a
+  `read_line` or `finish()` that meets the deadline after the child has
+  exited is not a timeout, and settles the group with the exit grace and the
+  kill, the child's status kept (`read_line` then returns the rest of
+  stdout). A deadline that is not
   finite, not positive or above `MAX_DEADLINE_SECONDS` (a week, within what
   every wait primitive can take) is refused with `ExecutionError` before
   anything is spawned;
 - EOF is not the child's exit: a descendant holding stdout keeps EOF away
-  for as long as it lives. `exited()` reports the child's own exit without
-  waiting, so a caller that reads records until EOF checks it between reads
+  for as long as it lives, and one that keeps writing keeps every read busy.
+  `exited()` reports the child's own exit without waiting, so a caller that
+  reads records until EOF checks it after every read, a record included,
   and calls `finish()` once the child has exited (the exit grace, then the
   kill, the child's status kept). After a `finish()` that did not time
   out, `read_line` returns the records still queued and then the end item,

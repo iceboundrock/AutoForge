@@ -569,6 +569,42 @@ def test_exited_reports_the_exit_that_a_held_stdout_keeps_from_eof(monkeypatch):
             _kill_quietly(pid)
 
 
+@pytest.mark.parametrize("late", [False, True], ids=["read-waits-into-it", "read-starts-past-it"])
+def test_a_child_that_exited_before_the_deadline_is_not_timed_out_by_a_read(monkeypatch, late):
+    """R4-F1, ADR 0002: the child exits in time, a descendant still holds its
+    stdout, and the deadline comes while a read waits for a record, or
+    before the caller reads again. As ``execute()``'s last look at the child
+    is at the deadline, the exit is in time: the read settles the group as
+    ``finish()`` does (the exit grace, then the kill) and returns the rest of
+    stdout, never ``Timeout``, and the child's own status is kept."""
+    monkeypatch.setattr(executor, "_EXIT_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    deadline = 2.0
+    started = time.monotonic()
+    with start_duplex(
+        DuplexRequest(command=[PY, "-c", _ORPHAN, "group", "3"], deadline_seconds=deadline)
+    ) as child:
+        child.close_stdin()
+        while not child.exited():
+            assert time.monotonic() - started < deadline / 2, "the child exited late"
+            time.sleep(0.01)
+        if late:
+            time.sleep(max(0.0, started + deadline + 0.2 - time.monotonic()))
+        first = child.read_line(timeout=60)
+        rest = child.read_line(timeout=60)
+        elapsed = time.monotonic() - started
+        res = child.finish()
+    assert isinstance(first, Record)
+    pid = int(first.data)
+    try:
+        assert rest == Eof() and elapsed >= deadline
+        assert not res.timed_out and res.exit_code == 3
+        assert res.descendants_killed and not (res.group_survived_kill or res.capture_abandoned)
+        assert _gone(pid, within=5)
+    finally:
+        _kill_quietly(pid)
+
+
 def test_read_line_after_finish_returns_the_rest_without_waiting_past_the_deadline():
     """After ``finish()`` every reader has ended, so ``read_line`` hands out
     the records still queued and then the end item at once. It never waits
