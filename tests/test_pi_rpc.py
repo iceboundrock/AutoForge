@@ -24,7 +24,7 @@ from autoforge.pi_rpc import PiConversation, js_trim
 from autoforge.providers import AgentRequest, PiProvider
 from autoforge.result_parser import parse_control_result
 from autoforge.transitions import Phase
-from tests.conftest import BRANCH, ISSUE, PR, SHA_A, block
+from tests.conftest import BRANCH, DECODER_LIMIT_RECORDS, ISSUE, PR, SHA_A, block
 
 MODEL = "openai/gpt-5.6-terra"
 STATE = {
@@ -289,6 +289,26 @@ def test_a_response_without_success_is_a_protocol_failure():
     run = Run()
     run.feed({"type": "response", "id": run.id_of("get_state"), "command": "get_state"})
     assert "no boolean 'success'" in run.failure()
+
+
+@pytest.mark.parametrize(
+    ("record", "why"),
+    [
+        (b"Loading extensions...", "a stdout record is not JSON"),
+        *(
+            pytest.param(
+                line,
+                "a stdout record exceeds the JSON decoder's integer or nesting limit",
+                id=name,
+            )
+            for name, line in DECODER_LIMIT_RECORDS.items()
+        ),
+    ],
+)
+def test_a_record_the_decoder_refuses_is_a_protocol_failure_not_an_exception(record, why):
+    run = Run().started()
+    run.feed(record)
+    assert run.failure() == f"pi: protocol violation: {why}"
 
 
 # -- settlement --------------------------------------------------------------------
@@ -896,11 +916,25 @@ def test_provider_stderr_is_never_parsed(tmp_path):
     assert "from-stderr" in res.stderr and "from-stderr" not in res.stdout
 
 
-def test_provider_a_non_json_stdout_line_is_a_protocol_failure(tmp_path):
+@pytest.mark.parametrize(
+    ("raw", "why"),
+    [
+        ("Loading extensions...", "a stdout record is not JSON"),
+        *(
+            pytest.param(
+                line.decode(),
+                "a stdout record exceeds the JSON decoder's integer or nesting limit",
+                id=name,
+            )
+            for name, line in DECODER_LIMIT_RECORDS.items()
+        ),
+    ],
+)
+def test_provider_an_undecodable_stdout_line_is_a_protocol_failure(tmp_path, raw, why):
     scenario = _happy()
-    scenario["on"]["prompt"].insert(1, {"raw": "Loading extensions...\n"})
+    scenario["on"]["prompt"].insert(1, {"raw": raw + "\n"})
     res, fake = _execute(tmp_path, scenario)
-    assert res.provider_failure == "pi: protocol violation: a stdout record is not JSON"
+    assert res.provider_failure == f"pi: protocol violation: {why}"
     assert res.exit_code == 0 and not res.timed_out and res.stdout == ""
     # The running prompt was aborted, then stdin closed (Pi exited on EOF).
     assert fake.commands()[-1] == "abort"

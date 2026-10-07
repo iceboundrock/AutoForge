@@ -30,7 +30,8 @@ The outcome:
   text``. Its ``is_error`` is checked first (``subtype: success`` can come
   with ``is_error: true``), then ``subtype`` must be ``success``, then
   ``result`` must be a string. Anything else is a provider failure.
-* A line that is not a JSON object with a string ``type``, an unterminated
+* A line that is not a JSON object with a string ``type`` (including one
+  the decoder refuses for an integer or nesting limit), an unterminated
   last line, a second ``result``, a queue overflow, and stdout ending
   without a ``result`` are provider failures too.
 * A line past the per-line bound is counted and skipped: a ``tool_result``
@@ -140,6 +141,13 @@ class ClaudeStream:
             record = json.loads(data.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             self._protocol("a stdout line is not JSON")
+            return
+        except (ValueError, RecursionError):
+            # The decoder's own limits, which are not JSONDecodeError: an
+            # integer past ``sys.get_int_max_str_digits()`` and nesting past
+            # the recursion limit or the C stack, both well inside the
+            # per-line bound. An interrupt is neither and still propagates.
+            self._protocol("a stdout line exceeds the JSON decoder's integer or nesting limit")
             return
         if not isinstance(record, dict) or not isinstance(record.get("type"), str):
             self._protocol("a stdout line is not a JSON object with a 'type'")

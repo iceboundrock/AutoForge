@@ -9,8 +9,10 @@ import json
 
 import pytest
 
+from autoforge import claude_stream
 from autoforge.claude_stream import ClaudeStream
 from autoforge.progress import ProgressEvent, ProgressKind
+from tests.conftest import DECODER_LIMIT_RECORDS
 
 CWD = "/work/tree"
 TEXT = 'done\n<<<CONTROL_RESULT>>>\n{"phase":"FIX","status":"success"}\n<<<END_CONTROL_RESULT>>>\n'
@@ -146,6 +148,28 @@ def test_a_malformed_line_fails_the_run_even_before_a_good_result(line, why):
     stream, _ = _run(line, _result())
     assert stream.text is None
     assert stream.failure == f"claude: stream-json protocol violation: {why}"
+
+
+@pytest.mark.parametrize("line", DECODER_LIMIT_RECORDS.values(), ids=DECODER_LIMIT_RECORDS.keys())
+def test_a_line_past_the_decoders_limits_is_a_protocol_failure_not_an_exception(line):
+    stream, _ = _run(line, _result())
+    assert stream.text is None
+    assert stream.failure == (
+        "claude: stream-json protocol violation: "
+        "a stdout line exceeds the JSON decoder's integer or nesting limit"
+    )
+    assert stream.summary()["failure"] == stream.failure and stream.summary()["records"] == 2
+
+
+def test_an_interrupt_inside_the_decoder_is_not_taken_for_a_bad_line(monkeypatch):
+    def interrupted(text: str) -> object:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(claude_stream.json, "loads", interrupted)
+    stream = ClaudeStream()
+    with pytest.raises(KeyboardInterrupt):
+        stream.feed(b'{"type": "system"}')
+    assert stream.failure is None
 
 
 def test_no_result_before_stdout_ends_is_a_failure():

@@ -19,6 +19,7 @@ from autoforge.providers import (
     ScriptedProvider,
     provider_for,
 )
+from tests.conftest import DECODER_LIMIT_RECORDS
 
 
 def _text(profile: ProfileConfig) -> ProfileConfig:
@@ -266,6 +267,16 @@ def test_a_fake_claude_stream_is_reduced_to_the_result_text_verbatim(tmp_path):
         ),
         ([], 0, "claude: exited without a result event (exit 0)"),
         ([], 1, "claude: exited without a result event (exit 1)"),
+        *(
+            pytest.param(
+                [line.decode(), "RESULT_OK"],
+                0,
+                "claude: stream-json protocol violation: a stdout line exceeds the JSON "
+                "decoder's integer or nesting limit",
+                id=name,
+            )
+            for name, line in DECODER_LIMIT_RECORDS.items()
+        ),
     ],
 )
 def test_a_fake_claude_failure_is_a_provider_failure_with_no_stdout(

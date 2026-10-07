@@ -239,6 +239,12 @@ class PiConversation:
         except (UnicodeDecodeError, json.JSONDecodeError):
             self._protocol("a stdout record is not JSON")
             return []
+        except (ValueError, RecursionError):
+            # The decoder's integer-digit and nesting limits, which are not
+            # JSONDecodeError (as in ``claude_stream``); an interrupt still
+            # propagates.
+            self._protocol("a stdout record exceeds the JSON decoder's integer or nesting limit")
+            return []
         if not isinstance(record, dict) or not isinstance(record.get("type"), str):
             self._protocol("a stdout record is not a JSON object with a 'type'")
             return []

@@ -67,6 +67,17 @@ CI_WORKFLOW_ID = 77
 CI_WORKFLOW_PATH = ".github/workflows/ci.yml"
 BASE_RUN_ID = 1000
 CI_RUN_ID = 1001
+# Provider stdout records the JSON decoder refuses with ValueError or
+# RecursionError, not JSONDecodeError, on every supported Python and far
+# inside any per-record bound: an integer past the default 4300-digit
+# conversion limit (well-formed, and followed by a stray comma), and nesting
+# no interpreter decodes (3.11 stops near 1,000 levels, 3.12+ go deeper,
+# none to 100,000).
+DECODER_LIMIT_RECORDS = {
+    "huge-int": b'{"type": "x", "n": ' + b"1" * 5000 + b"}",
+    "huge-int-then-comma": b'{"type": "x", "n": ' + b"1" * 5000 + b",}",
+    "deep-nesting": b'{"type": "x", "n": ' + b"[" * 100_000 + b"]" * 100_000 + b"}",
+}
 
 
 def ci_check(

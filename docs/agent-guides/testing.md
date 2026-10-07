@@ -177,8 +177,10 @@ Progress is observability, never part of an outcome. Keep covered:
 
 - the Claude `stream-json` reducer (`tests/test_claude_stream.py`): the
   `result` text verbatim, `is_error` checked before the subtype, a
-  malformed line, a missing or second result and an oversize result line
-  each a `provider_failure`, an oversize ordinary line counted and skipped,
+  malformed line (including one the JSON decoder refuses for its integer or
+  nesting limit, which must not escape as an exception), a missing or
+  second result and an oversize result line each a `provider_failure`, an
+  oversize ordinary line counted and skipped,
   a flat scalar summary, and no command, thinking, assistant text or tool
   result in any event
 - the real `ClaudeCodeProvider` on the fake `claude` (`tests/claude_fake.py`):
