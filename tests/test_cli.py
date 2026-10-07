@@ -21,11 +21,13 @@ from tests.conftest import (
     PR,
     SHA_A,
     FakeGitHub,
+    Origin,
     block,
     ci_check,
     comment_url,
+    connect_origin,
     git_repo,
-    implementation_pr_body,
+    implement,
     review_comment_body,
 )
 
@@ -37,11 +39,20 @@ def _tmp_path_is_a_repository(tmp_path):
 
 
 @pytest.fixture
-def fakes(monkeypatch):
-    """Route every engine the CLI builds through FakeGitHub + a scripted agent."""
+def fakes(monkeypatch, tmp_path, tmp_path_factory):
+    """Route every engine the CLI builds through FakeGitHub + a scripted agent.
+
+    The CLI's engine works in its cwd, tmp_path (the tests chdir there). One
+    bare origin, outside that checkout and seeded with its HEAD as ``main``,
+    is the git remote of every engine the CLI builds and the FakeGitHub's
+    git data (#161): an ANALYZE_EXECUTE entry fetches from it and the
+    controller publishes the agent's commit to it.
+    """
     gh = FakeGitHub()
     gh.add_issue(ISSUE, "Feature")
-    holder = {"gh": gh, "handler": lambda req: ""}
+    origin = Origin.seeded(tmp_path_factory.mktemp("cli-origin"), git_repo(tmp_path))
+    gh.attach_origin(origin)
+    holder = {"gh": gh, "origin": origin, "handler": lambda req: ""}
 
     def handler(req):
         return holder["handler"](req)
@@ -56,6 +67,7 @@ def fakes(monkeypatch):
             "providers", ProviderRegistry(overrides={"claude": provider, "opencode": provider})
         )
         real(self, *a, **k)
+        connect_origin(self, origin)
 
     monkeypatch.setattr(ControllerEngine, "__init__", patched)
     return holder
@@ -90,23 +102,6 @@ def test_run_dry_run_writes_nothing(tmp_path, capsys, monkeypatch, fakes):
     assert fakes["gh"].calls == [] and fakes["provider"].calls == []
 
 
-def _opens_the_pr(gh):
-    def agent(req):
-        gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
-        return block(
-            {
-                "phase": "ANALYZE_EXECUTE",
-                "status": "success",
-                "issue_url": ISSUE,
-                "pr_url": PR,
-                "head_sha": SHA_A,
-                "branch": BRANCH,
-            }
-        )
-
-    return agent
-
-
 def test_a_run_prints_each_outcome_as_its_step_ends_and_progress_on_stderr(
     tmp_path, capsys, monkeypatch, fakes
 ):
@@ -114,12 +109,11 @@ def test_a_run_prints_each_outcome_as_its_step_ends_and_progress_on_stderr(
     loop, and the agent's progress on stderr while it runs; stdout keeps the
     outcomes alone."""
     monkeypatch.chdir(tmp_path)
-    opens_the_pr = _opens_the_pr(fakes["gh"])
     while_the_agent_ran = []
 
     def agent(req):
         while_the_agent_ran.append(capsys.readouterr())
-        return opens_the_pr(req)
+        return implement(req)
 
     fakes["handler"] = agent
     sd = str(tmp_path / ".autoforge")
@@ -139,7 +133,7 @@ def test_a_run_prints_each_outcome_as_its_step_ends_and_progress_on_stderr(
 
 def test_a_step_shows_progress_and_a_dry_run_shows_none(tmp_path, capsys, monkeypatch, fakes):
     monkeypatch.chdir(tmp_path)
-    fakes["handler"] = _opens_the_pr(fakes["gh"])
+    fakes["handler"] = implement
     sd = str(tmp_path / ".autoforge")
     assert cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--dry-run"]) == 0
     assert (
@@ -635,24 +629,15 @@ def test_full_run_prints_ready_banner(tmp_path, capsys, monkeypatch, fakes):
 
     def agent(req):
         if req.phase == "ANALYZE_EXECUTE":
-            gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
-            return block(
-                {
-                    "phase": "ANALYZE_EXECUTE",
-                    "status": "success",
-                    "issue_url": ISSUE,
-                    "pr_url": PR,
-                    "head_sha": SHA_A,
-                    "branch": BRANCH,
-                }
-            )
-        gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
+            return implement(req)
+        head = gh.prs[PR].head_sha  # the controller-published implementation commit
+        gh.add_comment(PR, 100, review_comment_body(1, head, False))
         return block(
             {
                 "phase": "REVIEW",
                 "status": "success",
                 "round": 1,
-                "reviewed_head_sha": SHA_A,
+                "reviewed_head_sha": head,
                 "review_comment_url": comment_url(PR, 100),
                 "needs_fix_round": False,
                 "findings": [],
@@ -666,7 +651,10 @@ def test_full_run_prints_ready_banner(tmp_path, capsys, monkeypatch, fakes):
     assert rc == 0
     assert "AutoForge workflow reached READY_FOR_MERGE." in out
     assert "Automatic merge is disabled in this milestone." in out
-    assert PR in out and ISSUE in out and SHA_A in out and "Review round:  1" in out
+    head = fakes["origin"].head("autoforge/2")  # the commit the controller published
+    assert head is not None
+    assert load_state(tmp_path / ".autoforge" / "state.json").current_head_sha == head
+    assert PR in out and ISSUE in out and head in out and "Review round:  1" in out
     assert "Reviewed base: main" in out
     assert f"Reviewed merge base: {MERGE_BASE}" in out
     # resume on a held state re-prints the banner and does nothing else
@@ -693,22 +681,13 @@ def test_full_run_prints_ready_banner(tmp_path, capsys, monkeypatch, fakes):
 
 
 def _drive_to_ready(fakes):
-    """Agent script: ANALYZE_EXECUTE creates the PR, REVIEW is clean, UPDATE_EPIC ends."""
+    """Agent script: ANALYZE_EXECUTE commits (the controller opens the PR), REVIEW is
+    clean, UPDATE_EPIC ends."""
     gh = fakes["gh"]
 
     def agent(req):
         if req.phase == "ANALYZE_EXECUTE":
-            gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
-            return block(
-                {
-                    "phase": "ANALYZE_EXECUTE",
-                    "status": "success",
-                    "issue_url": ISSUE,
-                    "pr_url": PR,
-                    "head_sha": SHA_A,
-                    "branch": BRANCH,
-                }
-            )
+            return implement(req)
         if req.phase == "UPDATE_EPIC":
             return block(
                 {
@@ -719,13 +698,14 @@ def _drive_to_ready(fakes):
                     "next_issue_url": None,
                 }
             )
-        gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
+        head = gh.prs[PR].head_sha  # the controller-published implementation commit
+        gh.add_comment(PR, 100, review_comment_body(1, head, False))
         return block(
             {
                 "phase": "REVIEW",
                 "status": "success",
                 "round": 1,
-                "reviewed_head_sha": SHA_A,
+                "reviewed_head_sha": head,
                 "review_comment_url": comment_url(PR, 100),
                 "needs_fix_round": False,
                 "findings": [],
@@ -818,7 +798,9 @@ def test_resume_with_gate_open_merges_via_controller_to_done(tmp_path, capsys, m
 
     assert cli.main(["--config", cfg, "--state-dir", sd, "resume", "--allow-merge"]) == 0
     out = capsys.readouterr().out
-    assert gh.merges == [(PR, "squash", SHA_A, False)]
+    implemented = fakes["origin"].head("autoforge/2")
+    assert implemented is not None
+    assert gh.merges == [(PR, "squash", implemented, False)]
     assert [c.phase for c in fakes["provider"].calls] == [
         "ANALYZE_EXECUTE",
         "REVIEW",
@@ -992,17 +974,7 @@ def test_resume_never_resets_the_step_budget(tmp_path, capsys, monkeypatch, fake
 
     def agent(req):
         if req.phase == "ANALYZE_EXECUTE":
-            gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
-            return block(
-                {
-                    "phase": "ANALYZE_EXECUTE",
-                    "status": "success",
-                    "issue_url": ISSUE,
-                    "pr_url": PR,
-                    "head_sha": SHA_A,
-                    "branch": BRANCH,
-                }
-            )
+            return implement(req)
         if req.phase == "REVIEW":
             rounds["n"] += 1
             rnd = rounds["n"]
@@ -1402,20 +1374,6 @@ def test_run_refuses_state_created_by_a_concurrent_controller_before_lock(
 
 
 # -- R5-F1: one continuous lock per command ----------------------------------
-def _analyze_ok(gh) -> str:
-    gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
-    return block(
-        {
-            "phase": "ANALYZE_EXECUTE",
-            "status": "success",
-            "issue_url": ISSUE,
-            "pr_url": PR,
-            "head_sha": SHA_A,
-            "branch": BRANCH,
-        }
-    )
-
-
 @pytest.mark.parametrize("command", ["run", "step", "resume"])
 def test_command_holds_one_lock_from_state_load_through_agent_execution(
     tmp_path, capsys, monkeypatch, fakes, command
@@ -1436,7 +1394,7 @@ def test_command_holds_one_lock_from_state_load_through_agent_execution(
 
     def agent(req):
         seen.append(_second_controller_can_lock(lock_file))
-        return _analyze_ok(fakes["gh"])
+        return implement(req)
 
     fakes["handler"] = agent
     acquired = _count_lock_acquisitions(monkeypatch)
@@ -1466,7 +1424,7 @@ def test_step_executes_the_state_seen_under_the_lock_not_a_pre_lock_snapshot(
     sd.mkdir()
     sf = sd / "state.json"
     save_state(_other_controller_state("af-stale"), sf)
-    fakes["handler"] = lambda req: _analyze_ok(fakes["gh"])
+    fakes["handler"] = implement
     fired = _interleave_before_first_lock(
         monkeypatch, lambda: save_state(_other_controller_state("af-other", Phase.DONE), sf)
     )
@@ -1488,7 +1446,7 @@ def test_resume_executes_the_state_seen_under_the_lock_not_a_pre_lock_snapshot(
     sd.mkdir()
     sf = sd / "state.json"
     save_state(_other_controller_state("af-stale"), sf)
-    fakes["handler"] = lambda req: _analyze_ok(fakes["gh"])
+    fakes["handler"] = implement
     fired = _interleave_before_first_lock(
         monkeypatch,
         lambda: save_state(_other_controller_state("af-other", Phase.BLOCKED, "human needed"), sf),
@@ -1766,7 +1724,7 @@ def _run_argv(state_dir=None, *extra) -> list[str]:
 def test_lock_lives_in_the_git_dir_not_in_the_state_dir(tmp_path, capsys, monkeypatch, fakes):
     monkeypatch.chdir(tmp_path)
     sd = tmp_path / "elsewhere" / "state"
-    fakes["handler"] = lambda req: _analyze_ok(fakes["gh"])
+    fakes["handler"] = implement
     assert cli.main(_run_argv(sd)) == 0
     lock = repository_lock_path(tmp_path)
     assert lock == (tmp_path / ".git" / "autoforge" / "controller.lock").resolve()
@@ -1791,7 +1749,7 @@ def test_second_controller_with_another_state_dir_is_refused_while_the_first_run
     def agent(req):
         outcome["rc"] = cli.main(_run_argv(second_sd))
         outcome["calls"] = len(fakes["provider"].calls)
-        return _analyze_ok(fakes["gh"])
+        return implement(req)
 
     fakes["handler"] = agent
     assert cli.main(_run_argv(first_sd)) == 0
@@ -1818,7 +1776,7 @@ def test_second_controller_from_a_subdirectory_with_default_state_dir_is_refused
             outcome["rc"] = cli.main(_run_argv())  # no --state-dir: relative .autoforge
         finally:
             monkeypatch.chdir(tmp_path)
-        return _analyze_ok(fakes["gh"])
+        return implement(req)
 
     fakes["handler"] = agent
     assert cli.main(_run_argv()) == 0
@@ -1863,7 +1821,7 @@ def test_second_controller_in_a_linked_worktree_is_refused(tmp_path, capsys, mon
             outcome["rc"] = cli.main(_run_argv())
         finally:
             monkeypatch.chdir(tmp_path)
-        return _analyze_ok(fakes["gh"])
+        return implement(req)
 
     fakes["handler"] = agent
     assert cli.main(_run_argv()) == 0

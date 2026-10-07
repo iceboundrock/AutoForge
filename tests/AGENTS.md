@@ -29,8 +29,20 @@ read it before adding tests for a listed area.
   `make_local_engine` build a controller against those fakes; `block(...)`
   and `review_comment_body(...)` build well-formed `CONTROL_RESULT` blocks and
   review comments. Reuse these rather than hand-rolling fakes.
+- The controller pushes the implementation commit itself (#161), so a
+  REMOTE test that reaches `ANALYZE_EXECUTE`'s publication builds its engine
+  with `make_engine(..., origin=True)`: an `Origin` is a seeded bare
+  repository under `tmp_path` that the controller's git transport fetches
+  from and pushes to over `file://`, and that backs `FakeGitHub`'s branch
+  heads, PR heads and ancestry reads. `implement` is the implementation
+  agent (one commit on the worktree's detached `HEAD`, reported by
+  `analyze_payload`), and `scripted(...)` answers successive calls of one
+  agent. An autouse fixture fails any test whose engine would reach the
+  network git remote.
 - `tests/claude_fake.py` holds a fake `claude` that prints a scripted
-  stream-json transcript (and logs its argv, cwd and stdin), and can leave
+  stream-json transcript (and logs its argv, cwd and stdin; `$HEAD` in the
+  transcript is replaced by the `HEAD` of its cwd, such as a commit made
+  before the run), and can leave
   a helper holding its stdout after it exits, silent or writing lines on an
   interval; the real
   `ClaudeCodeProvider` launches it, so the stream path is tested end to end

@@ -5,7 +5,9 @@ the duplex handle exactly as it launches the CLI. It lives in ``tmp_path``,
 outside the repository, and logs its argv, its cwd and whether its stdin is
 ``/dev/null``; then it prints each scripted line (``$SENTINEL`` replaced by
 the value of ``CLAUDE_TEST_SENTINEL`` from its environment, ``$CWD`` by its
-working directory, JSON-escaped), sleeps where
+working directory, JSON-escaped, and ``$HEAD`` by ``git rev-parse HEAD`` in
+it, read once when a line first needs it: a commit made before the run, such
+as an implementation's, which no script can know in advance), sleeps where
 the script says so, writes the scripted stderr and exits with the scripted
 status. A ``spawn_holder`` step starts a helper in its process group that
 inherits its stdout, the way a server an agent left running holds it: the
@@ -50,6 +52,7 @@ with open(os.path.join(home, "script.json"), encoding="utf-8") as f:
     script = json.load(f)
 sentinel = os.environ.get("CLAUDE_TEST_SENTINEL", "")
 cwd = json.dumps(os.getcwd())[1:-1]
+head = None
 for step in script["lines"]:
     if isinstance(step, dict) and "spawn_holder" in step:
         holder = subprocess.Popen(
@@ -62,6 +65,12 @@ for step in script["lines"]:
     if isinstance(step, dict):
         time.sleep(step["sleep"])
         continue
+    if "$HEAD" in step and head is None:
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+        ).stdout.strip()
+    if head is not None:
+        step = step.replace("$HEAD", head)
     sys.stdout.write(step.replace("$SENTINEL", sentinel).replace("$CWD", cwd) + "\n")
     sys.stdout.flush()
 sys.stderr.write(script["stderr"])

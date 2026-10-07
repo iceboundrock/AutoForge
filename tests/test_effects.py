@@ -1293,6 +1293,79 @@ def test_pieces_naming_two_phases_fail_loudly():
         load_phase_effects(fix_plan(1), {}, AnalyzeContext(ISSUE).to_dict(), blocked)
 
 
+ANALYZE_BINDING = Binding(RUN_ID, Phase.ANALYZE_EXECUTE, ISSUE, "", 0, "")
+ANALYZE_REF = f"refs/heads/{BRANCH}"
+
+
+def analyze_observation(head: str | None = SHA_A, base: str | None = SHA_C, ref=ANALYZE_REF):
+    return {
+        "phase": "ANALYZE_EXECUTE",
+        "issue_url": ISSUE,
+        "pr_url": "",
+        "refs": {ref: head},
+        "base_sha": base,
+        "objects": {IMPL_MARKER: None},
+    }
+
+
+def analyze_push() -> EffectRecord:
+    return push_record(by=ANALYZE_OWNER)
+
+
+@pytest.mark.parametrize("second", [impl_record, adopt_record], ids=["create", "adopt"])
+def test_an_analyze_context_loads_with_its_push_and_pr_plan(second):
+    """#161: the context, the push then the PR create or adoption, and the observation load."""
+    effects = load_phase_effects(
+        [analyze_push().to_dict(), second().to_dict()],
+        analyze_observation(),
+        AnalyzeContext(ISSUE).to_dict(),
+        ANALYZE_BINDING,
+    )
+    assert [r.kind for r in effects.records] == [EffectKind.PUSH, second().kind]
+    assert isinstance(effects.context, AnalyzeContext)
+
+
+@pytest.mark.parametrize(
+    ("records", "observation", "match"),
+    [
+        ([], analyze_observation(), "a push then a PR create or adoption"),
+        ([analyze_push().to_dict()], analyze_observation(), "a push then a PR create"),
+        (
+            [replace(impl_record(), position=0).to_dict()],
+            analyze_observation(),
+            "a push then a PR create or adoption",
+        ),
+        (None, {}, "with the entry observation"),
+        (None, analyze_observation(ref="refs/heads/elsewhere"), "a ref the entry observation"),
+        (None, analyze_observation(head=SHA_B), "another head than the entry observed"),
+        (None, analyze_observation(head=None), "another head than the entry observed"),
+        (None, analyze_observation(base=SHA_A), "another base than the entry read"),
+        (
+            [analyze_push().to_dict(), impl_record(head="autoforge/2-other").to_dict()],
+            analyze_observation(),
+            "from another branch than the one it pushes",
+        ),
+    ],
+    ids=[
+        "no-plan",
+        "push-only",
+        "pr-only",
+        "no-observation",
+        "unobserved-ref",
+        "other-old-head",
+        "branch-observed-absent",
+        "other-base",
+        "pr-from-another-branch",
+    ],
+)
+def test_an_analyze_context_the_entry_does_not_explain_fails_loudly(records, observation, match):
+    """#161: a plan whose push no entry read explains is never completed."""
+    if records is None:
+        records = [analyze_push().to_dict(), impl_record().to_dict()]
+    with pytest.raises(StateError, match=match):
+        load_phase_effects(records, observation, AnalyzeContext(ISSUE).to_dict(), ANALYZE_BINDING)
+
+
 # -- operations: success and adoption (all GitHub kinds) --------------------------------
 
 

@@ -2562,7 +2562,9 @@ def test_a_legacy_remote_resume_is_labelled_by_the_contract_it_launched_under(
     """D13.2/D13.3: a protocol-5 REMOTE file with ``attempt >= 1`` in a publishing
     phase launched under the agent-publishing contract and is labelled
     ``agent_publishes``; before a launch, or outside a publishing phase, it gets
-    no label. The label survives the save that relabels the file."""
+    no label. The label survives the save that relabels the file. A legacy
+    re-entry is one into a phase the controller now publishes for: UPDATE_EPIC
+    (#160) and ANALYZE_EXECUTE (#161)."""
     from autoforge.effects import is_legacy_reentry
 
     p = _write(
@@ -2573,7 +2575,7 @@ def test_a_legacy_remote_resume_is_labelled_by_the_contract_it_launched_under(
     assert loaded.launch_label == label
     assert loaded.phase_effects().empty
     assert is_legacy_reentry(loaded.phase, loaded.attempt, loaded.launch_label) == (
-        phase == Phase.UPDATE_EPIC and attempt >= 1
+        phase in (Phase.ANALYZE_EXECUTE, Phase.UPDATE_EPIC) and attempt >= 1
     )
     save_state(loaded, p)
     assert json.loads(p.read_text(encoding="utf-8"))["launch_label"] == label

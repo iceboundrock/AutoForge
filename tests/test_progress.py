@@ -35,12 +35,10 @@ from autoforge.runlog import StepLog
 from autoforge.state import load_state
 from tests import claude_fake
 from tests.conftest import (
-    BRANCH,
-    ISSUE,
     PR,
-    SHA_A,
+    analyze_payload,
     block,
-    implementation_pr_body,
+    commit_in,
     make_engine,
 )
 
@@ -404,39 +402,30 @@ def test_a_refused_heartbeat_thread_leaves_the_reporter_working(monkeypatch):
 
 
 # -- acceptance: a fake claude through the engine ------------------------------
-ANALYZE_OK = {
-    "phase": "ANALYZE_EXECUTE",
-    "status": "success",
-    "issue_url": ISSUE,
-    "pr_url": PR,
-    "head_sha": SHA_A,
-    "branch": BRANCH,
-}
+# The fake resolves ``$HEAD`` to its worktree's HEAD when it prints the
+# line: the implementation commit, made before the run, has a SHA no script
+# can know in advance (#161).
+ANALYZE_OK = analyze_payload("$HEAD")
 
 
-class ClaudeThatOpensThePr(ClaudeCodeProvider):
-    """The real Claude adapter on the fake CLI; the "agent" opens the PR."""
-
-    def __init__(self, github) -> None:
-        super().__init__()
-        self.github = github
+class ClaudeThatCommits(ClaudeCodeProvider):
+    """The real Claude adapter on the fake CLI; the "agent" commits in its worktree."""
 
     def execute(self, req):
-        result = super().execute(req)
-        self.github.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
-        return result
+        commit_in(req.cwd)
+        return super().execute(req)
 
 
 def _engine_on_fake_claude(tmp_path, fake_github, lines):
     state_dir = tmp_path / ".autoforge"
-    eng = make_engine(state_dir, [], github=fake_github)
+    eng = make_engine(state_dir, [], github=fake_github, origin=True)
     eng.step()  # INITIALIZING
     _, fake = claude_fake.fake_claude(tmp_path, lines)
     cfg_profile = eng.config.profiles["analyze_execute"]
     eng.config.profiles["analyze_execute"] = replace(
         cfg_profile, command=fake.command, options={**fake.options, "output_format": "stream-json"}
     )
-    eng.providers._overrides["claude"] = ClaudeThatOpensThePr(fake_github)
+    eng.providers._overrides["claude"] = ClaudeThatCommits()
     return eng, state_dir
 
 
@@ -589,7 +578,7 @@ def test_disk_and_terminal_failing_on_one_controller_line_never_change_the_outco
     execution = json.loads((progress_log.parent / "execution.json").read_text(encoding="utf-8"))
     assert execution["exit_code"] == 0 and execution["error"] == ""
     result = json.loads((progress_log.parent / "control-result.json").read_text(encoding="utf-8"))
-    assert result["pr_url"] == PR
+    assert result == analyze_payload(eng.origin.head("autoforge/2"))
 
 
 def test_a_failed_stream_ends_with_its_failure_and_logs_its_summary(tmp_path, fake_github):

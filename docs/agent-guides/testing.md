@@ -199,6 +199,16 @@ High-priority coverage includes:
   branch, a non-fast-forward and a lease mismatch are refused, and a
   `pushurl`, `insteadOf`, `core.sshCommand`, `core.hooksPath` or `pre-push`
   hook planted in the shared repository neither redirects a push nor runs
+- `ANALYZE_EXECUTE`'s publication (#161, `tests/test_engine.py`, engine
+  built with `origin=True`): the controller pushes the agent's commit and
+  opens the PR (or adopts the open unmarked PR on the branch) and reads it
+  back; every candidate refusal (another issue, a `head_sha` other than the
+  worktree's, an attached `HEAD`, nothing committed, unrelated history, a
+  commit message closing another issue or carrying a credential, a body
+  linking the issue itself) is a correction with nothing published; the
+  entry blocks before launching on a PR it would not publish to; a marker
+  PR the agent opened itself, a branch pushed by someone else, or GitHub
+  changing under the run blocks with nothing published
 
 ### Recovery
 
@@ -214,6 +224,12 @@ High-priority coverage includes:
   posted or adopted comment writes no roadmap and switches no issue
 - dry-run executing no effect: the `UPDATE_EPIC` plan is built with a
   GitHub client that fails the test on any use
+- `ANALYZE_EXECUTE` across its crash windows: a crash after the plan was
+  saved completes from the journal without the agent; a PR create whose
+  reply was lost is read back, not resent, and one that never landed is
+  sent again by the next process; a branch moved after the plan conflicts
+  and `unblock` completes the plan; a dry run plans the publication and
+  sends nothing
 
 ### Integration
 

@@ -37,7 +37,11 @@ redacted), no closing keyword followed by an issue reference, and no
 ``@``-mention outside code. :func:`published_text_problem` judges one field,
 :func:`published_payload_problem` a whole rendered payload and
 :func:`commit_message_problem` a commit message; each names the subject and
-the rule, never the text. An UPDATE_EPIC result is validated against the
+the rule, never the text. An ANALYZE_EXECUTE result carries the PR title
+and body the controller publishes (``pr_title``, ``pr_body``), under that
+policy and bounded (``MAX_PR_TITLE_CHARS``, ``MAX_PR_BODY_CHARS``), plus
+the issue URL and the candidate SHA as cross-checks; it names no PR, branch
+or push target (#161). An UPDATE_EPIC result is validated against the
 schema of the request that launched the agent (:class:`UpdateEpicRequest`,
 D4.7): a re-request after publication carries only what it asks for.
 """
@@ -151,6 +155,18 @@ MAX_ROADMAP_SECTION_CHARS = 32768
 # comment must stay far under GitHub's 65,536-character comment limit.
 # Rejected, never clipped, like every other published field.
 MAX_PROGRESS_CHARS = 16384
+# Bounds on the PR text an ANALYZE_EXECUTE result carries (#161). The
+# controller creates the PR with this title and with the body followed by
+# its own ``Closes #n`` and implementation marker, so the body leaves room
+# for those under GitHub's 65,536-character body limit and the effect
+# payload's bound; the title is the effect's one-line title bound. Rejected,
+# never clipped, like every other published field.
+MAX_PR_TITLE_CHARS = 256
+MAX_PR_BODY_CHARS = 60000
+# Bounds on the ``tests`` list: names of what the agent ran, recorded with
+# the result and never published.
+MAX_TESTS_REPORTED = 50
+MAX_TEST_CHARS = 500
 
 
 class UpdateEpicRequest(StrEnum):
@@ -656,20 +672,54 @@ def commit_message_problem(message: str, *, repository: str, issue_number: int) 
 # -- typed per-phase models -----------------------------------------------
 @dataclass
 class AnalyzeExecuteResult:
+    """What an implementation agent reports; the controller publishes it (#161).
+
+    ``issue_url`` and ``head_sha`` are cross-checks against the run's issue
+    and the worktree's ``HEAD``, which the controller reads itself; neither
+    is a target. ``pr_title`` and ``pr_body`` are the agent's text for the PR
+    the controller creates: bounded, held to the published-content policy,
+    and never carrying a marker (the controller appends ``Closes #n`` and
+    the marker itself). ``tests`` names what the agent ran.
+    """
+
     issue_url: str
-    pr_url: str
     head_sha: str
-    branch: str
+    pr_title: str
+    pr_body: str
+    tests: list[str] = field(default_factory=list)
 
     @classmethod
     def from_payload(cls, p: dict) -> AnalyzeExecuteResult:
         ph = "ANALYZE_EXECUTE"
+        issue_url = _req_url(p, "issue_url", ph, "issue")
+        head_sha = _req_sha(p, "head_sha", ph)
+        title = _bounded(_req_str(p, "pr_title", ph), ph, "result", "pr_title", MAX_PR_TITLE_CHARS)
+        title = _analyze_published(_one_line(title, ph, "result", "pr_title"), "pr_title")
+        body = _bounded(_req_str(p, "pr_body", ph), ph, "result", "pr_body", MAX_PR_BODY_CHARS)
+        body = _analyze_published(_multi_line(body, ph, "result", "pr_body"), "pr_body")
+        tests = _opt_str_list(p, "tests", ph)
+        if len(tests) > MAX_TESTS_REPORTED:
+            raise ControlResultValidationError(
+                f"{ph}: field 'tests' lists {len(tests)} entries; the controller accepts at "
+                f"most {MAX_TESTS_REPORTED}. Summarise them and re-emit the CONTROL_RESULT."
+            )
+        for test in tests:
+            _one_line(_bounded(test, ph, "result", "tests", MAX_TEST_CHARS), ph, "result", "tests")
         return cls(
-            issue_url=_req_url(p, "issue_url", ph, "issue"),
-            pr_url=_req_url(p, "pr_url", ph, "pr"),
-            head_sha=_req_sha(p, "head_sha", ph),
-            branch=_req_str(p, "branch", ph),
+            issue_url=issue_url,
+            head_sha=head_sha,
+            pr_title=title,
+            pr_body=body,
+            tests=tests,
         )
+
+
+def _analyze_published(text: str, key: str) -> str:
+    """Refuse ANALYZE_EXECUTE field ``key`` under the published-content policy."""
+    problem = published_text_problem(key, text)
+    if problem is not None:
+        raise ControlResultValidationError(f"ANALYZE_EXECUTE: field {problem}")
+    return text
 
 
 # Control characters a *multi-line* text field may still carry: a newline

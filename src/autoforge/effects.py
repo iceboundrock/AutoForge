@@ -196,7 +196,7 @@ LABEL_NONE = ""
 LABEL_AGENT_PUBLISHES = "agent_publishes"
 LABEL_CONTROLLER_PUBLISHES = "controller_publishes"
 LAUNCH_LABELS = frozenset({LABEL_NONE, LABEL_AGENT_PUBLISHES, LABEL_CONTROLLER_PUBLISHES})
-CONTROLLER_PUBLISHED_PHASES = frozenset({Phase.UPDATE_EPIC})
+CONTROLLER_PUBLISHED_PHASES = frozenset({Phase.ANALYZE_EXECUTE, Phase.UPDATE_EPIC})
 
 
 def launch_label_for(phase: Phase) -> str:
@@ -1107,7 +1107,14 @@ def _context_header(raw: object, keys: Sequence[str], binding: Binding, phase: P
 
 @dataclass(frozen=True)
 class AnalyzeContext:
-    """``ANALYZE_EXECUTE``: no result data; completion persists K1's and K2's/K3's results."""
+    """``ANALYZE_EXECUTE``: no result data; completion persists K1's and K2's/K3's results.
+
+    The plan saved with it is the push (K1) at position 0, then either the
+    implementation PR (K2) on the pushed branch or the adoption (K3), and the
+    push is the one the entry observation explains: its base is the
+    observed default-branch head and its expected old value the observed
+    head of its ref (#161).
+    """
 
     issue_url: str
 
@@ -1115,10 +1122,40 @@ class AnalyzeContext:
     STORED_BOUND = MAX_URL_CHARS + 2 * _KEY_OVERHEAD
 
     @classmethod
-    def from_dict(cls, raw: object, binding: Binding, **_: object) -> AnalyzeContext:
+    def from_dict(
+        cls,
+        raw: object,
+        binding: Binding,
+        *,
+        records: Sequence[EffectRecord] = (),
+        observation: EntryObservation | None = None,
+        **_: object,
+    ) -> AnalyzeContext:
+        what = "ANALYZE_EXECUTE completion context"
         data = _context_header(raw, ("issue_url",), binding, cls.PHASE)
-        _issue_url(data["issue_url"], "ANALYZE_EXECUTE completion context.issue_url")
-        binding.check_issue(data["issue_url"], "ANALYZE_EXECUTE completion context")
+        _issue_url(data["issue_url"], f"{what}.issue_url")
+        binding.check_issue(data["issue_url"], what)
+        kinds = [r.kind for r in records]
+        if kinds not in (
+            [EffectKind.PUSH, EffectKind.IMPLEMENTATION_PR],
+            [EffectKind.PUSH, EffectKind.ADOPT_PR],
+        ):
+            _fail(what, "must be saved with a push then a PR create or adoption")
+        if observation is None:
+            _fail(what, "must be saved with the entry observation it is checked against")
+        push = records[0]
+        ref = push.target["ref"]
+        if ref not in observation.refs:
+            _fail(what, "pushes a ref the entry observation did not read")
+        if push.precondition["expected_old"] != observation.refs[ref]:
+            _fail(what, "pushes over another head than the entry observed on its ref")
+        if push.precondition["base_sha"] != observation.base_sha:
+            _fail(what, "pushes a candidate checked against another base than the entry read")
+        second = records[1]
+        if second.kind is EffectKind.IMPLEMENTATION_PR and (
+            "refs/heads/" + str(second.target["head"]) != ref
+        ):
+            _fail(what, "opens its PR from another branch than the one it pushes")
         return cls(data["issue_url"])
 
     def to_dict(self) -> dict:

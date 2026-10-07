@@ -296,10 +296,10 @@ malformed result, verification failure, refused run-log write, crash). In
 every one of those the agent may already have done its GitHub work. GitHub
 is the source of truth, so every REMOTE phase that launches an agent reads
 GitHub before launching anyone, in one place (`_remote_entry`), exactly as
-`ANALYZE_EXECUTE` recovers an existing open PR. The correction relaunch
-after a malformed result is a re-entry too and runs the same probe first:
-an agent that posted, pushed or created and then lost its result block is
-reconciled with, not relaunched unaware. The table of what each phase's
+`ANALYZE_EXECUTE` reads its journal and the issue's PRs first. The
+correction relaunch after a malformed result is a re-entry too and runs the
+same probe first: an agent that posted, pushed or created and then lost its
+result block is reconciled with, not relaunched unaware. The table of what each phase's
 re-entry does is complete by construction: every phase with an agent prompt
 has an entry, and a test holds the two tables together.
 
@@ -315,16 +315,22 @@ launched) and the read-back rejects the result. The entry never adopts
 what the read-back would refuse, and the read-back never accepts what the
 next entry could not find again.
 
-- `ANALYZE_EXECUTE` adopts the open PR carrying the issue's
+- `ANALYZE_EXECUTE` publishes nothing through its agent (#161): the
+  controller pushes the agent's commit and opens or adopts the PR from one
+  persisted plan. Its entry reads that journal first: a persisted plan is
+  completed from its records without launching the agent. Otherwise, at a
+  fresh entry, it adopts the open PR carrying the issue's
   `ai-implementation` marker (the persisted PR, or the one found by a
   complete listing of the repository's open PRs, read to the end), if one
   exists, without launching the agent; two candidates block, and so does a
   listing that cannot be read to its end, since "none exists" is then not
-  knowable. A
-  PR is identified by that marker alone, never by its branch name or a
-  linked issue; the read-back after the agent holds the reported PR to the
-  same rule (github-safety.md, "Before ANALYZE_EXECUTE"), and so does the
-  replan transaction for its replacement PR (replan-transaction.md).
+  knowable. After a launch of the entry, a marker PR the entry observation
+  did not record was not opened by the controller and blocks, as does a
+  branch head other than the recorded one. A PR is identified by that
+  marker alone, never by its branch name or a linked issue; the read-back
+  after the controller's own write holds the PR to the same rule
+  (github-safety.md, "Before ANALYZE_EXECUTE"), and so does the replan
+  transaction for its replacement PR (replan-transaction.md).
 - `REVIEW` reads the PR comments for the `ai-review-result` marker of the
   upcoming round at the bound HEAD, base *and merge base* (all re-read
   from GitHub by this entry). One such comment is handed to the reviewer
@@ -427,11 +433,14 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   only entry and the operator path never replays that transaction; an
   exhausted `workflow.max_total_steps` refuses, naming the setting to raise.
   Then the recovery inspection of the phase being re-entered runs against
-  GitHub: with no PR bound, the issue must be selectable and the strict
+  GitHub: with no PR bound, the issue must be selectable and either a
+  persisted `ANALYZE_EXECUTE` plan exists (the re-entry completes its push
+  and PR from the records, without launching the agent) or the strict
   marker listing of `ANALYZE_EXECUTE`'s entry must resolve (one adoptable PR
-  or none), and a conclusive GitHub failure of either read refuses exactly
-  as it does with a PR bound; with a PR bound, the PR is re-read and its
-  state, HEAD and base are compared with the persisted review binding.
+  or none, adopted at the fresh entry the unblock starts), and a conclusive
+  GitHub failure of either read refuses exactly as it does with a PR bound;
+  with a PR bound, the PR is re-read and its state, HEAD and base are
+  compared with the persisted review binding.
 - **Identity first.** A review binding (`reviewed_pr_url`) that names a PR
   other than `current_pr_url` refuses before the live PR state is even
   considered, as the merge gate does from state alone: review evidence is

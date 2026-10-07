@@ -45,7 +45,9 @@ Concretely:
 - Use the `gh` CLI for GitHub reads/writes and `git` for repository work.
 - Your working directory (the directory you were launched in) is a git
   worktree the controller created for this issue. Do all repository work
-  there: fetch, check out, commit and push from it. Never `cd` into,
+  there, and only the git and GitHub operations the phase section below
+  assigns to you: where it says the controller pushes and publishes, you
+  neither push, publish nor fetch. Never `cd` into,
   check out, commit in, reset or otherwise touch the operator's checkout or
   any other worktree of the repository, and never run `git worktree add`,
   `git worktree remove`, `git worktree move` or `git worktree prune`. The
@@ -61,9 +63,10 @@ Concretely:
   had to be. Stop what you start before you exit, and never rely on a
   background process for a later phase.
 - Do not modify AutoForge controller state (`.autoforge/`), and do not commit it.
-- Before performing a GitHub or git operation that may already have happened
-  (branch push, PR creation, comment, follow-up issue), first inspect the real
-  current state and reuse what exists instead of duplicating it.
+- Before performing a GitHub or git operation your phase assigns to you
+  that may already have happened (branch push, PR creation, comment,
+  follow-up issue), first inspect the real current state and reuse what
+  exists instead of duplicating it.
 
 ## Output protocol (mandatory)
 

@@ -173,7 +173,9 @@ that index is always into a value of accepted size. `escape_inline` and the
 resolution indentation stay in the renderer unchanged, as the defence for
 state persisted by a controller without this rule or edited by hand. Fields
 that are not rendered on one line of a prompt (`summary`, `message`,
-`branch`, `tests_attempted`, LOCAL `observations`) keep their existing rules.
+`tests_attempted`, LOCAL `observations`) keep their existing rules; the
+one-line `ANALYZE_EXECUTE` fields are under the rule ("ANALYZE_EXECUTE
+fields" below).
 
 ### Fix payload bounds
 
@@ -206,7 +208,7 @@ have the shape of a git SHA (`_SHA_RE`, the same rule as every required SHA
 field; see "SHA fields" above); a SHA rejection quotes the value only when
 it is short enough to be one and otherwise states its length. Every URL
 field (`follow_up_issue_url`,
-`issue_url`, `pr_url`, `review_comment_url`, `next_issue_url`) is bounded by
+`issue_url`, `review_comment_url`, `next_issue_url`) is bounded by
 length before `validation.parse_*` sees it, because those parsers quote the
 URL in their error and that error reaches the correction prompt and the run
 log; a malformed `follow_up_issue_url` is thereby a validation error of the
@@ -219,6 +221,36 @@ a claimed issue must carry, "After UPDATE_EPIC"), and an
 oversized value is never quoted into `next_issue_rejections`, the
 re-selection prompt or the run log. The fix prompts state the bounds
 through template variables filled from the same constants.
+
+### ANALYZE_EXECUTE fields
+
+The agent publishes nothing in `ANALYZE_EXECUTE` (ADR 0004, #161): it
+commits on its worktree's detached `HEAD`, and the controller pushes that
+commit to `autoforge/<n>` and opens (or adopts) the PR with the agent's
+text. The result therefore names no PR, branch or push target; `pr_url`
+and `branch` are not keys of this phase any more.
+
+| Key | Rule |
+|---|---|
+| `issue_url` | required issue URL, bounded by `MAX_URL_CHARS`; the engine compares it with the run's issue by identity (repository and number), never as a string |
+| `head_sha` | required SHA ("SHA fields" above); a cross-check only: the engine reads the worktree's `HEAD` itself and refuses a value that differs from it |
+| `pr_title` | required, one line (no control character), at most `MAX_PR_TITLE_CHARS` (256) |
+| `pr_body` | required, multi-line (newline and tab only), at most `MAX_PR_BODY_CHARS` (60000), leaving room for the two lines the controller appends under GitHub's body limit |
+| `tests` | optional list of one-line strings, at most `MAX_TESTS_REPORTED` (50) entries of `MAX_TEST_CHARS` (500); recorded, never published |
+
+Every bound rejects, never clips, and the message states the size and the
+limit, never the text. `pr_title` and `pr_body` pass the published-content
+policy (`published_text_problem`; [github-safety.md](github-safety.md),
+"Published content"): no controller marker opener, no credential class, no
+closing keyword followed by an issue reference (the controller writes
+`Closes #n` itself, after the body), and no `@`-mention outside code. What
+the parser cannot see is the engine's: the worktree's `HEAD` (detached,
+equal to `head_sha`, descending from the recorded base and branch head),
+the commit messages of the published range (`commit_message_problem`), and
+the composed body (the agent's body, `Closes #n` and the marker) judged as a
+whole with `published_payload_problem`. Each refusal is an ordinary
+correction with nothing pushed or created
+([github-safety.md](github-safety.md), "After ANALYZE_EXECUTE").
 
 ### UPDATE_EPIC fields
 

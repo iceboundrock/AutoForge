@@ -231,19 +231,19 @@ def _unique_issues(objects: Iterable[IssueInfo]) -> list[IssueInfo]:
     return out
 
 
-def _append_problem(what: str, kind: MarkerKind, payload: str) -> str:
-    """D5.5: why a rebased payload may not be persisted, or "".
+def append_problem(what: str, kind: MarkerKind, payload: str) -> str:
+    """D5.5: why a composed append payload may not be persisted, or "".
 
     The same rules the record's payload is validated with on save (size, no
-    NUL or DEL, redaction-invariant), checked first so a rebase that fails
-    them is a ``conflict`` instead of a save error, plus the marker kind's
-    own scan: the composed body must leave every marker of ``kind``
-    readable. The answer names ``what`` and the pattern class, never the
-    matched text or the body.
+    NUL or DEL, redaction-invariant), checked first so a rebase (or a plan,
+    #161) that fails them is a ``conflict`` or a block instead of a save
+    error, plus the marker kind's own scan: the composed body must leave
+    every marker of ``kind`` readable. The answer names ``what`` and the
+    pattern class, never the matched text or the body.
     """
     if len(payload) > MAX_BODY_CHARS:
         return (
-            f"the rebased body of {what} would be {len(payload)} characters, over the "
+            f"the composed body of {what} would be {len(payload)} characters, over the "
             f"{MAX_BODY_CHARS}-character limit"
         )
     if "\x00" in payload or "\x7f" in payload:
@@ -257,7 +257,7 @@ def _append_problem(what: str, kind: MarkerKind, payload: str) -> str:
         )
     if scan(kind, payload).defects:
         return (
-            f"the rebased body of {what} would carry a malformed or repeated {kind.name} "
+            f"the composed body of {what} would carry a malformed or repeated {kind.name} "
             "marker; the body read now is not one the block can be appended to"
         )
     return ""
@@ -505,7 +505,7 @@ class AdoptPrOp:
             carries_block_marker=(
                 record.marker in pr.body or any(c.key == claim.key for c in found.claims)
             ),
-            rebase_problem=lambda payload: _append_problem(pr_url, IMPLEMENTATION, payload),
+            rebase_problem=lambda payload: append_problem(pr_url, IMPLEMENTATION, payload),
         )
 
     def issue(self, record: EffectRecord) -> None:
@@ -675,7 +675,7 @@ class FollowUpAppendOp:
             carries_block_marker=(
                 any(m in issue.body for m in markers) or any(c.key in keys for c in found.claims)
             ),
-            rebase_problem=lambda payload: _append_problem(issue_url, FOLLOW_UP, payload),
+            rebase_problem=lambda payload: append_problem(issue_url, FOLLOW_UP, payload),
         )
 
     def issue(self, record: EffectRecord) -> None:

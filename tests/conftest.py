@@ -27,6 +27,7 @@ from autoforge.errors import (  # noqa: E402
     GitHubUnavailableError,
 )
 from autoforge.executor import ExecutionResult  # noqa: E402
+from autoforge.git_transport import GitRemote  # noqa: E402
 from autoforge.github import (  # noqa: E402
     ChangedFile,
     ChangedFiles,
@@ -170,7 +171,7 @@ def post_progress_comment(gh: FakeGitHub, cid: int = 300) -> None:
 
 
 def implementation_pr_body(issue_url: str = ISSUE) -> str:
-    """A PR body carrying the issue's implementation marker (what the agent must write)."""
+    """A PR body carrying the issue's implementation marker (an existing implementation PR)."""
     from autoforge.engine import render_implementation_marker
 
     return f"Closes {issue_url}\n\n{render_implementation_marker(issue_url)}\n"
@@ -364,10 +365,58 @@ class FakeGitHub:
         # Every call of the named effect identity read (commit_in_history,
         # latest_issue_number, list_issues_above, list_prs_for_head) raises this.
         self.effect_read_errors: dict[str, BaseException] = {}
+        # The bare repository standing in for GitHub's git data (attach_origin).
+        # Once attached, a branch head ``branch_heads`` does not override is
+        # read from it, an open same-repository PR's head follows each move of
+        # its branch there (unless ``pr_heads_lag``: GitHub has not caught up
+        # with a push yet), and ``commit_in_history`` asks it when ``history``
+        # is unset.
+        self.origin: Origin | None = None
+        self.pr_heads_lag: bool = False
+        self._origin_seen: dict[str, str] = {}
+        # Issues and PRs up to this number exist beyond the fake's listings
+        # (GitHub's one shared sequence): a created PR or issue gets the next.
+        self.last_number: int = 0
         self.add_issue(EPIC, "EPIC")
         self.add_issue(ISSUE, "Feature")
 
     # -- test helpers ---------------------------------------------------------
+    def attach_origin(self, origin: Origin) -> None:
+        """Back branch heads, PR heads and ancestry with ``origin`` (#161).
+
+        Its ``main`` becomes the default branch head (and the base branch's
+        `push` run moves there with it); the next PR a controller creates is
+        ``PR`` (#42), as the rest of the fake assumes.
+        """
+        main = origin.head("main")
+        assert main is not None, "the origin has no main branch"
+        self.origin = origin
+        self.branch_heads.pop("main", None)
+        self.workflow_runs[BASE_RUN_ID] = workflow_run(
+            BASE_RUN_ID, main, event="push", head_branch="main"
+        )
+        self.last_number = max(self.last_number, 41)
+
+    def _follow_origin(self) -> None:
+        """An open same-repository PR's head moves when its origin branch does, as on GitHub.
+
+        Only a move is followed: a head a test set with :meth:`set_head`
+        stands until the branch itself moves again.
+        """
+        if self.origin is None or self.pr_heads_lag:
+            return
+        for url, p in self.prs.items():
+            if not p.is_open or (
+                p.head_repository and not self._same_repo(p.head_repository, p.repository)
+            ):
+                continue
+            sha = self.origin.head(p.head_ref)
+            if sha is None or self._origin_seen.get(p.head_ref) == sha:
+                continue
+            self._origin_seen[p.head_ref] = sha
+            if sha != p.head_sha:
+                self.set_head(sha, url)
+
     def add_issue(
         self, url: str, title: str = "t", state: str = "OPEN", body: str = ""
     ) -> IssueInfo:
@@ -498,6 +547,7 @@ class FakeGitHub:
         from autoforge.validation import parse_pr_url
 
         ref = parse_pr_url(url)
+        self._follow_origin()
         for known, info in self.prs.items():
             if parse_pr_url(known).same_target(ref):
                 return info
@@ -601,10 +651,15 @@ class FakeGitHub:
     def get_branch_head_sha(self, repository: str, branch: str) -> str:
         self.calls.append(("get_branch_head_sha", repository, branch))
         self._actions_failure()
-        try:
+        return self._branch_head(branch)
+
+    def _branch_head(self, branch: str) -> str:
+        if branch in self.branch_heads:
             return self.branch_heads[branch]
-        except KeyError:
-            raise GitHubNotFoundError(f"branch not found: {branch}") from None
+        sha = self.origin.head(branch) if self.origin is not None else None
+        if sha is None:
+            raise GitHubNotFoundError(f"branch not found: {branch}")
+        return sha
 
     def get_merge_base_sha(self, repository: str, base_ref: str, head_sha: str) -> str:
         self.calls.append(("get_merge_base_sha", repository, base_ref, head_sha))
@@ -637,6 +692,7 @@ class FakeGitHub:
 
     def list_open_prs(self, repo: str) -> list[PRInfo]:
         self.calls.append(("list_open_prs", repo))
+        self._follow_origin()
         if self.open_pr_listing_incomplete:
             raise GitHubError(
                 f"open PR listing of {repo} cannot be read to its end: page 2 announces a "
@@ -650,6 +706,7 @@ class FakeGitHub:
 
     def list_all_prs(self, repo: str, *, strict: bool = False) -> list[PRInfo]:
         self.calls.append(("list_all_prs", repo, strict))
+        self._follow_origin()
         if strict and self.pr_listing_truncated:
             raise GitHubError(
                 f"{repo} has at least 1000 pull requests, so the listing may be "
@@ -857,7 +914,7 @@ class FakeGitHub:
         numbers += [
             p.number for p in self.prs.values() if self._same_repo(p.repository, repository)
         ]
-        return max(numbers, default=0) + 1
+        return max([*numbers, self.last_number]) + 1
 
     def _new_comment(self, parent_url: str, body: str) -> CreatedObject:
         cid = 950_000 + len(self.effect_writes)
@@ -891,7 +948,7 @@ class FakeGitHub:
     def create_pull_request(
         self, repository: str, *, base: str, head: str, title: str, body: str
     ) -> CreatedObject:
-        """Open a PR from ``head`` (a branch in ``branch_heads``) onto ``base``.
+        """Open a PR from ``head`` (a branch in ``branch_heads`` or the origin) onto ``base``.
 
         As on GitHub: an unknown head branch, or an open PR already headed at
         it onto the same base, is a conclusive 422; ``Closes #n`` style
@@ -905,8 +962,10 @@ class FakeGitHub:
         self._write_bounds("create_pull_request", body, title)
 
         def perform() -> CreatedObject:
-            if head not in self.branch_heads:
-                raise GitHubError("gh: Validation Failed (HTTP 422): head invalid")
+            try:
+                head_sha = self._branch_head(head)
+            except GitHubNotFoundError:
+                raise GitHubError("gh: Validation Failed (HTTP 422): head invalid") from None
             for p in self.prs.values():
                 if (
                     p.is_open
@@ -927,7 +986,7 @@ class FakeGitHub:
             ]
             info = self.add_pr(
                 f"https://github.com/{repository}/pull/{number}",
-                head_sha=self.branch_heads[head],
+                head_sha=head_sha,
                 branch=head,
                 body=body,
                 base_ref=base,
@@ -987,6 +1046,8 @@ class FakeGitHub:
         for sha in (base_sha, commit_sha):
             if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha.lower()):
                 raise GitHubError(f"commit_in_history: {sha!r} is not a full commit SHA")
+        if self.history is None and self.origin is not None:
+            return self.origin.is_ancestor(commit_sha.lower(), base_sha.lower())
         assert self.history is not None, "FakeGitHub.history is not set"
         return self.history(repository, base_sha.lower(), commit_sha.lower())
 
@@ -1008,6 +1069,7 @@ class FakeGitHub:
 
     def list_prs_for_head(self, repository: str, branch: str) -> list[PRInfo]:
         self._effect_read("list_prs_for_head", repository, branch)
+        self._follow_origin()
         prs = [
             replace(p)
             for p in self.prs.values()
@@ -1062,6 +1124,138 @@ def git_repo(path) -> Path:
     return root
 
 
+GIT_IDENT = ("-c", "user.name=AutoForge tests", "-c", "user.email=tests@example.invalid")
+
+
+def git_out(*args: str) -> str:
+    """``git`` with ``args``; its stdout, stripped. A failure fails the test."""
+    res = subprocess.run(["git", *args], capture_output=True, text=True)
+    assert res.returncode == 0, f"git {' '.join(args)}: {res.stderr}"
+    return res.stdout.strip()
+
+
+class Origin:
+    """A bare repository standing in for GitHub's copy of the repository (#161).
+
+    The controller's own git transport fetches from and pushes to it over
+    ``file://``, never over the network. Attached to a :class:`FakeGitHub`
+    (:meth:`FakeGitHub.attach_origin`) it backs branch heads, PR heads and
+    ancestry reads, as GitHub's API reflects its git data. ``gh`` is the
+    stand-in the transport resolves before any network git runs: a
+    ``file://`` remote never asks it for a credential.
+    """
+
+    def __init__(self, bare: Path, gh: Path) -> None:
+        self.bare = bare
+        self.gh = gh
+
+    @classmethod
+    def seeded(cls, where, checkout) -> Origin:
+        """A bare origin in ``where`` whose ``main`` is ``checkout``'s HEAD."""
+        where = Path(where)
+        bare = where / "origin.git"
+        git_out("init", "-q", "--bare", "-b", "main", str(bare))
+        gh = where / "fake-gh"
+        gh.write_text("#!/bin/sh\nexit 1\n")
+        gh.chmod(0o755)
+        origin = cls(bare, gh)
+        origin.publish(checkout, "HEAD", "main")
+        return origin
+
+    @property
+    def url(self) -> str:
+        return f"file://{self.bare}"
+
+    def head(self, branch: str) -> str | None:
+        res = subprocess.run(
+            ["git", f"--git-dir={self.bare}", "rev-parse", "-q", "--verify"]
+            + [f"refs/heads/{branch}"],
+            capture_output=True,
+            text=True,
+        )
+        return res.stdout.strip() if res.returncode == 0 else None
+
+    def is_ancestor(self, ancestor: str, sha: str) -> bool:
+        """GitHub's compare: False for a commit it does not hold."""
+        res = subprocess.run(
+            ["git", f"--git-dir={self.bare}", "merge-base", "--is-ancestor", ancestor, sha],
+            capture_output=True,
+        )
+        return res.returncode == 0
+
+    def publish(self, repo, rev: str, branch: str) -> str:
+        """A push that is not the controller's (a test's, an agent's, a human's)."""
+        sha = git_out("-C", str(repo), "rev-parse", f"{rev}^{{commit}}")
+        git_out("-C", str(repo), "push", "-q", "-f", self.url, f"{sha}:refs/heads/{branch}")
+        return sha
+
+    def delete(self, branch: str) -> None:
+        git_out(f"--git-dir={self.bare}", "update-ref", "-d", f"refs/heads/{branch}")
+
+
+def attach_origin(eng: ControllerEngine, where=None) -> Origin:
+    """Give ``eng`` a seeded bare origin as its git remote and its GitHub's git data.
+
+    ``where`` defaults to the parent of the engine's state directory (the
+    test's tmp_path). The engine's ``gh`` becomes the origin's stand-in.
+    """
+    root = Path(where) if where is not None else Path(eng.paths.state_dir).parent
+    origin = Origin.seeded(root, eng.workdir)
+    connect_origin(eng, origin)
+    gh = eng.github
+    assert isinstance(gh, FakeGitHub)
+    gh.attach_origin(origin)
+    return origin
+
+
+def connect_origin(eng: ControllerEngine, origin: Origin) -> None:
+    """Point ``eng``'s own git transport at ``origin`` (an engine built later, e.g. by the CLI)."""
+    eng._git_remote = GitRemote(url=origin.url)
+    eng.config.github.command = str(origin.gh)
+
+
+def commit_in(cwd, message: str = "Implement the feature (#2)") -> str:
+    """One (empty) commit on the agent worktree's detached HEAD; the new HEAD."""
+    git_out("-C", str(cwd), *GIT_IDENT, "commit", "-q", "--allow-empty", "-m", message)
+    return git_out("-C", str(cwd), "rev-parse", "HEAD")
+
+
+def analyze_payload(head_sha: str, **overrides) -> dict:
+    """An ANALYZE_EXECUTE success result reporting ``head_sha`` (#161 schema)."""
+    return {
+        "phase": "ANALYZE_EXECUTE",
+        "status": "success",
+        "issue_url": ISSUE,
+        "head_sha": head_sha,
+        "pr_title": "Add the feature",
+        "pr_body": "Adds the feature.\n\nTested with `pytest`.",
+        "tests": ["pytest: passed"],
+        **overrides,
+    }
+
+
+def implement(req, **overrides) -> str:
+    """An implementation agent: one commit in its worktree, reported in a CONTROL_RESULT."""
+    return block(analyze_payload(commit_in(req.cwd), **overrides))
+
+
+def scripted(*steps) -> Callable:
+    """A ScriptedProvider handler answering call N with ``steps[N]``.
+
+    A step is a stdout string, or a handler called with the request (such as
+    :func:`implement`); once the steps run out every call gets "".
+    """
+    queue = list(steps)
+
+    def handler(req) -> str:
+        if not queue:
+            return ""
+        step = queue.pop(0)
+        return step(req) if callable(step) else step
+
+    return handler
+
+
 def make_engine(
     state_dir,
     script=None,
@@ -1069,11 +1263,15 @@ def make_engine(
     cfg=None,
     exit_code: int = 0,
     workdir=None,
+    origin: bool = False,
 ):
     """Engine wired to a ScriptedProvider (agents) and FakeGitHub (verification).
 
     ``workdir`` defaults to the parent of ``state_dir`` (the test's tmp_path),
     made a git repository so the engine can derive its repository lock.
+    ``origin`` attaches a seeded bare origin (:func:`attach_origin`), which
+    an ANALYZE_EXECUTE entry needs: the controller fetches from and pushes
+    to it (#161). The engine keeps it as ``eng.origin``.
     """
     cfg = cfg or default_config()
     if workdir is None:
@@ -1086,7 +1284,29 @@ def make_engine(
     )
     eng.new_run(EPIC, ISSUE)
     eng.provider = provider  # type: ignore[attr-defined]
+    if origin:
+        eng.origin = attach_origin(eng)  # type: ignore[attr-defined]
     return eng
+
+
+@pytest.fixture(autouse=True)
+def _no_network_git_remote(monkeypatch):
+    """No test reaches GitHub through the controller's own git transport (#161).
+
+    An engine whose test did not give it a local origin would fetch from
+    ``https://github.com/<repository>.git``; that fails the test instead.
+    """
+    import autoforge.engine as engine_module
+
+    class LocalOnly(GitRemote):
+        @classmethod
+        def https(cls, repository: str) -> GitRemote:
+            raise AssertionError(
+                f"a test reached the network git remote of {repository}; build the engine "
+                "with make_engine(..., origin=True) or attach_origin(eng)"
+            )
+
+    monkeypatch.setattr(engine_module, "GitRemote", LocalOnly)
 
 
 @pytest.fixture

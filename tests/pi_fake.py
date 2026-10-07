@@ -294,19 +294,22 @@ def flag(argv: list[str], name: str) -> str:
     return argv[argv.index(name) + 1]
 
 
-def make_pi_engine(state_dir, fake: PiFake, script, github=None, cfg=None, names=None):
+def make_pi_engine(
+    state_dir, fake: PiFake, script, github=None, cfg=None, names=None, origin: bool = False
+):
     """``make_engine`` with ``names`` (default: every profile) routed to Pi on ``fake``.
 
     The same ``script`` drives both providers: the profiles left on Claude
     Code run it through the engine's ``ScriptedProvider`` (``eng.provider``),
-    the Pi ones through a :class:`ScriptedPi` (``eng.pi``).
+    the Pi ones through a :class:`ScriptedPi` (``eng.pi``). ``origin`` is
+    :func:`tests.conftest.make_engine`'s.
     """
     from autoforge.config import default_config
     from tests.conftest import make_engine
 
     cfg = cfg or default_config()
     route_to_pi(cfg, fake, names)
-    eng = make_engine(state_dir, script, github=github, cfg=cfg)
+    eng = make_engine(state_dir, script, github=github, cfg=cfg, origin=origin)
     eng.pi = ScriptedPi(fake, script)
     eng.providers._overrides["pi"] = eng.pi
     return eng

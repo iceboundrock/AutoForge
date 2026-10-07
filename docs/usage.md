@@ -57,7 +57,7 @@ does not need one).
 ## What a run does
 
 ```text
-Issue → ANALYZE_EXECUTE (Claude Code) → PR → REVIEW (OpenCode)
+Issue → ANALYZE_EXECUTE (Claude Code) → controller pushes, opens PR → REVIEW (OpenCode)
        → clean ───────────────────────────────▶ READY_FOR_MERGE
        → findings ────────────────────────────▶ FIX (Claude Code) → REVIEW …
        → excessive / low-finding stagnation ──▶ REPLAN_REEXECUTE (OpenCode)
@@ -71,7 +71,7 @@ never advances the state machine. In brief:
 | Phase | Who | What the controller checks |
 |---|---|---|
 | `INITIALIZING` | controller | cwd repo == issue repo, issue is in this repo, is not the EPIC, exists and is OPEN |
-| `ANALYZE_EXECUTE` | Claude Code (`analyze_execute`) | an open PR already carrying the issue's `ai-implementation` marker is adopted without running the agent (two block); afterwards the PR exists in this repo, is OPEN, its HEAD SHA and branch match the claim, and it is the only open PR carrying the marker |
+| `ANALYZE_EXECUTE` | Claude Code (`analyze_execute`), which makes no GitHub write | an open PR already carrying the issue's `ai-implementation` marker is adopted without running the agent (two block); the agent commits on its worktree's detached HEAD, and the controller checks that HEAD itself (the reported SHA, descent from the default branch head and from the branch head, every commit message), pushes it to `autoforge/<n>`, opens the PR with the agent's title and body (or adopts the open unmarked PR on that branch), journalling each write before it is sent, and reads the PR back at exactly the pushed HEAD; a marker PR or a branch head it did not write blocks |
 | `REVIEW` | OpenCode (`review_round_1`, `review_round_2_5`, `review_round_6_plus`) | the round is bound to the PR, HEAD, base and merge base read from GitHub; exactly one review comment for that round and revision; `needs_fix_round == (len(findings) > 0)`; then controller policy picks `FIX`, `READY_FOR_MERGE`, `REPLAN_REEXECUTE` or `BLOCKED` |
 | `FIX` | Claude Code (`fix`) | the PR is still at the reviewed revision (else back to `REVIEW` without running the fixer); every open finding resolved; a `fixed` resolution moved HEAD; a claimed follow-up issue exists and is OPEN |
 | `REPLAN_REEXECUTE` | OpenCode (`replan_reexecute`) | one durable transaction; the replacement PR is found only by the controller's transaction marker, and the old PR is closed by the controller only while both PRs still match their checkpoints |
@@ -148,8 +148,16 @@ that blocked as a conflict (for example the `UPDATE_EPIC` progress comment
 after its two attempts, or a marker comment the controller did not post)
 names the effect in the reason: perform the write by hand or remove the
 conflicting object, then `unblock`; the controller reconciles the write
-against GitHub again before it issues anything. A LOCAL run cannot be
-unblocked. The decision table is in
+against GitHub again before it issues anything. `ANALYZE_EXECUTE` blocks the
+same way on anything it did not write: a PR carrying the issue's marker
+that appeared while the agent ran (if it is the implementation, `unblock`
+binds it), a push to, creation or deletion of `autoforge/<n>` it did not
+record (inspect the branch; `unblock` reads it again and the agent continues
+from its head), a closed or merged PR on that branch (reopen it to have it
+adopted, or finish the issue by hand), and a push whose branch moved after
+the plan was saved (put the branch back, or delete it if it did not exist,
+then `unblock`: the plan completes without launching the agent). A LOCAL
+run cannot be unblocked. The decision table is in
 [Workflow: leaving BLOCKED](agent-guides/workflow.md#leaving-blocked-the-operators-unblock).
 
 ### DONE and FAILED
@@ -174,7 +182,7 @@ with the time since the launch, the phase and, in a remote run, the issue:
 [00:04:12 ANALYZE_EXECUTE #160] Bash Run the test suite
 [00:06:12 ANALYZE_EXECUTE #160] still running, last activity 14s ago, 312 events
 [00:09:55 ANALYZE_EXECUTE #160] agent exited 0, 841 progress events
-[run-…] ANALYZE_EXECUTE -> REVIEW: PR https://github.com/…/pull/161 verified
+[run-…] ANALYZE_EXECUTE -> REVIEW: pushed 3f2a9c1d0b7e to autoforge/160 and opened PR https://github.com/…/pull/161; ANALYZE_EXECUTE -> REVIEW
 ```
 
 - **Before the launch**, one line names the profile, provider, model and

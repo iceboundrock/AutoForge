@@ -96,7 +96,9 @@ A REMOTE run also records the effect state of the current phase entry (ADR
 - `completion_context`: what the phase needs to finish without relaunching
   its agent once its result is accepted (D4.6). For `UPDATE_EPIC` this is
   the roadmap section, the validated selection, the digests of the EPIC body
-  outside the markers, and which input a persisted rejection voided.
+  outside the markers, and which input a persisted rejection voided. For
+  `ANALYZE_EXECUTE` (#161) it is only the issue: the push and PR records
+  carry everything the completion needs.
 - `launch_label` (D13.3): whether the current entry's launches ran under the
   agent-publishes or the controller-publishes contract of its phase.
 
@@ -117,7 +119,13 @@ the one `progress_comment` record of its own (issue, PR) marker, or with no
 record only when the entry observation records that marker's comment as
 adopted (the D13.7 legacy re-entry). Neither, both, or no entry observation
 is refused, and completion itself refuses to splice the roadmap section or
-switch issues without a posted or adopted comment. Text the recovery path
+switch issues without a posted or adopted comment. An `ANALYZE_EXECUTE`
+completion context loads only with its plan of exactly two records, the
+`push` first and then the `implementation_pr` from the pushed branch or the
+`adopt_pr`, and with the entry observation it is checked against: the push
+is over the head the entry observed on its ref, for a candidate checked
+against the base the entry read. Anything else is refused, so a plan whose
+push no entry read explains is never completed. Text the recovery path
 publishes with no agent result in between is validated again under the
 parser's rules for its field, not only for its bounds and redaction
 invariance: the `UPDATE_EPIC` roadmap section in the

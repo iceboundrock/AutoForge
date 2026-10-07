@@ -14,37 +14,18 @@ from autoforge.locking import ControllerLock, repository_lock_path
 from autoforge.state import save_state
 from autoforge.transitions import Phase
 from tests.conftest import (
-    BRANCH,
     ISSUE,
-    PR,
-    SHA_A,
     FakeGitHub,
-    block,
     git_repo,
-    implementation_pr_body,
+    implement,
     make_engine,
 )
-
-ANALYZE_OK = {
-    "phase": "ANALYZE_EXECUTE",
-    "status": "success",
-    "issue_url": ISSUE,
-    "pr_url": PR,
-    "head_sha": SHA_A,
-    "branch": BRANCH,
-}
 
 
 def _github() -> FakeGitHub:
     gh = FakeGitHub()
     gh.add_issue(ISSUE, "Feature")
     return gh
-
-
-def _analyze_ok(gh: FakeGitHub) -> str:
-    """Agent stdout for ANALYZE_EXECUTE; creates the PR it claims on the fake GitHub."""
-    gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
-    return block(ANALYZE_OK)
 
 
 def _can_lock(path) -> bool:
@@ -106,9 +87,9 @@ def test_run_and_step_inside_locked_reuse_the_held_lock(tmp_state_dir, monkeypat
 
     def agent(req):
         seen.append(_can_lock(eng.lock_path()))
-        return _analyze_ok(gh)
+        return implement(req)
 
-    eng = make_engine(tmp_state_dir, agent, github=gh)
+    eng = make_engine(tmp_state_dir, agent, github=gh, origin=True)
     acquired = _count_acquisitions(monkeypatch)
     with eng.locked():
         eng._save()
@@ -135,7 +116,7 @@ def test_execution_outside_locked_rereads_disk_state_under_its_own_lock(
     seeded.state.phase = Phase.ANALYZE_EXECUTE
     seeded._save()
 
-    eng = make_engine(tmp_state_dir, lambda req: _analyze_ok(gh), github=gh)
+    eng = make_engine(tmp_state_dir, implement, github=gh)
     snapshot = eng.load()
     assert snapshot.phase == Phase.ANALYZE_EXECUTE
 
@@ -158,8 +139,7 @@ def test_execution_outside_locked_rereads_disk_state_under_its_own_lock(
 
 def test_in_memory_new_run_state_is_executed_as_is(tmp_state_dir):
     """new_run() state is not a disk snapshot: run() executes it without a re-read."""
-    gh = _github()
-    eng = make_engine(tmp_state_dir, lambda req: _analyze_ok(gh), github=gh)
+    eng = make_engine(tmp_state_dir, implement, github=_github(), origin=True)
     save_state(eng.state, eng.paths.state_file)
     run_id = eng.state.run_id
     outcomes = eng.run(max_steps=2)

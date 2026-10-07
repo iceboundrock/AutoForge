@@ -19,49 +19,109 @@ Examples:
 
 ### Before ANALYZE_EXECUTE
 
-The implementer is launched only after the controller has established that
-no open PR already implements the issue. The PR the controller persisted is
-read first; then the repository's open PRs are listed, to the end (the
-client walks GitHub's pages by cursor until it reports no next page, so
-the listing has no ceiling to fall past, #20; a listing the client cannot
-read to its end blocks, because "none exists" is then not knowable) for
-the `ai-implementation` marker of `{"issue"}`, which the controller
-renders into the implementer's prompt (`IMPLEMENTATION_MARKER`) and the
-agent must put in the PR body verbatim:
+The agent makes no GitHub write in this phase (ADR 0004, #161). It commits
+on its worktree's detached `HEAD` and returns the PR's title and body; the
+controller pushes the commit to `autoforge/<n>` (a `push` record), then
+opens the PR (`implementation_pr`) or adopts the open PR already on that
+branch (`adopt_pr`), and reads it back ("Controller-owned effects" below).
 
-- exactly one: it is adopted (recorded as the issue's PR, `REVIEW` next)
-  without launching the agent, whatever its branch name and whether or not
-  GitHub links it to the issue
-- two or more: `BLOCKED` without launching the agent; the controller never
-  chooses which PR is the issue's
+The journal is read first. A persisted completion context means the
+agent's commit was already accepted and the push and PR planned: the phase
+is completed from the records and no agent is launched. Otherwise the
+controller establishes that no open PR already implements the issue. The
+PR the controller persisted is read first; then the repository's open PRs
+are listed, to the end (the client walks GitHub's pages by cursor until it
+reports no next page, so the listing has no ceiling to fall past, #20; a
+listing the client cannot read to its end blocks, because "none exists" is
+then not knowable) for the `ai-implementation` marker of `{"issue"}`, which
+only the controller writes:
+
+- exactly one, at a fresh entry: it is adopted (recorded as the issue's PR,
+  `REVIEW` next) without launching the agent, whatever its branch name and
+  whether or not GitHub links it to the issue. After a launch of this entry
+  it is not: the entry observation recorded none, so the controller did not
+  open it, and the run is `BLOCKED` naming it (D9.4); `unblock` then binds
+  it at a fresh entry if the operator decides it is the implementation. The
+  one exception is the one-shot re-entry of a run persisted while an agent
+  of the previous contract was publishing the PR (D13.4), which recovers as
+  before.
+- two or more, one whose marker cannot be read, or one headed in a fork:
+  `BLOCKED` without launching the agent. The controller never chooses
+  which PR is the issue's, and it cannot publish to a fork's branch.
 - a PR carrying another issue's marker, or no marker, is not a candidate.
-  Linked issues and `autoforge/<n>` branch names are shape, and shape is
-  never proof of provenance (a human's PR, another tool's PR); the agent is
-  told about such a PR's existence only through its own GitHub reads, and
-  the prompt tells it to continue an existing PR for the issue and give it
-  the marker rather than open a second one
+  Linked issues and branch names are shape, and shape is never proof of
+  provenance (a human's PR, another tool's PR).
+
+Then the default branch head (the candidate's base), the head of
+`autoforge/<n>` and the PRs headed at that branch are read, both heads are
+fetched into the shared object store through the controller's transport,
+and the entry observation (the branch head, the base, no marker PR) is
+persisted by the pre-launch save, so a branch head or a marker PR a later
+entry finds is explained by this read or not at all:
+
+- no branch: the agent starts from the default branch head;
+- a branch with no PR: earlier work for the issue; the agent continues from
+  its head and the push is a fast-forward over it;
+- exactly one open PR on the branch, onto the default branch and carrying
+  no marker: the PR the controller adopts; the agent continues from its
+  head;
+- a closed or merged PR on the branch, two open PRs, a PR onto another
+  base, or one carrying another issue's (or a malformed) marker: `BLOCKED`
+  without launching. The controller never opens a second PR beside a
+  closed or merged one.
+
+At a re-entry after a launch, a branch head other than the recorded one
+(something else pushed, created or deleted the branch) blocks without
+launching. The base, branch and start commit are rendered into the prompt
+(`DEFAULT_BRANCH`, `BASE_SHA`, `BRANCH`, `START_SHA`); a dry-run plan shows
+placeholders for them. Only `GitHubUnavailableError` and a failed fetch
+propagate (nothing was launched; `resume` reads again).
 
 ### After ANALYZE_EXECUTE
 
-Verify:
+The candidate is checked before the result is accepted, so a refusal is an
+ordinary correction retry with nothing pushed or created. The controller
+reads the worktree itself, never the agent's word for it: `HEAD` is
+detached (a `HEAD` attached to a local branch is refused), equal to the
+reported `head_sha`, different from the recorded base, descending from it
+and from the branch head the entry recorded (so the push is a
+fast-forward), and every commit of the published range passes the
+commit-message policy ("Published content" below). `pr_title` and
+`pr_body` pass the published-content policy, and the composed body (the
+agent's body, `Closes #n` and the marker) passes the credential rule as a
+whole. A worktree read or an ancestry proof that cannot be completed is
+inconclusive (`VerificationError`, for `resume`), never a correction.
 
-- PR exists
-- repository is correct
-- PR is open
-- branch is correct
-- returned HEAD SHA matches GitHub
-- its body carries the issue's `ai-implementation` marker, and it is the
-  only open PR that does: a PR without the marker is one no later entry
-  could find again, and one of two is a choice the entry never makes. The
-  read-back uses the same complete listing the entry uses (one snapshot: the
-  marked PR's state, HEAD and branch are read from it), so the two cannot
-  disagree about which PR is the issue's. A replan's replacement PR is held
-  to the same rule, marker and sole-claimant alike, by the transaction's
-  target predicates on one complete listing at binding, on the final read
-  before the close, at the confirmation after it and at activation, with
-  the PR being superseded excluded by identity
-  ([replan-transaction.md](replan-transaction.md)), so the PR the
-  controller activates is one this entry finds again after a lost state file
+Then, in order, all from one persisted plan:
+
+1. The precondition read: the open PRs are listed again and the branch and
+   its PRs read again. A marker PR that appeared while the agent ran, a
+   branch head other than the recorded one, or a PR closed on the branch
+   meanwhile blocks with nothing planned or sent. Otherwise the `push`
+   record (the candidate, compare-and-swap against the recorded head) and
+   the `implementation_pr` record (the agent's title, its body followed by
+   `Closes #n` and the marker) or the `adopt_pr` record (the PR's current
+   body followed by the same two lines, against its digest) are saved with
+   the completion context in one save.
+2. The push is driven, then the PR record. An adopted PR is written to only
+   once GitHub shows it headed at the candidate: a head still at the
+   branch's old value is GitHub catching up (transient), any other head
+   blocks.
+3. The read-back: one complete listing of the open PRs, in which exactly
+   one carries the issue's marker, and it is the PR the record observed,
+   open, of this repository, headed at exactly the pushed candidate on
+   `autoforge/<n>` and based on the default branch. A head still at the
+   branch's old value is transient; any other mismatch blocks. Only then
+   is the PR bound (`current_pr_url`, `current_head_sha`,
+   `current_branch`) and the review history reset.
+
+A replan's replacement PR is held to the same marker rule, marker and
+sole-claimant alike, by the transaction's target predicates on one
+complete listing at binding, on the final read before the close, at the
+confirmation after it and at activation, with the PR being superseded
+excluded by identity ([replan-transaction.md](replan-transaction.md)), so
+the PR the controller activates is one this entry finds again after a lost
+state file.
 
 ### Before every launch
 
@@ -463,8 +523,9 @@ Never rely only on telling an LLM "do not modify anything".
 ADR 0004 (`docs/adr/0004-authority-boundary-and-typed-external-effects.md`)
 moves every externally visible write to the controller. #160 adds the
 mechanism and wires its first consumer, the `UPDATE_EPIC` progress comment;
-the other phases keep their current publication until #161 to #164 move
-them.
+#161 wires `ANALYZE_EXECUTE` (the push of the agent's commit and the
+implementation PR, opened or adopted); the other phases keep their current
+publication until #162 to #164 move them.
 
 - **Typed writes, never retried blind.** `GitHubClient` has one method per
   write the effects need (`create_issue_comment`, `create_pr_comment`,
@@ -530,9 +591,9 @@ them.
 ### Published content
 
 Agent text the controller publishes under the operator's identity
-(`progress`, `roadmap_section`, and the payloads of later kinds) is refused
-by `result_parser.published_text_problem`, and the agent is asked to correct
-it, when it contains:
+(`progress`, `roadmap_section`, `pr_title`, `pr_body`, and the payloads of
+later kinds) is refused by `result_parser.published_text_problem`, and the
+agent is asked to correct it, when it contains:
 
 - an HTML comment opening a controller marker (`<!-- ai-` or
   `<!-- autoforge-`, any spacing or case);
@@ -543,6 +604,13 @@ it, when it contains:
 
 `published_payload_problem` applies the credential rule to a whole payload,
 so a credential split across fields is refused too.
+
+A commit the controller pushes is published too. Every commit of the range
+from the base to the candidate is read back by the transport and refused
+(`result_parser.commit_message_problem`, named by SHA, never quoted) when
+its message contains a credential class, or a closing keyword naming any
+issue other than the run's own (`#n`, `owner/repo#n` or the issue's URL):
+GitHub would close that issue once the commit reaches the default branch.
 
 ## Merge safety
 
