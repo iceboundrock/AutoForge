@@ -1032,6 +1032,172 @@ def test_contained_clean_run_reports_nothing_and_leaves_other_children_alone():
         before.wait()
 
 
+# A child that orphans ``argv[1]`` short-lived processes the way a test suite
+# run by an agent does: each is started by an intermediary that exits at once,
+# so it is re-parented to the controller and dies as the controller's child;
+# every other one leaves the child's group first (``setsid``). One more orphan
+# lives on, detached. The child writes that one's pid to ``argv[2]``, runs on
+# until ``argv[3]`` exists, and exits 7.
+_ORPHAN_FACTORY = (
+    "import os, sys, time\n"
+    "def orphan(seconds, detach):\n"
+    "    r, w = os.pipe()\n"
+    "    if os.fork() == 0:\n"
+    "        pid = os.fork()\n"
+    "        if pid == 0:\n"
+    "            os.close(r); os.close(w)\n"
+    "            if detach:\n"
+    "                os.setsid()\n"
+    "            null = os.open(os.devnull, os.O_RDWR)\n"
+    "            for fd in (0, 1, 2):\n"
+    "                os.dup2(null, fd)\n"
+    "            time.sleep(seconds)\n"
+    "            os._exit(0)\n"
+    "        os.write(w, str(pid).encode())\n"
+    "        os._exit(0)\n"
+    "    os.close(w)\n"
+    "    os.wait()\n"
+    "    pid = int(os.read(r, 32))\n"
+    "    os.close(r)\n"
+    "    return pid\n"
+    "for i in range(int(sys.argv[1])):\n"
+    "    orphan(0.01, detach=i % 2 == 1)\n"
+    "kept = orphan(60, detach=True)\n"
+    "with open(sys.argv[2] + '.tmp', 'w') as fh:\n"
+    "    fh.write(str(kept))\n"
+    "os.rename(sys.argv[2] + '.tmp', sys.argv[2])\n"
+    "deadline = time.monotonic() + 30\n"
+    "while not os.path.exists(sys.argv[3]) and time.monotonic() < deadline:\n"
+    "    time.sleep(0.02)\n"
+    "sys.exit(7)\n"
+)
+
+
+def _new_zombies(before: frozenset[tuple[int, int]]) -> int:
+    """This process's dead, unreaped children that were not there ``before``."""
+    return sum(1 for key, zombie in executor._children().items() if zombie and key not in before)
+
+
+def _running(pid: int) -> bool:
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
+    except OSError:
+        return False
+
+
+@_linux_only
+def test_contained_dead_orphans_are_reaped_while_the_child_runs(monkeypatch, tmp_path):
+    """The controller is the orphans' parent for the whole invocation, so it
+    reaps them as they die, not only once the child has exited (#191). A long
+    agent run whose tools orphan thousands of short-lived processes (a test
+    suite) otherwise piles up zombies, which count against the session's
+    pids.max until no fork succeeds and the agent itself aborts. Reaping
+    signals nothing: a live orphan is left alone until the teardown kills it.
+    The child's own exit status is never taken by the reaper, and the reaper
+    ends with the invocation."""
+    monkeypatch.setattr(executor, "_EXIT_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    kept_file, go = tmp_path / "kept", tmp_path / "go"
+    before = frozenset(executor._children())
+    seen: list[int] = []
+    kept: list[int] = []
+    kept_ran = []
+
+    def watch() -> None:
+        deadline = time.monotonic() + 20
+        while not kept_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if kept_file.exists():
+            kept.append(int(kept_file.read_text()))
+        # Every short-lived orphan has died and the child still runs (it
+        # waits for ``go``).
+        settle = time.monotonic() + 3
+        while True:
+            seen.append(_new_zombies(before))
+            if seen[-1] == 0 or time.monotonic() >= settle:
+                break
+            time.sleep(0.05)
+        kept_ran.extend(_running(pid) for pid in kept)
+        go.touch()
+
+    watcher = threading.Thread(target=watch)
+    watcher.start()
+    try:
+        res = execute(
+            ExecutionRequest(
+                command=[PY, "-c", _ORPHAN_FACTORY, "200", str(kept_file), str(go)],
+                timeout_seconds=30,
+                contain_orphans=True,
+            )
+        )
+    finally:
+        go.touch()
+        watcher.join()
+    try:
+        assert res.exit_code == 7 and not res.timed_out
+        assert seen and seen[-1] == 0, f"dead orphans left unreaped while the child ran: {seen}"
+        assert kept_ran == [True], "a live orphan was killed while the child ran"
+        # Only the orphan still alive at the end was killed.
+        assert res.orphans_killed and not res.orphan_survived_kill
+        assert not (res.descendants_killed or res.group_survived_kill or res.capture_abandoned)
+        assert _gone(kept[0], within=1)
+        assert _new_zombies(before) == 0
+        assert _subreaper() == 0
+        assert not any(thread.name == "autoforge-reaper" for thread in threading.enumerate())
+    finally:
+        for pid in kept:
+            _kill_quietly(pid)
+
+
+@_linux_only
+def test_contained_reaper_leaves_a_pre_existing_childs_status_to_its_owner():
+    """A child the controller already had when the invocation began is not
+    one of its orphans: when it dies meanwhile, its exit status is left for
+    whoever started it."""
+    import subprocess
+
+    before = subprocess.Popen([PY, "-c", "import time; time.sleep(0.2); raise SystemExit(5)"])
+    try:
+        res = execute(
+            ExecutionRequest(
+                command=[PY, "-c", "import time; time.sleep(1)"],
+                timeout_seconds=30,
+                contain_orphans=True,
+            )
+        )
+        assert res.ok and res.leftovers == ""
+        assert before.wait(timeout=10) == 5
+    finally:
+        before.kill()
+        before.wait()
+
+
+@_linux_only
+def test_a_reaper_that_cannot_start_refuses_the_launch_before_the_spawn(monkeypatch, tmp_path):
+    """A reaper thread the system refuses (a thread limit) fails the launch as
+    an ExecutionError before anything is spawned, with the subreaper setting
+    restored and the next contained invocation free to run."""
+    real_start = threading.Thread.start
+
+    def refuse_the_reaper(self):
+        if self.name == "autoforge-reaper":
+            raise RuntimeError("can't start new thread")
+        return real_start(self)
+
+    spawned = tmp_path / "spawned"
+    with monkeypatch.context() as patch:
+        patch.setattr(threading.Thread, "start", refuse_the_reaper)
+        with pytest.raises(ExecutionError, match="failed to start the orphan reaper"):
+            execute(
+                ExecutionRequest(
+                    command=[PY, "-c", f"open({str(spawned)!r}, 'w')"], contain_orphans=True
+                )
+            )
+    assert not spawned.exists(), "the command ran without its reaper"
+    assert _subreaper() == 0
+    assert execute(ExecutionRequest(command=[PY, "-c", "pass"], contain_orphans=True)).ok
+
+
 @_linux_only
 def test_a_second_contained_invocation_at_once_is_refused():
     first = executor._Containment.begin()

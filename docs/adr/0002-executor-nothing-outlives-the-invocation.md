@@ -166,7 +166,8 @@ request (`ExecutionRequest.contain_orphans`, `DuplexRequest.contain_orphans`):
 - An orphan counts as part of what must be gone, within §3's bounds: it gets
   the exit grace, then each signal of the kill (SIGTERM, then SIGKILL)
   together with its own process group, and one that appears as its parent
-  dies is signalled when it appears. Dead orphans are reaped.
+  dies is signalled when it appears. Dead orphans are reaped as they die,
+  while the child runs, not only at teardown (below).
 - Reported as three more facts, recorded with the others in
   `execution.json` and `events.jsonl` and rendered by `describe_leftovers`:
   `orphans_killed`, `orphan_survived_kill`, and `orphans_unchecked` (the
@@ -178,6 +179,33 @@ request (`ExecutionRequest.contain_orphans`, `DuplexRequest.contain_orphans`):
   pre-merge verification). The controller's own `git`/`gh` plumbing is
   not, so a `git gc --auto` that git daemonized on purpose is left alone.
 
+**Reaping while the child runs.** Being a subreaper makes the controller
+the parent of everything the invocation orphans, for as long as the
+invocation lasts, and a dead child that nobody waits for stays a zombie.
+A zombie holds its pid, and pids count against the session's `pids.max`
+(systemd's `TasksMax`; 9332 on the machine where this was found). An
+agent's tools orphan short-lived processes all along: one run of this
+repository's test suite under an agent orphans about 1,750. When they were
+reaped only at teardown, five suite runs inside one hour-long agent
+invocation filled the limit. From then on no fork or thread creation in
+the operator's whole session succeeded, and the agent (Claude Code)
+aborted on SIGABRT with no output: `agent 'analyze_execute' exited -6`.
+
+So the containment starts a reaper thread that, every
+`_REAP_INTERVAL_SECONDS` (0.25 s), reaps the controller's new zombies:
+
+- It never reaps the child. The child's exit status belongs to its `Popen`,
+  which would otherwise report 0.
+- It never reaps a child the controller had before the invocation; that
+  child is left to its owner.
+- It reaps nothing until the child's pid is known.
+- The first look at the orphans after the child's run (the exit grace, the
+  kill) stops and joins it. From then on only the thread that signals the
+  orphans reaps them, so an orphan cannot be reaped, and its pid reused,
+  between being listed and being signalled.
+- A reaper the system refuses to start fails the launch as `ExecutionError`
+  before anything is spawned.
+
 **Limits.**
 
 - **Linux only.** Elsewhere a contained request runs uncontained and the
@@ -187,7 +215,12 @@ request (`ExecutionRequest.contain_orphans`, `DuplexRequest.contain_orphans`):
   apart from the controller's other children by being new, so a second
   contained invocation while one runs raises `ExecutionError` instead of
   waiting. The engine runs invocations one after another, so this does not
-  happen in practice.
+  happen in practice. The reaper applies the same rule for the whole
+  invocation. If the controller spawned a process some other way while a
+  contained invocation runs, that process would be reaped as an orphan once
+  it died, and its owner would lose its exit status. Nothing does this:
+  every subprocess goes through the executor, and nothing else spawns while
+  a contained child runs.
 - **What still escapes:** a descendant that makes itself a subreaper (its
   orphans go to it, not to the controller), and anything handed to a
   service manager or another session's process (`systemd-run`, `at`, a
@@ -223,7 +256,13 @@ SIGTERM escalating to SIGKILL. A clean contained run reports nothing and
 leaves the controller's other children alone. A second contained
 invocation at once is refused, and without a subreaper the limit is
 reported. `tests/test_executor_duplex.py` does the same through the
-handle, including when the `with` block raises.
+handle, including when the `with` block raises. Reaping while the child
+runs, through both `execute()` and the handle: a contained child orphans
+200 short-lived processes and keeps running. Their zombies are gone before
+it exits, its own exit status is kept, and nothing is reported. A child the
+controller already had keeps its exit status for its owner. A reaper that
+cannot start refuses the launch before the spawn and restores the
+subreaper setting.
 `tests/test_providers.py`: every agent launch asks for containment and
 the facts cross the provider boundary. `tests/test_pi_rpc.py`: a process a
 fake Pi's tool detached is killed after Pi exits, the result kept.

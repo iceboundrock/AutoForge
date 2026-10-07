@@ -632,6 +632,60 @@ def test_contained_orphan_is_killed_when_finish_is_interrupted(monkeypatch):
         _kill_quietly(pid)
 
 
+# Orphans ``argv[1]`` short-lived processes (each started by an intermediary
+# that exits at once, so it dies as the controller's child; every other one
+# leaves the child's group first), says so, runs on until stdin EOF, and
+# exits 7.
+_ORPHAN_FACTORY = (
+    "import os, sys, time\n"
+    "for i in range(int(sys.argv[1])):\n"
+    "    if os.fork() == 0:\n"
+    "        if os.fork() == 0:\n"
+    "            if i % 2:\n"
+    "                os.setsid()\n"
+    "            time.sleep(0.01)\n"
+    "            os._exit(0)\n"
+    "        os._exit(0)\n"
+    "    os.wait()\n"
+    "print('forked', flush=True)\n"
+    "sys.stdin.buffer.read()\n"
+    "sys.exit(7)\n"
+)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux-only subreaper")
+def test_contained_dead_orphans_are_reaped_while_the_child_runs():
+    """Through the handle as through ``execute()`` (#191): what the child
+    orphans is reaped as it dies, while the child still runs, so zombies
+    cannot pile up against the session's pids.max over a long conversation;
+    the child's own exit status is kept."""
+    previous = _subreaper()
+    before = frozenset(executor._children())
+
+    def new_zombies() -> int:
+        return sum(
+            1 for key, zombie in executor._children().items() if zombie and key not in before
+        )
+
+    with start_duplex(
+        DuplexRequest(
+            command=[PY, "-c", _ORPHAN_FACTORY, "200"], deadline_seconds=30, contain_orphans=True
+        )
+    ) as child:
+        assert child.read_line(timeout=20) == Record(b"forked")
+        settle = time.monotonic() + 3
+        while new_zombies() and time.monotonic() < settle:
+            time.sleep(0.05)
+        left = new_zombies()
+        child.close_stdin()
+        res = child.finish()
+    assert left == 0, f"{left} dead orphans were left unreaped while the child ran"
+    assert res.exit_code == 7 and not res.timed_out
+    assert not (res.orphans_killed or res.orphan_survived_kill) and res.leftovers == ""
+    assert new_zombies() == 0
+    assert _subreaper() == previous
+
+
 def _subreaper() -> int:
     value = ctypes.c_int(0)
     ctypes.CDLL(None, use_errno=True).prctl(37, ctypes.byref(value), 0, 0, 0)
