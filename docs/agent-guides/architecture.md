@@ -93,8 +93,10 @@ reducer, outcome classification) lives in `pi_rpc.py`, a pure reducer that
 command and event names, but no CLI flags and no processes. Claude Code's
 `stream-json` output is reduced the same way by `claude_stream.py`, which
 `ClaudeCodeProvider` drives over the same handle with stdin on `/dev/null`
-(#192): the `result` record's text becomes `stdout`, and an error result, a
-malformed line or a missing result becomes `provider_failure`. The CLI's
+(#192): the last `result` record's text becomes `stdout` (the CLI ends
+every turn with one, and runs another turn when a background task or a
+scheduled wakeup fires), and an error result in any turn, a malformed line
+or a turn without its result becomes `provider_failure`. The CLI's
 exit, not EOF, ends its wait for lines: the adapter looks at the CLI after
 every read, a line included, so a leftover holding its stdout, silent or
 still writing, gets ADR 0002's exit grace and kill, never the deadline,

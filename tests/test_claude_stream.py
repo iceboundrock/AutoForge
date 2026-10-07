@@ -2,7 +2,8 @@
 
 No process runs here: :class:`ClaudeStream` is fed bytes the way the
 provider's duplex driver feeds it. The record shapes follow the stream
-verified against claude 2.1.292 (module docstring).
+verified against claude 2.1.292, and its runs of several turns against
+2.1.293 (module docstring).
 """
 
 import json
@@ -179,16 +180,77 @@ def test_no_result_before_stdout_ends_is_a_failure():
     assert stream.failure == "claude: exited without a result event"
 
 
-def test_a_second_result_is_a_failure():
-    stream, _ = _run(_result(), _result(result="other"))
+def _later_turn(text: str, **over) -> tuple[dict, ...]:
+    """A turn the CLI runs after a result: a finished background task's
+    notice, then the turn itself (verified on claude 2.1.293)."""
+    return (
+        {"type": "system", "subtype": "task_notification"},
+        {"type": "system", "subtype": "init", "model": "claude-fable-5-1"},
+        _assistant({"type": "text", "text": text}),
+        _result(result=text, **over),
+    )
+
+
+def test_each_turn_ends_in_a_result_and_the_last_one_is_the_outcome():
+    """A background task or a scheduled wakeup still pending when a turn
+    ends keeps the CLI alive for another turn with its own result; text
+    output prints only the last result's text, and so does the reducer."""
+    stream, events = _run(
+        _result(result="waiting", num_turns=5, duration_ms=1_000, total_cost_usd=0.5),
+        *_later_turn("checked", num_turns=2, duration_ms=200, total_cost_usd=0.75),
+        {"type": "command_lifecycle", "state": "started"},
+        *_later_turn(TEXT, num_turns=1, duration_ms=30, total_cost_usd=0.8),
+        {"type": "command_lifecycle", "state": "completed"},
+    )
+    assert stream.failure is None and not stream.exited_early
+    assert stream.text == TEXT
+    summary = stream.summary()
+    assert summary["results"] == 3
+    # Turns and duration are per result; the cost is the session's so far.
+    assert summary["num_turns"] == 8 and summary["duration_ms"] == 1_230
+    assert summary["cost_micro_usd"] == 800_000
+    # Notices between turns and after the last one belong to no turn.
+    assert summary["records_after_result"] == 4
+    # Each later turn is progress like the first.
+    assert [e.kind for e in events].count(ProgressKind.STARTED) == 2
+    assert [e.kind for e in events].count(ProgressKind.ASSISTANT_TEXT) == 2
+
+
+def test_an_error_result_in_an_earlier_turn_fails_the_run():
+    stream, _ = _run(_result(is_error=True, result="Overloaded"), *_later_turn(TEXT))
     assert stream.text is None
-    assert stream.failure == "claude: stream-json protocol violation: a second result event"
+    assert stream.failure == (
+        "claude: the run ended in an error (subtype success, terminal_reason completed): Overloaded"
+    )
+    assert stream.summary()["results"] == 1
+
+
+def test_an_error_result_in_a_later_turn_fails_the_run():
+    stream, _ = _run(_result(), *_later_turn("", subtype="error_during_execution"))
+    assert stream.text is None
+    assert stream.failure == "claude: the run did not succeed (subtype error_during_execution)"
+
+
+@pytest.mark.parametrize(
+    "opens",
+    [
+        {"type": "system", "subtype": "init", "model": "m"},
+        _assistant({"type": "text", "text": "more"}),
+        _tool_result("t1"),
+    ],
+)
+def test_stdout_ending_inside_a_later_turn_is_a_failure(opens):
+    stream, _ = _run(_result(), {"type": "system", "subtype": "task_notification"}, opens)
+    assert stream.exited_early
+    assert stream.text is None
+    assert stream.failure == "claude: exited inside a turn that has no result event"
 
 
 def test_records_after_the_result_are_counted_and_ignored():
     stream, events = _run(_result(), {"type": "system", "subtype": "hook_response"})
     assert stream.failure is None and stream.text == TEXT
     assert stream.summary()["records_after_result"] == 1
+    assert stream.summary()["results"] == 1
     assert events == []
 
 

@@ -554,7 +554,7 @@ class ClaudeCodeProvider(AgentProvider):
         goes to :class:`~autoforge.claude_stream.ClaudeStream`, which emits
         progress and decides the outcome. The CLI's exit, not EOF, ends the
         wait, so a leftover holding stdout costs ADR 0002's exit grace and
-        kill, never the timeout. ``stdout`` of the result is the
+        kill, never the timeout. ``stdout`` of the result is the last
         ``result`` text, tail-bounded as the executor's capture is; a failure
         inside the stream is ``provider_failure`` and a timeout wins over it.
         ``exit_code`` is always the real process status.
