@@ -1,6 +1,6 @@
 # ADR 0002. Executor: nothing an agent starts outlives its invocation
 
-- **Status:** accepted, implemented for #85; amended by #132 (§4b)
+- **Status:** accepted, implemented for #85; amended by #132 (§4b) and #193 (§4c)
 - **Decides:** #85 (follow-up of PR #84's review and #53)
 - **Where:** `src/autoforge/executor.py` (`execute()`, `_terminate_group()`,
   `_Containment`), `src/autoforge/executor_duplex.py`,
@@ -239,6 +239,77 @@ So the containment starts a reaper thread that, every
 - An orphan that survives SIGKILL stays the controller's unreaped child
   until the controller exits. It is reported (`orphan_survived_kill`), not
   hidden.
+
+## 4c. Amendment: an idle timeout instead of one wall-clock deadline (#193)
+
+The decision above is unchanged; what bounds the child's exit is not. An
+agent invocation used to be bounded by one wall-clock `timeout_seconds`
+sized for the slowest legitimate task, so a stuck agent ran for the whole
+budget and a long productive one was killed with its work uncommitted
+(#159, #160). An agent invocation now has two limits:
+
+- **Idle timeout.** The child is killed once it has written nothing to
+  stdout or stderr for `idle_timeout_seconds`, counted from the spawn and
+  then from the last chunk either reader saw. The reader threads already
+  see every chunk; each records the monotonic time of its chunk before
+  handing it on.
+- **Maximum runtime.** An optional wall-clock ceiling, counted from the
+  spawn. Unset, it is `MAX_DEADLINE_SECONDS` (one week), the backstop that
+  bounds every invocation.
+
+Whichever is due first fires; if both are due at once, the ceiling is
+reported. `execute()` and the duplex handle wait in bounded slices and
+re-read that deadline after each one. When it has passed, the group is
+killed through the same `_terminate_group`, so containment, orphan
+reaping, the exit grace, the kill graces and the three leftover facts are
+exactly those of the old timeout path. A child that has exited is looked
+at before the deadline, as before, so a child that exits as a limit falls
+due is not a timeout.
+
+**The bound.** `execute()` now returns within the idle timeout after the
+child's last output, or within `max_runtime_seconds` of the spawn when that
+is due first, plus the exit grace plus two kill graces. Without a ceiling
+the outer bound is the one-week backstop. That is deliberate: an agent that
+keeps producing output is working, or looping; the idle timeout does not
+tell those apart, and #194 is the issue that will.
+
+**The handle.** The duplex handle applies the same two limits to every
+`send_line`, `read_line` and `finish`. Activity means a chunk read from the
+child, never a record the controller sent. An operation that must finish
+inside a fixed budget, such as Pi's `abort` and the finish that follows it,
+first pins the deadline: from then on, output no longer moves it, so a
+child cannot stretch its own shutdown by writing.
+
+**Human waits.** #147 counts a wait for a human answer inside the
+executor's deadline and never silently extends a duplex deadline. Activity
+here is output from the child and nothing else, so a future human wait
+(#126) is not activity and does not reset the idle timer. The two rules
+agree: a wait neither stops the clocks nor resets them, and an interaction
+design that needs a longer wait must say so explicitly.
+
+**Policy stays out of the executor.** The executor takes the two values
+and reports which one fired (`timeout_limit`: `idle` or `max_runtime`) and
+the wall-clock time of the last activity (`last_activity_at`). Which values
+a profile gets, and that a provider unable to report activity (Claude with
+`output_format: text`) runs under its ceiling alone and must have one, is
+configuration (`AutoForgeConfig.agent_limits`), and the provider says only
+whether its output is a progress signal (`reports_activity`). Commands that
+are not agents (`merge.verification_commands`,
+`local.validation_commands`, the controller's `git`) keep one wall-clock
+limit, `execution.command_timeout_seconds`.
+
+Tests for §4c: `tests/test_executor.py` and `tests/test_executor_duplex.py`
+run a child that writes on stdout, or on stderr, for longer than the idle
+timeout (not killed), a silent child (killed at the idle timeout, the whole
+group with it, `last_activity_at` unset), a child that goes silent after
+writing (killed one idle timeout after its last output), and an active
+child under a ceiling (killed at `max_runtime`); `_Limits` is also driven
+by a fake clock (first due wins, a tie goes to the ceiling, a pinned
+deadline stays put). `tests/test_providers.py` and `tests/test_pi_rpc.py`
+carry the same cases through the Claude stream and a fake Pi.
+`tests/test_engine.py` checks the error text and `execution.json` for each
+limit and that a text-mode Claude profile without a ceiling is never
+launched.
 
 ## 5. Tests
 

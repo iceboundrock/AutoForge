@@ -29,7 +29,8 @@ progress.py         provider-neutral ProgressEvent, cleaning, and the line rende
 executor.py         subprocess lifecycle, timeouts, capture, optional stdin payload
                     (no workflow semantics)
 executor_duplex.py  duplex child handle for RPC transports: stdin records out, LF-framed
-                    stdout records in, one deadline, ADR 0002 teardown; bytes only (#130)
+                    stdout records in, idle timeout and max runtime, ADR 0002 teardown;
+                    bytes only (#130, #193)
 github.py           GitHubClient over `gh`: verification reads, typed controller writes
                     (never retried on an ambiguous outcome) + controller-owned merge
 effects.py          ADR 0004 effect records: kinds, stages, attempt bound, drive/reconcile,

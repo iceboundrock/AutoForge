@@ -19,7 +19,7 @@ so they go before the subcommand. Without `--config` the controller uses its
 built-in defaults. `autoforge.yaml` and `autoforge.local.*` files are
 git-ignored; do not commit a config that names credentials or local paths.
 
-Edit the file to change model identifiers, effort, timeouts and provider
+Edit the file to change model identifiers, effort, agent limits and provider
 options without touching controller source. Provider-specific flags are
 built by the adapters in `src/autoforge/providers.py`; the engine never
 hard-codes CLI syntax. The CLI flag syntax in `autoforge.example.yaml` was
@@ -121,12 +121,12 @@ directory if it is missing and a probe file it creates and removes there.
 | Section | What it controls | Where the behaviour is specified |
 |---|---|---|
 | top level | `version`, `state_dir` (default `.autoforge`), `prompt_version` | [State and recovery](agent-guides/state-and-recovery.md) |
-| `execution` | default timeout, `max_correction_attempts` (default 1), the agent environment allow-list (`env_allowlist`, `env_allowlist_extra`), the per-issue agent worktree location (`worktree_dir`) | [Architecture](agent-guides/architecture.md), [Running the remote workflow](usage.md) |
+| `execution` | the default agent limits (`default_idle_timeout_seconds` 900, `default_max_runtime_seconds` unset), the wall-clock bound on controller-run commands (`command_timeout_seconds` 1800), `max_correction_attempts` (default 1), the agent environment allow-list (`env_allowlist`, `env_allowlist_extra`), the per-issue agent worktree location (`worktree_dir`) | [Architecture](agent-guides/architecture.md), [Running the remote workflow](usage.md) |
 | `safety` | the merge gate (`allow_merge`, default `false`), `protected_merge_paths` (default `.github/workflows/`), `required_checks` (default `ci`), `verify_check_definition` (default `true`) | [GitHub safety](agent-guides/github-safety.md#merge-safety) |
 | `merge` | how the controller merges once the gate is open: `method` (default `squash`), `delete_branch`, `max_verification_attempts` (default 5), `verification_commands` (argv lists, empty by default) | [GitHub safety](agent-guides/github-safety.md#merge-safety) |
 | `workflow` | loop bounds: `max_review_rounds` (20), `stagnation_identical_rounds` (2), `stagnation_unchanged_count_rounds` (3), `max_total_steps` (300); `epic_update_every` (1) | [Workflow](agent-guides/workflow.md#loop-bounds) |
 | `review.replan` | replan policy: `enabled`, `soft_threshold` (12), `hard_threshold` (20), `stagnation_window` (3), `max_findings_per_round` (2), `max_replans_per_issue` (2) | [Workflow](agent-guides/workflow.md#loop-bounds), [Replan transaction](agent-guides/replan-transaction.md) |
-| `profiles` | provider, model, effort, command, timeout and provider options per logical profile | [Profiles](#profiles) below |
+| `profiles` | provider, model, effort, command, idle timeout, maximum runtime and provider options per logical profile | [Profiles](#profiles) below |
 | `github` | the `gh` binary and its timeout | [GitHub safety](agent-guides/github-safety.md) |
 | `local` | Local Mode: `feature_dir`, `max_fix_rounds`, `validation_commands`, `exclude`, `max_workspace_entries`, `max_workspace_bytes` | [Local mode configuration](#local-mode-configuration) below |
 
@@ -137,8 +137,8 @@ Logical profile names (`analyze_execute`, `fix`, `review_round_1`,
 are stable. There is no `merge` profile: the controller merges, see `merge:`
 in the example file. Which profile serves which phase and review round is
 specified in [workflow.md](agent-guides/workflow.md#review-round-routing);
-the example file carries the default provider, model, effort and timeout for
-each. The built-in defaults are:
+the example file carries the default provider, model, effort and limits
+for each. The built-in defaults are:
 
 | Profile | Phase | Provider | Model | Effort |
 |---|---|---|---|---|
@@ -156,12 +156,63 @@ A profile in your file is merged over the built-in default of the same name,
 field by field, as long as it keeps the default's provider. If it names a
 *different* `provider`, it is a different CLI, so it is built from your
 mapping alone: `command` falls back to that provider's binary (`claude`,
-`opencode`, `pi`), `effort` to `high`, `timeout_seconds` to
-`execution.default_timeout_seconds`, and nothing is inherited from the
+`opencode`, `pi`), `effort` to `high`, the limits to the `execution`
+defaults (see [Agent limits](#agent-limits)), and nothing is inherited from the
 default's `options` or `extra_args` (an OpenCode `auto_approve` on a Claude
 profile, or a Claude flag in a Pi argv, would be wrong). Before #129 a
 provider switch kept the default's `command`, `options` and `extra_args`;
 restate any of them you relied on.
+
+### Agent limits
+
+An agent is killed when it makes **no progress**: nothing on its stdout or
+stderr for `idle_timeout_seconds`. Any output resets the timer, so a long
+task that keeps working is never killed for taking long, and a stuck one is
+killed after the idle timeout rather than after a fixed wall-clock budget
+sized for the slowest task (#193). `max_runtime_seconds` is an optional
+wall-clock ceiling measured from the launch; whichever limit is due first
+fires.
+
+| Key | On a profile | Default (`execution`) |
+|---|---|---|
+| idle timeout | `idle_timeout_seconds` | `default_idle_timeout_seconds`: 900 |
+| maximum runtime | `max_runtime_seconds` | `default_max_runtime_seconds`: unset (`null`) |
+
+Both are whole seconds, greater than 0 and at most one week (604800); a
+profile value wins over the default. With no ceiling, the executor's
+one-week backstop is the only wall-clock bound.
+
+- **What counts as progress.** Output, not intent: Claude's stream-json
+  records (one per tool call and per piece of thinking), Pi's RPC events,
+  OpenCode's text. A tool call that prints nothing for longer than the idle
+  timeout, such as a long silent test run inside one shell command, is no
+  progress and is killed; raise `idle_timeout_seconds` on that profile.
+- **The trade-off.** Without `max_runtime_seconds`, an agent that loops
+  while producing output is never killed: the idle timeout catches a silent
+  hang, not a busy one. Set a ceiling when that matters; #194 tracks
+  detecting a busy loop.
+- **Claude `output_format: text`** prints nothing until it exits, so the
+  idle timeout cannot tell a working agent from a stuck one. Such a profile
+  runs under its ceiling alone, and a ceiling is required: without
+  `max_runtime_seconds` (on the profile or as
+  `execution.default_max_runtime_seconds`) it is a configuration error: a
+  run refuses to start when a profile it requires has none, `autoforge
+  doctor` fails any profile the run can reach (including `update_epic`),
+  and the controller never launches it.
+- **Not agents.** `merge.verification_commands`, `local.validation_commands`
+  and the controller's own `git` plumbing keep a wall-clock limit,
+  `execution.command_timeout_seconds` (default 1800); `gh` calls use
+  `github.timeout_seconds`.
+
+`autoforge doctor`, the dry-run plan and the pre-launch progress line show
+both values for each profile (`idle timeout 900s, max runtime unset`). A
+timeout's error names the limit that fired and when the agent last wrote
+anything, and the step's `execution.json` records the same
+([Run logs](agent-guides/state-and-recovery.md#runtime-artifacts)).
+
+The keys are strict. A profile's `timeout_seconds` (the old wall-clock
+limit) and `execution.default_timeout_seconds` are load errors that name
+their replacements.
 
 ### Claude profiles
 
@@ -189,7 +240,9 @@ claude -p --output-format stream-json --verbose --model <model> --effort <effort
   unless it is the `result` record, which must arrive whole.
 - `text` is the opt-out: the CLI prints the final text once, at exit, so
   the run shows no progress and gives no sign of activity while it works
-  (the pre-launch line, the heartbeat and the end line still appear).
+  (the pre-launch line, the heartbeat and the end line still appear). It
+  requires `max_runtime_seconds`, which is then its only limit
+  ([Agent limits](#agent-limits)).
 
 Any other value is a configuration error.
 

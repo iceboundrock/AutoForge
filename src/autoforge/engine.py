@@ -118,7 +118,7 @@ from .claims import (
     render_implementation_marker,
     render_progress_marker,
 )
-from .config import DEFAULT_STATE_DIR, AutoForgeConfig, validate_required_profiles
+from .config import DEFAULT_STATE_DIR, AgentLimits, AutoForgeConfig, validate_required_profiles
 from .effect_ops import ProgressCommentOp, drive
 from .effects import (
     EffectKind,
@@ -149,7 +149,14 @@ from .errors import (
     StateTransitionError,
     VerificationError,
 )
-from .executor import DEFAULT_MAX_OUTPUT_BYTES, ExecutionRequest, execute
+from .executor import (
+    DEFAULT_MAX_OUTPUT_BYTES,
+    LIMIT_IDLE,
+    LIMIT_MAX_RUNTIME,
+    MAX_DEADLINE_SECONDS,
+    ExecutionRequest,
+    execute,
+)
 from .git_transport import GitRemote, GitTransport, local_git_request
 from .github import (
     CommentInfo,
@@ -379,6 +386,29 @@ def _with_leftovers(message: str, leftovers: str) -> str:
     return f"{message} ({leftovers})" if leftovers else message
 
 
+def _limit_reached(limits: AgentLimits, result: AgentExecutionResult) -> str:
+    """Which limit stopped a timed-out agent, as a predicate (#193).
+
+    ``made no progress for 900s (last activity 08:31:02 UTC)`` when it had
+    written nothing for its idle limit; the wall-clock ceiling it reached,
+    its ``max_runtime_seconds`` or the executor's one-week backstop when it
+    has none; ``timed out`` with both limits when the provider did not say
+    which fired.
+    """
+    if result.timeout_limit == LIMIT_IDLE and limits.idle_timeout_seconds is not None:
+        if result.last_activity_at:
+            seen = datetime.fromisoformat(result.last_activity_at).astimezone(UTC)
+            last = f"last activity {seen:%H:%M:%S} UTC"
+        else:
+            last = "no output since launch"
+        return f"made no progress for {limits.idle_timeout_seconds}s ({last})"
+    if result.timeout_limit == LIMIT_MAX_RUNTIME:
+        if limits.max_runtime_seconds is None:
+            return f"reached the {MAX_DEADLINE_SECONDS}s (one week) runtime backstop"
+        return f"reached its {limits.max_runtime_seconds}s maximum runtime"
+    return f"timed out ({limits.describe()})"
+
+
 _REVIEW_HEADING_RE = re.compile(r"^#\s*AI Code Review\s*[—–-]+\s*Round\s+(\d+)\s*$", re.MULTILINE)
 
 
@@ -427,7 +457,8 @@ class StepPlan:
     model: str
     effort: str
     command: list[str]
-    timeout_seconds: int
+    # The agent's limits (#193); ``None`` for a deterministic plan.
+    limits: AgentLimits | None
     prompt_length: int
     prompt_preview: str
     prompt_full: str
@@ -1745,8 +1776,7 @@ class ControllerEngine:
             model=profile.model,
             effort=profile.effort,
             command=command,
-            timeout_seconds=profile.timeout_seconds
-            or self.config.execution.default_timeout_seconds,
+            limits=self.config.agent_limits(profile),
             prompt_length=len(prompt),
             prompt_preview=prompt[:1200],
             prompt_full=prompt,
@@ -1857,8 +1887,7 @@ class ControllerEngine:
             model=profile.model,
             effort=profile.effort,
             command=command,
-            timeout_seconds=profile.timeout_seconds
-            or self.config.execution.default_timeout_seconds,
+            limits=self.config.agent_limits(profile),
             prompt_length=len(prompt),
             prompt_preview=prompt[:1200],
             prompt_full=prompt,
@@ -1916,7 +1945,7 @@ class ControllerEngine:
             model="(none)",
             effort="(none)",
             command=list(command or []),
-            timeout_seconds=0,
+            limits=None,
             prompt_length=0,
             prompt_preview="(no agent prompt)",
             prompt_full="",
@@ -2799,7 +2828,7 @@ class ControllerEngine:
             req = ExecutionRequest(
                 command=list(argv),
                 cwd=cwd,
-                timeout_seconds=self.config.execution.default_timeout_seconds,
+                timeout_seconds=self.config.execution.command_timeout_seconds,
                 env_allowlist=self.config.execution.environment_names(),
                 contain_orphans=True,
             )
@@ -4048,7 +4077,7 @@ class ControllerEngine:
         directory -- never the operator's checkout, no worktree, no branch,
         no ``.git`` inside -- and every command runs there in order, through
         the normal executor (argv only, never a shell), under
-        ``execution.default_timeout_seconds``. The directory is deleted
+        ``execution.command_timeout_seconds``. The directory is deleted
         afterwards whatever happened.
 
         Returns a non-empty reason when a command failed or timed out (the
@@ -4141,7 +4170,7 @@ class ControllerEngine:
         req = ExecutionRequest(
             command=list(argv),
             cwd=cwd,
-            timeout_seconds=self.config.execution.default_timeout_seconds,
+            timeout_seconds=self.config.execution.command_timeout_seconds,
             env_allowlist=self.config.execution.environment_names(),
             contain_orphans=True,
         )
@@ -6337,7 +6366,7 @@ class ControllerEngine:
         profile = profile_for_phase(self.config, phase, state.review_round)
         provider = self.providers.get(profile)
         provider.validate_profile(profile)
-        timeout = profile.timeout_seconds or self.config.execution.default_timeout_seconds
+        limits = self.config.agent_limits(profile)
         max_corrections = max(0, self.config.execution.max_correction_attempts)
         # Read once per invocation, before the loop: the agent and the record
         # of it are launched from the same directory, and for a LOCAL run
@@ -6414,7 +6443,8 @@ class ControllerEngine:
                 prompt=prompt,
                 cwd=cwd,
                 profile=profile,
-                timeout_seconds=timeout,
+                idle_timeout_seconds=limits.idle_timeout_seconds,
+                max_runtime_seconds=limits.max_runtime_seconds,
                 attempt=state.attempt,
                 correction=correction_error is not None,
                 env_allowlist=env_allowlist,
@@ -6435,7 +6465,8 @@ class ControllerEngine:
                 prompt_version=state.prompt_version,
                 command=provider.build_command_for(profile, prompt),
                 cwd=cwd,
-                timeout_seconds=timeout,
+                idle_timeout_seconds=limits.idle_timeout_seconds,
+                max_runtime_seconds=limits.max_runtime_seconds,
                 metadata={
                     **self._log_metadata(phase),
                     "env_allowlist": list(provider.environment_allowlist(req) or ()),
@@ -6443,7 +6474,7 @@ class ControllerEngine:
             )
             result: AgentExecutionResult | None = None
             try:
-                result = self._launch(provider, req, step_log, phase)
+                result = self._launch(provider, req, limits, step_log, phase)
             except ExecutionError as exc:
                 record.error = f"{type(exc).__name__}: {exc}"
                 self._record_invocation(logger, record, prompt, "", "", phase, step_log)
@@ -6452,6 +6483,8 @@ class ControllerEngine:
             record.finished_at = result.finished_at
             record.exit_code = result.exit_code
             record.timed_out = result.timed_out
+            record.timeout_limit = result.timeout_limit
+            record.last_activity_at = result.last_activity_at
             record.stdout_truncated = result.stdout_truncated
             record.stderr_truncated = result.stderr_truncated
             # What the invocation left behind is recorded whatever its
@@ -6469,12 +6502,12 @@ class ControllerEngine:
             record.provider_summary = dict(result.provider_summary)
             stdout, stderr = result.stdout or "", result.stderr or ""
             if result.timed_out:
-                record.error = _with_leftovers(f"timed out after {timeout}s", result.leftovers)
+                reached = _limit_reached(limits, result)
+                record.error = _with_leftovers(reached, result.leftovers)
                 self._record_invocation(logger, record, prompt, stdout, stderr, phase, step_log)
                 raise ExecutionTimeoutError(
                     _with_leftovers(
-                        f"agent '{profile.name}' timed out after {timeout}s and was killed",
-                        result.leftovers,
+                        f"agent '{profile.name}' {reached} and was killed", result.leftovers
                     )
                     + ". State unchanged — inspect the real Git/GitHub state, then 'resume'."
                 )
@@ -6568,7 +6601,12 @@ class ControllerEngine:
         return phase.value
 
     def _launch(
-        self, provider, req: AgentRequest, step_log: StepLog, phase: Phase
+        self,
+        provider,
+        req: AgentRequest,
+        limits: AgentLimits,
+        step_log: StepLog,
+        phase: Phase,
     ) -> AgentExecutionResult:
         """Run the agent with its live progress reported, then close the progress log.
 
@@ -6588,7 +6626,7 @@ class ControllerEngine:
                 reporter.line(
                     f"launching {profile.name} ({profile.provider}, model "
                     f"{profile.model or 'default'}, effort {profile.effort or 'default'}), "
-                    f"timeout {req.timeout_seconds}s, attempt {req.attempt}, "
+                    f"{limits.describe()}, attempt {req.attempt}, "
                     f"worktree {req.cwd}, log {step_log.path}"
                 )
                 req.progress = reporter.sink
@@ -6598,7 +6636,7 @@ class ControllerEngine:
                     reporter.line(f"agent could not be run: {type(exc).__name__}")
                     raise
                 if result.timed_out:
-                    end = f"timed out after {req.timeout_seconds}s"
+                    end = f"{_limit_reached(limits, result)}, killed"
                 elif result.provider_failure:
                     end = f"failed: {result.provider_failure}"
                 else:

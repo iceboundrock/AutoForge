@@ -65,7 +65,7 @@ _ECHO = (
 
 def _writer(chunks: list[bytes], delay: float = 0.0, **kw) -> DuplexRequest:
     return DuplexRequest(
-        command=[PY, "-c", _WRITER, repr(chunks), str(delay)], deadline_seconds=30, **kw
+        command=[PY, "-c", _WRITER, repr(chunks), str(delay)], max_runtime_seconds=30, **kw
     )
 
 
@@ -187,7 +187,7 @@ def test_oversize_record_is_reported_and_the_next_one_is_read():
 
 def test_unterminated_fragment_at_eof_is_reported_not_returned_as_a_record():
     script = "import sys; sys.stdout.buffer.write(b'whole\\npartial')"
-    with start_duplex(DuplexRequest(command=[PY, "-c", script], deadline_seconds=30)) as child:
+    with start_duplex(DuplexRequest(command=[PY, "-c", script], max_runtime_seconds=30)) as child:
         got = _drain(child)
         res = child.finish()
     assert got == [Record(b"whole"), Fragment(b"partial"), Eof()]
@@ -202,7 +202,9 @@ def test_partial_and_large_writes_are_delivered_intact():
     non-blocking writes and arrives whole, between two small ones."""
     big = bytes(range(256)).replace(b"\n", b"") * 8192  # ~2 MiB, no LF
     records = [b"small", big, b"\x00\xff\r tail"]
-    with start_duplex(DuplexRequest(command=[PY, "-c", _ECHO, "0"], deadline_seconds=30)) as child:
+    with start_duplex(
+        DuplexRequest(command=[PY, "-c", _ECHO, "0"], max_runtime_seconds=30)
+    ) as child:
         for record in records:
             child.send_line(record)
         got = [child.read_line(timeout=10) for _ in records]
@@ -218,7 +220,9 @@ def test_partial_and_large_writes_are_delivered_intact():
 
 
 def test_record_containing_lf_is_refused():
-    with start_duplex(DuplexRequest(command=[PY, "-c", _ECHO, "0"], deadline_seconds=30)) as child:
+    with start_duplex(
+        DuplexRequest(command=[PY, "-c", _ECHO, "0"], max_runtime_seconds=30)
+    ) as child:
         with pytest.raises(ExecutionError, match="must not contain LF"):
             child.send_line(b"two\nrecords")
         child.finish()
@@ -228,9 +232,9 @@ def test_send_to_a_child_that_never_reads_is_bounded_by_the_deadline(monkeypatch
     monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
     started = time.monotonic()
     with start_duplex(
-        DuplexRequest(command=[PY, "-c", "import time; time.sleep(60)"], deadline_seconds=1)
+        DuplexRequest(command=[PY, "-c", "import time; time.sleep(60)"], max_runtime_seconds=1)
     ) as child:
-        with pytest.raises(ExecutionTimeoutError, match="deadline"):
+        with pytest.raises(ExecutionTimeoutError, match="1s maximum runtime"):
             child.send_line(b"x" * (8 * 1024 * 1024))
         res = child.finish()
         assert child.read_line(timeout=5) == Timeout(deadline_exceeded=True)
@@ -245,7 +249,7 @@ def test_send_to_a_child_that_never_reads_is_bounded_by_the_deadline(monkeypatch
 
 def test_child_that_closed_stdin_raises_the_typed_broken_pipe_error():
     script = "import os, time; os.close(0); print('closed', flush=True); time.sleep(1)"
-    with start_duplex(DuplexRequest(command=[PY, "-c", script], deadline_seconds=30)) as child:
+    with start_duplex(DuplexRequest(command=[PY, "-c", script], max_runtime_seconds=30)) as child:
         assert child.read_line(timeout=10) == Record(b"closed")
         with pytest.raises(ChildStdinClosedError, match="closed its stdin"):
             child.send_line(b"hello")
@@ -268,7 +272,7 @@ def test_stdout_flood_without_newlines_is_oversize_with_bounded_memory():
         "sys.stdin.buffer.read()\n"
     )
     with start_duplex(
-        DuplexRequest(command=[PY, "-c", script], deadline_seconds=30, max_record_bytes=limit)
+        DuplexRequest(command=[PY, "-c", script], max_runtime_seconds=30, max_record_bytes=limit)
     ) as child:
         assert child.read_line(timeout=10) == Oversize(limit)
         assert child.read_line(timeout=10) == Record(b"next")
@@ -308,7 +312,7 @@ def test_record_queue_overflow_ends_the_invocation(monkeypatch):
     monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
     started = time.monotonic()
     with start_duplex(
-        DuplexRequest(command=[PY, "-c", script], deadline_seconds=30, max_pending_records=10)
+        DuplexRequest(command=[PY, "-c", script], max_runtime_seconds=30, max_pending_records=10)
     ) as child:
         while child._stderr.buffer.retained == 0:
             time.sleep(0.01)
@@ -326,7 +330,7 @@ def test_record_queue_overflow_by_bytes():
     with start_duplex(
         DuplexRequest(
             command=[PY, "-c", script],
-            deadline_seconds=30,
+            max_runtime_seconds=30,
             max_record_bytes=1000,
             max_pending_bytes=5000,
         )
@@ -339,7 +343,7 @@ def test_stderr_flood_is_bounded_and_flagged():
     bound = 32 * 1024
     script = "import sys; sys.stderr.buffer.write(b'e' * 2_000_000 + b'\\nEND\\n')"
     with start_duplex(
-        DuplexRequest(command=[PY, "-c", script], deadline_seconds=30, max_stderr_bytes=bound)
+        DuplexRequest(command=[PY, "-c", script], max_runtime_seconds=30, max_stderr_bytes=bound)
     ) as child:
         assert _drain(child) == [Eof()]
         res = child.finish()
@@ -354,7 +358,7 @@ def test_stderr_never_appears_as_a_record():
         "print('out-line', flush=True)\n"
         "print('err-two', file=sys.stderr, flush=True)\n"
     )
-    with start_duplex(DuplexRequest(command=[PY, "-c", script], deadline_seconds=30)) as child:
+    with start_duplex(DuplexRequest(command=[PY, "-c", script], max_runtime_seconds=30)) as child:
         got = _drain(child)
         res = child.finish()
     assert got == [Record(b"out-line"), Eof()]
@@ -363,7 +367,9 @@ def test_stderr_never_appears_as_a_record():
 
 # -- lifecycle -----------------------------------------------------------------
 def test_orderly_close_stdin_then_exit_zero():
-    with start_duplex(DuplexRequest(command=[PY, "-c", _ECHO, "0"], deadline_seconds=30)) as child:
+    with start_duplex(
+        DuplexRequest(command=[PY, "-c", _ECHO, "0"], max_runtime_seconds=30)
+    ) as child:
         child.send_line(b"ping")
         assert isinstance(child.read_line(timeout=10), Record)
         child.close_stdin()
@@ -379,7 +385,7 @@ def test_orderly_close_stdin_then_exit_zero():
 
 def test_child_death_mid_conversation_gives_eof_and_the_real_exit_code():
     script = "import sys\nsys.stdin.buffer.readline()\nprint('bye', flush=True)\nsys.exit(7)\n"
-    with start_duplex(DuplexRequest(command=[PY, "-c", script], deadline_seconds=30)) as child:
+    with start_duplex(DuplexRequest(command=[PY, "-c", script], max_runtime_seconds=30)) as child:
         child.send_line(b"hello")
         assert child.read_line(timeout=10) == Record(b"bye")
         assert child.read_line(timeout=10) == Eof()
@@ -388,7 +394,9 @@ def test_child_death_mid_conversation_gives_eof_and_the_real_exit_code():
 
 
 def test_per_call_read_timeout_leaves_the_child_running():
-    with start_duplex(DuplexRequest(command=[PY, "-c", _ECHO, "0"], deadline_seconds=30)) as child:
+    with start_duplex(
+        DuplexRequest(command=[PY, "-c", _ECHO, "0"], max_runtime_seconds=30)
+    ) as child:
         assert child.read_line(timeout=0.1) == Timeout(deadline_exceeded=False)
         child.send_line(b"still here")
         assert isinstance(child.read_line(timeout=10), Record)
@@ -400,7 +408,7 @@ def test_child_ignoring_stdin_close_is_killed_at_the_deadline(monkeypatch):
     monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
     started = time.monotonic()
     with start_duplex(
-        DuplexRequest(command=[PY, "-c", "import time; time.sleep(60)"], deadline_seconds=1)
+        DuplexRequest(command=[PY, "-c", "import time; time.sleep(60)"], max_runtime_seconds=1)
     ) as child:
         res = child.finish()
     elapsed = time.monotonic() - started
@@ -413,12 +421,131 @@ def test_child_ignoring_stdin_close_is_killed_at_the_deadline(monkeypatch):
 def test_read_past_the_deadline_kills_the_group(monkeypatch):
     monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
     with start_duplex(
-        DuplexRequest(command=[PY, "-c", "import time; time.sleep(60)"], deadline_seconds=0.5)
+        DuplexRequest(command=[PY, "-c", "import time; time.sleep(60)"], max_runtime_seconds=0.5)
     ) as child:
         assert child.read_line() == Timeout(deadline_exceeded=True)
         assert not executor._group_alive(child.pid)
         res = child.finish()
     assert res.timed_out and res.exit_code == -1
+
+
+# -- idle timeout and maximum runtime (#193) ------------------------------------
+# Writes ``count`` lines ``period`` seconds apart on the named stream, then
+# exits 0 without waiting for stdin.
+_TICKER = (
+    "import sys, time\n"
+    "stream = getattr(sys, sys.argv[1])\n"
+    "for n in range(int(sys.argv[2])):\n"
+    "    stream.write(f'{n}\\n'); stream.flush(); time.sleep(float(sys.argv[3]))\n"
+)
+
+
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+def test_a_child_that_keeps_writing_outlives_its_idle_timeout(stream):
+    """Records and stderr alike are progress: a child active for 1.6s under
+    a 0.6s idle limit runs to its own exit."""
+    started = time.monotonic()
+    with start_duplex(
+        DuplexRequest(
+            command=[PY, "-c", _TICKER, stream, "8", "0.2"],
+            idle_timeout_seconds=0.6,
+            max_runtime_seconds=30,
+        )
+    ) as child:
+        got = _drain(child)
+        res = child.finish()
+    assert isinstance(got[-1], Eof), got
+    records = [o.data for o in got if isinstance(o, Record)]
+    assert records == ([str(n).encode() for n in range(8)] if stream == "stdout" else [])
+    assert res.exit_code == 0 and not res.timed_out and res.timeout_limit == ""
+    assert time.monotonic() - started >= 1.6
+    assert res.last_activity_at is not None
+
+
+def test_a_silent_child_is_killed_at_its_idle_timeout(monkeypatch):
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    started = time.monotonic()
+    with start_duplex(
+        DuplexRequest(
+            command=[PY, "-c", "import time; time.sleep(60)"],
+            idle_timeout_seconds=0.5,
+            max_runtime_seconds=30,
+        )
+    ) as child:
+        assert child.read_line() == Timeout(deadline_exceeded=True)
+        assert child.deadline_limit == "idle"
+        res = child.finish()
+    assert res.timed_out and res.exit_code == -1 and res.timeout_limit == "idle"
+    assert res.last_activity_at is None
+    assert 0.5 <= time.monotonic() - started < 5
+    assert not (res.group_survived_kill or res.capture_abandoned)
+
+
+def test_a_child_that_goes_silent_is_killed_one_idle_timeout_after_its_last_record(monkeypatch):
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    started = time.monotonic()
+    with start_duplex(_writer([b"a\n", b"b\n", b"c\n"], 0.3, idle_timeout_seconds=0.6)) as child:
+        got = _drain(child)
+        res = child.finish()
+    assert [o.data for o in got if isinstance(o, Record)] == [b"a", b"b", b"c"]
+    assert got[-1] == Timeout(deadline_exceeded=True)
+    assert res.timed_out and res.timeout_limit == "idle" and res.last_activity_at is not None
+    assert time.monotonic() - started >= 0.6 + 0.6
+
+
+def test_a_send_to_a_silent_child_names_the_idle_timeout(monkeypatch):
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    with start_duplex(
+        DuplexRequest(
+            command=[PY, "-c", "import time; time.sleep(60)"],
+            idle_timeout_seconds=0.5,
+            max_runtime_seconds=30,
+        )
+    ) as child:
+        with pytest.raises(ExecutionTimeoutError, match="wrote nothing for 0.5s"):
+            child.send_line(b"x" * (8 * 1024 * 1024))
+        res = child.finish()
+    assert res.timed_out and res.timeout_limit == "idle"
+
+
+def test_the_maximum_runtime_kills_a_child_that_keeps_writing(monkeypatch):
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    started = time.monotonic()
+    with start_duplex(
+        DuplexRequest(
+            command=[PY, "-c", _TICKER, "stdout", "1000", "0.05"],
+            idle_timeout_seconds=5,
+            max_runtime_seconds=1,
+        )
+    ) as child:
+        got = _drain(child)
+        res = child.finish()
+    assert got[-1] == Timeout(deadline_exceeded=True) and len(got) > 5
+    assert res.timed_out and res.timeout_limit == "max_runtime"
+    assert 1 <= time.monotonic() - started < 5
+
+
+def test_a_pinned_deadline_is_not_moved_by_later_output(monkeypatch):
+    """Once the caller has decided to end the run (Pi's abort), output during
+    the shutdown it allows no longer extends the run."""
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    with start_duplex(
+        DuplexRequest(
+            command=[PY, "-c", _TICKER, "stdout", "1000", "0.05"],
+            idle_timeout_seconds=0.5,
+            max_runtime_seconds=30,
+        )
+    ) as child:
+        assert isinstance(child.read_line(timeout=10), Record)
+        child.pin_deadline()
+        pinned = child.deadline()
+        started = time.monotonic()
+        got = _drain(child)
+        res = child.finish()
+    assert got[-1] == Timeout(deadline_exceeded=True)
+    assert child.deadline() == pinned
+    assert time.monotonic() - started < 3
+    assert res.timed_out and res.timeout_limit == "idle"
 
 
 # A child that starts a descendant in its own group (both ignore stdin EOF),
@@ -439,7 +566,9 @@ def test_exception_inside_the_with_leaves_no_process_in_the_group(monkeypatch, r
     started = time.monotonic()
     descendant = None
     with pytest.raises(raised):
-        with start_duplex(DuplexRequest(command=[PY, "-c", _FAMILY], deadline_seconds=60)) as child:
+        with start_duplex(
+            DuplexRequest(command=[PY, "-c", _FAMILY], max_runtime_seconds=60)
+        ) as child:
             item = child.read_line(timeout=10)
             assert isinstance(item, Record)
             descendant = int(item.data)
@@ -467,7 +596,7 @@ def test_exception_lets_a_child_that_exits_on_stdin_eof_exit_by_itself(monkeypat
     monkeypatch.setattr(os, "killpg", spying_killpg)
     with pytest.raises(RuntimeError):
         with start_duplex(
-            DuplexRequest(command=[PY, "-c", _ECHO, "0"], deadline_seconds=30)
+            DuplexRequest(command=[PY, "-c", _ECHO, "0"], max_runtime_seconds=30)
         ) as child:
             raise RuntimeError("boom")
     assert signal.SIGTERM not in signalled and signal.SIGKILL not in signalled
@@ -496,7 +625,7 @@ def _orphan(mode: str, status: int, contain: bool = False):
     with start_duplex(
         DuplexRequest(
             command=[PY, "-c", _ORPHAN, mode, str(status)],
-            deadline_seconds=30,
+            max_runtime_seconds=30,
             contain_orphans=contain,
         )
     ) as child:
@@ -544,7 +673,7 @@ def test_exited_reports_the_exit_that_a_held_stdout_keeps_from_eof(monkeypatch):
     monkeypatch.setattr(executor, "_EXIT_GRACE_SECONDS", 0.5)
     monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
     with start_duplex(
-        DuplexRequest(command=[PY, "-c", _HELD_STDOUT], deadline_seconds=30)
+        DuplexRequest(command=[PY, "-c", _HELD_STDOUT], max_runtime_seconds=30)
     ) as child:
         item = child.read_line(timeout=10)
         assert isinstance(item, Record)
@@ -582,7 +711,7 @@ def test_a_child_that_exited_before_the_deadline_is_not_timed_out_by_a_read(monk
     deadline = 2.0
     started = time.monotonic()
     with start_duplex(
-        DuplexRequest(command=[PY, "-c", _ORPHAN, "group", "3"], deadline_seconds=deadline)
+        DuplexRequest(command=[PY, "-c", _ORPHAN, "group", "3"], max_runtime_seconds=deadline)
     ) as child:
         child.close_stdin()
         while not child.exited():
@@ -610,7 +739,9 @@ def test_read_line_after_finish_returns_the_rest_without_waiting_past_the_deadli
     the records still queued and then the end item at once. It never waits
     and never reports the deadline, even once the deadline has passed: the
     child exited in time and its stdout is not a timeout."""
-    req = DuplexRequest(command=[PY, "-c", _WRITER, repr([b"1\n2\n3\n"]), "0"], deadline_seconds=1)
+    req = DuplexRequest(
+        command=[PY, "-c", _WRITER, repr([b"1\n2\n3\n"]), "0"], max_runtime_seconds=1
+    )
     past_the_deadline = time.monotonic() + 1.2
     with start_duplex(req) as child:
         res = child.finish()
@@ -668,7 +799,7 @@ def test_contained_orphan_is_killed_when_the_with_block_raises(monkeypatch):
         with start_duplex(
             DuplexRequest(
                 command=[PY, "-c", _ORPHAN, "setsid", "0"],
-                deadline_seconds=30,
+                max_runtime_seconds=30,
                 contain_orphans=True,
             )
         ) as child:
@@ -681,7 +812,7 @@ def test_contained_orphan_is_killed_when_the_with_block_raises(monkeypatch):
     try:
         assert _gone(pid, within=1)
         with start_duplex(
-            DuplexRequest(command=[PY, "-c", "pass"], deadline_seconds=30, contain_orphans=True)
+            DuplexRequest(command=[PY, "-c", "pass"], max_runtime_seconds=30, contain_orphans=True)
         ) as again:
             assert again.finish().leftovers == ""
     finally:
@@ -719,7 +850,9 @@ def test_contained_orphan_is_killed_when_finish_is_interrupted(monkeypatch):
     pid = None
     with pytest.raises(KeyboardInterrupt):
         with start_duplex(
-            DuplexRequest(command=[PY, "-c", detacher], deadline_seconds=30, contain_orphans=True)
+            DuplexRequest(
+                command=[PY, "-c", detacher], max_runtime_seconds=30, contain_orphans=True
+            )
         ) as child:
             item = child.read_line(timeout=10)
             assert isinstance(item, Record)
@@ -771,7 +904,7 @@ def test_contained_dead_orphans_are_reaped_while_the_child_runs():
 
     with start_duplex(
         DuplexRequest(
-            command=[PY, "-c", _ORPHAN_FACTORY, "200"], deadline_seconds=30, contain_orphans=True
+            command=[PY, "-c", _ORPHAN_FACTORY, "200"], max_runtime_seconds=30, contain_orphans=True
         )
     ) as child:
         assert child.read_line(timeout=20) == Record(b"forked")
@@ -832,7 +965,7 @@ def test_sigterm_ignoring_child_is_escalated_to_sigkill(monkeypatch):
         "time.sleep(60)\n"
     )
     started = time.monotonic()
-    with start_duplex(DuplexRequest(command=[PY, "-c", script], deadline_seconds=1)) as child:
+    with start_duplex(DuplexRequest(command=[PY, "-c", script], max_runtime_seconds=1)) as child:
         assert child.read_line(timeout=10) == Record(b"ready")
         res = child.finish()
     elapsed = time.monotonic() - started
@@ -871,7 +1004,7 @@ def test_adr_0002_facts_match_execute(monkeypatch, scenario):
     monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.3)
     command = [PY, "-c", _PARITY[scenario]]
     one_shot = execute(ExecutionRequest(command=command, timeout_seconds=1))
-    with start_duplex(DuplexRequest(command=command, deadline_seconds=1)) as child:
+    with start_duplex(DuplexRequest(command=command, max_runtime_seconds=1)) as child:
         child.close_stdin()
         duplex = child.finish()
 
@@ -899,7 +1032,7 @@ def test_allowlist_applies_and_env_additions_are_present(monkeypatch):
     with start_duplex(
         DuplexRequest(
             command=[PY, "-c", script],
-            deadline_seconds=30,
+            max_runtime_seconds=30,
             env_allowlist=("PATH", "AUTOFORGE_TEST_KEEP_*"),
             env={"AUTOFORGE_TEST_ADDED": "x"},
         )
@@ -916,7 +1049,7 @@ def test_allowlist_applies_and_env_additions_are_present(monkeypatch):
 def test_cwd_is_applied(tmp_path):
     script = "import os; print(os.getcwd(), flush=True)"
     with start_duplex(
-        DuplexRequest(command=[PY, "-c", script], cwd=str(tmp_path), deadline_seconds=30)
+        DuplexRequest(command=[PY, "-c", script], cwd=str(tmp_path), max_runtime_seconds=30)
     ) as child:
         assert child.read_line(timeout=10) == Record(str(tmp_path.resolve()).encode())
         child.finish()
@@ -1006,7 +1139,7 @@ def test_a_setup_failure_after_the_spawn_leaves_nothing_behind(
             start_duplex(
                 DuplexRequest(
                     command=[PY, "-c", "import time; time.sleep(60)"],
-                    deadline_seconds=30,
+                    max_runtime_seconds=30,
                     contain_orphans=contain,
                 )
             )
@@ -1028,7 +1161,7 @@ def test_a_setup_failure_after_the_spawn_leaves_nothing_behind(
     if contain:
         assert _subreaper() == previous
     with start_duplex(
-        DuplexRequest(command=[PY, "-c", "pass"], deadline_seconds=30, contain_orphans=contain)
+        DuplexRequest(command=[PY, "-c", "pass"], max_runtime_seconds=30, contain_orphans=contain)
     ) as child:
         res = child.finish()
     assert res.exit_code == 0 and res.leftovers == ""
@@ -1038,13 +1171,18 @@ def test_a_setup_failure_after_the_spawn_leaves_nothing_behind(
     ("field", "value"),
     [
         ("command", []),
-        ("deadline_seconds", 0),
-        ("deadline_seconds", -1),
-        ("deadline_seconds", float("nan")),
-        ("deadline_seconds", float("inf")),
-        ("deadline_seconds", float("-inf")),
-        ("deadline_seconds", MAX_DEADLINE_SECONDS + 1),
-        ("deadline_seconds", 1e10),
+        ("max_runtime_seconds", 0),
+        ("max_runtime_seconds", -1),
+        ("max_runtime_seconds", float("nan")),
+        ("max_runtime_seconds", float("inf")),
+        ("max_runtime_seconds", float("-inf")),
+        ("max_runtime_seconds", MAX_DEADLINE_SECONDS + 1),
+        ("max_runtime_seconds", 1e10),
+        ("idle_timeout_seconds", 0),
+        ("idle_timeout_seconds", -1),
+        ("idle_timeout_seconds", float("nan")),
+        ("idle_timeout_seconds", float("inf")),
+        ("idle_timeout_seconds", MAX_DEADLINE_SECONDS + 1),
         ("max_record_bytes", 0),
         ("max_pending_records", 0),
         ("max_pending_bytes", 0),
@@ -1066,7 +1204,7 @@ def test_invalid_request_is_refused_before_spawning(field, value, monkeypatch):
 
 def test_the_largest_accepted_deadline_is_one_every_wait_can_take():
     """An unbounded read and a write both wait on the whole remaining deadline."""
-    req = DuplexRequest(command=[PY, "-c", _ECHO, "0"], deadline_seconds=MAX_DEADLINE_SECONDS)
+    req = DuplexRequest(command=[PY, "-c", _ECHO, "0"], max_runtime_seconds=MAX_DEADLINE_SECONDS)
     with start_duplex(req) as child:
         child.send_line(b"ping")
         record = child.read_line()
@@ -1080,7 +1218,7 @@ def test_server_mode_has_devnull_stdin_and_captured_stdout():
     with start_duplex(
         DuplexRequest(
             command=[PY, "-c", script],
-            deadline_seconds=30,
+            max_runtime_seconds=30,
             stdin_pipe=False,
             stdout_mode=StdoutMode.CAPTURE,
         )

@@ -545,7 +545,7 @@ def test_failing_validation_command_names_what_it_left_behind(tmp_path, monkeypa
             "print('lint failed'); sys.exit(3)",
         ]
     ]
-    cfg.execution.default_timeout_seconds = 30
+    cfg.execution.command_timeout_seconds = 30
     eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
     eng.provider._handler = scripted(
         eng, root, [(lambda r: touch_impl(r, "v1\n"), lambda e: impl_result())]

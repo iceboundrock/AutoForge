@@ -9,9 +9,13 @@ Layout::
             progress.log      # agent steps only: the live progress lines, appended while
                               # the agent runs (bounded, redacted; ``tail -f`` it)
             request.json      # phase, profile, provider, model, effort, prompt version,
-                              # cwd, timeout, redacted argv (no environment dump)
+                              # cwd, the limits (a command's timeout; an agent's idle
+                              # timeout and max runtime), redacted argv (no environment
+                              # dump)
             prompt.md         # rendered prompt sent to the agent (redacted)
-            execution.json    # timestamps, exit code, timed_out, stdout/stderr sizes,
+            execution.json    # timestamps, exit code, timed_out and, when it did, the
+                              # limit that fired (idle / max_runtime) with the configured
+                              # limits and the last output seen, stdout/stderr sizes,
                               # whether either stream was truncated at the capture bound
                               # and what the invocation left behind (descendants killed,
                               # a group member that survived SIGKILL, an abandoned capture);
@@ -238,11 +242,23 @@ class ExecutionRecord:
     prompt_version: str = ""
     command: list[str] = field(default_factory=list)
     cwd: str = ""
+    # The wall-clock limit of a controller-run command (a validation or
+    # pre-merge verification command); 0 for an agent, which runs under
+    # the limits below instead.
     timeout_seconds: int = 0
+    # The agent's limits (``config.AgentLimits``, #193): ``None`` is an idle
+    # limit its CLI cannot be held to, or no wall-clock ceiling.
+    idle_timeout_seconds: int | None = None
+    max_runtime_seconds: int | None = None
     started_at: str = ""
     finished_at: str = ""
     exit_code: int = 0
     timed_out: bool = False
+    # When it timed out: which limit fired (``executor.LIMIT_IDLE`` /
+    # ``LIMIT_MAX_RUNTIME``). Whatever happened: when its last output was
+    # seen (UTC ISO 8601), ``None`` when it wrote nothing.
+    timeout_limit: str = ""
+    last_activity_at: str | None = None
     # The executor kept head + marker + tail of the stream (see
     # ``executor.DEFAULT_MAX_OUTPUT_BYTES``); ``stdout.log`` shows the cut.
     stdout_truncated: bool = False
@@ -629,6 +645,8 @@ class RunLogger:
             "prompt_version": record.prompt_version,
             "cwd": record.cwd,
             "timeout_seconds": record.timeout_seconds,
+            "idle_timeout_seconds": record.idle_timeout_seconds,
+            "max_runtime_seconds": record.max_runtime_seconds,
             "command": record.command,
             "metadata": record.metadata,
         }
@@ -637,6 +655,10 @@ class RunLogger:
             "finished_at": record.finished_at,
             "exit_code": record.exit_code,
             "timed_out": record.timed_out,
+            "timeout_limit": record.timeout_limit,
+            "idle_timeout_seconds": record.idle_timeout_seconds,
+            "max_runtime_seconds": record.max_runtime_seconds,
+            "last_activity_at": record.last_activity_at,
             "stdout_truncated": record.stdout_truncated,
             "stderr_truncated": record.stderr_truncated,
             "descendants_killed": record.descendants_killed,

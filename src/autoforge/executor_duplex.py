@@ -33,13 +33,20 @@ Guarantees:
   selector, so a child that stops reading stdin cannot hold the controller
   past the deadline; a child that closed its stdin raises
   :class:`ChildStdinClosedError`;
-- one absolute deadline bounds every :meth:`DuplexChild.send_line`,
-  :meth:`DuplexChild.read_line` and :meth:`DuplexChild.finish`. Past it the
-  whole group is killed exactly as ``execute()`` kills it on timeout, and
-  the result is ``timed_out``; except that, as in ``execute()``, the child
-  is looked at first, and a ``read_line`` or ``finish()`` that meets the
-  deadline after the child has exited settles the group with the exit
-  grace instead, the child's status kept;
+- one deadline bounds every :meth:`DuplexChild.send_line`,
+  :meth:`DuplexChild.read_line` and :meth:`DuplexChild.finish`: the
+  ``execute()`` limits (#193), an idle limit that every chunk the child
+  writes on stdout or stderr restarts (``idle_timeout_seconds``) and a
+  wall-clock ceiling from the spawn (``max_runtime_seconds``, or
+  :data:`MAX_DEADLINE_SECONDS` when unset), whichever is due first. A
+  record written to the child is not activity. Past the deadline the whole
+  group is killed exactly as ``execute()`` kills it on timeout, and the
+  result is ``timed_out`` and names the limit; except that, as in
+  ``execute()``, the child is looked at first, and a ``read_line`` or
+  ``finish()`` that meets the deadline after the child has exited settles
+  the group with the exit grace instead, the child's status kept.
+  :meth:`DuplexChild.pin_deadline` stops output from moving it, for a
+  caller winding the child down;
 - EOF is not the child's exit: a descendant holding stdout keeps EOF away,
   and one that keeps writing keeps every read busy.
   :meth:`DuplexChild.exited` says whether the child itself has exited,
@@ -54,8 +61,9 @@ Guarantees:
   then the group kill if anything is left. The leftover facts
   (``descendants_killed``, ``group_survived_kill``, ``capture_abandoned``)
   mean what they mean in :class:`autoforge.executor.ExecutionResult`. With a
-  hostile child the whole invocation takes at most the deadline plus the
-  exit grace plus two kill graces, the bound ``execute()`` has;
+  hostile child the whole invocation takes at most the deadline (the idle
+  limit after the last output, or the ceiling) plus the exit grace plus two
+  kill graces, the bound ``execute()`` has;
 - ``contain_orphans`` catches what left the group exactly as in
   ``execute()`` (the subreaper is held from before the spawn to the end of
   the teardown), with the same three orphan facts.
@@ -68,7 +76,6 @@ uses the same handle with ``stdin_pipe=False`` and
 from __future__ import annotations
 
 import enum
-import math
 import os
 import selectors
 import subprocess
@@ -83,17 +90,21 @@ from . import executor
 from .errors import ChildStdinClosedError, ExecutionError, ExecutionTimeoutError
 from .executor import (
     DEFAULT_MAX_OUTPUT_BYTES,
+    LIMIT_IDLE,
+    MAX_DEADLINE_SECONDS,
     _BoundedReader,
     _child_environment,
     _Containment,
     _eof,
     _group_gone,
+    _Limits,
     _now,
     _PipeDrain,
     _reaped,
     _spawn,
     _terminate_group,
     _Termination,
+    check_limit,
     describe_leftovers,
 )
 
@@ -102,10 +113,6 @@ from .executor import (
 DEFAULT_MAX_RECORD_BYTES = 4 * 1024 * 1024
 DEFAULT_MAX_PENDING_RECORDS = 1024
 DEFAULT_MAX_PENDING_BYTES = 16 * 1024 * 1024
-# Every wait on the handle is bounded by the remaining deadline, and the wait
-# primitives cannot take an arbitrarily large timeout (epoll's is an int of
-# milliseconds, about 24.8 days); a week is far above any agent timeout.
-MAX_DEADLINE_SECONDS = 7 * 24 * 3600
 
 
 class StdoutMode(enum.Enum):
@@ -169,8 +176,13 @@ class DuplexRequest:
     env: dict[str, str] | None = None
     # As :attr:`autoforge.executor.ExecutionRequest.env_allowlist`.
     env_allowlist: tuple[str, ...] | None = None
-    # Measured from the spawn; bounds every call on the handle.
-    deadline_seconds: float = 1800
+    # Kill the child once it has written nothing on stdout or stderr for
+    # this long (every chunk restarts it); ``None``: no idle limit.
+    idle_timeout_seconds: float | None = None
+    # The wall-clock ceiling, measured from the spawn; ``None``:
+    # :data:`MAX_DEADLINE_SECONDS`. With the idle limit it bounds every call
+    # on the handle.
+    max_runtime_seconds: float | None = None
     max_record_bytes: int = DEFAULT_MAX_RECORD_BYTES
     max_pending_records: int = DEFAULT_MAX_PENDING_RECORDS
     max_pending_bytes: int = DEFAULT_MAX_PENDING_BYTES
@@ -209,6 +221,11 @@ class DuplexResult:
     orphans_killed: bool = False
     orphan_survived_kill: bool = False
     orphans_unchecked: bool = False
+    # As in :class:`autoforge.executor.ExecutionResult`: the limit that
+    # killed the child when ``timed_out`` (``"idle"`` or ``"max_runtime"``),
+    # and when it last wrote anything.
+    timeout_limit: str = ""
+    last_activity_at: str | None = None
 
     @property
     def leftovers(self) -> str:
@@ -353,8 +370,14 @@ class _RecordReader(_PipeDrain):
     way it does for any other child.
     """
 
-    def __init__(self, stream: IO[bytes], max_record_bytes: int, queue: _RecordQueue) -> None:
-        super().__init__(stream, "stdout")
+    def __init__(
+        self,
+        stream: IO[bytes],
+        max_record_bytes: int,
+        queue: _RecordQueue,
+        activity: _Limits | None = None,
+    ) -> None:
+        super().__init__(stream, "stdout", activity)
         self.framer = _LineFramer(max_record_bytes)
         self._queue = queue
 
@@ -375,11 +398,8 @@ class _RecordReader(_PipeDrain):
 def _validate(req: DuplexRequest) -> None:
     if not req.command:
         raise ExecutionError("empty command")
-    deadline = req.deadline_seconds
-    if not (math.isfinite(deadline) and 0 < deadline <= MAX_DEADLINE_SECONDS):
-        raise ExecutionError(
-            f"deadline_seconds must be finite, > 0 and <= {MAX_DEADLINE_SECONDS}, got {deadline}"
-        )
+    check_limit("idle_timeout_seconds", req.idle_timeout_seconds)
+    check_limit("max_runtime_seconds", req.max_runtime_seconds)
     for name in (
         "max_record_bytes",
         "max_pending_records",
@@ -489,7 +509,10 @@ class DuplexChild:
         self._contained = contained
         self._proc = proc
         self._started = started
-        self._deadline = time.monotonic() + req.deadline_seconds
+        ceiling = req.max_runtime_seconds
+        if ceiling is None:
+            ceiling = MAX_DEADLINE_SECONDS
+        self._limits = _Limits(req.idle_timeout_seconds, ceiling)
         self._pgid = proc.pid  # start_new_session: the child leads a group of its own
         self._write_lock = threading.RLock()
         self._lifecycle_lock = threading.RLock()
@@ -501,6 +524,7 @@ class DuplexChild:
         # the child's own exit.
         self._left: _Termination | None = None
         self._timed_out = False
+        self._timeout_limit = ""
         self._child_killed = False
         self._descendants_killed = False
         self._closed = False
@@ -518,12 +542,18 @@ class DuplexChild:
         stdout_reader: _PipeDrain
         if req.stdout_mode is StdoutMode.RECORDS:
             self._queue = _RecordQueue(req.max_pending_records, req.max_pending_bytes)
-            stdout_reader = _RecordReader(proc.stdout, req.max_record_bytes, self._queue)
+            stdout_reader = _RecordReader(
+                proc.stdout, req.max_record_bytes, self._queue, self._limits
+            )
         else:
-            self._capture = _BoundedReader(proc.stdout, req.max_stdout_bytes, "stdout")
+            self._capture = _BoundedReader(
+                proc.stdout, req.max_stdout_bytes, "stdout", activity=self._limits
+            )
             stdout_reader = self._capture
         self._readers = (stdout_reader,)
-        self._stderr = _BoundedReader(proc.stderr, req.max_stderr_bytes, "stderr")
+        self._stderr = _BoundedReader(
+            proc.stderr, req.max_stderr_bytes, "stderr", activity=self._limits
+        )
         self._readers += (self._stderr,)
         for reader in self._readers:
             reader.start()
@@ -532,6 +562,29 @@ class DuplexChild:
     def pid(self) -> int:
         """The child's pid, which is also its process group id."""
         return self._proc.pid
+
+    def deadline(self) -> float:
+        """When the invocation is over unless the child writes first
+        (``time.monotonic()``): the idle limit after its last output or the
+        ceiling, whichever is due first. Recomputed on every call."""
+        deadline = self._limits.deadline()
+        assert deadline is not None  # the ceiling always applies
+        return deadline
+
+    @property
+    def deadline_limit(self) -> str:
+        """The limit :meth:`deadline` belongs to: ``"idle"`` or ``"max_runtime"``."""
+        return self._limits.limit()
+
+    def pin_deadline(self) -> None:
+        """Fix the deadline where it is: output from here on no longer moves it.
+
+        For a caller that has decided to end the invocation (an abort, an
+        orderly shutdown) and gives the child a bounded chance to settle
+        within the deadline it had; a child that keeps writing meanwhile
+        cannot stretch that chance. Idempotent.
+        """
+        self._limits.pin()
 
     def __enter__(self) -> DuplexChild:
         return self
@@ -548,7 +601,7 @@ class DuplexChild:
         # An exception (KeyboardInterrupt included) is in flight: the child is
         # given a short chance to exit on stdin EOF and run its own cleanup,
         # never the rest of the deadline, and then the group goes.
-        exit_by = min(self._deadline, time.monotonic() + executor._EXIT_GRACE_SECONDS)
+        exit_by = min(self.deadline(), time.monotonic() + executor._EXIT_GRACE_SECONDS)
         try:
             self._teardown(exit_by)
         except ExecutionError:
@@ -576,7 +629,7 @@ class DuplexChild:
             with selectors.DefaultSelector() as sel:
                 sel.register(fd, selectors.EVENT_WRITE)
                 while view:
-                    remaining = self._deadline - time.monotonic()
+                    remaining = self.deadline() - time.monotonic()
                     if remaining <= 0:
                         self._expire()
                         raise self._timeout_error()
@@ -621,15 +674,19 @@ class DuplexChild:
         if self._closed:
             return self._rest()
         now = time.monotonic()
-        if now >= self._deadline:
-            return self._deadline_reached()
-        until = self._deadline if timeout is None else min(self._deadline, now + max(0.0, timeout))
-        item = self._queue.get(until)
-        if item is not None:
-            return item
-        if time.monotonic() >= self._deadline:
-            return self._deadline_reached()
-        return Timeout(deadline_exceeded=False)
+        give_up = None if timeout is None else now + max(0.0, timeout)
+        while True:
+            # Output (stderr included) moves the deadline while this waits,
+            # so a wait that ends at the deadline it started with looks again.
+            deadline = self.deadline()
+            if now >= deadline:
+                return self._deadline_reached()
+            item = self._queue.get(deadline if give_up is None else min(deadline, give_up))
+            if item is not None:
+                return item
+            now = time.monotonic()
+            if give_up is not None and now >= give_up and now < self.deadline():
+                return Timeout(deadline_exceeded=False)
 
     def _rest(self) -> ReadOutcome:
         """Torn down: every reader has ended, so the rest of stdout is queued
@@ -651,7 +708,7 @@ class DuplexChild:
         if not self.exited():
             self._expire()
             return Timeout(deadline_exceeded=True)
-        self._teardown(self._deadline)
+        self._teardown(time.monotonic())
         return self._rest()
 
     def close_stdin(self) -> None:
@@ -678,7 +735,7 @@ class DuplexChild:
         """
         if self._result is not None:
             return self._result
-        self._teardown(self._deadline)
+        self._teardown(None)
         for reader in self._readers:
             if reader.error is not None:
                 raise ExecutionError(
@@ -706,14 +763,24 @@ class DuplexChild:
             orphans_killed=self._contained is not None and self._contained.found,
             orphan_survived_kill=self._left.orphan_survived,
             orphans_unchecked=self._req.contain_orphans and self._contained is None,
+            timeout_limit=self._timeout_limit,
+            last_activity_at=self._limits.last_activity_at(),
         )
         return self._result
 
     def _timeout_error(self) -> ExecutionTimeoutError:
+        if (self._timeout_limit or self._limits.limit()) == LIMIT_IDLE:
+            what = f"wrote nothing for {self._limits.idle:g}s"
+        else:
+            what = f"reached its {self._limits.ceiling:g}s maximum runtime"
         return ExecutionTimeoutError(
-            f"command exceeded its {self._req.deadline_seconds}s deadline and was killed: "
-            f"{' '.join(self._req.command)}"
+            f"command {what} and was killed: {' '.join(self._req.command)}"
         )
+
+    def _mark_timed_out(self) -> None:
+        """Record the timeout and the limit it was; caller holds the lock."""
+        self._timed_out = True
+        self._timeout_limit = self._limits.limit()
 
     def _kill(self) -> None:
         """Kill the group before the child exited on its own; caller holds the lock."""
@@ -725,12 +792,13 @@ class DuplexChild:
         with self._lifecycle_lock:
             if self._left is not None:
                 return
-            self._timed_out = True
+            self._mark_timed_out()
             self._kill()
 
-    def _teardown(self, exit_by: float) -> None:
-        """Close stdin, give the child until ``exit_by`` to exit, apply the exit
-        grace or kill the group, and release the pipes. Idempotent."""
+    def _teardown(self, exit_by: float | None) -> None:
+        """Close stdin, give the child until ``exit_by`` to exit (``None``:
+        until the deadline, which output still moves), apply the exit grace
+        or kill the group, and release the pipes. Idempotent."""
         self.close_stdin()
         with self._lifecycle_lock:
             try:
@@ -757,14 +825,25 @@ class DuplexChild:
             self._proc.stdout.close()
             self._proc.stderr.close()
 
-    def _settle(self, exit_by: float) -> None:
+    def _exits_by(self, exit_by: float | None) -> bool:
+        """Wait for the child's exit until ``exit_by``, or (``None``) until the
+        deadline as output moves it; True when it exited."""
+        if exit_by is not None:
+            return _reaped(self._proc, exit_by)
+        while not _reaped(self._proc, self.deadline()):
+            if self._limits.expired():
+                return False
+        return True
+
+    def _settle(self, exit_by: float | None) -> None:
         """Deal with the group once: the exit grace, or the kill; caller holds the lock."""
         if self._left is None:
             overflowed = self._queue is not None and self._queue.overflowed
             if overflowed and self._proc.poll() is None:
                 self._kill()
-            elif not _reaped(self._proc, exit_by):
-                self._timed_out = time.monotonic() >= self._deadline
+            elif not self._exits_by(exit_by):
+                if self._limits.expired():
+                    self._mark_timed_out()
                 self._kill()
             else:
                 # The child exited on its own: ADR 0002's exit grace, then

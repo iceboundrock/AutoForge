@@ -2129,3 +2129,20 @@ def test_dry_run_shows_the_prompt_argument_as_a_placeholder(tmp_path, capsys, mo
     out = capsys.readouterr().out
     (command,) = [line for line in out.splitlines() if line.startswith("Command:")]
     assert command == "Command:  scripted-agent --profile=analyze_execute -- <prompt>"
+
+
+def test_dry_run_shows_both_agent_limits(tmp_path, capsys, monkeypatch, fakes):
+    """#193: the plan names the idle timeout and the maximum runtime the
+    agent would run under, the ceiling as unset when it is."""
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    assert (
+        cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"])
+        == 0
+    )
+    capsys.readouterr()
+    assert cli.main(["--state-dir", sd, "step", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    (limits,) = [line for line in out.splitlines() if line.startswith("Limits:")]
+    assert limits == "Limits:   idle timeout 900s, max runtime unset"
+    assert not any(line.startswith("Timeout:") for line in out.splitlines())

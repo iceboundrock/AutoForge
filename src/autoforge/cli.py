@@ -924,7 +924,8 @@ def print_plan(plan: StepPlan, full_prompt: bool = False) -> None:
             for arg in plan.command
         ]
         print(f"Command:  {' '.join(redact_argv(shown))}")
-        print(f"Timeout:  {plan.timeout_seconds}s")
+    if plan.limits is not None:
+        print(f"Limits:   {plan.limits.describe()}")
     print(f"Routing:  {plan.routing}")
     print(f"Expected next: {plan.expected_next or '-'}")
     if plan.legal_next:

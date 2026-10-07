@@ -824,7 +824,8 @@ def test_a_timed_out_agent_that_enlarged_the_journal_keeps_its_checkpoint(tmp_pa
     with pytest.raises(
         StateError,
         match=r"corrupted event journal.*interrupted attempt 1 of ANALYZE_EXECUTE after the "
-        r"agent had returned with: timed out after \d+s\. Its launch was checkpointed before "
+        r"agent had returned with: timed out \(idle timeout 900s, max runtime unset\)\. "
+        r"Its launch was checkpointed before "
         r"it started.*'resume' re-enters ANALYZE_EXECUTE as a retry judged against that "
         r"checkpoint",
     ):

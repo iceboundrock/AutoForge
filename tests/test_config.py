@@ -666,25 +666,29 @@ def test_allow_merge_rejects_non_boolean(tmp_path, body):
     "body, key",
     [
         (
-            '{"version": 1, "execution": {"default_timeout_seconds": "not-a-number"}}',
-            "execution.default_timeout_seconds",
+            '{"version": 1, "execution": {"default_idle_timeout_seconds": "not-a-number"}}',
+            "execution.default_idle_timeout_seconds",
+        ),
+        (
+            '{"version": 1, "execution": {"default_max_runtime_seconds": "1h"}}',
+            "execution.default_max_runtime_seconds",
         ),
         (
             '{"version": 1, "execution": {"max_correction_attempts": 1.5}}',
             "execution.max_correction_attempts",
         ),
         (
-            '{"version": 1, "execution": {"default_timeout_seconds": true}}',
-            "execution.default_timeout_seconds",
+            '{"version": 1, "execution": {"command_timeout_seconds": true}}',
+            "execution.command_timeout_seconds",
         ),
         ('{"version": 1, "github": {"timeout_seconds": "12"}}', "github.timeout_seconds"),
         (
-            '{"version": 1, "profiles": {"fix": {"timeout_seconds": "60"}}}',
-            "profiles.fix.timeout_seconds",
+            '{"version": 1, "profiles": {"fix": {"idle_timeout_seconds": "60"}}}',
+            "profiles.fix.idle_timeout_seconds",
         ),
         (
-            '{"version": 1, "profiles": {"custom": {"model": "m", "timeout_seconds": "60"}}}',
-            "profiles.custom.timeout_seconds",
+            '{"version": 1, "profiles": {"custom": {"model": "m", "max_runtime_seconds": "60"}}}',
+            "profiles.custom.max_runtime_seconds",
         ),
     ],
 )
@@ -707,16 +711,21 @@ def test_real_scalars_still_accepted(tmp_path):
     p = tmp_path / "cfg.json"
     p.write_text(
         '{"version": 1, "safety": {"allow_merge": true}, '
-        '"execution": {"default_timeout_seconds": 42, "max_correction_attempts": 0}, '
-        '"github": {"timeout_seconds": 7}, "profiles": {"fix": {"timeout_seconds": 9}}}',
+        '"execution": {"default_idle_timeout_seconds": 42, "default_max_runtime_seconds": 43, '
+        '"command_timeout_seconds": 44, "max_correction_attempts": 0}, '
+        '"github": {"timeout_seconds": 7}, '
+        '"profiles": {"fix": {"idle_timeout_seconds": 9, "max_runtime_seconds": 10}}}',
         encoding="utf-8",
     )
     cfg = load_config_file(p)
     assert cfg.safety.allow_merge is True
-    assert cfg.execution.default_timeout_seconds == 42
+    assert cfg.execution.default_idle_timeout_seconds == 42
+    assert cfg.execution.default_max_runtime_seconds == 43
+    assert cfg.execution.command_timeout_seconds == 44
     assert cfg.execution.max_correction_attempts == 0
     assert cfg.github.timeout_seconds == 7
-    assert cfg.profile("fix").timeout_seconds == 9
+    assert cfg.profile("fix").idle_timeout_seconds == 9
+    assert cfg.profile("fix").max_runtime_seconds == 10
 
 
 def test_workflow_defaults_and_parsing(tmp_path):
@@ -912,48 +921,161 @@ def test_protected_merge_paths_must_be_a_list_of_non_empty_strings(tmp_path, val
         load_config_file(p)
 
 
-@pytest.mark.parametrize("value", [0, -1, -1800])
-def test_a_non_positive_default_timeout_is_rejected(tmp_path, value):
+_EXECUTION_LIMITS = (
+    "default_idle_timeout_seconds",
+    "default_max_runtime_seconds",
+    "command_timeout_seconds",
+)
+
+
+@pytest.mark.parametrize("key", _EXECUTION_LIMITS)
+@pytest.mark.parametrize("value", [0, -1, -1800, config.MAX_DEADLINE_SECONDS + 1])
+def test_an_execution_limit_out_of_range_is_rejected(tmp_path, key, value):
     """PR #44, R1-F6: `timeout=0` disables the timeout rather than tightening it.
 
     `subprocess.run(..., timeout=0)` is not "fail immediately", and a negative
     value is not a timeout at all — both leave a hung agent running forever
     against the operator's machine, which is exactly what the timeout exists
     to bound. A configuration that reads as "no time allowed" must not
-    silently become "unlimited time".
+    silently become "unlimited time". Above one week is past the executor's
+    own backstop, which it would refuse at launch (#193).
     """
     p = tmp_path / "cfg.json"
-    p.write_text(
-        f'{{"version": 1, "execution": {{"default_timeout_seconds": {value}}}}}',
-        encoding="utf-8",
-    )
-    with pytest.raises(ConfigurationError, match="default_timeout_seconds.*must be > 0"):
+    p.write_text(json.dumps({"version": 1, "execution": {key: value}}), encoding="utf-8")
+    with pytest.raises(ConfigurationError, match=f"execution.{key}.*must be > 0"):
         load_config_file(p)
 
 
-@pytest.mark.parametrize("value", [0, -5])
-def test_a_non_positive_profile_timeout_is_rejected(tmp_path, value):
+@pytest.mark.parametrize("key", ["idle_timeout_seconds", "max_runtime_seconds"])
+@pytest.mark.parametrize("value", [0, -5, config.MAX_DEADLINE_SECONDS + 1])
+def test_a_profile_limit_out_of_range_is_rejected(tmp_path, key, value):
     """The same bound on the per-profile override that shadows the default.
 
     The profile override is checked when the profile is validated (the
-    controller's preflight and `doctor`) rather than at parse time, because a
-    config may legitimately carry profiles a given run never reaches.
+    controller's preflight and `doctor`) and whenever its limits are
+    resolved, rather than at parse time, because a config may legitimately
+    carry profiles a given run never reaches.
     """
     p = tmp_path / "cfg.json"
+    p.write_text(json.dumps({"version": 1, "profiles": {"fix": {key: value}}}), encoding="utf-8")
+    cfg = load_config_file(p)
+    assert getattr(cfg.profile("fix"), key) == value
+    with pytest.raises(ConfigurationError, match=f"{key}' must be > 0"):
+        validate_required_profiles(cfg, ["fix"])
+    with pytest.raises(ConfigurationError, match=f"{key}' must be > 0"):
+        cfg.agent_limits(cfg.profile("fix"))
+
+
+def test_limits_in_range_and_a_null_ceiling_are_accepted(tmp_path):
+    p = tmp_path / "cfg.json"
     p.write_text(
-        f'{{"version": 1, "profiles": {{"fix": {{"timeout_seconds": {value}}}}}}}',
+        json.dumps(
+            {
+                "version": 1,
+                "execution": {
+                    "default_idle_timeout_seconds": 1,
+                    "default_max_runtime_seconds": None,
+                    "command_timeout_seconds": config.MAX_DEADLINE_SECONDS,
+                },
+                "profiles": {"fix": {"idle_timeout_seconds": 2, "max_runtime_seconds": None}},
+            }
+        ),
         encoding="utf-8",
     )
     cfg = load_config_file(p)
-    assert cfg.profile("fix").timeout_seconds == value
-    with pytest.raises(ConfigurationError, match="timeout_seconds must be > 0"):
+    assert cfg.execution.default_idle_timeout_seconds == 1
+    assert cfg.execution.default_max_runtime_seconds is None
+    assert cfg.execution.command_timeout_seconds == config.MAX_DEADLINE_SECONDS
+    assert cfg.profile("fix").max_runtime_seconds is None
+
+
+def test_the_default_limits_are_an_idle_timeout_and_no_ceiling():
+    """#193: 900s without output kills an agent; nothing bounds an active one
+    but the executor's one-week backstop; commands keep 1800s wall-clock."""
+    cfg = default_config()
+    assert cfg.execution.default_idle_timeout_seconds == 900
+    assert cfg.execution.default_max_runtime_seconds is None
+    assert cfg.execution.command_timeout_seconds == 1800
+    for profile in cfg.profiles.values():
+        assert (profile.idle_timeout_seconds, profile.max_runtime_seconds) == (None, None)
+        assert cfg.agent_limits(profile) == config.AgentLimits(900, None), profile.name
+
+
+def test_agent_limits_take_the_profile_value_over_the_execution_default():
+    cfg = default_config()
+    cfg.execution.default_idle_timeout_seconds = 600
+    cfg.execution.default_max_runtime_seconds = 7200
+    fix = cfg.profile("fix")
+    assert cfg.agent_limits(fix) == config.AgentLimits(600, 7200)
+    fix.idle_timeout_seconds = 60
+    assert cfg.agent_limits(fix) == config.AgentLimits(60, 7200)
+    fix.max_runtime_seconds = 120
+    assert cfg.agent_limits(fix) == config.AgentLimits(60, 120)
+
+
+def test_a_profile_timeout_seconds_names_its_replacements(tmp_path):
+    """#193: the old wall-clock key is not reinterpreted as either new one."""
+    p = tmp_path / "cfg.json"
+    p.write_text('{"version": 1, "profiles": {"fix": {"timeout_seconds": 60}}}', encoding="utf-8")
+    with pytest.raises(ConfigurationError) as excinfo:
+        load_config_file(p)
+    message = str(excinfo.value)
+    assert "profiles.fix" in message and "'timeout_seconds' is no longer supported" in message
+    assert "'idle_timeout_seconds'" in message and "'max_runtime_seconds'" in message
+
+
+def test_a_new_profile_timeout_seconds_names_its_replacements(tmp_path):
+    p = tmp_path / "cfg.json"
+    p.write_text(
+        '{"version": 1, "profiles": {"custom": {"model": "m", "timeout_seconds": 60}}}',
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigurationError, match="profiles.custom.*idle_timeout_seconds"):
+        load_config_file(p)
+
+
+def test_execution_default_timeout_seconds_names_its_replacements(tmp_path):
+    p = tmp_path / "cfg.json"
+    p.write_text('{"version": 1, "execution": {"default_timeout_seconds": 60}}', encoding="utf-8")
+    with pytest.raises(ConfigurationError) as excinfo:
+        load_config_file(p)
+    message = str(excinfo.value)
+    assert "'execution.default_timeout_seconds' is no longer supported" in message
+    for replacement in _EXECUTION_LIMITS:
+        assert f"'execution.{replacement}'" in message
+
+
+def test_claude_text_mode_without_a_ceiling_is_refused():
+    """#193: `output_format: text` writes nothing until it exits, so an idle
+    limit would kill every run that outlasts it; it needs a wall-clock one."""
+    cfg = default_config()
+    fix = cfg.profile("fix")
+    fix.options["output_format"] = "text"
+    fix.idle_timeout_seconds = 300
+    with pytest.raises(ConfigurationError, match="'fix'.*max_runtime_seconds.*stream-json"):
+        cfg.agent_limits(fix)
+    with pytest.raises(ConfigurationError, match="max_runtime_seconds"):
         validate_required_profiles(cfg, ["fix"])
 
 
-def test_a_positive_default_timeout_is_still_accepted(tmp_path):
-    p = tmp_path / "cfg.json"
-    p.write_text('{"version": 1, "execution": {"default_timeout_seconds": 1}}', encoding="utf-8")
-    assert load_config_file(p).execution.default_timeout_seconds == 1
+@pytest.mark.parametrize("on_profile", [True, False])
+def test_claude_text_mode_runs_under_its_ceiling_alone(on_profile):
+    cfg = default_config()
+    fix = cfg.profile("fix")
+    fix.options["output_format"] = "text"
+    if on_profile:
+        fix.max_runtime_seconds = 3600
+    else:
+        cfg.execution.default_max_runtime_seconds = 3600
+    limits = cfg.agent_limits(fix)
+    assert limits == config.AgentLimits(None, 3600)
+    assert limits.describe() == "idle timeout off (no output until exit), max runtime 3600s"
+    validate_required_profiles(cfg, ["fix"])
+
+
+def test_agent_limits_describe_both_values():
+    assert config.AgentLimits(900, None).describe() == "idle timeout 900s, max runtime unset"
+    assert config.AgentLimits(60, 120).describe() == "idle timeout 60s, max runtime 120s"
 
 
 # -- agent environment allow-list and worktree location (#10) --------------------
@@ -1778,6 +1900,6 @@ def test_example_yaml_with_the_pi_block_enabled_loads_and_validates(tmp_path, ya
         "high",
         "pi",
     )
-    assert p.timeout_seconds == 1800
+    assert cfg.agent_limits(p) == config.AgentLimits(900, None)
     assert p.options == {"require_oauth": "true", "tools": "read,bash", "context_files": "true"}
     validate_required_profiles(cfg, REQUIRED_PROFILES)

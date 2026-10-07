@@ -825,6 +825,7 @@ def _execute(
     tmp_path,
     scenario,
     timeout=20,
+    idle=None,
     prompt="implement #131",
     options=None,
     env_allowlist=("PATH",),
@@ -837,7 +838,8 @@ def _execute(
         prompt=prompt,
         cwd=str(tmp_path),
         profile=_profile(fake.command, **(options or {})),
-        timeout_seconds=timeout,
+        idle_timeout_seconds=idle,
+        max_runtime_seconds=timeout,
         env_allowlist=env_allowlist,
     )
     return provider.execute(req), fake
@@ -1059,6 +1061,39 @@ def test_provider_deadline_mid_stream_aborts_then_closes_stdin(tmp_path):
     assert fake.commands()[-1] == "abort"
     assert res.provider_summary["abort_sent"] is True
     assert res.provider_summary["failure"].startswith("pi: the deadline was reached")
+    assert res.timeout_limit == "max_runtime"
+
+
+def test_provider_a_silent_pi_is_aborted_at_its_idle_timeout(tmp_path):
+    """#193: Pi answers, starts the prompt and goes silent. The abort goes out
+    within the idle limit, counted from Pi's last record, and the timeout is
+    named as the idle one."""
+    scenario = _happy()
+    scenario["on"]["prompt"] = [
+        {"respond": "prompt", "data": {"disposition": "started"}},
+        {"emit": {"type": "agent_start"}},
+    ]
+    started = time.monotonic()
+    res, fake = _execute(tmp_path, scenario, timeout=60, idle=2)
+    assert time.monotonic() - started < 15
+    assert res.timed_out and res.timeout_limit == "idle" and res.stdout == ""
+    assert res.last_activity_at is not None
+    assert fake.commands()[-1] == "abort"
+
+
+def test_provider_a_pi_that_keeps_reporting_outlives_its_idle_timeout(tmp_path):
+    scenario = _happy()
+    update = {"type": "message_update", "message": {"role": "assistant", "content": []}}
+    ticks = [{"sleep": 0.3}, {"emit": update}] * 6
+    scenario["on"]["prompt"] = [
+        {"respond": "prompt", "data": {"disposition": "started"}},
+        *ticks,
+        *scenario["on"]["prompt"][1:],
+    ]
+    started = time.monotonic()
+    res, _ = _execute(tmp_path, scenario, timeout=60, idle=1)
+    assert time.monotonic() - started >= 1.8
+    assert not res.timed_out and res.provider_failure is None and res.stdout == FINAL
 
 
 def test_provider_a_pi_that_ignores_abort_and_stdin_close_is_killed(tmp_path):
@@ -1093,7 +1128,7 @@ def test_provider_keeps_the_tail_of_a_text_past_the_bound(tmp_path):
 def test_provider_a_spawn_failure_raises_execution_error(tmp_path, require_oauth):
     provider = PiProvider()
     profile = _profile(tmp_path / "no-such-pi", require_oauth=require_oauth)
-    req = AgentRequest("REVIEW", "p", str(tmp_path), profile, 5, env_allowlist=("PATH",))
+    req = AgentRequest("REVIEW", "p", str(tmp_path), profile, None, 5, env_allowlist=("PATH",))
     with pytest.raises(ExecutionError):
         provider.execute(req)
 

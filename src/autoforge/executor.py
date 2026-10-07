@@ -52,12 +52,24 @@ Safety properties:
   (:attr:`ExecutionResult.orphans_killed`,
   :attr:`ExecutionResult.orphan_survived_kill`). Where no subreaper exists
   the result says the check could not be made
-  (:attr:`ExecutionResult.orphans_unchecked`). See the ADR 0002 amendment.
+  (:attr:`ExecutionResult.orphans_unchecked`). See the ADR 0002 amendment;
+- the child runs under two limits (:class:`_Limits`, #193): a wall-clock
+  ceiling (``timeout_seconds``, measured from the spawn) and, on request, an
+  idle limit (``idle_timeout_seconds``) that every chunk the child writes
+  on stdout or stderr restarts, so a child that keeps producing output is
+  never killed for being slow and a silent one is killed once it has been
+  silent that long. The wait runs in slices, each bounded by whichever
+  limit is due first, and the kill on either is the group kill above. The
+  result says which limit fired (:attr:`ExecutionResult.timeout_limit`) and
+  when the child last wrote anything (:attr:`ExecutionResult.last_activity_at`).
+  Only the child's output is activity: what the controller writes to it is
+  not, and neither is time spent waiting on anyone else.
 """
 
 from __future__ import annotations
 
 import ctypes
+import math
 import os
 import re
 import selectors
@@ -88,6 +100,16 @@ _READ_CHUNK_BYTES = 64 * 1024
 # smaller still. It is a request field rather than configuration because
 # nothing legitimate should reach it.
 DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024 * 1024
+
+# The backstop under every agent limit: an agent with no wall-clock ceiling
+# of its own still ends here. Every wait is bounded by the remaining time,
+# and the wait primitives cannot take an arbitrarily large timeout (epoll's
+# is an int of milliseconds, about 24.8 days); a week is far above any run.
+MAX_DEADLINE_SECONDS = 7 * 24 * 3600
+
+# The names :attr:`ExecutionResult.timeout_limit` takes when a limit fired.
+LIMIT_IDLE = "idle"
+LIMIT_MAX_RUNTIME = "max_runtime"
 
 # An environment allow-list entry: a variable name, or a name prefix followed
 # by ``*`` (``LC_*``, ``ANTHROPIC_*``). Nothing else -- no other glob
@@ -139,7 +161,12 @@ class ExecutionRequest:
     cwd: str | None = None
     # Layered over the inherited (or allow-listed) environment when given.
     env: dict[str, str] | None = None
+    # The wall-clock ceiling, measured from the spawn; 0 or less: none.
     timeout_seconds: int = 1800
+    # Kill the child once it has written nothing on stdout or stderr for
+    # this many seconds; every chunk restarts it (#193). ``None``: no idle
+    # limit, only the ceiling. For an agent; plumbing leaves it off.
+    idle_timeout_seconds: float | None = None
     max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES
     # ``None``: the child inherits the controller's whole environment (the
     # controller's own git/gh plumbing). A tuple of names/prefixes: the child
@@ -209,6 +236,13 @@ class ExecutionResult:
     # by any process holding the child's stdin counts as read; whether the
     # child then used what it read is beyond what the executor can see.
     stdin_unread: int = 0
+    # Which limit killed the child when ``timed_out``: ``"idle"`` (it wrote
+    # nothing for ``idle_timeout_seconds``) or ``"max_runtime"`` (the
+    # wall-clock ceiling); empty otherwise.
+    timeout_limit: str = ""
+    # When the child last wrote anything on stdout or stderr (UTC, ISO
+    # 8601); ``None`` when it wrote nothing at all.
+    last_activity_at: str | None = None
 
     @property
     def stdout_tail(self) -> str:
@@ -242,7 +276,8 @@ class ExecutionResult:
 
     def raise_if_failed(self) -> ExecutionResult:
         if self.timed_out:
-            raise ExecutionTimeoutError(f"command timed out: {' '.join(self.command)}")
+            limit = f" ({self.timeout_limit} limit)" if self.timeout_limit else ""
+            raise ExecutionTimeoutError(f"command timed out{limit}: {' '.join(self.command)}")
         if self.exit_code != 0:
             raise ExecutionError(
                 f"command exited {self.exit_code}: {' '.join(self.command)}\n"
@@ -394,6 +429,97 @@ class _BoundedBuffer:
         return _Captured(head_text + marker + tail_text, True, len(head_text) + len(marker))
 
 
+class _Limits:
+    """The limits one invocation runs under, and the activity that moves one (#193).
+
+    ``idle`` (seconds, or ``None``): the invocation is over once the child
+    has written nothing on stdout or stderr for that long, counted from the
+    spawn until the first chunk and from the latest chunk after it.
+    ``ceiling`` (seconds, or ``None``): measured from the spawn and never
+    moved. :meth:`deadline` is whichever is due first, recomputed on every
+    call, so a waiter that wakes at a deadline activity has since moved
+    simply waits again.
+
+    :meth:`touch` is called on the reader threads; it publishes the time of
+    the chunk in one assignment, so a waiter on another thread reads either
+    the previous chunk's time or this one's, never a mixture. Only output
+    touches it: what the controller writes to the child is not activity,
+    and neither is any time spent waiting on someone else.
+    """
+
+    def __init__(self, idle: float | None, ceiling: float | None) -> None:
+        self.idle = idle
+        self.ceiling = ceiling
+        self._started = time.monotonic()
+        # (monotonic, wall clock) of the latest chunk; None before the first.
+        self._last: tuple[float, float] | None = None
+        # (deadline, limit) once :meth:`pin` has fixed them.
+        self._pinned: tuple[float, str] | None = None
+
+    def touch(self) -> None:
+        """A chunk of output arrived."""
+        self._last = (time.monotonic(), time.time())
+
+    def _due(self) -> tuple[float, str] | None:
+        idle_at = None
+        if self.idle is not None:
+            last = self._last
+            idle_at = (self._started if last is None else last[0]) + self.idle
+        ceiling_at = None if self.ceiling is None else self._started + self.ceiling
+        if ceiling_at is not None and (idle_at is None or ceiling_at <= idle_at):
+            return ceiling_at, LIMIT_MAX_RUNTIME
+        if idle_at is not None:
+            return idle_at, LIMIT_IDLE
+        return None
+
+    def deadline(self) -> float | None:
+        """When the invocation is over unless output arrives first
+        (``time.monotonic()``); ``None`` when no limit applies."""
+        due = self._pinned or self._due()
+        return None if due is None else due[0]
+
+    def limit(self) -> str:
+        """The limit :meth:`deadline` belongs to; empty when none applies."""
+        due = self._pinned or self._due()
+        return "" if due is None else due[1]
+
+    def expired(self) -> bool:
+        deadline = self.deadline()
+        return deadline is not None and time.monotonic() >= deadline
+
+    def pin(self) -> None:
+        """Fix the current deadline: output from here on no longer moves it.
+
+        For a caller that has decided to end the invocation and is giving
+        the child a bounded chance to shut down in order. Idempotent.
+        """
+        if self._pinned is None:
+            self._pinned = self._due()
+
+    def last_activity_at(self) -> str | None:
+        """When the latest chunk arrived (UTC, ISO 8601); ``None`` before any."""
+        last = self._last
+        return None if last is None else datetime.fromtimestamp(last[1], UTC).isoformat()
+
+
+def _wait_within(proc: subprocess.Popen, limits: _Limits) -> bool:
+    """Wait for the child's exit while it stays within ``limits``; False when one ran out.
+
+    Each slice waits until the deadline due at its start; one that ends
+    without the exit looks again, since output may have moved the deadline
+    meanwhile, and only a deadline still past when looked at ends the wait.
+    """
+    while True:
+        deadline = limits.deadline()
+        try:
+            proc.wait(timeout=None if deadline is None else max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            if limits.expired():
+                return False
+            continue
+        return True
+
+
 class _PipeDrain(threading.Thread):
     """Drain one pipe until EOF or abandoned, handing each chunk to :meth:`_feed`.
 
@@ -402,7 +528,9 @@ class _PipeDrain(threading.Thread):
     arrives only once every writer is gone; :meth:`abandon` ends the read
     without it, for a writer nothing here can kill. What a chunk becomes
     (bounded capture here, LF-framed records in ``executor_duplex``) is the
-    subclass's.
+    subclass's. ``activity``, when given, is touched before each chunk is
+    handed on (see :class:`_Limits`), so whoever is woken by the chunk
+    already sees the deadline it moved.
 
     Building a reader takes nothing that must be given back: the wake pipe
     is opened by :meth:`start` and released by :meth:`close`. A launch holds
@@ -411,9 +539,10 @@ class _PipeDrain(threading.Thread):
     allocated, say) holds nothing for it to reach.
     """
 
-    def __init__(self, stream: IO[bytes], name: str) -> None:
+    def __init__(self, stream: IO[bytes], name: str, activity: _Limits | None = None) -> None:
         super().__init__(name=f"autoforge-capture-{name}", daemon=True)
         self._fd = stream.fileno()
+        self._activity = activity
         # (read end, write end): opened by :meth:`start`, closed by :meth:`close`.
         self._wake: tuple[int, int] | None = None
         self.error: OSError | None = None
@@ -440,6 +569,8 @@ class _PipeDrain(threading.Thread):
                     if not chunk:
                         eof = True
                         return
+                    if self._activity is not None:
+                        self._activity.touch()
                     self._feed(chunk)
         except OSError as exc:
             self.error = exc
@@ -512,8 +643,9 @@ class _BoundedReader(_PipeDrain):
         limit: int,
         name: str,
         observer: _OutputObserver | None = None,
+        activity: _Limits | None = None,
     ) -> None:
-        super().__init__(stream, name)
+        super().__init__(stream, name, activity)
         self.buffer = _BoundedBuffer(limit, name)
         self._stream_name = name
         self._observer = observer
@@ -1041,8 +1173,11 @@ def execute(req: ExecutionRequest) -> ExecutionResult:
     """Run one subprocess to completion, capturing output.
 
     Completion is the child's exit, EOF on both pipes and an empty process
-    group. The child's exit is bounded by ``timeout_seconds``; past it the
-    whole group is killed and the result is a timeout. Once the child has
+    group. The child's exit is bounded by ``timeout_seconds`` from the spawn
+    and, with ``idle_timeout_seconds``, by that long after the last chunk
+    the child wrote on either stream (see :class:`_Limits`); past either the
+    whole group is killed and the result is a timeout naming the limit
+    (``timeout_limit``). Once the child has
     exited on its own, the other two are given ``_EXIT_GRACE_SECONDS``: a
     descendant that outlives the child (a server it left running, holding
     the inherited pipes or with its stdio redirected) is then killed with
@@ -1053,9 +1188,10 @@ def execute(req: ExecutionRequest) -> ExecutionResult:
 
     Every wait past the child's exit is bounded, so what a kill cannot
     remove is reported (``group_survived_kill``, ``capture_abandoned``)
-    rather than waited for, and ``execute()`` returns within the timeout
-    plus the exit grace plus two kill grace periods whatever the child left
-    behind.
+    rather than waited for, and ``execute()`` returns within the limit that
+    fires (the idle limit after the last output, or the ceiling after the
+    spawn, whichever comes first) plus the exit grace plus two kill grace
+    periods whatever the child left behind.
 
     Timeouts, non-zero exits and truncated output are *returned* (not
     raised) so callers can log stdout/stderr first; use ``raise_if_failed()``
@@ -1072,6 +1208,7 @@ def execute(req: ExecutionRequest) -> ExecutionResult:
         raise ExecutionError("empty command")
     if req.max_output_bytes <= 0:
         raise ExecutionError(f"max_output_bytes must be > 0, got {req.max_output_bytes}")
+    check_limit("idle_timeout_seconds", req.idle_timeout_seconds)
     contained = _Containment.begin() if req.contain_orphans else None
     try:
         return _execute(req, contained)
@@ -1080,15 +1217,28 @@ def execute(req: ExecutionRequest) -> ExecutionResult:
             contained.release()
 
 
+def check_limit(name: str, value: float | None) -> None:
+    """Raise :class:`ExecutionError` unless ``value`` is ``None`` or a finite
+    number of seconds in ``(0, MAX_DEADLINE_SECONDS]``."""
+    if value is None:
+        return
+    if not (math.isfinite(value) and 0 < value <= MAX_DEADLINE_SECONDS):
+        raise ExecutionError(
+            f"{name} must be finite, > 0 and <= {MAX_DEADLINE_SECONDS}, got {value}"
+        )
+
+
 def _execute(req: ExecutionRequest, contained: _Containment | None) -> ExecutionResult:
     started = _now()
-    timeout = req.timeout_seconds if req.timeout_seconds > 0 else None
+    ceiling = req.timeout_seconds if req.timeout_seconds > 0 else None
+    limits = _Limits(req.idle_timeout_seconds, ceiling)
     try:
         feeder = None if req.stdin_data is None else _StdinFeeder(req.stdin_data)
     except OSError as exc:
         raise ExecutionError(f"failed to spawn {' '.join(req.command)}: {exc}") from exc
     readers: tuple[_BoundedReader, ...] = ()
     timed_out = False
+    timeout_limit = ""
     descendants_killed = False
     left = _Termination(group_survived=False, capture_abandoned=False)
     try:
@@ -1122,14 +1272,13 @@ def _execute(req: ExecutionRequest, contained: _Containment | None) -> Execution
             # would leave the invocation unlogged (#17).
             observer = None if req.on_output is None else _OutputObserver(req.on_output)
             for stream, name in ((proc.stdout, "stdout"), (proc.stderr, "stderr")):
-                readers += (_BoundedReader(stream, req.max_output_bytes, name, observer),)
+                readers += (_BoundedReader(stream, req.max_output_bytes, name, observer, limits),)
                 readers[-1].start()
         except (OSError, RuntimeError) as exc:
             raise ExecutionError(f"failed to start {' '.join(req.command)}: {exc}") from exc
-        try:
-            proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
+        if not _wait_within(proc, limits):
             timed_out = True
+            timeout_limit = limits.limit()
         if timed_out:
             left = _terminate_group(pgid, proc, readers, contained)
         else:
@@ -1191,4 +1340,6 @@ def _execute(req: ExecutionRequest, contained: _Containment | None) -> Execution
         orphan_survived_kill=left.orphan_survived,
         orphans_unchecked=req.contain_orphans and contained is None,
         stdin_unread=0 if feeder is None else feeder.unread,
+        timeout_limit=timeout_limit,
+        last_activity_at=limits.last_activity_at(),
     )

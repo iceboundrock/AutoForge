@@ -308,9 +308,12 @@ requirement named (#120). Same layout either way:
         <seq>-<phase>-<attempt>/
             progress.log                   # agent steps: live progress lines, appended while the
                                            # agent runs (published before the launch; bounded, redacted)
-            request.json                   # profile, model, effort, command, timeout
+            request.json                   # profile, model, effort, command, limits (idle timeout,
+                                           # max runtime; the wall-clock timeout of a command)
             prompt.md                      # rendered prompt (redacted)
-            execution.json                 # exit code, timing, timed_out, truncation, leftovers, error
+            execution.json                 # exit code, timing, timed_out, the limit that fired
+                                           # (idle / max_runtime), configured limits, last activity,
+                                           # truncation, leftovers, error
             stdout.log / stderr.log        # redacted; head + marker + tail past the capture bound
             control-result.json            # parsed CONTROL_RESULT (when valid)
 ```

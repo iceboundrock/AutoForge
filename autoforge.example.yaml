@@ -28,7 +28,22 @@ state_dir: .autoforge
 prompt_version: v1
 
 execution:
-  default_timeout_seconds: 1800
+  # An agent is killed once it has written nothing (stdout or stderr) for
+  # this long; any output resets the timer. A silent tool call counts as no
+  # progress, so raise it for a repository whose test suite runs longer
+  # than this without printing. A profile overrides it with
+  # `idle_timeout_seconds`.
+  default_idle_timeout_seconds: 900
+  # A wall-clock ceiling on every agent, however much it writes; a profile
+  # overrides it with `max_runtime_seconds`. null (the default): none, so an
+  # agent that loops while producing output is never killed (only the
+  # executor's one-week backstop applies). This is the only hard bound on an
+  # active agent. Required for a Claude profile with `output_format: text`,
+  # which writes nothing until it exits and so runs under this limit alone.
+  default_max_runtime_seconds: null
+  # Wall-clock limit of each `merge.verification_commands` and
+  # `local.validation_commands` entry the controller runs itself.
+  command_timeout_seconds: 1800
   # A malformed CONTROL_RESULT with exit code 0 triggers at most this many
   # correction prompts before the step fails (0 disables correction).
   max_correction_attempts: 1
@@ -140,7 +155,7 @@ merge:
   # `setuptools-scm` version stamping) or a submodule fails there, so keep
   # such steps out of this list. If the commit is not local yet,
   # `refs/pull/<n>/head` is fetched from `origin` (objects only, no local
-  # ref). A non-zero exit or a timeout (`execution.default_timeout_seconds`)
+  # ref). A non-zero exit or a timeout (`execution.command_timeout_seconds`)
   # is BLOCKED with the output tail; an unfetchable or unexportable commit is
   # inconclusive. A pass is persisted per (HEAD, command list) so `resume`
   # does not repeat it, and is cleared when the run moves to another issue.
@@ -237,7 +252,8 @@ profiles:
     model: fable            # `claude --model`
     effort: high            # `claude --effort` (low|medium|high|xhigh|max)
     command: claude
-    timeout_seconds: 1800
+    # idle_timeout_seconds: 1800   # overrides execution.default_idle_timeout_seconds
+    # max_runtime_seconds: 7200    # overrides execution.default_max_runtime_seconds
     options:
       permission_mode: bypassPermissions   # non-interactive; sandbox the working tree
       output_format: stream-json  # live progress; `text` opts out (no progress, final text at exit)
@@ -247,7 +263,6 @@ profiles:
     model: fable
     effort: high
     command: claude
-    timeout_seconds: 1800
     options:
       permission_mode: bypassPermissions
       output_format: stream-json
@@ -257,7 +272,6 @@ profiles:
     model: openai/gpt-5.6-luna     # `opencode run -m` (provider/model, no `#variant`)
     effort: high                   # sent as the `#<variant>` suffix: `-m openai/gpt-5.6-luna#high`
     command: opencode
-    timeout_seconds: 1800
     options:
       output_format: default       # final text on stdout (CONTROL_RESULT verbatim)
       auto_approve: false          # add `--auto` only if your OpenCode permissions need it
@@ -267,7 +281,6 @@ profiles:
     model: openai/gpt-5.6-terra
     effort: high
     command: opencode
-    timeout_seconds: 1800
     options:
       output_format: default
       auto_approve: false
@@ -287,7 +300,6 @@ profiles:
   #   model: openai/gpt-5.6-terra   # `pi --model` (<pi-provider>/<model-id>, no `:<thinking>`)
   #   effort: high                  # `pi --thinking` (off|minimal|low|medium|high|xhigh|max), required
   #   command: pi
-  #   timeout_seconds: 1800
   #   options:
   #     require_oauth: true         # refuse to run on an API key instead of the sign-in
   #     tools: read,bash            # Pi built-in tools; default read,bash for a reviewer
@@ -299,7 +311,6 @@ profiles:
     model: openai/gpt-5.6-sol
     effort: medium
     command: opencode
-    timeout_seconds: 1200
     options:
       output_format: default
       auto_approve: false
@@ -312,7 +323,6 @@ profiles:
     model: openai/gpt-5.6-terra
     effort: high
     command: opencode
-    timeout_seconds: 3600
     options:
       output_format: default
       auto_approve: false
@@ -325,7 +335,6 @@ profiles:
     model: openai/gpt-5.6-sol
     effort: high
     command: opencode
-    timeout_seconds: 1200
 
 github:
   # `gh` binary name / path. All GitHub reads/verification go through `gh`.
@@ -371,7 +380,8 @@ local:
   # Controller-owned validation, run by AutoForge (not by an agent) after
   # ANALYZE_EXECUTE and after FIX. Each entry is an argv ARRAY, never a shell
   # string: no shell is involved, so quoting, globs, pipes and `&&` do not
-  # work by design. A non-zero exit or a timeout means the phase is not
+  # work by design. A non-zero exit or a timeout (`execution.command_timeout_seconds`)
+  # means the phase is not
   # verified and the run stops with the phase unchanged for `resume`.
   # `--dry-run` lists them and runs none of them. Nothing is auto-detected;
   # if this list is empty, the controller runs no checks of its own.
