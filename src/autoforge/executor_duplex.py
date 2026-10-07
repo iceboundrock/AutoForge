@@ -496,9 +496,10 @@ class DuplexChild:
         self._result: DuplexResult | None = None
 
     def _start(self) -> None:
-        """Start draining the child's pipes. Each reader is in ``_readers``
-        as soon as it exists, so a failure part-way leaves what was taken
-        where :func:`start_duplex`'s guard releases it."""
+        """Start draining the child's pipes. A reader takes its wake pipe
+        only as it starts, and each is in ``_readers`` before it starts, so
+        a failure part-way leaves everything taken where
+        :func:`start_duplex`'s guard releases it."""
         proc, req = self._proc, self._req
         assert proc.stdout is not None and proc.stderr is not None
         if proc.stdin is not None:

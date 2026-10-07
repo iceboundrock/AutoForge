@@ -34,7 +34,7 @@ from autoforge.executor_duplex import (
     start_duplex,
 )
 
-from .test_executor import _baseline_fds, _open_fds
+from .test_executor import _baseline_fds, _open_fds, _refuse_setup_step
 
 PY = sys.executable
 
@@ -847,38 +847,33 @@ def test_missing_binary_raises_execution_error():
         ("start", "stdout", RuntimeError("can't start new thread")),
         ("start", "stderr", RuntimeError("can't start new thread")),
         ("pipe", "stderr", OSError(24, "Too many open files")),
+        ("buffer", "stderr", MemoryError()),
         ("lock", "handle", MemoryError()),
         ("lock", "handle", KeyboardInterrupt()),
     ],
-    ids=["stdout-reader", "stderr-reader", "stderr-reader-pipe", "handle", "handle-interrupted"],
+    ids=[
+        "stdout-reader",
+        "stderr-reader",
+        "stderr-reader-pipe",
+        "stderr-reader-buffer",
+        "handle",
+        "handle-interrupted",
+    ],
 )
 def test_a_setup_failure_after_the_spawn_leaves_nothing_behind(
     monkeypatch, step, name, error, contain
 ):
-    """#190 and the PR #196 reviews: the handle is built, its reader threads
-    start and their wake pipes open, after the child is spawned and before
-    the caller has a handle to tear down. A step the system refuses (a
-    thread or descriptor limit) fails the launch as an ExecutionError; an
-    allocation that fails, or Ctrl-C, while the handle is still being built
-    is raised as itself. Either way the child, which would otherwise sleep
-    on, is first killed and reaped; the containment is released with its
-    reaper thread, so the next contained invocation runs; and no thread or
-    descriptor is left open."""
-    refused = []
-    real_start, real_init = threading.Thread.start, executor._PipeDrain.__init__
+    """#190 and the PR #196 reviews: the handle is built, its readers are
+    built, and their wake pipes open and threads start, after the child is
+    spawned and before the caller has a handle to tear down. A step the
+    system refuses (a thread or descriptor limit) fails the launch as an
+    ExecutionError; an allocation that fails, or Ctrl-C, while the handle or
+    a reader is still being built is raised as itself. Either way the child,
+    which would otherwise sleep on, is first killed and reaped; the
+    containment is released with its reaper thread, so the next contained
+    invocation runs; and no thread or descriptor is left open, a reader's
+    wake pipe included."""
     real_rlock = threading.RLock
-
-    def start(self):
-        if self.name == f"autoforge-capture-{name}":
-            refused.append(self.name)
-            raise error
-        return real_start(self)
-
-    def init(self, stream, reader_name):
-        if reader_name == name:
-            refused.append(reader_name)
-            raise error
-        return real_init(self, stream, reader_name)
 
     def rlock(*args, **kwargs):
         # The first lock taken after the spawn is the handle's own.
@@ -897,12 +892,11 @@ def test_a_setup_failure_after_the_spawn_leaves_nothing_behind(
     previous = _subreaper() if contain else None
     fds, threads = _baseline_fds(), set(threading.enumerate())
     monkeypatch.setattr(executor_duplex, "_spawn", spawn)
-    if step == "start":
-        monkeypatch.setattr(threading.Thread, "start", start)
-    elif step == "pipe":
-        monkeypatch.setattr(executor._PipeDrain, "__init__", init)
-    else:
+    if step == "lock":
+        refused = []
         monkeypatch.setattr(threading, "RLock", rlock)
+    else:
+        refused = _refuse_setup_step(monkeypatch, step, f"autoforge-capture-{name}", error)
     if isinstance(error, (OSError, RuntimeError)):
         raised = pytest.raises(ExecutionError, match=f"failed to start .*{error.args[-1]}")
     else:

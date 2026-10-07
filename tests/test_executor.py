@@ -508,6 +508,55 @@ def test_a_stdin_pipe_that_cannot_be_opened_is_a_launch_failure(monkeypatch, fai
     assert _open_fds() == before
 
 
+def _refuse_setup_step(monkeypatch, step: str, thread: str, error: BaseException) -> list[str]:
+    """Make one setup step of the executor thread named ``thread`` raise
+    ``error``, once; the returned list records the refusal.
+
+    ``start`` refuses the thread's start; ``pipe`` the wake pipe a capture
+    reader opens as it starts, before its thread; ``buffer`` the capture
+    buffer a reader allocates while it is built."""
+    refused: list[str] = []
+    real_thread_start, real_drain_start = threading.Thread.start, executor._PipeDrain.start
+    real_pipe, real_buffer = os.pipe, executor._BoundedBuffer.__init__
+    starting: list[str] = []
+
+    def refuse(name: str) -> None:
+        if name == thread and not refused:
+            refused.append(name)
+            raise error
+
+    def thread_start(self):
+        refuse(self.name)
+        return real_thread_start(self)
+
+    def drain_start(self):
+        starting.append(self.name)
+        try:
+            return real_drain_start(self)
+        finally:
+            starting.pop()
+
+    def pipe():
+        if starting:
+            refuse(starting[-1])
+        return real_pipe()
+
+    def buffer(self, limit, name):
+        refuse(f"autoforge-capture-{name}")
+        return real_buffer(self, limit, name)
+
+    if step == "start":
+        monkeypatch.setattr(threading.Thread, "start", thread_start)
+    elif step == "pipe":
+        monkeypatch.setattr(executor._PipeDrain, "start", drain_start)
+        monkeypatch.setattr(executor.os, "pipe", pipe)
+    elif step == "buffer":
+        monkeypatch.setattr(executor._BoundedBuffer, "__init__", buffer)
+    else:
+        raise AssertionError(f"unknown setup step {step!r}")
+    return refused
+
+
 @pytest.mark.parametrize(
     "contain",
     [
@@ -522,41 +571,34 @@ def test_a_stdin_pipe_that_cannot_be_opened_is_a_launch_failure(monkeypatch, fai
     ids=["plain", "contained"],
 )
 @pytest.mark.parametrize(
-    ("step", "nth", "error"),
+    ("step", "thread", "error"),
     [
-        ("feeder-start", 1, RuntimeError("can't start new thread")),
-        ("reader-start", 1, RuntimeError("can't start new thread")),
-        ("reader-start", 2, RuntimeError("can't start new thread")),
-        ("reader-init", 2, OSError(24, "Too many open files")),
-        ("reader-start", 1, KeyboardInterrupt()),
+        ("start", "autoforge-feed-stdin", RuntimeError("can't start new thread")),
+        ("start", "autoforge-capture-stdout", RuntimeError("can't start new thread")),
+        ("start", "autoforge-capture-stderr", RuntimeError("can't start new thread")),
+        ("pipe", "autoforge-capture-stderr", OSError(24, "Too many open files")),
+        ("buffer", "autoforge-capture-stderr", MemoryError()),
+        ("start", "autoforge-capture-stdout", KeyboardInterrupt()),
     ],
-    ids=["stdin-feeder", "stdout-reader", "stderr-reader", "stderr-reader-pipe", "interrupted"],
+    ids=[
+        "stdin-feeder",
+        "stdout-reader",
+        "stderr-reader",
+        "stderr-reader-pipe",
+        "stderr-reader-buffer",
+        "interrupted",
+    ],
 )
-def test_a_setup_failure_after_the_spawn_kills_the_child(monkeypatch, step, nth, error, contain):
-    """The PR #188 review: the threads that feed and read the child start
-    after it is spawned. One the system refuses (a thread or descriptor
-    limit) fails the launch as an ExecutionError; Ctrl-C meanwhile is raised
-    as itself. Either way the child, which would otherwise sleep on, is
-    killed and reaped first; what did start is ended and nothing is left
-    open. Contained, the containment is released with its reaper thread
+def test_a_setup_failure_after_the_spawn_kills_the_child(monkeypatch, step, thread, error, contain):
+    """The PR #188 review: the threads that feed and read the child are set
+    up after it is spawned. A step the system refuses (a thread or
+    descriptor limit) fails the launch as an ExecutionError; Ctrl-C
+    meanwhile, or an allocation that fails while a reader is built, is
+    raised as itself. Either way the child, which would otherwise sleep on,
+    is killed and reaped first; what did start is ended and nothing is left
+    open, the stdout reader's wake pipe included when the stderr reader
+    fails. Contained, the containment is released with its reaper thread
     (PR #196 reviews)."""
-    calls = 0
-
-    def refuse_nth(real):
-        def call(*args, **kwargs):
-            nonlocal calls
-            calls += 1
-            if calls == nth:
-                raise error
-            return real(*args, **kwargs)
-
-        return call
-
-    target = {
-        "feeder-start": (executor._StdinFeeder, "start", threading.Thread.start),
-        "reader-start": (executor._BoundedReader, "start", threading.Thread.start),
-        "reader-init": (executor._BoundedReader, "__init__", executor._BoundedReader.__init__),
-    }[step]
     spawned = []
     real_spawn = executor._spawn
 
@@ -566,7 +608,7 @@ def test_a_setup_failure_after_the_spawn_kills_the_child(monkeypatch, step, nth,
 
     fds, threads = _baseline_fds(), set(threading.enumerate())
     monkeypatch.setattr(executor, "_spawn", spawn)
-    monkeypatch.setattr(target[0], target[1], refuse_nth(target[2]))
+    refused = _refuse_setup_step(monkeypatch, step, thread, error)
     if isinstance(error, (OSError, RuntimeError)):
         raised = pytest.raises(ExecutionError, match=f"failed to start .*{error.args[-1]}")
     else:
@@ -593,7 +635,7 @@ def test_a_setup_failure_after_the_spawn_kills_the_child(monkeypatch, step, nth,
                 proc.wait()
     assert time.monotonic() - started < 10
     monkeypatch.undo()
-    assert calls == nth
+    assert refused == [thread]
     assert set(threading.enumerate()) == threads
     assert _open_fds() == fds
     assert not executor._CONTAINMENT_LOCK.locked()

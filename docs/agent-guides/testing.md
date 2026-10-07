@@ -92,9 +92,9 @@ High-priority coverage includes:
   feeder or capture thread the system refuses to start (or a capture pipe
   it refuses to open) kills and reaps the child before the
   `ExecutionError`, and leaves no thread or descriptor behind; so does
-  Ctrl-C, or a failure while the duplex handle itself is built, raised as
-  itself; a contained invocation also releases the containment, its
-  reaper thread included
+  Ctrl-C, or a failure while a capture reader or the duplex handle itself
+  is built, raised as itself; a contained invocation also releases the
+  containment, its reaper thread included
 
 ### Agent isolation (REMOTE)
 

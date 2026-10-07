@@ -396,23 +396,38 @@ class _PipeDrain(threading.Thread):
     without it, for a writer nothing here can kill. What a chunk becomes
     (bounded capture here, LF-framed records in ``executor_duplex``) is the
     subclass's.
+
+    Building a reader takes nothing that must be given back: the wake pipe
+    is opened by :meth:`start` and released by :meth:`close`. A launch holds
+    each reader before it starts it, so its cleanup reaches every pipe
+    taken, and a reader that fails while it is built (its buffer cannot be
+    allocated, say) holds nothing for it to reach.
     """
 
     def __init__(self, stream: IO[bytes], name: str) -> None:
         super().__init__(name=f"autoforge-capture-{name}", daemon=True)
         self._fd = stream.fileno()
-        self._wake_r, self._wake_w = os.pipe()
+        # (read end, write end): opened by :meth:`start`, closed by :meth:`close`.
+        self._wake: tuple[int, int] | None = None
         self.error: OSError | None = None
 
+    def start(self) -> None:
+        """Open the wake pipe and start the thread. A thread that cannot be
+        started leaves the pipe open for :meth:`close`."""
+        self._wake = os.pipe()
+        super().start()
+
     def run(self) -> None:
+        assert self._wake is not None  # opened by start() before the thread began
+        wake_r = self._wake[0]
         eof = False
         try:
             with selectors.DefaultSelector() as sel:
                 sel.register(self._fd, selectors.EVENT_READ)
-                sel.register(self._wake_r, selectors.EVENT_READ)
+                sel.register(wake_r, selectors.EVENT_READ)
                 while True:
                     ready = {key.fd for key, _ in sel.select()}
-                    if self._wake_r in ready:
+                    if wake_r in ready:
                         return
                     chunk = os.read(self._fd, _READ_CHUNK_BYTES)
                     if not chunk:
@@ -438,15 +453,20 @@ class _PipeDrain(threading.Thread):
 
     def abandon(self) -> None:
         """Stop reading without EOF; what was read so far is what is captured."""
-        os.write(self._wake_w, b"\0")
+        assert self._wake is not None  # only a started reader is abandoned
+        os.write(self._wake[1], b"\0")
         self.join()
 
     def close(self) -> None:
-        for fd in (self._wake_r, self._wake_w):
+        """Release the wake pipe, if :meth:`start` opened one. Idempotent."""
+        if self._wake is None:
+            return
+        for fd in self._wake:
             try:
                 os.close(fd)
             except OSError:
                 pass
+        self._wake = None
 
 
 class _BoundedReader(_PipeDrain):
