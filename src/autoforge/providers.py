@@ -375,6 +375,10 @@ CLAUDE_DEFAULT_OUTPUT_FORMAT = "stream-json"
 # file) is skipped and counted, and is never buffered whole.
 CLAUDE_MAX_RECORD_BYTES = 2 * DEFAULT_MAX_OUTPUT_BYTES + 1024 * 1024
 CLAUDE_MAX_PENDING_BYTES = 2 * CLAUDE_MAX_RECORD_BYTES
+# How long the stream driver waits for a line before it checks whether the
+# CLI has exited: a descendant holding stdout keeps EOF away, and this is
+# how late its exit grace (ADR 0002) can start.
+CLAUDE_EXIT_POLL_SECONDS = 0.25
 
 
 class ClaudeCodeProvider(AgentProvider):
@@ -442,7 +446,9 @@ class ClaudeCodeProvider(AgentProvider):
         (a ``tool_result`` line quotes whole files), so a line callback in
         the one-shot executor would have duplicated that framer. Every line
         goes to :class:`~autoforge.claude_stream.ClaudeStream`, which emits
-        progress and decides the outcome. ``stdout`` of the result is the
+        progress and decides the outcome. The CLI's exit, not EOF, ends the
+        wait, so a leftover holding stdout costs ADR 0002's exit grace and
+        kill, never the timeout. ``stdout`` of the result is the
         ``result`` text, tail-bounded as the executor's capture is; a failure
         inside the stream is ``provider_failure`` and a timeout wins over it.
         ``exit_code`` is always the real process status.
@@ -502,9 +508,17 @@ class ClaudeCodeProvider(AgentProvider):
 
 
 def _read_claude_stream(child: DuplexChild, stream: ClaudeStream) -> bool:
-    """Feed every stdout outcome to ``stream`` until EOF; True on the deadline."""
+    """Feed every stdout outcome to ``stream`` through its end; True on the deadline.
+
+    The CLI's exit, not EOF, ends the wait: a descendant still holding its
+    stdout must not hold the invocation to the deadline (ADR 0002). Once a
+    read finds no new line and the CLI has exited, ``finish()`` gives what
+    is left the exit grace and kills it, keeping the CLI's own status, and
+    the rest of stdout, queued up to its end by then, is fed and validated
+    like every line before it.
+    """
     while True:
-        item = child.read_line()
+        item = child.read_line(timeout=CLAUDE_EXIT_POLL_SECONDS)
         if isinstance(item, Record):
             stream.feed(item.data)
         elif isinstance(item, Oversize):
@@ -519,6 +533,8 @@ def _read_claude_stream(child: DuplexChild, stream: ClaudeStream) -> bool:
             return False
         elif item.deadline_exceeded:
             return True
+        elif child.exited():
+            child.finish()
 
 
 class OpenCodeProvider(AgentProvider):

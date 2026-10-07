@@ -69,7 +69,10 @@ High-priority coverage includes:
   the child's own exit status (0 and non-zero) and output kept and
   `descendants_killed` set; a helper that exits within the grace is neither
   killed nor reported; a `setsid` escapee holding the pipes is reported as an
-  abandoned capture; a clean exit and a clean kill report nothing
+  abandoned capture; a clean exit and a clean kill report nothing. Through
+  the duplex handle, `exited()` reports the child's exit while a descendant
+  still holds stdout, and `read_line` after `finish()` returns the rest of
+  stdout at once, never the deadline
 - bounded capture: a stream past the bound keeps its head and tail, the
   retained size honours a bound smaller than one pipe read, and memory stays
   at the bound plus a constant under one-byte reads
@@ -186,6 +189,13 @@ Progress is observability, never part of an outcome. Keep covered:
 - the real `ClaudeCodeProvider` on the fake `claude` (`tests/claude_fake.py`):
   argv, stdin on `/dev/null`, orphan containment, the timeout, and a sink
   that raises never failing the run
+- the CLI's exit, not EOF, ends the stream (ADR 0002): a helper still
+  holding the CLI's stdout after it exits is killed after the exit grace,
+  the CLI's own status and outcome kept and no timeout reported, also when
+  the grace runs past the deadline; a helper that exits within the grace is
+  neither killed nor reported; and what stdout carries after the exit (a
+  second result, a malformed or unterminated line, an overflow) still fails
+  the run
 - cleaning (`tests/test_progress.py`): escapes and controls stripped
   before redaction and redaction before the clip, so a token split by an
   escape or cut by the bound is never shown

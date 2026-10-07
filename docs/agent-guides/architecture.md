@@ -94,7 +94,10 @@ command and event names, but no CLI flags and no processes. Claude Code's
 `stream-json` output is reduced the same way by `claude_stream.py`, which
 `ClaudeCodeProvider` drives over the same handle with stdin on `/dev/null`
 (#192): the `result` record's text becomes `stdout`, and an error result, a
-malformed line or a missing result becomes `provider_failure`. No CLI flag
+malformed line or a missing result becomes `provider_failure`. The CLI's
+exit, not EOF, ends its wait for lines, so a leftover holding its stdout
+gets ADR 0002's exit grace and kill, never the deadline, and the lines it
+wrote meanwhile are validated like the rest. No CLI flag
 and no provider wire-protocol name appears outside the provider layer.
 
 Live progress crosses the boundary in one provider-neutral shape. The engine
@@ -193,7 +196,7 @@ A child the controller must keep writing to while it runs, in step with
 what it reads back (an RPC transport such as Pi's, ADR 0003 §2.7), uses
 the duplex child handle in `src/autoforge/executor_duplex.py` instead:
 `with start_duplex(DuplexRequest(...)) as child:` then
-`send_line`, `read_line`, `close_stdin` and `finish`. It reuses the
+`send_line`, `read_line`, `exited`, `close_stdin` and `finish`. It reuses the
 executor's spawn, environment selection, pipe draining and group kill, and
 it is held to the same contract:
 
@@ -218,6 +221,13 @@ it is held to the same contract:
   finite, not positive or above `MAX_DEADLINE_SECONDS` (a week, within what
   every wait primitive can take) is refused with `ExecutionError` before
   anything is spawned;
+- EOF is not the child's exit: a descendant holding stdout keeps EOF away
+  for as long as it lives. `exited()` reports the child's own exit without
+  waiting, so a caller that reads records until EOF checks it between reads
+  and calls `finish()` once the child has exited (the exit grace, then the
+  kill, the child's status kept). After a `finish()` that did not time
+  out, `read_line` returns the records still queued and then the end item,
+  never waiting and never reporting the deadline;
 - the `with` tears down on every exit, an exception or `KeyboardInterrupt`
   included: stdin is closed (an orderly-shutdown request), the child gets a
   bounded wait to exit (the deadline from `finish()`, at most the exit grace

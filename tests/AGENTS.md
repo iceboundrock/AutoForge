@@ -30,7 +30,8 @@ read it before adding tests for a listed area.
   and `review_comment_body(...)` build well-formed `CONTROL_RESULT` blocks and
   review comments. Reuse these rather than hand-rolling fakes.
 - `tests/claude_fake.py` holds a fake `claude` that prints a scripted
-  stream-json transcript (and logs its argv, cwd and stdin); the real
+  stream-json transcript (and logs its argv, cwd and stdin), and can leave
+  a helper holding its stdout after it exits; the real
   `ClaudeCodeProvider` launches it, so the stream path is tested end to end
   without a real agent.
 - `tests/pi_fake.py` holds the engine-level Pi harness: `PiFake` (a fake

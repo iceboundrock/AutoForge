@@ -309,6 +309,146 @@ def test_a_fake_claude_that_overruns_its_timeout_is_killed_and_timed_out(tmp_pat
     assert res.exit_code != 0
 
 
+@pytest.mark.parametrize(
+    ("status", "lines", "failure"),
+    [
+        (0, ["RESULT"], None),
+        (3, [], "claude: exited without a result event (exit 3)"),
+    ],
+)
+def test_a_pipe_holding_leftover_after_the_cli_exits_is_killed_not_a_timeout(
+    tmp_path, monkeypatch, status, lines, failure
+):
+    """R3-F1, ADR 0002: the CLI exits while a helper it started still holds
+    its stdout. EOF never comes on its own, so the driver must watch the
+    CLI's exit, not EOF: the helper gets the exit grace, is killed with the
+    group, and the CLI's own status and outcome are kept. Before the fix the
+    driver waited for EOF until the deadline and reported a timeout."""
+    import time
+
+    from autoforge import executor
+    from tests import claude_fake
+    from tests.test_executor import _gone, _kill_quietly
+
+    monkeypatch.setattr(executor, "_EXIT_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    text = "Fixed.\n" + "done"
+    expand = {"RESULT": claude_fake.result(text)}
+    started = time.monotonic()
+    home, res = _claude_run(
+        tmp_path,
+        [claude_fake.init(), {"spawn_holder": 60}, *(expand[x] for x in lines)],
+        timeout=20,
+        exit_code=status,
+    )
+    elapsed = time.monotonic() - started
+    (pid,) = claude_fake.holders(home)
+    try:
+        assert not res.timed_out and res.exit_code == status
+        assert res.provider_failure == failure
+        assert res.stdout == ("" if failure else text)
+        assert res.descendants_killed and "left processes behind" in res.leftovers
+        assert not (res.group_survived_kill or res.capture_abandoned)
+        assert elapsed < 10, elapsed  # the grace and the kill, never the deadline
+        assert _gone(pid, within=5), "the pipe-holding helper outlived the invocation"
+    finally:
+        _kill_quietly(pid)
+
+
+def test_a_cli_that_exits_just_before_its_deadline_is_not_a_timeout(tmp_path, monkeypatch):
+    """R3-F1: the CLI exits in time, but a helper holding its stdout makes the
+    exit grace and the kill run past the deadline. The CLI did not overrun,
+    so the rest of stdout is still read and the result kept, as ``execute()``
+    keeps it; the deadline bounds the CLI's exit, not the cleanup after it."""
+    from autoforge import executor
+    from tests import claude_fake
+    from tests.test_executor import _kill_quietly
+
+    monkeypatch.setattr(executor, "_EXIT_GRACE_SECONDS", 1.5)
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    home, res = _claude_run(
+        tmp_path,
+        [claude_fake.init(), {"spawn_holder": 60}, {"sleep": 1.0}, claude_fake.result("done")],
+        timeout=2,
+    )
+    (pid,) = claude_fake.holders(home)
+    try:
+        assert not res.timed_out and res.exit_code == 0
+        assert res.provider_failure is None and res.stdout == "done"
+        assert res.descendants_killed
+    finally:
+        _kill_quietly(pid)
+
+
+def test_a_helper_that_exits_within_the_grace_is_neither_killed_nor_reported(tmp_path, monkeypatch):
+    """R3-F1, ADR 0002: a helper the CLI is shutting down as it exits holds
+    stdout briefly and leaves on its own within the exit grace. The result is
+    kept, nothing is killed or reported, and the wait is the helper's, not
+    the grace's."""
+    import time
+
+    from autoforge import executor
+    from tests import claude_fake
+
+    monkeypatch.setattr(executor, "_EXIT_GRACE_SECONDS", 5.0)
+    started = time.monotonic()
+    _, res = _claude_run(
+        tmp_path, [claude_fake.init(), {"spawn_holder": 0.3}, claude_fake.result("done")]
+    )
+    elapsed = time.monotonic() - started
+    assert res.ok and res.exit_code == 0 and not res.timed_out
+    assert res.provider_failure is None and res.stdout == "done"
+    assert res.leftovers == ""
+    assert elapsed < 5, elapsed
+
+
+@pytest.mark.parametrize(
+    ("then", "failure"),
+    [
+        ("SECOND_RESULT", "claude: stream-json protocol violation: a second result event"),
+        ("not json\n", "claude: stream-json protocol violation: a stdout line is not JSON"),
+        (
+            '{"type": "system"',
+            "claude: stream-json protocol violation: stdout ended inside an unterminated line",
+        ),
+        (
+            "HOOK_LINES",
+            "claude: stream-json protocol violation: stdout lines arrived faster than they "
+            "were read",
+        ),
+    ],
+)
+def test_what_stdout_carries_after_the_cli_exits_is_still_validated(
+    tmp_path, monkeypatch, then, failure
+):
+    """R3-F1: a helper that writes to the CLI's stdout after the CLI has exited
+    (within the exit grace) is held to the stream's rules: the lines are fed
+    to the reducer after the exit, so a second result, a malformed line, an
+    unterminated last line and an overflow of the pending queue still fail
+    the run, with the CLI's own exit status."""
+    from autoforge import providers
+    from tests import claude_fake
+
+    monkeypatch.setattr(providers, "CLAUDE_MAX_RECORD_BYTES", 4096)
+    monkeypatch.setattr(providers, "CLAUDE_MAX_PENDING_BYTES", 8192)
+    hook = claude_fake.line({"type": "system", "subtype": "hook_response"})
+    expand = {
+        "SECOND_RESULT": claude_fake.result("again") + "\n",
+        "HOOK_LINES": (hook + "\n") * 400,
+    }
+    _, res = _claude_run(
+        tmp_path,
+        [
+            claude_fake.init(),
+            {"spawn_holder": 0.5, "then": expand.get(then, then)},
+            claude_fake.result("done"),
+        ],
+    )
+    assert res.provider_failure == failure and res.stdout == ""
+    assert res.exit_code == 0 and not res.timed_out
+    assert res.leftovers == ""
+
+
 def test_an_oversize_tool_result_line_is_skipped_and_counted(tmp_path, monkeypatch):
     from autoforge import providers
     from tests import claude_fake
