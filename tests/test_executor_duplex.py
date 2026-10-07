@@ -11,6 +11,7 @@ import json
 import os
 import signal
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -32,6 +33,8 @@ from autoforge.executor_duplex import (
     _LineFramer,
     start_duplex,
 )
+
+from .test_executor import _baseline_fds, _open_fds
 
 PY = sys.executable
 
@@ -823,6 +826,101 @@ def test_cwd_is_applied(tmp_path):
 def test_missing_binary_raises_execution_error():
     with pytest.raises(ExecutionError, match="not found"):
         start_duplex(DuplexRequest(command=["autoforge-definitely-missing-binary-xyz"]))
+
+
+@pytest.mark.parametrize(
+    "contain",
+    [
+        False,
+        pytest.param(
+            True,
+            marks=pytest.mark.skipif(
+                not sys.platform.startswith("linux"), reason="Linux-only subreaper"
+            ),
+        ),
+    ],
+    ids=["plain", "contained"],
+)
+@pytest.mark.parametrize(
+    ("step", "name", "error"),
+    [
+        ("start", "stdout", RuntimeError("can't start new thread")),
+        ("start", "stderr", RuntimeError("can't start new thread")),
+        ("pipe", "stderr", OSError(24, "Too many open files")),
+    ],
+    ids=["stdout-reader", "stderr-reader", "stderr-reader-pipe"],
+)
+def test_a_setup_failure_after_the_spawn_leaves_nothing_behind(
+    monkeypatch, step, name, error, contain
+):
+    """#190 and the PR #196 review: the reader threads start, and their wake
+    pipes open, after the child is spawned and before the caller has a
+    handle to tear down. One the system refuses (a thread or descriptor
+    limit) fails the launch as an ExecutionError, and first the child, which
+    would otherwise sleep on, is killed and reaped; the containment is
+    released with its reaper thread, so the next contained invocation runs;
+    and no thread or descriptor is left open."""
+    refused = []
+    real_start, real_init = threading.Thread.start, executor._PipeDrain.__init__
+
+    def start(self):
+        if self.name == f"autoforge-capture-{name}":
+            refused.append(self.name)
+            raise error
+        return real_start(self)
+
+    def init(self, stream, reader_name):
+        if reader_name == name:
+            refused.append(reader_name)
+            raise error
+        return real_init(self, stream, reader_name)
+
+    spawned = []
+    real_spawn = executor_duplex._spawn
+
+    def spawn(*args, **kwargs):
+        spawned.append(real_spawn(*args, **kwargs))
+        return spawned[-1]
+
+    previous = _subreaper() if contain else None
+    fds, threads = _baseline_fds(), set(threading.enumerate())
+    monkeypatch.setattr(executor_duplex, "_spawn", spawn)
+    if step == "start":
+        monkeypatch.setattr(threading.Thread, "start", start)
+    else:
+        monkeypatch.setattr(executor._PipeDrain, "__init__", init)
+    started = time.monotonic()
+    try:
+        with pytest.raises(ExecutionError, match=f"failed to start .*{error.args[-1]}"):
+            start_duplex(
+                DuplexRequest(
+                    command=[PY, "-c", "import time; time.sleep(60)"],
+                    deadline_seconds=30,
+                    contain_orphans=contain,
+                )
+            )
+        (proc,) = spawned
+        assert proc.returncode is not None
+        with pytest.raises(ProcessLookupError):
+            os.killpg(proc.pid, 0)
+    finally:
+        for proc in spawned:
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+    assert time.monotonic() - started < 10
+    monkeypatch.undo()
+    assert len(refused) == 1
+    assert set(threading.enumerate()) == threads
+    assert _open_fds() == fds
+    assert not executor._CONTAINMENT_LOCK.locked()
+    if contain:
+        assert _subreaper() == previous
+    with start_duplex(
+        DuplexRequest(command=[PY, "-c", "pass"], deadline_seconds=30, contain_orphans=contain)
+    ) as child:
+        res = child.finish()
+    assert res.exit_code == 0 and res.leftovers == ""
 
 
 @pytest.mark.parametrize(

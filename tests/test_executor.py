@@ -509,6 +509,19 @@ def test_a_stdin_pipe_that_cannot_be_opened_is_a_launch_failure(monkeypatch, fai
 
 
 @pytest.mark.parametrize(
+    "contain",
+    [
+        False,
+        pytest.param(
+            True,
+            marks=pytest.mark.skipif(
+                not sys.platform.startswith("linux"), reason="the child subreaper is Linux-only"
+            ),
+        ),
+    ],
+    ids=["plain", "contained"],
+)
+@pytest.mark.parametrize(
     ("step", "nth", "error"),
     [
         ("feeder-start", 1, RuntimeError("can't start new thread")),
@@ -518,12 +531,13 @@ def test_a_stdin_pipe_that_cannot_be_opened_is_a_launch_failure(monkeypatch, fai
     ],
     ids=["stdin-feeder", "stdout-reader", "stderr-reader", "stderr-reader-pipe"],
 )
-def test_a_setup_failure_after_the_spawn_kills_the_child(monkeypatch, step, nth, error):
+def test_a_setup_failure_after_the_spawn_kills_the_child(monkeypatch, step, nth, error, contain):
     """The PR #188 review: the threads that feed and read the child start
     after it is spawned. One the system refuses (a thread or descriptor
     limit) fails the launch as an ExecutionError, and the child, which would
     otherwise sleep on, is killed and reaped first; what did start is ended
-    and nothing is left open."""
+    and nothing is left open. Contained, the containment is released with
+    its reaper thread (PR #196 review)."""
     calls = 0
 
     def refuse_nth(real):
@@ -559,6 +573,7 @@ def test_a_setup_failure_after_the_spawn_kills_the_child(monkeypatch, step, nth,
                     command=[PY, "-c", "import time; time.sleep(60)"],
                     stdin_data=b"z" * 200_000,
                     timeout_seconds=30,
+                    contain_orphans=contain,
                 )
             )
         (proc,) = spawned
@@ -575,6 +590,9 @@ def test_a_setup_failure_after_the_spawn_kills_the_child(monkeypatch, step, nth,
     assert calls == nth
     assert set(threading.enumerate()) == threads
     assert _open_fds() == fds
+    assert not executor._CONTAINMENT_LOCK.locked()
+    if contain:
+        assert _subreaper() == 0
 
 
 def test_cwd_is_applied(tmp_path):

@@ -205,6 +205,11 @@ So the containment starts a reaper thread that, every
   between being listed and being signalled.
 - A reaper the system refuses to start fails the launch as `ExecutionError`
   before anything is spawned.
+- A setup step after the spawn that the system refuses (a reader thread, a
+  reader's pipe) kills the group and releases the containment, which stops
+  the reaper, before the launch fails as `ExecutionError`. This holds for
+  `execute()` and the duplex handle alike, so the reaper never outlives the
+  invocation.
 
 **Limits.**
 
@@ -262,7 +267,9 @@ runs, through both `execute()` and the handle: a contained child orphans
 it exits, its own exit status is kept, and nothing is reported. A child the
 controller already had keeps its exit status for its owner. A reaper that
 cannot start refuses the launch before the spawn and restores the
-subreaper setting.
+subreaper setting. A reader thread or reader pipe of the handle that
+cannot be set up after the spawn kills and reaps the child, and leaves no
+reaper, thread, descriptor or held containment behind.
 `tests/test_providers.py`: every agent launch asks for containment and
 the facts cross the provider boundary. `tests/test_pi_rpc.py`: a process a
 fake Pi's tool detached is killed after Pi exits, the result kept.
