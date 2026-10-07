@@ -44,9 +44,12 @@ Guarantees:
   result is ``timed_out`` and names the limit; except that, as in
   ``execute()``, the child is looked at first, and a ``read_line`` or
   ``finish()`` that meets the deadline after the child has exited settles
-  the group with the exit grace instead, the child's status kept.
-  :meth:`DuplexChild.pin_deadline` stops output from moving it, for a
-  caller winding the child down;
+  the group with the exit grace instead, the child's status kept. A
+  caller that winds a child down in order once a limit falls due asks for
+  ``wind_down_seconds``: the limit still falls due on time
+  (:meth:`DuplexChild.limit_due`) and the deadline, the kill, comes that
+  much later. :meth:`DuplexChild.pin_deadline` stops output from moving
+  either, for a caller winding the child down;
 - EOF is not the child's exit: a descendant holding stdout keeps EOF away,
   and one that keeps writing keeps every read busy.
   :meth:`DuplexChild.exited` says whether the child itself has exited,
@@ -62,8 +65,8 @@ Guarantees:
   (``descendants_killed``, ``group_survived_kill``, ``capture_abandoned``)
   mean what they mean in :class:`autoforge.executor.ExecutionResult`. With a
   hostile child the whole invocation takes at most the deadline (the idle
-  limit after the last output, or the ceiling) plus the exit grace plus two
-  kill graces, the bound ``execute()`` has;
+  limit after the last output, or the ceiling, plus any wind-down) plus the
+  exit grace plus two kill graces, the bound ``execute()`` has;
 - ``contain_orphans`` catches what left the group exactly as in
   ``execute()`` (the subreaper is held from before the spawn to the end of
   the teardown), with the same three orphan facts.
@@ -183,6 +186,12 @@ class DuplexRequest:
     # :data:`MAX_DEADLINE_SECONDS`. With the idle limit it bounds every call
     # on the handle.
     max_runtime_seconds: float | None = None
+    # How long after a limit falls due a child still running is given before
+    # its group is killed, for a caller that winds it down in order (Pi's
+    # `abort`): the limit falls due on time (:meth:`DuplexChild.limit_due`),
+    # the kill comes this much later (:meth:`DuplexChild.deadline`). 0: as
+    # the limit falls due.
+    wind_down_seconds: float = 0.0
     max_record_bytes: int = DEFAULT_MAX_RECORD_BYTES
     max_pending_records: int = DEFAULT_MAX_PENDING_RECORDS
     max_pending_bytes: int = DEFAULT_MAX_PENDING_BYTES
@@ -400,6 +409,8 @@ def _validate(req: DuplexRequest) -> None:
         raise ExecutionError("empty command")
     check_limit("idle_timeout_seconds", req.idle_timeout_seconds)
     check_limit("max_runtime_seconds", req.max_runtime_seconds)
+    if req.wind_down_seconds != 0:
+        check_limit("wind_down_seconds", req.wind_down_seconds)
     for name in (
         "max_record_bytes",
         "max_pending_records",
@@ -563,13 +574,19 @@ class DuplexChild:
         """The child's pid, which is also its process group id."""
         return self._proc.pid
 
-    def deadline(self) -> float:
-        """When the invocation is over unless the child writes first
+    def limit_due(self) -> float:
+        """When a limit falls due unless the child writes first
         (``time.monotonic()``): the idle limit after its last output or the
         ceiling, whichever is due first. Recomputed on every call."""
-        deadline = self._limits.deadline()
-        assert deadline is not None  # the ceiling always applies
-        return deadline
+        due = self._limits.deadline()
+        assert due is not None  # the ceiling always applies
+        return due
+
+    def deadline(self) -> float:
+        """When the invocation is over unless the child writes first
+        (``time.monotonic()``): :meth:`limit_due` plus the request's
+        ``wind_down_seconds``. Recomputed on every call."""
+        return self.limit_due() + self._req.wind_down_seconds
 
     @property
     def deadline_limit(self) -> str:
@@ -582,9 +599,13 @@ class DuplexChild:
         For a caller that has decided to end the invocation (an abort, an
         orderly shutdown) and gives the child a bounded chance to settle
         within the deadline it had; a child that keeps writing meanwhile
-        cannot stretch that chance. Idempotent.
+        cannot stretch that chance. :meth:`limit_due` is fixed with it.
+        Idempotent.
         """
         self._limits.pin()
+
+    def _expired(self) -> bool:
+        return time.monotonic() >= self.deadline()
 
     def __enter__(self) -> DuplexChild:
         return self
@@ -831,7 +852,7 @@ class DuplexChild:
         if exit_by is not None:
             return _reaped(self._proc, exit_by)
         while not _reaped(self._proc, self.deadline()):
-            if self._limits.expired():
+            if self._expired():
                 return False
         return True
 
@@ -842,7 +863,7 @@ class DuplexChild:
             if overflowed and self._proc.poll() is None:
                 self._kill()
             elif not self._exits_by(exit_by):
-                if self._limits.expired():
+                if self._expired():
                     self._mark_timed_out()
                 self._kill()
             else:

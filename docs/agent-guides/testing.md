@@ -85,12 +85,16 @@ High-priority coverage includes:
   at `max_runtime` when a ceiling is set; a limit out of range is refused
   before the spawn; and the deadline arithmetic on a fake clock (first due
   wins, a tie goes to the ceiling, a pinned deadline is not moved by
-  output). The same cases cross the Claude stream and a fake Pi, the engine
-  names the limit and the last activity in the error and in
-  `execution.json`, a text-mode Claude profile without a ceiling is never
-  launched, and configuration rejects the legacy `timeout_seconds` keys by
-  name, out-of-range limits and that profile; dry-run and `doctor` show
-  both values
+  output); a wind-down lets a limit fall due without a kill and kills that
+  much later, and a child that exits within it is not a timeout. The same
+  cases cross the Claude stream and a fake Pi; Pi's `abort` goes out no
+  earlier than the limit, a Pi silent for most of its idle limit is not cut
+  short, and a protocol failure followed by continued output is still
+  killed by its pinned deadline. The engine names the limit and the last
+  activity in the error and in `execution.json`, a text-mode Claude
+  profile without a ceiling is never launched, and configuration rejects
+  the legacy `timeout_seconds` keys by name, out-of-range limits and that
+  profile; dry-run and `doctor` show both values
 - bounded capture: a stream past the bound keeps its head and tail, the
   retained size honours a bound smaller than one pipe read, and memory stays
   at the bound plus a constant under one-byte reads

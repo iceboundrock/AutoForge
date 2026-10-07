@@ -278,7 +278,11 @@ tell those apart, and #194 is the issue that will.
 child, never a record the controller sent. An operation that must finish
 inside a fixed budget, such as Pi's `abort` and the finish that follows it,
 first pins the deadline: from then on, output no longer moves it, so a
-child cannot stretch its own shutdown by writing.
+child cannot stretch its own shutdown by writing. A caller that winds the
+child down in order once a limit falls due asks for a wind-down
+(`wind_down_seconds`): the limit still falls due on time, and the kill
+comes that much later. Pi asks for its abort window, so its `abort` follows
+the limit and never shortens it.
 
 **Human waits.** #147 counts a wait for a human answer inside the
 executor's deadline and never silently extends a duplex deadline. Activity

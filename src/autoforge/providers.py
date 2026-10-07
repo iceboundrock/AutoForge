@@ -668,8 +668,8 @@ def _parse_version(text: str, pattern: re.Pattern[str]) -> tuple[int, int, int] 
 # settings and its model catalog), hence more than a bare round trip needs.
 PI_ROUND_TRIP_SECONDS = 15.0
 # How long an `abort` is given to settle a running prompt before stdin is
-# closed; taken from the end of the invocation's deadline (at most a quarter
-# of its shorter limit), so the abort and the group kill both land within it.
+# closed. It follows a limit falling due and never shortens it (#193): the
+# group is killed this long after the limit, Pi's own exit included.
 PI_ABORT_SECONDS = 5.0
 # A final text past the stdout bound must still arrive whole in one
 # `get_last_assistant_text` record so that its tail can be kept, and JSON
@@ -879,16 +879,16 @@ class PiProvider(AgentProvider):
 
         The child runs under the request's idle limit and ceiling, which
         the duplex handle turns into one deadline that Pi's output keeps
-        moving (#193). The last ``abort_seconds`` before it (at most a
-        quarter of the shorter limit) are kept for the abort: when the
-        conversation is still running at that point it is cut short, the
-        deadline is pinned (so what Pi writes while it settles cannot
-        stretch it), ``abort`` is sent, stdin is closed, and the duplex
-        handle kills the group if Pi has not exited by the deadline. The
-        result is then ``timed_out`` whatever Pi's exit status, and names
-        the limit that was due. A failure inside the
-        protocol is ``provider_failure``; ``exit_code`` is always the real
-        process status. A spawn failure raises :class:`ExecutionError`.
+        moving (#193). When a limit falls due with the conversation still
+        running, and not before, it is cut short: the deadline is pinned
+        (so what Pi writes while it settles cannot stretch it), ``abort``
+        is sent, stdin is closed, and the duplex handle kills the group if
+        Pi has not exited ``abort_seconds`` after the limit. The result is
+        then ``timed_out`` whatever Pi's exit status, and names the limit
+        that fell due. A failure inside the protocol is
+        ``provider_failure``; its abort runs under the deadline pinned when
+        the failure is acted on. ``exit_code`` is always the real process
+        status. A spawn failure raises :class:`ExecutionError`.
 
         With ``require_oauth`` (the default) the launch is refused before
         anything is spawned when a provider API key would reach Pi, and a
@@ -902,9 +902,6 @@ class PiProvider(AgentProvider):
             refused = self._auth_preflight(req, allowlist)
             if refused is not None:
                 return refused
-        limits = [v for v in (req.idle_timeout_seconds, req.max_runtime_seconds) if v]
-        shortest = float(min(limits)) if limits else float(MAX_DEADLINE_SECONDS)
-        abort_window = min(self.abort_seconds, shortest / 4)
         conversation = PiConversation(
             model=req.profile.model,
             thinking=req.profile.effort,
@@ -919,20 +916,25 @@ class PiProvider(AgentProvider):
             env_allowlist=allowlist,
             idle_timeout_seconds=req.idle_timeout_seconds,
             max_runtime_seconds=req.max_runtime_seconds,
+            # The abort comes after a limit, so the kill waits for it.
+            wind_down_seconds=self.abort_seconds,
             max_record_bytes=PI_MAX_RECORD_BYTES,
             max_pending_bytes=PI_MAX_PENDING_BYTES,
             # Pi's bash tool starts every command detached (ADR 0003 §6).
             contain_orphans=True,
         )
         with start_duplex(duplex) as child:
-            cut_short = self._converse(child, conversation, abort_window)
-            # The limit that was due when the conversation was cut short:
+            cut_short = self._converse(child, conversation)
+            # The limit that fell due when the conversation was cut short:
             # pinned by then, so Pi's own exit inside the abort keeps it.
             cut_limit = child.deadline_limit if cut_short else ""
             if cut_short:
                 conversation.deadline_reached()
             if conversation.failure is not None:
-                self._abort(child, conversation, abort_window)
+                # Every abort ends by a fixed deadline: what Pi writes while
+                # it settles, or after, cannot stretch its shutdown.
+                child.pin_deadline()
+                self._abort(child, conversation, self.abort_seconds)
             child.close_stdin()
             res = child.finish()
         timed_out = cut_short or res.timed_out
@@ -1060,26 +1062,26 @@ class PiProvider(AgentProvider):
                 conversation.stdin_closed()
                 return
 
-    def _converse(self, child: DuplexChild, conversation: PiConversation, window: float) -> bool:
-        """Drive the conversation to its outcome; True when the deadline cut it short.
+    def _converse(self, child: DuplexChild, conversation: PiConversation) -> bool:
+        """Drive the conversation to its outcome; True when a limit cut it short.
 
-        The conversation is cut short ``window`` seconds before the child's
-        deadline, which Pi's output keeps moving, so it is recomputed on
-        every turn; once cut short the deadline is pinned for the abort.
+        The conversation is cut short as the child's limit falls due, which
+        Pi's output keeps moving, so it is recomputed on every turn; once
+        cut short the deadline is pinned, the abort window after the limit.
         """
         try:
             self._send(child, conversation, conversation.start(time.monotonic()))
             while not conversation.done:
                 now = time.monotonic()
-                soft_deadline = child.deadline() - window
-                if now >= soft_deadline:
+                due = child.limit_due()
+                if now >= due:
                     child.pin_deadline()
                     return True
                 conversation.tick(now)
                 if conversation.done:
                     break
                 wake = conversation.next_wakeup
-                until = soft_deadline if wake is None else min(soft_deadline, wake)
+                until = due if wake is None else min(due, wake)
                 item = child.read_line(timeout=max(0.0, until - now))
                 if isinstance(item, Record):
                     replies = conversation.feed(item.data, time.monotonic())

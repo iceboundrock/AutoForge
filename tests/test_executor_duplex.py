@@ -548,6 +548,49 @@ def test_a_pinned_deadline_is_not_moved_by_later_output(monkeypatch):
     assert res.timed_out and res.timeout_limit == "idle"
 
 
+def test_a_wind_down_puts_the_kill_after_the_limit_and_a_pin_fixes_both(monkeypatch):
+    """A caller that winds the child down (Pi's abort) sees the limit fall
+    due on time, without a kill, and has ``wind_down_seconds`` after it."""
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    started = time.monotonic()
+    with start_duplex(
+        DuplexRequest(
+            command=[PY, "-c", "import time; time.sleep(30)"],
+            idle_timeout_seconds=0.5,
+            max_runtime_seconds=30,
+            wind_down_seconds=1.0,
+        )
+    ) as child:
+        assert child.deadline() - child.limit_due() == pytest.approx(1.0)
+        due = child.limit_due()
+        assert child.read_line(timeout=due - time.monotonic()) == Timeout(deadline_exceeded=False)
+        assert time.monotonic() >= child.limit_due() == due
+        child.pin_deadline()
+        assert (child.limit_due(), child.deadline_limit) == (due, "idle")
+        got = _drain(child)
+        res = child.finish()
+    assert got == [Timeout(deadline_exceeded=True)]
+    assert 1.5 <= time.monotonic() - started < 5
+    assert res.timed_out and res.exit_code == -1 and res.timeout_limit == "idle"
+
+
+def test_a_child_that_exits_within_its_wind_down_is_not_a_timeout():
+    """The limit fell due and the caller wound the child down: it exited
+    before the kill, so its own status is kept."""
+    with start_duplex(
+        DuplexRequest(
+            command=[PY, "-c", "import sys; sys.stdin.read(); sys.exit(3)"],
+            idle_timeout_seconds=0.5,
+            wind_down_seconds=5.0,
+        )
+    ) as child:
+        child.read_line(timeout=child.limit_due() - time.monotonic())
+        assert time.monotonic() >= child.limit_due()
+        child.pin_deadline()
+        res = child.finish()
+    assert not res.timed_out and res.exit_code == 3 and res.timeout_limit == ""
+
+
 # A child that starts a descendant in its own group (both ignore stdin EOF),
 # prints the descendant's pid and sleeps.
 _FAMILY = (
@@ -1183,6 +1226,9 @@ def test_a_setup_failure_after_the_spawn_leaves_nothing_behind(
         ("idle_timeout_seconds", float("nan")),
         ("idle_timeout_seconds", float("inf")),
         ("idle_timeout_seconds", MAX_DEADLINE_SECONDS + 1),
+        ("wind_down_seconds", -1),
+        ("wind_down_seconds", float("nan")),
+        ("wind_down_seconds", float("inf")),
         ("max_record_bytes", 0),
         ("max_pending_records", 0),
         ("max_pending_bytes", 0),

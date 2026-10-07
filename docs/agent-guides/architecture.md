@@ -231,9 +231,13 @@ it is held to the same contract:
 - the same two limits (`DuplexRequest.idle_timeout_seconds` and
   `max_runtime_seconds`) bound every `send_line`, `read_line` and `finish`;
   only a chunk read from the child is activity, never a record sent to it.
-  `deadline()` is the one due first and `deadline_limit` names it;
-  `pin_deadline()` fixes it so later output no longer moves it, which Pi's
-  `abort` and the finish after it use to stay inside a fixed budget. Past
+  `limit_due()` is when the one due first falls due and `deadline_limit`
+  names it; `deadline()` is that plus `wind_down_seconds` (0 unless a
+  caller winds the child down in order: Pi asks for its abort window, so
+  its `abort` goes out as the limit falls due, never before it, and the
+  kill follows the window later); `pin_deadline()` fixes both so later
+  output no longer moves them, which every Pi `abort` and the finish after
+  it use to stay inside a fixed budget. Past
   the deadline the group is killed exactly as on `execute()`'s timeout, and
   the result is `timed_out` with `exit_code = -1` and `timeout_limit`. As in `execute()`, whose last
   look at the child is at the deadline, the child is looked at first: a
@@ -260,7 +264,8 @@ it is held to the same contract:
   `descendants_killed`, `group_survived_kill` and `capture_abandoned`
   exactly as `ExecutionResult` does for the same leftovers, and the
   invocation takes at most the deadline (one idle timeout after the child's
-  last output, or the ceiling) plus the exit grace plus two kill graces.
+  last output, or the ceiling, plus any wind-down) plus the exit grace plus
+  two kill graces.
 
 The handle knows no JSON, no provider and no workflow. A server child that
 takes no input (#126) uses it with `stdin_pipe=False` and

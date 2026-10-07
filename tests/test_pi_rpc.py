@@ -740,7 +740,7 @@ def run(actions):
 
 run(scenario.get("start", []))
 for line in sys.stdin.buffer:
-    log.write(json.dumps({"stdin": line.decode("utf-8")}) + "\n")
+    log.write(json.dumps({"stdin": line.decode("utf-8"), "at": time.time()}) + "\n")
     log.flush()
     command = json.loads(line)
     ids[command["type"]] = command.get("id")
@@ -794,6 +794,14 @@ class FakePi:
     def commands(self) -> list[str]:
         return [json.loads(line)["type"] for line in self.stdin()]
 
+    def sent_at(self, command: str) -> float:
+        """When the first ``command`` record reached the fake (``time.time()``)."""
+        return next(
+            e["at"]
+            for e in self.entries()
+            if "stdin" in e and json.loads(e["stdin"])["type"] == command
+        )
+
     def argv(self) -> list[str]:
         """The RPC launch's argv (the auth preflight's is :meth:`auth_argvs`)."""
         return next(e["argv"] for e in self.entries() if e.get("argv", [""])[0] == "--mode")
@@ -829,10 +837,11 @@ def _execute(
     prompt="implement #131",
     options=None,
     env_allowlist=("PATH",),
+    abort_seconds=1,
     **kw,
 ):
     fake = FakePi(tmp_path, scenario)
-    provider = PiProvider(round_trip_seconds=5, abort_seconds=1, **kw)
+    provider = PiProvider(round_trip_seconds=5, abort_seconds=abort_seconds, **kw)
     req = AgentRequest(
         phase="ANALYZE_EXECUTE",
         prompt=prompt,
@@ -1053,12 +1062,14 @@ def test_provider_deadline_mid_stream_aborts_then_closes_stdin(tmp_path):
         {"respond": "prompt", "data": {"disposition": "started"}},
         {"emit": {"type": "agent_start"}},
     ]
-    started = time.monotonic()
+    started, launched = time.monotonic(), time.time()
     res, fake = _execute(tmp_path, scenario, timeout=2)
     assert time.monotonic() - started < 10
     assert res.timed_out and res.provider_failure is None and res.stdout == ""
     assert res.exit_code == 0  # Pi settled the abort and exited on stdin EOF
     assert fake.commands()[-1] == "abort"
+    # #193: the abort follows the maximum runtime, it does not eat into it.
+    assert fake.sent_at("abort") - launched >= 2
     assert res.provider_summary["abort_sent"] is True
     assert res.provider_summary["failure"].startswith("pi: the deadline was reached")
     assert res.timeout_limit == "max_runtime"
@@ -1066,19 +1077,36 @@ def test_provider_deadline_mid_stream_aborts_then_closes_stdin(tmp_path):
 
 def test_provider_a_silent_pi_is_aborted_at_its_idle_timeout(tmp_path):
     """#193: Pi answers, starts the prompt and goes silent. The abort goes out
-    within the idle limit, counted from Pi's last record, and the timeout is
-    named as the idle one."""
+    once the idle limit, counted from Pi's last record, has fallen due, never
+    before it, and the timeout is named as the idle one."""
     scenario = _happy()
     scenario["on"]["prompt"] = [
         {"respond": "prompt", "data": {"disposition": "started"}},
         {"emit": {"type": "agent_start"}},
     ]
-    started = time.monotonic()
+    started, launched = time.monotonic(), time.time()
     res, fake = _execute(tmp_path, scenario, timeout=60, idle=2)
     assert time.monotonic() - started < 15
     assert res.timed_out and res.timeout_limit == "idle" and res.stdout == ""
     assert res.last_activity_at is not None
     assert fake.commands()[-1] == "abort"
+    assert fake.sent_at("abort") - launched >= 2
+
+
+def test_provider_a_pi_silent_for_most_of_its_idle_limit_is_not_cut_short(tmp_path):
+    """#193 review: the abort window comes after the idle limit, never out of
+    it. A Pi that is silent for 3.2s under a 4s idle limit (longer than the
+    limit less the abort window) answers in time and its result is kept."""
+    scenario = _happy()
+    scenario["on"]["prompt"] = [
+        {"respond": "prompt", "data": {"disposition": "started"}},
+        {"emit": {"type": "agent_start"}},
+        {"sleep": 3.2},
+        *scenario["on"]["prompt"][2:],
+    ]
+    res, fake = _execute(tmp_path, scenario, timeout=60, idle=4)
+    assert not res.timed_out and res.provider_failure is None and res.stdout == FINAL
+    assert res.exit_code == 0 and "abort" not in fake.commands()
 
 
 def test_provider_a_pi_that_keeps_reporting_outlives_its_idle_timeout(tmp_path):
@@ -1094,6 +1122,28 @@ def test_provider_a_pi_that_keeps_reporting_outlives_its_idle_timeout(tmp_path):
     res, _ = _execute(tmp_path, scenario, timeout=60, idle=1)
     assert time.monotonic() - started >= 1.8
     assert not res.timed_out and res.provider_failure is None and res.stdout == FINAL
+
+
+def test_provider_a_protocol_failure_shutdown_is_not_stretched_by_output(tmp_path):
+    """#193 review: the abort after a protocol failure runs under a pinned
+    deadline. A Pi that keeps writing through it and ignores stdin EOF is
+    killed one idle limit after its failure plus the abort window, not kept
+    alive by its own output (with no ceiling, until the one-week backstop)."""
+    scenario = _happy()
+    update = {"type": "message_update", "message": {"role": "assistant", "content": []}}
+    scenario["on"]["prompt"] = [
+        {"respond": "prompt", "data": {"disposition": "started"}},
+        {"emit": {"type": "extension_ui_request", "id": "ui-9", "method": ["confirm"]}},
+    ]
+    scenario["on"]["abort"] = [{"respond": "abort"}] + [{"sleep": 0.1}, {"emit": update}] * 300
+    started = time.monotonic()
+    res, fake = _execute(tmp_path, scenario, timeout=None, idle=1)
+    assert time.monotonic() - started < 1 + 1 + executor._KILL_GRACE_SECONDS + 5
+    assert fake.commands()[-1] == "abort"
+    assert res.provider_summary["failure"] == (
+        "pi: protocol violation: an extension UI request without a string 'method'"
+    )
+    assert res.timed_out and res.exit_code == -1 and res.timeout_limit == "idle"
 
 
 def test_provider_a_pi_that_ignores_abort_and_stdin_close_is_killed(tmp_path):
