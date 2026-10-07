@@ -133,7 +133,8 @@ The process executor owns:
   child from only the named variables (exact names or `PREFIX*`) of the
   controller's environment, never from a copy of all of it
 - an optional output observer (`on_output`), told which stream a chunk
-  arrived on and never its bytes, and unhooked the first time it raises
+  arrived on and never its bytes, called by one stream at a time, and
+  unhooked for both streams the first time it raises
 
 It should remain independent of workflow semantics. Which names are
 allowed is policy: the engine reads it from `execution.env_allowlist` (plus

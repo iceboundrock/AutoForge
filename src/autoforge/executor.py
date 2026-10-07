@@ -158,8 +158,9 @@ class ExecutionRequest:
     # Called on the reader thread with the stream's name (``"stdout"`` or
     # ``"stderr"``) each time a chunk of it arrives: a liveness signal for an
     # agent that streams nothing parseable (#192). It never sees the bytes,
-    # so what the child wrote stays in the bounded capture alone. One that
-    # raises is not called again for this invocation; the drain goes on.
+    # so what the child wrote stays in the bounded capture alone. Calls from
+    # the two streams are serialized; one that raises is not called again
+    # for this invocation, on either stream, and both drains go on.
     on_output: Callable[[str], None] | None = None
 
 
@@ -475,12 +476,34 @@ class _PipeDrain(threading.Thread):
         self._wake = None
 
 
+class _OutputObserver:
+    """:attr:`ExecutionRequest.on_output`, shared by both readers of one
+    invocation.
+
+    Calls are serialized, and the first exception the observer raises
+    unhooks it for both streams: a call the other reader was waiting to make
+    finds it gone, so a failing observer is called once and can never stop
+    either drain.
+    """
+
+    def __init__(self, on_output: Callable[[str], None]) -> None:
+        self._on_output: Callable[[str], None] | None = on_output
+        self._lock = threading.Lock()
+
+    def __call__(self, stream: str) -> None:
+        with self._lock:
+            if self._on_output is None:
+                return
+            try:
+                self._on_output(stream)
+            except Exception:
+                self._on_output = None
+
+
 class _BoundedReader(_PipeDrain):
     """Drain one pipe into a :class:`_BoundedBuffer` until EOF or abandoned.
 
-    ``on_output``, when given, is told the stream's name after each chunk
-    (:attr:`ExecutionRequest.on_output`); the first exception it raises
-    unhooks it, so a failing observer can never stop the drain.
+    ``observer``, when given, is told the stream's name after each chunk.
     """
 
     def __init__(
@@ -488,20 +511,17 @@ class _BoundedReader(_PipeDrain):
         stream: IO[bytes],
         limit: int,
         name: str,
-        on_output: Callable[[str], None] | None = None,
+        observer: _OutputObserver | None = None,
     ) -> None:
         super().__init__(stream, name)
         self.buffer = _BoundedBuffer(limit, name)
         self._stream_name = name
-        self._on_output = on_output
+        self._observer = observer
 
     def _feed(self, chunk: bytes) -> None:
         self.buffer.feed(chunk)
-        if self._on_output is not None:
-            try:
-                self._on_output(self._stream_name)
-            except Exception:
-                self._on_output = None
+        if self._observer is not None:
+            self._observer(self._stream_name)
 
     def captured(self) -> _Captured:
         """Decode what was kept; call only once the thread has ended."""
@@ -1100,8 +1120,9 @@ def _execute(req: ExecutionRequest, contained: _Containment | None) -> Execution
             # output is untrusted (a dumped binary, a mis-encoded file the
             # agent cats), and a decode error is not an AutoForgeError, so it
             # would leave the invocation unlogged (#17).
+            observer = None if req.on_output is None else _OutputObserver(req.on_output)
             for stream, name in ((proc.stdout, "stdout"), (proc.stderr, "stderr")):
-                readers += (_BoundedReader(stream, req.max_output_bytes, name, req.on_output),)
+                readers += (_BoundedReader(stream, req.max_output_bytes, name, observer),)
                 readers[-1].start()
         except (OSError, RuntimeError) as exc:
             raise ExecutionError(f"failed to start {' '.join(req.command)}: {exc}") from exc
