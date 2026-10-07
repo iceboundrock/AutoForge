@@ -847,21 +847,26 @@ def test_missing_binary_raises_execution_error():
         ("start", "stdout", RuntimeError("can't start new thread")),
         ("start", "stderr", RuntimeError("can't start new thread")),
         ("pipe", "stderr", OSError(24, "Too many open files")),
+        ("lock", "handle", MemoryError()),
+        ("lock", "handle", KeyboardInterrupt()),
     ],
-    ids=["stdout-reader", "stderr-reader", "stderr-reader-pipe"],
+    ids=["stdout-reader", "stderr-reader", "stderr-reader-pipe", "handle", "handle-interrupted"],
 )
 def test_a_setup_failure_after_the_spawn_leaves_nothing_behind(
     monkeypatch, step, name, error, contain
 ):
-    """#190 and the PR #196 review: the reader threads start, and their wake
-    pipes open, after the child is spawned and before the caller has a
-    handle to tear down. One the system refuses (a thread or descriptor
-    limit) fails the launch as an ExecutionError, and first the child, which
-    would otherwise sleep on, is killed and reaped; the containment is
-    released with its reaper thread, so the next contained invocation runs;
-    and no thread or descriptor is left open."""
+    """#190 and the PR #196 reviews: the handle is built, its reader threads
+    start and their wake pipes open, after the child is spawned and before
+    the caller has a handle to tear down. A step the system refuses (a
+    thread or descriptor limit) fails the launch as an ExecutionError; an
+    allocation that fails, or Ctrl-C, while the handle is still being built
+    is raised as itself. Either way the child, which would otherwise sleep
+    on, is first killed and reaped; the containment is released with its
+    reaper thread, so the next contained invocation runs; and no thread or
+    descriptor is left open."""
     refused = []
     real_start, real_init = threading.Thread.start, executor._PipeDrain.__init__
+    real_rlock = threading.RLock
 
     def start(self):
         if self.name == f"autoforge-capture-{name}":
@@ -875,6 +880,13 @@ def test_a_setup_failure_after_the_spawn_leaves_nothing_behind(
             raise error
         return real_init(self, stream, reader_name)
 
+    def rlock(*args, **kwargs):
+        # The first lock taken after the spawn is the handle's own.
+        if spawned and not refused:
+            refused.append(name)
+            raise error
+        return real_rlock(*args, **kwargs)
+
     spawned = []
     real_spawn = executor_duplex._spawn
 
@@ -887,11 +899,17 @@ def test_a_setup_failure_after_the_spawn_leaves_nothing_behind(
     monkeypatch.setattr(executor_duplex, "_spawn", spawn)
     if step == "start":
         monkeypatch.setattr(threading.Thread, "start", start)
-    else:
+    elif step == "pipe":
         monkeypatch.setattr(executor._PipeDrain, "__init__", init)
+    else:
+        monkeypatch.setattr(threading, "RLock", rlock)
+    if isinstance(error, (OSError, RuntimeError)):
+        raised = pytest.raises(ExecutionError, match=f"failed to start .*{error.args[-1]}")
+    else:
+        raised = pytest.raises(type(error))
     started = time.monotonic()
     try:
-        with pytest.raises(ExecutionError, match=f"failed to start .*{error.args[-1]}"):
+        with raised:
             start_duplex(
                 DuplexRequest(
                     command=[PY, "-c", "import time; time.sleep(60)"],

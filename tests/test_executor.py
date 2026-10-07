@@ -528,16 +528,18 @@ def test_a_stdin_pipe_that_cannot_be_opened_is_a_launch_failure(monkeypatch, fai
         ("reader-start", 1, RuntimeError("can't start new thread")),
         ("reader-start", 2, RuntimeError("can't start new thread")),
         ("reader-init", 2, OSError(24, "Too many open files")),
+        ("reader-start", 1, KeyboardInterrupt()),
     ],
-    ids=["stdin-feeder", "stdout-reader", "stderr-reader", "stderr-reader-pipe"],
+    ids=["stdin-feeder", "stdout-reader", "stderr-reader", "stderr-reader-pipe", "interrupted"],
 )
 def test_a_setup_failure_after_the_spawn_kills_the_child(monkeypatch, step, nth, error, contain):
     """The PR #188 review: the threads that feed and read the child start
     after it is spawned. One the system refuses (a thread or descriptor
-    limit) fails the launch as an ExecutionError, and the child, which would
-    otherwise sleep on, is killed and reaped first; what did start is ended
-    and nothing is left open. Contained, the containment is released with
-    its reaper thread (PR #196 review)."""
+    limit) fails the launch as an ExecutionError; Ctrl-C meanwhile is raised
+    as itself. Either way the child, which would otherwise sleep on, is
+    killed and reaped first; what did start is ended and nothing is left
+    open. Contained, the containment is released with its reaper thread
+    (PR #196 reviews)."""
     calls = 0
 
     def refuse_nth(real):
@@ -565,9 +567,13 @@ def test_a_setup_failure_after_the_spawn_kills_the_child(monkeypatch, step, nth,
     fds, threads = _baseline_fds(), set(threading.enumerate())
     monkeypatch.setattr(executor, "_spawn", spawn)
     monkeypatch.setattr(target[0], target[1], refuse_nth(target[2]))
+    if isinstance(error, (OSError, RuntimeError)):
+        raised = pytest.raises(ExecutionError, match=f"failed to start .*{error.args[-1]}")
+    else:
+        raised = pytest.raises(type(error))
     started = time.monotonic()
     try:
-        with pytest.raises(ExecutionError, match=f"failed to start .*{error.args[-1]}"):
+        with raised:
             execute(
                 ExecutionRequest(
                     command=[PY, "-c", "import time; time.sleep(60)"],

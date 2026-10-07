@@ -1023,6 +1023,10 @@ def _execute(req: ExecutionRequest, contained: _Containment | None) -> Execution
         feeder = None if req.stdin_data is None else _StdinFeeder(req.stdin_data)
     except OSError as exc:
         raise ExecutionError(f"failed to spawn {' '.join(req.command)}: {exc}") from exc
+    readers: tuple[_BoundedReader, ...] = ()
+    timed_out = False
+    descendants_killed = False
+    left = _Termination(group_survived=False, capture_abandoned=False)
     try:
         proc = _spawn(
             req.command,
@@ -1038,15 +1042,13 @@ def _execute(req: ExecutionRequest, contained: _Containment | None) -> Execution
     if contained is not None:
         contained.child = proc.pid
     pgid = proc.pid  # start_new_session: the child leads a group of its own
-    readers: tuple[_BoundedReader, ...] = ()
-    timed_out = False
-    descendants_killed = False
-    left = _Termination(group_survived=False, capture_abandoned=False)
     try:
-        # The child is running from here on, so the threads that serve it
-        # start under the same guard as the wait: one the system refuses (a
-        # thread or descriptor limit) kills the group and fails the launch as
-        # a refused spawn would, never leaving the child behind.
+        # The child is running from here on, so everything that serves it
+        # is set up under the same guard as the wait, and nothing that can
+        # fail runs before it: a thread the system refuses (a thread or
+        # descriptor limit) kills the group and fails the launch as a
+        # refused spawn would, and anything else (an allocation, Ctrl-C)
+        # kills it too, never leaving the child behind.
         try:
             if feeder is not None:
                 feeder.start()
