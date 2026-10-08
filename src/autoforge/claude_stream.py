@@ -18,37 +18,55 @@ repeatedly while the model is still thinking; ``hook_started`` and
 output and are never shown), ``assistant`` messages whose content blocks
 are ``thinking``, ``text`` or ``tool_use`` (``id``, ``name``, ``input``),
 ``user`` messages carrying ``tool_result`` blocks (``tool_use_id``,
-``is_error``), ``rate_limit_event``, and one final ``result`` record.
-``system/api_retry`` (``attempt``, ``max_retries``) is mapped too, from the
-CLI's documented message set; it did not occur in the verified sample.
+``is_error``), ``rate_limit_event``, and a ``result`` record that ends the
+turn. ``system/api_retry`` (``attempt``, ``max_retries``) is mapped too, from
+the CLI's documented message set; it did not occur in the verified sample.
+
+One invocation can run more than one turn (verified on claude 2.1.293,
+2026-10-07): a background task or a scheduled wakeup still pending when a
+turn ends keeps the CLI alive, and when it fires the CLI runs another turn,
+from its own ``system/init`` to its own ``result`` (``result_index`` 0, 1,
+...), with notices such as ``system/task_notification`` or
+``command_lifecycle`` between turns. ``--output-format text`` prints only
+the last turn's result text, at exit.
 
 The outcome:
 
-* The ``result`` record's ``result`` string is the final assistant text,
-  verbatim once decoded: it becomes the invocation's stdout, so the
+* The last ``result`` record's ``result`` string is the final assistant
+  text, verbatim once decoded: it becomes the invocation's stdout, so the
   CONTROL_RESULT block is parsed exactly as it was from ``--output-format
-  text``. Its ``is_error`` is checked first (``subtype: success`` can come
-  with ``is_error: true``), then ``subtype`` must be ``success``, then
-  ``result`` must be a string. Anything else is a provider failure.
+  text``. Every ``result`` is checked: ``is_error`` first (``subtype:
+  success`` can come with ``is_error: true``), then ``subtype`` must be
+  ``success``, then ``result`` must be a string. Anything else is a provider
+  failure, also in a turn a later one would have followed.
 * A line that is not a JSON object with a string ``type`` (including one
   the decoder refuses for an integer or nesting limit), an unterminated
-  last line, a second ``result``, a queue overflow, and stdout ending
-  without a ``result`` are provider failures too.
+  last line, a queue overflow, a ``result`` outside a turn, and stdout
+  ending without a ``result`` for every turn are provider failures too. A
+  turn opens with the stream and, after a ``result``, again with a
+  ``system/init``, ``assistant`` or ``user`` record, and its ``result``
+  closes it.
 * A line past the per-line bound is counted and skipped: a ``tool_result``
   carries whole files, and progress is not worth failing a run for. The
   ``result`` line has no such allowance; if it was the line skipped, the
   stream ends without one and fails, the way Pi's final text must arrive
   whole in one record (ADR 0003).
-* Records after the ``result`` (the operator's ``SessionEnd`` hooks) are
-  counted and otherwise ignored.
+* Records after a ``result`` that open no turn (notices between turns, the
+  operator's ``SessionEnd`` hooks after the last one) are counted and
+  otherwise ignored.
 
 Progress: each record becomes at least one :class:`~autoforge.progress.ProgressEvent`
 (liveness for #193), and the only strings an event carries are the model
 name and one allow-listed input per tool (:data:`TOOL_DETAILS`) -- never a
 command line, a tool result, thinking or assistant text. The summary is
-flat bounded scalars from the ``result`` record (no nested ``usage`` or
-``modelUsage``); the cost is integer micro-USD, and a value that is absent
-or unreadable is left out rather than reported as zero.
+flat bounded scalars from the ``result`` records (no nested ``usage`` or
+``modelUsage``): the last one's, with ``num_turns`` and ``duration_ms``,
+which each ``result`` reports for its own turn, summed over all of them, and
+their count; ``total_cost_usd`` is the session's so far, so the last one's
+is the invocation's. The cost is integer micro-USD, and a value that is
+absent or unreadable is left out rather than reported as zero. So is a sum
+once one ``result`` lacks its count: what the others add up to is not the
+invocation's total.
 
 Loop detection (#194): given a :class:`~autoforge.loop_detect.LoopObserver`,
 each completed tool call is reported as an action fingerprinted from its
@@ -86,6 +104,8 @@ _PATH_INPUTS = frozenset({"file_path", "notebook_path"})
 # Record types that are activity only. Any other type is counted as unknown
 # (forward compatibility) and is activity too.
 _ACTIVITY_TYPES = frozenset({"rate_limit_event"})
+# Per-turn counts in a ``result``, summed over the invocation's turns.
+_PER_TURN_COUNTS = ("num_turns", "duration_ms")
 # Tool calls whose result has not arrived yet, kept to name a failed tool
 # and to fingerprint the call once it completes. Past the bound a result is
 # still counted, only not named, and is no action for the loop detector.
@@ -134,9 +154,15 @@ class ClaudeStream:
         self._loop = loop
         self.text: str | None = None
         self.failure: str | None = None
-        # stdout ended without a result; the driver names the exit code.
+        # stdout ended inside a turn; the driver names the exit code.
         self.exited_early = False
-        self._result_seen = False
+        # A turn is open from the start and from a record that opens one
+        # after a result, until its own result.
+        self._turn_open = True
+        self._results = 0
+        # The per-turn counts summed over the results so far. A count one
+        # result lacks makes its sum unknown, and it is dropped for good.
+        self._per_turn: dict[str, int] = dict.fromkeys(_PER_TURN_COUNTS, 0)
         # Open tool calls: their name and, with a loop observer, their input's digest.
         self._open_tools: dict[str, tuple[str, bytes]] = {}
         self._records = 0
@@ -171,14 +197,18 @@ class ClaudeStream:
             return
         kind = record["type"]
         if kind == "result":
-            if self._result_seen:
-                self._protocol("a second result event")
-            else:
+            if self._turn_open:
                 self._take_result(record)
+            else:
+                self._protocol("a result event outside a turn")
             return
-        if self._result_seen:
-            self._after_result += 1
-            return
+        if not self._turn_open:
+            if kind not in ("assistant", "user") and not (
+                kind == "system" and record.get("subtype") == "init"
+            ):
+                self._after_result += 1
+                return
+            self._turn_open = True
         self._observe(kind, record)
 
     def oversize(self, limit: int) -> None:
@@ -191,9 +221,12 @@ class ClaudeStream:
 
     def stream_ended(self) -> None:
         """stdout reached EOF."""
-        if self._result_seen or self.failure is not None:
+        if not self._turn_open or self.failure is not None:
             return
         self.exited_early = True
+        if self._results:
+            self._fail("claude: exited inside a turn that has no result event")
+            return
         reason = "claude: exited without a result event"
         if self._oversize:
             reason += (
@@ -206,6 +239,7 @@ class ClaudeStream:
         """The flat, bounded, redacted summary for ``execution.json``."""
         return {
             **self._result,
+            "results": self._results,
             "records": self._records,
             "oversize_records": self._oversize,
             "unknown_events": self._unknown,
@@ -230,7 +264,8 @@ class ClaudeStream:
         self._fail(f"claude: stream-json protocol violation: {what}")
 
     def _take_result(self, record: dict) -> None:
-        self._result_seen = True
+        self._turn_open = False
+        self._results += 1
         subtype = record.get("subtype")
         is_error = record.get("is_error")
         summary: dict[str, str | int | bool] = {
@@ -239,10 +274,13 @@ class ClaudeStream:
             "terminal_reason": clean(record.get("terminal_reason"), MAX_VALUE_CHARS),
             "stop_reason": clean(record.get("stop_reason"), MAX_VALUE_CHARS),
         }
-        for key in ("num_turns", "duration_ms"):
+        for key, total in list(self._per_turn.items()):
             value = _count(record.get(key))
-            if value is not None:
-                summary[key] = value
+            if value is None:
+                del self._per_turn[key]
+            else:
+                self._per_turn[key] = min(total + value, _MAX_COUNT)
+        summary.update(self._per_turn)
         cost = _micro_usd(record.get("total_cost_usd"))
         if cost is not None:
             summary["cost_micro_usd"] = cost

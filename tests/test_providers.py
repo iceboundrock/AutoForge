@@ -257,6 +257,35 @@ def test_a_fake_claude_stream_is_reduced_to_the_result_text_verbatim(tmp_path):
     assert all(type(v) in (str, int, bool) for v in summary.values())
 
 
+def test_the_last_turns_result_is_the_stdout_of_a_multi_turn_run(tmp_path):
+    """A background task or a scheduled wakeup still pending at the end of a
+    turn keeps the CLI alive for another turn, which ends in its own result
+    (claude 2.1.293): the run is not a protocol violation, and its stdout is
+    the last result's text, as ``--output-format text`` prints it."""
+    from tests import claude_fake
+    from tests.conftest import block
+
+    text = "Done.\n" + block({"phase": "FIX", "status": "success"})
+    _, res = _claude_run(
+        tmp_path,
+        [
+            claude_fake.init(),
+            claude_fake.tool_use("t1", "ScheduleWakeup", delaySeconds=60),
+            claude_fake.tool_result("t1", "Next wakeup scheduled"),
+            claude_fake.result("Waiting for the checks."),
+            claude_fake.line({"type": "command_lifecycle", "state": "started"}),
+            claude_fake.init(),
+            claude_fake.result(text, total_cost_usd=0.02),
+            claude_fake.line({"type": "command_lifecycle", "state": "completed"}),
+        ],
+    )
+    assert res.ok and res.provider_failure is None, (res.exit_code, res.stderr)
+    assert res.stdout == text
+    summary = res.provider_summary
+    assert summary["results"] == 2 and summary["num_turns"] == 6
+    assert summary["cost_micro_usd"] == 20_000 and summary["records_after_result"] == 2
+
+
 def _looping(n: int, *, tail: list | None = None) -> list:
     """``n`` copies of the same two tool calls (Bash then Read), each with
     the same input and the same result: an agent going round in circles."""
@@ -665,7 +694,12 @@ def test_a_helper_that_exits_within_the_grace_is_neither_killed_nor_reported(tmp
 @pytest.mark.parametrize(
     ("then", "failure"),
     [
-        ("SECOND_RESULT", "claude: stream-json protocol violation: a second result event"),
+        ("RESULT", "claude: stream-json protocol violation: a result event outside a turn"),
+        (
+            "ERROR_TURN",
+            "claude: the run ended in an error (subtype success, terminal_reason completed): again",
+        ),
+        ("TURN", "claude: exited inside a turn that has no result event (exit 0)"),
         ("not json\n", "claude: stream-json protocol violation: a stdout line is not JSON"),
         (
             '{"type": "system"',
@@ -683,7 +717,8 @@ def test_what_stdout_carries_after_the_cli_exits_is_still_validated(
 ):
     """R3-F1: a helper that writes to the CLI's stdout after the CLI has exited
     (within the exit grace) is held to the stream's rules: the lines are fed
-    to the reducer after the exit, so a second result, a malformed line, an
+    to the reducer after the exit, so a result outside a turn, a turn that
+    ends in an error result or without its result, a malformed line, an
     unterminated last line and an overflow of the pending queue still fail
     the run, with the CLI's own exit status."""
     from autoforge import providers
@@ -693,7 +728,9 @@ def test_what_stdout_carries_after_the_cli_exits_is_still_validated(
     monkeypatch.setattr(providers, "CLAUDE_MAX_PENDING_BYTES", 8192)
     hook = claude_fake.line({"type": "system", "subtype": "hook_response"})
     expand = {
-        "SECOND_RESULT": claude_fake.result("again") + "\n",
+        "RESULT": claude_fake.result("again") + "\n",
+        "ERROR_TURN": claude_fake.init() + "\n" + claude_fake.result("again", is_error=True) + "\n",
+        "TURN": claude_fake.init() + "\n",
         "HOOK_LINES": (hook + "\n") * 400,
     }
     _, res = _claude_run(

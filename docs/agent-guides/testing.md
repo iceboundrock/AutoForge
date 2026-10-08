@@ -237,11 +237,13 @@ Progress is observability, never part of an outcome. Keep covered:
 - the Claude `stream-json` reducer (`tests/test_claude_stream.py`): the
   `result` text verbatim, `is_error` checked before the subtype, a
   malformed line (including one the JSON decoder refuses for its integer or
-  nesting limit, which must not escape as an exception), a missing or
-  second result and an oversize result line each a `provider_failure`, an
-  oversize ordinary line counted and skipped,
-  a flat scalar summary, and no command, thinking, assistant text or tool
-  result in any event
+  nesting limit, which must not escape as an exception), a missing result,
+  an oversize result line, an error result in any turn, a result outside a
+  turn and stdout ending inside a later turn each a `provider_failure`, the
+  last turn's result the outcome of a run of several, an oversize ordinary
+  line counted and skipped, a flat scalar summary (a per-turn sum left out
+  once one result lacks its count), and no command, thinking, assistant
+  text or tool result in any event
 - the real `ClaudeCodeProvider` on the fake `claude` (`tests/claude_fake.py`):
   argv, stdin on `/dev/null`, orphan containment, the timeout, and a sink
   that raises never failing the run
@@ -253,8 +255,8 @@ Progress is observability, never part of an outcome. Keep covered:
   into the deadline; a CLI still running at its deadline is a timeout
   however busy its stdout; a helper that exits within the grace is
   neither killed nor reported; and what stdout carries after the exit (a
-  second result, a malformed or unterminated line, an overflow) still fails
-  the run
+  result outside a turn, a turn ending in an error result or without its
+  result, a malformed or unterminated line, an overflow) still fails the run
 - cleaning (`tests/test_progress.py`): escapes and controls stripped
   before redaction and redaction before the clip, so a token split by an
   escape or cut by the bound is never shown
