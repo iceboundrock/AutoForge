@@ -223,7 +223,9 @@ High-priority coverage includes:
   did not journal blocks at the entry (nothing launched) and at the
   precondition read (nothing planned); a stale round still gets its
   comment; the entry fetches the bound HEAD and merge base, and a failed
-  fetch launches nothing
+  fetch launches nothing; the merge gate re-reads the comment the
+  controller posted, and blocks once an edit drops its marker; a dry run,
+  with or without a saved plan, reads, fetches, launches and posts nothing
 
 ### Recovery
 

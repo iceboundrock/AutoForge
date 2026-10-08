@@ -3160,6 +3160,37 @@ def test_gate_reads_the_review_comment_exactly_once_per_pass(tmp_state_dir, fake
     assert fake_github.merges == [(PR, "squash", SHA_A, False)]
 
 
+def test_gate_re_reads_the_review_comment_the_controller_posted(tmp_state_dir, fake_github):
+    """#162: the comment the gate re-reads is the one the controller rendered,
+    posted and read back for the clean round, by the URL it persisted. The
+    gate itself is unchanged."""
+    eng = _in_review(tmp_state_dir, fake_github, [block(review_result(1, SHA_A))])
+    eng.config.safety.allow_merge = True
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    posted = controller_review_comment(eng, 1).url
+    assert load_state(eng.paths.state_file).last_review_comment_url == posted
+    assert eng.step(allow_merge=True).next_phase == "MERGE"
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "UPDATE_EPIC", out.message
+    reads = [c for c in fake_github.calls if c[0] == "get_comment"]
+    assert reads == [("get_comment", posted)] * 2
+    assert fake_github.merges == [(PR, "squash", SHA_A, False)]
+
+
+def test_gate_blocks_when_the_comment_the_controller_posted_was_edited(tmp_state_dir, fake_github):
+    """#162: the controller's comment is evidence only while it still says what
+    the controller posted. Edited afterwards to drop its marker, it no longer
+    backs the clean review, and the gate blocks as for any other comment."""
+    eng = _in_review(tmp_state_dir, fake_github, [block(review_result(1, SHA_A))])
+    eng.config.safety.allow_merge = True
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    posted = controller_review_comment(eng, 1)
+    edited = replace(posted, body=posted.body.split("<!--")[0] + "LGTM\n")
+    fake_github.comments[PR] = [edited]
+    _gate_blocks_on_review_comment(eng, fake_github, "no comment carries")
+    assert ("get_comment", posted.url) in fake_github.calls
+
+
 @pytest.mark.parametrize("phase", [Phase.READY_FOR_MERGE, Phase.MERGE])
 def test_gate_does_not_read_the_review_comment_of_a_drifted_pr(tmp_state_dir, fake_github, phase):
     """A PR past the reviewed revision goes back to REVIEW whatever its old
@@ -9332,3 +9363,39 @@ def test_k4_dry_run_names_the_comment_it_would_post_and_posts_nothing(
     assert any("review comment" in n for n in out.plan.notes)
     assert eng.provider.calls == [] and fake_github.effect_writes == []
     assert offline_fetches == [] and fake_github.calls == calls_before
+
+
+def test_k4_dry_run_touches_no_github_at_all(tmp_state_dir, fake_github, offline_fetches):
+    """The dry-run invariant against a client that fails on any use, so no read
+    the plan might make is overlooked, and against the state file's bytes."""
+    eng = _in_review(tmp_state_dir, fake_github, ["never"])
+    eng._save()
+    eng._github = _NoGitHub()
+    before = eng.paths.state_file.read_bytes()
+    offline_fetches.clear()
+    out = eng.step(dry_run=True)
+    assert any("post it on the PR itself" in n for n in out.plan.notes)
+    assert eng.provider.calls == [] and offline_fetches == []
+    assert eng.paths.state_file.read_bytes() == before
+
+
+def test_k4_dry_run_with_a_saved_plan_names_the_comment_and_posts_nothing(
+    tmp_state_dir, fake_github, offline_fetches
+):
+    """A plan saved before a crash: the dry run says the round completes from it
+    without the reviewer, and reads, fetches, launches and posts nothing."""
+    eng = _in_review(tmp_state_dir, fake_github, [block(review_result(1, SHA_A, [_finding(1)]))])
+    eng._persist_effect = _crash_on_first_call(eng._persist_effect)
+    with pytest.raises(RuntimeError, match="power loss"):
+        eng.step()
+
+    eng.load()
+    eng._github = _NoGitHub()
+    before = eng.paths.state_file.read_bytes()
+    offline_fetches.clear()
+    out = eng.step(dry_run=True)
+    notes = "\n".join(out.plan.notes)
+    assert "would complete review round 1 from the persisted REVIEW plan" in notes
+    assert "would reconcile" in notes and "(intended, 0 attempt(s))" in notes
+    assert len(eng.provider.calls) == 1 and fake_github.effect_writes == []
+    assert offline_fetches == [] and eng.paths.state_file.read_bytes() == before
