@@ -403,12 +403,12 @@ def test_an_error_in_a_held_result_fails_the_run():
 
 
 def test_a_turn_opened_before_its_init_is_one_turn():
-    """After a result, a background agent's record opens the next turn; the
+    """After a result, an ``assistant`` record opens the next turn; the
     ``system/init`` that follows is that turn's own, not one more."""
     stream, _ = _run(
         _INIT,
         _result(result="waiting"),
-        {**_assistant({"type": "text", "text": "A done"}), "parent_tool_use_id": "a1"},
+        _assistant({"type": "text", "text": "more"}),
         *_held_turn(TEXT),
         _result(result=TEXT),
     )

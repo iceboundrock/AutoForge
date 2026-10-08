@@ -35,7 +35,14 @@ agent (``Agent`` run in the background) is still running does not get its
 held results arrive together, in turn order, after the last turn's records
 (verified on claude 2.1.293, 2026-10-07). A turn that ends with only a
 background shell task pending gets its ``result`` at once. Either way the
-n-th ``result`` belongs to the n-th turn.
+n-th ``result`` belongs to the n-th turn. A background agent's own records
+reach the stream too, each with the ``parent_tool_use_id`` of the call
+that started the agent, but only as ``assistant`` and ``user`` records; the
+agent's start and end are main-conversation notices (``system/task_*``),
+and every ``system/init`` and ``result`` is the main conversation's
+(verified on claude 2.1.293, 2026-10-07, with three background agents).
+The turn count rests on that: a subagent's own ``system/init`` or
+``result`` would throw it off.
 
 The outcome:
 
