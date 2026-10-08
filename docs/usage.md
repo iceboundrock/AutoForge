@@ -179,14 +179,20 @@ it or remove its marker first); an issue a deferral names that is no
 longer open or has moved to another repository (reopen it, or `unblock`
 to run the fixer afresh); an issue whose body now holds something shaped
 like a credential, so the marker cannot be appended to it (remove it, then
-`unblock`); a reused follow-up issue that is no longer the one open issue
-carrying its finding's marker; and a write that conflicts after the plan
-was saved (reopen the follow-up issue the controller created, put the
-issue body back, or leave the PR branch at the reviewed HEAD or the
-planned commit, then `unblock`: the plan completes without running the
-fixer again). A push to the PR branch the controller did not make, before
+`unblock`); after the plan was saved, a follow-up issue (reused, or one
+the controller already created or appended to) that is no longer the one
+open issue carrying its finding's marker, or an open issue carrying the
+marker of a finding the plan resolved without a deferral (reopen the
+controller's issue, or close or unmark the one it did not write, then
+`unblock`); a PR whose head repository GitHub no longer reports, or whose
+head moved to a fork or another branch, after the plan was saved; and a
+write that conflicts after the plan was saved (reopen the follow-up issue
+the controller created, put the issue body back, or leave the PR branch at
+the reviewed HEAD or the planned commit, then `unblock`: the plan
+completes without running the fixer again). A push to the PR branch the controller did not make, before
 or after the fixer ran, is not a block: the PR goes back to `REVIEW` of the
-pushed HEAD. A LOCAL
+pushed HEAD; so does a PR retargeted to another base, or a base rewritten
+under its name, at any point of the phase. A LOCAL
 run cannot be unblocked. The decision table is in
 [Workflow: leaving BLOCKED](agent-guides/workflow.md#leaving-blocked-the-operators-unblock).
 

@@ -392,7 +392,10 @@ next entry could not find again.
   because the branch moved, or a head other than the reviewed HEAD or the
   candidate at any later entry, is the same drift: `FIX -> REVIEW`, the
   plan dropped and no fix recorded (github-safety.md, "Before FIX" and
-  "After FIX").
+  "After FIX"). A saved plan is held to the entry's rules again before it
+  sends anything and when it completes: a base or merge base that left the
+  findings' binding is the same drift with the findings carried, and a
+  head branch or follow-up issue the plan cannot prove blocks.
 - `REPLAN_REEXECUTE` replays its durable transaction (replan-transaction.md).
 - `UPDATE_EPIC` reads its journal first: a persisted completion context
   means the agent's result was already accepted, so the phase is completed

@@ -3008,7 +3008,7 @@ def test_fix_reused_follow_up_closed_or_joined_blocks_with_no_write(
     assert out.next_phase == "BLOCKED", out.message
     reason = load_state(eng.paths.state_file).block_reason
     if when == "at-completion":
-        assert "A follow-up issue the fixer reused is no longer the one open issue" in reason
+        assert "The open issues contradict the FIX plan" in reason
         assert "nothing more was sent" in reason
     else:
         assert "othing was created, appended or pushed" in reason
@@ -3292,6 +3292,402 @@ def test_fix_created_follow_up_closed_by_a_human_before_the_read_back_blocks(tmp
     assert "reopen the follow-up issue the controller created" in reason
     assert [w[0] for w in gh.effect_writes] == ["create_issue"]
     assert eng.origin.head(BRANCH) == reviewed and eng2.provider.calls == []
+
+
+# -- PR #205 review round 2: a saved FIX plan is held to the entry's rules again --------
+ISSUE4 = "https://github.com/owner/repo/issues/4"
+
+
+def _plan_saved(eng, monkeypatch) -> None:
+    """The fixer runs and the plan is saved; the process dies before anything is sent."""
+    from autoforge.engine import ControllerEngine
+
+    monkeypatch.setattr(ControllerEngine, "_complete_fix", _crash)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    monkeypatch.undo()
+    assert {r["stage"] for r in load_state(eng.paths.state_file).effect_records} == {"intended"}
+
+
+def _bound_to_main(eng) -> None:
+    """Bind the open findings to base ``main`` and the reviewed HEAD's real merge base."""
+    eng.state.reviewed_base_ref = "main"
+    eng.state.current_base_ref = "main"
+    eng.state.reviewed_merge_base_sha = eng.origin.merge_base("main", eng.state.reviewed_head_sha)
+
+
+def _after_persisting(eng, kind: EffectKind, stage: Stage, then) -> None:
+    """Call ``then(record)`` once, right after a ``kind`` record is persisted at ``stage``."""
+    persist = eng._persist_effect
+    fired: list[int] = []
+
+    def hooked(record):
+        persist(record)
+        if not fired and record.kind is kind and record.stage is stage:
+            fired.append(record.position)
+            then(record)
+
+    eng._persist_effect = hooked
+
+
+@pytest.mark.parametrize(
+    ("head_repository", "branch", "reason"),
+    [
+        pytest.param(
+            "",
+            BRANCH,
+            f"PR {PR} has no readable head repository, so the controller cannot prove its "
+            "branch is a branch of owner/repo",
+            id="no-head-repository",
+        ),
+        pytest.param(
+            "someone/repo",
+            BRANCH,
+            f"PR {PR} is headed in someone/repo, not in owner/repo",
+            id="fork-head",
+        ),
+        pytest.param(
+            "owner/repo",
+            "another-branch",
+            f"PR {PR} is headed at refs/heads/another-branch, but the FIX plan was made for "
+            f"refs/heads/{BRANCH}",
+            id="another-branch",
+        ),
+    ],
+)
+def test_fix_saved_plan_blocks_when_its_push_target_is_no_longer_the_pr_head(
+    tmp_state_dir, monkeypatch, head_repository, branch, reason
+):
+    """PR #205 R2-F1: the plan proved the PR headed at a branch of the run's
+    repository when it was saved; a later process replaying it proves that
+    again before anything is sent. A head repository emptied or moved to a
+    fork, or a head branch renamed, after the save blocks with no follow-up
+    created and nothing pushed, and the fixer is not launched again."""
+    gh = FakeGitHub()
+    eng = _in_fix(
+        tmp_state_dir,
+        gh,
+        fixer(fixed("R1-F1"), new_follow_up("R1-F2")),
+        [_finding(1, 1), _finding(1, 2)],
+        origin=True,
+    )
+    reviewed = eng.state.reviewed_head_sha
+    _plan_saved(eng, monkeypatch)
+    gh.prs[PR].head_repository = head_repository
+    gh.prs[PR].head_ref = branch
+
+    eng2 = _resumed(eng, tmp_state_dir, gh, "never")
+    out = eng2.step()
+    assert out.next_phase == "BLOCKED", out.message
+    s = load_state(eng2.paths.state_file)
+    assert reason in s.block_reason and "nothing more was sent" in s.block_reason
+    assert {r["stage"] for r in s.effect_records} == {"intended"}
+    assert s.last_review_result != "fixed" and [f["id"] for f in s.open_findings] == [
+        "R1-F1",
+        "R1-F2",
+    ]
+    assert gh.effect_writes == [] and eng.origin.head(BRANCH) == reviewed
+    assert eng2.provider.calls == []
+
+
+@pytest.mark.parametrize(
+    ("marked", "planned", "issues"),
+    [
+        pytest.param("R1-F1", "resolved as fixed", 1, id="fixed"),
+        pytest.param("R1-F2", "resolved as no_change_with_rationale", 1, id="no-change"),
+        pytest.param("R1-F3", "deferred to follow_up_issue effect 0", 1, id="create-not-issued"),
+        pytest.param("R1-F1", "", 2, id="duplicate-claimants"),
+    ],
+)
+def test_fix_saved_plan_blocks_on_a_marked_issue_it_did_not_write(
+    tmp_state_dir, monkeypatch, marked, planned, issues
+):
+    """PR #205 R2-F2: every resolution is checked against the open issues, not
+    only the deferred ones. A finding resolved as fixed or with a rationale
+    has no follow-up the controller wrote, so an open issue carrying its
+    marker (or two) contradicts the plan; so does one carrying the marker of
+    a follow-up the plan has not created yet. It blocks before anything is
+    sent; the controller never adopts or chooses between such issues."""
+    gh = FakeGitHub()
+    eng = _in_fix(
+        tmp_state_dir,
+        gh,
+        fixer(fixed("R1-F1"), no_change("R1-F2"), new_follow_up("R1-F3")),
+        [_finding(1, 1), _finding(1, 2), _finding(1, 3)],
+        origin=True,
+    )
+    reviewed = eng.state.reviewed_head_sha
+    _plan_saved(eng, monkeypatch)
+    for n in range(issues):
+        gh.add_issue(f"https://github.com/owner/repo/issues/{4 + n}", "rogue", body=_marked(marked))
+
+    eng2 = _resumed(eng, tmp_state_dir, gh, "never")
+    out = eng2.step()
+    assert out.next_phase == "BLOCKED", out.message
+    s = load_state(eng2.paths.state_file)
+    if planned:
+        assert (
+            f"open issue {ISSUE4} carries the follow-up marker of {marked}, which the FIX plan "
+            f"has {planned}"
+        ) in s.block_reason
+    else:
+        assert "finding R1-F1 of" in s.block_reason and ISSUE4 in s.block_reason
+    assert "The open issues contradict the FIX plan" in s.block_reason
+    assert "nothing more was sent" in s.block_reason
+    assert {r["stage"] for r in s.effect_records} == {"intended"}
+    assert s.last_review_result != "fixed" and s.last_fix_resolutions == []
+    assert gh.effect_writes == [] and eng.origin.head(BRANCH) == reviewed
+    assert eng2.provider.calls == []
+
+
+@pytest.mark.parametrize(
+    ("kind", "change"),
+    [
+        (kind, change)
+        for kind in (EffectKind.FOLLOW_UP_ISSUE, EffectKind.FOLLOW_UP_APPEND)
+        for change in ("closed", "unmarked", "duplicated")
+    ],
+    ids=lambda v: v.value if isinstance(v, EffectKind) else v,
+)
+def test_fix_replay_revalidates_observed_follow_ups_before_the_push(tmp_state_dir, kind, change):
+    """PR #205 R2-F3: a follow-up an earlier process created or appended to,
+    and journaled as observed, is read again when the plan is replayed: an
+    observed record is settled in the journal, not on GitHub. Closed,
+    unmarked, or joined by a second issue carrying the marker since, it is
+    no longer the one open issue the plan names, so it blocks before the
+    push: nothing is written again, and the branch stays at the reviewed
+    HEAD."""
+    gh = FakeGitHub()
+    earlier = _marked("R1-F5")
+    gh.add_issue(ISSUE3, "deferred in round 1", body=earlier)
+    eng = _in_fix(
+        tmp_state_dir,
+        gh,
+        fixer(fixed("R1-F1"), new_follow_up("R1-F2"), deferred_to("R1-F3", ISSUE3)),
+        [_finding(1, 1), _finding(1, 2), _finding(1, 3)],
+        origin=True,
+    )
+    reviewed = eng.state.reviewed_head_sha
+    _power_loss_at(eng, kind, Stage.OBSERVED, saved=True)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    written = [w[0] for w in gh.effect_writes]
+    assert written == (
+        ["create_issue"]
+        if kind is EffectKind.FOLLOW_UP_ISSUE
+        else ["create_issue", "write_issue_body"]
+    )
+    issue, fid = (ISSUE43, "R1-F2") if kind is EffectKind.FOLLOW_UP_ISSUE else (ISSUE3, "R1-F3")
+    if change == "closed":
+        gh.issues[issue].state = "CLOSED"
+    elif change == "unmarked":
+        gh.issues[issue].body = "No marker any more."
+    else:
+        gh.add_issue(ISSUE4, "rogue", body=_marked(fid))
+
+    eng2 = _resumed(eng, tmp_state_dir, gh, "never")
+    out = eng2.step()
+    assert out.next_phase == "BLOCKED", out.message
+    s = load_state(eng2.paths.state_file)
+    assert f"finding {fid} of" in s.block_reason or fid in s.block_reason
+    assert "The open issues contradict the FIX plan" in s.block_reason
+    assert "nothing more was sent" in s.block_reason
+    assert [w[0] for w in gh.effect_writes] == written
+    assert eng.origin.head(BRANCH) == reviewed and gh.prs[PR].head_sha == reviewed
+    assert s.last_review_result != "fixed" and s.effect_records[-1]["stage"] == "intended"
+    assert eng2.provider.calls == []
+
+
+@pytest.mark.parametrize("marked", ["R1-F1", "R1-F2"], ids=["fixed", "duplicated"])
+def test_fix_marker_appearing_after_a_follow_up_write_blocks_the_push(tmp_state_dir, marked):
+    """PR #205 R2-F2/R2-F3, within one process: the open issues are read
+    again after the follow-up writes and before the push, the commit point.
+    An issue marked for a finding resolved as fixed, or a second issue
+    marked for the finding the controller just deferred, appearing in
+    between blocks with the follow-up on GitHub and nothing pushed."""
+    gh = FakeGitHub()
+    eng = _in_fix(
+        tmp_state_dir,
+        gh,
+        fixer(fixed("R1-F1"), new_follow_up("R1-F2")),
+        [_finding(1, 1), _finding(1, 2)],
+        origin=True,
+    )
+    reviewed = eng.state.reviewed_head_sha
+    _after_persisting(
+        eng,
+        EffectKind.FOLLOW_UP_ISSUE,
+        Stage.OBSERVED,
+        lambda record: gh.add_issue(ISSUE4, "rogue", body=_marked(marked)),
+    )
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    s = load_state(eng.paths.state_file)
+    assert "The open issues contradict the FIX plan" in s.block_reason
+    assert "the follow-ups are on GitHub but the candidate was not pushed" in s.block_reason
+    assert [r["stage"] for r in s.effect_records] == ["observed", "intended"]
+    assert [w[0] for w in gh.effect_writes] == ["create_issue"]
+    assert eng.origin.head(BRANCH) == reviewed and s.last_review_result != "fixed"
+
+
+def test_fix_marker_for_a_fixed_finding_at_completion_is_not_accepted(tmp_state_dir):
+    """PR #205 R2-F2 at completion: an issue marked for a finding resolved as
+    fixed, appearing after the push landed, is not accepted. The fix is not
+    recorded (the findings stay open, the plan stays saved); it blocks until
+    the issue is closed, and 'unblock' then completes from the journal
+    without writing anything again."""
+    gh = FakeGitHub()
+    eng = _in_fix(
+        tmp_state_dir,
+        gh,
+        fixer(fixed("R1-F1"), new_follow_up("R1-F2")),
+        [_finding(1, 1), _finding(1, 2)],
+        origin=True,
+    )
+    _after_persisting(
+        eng,
+        EffectKind.PUSH,
+        Stage.OBSERVED,
+        lambda record: gh.add_issue(ISSUE4, "rogue", body=_marked("R1-F1")),
+    )
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    candidate = _worktree_head(eng.provider.calls[0])
+    s = load_state(eng.paths.state_file)
+    assert f"open issue {ISSUE4} carries the follow-up marker of R1-F1" in s.block_reason
+    assert "the fix is not recorded" in s.block_reason
+    assert s.last_review_result != "fixed" and s.last_fix_resolutions == []
+    assert [f["id"] for f in s.open_findings] == ["R1-F1", "R1-F2"]
+    assert eng.origin.head(BRANCH) == candidate
+    writes = list(gh.effect_writes)
+
+    gh.issues[ISSUE4].state = "CLOSED"
+    eng2 = _resumed(eng, tmp_state_dir, gh, "never")
+    assert eng2.unblock("closed the rogue follow-up").unblocked
+    out = eng2.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert gh.effect_writes == writes and eng2.provider.calls == []
+    s = load_state(eng2.paths.state_file)
+    assert s.last_review_result == "fixed" and s.current_head_sha == candidate
+
+
+@pytest.mark.parametrize("drift", ["retargeted", "rewritten"])
+def test_fix_saved_plan_with_the_base_moved_goes_to_review_without_sending(
+    tmp_state_dir, monkeypatch, drift
+):
+    """PR #205 R2-F4: the findings are bound to the base and the merge base
+    as well as the HEAD (#95, #96), and a saved plan does not bypass that.
+    The PR retargeted from main to release/1.x, or main rewritten under its
+    name, after the plan was saved: the review is stale, nothing is sent,
+    no fix is recorded and the findings are carried to the next review."""
+    gh = FakeGitHub()
+    eng = _in_fix(
+        tmp_state_dir,
+        gh,
+        fixer(fixed("R1-F1"), new_follow_up("R1-F2")),
+        [_finding(1, 1), _finding(1, 2)],
+        origin=True,
+    )
+    _bound_to_main(eng)
+    reviewed = eng.state.reviewed_head_sha
+    _plan_saved(eng, monkeypatch)
+    if drift == "retargeted":
+        gh.prs[PR].base_ref = "release/1.x"
+    else:
+        gh.merge_base = MERGE_BASE_B
+
+    eng2 = _resumed(eng, tmp_state_dir, gh, "never")
+    out = eng2.step()
+    assert out.next_phase == "REVIEW", out.message
+    if drift == "retargeted":
+        assert "base changed to 'release/1.x' from the reviewed base 'main'" in out.message
+    else:
+        assert f"PR merge base moved to {MERGE_BASE_B[:12]}" in out.message
+    assert "nothing more was sent" in out.message
+    assert "the 2 finding(s) of round 1 are carried to that review to re-check" in out.message
+    s = load_state(eng2.paths.state_file)
+    assert s.phase == Phase.REVIEW and s.review_round == 1
+    assert s.last_review_result == "stale" and s.last_fix_resolutions == []
+    assert s.prior_findings == [_finding(1, 1), _finding(1, 2)] and s.open_findings == []
+    assert s.effect_records == [] and s.completion_context == {}
+    assert s.current_head_sha == reviewed
+    assert gh.effect_writes == [] and eng.origin.head(BRANCH) == reviewed
+    assert eng2.provider.calls == []
+
+
+@pytest.mark.parametrize("drift", ["retargeted", "rewritten"])
+def test_fix_base_moved_when_the_push_lands_is_not_recorded_as_fixed(tmp_state_dir, drift):
+    """PR #205 R2-F4 at completion: the base or merge base moves while the
+    plan is sent. The candidate is on the PR, but the findings it resolves
+    describe a diff the PR no longer proposes, so the fix is not recorded:
+    the actual revision is reviewed with the findings carried."""
+    gh = FakeGitHub()
+    eng = _in_fix(tmp_state_dir, gh, fixer(fixed("R1-F1")), origin=True)
+    _bound_to_main(eng)
+
+    def moves(record):
+        if drift == "retargeted":
+            gh.prs[PR].base_ref = "release/1.x"
+        else:
+            gh.merge_base = MERGE_BASE_B
+
+    _after_persisting(eng, EffectKind.PUSH, Stage.OBSERVED, moves)
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert "read back after the FIX plan was sent" in out.message
+    candidate = _worktree_head(eng.provider.calls[0])
+    s = load_state(eng.paths.state_file)
+    assert s.last_review_result == "stale" and s.last_fix_resolutions == []
+    assert s.prior_findings == [_finding(1)] and s.open_findings == []
+    assert s.current_head_sha == candidate == eng.origin.head(BRANCH)
+    assert s.effect_records == []
+
+
+def test_fix_saved_plan_with_an_unreadable_base_is_a_verification_failure(
+    tmp_state_dir, monkeypatch
+):
+    """PR #205 R2-F4: a base GitHub does not report when the saved plan is
+    replayed is a read the controller cannot decide on, not a retarget: it
+    is refused with nothing sent, the phase and the plan kept."""
+    gh = FakeGitHub()
+    eng = _in_fix(tmp_state_dir, gh, fixer(fixed("R1-F1")), origin=True)
+    _bound_to_main(eng)
+    reviewed = eng.state.reviewed_head_sha
+    _plan_saved(eng, monkeypatch)
+    gh.prs[PR].base_ref = ""
+
+    eng2 = _resumed(eng, tmp_state_dir, gh, "never")
+    with pytest.raises(VerificationError, match="no readable base branch.*bound to base 'main'"):
+        eng2.step()
+    s = load_state(eng2.paths.state_file)
+    assert s.phase == Phase.FIX and [r["stage"] for r in s.effect_records] == ["intended"]
+    assert s.last_review_result != "stale" and [f["id"] for f in s.open_findings] == ["R1-F1"]
+    assert gh.effect_writes == [] and eng.origin.head(BRANCH) == reviewed
+    assert eng2.provider.calls == []
+
+
+def test_fix_own_push_moving_the_prs_merge_base_still_completes(tmp_state_dir):
+    """PR #205 R2-F4: the merge base the findings are bound to is read
+    against the reviewed HEAD, not the PR's. The controller's own push (here
+    a candidate GitHub reports another merge base for, as when a fix merges
+    the base in) is not drift: the base the findings describe has not
+    moved, and the fix is recorded."""
+    gh = FakeGitHub()
+    eng = _in_fix(tmp_state_dir, gh, fixer(fixed("R1-F1")), origin=True)
+    _bound_to_main(eng)
+    reviewed = eng.state.reviewed_head_sha
+
+    def pins(record):
+        gh.merge_bases[("main", str(record.payload["sha"]))] = MERGE_BASE_B
+
+    _after_persisting(eng, EffectKind.PUSH, Stage.OBSERVED, pins)
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    candidate = _worktree_head(eng.provider.calls[0])
+    assert ("get_merge_base_sha", "owner/repo", "main", reviewed) in gh.calls
+    assert ("get_merge_base_sha", "owner/repo", "main", candidate) not in gh.calls
+    s = load_state(eng.paths.state_file)
+    assert s.last_review_result == "fixed" and s.current_head_sha == candidate
 
 
 def test_fix_human_push_before_the_controllers_is_refused_by_the_lease_and_reviewed(
