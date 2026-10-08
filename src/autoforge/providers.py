@@ -6,7 +6,7 @@ effort, timeout, options) into a concrete non-interactive CLI invocation.
 
 Verified against locally installed CLIs (2026-09):
 
-Claude Code (``claude 2.1.x``; the stream run against 2.1.291 and 2.1.292)::
+Claude Code (``claude 2.1.x``; the stream run against 2.1.291 to 2.1.293)::
 
     claude -p --output-format stream-json --verbose --model <alias|id>
            --effort <low|medium|high|xhigh|max> --permission-mode <mode>
@@ -15,14 +15,17 @@ Claude Code (``claude 2.1.x``; the stream run against 2.1.291 and 2.1.292)::
   * ``-p/--print`` = non-interactive. With ``stream-json`` (the default,
     #192) stdout is one JSON record per line while the agent runs
     (``system`` init / thinking_tokens / api_retry, ``assistant`` content
-    blocks, ``user`` tool results, ``rate_limit_event``) and one final
-    ``result`` record whose ``result`` field is the final assistant text;
-    the CLI refuses ``stream-json`` under ``--print`` without
-    ``--verbose``. The child runs under the duplex handle and the stream is
-    reduced in claude_stream.py: ``stdout`` of the result is that text
-    verbatim (so the CONTROL_RESULT block survives untouched), the records
-    before it become live progress (:mod:`autoforge.progress`), and an
-    error result, a malformed line or a missing result is a
+    blocks, ``user`` tool results, ``rate_limit_event``) and a ``result``
+    record that ends the turn, whose ``result`` field is its final
+    assistant text; a background task or a scheduled wakeup still pending
+    then keeps the CLI alive for another turn with its own ``result``. The
+    CLI refuses ``stream-json`` under ``--print`` without ``--verbose``.
+    The child runs under the duplex handle and the stream is reduced in
+    claude_stream.py: ``stdout`` of the result is the last ``result``
+    text verbatim (so the CONTROL_RESULT block survives untouched), the
+    other records become live progress (:mod:`autoforge.progress`), and an
+    error result in any turn, a result outside a turn, a malformed line or
+    a turn without its result is a
     :attr:`AgentExecutionResult.provider_failure`.
   * ``options.output_format: text`` is the opt-out: the final text is
     printed once, at exit, and the run reports no progress and no activity
@@ -465,8 +468,8 @@ class AgentProvider:
 CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 CLAUDE_PERMISSION_MODES = ("acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan")
 # `stream-json` (the default) reports progress while the agent runs and
-# carries the final text in its `result` line; `text` prints only the final
-# text, at exit, and is kept as an explicit opt-out. `json` prints one
+# carries the final text in its last `result` line; `text` prints only the
+# final text, at exit, and is kept as an explicit opt-out. `json` prints one
 # object at exit: no progress, so nothing over `text`, and not accepted.
 CLAUDE_OUTPUT_FORMATS = ("stream-json", "text")
 CLAUDE_DEFAULT_OUTPUT_FORMAT = "stream-json"

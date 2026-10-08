@@ -41,10 +41,11 @@ The outcome:
   failure, also in a turn a later one would have followed.
 * A line that is not a JSON object with a string ``type`` (including one
   the decoder refuses for an integer or nesting limit), an unterminated
-  last line, a queue overflow, and stdout ending without a ``result`` for
-  every turn are provider failures too. A turn opens with the stream and,
-  after a ``result``, again with a ``system/init``, ``assistant`` or
-  ``user`` record.
+  last line, a queue overflow, a ``result`` outside a turn, and stdout
+  ending without a ``result`` for every turn are provider failures too. A
+  turn opens with the stream and, after a ``result``, again with a
+  ``system/init``, ``assistant`` or ``user`` record, and its ``result``
+  closes it.
 * A line past the per-line bound is counted and skipped: a ``tool_result``
   carries whole files, and progress is not worth failing a run for. The
   ``result`` line has no such allowance; if it was the line skipped, the
@@ -192,7 +193,10 @@ class ClaudeStream:
             return
         kind = record["type"]
         if kind == "result":
-            self._take_result(record)
+            if self._turn_open:
+                self._take_result(record)
+            else:
+                self._protocol("a result event outside a turn")
             return
         if not self._turn_open:
             if kind not in ("assistant", "user") and not (

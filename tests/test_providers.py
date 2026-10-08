@@ -694,8 +694,9 @@ def test_a_helper_that_exits_within_the_grace_is_neither_killed_nor_reported(tmp
 @pytest.mark.parametrize(
     ("then", "failure"),
     [
+        ("RESULT", "claude: stream-json protocol violation: a result event outside a turn"),
         (
-            "ERROR_RESULT",
+            "ERROR_TURN",
             "claude: the run ended in an error (subtype success, terminal_reason completed): again",
         ),
         ("TURN", "claude: exited inside a turn that has no result event (exit 0)"),
@@ -716,9 +717,10 @@ def test_what_stdout_carries_after_the_cli_exits_is_still_validated(
 ):
     """R3-F1: a helper that writes to the CLI's stdout after the CLI has exited
     (within the exit grace) is held to the stream's rules: the lines are fed
-    to the reducer after the exit, so an error result, a turn left without
-    its result, a malformed line, an unterminated last line and an overflow
-    of the pending queue still fail the run, with the CLI's own exit status."""
+    to the reducer after the exit, so a result outside a turn, a turn that
+    ends in an error result or without its result, a malformed line, an
+    unterminated last line and an overflow of the pending queue still fail
+    the run, with the CLI's own exit status."""
     from autoforge import providers
     from tests import claude_fake
 
@@ -726,7 +728,8 @@ def test_what_stdout_carries_after_the_cli_exits_is_still_validated(
     monkeypatch.setattr(providers, "CLAUDE_MAX_PENDING_BYTES", 8192)
     hook = claude_fake.line({"type": "system", "subtype": "hook_response"})
     expand = {
-        "ERROR_RESULT": claude_fake.result("again", is_error=True) + "\n",
+        "RESULT": claude_fake.result("again") + "\n",
+        "ERROR_TURN": claude_fake.init() + "\n" + claude_fake.result("again", is_error=True) + "\n",
         "TURN": claude_fake.init() + "\n",
         "HOOK_LINES": (hook + "\n") * 400,
     }

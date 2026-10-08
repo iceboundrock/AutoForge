@@ -232,6 +232,25 @@ def test_an_error_result_in_a_later_turn_fails_the_run():
 
 
 @pytest.mark.parametrize(
+    "between",
+    [
+        (),
+        ({"type": "system", "subtype": "task_notification"},),
+        ({"type": "command_lifecycle", "state": "started"},),
+    ],
+)
+def test_a_result_outside_a_turn_is_a_failure(between):
+    """A result ends a turn; only a ``system/init``, ``assistant`` or
+    ``user`` record opens the next one (claude 2.1.293 opens each with
+    ``system/init``). A result with no turn since the last one, notices
+    between turns aside, ends no turn, and its text is never the outcome."""
+    stream, _ = _run(_result(), *between, _result(result="other"))
+    assert stream.text is None
+    assert stream.failure == "claude: stream-json protocol violation: a result event outside a turn"
+    assert stream.summary()["results"] == 1
+
+
+@pytest.mark.parametrize(
     "opens",
     [
         {"type": "system", "subtype": "init", "model": "m"},

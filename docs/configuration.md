@@ -322,8 +322,9 @@ claude -p --output-format stream-json --verbose --model <model> --effort <effort
   with a `result` record, and runs another turn when a background task or a
   scheduled wakeup the agent left pending fires, so one run can carry
   several; the last one is the run's. An error result (`is_error`, a
-  subtype other than `success`) in any turn, a line that is not JSON, or a
-  turn without its `result` record when the CLI exits fails the step as a
+  subtype other than `success`) in any turn, a `result` record with no turn
+  between it and the previous one, a line that is not JSON, or a turn
+  without its `result` record when the CLI exits fails the step as a
   provider failure. A record larger than the per-line bound is counted and skipped
   unless it is the `result` record, which must arrive whole.
 - `text` is the opt-out: the CLI prints the final text once, at exit, so
