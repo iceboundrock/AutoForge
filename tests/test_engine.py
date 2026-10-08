@@ -54,6 +54,7 @@ from autoforge.result_parser import (
     MAX_FIX_RATIONALE_CHARS,
     MAX_URL_CHARS,
     ReviewResult,
+    published_markdown_problem,
 )
 from autoforge.state import load_state
 from autoforge.transitions import Phase
@@ -9161,6 +9162,21 @@ def _tamper_section_and_body(data: dict) -> None:
     )
 
 
+def _tamper_composition(data: dict) -> None:
+    """The finding's resolution and the summary, each valid alone, and the body
+    re-rendered from them: the resolution leaves a fence open that the
+    summary's first fence closes, so the summary's mention is not code."""
+    finding = dict(_finding(1), required_resolution="Rename it:\n~~~")
+    res = ReviewResult.from_payload(
+        review_result(1, SHA_A, [finding], summary="See\n~~~\n@octocat\n~~~")
+    )
+    data["completion_context"]["findings"] = [f.to_dict() for f in res.findings]
+    data["completion_context"]["sections"] = res.sections
+    data["effect_records"][0]["payload"]["body"] = render_review_comment(
+        res, SHA_A, "main", MERGE_BASE
+    )
+
+
 @pytest.mark.parametrize(
     ("tamper", "needle"),
     [
@@ -9174,14 +9190,21 @@ def _tamper_section_and_body(data: dict) -> None:
             "sections.summary is invalid: REVIEW: field 'summary' contains an @-mention",
             id="section-and-body",
         ),
+        pytest.param(
+            _tamper_composition,
+            "a review comment the controller may not publish: the rendered 'review comment' "
+            "contains an @-mention",
+            id="fields-and-body-composed",
+        ),
     ],
 )
 def test_k4_a_persisted_body_altered_after_the_save_is_refused_and_never_posted(
     tmp_state_dir, fake_github, tamper, needle
 ):
     """The plan is journaled and the write never issued; the file is then edited
-    so that the K4 body carries an @-mention, alone or together with the
-    context's section it renders. Recovery posts the persisted body with no
+    so that the K4 body carries an @-mention, alone, together with the
+    context's section it renders, or composed of context fields each valid
+    alone (R2-F1). Recovery posts the persisted body with no
     reviewer result in between, so loading the state refuses it (ADR 0004
     D4.6): nothing is posted, the reviewer is not relaunched, and the file is
     left for the operator."""
@@ -9350,6 +9373,66 @@ def test_k4_prose_the_controller_would_publish_is_corrected_never_posted(
     assert "summary" in eng.provider.calls[1].prompt
     assert _review_posts(fake_github) == [("create_pr_comment", PR, _k4_body(1))]
     assert all(text not in c.body for c in fake_github.comments[PR])
+
+
+@pytest.mark.parametrize(
+    ("findings", "sections"),
+    [
+        pytest.param(
+            [
+                dict(_finding(1, 1), required_resolution="Rename it:\n~~~"),
+                dict(_finding(1, 2), required_resolution="See\n~~~\n@octocat\n~~~"),
+            ],
+            {},
+            id="a-fence-closed-by-the-next-finding",
+        ),
+        pytest.param(
+            [],
+            {"observations": "Logs:\n```", "verification": "Ran:\n```\n@octocat"},
+            id="a-fence-closed-by-the-next-section",
+        ),
+        pytest.param(
+            [dict(_finding(1), title="Use `@octocat`")],
+            {"verification": "<pre>"},
+            id="raw-html-beside-a-mention-in-code",
+        ),
+    ],
+)
+def test_k4_fields_that_compose_a_mention_outside_code_are_corrected_never_posted(
+    tmp_state_dir, fake_github, findings, sections
+):
+    """R2-F1, D8.2: every field passes the policy alone, but in the rendered
+    comment one field's fence or raw HTML leaves another's mention outside
+    code. The comment is judged as composed before anything is planned: a
+    correction, with nothing journaled or posted."""
+    hostile = block(review_result(1, SHA_A, findings, **sections))
+    eng = _in_review(tmp_state_dir, fake_github, [hostile, block(review_result(1, SHA_A))])
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    assert len(eng.provider.calls) == 2 and eng.provider.calls[1].correction
+    prompt = eng.provider.calls[1].prompt
+    assert "the rendered 'review comment' contains an @-mention" in prompt
+    assert _review_posts(fake_github) == [("create_pr_comment", PR, _k4_body(1))]
+    assert all("@octocat" not in c.body for c in fake_github.comments[PR])
+
+
+def test_k4_the_reviewers_code_stays_code_in_the_posted_comment(tmp_state_dir, fake_github):
+    """R2-F1: a title ending in an unpaired backtick and a resolution opening
+    with a fence are each a block of the comment, so the mention each holds
+    in code is still code once composed (as a list item it was not): the
+    result is accepted as returned and posted once."""
+    findings = [
+        dict(_finding(1, 1, "blocked"), title="A `", required_resolution="`@octocat`"),
+        dict(_finding(1, 2, "blocked"), required_resolution="~~~\n@octocat\n~~~"),
+    ]
+    eng = _in_review(tmp_state_dir, fake_github, [block(review_result(1, SHA_A, findings))])
+    assert eng.step().next_phase == "FIX"
+    assert len(eng.provider.calls) == 1
+    body = _k4_body(1, findings)
+    assert _review_posts(fake_github) == [("create_pr_comment", PR, body)]
+    assert "\n\nRequired resolution:\n\n`@octocat`\n\n" in body
+    assert "\n\nRequired resolution:\n\n~~~\n@octocat\n~~~\n\n" in body
+    before_marker = body.rsplit("\n\n", 1)[0]
+    assert published_markdown_problem("review comment", before_marker) is None
 
 
 def test_k4_an_oversized_rendered_comment_is_corrected_before_any_effect(

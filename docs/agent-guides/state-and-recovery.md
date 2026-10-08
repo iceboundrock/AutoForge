@@ -155,7 +155,9 @@ implementation marker), an `adopt_pr` block is that closing block, both
 PRs are in the issue's repository, the one `Closes #n` names, and a
 `review_comment` body is byte-for-byte the comment `review_comment_body`
 renders from the `REVIEW` context saved with it, at the HEAD, base and
-merge base its marker binds, so no text in it escaped the parser. The
+merge base its marker binds, and passes `review_comment_problem` as a
+whole, so no text in it, and no composition of its fields, escaped the
+parser. The
 existing body an `adopt_pr` appends to is a human's text and keeps only
 the append checks. A stored value the result path would have refused is a
 `StateError`, never rewritten. LOCAL

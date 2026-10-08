@@ -154,6 +154,7 @@ from .effects import (
     launch_label_for,
     progress_comment_body,
     review_comment_body,
+    review_comment_problem,
     sha256_text,
 )
 from .errors import (
@@ -7735,8 +7736,10 @@ class ControllerEngine:
         the controller bound; a mismatch is corrected, never followed (ADR
         0004 D8.1). The comment the controller renders from the result, with
         its own binding line and marker, must fit GitHub's comment limit
-        (D8.6) and pass the credential rule as a whole (D8.3): fields that
-        pass one by one can still join into a credential shape.
+        (D8.6) and pass the credential and mention rules as a whole (D8.2,
+        D8.3, :func:`review_comment_problem`): fields that pass one by one
+        can still join into a credential shape, or leave a fence that a
+        later field closes, so the mention after it is no longer code.
         """
         state = self._require_state()
         res = ReviewResult.from_payload(payload)
@@ -7759,7 +7762,9 @@ class ControllerEngine:
                 f"characters, over GitHub's limit of {MAX_BODY_CHARS}; nothing was posted. "
                 "Shorten the prose sections or the findings and re-emit the CONTROL_RESULT"
             )
-        problem = published_payload_problem("review comment", body)
+        problem = review_comment_problem(
+            res, head, state.current_base_ref, state.current_merge_base_sha
+        )
         if problem:
             raise ControlResultValidationError(f"REVIEW: {problem}")
         return res

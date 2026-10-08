@@ -256,9 +256,14 @@ correction retry with nothing posted:
   reviewer's), the findings, the prose sections under fixed headings, the
   needs-fix line and the marker, whose `needs_fix_round` and `finding_ids`
   come from the same result, so the comment cannot tell a different story
-  from the findings the controller persists. The whole body passes the
-  credential rule (D8.3) and fits GitHub's comment limit of 65,536
-  characters (D8.6); the per-finding bounds are unchanged.
+  from the findings the controller persists. Each finding is a heading
+  line (id, classification, location, title) followed by its required
+  resolution as a block of its own, at column 0 between blank lines, so
+  every field keeps the code spans and fences it was judged with alone.
+  The whole body passes the credential rule (D8.3), everything before the
+  marker passes the mention rule as composed (D8.2), and the body fits
+  GitHub's comment limit of 65,536 characters (D8.6); the per-finding
+  bounds are unchanged.
 
 Then, in order, all from one persisted plan:
 
@@ -268,10 +273,11 @@ Then, in order, all from one persisted plan:
    Otherwise the `review_comment` record (the rendered body) is saved with
    the completion context (the round, its verdict, its findings and the
    prose sections) in one save. Every load re-validates the findings and
-   sections under the parser's rules and requires the body to be exactly
-   the comment rendered from them at the revision the marker binds, so a
-   body edited on disk after the save is refused before recovery can post
-   it.
+   sections under the parser's rules, requires the body to be exactly
+   the comment rendered from them at the revision the marker binds, and
+   judges that comment as a whole again, so a body edited on disk after
+   the save, or a context whose fields compose a comment the result path
+   would have refused, is refused before recovery can post it.
 2. The record is driven: reconciled before anything is posted, then
    posted at most within its attempt bound. The read-back is one complete
    comment listing in which exactly one top-level comment carries the
@@ -661,6 +667,11 @@ it, when it contains:
 
 `published_payload_problem` applies the credential rule to a whole payload,
 so a credential split across fields is refused too.
+`published_markdown_problem` applies the mention rule to Markdown the
+controller composes from several fields (the review comment before its
+marker): a fence one field leaves open and a later field closes, or raw
+HTML in one field, can leave a mention outside code that each field alone
+kept in code.
 
 A commit the controller pushes is published too. Every commit of the range
 from the base to the candidate is read back by the transport and refused

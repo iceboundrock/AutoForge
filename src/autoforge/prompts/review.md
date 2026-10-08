@@ -147,9 +147,13 @@ Reviewed HEAD: `{{REVIEWED_HEAD_SHA}}` against base `{{REVIEWED_BASE_REF}}` (mer
 
 ## Findings
 
-- **R{{REVIEW_ROUND}}-F1** [blocked|non-blocked|nit] `<location>` — <title>
-  Required resolution: <required_resolution>
-(or "None." when there are no findings)
+### R{{REVIEW_ROUND}}-F1 [blocked|non-blocked|nit] `<location>` — <title>
+
+Required resolution:
+
+<required_resolution>
+
+(one such block per finding, or "None." when there are no findings)
 
 ## Spec
 
@@ -204,6 +208,13 @@ is rejected, and you are asked to correct it, when any of them contains:
 - an `@` that would mention a user or team outside a code span or a fenced
   block. Put such tokens in a code span (`` `@name` ``); `location` already
   is one.
+
+The rendered comment is judged as a whole too. Each field stands in a
+block of its own, but a fence one field leaves open runs on into the fields
+after it, so an `@` that is code in its own field may be outside code in the
+comment; and raw HTML outside code anywhere in the comment voids the code
+exemption for every `@` in it. Close every fenced block in the field that
+opens it.
 
 The comment as a whole must also fit GitHub's limit of
 {{MAX_REVIEW_COMMENT_CHARS}} characters; a result whose rendered comment is

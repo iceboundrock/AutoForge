@@ -2629,7 +2629,7 @@ def _edit_body(old, new):
             id="closing-keyword-in-a-finding",
         ),
         pytest.param(
-            _edit_body("**R1-F1** [blocked]", "**R1-F1** [blocked] thanks @octocat"),
+            _edit_body("### R1-F1 [blocked]", "### R1-F1 [blocked] thanks @octocat"),
             id="mention-in-a-finding-line",
         ),
         pytest.param(
@@ -2822,6 +2822,79 @@ def test_a_review_context_and_its_comment_round_trip_with_every_published_field(
     effects = load_state(p).phase_effects()
     assert effects.records == (record,) and effects.context == context
     assert effects.context.sections == sections
+
+
+def _review_plan(findings, sections=REVIEW_SECTIONS):
+    """A REVIEW state whose context and K4 body agree: only the rules can refuse it."""
+    record = _review_record(findings=findings, body=_review_body(findings, sections))
+    return _review_state(
+        effect_records=[record.to_dict()],
+        completion_context=_review_context(findings, sections).to_dict(),
+    ).to_dict()
+
+
+@pytest.mark.parametrize(
+    ("findings", "sections"),
+    [
+        pytest.param(
+            (
+                dict(FIX_FINDINGS[0], required_resolution="Rename it:\n~~~"),
+                dict(FIX_FINDINGS[1], required_resolution="See\n~~~\n@octocat\n~~~"),
+            ),
+            REVIEW_SECTIONS,
+            id="a-fence-closed-by-the-next-finding",
+        ),
+        pytest.param(
+            (FIX_FINDINGS[0],),
+            _sections_with(observations="Logs:\n```", verification="Ran:\n```\n@octocat"),
+            id="a-fence-closed-by-the-next-section",
+        ),
+        pytest.param(
+            (dict(FIX_FINDINGS[0], title="Use `@octocat`"),),
+            _sections_with(verification="<pre>"),
+            id="raw-html-beside-a-mention-in-code",
+        ),
+    ],
+)
+def test_a_review_plan_whose_fields_compose_a_mention_outside_code_is_refused(
+    tmp_path, findings, sections
+):
+    """#162 (R2-F1), D4.6: every field passes the parser's rules alone and the
+    body is exactly the context's rendering, but in the composed comment one
+    field's fence or raw HTML leaves another's mention outside code. The
+    result path refuses such a comment before planning it, so a saved plan
+    holding one was never accepted: loading it is refused, never replayed,
+    the message never quoting the text, and the file left unchanged."""
+    p = _write(tmp_path / "state.json", _review_plan(findings, sections))
+    before = p.read_bytes()
+    with pytest.raises(StateError) as exc:
+        load_state(p)
+    assert (
+        "REVIEW completion context is saved with a review comment the controller may not "
+        "publish: the rendered 'review comment' contains an @-mention" in str(exc.value)
+    )
+    assert "@octocat" not in str(exc.value)
+    assert p.read_bytes() == before
+
+
+def test_a_review_plan_keeps_each_fields_code_in_the_composed_comment(tmp_path):
+    """#162 (R2-F1): a title ending in an unpaired backtick and a resolution
+    that opens with a fence are blocks of their own in the comment, so the
+    mentions they hold stay code (in a list item they did not: the backtick
+    paired with the resolution's, and the prefix pushed the fence off its
+    column). The plan loads as saved."""
+    findings = (
+        dict(FIX_FINDINGS[0], title="A `", required_resolution="`@octocat`"),
+        dict(FIX_FINDINGS[1], required_resolution="~~~\n@octocat\n~~~"),
+    )
+    body = _review_body(findings)
+    assert "### R1-F1 [blocked] — A `\n\nRequired resolution:\n\n`@octocat`\n\n" in body
+    assert "### R1-F2 [blocked]\n\nRequired resolution:\n\n~~~\n@octocat\n~~~\n\n" in body
+    p = tmp_path / "state.json"
+    _write(p, _review_plan(findings))
+    effects = load_state(p).phase_effects()
+    assert effects.context == _review_context(findings)
+    assert effects.records[0].body == body
 
 
 def _set_finding(**change):

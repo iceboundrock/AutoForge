@@ -218,8 +218,11 @@ High-priority coverage includes:
   review tests): the controller renders the round's comment from the
   validated result, posts it and reads it back, and the reviewer posts
   nothing; a round or HEAD other than the bound one, prose or a finding the
-  published-content policy refuses, and a rendered comment over GitHub's
-  limit are corrections with nothing posted; a round comment the controller
+  published-content policy refuses, fields valid alone that compose a
+  mention outside code, and a rendered comment over GitHub's limit are
+  corrections with nothing posted, and a saved plan with such fields is
+  refused on load; a title's unpaired backtick and a resolution opening
+  with a fence keep their code in the posted comment; a round comment the controller
   did not journal blocks at the entry (nothing launched) and at the
   precondition read (nothing planned); a stale round still gets its
   comment; the entry fetches the bound HEAD and merge base, and a failed

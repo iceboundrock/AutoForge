@@ -41,6 +41,7 @@ from autoforge.result_parser import (
     _mention_problem,
     commit_message_problem,
     parse_control_result,
+    published_markdown_problem,
     published_payload_problem,
     published_text_problem,
     validate_for_phase,
@@ -1634,6 +1635,56 @@ def test_payload_is_judged_whole_for_credentials():
     # The payload check is the credential check only: the controller renders
     # the run's own closing keyword itself.
     assert published_payload_problem("PR body", "Body.\n\nCloses #5") is None
+
+
+@pytest.mark.parametrize(
+    ("fields", "composed"),
+    [
+        pytest.param(
+            ("A `", "`@octocat`"),
+            "- **R1-F1** [blocked] — A `\n  Required resolution: `@octocat`",
+            id="backtick-paired-across-fields",
+        ),
+        pytest.param(
+            ("A", "~~~\n@octocat\n~~~"),
+            "- **R1-F1** [blocked] — A\n  Required resolution: ~~~\n  @octocat\n  ~~~",
+            id="fence-behind-a-prefix",
+        ),
+        pytest.param(
+            ("Rename it:\n~~~", "See\n~~~\n@octocat\n~~~"),
+            "Rename it:\n~~~\n\n### R1-F2\n\nSee\n~~~\n@octocat\n~~~",
+            id="fence-closed-by-a-later-field",
+        ),
+        pytest.param(
+            ("<pre>", "Use `@octocat`."),
+            "<pre>\n\n## Summary\n\nUse `@octocat`.",
+            id="raw-html-before-a-later-field",
+        ),
+    ],
+)
+def test_markdown_composed_of_fields_is_judged_whole_for_mentions(fields, composed):
+    """#162, D8.2: each field passes the mention rule alone, but the Markdown
+    they compose shows the mention outside code (or beside raw HTML, where
+    the code exemption is not trusted): a backtick in one field pairs with
+    one in the next, a prefix pushes a fence off column 0, or one field's
+    fence or HTML block runs into the next. Named by index, never quoted."""
+    for field in fields:
+        assert published_text_problem("field", field) is None
+    msg = published_markdown_problem("review comment", composed)
+    assert msg is not None and "the rendered 'review comment' contains an @-mention" in msg
+    assert "each field may pass alone" in msg and "octocat" not in msg
+
+
+def test_markdown_with_its_mentions_in_code_passes_whole():
+    """Fields that are blocks of their own keep their code: a heading's
+    unpaired backtick ends with its line, a fence at column 0 is a fence."""
+    composed = (
+        "### R1-F1 [blocked] — A `\n\nRequired resolution:\n\n`@octocat`\n\n"
+        "### R1-F2 [nit]\n\nRequired resolution:\n\n~~~\n@octocat\n~~~\n\n"
+        "## Summary\n\nWrite a@b.c, then ```@pytest.fixture```."
+    )
+    assert published_markdown_problem("review comment", composed) is None
+    assert published_markdown_problem("review comment", "No mention at all.") is None
 
 
 @pytest.mark.parametrize(

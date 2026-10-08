@@ -35,7 +35,8 @@ D8.2, D8.3, D8.5): no controller marker opener of either prefix, no
 credential-shaped string (refused by the redactor's pattern class, never
 redacted), no closing keyword followed by an issue reference, and no
 ``@``-mention outside code. :func:`published_text_problem` judges one field,
-:func:`published_payload_problem` a whole rendered payload and
+:func:`published_payload_problem` a whole rendered payload,
+:func:`published_markdown_problem` the Markdown several fields compose and
 :func:`commit_message_problem` a commit message; each names the subject and
 the rule, never the text. An ANALYZE_EXECUTE result carries the PR title
 and body the controller publishes (``pr_title``, ``pr_body``), under that
@@ -566,8 +567,13 @@ def _outside(ranges: list[tuple[int, int]], positions: Iterable[int]) -> Iterato
         yield position
 
 
-def _mention_problem(subject: str, text: str) -> str | None:
-    """The refusal of the first ``@``-mention outside code in ``text``, if any."""
+def _exposed_mention(text: str) -> tuple[int, int | None] | None:
+    """The first ``@``-mention of ``text`` GitHub may read as one, if any.
+
+    ``(index, None)`` for a mention outside every code range; ``(index,
+    html)`` for the first mention, even one in code, when raw HTML stands
+    outside code at ``html``, where the code exemption is not trusted.
+    """
     mentions = [m.start() for m in _MENTION_RE.finditer(text)]
     if not mentions:
         return None
@@ -575,16 +581,27 @@ def _mention_problem(subject: str, text: str) -> str | None:
     outside = next(_outside(ranges, mentions), None)
     raw_html = next(_outside(ranges, (m.start() for m in _RAW_HTML_RE.finditer(text))), None)
     if raw_html is not None and outside != mentions[0]:
+        return mentions[0], raw_html
+    if outside is None:
+        return None
+    return outside, None
+
+
+def _mention_problem(subject: str, text: str) -> str | None:
+    """The refusal of the first ``@``-mention outside code in ``text``, if any."""
+    exposed = _exposed_mention(text)
+    if exposed is None:
+        return None
+    index, raw_html = exposed
+    if raw_html is not None:
         return (
-            f"{subject!r} contains an @-mention at index {mentions[0]} and raw HTML (a tag, "
+            f"{subject!r} contains an @-mention at index {index} and raw HTML (a tag, "
             f"comment or autolink) outside code at index {raw_html}; GitHub may read code "
             "near raw HTML as text, so the code exemption does not apply. Remove the HTML or "
             "the mention and re-emit the CONTROL_RESULT."
         )
-    if outside is None:
-        return None
     return (
-        f"{subject!r} contains an @-mention at index {outside} outside a code span or fenced "
+        f"{subject!r} contains an @-mention at index {index} outside a code span or fenced "
         "block; GitHub would notify that user or team. Put such tokens in code spans "
         "(`@name`) and re-emit the CONTROL_RESULT."
     )
@@ -644,6 +661,37 @@ def published_payload_problem(subject: str, payload: str) -> str | None:
         f"{', '.join(classes)}), although each field may pass alone: a field's end can join "
         "the text rendered after it. Published text is refused, never redacted; change the "
         "fields so that no credential shape remains and re-emit the CONTROL_RESULT."
+    )
+
+
+def published_markdown_problem(subject: str, markdown: str) -> str | None:
+    """Why the Markdown ``subject`` composed of several fields may not be published, or ``None``.
+
+    Judges the mention rule on the composition (ADR 0004 D8.2): fields that
+    pass one by one do not make Markdown that passes, because a field's
+    unclosed fence, unpaired backtick or raw HTML can change how GitHub
+    reads the text rendered after it (a fence one field leaves open is
+    closed by another's, and the mention that followed that fence is no
+    longer code). ``markdown`` is everything the controller renders before
+    its own marker, the one raw HTML it writes. Names the payload and an
+    index, never the text.
+    """
+    exposed = _exposed_mention(markdown)
+    if exposed is None:
+        return None
+    index, raw_html = exposed
+    where = (
+        f"and raw HTML (a tag, comment or autolink) outside code at index {raw_html}, near "
+        "which GitHub may read code as text"
+        if raw_html is not None
+        else "outside a code span or fenced block"
+    )
+    return (
+        f"the rendered {subject!r} contains an @-mention at index {index} {where}, although "
+        "each field may pass alone: an unclosed fence, an unpaired backtick or raw HTML in one "
+        "field changes how GitHub reads the fields rendered after it. Close every code span and "
+        "fenced block in the field that opens it, drop the raw HTML or the mention, and "
+        "re-emit the CONTROL_RESULT."
     )
 
 

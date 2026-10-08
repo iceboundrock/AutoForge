@@ -80,6 +80,8 @@ from .result_parser import (
     ReviewResult,
     check_published_finding,
     markdown_code_span,
+    published_markdown_problem,
+    published_payload_problem,
     validate_pr_body,
     validate_pr_title,
     validate_progress_text,
@@ -165,17 +167,10 @@ REVIEW_SECTION_HEADINGS: tuple[tuple[str, str], ...] = (
 )
 
 
-def review_comment_body(result: ReviewResult, head: str, base: str, merge_base: str) -> str:
-    """K4's payload (#162): the round's review comment, rendered from the validated result.
-
-    The heading, the binding line (``head``, ``base`` and ``merge_base`` are
-    the controller's binding of the round, never the reviewer's), the
-    findings, the needs-fix line and the marker are the controller's
-    rendering; the reviewer's prose sections stand under their fixed
-    headings. The marker's ``needs_fix_round`` and ``finding_ids`` and the
-    needs-fix line come from the same result, so they cannot disagree with
-    it or with each other.
-    """
+def _review_comment_parts(
+    result: ReviewResult, head: str, base: str, merge_base: str
+) -> tuple[str, str]:
+    """The round's review comment up to its marker, and the marker (#162)."""
     lines = [
         f"# AI Code Review — Round {result.round}",
         "",
@@ -183,22 +178,24 @@ def review_comment_body(result: ReviewResult, head: str, base: str, merge_base: 
         f"(merge base {markdown_code_span(merge_base)})",
         "",
         "## Findings",
-        "",
     ]
     for finding in result.findings:
-        line = f"- **{finding.id}** [{finding.classification}]"
+        heading = f"### {finding.id} [{finding.classification}]"
         if finding.location:
-            line += f" {markdown_code_span(finding.location)}"
+            heading += f" {markdown_code_span(finding.location)}"
         if finding.title:
-            line += f" — {finding.title}"
-        first, *rest = finding.required_resolution.split("\n")
-        lines.append(line)
-        lines.append(f"  Required resolution: {first}")
-        lines.extend(f"  {text}" if text else "" for text in rest)
+            heading += f" — {finding.title}"
+        # Every field is a block of its own, at column 0 between blank lines,
+        # so GitHub reads it in the context it was judged in alone: a title's
+        # unpaired backtick ends with its heading line, and a resolution's
+        # fence opens where the resolution starts.
+        lines.extend(["", heading, "", "Required resolution:", "", finding.required_resolution])
     if not result.findings:
-        lines.append("None.")
+        lines.extend(["", "None."])
     for key, heading in REVIEW_SECTION_HEADINGS:
         lines.extend(["", f"## {heading}", "", result.sections[key]])
+    verdict = "YES" if result.needs_fix_round else "NO"
+    lines.extend(["", f"Needs another fix round: {verdict}"])
     marker = render_review_marker(
         result.round,
         head,
@@ -207,9 +204,43 @@ def review_comment_body(result: ReviewResult, head: str, base: str, merge_base: 
         result.needs_fix_round,
         [finding.id for finding in result.findings],
     )
-    verdict = "YES" if result.needs_fix_round else "NO"
-    lines.extend(["", f"Needs another fix round: {verdict}", "", marker])
-    return "\n".join(lines)
+    return "\n".join(lines), marker
+
+
+def review_comment_body(result: ReviewResult, head: str, base: str, merge_base: str) -> str:
+    """K4's payload (#162): the round's review comment, rendered from the validated result.
+
+    The heading, the binding line (``head``, ``base`` and ``merge_base`` are
+    the controller's binding of the round, never the reviewer's), the
+    findings' layout, the needs-fix line and the marker are the controller's
+    rendering; each finding's title, location and required resolution, and
+    the reviewer's prose sections under their fixed headings, are blocks of
+    their own. The marker's ``needs_fix_round`` and ``finding_ids`` and the
+    needs-fix line come from the same result, so they cannot disagree with
+    it or with each other.
+    """
+    text, marker = _review_comment_parts(result, head, base, merge_base)
+    return f"{text}{APPEND_SEPARATOR}{marker}"
+
+
+def review_comment_problem(
+    result: ReviewResult, head: str, base: str, merge_base: str
+) -> str | None:
+    """Why the comment :func:`review_comment_body` renders may not be published, or ``None``.
+
+    Each field passed the published-content policy alone
+    (``check_published_finding``, ``validate_review_section``); the comment
+    is judged as a whole too, because fields join (#162). The credential rule
+    applies to the whole body (D8.3), and the mention rule to everything
+    before the controller's marker (D8.2): one field's unclosed fence or raw
+    HTML can make a later field's code text. Judged before the result is
+    accepted and again when a saved plan is loaded, so recovery never posts
+    a comment the result path would have refused.
+    """
+    text, marker = _review_comment_parts(result, head, base, merge_base)
+    return published_payload_problem(
+        "review comment", f"{text}{APPEND_SEPARATOR}{marker}"
+    ) or published_markdown_problem("review comment", text)
 
 
 def implementation_closing_block(issue_url: str) -> str:
@@ -1344,9 +1375,11 @@ class ReviewContext:
     comment's marker is the context's verdict: the same round, the same
     ``needs_fix_round`` and the findings' ids in the same order (#162).
     The comment's body is exactly what :func:`review_comment_body` renders
-    from the context at the revision the marker binds, so every published
-    field of a body that recovery posts was validated under the parser's
-    rules when the state was loaded, not only when the result was accepted.
+    from the context at the revision the marker binds, and passes
+    :func:`review_comment_problem` as a whole, so every published field of a
+    body that recovery posts, and their composition, was validated under the
+    parser's rules when the state was loaded, not only when the result was
+    accepted.
     """
 
     issue_url: str
@@ -1440,18 +1473,23 @@ class ReviewContext:
             findings=parsed_findings,
             sections=sections,
         )
-        rendered = review_comment_body(
-            result,
+        binding_args = (
             claim.reviewed_head_sha,
             claim.reviewed_base_ref or "",
             claim.reviewed_merge_base_sha or "",
         )
-        if record.body != rendered:
+        if record.body != review_comment_body(result, *binding_args):
             _fail(
                 what,
                 "is saved with a review comment whose body is not the comment the controller "
                 "renders from it",
             )
+        # Fields valid one by one can still compose a comment the result path
+        # refuses (an unclosed fence closed by a later field's); such a plan
+        # was never accepted, so it is refused, never replayed.
+        problem = review_comment_problem(result, *binding_args)
+        if problem:
+            _fail(what, f"is saved with a review comment the controller may not publish: {problem}")
         return cls(data["issue_url"], data["pr_url"], round_, needs_fix, tuple(findings), sections)
 
     @staticmethod

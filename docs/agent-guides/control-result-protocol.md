@@ -98,9 +98,11 @@ section and every finding's `title`, `location` (judged as the code span
 the comment renders it in) and `required_resolution` pass the
 published-content policy (`published_text_problem`;
 [github-safety.md](github-safety.md), "Published content"), and the rendered
-comment as a whole must pass the credential rule and fit GitHub's comment
-limit (ADR 0004 D8.3, D8.6); a refusal is a correction with nothing
-posted. A LOCAL `REVIEW` is unchanged: it carries no prose sections and
+comment as a whole must pass the credential rule, pass the mention rule
+before its marker (`published_markdown_problem`: one field's unclosed fence
+or raw HTML can leave another field's mention outside code), and fit
+GitHub's comment limit (ADR 0004 D8.2, D8.3, D8.6); a refusal is a
+correction with nothing posted. A LOCAL `REVIEW` is unchanged: it carries no prose sections and
 publishes nothing.
 
 ### Review invariant
