@@ -53,6 +53,7 @@ from autoforge.effect_ops import (
     raise_conflict,
 )
 from autoforge.effects import (
+    APPEND_SEPARATOR,
     MAX_BODY_CHARS,
     MAX_CONFLICT_REASON_CHARS,
     MAX_EFFECT_ATTEMPTS,
@@ -68,9 +69,11 @@ from autoforge.effects import (
     FixContext,
     Stage,
     compose_append,
+    follow_up_issue_body,
     implementation_closing_block,
     load_phase_effects,
     load_records,
+    payload_chars,
     plan_size_problem,
     progress_comment_body,
     sha256_text,
@@ -87,7 +90,11 @@ from autoforge.executor import ExecutionRequest, ExecutionResult, execute
 from autoforge.git_transport import GitRemote, GitTransport
 from autoforge.github import GitHubClient
 from autoforge.replan_txn import ReplanAttestation, render_marker
-from autoforge.result_parser import MAX_FINDINGS_PER_REVIEW, MAX_PR_BODY_CHARS
+from autoforge.result_parser import (
+    MAX_FINDINGS_PER_REVIEW,
+    MAX_FOLLOW_UP_BODY_CHARS,
+    MAX_PR_BODY_CHARS,
+)
 from autoforge.transitions import Phase
 from tests.conftest import (
     BRANCH,
@@ -226,7 +233,11 @@ def follow_up_record(
         precondition={"absent": True, "watermark": watermark},
         payload={
             "title": f"Follow-up: {finding_id} of PR #42",
-            "body": f"Deferred {finding_id} of {PR}.\n\n{marker}" if body is None else body,
+            "body": (
+                follow_up_issue_body(f"The deferred part of {finding_id}.", PR, finding_id)
+                if body is None
+                else body
+            ),
         },
     )
 
@@ -1058,6 +1069,56 @@ CORRUPTIONS = [
         ),
         "carries a marker for another PR than its owner's",
     ),
+    # K5's text (#163): the reference and marker are the controller's, exactly,
+    # and the title and the body text before them get the FIX parser's rules
+    # again, because a resumed create publishes them with no result between.
+    _p(
+        "k5-repo-of-another-pr",
+        FOLLOW,
+        both(at("identity.repository", "owner/other"), at("target.repository", "owner/other")),
+        "in another repository than its owner's PR",
+    ),
+    _p(
+        "k5-body-without-the-reference",
+        FOLLOW,
+        at("payload.body", f"Deferred.{APPEND_SEPARATOR}{FOLLOW_UP_MARKER}"),
+        "not its text, the controller's reference to its PR and finding, and its marker",
+    ),
+    _p(
+        "k5-reference-to-another-finding",
+        FOLLOW,
+        at(
+            "payload.body",
+            follow_up_issue_body("Deferred.", PR, "R1-F2").replace(
+                render_follow_up_marker(PR, "R1-F2"), FOLLOW_UP_MARKER
+            ),
+        ),
+        "not its text, the controller's reference to its PR and finding, and its marker",
+    ),
+    _p(
+        "k5-title-mention",
+        FOLLOW,
+        at("payload.title", "Ask @octocat"),
+        "has an invalid follow-up title",
+    ),
+    _p(
+        "k5-title-not-stripped",
+        FOLLOW,
+        at("payload.title", " Follow-up "),
+        "follow-up title that is not in the parser's stored form",
+    ),
+    _p(
+        "k5-body-text-closes-an-issue",
+        FOLLOW,
+        at("payload.body", follow_up_issue_body("Closes #3", PR, "R1-F1")),
+        "has an invalid follow-up body",
+    ),
+    _p(
+        "k5-body-text-blank",
+        FOLLOW,
+        at("payload.body", follow_up_issue_body("", PR, "R1-F1")),
+        "has an invalid follow-up body",
+    ),
     _p("k5-watermark-negative", FOLLOW, at("precondition.watermark", -1), "must be >= 0"),
     _p("k5-watermark-bool", FOLLOW, at("precondition.watermark", True), "must be an integer"),
     _p(
@@ -1230,10 +1291,17 @@ def _body_of_length(length: int, marker: str = IMPL_MARKER) -> str:
 def test_field_bounds_are_inclusive():
     """Each field holds exactly its bound and refuses one character more."""
     assert len(impl_record(title="t" * MAX_TITLE_CHARS).payload["title"]) == MAX_TITLE_CHARS
-    longest = follow_up_record(body=_body_of_length(MAX_BODY_CHARS, FOLLOW_UP_MARKER))
-    assert len(longest.body) == MAX_BODY_CHARS
+    marker_line = render_follow_up_marker(PR, "R1-F1")
+    base = "x" * (MAX_BODY_CHARS - len(APPEND_SEPARATOR) - len(marker_line))
+    assert len(append_record(base=base).body) == MAX_BODY_CHARS
     with pytest.raises(StateError, match=f"over its bound of {MAX_BODY_CHARS}"):
-        follow_up_record(body=_body_of_length(MAX_BODY_CHARS + 1, FOLLOW_UP_MARKER))
+        append_record(base=base + "x")
+    # K5's body is the agent's text, at most the parser's bound, then the
+    # controller's reference to the PR and finding and the marker (#163).
+    text = "x" * MAX_FOLLOW_UP_BODY_CHARS
+    assert follow_up_record(body=follow_up_issue_body(text, PR, "R1-F1")).body.startswith(text)
+    with pytest.raises(StateError, match=f"is {MAX_FOLLOW_UP_BODY_CHARS + 1} characters"):
+        follow_up_record(body=follow_up_issue_body(text + "x", PR, "R1-F1"))
     # K2's body is the agent's text, at most the parser's bound, then the closing block.
     text = "x" * MAX_PR_BODY_CHARS
     assert impl_record(body=f"{text}\n\n{CLOSING}").body.startswith(text)
@@ -1399,7 +1467,7 @@ def _maximal_follow_ups(count: int) -> list[dict]:
         follow_up_record(
             finding_id=f"R1-F{i}",
             position=i - 1,
-            body=_body_of_length(MAX_BODY_CHARS, render_follow_up_marker(PR, f"R1-F{i}")),
+            body=follow_up_issue_body("x" * MAX_FOLLOW_UP_BODY_CHARS, PR, f"R1-F{i}"),
         )
         for i in range(1, count + 1)
     ]
@@ -1409,7 +1477,8 @@ def _maximal_follow_ups(count: int) -> list[dict]:
 def test_the_total_size_bound_counts_payloads_and_the_context():
     """D2.4: payloads plus the context's stored bound stay under MAX_EFFECT_STATE_CHARS."""
     room = MAX_EFFECT_STATE_CHARS - FixContext.STORED_BOUND
-    over = room // MAX_BODY_CHARS + 1
+    largest = payload_chars([EffectRecord.from_dict(_maximal_follow_ups(1)[0])])
+    over = room // largest + 1
     assert over <= MAX_EFFECTS_PER_PLAN
     fits = load_phase_effects(_maximal_follow_ups(over - 1), {}, FIX_CONTEXT, FIX_BINDING)
     assert len(fits.records) == over - 1

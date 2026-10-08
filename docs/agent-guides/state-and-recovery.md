@@ -107,7 +107,14 @@ A REMOTE run also records the effect state of the current phase entry (ADR
   the roadmap section, the validated selection, the digests of the EPIC body
   outside the markers, and which input a persisted rejection voided. For
   `ANALYZE_EXECUTE` (#161) it is only the issue: the push and PR records
-  carry everything the completion needs.
+  carry everything the completion needs. For `FIX` (#163) it is the round
+  and one resolution per open finding: the redacted rationale, the commit
+  the fixer named, and the follow-up source of a deferred finding (`entry`
+  for the follow-up the entry handed over and the fixer reused, or the plan
+  position of the `follow_up_issue` or `follow_up_append` record that
+  records the deferral). The plan holds the creates first, then the
+  appends, then the `push` of the candidate, last, when the fixer
+  committed.
 - `launch_label` (D13.3): whether the current entry's launches ran under the
   agent-publishes or the controller-publishes contract of its phase.
 
@@ -145,11 +152,21 @@ invariance: the `UPDATE_EPIC` roadmap section in the
 completion context (`validate_roadmap_section`), the progress text of a
 progress-comment record (`validate_progress_text`), the title and the
 agent's part of the body of an `implementation_pr` record
-(`validate_pr_title`, `validate_pr_body`), and the findings and prose
+(`validate_pr_title`, `validate_pr_body`), the findings and prose
 sections of a `REVIEW` completion context (`check_published_finding`,
-`validate_review_section`), in the stripped form the parser returns.
+`validate_review_section`), and the title and the fixer's part of the body
+of a `follow_up_issue` record (`validate_follow_up_title`,
+`validate_follow_up_body`), in the stripped form the parser returns. A
+`FIX` completion context loads only for the round being fixed, with
+exactly one resolution per open finding, and each deferred finding has
+exactly one source the plan and the entry observation explain: a finding
+whose follow-up the observation recorded reuses it through `entry` and is
+in no append block; any other names a create of its own marker or an
+append whose block carries it.
 Controller text stored with them is checked to be exactly what the
-controller renders: an `implementation_pr` body ends in a blank line and
+controller renders: a `follow_up_issue` body is the fixer's text, the
+controller's reference to the PR and finding and the finding's marker, in
+the repository of its owner's PR; an `implementation_pr` body ends in a blank line and
 the closing block of its owner's issue (`Closes #n`, a blank line, the
 implementation marker), an `adopt_pr` block is that closing block, both
 PRs are in the issue's repository, the one `Closes #n` names, and a
@@ -235,7 +252,7 @@ Examples:
 
 Resume logic must inspect actual Git/GitHub state before repeating destructive or duplicative actions.
 
-A controller effect (ADR 0004) is resumed from its record and never re-sent blind. Every crash window has one answer: a crash before the intent is saved means nothing happened and the step re-runs; an `intended` or `attempted` record is reconciled by its identity before anything is sent, so a write that landed before the save is adopted as `observed` (no second write) and one that did not is issued again within the attempt bound; an object that a human created or changed between the intent and the write, a conflicting identity, or two marker-bearing objects make the record `conflict` (`BLOCKED`, naming the object); an exhausted bound is `BLOCKED` naming the record and the manual step; and a transient GitHub failure during reconciliation leaves the state unchanged for `resume`. A phase whose effect landed finishes from its completion context without relaunching its agent. The run log's `events.jsonl` is never read by any recovery path.
+A controller effect (ADR 0004) is resumed from its record and never re-sent blind. Every crash window has one answer: a crash before the intent is saved means nothing happened and the step re-runs; an `intended` or `attempted` record is reconciled by its identity before anything is sent, so a write that landed before the save is adopted as `observed` (no second write) and one that did not is issued again within the attempt bound; an object that a human created or changed between the intent and the write, a conflicting identity, or two marker-bearing objects make the record `conflict` (`BLOCKED`, naming the object); an exhausted bound is `BLOCKED` naming the record and the manual step; and a transient GitHub failure during reconciliation leaves the state unchanged for `resume`. A phase whose effect landed finishes from its completion context without relaunching its agent. `FIX` (#163) is the case with the most windows, and each has one outcome: a crash before the plan is saved sent nothing, so `resume` launches the fixer again, against the entry observation saved before the first launch (a follow-up issue found later that it does not explain blocks); a crash after the plan is saved, at any stage of any create, append or push, completes the plan from the journal without relaunching the fixer, each record adopted or issued at most once in plan order; a PR head at the planned candidate is the controller's own push and never takes a `REVIEW` detour; and a head that is neither the reviewed HEAD nor the candidate is someone else's push (`FIX -> REVIEW`, the plan dropped, no fix recorded). The run log's `events.jsonl` is never read by any recovery path.
 
 If recovery cannot determine the safe state with sufficient confidence, enter `BLOCKED` rather than guessing.
 

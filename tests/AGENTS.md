@@ -35,11 +35,19 @@ read it before adding tests for a listed area.
   else posted: an earlier round's evidence for a test that starts past
   `REVIEW`, or an unjournaled comment that blocks the round. Reuse these
   rather than hand-rolling fakes.
-- `REVIEW` fetches the bound HEAD and merge base before launching the
-  reviewer. An engine without an origin records that fetch in the
-  `offline_fetches` fixture and fetches nothing; with `origin=True` it
-  fetches from the origin, so a `FIX` there pushes a real commit
-  (`push_fix`) rather than setting a fake HEAD.
+- `REVIEW` and `FIX` fetch the bound HEAD (and `REVIEW` the merge base)
+  before launching the agent. An engine without an origin records that
+  fetch in the `offline_fetches` fixture and fetches nothing; with
+  `origin=True` it fetches from the origin.
+- The controller publishes `FIX` itself (#163): the fixer commits on its
+  worktree's detached `HEAD` and the controller creates the follow-up
+  issues, appends the markers and pushes the commit. A test that reaches
+  `FIX`'s publication builds its engine with `origin=True` and starts the
+  PR at a real commit (`publish_pr_head`; a human's push to the PR branch
+  is the same helper). `fixer(...)` is the fixer (one commit on the
+  reviewed HEAD, or none with `commit=False`, then the result), answering
+  with resolutions built by `fixed`, `new_follow_up`, `deferred_to` and
+  `no_change`; `fix_commit` and `fix_payload` build a handler by hand.
 - The controller pushes the implementation commit itself (#161), so a
   REMOTE test that reaches `ANALYZE_EXECUTE`'s publication builds its engine
   with `make_engine(..., origin=True)`: an `Origin` is a seeded bare

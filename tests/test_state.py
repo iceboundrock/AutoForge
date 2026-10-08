@@ -26,6 +26,7 @@ from autoforge.effects import (
     Stage,
     UpdateEpicContext,
     compose_append,
+    follow_up_issue_body,
     payload_chars,
     progress_comment_body,
     review_comment_body,
@@ -1676,7 +1677,10 @@ def _follow_up_record(position, finding_id, *, text="Deferred from review round 
         identity={"repository": "owner/repo", "marker": marker},
         target={"repository": "owner/repo"},
         precondition={"absent": True, "watermark": 41},
-        payload={"title": f"Follow-up for {finding_id}", "body": f"{text}\n\n{marker}"},
+        payload={
+            "title": f"Follow-up for {finding_id}",
+            "body": follow_up_issue_body(text, PR42, finding_id),
+        },
     )
 
 
@@ -3001,8 +3005,8 @@ def test_effect_records_over_the_per_plan_count_are_refused(tmp_path):
 
 
 def _big_fix_state(count):
-    """A FIX entry deferring ``count`` findings, each to a ~62K-character follow-up."""
-    filler = "word " * 12_400
+    """A FIX entry deferring ``count`` findings, each to a ~60K-character follow-up."""
+    filler = "word " * 12_000
     records = [_follow_up_record(i, f"R1-F{i + 1}", text=filler.rstrip()) for i in range(count)]
     context = _fix_context([(f"R1-F{i + 1}", "follow_up_created", "", i) for i in range(count)])
     state = make_state(
@@ -3025,13 +3029,13 @@ def test_effect_state_over_the_total_character_bound_is_refused(tmp_path):
     """D2.4: the plan's payload characters plus its context's stored bound stay
     within MAX_EFFECT_STATE_CHARS. One more follow-up than fits is refused on
     load with the total named; the plan just under the bound loads."""
-    fits, fits_total = _big_fix_state(11)
-    over, over_total = _big_fix_state(12)
+    fits, fits_total = _big_fix_state(12)
+    over, over_total = _big_fix_state(13)
     assert fits_total <= MAX_EFFECT_STATE_CHARS < over_total
 
     p = tmp_path / "fits.json"
     save_state(fits, p)
-    assert len(load_state(p).phase_effects().records) == 11
+    assert len(load_state(p).phase_effects().records) == 12
 
     p = tmp_path / "over.json"
     save_state(over, p)
@@ -3141,7 +3145,7 @@ def test_a_legacy_remote_resume_is_labelled_by_the_contract_it_launched_under(
     ``agent_publishes``; before a launch, or outside a publishing phase, it gets
     no label. The label survives the save that relabels the file. A legacy
     re-entry is one into a phase the controller now publishes for: UPDATE_EPIC
-    (#160), ANALYZE_EXECUTE (#161) and REVIEW (#162)."""
+    (#160), ANALYZE_EXECUTE (#161), REVIEW (#162) and FIX (#163)."""
     from autoforge.effects import is_legacy_reentry
 
     p = _write(
@@ -3152,7 +3156,8 @@ def test_a_legacy_remote_resume_is_labelled_by_the_contract_it_launched_under(
     assert loaded.launch_label == label
     assert loaded.phase_effects().empty
     assert is_legacy_reentry(loaded.phase, loaded.attempt, loaded.launch_label) == (
-        phase in (Phase.ANALYZE_EXECUTE, Phase.REVIEW, Phase.UPDATE_EPIC) and attempt >= 1
+        phase in (Phase.ANALYZE_EXECUTE, Phase.REVIEW, Phase.FIX, Phase.UPDATE_EPIC)
+        and attempt >= 1
     )
     save_state(loaded, p)
     assert json.loads(p.read_text(encoding="utf-8"))["launch_label"] == label

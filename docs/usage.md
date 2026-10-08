@@ -73,7 +73,7 @@ never advances the state machine. In brief:
 | `INITIALIZING` | controller | cwd repo == issue repo, issue is in this repo, is not the EPIC, exists and is OPEN |
 | `ANALYZE_EXECUTE` | Claude Code (`analyze_execute`), which makes no GitHub write | an open PR already carrying the issue's `ai-implementation` marker is adopted without running the agent (two block); the agent commits on its worktree's detached HEAD, and the controller checks that HEAD itself (the reported SHA, descent from the default branch head and from the branch head, every commit message), pushes it to `autoforge/<n>`, opens the PR with the agent's title and body (or adopts the open unmarked PR on that branch), journalling each write before it is sent, and reads the PR back at exactly the pushed HEAD; a marker PR or a branch head it did not write blocks |
 | `REVIEW` | OpenCode (`review_round_1`, `review_round_2_5`, `review_round_6_plus`), which makes no GitHub write | the round is bound to the PR, HEAD, base and merge base read from GitHub, and a comment already carrying that round's marker blocks (the controller never adopts one it did not post); the reviewer's round and HEAD must match the binding and `needs_fix_round == (len(findings) > 0)`; the controller renders the review comment from the result, journals it, posts it and reads it back, so a crash or `resume` never posts a second one; then controller policy picks `FIX`, `READY_FOR_MERGE`, `REPLAN_REEXECUTE` or `BLOCKED` |
-| `FIX` | Claude Code (`fix`) | the PR is still at the reviewed revision (else back to `REVIEW` without running the fixer); every open finding resolved; a `fixed` resolution moved HEAD; a claimed follow-up issue exists and is OPEN |
+| `FIX` | Claude Code (`fix`), which makes no GitHub write | the PR is still at the reviewed revision (else back to `REVIEW` without running the fixer); the open issues already marked as a finding's follow-up are handed to the fixer to reuse, and one the controller did not hand over or create blocks; the fixer commits on its worktree's detached HEAD and resolves every open finding exactly once, and the controller checks that HEAD itself (the reported SHA, descent from the reviewed HEAD, every commit message, a commit for each `fixed` finding); it creates the follow-up issues the fixer asks for, appends the finding markers to the handed-over issues it defers to, then pushes the commit last, journalling each write before it is sent, and reads the follow-ups and the PR head back, so a crash or `resume` never creates or pushes twice; a push it did not make sends the PR back to `REVIEW` |
 | `REPLAN_REEXECUTE` | OpenCode (`replan_reexecute`) | one durable transaction; the replacement PR is found only by the controller's transaction marker, and the old PR is closed by the controller only while both PRs still match their checkpoints |
 | `READY_FOR_MERGE` | nobody | holding state; with the merge gate open, the full pre-merge verification runs before `MERGE` is entered |
 | `MERGE` (gated) | controller, never an agent | `gh pr merge --match-head-commit <reviewed HEAD>`, counted only once GitHub reports `MERGED` at that HEAD into the reviewed base |
@@ -169,7 +169,24 @@ reviewer of an earlier AutoForge version posted) or appeared while it ran:
 the controller never adopts, edits or duplicates it. Delete the comment or
 its marker, then `unblock`, and the round runs (or, when the reviewer's
 result was already accepted, its comment is posted from the plan without
-running the reviewer again). A LOCAL
+running the reviewer again). `FIX` blocks on follow-up issues it did not
+write: two open issues carrying one finding's follow-up marker, or an
+unreadable follow-up marker on any open issue (close or repair the extra
+or unreadable issue, then `unblock`); a follow-up issue that appeared or
+disappeared while the fixer ran (if it is the finding's follow-up,
+`unblock` starts a fresh entry that hands it to the fixer; otherwise close
+it or remove its marker first); an issue a deferral names that is no
+longer open or has moved to another repository (reopen it, or `unblock`
+to run the fixer afresh); an issue whose body now holds something shaped
+like a credential, so the marker cannot be appended to it (remove it, then
+`unblock`); a reused follow-up issue that is no longer the one open issue
+carrying its finding's marker; and a write that conflicts after the plan
+was saved (reopen the follow-up issue the controller created, put the
+issue body back, or leave the PR branch at the reviewed HEAD or the
+planned commit, then `unblock`: the plan completes without running the
+fixer again). A push to the PR branch the controller did not make, before
+or after the fixer ran, is not a block: the PR goes back to `REVIEW` of the
+pushed HEAD. A LOCAL
 run cannot be unblocked. The decision table is in
 [Workflow: leaving BLOCKED](agent-guides/workflow.md#leaving-blocked-the-operators-unblock).
 

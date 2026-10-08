@@ -97,7 +97,7 @@ import json
 import os
 import re
 import secrets
-from collections.abc import Callable, Hashable, Iterator
+from collections.abc import Callable, Hashable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -139,19 +139,24 @@ from .effect_ops import (
     operation_for,
 )
 from .effects import (
+    FOLLOW_UP_SOURCE_ENTRY,
     MAX_BODY_CHARS,
+    MAX_EFFECT_STATE_CHARS,
     AnalyzeContext,
     EffectKind,
     EffectOwner,
     EffectRecord,
     EntryObservation,
+    FixContext,
     ReviewContext,
     Stage,
     UpdateEpicContext,
     compose_append,
+    follow_up_issue_body,
     implementation_closing_block,
     is_legacy_reentry,
     launch_label_for,
+    plan_size_problem,
     progress_comment_body,
     review_comment_body,
     review_comment_problem,
@@ -182,7 +187,13 @@ from .executor import (
     ExecutionRequest,
     execute,
 )
-from .git_transport import GitRemote, GitTransport, local_git_request, published_range_problem
+from .git_transport import (
+    GitRemote,
+    GitTransport,
+    local_git_request,
+    published_range_problem,
+    valid_branch_name,
+)
 from .github import (
     CommentInfo,
     GitHubClient,
@@ -264,6 +275,8 @@ from .result_parser import (
     MAX_FINDING_TITLE_CHARS,
     MAX_FINDINGS_PER_REVIEW,
     MAX_FIX_RATIONALE_CHARS,
+    MAX_FOLLOW_UP_BODY_CHARS,
+    MAX_FOLLOW_UP_TITLE_CHARS,
     MAX_PR_BODY_CHARS,
     MAX_PR_TITLE_CHARS,
     MAX_PROGRESS_CHARS,
@@ -273,6 +286,7 @@ from .result_parser import (
     MAX_ROADMAP_SECTION_CHARS,
     MIN_RATIONALE_CHARS,
     AnalyzeExecuteResult,
+    FindingResolution,
     FixResult,
     LocalAnalyzeExecuteResult,
     LocalFixResult,
@@ -350,6 +364,8 @@ FIX_BOUND_VARIABLES: dict[str, str | int | None] = {
     "MAX_RESOLUTIONS_PER_FIX": MAX_RESOLUTIONS_PER_FIX,
     "MAX_FIX_RATIONALE_CHARS": MAX_FIX_RATIONALE_CHARS,
     "MIN_RATIONALE_CHARS": MIN_RATIONALE_CHARS,
+    "MAX_FOLLOW_UP_TITLE_CHARS": MAX_FOLLOW_UP_TITLE_CHARS,
+    "MAX_FOLLOW_UP_BODY_CHARS": MAX_FOLLOW_UP_BODY_CHARS,
 }
 
 # How many times one LOCAL phase entry may launch a write-capable agent
@@ -644,8 +660,10 @@ _REMOTE_REENTRY_RECONCILIATION: dict[Phase, str] = {
         "did not journal, instead of relaunching the reviewer"
     ),
     Phase.FIX: (
-        "routes a HEAD already pushed past the reviewed one back to REVIEW instead of "
-        "relaunching the fixer"
+        "completes the follow-up issues, marker appends and push from the persisted plan when "
+        "it was saved, and otherwise routes a HEAD already pushed past the reviewed one back "
+        "to REVIEW and refuses a follow-up issue it did not journal, instead of relaunching "
+        "the fixer"
     ),
     Phase.REPLAN_REEXECUTE: "replays the persisted replan transaction",
     Phase.UPDATE_EPIC: (
@@ -706,9 +724,11 @@ class ControllerEngine:
         self._local_resumed_invocation = False
         # Likewise for the FIX entry: the open follow-up issues it found
         # already carrying a marker for one of the open findings (rendered
-        # into ``FOLLOW_UP_ISSUES``). Re-derived from GitHub on every entry,
-        # never persisted.
+        # into ``FOLLOW_UP_ISSUES``), and the candidate its result check
+        # accepted (#163). Re-derived on every entry, never persisted: the
+        # entry observation and the completion context are what persist.
         self._existing_follow_ups: dict[str, str] = {}
+        self._fix_candidate = ""
         # The progress comment an UPDATE_EPIC entry adopted without a record:
         # posted by an agent under the previous contract (ADR 0004 D13.7), or
         # recorded as pre-existing by the entry observation of that adoption.
@@ -1386,22 +1406,20 @@ class ControllerEngine:
 
     @staticmethod
     def _format_follow_ups(pr_url: str, findings: list[dict], existing: dict[str, str]) -> str:
-        """Per open finding: its follow-up marker and the follow-up issue that exists.
+        """Per open finding: the follow-up issue that already exists, if any.
 
         Controller-rendered, not agent text: the finding ids passed the
-        parser's shape check (``R<n>-F<m>``), the marker is built by
-        :func:`render_follow_up_marker` and the URLs come from GitHub.
+        parser's shape check (``R<n>-F<m>``) and the URLs come from GitHub.
+        No marker is rendered (#163): the controller writes every follow-up
+        marker itself, so the fixer has none to copy.
         """
         if not pr_url or not findings:
             return "(none)"
         lines = []
         for f in findings:
             fid = str(f.get("id"))
-            marker = render_follow_up_marker(pr_url, fid)
             url = existing.get(fid, "(none)")
-            lines.append(
-                f"- {escape_inline(fid)}: marker `{marker}`; existing issue: {escape_inline(url)}"
-            )
+            lines.append(f"- {escape_inline(fid)}: existing issue: {escape_inline(url)}")
         return "\n".join(lines)
 
     @staticmethod
@@ -1458,6 +1476,26 @@ class ControllerEngine:
             f"Review round {s.review_round} at HEAD `{s.reviewed_head_sha}` "
             f"({s.last_review_comment_url or 'comment URL not recorded'}) reported these "
             "findings, and no FIX round resolved them:\n" + self._format_findings(s.prior_findings)
+        )
+
+    def _format_previous_fix_resolutions(self) -> str:
+        """The last FIX round's resolutions, for the next REVIEW prompt (#163, D5.3).
+
+        The fixer no longer replies on the PR; its verified resolutions are
+        handed to the reviewer as data instead. The finding ids, resolutions,
+        commit SHAs and follow-up URLs are controller-verified, the rationales
+        are the fixer's (redacted) text, so the whole list is quoted through
+        the unclosable fence.
+        """
+        s = self._require_state()
+        if not s.last_fix_resolutions:
+            return "(none)"
+        return (
+            "The controller verified these against the commits it pushed and the follow-up "
+            "issues it read back; each rationale is the fixer's text:\n"
+            + fenced_untrusted_block(
+                json.dumps(s.last_fix_resolutions, indent=2, ensure_ascii=False), "json"
+            )
         )
 
     def _validation_commands_text(self) -> str:
@@ -1565,6 +1603,7 @@ class ControllerEngine:
             "REVIEWED_MERGE_BASE_SHA": reviewed_merge_base or "(none)",
             "FINDINGS": self._format_findings(s.open_findings),
             "PRIOR_FINDINGS": self._format_prior_findings(),
+            "PREVIOUS_FIX_RESOLUTIONS": self._format_previous_fix_resolutions(),
             "MERGED_SINCE_EPIC_UPDATE": s.merged_since_epic_update,
             "EPIC_UPDATE_EVERY": self.config.workflow.epic_update_every,
             "MERGED_PRS_SINCE_EPIC_UPDATE": self._format_merged_since_epic_update(s),
@@ -1810,6 +1849,8 @@ class ControllerEngine:
                 f"{self.config.workflow.max_review_rounds} (workflow.max_review_rounds)"
             )
             notes.extend(self._review_plan_notes(s))
+        if s.phase == Phase.FIX:
+            notes.extend(self._fix_plan_notes(s))
         if s.phase == Phase.REPLAN_REEXECUTE:
             replan_txn = ReplanTransaction.from_dict(s.replan_transaction)
             stage_notes, expected_next = self._replan_plan(replan_txn)
@@ -2032,7 +2073,10 @@ class ControllerEngine:
                 "PR, and reads it back via gh)"
             ),
             Phase.REVIEW: "FIX if any finding, READY_FOR_MERGE if clean, REVIEW if HEAD moved",
-            Phase.FIX: "REVIEW (after new HEAD verification via gh)",
+            Phase.FIX: (
+                "REVIEW (after the controller creates the follow-up issues, appends the "
+                "markers, pushes the verified HEAD and reads all of it back via gh)"
+            ),
             Phase.REPLAN_REEXECUTE: "REVIEW (replacement PR; fresh review round 1)",
             Phase.MERGE: "UPDATE_EPIC (controller merge verified as MERGED via gh) | REVIEW",
             Phase.UPDATE_EPIC: "ANALYZE_EXECUTE | DONE",
@@ -3572,6 +3616,158 @@ class ControllerEngine:
         self._analyze_candidate = head
         return res
 
+    def _check_fix_result(self, payload: dict, cwd: str) -> FixResult:
+        """The controller's half of the REMOTE FIX schema: resolutions and candidate (#163).
+
+        Checked before the result is accepted, so a refusal is corrected (the
+        fixer is asked again) before anything is created, appended or
+        pushed. The resolutions cover exactly the open findings. A finding
+        whose follow-up issue the entry found is resolved as
+        ``follow_up_created`` with exactly that issue: the controller reuses
+        it and never records a second decision. Any other deferral either
+        names an issue the entry handed over (one finding's own follow-up,
+        or an earlier round's), never the current issue, or asks for a new
+        issue whose composed body passes the credential rule as a whole.
+        The candidate is the worktree's ``HEAD`` as the controller reads it:
+        detached, equal to ``head_sha``, and either the reviewed HEAD itself
+        (nothing committed, so no finding is ``fixed``) or a descendant of
+        it whose every published commit passes the commit-message policy,
+        and which holds each ``fixed`` finding's named commit (ADR 0004 D7.5,
+        D8.5). A read that cannot be completed is inconclusive
+        (:class:`VerificationError`), never a correction.
+        """
+        state = self._require_state()
+        res = FixResult.from_payload(payload)
+        reviewed = state.reviewed_head_sha.lower()
+        issue = parse_issue_url(state.current_issue_url)
+        pr_url = parse_pr_url(state.current_pr_url).canonical
+        if res.previous_head_sha != reviewed:
+            raise ControlResultValidationError(
+                f"FIX: field 'previous_head_sha' is {res.previous_head_sha}, but the open "
+                f"findings are bound to the reviewed HEAD {reviewed}; report that HEAD"
+            )
+        open_ids = [str(f["id"]) for f in state.open_findings]
+        reported = [r.finding_id for r in res.resolutions]
+        missing = [fid for fid in open_ids if fid not in reported]
+        unknown = [fid for fid in reported if fid not in open_ids]
+        if missing or unknown:
+            raise ControlResultValidationError(
+                f"FIX: 'resolutions' must resolve exactly the open findings {open_ids}, one "
+                f"resolution each; missing {missing}, unknown {unknown}"
+            )
+        handed = {url for url in self._existing_follow_ups.values()} | {
+            parse_issue_url(url).canonical for _, url in self._existing_pr_follow_ups
+        }
+        new_chars = 0
+        for r in res.resolutions:
+            fid = r.finding_id
+            own = self._existing_follow_ups.get(fid)
+            if own is not None:
+                if (
+                    r.resolution != "follow_up_created"
+                    or r.new_follow_up
+                    or not same_issue_url(r.follow_up_issue_url, own)
+                ):
+                    raise ControlResultValidationError(
+                        f"FIX: open issue {own} already is the follow-up of {fid}; resolve {fid} "
+                        "as follow_up_created with that issue's URL as 'follow_up_issue_url', "
+                        "or report status 'blocked' if that issue is wrong"
+                    )
+                continue
+            if r.resolution != "follow_up_created":
+                continue
+            if r.new_follow_up:
+                body = follow_up_issue_body(r.follow_up_body, pr_url, fid)
+                problem = published_payload_problem(
+                    f"follow-up issue title of {fid}", r.follow_up_title
+                ) or published_payload_problem(f"follow-up issue body of {fid}", body)
+                if problem:
+                    raise ControlResultValidationError(f"FIX: {problem}")
+                new_chars += len(r.follow_up_title) + len(body)
+                continue
+            if same_issue_url(r.follow_up_issue_url, state.current_issue_url):
+                raise ControlResultValidationError(
+                    f"FIX: the follow-up of {fid} names the current issue {issue.canonical}, "
+                    "which is never a follow-up; resolve the finding in this PR, or defer it "
+                    "to another issue"
+                )
+            if parse_issue_url(r.follow_up_issue_url).canonical not in handed:
+                listed = ", ".join(sorted(handed)) or "none"
+                raise ControlResultValidationError(
+                    f"FIX: {r.follow_up_issue_url} (the follow-up of {fid}) is not a follow-up "
+                    f"issue the controller handed over for this PR (listed: {listed}); name one "
+                    "of those, or ask for a new issue with 'follow_up_issue'"
+                )
+        if new_chars + FixContext.STORED_BOUND > MAX_EFFECT_STATE_CHARS:
+            raise ControlResultValidationError(
+                f"FIX: the new follow-up issues hold {new_chars} characters together, more "
+                "than the controller journals for one FIX round; shorten their bodies and "
+                "re-emit the CONTROL_RESULT"
+            )
+        attached, _ = self._worktree_git(
+            ["symbolic-ref", "-q", "HEAD"], cwd, "whether HEAD is detached"
+        )
+        if attached == 0:
+            raise ControlResultValidationError(
+                "FIX: the worktree's HEAD is attached to a local branch; the controller "
+                "publishes a detached HEAD only. Run `git checkout --detach`, keep your "
+                "commits, and re-emit the CONTROL_RESULT"
+            )
+        found, head = self._worktree_git(
+            ["rev-parse", "--verify", "-q", "HEAD^{commit}"], cwd, "the HEAD commit"
+        )
+        if found != 0 or not re.fullmatch(r"[0-9a-f]{40}", head):
+            raise ControlResultValidationError(
+                "FIX: the worktree has no HEAD commit the controller can read; check out "
+                f"{reviewed} (or your commits on it) and re-emit the CONTROL_RESULT"
+            )
+        if head != res.head_sha:
+            raise ControlResultValidationError(
+                f"FIX: field 'head_sha' is {res.head_sha}, but the worktree's HEAD is {head}; "
+                "report `git rev-parse HEAD`"
+            )
+        fixed = [r for r in res.resolutions if r.resolution == "fixed"]
+        if head == reviewed:
+            if fixed:
+                raise ControlResultValidationError(
+                    f"FIX: {', '.join(r.finding_id for r in fixed)} resolved as fixed, but HEAD "
+                    f"is still the reviewed HEAD {reviewed}: a fixed finding needs a commit. "
+                    "Commit the fix, or resolve it another way, and re-emit the CONTROL_RESULT"
+                )
+            self._fix_candidate = head
+            return res
+        try:
+            proof = self._git_transport().prove_range(reviewed, head)
+        except GitTransportError as exc:
+            raise VerificationError(
+                f"the ancestry of the candidate {head} could not be proven: {exc}. Nothing was "
+                "pushed; 'resume' proves it again"
+            ) from exc
+        if not proof.reached_base:
+            raise ControlResultValidationError(
+                f"FIX: HEAD {head} does not descend from the reviewed HEAD {reviewed}, so the "
+                "push would not be a fast-forward of the PR branch; rebuild your commits on "
+                "it (never rewrite the PR's history) and re-emit the CONTROL_RESULT"
+            )
+        message_problem = published_range_problem(
+            proof,
+            lambda message: commit_message_problem(
+                message, repository=state.repository, issue_number=issue.number
+            ),
+        )
+        if message_problem:
+            raise ControlResultValidationError(f"FIX: {message_problem}")
+        published = {commit.sha for commit in proof.commits}
+        for r in fixed:
+            if r.commit_sha and r.commit_sha not in published:
+                raise ControlResultValidationError(
+                    f"FIX: the commit_sha {r.commit_sha} of {r.finding_id} is not one of the "
+                    f"commits after the reviewed HEAD {reviewed[:12]} up to {head[:12]}; name "
+                    "the commit that fixed it, or omit commit_sha"
+                )
+        self._fix_candidate = head
+        return res
+
     # -- operator unblock (issue #5) -------------------------------------------
     def unblock(self, reason: str, *, dry_run: bool = False) -> UnblockOutcome:
         """The operator's explicit exit from BLOCKED.
@@ -3931,6 +4127,19 @@ class ControllerEngine:
                 f"{effects.context.round} is planned "
                 f"({', '.join(r.describe() for r in effects.records)}); REVIEW completes from "
                 "its persisted plan without launching the reviewer",
+                pr=pr,
+            )
+        if effects.phase == Phase.FIX and isinstance(effects.context, FixContext):
+            # The fixer's result was accepted and its writes planned: the
+            # re-entry completes them from the journal, and a PR head at the
+            # planned candidate is the controller's own push. No fixer is
+            # launched for it again.
+            records = ", ".join(r.describe() for r in effects.records) or "nothing to send"
+            return UnblockDecision(
+                Phase.FIX,
+                f"PR {canonical} is OPEN and the FIX plan of review round "
+                f"{effects.context.round} is saved ({records}); FIX completes from its "
+                "persisted plan without launching the fixer",
                 pr=pr,
             )
         cap = next_round_cap_reason(state.review_round, self.config.workflow.max_review_rounds)
@@ -4777,6 +4986,34 @@ class ControllerEngine:
         ``message`` replaces the default merge-path wording.
         """
         state = self._require_state()
+        nxt, what, carried = self._stale_revision(phase, pr, merge_base_sha)
+        validate_transition(phase, nxt)
+        state.phase = nxt
+        state.attempt = 0
+        self._save()
+        return self._outcome(
+            phase,
+            plan=plan,
+            message=(
+                message
+                or (
+                    f"{what} after the clean review{detail}; {phase.value} -> {nxt.value} "
+                    "(not merged)"
+                )
+            )
+            + carried,
+        )
+
+    def _stale_revision(
+        self, phase: Phase, pr: PRInfo, merge_base_sha: str = ""
+    ) -> tuple[Phase, str, str]:
+        """Record that the reviewed revision is no longer the PR's: ``(next, what, carried)``.
+
+        The state half of :meth:`_revision_drift_to_review`, shared with the
+        FIX completion, which routes through its caller's transition
+        (:meth:`_fix_drift`). Leaves the phase and the save to the caller.
+        """
+        state = self._require_state()
         if pr.base_ref and pr.base_ref != state.reviewed_base_ref:
             what = f"PR base changed to {pr.base_ref!r}"
         elif pr.head_sha.lower() != (state.reviewed_head_sha or "").lower():
@@ -4802,23 +5039,7 @@ class ControllerEngine:
         )
         # FIX's only edge is REVIEW; READY_FOR_MERGE and MERGE route there on
         # the observation that the reviewed revision is no longer the PR's.
-        nxt = self._next_phase(phase, {"head_changed_after_review": True})
-        validate_transition(phase, nxt)
-        state.phase = nxt
-        state.attempt = 0
-        self._save()
-        return self._outcome(
-            phase,
-            plan=plan,
-            message=(
-                message
-                or (
-                    f"{what} after the clean review{detail}; {phase.value} -> {nxt.value} "
-                    "(not merged)"
-                )
-            )
-            + carried,
-        )
+        return self._next_phase(phase, {"head_changed_after_review": True}), what, carried
 
     @staticmethod
     def _merged_revision_problem(pr: PRInfo, reviewed: str, reviewed_base: str) -> str:
@@ -5375,6 +5596,42 @@ class ControllerEngine:
         )
         return notes
 
+    def _fix_plan_notes(self, s: AutoForgeState) -> list[str]:
+        """What FIX would do, from persisted state only (no read, no effect; #163)."""
+        effects = s.phase_effects()
+        notes = [
+            f"would reconcile {record.describe()} ({record.stage.value}, "
+            f"{record.attempts} attempt(s)) against GitHub before anything else, and send it "
+            "only if GitHub does not already hold it and its attempt bound is left"
+            for record in effects.records
+        ]
+        if isinstance(effects.context, FixContext):
+            notes.append(
+                f"would complete FIX of review round {effects.context.round} from the persisted "
+                "plan without launching the fixer: create the follow-up issues, append the "
+                "markers, push last, then read the follow-ups and the PR head back (a PR head "
+                "neither the reviewed HEAD nor the planned candidate routes to REVIEW)"
+            )
+            return notes
+        notes.extend(
+            [
+                "would re-read the PR's HEAD, base and merge base first: a revision past the "
+                "reviewed one routes FIX -> REVIEW without launching the fixer",
+                "would read the open issues for each open finding's follow-up marker (handed "
+                "to the fixer to reuse) and for earlier rounds' deferrals, and fetch the "
+                "reviewed HEAD into the shared object store, before launching the fixer, "
+                "which publishes nothing",
+                "would check the fixer's resolutions against the open findings and the "
+                "follow-up issues handed over, and its head_sha against the worktree's "
+                "detached HEAD, its ancestry from the reviewed HEAD and every published commit "
+                "message, asking the fixer again on a refusal",
+                "would save the plan (new follow-up issues, marker appends to handed-over "
+                "issues, then the push of that HEAD as a fast-forward over the reviewed HEAD), "
+                "perform it in that order, and read the follow-ups and the PR head back",
+            ]
+        )
+        return notes
+
     def _update_epic_plan_notes(self, s: AutoForgeState) -> list[str]:
         """What UPDATE_EPIC would do, from persisted state only (no read, no effect)."""
         every = self.config.workflow.epic_update_every
@@ -5597,50 +5854,60 @@ class ControllerEngine:
         )
 
     def _prepare_fix(self, plan: StepPlan) -> StepOutcome | None:
-        """Re-read the PR before the fixer runs; an unreviewed push goes back to REVIEW.
+        """Journal first, then GitHub, before any FIX launch (#163, ADR 0004 §2.5).
 
-        FIX resolves the findings of one review, and those findings are bound
-        to the HEAD that review saw. A PR HEAD past it before the fixer is
-        launched is a push the controller never verified: an earlier fixer
-        whose result was not recorded (timeout, non-zero exit, refused run-log
-        write, verification failure, crash) or an operator. Which findings
-        that push resolved, if any, is not knowable from controller state and
-        is never inferred, so the rule for every other HEAD drift applies
-        here too: the review is stale and the actual HEAD is reviewed
-        (``FIX -> REVIEW``) instead of a fixer being launched against findings
-        of a commit that is no longer the PR. The cost is one review round;
-        the review of the actual HEAD is what says what remains.
+        The controller performs this phase's writes itself: it creates the
+        follow-up issues the fixer asks for (K5), appends finding markers to
+        the follow-up issues it handed over (K6), then pushes the fixer's
+        commit to the PR branch (K1, last: the commit point). So:
 
-        The findings are bound to the base too: the diff a reviewer reads is
-        the HEAD against the PR's base, so a PR retargeted to another base
-        since the review has findings raised on a diff the PR no longer
-        proposes. A base other than ``reviewed_base_ref`` is treated exactly
-        like a HEAD past the reviewed one (``FIX -> REVIEW`` of the actual
-        revision, no fixer launched, the findings carried to that review);
-        an empty ``reviewed_base_ref`` (a protocol-2 state file loaded in
-        FIX, written before the base was bound) has no base to compare and
-        launches the fixer; the next completed review writes the binding.
-        The merge base is bound the same way (#96): a base branch rewritten
-        under its name since the review moves it, and the findings then
-        describe a diff the PR no longer shows; an empty
-        ``reviewed_merge_base_sha`` (a protocol-3 file) has nothing to
-        compare and launches the fixer.
+        - A persisted completion context means the fixer's result was
+          accepted and the plan saved. The phase is completed from the
+          journal (:meth:`_finish_fix_entry`) and the fixer is never launched
+          for it again; a PR head equal to the planned candidate is the
+          controller's own push, never a reason to review first.
+        - Otherwise the PR is re-read. FIX resolves the findings of one
+          review, and those findings are bound to the HEAD that review saw. A
+          PR HEAD past it is a push the controller never verified (an
+          operator, or a fixer of the previous contract): which findings it
+          resolved is not knowable from controller state and is never
+          inferred, so the review is stale and the actual HEAD is reviewed
+          (``FIX -> REVIEW``, the findings carried to that review) instead of
+          a fixer being launched. The findings are bound to the base and the
+          merge base too (#95, #96): a retargeted PR or a base rewritten under
+          its name is treated the same way; an empty ``reviewed_base_ref`` or
+          ``reviewed_merge_base_sha`` (an older state file) has nothing to
+          compare and launches the fixer.
+        - The open issues are read for the ``ai-follow-up`` marker of (this
+          PR, an open finding id): exactly one per finding is handed to the
+          fixer (``FOLLOW_UP_ISSUES``) as that finding's follow-up, two or
+          more for one finding is a state the controller cannot resolve
+          without choosing, and a listing that cannot be proven complete
+          blocks, because "no such issue exists" is then not knowable. The
+          same listing gives the earlier rounds' deferrals
+          (``EXISTING_FOLLOW_UP_ISSUES``, #90).
+        - The observation records the PR branch at the reviewed HEAD and,
+          per open finding, its follow-up issue or none. A re-entry after a
+          launch of this entry (a correction relaunch, or a 'resume' after
+          the fixer failed) honors it: a follow-up issue that appeared, or
+          disappeared, since is not the controller's and blocks, never
+          adopted (ADR 0004 §2.5). The legacy re-entry of a run upgraded
+          while a fixer of the previous contract was publishing (D13.6) has
+          no observation to honor: its follow-ups are handed over as found.
 
-        A push is not the only write a fixer makes: a ``follow_up_created``
-        resolution creates an issue and moves no HEAD. So with the HEAD
-        still the reviewed one, the open issues of the repository are read
-        for the ``ai-follow-up`` marker of (this PR, an open finding id):
-        exactly one per finding is handed to the fixer (``FOLLOW_UP_ISSUES``)
-        to report instead of creating a second, two or more for one finding
-        is a state the controller cannot resolve without choosing and blocks
-        without launching anyone, and a listing that cannot be proven
-        complete blocks too, because "no such issue exists" is then not
-        knowable. :meth:`_apply_fix` enforces the same one-per-finding rule
-        on read-back.
+        The reviewed HEAD is fetched into the shared object store before the
+        launch (objects only; no ref moves), so the fixer starts from it
+        without contacting the remote. Only an unavailable GitHub and a
+        failed fetch propagate (nothing was launched and 'resume' reads
+        again); a conclusive failure blocks.
         """
         state = self._require_state()
         self._existing_follow_ups = {}
         self._existing_pr_follow_ups = []
+        self._fix_candidate = ""
+        effects = state.phase_effects()
+        if isinstance(effects.context, FixContext):
+            return self._finish_fix_entry(plan)
         if not state.open_findings:
             raise StateError("FIX phase entered without open findings in state")
         pr = self._require_open_pr()
@@ -5655,9 +5922,8 @@ class ControllerEngine:
                 message=(
                     f"PR HEAD {pr.head_sha[:12]} is past the reviewed HEAD {reviewed[:12]} "
                     f"that the open findings of round {state.review_round} are bound to "
-                    "(an unrecorded fix or an operator push; the controller does not infer "
-                    "which findings it resolved); FIX -> REVIEW of the actual HEAD, no fixer "
-                    "launched"
+                    "(a push the controller did not make; it does not infer which findings it "
+                    "resolved); FIX -> REVIEW of the actual HEAD, no fixer launched"
                 ),
             )
         if reviewed_base and not pr.base_ref:
@@ -5703,6 +5969,9 @@ class ControllerEngine:
                     ),
                     merge_base_sha=merge_base,
                 )
+        problem = self._fix_branch_problem(pr)
+        if problem:
+            return self._block(Phase.FIX, plan, problem + ". Nothing was launched")
         pr_ref = parse_pr_url(state.current_pr_url)
         open_ids = [str(f["id"]) for f in state.open_findings]
         try:
@@ -5710,16 +5979,7 @@ class ControllerEngine:
             # (checked below) and the earlier rounds' deferrals, handed to
             # the fixer so a re-raised problem is recorded on the issue that
             # already exists instead of in a second one (#90).
-            follow_ups = self._follow_up_issues(pr_ref)
-            for fid in open_ids:
-                holder = follow_ups.claimants(
-                    (pr_ref.identity, fid), _finding_what(pr_ref, fid)
-                ).at_most_one()
-                if holder is not None:
-                    self._existing_follow_ups[fid] = holder.obj.url
-            deferred = follow_ups.grouped(
-                lambda c: c.finding_id not in open_ids, f"PR {pr_ref.canonical}"
-            )
+            own, deferred = self._fix_follow_ups(pr_ref, open_ids)
         except GitHubUnavailableError:
             raise
         except GitHubError as exc:
@@ -5728,7 +5988,7 @@ class ControllerEngine:
                 plan,
                 f"cannot establish which follow-up issues already exist for the open "
                 f"findings of PR {pr_ref.canonical}: {exc}. The controller will not launch a "
-                "fixer that could create a second one",
+                "fixer whose deferrals could create a second one",
             )
         except ClaimConflictError as exc:
             return self._block(
@@ -5737,10 +5997,123 @@ class ControllerEngine:
                 f"{exc}. The controller never chooses between them: close or repair the "
                 "extra or unreadable issue(s) so exactly one remains, then start a new run",
             )
-        self._existing_pr_follow_ups = _follow_up_pairs(deferred)
+        ref = f"refs/heads/{pr.head_ref}"
+        observed = self._fix_observed_objects(pr_ref, open_ids, own)
+        observation = effects.observation
+        honored = (
+            observation
+            if observation is not None
+            and state.attempt >= 1
+            and not is_legacy_reentry(Phase.FIX, state.attempt, state.launch_label)
+            else None
+        )
+        if honored is not None and (
+            dict(honored.objects) != observed or dict(honored.refs) != {ref: reviewed}
+        ):
+            return self._block(
+                Phase.FIX, plan, self._unjournaled_fix_text(honored, observed, ref, reviewed)
+            )
+        try:
+            self._git_transport().fetch([reviewed])
+        except GitTransportError as exc:
+            raise VerificationError(
+                f"the controller could not fetch the reviewed HEAD {reviewed} into the shared "
+                f"object store before launching the fixer: {exc}. Nothing was launched; "
+                "'resume' fetches again"
+            ) from exc
+        if honored is None:
+            # D4.4: persisted before the launch, so that a follow-up issue a
+            # later entry finds is explained by this read or not at all.
+            state.entry_observation = EntryObservation(
+                Phase.FIX,
+                state.current_issue_url,
+                state.current_pr_url,
+                {ref: reviewed},
+                reviewed,
+                observed,
+            ).to_dict()
+        self._existing_follow_ups = own
+        self._existing_pr_follow_ups = deferred
         state.current_head_sha = pr.head_sha
         self._save()
         return None
+
+    def _fix_branch_problem(self, pr: PRInfo) -> str:
+        """Why the controller cannot push a fix to ``pr``'s branch, or "" when it can."""
+        state = self._require_state()
+        url = parse_pr_url(pr.url or state.current_pr_url).canonical
+        if pr.head_repository and pr.head_repository.lower() != state.repository.lower():
+            return (
+                f"PR {url} is headed in {pr.head_repository}, not in {state.repository}: the "
+                "controller pushes a fix to a branch of the run's repository only"
+            )
+        if not pr.head_ref or not valid_branch_name(pr.head_ref):
+            return (
+                f"PR {url} has no readable head branch ({pr.head_ref!r}), so the controller "
+                "has no branch to push the fix to"
+            )
+        return ""
+
+    def _fix_follow_ups(
+        self, pr_ref: GitHubPullRequestRef, open_ids: list[str]
+    ) -> tuple[dict[str, str], list[tuple[str, str]]]:
+        """One open-issue listing: each open finding's follow-up, and the earlier deferrals.
+
+        ``({finding id: issue URL}, [(finding id, issue URL), ...])``. Raises
+        what the listing raises: two issues for one finding, or a defect,
+        is a :class:`ClaimConflictError`.
+        """
+        follow_ups = self._follow_up_issues(pr_ref)
+        own: dict[str, str] = {}
+        for fid in open_ids:
+            holder = follow_ups.claimants(
+                (pr_ref.identity, fid), _finding_what(pr_ref, fid)
+            ).at_most_one()
+            if holder is not None:
+                own[fid] = parse_issue_url(holder.obj.url).canonical
+        deferred = follow_ups.grouped(
+            lambda c: c.finding_id not in open_ids, f"PR {pr_ref.canonical}"
+        )
+        return own, _follow_up_pairs(deferred)
+
+    @staticmethod
+    def _fix_observed_objects(
+        pr_ref: GitHubPullRequestRef, open_ids: list[str], own: dict[str, str]
+    ) -> dict[str, str | None]:
+        """The entry observation's objects: each open finding's marker, and its issue or None."""
+        return {render_follow_up_marker(pr_ref.canonical, fid): own.get(fid) for fid in open_ids}
+
+    def _unjournaled_fix_text(
+        self,
+        recorded: EntryObservation,
+        observed: dict[str, str | None],
+        ref: str,
+        reviewed: str,
+    ) -> str:
+        state = self._require_state()
+        changes = []
+        for marker in sorted(set(recorded.objects) | set(observed)):
+            before, now = recorded.objects.get(marker), observed.get(marker)
+            if before != now:
+                fid = scan(FOLLOW_UP, marker).claims[0].finding_id
+                changes.append(
+                    f"the follow-up issue of {fid} is {now or 'none'}, but this phase's entry "
+                    f"recorded {before or 'none'}"
+                )
+        if dict(recorded.refs) != {ref: reviewed}:
+            changes.append(
+                f"the PR branch is {ref} at {reviewed}, but this phase's entry recorded "
+                f"{', '.join(f'{r} at {s}' for r, s in sorted(recorded.refs.items())) or 'none'}"
+            )
+        return (
+            f"{'; '.join(changes)}. Something other than the controller created, closed or "
+            f"marked a follow-up issue of PR {state.current_pr_url} after the fixer was "
+            "launched, and the controller creates the follow-up issues itself, from a plan it "
+            "journals before anything is sent; it never adopts one it did not journal (ADR "
+            "0004 §2.5). Nothing was created, appended or pushed. If such an issue is the "
+            "finding's follow-up, 'unblock' starts a fresh entry that hands it to the fixer; "
+            "otherwise close it or remove its marker first"
+        )
 
     # -- durable-claim reads --------------------------------------------------
     #
@@ -7191,6 +7564,16 @@ class ControllerEngine:
                     # result: refused here, it is corrected before anything is
                     # posted (#162).
                     self._check_review_result(payload)
+                if (
+                    phase == Phase.FIX
+                    and state.mode == WorkflowMode.REMOTE
+                    and payload.get("status") == "success"
+                ):
+                    # The resolutions and the candidate the controller would
+                    # publish, read from the worktree itself: refused here,
+                    # it is corrected before anything is created or pushed
+                    # (#163).
+                    self._check_fix_result(payload, cwd)
             except VerificationError as exc:
                 # A read of the candidate that could not be completed: not the
                 # agent's error, so no correction; 'resume' reads it again.
@@ -8151,94 +8534,470 @@ class ControllerEngine:
         )
 
     def _apply_fix(self, res: FixResult) -> tuple[Phase, str]:
+        """Plan the FIX writes from the accepted result, save them, then complete (#163).
+
+        The result was checked before it was accepted
+        (:meth:`_check_fix_result`): the resolutions cover the open findings
+        exactly and the candidate is the worktree's HEAD, the reviewed HEAD
+        or a fast-forward of it. A precondition read then finds GitHub as the
+        entry observed it: the PR open at the reviewed HEAD (a HEAD past it
+        is a push the controller did not make: ``FIX -> REVIEW``, nothing
+        sent), each open finding's follow-up issue as the entry recorded it,
+        and each issue a deferral names open in this repository with a body
+        the marker block can be appended to; anything else blocks with
+        nothing planned or sent (ADR 0004 §2.5). The follow-up issues to
+        create (K5, in result order), the marker appends (K6, one per
+        handed-over issue, its findings' markers in result order) and the
+        push (K1, last: the commit point; none when nothing was committed)
+        are planned and saved with the completion context in one save, and
+        :meth:`_complete_fix` does the rest from what was saved, as a later
+        entry would.
+        """
         state = self._require_state()
-        expected_prev = state.current_head_sha.lower()
-        if res.previous_head_sha != expected_prev:
-            raise VerificationError(
-                f"FIX previous_head_sha {res.previous_head_sha} != controller HEAD {expected_prev}"
-            )
-        open_ids = [f["id"] for f in state.open_findings]
-        reported = [r.finding_id for r in res.resolutions]
-        missing = sorted(set(open_ids) - set(reported))
-        extra = sorted(set(reported) - set(open_ids))
-        if missing or extra:
-            raise VerificationError(
-                f"FIX resolutions must cover exactly the open findings; missing={missing} "
-                f"unknown={extra}"
+        reviewed = state.reviewed_head_sha.lower()
+        candidate = self._fix_candidate
+        if not candidate or candidate != res.head_sha or res.previous_head_sha != reviewed:
+            raise StateError("a FIX result was applied without the candidate its check accepted")
+        observation = state.phase_effects().observation
+        if observation is None or observation.phase != Phase.FIX:
+            raise StateError("a FIX result was applied without the observation of its entry")
+        pr = self._require_open_pr()
+        if pr.head_sha.lower() != reviewed:
+            return self._fix_drift(
+                pr,
+                f"PR HEAD {pr.head_sha[:12]} moved past the reviewed HEAD {reviewed[:12]} while "
+                "the fixer ran (a push the controller did not make; it does not infer which "
+                "findings it resolved), so nothing was created, appended or pushed",
             )
         pr_ref = parse_pr_url(state.current_pr_url)
         pr_url = pr_ref.canonical
-        # The same read the entry made: the open issues carrying this PR's
-        # follow-up marker, per finding. A follow-up the result claims must
-        # be the one marked open issue of its finding, and a finding resolved
-        # any other way must have none: the marked issue is the durable
-        # record of the decision, and state never records a different one.
-        follow_ups = self._follow_up_issues(pr_ref)
+        open_ids = [str(f["id"]) for f in state.open_findings]
+        ref = f"refs/heads/{pr.head_ref}"
+        try:
+            own, _ = self._fix_follow_ups(pr_ref, open_ids)
+        except GitHubUnavailableError:
+            raise
+        except GitHubError as exc:
+            return Phase.BLOCKED, (
+                f"the follow-up issues of PR {pr_url} could not be read before the FIX plan "
+                f"was saved: {exc}. This is not a transient GitHub failure; nothing was "
+                "created, appended or pushed. Fix the cause, then 'unblock'"
+            )
+        except ClaimConflictError as exc:
+            return Phase.BLOCKED, (
+                f"{exc}. The controller never chooses between follow-up issues; nothing was "
+                "created, appended or pushed. Close or repair the extra or unreadable "
+                "issue(s) so at most one remains per finding, then 'unblock'"
+            )
+        observed = self._fix_observed_objects(pr_ref, open_ids, own)
+        if observed != dict(observation.objects) or dict(observation.refs) != {ref: reviewed}:
+            return Phase.BLOCKED, self._unjournaled_fix_text(observation, observed, ref, reviewed)
+        new: list[FindingResolution] = []
+        appends: dict[str, list[str]] = {}
         for r in res.resolutions:
-            try:
-                marked = follow_ups.claimants(
-                    (pr_ref.identity, r.finding_id), _finding_what(pr_ref, r.finding_id)
-                ).at_most_one()
-            except ClaimConflictError as exc:
-                raise VerificationError(
-                    f"{exc}; a finding has at most one follow-up issue"
-                ) from exc
-            if r.resolution != "follow_up_created":
-                if marked is not None:
-                    raise VerificationError(
-                        f"{r.finding_id} is resolved as {r.resolution} but open issue "
-                        f"{marked.obj.url} carries its follow-up marker"
-                    )
+            if r.resolution != "follow_up_created" or r.finding_id in own:
                 continue
-            ref = parse_issue_url(r.follow_up_issue_url)
-            if ref.repository.lower() != state.repository.lower():
-                raise VerificationError(
-                    f"follow-up issue {ref.canonical} for {r.finding_id} is outside "
-                    f"{state.repository}"
+            if r.new_follow_up:
+                new.append(r)
+            else:
+                url = parse_issue_url(r.follow_up_issue_url).canonical
+                appends.setdefault(url, []).append(r.finding_id)
+        bases: dict[str, str] = {}
+        try:
+            watermark = self.github.latest_issue_number(state.repository) if new else 0
+            for url, fids in appends.items():
+                issue = self.github.get_issue(url)
+                deferred = ", ".join(fids)
+                if not issue.is_open or not parse_issue_url(issue.url or url).same_repository(
+                    state.repository
+                ):
+                    return Phase.BLOCKED, (
+                        f"follow-up issue {url}, which {deferred} is deferred to, is "
+                        f"{issue.state} or not in {state.repository}: the controller appends "
+                        "a finding's marker to an open issue of this repository only. Nothing "
+                        "was created, appended or pushed. Reopen it, or 'unblock' to launch "
+                        "the fixer afresh"
+                    )
+                block = "\n".join(render_follow_up_marker(pr_url, fid) for fid in fids)
+                problem = append_problem(url, FOLLOW_UP, compose_append(issue.body, block))
+                if problem:
+                    return Phase.BLOCKED, (
+                        f"the markers of {deferred} cannot be appended to {url}: {problem}. "
+                        "Nothing was created, appended or pushed"
+                    )
+                bases[url] = issue.body
+        except GitHubUnavailableError:
+            raise
+        except GitHubError as exc:
+            return Phase.BLOCKED, (
+                f"the issues the FIX plan writes to could not be read before it was saved: "
+                f"{exc}. This is not a transient GitHub failure; nothing was created, "
+                "appended or pushed. Fix the cause, then 'unblock'"
+            )
+        owner = EffectOwner(
+            run_id=state.run_id,
+            phase=Phase.FIX,
+            issue_url=state.current_issue_url,
+            pr_url=state.current_pr_url,
+            transaction_id="",
+        )
+        records: list[EffectRecord] = []
+        sources: dict[str, str | int] = {
+            fid: FOLLOW_UP_SOURCE_ENTRY
+            for fid in own
+            if any(r.finding_id == fid for r in res.resolutions)
+        }
+        for r in new:
+            marker = render_follow_up_marker(pr_url, r.finding_id)
+            sources[r.finding_id] = len(records)
+            records.append(
+                EffectRecord.plan(
+                    len(records),
+                    EffectKind.FOLLOW_UP_ISSUE,
+                    owner,
+                    identity={"repository": state.repository, "marker": marker},
+                    target={"repository": state.repository},
+                    precondition={"absent": True, "watermark": watermark},
+                    payload={
+                        "title": r.follow_up_title,
+                        "body": follow_up_issue_body(r.follow_up_body, pr_url, r.finding_id),
+                    },
                 )
-            if same_issue_url(ref.canonical, state.current_issue_url):
-                raise VerificationError(
-                    f"follow-up for {r.finding_id} points at the current issue itself"
+            )
+        for url, fids in appends.items():
+            markers = [render_follow_up_marker(pr_url, fid) for fid in fids]
+            block = "\n".join(markers)
+            for fid in fids:
+                sources[fid] = len(records)
+            records.append(
+                EffectRecord.plan(
+                    len(records),
+                    EffectKind.FOLLOW_UP_APPEND,
+                    owner,
+                    identity={"issue_url": url, "markers": markers},
+                    target={"issue_url": url},
+                    precondition={"base_sha256": sha256_text(bases[url])},
+                    payload={"body": compose_append(bases[url], block), "block": block},
                 )
+            )
+        if candidate != reviewed:
+            records.append(
+                EffectRecord.plan(
+                    len(records),
+                    EffectKind.PUSH,
+                    owner,
+                    identity={
+                        "repository": state.repository,
+                        "ref": ref,
+                        "candidate_sha": candidate,
+                    },
+                    target={"repository": state.repository, "ref": ref},
+                    precondition={"expected_old": reviewed, "base_sha": reviewed},
+                    payload={"sha": candidate},
+                )
+            )
+        context = FixContext(
+            state.current_issue_url,
+            state.current_pr_url,
+            state.review_round,
+            tuple(
+                {
+                    "finding_id": r.finding_id,
+                    "resolution": r.resolution,
+                    # Agent-authored text persisted in plain `state.json` and
+                    # shown to the next reviewer: the same redaction boundary
+                    # as the run log.
+                    "rationale": redact(r.rationale),
+                    "commit_sha": r.commit_sha,
+                    "follow_up_source": sources.get(r.finding_id),
+                }
+                for r in res.resolutions
+            ),
+        )
+        problem = plan_size_problem(records, context)
+        if problem:
+            return Phase.BLOCKED, (
+                f"the FIX plan cannot be saved: {problem}. Nothing was created, appended or "
+                "pushed. Shorten the issue bodies it appends to, then 'unblock'"
+            )
+        state.effect_records = [record.to_dict() for record in records]
+        state.completion_context = context.to_dict()
+        # Strictly validated exactly as a later load will validate it, against
+        # the entry observation the pre-launch save persisted: a plan that
+        # fails is never written (D4.6).
+        state.phase_effects()
+        self._fix_candidate = ""
+        self._save()
+        return self._complete_fix()
+
+    def _finish_fix_entry(self, plan: StepPlan) -> StepOutcome:
+        """Complete FIX from its persisted plan, launching nothing (#163)."""
+        state = self._require_state()
+        try:
+            nxt, message = self._complete_fix()
+        except VerificationError as exc:
+            self._record_verification_failure(Phase.FIX, exc)
+            self._save()
+            raise
+        if nxt == Phase.BLOCKED:
+            return self._block(Phase.FIX, plan, message)
+        validate_transition(Phase.FIX, nxt)
+        state.phase = nxt
+        state.attempt = 0
+        self._save()
+        return self._outcome(
+            Phase.FIX,
+            plan=plan,
+            message=f"{message} (completed from the persisted FIX plan; no fixer launched)",
+        )
+
+    def _fix_drift(self, pr: PRInfo, what: str) -> tuple[Phase, str]:
+        """FIX -> REVIEW of the actual revision: the fix is not recorded (#163).
+
+        The plan is dropped with the phase it belongs to. What it already
+        sent stays on GitHub: a follow-up issue it created or a marker it
+        appended is an earlier round's deferral to the next fixer.
+        """
+        state = self._require_state()
+        state.last_fix_resolutions = []
+        state.drop_phase_effects()
+        nxt, _, carried = self._stale_revision(Phase.FIX, pr)
+        return nxt, f"{what}; FIX -> {nxt.value} of the actual HEAD, no fix recorded{carried}"
+
+    def _fix_conflict(self, record: EffectRecord) -> tuple[Phase, str]:
+        """A conflicting FIX record: drift when the PR moved, otherwise BLOCKED.
+
+        A push refused by its lease is the case to tell apart: a human push
+        to the PR branch before the controller's is the same drift a later
+        entry would route (``FIX -> REVIEW``), never a reason to force it.
+        """
+        state = self._require_state()
+        if record.kind is EffectKind.PUSH:
+            pr = self._require_open_pr()
+            head = pr.head_sha.lower()
+            if head not in (str(record.precondition["expected_old"]), str(record.payload["sha"])):
+                return self._fix_drift(
+                    pr,
+                    f"{record.describe()} was refused and PR HEAD is {head[:12]} (a push the "
+                    "controller did not make; it does not infer which findings it resolved)",
+                )
+            repair = (
+                f"leave the PR branch at the reviewed HEAD {record.precondition['expected_old']} "
+                f"or put it at the candidate {record.payload['sha']}, and fix what refused the "
+                "push"
+            )
+        elif record.kind is EffectKind.FOLLOW_UP_ISSUE:
+            repair = (
+                "reopen the follow-up issue the controller created, or close or unmark the "
+                "issue(s) named above that it did not create"
+            )
+        else:
+            repair = (
+                f"put the body of {record.target['issue_url']} back to a state the markers can "
+                "be appended to, or unmark the issue(s) named above that the controller did not "
+                "write"
+            )
+        return Phase.BLOCKED, (
+            f"{record.reason}. The controller never force-pushes, duplicates or chooses between "
+            f"such objects; the fix of review round {state.review_round} is not recorded. "
+            f"Inspect GitHub, {repair}, then 'unblock': the record is reconciled again within "
+            "its attempt bound"
+        )
+
+    def _fix_source_url(
+        self,
+        finding_id: str,
+        source: str | int,
+        records: Sequence[EffectRecord],
+        observation: EntryObservation,
+    ) -> str:
+        """The follow-up issue a deferred finding's source names, as the plan read it back."""
+        state = self._require_state()
+        marker = render_follow_up_marker(parse_pr_url(state.current_pr_url).canonical, finding_id)
+        if source == FOLLOW_UP_SOURCE_ENTRY:
+            url = observation.objects.get(marker)
+        else:
+            assert isinstance(source, int)
+            record = records[source]
+            url = (record.observed or {}).get("url")
+        if not url:
+            raise StateError(f"the follow-up of {finding_id} has no issue its source observed")
+        return str(url)
+
+    def _fix_follow_up_problem(
+        self,
+        context: FixContext,
+        records: Sequence[EffectRecord],
+        observation: EntryObservation,
+        *,
+        reused_only: bool,
+    ) -> str:
+        """Why a deferred finding is not exactly one open issue's follow-up, or "".
+
+        One complete listing of the open issues: each deferred finding (or,
+        with ``reused_only``, each finding reusing the follow-up its entry
+        found) has exactly one open issue carrying its marker, and it is the
+        issue its source names. A closed follow-up, or a second issue marked
+        for the same finding, is never resolved by choosing.
+        """
+        pr_ref = parse_pr_url(context.pr_url)
+        follow_ups = self._follow_up_issues(pr_ref)
+        problems = []
+        for resolution in context.resolutions:
+            source = resolution["follow_up_source"]
+            if source is None or (reused_only and source != FOLLOW_UP_SOURCE_ENTRY):
+                continue
+            fid = resolution["finding_id"]
+            expected = self._fix_source_url(fid, source, records, observation)
             try:
-                issue = self.github.get_issue(ref.canonical)
+                holder = follow_ups.claimants(
+                    (pr_ref.identity, fid), _finding_what(pr_ref, fid)
+                ).exactly_one()
+            except ClaimConflictError as exc:
+                problems.append(f"{exc} (its follow-up is {expected})")
+                continue
+            if not same_issue_url(holder.obj.url, expected):
+                problems.append(
+                    f"the open follow-up issue of {fid} is {holder.obj.url}, not {expected}"
+                )
+        return "; ".join(problems)
+
+    def _complete_fix(self) -> tuple[Phase, str]:
+        """Finish FIX from the persisted plan: create, append, push, read back (#163).
+
+        The same code for the step that saved the plan and for every later
+        entry (journal first). A PR HEAD that is neither the reviewed HEAD nor
+        the planned candidate is a push the controller did not make
+        (``FIX -> REVIEW``); the candidate itself is the controller's own push,
+        never a reason to review first. A follow-up issue reused from the
+        entry is re-read before anything is sent. Each record is then
+        reconciled against GitHub and issued at most once, in plan order, so
+        the push (the commit point) is never issued before every follow-up
+        is on GitHub; a push refused because the branch moved is the same
+        drift. Then every deferral is read back as the one open issue
+        carrying its finding's marker, and the PR as headed at the candidate.
+        A conflict or a conclusive failure blocks with the records as
+        persisted; an unavailable GitHub, a write whose outcome is not
+        readable yet, or a PR head GitHub has not moved yet, propagates for
+        'resume'.
+        """
+        state = self._require_state()
+        effects = state.phase_effects()
+        context = effects.context
+        observation = effects.observation
+        if not isinstance(context, FixContext) or observation is None:
+            raise StateError("FIX has no persisted plan to complete")
+        records = list(effects.records)
+        reviewed = state.reviewed_head_sha.lower()
+        push = records[-1] if records and records[-1].kind is EffectKind.PUSH else None
+        candidate = str(push.payload["sha"]) if push is not None else reviewed
+        pr = self._require_open_pr()
+        if pr.head_sha.lower() not in (reviewed, candidate):
+            return self._fix_drift(
+                pr,
+                f"PR HEAD {pr.head_sha[:12]} is neither the reviewed HEAD {reviewed[:12]} nor "
+                f"the candidate {candidate[:12]} the plan pushes (a push the controller did not "
+                "make; it does not infer which findings it resolved)",
+            )
+        try:
+            problem = self._fix_follow_up_problem(context, records, observation, reused_only=True)
+        except GitHubUnavailableError:
+            raise
+        except (GitHubError, ClaimConflictError) as exc:
+            problem = str(exc)
+        if problem:
+            return Phase.BLOCKED, (
+                f"{problem}. A follow-up issue the fixer reused is no longer the one open issue "
+                "carrying its finding's marker, and the controller never chooses another; "
+                "nothing more was sent. Reopen it or close the extra issue, then 'unblock'"
+            )
+        default_branch = ""
+        for index, record in enumerate(records):
+            if record.stage == Stage.CONFLICT:
+                return self._fix_conflict(record)
+            if not record.pending:
+                continue
+            try:
+                if record.kind is EffectKind.PUSH:
+                    default_branch = self.github.get_repo(state.repository).default_branch
+                op = operation_for(
+                    record,
+                    self.github,
+                    transport=self._git_transport() if record.kind is EffectKind.PUSH else None,
+                    default_branch=default_branch,
+                )
+                driven = drive(record, op, self._persist_effect)
             except GitHubUnavailableError:
                 raise
             except GitHubError as exc:
-                raise VerificationError(
-                    f"follow-up issue {ref.canonical} for {r.finding_id} does not exist: {exc}"
-                ) from exc
-            if not issue.is_open:
-                raise VerificationError(
-                    f"follow-up issue {ref.canonical} for {r.finding_id} is {issue.state}"
+                return Phase.BLOCKED, (
+                    f"{record.describe()} could not be reconciled with GitHub: {exc}. This is "
+                    "not a transient failure (authentication, permissions, or malformed "
+                    "data); nothing was sent again. Fix the cause, then 'unblock'"
                 )
-            if marked is None or not same_issue_url(marked.obj.url, ref.canonical):
-                raise VerificationError(
-                    f"follow-up issue {ref.canonical} for {r.finding_id} is not the open issue "
-                    f"carrying the marker {render_follow_up_marker(pr_url, r.finding_id)!r}"
-                    + (
-                        f" (that is {marked.obj.url})"
-                        if marked is not None
-                        else " (no open issue does)"
-                    )
-                )
-        pr = self._require_open_pr()
-        if pr.head_sha != res.new_head_sha:
-            raise VerificationError(
-                f"FIX new_head_sha {res.new_head_sha} != actual PR HEAD {pr.head_sha}"
+            records[index] = driven.record
+            if driven.record.stage == Stage.CONFLICT:
+                return self._fix_conflict(driven.record)
+        try:
+            problem = self._fix_follow_up_problem(context, records, observation, reused_only=False)
+        except GitHubUnavailableError:
+            raise
+        except (GitHubError, ClaimConflictError) as exc:
+            problem = str(exc)
+        if problem:
+            return Phase.BLOCKED, (
+                f"{problem}. The follow-up issues of this FIX do not read back as the one open "
+                "issue carrying each deferred finding's marker; the fix is not recorded. "
+                "Reopen the controller's issue or close the extra one, then 'unblock'"
             )
-        any_fixed = any(r.resolution == "fixed" for r in res.resolutions)
-        if any_fixed and res.new_head_sha == expected_prev:
-            raise VerificationError("FIX claims 'fixed' resolutions but the PR HEAD did not change")
-        state.current_head_sha = pr.head_sha
-        state.last_fix_resolutions = [redact_dict(r.to_dict()) for r in res.resolutions]
-        state.open_findings = []
+        latest = self._require_open_pr()
+        head = latest.head_sha.lower()
+        if push is not None and head == reviewed:
+            raise GitHubUnavailableError(
+                f"PR {state.current_pr_url} is still headed at the reviewed HEAD {reviewed} "
+                f"after the push of {candidate}; GitHub has not caught up yet, and 'resume' "
+                "reads it back again"
+            )
+        if head != candidate:
+            return self._fix_drift(
+                latest,
+                f"PR HEAD {head[:12]} is not the candidate {candidate[:12]} the controller "
+                "verified (a push the controller did not make)",
+            )
+        state.last_fix_resolutions = [
+            {
+                "finding_id": r["finding_id"],
+                "resolution": r["resolution"],
+                "rationale": r["rationale"],
+                "follow_up_issue_url": (
+                    ""
+                    if r["follow_up_source"] is None
+                    else self._fix_source_url(
+                        r["finding_id"], r["follow_up_source"], records, observation
+                    )
+                ),
+                "commit_sha": r["commit_sha"],
+            }
+            for r in context.resolutions
+        ]
+        state.current_head_sha = latest.head_sha
         state.last_review_result = "fixed"
+        # The plan is complete, and the save that leaves FIX drops it; the
+        # open findings go last, because the plan resolves exactly them.
+        state.drop_phase_effects()
+        state.open_findings = []
+        created = sum(1 for r in records if r.kind is EffectKind.FOLLOW_UP_ISSUE)
+        appended = sum(1 for r in records if r.kind is EffectKind.FOLLOW_UP_APPEND)
         nxt = self._next_phase(Phase.FIX, {})
+        moved = (
+            f"pushed {candidate[:12]} over {reviewed[:12]}"
+            if push is not None
+            else f"nothing to push (HEAD stays {reviewed[:12]})"
+        )
         return nxt, (
-            f"FIX verified: HEAD {expected_prev[:12]} -> {pr.head_sha[:12]}, "
-            f"{len(res.resolutions)} resolution(s); FIX -> {nxt.value} "
-            f"(round {state.review_round + 1})"
+            f"FIX of review round {context.round}: {len(context.resolutions)} resolution(s), "
+            f"{created} follow-up issue(s) created, {appended} marker append(s), {moved}; "
+            f"FIX -> {nxt.value} (round {state.review_round + 1})"
         )
 
     def _apply_replan(self, res: ReplanReexecuteResult) -> tuple[Phase, str]:

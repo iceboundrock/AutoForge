@@ -65,7 +65,10 @@ from tests.conftest import (
     FakeGitHub,
     block,
     controller_review_comment,
+    fixed,
+    fixer,
     make_engine,
+    publish_pr_head,
     review_result,
 )
 
@@ -560,27 +563,19 @@ def test_default_stagnation_routes_to_replan_through_engine(tmp_state_dir):
                 )
             )
         if req.phase == "FIX":
-            gh.set_head(SHA_B)
-            return block(
-                {
-                    "phase": "FIX",
-                    "status": "success",
-                    "previous_head_sha": SHA_A,
-                    "new_head_sha": SHA_B,
-                    "resolutions": [{"finding_id": "R1-F1", "resolution": "fixed"}],
-                }
-            )
+            return fixer(fixed("R1-F1"))(req)  # one commit; the controller pushes it (#163)
         raise AssertionError(req.phase)
 
-    eng = make_engine(tmp_state_dir, agent, github=gh)
+    eng = make_engine(tmp_state_dir, agent, github=gh, origin=True)
     # Stagnation only escalates from soft_threshold onwards; lower it so the
     # streak is reached in two rounds instead of twelve.
     eng.config.review.replan.soft_threshold = 2
-    gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2])
+    head = publish_pr_head(eng)
+    gh.add_pr(head_sha=head, branch=BRANCH, linked=[2])
     eng.state.phase = Phase.REVIEW
     eng.state.current_pr_url = PR
     eng.state.current_branch = BRANCH
-    eng.state.current_head_sha = SHA_A
+    eng.state.current_head_sha = head
     assert eng.step().next_phase == "FIX"
     assert eng.step().next_phase == "REVIEW"
     out = eng.step()

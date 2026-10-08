@@ -79,8 +79,10 @@ Each line is a summary; the linked document is the precise statement.
   default branch, and the PR the controller opened for it is open, at that
   HEAD, on the issue's branch; the review comment the controller rendered
   from the reviewer's result is on that PR, exactly once, for the right
-  round and SHA; a fix actually moved HEAD; the follow-up issue, the
-  EPIC update and the next issue exist.
+  round and SHA; the fix commit is the fixer's own HEAD, descends from the
+  reviewed HEAD and is the PR's head once the controller has pushed it; the
+  follow-up issues the controller created or recorded a deferral in are the
+  one open issue per finding; the EPIC update and the next issue exist.
   ([GitHub safety](docs/agent-guides/github-safety.md))
 - **Agents never merge.** Every agent prompt carries the rule "never merge a
   pull request" (LOCAL prompts forbid `git merge` and have no PR to merge).

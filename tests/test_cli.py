@@ -25,6 +25,8 @@ from tests.conftest import (
     ci_check,
     comment_url,
     connect_origin,
+    fixed,
+    fixer,
     git_repo,
     implement,
     review_result,
@@ -964,18 +966,7 @@ def test_resume_never_resets_the_step_budget(tmp_path, capsys, monkeypatch, fake
                 "required_resolution": f"different text {rnd}",
             }
             return block(review_result(rnd, gh.prs[PR].head_sha, [finding]))
-        prev = gh.prs[PR].head_sha
-        new = f"{rounds['n']:040x}"
-        gh.set_head(new)
-        return block(
-            {
-                "phase": "FIX",
-                "status": "success",
-                "previous_head_sha": prev,
-                "new_head_sha": new,
-                "resolutions": [{"finding_id": f"R{rounds['n']}-F1", "resolution": "fixed"}],
-            }
-        )
+        return fixer(fixed(f"R{rounds['n']}-F1"))(req)  # the controller pushes it (#163)
 
     fakes["handler"] = agent
     cfg = tmp_path / "autoforge.json"

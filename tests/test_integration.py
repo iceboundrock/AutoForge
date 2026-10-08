@@ -2,8 +2,9 @@
 
 Every agent call is a ScriptedProvider handler that acts the way the real
 agent would (commit in its worktree, which the controller publishes as the
-PR; return a review, whose comment the controller posts; push a fix). State
-is reloaded from disk after every step to prove persistence.
+PR; return a review, whose comment the controller posts; commit a fix, which
+the controller pushes). State is reloaded from disk after every step to prove
+persistence.
 """
 
 import dataclasses
@@ -25,9 +26,9 @@ from tests.conftest import (
     analyze_payload,
     block,
     controller_review_comment,
+    fix_commit,
     implement,
     make_engine,
-    push_fix,
     review_result,
 )
 
@@ -54,13 +55,13 @@ def test_full_loop_to_ready_for_merge(tmp_state_dir):
         if req.phase == "FIX":
             prev = gh.prs[PR].head_sha
             assert "R1-F1" in req.prompt and prev in req.prompt
-            fixed.append(push_fix(req, gh))
+            fixed.append(fix_commit(req))
             return block(
                 {
                     "phase": "FIX",
                     "status": "success",
                     "previous_head_sha": prev,
-                    "new_head_sha": fixed[0],
+                    "head_sha": fixed[0],
                     "resolutions": [
                         {"finding_id": "R1-F1", "resolution": "fixed", "commit_sha": fixed[0]}
                     ],
@@ -133,13 +134,13 @@ def test_each_fix_round_receives_its_own_verified_review_comment(tmp_state_dir):
         if req.phase == "FIX":
             fix_prompts.append(req.prompt)
             prev = gh.prs[PR].head_sha
-            new = push_fix(req, gh)
+            new = fix_commit(req)
             return block(
                 {
                     "phase": "FIX",
                     "status": "success",
                     "previous_head_sha": prev,
-                    "new_head_sha": new,
+                    "head_sha": new,
                     "resolutions": [{"finding_id": f"R{len(heads)}-F1", "resolution": "fixed"}],
                 }
             )
@@ -271,13 +272,13 @@ def test_runaway_review_fix_loop_is_bounded(tmp_state_dir):
             return block(review_result(rnd, gh.prs[PR].head_sha, [finding]))
         if req.phase == "FIX":
             prev = gh.prs[PR].head_sha
-            new = push_fix(req, gh)
+            new = fix_commit(req)
             return block(
                 {
                     "phase": "FIX",
                     "status": "success",
                     "previous_head_sha": prev,
-                    "new_head_sha": new,
+                    "head_sha": new,
                     "resolutions": [
                         {"finding_id": f"R{rounds['n']}-F1", "resolution": "fixed"},
                     ],
@@ -320,13 +321,13 @@ def _full_lifecycle_agent(gh: FakeGitHub):
             return block(review_result(1, head, [finding]))
         if req.phase == "FIX":
             prev = gh.prs[PR].head_sha
-            new = push_fix(req, gh)
+            new = fix_commit(req)
             return block(
                 {
                     "phase": "FIX",
                     "status": "success",
                     "previous_head_sha": prev,
-                    "new_head_sha": new,
+                    "head_sha": new,
                     "resolutions": [
                         {"finding_id": "R1-F1", "resolution": "fixed", "commit_sha": new}
                     ],
@@ -456,13 +457,13 @@ def _six_round_agent(gh: FakeGitHub, clean_round: int = 6):
         if req.phase == "FIX":
             rnd = len(gh.comments.get(PR, []))
             prev = gh.prs[PR].head_sha
-            new = push_fix(req, gh, f"Fix round {rnd} (#2)")
+            new = fix_commit(req, f"Fix round {rnd} (#2)")
             return block(
                 {
                     "phase": "FIX",
                     "status": "success",
                     "previous_head_sha": prev,
-                    "new_head_sha": new,
+                    "head_sha": new,
                     "resolutions": [
                         {"finding_id": f"R{rnd}-F1", "resolution": "fixed", "commit_sha": new}
                     ],

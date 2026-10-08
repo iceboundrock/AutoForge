@@ -251,9 +251,38 @@ def test_fix_prompt_contract():
         "follow_up_created",
         "fixed",
         "previous_head_sha",
-        "new_head_sha",
+        '"head_sha"',
+        '"follow_up_issue"',
+        "commit_sha",
+        "You publish nothing",
+        "the controller creates the\nfollow-up issues you ask for",
+        "it pushes the exact commit you report",
+        "Stay on the detached `HEAD`",
     ):
         assert phrase in text, phrase
+    assert "new_head_sha" not in text
+
+
+def test_fix_prompt_asks_for_no_github_or_remote_write():
+    """#163: the controller owns every FIX effect; the prompt instructs no push,
+    no PR checkout or pull, and no issue or PR write, and says so explicitly."""
+    text = prompts.load_template("fix.md")
+    flat = " ".join(text.split())
+    for forbidden in (
+        "git push",
+        "gh pr checkout",
+        "git pull",
+        "gh issue create",
+        "gh issue edit",
+        "gh pr comment",
+        "gh api",
+    ):
+        assert forbidden not in text, forbidden
+    assert (
+        "do not push, fetch or pull, and do not create, edit, close or comment on any pull "
+        "request or issue" in flat
+    )
+    assert "Do not write a marker or a link back to this PR into the body" in flat
 
 
 def test_replan_prompt_contract():
@@ -410,14 +439,15 @@ def test_fix_prompt_names_the_verified_review_comment_as_authoritative():
     at the reviewed HEAD, and the fixer may not substitute another PR comment
     or round. The PR URL stays, for context only."""
     text = prompts.load_template("fix.md")
+    flat = " ".join(text.split())
     for phrase in (
         "- Verified review comment: {{REVIEW_COMMENT_URL}}",
-        "authoritative review for round {{REVIEW_ROUND}} at HEAD\n`{{REVIEWED_HEAD_SHA}}`",
-        "Do not substitute a different PR comment or\nreview round",
+        "authoritative review for round {{REVIEW_ROUND}} at HEAD `{{REVIEWED_HEAD_SHA}}`",
+        "Do not substitute a different PR comment or review round",
         "The PR URL is given for context only",
         "Read the verified review comment ({{REVIEW_COMMENT_URL}})",
     ):
-        assert phrase in text, phrase
+        assert phrase in flat, phrase
     assert "- PR: {{PR_URL}}" in text
 
 
@@ -439,24 +469,24 @@ def test_engine_fix_prompt_renders_the_persisted_review_comment_url(engine):
 
 
 def test_fix_prompt_hands_over_existing_follow_up_issues():
-    """PR #89 F3: a follow-up issue an earlier fixer created is reported, not recreated."""
+    """PR #89 F3: a follow-up issue that already exists is reported, not recreated."""
     text = prompts.load_template("fix.md")
     for phrase in (
         "{{FOLLOW_UP_ISSUES}}",
-        "line verbatim in its body",
-        "do NOT create a\nsecond one",
-        "the one open issue carrying its finding's",
-        "no open issue\ncarrying its marker",
+        "that issue already is the\nfinding's follow-up",
+        "with that issue's URL as its\n`follow_up_issue_url`",
+        "refuses\nany other resolution of that finding",
         # PR #89 F2 (#90): earlier rounds' deferrals are listed so a re-raised
         # problem is recorded on the existing issue, never in a second one.
         "{{EXISTING_FOLLOW_UP_ISSUES}}",
-        "do not open a second issue",
+        "Do\nnot ask for a second issue",
         "two markers is the follow-up of both findings",
+        "the controller appends this finding's marker to that\nissue",
     ):
         assert phrase in text, phrase
 
 
-def test_engine_fix_prompt_lists_a_marker_and_the_existing_issue_per_finding(engine):
+def test_engine_fix_prompt_lists_the_existing_issue_per_finding_and_no_marker(engine):
     from autoforge.engine import render_follow_up_marker
     from tests.conftest import ISSUE3, PR
 
@@ -468,9 +498,12 @@ def test_engine_fix_prompt_lists_a_marker_and_the_existing_issue_per_finding(eng
     ]
     engine._existing_follow_ups = {"R1-F2": ISSUE3}
     text = engine.render_prompt_for(Phase.FIX)
-    m1, m2 = render_follow_up_marker(PR, "R1-F1"), render_follow_up_marker(PR, "R1-F2")
-    assert f"- R1-F1: marker `{m1}`; existing issue: (none)" in text
-    assert f"- R1-F2: marker `{m2}`; existing issue: {ISSUE3}" in text
+    assert "- R1-F1: existing issue: (none)" in text
+    assert f"- R1-F2: existing issue: {ISSUE3}" in text
+    # #163: the controller writes every follow-up marker; the fixer sees none.
+    for fid in ("R1-F1", "R1-F2"):
+        assert render_follow_up_marker(PR, fid) not in text
+    assert "<!-- ai-follow-up" not in text
 
 
 def test_engine_update_epic_prompt_asks_for_the_full_result_and_no_write(engine):
