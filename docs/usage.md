@@ -154,9 +154,15 @@ that appeared while the agent ran (if it is the implementation, `unblock`
 binds it), a push to, creation or deletion of `autoforge/<n>` it did not
 record (inspect the branch; `unblock` reads it again and the agent continues
 from its head), a closed or merged PR on that branch (reopen it to have it
-adopted, or finish the issue by hand), and a push whose branch moved after
+adopted, or finish the issue by hand), an open PR on that branch the entry
+did not record, such as one opened while the agent ran (`unblock` reads the
+branch again and adopts it, so close it first if it is not the issue's), a
+default branch renamed or switched before the plan was saved (`unblock`
+starts a fresh entry against the new one), and a push whose branch moved after
 the plan was saved (put the branch back, or delete it if it did not exist,
-then `unblock`: the plan completes without launching the agent). A LOCAL
+then `unblock`: the plan completes without launching the agent). A default
+branch changed after the plan was saved blocks before the planned PR is
+created: make the planned branch the default again, then `unblock`. A LOCAL
 run cannot be unblocked. The decision table is in
 [Workflow: leaving BLOCKED](agent-guides/workflow.md#leaving-blocked-the-operators-unblock).
 

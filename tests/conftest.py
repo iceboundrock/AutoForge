@@ -373,6 +373,9 @@ class FakeGitHub:
         # is unset.
         self.origin: Origin | None = None
         self.pr_heads_lag: bool = False
+        # The repository's default branch as ``get_repo`` names it; a test
+        # renames it under a run (#161).
+        self.default_branch: str = "main"
         self._origin_seen: dict[str, str] = {}
         # Issues and PRs up to this number exist beyond the fake's listings
         # (GitHub's one shared sequence): a created PR or issue gets the next.
@@ -481,10 +484,10 @@ class FakeGitHub:
     # -- client API --------------------------------------------------------------
     def current_repo(self) -> RepoInfo:
         self.calls.append(("current_repo",))
-        return RepoInfo(name_with_owner=self.repo, default_branch="main")
+        return RepoInfo(name_with_owner=self.repo, default_branch=self.default_branch)
 
     def get_repo(self, repo: str) -> RepoInfo:
-        return RepoInfo(name_with_owner=repo, default_branch="main")
+        return RepoInfo(name_with_owner=repo, default_branch=self.default_branch)
 
     def get_issue(self, url: str) -> IssueInfo:
         self.calls.append(("get_issue", url))

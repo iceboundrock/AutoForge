@@ -392,6 +392,13 @@ def _finding_what(pr_ref: GitHubPullRequestRef, finding_id: str) -> str:
     return f"finding {finding_id} of PR {pr_ref.canonical}"
 
 
+def _same_pr(a: str, b: str) -> bool:
+    """Whether two PR URLs name one PR, ``""`` standing for no PR on either side."""
+    if not a or not b:
+        return not a and not b
+    return same_pr_url(a, b)
+
+
 def _with_leftovers(message: str, leftovers: str) -> str:
     """``message`` followed by what the invocation left behind, when anything.
 
@@ -547,7 +554,10 @@ class _AnalyzeEntry:
     does not exist), the push's expected old value. ``adopt_url`` is the
     open, unmarked PR already on that branch, which the controller adopts
     instead of opening a second one (ADR 0004 D9.4). In memory only: the
-    persisted half is the entry observation.
+    entry observation persists the default branch at the base, the branch
+    head and the PR to adopt, and the default branch is read again before
+    the plan is journaled and before its PR is created, so a rename since
+    the entry fails closed.
     """
 
     issue_url: str
@@ -3163,6 +3173,11 @@ class ControllerEngine:
           the push is a fast-forward over it. An open, unmarked PR on it is
           the PR the controller adopts. A closed or merged PR on the branch,
           or a branch head the observation does not explain, blocks.
+        - The observation records the default branch, its head, the branch
+          head and the open PR on the branch (or none), and a re-entry it
+          honors finds all of them again or blocks: a PR that appeared on,
+          left or was replaced on the branch, or a default branch renamed
+          since, is never adopted or targeted from a stale read (K2, K3).
 
         Only an unavailable GitHub and a failed fetch propagate (nothing was
         launched and 'resume' reads again); a conclusive failure blocks.
@@ -3201,9 +3216,24 @@ class ControllerEngine:
                     "and never to the default branch. Nothing was launched",
                 )
             if honored is not None:
-                if honored.base_sha is None:
+                recorded_base = [r for r in honored.refs if r != ref]
+                if (
+                    honored.base_sha is None
+                    or len(recorded_base) != 1
+                    or honored.refs[recorded_base[0]] != honored.base_sha
+                ):
                     raise StateError(
-                        "the ANALYZE_EXECUTE entry observation records no default-branch head"
+                        "the ANALYZE_EXECUTE entry observation records no default branch head"
+                    )
+                if recorded_base[0] != f"refs/heads/{default_branch}":
+                    return self._block(
+                        Phase.ANALYZE_EXECUTE,
+                        plan,
+                        self._default_branch_changed_text(
+                            recorded_base[0].removeprefix("refs/heads/"), default_branch
+                        )
+                        + ". Nothing was launched, pushed or created. 'unblock' starts a fresh "
+                        "entry that reads the default branch again",
                     )
                 base_sha = honored.base_sha
             else:
@@ -3230,6 +3260,20 @@ class ControllerEngine:
                 plan,
                 self._unjournaled_branch_text(branch, honored.refs.get(ref), remote_head),
             )
+        adopt_url = parse_pr_url(adopt.url).canonical if adopt is not None else ""
+        if honored is not None:
+            if ref not in honored.prs:
+                raise StateError(
+                    "the ANALYZE_EXECUTE entry observation records no read of the PRs on "
+                    f"{branch!r}"
+                )
+            recorded = honored.prs[ref] or ""
+            if not _same_pr(adopt_url, recorded):
+                return self._block(
+                    Phase.ANALYZE_EXECUTE,
+                    plan,
+                    self._unobserved_branch_pr_text(branch, recorded, adopt_url),
+                )
         wanted = [base_sha] + ([remote_head] if remote_head and remote_head != base_sha else [])
         try:
             self._git_transport().fetch(wanted)
@@ -3240,23 +3284,24 @@ class ControllerEngine:
                 "launched; 'resume' fetches again"
             ) from exc
         if honored is None:
-            # D4.4: persisted by the pre-launch save, so that a branch head or
-            # a marker PR found by a later entry is explained by this read or
-            # not at all.
+            # D4.4: persisted by the pre-launch save, so that a branch head, a
+            # marker PR, an unmarked PR on the branch or the default branch
+            # found by a later entry is explained by this read or not at all.
             state.entry_observation = EntryObservation(
                 Phase.ANALYZE_EXECUTE,
                 state.current_issue_url,
                 state.current_pr_url,
-                {ref: remote_head},
+                {ref: remote_head, f"refs/heads/{default_branch}": base_sha},
                 base_sha,
                 {render_implementation_marker(state.current_issue_url): None},
+                {ref: adopt_url or None},
             ).to_dict()
         self._analyze_entry = _AnalyzeEntry(
             issue_url=state.current_issue_url,
             default_branch=default_branch,
             base_sha=base_sha,
             remote_head=remote_head,
-            adopt_url=parse_pr_url(adopt.url).canonical if adopt is not None else "",
+            adopt_url=adopt_url,
         )
         return None
 
@@ -3337,6 +3382,24 @@ class ControllerEngine:
             "this issue to, and it never pushes over a head it did not record (ADR 0004 "
             "D9.4). Nothing was pushed. Inspect the branch, then 'unblock': the entry reads "
             "it again and the agent continues from its head"
+        )
+
+    def _default_branch_changed_text(self, planned: str, found: str) -> str:
+        return (
+            f"the default branch of {self._require_state().repository} is {found!r}, but this "
+            f"phase's entry read {planned!r} and the candidate was checked against its head: "
+            "the default branch was renamed or switched under the run, and the controller "
+            "opens the implementation PR only onto the default branch it read (ADR 0004 K2)"
+        )
+
+    def _unobserved_branch_pr_text(self, branch: str, recorded: str, found: str) -> str:
+        return (
+            f"the open PR on {branch!r} is {found or 'none'}, but this phase's entry recorded "
+            f"{recorded or 'none'}: a PR was opened, closed or replaced on the branch the "
+            "controller publishes this issue to after the entry read it, and the controller "
+            "adopts only the PR its entry observed (ADR 0004 D9.4). Nothing was pushed or "
+            "written. Inspect that PR, then 'unblock': the entry reads the branch again and "
+            "adopts an open unmarked PR on it, so close the PR first if it is not this issue's"
         )
 
     def _analyze_prompt_variables(self) -> dict[str, str | int | None]:
@@ -7220,10 +7283,11 @@ class ControllerEngine:
         The result was checked before it was accepted
         (:meth:`_check_analyze_result`): the candidate is the worktree's HEAD
         as the controller read it. A precondition read then finds GitHub as
-        the entry observed it: no open PR carries the issue's marker and the
-        branch is at the head the entry recorded; anything else is
-        unexplained and blocks with nothing sent (ADR 0004 D9.4). The PR to
-        adopt, if any, is the open one on the branch now. The push (K1) and
+        the entry observed it: the default branch is the one it read, no
+        open PR carries the issue's marker, the branch is at the head the
+        entry recorded and the open PR on it, if any, is the one the entry
+        recorded; anything else is unexplained and blocks with nothing
+        planned or sent (ADR 0004 D9.4, K2, K3). The push (K1) and
         the PR (K2 to open it, K3 to adopt) are planned and saved with the
         completion context in one save, and :meth:`_complete_analyze` does
         the rest from what was saved, as a later entry would.
@@ -7246,6 +7310,13 @@ class ControllerEngine:
         if pr is not None:
             return Phase.BLOCKED, self._unjournaled_pr_text(parse_pr_url(pr.url).canonical)
         try:
+            default_branch = self.github.get_repo(state.repository).default_branch
+            if default_branch != entry.default_branch:
+                return Phase.BLOCKED, (
+                    self._default_branch_changed_text(entry.default_branch, default_branch)
+                    + ". Nothing was planned, pushed or created. 'unblock' starts a fresh entry "
+                    "that reads the default branch again"
+                )
             head = self._branch_head(branch)
             adopt, problem = self._analyze_branch_pr(branch, entry.default_branch)
             adopt_body = self.github.get_pr(adopt.url).body if adopt is not None else ""
@@ -7253,14 +7324,19 @@ class ControllerEngine:
             raise
         except GitHubError as exc:
             return Phase.BLOCKED, (
-                f"branch {branch!r} or the PRs headed at it could not be read before "
-                f"publishing: {exc}. This is not a transient GitHub failure, so nothing was "
-                "pushed or created. Fix the cause, then 'unblock'"
+                f"the default branch, branch {branch!r} or the PRs headed at it could not be "
+                f"read before publishing: {exc}. This is not a transient GitHub failure, so "
+                "nothing was pushed or created. Fix the cause, then 'unblock'"
             )
         if problem:
             return Phase.BLOCKED, problem
         if head != entry.remote_head:
             return Phase.BLOCKED, self._unjournaled_branch_text(branch, entry.remote_head, head)
+        adopt_url = parse_pr_url(adopt.url).canonical if adopt is not None else ""
+        if not _same_pr(adopt_url, entry.adopt_url):
+            return Phase.BLOCKED, self._unobserved_branch_pr_text(
+                branch, entry.adopt_url, adopt_url
+            )
         owner = EffectOwner(
             run_id=state.run_id,
             phase=Phase.ANALYZE_EXECUTE,
@@ -7293,7 +7369,7 @@ class ControllerEngine:
                 payload={"title": res.pr_title, "body": self._analyze_pr_body(res.pr_body)},
             )
         else:
-            url = parse_pr_url(adopt.url).canonical
+            url = adopt_url
             block = self._analyze_closing_block()
             body = compose_append(adopt_body, block)
             problem = append_problem(f"PR {url}", IMPLEMENTATION, body)
@@ -7324,10 +7400,12 @@ class ControllerEngine:
         """Finish ANALYZE_EXECUTE from the persisted plan: push, open or adopt, read back.
 
         The same code for the step that saved the plan and for every later
-        entry (journal first): each record is reconciled against GitHub and
-        issued at most once, in plan order, so the PR is never opened or
-        adopted before the branch holds the candidate, and a PR to adopt is
-        written to only once GitHub shows it at the candidate. Then the PR is
+        entry (journal first): a PR create still pending blocks with nothing
+        sent when its planned base is no longer the default branch; each
+        record is reconciled against GitHub and issued at most once, in plan
+        order, so the PR is never opened or adopted before the branch holds
+        the candidate, and a PR to adopt is written to only once GitHub shows
+        it at the candidate, onto the default branch. Then the PR is
         read back as the one open PR carrying the issue's marker, the one the
         record observed, headed at exactly the pushed HEAD on the
         controller's branch of this repository and based on the default
@@ -7355,6 +7433,23 @@ class ControllerEngine:
                 "not a transient GitHub failure; nothing was sent again. Fix the cause, then "
                 "'unblock'"
             )
+        planned_base = (
+            str(records[1].target["base"])
+            if records[1].kind is EffectKind.IMPLEMENTATION_PR
+            else default_branch
+        )
+        if records[1].pending and planned_base != default_branch:
+            # K2's base is checked before anything of the plan is sent, the
+            # push included: a create is never issued onto a branch that is
+            # no longer the default (ADR 0004 K2).
+            return Phase.BLOCKED, (
+                self._default_branch_changed_text(planned_base, default_branch)
+                + f". The journaled plan opens the PR onto {planned_base!r}, so the controller "
+                "sends nothing more for it: no push and no PR create (an attempt sent before "
+                f"the change may already show on GitHub). Make {planned_base!r} the default "
+                "branch again, then 'unblock'; otherwise this plan cannot complete, and the "
+                "issue's PR is opened by hand"
+            )
         for index, record in enumerate(records):
             if record.stage == Stage.CONFLICT:
                 return Phase.BLOCKED, self._analyze_conflict_text(record)
@@ -7363,7 +7458,7 @@ class ControllerEngine:
             try:
                 if record.kind is EffectKind.ADOPT_PR:
                     drift = self._adopted_head_problem(
-                        str(record.target["pr_url"]), candidate, expected_old
+                        str(record.target["pr_url"]), candidate, expected_old, default_branch
                     )
                     if drift:
                         return Phase.BLOCKED, drift
@@ -7397,16 +7492,27 @@ class ControllerEngine:
             adopted=records[1].kind is EffectKind.ADOPT_PR,
         )
 
-    def _adopted_head_problem(self, url: str, candidate: str, expected_old: str | None) -> str:
-        """Before K3 writes: the PR to adopt is headed at the pushed candidate, or "".
+    def _adopted_head_problem(
+        self, url: str, candidate: str, expected_old: str | None, default_branch: str
+    ) -> str:
+        """Before K3 writes: the PR to adopt is onto the default branch, at the candidate, or "".
 
         The adoption binds the issue's marker to the PR's code, so it is
-        written only once GitHub shows that code to be the candidate. A head
-        still at the branch's old value is GitHub catching up with the push
+        written only once GitHub shows that code to be the candidate, on a
+        PR that still targets the default branch. A head still at the
+        branch's old value is GitHub catching up with the push
         (:class:`GitHubUnavailableError`, for 'resume'); any other head is
-        something else pushed to the branch, and blocks.
+        something else pushed to the branch, and blocks, as does another
+        base.
         """
         pr = self.github.get_pr(url)
+        if pr.base_ref != default_branch:
+            return (
+                f"PR {url} targets {pr.base_ref!r}, not the default branch {default_branch!r}: "
+                "it was retargeted, or the default branch changed, after the plan was saved, "
+                "so the controller does not adopt it. Nothing was written to the PR. Retarget "
+                "it onto the default branch, then 'unblock'"
+            )
         if pr.head_sha == candidate:
             return ""
         if expected_old is not None and pr.head_sha == expected_old:

@@ -52,12 +52,13 @@ only the controller writes:
   Linked issues and branch names are shape, and shape is never proof of
   provenance (a human's PR, another tool's PR).
 
-Then the default branch head (the candidate's base), the head of
+Then the default branch and its head (the candidate's base), the head of
 `autoforge/<n>` and the PRs headed at that branch are read, both heads are
 fetched into the shared object store through the controller's transport,
-and the entry observation (the branch head, the base, no marker PR) is
-persisted by the pre-launch save, so a branch head or a marker PR a later
-entry finds is explained by this read or not at all:
+and the entry observation (the branch head, the default branch at the base,
+no marker PR, and the open PR on the branch or none) is persisted by the
+pre-launch save, so a branch head, a marker PR, a PR on the branch or a
+default branch a later entry finds is explained by this read or not at all:
 
 - no branch: the agent starts from the default branch head;
 - a branch with no PR: earlier work for the issue; the agent continues from
@@ -71,8 +72,11 @@ entry finds is explained by this read or not at all:
   closed or merged one.
 
 At a re-entry after a launch, a branch head other than the recorded one
-(something else pushed, created or deleted the branch) blocks without
-launching. The base, branch and start commit are rendered into the prompt
+(something else pushed, created or deleted the branch), an open PR on the
+branch other than the recorded one (one opened where the entry recorded
+none, or the recorded one gone), or a default branch other than the
+recorded one (renamed or switched) blocks without launching. The base,
+branch and start commit are rendered into the prompt
 (`DEFAULT_BRANCH`, `BASE_SHA`, `BRANCH`, `START_SHA`); a dry-run plan shows
 placeholders for them. Only `GitHubUnavailableError` and a failed fetch
 propagate (nothing was launched; `resume` reads again).
@@ -94,19 +98,30 @@ inconclusive (`VerificationError`, for `resume`), never a correction.
 
 Then, in order, all from one persisted plan:
 
-1. The precondition read: the open PRs are listed again and the branch and
-   its PRs read again. A marker PR that appeared while the agent ran, a
-   branch head other than the recorded one, or a PR closed on the branch
-   meanwhile blocks with nothing planned or sent. Otherwise the `push`
-   record (the candidate, compare-and-swap against the recorded head) and
-   the `implementation_pr` record (the agent's title, its body followed by
-   `Closes #n` and the marker) or the `adopt_pr` record (the PR's current
-   body followed by the same two lines, against its digest) are saved with
-   the completion context in one save.
-2. The push is driven, then the PR record. An adopted PR is written to only
-   once GitHub shows it headed at the candidate: a head still at the
-   branch's old value is GitHub catching up (transient), any other head
-   blocks.
+1. The precondition read: the default branch is read again, the open PRs
+   are listed again and the branch and its PRs read again. A default
+   branch other than the one the entry read, a marker PR that appeared
+   while the agent ran, a branch head other than the recorded one, a PR
+   closed on the branch meanwhile, or an open PR on the branch other than
+   the one the entry recorded (an unmarked PR opened where the entry saw
+   none is never adopted, ADR 0004 K3) blocks with nothing planned or
+   sent. Otherwise the `push` record (the candidate, compare-and-swap
+   against the recorded head) and the `implementation_pr` record (onto the
+   default branch the entry read; the agent's title, its body followed by
+   `Closes #n` and the marker) or the `adopt_pr` record (the PR the entry
+   recorded; its current body followed by the same two lines, against its
+   digest) are saved with the completion context in one save. The load
+   refuses a plan whose PR the observation does not explain: a create
+   beside an observed PR or onto another base, an adoption of another PR.
+2. Before anything of the plan is sent, and again at every later entry
+   that completes it from the journal, a PR create still pending is
+   checked against the default branch: when its planned base is no longer
+   the default branch it blocks with nothing more sent, the push included
+   (make the planned branch the default again, then `unblock`). The push
+   is driven, then the PR record. An adopted PR is written to only once
+   GitHub shows it onto the default branch and headed at the candidate: a
+   head still at the branch's old value is GitHub catching up (transient),
+   any other head or base blocks.
 3. The read-back: one complete listing of the open PRs, in which exactly
    one carries the issue's marker, and it is the PR the record observed,
    open, of this repository, headed at exactly the pushed candidate on

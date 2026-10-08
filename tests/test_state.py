@@ -1950,6 +1950,14 @@ def _pop(path):
     return mutate
 
 
+def _both(*mutations):
+    def mutate(d):
+        for m in mutations:
+            m(d)
+
+    return mutate
+
+
 def _many(*mutations):
     def mutate(d):
         for m in mutations:
@@ -2117,11 +2125,36 @@ def test_a_corrupt_effect_record_fails_loudly(tmp_path, mutate, needle):
             _set(("entry_observation", "pr_url"), EFFECT_ISSUE),
             "entry_observation.pr_url is not a GitHub URL of the expected kind",
         ),
+        (
+            _set(("entry_observation", "prs"), []),
+            "prs must be a non-empty object of at most 4 refs when stored",
+        ),
+        (
+            _set(("entry_observation", "prs"), {}),
+            "prs must be a non-empty object of at most 4 refs when stored",
+        ),
+        (
+            _set(("entry_observation", "prs"), {f"refs/heads/b{n}": None for n in range(5)}),
+            "prs must be a non-empty object of at most 4 refs when stored",
+        ),
+        (_set(("entry_observation", "prs"), {"main": None}), "must be a full refs/heads/"),
+        (
+            _set(("entry_observation", "prs"), {FIX_REF: None}),
+            f"records a PR on {FIX_REF}, a ref the observation did not read",
+        ),
+        (
+            _both(
+                _set(("entry_observation", "refs"), {FIX_REF: None}),
+                _set(("entry_observation", "prs"), {FIX_REF: EFFECT_ISSUE}),
+            ),
+            f"entry_observation.prs[{FIX_REF}] is not a GitHub URL of the expected kind",
+        ),
     ],
 )
 def test_a_corrupt_entry_observation_fails_loudly(tmp_path, mutate, needle):
     """D4.4: the entry observation is a closed, bounded schema (refs, base,
-    marker-keyed objects); anything else is corruption and refused on load."""
+    marker-keyed objects, the open PR read on a ref it read); anything else
+    is corruption and refused on load."""
     d = _update_epic_state().to_dict()
     mutate(d)
     p = _write(tmp_path / "state.json", d)

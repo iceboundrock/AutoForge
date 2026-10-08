@@ -27,8 +27,9 @@ observation and the completion context together (D2.4).
 
 The **entry observation** (:class:`EntryObservation`, D4.4) is what the
 controller read before the phase's first launch, in a kind-neutral shape:
-remote refs, the base revision, and the marker-bearing objects of the
-phase's identities. It is the launch fence: a difference after the agent
+remote refs, the base revision, the marker-bearing objects of the
+phase's identities, and the open PR headed at a ref, when the phase may
+adopt one. It is the launch fence: a difference after the agent
 returned is something published during the run (ADR 0004 §2.9).
 
 The **completion context** (D4.6) is the validated result data the phase
@@ -46,7 +47,7 @@ from __future__ import annotations
 import hashlib
 import re
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any, NoReturn
 
@@ -223,10 +224,10 @@ def _fail(what: str, message: str) -> NoReturn:
     raise StateError(f"{what} {message}")
 
 
-def _exact(raw: object, keys: Sequence[str], what: str) -> dict:
+def _exact(raw: object, keys: Sequence[str], what: str, optional: Sequence[str] = ()) -> dict:
     if not isinstance(raw, dict):
         _fail(what, f"must be an object, got {type(raw).__name__}")
-    unknown = sorted(str(k) for k in raw if k not in keys)
+    unknown = sorted(str(k) for k in raw if k not in keys and k not in optional)
     if unknown:
         _fail(what, f"has unknown key(s) {unknown}")
     missing = [k for k in keys if k not in raw]
@@ -1022,7 +1023,14 @@ class EntryObservation:
 
     ``refs`` maps a ``refs/heads/...`` ref to its head SHA, or ``None`` when
     the ref was absent. ``objects`` maps a marker (the identity text) to the
-    one object that carried it, or ``None`` when none did.
+    one object that carried it, or ``None`` when none did. ``prs`` maps a
+    ref of ``refs`` whose PRs were read to the one open PR of the repository
+    headed at it, or ``None`` when there was none: the PR a phase may adopt
+    carries no marker yet, so it is recorded by its branch (#161, ADR 0004
+    K3). A ref missing from ``prs`` had its PRs not read, which is not "no
+    PR": a phase that needs the answer fails where it uses it. ``prs`` is
+    stored only when it is not empty, so an observation that read no PR
+    (every phase but ``ANALYZE_EXECUTE``) is stored as before it existed.
     """
 
     phase: Phase
@@ -1031,13 +1039,15 @@ class EntryObservation:
     refs: Mapping[str, str | None]
     base_sha: str | None
     objects: Mapping[str, str | None]
+    prs: Mapping[str, str | None] = field(default_factory=dict)
 
     _KEYS = ("phase", "issue_url", "pr_url", "refs", "base_sha", "objects")
+    _OPTIONAL_KEYS = ("prs",)
 
     @classmethod
     def from_dict(cls, raw: object, binding: Binding) -> EntryObservation:
         what = "entry_observation"
-        data = _exact(raw, cls._KEYS, what)
+        data = _exact(raw, cls._KEYS, what, cls._OPTIONAL_KEYS)
         phase_text = _str(data["phase"], f"{what}.phase", 64)
         try:
             phase = Phase(phase_text)
@@ -1064,10 +1074,30 @@ class EntryObservation:
             _observed_identity(key, f"{what}.objects key")
             if url is not None:
                 _object_url(url, f"{what}.objects value")
-        return cls(phase, data["issue_url"], pr_url, dict(refs), data["base_sha"], dict(objects))
+        prs = data.get("prs", {})
+        if not isinstance(prs, dict) or len(prs) > MAX_OBSERVED_REFS or ("prs" in data and not prs):
+            _fail(
+                f"{what}.prs",
+                f"must be a non-empty object of at most {MAX_OBSERVED_REFS} refs when stored",
+            )
+        for ref, url in prs.items():
+            _ref(ref, f"{what}.prs key")
+            if ref not in refs:
+                _fail(f"{what}.prs", f"records a PR on {ref}, a ref the observation did not read")
+            if url is not None:
+                _pr_url(url, f"{what}.prs[{ref}]")
+        return cls(
+            phase,
+            data["issue_url"],
+            pr_url,
+            dict(refs),
+            data["base_sha"],
+            dict(objects),
+            dict(prs),
+        )
 
     def to_dict(self) -> dict:
-        return {
+        data = {
             "phase": self.phase.value,
             "issue_url": self.issue_url,
             "pr_url": self.pr_url,
@@ -1075,6 +1105,9 @@ class EntryObservation:
             "base_sha": self.base_sha,
             "objects": dict(self.objects),
         }
+        if self.prs:
+            data["prs"] = dict(self.prs)
+        return data
 
 
 def _observed_identity(value: object, what: str) -> None:
@@ -1113,7 +1146,11 @@ class AnalyzeContext:
     implementation PR (K2) on the pushed branch or the adoption (K3), and the
     push is the one the entry observation explains: its base is the
     observed default-branch head and its expected old value the observed
-    head of its ref (#161).
+    head of its ref (#161). So is the PR: the observation read the PRs on
+    the pushed ref, a create follows an observation of none there onto the
+    default branch the observation read (its ref, at the base), and an
+    adoption targets the very PR it recorded (ADR 0004 K2, K3), so a PR
+    that appeared or changed after the entry is never adopted from a plan.
     """
 
     issue_url: str
@@ -1156,6 +1193,26 @@ class AnalyzeContext:
             "refs/heads/" + str(second.target["head"]) != ref
         ):
             _fail(what, "opens its PR from another branch than the one it pushes")
+        if second.kind is EffectKind.IMPLEMENTATION_PR:
+            base_ref = "refs/heads/" + str(second.target["base"])
+            if (
+                base_ref == ref
+                or base_ref not in observation.refs
+                or observation.refs[base_ref] != observation.base_sha
+            ):
+                _fail(
+                    what, "opens its PR onto another branch than the default branch the entry read"
+                )
+        if ref not in observation.prs:
+            _fail(what, "is saved with an entry observation that did not read the PRs on its ref")
+        observed_pr = observation.prs[ref]
+        if second.kind is EffectKind.IMPLEMENTATION_PR and observed_pr is not None:
+            _fail(what, "opens a PR on a branch where the entry observed an open PR")
+        if second.kind is EffectKind.ADOPT_PR and (
+            observed_pr is None
+            or not _same_url(str(second.target["pr_url"]), observed_pr, parse_pr_url)
+        ):
+            _fail(what, "adopts another PR than the one the entry observed on its branch")
         return cls(data["issue_url"])
 
     def to_dict(self) -> dict:

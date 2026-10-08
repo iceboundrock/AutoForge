@@ -686,6 +686,87 @@ def test_analyze_branch_pushed_by_someone_else_during_the_run_blocks(tmp_state_d
     assert fake_github.effect_writes == [] and PR not in fake_github.prs
 
 
+def test_analyze_unmarked_pr_opened_on_the_branch_during_the_run_is_not_adopted(
+    tmp_state_dir, fake_github
+):
+    """R1-F1 (ADR 0004 K3): the controller adopts only the open PR its entry
+    recorded on ``autoforge/<n>``. One opened there while the agent ran,
+    over the very head the entry recorded, is unexplained: nothing is
+    planned, pushed or written. 'unblock' starts a fresh entry, which reads
+    the branch again and adopts it."""
+    eng = make_engine(tmp_state_dir, None, github=fake_github, origin=True)
+    earlier = _earlier_work(eng)
+
+    def opens_a_pr_meanwhile(req):
+        reply = _from_start(req)
+        fake_github.add_pr(PR41, head_sha=earlier, branch="autoforge/2", body="Started by hand.")
+        return reply
+
+    eng.provider._handler = scripted(opens_a_pr_meanwhile, _reports_head)
+    out = _analyzed(eng)
+    assert out.next_phase == "BLOCKED"
+    assert (
+        f"the open PR on 'autoforge/2' is {PR41}, but this phase's entry recorded none"
+        in eng.state.block_reason
+    )
+    s = load_state(eng.paths.state_file)
+    assert s.entry_observation["prs"] == {"refs/heads/autoforge/2": None}
+    assert not s.effect_records and not s.completion_context
+    assert fake_github.effect_writes == [] and eng.origin.head("autoforge/2") == earlier
+    assert fake_github.prs[PR41].body == "Started by hand."
+
+    assert eng.unblock("that PR is the issue's").unblocked
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    candidate = _worktree_head(eng.provider.calls[1])
+    assert eng.state.current_pr_url == PR41 and eng.state.current_head_sha == candidate
+    assert fake_github.prs[PR41].body == f"Started by hand.\n\n{CLOSING}"
+    assert [w[0] for w in fake_github.effect_writes] == ["write_pr_body"]
+
+
+def test_analyze_correction_after_an_unmarked_pr_appeared_on_the_branch_blocks_before_relaunching(
+    tmp_state_dir, fake_github
+):
+    """R1-F1 across re-entry: the observation saved before the first launch
+    records no PR on the branch, so the correction relaunch's entry, which
+    honors it, blocks on a PR opened there meanwhile instead of launching an
+    agent whose work would be published to it."""
+    eng = make_engine(tmp_state_dir, None, github=fake_github, origin=True)
+    earlier = _earlier_work(eng)
+
+    def opens_a_pr_and_loses_the_block(req):
+        _from_start(req)
+        fake_github.add_pr(PR41, head_sha=earlier, branch="autoforge/2", body="Started by hand.")
+        return "no block here\n"
+
+    eng.provider._handler = scripted(opens_a_pr_and_loses_the_block)
+    out = _analyzed(eng)
+    assert out.next_phase == "BLOCKED"
+    assert len(eng.provider.calls) == 1
+    assert (
+        f"the open PR on 'autoforge/2' is {PR41}, but this phase's entry recorded none"
+        in eng.state.block_reason
+    )
+    assert fake_github.effect_writes == [] and eng.origin.head("autoforge/2") == earlier
+
+
+def test_analyze_correction_adopts_the_pr_its_entry_observed(tmp_state_dir, fake_github):
+    """K3 across re-entry: the PR the first entry recorded on the branch is
+    still the one there at the correction relaunch, so the honored
+    observation explains it and the corrected result adopts it."""
+    eng = make_engine(tmp_state_dir, None, github=fake_github, origin=True)
+    earlier = _earlier_work(eng)
+    fake_github.add_pr(PR41, head_sha=earlier, branch="autoforge/2", body="Started by hand.")
+    eng.provider._handler = scripted(
+        lambda req: (_from_start(req), "no block here\n")[1], _reports_head
+    )
+    out = _analyzed(eng)
+    assert out.next_phase == "REVIEW", out.message
+    assert len(eng.provider.calls) == 2 and eng.provider.calls[1].correction
+    assert eng.state.current_pr_url == PR41
+    assert [w[0] for w in fake_github.effect_writes] == ["write_pr_body"]
+
+
 def test_analyze_unavailable_github_at_publication_relaunches_from_the_agents_commit(
     tmp_state_dir, fake_github, monkeypatch
 ):
@@ -829,6 +910,137 @@ def test_analyze_branch_moved_after_the_plan_conflicts_and_unblock_completes_the
     assert out.next_phase == "REVIEW", out.message
     assert eng2.provider.calls == []
     assert eng.origin.head("autoforge/2") == candidate == eng2.state.current_head_sha
+
+
+def _rename_main_to_trunk(eng, gh) -> None:
+    """GitHub renames the default branch: ``trunk`` at ``main``'s head is now the default."""
+    eng.origin.publish(eng.workdir, eng.origin.head("main"), "trunk")
+    gh.default_branch = "trunk"
+
+
+def test_analyze_default_branch_renamed_during_the_run_plans_nothing(tmp_state_dir, fake_github):
+    """R1-F2 (ADR 0004 K2): the PR is opened onto the default branch the entry
+    read, and only while it is still the default. A rename while the agent
+    ran blocks before the plan is saved, with nothing pushed or created;
+    'unblock' starts a fresh entry, which opens the PR onto the new one."""
+    eng = make_engine(tmp_state_dir, None, github=fake_github, origin=True)
+
+    def renames_meanwhile(req):
+        reply = implement(req)
+        _rename_main_to_trunk(eng, fake_github)
+        return reply
+
+    eng.provider._handler = scripted(renames_meanwhile, _reports_head)
+    out = _analyzed(eng)
+    assert out.next_phase == "BLOCKED"
+    assert (
+        "the default branch of owner/repo is 'trunk', but this phase's entry read 'main'"
+        in eng.state.block_reason
+    )
+    assert "Nothing was planned, pushed or created" in eng.state.block_reason
+    s = load_state(eng.paths.state_file)
+    assert not s.effect_records and not s.completion_context
+    assert fake_github.effect_writes == [] and eng.origin.head("autoforge/2") is None
+
+    assert eng.unblock("the default branch was renamed").unblocked
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert fake_github.prs[PR].base_ref == "trunk"
+    assert [w[0] for w in fake_github.effect_writes] == ["create_pull_request"]
+
+
+def test_analyze_correction_after_the_default_branch_was_renamed_blocks_before_relaunching(
+    tmp_state_dir, fake_github
+):
+    """R1-F2 across re-entry: the observation records the default branch the
+    candidate is checked against, so the correction relaunch's entry blocks
+    after a rename instead of relaunching against a base it did not read."""
+    eng = make_engine(tmp_state_dir, None, github=fake_github, origin=True)
+
+    def renames_and_loses_the_block(req):
+        commit_in(req.cwd)
+        _rename_main_to_trunk(eng, fake_github)
+        return "no block here\n"
+
+    eng.provider._handler = scripted(renames_and_loses_the_block)
+    out = _analyzed(eng)
+    assert out.next_phase == "BLOCKED"
+    assert len(eng.provider.calls) == 1
+    assert (
+        "the default branch of owner/repo is 'trunk', but this phase's entry read 'main'"
+        in eng.state.block_reason
+    )
+    assert "Nothing was launched, pushed or created" in eng.state.block_reason
+    assert fake_github.effect_writes == [] and eng.origin.head("autoforge/2") is None
+
+
+@pytest.mark.parametrize("attempted", [False, True], ids=["planned", "create-attempted"])
+def test_analyze_default_branch_renamed_after_the_plan_creates_no_pr(
+    tmp_state_dir, fake_github, monkeypatch, attempted
+):
+    """R1-F2 with journal recovery: a PR create still pending in the persisted
+    plan is checked against the default branch before anything of the plan
+    is sent, the push included, and a rename since the plan blocks with no
+    PR created. Once the planned branch is the default again, 'unblock'
+    completes the plan from the journal without launching the agent."""
+    from autoforge.engine import ControllerEngine
+
+    eng = make_engine(tmp_state_dir, implement, github=fake_github, origin=True)
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    if attempted:
+        fake_github.write_failures.append(
+            ("create_pull_request", GitHubUnavailableError("gh: HTTP 502"), False)
+        )
+        with pytest.raises(GitHubUnavailableError, match="'resume' reconciles it"):
+            eng.step()
+    else:
+        monkeypatch.setattr(ControllerEngine, "_complete_analyze", _crash)
+        with pytest.raises(KeyboardInterrupt):
+            eng.step()
+        monkeypatch.undo()
+    candidate = _worktree_head(eng.provider.calls[0])
+    pushed = eng.origin.head("autoforge/2")
+    assert pushed == (candidate if attempted else None)
+    writes = list(fake_github.effect_writes)
+    _rename_main_to_trunk(eng, fake_github)
+
+    eng2 = _resumed(eng, tmp_state_dir, fake_github, "never")
+    out = eng2.step()
+    assert out.next_phase == "BLOCKED"
+    assert "The journaled plan opens the PR onto 'main'" in eng2.state.block_reason
+    assert eng2.provider.calls == []
+    assert eng.origin.head("autoforge/2") == pushed
+    assert fake_github.effect_writes == writes and PR not in fake_github.prs
+
+    fake_github.default_branch = "main"
+    assert eng2.unblock("main is the default branch again").unblocked
+    out = eng2.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert eng2.provider.calls == []
+    assert eng.origin.head("autoforge/2") == candidate == eng2.state.current_head_sha
+    assert fake_github.prs[PR].base_ref == "main"
+
+
+def test_analyze_adoption_of_a_pr_retargeted_after_the_plan_blocks(tmp_state_dir, fake_github):
+    """R1-F2 for K3: the PR to adopt still targets the default branch when its
+    body is written, or it is not adopted; nothing is written to it."""
+    eng = make_engine(tmp_state_dir, _from_start, github=fake_github, origin=True)
+    earlier = _earlier_work(eng)
+    fake_github.add_pr(PR41, head_sha=earlier, branch="autoforge/2", body="Started by hand.")
+    fake_github.pr_heads_lag = True
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    with pytest.raises(GitHubUnavailableError, match="has not caught up"):
+        eng.step()
+    fake_github.pr_heads_lag = False
+    fake_github.prs[PR41].base_ref = "release"
+
+    eng2 = _resumed(eng, tmp_state_dir, fake_github, "never")
+    out = eng2.step()
+    assert out.next_phase == "BLOCKED"
+    assert f"PR {PR41} targets 'release', not the default branch 'main'" in (
+        eng2.state.block_reason
+    )
+    assert fake_github.effect_writes == [] and MARKER not in fake_github.prs[PR41].body
 
 
 def test_analyze_dry_run_plans_the_publication_and_sends_nothing(tmp_state_dir, fake_github):

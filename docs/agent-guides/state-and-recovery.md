@@ -92,7 +92,16 @@ A REMOTE run also records the effect state of the current phase entry (ADR
   stored bound fit in `MAX_EFFECT_STATE_CHARS`.
 - `entry_observation`: what the entry's identity reads saw before the
   phase's first launch (D4.4), so that an object found later is explained by
-  a record, by this observation, or not at all (D9.1).
+  a record, by this observation, or not at all (D9.1): the heads of the refs
+  it read, the base, the marker-bearing objects, and, under the optional
+  key `prs`, the one open PR headed at a ref it read, or none. `prs` is
+  stored only when PRs were read (`ANALYZE_EXECUTE`, whose adoption
+  candidate carries no marker yet, #161), so every other phase's
+  observation is stored exactly as before; a ref missing from `prs` was
+  not read, which is never taken for "no PR", and a stored `prs` that is
+  empty, over its bound, or names a ref the observation did not read is
+  refused. The `ANALYZE_EXECUTE` observation also records the default
+  branch it read, as a ref at the base.
 - `completion_context`: what the phase needs to finish without relaunching
   its agent once its result is accepted (D4.6). For `UPDATE_EPIC` this is
   the roadmap section, the validated selection, the digests of the EPIC body
@@ -124,8 +133,12 @@ completion context loads only with its plan of exactly two records, the
 `push` first and then the `implementation_pr` from the pushed branch or the
 `adopt_pr`, and with the entry observation it is checked against: the push
 is over the head the entry observed on its ref, for a candidate checked
-against the base the entry read. Anything else is refused, so a plan whose
-push no entry read explains is never completed. Text the recovery path
+against the base the entry read; the observation read the PRs on that ref;
+an `implementation_pr` follows an observation of no open PR there and is
+onto the default branch the observation records at the base; an
+`adopt_pr` targets the very PR the observation recorded there. Anything
+else is refused, so a plan whose push or PR no entry read explains is
+never completed. Text the recovery path
 publishes with no agent result in between is validated again under the
 parser's rules for its field, not only for its bounds and redaction
 invariance: the `UPDATE_EPIC` roadmap section in the

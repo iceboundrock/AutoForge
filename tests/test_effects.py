@@ -64,6 +64,7 @@ from autoforge.effects import (
     EffectKind,
     EffectOwner,
     EffectRecord,
+    EntryObservation,
     FixContext,
     Stage,
     compose_append,
@@ -175,6 +176,7 @@ def impl_record(
     title: str = "Implement #2",
     body: str | None = None,
     head: str = BRANCH,
+    base: str = "main",
     by: EffectOwner = ANALYZE_OWNER,
 ) -> EffectRecord:
     return EffectRecord.plan(
@@ -182,7 +184,7 @@ def impl_record(
         EffectKind.IMPLEMENTATION_PR,
         by,
         identity={"repository": REPO, "marker": IMPL_MARKER, "head_branch": head},
-        target={"repository": REPO, "base": "main", "head": head},
+        target={"repository": REPO, "base": base, "head": head},
         precondition={"absent": True},
         payload={
             "title": title,
@@ -1297,14 +1299,25 @@ ANALYZE_BINDING = Binding(RUN_ID, Phase.ANALYZE_EXECUTE, ISSUE, "", 0, "")
 ANALYZE_REF = f"refs/heads/{BRANCH}"
 
 
-def analyze_observation(head: str | None = SHA_A, base: str | None = SHA_C, ref=ANALYZE_REF):
+def analyze_observation(
+    head: str | None = SHA_A,
+    base: str | None = SHA_C,
+    ref: str = ANALYZE_REF,
+    *,
+    pr: str | None = None,
+    prs: dict | None = None,
+    default_refs: dict | None = None,
+):
+    """The ANALYZE_EXECUTE entry read: the branch, the default branch at the base, its PR."""
+    default = {"refs/heads/main": base} if default_refs is None else default_refs
     return {
         "phase": "ANALYZE_EXECUTE",
         "issue_url": ISSUE,
         "pr_url": "",
-        "refs": {ref: head},
+        "refs": {ref: head, **default},
         "base_sha": base,
         "objects": {IMPL_MARKER: None},
+        **({"prs": {ref: pr}} if prs is None else {"prs": prs} if prs else {}),
     }
 
 
@@ -1312,12 +1325,32 @@ def analyze_push() -> EffectRecord:
     return push_record(by=ANALYZE_OWNER)
 
 
-@pytest.mark.parametrize("second", [impl_record, adopt_record], ids=["create", "adopt"])
-def test_an_analyze_context_loads_with_its_push_and_pr_plan(second):
+@pytest.mark.parametrize("pr", [None, PR], ids=["no-pr", "pr"])
+def test_an_analyze_observation_round_trips_with_the_pr_on_its_branch(pr):
+    """#161: the open PR the entry read on the branch, or none, is stored by its ref."""
+    raw = analyze_observation(pr=pr)
+    observation = EntryObservation.from_dict(raw, ANALYZE_BINDING)
+    assert observation.prs == {ANALYZE_REF: pr}
+    assert observation.to_dict() == raw
+
+
+def test_an_observation_that_read_no_pr_is_stored_without_prs():
+    """#161: ``prs`` is written only when PRs were read, so other phases' are unchanged."""
+    raw = analyze_observation(prs={})
+    assert "prs" not in raw
+    observation = EntryObservation.from_dict(raw, ANALYZE_BINDING)
+    assert observation.prs == {}
+    assert observation.to_dict() == raw
+
+
+@pytest.mark.parametrize(
+    ("second", "pr"), [(impl_record, None), (adopt_record, PR)], ids=["create", "adopt"]
+)
+def test_an_analyze_context_loads_with_its_push_and_pr_plan(second, pr):
     """#161: the context, the push then the PR create or adoption, and the observation load."""
     effects = load_phase_effects(
         [analyze_push().to_dict(), second().to_dict()],
-        analyze_observation(),
+        analyze_observation(pr=pr),
         AnalyzeContext(ISSUE).to_dict(),
         ANALYZE_BINDING,
     )
@@ -1345,6 +1378,43 @@ def test_an_analyze_context_loads_with_its_push_and_pr_plan(second):
             analyze_observation(),
             "from another branch than the one it pushes",
         ),
+        (
+            [analyze_push().to_dict(), impl_record(base="trunk").to_dict()],
+            analyze_observation(),
+            "onto another branch than the default branch the entry read",
+        ),
+        (
+            None,
+            analyze_observation(default_refs={}),
+            "onto another branch than the default branch the entry read",
+        ),
+        (
+            None,
+            analyze_observation(default_refs={"refs/heads/main": SHA_B}),
+            "onto another branch than the default branch the entry read",
+        ),
+        (
+            [analyze_push().to_dict(), impl_record(base=BRANCH).to_dict()],
+            analyze_observation(),
+            "onto another branch than the default branch the entry read",
+        ),
+        (None, analyze_observation(prs={}), "did not read the PRs on its ref"),
+        (
+            None,
+            analyze_observation(prs={"refs/heads/main": None}),
+            "did not read the PRs on its ref",
+        ),
+        (None, analyze_observation(pr=PR), "where the entry observed an open PR"),
+        (
+            [analyze_push().to_dict(), adopt_record().to_dict()],
+            analyze_observation(),
+            "adopts another PR than the one the entry observed",
+        ),
+        (
+            [analyze_push().to_dict(), adopt_record().to_dict()],
+            analyze_observation(pr=PR43),
+            "adopts another PR than the one the entry observed",
+        ),
     ],
     ids=[
         "no-plan",
@@ -1356,6 +1426,15 @@ def test_an_analyze_context_loads_with_its_push_and_pr_plan(second):
         "branch-observed-absent",
         "other-base",
         "pr-from-another-branch",
+        "pr-onto-another-base-branch",
+        "default-branch-not-observed",
+        "default-branch-at-another-head",
+        "pr-onto-its-own-branch",
+        "prs-not-read",
+        "prs-read-on-another-ref",
+        "create-beside-an-observed-pr",
+        "adopt-where-none-was-observed",
+        "adopt-another-pr",
     ],
 )
 def test_an_analyze_context_the_entry_does_not_explain_fails_loudly(records, observation, match):

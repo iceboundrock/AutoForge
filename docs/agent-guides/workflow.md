@@ -325,8 +325,9 @@ next entry could not find again.
   exists, without launching the agent; two candidates block, and so does a
   listing that cannot be read to its end, since "none exists" is then not
   knowable. After a launch of the entry, a marker PR the entry observation
-  did not record was not opened by the controller and blocks, as does a
-  branch head other than the recorded one. A PR is identified by that
+  did not record was not opened by the controller and blocks, as do a
+  branch head, an open PR on the branch or a default branch other than the
+  recorded one. A PR is identified by that
   marker alone, never by its branch name or a linked issue; the read-back
   after the controller's own write holds the PR to the same rule
   (github-safety.md, "Before ANALYZE_EXECUTE"), and so does the replan

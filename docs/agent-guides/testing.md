@@ -208,7 +208,12 @@ High-priority coverage includes:
   linking the issue itself) is a correction with nothing published; the
   entry blocks before launching on a PR it would not publish to; a marker
   PR the agent opened itself, a branch pushed by someone else, or GitHub
-  changing under the run blocks with nothing published
+  changing under the run blocks with nothing published; an unmarked PR
+  that appears on the branch after the entry is never adopted, at the plan
+  or at a re-entry; a default branch renamed during the run, across a
+  re-entry, or after the plan (also with the create attempted) blocks with
+  no PR created, and an adopted PR retargeted after the plan is not
+  written to
 
 ### Recovery
 
