@@ -75,6 +75,7 @@ from .result_parser import (
     MAX_RESOLUTIONS_PER_FIX,
     MAX_ROADMAP_SECTION_CHARS,
     MAX_URL_CHARS,
+    REVIEW_PROSE_SECTIONS,
     Finding,
     ReviewResult,
     check_published_finding,
@@ -82,6 +83,7 @@ from .result_parser import (
     validate_pr_body,
     validate_pr_title,
     validate_progress_text,
+    validate_review_section,
     validate_roadmap_section,
 )
 from .transitions import Phase
@@ -1028,6 +1030,9 @@ def _cross_review_comment(record: EffectRecord, what: str) -> None:
     if claim.reviewed_base_ref is None or claim.reviewed_merge_base_sha is None:
         _fail(what, "carries a review marker without the base it reviewed, which no round binds")
     _check_body_ends_with_marker(record, record.identity["marker"], what)
+    # The rest of the body is checked where its source is: the REVIEW
+    # completion context saved with it must render exactly this body from
+    # fields that pass the parser's rules (ReviewContext.from_dict).
     if record.observed is not None and not parse_comment_url(record.observed["url"]).on(
         parse_pr_url(record.target["pr_url"])
     ):
@@ -1333,11 +1338,15 @@ class AnalyzeContext:
 
 @dataclass(frozen=True)
 class ReviewContext:
-    """``REVIEW``: the round, ``needs_fix_round`` and the findings, in result order.
+    """``REVIEW``: the round, ``needs_fix_round``, the findings and the prose sections.
 
     It is saved with the round's review comment (K4) alone, and the
     comment's marker is the context's verdict: the same round, the same
     ``needs_fix_round`` and the findings' ids in the same order (#162).
+    The comment's body is exactly what :func:`review_comment_body` renders
+    from the context at the revision the marker binds, so every published
+    field of a body that recovery posts was validated under the parser's
+    rules when the state was loaded, not only when the result was accepted.
     """
 
     issue_url: str
@@ -1345,11 +1354,20 @@ class ReviewContext:
     round: int
     needs_fix_round: bool
     findings: tuple[dict, ...]
+    sections: dict[str, str]
 
     PHASE = Phase.REVIEW
     # A finding's stored form is bounded by its parser fields.
     _FINDING_BOUND = 2000 + 200 + 300 + MAX_FINDING_ID_CHARS + 16 + 5 * _KEY_OVERHEAD
-    STORED_BOUND = 2 * MAX_URL_CHARS + MAX_FINDINGS_PER_REVIEW * _FINDING_BOUND + 6 * _KEY_OVERHEAD
+    _SECTIONS_BOUND = (
+        sum(limit + _KEY_OVERHEAD for _, limit in REVIEW_PROSE_SECTIONS) + _KEY_OVERHEAD
+    )
+    STORED_BOUND = (
+        2 * MAX_URL_CHARS
+        + MAX_FINDINGS_PER_REVIEW * _FINDING_BOUND
+        + _SECTIONS_BOUND
+        + 7 * _KEY_OVERHEAD
+    )
 
     @classmethod
     def from_dict(
@@ -1362,7 +1380,10 @@ class ReviewContext:
     ) -> ReviewContext:
         what = "REVIEW completion context"
         data = _context_header(
-            raw, ("issue_url", "pr_url", "round", "needs_fix_round", "findings"), binding, cls.PHASE
+            raw,
+            ("issue_url", "pr_url", "round", "needs_fix_round", "findings", "sections"),
+            binding,
+            cls.PHASE,
         )
         _issue_url(data["issue_url"], f"{what}.issue_url")
         binding.check_issue(data["issue_url"], what)
@@ -1378,6 +1399,7 @@ class ReviewContext:
         raw_findings = data["findings"]
         if not isinstance(raw_findings, list) or len(raw_findings) > MAX_FINDINGS_PER_REVIEW:
             _fail(f"{what}.findings", f"must be a list of at most {MAX_FINDINGS_PER_REVIEW}")
+        parsed_findings: list[Finding] = []
         findings: list[dict] = []
         for i, item in enumerate(raw_findings):
             try:
@@ -1389,21 +1411,63 @@ class ReviewContext:
             parsed = finding.to_dict()
             if parsed != item:
                 _fail(f"{what}.findings[{i}]", "is not in the parser's stored form")
+            parsed_findings.append(finding)
             findings.append(parsed)
         if len({f["id"] for f in findings}) != len(findings):
             _fail(f"{what}.findings", "repeats a finding id")
         if needs_fix != bool(findings):
             _fail(f"{what}.needs_fix_round", "must be true exactly when findings are present")
+        sections = cls._sections(data["sections"], f"{what}.sections")
         if [r.kind for r in records] != [EffectKind.REVIEW_COMMENT]:
             _fail(what, "must be saved with exactly one review comment")
-        claim = _marker_claim(REVIEW, records[0].identity["marker"])
+        record = records[0]
+        claim = _marker_claim(REVIEW, record.identity["marker"])
         if (
             claim.round != round_
             or claim.needs_fix_round != needs_fix
             or claim.finding_ids != tuple(f["id"] for f in findings)
         ):
             _fail(what, "disagrees with its review comment's marker on the round's verdict")
-        return cls(data["issue_url"], data["pr_url"], round_, needs_fix, tuple(findings))
+        # A resumed create posts the body with no reviewer result in between
+        # (D4.6), so the body must be the controller's rendering of what was
+        # just validated, at the revision its marker binds: nothing else in it
+        # is the reviewer's, and nothing in it escaped the parser's rules.
+        # The record's own check has already refused a marker without a base.
+        result = ReviewResult(
+            round=round_,
+            reviewed_head_sha=claim.reviewed_head_sha,
+            needs_fix_round=needs_fix,
+            findings=parsed_findings,
+            sections=sections,
+        )
+        rendered = review_comment_body(
+            result,
+            claim.reviewed_head_sha,
+            claim.reviewed_base_ref or "",
+            claim.reviewed_merge_base_sha or "",
+        )
+        if record.body != rendered:
+            _fail(
+                what,
+                "is saved with a review comment whose body is not the comment the controller "
+                "renders from it",
+            )
+        return cls(data["issue_url"], data["pr_url"], round_, needs_fix, tuple(findings), sections)
+
+    @staticmethod
+    def _sections(raw: object, what: str) -> dict[str, str]:
+        """The prose sections, each in the stored form the parser returns for it."""
+        data = _exact(raw, tuple(key for key, _ in REVIEW_PROSE_SECTIONS), what)
+        sections: dict[str, str] = {}
+        for key, _ in REVIEW_PROSE_SECTIONS:
+            try:
+                parsed = validate_review_section(key, data[key])
+            except ControlResultValidationError as exc:
+                _fail(f"{what}.{key}", f"is invalid: {exc}")
+            if parsed != data[key]:
+                _fail(f"{what}.{key}", "is not in the parser's stored form")
+            sections[key] = parsed
+        return sections
 
     def to_dict(self) -> dict:
         return {
@@ -1413,6 +1477,7 @@ class ReviewContext:
             "round": self.round,
             "needs_fix_round": self.needs_fix_round,
             "findings": [dict(f) for f in self.findings],
+            "sections": dict(self.sections),
         }
 
 

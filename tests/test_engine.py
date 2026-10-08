@@ -9142,6 +9142,67 @@ def test_k4_intent_saved_and_write_never_issued_posts_once_without_a_relaunch(
     assert s.last_review_comment_url == controller_review_comment(eng, 1).url
 
 
+def _tamper_body_only(data: dict) -> None:
+    """An @-mention added to the persisted body's summary; the context is untouched."""
+    payload = data["effect_records"][0]["payload"]
+    assert payload["body"].count("## Summary\n\nReady.") == 1
+    payload["body"] = payload["body"].replace(
+        "## Summary\n\nReady.", "## Summary\n\nReady, @octocat."
+    )
+
+
+def _tamper_section_and_body(data: dict) -> None:
+    """The same mention in the context's summary, and the body re-rendered from it."""
+    res = ReviewResult.from_payload(review_result(1, SHA_A, [_finding(1)]))
+    res.sections["summary"] = "Ready, @octocat."
+    data["completion_context"]["sections"]["summary"] = res.sections["summary"]
+    data["effect_records"][0]["payload"]["body"] = render_review_comment(
+        res, SHA_A, "main", MERGE_BASE
+    )
+
+
+@pytest.mark.parametrize(
+    ("tamper", "needle"),
+    [
+        pytest.param(
+            _tamper_body_only,
+            "whose body is not the comment the controller renders from it",
+            id="body-only",
+        ),
+        pytest.param(
+            _tamper_section_and_body,
+            "sections.summary is invalid: REVIEW: field 'summary' contains an @-mention",
+            id="section-and-body",
+        ),
+    ],
+)
+def test_k4_a_persisted_body_altered_after_the_save_is_refused_and_never_posted(
+    tmp_state_dir, fake_github, tamper, needle
+):
+    """The plan is journaled and the write never issued; the file is then edited
+    so that the K4 body carries an @-mention, alone or together with the
+    context's section it renders. Recovery posts the persisted body with no
+    reviewer result in between, so loading the state refuses it (ADR 0004
+    D4.6): nothing is posted, the reviewer is not relaunched, and the file is
+    left for the operator."""
+    eng = _in_review(tmp_state_dir, fake_github, [block(review_result(1, SHA_A, [_finding(1)]))])
+    eng._persist_effect = _crash_on_first_call(eng._persist_effect)
+    with pytest.raises(RuntimeError, match="power loss"):
+        eng.step()
+    data = json.loads(eng.paths.state_file.read_text(encoding="utf-8"))
+    assert data["effect_records"][0]["stage"] == "intended"
+    tamper(data)
+    eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
+    before = eng.paths.state_file.read_bytes()
+
+    with pytest.raises(StateError) as exc:
+        eng.load()
+    assert needle in str(exc.value) and "@octocat" not in str(exc.value)
+    assert fake_github.effect_writes == [] and PR not in fake_github.comments
+    assert len(eng.provider.calls) == 1
+    assert eng.paths.state_file.read_bytes() == before
+
+
 @pytest.mark.parametrize("stale", [False, True], ids=["bound", "stale"])
 def test_k4_create_landed_save_lost_completes_as_an_uninterrupted_round(
     tmp_path, tmp_state_dir, fake_github, stale

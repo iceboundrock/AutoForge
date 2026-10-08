@@ -255,7 +255,11 @@ High-priority coverage includes:
   carried findings, the review history, the next phase); a write lost in
   flight is reconciled and issued once more; a second matching comment, or
   one posted by someone else after the intent, blocks naming it; `unblock`
-  with a saved plan completes the round without the reviewer
+  with a saved plan completes the round without the reviewer; a persisted
+  comment body edited after the save (alone, or with the context's prose
+  section it renders) is refused on load and never posted
+  (`tests/test_state.py` covers each edit: a body that is not the
+  rendering of its context, and a section the parser would refuse)
 
 ### Integration
 

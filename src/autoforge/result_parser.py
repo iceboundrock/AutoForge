@@ -1030,8 +1030,7 @@ class ReviewResult:
         for finding in findings:
             check_published_finding(finding)
         sections = {
-            key: _review_published(_review_section(p, key, limit), key)
-            for key, limit in REVIEW_PROSE_SECTIONS
+            key: validate_review_section(key, p.get(key)) for key, _ in REVIEW_PROSE_SECTIONS
         }
         return cls(
             round=rnd,
@@ -1058,11 +1057,21 @@ def check_published_finding(finding: Finding) -> None:
     _review_published(finding.required_resolution, f"{finding.id}.required_resolution")
 
 
-def _review_section(p: dict, key: str, limit: int) -> str:
-    """REVIEW prose section ``key``: non-blank, bounded, multi-line printable text."""
+def validate_review_section(key: str, text: object) -> str:
+    """``text`` as REVIEW prose section ``key``, or a rejection (#162).
+
+    Non-blank, within the section's bound (:data:`REVIEW_PROSE_SECTIONS`),
+    multi-line text with no other control character, and publishable
+    (:func:`published_text_problem`): the controller renders it into the
+    round's review comment under its fixed heading. The checks
+    :meth:`ReviewResult.from_payload` applies, with the same messages, so a
+    persisted section can be re-validated under the parser's rules.
+    """
     ph = "REVIEW"
-    text = _req_str(p, key, ph)
-    return _multi_line(_bounded(text, ph, "result", key, limit), ph, "result", key)
+    limit = dict(REVIEW_PROSE_SECTIONS)[key]
+    stripped = _req_str({key: text}, key, ph)
+    stripped = _multi_line(_bounded(stripped, ph, "result", key, limit), ph, "result", key)
+    return _review_published(stripped, key)
 
 
 def _review_published(text: str, subject: str) -> str:

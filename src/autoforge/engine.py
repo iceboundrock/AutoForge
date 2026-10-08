@@ -7838,6 +7838,7 @@ class ControllerEngine:
             res.round,
             res.needs_fix_round,
             tuple(f.to_dict() for f in res.findings),
+            dict(res.sections),
         )
         state.effect_records = [record.to_dict()]
         state.completion_context = context.to_dict()

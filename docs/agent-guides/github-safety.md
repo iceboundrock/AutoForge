@@ -266,8 +266,12 @@ Then, in order, all from one persisted plan:
    carrying the round's marker at the bound revision that appeared while
    the reviewer ran blocks with nothing planned or posted, as at entry.
    Otherwise the `review_comment` record (the rendered body) is saved with
-   the completion context (the round, its verdict and its findings) in
-   one save.
+   the completion context (the round, its verdict, its findings and the
+   prose sections) in one save. Every load re-validates the findings and
+   sections under the parser's rules and requires the body to be exactly
+   the comment rendered from them at the revision the marker binds, so a
+   body edited on disk after the save is refused before recovery can post
+   it.
 2. The record is driven: reconciled before anything is posted, then
    posted at most within its attempt bound. The read-back is one complete
    comment listing in which exactly one top-level comment carries the
