@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from autoforge import __prompt_version__
-from autoforge.claims import render_progress_marker
+from autoforge.claims import render_implementation_marker, render_progress_marker
 from autoforge.config import default_config
 from autoforge.errors import (
     ConfigurationError,
@@ -27,7 +27,12 @@ from autoforge.errors import (
     VerificationError,
 )
 from autoforge.executor import ExecutionResult, execute
-from autoforge.git_transport import LOCAL_GIT_ENV_ALLOWLIST, LOCAL_GIT_SWITCHES, GitRemote
+from autoforge.git_transport import (
+    LOCAL_GIT_ENV_ALLOWLIST,
+    LOCAL_GIT_SWITCHES,
+    NETWORK_GIT_ENV_ALLOWLIST,
+    GitRemote,
+)
 from autoforge.github import (
     ChangedFile,
     CheckInfo,
@@ -55,6 +60,7 @@ from tests.conftest import (
     CI_RUN_ID,
     CI_WORKFLOW_ID,
     EPIC,
+    GIT_IDENT,
     ISSUE,
     ISSUE3,
     MAIN_SHA,
@@ -65,27 +71,26 @@ from tests.conftest import (
     SHA_B,
     SHA_C,
     FakeGitHub,
+    analyze_payload,
     block,
     ci_check,
     ci_jobs,
     comment_url,
+    commit_in,
+    connect_origin,
     follow_up_issue_body,
+    git_out,
     git_repo,
+    implement,
     implementation_pr_body,
     make_engine,
     post_progress_comment,
     progress_comment_body,
     review_comment_body,
+    scripted,
 )
 
-ANALYZE_OK = {
-    "phase": "ANALYZE_EXECUTE",
-    "status": "success",
-    "issue_url": ISSUE,
-    "pr_url": PR,
-    "head_sha": SHA_A,
-    "branch": BRANCH,
-}
+PR41 = "https://github.com/owner/repo/pull/41"
 
 
 def _finding(rnd: int, n: int = 1, cls: str = "nit") -> dict:
@@ -195,144 +200,927 @@ def test_initializing_rejects_the_epic_as_the_issue(tmp_state_dir, fake_github):
 
 
 # -- ANALYZE_EXECUTE ---------------------------------------------------------------
-def test_analyze_valid_pr_verified_enters_review(tmp_state_dir, fake_github):
-    eng = make_engine(tmp_state_dir, [block(ANALYZE_OK)], github=fake_github)
-    eng.step()  # INITIALIZING
+MARKER = render_implementation_marker(ISSUE)
+CLOSING = f"Closes #2\n\n{MARKER}"
 
-    def on_call(req):  # the agent "creates" the PR as a side effect
-        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
-        return block(ANALYZE_OK)
 
-    eng.provider._handler = on_call
-    out = eng.step()
+def _analyzed(eng):
+    """INITIALIZING, then the ANALYZE_EXECUTE step; its outcome."""
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    return eng.step()
+
+
+def _worktree_head(req) -> str:
+    return git_out("-C", req.cwd, "rev-parse", "HEAD")
+
+
+def _reports_head(req, **overrides) -> str:
+    """An agent whose work is already committed: it reports the worktree's HEAD."""
+    return block(analyze_payload(_worktree_head(req), **overrides))
+
+
+def _from_start(req, **overrides) -> str:
+    """The agent the prompt asks for: detached at the start commit, then one commit."""
+    start = re.search(r"Start commit: `([0-9a-f]{40})`", req.prompt)
+    assert start, "the prompt names no start commit"
+    git_out("-C", req.cwd, "checkout", "-q", "--detach", start.group(1))
+    return implement(req, **overrides)
+
+
+def _side_commit(repo, parent: str, message: str = "Earlier work (#2)") -> str:
+    """A commit on ``parent`` that moves no ref of ``repo`` (work pushed by someone else)."""
+    tree = git_out("-C", str(repo), "rev-parse", f"{parent}^{{tree}}")
+    return git_out("-C", str(repo), *GIT_IDENT, "commit-tree", tree, "-p", parent, "-m", message)
+
+
+def _earlier_work(eng) -> str:
+    """Publish a commit for this issue to ``autoforge/2`` before the run."""
+    sha = _side_commit(eng.workdir, eng.origin.head("main"))
+    return eng.origin.publish(eng.workdir, sha, "autoforge/2")
+
+
+def _crash(self):
+    """The process dies right after the plan's save, before anything is sent."""
+    raise KeyboardInterrupt
+
+
+def _resumed(eng, tmp_state_dir, gh, script=None):
+    """A new controller process on the same state, git remote and GitHub."""
+    eng.close()
+    eng2 = make_engine(tmp_state_dir, script, github=gh)
+    connect_origin(eng2, eng.origin)
+    eng2.origin = eng.origin
+    eng2.load()
+    return eng2
+
+
+def test_analyze_the_controller_pushes_the_agents_commit_and_opens_the_pr(
+    tmp_state_dir, fake_github
+):
+    """#161: the agent only commits. The controller pushes that commit to
+    ``autoforge/<n>``, opens the PR with the agent's title and body followed
+    by its own ``Closes #n`` line and the issue's marker, reads it back and
+    binds it; the prompt names the base the entry fetched."""
+    eng = make_engine(tmp_state_dir, implement, github=fake_github, origin=True)
+    base = eng.origin.head("main")
+    out = _analyzed(eng)
     assert out.next_phase == "REVIEW"
+    (req,) = eng.provider.calls
+    assert f"- Default branch: `main`, at `{base}` when the controller" in req.prompt
+    assert f"Start commit: `{base}` (the default branch head)" in req.prompt
+    assert "Branch the controller will push to: `autoforge/2`" in req.prompt
+    head = _worktree_head(req)
+    assert eng.origin.head("autoforge/2") == head
+    assert git_out("-C", req.cwd, "rev-parse", "HEAD^") == base
     s = load_state(eng.paths.state_file)
-    assert s.current_pr_url == PR and s.current_head_sha == SHA_A and s.current_branch == BRANCH
-    assert s.review_round == 0
-    call = eng.provider.calls[0]
-    assert call.phase == "ANALYZE_EXECUTE" and call.profile.model == "fable"
-    assert call.profile.effort == "high"
-
-
-def test_analyze_fake_pr_url_rejected(tmp_state_dir, fake_github):
-    eng = make_engine(tmp_state_dir, [block(ANALYZE_OK)], github=fake_github)
-    eng.state.phase = Phase.ANALYZE_EXECUTE
-    with pytest.raises(VerificationError, match="no open PR carries the ai-implementation marker"):
-        eng.step()
-    assert load_state(eng.paths.state_file).phase == Phase.ANALYZE_EXECUTE
-
-
-def test_analyze_head_sha_mismatch_rejected(tmp_state_dir, fake_github):
-    eng = make_engine(tmp_state_dir, [block(ANALYZE_OK)], github=fake_github)
-    eng.state.phase = Phase.ANALYZE_EXECUTE
-    eng.provider._handler = lambda req: (
-        fake_github.add_pr(head_sha=SHA_B, body=implementation_pr_body()),
-        block(ANALYZE_OK),
-    )[1]
-    with pytest.raises(VerificationError, match="head mismatch"):
-        eng.step()
-    assert eng.state.phase == Phase.ANALYZE_EXECUTE
-    assert eng.state.current_pr_url == ""  # never entered REVIEW
+    assert (s.phase, s.attempt, s.review_round) == (Phase.REVIEW, 0, 0)
+    assert (s.current_pr_url, s.current_head_sha, s.current_branch, s.current_base_ref) == (
+        PR,
+        head,
+        "autoforge/2",
+        "main",
+    )
+    pr = fake_github.prs[PR]
+    assert (pr.title, pr.head_ref, pr.base_ref, pr.head_sha) == (
+        "Add the feature",
+        "autoforge/2",
+        "main",
+        head,
+    )
+    assert pr.body == f"Adds the feature.\n\nTested with `pytest`.\n\n{CLOSING}"
+    assert pr.linked_issue_numbers == [2]
+    assert [w[0] for w in fake_github.effect_writes] == ["create_pull_request"]
+    assert f"pushed {head[:12]} to autoforge/2 and opened PR {PR}" in out.message
 
 
 def test_analyze_issue_claim_is_compared_by_identity_not_url_string(tmp_state_dir, fake_github):
-    """Issue #37 N1: `Owner/REPO` names the run's repository as GitHub sees it."""
-    payload = dict(ANALYZE_OK, issue_url="https://github.com/Owner/REPO/issues/2")
-    eng = make_engine(tmp_state_dir, [block(payload)], github=fake_github)
-    eng.state.phase = Phase.ANALYZE_EXECUTE
-    eng.provider._handler = lambda req: (
-        fake_github.add_pr(
-            head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body()
+    eng = make_engine(
+        tmp_state_dir,
+        lambda req: implement(req, issue_url="https://github.com/OWNER/Repo/issues/2"),
+        github=fake_github,
+        origin=True,
+    )
+    assert _analyzed(eng).next_phase == "REVIEW"
+    assert len(eng.provider.calls) == 1
+
+
+def _attached(req) -> str:
+    git_out("-C", req.cwd, "checkout", "-q", "-b", "my-work")
+    return implement(req)
+
+
+def _detach_and_report(req) -> str:
+    git_out("-C", req.cwd, "checkout", "-q", "--detach")
+    return _reports_head(req)
+
+
+def _unrelated_history(req) -> str:
+    tree = git_out("-C", req.cwd, "rev-parse", "HEAD^{tree}")
+    root = git_out("-C", req.cwd, *GIT_IDENT, "commit-tree", tree, "-m", "Implement (#2)")
+    git_out("-C", req.cwd, "checkout", "-q", "--detach", root)
+    return _reports_head(req)
+
+
+_FAKE_TOKEN = "gh" + "p_" + "FAKE0000000000000000000000000000000000"
+
+
+@pytest.mark.parametrize(
+    ("first", "again", "error"),
+    [
+        pytest.param(
+            lambda req: implement(req, issue_url=ISSUE3),
+            _reports_head,
+            "field 'issue_url' names https://github.com/owner/repo/issues/3",
+            id="another-issue",
         ),
-        block(payload),
-    )[1]
-    assert eng.step().next_phase == "REVIEW"
-    assert eng.state.current_issue_url == ISSUE  # the run's own spelling is kept
+        pytest.param(
+            lambda req: (commit_in(req.cwd), block(analyze_payload(SHA_A)))[1],
+            _reports_head,
+            f"field 'head_sha' is {SHA_A}, but the worktree's HEAD is",
+            id="head-is-not-the-worktree-head",
+        ),
+        pytest.param(
+            _attached,
+            _detach_and_report,
+            "the worktree's HEAD is attached to a local branch",
+            id="attached-head",
+        ),
+        pytest.param(
+            _reports_head,
+            implement,
+            "is the default branch head itself; commit the implementation",
+            id="nothing-committed",
+        ),
+        pytest.param(
+            _unrelated_history,
+            _from_start,
+            "does not descend from the default branch head",
+            id="unrelated-history",
+        ),
+        pytest.param(
+            lambda req: implement(req) if commit_in(req.cwd, "Implement it, closes #3") else "",
+            _from_start,
+            "commit message names an issue other than this run's own #2 with a closing keyword",
+            id="commit-closes-another-issue",
+        ),
+        pytest.param(
+            lambda req: implement(req) if commit_in(req.cwd, f"Use {_FAKE_TOKEN}") else "",
+            _from_start,
+            "commit message contains a credential-shaped string",
+            id="commit-carries-a-credential",
+        ),
+        pytest.param(
+            lambda req: implement(req, pr_body="Adds it. Fixes #2"),
+            _reports_head,
+            "closing keyword",
+            id="body-links-the-issue-itself",
+        ),
+    ],
+)
+def test_analyze_candidate_refusal_is_corrected_before_anything_is_published(
+    tmp_state_dir, fake_github, first, again, error
+):
+    """The controller reads the candidate from the worktree itself (detached
+    HEAD equal to ``head_sha``, a commit over the base, descending from it,
+    every published commit message within policy) and the published text;
+    a refusal is the agent's to correct, before any push or PR."""
+    eng = make_engine(tmp_state_dir, None, github=fake_github, origin=True)
+
+    def corrected(req):
+        assert req.correction and error in req.prompt
+        assert eng.origin.head("autoforge/2") is None and fake_github.effect_writes == []
+        return again(req)
+
+    eng.provider._handler = scripted(first, corrected)
+    out = _analyzed(eng)
+    assert out.next_phase == "REVIEW", out.message
+    assert len(eng.provider.calls) == 2
+    head = _worktree_head(eng.provider.calls[1])
+    assert eng.origin.head("autoforge/2") == head == eng.state.current_head_sha
+    assert [w[0] for w in fake_github.effect_writes] == ["create_pull_request"]
 
 
-def test_analyze_issue_repo_mismatch_rejected(tmp_state_dir, fake_github):
-    payload = dict(ANALYZE_OK, issue_url="https://github.com/other/repo/issues/2")
-    eng = make_engine(tmp_state_dir, [block(payload)], github=fake_github)
-    eng.state.phase = Phase.ANALYZE_EXECUTE
-    with pytest.raises(VerificationError, match="issue"):
+def test_analyze_continues_earlier_work_on_its_branch_as_a_fast_forward(tmp_state_dir, fake_github):
+    """A branch with no PR is earlier work for the issue: the prompt starts the
+    agent from its head, a candidate that ignores it is corrected (the push
+    would not be a fast-forward), and the PR is opened over it."""
+    eng = make_engine(tmp_state_dir, None, github=fake_github, origin=True)
+    earlier = _earlier_work(eng)
+    eng.provider._handler = scripted(implement, _from_start)
+    out = _analyzed(eng)
+    assert out.next_phase == "REVIEW", out.message
+    first, second = eng.provider.calls
+    assert (
+        f"Start commit: `{earlier}` (the head of `autoforge/2` on GitHub: earlier work for "
+        "this issue, with no PR yet)" in first.prompt
+    )
+    assert f"does not descend from {earlier}, the head of the branch" in second.prompt
+    head = _worktree_head(second)
+    assert git_out("-C", second.cwd, "rev-parse", "HEAD^") == earlier
+    assert eng.origin.head("autoforge/2") == head == eng.state.current_head_sha
+    assert fake_github.prs[PR].head_sha == head
+
+
+def test_analyze_adopts_the_open_unmarked_pr_on_its_branch(tmp_state_dir, fake_github):
+    """K3: an open PR on ``autoforge/<n>`` without a marker is the issue's PR.
+    The controller pushes over its head, then appends ``Closes #n`` and the
+    marker to its body once GitHub shows it at the candidate; no PR is
+    created."""
+    eng = make_engine(tmp_state_dir, _from_start, github=fake_github, origin=True)
+    earlier = _earlier_work(eng)
+    fake_github.add_pr(PR41, head_sha=earlier, branch="autoforge/2", body="Started by hand.")
+    out = _analyzed(eng)
+    assert out.next_phase == "REVIEW", out.message
+    (req,) = eng.provider.calls
+    assert (
+        f"Start commit: `{earlier}` (the head of `autoforge/2` on GitHub, the branch of open "
+        f"PR {PR41}, which the controller will adopt)" in req.prompt
+    )
+    head = _worktree_head(req)
+    s = load_state(eng.paths.state_file)
+    assert (s.current_pr_url, s.current_head_sha, s.current_branch) == (PR41, head, "autoforge/2")
+    assert fake_github.prs[PR41].body == f"Started by hand.\n\n{CLOSING}"
+    assert [w[0] for w in fake_github.effect_writes] == ["write_pr_body"]
+    assert PR not in fake_github.prs
+    assert f"adopted PR {PR41}" in out.message
+
+
+def test_analyze_adoption_waits_for_github_to_show_the_pushed_head(tmp_state_dir, fake_github):
+    """K3 binds the marker to the PR's code, so it is written only once GitHub
+    shows the PR at the candidate: a head still at the branch's old value is
+    transient, and the next process completes from the persisted plan
+    without launching the agent again."""
+    eng = make_engine(tmp_state_dir, _from_start, github=fake_github, origin=True)
+    earlier = _earlier_work(eng)
+    fake_github.add_pr(PR41, head_sha=earlier, branch="autoforge/2", body="Started by hand.")
+    fake_github.pr_heads_lag = True
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    with pytest.raises(GitHubUnavailableError, match="has not caught up"):
         eng.step()
+    (req,) = eng.provider.calls
+    candidate = _worktree_head(req)
+    assert eng.origin.head("autoforge/2") == candidate, "the push landed"
+    assert fake_github.effect_writes == [] and MARKER not in fake_github.prs[PR41].body
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.ANALYZE_EXECUTE and s.completion_context
+
+    fake_github.pr_heads_lag = False
+    eng2 = _resumed(eng, tmp_state_dir, fake_github, "never")
+    out = eng2.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert "completed from the persisted ANALYZE_EXECUTE plan; no agent launched" in out.message
+    assert eng2.provider.calls == []
+    assert eng2.state.current_pr_url == PR41 and eng2.state.current_head_sha == candidate
+    assert [w[0] for w in fake_github.effect_writes] == ["write_pr_body"]
 
 
-def test_analyze_pr_in_other_repo_rejected(tmp_state_dir, fake_github):
-    payload = dict(ANALYZE_OK, pr_url="https://github.com/other/repo/pull/1")
-    eng = make_engine(tmp_state_dir, [block(payload)], github=fake_github)
-    eng.state.phase = Phase.ANALYZE_EXECUTE
-    with pytest.raises(VerificationError, match="outside repository"):
-        eng.step()
+@pytest.mark.parametrize(
+    ("setup", "reason"),
+    [
+        pytest.param(
+            lambda eng, gh: gh.add_pr(PR41, head_sha=SHA_A, branch="autoforge/2", state="CLOSED"),
+            f"branch 'autoforge/2' already has a closed or merged PR: {PR41} (CLOSED)",
+            id="closed-pr-on-the-branch",
+        ),
+        pytest.param(
+            lambda eng, gh: gh.add_pr(PR41, head_sha=SHA_A, branch="autoforge/2", state="MERGED"),
+            f"branch 'autoforge/2' already has a closed or merged PR: {PR41} (MERGED)",
+            id="merged-pr-on-the-branch",
+        ),
+        pytest.param(
+            lambda eng, gh: (
+                gh.add_pr(PR41, head_sha=SHA_A, branch="autoforge/2"),
+                gh.add_pr(
+                    "https://github.com/owner/repo/pull/40", head_sha=SHA_A, branch="autoforge/2"
+                ),
+            ),
+            "2 open PRs are headed at 'autoforge/2'",
+            id="two-open-prs-on-the-branch",
+        ),
+        pytest.param(
+            lambda eng, gh: gh.add_pr(
+                PR41, head_sha=SHA_A, branch="autoforge/2", base_ref="release"
+            ),
+            f"open PR {PR41} on 'autoforge/2' targets 'release', not the default branch 'main'",
+            id="pr-onto-another-base",
+        ),
+        pytest.param(
+            lambda eng, gh: gh.add_pr(
+                PR41, head_sha=SHA_A, branch="autoforge/2", body=implementation_pr_body(ISSUE3)
+            ),
+            f"open PR {PR41} on 'autoforge/2' carries an implementation marker that is not "
+            "issue #2's",
+            id="another-issues-marker-on-the-branch",
+        ),
+        pytest.param(
+            lambda eng, gh: setattr(
+                gh.add_pr(PR41, head_sha=SHA_A, branch="feature", body=implementation_pr_body()),
+                "head_repository",
+                "someone/repo",
+            ),
+            f"open PR {PR41} carries the implementation marker for issue #2 but is headed in "
+            "the fork someone/repo",
+            id="marker-pr-from-a-fork",
+        ),
+    ],
+)
+def test_analyze_entry_blocks_before_launching_on_a_pr_it_would_not_publish_to(
+    tmp_state_dir, fake_github, setup, reason
+):
+    """A closed or merged PR on the controller's branch, two PRs there, a PR
+    onto another base or carrying another issue's marker, or this issue's
+    marker on a fork's PR: the controller never opens a second PR beside
+    them, never chooses, and cannot publish to a fork, so it blocks before
+    the agent runs and sends nothing."""
+    eng = make_engine(tmp_state_dir, "never", github=fake_github, origin=True)
+    setup(eng, fake_github)
+    out = _analyzed(eng)
+    assert out.next_phase == "BLOCKED"
+    assert reason in eng.state.block_reason
+    assert eng.provider.calls == []
+    assert fake_github.effect_writes == [] and eng.origin.head("autoforge/2") is None
 
 
-def test_analyze_branch_mismatch_rejected(tmp_state_dir, fake_github):
-    eng = make_engine(tmp_state_dir, [block(ANALYZE_OK)], github=fake_github)
-    eng.state.phase = Phase.ANALYZE_EXECUTE
-    eng.provider._handler = lambda req: (
-        fake_github.add_pr(head_sha=SHA_A, branch="feature/other", body=implementation_pr_body()),
-        block(ANALYZE_OK),
-    )[1]
-    with pytest.raises(VerificationError, match="branch mismatch"):
-        eng.step()
-    assert eng.state.phase == Phase.ANALYZE_EXECUTE and eng.state.current_pr_url == ""
-
-
-# -- ANALYZE_EXECUTE read-back: the implementation marker (PR #89 review F1) --------------
-def test_analyze_pr_without_the_implementation_marker_is_rejected(tmp_state_dir, fake_github):
-    """A PR the read-back accepts must be a PR every later entry finds. The
-    entry finds PRs by the marker alone, so a PR without it (branch and
-    linkage notwithstanding) is not accepted, whatever the agent claims."""
-    from autoforge.engine import render_implementation_marker
-
-    eng = make_engine(tmp_state_dir, [block(ANALYZE_OK)], github=fake_github)
-    eng.state.phase = Phase.ANALYZE_EXECUTE
-    eng.provider._handler = lambda req: (
-        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2]),
-        block(ANALYZE_OK),
-    )[1]
-    with pytest.raises(VerificationError, match="no open PR carries the ai-implementation marker"):
-        eng.step()
-    assert eng.state.phase == Phase.ANALYZE_EXECUTE and eng.state.current_pr_url == ""
-    assert render_implementation_marker(ISSUE) in eng.provider.calls[0].prompt
-
-
-def test_analyze_pr_marked_for_another_issue_is_rejected(tmp_state_dir, fake_github):
-    eng = make_engine(tmp_state_dir, [block(ANALYZE_OK)], github=fake_github)
-    eng.state.phase = Phase.ANALYZE_EXECUTE
-    eng.provider._handler = lambda req: (
-        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, body=implementation_pr_body(ISSUE3)),
-        block(ANALYZE_OK),
-    )[1]
-    with pytest.raises(VerificationError, match="no open PR carries the ai-implementation marker"):
-        eng.step()
-
-
-def test_analyze_second_marked_pr_is_rejected_then_the_next_entry_blocks(
+def test_analyze_marker_pr_the_agent_opened_itself_blocks_with_nothing_published(
     tmp_state_dir, fake_github
 ):
-    """Read-back and entry agree: two open PRs carrying the issue's marker is
-    a pair the read-back rejects and the next entry blocks on, so the
-    controller never picks one of them."""
-    other = "https://github.com/owner/repo/pull/43"
+    """A PR carrying the issue's marker that the entry did not record was not
+    opened by the controller: the result is not published beside it, and
+    the run blocks rather than adopting it silently."""
 
-    def creates_two(req):
-        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, body=implementation_pr_body())
-        fake_github.add_pr(
-            url=other, head_sha=SHA_B, branch="autoforge/2-again", body=implementation_pr_body()
-        )
-        return block(ANALYZE_OK)
+    def publishes_itself(req):
+        sha = commit_in(req.cwd)
+        fake_github.add_pr(PR41, head_sha=sha, branch="mine", body=implementation_pr_body())
+        return block(analyze_payload(sha))
 
-    eng = make_engine(tmp_state_dir, creates_two, github=fake_github)
-    eng.state.phase = Phase.ANALYZE_EXECUTE
-    with pytest.raises(VerificationError, match="2 open PRs carry the ai-implementation marker"):
-        eng.step()
-    assert eng.state.current_pr_url == ""
+    eng = make_engine(tmp_state_dir, publishes_itself, github=fake_github, origin=True)
+    out = _analyzed(eng)
+    assert out.next_phase == "BLOCKED"
+    assert f"open PR {PR41} carries the implementation marker for issue" in eng.state.block_reason
+    assert "but the controller did not open it" in eng.state.block_reason
+    assert fake_github.effect_writes == [] and eng.origin.head("autoforge/2") is None
+    assert not eng.state.effect_records and not eng.state.completion_context
+
+    # The operator decides that PR is the implementation: 'unblock' re-enters
+    # the phase, whose fresh entry binds it without launching the agent.
+    assert eng.unblock("that PR is the issue's implementation").unblocked
     out = eng.step()
-    assert out.next_phase == "BLOCKED" and len(eng.provider.calls) == 1
-    reason = load_state(eng.paths.state_file).block_reason
-    assert "2 open PRs carry the ai-implementation marker" in reason
-    assert PR in reason and other in reason and "never guesses" in reason
+    assert out.next_phase == "REVIEW", out.message
+    assert len(eng.provider.calls) == 1
+    assert eng.state.current_pr_url == PR41 and eng.state.current_branch == "mine"
+
+
+def test_analyze_correction_after_the_agent_opened_a_marker_pr_blocks_instead_of_relaunching(
+    tmp_state_dir, fake_github
+):
+    """PR #89 review F1, under #161: a correction relaunch is a re-entry, so
+    the entry's reads run before it. An agent that opened a marker PR itself
+    and lost its result block is not relaunched beside that PR, and the PR
+    is not adopted silently either: the run blocks naming it."""
+
+    def publishes_and_loses_the_block(req):
+        assert not req.correction
+        sha = commit_in(req.cwd)
+        fake_github.add_pr(PR41, head_sha=sha, branch="mine", body=implementation_pr_body())
+        return "no block here\n"
+
+    eng = make_engine(tmp_state_dir, publishes_and_loses_the_block, github=fake_github, origin=True)
+    out = _analyzed(eng)
+    assert out.next_phase == "BLOCKED"
+    assert len(eng.provider.calls) == 1
+    assert f"open PR {PR41} carries the implementation marker" in eng.state.block_reason
+    assert fake_github.effect_writes == [] and eng.origin.head("autoforge/2") is None
+
+
+@pytest.mark.parametrize(
+    "existing",
+    [
+        pytest.param(
+            {"branch": "feature-x", "body": implementation_pr_body(ISSUE3)},
+            id="another-issues-marker-elsewhere",
+        ),
+        pytest.param(
+            {"branch": "autoforge/2-x", "linked": [2], "body": "Closes #2"},
+            id="unmarked-pr-linked-to-the-issue",
+        ),
+    ],
+)
+def test_analyze_a_pr_that_is_not_the_issues_implementation_is_neither_adopted_nor_blocking(
+    tmp_state_dir, fake_github, existing
+):
+    """Off the issue's branch, only the issue's own marker is provenance: a PR
+    marked for another issue, or linked to this one without the marker (a
+    human's, another tool's), is not adopted, and the controller opens its
+    own PR on ``autoforge/<n>`` beside it."""
+    fake_github.add_pr(**existing)
+    before = fake_github.prs[PR].body
+    eng = make_engine(tmp_state_dir, implement, github=fake_github, origin=True)
+    out = _analyzed(eng)
+    assert out.next_phase == "REVIEW", out.message
+    assert len(eng.provider.calls) == 1
+    assert eng.state.current_pr_url not in ("", PR)
+    assert eng.state.current_branch == "autoforge/2"
+    assert [w[0] for w in fake_github.effect_writes] == ["create_pull_request"]
+    assert fake_github.prs[PR].body == before
+
+
+@pytest.mark.parametrize(
+    ("during", "reason"),
+    [
+        pytest.param(
+            lambda gh, sha: gh.add_pr(
+                PR41, head_sha=sha, branch="mine", body='<!-- ai-implementation: {"issue": 2} -->'
+            ),
+            "repair the unreadable marker",
+            id="unreadable-marker",
+        ),
+        pytest.param(
+            lambda gh, sha: setattr(gh, "open_pr_listing_incomplete", True),
+            "cannot establish whether an open PR already implements issue #2",
+            id="listing-incomplete",
+        ),
+        pytest.param(
+            lambda gh, sha: gh.add_pr(PR41, head_sha=sha, branch="autoforge/2", state="CLOSED"),
+            "already has a closed or merged PR",
+            id="pr-closed-on-the-branch-during-the-run",
+        ),
+    ],
+)
+def test_analyze_publication_blocks_when_github_changed_under_the_run(
+    tmp_state_dir, fake_github, during, reason
+):
+    """The precondition read before the plan is saved: GitHub as the entry
+    observed it, or nothing is planned, pushed or created."""
+
+    def agent(req):
+        sha = commit_in(req.cwd)
+        during(fake_github, sha)
+        return block(analyze_payload(sha))
+
+    eng = make_engine(tmp_state_dir, agent, github=fake_github, origin=True)
+    out = _analyzed(eng)
+    assert out.next_phase == "BLOCKED"
+    assert reason in eng.state.block_reason
+    assert fake_github.effect_writes == [] and eng.origin.head("autoforge/2") is None
+    assert not eng.state.effect_records and not eng.state.completion_context
+
+
+def test_analyze_branch_pushed_by_someone_else_during_the_run_blocks(tmp_state_dir, fake_github):
+    """A head of ``autoforge/<n>`` the entry did not record is never pushed
+    over, even when it is the candidate itself; the next entry blocks on it
+    before launching anything."""
+
+    def pushes_itself(req):
+        sha = commit_in(req.cwd)
+        eng.origin.publish(req.cwd, "HEAD", "autoforge/2")
+        return block(analyze_payload(sha))
+
+    eng = make_engine(tmp_state_dir, pushes_itself, github=fake_github, origin=True)
+    out = _analyzed(eng)
+    assert out.next_phase == "BLOCKED"
+    candidate = _worktree_head(eng.provider.calls[0])
+    assert (
+        f"branch 'autoforge/2' is at {candidate}, but this phase's entry recorded no such branch"
+        in eng.state.block_reason
+    )
+    assert fake_github.effect_writes == [] and PR not in fake_github.prs
+
+
+def test_analyze_unmarked_pr_opened_on_the_branch_during_the_run_is_not_adopted(
+    tmp_state_dir, fake_github
+):
+    """R1-F1 (ADR 0004 K3): the controller adopts only the open PR its entry
+    recorded on ``autoforge/<n>``. One opened there while the agent ran,
+    over the very head the entry recorded, is unexplained: nothing is
+    planned, pushed or written. 'unblock' starts a fresh entry, which reads
+    the branch again and adopts it."""
+    eng = make_engine(tmp_state_dir, None, github=fake_github, origin=True)
+    earlier = _earlier_work(eng)
+
+    def opens_a_pr_meanwhile(req):
+        reply = _from_start(req)
+        fake_github.add_pr(PR41, head_sha=earlier, branch="autoforge/2", body="Started by hand.")
+        return reply
+
+    eng.provider._handler = scripted(opens_a_pr_meanwhile, _reports_head)
+    out = _analyzed(eng)
+    assert out.next_phase == "BLOCKED"
+    assert (
+        f"the open PR on 'autoforge/2' is {PR41}, but this phase's entry recorded none"
+        in eng.state.block_reason
+    )
+    s = load_state(eng.paths.state_file)
+    assert s.entry_observation["prs"] == {"refs/heads/autoforge/2": None}
+    assert not s.effect_records and not s.completion_context
+    assert fake_github.effect_writes == [] and eng.origin.head("autoforge/2") == earlier
+    assert fake_github.prs[PR41].body == "Started by hand."
+
+    assert eng.unblock("that PR is the issue's").unblocked
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    candidate = _worktree_head(eng.provider.calls[1])
+    assert eng.state.current_pr_url == PR41 and eng.state.current_head_sha == candidate
+    assert fake_github.prs[PR41].body == f"Started by hand.\n\n{CLOSING}"
+    assert [w[0] for w in fake_github.effect_writes] == ["write_pr_body"]
+
+
+def test_analyze_correction_after_an_unmarked_pr_appeared_on_the_branch_blocks_before_relaunching(
+    tmp_state_dir, fake_github
+):
+    """R1-F1 across re-entry: the observation saved before the first launch
+    records no PR on the branch, so the correction relaunch's entry, which
+    honors it, blocks on a PR opened there meanwhile instead of launching an
+    agent whose work would be published to it."""
+    eng = make_engine(tmp_state_dir, None, github=fake_github, origin=True)
+    earlier = _earlier_work(eng)
+
+    def opens_a_pr_and_loses_the_block(req):
+        _from_start(req)
+        fake_github.add_pr(PR41, head_sha=earlier, branch="autoforge/2", body="Started by hand.")
+        return "no block here\n"
+
+    eng.provider._handler = scripted(opens_a_pr_and_loses_the_block)
+    out = _analyzed(eng)
+    assert out.next_phase == "BLOCKED"
+    assert len(eng.provider.calls) == 1
+    assert (
+        f"the open PR on 'autoforge/2' is {PR41}, but this phase's entry recorded none"
+        in eng.state.block_reason
+    )
+    assert fake_github.effect_writes == [] and eng.origin.head("autoforge/2") == earlier
+
+
+def test_analyze_correction_adopts_the_pr_its_entry_observed(tmp_state_dir, fake_github):
+    """K3 across re-entry: the PR the first entry recorded on the branch is
+    still the one there at the correction relaunch, so the honored
+    observation explains it and the corrected result adopts it."""
+    eng = make_engine(tmp_state_dir, None, github=fake_github, origin=True)
+    earlier = _earlier_work(eng)
+    fake_github.add_pr(PR41, head_sha=earlier, branch="autoforge/2", body="Started by hand.")
+    eng.provider._handler = scripted(
+        lambda req: (_from_start(req), "no block here\n")[1], _reports_head
+    )
+    out = _analyzed(eng)
+    assert out.next_phase == "REVIEW", out.message
+    assert len(eng.provider.calls) == 2 and eng.provider.calls[1].correction
+    assert eng.state.current_pr_url == PR41
+    assert [w[0] for w in fake_github.effect_writes] == ["write_pr_body"]
+
+
+def test_analyze_unavailable_github_at_publication_relaunches_from_the_agents_commit(
+    tmp_state_dir, fake_github, monkeypatch
+):
+    """An unavailable GitHub before the plan is saved is transient: nothing
+    was sent, the step can be resumed, and the relaunched agent continues
+    from the commit it left in the worktree; one push, one PR."""
+    listing = fake_github.list_open_prs
+
+    def agent(req):
+        sha = commit_in(req.cwd)
+
+        def unavailable(repo):
+            raise GitHubUnavailableError("gh: HTTP 502")
+
+        monkeypatch.setattr(fake_github, "list_open_prs", unavailable)
+        return block(analyze_payload(sha))
+
+    eng = make_engine(tmp_state_dir, agent, github=fake_github, origin=True)
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    with pytest.raises(GitHubUnavailableError):
+        eng.step()
+    first = _worktree_head(eng.provider.calls[0])
+    s = load_state(eng.paths.state_file)
+    assert (s.phase, s.attempt, s.completion_context) == (Phase.ANALYZE_EXECUTE, 1, {})
+    assert fake_github.effect_writes == [] and eng.origin.head("autoforge/2") is None
+
+    monkeypatch.setattr(fake_github, "list_open_prs", listing)
+    eng2 = _resumed(eng, tmp_state_dir, fake_github, _reports_head)
+    out = eng2.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert _worktree_head(eng2.provider.calls[0]) == first
+    assert eng.origin.head("autoforge/2") == first == eng2.state.current_head_sha
+    assert [w[0] for w in fake_github.effect_writes] == ["create_pull_request"]
+
+
+def test_analyze_crash_after_the_plan_save_completes_from_the_journal(
+    tmp_state_dir, fake_github, monkeypatch
+):
+    """A crash after the plan is saved and before anything is sent: the next
+    process pushes and opens the PR from the persisted plan, and never
+    launches the agent again."""
+    from autoforge.engine import ControllerEngine
+
+    eng = make_engine(tmp_state_dir, implement, github=fake_github, origin=True)
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+
+    monkeypatch.setattr(ControllerEngine, "_complete_analyze", _crash)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.ANALYZE_EXECUTE and len(s.effect_records) == 2
+    assert eng.origin.head("autoforge/2") is None and fake_github.effect_writes == []
+    candidate = _worktree_head(eng.provider.calls[0])
+    monkeypatch.undo()
+
+    eng2 = _resumed(eng, tmp_state_dir, fake_github, "never")
+    out = eng2.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert eng2.provider.calls == []
+    assert eng.origin.head("autoforge/2") == candidate == eng2.state.current_head_sha
+    assert fake_github.prs[PR].body == f"Adds the feature.\n\nTested with `pytest`.\n\n{CLOSING}"
+
+
+@pytest.mark.parametrize(
+    ("key", "edit", "rule"),
+    [
+        ("title", lambda title: "Notify @octocat", "invalid PR title: .*an @-mention"),
+        ("body", lambda body: "Closes #3\n" + body, "invalid PR body: .*a closing keyword"),
+        (
+            "body",
+            lambda body: "<!-- ai-implementation -->\n" + body,
+            "invalid PR body: .*a controller marker opener",
+        ),
+        ("title", lambda title: title + "\x1b", r"invalid PR title: .*control character"),
+        ("body", lambda body: "a\x0b" + body, r"invalid PR body: .*control character"),
+        ("body", lambda body: "x" * 60000 + body, "invalid PR body: .*accepts at most 60000"),
+        ("body", lambda body: body.replace(CLOSING, f"Closes #3\n\n{MARKER}"), "closing block"),
+    ],
+    ids=[
+        "title-mention",
+        "extra-closing-reference",
+        "marker-opener",
+        "title-control-character",
+        "body-control-character",
+        "body-over-its-bound",
+        "closing-line-of-another-issue",
+    ],
+)
+def test_analyze_a_journaled_pr_text_the_parser_refuses_is_never_published_on_recovery(
+    tmp_state_dir, fake_github, monkeypatch, key, edit, rule
+):
+    """R2-F1: the plan is completed from the journal with no agent result in
+    between, so the K2 title and the agent's part of its body get the ANALYZE
+    parser's rules again on load, and its closing block must be exactly the
+    controller's. A stored text the result path would have refused fails the
+    load before anything is sent: no push, no PR, no relaunch, and the file
+    is left as it is for the operator."""
+    from autoforge.engine import ControllerEngine
+
+    eng = make_engine(tmp_state_dir, implement, github=fake_github, origin=True)
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    monkeypatch.setattr(ControllerEngine, "_complete_analyze", _crash)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    monkeypatch.undo()
+    data = json.loads(eng.paths.state_file.read_text(encoding="utf-8"))
+    payload = data["effect_records"][1]["payload"]
+    assert payload == {
+        "title": "Add the feature",
+        "body": f"Adds the feature.\n\nTested with `pytest`.\n\n{CLOSING}",
+    }
+    payload[key] = edit(payload[key])
+    eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
+    before = eng.paths.state_file.read_bytes()
+    eng.close()
+
+    eng2 = make_engine(tmp_state_dir, "never", github=fake_github)
+    connect_origin(eng2, eng.origin)
+    with pytest.raises(StateError, match=rule) as info:
+        eng2.load()
+    assert "octocat" not in str(info.value)
+    assert eng2.provider.calls == []
+    assert fake_github.effect_writes == [] and PR not in fake_github.prs
+    assert eng.origin.head("autoforge/2") is None
+    assert eng.paths.state_file.read_bytes() == before
+
+
+def test_analyze_pr_create_whose_reply_was_lost_is_read_back_not_resent(tmp_state_dir, fake_github):
+    """The PR create lands but its reply is lost: the read-back finds the PR
+    by the issue's marker and binds it; nothing is sent twice."""
+    fake_github.write_failures.append(
+        ("create_pull_request", GitHubUnavailableError("gh: HTTP 502"), True)
+    )
+    eng = make_engine(tmp_state_dir, implement, github=fake_github, origin=True)
+    out = _analyzed(eng)
+    assert out.next_phase == "REVIEW", out.message
+    assert eng.state.current_pr_url == PR
+    assert eng.state.current_head_sha == eng.origin.head("autoforge/2")
+    assert [w[0] for w in fake_github.effect_writes] == ["create_pull_request"]
+
+
+def test_analyze_pr_create_that_never_landed_is_sent_again_by_the_next_process(
+    tmp_state_dir, fake_github
+):
+    """After the push, the PR create fails before reaching GitHub: the step
+    stops for 'resume' with the record attempted, and the next process
+    reconciles it by the issue's marker first, then opens the PR once,
+    without launching the agent."""
+    fake_github.write_failures.append(
+        ("create_pull_request", GitHubUnavailableError("gh: HTTP 502"), False)
+    )
+    eng = make_engine(tmp_state_dir, implement, github=fake_github, origin=True)
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    with pytest.raises(GitHubUnavailableError, match="'resume' reconciles it"):
+        eng.step()
+    candidate = _worktree_head(eng.provider.calls[0])
+    assert eng.origin.head("autoforge/2") == candidate, "the push landed first"
+    assert PR not in fake_github.prs
+
+    eng2 = _resumed(eng, tmp_state_dir, fake_github, "never")
+    out = eng2.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert eng2.provider.calls == []
+    assert eng2.state.current_pr_url == PR and eng2.state.current_head_sha == candidate
+    assert [w[0] for w in fake_github.effect_writes] == ["create_pull_request"] * 2
+    assert [p.url for p in fake_github.prs.values() if MARKER in p.body] == [PR]
+
+
+def test_analyze_branch_moved_after_the_plan_conflicts_and_unblock_completes_the_plan(
+    tmp_state_dir, fake_github, monkeypatch
+):
+    """The push is checked against the head the plan recorded: a branch
+    another push created in the meantime is a conflict, never force-pushed
+    over; once the operator deletes it, 'unblock' re-enters the phase and
+    the plan completes from the journal without launching the agent."""
+    from autoforge.engine import ControllerEngine
+
+    eng = make_engine(tmp_state_dir, implement, github=fake_github, origin=True)
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    monkeypatch.setattr(ControllerEngine, "_complete_analyze", _crash)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    monkeypatch.undo()
+    candidate = _worktree_head(eng.provider.calls[0])
+    other = eng.origin.publish(
+        eng.workdir, _side_commit(eng.workdir, eng.origin.head("main")), "autoforge/2"
+    )
+
+    eng2 = _resumed(eng, tmp_state_dir, fake_github, "never")
+    out = eng2.step()
+    assert out.next_phase == "BLOCKED"
+    assert "delete the branch, which did not exist when the controller planned the push" in (
+        eng2.state.block_reason
+    )
+    assert eng.origin.head("autoforge/2") == other and fake_github.effect_writes == []
+
+    preview = eng2.unblock("checking", dry_run=True)
+    assert preview.message.startswith("[dry-run] would re-enter ANALYZE_EXECUTE: ")
+    assert "its push and PR are planned" in preview.message
+    assert "completes from its persisted plan without launching the agent" in preview.message
+
+    eng.origin.delete("autoforge/2")
+    assert eng2.unblock("deleted the stray branch").unblocked
+    out = eng2.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert eng2.provider.calls == []
+    assert eng.origin.head("autoforge/2") == candidate == eng2.state.current_head_sha
+
+
+def _rename_main_to_trunk(eng, gh) -> None:
+    """GitHub renames the default branch: ``trunk`` at ``main``'s head is now the default."""
+    eng.origin.publish(eng.workdir, eng.origin.head("main"), "trunk")
+    gh.default_branch = "trunk"
+
+
+def test_analyze_default_branch_renamed_during_the_run_plans_nothing(tmp_state_dir, fake_github):
+    """R1-F2 (ADR 0004 K2): the PR is opened onto the default branch the entry
+    read, and only while it is still the default. A rename while the agent
+    ran blocks before the plan is saved, with nothing pushed or created;
+    'unblock' starts a fresh entry, which opens the PR onto the new one."""
+    eng = make_engine(tmp_state_dir, None, github=fake_github, origin=True)
+
+    def renames_meanwhile(req):
+        reply = implement(req)
+        _rename_main_to_trunk(eng, fake_github)
+        return reply
+
+    eng.provider._handler = scripted(renames_meanwhile, _reports_head)
+    out = _analyzed(eng)
+    assert out.next_phase == "BLOCKED"
+    assert (
+        "the default branch of owner/repo is 'trunk', but this phase's entry read 'main'"
+        in eng.state.block_reason
+    )
+    assert "Nothing was planned, pushed or created" in eng.state.block_reason
+    s = load_state(eng.paths.state_file)
+    assert not s.effect_records and not s.completion_context
+    assert fake_github.effect_writes == [] and eng.origin.head("autoforge/2") is None
+
+    assert eng.unblock("the default branch was renamed").unblocked
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert fake_github.prs[PR].base_ref == "trunk"
+    assert [w[0] for w in fake_github.effect_writes] == ["create_pull_request"]
+
+
+def test_analyze_correction_after_the_default_branch_was_renamed_blocks_before_relaunching(
+    tmp_state_dir, fake_github
+):
+    """R1-F2 across re-entry: the observation records the default branch the
+    candidate is checked against, so the correction relaunch's entry blocks
+    after a rename instead of relaunching against a base it did not read."""
+    eng = make_engine(tmp_state_dir, None, github=fake_github, origin=True)
+
+    def renames_and_loses_the_block(req):
+        commit_in(req.cwd)
+        _rename_main_to_trunk(eng, fake_github)
+        return "no block here\n"
+
+    eng.provider._handler = scripted(renames_and_loses_the_block)
+    out = _analyzed(eng)
+    assert out.next_phase == "BLOCKED"
+    assert len(eng.provider.calls) == 1
+    assert (
+        "the default branch of owner/repo is 'trunk', but this phase's entry read 'main'"
+        in eng.state.block_reason
+    )
+    assert "Nothing was launched, pushed or created" in eng.state.block_reason
+    assert fake_github.effect_writes == [] and eng.origin.head("autoforge/2") is None
+
+
+@pytest.mark.parametrize("attempted", [False, True], ids=["planned", "create-attempted"])
+def test_analyze_default_branch_renamed_after_the_plan_creates_no_pr(
+    tmp_state_dir, fake_github, monkeypatch, attempted
+):
+    """R1-F2 with journal recovery: a PR create still pending in the persisted
+    plan is checked against the default branch before anything of the plan
+    is sent, the push included, and a rename since the plan blocks with no
+    PR created. Once the planned branch is the default again, 'unblock'
+    completes the plan from the journal without launching the agent."""
+    from autoforge.engine import ControllerEngine
+
+    eng = make_engine(tmp_state_dir, implement, github=fake_github, origin=True)
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    if attempted:
+        fake_github.write_failures.append(
+            ("create_pull_request", GitHubUnavailableError("gh: HTTP 502"), False)
+        )
+        with pytest.raises(GitHubUnavailableError, match="'resume' reconciles it"):
+            eng.step()
+    else:
+        monkeypatch.setattr(ControllerEngine, "_complete_analyze", _crash)
+        with pytest.raises(KeyboardInterrupt):
+            eng.step()
+        monkeypatch.undo()
+    candidate = _worktree_head(eng.provider.calls[0])
+    pushed = eng.origin.head("autoforge/2")
+    assert pushed == (candidate if attempted else None)
+    writes = list(fake_github.effect_writes)
+    _rename_main_to_trunk(eng, fake_github)
+
+    eng2 = _resumed(eng, tmp_state_dir, fake_github, "never")
+    out = eng2.step()
+    assert out.next_phase == "BLOCKED"
+    assert "The journaled plan opens the PR onto 'main'" in eng2.state.block_reason
+    assert eng2.provider.calls == []
+    assert eng.origin.head("autoforge/2") == pushed
+    assert fake_github.effect_writes == writes and PR not in fake_github.prs
+
+    fake_github.default_branch = "main"
+    assert eng2.unblock("main is the default branch again").unblocked
+    out = eng2.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert eng2.provider.calls == []
+    assert eng.origin.head("autoforge/2") == candidate == eng2.state.current_head_sha
+    assert fake_github.prs[PR].base_ref == "main"
+
+
+def test_analyze_adoption_of_a_pr_retargeted_after_the_plan_blocks(tmp_state_dir, fake_github):
+    """R1-F2 for K3: the PR to adopt still targets the default branch when its
+    body is written, or it is not adopted; nothing is written to it."""
+    eng = make_engine(tmp_state_dir, _from_start, github=fake_github, origin=True)
+    earlier = _earlier_work(eng)
+    fake_github.add_pr(PR41, head_sha=earlier, branch="autoforge/2", body="Started by hand.")
+    fake_github.pr_heads_lag = True
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    with pytest.raises(GitHubUnavailableError, match="has not caught up"):
+        eng.step()
+    fake_github.pr_heads_lag = False
+    fake_github.prs[PR41].base_ref = "release"
+
+    eng2 = _resumed(eng, tmp_state_dir, fake_github, "never")
+    out = eng2.step()
+    assert out.next_phase == "BLOCKED"
+    assert f"PR {PR41} targets 'release', not the default branch 'main'" in (
+        eng2.state.block_reason
+    )
+    assert fake_github.effect_writes == [] and MARKER not in fake_github.prs[PR41].body
+
+
+def test_analyze_dry_run_plans_the_publication_and_sends_nothing(tmp_state_dir, fake_github):
+    """Dry-run reads no candidate and performs no fetch, push or PR write: the
+    plan names what the controller would read, check and publish, and the
+    prompt shows placeholders rather than a guessed base."""
+    eng = make_engine(tmp_state_dir, "never", github=fake_github)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    plan = eng.step(dry_run=True).plan
+    notes = "\n".join(plan.notes)
+    assert "would read the default branch head, the head of 'autoforge/2'" in notes
+    assert "would check the agent's reported head_sha against the worktree's detached" in notes
+    assert "would save the push of that HEAD to 'autoforge/2'" in notes
+    assert "Start commit: `(read from GitHub at execution)`" in plan.prompt_full
+    assert eng.provider.calls == [] and fake_github.effect_writes == []
+    assert not eng.paths.state_file.exists()
 
 
 # -- recovery ------------------------------------------------------------------------
@@ -396,45 +1184,6 @@ def test_recovery_blocks_when_the_open_pr_listing_cannot_be_read_to_its_end(
     reason = load_state(eng.paths.state_file).block_reason
     assert "cannot establish whether an open PR already implements issue #2" in reason
     assert "cannot be read to its end" in reason and "will not launch an agent" in reason
-
-
-def test_recovery_ignores_a_pr_marked_for_another_issue(tmp_state_dir, fake_github):
-    fake_github.add_pr(
-        head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body(ISSUE3)
-    )
-
-    def agent(req):
-        fake_github.prs[PR].body = implementation_pr_body()  # takes it over, as told
-        return block(ANALYZE_OK)
-
-    eng = make_engine(tmp_state_dir, agent, github=fake_github)
-    eng.state.phase = Phase.ANALYZE_EXECUTE
-    assert eng.step().next_phase == "REVIEW" and len(eng.provider.calls) == 1
-
-
-def test_recovery_does_not_adopt_an_unmarked_pr_the_agent_is_told_to_mark(
-    tmp_state_dir, fake_github
-):
-    """A linked PR on the controller's branch but without the marker is not
-    provenance (a human, an older controller): it is not adopted. The agent
-    runs, is told the marker, gives the existing PR the marker instead of
-    opening a second one, and the read-back then accepts it."""
-    from autoforge.engine import render_implementation_marker
-
-    fake_github.add_pr(head_sha=SHA_A, branch="autoforge/2-x", linked=[2])
-    payload = dict(ANALYZE_OK, branch="autoforge/2-x")
-
-    def marks_the_existing_pr(req):
-        assert f"`{render_implementation_marker(ISSUE)}`" in req.prompt
-        assert "gh pr edit" in req.prompt
-        fake_github.prs[PR].body = implementation_pr_body()
-        return block(payload)
-
-    eng = make_engine(tmp_state_dir, marks_the_existing_pr, github=fake_github)
-    eng.state.phase = Phase.ANALYZE_EXECUTE
-    out = eng.step()
-    assert out.next_phase == "REVIEW" and len(eng.provider.calls) == 1
-    assert eng.state.current_pr_url == PR
 
 
 def test_recovery_after_crash_with_persisted_pr(tmp_state_dir, fake_github):
@@ -1972,38 +2721,13 @@ def test_remote_fix_resolutions_are_redacted_before_they_are_persisted(tmp_state
 
 
 # -- correction retry ---------------------------------------------------------------------
-def test_malformed_result_after_the_pr_was_created_is_recovered_not_corrected(
-    tmp_state_dir, fake_github
-):
-    """PR #89 review F1: a correction relaunch is a re-entry like any other,
-    so the phase's GitHub reconciliation runs before it. The agent created
-    the PR and then lost its result block: the PR is adopted and no
-    correction is launched."""
-
-    def agent(req):
-        assert not req.correction
-        fake_github.add_pr(
-            head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body()
-        )  # PR was created…
-        return "no block here\n"  # …but the result block was lost
-
-    eng = make_engine(tmp_state_dir, agent, github=fake_github)
-    eng.state.phase = Phase.ANALYZE_EXECUTE
-    out = eng.step()
-    assert out.next_phase == "REVIEW" and "recovered" in out.message
-    assert len(eng.provider.calls) == 1
-    s = load_state(eng.paths.state_file)
-    assert s.current_pr_url == PR and s.current_head_sha == SHA_A and s.attempt == 0
-
-
 def test_malformed_result_triggers_one_correction(tmp_state_dir, fake_github):
     def agent(req):
         if not req.correction:
             return "no block here\n"  # nothing was done, and no result block
-        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
-        return block(ANALYZE_OK)  # correction run does the work and reports it
+        return implement(req)  # correction run does the work and reports it
 
-    eng = make_engine(tmp_state_dir, agent, github=fake_github)
+    eng = make_engine(tmp_state_dir, agent, github=fake_github, origin=True)
     eng.state.phase = Phase.ANALYZE_EXECUTE
     out = eng.step()
     assert out.next_phase == "REVIEW"
@@ -2098,7 +2822,7 @@ def test_every_remote_agent_phase_reconciles_with_github_before_launching():
 
 
 def test_correction_is_bounded(tmp_state_dir, fake_github):
-    eng = make_engine(tmp_state_dir, ["junk", "junk again"], github=fake_github)
+    eng = make_engine(tmp_state_dir, ["junk", "junk again"], github=fake_github, origin=True)
     eng.state.phase = Phase.ANALYZE_EXECUTE
     with pytest.raises(ControlResultValidationError, match="after 2 attempt"):
         eng.step()
@@ -2110,7 +2834,7 @@ def test_correction_is_bounded(tmp_state_dir, fake_github):
 def test_correction_disabled(tmp_state_dir, fake_github):
     from autoforge.errors import ControlResultError
 
-    eng = make_engine(tmp_state_dir, ["junk", block(ANALYZE_OK)], github=fake_github)
+    eng = make_engine(tmp_state_dir, scripted("junk", implement), github=fake_github, origin=True)
     eng.config.execution.max_correction_attempts = 0
     eng.state.phase = Phase.ANALYZE_EXECUTE
     with pytest.raises((ControlResultError, ControlResultValidationError)):
@@ -2119,7 +2843,7 @@ def test_correction_disabled(tmp_state_dir, fake_github):
 
 
 def test_nonzero_exit_is_not_corrected(tmp_state_dir, fake_github):
-    eng = make_engine(tmp_state_dir, ["junk", "junk"], github=fake_github, exit_code=3)
+    eng = make_engine(tmp_state_dir, ["junk", "junk"], github=fake_github, exit_code=3, origin=True)
     eng.state.phase = Phase.ANALYZE_EXECUTE
     with pytest.raises(ExecutionError, match="exited 3"):
         eng.step()
@@ -2141,7 +2865,7 @@ def test_timeout_raises_and_keeps_state(tmp_state_dir, fake_github):
                 timed_out=True,
             )
 
-    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    eng = make_engine(tmp_state_dir, [], github=fake_github, origin=True)
     eng.providers._overrides = {"claude": TimingOut(), "opencode": TimingOut()}
     eng.state.phase = Phase.ANALYZE_EXECUTE
     with pytest.raises(ExecutionTimeoutError):
@@ -2241,7 +2965,7 @@ def test_launch_is_persisted_before_the_agent_runs(tmp_state_dir):
 # -- agent-reported failure / blocked ----------------------------------------------------------
 def test_agent_failure_moves_to_failed(tmp_state_dir, fake_github):
     payload = {"phase": "ANALYZE_EXECUTE", "status": "failure", "message": "tests red"}
-    eng = make_engine(tmp_state_dir, [block(payload)], github=fake_github)
+    eng = make_engine(tmp_state_dir, [block(payload)], github=fake_github, origin=True)
     eng.state.phase = Phase.ANALYZE_EXECUTE
     out = eng.step()
     assert out.next_phase == "FAILED" and eng.state.block_reason == "tests red"
@@ -2249,7 +2973,7 @@ def test_agent_failure_moves_to_failed(tmp_state_dir, fake_github):
 
 def test_agent_blocked_moves_to_blocked(tmp_state_dir, fake_github):
     payload = {"phase": "ANALYZE_EXECUTE", "status": "blocked", "message": "need decision"}
-    eng = make_engine(tmp_state_dir, [block(payload)], github=fake_github)
+    eng = make_engine(tmp_state_dir, [block(payload)], github=fake_github, origin=True)
     eng.state.phase = Phase.ANALYZE_EXECUTE
     assert eng.step().next_phase == "BLOCKED"
     with pytest.raises(StateTransitionError):
@@ -2729,7 +3453,7 @@ def test_run_logs_are_redacted_and_structured(tmp_state_dir, fake_github):
         "status": "failure",
         "message": "token ghp_abcdefghijklmnopqrstuvwxyz0123456789 leaked",
     }
-    eng = make_engine(tmp_state_dir, [block(payload)], github=fake_github)
+    eng = make_engine(tmp_state_dir, [block(payload)], github=fake_github, origin=True)
     eng.state.phase = Phase.ANALYZE_EXECUTE
     eng.step()
     run_dir = eng.paths.logs_dir / eng.state.run_id
@@ -4117,7 +4841,7 @@ def test_agent_message_is_bounded_before_it_reaches_state(tmp_state_dir, fake_gi
     message = "tests red: " + ("FAILED tests/test_x.py::test_y; " * 5000) + "see the run log"
     assert len(message) > MAX_BLOCK_REASON_CHARS
     payload = {"phase": "ANALYZE_EXECUTE", "status": status, "message": message}
-    eng = make_engine(tmp_state_dir, [block(payload)], github=fake_github)
+    eng = make_engine(tmp_state_dir, [block(payload)], github=fake_github, origin=True)
     eng.state.phase = Phase.ANALYZE_EXECUTE
     out = eng.step()
     assert out.next_phase == ("FAILED" if status == "failure" else "BLOCKED")
@@ -4707,7 +5431,6 @@ def test_update_epic_conclusive_github_failure_blocks_without_reinvoking_agent(
 ROADMAP_START = "<!-- ai-controller-roadmap:start -->"
 ROADMAP_END = "<!-- ai-controller-roadmap:end -->"
 OPERATOR_BODY = "# EPIC\n\nOperator text.\n\n- [ ] #2 feature\n- [ ] #3 next\n"
-PR41 = "https://github.com/owner/repo/pull/41"
 
 
 def _epic_body(section: str | None = None, trailing: str = "") -> str:
@@ -5630,8 +6353,7 @@ def _loop_agent(gh: FakeGitHub, findings_for_round, seen: list[str] | None = Non
     def agent(req):
         seen.append(req.phase)
         if req.phase == "ANALYZE_EXECUTE":
-            gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
-            return block(ANALYZE_OK)
+            return implement(req)
         if req.phase == "REVIEW":
             rounds["n"] += 1
             rnd = rounds["n"]
@@ -5668,7 +6390,9 @@ def test_review_round_cap_blocks_with_findings_and_never_starts_the_last_fix(tmp
     """Round N == cap still has findings -> BLOCKED; no FIX whose result could never be reviewed."""
     gh = FakeGitHub()
     seen: list[str] = []
-    eng = make_engine(tmp_state_dir, _loop_agent(gh, _one_finding_per_round, seen), github=gh)
+    eng = make_engine(
+        tmp_state_dir, _loop_agent(gh, _one_finding_per_round, seen), github=gh, origin=True
+    )
     eng.config.workflow.max_review_rounds = 3
     _no_stagnation(eng.config)
     eng._save()
@@ -5692,6 +6416,7 @@ def test_review_round_cap_does_not_block_a_clean_last_round(tmp_state_dir):
         tmp_state_dir,
         _loop_agent(gh, lambda rnd: _one_finding_per_round(rnd) if rnd < 2 else []),
         github=gh,
+        origin=True,
     )
     eng.config.workflow.max_review_rounds = 2
     eng._save()
@@ -5733,7 +6458,7 @@ def test_review_stagnation_identical_resolutions_blocks(tmp_state_dir):
     seen: list[str] = []
     texts = {1: "Add a regression test", 2: "  add   A REGRESSION test  "}
     agent = _loop_agent(gh, lambda rnd: _one_finding_per_round(rnd, texts[rnd]), seen)
-    eng = make_engine(tmp_state_dir, agent, github=gh)
+    eng = make_engine(tmp_state_dir, agent, github=gh, origin=True)
     # Below the replan soft threshold the verdict is the loop guard's to act on.
     assert eng.config.review.replan.soft_threshold > 2
     outcomes = eng.run(max_steps=50)
@@ -5750,8 +6475,9 @@ def test_review_stagnation_identical_resolutions_blocks(tmp_state_dir):
     assert s.review_round == 2 and "identical resolutions" in s.block_reason
     assert "stagnation_identical_rounds=2" in s.block_reason
     # The FIX really moved the PR, and each round is recorded at the HEAD it reviewed ...
-    assert gh.prs[PR].head_sha == _sha(1) and _sha(1) != SHA_A
-    assert [r["reviewed_head_sha"] for r in s.review_history] == [SHA_A, _sha(1)]
+    implemented = eng.origin.head("autoforge/2")
+    assert gh.prs[PR].head_sha == _sha(1) and _sha(1) != implemented
+    assert [r["reviewed_head_sha"] for r in s.review_history] == [implemented, _sha(1)]
     assert [r["result"] for r in s.review_history] == ["needs_fix", "needs_fix"]
     # ... while the demand, once normalised, is the one round 1 already made.
     assert s.review_history[0]["fingerprint"] == s.review_history[1]["fingerprint"]
@@ -5769,7 +6495,7 @@ def test_review_stagnation_unchanged_count_blocks_a_ping_pong(tmp_state_dir):
     gh = FakeGitHub()
     texts = {1: "apply refactor X", 2: "revert refactor X", 3: "Apply refactor X"}
     agent = _loop_agent(gh, lambda rnd: _one_finding_per_round(rnd, texts[rnd]))
-    eng = make_engine(tmp_state_dir, agent, github=gh)
+    eng = make_engine(tmp_state_dir, agent, github=gh, origin=True)
     eng._save()
     outcomes = eng.run(max_steps=50)
     assert [o.next_phase for o in outcomes][-3:] == ["FIX", "REVIEW", "BLOCKED"]
@@ -5784,7 +6510,9 @@ def test_review_one_new_finding_per_round_is_progress_not_stagnation(tmp_state_d
     """A reviewer that raises a fresh finding every round (each earlier one fixed) is
     bounded by the round cap only: the unchanged count alone is not stagnation."""
     gh = FakeGitHub()
-    eng = make_engine(tmp_state_dir, _loop_agent(gh, _one_finding_per_round), github=gh)
+    eng = make_engine(
+        tmp_state_dir, _loop_agent(gh, _one_finding_per_round), github=gh, origin=True
+    )
     eng.config.workflow.max_review_rounds = 4
     eng._save()  # defaults: identical=2, unchanged_count=3
     outcomes = eng.run(max_steps=50)
@@ -5806,7 +6534,7 @@ def test_review_progress_is_not_stagnation(tmp_state_dir):
             for n in range(1, per_round[rnd] + 1)
         ]
 
-    eng = make_engine(tmp_state_dir, _loop_agent(gh, findings), github=gh)
+    eng = make_engine(tmp_state_dir, _loop_agent(gh, findings), github=gh, origin=True)
     eng._save()
     outcomes = eng.run(max_steps=50)
     assert outcomes[-1].next_phase == "READY_FOR_MERGE"
@@ -5890,11 +6618,7 @@ def test_review_refused_by_the_post_review_pr_read_consumes_neither_round_nor_hi
 
 
 def test_new_pr_resets_review_history(tmp_state_dir, fake_github):
-    def on_call(req):
-        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, body=implementation_pr_body())
-        return block(ANALYZE_OK)
-
-    eng = make_engine(tmp_state_dir, on_call, github=fake_github)
+    eng = make_engine(tmp_state_dir, implement, github=fake_github, origin=True)
     eng.state.phase = Phase.ANALYZE_EXECUTE
     eng.state.review_history = [review_record(1, SHA_B, RESULT_NEEDS_FIX, [_finding(1)])]
     eng.state.review_round = 1
@@ -5912,7 +6636,7 @@ def test_step_budget_is_cumulative_and_survives_resume(tmp_state_dir):
     gh = FakeGitHub()
     seen: list[str] = []
     agent = _loop_agent(gh, _one_finding_per_round, seen)
-    eng = make_engine(tmp_state_dir, agent, github=gh)
+    eng = make_engine(tmp_state_dir, agent, github=gh, origin=True)
     eng.config.workflow.max_total_steps = 4
     _no_stagnation(eng.config)
     eng._save()
@@ -5922,6 +6646,7 @@ def test_step_budget_is_cumulative_and_survives_resume(tmp_state_dir):
 
     # a fresh engine, as `resume` builds it: state (and the budget) come from disk
     resumed = make_engine(tmp_state_dir, agent, github=gh, cfg=eng.config)
+    connect_origin(resumed, eng.origin)
     resumed.load()
     second = resumed.run(max_steps=50)
     assert [o.next_phase for o in second] == ["FIX", "REVIEW", "BLOCKED"]
@@ -6208,27 +6933,28 @@ def test_fix_prompt_size_is_bounded_by_the_review_bounds(tmp_state_dir, fake_git
 # -- bounded stdout capture (#53) ---------------------------------------------------------
 class _TruncatedOutputProvider(ScriptedProvider):
     """Returns what the executor returns for an agent whose stdout passed the
-    capture bound: ``head + marker + tail`` with the tail offset recorded."""
+    capture bound: ``head + marker + tail`` with the tail offset recorded.
+    ``head`` and ``tail`` are text, or handlers called with the request (such
+    as :func:`implement`, the agent's commit in its worktree and its result)."""
 
-    def __init__(self, head: str, tail: str, on_call=None) -> None:
+    def __init__(self, head, tail) -> None:
         super().__init__()
         self.marker = "\n[autoforge: 999 bytes of stdout omitted; ...]\n"
         self.head, self.tail = head, tail
-        self.on_call = on_call
 
     def execute(self, req):
         self.calls.append(req)
-        if self.on_call is not None:
-            self.on_call()
+        head = self.head(req) if callable(self.head) else self.head
+        tail = self.tail(req) if callable(self.tail) else self.tail
         return AgentExecutionResult(
             command=["x"],
             exit_code=0,
-            stdout=self.head + self.marker + self.tail,
+            stdout=head + self.marker + tail,
             stderr="",
             started_at="t",
             finished_at="t",
             stdout_truncated=True,
-            stdout_tail_offset=len(self.head) + len(self.marker),
+            stdout_tail_offset=len(head) + len(self.marker),
         )
 
 
@@ -6240,13 +6966,9 @@ def _install(eng, provider):
 def test_truncated_stdout_accepts_a_block_that_lies_in_the_tail(tmp_state_dir, fake_github):
     """The block is the last thing on stdout, so the kept tail preserves it;
     the whole (marked) capture is what reaches stdout.log."""
-    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    eng = make_engine(tmp_state_dir, [], github=fake_github, origin=True)
     provider = _TruncatedOutputProvider(
-        "runaway logs " * 100,
-        "last logs\n" + block(ANALYZE_OK),
-        on_call=lambda: fake_github.add_pr(
-            head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body()
-        ),
+        "runaway logs " * 100, lambda req: "last logs\n" + implement(req)
     )
     _install(eng, provider)
     eng.state.phase = Phase.ANALYZE_EXECUTE
@@ -6264,21 +6986,20 @@ def test_truncated_stdout_accepts_a_block_that_lies_in_the_tail(tmp_state_dir, f
 # -- what an invocation left behind (#85) ------------------------------------------
 class _LeftoverProvider(ScriptedProvider):
     """Returns what the executor returns for an agent that left processes
-    behind (killed after its exit) or whose kill was not clean."""
+    behind (killed after its exit) or whose kill was not clean. ``stdout`` is
+    text, or a handler called with the request (such as :func:`implement`)."""
 
-    def __init__(self, stdout: str, on_call=None, exit_code=0, **facts) -> None:
+    def __init__(self, stdout, exit_code=0, **facts) -> None:
         super().__init__()
-        self.stdout, self.on_call, self.facts = stdout, on_call, facts
+        self.stdout, self.facts = stdout, facts
         self.exit_code = -1 if facts.get("timed_out") else exit_code
 
     def execute(self, req):
         self.calls.append(req)
-        if self.on_call is not None:
-            self.on_call()
         return AgentExecutionResult(
             command=["x"],
             exit_code=self.exit_code,
-            stdout=self.stdout,
+            stdout=self.stdout(req) if callable(self.stdout) else self.stdout,
             stderr="boom",
             started_at="t",
             finished_at="t",
@@ -6291,14 +7012,8 @@ def test_descendants_killed_after_a_clean_exit_keeps_the_result_and_is_journaled
 ):
     """The agent's own exit and CONTROL_RESULT are what count; that its
     leftovers were killed is recorded, not an error (#85, point 1)."""
-    eng = make_engine(tmp_state_dir, [], github=fake_github)
-    provider = _LeftoverProvider(
-        block(ANALYZE_OK),
-        on_call=lambda: fake_github.add_pr(
-            head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body()
-        ),
-        descendants_killed=True,
-    )
+    eng = make_engine(tmp_state_dir, [], github=fake_github, origin=True)
+    provider = _LeftoverProvider(implement, descendants_killed=True)
     _install(eng, provider)
     eng.state.phase = Phase.ANALYZE_EXECUTE
     out = eng.step()
@@ -6317,7 +7032,7 @@ def test_descendants_killed_after_a_clean_exit_keeps_the_result_and_is_journaled
 def test_agent_orphan_facts_are_journaled_and_named(tmp_state_dir, fake_github):
     """#132: what the agent left outside its group is recorded with the
     other leftover facts, and its sentence follows a failed exit."""
-    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    eng = make_engine(tmp_state_dir, [], github=fake_github, origin=True)
     provider = _LeftoverProvider(
         "", exit_code=2, orphans_killed=True, orphan_survived_kill=True, orphans_unchecked=False
     )
@@ -6339,7 +7054,7 @@ def test_timeout_names_a_group_member_that_survived_the_kill(tmp_state_dir, fake
     """#85 addendum: 'was killed' must not read as 'is gone'. A member still
     in the group after SIGKILL is named in the error, the journal and the
     run log so the operator looks for the leftover before resuming."""
-    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    eng = make_engine(tmp_state_dir, [], github=fake_github, origin=True)
     provider = _LeftoverProvider("", timed_out=True, group_survived_kill=True)
     _install(eng, provider)
     eng.state.phase = Phase.ANALYZE_EXECUTE
@@ -6362,7 +7077,7 @@ def test_timeout_names_a_group_member_that_survived_the_kill(tmp_state_dir, fake
 def test_an_idle_timeout_names_the_limit_and_the_last_activity(tmp_state_dir, fake_github):
     """#193: the error, the run log and the progress line say the agent made
     no progress for its idle limit, and when it was last seen writing."""
-    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    eng = make_engine(tmp_state_dir, [], github=fake_github, origin=True)
     provider = _LeftoverProvider(
         "", timed_out=True, timeout_limit="idle", last_activity_at="2026-10-07T08:31:02+00:00"
     )
@@ -6393,7 +7108,7 @@ def test_an_idle_timeout_names_the_limit_and_the_last_activity(tmp_state_dir, fa
 
 
 def test_an_idle_timeout_before_any_output_says_so(tmp_state_dir, fake_github):
-    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    eng = make_engine(tmp_state_dir, [], github=fake_github, origin=True)
     _install(eng, _LeftoverProvider("", timed_out=True, timeout_limit="idle"))
     eng.state.phase = Phase.ANALYZE_EXECUTE
     with pytest.raises(
@@ -6411,7 +7126,7 @@ def test_an_idle_timeout_before_any_output_says_so(tmp_state_dir, fake_github):
     ],
 )
 def test_a_maximum_runtime_timeout_names_the_ceiling(tmp_state_dir, fake_github, ceiling, expected):
-    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    eng = make_engine(tmp_state_dir, [], github=fake_github, origin=True)
     eng.config.execution.default_max_runtime_seconds = ceiling
     eng.config.profile("analyze_execute").idle_timeout_seconds = 120
     provider = _LeftoverProvider(
@@ -6448,7 +7163,7 @@ def test_failed_exit_names_what_the_agent_left_behind(tmp_state_dir, fake_github
     timeout. The immediate error, the journal and the run log all name the
     writer that still holds the pipes, so the operator does not read
     "exited 2" as "is gone" before resuming."""
-    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    eng = make_engine(tmp_state_dir, [], github=fake_github, origin=True)
     provider = _LeftoverProvider("", exit_code=2, capture_abandoned=True)
     _install(eng, provider)
     eng.state.phase = Phase.ANALYZE_EXECUTE
@@ -6482,12 +7197,10 @@ def test_a_provider_failure_raises_before_the_parser_and_is_journaled(tmp_state_
     """#131: a protocol-level failure (here: Pi rejected the prompt) is its own
     error, even with a well-formed block on stdout and exit 0; the run log
     keeps the reason and the provider summary, and state does not move."""
-    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    eng = make_engine(tmp_state_dir, [], github=fake_github, origin=True)
     reason = "pi: prompt rejected before acceptance: No API key found for openai."
     summary = {"resolved_model_id": "gpt-5.6-terra", "agent_ends": 0, "abort_sent": False}
-    provider = _LeftoverProvider(
-        block(ANALYZE_OK), provider_failure=reason, provider_summary=summary
-    )
+    provider = _LeftoverProvider(implement, provider_failure=reason, provider_summary=summary)
     _install(eng, provider)
     eng.state.phase = Phase.ANALYZE_EXECUTE
     with pytest.raises(ExecutionError) as excinfo:
@@ -6509,7 +7222,7 @@ def test_a_provider_failure_raises_before_the_parser_and_is_journaled(tmp_state_
 
 
 def test_a_timeout_wins_over_a_provider_failure(tmp_state_dir, fake_github):
-    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    eng = make_engine(tmp_state_dir, [], github=fake_github, origin=True)
     provider = _LeftoverProvider("", timed_out=True, provider_failure="pi: exited early")
     _install(eng, provider)
     eng.state.phase = Phase.ANALYZE_EXECUTE
@@ -6519,7 +7232,7 @@ def test_a_timeout_wins_over_a_provider_failure(tmp_state_dir, fake_github):
 
 
 def test_a_provider_failure_names_what_the_agent_left_behind(tmp_state_dir, fake_github):
-    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    eng = make_engine(tmp_state_dir, [], github=fake_github, origin=True)
     provider = _LeftoverProvider(
         "", provider_failure="pi: exited before agent_settled (exit 1)", capture_abandoned=True
     )
@@ -6530,13 +7243,8 @@ def test_a_provider_failure_names_what_the_agent_left_behind(tmp_state_dir, fake
 
 
 def test_a_one_shot_provider_writes_no_provider_summary(tmp_state_dir, fake_github):
-    eng = make_engine(tmp_state_dir, [], github=fake_github)
-    provider = _LeftoverProvider(
-        block(ANALYZE_OK),
-        on_call=lambda: fake_github.add_pr(
-            head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body()
-        ),
-    )
+    eng = make_engine(tmp_state_dir, [], github=fake_github, origin=True)
+    provider = _LeftoverProvider(implement)
     _install(eng, provider)
     eng.state.phase = Phase.ANALYZE_EXECUTE
     assert eng.step().next_phase == "REVIEW"
@@ -6555,14 +7263,15 @@ def test_a_pi_phase_runs_end_to_end_over_rpc(tmp_state_dir, fake_github, tmp_pat
 
     (tmp_path / "fake").mkdir()
     fake = FakePi(tmp_path / "fake", _happy())
+    final: list[str] = []
 
     class _Pi(PiProvider):
         def execute(self, req):
-            res = super().execute(req)
-            fake_github.add_pr(
-                head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body()
-            )
-            return res
+            # The agent's work, one commit in its worktree, reported as Pi's
+            # final text: the same fake `pi`, rescripted before it starts.
+            final.append(js_trim(implement(req)))
+            FakePi(tmp_path / "fake", _happy(final[-1]))
+            return super().execute(req)
 
     cfg = default_config()
     cfg.profiles["analyze_execute"] = replace(
@@ -6574,7 +7283,7 @@ def test_a_pi_phase_runs_end_to_end_over_rpc(tmp_state_dir, fake_github, tmp_pat
         extra_args=[],
         options={},
     )
-    eng = make_engine(tmp_state_dir, [], github=fake_github, cfg=cfg)
+    eng = make_engine(tmp_state_dir, [], github=fake_github, cfg=cfg, origin=True)
     eng.providers._overrides["pi"] = _Pi(round_trip_seconds=5, abort_seconds=1)
     eng.state.phase = Phase.ANALYZE_EXECUTE
     assert eng.step().next_phase == "REVIEW"
@@ -6587,7 +7296,8 @@ def test_a_pi_phase_runs_end_to_end_over_rpc(tmp_state_dir, fake_github, tmp_pat
     prompt = json.loads(fake.stdin()[2])["message"]
     assert "CONTROL_RESULT" in prompt
     _, step = _step_dir(eng)
-    assert (step / "stdout.log").read_text(encoding="utf-8") == js_trim(block(ANALYZE_OK))
+    assert len(final) == 1
+    assert (step / "stdout.log").read_text(encoding="utf-8") == final[0]
     execution = json.loads((step / "execution.json").read_text(encoding="utf-8"))
     assert execution["provider_summary"]["stop_reason"] == "stop"
     assert execution["provider_summary"]["failure"] == ""
@@ -6600,9 +7310,9 @@ def test_truncated_stdout_never_accepts_a_block_from_the_head(tmp_state_dir, fak
     """A block before the cut is stale (the agent wrote more after it) or
     spans the cut; either way it is not the agent's final result. The
     rejection names the truncation so the correction prompt carries it."""
-    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    eng = make_engine(tmp_state_dir, [], github=fake_github, origin=True)
     eng.config.execution.max_correction_attempts = 0
-    provider = _TruncatedOutputProvider(block(ANALYZE_OK), "trailing logs only\n")
+    provider = _TruncatedOutputProvider(implement, "trailing logs only\n")
     _install(eng, provider)
     eng.state.phase = Phase.ANALYZE_EXECUTE
     with pytest.raises(ControlResultValidationError, match="capture bound") as exc:
@@ -6618,7 +7328,6 @@ def test_truncated_stdout_never_accepts_a_block_from_the_head(tmp_state_dir, fak
 # The shared durable-claim protocol (PR #89 re-review): entry reconciliation and
 # post-agent read-back consume one validated identity model, for every marker kind.
 # =====================================================================================
-PR41 = "https://github.com/owner/repo/pull/41"
 ISSUE4 = "https://github.com/owner/repo/issues/4"
 
 
@@ -6676,143 +7385,6 @@ def test_analyze_entry_blocks_on_an_unreadable_implementation_marker_without_lau
     reason = load_state(eng.paths.state_file).block_reason
     assert "ai-implementation marker" in reason and f"open PR {PR41}" in reason
     assert "repair the unreadable marker" in reason and eng.state.current_pr_url == ""
-
-
-@pytest.mark.parametrize("body", _UNREADABLE_IMPLEMENTATION_BODIES)
-def test_analyze_read_back_rejects_when_any_open_pr_carries_an_unreadable_marker(
-    tmp_state_dir, fake_github, body
-):
-    """The read-back asks the same question of the same collection: the agent
-    created the right PR, but another open PR (its own abandoned draft, an
-    operator's) carries a marker that could not be read, so "exactly one PR
-    carries this issue's marker" is not established and nothing is persisted."""
-
-    def agent(req):
-        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, body=implementation_pr_body())
-        fake_github.add_pr(url=PR41, head_sha=SHA_B, branch="feature/draft", body=body)
-        return block(ANALYZE_OK)
-
-    eng = make_engine(tmp_state_dir, agent, github=fake_github)
-    eng.state.phase = Phase.ANALYZE_EXECUTE
-    with pytest.raises(VerificationError, match=f"cannot accept PR {PR} .*open PR {PR41}"):
-        eng.step()
-    s = load_state(eng.paths.state_file)
-    assert s.phase == Phase.ANALYZE_EXECUTE and s.current_pr_url == ""
-
-
-def test_analyze_pr_carrying_this_issues_marker_and_anothers_is_rejected_then_blocked(
-    tmp_state_dir, fake_github
-):
-    """PR #89 F4: a PR marked for the current issue *and* another issue is not
-    "the current issue's PR with noise". It publishes two identities and
-    proves neither, on read-back and at the next entry alike."""
-
-    def agent(req):
-        fake_github.add_pr(
-            head_sha=SHA_A,
-            branch=BRANCH,
-            body=implementation_pr_body(ISSUE) + implementation_pr_body(ISSUE3),
-        )
-        return block(ANALYZE_OK)
-
-    eng = make_engine(tmp_state_dir, agent, github=fake_github)
-    eng.state.phase = Phase.ANALYZE_EXECUTE
-    with pytest.raises(VerificationError, match="carries 2 ai-implementation markers"):
-        eng.step()
-    assert eng.state.current_pr_url == ""
-    assert eng.step().next_phase == "BLOCKED" and len(eng.provider.calls) == 1
-    reason = load_state(eng.paths.state_file).block_reason
-    assert f"open PR {PR}: carries 2 ai-implementation markers" in reason
-
-
-def test_analyze_read_back_reads_the_pr_from_the_listing_snapshot_not_a_second_view(
-    tmp_state_dir,
-):
-    """PR #89 F1: the identity check and the state/HEAD/branch checks must
-    see the same PR. A client whose single-PR view still shows the marker
-    while the listing (the collection the next entry reads) does not must
-    not get the PR accepted: the listing is the one snapshot."""
-
-    class ViewDisagrees(FakeGitHub):
-        def get_pr(self, url):
-            pr = super().get_pr(url)
-            return replace(pr, body=implementation_pr_body())  # the view says "marked"
-
-    gh = ViewDisagrees()
-
-    def agent(req):
-        gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body="")  # the listing says "not"
-        return block(ANALYZE_OK)
-
-    eng = make_engine(tmp_state_dir, agent, github=gh)
-    eng.state.phase = Phase.ANALYZE_EXECUTE
-    with pytest.raises(VerificationError, match="no open PR carries the ai-implementation marker"):
-        eng.step()
-    assert eng.state.current_pr_url == ""
-
-
-def test_analyze_read_back_rejects_when_the_marked_pr_is_not_the_reported_one(
-    tmp_state_dir, fake_github
-):
-    """The agent reports PR 42 while the one open PR carrying the marker is
-    PR 41: the report is not adopted, and neither is PR 41 (the agent's
-    claim and GitHub's record disagree, so nothing is proven)."""
-
-    def agent(req):
-        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, body="")
-        fake_github.add_pr(url=PR41, head_sha=SHA_A, branch=BRANCH, body=implementation_pr_body())
-        return block(ANALYZE_OK)
-
-    eng = make_engine(tmp_state_dir, agent, github=fake_github)
-    eng.state.phase = Phase.ANALYZE_EXECUTE
-    with pytest.raises(VerificationError, match=f"agent reported PR {PR} but .* is {PR41}"):
-        eng.step()
-    assert eng.state.current_pr_url == ""
-
-
-def test_analyze_read_back_rejects_when_the_open_pr_listing_cannot_be_read_to_its_end(
-    tmp_state_dir, fake_github
-):
-    """The read-back's "exactly one" is a claim about every open PR, like the
-    entry's "at most one": a listing that stopped before its end cannot make it."""
-
-    def agent(req):
-        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, body=implementation_pr_body())
-        fake_github.open_pr_listing_incomplete = True
-        return block(ANALYZE_OK)
-
-    eng = make_engine(tmp_state_dir, agent, github=fake_github)
-    eng.state.phase = Phase.ANALYZE_EXECUTE
-    with pytest.raises(VerificationError, match="cannot accept PR .* cannot be read to its end"):
-        eng.step()
-    assert eng.state.current_pr_url == "" and eng.state.phase == Phase.ANALYZE_EXECUTE
-
-
-def test_analyze_read_back_lets_an_unavailable_github_through_as_transient(tmp_state_dir):
-    """A transient failure of the listing is not a verification failure of
-    the agent's claim; it is re-raised as such and nothing is persisted."""
-
-    class Flaky(FakeGitHub):
-        outage = False
-
-        def list_open_prs(self, repo):
-            if self.outage:
-                raise GitHubUnavailableError("`gh api graphql` failed (exit 1): HTTP 503")
-            return super().list_open_prs(repo)
-
-    gh = Flaky()
-
-    def agent(req):
-        gh.add_pr(head_sha=SHA_A, branch=BRANCH, body=implementation_pr_body())
-        gh.outage = True
-        return block(ANALYZE_OK)
-
-    eng = make_engine(tmp_state_dir, agent, github=gh)
-    eng.state.phase = Phase.ANALYZE_EXECUTE
-    with pytest.raises(GitHubUnavailableError) as info:
-        eng.step()
-    assert not isinstance(info.value, VerificationError)
-    assert eng.state.current_pr_url == ""
 
 
 # -- follow-up markers: a defect on any open issue is a defect of the open-issue set ------
@@ -7028,7 +7600,7 @@ def test_correction_after_a_botched_implementation_pr_blocks_instead_of_relaunch
         )
         return "junk\n"
 
-    eng = make_engine(tmp_state_dir, agent, github=fake_github)
+    eng = make_engine(tmp_state_dir, agent, github=fake_github, origin=True)
     eng.state.phase = Phase.ANALYZE_EXECUTE
     out = eng.step()
     assert out.next_phase == "BLOCKED" and len(eng.provider.calls) == 1
@@ -7760,11 +8332,7 @@ def test_review_entry_ignores_a_pre_merge_base_comment_for_the_round(tmp_state_d
 
 
 def test_new_pr_clears_the_review_binding(tmp_state_dir, fake_github):
-    def on_call(req):
-        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, body=implementation_pr_body())
-        return block(ANALYZE_OK)
-
-    eng = make_engine(tmp_state_dir, on_call, github=fake_github)
+    eng = make_engine(tmp_state_dir, implement, github=fake_github, origin=True)
     eng.state.phase = Phase.ANALYZE_EXECUTE
     eng.state.reviewed_pr_url = "https://github.com/owner/repo/pull/7"
     eng.state.reviewed_head_sha = SHA_B
@@ -7781,17 +8349,40 @@ def _worktrees(repo) -> list[str]:
     return [line.split(" ", 1)[1] for line in out.splitlines() if line.startswith("worktree ")]
 
 
-def _analyze_with(tmp_state_dir, fake_github, handler):
-    eng = make_engine(tmp_state_dir, [], github=fake_github)
+def _analyze_with(tmp_state_dir, fake_github, handler, agent=implement):
+    """INITIALIZING done; the ANALYZE_EXECUTE agent runs ``handler``, then ``agent``'s work."""
+    eng = make_engine(tmp_state_dir, [], github=fake_github, origin=True)
     eng.step()  # INITIALIZING
 
     def on_call(req):
         handler(req)
-        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
-        return block(ANALYZE_OK)
+        return agent(req)
 
     eng.provider._handler = on_call
     return eng
+
+
+def _implement_without_hooks(req) -> str:
+    """:func:`implement`, by an agent whose own git runs no planted hook or monitor.
+
+    What a test plants for the controller's git processes (repository hooks,
+    the file-system monitor, ``GIT_*`` variables) must not be tripped by the
+    agent's commit, or the test could not tell whose process ran it.
+    """
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    argv = ["git", "-C", req.cwd, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"]
+    ident = ["-c", "user.name=t", "-c", "user.email=t@x"]
+    message = "Implement the feature (#2)"
+    subprocess.run(
+        [*argv, *ident, "commit", "-q", "--allow-empty", "-m", message],
+        env=env,
+        check=True,
+        capture_output=True,
+    )
+    head = subprocess.run(
+        [*argv, "rev-parse", "HEAD"], env=env, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    return block(analyze_payload(head))
 
 
 def test_remote_agent_runs_in_a_per_issue_worktree_under_the_git_common_dir(
@@ -7808,6 +8399,8 @@ def test_remote_agent_runs_in_a_per_issue_worktree_under_the_git_common_dir(
         seen["exists"] = (Path(req.cwd) / "a.txt").exists()
         seen["sees_uncommitted"] = (Path(req.cwd) / "uncommitted.txt").exists()
         seen["sees_state"] = (Path(req.cwd) / ".autoforge").exists()
+        seen["head"] = _git(req.cwd, "rev-parse", "HEAD")
+        seen["branch"] = _git(req.cwd, "rev-parse", "--abbrev-ref", "HEAD")
 
     eng = _analyze_with(tmp_state_dir, fake_github, handler)
     assert eng.step().next_phase == "REVIEW"
@@ -7815,7 +8408,11 @@ def test_remote_agent_runs_in_a_per_issue_worktree_under_the_git_common_dir(
     assert seen["cwd"] == expected and seen["exists"]
     assert not seen["sees_uncommitted"] and not seen["sees_state"]
     assert str(expected.resolve()) in _worktrees(repo)
-    assert _git(expected, "rev-parse", "HEAD") == base
+    # Created detached at the checkout's HEAD; the agent's one commit on it is
+    # what the controller published.
+    assert seen["head"] == base and seen["branch"] == "HEAD"
+    assert _git(expected, "rev-parse", "HEAD") == eng.state.current_head_sha
+    assert _git(expected, "rev-parse", "HEAD^") == base
     assert _git(expected, "rev-parse", "--abbrev-ref", "HEAD") == "HEAD"  # detached
     # The operator's checkout is untouched.
     assert _git(repo, "rev-parse", "HEAD") == base
@@ -7858,6 +8455,9 @@ def test_worktree_creation_runs_no_repository_hook_and_holds_no_credential(
     (repo / ".git" / "info" / "attributes").write_text("* filter=leak\n")
     _git(repo, "config", "filter.leak.smudge", f'env > "{planted}/filter-env"; cat')
     decoy = git_repo(planted / "decoy")
+    # The test's origin is seeded before the environment is planted: the push
+    # publishing its main is the harness's, not a controller process.
+    eng = make_engine(tmp_state_dir, [], github=fake_github, origin=True)
     monkeypatch.setenv("GITHUB_TOKEN", "ghp_controllertokenvalue")
     monkeypatch.setenv("GH_TOKEN", "ghp_controllertokenvalue")
     monkeypatch.setenv("GIT_DIR", str(decoy / ".git"))
@@ -7865,7 +8465,8 @@ def test_worktree_creation_runs_no_repository_hook_and_holds_no_credential(
     monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.hooksPath")
     monkeypatch.setenv("GIT_CONFIG_VALUE_0", str(hooks))
 
-    eng = _analyze_with(tmp_state_dir, fake_github, lambda req: None)
+    eng.step()  # INITIALIZING
+    eng.provider._handler = _implement_without_hooks
     real = eng._runner
     requests = []
 
@@ -7886,8 +8487,10 @@ def test_worktree_creation_runs_no_repository_hook_and_holds_no_credential(
     seen = (planted / "filter-env").read_text()
     assert "ghp_controllertokenvalue" not in seen
     assert str(decoy) not in seen and "GIT_CONFIG_COUNT" not in seen
-    # Still detached at HEAD, beside an untouched checkout, with no branch made.
-    assert _git(expected, "rev-parse", "HEAD") == base
+    # Still detached at HEAD, beside an untouched checkout, with no branch made:
+    # created at the checkout's HEAD, holding the agent's one commit on it.
+    assert _git(expected, "rev-parse", "HEAD") == eng.state.current_head_sha
+    assert _git(expected, "rev-parse", "HEAD^") == base
     assert _git(expected, "rev-parse", "--abbrev-ref", "HEAD") == "HEAD"
     assert _git(repo, "rev-parse", "--abbrev-ref", "HEAD") == "main"
     assert _git(repo, "for-each-ref", "--format=%(refname)", "refs/heads") == "refs/heads/main"
@@ -7897,12 +8500,27 @@ def test_worktree_creation_runs_no_repository_hook_and_holds_no_credential(
     assert ["worktree", "add", "--detach", str(expected), "HEAD"] in run
     assert ["worktree", "list", "--porcelain"] in run
     assert ["-C", str(expected), "rev-parse", "--show-toplevel", "--git-common-dir"] in run
+    network = []
     for req in requests:
         if req.command[0] != "git":
             continue
         assert req.command[: 1 + len(LOCAL_GIT_SWITCHES)] == ["git", *LOCAL_GIT_SWITCHES]
-        assert req.env_allowlist == LOCAL_GIT_ENV_ALLOWLIST
         assert (req.env or {})["GIT_NO_REPLACE_OBJECTS"] == "1"
+        if "GIT_DIR" not in (req.env or {}):
+            assert req.env_allowlist == LOCAL_GIT_ENV_ALLOWLIST
+            continue
+        # The controller's own fetch and push (#161) run in the git transport's
+        # private directory, never the planted one, with no global or system
+        # configuration; only a network operation holds what gh's credential
+        # helper needs (its hardening is test_git_transport.py's).
+        assert req.env["GIT_DIR"] == req.cwd and str(decoy) not in req.cwd
+        assert req.env["GIT_CONFIG_GLOBAL"] == os.devnull
+        assert req.env["GIT_CONFIG_NOSYSTEM"] == "1"
+        if req.env_allowlist == NETWORK_GIT_ENV_ALLOWLIST:
+            network.append(next(a for a in ("fetch", "push") if a in req.command))
+        else:
+            assert req.env_allowlist == LOCAL_GIT_ENV_ALLOWLIST
+    assert network == ["fetch", "push"]
 
 
 def test_the_issue_worktree_is_reused_across_phases_as_the_agent_left_it(
@@ -7966,7 +8584,7 @@ def test_a_subdirectory_of_an_existing_tree_is_not_adopted_as_a_worktree(
     cfg = default_config()
     cfg.execution.worktree_dir = "agents"
     (repo / "agents" / "2").mkdir(parents=True)
-    eng = make_engine(tmp_state_dir, [], github=fake_github, cfg=cfg)
+    eng = make_engine(tmp_state_dir, [], github=fake_github, cfg=cfg, origin=True)
     eng.step()
     with pytest.raises(VerificationError, match="inside the worktree rooted at"):
         eng.step()
@@ -8119,14 +8737,9 @@ def test_execution_worktree_dir_relocates_the_agent_worktrees(tmp_state_dir, fak
     _commit(repo, "a.txt", "1", "base")
     cfg = default_config()
     cfg.execution.worktree_dir = "../agent-trees"
-    eng = make_engine(tmp_state_dir, [], github=fake_github, cfg=cfg)
+    eng = make_engine(tmp_state_dir, [], github=fake_github, cfg=cfg, origin=True)
     eng.step()
-
-    def on_call(req):
-        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
-        return block(ANALYZE_OK)
-
-    eng.provider._handler = on_call
+    eng.provider._handler = implement
     assert eng.step().next_phase == "REVIEW"
     expected = (repo.parent / "agent-trees" / "2").resolve()
     assert Path(eng.provider.calls[0].cwd) == expected
@@ -8155,14 +8768,9 @@ def test_agent_launch_carries_the_configured_environment_allowlist(tmp_state_dir
     cfg.execution.env_allowlist_extra = ["MY_TOOL_*"]
     repo = git_repo(tmp_state_dir.parent)
     _commit(repo, "a.txt", "1", "base")
-    eng = make_engine(tmp_state_dir, [], github=fake_github, cfg=cfg)
+    eng = make_engine(tmp_state_dir, [], github=fake_github, cfg=cfg, origin=True)
     eng.step()
-
-    def on_call(req):
-        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
-        return block(ANALYZE_OK)
-
-    eng.provider._handler = on_call
+    eng.provider._handler = implement
     assert eng.step().next_phase == "REVIEW"
     req = eng.provider.calls[0]
     assert req.env_allowlist == cfg.execution.environment_names()
@@ -8198,15 +8806,14 @@ def _drift_engine(tmp_state_dir, fake_github, mutate, fail=False):
     """ANALYZE_EXECUTE whose agent moves the *operator's* checkout while it runs."""
     repo = git_repo(tmp_state_dir.parent)
     _commit(repo, "a.txt", "1", "base")
-    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    eng = make_engine(tmp_state_dir, [], github=fake_github, origin=True)
     eng.step()
 
     def on_call(req):
         mutate(repo)
         if fail:
             raise RuntimeError("agent exploded")
-        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
-        return block(ANALYZE_OK)
+        return implement(req)
 
     eng.provider._handler = on_call
     return eng
@@ -8259,6 +8866,7 @@ def test_an_unchanged_checkout_is_not_drift(tmp_state_dir, fake_github):
         wt = repo / ".git" / "autoforge" / "worktrees" / "2"
         _git(wt, "checkout", "-q", "-b", BRANCH)
         _commit(wt, "agent.txt", "x", "agent commit")
+        _git(wt, "checkout", "-q", "--detach")  # the controller publishes a detached HEAD
 
     eng = _drift_engine(tmp_state_dir, fake_github, work_in_worktree)
     assert eng.step().next_phase == "REVIEW"
@@ -8321,40 +8929,42 @@ def _to_pi(eng, tmp_path_factory, script):
     return fake
 
 
-def _analyze_writes_pr(gh):
-    def agent(req):
-        gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
-        return block(ANALYZE_OK)
-
-    return agent
-
-
 @pytest.mark.parametrize("claim", ["pull-request", "review-comment"])
 def test_a_pi_claim_github_does_not_back_fails_as_a_scripted_one_does(tmp_path_factory, claim):
-    """A Pi CONTROL_RESULT naming a PR (or review comment) FakeGitHub does not
-    have is refused by the same verification, with the same error, and state
-    stays where it was, exactly as for ScriptedProvider."""
+    """A Pi CONTROL_RESULT the controller cannot back is refused by the same
+    check, with the same error, and state stays where it was, exactly as for
+    ScriptedProvider: a head_sha that is not the worktree's HEAD (#161: a
+    refusal the agent is asked to correct, and nothing is pushed), or a
+    review comment FakeGitHub does not have."""
     if claim == "pull-request":
-        script = [block(ANALYZE_OK)]
+        # The correction gets the same answer, so the bound is reached.
+        script = [block(analyze_payload(SHA_A))] * 2
+        error: type[Exception] = ControlResultValidationError
     else:
         script = [block(review_payload(1, SHA_A, []))]
+        error = VerificationError
     seen = []
     for on_pi in (False, True):
         gh = FakeGitHub()
         state_dir = tmp_path_factory.mktemp("pi-run" if on_pi else "scripted") / ".autoforge"
         if claim == "pull-request":
-            eng = make_engine(state_dir, list(script), github=gh)
+            eng = make_engine(state_dir, list(script), github=gh, origin=True)
             eng.state.phase = Phase.ANALYZE_EXECUTE
         else:
             eng = _in_review(state_dir, gh, list(script))
         if on_pi:
             fake = _to_pi(eng, tmp_path_factory, list(script))
-        with pytest.raises(VerificationError) as excinfo:
+        with pytest.raises(error) as excinfo:
             eng.step()
+        # Each run's worktree HEAD is its own repository's commit.
+        message = re.sub(r"\b(?!a{40})[0-9a-f]{40}\b", "<HEAD>", str(excinfo.value))
         s = load_state(eng.paths.state_file)
-        seen.append((str(excinfo.value), s.phase, s.current_pr_url, s.review_round))
+        seen.append((message, s.phase, s.current_pr_url, s.review_round, gh.effect_writes))
     assert seen[0] == seen[1]
-    assert eng.provider.calls == [] and len(fake.launches()) == 1
+    assert seen[0][4] == []
+    if claim == "pull-request":
+        assert f"field 'head_sha' is {SHA_A}, but the worktree's HEAD is <HEAD>" in seen[0][0]
+    assert eng.provider.calls == [] and len(fake.launches()) == len(script)
 
 
 def test_a_pi_correction_is_a_second_separate_pi_process(
@@ -8370,19 +8980,18 @@ def test_a_pi_correction_is_a_second_separate_pi_process(
     def agent(req):
         if not req.correction:
             return PiTurn(text="I am done, no block here", stderr=PI_STDERR)
-        fake_github.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
-        return block(ANALYZE_OK)
+        return implement(req)
 
-    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    eng = make_engine(tmp_state_dir, [], github=fake_github, origin=True)
     fake = _to_pi(eng, tmp_path_factory, agent)
     reconciled = []
-    recover = eng._try_recover_pr
+    reconcile = eng._reconcile_analyze_entry
 
-    def spy():
+    def spy(plan):
         reconciled.append(len(fake.launches()))
-        return recover()
+        return reconcile(plan)
 
-    eng._try_recover_pr = spy
+    eng._reconcile_analyze_entry = spy
     eng.state.phase = Phase.ANALYZE_EXECUTE
 
     assert eng.step().next_phase == "REVIEW"
@@ -8414,7 +9023,7 @@ def test_pi_corrections_are_bounded_as_scripted_ones_are(
     seen = []
     for on_pi in (False, True):
         state_dir = tmp_path_factory.mktemp("pi-run" if on_pi else "scripted") / ".autoforge"
-        eng = make_engine(state_dir, ["junk"] * 5, github=FakeGitHub())
+        eng = make_engine(state_dir, ["junk"] * 5, github=FakeGitHub(), origin=True)
         eng.config.execution.max_correction_attempts = corrections
         if on_pi:
             fake = _to_pi(eng, tmp_path_factory, ["junk"] * 5)
@@ -8472,13 +9081,9 @@ def test_a_pi_failure_leaves_state_unchanged_and_resume_relaunches(
     relaunches the phase, which then advances on a valid result."""
     from tests.pi_fake import PiTurn
 
-    script = [PiTurn(stderr=PI_STDERR, **turn), _analyze_writes_pr(fake_github)]
+    agent = scripted(PiTurn(stderr=PI_STDERR, **turn), implement)
 
-    def agent(req):
-        step = script.pop(0)
-        return step if isinstance(step, PiTurn) else step(req)
-
-    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    eng = make_engine(tmp_state_dir, [], github=fake_github, origin=True)
     fake = _to_pi(eng, tmp_path_factory, agent)
     eng.state.phase = Phase.ANALYZE_EXECUTE
     with pytest.raises(ExecutionError) as excinfo:
@@ -8514,13 +9119,9 @@ def test_a_pi_deadline_is_a_timeout_naming_what_it_left_behind(
     is swept and named; state does not move and `resume` relaunches."""
     from tests.pi_fake import PiTurn
 
-    script = [PiTurn(outcome="hang", detach=60, stderr=PI_STDERR), _analyze_writes_pr(fake_github)]
+    agent = scripted(PiTurn(outcome="hang", detach=60, stderr=PI_STDERR), implement)
 
-    def agent(req):
-        step = script.pop(0)
-        return step if isinstance(step, PiTurn) else step(req)
-
-    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    eng = make_engine(tmp_state_dir, [], github=fake_github, origin=True)
     _to_pi(eng, tmp_path_factory, agent)
     eng.config.profiles["analyze_execute"] = replace(
         eng.config.profile("analyze_execute"), idle_timeout_seconds=2
@@ -8563,13 +9164,13 @@ def test_a_pi_run_log_records_argv_env_and_summary_and_redacts_secrets(
 
     secret = "sk-proj-" + "Z9" * 12
     monkeypatch.setenv("OPENAI_API_KEY", secret)  # never reaches Pi: not allow-listed
-    text = f"Used {secret} while working.\n\n" + block(ANALYZE_OK)
+    texts = []
 
     def agent(req):
-        _analyze_writes_pr(fake_github)(req)
-        return PiTurn(text=text, stderr=f"warning: token {secret} rejected\n")
+        texts.append(f"Used {secret} while working.\n\n" + implement(req))
+        return PiTurn(text=texts[-1], stderr=f"warning: token {secret} rejected\n")
 
-    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    eng = make_engine(tmp_state_dir, [], github=fake_github, origin=True)
     fake = _to_pi(eng, tmp_path_factory, agent)
     eng.state.phase = Phase.ANALYZE_EXECUTE
     assert eng.step().next_phase == "REVIEW"
@@ -8588,6 +9189,7 @@ def test_a_pi_run_log_records_argv_env_and_summary_and_redacts_secrets(
     assert execution["provider_summary"]["stop_reason"] == "stop"
     assert execution["provider_summary"]["failure"] == ""
     stdout = (step / "stdout.log").read_text(encoding="utf-8")
+    (text,) = texts
     assert stdout == js_trim(text).replace(secret, "***REDACTED***")
     assert '"agent_settled"' not in stdout and '"type"' not in stdout
     stderr = (step / "stderr.log").read_text(encoding="utf-8")

@@ -1,8 +1,9 @@
 """Scripted end-to-end loop: INITIALIZING -> ... -> READY_FOR_MERGE.
 
-Every agent call is a ScriptedProvider handler that mutates FakeGitHub the
-way the real agent would (create PR, post comment, push fix). State is
-reloaded from disk after every step to prove persistence.
+Every agent call is a ScriptedProvider handler that acts the way the real
+agent would (commit in its worktree, which the controller publishes as the
+PR; post a review comment; push a fix). State is reloaded from disk after
+every step to prove persistence.
 """
 
 import dataclasses
@@ -11,23 +12,22 @@ import json
 import pytest
 
 import autoforge.engine as engine_mod
-from autoforge.claims import render_progress_marker
+from autoforge.claims import render_implementation_marker, render_progress_marker
 from autoforge.config import default_config
 from autoforge.errors import StateTransitionError
 from autoforge.state import load_state
 from autoforge.transitions import Phase, decide_next_phase
 from tests.conftest import (
-    BRANCH,
     EPIC,
     ISSUE,
     PR,
-    SHA_A,
     SHA_B,
     SHA_C,
     FakeGitHub,
+    analyze_payload,
     block,
     comment_url,
-    implementation_pr_body,
+    implement,
     make_engine,
     review_comment_body,
 )
@@ -40,25 +40,16 @@ def test_full_loop_to_ready_for_merge(tmp_state_dir):
     def agent(req):
         phases_seen.append((req.phase, req.profile.model, req.profile.effort))
         if req.phase == "ANALYZE_EXECUTE":
-            gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
-            return block(
-                {
-                    "phase": "ANALYZE_EXECUTE",
-                    "status": "success",
-                    "issue_url": ISSUE,
-                    "pr_url": PR,
-                    "head_sha": SHA_A,
-                    "branch": BRANCH,
-                }
-            )
+            return implement(req)
         if req.phase == "REVIEW" and "Round 1" in req.prompt:
-            gh.add_comment(PR, 100, review_comment_body(1, SHA_A, True, ["R1-F1"]))
+            head = gh.prs[PR].head_sha  # the controller-published implementation commit
+            gh.add_comment(PR, 100, review_comment_body(1, head, True, ["R1-F1"]))
             return block(
                 {
                     "phase": "REVIEW",
                     "status": "success",
                     "round": 1,
-                    "reviewed_head_sha": SHA_A,
+                    "reviewed_head_sha": head,
                     "review_comment_url": comment_url(PR, 100),
                     "needs_fix_round": True,
                     "findings": [
@@ -73,13 +64,14 @@ def test_full_loop_to_ready_for_merge(tmp_state_dir):
                 }
             )
         if req.phase == "FIX":
-            assert "R1-F1" in req.prompt and SHA_A in req.prompt
+            prev = gh.prs[PR].head_sha
+            assert "R1-F1" in req.prompt and prev in req.prompt
             gh.set_head(SHA_B)
             return block(
                 {
                     "phase": "FIX",
                     "status": "success",
-                    "previous_head_sha": SHA_A,
+                    "previous_head_sha": prev,
                     "new_head_sha": SHA_B,
                     "resolutions": [
                         {"finding_id": "R1-F1", "resolution": "fixed", "commit_sha": SHA_B}
@@ -101,7 +93,7 @@ def test_full_loop_to_ready_for_merge(tmp_state_dir):
             )
         raise AssertionError(f"unexpected call {req.phase}")
 
-    eng = make_engine(tmp_state_dir, agent, github=gh)
+    eng = make_engine(tmp_state_dir, agent, github=gh, origin=True)
     eng._save()
     expected = ["ANALYZE_EXECUTE", "REVIEW", "FIX", "REVIEW", "READY_FOR_MERGE"]
     for exp in expected:
@@ -150,25 +142,16 @@ def test_each_fix_round_receives_its_own_verified_review_comment(tmp_state_dir):
 
     def agent(req):
         if req.phase == "ANALYZE_EXECUTE":
-            gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
-            return block(
-                {
-                    "phase": "ANALYZE_EXECUTE",
-                    "status": "success",
-                    "issue_url": ISSUE,
-                    "pr_url": PR,
-                    "head_sha": SHA_A,
-                    "branch": BRANCH,
-                }
-            )
+            return implement(req)
         if req.phase == "REVIEW" and "Round 1" in req.prompt:
-            gh.add_comment(PR, 100, review_comment_body(1, SHA_A, True, ["R1-F1"]))
+            head = gh.prs[PR].head_sha  # the controller-published implementation commit
+            gh.add_comment(PR, 100, review_comment_body(1, head, True, ["R1-F1"]))
             return block(
                 {
                     "phase": "REVIEW",
                     "status": "success",
                     "round": 1,
-                    "reviewed_head_sha": SHA_A,
+                    "reviewed_head_sha": head,
                     "review_comment_url": comment_a,
                     "needs_fix_round": True,
                     "findings": [finding(1)],
@@ -176,12 +159,13 @@ def test_each_fix_round_receives_its_own_verified_review_comment(tmp_state_dir):
             )
         if req.phase == "FIX" and "R1-F1" in req.prompt:
             fix_prompts.append(req.prompt)
+            prev = gh.prs[PR].head_sha
             gh.set_head(SHA_B)
             return block(
                 {
                     "phase": "FIX",
                     "status": "success",
-                    "previous_head_sha": SHA_A,
+                    "previous_head_sha": prev,
                     "new_head_sha": SHA_B,
                     "resolutions": [{"finding_id": "R1-F1", "resolution": "fixed"}],
                 }
@@ -226,7 +210,7 @@ def test_each_fix_round_receives_its_own_verified_review_comment(tmp_state_dir):
             )
         raise AssertionError(f"unexpected call {req.phase}")
 
-    eng = make_engine(tmp_state_dir, agent, github=gh)
+    eng = make_engine(tmp_state_dir, agent, github=gh, origin=True)
     eng._save()
     expected = ["ANALYZE_EXECUTE", "REVIEW", "FIX", "REVIEW", "FIX", "REVIEW", "READY_FOR_MERGE"]
     handoffs = []
@@ -243,7 +227,8 @@ def test_each_fix_round_receives_its_own_verified_review_comment(tmp_state_dir):
     assert f"Verified review comment: {comment_a}" in first and comment_b not in first
     assert f"Verified review comment: {comment_b}" in second and comment_a not in second
     assert "Review round: 1" in first and "Review round: 2" in second
-    assert SHA_A in first and SHA_B in second
+    implemented = eng.origin.head("autoforge/2")
+    assert implemented is not None and implemented in first and SHA_B in second
     s = load_state(eng.paths.state_file)
     assert s.last_review_comment_url == comment_url(PR, 102)
     assert [r["review_comment_url"] for r in s.review_history] == [
@@ -258,31 +243,22 @@ def test_run_loops_until_ready_for_merge(tmp_state_dir):
 
     def agent(req):
         if req.phase == "ANALYZE_EXECUTE":
-            gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
-            return block(
-                {
-                    "phase": "ANALYZE_EXECUTE",
-                    "status": "success",
-                    "issue_url": ISSUE,
-                    "pr_url": PR,
-                    "head_sha": SHA_A,
-                    "branch": BRANCH,
-                }
-            )
-        gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
+            return implement(req)
+        head = gh.prs[PR].head_sha  # the controller-published implementation commit
+        gh.add_comment(PR, 100, review_comment_body(1, head, False))
         return block(
             {
                 "phase": "REVIEW",
                 "status": "success",
                 "round": 1,
-                "reviewed_head_sha": SHA_A,
+                "reviewed_head_sha": head,
                 "review_comment_url": comment_url(PR, 100),
                 "needs_fix_round": False,
                 "findings": [],
             }
         )
 
-    eng = make_engine(tmp_state_dir, agent, github=gh)
+    eng = make_engine(tmp_state_dir, agent, github=gh, origin=True)
     eng._save()
     outcomes = eng.run(max_steps=50)
     assert [o.next_phase for o in outcomes] == ["ANALYZE_EXECUTE", "REVIEW", "READY_FOR_MERGE"]
@@ -302,25 +278,16 @@ def test_gate_open_loop_merges_via_controller_then_update_epic_to_done(tmp_state
     def agent(req):
         phases_seen.append(req.phase)
         if req.phase == "ANALYZE_EXECUTE":
-            gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
-            return block(
-                {
-                    "phase": "ANALYZE_EXECUTE",
-                    "status": "success",
-                    "issue_url": ISSUE,
-                    "pr_url": PR,
-                    "head_sha": SHA_A,
-                    "branch": BRANCH,
-                }
-            )
+            return implement(req)
         if req.phase == "REVIEW":
-            gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
+            head = gh.prs[PR].head_sha  # the controller-published implementation commit
+            gh.add_comment(PR, 100, review_comment_body(1, head, False))
             return block(
                 {
                     "phase": "REVIEW",
                     "status": "success",
                     "round": 1,
-                    "reviewed_head_sha": SHA_A,
+                    "reviewed_head_sha": head,
                     "review_comment_url": comment_url(PR, 100),
                     "needs_fix_round": False,
                     "findings": [],
@@ -340,7 +307,7 @@ def test_gate_open_loop_merges_via_controller_then_update_epic_to_done(tmp_state
             )
         raise AssertionError(f"unexpected call {req.phase}")
 
-    eng = make_engine(tmp_state_dir, agent, github=gh)
+    eng = make_engine(tmp_state_dir, agent, github=gh, origin=True)
     eng.config.safety.allow_merge = True
     eng._save()
     # CLI flag alone does not open the gate: run() holds at READY_FOR_MERGE
@@ -355,7 +322,9 @@ def test_gate_open_loop_merges_via_controller_then_update_epic_to_done(tmp_state
     assert [o.next_phase for o in outcomes] == ["MERGE", "UPDATE_EPIC", "DONE"]
     assert load_state(eng.paths.state_file).phase == Phase.DONE
 
-    assert gh.merges == [(PR, "squash", SHA_A, False)]
+    implemented = eng.origin.head("autoforge/2")
+    assert implemented is not None
+    assert gh.merges == [(PR, "squash", implemented, False)]
     assert gh.prs[PR].state == "MERGED"
     assert phases_seen == ["ANALYZE_EXECUTE", "REVIEW", "UPDATE_EPIC"]  # no MERGE agent call
     s = load_state(eng.paths.state_file)
@@ -377,17 +346,7 @@ def test_runaway_review_fix_loop_is_bounded(tmp_state_dir):
     def agent(req):
         phases_seen.append(req.phase)
         if req.phase == "ANALYZE_EXECUTE":
-            gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
-            return block(
-                {
-                    "phase": "ANALYZE_EXECUTE",
-                    "status": "success",
-                    "issue_url": ISSUE,
-                    "pr_url": PR,
-                    "head_sha": SHA_A,
-                    "branch": BRANCH,
-                }
-            )
+            return implement(req)
         if req.phase == "REVIEW":
             rounds["n"] += 1
             rnd = rounds["n"]
@@ -429,7 +388,7 @@ def test_runaway_review_fix_loop_is_bounded(tmp_state_dir):
             )
         raise AssertionError(f"unexpected call {req.phase}")
 
-    eng = make_engine(tmp_state_dir, agent, github=gh)
+    eng = make_engine(tmp_state_dir, agent, github=gh, origin=True)
     outcomes = eng.run(max_steps=50)
     assert outcomes[-1].next_phase == "BLOCKED"
     assert len(outcomes) < 50
@@ -451,25 +410,16 @@ def _full_lifecycle_agent(gh: FakeGitHub):
 
     def agent(req):
         if req.phase == "ANALYZE_EXECUTE":
-            gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
-            return block(
-                {
-                    "phase": "ANALYZE_EXECUTE",
-                    "status": "success",
-                    "issue_url": ISSUE,
-                    "pr_url": PR,
-                    "head_sha": SHA_A,
-                    "branch": BRANCH,
-                }
-            )
+            return implement(req)
         if req.phase == "REVIEW" and "Round 1" in req.prompt:
-            gh.add_comment(PR, 100, review_comment_body(1, SHA_A, True, ["R1-F1"]))
+            head = gh.prs[PR].head_sha  # the controller-published implementation commit
+            gh.add_comment(PR, 100, review_comment_body(1, head, True, ["R1-F1"]))
             return block(
                 {
                     "phase": "REVIEW",
                     "status": "success",
                     "round": 1,
-                    "reviewed_head_sha": SHA_A,
+                    "reviewed_head_sha": head,
                     "review_comment_url": comment_url(PR, 100),
                     "needs_fix_round": True,
                     "findings": [
@@ -484,12 +434,13 @@ def _full_lifecycle_agent(gh: FakeGitHub):
                 }
             )
         if req.phase == "FIX":
+            prev = gh.prs[PR].head_sha
             gh.set_head(SHA_B)
             return block(
                 {
                     "phase": "FIX",
                     "status": "success",
-                    "previous_head_sha": SHA_A,
+                    "previous_head_sha": prev,
                     "new_head_sha": SHA_B,
                     "resolutions": [
                         {"finding_id": "R1-F1", "resolution": "fixed", "commit_sha": SHA_B}
@@ -545,7 +496,7 @@ def test_every_lifecycle_transition_is_decided_by_decide_next_phase(tmp_state_di
 
     monkeypatch.setattr(engine_mod, "decide_next_phase", recording)
     gh = FakeGitHub()
-    eng = make_engine(tmp_state_dir, _full_lifecycle_agent(gh), github=gh)
+    eng = make_engine(tmp_state_dir, _full_lifecycle_agent(gh), github=gh, origin=True)
     eng.config.safety.allow_merge = True
     eng._save()
 
@@ -589,7 +540,7 @@ def test_a_decision_outside_the_topology_is_refused_before_it_is_applied(
 
     monkeypatch.setattr(engine_mod, "decide_next_phase", rogue)
     gh = FakeGitHub()
-    eng = make_engine(tmp_state_dir, _full_lifecycle_agent(gh), github=gh)
+    eng = make_engine(tmp_state_dir, _full_lifecycle_agent(gh), github=gh, origin=True)
     eng._save()
     assert [o.next_phase for o in (eng.step(), eng.step())] == ["ANALYZE_EXECUTE", "REVIEW"]
     with pytest.raises(StateTransitionError, match="REVIEW -> DONE"):
@@ -610,17 +561,7 @@ def _six_round_agent(gh: FakeGitHub, clean_round: int = 6):
 
     def agent(req):
         if req.phase == "ANALYZE_EXECUTE":
-            gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2], body=implementation_pr_body())
-            return block(
-                {
-                    "phase": "ANALYZE_EXECUTE",
-                    "status": "success",
-                    "issue_url": ISSUE,
-                    "pr_url": PR,
-                    "head_sha": SHA_A,
-                    "branch": BRANCH,
-                }
-            )
+            return implement(req)
         if req.phase == "REVIEW":
             rnd = len(gh.comments.get(PR, [])) + 1
             sha = gh.prs[PR].head_sha
@@ -690,7 +631,7 @@ def test_an_all_pi_run_routes_every_launch_through_its_profile(tmp_state_dir, tm
 
     fake = PiFake(tmp_path_factory.mktemp("pi"))
     gh = FakeGitHub()
-    eng = make_pi_engine(tmp_state_dir, fake, _six_round_agent(gh), github=gh)
+    eng = make_pi_engine(tmp_state_dir, fake, _six_round_agent(gh), github=gh, origin=True)
     eng.config.safety.allow_merge = True
     eng._save()
 
@@ -723,11 +664,15 @@ def test_an_all_pi_run_routes_every_launch_through_its_profile(tmp_state_dir, tm
     assert len(fake.auth_checks()) == len(expected)  # one OAuth preflight per launch
     assert eng.provider.calls == []
     assert gh.merges == [(PR, "squash", f"{5:040x}", False)]
-    # ADR 0004 K8 parity: the Pi agent returned the progress text; the
-    # controller posted it on the EPIC with the marker, once.
+    # ADR 0004 parity: the Pi agent returned the PR text and the progress
+    # text; the controller opened the PR (#161) and posted the progress on
+    # the EPIC with the marker, once each.
+    pr_body = analyze_payload("")["pr_body"]
+    closing = f"Closes #2\n\n{render_implementation_marker(ISSUE)}"
     marker = render_progress_marker(ISSUE, PR)
     assert gh.effect_writes == [
-        ("create_issue_comment", EPIC, f"Issue done; the PR is merged.\n\n{marker}")
+        ("create_pull_request", "owner/repo", f"{pr_body}\n\n{closing}"),
+        ("create_issue_comment", EPIC, f"Issue done; the PR is merged.\n\n{marker}"),
     ]
     s = load_state(eng.paths.state_file)
     assert s.phase == Phase.DONE and s.counted_merged_prs == [PR]
@@ -754,7 +699,13 @@ def test_a_mixed_config_routes_each_profile_to_its_own_provider(
     for name in set(PI_PROFILES) - set(pi_profiles):  # everything else on Claude Code
         cfg.profiles[name] = dataclasses.replace(cfg.profile("analyze_execute"), name=name)
     eng = make_pi_engine(
-        tmp_state_dir, fake, _full_lifecycle_agent(gh), github=gh, cfg=cfg, names=pi_profiles
+        tmp_state_dir,
+        fake,
+        _full_lifecycle_agent(gh),
+        github=gh,
+        cfg=cfg,
+        names=pi_profiles,
+        origin=True,
     )
     eng.config.safety.allow_merge = True
     eng._save()

@@ -24,7 +24,7 @@ from autoforge.pi_rpc import PiConversation, js_trim
 from autoforge.providers import AgentRequest, PiProvider
 from autoforge.result_parser import parse_control_result
 from autoforge.transitions import Phase
-from tests.conftest import BRANCH, DECODER_LIMIT_RECORDS, ISSUE, PR, SHA_A, block
+from tests.conftest import DECODER_LIMIT_RECORDS, SHA_A, analyze_payload, block
 
 MODEL = "openai/gpt-5.6-terra"
 STATE = {
@@ -38,14 +38,7 @@ MODELS = {
         {"provider": "openai", "id": "gpt-5.6-terra"},
     ]
 }
-ANALYZE_OK = {
-    "phase": "ANALYZE_EXECUTE",
-    "status": "success",
-    "issue_url": ISSUE,
-    "pr_url": PR,
-    "head_sha": SHA_A,
-    "branch": BRANCH,
-}
+ANALYZE_OK = analyze_payload(SHA_A)
 # What Pi returns: the text blocks of the last assistant message, trimmed.
 FINAL = js_trim(block(ANALYZE_OK))
 
@@ -916,14 +909,15 @@ def test_provider_crlf_records_and_raw_u2028_in_strings(tmp_path):
 
 
 def test_provider_stderr_is_never_parsed(tmp_path):
-    fake_block = block({**ANALYZE_OK, "branch": "from-stderr"})
+    fake_block = block({**ANALYZE_OK, "pr_title": "from-stderr"})
     noise = '{"type":"response","id":"x","success":true}\n' + fake_block
     scenario = _happy()
     scenario["start"] = [{"stderr": noise}]
     scenario["on"]["prompt"].insert(1, {"stderr": '{"type":"agent_settled"}\n'})
     res, _ = _execute(tmp_path, scenario)
     assert res.provider_failure is None and res.stdout == FINAL
-    assert parse_control_result(res.stdout, Phase.ANALYZE_EXECUTE)["branch"] == BRANCH
+    parsed = parse_control_result(res.stdout, Phase.ANALYZE_EXECUTE)
+    assert parsed["pr_title"] == ANALYZE_OK["pr_title"]
     assert "from-stderr" in res.stderr and "from-stderr" not in res.stdout
 
 

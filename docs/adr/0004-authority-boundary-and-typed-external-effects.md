@@ -441,13 +441,21 @@ effects will need as preconditions:
 
 - the remote branch head (absent, or a SHA);
 - the base revision a candidate must descend from;
-- the marker-bearing objects for the phase's identities.
+- the marker-bearing objects for the phase's identities;
+- for a phase that may adopt an unmarked PR (K3), the open PR headed at the
+  derived branch, or none.
 
 It persists them in the same save that charges the launch (the existing
 `attempt` save). Values already persisted are reused, not copied: the review
 binding, and the replan `PREPARED` checkpoint. #160 persists the observation
 in a kind-neutral shape, and defines every phase's completion context
-(D4.6), so #161–#164 add no persisted field.
+(D4.6). #161 adds one optional key to that shape, `prs` (a ref the
+observation read, mapped to the open PR headed at it or to none), because
+the PR K3 adopts carries no marker the marker-keyed objects could record it
+by; it is stored only when PRs were read, so every other phase's
+observation is unchanged. `ANALYZE_EXECUTE` records the default branch it
+read as a ref at the base, so K2's base is explained by the observation as
+well. Otherwise #161–#164 add no persisted field.
 
 When the agent returns, ADR 0002 guarantees that nothing it started still
 runs. The precondition read made before the intents are persisted therefore
@@ -806,12 +814,16 @@ protocol bump; this is why the set is closed now.
 - **Consumer:** #161.
 - **Identity:** the issue's `ai-implementation` marker and the derived head
   branch, in the verified repository.
-- **Target:** the verified repository, base = the default branch, head = the
-  derived branch.
+- **Target:** the verified repository, base = the default branch the entry
+  observation recorded, head = the derived branch.
 - **Precondition:**
   - no PR in any state has the derived branch as head;
   - the complete open listing has no PR with the issue's marker
     (`at_most_one` gives zero);
+  - the base is still the repository's default branch, read before the
+    plan is persisted and again before anything of the plan is sent, at
+    every entry that completes it: a default branch renamed or switched
+    since the entry is `BLOCKED` with no PR created;
   - K1 is `observed`.
 - **Payload:** a title and body. The body is the agent's validated text
   followed by a controller-rendered `Closes #n` line and the implementation
@@ -832,13 +844,20 @@ protocol bump; this is why the set is closed now.
 
 - **Consumer:** #161.
 - **Identity:** the PR number and the issue's implementation marker.
-- **Target:** a PR recorded in the entry observation that is:
+- **Target:** the PR the entry observation recorded on the derived branch
+  (`prs`), which is:
   - open;
   - in this repository, not from a fork;
   - headed at the derived branch;
+  - onto the default branch;
   - without an implementation marker.
+
+  An unmarked PR that first appears on the branch after the entry, or one
+  that replaced the recorded PR, is not that PR: it is `BLOCKED` with
+  nothing pushed or written, at the plan and at every re-entry, and the
+  persisted plan loads only when its target is the recorded PR.
 - **Precondition:**
-  - the PR is still open;
+  - the PR is still open and still onto the default branch;
   - its head equals the K1 candidate (K1 is `observed` first);
   - its body equals the recorded base and carries no implementation marker
     for the issue (D5.5).

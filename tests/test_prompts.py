@@ -262,30 +262,43 @@ def test_implementation_prompt_contract():
         "AGENTS.md",
         "CLAUDE.md",
         "CONTROL_RESULT",
-        "pr_url",
         "head_sha",
-        "branch",
-        # PR #89 F1: the PR body carries the controller's marker, verbatim; an
-        # existing unmarked PR is given it rather than duplicated.
-        "{{IMPLEMENTATION_MARKER}}",
-        "verbatim",
-        "gh pr edit",
-        "Never put it in the body of any other PR",
-        "a PR without it is rejected",
+        '"pr_title"',
+        '"pr_body"',
+        '"tests"',
+        # #161: the controller pushes and opens (or adopts) the PR; the agent
+        # commits on a detached HEAD from the start commit and publishes nothing.
+        "## You publish nothing",
+        "do not push, fetch or pull",
+        "do not create, edit or comment on any\npull request",
+        "`git checkout --detach {{START_SHA}}`",
+        "Stay on the detached `HEAD`",
+        "`git merge --no-edit {{BASE_SHA}}`",
+        "never rebase commits that\n   are already on `{{BRANCH}}`",
+        "There is no `pr_url` or `branch` field",
+        "{{MAX_PR_TITLE_CHARS}}",
+        "{{MAX_PR_BODY_CHARS}}",
+        # The controller adds the closing line and the marker itself.
+        "Do not write\n   `Closes #{{ISSUE_NUMBER}}` or any marker",
+        "never adopted\nsilently",
     ):
         assert phrase in text, phrase
-    assert "create pr" in text.lower() and "do not merge" in text.lower()
+    assert "{{IMPLEMENTATION_MARKER}}" not in text and "gh pr create" not in text
+    assert "do not merge" in text.lower()
 
 
-def test_engine_implementation_prompt_carries_the_issues_marker(engine):
+def test_engine_implementation_prompt_names_the_controllers_branch_not_a_marker(engine):
+    """#161: the agent is told the branch the controller pushes to and that the
+    controller adds the marker; the marker itself is not the agent's to write.
+    The SHAs come from the entry's reads, so a render before it says so."""
     from autoforge.engine import render_implementation_marker
     from tests.conftest import ISSUE
 
     engine.state.phase = Phase.ANALYZE_EXECUTE
     text = engine.render_prompt_for(Phase.ANALYZE_EXECUTE)
-    marker = render_implementation_marker(ISSUE)
-    assert marker == '<!-- ai-implementation: {"issue": "' + ISSUE + '"} -->'
-    assert f"PR body marker (required, verbatim): `{marker}`" in text
+    assert render_implementation_marker(ISSUE) not in text
+    assert "Branch the controller will push to: `autoforge/2`" in text
+    assert "Start commit: `(read from GitHub at execution)`" in text
 
 
 def test_update_epic_prompt_contract():

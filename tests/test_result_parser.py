@@ -41,6 +41,8 @@ from autoforge.result_parser import (
     published_text_problem,
     validate_for_phase,
     validate_next_issue_url,
+    validate_pr_body,
+    validate_pr_title,
     validate_progress_text,
     validate_roadmap_section,
 )
@@ -136,24 +138,27 @@ def test_per_phase_schemas():
         "phase": "ANALYZE_EXECUTE",
         "status": "success",
         "issue_url": ISSUE,
-        "pr_url": PR,
         "head_sha": SHA_A.upper(),
-        "branch": BRANCH,
+        "pr_title": "Add the transaction filter",
+        "pr_body": "Adds `--since`.\n\nTested with `pytest`.",
+        "tests": ["pytest: 12 passed"],
     }
     assert parse_control_result(BEGIN + json.dumps(ae) + END, Phase.ANALYZE_EXECUTE) == ae
     parsed = AnalyzeExecuteResult.from_payload(ae)
     assert parsed.head_sha == SHA_A  # normalized to lowercase
-    for missing in ("head_sha", "branch", "pr_url"):
+    assert parsed.pr_title == ae["pr_title"] and parsed.pr_body == ae["pr_body"]
+    assert parsed.tests == ["pytest: 12 passed"]
+    for missing in ("head_sha", "pr_title", "pr_body"):
         bad = dict(ae)
         del bad[missing]
         with pytest.raises(ControlResultValidationError, match=missing):
             parse_control_result(BEGIN + json.dumps(bad) + END, Phase.ANALYZE_EXECUTE)
+    without_tests = {k: v for k, v in ae.items() if k != "tests"}
+    assert AnalyzeExecuteResult.from_payload(without_tests).tests == []
     with pytest.raises(ControlResultValidationError, match="head_sha"):
         parse_control_result(
             BEGIN + json.dumps(dict(ae, head_sha="h")) + END, Phase.ANALYZE_EXECUTE
         )
-    with pytest.raises(ControlResultValidationError, match="pr_url"):
-        parse_control_result(BEGIN + json.dumps(dict(ae, pr_url="p")) + END, Phase.ANALYZE_EXECUTE)
 
     # MERGE is controller-executed: an agent "merged" claim is never accepted.
     merge = {"phase": "MERGE", "status": "success", "merged": True, "next_action": "UPDATE_EPIC"}
@@ -169,6 +174,78 @@ def test_per_phase_schemas():
     assert parse_control_result(BEGIN + json.dumps(epic) + END, Phase.UPDATE_EPIC) == epic
     epic["roadmap_section"] = "- [x] #1"
     assert parse_control_result(BEGIN + json.dumps(epic) + END, Phase.UPDATE_EPIC) == epic
+
+
+_ANALYZE = {
+    "issue_url": ISSUE,
+    "head_sha": SHA_A,
+    "pr_title": "Add the transaction filter",
+    "pr_body": "Adds `--since`.",
+}
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "rule"),
+    [
+        ("pr_title", "Add\nthe filter", "control character"),
+        ("pr_title", "x" * 257, "at most 256"),
+        ("pr_body", "x" * 60001, "at most 60000"),
+        ("pr_body", 'Done.\n<!-- ai-implementation: {"issue": "x"} -->', "controller marker"),
+        ("pr_body", "Done.\n\nCloses #2", "closing keyword"),
+        ("pr_title", "Fixes owner/repo#3", "closing keyword"),
+        ("pr_body", "Thanks @octocat", "@-mention"),
+        ("pr_body", "Set GH_TOKEN=FAKEtoken123456 first", "credential-shaped"),
+        ("tests", ["pytest\n12 passed"], "control character"),
+        ("tests", ["pytest"] * 51, "at most 50"),
+        ("tests", "pytest", "tests"),
+    ],
+)
+def test_analyze_result_text_is_bounded_and_held_to_the_published_policy(key, value, rule):
+    """#161: the controller publishes ``pr_title`` and ``pr_body`` as given, so the
+    result is refused (and the agent asked again) rather than the text clipped or
+    rewritten; ``Closes #n`` and the marker are the controller's to add."""
+    with pytest.raises(ControlResultValidationError, match=rule) as info:
+        AnalyzeExecuteResult.from_payload(dict(_ANALYZE, **{key: value}))
+    assert "octocat" not in str(info.value) and "FAKEtoken" not in str(info.value)
+
+
+@pytest.mark.parametrize(
+    ("validator", "key", "bad"),
+    [
+        (validate_pr_title, "pr_title", "Notify @octocat"),
+        (validate_pr_title, "pr_title", "Fixes #3"),
+        (validate_pr_title, "pr_title", "<!-- ai-x -->"),
+        (validate_pr_title, "pr_title", "a\x1bb"),
+        (validate_pr_title, "pr_title", "x" * 257),
+        (validate_pr_title, "pr_title", "  "),
+        (validate_pr_body, "pr_body", "Closes #3\nDone."),
+        (validate_pr_body, "pr_body", "Thanks @octocat"),
+        (validate_pr_body, "pr_body", "Done.\n<!-- autoforge-x -->"),
+        (validate_pr_body, "pr_body", "a\x0bb"),
+        (validate_pr_body, "pr_body", "x" * 60001),
+        (validate_pr_body, "pr_body", "\n\t"),
+    ],
+)
+def test_pr_text_validators_apply_the_parsers_rules_with_its_messages(validator, key, bad):
+    """#161: a persisted K2 title or body text is re-validated under the parser's rules."""
+    with pytest.raises(ControlResultValidationError) as from_validator:
+        validator(bad)
+    with pytest.raises(ControlResultValidationError) as from_payload:
+        AnalyzeExecuteResult.from_payload(dict(_ANALYZE, **{key: bad}))
+    assert str(from_validator.value) == str(from_payload.value)
+
+
+def test_pr_text_validators_return_accepted_text():
+    assert validate_pr_title(_ANALYZE["pr_title"]) == _ANALYZE["pr_title"]
+    assert validate_pr_body(_ANALYZE["pr_body"]) == _ANALYZE["pr_body"]
+    assert validate_pr_body("x" * 60000) == "x" * 60000
+
+
+def test_analyze_result_names_no_target():
+    """#161: a PR URL or branch an agent still reports is not read; the controller
+    chooses the branch and opens the PR itself."""
+    parsed = AnalyzeExecuteResult.from_payload(dict(_ANALYZE, pr_url=PR, branch="feature/x"))
+    assert not hasattr(parsed, "pr_url") and not hasattr(parsed, "branch")
 
 
 def test_failure_status_skips_schema_but_needs_message():
@@ -840,7 +917,7 @@ _SHA_FIELDS = [
     pytest.param(
         Phase.ANALYZE_EXECUTE,
         WorkflowMode.REMOTE,
-        {"issue_url": ISSUE, "pr_url": PR, "branch": BRANCH},
+        {"issue_url": ISSUE, "pr_title": "Add it", "pr_body": "Adds it."},
         "head_sha",
         id="ANALYZE_EXECUTE.head_sha",
     ),
@@ -1092,7 +1169,7 @@ def test_update_epic_roadmap_section_is_optional_bounded_text():
         (
             "ANALYZE_EXECUTE.issue_url",
             lambda v: AnalyzeExecuteResult.from_payload(
-                {"issue_url": v, "pr_url": PR, "head_sha": SHA_A, "branch": BRANCH}
+                {"issue_url": v, "head_sha": SHA_A, "pr_title": "Add it", "pr_body": "Adds it."}
             ),
         ),
         (

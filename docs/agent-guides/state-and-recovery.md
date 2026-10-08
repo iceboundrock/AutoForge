@@ -92,11 +92,22 @@ A REMOTE run also records the effect state of the current phase entry (ADR
   stored bound fit in `MAX_EFFECT_STATE_CHARS`.
 - `entry_observation`: what the entry's identity reads saw before the
   phase's first launch (D4.4), so that an object found later is explained by
-  a record, by this observation, or not at all (D9.1).
+  a record, by this observation, or not at all (D9.1): the heads of the refs
+  it read, the base, the marker-bearing objects, and, under the optional
+  key `prs`, the one open PR headed at a ref it read, or none. `prs` is
+  stored only when PRs were read (`ANALYZE_EXECUTE`, whose adoption
+  candidate carries no marker yet, #161), so every other phase's
+  observation is stored exactly as before; a ref missing from `prs` was
+  not read, which is never taken for "no PR", and a stored `prs` that is
+  empty, over its bound, or names a ref the observation did not read is
+  refused. The `ANALYZE_EXECUTE` observation also records the default
+  branch it read, as a ref at the base.
 - `completion_context`: what the phase needs to finish without relaunching
   its agent once its result is accepted (D4.6). For `UPDATE_EPIC` this is
   the roadmap section, the validated selection, the digests of the EPIC body
-  outside the markers, and which input a persisted rejection voided.
+  outside the markers, and which input a persisted rejection voided. For
+  `ANALYZE_EXECUTE` (#161) it is only the issue: the push and PR records
+  carry everything the completion needs.
 - `launch_label` (D13.3): whether the current entry's launches ran under the
   agent-publishes or the controller-publishes contract of its phase.
 
@@ -117,13 +128,32 @@ the one `progress_comment` record of its own (issue, PR) marker, or with no
 record only when the entry observation records that marker's comment as
 adopted (the D13.7 legacy re-entry). Neither, both, or no entry observation
 is refused, and completion itself refuses to splice the roadmap section or
-switch issues without a posted or adopted comment. Text the recovery path
+switch issues without a posted or adopted comment. An `ANALYZE_EXECUTE`
+completion context loads only with its plan of exactly two records, the
+`push` first and then the `implementation_pr` from the pushed branch or the
+`adopt_pr`, and with the entry observation it is checked against: the push
+is over the head the entry observed on its ref, for a candidate checked
+against the base the entry read; the observation read the PRs on that ref;
+an `implementation_pr` follows an observation of no open PR there and is
+onto the default branch the observation records at the base; an
+`adopt_pr` targets the very PR the observation recorded there. Anything
+else is refused, so a plan whose push or PR no entry read explains is
+never completed. Text the recovery path
 publishes with no agent result in between is validated again under the
 parser's rules for its field, not only for its bounds and redaction
 invariance: the `UPDATE_EPIC` roadmap section in the
-completion context (`validate_roadmap_section`) and the progress text of a
-progress-comment record (`validate_progress_text`). A stored value the
-result path would have refused is a `StateError`, never rewritten. LOCAL
+completion context (`validate_roadmap_section`), the progress text of a
+progress-comment record (`validate_progress_text`), and the title and the
+agent's part of the body of an `implementation_pr` record
+(`validate_pr_title`, `validate_pr_body`), in the stripped form the parser
+returns. Controller text stored with them is checked to be exactly what
+the controller renders: an `implementation_pr` body ends in a blank line
+and the closing block of its owner's issue (`Closes #n`, a blank line, the
+implementation marker), an `adopt_pr` block is that closing block, and
+both PRs are in the issue's repository, the one `Closes #n` names. The
+existing body an `adopt_pr` appends to is a human's text and keeps only
+the append checks. A stored value the result path would have refused is a
+`StateError`, never rewritten. LOCAL
 state carrying any of them is refused as corrupt: a LOCAL run performs no
 external effect.
 

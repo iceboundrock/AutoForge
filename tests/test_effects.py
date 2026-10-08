@@ -64,9 +64,11 @@ from autoforge.effects import (
     EffectKind,
     EffectOwner,
     EffectRecord,
+    EntryObservation,
     FixContext,
     Stage,
     compose_append,
+    implementation_closing_block,
     load_phase_effects,
     load_records,
     plan_size_problem,
@@ -85,7 +87,7 @@ from autoforge.executor import ExecutionRequest, ExecutionResult, execute
 from autoforge.git_transport import GitRemote, GitTransport
 from autoforge.github import GitHubClient
 from autoforge.replan_txn import ReplanAttestation, render_marker
-from autoforge.result_parser import MAX_FINDINGS_PER_REVIEW
+from autoforge.result_parser import MAX_FINDINGS_PER_REVIEW, MAX_PR_BODY_CHARS
 from autoforge.transitions import Phase
 from tests.conftest import (
     BRANCH,
@@ -113,6 +115,7 @@ SECRET = "supersecretvalue123"
 CREDENTIAL_TEXT = f"GH_TOKEN={SECRET}"
 
 IMPL_MARKER = render_implementation_marker(ISSUE)
+CLOSING = f"Closes #2\n\n{IMPL_MARKER}"
 FOLLOW_UP_MARKER = render_follow_up_marker(PR, "R1-F1")
 PROGRESS_MARKER = render_progress_marker(ISSUE, PR)
 REVIEW_PAYLOAD: dict[str, object] = {
@@ -175,6 +178,7 @@ def impl_record(
     title: str = "Implement #2",
     body: str | None = None,
     head: str = BRANCH,
+    base: str = "main",
     by: EffectOwner = ANALYZE_OWNER,
 ) -> EffectRecord:
     return EffectRecord.plan(
@@ -182,17 +186,17 @@ def impl_record(
         EffectKind.IMPLEMENTATION_PR,
         by,
         identity={"repository": REPO, "marker": IMPL_MARKER, "head_branch": head},
-        target={"repository": REPO, "base": "main", "head": head},
+        target={"repository": REPO, "base": base, "head": head},
         precondition={"absent": True},
         payload={
             "title": title,
-            "body": f"Implements {ISSUE}.\n\nCloses #2\n\n{IMPL_MARKER}" if body is None else body,
+            "body": f"Implements {ISSUE}.\n\n{CLOSING}" if body is None else body,
         },
     )
 
 
 def adopt_record(base: str = ADOPT_BASE) -> EffectRecord:
-    block = f"Closes #2\n\n{IMPL_MARKER}"
+    block = CLOSING
     return EffectRecord.plan(
         1,
         EffectKind.ADOPT_PR,
@@ -874,6 +878,104 @@ CORRUPTIONS = [
     ),
     _p("k2-head-mismatch", IMPL, at("identity.head_branch", "other"), "head branch that differs"),
     _p("k2-repo-mismatch", IMPL, at("target.repository", "owner/other"), "repository that differs"),
+    # K2's text (#161): the closing block is the controller's, exactly, and the
+    # title and the body text before it get the ANALYZE parser's rules again.
+    _p(
+        "k2-repo-of-another-issue",
+        IMPL,
+        both(at("identity.repository", "owner/other"), at("target.repository", "owner/other")),
+        "in another repository than its owner's issue",
+    ),
+    _p(
+        "k2-closes-another-issue",
+        IMPL,
+        at("payload.body", f"Implements it.\n\nCloses #3\n\n{IMPL_MARKER}"),
+        "not its text, a blank line and the closing block of its owner's issue",
+    ),
+    _p(
+        "k2-no-closing-line",
+        IMPL,
+        at("payload.body", f"Implements it.\n\n{IMPL_MARKER}"),
+        "not its text, a blank line and the closing block of its owner's issue",
+    ),
+    _p(
+        "k2-closing-line-not-after-a-blank-line",
+        IMPL,
+        at("payload.body", f"Implements it.\n{CLOSING}"),
+        "not its text, a blank line and the closing block of its owner's issue",
+    ),
+    _p(
+        "k2-title-mention",
+        IMPL,
+        at("payload.title", "Notify @octocat"),
+        "invalid PR title: .*an @-mention",
+    ),
+    _p(
+        "k2-title-closing-reference",
+        IMPL,
+        at("payload.title", "Fixes owner/repo#3"),
+        "invalid PR title: .*a closing keyword",
+    ),
+    _p(
+        "k2-title-marker-opener",
+        IMPL,
+        at("payload.title", "Add it <!-- ai-x -->"),
+        "invalid PR title: .*a controller marker opener",
+    ),
+    _p(
+        "k2-title-control-character",
+        IMPL,
+        at("payload.title", "Add\x1bit"),
+        r"invalid PR title: .*a control character \(U\+001B",
+    ),
+    _p(
+        "k2-title-not-stripped",
+        IMPL,
+        at("payload.title", "Add it "),
+        "PR title that is not in the parser's stored form",
+    ),
+    _p(
+        "k2-body-mention",
+        IMPL,
+        at("payload.body", f"Thanks @octocat.\n\n{CLOSING}"),
+        "invalid PR body: .*an @-mention",
+    ),
+    _p(
+        "k2-body-extra-closing-reference",
+        IMPL,
+        at("payload.body", f"Closes #3\nImplements it.\n\n{CLOSING}"),
+        "invalid PR body: .*a closing keyword",
+    ),
+    _p(
+        "k2-body-marker-opener",
+        IMPL,
+        at("payload.body", f"<!-- autoforge-note -->\n\n{CLOSING}"),
+        "invalid PR body: .*a controller marker opener",
+    ),
+    _p(
+        "k2-body-control-character",
+        IMPL,
+        at("payload.body", f"Implements\x0bit.\n\n{CLOSING}"),
+        r"invalid PR body: .*a control character \(U\+000B",
+    ),
+    _p(
+        "k2-body-over-its-bound",
+        IMPL,
+        at("payload.body", f"{'x' * (MAX_PR_BODY_CHARS + 1)}\n\n{CLOSING}"),
+        f"invalid PR body: .*is {MAX_PR_BODY_CHARS + 1} characters",
+    ),
+    _p(
+        "k2-body-blank",
+        IMPL,
+        at("payload.body", f"\n\n{CLOSING}"),
+        "invalid PR body: .*missing required field 'pr_body'",
+    ),
+    _p(
+        "k2-body-not-stripped",
+        IMPL,
+        at("payload.body", f"Implements it.\n\n\n{CLOSING}"),
+        "PR body that is not in the parser's stored form",
+    ),
     # K1.
     _p("k1-ref-not-full", PUSH, at("target.ref", BRANCH), r"full refs/heads/<branch> ref"),
     _p("k1-ref-bad-branch", PUSH, at("target.ref", "refs/heads/a b"), "plain branch name"),
@@ -913,6 +1015,36 @@ CORRUPTIONS = [
             at("payload.body", compose_append(ADOPT_BASE, "Closes #2")),
         ),
         "has a block that does not carry its identity's marker",
+    ),
+    _p(
+        "k3-block-with-more-than-the-closing-block",
+        ADOPT,
+        both(
+            at("payload.block", f"Closes #2 thanks @octocat\n\n{IMPL_MARKER}"),
+            at(
+                "payload.body",
+                compose_append(ADOPT_BASE, f"Closes #2 thanks @octocat\n\n{IMPL_MARKER}"),
+            ),
+        ),
+        "has a block that is not the closing block of its owner's issue",
+    ),
+    _p(
+        "k3-block-closes-another-issue",
+        ADOPT,
+        both(
+            at("payload.block", f"Closes #3\n\n{IMPL_MARKER}"),
+            at("payload.body", compose_append(ADOPT_BASE, f"Closes #3\n\n{IMPL_MARKER}")),
+        ),
+        "has a block that is not the closing block of its owner's issue",
+    ),
+    _p(
+        "k3-pr-of-another-repository",
+        ADOPT,
+        both(
+            at("identity.pr_url", "https://github.com/owner/other/pull/42"),
+            at("target.pr_url", "https://github.com/owner/other/pull/42"),
+        ),
+        "in another repository than its owner's issue",
     ),
     _p("k3-pr-mismatch", ADOPT, at("identity.pr_url", PR43), "PR that differs"),
     _p("k3-observed-other-pr", ADOPT, observed_as({"url": PR43}), "observed on another PR"),
@@ -1098,9 +1230,15 @@ def _body_of_length(length: int, marker: str = IMPL_MARKER) -> str:
 def test_field_bounds_are_inclusive():
     """Each field holds exactly its bound and refuses one character more."""
     assert len(impl_record(title="t" * MAX_TITLE_CHARS).payload["title"]) == MAX_TITLE_CHARS
-    assert len(impl_record(body=_body_of_length(MAX_BODY_CHARS)).body) == MAX_BODY_CHARS
+    longest = follow_up_record(body=_body_of_length(MAX_BODY_CHARS, FOLLOW_UP_MARKER))
+    assert len(longest.body) == MAX_BODY_CHARS
     with pytest.raises(StateError, match=f"over its bound of {MAX_BODY_CHARS}"):
-        impl_record(body=_body_of_length(MAX_BODY_CHARS + 1))
+        follow_up_record(body=_body_of_length(MAX_BODY_CHARS + 1, FOLLOW_UP_MARKER))
+    # K2's body is the agent's text, at most the parser's bound, then the closing block.
+    text = "x" * MAX_PR_BODY_CHARS
+    assert impl_record(body=f"{text}\n\n{CLOSING}").body.startswith(text)
+    with pytest.raises(StateError, match=f"is {MAX_PR_BODY_CHARS + 1} characters"):
+        impl_record(body=f"{text}x\n\n{CLOSING}")
     assert impl_record(by=owner(Phase.ANALYZE_EXECUTE, run_id="r" * 128)).owner.run_id
     raw = impl_record().to_dict() | {"stage": "conflict", "reason": "r" * MAX_CONFLICT_REASON_CHARS}
     assert len(EffectRecord.from_dict(raw).reason) == MAX_CONFLICT_REASON_CHARS
@@ -1291,6 +1429,203 @@ def test_pieces_naming_two_phases_fail_loudly():
     blocked = replace(FIX_BINDING, phase=Phase.BLOCKED)
     with pytest.raises(StateError, match="names more than one phase"):
         load_phase_effects(fix_plan(1), {}, AnalyzeContext(ISSUE).to_dict(), blocked)
+
+
+ANALYZE_BINDING = Binding(RUN_ID, Phase.ANALYZE_EXECUTE, ISSUE, "", 0, "")
+ANALYZE_REF = f"refs/heads/{BRANCH}"
+
+
+def analyze_observation(
+    head: str | None = SHA_A,
+    base: str | None = SHA_C,
+    ref: str = ANALYZE_REF,
+    *,
+    pr: str | None = None,
+    prs: dict | None = None,
+    default_refs: dict | None = None,
+):
+    """The ANALYZE_EXECUTE entry read: the branch, the default branch at the base, its PR."""
+    default = {"refs/heads/main": base} if default_refs is None else default_refs
+    return {
+        "phase": "ANALYZE_EXECUTE",
+        "issue_url": ISSUE,
+        "pr_url": "",
+        "refs": {ref: head, **default},
+        "base_sha": base,
+        "objects": {IMPL_MARKER: None},
+        **({"prs": {ref: pr}} if prs is None else {"prs": prs} if prs else {}),
+    }
+
+
+def analyze_push() -> EffectRecord:
+    return push_record(by=ANALYZE_OWNER)
+
+
+@pytest.mark.parametrize("pr", [None, PR], ids=["no-pr", "pr"])
+def test_an_analyze_observation_round_trips_with_the_pr_on_its_branch(pr):
+    """#161: the open PR the entry read on the branch, or none, is stored by its ref."""
+    raw = analyze_observation(pr=pr)
+    observation = EntryObservation.from_dict(raw, ANALYZE_BINDING)
+    assert observation.prs == {ANALYZE_REF: pr}
+    assert observation.to_dict() == raw
+
+
+def test_an_observation_that_read_no_pr_is_stored_without_prs():
+    """#161: ``prs`` is written only when PRs were read, so other phases' are unchanged."""
+    raw = analyze_observation(prs={})
+    assert "prs" not in raw
+    observation = EntryObservation.from_dict(raw, ANALYZE_BINDING)
+    assert observation.prs == {}
+    assert observation.to_dict() == raw
+
+
+@pytest.mark.parametrize(
+    ("second", "pr"), [(impl_record, None), (adopt_record, PR)], ids=["create", "adopt"]
+)
+def test_an_analyze_context_loads_with_its_push_and_pr_plan(second, pr):
+    """#161: the context, the push then the PR create or adoption, and the observation load."""
+    effects = load_phase_effects(
+        [analyze_push().to_dict(), second().to_dict()],
+        analyze_observation(pr=pr),
+        AnalyzeContext(ISSUE).to_dict(),
+        ANALYZE_BINDING,
+    )
+    assert [r.kind for r in effects.records] == [EffectKind.PUSH, second().kind]
+    assert isinstance(effects.context, AnalyzeContext)
+
+
+@pytest.mark.parametrize(
+    ("records", "observation", "match"),
+    [
+        ([], analyze_observation(), "a push then a PR create or adoption"),
+        ([analyze_push().to_dict()], analyze_observation(), "a push then a PR create"),
+        (
+            [replace(impl_record(), position=0).to_dict()],
+            analyze_observation(),
+            "a push then a PR create or adoption",
+        ),
+        (None, {}, "with the entry observation"),
+        (None, analyze_observation(ref="refs/heads/elsewhere"), "a ref the entry observation"),
+        (None, analyze_observation(head=SHA_B), "another head than the entry observed"),
+        (None, analyze_observation(head=None), "another head than the entry observed"),
+        (None, analyze_observation(base=SHA_A), "another base than the entry read"),
+        (
+            [analyze_push().to_dict(), impl_record(head="autoforge/2-other").to_dict()],
+            analyze_observation(),
+            "from another branch than the one it pushes",
+        ),
+        (
+            [analyze_push().to_dict(), impl_record(base="trunk").to_dict()],
+            analyze_observation(),
+            "onto another branch than the default branch the entry read",
+        ),
+        (
+            None,
+            analyze_observation(default_refs={}),
+            "onto another branch than the default branch the entry read",
+        ),
+        (
+            None,
+            analyze_observation(default_refs={"refs/heads/main": SHA_B}),
+            "onto another branch than the default branch the entry read",
+        ),
+        (
+            [analyze_push().to_dict(), impl_record(base=BRANCH).to_dict()],
+            analyze_observation(),
+            "onto another branch than the default branch the entry read",
+        ),
+        (None, analyze_observation(prs={}), "did not read the PRs on its ref"),
+        (
+            None,
+            analyze_observation(prs={"refs/heads/main": None}),
+            "did not read the PRs on its ref",
+        ),
+        (None, analyze_observation(pr=PR), "where the entry observed an open PR"),
+        (
+            [analyze_push().to_dict(), adopt_record().to_dict()],
+            analyze_observation(),
+            "adopts another PR than the one the entry observed",
+        ),
+        (
+            [analyze_push().to_dict(), adopt_record().to_dict()],
+            analyze_observation(pr=PR43),
+            "adopts another PR than the one the entry observed",
+        ),
+    ],
+    ids=[
+        "no-plan",
+        "push-only",
+        "pr-only",
+        "no-observation",
+        "unobserved-ref",
+        "other-old-head",
+        "branch-observed-absent",
+        "other-base",
+        "pr-from-another-branch",
+        "pr-onto-another-base-branch",
+        "default-branch-not-observed",
+        "default-branch-at-another-head",
+        "pr-onto-its-own-branch",
+        "prs-not-read",
+        "prs-read-on-another-ref",
+        "create-beside-an-observed-pr",
+        "adopt-where-none-was-observed",
+        "adopt-another-pr",
+    ],
+)
+def test_an_analyze_context_the_entry_does_not_explain_fails_loudly(records, observation, match):
+    """#161: a plan whose push no entry read explains is never completed."""
+    if records is None:
+        records = [analyze_push().to_dict(), impl_record().to_dict()]
+    with pytest.raises(StateError, match=match):
+        load_phase_effects(records, observation, AnalyzeContext(ISSUE).to_dict(), ANALYZE_BINDING)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "rule"),
+    [
+        (at("payload.title", "Notify @octocat"), "invalid PR title: .*an @-mention"),
+        (
+            at("payload.body", f"Closes #3\nImplements it.\n\n{CLOSING}"),
+            "invalid PR body: .*a closing keyword",
+        ),
+        (
+            at("payload.body", f"Implements it.\n\nCloses #3\n\n{CLOSING}"),
+            "invalid PR body: .*a closing keyword",
+        ),
+    ],
+    ids=["title-mention", "closing-reference-first", "closing-reference-before-the-block"],
+)
+def test_an_analyze_plan_whose_pr_text_the_parser_refuses_fails_to_load(mutate, rule):
+    """R2-F1: a journaled K2 is created with no agent result in between, so a
+    title or body text the ANALYZE parser refuses fails the load; the plan is
+    never completed from it."""
+    raw = impl_record().to_dict()
+    mutate(raw)
+    with pytest.raises(StateError, match=rule) as info:
+        load_phase_effects(
+            [analyze_push().to_dict(), raw],
+            analyze_observation(),
+            AnalyzeContext(ISSUE).to_dict(),
+            ANALYZE_BINDING,
+        )
+    assert "octocat" not in str(info.value)
+
+
+def test_an_adoption_keeps_the_adopted_prs_own_body_as_it_is():
+    """#161 (ADR 0004 K3): the base of an adoption is the PR's existing body, a
+    human's text the controller does not rewrite, so the agent-text policy is
+    not applied to it; only the block is the controller's, and it is exactly
+    the closing block of the owner's issue."""
+    assert implementation_closing_block(ISSUE) == CLOSING
+    base = "Started by hand, thanks @octocat.\n\nFixes #3"
+    effects = load_phase_effects(
+        [analyze_push().to_dict(), adopt_record(base).to_dict()],
+        analyze_observation(pr=PR),
+        AnalyzeContext(ISSUE).to_dict(),
+        ANALYZE_BINDING,
+    )
+    assert effects.records[1].body == compose_append(base, CLOSING)
 
 
 # -- operations: success and adoption (all GitHub kinds) --------------------------------

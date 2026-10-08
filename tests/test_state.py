@@ -1950,6 +1950,14 @@ def _pop(path):
     return mutate
 
 
+def _both(*mutations):
+    def mutate(d):
+        for m in mutations:
+            m(d)
+
+    return mutate
+
+
 def _many(*mutations):
     def mutate(d):
         for m in mutations:
@@ -2117,11 +2125,36 @@ def test_a_corrupt_effect_record_fails_loudly(tmp_path, mutate, needle):
             _set(("entry_observation", "pr_url"), EFFECT_ISSUE),
             "entry_observation.pr_url is not a GitHub URL of the expected kind",
         ),
+        (
+            _set(("entry_observation", "prs"), []),
+            "prs must be a non-empty object of at most 4 refs when stored",
+        ),
+        (
+            _set(("entry_observation", "prs"), {}),
+            "prs must be a non-empty object of at most 4 refs when stored",
+        ),
+        (
+            _set(("entry_observation", "prs"), {f"refs/heads/b{n}": None for n in range(5)}),
+            "prs must be a non-empty object of at most 4 refs when stored",
+        ),
+        (_set(("entry_observation", "prs"), {"main": None}), "must be a full refs/heads/"),
+        (
+            _set(("entry_observation", "prs"), {FIX_REF: None}),
+            f"records a PR on {FIX_REF}, a ref the observation did not read",
+        ),
+        (
+            _both(
+                _set(("entry_observation", "refs"), {FIX_REF: None}),
+                _set(("entry_observation", "prs"), {FIX_REF: EFFECT_ISSUE}),
+            ),
+            f"entry_observation.prs[{FIX_REF}] is not a GitHub URL of the expected kind",
+        ),
     ],
 )
 def test_a_corrupt_entry_observation_fails_loudly(tmp_path, mutate, needle):
     """D4.4: the entry observation is a closed, bounded schema (refs, base,
-    marker-keyed objects); anything else is corruption and refused on load."""
+    marker-keyed objects, the open PR read on a ref it read); anything else
+    is corruption and refused on load."""
     d = _update_epic_state().to_dict()
     mutate(d)
     p = _write(tmp_path / "state.json", d)
@@ -2562,7 +2595,9 @@ def test_a_legacy_remote_resume_is_labelled_by_the_contract_it_launched_under(
     """D13.2/D13.3: a protocol-5 REMOTE file with ``attempt >= 1`` in a publishing
     phase launched under the agent-publishing contract and is labelled
     ``agent_publishes``; before a launch, or outside a publishing phase, it gets
-    no label. The label survives the save that relabels the file."""
+    no label. The label survives the save that relabels the file. A legacy
+    re-entry is one into a phase the controller now publishes for: UPDATE_EPIC
+    (#160) and ANALYZE_EXECUTE (#161)."""
     from autoforge.effects import is_legacy_reentry
 
     p = _write(
@@ -2573,7 +2608,7 @@ def test_a_legacy_remote_resume_is_labelled_by_the_contract_it_launched_under(
     assert loaded.launch_label == label
     assert loaded.phase_effects().empty
     assert is_legacy_reentry(loaded.phase, loaded.attempt, loaded.launch_label) == (
-        phase == Phase.UPDATE_EPIC and attempt >= 1
+        phase in (Phase.ANALYZE_EXECUTE, Phase.UPDATE_EPIC) and attempt >= 1
     )
     save_state(loaded, p)
     assert json.loads(p.read_text(encoding="utf-8"))["launch_label"] == label

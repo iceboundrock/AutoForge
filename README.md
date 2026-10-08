@@ -5,8 +5,8 @@
 智铸：AI 驱动的软件工程自动化控制器。
 
 > **Early development (Phase 2).** The first real AI development loop is
-> wired end to end: GitHub issue → Claude Code implementation → PR
-> verification → OpenCode review → Claude Code remediation → repeated review
+> wired end to end: GitHub issue → Claude Code implementation → controller
+> push and PR → OpenCode review → Claude Code remediation → repeated review
 > → `READY_FOR_MERGE`. Merging is opt-in and controller-owned: by default the
 > loop stops at `READY_FOR_MERGE` for a human; with the merge safety gate
 > open (`safety.allow_merge: true` in config and `--allow-merge` on the CLI)
@@ -20,7 +20,7 @@ layer that drives existing agents through the software lifecycle and refuses
 to trust anything they claim without checking it against GitHub:
 
 ```text
-Issue → ANALYZE_EXECUTE (Claude Code) → PR → REVIEW (OpenCode)
+Issue → ANALYZE_EXECUTE (Claude Code) → controller pushes, opens PR → REVIEW (OpenCode)
        → clean ───────────────────────────────▶ READY_FOR_MERGE
        → findings ────────────────────────────▶ FIX (Claude Code) → REVIEW …
        → excessive / low-finding stagnation ──▶ REPLAN_REEXECUTE (OpenCode)
@@ -74,10 +74,12 @@ Each line is a summary; the linked document is the precise statement.
   ([CONTROL_RESULT protocol](docs/agent-guides/control-result-protocol.md),
   [workflow](docs/agent-guides/workflow.md))
 - **GitHub is read back, not believed.** Each phase re-reads what its agent
-  claims to have done: the PR exists, is open, at the claimed HEAD on the
-  claimed branch; the review comment is on the right PR for the right round
-  and SHA; a fix actually moved HEAD; the follow-up issue, the EPIC update
-  and the next issue exist.
+  claims to have done, or what the controller did on its behalf: the
+  implementation commit is the worktree's own HEAD and descends from the
+  default branch, and the PR the controller opened for it is open, at that
+  HEAD, on the issue's branch; the review comment is on the right PR for the
+  right round and SHA; a fix actually moved HEAD; the follow-up issue, the
+  EPIC update and the next issue exist.
   ([GitHub safety](docs/agent-guides/github-safety.md))
 - **Agents never merge.** Every agent prompt carries the rule "never merge a
   pull request" (LOCAL prompts forbid `git merge` and have no PR to merge).
@@ -283,11 +285,12 @@ Coding agents working on this repository start at [AGENTS.md](AGENTS.md).
 
 ## Current maturity
 
-**Supported now (Phase 2):** GitHub issue → Claude Code implementation → PR
-verification via `gh` → OpenCode review with round-based model routing →
-Claude Code remediation of finding IDs → repeated review with SHA binding →
-`READY_FOR_MERGE`; the bounded REVIEW/FIX loop with stagnation detection and
-the `REPLAN_REEXECUTE` transaction; recovery of an already-created PR;
+**Supported now (Phase 2):** GitHub issue → Claude Code implementation → the
+controller's push and PR, read back via `gh` → OpenCode review with
+round-based model routing → Claude Code remediation of finding IDs →
+repeated review with SHA binding → `READY_FOR_MERGE`; the bounded REVIEW/FIX
+loop with stagnation detection and the `REPLAN_REEXECUTE` transaction;
+journal-first recovery of an interrupted push or PR creation;
 bounded correction retry for malformed results; `doctor`; redacted
 per-invocation logs; LOCAL mode against a feature Markdown file.
 
