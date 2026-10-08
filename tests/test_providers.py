@@ -286,6 +286,34 @@ def test_the_last_turns_result_is_the_stdout_of_a_multi_turn_run(tmp_path):
     assert summary["cost_micro_usd"] == 20_000 and summary["records_after_result"] == 2
 
 
+def test_results_held_back_while_a_background_agent_runs_end_their_turns(tmp_path):
+    """A background agent still running at the end of a turn makes the CLI
+    hold that turn's result back; the next turn opens with its own
+    ``system/init``, and the held results follow the last turn, in order
+    (claude 2.1.293). The run succeeds, and its stdout is the last result's
+    text."""
+    from tests import claude_fake
+    from tests.conftest import block
+
+    text = "Done.\n" + block({"phase": "FIX", "status": "success"})
+    _, res = _claude_run(
+        tmp_path,
+        [
+            claude_fake.init(),
+            claude_fake.tool_use("t1", "Agent", description="Migrate", run_in_background=True),
+            claude_fake.tool_result("t1", "Async agent launched"),
+            claude_fake.line({"type": "system", "subtype": "task_notification"}),
+            claude_fake.init(),
+            claude_fake.result("Waiting for the agent.", result_index=0),
+            claude_fake.result(text, result_index=1),
+        ],
+    )
+    assert res.ok and res.provider_failure is None, (res.exit_code, res.stderr)
+    assert res.stdout == text
+    summary = res.provider_summary
+    assert summary["results"] == 2 and summary["num_turns"] == 6
+
+
 def _looping(n: int, *, tail: list | None = None) -> list:
     """``n`` copies of the same two tool calls (Bash then Read), each with
     the same input and the same result: an agent going round in circles."""

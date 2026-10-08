@@ -18,8 +18,9 @@ Claude Code (``claude 2.1.x``; the stream run against 2.1.291 to 2.1.293)::
     blocks, ``user`` tool results, ``rate_limit_event``) and a ``result``
     record that ends the turn, whose ``result`` field is its final
     assistant text; a background task or a scheduled wakeup still pending
-    then keeps the CLI alive for another turn with its own ``result``. The
-    CLI refuses ``stream-json`` under ``--print`` without ``--verbose``.
+    then keeps the CLI alive for another turn with its own ``result``
+    (held back to the end, in turn order, while a background agent runs).
+    The CLI refuses ``stream-json`` under ``--print`` without ``--verbose``.
     The child runs under the duplex handle and the stream is reduced in
     claude_stream.py: ``stdout`` of the result is the last ``result``
     text verbatim (so the CONTROL_RESULT block survives untouched), the

@@ -28,7 +28,14 @@ turn ends keeps the CLI alive, and when it fires the CLI runs another turn,
 from its own ``system/init`` to its own ``result`` (``result_index`` 0, 1,
 ...), with notices such as ``system/task_notification`` or
 ``command_lifecycle`` between turns. ``--output-format text`` prints only
-the last turn's result text, at exit.
+the last turn's result text, at exit. A turn that ends while a background
+agent (``Agent`` run in the background) is still running does not get its
+``result`` then: the CLI holds it back, the next turn opens with its own
+``system/init`` all the same, and once no background agent is left the
+held results arrive together, in turn order, after the last turn's records
+(verified on claude 2.1.293, 2026-10-07). A turn that ends with only a
+background shell task pending gets its ``result`` at once. Either way the
+n-th ``result`` belongs to the n-th turn.
 
 The outcome:
 
@@ -41,19 +48,20 @@ The outcome:
   failure, also in a turn a later one would have followed.
 * A line that is not a JSON object with a string ``type`` (including one
   the decoder refuses for an integer or nesting limit), an unterminated
-  last line, a queue overflow, a ``result`` outside a turn, and stdout
-  ending without a ``result`` for every turn are provider failures too. A
-  turn opens with the stream and, after a ``result``, again with a
-  ``system/init``, ``assistant`` or ``user`` record, and its ``result``
-  closes it.
+  last line, a queue overflow, a ``result`` outside a turn (one with every
+  turn so far closed), and stdout ending before every turn has its
+  ``result`` are provider failures too. The first turn opens with the
+  stream; a later one opens with its own ``system/init`` or, with every
+  turn so far closed, with an ``assistant`` or ``user`` record, whose
+  ``system/init`` is then that turn's own. A turn's ``result`` closes it.
 * A line past the per-line bound is counted and skipped: a ``tool_result``
   carries whole files, and progress is not worth failing a run for. The
   ``result`` line has no such allowance; if it was the line skipped, the
   stream ends without one and fails, the way Pi's final text must arrive
   whole in one record (ADR 0003).
-* Records after a ``result`` that open no turn (notices between turns, the
-  operator's ``SessionEnd`` hooks after the last one) are counted and
-  otherwise ignored.
+* Records that arrive with every turn closed and open no turn (notices
+  between turns, the operator's ``SessionEnd`` hooks after the last one)
+  are counted and otherwise ignored.
 
 Progress: each record becomes at least one :class:`~autoforge.progress.ProgressEvent`
 (liveness for #193), and the only strings an event carries are the model
@@ -156,9 +164,13 @@ class ClaudeStream:
         self.failure: str | None = None
         # stdout ended inside a turn; the driver names the exit code.
         self.exited_early = False
-        # A turn is open from the start and from a record that opens one
-        # after a result, until its own result.
-        self._turn_open = True
+        # Turns opened so far: the first with the stream, each later one by
+        # its ``system/init`` or, with every turn so far closed, by a record
+        # that opens one. Result n closes turn n, so a turn waits for its
+        # result while ``_results < _turns``.
+        self._turns = 1
+        # The newest turn has had its ``system/init``; the next one opens a turn.
+        self._turn_has_init = False
         self._results = 0
         # The per-turn counts summed over the results so far. A count one
         # result lacks makes its sum unknown, and it is dropped for good.
@@ -197,18 +209,22 @@ class ClaudeStream:
             return
         kind = record["type"]
         if kind == "result":
-            if self._turn_open:
+            if self._results < self._turns:
                 self._take_result(record)
             else:
                 self._protocol("a result event outside a turn")
             return
-        if not self._turn_open:
-            if kind not in ("assistant", "user") and not (
-                kind == "system" and record.get("subtype") == "init"
-            ):
+        is_init = kind == "system" and record.get("subtype") == "init"
+        if self._results == self._turns:
+            if kind not in ("assistant", "user") and not is_init:
                 self._after_result += 1
                 return
-            self._turn_open = True
+            self._turns += 1
+            self._turn_has_init = is_init
+        elif is_init:
+            if self._turn_has_init:
+                self._turns += 1
+            self._turn_has_init = True
         self._observe(kind, record)
 
     def oversize(self, limit: int) -> None:
@@ -221,7 +237,7 @@ class ClaudeStream:
 
     def stream_ended(self) -> None:
         """stdout reached EOF."""
-        if not self._turn_open or self.failure is not None:
+        if self._results == self._turns or self.failure is not None:
             return
         self.exited_early = True
         if self._results:
@@ -264,7 +280,6 @@ class ClaudeStream:
         self._fail(f"claude: stream-json protocol violation: {what}")
 
     def _take_result(self, record: dict) -> None:
-        self._turn_open = False
         self._results += 1
         subtype = record.get("subtype")
         is_error = record.get("is_error")

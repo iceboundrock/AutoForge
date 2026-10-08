@@ -95,7 +95,9 @@ command and event names, but no CLI flags and no processes. Claude Code's
 `ClaudeCodeProvider` drives over the same handle with stdin on `/dev/null`
 (#192): the last `result` record's text becomes `stdout` (the CLI ends
 every turn with one, and runs another turn when a background task or a
-scheduled wakeup fires), and an error result in any turn, a result
+scheduled wakeup fires; while a background agent runs it holds the results
+back and sends them after the last turn, in turn order, so the n-th result
+belongs to the n-th turn's `system/init`), and an error result in any turn, a result
 outside a turn, a malformed line or a turn without its result becomes
 `provider_failure`. The CLI's exit, not EOF, ends its wait for lines: the
 adapter looks at the CLI after every read, a line included, so a leftover
