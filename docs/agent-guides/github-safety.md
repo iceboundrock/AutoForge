@@ -387,6 +387,11 @@ knowable) for the `ai-follow-up` marker of `{"finding_id", "pr"}`:
   deferring again is right, deferred to that issue (the controller appends
   the new finding's marker to it; an issue may carry several markers),
   never to a second issue
+- the current issue carrying an open finding's marker: `BLOCKED` without
+  launching the fixer. The current issue is never a follow-up of its own
+  PR's findings, so the controller neither hands it over as one nor
+  records a finding as deferred to it (PR #205 R3-F1); once the marker is
+  removed, `unblock` starts a fresh entry
 
 The entry observation records the PR branch at the reviewed HEAD and, per
 open finding, its follow-up issue or none, and is saved before the launch
@@ -419,8 +424,9 @@ for it:
 - a finding whose follow-up issue the entry found is resolved as
   `follow_up_created` with exactly that issue
 - any other deferral either names an issue the entry handed over (a
-  finding's own follow-up or an earlier round's), never the current issue,
-  or asks for a new issue (`follow_up_issue`: bounded title and body, no
+  finding's own follow-up or an earlier round's), never the current issue
+  whatever marker it carries (an earlier round's marker on it hands it
+  over, but a deferral to it is still refused), or asks for a new issue (`follow_up_issue`: bounded title and body, no
   marker); the composed body (the fixer's text, the controller's reference
   to the PR and finding, and the marker) passes the credential rule as a
   whole, and the new issues together fit what one FIX round journals
@@ -455,6 +461,12 @@ Then, in order, all from one persisted plan:
 2. Before anything is sent, and again at every later entry that completes
    the plan from the journal (PR #205 R2), the entry's rules are applied
    to the saved plan:
+   - the deferrals: one naming the current issue (a plan saved before that
+     rule, or a reused follow-up the entry recorded as the current issue)
+     blocks with nothing more sent; such a plan cannot be completed as
+     saved, and the run starts again (PR #205 R3-F1);
+   - the PR: a closed one is a `VerificationError` with nothing more sent,
+     for `resume` once it is reopened;
    - the PR head: one that is neither the reviewed HEAD nor the candidate
      is the same drift (`FIX -> REVIEW`, the plan dropped; an issue it
      already created or a marker it already appended stays on GitHub as an
@@ -483,9 +495,12 @@ Then, in order, all from one persisted plan:
      anything is sent again.
 3. The records are driven in plan order, so the push, the commit point, is
    issued only after every follow-up is on GitHub, and, after any
-   follow-up write, only once the open issues are read again and agree
-   with every resolution as in step 2 (otherwise it blocks with the
-   follow-ups on GitHub and nothing pushed). A body edited between the
+   follow-up write, only once the PR is read again and held to step 2's
+   rules (open, head, base and merge base, push target) and the open
+   issues are read again and agree with every resolution as in step 2
+   (PR #205 R2-F2, R3-F2). Otherwise nothing is pushed and the follow-ups
+   stay on GitHub: a closed PR is a `VerificationError` for `resume`, a
+   moved head or base is the same drift, and anything else blocks. A body edited between the
    plan and the append is rebased (D5.5) within the size and credential
    rules. A push refused by its lease while the PR head moved is the same
    drift, never forced; any other conflict blocks naming the record and
@@ -496,7 +511,13 @@ Then, in order, all from one persisted plan:
    appended to, or the one the entry handed over, and no other finding has
    any); the PR headed at the candidate; and its base and merge base still
    the ones the findings are bound to (otherwise the same drift: the
-   candidate is reviewed as stale, no fix recorded). A head still at the
+   candidate is reviewed as stale, no fix recorded); no deferral naming
+   the current issue; and the PR still headed in the run's repository at
+   the branch the plan pushed to. A target lost after the push (a head
+   repository GitHub no longer reports, a fork's, another branch) blocks
+   with the fix not recorded and the findings open; the plan stays saved,
+   so `unblock` completes it from the journal and sends nothing GitHub
+   already holds (PR #205 R3-F2). A head still at the
    reviewed HEAD after the push is GitHub catching up (transient); any
    other head is drift. Only then are the resolutions recorded
    (`last_fix_resolutions`, each deferral with the URL GitHub returned),

@@ -3621,13 +3621,14 @@ class ControllerEngine:
 
         Checked before the result is accepted, so a refusal is corrected (the
         fixer is asked again) before anything is created, appended or
-        pushed. The resolutions cover exactly the open findings. A finding
-        whose follow-up issue the entry found is resolved as
+        pushed. The resolutions cover exactly the open findings. No deferral
+        names the current issue, whatever marker it carries (PR #205 R3-F1).
+        A finding whose follow-up issue the entry found is resolved as
         ``follow_up_created`` with exactly that issue: the controller reuses
         it and never records a second decision. Any other deferral either
         names an issue the entry handed over (one finding's own follow-up,
-        or an earlier round's), never the current issue, or asks for a new
-        issue whose composed body passes the credential rule as a whole.
+        or an earlier round's), or asks for a new issue whose composed body
+        passes the credential rule as a whole.
         The candidate is the worktree's ``HEAD`` as the controller reads it:
         detached, equal to ``head_sha``, and either the reviewed HEAD itself
         (nothing committed, so no finding is ``fixed``) or a descendant of
@@ -3661,6 +3662,19 @@ class ControllerEngine:
         new_chars = 0
         for r in res.resolutions:
             fid = r.finding_id
+            if (
+                r.resolution == "follow_up_created"
+                and not r.new_follow_up
+                and same_issue_url(r.follow_up_issue_url, state.current_issue_url)
+            ):
+                # Before the reuse rule (PR #205 R3-F1): the entry refuses to
+                # hand the current issue over, so it is never a finding's own
+                # follow-up either.
+                raise ControlResultValidationError(
+                    f"FIX: the follow-up of {fid} names the current issue {issue.canonical}, "
+                    "which is never a follow-up; resolve the finding in this PR, or defer it "
+                    "to another issue"
+                )
             own = self._existing_follow_ups.get(fid)
             if own is not None:
                 if (
@@ -3685,12 +3699,6 @@ class ControllerEngine:
                     raise ControlResultValidationError(f"FIX: {problem}")
                 new_chars += len(r.follow_up_title) + len(body)
                 continue
-            if same_issue_url(r.follow_up_issue_url, state.current_issue_url):
-                raise ControlResultValidationError(
-                    f"FIX: the follow-up of {fid} names the current issue {issue.canonical}, "
-                    "which is never a follow-up; resolve the finding in this PR, or defer it "
-                    "to another issue"
-                )
             if parse_issue_url(r.follow_up_issue_url).canonical not in handed:
                 listed = ", ".join(sorted(handed)) or "none"
                 raise ControlResultValidationError(
@@ -5612,9 +5620,10 @@ class ControllerEngine:
                 "and head branch, and the open issues against every resolution, before "
                 "anything is sent (a PR head neither the reviewed HEAD nor the planned "
                 "candidate, or a base or merge base that moved, routes to REVIEW; a head "
-                "branch or follow-up the plan cannot prove blocks), then create the follow-up "
-                "issues, append the markers, read the open issues again and push last, then "
-                "read the follow-ups, the PR head, base and merge base back"
+                "branch or follow-up the plan cannot prove, or a deferral to the current "
+                "issue, blocks), then create the follow-up issues, append the markers, read "
+                "the PR and the open issues again and push last, then read the follow-ups, the "
+                "PR head, base, merge base and head branch back"
             )
             return notes
         notes.extend(
@@ -5890,8 +5899,9 @@ class ControllerEngine:
           more for one finding is a state the controller cannot resolve
           without choosing, and a listing that cannot be proven complete
           blocks, because "no such issue exists" is then not knowable. The
-          same listing gives the earlier rounds' deferrals
-          (``EXISTING_FOLLOW_UP_ISSUES``, #90).
+          current issue carrying one blocks too: it is never a follow-up of
+          its own PR's findings (PR #205 R3-F1). The same listing gives the
+          earlier rounds' deferrals (``EXISTING_FOLLOW_UP_ISSUES``, #90).
         - The observation records the PR branch at the reviewed HEAD and,
           per open finding, its follow-up issue or none. A re-entry after a
           launch of this entry (a correction relaunch, or a 'resume' after
@@ -6003,6 +6013,15 @@ class ControllerEngine:
                 f"{exc}. The controller never chooses between them: close or repair the "
                 "extra or unreadable issue(s) so exactly one remains, then start a new run",
             )
+        problem = self._fix_self_follow_up_problem(own)
+        if problem:
+            return self._block(
+                Phase.FIX,
+                plan,
+                f"{problem}. Remove that marker from the current issue (the finding is then "
+                "resolved in this PR or deferred to another issue), then 'unblock'. Nothing was "
+                "launched",
+            )
         ref = f"refs/heads/{pr.head_ref}"
         observed = self._fix_observed_objects(pr_ref, open_ids, own)
         observation = effects.observation
@@ -6090,6 +6109,27 @@ class ControllerEngine:
             lambda c: c.finding_id not in open_ids, f"PR {pr_ref.canonical}"
         )
         return own, _follow_up_pairs(deferred)
+
+    def _fix_self_follow_up_problem(self, follow_ups: dict[str, str]) -> str:
+        """Why a finding's follow-up in ``follow_ups`` is the current issue, or "" (PR #205 R3-F1).
+
+        ``follow_ups`` maps finding ids to the issue each is deferred to. The
+        current issue is never a follow-up of its own PR's findings: a
+        deferral to it would record the finding as resolved with nothing
+        changed, whoever put the marker there.
+        """
+        state = self._require_state()
+        selves = sorted(
+            fid for fid, url in follow_ups.items() if same_issue_url(url, state.current_issue_url)
+        )
+        if not selves:
+            return ""
+        return (
+            f"the current issue {parse_issue_url(state.current_issue_url).canonical} is the "
+            f"follow-up of {', '.join(selves)} of PR {parse_pr_url(state.current_pr_url).canonical}"
+            ", but the current issue is never a follow-up of its own PR's findings: the "
+            "controller neither hands it to the fixer nor records a finding as deferred to it"
+        )
 
     @staticmethod
     def _fix_observed_objects(
@@ -8876,6 +8916,47 @@ class ControllerEngine:
             )
         return ""
 
+    def _fix_pr_outcome(
+        self,
+        push: EffectRecord | None,
+        observation: EntryObservation,
+        candidate: str,
+        sent: str,
+    ) -> tuple[Phase, str] | None:
+        """The saved FIX plan's PR preconditions, read live: ``None`` when they hold.
+
+        Read before the plan sends anything (PR #205 R2) and again before
+        the push after any follow-up write (R3-F2): the PR open in the run's
+        repository with a readable HEAD (otherwise :class:`VerificationError`
+        from :meth:`_require_open_pr`); headed at the reviewed HEAD or the
+        planned candidate, the controller's own push (any other HEAD is
+        drift); its base and merge base still the findings' binding
+        (:meth:`_fix_rebound`); and its head branch still the plan's push
+        target (:meth:`_fix_target_problem`, which blocks). ``sent`` says
+        what is on GitHub when it does not hold.
+        """
+        state = self._require_state()
+        reviewed = state.reviewed_head_sha.lower()
+        pr = self._require_open_pr()
+        if pr.head_sha.lower() not in (reviewed, candidate):
+            return self._fix_drift(
+                pr,
+                f"PR HEAD {pr.head_sha[:12]} is neither the reviewed HEAD {reviewed[:12]} nor "
+                f"the candidate {candidate[:12]} the plan pushes (a push the controller did not "
+                f"make; it does not infer which findings it resolved); {sent}",
+            )
+        outcome = self._fix_rebound(pr, sent)
+        if outcome is not None:
+            return outcome
+        problem = self._fix_target_problem(pr, push, observation)
+        if problem:
+            return Phase.BLOCKED, (
+                f"{problem}. The controller pushes the fix only to the head branch the review "
+                f"bound and the FIX plan names; {sent} and the fix of review round "
+                f"{state.review_round} is not recorded. Inspect the PR, then 'unblock'"
+            )
+        return None
+
     def _fix_conflict(self, record: EffectRecord) -> tuple[Phase, str]:
         """A conflicting FIX record: drift when the PR moved, otherwise BLOCKED.
 
@@ -9017,31 +9098,78 @@ class ControllerEngine:
             "issue(s) it did not write, or reopen the one it did, then 'unblock'"
         )
 
+    def _fix_self_deferral_problem(
+        self,
+        context: FixContext,
+        records: Sequence[EffectRecord],
+        observation: EntryObservation,
+    ) -> str:
+        """Why the FIX plan defers a finding to the current issue, or "" (PR #205 R3-F1).
+
+        The entry and the result check refuse such a deferral, so only a plan
+        saved without those checks holds one; it is refused before anything
+        is sent and before a fix is recorded, whatever the open issues say.
+        Each deferral's issue is the one its source names: the entry's
+        observation for a reused follow-up, an append's target, or the issue
+        a create read back.
+        """
+        pr_url = parse_pr_url(context.pr_url).canonical
+        follow_ups: dict[str, str] = {}
+        for resolution in context.resolutions:
+            fid = resolution["finding_id"]
+            source = resolution["follow_up_source"]
+            if source is None:
+                continue
+            url: object
+            if source == FOLLOW_UP_SOURCE_ENTRY:
+                url = observation.objects.get(render_follow_up_marker(pr_url, fid))
+            else:
+                assert isinstance(source, int)
+                record = records[source]
+                url = record.target.get("issue_url") or (record.observed or {}).get("url")
+            if url:
+                follow_ups[fid] = str(url)
+        return self._fix_self_follow_up_problem(follow_ups)
+
+    def _fix_self_deferral_block(self, problem: str, sent: str) -> tuple[Phase, str]:
+        state = self._require_state()
+        return Phase.BLOCKED, (
+            f"{problem}. The persisted FIX plan was saved without that check and cannot be "
+            f"completed as saved: {sent}, the fix of review round {state.review_round} is not "
+            "recorded and the findings stay open. This run cannot continue automatically: "
+            "inspect the plan ('autoforge status') and the current issue, remove the marker "
+            "from the current issue, and start a new run"
+        )
+
     def _complete_fix(self) -> tuple[Phase, str]:
         """Finish FIX from the persisted plan: create, append, push, read back (#163).
 
         The same code for the step that saved the plan and for every later
         entry (journal first), so a saved plan is held to the entry's rules
-        again before it sends anything (PR #205 R2). A PR HEAD that is
-        neither the reviewed HEAD nor the planned candidate is a push the
-        controller did not make, and a base or merge base that left the
-        findings' binding makes them stale (``FIX -> REVIEW`` either way,
-        :meth:`_fix_rebound`); the candidate itself is the controller's own
-        push, never a reason to review first. The PR must still be headed in
-        the run's repository at the branch the plan pushes to
-        (:meth:`_fix_target_problem`), and the open issues must agree with
-        every resolution, including follow-ups an earlier entry already
-        observed (:meth:`_fix_disposition_problem`); otherwise it blocks with
-        nothing more sent. Each record is then reconciled against GitHub and
-        issued at most once, in plan order, and the open issues are read
-        again before the push (the commit point) is issued after any
-        follow-up write; a push refused because the branch moved is the same
-        drift. Then every resolution is read back against the open issues,
-        the PR as headed at the candidate, and its base and merge base as
-        still bound. A conflict or a conclusive failure blocks with the
-        records as persisted; an unavailable GitHub, a write whose outcome is
-        not readable yet, or a PR head GitHub has not moved yet, propagates
-        for 'resume'.
+        again before it sends anything (PR #205 R2). A plan deferring a
+        finding to the current issue is refused outright
+        (:meth:`_fix_self_deferral_problem`, R3-F1). The PR must be open
+        (:meth:`_fix_pr_outcome`): a PR HEAD that is neither the reviewed
+        HEAD nor the planned candidate is a push the controller did not
+        make, and a base or merge base that left the findings' binding makes
+        them stale (``FIX -> REVIEW`` either way, :meth:`_fix_rebound`); the
+        candidate itself is the controller's own push, never a reason to
+        review first. The PR must still be headed in the run's repository at
+        the branch the plan pushes to (:meth:`_fix_target_problem`), and the
+        open issues must agree with every resolution, including follow-ups
+        an earlier entry already observed (:meth:`_fix_disposition_problem`);
+        otherwise it blocks with nothing more sent. Each record is then
+        reconciled against GitHub and issued at most once, in plan order,
+        and after any follow-up write the PR and the open issues are read
+        and held to the same rules again before the push (the commit point)
+        is issued (R3-F2); a push refused because the branch moved is the
+        same drift. Then every resolution is read back against the open
+        issues, and the PR as headed at the candidate, its base and merge
+        base as still bound, and its head branch as still the plan's target.
+        A conflict or a conclusive failure blocks with the records as
+        persisted; an unavailable GitHub, a write whose outcome is not
+        readable yet, or a PR head GitHub has not moved yet, propagates for
+        'resume'.
         """
         state = self._require_state()
         effects = state.phase_effects()
@@ -9053,43 +9181,33 @@ class ControllerEngine:
         reviewed = state.reviewed_head_sha.lower()
         push = records[-1] if records and records[-1].kind is EffectKind.PUSH else None
         candidate = str(push.payload["sha"]) if push is not None else reviewed
-        pr = self._require_open_pr()
-        if pr.head_sha.lower() not in (reviewed, candidate):
-            return self._fix_drift(
-                pr,
-                f"PR HEAD {pr.head_sha[:12]} is neither the reviewed HEAD {reviewed[:12]} nor "
-                f"the candidate {candidate[:12]} the plan pushes (a push the controller did not "
-                "make; it does not infer which findings it resolved)",
-            )
-        outcome = self._fix_rebound(pr, "nothing more was sent")
+        problem = self._fix_self_deferral_problem(context, records, observation)
+        if problem:
+            return self._fix_self_deferral_block(problem, "nothing more was sent")
+        outcome = self._fix_pr_outcome(push, observation, candidate, "nothing more was sent")
         if outcome is not None:
             return outcome
-        problem = self._fix_target_problem(pr, push, observation)
-        if problem:
-            return Phase.BLOCKED, (
-                f"{problem}. The controller pushes the fix only to the head branch the review "
-                f"bound and the FIX plan names; nothing more was sent and the fix of review "
-                f"round {state.review_round} is not recorded. Inspect the PR, then 'unblock'"
-            )
         problem = self._fix_disposition_problem(context, records, observation)
         if problem:
             return self._fix_disposition_block(problem, "nothing more was sent")
-        # True while the last listing postdates every follow-up write: the
-        # push is never issued over a deferral not read back as planned.
-        listed = True
+        # True while the last PR read and issue listing postdate every
+        # follow-up write: the push is never issued over a PR or a deferral
+        # not read back as planned (PR #205 R2-F2, R2-F3, R3-F2).
+        checked = True
         default_branch = ""
         for index, record in enumerate(records):
             if record.stage == Stage.CONFLICT:
                 return self._fix_conflict(record)
             if not record.pending:
                 continue
-            if record.kind is EffectKind.PUSH and not listed:
+            if record.kind is EffectKind.PUSH and not checked:
+                unpushed = "the follow-ups are on GitHub but the candidate was not pushed"
+                outcome = self._fix_pr_outcome(push, observation, candidate, unpushed)
+                if outcome is not None:
+                    return outcome
                 problem = self._fix_disposition_problem(context, records, observation)
                 if problem:
-                    return self._fix_disposition_block(
-                        problem,
-                        "the follow-ups are on GitHub but the candidate was not pushed",
-                    )
+                    return self._fix_disposition_block(problem, unpushed)
             try:
                 if record.kind is EffectKind.PUSH:
                     default_branch = self.github.get_repo(state.repository).default_branch
@@ -9109,9 +9227,12 @@ class ControllerEngine:
                     "data); nothing was sent again. Fix the cause, then 'unblock'"
                 )
             records[index] = driven.record
-            listed = listed and record.kind is EffectKind.PUSH
+            checked = checked and record.kind is EffectKind.PUSH
             if driven.record.stage == Stage.CONFLICT:
                 return self._fix_conflict(driven.record)
+        problem = self._fix_self_deferral_problem(context, records, observation)
+        if problem:
+            return self._fix_self_deferral_block(problem, "the fix is not recorded")
         problem = self._fix_disposition_problem(context, records, observation)
         if problem:
             return self._fix_disposition_block(problem, "the fix is not recorded")
@@ -9132,6 +9253,18 @@ class ControllerEngine:
         outcome = self._fix_rebound(latest, "read back after the FIX plan was sent")
         if outcome is not None:
             return outcome
+        problem = self._fix_target_problem(latest, push, observation)
+        if problem:
+            # The candidate on the PR is the controller's own push, so this is
+            # not drift: the plan stays saved and is completed from the
+            # journal once the PR is headed at its branch again (R3-F2).
+            return Phase.BLOCKED, (
+                f"{problem}, read back after the FIX plan was sent. The controller records a "
+                "fix only for the head branch the review bound and the FIX plan names; the fix "
+                f"of review round {state.review_round} is not recorded and the findings stay "
+                "open. Inspect the PR, then 'unblock': FIX completes from the persisted plan, "
+                "which sends nothing GitHub already holds"
+            )
         state.last_fix_resolutions = [
             {
                 "finding_id": r["finding_id"],
