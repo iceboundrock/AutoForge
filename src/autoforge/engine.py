@@ -141,6 +141,7 @@ from .effects import (
     Stage,
     UpdateEpicContext,
     compose_append,
+    implementation_closing_block,
     is_legacy_reentry,
     launch_label_for,
     progress_comment_body,
@@ -3455,9 +3456,7 @@ class ControllerEngine:
 
     def _analyze_closing_block(self) -> str:
         """``Closes #n`` and the issue's implementation marker, as the controller writes them."""
-        state = self._require_state()
-        number = parse_issue_url(state.current_issue_url).number
-        return f"Closes #{number}\n\n{render_implementation_marker(state.current_issue_url)}"
+        return implementation_closing_block(self._require_state().current_issue_url)
 
     def _worktree_git(self, args: list[str], cwd: str, what: str) -> tuple[int, str]:
         """One local git read in the agent's worktree: ``(exit code, stdout)``.

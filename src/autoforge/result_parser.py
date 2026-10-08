@@ -51,7 +51,7 @@ from __future__ import annotations
 import json
 import re
 from collections import deque
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from enum import StrEnum
 
@@ -693,10 +693,8 @@ class AnalyzeExecuteResult:
         ph = "ANALYZE_EXECUTE"
         issue_url = _req_url(p, "issue_url", ph, "issue")
         head_sha = _req_sha(p, "head_sha", ph)
-        title = _bounded(_req_str(p, "pr_title", ph), ph, "result", "pr_title", MAX_PR_TITLE_CHARS)
-        title = _analyze_published(_one_line(title, ph, "result", "pr_title"), "pr_title")
-        body = _bounded(_req_str(p, "pr_body", ph), ph, "result", "pr_body", MAX_PR_BODY_CHARS)
-        body = _analyze_published(_multi_line(body, ph, "result", "pr_body"), "pr_body")
+        title = validate_pr_title(_req_str(p, "pr_title", ph))
+        body = validate_pr_body(_req_str(p, "pr_body", ph))
         tests = _opt_str_list(p, "tests", ph)
         if len(tests) > MAX_TESTS_REPORTED:
             raise ControlResultValidationError(
@@ -720,6 +718,46 @@ def _analyze_published(text: str, key: str) -> str:
     if problem is not None:
         raise ControlResultValidationError(f"ANALYZE_EXECUTE: field {problem}")
     return text
+
+
+def _analyze_pr_text(
+    text: str, key: str, limit: int, lines: Callable[[str, str, str, str], str]
+) -> str:
+    ph = "ANALYZE_EXECUTE"
+    if not isinstance(text, str):
+        raise ControlResultValidationError(f"{ph}: field {key!r} must be a string")
+    if not text.strip():
+        raise ControlResultValidationError(
+            f"CONTROL_RESULT for {ph} missing required field {key!r}"
+        )
+    text = _bounded(text, ph, "result", key, limit)
+    return _analyze_published(lines(text, ph, "result", key), key)
+
+
+def validate_pr_title(text: str) -> str:
+    """``text`` as an ANALYZE_EXECUTE ``pr_title``, or a rejection.
+
+    Non-blank, at most :data:`MAX_PR_TITLE_CHARS`, one line of printable
+    text, and publishable (:func:`published_text_problem`): the controller
+    creates the PR with it (#161). The checks
+    :meth:`AnalyzeExecuteResult.from_payload` applies, with the same
+    messages, so a persisted K2 title can be re-validated under the parser's
+    rules.
+    """
+    return _analyze_pr_text(text, "pr_title", MAX_PR_TITLE_CHARS, _one_line)
+
+
+def validate_pr_body(text: str) -> str:
+    """``text`` as an ANALYZE_EXECUTE ``pr_body``, or a rejection.
+
+    Non-blank, at most :data:`MAX_PR_BODY_CHARS`, multi-line text with no
+    other control character, and publishable (:func:`published_text_problem`):
+    the agent's part of the PR body, before the controller's ``Closes #n``
+    and marker. The checks :meth:`AnalyzeExecuteResult.from_payload`
+    applies, with the same messages, so the agent's part of a persisted K2
+    body can be re-validated under the parser's rules.
+    """
+    return _analyze_pr_text(text, "pr_body", MAX_PR_BODY_CHARS, _multi_line)
 
 
 # Control characters a *multi-line* text field may still carry: a newline

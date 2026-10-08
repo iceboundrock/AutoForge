@@ -57,6 +57,7 @@ from .claims import (
     PROGRESS,
     REVIEW,
     MarkerKind,
+    render_implementation_marker,
     render_progress_marker,
     scan,
 )
@@ -74,6 +75,8 @@ from .result_parser import (
     MAX_ROADMAP_SECTION_CHARS,
     MAX_URL_CHARS,
     Finding,
+    validate_pr_body,
+    validate_pr_title,
     validate_progress_text,
     validate_roadmap_section,
 )
@@ -142,6 +145,12 @@ def compose_append(base: str, block: str) -> str:
 def progress_comment_body(progress: str, marker: str) -> str:
     """K8's payload: the validated progress text, a blank line, the marker (§2.5)."""
     return f"{progress}{APPEND_SEPARATOR}{marker}"
+
+
+def implementation_closing_block(issue_url: str) -> str:
+    """What K2's body ends with and K3 appends: ``Closes #n``, a blank line, the marker (#161)."""
+    number = parse_issue_url(issue_url).number
+    return f"Closes #{number}{APPEND_SEPARATOR}{render_implementation_marker(issue_url)}"
 
 
 # -- closed sets -------------------------------------------------------------------
@@ -887,6 +896,17 @@ def _cross_push(record: EffectRecord, what: str) -> None:
         _fail(what, "is observed at another SHA than its candidate")
 
 
+def _owner_closing_block(record: EffectRecord, repository: str, what: str) -> str:
+    """The closing block of the owner's issue, for a PR in ``repository``.
+
+    ``Closes #n`` names issue ``n`` of the PR's own repository, so it is the
+    owner's issue only when the PR is in that issue's repository.
+    """
+    if not parse_issue_url(record.owner.issue_url).same_repository(repository):
+        _fail(what, "is in another repository than its owner's issue, which 'Closes #n' names")
+    return implementation_closing_block(record.owner.issue_url)
+
+
 def _cross_implementation_pr(record: EffectRecord, what: str) -> None:
     _same(
         record,
@@ -896,12 +916,41 @@ def _cross_implementation_pr(record: EffectRecord, what: str) -> None:
     )
     _check_owner_issue_marker(record, IMPLEMENTATION, what)
     _check_body_ends_with_marker(record, record.identity["marker"], what)
+    # The payload is the title and body the parser accepted, the body then
+    # followed by a blank line and the controller's closing block; both texts
+    # get the parser's rules again, because a resumed create publishes them
+    # with no agent result in between. The credential rule over the whole
+    # body is the record's redaction invariance.
+    tail = APPEND_SEPARATOR + _owner_closing_block(record, record.target["repository"], what)
+    if not record.body.endswith(tail):
+        _fail(
+            what,
+            "has a payload body that is not its text, a blank line and the closing block "
+            "of its owner's issue",
+        )
+    text = record.body[: len(record.body) - len(tail)]
+    for key, value, validate in (
+        ("title", str(record.payload["title"]), validate_pr_title),
+        ("body", text, validate_pr_body),
+    ):
+        if value != value.strip():
+            _fail(what, f"has a PR {key} that is not in the parser's stored form")
+        try:
+            validate(value)
+        except ControlResultValidationError as exc:
+            _fail(what, f"has an invalid PR {key}: {exc}")
 
 
 def _cross_adopt_pr(record: EffectRecord, what: str) -> None:
     _same(record, what, (record.identity["pr_url"], record.target["pr_url"], "PR"))
     _check_owner_issue_marker(record, IMPLEMENTATION, what)
     _check_append(record, (record.identity["marker"],), what)
+    # The base is the adopted PR's own body, a human's text the controller
+    # keeps as it is; only the block is the controller's, and it is exactly
+    # the closing block of the owner's issue.
+    repository = parse_pr_url(record.target["pr_url"]).repository
+    if record.payload["block"] != _owner_closing_block(record, repository, what):
+        _fail(what, "has a block that is not the closing block of its owner's issue")
     if record.observed is not None and record.observed["url"] != record.target["pr_url"]:
         _fail(what, "is observed on another PR than its target")
 

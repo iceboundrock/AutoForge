@@ -41,6 +41,8 @@ from autoforge.result_parser import (
     published_text_problem,
     validate_for_phase,
     validate_next_issue_url,
+    validate_pr_body,
+    validate_pr_title,
     validate_progress_text,
     validate_roadmap_section,
 )
@@ -205,6 +207,38 @@ def test_analyze_result_text_is_bounded_and_held_to_the_published_policy(key, va
     with pytest.raises(ControlResultValidationError, match=rule) as info:
         AnalyzeExecuteResult.from_payload(dict(_ANALYZE, **{key: value}))
     assert "octocat" not in str(info.value) and "FAKEtoken" not in str(info.value)
+
+
+@pytest.mark.parametrize(
+    ("validator", "key", "bad"),
+    [
+        (validate_pr_title, "pr_title", "Notify @octocat"),
+        (validate_pr_title, "pr_title", "Fixes #3"),
+        (validate_pr_title, "pr_title", "<!-- ai-x -->"),
+        (validate_pr_title, "pr_title", "a\x1bb"),
+        (validate_pr_title, "pr_title", "x" * 257),
+        (validate_pr_title, "pr_title", "  "),
+        (validate_pr_body, "pr_body", "Closes #3\nDone."),
+        (validate_pr_body, "pr_body", "Thanks @octocat"),
+        (validate_pr_body, "pr_body", "Done.\n<!-- autoforge-x -->"),
+        (validate_pr_body, "pr_body", "a\x0bb"),
+        (validate_pr_body, "pr_body", "x" * 60001),
+        (validate_pr_body, "pr_body", "\n\t"),
+    ],
+)
+def test_pr_text_validators_apply_the_parsers_rules_with_its_messages(validator, key, bad):
+    """#161: a persisted K2 title or body text is re-validated under the parser's rules."""
+    with pytest.raises(ControlResultValidationError) as from_validator:
+        validator(bad)
+    with pytest.raises(ControlResultValidationError) as from_payload:
+        AnalyzeExecuteResult.from_payload(dict(_ANALYZE, **{key: bad}))
+    assert str(from_validator.value) == str(from_payload.value)
+
+
+def test_pr_text_validators_return_accepted_text():
+    assert validate_pr_title(_ANALYZE["pr_title"]) == _ANALYZE["pr_title"]
+    assert validate_pr_body(_ANALYZE["pr_body"]) == _ANALYZE["pr_body"]
+    assert validate_pr_body("x" * 60000) == "x" * 60000
 
 
 def test_analyze_result_names_no_target():

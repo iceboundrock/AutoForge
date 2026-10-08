@@ -142,9 +142,18 @@ never completed. Text the recovery path
 publishes with no agent result in between is validated again under the
 parser's rules for its field, not only for its bounds and redaction
 invariance: the `UPDATE_EPIC` roadmap section in the
-completion context (`validate_roadmap_section`) and the progress text of a
-progress-comment record (`validate_progress_text`). A stored value the
-result path would have refused is a `StateError`, never rewritten. LOCAL
+completion context (`validate_roadmap_section`), the progress text of a
+progress-comment record (`validate_progress_text`), and the title and the
+agent's part of the body of an `implementation_pr` record
+(`validate_pr_title`, `validate_pr_body`), in the stripped form the parser
+returns. Controller text stored with them is checked to be exactly what
+the controller renders: an `implementation_pr` body ends in a blank line
+and the closing block of its owner's issue (`Closes #n`, a blank line, the
+implementation marker), an `adopt_pr` block is that closing block, and
+both PRs are in the issue's repository, the one `Closes #n` names. The
+existing body an `adopt_pr` appends to is a human's text and keeps only
+the append checks. A stored value the result path would have refused is a
+`StateError`, never rewritten. LOCAL
 state carrying any of them is refused as corrupt: a LOCAL run performs no
 external effect.
 

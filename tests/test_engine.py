@@ -830,6 +830,70 @@ def test_analyze_crash_after_the_plan_save_completes_from_the_journal(
     assert fake_github.prs[PR].body == f"Adds the feature.\n\nTested with `pytest`.\n\n{CLOSING}"
 
 
+@pytest.mark.parametrize(
+    ("key", "edit", "rule"),
+    [
+        ("title", lambda title: "Notify @octocat", "invalid PR title: .*an @-mention"),
+        ("body", lambda body: "Closes #3\n" + body, "invalid PR body: .*a closing keyword"),
+        (
+            "body",
+            lambda body: "<!-- ai-implementation -->\n" + body,
+            "invalid PR body: .*a controller marker opener",
+        ),
+        ("title", lambda title: title + "\x1b", r"invalid PR title: .*control character"),
+        ("body", lambda body: "a\x0b" + body, r"invalid PR body: .*control character"),
+        ("body", lambda body: "x" * 60000 + body, "invalid PR body: .*accepts at most 60000"),
+        ("body", lambda body: body.replace(CLOSING, f"Closes #3\n\n{MARKER}"), "closing block"),
+    ],
+    ids=[
+        "title-mention",
+        "extra-closing-reference",
+        "marker-opener",
+        "title-control-character",
+        "body-control-character",
+        "body-over-its-bound",
+        "closing-line-of-another-issue",
+    ],
+)
+def test_analyze_a_journaled_pr_text_the_parser_refuses_is_never_published_on_recovery(
+    tmp_state_dir, fake_github, monkeypatch, key, edit, rule
+):
+    """R2-F1: the plan is completed from the journal with no agent result in
+    between, so the K2 title and the agent's part of its body get the ANALYZE
+    parser's rules again on load, and its closing block must be exactly the
+    controller's. A stored text the result path would have refused fails the
+    load before anything is sent: no push, no PR, no relaunch, and the file
+    is left as it is for the operator."""
+    from autoforge.engine import ControllerEngine
+
+    eng = make_engine(tmp_state_dir, implement, github=fake_github, origin=True)
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    monkeypatch.setattr(ControllerEngine, "_complete_analyze", _crash)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    monkeypatch.undo()
+    data = json.loads(eng.paths.state_file.read_text(encoding="utf-8"))
+    payload = data["effect_records"][1]["payload"]
+    assert payload == {
+        "title": "Add the feature",
+        "body": f"Adds the feature.\n\nTested with `pytest`.\n\n{CLOSING}",
+    }
+    payload[key] = edit(payload[key])
+    eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
+    before = eng.paths.state_file.read_bytes()
+    eng.close()
+
+    eng2 = make_engine(tmp_state_dir, "never", github=fake_github)
+    connect_origin(eng2, eng.origin)
+    with pytest.raises(StateError, match=rule) as info:
+        eng2.load()
+    assert "octocat" not in str(info.value)
+    assert eng2.provider.calls == []
+    assert fake_github.effect_writes == [] and PR not in fake_github.prs
+    assert eng.origin.head("autoforge/2") is None
+    assert eng.paths.state_file.read_bytes() == before
+
+
 def test_analyze_pr_create_whose_reply_was_lost_is_read_back_not_resent(tmp_state_dir, fake_github):
     """The PR create lands but its reply is lost: the read-back finds the PR
     by the issue's marker and binds it; nothing is sent twice."""
