@@ -182,30 +182,40 @@ one, and every probe and read-back reads them through it:
 
 ### Before REVIEW
 
-The reviewer is launched only after the controller has bound the revision
-it is to review, all read from GitHub: the PR HEAD, its base branch, and
-the merge base of the two (`repos/{owner}/{repo}/compare/{base}...{head}`,
+The reviewer makes no GitHub write in this phase (ADR 0004 K4, #162). It
+reviews the bound revision and returns its verdict, its findings and its
+prose sections; the controller renders the round's comment, posts it (a
+`review_comment` record) and reads it back ("After REVIEW" below).
+
+The journal is read first. A persisted completion context means the
+round's result was already accepted and its comment planned: the phase is
+completed from the record and no reviewer is launched. Otherwise the
+reviewer is launched only after the controller has bound the revision it
+is to review, all read from GitHub: the PR HEAD, its base branch, and the
+merge base of the two (`repos/{owner}/{repo}/compare/{base}...{head}`,
 `merge_base_commit.sha`, the commit the PR diff is computed from; a base
 rewritten under its name moves it, ordinary commits on the base do not,
 #96). A read that fails refuses the entry; nothing is launched against a
 revision the controller could not name. It has then read the PR's
 comments for a comment already carrying the `ai-review-result` marker of
-the upcoming round at the bound HEAD, base and merge base (an earlier
-invocation of the same round whose result was never recorded):
+the upcoming round at the bound HEAD, base and merge base:
 
-- exactly one: its URL is handed to the reviewer as
-  `EXISTING_REVIEW_COMMENT_URL`, to adopt or edit in place, never duplicate
-- two or more: `BLOCKED` without launching the reviewer; the controller
-  never chooses which review is the round's
+- one or more: `BLOCKED` without launching the reviewer, naming the
+  comment. The controller journals the round's comment before it posts
+  it, so one it finds with no plan is not its own: a human's, or one a
+  reviewer of the previous contract posted (D13.5). It is never adopted,
+  edited or duplicated (D9.6): adopting it would let any author define the
+  round's findings, and the validated result it would need does not exist.
+  `unblock` does not change that; the operator deletes the comment or its
+  marker, then unblocks, and the round runs.
 - a comment for the same round at another HEAD, against another base, or
   from another merge base is not this round's: the round's identity is the
   diff it decided on, and a review posted before the PR was retargeted, or
   before its base was rewritten under its name, decided on another diff
 - a marker that names no base, or no merge base, was written before the
   marker recorded one; it reviewed a diff nobody recorded, so it matches
-  no bound key and is never adopted, but it is not a defect (a PR
-  mid-flight carries one from every earlier round, and a defect would
-  block every later entry on it)
+  no bound key, but it is not a defect (a PR mid-flight carries one from
+  every earlier round, and a defect would block every later entry on it)
 - the marker is a JSON object with exactly an integer `round` (not a
   boolean, not a float), a 40-hex `reviewed_head_sha`, a boolean
   `needs_fix_round` and optionally `reviewed_base_ref` (a branch name),
@@ -223,61 +233,86 @@ deferred problem is not a finding of the round unless the deferral itself is
 wrong for this PR. A listing that may be truncated blocks: a reviewer
 launched on an incomplete list could re-raise a deferred problem.
 
+Last, the bound HEAD and merge base are fetched into the shared object
+store through the controller's transport, so the reviewer diffs them
+locally and fetches nothing itself. A failed fetch propagates: nothing was
+launched, and `resume` fetches again. A dry-run plan names these reads,
+the fetch and the comment the step would post, and performs none of them.
+
 ### After REVIEW
 
-Verify:
+The result is checked before it is accepted, so a refusal is an ordinary
+correction retry with nothing posted:
 
-- review comment exists
-- it belongs to the expected PR
-- it carries the `# AI Code Review — Round N` heading for this round
-- review round marker is correct
-- reviewed HEAD is correct
-- it is the only comment carrying this round's marker at this HEAD against
-  the bound base from the bound merge base, and it is the comment the
-  result names; a second one rejects the round (the uniqueness rule is
-  enforced on read-back, never trusted to the prompt), and so does a result
-  naming a comment whose marker is for another base or merge base, or
-  names none: the entry would not have handed it over, and the binding the
-  round writes (`reviewed_base_ref`, `reviewed_merge_base_sha`) must be the
-  base and merge base its comment claims
-- the marker's `needs_fix_round` equals the result's, and its
-  `finding_ids`, when present, are exactly the ids of the result's findings
-  as a set (order is presentation); the marker is the durable copy of the
-  round that a later entry, the fixer and a human read, so it may not tell
-  a different story from the findings the controller persists
+- `round` and `reviewed_head_sha` are cross-checks, never targets: they
+  must be the round and the HEAD the controller bound (D8.1). A reviewer
+  reporting another round or HEAD is asked to correct it, never followed.
+- the prose sections (`spec`, `standards`, `assessment`, `observations`,
+  `verification`, `summary`) and every finding's title, location (as the
+  code span the comment renders it in) and required resolution pass the
+  published-content policy ("Published content" below)
+- the controller renders the comment from the result: the heading, the
+  binding line (the HEAD, base and merge base it bound, never the
+  reviewer's), the findings, the prose sections under fixed headings, the
+  needs-fix line and the marker, whose `needs_fix_round` and `finding_ids`
+  come from the same result, so the comment cannot tell a different story
+  from the findings the controller persists. The whole body passes the
+  credential rule (D8.3) and fits GitHub's comment limit of 65,536
+  characters (D8.6); the per-finding bounds are unchanged.
 
-The verified comment's URL is the REVIEW -> FIX handoff artifact (#80). The
-round persists GitHub's URL of the comment the controller located
-(`last_review_comment_url`, also recorded in `review_history`), never the
-reviewer's spelling of it: the result's `review_comment_url` is matched to the
-located comment by identity (owner and repository case-folded, number,
-comment id), so a case-variant spelling of the PR, or the `issues/<n>` path
-GitHub also serves a PR comment under, is accepted as naming the comment
-(a comment on another number or repository is not), and the URL the FIX
-prompt renders as `REVIEW_COMMENT_URL` is the one GitHub reported, in its
-`pull/<n>` form. The FIX prompt names that comment as the authoritative review for
-the round at the reviewed HEAD and tells the fixer not to substitute another
-PR comment or round; a human comment, an earlier or stale round, or an
-unrelated bot comment on the same PR is never the handoff because only the
-comment carrying the round's marker at the bound HEAD, base and merge base
-can be verified. A round that went stale (HEAD, base or merge base moved while
-the reviewer worked) records its comment URL in its history entry and in
+Then, in order, all from one persisted plan:
+
+1. The precondition read: the PR's comments are read again. A comment
+   carrying the round's marker at the bound revision that appeared while
+   the reviewer ran blocks with nothing planned or posted, as at entry.
+   Otherwise the `review_comment` record (the rendered body) is saved with
+   the completion context (the round, its verdict and its findings) in
+   one save.
+2. The record is driven: reconciled before anything is posted, then
+   posted at most within its attempt bound. The read-back is one complete
+   comment listing in which exactly one top-level comment carries the
+   round's marker, with exactly the planned body. A matching comment with
+   another body, or two, is a conflict that blocks naming them; the
+   controller never edits, duplicates or chooses between them.
+3. The post-review re-read: a closed or merged PR refuses the round
+   (`VerificationError`, nothing consumed); a HEAD, base or merge base that
+   moved during the review makes it stale; otherwise its verdict decides.
+   The round is judged from the persisted verdict and findings, never from
+   the comment's text, against the revision its marker binds. The save that
+   consumes the round drops the plan.
+
+A crash anywhere in this sequence resumes from the plan: the comment is
+posted at most once, and the round completes without relaunching the
+reviewer. `unblock` into a phase whose plan is saved routes back to
+`REVIEW`, which completes it the same way.
+
+The posted comment's URL is the REVIEW -> FIX handoff artifact (#80). The
+round persists the URL GitHub reported on the read-back, in its `pull/<n>`
+form (`last_review_comment_url`, also recorded in `review_history`), and
+the FIX prompt renders it as `REVIEW_COMMENT_URL`. The FIX prompt names
+that comment as the authoritative review for the round at the reviewed HEAD
+and tells the fixer not to substitute another PR comment or round; a human
+comment, an earlier or stale round, or an unrelated bot comment on the same
+PR is never the handoff because only the comment carrying the round's
+marker at the bound HEAD, base and merge base can be verified. A round that
+went stale (HEAD, base or merge base moved while the reviewer worked)
+records its comment URL in its history entry and in
 `last_review_comment_url` for the next REVIEW prompt's
-`PREVIOUS_REVIEW_COMMENT_URL`, but launches no fixer, so a stale comment never
-becomes a FIX handoff.
+`PREVIOUS_REVIEW_COMMENT_URL`, but launches no fixer, so a stale comment
+never becomes a FIX handoff.
 
 The reviewer is a full coding agent launched in the issue's worktree, and
-the REVIEW prompt makes the phase read-only: the one review comment is its
-only write; it commits, pushes and edits nothing, and a defect it finds is a
-finding for the fixer, never its own fix (#19). That is a prompt rule; what
-the controller enforces is the binding above. A reviewer that pushes anyway
-moves the HEAD its own round was bound to, and the controller treats that
-exactly as any other push during the round: the round is stale, consumed
-against the cap, its findings carried, and the next round reviews the
-reviewer's commit. It is not made a hard error because the post-review
-read cannot tell the reviewer's push from an operator's or a fixer's, and
-blocking on every push during a round would turn ordinary concurrent work
-on the PR into a human decision.
+the REVIEW prompt makes the phase read-only: it posts, commits, pushes and
+edits nothing, and a defect it finds is a finding for the fixer, never its
+own fix (#19). That is a prompt rule; what the controller enforces is the
+binding above, and that a round comment it did not journal stops the round.
+A reviewer that pushes anyway moves the HEAD its own round was bound to,
+and the controller treats that exactly as any other push during the round:
+the round is stale, consumed against the cap, its findings carried, and the
+next round reviews the reviewer's commit. It is not made a hard error
+because the post-review read cannot tell the reviewer's push from an
+operator's or a fixer's, and blocking on every push during a round would
+turn ordinary concurrent work on the PR into a human decision.
 
 ### Before FIX
 
@@ -539,8 +574,9 @@ ADR 0004 (`docs/adr/0004-authority-boundary-and-typed-external-effects.md`)
 moves every externally visible write to the controller. #160 adds the
 mechanism and wires its first consumer, the `UPDATE_EPIC` progress comment;
 #161 wires `ANALYZE_EXECUTE` (the push of the agent's commit and the
-implementation PR, opened or adopted); the other phases keep their current
-publication until #162 to #164 move them.
+implementation PR, opened or adopted); #162 wires `REVIEW` (the round's
+review comment); the other phases keep their current publication until
+#163 and #164 move them.
 
 - **Typed writes, never retried blind.** `GitHubClient` has one method per
   write the effects need (`create_issue_comment`, `create_pr_comment`,
@@ -606,9 +642,11 @@ publication until #162 to #164 move them.
 ### Published content
 
 Agent text the controller publishes under the operator's identity
-(`progress`, `roadmap_section`, `pr_title`, `pr_body`, and the payloads of
-later kinds) is refused by `result_parser.published_text_problem`, and the
-agent is asked to correct it, when it contains:
+(`progress`, `roadmap_section`, `pr_title`, `pr_body`, a review's prose
+sections and its findings' titles, locations and required resolutions, and
+the payloads of later kinds) is refused by
+`result_parser.published_text_problem`, and the agent is asked to correct
+it, when it contains:
 
 - an HTML comment opening a controller marker (`<!-- ai-` or
   `<!-- autoforge-`, any spacing or case);

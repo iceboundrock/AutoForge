@@ -22,13 +22,24 @@ read it before adding tests for a listed area.
 ## Fixtures and fakes (`tests/conftest.py`)
 
 - `ScriptedProvider` (`src/autoforge/providers.py`) handlers stand in for
-  every agent call and mutate `FakeGitHub` the way the real agent would
-  (create PR, post comment, push fix); `ExplodingGitHub` fails a test if
-  LOCAL mode reaches for GitHub.
+  every agent call and do what the real agent would (commit, push a fix,
+  answer with a result); `ExplodingGitHub` fails a test if LOCAL mode
+  reaches for GitHub.
 - `engine`, `fake_github`, `tmp_state_dir`, `repo` and `make_engine` /
   `make_local_engine` build a controller against those fakes; `block(...)`
-  and `review_comment_body(...)` build well-formed `CONTROL_RESULT` blocks and
-  review comments. Reuse these rather than hand-rolling fakes.
+  builds a well-formed `CONTROL_RESULT` block. The controller posts the
+  review comment (#162): a reviewer returns `review_result(...)` (the full
+  REMOTE `REVIEW` payload, prose included) and posts nothing, and
+  `controller_review_comment(eng, round)` returns the one comment carrying
+  that round's marker. `review_comment_body(...)` builds a comment someone
+  else posted: an earlier round's evidence for a test that starts past
+  `REVIEW`, or an unjournaled comment that blocks the round. Reuse these
+  rather than hand-rolling fakes.
+- `REVIEW` fetches the bound HEAD and merge base before launching the
+  reviewer. An engine without an origin records that fetch in the
+  `offline_fetches` fixture and fetches nothing; with `origin=True` it
+  fetches from the origin, so a `FIX` there pushes a real commit
+  (`push_fix`) rather than setting a fake HEAD.
 - The controller pushes the implementation commit itself (#161), so a
   REMOTE test that reaches `ANALYZE_EXECUTE`'s publication builds its engine
   with `make_engine(..., origin=True)`: an `Origin` is a seeded bare

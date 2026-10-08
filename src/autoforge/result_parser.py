@@ -41,7 +41,13 @@ the rule, never the text. An ANALYZE_EXECUTE result carries the PR title
 and body the controller publishes (``pr_title``, ``pr_body``), under that
 policy and bounded (``MAX_PR_TITLE_CHARS``, ``MAX_PR_BODY_CHARS``), plus
 the issue URL and the candidate SHA as cross-checks; it names no PR, branch
-or push target (#161). An UPDATE_EPIC result is validated against the
+or push target (#161). A REMOTE REVIEW result carries the prose sections of
+the review comment the controller renders and posts (``spec``,
+``standards``, ``assessment``, ``observations``, ``verification``,
+``summary``), each under that policy and bounded
+(``MAX_REVIEW_SECTION_CHARS``, ``MAX_REVIEW_SUMMARY_CHARS``), and so is
+every finding field the comment shows; ``round`` and ``reviewed_head_sha``
+are cross-checks, and it names no comment (#162). An UPDATE_EPIC result is validated against the
 schema of the request that launched the agent (:class:`UpdateEpicRequest`,
 D4.7): a re-request after publication carries only what it asks for.
 """
@@ -163,6 +169,25 @@ MAX_PROGRESS_CHARS = 16384
 # never clipped, like every other published field.
 MAX_PR_TITLE_CHARS = 256
 MAX_PR_BODY_CHARS = 60000
+# Bounds on the prose sections of a REVIEW result (#162). The controller
+# renders the round's review comment from the result: its heading, binding
+# line, findings, needs-fix line and marker are its own, and each prose
+# section is the reviewer's text under its fixed heading. Rejected, never
+# clipped, like every other published field; the rendered comment as a
+# whole is checked against GitHub's comment limit too (ADR 0004 D8.6),
+# because the findings alone may already exceed it.
+MAX_REVIEW_SECTION_CHARS = 6000
+MAX_REVIEW_SUMMARY_CHARS = 2000
+# The prose sections, in the order the comment renders them, each mapped to
+# its bound.
+REVIEW_PROSE_SECTIONS: tuple[tuple[str, int], ...] = (
+    ("spec", MAX_REVIEW_SECTION_CHARS),
+    ("standards", MAX_REVIEW_SECTION_CHARS),
+    ("assessment", MAX_REVIEW_SECTION_CHARS),
+    ("observations", MAX_REVIEW_SECTION_CHARS),
+    ("verification", MAX_REVIEW_SECTION_CHARS),
+    ("summary", MAX_REVIEW_SUMMARY_CHARS),
+)
 # Bounds on the ``tests`` list: names of what the agent ran, recorded with
 # the result and never published.
 MAX_TESTS_REPORTED = 50
@@ -622,6 +647,22 @@ def published_payload_problem(subject: str, payload: str) -> str | None:
     )
 
 
+def markdown_code_span(text: str) -> str:
+    """``text`` as one Markdown code span, whatever backticks it holds.
+
+    The delimiter is one backtick longer than the longest run inside, and a
+    space pads a value that starts or ends with a backtick, or that starts
+    and ends with a space (CommonMark strips one such pair), so the span
+    shows ``text`` exactly. One-line text only; an empty value is ``""``.
+    """
+    if not text:
+        return ""
+    longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
+    fence = "`" * (longest + 1)
+    pad = " " if text[0] == "`" or text[-1] == "`" or (text[0] == " " and text[-1] == " ") else ""
+    return f"{fence}{pad}{text}{pad}{fence}"
+
+
 def _names_issue(m: re.Match[str], repository: str, issue_number: int) -> bool:
     """Whether closing reference ``m`` names issue ``issue_number`` of ``repository``.
 
@@ -960,11 +1001,23 @@ class Finding:
 
 @dataclass
 class ReviewResult:
+    """What a REMOTE reviewer reports; the controller publishes it (#162).
+
+    ``round`` and ``reviewed_head_sha`` are cross-checks against the round
+    and the HEAD the controller bound; neither is a target, and the result
+    names no comment. ``needs_fix_round`` and ``findings`` are the verdict.
+    ``sections`` holds the prose of :data:`REVIEW_PROSE_SECTIONS`, in that
+    order. Every field the controller renders into the review comment (the
+    prose, and each finding's ``title``, ``location`` and
+    ``required_resolution``) is held to the published-content policy; the
+    findings' shape and bounds are LOCAL's too, unchanged.
+    """
+
     round: int
     reviewed_head_sha: str
-    review_comment_url: str
     needs_fix_round: bool
     findings: list[Finding] = field(default_factory=list)
+    sections: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_payload(cls, p: dict) -> ReviewResult:
@@ -974,13 +1027,50 @@ class ReviewResult:
             raise ControlResultValidationError("'round' must be an int >= 1")
         needs_fix = _req_bool(p, "needs_fix_round", ph)
         findings = _parse_findings(p, rnd, needs_fix)
+        for finding in findings:
+            check_published_finding(finding)
+        sections = {
+            key: _review_published(_review_section(p, key, limit), key)
+            for key, limit in REVIEW_PROSE_SECTIONS
+        }
         return cls(
             round=rnd,
             reviewed_head_sha=_req_sha(p, "reviewed_head_sha", ph),
-            review_comment_url=_req_url(p, "review_comment_url", ph, "comment"),
             needs_fix_round=needs_fix,
             findings=findings,
+            sections=sections,
         )
+
+
+def check_published_finding(finding: Finding) -> None:
+    """Refuse ``finding`` unless the round's review comment may show it (#162).
+
+    Each field is judged as the comment renders it: the location inside a
+    code span, the others as Markdown text. A persisted REVIEW plan's
+    findings are held to the same rule when they are loaded (ADR 0004 D4.6).
+    """
+    _review_published(finding.title, f"{finding.id}.title")
+    _review_published(markdown_code_span(finding.location), f"{finding.id}.location")
+    if credential_classes(finding.location):
+        # The span's backticks must not hide a shape the bare value has: the
+        # findings are persisted as reported, in plain state.
+        _review_published(finding.location, f"{finding.id}.location")
+    _review_published(finding.required_resolution, f"{finding.id}.required_resolution")
+
+
+def _review_section(p: dict, key: str, limit: int) -> str:
+    """REVIEW prose section ``key``: non-blank, bounded, multi-line printable text."""
+    ph = "REVIEW"
+    text = _req_str(p, key, ph)
+    return _multi_line(_bounded(text, ph, "result", key, limit), ph, "result", key)
+
+
+def _review_published(text: str, subject: str) -> str:
+    """Refuse REVIEW text ``subject`` under the published-content policy."""
+    problem = published_text_problem(subject, text)
+    if problem is not None:
+        raise ControlResultValidationError(f"REVIEW: field {problem}")
+    return text
 
 
 @dataclass

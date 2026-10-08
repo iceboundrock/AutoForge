@@ -48,7 +48,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Callable, Hashable, Iterable
+from collections.abc import Callable, Hashable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import Generic, Protocol, TypeVar
 
@@ -387,8 +387,7 @@ def marker_json(value: object) -> str:
     two characters occur only as themselves, and only inside a string
     literal, since neither is JSON structure.
 
-    This is the one JSON encoder for marker text: the renderers use it,
-    and so does the prompt variable a reviewer copies into its marker.
+    This is the one JSON encoder for marker text: every renderer uses it.
     """
     return json.dumps(value, sort_keys=True).replace("<", "\\u003c").replace(">", "\\u003e")
 
@@ -410,6 +409,27 @@ def render_progress_marker(issue_url: str, pr_url: str) -> str:
     """The exact ``ai-epic-progress`` marker of one UPDATE_EPIC entry (issue, PR)."""
     return PROGRESS.render(
         {"issue": parse_issue_url(issue_url).canonical, "pr": parse_pr_url(pr_url).canonical}
+    )
+
+
+def render_review_marker(
+    round_: int,
+    reviewed_head_sha: str,
+    reviewed_base_ref: str,
+    reviewed_merge_base_sha: str,
+    needs_fix_round: bool,
+    finding_ids: Sequence[str],
+) -> str:
+    """The exact ``ai-review-result`` marker of one round's review comment."""
+    return REVIEW.render(
+        {
+            "finding_ids": list(finding_ids),
+            "needs_fix_round": needs_fix_round,
+            "reviewed_base_ref": reviewed_base_ref,
+            "reviewed_head_sha": reviewed_head_sha.lower(),
+            "reviewed_merge_base_sha": reviewed_merge_base_sha.lower(),
+            "round": round_,
+        }
     )
 
 
@@ -585,5 +605,6 @@ __all__ = [
     "render_follow_up_marker",
     "render_implementation_marker",
     "render_progress_marker",
+    "render_review_marker",
     "scan",
 ]

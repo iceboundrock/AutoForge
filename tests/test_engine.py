@@ -12,8 +12,9 @@ from pathlib import Path
 import pytest
 
 from autoforge import __prompt_version__
-from autoforge.claims import render_implementation_marker, render_progress_marker
+from autoforge.claims import REVIEW, render_implementation_marker, render_progress_marker, scan
 from autoforge.config import default_config
+from autoforge.effects import review_comment_body as render_review_comment
 from autoforge.errors import (
     ConfigurationError,
     ControlResultValidationError,
@@ -22,6 +23,7 @@ from autoforge.errors import (
     GitHubError,
     GitHubNotFoundError,
     GitHubUnavailableError,
+    GitTransportError,
     StateError,
     StateTransitionError,
     VerificationError,
@@ -51,6 +53,7 @@ from autoforge.result_parser import (
     MAX_FINDINGS_PER_REVIEW,
     MAX_FIX_RATIONALE_CHARS,
     MAX_URL_CHARS,
+    ReviewResult,
 )
 from autoforge.state import load_state
 from autoforge.transitions import Phase
@@ -78,6 +81,7 @@ from tests.conftest import (
     comment_url,
     commit_in,
     connect_origin,
+    controller_review_comment,
     follow_up_issue_body,
     git_out,
     git_repo,
@@ -86,7 +90,9 @@ from tests.conftest import (
     make_engine,
     post_progress_comment,
     progress_comment_body,
+    push_fix,
     review_comment_body,
+    review_result,
     scripted,
 )
 
@@ -103,16 +109,9 @@ def _finding(rnd: int, n: int = 1, cls: str = "nit") -> dict:
     }
 
 
-def review_payload(rnd: int, sha: str, findings: list[dict], cid: int = 100) -> dict:
-    return {
-        "phase": "REVIEW",
-        "status": "success",
-        "round": rnd,
-        "reviewed_head_sha": sha,
-        "review_comment_url": comment_url(PR, cid),
-        "needs_fix_round": bool(findings),
-        "findings": findings,
-    }
+def review_payload(rnd: int, sha: str, findings: list[dict]) -> dict:
+    """A REMOTE REVIEW result (#162): the controller renders and posts the comment."""
+    return review_result(rnd, sha, findings)
 
 
 def _in_review(tmp_state_dir, gh: FakeGitHub, script, round_done: int = 0, head: str = SHA_A):
@@ -1246,7 +1245,6 @@ def test_recovery_ambiguous_blocks(tmp_state_dir, fake_github):
 def test_review_routing_by_round(tmp_state_dir, round_done, model, effort):
     gh = FakeGitHub()
     rnd = round_done + 1
-    gh.add_comment(PR, 100, review_comment_body(rnd, SHA_A, False))
     eng = _in_review(tmp_state_dir, gh, [block(review_payload(rnd, SHA_A, []))], round_done)
     out = eng.step()
     assert out.next_phase == "READY_FOR_MERGE"
@@ -1259,13 +1257,12 @@ def test_review_routing_by_round(tmp_state_dir, round_done, model, effort):
 
 def test_review_finding_goes_to_fix(tmp_state_dir):
     gh = FakeGitHub()
-    gh.add_comment(PR, 100, review_comment_body(1, SHA_A, True, ["R1-F1"]))
     eng = _in_review(tmp_state_dir, gh, [block(review_payload(1, SHA_A, [_finding(1)]))])
     out = eng.step()
     assert out.next_phase == "FIX"
     s = load_state(eng.paths.state_file)
     assert s.open_findings[0]["id"] == "R1-F1" and s.last_review_needs_fix is True
-    assert s.last_review_comment_url == comment_url(PR, 100)
+    assert s.last_review_comment_url == controller_review_comment(eng, 1).url
 
 
 def test_review_invariant_mismatch_rejected(tmp_state_dir):
@@ -1279,230 +1276,43 @@ def test_review_invariant_mismatch_rejected(tmp_state_dir):
     assert eng.state.review_round == 0  # failed invocation does not consume a round
 
 
-def test_review_comment_missing_rejected(tmp_state_dir):
-    gh = FakeGitHub()
-    eng = _in_review(tmp_state_dir, gh, [block(review_payload(1, SHA_A, []))])
-    with pytest.raises(VerificationError, match="no comment carries the ai-review-result marker"):
-        eng.step()
-    assert eng.state.review_round == 0 and eng.state.phase == Phase.REVIEW
-
-
-def test_review_comment_wrong_round_marker_rejected(tmp_state_dir):
+def test_review_entry_ignores_a_comment_for_another_round(tmp_state_dir):
+    """The marker binds a comment to its round. A round-2 comment at the bound
+    HEAD (a human's, or one left by another run) is not round 1's: the entry
+    launches the reviewer, and the controller posts round 1's own comment."""
     gh = FakeGitHub()
     gh.add_comment(PR, 100, review_comment_body(2, SHA_A, False))
     eng = _in_review(tmp_state_dir, gh, [block(review_payload(1, SHA_A, []))])
-    with pytest.raises(VerificationError, match="no comment carries .* for round 1"):
-        eng.step()
-
-
-@pytest.mark.parametrize(
-    "marked, reported",
-    [
-        pytest.param([], ["R1-F1"], id="marker-empty-result-has-finding"),
-        pytest.param(["R1-F2"], ["R1-F1"], id="different-id"),
-        pytest.param(["R1-F1"], [], id="marker-has-finding-result-empty"),
-        pytest.param(["R1-F1"], ["R1-F1", "R1-F2"], id="marker-misses-one"),
-    ],
-)
-def test_review_comment_finding_ids_disagreeing_with_the_result_are_rejected(
-    tmp_state_dir, marked, reported
-):
-    """The marker's finding ids are the durable copy of the round's findings:
-    a later entry, a fixer, or a human reads them from the comment while the
-    controller persists the CONTROL_RESULT's. The read-back holds the two to
-    each other, as it already does for the HEAD and the verdict, instead of
-    letting the comment and the state tell different stories."""
-    gh = FakeGitHub()
-    findings = [_finding(1, int(fid.split("-F")[1])) for fid in reported]
-
-    def reviews(req):
-        gh.add_comment(PR, 100, review_comment_body(1, SHA_A, bool(reported), marked))
-        return block(review_payload(1, SHA_A, findings))
-
-    eng = _in_review(tmp_state_dir, gh, reviews)
-    with pytest.raises(VerificationError, match="finding_ids .* disagree with the CONTROL_RESULT"):
-        eng.step()
-    assert eng.state.phase == Phase.REVIEW and eng.state.review_round == 0
-
-
-@pytest.mark.parametrize(
-    "marker_ids",
-    [
-        pytest.param(["R1-F2", "R1-F1"], id="reordered"),
-        pytest.param(None, id="omitted"),
-    ],
-)
-def test_review_comment_finding_ids_are_compared_as_a_set_and_may_be_omitted(
-    tmp_state_dir, marker_ids
-):
-    """Order is presentation, and the key is optional by the documented schema."""
-    gh = FakeGitHub()
-    findings = [_finding(1, 1), _finding(1, 2)]
-
-    def reviews(req):
-        body = review_comment_body(1, SHA_A, True, marker_ids)
-        if marker_ids is None:
-            body = body.replace(', "finding_ids": []', "")
-            assert "finding_ids" not in body
-        gh.add_comment(PR, 100, body)
-        return block(review_payload(1, SHA_A, findings))
-
-    eng = _in_review(tmp_state_dir, gh, reviews)
-    assert eng.step().next_phase == "FIX"
-    assert eng.state.review_round == 1
-
-
-def test_review_comment_wrong_sha_marker_rejected(tmp_state_dir):
-    gh = FakeGitHub()
-    gh.add_comment(PR, 100, review_comment_body(1, SHA_B, False))
-    eng = _in_review(tmp_state_dir, gh, [block(review_payload(1, SHA_A, []))])
-    with pytest.raises(VerificationError, match=f"no comment carries .* at HEAD {SHA_A[:12]}"):
-        eng.step()
-
-
-def test_review_comment_on_other_pr_rejected(tmp_state_dir):
-    gh = FakeGitHub()
-    payload = review_payload(1, SHA_A, [])
-    payload["review_comment_url"] = comment_url("https://github.com/owner/repo/pull/7", 100)
-    eng = _in_review(tmp_state_dir, gh, [block(payload)])
-    with pytest.raises(VerificationError, match="does not belong"):
-        eng.step()
-
-
-def test_review_comment_on_a_case_variant_of_the_pr_belongs_to_it(tmp_state_dir):
-    """Issue #37 N1: the comment's parent PR is compared by identity, not URL text.
-
-    #80: the spelling is accepted as naming the comment, but what the round
-    persists is GitHub's URL of the comment the controller located."""
-    gh = FakeGitHub()
-    gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
-    payload = review_payload(1, SHA_A, [])
-    payload["review_comment_url"] = comment_url("https://github.com/Owner/REPO/pull/42", 100)
-    eng = _in_review(tmp_state_dir, gh, [block(payload)])
     assert eng.step().next_phase == "READY_FOR_MERGE"
-    s = load_state(eng.paths.state_file)
-    assert s.last_review_comment_url == comment_url(PR, 100)
-    assert s.review_history[-1]["review_comment_url"] == comment_url(PR, 100)
+    assert len(eng.provider.calls) == 1
+    posted = controller_review_comment(eng, 1)
+    assert posted.url != comment_url(PR, 100)
+    assert load_state(eng.paths.state_file).last_review_comment_url == posted.url
 
 
-@pytest.mark.parametrize(
-    "spelling",
-    [
-        comment_url("https://github.com/Owner/REPO/pull/42", 100),
-        comment_url("https://github.com/OWNER/Repo/pull/42", 100),
-        comment_url("https://github.com/owner/REPO/pull/42", 100),
-    ],
-)
-def test_review_to_fix_handoff_is_githubs_url_of_the_verified_comment(tmp_state_dir, spelling):
+def test_review_to_fix_handoff_is_githubs_url_of_the_posted_comment(tmp_state_dir):
     """#80: the REVIEW -> FIX handoff is derived from the GitHub object the
-    controller verified, never from the reviewer's string. A reviewer naming
-    the verified comment by a case-variant spelling of the PR is accepted
-    (GitHub treats owner and repository case-insensitively), and the URL
+    controller verified, never from a string an agent wrote. Since #162 that
+    object is the comment the controller posted and read back: the URL
     persisted for the fixer and rendered into the FIX prompt is the one
-    GitHub reported for that comment."""
+    GitHub reported for it."""
     gh = FakeGitHub()
-    gh.add_comment(PR, 100, review_comment_body(1, SHA_A, True, ["R1-F1"]))
-    payload = review_payload(1, SHA_A, [_finding(1)])
-    payload["review_comment_url"] = spelling
 
     def agent(req):
         if req.phase == "REVIEW":
-            return block(payload)
+            return block(review_payload(1, SHA_A, [_finding(1)]))
         gh.set_head(SHA_B)
         return block(fix_payload(SHA_A, SHA_B, [{"finding_id": "R1-F1", "resolution": "fixed"}]))
 
     eng = _in_review(tmp_state_dir, gh, agent)
     assert eng.step().next_phase == "FIX"
+    posted = controller_review_comment(eng, 1)
     s = load_state(eng.paths.state_file)
-    assert s.last_review_comment_url == comment_url(PR, 100)
-    assert s.last_review_comment_url != spelling
-    assert s.review_history[-1]["review_comment_url"] == comment_url(PR, 100)
+    assert s.last_review_comment_url == posted.url
+    assert s.review_history[-1]["review_comment_url"] == posted.url
     assert eng.step().next_phase == "REVIEW"
     prompt = eng.provider.calls[1].prompt
-    assert f"Verified review comment: {comment_url(PR, 100)}" in prompt
-    assert spelling not in prompt
-
-
-@pytest.mark.parametrize(
-    "spelling",
-    [
-        comment_url("https://github.com/owner/repo/issues/42", 100),
-        comment_url("https://github.com/Owner/REPO/issues/42", 100),
-    ],
-)
-def test_review_comment_named_by_the_issues_form_of_the_pr_is_the_verified_comment(
-    tmp_state_dir, spelling
-):
-    """#80: GitHub serves a PR comment under both ``pull/<n>#issuecomment-<id>``
-    and ``issues/<n>#issuecomment-<id>`` (a PR is an issue to the comments
-    API). A reviewer naming the verified comment by the ``issues/`` path names
-    this PR's comment: it is matched to the comment carrying the round's marker
-    at the bound HEAD and base by repository, number and comment id, and the
-    URL persisted and handed to the fixer is GitHub's ``pull/`` URL of that
-    comment, never the reviewer's spelling."""
-    gh = FakeGitHub()
-    gh.add_comment(PR, 100, review_comment_body(1, SHA_A, True, ["R1-F1"]))
-    payload = review_payload(1, SHA_A, [_finding(1)])
-    payload["review_comment_url"] = spelling
-
-    def agent(req):
-        if req.phase == "REVIEW":
-            return block(payload)
-        gh.set_head(SHA_B)
-        return block(fix_payload(SHA_A, SHA_B, [{"finding_id": "R1-F1", "resolution": "fixed"}]))
-
-    eng = _in_review(tmp_state_dir, gh, agent)
-    assert eng.step().next_phase == "FIX"
-    s = load_state(eng.paths.state_file)
-    assert s.last_review_comment_url == comment_url(PR, 100)
-    assert "/issues/" not in s.last_review_comment_url
-    assert s.review_history[-1]["review_comment_url"] == comment_url(PR, 100)
-    assert eng.step().next_phase == "REVIEW"
-    prompt = eng.provider.calls[1].prompt
-    assert f"Verified review comment: {comment_url(PR, 100)}" in prompt
-    assert spelling not in prompt
-
-
-@pytest.mark.parametrize(
-    "spelling",
-    [
-        comment_url("https://github.com/owner/repo/issues/43", 100),
-        comment_url("https://github.com/other/repo/issues/42", 100),
-        comment_url("https://github.com/owner/repo/pull/43", 100),
-    ],
-)
-def test_review_comment_on_another_number_or_repository_is_rejected(tmp_state_dir, spelling):
-    """#80: accepting the ``issues/`` path does not loosen the parent check.
-    The comment named must be on this PR's number in this repository under
-    either path; another number (an issue or PR) or another repository is
-    refused before any GitHub read, and the round is not consumed."""
-    gh = FakeGitHub()
-    gh.add_comment(PR, 100, review_comment_body(1, SHA_A, True, ["R1-F1"]))
-    payload = review_payload(1, SHA_A, [_finding(1)])
-    payload["review_comment_url"] = spelling
-    eng = _in_review(tmp_state_dir, gh, [block(payload)])
-    with pytest.raises(VerificationError, match="does not belong to PR"):
-        eng.step()
-    s = load_state(eng.paths.state_file)
-    assert s.phase == Phase.REVIEW and s.review_round == 0
-    assert s.last_review_comment_url == "" and s.open_findings == []
-
-
-def test_issues_form_of_a_comment_that_is_not_the_rounds_review_is_rejected(tmp_state_dir):
-    """#80: the ``issues/`` spelling is matched against the comment the
-    controller located, not trusted: naming a human comment on the same PR by
-    that path is refused exactly as its ``pull/`` spelling would be."""
-    gh = FakeGitHub()
-    gh.add_comment(PR, 90, "Human: please also look at the docs.")
-    gh.add_comment(PR, 100, review_comment_body(1, SHA_A, True, ["R1-F1"]))
-    payload = review_payload(1, SHA_A, [_finding(1)])
-    payload["review_comment_url"] = comment_url("https://github.com/owner/repo/issues/42", 90)
-    eng = _in_review(tmp_state_dir, gh, [block(payload)])
-    with pytest.raises(VerificationError, match="is not the comment carrying the round 1 marker"):
-        eng.step()
-    s = load_state(eng.paths.state_file)
-    assert s.phase == Phase.REVIEW and s.review_round == 0
-    assert s.last_review_comment_url == ""
+    assert f"Verified review comment: {posted.url}" in prompt
 
 
 def test_fix_handoff_survives_a_restart_between_review_and_fix(tmp_state_dir):
@@ -1511,12 +1321,12 @@ def test_fix_handoff_survives_a_restart_between_review_and_fix(tmp_state_dir):
     hands the fixer the same comment it would have without the restart, read
     from ``state.json`` rather than re-chosen from the PR conversation."""
     gh = FakeGitHub()
-    gh.add_comment(PR, 100, review_comment_body(1, SHA_A, True, ["R1-F1"]))
     eng = _in_review(tmp_state_dir, gh, [block(review_payload(1, SHA_A, [_finding(1)]))])
     assert eng.step().next_phase == "FIX"
     persisted = load_state(eng.paths.state_file)
     assert persisted.phase == Phase.FIX
-    assert persisted.last_review_comment_url == comment_url(PR, 100)
+    posted = controller_review_comment(eng, 1).url
+    assert persisted.last_review_comment_url == posted
     del eng
 
     def fixes(req):
@@ -1529,27 +1339,26 @@ def test_fix_handoff_survives_a_restart_between_review_and_fix(tmp_state_dir):
     assert eng2.state.phase == Phase.FIX
     assert eng2.step().next_phase == "REVIEW"
     prompt = eng2.provider.calls[0].prompt
-    assert f"Verified review comment: {comment_url(PR, 100)}" in prompt
-    assert f"Read the verified review comment ({comment_url(PR, 100)})" in prompt
+    assert f"Verified review comment: {posted}" in prompt
+    assert f"Read the verified review comment ({posted})" in prompt
     assert "R1-F1" in prompt and SHA_A in prompt
 
 
 def test_fix_handoff_in_a_mixed_pr_conversation_is_the_marked_round_comment(tmp_state_dir):
     """#80: the PR conversation holds a human comment, the previous round's
-    (stale) review, another human comment, this round's review and an
-    unrelated bot comment. Only the comment carrying round 2's marker at the
-    bound HEAD is verified and handed to the fixer; the reviewer naming any
-    other comment on the same PR is rejected."""
+    (stale) review, another human comment and an unrelated bot comment. None
+    of them is round 2's at the bound HEAD, so the entry launches the
+    reviewer, the controller posts round 2's comment, and only that comment
+    is handed to the fixer."""
     gh = FakeGitHub()
     gh.add_comment(PR, 90, "Human: please also look at the docs.")
     gh.add_comment(PR, 100, review_comment_body(1, SHA_A, True, ["R1-F1"]))
     gh.add_comment(PR, 91, "Human: thanks, pushed a fix.")
-    gh.add_comment(PR, 101, review_comment_body(2, SHA_B, True, ["R2-F1"]))
     gh.add_comment(PR, 92, "codecov: coverage 98.2% (+0.1%)")
 
     def agent(req):
         if req.phase == "REVIEW":
-            return block(review_payload(2, SHA_B, [_finding(2)], cid=101))
+            return block(review_payload(2, SHA_B, [_finding(2)]))
         gh.set_head(SHA_C)
         return block(fix_payload(SHA_B, SHA_C, [{"finding_id": "R2-F1", "resolution": "fixed"}]))
 
@@ -1557,51 +1366,48 @@ def test_fix_handoff_in_a_mixed_pr_conversation_is_the_marked_round_comment(tmp_
     eng.state.reviewed_head_sha = SHA_A
     eng.state.last_review_comment_url = comment_url(PR, 100)
     assert eng.step().next_phase == "FIX"
+    posted = controller_review_comment(eng, 2).url
     s = load_state(eng.paths.state_file)
-    assert s.last_review_comment_url == comment_url(PR, 101)
+    assert s.last_review_comment_url == posted
     assert eng.step().next_phase == "REVIEW"
     prompt = eng.provider.calls[1].prompt
-    assert f"Verified review comment: {comment_url(PR, 101)}" in prompt
+    assert f"Verified review comment: {posted}" in prompt
     for other in (90, 100, 91, 92):
         assert comment_url(PR, other) not in prompt
 
-    # The reviewer naming any other comment of the conversation is rejected:
-    # a human comment, the stale round's review, the bot's comment.
-    for other in (90, 100, 92):
-        gh2 = FakeGitHub()
-        for c in gh.comments[PR]:
-            gh2.add_comment(PR, c.id, c.body)
-        eng2 = _in_review(
-            tmp_state_dir.parent / f"other-{other}" / ".autoforge",
-            gh2,
-            [block(review_payload(2, SHA_B, [_finding(2)], cid=other))],
-            round_done=1,
-            head=SHA_B,
-        )
-        with pytest.raises(VerificationError, match="is not the comment carrying the round 2"):
-            eng2.step()
-        assert eng2.state.phase == Phase.REVIEW and eng2.state.review_round == 1
 
-
-def test_review_wrong_reviewed_sha_rejected(tmp_state_dir):
+@pytest.mark.parametrize(
+    "payload, field",
+    [
+        pytest.param(review_payload(1, SHA_B, []), "reviewed_head_sha", id="other-head"),
+        pytest.param(review_payload(3, SHA_A, []), "round", id="other-round"),
+    ],
+)
+def test_review_result_for_another_round_or_head_is_corrected_and_never_posted(
+    tmp_state_dir, payload, field
+):
+    """``round`` and ``reviewed_head_sha`` are cross-checks against the round
+    and the HEAD the controller bound. A mismatch is the reviewer's error,
+    refused before the result is accepted (#162): the reviewer is asked
+    again, and a reviewer that repeats it fails the step with nothing posted
+    and no round consumed."""
     gh = FakeGitHub()
-    gh.add_comment(PR, 100, review_comment_body(1, SHA_B, False))
-    eng = _in_review(tmp_state_dir, gh, [block(review_payload(1, SHA_B, []))])
-    with pytest.raises(VerificationError, match="SHA mismatch"):
+    eng = _in_review(tmp_state_dir, gh, [block(payload), block(payload)])
+    with pytest.raises(
+        ControlResultValidationError, match="did not return a valid CONTROL_RESULT after 2"
+    ):
         eng.step()
-
-
-def test_review_round_mismatch_rejected(tmp_state_dir):
-    gh = FakeGitHub()
-    eng = _in_review(tmp_state_dir, gh, [block(review_payload(3, SHA_A, []))])
-    with pytest.raises(VerificationError, match="round mismatch"):
-        eng.step()
+    assert len(eng.provider.calls) == 2 and eng.provider.calls[1].correction
+    assert f"field '{field}'" in eng.provider.calls[1].prompt
+    assert gh.effect_writes == [] and gh.comments.get(PR, []) == []
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.REVIEW and s.review_round == 0 and s.reviewed_head_sha == ""
+    assert s.last_review_comment_url == "" and s.effect_records == []
 
 
 def test_review_binds_head_fetched_before_review(tmp_state_dir):
     """State says SHA_A but GitHub says SHA_B: the review must target SHA_B."""
     gh = FakeGitHub()
-    gh.add_comment(PR, 100, review_comment_body(1, SHA_B, False))
     eng = _in_review(tmp_state_dir, gh, [block(review_payload(1, SHA_B, []))], head=SHA_A)
     gh.set_head(SHA_B)
     assert eng.step().next_phase == "READY_FOR_MERGE"
@@ -1616,9 +1422,11 @@ def test_review_post_agent_journal_refusal_keeps_the_phase_for_resume(tmp_state_
     no round consumed, the attempt the launch was charged as is persisted,
     the invocation's artifacts are published, the oversized journal is neither
     materialised nor carried forward, and the refusal names the outcome it
-    interrupted and what `resume` will do. A resume in a new process re-enters
-    REVIEW, finds the round-1 comment the dead reviewer posted at this HEAD,
-    and hands it to the reviewer to adopt: the round ends with one comment."""
+    interrupted and what `resume` will do. The refusal comes before the
+    round's comment is planned, so nothing was posted (#162): a resume in a
+    new process re-enters REVIEW, finds no comment for the round, launches
+    the reviewer again, and the round ends with the one comment the
+    controller posts."""
     from autoforge.runlog import MAX_EVENT_JOURNAL_BYTES
 
     gh = FakeGitHub()
@@ -1626,7 +1434,6 @@ def test_review_post_agent_journal_refusal_keeps_the_phase_for_resume(tmp_state_
     journal = Path(eng.paths.logs_dir) / eng.state.run_id / "events.jsonl"
 
     def reviews_then_enlarges_the_journal(req):
-        gh.add_comment(PR, 100, review_comment_body(1, SHA_A, True, ["R1-F1"]))
         journal.parent.mkdir(parents=True, exist_ok=True)
         journal.touch()
         os.truncate(journal, 2 * MAX_EVENT_JOURNAL_BYTES)
@@ -1638,82 +1445,73 @@ def test_review_post_agent_journal_refusal_keeps_the_phase_for_resume(tmp_state_
         match=r"corrupted event journal.*larger than.*interrupted attempt 1 of REVIEW after the "
         r"agent had returned with: a CONTROL_RESULT the controller accepted.*"
         r"a comment, a push, a PR.*may exist.*Repair the log directory, then 'resume'.*"
-        r"re-enters REVIEW and hands a review comment already posted",
+        r"re-enters REVIEW and completes the round from the persisted review comment plan",
     ):
         eng.step()
     s = load_state(eng.paths.state_file)
     assert s.phase == Phase.REVIEW and s.review_round == 0 and s.attempt == 1
     assert s.open_findings == [] and s.last_review_comment_url == ""
+    assert s.effect_records == [] and gh.effect_writes == [] and gh.comments.get(PR, []) == []
     assert journal.stat().st_size == 2 * MAX_EVENT_JOURNAL_BYTES, "not carried forward"
     steps = sorted(p.name for p in journal.parent.iterdir() if p.is_dir())
     assert steps == ["001-review-1"]
     assert (journal.parent / steps[0] / "control-result.json").exists()
-    assert len(gh.comments[PR]) == 1
     eng.close()
 
     # The operator repairs the journal and resumes in a new process.
     os.truncate(journal, 0)
-    eng2 = make_engine(tmp_state_dir, None, github=gh)
+    eng2 = make_engine(tmp_state_dir, [block(review_payload(1, SHA_A, [_finding(1)]))], github=gh)
     eng2.load()
-
-    def adopts_the_existing_comment(req):
-        assert comment_url(PR, 100) in req.prompt, "the existing comment was not handed over"
-        return block(review_payload(1, SHA_A, [_finding(1)]))
-
-    eng2.provider._handler = adopts_the_existing_comment
     assert eng2.step().next_phase == "FIX"
     assert len(eng2.provider.calls) == 1
     s = load_state(eng2.paths.state_file)
     assert s.review_round == 1 and s.attempt == 0
-    assert s.last_review_comment_url == comment_url(PR, 100)
+    assert s.last_review_comment_url == controller_review_comment(eng2, 1).url
     assert [f["id"] for f in s.open_findings] == ["R1-F1"]
     assert len(gh.comments[PR]) == 1, "the round has exactly one comment"
 
 
 # -- REVIEW entry: reconciliation with the PR before the reviewer runs (PR #89 F1) ---------
-def test_review_entry_hands_an_existing_round_comment_to_the_reviewer(tmp_state_dir):
-    """A comment carrying the marker for the upcoming round at the bound HEAD
-    already exists (a reviewer whose result was never recorded). The
-    controller reads the PR first and names it in the prompt; the reviewer
-    adopts it instead of posting a second one."""
+def test_review_entry_blocks_on_a_round_comment_it_did_not_journal(tmp_state_dir):
+    """A comment carrying the marker for the upcoming round at the bound HEAD,
+    base and merge base already exists (a human's, or one a reviewer of the
+    previous contract posted before its result was recorded). The controller
+    posts the round's comment itself (#162) and never adopts or duplicates
+    one it did not journal: the entry blocks naming it, with nobody launched
+    and nothing posted."""
     gh = FakeGitHub()
     gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
-    eng = _in_review(tmp_state_dir, gh, [block(review_payload(1, SHA_A, []))])
-    assert eng.step().next_phase == "READY_FOR_MERGE"
-    prompt = eng.provider.calls[0].prompt
-    assert (
-        "Comment already posted for THIS round at THIS HEAD against THIS base and\n"
-        "  THIS merge base (if any): "
-        f"{comment_url(PR, 100)}" in prompt
-    )
-    assert "THIS HEAD against THIS base and\n  THIS merge base (if any): (none)" not in prompt
-    assert len(gh.comments[PR]) == 1
+    eng = _in_review(tmp_state_dir, gh, ["never"])
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and eng.provider.calls == []
+    s = load_state(eng.paths.state_file)
+    assert "that the controller did not post" in s.block_reason
+    assert comment_url(PR, 100) in s.block_reason
+    assert "never adopts or duplicates one it did not journal (ADR 0004 D9.6)" in s.block_reason
+    assert s.review_round == 0 and s.effect_records == []
+    assert gh.effect_writes == [] and len(gh.comments[PR]) == 1
 
 
 def test_review_entry_ignores_a_comment_for_the_round_at_another_head(tmp_state_dir):
     """The marker binds a comment to (round, HEAD). A round-1 comment at SHA_B
-    when the round is bound to SHA_A is not this round's comment."""
+    when the round is bound to SHA_A is not this round's comment: the
+    reviewer is launched without it, and the controller posts its own."""
     gh = FakeGitHub()
     gh.add_comment(PR, 90, review_comment_body(1, SHA_B, True, ["R1-F1"]))
-
-    def reviews(req):
-        gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
-        return block(review_payload(1, SHA_A, []))
-
-    eng = _in_review(tmp_state_dir, gh, reviews)
+    eng = _in_review(tmp_state_dir, gh, [block(review_payload(1, SHA_A, []))])
     assert eng.step().next_phase == "READY_FOR_MERGE"
-    prompt = eng.provider.calls[0].prompt
-    assert (
-        "Comment already posted for THIS round at THIS HEAD against THIS base and\n"
-        "  THIS merge base (if any): (none)" in prompt
-    )
-    assert comment_url(PR, 90) not in prompt
+    assert comment_url(PR, 90) not in eng.provider.calls[0].prompt
+    assert [w[0] for w in gh.effect_writes] == ["create_pr_comment"]
+    assert len(gh.comments[PR]) == 2
+    posted = gh.comments[PR][-1]
+    assert load_state(eng.paths.state_file).last_review_comment_url == posted.url
+    assert f"Reviewed HEAD: `{SHA_A}`" in posted.body
 
 
 def test_review_entry_blocks_on_two_comments_for_the_round_without_invoking(tmp_state_dir):
     """Two comments claim the same (round, HEAD): the controller cannot know
     which review is the round's and never chooses. BLOCKED, nobody launched,
-    and the reason names both so the operator can remove one."""
+    and the reason names both so the operator can remove them."""
     gh = FakeGitHub()
     gh.add_comment(PR, 100, review_comment_body(1, SHA_A, True, ["R1-F1"]))
     gh.add_comment(PR, 101, review_comment_body(1, SHA_A, False))
@@ -1723,33 +1521,33 @@ def test_review_entry_blocks_on_two_comments_for_the_round_without_invoking(tmp_
     reason = load_state(eng.paths.state_file).block_reason
     assert "2 comments carry the ai-review-result marker for round 1" in reason
     assert comment_url(PR, 100) in reason and comment_url(PR, 101) in reason
-    assert "exactly one remains" in reason
+    assert "never chooses between comments it did not post" in reason
+    assert gh.effect_writes == []
 
 
-def test_reviewer_posting_a_second_comment_for_the_round_is_rejected_then_blocked(
+def test_a_round_comment_posted_during_the_review_blocks_before_the_controller_posts(
     tmp_state_dir,
 ):
-    """The reviewer ignores the existing comment and posts another: the round
-    is rejected after the fact (the uniqueness rule is enforced on read-back,
-    not trusted to the prompt), no round is consumed, and the next entry
-    blocks on the two comments instead of launching a third reviewer."""
+    """The reviewer publishes nothing (#162), but one that still holds a
+    credential, or a human, may post a comment carrying the round's marker
+    while it runs. The read of the PR's comments after the result was
+    accepted finds it (the uniqueness rule is enforced by the controller,
+    not trusted to the prompt): the round blocks naming it, nothing is
+    planned or posted, and no round is consumed."""
     gh = FakeGitHub()
-    gh.add_comment(PR, 100, review_comment_body(1, SHA_A, True, ["R1-F1"]))
 
-    def posts_again(req):
+    def posts_its_own(req):
         gh.add_comment(PR, 101, review_comment_body(1, SHA_A, True, ["R1-F1"]))
-        return block(review_payload(1, SHA_A, [_finding(1)], cid=101))
+        return block(review_payload(1, SHA_A, [_finding(1)]))
 
-    eng = _in_review(tmp_state_dir, gh, posts_again)
-    with pytest.raises(
-        VerificationError,
-        match=r"2 comments carry the ai-review-result marker for round 1.*exactly one review",
-    ):
-        eng.step()
-    s = load_state(eng.paths.state_file)
-    assert s.phase == Phase.REVIEW and s.review_round == 0 and s.open_findings == []
+    eng = _in_review(tmp_state_dir, gh, posts_its_own)
     assert eng.step().next_phase == "BLOCKED"
     assert len(eng.provider.calls) == 1
+    s = load_state(eng.paths.state_file)
+    assert s.review_round == 0 and s.open_findings == [] and s.last_review_comment_url == ""
+    assert "that the controller did not post" in s.block_reason
+    assert comment_url(PR, 101) in s.block_reason
+    assert s.effect_records == [] and gh.effect_writes == [] and len(gh.comments[PR]) == 1
 
 
 def _review_body_with_marker(marker_json: str) -> str:
@@ -1838,11 +1636,16 @@ _MALFORMED_MARKERS = [
 
 
 @pytest.mark.parametrize("marker_json", _MALFORMED_MARKERS)
-def test_review_verification_rejects_a_malformed_marker(tmp_state_dir, marker_json):
-    """The reviewer posts a comment whose marker is not the documented shape
-    (`true == 1` and `1.0 == 1` in Python must not make it round 1). The
-    read-back meets a marker it cannot read: the round's comment set is
-    inconclusive, the result is rejected, nothing is consumed."""
+def test_a_malformed_marker_posted_during_the_review_blocks_before_the_controller_posts(
+    tmp_state_dir, marker_json
+):
+    """A comment whose review marker is not the documented shape (`true == 1`
+    and `1.0 == 1` in Python must not make it round 1) appears on the PR
+    while the reviewer runs (the reviewer publishes nothing since #162, but
+    one holding a credential, or a human, may). The read of the PR's comments
+    before the controller posts meets a marker it cannot read: "no comment
+    claims this round" is not provable, so the round blocks naming the
+    comment, nothing is planned or posted, and nothing is consumed."""
     gh = FakeGitHub()
 
     def reviews(req):
@@ -1850,9 +1653,12 @@ def test_review_verification_rejects_a_malformed_marker(tmp_state_dir, marker_js
         return block(review_payload(1, SHA_A, []))
 
     eng = _in_review(tmp_state_dir, gh, reviews)
-    with pytest.raises(VerificationError, match="cannot establish which comment carries"):
-        eng.step()
-    assert eng.state.phase == Phase.REVIEW and eng.state.review_round == 0
+    assert eng.step().next_phase == "BLOCKED"
+    s = load_state(eng.paths.state_file)
+    assert "cannot establish which comment carries the ai-review-result marker" in s.block_reason
+    assert comment_url(PR, 100) in s.block_reason and "nothing was posted" in s.block_reason
+    assert s.review_round == 0 and s.last_review_comment_url == ""
+    assert s.effect_records == [] and gh.effect_writes == [] and len(gh.comments[PR]) == 1
 
 
 @pytest.mark.parametrize("marker_json", _MALFORMED_MARKERS)
@@ -1875,7 +1681,6 @@ def test_review_entry_blocks_on_a_malformed_marker_without_invoking(tmp_state_di
 
 def test_review_head_changes_during_review_re_reviews(tmp_state_dir):
     gh = FakeGitHub()
-    gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
 
     def on_call(req):
         gh.set_head(SHA_B)  # someone pushed while the reviewer was working
@@ -1901,8 +1706,6 @@ def test_review_stale_round_with_findings_carries_them_to_the_next_review(tmp_st
     came from, as findings to re-check at the actual HEAD. That completed
     round then clears the carry: its verdict decided about them."""
     gh = FakeGitHub()
-    gh.add_comment(PR, 100, review_comment_body(1, SHA_A, True, ["R1-F1"]))
-    gh.add_comment(PR, 101, review_comment_body(2, SHA_B, True, ["R2-F1"]))
     stale_finding = _finding(1)
     stale_finding["required_resolution"] = "rename the helper\nand its test"
 
@@ -1921,17 +1724,19 @@ def test_review_stale_round_with_findings_carries_them_to_the_next_review(tmp_st
     assert s.open_findings == [] and s.prior_findings == [stale_finding]
     assert s.reviewed_head_sha == SHA_A and s.current_head_sha == SHA_B
     assert [r["result"] for r in s.review_history] == ["stale"]
+    round_one = controller_review_comment(eng, 1).url
+    assert s.last_review_comment_url == round_one
     eng.close()
 
     # The next entry (a resume, so the carry is read back from disk) hands the
     # findings to the reviewer of the actual HEAD as untrusted evidence.
     def round_two_re_raises(req):
         tail = req.prompt.split("Prior findings to re-check", 1)[1]
-        assert f"Review round 1 at HEAD `{SHA_A}` ({comment_url(PR, 100)})" in tail
+        assert f"Review round 1 at HEAD `{SHA_A}` ({round_one})" in tail
         assert "no FIX round resolved them" in tail
         assert "- R1-F1 [nit] src/x.py:1 — typo" in tail
         assert "Required resolution: rename the helper\n    and its test" in tail
-        return block(review_payload(2, SHA_B, [_finding(2)], cid=101))
+        return block(review_payload(2, SHA_B, [_finding(2)]))
 
     eng2 = make_engine(tmp_state_dir, round_two_re_raises, github=gh)
     eng2.load()
@@ -1947,9 +1752,8 @@ def test_review_clean_round_clears_the_carried_findings(tmp_state_dir):
     (the reviewer was shown them and raised none): nothing is carried past
     READY_FOR_MERGE."""
     gh = FakeGitHub()
-    gh.add_comment(PR, 101, review_comment_body(2, SHA_B, False))
     eng = _in_review(
-        tmp_state_dir, gh, [block(review_payload(2, SHA_B, [], cid=101))], round_done=1, head=SHA_B
+        tmp_state_dir, gh, [block(review_payload(2, SHA_B, []))], round_done=1, head=SHA_B
     )
     eng.state.reviewed_head_sha = SHA_A
     eng.state.last_review_comment_url = comment_url(PR, 100)
@@ -1966,11 +1770,10 @@ def test_review_stale_round_replaces_the_carried_findings_with_its_own(tmp_state
     went stale in turn was shown the earlier findings and re-raised the ones
     that still applied, so its findings (here: none) supersede them."""
     gh = FakeGitHub()
-    gh.add_comment(PR, 101, review_comment_body(2, SHA_B, False))
 
     def round_two_goes_stale_and_clean(req):
         gh.set_head(SHA_C)
-        return block(review_payload(2, SHA_B, [], cid=101))
+        return block(review_payload(2, SHA_B, []))
 
     eng = _in_review(tmp_state_dir, gh, round_two_goes_stale_and_clean, round_done=1, head=SHA_B)
     eng.state.reviewed_head_sha = SHA_A
@@ -1986,7 +1789,6 @@ def test_review_stale_round_replaces_the_carried_findings_with_its_own(tmp_state
 
 def test_review_clean_then_ready_for_merge_holds(tmp_state_dir):
     gh = FakeGitHub()
-    gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
     eng = _in_review(tmp_state_dir, gh, [block(review_payload(1, SHA_A, []))])
     assert eng.step().next_phase == "READY_FOR_MERGE"
     with pytest.raises(VerificationError, match="merge is disabled"):
@@ -2101,12 +1903,11 @@ def test_fix_entry_with_head_past_the_reviewed_one_goes_to_review_without_a_fixe
     (#14 item 2): they are carried to that review to re-check, and the
     reviewer of the actual HEAD is shown them."""
     gh = FakeGitHub()
-    gh.add_comment(PR, 101, review_comment_body(2, SHA_B, False))
 
     def round_two_sees_the_carry(req):
         assert "- R1-F1 [nit] src/x.py:1 — typo" in req.prompt
         assert f"Review round 1 at HEAD `{SHA_A}` ({comment_url(PR, 100)})" in req.prompt
-        return block(review_payload(2, SHA_B, [], cid=101))
+        return block(review_payload(2, SHA_B, []))
 
     eng = _in_fix(tmp_state_dir, gh, round_two_sees_the_carry)
     gh.set_head(SHA_B)
@@ -2137,11 +1938,10 @@ def test_fix_entry_with_the_pr_retargeted_goes_to_review_without_a_fixer(tmp_sta
     revision is reviewed, no fixer is launched, and the findings are carried
     to that review to re-check rather than dropped."""
     gh = FakeGitHub()
-    gh.add_comment(PR, 101, review_comment_body(2, SHA_A, False, base_ref="release/1.x"))
 
     def round_two_sees_the_carry(req):
         assert "- R1-F1 [nit] src/x.py:1 — typo" in req.prompt
-        return block(review_payload(2, SHA_A, [], cid=101))
+        return block(review_payload(2, SHA_A, []))
 
     eng = _in_fix(tmp_state_dir, gh, round_two_sees_the_carry)
     eng.state.reviewed_base_ref = "main"
@@ -2219,11 +2019,10 @@ def test_fix_entry_with_the_base_rewritten_goes_to_review_without_a_fixer(tmp_st
     diff the PR no longer shows. Treated like a retarget (#95): the review
     is stale, no fixer is launched, the findings are carried."""
     gh = FakeGitHub()
-    gh.add_comment(PR, 101, review_comment_body(2, SHA_A, False, merge_base_sha=MERGE_BASE_B))
 
     def round_two_sees_the_carry(req):
         assert "- R1-F1 [nit] src/x.py:1 — typo" in req.prompt
-        return block(review_payload(2, SHA_A, [], cid=101))
+        return block(review_payload(2, SHA_A, []))
 
     eng = _in_fix(tmp_state_dir, gh, round_two_sees_the_carry)
     eng.state.reviewed_base_ref = "main"
@@ -2470,7 +2269,6 @@ def test_review_entry_hands_the_prs_existing_follow_up_issues_to_the_reviewer(tm
     def reviews(req):
         assert (f"from\n  earlier rounds:\n  - R1-F1: {other}\n- R1-F2: {ISSUE3}\n") in req.prompt
         assert "issues/5" not in req.prompt and "issues/6" not in req.prompt
-        gh.add_comment(PR, 100, review_comment_body(2, SHA_A, False))
         return block(review_payload(2, SHA_A, []))
 
     eng = _in_review(tmp_state_dir, gh, reviews, round_done=1)
@@ -2530,7 +2328,6 @@ def test_a_deferral_survives_an_unrecorded_fix_round(tmp_state_dir):
             return "junk\n"  # the result block was lost
         assert req.phase == "REVIEW"
         assert f"earlier rounds:\n  - R1-F1: {new}\n" in req.prompt
-        gh.add_comment(PR, 100, review_comment_body(2, SHA_B, False))
         return block(review_payload(2, SHA_B, []))
 
     eng = _in_fix(tmp_state_dir, gh, agent)
@@ -2682,18 +2479,30 @@ def test_fix_no_change_requires_rationale(tmp_state_dir):
 # REVIEW findings and FIX resolutions are agent-authored text that lands in
 # plain `state.json` and in `status --json`; the engine redacts them before
 # they are assigned to state, mirroring the LOCAL-mode test in test_local.py.
-def test_remote_review_findings_are_redacted_before_they_are_persisted(tmp_state_dir):
+def test_remote_review_findings_with_a_credential_never_reach_state_or_the_pr(tmp_state_dir):
+    """Since #162 a REMOTE finding is published in the round's comment, so a
+    credential-shaped one is refused by the published-content policy before
+    the result is accepted (refused, never redacted and published): the
+    reviewer is asked again, told the pattern class and not the text, and the
+    secret reaches neither `state.json` nor the PR. The redaction at the
+    persistence boundary stays behind that refusal as defence in depth."""
     secret = "sk-ant-" + "B" * 30
     gh = FakeGitHub()
-    gh.add_comment(PR, 100, review_comment_body(1, SHA_A, True, ["R1-F1"]))
     leaky = _finding(1)
     leaky["required_resolution"] = f"Set ANTHROPIC_API_KEY={secret} in the test fixture."
-    eng = _in_review(tmp_state_dir, gh, [block(review_payload(1, SHA_A, [leaky]))])
+    eng = _in_review(
+        tmp_state_dir,
+        gh,
+        [block(review_payload(1, SHA_A, [leaky])), block(review_payload(1, SHA_A, [_finding(1)]))],
+    )
     out = eng.step()
     assert out.next_phase == "FIX"
-    assert secret not in json.dumps(eng.state.open_findings)
-    assert "***REDACTED***" in eng.state.open_findings[0]["required_resolution"]
+    assert len(eng.provider.calls) == 2 and eng.provider.calls[1].correction
+    assert "pattern class: env-assignment" in eng.provider.calls[1].prompt
+    assert secret not in eng.provider.calls[1].prompt
+    assert [f["required_resolution"] for f in eng.state.open_findings] == ["fix the typo"]
     assert secret not in eng.paths.state_file.read_text(encoding="utf-8")
+    assert len(gh.comments[PR]) == 1 and secret not in gh.comments[PR][0].body
 
 
 def test_remote_fix_resolutions_are_redacted_before_they_are_persisted(tmp_state_dir):
@@ -2746,25 +2555,25 @@ def test_malformed_result_triggers_one_correction(tmp_state_dir, fake_github):
     assert (run_dir / dirs[1] / "control-result.json").exists()
 
 
-def test_correction_after_the_review_comment_was_posted_adopts_it(tmp_state_dir):
-    """The reviewer posted the round's comment, then returned junk. The
-    correction relaunch is preceded by the REVIEW entry probe: the comment is
-    handed to the corrected reviewer, which adopts it. One comment remains."""
+def test_correction_after_the_reviewer_posted_a_round_comment_blocks(tmp_state_dir):
+    """The reviewer posted a comment carrying the round's marker itself (the
+    controller's write since #162, ADR 0004 D9.6), then returned junk. The
+    correction relaunch is preceded by the REVIEW entry probe: it finds a
+    comment the controller did not journal and blocks rather than adopt or
+    duplicate it. No correction is launched and nothing is posted."""
     gh = FakeGitHub()
 
     def reviews(req):
-        if not req.correction:
-            gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
-            return "junk\n"
-        assert (
-            f"THIS HEAD against THIS base and\n  THIS merge base (if any): {comment_url(PR, 100)}"
-            in req.prompt
-        )
-        return block(review_payload(1, SHA_A, []))
+        assert not req.correction, "a correction must not be launched"
+        gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
+        return "junk\n"
 
     eng = _in_review(tmp_state_dir, gh, reviews)
-    assert eng.step().next_phase == "READY_FOR_MERGE"
-    assert len(eng.provider.calls) == 2 and len(gh.comments[PR]) == 1
+    assert eng.step().next_phase == "BLOCKED"
+    assert len(eng.provider.calls) == 1 and len(gh.comments[PR]) == 1
+    reason = load_state(eng.paths.state_file).block_reason
+    assert "that the controller did not post" in reason and "D9.6" in reason
+    assert comment_url(PR, 100) in reason and gh.effect_writes == []
 
 
 def test_correction_after_the_fix_was_pushed_goes_to_review_without_relaunching(tmp_state_dir):
@@ -2954,7 +2763,6 @@ def test_launch_is_persisted_before_the_agent_runs(tmp_state_dir):
 
     def reads_state(req):
         seen.append(load_state(eng.paths.state_file).attempt)
-        gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
         return block(review_payload(1, SHA_A, []))
 
     eng = _in_review(tmp_state_dir, gh, reads_state)
@@ -6336,19 +6144,23 @@ def test_update_epic_dry_run_names_the_record_it_would_reconcile(tmp_state_dir, 
 
 
 # -- loop bounds: review-round cap, stagnation, step budget (#9) ------------------------------
-def _sha(n: int) -> str:
-    return f"{n:040x}"
-
-
-def _loop_agent(gh: FakeGitHub, findings_for_round, seen: list[str] | None = None):
-    """Scripted ANALYZE_EXECUTE / REVIEW / FIX loop over FakeGitHub.
+def _loop_agent(
+    gh: FakeGitHub,
+    findings_for_round,
+    seen: list[str] | None = None,
+    pushed: list[str] | None = None,
+):
+    """Scripted ANALYZE_EXECUTE / REVIEW / FIX loop over FakeGitHub and its origin.
 
     ``findings_for_round(n)`` returns the findings review round ``n`` reports
-    (``[]`` == clean). Every FIX pushes a new distinct HEAD and resolves every
-    open finding as ``fixed`` — the runaway loop from the issue's evidence.
+    (``[]`` == clean). Every FIX pushes a new distinct HEAD (appended to
+    ``pushed``) and resolves every open finding as ``fixed`` — the runaway
+    loop from the issue's evidence. The reviewer posts nothing: the
+    controller posts each round's comment (#162).
     """
     rounds = {"n": 0}
     seen = seen if seen is not None else []
+    pushed = pushed if pushed is not None else []
 
     def agent(req):
         seen.append(req.phase)
@@ -6358,15 +6170,12 @@ def _loop_agent(gh: FakeGitHub, findings_for_round, seen: list[str] | None = Non
             rounds["n"] += 1
             rnd = rounds["n"]
             sha = gh.prs[PR].head_sha
-            findings = findings_for_round(rnd)
-            ids = [f["id"] for f in findings]
-            gh.add_comment(PR, 100 + rnd, review_comment_body(rnd, sha, bool(findings), ids))
-            return block(review_payload(rnd, sha, findings, cid=100 + rnd))
+            return block(review_payload(rnd, sha, findings_for_round(rnd)))
         if req.phase == "FIX":
             prev = gh.prs[PR].head_sha
             ids = re.findall(r"^- (R\d+-F\d+) \[", req.prompt, re.M)
-            new = _sha(rounds["n"])
-            gh.set_head(new)
+            new = push_fix(req, gh, f"Fix round {rounds['n']} (#2)")
+            pushed.append(new)
             return block(
                 fix_payload(prev, new, [{"finding_id": i, "resolution": "fixed"} for i in ids])
             )
@@ -6390,8 +6199,12 @@ def test_review_round_cap_blocks_with_findings_and_never_starts_the_last_fix(tmp
     """Round N == cap still has findings -> BLOCKED; no FIX whose result could never be reviewed."""
     gh = FakeGitHub()
     seen: list[str] = []
+    pushed: list[str] = []
     eng = make_engine(
-        tmp_state_dir, _loop_agent(gh, _one_finding_per_round, seen), github=gh, origin=True
+        tmp_state_dir,
+        _loop_agent(gh, _one_finding_per_round, seen, pushed),
+        github=gh,
+        origin=True,
     )
     eng.config.workflow.max_review_rounds = 3
     _no_stagnation(eng.config)
@@ -6405,7 +6218,8 @@ def test_review_round_cap_blocks_with_findings_and_never_starts_the_last_fix(tmp
     assert "workflow.max_review_rounds=3" in s.block_reason and "3 finding" not in s.block_reason
     assert "round 3: 1 finding(s)" in s.block_reason
     assert s.open_findings[0]["id"] == "R3-F1"  # kept for the human
-    assert s.last_review_result == "needs_fix" and s.reviewed_head_sha == _sha(2)
+    assert len(pushed) == 2
+    assert s.last_review_result == "needs_fix" and s.reviewed_head_sha == pushed[1]
     assert [r["result"] for r in s.review_history] == ["needs_fix"] * 3
     assert gh.prs[PR].state == "OPEN" and gh.merges == []
 
@@ -6456,8 +6270,9 @@ def test_review_stagnation_identical_resolutions_blocks(tmp_state_dir):
     and spacing) -> BLOCKED on the open PR, and no second FIX is launched."""
     gh = FakeGitHub()
     seen: list[str] = []
+    pushed: list[str] = []
     texts = {1: "Add a regression test", 2: "  add   A REGRESSION test  "}
-    agent = _loop_agent(gh, lambda rnd: _one_finding_per_round(rnd, texts[rnd]), seen)
+    agent = _loop_agent(gh, lambda rnd: _one_finding_per_round(rnd, texts[rnd]), seen, pushed)
     eng = make_engine(tmp_state_dir, agent, github=gh, origin=True)
     # Below the replan soft threshold the verdict is the loop guard's to act on.
     assert eng.config.review.replan.soft_threshold > 2
@@ -6475,9 +6290,10 @@ def test_review_stagnation_identical_resolutions_blocks(tmp_state_dir):
     assert s.review_round == 2 and "identical resolutions" in s.block_reason
     assert "stagnation_identical_rounds=2" in s.block_reason
     # The FIX really moved the PR, and each round is recorded at the HEAD it reviewed ...
-    implemented = eng.origin.head("autoforge/2")
-    assert gh.prs[PR].head_sha == _sha(1) and _sha(1) != implemented
-    assert [r["reviewed_head_sha"] for r in s.review_history] == [implemented, _sha(1)]
+    implemented = git_out(f"--git-dir={eng.origin.bare}", "rev-parse", f"{pushed[0]}^")
+    assert gh.prs[PR].head_sha == eng.origin.head("autoforge/2") == pushed[0]
+    assert pushed[0] != implemented
+    assert [r["reviewed_head_sha"] for r in s.review_history] == [implemented, pushed[0]]
     assert [r["result"] for r in s.review_history] == ["needs_fix", "needs_fix"]
     # ... while the demand, once normalised, is the one round 1 already made.
     assert s.review_history[0]["fingerprint"] == s.review_history[1]["fingerprint"]
@@ -6548,14 +6364,12 @@ def test_review_stale_round_is_recorded_and_breaks_the_stagnation_streak(tmp_sta
     round's demand, so it ends the streak instead of extending it and the
     round after it goes to FIX."""
     gh = FakeGitHub()
-    gh.add_comment(PR, 100, review_comment_body(2, SHA_A, True, ["R2-F1"]))
-    gh.add_comment(PR, 101, review_comment_body(3, SHA_B, True, ["R3-F1"]))
 
     def on_call(req):
         if gh.prs[PR].head_sha == SHA_A:
             gh.set_head(SHA_B)  # someone pushed while the reviewer was working
             return block(review_payload(2, SHA_A, _one_finding_per_round(2, "same text")))
-        return block(review_payload(3, SHA_B, _one_finding_per_round(3, "same text"), cid=101))
+        return block(review_payload(3, SHA_B, _one_finding_per_round(3, "same text")))
 
     eng = _in_review(tmp_state_dir, gh, on_call, round_done=1)
     eng.state.review_history = [
@@ -6576,26 +6390,33 @@ def test_review_stale_round_is_recorded_and_breaks_the_stagnation_streak(tmp_sta
 
 
 def test_failed_review_invocation_consumes_neither_round_nor_history(tmp_state_dir):
+    """A review the controller cannot accept (here: no summary, through the
+    correction too) is no round: nothing is posted and nothing is recorded."""
     gh = FakeGitHub()
-    eng = _in_review(tmp_state_dir, gh, [block(review_payload(1, SHA_A, [_finding(1)]))])
-    with pytest.raises(VerificationError, match="no comment carries"):  # no review comment
+    incomplete = review_payload(1, SHA_A, [_finding(1)])
+    del incomplete["summary"]
+    eng = _in_review(tmp_state_dir, gh, lambda req: block(incomplete))
+    with pytest.raises(ControlResultValidationError, match="did not return a valid"):
         eng.step()
     s = load_state(eng.paths.state_file)
     assert s.review_round == 0 and s.review_history == [] and s.phase == Phase.REVIEW
+    assert s.last_review_comment_url == "" and s.effect_records == []
+    assert gh.effect_writes == [] and gh.comments.get(PR, []) == []
 
 
 def test_review_refused_by_the_post_review_pr_read_consumes_neither_round_nor_history(
     tmp_state_dir,
 ):
-    """The round's comment verifies, but the PR was closed under the reviewer and
-    the controller's re-read refuses it. That failed verification is persisted,
-    so nothing of the round may be: once the PR is open again, round 1 is still
-    the round to complete, and it enters the history exactly once."""
+    """The controller posts the round's comment, but the PR was closed under the
+    reviewer and the controller's re-read refuses it. That failed verification
+    is persisted, so nothing of the round may be: once the PR is open again,
+    round 1 is still the round to complete (from the saved plan: the reviewer
+    is not relaunched and the comment is not posted again), and it enters the
+    history exactly once."""
     gh = FakeGitHub()
     payload = block(review_payload(1, SHA_A, [_finding(1)]))
 
     def closed_under_the_reviewer(req):
-        gh.add_comment(PR, 100, review_comment_body(1, SHA_A, True, ["R1-F1"]))
         gh.prs[PR].state = "CLOSED"
         return payload
 
@@ -6613,8 +6434,10 @@ def test_review_refused_by_the_post_review_pr_read_consumes_neither_round_nor_hi
     resumed = make_engine(tmp_state_dir, [payload], github=gh)
     resumed.load()
     assert resumed.step().next_phase == "FIX"
+    assert resumed.provider.calls == [] and len(gh.effect_writes) == 1
     s = load_state(resumed.paths.state_file)
     assert s.review_round == 1 and [r["round"] for r in s.review_history] == [1]
+    assert s.last_review_comment_url == controller_review_comment(resumed, 1).url
 
 
 def test_new_pr_resets_review_history(tmp_state_dir, fake_github):
@@ -6680,7 +6503,6 @@ def test_a_transient_entry_failure_is_not_a_step_and_is_not_charged(tmp_state_di
     budget exemption inherits this rule rather than adding one (#71).
     """
     gh = FakeGitHub()
-    gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
     eng = _in_review(tmp_state_dir, gh, [block(review_payload(1, SHA_A, []))])
     eng.config.workflow.max_total_steps = 5
     eng.state.step_count = 4  # the last step the budget allows
@@ -6717,20 +6539,17 @@ def test_dry_run_plan_reports_loop_bounds(tmp_state_dir, fake_github):
 
 
 # -- REVIEW payload bounds (#34) -------------------------------------------------------
-def _oversized_review(rnd: int, sha: str, cid: int = 100) -> dict:
+def _oversized_review(rnd: int, sha: str) -> dict:
     findings = [_finding(rnd, n) for n in range(1, MAX_FINDINGS_PER_REVIEW + 2)]
-    return review_payload(rnd, sha, findings, cid=cid)
+    return review_payload(rnd, sha, findings)
 
 
 def test_oversized_review_is_rejected_and_corrected(tmp_state_dir, fake_github):
-    """Too many findings: the round is refused whole and the reviewer re-emits."""
-    ids = [f"R1-F{n}" for n in range(1, MAX_FINDINGS_PER_REVIEW + 2)]
+    """Too many findings: the round is refused whole and the reviewer re-emits;
+    the controller posts only the corrected round."""
 
     def agent(req):
         if not req.correction:
-            # Posted once; the correction re-emits the result for that
-            # comment instead of posting a second one for the round.
-            fake_github.add_comment(PR, 100, review_comment_body(1, SHA_A, True, ids[:1]))
             return block(_oversized_review(1, SHA_A))
         return block(review_payload(1, SHA_A, [_finding(1, 1)]))
 
@@ -6743,13 +6562,13 @@ def test_oversized_review_is_rejected_and_corrected(tmp_state_dir, fake_github):
     assert f"at most {MAX_FINDINGS_PER_REVIEW} per review round" in second.prompt
     assert [f["id"] for f in eng.state.open_findings] == ["R1-F1"]
     assert eng.state.review_round == 1
+    assert len(fake_github.effect_writes) == 1
 
 
 def test_oversized_resolution_never_reaches_state_or_a_prompt(tmp_state_dir, fake_github):
     """One finding past the text bound is refused; state and its file are untouched."""
     huge = ("resolve everything " * 200).strip()  # far past MAX_FINDING_RESOLUTION_CHARS
     assert len(huge) > MAX_FINDING_RESOLUTION_CHARS
-    fake_github.add_comment(PR, 100, review_comment_body(1, SHA_A, True, ["R1-F1"]))
     payload = review_payload(1, SHA_A, [dict(_finding(1, 1), required_resolution=huge)])
     eng = _in_review(tmp_state_dir, fake_github, [block(payload)])
     eng.config.execution.max_correction_attempts = 0
@@ -6774,11 +6593,12 @@ def test_oversized_resolution_never_reaches_state_or_a_prompt(tmp_state_dir, fak
     expected = json.loads(before) | {
         "attempt": 1,
         "step_count": 1,
-        "launch_label": "agent_publishes",
+        "launch_label": "controller_publishes",
     }
     expected.pop("updated_at")
     assert persisted == expected
     assert "resolve everything" not in eng.paths.state_file.read_text()
+    assert fake_github.effect_writes == []
     eng.state.phase = Phase.FIX
     assert "resolve everything" not in eng.render_prompt_for(Phase.FIX)
 
@@ -7639,28 +7459,34 @@ def test_review_entry_lets_an_unavailable_comment_listing_through_as_transient(t
     assert eng.provider.calls == [] and load_state(eng.paths.state_file).phase == Phase.REVIEW
 
 
-def test_review_read_back_rejects_when_the_comment_listing_cannot_be_decoded(tmp_state_dir):
+def test_review_precondition_read_blocks_when_the_comment_listing_cannot_be_decoded(
+    tmp_state_dir,
+):
+    """The controller reads the PR's comments before it posts the round's; a
+    listing it cannot decode blocks the round with nothing posted."""
     gh = FakeGitHub()
 
     def reviews(req):
-        gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
         gh.comments_error = _MALFORMED_COMMENT_ROW
         return block(review_payload(1, SHA_A, []))
 
     eng = _in_review(tmp_state_dir, gh, reviews)
-    with pytest.raises(VerificationError, match="not a GitHub comment URL.*exactly one review"):
-        eng.step()
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
     s = load_state(eng.paths.state_file)
-    assert s.phase == Phase.REVIEW and s.review_round == 0 and s.review_history == []
+    assert s.phase == Phase.BLOCKED and s.review_round == 0 and s.review_history == []
+    assert "could not be read before the comment of review round 1 was posted" in s.block_reason
+    assert "not a GitHub comment URL" in s.block_reason
+    assert "nothing was posted" in s.block_reason
+    assert gh.effect_writes == [] and s.effect_records == []
 
 
-def test_review_read_back_lets_an_unavailable_comment_listing_through_as_transient(
+def test_review_precondition_read_lets_an_unavailable_comment_listing_through_as_transient(
     tmp_state_dir,
 ):
     gh = FakeGitHub()
 
     def reviews(req):
-        gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
         gh.comments_error = GitHubUnavailableError("`gh pr view` failed (exit 1): HTTP 502")
         return block(review_payload(1, SHA_A, []))
 
@@ -7668,6 +7494,7 @@ def test_review_read_back_lets_an_unavailable_comment_listing_through_as_transie
     with pytest.raises(GitHubUnavailableError):
         eng.step()
     assert load_state(eng.paths.state_file).review_round == 0
+    assert gh.effect_writes == []
 
 
 def test_update_epic_entry_blocks_when_the_comment_listing_cannot_be_decoded(
@@ -7828,7 +7655,6 @@ def test_review_after_a_retarget_rebinds_the_base_and_then_merges(tmp_state_dir,
     fake_github.workflow_runs[BASE_RUN_ID] = replace(
         fake_github.workflow_runs[BASE_RUN_ID], head_branch="release/1.x"
     )
-    fake_github.add_comment(PR, 100, review_comment_body(3, SHA_A, False, base_ref="release/1.x"))
     eng = _in_merge(tmp_state_dir, fake_github, [block(review_payload(3, SHA_A, []))])
     assert eng.step(allow_merge=True).next_phase == "REVIEW"
     assert eng.step(allow_merge=True).next_phase == "READY_FOR_MERGE"
@@ -8045,7 +7871,6 @@ def test_merge_pr_without_a_readable_base_blocks(tmp_state_dir, fake_github):
 
 def test_review_records_the_pr_head_and_base_it_decided_on(tmp_state_dir):
     gh = FakeGitHub()
-    gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
     eng = _in_review(tmp_state_dir, gh, [block(review_payload(1, SHA_A, []))])
     eng.state.current_base_ref = ""  # bound by the controller right before the review
     assert eng.step().next_phase == "READY_FOR_MERGE"
@@ -8068,7 +7893,6 @@ def test_review_entry_binds_the_base_before_launching(tmp_state_dir):
 
 def test_review_base_changed_during_the_review_is_stale(tmp_state_dir):
     gh = FakeGitHub()
-    gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
 
     def on_call(req):
         gh.prs[PR].base_ref = "release/1.x"  # retargeted while the reviewer worked
@@ -8087,55 +7911,45 @@ def test_review_base_changed_during_the_review_is_stale(tmp_state_dir):
 def test_review_reentry_after_a_retarget_does_not_adopt_the_old_base_comment(tmp_state_dir):
     """PR #93 review (High): round 1 was posted while the PR targeted main
     and the result was lost; the PR was then retargeted at the same HEAD.
-    The re-entry binds the new base and must not hand the old comment to the
-    reviewer as this round's: it reviewed the diff against main, and adopting
-    it would record release/1.x as reviewed by a review it never had."""
+    The re-entry binds the new base and must not take the old comment as
+    this round's (neither adopt it nor block on it): it reviewed the diff
+    against main, and adopting it would record release/1.x as reviewed by a
+    review it never had. The round is reviewed and posted afresh."""
     gh = FakeGitHub()
     gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False, base_ref="main"))
     prompts = []
 
     def reviews(req):
         prompts.append(req.prompt)
-        gh.add_comment(PR, 101, review_comment_body(1, SHA_A, False, base_ref="release/1.x"))
-        return block(review_payload(1, SHA_A, [], cid=101))
+        return block(review_payload(1, SHA_A, []))
 
     eng = _in_review(tmp_state_dir, gh, reviews)
     gh.prs[PR].base_ref = "release/1.x"
     assert eng.step().next_phase == "READY_FOR_MERGE"
-    assert "THIS HEAD against THIS base and\n  THIS merge base (if any): (none)" in prompts[0]
     assert comment_url(PR, 100) not in prompts[0]
     assert "Reviewed base branch (bound by the controller): `release/1.x`" in prompts[0]
-    assert '"reviewed_base_ref": "release/1.x"' in prompts[0]
     s = load_state(eng.paths.state_file)
     assert (s.reviewed_pr_url, s.reviewed_head_sha, s.reviewed_base_ref) == (
         PR,
         SHA_A,
         "release/1.x",
     )
-    assert s.last_review_comment_url == comment_url(PR, 101)
+    assert len(gh.effect_writes) == 1
+    assert s.last_review_comment_url == comment_url(PR, 950_001)  # the controller's own
 
 
 @pytest.mark.parametrize("base", ["x-->y", "<!--x", "a--!>b"])
 def test_a_review_against_a_base_named_like_a_comment_delimiter_completes(tmp_state_dir, base):
-    """PR #93 review (Medium): ``x-->y`` is a valid refname. The reviewer
-    copies the base into the marker from the prompt, where it is given as
-    delimiter-free JSON, so the comment it posts scans as one marker; the
-    round binds and verifies like any other."""
+    """PR #93 review (Medium): ``x-->y`` is a valid refname. The controller
+    renders the base into the marker as delimiter-free JSON, so the comment
+    it posts scans as one marker; the round binds and verifies like any
+    other."""
     gh = FakeGitHub()
     prompts = []
 
     def reviews(req):
         prompts.append(req.prompt)
-        (marker_line,) = [
-            line for line in req.prompt.splitlines() if "<!-- ai-review-result:" in line
-        ]
-        literal = marker_line.split('"reviewed_base_ref": ', 1)[1].split(", ", 1)[0]
-        body = review_comment_body(1, SHA_A, False, base_ref=json.loads(literal))
-        # As the reviewer is told to: the literal exactly as given, not re-encoded.
-        body = body.replace(json.dumps(base), literal)
-        assert "-->" not in body.split("<!-- ai-review-result:", 1)[1].rsplit("-->", 1)[0]
-        gh.add_comment(PR, 101, body)
-        return block(review_payload(1, SHA_A, [], cid=101))
+        return block(review_payload(1, SHA_A, []))
 
     eng = _in_review(tmp_state_dir, gh, reviews)
     gh.prs[PR].base_ref = base
@@ -8143,44 +7957,27 @@ def test_a_review_against_a_base_named_like_a_comment_delimiter_completes(tmp_st
     assert f"Reviewed base branch (bound by the controller): `{base}`" in prompts[0]
     s = load_state(eng.paths.state_file)
     assert (s.reviewed_pr_url, s.reviewed_head_sha, s.reviewed_base_ref) == (PR, SHA_A, base)
-    assert s.last_review_comment_url == comment_url(PR, 101)
-
-
-@pytest.mark.parametrize("old_base", ["main", None], ids=["other-base", "no-base"])
-def test_review_result_naming_a_comment_for_another_base_is_rejected(tmp_state_dir, old_base):
-    """A reviewer that adopts the old-base (or pre-base) comment anyway is
-    held to the same key the entry used: the round is rejected, nothing is
-    bound, and no round is consumed."""
-    gh = FakeGitHub()
-    gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False, base_ref=old_base))
-    eng = _in_review(tmp_state_dir, gh, [block(review_payload(1, SHA_A, [], cid=100))])
-    gh.prs[PR].base_ref = "release/1.x"
-    with pytest.raises(VerificationError, match="round 1 at HEAD .* on base 'release/1.x'"):
-        eng.step()
-    s = load_state(eng.paths.state_file)
-    assert s.review_round == 0 and s.phase == Phase.REVIEW
-    assert (s.reviewed_pr_url, s.reviewed_head_sha, s.reviewed_base_ref) == ("", "", "")
-    assert s.current_base_ref == "release/1.x"
+    posted = controller_review_comment(eng, 1)
+    assert s.last_review_comment_url == posted.url
+    assert "-->" not in posted.body.split("<!-- ai-review-result:", 1)[1].rsplit("-->", 1)[0]
 
 
 def test_review_entry_ignores_a_pre_base_comment_for_the_round(tmp_state_dir):
     """A marker written before ``reviewed_base_ref`` existed reviewed a base
     nobody recorded. It is not this round's comment (never adopted) and not
-    a defect either (a PR mid-flight carries one per earlier round)."""
+    a defect either (a PR mid-flight carries one per earlier round): the round
+    is reviewed and the controller posts its own comment."""
     gh = FakeGitHub()
     gh.add_comment(PR, 90, review_comment_body(1, SHA_B, True, ["R1-F1"], base_ref=None))
     gh.add_comment(PR, 91, review_comment_body(2, SHA_A, True, ["R2-F1"], base_ref=None))
-
-    def reviews(req):
-        gh.add_comment(PR, 100, review_comment_body(2, SHA_A, False))
-        return block(review_payload(2, SHA_A, []))
-
-    eng = _in_review(tmp_state_dir, gh, reviews, round_done=1)
+    eng = _in_review(tmp_state_dir, gh, [block(review_payload(2, SHA_A, []))], round_done=1)
     assert eng.step().next_phase == "READY_FOR_MERGE"
     prompt = eng.provider.calls[0].prompt
-    assert "THIS HEAD against THIS base and\n  THIS merge base (if any): (none)" in prompt
     assert comment_url(PR, 91) not in prompt
-    assert load_state(eng.paths.state_file).reviewed_base_ref == "main"
+    s = load_state(eng.paths.state_file)
+    assert s.reviewed_base_ref == "main"
+    assert len(gh.effect_writes) == 1
+    assert s.last_review_comment_url == comment_url(PR, 950_001)  # the controller's own
 
 
 def test_review_records_the_merge_base_it_decided_on(tmp_state_dir):
@@ -8188,7 +7985,6 @@ def test_review_records_the_merge_base_it_decided_on(tmp_state_dir):
     the completed round records it next to the HEAD and base."""
     gh = FakeGitHub()
     gh.merge_base = MERGE_BASE_B
-    gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False, merge_base_sha=MERGE_BASE_B))
     prompts = []
 
     def reviews(req):
@@ -8200,7 +7996,6 @@ def test_review_records_the_merge_base_it_decided_on(tmp_state_dir):
     assert eng.step().next_phase == "READY_FOR_MERGE"
     assert ("get_merge_base_sha", "owner/repo", "main", SHA_A) in gh.calls
     assert f"computed from): `{MERGE_BASE_B}`" in prompts[0]
-    assert f'"reviewed_merge_base_sha": "{MERGE_BASE_B}"' in prompts[0]
     s = load_state(eng.paths.state_file)
     assert s.reviewed_merge_base_sha == MERGE_BASE_B and s.current_merge_base_sha == MERGE_BASE_B
     assert (s.reviewed_pr_url, s.reviewed_head_sha, s.reviewed_base_ref) == (PR, SHA_A, "main")
@@ -8224,7 +8019,6 @@ def test_review_merge_base_moved_during_the_review_is_stale(tmp_state_dir):
     longer shows: stale, round consumed, the new merge base bound for the
     re-review, and the findings carried."""
     gh = FakeGitHub()
-    gh.add_comment(PR, 100, review_comment_body(1, SHA_A, True, ["R1-F1"]))
 
     def on_call(req):
         gh.merge_base = MERGE_BASE_B  # main rewritten while the reviewer worked
@@ -8248,7 +8042,6 @@ def test_review_base_tip_moved_during_the_review_is_not_stale(tmp_state_dir):
     """Commits landing on the base while the reviewer worked do not move the
     merge base: the round binds and completes."""
     gh = FakeGitHub()
-    gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
 
     def on_call(req):
         gh.branch_heads["main"] = SHA_B
@@ -8266,69 +8059,43 @@ def test_review_reentry_after_a_base_rewrite_does_not_adopt_the_old_merge_base_c
     """#96, the #93 rule applied to the merge base: round 1 was posted from
     the old merge base and the result was lost; the base was then rewritten
     under its name at the same HEAD. The re-entry binds the new merge base
-    and must not hand the old comment to the reviewer as this round's."""
+    and must not take the old comment as this round's (neither adopt it nor
+    block on it); the round is reviewed and posted afresh."""
     gh = FakeGitHub()
     gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False, merge_base_sha=MERGE_BASE))
     prompts = []
 
     def reviews(req):
         prompts.append(req.prompt)
-        gh.add_comment(PR, 101, review_comment_body(1, SHA_A, False, merge_base_sha=MERGE_BASE_B))
-        return block(review_payload(1, SHA_A, [], cid=101))
+        return block(review_payload(1, SHA_A, []))
 
     eng = _in_review(tmp_state_dir, gh, reviews)
     gh.merge_base = MERGE_BASE_B
     assert eng.step().next_phase == "READY_FOR_MERGE"
-    assert "THIS HEAD against THIS base and\n  THIS merge base (if any): (none)" in prompts[0]
     assert comment_url(PR, 100) not in prompts[0]
-    assert f'"reviewed_merge_base_sha": "{MERGE_BASE_B}"' in prompts[0]
+    assert f"computed from): `{MERGE_BASE_B}`" in prompts[0]
     s = load_state(eng.paths.state_file)
     assert s.reviewed_merge_base_sha == MERGE_BASE_B
-    assert s.last_review_comment_url == comment_url(PR, 101)
-
-
-@pytest.mark.parametrize(
-    "old_merge_base", [MERGE_BASE, None], ids=["other-merge-base", "no-merge-base"]
-)
-def test_review_result_naming_a_comment_for_another_merge_base_is_rejected(
-    tmp_state_dir, old_merge_base
-):
-    """A reviewer that adopts the old-merge-base (or pre-merge-base) comment
-    anyway is held to the key the entry used: rejected, nothing bound, no
-    round consumed."""
-    gh = FakeGitHub()
-    gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False, merge_base_sha=old_merge_base))
-    eng = _in_review(tmp_state_dir, gh, [block(review_payload(1, SHA_A, [], cid=100))])
-    gh.merge_base = MERGE_BASE_B
-    with pytest.raises(
-        VerificationError,
-        match=f"round 1 at HEAD .* on base 'main' from merge base {MERGE_BASE_B[:12]}",
-    ):
-        eng.step()
-    s = load_state(eng.paths.state_file)
-    assert s.review_round == 0 and s.phase == Phase.REVIEW
-    assert (s.reviewed_head_sha, s.reviewed_base_ref, s.reviewed_merge_base_sha) == ("", "", "")
-    assert s.current_merge_base_sha == MERGE_BASE_B
+    assert len(gh.effect_writes) == 1
+    assert s.last_review_comment_url == comment_url(PR, 950_001)  # the controller's own
 
 
 def test_review_entry_ignores_a_pre_merge_base_comment_for_the_round(tmp_state_dir):
     """A marker written before ``reviewed_merge_base_sha`` existed (#96)
     reviewed a diff from a merge base nobody recorded. It is not this
-    round's comment (never adopted) and not a defect either."""
+    round's comment (never adopted) and not a defect either: the round is
+    reviewed and the controller posts its own comment."""
     gh = FakeGitHub()
     gh.add_comment(PR, 90, review_comment_body(1, SHA_B, True, ["R1-F1"], merge_base_sha=None))
     gh.add_comment(PR, 91, review_comment_body(2, SHA_A, True, ["R2-F1"], merge_base_sha=None))
-
-    def reviews(req):
-        gh.add_comment(PR, 100, review_comment_body(2, SHA_A, False))
-        return block(review_payload(2, SHA_A, []))
-
-    eng = _in_review(tmp_state_dir, gh, reviews, round_done=1)
+    eng = _in_review(tmp_state_dir, gh, [block(review_payload(2, SHA_A, []))], round_done=1)
     assert eng.step().next_phase == "READY_FOR_MERGE"
     prompt = eng.provider.calls[0].prompt
-    assert "THIS HEAD against THIS base and\n  THIS merge base (if any): (none)" in prompt
     assert comment_url(PR, 91) not in prompt
-    assert load_state(eng.paths.state_file).reviewed_merge_base_sha == MERGE_BASE
+    s = load_state(eng.paths.state_file)
+    assert s.reviewed_merge_base_sha == MERGE_BASE
+    assert len(gh.effect_writes) == 1
+    assert s.last_review_comment_url == comment_url(PR, 950_001)  # the controller's own
 
 
 def test_new_pr_clears_the_review_binding(tmp_state_dir, fake_github):
@@ -8929,20 +8696,20 @@ def _to_pi(eng, tmp_path_factory, script):
     return fake
 
 
-@pytest.mark.parametrize("claim", ["pull-request", "review-comment"])
+@pytest.mark.parametrize("claim", ["pull-request", "reviewed-head"])
 def test_a_pi_claim_github_does_not_back_fails_as_a_scripted_one_does(tmp_path_factory, claim):
     """A Pi CONTROL_RESULT the controller cannot back is refused by the same
     check, with the same error, and state stays where it was, exactly as for
     ScriptedProvider: a head_sha that is not the worktree's HEAD (#161: a
     refusal the agent is asked to correct, and nothing is pushed), or a
-    review comment FakeGitHub does not have."""
+    review of a HEAD the PR is not bound to (#162: a refusal the reviewer is
+    asked to correct, and no review comment is posted)."""
+    # The correction gets the same answer, so the bound is reached.
     if claim == "pull-request":
-        # The correction gets the same answer, so the bound is reached.
         script = [block(analyze_payload(SHA_A))] * 2
-        error: type[Exception] = ControlResultValidationError
     else:
-        script = [block(review_payload(1, SHA_A, []))]
-        error = VerificationError
+        script = [block(review_payload(1, SHA_B, []))] * 2
+    error = ControlResultValidationError
     seen = []
     for on_pi in (False, True):
         gh = FakeGitHub()
@@ -8964,6 +8731,9 @@ def test_a_pi_claim_github_does_not_back_fails_as_a_scripted_one_does(tmp_path_f
     assert seen[0][4] == []
     if claim == "pull-request":
         assert f"field 'head_sha' is {SHA_A}, but the worktree's HEAD is <HEAD>" in seen[0][0]
+    else:
+        assert "field 'reviewed_head_sha'" in seen[0][0]
+        assert seen[0][3] == 0 and seen[0][1] == Phase.REVIEW
     assert eng.provider.calls == [] and len(fake.launches()) == len(script)
 
 
@@ -9217,3 +8987,348 @@ def test_a_pi_dry_run_prints_the_pi_argv_and_spawns_nothing(
     assert plan.prompt_full not in plan.command
     assert not fake.spawned() and eng.pi.calls == []
     assert not eng.paths.state_file.exists() and fake_github.calls == []
+
+
+# -- REVIEW: the controller-posted review comment (K4, #162) -------------------------------
+# ADR 0004 K4 at the phase level: the reviewer publishes nothing; the
+# controller renders the round's comment from the validated result, journals
+# it with the round's verdict in one save, posts it at most once whatever
+# window a process dies in, and completes the round from the journal without
+# relaunching the reviewer. No step parses the comment.
+def _k4_body(rnd: int = 1, findings: list[dict] | None = None, sha: str = SHA_A) -> str:
+    """The comment the controller renders for review round ``rnd`` of ``sha``."""
+    res = ReviewResult.from_payload(review_result(rnd, sha, findings))
+    return render_review_comment(res, sha, "main", MERGE_BASE)
+
+
+def _review_posts(gh: FakeGitHub) -> list[tuple]:
+    return [w for w in gh.effect_writes if w[0] == "create_pr_comment"]
+
+
+def _round_outcome(eng) -> dict:
+    """What a review round leaves in state, minus the clock."""
+    s = load_state(eng.paths.state_file)
+    return {
+        "phase": s.phase,
+        "review_round": s.review_round,
+        "reviewed": (s.reviewed_pr_url, s.reviewed_head_sha, s.reviewed_base_ref),
+        "reviewed_merge_base_sha": s.reviewed_merge_base_sha,
+        "current": (s.current_head_sha, s.current_base_ref, s.current_merge_base_sha),
+        "last_review": (s.last_review_result, s.last_review_needs_fix),
+        "last_review_comment_url": s.last_review_comment_url,
+        "open_findings": s.open_findings,
+        "prior_findings": s.prior_findings,
+        "review_history": [
+            {k: v for k, v in entry.items() if k != "timestamp"} for entry in s.review_history
+        ],
+        "effects": (s.effect_records, s.completion_context),
+    }
+
+
+def _moves_head(gh: FakeGitHub, payload: dict):
+    """A reviewer during whose run the PR HEAD moves to SHA_B."""
+
+    def handler(req):
+        gh.set_head(SHA_B)
+        return block(payload)
+
+    return handler
+
+
+@pytest.mark.parametrize("findings", [[], [_finding(1)]], ids=["clean", "findings"])
+def test_k4_the_controller_renders_posts_and_reads_back_the_round_comment(
+    tmp_state_dir, fake_github, findings
+):
+    eng = _in_review(tmp_state_dir, fake_github, [block(review_result(1, SHA_A, findings))])
+    out = eng.step()
+    assert out.next_phase == ("FIX" if findings else "READY_FOR_MERGE")
+    body = _k4_body(1, findings)
+    assert _review_posts(fake_github) == [("create_pr_comment", PR, body)]
+    comment = controller_review_comment(eng, 1)
+    assert comment.body == body
+    assert body.startswith("# AI Code Review — Round 1\n")
+    assert f"Reviewed HEAD: `{SHA_A}` against base `main` (merge base `{MERGE_BASE}`)" in body
+    assert "## Summary\n\nReady." in body
+    assert f"Needs another fix round: {'YES' if findings else 'NO'}" in body
+    # The marker is the durable copy of the round: it is written from the same
+    # result as the findings the controller persists, and binds what it bound.
+    [claim] = scan(REVIEW, comment.body).claims
+    assert claim.round == 1 and claim.needs_fix_round == bool(findings)
+    assert claim.finding_ids == tuple(f["id"] for f in findings)
+    assert (claim.reviewed_head_sha, claim.reviewed_base_ref) == (SHA_A, "main")
+    assert claim.reviewed_merge_base_sha == MERGE_BASE
+    s = load_state(eng.paths.state_file)
+    assert s.last_review_comment_url == comment.url
+    assert s.review_history[-1]["review_comment_url"] == comment.url
+    assert [f["id"] for f in s.open_findings] == [f["id"] for f in findings]
+    assert s.effect_records == [] and s.completion_context == {}
+    assert "review_comment_url" not in eng.provider.calls[0].prompt
+
+
+def test_k4_crash_before_the_plan_is_saved_relaunches_the_reviewer_and_posts_once(
+    tmp_state_dir, fake_github
+):
+    """Nothing was journaled, nothing was sent: the step re-runs from the launch."""
+    payload = review_result(1, SHA_A, [_finding(1)])
+    eng = _in_review(tmp_state_dir, fake_github, [block(payload)] * 2)
+    eng._apply_review = _crash_on_first_call(eng._apply_review)
+    with pytest.raises(RuntimeError, match="power loss"):
+        eng.step()
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.REVIEW and s.review_round == 0
+    assert s.effect_records == [] and s.completion_context == {}
+    assert fake_github.effect_writes == []
+
+    eng.load()
+    out = eng.step()
+    assert out.next_phase == "FIX" and len(eng.provider.calls) == 2
+    assert not eng.provider.calls[1].correction
+    assert _review_posts(fake_github) == [("create_pr_comment", PR, _k4_body(1, [_finding(1)]))]
+
+
+def test_k4_intent_saved_and_write_never_issued_posts_once_without_a_relaunch(
+    tmp_state_dir, fake_github
+):
+    """The record is ``intended`` and the round's verdict is journaled with it:
+    the comment is posted once from the journal; the reviewer is not asked again."""
+    eng = _in_review(tmp_state_dir, fake_github, [block(review_result(1, SHA_A, [_finding(1)]))])
+    eng._persist_effect = _crash_on_first_call(eng._persist_effect)
+    with pytest.raises(RuntimeError, match="power loss"):
+        eng.step()
+    s = load_state(eng.paths.state_file)
+    [record] = s.effect_records
+    assert record["kind"] == "review_comment" and record["stage"] == "intended"
+    assert record["attempts"] == 0 and s.completion_context["round"] == 1
+    assert s.phase == Phase.REVIEW and s.review_round == 0
+    assert fake_github.effect_writes == []
+
+    eng.load()
+    out = eng.step()
+    assert out.next_phase == "FIX" and "no reviewer launched" in out.message
+    assert len(eng.provider.calls) == 1 and len(_review_posts(fake_github)) == 1
+    s = load_state(eng.paths.state_file)
+    assert [f["id"] for f in s.open_findings] == ["R1-F1"]
+    assert s.last_review_comment_url == controller_review_comment(eng, 1).url
+
+
+@pytest.mark.parametrize("stale", [False, True], ids=["bound", "stale"])
+def test_k4_create_landed_save_lost_completes_as_an_uninterrupted_round(
+    tmp_path, tmp_state_dir, fake_github, stale
+):
+    """The comment landed and the process died before the save: the next entry
+    observes it (no second post, no relaunch) and the round completes exactly
+    as it would have uninterrupted, the stale path's carried findings included."""
+    payload = review_result(1, SHA_A, [_finding(1)])
+
+    def run(state_dir, gh):
+        script = _moves_head(gh, payload) if stale else [block(payload)]
+        return _in_review(state_dir, gh, script)
+
+    reference = run(tmp_path / "reference" / ".autoforge", FakeGitHub())
+    reference.step()
+
+    landed = fake_github.create_pr_comment
+
+    def crash_after_write(url, body):
+        landed(url, body)
+        raise RuntimeError("power loss")
+
+    fake_github.create_pr_comment = crash_after_write
+    eng = run(tmp_state_dir, fake_github)
+    with pytest.raises(RuntimeError, match="power loss"):
+        eng.step()
+    [record] = _k8_records(eng)
+    assert record["stage"] == "attempted" and len(fake_github.comments[PR]) == 1
+
+    fake_github.create_pr_comment = landed
+    eng.load()
+    out = eng.step()
+    assert out.next_phase == ("REVIEW" if stale else "FIX")
+    assert "no reviewer launched" in out.message and len(eng.provider.calls) == 1
+    assert len(_review_posts(fake_github)) == 1 and len(fake_github.comments[PR]) == 1
+    assert _round_outcome(eng) == _round_outcome(reference)
+    if stale:
+        s = load_state(eng.paths.state_file)
+        assert s.last_review_result == "stale" and s.current_head_sha == SHA_B
+        assert [f["id"] for f in s.prior_findings] == ["R1-F1"] and s.open_findings == []
+
+
+def test_k4_write_lost_in_flight_is_reconciled_then_issued_once_more(tmp_state_dir, fake_github):
+    """Attempt persisted, outcome unknown, and the write did not land: never a blind
+    re-send in the same step; the next entry reads, finds nothing, posts once more."""
+    fake_github.write_failures = [
+        ("create_pr_comment", GitHubUnavailableError("gh: timed out"), False)
+    ]
+    eng = _in_review(tmp_state_dir, fake_github, [block(review_result(1, SHA_A, [_finding(1)]))])
+    with pytest.raises(GitHubUnavailableError, match="'resume' reconciles it"):
+        eng.step()
+    [record] = _k8_records(eng)
+    assert record["stage"] == "attempted" and record["attempts"] == 1
+    assert len(_review_posts(fake_github)) == 1 and PR not in fake_github.comments
+    assert load_state(eng.paths.state_file).review_round == 0
+
+    eng.load()
+    out = eng.step()
+    assert out.next_phase == "FIX" and len(eng.provider.calls) == 1
+    assert len(_review_posts(fake_github)) == 2  # the lost one, then exactly one more
+    assert [c.body for c in fake_github.comments[PR]] == [_k4_body(1, [_finding(1)])]
+
+
+def test_k4_write_landed_with_its_reply_lost_is_observed_by_the_read_back(
+    tmp_state_dir, fake_github
+):
+    """A timeout whose comment landed: the read-back in the same step finds exactly
+    one comment with the payload; nothing is sent again."""
+    fake_github.write_failures = [
+        ("create_pr_comment", GitHubUnavailableError("gh: timed out"), True)
+    ]
+    eng = _in_review(tmp_state_dir, fake_github, [block(review_result(1, SHA_A))])
+    out = eng.step()
+    assert out.next_phase == "READY_FOR_MERGE"
+    assert len(_review_posts(fake_github)) == 1 and len(fake_github.comments[PR]) == 1
+    assert load_state(eng.paths.state_file).last_review_comment_url == (
+        controller_review_comment(eng, 1).url
+    )
+
+
+def test_k4_a_round_comment_posted_by_someone_else_between_intent_and_write_blocks(
+    tmp_state_dir, fake_github
+):
+    """The precondition no longer holds and the comment found is not the payload:
+    BLOCKED naming it; nothing is posted and the round is not consumed."""
+    eng = _in_review(tmp_state_dir, fake_github, [block(review_result(1, SHA_A, [_finding(1)]))])
+    eng._persist_effect = _crash_on_first_call(eng._persist_effect)
+    with pytest.raises(RuntimeError, match="power loss"):
+        eng.step()
+    fake_github.add_comment(PR, 310, review_comment_body(1, SHA_A, True, ["R1-F1"]))
+
+    eng.load()
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and len(eng.provider.calls) == 1
+    s = load_state(eng.paths.state_file)
+    assert comment_url(PR, 310) in s.block_reason and "'unblock'" in s.block_reason
+    assert _review_posts(fake_github) == []
+    assert [r["stage"] for r in s.effect_records] == ["conflict"]
+    assert s.review_round == 0 and s.open_findings == [] and s.last_review_comment_url == ""
+
+
+def test_k4_a_second_matching_comment_after_the_write_blocks_naming_both(
+    tmp_state_dir, fake_github
+):
+    landed = fake_github.create_pr_comment
+
+    def crash_after_write(url, body):
+        landed(url, body)
+        raise RuntimeError("power loss")
+
+    fake_github.create_pr_comment = crash_after_write
+    eng = _in_review(tmp_state_dir, fake_github, [block(review_result(1, SHA_A))])
+    with pytest.raises(RuntimeError, match="power loss"):
+        eng.step()
+    fake_github.create_pr_comment = landed
+    ours = fake_github.comments[PR][0].url
+    fake_github.add_comment(PR, 320, _k4_body(1))  # a copy, by someone else
+
+    eng.load()
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and len(eng.provider.calls) == 1
+    s = load_state(eng.paths.state_file)
+    assert ours in s.block_reason and comment_url(PR, 320) in s.block_reason
+    assert len(_review_posts(fake_github)) == 1 and len(fake_github.comments[PR]) == 2
+    assert s.review_round == 0 and s.last_review_comment_url == ""
+
+
+@pytest.mark.parametrize(
+    ("text", "problem"),
+    [
+        ("Looks fine. <!-- ai-review-result: {} -->", "marker"),
+        ("Ping @someone about it.", "mention"),
+        ("This closes #7 as well.", "closing"),
+        ("Use GITHUB_TOKEN=ghp_" + "a" * 36 + " to test.", "credential"),
+    ],
+    ids=["marker", "mention", "closing-keyword", "credential"],
+)
+def test_k4_prose_the_controller_would_publish_is_corrected_never_posted(
+    tmp_state_dir, fake_github, text, problem
+):
+    hostile = block(review_result(1, SHA_A, summary=text))
+    eng = _in_review(tmp_state_dir, fake_github, [hostile, block(review_result(1, SHA_A))])
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    assert len(eng.provider.calls) == 2 and eng.provider.calls[1].correction
+    assert "summary" in eng.provider.calls[1].prompt
+    assert _review_posts(fake_github) == [("create_pr_comment", PR, _k4_body(1))]
+    assert all(text not in c.body for c in fake_github.comments[PR])
+
+
+def test_k4_an_oversized_rendered_comment_is_corrected_before_any_effect(
+    tmp_state_dir, fake_github
+):
+    """D8.6: every field within its own bound, the comment over GitHub's limit."""
+    resolution = ("rename the helper and update every caller " * 60)[:MAX_FINDING_RESOLUTION_CHARS]
+    big = [dict(_finding(1, n), required_resolution=resolution) for n in range(1, 34)]
+    payload = review_result(1, SHA_A, big)
+    assert len(_k4_body(1, big)) > 65536
+    eng = _in_review(tmp_state_dir, fake_github, [block(payload), block(review_result(1, SHA_A))])
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    assert eng.provider.calls[1].correction
+    assert "over GitHub's limit of 65536" in eng.provider.calls[1].prompt
+    assert _review_posts(fake_github) == [("create_pr_comment", PR, _k4_body(1))]
+
+
+def test_k4_unblock_with_a_saved_plan_completes_the_round_without_the_reviewer(
+    tmp_state_dir, fake_github
+):
+    """A conflict blocked the planned comment; once the operator removes the stray
+    comment, 'unblock' routes back to REVIEW, which posts from the plan."""
+    eng = _in_review(tmp_state_dir, fake_github, [block(review_result(1, SHA_A, [_finding(1)]))])
+    eng._persist_effect = _crash_on_first_call(eng._persist_effect)
+    with pytest.raises(RuntimeError, match="power loss"):
+        eng.step()
+    fake_github.add_comment(PR, 340, review_comment_body(1, SHA_A, True, ["R1-F1"]))
+    eng.load()
+    assert eng.step().next_phase == "BLOCKED"
+
+    fake_github.comments[PR] = []  # the operator deletes the stray comment
+    eng.load()
+    unblocked = eng.unblock("removed the stray review comment")
+    assert unblocked.unblocked and unblocked.phase == "REVIEW"
+    assert "without launching the reviewer" in unblocked.message
+    out = eng.step()
+    assert out.next_phase == "FIX" and "no reviewer launched" in out.message
+    assert len(eng.provider.calls) == 1
+    assert _review_posts(fake_github) == [("create_pr_comment", PR, _k4_body(1, [_finding(1)]))]
+    s = load_state(eng.paths.state_file)
+    assert [f["id"] for f in s.open_findings] == ["R1-F1"] and s.effect_records == []
+
+
+def test_k4_the_entry_fetches_the_bound_head_and_merge_base_before_the_launch(
+    tmp_state_dir, fake_github, offline_fetches
+):
+    eng = _in_review(tmp_state_dir, fake_github, [block(review_result(1, SHA_A))])
+    offline_fetches.clear()
+    eng.step()
+    assert offline_fetches == [[SHA_A, MERGE_BASE]]
+
+
+def test_k4_a_failed_fetch_launches_nothing(tmp_state_dir, fake_github, monkeypatch):
+    def refuse(self, revisions):
+        raise GitTransportError("fatal: could not read from remote repository")
+
+    eng = _in_review(tmp_state_dir, fake_github, [block(review_result(1, SHA_A))])
+    monkeypatch.setattr("autoforge.engine.GitTransport.fetch", refuse)
+    with pytest.raises(VerificationError, match="before launching the reviewer"):
+        eng.step()
+    assert eng.provider.calls == [] and fake_github.effect_writes == []
+    assert load_state(eng.paths.state_file).phase == Phase.REVIEW
+
+
+def test_k4_dry_run_names_the_comment_it_would_post_and_posts_nothing(
+    tmp_state_dir, fake_github, offline_fetches
+):
+    eng = _in_review(tmp_state_dir, fake_github, ["never"])
+    offline_fetches.clear()
+    calls_before = list(fake_github.calls)
+    out = eng.step(dry_run=True)
+    assert any("review comment" in n for n in out.plan.notes)
+    assert eng.provider.calls == [] and fake_github.effect_writes == []
+    assert offline_fetches == [] and fake_github.calls == calls_before

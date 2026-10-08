@@ -25,12 +25,16 @@ from autoforge.result_parser import (
     MAX_FIX_RATIONALE_CHARS,
     MAX_PROGRESS_CHARS,
     MAX_RESOLUTIONS_PER_FIX,
+    MAX_REVIEW_SECTION_CHARS,
+    MAX_REVIEW_SUMMARY_CHARS,
     MAX_ROADMAP_SECTION_CHARS,
     MAX_URL_CHARS,
+    REVIEW_PROSE_SECTIONS,
     AnalyzeExecuteResult,
     Finding,
     FixResult,
     LocalFixResult,
+    LocalReviewResult,
     ReviewResult,
     UpdateEpicRequest,
     UpdateEpicResult,
@@ -47,16 +51,16 @@ from autoforge.result_parser import (
     validate_roadmap_section,
 )
 from autoforge.transitions import Phase, WorkflowMode
-from tests.conftest import BRANCH, ISSUE, PR, SHA_A, SHA_B, block, comment_url
+from tests.conftest import BRANCH, ISSUE, PR, REVIEW_PROSE, SHA_A, SHA_B, block, comment_url
 
 GOOD_REVIEW = {
     "phase": "REVIEW",
     "status": "success",
     "round": 1,
     "reviewed_head_sha": SHA_A,
-    "review_comment_url": comment_url(PR, 1),
     "needs_fix_round": False,
     "findings": [],
+    **REVIEW_PROSE,
 }
 
 
@@ -75,9 +79,9 @@ def test_multiple_blocks_last_wins():
                 "status": "success",
                 "round": 99,
                 "reviewed_head_sha": SHA_B,
-                "review_comment_url": comment_url(PR, 2),
                 "needs_fix_round": True,
                 "findings": [{"id": "R99-F1", "classification": "nit", "required_resolution": "x"}],
+                **REVIEW_PROSE,
             }
         )
         + "\n"
@@ -291,8 +295,6 @@ def test_review_findings_invariant_and_ids():
     )
     assert [f.id for f in good.findings] == ["R1-F1", "R1-F2"]
     assert isinstance(good.findings[0], Finding) and good.needs_fix_round
-    with pytest.raises(ControlResultValidationError, match="review_comment_url"):
-        ReviewResult.from_payload(dict(base, review_comment_url=PR))
     with pytest.raises(ControlResultValidationError, match="round"):
         ReviewResult.from_payload(dict(base, round=0))
 
@@ -800,7 +802,19 @@ def test_parser_bounds_never_exceed_the_persisted_evidence_bounds():
         )
         for n in range(1, MAX_FINDINGS_PER_REVIEW + 1)
     ]
-    res = ReviewResult.from_payload(dict(GOOD_REVIEW, needs_fix_round=True, findings=findings))
+    # A REMOTE finding is published in the controller's review comment, so a
+    # credential shape is refused at parse (#162); a LOCAL one is published
+    # nowhere and still reaches the redaction this bound has to absorb.
+    with pytest.raises(ControlResultValidationError, match="credential-shaped"):
+        ReviewResult.from_payload(dict(GOOD_REVIEW, needs_fix_round=True, findings=findings))
+    res = LocalReviewResult.from_payload(
+        {
+            "round": 1,
+            "reviewed_workspace_fingerprint": "a" * 64,
+            "needs_fix_round": True,
+            "findings": findings,
+        }
+    )
     persisted = [redact_dict(f.to_dict()) for f in res.findings]  # the engine's own path
     assert len(persisted[0]["required_resolution"]) > MAX_FINDING_RESOLUTION_CHARS
     assert "HF_TOKEN=x" not in persisted[0]["required_resolution"]
@@ -924,12 +938,7 @@ _SHA_FIELDS = [
     pytest.param(
         Phase.REVIEW,
         WorkflowMode.REMOTE,
-        {
-            "round": 1,
-            "review_comment_url": comment_url(PR, 1),
-            "needs_fix_round": False,
-            "findings": [],
-        },
+        {"round": 1, "needs_fix_round": False, "findings": [], **REVIEW_PROSE},
         "reviewed_head_sha",
         id="REVIEW.reviewed_head_sha",
     ),
@@ -1173,10 +1182,6 @@ def test_update_epic_roadmap_section_is_optional_bounded_text():
             ),
         ),
         (
-            "REVIEW.review_comment_url",
-            lambda v: ReviewResult.from_payload(dict(GOOD_REVIEW, review_comment_url=v)),
-        ),
-        (
             "UPDATE_EPIC.next_issue_url",
             lambda v: UpdateEpicResult.from_payload(
                 {
@@ -1188,7 +1193,7 @@ def test_update_epic_roadmap_section_is_optional_bounded_text():
             ),
         ),
     ],
-    ids=["optional-issue", "required-issue", "required-comment", "nullable-issue"],
+    ids=["optional-issue", "required-issue", "nullable-issue"],
 )
 def test_url_fields_are_bounded_before_the_url_parser_quotes_them(label, build):
     """``validation`` quotes the URL in its error, and that error reaches the
@@ -1338,11 +1343,27 @@ def test_the_length_bound_speaks_before_the_control_character_rule():
 
 
 def test_control_characters_are_refused_where_the_renderer_would_escape_them_only():
-    """Fields outside findings keep their existing rules: a REVIEW
-    ``summary``/``message`` or a LOCAL ``observations`` entry is quoted as a
-    block or not rendered at all, and is out of scope for #78."""
-    payload = dict(GOOD_REVIEW, summary="line one\x1bline two", message="a\rb")
-    ReviewResult.from_payload(payload)
+    """Fields outside findings keep their existing rules: a REVIEW ``message``
+    or a LOCAL ``observations`` entry is quoted as a block or not rendered at
+    all, and is out of scope for #78. A REMOTE prose section is published in
+    the controller's review comment (#162), so it is multi-line text."""
+    ReviewResult.from_payload(dict(GOOD_REVIEW, message="a\rb"))
+    local = LocalReviewResult.from_payload(
+        {
+            "round": 1,
+            "reviewed_workspace_fingerprint": "a" * 64,
+            "needs_fix_round": False,
+            "findings": [],
+            "observations": ["line one\x1bline two"],
+        }
+    )
+    assert local.observations == ["line one\x1bline two"]
+    with pytest.raises(ControlResultValidationError) as excinfo:
+        ReviewResult.from_payload(dict(GOOD_REVIEW, summary="line one\x1bline two"))
+    msg = str(excinfo.value)
+    assert "REVIEW: result field 'summary' contains a control character" in msg
+    assert "(U+001B at index 8)" in msg
+    assert "line one" not in msg
 
 
 # -- whole-payload bound (#53) ---------------------------------------------------------------
@@ -1373,7 +1394,9 @@ def test_largest_review_the_field_bounds_accept_fits_the_block_bound(mode):
     """Pins the relation between the bounds: a REVIEW at every field bound,
     in the worst-case JSON encoding (non-ASCII text escaped as \\uXXXX, six
     characters per character), is still under the whole-block bound, so the
-    field bounds -- not the block bound -- are what a reviewer is held to."""
+    field bounds -- not the block bound -- are what a reviewer is held to.
+    A REMOTE review carries its prose sections too (#162), each at its own
+    bound in the same encoding."""
     findings = [
         {
             "id": f"R1-F{n}",
@@ -1384,12 +1407,20 @@ def test_largest_review_the_field_bounds_accept_fits_the_block_bound(mode):
         }
         for n in range(1, MAX_FINDINGS_PER_REVIEW + 1)
     ]
-    stdout, wf_mode = _review_with(findings, mode)
+    if mode == "REMOTE":
+        prose = {key: "汉" * limit for key, limit in REVIEW_PROSE_SECTIONS}
+        stdout = block(dict(GOOD_REVIEW, needs_fix_round=True, findings=findings, **prose))
+        wf_mode = WorkflowMode.REMOTE
+    else:
+        stdout, wf_mode = _review_with(findings, mode)
     assert "\\u6c49" in stdout  # json.dumps escaped the text: the worst case
     raw = stdout.split(BEGIN, 1)[1].split(END, 1)[0].strip()
     assert len(raw) <= MAX_CONTROL_RESULT_CHARS
     payload = parse_control_result(stdout, Phase.REVIEW, wf_mode)
     assert len(payload["findings"]) == MAX_FINDINGS_PER_REVIEW
+    if mode == "REMOTE":
+        sections = ReviewResult.from_payload(payload).sections
+        assert {key: len(text) for key, text in sections.items()} == dict(REVIEW_PROSE_SECTIONS)
 
 
 # -- published-content policy (ADR 0004 D8.2, D8.3, D8.5) -------------------
@@ -1688,6 +1719,173 @@ def test_published_text_problem_is_linear_on_a_mixed_mebibyte():
     assert published_text_problem("progress", text) is None
     assert commit_message_problem(text, repository="owner/repo", issue_number=2) is None
     assert time.perf_counter() - started < 6.0
+
+
+# -- REVIEW prose and the published-content policy (#162) --------------------
+# The controller renders the round's review comment from a REMOTE result and
+# posts it itself: the reviewer's prose sections stand under fixed headings,
+# and each finding's title, location and required resolution are shown. All
+# of it is published as given, so it is refused, never clipped or rewritten.
+
+_PROSE_KEYS = [key for key, _ in REVIEW_PROSE_SECTIONS]
+_FINDING_TEXT_KEYS = ["title", "location", "required_resolution"]
+
+
+def _review_text(key: str, text: str) -> ReviewResult:
+    """A REMOTE review whose prose section or R1-F1 field ``key`` is ``text``."""
+    if key in _FINDING_TEXT_KEYS:
+        finding = dict(_finding(1, 1), **{key: text})
+        return ReviewResult.from_payload(
+            dict(GOOD_REVIEW, needs_fix_round=True, findings=[finding])
+        )
+    return ReviewResult.from_payload(dict(GOOD_REVIEW, **{key: text}))
+
+
+def _review_text_of(res: ReviewResult, key: str) -> str:
+    if key in _FINDING_TEXT_KEYS:
+        return getattr(res.findings[0], key)
+    return res.sections[key]
+
+
+def test_remote_review_carries_the_prose_it_publishes_and_names_no_comment():
+    """The result carries the six prose sections, stripped and in the order
+    the comment renders them; a comment URL a reviewer still reports is not
+    read, since the reviewer posts no comment to name."""
+    assert REVIEW_PROSE_SECTIONS == (
+        ("spec", MAX_REVIEW_SECTION_CHARS),
+        ("standards", MAX_REVIEW_SECTION_CHARS),
+        ("assessment", MAX_REVIEW_SECTION_CHARS),
+        ("observations", MAX_REVIEW_SECTION_CHARS),
+        ("verification", MAX_REVIEW_SECTION_CHARS),
+        ("summary", MAX_REVIEW_SUMMARY_CHARS),
+    )
+    res = ReviewResult.from_payload(
+        dict(GOOD_REVIEW, spec="  Does what #2 asks.\n", review_comment_url=comment_url(PR, 1))
+    )
+    assert not hasattr(res, "review_comment_url")
+    assert list(res.sections) == _PROSE_KEYS
+    assert res.sections == dict(REVIEW_PROSE, spec="Does what #2 asks.")
+
+
+@pytest.mark.parametrize("key", _PROSE_KEYS)
+def test_each_prose_section_is_required_non_blank_text(key):
+    absent = {k: v for k, v in GOOD_REVIEW.items() if k != key}
+    with pytest.raises(ControlResultValidationError, match=f"missing required field {key!r}"):
+        parse_control_result(block(absent), Phase.REVIEW)
+    for blank in (None, "", " \n\t "):
+        msg = _refusal(lambda blank=blank: _review_text(key, blank))
+        assert f"CONTROL_RESULT for REVIEW missing required field {key!r}" in msg
+    for bad in NON_STRING_JSON_VALUES:
+        msg = _refusal(lambda bad=bad: ReviewResult.from_payload(dict(GOOD_REVIEW, **{key: bad})))
+        assert f"REVIEW: field {key!r} must be a string" in msg
+
+
+@pytest.mark.parametrize("key,limit", REVIEW_PROSE_SECTIONS, ids=_PROSE_KEYS)
+def test_each_prose_section_is_bounded_and_rejected_not_clipped(key, limit):
+    exact = "x" * limit
+    assert _review_text(key, exact).sections[key] == exact
+    # The bound applies to the stripped value the controller publishes.
+    assert _review_text(key, f"\n  {exact}  \n").sections[key] == exact
+    msg = _refusal(lambda: _review_text(key, "y" * (limit + 1)))
+    assert f"REVIEW: result field {key!r} is {limit + 1} characters" in msg
+    assert f"at most {limit}" in msg
+    assert "yyyy" not in msg
+
+
+@pytest.mark.parametrize("name", sorted(_CONTROL_SAMPLES), ids=str)
+def test_each_prose_section_keeps_newlines_and_tabs_and_nothing_else(name):
+    ch = _CONTROL_SAMPLES[name]
+    text = f"first{ch}second"
+    for key in _PROSE_KEYS:
+        if ch in ("\n", "\t"):
+            assert _review_text(key, text).sections[key] == text
+            continue
+        msg = _refusal(lambda key=key: _review_text(key, text))
+        assert f"REVIEW: result field {key!r} contains a control character" in msg
+        assert f"(U+{ord(ch):04X} at index 5)" in msg
+        assert "first" not in msg and "second" not in msg
+
+
+# (text, what the refusal names, what it must never quote)
+_PUBLISHED_VIOLATIONS = {
+    "marker": ("see <!-- ai-review-result: {} --> here", "controller marker", "review-result"),
+    "mention": ("thanks @octocat", "@-mention", "octocat"),
+    "closing": ("this Closes #3 too", "closing keyword", "#3"),
+    "credential": ("set GH_TOKEN=FAKEtoken123 first", "env-assignment", "FAKEtoken123"),
+}
+
+
+@pytest.mark.parametrize(
+    "key,rule",
+    [
+        (key, rule)
+        for key in _PROSE_KEYS + _FINDING_TEXT_KEYS
+        for rule in _PUBLISHED_VIOLATIONS
+        # A location is shown in a code span, where a mention notifies no one
+        # (see the location test below).
+        if (key, rule) != ("location", "mention")
+    ],
+)
+def test_review_prose_and_finding_text_are_held_to_the_published_policy(key, rule):
+    """A violation is refused (the reviewer is asked again) and the refusal
+    names the field and the rule, never the text."""
+    text, names, secret = _PUBLISHED_VIOLATIONS[rule]
+    msg = _refusal(lambda: _review_text(key, text))
+    subject = f"R1-F1.{key}" if key in _FINDING_TEXT_KEYS else key
+    assert f"REVIEW: field {subject!r} contains" in msg
+    assert names in msg
+    assert secret not in msg
+
+
+@pytest.mark.parametrize("cls,text,secret", _CREDENTIALS, ids=[c[1] for c in _CREDENTIALS])
+def test_each_credential_class_is_refused_in_review_text(cls, text, secret):
+    for key in ("summary", "title", "location", "required_resolution"):
+        msg = _refusal(lambda key=key: _review_text(key, f"see {text} end"))
+        assert cls in msg and "never redacted" in msg
+        assert secret not in msg
+
+
+@pytest.mark.parametrize("key", [k for k in _PROSE_KEYS + _FINDING_TEXT_KEYS if k != "location"])
+def test_a_mention_in_code_is_accepted_and_a_closing_reference_in_code_is_not(key):
+    """The policy's code exemption is the mention's alone: GitHub notifies no
+    one for ``@name`` in code, but closes an issue a closing keyword names
+    even there (fail closed)."""
+    for text in ("ask `@octocat` about it", "use ``@octo-org/team``"):
+        assert _review_text_of(_review_text(key, text), key) == text
+    msg = _refusal(lambda: _review_text(key, "see `Closes #3`"))
+    assert "closing keyword" in msg and "#3" not in msg
+
+
+def test_a_prose_section_may_quote_a_mention_in_a_fenced_block():
+    text = "Ran:\n```\ngit log --author=@octocat\n```"
+    assert _review_text("observations", text).sections["observations"] == text
+    assert "@-mention" in _refusal(lambda: _review_text("observations", text + "\n@octocat"))
+
+
+def test_a_location_is_judged_as_the_comment_renders_it_in_a_code_span():
+    """The comment shows a location as a code span, so a mention there
+    notifies no one and is accepted as written; the rules code does not
+    exempt still refuse it."""
+    for text in ("@octocat", "src/@scope/pkg/index.ts:3", "a `@b` c"):
+        assert _review_text("location", text).findings[0].location == text
+    for text, names in (
+        ("Closes #3", "closing keyword"),
+        ("<!-- ai-x -->", "controller marker"),
+        ("GH_TOKEN=FAKEtoken123", "credential-shaped"),
+    ):
+        msg = _refusal(lambda text=text: _review_text("location", text))
+        assert "R1-F1.location" in msg and names in msg
+        assert "FAKEtoken123" not in msg and "#3" not in msg
+
+
+def test_local_review_reports_no_prose_sections():
+    """LOCAL mode is unchanged by #162: a local review is published nowhere and
+    carries no prose sections, while a REMOTE review without them is refused."""
+    payload = parse_control_result(_local_review({}), Phase.REVIEW, WorkflowMode.LOCAL)
+    assert not set(payload) & set(_PROSE_KEYS)
+    remote = {k: v for k, v in GOOD_REVIEW.items() if k not in _PROSE_KEYS}
+    with pytest.raises(ControlResultValidationError, match="missing required field 'spec'"):
+        parse_control_result(block(remote), Phase.REVIEW, WorkflowMode.REMOTE)
 
 
 # -- UPDATE_EPIC request schemas (ADR 0004 D4.7, D8.1) -----------------------

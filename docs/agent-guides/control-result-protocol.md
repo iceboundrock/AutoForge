@@ -75,17 +75,33 @@ A `REVIEW` result carries, besides `phase` and `status`:
 ```text
 round                 integer; must equal the round the controller launched
 reviewed_head_sha     40-hex SHA; must equal the HEAD the controller bound
-review_comment_url    URL of the one PR comment the reviewer posted for the
-                      round (`.../pull/<n>#issuecomment-<id>`); a missing or
-                      non-comment URL fails the result at parse time
 needs_fix_round       boolean; see the review invariant
 findings              list of findings (bounded; see below)
+spec                  prose: does the change do what the issue asks
+standards             prose: does it follow the repository's conventions
+assessment            prose: the overall assessment
+observations          prose: what is worth noting that is not a finding
+verification          prose: what the reviewer ran or read, and its outcome
+summary               prose: the verdict in a few lines
 ```
 
-`review_comment_url` is a claim like every other field: the engine locates
-the comment on the PR, verifies it ([github-safety.md](github-safety.md),
-"After REVIEW"), and persists GitHub's URL of the verified comment as the
-REVIEW -> FIX handoff, never the string the reviewer emitted.
+A REMOTE reviewer publishes nothing (#162): the controller renders the
+round's review comment from the result and posts it itself
+([github-safety.md](github-safety.md), "After REVIEW"), so the result
+names no comment. `round` and `reviewed_head_sha` are cross-checks, never
+targets: a value other than the round and HEAD the controller bound is a
+validation error the reviewer is asked to correct (ADR 0004 D8.1), not a
+verification failure. Each prose section is non-blank, multi-line
+printable text bounded by `MAX_REVIEW_SECTION_CHARS` (`summary` by
+`MAX_REVIEW_SUMMARY_CHARS`), and is rejected, never clipped. Every prose
+section and every finding's `title`, `location` (judged as the code span
+the comment renders it in) and `required_resolution` pass the
+published-content policy (`published_text_problem`;
+[github-safety.md](github-safety.md), "Published content"), and the rendered
+comment as a whole must pass the credential rule and fit GitHub's comment
+limit (ADR 0004 D8.3, D8.6); a refusal is a correction with nothing
+posted. A LOCAL `REVIEW` is unchanged: it carries no prose sections and
+publishes nothing.
 
 ### Review invariant
 
@@ -208,7 +224,7 @@ have the shape of a git SHA (`_SHA_RE`, the same rule as every required SHA
 field; see "SHA fields" above); a SHA rejection quotes the value only when
 it is short enough to be one and otherwise states its length. Every URL
 field (`follow_up_issue_url`,
-`issue_url`, `review_comment_url`, `next_issue_url`) is bounded by
+`issue_url`, `next_issue_url`) is bounded by
 length before `validation.parse_*` sees it, because those parsers quote the
 URL in their error and that error reaches the correction prompt and the run
 log; a malformed `follow_up_issue_url` is thereby a validation error of the

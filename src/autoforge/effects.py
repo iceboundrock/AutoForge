@@ -59,6 +59,7 @@ from .claims import (
     MarkerKind,
     render_implementation_marker,
     render_progress_marker,
+    render_review_marker,
     scan,
 )
 from .errors import ConfigurationError, ControlResultValidationError, StateError
@@ -75,6 +76,9 @@ from .result_parser import (
     MAX_ROADMAP_SECTION_CHARS,
     MAX_URL_CHARS,
     Finding,
+    ReviewResult,
+    check_published_finding,
+    markdown_code_span,
     validate_pr_body,
     validate_pr_title,
     validate_progress_text,
@@ -147,6 +151,65 @@ def progress_comment_body(progress: str, marker: str) -> str:
     return f"{progress}{APPEND_SEPARATOR}{marker}"
 
 
+# The prose sections of a review comment, in rendered order, under their
+# fixed headings (#162).
+REVIEW_SECTION_HEADINGS: tuple[tuple[str, str], ...] = (
+    ("spec", "Spec"),
+    ("standards", "Standards"),
+    ("assessment", "Assessment"),
+    ("observations", "Observations"),
+    ("verification", "Verification"),
+    ("summary", "Summary"),
+)
+
+
+def review_comment_body(result: ReviewResult, head: str, base: str, merge_base: str) -> str:
+    """K4's payload (#162): the round's review comment, rendered from the validated result.
+
+    The heading, the binding line (``head``, ``base`` and ``merge_base`` are
+    the controller's binding of the round, never the reviewer's), the
+    findings, the needs-fix line and the marker are the controller's
+    rendering; the reviewer's prose sections stand under their fixed
+    headings. The marker's ``needs_fix_round`` and ``finding_ids`` and the
+    needs-fix line come from the same result, so they cannot disagree with
+    it or with each other.
+    """
+    lines = [
+        f"# AI Code Review — Round {result.round}",
+        "",
+        f"Reviewed HEAD: {markdown_code_span(head)} against base {markdown_code_span(base)} "
+        f"(merge base {markdown_code_span(merge_base)})",
+        "",
+        "## Findings",
+        "",
+    ]
+    for finding in result.findings:
+        line = f"- **{finding.id}** [{finding.classification}]"
+        if finding.location:
+            line += f" {markdown_code_span(finding.location)}"
+        if finding.title:
+            line += f" — {finding.title}"
+        first, *rest = finding.required_resolution.split("\n")
+        lines.append(line)
+        lines.append(f"  Required resolution: {first}")
+        lines.extend(f"  {text}" if text else "" for text in rest)
+    if not result.findings:
+        lines.append("None.")
+    for key, heading in REVIEW_SECTION_HEADINGS:
+        lines.extend(["", f"## {heading}", "", result.sections[key]])
+    marker = render_review_marker(
+        result.round,
+        head,
+        base,
+        merge_base,
+        result.needs_fix_round,
+        [finding.id for finding in result.findings],
+    )
+    verdict = "YES" if result.needs_fix_round else "NO"
+    lines.extend(["", f"Needs another fix round: {verdict}", "", marker])
+    return "\n".join(lines)
+
+
 def implementation_closing_block(issue_url: str) -> str:
     """What K2's body ends with and K3 appends: ``Closes #n``, a blank line, the marker (#161)."""
     number = parse_issue_url(issue_url).number
@@ -206,7 +269,7 @@ LABEL_NONE = ""
 LABEL_AGENT_PUBLISHES = "agent_publishes"
 LABEL_CONTROLLER_PUBLISHES = "controller_publishes"
 LAUNCH_LABELS = frozenset({LABEL_NONE, LABEL_AGENT_PUBLISHES, LABEL_CONTROLLER_PUBLISHES})
-CONTROLLER_PUBLISHED_PHASES = frozenset({Phase.ANALYZE_EXECUTE, Phase.UPDATE_EPIC})
+CONTROLLER_PUBLISHED_PHASES = frozenset({Phase.ANALYZE_EXECUTE, Phase.REVIEW, Phase.UPDATE_EPIC})
 
 
 def launch_label_for(phase: Phase) -> str:
@@ -1270,7 +1333,12 @@ class AnalyzeContext:
 
 @dataclass(frozen=True)
 class ReviewContext:
-    """``REVIEW``: the round, ``needs_fix_round`` and the findings, in result order."""
+    """``REVIEW``: the round, ``needs_fix_round`` and the findings, in result order.
+
+    It is saved with the round's review comment (K4) alone, and the
+    comment's marker is the context's verdict: the same round, the same
+    ``needs_fix_round`` and the findings' ids in the same order (#162).
+    """
 
     issue_url: str
     pr_url: str
@@ -1284,7 +1352,14 @@ class ReviewContext:
     STORED_BOUND = 2 * MAX_URL_CHARS + MAX_FINDINGS_PER_REVIEW * _FINDING_BOUND + 6 * _KEY_OVERHEAD
 
     @classmethod
-    def from_dict(cls, raw: object, binding: Binding, **_: object) -> ReviewContext:
+    def from_dict(
+        cls,
+        raw: object,
+        binding: Binding,
+        *,
+        records: Sequence[EffectRecord] = (),
+        **_: object,
+    ) -> ReviewContext:
         what = "REVIEW completion context"
         data = _context_header(
             raw, ("issue_url", "pr_url", "round", "needs_fix_round", "findings"), binding, cls.PHASE
@@ -1306,9 +1381,12 @@ class ReviewContext:
         findings: list[dict] = []
         for i, item in enumerate(raw_findings):
             try:
-                parsed = Finding.from_payload(item, round_, i).to_dict()
+                finding = Finding.from_payload(item, round_, i)
+                # The findings were accepted as publishable in the round's comment.
+                check_published_finding(finding)
             except ControlResultValidationError as exc:
                 _fail(f"{what}.findings[{i}]", f"is invalid: {exc}")
+            parsed = finding.to_dict()
             if parsed != item:
                 _fail(f"{what}.findings[{i}]", "is not in the parser's stored form")
             findings.append(parsed)
@@ -1316,6 +1394,15 @@ class ReviewContext:
             _fail(f"{what}.findings", "repeats a finding id")
         if needs_fix != bool(findings):
             _fail(f"{what}.needs_fix_round", "must be true exactly when findings are present")
+        if [r.kind for r in records] != [EffectKind.REVIEW_COMMENT]:
+            _fail(what, "must be saved with exactly one review comment")
+        claim = _marker_claim(REVIEW, records[0].identity["marker"])
+        if (
+            claim.round != round_
+            or claim.needs_fix_round != needs_fix
+            or claim.finding_ids != tuple(f["id"] for f in findings)
+        ):
+            _fail(what, "disagrees with its review comment's marker on the round's verdict")
         return cls(data["issue_url"], data["pr_url"], round_, needs_fix, tuple(findings))
 
     def to_dict(self) -> dict:
