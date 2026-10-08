@@ -72,7 +72,7 @@ never advances the state machine. In brief:
 |---|---|---|
 | `INITIALIZING` | controller | cwd repo == issue repo, issue is in this repo, is not the EPIC, exists and is OPEN |
 | `ANALYZE_EXECUTE` | Claude Code (`analyze_execute`), which makes no GitHub write | an open PR already carrying the issue's `ai-implementation` marker is adopted without running the agent (two block); the agent commits on its worktree's detached HEAD, and the controller checks that HEAD itself (the reported SHA, descent from the default branch head and from the branch head, every commit message), pushes it to `autoforge/<n>`, opens the PR with the agent's title and body (or adopts the open unmarked PR on that branch), journalling each write before it is sent, and reads the PR back at exactly the pushed HEAD; a marker PR or a branch head it did not write blocks |
-| `REVIEW` | OpenCode (`review_round_1`, `review_round_2_5`, `review_round_6_plus`) | the round is bound to the PR, HEAD, base and merge base read from GitHub; exactly one review comment for that round and revision; `needs_fix_round == (len(findings) > 0)`; then controller policy picks `FIX`, `READY_FOR_MERGE`, `REPLAN_REEXECUTE` or `BLOCKED` |
+| `REVIEW` | OpenCode (`review_round_1`, `review_round_2_5`, `review_round_6_plus`), which makes no GitHub write | the round is bound to the PR, HEAD, base and merge base read from GitHub, and a comment already carrying that round's marker blocks (the controller never adopts one it did not post); the reviewer's round and HEAD must match the binding and `needs_fix_round == (len(findings) > 0)`; the controller renders the review comment from the result, journals it, posts it and reads it back, so a crash or `resume` never posts a second one; then controller policy picks `FIX`, `READY_FOR_MERGE`, `REPLAN_REEXECUTE` or `BLOCKED` |
 | `FIX` | Claude Code (`fix`) | the PR is still at the reviewed revision (else back to `REVIEW` without running the fixer); every open finding resolved; a `fixed` resolution moved HEAD; a claimed follow-up issue exists and is OPEN |
 | `REPLAN_REEXECUTE` | OpenCode (`replan_reexecute`) | one durable transaction; the replacement PR is found only by the controller's transaction marker, and the old PR is closed by the controller only while both PRs still match their checkpoints |
 | `READY_FOR_MERGE` | nobody | holding state; with the merge gate open, the full pre-merge verification runs before `MERGE` is entered |
@@ -162,7 +162,14 @@ starts a fresh entry against the new one), and a push whose branch moved after
 the plan was saved (put the branch back, or delete it if it did not exist,
 then `unblock`: the plan completes without launching the agent). A default
 branch changed after the plan was saved blocks before the planned PR is
-created: make the planned branch the default again, then `unblock`. A LOCAL
+created: make the planned branch the default again, then `unblock`.
+`REVIEW` blocks on a comment carrying the round's review marker that it did
+not post, whether it was there before the reviewer ran (a human's, or one a
+reviewer of an earlier AutoForge version posted) or appeared while it ran:
+the controller never adopts, edits or duplicates it. Delete the comment or
+its marker, then `unblock`, and the round runs (or, when the reviewer's
+result was already accepted, its comment is posted from the plan without
+running the reviewer again). A LOCAL
 run cannot be unblocked. The decision table is in
 [Workflow: leaving BLOCKED](agent-guides/workflow.md#leaving-blocked-the-operators-unblock).
 
@@ -372,9 +379,9 @@ ownership or discard uncommitted user changes.
 
 - **The process was interrupted** (`Ctrl-C`, a killed process, a reboot):
   run `autoforge resume`. State is written atomically, and every phase that
-  launches an agent reads GitHub first, so work the agent already did (an
-  open PR, a posted review comment, a pushed fix) is adopted rather than
-  repeated. See
+  launches an agent reads its journal and GitHub first, so work already
+  done (an open PR, a review comment the controller posted, a pushed fix)
+  is adopted or completed rather than repeated. See
   [Workflow: re-entering a phase](agent-guides/workflow.md#re-entering-a-phase).
 - **An agent failed, timed out or returned a malformed result:** a malformed
   `CONTROL_RESULT` from an agent that exited 0 is retried with a correction

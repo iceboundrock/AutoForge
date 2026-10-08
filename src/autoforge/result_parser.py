@@ -35,13 +35,20 @@ D8.2, D8.3, D8.5): no controller marker opener of either prefix, no
 credential-shaped string (refused by the redactor's pattern class, never
 redacted), no closing keyword followed by an issue reference, and no
 ``@``-mention outside code. :func:`published_text_problem` judges one field,
-:func:`published_payload_problem` a whole rendered payload and
+:func:`published_payload_problem` a whole rendered payload,
+:func:`published_markdown_problem` the Markdown several fields compose and
 :func:`commit_message_problem` a commit message; each names the subject and
 the rule, never the text. An ANALYZE_EXECUTE result carries the PR title
 and body the controller publishes (``pr_title``, ``pr_body``), under that
 policy and bounded (``MAX_PR_TITLE_CHARS``, ``MAX_PR_BODY_CHARS``), plus
 the issue URL and the candidate SHA as cross-checks; it names no PR, branch
-or push target (#161). An UPDATE_EPIC result is validated against the
+or push target (#161). A REMOTE REVIEW result carries the prose sections of
+the review comment the controller renders and posts (``spec``,
+``standards``, ``assessment``, ``observations``, ``verification``,
+``summary``), each under that policy and bounded
+(``MAX_REVIEW_SECTION_CHARS``, ``MAX_REVIEW_SUMMARY_CHARS``), and so is
+every finding field the comment shows; ``round`` and ``reviewed_head_sha``
+are cross-checks, and it names no comment (#162). An UPDATE_EPIC result is validated against the
 schema of the request that launched the agent (:class:`UpdateEpicRequest`,
 D4.7): a re-request after publication carries only what it asks for.
 """
@@ -163,6 +170,25 @@ MAX_PROGRESS_CHARS = 16384
 # never clipped, like every other published field.
 MAX_PR_TITLE_CHARS = 256
 MAX_PR_BODY_CHARS = 60000
+# Bounds on the prose sections of a REVIEW result (#162). The controller
+# renders the round's review comment from the result: its heading, binding
+# line, findings, needs-fix line and marker are its own, and each prose
+# section is the reviewer's text under its fixed heading. Rejected, never
+# clipped, like every other published field; the rendered comment as a
+# whole is checked against GitHub's comment limit too (ADR 0004 D8.6),
+# because the findings alone may already exceed it.
+MAX_REVIEW_SECTION_CHARS = 6000
+MAX_REVIEW_SUMMARY_CHARS = 2000
+# The prose sections, in the order the comment renders them, each mapped to
+# its bound.
+REVIEW_PROSE_SECTIONS: tuple[tuple[str, int], ...] = (
+    ("spec", MAX_REVIEW_SECTION_CHARS),
+    ("standards", MAX_REVIEW_SECTION_CHARS),
+    ("assessment", MAX_REVIEW_SECTION_CHARS),
+    ("observations", MAX_REVIEW_SECTION_CHARS),
+    ("verification", MAX_REVIEW_SECTION_CHARS),
+    ("summary", MAX_REVIEW_SUMMARY_CHARS),
+)
 # Bounds on the ``tests`` list: names of what the agent ran, recorded with
 # the result and never published.
 MAX_TESTS_REPORTED = 50
@@ -541,8 +567,13 @@ def _outside(ranges: list[tuple[int, int]], positions: Iterable[int]) -> Iterato
         yield position
 
 
-def _mention_problem(subject: str, text: str) -> str | None:
-    """The refusal of the first ``@``-mention outside code in ``text``, if any."""
+def _exposed_mention(text: str) -> tuple[int, int | None] | None:
+    """The first ``@``-mention of ``text`` GitHub may read as one, if any.
+
+    ``(index, None)`` for a mention outside every code range; ``(index,
+    html)`` for the first mention, even one in code, when raw HTML stands
+    outside code at ``html``, where the code exemption is not trusted.
+    """
     mentions = [m.start() for m in _MENTION_RE.finditer(text)]
     if not mentions:
         return None
@@ -550,16 +581,27 @@ def _mention_problem(subject: str, text: str) -> str | None:
     outside = next(_outside(ranges, mentions), None)
     raw_html = next(_outside(ranges, (m.start() for m in _RAW_HTML_RE.finditer(text))), None)
     if raw_html is not None and outside != mentions[0]:
+        return mentions[0], raw_html
+    if outside is None:
+        return None
+    return outside, None
+
+
+def _mention_problem(subject: str, text: str) -> str | None:
+    """The refusal of the first ``@``-mention outside code in ``text``, if any."""
+    exposed = _exposed_mention(text)
+    if exposed is None:
+        return None
+    index, raw_html = exposed
+    if raw_html is not None:
         return (
-            f"{subject!r} contains an @-mention at index {mentions[0]} and raw HTML (a tag, "
+            f"{subject!r} contains an @-mention at index {index} and raw HTML (a tag, "
             f"comment or autolink) outside code at index {raw_html}; GitHub may read code "
             "near raw HTML as text, so the code exemption does not apply. Remove the HTML or "
             "the mention and re-emit the CONTROL_RESULT."
         )
-    if outside is None:
-        return None
     return (
-        f"{subject!r} contains an @-mention at index {outside} outside a code span or fenced "
+        f"{subject!r} contains an @-mention at index {index} outside a code span or fenced "
         "block; GitHub would notify that user or team. Put such tokens in code spans "
         "(`@name`) and re-emit the CONTROL_RESULT."
     )
@@ -620,6 +662,53 @@ def published_payload_problem(subject: str, payload: str) -> str | None:
         "the text rendered after it. Published text is refused, never redacted; change the "
         "fields so that no credential shape remains and re-emit the CONTROL_RESULT."
     )
+
+
+def published_markdown_problem(subject: str, markdown: str) -> str | None:
+    """Why the Markdown ``subject`` composed of several fields may not be published, or ``None``.
+
+    Judges the mention rule on the composition (ADR 0004 D8.2): fields that
+    pass one by one do not make Markdown that passes, because a field's
+    unclosed fence, unpaired backtick or raw HTML can change how GitHub
+    reads the text rendered after it (a fence one field leaves open is
+    closed by another's, and the mention that followed that fence is no
+    longer code). ``markdown`` is everything the controller renders before
+    its own marker, the one raw HTML it writes. Names the payload and an
+    index, never the text.
+    """
+    exposed = _exposed_mention(markdown)
+    if exposed is None:
+        return None
+    index, raw_html = exposed
+    where = (
+        f"and raw HTML (a tag, comment or autolink) outside code at index {raw_html}, near "
+        "which GitHub may read code as text"
+        if raw_html is not None
+        else "outside a code span or fenced block"
+    )
+    return (
+        f"the rendered {subject!r} contains an @-mention at index {index} {where}, although "
+        "each field may pass alone: an unclosed fence, an unpaired backtick or raw HTML in one "
+        "field changes how GitHub reads the fields rendered after it. Close every code span and "
+        "fenced block in the field that opens it, drop the raw HTML or the mention, and "
+        "re-emit the CONTROL_RESULT."
+    )
+
+
+def markdown_code_span(text: str) -> str:
+    """``text`` as one Markdown code span, whatever backticks it holds.
+
+    The delimiter is one backtick longer than the longest run inside, and a
+    space pads a value that starts or ends with a backtick, or that starts
+    and ends with a space (CommonMark strips one such pair), so the span
+    shows ``text`` exactly. One-line text only; an empty value is ``""``.
+    """
+    if not text:
+        return ""
+    longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
+    fence = "`" * (longest + 1)
+    pad = " " if text[0] == "`" or text[-1] == "`" or (text[0] == " " and text[-1] == " ") else ""
+    return f"{fence}{pad}{text}{pad}{fence}"
 
 
 def _names_issue(m: re.Match[str], repository: str, issue_number: int) -> bool:
@@ -960,11 +1049,23 @@ class Finding:
 
 @dataclass
 class ReviewResult:
+    """What a REMOTE reviewer reports; the controller publishes it (#162).
+
+    ``round`` and ``reviewed_head_sha`` are cross-checks against the round
+    and the HEAD the controller bound; neither is a target, and the result
+    names no comment. ``needs_fix_round`` and ``findings`` are the verdict.
+    ``sections`` holds the prose of :data:`REVIEW_PROSE_SECTIONS`, in that
+    order. Every field the controller renders into the review comment (the
+    prose, and each finding's ``title``, ``location`` and
+    ``required_resolution``) is held to the published-content policy; the
+    findings' shape and bounds are LOCAL's too, unchanged.
+    """
+
     round: int
     reviewed_head_sha: str
-    review_comment_url: str
     needs_fix_round: bool
     findings: list[Finding] = field(default_factory=list)
+    sections: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_payload(cls, p: dict) -> ReviewResult:
@@ -974,13 +1075,59 @@ class ReviewResult:
             raise ControlResultValidationError("'round' must be an int >= 1")
         needs_fix = _req_bool(p, "needs_fix_round", ph)
         findings = _parse_findings(p, rnd, needs_fix)
+        for finding in findings:
+            check_published_finding(finding)
+        sections = {
+            key: validate_review_section(key, p.get(key)) for key, _ in REVIEW_PROSE_SECTIONS
+        }
         return cls(
             round=rnd,
             reviewed_head_sha=_req_sha(p, "reviewed_head_sha", ph),
-            review_comment_url=_req_url(p, "review_comment_url", ph, "comment"),
             needs_fix_round=needs_fix,
             findings=findings,
+            sections=sections,
         )
+
+
+def check_published_finding(finding: Finding) -> None:
+    """Refuse ``finding`` unless the round's review comment may show it (#162).
+
+    Each field is judged as the comment renders it: the location inside a
+    code span, the others as Markdown text. A persisted REVIEW plan's
+    findings are held to the same rule when they are loaded (ADR 0004 D4.6).
+    """
+    _review_published(finding.title, f"{finding.id}.title")
+    _review_published(markdown_code_span(finding.location), f"{finding.id}.location")
+    if credential_classes(finding.location):
+        # The span's backticks must not hide a shape the bare value has: the
+        # findings are persisted as reported, in plain state.
+        _review_published(finding.location, f"{finding.id}.location")
+    _review_published(finding.required_resolution, f"{finding.id}.required_resolution")
+
+
+def validate_review_section(key: str, text: object) -> str:
+    """``text`` as REVIEW prose section ``key``, or a rejection (#162).
+
+    Non-blank, within the section's bound (:data:`REVIEW_PROSE_SECTIONS`),
+    multi-line text with no other control character, and publishable
+    (:func:`published_text_problem`): the controller renders it into the
+    round's review comment under its fixed heading. The checks
+    :meth:`ReviewResult.from_payload` applies, with the same messages, so a
+    persisted section can be re-validated under the parser's rules.
+    """
+    ph = "REVIEW"
+    limit = dict(REVIEW_PROSE_SECTIONS)[key]
+    stripped = _req_str({key: text}, key, ph)
+    stripped = _multi_line(_bounded(stripped, ph, "result", key, limit), ph, "result", key)
+    return _review_published(stripped, key)
+
+
+def _review_published(text: str, subject: str) -> str:
+    """Refuse REVIEW text ``subject`` under the published-content policy."""
+    problem = published_text_problem(subject, text)
+    if problem is not None:
+        raise ControlResultValidationError(f"REVIEW: field {problem}")
+    return text
 
 
 @dataclass

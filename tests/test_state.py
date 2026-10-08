@@ -5,7 +5,12 @@ import json
 
 import pytest
 
-from autoforge.claims import render_follow_up_marker, render_progress_marker
+from autoforge.claims import (
+    REVIEW,
+    render_follow_up_marker,
+    render_progress_marker,
+    render_review_marker,
+)
 from autoforge.effects import (
     LABEL_AGENT_PUBLISHES,
     LABEL_CONTROLLER_PUBLISHES,
@@ -23,9 +28,11 @@ from autoforge.effects import (
     compose_append,
     payload_chars,
     progress_comment_body,
+    review_comment_body,
     sha256_text,
 )
 from autoforge.errors import StateError
+from autoforge.result_parser import Finding, ReviewResult
 from autoforge.state import AutoForgeState, StatePaths, load_state, save_state
 from autoforge.transitions import Phase, WorkflowMode
 
@@ -1753,22 +1760,79 @@ def _fix_state(**kw):
     return make_state(**base)
 
 
-def _review_state(**kw):
-    context = ReviewContext(
+def _review_marker(round_=1, needs_fix_round=True, finding_ids=("R1-F1",)):
+    return render_review_marker(
+        round_, CANDIDATE_SHA, "main", BASE_SHA, needs_fix_round, list(finding_ids)
+    )
+
+
+# The reviewer's prose sections, in the parser's stored form (#162).
+REVIEW_SECTIONS = {
+    "spec": "Meets the issue's acceptance criteria.",
+    "standards": "Follows the repository's conventions.",
+    "assessment": "One problem remains.",
+    "observations": "None.",
+    "verification": "Ran `make check`.",
+    "summary": "Needs a fix round.",
+}
+
+
+def _review_body(findings=(FIX_FINDINGS[0],), sections=REVIEW_SECTIONS):
+    """The comment the controller renders from a round-1 result at the bound revision."""
+    result = ReviewResult(
+        round=1,
+        reviewed_head_sha=CANDIDATE_SHA,
+        needs_fix_round=bool(findings),
+        findings=[Finding(**f) for f in findings],
+        sections=dict(sections),
+    )
+    return review_comment_body(result, CANDIDATE_SHA, "main", BASE_SHA)
+
+
+def _review_record(marker=None, position=0, findings=(FIX_FINDINGS[0],), body=None):
+    """K4, the round's review comment, planned the way the engine's REVIEW does (#162).
+
+    The body is the controller's rendering of ``findings`` with the shared
+    sections, ending in ``marker`` (the rendering's own by default).
+    """
+    rendered = _review_body(findings) if body is None else body
+    own = _review_marker(1, bool(findings), tuple(f["id"] for f in findings))
+    if marker is not None:
+        assert rendered.endswith(own)
+        rendered = rendered[: -len(own)] + marker
+    return EffectRecord.plan(
+        position,
+        EffectKind.REVIEW_COMMENT,
+        _owner(Phase.REVIEW),
+        identity={"pr_url": PR42, "marker": own if marker is None else marker},
+        target={"pr_url": PR42},
+        precondition={"absent": True},
+        payload={"body": rendered},
+    )
+
+
+def _review_context(findings=(FIX_FINDINGS[0],), sections=REVIEW_SECTIONS):
+    return ReviewContext(
         issue_url=EFFECT_ISSUE,
         pr_url=PR42,
         round=1,
-        needs_fix_round=True,
-        findings=(dict(FIX_FINDINGS[0]),),
+        needs_fix_round=bool(findings),
+        findings=tuple(dict(f) for f in findings),
+        sections=dict(sections),
     )
+
+
+def _review_state(**kw):
+    """A REVIEW entry: the K4 plan saved with the context whose verdict its marker is."""
     base = dict(
         phase=Phase.REVIEW,
         current_pr_url=PR42,
         review_round=0,
         attempt=1,
-        launch_label=LABEL_AGENT_PUBLISHES,
+        launch_label=LABEL_CONTROLLER_PUBLISHES,
+        effect_records=[_review_record().to_dict()],
         entry_observation=_observation(Phase.REVIEW),
-        completion_context=context.to_dict(),
+        completion_context=_review_context().to_dict(),
     )
     base.update(kw)
     return make_state(**base)
@@ -1909,9 +1973,10 @@ def test_a_fix_plan_in_every_stage_round_trips_with_its_completion_context(tmp_p
 
 
 def test_review_and_replan_completion_contexts_round_trip_bound_to_their_state(tmp_path):
-    """D4.6: the REVIEW context (round, needs_fix_round, findings) and the
-    REPLAN_REEXECUTE context and push record (bound to the state's replan
-    transaction id) round-trip; a context saved without records is legal."""
+    """D4.6: the REVIEW context (round, needs_fix_round, findings) with the one
+    review comment (K4) its marker binds (#162), and the REPLAN_REEXECUTE
+    context and push record (bound to the state's replan transaction id),
+    round-trip."""
     for name, s in (("review", _review_state()), ("replan", _replan_state())):
         p = tmp_path / f"{name}.json"
         save_state(s, p)
@@ -1921,7 +1986,9 @@ def test_review_and_replan_completion_contexts_round_trip_bound_to_their_state(t
         assert effects.context is not None
         assert effects.context.to_dict() == s.completion_context
     review = load_state(tmp_path / "review.json").phase_effects()
-    assert review.records == () and review.context.round == 1
+    assert review.records == (_review_record(),)
+    assert [r.kind for r in review.records] == [EffectKind.REVIEW_COMMENT]
+    assert review.context == _review_context() and review.context.round == 1
     replan = load_state(tmp_path / "replan.json").phase_effects()
     assert replan.records[0].owner.transaction_id == EFFECT_TXN
     assert replan.context.transaction_id == EFFECT_TXN
@@ -2434,6 +2501,483 @@ def test_update_epic_context_of_an_adopted_legacy_comment_loads_with_no_record(t
     assert isinstance(effects.context, UpdateEpicContext)
 
 
+# The REVIEW context and its review comment (#162): REVIEW completes from its
+# context by posting the round's one comment (K4), whose marker is the verdict
+# the context holds.
+
+
+def _follow_up_owned_by_review():
+    """A follow-up issue record relabelled as REVIEW's, which REVIEW never plans."""
+    d = _follow_up_record(0, "R1-F1").to_dict()
+    d["owner"]["phase"] = Phase.REVIEW.value
+    return d
+
+
+@pytest.mark.parametrize("phase", [Phase.REVIEW, Phase.BLOCKED])
+@pytest.mark.parametrize(
+    ("records", "needle"),
+    [
+        pytest.param(
+            [],
+            "REVIEW completion context must be saved with exactly one review comment",
+            id="no-record",
+        ),
+        pytest.param(
+            [_review_record().to_dict(), _review_record(position=1).to_dict()],
+            "REVIEW completion context must be saved with exactly one review comment",
+            id="two-records",
+        ),
+        pytest.param(
+            [_follow_up_owned_by_review()],
+            "effect record 0 is a follow_up_issue effect, which REVIEW never plans",
+            id="a-kind-review-never-plans",
+        ),
+    ],
+)
+def test_review_context_without_its_one_review_comment_is_refused(tmp_path, phase, records, needle):
+    """#162, D4.6: the context is saved in the same save as the round's one K4
+    record and completes by posting it, so it loads only beside exactly that
+    record. No record, two of them, or a record of another kind is corruption:
+    refused on load, and the file left unchanged."""
+    s = _review_state(phase=phase, effect_records=records)
+    p = _write(tmp_path / "state.json", s.to_dict())
+    before = p.read_bytes()
+    with pytest.raises(StateError) as exc:
+        load_state(p)
+    assert needle in str(exc.value)
+    assert p.read_bytes() == before
+
+
+_NO_FINDING_IDS_MARKER = REVIEW.render(
+    {
+        "round": 1,
+        "reviewed_head_sha": CANDIDATE_SHA,
+        "reviewed_base_ref": "main",
+        "reviewed_merge_base_sha": BASE_SHA,
+        "needs_fix_round": True,
+    }
+)
+
+
+@pytest.mark.parametrize(
+    ("findings", "marker"),
+    [
+        pytest.param((), _review_marker(2, False, ()), id="round"),
+        pytest.param((FIX_FINDINGS[0],), _review_marker(1, False, ("R1-F1",)), id="needs-fix"),
+        pytest.param((), _review_marker(1, True, ()), id="needs-fix-on-a-clean-round"),
+        pytest.param((FIX_FINDINGS[0],), _review_marker(1, True, ("R1-F2",)), id="finding-id"),
+        pytest.param(
+            FIX_FINDINGS[:2], _review_marker(1, True, ("R1-F2", "R1-F1")), id="finding-order"
+        ),
+        pytest.param(FIX_FINDINGS[:2], _review_marker(1, True, ("R1-F1",)), id="a-finding-short"),
+        pytest.param((FIX_FINDINGS[0],), _NO_FINDING_IDS_MARKER, id="no-finding-ids"),
+    ],
+)
+def test_review_context_disagreeing_with_its_comments_marker_is_refused(tmp_path, findings, marker):
+    """#162: the comment's marker is the context's verdict -- the same round, the
+    same needs_fix_round, and the findings' ids in the same order. A pair that
+    disagrees would publish one verdict and route the run on another, so it
+    is refused on load; the same context beside its own marker loads."""
+    context = _review_context(findings).to_dict()
+    ids = tuple(f["id"] for f in findings)
+    agreeing = _review_record(_review_marker(1, bool(findings), ids), findings=findings)
+    p = tmp_path / "state.json"
+    save_state(_review_state(effect_records=[agreeing.to_dict()], completion_context=context), p)
+    effects = load_state(p).phase_effects()
+    assert effects.records == (agreeing,) and effects.context == _review_context(findings)
+
+    disagreeing = _review_record(marker, findings=findings)
+    s = _review_state(effect_records=[disagreeing.to_dict()], completion_context=context)
+    p = _write(tmp_path / "state.json", s.to_dict())
+    before = p.read_bytes()
+    with pytest.raises(StateError) as exc:
+        load_state(p)
+    assert (
+        "REVIEW completion context disagrees with its review comment's marker on the round's "
+        "verdict" in str(exc.value)
+    )
+    assert p.read_bytes() == before
+
+
+def _edit_body(old, new):
+    """Replace the one occurrence of ``old`` in the persisted K4 body with ``new``."""
+
+    def mutate(d):
+        payload = d["effect_records"][0]["payload"]
+        assert payload["body"].count(old) == 1
+        payload["body"] = payload["body"].replace(old, new)
+
+    return mutate
+
+
+@pytest.mark.parametrize("phase", [Phase.REVIEW, Phase.BLOCKED])
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        # Each edit leaves the record valid on its own (bounded, redaction-
+        # invariant, ending in its marker): only its context can tell.
+        pytest.param(
+            _edit_body("One problem remains.", "One problem remains, @octocat."),
+            id="mention-in-a-section",
+        ),
+        pytest.param(
+            _edit_body("Needs a fix round.", "Needs a fix round.\n<!-- ai-review-result: {} -->"),
+            id="marker-opener-in-a-section",
+        ),
+        pytest.param(
+            _edit_body("Resolve problem 1.", "Resolve problem 1. Closes #3"),
+            id="closing-keyword-in-a-finding",
+        ),
+        pytest.param(
+            _edit_body("### R1-F1 [blocked]", "### R1-F1 [blocked] thanks @octocat"),
+            id="mention-in-a-finding-line",
+        ),
+        pytest.param(
+            _edit_body(
+                "# AI Code Review — Round 1\n", "# AI Code Review — Round 1\n\ncc @org/team\n"
+            ),
+            id="text-outside-every-field",
+        ),
+        pytest.param(
+            _edit_body(f"Reviewed HEAD: `{CANDIDATE_SHA}`", f"Reviewed HEAD: `{BASE_SHA}`"),
+            id="binding-line",
+        ),
+        pytest.param(_edit_body("## Observations\n\nNone.\n\n", ""), id="a-section-dropped"),
+        pytest.param(
+            _edit_body("Needs another fix round: YES", "Needs another fix round: NO"),
+            id="needs-fix-line",
+        ),
+        pytest.param(
+            lambda d: d["effect_records"][0]["payload"].update(body=_review_marker()),
+            id="the-marker-alone",
+        ),
+    ],
+)
+def test_a_persisted_review_comment_that_is_not_its_contexts_rendering_is_refused(
+    tmp_path, phase, mutate
+):
+    """#162, D4.6: a resumed K4 posts its persisted body with no reviewer result
+    in between, so the body must be exactly what the controller renders from
+    the context saved with it (the findings and prose sections the parser
+    accepted) at the revision its marker binds. A body altered after the
+    save -- an @-mention, a marker opener or a closing keyword added to a
+    field or around them, the binding line, a section or the needs-fix line
+    changed -- would publish what no validated result holds: refused on
+    load, before recovery can issue it, and the file left unchanged."""
+    d = _review_state(phase=phase).to_dict()
+    mutate(d)
+    p = _write(tmp_path / "state.json", d)
+    before = p.read_bytes()
+    with pytest.raises(StateError) as exc:
+        load_state(p)
+    assert (
+        "REVIEW completion context is saved with a review comment whose body is not the "
+        "comment the controller renders from it" in str(exc.value)
+    )
+    assert p.read_bytes() == before
+
+
+def _sections_with(**change):
+    sections = dict(REVIEW_SECTIONS)
+    sections.update(change)
+    return sections
+
+
+def _section_edit(key, value):
+    """Set section ``key`` in the context and re-render the body to agree with it.
+
+    The pair is consistent, so only the parser's rules for the section can
+    refuse it: an edit of state that changed both is still caught.
+    """
+
+    def mutate(d):
+        sections = _sections_with(**{key: value})
+        d["completion_context"]["sections"] = sections
+        record = d["effect_records"][0]
+        record["payload"]["body"] = _review_body(sections=sections)
+
+    return mutate
+
+
+def _sections_raw(change):
+    """Change the context's raw sections only (no body can render the result)."""
+
+    def mutate(d):
+        change(d["completion_context"]["sections"])
+
+    return mutate
+
+
+def _drop(key):
+    def change(sections):
+        del sections[key]
+
+    return change
+
+
+@pytest.mark.parametrize(
+    ("mutate", "needle"),
+    [
+        pytest.param(
+            _section_edit("assessment", "One problem remains, @octocat."),
+            "sections.assessment is invalid: REVIEW: field 'assessment' contains an @-mention",
+            id="mention",
+        ),
+        pytest.param(
+            _section_edit("summary", "Done.\n<!-- ai-review-result: {} -->"),
+            "sections.summary is invalid: REVIEW: field 'summary' contains a controller marker "
+            "opener",
+            id="marker-opener",
+        ),
+        pytest.param(
+            _section_edit("spec", "Closes #3"),
+            "sections.spec is invalid: REVIEW: field 'spec' contains a closing keyword",
+            id="closing-keyword",
+        ),
+        pytest.param(
+            _section_edit("verification", "bad\x01text"),
+            "sections.verification is invalid: REVIEW: result field 'verification' contains a "
+            "control character (U+0001",
+            id="control-character",
+        ),
+        pytest.param(
+            _section_edit("summary", "x" * 2001),
+            "sections.summary is invalid: REVIEW: result field 'summary' is 2001 characters; "
+            "the controller accepts at most 2000",
+            id="over-its-bound",
+        ),
+        pytest.param(
+            _section_edit("summary", "  Needs a fix round.  "),
+            "sections.summary is not in the parser's stored form",
+            id="unstripped",
+        ),
+        pytest.param(
+            _section_edit("observations", "   "),
+            "sections.observations is invalid: CONTROL_RESULT for REVIEW missing required "
+            "field 'observations'",
+            id="blank",
+        ),
+        pytest.param(
+            _sections_raw(lambda sections: sections.update(summary=5)),
+            "sections.summary is invalid: REVIEW: field 'summary' must be a string",
+            id="not-a-string",
+        ),
+        pytest.param(
+            _sections_raw(lambda sections: sections.update(standards=CREDENTIAL_SAMPLE)),
+            "sections.standards is invalid: REVIEW: field 'standards' contains a "
+            "credential-shaped string",
+            id="credential",
+        ),
+        pytest.param(
+            _sections_raw(_drop("summary")),
+            "sections is missing key(s) ['summary']",
+            id="missing-section",
+        ),
+        pytest.param(
+            _sections_raw(lambda sections: sections.update(notes="More.")),
+            "sections has unknown key(s) ['notes']",
+            id="unknown-section",
+        ),
+        pytest.param(
+            lambda d: d["completion_context"].pop("sections"),
+            "REVIEW completion context is missing key(s) ['sections']",
+            id="no-sections",
+        ),
+    ],
+)
+def test_review_context_sections_not_in_the_parsers_stored_form_are_refused(
+    tmp_path, mutate, needle
+):
+    """#162, D4.6: the prose sections the K4 body renders are saved with it and
+    get the parser's rules again on load, so a state edited consistently
+    (section and body alike) still cannot make recovery publish text the
+    result path would have refused. Refused, never normalized, the message
+    never quoting the refused text, and the file left unchanged."""
+    d = _review_state().to_dict()
+    mutate(d)
+    p = _write(tmp_path / "state.json", d)
+    before = p.read_bytes()
+    with pytest.raises(StateError) as exc:
+        load_state(p)
+    assert needle in str(exc.value)
+    assert CREDENTIAL_SAMPLE not in str(exc.value) and "@octocat" not in str(exc.value)
+    assert p.read_bytes() == before
+
+
+def test_a_review_context_and_its_comment_round_trip_with_every_published_field(tmp_path):
+    """#162: findings with a title and a location (rendered in a code span,
+    backticks and all) and multi-line prose round-trip: the body re-rendered
+    on load is byte-identical to the one saved."""
+    findings = (
+        dict(FIX_FINDINGS[0], title="A title", location="src/a.py:1 `x`"),
+        dict(FIX_FINDINGS[1], required_resolution="First line.\n\n- then a list\n\tand a tab"),
+    )
+    sections = _sections_with(spec="Line one.\n\n## A heading of its own\n\nLine two.")
+    record = _review_record(findings=findings, body=_review_body(findings, sections))
+    context = _review_context(findings, sections)
+    p = tmp_path / "state.json"
+    save_state(
+        _review_state(effect_records=[record.to_dict()], completion_context=context.to_dict()), p
+    )
+    effects = load_state(p).phase_effects()
+    assert effects.records == (record,) and effects.context == context
+    assert effects.context.sections == sections
+
+
+def _review_plan(findings, sections=REVIEW_SECTIONS):
+    """A REVIEW state whose context and K4 body agree: only the rules can refuse it."""
+    record = _review_record(findings=findings, body=_review_body(findings, sections))
+    return _review_state(
+        effect_records=[record.to_dict()],
+        completion_context=_review_context(findings, sections).to_dict(),
+    ).to_dict()
+
+
+@pytest.mark.parametrize(
+    ("findings", "sections"),
+    [
+        pytest.param(
+            (
+                dict(FIX_FINDINGS[0], required_resolution="Rename it:\n~~~"),
+                dict(FIX_FINDINGS[1], required_resolution="See\n~~~\n@octocat\n~~~"),
+            ),
+            REVIEW_SECTIONS,
+            id="a-fence-closed-by-the-next-finding",
+        ),
+        pytest.param(
+            (FIX_FINDINGS[0],),
+            _sections_with(observations="Logs:\n```", verification="Ran:\n```\n@octocat"),
+            id="a-fence-closed-by-the-next-section",
+        ),
+        pytest.param(
+            (dict(FIX_FINDINGS[0], title="Use `@octocat`"),),
+            _sections_with(verification="<pre>"),
+            id="raw-html-beside-a-mention-in-code",
+        ),
+    ],
+)
+def test_a_review_plan_whose_fields_compose_a_mention_outside_code_is_refused(
+    tmp_path, findings, sections
+):
+    """#162 (R2-F1), D4.6: every field passes the parser's rules alone and the
+    body is exactly the context's rendering, but in the composed comment one
+    field's fence or raw HTML leaves another's mention outside code. The
+    result path refuses such a comment before planning it, so a saved plan
+    holding one was never accepted: loading it is refused, never replayed,
+    the message never quoting the text, and the file left unchanged."""
+    p = _write(tmp_path / "state.json", _review_plan(findings, sections))
+    before = p.read_bytes()
+    with pytest.raises(StateError) as exc:
+        load_state(p)
+    assert (
+        "REVIEW completion context is saved with a review comment the controller may not "
+        "publish: the rendered 'review comment' contains an @-mention" in str(exc.value)
+    )
+    assert "@octocat" not in str(exc.value)
+    assert p.read_bytes() == before
+
+
+def test_a_review_plan_keeps_each_fields_code_in_the_composed_comment(tmp_path):
+    """#162 (R2-F1): a title ending in an unpaired backtick and a resolution
+    that opens with a fence are blocks of their own in the comment, so the
+    mentions they hold stay code (in a list item they did not: the backtick
+    paired with the resolution's, and the prefix pushed the fence off its
+    column). The plan loads as saved."""
+    findings = (
+        dict(FIX_FINDINGS[0], title="A `", required_resolution="`@octocat`"),
+        dict(FIX_FINDINGS[1], required_resolution="~~~\n@octocat\n~~~"),
+    )
+    body = _review_body(findings)
+    assert "### R1-F1 [blocked] — A `\n\nRequired resolution:\n\n`@octocat`\n\n" in body
+    assert "### R1-F2 [blocked]\n\nRequired resolution:\n\n~~~\n@octocat\n~~~\n\n" in body
+    p = tmp_path / "state.json"
+    _write(p, _review_plan(findings))
+    effects = load_state(p).phase_effects()
+    assert effects.context == _review_context(findings)
+    assert effects.records[0].body == body
+
+
+def _set_finding(**change):
+    def mutate(finding):
+        finding.update(change)
+
+    return mutate
+
+
+def _drop_finding_key(key):
+    def mutate(finding):
+        del finding[key]
+
+    return mutate
+
+
+@pytest.mark.parametrize(
+    ("mutate", "needle"),
+    [
+        pytest.param(
+            _set_finding(required_resolution="  Resolve problem 1.  "),
+            "findings[0] is not in the parser's stored form",
+            id="unstripped",
+        ),
+        pytest.param(
+            _drop_finding_key("title"),
+            "findings[0] is not in the parser's stored form",
+            id="missing-key",
+        ),
+        pytest.param(
+            _set_finding(severity="high"),
+            "findings[0] is not in the parser's stored form",
+            id="extra-key",
+        ),
+        pytest.param(
+            _set_finding(classification="maybe"),
+            "findings[0] is invalid: REVIEW: finding R1-F1 classification must be one of",
+            id="classification",
+        ),
+        pytest.param(
+            _set_finding(title="two\nlines"),
+            "findings[0] is invalid: REVIEW:",
+            id="multi-line-title",
+        ),
+        # The comment published the findings: the parser's publication rules
+        # are its rules for these fields too (#162).
+        pytest.param(
+            _set_finding(title="thanks @octocat"),
+            "findings[0] is invalid: REVIEW: field 'R1-F1.title'",
+            id="mention",
+        ),
+        pytest.param(
+            _set_finding(required_resolution="Closes #3"),
+            "findings[0] is invalid: REVIEW: field 'R1-F1.required_resolution'",
+            id="closing-keyword",
+        ),
+        pytest.param(
+            _set_finding(title="<!-- ai-review-result: x -->"),
+            "findings[0] is invalid: REVIEW: field 'R1-F1.title'",
+            id="marker",
+        ),
+        pytest.param(
+            _set_finding(location="ghp_" + "a" * 36),
+            "findings[0] is invalid: REVIEW: field 'R1-F1.location'",
+            id="credential",
+        ),
+    ],
+)
+def test_review_context_findings_not_in_the_parsers_stored_form_are_refused(
+    tmp_path, mutate, needle
+):
+    """D4.6: a stored finding is exactly what the parser returns for it, and
+    the next FIX round's open findings come from it; one the parser would
+    refuse or store differently is corruption, never normalized on load."""
+    d = _review_state().to_dict()
+    mutate(d["completion_context"]["findings"][0])
+    p = _write(tmp_path / "state.json", d)
+    with pytest.raises(StateError) as exc:
+        load_state(p)
+    assert f"REVIEW completion context.{needle}" in str(exc.value)
+    assert "a" * 36 not in str(exc.value)
+
+
 def test_records_persisted_without_their_completion_context_are_refused(tmp_path):
     """D4.6: records are written in the same save as the context they complete;
     records without one could never complete the phase, and are corruption."""
@@ -2597,7 +3141,7 @@ def test_a_legacy_remote_resume_is_labelled_by_the_contract_it_launched_under(
     ``agent_publishes``; before a launch, or outside a publishing phase, it gets
     no label. The label survives the save that relabels the file. A legacy
     re-entry is one into a phase the controller now publishes for: UPDATE_EPIC
-    (#160) and ANALYZE_EXECUTE (#161)."""
+    (#160), ANALYZE_EXECUTE (#161) and REVIEW (#162)."""
     from autoforge.effects import is_legacy_reentry
 
     p = _write(
@@ -2608,7 +3152,7 @@ def test_a_legacy_remote_resume_is_labelled_by_the_contract_it_launched_under(
     assert loaded.launch_label == label
     assert loaded.phase_effects().empty
     assert is_legacy_reentry(loaded.phase, loaded.attempt, loaded.launch_label) == (
-        phase in (Phase.ANALYZE_EXECUTE, Phase.UPDATE_EPIC) and attempt >= 1
+        phase in (Phase.ANALYZE_EXECUTE, Phase.REVIEW, Phase.UPDATE_EPIC) and attempt >= 1
     )
     save_state(loaded, p)
     assert json.loads(p.read_text(encoding="utf-8"))["launch_label"] == label

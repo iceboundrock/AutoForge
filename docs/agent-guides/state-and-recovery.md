@@ -143,14 +143,21 @@ publishes with no agent result in between is validated again under the
 parser's rules for its field, not only for its bounds and redaction
 invariance: the `UPDATE_EPIC` roadmap section in the
 completion context (`validate_roadmap_section`), the progress text of a
-progress-comment record (`validate_progress_text`), and the title and the
+progress-comment record (`validate_progress_text`), the title and the
 agent's part of the body of an `implementation_pr` record
-(`validate_pr_title`, `validate_pr_body`), in the stripped form the parser
-returns. Controller text stored with them is checked to be exactly what
-the controller renders: an `implementation_pr` body ends in a blank line
-and the closing block of its owner's issue (`Closes #n`, a blank line, the
-implementation marker), an `adopt_pr` block is that closing block, and
-both PRs are in the issue's repository, the one `Closes #n` names. The
+(`validate_pr_title`, `validate_pr_body`), and the findings and prose
+sections of a `REVIEW` completion context (`check_published_finding`,
+`validate_review_section`), in the stripped form the parser returns.
+Controller text stored with them is checked to be exactly what the
+controller renders: an `implementation_pr` body ends in a blank line and
+the closing block of its owner's issue (`Closes #n`, a blank line, the
+implementation marker), an `adopt_pr` block is that closing block, both
+PRs are in the issue's repository, the one `Closes #n` names, and a
+`review_comment` body is byte-for-byte the comment `review_comment_body`
+renders from the `REVIEW` context saved with it, at the HEAD, base and
+merge base its marker binds, and passes `review_comment_problem` as a
+whole, so no text in it, and no composition of its fields, escaped the
+parser. The
 existing body an `adopt_pr` appends to is a human's text and keeps only
 the append checks. A stored value the result path would have refused is a
 `StateError`, never rewritten. LOCAL

@@ -64,9 +64,9 @@ from tests.conftest import (
     SHA_C,
     FakeGitHub,
     block,
-    comment_url,
+    controller_review_comment,
     make_engine,
-    review_comment_body,
+    review_result,
 )
 
 REPLACEMENT_PR = "https://github.com/owner/repo/pull/43"
@@ -270,15 +270,9 @@ def _replan_payload(**override) -> dict:
 
 
 def _trigger_review_payload() -> dict:
-    return {
-        "phase": "REVIEW",
-        "status": "success",
-        "round": 20,
-        "reviewed_head_sha": SHA_A,
-        "review_comment_url": comment_url(PR, 120),
-        "needs_fix_round": True,
-        "findings": [{"id": "R20-F1", "classification": "nit", "required_resolution": "x"}],
-    }
+    return review_result(
+        20, SHA_A, [{"id": "R20-F1", "classification": "nit", "required_resolution": "x"}]
+    )
 
 
 def _park_at_hard_threshold(tmp_state_dir, gh, agent):
@@ -301,7 +295,6 @@ def _replan_agent(gh, *, payload_over=None, marker_over=None, body=None, url=REP
 
     def agent(req):
         if req.phase == "REVIEW":
-            gh.add_comment(PR, 120, review_comment_body(20, SHA_A, True, ["R20-F1"]))
             return block(_trigger_review_payload())
         assert req.phase == "REPLAN_REEXECUTE", req.phase
         gh.add_pr(
@@ -553,27 +546,18 @@ def test_default_stagnation_routes_to_replan_through_engine(tmp_state_dir):
             rounds["number"] += 1
             number = rounds["number"]
             sha = gh.prs[PR].head_sha
-            gh.add_comment(
-                PR,
-                300 + number,
-                review_comment_body(number, sha, True, [f"R{number}-F1"]),
-            )
             return block(
-                {
-                    "phase": "REVIEW",
-                    "status": "success",
-                    "round": number,
-                    "reviewed_head_sha": sha,
-                    "review_comment_url": comment_url(PR, 300 + number),
-                    "needs_fix_round": True,
-                    "findings": [
+                review_result(
+                    number,
+                    sha,
+                    [
                         {
                             "id": f"R{number}-F1",
                             "classification": "non-blocked",
                             "required_resolution": "add a regression test",
                         }
                     ],
-                }
+                )
             )
         if req.phase == "FIX":
             gh.set_head(SHA_B)
@@ -617,23 +601,18 @@ def test_replan_limit_blocks_through_engine(tmp_state_dir):
 
     def agent(req):
         assert req.phase == "REVIEW"
-        gh.add_comment(PR, 401, review_comment_body(2, SHA_A, True, ["R2-F1"]))
         return block(
-            {
-                "phase": "REVIEW",
-                "status": "success",
-                "round": 2,
-                "reviewed_head_sha": SHA_A,
-                "review_comment_url": comment_url(PR, 401),
-                "needs_fix_round": True,
-                "findings": [
+            review_result(
+                2,
+                SHA_A,
+                [
                     {
                         "id": "R2-F1",
                         "classification": "non-blocked",
                         "required_resolution": "add a regression test",
                     }
                 ],
-            }
+            )
         )
 
     eng = make_engine(tmp_state_dir, agent, github=gh)
@@ -708,7 +687,6 @@ def test_review_beyond_the_parser_bound_is_refused_before_it_can_be_persisted(tm
 
     def agent(req):
         assert req.phase == "REVIEW", f"{req.phase} must not be invoked"
-        gh.add_comment(PR, 120, review_comment_body(20, SHA_A, True, finding_ids))
         payload = _trigger_review_payload()
         payload["findings"] = [
             {"id": fid, "classification": "blocked", "required_resolution": f"resolve {fid}"}
@@ -721,48 +699,65 @@ def test_review_beyond_the_parser_bound_is_refused_before_it_can_be_persisted(tm
     with pytest.raises(ControlResultValidationError, match="accepts at most"):
         eng.step()
     assert eng.state.phase == Phase.REVIEW and eng.state.review_round == 19
+    assert gh.effect_writes == [] and eng.state.effect_records == []  # nothing posted
     assert eng.state.open_findings == []
     assert len(eng.state.review_history) == 19
     assert truncated_evidence_rounds(eng.state.review_history) == []
     _assert_source_untouched(eng, gh)
 
 
-def test_redaction_growth_never_marks_an_accepted_round_truncated(tmp_state_dir):
-    """#33: the one way an accepted review could still exceed the persisted bound.
+def test_a_secret_quoting_resolution_is_corrected_never_redacted_into_the_evidence(
+    tmp_state_dir,
+):
+    """#33, #162: a REMOTE round's findings reach the replan evidence verbatim.
 
-    A resolution exactly at the parser bound that quotes a secret grows under
-    redaction (a short token becomes the 14-character marker) before it is
-    persisted. The persisted bound absorbs that growth, so the round is
-    retained complete, the replan is not refused, every finding is rendered
-    into the replan prompt and the acknowledgement count covers it.
+    A resolution exactly at the parser bound that quotes a secret used to be
+    accepted and grow under redaction before it was persisted (#33). The
+    controller now publishes the round's findings in its own comment, so
+    such text is refused, never redacted: the reviewer is corrected, nothing
+    is posted or recorded for the refused result, and the corrected round,
+    again at the parser bound, is retained whole. The replan is not refused,
+    every finding is rendered into the replan prompt and the acknowledgement
+    count covers it.
     """
     gh = FakeGitHub()
-    # Long enough that the marker cannot fit inside the parser bound.
+    # Long enough that the secret repeats up to the parser bound.
     quoted = "remove the hard-coded header Authorization: Bearer s3cr3t "
-    resolution = (quoted * (MAX_FINDING_RESOLUTION_CHARS // len(quoted) + 1))[
+    leaking = (quoted * (MAX_FINDING_RESOLUTION_CHARS // len(quoted) + 1))[
         :MAX_FINDING_RESOLUTION_CHARS
     ]
-    assert len(resolution) == MAX_FINDING_RESOLUTION_CHARS
+    # The parser strips surrounding whitespace, so the bound is met by a
+    # resolution that ends in a word.
+    clean = ("remove the hard-coded authorization header " * 100)[
+        : MAX_FINDING_RESOLUTION_CHARS - 1
+    ] + "."
+    assert len(leaking) == len(clean) == MAX_FINDING_RESOLUTION_CHARS
     replan = _replan_agent(gh)
+    answers = [leaking, clean]
 
     def agent(req):
         if req.phase != "REVIEW":
             return replan(req)
-        gh.add_comment(PR, 120, review_comment_body(20, SHA_A, True, ["R20-F1"]))
         payload = _trigger_review_payload()
-        payload["findings"][0]["required_resolution"] = resolution
+        payload["findings"][0]["required_resolution"] = answers.pop(0)
         return block(payload)
 
     eng = _park_at_hard_threshold(tmp_state_dir, gh, agent)
     assert eng.step().next_phase == "REPLAN_REEXECUTE"
+    assert answers == [] and [c.phase for c in eng.provider.calls] == ["REVIEW", "REVIEW"]
+    correction = eng.provider.calls[1].prompt
+    assert "credential-shaped" in correction and "s3cr3t" not in correction
+    # Only the corrected result was posted and recorded.
+    assert gh.effect_writes == [("create_pr_comment", PR, controller_review_comment(eng, 20).body)]
+    assert "s3cr3t" not in controller_review_comment(eng, 20).body
     record = eng.state.review_history[-1]
     persisted = record["findings"][0]["required_resolution"]
-    assert len(persisted) > MAX_FINDING_RESOLUTION_CHARS  # it did grow ...
-    assert "s3cr3t" not in persisted and "***REDACTED***" in persisted
-    assert "evidence_truncated" not in record  # ... and was retained whole
+    assert persisted == clean  # never redacted, never grown ...
+    assert "evidence_truncated" not in record  # ... and retained whole
     assert truncated_evidence_rounds(eng.state.review_history) == []
-    # Every finding of every round, the grown one included, is what the
-    # replacement must acknowledge.
+    assert "s3cr3t" not in eng.paths.state_file.read_text()
+    # Every finding of every round, the one at the bound included, is what
+    # the replacement must acknowledge.
     expected = sum(r["finding_count"] for r in eng.state.review_history)
     assert expected == sum(len(r.get("findings", [])) for r in eng.state.review_history)
 
@@ -1482,7 +1477,6 @@ def test_agent_claiming_a_different_pr_than_the_marked_one_is_rejected(tmp_state
 
     def agent(req):
         if req.phase == "REVIEW":
-            gh.add_comment(PR, 120, review_comment_body(20, SHA_A, True, ["R20-F1"]))
             return block(_trigger_review_payload())
         gh.add_pr(
             url=REPLACEMENT_PR,
@@ -1518,7 +1512,6 @@ def test_agent_claiming_a_different_pr_than_the_marked_one_is_rejected(tmp_state
 def _replacement_without(tmp_state_dir, gh, implementation: str | None):
     def agent(req):
         if req.phase == "REVIEW":
-            gh.add_comment(PR, 120, review_comment_body(20, SHA_A, True, ["R20-F1"]))
             return block(_trigger_review_payload())
         lines = [_marker_for_prompt(req.prompt)]
         if implementation is not None:
@@ -1624,7 +1617,6 @@ def test_prompt_carries_the_transaction_id_and_the_exact_marker(tmp_state_dir):
 
     def agent(req):
         if req.phase == "REVIEW":
-            gh.add_comment(PR, 120, review_comment_body(20, SHA_A, True, ["R20-F1"]))
             return block(_trigger_review_payload())
         seen["prompt"] = req.prompt
         gh.add_pr(
@@ -2061,7 +2053,6 @@ def test_target_facts_are_checked_on_the_apply_path_too(tmp_state_dir, field, va
 
     def agent(req):
         if req.phase == "REVIEW":
-            gh.add_comment(PR, 120, review_comment_body(20, SHA_A, True, ["R20-F1"]))
             return block(_trigger_review_payload())
         gh.add_pr(
             url=REPLACEMENT_PR,
@@ -6569,7 +6560,6 @@ def _replan_agent_that_fails(gh, stdout):
 
     def agent(req):
         if req.phase == "REVIEW":
-            gh.add_comment(PR, 120, review_comment_body(20, SHA_A, True, ["R20-F1"]))
             return block(_trigger_review_payload())
         assert req.phase == "REPLAN_REEXECUTE", req.phase
         return stdout

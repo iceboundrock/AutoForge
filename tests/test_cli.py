@@ -17,7 +17,6 @@ from tests.conftest import (
     BRANCH,
     EPIC,
     ISSUE,
-    MERGE_BASE,
     PR,
     SHA_A,
     FakeGitHub,
@@ -28,7 +27,7 @@ from tests.conftest import (
     connect_origin,
     git_repo,
     implement,
-    review_comment_body,
+    review_result,
 )
 
 
@@ -631,18 +630,7 @@ def test_full_run_prints_ready_banner(tmp_path, capsys, monkeypatch, fakes):
         if req.phase == "ANALYZE_EXECUTE":
             return implement(req)
         head = gh.prs[PR].head_sha  # the controller-published implementation commit
-        gh.add_comment(PR, 100, review_comment_body(1, head, False))
-        return block(
-            {
-                "phase": "REVIEW",
-                "status": "success",
-                "round": 1,
-                "reviewed_head_sha": head,
-                "review_comment_url": comment_url(PR, 100),
-                "needs_fix_round": False,
-                "findings": [],
-            }
-        )
+        return block(review_result(1, head))
 
     fakes["handler"] = agent
     sd = str(tmp_path / ".autoforge")
@@ -656,7 +644,8 @@ def test_full_run_prints_ready_banner(tmp_path, capsys, monkeypatch, fakes):
     assert load_state(tmp_path / ".autoforge" / "state.json").current_head_sha == head
     assert PR in out and ISSUE in out and head in out and "Review round:  1" in out
     assert "Reviewed base: main" in out
-    assert f"Reviewed merge base: {MERGE_BASE}" in out
+    merge_base = fakes["origin"].head("main")  # the implementation commit's parent
+    assert f"Reviewed merge base: {merge_base}" in out
     # resume on a held state re-prints the banner and does nothing else
     n_calls = len(fakes["provider"].calls)
     assert cli.main(["--state-dir", sd, "resume"]) == 0
@@ -670,14 +659,14 @@ def test_full_run_prints_ready_banner(tmp_path, capsys, monkeypatch, fakes):
     status = json.loads(capsys.readouterr().out)
     assert status["phase"] == "READY_FOR_MERGE"
     assert (status["reviewed_pr_url"], status["reviewed_base_ref"]) == (PR, "main")
-    assert status["reviewed_merge_base_sha"] == MERGE_BASE
-    assert status["current_merge_base_sha"] == MERGE_BASE
+    assert status["reviewed_merge_base_sha"] == merge_base
+    assert status["current_merge_base_sha"] == merge_base
     assert cli.main(["--state-dir", sd, "status"]) == 0
     out = capsys.readouterr().out
     assert f"Reviewed PR:   {PR}" in out and "Reviewed base: main" in out
     assert "Current base:  main" in out
-    assert f"Current merge base:  {MERGE_BASE}" in out
-    assert f"Reviewed merge base: {MERGE_BASE}" in out
+    assert f"Current merge base:  {merge_base}" in out
+    assert f"Reviewed merge base: {merge_base}" in out
 
 
 def _drive_to_ready(fakes):
@@ -699,18 +688,7 @@ def _drive_to_ready(fakes):
                 }
             )
         head = gh.prs[PR].head_sha  # the controller-published implementation commit
-        gh.add_comment(PR, 100, review_comment_body(1, head, False))
-        return block(
-            {
-                "phase": "REVIEW",
-                "status": "success",
-                "round": 1,
-                "reviewed_head_sha": head,
-                "review_comment_url": comment_url(PR, 100),
-                "needs_fix_round": False,
-                "findings": [],
-            }
-        )
+        return block(review_result(1, head))
 
     fakes["handler"] = agent
 
@@ -978,27 +956,14 @@ def test_resume_never_resets_the_step_budget(tmp_path, capsys, monkeypatch, fake
         if req.phase == "REVIEW":
             rounds["n"] += 1
             rnd = rounds["n"]
-            sha = gh.prs[PR].head_sha
-            gh.add_comment(PR, 100 + rnd, review_comment_body(rnd, sha, True, [f"R{rnd}-F1"]))
-            return block(
-                {
-                    "phase": "REVIEW",
-                    "status": "success",
-                    "round": rnd,
-                    "reviewed_head_sha": sha,
-                    "review_comment_url": comment_url(PR, 100 + rnd),
-                    "needs_fix_round": True,
-                    "findings": [
-                        {
-                            "id": f"R{rnd}-F1",
-                            "classification": "nit",
-                            "title": "t",
-                            "location": "src/x.py:1",
-                            "required_resolution": f"different text {rnd}",
-                        }
-                    ],
-                }
-            )
+            finding = {
+                "id": f"R{rnd}-F1",
+                "classification": "nit",
+                "title": "t",
+                "location": "src/x.py:1",
+                "required_resolution": f"different text {rnd}",
+            }
+            return block(review_result(rnd, gh.prs[PR].head_sha, [finding]))
         prev = gh.prs[PR].head_sha
         new = f"{rounds['n']:040x}"
         gh.set_head(new)

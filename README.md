@@ -77,8 +77,9 @@ Each line is a summary; the linked document is the precise statement.
   claims to have done, or what the controller did on its behalf: the
   implementation commit is the worktree's own HEAD and descends from the
   default branch, and the PR the controller opened for it is open, at that
-  HEAD, on the issue's branch; the review comment is on the right PR for the
-  right round and SHA; a fix actually moved HEAD; the follow-up issue, the
+  HEAD, on the issue's branch; the review comment the controller rendered
+  from the reviewer's result is on that PR, exactly once, for the right
+  round and SHA; a fix actually moved HEAD; the follow-up issue, the
   EPIC update and the next issue exist.
   ([GitHub safety](docs/agent-guides/github-safety.md))
 - **Agents never merge.** Every agent prompt carries the rule "never merge a

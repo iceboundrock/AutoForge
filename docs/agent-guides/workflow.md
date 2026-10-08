@@ -169,9 +169,11 @@ right before the reviewer is launched (`current_head_sha`,
 round is accepted. The round's comment carries the same revision in its
 `ai-review-result` marker (`reviewed_head_sha`, `reviewed_base_ref`,
 `reviewed_merge_base_sha`), so the durable copy of the review on GitHub
-identifies the diff it decided on and a later entry can only ever adopt a
+identifies the diff it decided on and a later entry only ever recognises a
 comment for the base and merge base the PR has now (see **Re-entering a
-phase**).
+phase**). The controller renders that comment and its marker from the
+bound revision itself (#162); the reviewer's `reviewed_head_sha` is a
+cross-check that must equal the bound HEAD, never the value written.
 
 The base is bound by name *and* by the merge base, not by the base
 branch's tip: the PR diff a reviewer reads is HEAD against the merge base
@@ -229,8 +231,8 @@ that merge base ([replan-transaction.md](replan-transaction.md),
 "The decision point is what may be closed").
 
 A branch name is compared as GitHub reports it and is never interpreted;
-where it is written into an HTML-comment marker (the prompt's
-`REVIEWED_BASE_REF_JSON`, every marker renderer) it goes through
+where it is written into an HTML-comment marker (every marker renderer)
+it goes through
 `claims.marker_json`, which escapes `<` and `>` as JSON does so that a valid
 refname such as `x-->y` cannot end the marker early and leave the round's
 comment unreadable.
@@ -332,23 +334,26 @@ next entry could not find again.
   after the controller's own write holds the PR to the same rule
   (github-safety.md, "Before ANALYZE_EXECUTE"), and so does the replan
   transaction for its replacement PR (replan-transaction.md).
-- `REVIEW` reads the PR comments for the `ai-review-result` marker of the
+- `REVIEW` publishes nothing through its agent (#162): the controller
+  renders the round's comment from the validated result and posts it from
+  one persisted plan. Its entry reads that journal first: a persisted plan
+  is completed from its record without launching the reviewer. Otherwise
+  it reads the PR comments for the `ai-review-result` marker of the
   upcoming round at the bound HEAD, base *and merge base* (all re-read
-  from GitHub by this entry). One such comment is handed to the reviewer
-  (`EXISTING_REVIEW_COMMENT_URL`) to adopt, or to edit in place, instead of
-  posting a second one. Two or more is a state the controller cannot
-  resolve without choosing which review is the round's, so it enters
-  `BLOCKED` without invoking anyone and names the comments. A comment for
-  the same round at another HEAD, against another base, from another merge
-  base, or whose marker names no base or no merge base (written before the
-  marker recorded one), is not this round's and is ignored: a review of the
-  diff against the old base, or from the old merge base, is not a review
-  of the diff the PR shows now, and adopting it would record the new base
-  or merge base as reviewed. After the reviewer returns, verification
-  enforces that the round still has exactly one comment at its HEAD, base
-  and merge base; a reviewer that posted a second one, or that adopted a
-  comment for another base or merge base, has its round rejected, and the
-  next entry blocks on a pair. The same entry lists the
+  from GitHub by this entry). Any such comment is one the controller did
+  not journal (a human's, or one a reviewer of the previous contract
+  posted), so the entry enters `BLOCKED` without invoking anyone and names
+  it; it is never adopted, edited or duplicated (ADR 0004 D9.6, D13.5),
+  and two or more are named together. A comment for the same round at
+  another HEAD, against another base, from another merge base, or whose
+  marker names no base or no merge base (written before the marker
+  recorded one), is not this round's and is ignored: a review of the diff
+  against the old base, or from the old merge base, is not a review of the
+  diff the PR shows now. After the reviewer returns, the comments are read
+  again before the plan is saved, and the read-back after the controller's
+  own post requires exactly one comment at the round's HEAD, base and merge
+  base, with exactly the planned body; a second one is a conflict that
+  blocks naming both. The same entry lists the
   open issues carrying this PR's `ai-follow-up` marker for any finding id
   (strictly; a listing that cannot be proven complete blocks) and hands
   them to the reviewer (`EXISTING_FOLLOW_UP_ISSUES`), so a problem an
@@ -448,7 +453,11 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   a decision about one PR and is neither a verdict to merge on nor findings
   to carry into another PR's review. An empty binding is "no completed
   review" and decides as below.
-- **Decision table** (PR bound). `OPEN` at the reviewed HEAD and base with a
+- **Decision table** (PR bound). `OPEN` with a persisted `REVIEW` plan (a
+  review accepted and its comment planned, #162) -> `REVIEW`, which posts or
+  reconciles the comment from the journal and judges the round against the
+  revision its marker binds, without launching the reviewer. `OPEN` at the
+  reviewed HEAD and base with a
   clean review -> `READY_FOR_MERGE` (the merge gate re-verifies from there);
   at the reviewed HEAD and base with open findings -> `FIX` with the findings
   open, unless the next review round is past `workflow.max_review_rounds`,

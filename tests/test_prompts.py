@@ -85,38 +85,18 @@ def test_review_prompt_contract():
         "Observations",
         "needs_fix_round",
         "reviewed HEAD",
-        "single PR comment",
         "AI Code Review",
         "ai-review-result",
         "Needs another fix round",
         "blocked",
         "non-blocked",
         "nit",
-        # PR #89 F1: an earlier invocation's comment for this round is adopted,
-        # never duplicated; the controller enforces one comment per (round, HEAD).
-        "{{EXISTING_REVIEW_COMMENT_URL}}",
-        "If a comment for this round already exists",
-        "do NOT post a second one",
-        # #96 R2-F1: the uniqueness rule names the full four-part key.
-        "exactly one review comment at its HEAD, base and merge base",
-        "against THIS base and\n  THIS merge base",
-        "at merge base `{{REVIEWED_MERGE_BASE_SHA}}`",
-        # PR #93 review: the round's comment is looked up by (round, HEAD,
-        # base); a comment against another base is never this round's.
+        # PR #93 review, #96: the round is bound to its HEAD, base and merge
+        # base, and the comment the controller renders states all three.
         "{{REVIEWED_BASE_REF}}",
-        '"reviewed_base_ref": {{REVIEWED_BASE_REF_JSON}}',
-        "another base branch, another merge base, or no base branch or merge base at",
-        # #96: ... and by the merge base the diff is computed from, so a base
-        # branch rewritten under its name is a different diff.
         "{{REVIEWED_MERGE_BASE_SHA}}",
-        '"reviewed_merge_base_sha": "{{REVIEWED_MERGE_BASE_SHA}}"',
-        "`reviewed_merge_base_sha` (the 40 character SHA of the merge base)",
-        "re-reads the merge base",
-        # The marker layout holds placeholders that cannot be mistaken for
-        # values: a copied `true|false` was invalid JSON that read as a
-        # template to fill; `<...>` is the template's own placeholder form.
-        '"needs_fix_round": <true or false>',
-        "Every `<...>` above is a placeholder to replace",
+        "Reviewed HEAD: `{{REVIEWED_HEAD_SHA}}` against base `{{REVIEWED_BASE_REF}}` "
+        "(merge base `{{REVIEWED_MERGE_BASE_SHA}}`)",
         # PR #89 F2 (#90): a problem an earlier round deferred to a follow-up
         # issue is not re-raised under a new finding id.
         "{{EXISTING_FOLLOW_UP_ISSUES}}",
@@ -127,8 +107,53 @@ def test_review_prompt_contract():
         "{{PRIOR_FINDINGS}}",
         "## Prior findings to re-check",
         "Never drop a prior finding silently",
+        # #162: the reviewer reports the prose sections of the comment the
+        # controller renders, under the parser's bounds.
+        '"spec": "<',
+        '"standards": "<',
+        '"assessment": "<',
+        '"observations": "<',
+        '"verification": "<',
+        '"summary": "<',
+        "{{MAX_REVIEW_SECTION_CHARS}}",
+        "{{MAX_REVIEW_SUMMARY_CHARS}}",
+        "{{MAX_REVIEW_COMMENT_CHARS}}",
     ):
         assert phrase in text, phrase
+    flat = " ".join(text.split())
+    for phrase in (
+        "re-reads the merge base",
+        # #162: the reviewer publishes nothing; the controller posts the
+        # round's one comment, and one it did not post is never adopted (the
+        # earlier "adopt the comment an earlier invocation posted" rule).
+        "## You publish nothing",
+        "You publish nothing: the controller renders this round's review comment from your "
+        "result and posts it on the PR itself.",
+        "do not post, edit or delete a comment",
+        "A comment carrying this round's marker that the controller did not post stops the "
+        "run: it is never adopted.",
+        "The heading, the binding line, the layout of the findings, the needs-fix line and "
+        "the marker are the controller's",
+        # The published-content policy the parser holds the text to.
+        "The prose fields and each finding's `title`, `location` and `required_resolution` "
+        "are published on GitHub as you return them.",
+        "`<!-- ai-` or `<!-- autoforge-`",
+        "anything shaped like a credential",
+        "a closing keyword followed by an issue reference",
+        "even inside code",
+        "an `@` that would mention a user or team outside a code span or a fenced block",
+    ):
+        assert phrase in flat, phrase
+    # The reviewer names no comment and writes no marker: the controller
+    # renders the marker from its own binding.
+    for gone in (
+        "review_comment_url",
+        "{{EXISTING_REVIEW_COMMENT_URL}}",
+        "{{REVIEWED_BASE_REF_JSON}}",
+        "gh pr comment",
+        "<!-- ai-review-result:",
+    ):
+        assert gone not in text, gone
 
 
 def test_review_prompts_state_the_parser_bounds(engine):
@@ -160,6 +185,23 @@ def test_review_prompts_state_the_parser_bounds(engine):
     assert f"`title` at most {MAX_FINDING_TITLE_CHARS}" in rendered
     assert f"`location` at most\n  {MAX_FINDING_LOCATION_CHARS}" in rendered
     assert f"`id` at most {MAX_FINDING_ID_CHARS}" in rendered
+
+
+def test_review_prompt_states_the_prose_and_comment_bounds(engine):
+    """#162: the REMOTE reviewer is told the prose bounds the parser rejects
+    against and the comment limit the rendered comment is checked against."""
+    from autoforge.effects import MAX_BODY_CHARS
+    from autoforge.result_parser import MAX_REVIEW_SECTION_CHARS, MAX_REVIEW_SUMMARY_CHARS
+
+    engine.state.phase = Phase.REVIEW
+    rendered = " ".join(engine.render_prompt_for(Phase.REVIEW).split())
+    assert (
+        '`"spec"`, `"standards"`, `"assessment"`, `"observations"` and `"verification"` are '
+        f"each required, non-blank Markdown of at most {MAX_REVIEW_SECTION_CHARS} characters, "
+        f'and `"summary"` at most {MAX_REVIEW_SUMMARY_CHARS}' in rendered
+    )
+    assert f"GitHub's limit of {MAX_BODY_CHARS} characters" in rendered
+    assert "may contain newlines and tabs but no other control character" in rendered
 
 
 def test_finding_prompts_state_the_control_character_rule(engine):
@@ -487,33 +529,21 @@ def test_engine_prompt_variables_review_and_fix(engine):
     engine.state.reviewed_merge_base_sha = MERGE_BASE
     text = engine.render_prompt_for(Phase.REVIEW)
     assert "Round 2" in text and SHA_B in text  # reviews the *current* HEAD
-    # ... against the *current* base, given as a JSON literal inside the
-    # marker so a quote in the branch name cannot break the marker's JSON.
+    # ... against the *current* base ...
     assert 'Reviewed base branch (bound by the controller): `rel"1`' in text
-    assert '"reviewed_base_ref": "rel\\"1", "reviewed_merge_base_sha": ' in text
     # ... from the *current* merge base (#96), the one bound for this round.
     assert f"computed from): `{MERGE_BASE_B}`" in text
-    assert f'"reviewed_merge_base_sha": "{MERGE_BASE_B}", "needs_fix_round"' in text
+    # The comment the controller renders states the same binding (#162).
+    assert f'Reviewed HEAD: `{SHA_B}` against base `rel"1` (merge base `{MERGE_BASE_B}`)' in text
     assert MERGE_BASE not in text
-    # A comment delimiter in the branch name is escaped the same way (as the
-    # JSON escapes `\u003c` / `\u003e`), so the marker line the reviewer
-    # copies holds exactly one `-->`: the template's own.
+    # The controller renders the marker from its own binding, so a quote or
+    # a comment delimiter in the branch name never reaches a marker the
+    # reviewer copies: the prompt holds none, and names no existing comment.
     engine.state.current_base_ref = "x-->y"
     text = engine.render_prompt_for(Phase.REVIEW)
-    assert '"reviewed_base_ref": "x--\\u003ey", "reviewed_merge_base_sha"' in text
-    (marker_line,) = [line for line in text.splitlines() if "<!-- ai-review-result:" in line]
-    assert marker_line.count("-->") == 1 and marker_line.endswith("-->")
-    # Rendered outside a step, no PR was read: no existing comment is named.
-    assert (
-        "Comment already posted for THIS round at THIS HEAD against THIS base and\n"
-        "  THIS merge base (if any): (none)" in text
-    )
-    engine._existing_review_comment_url = f"{PR}#issuecomment-7"
-    text = engine.render_prompt_for(Phase.REVIEW)
-    assert (
-        f"THIS HEAD against THIS base and\n  THIS merge base (if any): {PR}#issuecomment-7" in text
-    )
-    engine._existing_review_comment_url = ""
+    assert "Reviewed base branch (bound by the controller): `x-->y`" in text
+    assert "<!-- ai-review-result:" not in text
+    assert "Comment already posted" not in text
     engine.state.phase = Phase.FIX
     engine.state.open_findings = [
         {"id": "R1-F1", "classification": "nit", "required_resolution": "do x"}
@@ -601,8 +631,9 @@ def test_common_prompt_requires_the_full_sha_the_parser_requires():
 
 
 def test_review_prompt_makes_the_phase_read_only(engine):
-    """#19 item 4: the reviewer is a full coding agent, so the prompt says its
-    only write is the review comment. LOCAL review already had the rule."""
+    """#19 item 4: the reviewer is a full coding agent, so the prompt says it
+    writes nothing to GitHub (#162: the controller posts the review comment from
+    its result). LOCAL review already had the rule."""
     from tests.conftest import PR, SHA_A
 
     review = prompts.load_template("review.md")
@@ -613,11 +644,14 @@ def test_review_prompt_makes_the_phase_read_only(engine):
         "do not modify, create, format or delete a file",
         "do not edit the PR title",
         "is a finding for the FIX round, never something you fix yourself",
-        "only write is the one review comment",
         "makes the round stale",
         "no fixer is launched",
     ):
         assert phrase in read_only, phrase
+    assert (
+        "You write nothing to GitHub at all; your only output is the CONTROL_RESULT on "
+        "stdout, from which the controller posts the round's comment."
+    ) in " ".join(read_only.split())
     assert "**Read-only phase.**" in prompts.load_template("local_review.md")
 
     engine.state.phase = Phase.REVIEW

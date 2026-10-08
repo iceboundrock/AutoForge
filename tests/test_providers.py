@@ -898,17 +898,9 @@ def _fake_opencode(tmp_path, mode="read", answer="done\n"):
 def test_a_fake_opencode_receives_the_prompt_verbatim_and_answers_on_stdout(tmp_path):
     from autoforge.result_parser import parse_control_result
     from autoforge.transitions import Phase
-    from tests.conftest import PR, SHA_A, block, comment_url
+    from tests.conftest import SHA_A, block, review_result
 
-    review = {
-        "phase": "REVIEW",
-        "status": "success",
-        "round": 1,
-        "reviewed_head_sha": SHA_A,
-        "review_comment_url": comment_url(PR, 1),
-        "needs_fix_round": False,
-        "findings": [],
-    }
+    review = review_result(1, SHA_A)
     home, profile = _fake_opencode(tmp_path, answer=block(review))
     head = '-x --help\r\n# Review "PR" `code` $(id) \\ back\n{"k": "v"}\n\u00e9\u4e2d\n'
     prompt = head + "filler line\n" * 20_000  # well over one pipe buffer
@@ -946,17 +938,9 @@ def test_a_fake_opencode_that_exits_without_reading_its_whole_prompt_fails(tmp_p
     cannot be to a prompt the CLI never saw (the PR #188 review)."""
     from autoforge.result_parser import parse_control_result
     from autoforge.transitions import Phase
-    from tests.conftest import PR, SHA_A, block, comment_url
+    from tests.conftest import SHA_A, block, review_result
 
-    review = {
-        "phase": "REVIEW",
-        "status": "success",
-        "round": 1,
-        "reviewed_head_sha": SHA_A,
-        "review_comment_url": comment_url(PR, 1),
-        "needs_fix_round": False,
-        "findings": [],
-    }
+    review = review_result(1, SHA_A)
     _, profile = _fake_opencode(tmp_path, mode=mode, answer=block(review))
     res = OpenCodeProvider().execute(
         AgentRequest("REVIEW", prompt, str(tmp_path), profile, None, 30)

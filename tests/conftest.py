@@ -27,7 +27,7 @@ from autoforge.errors import (  # noqa: E402
     GitHubUnavailableError,
 )
 from autoforge.executor import ExecutionResult  # noqa: E402
-from autoforge.git_transport import GitRemote  # noqa: E402
+from autoforge.git_transport import GitRemote, GitTransport  # noqa: E402
 from autoforge.github import (  # noqa: E402
     ChangedFile,
     ChangedFiles,
@@ -186,6 +186,53 @@ def follow_up_issue_body(finding_id: str, pr_url: str = PR) -> str:
     )
 
 
+# The prose sections of a REMOTE REVIEW result (#162): the controller renders
+# them, with the findings and its own binding line and marker, into the
+# round's comment.
+REVIEW_PROSE: dict[str, str] = {
+    "spec": "The change does what the issue asks.",
+    "standards": "It follows the repository conventions.",
+    "assessment": "Sound.",
+    "observations": "None.",
+    "verification": "Ran `pytest`.",
+    "summary": "Ready.",
+}
+
+
+def review_result(round: int, sha: str, findings: list[dict] | None = None, **overrides) -> dict:
+    """A REMOTE REVIEW success result of ``round`` at ``sha`` (#162 schema).
+
+    ``needs_fix_round`` follows the findings unless overridden. The reviewer
+    posts nothing: the controller renders and posts the round's comment.
+    """
+    findings = list(findings or [])
+    return {
+        "phase": "REVIEW",
+        "status": "success",
+        "round": round,
+        "reviewed_head_sha": sha,
+        "needs_fix_round": bool(findings),
+        "findings": findings,
+        **REVIEW_PROSE,
+        **overrides,
+    }
+
+
+def controller_review_comment(eng: ControllerEngine, round: int, pr_url: str = PR) -> CommentInfo:
+    """The one comment carrying round ``round``'s marker that the controller posted."""
+    from autoforge.claims import REVIEW, scan
+
+    gh = eng.github
+    assert isinstance(gh, FakeGitHub)
+    held = [
+        c
+        for c in gh.comments.get(pr_url, [])
+        if any(claim.round == round for claim in scan(REVIEW, c.body).claims)
+    ]
+    assert len(held) == 1, f"{len(held)} comments carry round {round}'s marker"
+    return held[0]
+
+
 def review_comment_body(
     round: int,
     sha: str,
@@ -195,8 +242,12 @@ def review_comment_body(
     base_ref: str | None = "main",
     merge_base_sha: str | None = MERGE_BASE,
 ) -> str:
-    """A well-formed round comment.
+    """A well-formed round comment someone else posted.
 
+    The controller posts every round's comment itself (#162), so in a test
+    that reaches REVIEW this is a comment it did not journal (a human's, or
+    one a previous-protocol reviewer left) and stops the round; elsewhere it
+    is the earlier round comment the merge gate and ``unblock`` re-read.
     ``base_ref=None`` writes a pre-base (protocol-2) marker and
     ``merge_base_sha=None`` a pre-merge-base (protocol-3) one.
     """
@@ -668,7 +719,16 @@ class FakeGitHub:
         self.calls.append(("get_merge_base_sha", repository, base_ref, head_sha))
         if self.merge_base_error is not None:
             raise self.merge_base_error
-        return self.merge_bases.get((base_ref, head_sha.lower()), self.merge_base)
+        pinned = self.merge_bases.get((base_ref, head_sha.lower()))
+        if pinned is not None:
+            return pinned
+        if self.origin is not None and self.merge_base == MERGE_BASE:
+            # GitHub computes it from its git data; a rewritten ``merge_base``
+            # still simulates a moved base.
+            computed = self.origin.merge_base(base_ref, head_sha.lower())
+            if computed is not None:
+                return computed
+        return self.merge_base
 
     def find_workflow_runs(
         self, repository: str, workflow_id: int, *, branch: str, event: str, head_sha: str
@@ -1186,6 +1246,15 @@ class Origin:
         )
         return res.returncode == 0
 
+    def merge_base(self, branch: str, sha: str) -> str | None:
+        """GitHub's merge base of ``sha`` with ``branch``; None when either is unknown."""
+        res = subprocess.run(
+            ["git", f"--git-dir={self.bare}", "merge-base", f"refs/heads/{branch}", sha],
+            capture_output=True,
+            text=True,
+        )
+        return res.stdout.strip() if res.returncode == 0 else None
+
     def publish(self, repo, rev: str, branch: str) -> str:
         """A push that is not the controller's (a test's, an agent's, a human's)."""
         sha = git_out("-C", str(repo), "rev-parse", f"{rev}^{{commit}}")
@@ -1221,6 +1290,20 @@ def commit_in(cwd, message: str = "Implement the feature (#2)") -> str:
     """One (empty) commit on the agent worktree's detached HEAD; the new HEAD."""
     git_out("-C", str(cwd), *GIT_IDENT, "commit", "-q", "--allow-empty", "-m", message)
     return git_out("-C", str(cwd), "rev-parse", "HEAD")
+
+
+def push_fix(req, gh: FakeGitHub, message: str = "Fix the review findings (#2)") -> str:
+    """A FIX agent's push: one commit in its worktree, published to the PR's branch.
+
+    The fixer still pushes its own commit (the controller does from #163 on),
+    and the next REVIEW fetches the PR's HEAD from the origin before it
+    launches (#162), so an origin-backed run's fix is a real commit there
+    rather than a :meth:`FakeGitHub.set_head` placeholder. The new HEAD.
+    """
+    assert gh.origin is not None, "push_fix needs an origin-backed engine"
+    sha = commit_in(req.cwd, message)
+    gh.origin.publish(req.cwd, sha, gh.prs[PR].head_ref)
+    return sha
 
 
 def analyze_payload(head_sha: str, **overrides) -> dict:
@@ -1292,24 +1375,55 @@ def make_engine(
     return eng
 
 
+class OfflineRemote(GitRemote):
+    """The network remote of an engine whose test gave it no origin."""
+
+
+# Every revision an engine without an origin fetched, in order (see
+# ``_no_network_git_remote``); a test reads it through ``offline_fetches``.
+_OFFLINE_FETCHES: list[list[str]] = []
+
+
 @pytest.fixture(autouse=True)
 def _no_network_git_remote(monkeypatch):
     """No test reaches GitHub through the controller's own git transport (#161).
 
-    An engine whose test did not give it a local origin would fetch from
-    ``https://github.com/<repository>.git``; that fails the test instead.
+    An engine whose test did not give it a local origin would talk to
+    ``https://github.com/<repository>.git``. Its fetch is recorded and does
+    nothing: a REVIEW entry fetches the reviewed revisions for a scripted
+    reviewer that never reads them (#162). Any push to it fails the test.
     """
     import autoforge.engine as engine_module
 
     class LocalOnly(GitRemote):
         @classmethod
         def https(cls, repository: str) -> GitRemote:
-            raise AssertionError(
-                f"a test reached the network git remote of {repository}; build the engine "
-                "with make_engine(..., origin=True) or attach_origin(eng)"
-            )
+            return OfflineRemote(url=GitRemote.https(repository).url)
 
+    class OfflineAware(GitTransport):
+        def fetch(self, revisions) -> None:
+            if not isinstance(self.remote, OfflineRemote):
+                return super().fetch(revisions)
+            _OFFLINE_FETCHES.append(list(revisions))
+            return None
+
+        def push(self, *args, **kwargs):
+            if isinstance(self.remote, OfflineRemote):
+                raise AssertionError(
+                    f"a test pushed to the network git remote {self.remote.url}; build the "
+                    "engine with make_engine(..., origin=True) or attach_origin(eng)"
+                )
+            return super().push(*args, **kwargs)
+
+    _OFFLINE_FETCHES.clear()
     monkeypatch.setattr(engine_module, "GitRemote", LocalOnly)
+    monkeypatch.setattr(engine_module, "GitTransport", OfflineAware)
+
+
+@pytest.fixture
+def offline_fetches() -> list[list[str]]:
+    """The fetches of this test's engines that have no origin, in order."""
+    return _OFFLINE_FETCHES
 
 
 @pytest.fixture

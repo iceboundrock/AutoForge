@@ -214,6 +214,21 @@ High-priority coverage includes:
   re-entry, or after the plan (also with the create attempted) blocks with
   no PR created, and an adopted PR retargeted after the plan is not
   written to
+- `REVIEW`'s publication (#162, `tests/test_engine.py`, `test_k4_*` and the
+  review tests): the controller renders the round's comment from the
+  validated result, posts it and reads it back, and the reviewer posts
+  nothing; a round or HEAD other than the bound one, prose or a finding the
+  published-content policy refuses, fields valid alone that compose a
+  mention outside code, and a rendered comment over GitHub's limit are
+  corrections with nothing posted, and a saved plan with such fields is
+  refused on load; a title's unpaired backtick and a resolution opening
+  with a fence keep their code in the posted comment; a round comment the controller
+  did not journal blocks at the entry (nothing launched) and at the
+  precondition read (nothing planned); a stale round still gets its
+  comment; the entry fetches the bound HEAD and merge base, and a failed
+  fetch launches nothing; the merge gate re-reads the comment the
+  controller posted, and blocks once an edit drops its marker; a dry run,
+  with or without a saved plan, reads, fetches, launches and posts nothing
 
 ### Recovery
 
@@ -235,6 +250,19 @@ High-priority coverage includes:
   sent again by the next process; a branch moved after the plan conflicts
   and `unblock` completes the plan; a dry run plans the publication and
   sends nothing
+- `REVIEW` across its crash windows (`test_k4_*` in `tests/test_engine.py`):
+  a crash before the plan is saved relaunches the reviewer and posts once;
+  an intent saved and never issued posts once without a relaunch; a
+  comment that landed before the save is observed, and the round completes
+  exactly as an uninterrupted one would (open findings, the stale path's
+  carried findings, the review history, the next phase); a write lost in
+  flight is reconciled and issued once more; a second matching comment, or
+  one posted by someone else after the intent, blocks naming it; `unblock`
+  with a saved plan completes the round without the reviewer; a persisted
+  comment body edited after the save (alone, or with the context's prose
+  section it renders) is refused on load and never posted
+  (`tests/test_state.py` covers each edit: a body that is not the
+  rendering of its context, and a section the parser would refuse)
 
 ### Integration
 

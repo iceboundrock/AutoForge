@@ -118,10 +118,10 @@ from .claims import (
     ProgressClaim,
     ReviewClaim,
     collect,
-    marker_json,
     render_follow_up_marker,
     render_implementation_marker,
     render_progress_marker,
+    render_review_marker,
     scan,
 )
 from .config import (
@@ -131,13 +131,21 @@ from .config import (
     LoopDetectionConfig,
     validate_required_profiles,
 )
-from .effect_ops import ProgressCommentOp, append_problem, drive, operation_for
+from .effect_ops import (
+    ProgressCommentOp,
+    ReviewCommentOp,
+    append_problem,
+    drive,
+    operation_for,
+)
 from .effects import (
+    MAX_BODY_CHARS,
     AnalyzeContext,
     EffectKind,
     EffectOwner,
     EffectRecord,
     EntryObservation,
+    ReviewContext,
     Stage,
     UpdateEpicContext,
     compose_append,
@@ -145,6 +153,8 @@ from .effects import (
     is_legacy_reentry,
     launch_label_for,
     progress_comment_body,
+    review_comment_body,
+    review_comment_problem,
     sha256_text,
 )
 from .errors import (
@@ -258,6 +268,8 @@ from .result_parser import (
     MAX_PR_TITLE_CHARS,
     MAX_PROGRESS_CHARS,
     MAX_RESOLUTIONS_PER_FIX,
+    MAX_REVIEW_SECTION_CHARS,
+    MAX_REVIEW_SUMMARY_CHARS,
     MAX_ROADMAP_SECTION_CHARS,
     MIN_RATIONALE_CHARS,
     AnalyzeExecuteResult,
@@ -329,6 +341,9 @@ REVIEW_BOUND_VARIABLES: dict[str, str | int | None] = {
     "MAX_FINDING_TITLE_CHARS": MAX_FINDING_TITLE_CHARS,
     "MAX_FINDING_LOCATION_CHARS": MAX_FINDING_LOCATION_CHARS,
     "MAX_FINDING_ID_CHARS": MAX_FINDING_ID_CHARS,
+    "MAX_REVIEW_SECTION_CHARS": MAX_REVIEW_SECTION_CHARS,
+    "MAX_REVIEW_SUMMARY_CHARS": MAX_REVIEW_SUMMARY_CHARS,
+    "MAX_REVIEW_COMMENT_CHARS": MAX_BODY_CHARS,
 }
 # The FIX payload bounds (#77), stated to the fixer the same way.
 FIX_BOUND_VARIABLES: dict[str, str | int | None] = {
@@ -440,9 +455,6 @@ def _loop_killed(result: AgentExecutionResult) -> str:
     if result.timeout_limit != LIMIT_LOOP:
         return ""
     return result.loop.describe() if result.loop is not None else "it repeated itself"
-
-
-_REVIEW_HEADING_RE = re.compile(r"^#\s*AI Code Review\s*[—–-]+\s*Round\s+(\d+)\s*$", re.MULTILINE)
 
 
 def generate_run_id() -> str:
@@ -627,8 +639,9 @@ _REMOTE_REENTRY_RECONCILIATION: dict[Phase, str] = {
         "relaunching the agent"
     ),
     Phase.REVIEW: (
-        "hands a review comment already posted for this round at this HEAD to the "
-        "reviewer to adopt instead of posting a second one"
+        "completes the round from the persisted review comment plan when it was saved, "
+        "and otherwise refuses a review comment for this round at this revision that it "
+        "did not journal, instead of relaunching the reviewer"
     ),
     Phase.FIX: (
         "routes a HEAD already pushed past the reviewed one back to REVIEW instead of "
@@ -691,12 +704,6 @@ class ControllerEngine:
         # ``AutoForgeState.local_pending_phase``); the prompt then tells the
         # agent that work from the earlier attempt may already be present.
         self._local_resumed_invocation = False
-        # The review comment the REVIEW entry probe found already posted for
-        # the upcoming round at the bound HEAD (see
-        # :meth:`_reconcile_review_entry`), handed to the reviewer as
-        # ``EXISTING_REVIEW_COMMENT_URL`` so it adopts it instead of posting a
-        # second one. Re-derived from GitHub on every REVIEW entry.
-        self._existing_review_comment_url = ""
         # Likewise for the FIX entry: the open follow-up issues it found
         # already carrying a marker for one of the open findings (rendered
         # into ``FOLLOW_UP_ISSUES``). Re-derived from GitHub on every entry,
@@ -1536,7 +1543,6 @@ class ControllerEngine:
             "HEAD_SHA": s.current_head_sha or "(none)",
             "REVIEW_COMMENT_URL": s.last_review_comment_url or "(none)",
             "PREVIOUS_REVIEW_COMMENT_URL": s.last_review_comment_url or "(none)",
-            "EXISTING_REVIEW_COMMENT_URL": self._existing_review_comment_url or "(none)",
             "FOLLOW_UP_ISSUES": self._format_follow_ups(
                 s.current_pr_url, s.open_findings, self._existing_follow_ups
             ),
@@ -1552,15 +1558,10 @@ class ControllerEngine:
                 s.current_head_sha if s.phase == Phase.REVIEW else s.reviewed_head_sha
             )
             or "(none)",
-            # The base the round is bound to, next to the HEAD: the reviewer
-            # copies it into the marker, so it is also given as marker-safe
-            # JSON (a branch name may contain a double quote, which a raw
-            # substitution inside the marker's JSON would break, or a comment
-            # delimiter such as `-->`, which would end the marker early).
+            # The base the round is bound to, next to the HEAD, and the merge
+            # base the reviewed diff is computed from (#96), a full SHA read
+            # from GitHub.
             "REVIEWED_BASE_REF": escape_inline(reviewed_base or "(none)"),
-            "REVIEWED_BASE_REF_JSON": marker_json(reviewed_base or "(none)"),
-            # The merge base the reviewed diff is computed from (#96): a
-            # full SHA read from GitHub, copied into the marker verbatim.
             "REVIEWED_MERGE_BASE_SHA": reviewed_merge_base or "(none)",
             "FINDINGS": self._format_findings(s.open_findings),
             "PRIOR_FINDINGS": self._format_prior_findings(),
@@ -1808,10 +1809,7 @@ class ControllerEngine:
                 f"review round {s.review_round + 1} of at most "
                 f"{self.config.workflow.max_review_rounds} (workflow.max_review_rounds)"
             )
-            notes.append(
-                "REVIEWED_HEAD_SHA, REVIEWED_BASE_REF and REVIEWED_MERGE_BASE_SHA are fetched "
-                "from gh immediately before the review"
-            )
+            notes.extend(self._review_plan_notes(s))
         if s.phase == Phase.REPLAN_REEXECUTE:
             replan_txn = ReplanTransaction.from_dict(s.replan_transaction)
             stage_notes, expected_next = self._replan_plan(replan_txn)
@@ -2331,6 +2329,10 @@ class ControllerEngine:
         if previous == Phase.ANALYZE_EXECUTE:
             return self._reconcile_analyze_entry(plan)
         if previous == Phase.REVIEW:
+            # Journal first: a saved plan is completed, never re-reviewed,
+            # and its round stays bound to the revision its marker names.
+            if isinstance(self._require_state().phase_effects().context, ReviewContext):
+                return self._finish_review_entry(plan)
             self._bind_review_head()
             return self._reconcile_review_entry(plan)
         if previous == Phase.FIX:
@@ -3918,6 +3920,19 @@ class ControllerEngine:
             return UnblockDecision(None, f"open PR {canonical} has no readable head SHA", pr=pr)
         if not pr.base_ref:
             return UnblockDecision(None, f"open PR {canonical} has no readable base branch", pr=pr)
+        effects = state.phase_effects()
+        if effects.phase == Phase.REVIEW and isinstance(effects.context, ReviewContext):
+            # The reviewer's verdict was accepted and its comment planned: the
+            # re-entry posts or reconciles the comment from the journal and
+            # judges the round then. No reviewer is launched for it again.
+            return UnblockDecision(
+                Phase.REVIEW,
+                f"PR {canonical} is OPEN and the comment of review round "
+                f"{effects.context.round} is planned "
+                f"({', '.join(r.describe() for r in effects.records)}); REVIEW completes from "
+                "its persisted plan without launching the reviewer",
+                pr=pr,
+            )
         cap = next_round_cap_reason(state.review_round, self.config.workflow.max_review_rounds)
         if at_reviewed_revision and clean:
             return UnblockDecision(
@@ -5327,6 +5342,39 @@ class ControllerEngine:
         )
         return notes
 
+    def _review_plan_notes(self, s: AutoForgeState) -> list[str]:
+        """What REVIEW would do, from persisted state only (no read, no effect)."""
+        effects = s.phase_effects()
+        notes = [
+            f"would reconcile {record.describe()} ({record.stage.value}, "
+            f"{record.attempts} attempt(s)) against the PR's comments before anything else, "
+            "and post it only if no comment carries its marker and its attempt bound is left"
+            for record in effects.records
+        ]
+        if isinstance(effects.context, ReviewContext):
+            notes.append(
+                f"would complete review round {effects.context.round} from the persisted "
+                "REVIEW plan without launching the reviewer: post or reconcile the planned "
+                "comment, then re-read the PR's HEAD, base and merge base to judge the round"
+            )
+            return notes
+        notes.extend(
+            [
+                "REVIEWED_HEAD_SHA, REVIEWED_BASE_REF and REVIEWED_MERGE_BASE_SHA are fetched "
+                "from gh immediately before the review",
+                "would read the PR's comments first: one carrying this round's marker at the "
+                "bound revision, which the controller did not post, blocks without launching",
+                "would fetch the bound HEAD and merge base into the shared object store before "
+                "launching the reviewer, which publishes nothing",
+                "would check the reviewer's round and reviewed_head_sha against the binding and "
+                "render the review comment (heading, binding line, findings, the reviewer's "
+                "sections, needs-fix line, marker), asking the reviewer again on a refusal",
+                "would save the planned comment, post it on the PR itself, and read it back as "
+                "the one comment carrying the round's marker",
+            ]
+        )
+        return notes
+
     def _update_epic_plan_notes(self, s: AutoForgeState) -> list[str]:
         """What UPDATE_EPIC would do, from persisted state only (no read, no effect)."""
         every = self.config.workflow.epic_update_every
@@ -5442,25 +5490,21 @@ class ControllerEngine:
         self._save()
 
     def _reconcile_review_entry(self, plan: StepPlan) -> StepOutcome | None:
-        """Read the PR for this round's comment before the reviewer is launched.
+        """Read the PR for this round's comment, and fetch the diff, before the reviewer runs.
 
-        A reviewer whose result was never recorded (timeout, non-zero exit,
-        refused run-log write, verification failure, crash) may already have
-        posted the round's comment. GitHub is the source of truth, so the
-        controller looks before relaunching: exactly one comment carrying the
-        ``ai-review-result`` marker for the upcoming round at the bound HEAD,
-        base and merge base is handed to the reviewer
-        (``EXISTING_REVIEW_COMMENT_URL``) to adopt rather than duplicate, and
-        :meth:`_verify_review_comment` enforces afterwards that the round
-        still has exactly one. Two or more is a state the controller cannot
-        resolve without guessing which review is the round's, so it blocks
-        without invoking anyone. Comments for the same round at another
-        HEAD, against another base or from another merge base (an earlier
-        run, a stale re-review, a round posted before the PR was retargeted
-        or before its base was rewritten) are not this round's and are
-        ignored: a review of the diff against the old base is not a review
-        of the diff against the new one, and adopting it would record the
-        new base as reviewed.
+        The controller posts the round's review comment itself (K4, #162),
+        after it has planned and saved it, and the reviewer publishes
+        nothing. So a comment carrying the ``ai-review-result`` marker for
+        the upcoming round at the bound HEAD, base and merge base, found
+        before any plan was saved, is one the controller did not journal: a
+        human's, an agent's that still held a credential, or one posted by
+        an older version of the controller's reviewer. It is never adopted
+        and never duplicated; the entry blocks naming it (ADR 0004 D9.6,
+        D13.5), and only removing the comment or its marker lets the round
+        be reviewed. Comments for the same round at another HEAD, against
+        another base or from another merge base (an earlier run, a stale
+        re-review, a round posted before the PR was retargeted or before its
+        base was rewritten) are not this round's and are ignored.
 
         The reviewer is also told which problems earlier rounds already
         deferred: the open issues carrying this PR's ``ai-follow-up`` marker
@@ -5470,9 +5514,13 @@ class ControllerEngine:
         that knows about the first issue does not re-raise it (#90). The
         listing is strict for the same reason the FIX entry's is: "no such
         issue exists" is not knowable from a listing that may be truncated.
+
+        Last, the bound HEAD and merge base are fetched into the shared
+        object store, so the reviewer reads the diff with no network git
+        of its own. A failed fetch propagates (nothing was launched, and
+        'resume' fetches again).
         """
         state = self._require_state()
-        self._existing_review_comment_url = ""
         self._existing_pr_follow_ups = []
         upcoming = state.review_round + 1
         head = state.current_head_sha.lower()
@@ -5489,18 +5537,19 @@ class ControllerEngine:
                 plan,
                 f"cannot establish which comment carries the review for round {upcoming} at "
                 f"HEAD {head[:12]} on base {base!r} from merge base {merge_base[:12]} of PR "
-                f"{pr_ref.canonical}: {exc}. The controller will not launch a reviewer that "
-                "could post a second review comment",
+                f"{pr_ref.canonical}: {exc}. The controller will not review a round whose "
+                "comment it could not tell apart from one it would post",
             )
         except ClaimConflictError as exc:
             return self._block(
                 Phase.REVIEW,
                 plan,
-                f"{exc}. The controller never chooses between them: remove or edit the extra "
-                "or unreadable comment(s) so exactly one remains, then start a new run",
+                f"{exc}. The controller posts this round's comment itself and never chooses "
+                "between comments it did not post; nothing was launched. Remove the comments or "
+                "their markers, then 'unblock'",
             )
         if holder is not None:
-            self._existing_review_comment_url = holder.obj.url
+            return self._block(Phase.REVIEW, plan, self._unjournaled_review_text(holder.obj.url))
         try:
             deferred = self._follow_up_issues(pr_ref).grouped(
                 lambda c: True, f"PR {pr_ref.canonical}"
@@ -5516,7 +5565,36 @@ class ControllerEngine:
                 "could re-raise a problem an earlier round already deferred",
             )
         self._existing_pr_follow_ups = _follow_up_pairs(deferred)
+        wanted = [head] + ([merge_base] if merge_base and merge_base != head else [])
+        try:
+            self._git_transport().fetch(wanted)
+        except GitTransportError as exc:
+            raise VerificationError(
+                f"the controller could not fetch {', '.join(wanted)} into the shared object "
+                f"store before launching the reviewer: {exc}. Nothing was launched; 'resume' "
+                "fetches again"
+            ) from exc
         return None
+
+    def _unjournaled_review_text(self, url: str) -> str:
+        """Why a round comment the controller did not journal stops the round (D9.6, D13.5)."""
+        state = self._require_state()
+        upcoming = state.review_round + 1
+        legacy = (
+            " It was most likely posted by a reviewer of the previous contract, which "
+            "published its own comment before this run was upgraded (ADR 0004 D13.5)."
+            if is_legacy_reentry(Phase.REVIEW, state.attempt, state.launch_label)
+            else ""
+        )
+        return (
+            f"PR {state.current_pr_url} carries a review comment for round {upcoming} at HEAD "
+            f"{state.current_head_sha.lower()[:12]} on base {state.current_base_ref!r} from "
+            f"merge base {state.current_merge_base_sha[:12]} that the controller did not "
+            f"post: {url}.{legacy} The controller posts this round's comment itself and "
+            "journals it before it is sent; it never adopts or duplicates one it did not "
+            "journal (ADR 0004 D9.6), and 'unblock' does not change that. Nothing was "
+            "launched or posted. Delete that comment or its marker, then 'unblock'"
+        )
 
     def _prepare_fix(self, plan: StepPlan) -> StepOutcome | None:
         """Re-read the PR before the fixer runs; an unreviewed push goes back to REVIEW.
@@ -7104,6 +7182,15 @@ class ControllerEngine:
                     # the worktree itself: refused here, it is corrected
                     # before anything is pushed or created (#161).
                     self._check_analyze_result(payload, cwd)
+                if (
+                    phase == Phase.REVIEW
+                    and state.mode == WorkflowMode.REMOTE
+                    and payload.get("status") == "success"
+                ):
+                    # The comment the controller would post, rendered from the
+                    # result: refused here, it is corrected before anything is
+                    # posted (#162).
+                    self._check_review_result(payload)
             except VerificationError as exc:
                 # A read of the candidate that could not be completed: not the
                 # agent's error, so no correction; 'resume' reads it again.
@@ -7640,117 +7727,211 @@ class ControllerEngine:
             "within its attempt bound"
         )
 
-    def _verify_review_comment(
-        self, res: ReviewResult, expected_head: str, expected_base: str, expected_merge_base: str
-    ) -> CommentInfo:
-        """Verify the review comment the result names and return it as GitHub read it.
+    def _check_review_result(self, payload: dict) -> ReviewResult:
+        """The controller's half of the REMOTE REVIEW schema: the round's comment (#162).
 
-        The returned :class:`CommentInfo` is the comment the controller
-        located on the PR (the one carrying the round's marker at the bound
-        HEAD, base and merge base), matched to the result's ``review_comment_url`` by
-        identity. Its ``url`` is GitHub's URL of that comment, which is what
-        the round persists and hands to the fixer: the reviewer's spelling of
-        the URL (``Owner/REPO`` for ``owner/repo``, or the ``issues/<n>`` path
-        GitHub also serves a PR comment under) is accepted as naming the same
-        comment but is never the handoff artifact.
+        Checked before the result is accepted, so a refusal is corrected (the
+        reviewer is asked again) before anything is posted. ``round`` and
+        ``reviewed_head_sha`` are cross-checks against the round and the HEAD
+        the controller bound; a mismatch is corrected, never followed (ADR
+        0004 D8.1). The comment the controller renders from the result, with
+        its own binding line and marker, must fit GitHub's comment limit
+        (D8.6) and pass the credential and mention rules as a whole (D8.2,
+        D8.3, :func:`review_comment_problem`): fields that pass one by one
+        can still join into a credential shape, or leave a fence that a
+        later field closes, so the mention after it is no longer code.
         """
         state = self._require_state()
-        try:
-            cref = parse_comment_url(res.review_comment_url)
-        except Exception as exc:
-            raise VerificationError(
-                f"review_comment_url is not a GitHub PR comment URL: {exc}"
-            ) from exc
-        pr_ref = parse_pr_url(state.current_pr_url)
-        if not cref.on(pr_ref):
-            raise VerificationError(
-                f"review comment {res.review_comment_url} does not belong to PR {pr_ref.canonical}"
+        res = ReviewResult.from_payload(payload)
+        expected_round = state.review_round + 1
+        head = state.current_head_sha.lower()
+        if res.round != expected_round:
+            raise ControlResultValidationError(
+                f"REVIEW: field 'round' is {res.round}, but this is review round "
+                f"{expected_round}; report the round you were given"
             )
-        # The same read the entry made: exactly one comment on the PR claims
-        # this round at this HEAD against this base from this merge base,
-        # and it is the comment the result names. A second one, whoever
-        # posted it, leaves the round's review ambiguous and the next REVIEW
-        # entry would block on it rather than choose; a comment whose marker
-        # is unreadable is refused for the same reason it would be refused
-        # at entry; and a comment for this round and HEAD against another
-        # base or from another merge base (or none) is a review of a
-        # different diff that the reviewer was told not to adopt, so a
-        # result naming it is refused too.
-        try:
-            holder = self._review_comments(
-                pr_ref, res.round, expected_head, expected_base, expected_merge_base
-            ).exactly_one()
-        except GitHubUnavailableError:
-            raise
-        except (GitHubError, ClaimConflictError) as exc:
-            raise VerificationError(
-                f"{exc}; a round has exactly one review comment at its HEAD, base and merge base"
-            ) from exc
-        if not parse_comment_url(holder.obj.url).same_target(cref):
-            raise VerificationError(
-                f"review comment {res.review_comment_url} is not the comment carrying the "
-                f"round {res.round} marker at HEAD {expected_head[:12]} on base "
-                f"{expected_base!r} from merge base {expected_merge_base[:12]} "
-                f"(that is {holder.obj.url})"
+        if res.reviewed_head_sha != head:
+            raise ControlResultValidationError(
+                f"REVIEW: field 'reviewed_head_sha' is {res.reviewed_head_sha}, but the "
+                f"controller bound this round to HEAD {head}; review that HEAD and report it"
             )
-        heading = _REVIEW_HEADING_RE.search(holder.obj.body or "")
-        if heading is None or int(heading.group(1)) != res.round:
-            raise VerificationError(
-                f"review comment lacks the '# AI Code Review — Round {res.round}' heading"
+        body = review_comment_body(res, head, state.current_base_ref, state.current_merge_base_sha)
+        if len(body) > MAX_BODY_CHARS:
+            raise ControlResultValidationError(
+                f"REVIEW: the review comment rendered from this result is {len(body)} "
+                f"characters, over GitHub's limit of {MAX_BODY_CHARS}; nothing was posted. "
+                "Shorten the prose sections or the findings and re-emit the CONTROL_RESULT"
             )
-        if holder.claim.needs_fix_round != res.needs_fix_round:
-            raise VerificationError(
-                "review comment marker needs_fix_round disagrees with CONTROL_RESULT"
-            )
-        # The marker's finding ids are the durable copy of the round's
-        # findings; when published they must be the findings being
-        # persisted, as a set (order is presentation, and both sides are
-        # distinct by construction). Both lists hold validated ids, so
-        # quoting them is safe.
-        if holder.claim.finding_ids is not None:
-            marked = sorted(holder.claim.finding_ids)
-            reported = sorted(f.id for f in res.findings)
-            if marked != reported:
-                raise VerificationError(
-                    f"review comment marker finding_ids {marked} disagree with the "
-                    f"CONTROL_RESULT findings {reported}"
-                )
-        return holder.obj
+        problem = review_comment_problem(
+            res, head, state.current_base_ref, state.current_merge_base_sha
+        )
+        if problem:
+            raise ControlResultValidationError(f"REVIEW: {problem}")
+        return res
 
     def _apply_review(self, res: ReviewResult) -> tuple[Phase, str]:
+        """Plan, post and complete the round's review comment from the accepted result (#162).
+
+        The result was checked before it was accepted
+        (:meth:`_check_review_result`): it is this round's, of the bound
+        HEAD, and its comment renders within the limit and the policy. A
+        precondition read then finds no comment carrying the round's marker
+        at the bound revision; one would be a comment the controller did not
+        journal, and blocks with nothing planned or posted (ADR 0004 D9.6).
+        The comment (K4) is planned and saved with the completion context
+        (the round's verdict and findings) in one save, and
+        :meth:`_complete_review` does the rest from what was saved, as a
+        later entry would.
+        """
         state = self._require_state()
-        expected_round = state.review_round + 1
-        expected_head = state.current_head_sha.lower()
-        if res.round != expected_round:
-            raise VerificationError(
-                f"REVIEW round mismatch: expected {expected_round}, got {res.round}"
-            )
-        if res.reviewed_head_sha != expected_head:
-            raise VerificationError(
-                f"REVIEW SHA mismatch: controller bound HEAD {expected_head}, "
-                f"agent reviewed {res.reviewed_head_sha}"
-            )
-        expected_base = state.current_base_ref
-        if not expected_base:
+        head = state.current_head_sha.lower()
+        base = state.current_base_ref
+        merge_base = state.current_merge_base_sha
+        if res.round != state.review_round + 1 or res.reviewed_head_sha != head:
+            raise StateError("a REVIEW result was applied without the check that accepted it")
+        if not base:
             raise VerificationError(
                 f"REVIEW round {res.round} was launched without a bound base branch; the "
                 "review cannot be recorded against the diff it decided on"
             )
-        expected_merge_base = state.current_merge_base_sha
-        if not expected_merge_base:
+        if not merge_base:
             raise VerificationError(
                 f"REVIEW round {res.round} was launched without a bound merge base; the "
                 "review cannot be recorded against the diff it decided on"
             )
-        verified = self._verify_review_comment(
-            res, expected_head, expected_base, expected_merge_base
+        pr_ref = parse_pr_url(state.current_pr_url)
+        try:
+            holder = self._review_comments(pr_ref, res.round, head, base, merge_base).at_most_one()
+        except GitHubUnavailableError:
+            raise
+        except GitHubError as exc:
+            return Phase.BLOCKED, (
+                f"the comments of PR {pr_ref.canonical} could not be read before the comment "
+                f"of review round {res.round} was posted: {exc}. This is not a transient "
+                "GitHub failure; nothing was posted. Fix the cause, then 'unblock'"
+            )
+        except ClaimConflictError as exc:
+            return Phase.BLOCKED, (
+                f"{exc}. The controller posts this round's comment itself and never chooses "
+                "between comments it did not post; nothing was posted. Remove the comments "
+                "or their markers, then 'unblock'"
+            )
+        if holder is not None:
+            return Phase.BLOCKED, self._unjournaled_review_text(holder.obj.url)
+        canonical = pr_ref.canonical
+        marker = render_review_marker(
+            res.round, head, base, merge_base, res.needs_fix_round, [f.id for f in res.findings]
         )
-        # The handoff artifact is GitHub's URL of the comment the controller
-        # verified, never the reviewer's spelling of it (#80): the FIX prompt,
-        # `state.json` and the review history all name the comment as the
-        # GitHub object that was read. The parsed canonical form is the
-        # fallback for a client that reported no URL for the comment.
-        verified_comment_url = verified.url or parse_comment_url(res.review_comment_url).canonical
+        record = EffectRecord.plan(
+            0,
+            EffectKind.REVIEW_COMMENT,
+            EffectOwner(
+                run_id=state.run_id,
+                phase=Phase.REVIEW,
+                issue_url=state.current_issue_url,
+                pr_url=state.current_pr_url,
+                transaction_id="",
+            ),
+            identity={"pr_url": canonical, "marker": marker},
+            target={"pr_url": canonical},
+            precondition={"absent": True},
+            payload={"body": review_comment_body(res, head, base, merge_base)},
+        )
+        context = ReviewContext(
+            state.current_issue_url,
+            state.current_pr_url,
+            res.round,
+            res.needs_fix_round,
+            tuple(f.to_dict() for f in res.findings),
+            dict(res.sections),
+        )
+        state.effect_records = [record.to_dict()]
+        state.completion_context = context.to_dict()
+        # Strictly validated exactly as a later load will validate it: a plan
+        # that fails is never written (D4.6).
+        state.phase_effects()
+        self._save()
+        return self._complete_review()
+
+    def _finish_review_entry(self, plan: StepPlan) -> StepOutcome:
+        """Complete REVIEW from its persisted plan, launching nothing (#162)."""
+        state = self._require_state()
+        try:
+            nxt, message = self._complete_review()
+        except VerificationError as exc:
+            self._record_verification_failure(Phase.REVIEW, exc)
+            self._save()
+            raise
+        if nxt == Phase.BLOCKED:
+            return self._block(Phase.REVIEW, plan, message)
+        validate_transition(Phase.REVIEW, nxt)
+        state.phase = nxt
+        state.attempt = 0
+        self._save()
+        return self._outcome(
+            Phase.REVIEW,
+            plan=plan,
+            message=f"{message} (completed from the persisted REVIEW plan; no reviewer launched)",
+        )
+
+    def _review_conflict_text(self, record: EffectRecord) -> str:
+        state = self._require_state()
+        return (
+            f"{record.reason}. The controller never edits, duplicates or chooses between "
+            f"such comments; the round is not recorded. Inspect PR {state.current_pr_url}, "
+            "remove the comment(s) named above that the controller did not post, or their "
+            "markers, then 'unblock': the record is reconciled again within its attempt bound"
+        )
+
+    def _complete_review(self) -> tuple[Phase, str]:
+        """Finish REVIEW from the persisted plan: post the comment, then judge the round.
+
+        The same code for the step that saved the plan and for every later
+        entry (journal first): the K4 record is reconciled and issued at most
+        once, and the comment it reads back (exactly one comment carrying
+        the round's marker, with the planned body) is the round's handoff
+        artifact. A conflict or a conclusive GitHub failure blocks with the
+        record as persisted; an unavailable GitHub or a write whose outcome
+        is not readable yet propagates for 'resume'.
+
+        Then the post-review re-read judges the round from the persisted
+        verdict and findings, never from the comment's text, against the
+        revision the marker binds (an ``unblock`` may have rebound the
+        state's): a closed or merged PR refuses the round
+        (:class:`VerificationError`, nothing consumed); a HEAD, base or merge
+        base that moved makes it stale; otherwise its verdict decides. The
+        save that consumes the round drops the plan with it.
+        """
+        state = self._require_state()
+        effects = state.phase_effects()
+        context = effects.context
+        if not isinstance(context, ReviewContext) or len(effects.records) != 1:
+            raise StateError("REVIEW has no persisted review comment plan to complete")
+        record = effects.records[0]
+        if record.stage == Stage.CONFLICT:
+            return Phase.BLOCKED, self._review_conflict_text(record)
+        if record.pending:
+            try:
+                record = drive(record, ReviewCommentOp(self.github), self._persist_effect).record
+            except GitHubUnavailableError:
+                raise
+            except GitHubError as exc:
+                return Phase.BLOCKED, (
+                    f"{record.describe()} could not be reconciled with GitHub: {exc}. This is "
+                    "not a transient failure (authentication, permissions, or malformed "
+                    "data); nothing was sent again. Fix the cause, then 'unblock'"
+                )
+            if record.stage == Stage.CONFLICT:
+                return Phase.BLOCKED, self._review_conflict_text(record)
+        if record.observed is None:  # pragma: no cover - terminal and not a conflict
+            raise StateError(f"{record.describe()} is settled without an observed comment")
+        comment_url = parse_comment_url(record.observed["url"]).canonical
+        claim = scan(REVIEW, record.marker).claims[0]
+        expected_head = claim.reviewed_head_sha
+        expected_base = claim.reviewed_base_ref or ""
+        expected_merge_base = claim.reviewed_merge_base_sha or ""
+        round_ = context.round
+        needs_fix_round = context.needs_fix_round
 
         # The post-review re-read comes before anything is recorded. It can
         # still refuse the round (the PR closed or merged under the reviewer),
@@ -7782,17 +7963,21 @@ class ControllerEngine:
         # comment was verified to belong to, the HEAD, the base and the
         # merge base -- and the merge gate later requires all four, not the
         # HEAD alone.
-        state.review_round = res.round
+        state.review_round = round_
         state.reviewed_pr_url = parse_pr_url(state.current_pr_url).canonical
         state.reviewed_head_sha = expected_head
         state.reviewed_base_ref = expected_base
         state.reviewed_merge_base_sha = expected_merge_base
-        state.last_review_comment_url = verified_comment_url
-        state.last_review_needs_fix = res.needs_fix_round
+        state.last_review_comment_url = comment_url
+        state.last_review_needs_fix = needs_fix_round
         # Findings are agent-authored text persisted in plain `state.json` and
         # rendered into the next FIX prompt, so they cross the same redaction
         # boundary as the run log.
-        findings = [redact_dict(f.to_dict()) for f in res.findings]
+        findings = [redact_dict(dict(f)) for f in context.findings]
+        # The plan is complete: the save that consumes the round drops it, so
+        # that a later entry of REVIEW (a stale round's re-review, or an
+        # unblock after a loop stop) reviews the next round afresh.
+        state.drop_phase_effects()
         if moved:
             state.current_head_sha = latest.head_sha
             state.current_base_ref = latest.base_ref
@@ -7807,7 +7992,7 @@ class ControllerEngine:
             # that reviewer was shown the earlier findings and re-raised
             # the ones that still applied.
             state.prior_findings = findings
-            self._record_review(res.round, expected_head, RESULT_STALE, findings)
+            self._record_review(round_, expected_head, RESULT_STALE, findings)
             carried = (
                 f"; its {len(findings)} finding(s) are carried to that review to re-check"
                 if findings
@@ -7815,20 +8000,26 @@ class ControllerEngine:
             )
             nxt = self._next_phase(
                 Phase.REVIEW,
-                {"needs_fix_round": res.needs_fix_round, "head_changed_after_review": True},
+                {"needs_fix_round": needs_fix_round, "head_changed_after_review": True},
             )
             return nxt, (
-                f"review round {res.round} completed for {expected_head[:12]} but {moved} "
+                f"review round {round_} completed for {expected_head[:12]} but {moved} "
                 f"during the review; REVIEW -> {nxt.value} of the latest revision{carried}"
             )
+        # The revision is the bound one. It is written back because an
+        # unblock into this plan rebinds the HEAD and base and leaves the
+        # merge base for the entry to read, and a plan completes unbound.
+        state.current_head_sha = latest.head_sha
+        state.current_base_ref = latest.base_ref
+        state.current_merge_base_sha = latest_merge_base
         # A completed round of the actual revision decides about the carried
         # findings: the reviewer was shown them and re-raised, under this
         # round's ids, the ones that still apply.
         state.prior_findings = []
-        if res.needs_fix_round:
+        if needs_fix_round:
             state.last_review_result = "needs_fix"
             state.open_findings = findings
-            self._record_review(res.round, expected_head, RESULT_NEEDS_FIX, findings)
+            self._record_review(round_, expected_head, RESULT_NEEDS_FIX, findings)
             workflow_stagnation = stagnation_reason(
                 state.review_history,
                 self.config.workflow.stagnation_identical_rounds,
@@ -7836,7 +8027,7 @@ class ControllerEngine:
             )
             decision = evaluate_replan_policy(
                 has_actionable_findings=True,
-                current_review_round=res.round,
+                current_review_round=round_,
                 review_history=state.review_history,
                 escalation_count=state.escalation_count,
                 config=self.config.review.replan,
@@ -7866,7 +8057,7 @@ class ControllerEngine:
                     unbound = f"the reviewed issue URL is unusable ({exc})"
                 if unbound:
                     return Phase.BLOCKED, self._loop_block_reason(
-                        f"review round {res.round}: {len(findings)} finding(s); controller "
+                        f"review round {round_}: {len(findings)} finding(s); controller "
                         f"policy triggered REPLAN_REEXECUTE ({decision.reason}), but {unbound}, "
                         "so the replan decision cannot bind the revision it was made on. Human "
                         "intervention is required"
@@ -7889,24 +8080,24 @@ class ControllerEngine:
                     escalation=decision.metadata or {"trigger": decision.reason},
                 ).to_dict()
                 return nxt, (
-                    f"review round {res.round}: {len(findings)} finding(s); controller policy "
+                    f"review round {round_}: {len(findings)} finding(s); controller policy "
                     f"triggered {nxt.value} ({decision.reason})"
                 )
-            stop = self._review_loop_stop_reason(res.round)
+            stop = self._review_loop_stop_reason(round_)
             if stop:
                 # Findings stay persisted for the human; no FIX is started.
                 return Phase.BLOCKED, self._loop_block_reason(
-                    f"review round {res.round}: {len(findings)} finding(s), but {stop}"
+                    f"review round {round_}: {len(findings)} finding(s), but {stop}"
                 )
             return nxt, (
-                f"review round {res.round}: {len(findings)} finding(s); REVIEW -> {nxt.value}"
+                f"review round {round_}: {len(findings)} finding(s); REVIEW -> {nxt.value}"
             )
         state.last_review_result = "clean"
         state.open_findings = []
-        self._record_review(res.round, expected_head, RESULT_CLEAN, findings)
+        self._record_review(round_, expected_head, RESULT_CLEAN, findings)
         nxt = self._next_phase(Phase.REVIEW, {"needs_fix_round": False})
         return nxt, (
-            f"review round {res.round} clean for HEAD {expected_head[:12]}; REVIEW -> {nxt.value}"
+            f"review round {round_} clean for HEAD {expected_head[:12]}; REVIEW -> {nxt.value}"
         )
 
     @staticmethod
