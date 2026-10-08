@@ -292,6 +292,130 @@ def test_stdout_ending_inside_a_later_turn_is_a_failure(opens):
     assert stream.failure == "claude: exited inside a turn that has no result event"
 
 
+_INIT = {"type": "system", "subtype": "init", "model": "claude-fable-5-1"}
+
+
+def _held_turn(text: str) -> tuple[dict, ...]:
+    """A turn the CLI runs while a background agent is still running, with
+    its result held back (verified on claude 2.1.293): a finished task's
+    notice, then the turn up to its last text, and no result."""
+    return (
+        {"type": "system", "subtype": "task_notification"},
+        _INIT,
+        _assistant({"type": "text", "text": text}),
+    )
+
+
+def _held_run(results: tuple[dict, ...]) -> tuple[ClaudeStream, list[ProgressEvent]]:
+    """Three turns whose results the CLI holds back while a background agent
+    runs, then ``results``: once no background agent is left, the held
+    results arrive together, in turn order, after the last turn's records
+    (verified on claude 2.1.293, ``result_index`` 0, 1, 2)."""
+    return _run(
+        _INIT,
+        _assistant(_tool_use("a1", "Agent", description="Migrate the tests")),
+        {"type": "system", "subtype": "task_started", "task_id": "a"},
+        _tool_result("a1"),
+        # The background agent's own records name the call that started it.
+        {
+            **_assistant(_tool_use("s1", "Bash", description="Run the tests")),
+            "parent_tool_use_id": "a1",
+        },
+        _assistant({"type": "text", "text": "waiting"}),
+        {**_tool_result("s1"), "parent_tool_use_id": "a1"},
+        *_held_turn("checked"),
+        *_held_turn(TEXT),
+        *results,
+    )
+
+
+def test_results_held_back_until_the_last_turn_end_their_turns_in_order():
+    """Background agents still running when a turn ends make the CLI hold
+    that turn's result back; each later turn opens with its own
+    ``system/init`` and the results follow the last turn, in order. Text
+    output prints only the last one's text, and so does the reducer."""
+    stream, events = _held_run(
+        (
+            _result(result="waiting", result_index=0, num_turns=5, duration_ms=1_000),
+            _result(result="checked", result_index=1, num_turns=2, duration_ms=200),
+            _result(result=TEXT, result_index=2, num_turns=1, duration_ms=30),
+        )
+    )
+    assert stream.failure is None and not stream.exited_early
+    assert stream.text == TEXT
+    summary = stream.summary()
+    assert summary["results"] == 3 and summary["records_after_result"] == 0
+    assert summary["num_turns"] == 8 and summary["duration_ms"] == 1_230
+    assert [e.kind for e in events].count(ProgressKind.STARTED) == 3
+
+
+def test_a_result_sent_at_once_and_results_held_back_mix_in_one_run():
+    """A turn that ends with no background agent running gets its result at
+    once; later turns that end while one runs get theirs at the end."""
+    stream, _ = _run(
+        _INIT,
+        _result(result="waiting"),
+        *_held_turn("checked"),
+        *_held_turn(TEXT),
+        _result(result="checked"),
+        _result(result=TEXT),
+    )
+    assert stream.failure is None and stream.text == TEXT
+    assert stream.summary()["results"] == 3
+
+
+def test_stdout_ending_before_every_held_result_arrived_is_a_failure():
+    """The text of an earlier turn is never the outcome: a run whose last
+    turn has no result failed, however many results arrived."""
+    stream, _ = _held_run((_result(result="waiting"), _result(result="checked")))
+    assert stream.exited_early
+    assert stream.text is None
+    assert stream.failure == "claude: exited inside a turn that has no result event"
+    assert stream.summary()["results"] == 2
+
+
+def test_a_held_result_past_the_last_turn_is_a_failure():
+    stream, _ = _held_run(
+        (
+            _result(result="waiting"),
+            _result(result="checked"),
+            _result(result=TEXT),
+            _result(result="other"),
+        )
+    )
+    assert stream.text is None
+    assert stream.failure == "claude: stream-json protocol violation: a result event outside a turn"
+    assert stream.summary()["results"] == 3
+
+
+def test_an_error_in_a_held_result_fails_the_run():
+    stream, _ = _held_run(
+        (
+            _result(result="waiting"),
+            _result(is_error=True, result="Overloaded"),
+            _result(result=TEXT),
+        )
+    )
+    assert stream.text is None
+    assert stream.failure == (
+        "claude: the run ended in an error (subtype success, terminal_reason completed): Overloaded"
+    )
+
+
+def test_a_turn_opened_before_its_init_is_one_turn():
+    """After a result, an ``assistant`` record opens the next turn; the
+    ``system/init`` that follows is that turn's own, not one more."""
+    stream, _ = _run(
+        _INIT,
+        _result(result="waiting"),
+        _assistant({"type": "text", "text": "more"}),
+        *_held_turn(TEXT),
+        _result(result=TEXT),
+    )
+    assert stream.failure is None and stream.text == TEXT
+    assert stream.summary()["results"] == 2
+
+
 def test_records_after_the_result_are_counted_and_ignored():
     stream, events = _run(_result(), {"type": "system", "subtype": "hook_response"})
     assert stream.failure is None and stream.text == TEXT

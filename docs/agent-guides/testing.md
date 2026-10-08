@@ -261,7 +261,9 @@ Progress is observability, never part of an outcome. Keep covered:
   nesting limit, which must not escape as an exception), a missing result,
   an oversize result line, an error result in any turn, a result outside a
   turn and stdout ending inside a later turn each a `provider_failure`, the
-  last turn's result the outcome of a run of several, an oversize ordinary
+  last turn's result the outcome of a run of several, also when the CLI
+  holds the results back until after the last turn (too few or too many of
+  them a `provider_failure`), an oversize ordinary
   line counted and skipped, a flat scalar summary (a per-turn sum left out
   once one result lacks its count), and no command, thinking, assistant
   text or tool result in any event
