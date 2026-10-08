@@ -3627,8 +3627,9 @@ class ControllerEngine:
         ``follow_up_created`` with exactly that issue: the controller reuses
         it and never records a second decision. Any other deferral either
         names an issue the entry handed over (one finding's own follow-up,
-        or an earlier round's), or asks for a new issue whose composed body
-        passes the credential rule as a whole.
+        or an earlier round's), compared by identity, so any spelling GitHub
+        resolves to it is that issue (PR #205 R4-F1), or asks for a new issue
+        whose composed body passes the credential rule as a whole.
         The candidate is the worktree's ``HEAD`` as the controller reads it:
         detached, equal to ``head_sha``, and either the reviewed HEAD itself
         (nothing committed, so no finding is ``fixed``) or a descendant of
@@ -3656,9 +3657,7 @@ class ControllerEngine:
                 f"FIX: 'resolutions' must resolve exactly the open findings {open_ids}, one "
                 f"resolution each; missing {missing}, unknown {unknown}"
             )
-        handed = {url for url in self._existing_follow_ups.values()} | {
-            parse_issue_url(url).canonical for _, url in self._existing_pr_follow_ups
-        }
+        handed = self._fix_handed_over()
         new_chars = 0
         for r in res.resolutions:
             fid = r.finding_id
@@ -3699,8 +3698,8 @@ class ControllerEngine:
                     raise ControlResultValidationError(f"FIX: {problem}")
                 new_chars += len(r.follow_up_title) + len(body)
                 continue
-            if parse_issue_url(r.follow_up_issue_url).canonical not in handed:
-                listed = ", ".join(sorted(handed)) or "none"
+            if parse_issue_url(r.follow_up_issue_url).identity not in handed:
+                listed = ", ".join(sorted(handed.values())) or "none"
                 raise ControlResultValidationError(
                     f"FIX: {r.follow_up_issue_url} (the follow-up of {fid}) is not a follow-up "
                     f"issue the controller handed over for this PR (listed: {listed}); name one "
@@ -6109,6 +6108,23 @@ class ControllerEngine:
             lambda c: c.finding_id not in open_ids, f"PR {pr_ref.canonical}"
         )
         return own, _follow_up_pairs(deferred)
+
+    def _fix_handed_over(self) -> dict[tuple[str, str, str, int], str]:
+        """The issues this FIX entry handed over, by identity, each the URL the controller read.
+
+        The open findings' own follow-ups and the earlier rounds' deferrals,
+        from the entry's listing. A deferral names one by identity
+        (:attr:`GitHubRef.identity`), so ``Owner/REPO`` is the issue the
+        entry read as ``owner/repo``, and it is resolved to the URL read
+        here, never to the spelling the fixer reported (PR #205 R4-F1).
+        """
+        urls = [*self._existing_follow_ups.values()]
+        urls += [url for _, url in self._existing_pr_follow_ups]
+        handed: dict[tuple[str, str, str, int], str] = {}
+        for url in urls:
+            ref = parse_issue_url(url)
+            handed.setdefault(ref.identity, ref.canonical)
+        return handed
 
     def _fix_self_follow_up_problem(self, follow_ups: dict[str, str]) -> str:
         """Why a finding's follow-up in ``follow_ups`` is the current issue, or "" (PR #205 R3-F1).
@@ -8655,15 +8671,23 @@ class ControllerEngine:
         if observed != dict(observation.objects) or dict(observation.refs) != {ref: reviewed}:
             return Phase.BLOCKED, self._unjournaled_fix_text(observation, observed, ref, reviewed)
         new: list[FindingResolution] = []
+        # One append per handed-over issue, whichever spelling each deferral
+        # used, written to the URL the entry read (PR #205 R4-F1).
+        handed = self._fix_handed_over()
         appends: dict[str, list[str]] = {}
         for r in res.resolutions:
             if r.resolution != "follow_up_created" or r.finding_id in own:
                 continue
             if r.new_follow_up:
                 new.append(r)
-            else:
-                url = parse_issue_url(r.follow_up_issue_url).canonical
-                appends.setdefault(url, []).append(r.finding_id)
+                continue
+            url = handed.get(parse_issue_url(r.follow_up_issue_url).identity)
+            if url is None:
+                raise StateError(
+                    f"the FIX result defers {r.finding_id} to {r.follow_up_issue_url}, which "
+                    "its check did not find among the issues the entry handed over"
+                )
+            appends.setdefault(url, []).append(r.finding_id)
         bases: dict[str, str] = {}
         try:
             watermark = self.github.latest_issue_number(state.repository) if new else 0

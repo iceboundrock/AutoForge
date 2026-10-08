@@ -2893,6 +2893,84 @@ def test_fix_two_findings_deferred_to_one_issue_append_once(tmp_state_dir):
     assert urls == [ISSUE3, ISSUE3]
 
 
+def test_fix_deferral_spelling_a_handed_over_issue_otherwise_is_that_issue(tmp_state_dir):
+    """PR #205 R4-F1: GitHub owner and repository names are case-insensitive,
+    so ``Owner/REPO/issues/3`` is the earlier round's follow-up the entry
+    handed over as ``owner/repo/issues/3``. The deferral is accepted with no
+    correction, joins the deferral spelling it as read in one append (one K6
+    record, one body write, each marker once), and the record and the
+    resolutions carry the URL the controller read, never the reported one."""
+    gh = FakeGitHub()
+    earlier = _marked("R1-F9")
+    gh.add_issue(ISSUE3, "deferred in round 1", body=earlier)
+    eng = _in_fix(
+        tmp_state_dir,
+        gh,
+        fixer(
+            deferred_to("R2-F1", "https://github.com/Owner/REPO/issues/3"),
+            deferred_to("R2-F2", ISSUE3),
+            commit=False,
+        ),
+        findings=[_finding(2, 1), _finding(2, 2)],
+        origin=True,
+    )
+    eng.state.review_round = 2
+    eng.config.execution.max_correction_attempts = 0
+    targets: list[str] = []
+    persist = eng._persist_effect
+
+    def spy(record):
+        targets.append(record.target["issue_url"])
+        persist(record)
+
+    eng._persist_effect = spy
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert len(eng.provider.calls) == 1
+    assert "0 follow-up issue(s) created, 1 marker append(s)" in out.message
+    block_ = "\n".join(render_follow_up_marker(PR, fid) for fid in ("R2-F1", "R2-F2"))
+    appended = compose_append(earlier, block_)
+    assert gh.effect_writes == [("write_issue_body", ISSUE3, appended)]
+    assert gh.issues[ISSUE3].body == appended
+    assert targets == [ISSUE3, ISSUE3]  # attempted, observed
+    urls = [r["follow_up_issue_url"] for r in eng.state.last_fix_resolutions]
+    assert urls == [ISSUE3, ISSUE3]
+
+
+@pytest.mark.parametrize(
+    "other",
+    [
+        "https://github.com/Owner/REPO/issues/4",
+        "https://github.com/owner/other/issues/3",
+    ],
+    ids=["another-number", "another-repository"],
+)
+def test_fix_deferral_to_another_issue_than_the_handed_over_one_is_refused(tmp_state_dir, other):
+    """PR #205 R4-F1: identity, not spelling, decides whether a deferral
+    names a handed-over issue. Another number, or the same number in another
+    repository, is another issue and stays refused before any effect."""
+    gh = FakeGitHub()
+    gh.add_issue(ISSUE3, "deferred in round 1", body=_marked("R1-F9"))
+    gh.add_issue("https://github.com/owner/repo/issues/4", "unmarked")
+    eng = _in_fix(
+        tmp_state_dir,
+        gh,
+        fixer(deferred_to("R2-F1", other), commit=False),
+        findings=[_finding(2)],
+        origin=True,
+    )
+    eng.state.review_round = 2
+    eng.config.execution.max_correction_attempts = 0
+    with pytest.raises(
+        ControlResultValidationError,
+        match=rf"{other} \(the follow-up of R2-F1\) is not a follow-up issue the controller "
+        rf"handed over for this PR \(listed: {ISSUE3}\)",
+    ):
+        eng.step()
+    assert gh.effect_writes == []
+    assert load_state(eng.paths.state_file).effect_records == []
+
+
 def test_fix_reuse_beside_an_append_writes_the_other_findings_marker_only(tmp_state_dir):
     """Finding A's own follow-up is ISSUE3 (found at entry); the fixer
     reuses it for A and defers B to it too. One K6 appends B's marker only,
