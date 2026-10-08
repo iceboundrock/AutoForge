@@ -241,8 +241,9 @@ Progress is observability, never part of an outcome. Keep covered:
   an oversize result line, an error result in any turn, a result outside a
   turn and stdout ending inside a later turn each a `provider_failure`, the
   last turn's result the outcome of a run of several, an oversize ordinary
-  line counted and skipped, a flat scalar summary, and no command,
-  thinking, assistant text or tool result in any event
+  line counted and skipped, a flat scalar summary (a per-turn sum left out
+  once one result lacks its count), and no command, thinking, assistant
+  text or tool result in any event
 - the real `ClaudeCodeProvider` on the fake `claude` (`tests/claude_fake.py`):
   argv, stdin on `/dev/null`, orphan containment, the timeout, and a sink
   that raises never failing the run

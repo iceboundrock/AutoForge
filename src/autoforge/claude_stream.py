@@ -64,7 +64,9 @@ flat bounded scalars from the ``result`` records (no nested ``usage`` or
 which each ``result`` reports for its own turn, summed over all of them, and
 their count; ``total_cost_usd`` is the session's so far, so the last one's
 is the invocation's. The cost is integer micro-USD, and a value that is
-absent or unreadable is left out rather than reported as zero.
+absent or unreadable is left out rather than reported as zero. So is a sum
+once one ``result`` lacks its count: what the others add up to is not the
+invocation's total.
 
 Loop detection (#194): given a :class:`~autoforge.loop_detect.LoopObserver`,
 each completed tool call is reported as an action fingerprinted from its
@@ -158,7 +160,9 @@ class ClaudeStream:
         # after a result, until its own result.
         self._turn_open = True
         self._results = 0
-        self._per_turn: dict[str, int] = {}
+        # The per-turn counts summed over the results so far. A count one
+        # result lacks makes its sum unknown, and it is dropped for good.
+        self._per_turn: dict[str, int] = dict.fromkeys(_PER_TURN_COUNTS, 0)
         # Open tool calls: their name and, with a loop observer, their input's digest.
         self._open_tools: dict[str, tuple[str, bytes]] = {}
         self._records = 0
@@ -270,10 +274,12 @@ class ClaudeStream:
             "terminal_reason": clean(record.get("terminal_reason"), MAX_VALUE_CHARS),
             "stop_reason": clean(record.get("stop_reason"), MAX_VALUE_CHARS),
         }
-        for key in _PER_TURN_COUNTS:
+        for key, total in list(self._per_turn.items()):
             value = _count(record.get(key))
-            if value is not None:
-                self._per_turn[key] = min(self._per_turn.get(key, 0) + value, _MAX_COUNT)
+            if value is None:
+                del self._per_turn[key]
+            else:
+                self._per_turn[key] = min(total + value, _MAX_COUNT)
         summary.update(self._per_turn)
         cost = _micro_usd(record.get("total_cost_usd"))
         if cost is not None:

@@ -216,6 +216,33 @@ def test_each_turn_ends_in_a_result_and_the_last_one_is_the_outcome():
     assert [e.kind for e in events].count(ProgressKind.ASSISTANT_TEXT) == 2
 
 
+_ABSENT = object()
+
+
+@pytest.mark.parametrize("lacking", [0, 1, 2], ids=["first", "middle", "last"])
+@pytest.mark.parametrize(
+    "value",
+    [_ABSENT, None, -1, True, "7", 10**16],
+    ids=["absent", "null", "negative", "bool", "string", "past-bound"],
+)
+def test_a_sum_is_left_out_once_one_result_lacks_its_count(lacking, value):
+    """``num_turns`` is per result: once one result lacks it, absent or
+    unreadable, what the others add up to is not the invocation's total,
+    and a later result that has it does not bring the sum back."""
+    turns = [(_result(result="waiting"),), _later_turn("checked"), _later_turn(TEXT)]
+    result = turns[lacking][-1]
+    if value is _ABSENT:
+        del result["num_turns"]
+    else:
+        result["num_turns"] = value
+    stream, _ = _run(*(record for turn in turns for record in turn))
+    assert stream.failure is None and stream.text == TEXT
+    summary = stream.summary()
+    assert "num_turns" not in summary
+    # The other count is in every result, and is still summed.
+    assert summary["duration_ms"] == 3 * 61_234 and summary["results"] == 3
+
+
 def test_an_error_result_in_an_earlier_turn_fails_the_run():
     stream, _ = _run(_result(is_error=True, result="Overloaded"), *_later_turn(TEXT))
     assert stream.text is None
