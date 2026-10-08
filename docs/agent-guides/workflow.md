@@ -358,25 +358,44 @@ next entry could not find again.
   (strictly; a listing that cannot be proven complete blocks) and hands
   them to the reviewer (`EXISTING_FOLLOW_UP_ISSUES`), so a problem an
   earlier round deferred is not raised again under this round's ids.
-- `FIX` re-reads the PR HEAD, base and merge base. Past the reviewed HEAD,
+- `FIX` publishes nothing through its fixer (#163): the controller creates
+  the follow-up issues the fixer asks for, appends the deferral markers and
+  pushes the fixer's commit, last, from one persisted plan. Its entry reads
+  that journal first: a persisted plan is completed from its records
+  without launching the fixer, and a PR head at the planned candidate is the
+  controller's own push, never a reason to review first (a head that is
+  neither the reviewed HEAD nor the candidate is drift, below). Otherwise it
+  re-reads the PR HEAD, base and merge base. Past the reviewed HEAD,
   retargeted to another base (compared only when `reviewed_base_ref` is
   set), or with the merge base moved (compared only when
-  `reviewed_merge_base_sha` is set): `FIX -> REVIEW` of the actual revision, no fixer launched (the rule
-  above), the open findings carried to that review as prior findings to
-  re-check; a fixer whose push landed but whose result was never recorded
-  is therefore never relaunched against findings its push may have
-  resolved, and the findings its push did not resolve are not lost either.
-  Equal on all of them: the repository's open
+  `reviewed_merge_base_sha` is set): `FIX -> REVIEW` of the actual
+  revision, no fixer launched (the rule above), the open findings carried
+  to that review as prior findings to re-check; a push the controller did
+  not journal (an operator's, or a fixer of the previous contract whose
+  result was never recorded) is therefore never answered by relaunching a
+  fixer against findings it may have resolved, and the findings it did not
+  resolve are not lost either. Equal on all of them: the repository's open
   issues are listed for the `ai-follow-up` marker of (this PR, an open
-  finding), because a `follow_up_created` resolution creates an issue and
-  moves no HEAD. One per finding is handed to the fixer (`FOLLOW_UP_ISSUES`)
-  to report instead of recreate; two for one finding block; a listing that
-  cannot be proven complete blocks, since "none exists" is then not
-  knowable. Read-back holds the fixer to the same rule. The issues the
-  listing found for earlier rounds' findings are handed over as well
-  (`EXISTING_FOLLOW_UP_ISSUES`), so a re-raised problem is recorded on the
-  issue that exists (a second marker in its body) rather than in a second
-  issue.
+  finding). One per finding is handed to the fixer (`FOLLOW_UP_ISSUES`) as
+  that finding's follow-up, to reuse; two for one finding block; a listing
+  that cannot be proven complete blocks, since "none exists" is then not
+  knowable. The issues the listing found for earlier rounds' findings are
+  handed over as well (`EXISTING_FOLLOW_UP_ISSUES`), so a re-raised problem
+  deferred again is recorded on the issue that exists (the controller
+  appends a second marker to its body) rather than in a second issue. The
+  entry observation records each finding's follow-up or none and the branch
+  at the reviewed HEAD; after a launch of the entry, a follow-up issue that
+  appeared or disappeared, or a branch that moved, was not the controller's
+  and blocks, never adopted. The reviewed HEAD is fetched into the shared
+  object store before the launch. After the fixer, a PR head past the
+  reviewed one (before the plan is saved), a push refused by its lease
+  because the branch moved, or a head other than the reviewed HEAD or the
+  candidate at any later entry, is the same drift: `FIX -> REVIEW`, the
+  plan dropped and no fix recorded (github-safety.md, "Before FIX" and
+  "After FIX"). A saved plan is held to the entry's rules again before it
+  sends anything and when it completes: a base or merge base that left the
+  findings' binding is the same drift with the findings carried, and a
+  head branch or follow-up issue the plan cannot prove blocks.
 - `REPLAN_REEXECUTE` replays its durable transaction (replan-transaction.md).
 - `UPDATE_EPIC` reads its journal first: a persisted completion context
   means the agent's result was already accepted, so the phase is completed
@@ -456,7 +475,10 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
 - **Decision table** (PR bound). `OPEN` with a persisted `REVIEW` plan (a
   review accepted and its comment planned, #162) -> `REVIEW`, which posts or
   reconciles the comment from the journal and judges the round against the
-  revision its marker binds, without launching the reviewer. `OPEN` at the
+  revision its marker binds, without launching the reviewer. `OPEN` with a
+  persisted `FIX` plan (a fixer's result accepted and its writes planned,
+  #163) -> `FIX`, which completes the plan from the journal without
+  launching the fixer. `OPEN` at the
   reviewed HEAD and base with a
   clean review -> `READY_FOR_MERGE` (the merge gate re-verifies from there);
   at the reviewed HEAD and base with open findings -> `FIX` with the findings

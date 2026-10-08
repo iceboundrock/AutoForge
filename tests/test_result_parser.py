@@ -23,12 +23,16 @@ from autoforge.result_parser import (
     MAX_FINDING_TITLE_CHARS,
     MAX_FINDINGS_PER_REVIEW,
     MAX_FIX_RATIONALE_CHARS,
+    MAX_FOLLOW_UP_BODY_CHARS,
+    MAX_FOLLOW_UP_TITLE_CHARS,
     MAX_PROGRESS_CHARS,
     MAX_RESOLUTIONS_PER_FIX,
     MAX_REVIEW_SECTION_CHARS,
     MAX_REVIEW_SUMMARY_CHARS,
     MAX_ROADMAP_SECTION_CHARS,
+    MAX_TESTS_REPORTED,
     MAX_URL_CHARS,
+    MIN_RATIONALE_CHARS,
     REVIEW_PROSE_SECTIONS,
     AnalyzeExecuteResult,
     Finding,
@@ -301,13 +305,13 @@ def test_review_findings_invariant_and_ids():
 
 
 def test_fix_resolution_rules():
-    base = {"phase": "FIX", "status": "success", "previous_head_sha": SHA_A, "new_head_sha": SHA_B}
+    base = {"phase": "FIX", "status": "success", "previous_head_sha": SHA_A, "head_sha": SHA_B}
     with pytest.raises(ControlResultValidationError, match="resolutions"):
         FixResult.from_payload(base)
     ok = FixResult.from_payload(
         dict(base, resolutions=[{"finding_id": "R1-F1", "resolution": "fixed"}])
     )
-    assert ok.resolutions[0].resolution == "fixed" and ok.new_head_sha == SHA_B
+    assert ok.resolutions[0].resolution == "fixed" and ok.head_sha == SHA_B
     with pytest.raises(ControlResultValidationError, match="rationale"):
         FixResult.from_payload(
             dict(
@@ -332,7 +336,7 @@ def test_fix_resolution_rules():
         FixResult.from_payload(
             dict(base, resolutions=[{"finding_id": "R1-F1", "resolution": "follow_up_created"}])
         )
-    with pytest.raises(ControlResultValidationError, match="follow_up_issue_url"):
+    with pytest.raises(ControlResultValidationError, match="carries a follow-up issue"):
         FixResult.from_payload(
             dict(
                 base,
@@ -349,6 +353,107 @@ def test_fix_resolution_rules():
         FixResult.from_payload(
             dict(base, resolutions=[{"finding_id": "R1-F1", "resolution": "fixed"}] * 2)
         )
+
+
+NEW_FOLLOW_UP = {"title": "Cache the parsed config", "body": "The config is parsed twice."}
+
+
+def test_fix_follow_up_is_a_handed_issue_or_a_new_one_never_both():
+    """#163: a deferral names an issue the controller handed over, or asks for a
+    new one by title and body; it is never both or neither, and no other
+    resolution carries either. Only a fixed finding names a commit."""
+    base = {"phase": "FIX", "status": "success", "previous_head_sha": SHA_A, "head_sha": SHA_B}
+
+    def one(**resolution):
+        return FixResult.from_payload(
+            dict(base, resolutions=[{"finding_id": "R1-F1", **resolution}])
+        ).resolutions[0]
+
+    new = one(resolution="follow_up_created", follow_up_issue=NEW_FOLLOW_UP)
+    assert new.new_follow_up and new.follow_up_issue_url == ""
+    assert (new.follow_up_title, new.follow_up_body) == (
+        NEW_FOLLOW_UP["title"],
+        NEW_FOLLOW_UP["body"],
+    )
+    assert "follow_up_title" not in new.to_dict() and "follow_up_body" not in new.to_dict()
+    handed = one(resolution="follow_up_created", follow_up_issue_url=ISSUE)
+    assert not handed.new_follow_up and handed.follow_up_issue_url == ISSUE
+    assert one(resolution="fixed", commit_sha=SHA_B).commit_sha == SHA_B
+    with pytest.raises(ControlResultValidationError, match="exactly one of"):
+        one(
+            resolution="follow_up_created",
+            follow_up_issue_url=ISSUE,
+            follow_up_issue=NEW_FOLLOW_UP,
+        )
+    with pytest.raises(ControlResultValidationError, match="carries a follow-up issue"):
+        one(
+            resolution="no_change_with_rationale",
+            rationale="x" * MIN_RATIONALE_CHARS,
+            follow_up_issue=NEW_FOLLOW_UP,
+        )
+    with pytest.raises(ControlResultValidationError, match="only a fixed finding"):
+        one(resolution="follow_up_created", follow_up_issue_url=ISSUE, commit_sha=SHA_B)
+    with pytest.raises(ControlResultValidationError, match="must be an object"):
+        one(resolution="follow_up_created", follow_up_issue="Cache the parsed config")
+
+
+@pytest.mark.parametrize(
+    ("issue", "match"),
+    [
+        pytest.param({"body": "b"}, "'title' must be a string", id="no-title"),
+        pytest.param({"title": "t"}, "'body' must be a string", id="no-body"),
+        pytest.param({"title": "  ", "body": "b"}, "missing required field 'title'", id="blank"),
+        pytest.param({"title": "a\nb", "body": "b"}, "title", id="two-line-title"),
+        pytest.param(
+            {"title": "t" * (MAX_FOLLOW_UP_TITLE_CHARS + 1), "body": "b"},
+            f"at most {MAX_FOLLOW_UP_TITLE_CHARS}",
+            id="long-title",
+        ),
+        pytest.param(
+            {"title": "t", "body": "b" * (MAX_FOLLOW_UP_BODY_CHARS + 1)},
+            f"at most {MAX_FOLLOW_UP_BODY_CHARS}",
+            id="long-body",
+        ),
+        pytest.param({"title": "Closes #12", "body": "b"}, "closing", id="closing-title"),
+        pytest.param({"title": "t", "body": "Fixes #3 too"}, "closing", id="closing-body"),
+        pytest.param(
+            {"title": "t", "body": "<!-- ai-follow-up: x -->"}, "marker", id="marker-body"
+        ),
+        pytest.param({"title": "t", "body": "ask @octocat"}, "mention", id="mention"),
+        pytest.param({"title": 3, "body": "b"}, "must be a string", id="not-a-string"),
+    ],
+)
+def test_fix_new_follow_up_text_is_bounded_and_publishable(issue, match):
+    """#163: the controller publishes a new follow-up's title and body as given,
+    so each is rejected (never clipped or redacted) when it is blank, too long,
+    or would act on GitHub: a closing keyword, a controller marker, a mention."""
+    payload = {
+        "phase": "FIX",
+        "status": "success",
+        "previous_head_sha": SHA_A,
+        "head_sha": SHA_B,
+        "resolutions": [
+            {"finding_id": "R1-F1", "resolution": "follow_up_created", "follow_up_issue": issue}
+        ],
+    }
+    with pytest.raises(ControlResultValidationError, match=match):
+        FixResult.from_payload(payload)
+
+
+def test_fix_result_reports_its_tests_within_bounds():
+    """The ``tests`` list is recorded with the result, bounded like ANALYZE_EXECUTE's."""
+    base = {
+        "phase": "FIX",
+        "status": "success",
+        "previous_head_sha": SHA_A,
+        "head_sha": SHA_B,
+        "resolutions": [{"finding_id": "R1-F1", "resolution": "fixed"}],
+    }
+    assert FixResult.from_payload(dict(base, tests=["make check: passed"])).tests == [
+        "make check: passed"
+    ]
+    with pytest.raises(ControlResultValidationError, match="at most"):
+        FixResult.from_payload(dict(base, tests=["t"] * (MAX_TESTS_REPORTED + 1)))
 
 
 # -- R6-F3: optional free-text fields are validated, never coerced ------------
@@ -385,7 +490,7 @@ def test_finding_optional_text_fields_accept_absent_null_and_strings():
 @pytest.mark.parametrize("key", ["rationale", "follow_up_issue_url", "commit_sha"])
 @pytest.mark.parametrize("bad", [1, ["x"], {"a": 1}])
 def test_remote_fix_optional_text_fields_reject_non_strings(key, bad):
-    base = {"phase": "FIX", "status": "success", "previous_head_sha": SHA_A, "new_head_sha": SHA_B}
+    base = {"phase": "FIX", "status": "success", "previous_head_sha": SHA_A, "head_sha": SHA_B}
     resolution = {"finding_id": "R1-F1", "resolution": "fixed", key: bad}
     with pytest.raises(ControlResultValidationError, match=key):
         FixResult.from_payload(dict(base, resolutions=[resolution]))
@@ -412,7 +517,7 @@ def _remote_fix(resolution_extra: dict, **top) -> str:
             "phase": "FIX",
             "status": "success",
             "previous_head_sha": SHA_A,
-            "new_head_sha": SHA_B,
+            "head_sha": SHA_B,
             "resolutions": [{"finding_id": "R1-F1", "resolution": "fixed", **resolution_extra}],
             **top,
         }
@@ -732,7 +837,7 @@ def test_fix_finding_id_is_bounded_at_parse_time():
         "phase": "FIX",
         "status": "success",
         "previous_head_sha": SHA_A,
-        "new_head_sha": SHA_B,
+        "head_sha": SHA_B,
     }
     ok = FixResult.from_payload(
         dict(remote, resolutions=[{"finding_id": exact, "resolution": "fixed"}])
@@ -833,7 +938,7 @@ def test_parser_bounds_never_exceed_the_persisted_evidence_bounds():
 # persisted block reason that ``status`` shows. Same policy as the REVIEW
 # bounds: rejected whole, never clipped; the message names the size and the
 # limit, never the text; the count is checked before any element is parsed.
-_FIX_TOP = {"phase": "FIX", "status": "success", "previous_head_sha": SHA_A, "new_head_sha": SHA_B}
+_FIX_TOP = {"phase": "FIX", "status": "success", "previous_head_sha": SHA_A, "head_sha": SHA_B}
 _LOCAL_FIX_TOP = {"phase": "FIX", "status": "success", "changed_workspace": True}
 
 
@@ -946,7 +1051,7 @@ _SHA_FIELDS = [
     pytest.param(
         Phase.FIX,
         WorkflowMode.REMOTE,
-        {"new_head_sha": SHA_B, "resolutions": []},
+        {"head_sha": SHA_B, "resolutions": []},
         "previous_head_sha",
         id="FIX.previous_head_sha",
     ),
@@ -954,8 +1059,8 @@ _SHA_FIELDS = [
         Phase.FIX,
         WorkflowMode.REMOTE,
         {"previous_head_sha": SHA_A, "resolutions": []},
-        "new_head_sha",
-        id="FIX.new_head_sha",
+        "head_sha",
+        id="FIX.head_sha",
     ),
     pytest.param(
         Phase.REPLAN_REEXECUTE,
@@ -1029,8 +1134,8 @@ def test_a_fenced_control_result_block_is_accepted():
     [
         ("FIX.resolutions[].commit_sha", lambda v: _remote_fix_result(commit_sha=v)),
         (
-            "FIX.new_head_sha",
-            lambda v: FixResult.from_payload(dict(_FIX_TOP, new_head_sha=v, resolutions=[])),
+            "FIX.head_sha",
+            lambda v: FixResult.from_payload(dict(_FIX_TOP, head_sha=v, resolutions=[])),
         ),
     ],
     ids=["optional", "required"],

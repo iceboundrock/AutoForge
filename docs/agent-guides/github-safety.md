@@ -326,16 +326,33 @@ turn ordinary concurrent work on the PR into a human decision.
 
 ### Before FIX
 
-The fixer is launched only while the PR HEAD, base and merge base read
-from GitHub equal the reviewed HEAD, base and merge base the open findings
-are bound to. A HEAD past it is an unverified push (an unrecorded fix, an
-operator); a base other than `reviewed_base_ref` is a retargeted PR whose
-findings were raised on a diff against another base (#95); a merge base
-other than `reviewed_merge_base_sha` under the same base name is a base
-rewritten under its name, whose findings were raised on the diff from the
-old merge base (#96). In every case the review is stale and the phase goes
-to `REVIEW` of the actual revision without launching the fixer, with the
-open findings carried to that review as prior findings to re-check
+The fixer publishes nothing (#163, ADR 0004): it commits on the
+worktree's detached `HEAD` and returns one resolution per open finding.
+The controller creates the follow-up issues, appends the deferral markers
+and pushes the commit itself, from a plan it journals before anything is
+sent ("After FIX" below).
+
+The journal is read first. A persisted completion context means the
+fixer's result was already accepted and its plan saved: the phase is
+completed from the journal (After FIX, steps 2 to 4) and no fixer is
+launched. A PR head equal to the planned candidate is then the
+controller's own push, never a reason to review first; only a head that
+is neither the reviewed HEAD nor the candidate, or a base or merge base
+that left the findings' binding, goes to `REVIEW`. A saved plan does not
+bypass the rules below: they are applied to it again before it sends
+anything (After FIX, step 2).
+
+Otherwise the fixer is launched only while the PR HEAD, base and merge
+base read from GitHub equal the reviewed HEAD, base and merge base the
+open findings are bound to. A HEAD past it is an unverified push (an
+operator, or a fixer of the previous contract); a base other than
+`reviewed_base_ref` is a retargeted PR whose findings were raised on a
+diff against another base (#95); a merge base other than
+`reviewed_merge_base_sha` under the same base name is a base rewritten
+under its name, whose findings were raised on the diff from the old merge
+base (#96). In every case the review is stale and the phase goes to
+`REVIEW` of the actual revision without launching the fixer, with the open
+findings carried to that review as prior findings to re-check
 (workflow.md, "Bind reviews to PR HEAD SHA and to the PR identity" and
 "Stale rounds keep their findings"). A PR whose base or merge base cannot
 be read is refused as a verification failure, as the review and merge
@@ -343,17 +360,21 @@ entries refuse it, never read as a retarget or a rewrite. The base is
 compared only when `reviewed_base_ref` is set and the merge base only when
 `reviewed_merge_base_sha` is set: a protocol-2 or protocol-3 state file
 loaded in `FIX` lacks them, so its fixer is launched and the next completed
-review writes the binding.
+review writes the binding. A PR headed in another repository, with no
+readable head repository (GitHub reports none when the head repository was
+deleted, so a same-named branch of the run's repository is not proven to be
+its head), or with no readable head branch, blocks: the controller pushes a
+fix only to a branch it has proven is the PR's head in the run's
+repository.
 
-A push is not the only write a fixer makes: a `follow_up_created`
-resolution creates an issue and moves no HEAD. With the HEAD unchanged the
-controller lists the repository's open issues (strictly: a listing that may
-be truncated blocks, because "none exists" is then not knowable) for the
-`ai-follow-up` marker of `{"finding_id", "pr"}`:
+The controller then lists the repository's open issues (strictly: a
+listing that may be truncated blocks, because "none exists" is then not
+knowable) for the `ai-follow-up` marker of `{"finding_id", "pr"}`:
 
-- exactly one per finding: its URL is handed to the fixer in
-  `FOLLOW_UP_ISSUES` to report as that finding's `follow_up_issue_url`,
-  never to recreate
+- exactly one per open finding: its URL is handed to the fixer in
+  `FOLLOW_UP_ISSUES` as that finding's follow-up, to reuse, never to
+  recreate; the fixer must resolve that finding as `follow_up_created`
+  with that URL
 - two or more for one finding: `BLOCKED` without launching the fixer
 - a marker whose `finding_id` is not of the form `R<round>-F<n>` (or longer
   than the parser's bound), an issue carrying the same marker twice, or any
@@ -363,25 +384,149 @@ be truncated blocks, because "none exists" is then not knowable) for the
 - the same listing's issues carrying this PR's marker for a finding of an
   earlier round go to the fixer as `EXISTING_FOLLOW_UP_ISSUES`; a finding
   that turns out to be one of those problems is resolved in the PR or, when
-  deferring again is right, recorded by adding the new finding's marker to
-  that existing issue (an issue may carry several markers), never by a
-  second issue
+  deferring again is right, deferred to that issue (the controller appends
+  the new finding's marker to it; an issue may carry several markers),
+  never to a second issue
+- the current issue carrying an open finding's marker: `BLOCKED` without
+  launching the fixer. The current issue is never a follow-up of its own
+  PR's findings, so the controller neither hands it over as one nor
+  records a finding as deferred to it (PR #205 R3-F1); once the marker is
+  removed, `unblock` starts a fresh entry
+
+The entry observation records the PR branch at the reviewed HEAD and, per
+open finding, its follow-up issue or none, and is saved before the launch
+(D4.4). A re-entry after a launch of this entry (a correction relaunch, or
+a `resume` after the fixer failed) honors it: a follow-up issue that
+appeared or disappeared since, or a branch that moved, is not the
+controller's and blocks with nothing created, appended or pushed; it is
+never adopted (ADR 0004 §2.5). `unblock` starts a fresh entry that hands
+such an issue to the fixer. The one-shot re-entry of a run upgraded while a
+fixer of the previous contract was publishing (D13.6) has no observation to
+honor: its follow-ups are handed over as found.
+
+Last, the reviewed HEAD is fetched into the shared object store through
+the controller's transport (objects only; no ref moves), so the fixer
+starts from it and contacts no remote. A failed fetch propagates: nothing
+was launched, and `resume` fetches again. A dry-run plan names these reads,
+the fetch and the writes the step would make, and every persisted record it
+would reconcile first, and performs none of them.
 
 ### After FIX
 
-Verify:
+The result is checked before it is accepted, so a refusal is an ordinary
+correction (the fixer is asked again) with nothing created, appended or
+pushed. The controller reads the worktree itself, never the fixer's word
+for it:
 
-- the result's `previous_head_sha` is the HEAD the controller bound the
-  findings to
-- the resolutions cover exactly the open finding IDs, each one `fixed`,
-  `follow_up_created` or `no_change_with_rationale`
-- current PR HEAD matches the returned new HEAD
-- a `fixed` resolution moved HEAD
-- a claimed follow-up issue exists in this repository, is `OPEN`, is not the
-  current issue, and is the one open issue carrying its finding's marker
-- a finding resolved any other way has no open issue carrying its marker;
-  the marked issue is the durable record of the decision and state never
-  records a resolution GitHub contradicts
+- `previous_head_sha` is the reviewed HEAD the findings are bound to
+- the resolutions cover exactly the open finding IDs, one each, as
+  `fixed`, `follow_up_created` or `no_change_with_rationale`
+- a finding whose follow-up issue the entry found is resolved as
+  `follow_up_created` with exactly that issue
+- any other deferral either names an issue the entry handed over (a
+  finding's own follow-up or an earlier round's), never the current issue
+  whatever marker it carries (an earlier round's marker on it hands it
+  over, but a deferral to it is still refused), or asks for a new issue (`follow_up_issue`: bounded title and body, no
+  marker); the composed body (the fixer's text, the controller's reference
+  to the PR and finding, and the marker) passes the credential rule as a
+  whole, and the new issues together fit what one FIX round journals
+- `HEAD` is detached and equal to `head_sha`; it is either the reviewed
+  HEAD itself (nothing committed, and then no finding is `fixed`) or a
+  descendant of it, proven by the transport, every commit of whose range
+  passes the commit-message policy ("Published content" below)
+- a `fixed` finding's `commit_sha`, when given, is one of the commits after
+  the reviewed HEAD up to the candidate
+
+A worktree read or an ancestry proof that cannot be completed is
+inconclusive (`VerificationError`, for `resume`), never a correction.
+
+Then, in order, all from one persisted plan:
+
+1. The precondition read: the PR is re-read, and a HEAD past the reviewed
+   one is a push the controller did not make: `FIX -> REVIEW` of the
+   actual HEAD with nothing sent and no fix recorded. A PR no longer
+   proven headed at a branch of the run's repository (the entry's rule)
+   blocks with nothing planned or sent. The open issues are
+   listed again, and each open finding's follow-up must be the one the
+   entry recorded; each issue a deferral names must be open in this
+   repository, with a body the marker block can be appended to (the
+   credential rule on the composed body). Anything else blocks with
+   nothing planned or sent. Otherwise the `follow_up_issue` records (K5,
+   in result order, against a watermark read now), the `follow_up_append`
+   records (K6, one per handed-over issue, its findings' markers in result
+   order, against the digest of the body read now) and the `push` record
+   (K1, the candidate, compare-and-swap against the reviewed HEAD; none
+   when nothing was committed) are saved with the completion context in
+   one save.
+2. Before anything is sent, and again at every later entry that completes
+   the plan from the journal (PR #205 R2), the entry's rules are applied
+   to the saved plan:
+   - the deferrals: one naming the current issue (a plan saved before that
+     rule, or a reused follow-up the entry recorded as the current issue)
+     blocks with nothing more sent; such a plan cannot be completed as
+     saved, and the run starts again (PR #205 R3-F1);
+   - the PR: a closed one is a `VerificationError` with nothing more sent,
+     for `resume` once it is reopened;
+   - the PR head: one that is neither the reviewed HEAD nor the candidate
+     is the same drift (`FIX -> REVIEW`, the plan dropped; an issue it
+     already created or a marker it already appended stays on GitHub as an
+     earlier round's deferral for the next fixer);
+   - the base and merge base: a PR retargeted from the reviewed base, or a
+     base rewritten under its name, is the same drift, with the findings
+     carried to that review (#95, #96). The merge base is read against the
+     reviewed HEAD, not the PR's, so the controller's own push (a
+     fast-forward that may merge the base in) is never mistaken for it. An
+     unreadable base is a `VerificationError` with nothing sent; a merge
+     base that cannot be read for a conclusive reason blocks;
+   - the push target: the PR must still be headed in the run's repository
+     at the branch the entry observed and the push record targets; a head
+     repository GitHub no longer reports, a fork's, or another branch
+     blocks with nothing more sent;
+   - the open issues, against every resolution: a finding resolved as
+     `fixed` or `no_change_with_rationale`, or deferred to a record not
+     issued yet, has no open issue carrying its marker (one is not the
+     controller's); a finding whose follow-up is settled (reused from the
+     entry, or its record already `observed`, which the journal alone
+     never re-proves) has exactly one, the issue the plan names. A closed,
+     unmarked or duplicated follow-up, or an unjournaled marker, blocks
+     with nothing more sent; the controller never adopts, chooses between
+     or recreates follow-up issues. A record issued but not read back yet
+     is left to its own reconciliation, which reads the same marker before
+     anything is sent again.
+3. The records are driven in plan order, so the push, the commit point, is
+   issued only after every follow-up is on GitHub, and, after any
+   follow-up write, only once the PR is read again and held to step 2's
+   rules (open, head, base and merge base, push target) and the open
+   issues are read again and agree with every resolution as in step 2
+   (PR #205 R2-F2, R3-F2). Otherwise nothing is pushed and the follow-ups
+   stay on GitHub: a closed PR is a `VerificationError` for `resume`, a
+   moved head or base is the same drift, and anything else blocks. A body edited between the
+   plan and the append is rebased (D5.5) within the size and credential
+   rules. A push refused by its lease while the PR head moved is the same
+   drift, never forced; any other conflict blocks naming the record and
+   the repair, and `unblock` reconciles it again within its attempt bound.
+4. The read-back: one complete listing of the open issues, checked against
+   every resolution as in step 2 (each deferred finding has exactly one
+   open issue carrying its marker, the issue its record created or
+   appended to, or the one the entry handed over, and no other finding has
+   any); the PR headed at the candidate; and its base and merge base still
+   the ones the findings are bound to (otherwise the same drift: the
+   candidate is reviewed as stale, no fix recorded); no deferral naming
+   the current issue; and the PR still headed in the run's repository at
+   the branch the plan pushed to. A target lost after the push (a head
+   repository GitHub no longer reports, a fork's, another branch) blocks
+   with the fix not recorded and the findings open; the plan stays saved,
+   so `unblock` completes it from the journal and sends nothing GitHub
+   already holds (PR #205 R3-F2). A head still at the
+   reviewed HEAD after the push is GitHub catching up (transient); any
+   other head is drift. Only then are the resolutions recorded
+   (`last_fix_resolutions`, each deferral with the URL GitHub returned),
+   the open findings cleared and the phase advanced to `REVIEW`, whose
+   prompt renders those resolutions as `PREVIOUS_FIX_RESOLUTIONS`: data
+   for the reviewer to check, never a reply posted on the PR.
+
+The marked issue is the durable record of a deferral: state never records
+a resolution GitHub contradicts.
 
 ### Before UPDATE_EPIC
 
@@ -585,8 +730,9 @@ moves every externally visible write to the controller. #160 adds the
 mechanism and wires its first consumer, the `UPDATE_EPIC` progress comment;
 #161 wires `ANALYZE_EXECUTE` (the push of the agent's commit and the
 implementation PR, opened or adopted); #162 wires `REVIEW` (the round's
-review comment); the other phases keep their current publication until
-#163 and #164 move them.
+review comment); #163 wires `FIX` (the follow-up issues it creates, the
+deferral markers it appends and the push of the fixer's commit, last); the
+other phases keep their current publication until #164 moves them.
 
 - **Typed writes, never retried blind.** `GitHubClient` has one method per
   write the effects need (`create_issue_comment`, `create_pr_comment`,
@@ -653,8 +799,9 @@ review comment); the other phases keep their current publication until
 
 Agent text the controller publishes under the operator's identity
 (`progress`, `roadmap_section`, `pr_title`, `pr_body`, a review's prose
-sections and its findings' titles, locations and required resolutions, and
-the payloads of later kinds) is refused by
+sections and its findings' titles, locations and required resolutions, a
+new follow-up issue's title and body, and the payloads of later kinds) is
+refused by
 `result_parser.published_text_problem`, and the agent is asked to correct
 it, when it contains:
 

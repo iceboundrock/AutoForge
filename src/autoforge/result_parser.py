@@ -48,9 +48,16 @@ the review comment the controller renders and posts (``spec``,
 ``summary``), each under that policy and bounded
 (``MAX_REVIEW_SECTION_CHARS``, ``MAX_REVIEW_SUMMARY_CHARS``), and so is
 every finding field the comment shows; ``round`` and ``reviewed_head_sha``
-are cross-checks, and it names no comment (#162). An UPDATE_EPIC result is validated against the
-schema of the request that launched the agent (:class:`UpdateEpicRequest`,
-D4.7): a re-request after publication carries only what it asks for.
+are cross-checks, and it names no comment (#162). A REMOTE FIX result
+carries one resolution per open finding; a deferral either names an issue
+the controller handed over or carries the title and body of a new follow-up
+issue the controller creates, under that policy and bounded
+(``MAX_FOLLOW_UP_TITLE_CHARS``, ``MAX_FOLLOW_UP_BODY_CHARS``), and
+``previous_head_sha`` and ``head_sha`` are cross-checks; it names no push
+target and creates nothing (#163). An UPDATE_EPIC result is validated
+against the schema of the request that launched the agent
+(:class:`UpdateEpicRequest`, D4.7): a re-request after publication carries
+only what it asks for.
 """
 
 from __future__ import annotations
@@ -189,6 +196,14 @@ REVIEW_PROSE_SECTIONS: tuple[tuple[str, int], ...] = (
     ("verification", MAX_REVIEW_SECTION_CHARS),
     ("summary", MAX_REVIEW_SUMMARY_CHARS),
 )
+# Bounds on a new follow-up issue a FIX result asks for (#163). The
+# controller creates the issue with this title and with the body followed by
+# its own reference to the PR and finding and the finding's follow-up marker,
+# so the body leaves room for those under GitHub's 65,536-character body
+# limit and the effect payload's bound; the title is the effect's one-line
+# title bound. Rejected, never clipped, like every other published field.
+MAX_FOLLOW_UP_TITLE_CHARS = 256
+MAX_FOLLOW_UP_BODY_CHARS = 60000
 # Bounds on the ``tests`` list: names of what the agent ran, recorded with
 # the result and never published.
 MAX_TESTS_REPORTED = 50
@@ -1130,13 +1145,70 @@ def _review_published(text: str, subject: str) -> str:
     return text
 
 
+def _fix_text(text: object, subject: str, key: str, limit: int, one_line: bool) -> str:
+    """A FIX follow-up text the controller publishes: non-blank, bounded, publishable."""
+    ph = "FIX"
+    if not isinstance(text, str):
+        raise ControlResultValidationError(f"{ph}: {subject} field {key!r} must be a string")
+    stripped = text.strip()
+    if not stripped:
+        raise ControlResultValidationError(f"{ph}: {subject} is missing required field {key!r}")
+    stripped = _bounded(stripped, ph, subject, key, limit)
+    stripped = (_one_line if one_line else _multi_line)(stripped, ph, subject, key)
+    problem = published_text_problem(f"{subject} {key}", stripped)
+    if problem is not None:
+        raise ControlResultValidationError(f"{ph}: field {problem}")
+    return stripped
+
+
+def validate_follow_up_title(text: object, subject: str = "follow_up_issue") -> str:
+    """``text`` as the title of a new follow-up issue (#163), or a rejection.
+
+    Non-blank, at most :data:`MAX_FOLLOW_UP_TITLE_CHARS`, one line of
+    printable text, and publishable (:func:`published_text_problem`): the
+    controller creates the issue with it. The checks
+    :meth:`FindingResolution.from_payload` applies, so a persisted K5 title
+    can be re-validated under the parser's rules.
+    """
+    return _fix_text(text, subject, "title", MAX_FOLLOW_UP_TITLE_CHARS, one_line=True)
+
+
+def validate_follow_up_body(text: object, subject: str = "follow_up_issue") -> str:
+    """``text`` as the agent's part of a new follow-up issue's body (#163), or a rejection.
+
+    Non-blank, at most :data:`MAX_FOLLOW_UP_BODY_CHARS`, multi-line text
+    with no other control character, and publishable: the controller
+    follows it with its own reference to the PR and finding and the
+    finding's marker. The checks :meth:`FindingResolution.from_payload`
+    applies, so the agent's part of a persisted K5 body can be re-validated.
+    """
+    return _fix_text(text, subject, "body", MAX_FOLLOW_UP_BODY_CHARS, one_line=False)
+
+
 @dataclass
 class FindingResolution:
+    """One open finding's resolution, as a REMOTE fixer reports it (#163).
+
+    A ``follow_up_created`` resolution either names an issue the controller
+    handed over (``follow_up_issue_url``) or carries the title and body of a
+    new follow-up issue the controller creates (``follow_up_title``,
+    ``follow_up_body``; the payload's ``follow_up_issue`` object), never
+    both. ``commit_sha`` is allowed on ``fixed`` only. ``to_dict`` keeps the
+    persisted shape of ``state.last_fix_resolutions``.
+    """
+
     finding_id: str
     resolution: str
     rationale: str = ""
     follow_up_issue_url: str = ""
     commit_sha: str = ""
+    follow_up_title: str = ""
+    follow_up_body: str = ""
+
+    @property
+    def new_follow_up(self) -> bool:
+        """A follow-up issue the controller creates for this finding."""
+        return bool(self.follow_up_title)
 
     @classmethod
     def from_payload(cls, raw: object, index: int) -> FindingResolution:
@@ -1161,26 +1233,47 @@ class FindingResolution:
             "rationale",
         )
         follow_up = _opt_url(raw, "follow_up_issue_url", ph, "issue")
+        new_issue = raw.get("follow_up_issue")
+        commit_sha = _opt_sha(raw, "commit_sha", ph)
         if res == "no_change_with_rationale":
             if len(rationale) < MIN_RATIONALE_CHARS:
                 raise ControlResultValidationError(
                     f"{ph}: {fid} uses no_change_with_rationale but the rationale is missing "
                     f"or too short (>= {MIN_RATIONALE_CHARS} chars of actual reasoning required)"
                 )
-        if res == "follow_up_created" and not follow_up:
+        if res != "follow_up_created":
+            if follow_up or new_issue is not None:
+                raise ControlResultValidationError(
+                    f"{ph}: {fid} carries a follow-up issue but resolution is {res!r}"
+                )
+        elif bool(follow_up) == (new_issue is not None):
             raise ControlResultValidationError(
-                f"{ph}: {fid} uses follow_up_created but 'follow_up_issue_url' is missing"
+                f"{ph}: {fid} uses follow_up_created and must carry exactly one of "
+                "'follow_up_issue_url' (an issue the prompt lists) and 'follow_up_issue' "
+                "(the title and body of a new issue the controller creates)"
             )
-        if res != "follow_up_created" and follow_up:
+        if commit_sha and res != "fixed":
             raise ControlResultValidationError(
-                f"{ph}: {fid} carries follow_up_issue_url but resolution is {res!r}"
+                f"{ph}: {fid} carries commit_sha but resolution is {res!r}; only a fixed "
+                "finding names the commit that fixed it"
             )
+        title = body = ""
+        if new_issue is not None:
+            if not isinstance(new_issue, dict):
+                raise ControlResultValidationError(
+                    f"{ph}: {fid} field 'follow_up_issue' must be an object with title and body"
+                )
+            what = f"follow_up_issue of {fid}"
+            title = validate_follow_up_title(new_issue.get("title"), what)
+            body = validate_follow_up_body(new_issue.get("body"), what)
         return cls(
             finding_id=fid,
             resolution=res,
             rationale=rationale,
             follow_up_issue_url=follow_up,
-            commit_sha=_opt_sha(raw, "commit_sha", ph),
+            commit_sha=commit_sha,
+            follow_up_title=title,
+            follow_up_body=body,
         )
 
     def to_dict(self) -> dict:
@@ -1195,24 +1288,39 @@ class FindingResolution:
 
 @dataclass
 class FixResult:
+    """What a REMOTE fixer reports; the controller publishes it (#163).
+
+    ``previous_head_sha`` and ``head_sha`` are cross-checks against the
+    reviewed HEAD and the worktree's ``HEAD``, which the controller reads
+    itself; neither is a target. ``resolutions`` holds one resolution per
+    open finding, ``tests`` names what the agent ran.
+    """
+
     previous_head_sha: str
-    new_head_sha: str
+    head_sha: str
     resolutions: list[FindingResolution] = field(default_factory=list)
+    tests: list[str] = field(default_factory=list)
 
     @classmethod
     def from_payload(cls, p: dict) -> FixResult:
         ph = "FIX"
+        previous = _req_sha(p, "previous_head_sha", ph)
+        head = _req_sha(p, "head_sha", ph)
         resolutions = [
             FindingResolution.from_payload(r, i) for i, r in enumerate(_raw_resolutions(p))
         ]
         ids = [r.finding_id for r in resolutions]
         if len(set(ids)) != len(ids):
             raise ControlResultValidationError(f"duplicate resolution finding_ids: {ids}")
-        return cls(
-            previous_head_sha=_req_sha(p, "previous_head_sha", ph),
-            new_head_sha=_req_sha(p, "new_head_sha", ph),
-            resolutions=resolutions,
-        )
+        tests = _opt_str_list(p, "tests", ph)
+        if len(tests) > MAX_TESTS_REPORTED:
+            raise ControlResultValidationError(
+                f"{ph}: field 'tests' lists {len(tests)} entries; the controller accepts at "
+                f"most {MAX_TESTS_REPORTED}. Summarise them and re-emit the CONTROL_RESULT."
+            )
+        for test in tests:
+            _one_line(_bounded(test, ph, "result", "tests", MAX_TEST_CHARS), ph, "result", "tests")
+        return cls(previous_head_sha=previous, head_sha=head, resolutions=resolutions, tests=tests)
 
 
 @dataclass

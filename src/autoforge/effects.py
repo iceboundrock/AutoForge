@@ -57,6 +57,7 @@ from .claims import (
     PROGRESS,
     REVIEW,
     MarkerKind,
+    render_follow_up_marker,
     render_implementation_marker,
     render_progress_marker,
     render_review_marker,
@@ -82,6 +83,8 @@ from .result_parser import (
     markdown_code_span,
     published_markdown_problem,
     published_payload_problem,
+    validate_follow_up_body,
+    validate_follow_up_title,
     validate_pr_body,
     validate_pr_title,
     validate_progress_text,
@@ -249,6 +252,19 @@ def implementation_closing_block(issue_url: str) -> str:
     return f"Closes #{number}{APPEND_SEPARATOR}{render_implementation_marker(issue_url)}"
 
 
+def follow_up_reference(pr_url: str, finding_id: str) -> str:
+    """The controller's line in a follow-up issue it creates: the PR and finding (#163)."""
+    return f"Deferred from finding `{finding_id}` of {parse_pr_url(pr_url).canonical}."
+
+
+def follow_up_issue_body(text: str, pr_url: str, finding_id: str) -> str:
+    """K5's body: the agent's text, the controller's reference, then the finding's marker (#163)."""
+    return (
+        f"{text}{APPEND_SEPARATOR}{follow_up_reference(pr_url, finding_id)}"
+        f"{APPEND_SEPARATOR}{render_follow_up_marker(pr_url, finding_id)}"
+    )
+
+
 # -- closed sets -------------------------------------------------------------------
 
 
@@ -302,7 +318,9 @@ LABEL_NONE = ""
 LABEL_AGENT_PUBLISHES = "agent_publishes"
 LABEL_CONTROLLER_PUBLISHES = "controller_publishes"
 LAUNCH_LABELS = frozenset({LABEL_NONE, LABEL_AGENT_PUBLISHES, LABEL_CONTROLLER_PUBLISHES})
-CONTROLLER_PUBLISHED_PHASES = frozenset({Phase.ANALYZE_EXECUTE, Phase.REVIEW, Phase.UPDATE_EPIC})
+CONTROLLER_PUBLISHED_PHASES = frozenset(
+    {Phase.ANALYZE_EXECUTE, Phase.REVIEW, Phase.FIX, Phase.UPDATE_EPIC}
+)
 
 
 def launch_label_for(phase: Phase) -> str:
@@ -1074,6 +1092,34 @@ def _cross_follow_up_issue(record: EffectRecord, what: str) -> None:
     _same(record, what, (record.identity["repository"], record.target["repository"], "repo"))
     _check_owner_issue_marker(record, FOLLOW_UP, what)
     _check_body_ends_with_marker(record, record.identity["marker"], what)
+    if not parse_pr_url(record.owner.pr_url).same_repository(record.target["repository"]):
+        _fail(what, "creates a follow-up issue in another repository than its owner's PR")
+    # The payload is the title and body the parser accepted, the body then
+    # followed by the controller's reference to the PR and finding and the
+    # marker (#163); both texts get the parser's rules again, because a
+    # resumed create publishes them with no agent result in between.
+    claim = _marker_claim(FOLLOW_UP, record.identity["marker"])
+    tail = (
+        f"{APPEND_SEPARATOR}{follow_up_reference(record.owner.pr_url, claim.finding_id)}"
+        f"{APPEND_SEPARATOR}{record.identity['marker']}"
+    )
+    if not record.body.endswith(tail):
+        _fail(
+            what,
+            "has a payload body that is not its text, the controller's reference to its PR "
+            "and finding, and its marker",
+        )
+    text = record.body[: len(record.body) - len(tail)]
+    for key, value, validate in (
+        ("title", str(record.payload["title"]), validate_follow_up_title),
+        ("body", text, validate_follow_up_body),
+    ):
+        if value != value.strip():
+            _fail(what, f"has a follow-up {key} that is not in the parser's stored form")
+        try:
+            validate(value)
+        except ControlResultValidationError as exc:
+            _fail(what, f"has an invalid follow-up {key}: {exc}")
 
 
 def _cross_follow_up_append(record: EffectRecord, what: str) -> None:

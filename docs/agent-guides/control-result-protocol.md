@@ -57,8 +57,7 @@ again.
 ### SHA fields
 
 Every SHA field (`head_sha`, `reviewed_head_sha`, `previous_head_sha`,
-`new_head_sha`, `replacement_head_sha`, a FIX resolution's optional
-`commit_sha`) must be the **full 40-character** hexadecimal object id, and
+`replacement_head_sha`, a FIX resolution's optional `commit_sha`) must be the **full 40-character** hexadecimal object id, and
 is lower-cased on acceptance (`_SHA_RE`). The parser holds the agent to the
 same rule the prompts state and `autoforge.claims` applies to a marker: the
 controller compares each accepted SHA by equality with one read from GitHub
@@ -234,8 +233,8 @@ log; a malformed `follow_up_issue_url` is thereby a validation error of the
 and a malformed `next_issue_url` a validation error of the `UPDATE_EPIC`
 result rather than a selection for the engine to reject: the shape of the
 field is the parser's, which issue it names is the engine's
-([github-safety.md](github-safety.md), "After FIX" for the follow-up marker
-a claimed issue must carry, "After UPDATE_EPIC"), and an
+([github-safety.md](github-safety.md), "After FIX" for the issues a
+deferral may name, "After UPDATE_EPIC"), and an
 oversized value is never quoted into `next_issue_rejections`, the
 re-selection prompt or the run log. The fix prompts state the bounds
 through template variables filled from the same constants.
@@ -269,6 +268,41 @@ the composed body (the agent's body, `Closes #n` and the marker) judged as a
 whole with `published_payload_problem`. Each refusal is an ordinary
 correction with nothing pushed or created
 ([github-safety.md](github-safety.md), "After ANALYZE_EXECUTE").
+
+### FIX fields
+
+The fixer publishes nothing in REMOTE `FIX` (ADR 0004, #163): it commits on
+its worktree's detached `HEAD`, and the controller creates the follow-up
+issues it asks for, appends the deferral markers and pushes that commit to
+the PR branch. The result therefore names no push target; `new_head_sha` is
+not a key of this phase any more.
+
+| Key | Rule |
+|---|---|
+| `previous_head_sha` | required SHA; a cross-check only: the engine refuses a value other than the reviewed HEAD the open findings are bound to |
+| `head_sha` | required SHA; a cross-check only: the engine reads the worktree's `HEAD` itself and refuses a value that differs from it |
+| `resolutions` | required list, at most `MAX_RESOLUTIONS_PER_FIX`, distinct `finding_id`s; the engine refuses any set other than exactly the open findings |
+| `resolutions[].resolution` | `fixed`, `follow_up_created` or `no_change_with_rationale` |
+| `resolutions[].commit_sha` | optional SHA, on `fixed` only; the engine refuses one outside the commits after the reviewed HEAD up to `head_sha` |
+| `resolutions[].follow_up_issue_url` | on `follow_up_created` only, exclusive with `follow_up_issue`: an issue URL bounded by `MAX_URL_CHARS`; the engine refuses one it did not hand over and the current issue |
+| `resolutions[].follow_up_issue` | on `follow_up_created` only, exclusive with `follow_up_issue_url`: an object with `title` (one line, at most `MAX_FOLLOW_UP_TITLE_CHARS`, 256) and `body` (multi-line, at most `MAX_FOLLOW_UP_BODY_CHARS`, 60000), both non-blank |
+| `resolutions[].rationale` | at most `MAX_FIX_RATIONALE_CHARS`; at least `MIN_RATIONALE_CHARS` on `no_change_with_rationale` |
+| `tests` | optional list of one-line strings, at most `MAX_TESTS_REPORTED` (50) entries of `MAX_TEST_CHARS` (500); recorded, never published |
+
+A new follow-up issue's `title` and `body` pass the published-content
+policy (`published_text_problem`), so a body carries no marker: the
+controller follows it with its own reference to the PR and finding and the
+finding's marker, and judges that composed body as a whole with
+`published_payload_problem`. What the parser cannot see is the engine's:
+the worktree's `HEAD` (detached, equal to `head_sha`, the reviewed HEAD or a
+descendant of it), the commit messages of the published range
+(`commit_message_problem`), a `fixed` finding with no commit, and which
+issue a deferral names. Each refusal is an ordinary correction with nothing
+created, appended or pushed ([github-safety.md](github-safety.md), "After
+FIX"). The persisted `last_fix_resolutions` keeps its shape: a deferral is
+recorded with the URL of the issue GitHub read back, whichever form asked
+for it. LOCAL `FIX` is unchanged: it has no follow-ups and its own
+resolutions (`LOCAL_FIX_RESOLUTIONS`).
 
 ### UPDATE_EPIC fields
 

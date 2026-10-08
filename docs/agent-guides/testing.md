@@ -229,6 +229,37 @@ High-priority coverage includes:
   fetch launches nothing; the merge gate re-reads the comment the
   controller posted, and blocks once an edit drops its marker; a dry run,
   with or without a saved plan, reads, fetches, launches and posts nothing
+- `FIX`'s publication (#163, `tests/test_engine.py`, the `test_fix_*`
+  tests): the fixer commits and publishes nothing, and the controller
+  creates the follow-up issues it asks for, appends the markers to the
+  handed-over issues it defers to and pushes its commit, in that order and
+  the push last; a `previous_head_sha` or `head_sha` other than the
+  reviewed HEAD or the worktree's `HEAD`, a `HEAD` attached to a branch or
+  not descending from the reviewed HEAD, a published commit message the
+  policy refuses, a `fixed` finding with no commit, a `commit_sha` outside
+  the published range, resolutions other than exactly the open findings,
+  a deferral to the current issue or to an issue not handed over, a
+  finding's own follow-up resolved otherwise, and a follow-up title or
+  body the published-content policy refuses are corrections with nothing
+  created, appended or pushed; the entry fetches the reviewed HEAD before
+  the launch and hands over each finding's follow-up and the earlier
+  rounds'; the current issue carrying an open finding's marker blocks
+  before the launch, and a saved plan deferring to it (replayed or not)
+  blocks with nothing sent; a PR headed in a fork, with no readable head
+  repository or with no readable head branch blocks before the launch, and
+  one whose head repository is gone when the fixer returns blocks before
+  the plan; a PR closed, losing its head repository or retargeted after a
+  follow-up is created or appended is read before the push and pushes
+  nothing; a push target lost when the push lands records no fix, and
+  `unblock` completes the plan once it is restored; a
+  follow-up issue the controller did not journal, a reused one
+  no longer the finding's, an append target closed, moved or holding a
+  credential block with nothing sent; a push by someone else, while the
+  fixer ran or before the controller's (refused by the lease), goes to
+  `REVIEW` with nothing more sent; the next `REVIEW` prompt renders the
+  recorded resolutions; Pi reaches the same outcome as the scripted
+  provider; a dry run, with or without a saved plan, reads, fetches,
+  launches and writes nothing
 
 ### Recovery
 
@@ -263,6 +294,19 @@ High-priority coverage includes:
   section it renders) is refused on load and never posted
   (`tests/test_state.py` covers each edit: a body that is not the
   rendering of its context, and a section the parser would refuse)
+- `FIX` across its crash windows
+  (`test_fix_crash_window_resumes_from_the_journal_and_writes_each_effect_once`):
+  a crash with a create, an append or the push intended, landed with its
+  save lost, or observed, completes the plan from the journal without the
+  fixer and writes each effect exactly once; a PR head at the planned
+  candidate completes with no `REVIEW` detour; a duplicate invocation after
+  the effects writes nothing again; an issue body edited after the plan is
+  rebased, and one edited to hold a credential conflicts with no write; a
+  follow-up the controller created and a human closed before the read-back
+  blocks; a persisted follow-up create whose title or body the parser would
+  refuse, or whose body is not the fixer's text followed by the controller's
+  reference and marker, is refused on load (the `k5-*` cases of
+  `test_a_corrupt_record_fails_loudly` in `tests/test_effects.py`)
 
 ### Integration
 

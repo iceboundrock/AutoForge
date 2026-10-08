@@ -12,8 +12,16 @@ from pathlib import Path
 import pytest
 
 from autoforge import __prompt_version__
-from autoforge.claims import REVIEW, render_implementation_marker, render_progress_marker, scan
+from autoforge.claims import (
+    REVIEW,
+    render_follow_up_marker,
+    render_implementation_marker,
+    render_progress_marker,
+    scan,
+)
 from autoforge.config import default_config
+from autoforge.effects import EffectKind, Stage, compose_append
+from autoforge.effects import follow_up_issue_body as controller_follow_up_body
 from autoforge.effects import review_comment_body as render_review_comment
 from autoforge.errors import (
     ConfigurationError,
@@ -64,12 +72,15 @@ from tests.conftest import (
     CI_RUN_ID,
     CI_WORKFLOW_ID,
     EPIC,
+    FOLLOW_UP_TEXT,
+    FOLLOW_UP_TITLE,
     GIT_IDENT,
     ISSUE,
     ISSUE3,
     MAIN_SHA,
     MERGE_BASE,
     MERGE_BASE_B,
+    NO_CHANGE_RATIONALE,
     PR,
     SHA_A,
     SHA_B,
@@ -83,17 +94,25 @@ from tests.conftest import (
     commit_in,
     connect_origin,
     controller_review_comment,
+    deferred_to,
+    fix_commit,
+    fix_payload,
+    fixed,
+    fixer,
     follow_up_issue_body,
     git_out,
     git_repo,
     implement,
     implementation_pr_body,
     make_engine,
+    new_follow_up,
+    no_change,
     post_progress_comment,
     progress_comment_body,
-    push_fix,
+    publish_pr_head,
     review_comment_body,
     review_result,
+    reviewed_head_in,
     scripted,
 )
 
@@ -115,15 +134,30 @@ def review_payload(rnd: int, sha: str, findings: list[dict]) -> dict:
     return review_result(rnd, sha, findings)
 
 
-def _in_review(tmp_state_dir, gh: FakeGitHub, script, round_done: int = 0, head: str = SHA_A):
-    eng = make_engine(tmp_state_dir, script, github=gh)
+def _in_review(
+    tmp_state_dir,
+    gh: FakeGitHub,
+    script,
+    round_done: int = 0,
+    head: str = SHA_A,
+    origin: bool = False,
+):
+    """A run in REVIEW after ``round_done`` rounds, bound to the PR's HEAD.
+
+    With ``origin`` that HEAD is a real commit published to the PR branch
+    (``head`` is not used), so a FIX that follows commits on it and the
+    controller pushes the fix (#163).
+    """
+    eng = make_engine(tmp_state_dir, script, github=gh, origin=origin)
+    if origin:
+        head = publish_pr_head(eng)
     gh.add_pr(head_sha=head)
     eng.state.phase = Phase.REVIEW
     eng.state.current_pr_url = PR
     eng.state.current_branch = BRANCH
     eng.state.current_head_sha = head
     eng.state.current_base_ref = "main"
-    eng.state.current_merge_base_sha = MERGE_BASE
+    eng.state.current_merge_base_sha = eng.origin.merge_base("main", head) if origin else MERGE_BASE
     eng.state.review_round = round_done
     return eng
 
@@ -1301,11 +1335,10 @@ def test_review_to_fix_handoff_is_githubs_url_of_the_posted_comment(tmp_state_di
 
     def agent(req):
         if req.phase == "REVIEW":
-            return block(review_payload(1, SHA_A, [_finding(1)]))
-        gh.set_head(SHA_B)
-        return block(fix_payload(SHA_A, SHA_B, [{"finding_id": "R1-F1", "resolution": "fixed"}]))
+            return block(review_payload(1, gh.prs[PR].head_sha, [_finding(1)]))
+        return fixer(fixed("R1-F1"))(req)
 
-    eng = _in_review(tmp_state_dir, gh, agent)
+    eng = _in_review(tmp_state_dir, gh, agent, origin=True)
     assert eng.step().next_phase == "FIX"
     posted = controller_review_comment(eng, 1)
     s = load_state(eng.paths.state_file)
@@ -1322,27 +1355,26 @@ def test_fix_handoff_survives_a_restart_between_review_and_fix(tmp_state_dir):
     hands the fixer the same comment it would have without the restart, read
     from ``state.json`` rather than re-chosen from the PR conversation."""
     gh = FakeGitHub()
-    eng = _in_review(tmp_state_dir, gh, [block(review_payload(1, SHA_A, [_finding(1)]))])
+
+    def reviews(req):
+        return block(review_payload(1, gh.prs[PR].head_sha, [_finding(1)]))
+
+    eng = _in_review(tmp_state_dir, gh, reviews, origin=True)
+    head = eng.state.current_head_sha
     assert eng.step().next_phase == "FIX"
     persisted = load_state(eng.paths.state_file)
     assert persisted.phase == Phase.FIX
     posted = controller_review_comment(eng, 1).url
     assert persisted.last_review_comment_url == posted
-    del eng
-
-    def fixes(req):
-        gh.set_head(SHA_B)
-        return block(fix_payload(SHA_A, SHA_B, [{"finding_id": "R1-F1", "resolution": "fixed"}]))
 
     # A new process: nothing in memory, state loaded from disk.
-    eng2 = make_engine(tmp_state_dir, fixes, github=gh)
-    eng2.load()
+    eng2 = _resumed(eng, tmp_state_dir, gh, fixer(fixed("R1-F1")))
     assert eng2.state.phase == Phase.FIX
     assert eng2.step().next_phase == "REVIEW"
     prompt = eng2.provider.calls[0].prompt
     assert f"Verified review comment: {posted}" in prompt
     assert f"Read the verified review comment ({posted})" in prompt
-    assert "R1-F1" in prompt and SHA_A in prompt
+    assert "R1-F1" in prompt and head in prompt
 
 
 def test_fix_handoff_in_a_mixed_pr_conversation_is_the_marked_round_comment(tmp_state_dir):
@@ -1359,11 +1391,10 @@ def test_fix_handoff_in_a_mixed_pr_conversation_is_the_marked_round_comment(tmp_
 
     def agent(req):
         if req.phase == "REVIEW":
-            return block(review_payload(2, SHA_B, [_finding(2)]))
-        gh.set_head(SHA_C)
-        return block(fix_payload(SHA_B, SHA_C, [{"finding_id": "R2-F1", "resolution": "fixed"}]))
+            return block(review_payload(2, gh.prs[PR].head_sha, [_finding(2)]))
+        return fixer(fixed("R2-F1"))(req)
 
-    eng = _in_review(tmp_state_dir, gh, agent, round_done=1, head=SHA_B)
+    eng = _in_review(tmp_state_dir, gh, agent, round_done=1, origin=True)
     eng.state.reviewed_head_sha = SHA_A
     eng.state.last_review_comment_url = comment_url(PR, 100)
     assert eng.step().next_phase == "FIX"
@@ -1802,107 +1833,197 @@ def test_review_clean_then_ready_for_merge_holds(tmp_state_dir):
 
 
 # -- FIX ----------------------------------------------------------------------------------
-def _in_fix(tmp_state_dir, gh: FakeGitHub, script, findings=None):
-    eng = make_engine(tmp_state_dir, script, github=gh)
-    gh.add_pr(head_sha=SHA_A)
+# Since #163 the fixer only commits: the controller creates the follow-up
+# issues it asks for (K5), appends the markers of the findings it defers to
+# a handed-over issue (K6), and pushes its commit last (K1, the commit point).
+ISSUE43 = "https://github.com/owner/repo/issues/43"  # the first issue an origin-backed run creates
+
+
+def _in_fix(tmp_state_dir, gh: FakeGitHub, script, findings=None, origin: bool = False):
+    """A run in FIX after review round 1, bound to the PR's HEAD.
+
+    With ``origin`` that HEAD is a real commit published to the PR branch of
+    the engine's origin, which a fixer commits on and the controller pushes
+    to; without, it is ``SHA_A`` and no fixer may reach the push.
+    """
+    eng = make_engine(tmp_state_dir, script, github=gh, origin=origin)
+    head = publish_pr_head(eng) if origin else SHA_A
+    gh.add_pr(head_sha=head)
     eng.state.phase = Phase.FIX
     eng.state.current_pr_url = PR
-    eng.state.current_head_sha = SHA_A
-    eng.state.reviewed_head_sha = SHA_A
+    eng.state.current_head_sha = head
+    eng.state.reviewed_head_sha = head
     eng.state.review_round = 1
     eng.state.last_review_comment_url = comment_url(PR, 100)
     eng.state.open_findings = findings if findings is not None else [_finding(1)]
     return eng
 
 
-def fix_payload(prev: str, new: str, resolutions: list[dict]) -> dict:
-    return {
-        "phase": "FIX",
-        "status": "success",
-        "previous_head_sha": prev,
-        "new_head_sha": new,
-        "resolutions": resolutions,
-    }
+def _reports_fix(*resolutions: dict):
+    """A fixer whose work is already committed: it reports the worktree's HEAD."""
+
+    def handler(req) -> str:
+        reviewed = reviewed_head_in(req.prompt)
+        return block(fix_payload(reviewed, _worktree_head(req), list(resolutions)))
+
+    return handler
 
 
-def test_fix_valid_head_changed(tmp_state_dir):
+def _power_loss_at(eng, kind: EffectKind, stage: Stage, *, saved: bool) -> None:
+    """The process dies the first time a ``kind`` record moves to ``stage``.
+
+    ``saved``: right after that move was persisted; otherwise with it lost
+    (for ``observed``, the write it records has landed on GitHub).
+    """
+    persist = eng._persist_effect
+    fired: list[int] = []
+
+    def dying(record):
+        if not fired and record.kind is kind and record.stage is stage:
+            fired.append(record.position)
+            if saved:
+                persist(record)
+            raise KeyboardInterrupt
+        persist(record)
+
+    eng._persist_effect = dying
+
+
+def _stages(eng) -> list[tuple[str, str]]:
+    """Every persisted move of a FIX record, as (kind, stage), in order."""
+    moves: list[tuple[str, str]] = []
+    persist = eng._persist_effect
+
+    def spy(record):
+        moves.append((record.kind.value, record.stage.value))
+        persist(record)
+
+    eng._persist_effect = spy
+    return moves
+
+
+def _marked(finding_id: str, text: str = "A deferred problem.") -> str:
+    """An issue body carrying ``finding_id``'s follow-up marker for PR."""
+    return f"{text}\n\n{render_follow_up_marker(PR, finding_id)}\n"
+
+
+def test_fix_the_controller_pushes_the_fixers_commit(tmp_state_dir):
+    """#163: the fixer only commits. The controller checks the result against
+    the worktree's detached HEAD, pushes that commit to the PR branch as a
+    fast-forward over the reviewed HEAD, reads the PR head back and binds
+    it. The fixer published nothing, and nothing else was written."""
     gh = FakeGitHub()
-
-    def on_call(req):
-        gh.set_head(SHA_B)
-        return block(fix_payload(SHA_A, SHA_B, [{"finding_id": "R1-F1", "resolution": "fixed"}]))
-
-    eng = _in_fix(tmp_state_dir, gh, on_call)
+    eng = _in_fix(tmp_state_dir, gh, fixer(fixed("R1-F1")), origin=True)
+    reviewed = eng.state.reviewed_head_sha
     out = eng.step()
-    assert out.next_phase == "REVIEW"
+    assert out.next_phase == "REVIEW", out.message
     call = eng.provider.calls[0]
     assert call.profile.model == "fable" and call.profile.effort == "high"
     assert "R1-F1" in call.prompt and comment_url(PR, 100) in call.prompt
-    s = eng.state
-    assert s.current_head_sha == SHA_B and s.open_findings == []
-    assert s.last_fix_resolutions[0]["resolution"] == "fixed"
+    new = _worktree_head(call)
+    assert new != reviewed and eng.origin.is_ancestor(reviewed, new)
+    assert eng.origin.head(BRANCH) == new == gh.prs[PR].head_sha
+    assert f"pushed {new[:12]} over {reviewed[:12]}" in out.message
+    assert "0 follow-up issue(s) created, 0 marker append(s)" in out.message
+    s = load_state(eng.paths.state_file)
+    assert s.current_head_sha == new and s.reviewed_head_sha == reviewed
+    assert s.open_findings == [] and s.last_review_result == "fixed"
+    assert s.last_fix_resolutions == [
+        {
+            "finding_id": "R1-F1",
+            "resolution": "fixed",
+            "rationale": "",
+            "follow_up_issue_url": "",
+            "commit_sha": "",
+        }
+    ]
+    assert s.effect_records == [] and s.completion_context == {} and s.entry_observation == {}
     assert s.review_round == 1  # next review is round 2
+    assert gh.effect_writes == []
+
+
+def test_fix_prompt_asks_for_a_commit_and_publishes_nothing(tmp_state_dir):
+    """The prompt the fixer gets names the reviewed HEAD as its cross-check
+    and asks for no push, checkout of the PR, pull, issue write or PR
+    comment (#163)."""
+    gh = FakeGitHub()
+    eng = _in_fix(tmp_state_dir, gh, fixer(fixed("R1-F1")), origin=True)
+    assert eng.step().next_phase == "REVIEW"
+    prompt = eng.provider.calls[0].prompt
+    assert reviewed_head_in(prompt) == load_state(eng.paths.state_file).reviewed_head_sha
+    for forbidden in (
+        "git push",
+        "gh pr checkout",
+        "git pull",
+        "gh issue create",
+        "gh issue edit",
+        "gh pr comment",
+    ):
+        assert forbidden not in prompt, forbidden
 
 
 def test_fix_post_agent_journal_refusal_keeps_the_phase_for_resume(tmp_state_dir):
-    """#55 in REMOTE mode, FIX: the fixer pushed, then the journal append was
-    refused. The phase, the bound HEAD and the open findings are unchanged
-    and the launch is persisted as attempt 1; the refusal names the accepted
-    result it interrupted and that `resume` re-enters FIX and routes a pushed
-    HEAD back to REVIEW. The resume then finds HEAD past the reviewed one and
-    schedules the review of the actual HEAD without launching a fixer."""
+    """#55 in REMOTE mode, FIX: the fixer committed, then the journal append
+    was refused before the result was applied. Nothing was planned or
+    pushed; the phase, the bound HEAD and the open findings are unchanged
+    and the launch is persisted as attempt 1. The refusal names the accepted
+    result it interrupted and what `resume` does. The resume relaunches the
+    fixer (no plan was saved), which reports the commit it already made, and
+    the controller pushes it once."""
     from autoforge.runlog import MAX_EVENT_JOURNAL_BYTES
 
     gh = FakeGitHub()
+    fixes = fixer(fixed("R1-F1"))
 
     def fixes_then_enlarges_the_journal(req):
-        gh.set_head(SHA_B)
+        out = fixes(req)
         journal.parent.mkdir(parents=True, exist_ok=True)
         journal.touch()
         os.truncate(journal, 2 * MAX_EVENT_JOURNAL_BYTES)
-        return block(fix_payload(SHA_A, SHA_B, [{"finding_id": "R1-F1", "resolution": "fixed"}]))
+        return out
 
-    eng = _in_fix(tmp_state_dir, gh, fixes_then_enlarges_the_journal)
+    eng = _in_fix(tmp_state_dir, gh, fixes_then_enlarges_the_journal, origin=True)
+    reviewed = eng.state.reviewed_head_sha
     journal = Path(eng.paths.logs_dir) / eng.state.run_id / "events.jsonl"
     with pytest.raises(
         StateError,
         match=r"corrupted event journal.*interrupted attempt 1 of FIX after the agent had "
         r"returned with: a CONTROL_RESULT the controller accepted.*then 'resume': it "
-        r"re-enters FIX and routes a HEAD already pushed past the reviewed one back to REVIEW",
+        r"re-enters FIX and completes the follow-up issues, marker appends and push from the "
+        r"persisted plan when it was saved",
     ):
         eng.step()
     s = load_state(eng.paths.state_file)
     assert s.phase == Phase.FIX and s.review_round == 1 and s.attempt == 1
-    assert s.current_head_sha == SHA_A and s.reviewed_head_sha == SHA_A
+    assert s.current_head_sha == reviewed and s.reviewed_head_sha == reviewed
     assert [f["id"] for f in s.open_findings] == ["R1-F1"] and s.last_fix_resolutions == []
+    assert s.effect_records == [] and s.completion_context == {}
+    assert eng.origin.head(BRANCH) == reviewed and gh.effect_writes == []
     assert journal.stat().st_size == 2 * MAX_EVENT_JOURNAL_BYTES, "not carried forward"
     assert sorted(p.name for p in journal.parent.iterdir() if p.is_dir()) == ["001-fix-1"]
-    eng.close()
+    committed = _worktree_head(eng.provider.calls[0])
 
     os.truncate(journal, 0)
-    eng2 = make_engine(tmp_state_dir, ["never"], github=gh)
-    eng2.load()
+    eng2 = _resumed(eng, tmp_state_dir, gh, _reports_fix(fixed("R1-F1")))
     out = eng2.step()
-    assert out.next_phase == "REVIEW" and "no fixer launched" in out.message
-    assert eng2.provider.calls == []
+    assert out.next_phase == "REVIEW", out.message
+    assert len(eng2.provider.calls) == 1
+    assert eng.origin.head(BRANCH) == committed == gh.prs[PR].head_sha
     s = load_state(eng2.paths.state_file)
-    assert s.phase == Phase.REVIEW and s.current_head_sha == SHA_B
-    assert s.open_findings == [] and s.last_review_result == "stale" and s.attempt == 0
-    # The push may or may not have resolved R1-F1; the review of the actual
-    # HEAD is told to re-check it rather than the finding being dropped.
-    assert [f["id"] for f in s.prior_findings] == ["R1-F1"]
+    assert s.phase == Phase.REVIEW and s.current_head_sha == committed
+    assert s.last_review_result == "fixed" and s.attempt == 0 and s.prior_findings == []
 
 
 def test_fix_entry_with_head_past_the_reviewed_one_goes_to_review_without_a_fixer(
     tmp_state_dir,
 ):
     """PR #89 F1, FIX side: the HEAD the findings are bound to is no longer
-    the PR HEAD when FIX is entered (an unrecorded fix, an operator push).
-    The general HEAD-binding rule applies: the review is stale, the actual
-    HEAD gets reviewed, and no fixer is launched against findings of a
-    commit that is no longer the PR. The findings are not dropped either
-    (#14 item 2): they are carried to that review to re-check, and the
-    reviewer of the actual HEAD is shown them."""
+    the PR HEAD when FIX is entered (an operator push, or a fixer of the
+    previous contract that pushed). The general HEAD-binding rule applies:
+    the review is stale, the actual HEAD gets reviewed, and no fixer is
+    launched against findings of a commit that is no longer the PR. The
+    findings are not dropped either (#14 item 2): they are carried to that
+    review to re-check, and the reviewer of the actual HEAD is shown them."""
     gh = FakeGitHub()
 
     def round_two_sees_the_carry(req):
@@ -1979,19 +2100,14 @@ def test_fix_entry_without_a_reviewed_base_still_launches_the_fixer(tmp_state_di
     base to compare, so the fixer is launched whatever the PR's base is;
     the next completed review writes the binding."""
     gh = FakeGitHub()
-
-    def on_call(req):
-        gh.set_head(SHA_B)
-        return block(fix_payload(SHA_A, SHA_B, [{"finding_id": "R1-F1", "resolution": "fixed"}]))
-
-    eng = _in_fix(tmp_state_dir, gh, on_call)
+    eng = _in_fix(tmp_state_dir, gh, fixer(fixed("R1-F1")), origin=True)
     assert eng.state.reviewed_base_ref == ""
     gh.prs[PR].base_ref = "release/1.x"
     out = eng.step()
     assert out.next_phase == "REVIEW" and len(eng.provider.calls) == 1
     s = load_state(eng.paths.state_file)
-    assert s.current_head_sha == SHA_B and s.open_findings == []
-    assert s.last_fix_resolutions[0]["resolution"] == "fixed"
+    assert s.current_head_sha == _worktree_head(eng.provider.calls[0])
+    assert s.open_findings == [] and s.last_fix_resolutions[0]["resolution"] == "fixed"
     assert s.reviewed_base_ref == ""
 
 
@@ -2063,12 +2179,7 @@ def test_fix_entry_without_a_reviewed_merge_base_still_launches_the_fixer(tmp_st
     merge base is not read and the fixer is launched; the next completed
     review writes the binding."""
     gh = FakeGitHub()
-
-    def on_call(req):
-        gh.set_head(SHA_B)
-        return block(fix_payload(SHA_A, SHA_B, [{"finding_id": "R1-F1", "resolution": "fixed"}]))
-
-    eng = _in_fix(tmp_state_dir, gh, on_call)
+    eng = _in_fix(tmp_state_dir, gh, fixer(fixed("R1-F1")), origin=True)
     eng.state.reviewed_base_ref = "main"
     eng.state.current_base_ref = "main"
     assert eng.state.reviewed_merge_base_sha == ""
@@ -2077,127 +2188,586 @@ def test_fix_entry_without_a_reviewed_merge_base_still_launches_the_fixer(tmp_st
     assert out.next_phase == "REVIEW" and len(eng.provider.calls) == 1
     assert not [c for c in gh.calls if c[0] == "get_merge_base_sha"]
     s = load_state(eng.paths.state_file)
-    assert s.current_head_sha == SHA_B and s.reviewed_merge_base_sha == ""
+    assert s.current_head_sha == _worktree_head(eng.provider.calls[0])
+    assert s.reviewed_merge_base_sha == ""
 
 
 def test_fix_entry_with_the_unchanged_merge_base_launches_the_fixer(tmp_state_dir):
     gh = FakeGitHub()
-
-    def on_call(req):
-        gh.set_head(SHA_B)
-        return block(fix_payload(SHA_A, SHA_B, [{"finding_id": "R1-F1", "resolution": "fixed"}]))
-
-    eng = _in_fix(tmp_state_dir, gh, on_call)
+    eng = _in_fix(tmp_state_dir, gh, fixer(fixed("R1-F1")), origin=True)
+    head = eng.state.reviewed_head_sha
     eng.state.reviewed_base_ref = "main"
     eng.state.current_base_ref = "main"
-    eng.state.reviewed_merge_base_sha = MERGE_BASE
-    gh.branch_heads["main"] = SHA_B  # main advanced; the merge base did not move
+    eng.state.reviewed_merge_base_sha = eng.origin.merge_base("main", head)
+    # main advanced; the merge base did not move
+    publish_pr_head(eng, message="Unrelated work on main", branch="main")
     out = eng.step()
     assert out.next_phase == "REVIEW" and len(eng.provider.calls) == 1
-    assert ("get_merge_base_sha", "owner/repo", "main", SHA_A) in gh.calls
+    assert ("get_merge_base_sha", "owner/repo", "main", head) in gh.calls
     assert load_state(eng.paths.state_file).open_findings == []
 
 
-def test_fix_entry_binds_the_unchanged_head_and_launches_the_fixer(tmp_state_dir):
-    """HEAD still equals the reviewed HEAD at FIX entry: the fixer runs."""
+def test_fix_entry_binds_the_unchanged_head_and_fetches_it_before_the_launch(tmp_state_dir):
+    """HEAD still equals the reviewed HEAD at FIX entry: the controller
+    fetches it into the shared object store (the fixer starts from it
+    without contacting the remote), then launches the fixer."""
     gh = FakeGitHub()
+    seen = []
 
-    def on_call(req):
-        gh.set_head(SHA_B)
-        return block(fix_payload(SHA_A, SHA_B, [{"finding_id": "R1-F1", "resolution": "fixed"}]))
+    def checks_the_object_store(req):
+        reviewed = reviewed_head_in(req.prompt)
+        seen.append(git_out("-C", req.cwd, "cat-file", "-t", reviewed))
+        return fixer(fixed("R1-F1"))(req)
 
-    eng = _in_fix(tmp_state_dir, gh, on_call)
+    eng = _in_fix(tmp_state_dir, gh, checks_the_object_store, origin=True)
     assert eng.step().next_phase == "REVIEW"
-    assert len(eng.provider.calls) == 1
+    assert len(eng.provider.calls) == 1 and seen == ["commit"]
     assert ("get_pr", PR) in gh.calls
 
 
-def test_fix_returned_sha_mismatch_rejected(tmp_state_dir):
+def test_fix_entry_fetches_the_reviewed_head_before_the_launch(tmp_state_dir, offline_fetches):
+    """Without an origin the fetch is recorded (and does nothing): the
+    reviewed HEAD is what the entry asks for, before the launch."""
     gh = FakeGitHub()
-
-    def on_call(req):
-        gh.set_head(SHA_C)
-        return block(fix_payload(SHA_A, SHA_B, [{"finding_id": "R1-F1", "resolution": "fixed"}]))
-
-    eng = _in_fix(tmp_state_dir, gh, on_call)
-    with pytest.raises(VerificationError, match="actual PR HEAD"):
+    eng = _in_fix(tmp_state_dir, gh, [block(fix_payload(SHA_A, SHA_A, [fixed("R1-F1")]))])
+    eng.config.execution.max_correction_attempts = 0
+    offline_fetches.clear()
+    with pytest.raises(ControlResultValidationError):
         eng.step()
-    assert eng.state.phase == Phase.FIX
+    assert offline_fetches == [[SHA_A]]
 
 
-def test_fix_claims_fixed_without_new_commit_rejected(tmp_state_dir):
+@pytest.mark.parametrize(
+    ("head_repository", "branch", "reason"),
+    [
+        pytest.param(
+            "",
+            BRANCH,
+            f"PR {PR} has no readable head repository, so the controller cannot prove its "
+            "branch is a branch of owner/repo",
+            id="no-head-repository",
+        ),
+        pytest.param(
+            "someone/repo",
+            BRANCH,
+            f"PR {PR} is headed in someone/repo, not in owner/repo",
+            id="fork-head",
+        ),
+        pytest.param(
+            "owner/repo",
+            "",
+            f"PR {PR} has no readable head branch ('')",
+            id="no-head-branch",
+        ),
+    ],
+)
+def test_fix_entry_blocks_without_a_branch_of_the_run_repository(
+    tmp_state_dir, head_repository, branch, reason
+):
+    """PR #205 R1-F1: the controller pushes a fix only to a branch it has
+    proven is the PR's head in the run's repository. A PR GitHub reports
+    with no head repository (its head was deleted, a fork's typically) is
+    not one: a same-named branch of the run's repository is not proven to
+    be its head. It blocks before the launch like a fork's head or an
+    unreadable branch: no fixer, no entry observation, nothing sent."""
     gh = FakeGitHub()
+    eng = _in_fix(tmp_state_dir, gh, fixer(fixed("R1-F1")), origin=True)
+    gh.prs[PR].head_repository = head_repository
+    gh.prs[PR].head_ref = branch
+    reviewed = eng.state.reviewed_head_sha
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    s = load_state(eng.paths.state_file)
+    assert reason in s.block_reason and "Nothing was launched" in s.block_reason
+    assert eng.provider.calls == [] and s.entry_observation == {}
+    assert s.effect_records == [] and s.completion_context == {}
+    assert gh.effect_writes == [] and eng.origin.head(BRANCH) == reviewed
+
+
+@pytest.mark.parametrize(
+    "resolution", [fixed("R1-F1"), new_follow_up("R1-F1")], ids=["fixed", "new-follow-up"]
+)
+def test_fix_plan_blocks_when_the_head_repository_is_gone_after_the_launch(
+    tmp_state_dir, resolution
+):
+    """PR #205 R1-F1, at the plan: the head repository the entry proved is
+    no longer readable when the fixer returns. The PR branch is not proven
+    to be the run repository's, so neither the push nor a follow-up issue
+    is planned or sent."""
+    gh = FakeGitHub()
+    commits = fixer(resolution)
+
+    def commits_then_the_head_repository_goes(req):
+        answer = commits(req)
+        gh.prs[PR].head_repository = ""
+        return answer
+
+    eng = _in_fix(tmp_state_dir, gh, commits_then_the_head_repository_goes, origin=True)
+    reviewed = eng.state.reviewed_head_sha
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert len(eng.provider.calls) == 1
+    s = load_state(eng.paths.state_file)
+    assert f"PR {PR} has no readable head repository" in s.block_reason
+    assert "Nothing was created, appended or pushed" in s.block_reason
+    assert s.effect_records == [] and s.completion_context == {}
+    assert gh.effect_writes == [] and eng.origin.head(BRANCH) == reviewed
+
+
+def _detached_at_the_reviewed_parent(req) -> str:
+    """A fixer that rebuilt its commit on the reviewed HEAD's parent."""
+    reviewed = reviewed_head_in(req.prompt)
+    git_out("-C", req.cwd, "checkout", "-q", "--detach", f"{reviewed}^")
+    head = commit_in(req.cwd, "Fix R1-F1 (#2)")
+    return block(fix_payload(reviewed, head, [fixed("R1-F1"), no_change("R1-F2")]))
+
+
+def _on_a_local_branch(req) -> str:
+    out = fixer(fixed("R1-F1"), no_change("R1-F2"))(req)
+    git_out("-C", req.cwd, "checkout", "-q", "-b", "my-fix")
+    return out
+
+
+def _names_the_reviewed_commit(req) -> str:
+    reviewed = reviewed_head_in(req.prompt)
+    return fixer(fixed("R1-F1", commit_sha=reviewed), no_change("R1-F2"))(req)
+
+
+@pytest.mark.parametrize(
+    ("agent", "rule"),
+    [
+        (
+            fixer(fixed("R1-F1"), no_change("R1-F2"), commit=False),
+            r"R1-F1 resolved as fixed, but HEAD is still the reviewed HEAD .*: a fixed "
+            r"finding needs a commit",
+        ),
+        (
+            fixer(fixed("R1-F1"), no_change("R1-F2"), head_sha=SHA_B),
+            rf"field 'head_sha' is {SHA_B}, but the worktree's HEAD is [0-9a-f]{{40}}",
+        ),
+        (
+            fixer(fixed("R1-F1"), no_change("R1-F2"), previous_head_sha=SHA_C),
+            rf"field 'previous_head_sha' is {SHA_C}, but the open findings are bound to",
+        ),
+        (
+            fixer(fixed("R1-F1")),
+            r"must resolve exactly the open findings \['R1-F1', 'R1-F2'\], one resolution "
+            r"each; missing \['R1-F2'\], unknown \[\]",
+        ),
+        (
+            fixer(fixed("R1-F1"), no_change("R1-F2"), fixed("R1-F9")),
+            r"missing \[\], unknown \['R1-F9'\]",
+        ),
+        (_names_the_reviewed_commit, r"is not one of the commits after the reviewed HEAD"),
+        (
+            fixer(fixed("R1-F1", commit_sha=SHA_C), no_change("R1-F2")),
+            rf"the commit_sha {SHA_C} of R1-F1 is not one of the commits",
+        ),
+        (_detached_at_the_reviewed_parent, r"does not descend from the reviewed HEAD"),
+        (_on_a_local_branch, r"the worktree's HEAD is attached to a local branch"),
+        (
+            fixer(fixed("R1-F1"), no_change("R1-F2"), message="Fix R1-F1, closes #7"),
+            r"commit message names an issue other than this run's own #2 with a closing "
+            r"keyword",
+        ),
+        (
+            fixer(
+                fixed("R1-F1"),
+                no_change("R1-F2"),
+                message="Fix R1-F1 with ghp_" + "A1b2C3d4" * 5,
+            ),
+            r"commit message contains a credential-shaped string",
+        ),
+        (
+            fixer(fixed("R1-F1"), deferred_to("R1-F2", "https://github.com/Owner/REPO/issues/2")),
+            r"the follow-up of R1-F2 names the current issue https://github.com/owner/repo/"
+            r"issues/2, which is never a follow-up",
+        ),
+        (
+            fixer(fixed("R1-F1"), deferred_to("R1-F2", ISSUE3)),
+            rf"{ISSUE3} \(the follow-up of R1-F2\) is not a follow-up issue the controller "
+            r"handed over for this PR \(listed: none\)",
+        ),
+        (
+            fixer(fixed("R1-F1"), deferred_to("R1-F2", "https://github.com/other/repo/issues/9")),
+            r"is not a follow-up issue the controller handed over",
+        ),
+    ],
+    ids=[
+        "fixed-without-a-commit",
+        "head-not-the-worktree-head",
+        "previous-head-not-the-reviewed-head",
+        "missing-finding",
+        "extra-finding",
+        "commit-sha-is-the-reviewed-head",
+        "commit-sha-outside-the-candidate",
+        "not-a-fast-forward",
+        "attached-head",
+        "closes-another-issue",
+        "credential-in-a-commit-message",
+        "follow-up-is-the-current-issue",
+        "follow-up-not-handed-over",
+        "follow-up-in-another-repo",
+    ],
+)
+def test_fix_result_is_refused_before_any_effect(tmp_state_dir, agent, rule):
+    """#163: the result is checked in full before anything is created,
+    appended or pushed, and a refusal is a correction (here with no
+    correction left): the PR branch stays at the reviewed HEAD, GitHub gets
+    no write, no plan is saved, and the findings stay open."""
+    gh = FakeGitHub()
+    eng = _in_fix(tmp_state_dir, gh, agent, [_finding(1, 1), _finding(1, 2)], origin=True)
+    reviewed = eng.state.reviewed_head_sha
+    eng.config.execution.max_correction_attempts = 0
+    with pytest.raises(ControlResultValidationError, match=rule) as info:
+        eng.step()
+    assert "ghp_" not in str(info.value)
+    assert eng.origin.head(BRANCH) == reviewed == gh.prs[PR].head_sha
+    assert gh.effect_writes == []
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.FIX and s.current_head_sha == reviewed
+    assert [f["id"] for f in s.open_findings] == ["R1-F1", "R1-F2"]
+    assert s.effect_records == [] and s.completion_context == {}
+    assert s.last_fix_resolutions == []
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "",
+        follow_up_issue_body("R1-F1", PR41),
+        "closed",
+        "missing",
+    ],
+    ids=["no-marker", "another-pr", "closed", "missing"],
+)
+def test_fix_deferral_to_an_issue_not_handed_over_is_refused(tmp_state_dir, body):
+    """An existing issue is a follow-up the fixer may defer to only when the
+    entry handed it over: an open issue carrying a marker of this PR. An
+    unmarked issue, another PR's follow-up, a closed one or one that does
+    not exist is refused before anything is sent, so the controller never
+    writes a marker into an issue it did not hand over."""
+    gh = FakeGitHub()
+    if body == "closed":
+        gh.add_issue(ISSUE3, "closed follow-up", state="CLOSED", body=_marked("R1-F5"))
+    elif body != "missing":
+        gh.add_issue(ISSUE3, "some issue", body=body)
+    eng = _in_fix(tmp_state_dir, gh, fixer(deferred_to("R1-F1", ISSUE3), commit=False), origin=True)
+    eng.config.execution.max_correction_attempts = 0
+    with pytest.raises(
+        ControlResultValidationError,
+        match=rf"{ISSUE3} \(the follow-up of R1-F1\) is not a follow-up issue the controller "
+        r"handed over for this PR \(listed: none\)",
+    ):
+        eng.step()
+    assert gh.effect_writes == []
+    assert load_state(eng.paths.state_file).effect_records == []
+
+
+@pytest.mark.parametrize(
+    "resolution",
+    [
+        fixed("R1-F1"),
+        no_change("R1-F1"),
+        new_follow_up("R1-F1"),
+        deferred_to("R1-F1", "https://github.com/owner/repo/issues/4"),
+    ],
+    ids=["fixed", "no-change", "new-follow-up", "deferred-elsewhere"],
+)
+def test_fix_finding_with_its_own_follow_up_resolved_otherwise_is_refused(
+    tmp_state_dir, resolution
+):
+    """The open issue carrying a finding's marker is the durable record of
+    its disposition: the fixer must reuse it, and any other resolution is
+    refused before any effect, so no second follow-up is created and state
+    never records a resolution GitHub does not carry."""
+    gh = FakeGitHub()
+    gh.add_issue(ISSUE3, "follow-up", body=follow_up_issue_body("R1-F1"))
+    gh.add_issue("https://github.com/owner/repo/issues/4", "earlier", body=_marked("R1-F7"))
+    eng = _in_fix(tmp_state_dir, gh, fixer(resolution), origin=True)
+    reviewed = eng.state.reviewed_head_sha
+    eng.config.execution.max_correction_attempts = 0
+    with pytest.raises(
+        ControlResultValidationError,
+        match=rf"open issue {ISSUE3} already is the follow-up of R1-F1; resolve R1-F1 as "
+        "follow_up_created with that issue's URL",
+    ):
+        eng.step()
+    assert gh.effect_writes == [] and eng.origin.head(BRANCH) == reviewed
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.FIX and s.last_fix_resolutions == [] and s.effect_records == []
+    assert len(gh.issues) == 4  # EPIC, ISSUE, ISSUE3, issues/4: nothing created
+
+
+def test_fix_malformed_result_is_corrected_and_the_correction_is_pushed(tmp_state_dir):
+    """A fixer that committed and lost its block is asked again; the
+    correction reports the commit already in the worktree, and the
+    controller pushes it once."""
+    gh = FakeGitHub()
+
+    def commits_and_loses_the_block(req):
+        fix_commit(req, "Fix R1-F1 (#2)")
+        return "junk\n"
+
     eng = _in_fix(
         tmp_state_dir,
         gh,
-        [block(fix_payload(SHA_A, SHA_A, [{"finding_id": "R1-F1", "resolution": "fixed"}]))],
+        scripted(commits_and_loses_the_block, _reports_fix(fixed("R1-F1"))),
+        origin=True,
     )
-    with pytest.raises(VerificationError, match="did not change"):
-        eng.step()
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    first, second = eng.provider.calls
+    assert not first.correction and second.correction
+    assert "no CONTROL_RESULT block found" in second.prompt
+    assert eng.origin.head(BRANCH) == _worktree_head(second) == eng.state.current_head_sha
+    assert gh.effect_writes == []
 
 
-def test_fix_previous_sha_mismatch_rejected(tmp_state_dir):
+def test_fix_refused_result_is_corrected_before_any_effect(tmp_state_dir):
+    """A result the controller refuses (a fixed finding with no commit) is a
+    correction like a malformed one: the fixer is asked again with the
+    refusal, nothing was sent in between, and the corrected result is
+    planned and pushed."""
     gh = FakeGitHub()
+    sent = []
+
+    def corrects(req):
+        sent.append(list(gh.effect_writes))
+        return fixer(fixed("R1-F1"))(req)
+
     eng = _in_fix(
         tmp_state_dir,
         gh,
-        [block(fix_payload(SHA_C, SHA_B, [{"finding_id": "R1-F1", "resolution": "fixed"}]))],
+        scripted(fixer(fixed("R1-F1"), commit=False), corrects),
+        origin=True,
     )
-    with pytest.raises(VerificationError, match="previous_head_sha"):
-        eng.step()
+    reviewed = eng.state.reviewed_head_sha
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    first, second = eng.provider.calls
+    assert "a fixed finding needs a commit" in second.prompt
+    assert sent == [[]]
+    assert eng.origin.head(BRANCH) == _worktree_head(second) != reviewed
 
 
-def test_fix_must_cover_all_findings(tmp_state_dir):
+def test_fix_creates_the_follow_up_issue_the_fixer_asks_for(tmp_state_dir):
+    """A deferral to a new issue: the controller creates it with the fixer's
+    title, the fixer's body followed by its own reference to the PR and
+    finding and the marker, reads it back, and records its URL. Nothing was
+    committed, so nothing is pushed."""
     gh = FakeGitHub()
-    findings = [_finding(1, 1), _finding(1, 2, "blocked")]
-
-    def on_call(req):
-        gh.set_head(SHA_B)
-        return block(fix_payload(SHA_A, SHA_B, [{"finding_id": "R1-F1", "resolution": "fixed"}]))
-
-    eng = _in_fix(tmp_state_dir, gh, on_call, findings)
-    with pytest.raises(VerificationError, match="missing=\\['R1-F2'\\]"):
-        eng.step()
-
-
-def test_fix_follow_up_issue_verified(tmp_state_dir):
-    gh = FakeGitHub()
-
-    def creates_follow_up(req):
-        gh.add_issue(ISSUE3, "follow-up", body=follow_up_issue_body("R1-F1"))
-        return block(fix_payload(SHA_A, SHA_A, _follow_up("R1-F1", ISSUE3)))
-
-    eng = _in_fix(tmp_state_dir, gh, creates_follow_up)
-    assert eng.step().next_phase == "REVIEW"  # no commit needed for a pure follow-up
-    assert ("get_issue", ISSUE3) in gh.calls
-    assert ("list_open_issues", "owner/repo", True) in gh.calls
-
-
-def _follow_up(finding_id: str, url: str) -> list[dict]:
-    return [
-        {"finding_id": finding_id, "resolution": "follow_up_created", "follow_up_issue_url": url}
+    eng = _in_fix(tmp_state_dir, gh, fixer(new_follow_up("R1-F1"), commit=False), origin=True)
+    reviewed = eng.state.reviewed_head_sha
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert "1 follow-up issue(s) created" in out.message
+    assert f"nothing to push (HEAD stays {reviewed[:12]})" in out.message
+    body = controller_follow_up_body(FOLLOW_UP_TEXT, PR, "R1-F1")
+    assert body.startswith(FOLLOW_UP_TEXT) and body.endswith(render_follow_up_marker(PR, "R1-F1"))
+    assert gh.effect_writes == [("create_issue", "owner/repo", body)]
+    issue = gh.issues[ISSUE43]
+    assert issue.title == FOLLOW_UP_TITLE and issue.body == body and issue.is_open
+    assert eng.origin.head(BRANCH) == reviewed
+    s = load_state(eng.paths.state_file)
+    assert s.current_head_sha == reviewed and s.last_review_result == "fixed"
+    assert s.last_fix_resolutions == [
+        {
+            "finding_id": "R1-F1",
+            "resolution": "follow_up_created",
+            "rationale": "",
+            "follow_up_issue_url": ISSUE43,
+            "commit_sha": "",
+        }
     ]
 
 
-# -- FIX entry and read-back: follow-up issues (PR #89 review, F3) -------------------------
+def test_fix_round_mixing_every_resolution_creates_appends_then_pushes(tmp_state_dir):
+    """#163's happy path: a fixed finding (with the commit that fixed it), a
+    new follow-up issue, a re-deferral to an earlier round's follow-up and a
+    no-change rationale. The records are persisted in plan order (create,
+    append, push last), each read back before the next is sent; every
+    resolution's URL is the one its source read back; and the next reviewer
+    gets the resolutions as data instead of a PR comment."""
+    gh = FakeGitHub()
+    earlier = _marked("R1-F9")
+    gh.add_issue(ISSUE3, "deferred in round 1", body=earlier)
+    findings = [_finding(2, n) for n in (1, 2, 3, 4)]
+
+    def agent(req):
+        if req.phase == "REVIEW":
+            assert "The last FIX round's resolutions" in req.prompt
+            assert "The controller verified these against the commits it pushed" in req.prompt
+            assert f'"follow_up_issue_url": "{ISSUE43}"' in req.prompt
+            assert f'"commit_sha": "{new[0]}"' in req.prompt
+            assert NO_CHANGE_RATIONALE in req.prompt
+            for fid, url in (("R1-F9", ISSUE3), ("R2-F2", ISSUE43), ("R2-F3", ISSUE3)):
+                assert f"- {fid}: {url}" in req.prompt
+            return block(review_payload(3, new[0], []))
+        assert "- R2-F1: existing issue: (none)" in req.prompt
+        assert f"earlier rounds (finding id:\nissue):\n\n- R1-F9: {ISSUE3}\n" in req.prompt
+        new.append(fix_commit(req, "Fix R2-F1 (#2)"))
+        return block(
+            fix_payload(
+                reviewed_head_in(req.prompt),
+                new[0],
+                [
+                    fixed("R2-F1", commit_sha=new[0]),
+                    new_follow_up("R2-F2"),
+                    deferred_to("R2-F3", ISSUE3),
+                    no_change("R2-F4"),
+                ],
+            )
+        )
+
+    new: list[str] = []
+    eng = _in_fix(tmp_state_dir, gh, agent, findings, origin=True)
+    eng.state.review_round = 2
+    reviewed = eng.state.reviewed_head_sha
+    moves = _stages(eng)
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert moves == [
+        ("follow_up_issue", "attempted"),
+        ("follow_up_issue", "observed"),
+        ("follow_up_append", "attempted"),
+        ("follow_up_append", "observed"),
+        ("push", "attempted"),
+        ("push", "observed"),
+    ]
+    appended = compose_append(earlier, render_follow_up_marker(PR, "R2-F3"))
+    assert gh.effect_writes == [
+        ("create_issue", "owner/repo", controller_follow_up_body(FOLLOW_UP_TEXT, PR, "R2-F2")),
+        ("write_issue_body", ISSUE3, appended),
+    ]
+    assert gh.issues[ISSUE3].body == appended
+    assert eng.origin.head(BRANCH) == new[0] == gh.prs[PR].head_sha
+    assert (
+        f"FIX of review round 2: 4 resolution(s), 1 follow-up issue(s) created, 1 marker "
+        f"append(s), pushed {new[0][:12]} over {reviewed[:12]}; FIX -> REVIEW (round 3)"
+    ) == out.message
+    s = load_state(eng.paths.state_file)
+    assert s.current_head_sha == new[0] and s.open_findings == []
+    assert s.last_fix_resolutions == [
+        {
+            "finding_id": "R2-F1",
+            "resolution": "fixed",
+            "rationale": "",
+            "follow_up_issue_url": "",
+            "commit_sha": new[0],
+        },
+        {
+            "finding_id": "R2-F2",
+            "resolution": "follow_up_created",
+            "rationale": "",
+            "follow_up_issue_url": ISSUE43,
+            "commit_sha": "",
+        },
+        {
+            "finding_id": "R2-F3",
+            "resolution": "follow_up_created",
+            "rationale": "",
+            "follow_up_issue_url": ISSUE3,
+            "commit_sha": "",
+        },
+        {
+            "finding_id": "R2-F4",
+            "resolution": "no_change_with_rationale",
+            "rationale": NO_CHANGE_RATIONALE,
+            "follow_up_issue_url": "",
+            "commit_sha": "",
+        },
+    ]
+
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    assert [c.phase for c in eng.provider.calls] == ["FIX", "REVIEW"]
+    assert not [c for c in gh.calls if c[0] in ("comment_pr", "create_pr_comment")][1:]
+
+
 def test_fix_entry_hands_an_existing_follow_up_issue_to_the_fixer(tmp_state_dir):
-    """A fixer whose result was never recorded created the follow-up issue and
-    pushed nothing, so the HEAD is unchanged and a HEAD probe sees nothing.
-    The open issue carrying the (PR, finding) marker is what records that
-    write; the entry finds it, names it in the prompt, and the fixer reports
-    it instead of creating a second one."""
+    """A human (or a fixer of the previous contract) created the finding's
+    follow-up before this entry. The open issue carrying the (PR, finding)
+    marker is found, named in the prompt, and the fixer reuses it: an empty
+    plan, so nothing is created, appended or pushed."""
     gh = FakeGitHub()
     gh.add_issue(ISSUE3, "follow-up", body=follow_up_issue_body("R1-F1"))
-    from autoforge.engine import render_follow_up_marker
 
     def adopts(req):
-        marker = render_follow_up_marker(PR, "R1-F1")
-        assert f"- R1-F1: marker `{marker}`; existing issue: {ISSUE3}" in req.prompt
-        return block(fix_payload(SHA_A, SHA_A, _follow_up("R1-F1", ISSUE3)))
+        assert f"- R1-F1: existing issue: {ISSUE3}" in req.prompt
+        assert render_follow_up_marker(PR, "R1-F1") not in req.prompt
+        return fixer(deferred_to("R1-F1", ISSUE3), commit=False)(req)
 
-    eng = _in_fix(tmp_state_dir, gh, adopts)
-    assert eng.step().next_phase == "REVIEW"
+    eng = _in_fix(tmp_state_dir, gh, adopts, origin=True)
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert "0 follow-up issue(s) created, 0 marker append(s), nothing to push" in out.message
     assert len(eng.provider.calls) == 1 and len(gh.issues) == 1 + 2  # EPIC, ISSUE, ISSUE3
+    assert gh.effect_writes == []
+    s = load_state(eng.paths.state_file)
+    assert s.last_fix_resolutions[0]["follow_up_issue_url"] == ISSUE3
+
+
+def test_fix_reuse_with_an_empty_plan_completes_after_a_crash_without_a_launch(
+    tmp_state_dir, monkeypatch
+):
+    """The same reuse, with the process dying right after the (empty) plan
+    is saved: the next process completes FIX from the journal with no
+    launch, no write and no second issue."""
+    from autoforge.engine import ControllerEngine
+
+    gh = FakeGitHub()
+    gh.add_issue(ISSUE3, "follow-up", body=follow_up_issue_body("R1-F1"))
+    eng = _in_fix(tmp_state_dir, gh, fixer(deferred_to("R1-F1", ISSUE3), commit=False), origin=True)
+    monkeypatch.setattr(ControllerEngine, "_complete_fix", _crash)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    monkeypatch.undo()
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.FIX and s.effect_records == [] and s.completion_context
+
+    eng2 = _resumed(eng, tmp_state_dir, gh, "never")
+    out = eng2.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert "completed from the persisted FIX plan; no fixer launched" in out.message
+    assert eng2.provider.calls == [] and gh.effect_writes == [] and len(gh.issues) == 3
+    s = load_state(eng2.paths.state_file)
+    assert s.last_fix_resolutions[0]["follow_up_issue_url"] == ISSUE3
+
+
+def test_fix_legacy_reentry_hands_over_the_follow_up_a_previous_fixer_created(tmp_state_dir):
+    """D13.6: a run upgraded while a fixer of the previous contract (which
+    created follow-up issues itself) was running. Its re-entry has no entry
+    observation to honor; the issue it created is handed over as found, the
+    relaunched fixer reuses it, and nothing is created twice."""
+    gh = FakeGitHub()
+    eng = _in_fix(tmp_state_dir, gh, fixer(deferred_to("R1-F1", ISSUE3), commit=False), origin=True)
+    eng._save()
+    _as_protocol_5(eng, attempt=1)
+    gh.add_issue(ISSUE3, "follow-up", body=follow_up_issue_body("R1-F1"))  # the old fixer's
+    eng.load()
+    assert eng.state.launch_label == "agent_publishes"
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert f"- R1-F1: existing issue: {ISSUE3}" in eng.provider.calls[0].prompt
+    assert gh.effect_writes == [] and len(gh.issues) == 3
+    s = load_state(eng.paths.state_file)
+    assert s.last_fix_resolutions[0]["follow_up_issue_url"] == ISSUE3
+
+
+def test_fix_entry_ignores_a_closed_issue_carrying_the_marker(tmp_state_dir):
+    """A closed follow-up is not the finding's open follow-up: the fixer is
+    told none exists, and the new issue it asks for is created."""
+    gh = FakeGitHub()
+    gh.add_issue(ISSUE3, "closed follow-up", state="CLOSED", body=follow_up_issue_body("R1-F1"))
+
+    def creates(req):
+        assert "- R1-F1: existing issue: (none)" in req.prompt and ISSUE3 not in req.prompt
+        return fixer(new_follow_up("R1-F1"), commit=False)(req)
+
+    eng = _in_fix(tmp_state_dir, gh, creates, origin=True)
+    assert eng.step().next_phase == "REVIEW"
+    assert [w[0] for w in gh.effect_writes] == ["create_issue"]
+    assert eng.state.last_fix_resolutions[0]["follow_up_issue_url"] == ISSUE43
 
 
 def test_fix_entry_blocks_on_two_follow_up_issues_for_one_finding_without_invoking(
@@ -2220,7 +2790,7 @@ def test_fix_entry_blocks_when_the_open_issue_listing_cannot_be_proven_complete(
 ):
     """ "No follow-up issue exists" is a claim about every open issue; a listing
     that may be truncated cannot make it, and a fixer launched on it could
-    create a second issue. BLOCKED, nobody launched, HEAD not bound."""
+    ask for a second one. BLOCKED, nobody launched, HEAD not bound."""
     gh = FakeGitHub()
     gh.issue_listing_truncated = True
     eng = _in_fix(tmp_state_dir, gh, ["never"])
@@ -2229,22 +2799,6 @@ def test_fix_entry_blocks_when_the_open_issue_listing_cannot_be_proven_complete(
     reason = load_state(eng.paths.state_file).block_reason
     assert "cannot establish which follow-up issues already exist" in reason
     assert "may be truncated" in reason
-
-
-def test_fix_entry_ignores_a_closed_issue_carrying_the_marker(tmp_state_dir):
-    """A closed follow-up is not the finding's open follow-up: the fixer is
-    told none exists and may create one during its run."""
-    gh = FakeGitHub()
-    gh.add_issue(ISSUE3, "closed follow-up", state="CLOSED", body=follow_up_issue_body("R1-F1"))
-    new = "https://github.com/owner/repo/issues/5"
-
-    def creates(req):
-        assert "; existing issue: (none)" in req.prompt and ISSUE3 not in req.prompt
-        gh.add_issue(new, "follow-up", body=follow_up_issue_body("R1-F1"))
-        return block(fix_payload(SHA_A, SHA_A, _follow_up("R1-F1", new)))
-
-    eng = _in_fix(tmp_state_dir, gh, creates)
-    assert eng.step().next_phase == "REVIEW"
 
 
 # -- earlier rounds' follow-ups reach the reviewer and the fixer (PR #89 review F2, #90) ---
@@ -2290,181 +2844,1419 @@ def test_review_entry_blocks_when_the_open_issue_listing_cannot_be_proven_comple
     assert "may be truncated" in reason
 
 
-def test_fix_entry_hands_earlier_rounds_follow_ups_to_the_fixer(tmp_state_dir):
+def test_fix_entry_hands_earlier_rounds_follow_ups_and_appends_the_marker(tmp_state_dir):
     """The open finding's own follow-up slot is empty; the deferral of an
-    earlier round is listed separately, so a re-raised problem can be
-    recorded on the issue that exists instead of in a second one."""
+    earlier round is listed separately, so a re-raised problem is recorded
+    on the issue that exists instead of in a second one: the controller
+    appends the finding's marker to it, and the issue then carries both."""
     gh = FakeGitHub()
-    gh.add_issue(ISSUE3, "deferred in round 1", body=follow_up_issue_body("R1-F2"))
-    from autoforge.engine import render_follow_up_marker
+    earlier = follow_up_issue_body("R1-F2")
+    gh.add_issue(ISSUE3, "deferred in round 1", body=earlier)
 
-    def adds_the_marker(req):
-        marker = render_follow_up_marker(PR, "R2-F1")
-        assert f"- R2-F1: marker `{marker}`; existing issue: (none)" in req.prompt
+    def defers_again(req):
+        assert "- R2-F1: existing issue: (none)" in req.prompt
         assert f"earlier rounds (finding id:\nissue):\n\n- R1-F2: {ISSUE3}\n" in req.prompt
-        gh.issues[ISSUE3].body += marker + "\n"  # the same problem: one issue, two markers
-        return block(fix_payload(SHA_A, SHA_A, _follow_up("R2-F1", ISSUE3)))
+        return fixer(deferred_to("R2-F1", ISSUE3), commit=False)(req)
 
-    eng = _in_fix(tmp_state_dir, gh, adds_the_marker, findings=[_finding(2)])
+    eng = _in_fix(tmp_state_dir, gh, defers_again, findings=[_finding(2)], origin=True)
     eng.state.review_round = 2
-    assert eng.step().next_phase == "REVIEW"
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert "0 follow-up issue(s) created, 1 marker append(s)" in out.message
+    appended = compose_append(earlier, render_follow_up_marker(PR, "R2-F1"))
+    assert gh.effect_writes == [("write_issue_body", ISSUE3, appended)]
+    assert gh.issues[ISSUE3].body == appended
     assert len(gh.issues) == 3  # EPIC, ISSUE, ISSUE3: no second follow-up issue
     assert eng.state.last_fix_resolutions[0]["follow_up_issue_url"] == ISSUE3
 
 
-def test_a_deferral_survives_an_unrecorded_fix_round(tmp_state_dir):
-    """Issue #90's scenario end to end: the fixer creates the follow-up issue,
-    pushes, and loses its result. The FIX re-entry routes to REVIEW of the
-    pushed HEAD (which findings the push resolved is not inferred), and that
-    review is told about the issue, so the problem is not re-raised under a
-    new id; the run ends clean with one follow-up issue."""
+def test_fix_two_findings_deferred_to_one_issue_append_once(tmp_state_dir):
+    """Two findings deferred to the same handed-over issue are one append
+    (one K6 record, one body write) carrying both markers, in result order."""
     gh = FakeGitHub()
-    new = "https://github.com/owner/repo/issues/5"
+    earlier = _marked("R1-F5")
+    gh.add_issue(ISSUE3, "deferred in round 1", body=earlier)
+    eng = _in_fix(
+        tmp_state_dir,
+        gh,
+        fixer(deferred_to("R2-F2", ISSUE3), deferred_to("R2-F1", ISSUE3), commit=False),
+        findings=[_finding(2, 1), _finding(2, 2)],
+        origin=True,
+    )
+    eng.state.review_round = 2
+    moves = _stages(eng)
+    assert eng.step().next_phase == "REVIEW"
+    assert moves == [("follow_up_append", "attempted"), ("follow_up_append", "observed")]
+    block_ = "\n".join(render_follow_up_marker(PR, fid) for fid in ("R2-F2", "R2-F1"))
+    assert gh.effect_writes == [("write_issue_body", ISSUE3, compose_append(earlier, block_))]
+    urls = [r["follow_up_issue_url"] for r in eng.state.last_fix_resolutions]
+    assert urls == [ISSUE3, ISSUE3]
 
-    def agent(req):
-        if req.phase == "FIX":
-            assert not req.correction
-            gh.add_issue(new, "follow-up", body=follow_up_issue_body("R1-F1"))
-            gh.set_head(SHA_B)
-            return "junk\n"  # the result block was lost
-        assert req.phase == "REVIEW"
-        assert f"earlier rounds:\n  - R1-F1: {new}\n" in req.prompt
-        return block(review_payload(2, SHA_B, []))
 
-    eng = _in_fix(tmp_state_dir, gh, agent)
+def test_fix_deferral_spelling_a_handed_over_issue_otherwise_is_that_issue(tmp_state_dir):
+    """PR #205 R4-F1: GitHub owner and repository names are case-insensitive,
+    so ``Owner/REPO/issues/3`` is the earlier round's follow-up the entry
+    handed over as ``owner/repo/issues/3``. The deferral is accepted with no
+    correction, joins the deferral spelling it as read in one append (one K6
+    record, one body write, each marker once), and the record and the
+    resolutions carry the URL the controller read, never the reported one."""
+    gh = FakeGitHub()
+    earlier = _marked("R1-F9")
+    gh.add_issue(ISSUE3, "deferred in round 1", body=earlier)
+    eng = _in_fix(
+        tmp_state_dir,
+        gh,
+        fixer(
+            deferred_to("R2-F1", "https://github.com/Owner/REPO/issues/3"),
+            deferred_to("R2-F2", ISSUE3),
+            commit=False,
+        ),
+        findings=[_finding(2, 1), _finding(2, 2)],
+        origin=True,
+    )
+    eng.state.review_round = 2
+    eng.config.execution.max_correction_attempts = 0
+    targets: list[str] = []
+    persist = eng._persist_effect
+
+    def spy(record):
+        targets.append(record.target["issue_url"])
+        persist(record)
+
+    eng._persist_effect = spy
     out = eng.step()
-    assert out.next_phase == "REVIEW" and "no fixer launched" in out.message
-    assert eng.step().next_phase == "READY_FOR_MERGE"
-    assert [c.phase for c in eng.provider.calls] == ["FIX", "REVIEW"]
-    assert len(gh.issues) == 3  # EPIC, ISSUE, the one follow-up
+    assert out.next_phase == "REVIEW", out.message
+    assert len(eng.provider.calls) == 1
+    assert "0 follow-up issue(s) created, 1 marker append(s)" in out.message
+    block_ = "\n".join(render_follow_up_marker(PR, fid) for fid in ("R2-F1", "R2-F2"))
+    appended = compose_append(earlier, block_)
+    assert gh.effect_writes == [("write_issue_body", ISSUE3, appended)]
+    assert gh.issues[ISSUE3].body == appended
+    assert targets == [ISSUE3, ISSUE3]  # attempted, observed
+    urls = [r["follow_up_issue_url"] for r in eng.state.last_fix_resolutions]
+    assert urls == [ISSUE3, ISSUE3]
 
 
 @pytest.mark.parametrize(
-    "body",
+    "other",
     [
-        "",
-        follow_up_issue_body("R1-F2"),
-        follow_up_issue_body("R1-F1", "https://github.com/owner/repo/pull/41"),
+        "https://github.com/Owner/REPO/issues/4",
+        "https://github.com/owner/other/issues/3",
     ],
-    ids=["no-marker", "another-finding", "another-pr"],
+    ids=["another-number", "another-repository"],
 )
-def test_fix_follow_up_issue_not_carrying_the_findings_marker_is_rejected(tmp_state_dir, body):
-    """An existing open issue is not a follow-up of this finding unless it
-    carries the (PR, finding) marker; the marker is what a later entry finds,
-    so an unmarked follow-up would be recreated on the next relaunch."""
+def test_fix_deferral_to_another_issue_than_the_handed_over_one_is_refused(tmp_state_dir, other):
+    """PR #205 R4-F1: identity, not spelling, decides whether a deferral
+    names a handed-over issue. Another number, or the same number in another
+    repository, is another issue and stays refused before any effect."""
     gh = FakeGitHub()
-    gh.add_issue(ISSUE3, "some issue", body=body)
+    gh.add_issue(ISSUE3, "deferred in round 1", body=_marked("R1-F9"))
+    gh.add_issue("https://github.com/owner/repo/issues/4", "unmarked")
     eng = _in_fix(
-        tmp_state_dir, gh, [block(fix_payload(SHA_A, SHA_A, _follow_up("R1-F1", ISSUE3)))]
+        tmp_state_dir,
+        gh,
+        fixer(deferred_to("R2-F1", other), commit=False),
+        findings=[_finding(2)],
+        origin=True,
     )
-    with pytest.raises(VerificationError, match="is not the open issue carrying the marker"):
+    eng.state.review_round = 2
+    eng.config.execution.max_correction_attempts = 0
+    with pytest.raises(
+        ControlResultValidationError,
+        match=rf"{other} \(the follow-up of R2-F1\) is not a follow-up issue the controller "
+        rf"handed over for this PR \(listed: {ISSUE3}\)",
+    ):
         eng.step()
-    assert eng.state.phase == Phase.FIX
+    assert gh.effect_writes == []
+    assert load_state(eng.paths.state_file).effect_records == []
 
 
-def test_fix_follow_up_claiming_another_issue_than_the_marked_one_is_rejected(tmp_state_dir):
+def test_fix_reuse_beside_an_append_writes_the_other_findings_marker_only(tmp_state_dir):
+    """Finding A's own follow-up is ISSUE3 (found at entry); the fixer
+    reuses it for A and defers B to it too. One K6 appends B's marker only,
+    so each marker appears exactly once, and each resolution names ISSUE3
+    from its own source (the entry for A, the append for B)."""
     gh = FakeGitHub()
-    other = "https://github.com/owner/repo/issues/4"
-    gh.add_issue(ISSUE3, "the marked one", body=follow_up_issue_body("R1-F1"))
-    gh.add_issue(other, "unmarked")
-    eng = _in_fix(tmp_state_dir, gh, [block(fix_payload(SHA_A, SHA_A, _follow_up("R1-F1", other)))])
-    with pytest.raises(VerificationError, match=rf"carrying the marker .*\(that is {ISSUE3}\)"):
-        eng.step()
+    own = follow_up_issue_body("R2-F1")
+    gh.add_issue(ISSUE3, "follow-up of A", body=own)
+    eng = _in_fix(
+        tmp_state_dir,
+        gh,
+        fixer(deferred_to("R2-F1", ISSUE3), deferred_to("R2-F2", ISSUE3), commit=False),
+        findings=[_finding(2, 1), _finding(2, 2)],
+        origin=True,
+    )
+    eng.state.review_round = 2
+    assert eng.step().next_phase == "REVIEW"
+    marker_a, marker_b = (render_follow_up_marker(PR, fid) for fid in ("R2-F1", "R2-F2"))
+    assert gh.effect_writes == [("write_issue_body", ISSUE3, compose_append(own, marker_b))]
+    body = gh.issues[ISSUE3].body
+    assert body.count(marker_a) == 1 and body.count(marker_b) == 1
+    urls = [r["follow_up_issue_url"] for r in eng.state.last_fix_resolutions]
+    assert urls == [ISSUE3, ISSUE3]
 
 
-def test_fix_resolving_a_finding_otherwise_while_its_follow_up_issue_is_open_is_rejected(
+def test_fix_another_issue_marked_for_a_reused_finding_while_the_fixer_ran_blocks(
     tmp_state_dir,
 ):
-    """The marked open issue is the durable record of the finding's
-    disposition; a result that contradicts it is not adopted, and state never
-    records a resolution GitHub does not carry."""
-    gh = FakeGitHub()
-    gh.add_issue(ISSUE3, "follow-up", body=follow_up_issue_body("R1-F1"))
-
-    def fixes_instead(req):
-        gh.set_head(SHA_B)
-        return block(fix_payload(SHA_A, SHA_B, [{"finding_id": "R1-F1", "resolution": "fixed"}]))
-
-    eng = _in_fix(tmp_state_dir, gh, fixes_instead)
-    with pytest.raises(VerificationError, match="resolved as fixed but open issue .* carries"):
-        eng.step()
-    assert eng.state.phase == Phase.FIX and eng.state.last_fix_resolutions == []
-
-
-def test_fix_creating_a_second_follow_up_issue_is_rejected_then_blocked(tmp_state_dir):
-    """The fixer ignores the existing issue and creates another: the result is
-    rejected on read-back (the rule is not trusted to the prompt), and the
-    next entry blocks on the pair instead of launching a third fixer."""
+    """Someone marks a second issue for a finding whose follow-up the fixer
+    reuses: the precondition read finds two, the controller never chooses
+    between them, and nothing is created, appended or pushed."""
     gh = FakeGitHub()
     other = "https://github.com/owner/repo/issues/4"
     gh.add_issue(ISSUE3, "follow-up", body=follow_up_issue_body("R1-F1"))
+    reuses = fixer(deferred_to("R1-F1", ISSUE3))
 
-    def creates_again(req):
-        gh.add_issue(other, "follow-up again", body=follow_up_issue_body("R1-F1"))
-        return block(fix_payload(SHA_A, SHA_A, _follow_up("R1-F1", other)))
+    def reuses_while_another_is_marked(req):
+        gh.add_issue(other, "rogue", body=follow_up_issue_body("R1-F1"))
+        return reuses(req)
 
-    eng = _in_fix(tmp_state_dir, gh, creates_again)
-    with pytest.raises(VerificationError, match="2 open issues carry the ai-follow-up marker"):
-        eng.step()
-    assert eng.step().next_phase == "BLOCKED"
-    assert len(eng.provider.calls) == 1
+    eng = _in_fix(tmp_state_dir, gh, reuses_while_another_is_marked, origin=True)
+    reviewed = eng.state.reviewed_head_sha
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    reason = load_state(eng.paths.state_file).block_reason
+    assert "2 open issues carry the ai-follow-up marker for finding R1-F1" in reason
+    assert "nothing was created, appended or pushed" in reason
+    assert gh.effect_writes == [] and eng.origin.head(BRANCH) == reviewed
 
 
-def test_fix_follow_up_read_back_lets_an_unavailable_issue_read_through_as_transient(
-    tmp_state_dir,
+def test_fix_a_follow_up_the_controller_did_not_journal_blocks_the_plan(tmp_state_dir):
+    """The fixer creates a marked follow-up issue itself (the previous
+    contract) and resolves the finding as fixed: the entry recorded no
+    follow-up for it, so the issue is not the controller's, is never
+    adopted, and nothing is created, appended or pushed."""
+    gh = FakeGitHub()
+    fixes = fixer(fixed("R1-F1"))
+
+    def creates_one_itself(req):
+        gh.add_issue(ISSUE3, "follow-up", body=follow_up_issue_body("R1-F1"))
+        return fixes(req)
+
+    eng = _in_fix(tmp_state_dir, gh, creates_one_itself, origin=True)
+    reviewed = eng.state.reviewed_head_sha
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    reason = load_state(eng.paths.state_file).block_reason
+    assert f"the follow-up issue of R1-F1 is {ISSUE3}, but this phase's entry recorded none" in (
+        reason
+    )
+    assert "Nothing was created, appended or pushed" in reason
+    assert gh.effect_writes == [] and eng.origin.head(BRANCH) == reviewed
+
+
+@pytest.mark.parametrize("when", ["before-the-plan", "at-completion"])
+@pytest.mark.parametrize("change", ["closed", "joined"])
+def test_fix_reused_follow_up_closed_or_joined_blocks_with_no_write(
+    tmp_state_dir, monkeypatch, when, change
 ):
-    """A follow-up issue `gh` cannot reach is not a follow-up issue that does
-    not exist: the transient error propagates instead of becoming a
-    VerificationError that feeds the correction loop and stagnation."""
+    """A follow-up issue the fixer reused must still be the one open issue
+    carrying its finding's marker when the plan is saved and again before
+    anything is sent: closed by a human, or joined by a second marked issue,
+    it blocks with no write, and nothing is pushed."""
+    from autoforge.engine import ControllerEngine
+
     gh = FakeGitHub()
     gh.add_issue(ISSUE3, "follow-up", body=follow_up_issue_body("R1-F1"))
 
-    def fixes(req):
-        gh.get_issue_error = GitHubUnavailableError("`gh issue view` failed (exit 1): HTTP 502")
-        return block(fix_payload(SHA_A, SHA_A, _follow_up("R1-F1", ISSUE3)))
+    def mutate():
+        if change == "closed":
+            gh.issues[ISSUE3].state = "CLOSED"
+        else:
+            gh.add_issue("https://github.com/owner/repo/issues/4", "rogue", body=_marked("R1-F1"))
 
-    eng = _in_fix(tmp_state_dir, gh, fixes)
-    with pytest.raises(GitHubUnavailableError):
+    reuses = fixer(deferred_to("R1-F1", ISSUE3))
+
+    def agent(req):
+        out = reuses(req)
+        if when == "before-the-plan":
+            mutate()
+        return out
+
+    eng = _in_fix(tmp_state_dir, gh, agent, origin=True)
+    reviewed = eng.state.reviewed_head_sha
+    if when == "at-completion":
+        monkeypatch.setattr(ControllerEngine, "_complete_fix", _crash)
+        with pytest.raises(KeyboardInterrupt):
+            eng.step()
+        monkeypatch.undo()
+        mutate()
+        eng = _resumed(eng, tmp_state_dir, gh, "never")
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    reason = load_state(eng.paths.state_file).block_reason
+    if when == "at-completion":
+        assert "The open issues contradict the FIX plan" in reason
+        assert "nothing more was sent" in reason
+    else:
+        assert "othing was created, appended or pushed" in reason
+    assert gh.effect_writes == [] and eng.origin.head(BRANCH) == reviewed
+    assert len(eng.provider.calls) == (1 if when == "before-the-plan" else 0)
+
+
+def test_fix_unavailable_append_target_propagates_with_no_plan_saved(tmp_state_dir):
+    """A follow-up issue `gh` cannot reach when the plan reads it is not an
+    issue that does not exist: the transient error propagates with nothing
+    planned or sent, and 'resume' reads again."""
+    gh = FakeGitHub()
+    gh.add_issue(ISSUE3, "deferred in round 1", body=_marked("R1-F5"))
+    defers = fixer(deferred_to("R1-F1", ISSUE3))
+
+    def defers_then_github_fails(req):
+        gh.get_issue_errors[ISSUE3] = GitHubUnavailableError(
+            "`gh issue view` failed (exit 1): HTTP 502"
+        )
+        return defers(req)
+
+    eng = _in_fix(tmp_state_dir, gh, defers_then_github_fails, origin=True)
+    reviewed = eng.state.reviewed_head_sha
+    with pytest.raises(GitHubUnavailableError, match="HTTP 502"):
         eng.step()
     assert len(eng.provider.calls) == 1
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.FIX and s.effect_records == [] and s.completion_context == {}
+    assert gh.effect_writes == [] and eng.origin.head(BRANCH) == reviewed
 
 
-def test_fix_follow_up_issue_missing_rejected(tmp_state_dir):
+@pytest.mark.parametrize("target", ["closed", "other-repo"])
+def test_fix_append_target_no_longer_open_blocks_before_the_plan(tmp_state_dir, target):
     gh = FakeGitHub()
-    res = [
-        {"finding_id": "R1-F1", "resolution": "follow_up_created", "follow_up_issue_url": ISSUE3}
-    ]
-    eng = _in_fix(tmp_state_dir, gh, [block(fix_payload(SHA_A, SHA_A, res))])
-    with pytest.raises(VerificationError, match="does not exist"):
-        eng.step()
+    gh.add_issue(ISSUE3, "deferred in round 1", body=_marked("R1-F5"))
+    defers = fixer(deferred_to("R1-F1", ISSUE3))
+
+    def defers_then_it_moves(req):
+        if target == "closed":
+            gh.issues[ISSUE3].state = "CLOSED"
+        else:
+            # Transferred: GitHub answers the old URL with the issue's new one.
+            gh.issues[ISSUE3].url = "https://github.com/other/repo/issues/9"
+            gh.issues[ISSUE3].repository = "other/repo"
+        return defers(req)
+
+    eng = _in_fix(tmp_state_dir, gh, defers_then_it_moves, origin=True)
+    reviewed = eng.state.reviewed_head_sha
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    reason = load_state(eng.paths.state_file).block_reason
+    assert f"follow-up issue {ISSUE3}, which R1-F1 is deferred to" in reason
+    assert gh.effect_writes == [] and eng.origin.head(BRANCH) == reviewed
 
 
-def test_fix_follow_up_on_a_case_variant_of_the_current_issue_is_self_reference(tmp_state_dir):
-    """Issue #37 N1: `Owner/REPO/issues/2` *is* the current issue; it must not slip
-    past the self-reference check by spelling."""
+CREDENTIAL = "ghp_" + "A1b2C3d4" * 4 + "Zz9Y"
+
+
+def test_fix_append_to_a_body_holding_a_credential_blocks_with_no_plan(tmp_state_dir):
+    """The base an append would extend holds a credential-shaped string: the
+    marker block is never appended to it (published text is refused, never
+    redacted). BLOCKED with no plan, record or context, the credential is in
+    no state file, and no body write is issued."""
     gh = FakeGitHub()
-    variant = "https://github.com/Owner/REPO/issues/2"
-    gh.add_issue(variant, "the same issue")
-    res = [
-        {"finding_id": "R1-F1", "resolution": "follow_up_created", "follow_up_issue_url": variant}
-    ]
-    eng = _in_fix(tmp_state_dir, gh, [block(fix_payload(SHA_A, SHA_A, res))])
-    with pytest.raises(VerificationError, match="points at the current issue itself"):
-        eng.step()
+    gh.add_issue(ISSUE3, "deferred", body=_marked("R1-F5", f"Token: {CREDENTIAL}"))
+    eng = _in_fix(tmp_state_dir, gh, fixer(deferred_to("R1-F1", ISSUE3)), origin=True)
+    reviewed = eng.state.reviewed_head_sha
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    s = load_state(eng.paths.state_file)
+    assert f"the markers of R1-F1 cannot be appended to {ISSUE3}" in s.block_reason
+    assert "credential-shaped string (pattern class:" in s.block_reason
+    assert s.effect_records == [] and s.completion_context == {}
+    assert CREDENTIAL not in eng.paths.state_file.read_text(encoding="utf-8")
+    assert gh.effect_writes == [] and eng.origin.head(BRANCH) == reviewed
 
 
-def test_fix_follow_up_issue_other_repo_rejected(tmp_state_dir):
+@pytest.mark.parametrize("restart", [False, True], ids=["racing", "after-a-crash"])
+def test_fix_body_edited_after_the_plan_was_saved_is_rebased(tmp_state_dir, monkeypatch, restart):
+    """D5.5: the append's base was read and the plan saved, then a human
+    edited the issue body (while the plan ran, or before the next process
+    resumed it). The append is rebased onto the body read now, and the
+    human's edit is kept."""
+    from autoforge.engine import ControllerEngine
+
     gh = FakeGitHub()
-    res = [
-        {
-            "finding_id": "R1-F1",
-            "resolution": "follow_up_created",
-            "follow_up_issue_url": "https://github.com/other/repo/issues/9",
-        }
-    ]
-    eng = _in_fix(tmp_state_dir, gh, [block(fix_payload(SHA_A, SHA_A, res))])
-    with pytest.raises(VerificationError, match="outside"):
+    earlier = _marked("R1-F5")
+    gh.add_issue(ISSUE3, "deferred", body=earlier)
+    edited = "Edited by a human.\n\n" + earlier
+    eng = _in_fix(tmp_state_dir, gh, fixer(deferred_to("R1-F1", ISSUE3)), origin=True)
+    complete = ControllerEngine._complete_fix
+
+    def edits_first(self):
+        gh.issues[ISSUE3].body = edited
+        if restart:
+            raise KeyboardInterrupt
+        return complete(self)
+
+    monkeypatch.setattr(ControllerEngine, "_complete_fix", edits_first)
+    if restart:
+        with pytest.raises(KeyboardInterrupt):
+            eng.step()
+        monkeypatch.undo()
+        eng = _resumed(eng, tmp_state_dir, gh, "never")
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    rebased = compose_append(edited, render_follow_up_marker(PR, "R1-F1"))
+    assert gh.effect_writes == [("write_issue_body", ISSUE3, rebased)]
+    assert gh.issues[ISSUE3].body == rebased
+    assert eng.origin.head(BRANCH) == eng.state.current_head_sha
+
+
+def test_fix_credential_edited_in_before_a_rebase_is_a_conflict_with_no_write(
+    tmp_state_dir, monkeypatch
+):
+    """The plan is saved, then a credential is edited into the issue body
+    before the next process rebases the append: the rebased body would
+    publish it, so the record is a conflict, no rebase is saved, no body
+    write and no push is issued, and the state file never holds it."""
+    from autoforge.engine import ControllerEngine
+
+    gh = FakeGitHub()
+    earlier = _marked("R1-F5")
+    gh.add_issue(ISSUE3, "deferred", body=earlier)
+    eng = _in_fix(tmp_state_dir, gh, fixer(deferred_to("R1-F1", ISSUE3)), origin=True)
+    reviewed = eng.state.reviewed_head_sha
+    monkeypatch.setattr(ControllerEngine, "_complete_fix", _crash)
+    with pytest.raises(KeyboardInterrupt):
         eng.step()
+    monkeypatch.undo()
+    planned = load_state(eng.paths.state_file).effect_records[0]
+    gh.issues[ISSUE3].body = f"Token: {CREDENTIAL}\n\n" + earlier
+
+    eng2 = _resumed(eng, tmp_state_dir, gh, "never")
+    out = eng2.step()
+    assert out.next_phase == "BLOCKED", out.message
+    s = load_state(eng2.paths.state_file)
+    assert "no rebase" in s.block_reason and "credential-shaped string" in s.block_reason
+    assert f"put the body of {ISSUE3} back" in s.block_reason
+    record = s.effect_records[0]
+    assert record["stage"] == "conflict"
+    assert record["payload"] == planned["payload"]
+    assert record["precondition"] == planned["precondition"]
+    assert CREDENTIAL not in eng2.paths.state_file.read_text(encoding="utf-8")
+    assert gh.effect_writes == [] and eng.origin.head(BRANCH) == reviewed
+    assert eng2.provider.calls == []
+
+
+@pytest.mark.parametrize(
+    ("kind", "stage", "saved"),
+    [
+        (EffectKind.FOLLOW_UP_ISSUE, Stage.ATTEMPTED, True),
+        (EffectKind.FOLLOW_UP_ISSUE, Stage.OBSERVED, False),
+        (EffectKind.FOLLOW_UP_ISSUE, Stage.OBSERVED, True),
+        (EffectKind.FOLLOW_UP_APPEND, Stage.ATTEMPTED, True),
+        (EffectKind.FOLLOW_UP_APPEND, Stage.OBSERVED, False),
+        (EffectKind.FOLLOW_UP_APPEND, Stage.OBSERVED, True),
+        (EffectKind.PUSH, Stage.ATTEMPTED, True),
+        (EffectKind.PUSH, Stage.OBSERVED, False),
+    ],
+    ids=[
+        "create-intent-saved",
+        "create-landed-save-lost",
+        "create-observed",
+        "append-intent-saved",
+        "append-landed-save-lost",
+        "append-observed",
+        "push-not-issued",
+        "push-landed-save-lost",
+    ],
+)
+def test_fix_crash_window_resumes_from_the_journal_and_writes_each_effect_once(
+    tmp_state_dir, kind, stage, saved
+):
+    """Every crash window between the plan's save and the phase's: the next
+    process completes FIX from the journal without launching the fixer, a
+    landed create is found by its marker, a landed append by its body, a
+    landed push by the branch head, and each effect is written exactly once.
+    Its own journaled push never routes to REVIEW of a 'drifted' HEAD."""
+    gh = FakeGitHub()
+    earlier = _marked("R1-F5")
+    gh.add_issue(ISSUE3, "deferred in round 1", body=earlier)
+    eng = _in_fix(
+        tmp_state_dir,
+        gh,
+        fixer(fixed("R1-F1"), new_follow_up("R1-F2"), deferred_to("R1-F3", ISSUE3)),
+        [_finding(1, 1), _finding(1, 2), _finding(1, 3)],
+        origin=True,
+    )
+    reviewed = eng.state.reviewed_head_sha
+    _power_loss_at(eng, kind, stage, saved=saved)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    candidate = _worktree_head(eng.provider.calls[0])
+    pushed = kind is EffectKind.PUSH and stage is Stage.OBSERVED
+    assert eng.origin.head(BRANCH) == (candidate if pushed else reviewed)
+
+    eng2 = _resumed(eng, tmp_state_dir, gh, "never")
+    out = eng2.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert "completed from the persisted FIX plan; no fixer launched" in out.message
+    assert f"pushed {candidate[:12]} over {reviewed[:12]}" in out.message
+    assert eng2.provider.calls == []
+    assert [w[0] for w in gh.effect_writes] == ["create_issue", "write_issue_body"]
+    assert [i for i in gh.issues if i == ISSUE43] == [ISSUE43] and len(gh.issues) == 4
+    assert gh.issues[ISSUE3].body == compose_append(earlier, render_follow_up_marker(PR, "R1-F3"))
+    assert eng.origin.head(BRANCH) == candidate == gh.prs[PR].head_sha
+    s = load_state(eng2.paths.state_file)
+    assert s.current_head_sha == candidate and s.last_review_result == "fixed"
+    assert s.prior_findings == [] and s.effect_records == []
+    urls = [r["follow_up_issue_url"] for r in s.last_fix_resolutions]
+    assert urls == ["", ISSUE43, ISSUE3]
+
+
+def test_fix_duplicate_invocation_after_the_effects_writes_nothing_again(
+    tmp_state_dir, monkeypatch
+):
+    """Every effect landed and was journaled, then the process died before
+    the phase was saved: the next invocation reads them all back and
+    completes, with no second issue, append or push."""
+    from autoforge.engine import ControllerEngine
+
+    gh = FakeGitHub()
+    gh.add_issue(ISSUE3, "deferred in round 1", body=_marked("R1-F5"))
+    eng = _in_fix(
+        tmp_state_dir,
+        gh,
+        fixer(fixed("R1-F1"), new_follow_up("R1-F2"), deferred_to("R1-F3", ISSUE3)),
+        [_finding(1, 1), _finding(1, 2), _finding(1, 3)],
+        origin=True,
+    )
+    complete = ControllerEngine._complete_fix
+
+    def dies_after(self):
+        complete(self)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(ControllerEngine, "_complete_fix", dies_after)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    monkeypatch.undo()
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.FIX and {r["stage"] for r in s.effect_records} == {"observed"}
+    writes = list(gh.effect_writes)
+    candidate = eng.origin.head(BRANCH)
+
+    eng2 = _resumed(eng, tmp_state_dir, gh, "never")
+    out = eng2.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert gh.effect_writes == writes and len(gh.issues) == 4
+    assert eng.origin.head(BRANCH) == candidate == eng2.state.current_head_sha
+    assert eng2.provider.calls == []
+
+
+def test_fix_created_follow_up_closed_by_a_human_before_the_read_back_blocks(tmp_state_dir):
+    """The create landed and its save was lost; a human closed the issue
+    before the next process read it back. A closed controller-created
+    follow-up is a conflict, never a reason to create a second one; nothing
+    is pushed."""
+    gh = FakeGitHub()
+    eng = _in_fix(
+        tmp_state_dir,
+        gh,
+        fixer(fixed("R1-F1"), new_follow_up("R1-F2")),
+        [_finding(1, 1), _finding(1, 2)],
+        origin=True,
+    )
+    reviewed = eng.state.reviewed_head_sha
+    _power_loss_at(eng, EffectKind.FOLLOW_UP_ISSUE, Stage.OBSERVED, saved=False)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    gh.issues[ISSUE43].state = "CLOSED"
+
+    eng2 = _resumed(eng, tmp_state_dir, gh, "never")
+    out = eng2.step()
+    assert out.next_phase == "BLOCKED", out.message
+    reason = load_state(eng2.paths.state_file).block_reason
+    assert f"{ISSUE43} carries its identity but is not the object the controller intended" in (
+        reason
+    )
+    assert "reopen the follow-up issue the controller created" in reason
+    assert [w[0] for w in gh.effect_writes] == ["create_issue"]
+    assert eng.origin.head(BRANCH) == reviewed and eng2.provider.calls == []
+
+
+# -- PR #205 review round 2: a saved FIX plan is held to the entry's rules again --------
+ISSUE4 = "https://github.com/owner/repo/issues/4"
+
+
+def _plan_saved(eng, monkeypatch) -> None:
+    """The fixer runs and the plan is saved; the process dies before anything is sent."""
+    from autoforge.engine import ControllerEngine
+
+    monkeypatch.setattr(ControllerEngine, "_complete_fix", _crash)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    monkeypatch.undo()
+    assert {r["stage"] for r in load_state(eng.paths.state_file).effect_records} == {"intended"}
+
+
+def _bound_to_main(eng) -> None:
+    """Bind the open findings to base ``main`` and the reviewed HEAD's real merge base."""
+    eng.state.reviewed_base_ref = "main"
+    eng.state.current_base_ref = "main"
+    eng.state.reviewed_merge_base_sha = eng.origin.merge_base("main", eng.state.reviewed_head_sha)
+
+
+def _after_persisting(eng, kind: EffectKind, stage: Stage, then) -> None:
+    """Call ``then(record)`` once, right after a ``kind`` record is persisted at ``stage``."""
+    persist = eng._persist_effect
+    fired: list[int] = []
+
+    def hooked(record):
+        persist(record)
+        if not fired and record.kind is kind and record.stage is stage:
+            fired.append(record.position)
+            then(record)
+
+    eng._persist_effect = hooked
+
+
+@pytest.mark.parametrize(
+    ("head_repository", "branch", "reason"),
+    [
+        pytest.param(
+            "",
+            BRANCH,
+            f"PR {PR} has no readable head repository, so the controller cannot prove its "
+            "branch is a branch of owner/repo",
+            id="no-head-repository",
+        ),
+        pytest.param(
+            "someone/repo",
+            BRANCH,
+            f"PR {PR} is headed in someone/repo, not in owner/repo",
+            id="fork-head",
+        ),
+        pytest.param(
+            "owner/repo",
+            "another-branch",
+            f"PR {PR} is headed at refs/heads/another-branch, but the FIX plan was made for "
+            f"refs/heads/{BRANCH}",
+            id="another-branch",
+        ),
+    ],
+)
+def test_fix_saved_plan_blocks_when_its_push_target_is_no_longer_the_pr_head(
+    tmp_state_dir, monkeypatch, head_repository, branch, reason
+):
+    """PR #205 R2-F1: the plan proved the PR headed at a branch of the run's
+    repository when it was saved; a later process replaying it proves that
+    again before anything is sent. A head repository emptied or moved to a
+    fork, or a head branch renamed, after the save blocks with no follow-up
+    created and nothing pushed, and the fixer is not launched again."""
+    gh = FakeGitHub()
+    eng = _in_fix(
+        tmp_state_dir,
+        gh,
+        fixer(fixed("R1-F1"), new_follow_up("R1-F2")),
+        [_finding(1, 1), _finding(1, 2)],
+        origin=True,
+    )
+    reviewed = eng.state.reviewed_head_sha
+    _plan_saved(eng, monkeypatch)
+    gh.prs[PR].head_repository = head_repository
+    gh.prs[PR].head_ref = branch
+
+    eng2 = _resumed(eng, tmp_state_dir, gh, "never")
+    out = eng2.step()
+    assert out.next_phase == "BLOCKED", out.message
+    s = load_state(eng2.paths.state_file)
+    assert reason in s.block_reason and "nothing more was sent" in s.block_reason
+    assert {r["stage"] for r in s.effect_records} == {"intended"}
+    assert s.last_review_result != "fixed" and [f["id"] for f in s.open_findings] == [
+        "R1-F1",
+        "R1-F2",
+    ]
+    assert gh.effect_writes == [] and eng.origin.head(BRANCH) == reviewed
+    assert eng2.provider.calls == []
+
+
+@pytest.mark.parametrize(
+    ("marked", "planned", "issues"),
+    [
+        pytest.param("R1-F1", "resolved as fixed", 1, id="fixed"),
+        pytest.param("R1-F2", "resolved as no_change_with_rationale", 1, id="no-change"),
+        pytest.param("R1-F3", "deferred to follow_up_issue effect 0", 1, id="create-not-issued"),
+        pytest.param("R1-F1", "", 2, id="duplicate-claimants"),
+    ],
+)
+def test_fix_saved_plan_blocks_on_a_marked_issue_it_did_not_write(
+    tmp_state_dir, monkeypatch, marked, planned, issues
+):
+    """PR #205 R2-F2: every resolution is checked against the open issues, not
+    only the deferred ones. A finding resolved as fixed or with a rationale
+    has no follow-up the controller wrote, so an open issue carrying its
+    marker (or two) contradicts the plan; so does one carrying the marker of
+    a follow-up the plan has not created yet. It blocks before anything is
+    sent; the controller never adopts or chooses between such issues."""
+    gh = FakeGitHub()
+    eng = _in_fix(
+        tmp_state_dir,
+        gh,
+        fixer(fixed("R1-F1"), no_change("R1-F2"), new_follow_up("R1-F3")),
+        [_finding(1, 1), _finding(1, 2), _finding(1, 3)],
+        origin=True,
+    )
+    reviewed = eng.state.reviewed_head_sha
+    _plan_saved(eng, monkeypatch)
+    for n in range(issues):
+        gh.add_issue(f"https://github.com/owner/repo/issues/{4 + n}", "rogue", body=_marked(marked))
+
+    eng2 = _resumed(eng, tmp_state_dir, gh, "never")
+    out = eng2.step()
+    assert out.next_phase == "BLOCKED", out.message
+    s = load_state(eng2.paths.state_file)
+    if planned:
+        assert (
+            f"open issue {ISSUE4} carries the follow-up marker of {marked}, which the FIX plan "
+            f"has {planned}"
+        ) in s.block_reason
+    else:
+        assert "finding R1-F1 of" in s.block_reason and ISSUE4 in s.block_reason
+    assert "The open issues contradict the FIX plan" in s.block_reason
+    assert "nothing more was sent" in s.block_reason
+    assert {r["stage"] for r in s.effect_records} == {"intended"}
+    assert s.last_review_result != "fixed" and s.last_fix_resolutions == []
+    assert gh.effect_writes == [] and eng.origin.head(BRANCH) == reviewed
+    assert eng2.provider.calls == []
+
+
+@pytest.mark.parametrize(
+    ("kind", "change"),
+    [
+        (kind, change)
+        for kind in (EffectKind.FOLLOW_UP_ISSUE, EffectKind.FOLLOW_UP_APPEND)
+        for change in ("closed", "unmarked", "duplicated")
+    ],
+    ids=lambda v: v.value if isinstance(v, EffectKind) else v,
+)
+def test_fix_replay_revalidates_observed_follow_ups_before_the_push(tmp_state_dir, kind, change):
+    """PR #205 R2-F3: a follow-up an earlier process created or appended to,
+    and journaled as observed, is read again when the plan is replayed: an
+    observed record is settled in the journal, not on GitHub. Closed,
+    unmarked, or joined by a second issue carrying the marker since, it is
+    no longer the one open issue the plan names, so it blocks before the
+    push: nothing is written again, and the branch stays at the reviewed
+    HEAD."""
+    gh = FakeGitHub()
+    earlier = _marked("R1-F5")
+    gh.add_issue(ISSUE3, "deferred in round 1", body=earlier)
+    eng = _in_fix(
+        tmp_state_dir,
+        gh,
+        fixer(fixed("R1-F1"), new_follow_up("R1-F2"), deferred_to("R1-F3", ISSUE3)),
+        [_finding(1, 1), _finding(1, 2), _finding(1, 3)],
+        origin=True,
+    )
+    reviewed = eng.state.reviewed_head_sha
+    _power_loss_at(eng, kind, Stage.OBSERVED, saved=True)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    written = [w[0] for w in gh.effect_writes]
+    assert written == (
+        ["create_issue"]
+        if kind is EffectKind.FOLLOW_UP_ISSUE
+        else ["create_issue", "write_issue_body"]
+    )
+    issue, fid = (ISSUE43, "R1-F2") if kind is EffectKind.FOLLOW_UP_ISSUE else (ISSUE3, "R1-F3")
+    if change == "closed":
+        gh.issues[issue].state = "CLOSED"
+    elif change == "unmarked":
+        gh.issues[issue].body = "No marker any more."
+    else:
+        gh.add_issue(ISSUE4, "rogue", body=_marked(fid))
+
+    eng2 = _resumed(eng, tmp_state_dir, gh, "never")
+    out = eng2.step()
+    assert out.next_phase == "BLOCKED", out.message
+    s = load_state(eng2.paths.state_file)
+    assert f"finding {fid} of" in s.block_reason or fid in s.block_reason
+    assert "The open issues contradict the FIX plan" in s.block_reason
+    assert "nothing more was sent" in s.block_reason
+    assert [w[0] for w in gh.effect_writes] == written
+    assert eng.origin.head(BRANCH) == reviewed and gh.prs[PR].head_sha == reviewed
+    assert s.last_review_result != "fixed" and s.effect_records[-1]["stage"] == "intended"
+    assert eng2.provider.calls == []
+
+
+@pytest.mark.parametrize("marked", ["R1-F1", "R1-F2"], ids=["fixed", "duplicated"])
+def test_fix_marker_appearing_after_a_follow_up_write_blocks_the_push(tmp_state_dir, marked):
+    """PR #205 R2-F2/R2-F3, within one process: the open issues are read
+    again after the follow-up writes and before the push, the commit point.
+    An issue marked for a finding resolved as fixed, or a second issue
+    marked for the finding the controller just deferred, appearing in
+    between blocks with the follow-up on GitHub and nothing pushed."""
+    gh = FakeGitHub()
+    eng = _in_fix(
+        tmp_state_dir,
+        gh,
+        fixer(fixed("R1-F1"), new_follow_up("R1-F2")),
+        [_finding(1, 1), _finding(1, 2)],
+        origin=True,
+    )
+    reviewed = eng.state.reviewed_head_sha
+    _after_persisting(
+        eng,
+        EffectKind.FOLLOW_UP_ISSUE,
+        Stage.OBSERVED,
+        lambda record: gh.add_issue(ISSUE4, "rogue", body=_marked(marked)),
+    )
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    s = load_state(eng.paths.state_file)
+    assert "The open issues contradict the FIX plan" in s.block_reason
+    assert "the follow-ups are on GitHub but the candidate was not pushed" in s.block_reason
+    assert [r["stage"] for r in s.effect_records] == ["observed", "intended"]
+    assert [w[0] for w in gh.effect_writes] == ["create_issue"]
+    assert eng.origin.head(BRANCH) == reviewed and s.last_review_result != "fixed"
+
+
+def test_fix_marker_for_a_fixed_finding_at_completion_is_not_accepted(tmp_state_dir):
+    """PR #205 R2-F2 at completion: an issue marked for a finding resolved as
+    fixed, appearing after the push landed, is not accepted. The fix is not
+    recorded (the findings stay open, the plan stays saved); it blocks until
+    the issue is closed, and 'unblock' then completes from the journal
+    without writing anything again."""
+    gh = FakeGitHub()
+    eng = _in_fix(
+        tmp_state_dir,
+        gh,
+        fixer(fixed("R1-F1"), new_follow_up("R1-F2")),
+        [_finding(1, 1), _finding(1, 2)],
+        origin=True,
+    )
+    _after_persisting(
+        eng,
+        EffectKind.PUSH,
+        Stage.OBSERVED,
+        lambda record: gh.add_issue(ISSUE4, "rogue", body=_marked("R1-F1")),
+    )
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    candidate = _worktree_head(eng.provider.calls[0])
+    s = load_state(eng.paths.state_file)
+    assert f"open issue {ISSUE4} carries the follow-up marker of R1-F1" in s.block_reason
+    assert "the fix is not recorded" in s.block_reason
+    assert s.last_review_result != "fixed" and s.last_fix_resolutions == []
+    assert [f["id"] for f in s.open_findings] == ["R1-F1", "R1-F2"]
+    assert eng.origin.head(BRANCH) == candidate
+    writes = list(gh.effect_writes)
+
+    gh.issues[ISSUE4].state = "CLOSED"
+    eng2 = _resumed(eng, tmp_state_dir, gh, "never")
+    assert eng2.unblock("closed the rogue follow-up").unblocked
+    out = eng2.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert gh.effect_writes == writes and eng2.provider.calls == []
+    s = load_state(eng2.paths.state_file)
+    assert s.last_review_result == "fixed" and s.current_head_sha == candidate
+
+
+@pytest.mark.parametrize("drift", ["retargeted", "rewritten"])
+def test_fix_saved_plan_with_the_base_moved_goes_to_review_without_sending(
+    tmp_state_dir, monkeypatch, drift
+):
+    """PR #205 R2-F4: the findings are bound to the base and the merge base
+    as well as the HEAD (#95, #96), and a saved plan does not bypass that.
+    The PR retargeted from main to release/1.x, or main rewritten under its
+    name, after the plan was saved: the review is stale, nothing is sent,
+    no fix is recorded and the findings are carried to the next review."""
+    gh = FakeGitHub()
+    eng = _in_fix(
+        tmp_state_dir,
+        gh,
+        fixer(fixed("R1-F1"), new_follow_up("R1-F2")),
+        [_finding(1, 1), _finding(1, 2)],
+        origin=True,
+    )
+    _bound_to_main(eng)
+    reviewed = eng.state.reviewed_head_sha
+    _plan_saved(eng, monkeypatch)
+    if drift == "retargeted":
+        gh.prs[PR].base_ref = "release/1.x"
+    else:
+        gh.merge_base = MERGE_BASE_B
+
+    eng2 = _resumed(eng, tmp_state_dir, gh, "never")
+    out = eng2.step()
+    assert out.next_phase == "REVIEW", out.message
+    if drift == "retargeted":
+        assert "base changed to 'release/1.x' from the reviewed base 'main'" in out.message
+    else:
+        assert f"PR merge base moved to {MERGE_BASE_B[:12]}" in out.message
+    assert "nothing more was sent" in out.message
+    assert "the 2 finding(s) of round 1 are carried to that review to re-check" in out.message
+    s = load_state(eng2.paths.state_file)
+    assert s.phase == Phase.REVIEW and s.review_round == 1
+    assert s.last_review_result == "stale" and s.last_fix_resolutions == []
+    assert s.prior_findings == [_finding(1, 1), _finding(1, 2)] and s.open_findings == []
+    assert s.effect_records == [] and s.completion_context == {}
+    assert s.current_head_sha == reviewed
+    assert gh.effect_writes == [] and eng.origin.head(BRANCH) == reviewed
+    assert eng2.provider.calls == []
+
+
+@pytest.mark.parametrize("drift", ["retargeted", "rewritten"])
+def test_fix_base_moved_when_the_push_lands_is_not_recorded_as_fixed(tmp_state_dir, drift):
+    """PR #205 R2-F4 at completion: the base or merge base moves while the
+    plan is sent. The candidate is on the PR, but the findings it resolves
+    describe a diff the PR no longer proposes, so the fix is not recorded:
+    the actual revision is reviewed with the findings carried."""
+    gh = FakeGitHub()
+    eng = _in_fix(tmp_state_dir, gh, fixer(fixed("R1-F1")), origin=True)
+    _bound_to_main(eng)
+
+    def moves(record):
+        if drift == "retargeted":
+            gh.prs[PR].base_ref = "release/1.x"
+        else:
+            gh.merge_base = MERGE_BASE_B
+
+    _after_persisting(eng, EffectKind.PUSH, Stage.OBSERVED, moves)
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert "read back after the FIX plan was sent" in out.message
+    candidate = _worktree_head(eng.provider.calls[0])
+    s = load_state(eng.paths.state_file)
+    assert s.last_review_result == "stale" and s.last_fix_resolutions == []
+    assert s.prior_findings == [_finding(1)] and s.open_findings == []
+    assert s.current_head_sha == candidate == eng.origin.head(BRANCH)
+    assert s.effect_records == []
+
+
+def test_fix_saved_plan_with_an_unreadable_base_is_a_verification_failure(
+    tmp_state_dir, monkeypatch
+):
+    """PR #205 R2-F4: a base GitHub does not report when the saved plan is
+    replayed is a read the controller cannot decide on, not a retarget: it
+    is refused with nothing sent, the phase and the plan kept."""
+    gh = FakeGitHub()
+    eng = _in_fix(tmp_state_dir, gh, fixer(fixed("R1-F1")), origin=True)
+    _bound_to_main(eng)
+    reviewed = eng.state.reviewed_head_sha
+    _plan_saved(eng, monkeypatch)
+    gh.prs[PR].base_ref = ""
+
+    eng2 = _resumed(eng, tmp_state_dir, gh, "never")
+    with pytest.raises(VerificationError, match="no readable base branch.*bound to base 'main'"):
+        eng2.step()
+    s = load_state(eng2.paths.state_file)
+    assert s.phase == Phase.FIX and [r["stage"] for r in s.effect_records] == ["intended"]
+    assert s.last_review_result != "stale" and [f["id"] for f in s.open_findings] == ["R1-F1"]
+    assert gh.effect_writes == [] and eng.origin.head(BRANCH) == reviewed
+    assert eng2.provider.calls == []
+
+
+def test_fix_own_push_moving_the_prs_merge_base_still_completes(tmp_state_dir):
+    """PR #205 R2-F4: the merge base the findings are bound to is read
+    against the reviewed HEAD, not the PR's. The controller's own push (here
+    a candidate GitHub reports another merge base for, as when a fix merges
+    the base in) is not drift: the base the findings describe has not
+    moved, and the fix is recorded."""
+    gh = FakeGitHub()
+    eng = _in_fix(tmp_state_dir, gh, fixer(fixed("R1-F1")), origin=True)
+    _bound_to_main(eng)
+    reviewed = eng.state.reviewed_head_sha
+
+    def pins(record):
+        gh.merge_bases[("main", str(record.payload["sha"]))] = MERGE_BASE_B
+
+    _after_persisting(eng, EffectKind.PUSH, Stage.OBSERVED, pins)
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    candidate = _worktree_head(eng.provider.calls[0])
+    assert ("get_merge_base_sha", "owner/repo", "main", reviewed) in gh.calls
+    assert ("get_merge_base_sha", "owner/repo", "main", candidate) not in gh.calls
+    s = load_state(eng.paths.state_file)
+    assert s.last_review_result == "fixed" and s.current_head_sha == candidate
+
+
+# -- PR #205 review round 3: the current issue, and the PR around the commit point -------
+_SELF_DEFERRALS = {
+    # One finding deferred to the current issue, nothing committed: no push.
+    "no-push": ("R1-F1", lambda: fixer(deferred_to("R1-F1", ISSUE), commit=False)),
+    # One finding fixed beside it: the plan would push.
+    "mixed": ("R1-F2", lambda: fixer(fixed("R1-F1"), deferred_to("R1-F2", ISSUE))),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_SELF_DEFERRALS))
+def test_fix_entry_blocks_when_the_current_issue_carries_a_findings_marker(tmp_state_dir, case):
+    """PR #205 R3-F1: an open issue carrying the (PR, finding) marker is
+    normally the finding's follow-up, handed to the fixer to reuse. The
+    current issue carrying it is not: it is never a follow-up of its own
+    PR's findings, so the entry blocks before the fixer is launched (which
+    would otherwise be told to resolve the finding as deferred to it).
+    Nothing is created, appended or pushed, the findings stay open, and
+    once the marker is removed 'unblock' launches the fixer afresh."""
+    marked, agent = _SELF_DEFERRALS[case]
+    gh = FakeGitHub()
+    eng = _in_fix(tmp_state_dir, gh, agent(), [_finding(1, 1), _finding(1, 2)], origin=True)
+    _bound_to_main(eng)
+    eng.state.reviewed_pr_url = PR
+    eng.state.last_review_result = "needs_fix"
+    reviewed = eng.state.reviewed_head_sha
+    gh.issues[ISSUE].body = _marked(marked, "The issue being implemented.")
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    s = load_state(eng.paths.state_file)
+    assert (
+        f"the current issue {ISSUE} is the follow-up of {marked} of PR {PR}, but the current "
+        "issue is never a follow-up of its own PR's findings"
+    ) in s.block_reason
+    assert "Nothing was launched" in s.block_reason
+    assert eng.provider.calls == [] and gh.effect_writes == []
+    assert eng.origin.head(BRANCH) == reviewed == gh.prs[PR].head_sha
+    assert [f["id"] for f in s.open_findings] == ["R1-F1", "R1-F2"]
+    assert s.last_fix_resolutions == [] and s.last_review_result != "fixed"
+    assert s.effect_records == [] and s.completion_context == {}
+
+    gh.issues[ISSUE].body = "The issue being implemented."
+    eng2 = _resumed(eng, tmp_state_dir, gh, fixer(fixed("R1-F1"), no_change("R1-F2")))
+    unblocked = eng2.unblock("removed the follow-up marker from the current issue")
+    assert unblocked.unblocked and unblocked.phase == "FIX", unblocked.message
+    out = eng2.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert "- R1-F1: existing issue: (none)" in eng2.provider.calls[0].prompt
+    s = load_state(eng2.paths.state_file)
+    assert s.last_review_result == "fixed" and gh.effect_writes == []
+    assert eng.origin.head(BRANCH) == _worktree_head(eng2.provider.calls[0])
+
+
+def test_fix_deferral_to_the_current_issue_handed_as_an_earlier_follow_up_is_refused(
+    tmp_state_dir,
+):
+    """PR #205 R3-F1: the current issue carrying an earlier round's marker is
+    listed among the earlier follow-ups, but a deferral naming it is still
+    refused before anything is sent: no marker is ever appended to it."""
+    gh = FakeGitHub()
+    eng = _in_fix(tmp_state_dir, gh, fixer(deferred_to("R1-F1", ISSUE), commit=False), origin=True)
+    gh.issues[ISSUE].body = _marked("R1-F9", "The issue being implemented.")
+    eng.config.execution.max_correction_attempts = 0
+    with pytest.raises(
+        ControlResultValidationError,
+        match=rf"the follow-up of R1-F1 names the current issue {ISSUE}, which is never a "
+        "follow-up",
+    ):
+        eng.step()
+    assert f"- R1-F9: {ISSUE}" in eng.provider.calls[0].prompt
+    assert gh.effect_writes == []
+    s = load_state(eng.paths.state_file)
+    assert s.effect_records == [] and s.completion_context == {}
+    assert [f["id"] for f in s.open_findings] == ["R1-F1"]
+
+
+@pytest.mark.parametrize("case", ["no-push", "mixed"])
+def test_fix_replayed_plan_deferring_to_the_current_issue_blocks_with_nothing_sent(
+    tmp_state_dir, monkeypatch, case
+):
+    """PR #205 R3-F1 on replay: a saved plan that reuses the current issue as
+    a finding's follow-up (one saved without the entry's check; written into
+    the journal here) is refused before anything is sent, even though the
+    open issues agree with it: the current issue is never a follow-up. The
+    finding is not recorded as deferred, nothing is created or pushed, the
+    findings stay open and the fixer is not launched again."""
+    from autoforge.engine import ControllerEngine
+
+    gh = FakeGitHub()
+    gh.add_issue(ISSUE3, "follow-up", body=_marked("R1-F1"))
+    if case == "no-push":
+        agent = fixer(deferred_to("R1-F1", ISSUE3), commit=False)
+        findings = [_finding(1, 1)]
+    else:
+        agent = fixer(deferred_to("R1-F1", ISSUE3), fixed("R1-F2"))
+        findings = [_finding(1, 1), _finding(1, 2)]
+    eng = _in_fix(tmp_state_dir, gh, agent, findings, origin=True)
+    reviewed = eng.state.reviewed_head_sha
+    monkeypatch.setattr(ControllerEngine, "_complete_fix", _crash)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    monkeypatch.undo()
+    marker = render_follow_up_marker(PR, "R1-F1")
+    assert eng.state.entry_observation["objects"][marker] == ISSUE3
+    eng.state.entry_observation["objects"][marker] = ISSUE
+    eng._save()
+    gh.issues[ISSUE3].body = "No marker any more."
+    gh.issues[ISSUE].body = _marked("R1-F1", "The issue being implemented.")
+
+    eng2 = _resumed(eng, tmp_state_dir, gh, "never")
+    out = eng2.step()
+    assert out.next_phase == "BLOCKED", out.message
+    s = load_state(eng2.paths.state_file)
+    assert f"the current issue {ISSUE} is the follow-up of R1-F1 of PR {PR}" in s.block_reason
+    assert "cannot be completed as saved: nothing more was sent" in s.block_reason
+    assert [r["stage"] for r in s.effect_records] == (["intended"] if case == "mixed" else [])
+    assert s.last_review_result != "fixed" and s.last_fix_resolutions == []
+    assert [f["id"] for f in s.open_findings] == [f["id"] for f in findings]
+    assert gh.effect_writes == [] and eng.origin.head(BRANCH) == reviewed
+    assert gh.prs[PR].head_sha == reviewed and eng2.provider.calls == []
+
+
+@pytest.mark.parametrize(
+    ("kind", "change"),
+    [
+        (kind, change)
+        for kind in (EffectKind.FOLLOW_UP_ISSUE, EffectKind.FOLLOW_UP_APPEND)
+        for change in ("closed", "no-head-repository", "retargeted")
+    ],
+    ids=lambda v: v.value if isinstance(v, EffectKind) else v,
+)
+def test_fix_pr_changed_after_a_follow_up_write_is_read_before_the_push(
+    tmp_state_dir, kind, change
+):
+    """PR #205 R3-F2: the PR the plan was checked against before it sent
+    anything may change while the follow-ups are written, so it is read
+    again, under the same rules, before the push (the commit point). A PR
+    closed meanwhile is refused (VerificationError, for 'resume'); one no
+    longer headed at a branch of the run's repository blocks; one
+    retargeted is drift (the findings carried to REVIEW). In each case the
+    follow-ups stay on GitHub and the candidate is never pushed."""
+    gh = FakeGitHub()
+    gh.add_issue(ISSUE3, "deferred in round 1", body=_marked("R1-F5"))
+    eng = _in_fix(
+        tmp_state_dir,
+        gh,
+        fixer(fixed("R1-F1"), new_follow_up("R1-F2"), deferred_to("R1-F3", ISSUE3)),
+        [_finding(1, 1), _finding(1, 2), _finding(1, 3)],
+        origin=True,
+    )
+    _bound_to_main(eng)
+    reviewed = eng.state.reviewed_head_sha
+
+    def changes(record):
+        if change == "closed":
+            gh.prs[PR].state = "CLOSED"
+        elif change == "no-head-repository":
+            gh.prs[PR].head_repository = ""
+        else:
+            gh.prs[PR].base_ref = "release/1.x"
+
+    _after_persisting(eng, kind, Stage.OBSERVED, changes)
+    unpushed = "the follow-ups are on GitHub but the candidate was not pushed"
+    if change == "closed":
+        with pytest.raises(VerificationError, match="is CLOSED; the workflow only operates"):
+            eng.step()
+    else:
+        out = eng.step()
+    assert [w[0] for w in gh.effect_writes] == ["create_issue", "write_issue_body"]
+    assert eng.origin.head(BRANCH) == reviewed and gh.prs[PR].head_sha == reviewed
+    s = load_state(eng.paths.state_file)
+    assert s.last_review_result != "fixed" and s.last_fix_resolutions == []
+    if change == "closed":
+        assert s.phase == Phase.FIX
+        assert [r["stage"] for r in s.effect_records] == ["observed", "observed", "intended"]
+        assert [f["id"] for f in s.open_findings] == ["R1-F1", "R1-F2", "R1-F3"]
+    elif change == "no-head-repository":
+        assert out.next_phase == "BLOCKED", out.message
+        assert f"PR {PR} has no readable head repository" in s.block_reason
+        assert unpushed in s.block_reason
+        assert [r["stage"] for r in s.effect_records] == ["observed", "observed", "intended"]
+        assert [f["id"] for f in s.open_findings] == ["R1-F1", "R1-F2", "R1-F3"]
+    else:
+        assert out.next_phase == "REVIEW", out.message
+        assert "base changed to 'release/1.x' from the reviewed base 'main'" in out.message
+        assert unpushed in out.message
+        assert s.effect_records == [] and s.open_findings == []
+        assert [f["id"] for f in s.prior_findings] == ["R1-F1", "R1-F2", "R1-F3"]
+
+
+def test_fix_pr_closed_after_a_follow_up_write_pushes_once_it_is_reopened(tmp_state_dir):
+    """PR #205 R3-F2: the refusal is idempotent. A PR closed after the
+    follow-up was created leaves the push unsent; once the PR is reopened,
+    'resume' completes the plan from the journal: the follow-up is not
+    created again, the candidate is pushed and the fix recorded."""
+    gh = FakeGitHub()
+    eng = _in_fix(
+        tmp_state_dir,
+        gh,
+        fixer(fixed("R1-F1"), new_follow_up("R1-F2")),
+        [_finding(1, 1), _finding(1, 2)],
+        origin=True,
+    )
+    reviewed = eng.state.reviewed_head_sha
+
+    def closes(record):
+        gh.prs[PR].state = "CLOSED"
+
+    _after_persisting(eng, EffectKind.FOLLOW_UP_ISSUE, Stage.OBSERVED, closes)
+    with pytest.raises(VerificationError, match="is CLOSED"):
+        eng.step()
+    candidate = _worktree_head(eng.provider.calls[0])
+    assert eng.origin.head(BRANCH) == reviewed and [w[0] for w in gh.effect_writes] == [
+        "create_issue"
+    ]
+
+    gh.prs[PR].state = "OPEN"
+    eng2 = _resumed(eng, tmp_state_dir, gh, "never")
+    out = eng2.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert [w[0] for w in gh.effect_writes] == ["create_issue"] and eng2.provider.calls == []
+    assert eng.origin.head(BRANCH) == candidate == gh.prs[PR].head_sha
+    s = load_state(eng2.paths.state_file)
+    assert s.last_review_result == "fixed" and s.current_head_sha == candidate
+    assert s.last_fix_resolutions[1]["follow_up_issue_url"] == ISSUE43
+
+
+@pytest.mark.parametrize(
+    ("head_repository", "branch", "reason"),
+    [
+        pytest.param("", BRANCH, f"PR {PR} has no readable head repository", id="no-head-repo"),
+        pytest.param(
+            "someone/repo",
+            BRANCH,
+            f"PR {PR} is headed in someone/repo, not in owner/repo",
+            id="fork-head",
+        ),
+        pytest.param(
+            "owner/repo",
+            "another-branch",
+            f"PR {PR} is headed at refs/heads/another-branch, but the FIX plan was made for "
+            f"refs/heads/{BRANCH}",
+            id="another-branch",
+        ),
+    ],
+)
+def test_fix_push_target_lost_when_the_push_lands_is_not_recorded_as_fixed(
+    tmp_state_dir, head_repository, branch, reason
+):
+    """PR #205 R3-F2 at completion: the PR is read back headed at the
+    candidate, the controller's own push, but no longer at the branch of the
+    run's repository the plan pushed to. The fix is not recorded (the
+    findings stay open, the plan stays saved) and it blocks; once the PR is
+    headed there again, 'unblock' completes the plan from the journal with
+    nothing sent again."""
+    gh = FakeGitHub()
+    eng = _in_fix(
+        tmp_state_dir,
+        gh,
+        fixer(fixed("R1-F1"), new_follow_up("R1-F2")),
+        [_finding(1, 1), _finding(1, 2)],
+        origin=True,
+    )
+
+    def loses(record):
+        gh.get_pr(PR)  # GitHub has caught up with the push
+        gh.prs[PR].head_repository = head_repository
+        gh.prs[PR].head_ref = branch
+
+    _after_persisting(eng, EffectKind.PUSH, Stage.OBSERVED, loses)
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    candidate = _worktree_head(eng.provider.calls[0])
+    s = load_state(eng.paths.state_file)
+    assert reason in s.block_reason
+    assert "read back after the FIX plan was sent" in s.block_reason
+    assert "the fix of review round 1 is not recorded" in s.block_reason
+    assert s.last_review_result != "fixed" and s.last_fix_resolutions == []
+    assert [f["id"] for f in s.open_findings] == ["R1-F1", "R1-F2"]
+    assert [r["stage"] for r in s.effect_records] == ["observed", "observed"]
+    assert eng.origin.head(BRANCH) == candidate == gh.prs[PR].head_sha
+    writes = list(gh.effect_writes)
+
+    gh.prs[PR].head_repository = "owner/repo"
+    gh.prs[PR].head_ref = BRANCH
+    eng2 = _resumed(eng, tmp_state_dir, gh, "never")
+    assert eng2.unblock("the PR is headed at its branch again").unblocked
+    out = eng2.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert gh.effect_writes == writes and eng2.provider.calls == []
+    s = load_state(eng2.paths.state_file)
+    assert s.last_review_result == "fixed" and s.current_head_sha == candidate
+    assert s.open_findings == []
+
+
+def test_fix_human_push_before_the_controllers_is_refused_by_the_lease_and_reviewed(
+    tmp_state_dir,
+):
+    """Issue #90's scenario under #163: the follow-up issue is created, then a
+    human pushes to the PR branch between the plan and the controller's
+    push. The lease refuses the push (never forced); the PR routes to REVIEW
+    of the actual HEAD with the findings carried, and that review is told
+    about the follow-up issue, so the run ends clean with exactly one."""
+    gh = FakeGitHub()
+    human: list[str] = []
+
+    def agent(req):
+        if req.phase == "FIX":
+            return fixer(new_follow_up("R1-F1"))(req)
+        assert f"earlier rounds:\n  - R1-F1: {ISSUE43}\n" in req.prompt
+        assert "- R1-F1 [nit] src/x.py:1 — typo" in req.prompt
+        return block(review_payload(2, human[0], []))
+
+    eng = _in_fix(tmp_state_dir, gh, agent, origin=True)
+    reviewed = eng.state.reviewed_head_sha
+    persist = eng._persist_effect
+
+    def human_pushes(record):
+        persist(record)
+        if record.kind is EffectKind.PUSH and record.stage is Stage.ATTEMPTED and not human:
+            human.append(publish_pr_head(eng, parent=reviewed, message="Human fix (#2)"))
+
+    eng._persist_effect = human_pushes
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert "was refused and PR HEAD is" in out.message and human[0][:12] in out.message
+    assert "no fix recorded" in out.message
+    assert eng.origin.head(BRANCH) == human[0] == gh.prs[PR].head_sha
+    s = load_state(eng.paths.state_file)
+    assert s.current_head_sha == human[0] and s.last_fix_resolutions == []
+    assert s.effect_records == [] and [f["id"] for f in s.prior_findings] == ["R1-F1"]
+    assert s.last_review_result == "stale"
+
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    assert [c.phase for c in eng.provider.calls] == ["FIX", "REVIEW"]
+    assert [w[0] for w in gh.effect_writes] == ["create_issue", "create_pr_comment"]
+
+
+def test_fix_human_push_while_the_fixer_ran_sends_nothing_and_goes_to_review(tmp_state_dir):
+    gh = FakeGitHub()
+    human: list[str] = []
+    fixes = fixer(fixed("R1-F1"), new_follow_up("R1-F2"))
+
+    def pushed_meanwhile(req):
+        human.append(publish_pr_head(eng, parent=reviewed_head_in(req.prompt)))
+        return fixes(req)
+
+    eng = _in_fix(
+        tmp_state_dir, gh, pushed_meanwhile, [_finding(1, 1), _finding(1, 2)], origin=True
+    )
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert "moved past the reviewed HEAD" in out.message and "while the fixer ran" in out.message
+    assert "nothing was created, appended or pushed" in out.message
+    assert gh.effect_writes == [] and eng.origin.head(BRANCH) == human[0]
+    s = load_state(eng.paths.state_file)
+    assert s.current_head_sha == human[0] and s.effect_records == []
+    assert s.last_fix_resolutions == [] and len(s.prior_findings) == 2
+
+
+def test_fix_pr_closed_while_the_fixer_ran_is_refused(tmp_state_dir):
+    gh = FakeGitHub()
+    fixes = fixer(fixed("R1-F1"))
+
+    def closes(req):
+        gh.prs[PR].state = "CLOSED"
+        return fixes(req)
+
+    eng = _in_fix(tmp_state_dir, gh, closes, origin=True)
+    reviewed = eng.state.reviewed_head_sha
+    with pytest.raises(VerificationError, match="is CLOSED; the workflow only operates on OPEN"):
+        eng.step()
+    assert gh.effect_writes == [] and eng.origin.head(BRANCH) == reviewed
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.FIX and s.effect_records == []
+
+
+@pytest.mark.parametrize("committed", [False, True], ids=["before-a-commit", "after-a-commit"])
+def test_fix_provider_failure_changes_nothing_and_the_relaunch_is_pushed(tmp_state_dir, committed):
+    """The fixer exits non-zero, before or after a local commit: nothing is
+    planned, created or pushed. The relaunch (attempt 2) reports the commit
+    in its worktree (its own, or the one the failed attempt left), and the
+    controller pushes it."""
+    gh = FakeGitHub()
+
+    def fails(req):
+        if committed:
+            fix_commit(req, "Fix R1-F1 (#2)")
+        return ""
+
+    second = _reports_fix(fixed("R1-F1")) if committed else fixer(fixed("R1-F1"))
+    eng = _in_fix(tmp_state_dir, gh, scripted(fails, second), origin=True)
+    reviewed = eng.state.reviewed_head_sha
+    eng.provider.exit_code = 1
+    with pytest.raises(ExecutionError, match="exited 1"):
+        eng.step()
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.FIX and s.attempt == 1 and s.effect_records == []
+    assert gh.effect_writes == [] and eng.origin.head(BRANCH) == reviewed
+
+    eng.provider.exit_code = 0
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    head = _worktree_head(eng.provider.calls[1])
+    assert eng.origin.head(BRANCH) == head != reviewed
+    assert eng.state.current_head_sha == head
+
+
+def test_fix_on_pi_matches_the_scripted_provider(tmp_path_factory):
+    """Provider parity (#163): the same fixer behind Pi and behind the
+    scripted provider gives the same plan, the same writes and the same
+    state; the engine has no provider branch."""
+    seen = []
+    for on_pi in (False, True):
+        gh = FakeGitHub()
+        gh.add_issue(ISSUE3, "deferred in round 1", body=_marked("R1-F5"))
+        state_dir = tmp_path_factory.mktemp("pi-run" if on_pi else "scripted") / ".autoforge"
+        agent = fixer(fixed("R1-F1"), new_follow_up("R1-F2"), deferred_to("R1-F3", ISSUE3))
+        eng = _in_fix(
+            state_dir,
+            gh,
+            agent,
+            [_finding(1, 1), _finding(1, 2), _finding(1, 3)],
+            origin=True,
+        )
+        if on_pi:
+            fake = _to_pi(eng, tmp_path_factory, agent)
+        out = eng.step()
+        s = load_state(eng.paths.state_file)
+        assert eng.origin.head(BRANCH) == s.current_head_sha
+        seen.append(
+            (
+                re.sub(r"\b[0-9a-f]{12}\b", "<SHA>", out.message),
+                out.next_phase,
+                s.last_fix_resolutions,
+                gh.effect_writes,
+            )
+        )
+    assert seen[0] == seen[1]
+    assert seen[0][1] == "REVIEW"
+    assert eng.provider.calls == [] and len(fake.launches()) == 1
+
+
+def test_fix_dry_run_without_a_plan_performs_nothing(tmp_state_dir, offline_fetches):
+    gh = FakeGitHub()
+    eng = _in_fix(tmp_state_dir, gh, ["never"])
+    eng._save()
+    eng._github = _NoGitHub()
+    before = eng.paths.state_file.read_bytes()
+    offline_fetches.clear()
+    out = eng.step(dry_run=True)
+    notes = "\n".join(out.plan.notes)
+    assert "would re-read the PR's HEAD, base and merge base first" in notes
+    assert "launching the fixer, which publishes nothing" in notes
+    assert "then the push of that HEAD as a fast-forward over the reviewed HEAD" in notes
+    assert eng.provider.calls == [] and offline_fetches == []
+    assert eng.paths.state_file.read_bytes() == before
+
+
+def test_fix_dry_run_with_a_saved_plan_names_it_and_performs_nothing(tmp_state_dir, monkeypatch):
+    from autoforge.engine import ControllerEngine
+
+    gh = FakeGitHub()
+    eng = _in_fix(
+        tmp_state_dir,
+        gh,
+        fixer(fixed("R1-F1"), new_follow_up("R1-F2")),
+        [_finding(1, 1), _finding(1, 2)],
+        origin=True,
+    )
+    reviewed = eng.state.reviewed_head_sha
+    monkeypatch.setattr(ControllerEngine, "_complete_fix", _crash)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    monkeypatch.undo()
+    eng2 = _resumed(eng, tmp_state_dir, gh, "never")
+    eng2._github = _NoGitHub()
+    before = eng2.paths.state_file.read_bytes()
+    out = eng2.step(dry_run=True)
+    notes = "\n".join(out.plan.notes)
+    assert "would reconcile follow_up_issue effect 0 on owner/repo (intended, 0 attempt(s))" in (
+        notes
+    )
+    assert f"would reconcile push effect 1 on refs/heads/{BRANCH} (intended" in notes
+    assert "would complete FIX of review round 1 from the persisted plan without launching" in (
+        notes
+    )
+    assert eng2.provider.calls == [] and gh.effect_writes == []
+    assert eng.origin.head(BRANCH) == reviewed
+    assert eng2.paths.state_file.read_bytes() == before
 
 
 def test_fix_no_change_requires_rationale(tmp_state_dir):
@@ -2509,25 +4301,40 @@ def test_remote_review_findings_with_a_credential_never_reach_state_or_the_pr(tm
 def test_remote_fix_resolutions_are_redacted_before_they_are_persisted(tmp_state_dir):
     secret = "sk-ant-" + "B" * 30
     gh = FakeGitHub()
-    res = [
-        {"finding_id": "R1-F1", "resolution": "fixed"},
-        {
-            "finding_id": "R1-F2",
-            "resolution": "no_change_with_rationale",
-            "rationale": f"The fixture already sets ANTHROPIC_API_KEY={secret}, so nothing to do.",
-        },
-    ]
-
-    def on_call(req):
-        gh.set_head(SHA_B)
-        return block(fix_payload(SHA_A, SHA_B, res))
-
-    eng = _in_fix(tmp_state_dir, gh, on_call, findings=[_finding(1, 1), _finding(1, 2)])
+    rationale = f"The fixture already sets ANTHROPIC_API_KEY={secret}, so nothing to do."
+    agent = fixer(fixed("R1-F1"), no_change("R1-F2", rationale))
+    eng = _in_fix(tmp_state_dir, gh, agent, [_finding(1, 1), _finding(1, 2)], origin=True)
     out = eng.step()
     assert out.next_phase == "REVIEW"
     assert secret not in json.dumps(eng.state.last_fix_resolutions)
     assert "***REDACTED***" in eng.state.last_fix_resolutions[1]["rationale"]
     assert secret not in eng.paths.state_file.read_text(encoding="utf-8")
+
+
+def test_fix_rationale_redaction_may_carry_it_past_either_parser_bound(tmp_state_dir):
+    """ADR 0004 §6.1 (#163): the parser bounds a rationale as the fixer wrote
+    it, and the controller persists it redacted. A rationale at the upper
+    bound that redaction lengthens, and one just over the lower bound that
+    redaction shortens below it, are both accepted and persisted exactly as
+    ``redact`` renders them; the state file reloads and holds neither secret."""
+    from autoforge.redaction import redact
+    from autoforge.result_parser import MIN_RATIONALE_CHARS
+
+    unit = "HF_TOKEN=x;"
+    body = unit * (MAX_FIX_RATIONALE_CHARS // len(unit))
+    grows = body + "." * (MAX_FIX_RATIONALE_CHARS - len(body))
+    shrinks = "HF_TOKEN=" + "x" * 40
+    gh = FakeGitHub()
+    agent = fixer(no_change("R1-F1", grows), no_change("R1-F2", shrinks), commit=False)
+    eng = _in_fix(tmp_state_dir, gh, agent, [_finding(1, 1), _finding(1, 2)], origin=True)
+    assert eng.step().next_phase == "REVIEW"
+    assert len(eng.provider.calls) == 1  # accepted as written, no correction
+    s = load_state(eng.paths.state_file)
+    first, second = (r["rationale"] for r in s.last_fix_resolutions)
+    assert first == redact(grows) and len(first) > MAX_FIX_RATIONALE_CHARS
+    assert second == redact(shrinks) and len(second) < MIN_RATIONALE_CHARS
+    text = eng.paths.state_file.read_text(encoding="utf-8")
+    assert "HF_TOKEN=x" not in text and shrinks not in text
 
 
 # -- correction retry ---------------------------------------------------------------------
@@ -2578,10 +4385,12 @@ def test_correction_after_the_reviewer_posted_a_round_comment_blocks(tmp_state_d
 
 
 def test_correction_after_the_fix_was_pushed_goes_to_review_without_relaunching(tmp_state_dir):
-    """The fixer pushed, then returned junk. Before the correction relaunch
-    the FIX entry probe sees the HEAD past the reviewed one and routes to
-    REVIEW of the actual HEAD; a fixer is never relaunched against findings
-    its push may have resolved."""
+    """Someone pushed to the PR branch while the fixer ran (a fixer ignoring
+    its contract, which since #163 publishes nothing, or a human), then the
+    fixer returned junk. Before the correction relaunch the FIX entry probe
+    sees the HEAD past the reviewed one and routes to REVIEW of the actual
+    HEAD; a fixer is never relaunched against findings that push may have
+    resolved."""
     gh = FakeGitHub()
 
     def pushes_then_junk(req):
@@ -6185,10 +7994,10 @@ def _loop_agent(
     """Scripted ANALYZE_EXECUTE / REVIEW / FIX loop over FakeGitHub and its origin.
 
     ``findings_for_round(n)`` returns the findings review round ``n`` reports
-    (``[]`` == clean). Every FIX pushes a new distinct HEAD (appended to
-    ``pushed``) and resolves every open finding as ``fixed`` — the runaway
-    loop from the issue's evidence. The reviewer posts nothing: the
-    controller posts each round's comment (#162).
+    (``[]`` == clean). Every FIX commits a new distinct HEAD (appended to
+    ``pushed``; the controller pushes it, #163) and resolves every open
+    finding as ``fixed`` — the runaway loop from the issue's evidence. The
+    reviewer posts nothing: the controller posts each round's comment (#162).
     """
     rounds = {"n": 0}
     seen = seen if seen is not None else []
@@ -6204,13 +8013,10 @@ def _loop_agent(
             sha = gh.prs[PR].head_sha
             return block(review_payload(rnd, sha, findings_for_round(rnd)))
         if req.phase == "FIX":
-            prev = gh.prs[PR].head_sha
             ids = re.findall(r"^- (R\d+-F\d+) \[", req.prompt, re.M)
-            new = push_fix(req, gh, f"Fix round {rounds['n']} (#2)")
+            new = fix_commit(req, f"Fix round {rounds['n']} (#2)")
             pushed.append(new)
-            return block(
-                fix_payload(prev, new, [{"finding_id": i, "resolution": "fixed"} for i in ids])
-            )
+            return block(fix_payload(reviewed_head_in(req.prompt), new, [fixed(i) for i in ids]))
         raise AssertionError(f"unexpected call {req.phase}")
 
     return agent
@@ -6646,21 +8452,9 @@ def test_oversized_fix_rationale_is_refused_and_corrected(tmp_state_dir):
 
     def agent(req):
         rationale = fine if req.correction else huge
-        return block(
-            fix_payload(
-                SHA_A,
-                SHA_A,
-                [
-                    {
-                        "finding_id": "R1-F1",
-                        "resolution": "no_change_with_rationale",
-                        "rationale": rationale,
-                    }
-                ],
-            )
-        )
+        return fixer(no_change("R1-F1", rationale), commit=False)(req)
 
-    eng = _in_fix(tmp_state_dir, gh, agent)
+    eng = _in_fix(tmp_state_dir, gh, agent, origin=True)
     out = eng.step()
     assert out.next_phase == "REVIEW"
     assert len(eng.provider.calls) == 2
@@ -6754,10 +8548,10 @@ def test_fix_prompt_size_is_bounded_by_the_review_bounds(tmp_state_dir, fake_git
     escape_width = 6  # escape_inline: a control character renders as \\xNN or \\uNNNN
     indent_width = 5  # a newline inside required_resolution renders as "\n" + 4 spaces
     framing = 64  # classification, separators, the "Required resolution:" label
-    # The follow-up section renders one more line per finding: the id, its
-    # marker (the PR URL and the id again, JSON-quoted) and the existing
-    # issue URL or "(none)"; every part is bounded by the id and URL bounds.
-    follow_up_line = 2 * MAX_FINDING_ID_CHARS + 2 * MAX_URL_CHARS + framing
+    # The follow-up section renders one more line per finding: the id and
+    # the existing issue URL or "(none)", each bounded by the id and URL
+    # bounds (#163: no marker is rendered; the controller writes it).
+    follow_up_line = MAX_FINDING_ID_CHARS + MAX_URL_CHARS + framing
     per_finding = (
         MAX_FINDING_ID_CHARS  # the id's shape admits no control character
         + escape_width * (MAX_FINDING_TITLE_CHARS + MAX_FINDING_LOCATION_CHARS)
@@ -7293,24 +9087,29 @@ def test_review_entry_blocks_on_an_unreadable_follow_up_marker_on_any_open_issue
     assert f"open issue {ISSUE4}: " in reason and "\n" not in reason
 
 
-def test_fix_read_back_rejects_when_any_open_issue_carries_an_unreadable_follow_up_marker(
+def test_fix_plan_blocks_when_any_open_issue_carries_an_unreadable_follow_up_marker(
     tmp_state_dir,
 ):
-    """The fixer created a well-formed follow-up issue and also botched a
-    marker elsewhere (an edit to another issue): the open-issue set is
-    inconclusive, the result is rejected, no resolution is recorded."""
+    """A follow-up marker was botched on another open issue while the fixer
+    ran (an edit by hand, or a fixer ignoring its contract): the open-issue
+    set the plan is read from is inconclusive, so nothing is planned,
+    created or pushed and no resolution is recorded."""
     gh = FakeGitHub()
+    fixes = fixer(fixed("R1-F1"))
 
-    def fixes(req):
-        gh.add_issue(ISSUE3, "follow-up", body=follow_up_issue_body("R1-F1"))
+    def botched_meanwhile(req):
         gh.add_issue(ISSUE4, "botched", body=_fu_marker({"finding_id": "R1-F1", "pr": PR, "z": 0}))
-        return block(fix_payload(SHA_A, SHA_A, _follow_up("R1-F1", ISSUE3)))
+        return fixes(req)
 
-    eng = _in_fix(tmp_state_dir, gh, fixes)
-    with pytest.raises(VerificationError, match=f"open issue {ISSUE4}: .*at most one follow-up"):
-        eng.step()
+    eng = _in_fix(tmp_state_dir, gh, botched_meanwhile, origin=True)
+    reviewed = eng.state.reviewed_head_sha
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
     s = load_state(eng.paths.state_file)
-    assert s.phase == Phase.FIX and s.last_fix_resolutions == []
+    assert f"open issue {ISSUE4}: " in s.block_reason
+    assert "nothing was created, appended or pushed" in s.block_reason
+    assert s.last_fix_resolutions == [] and s.effect_records == []
+    assert gh.effect_writes == [] and eng.origin.head(BRANCH) == reviewed
 
 
 def test_fix_entry_lists_an_issue_carrying_several_distinct_follow_up_markers_once_each(
@@ -7329,11 +9128,10 @@ def test_fix_entry_lists_an_issue_carrying_several_distinct_follow_up_markers_on
             "earlier rounds (finding id:\nissue):\n\n- R1-F2: https://github.com/Owner/REPO/issues/4"
             "\n- R1-F3: https://github.com/Owner/REPO/issues/4\n"
         ) in req.prompt
-        assert "- R2-F1: marker `" in req.prompt and "; existing issue: (none)" in req.prompt
-        gh.set_head(SHA_B)
-        return block(fix_payload(SHA_A, SHA_B, [{"finding_id": "R2-F1", "resolution": "fixed"}]))
+        assert "- R2-F1: existing issue: (none)" in req.prompt
+        return fixer(fixed("R2-F1"))(req)
 
-    eng = _in_fix(tmp_state_dir, gh, fixes, findings=[_finding(2)])
+    eng = _in_fix(tmp_state_dir, gh, fixes, findings=[_finding(2)], origin=True)
     eng.state.review_round = 2
     assert eng.step().next_phase == "REVIEW"
 

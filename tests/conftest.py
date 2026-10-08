@@ -7,6 +7,7 @@ agents are ``ScriptedProvider`` instances, GitHub is ``FakeGitHub``.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from collections.abc import Callable
@@ -515,6 +516,9 @@ class FakeGitHub:
             mergeable="MERGEABLE",
             merge_state_status="CLEAN",
             repository=ref.repository,
+            # As GitHub reports a PR headed in its own repository; a test
+            # sets another (a fork) or "" (a deleted head repository).
+            head_repository=ref.repository,
             linked_issue_numbers=list(linked or []),
             body=body,
             checks=[ci_check()] if checks is None else list(checks),
@@ -1292,18 +1296,124 @@ def commit_in(cwd, message: str = "Implement the feature (#2)") -> str:
     return git_out("-C", str(cwd), "rev-parse", "HEAD")
 
 
-def push_fix(req, gh: FakeGitHub, message: str = "Fix the review findings (#2)") -> str:
-    """A FIX agent's push: one commit in its worktree, published to the PR's branch.
+def publish_pr_head(
+    eng: ControllerEngine,
+    parent: str = "HEAD",
+    message: str = "Implement the feature (#2)",
+    branch: str = BRANCH,
+) -> str:
+    """A commit on ``parent``, published to ``branch`` on the engine's origin; its SHA.
 
-    The fixer still pushes its own commit (the controller does from #163 on),
-    and the next REVIEW fetches the PR's HEAD from the origin before it
-    launches (#162), so an origin-backed run's fix is a real commit there
-    rather than a :meth:`FakeGitHub.set_head` placeholder. The new HEAD.
+    Written with ``commit-tree`` into the checkout's object store, so the
+    checkout's HEAD, index and working tree are not moved: a PR head (or a
+    human's push to it) that a test starts from, with no agent involved.
     """
-    assert gh.origin is not None, "push_fix needs an origin-backed engine"
-    sha = commit_in(req.cwd, message)
-    gh.origin.publish(req.cwd, sha, gh.prs[PR].head_ref)
+    origin = getattr(eng, "origin", None)
+    assert origin is not None, "publish_pr_head needs an origin-backed engine"
+    sha = git_out(
+        "-C",
+        str(eng.workdir),
+        *GIT_IDENT,
+        "commit-tree",
+        f"{parent}^{{tree}}",
+        "-p",
+        parent,
+        "-m",
+        message,
+    )
+    origin.publish(eng.workdir, sha, branch)
     return sha
+
+
+_REVIEWED_HEAD_RE = re.compile(r'"previous_head_sha": "([0-9a-f]{40})"')
+
+
+def reviewed_head_in(prompt: str) -> str:
+    """The reviewed HEAD a REMOTE FIX prompt names (its result's cross-check)."""
+    m = _REVIEWED_HEAD_RE.search(prompt)
+    assert m is not None, "not a REMOTE FIX prompt"
+    return m.group(1)
+
+
+def fix_commit(req, message: str = "Fix the review findings (#2)") -> str:
+    """A fixer's work since #163: one commit on the reviewed HEAD; the new HEAD.
+
+    The reviewed HEAD the prompt names is checked out detached in the
+    fixer's worktree (the controller fetched it before the launch) and the
+    commit is made on it. Nothing is pushed: the controller pushes it.
+    """
+    git_out("-C", str(req.cwd), "checkout", "-q", "--detach", reviewed_head_in(req.prompt))
+    return commit_in(req.cwd, message)
+
+
+def fix_payload(prev: str, head: str, resolutions: list[dict], **overrides) -> dict:
+    """A REMOTE FIX success result (#163 schema)."""
+    return {
+        "phase": "FIX",
+        "status": "success",
+        "previous_head_sha": prev,
+        "head_sha": head,
+        "resolutions": resolutions,
+        **overrides,
+    }
+
+
+def fixer(
+    *resolutions: dict,
+    commit: bool = True,
+    message: str = "Fix the review findings (#2)",
+    **overrides,
+) -> Callable:
+    """A FIX agent: a local commit (unless ``commit`` is False), then ``resolutions``.
+
+    Without a commit the worktree is left at the reviewed HEAD, which the
+    result reports as its ``head_sha``.
+    """
+
+    def handler(req) -> str:
+        reviewed = reviewed_head_in(req.prompt)
+        if commit:
+            head = fix_commit(req, message)
+        else:
+            git_out("-C", str(req.cwd), "checkout", "-q", "--detach", reviewed)
+            head = reviewed
+        return block(fix_payload(reviewed, head, list(resolutions), **overrides))
+
+    return handler
+
+
+FOLLOW_UP_TITLE = "Cache the parsed configuration"
+FOLLOW_UP_TEXT = "The configuration is parsed twice per run; parse it once and pass it down."
+NO_CHANGE_RATIONALE = (
+    "The loader already validates this path in `load_config`, and the test "
+    "`test_config_rejects_unknown_keys` covers it; no change is needed."
+)
+
+
+def fixed(finding_id: str, **extra) -> dict:
+    return {"finding_id": finding_id, "resolution": "fixed", **extra}
+
+
+def new_follow_up(finding_id: str, title: str = FOLLOW_UP_TITLE, text: str = FOLLOW_UP_TEXT):
+    """A deferral to a new follow-up issue the controller creates."""
+    return {
+        "finding_id": finding_id,
+        "resolution": "follow_up_created",
+        "follow_up_issue": {"title": title, "body": text},
+    }
+
+
+def deferred_to(finding_id: str, url: str) -> dict:
+    """A deferral to an issue the controller handed over."""
+    return {"finding_id": finding_id, "resolution": "follow_up_created", "follow_up_issue_url": url}
+
+
+def no_change(finding_id: str, rationale: str = NO_CHANGE_RATIONALE) -> dict:
+    return {
+        "finding_id": finding_id,
+        "resolution": "no_change_with_rationale",
+        "rationale": rationale,
+    }
 
 
 def analyze_payload(head_sha: str, **overrides) -> dict:
