@@ -2237,6 +2237,83 @@ def test_fix_entry_fetches_the_reviewed_head_before_the_launch(tmp_state_dir, of
     assert offline_fetches == [[SHA_A]]
 
 
+@pytest.mark.parametrize(
+    ("head_repository", "branch", "reason"),
+    [
+        pytest.param(
+            "",
+            BRANCH,
+            f"PR {PR} has no readable head repository, so the controller cannot prove its "
+            "branch is a branch of owner/repo",
+            id="no-head-repository",
+        ),
+        pytest.param(
+            "someone/repo",
+            BRANCH,
+            f"PR {PR} is headed in someone/repo, not in owner/repo",
+            id="fork-head",
+        ),
+        pytest.param(
+            "owner/repo",
+            "",
+            f"PR {PR} has no readable head branch ('')",
+            id="no-head-branch",
+        ),
+    ],
+)
+def test_fix_entry_blocks_without_a_branch_of_the_run_repository(
+    tmp_state_dir, head_repository, branch, reason
+):
+    """PR #205 R1-F1: the controller pushes a fix only to a branch it has
+    proven is the PR's head in the run's repository. A PR GitHub reports
+    with no head repository (its head was deleted, a fork's typically) is
+    not one: a same-named branch of the run's repository is not proven to
+    be its head. It blocks before the launch like a fork's head or an
+    unreadable branch: no fixer, no entry observation, nothing sent."""
+    gh = FakeGitHub()
+    eng = _in_fix(tmp_state_dir, gh, fixer(fixed("R1-F1")), origin=True)
+    gh.prs[PR].head_repository = head_repository
+    gh.prs[PR].head_ref = branch
+    reviewed = eng.state.reviewed_head_sha
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    s = load_state(eng.paths.state_file)
+    assert reason in s.block_reason and "Nothing was launched" in s.block_reason
+    assert eng.provider.calls == [] and s.entry_observation == {}
+    assert s.effect_records == [] and s.completion_context == {}
+    assert gh.effect_writes == [] and eng.origin.head(BRANCH) == reviewed
+
+
+@pytest.mark.parametrize(
+    "resolution", [fixed("R1-F1"), new_follow_up("R1-F1")], ids=["fixed", "new-follow-up"]
+)
+def test_fix_plan_blocks_when_the_head_repository_is_gone_after_the_launch(
+    tmp_state_dir, resolution
+):
+    """PR #205 R1-F1, at the plan: the head repository the entry proved is
+    no longer readable when the fixer returns. The PR branch is not proven
+    to be the run repository's, so neither the push nor a follow-up issue
+    is planned or sent."""
+    gh = FakeGitHub()
+    commits = fixer(resolution)
+
+    def commits_then_the_head_repository_goes(req):
+        answer = commits(req)
+        gh.prs[PR].head_repository = ""
+        return answer
+
+    eng = _in_fix(tmp_state_dir, gh, commits_then_the_head_repository_goes, origin=True)
+    reviewed = eng.state.reviewed_head_sha
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert len(eng.provider.calls) == 1
+    s = load_state(eng.paths.state_file)
+    assert f"PR {PR} has no readable head repository" in s.block_reason
+    assert "Nothing was created, appended or pushed" in s.block_reason
+    assert s.effect_records == [] and s.completion_context == {}
+    assert gh.effect_writes == [] and eng.origin.head(BRANCH) == reviewed
+
+
 def _detached_at_the_reviewed_parent(req) -> str:
     """A fixer that rebuilt its commit on the reviewed HEAD's parent."""
     reviewed = reviewed_head_in(req.prompt)

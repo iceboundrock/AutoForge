@@ -243,7 +243,10 @@ High-priority coverage includes:
   body the published-content policy refuses are corrections with nothing
   created, appended or pushed; the entry fetches the reviewed HEAD before
   the launch and hands over each finding's follow-up and the earlier
-  rounds'; a follow-up issue the controller did not journal, a reused one
+  rounds'; a PR headed in a fork, with no readable head repository or with
+  no readable head branch blocks before the launch, and one whose head
+  repository is gone when the fixer returns blocks before the plan; a
+  follow-up issue the controller did not journal, a reused one
   no longer the finding's, an append target closed, moved or holding a
   credential block with nothing sent; a push by someone else, while the
   fixer ran or before the controller's (refused by the lease), goes to

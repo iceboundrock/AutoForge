@@ -516,6 +516,9 @@ class FakeGitHub:
             mergeable="MERGEABLE",
             merge_state_status="CLEAN",
             repository=ref.repository,
+            # As GitHub reports a PR headed in its own repository; a test
+            # sets another (a fork) or "" (a deleted head repository).
+            head_repository=ref.repository,
             linked_issue_numbers=list(linked or []),
             body=body,
             checks=[ci_check()] if checks is None else list(checks),

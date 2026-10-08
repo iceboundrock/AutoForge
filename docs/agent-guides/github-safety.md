@@ -357,9 +357,12 @@ entries refuse it, never read as a retarget or a rewrite. The base is
 compared only when `reviewed_base_ref` is set and the merge base only when
 `reviewed_merge_base_sha` is set: a protocol-2 or protocol-3 state file
 loaded in `FIX` lacks them, so its fixer is launched and the next completed
-review writes the binding. A PR headed in another repository, or with no
-readable head branch, blocks: the controller pushes a fix only to a
-branch of the run's repository.
+review writes the binding. A PR headed in another repository, with no
+readable head repository (GitHub reports none when the head repository was
+deleted, so a same-named branch of the run's repository is not proven to be
+its head), or with no readable head branch, blocks: the controller pushes a
+fix only to a branch it has proven is the PR's head in the run's
+repository.
 
 The controller then lists the repository's open issues (strictly: a
 listing that may be truncated blocks, because "none exists" is then not
@@ -432,7 +435,9 @@ Then, in order, all from one persisted plan:
 
 1. The precondition read: the PR is re-read, and a HEAD past the reviewed
    one is a push the controller did not make: `FIX -> REVIEW` of the
-   actual HEAD with nothing sent and no fix recorded. The open issues are
+   actual HEAD with nothing sent and no fix recorded. A PR no longer
+   proven headed at a branch of the run's repository (the entry's rule)
+   blocks with nothing planned or sent. The open issues are
    listed again, and each open finding's follow-up must be the one the
    entry recorded; each issue a deferral names must be open in this
    repository, with a body the marker block can be appended to (the

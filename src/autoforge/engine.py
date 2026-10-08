@@ -6042,7 +6042,16 @@ class ControllerEngine:
         """Why the controller cannot push a fix to ``pr``'s branch, or "" when it can."""
         state = self._require_state()
         url = parse_pr_url(pr.url or state.current_pr_url).canonical
-        if pr.head_repository and pr.head_repository.lower() != state.repository.lower():
+        if not pr.head_repository:
+            # GitHub reports no head repository for a PR whose head was
+            # deleted (a fork, typically): its branch name alone does not
+            # prove a same-named branch of the run's repository is its head.
+            return (
+                f"PR {url} has no readable head repository, so the controller cannot prove "
+                f"its branch is a branch of {state.repository}: it pushes a fix to a branch "
+                "of the run's repository only"
+            )
+        if pr.head_repository.lower() != state.repository.lower():
             return (
                 f"PR {url} is headed in {pr.head_repository}, not in {state.repository}: the "
                 "controller pushes a fix to a branch of the run's repository only"
@@ -8542,7 +8551,8 @@ class ControllerEngine:
         or a fast-forward of it. A precondition read then finds GitHub as the
         entry observed it: the PR open at the reviewed HEAD (a HEAD past it
         is a push the controller did not make: ``FIX -> REVIEW``, nothing
-        sent), each open finding's follow-up issue as the entry recorded it,
+        sent) and headed at a branch of this repository, each open
+        finding's follow-up issue as the entry recorded it,
         and each issue a deferral names open in this repository with a body
         the marker block can be appended to; anything else blocks with
         nothing planned or sent (ADR 0004 §2.5). The follow-up issues to
@@ -8568,6 +8578,12 @@ class ControllerEngine:
                 f"PR HEAD {pr.head_sha[:12]} moved past the reviewed HEAD {reviewed[:12]} while "
                 "the fixer ran (a push the controller did not make; it does not infer which "
                 "findings it resolved), so nothing was created, appended or pushed",
+            )
+        problem = self._fix_branch_problem(pr)
+        if problem:
+            return Phase.BLOCKED, (
+                f"{problem}. Nothing was created, appended or pushed. Inspect the PR, then "
+                "'unblock'"
             )
         pr_ref = parse_pr_url(state.current_pr_url)
         pr_url = pr_ref.canonical
