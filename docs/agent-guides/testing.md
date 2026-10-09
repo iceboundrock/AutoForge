@@ -182,8 +182,10 @@ High-priority coverage includes:
 - the agent request and the run log carry the configured allow-list; pre-merge
   and validation commands run under the same one
 - HEAD or branch of the operator's checkout changing while the agent ran
-  enters BLOCKED (also when the invocation itself failed); agent commits in
-  its own worktree are not drift
+  enters BLOCKED (also when the invocation itself failed, and before any
+  relaunch: a launch that moved it and then failed transiently or returned
+  a result to correct is neither reconciled nor relaunched); agent commits
+  in its own worktree are not drift
 
 ### GitHub verification
 

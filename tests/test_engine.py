@@ -10676,6 +10676,67 @@ def test_the_invocation_failure_propagates_when_nothing_moved(tmp_state_dir, fak
         eng.step()
 
 
+class _MovesTheCheckoutFirst(ScriptedProvider):
+    """The first launch commits to the *operator's* checkout and ends with
+    ``first`` (keyword arguments of its result); a relaunch would implement
+    and succeed."""
+
+    def __init__(self, repo, **first) -> None:
+        super().__init__(implement)
+        self.repo, self.first = repo, first
+
+    def execute(self, req):
+        if self.calls:
+            return super().execute(req)
+        self.calls.append(req)
+        _commit(self.repo, "b.txt", "2", "sneaky")
+        result = {"exit_code": 0, "stdout": "", **self.first}
+        return AgentExecutionResult(
+            command=["x"], stderr="boom", started_at="t", finished_at="t", **result
+        )
+
+
+@pytest.mark.parametrize(
+    "first",
+    [
+        pytest.param({"exit_code": 1, "transient_failure": TRANSIENT}, id="transient-failure"),
+        pytest.param({"stdout": "not a control result"}, id="malformed-result"),
+    ],
+)
+def test_drift_left_by_a_launch_blocks_before_any_relaunch(tmp_state_dir, fake_github, first):
+    """The checkout is read before every relaunch, not only around the
+    step: a launch that moved it and then failed transiently, or returned a
+    result to correct, is followed by neither a reconciliation nor another
+    launch."""
+    repo = git_repo(tmp_state_dir.parent)
+    _commit(repo, "a.txt", "1", "base")
+    eng = make_engine(tmp_state_dir, [], github=fake_github, origin=True)
+    eng.config.execution.max_correction_attempts = 1
+    eng.step()
+    provider = _MovesTheCheckoutFirst(repo, **first)
+    _install(eng, provider)
+    original_entry = eng._remote_entry
+    entries = []
+
+    def counted_entry(previous, plan):
+        entries.append(previous)
+        return original_entry(previous, plan)
+
+    eng._remote_entry = counted_entry
+    assert eng.step().next_phase == "BLOCKED"
+
+    assert len(provider.calls) == 1
+    assert entries == [Phase.ANALYZE_EXECUTE]  # the step's own entry only
+    reason = eng.state.block_reason
+    assert "moved while ANALYZE_EXECUTE ran" in reason and "HEAD moved from" in reason
+    assert "Found before a relaunch: attempt 1 ended without a usable result" in reason
+    assert "neither reconciled nor launched again" in reason
+    assert reason.count("moved while") == 1  # reported once, not wrapped again
+    s = load_state(eng.paths.state_file)
+    assert s.phase is Phase.BLOCKED and s.attempt == 1 and s.current_pr_url == ""
+    assert fake_github.effect_writes == [] and eng.origin.head("autoforge/2") is None
+
+
 def test_dry_run_renders_a_pi_profile_without_launching_it(tmp_state_dir):
     """#129: a Pi reviewer shows its exact argv; the prompt is not in it (stdin RPC, #131)."""
     cfg = default_config()

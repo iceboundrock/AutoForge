@@ -386,10 +386,10 @@ the provider adapter declares for its own CLI (`ANTHROPIC_*` and `CLAUDE_*`
 for Claude Code; `OPENCODE_*`, `OPENAI_*`, `ANTHROPIC_*`, `GEMINI_*`,
 `GOOGLE_*` for OpenCode); nothing else in the operator's environment is
 inherited, and the names (never the values) are recorded in the invocation's
-`request.json`. Before and after each invocation the controller reads HEAD
-and the checked-out branch of its own checkout; a change enters `BLOCKED`
-with the drift in the reason, nothing is rolled back, and `unblock`
-reconciles the agent's GitHub work. This is process and filesystem-level
+`request.json`. Before and after each invocation, including before every
+relaunch within a step, the controller reads HEAD and the checked-out branch
+of its own checkout; a change enters `BLOCKED` with the drift in the reason,
+nothing is rolled back, and `unblock` reconciles the agent's GitHub work. This is process and filesystem-level
 separation, not a sandbox: the agent still runs as the operator with network
 access and the allow-listed credentials.
 

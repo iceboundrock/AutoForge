@@ -1151,18 +1151,40 @@ class ControllerEngine:
 
         The LOCAL anchor check (:meth:`_git_anchor_drift`), reused for a
         REMOTE run: HEAD and the checked-out branch of the checkout the
-        controller is run from are read before the launch and again after
-        it returns -- however it returns -- and a change is a
-        :class:`CheckoutDriftError`, which the step turns into BLOCKED. The
-        agents are launched in the per-issue worktree and told to work only
-        there, so the checkout moving means an agent (or someone else) did
-        what the prompts forbid, and the controller cannot tell which;
-        nothing is rolled back. The read itself failing is a
+        controller is run from are read before the first launch, again
+        before every relaunch (a correction, or the retry of a transient
+        failure), and after the invocation returns -- however it returns --
+        and a change is a :class:`CheckoutDriftError`, which the step turns
+        into BLOCKED. The agents are launched in the per-issue worktree and
+        told to work only there, so the checkout moving means an agent (or
+        someone else) did what the prompts forbid, and the controller cannot
+        tell which; nothing is rolled back. The read itself failing is a
         VerificationError as in LOCAL mode: not evidence of no drift.
         """
         anchor = self._checkout_anchor()
+
+        def reconcile_anchored() -> StepOutcome | None:
+            # :meth:`_invoke_phase` calls this before every relaunch: a
+            # checkout the previous launch moved is found here, before the
+            # phase is reconciled on top of it or an agent launched again.
+            drift = self._checkout_drift(anchor)
+            if drift:
+                raise CheckoutDriftError(
+                    self._checkout_drift_reason(
+                        phase,
+                        drift,
+                        f"Found before a relaunch: attempt {self._require_state().attempt} "
+                        "ended without a usable result (its run log says why), and the phase "
+                        "was neither reconciled nor launched again",
+                    )
+                )
+            return reconcile()
+
         try:
-            result = self._invoke_phase(phase, reconcile)
+            result = self._invoke_phase(phase, reconcile_anchored)
+        except CheckoutDriftError:
+            # Found before a relaunch and already worded: not wrapped again.
+            raise
         except Exception as exc:
             drift = self._checkout_drift(anchor)
             if drift:
@@ -7434,7 +7456,9 @@ class ControllerEngine:
         it may already have done the phase's GitHub work, and the relaunch
         must see it exactly as ``resume`` would. An outcome from
         reconciliation resolves the phase without relaunching and is
-        returned in place of a payload. A LOCAL run passes none and never
+        returned in place of a payload; an exception from it (the checkout
+        drift :meth:`_invoke_phase_anchored` checks there) propagates
+        without relaunching. A LOCAL run passes none and never
         retries a transient failure: its write phases are judged against the
         durable launch checkpoint and its review verification refuses a tree
         the reviewer changed.
