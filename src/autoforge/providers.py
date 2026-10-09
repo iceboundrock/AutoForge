@@ -66,11 +66,10 @@ OpenCode (``opencode 2.0.x``, #186; run against 2.0.23)::
     stderr is an ``activity`` event, which prints nothing but keeps the
     heartbeat's "last activity" current; the trace itself reaches the
     operator only in ``stderr.log``.
-  * ``options.openai_transport`` sets OpenCode v2's
-    ``providers.openai.settings.transport`` for this invocation. HTTP avoids
-    intermittent WebSocket disconnects observed with OpenAI Responses; the
-    override is merged into ``OPENCODE_CONFIG_CONTENT`` without replacing the
-    operator's other inline settings.
+  * A non-zero exit for an ``openai/*`` model whose stderr contains the
+    exact ``WebSocket closed with code 1000`` failure is marked as a known
+    retryable transport failure. The engine bounds the retries and reconciles
+    the REMOTE phase entry before relaunching; other exits are unchanged.
   * bash/edit tools run without ``--auto`` under the default agent;
     ``--auto`` is opt-in via ``options.auto_approve: true``.
   * ``opencode --version`` prints ``opencode v2.0.23``; 1.x printed the
@@ -226,6 +225,11 @@ class AgentExecutionResult:
     # like a non-zero exit (ADR 0003 §2.6). A one-shot CLI adapter sets it
     # only when the CLI exited 0 without reading the whole prompt from stdin.
     provider_failure: str | None = None
+    # A provider-neutral signal for the engine's narrow bounded retry path.
+    # Adapters set this only for a known transient failure that is safe to
+    # retry after phase-entry reconciliation; the engine does not infer
+    # retryability from provider names or error text.
+    retryable_failure: bool = False
     # A small flat mapping of scalars, bounded and redacted by the adapter,
     # that the engine writes to ``execution.json`` under this key without
     # interpreting it. Never raw protocol records or message contents.
@@ -396,10 +400,6 @@ class AgentProvider:
         """What :meth:`execute` writes to the CLI's stdin; ``None`` is ``/dev/null``."""
         return None
 
-    def environment_overrides(self, req: AgentRequest) -> dict[str, str] | None:
-        """Provider-specific environment layered over the allow-listed environment."""
-        return None
-
     def reports_activity(self, profile: ProfileConfig) -> bool:
         """Whether the CLI, launched for ``profile``, writes output while it works.
 
@@ -455,7 +455,6 @@ class AgentProvider:
                 timeout_seconds=req.max_runtime_seconds or MAX_DEADLINE_SECONDS,
                 idle_timeout_seconds=req.idle_timeout_seconds,
                 env_allowlist=self.environment_allowlist(req),
-                env=self.environment_overrides(req),
                 # Nothing an agent starts outlives its invocation (ADR 0002),
                 # including what it detached from its process group.
                 contain_orphans=True,
@@ -678,7 +677,7 @@ class OpenCodeProvider(AgentProvider):
     # routes to; a provider not listed here is added through
     # ``execution.env_allowlist_extra``.
     environment_names = ("OPENCODE_*", "OPENAI_*", "ANTHROPIC_*", "GEMINI_*", "GOOGLE_*")
-    option_keys = ("output_format", "auto_approve", "openai_transport")
+    option_keys = ("output_format", "auto_approve")
 
     def validate_profile(self, profile: ProfileConfig) -> None:
         super().validate_profile(profile)
@@ -699,42 +698,6 @@ class OpenCodeProvider(AgentProvider):
                 "CONTROL_RESULT block reaches stdout verbatim (the json event stream escapes "
                 "it and has no final result record)"
             )
-        transport = profile.options.get("openai_transport")
-        if transport is not None:
-            if transport not in ("http", "websocket"):
-                raise ConfigurationError(
-                    f"profile {profile.name!r}: opencode openai_transport must be 'http' "
-                    f"or 'websocket', got {transport!r}"
-                )
-            if profile.model.partition("/")[0] != "openai":
-                raise ConfigurationError(
-                    f"profile {profile.name!r}: opencode openai_transport only applies to "
-                    "models from the openai provider"
-                )
-
-    def environment_overrides(self, req: AgentRequest) -> dict[str, str] | None:
-        transport = req.profile.options.get("openai_transport")
-        if transport is None:
-            return None
-        return {"OPENCODE_CONFIG_CONTENT": _opencode_inline_transport_config(transport)}
-
-    def execute(self, req: AgentRequest) -> AgentExecutionResult:
-        result = super().execute(req)
-        if result.exit_code != 0 and req.profile.model.partition("/")[0] == "openai":
-            match = re.search(r"WebSocket closed with code (\d{4})\b", result.stderr)
-            if match is not None:
-                if req.profile.options.get("openai_transport") == "http":
-                    next_step = (
-                        "this profile already requests HTTP; verify OpenCode applies "
-                        "OPENCODE_CONFIG_CONTENT, then resume"
-                    )
-                else:
-                    next_step = "set this profile's options.openai_transport to 'http', then resume"
-                result.provider_failure = (
-                    "opencode: OpenAI WebSocket transport closed "
-                    f"(code {match.group(1)}); {next_step}"
-                )
-        return result
 
     def build_command_for(self, profile: ProfileConfig, prompt: str) -> list[str]:
         """The argv, without the prompt: it goes on stdin (:meth:`stdin_payload`)."""
@@ -753,41 +716,17 @@ class OpenCodeProvider(AgentProvider):
         # becomes U+FFFD rather than failing the launch.
         return encodable(req.prompt).encode("utf-8")
 
-
-def _opencode_inline_transport_config(transport: str) -> str:
-    """Merge a profile's OpenAI transport override into OpenCode's inline config.
-
-    OpenCode v2 loads ``OPENCODE_CONFIG_CONTENT`` after project and global
-    configuration. Preserve the operator's existing JSON object and override
-    only the one provider setting AutoForge owns for this invocation.
-    """
-    raw = os.environ.get("OPENCODE_CONFIG_CONTENT", "")
-    try:
-        config = json.loads(raw) if raw.strip() else {}
-    except json.JSONDecodeError:
-        raise ConfigurationError(
-            "OPENCODE_CONFIG_CONTENT must be a JSON object when a profile sets "
-            "options.openai_transport"
-        ) from None
-    if not isinstance(config, dict):
-        raise ConfigurationError(
-            "OPENCODE_CONFIG_CONTENT must be a JSON object when a profile sets "
-            "options.openai_transport"
-        )
-
-    current = config
-    path: list[str] = []
-    for key in ("providers", "openai", "settings"):
-        path.append(key)
-        child = current.setdefault(key, {})
-        if not isinstance(child, dict):
-            raise ConfigurationError(
-                "OPENCODE_CONFIG_CONTENT must use an object at "
-                f"'{'.'.join(path)}' when a profile sets options.openai_transport"
-            )
-        current = child
-    current["transport"] = transport
-    return json.dumps(config, ensure_ascii=False, separators=(",", ":"))
+    def execute(self, req: AgentRequest) -> AgentExecutionResult:
+        result = super().execute(req)
+        if (
+            not result.timed_out
+            and result.exit_code != 0
+            and req.profile.model.partition("/")[0] == "openai"
+            and re.search(r"WebSocket closed with code 1000\b", result.stderr)
+        ):
+            result.provider_failure = "opencode: OpenAI WebSocket closed with code 1000"
+            result.retryable_failure = True
+        return result
 
 
 # #186: the CLI whose argv and stdin delivery the adapter speaks. No upper bound.

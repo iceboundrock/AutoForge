@@ -58,6 +58,10 @@ High-priority coverage includes:
 
 - success
 - non-zero exit
+- the exact OpenAI OpenCode WebSocket-close signature is adapter-classified;
+  the engine retries it successfully before the three-total-attempt bound,
+  stops at the bound with the phase unchanged, and does not retry unrelated
+  failures; each relaunch re-runs REMOTE phase-entry reconciliation
 - timeout, including a same-group descendant that closed its stdio and
   ignores SIGTERM (escalated to SIGKILL, gone before `execute()` returns),
   a writer outside the group via `setsid` (the capture abandoned after the

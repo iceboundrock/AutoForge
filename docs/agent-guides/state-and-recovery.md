@@ -419,9 +419,13 @@ VerificationError
 
 Do not retry every failure blindly.
 
-Potentially transient failures may be retried with bounded retry/backoff, such as:
+Potentially transient failures may be retried only when their failure class is
+known and the retry path is bounded. Current cases include:
 
-- temporary process failure
+- an OpenCode OpenAI `WebSocket closed with code 1000` exit in a REMOTE run:
+  the provider marks only this signature retryable, the engine makes at most
+  three total launches (including the first), and it re-runs phase-entry
+  reconciliation before each automatic relaunch
 - temporary GitHub/network error
 - malformed CONTROL_RESULT correction attempt
 

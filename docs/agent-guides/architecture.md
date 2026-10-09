@@ -148,6 +148,15 @@ redacted `provider_summary` (scalars only) goes to `execution.json`. The engine 
 check. The adapter returns the text the parser reads as `stdout`, which for
 Pi is the final assistant message, never raw protocol records.
 
+An adapter may also set the provider-neutral `retryable_failure` signal when
+it recognizes a specific transient failure that is safe to retry. The REMOTE
+engine retries such a failure at most three total launches (including the
+first) and runs the phase-entry reconciliation before each relaunch; every
+launch remains separately logged, and state advances only after a validated
+result. Other provider failures, non-zero exits and all timeouts retain their
+existing failure behavior. The current adapter classification is limited to
+an OpenCode OpenAI `WebSocket closed with code 1000` exit.
+
 ### Executor
 
 The process executor owns:

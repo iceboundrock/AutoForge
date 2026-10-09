@@ -408,10 +408,14 @@ ownership or discard uncommitted user changes.
   [Workflow: re-entering a phase](agent-guides/workflow.md#re-entering-a-phase).
 - **An agent failed, timed out or returned a malformed result:** a malformed
   `CONTROL_RESULT` from an agent that exited 0 is retried with a correction
-  prompt (`execution.max_correction_attempts`, default once). A non-zero
-  exit, a timeout or a verification failure is not retried automatically and
-  leaves the phase unchanged for `resume`. Inspect the invocation under
-  `<state dir>/logs/<run-id>/`. A timeout says which limit fired; see
+  prompt (`execution.max_correction_attempts`, default once). The one
+  non-zero-exit exception is an OpenCode OpenAI run whose stderr contains the
+  exact `WebSocket closed with code 1000` signature: REMOTE runs retry it up
+  to three total launches, reconciling GitHub before each retry. If that bound
+  is exhausted, the phase remains unchanged for `resume`; other non-zero
+  exits, timeouts and verification failures are not retried automatically.
+  Inspect each invocation under `<state dir>/logs/<run-id>/`. A timeout says
+  which limit fired; see
   [Agent limits](#agent-limits) before raising one.
 - **The run is `BLOCKED`:** read `autoforge status`, fix the cause, then
   `autoforge unblock --reason "..."` and `autoforge resume` (see above).

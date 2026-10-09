@@ -52,7 +52,7 @@ from autoforge.github import (
     WorkflowRunJobs,
 )
 from autoforge.loop_guard import RESULT_NEEDS_FIX, review_record
-from autoforge.providers import AgentExecutionResult, ScriptedProvider
+from autoforge.providers import AgentExecutionResult, OpenCodeProvider, ScriptedProvider
 from autoforge.result_parser import (
     MAX_FINDING_ID_CHARS,
     MAX_FINDING_LOCATION_CHARS,
@@ -160,6 +160,19 @@ def _in_review(
     eng.state.current_merge_base_sha = eng.origin.merge_base("main", head) if origin else MERGE_BASE
     eng.state.review_round = round_done
     return eng
+
+
+def _install_opencode_responses(eng, outcomes):
+    """Use the real adapter around a sequence of fake OpenCode exits."""
+    seen = []
+
+    def runner(req):
+        seen.append(req)
+        exit_code, stdout, stderr = outcomes.pop(0)
+        return ExecutionResult(req.command, req.cwd, exit_code, stdout, stderr, "t", "t")
+
+    eng.providers._overrides["opencode"] = OpenCodeProvider(runner=runner)
+    return seen
 
 
 # -- INITIALIZING --------------------------------------------------------------
@@ -8865,6 +8878,101 @@ def test_a_provider_failure_raises_before_the_parser_and_is_journaled(tmp_state_
     assert not (step / "control-result.json").exists()
     event = json.loads((run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()[-1])
     assert event["provider_summary"] == summary
+
+
+def test_openai_websocket_disconnect_retries_and_reconciles_before_relaunch(
+    tmp_state_dir, fake_github
+):
+    eng = _in_review(tmp_state_dir, fake_github, [])
+    calls = _install_opencode_responses(
+        eng,
+        [
+            (1, "complete but rejected", "WebSocket closed with code 1000"),
+            (1, "complete but rejected", "WebSocket closed with code 1000"),
+            (0, block(review_payload(1, SHA_A, [])), ""),
+        ],
+    )
+    original_entry = eng._remote_entry
+    reconciliations = []
+
+    def counted_entry(previous, plan):
+        reconciliations.append(previous)
+        return original_entry(previous, plan)
+
+    eng._remote_entry = counted_entry
+    out = eng.step()
+
+    assert out.next_phase == "READY_FOR_MERGE"
+    assert len(calls) == 3
+    assert reconciliations == [Phase.REVIEW, Phase.REVIEW, Phase.REVIEW]
+    run_dir = eng.paths.logs_dir / eng.state.run_id
+    steps = sorted(p for p in run_dir.iterdir() if p.is_dir())
+    assert len(steps) == 3
+    assert [
+        json.loads((p / "execution.json").read_text(encoding="utf-8"))["exit_code"] for p in steps
+    ] == [
+        1,
+        1,
+        0,
+    ]
+    assert all((p / "error.txt").exists() for p in steps[:2])
+    assert (steps[2] / "control-result.json").exists()
+
+
+def test_openai_websocket_disconnect_stops_after_three_total_attempts(tmp_state_dir, fake_github):
+    eng = _in_review(tmp_state_dir, fake_github, [])
+    calls = _install_opencode_responses(
+        eng,
+        [(1, "complete but rejected", "WebSocket closed with code 1000")] * 3,
+    )
+
+    with pytest.raises(ExecutionError, match="after 3 consecutive retryable failures") as excinfo:
+        eng.step()
+
+    state = load_state(eng.paths.state_file)
+    assert state.phase == Phase.REVIEW and state.review_round == 0
+    assert state.current_pr_url == PR and state.attempt == 3 and state.step_count == 1
+    assert len(calls) == 3
+    assert "State unchanged" in str(excinfo.value) and "resume" in str(excinfo.value)
+    run_dir = eng.paths.logs_dir / state.run_id
+    steps = sorted(p for p in run_dir.iterdir() if p.is_dir())
+    assert len(steps) == 3
+    assert all("code 1000" in (p / "error.txt").read_text() for p in steps)
+    assert all(not (p / "control-result.json").exists() for p in steps)
+
+
+def test_openai_websocket_retry_does_not_consume_control_result_correction(
+    tmp_state_dir, fake_github
+):
+    eng = _in_review(tmp_state_dir, fake_github, [])
+    eng.config.execution.max_correction_attempts = 1
+    calls = _install_opencode_responses(
+        eng,
+        [
+            (1, "", "WebSocket closed with code 1000"),
+            (0, "not a control result", ""),
+            (0, block(review_payload(1, SHA_A, [])), ""),
+        ],
+    )
+
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    assert len(calls) == 3
+    run_dir = eng.paths.logs_dir / eng.state.run_id
+    steps = sorted(p for p in run_dir.iterdir() if p.is_dir())
+    requests = [json.loads((p / "request.json").read_text()) for p in steps]
+    assert [request["correction"] for request in requests] == [False, False, True]
+
+
+def test_unrelated_opencode_failure_is_not_retried(tmp_state_dir, fake_github):
+    eng = _in_review(tmp_state_dir, fake_github, [])
+    calls = _install_opencode_responses(eng, [(1, "", "WebSocket closed with code 1006")])
+
+    with pytest.raises(ExecutionError, match="exited 1"):
+        eng.step()
+
+    state = load_state(eng.paths.state_file)
+    assert state.phase == Phase.REVIEW and state.attempt == 1
+    assert len(calls) == 1
 
 
 def test_a_timeout_wins_over_a_provider_failure(tmp_state_dir, fake_github):

@@ -87,8 +87,11 @@ Safety rules:
 - READY_FOR_MERGE is a holding state. MERGE requires BOTH
   ``safety.allow_merge=true`` in config AND ``--allow-merge`` on the CLI.
 - Business failures (agent reports failure/blocked, verification mismatch,
-  ambiguous recovery) never trigger blind retries. Only a malformed
-  CONTROL_RESULT with exit code 0 gets a bounded correction attempt.
+  ambiguous recovery) never trigger blind retries. A provider may classify a
+  known transient failure for a bounded REMOTE retry; the current case is an
+  OpenAI OpenCode WebSocket close with code 1000, limited to three total
+  attempts and reconciled with GitHub before each relaunch. A malformed
+  CONTROL_RESULT with exit code 0 keeps its separate bounded correction path.
 """
 
 from __future__ import annotations
@@ -378,6 +381,11 @@ FIX_BOUND_VARIABLES: dict[str, str | int | None] = {
 # Without it, a phase that can never be verified would be re-invoked by every
 # ``resume`` forever.
 MAX_LOCAL_PHASE_ATTEMPTS = 3
+
+# Total consecutive launches for an adapter-classified transient failure,
+# including the initial launch. This retry is REMOTE-only; LOCAL has its own
+# durable launch checkpoint and workspace-verification boundary.
+MAX_RETRYABLE_AGENT_ATTEMPTS = 3
 
 
 MERGE_GATE_MESSAGE = (
@@ -7413,12 +7421,13 @@ class ControllerEngine:
         """Launch the phase's agent, correcting a malformed result within bound.
 
         ``reconcile`` is the phase-entry reconciliation (:meth:`_remote_entry`)
-        and is called before every correction relaunch: the agent that
-        returned the malformed result may already have done the phase's
-        GitHub work, and the relaunch must see it exactly as ``resume``
-        would. An outcome from it resolves the phase without relaunching and
-        is returned in place of a payload. A LOCAL run passes none: its
-        write phases are judged against the durable launch checkpoint and
+        and is called before every correction relaunch and every automatic
+        retry of an adapter-classified transient failure: the agent may
+        already have done the phase's GitHub work, and the relaunch must see
+        it exactly as ``resume`` would. An outcome from reconciliation
+        resolves the phase without relaunching and is returned in place of a
+        payload. A LOCAL run passes none and does not use the automatic retry:
+        its write phases are judged against the durable launch checkpoint and
         its review verification refuses a tree the reviewer changed.
         """
         state = self._require_state()
@@ -7448,15 +7457,19 @@ class ControllerEngine:
         # capability it goes through.
         logger = self._logger()
         correction_error: str | None = None
+        retry_reconcile = False
         attempt = 0
+        corrections_used = 0
+        retryable_attempts = 0
         while True:
-            if correction_error is not None and reconcile is not None:
-                # The malformed attempt is a launch that returned; whatever it
-                # wrote to GitHub is reconciled before anything is launched
-                # again, and the prompt below is rendered from that.
+            if (correction_error is not None or retry_reconcile) and reconcile is not None:
+                # A failed or malformed launch may already have done GitHub
+                # work. Reconcile before every relaunch, whether it is a
+                # correction or the narrowly classified transient retry.
                 resolved = reconcile()
                 if resolved is not None:
                     return resolved
+            retry_reconcile = False
             # Which UPDATE_EPIC result this launch asks for (ADR 0004 D4.7):
             # decided by the entry above, and the schema its result is held to.
             request = (
@@ -7583,6 +7596,28 @@ class ControllerEngine:
                 # before it because the reason says more (ADR 0003 §2.6).
                 record.error = _with_leftovers(result.provider_failure, result.leftovers)
                 self._record_invocation(logger, record, prompt, stdout, stderr, phase, step_log)
+                # The adapter's neutral signal is the only retry authority;
+                # generic non-zero exits and provider failures remain fatal.
+                if (
+                    result.retryable_failure
+                    and state.mode == WorkflowMode.REMOTE
+                    and reconcile is not None
+                ):
+                    retryable_attempts += 1
+                    if retryable_attempts < MAX_RETRYABLE_AGENT_ATTEMPTS:
+                        retry_reconcile = True
+                        continue
+                    raise ExecutionError(
+                        _with_leftovers(
+                            f"agent '{profile.name}' failed after {retryable_attempts} "
+                            "consecutive retryable failures "
+                            f"(limit {MAX_RETRYABLE_AGENT_ATTEMPTS} total attempts): "
+                            f"{result.provider_failure}",
+                            result.leftovers,
+                        )
+                        + ". State unchanged — inspect the invocation logs and real GitHub "
+                        "state, then run 'resume' when ready."
+                    )
                 raise ExecutionError(
                     _with_leftovers(
                         f"agent '{profile.name}' failed: {result.provider_failure}",
@@ -7601,6 +7636,7 @@ class ControllerEngine:
                     + f". stderr tail: {stderr[-2000:]} "
                     "State unchanged — inspect logs, then 'resume'."
                 )
+            retryable_attempts = 0
             try:
                 # Only the tail of a truncated stdout is searched: the block
                 # is the last thing the agent writes, so the kept tail holds
@@ -7661,11 +7697,12 @@ class ControllerEngine:
                     )
                 record.error = f"{type(exc).__name__}: {detail}"
                 self._record_invocation(logger, record, prompt, stdout, stderr, phase, step_log)
-                if attempt <= max_corrections:
+                if corrections_used < max_corrections:
                     # A correction re-launches the same write-capable agent;
                     # the top of the loop charges it against the same durable
                     # bound as the launch that preceded it, or refuses.
                     correction_error = f"{type(exc).__name__}: {detail}"
+                    corrections_used += 1
                     continue
                 raise ControlResultValidationError(
                     f"agent '{profile.name}' did not return a valid CONTROL_RESULT after "

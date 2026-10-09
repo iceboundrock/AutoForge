@@ -305,6 +305,14 @@ result block is reconciled with, not relaunched unaware. The table of what each 
 re-entry does is complete by construction: every phase with an agent prompt
 has an entry, and a test holds the two tables together.
 
+One narrowly classified transport failure is retried inside the current
+REMOTE step: an OpenCode OpenAI invocation that exits with
+`WebSocket closed with code 1000`. The initial launch counts toward the limit
+of three total attempts. Before each automatic relaunch, the same phase-entry
+reconciliation runs; each attempt is logged, and exhausting the bound leaves
+the workflow phase unchanged for an operator-directed `resume`. Other failed
+exits and LOCAL invocations are not automatically retried.
+
 Every probe below and the read-back after the agent consume one identity
 model, `src/autoforge/claims.py`: one exact-schema decoder per marker kind,
 one renderer, one scan that classifies *every* marker it meets, and
