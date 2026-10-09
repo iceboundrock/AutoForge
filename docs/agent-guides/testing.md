@@ -260,6 +260,31 @@ High-priority coverage includes:
   recorded resolutions; Pi reaches the same outcome as the scripted
   provider; a dry run, with or without a saved plan, reads, fetches,
   launches and writes nothing
+- `REPLAN_REEXECUTE`'s publication (#164, `tests/test_replan.py`, "The
+  controller publishes the replacement"): the replan agent commits on the
+  base its prompt names and publishes nothing, and the controller pushes
+  the commit to the branch derived from the transaction id and creates the
+  replacement PR, its body the agent's text followed by the controller's
+  closing block, implementation marker and transaction marker attesting
+  the result's counts; a marker in the agent's body, a commit message
+  closing another issue, a `HEAD` attached to a local branch and a
+  malformed result are corrections with nothing pushed or created; claim
+  mismatches, failed tests, a `head_sha` other than the worktree's `HEAD`,
+  a candidate that is the base or does not descend from it are rejections
+  with nothing pushed or created; a PR the agent opens itself is never the
+  replacement, and a PR carrying the transaction's marker at `PREPARED`
+  with no saved plan is refused, except on the D13.3 / D13.8 legacy re-entry,
+  which binds it; a replacement branch that exists before the launch or
+  appears while the agent ran rejects with nothing sent, one moved between
+  the push and the create creates no PR, and one moved after the create is
+  never bound; a crash after the plan is saved completes it on `resume`
+  without the agent, a create lost in flight is reconciled and issued once
+  more, a create that landed before the crash is observed and not
+  repeated, and a replacement a human closed after the crash is never
+  bound; a crash after the agent ran relaunches it on the recorded base; a
+  provider failure publishes nothing and the relaunch is published; Pi
+  reaches the same outcome as the scripted provider; a dry run over a
+  saved plan sends nothing and launches no agent
 
 ### Recovery
 
@@ -379,8 +404,9 @@ is scripted with the same handlers `ScriptedProvider` takes. Keep covered:
   child's `--model` / `--thinking` is that of the routed profile, its cwd
   is the per-issue worktree; and the mixed configurations (Claude Code
   writers with Pi reviewers, and the reverse)
-- REPLAN_REEXECUTE on Pi: the same transaction, markers, close and
-  activation; a replacement PR the fake GitHub lacks is refused identically
+- REPLAN_REEXECUTE on Pi: the same transaction, controller-published
+  replacement, markers, close and activation; a `head_sha` the worktree's
+  `HEAD` does not back is refused identically
 - a Pi claim the fake GitHub does not back fails with the same error and
   state as the same claim from `ScriptedProvider`
 - LOCAL on Pi: cwd is the repository root, no GitHub access, LOCAL prompts

@@ -67,6 +67,7 @@ from autoforge.effects import (
     EffectRecord,
     EntryObservation,
     FixContext,
+    ReplanContext,
     Stage,
     compose_append,
     follow_up_issue_body,
@@ -76,6 +77,7 @@ from autoforge.effects import (
     payload_chars,
     plan_size_problem,
     progress_comment_body,
+    replacement_pr_body,
     sha256_text,
 )
 from autoforge.errors import (
@@ -135,6 +137,7 @@ REVIEW_PAYLOAD: dict[str, object] = {
 }
 REVIEW_MARKER = REVIEW.render(REVIEW_PAYLOAD)
 REPLAN_MARKER = render_marker(ReplanAttestation(TXN, 1, 2, 1, True))
+FAILED_REPLAN_MARKER = render_marker(ReplanAttestation(TXN, 1, 2, 1, False))
 ADOPT_BASE = "A human's PR.\n\nIt adds the transaction filter."
 APPEND_BASE = "An older follow-up issue.\n\nStill open."
 
@@ -273,7 +276,7 @@ def replacement_record(
         precondition={"absent": True, "watermark": watermark},
         payload={
             "title": "Replace PR #42 for #2",
-            "body": f"Replaces {PR} for {ISSUE}.\n\nCloses #2\n\n{REPLAN_MARKER}",
+            "body": replacement_pr_body(f"Replaces {PR} for {ISSUE}.", ISSUE, REPLAN_MARKER),
         },
     )
 
@@ -1183,7 +1186,7 @@ CORRUPTIONS = [
         "k7-body-without-marker",
         REPLACE,
         at("payload.body", "Replacement."),
-        "does not carry its transaction marker",
+        "does not end with its identity's marker",
     ),
     _p(
         "k7-marker-malformed",
@@ -1192,6 +1195,55 @@ CORRUPTIONS = [
         "exactly one well-formed replan transaction marker",
     ),
     _p("k7-watermark-type", REPLACE, at("precondition.watermark", "42"), "must be an integer"),
+    # K7's text (#164): the controller renders the closing block and the
+    # marker after the agent's text, and the text gets the parser's rules.
+    _p(
+        "k7-no-closing-line",
+        REPLACE,
+        at("payload.body", f"Replacement.\n\n{REPLAN_MARKER}"),
+        "not its text, the closing block of its owner's issue and its transaction marker",
+    ),
+    _p(
+        "k7-closes-another-issue",
+        REPLACE,
+        at(
+            "payload.body",
+            f"Replacement.\n\nCloses #3\n\n{render_implementation_marker(ISSUE3)}"
+            f"\n\n{REPLAN_MARKER}",
+        ),
+        "not its text, the closing block of its owner's issue and its transaction marker",
+    ),
+    _p(
+        "k7-marker-attests-failed-tests",
+        REPLACE,
+        both(
+            at("identity.transaction_marker", FAILED_REPLAN_MARKER),
+            at("payload.body", replacement_pr_body("Replacement.", ISSUE, FAILED_REPLAN_MARKER)),
+        ),
+        "attesting failed tests",
+    ),
+    _p(
+        "k7-text-closes-an-issue",
+        REPLACE,
+        at("payload.body", replacement_pr_body("Fixes #9 too.", ISSUE, REPLAN_MARKER)),
+        "has an invalid PR body",
+    ),
+    _p(
+        "k7-text-carries-a-marker",
+        REPLACE,
+        at(
+            "payload.body",
+            replacement_pr_body(f"Replacement.\n\n{OTHER_IMPL_MARKER}", ISSUE, REPLAN_MARKER),
+        ),
+        "has an invalid PR body",
+    ),
+    _p("k7-title-credential", REPLACE, at("payload.title", CREDENTIAL_TEXT), "redaction-invariant"),
+    _p(
+        "k7-observed-in-another-repository",
+        REPLACE,
+        observed_as({"url": "https://github.com/owner/other/pull/43", "number": 43}),
+        "observed in another repository",
+    ),
     # K4: the marker names a revision, not a PR; the PR is where the comment is posted.
     _p("k4-pr-mismatch", REVIEWED, at("identity.pr_url", PR43), "PR that differs"),
     _p(
@@ -1648,6 +1700,148 @@ def test_an_analyze_context_the_entry_does_not_explain_fails_loudly(records, obs
         records = [analyze_push().to_dict(), impl_record().to_dict()]
     with pytest.raises(StateError, match=match):
         load_phase_effects(records, observation, AnalyzeContext(ISSUE).to_dict(), ANALYZE_BINDING)
+
+
+REPLAN_BINDING = Binding(RUN_ID, Phase.REPLAN_REEXECUTE, ISSUE, PR, 1, TXN)
+REPLAN_REF = f"refs/heads/{REPLACEMENT_BRANCH}"
+REPLAN_CONTEXT = ReplanContext(ISSUE, PR, TXN, 2, 1)
+
+
+def replan_observation(
+    head: str | None = None,
+    base: str | None = SHA_C,
+    ref: str = REPLAN_REF,
+    *,
+    default_refs: dict | None = None,
+):
+    """The REPLAN_REEXECUTE entry read (#164): the derived branch absent, the base."""
+    default = {"refs/heads/main": base} if default_refs is None else default_refs
+    return {
+        "phase": "REPLAN_REEXECUTE",
+        "issue_url": ISSUE,
+        "pr_url": PR,
+        "refs": {ref: head, **default},
+        "base_sha": base,
+        "objects": {},
+    }
+
+
+def replan_push(**kw: Any) -> EffectRecord:
+    return push_record(
+        **{"expected_old": None, "branch": REPLACEMENT_BRANCH, "by": REPLAN_OWNER, **kw}
+    )
+
+
+def replan_plan() -> list[dict]:
+    return [replan_push().to_dict(), replacement_record().to_dict()]
+
+
+def test_a_replan_context_loads_with_its_push_and_replacement_pr_plan():
+    """#164: the context, the push of the candidate then the replacement PR create,
+    and the entry observation that read the derived branch absent, load."""
+    effects = load_phase_effects(
+        replan_plan(), replan_observation(), REPLAN_CONTEXT.to_dict(), REPLAN_BINDING
+    )
+    assert [r.kind for r in effects.records] == [EffectKind.PUSH, EffectKind.REPLACEMENT_PR]
+    assert effects.context == REPLAN_CONTEXT
+
+
+@pytest.mark.parametrize(
+    ("records", "observation", "context", "match"),
+    [
+        pytest.param([], None, None, "a push then the replacement PR", id="no-plan"),
+        pytest.param(
+            [replan_push().to_dict()], None, None, "a push then the replacement PR", id="push-only"
+        ),
+        pytest.param(
+            [replacement_record(position=0).to_dict()],
+            None,
+            None,
+            "a push then the replacement PR",
+            id="pr-only",
+        ),
+        pytest.param(None, {}, None, "with the entry observation", id="no-observation"),
+        pytest.param(
+            None,
+            replan_observation(ref="refs/heads/elsewhere"),
+            None,
+            "a ref the entry observation did not read as absent",
+            id="unobserved-ref",
+        ),
+        pytest.param(
+            None,
+            replan_observation(head=SHA_A),
+            None,
+            "a ref the entry observation did not read as absent",
+            id="branch-observed-present",
+        ),
+        pytest.param(
+            [replan_push(expected_old=SHA_A).to_dict(), replacement_record().to_dict()],
+            None,
+            None,
+            "compared against absent",
+            id="push-over-a-head",
+        ),
+        pytest.param(
+            None, replan_observation(base=SHA_A), None, "another base than the entry", id="base"
+        ),
+        pytest.param(
+            [replan_push().to_dict(), replacement_record(head="autoforge/2-other").to_dict()],
+            None,
+            None,
+            "from another branch than the one it pushes",
+            id="pr-from-another-branch",
+        ),
+        pytest.param(
+            None,
+            replan_observation(default_refs={}),
+            None,
+            "onto another branch than the default branch the entry read",
+            id="default-branch-not-observed",
+        ),
+        pytest.param(
+            None,
+            replan_observation(default_refs={"refs/heads/main": SHA_B}),
+            None,
+            "onto another branch than the default branch the entry read",
+            id="default-branch-at-another-head",
+        ),
+        pytest.param(
+            None,
+            None,
+            replace(REPLAN_CONTEXT, historical_findings_considered=3),
+            "a transaction marker that attests other counts",
+            id="other-findings-count",
+        ),
+        pytest.param(
+            None,
+            None,
+            replace(REPLAN_CONTEXT, unique_failure_constraints=2),
+            "a transaction marker that attests other counts",
+            id="other-unique-count",
+        ),
+        pytest.param(
+            None,
+            None,
+            replace(REPLAN_CONTEXT, unique_failure_constraints=3),
+            "more unique constraints than findings considered",
+            id="more-constraints-than-findings",
+        ),
+    ],
+)
+def test_a_replan_context_the_entry_does_not_explain_fails_loudly(
+    records, observation, context, match
+):
+    """#164: a replan plan no entry read explains is never driven: the derived
+    branch was read absent at the recorded base, the PR goes from it onto the
+    default branch, and the marker attests the counts the context records."""
+    with pytest.raises(StateError, match=match):
+        load_phase_effects(
+            replan_plan() if records is None else records,
+            replan_observation() if observation is None else observation,
+            (REPLAN_CONTEXT if context is None else context).to_dict(),
+            REPLAN_BINDING,
+        )
 
 
 @pytest.mark.parametrize(

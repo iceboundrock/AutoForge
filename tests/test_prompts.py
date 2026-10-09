@@ -300,12 +300,32 @@ def test_replan_prompt_contract():
         "{{HISTORICAL_FINDING_COUNT}}",
         "Do not run `gh pr close`",
         "~~~~untrusted",
-        # The replacement is the issue's implementation PR: it carries the
-        # same marker ANALYZE_EXECUTE adopts, or no later entry could find it.
-        "{{IMPLEMENTATION_MARKER}}",
-        "the replacement PR body\ncarries both",
+        # #164: the agent commits on a detached HEAD from the recorded base and
+        # hands over the PR text; the controller pushes and creates the PR.
+        "`git checkout --detach {{BASE_SHA}}`",
+        "stay on the detached `HEAD`",
+        "`{{REPLACEMENT_BRANCH}}`",
+        "You publish nothing.",
+        "no `gh pr create`",
+        "Do not fetch, pull or push",
+        '"head_sha"',
+        '"pr_title"',
+        '"pr_body"',
+        "{{MAX_PR_TITLE_CHARS}}",
+        "{{MAX_PR_BODY_CHARS}}",
+        "## What published text may contain",
     ):
         assert phrase in text, phrase
+    # The controller renders both markers and the closing line itself, so the
+    # prompt names neither a marker to copy nor a replacement field to report.
+    for forbidden in (
+        "{{IMPLEMENTATION_MARKER}}",
+        "{{REPLAN_MARKER}}",
+        'replacement_pr_url"',
+        "replacement_head_sha",
+        "Create a NEW branch",
+    ):
+        assert forbidden not in text, forbidden
 
 
 def test_replan_prompt_forbids_agent_owned_close_and_local_cleanup():

@@ -101,7 +101,9 @@ A REMOTE run also records the effect state of the current phase entry (ADR
   not read, which is never taken for "no PR", and a stored `prs` that is
   empty, over its bound, or names a ref the observation did not read is
   refused. The `ANALYZE_EXECUTE` observation also records the default
-  branch it read, as a ref at the base.
+  branch it read, as a ref at the base. The `REPLAN_REEXECUTE` observation
+  (#164) records the derived replacement branch as absent and the
+  transaction's default branch at the base the replan agent builds on.
 - `completion_context`: what the phase needs to finish without relaunching
   its agent once its result is accepted (D4.6). For `UPDATE_EPIC` this is
   the roadmap section, the validated selection, the digests of the EPIC body
@@ -114,7 +116,10 @@ A REMOTE run also records the effect state of the current phase entry (ADR
   position of the `follow_up_issue` or `follow_up_append` record that
   records the deferral). The plan holds the creates first, then the
   appends, then the `push` of the candidate, last, when the fixer
-  committed.
+  committed. For `REPLAN_REEXECUTE` (#164) it is the transaction id and
+  the two counts the replacement's transaction marker attests; the plan is
+  the `push` of the candidate to the derived replacement branch, then the
+  `replacement_pr` from it.
 - `launch_label` (D13.3): whether the current entry's launches ran under the
   agent-publishes or the controller-publishes contract of its phase.
 
@@ -145,7 +150,13 @@ an `implementation_pr` follows an observation of no open PR there and is
 onto the default branch the observation records at the base; an
 `adopt_pr` targets the very PR the observation recorded there. Anything
 else is refused, so a plan whose push or PR no entry read explains is
-never completed. Text the recovery path
+never completed. A `REPLAN_REEXECUTE` completion context is held to the
+same rule: it loads only for the state's transaction, with its plan of
+exactly two records, the `push` of a ref the entry observation read as
+absent (expected old head absent) for a candidate checked against the
+base the entry read, then the `replacement_pr` from that ref onto the
+default branch the observation records at the base, its transaction
+marker attesting the counts the context saves. Text the recovery path
 publishes with no agent result in between is validated again under the
 parser's rules for its field, not only for its bounds and redaction
 invariance: the `UPDATE_EPIC` roadmap section in the
@@ -156,7 +167,9 @@ agent's part of the body of an `implementation_pr` record
 sections of a `REVIEW` completion context (`check_published_finding`,
 `validate_review_section`), and the title and the fixer's part of the body
 of a `follow_up_issue` record (`validate_follow_up_title`,
-`validate_follow_up_body`), in the stripped form the parser returns. A
+`validate_follow_up_body`), and the title and the agent's part of the body
+of a `replacement_pr` record (`validate_pr_title`, `validate_pr_body`), in
+the stripped form the parser returns. A
 `FIX` completion context loads only for the round being fixed, with
 exactly one resolution per open finding, and each deferred finding has
 exactly one source the plan and the entry observation explain: a finding
@@ -168,7 +181,10 @@ controller renders: a `follow_up_issue` body is the fixer's text, the
 controller's reference to the PR and finding and the finding's marker, in
 the repository of its owner's PR; an `implementation_pr` body ends in a blank line and
 the closing block of its owner's issue (`Closes #n`, a blank line, the
-implementation marker), an `adopt_pr` block is that closing block, both
+implementation marker), a `replacement_pr` body is the agent's text, that
+closing block and the transaction marker, each after a blank line
+(`replacement_pr_body`), and the marker attests passed tests, an
+`adopt_pr` block is that closing block, both
 PRs are in the issue's repository, the one `Closes #n` names, and a
 `review_comment` body is byte-for-byte the comment `review_comment_body`
 renders from the `REVIEW` context saved with it, at the HEAD, base and
@@ -252,7 +268,7 @@ Examples:
 
 Resume logic must inspect actual Git/GitHub state before repeating destructive or duplicative actions.
 
-A controller effect (ADR 0004) is resumed from its record and never re-sent blind. Every crash window has one answer: a crash before the intent is saved means nothing happened and the step re-runs; an `intended` or `attempted` record is reconciled by its identity before anything is sent, so a write that landed before the save is adopted as `observed` (no second write) and one that did not is issued again within the attempt bound; an object that a human created or changed between the intent and the write, a conflicting identity, or two marker-bearing objects make the record `conflict` (`BLOCKED`, naming the object); an exhausted bound is `BLOCKED` naming the record and the manual step; and a transient GitHub failure during reconciliation leaves the state unchanged for `resume`. A phase whose effect landed finishes from its completion context without relaunching its agent. `FIX` (#163) is the case with the most windows, and each has one outcome: a crash before the plan is saved sent nothing, so `resume` launches the fixer again, against the entry observation saved before the first launch (a follow-up issue found later that it does not explain blocks); a crash after the plan is saved, at any stage of any create, append or push, completes the plan from the journal without relaunching the fixer, each record adopted or issued at most once in plan order; a PR head at the planned candidate is the controller's own push and never takes a `REVIEW` detour; and a head that is neither the reviewed HEAD nor the candidate is someone else's push (`FIX -> REVIEW`, the plan dropped, no fix recorded). The journal never stands in for GitHub on replay: before the completion sends anything it re-reads the PR's base and merge base (moved: the same `REVIEW` route, findings carried), its head repository and branch (no longer the plan's target: `BLOCKED`), and the open issues against every resolution, including follow-ups already journaled as `observed` (closed, unmarked, duplicated, or a marker the controller did not write: `BLOCKED`). The run log's `events.jsonl` is never read by any recovery path.
+A controller effect (ADR 0004) is resumed from its record and never re-sent blind. Every crash window has one answer: a crash before the intent is saved means nothing happened and the step re-runs; an `intended` or `attempted` record is reconciled by its identity before anything is sent, so a write that landed before the save is adopted as `observed` (no second write) and one that did not is issued again within the attempt bound; an object that a human created or changed between the intent and the write, a conflicting identity, or two marker-bearing objects make the record `conflict` (`BLOCKED`, naming the object); an exhausted bound is `BLOCKED` naming the record and the manual step; and a transient GitHub failure during reconciliation leaves the state unchanged for `resume`. A phase whose effect landed finishes from its completion context without relaunching its agent. `FIX` (#163) is the case with the most windows, and each has one outcome: a crash before the plan is saved sent nothing, so `resume` launches the fixer again, against the entry observation saved before the first launch (a follow-up issue found later that it does not explain blocks); a crash after the plan is saved, at any stage of any create, append or push, completes the plan from the journal without relaunching the fixer, each record adopted or issued at most once in plan order; a PR head at the planned candidate is the controller's own push and never takes a `REVIEW` detour; and a head that is neither the reviewed HEAD nor the candidate is someone else's push (`FIX -> REVIEW`, the plan dropped, no fix recorded). `REPLAN_REEXECUTE` (#164) has the same split: a crash before its push and PR plan is saved sent nothing, so `resume` launches the replan agent again on the base the entry observation recorded (a replacement branch, or a PR carrying the transaction's marker, found later is not the controller's and rejects the transaction); a crash after it, before the push, between the push and the PR or after the PR was created, completes the plan without relaunching the agent, and the PR is created only while the derived branch still holds the pushed candidate. The journal never stands in for GitHub on replay: before the completion sends anything it re-reads the PR's base and merge base (moved: the same `REVIEW` route, findings carried), its head repository and branch (no longer the plan's target: `BLOCKED`), and the open issues against every resolution, including follow-ups already journaled as `observed` (closed, unmarked, duplicated, or a marker the controller did not write: `BLOCKED`). The run log's `events.jsonl` is never read by any recovery path.
 
 If recovery cannot determine the safe state with sufficient confidence, enter `BLOCKED` rather than guessing.
 

@@ -29,10 +29,12 @@ from autoforge.effects import (
     follow_up_issue_body,
     payload_chars,
     progress_comment_body,
+    replacement_pr_body,
     review_comment_body,
     sha256_text,
 )
 from autoforge.errors import StateError
+from autoforge.replan_txn import ReplanAttestation, render_marker
 from autoforge.result_parser import Finding, ReviewResult
 from autoforge.state import AutoForgeState, StatePaths, load_state, save_state
 from autoforge.transitions import Phase, WorkflowMode
@@ -1842,11 +1844,13 @@ def _review_state(**kw):
     return make_state(**base)
 
 
-REPLAN_REF = "refs/heads/autoforge/2-replan"
+REPLAN_BRANCH = f"autoforge/2-replan-{EFFECT_TXN}"
+REPLAN_REF = f"refs/heads/{REPLAN_BRANCH}"
 
 
 def _replan_state(**kw):
-    """A REPLAN_REEXECUTE entry: a K1 push owned by the transaction, and the K7 counts."""
+    """A REPLAN_REEXECUTE entry (#164): the K1 push of the candidate and the K7
+    replacement PR, both owned by the transaction, and the counts its marker attests."""
     push = EffectRecord.plan(
         0,
         EffectKind.PUSH,
@@ -1855,6 +1859,23 @@ def _replan_state(**kw):
         target={"repository": "owner/repo", "ref": REPLAN_REF},
         precondition={"expected_old": None, "base_sha": BASE_SHA},
         payload={"sha": CANDIDATE_SHA},
+    )
+    marker = render_marker(ReplanAttestation(EFFECT_TXN, 1, 3, 2, True))
+    create = EffectRecord.plan(
+        1,
+        EffectKind.REPLACEMENT_PR,
+        _owner(Phase.REPLAN_REEXECUTE, txn=EFFECT_TXN),
+        identity={
+            "repository": "owner/repo",
+            "transaction_marker": marker,
+            "head_branch": REPLAN_BRANCH,
+        },
+        target={"repository": "owner/repo", "base": "main", "head": REPLAN_BRANCH},
+        precondition={"absent": True, "watermark": 42},
+        payload={
+            "title": "Reimplement issue #2",
+            "body": replacement_pr_body("A fresh reimplementation.", EFFECT_ISSUE, marker),
+        },
     )
     context = ReplanContext(
         issue_url=EFFECT_ISSUE,
@@ -1868,10 +1889,12 @@ def _replan_state(**kw):
         current_pr_url=PR42,
         replan_transaction={"transaction_id": EFFECT_TXN},
         attempt=1,
-        launch_label=LABEL_AGENT_PUBLISHES,
-        effect_records=[push.to_dict()],
+        launch_label=LABEL_CONTROLLER_PUBLISHES,
+        effect_records=[push.to_dict(), create.to_dict()],
         entry_observation=_observation(
-            Phase.REPLAN_REEXECUTE, refs={REPLAN_REF: None}, base_sha=BASE_SHA
+            Phase.REPLAN_REEXECUTE,
+            refs={REPLAN_REF: None, "refs/heads/main": BASE_SHA},
+            base_sha=BASE_SHA,
         ),
         completion_context=context.to_dict(),
     )
@@ -1979,8 +2002,8 @@ def test_a_fix_plan_in_every_stage_round_trips_with_its_completion_context(tmp_p
 def test_review_and_replan_completion_contexts_round_trip_bound_to_their_state(tmp_path):
     """D4.6: the REVIEW context (round, needs_fix_round, findings) with the one
     review comment (K4) its marker binds (#162), and the REPLAN_REEXECUTE
-    context and push record (bound to the state's replan transaction id),
-    round-trip."""
+    context with its push and replacement PR records (bound to the state's
+    replan transaction id, #164), round-trip."""
     for name, s in (("review", _review_state()), ("replan", _replan_state())):
         p = tmp_path / f"{name}.json"
         save_state(s, p)
@@ -1994,7 +2017,8 @@ def test_review_and_replan_completion_contexts_round_trip_bound_to_their_state(t
     assert [r.kind for r in review.records] == [EffectKind.REVIEW_COMMENT]
     assert review.context == _review_context() and review.context.round == 1
     replan = load_state(tmp_path / "replan.json").phase_effects()
-    assert replan.records[0].owner.transaction_id == EFFECT_TXN
+    assert [r.kind for r in replan.records] == [EffectKind.PUSH, EffectKind.REPLACEMENT_PR]
+    assert {r.owner.transaction_id for r in replan.records} == {EFFECT_TXN}
     assert replan.context.transaction_id == EFFECT_TXN
 
 
@@ -3145,7 +3169,8 @@ def test_a_legacy_remote_resume_is_labelled_by_the_contract_it_launched_under(
     ``agent_publishes``; before a launch, or outside a publishing phase, it gets
     no label. The label survives the save that relabels the file. A legacy
     re-entry is one into a phase the controller now publishes for: UPDATE_EPIC
-    (#160), ANALYZE_EXECUTE (#161), REVIEW (#162) and FIX (#163)."""
+    (#160), ANALYZE_EXECUTE (#161), REVIEW (#162), FIX (#163) and
+    REPLAN_REEXECUTE (#164)."""
     from autoforge.effects import is_legacy_reentry
 
     p = _write(
@@ -3156,7 +3181,14 @@ def test_a_legacy_remote_resume_is_labelled_by_the_contract_it_launched_under(
     assert loaded.launch_label == label
     assert loaded.phase_effects().empty
     assert is_legacy_reentry(loaded.phase, loaded.attempt, loaded.launch_label) == (
-        phase in (Phase.ANALYZE_EXECUTE, Phase.REVIEW, Phase.FIX, Phase.UPDATE_EPIC)
+        phase
+        in (
+            Phase.ANALYZE_EXECUTE,
+            Phase.REVIEW,
+            Phase.FIX,
+            Phase.REPLAN_REEXECUTE,
+            Phase.UPDATE_EPIC,
+        )
         and attempt >= 1
     )
     save_state(loaded, p)

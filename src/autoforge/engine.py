@@ -148,6 +148,7 @@ from .effects import (
     EffectRecord,
     EntryObservation,
     FixContext,
+    ReplanContext,
     ReviewContext,
     Stage,
     UpdateEpicContext,
@@ -158,6 +159,7 @@ from .effects import (
     launch_label_for,
     plan_size_problem,
     progress_comment_body,
+    replacement_pr_body,
     review_comment_body,
     review_comment_problem,
     sha256_text,
@@ -256,6 +258,7 @@ from .replan_txn import (
     may_invoke_agent,
     new_transaction_id,
     render_close_receipt,
+    replacement_branch_for,
     select_bound_candidate,
     verify_attestation,
     verify_close_never_ran,
@@ -596,6 +599,24 @@ class _AnalyzeEntry:
     adopt_url: str = ""
 
 
+@dataclass(frozen=True)
+class _ReplanEntry:
+    """What a REPLAN_REEXECUTE launch entry read before the launch (#164).
+
+    ``branch`` is the replacement branch the controller derived from the
+    issue and ``transaction_id`` (absent when read), and ``base_sha`` the
+    head of the transaction's verified default branch, which the candidate
+    must descend from and differ from. In memory only: the entry
+    observation persists both, so a relaunch of the same entry builds on
+    the same base and a branch or PR the observation does not explain is
+    refused (ADR 0004 D9.8).
+    """
+
+    transaction_id: str
+    branch: str
+    base_sha: str
+
+
 @dataclass
 class UnblockOutcome:
     """Result of :meth:`ControllerEngine.unblock` for the CLI."""
@@ -709,6 +730,12 @@ class ControllerEngine:
         # entry, never trusted across one.
         self._analyze_entry: _AnalyzeEntry | None = None
         self._analyze_candidate = ""
+        # The same for REPLAN_REEXECUTE (see :meth:`_replan_launch_entry`):
+        # the entry's reads, the candidate the result check read from the
+        # worktree, and the reason it rejected the result, if it did.
+        self._replan_entry: _ReplanEntry | None = None
+        self._replan_candidate = ""
+        self._replan_rejection = ""
         self._workspace: LocalWorkspace | None = None
         # The per-issue agent worktree paths already derived (a git read
         # each), keyed by the worktree's name; see :meth:`agent_worktree_path`.
@@ -1641,12 +1668,34 @@ class ControllerEngine:
                     "HISTORICAL_VERIFICATION_FAILURES": txn.rendered_verification_failures
                     or pending,
                     "REPLAN_TRANSACTION_ID": txn.transaction_id or "(generated at execution)",
-                    "REPLAN_MARKER": (
-                        txn.marker_example() if txn.transaction_id else "(generated at execution)"
-                    ),
+                    **self._replan_publication_variables(txn),
                 }
             )
         return variables
+
+    def _replan_publication_variables(self, txn: ReplanTransaction) -> dict[str, str | int | None]:
+        """The replacement's base, branch and PR text bounds (#164).
+
+        Rendered from the launch entry's reads; a plan rendered without them
+        (a dry run, or before the transaction id exists) shows visible
+        placeholders rather than a plausible guess.
+        """
+        entry = self._replan_entry
+        if entry is not None and entry.transaction_id == txn.transaction_id:
+            branch, base_sha = entry.branch, entry.base_sha
+        else:
+            base_sha = "(read from GitHub at execution)"
+            branch = (
+                replacement_branch_for(parse_issue_url(txn.issue_url).number, txn.transaction_id)
+                if txn.transaction_id and txn.issue_url
+                else "(derived at execution)"
+            )
+        return {
+            "BASE_SHA": base_sha,
+            "REPLACEMENT_BRANCH": escape_inline(branch),
+            "MAX_PR_TITLE_CHARS": MAX_PR_TITLE_CHARS,
+            "MAX_PR_BODY_CHARS": MAX_PR_BODY_CHARS,
+        }
 
     def _roadmap_update_due(self, s: AutoForgeState) -> bool:
         """Whether this UPDATE_EPIC entry writes the EPIC's roadmap section.
@@ -1858,11 +1907,13 @@ class ControllerEngine:
             if replan_txn.escalation:
                 notes.append(f"replan policy: {json.dumps(replan_txn.escalation, sort_keys=True)}")
             notes.append(f"replan transaction stage: {replan_txn.stage.value}")
-            if not may_invoke_agent(replan_txn):
+            journaled = isinstance(s.phase_effects().context, ReplanContext)
+            if journaled or not may_invoke_agent(replan_txn):
                 # The reducer resolves this step itself (`_drive_replan` never
-                # falls through to the invocation past PREPARED), so the plan
-                # carries no agent command, template or prompt: what it shows
-                # is what the step can do (PR #92 review).
+                # falls through to the invocation past PREPARED, nor at
+                # PREPARED once a push and PR plan is journaled, #164), so the
+                # plan carries no agent command, template or prompt: what it
+                # shows is what the step can do (PR #92 review).
                 return self._deterministic_plan(
                     s,
                     f"REPLAN_REEXECUTE at stage {replan_txn.stage.value} (controller finishes "
@@ -4433,17 +4484,27 @@ class ControllerEngine:
         # Before the write. PENDING and PREPARED may still launch the agent;
         # VERIFIED never does.
         agent: list[str]
+        publish = (
+            "the controller then pushes the agent's commit to the replacement branch it "
+            "derives from the issue and the transaction id, and creates the replacement PR "
+            "onto the default branch with this transaction's marker, from a plan it journals "
+            "first"
+        )
         if txn.stage is ReplanStage.PENDING:
             agent = [
                 "would checkpoint the source PR, its HEAD, the verified default branch, the "
-                "review evidence and the PRs that already exist, then invoke the replan agent "
-                "(command above) to create the replacement PR",
+                "review evidence and the PRs that already exist, read the default branch head, "
+                "then invoke the replan agent (command above) to commit the replacement on it",
+                publish,
             ]
         elif txn.stage is ReplanStage.PREPARED:
             agent = [
-                "would look for a PR carrying this transaction's marker: none -> invoke the "
-                "replan agent (command above) to create the replacement PR from the verified "
-                "default branch; one -> verify it without an agent",
+                "a journaled push and PR plan -> would complete it and verify the PR without an "
+                "agent; otherwise a PR carrying this transaction's marker, or an existing "
+                "replacement branch, was not created by the controller -> would refuse; "
+                "neither -> would read the default branch head and invoke the replan agent "
+                "(command above) to commit the replacement on it",
+                publish,
             ]
         else:
             agent = [
@@ -6437,8 +6498,12 @@ class ControllerEngine:
     #
     #   policy decision        REVIEW      ``evaluate_replan_policy``
     #   transaction creation   controller  ``_prepare_replan``
+    #   base and branch        controller  ``_replan_launch_entry``
     #   agent invocation       controller  ``_invoke_phase``
-    #   replacement PR         agent       (the only agent-owned write here)
+    #   replacement commit     agent       (local, on the worktree's HEAD)
+    #   candidate check        controller  ``_check_replan_result``
+    #   push / replacement PR  controller  ``_apply_replan`` journals K1 and
+    #                                      K7, ``_complete_replan`` drives them
     #   candidate discovery    controller  ``_bind_replacement``
     #   verification           shared      ``replan_txn`` predicates
     #   supersede / close      controller  ``_supersede_source`` (the only
@@ -6450,8 +6515,8 @@ class ControllerEngine:
     #   recovery               controller  ``_drive_replan`` (replays intent)
     #   rejection/escalation   controller  ``_reject_replan`` (persisted)
     #
-    # The agent never closes, merges or adopts a PR; the controller never
-    # writes code.
+    # The agent never pushes, creates, closes, merges or adopts a PR (#164);
+    # the controller never writes code.
     # ======================================================================
 
     def _replan_log_metadata(self) -> dict:
@@ -6532,6 +6597,9 @@ class ControllerEngine:
         when the replacement agent still has to be invoked.
         """
         state = self._require_state()
+        self._replan_entry = None
+        self._replan_candidate = ""
+        self._replan_rejection = ""
         if not state.replan_transaction:
             raise StateError("REPLAN_REEXECUTE entered without a replan transaction in state")
         try:
@@ -6563,16 +6631,119 @@ class ControllerEngine:
             if prepared is not None:
                 return prepared
         if txn.stage is ReplanStage.PREPARED:
-            # A PR bound to this transaction can only exist if the agent ran:
-            # the id is random, controller-generated and persisted before the
-            # invocation. So "crashed before invoking" and "crashed while the
-            # agent ran" are one recoverable state, resolved by looking.
-            refused = self._bind_replacement(txn)
+            # Journal first (#164): a saved push and PR plan means the
+            # agent's commit was accepted; the plan is completed and bound,
+            # and the agent is never launched for it again.
+            if isinstance(state.phase_effects().context, ReplanContext):
+                return self._complete_replan(txn)
+            # Without a plan the controller has created nothing, so a PR
+            # carrying this transaction's marker is not its own (ADR 0004
+            # D9.8): the id is random and persisted before any launch, and
+            # only the controller renders the marker. The one exception is
+            # the legacy re-entry of a run upgraded while an agent of the
+            # previous contract was publishing (D13.3, D13.8): its PR is bound as
+            # before.
+            legacy = is_legacy_reentry(Phase.REPLAN_REEXECUTE, state.attempt, state.launch_label)
+            refused = self._bind_replacement(txn, unjournaled=not legacy)
             if refused is not None:
                 return refused
             if not txn.is_bound:
-                return None  # nothing exists yet -> invoke the replan agent
+                # Nothing exists yet: read the base, derive the branch, then
+                # invoke the replan agent.
+                return self._replan_launch_entry(txn, legacy)
         return self._supersede_source(txn)
+
+    def _replan_base_moved_text(self, txn: ReplanTransaction, found: str) -> str:
+        return (
+            f"the default branch of {self._require_state().repository} is {found!r}, but the "
+            f"replan transaction verified {txn.base_branch!r}: the replacement is built on that "
+            "branch's head and opened onto it only, so the controller launches, pushes and "
+            "creates nothing more for this transaction"
+        )
+
+    def _replan_launch_entry(self, txn: ReplanTransaction, legacy: bool) -> StepOutcome | None:
+        """Read the base and derive the branch before a REPLAN_REEXECUTE launch (#164).
+
+        The replacement branch is derived from the issue and the transaction
+        id (:func:`replacement_branch_for`), never chosen by the agent, and
+        must not exist: nothing has been pushed to it without a journaled
+        plan. The base is the head of the transaction's verified default
+        branch, which must still be the repository's default branch. A fresh
+        entry reads it and records it, with the branch read as absent, in
+        the entry observation the pre-launch save persists; a relaunch of
+        the same entry (a correction, or a resume after the agent ran)
+        builds on the recorded base. The base is fetched into the shared
+        object store so the agent's worktree can check it out without a
+        fetch of its own. Returns ``None`` when the agent may be launched.
+
+        Only an unavailable GitHub and a failed fetch propagate (nothing was
+        launched and 'resume' reads again); a conclusive failure rejects.
+        """
+        state = self._require_state()
+        effects = state.phase_effects()
+        observation = effects.observation
+        honored = (
+            observation if observation is not None and state.attempt >= 1 and not legacy else None
+        )
+        branch = replacement_branch_for(parse_issue_url(txn.issue_url).number, txn.transaction_id)
+        ref = f"refs/heads/{branch}"
+        base_ref = f"refs/heads/{txn.base_branch}"
+        try:
+            default_branch = self.github.get_repo(state.repository).default_branch
+            if default_branch != txn.base_branch:
+                return self._reject_replan(txn, self._replan_base_moved_text(txn, default_branch))
+            if honored is not None:
+                if (
+                    set(honored.refs) != {ref, base_ref}
+                    or honored.refs[ref] is not None
+                    or honored.base_sha is None
+                    or honored.refs[base_ref] != honored.base_sha
+                ):
+                    raise StateError(
+                        "the REPLAN_REEXECUTE entry observation does not record the replacement "
+                        "branch as absent and the default branch at its base"
+                    )
+                base_sha = honored.base_sha
+            else:
+                base_sha = self.github.get_branch_head_sha(state.repository, txn.base_branch)
+            head = self._branch_head(branch)
+        except GitHubUnavailableError:
+            raise
+        except GitHubError as exc:
+            return self._reject_replan(
+                txn,
+                f"the default branch or the replacement branch {branch!r} could not be read "
+                f"before the launch: {exc}",
+            )
+        if head is not None:
+            return self._reject_replan(
+                txn,
+                f"the replacement branch {branch!r} already exists at {head}, but the "
+                "controller pushes to it only from a plan it journals first, and none was "
+                "journaled (ADR 0004 D9.8); nothing was launched, pushed or created",
+            )
+        try:
+            self._git_transport().fetch([base_sha])
+        except GitTransportError as exc:
+            raise VerificationError(
+                f"the controller could not fetch the default branch head {base_sha} into the "
+                f"shared object store before launching the replan agent: {exc}. Nothing was "
+                "launched; 'resume' fetches again"
+            ) from exc
+        if honored is None:
+            # D4.4: persisted by the pre-launch save, so that a replacement
+            # branch, or a base the plan names, found by a later entry is
+            # explained by this read or not at all.
+            state.entry_observation = EntryObservation(
+                Phase.REPLAN_REEXECUTE,
+                state.current_issue_url,
+                state.current_pr_url,
+                {ref: None, base_ref: base_sha},
+                base_sha,
+                {},
+            ).to_dict()
+        self._replan_entry = _ReplanEntry(txn.transaction_id, branch, base_sha)
+        return None
 
     def _replan_unbound(self, txn: ReplanTransaction) -> StepOutcome | None:
         """Refuse a transaction whose source or issue is not this run's.
@@ -6756,15 +6927,26 @@ class ControllerEngine:
         return None
 
     def _bind_replacement(
-        self, txn: ReplanTransaction, claimed_url: str = ""
+        self,
+        txn: ReplanTransaction,
+        *,
+        candidate: str = "",
+        counts: tuple[int, int] | None = None,
+        unjournaled: bool = False,
     ) -> StepOutcome | None:
         """Find, verify and checkpoint the PR causally bound to ``txn``.
 
         Returns a BLOCKED outcome when the candidate set is conclusively
         unusable; otherwise ``None``, with ``txn.is_bound`` telling the caller
-        whether a replacement was found. ``claimed_url`` is the agent's
-        CONTROL_RESULT claim: it never *selects* the candidate, it is only
-        checked against the one GitHub proves.
+        whether a replacement was found.
+
+        The controller creates the replacement itself (#164), so the PR
+        bound after its journaled plan completed must also be headed at the
+        ``candidate`` that plan pushed and attest the ``counts`` it saved: a
+        push to the branch between the push and the binding is someone
+        else's code, never the replacement. With ``unjournaled`` no plan was
+        journaled, so any PR carrying the transaction's marker is not the
+        controller's and is refused rather than bound (ADR 0004 D9.8).
         """
         state = self._require_state()
         try:
@@ -6796,26 +6978,21 @@ class ControllerEngine:
             closed = find_non_open_claimant(all_prs, txn)
             if closed.disposition is not Disposition.NONE:
                 return self._reject_replan(txn, closed.reason)
-            if claimed_url:
-                return self._reject_replan(
-                    txn,
-                    f"the agent reports replacement PR {claimed_url}, but no open PR in "
-                    f"{state.repository} carries the marker for replan transaction "
-                    f"{txn.transaction_id}",
-                    claimed_url,
-                )
             return None
         if selection.disposition is not Disposition.OK:
             return self._reject_replan(txn, selection.reason)
         pr, attestation = selection.pr, selection.attestation
         assert pr is not None and attestation is not None  # Disposition.OK invariant
         canonical = parse_pr_url(pr.url).canonical
-        if claimed_url and not same_pr_url(claimed_url, canonical):
+        if unjournaled:
             return self._reject_replan(
                 txn,
-                f"the agent reports replacement PR {claimed_url}, but the PR bound to replan "
-                f"transaction {txn.transaction_id} is {canonical}",
-                claimed_url,
+                f"open PR {canonical} carries the marker of replan transaction "
+                f"{txn.transaction_id}, but the controller did not create it: no push and PR "
+                "plan was journaled for this transaction, and the controller creates the "
+                "replacement itself, only from a plan it journals before anything is sent "
+                "(ADR 0004 D9.8). It is never bound as the replacement",
+                canonical,
             )
         drift = (
             verify_target_pr(pr, txn, state.repository, require_checkpoint_head=False)
@@ -6826,6 +7003,23 @@ class ControllerEngine:
             # refuse to choose between, so the replan does not choose either.
             or verify_sole_implementation_claimant(open_prs, canonical, txn, state.repository)
         )
+        if not drift and candidate and pr.head_sha != candidate:
+            drift = (
+                f"replacement PR {canonical} is headed at {pr.head_sha}, not at {candidate}, "
+                "the candidate the controller pushed: something else was pushed to the "
+                "replacement branch before it was bound, so it is not the implementation the "
+                "controller verified"
+            )
+        if (
+            not drift
+            and counts is not None
+            and (attestation.findings_considered, attestation.unique_constraints) != counts
+        ):
+            drift = (
+                f"replacement PR {canonical} attests {attestation.findings_considered} "
+                f"finding(s) considered and {attestation.unique_constraints} unique "
+                f"constraint(s), but the journaled plan rendered {counts[0]} and {counts[1]}"
+            )
         if drift:
             return self._reject_replan(txn, drift, canonical)
         txn.replacement_pr_url = canonical
@@ -7645,6 +7839,15 @@ class ControllerEngine:
                     # it is corrected before anything is created or pushed
                     # (#163).
                     self._check_fix_result(payload, cwd)
+                if (
+                    phase == Phase.REPLAN_REEXECUTE
+                    and state.mode == WorkflowMode.REMOTE
+                    and payload.get("status") == "success"
+                ):
+                    # The candidate the controller would publish, read from
+                    # the worktree itself: corrected, or its rejection
+                    # decided, before anything is pushed or created (#164).
+                    self._check_replan_result(payload, cwd)
             except VerificationError as exc:
                 # A read of the candidate that could not be completed: not the
                 # agent's error, so no correction; 'resume' reads it again.
@@ -9325,20 +9528,136 @@ class ControllerEngine:
             f"FIX -> {nxt.value} (round {state.review_round + 1})"
         )
 
+    def _check_replan_result(self, payload: dict, cwd: str) -> ReplanReexecuteResult:
+        """The controller's half of the REPLAN_REEXECUTE schema: the candidate (#164).
+
+        Checked before the result is accepted, and before anything is
+        pushed or created. What the agent can repair is corrected (it is
+        asked again): a composed PR body that fails the credential rule as
+        a whole, a HEAD attached to a local branch or not readable, and a
+        published commit whose message fails the commit-message policy (ADR
+        0004 D7.5, D8.5). What contradicts the checkpoint is a rejection,
+        decided here and persisted by :meth:`_apply_replan` before any
+        effect: the cross-checks against the transaction, failed tests, a
+        ``head_sha`` that is not the worktree's ``HEAD``, and a candidate
+        that is the recorded base or does not descend from it. A read that
+        cannot be completed is inconclusive (:class:`VerificationError`),
+        never a correction.
+        """
+        state = self._require_state()
+        res = ReplanReexecuteResult.from_payload(payload)
+        txn = ReplanTransaction.from_dict(state.replan_transaction)
+        entry = self._replan_entry
+        if entry is None or entry.transaction_id != txn.transaction_id:
+            raise StateError("a REPLAN_REEXECUTE result was checked without the entry's reads")
+        self._replan_candidate = ""
+        self._replan_rejection = self._replan_claim_mismatch(res, txn)
+        if self._replan_rejection:
+            return res
+        marker = txn.rendered_marker(
+            res.historical_findings_considered, res.unique_failure_constraints
+        )
+        problem = published_payload_problem(
+            "PR body", replacement_pr_body(res.pr_body, txn.issue_url, marker)
+        )
+        if problem:
+            raise ControlResultValidationError(f"REPLAN_REEXECUTE: {problem}")
+        attached, _ = self._worktree_git(
+            ["symbolic-ref", "-q", "HEAD"], cwd, "whether HEAD is detached"
+        )
+        if attached == 0:
+            raise ControlResultValidationError(
+                "REPLAN_REEXECUTE: the worktree's HEAD is attached to a local branch; the "
+                "controller publishes a detached HEAD only. Run `git checkout --detach`, keep "
+                "your commits, and re-emit the CONTROL_RESULT"
+            )
+        found, head = self._worktree_git(
+            ["rev-parse", "--verify", "-q", "HEAD^{commit}"], cwd, "the HEAD commit"
+        )
+        if found != 0 or not re.fullmatch(r"[0-9a-f]{40}", head):
+            raise ControlResultValidationError(
+                "REPLAN_REEXECUTE: the worktree has no HEAD commit the controller can read; "
+                "commit your work and re-emit the CONTROL_RESULT"
+            )
+        if head != res.head_sha:
+            self._replan_rejection = (
+                f"the result reports head_sha {res.head_sha}, but the worktree's HEAD is {head}"
+            )
+            return res
+        if head == entry.base_sha:
+            self._replan_rejection = (
+                f"the worktree's HEAD {head} is the default branch head itself: nothing was "
+                "committed on it"
+            )
+            return res
+        try:
+            proof = self._git_transport().prove_range(entry.base_sha, head)
+        except GitTransportError as exc:
+            raise VerificationError(
+                f"the ancestry of the candidate {head} could not be proven: {exc}. Nothing was "
+                "pushed; 'resume' proves it again"
+            ) from exc
+        if not proof.reached_base:
+            self._replan_rejection = (
+                f"the worktree's HEAD {head} does not descend from {entry.base_sha}, the head "
+                f"of {txn.base_branch!r} the replacement had to be built on"
+            )
+            return res
+        issue = parse_issue_url(txn.issue_url)
+        message_problem = published_range_problem(
+            proof,
+            lambda message: commit_message_problem(
+                message, repository=state.repository, issue_number=issue.number
+            ),
+        )
+        if message_problem:
+            raise ControlResultValidationError(f"REPLAN_REEXECUTE: {message_problem}")
+        self._replan_candidate = head
+        return res
+
+    @staticmethod
+    def _replan_claim_mismatch(res: ReplanReexecuteResult, txn: ReplanTransaction) -> str:
+        """Why the result describes another world than the checkpoint, or ``""``."""
+        if not same_issue_url(res.issue_url, txn.issue_url):
+            return f"issue_url {res.issue_url!r} does not match the replan issue"
+        if not same_pr_url(res.previous_pr_url, txn.source_pr_url):
+            return f"previous_pr_url {res.previous_pr_url!r} does not match the checkpoint"
+        if res.previous_branch != txn.source_branch:
+            return f"previous_branch {res.previous_branch!r} does not match the checkpoint"
+        if res.previous_head_sha != txn.source_head_sha:
+            return f"previous_head_sha {res.previous_head_sha!r} does not match the checkpoint"
+        if res.execution_attempt != txn.expected_execution_attempt:
+            return (
+                f"execution_attempt must be {txn.expected_execution_attempt}, "
+                f"got {res.execution_attempt}"
+            )
+        if not res.tests_passed:
+            return "the replacement reports tests_passed=false"
+        if res.historical_findings_considered < txn.evidence_finding_count:
+            return (
+                f"the replacement considered {res.historical_findings_considered} of the "
+                f"{txn.evidence_finding_count} historical finding(s) the controller preserved"
+            )
+        return ""
+
     def _apply_replan(self, res: ReplanReexecuteResult) -> tuple[Phase, str]:
-        """Cross-check the agent's claims, then bind, supersede and activate.
+        """Plan, publish and bind the replacement from the accepted candidate (#164).
 
-        The CONTROL_RESULT is a claim, never the authority. Every field below
-        is compared against the checkpoint the controller wrote *before* the
-        agent ran, or against GitHub; a mismatch means the agent is describing
-        a different world than the one the replan decision was made in, and
-        this attempt is rejected.
-
-        Acceptance itself is delegated to the same helpers ``_drive_replan``
-        uses on ``resume`` — the marker on the replacement PR, not this
-        payload, is what proves causality and carries the attestation. That is
-        why a crash between the agent's write and this method cannot lower the
-        bar: there is nothing here that recovery does not also check.
+        The CONTROL_RESULT is a claim, never the authority. It was checked
+        before it was accepted (:meth:`_check_replan_result`) against the
+        checkpoint the controller wrote *before* the agent ran and against
+        the worktree; a rejection decided there is persisted here, before
+        any effect. A precondition read then finds GitHub as the entry
+        observed it: the default branch is the transaction's, the derived
+        replacement branch is absent and no PR carries the transaction's
+        marker; anything else is unexplained and rejects with nothing
+        planned or sent (ADR 0004 D9.8). The push (K1) and the replacement
+        PR (K7) are planned and saved with the completion context in one
+        save, owned by the transaction id, and :meth:`_complete_replan` does
+        the rest from what was saved, as a later entry would: the marker on
+        the replacement PR, rendered by the controller, carries the
+        attestation that binding and recovery check, so a crash between any
+        two writes cannot lower the bar.
         """
         state = self._require_state()
         if not state.replan_transaction:
@@ -9352,90 +9671,194 @@ class ControllerEngine:
                     f"{txn.stage.value!r}, which cannot accept one",
                 )
             )
-        claimed_url = parse_pr_url(res.replacement_pr_url).canonical
-        mismatch = ""
-        if not same_issue_url(res.issue_url, txn.issue_url):
-            mismatch = f"issue_url {res.issue_url!r} does not match the replan issue"
-        elif not same_pr_url(res.previous_pr_url, txn.source_pr_url):
-            mismatch = f"previous_pr_url {res.previous_pr_url!r} does not match the checkpoint"
-        elif res.previous_branch != txn.source_branch:
-            mismatch = f"previous_branch {res.previous_branch!r} does not match the checkpoint"
-        elif res.previous_head_sha != txn.source_head_sha:
-            mismatch = f"previous_head_sha {res.previous_head_sha!r} does not match the checkpoint"
-        elif res.execution_attempt != txn.expected_execution_attempt:
-            mismatch = (
-                f"execution_attempt must be {txn.expected_execution_attempt}, "
-                f"got {res.execution_attempt}"
+        entry = self._replan_entry
+        if entry is None or entry.transaction_id != txn.transaction_id:
+            raise StateError(
+                "a REPLAN_REEXECUTE result was applied without the entry its check read"
             )
-        elif not res.tests_passed:
-            mismatch = "the replacement reports tests_passed=false"
-        elif res.historical_findings_considered < txn.evidence_finding_count:
-            mismatch = (
-                f"the replacement considered {res.historical_findings_considered} of the "
-                f"{txn.evidence_finding_count} historical finding(s) the controller preserved"
-            )
-        if mismatch:
+        if self._replan_rejection:
             return self._blocked_replan(
                 self._reject_replan(
-                    txn, f"REPLAN_REEXECUTE result rejected: {mismatch}", claimed_url
+                    txn, f"REPLAN_REEXECUTE result rejected: {self._replan_rejection}"
                 )
             )
-        refused = self._bind_replacement(txn, claimed_url=claimed_url)
+        if self._replan_candidate != res.head_sha:
+            raise StateError(
+                "a REPLAN_REEXECUTE result was applied without the candidate its check accepted"
+            )
+        try:
+            default_branch = self.github.get_repo(state.repository).default_branch
+            if default_branch != txn.base_branch:
+                return self._blocked_replan(
+                    self._reject_replan(txn, self._replan_base_moved_text(txn, default_branch))
+                )
+            head = self._branch_head(entry.branch)
+        except GitHubUnavailableError:
+            raise
+        except GitHubError as exc:
+            return self._blocked_replan(
+                self._reject_replan(
+                    txn,
+                    f"the default branch or the replacement branch {entry.branch!r} could not "
+                    f"be read before publishing: {exc}",
+                )
+            )
+        if head is not None:
+            return self._blocked_replan(
+                self._reject_replan(
+                    txn,
+                    f"the replacement branch {entry.branch!r} appeared at {head} while the "
+                    "agent ran, but the controller pushes to it only from a plan it journals "
+                    "first, and none was journaled (ADR 0004 D9.8); nothing was pushed or "
+                    "created",
+                )
+            )
+        refused = self._bind_replacement(txn, unjournaled=True)
         if refused is not None:
             return self._blocked_replan(refused)
-        if not txn.is_bound:  # pragma: no cover - _bind_replacement rejects this
-            return self._blocked_replan(
-                self._reject_replan(txn, "no replacement PR is bound to this transaction")
-            )
-        if res.replacement_branch != txn.replacement_branch:
-            return self._blocked_replan(
-                self._reject_replan(
-                    txn,
-                    f"replacement branch mismatch: GitHub reports {txn.replacement_branch!r}, "
-                    f"the agent claimed {res.replacement_branch!r}",
-                    txn.replacement_pr_url,
-                )
-            )
-        if res.replacement_head_sha != txn.replacement_head_sha:
-            return self._blocked_replan(
-                self._reject_replan(
-                    txn,
-                    f"replacement HEAD mismatch: GitHub reports {txn.replacement_head_sha}, "
-                    f"the agent claimed {res.replacement_head_sha}",
-                    txn.replacement_pr_url,
-                )
-            )
-        # The marker is the authoritative attestation, so stdout is not allowed
-        # to tell a different story about it: an internally inconsistent result
-        # means the two numbers were not produced by one honest accounting, and
-        # the controller cannot tell which (if either) is the real one.
-        for field_name, claimed, attested in (
-            (
-                "historical_findings_considered",
-                res.historical_findings_considered,
-                txn.attested_findings_considered,
-            ),
-            (
-                "unique_failure_constraints",
-                res.unique_failure_constraints,
-                txn.attested_unique_constraints,
-            ),
-        ):
-            if claimed != attested:
-                return self._blocked_replan(
-                    self._reject_replan(
-                        txn,
-                        f"CONTROL_RESULT {field_name}={claimed} disagrees with the replan marker "
-                        f"published on {txn.replacement_pr_url}, which attests {attested}",
-                        txn.replacement_pr_url,
-                    )
-                )
-        outcome = self._supersede_source(txn)
+        counts = (res.historical_findings_considered, res.unique_failure_constraints)
+        marker = txn.rendered_marker(*counts)
+        owner = EffectOwner(
+            run_id=state.run_id,
+            phase=Phase.REPLAN_REEXECUTE,
+            issue_url=state.current_issue_url,
+            pr_url=state.current_pr_url,
+            transaction_id=txn.transaction_id,
+        )
+        ref = f"refs/heads/{entry.branch}"
+        push = EffectRecord.plan(
+            0,
+            EffectKind.PUSH,
+            owner,
+            identity={"repository": state.repository, "ref": ref, "candidate_sha": res.head_sha},
+            target={"repository": state.repository, "ref": ref},
+            precondition={"expected_old": None, "base_sha": entry.base_sha},
+            payload={"sha": res.head_sha},
+        )
+        create = EffectRecord.plan(
+            1,
+            EffectKind.REPLACEMENT_PR,
+            owner,
+            identity={
+                "repository": state.repository,
+                "transaction_marker": marker,
+                "head_branch": entry.branch,
+            },
+            target={"repository": state.repository, "base": txn.base_branch, "head": entry.branch},
+            precondition={"absent": True, "watermark": txn.pr_number_watermark},
+            payload={
+                "title": res.pr_title,
+                "body": replacement_pr_body(res.pr_body, txn.issue_url, marker),
+            },
+        )
+        state.effect_records = [push.to_dict(), create.to_dict()]
+        state.completion_context = ReplanContext(
+            state.current_issue_url, state.current_pr_url, txn.transaction_id, *counts
+        ).to_dict()
+        # Strictly validated exactly as a later load will validate it, against
+        # the entry observation the pre-launch save persisted: a plan that
+        # fails is never written.
+        state.phase_effects()
+        self._save()
+        outcome = self._complete_replan(txn)
         if state.phase == Phase.BLOCKED:
             return Phase.BLOCKED, outcome.message
         # ``_supersede_source`` activated the replacement and already applied
         # REPLAN_REEXECUTE's one edge; the same decision is returned here.
         return self._next_phase(Phase.REPLAN_REEXECUTE, {}), outcome.message
+
+    def _complete_replan(self, txn: ReplanTransaction) -> StepOutcome:
+        """Finish the replacement from the persisted plan: push, create, bind (#164).
+
+        The same code for the step that saved the plan and for every later
+        entry (journal first): a PR create still pending rejects with
+        nothing sent when the transaction's base is no longer the default
+        branch; each record is reconciled against GitHub and issued at most
+        once, in plan order, so the PR is never created before the branch
+        holds the candidate, and is created only while the branch still
+        holds it. Then the PR carrying the transaction's marker is bound by
+        every predicate binding always had, headed at exactly the pushed
+        candidate and attesting the saved counts, and the source is
+        superseded. A conflict or a conclusive failure rejects with the
+        records as persisted; an unavailable GitHub, or a write whose
+        outcome is not readable yet, propagates for 'resume'.
+        """
+        state = self._require_state()
+        effects = state.phase_effects()
+        context = effects.context
+        if not isinstance(context, ReplanContext) or len(effects.records) != 2:
+            raise StateError("REPLAN_REEXECUTE has no persisted push and PR plan to complete")
+        records = list(effects.records)
+        push, create = records
+        branch = str(push.target["ref"]).removeprefix("refs/heads/")
+        candidate = str(push.payload["sha"])
+        try:
+            default_branch = self.github.get_repo(state.repository).default_branch
+        except GitHubUnavailableError:
+            raise
+        except GitHubError as exc:
+            return self._reject_replan(
+                txn, f"the default branch of {state.repository} could not be read: {exc}"
+            )
+        if create.pending and default_branch != str(create.target["base"]):
+            # K7's base is checked before anything of the plan is sent, the
+            # push included: a create is never issued onto a branch that is
+            # no longer the default.
+            return self._reject_replan(txn, self._replan_base_moved_text(txn, default_branch))
+        for index, record in enumerate(records):
+            if record.stage == Stage.CONFLICT:
+                return self._reject_replan(txn, self._replan_conflict_text(record))
+            if not record.pending:
+                continue
+            try:
+                if record.kind is EffectKind.REPLACEMENT_PR:
+                    head = self._branch_head(branch)
+                    if head != candidate:
+                        return self._reject_replan(
+                            txn,
+                            f"the replacement branch {branch!r} is at {head or 'nothing'}, not "
+                            f"at {candidate}, the candidate the controller pushed: something "
+                            "else moved it before the replacement PR was created, so no PR is "
+                            "created from it",
+                        )
+                op = operation_for(
+                    record,
+                    self.github,
+                    transport=self._git_transport() if record.kind is EffectKind.PUSH else None,
+                    default_branch=default_branch,
+                )
+                driven = drive(record, op, self._persist_effect)
+            except GitHubUnavailableError:
+                raise
+            except GitHubError as exc:
+                return self._reject_replan(
+                    txn, f"{record.describe()} could not be reconciled with GitHub: {exc}"
+                )
+            records[index] = driven.record
+            if driven.record.stage == Stage.CONFLICT:
+                return self._reject_replan(txn, self._replan_conflict_text(driven.record))
+        refused = self._bind_replacement(
+            txn,
+            candidate=candidate,
+            counts=(context.historical_findings_considered, context.unique_failure_constraints),
+        )
+        if refused is not None:
+            return refused
+        if not txn.is_bound:
+            return self._reject_replan(
+                txn,
+                f"{records[1].describe()} is observed, but no open PR carrying the marker of "
+                f"replan transaction {txn.transaction_id} could be bound",
+            )
+        return self._supersede_source(txn)
+
+    @staticmethod
+    def _replan_conflict_text(record: EffectRecord) -> str:
+        return (
+            f"{record.reason}. The controller never force-pushes, duplicates or chooses "
+            "between such objects, and a replan block is terminal: nothing more is sent for "
+            "this transaction"
+        )
 
     @staticmethod
     def _blocked_replan(outcome: StepOutcome) -> tuple[Phase, str]:

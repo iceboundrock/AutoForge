@@ -396,7 +396,19 @@ next entry could not find again.
   sends anything and when it completes: a base or merge base that left the
   findings' binding is the same drift with the findings carried, and a
   head branch or follow-up issue the plan cannot prove blocks.
-- `REPLAN_REEXECUTE` replays its durable transaction (replan-transaction.md).
+- `REPLAN_REEXECUTE` replays its durable transaction (replan-transaction.md)
+  and publishes nothing through its agent (#164): the controller pushes the
+  agent's commit to the branch it derives from the transaction id and
+  creates the replacement PR from one persisted plan. At `PREPARED` its
+  entry reads that journal first: a persisted plan is completed from its
+  records and bound without launching the agent. Otherwise a PR carrying
+  the transaction's marker was not created by the controller and rejects
+  the transaction (the one-shot re-entry of a run persisted while an agent
+  of the previous contract was publishing binds it as before), and so does
+  a replacement branch that already exists. A fresh entry records the
+  default branch head the agent builds on, and the branch as absent, in its
+  entry observation; a relaunch builds on the recorded base
+  (replan-transaction.md, "The controller publishes the replacement").
 - `UPDATE_EPIC` reads its journal first: a persisted completion context
   means the agent's result was already accepted, so the phase is completed
   from it with no launch (or with a re-request for the one input a

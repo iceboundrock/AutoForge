@@ -35,7 +35,8 @@
 4. 放弃旧 implementation branch
 5. 基于最新 default branch 建立全新的实现
 6. 避免旧 PR 曾经出现过的所有已知问题
-7. 创建一个新的 replacement PR
+7. 在本 worktree 的 detached `HEAD` 上提交新的实现，并给出 replacement PR 的
+   title 和 body；push 与创建 replacement PR 由 controller 完成（section 20）
 
 ---
 
@@ -72,6 +73,16 @@ Previous PR HEAD:
 Default branch:
 
 `{{DEFAULT_BRANCH}}`
+
+Default branch head (the base the replacement must be built on, already
+fetched into the object store this worktree shares):
+
+`{{BASE_SHA}}`
+
+Replacement branch the controller will push your commit to (derived by the
+controller; yours to read about, not to create):
+
+`{{REPLACEMENT_BRANCH}}`
 
 Escalation reason:
 
@@ -521,8 +532,8 @@ stop using the old implementation branch.
 Do not:
 
 * continue committing to it
-* rebase it into the new branch
-* merge it into the new branch
+* rebase it into the new implementation
+* merge it into the new implementation
 * cherry-pick its implementation commits
 * copy its diff wholesale
 
@@ -539,8 +550,8 @@ exactly as found.
 * Do not delete unrelated branches, unrelated worktrees, or uncommitted user
   work.
 
-The only branch you may create is the NEW replacement branch in section 15,
-and creating it must not delete, rename, or move anything else.
+Do not create any branch either: you work on a detached `HEAD` (section 15),
+and the controller pushes your commit to the replacement branch it derived.
 
 Leave the old local branch alone and report it.
 
@@ -550,31 +561,26 @@ Safety is more important than cleanup.
 
 # 15. Start from fresh default branch
 
-Fetch the remote repository.
+The controller already read the head of `{{DEFAULT_BRANCH}}` and fetched it
+into the object store this worktree shares. Do not fetch, pull or push, and
+run no other command that contacts the git remote.
 
-Establish the latest valid default branch state.
-
-The replacement implementation must originate from:
-
-```text
-latest origin/{{DEFAULT_BRANCH}}
-```
-
-or the repository's verified equivalent.
-
-Create a NEW branch.
-
-Do not reuse the previous branch name.
-
-Example conceptual naming:
+The replacement implementation must originate from exactly:
 
 ```text
-autoforge/retry-<issue-number>-<attempt>
+{{BASE_SHA}}
 ```
 
-or repository convention.
+Run `git checkout --detach {{BASE_SHA}}` and stay on the detached `HEAD`: do
+not create, check out or rename a local branch (`git checkout -b`,
+`git switch -c`, `git branch`), and do not reset the worktree to anything
+that does not descend from `{{BASE_SHA}}`.
 
-The controller/repository policy determines actual naming.
+You choose no branch name. The controller pushes the commit you report to
+`{{REPLACEMENT_BRANCH}}`, a branch it derives from the issue and the replan
+transaction id, after checking that the branch does not exist yet. A branch
+or a replacement PR for this transaction that the controller did not create
+from its own journal stops the run: it is never adopted.
 
 ---
 
@@ -613,7 +619,17 @@ Follow normal repository development discipline:
 * run build where applicable
 * verify important edge cases
 
-Fix failures before creating the replacement PR.
+Fix failures before returning the result.
+
+Commit locally on the detached `HEAD`, with clear messages referencing
+`#{{ISSUE_NUMBER}}`. A commit message must not use a closing keyword
+(`close`, `fix`, `resolve` in any form) followed by any issue other than
+`#{{ISSUE_NUMBER}}`, and must contain nothing shaped like a credential: the
+controller reads every commit it would publish and asks you to correct the
+result otherwise. Leave the working tree clean.
+
+Read the commit to report with `git rev-parse HEAD`. It must differ from
+`{{BASE_SHA}}` (you must have committed something) and descend from it.
 
 Do not lower standards simply because this is a recovery attempt.
 
@@ -671,15 +687,26 @@ suggested fix in old review
 
 # 20. Replacement PR
 
-Create a new Pull Request.
+You publish nothing. The replacement's two GitHub writes belong to the
+controller, and it journals both before either is sent:
 
-The replacement PR must:
+1. it pushes the exact commit you report to `{{REPLACEMENT_BRANCH}}`,
+   compared against "absent";
+2. it creates the replacement PR from `{{REPLACEMENT_BRANCH}}` onto
+   `{{DEFAULT_BRANCH}}`, with your title and with your body followed by its
+   own `Closes #{{ISSUE_NUMBER}}` line, the issue's implementation marker and
+   the replan transaction marker for transaction `{{REPLAN_TRANSACTION_ID}}`,
+   which it renders from your `CONTROL_RESULT` counts.
 
-* link the original issue with a closing keyword (`Closes #<n>`) **in the body
-  you pass to `gh pr create`**, not in a later edit. The controller reads every
-  open pull request in the repository looking for your marker, so a marked PR
-  that is not linked to the issue is not overlooked: it is *refused*, and the
-  run blocks for a human.
+So do not push, and do not create, edit or comment on any pull request or
+issue (no `gh pr create`, no `gh pr edit`). Do not write `Closes #<n>`, the
+implementation marker or the transaction marker anywhere: the controller adds
+them, and a PR carrying this transaction's marker that it did not create is
+refused, never adopted.
+
+The PR title is one line of at most {{MAX_PR_TITLE_CHARS}} characters. The PR
+body is Markdown of at most {{MAX_PR_BODY_CHARS}} characters, and must:
+
 * clearly identify itself as a fresh reimplementation
 * link the superseded PR
 * explain why reimplementation was chosen
@@ -691,78 +718,39 @@ Do not reproduce dozens of historical comments in the PR body.
 
 Summarize them by root-cause category.
 
-## Required: the issue's implementation marker
+## What published text may contain
 
-The replacement becomes the issue's implementation PR, and the controller
-identifies the issue's implementation PR by one marker only, never by branch
-name or issue linkage. Put this line in the replacement PR body **verbatim**,
-exactly once, in the body you pass to `gh pr create`:
+`pr_title` and `pr_body` are published on GitHub as you return them. Either
+is rejected, and you are asked to correct it, when it contains:
 
-```text
-{{IMPLEMENTATION_MARKER}}
-```
+- an HTML comment opening a controller marker (`<!-- ai-` or
+  `<!-- autoforge-`, in any spacing or case);
+- anything shaped like a credential (a token, a key, an authorization
+  header, a URL with a password);
+- a closing keyword followed by an issue reference (`Closes #12`,
+  `fixes owner/repo#3`, `Resolves GH-4`), even inside code: GitHub would
+  act on it, and the controller links this issue itself;
+- an `@` that would mention a user or team outside a code span or a fenced
+  block. Put such tokens in a code span (`` `@name` ``).
 
-Without it the replacement is refused: a PR the controller could not find
-again after a restart is never activated. Never put it in the body of any
-other PR, and never copy another PR's implementation marker into yours. It is
-a different marker from the transaction marker below; the replacement PR body
-carries both.
+## The counts the transaction marker attests
 
-## Required: the replan transaction marker
+The controller identifies the replacement PR by the transaction marker it
+renders, never by shape, and treats that marker as the authoritative
+attestation when it binds the PR, before it closes the superseded PR, and
+after a crash. It renders the marker from your result:
 
-The controller does **not** identify your replacement PR by shape. "The only
-other open PR on this issue" is not proof of anything, and a PR that already
-existed before this replan is never adopted. The replacement PR is recognised
-only by a machine-readable marker in its **PR body**, which you must include
-verbatim except for the numeric fields:
-
-```text
-{{REPLAN_MARKER}}
-```
-
-Rules:
-
-* Put it in the replacement PR body (an HTML comment, so it stays invisible in
-  the rendered description). One marker, exactly once.
-* Leave it there. The controller re-reads the body one last time immediately
-  before it closes the superseded PR, and refuses if the marker has been
-  removed or now attests different numbers. Do not "tidy" the body afterwards.
-* Include it in the body you pass to `gh pr create`, not in a later edit. If
-  the controller crashes between your PR creation and your `CONTROL_RESULT`, a
-  PR that already carries the marker is recovered and adopted, while one
-  without it is invisible to the controller and the replan is restarted.
-* It must go on a PR **you create for this replan**. The controller recorded
-  the repository's highest pull-request number before this transaction existed,
-  and refuses any PR at or below it. Adding the marker to an already-open PR
-  (including the one being superseded, or an unrelated one you also happen to
-  be working on) rejects the replan; it does not adopt that PR.
-* Exactly one marker in the body *in total*, and nothing marker-shaped beside
-  it. Any complete `<!-- autoforge-replan-transaction: ... -->` comment whose
-  payload is not a valid attestation (prose, an example, an empty payload) is
-  an unusable marker, and a body carrying one is refused even when a valid
-  marker sits beside it. A second marker that *is* valid but carries a
-  different `transaction_id` is refused too: a body naming two transactions
-  proves neither. Do not quote these instructions in the PR body, and do not
-  copy a marker out of another PR's description into yours.
-* `transaction_id` must be exactly `{{REPLAN_TRANSACTION_ID}}`. Do not invent,
-  shorten or reformat it. Do not copy it into any other PR.
 * `execution_attempt` must be exactly `{{EXECUTION_ATTEMPT}}`.
-* `findings_considered` must be the real number of historical actionable
-  findings you analysed, and must be at least `{{HISTORICAL_FINDING_COUNT}}`,
-  the count the controller preserved. If you cannot honestly account for all of
-  them, return the blocked result in section 27 instead of lowering the number.
-* `unique_constraints` must be the deduplicated count and must not exceed
-  `findings_considered`.
-* `tests_passed` must be your real verification outcome. `false` here means the
-  controller refuses the replacement; it never means "close the old PR anyway".
-
-The same numbers must appear in your `CONTROL_RESULT`. The controller reads the
-marker back from GitHub and treats it, not your stdout, as the authoritative
-attestation; a mismatch between the two is a rejection.
-
-Without a correct marker the replacement is not found at all: the previous PR
-stays open and the run blocks for a human. Nothing you write in prose can
-substitute for it.
+* `historical_findings_considered` must be the real number of historical
+  actionable findings you analysed, and must be at least
+  `{{HISTORICAL_FINDING_COUNT}}`, the count the controller preserved. If you
+  cannot honestly account for all of them, return the blocked result in
+  section 27 instead of lowering the number.
+* `unique_failure_constraints` must be the deduplicated count and must not
+  exceed `historical_findings_considered`.
+* `verification.tests_passed` must be your real verification outcome. `false`
+  means the controller refuses the replacement before anything is pushed; it
+  never means "close the old PR anyway".
 
 ---
 
@@ -801,7 +789,7 @@ Adapt to repository conventions.
 
 # 22. Previous PR disposition
 
-Once the replacement PR exists:
+Once the controller has created and verified the replacement PR:
 
 the controller, not you, closes the previous PR without merging it and posts
 the supersession link. Do not run `gh pr close` or otherwise close the previous
@@ -855,7 +843,7 @@ so historical failure information is not lost.
 
 # 24. Do not reset escalation history completely
 
-A new branch does not mean AutoForge should forget the issue has already failed to converge once.
+A fresh implementation does not mean AutoForge should forget the issue has already failed to converge once.
 
 The controller should retain something equivalent to:
 
@@ -894,7 +882,7 @@ produced, return the blocked result below rather than fabricating success.
 
 # 26. CONTROL_RESULT
 
-After successfully creating and verifying the replacement PR, stdout must end with exactly one:
+After committing and verifying the replacement implementation, stdout must end with exactly one:
 
 ```text
 <<<CONTROL_RESULT>>>
@@ -903,11 +891,9 @@ After successfully creating and verifying the replacement PR, stdout must end wi
   "status": "success",
   "issue_url": "{{ISSUE_URL}}",
   "previous_pr_url": "{{PREVIOUS_PR_URL}}",
-  "replacement_pr_url": "https://github.com/...",
   "previous_branch": "{{PREVIOUS_BRANCH}}",
-  "replacement_branch": "...",
   "previous_head_sha": "{{PREVIOUS_HEAD_SHA}}",
-  "replacement_head_sha": "...",
+  "head_sha": "<git rev-parse HEAD in this worktree, 40 hex chars>",
   "execution_attempt": {{EXECUTION_ATTEMPT}},
   "historical_findings_considered": {{HISTORICAL_FINDING_COUNT}},
   "unique_failure_constraints": 2,
@@ -916,12 +902,21 @@ After successfully creating and verifying the replacement PR, stdout must end wi
   "verification": {
     "tests_run": [],
     "tests_passed": true
-  }
+  },
+  "pr_title": "<one-line PR title>",
+  "pr_body": "<PR body, Markdown: the sections of section 21>"
 }
 <<<END_CONTROL_RESULT>>>
 ```
 
 Use actual values.
+
+`head_sha` is a cross-check: the controller reads this worktree's `HEAD`
+itself, and rejects the replacement when `head_sha` differs from it or when
+the commit is `{{BASE_SHA}}` itself or does not descend from it. A `HEAD`
+attached to a local branch is corrected, not published. There is no
+`replacement_pr_url` or `replacement_branch` field: you create no PR and
+choose no branch.
 
 `historical_findings_considered` means the number of historical actionable findings actually analyzed.
 
@@ -929,9 +924,9 @@ Use actual values.
 recorded by the controller alongside the superseded PR; report the real number (the `2` above is only an example)
 and never a value greater than `historical_findings_considered`.
 
-These values must equal the ones in the replan transaction marker on the
-replacement PR body (section 20). The controller compares them; a disagreement
-between your stdout and the published marker rejects the replacement.
+The controller renders these values into the replan transaction marker on
+the replacement PR (section 20), and compares the marker it reads back from
+GitHub with them; a disagreement rejects the replacement.
 
 ---
 
@@ -983,4 +978,4 @@ Re-derive the solution from:
 * current standards
 * accumulated failure knowledge
 
-and execute it cleanly from a fresh branch.
+and execute it cleanly from the fresh default branch head.
