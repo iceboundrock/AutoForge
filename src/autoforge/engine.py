@@ -1971,7 +1971,9 @@ class ControllerEngine:
             effort=profile.effort,
             command=command,
             limits=self.config.agent_limits(profile),
-            loop_detection=self.config.execution.loop_detection,
+            loop_detection=self.config.execution.loop_detection.for_invocation(
+                profile.provider, s.phase.value
+            ),
             prompt_length=len(prompt),
             prompt_preview=prompt[:1200],
             prompt_full=prompt,
@@ -2083,7 +2085,9 @@ class ControllerEngine:
             effort=profile.effort,
             command=command,
             limits=self.config.agent_limits(profile),
-            loop_detection=self.config.execution.loop_detection,
+            loop_detection=self.config.execution.loop_detection.for_invocation(
+                profile.provider, s.phase.value
+            ),
             prompt_length=len(prompt),
             prompt_preview=prompt[:1200],
             prompt_full=prompt,
@@ -7765,7 +7769,7 @@ class ControllerEngine:
                 cwd=cwd,
                 idle_timeout_seconds=limits.idle_timeout_seconds,
                 max_runtime_seconds=limits.max_runtime_seconds,
-                loop_detection=self.config.execution.loop_detection.as_dict(),
+                loop_detection=req.loop_detection.as_dict(),
                 metadata={
                     **self._log_metadata(phase),
                     "env_allowlist": list(provider.environment_allowlist(req) or ()),

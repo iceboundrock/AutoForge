@@ -214,7 +214,8 @@ def test_the_largest_real_run_figures_draw_no_warning_under_the_defaults():
     """#199: legitimate work stays below half of every default threshold, the
     level from which the detector warns, so the default ``kill`` never ends it."""
     warnings: list[str] = []
-    monitor = LoopMonitor(LoopDetectionConfig(), 0.0, warnings.append)
+    config = LoopDetectionConfig().for_invocation("claude", "ANALYZE_EXECUTE")
+    monitor = LoopMonitor(config, 0.0, warnings.append)
     assert monitor.mode == "kill"
     # OpenCode's trace: one log line, its timestamps masked, then another.
     trace = b"".join(
@@ -237,6 +238,13 @@ def test_the_largest_real_run_figures_draw_no_warning_under_the_defaults():
     ) == REAL_NOVELTY_FREE
     assert calibration["loop_max_cycle_repeats"] == calibration["loop_max_retry_streak"] == 0
     assert warnings == [] and monitor.report(killed=False) is None
+
+
+def test_a_monitor_refuses_a_mode_no_invocation_resolved():
+    """#199: an unset mode is ``kill`` or ``warn`` depending on the provider
+    and phase, which a monitor does not know; it is refused, not guessed."""
+    with pytest.raises(ValueError, match="for_invocation"):
+        LoopMonitor(LoopDetectionConfig(), 0.0)
 
 
 # -- B: no novelty --------------------------------------------------------------
@@ -582,7 +590,7 @@ def test_e2e_the_default_kills_a_looping_agent_and_leaves_the_phase_unchanged(
     eng, state_dir = _engine_on_fake_claude(
         tmp_path, fake_github, _looping_lines(12, secret=TOKEN, tail=[{"sleep": 30}])
     )
-    assert eng.config.execution.loop_detection == LoopDetectionConfig(mode="kill")
+    assert eng.config.execution.loop_detection == LoopDetectionConfig()
     lines: list[str] = []
     eng.progress_output = lines.append
     started = time.monotonic()

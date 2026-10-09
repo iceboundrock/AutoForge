@@ -267,7 +267,8 @@ profile; see [Configuration: Agent limits](configuration.md#agent-limits).
   ([Loop detection](#loop-detection)), and one that keeps doing new things
   runs until the executor's one-week backstop. Set `max_runtime_seconds`
   on a profile when an unattended run must end by a known time, and always
-  when loop detection is set to `warn` or `off`.
+  where loop detection only warns or is off: with `warn` or `off`, and by
+  default on a Pi profile and in `UPDATE_EPIC`.
 - **A silent tool call counts as no progress.** A test suite that runs for
   twenty minutes inside one shell command and prints nothing until it ends
   looks exactly like a hang. If your project has one, raise
@@ -305,7 +306,8 @@ agent is killed:
 The warning repeats at most every two minutes while the loop goes on, and
 the step's `execution.json` records it (`loop`, `loop_warnings`).
 
-- **In `kill` mode (the default)** the agent is killed at the threshold,
+- **In `kill` mode (the default, except on a Pi profile and in
+  `UPDATE_EPIC`)** the agent is killed at the threshold,
   exactly as on a timeout: its whole process group is ended, the state is
   unchanged and nothing is retried automatically. The error names the
   pattern:
@@ -323,7 +325,9 @@ the step's `execution.json` records it (`loop`, `loop_warnings`).
 - **In `warn` mode** the agent runs on past the threshold, and the
   progress output says `loop detected, not killed (mode warn): …` instead.
   Watch for these lines, and stop the run (`Ctrl-C`) if the agent is
-  stuck.
+  stuck. A config that does not set `mode` runs a Pi profile and
+  `UPDATE_EPIC` this way, because no real run has measured either yet;
+  `mode: kill` kills there too. The launch line names the mode in force.
 
 **After a loop kill**, look at the agent worktree and the PR the way you
 would after a timeout: the agent may have pushed part of its work. Then
@@ -336,7 +340,7 @@ In every mode, `off` included, `provider_summary` in `execution.json`
 records the `loop_*` calibration fields: how close the invocation came to
 each threshold. The defaults were checked against those fields from real
 runs (#199,
-[Configuration: Loop detection](configuration.md#loop-detection)).
+[Configuration: How the defaults were set](configuration.md#how-the-defaults-were-set)).
 
 ## Dry run
 

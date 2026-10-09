@@ -37,9 +37,9 @@ execution:
   # A wall-clock ceiling on every agent, however much it writes; a profile
   # overrides it with `max_runtime_seconds`. null (the default): none, so an
   # active agent is bounded only by `loop_detection` below (in `kill` mode,
-  # the default) and the executor's one-week backstop. Required for a Claude
-  # profile with `output_format: text`, which writes nothing until it exits
-  # and so runs under this limit alone.
+  # the default outside Pi and UPDATE_EPIC) and the executor's one-week
+  # backstop. Required for a Claude profile with `output_format: text`,
+  # which writes nothing until it exits and so runs under this limit alone.
   default_max_runtime_seconds: null
   # An agent that keeps producing output while it repeats itself resets the
   # idle timer forever. Loop detection watches what it does instead: the
@@ -57,9 +57,11 @@ execution:
   # `resume` relaunches it); `warn` only reports it and lets the agent run
   # on; `off` reports nothing. Every mode records in `provider_summary` how
   # close each run came to the thresholds; real runs stayed below half of
-  # every one of these defaults (#199).
+  # every one of these defaults (#199). No real run has measured a Pi
+  # profile or UPDATE_EPIC yet, so while `mode` is unset those only warn;
+  # a `mode` you set applies to every provider and phase.
   loop_detection:
-    mode: kill
+    # mode: kill
     max_cycle_period: 4
     max_cycle_repeats: 8
     novelty_window_seconds: 1800

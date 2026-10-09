@@ -1914,14 +1914,49 @@ def test_example_yaml_with_the_pi_block_enabled_loads_and_validates(tmp_path, ya
 # -- execution.loop_detection (#194) ---------------------------------------------
 def test_loop_detection_defaults_to_kill_with_the_calibrated_thresholds():
     """#199: ``kill`` by default, the thresholds #194 proposed kept after real
-    runs stayed below half of each; ``warn`` and ``off`` stay available."""
+    runs stayed below half of each; ``warn`` and ``off`` stay available. The
+    mode is left unset so that what no real run measured only warns."""
     loop = default_config().execution.loop_detection
-    assert loop == config.LoopDetectionConfig("kill", 4, 8, 1800, 200)
+    assert loop == config.LoopDetectionConfig(None, 4, 8, 1800, 200)
     assert config.LOOP_DETECTION_MODES == ("kill", "warn", "off")
     assert loop.describe() == (
-        "loop detection kill (cycles of up to 4 actions x8, no new action for 1800s, "
-        "repeated lines x200)"
+        "loop detection kill (warn on provider pi and in UPDATE_EPIC: not calibrated yet) "
+        "(cycles of up to 4 actions x8, no new action for 1800s, repeated lines x200)"
     )
+
+
+@pytest.mark.parametrize(
+    ("provider", "phase", "mode"),
+    [
+        ("claude", "ANALYZE_EXECUTE", "kill"),
+        ("claude", "FIX", "kill"),
+        ("opencode", "REVIEW", "kill"),
+        ("claude", "REPLAN_REEXECUTE", "kill"),
+        ("pi", "ANALYZE_EXECUTE", "warn"),
+        ("pi", "REVIEW", "warn"),
+        ("claude", "UPDATE_EPIC", "warn"),
+        ("opencode", "UPDATE_EPIC", "warn"),
+        ("pi", "UPDATE_EPIC", "warn"),
+    ],
+)
+def test_the_unset_mode_kills_only_where_real_runs_calibrated_it(provider, phase, mode):
+    """#199 (R1-F2): no real run had used Pi or reached UPDATE_EPIC, so with
+    ``mode`` unset an invocation there warns instead of being killed; every
+    other one is killed. The thresholds are the same everywhere."""
+    loop = config.LoopDetectionConfig().for_invocation(provider, phase)
+    assert loop == config.LoopDetectionConfig(mode, 4, 8, 1800, 200)
+    assert loop.as_dict()["mode"] == mode
+    assert loop.describe().startswith(f"loop detection {mode} (cycles of up to 4 actions")
+
+
+@pytest.mark.parametrize("mode", config.LOOP_DETECTION_MODES)
+def test_a_mode_the_config_sets_applies_to_every_provider_and_phase(tmp_path, mode):
+    p = tmp_path / "cfg.json"
+    p.write_text(f'{{"version": 1, "execution": {{"loop_detection": {{"mode": "{mode}"}}}}}}')
+    loop = load_config_file(p).execution.loop_detection
+    for provider, phase in (("pi", "FIX"), ("claude", "UPDATE_EPIC"), ("claude", "FIX")):
+        assert loop.for_invocation(provider, phase) is loop
+        assert loop.for_invocation(provider, phase).mode == mode
 
 
 def test_loop_detection_reads_every_key_from_yaml(tmp_path, yaml_backend):
@@ -1975,8 +2010,10 @@ def test_loop_detection_refuses_a_bad_value(tmp_path, section, message):
 
 
 def test_the_example_config_shows_loop_detection_in_kill_mode(tmp_path, no_pyyaml):
+    """The example leaves ``mode`` unset, as the default does (#199): set,
+    it would also kill on Pi and in UPDATE_EPIC."""
     import autoforge
 
     example = Path(autoforge.__file__).parents[2] / "autoforge.example.yaml"
-    assert "  loop_detection:\n    mode: kill\n" in example.read_text(encoding="utf-8")
+    assert "  loop_detection:\n    # mode: kill\n" in example.read_text(encoding="utf-8")
     assert load_config_file(example).execution.loop_detection == config.LoopDetectionConfig()

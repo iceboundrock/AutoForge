@@ -38,7 +38,7 @@ from __future__ import annotations
 import fnmatch
 import re
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from . import __prompt_version__
@@ -147,6 +147,12 @@ EXECUTION_KEYS = (
 # real runs stayed below half of every default threshold (the margins are in
 # docs/configuration.md, "How the defaults were set").
 LOOP_DETECTION_MODES = ("kill", "warn", "off")
+# The providers and phases no real run had recorded the calibration figures
+# for when #199 made ``kill`` the default. Until they have, an invocation on
+# one of them only warns unless ``mode`` is set (``mode: kill`` kills there
+# too); see ``LoopDetectionConfig.for_invocation``.
+LOOP_DETECTION_UNCALIBRATED_PROVIDERS = ("pi",)
+LOOP_DETECTION_UNCALIBRATED_PHASES = ("UPDATE_EPIC",)
 LOOP_DETECTION_KEYS = (
     "mode",
     "max_cycle_period",
@@ -226,18 +232,40 @@ class LoopDetectionConfig:
     ``max_cycle_period * max_cycle_repeats`` of them were replayed; a line of
     unstructured output, or a cycle of up to ``max_cycle_period`` lines,
     repeated ``max_line_repeats`` times in a row. See ``autoforge.loop_detect``.
+
+    ``mode`` ``None`` is a config that does not set it: ``kill``, except on
+    an uncalibrated provider or phase, which only warns (#199). A launch runs
+    under :meth:`for_invocation`, which always names the mode.
     """
 
-    mode: str = "kill"
+    mode: str | None = None
     max_cycle_period: int = 4
     max_cycle_repeats: int = 8
     novelty_window_seconds: int = 1800
     max_line_repeats: int = 200
 
+    def for_invocation(self, provider: str, phase: str) -> LoopDetectionConfig:
+        """This config with the mode one invocation of ``provider`` in
+        ``phase`` runs under; a mode the config sets applies everywhere."""
+        if self.mode is not None:
+            return self
+        uncalibrated = (
+            provider in LOOP_DETECTION_UNCALIBRATED_PROVIDERS
+            or phase in LOOP_DETECTION_UNCALIBRATED_PHASES
+        )
+        return replace(self, mode="warn" if uncalibrated else "kill")
+
     def describe(self) -> str:
         """The mode and thresholds, for the dry-run plan and ``doctor``."""
+        mode = self.mode or (
+            "kill (warn on provider "
+            + ", ".join(LOOP_DETECTION_UNCALIBRATED_PROVIDERS)
+            + " and in "
+            + ", ".join(LOOP_DETECTION_UNCALIBRATED_PHASES)
+            + ": not calibrated yet)"
+        )
         return (
-            f"loop detection {self.mode} (cycles of up to {self.max_cycle_period} actions "
+            f"loop detection {mode} (cycles of up to {self.max_cycle_period} actions "
             f"x{self.max_cycle_repeats}, no new action for {self.novelty_window_seconds}s, "
             f"repeated lines x{self.max_line_repeats})"
         )

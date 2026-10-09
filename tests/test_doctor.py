@@ -161,13 +161,14 @@ def test_doctor_reports_the_limits_of_every_reachable_profile(tmp_path):
 
 
 def test_doctor_shows_the_loop_detection_mode_and_thresholds(tmp_path):
-    """#194: informational; the default is kill (#199)."""
+    """#194: informational; the default is kill, and warn where no real run
+    has calibrated it yet (#199)."""
     d = Doctor(cwd=str(tmp_path), runner=_runner_factory())
     row = {r.name: r for r in d.run_all()}["loop detection"]
     assert row.ok and not row.required
     assert row.detail == (
-        "loop detection kill (cycles of up to 4 actions x8, no new action for 1800s, "
-        "repeated lines x200)"
+        "loop detection kill (warn on provider pi and in UPDATE_EPIC: not calibrated yet) "
+        "(cycles of up to 4 actions x8, no new action for 1800s, repeated lines x200)"
     )
     cfg = tmp_path / "c.json"
     cfg.write_text(json.dumps({"version": 1, "execution": {"loop_detection": {"mode": "warn"}}}))

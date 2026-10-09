@@ -419,7 +419,14 @@ class LoopMonitor:
         *,
         warn_interval: float = WARN_INTERVAL_SECONDS,
     ) -> None:
-        self.mode = config.mode
+        if config.mode is None:
+            # Unset means "kill unless uncalibrated", which only the
+            # invocation's provider and phase decide (#199).
+            raise ValueError(
+                "LoopMonitor needs the mode of one invocation: pass "
+                "LoopDetectionConfig.for_invocation(provider, phase)"
+            )
+        self.mode: str = config.mode
         self._period = config.max_cycle_period
         self._cycle_repeats = config.max_cycle_repeats
         self._window = float(config.novelty_window_seconds)
