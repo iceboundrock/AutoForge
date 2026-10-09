@@ -3,6 +3,7 @@
 import dataclasses
 import hashlib
 import json
+import os
 import sys
 import time
 
@@ -131,6 +132,101 @@ def test_opencode_auto_flag_and_extra_args():
     argv = OpenCodeProvider().build_command_for(p, "x")
     assert argv[argv.index("-m") + 1] == "openai/gpt-5.6-sol#medium"
     assert argv[-3:] == ["--auto", "--agent", "reviewer"]
+
+
+def test_opencode_transport_override_merges_inline_config(monkeypatch):
+    existing = {
+        "default_agent": "build",
+        "providers": {"openai": {"settings": {"timeout": 1234}}},
+    }
+    monkeypatch.setenv("OPENCODE_CONFIG_CONTENT", json.dumps(existing))
+    p = ProfileConfig(
+        name="review",
+        provider="opencode",
+        model="openai/gpt-6-luna",
+        effort="xhigh",
+        options={"openai_transport": "http"},
+    )
+    seen = []
+    OpenCodeProvider(runner=_capture_runner(seen)).execute(
+        AgentRequest("REVIEW", "review", "/tmp", p, None, 7)
+    )
+
+    assert json.loads(seen[0].env["OPENCODE_CONFIG_CONTENT"]) == {
+        "default_agent": "build",
+        "providers": {"openai": {"settings": {"timeout": 1234, "transport": "http"}}},
+    }
+    assert json.loads(os.environ["OPENCODE_CONFIG_CONTENT"]) == existing
+
+
+def test_opencode_transport_refuses_malformed_inline_config_without_echoing_it(monkeypatch):
+    malformed = '{"private_value":"never echo this'
+    monkeypatch.setenv("OPENCODE_CONFIG_CONTENT", malformed)
+    p = ProfileConfig(
+        name="review",
+        provider="opencode",
+        model="openai/gpt-6-luna",
+        options={"openai_transport": "http"},
+    )
+    with pytest.raises(ConfigurationError) as err:
+        OpenCodeProvider(runner=_capture_runner([])).execute(
+            AgentRequest("REVIEW", "review", "/tmp", p, None, 7)
+        )
+    assert "OPENCODE_CONFIG_CONTENT" in str(err.value)
+    assert "never echo this" not in str(err.value)
+
+
+@pytest.mark.parametrize("transport", ["ws", "HTTP", "", "auto"])
+def test_opencode_rejects_an_unknown_openai_transport(transport):
+    p = ProfileConfig(
+        name="review",
+        provider="opencode",
+        model="openai/gpt-6-luna",
+        options={"openai_transport": transport},
+    )
+    with pytest.raises(ConfigurationError, match="openai_transport"):
+        OpenCodeProvider().validate_profile(p)
+
+
+def test_opencode_openai_transport_rejects_other_model_providers():
+    p = ProfileConfig(
+        name="review",
+        provider="opencode",
+        model="anthropic/claude-sonnet",
+        options={"openai_transport": "http"},
+    )
+    with pytest.raises(ConfigurationError, match="only applies to models from the openai"):
+        OpenCodeProvider().validate_profile(p)
+
+
+def test_opencode_openai_websocket_disconnect_is_actionable():
+    from autoforge.executor import ExecutionResult
+
+    def runner(req):
+        return ExecutionResult(
+            req.command,
+            req.cwd,
+            1,
+            "complete response",
+            "Error: WebSocket closed with code 1000",
+            "t",
+            "t",
+        )
+
+    p = ProfileConfig(
+        name="review",
+        provider="opencode",
+        model="openai/gpt-6-luna",
+        options={"output_format": "default"},
+    )
+    result = OpenCodeProvider(runner=runner).execute(
+        AgentRequest("REVIEW", "review", "/tmp", p, None, 7)
+    )
+    assert result.exit_code == 1
+    assert result.provider_failure == (
+        "opencode: OpenAI WebSocket transport closed (code 1000); "
+        "set this profile's options.openai_transport to 'http', then resume"
+    )
 
 
 def test_opencode_rejects_a_variant_in_the_model():
@@ -1198,6 +1294,7 @@ def test_every_real_provider_declares_only_valid_environment_patterns():
     [
         ("claude", "fable", "permision_mode"),
         ("claude", "fable", "auto_approve"),  # an OpenCode knob on a Claude profile
+        ("claude", "fable", "openai_transport"),  # OpenCode v2 only
         ("opencode", "openai/gpt-5.6-luna", "permission_mode"),
         ("opencode", "openai/gpt-5.6-luna", "autoapprove"),
         ("pi", "openai/gpt-5.6-terra", "require_oath"),
@@ -1217,9 +1314,19 @@ def test_an_unknown_option_key_is_rejected_with_the_profile_and_accepted_set(pro
 
 
 def test_the_shipped_option_keys_are_accepted():
-    for name in ("analyze_execute", "fix", "review_round_1", "update_epic"):
+    for name in (
+        "analyze_execute",
+        "fix",
+        "review_round_1",
+        "review_round_2_5",
+        "review_round_6_plus",
+        "replan_reexecute",
+        "update_epic",
+    ):
         p = default_config().profile(name)
         provider_for(p).validate_profile(p)
+        if p.provider == "opencode":
+            assert p.options["openai_transport"] == "http"
     claude = ProfileConfig(
         name="x", provider="claude", model="fable", options={"session_persistence": "true"}
     )

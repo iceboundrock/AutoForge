@@ -1738,6 +1738,16 @@ def test_example_config_is_the_same_on_both_yaml_backends(monkeypatch):
     pyyaml, subset = load_both_yaml_backends(example, monkeypatch)
     # Not vacuously true: the example must load, not merely fail on both.
     assert pyyaml[0] == "ok" and subset[0] == "ok"
+    assert all(
+        pyyaml[1].profile(name).options["openai_transport"] == "http"
+        for name in (
+            "review_round_1",
+            "review_round_2_5",
+            "review_round_6_plus",
+            "replan_reexecute",
+            "update_epic",
+        )
+    )
 
 
 def test_dev_group_keeps_pyyaml_so_ci_exercises_the_pyyaml_branch():

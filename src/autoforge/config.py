@@ -689,7 +689,11 @@ def _opencode_profile(name: str, model: str, effort: str) -> ProfileConfig:
         effort=effort,
         command="opencode",
         extra_args=[],
-        options={"output_format": "default", "auto_approve": "false"},
+        options={
+            "output_format": "default",
+            "auto_approve": "false",
+            "openai_transport": "http",
+        },
     )
 
 

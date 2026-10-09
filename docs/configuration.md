@@ -353,6 +353,12 @@ to pass each provider's check. The profile's fields map as follows:
 - `options.output_format` must be `default` (the final assistant text on
   stdout, tool traces on stderr), and `options.auto_approve: true` adds
   `--auto`.
+- `options.openai_transport` (`http` or `websocket`) applies to `openai/*`
+  models. It sets OpenCode v2's `providers.openai.settings.transport` for only
+  that invocation through `OPENCODE_CONFIG_CONTENT`, preserving other inline
+  JSON settings. AutoForge defaults this to `http` because OpenAI Responses
+  WebSocket sessions can intermittently close before the CLI completes; set
+  it to `websocket` only if you explicitly prefer that transport.
 - `extra_args` are appended after the adapter's own flags.
 
 The prompt travels on stdin, never in argv: OpenCode 2 duplicates or
