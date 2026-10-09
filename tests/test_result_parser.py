@@ -39,6 +39,7 @@ from autoforge.result_parser import (
     FixResult,
     LocalFixResult,
     LocalReviewResult,
+    ReplanReexecuteResult,
     ReviewResult,
     UpdateEpicRequest,
     UpdateEpicResult,
@@ -56,7 +57,7 @@ from autoforge.result_parser import (
     validate_roadmap_section,
 )
 from autoforge.transitions import Phase, WorkflowMode
-from tests.conftest import BRANCH, ISSUE, PR, REVIEW_PROSE, SHA_A, SHA_B, block, comment_url
+from tests.conftest import BRANCH, ISSUE, PR, REVIEW_PROSE, SHA_A, SHA_B, SHA_C, block, comment_url
 
 GOOD_REVIEW = {
     "phase": "REVIEW",
@@ -255,6 +256,66 @@ def test_analyze_result_names_no_target():
     chooses the branch and opens the PR itself."""
     parsed = AnalyzeExecuteResult.from_payload(dict(_ANALYZE, pr_url=PR, branch="feature/x"))
     assert not hasattr(parsed, "pr_url") and not hasattr(parsed, "branch")
+
+
+def _replan(**changes: object) -> dict:
+    payload = {
+        "phase": "REPLAN_REEXECUTE",
+        "status": "success",
+        "previous_head_sha": SHA_A,
+        "head_sha": SHA_B,
+        **_REPLAN_REST,
+    }
+    payload.update(changes)
+    return payload
+
+
+def test_replan_result_carries_the_commit_and_the_pr_text():
+    """#164: the agent reports the commit it made and the replacement PR's text;
+    the controller derives the branch, pushes and creates the PR."""
+    parsed = ReplanReexecuteResult.from_payload(_replan(head_sha=SHA_B.upper()))
+    assert parsed.head_sha == SHA_B
+    assert (parsed.pr_title, parsed.pr_body) == ("Reimplement it", "A fresh reimplementation.")
+    for missing in ("head_sha", "pr_title", "pr_body"):
+        bad = _replan()
+        del bad[missing]
+        with pytest.raises(ControlResultValidationError, match=missing):
+            parse_control_result(block(bad), Phase.REPLAN_REEXECUTE)
+
+
+def test_replan_result_names_no_replacement_target():
+    """#164: a replacement PR, branch or head an agent still reports is not read."""
+    parsed = ReplanReexecuteResult.from_payload(
+        _replan(
+            replacement_pr_url="https://github.com/owner/repo/pull/8",
+            replacement_branch=BRANCH + "-r2",
+            replacement_head_sha=SHA_C,
+        )
+    )
+    for name in ("replacement_pr_url", "replacement_branch", "replacement_head_sha"):
+        assert not hasattr(parsed, name)
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "rule"),
+    [
+        ("pr_title", "Reimplement\nit", "control character"),
+        ("pr_title", "x" * 257, "at most 256"),
+        ("pr_body", "x" * 60001, "at most 60000"),
+        ("pr_body", 'Done.\n<!-- autoforge-replan-transaction: {"x": 1} -->', "controller marker"),
+        ("pr_body", "Done.\n\nCloses #2", "closing keyword"),
+        ("pr_title", "Resolves GH-4", "closing keyword"),
+        ("pr_body", "Thanks @octocat", "@-mention"),
+        ("pr_body", "Set GH_TOKEN=FAKEtoken123456 first", "credential-shaped"),
+    ],
+)
+def test_replan_pr_text_is_held_to_the_published_policy(key, value, rule):
+    """#164: the controller publishes the replacement PR's text as given, so the
+    result is refused rather than the text rewritten, under the phase's name."""
+    with pytest.raises(ControlResultValidationError, match=rule) as info:
+        ReplanReexecuteResult.from_payload(_replan(**{key: value}))
+    assert str(info.value).startswith("REPLAN_REEXECUTE")
+    assert "octocat" not in str(info.value) and "FAKEtoken" not in str(info.value)
 
 
 def test_failure_status_skips_schema_but_needs_message():
@@ -1022,15 +1083,15 @@ def test_fix_commit_sha_must_be_a_full_sha_when_present():
 _REPLAN_REST = {
     "issue_url": ISSUE,
     "previous_pr_url": PR,
-    "replacement_pr_url": "https://github.com/owner/repo/pull/8",
     "previous_branch": BRANCH,
-    "replacement_branch": BRANCH + "-r2",
     "execution_attempt": 2,
     "historical_findings_considered": 1,
     "unique_failure_constraints": 1,
     "previous_pr_disposition": "superseded",
     "fresh_review_round": 1,
     "verification": {"tests_run": ["pytest"], "tests_passed": True},
+    "pr_title": "Reimplement it",
+    "pr_body": "A fresh reimplementation.",
 }
 
 _SHA_FIELDS = [
@@ -1065,7 +1126,7 @@ _SHA_FIELDS = [
     pytest.param(
         Phase.REPLAN_REEXECUTE,
         WorkflowMode.REMOTE,
-        dict(_REPLAN_REST, replacement_head_sha=SHA_B),
+        dict(_REPLAN_REST, head_sha=SHA_B),
         "previous_head_sha",
         id="REPLAN_REEXECUTE.previous_head_sha",
     ),
@@ -1073,8 +1134,8 @@ _SHA_FIELDS = [
         Phase.REPLAN_REEXECUTE,
         WorkflowMode.REMOTE,
         dict(_REPLAN_REST, previous_head_sha=SHA_B),
-        "replacement_head_sha",
-        id="REPLAN_REEXECUTE.replacement_head_sha",
+        "head_sha",
+        id="REPLAN_REEXECUTE.head_sha",
     ),
 ]
 

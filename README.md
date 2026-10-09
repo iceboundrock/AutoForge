@@ -24,7 +24,8 @@ Issue → ANALYZE_EXECUTE (Claude Code) → controller pushes, opens PR → REVI
        → clean ───────────────────────────────▶ READY_FOR_MERGE
        → findings ────────────────────────────▶ FIX (Claude Code) → REVIEW …
        → excessive / low-finding stagnation ──▶ REPLAN_REEXECUTE (OpenCode)
-                                                    → replacement PR → REVIEW round 1
+                                                    → controller pushes, opens replacement PR
+                                                    → REVIEW round 1
                                        ├─ merge gate closed (default): stops here; human merges
                                        └─ gate open: controller verifies on GitHub
                                           → MERGE (gh pr merge by the controller, no agent)

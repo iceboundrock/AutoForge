@@ -42,7 +42,10 @@ the rule, never the text. An ANALYZE_EXECUTE result carries the PR title
 and body the controller publishes (``pr_title``, ``pr_body``), under that
 policy and bounded (``MAX_PR_TITLE_CHARS``, ``MAX_PR_BODY_CHARS``), plus
 the issue URL and the candidate SHA as cross-checks; it names no PR, branch
-or push target (#161). A REMOTE REVIEW result carries the prose sections of
+or push target (#161). A REPLAN_REEXECUTE result carries the replacement
+PR's title and body under the same policy and bounds, the candidate SHA and
+the transaction checkpoint's cross-checks, and names no replacement PR,
+branch or push target either (#164). A REMOTE REVIEW result carries the prose sections of
 the review comment the controller renders and posts (``spec``,
 ``standards``, ``assessment``, ``observations``, ``verification``,
 ``summary``), each under that policy and bounded
@@ -816,18 +819,17 @@ class AnalyzeExecuteResult:
         )
 
 
-def _analyze_published(text: str, key: str) -> str:
-    """Refuse ANALYZE_EXECUTE field ``key`` under the published-content policy."""
+def _published_field(text: str, key: str, phase: str) -> str:
+    """Refuse ``phase``'s field ``key`` under the published-content policy."""
     problem = published_text_problem(key, text)
     if problem is not None:
-        raise ControlResultValidationError(f"ANALYZE_EXECUTE: field {problem}")
+        raise ControlResultValidationError(f"{phase}: field {problem}")
     return text
 
 
-def _analyze_pr_text(
-    text: str, key: str, limit: int, lines: Callable[[str, str, str, str], str]
+def _pr_text(
+    text: str, key: str, limit: int, lines: Callable[[str, str, str, str], str], ph: str
 ) -> str:
-    ph = "ANALYZE_EXECUTE"
     if not isinstance(text, str):
         raise ControlResultValidationError(f"{ph}: field {key!r} must be a string")
     if not text.strip():
@@ -835,33 +837,36 @@ def _analyze_pr_text(
             f"CONTROL_RESULT for {ph} missing required field {key!r}"
         )
     text = _bounded(text, ph, "result", key, limit)
-    return _analyze_published(lines(text, ph, "result", key), key)
+    return _published_field(lines(text, ph, "result", key), key, ph)
 
 
-def validate_pr_title(text: str) -> str:
-    """``text`` as an ANALYZE_EXECUTE ``pr_title``, or a rejection.
+def validate_pr_title(text: str, *, phase: str = "ANALYZE_EXECUTE") -> str:
+    """``text`` as a ``pr_title`` of ``phase``, or a rejection.
 
     Non-blank, at most :data:`MAX_PR_TITLE_CHARS`, one line of printable
     text, and publishable (:func:`published_text_problem`): the controller
-    creates the PR with it (#161). The checks
-    :meth:`AnalyzeExecuteResult.from_payload` applies, with the same
-    messages, so a persisted K2 title can be re-validated under the parser's
+    creates the PR with it, the implementation PR of ANALYZE_EXECUTE (#161)
+    or the replacement PR of REPLAN_REEXECUTE (#164). The checks
+    :meth:`AnalyzeExecuteResult.from_payload` and
+    :meth:`ReplanReexecuteResult.from_payload` apply, with the same messages,
+    so a persisted K2 or K7 title can be re-validated under the parser's
     rules.
     """
-    return _analyze_pr_text(text, "pr_title", MAX_PR_TITLE_CHARS, _one_line)
+    return _pr_text(text, "pr_title", MAX_PR_TITLE_CHARS, _one_line, phase)
 
 
-def validate_pr_body(text: str) -> str:
-    """``text`` as an ANALYZE_EXECUTE ``pr_body``, or a rejection.
+def validate_pr_body(text: str, *, phase: str = "ANALYZE_EXECUTE") -> str:
+    """``text`` as a ``pr_body`` of ``phase``, or a rejection.
 
     Non-blank, at most :data:`MAX_PR_BODY_CHARS`, multi-line text with no
     other control character, and publishable (:func:`published_text_problem`):
     the agent's part of the PR body, before the controller's ``Closes #n``
-    and marker. The checks :meth:`AnalyzeExecuteResult.from_payload`
-    applies, with the same messages, so the agent's part of a persisted K2
-    body can be re-validated under the parser's rules.
+    and markers. The checks :meth:`AnalyzeExecuteResult.from_payload` and
+    :meth:`ReplanReexecuteResult.from_payload` apply, with the same messages,
+    so the agent's part of a persisted K2 or K7 body can be re-validated
+    under the parser's rules.
     """
-    return _analyze_pr_text(text, "pr_body", MAX_PR_BODY_CHARS, _multi_line)
+    return _pr_text(text, "pr_body", MAX_PR_BODY_CHARS, _multi_line, phase)
 
 
 # Control characters a *multi-line* text field may still carry: a newline
@@ -1325,35 +1330,39 @@ class FixResult:
 
 @dataclass
 class ReplanReexecuteResult:
+    """What a replan agent reports; the controller publishes it (#164).
+
+    ``issue_url``, ``previous_pr_url``, ``previous_branch``,
+    ``previous_head_sha`` and ``execution_attempt`` are cross-checks against
+    the transaction's checkpoint, and ``head_sha`` against the worktree's
+    ``HEAD``, which the controller reads itself; none of them is a target.
+    The counts and ``verification.tests_passed`` become the transaction
+    marker the controller renders. ``pr_title`` and ``pr_body`` are the
+    agent's text for the replacement PR the controller creates, under the
+    same bounds and content policy as ANALYZE_EXECUTE's: the controller
+    appends ``Closes #n``, the implementation marker and the transaction
+    marker itself. The result names no replacement PR, branch or push target.
+    """
+
     issue_url: str
     previous_pr_url: str
-    replacement_pr_url: str
     previous_branch: str
-    replacement_branch: str
     previous_head_sha: str
-    replacement_head_sha: str
+    head_sha: str
     execution_attempt: int
     historical_findings_considered: int
     unique_failure_constraints: int
     fresh_review_round: int
     tests_run: list[str]
     tests_passed: bool
+    pr_title: str
+    pr_body: str
 
     @classmethod
     def from_payload(cls, p: dict) -> ReplanReexecuteResult:
         ph = "REPLAN_REEXECUTE"
         previous_pr = _req_url(p, "previous_pr_url", ph, "pr")
-        replacement_pr = _req_url(p, "replacement_pr_url", ph, "pr")
-        if parse_pr_url(previous_pr).same_target(parse_pr_url(replacement_pr)):
-            raise ControlResultValidationError(
-                "REPLAN_REEXECUTE: replacement_pr_url must differ from previous_pr_url"
-            )
         previous_branch = _req_str(p, "previous_branch", ph)
-        replacement_branch = _req_str(p, "replacement_branch", ph)
-        if previous_branch == replacement_branch:
-            raise ControlResultValidationError(
-                "REPLAN_REEXECUTE: replacement_branch must differ from previous_branch"
-            )
         ints: dict[str, int] = {}
         for key in (
             "execution_attempt",
@@ -1394,17 +1403,17 @@ class ReplanReexecuteResult:
         return cls(
             issue_url=_req_url(p, "issue_url", ph, "issue"),
             previous_pr_url=previous_pr,
-            replacement_pr_url=replacement_pr,
             previous_branch=previous_branch,
-            replacement_branch=replacement_branch,
             previous_head_sha=_req_sha(p, "previous_head_sha", ph),
-            replacement_head_sha=_req_sha(p, "replacement_head_sha", ph),
+            head_sha=_req_sha(p, "head_sha", ph),
             execution_attempt=ints["execution_attempt"],
             historical_findings_considered=ints["historical_findings_considered"],
             unique_failure_constraints=ints["unique_failure_constraints"],
             fresh_review_round=1,
             tests_run=tests_run,
             tests_passed=tests_passed,
+            pr_title=validate_pr_title(_req_str(p, "pr_title", ph), phase=ph),
+            pr_body=validate_pr_body(_req_str(p, "pr_body", ph), phase=ph),
         )
 
 
@@ -1435,14 +1444,6 @@ _RE_REQUEST_FIELDS: dict[UpdateEpicRequest, tuple[str, ...]] = {
 _UPDATE_EPIC_FIELDS = ("progress", "roadmap_section", "next_issue_url")
 
 
-def _published_field(text: str, key: str) -> str:
-    """Refuse UPDATE_EPIC field ``key`` under the published-content policy."""
-    problem = published_text_problem(key, text)
-    if problem is not None:
-        raise ControlResultValidationError(f"UPDATE_EPIC: field {problem}")
-    return text
-
-
 def validate_progress_text(text: str) -> str:
     """``text`` as an UPDATE_EPIC ``progress`` field, or a rejection.
 
@@ -1461,7 +1462,7 @@ def validate_progress_text(text: str) -> str:
         )
     text = _bounded(text, "UPDATE_EPIC", "result", "progress", MAX_PROGRESS_CHARS)
     text = _multi_line(text, "UPDATE_EPIC", "result", "progress")
-    text = _published_field(text, "progress")
+    text = _published_field(text, "progress", "UPDATE_EPIC")
     m = _PROGRESS_URL_RE.search(text)
     if m is not None:
         raise ControlResultValidationError(
@@ -1500,7 +1501,7 @@ def validate_roadmap_section(text: str) -> str:
             f"{ROADMAP_START_MARKER!r} and {ROADMAP_END_MARKER!r} around the section "
             "itself. Return only the section's content and re-emit the CONTROL_RESULT."
         )
-    return _published_field(text, "roadmap_section")
+    return _published_field(text, "roadmap_section", "UPDATE_EPIC")
 
 
 def validate_next_issue_url(url: str) -> str:

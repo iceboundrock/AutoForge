@@ -136,7 +136,15 @@ complete listing at binding, on the final read before the close, at the
 confirmation after it and at activation, with the PR being superseded
 excluded by identity ([replan-transaction.md](replan-transaction.md)), so
 the PR the controller activates is one this entry finds again after a lost
-state file.
+state file. The controller creates that PR too (#164): the replan agent
+commits on the default branch head the entry recorded and returns the PR's
+title and body; the controller pushes the commit to the branch it derives
+from the transaction id (a `push` record against an absent branch) and
+creates the PR (`replacement_pr`), its body followed by `Closes #<n>`, the
+issue's `ai-implementation` marker and the transaction marker, all
+rendered by the controller. The PR is created only while that branch is at
+the pushed candidate and bound only at exactly that head (replan-transaction.md,
+"The controller publishes the replacement").
 
 ### Before every launch
 
@@ -731,8 +739,11 @@ mechanism and wires its first consumer, the `UPDATE_EPIC` progress comment;
 #161 wires `ANALYZE_EXECUTE` (the push of the agent's commit and the
 implementation PR, opened or adopted); #162 wires `REVIEW` (the round's
 review comment); #163 wires `FIX` (the follow-up issues it creates, the
-deferral markers it appends and the push of the fixer's commit, last); the
-other phases keep their current publication until #164 moves them.
+deferral markers it appends and the push of the fixer's commit, last);
+#164 wires `REPLAN_REEXECUTE` (the push of the replan agent's commit to the
+derived replacement branch, then the replacement PR). Every phase that
+publishes now does so through the controller; no agent makes a GitHub
+write or pushes.
 
 - **Typed writes, never retried blind.** `GitHubClient` has one method per
   write the effects need (`create_issue_comment`, `create_pr_comment`,

@@ -252,6 +252,18 @@ def implementation_closing_block(issue_url: str) -> str:
     return f"Closes #{number}{APPEND_SEPARATOR}{render_implementation_marker(issue_url)}"
 
 
+def replacement_pr_body(text: str, issue_url: str, transaction_marker: str) -> str:
+    """K7's body: the agent's text, ``Closes #n`` and the marker, then the transaction marker.
+
+    The controller renders everything after the agent's text (#164): the
+    closing block of the issue (:func:`implementation_closing_block`) and
+    the transaction's marker with the validated counts.
+    """
+    return compose_append(
+        compose_append(text, implementation_closing_block(issue_url)), transaction_marker
+    )
+
+
 def follow_up_reference(pr_url: str, finding_id: str) -> str:
     """The controller's line in a follow-up issue it creates: the PR and finding (#163)."""
     return f"Deferred from finding `{finding_id}` of {parse_pr_url(pr_url).canonical}."
@@ -313,13 +325,14 @@ KIND_PHASES: Mapping[EffectKind, frozenset[Phase]] = {
 
 # D13.3: the contract a launch ran under, recorded in every pre-launch save of
 # a publishing phase. A phase is controller-published once the running version
-# performs its writes itself; #161-#164 add theirs as they land.
+# performs its writes itself; #161-#164 added theirs as they landed, so every
+# publishing phase now is.
 LABEL_NONE = ""
 LABEL_AGENT_PUBLISHES = "agent_publishes"
 LABEL_CONTROLLER_PUBLISHES = "controller_publishes"
 LAUNCH_LABELS = frozenset({LABEL_NONE, LABEL_AGENT_PUBLISHES, LABEL_CONTROLLER_PUBLISHES})
 CONTROLLER_PUBLISHED_PHASES = frozenset(
-    {Phase.ANALYZE_EXECUTE, Phase.REVIEW, Phase.FIX, Phase.UPDATE_EPIC}
+    {Phase.ANALYZE_EXECUTE, Phase.REVIEW, Phase.FIX, Phase.REPLAN_REEXECUTE, Phase.UPDATE_EPIC}
 )
 
 
@@ -1147,8 +1160,40 @@ def _cross_replacement_pr(record: EffectRecord, what: str) -> None:
     attestation = scan_replan_markers(record.identity["transaction_marker"]).attestations[0]
     if attestation.transaction_id != record.owner.transaction_id:
         _fail(what, "carries the marker of another replan transaction than its owner's")
-    if record.identity["transaction_marker"] not in record.body:
-        _fail(what, "has a payload body that does not carry its transaction marker")
+    if not attestation.tests_passed:
+        _fail(what, "carries a marker attesting failed tests, which is never published")
+    _check_body_ends_with_marker(record, record.identity["transaction_marker"], what)
+    # The payload is the title and body the parser accepted, the body then
+    # followed by the controller's closing block and transaction marker
+    # (#164); both texts get the parser's rules again, because a resumed
+    # create publishes them with no agent result in between.
+    tail = (
+        APPEND_SEPARATOR
+        + _owner_closing_block(record, record.target["repository"], what)
+        + APPEND_SEPARATOR
+        + record.identity["transaction_marker"]
+    )
+    if not record.body.endswith(tail):
+        _fail(
+            what,
+            "has a payload body that is not its text, the closing block of its owner's issue "
+            "and its transaction marker",
+        )
+    text = record.body[: len(record.body) - len(tail)]
+    for key, value, validate in (
+        ("title", str(record.payload["title"]), validate_pr_title),
+        ("body", text, validate_pr_body),
+    ):
+        if value != value.strip():
+            _fail(what, f"has a PR {key} that is not in the parser's stored form")
+        try:
+            validate(value, phase=Phase.REPLAN_REEXECUTE.value)
+        except ControlResultValidationError as exc:
+            _fail(what, f"has an invalid PR {key}: {exc}")
+    if record.observed is not None and not parse_pr_url(record.observed["url"]).same_repository(
+        record.target["repository"]
+    ):
+        _fail(what, "is observed in another repository than its target")
 
 
 def _cross_progress_comment(record: EffectRecord, what: str) -> None:
@@ -1710,7 +1755,17 @@ class FixContext:
 
 @dataclass(frozen=True)
 class ReplanContext:
-    """``REPLAN_REEXECUTE``: the counts the K7 marker renders."""
+    """``REPLAN_REEXECUTE``: the counts the K7 marker renders (#164).
+
+    The plan saved with it is the push (K1) of the candidate to the
+    controller-derived replacement branch, compared against "absent", at
+    position 0, then the replacement PR (K7) from that branch, and both are
+    the ones the entry observation explains: the observation recorded the
+    branch absent and the default branch at the base the candidate was
+    checked against, and the PR is opened onto that default branch. The
+    transaction marker the PR carries attests exactly these counts and
+    passed tests, for the state's transaction and execution attempt.
+    """
 
     issue_url: str
     pr_url: str
@@ -1722,7 +1777,15 @@ class ReplanContext:
     STORED_BOUND = 2 * MAX_URL_CHARS + 32 + 2 * 20 + 6 * _KEY_OVERHEAD
 
     @classmethod
-    def from_dict(cls, raw: object, binding: Binding, **_: object) -> ReplanContext:
+    def from_dict(
+        cls,
+        raw: object,
+        binding: Binding,
+        *,
+        records: Sequence[EffectRecord] = (),
+        observation: EntryObservation | None = None,
+        **_: object,
+    ) -> ReplanContext:
         what = "REPLAN_REEXECUTE completion context"
         data = _context_header(
             raw,
@@ -1743,13 +1806,43 @@ class ReplanContext:
         txn = _str(data["transaction_id"], f"{what}.transaction_id", 32)
         if not TRANSACTION_ID_RE.match(txn) or txn != binding.transaction_id:
             _fail(f"{what}.transaction_id", "is not the state's replan transaction id")
-        return cls(
+        context = cls(
             data["issue_url"],
             data["pr_url"],
             txn,
             _int(data["historical_findings_considered"], f"{what}.historical_findings_considered"),
             _int(data["unique_failure_constraints"], f"{what}.unique_failure_constraints"),
         )
+        if context.unique_failure_constraints > context.historical_findings_considered:
+            _fail(what, "counts more unique constraints than findings considered")
+        if [r.kind for r in records] != [EffectKind.PUSH, EffectKind.REPLACEMENT_PR]:
+            _fail(what, "must be saved with a push then the replacement PR")
+        if observation is None:
+            _fail(what, "must be saved with the entry observation it is checked against")
+        push, create = records
+        ref = push.target["ref"]
+        if ref not in observation.refs or observation.refs[ref] is not None:
+            _fail(what, "pushes a ref the entry observation did not read as absent")
+        if push.precondition["expected_old"] is not None:
+            _fail(what, "pushes over a head; the replacement branch is compared against absent")
+        if push.precondition["base_sha"] != observation.base_sha:
+            _fail(what, "pushes a candidate checked against another base than the entry read")
+        if "refs/heads/" + str(create.target["head"]) != ref:
+            _fail(what, "opens its PR from another branch than the one it pushes")
+        base_ref = "refs/heads/" + str(create.target["base"])
+        if (
+            base_ref == ref
+            or base_ref not in observation.refs
+            or observation.refs[base_ref] != observation.base_sha
+        ):
+            _fail(what, "opens its PR onto another branch than the default branch the entry read")
+        attestation = scan_replan_markers(create.identity["transaction_marker"]).attestations[0]
+        if (
+            attestation.findings_considered != context.historical_findings_considered
+            or attestation.unique_constraints != context.unique_failure_constraints
+        ):
+            _fail(what, "is saved with a transaction marker that attests other counts")
+        return context
 
     def to_dict(self) -> dict:
         return {

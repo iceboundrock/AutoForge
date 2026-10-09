@@ -304,6 +304,42 @@ recorded with the URL of the issue GitHub read back, whichever form asked
 for it. LOCAL `FIX` is unchanged: it has no follow-ups and its own
 resolutions (`LOCAL_FIX_RESOLUTIONS`).
 
+### REPLAN_REEXECUTE fields
+
+The replan agent publishes nothing (ADR 0004 K1 and K7, #164): it commits on
+its worktree's detached `HEAD`, built on the default branch head the
+controller fetched and named, and the controller pushes that commit to the
+branch it derives from the issue and the transaction id and creates the
+replacement PR with the agent's text. The result therefore names no
+replacement PR, branch or push target; `replacement_pr_url`,
+`replacement_branch` and `replacement_head_sha` are not keys of this phase
+any more.
+
+| Key | Rule |
+|---|---|
+| `issue_url`, `previous_pr_url`, `previous_branch`, `previous_head_sha`, `execution_attempt` | required; cross-checks only: the engine refuses any value other than the transaction's checkpoint (URLs by identity) |
+| `head_sha` | required SHA; a cross-check only: the engine reads the worktree's `HEAD` itself and refuses a value that differs from it |
+| `historical_findings_considered`, `unique_failure_constraints` | required non-negative integers, the second at most the first; the engine refuses fewer findings than the controller preserved, and renders both into the transaction marker it publishes |
+| `verification` | required object: `tests_run` (list of strings) and `tests_passed` (boolean); the engine rejects `false` |
+| `previous_pr_disposition`, `fresh_review_round` | required, exactly `superseded` and `1` |
+| `pr_title`, `pr_body` | the bounds, line rules and published-content policy of `ANALYZE_EXECUTE`'s (above), shared through `validate_pr_title` / `validate_pr_body` |
+
+`pr_body` carries no marker: the controller follows it with `Closes #n`,
+the issue's implementation marker and the transaction marker it renders
+from the validated counts (`replacement_pr_body`), and judges that composed
+body as a whole with `published_payload_problem`. What the parser cannot
+see is the engine's (`_check_replan_result`), and it splits two ways. What
+the agent can repair is an ordinary correction with nothing pushed or
+created: the composed body, a `HEAD` attached to a local branch or not
+readable, and the commit messages of the published range
+(`commit_message_problem`). What contradicts the checkpoint is a rejection,
+persisted as `REJECTED` before any effect: a cross-check that does not
+match, `tests_passed: false`, too few findings considered, a `head_sha`
+that is not the worktree's `HEAD`, and a `HEAD` that is the recorded base
+itself or does not descend from it
+([replan-transaction.md](replan-transaction.md), "The controller publishes
+the replacement").
+
 ### UPDATE_EPIC fields
 
 The agent publishes nothing in `UPDATE_EPIC` (ADR 0004): the controller posts

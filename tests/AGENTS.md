@@ -58,6 +58,16 @@ read it before adding tests for a listed area.
   `analyze_payload`), and `scripted(...)` answers successive calls of one
   agent. An autouse fixture fails any test whose engine would reach the
   network git remote.
+- The controller publishes `REPLAN_REEXECUTE` too (#164): the replan agent
+  commits on the base its prompt names and the controller pushes it to the
+  derived replacement branch and creates the replacement PR. In
+  `tests/test_replan.py`, `_park_at_hard_threshold` builds the engine with
+  `origin=True` and the source PR at a real commit (`eng.source`, built on
+  `eng.merge_base`), and `_replan_agent(...)` is the reviewer that triggers
+  the replan followed by that agent (`commit=False` for none, `during` for
+  a write while it runs, `payload_over` to change its result).
+  `_published_marker` and `_controller_body` give the marker and body the
+  controller renders.
 - `tests/claude_fake.py` holds a fake `claude` that prints a scripted
   stream-json transcript (and logs its argv, cwd and stdin; `$HEAD` in the
   transcript is replaced by the `HEAD` of its cwd, such as a commit made
