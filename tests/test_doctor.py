@@ -161,19 +161,19 @@ def test_doctor_reports_the_limits_of_every_reachable_profile(tmp_path):
 
 
 def test_doctor_shows_the_loop_detection_mode_and_thresholds(tmp_path):
-    """#194: informational; the default is warn."""
+    """#194: informational; the default is kill (#199)."""
     d = Doctor(cwd=str(tmp_path), runner=_runner_factory())
     row = {r.name: r for r in d.run_all()}["loop detection"]
     assert row.ok and not row.required
     assert row.detail == (
-        "loop detection warn (cycles of up to 4 actions x8, no new action for 1800s, "
+        "loop detection kill (cycles of up to 4 actions x8, no new action for 1800s, "
         "repeated lines x200)"
     )
     cfg = tmp_path / "c.json"
-    cfg.write_text(json.dumps({"version": 1, "execution": {"loop_detection": {"mode": "kill"}}}))
+    cfg.write_text(json.dumps({"version": 1, "execution": {"loop_detection": {"mode": "warn"}}}))
     d = Doctor(config_path=str(cfg), cwd=str(tmp_path), runner=_runner_factory())
     assert {r.name: r for r in d.run_all()}["loop detection"].detail.startswith(
-        "loop detection kill ("
+        "loop detection warn ("
     )
 
 
@@ -1102,7 +1102,7 @@ def test_local_doctor_checks_a_pi_reviewer(tmp_path):
     results = {r.name: r for r in d.run_local()}
     assert results["agent 'pi' available (review_round_1)"].ok
     assert results["agent 'pi' auth ready (review_round_1)"].ok
-    assert results["loop detection"].detail.startswith("loop detection warn (")
+    assert results["loop detection"].detail.startswith("loop detection kill (")
 
 
 # -- instructions Pi loads from outside the checkout (#132) -----------------------

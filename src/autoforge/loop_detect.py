@@ -47,7 +47,8 @@ from half a threshold it warns, again at most every
 conclusive, never on every event; in ``kill`` mode it returns the first
 conclusive finding as the verdict its caller ends the invocation on. In every
 mode, ``off`` included, it keeps the calibration figures
-(:meth:`LoopMonitor.calibration`) the default thresholds are to be set from.
+(:meth:`LoopMonitor.calibration`) the default thresholds were checked
+against (#199).
 """
 
 from __future__ import annotations

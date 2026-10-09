@@ -143,8 +143,9 @@ EXECUTION_KEYS = (
 # that keeps producing output repeats itself with nothing new: ``kill`` ends
 # the invocation like a timeout, ``warn`` only says so in the progress output
 # and ``execution.json``, ``off`` says nothing. Every mode records the
-# calibration figures in ``provider_summary``. The default is ``warn`` until
-# real runs have calibrated the thresholds.
+# calibration figures in ``provider_summary``. The default is ``kill`` (#199):
+# real runs stayed below half of every default threshold (the margins are in
+# docs/configuration.md, "How the defaults were set").
 LOOP_DETECTION_MODES = ("kill", "warn", "off")
 LOOP_DETECTION_KEYS = (
     "mode",
@@ -227,7 +228,7 @@ class LoopDetectionConfig:
     repeated ``max_line_repeats`` times in a row. See ``autoforge.loop_detect``.
     """
 
-    mode: str = "warn"
+    mode: str = "kill"
     max_cycle_period: int = 4
     max_cycle_repeats: int = 8
     novelty_window_seconds: int = 1800

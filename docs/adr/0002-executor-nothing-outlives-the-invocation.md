@@ -356,7 +356,8 @@ engine's existing timeout path handles it: state unchanged, a typed
 stopped for a loop is not sent `abort` first: the run is discarded as on a
 timeout, and the abort window exists for an orderly wind-down that a run
 being discarded does not need. Whether to stop at all is configuration
-(`execution.loop_detection.mode`: `kill`, `warn` (the default) or `off`).
+(`execution.loop_detection.mode`: `kill` (the default since #199), `warn`
+or `off`).
 
 Tests for §4d: `tests/test_executor.py` stops a child that keeps writing
 from its `on_chunk` hook (the result is `stopped`, not `timed_out`) and

@@ -1912,11 +1912,14 @@ def test_example_yaml_with_the_pi_block_enabled_loads_and_validates(tmp_path, ya
 
 
 # -- execution.loop_detection (#194) ---------------------------------------------
-def test_loop_detection_defaults_to_warn_with_the_issue_thresholds():
+def test_loop_detection_defaults_to_kill_with_the_calibrated_thresholds():
+    """#199: ``kill`` by default, the thresholds #194 proposed kept after real
+    runs stayed below half of each; ``warn`` and ``off`` stay available."""
     loop = default_config().execution.loop_detection
-    assert loop == config.LoopDetectionConfig("warn", 4, 8, 1800, 200)
+    assert loop == config.LoopDetectionConfig("kill", 4, 8, 1800, 200)
+    assert config.LOOP_DETECTION_MODES == ("kill", "warn", "off")
     assert loop.describe() == (
-        "loop detection warn (cycles of up to 4 actions x8, no new action for 1800s, "
+        "loop detection kill (cycles of up to 4 actions x8, no new action for 1800s, "
         "repeated lines x200)"
     )
 
@@ -1971,9 +1974,9 @@ def test_loop_detection_refuses_a_bad_value(tmp_path, section, message):
         load_config_file(p)
 
 
-def test_the_example_config_shows_loop_detection_in_warn_mode(tmp_path, no_pyyaml):
+def test_the_example_config_shows_loop_detection_in_kill_mode(tmp_path, no_pyyaml):
     import autoforge
 
     example = Path(autoforge.__file__).parents[2] / "autoforge.example.yaml"
-    assert "  loop_detection:\n    mode: warn\n" in example.read_text(encoding="utf-8")
+    assert "  loop_detection:\n    mode: kill\n" in example.read_text(encoding="utf-8")
     assert load_config_file(example).execution.loop_detection == config.LoopDetectionConfig()
