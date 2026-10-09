@@ -133,17 +133,23 @@ def test_opencode_auto_flag_and_extra_args():
     assert argv[-3:] == ["--auto", "--agent", "reviewer"]
 
 
-@pytest.mark.parametrize(
-    ("model", "exit_code", "stderr", "retryable"),
-    [
-        ("openai/gpt-6-luna", 1, "Error: WebSocket closed with code 1000", True),
-        ("openai/gpt-6-luna", 1, "Error: WebSocket closed with code 1006", False),
-        ("anthropic/claude-sonnet", 1, "Error: WebSocket closed with code 1000", False),
-        ("openai/gpt-6-luna", 0, "Error: WebSocket closed with code 1000", False),
-    ],
-)
-def test_opencode_classifies_only_the_known_openai_websocket_failure(
-    model, exit_code, stderr, retryable
+# How OpenCode 2.0.26 prints an error on stderr, and the line of a failed
+# tool that precedes the tool's own error (see providers.py).
+OC_ERROR = "\x1b[91m\x1b[1mError: \x1b[0m"
+OC_WS_CLOSED = OC_ERROR + "WebSocket closed with code 1000"
+
+
+def oc_tool_failed(title: str) -> str:
+    return f"\x1b[0m✗ \x1b[0m{title} failed"
+
+
+def _opencode_run(
+    stderr: str,
+    *,
+    model: str = "openai/gpt-6-luna",
+    exit_code: int = 1,
+    timed_out: bool = False,
+    stderr_truncated: bool = False,
 ):
     profile = ProfileConfig(
         name="review",
@@ -155,17 +161,82 @@ def test_opencode_classifies_only_the_known_openai_websocket_failure(
 
     def runner(req):
         return ExecutionResult(
-            req.command, req.cwd, exit_code, "complete response", stderr, "t", "t"
+            req.command,
+            req.cwd,
+            exit_code,
+            "partial response",
+            stderr,
+            "t",
+            "t",
+            timed_out=timed_out,
+            stderr_truncated=stderr_truncated,
         )
 
-    result = OpenCodeProvider(runner=runner).execute(
+    return OpenCodeProvider(runner=runner).execute(
         AgentRequest("REVIEW", "review", "/tmp", profile, None, 7)
     )
-    assert result.retryable_failure is retryable
-    if retryable:
-        assert result.provider_failure == "opencode: OpenAI WebSocket closed with code 1000"
-    else:
-        assert result.provider_failure is None
+
+
+@pytest.mark.parametrize(
+    ("stderr", "transient"),
+    [
+        # The run of #164: the socket closed mid-turn, the session went on,
+        # and the CLI exited 1 with this as its only error.
+        (f"> build · gpt-6-luna\n{OC_WS_CLOSED}\n\x1b[0m→ \x1b[0mRead src/x.py\n", True),
+        # A tool's error fails nothing; the run-level error is still the close.
+        (
+            f"{oc_tool_failed('Read docs/x.md')}\n{OC_ERROR}File not found: docs/x.md\n"
+            f'{oc_tool_failed("")}\n{OC_ERROR}Invalid arguments for tool "shell":\n'
+            f"  expected string\n{OC_WS_CLOSED}\n",
+            True,
+        ),
+        (OC_ERROR + "WebSocket closed with code 1006\n", False),
+        # The phrase is not OpenCode's error line unless OpenCode printed it.
+        ("Error: WebSocket closed with code 1000\n", False),
+        (
+            "+    stderr = '\\x1b[91mError: WebSocket closed with code 1000'\n"
+            f"{OC_ERROR}insufficient_quota\n",
+            False,
+        ),
+        # A line break OpenCode does not write does not start an error line.
+        (f"output\u2028{OC_WS_CLOSED}\n", False),
+        (f"{OC_WS_CLOSED}\r\n", True),
+        # The quoted error line inside a tool's output is not on a line of its own.
+        (f"| {OC_WS_CLOSED}\n{OC_ERROR}The usage limit has been reached\n", False),
+        # A close the session recovered from, then the error the run died of.
+        (f"{OC_WS_CLOSED}\n> build · gpt-6-luna\n{OC_ERROR}Model not found: openai/x\n", False),
+        (f"{OC_ERROR}Model not found: openai/x\n{OC_WS_CLOSED}\n", False),
+        # A tool that failed with the same text is a tool's error, not the run's.
+        (f"{oc_tool_failed('WebFetch https://x')}\n{OC_WS_CLOSED}\n", False),
+        # No error line at all (a cancelled permission prompt also exits 1).
+        ("> build · gpt-6-luna\n", False),
+    ],
+)
+def test_opencode_classifies_a_run_whose_only_error_is_the_openai_socket_close(stderr, transient):
+    result = _opencode_run(stderr)
+    assert result.transient_failure == (
+        "opencode: OpenAI WebSocket closed with code 1000" if transient else None
+    )
+    # A fact next to the failed exit, never in place of it.
+    assert result.exit_code == 1
+    assert result.provider_failure is None
+
+
+@pytest.mark.parametrize(
+    "run",
+    [
+        {"model": "anthropic/claude-sonnet-4-6"},
+        {"exit_code": 0},
+        {"exit_code": 2},
+        {"timed_out": True},
+        # A cut stderr may hide the error the run died of.
+        {"stderr_truncated": True},
+    ],
+)
+def test_opencode_classifies_the_socket_close_only_for_an_untruncated_openai_exit_1(run):
+    result = _opencode_run(f"{OC_WS_CLOSED}\n", **run)
+    assert result.transient_failure is None
+    assert result.provider_failure is None
 
 
 def test_opencode_rejects_a_variant_in_the_model():

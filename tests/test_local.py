@@ -21,6 +21,7 @@ from autoforge.doctor import Doctor
 from autoforge.errors import (
     ConfigurationError,
     ControlResultValidationError,
+    ExecutionError,
     StateError,
     VerificationError,
 )
@@ -3279,6 +3280,37 @@ def test_the_readme_no_github_promise_is_the_controllers_not_the_runs():
     assert "docs/adr/0001-local-mode-workspace-identity-and-filesystem-boundary.md" in flat
     assert "§2.2" in flat and "§8.1" in flat
     assert "tracked in #10" in flat
+
+
+def test_a_local_transient_failure_is_not_relaunched(tmp_path):
+    """#164: the relaunch of a failure the adapter calls transient follows
+    REMOTE's phase-entry reconciliation, which LOCAL has none of: the failed
+    launch is a failed exit, charged to the durable bound like any other."""
+    from autoforge.providers import AgentExecutionResult, ScriptedProvider
+
+    class TransientlyFailing(ScriptedProvider):
+        def execute(self, req):
+            self.calls.append(req)
+            return AgentExecutionResult(
+                command=["x"],
+                exit_code=1,
+                stdout="",
+                stderr="boom",
+                started_at="t",
+                finished_at="t",
+                transient_failure="opencode: OpenAI WebSocket closed with code 1000",
+            )
+
+    root = local_repo(tmp_path)
+    eng = make_local_engine(root, "features/add-filter.md")
+    eng.step()  # INITIALIZING -> ANALYZE_EXECUTE
+    provider = TransientlyFailing()
+    eng.providers._overrides = dict.fromkeys(eng.providers._overrides, provider)
+    with pytest.raises(ExecutionError, match="not relaunched: LOCAL mode never relaunches it"):
+        eng.step()
+    assert len(provider.calls) == 1
+    persisted = load_state(eng.paths.state_file)
+    assert persisted.phase == Phase.ANALYZE_EXECUTE and persisted.local_pending_attempts == 1
 
 
 # -- Pi parity (#133) --------------------------------------------------------------

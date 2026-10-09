@@ -305,13 +305,18 @@ result block is reconciled with, not relaunched unaware. The table of what each 
 re-entry does is complete by construction: every phase with an agent prompt
 has an entry, and a test holds the two tables together.
 
-One narrowly classified transport failure is retried inside the current
-REMOTE step: an OpenCode OpenAI invocation that exits with
-`WebSocket closed with code 1000`. The initial launch counts toward the limit
-of three total attempts. Before each automatic relaunch, the same phase-entry
-reconciliation runs; each attempt is logged, and exhausting the bound leaves
-the workflow phase unchanged for an operator-directed `resume`. Other failed
-exits and LOCAL invocations are not automatically retried.
+A failed launch its adapter reports as a known transient failure of the
+provider (`transient_failure`, #164; today an OpenCode `openai/*` run whose
+only run-level error is `WebSocket closed with code 1000`) is relaunched
+inside the current REMOTE step, at most `MAX_TRANSIENT_RETRIES` (2) times.
+That budget belongs to the step: it is counted apart from the CONTROL_RESULT
+corrections and is not refilled by them, so one step launches at most
+`1 + execution.max_correction_attempts + 2` agents. Each relaunch is a
+re-entry like a correction: the phase-entry reconciliation runs first and
+may resolve or block the phase instead. A launch that may have left a
+process running is not relaunched. Exhausting the budget fails the step like
+any other failed exit, with the phase unchanged for `resume`. LOCAL runs
+never relaunch a transient failure.
 
 Every probe below and the read-back after the agent consume one identity
 model, `src/autoforge/claims.py`: one exact-schema decoder per marker kind,

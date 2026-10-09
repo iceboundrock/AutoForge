@@ -87,11 +87,14 @@ Safety rules:
 - READY_FOR_MERGE is a holding state. MERGE requires BOTH
   ``safety.allow_merge=true`` in config AND ``--allow-merge`` on the CLI.
 - Business failures (agent reports failure/blocked, verification mismatch,
-  ambiguous recovery) never trigger blind retries. A provider may classify a
-  known transient failure for a bounded REMOTE retry; the current case is an
-  OpenAI OpenCode WebSocket close with code 1000, limited to three total
-  attempts and reconciled with GitHub before each relaunch. A malformed
-  CONTROL_RESULT with exit code 0 keeps its separate bounded correction path.
+  ambiguous recovery) never trigger blind retries. A failed launch the
+  adapter recognised as a known transient failure of its provider
+  (``transient_failure``; today an OpenAI socket OpenCode saw close with
+  code 1000, #164) is relaunched in REMOTE mode at most
+  :data:`MAX_TRANSIENT_RETRIES` times per step, each relaunch after the
+  phase-entry reconciliation, and never while a process the failed launch
+  started may still be running. A malformed CONTROL_RESULT keeps its
+  separate bounded correction path.
 """
 
 from __future__ import annotations
@@ -382,10 +385,14 @@ FIX_BOUND_VARIABLES: dict[str, str | int | None] = {
 # ``resume`` forever.
 MAX_LOCAL_PHASE_ATTEMPTS = 3
 
-# Total consecutive launches for an adapter-classified transient failure,
-# including the initial launch. This retry is REMOTE-only; LOCAL has its own
-# durable launch checkpoint and workspace-verification boundary.
-MAX_RETRYABLE_AGENT_ATTEMPTS = 3
+# Relaunches of one step after a failure its adapter recognised as transient
+# (``AgentExecutionResult.transient_failure``, #164). Counted apart from the
+# CONTROL_RESULT corrections and never reset within the step, so one step
+# launches at most ``1 + execution.max_correction_attempts +
+# MAX_TRANSIENT_RETRIES`` agents however the failures interleave. REMOTE
+# only: each relaunch follows the phase-entry reconciliation, and LOCAL has
+# none (its write phases are bounded by the durable launch checkpoint).
+MAX_TRANSIENT_RETRIES = 2
 
 
 MERGE_GATE_MESSAGE = (
@@ -2312,8 +2319,9 @@ class ControllerEngine:
             # forbid it; this is the controller enforcing it, as LOCAL does).
             return self._block(previous, plan, str(exc))
         if isinstance(invoked, StepOutcome):
-            # A correction relaunch was pre-empted by the entry reconciliation:
-            # the malformed attempt's GitHub work resolved the phase.
+            # A relaunch (a correction, or the retry of a transient failure)
+            # was pre-empted by the entry reconciliation: the GitHub work of
+            # the launch before it resolved the phase.
             return invoked
         payload = invoked
         status = payload.get("status")
@@ -7421,14 +7429,15 @@ class ControllerEngine:
         """Launch the phase's agent, correcting a malformed result within bound.
 
         ``reconcile`` is the phase-entry reconciliation (:meth:`_remote_entry`)
-        and is called before every correction relaunch and every automatic
-        retry of an adapter-classified transient failure: the agent may
-        already have done the phase's GitHub work, and the relaunch must see
-        it exactly as ``resume`` would. An outcome from reconciliation
-        resolves the phase without relaunching and is returned in place of a
-        payload. A LOCAL run passes none and does not use the automatic retry:
-        its write phases are judged against the durable launch checkpoint and
-        its review verification refuses a tree the reviewer changed.
+        and is called before every relaunch, a correction or the retry of a
+        failure the adapter recognised as transient (#164): the launch before
+        it may already have done the phase's GitHub work, and the relaunch
+        must see it exactly as ``resume`` would. An outcome from
+        reconciliation resolves the phase without relaunching and is
+        returned in place of a payload. A LOCAL run passes none and never
+        retries a transient failure: its write phases are judged against the
+        durable launch checkpoint and its review verification refuses a tree
+        the reviewer changed.
         """
         state = self._require_state()
         profile = profile_for_phase(self.config, phase, state.review_round)
@@ -7457,19 +7466,17 @@ class ControllerEngine:
         # capability it goes through.
         logger = self._logger()
         correction_error: str | None = None
-        retry_reconcile = False
         attempt = 0
         corrections_used = 0
-        retryable_attempts = 0
+        transient_retries = 0
         while True:
-            if (correction_error is not None or retry_reconcile) and reconcile is not None:
-                # A failed or malformed launch may already have done GitHub
-                # work. Reconcile before every relaunch, whether it is a
-                # correction or the narrowly classified transient retry.
+            if attempt and reconcile is not None:
+                # Every launch after the first is a relaunch, and the launch
+                # before it, malformed or failed, may already have done the
+                # phase's GitHub work.
                 resolved = reconcile()
                 if resolved is not None:
                     return resolved
-            retry_reconcile = False
             # Which UPDATE_EPIC result this launch asks for (ADR 0004 D4.7):
             # decided by the entry above, and the schema its result is held to.
             request = (
@@ -7590,53 +7597,44 @@ class ControllerEngine:
                     _with_leftovers(f"agent '{profile.name}' {killed}", result.leftovers)
                     + ". State unchanged — inspect the real Git/GitHub state, then 'resume'."
                 )
-            if result.provider_failure:
-                # The run failed inside the provider's protocol, whatever the
-                # exit status: handled exactly like a failed exit, and checked
-                # before it because the reason says more (ADR 0003 §2.6).
-                record.error = _with_leftovers(result.provider_failure, result.leftovers)
+            if result.provider_failure or result.exit_code != 0:
+                # A run that failed inside the provider's protocol, whatever
+                # the exit status, is handled exactly like a failed exit, and
+                # its reason is named rather than the status because it says
+                # more (ADR 0003 §2.6).
+                ended = (
+                    f"failed: {result.provider_failure}"
+                    if result.provider_failure
+                    else f"exited {result.exit_code}"
+                )
+                failure = result.provider_failure or f"exit {result.exit_code}"
+                if result.transient_failure:
+                    failure += f" (transient: {result.transient_failure})"
+                record.error = _with_leftovers(failure, result.leftovers)
                 self._record_invocation(logger, record, prompt, stdout, stderr, phase, step_log)
-                # The adapter's neutral signal is the only retry authority;
-                # generic non-zero exits and provider failures remain fatal.
-                if (
-                    result.retryable_failure
-                    and state.mode == WorkflowMode.REMOTE
-                    and reconcile is not None
-                ):
-                    retryable_attempts += 1
-                    if retryable_attempts < MAX_RETRYABLE_AGENT_ATTEMPTS:
-                        retry_reconcile = True
-                        continue
-                    raise ExecutionError(
-                        _with_leftovers(
-                            f"agent '{profile.name}' failed after {retryable_attempts} "
-                            "consecutive retryable failures "
-                            f"(limit {MAX_RETRYABLE_AGENT_ATTEMPTS} total attempts): "
-                            f"{result.provider_failure}",
-                            result.leftovers,
+                if result.transient_failure:
+                    # The adapter's fact is the only input naming the failure
+                    # transient; whether and how often to relaunch is decided
+                    # here. Never while a process the failed launch started
+                    # may still be running: the relaunch would race it.
+                    if reconcile is None:
+                        held = "LOCAL mode never relaunches it"
+                    elif result.may_have_survivor:
+                        held = "a process the launch started may still be running"
+                    elif transient_retries >= MAX_TRANSIENT_RETRIES:
+                        held = (
+                            f"this step already relaunched it {transient_retries} time(s), "
+                            f"the bound of {MAX_TRANSIENT_RETRIES}"
                         )
-                        + ". State unchanged — inspect the invocation logs and real GitHub "
-                        "state, then run 'resume' when ready."
-                    )
+                    else:
+                        transient_retries += 1
+                        continue
+                    ended += f" (transient: {result.transient_failure}; not relaunched: {held})"
                 raise ExecutionError(
-                    _with_leftovers(
-                        f"agent '{profile.name}' failed: {result.provider_failure}",
-                        result.leftovers,
-                    )
+                    _with_leftovers(f"agent '{profile.name}' {ended}", result.leftovers)
                     + f". stderr tail: {stderr[-2000:]} "
                     "State unchanged — inspect logs, then 'resume'."
                 )
-            if result.exit_code != 0:
-                record.error = _with_leftovers(f"exit {result.exit_code}", result.leftovers)
-                self._record_invocation(logger, record, prompt, stdout, stderr, phase, step_log)
-                raise ExecutionError(
-                    _with_leftovers(
-                        f"agent '{profile.name}' exited {result.exit_code}", result.leftovers
-                    )
-                    + f". stderr tail: {stderr[-2000:]} "
-                    "State unchanged — inspect logs, then 'resume'."
-                )
-            retryable_attempts = 0
             try:
                 # Only the tail of a truncated stdout is searched: the block
                 # is the last thing the agent writes, so the kept tail holds
@@ -7782,6 +7780,8 @@ class ControllerEngine:
                     end = f"failed: {result.provider_failure}"
                 else:
                     end = f"exited {result.exit_code}"
+                if result.transient_failure and (result.provider_failure or result.exit_code):
+                    end += f" (transient: {result.transient_failure})"
                 reporter.line(f"agent {end}, {reporter.events} progress events")
                 return result
         finally:

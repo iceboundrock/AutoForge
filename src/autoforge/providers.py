@@ -66,10 +66,20 @@ OpenCode (``opencode 2.0.x``, #186; run against 2.0.23)::
     stderr is an ``activity`` event, which prints nothing but keeps the
     heartbeat's "last activity" current; the trace itself reaches the
     operator only in ``stderr.log``.
-  * A non-zero exit for an ``openai/*`` model whose stderr contains the
-    exact ``WebSocket closed with code 1000`` failure is marked as a known
-    retryable transport failure. The engine bounds the retries and reconciles
-    the REMOTE phase entry before relaunching; other exits are unchanged.
+  * a run-level error prints ``ESC[91mESC[1mError: ESC[0m<message>`` on
+    stderr (whether or not it is a terminal) and sets exit 1; a tool's error
+    is the same line right after the tool's ``ESC[0m✗ ESC[0m<title> failed``
+    line and fails nothing (read from the 2.0.26 build). An exit 1 of an
+    ``openai/*`` model whose run-level errors are all ``WebSocket closed
+    with code 1000`` (the socket to the model closed under a running turn,
+    #164) is reported as a :attr:`AgentExecutionResult.transient_failure`;
+    the exit stays a failed exit, and whether to relaunch is the engine's
+    policy. Text anywhere else in the trace (a diff, a file, a command's
+    output) is not an error line, and a truncated ``stderr`` or a timeout
+    is never classified. Not visible to this check: an error the CLI does
+    not print (it prints one execution failure only when no step failed
+    before it) and an exit 1 without any error line (a cancelled
+    permission prompt); both are failed exits all the same.
   * bash/edit tools run without ``--auto`` under the default agent;
     ``--auto`` is opt-in via ``options.auto_approve: true``.
   * ``opencode --version`` prints ``opencode v2.0.23``; 1.x printed the
@@ -225,11 +235,13 @@ class AgentExecutionResult:
     # like a non-zero exit (ADR 0003 §2.6). A one-shot CLI adapter sets it
     # only when the CLI exited 0 without reading the whole prompt from stdin.
     provider_failure: str | None = None
-    # A provider-neutral signal for the engine's narrow bounded retry path.
-    # Adapters set this only for a known transient failure that is safe to
-    # retry after phase-entry reconciliation; the engine does not infer
-    # retryability from provider names or error text.
-    retryable_failure: bool = False
+    # A failed run the adapter recognised as a known transient failure of
+    # the provider (#164): a short, fixed reason naming it, never text taken
+    # from the output. It is a fact about this failure, not a decision: it
+    # never replaces the exit status or ``provider_failure``, and whether to
+    # relaunch is the engine's policy, which reads no provider name or error
+    # text of its own.
+    transient_failure: str | None = None
     # A small flat mapping of scalars, bounded and redacted by the adapter,
     # that the engine writes to ``execution.json`` under this key without
     # interpreting it. Never raw protocol records or message contents.
@@ -260,6 +272,15 @@ class AgentExecutionResult:
             orphan_survived_kill=self.orphan_survived_kill,
             orphans_unchecked=self.orphans_unchecked,
         )
+
+    @property
+    def may_have_survivor(self) -> bool:
+        """Whether a process the invocation started may still be running: a
+        member of its group outlived SIGKILL, a writer beyond the kill's reach
+        still held its pipes, or a re-parented process outlived its kill. Not
+        ``orphans_unchecked``, which is a fact of the platform (no subreaper)
+        and true of every invocation there, not evidence of a survivor."""
+        return self.group_survived_kill or self.capture_abandoned or self.orphan_survived_kill
 
     @property
     def ok(self) -> bool:
@@ -719,14 +740,43 @@ class OpenCodeProvider(AgentProvider):
     def execute(self, req: AgentRequest) -> AgentExecutionResult:
         result = super().execute(req)
         if (
-            not result.timed_out
-            and result.exit_code != 0
+            result.exit_code == 1
+            and not result.timed_out
+            and not result.stderr_truncated
             and req.profile.model.partition("/")[0] == "openai"
-            and re.search(r"WebSocket closed with code 1000\b", result.stderr)
         ):
-            result.provider_failure = "opencode: OpenAI WebSocket closed with code 1000"
-            result.retryable_failure = True
+            errors = _opencode_run_errors(result.stderr)
+            if errors and all(e == _OPENCODE_OPENAI_WS_CLOSED for e in errors):
+                result.transient_failure = "opencode: OpenAI WebSocket closed with code 1000"
         return result
+
+
+# How OpenCode 2.0.26 prints an error on stderr: `ESC[91mESC[1mError: ESC[0m`
+# and the message's first line (no terminal check), and a failed tool: its
+# `ESC[0m✗ ESC[0m<title> failed` line, then the tool's error in the same form.
+_OPENCODE_ERROR_LINE_RE = re.compile(r"\x1b\[91m\x1b\[1mError: \x1b\[0m(.*)")
+_OPENCODE_TOOL_FAILED_LINE_RE = re.compile(r"\x1b\[0m✗ \x1b\[0m.* failed")
+# The run-level error of a socket to OpenAI that closed normally (code 1000)
+# under a running turn (#164).
+_OPENCODE_OPENAI_WS_CLOSED = "WebSocket closed with code 1000"
+
+
+def _opencode_run_errors(stderr: str) -> list[str]:
+    """The run-level errors OpenCode printed on ``stderr``, in order: each
+    error line's message, except a failed tool's (the line right after its
+    ``✗ ... failed`` line), which does not fail the run. Text that is not
+    such a line, wherever it says ``Error:``, is not an error. Lines end
+    where OpenCode ends them (``os.EOL``), not at every character
+    :meth:`str.splitlines` breaks on."""
+    errors: list[str] = []
+    previous = ""
+    for line in stderr.split("\n"):
+        line = line.removesuffix("\r")
+        error = _OPENCODE_ERROR_LINE_RE.fullmatch(line)
+        if error and not _OPENCODE_TOOL_FAILED_LINE_RE.fullmatch(previous):
+            errors.append(error.group(1))
+        previous = line
+    return errors
 
 
 # #186: the CLI whose argv and stdin delivery the adapter speaks. No upper bound.

@@ -58,10 +58,15 @@ High-priority coverage includes:
 
 - success
 - non-zero exit
-- the exact OpenAI OpenCode WebSocket-close signature is adapter-classified;
-  the engine retries it successfully before the three-total-attempt bound,
-  stops at the bound with the phase unchanged, and does not retry unrelated
-  failures; each relaunch re-runs REMOTE phase-entry reconciliation
+- a failed run the adapter reports as transient: OpenCode's classification
+  reads only the run-level error lines it prints (the phrase in a tool's
+  trace or in a tool's error is not one; another run-level error, a
+  truncated stderr or a timeout is never transient); the engine relaunches
+  it after the phase-entry reconciliation, which may resolve or block the
+  phase instead, at most `MAX_TRANSIENT_RETRIES` times per step however it
+  interleaves with corrections, never in LOCAL mode or while a process the
+  launch started may still be running, and the exhausted failure keeps its
+  stderr tail and leaves the phase unchanged
 - timeout, including a same-group descendant that closed its stdio and
   ignores SIGTERM (escalated to SIGKILL, gone before `execute()` returns),
   a writer outside the group via `setsid` (the capture abandoned after the

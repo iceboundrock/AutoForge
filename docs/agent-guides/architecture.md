@@ -148,14 +148,20 @@ redacted `provider_summary` (scalars only) goes to `execution.json`. The engine 
 check. The adapter returns the text the parser reads as `stdout`, which for
 Pi is the final assistant message, never raw protocol records.
 
-An adapter may also set the provider-neutral `retryable_failure` signal when
-it recognizes a specific transient failure that is safe to retry. The REMOTE
-engine retries such a failure at most three total launches (including the
-first) and runs the phase-entry reconciliation before each relaunch; every
-launch remains separately logged, and state advances only after a validated
-result. Other provider failures, non-zero exits and all timeouts retain their
-existing failure behavior. The current adapter classification is limited to
-an OpenCode OpenAI `WebSocket closed with code 1000` exit.
+An adapter may also report a failed run as a known transient failure of its
+provider (`transient_failure`, a short fixed reason). It is a fact,
+recognised from the CLI's own output by the one layer that knows that
+output, and it never replaces the exit status or `provider_failure`: the
+launch is logged and reported as the failed exit it was. Whether to relaunch
+is the engine's policy, keyed on that field alone (no provider name, no
+error text): in REMOTE mode at most `MAX_TRANSIENT_RETRIES` (2) relaunches
+per step, counted apart from the CONTROL_RESULT corrections, each after the
+phase-entry reconciliation, and none while a process the failed launch
+started may still be running. Today the one classification is OpenCode's:
+an exit 1 of an `openai/*` model whose run-level errors, read from the error
+lines OpenCode itself prints rather than from text anywhere in its trace,
+are all `WebSocket closed with code 1000` (the adapter's docstring says what
+that check cannot see).
 
 ### Executor
 
