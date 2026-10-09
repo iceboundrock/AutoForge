@@ -58,6 +58,15 @@ High-priority coverage includes:
 
 - success
 - non-zero exit
+- a failed run the adapter reports as transient: OpenCode's classification
+  reads only the run-level error lines it prints (the phrase in a tool's
+  trace or in a tool's error is not one; another run-level error, a
+  truncated stderr or a timeout is never transient); the engine relaunches
+  it after the phase-entry reconciliation, which may resolve or block the
+  phase instead, at most `MAX_TRANSIENT_RETRIES` times per step however it
+  interleaves with corrections, never in LOCAL mode or while a process the
+  launch started may still be running, and the exhausted failure keeps its
+  stderr tail and leaves the phase unchanged
 - timeout, including a same-group descendant that closed its stdio and
   ignores SIGTERM (escalated to SIGKILL, gone before `execute()` returns),
   a writer outside the group via `setsid` (the capture abandoned after the
@@ -173,8 +182,10 @@ High-priority coverage includes:
 - the agent request and the run log carry the configured allow-list; pre-merge
   and validation commands run under the same one
 - HEAD or branch of the operator's checkout changing while the agent ran
-  enters BLOCKED (also when the invocation itself failed); agent commits in
-  its own worktree are not drift
+  enters BLOCKED (also when the invocation itself failed, and before any
+  relaunch: a launch that moved it and then failed transiently or returned
+  a result to correct is neither reconciled nor relaunched); agent commits
+  in its own worktree are not drift
 
 ### GitHub verification
 

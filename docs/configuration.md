@@ -353,6 +353,10 @@ to pass each provider's check. The profile's fields map as follows:
 - `options.output_format` must be `default` (the final assistant text on
   stdout, tool traces on stderr), and `options.auto_approve: true` adds
   `--auto`.
+- For an `openai/*` model, an exit 1 whose only run-level error OpenCode
+  printed is `WebSocket closed with code 1000` is reported to the engine as
+  transient, and a REMOTE run relaunches it at most twice per step, after
+  the phase's GitHub entry checks. No other failure is relaunched.
 - `extra_args` are appended after the adapter's own flags.
 
 The prompt travels on stdin, never in argv: OpenCode 2 duplicates or

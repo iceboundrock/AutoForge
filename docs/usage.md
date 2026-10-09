@@ -386,10 +386,10 @@ the provider adapter declares for its own CLI (`ANTHROPIC_*` and `CLAUDE_*`
 for Claude Code; `OPENCODE_*`, `OPENAI_*`, `ANTHROPIC_*`, `GEMINI_*`,
 `GOOGLE_*` for OpenCode); nothing else in the operator's environment is
 inherited, and the names (never the values) are recorded in the invocation's
-`request.json`. Before and after each invocation the controller reads HEAD
-and the checked-out branch of its own checkout; a change enters `BLOCKED`
-with the drift in the reason, nothing is rolled back, and `unblock`
-reconciles the agent's GitHub work. This is process and filesystem-level
+`request.json`. Before and after each invocation, including before every
+relaunch within a step, the controller reads HEAD and the checked-out branch
+of its own checkout; a change enters `BLOCKED` with the drift in the reason,
+nothing is rolled back, and `unblock` reconciles the agent's GitHub work. This is process and filesystem-level
 separation, not a sandbox: the agent still runs as the operator with network
 access and the allow-listed credentials.
 
@@ -408,10 +408,15 @@ ownership or discard uncommitted user changes.
   [Workflow: re-entering a phase](agent-guides/workflow.md#re-entering-a-phase).
 - **An agent failed, timed out or returned a malformed result:** a malformed
   `CONTROL_RESULT` from an agent that exited 0 is retried with a correction
-  prompt (`execution.max_correction_attempts`, default once). A non-zero
-  exit, a timeout or a verification failure is not retried automatically and
-  leaves the phase unchanged for `resume`. Inspect the invocation under
-  `<state dir>/logs/<run-id>/`. A timeout says which limit fired; see
+  prompt (`execution.max_correction_attempts`, default once). The one failed
+  exit relaunched automatically is a launch its adapter reports as transient
+  (today an OpenCode `openai/*` run whose only error is `WebSocket closed
+  with code 1000`): a REMOTE run relaunches it at most twice per step, after
+  re-reading GitHub, and when it stops the error says why ("not relaunched:
+  ..."). Any other non-zero exit, a timeout or a verification failure is not
+  retried automatically and leaves the phase unchanged for `resume`. Inspect
+  each invocation under `<state dir>/logs/<run-id>/`; a transient failure's
+  `error.txt` says `(transient: ...)`. A timeout says which limit fired; see
   [Agent limits](#agent-limits) before raising one.
 - **The run is `BLOCKED`:** read `autoforge status`, fix the cause, then
   `autoforge unblock --reason "..."` and `autoforge resume` (see above).

@@ -148,6 +148,22 @@ redacted `provider_summary` (scalars only) goes to `execution.json`. The engine 
 check. The adapter returns the text the parser reads as `stdout`, which for
 Pi is the final assistant message, never raw protocol records.
 
+An adapter may also report a failed run as a known transient failure of its
+provider (`transient_failure`, a short fixed reason). It is a fact,
+recognised from the CLI's own output by the one layer that knows that
+output, and it never replaces the exit status or `provider_failure`: the
+launch is logged and reported as the failed exit it was. Whether to relaunch
+is the engine's policy, keyed on that field alone (no provider name, no
+error text): in REMOTE mode at most `MAX_TRANSIENT_RETRIES` (2) relaunches
+per step, counted apart from the CONTROL_RESULT corrections, each after the
+checkout check and the phase-entry reconciliation, and none while a process
+the failed launch started may still be running. Today the one
+classification is OpenCode's: an exit 1 of an `openai/*` model whose
+run-level errors, read from the error lines OpenCode itself prints rather
+than from text anywhere in its trace, are all
+`WebSocket closed with code 1000` (the adapter's docstring says what that
+check cannot see).
+
 ### Executor
 
 The process executor owns:
@@ -174,7 +190,8 @@ The engine also owns *where* an agent runs: in REMOTE mode a per-issue
 `git worktree` it creates under `<git common dir>/autoforge/worktrees/<n>`
 (or `execution.worktree_dir`) at the first launch and never deletes, and it
 reads HEAD and branch of its own checkout before and after each invocation,
-entering `BLOCKED` on a change.
+including before every relaunch within a step (a correction or a transient
+retry), entering `BLOCKED` on a change before anything is relaunched.
 
 Nothing an agent starts outlives its invocation
 ([ADR 0002](../adr/0002-executor-nothing-outlives-the-invocation.md)). The

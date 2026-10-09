@@ -301,9 +301,26 @@ GitHub before launching anyone, in one place (`_remote_entry`), exactly as
 `ANALYZE_EXECUTE` reads its journal and the issue's PRs first. The
 correction relaunch after a malformed result is a re-entry too and runs the
 same probe first: an agent that posted, pushed or created and then lost its
-result block is reconciled with, not relaunched unaware. The table of what each phase's
+result block is reconciled with, not relaunched unaware. Before that probe,
+every relaunch re-reads HEAD and the branch of the checkout the controller
+is run from: if the launch before it moved them, the step enters `BLOCKED`
+without reconciling or launching again. The table of what each phase's
 re-entry does is complete by construction: every phase with an agent prompt
 has an entry, and a test holds the two tables together.
+
+A failed launch its adapter reports as a known transient failure of the
+provider (`transient_failure`, #164; today an OpenCode `openai/*` run whose
+only run-level error is `WebSocket closed with code 1000`) is relaunched
+inside the current REMOTE step, at most `MAX_TRANSIENT_RETRIES` (2) times.
+That budget belongs to the step: it is counted apart from the CONTROL_RESULT
+corrections and is not refilled by them, so one step launches at most
+`1 + execution.max_correction_attempts + 2` agents. Each relaunch is a
+re-entry like a correction: the checkout check and then the phase-entry
+reconciliation run first, and either may block (or the reconciliation
+resolve) the phase instead. A launch that may have left a process running is
+not relaunched. Exhausting the budget fails the step like any other failed
+exit, with the phase unchanged for `resume`. LOCAL runs never relaunch a
+transient failure.
 
 Every probe below and the read-back after the agent consume one identity
 model, `src/autoforge/claims.py`: one exact-schema decoder per marker kind,

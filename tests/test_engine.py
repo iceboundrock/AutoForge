@@ -23,6 +23,7 @@ from autoforge.config import default_config
 from autoforge.effects import EffectKind, Stage, compose_append
 from autoforge.effects import follow_up_issue_body as controller_follow_up_body
 from autoforge.effects import review_comment_body as render_review_comment
+from autoforge.engine import MAX_TRANSIENT_RETRIES
 from autoforge.errors import (
     ConfigurationError,
     ControlResultValidationError,
@@ -52,7 +53,7 @@ from autoforge.github import (
     WorkflowRunJobs,
 )
 from autoforge.loop_guard import RESULT_NEEDS_FIX, review_record
-from autoforge.providers import AgentExecutionResult, ScriptedProvider
+from autoforge.providers import AgentExecutionResult, OpenCodeProvider, ScriptedProvider
 from autoforge.result_parser import (
     MAX_FINDING_ID_CHARS,
     MAX_FINDING_LOCATION_CHARS,
@@ -160,6 +161,19 @@ def _in_review(
     eng.state.current_merge_base_sha = eng.origin.merge_base("main", head) if origin else MERGE_BASE
     eng.state.review_round = round_done
     return eng
+
+
+def _install_opencode_responses(eng, outcomes):
+    """Use the real adapter around a sequence of fake OpenCode exits."""
+    seen = []
+
+    def runner(req):
+        seen.append(req)
+        exit_code, stdout, stderr = outcomes.pop(0)
+        return ExecutionResult(req.command, req.cwd, exit_code, stdout, stderr, "t", "t")
+
+    eng.providers._overrides["opencode"] = OpenCodeProvider(runner=runner)
+    return seen
 
 
 # -- INITIALIZING --------------------------------------------------------------
@@ -8867,6 +8881,193 @@ def test_a_provider_failure_raises_before_the_parser_and_is_journaled(tmp_state_
     assert event["provider_summary"] == summary
 
 
+# -- transient provider failures (#164) -----------------------------------------
+# What OpenCode 2.0.26 writes on stderr when the socket to OpenAI closed under
+# a running turn: its own error line, styled whatever stderr is.
+WS_CLOSED = "> build · gpt-6-luna\n\x1b[91m\x1b[1mError: \x1b[0mWebSocket closed with code 1000\n"
+TRANSIENT = "opencode: OpenAI WebSocket closed with code 1000"
+
+
+def test_openai_websocket_disconnect_retries_and_reconciles_before_relaunch(
+    tmp_state_dir, fake_github
+):
+    """#164: a reviewer whose OpenCode run died of the socket close is
+    relaunched, each relaunch after the phase-entry reconciliation, and every
+    failed launch is logged as the failed exit it was."""
+    eng = _in_review(tmp_state_dir, fake_github, [])
+    calls = _install_opencode_responses(
+        eng,
+        [
+            (1, "complete but rejected", WS_CLOSED),
+            (1, "complete but rejected", WS_CLOSED),
+            (0, block(review_payload(1, SHA_A, [])), ""),
+        ],
+    )
+    original_entry = eng._remote_entry
+    reconciliations = []
+
+    def counted_entry(previous, plan):
+        reconciliations.append(previous)
+        return original_entry(previous, plan)
+
+    eng._remote_entry = counted_entry
+    out = eng.step()
+
+    assert out.next_phase == "READY_FOR_MERGE"
+    assert len(calls) == 3
+    # The step's own entry, then one before each relaunch.
+    assert reconciliations == [Phase.REVIEW, Phase.REVIEW, Phase.REVIEW]
+    run_dir, _ = _step_dir(eng)
+    steps = sorted(p for p in run_dir.iterdir() if p.is_dir())
+    assert len(steps) == 3
+    executions = [json.loads((p / "execution.json").read_text(encoding="utf-8")) for p in steps]
+    assert [e["exit_code"] for e in executions] == [1, 1, 0]
+    assert [e["error"] for e in executions[:2]] == [f"exit 1 (transient: {TRANSIENT})"] * 2
+    assert (steps[0] / "stderr.log").read_text(encoding="utf-8") == WS_CLOSED
+    progress = (steps[0] / "progress.log").read_text(encoding="utf-8")
+    assert f"agent exited 1 (transient: {TRANSIENT})" in progress
+    assert (steps[2] / "control-result.json").exists()
+
+
+def test_openai_websocket_disconnect_is_relaunched_at_most_twice_per_step(
+    tmp_state_dir, fake_github
+):
+    eng = _in_review(tmp_state_dir, fake_github, [])
+    calls = _install_opencode_responses(eng, [(1, "complete but rejected", WS_CLOSED)] * 3)
+
+    with pytest.raises(ExecutionError) as excinfo:
+        eng.step()
+
+    message = str(excinfo.value)
+    assert f"exited 1 (transient: {TRANSIENT}; not relaunched: this step already " in message
+    assert f"relaunched it {MAX_TRANSIENT_RETRIES} time(s), the bound of " in message
+    # The failure the operator is pointed at, as for any failed exit.
+    assert "stderr tail: > build · gpt-6-luna" in message and "WebSocket closed" in message
+    assert "State unchanged" in message and "resume" in message
+    state = load_state(eng.paths.state_file)
+    assert state.phase == Phase.REVIEW and state.review_round == 0
+    assert state.current_pr_url == PR and state.attempt == 3 and state.step_count == 1
+    assert len(calls) == 1 + MAX_TRANSIENT_RETRIES
+    run_dir, _ = _step_dir(eng)
+    steps = sorted(p for p in run_dir.iterdir() if p.is_dir())
+    assert len(steps) == 3
+    assert all("code 1000" in (p / "error.txt").read_text() for p in steps)
+    assert all(not (p / "control-result.json").exists() for p in steps)
+
+
+def test_openai_websocket_retry_does_not_consume_control_result_correction(
+    tmp_state_dir, fake_github
+):
+    eng = _in_review(tmp_state_dir, fake_github, [])
+    eng.config.execution.max_correction_attempts = 1
+    calls = _install_opencode_responses(
+        eng,
+        [
+            (1, "", WS_CLOSED),
+            (0, "not a control result", ""),
+            (0, block(review_payload(1, SHA_A, [])), ""),
+        ],
+    )
+
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    assert len(calls) == 3
+    run_dir, _ = _step_dir(eng)
+    steps = sorted(p for p in run_dir.iterdir() if p.is_dir())
+    requests = [json.loads((p / "request.json").read_text()) for p in steps]
+    assert [request["correction"] for request in requests] == [False, False, True]
+
+
+def test_transient_retries_are_bounded_per_step_across_corrections(tmp_state_dir, fake_github):
+    """The retry budget is the step's, not a run of consecutive failures: a
+    correction in between does not refill it, so a step launches at most
+    ``1 + max_correction_attempts + MAX_TRANSIENT_RETRIES`` agents."""
+    eng = _in_review(tmp_state_dir, fake_github, [])
+    eng.config.execution.max_correction_attempts = 1
+    calls = _install_opencode_responses(
+        eng,
+        [
+            (1, "", WS_CLOSED),
+            (0, "not a control result", ""),
+            (1, "", WS_CLOSED),
+            (1, "", WS_CLOSED),
+            (0, block(review_payload(1, SHA_A, [])), ""),
+        ],
+    )
+
+    with pytest.raises(ExecutionError, match="the bound of 2"):
+        eng.step()
+    assert len(calls) == 4 == 1 + 1 + MAX_TRANSIENT_RETRIES
+    # The relaunch of a correction is still that correction.
+    run_dir, _ = _step_dir(eng)
+    steps = sorted(p for p in run_dir.iterdir() if p.is_dir())
+    requests = [json.loads((p / "request.json").read_text()) for p in steps]
+    assert [request["correction"] for request in requests] == [False, False, True, True]
+    assert load_state(eng.paths.state_file).phase == Phase.REVIEW
+
+
+def test_unrelated_opencode_failure_is_not_retried(tmp_state_dir, fake_github):
+    eng = _in_review(tmp_state_dir, fake_github, [])
+    stderr = "\x1b[91m\x1b[1mError: \x1b[0mWebSocket closed with code 1006\n"
+    calls = _install_opencode_responses(eng, [(1, "", stderr)])
+
+    with pytest.raises(ExecutionError, match="exited 1. stderr tail: .*code 1006") as excinfo:
+        eng.step()
+    assert "transient" not in str(excinfo.value)
+
+    state = load_state(eng.paths.state_file)
+    assert state.phase == Phase.REVIEW and state.attempt == 1
+    assert len(calls) == 1
+
+
+def test_a_transient_failure_after_the_agent_opened_a_marker_pr_blocks_instead_of_relaunching(
+    tmp_state_dir, fake_github
+):
+    """The retry is a re-entry like a correction: the agent that opened a
+    marker PR itself before its run failed is not relaunched beside it."""
+
+    def publishes_then_fails(req):
+        sha = commit_in(req.cwd)
+        fake_github.add_pr(PR41, head_sha=sha, branch="mine", body=implementation_pr_body())
+        return ""
+
+    eng = make_engine(tmp_state_dir, [], github=fake_github, origin=True)
+    provider = _LeftoverProvider(publishes_then_fails, exit_code=1, transient_failure=TRANSIENT)
+    _install(eng, provider)
+    out = _analyzed(eng)
+    assert out.next_phase == "BLOCKED"
+    assert len(provider.calls) == 1
+    assert f"open PR {PR41} carries the implementation marker" in eng.state.block_reason
+    assert fake_github.effect_writes == [] and eng.origin.head("autoforge/2") is None
+
+
+@pytest.mark.parametrize(
+    "survivor", ["group_survived_kill", "capture_abandoned", "orphan_survived_kill"]
+)
+def test_a_transient_failure_is_not_relaunched_while_a_process_it_started_may_run(
+    tmp_state_dir, fake_github, survivor
+):
+    eng = _in_review(tmp_state_dir, fake_github, [])
+    provider = _LeftoverProvider("", exit_code=1, transient_failure=TRANSIENT, **{survivor: True})
+    _install(eng, provider)
+    with pytest.raises(ExecutionError) as excinfo:
+        eng.step()
+    assert len(provider.calls) == 1
+    assert "not relaunched: a process the launch started may still be running" in str(excinfo.value)
+
+
+def test_an_unchecked_platform_does_not_stop_the_transient_retry(tmp_state_dir, fake_github):
+    """``orphans_unchecked`` is true of every launch on a platform without a
+    subreaper, not evidence that anything survived."""
+    eng = _in_review(tmp_state_dir, fake_github, [])
+    provider = _LeftoverProvider(
+        "", exit_code=1, transient_failure=TRANSIENT, orphans_unchecked=True
+    )
+    _install(eng, provider)
+    with pytest.raises(ExecutionError, match="the bound of 2"):
+        eng.step()
+    assert len(provider.calls) == 1 + MAX_TRANSIENT_RETRIES
+
+
 def test_a_timeout_wins_over_a_provider_failure(tmp_state_dir, fake_github):
     eng = make_engine(tmp_state_dir, [], github=fake_github, origin=True)
     provider = _LeftoverProvider("", timed_out=True, provider_failure="pi: exited early")
@@ -10473,6 +10674,67 @@ def test_the_invocation_failure_propagates_when_nothing_moved(tmp_state_dir, fak
     eng = _drift_engine(tmp_state_dir, fake_github, lambda repo: None, fail=True)
     with pytest.raises(RuntimeError, match="agent exploded"):
         eng.step()
+
+
+class _MovesTheCheckoutFirst(ScriptedProvider):
+    """The first launch commits to the *operator's* checkout and ends with
+    ``first`` (keyword arguments of its result); a relaunch would implement
+    and succeed."""
+
+    def __init__(self, repo, **first) -> None:
+        super().__init__(implement)
+        self.repo, self.first = repo, first
+
+    def execute(self, req):
+        if self.calls:
+            return super().execute(req)
+        self.calls.append(req)
+        _commit(self.repo, "b.txt", "2", "sneaky")
+        result = {"exit_code": 0, "stdout": "", **self.first}
+        return AgentExecutionResult(
+            command=["x"], stderr="boom", started_at="t", finished_at="t", **result
+        )
+
+
+@pytest.mark.parametrize(
+    "first",
+    [
+        pytest.param({"exit_code": 1, "transient_failure": TRANSIENT}, id="transient-failure"),
+        pytest.param({"stdout": "not a control result"}, id="malformed-result"),
+    ],
+)
+def test_drift_left_by_a_launch_blocks_before_any_relaunch(tmp_state_dir, fake_github, first):
+    """The checkout is read before every relaunch, not only around the
+    step: a launch that moved it and then failed transiently, or returned a
+    result to correct, is followed by neither a reconciliation nor another
+    launch."""
+    repo = git_repo(tmp_state_dir.parent)
+    _commit(repo, "a.txt", "1", "base")
+    eng = make_engine(tmp_state_dir, [], github=fake_github, origin=True)
+    eng.config.execution.max_correction_attempts = 1
+    eng.step()
+    provider = _MovesTheCheckoutFirst(repo, **first)
+    _install(eng, provider)
+    original_entry = eng._remote_entry
+    entries = []
+
+    def counted_entry(previous, plan):
+        entries.append(previous)
+        return original_entry(previous, plan)
+
+    eng._remote_entry = counted_entry
+    assert eng.step().next_phase == "BLOCKED"
+
+    assert len(provider.calls) == 1
+    assert entries == [Phase.ANALYZE_EXECUTE]  # the step's own entry only
+    reason = eng.state.block_reason
+    assert "moved while ANALYZE_EXECUTE ran" in reason and "HEAD moved from" in reason
+    assert "Found before a relaunch: attempt 1 ended without a usable result" in reason
+    assert "neither reconciled nor launched again" in reason
+    assert reason.count("moved while") == 1  # reported once, not wrapped again
+    s = load_state(eng.paths.state_file)
+    assert s.phase is Phase.BLOCKED and s.attempt == 1 and s.current_pr_url == ""
+    assert fake_github.effect_writes == [] and eng.origin.head("autoforge/2") is None
 
 
 def test_dry_run_renders_a_pi_profile_without_launching_it(tmp_state_dir):

@@ -419,9 +419,15 @@ VerificationError
 
 Do not retry every failure blindly.
 
-Potentially transient failures may be retried with bounded retry/backoff, such as:
+Potentially transient failures may be retried only when their failure class is
+known and the retry path is bounded. Current cases include:
 
-- temporary process failure
+- a failed agent launch its adapter reported as a known transient failure
+  (`transient_failure`; today an OpenCode `openai/*` run whose only
+  run-level error is `WebSocket closed with code 1000`), in a REMOTE run: at
+  most `MAX_TRANSIENT_RETRIES` (2) relaunches per step, counted apart from
+  the corrections, each after the phase-entry reconciliation, and none while
+  a process the failed launch started may still be running
 - temporary GitHub/network error
 - malformed CONTROL_RESULT correction attempt
 
