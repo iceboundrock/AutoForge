@@ -199,8 +199,12 @@ class AgentRequest:
     # changes an outcome.
     progress: ProgressSink | None = None
     # How the adapter watches the invocation for a loop (#194): the engine
-    # passes ``execution.loop_detection``.
+    # passes ``execution.loop_detection``, and the request keeps it with the
+    # mode its own provider and phase run under (#199).
     loop_detection: LoopDetectionConfig = field(default_factory=LoopDetectionConfig)
+
+    def __post_init__(self) -> None:
+        self.loop_detection = self.loop_detection.for_invocation(self.profile.provider, self.phase)
 
 
 @dataclass

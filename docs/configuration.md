@@ -121,7 +121,7 @@ directory if it is missing and a probe file it creates and removes there.
 | Section | What it controls | Where the behaviour is specified |
 |---|---|---|
 | top level | `version`, `state_dir` (default `.autoforge`), `prompt_version` | [State and recovery](agent-guides/state-and-recovery.md) |
-| `execution` | the default agent limits (`default_idle_timeout_seconds` 900, `default_max_runtime_seconds` unset), loop detection (`loop_detection`, mode `warn`), the wall-clock bound on controller-run commands (`command_timeout_seconds` 1800), `max_correction_attempts` (default 1), the agent environment allow-list (`env_allowlist`, `env_allowlist_extra`), the per-issue agent worktree location (`worktree_dir`) | [Architecture](agent-guides/architecture.md), [Running the remote workflow](usage.md) |
+| `execution` | the default agent limits (`default_idle_timeout_seconds` 900, `default_max_runtime_seconds` unset), loop detection (`loop_detection`, mode `kill`; unset, `warn` on Pi and in `UPDATE_EPIC`), the wall-clock bound on controller-run commands (`command_timeout_seconds` 1800), `max_correction_attempts` (default 1), the agent environment allow-list (`env_allowlist`, `env_allowlist_extra`), the per-issue agent worktree location (`worktree_dir`) | [Architecture](agent-guides/architecture.md), [Running the remote workflow](usage.md) |
 | `safety` | the merge gate (`allow_merge`, default `false`), `protected_merge_paths` (default `.github/workflows/`), `required_checks` (default `ci`), `verify_check_definition` (default `true`) | [GitHub safety](agent-guides/github-safety.md#merge-safety) |
 | `merge` | how the controller merges once the gate is open: `method` (default `squash`), `delete_branch`, `max_verification_attempts` (default 5), `verification_commands` (argv lists, empty by default) | [GitHub safety](agent-guides/github-safety.md#merge-safety) |
 | `workflow` | loop bounds: `max_review_rounds` (20), `stagnation_identical_rounds` (2), `stagnation_unchanged_count_rounds` (3), `max_total_steps` (300); `epic_update_every` (1) | [Workflow](agent-guides/workflow.md#loop-bounds) |
@@ -189,9 +189,11 @@ one-week backstop is the only wall-clock bound.
   progress and is killed; raise `idle_timeout_seconds` on that profile.
 - **The trade-off.** The idle timeout catches a silent hang, not a busy
   one: output that keeps flowing resets it. [Loop detection](#loop-detection)
-  catches an agent that keeps repeating itself, and kills it in `kill` mode;
-  in the default `warn` mode it only warns, so set `max_runtime_seconds`
-  when an unattended run needs a hard bound on an active agent.
+  catches an agent that keeps repeating itself and, in the default `kill`
+  mode, kills it; an agent that keeps doing new things is bounded only by
+  `max_runtime_seconds`, so set it when an unattended run needs a hard
+  bound on an active agent (and whenever loop detection only warns or is
+  off, which by default it does on a Pi profile and in `UPDATE_EPIC`).
 - **Claude `output_format: text`** prints nothing until it exits, so the
   idle timeout cannot tell a working agent from a stuck one. Such a profile
   runs under its ceiling alone, and a ceiling is required: without
@@ -226,7 +228,7 @@ text alone.
 ```yaml
 execution:
   loop_detection:
-    mode: warn                    # kill | warn | off
+    # mode: kill                  # kill | warn | off; unset: see the modes
     max_cycle_period: 4           # 1-16
     max_cycle_repeats: 8          # 2-100000
     novelty_window_seconds: 1800  # 1-604800
@@ -271,17 +273,24 @@ The modes:
 
 | `mode` | From half a threshold | At a threshold |
 |---|---|---|
-| `warn` (default) | warns | warns that the loop is conclusive; the agent runs on |
-| `kill` | warns | kills the agent as on a timeout |
+| `kill` (default) | warns | kills the agent as on a timeout |
+| `warn` | warns | warns that the loop is conclusive; the agent runs on |
 | `off` | nothing | nothing |
+
+A config that does not set `mode` gets `kill` for every provider and phase
+real runs have measured, and `warn` for the two they have not: a Pi
+profile, and `UPDATE_EPIC` with any provider
+([How the defaults were set](#how-the-defaults-were-set)). A `mode` the
+config sets applies to every provider and phase, so `mode: kill` kills on
+Pi and in `UPDATE_EPIC` too.
 
 A warning is a progress line, such as `possible loop: 2-step cycle (Bash,
 Read) repeated 4×`. It repeats at most every two minutes while the loop
 goes on, plus once when the loop becomes conclusive. In every mode, `off`
 included, `provider_summary` in `execution.json` records how close the
 invocation came to each threshold. These are the `loop_*` calibration
-fields, and #199 sets the thresholds and switches the default to `kill`
-from them. What a kill looks like, and how to resume after one, is in
+fields ([How the defaults were set](#how-the-defaults-were-set)). What a
+kill looks like, and how to resume after one, is in
 [Running the remote workflow](usage.md#loop-detection).
 
 Work that repeats legitimately stays below every threshold:
@@ -293,11 +302,57 @@ Work that repeats legitimately stays below every threshold:
 - one long silent tool call.
 
 `autoforge doctor`, the dry-run plan (`Loops:`) and the launch line show
-the mode, and the doctor and dry-run also show the thresholds. The keys
-are strict, like everywhere else. An unknown key, an unknown mode or a
+the mode, and the doctor and dry-run also show the thresholds. The
+dry-run plan and the launch line show the mode the phase's profile runs
+under; `doctor` shows an unset mode as `kill (warn on provider pi and in
+UPDATE_EPIC: not calibrated yet)`. The keys are strict, like everywhere
+else. An unknown key, an unknown mode or a
 value out of range is a load error. A repeat count of 1, or a period of
 0, is refused rather than read as "off"; `mode: off` is the way to turn
 detection off.
+
+#### How the defaults were set
+
+#199 checked the defaults against the calibration fields of real runs
+before it made `kill` the default. The data came from 27 invocations that
+recorded the fields, in four runs between 2026-10-07 and 2026-10-09
+(#161 to #164), all in `warn` mode, and none of them warned. Each cell
+is the largest figure; the nearest-rank 90th percentile equals it except
+where shown:
+
+| Provider / phase | Runs | `loop_actions` | `loop_max_cycle_repeats` / `loop_max_cycle_period` | `loop_longest_novelty_free_seconds` / `…_actions` | `loop_max_line_repeats` | `loop_max_retry_streak` |
+|---|---|---|---|---|---|---|
+| Claude stream-json / `ANALYZE_EXECUTE` | 5 | 733 | 0 / 0 | 28 / 1 | 0 | 0 |
+| Claude stream-json / `FIX` (rounds 1–4) | 8 | 136 | 0 / 0 | 43 / 1 | 0 | 0 |
+| OpenCode / `REVIEW` (rounds 0–4) | 14 | 0 | 0 / 0 | 0 / 0 | 4 (p90 3) | 0 |
+
+The largest `ANALYZE_EXECUTE` ran 2h11m. The saved output of 25 earlier
+OpenCode `REVIEW` invocations was also replayed through the
+repeated-lines signal (maximum 7, p90 4), and so was that of 24 earlier
+Claude `output_format: text` invocations (0). The replay reproduced the
+recorded figure of each of the 14 OpenCode invocations above exactly.
+
+No invocation came within half of any threshold, the level from which
+the detector warns:
+
+| Threshold | Default | Largest figure recorded | Margin |
+|---|---|---|---|
+| `max_cycle_repeats` (action cycle) | 8 | `loop_max_cycle_repeats` 0: no cycle of up to 4 actions came back even once, in 2972 tool calls | no repeat at all |
+| `novelty_window_seconds` (no novelty) | 1800 s, with at least 32 replays | `loop_longest_novelty_free_seconds` 43, `loop_longest_novelty_free_actions` 1 | 41× in time, 32× in replays |
+| `max_line_repeats` (repeated lines) | 200 | `loop_max_line_repeats` 7 (OpenCode's stderr; 4 in the live runs) | 28× |
+| retry storm (`max_cycle_repeats` retries over `novelty_window_seconds`) | 8 over 1800 s | `loop_max_retry_streak` 0 | no retry at all |
+| `max_cycle_period` | 4 | `loop_max_cycle_period` 0 | no cycle at any period |
+
+Every threshold therefore stays at #194's value. The data would allow
+tighter ones, but the same change made a false positive a kill. A loop is
+still found within eight copies of a cycle, or within half an hour of
+nothing new, against a week-long backstop.
+
+No run had used a Pi profile or reached `UPDATE_EPIC` (every run stopped
+at `READY_FOR_MERGE` with the merge gate closed), so neither has data
+behind a kill. That is why an unset `mode` only warns there. Every run
+keeps recording the fields, in every mode, so a later change can switch
+those two to `kill`, or tighten the thresholds, from more data.
 
 ### Claude profiles
 

@@ -202,6 +202,51 @@ def test_a_new_action_breaks_the_cycle():
     assert _feed(monitor, actions) == {}
 
 
+# The largest calibration figures real runs recorded (#199): 27 invocations of
+# Claude stream-json (ANALYZE_EXECUTE, FIX) and OpenCode (REVIEW), plus the
+# replayed output of 25 earlier OpenCode reviews. No action cycle and no
+# provider retry ever came back.
+REAL_LINE_REPEATS = 7
+REAL_NOVELTY_FREE = (43, 1)  # seconds, replayed actions
+
+
+def test_the_largest_real_run_figures_draw_no_warning_under_the_defaults():
+    """#199: legitimate work stays below half of every default threshold, the
+    level from which the detector warns, so the default ``kill`` never ends it."""
+    warnings: list[str] = []
+    config = LoopDetectionConfig().for_invocation("claude", "ANALYZE_EXECUTE")
+    monitor = LoopMonitor(config, 0.0, warnings.append)
+    assert monitor.mode == "kill"
+    # OpenCode's trace: one log line, its timestamps masked, then another.
+    trace = b"".join(
+        f"INFO  2026-10-08T03:41:{i:02d} +{i}ms service=bus type=message.part.updated "
+        "publishing\n".encode()
+        for i in range(REAL_LINE_REPEATS)
+    )
+    assert monitor.output("stderr", trace + b"INFO  service=session done\n", 1.0) is None
+    # A file read again 43 s after the last new action, with no cycle.
+    seconds, _ = REAL_NOVELTY_FREE
+    read = _action("Read", {"path": "a.py"})
+    test = _action("Bash", {"command": "pytest"}, "1 passed")
+    assert _feed(monitor, [read, test]) == {}
+    assert monitor.action(*read, 1.0 + seconds) is None
+    calibration = monitor.calibration()
+    assert calibration["loop_max_line_repeats"] == REAL_LINE_REPEATS
+    assert (
+        calibration["loop_longest_novelty_free_seconds"],
+        calibration["loop_longest_novelty_free_actions"],
+    ) == REAL_NOVELTY_FREE
+    assert calibration["loop_max_cycle_repeats"] == calibration["loop_max_retry_streak"] == 0
+    assert warnings == [] and monitor.report(killed=False) is None
+
+
+def test_a_monitor_refuses_a_mode_no_invocation_resolved():
+    """#199: an unset mode is ``kill`` or ``warn`` depending on the provider
+    and phase, which a monitor does not know; it is refused, not guessed."""
+    with pytest.raises(ValueError, match="for_invocation"):
+        LoopMonitor(LoopDetectionConfig(), 0.0)
+
+
 # -- B: no novelty --------------------------------------------------------------
 
 SMALL = {"max_cycle_period": 2, "max_cycle_repeats": 3, "novelty_window_seconds": 60}
@@ -529,10 +574,13 @@ def _step_files(state_dir) -> dict[str, dict]:
     }
 
 
-def test_e2e_kill_mode_kills_a_looping_agent_and_leaves_the_phase_unchanged(tmp_path, fake_github):
-    """#194 acceptance: a looping agent that would otherwise run on is
-    killed as on a timeout; the error names the cycle; the phase is not
-    advanced; ``execution.json`` says why, with names and counts only."""
+def test_e2e_the_default_kills_a_looping_agent_and_leaves_the_phase_unchanged(
+    tmp_path, fake_github
+):
+    """#194 acceptance, under #199's default ``kill``: a looping agent that
+    would otherwise run on is killed as on a timeout; the error names the
+    cycle; the phase is not advanced; ``execution.json`` says why, with names
+    and counts only."""
     import time
 
     from autoforge.errors import ExecutionTimeoutError
@@ -542,7 +590,7 @@ def test_e2e_kill_mode_kills_a_looping_agent_and_leaves_the_phase_unchanged(tmp_
     eng, state_dir = _engine_on_fake_claude(
         tmp_path, fake_github, _looping_lines(12, secret=TOKEN, tail=[{"sleep": 30}])
     )
-    eng.config.execution.loop_detection = LoopDetectionConfig(mode="kill")
+    assert eng.config.execution.loop_detection == LoopDetectionConfig()
     lines: list[str] = []
     eng.progress_output = lines.append
     started = time.monotonic()
@@ -582,8 +630,8 @@ def test_e2e_kill_mode_kills_a_looping_agent_and_leaves_the_phase_unchanged(tmp_
     assert execution["provider_summary"]["loop_max_cycle_repeats"] == 8
 
 
-def test_e2e_warn_default_warns_at_bounded_intervals_and_never_kills(tmp_path, fake_github):
-    """The default mode is ``warn``: the loop is reported in progress and in
+def test_e2e_warn_mode_warns_at_bounded_intervals_and_never_kills(tmp_path, fake_github):
+    """In ``warn`` mode the loop is reported in progress and in
     ``execution.json`` but the agent runs to its own end, and forty copies
     of the cycle give two warnings, not one per action."""
     from tests import claude_fake
@@ -594,7 +642,7 @@ def test_e2e_warn_default_warns_at_bounded_intervals_and_never_kills(tmp_path, f
     eng, state_dir = _engine_on_fake_claude(
         tmp_path, fake_github, _looping_lines(40, tail=[claude_fake.result(block(ANALYZE_OK))])
     )
-    assert eng.config.execution.loop_detection.mode == "warn"
+    eng.config.execution.loop_detection = LoopDetectionConfig(mode="warn")
     lines: list[str] = []
     eng.progress_output = lines.append
     out = eng.step()

@@ -6674,6 +6674,30 @@ def test_update_epic_null_completes_the_run(tmp_state_dir, fake_github):
     assert [c for c in fake_github.calls if c[0] == "get_issue" and c[1] != EPIC] == []
 
 
+@pytest.mark.parametrize(("configured", "mode"), [(None, "warn"), ("kill", "kill")])
+def test_update_epic_only_warns_of_a_loop_unless_the_config_sets_the_mode(
+    tmp_state_dir, fake_github, configured, mode
+):
+    """#199 (R1-F2): no real run has reached UPDATE_EPIC, so a config that
+    leaves ``execution.loop_detection.mode`` unset launches it in ``warn``
+    mode; one that sets ``kill`` kills there too. The launch line and both
+    run-log files name the mode the agent ran under."""
+    from autoforge.config import LoopDetectionConfig
+
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(None)])
+    eng.config.execution.loop_detection = LoopDetectionConfig(mode=configured)
+    lines: list[str] = []
+    eng.progress_output = lines.append
+    assert eng.step().next_phase == "DONE"
+    (req,) = eng.provider.calls
+    assert req.phase == "UPDATE_EPIC" and req.loop_detection.mode == mode
+    assert f"loop detection {mode}, attempt 1" in lines[0]
+    _, step = _step_dir(eng)
+    for name in ("request", "execution"):
+        logged = json.loads((step / f"{name}.json").read_text(encoding="utf-8"))
+        assert logged["loop_detection"] == LoopDetectionConfig(mode=mode).as_dict()
+
+
 # -- UPDATE_EPIC entry and read-back: the progress comment (PR #89 review, F2) -------------
 def test_update_epic_entry_blocks_on_a_progress_comment_it_did_not_journal(
     tmp_state_dir, fake_github
@@ -8763,7 +8787,7 @@ def test_an_idle_timeout_names_the_limit_and_the_last_activity(tmp_state_dir, fa
     request = json.loads((step / "request.json").read_text(encoding="utf-8"))
     assert request["idle_timeout_seconds"] == 900 and request["max_runtime_seconds"] is None
     shown = [line.split("] ", 1)[1] for line in lines]
-    assert "idle timeout 900s, max runtime unset, loop detection warn, attempt 1" in shown[0]
+    assert "idle timeout 900s, max runtime unset, loop detection kill, attempt 1" in shown[0]
     assert shown[-1].startswith("agent made no progress for 900s (last activity 08:31:02 UTC)")
 
 

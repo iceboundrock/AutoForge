@@ -1632,3 +1632,51 @@ def test_provider_a_looping_agent_is_killed_in_kill_mode_as_a_timeout(tmp_path):
     assert record["tools"] == ["bash"]
     assert res.provider_summary["loop_max_cycle_repeats"] == 8
     assert "abort" not in fake.commands()
+
+
+def test_provider_by_default_a_looping_pi_is_warned_about_not_killed(tmp_path):
+    """#199 (R1-F2): no real run has measured Pi yet, so with
+    ``execution.loop_detection.mode`` unset the same loop that ``kill`` ends
+    is only reported, and the agent runs to its own end."""
+    from autoforge.config import LoopDetectionConfig
+
+    stream: list[dict] = [{"type": "agent_start"}]
+    for n in range(12):
+        args = {"command": "gh pr checks 5"}
+        stream += [
+            {
+                "type": "tool_execution_start",
+                "toolCallId": f"c{n}",
+                "toolName": "bash",
+                "args": args,
+            },
+            {
+                "type": "tool_execution_end",
+                "toolCallId": f"c{n}",
+                "toolName": "bash",
+                "result": {"content": [{"type": "text", "text": "pending"}]},
+                "isError": False,
+            },
+        ]
+    stream += [
+        {"type": "message_end", "message": assistant(FINAL)},
+        {"type": "agent_end", "messages": [], "willRetry": False},
+        {"type": "agent_settled"},
+    ]
+    fake = FakePi(tmp_path, _happy(events=stream))
+    req = AgentRequest(
+        phase="FIX",
+        prompt="fix it",
+        cwd=str(tmp_path),
+        profile=_profile(fake.command, name="fix"),
+        idle_timeout_seconds=None,
+        max_runtime_seconds=60,
+        env_allowlist=("PATH",),
+        loop_detection=LoopDetectionConfig(),
+    )
+    assert req.loop_detection.mode == "warn"
+    res = PiProvider(round_trip_seconds=5, abort_seconds=1).execute(req)
+    assert not res.timed_out and not res.timeout_limit and res.provider_failure is None
+    assert res.exit_code == 0 and FINAL in res.stdout
+    assert res.loop is not None and res.loop.action == "warned"
+    assert res.provider_summary["loop_max_cycle_repeats"] == 12

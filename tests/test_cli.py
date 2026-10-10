@@ -2063,6 +2063,6 @@ def test_dry_run_shows_both_agent_limits(tmp_path, capsys, monkeypatch, fakes):
     assert not any(line.startswith("Timeout:") for line in out.splitlines())
     (loops,) = [line for line in out.splitlines() if line.startswith("Loops:")]
     assert loops == (
-        "Loops:    loop detection warn (cycles of up to 4 actions x8, no new action for 1800s, "
+        "Loops:    loop detection kill (cycles of up to 4 actions x8, no new action for 1800s, "
         "repeated lines x200)"
     )

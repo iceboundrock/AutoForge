@@ -116,6 +116,10 @@ High-priority coverage includes:
   - each known legitimate repetition staying below every threshold: an
     edit/test loop, `git status` between edits, a few CI polls, pytest dot
     lines, `\r` progress bars and one long silent call;
+  - the largest figures real runs recorded (#199) drawing no warning under
+    the default configuration;
+  - the unset mode resolving to `kill` per invocation, and to `warn` on a
+    Pi profile and in `UPDATE_EPIC`; a monitor refusing an unresolved mode;
   - warnings from half a threshold at bounded intervals;
   - calibration in every mode, `off` included;
   - a report that holds names, counts and times only.
@@ -132,12 +136,15 @@ High-priority coverage includes:
     response ends it.
   - A loop kill crosses the fake `claude` (stream and text mode) and a fake
     Pi as a timeout with the `loop` limit.
-  - End to end on the engine: kill mode leaves the phase unchanged, names
-    the cycle in the error and writes `ended_by: loop` and the `loop`
-    report to `execution.json`. The default `warn` mode never kills and
-    warns twice for forty copies of a cycle. A token-shaped string in the
-    looping tool's input and result, and its digests, reach no line and no
-    file.
+  - End to end on the engine: the default `kill` mode leaves the phase
+    unchanged, names the cycle in the error and writes `ended_by: loop` and
+    the `loop` report to `execution.json`. `warn` mode never kills and
+    warns twice for forty copies of a cycle. Under the default,
+    `UPDATE_EPIC` launches in `warn` mode unless the config sets `kill`,
+    and the launch line, `request.json` and `execution.json` name the mode
+    it ran under; a looping Pi on the fake `pi` is warned about and runs to
+    its end. A token-shaped string in the looping tool's input and result,
+    and its digests, reach no line and no file.
 - bounded capture: a stream past the bound keeps its head and tail, the
   retained size honours a bound smaller than one pipe read, and memory stays
   at the bound plus a constant under one-byte reads

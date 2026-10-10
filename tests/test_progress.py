@@ -465,7 +465,7 @@ def test_seeded_secrets_escapes_and_env_values_reach_no_line_and_no_file(
     shown = [line.split("] ", 1)[1] for line in lines]
     assert shown[0].startswith(
         "launching analyze_execute (claude, model fable, effort high), "
-        "idle timeout 900s, max runtime unset, loop detection warn, attempt "
+        "idle timeout 900s, max runtime unset, loop detection kill, attempt "
     )
     assert shown[1:] == [
         "agent started (claude-fable-5-1)",

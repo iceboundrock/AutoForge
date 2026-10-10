@@ -47,7 +47,8 @@ from half a threshold it warns, again at most every
 conclusive, never on every event; in ``kill`` mode it returns the first
 conclusive finding as the verdict its caller ends the invocation on. In every
 mode, ``off`` included, it keeps the calibration figures
-(:meth:`LoopMonitor.calibration`) the default thresholds are to be set from.
+(:meth:`LoopMonitor.calibration`) the default thresholds were checked
+against (#199).
 """
 
 from __future__ import annotations
@@ -418,7 +419,14 @@ class LoopMonitor:
         *,
         warn_interval: float = WARN_INTERVAL_SECONDS,
     ) -> None:
-        self.mode = config.mode
+        if config.mode is None:
+            # Unset means "kill unless uncalibrated", which only the
+            # invocation's provider and phase decide (#199).
+            raise ValueError(
+                "LoopMonitor needs the mode of one invocation: pass "
+                "LoopDetectionConfig.for_invocation(provider, phase)"
+            )
+        self.mode: str = config.mode
         self._period = config.max_cycle_period
         self._cycle_repeats = config.max_cycle_repeats
         self._window = float(config.novelty_window_seconds)
