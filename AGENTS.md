@@ -181,7 +181,8 @@ docs/agent-guides/
   testing.md                           testing requirements and high-priority coverage
 docs/adr/                              accepted design records (LOCAL mode workspace boundary,
                                        executor: nothing an agent starts outlives its invocation,
-                                       Pi provider, authority boundary and typed external effects)
+                                       Pi provider, authority boundary and typed external effects,
+                                       outer sandbox and host-resource capability model)
 docs/README.md                         human-oriented documentation index, by intent
 docs/usage.md                          operator guide: remote commands, stop phases, unblock, recovery
 docs/local-mode.md                     operator guide: LOCAL mode (no GitHub)
