@@ -213,7 +213,8 @@ proof over the written directory can establish that they were.
 - **Validator:** the process a definition launches. Its argv is trusted;
   what it executes is candidate code and untrusted.
 - **`ValidationRecord`:** what the controller observed for one launch of one
-  definition against one candidate under one policy (D10.1).
+  definition against one candidate under one policy, or, for an attempt a
+  crash interrupted, what it was about to launch (D10.1, D10.7).
 - **Applicable:** a record whose candidate, definition and policy equal the
   ones in force at the point of use (D8.3). Derived at use time, never
   stored.
@@ -250,6 +251,17 @@ The argv is trusted configuration. What it executes (test files, build
 scripts, `Makefile` targets) is candidate code and untrusted. The controller
 trusts only its own observation of the launch, the exit and the captured
 bytes.
+
+The statement covers the outcomes the controller observed: `PASS`, `FAIL`
+and `TIMEOUT`. An **`INTERRUPTED`** record (D10.7) means exactly:
+
+> AutoForge was about to launch validator X, as defined by trusted
+> configuration Y, against candidate C under execution policy P, and stopped
+> before it observed a result.
+
+It does not say whether the validator was launched, what it did or how it
+ended. Y and P are the ones in force when the controller wrote the attempt
+marker (D11.2), not the ones in force when the record was written.
 
 **D1.2 (documentation only).** A **`ReviewCertificate`** means exactly:
 
@@ -306,8 +318,8 @@ its key.** It is one of:
 - `pr-head`: the canonical PR URL, with the objects fetched without
   creating a ref.
 
-Provenance is bounded strings and booleans, displayed in the REVIEW
-evidence section (D9.1), and never compared.
+Provenance is strings, an integer and booleans, bounded by D10.3, displayed
+in the REVIEW evidence section (D9.1), and never compared.
 
 **D2.4 (#173).** **No mutable local branch is ever an input.**
 
@@ -745,9 +757,11 @@ restored or a new round runs (D14.1).
 timeout, and the **enforcement facts** copied from the in-memory
 `ExecutionResult.sandbox` (`SandboxFacts`) the executor returned for that
 launch: enforced or not, the backend and its version, the network position,
-and the teardown fact. They are bounded strings and booleans, displayed
-(D9.1, `status`), and read by no decision except D8.3's second rule. A
-launch with no description records `enforced: false` and no backend.
+and the teardown fact. They are strings and booleans bounded by D10.3, and
+nothing else of `SandboxFacts` is copied (not `tmpfs`, `unset_env` or
+`setup_failure`). They are displayed (D9.1, `status`), and read by no
+decision except D8.3's second rule. A launch with no description records
+`enforced: false` and no backend.
 
 **D8.3 (#172).** **Applicability.**
 
@@ -853,46 +867,146 @@ failure happened.
 
 ### 2.10 The `ValidationRecord` schema (item 10)
 
-**D10.1 (#172).** **Fields** (bounded, typed, no free-form dictionary):
+**D10.1 (#172).** **Fields** (bounded by D10.3, typed, no free-form
+dictionary). The last column names the shape a field belongs to:
 
-| Field | Content |
-|---|---|
-| `schema` | integer record schema version (1) |
-| `seq` | per-state, monotonically increasing integer |
-| `digest` | SHA-256 over the canonical encoding of every other field |
-| `candidate` | `RemoteCandidate` or `LocalCandidate` (D2.1, D2.6) under its `kind`, plus bounded provenance (D2.3) |
-| `definition` | set index, redacted argv, `definition_digest`, scope |
-| `policy` | `policy_digest`, mode, timeout seconds |
-| `enforcement` | the copied facts (D8.2) |
-| `outcome` | `PASS`, `FAIL`, `TIMEOUT` or `INTERRUPTED` |
-| `exit_code` | integer as the executor reported it, or null (`TIMEOUT`, `INTERRUPTED`) |
-| timing | `started_at`, `finished_at` (UTC, ISO 8601) |
-| leftovers | ADR 0002's facts: descendants killed, group survived the kill, orphans killed, orphan survived, orphans unchecked |
-| output | `stdout_tail`, `stderr_tail`, `stdout_bytes`, `stderr_bytes`, and `tail_truncated` per stream |
-| LOCAL only | `start_fingerprint`, `end_fingerprint` |
-| `run_log` | the relative run-log name: informational, never read for authority |
+| Field | Content | Shape |
+|---|---|---|
+| `schema` | integer record schema version (1) | both |
+| `seq` | per-state, monotonically increasing integer | both |
+| `digest` | SHA-256 over the canonical encoding of every other field | both |
+| `candidate` | `RemoteCandidate` or `LocalCandidate` (D2.1, D2.6) under its `kind`, plus its provenance (D2.3) | both |
+| `definition` | set index, redacted argv, `definition_digest`, scope | both |
+| `policy` | `policy_digest`, mode, timeout seconds | both |
+| `outcome` | `PASS`, `FAIL` or `TIMEOUT` (observed); `INTERRUPTED` (interrupted) | both: the discriminator |
+| `run_log` | the relative run-log name of the step that launched the validator or wrote the marker: informational, never read for authority | both |
+| LOCAL `start_fingerprint` | the fingerprint the walk before the command read (D7.2) | both |
+| `enforcement` | the copied facts (D8.2) | observed |
+| `exit_code` | integer as the executor reported it, or null (`TIMEOUT`) | observed |
+| timing | `started_at`, `finished_at` (UTC, ISO 8601), as the executor reported them | observed |
+| leftovers | ADR 0002's facts: descendants killed, group survived the kill, orphans killed, orphan survived, orphans unchecked | observed |
+| output | `stdout_tail`, `stderr_tail`, `stdout_bytes`, `stderr_bytes`, and `tail_truncated` per stream | observed |
+| LOCAL `end_fingerprint` | the fingerprint the walk after the command read (D7.2) | observed |
+| `marked_at` | when the attempt marker was written (UTC, ISO 8601) | interrupted |
+| `recovered_at` | when the resume path wrote the record (UTC, ISO 8601) | interrupted |
 
-The configuration does not bound an argv today (`_as_argv_list`). #172 bounds
-the element count and each element's length for every command list a record
-copies, and refuses a configuration beyond them at load, so a record never
-truncates an argv.
+A record has exactly one of two shapes, chosen by its `outcome`. An
+**observed** record (`PASS`, `FAIL`, `TIMEOUT`) holds the fields marked
+"both" and "observed". An **interrupted** record (`INTERRUPTED`, D10.7)
+holds the fields marked "both" and "interrupted". The two shapes share no
+optional field, as the candidate kinds share none (D2.7). Parsing refuses a
+record that lacks a field of its shape or carries a field of the other. A
+LOCAL field appears exactly in a `local` record.
 
 **D10.2 (#172).** **Output safety.** Raw bytes are processed in this order:
 
 1. they are captured under the executor's byte caps;
 2. they are decoded with replacement characters;
 3. they are redacted (`redaction.redact`) on the full captured text;
-4. the tail is cut to the bound;
-5. control characters other than newline and tab are escaped;
+4. control characters other than newline and tab are escaped;
+5. the tail is cut to its bound (D10.3): the longest suffix that fits, so a
+   cut never splits an escape;
 6. the truncation facts are recorded.
 
-**D10.3 (#172).** **Bounds** (recommended; #172 may lower them, never raise
-them silently):
+**D10.3 (#172).** **Bounds.** This decision is the one bound definition for
+every Wave 2B persisted field: the records, the attempt marker, the
+`review_evidence` binding, the failure counter, the override watermark and
+the certificate (D11.2, D12.1). #172 defines each bound once, as a named
+constant beside the schema (as `effects.py` defines the effect record's),
+and the writers and the loader use the same constants. #172 may lower a
+value before its migration merges, never raise one silently. Once the
+migration has merged, the bounds are part of the state protocol, so
+lowering one is a protocol change (D15.5).
 
-- at most 16 definitions per set, refused at load beyond;
-- at most 2,000 characters per stream tail (today's `VerificationError`
-  tail);
-- at most 64 records per state (D11.4 decides eviction).
+*Lists:*
+
+| Value | Bound |
+|---|---|
+| definitions per set (`validation.commands`, `local.validation_commands`) | 16 |
+| `validation_records` | 64 records (D11.4 evicts) |
+| record seqs and digests in the binding or the certificate | 16 pairs, one per definition of the set |
+| elements of an argv | 32 |
+
+*Strings:*
+
+| Value | Bound |
+|---|---|
+| an argv element as configured | 1,024 characters, non-blank (as today) |
+| an argv as configured | 4,096 characters, summed over its elements |
+| the redacted argv a record or marker holds | 3,072 characters per element and 12,288 in all: the configured bounds times redaction's `MAX_GROWTH_FACTOR` (3), as `MAX_STORED_RATIONALE_CHARS` is derived |
+| `stdout_tail`, `stderr_tail` | 2,000 characters each as stored, after escaping (D10.2); today's `VerificationError` tail |
+| the repository (`owner/name`) | 200 characters, under `effects.py`'s repository rule |
+| a PR URL (`pr-head` provenance, `reviewed_pr_url`) | 512 characters (`MAX_URL_CHARS`); parsed by `parse_pr_url`, in the candidate's repository |
+| the review comment URL | 512 characters; parsed by `parse_comment_url`, on the certificate's PR |
+| `reviewed_base_ref` | 255 characters, under `effects.py`'s ref rule |
+| the worktree id | 255 characters, one path component: no `/`, NUL or control character, and not `.` or `..` |
+| the LOCAL run id | `RUN_ID_RE` (at most 128 characters) |
+| `run_log` | 256 characters: `<run id>/<step directory>`, under `RUN_ID_RE` and `STEP_DIR_RE` |
+| `backend`, `backend_version` | 64 characters each |
+| `teardown` | 128 characters |
+
+*Fixed formats and enumerations:*
+
+- a commit, tree or base SHA: full lower-case hex of the length of the
+  candidate's `object_format` (40 or 64);
+- every digest and fingerprint (`digest`, `definition_digest`,
+  `policy_digest`, `validation_set_digest`, `workspace_policy_digest`, the
+  LOCAL fingerprints): 64 lower-case hex characters;
+- every timestamp: an ISO 8601 UTC time as `utcnow_iso` writes it, at most
+  32 characters;
+- `kind` (`remote`, `local`), the provenance kind (`worktree`, `pr-head`),
+  `object_format` (`sha1`, `sha256`), the scope (`candidate-tree`), the mode
+  (`disabled`, `preferred`, `required`), `network` (`host`, `isolated`, or
+  empty when there is no backend), `outcome`, and the counter's phase
+  (`ANALYZE_EXECUTE`, `FIX`).
+
+*Integers and booleans:* `schema` is 1; a set index is 0 to 15; the timeout
+is 1 to `MAX_DEADLINE_SECONDS` (`execution.command_timeout_seconds`' own
+range); `exit_code` is -128 to 255 (a signal is reported negated); a `seq`,
+the watermark, a review round and an issue number are 1 to `2**31 - 1`; a
+comment id is 1 to `2**53 - 1`, and a byte count 0 to `2**53 - 1`; the
+counter's count is 1 to its bound (3, D5.2). Booleans are JSON booleans,
+never strings or integers.
+
+**Writers.** A writer never produces a value the loader would refuse.
+
+- An argv beyond its bounds is refused where it enters the controller:
+  `validation.commands` and `local.validation_commands` at configuration
+  load, so a new run contract never holds one. A LOCAL run contract persisted
+  before #172 is checked before its first launch. An argv beyond the bounds
+  there is refused before any marker: no record, no re-check (it could not
+  change the answer), and `BLOCKED` naming the definition and the bound. A
+  record therefore never truncates an argv. `merge.verification_commands` is copied into no record
+  and is not bounded by this decision.
+- The identifiers and URLs come from values the controller has already
+  validated (a SHA read from the store, `current_pr_url`, the run id, the
+  K4 read-back); one outside its format is refused before the marker, with
+  no record, never clipped.
+- The output tails are cut by D10.2, and `tail_truncated` says so.
+- The enforcement text facts are display-only (D8.2). One longer than its
+  bound is clipped with an ellipsis by `SandboxFacts`' existing rule, which
+  already clips `backend_version` at 64 characters.
+- `validation_records` is evicted to its bound (D11.4) in the write that
+  appends.
+
+Nothing else is ever clipped.
+
+**Loading.** A persisted value outside its bound, format or enumeration, a
+list longer than its bound, a field of the wrong type, or a record of the
+wrong shape (D10.1) is corruption. The load raises `StateError` naming the
+field and the bound, like a digest mismatch (D11.1). Nothing is clipped,
+padded, defaulted or dropped to make a file fit. `run` refuses the file
+unless `--force` quarantines it, as for any corrupt state file today, and
+every other command that loads it reports the error.
+
+**Total.** Counted at its bounds, one record is under 20,000 characters,
+most of them the redacted argv and the two tails. The 64 records, the
+marker, the binding, the counter, the watermark and the certificate
+therefore stay under 1.5 million characters: under 18 MiB of
+`ensure_ascii` JSON at 12 bytes a character, the worst case
+`MAX_EFFECT_STATE_CHARS` is counted with. Beside the effect part's 12 MiB,
+that keeps a state file within `MAX_STATE_FILE_BYTES` (64 MiB). #172 pins
+the relation in a test.
 
 **D10.4 (#172).** **Outcomes.**
 
@@ -900,8 +1014,8 @@ them silently):
 - `FAIL`: any other exit status of a launched command, 126 and 127
   included, and a termination by a signal the executor did not send.
 - `TIMEOUT`: the executor's timeout ended it.
-- `INTERRUPTED`: historical only, written by the resume path from a
-  leftover marker (D11.3).
+- `INTERRUPTED`: not an observed outcome. Only the resume path writes it,
+  from a leftover marker, in the interrupted shape (D10.7, D11.3).
 
 `FAIL` and `TIMEOUT` are terminal for (C, definition, P) under automatic
 recovery; only the operator's override makes them historical (D14.2).
@@ -925,9 +1039,37 @@ record (D10.4) is reused and ends the set; otherwise the definition runs.
 The set stops at the first non-PASS, and the definitions after it get no
 record.
 
+**D10.7 (#172).** **The interrupted record.**
+
+- **It is built from the attempt marker alone** (D11.2). The candidate and
+  its provenance, the definition (set index, redacted argv,
+  `definition_digest`, scope), the policy (`policy_digest`, mode, timeout),
+  the LOCAL `start_fingerprint`, `run_log` and `marked_at` are copied from
+  the marker. `seq`, `digest` and `recovered_at` are the resume path's own.
+  Nothing is taken from the configuration in force at recovery, so a
+  configuration changed after the crash cannot change what the record says.
+  Nothing is read from `execution.json` or the run log.
+- **It claims no launch.** It holds no enforcement facts, exit status,
+  launch timing, leftovers, output or `end_fingerprint`, because none was
+  observed. The crash may have come before the launch, while the validator
+  ran, or after it exited, and the record does not say which (D1.1).
+- **It is never evidence and never terminal.** D10.6 runs its definition
+  again. No binding, certificate or counter names it, and it is rendered
+  into no prompt (D5.4, D9.1). `status` shows it.
+- **It counts toward §2.16's bound.** In the write that appends it, the
+  resume path counts the retained `INTERRUPTED` records with the same
+  candidate identity (not provenance), `definition_digest` and
+  `policy_digest`, this one included. It enters `BLOCKED` when the count
+  exceeds 2. A record at or below the override watermark (D14.2) is not
+  counted. Eviction (D11.4) can only lower the count, which delays the
+  `BLOCKED` and never makes evidence.
+
 *Rationale.* A record holds only what the controller itself observed, in a
-shape a loader can validate field by field. Redacting before the cut keeps
-a secret that straddles the cut from surviving as a fragment.
+shape a loader can validate field by field. An interruption is recorded
+with what the controller knew before the launch, because that is all it
+knows. Redacting before the cut keeps a secret that straddles the cut from
+surviving as a fragment. Escaping before the cut makes the bound the stored
+length, which is what the loader checks.
 
 ### 2.11 Persistence: Option A, bounded strict state (item 11)
 
@@ -937,10 +1079,12 @@ failure counter and the override watermark. They are validated on load
 like every persisted field. Corruption fails loudly, and referential
 integrity is checked on load:
 
-- a certificate, binding or counter that names a missing record;
+- a certificate, binding or counter that names a missing record, or an
+  `INTERRUPTED` one (D10.7);
 - a digest mismatch;
 - a record matching neither candidate kind, or the other mode's kind
-  (D2.7).
+  (D2.7);
+- a value beyond its bound, or a record of the wrong shape (D10.1, D10.3).
 
 Nothing is written outside the state file, so SafeRoot's atomic write
 (`safefs.py`) is the only primitive needed. There is no blob store. Run
@@ -951,15 +1095,23 @@ never authority.
 (D15.1):
 
 - `validation_records`: a bounded list (D10.1, D10.3).
-- `validation_attempt`: one optional marker {candidate, definition digest,
-  policy digest, `started_at`}. It is written immediately before each
-  launch: after the pre-launch capability gate, the materialization and its
-  proof, and #165's preflight, so a refusal by any of them writes no marker.
-  It is cleared in the write that appends the record. When the executor
-  reports a launch or setup failure instead (D10.5), it is cleared in the
-  controller's next write: the re-check's own marker replaces it, or the
-  `BLOCKED` write clears it. Only a crash leaves a marker for the resume
-  path to find (§2.16).
+- `validation_attempt`: one optional marker holding every field an
+  interrupted record copies (D10.7), and nothing observed: the candidate and
+  its provenance, the definition (set index, redacted argv,
+  `definition_digest`, scope), the policy (`policy_digest`, mode, timeout
+  seconds), the LOCAL `start_fingerprint`, the step's `run_log`, and
+  `marked_at`. It obeys the candidate-kind rule (D2.7).
+  - It is written immediately before each launch: after the pre-launch
+    capability gate, the materialization and its proof, and #165's
+    preflight, so a refusal by any of them writes no marker.
+  - Writing it is not a launch. The launch follows the write, so a crash
+    between the two leaves a marker for a validator that never started;
+    this is why an interrupted record claims no launch (D10.7).
+  - It is cleared in the write that appends the record. When the executor
+    reports a launch or setup failure instead (D10.5), it is cleared in the
+    controller's next write: the re-check's own marker replaces it, or the
+    `BLOCKED` write clears it. Only a crash leaves a marker for the resume
+    path to find (§2.16).
 - `review_evidence`: an optional binding {review round, candidate, ordered
   record seqs and digests, `validation_set_digest`}, written before the
   reviewer launches (D5.5, D5.7).
@@ -969,11 +1121,13 @@ never authority.
 - `validation_override_seq`: an optional integer, the operator's override
   watermark (D14.2).
 
+Every field of every addition is bounded by D10.3.
+
 **D11.3 (#172).** **Loading is read-only.** Load validates and never mutates.
-Converting a leftover marker into an `INTERRUPTED` record, and clearing a
-marker whose record exists, happen only in the engine's resume and step path
-under the repository lock, in one atomic write. `status`, `doctor` and the
-dry run only report a pending marker.
+Converting a leftover marker into an `INTERRUPTED` record (D10.7, from the
+marker alone), and clearing a marker whose record exists, happen only in the
+engine's resume and step path under the repository lock, in one atomic
+write. `status`, `doctor` and the dry run only report a pending marker.
 
 **D11.4 (#172).** **Retention.**
 
@@ -1017,7 +1171,7 @@ certificate, D12.2):
 - the clean result (`needs_fix_round: false`, zero actionable findings);
 - `issued_at`.
 
-No review prose is included.
+No review prose is included. Every field is bounded by D10.3.
 
 **D12.2 (#174).** **Issuance.**
 
@@ -1115,7 +1269,8 @@ write.
 
 - A non-PASS record at or below the watermark is historical, no longer
   terminal, so the next gate re-validates the same candidate. PASS records
-  keep their applicability.
+  keep their applicability. An `INTERRUPTED` record at or below it no
+  longer counts toward the interruption bound (D10.7).
 - It is a human decision, shown in `status` and the run log. Automatic
   recovery never sets it.
 - LOCAL has no unblock; a new run starts with no records.
@@ -1155,8 +1310,8 @@ fold it into #172's migration before that merges or make its own bump.
 | Window | Rule | Owner |
 |---|---|---|
 | candidate selected, nothing launched | resume re-reads the candidate and validates | #173 |
-| marker written, validator running | the engine's resume path (never load) records `INTERRUPTED` (historical) and reruns; more than 2 interrupted attempts for the same (C, definition, P) → `BLOCKED` | #172 |
-| validator exited, record not written | as above: the outcome was never observed durably, so it is rerun, never assumed | #172 |
+| marker written, validator not yet launched or running | the engine's resume path (never load) records `INTERRUPTED` from the marker alone, claiming no launch (D10.7), and reruns; more than 2 interrupted attempts for the same (C, definition, P) → `BLOCKED` | #172 |
+| validator exited, record not written | as above: the outcome was never observed durably, so the record claims none and the definition is rerun, never assumed | #172 |
 | record written, marker not cleared | impossible by construction (one write); a hand-made stale marker is cleared by the resume path, never by load | #172 |
 | producer: PASS records written, no effect intent | ADR 0004 W1: no plan and no completion context were saved, because a phase persists its rendered payload only with its intents (ADR 0004 D8.4), so the agent is relaunched under the existing attempt accounting; its commit is still in the worktree, and the same candidate reuses the records without rerunning them | #173 |
 | producer: a FAIL record written | the record and the counter are one write (in `REPLAN_REEXECUTE`, the record and the rejection, D5.3); terminal for (C, definition, P); the next step relaunches until the bound, then `BLOCKED`; never PASS by recovery | #173 |
@@ -1243,7 +1398,7 @@ the parity work (#155) are consumed, not changed.
 | Child | Decisions |
 |---|---|
 | #171 | D6.1–D6.4, D6.6; §2.16's export row |
-| #172 | D2.1–D2.3, D2.6, D2.7, D3.1, D3.2, D3.5, D3.6, D4.2, D5.6, D7.1, D7.2, D8.1–D8.3, D8.5, D8.6, D10.1–D10.6, D11.1–D11.4, D12.1, D15.1, D15.2, D15.4; §2.16's marker rows |
+| #172 | D2.1–D2.3, D2.6, D2.7, D3.1, D3.2, D3.5, D3.6, D4.2, D5.6, D7.1, D7.2, D8.1–D8.3, D8.5, D8.6, D10.1–D10.7, D11.1–D11.4, D12.1, D15.1, D15.2, D15.4; §2.16's marker rows |
 | #173 | D2.4, D5.1–D5.5, D5.7, D9.1–D9.5; §2.16's producer and REVIEW-entry rows |
 | #174 | D1.3, D12.2, D12.3, D12.5; §2.16's comment and certificate rows |
 | #175 | D12.4, D13.1, D13.2, D14.1, D14.2; §2.16's moved-candidate row |
@@ -1294,10 +1449,26 @@ the parity work (#155) are consumed, not changed.
 - **The attempt marker** is written after every check that can refuse a
   launch, and a launch failure leaves none behind (D11.2), so that only a
   crash produces `INTERRUPTED`.
+- **An `INTERRUPTED` record has a shape and a trust statement of its own**
+  (D1.1, D10.1, D10.7). #170's marker held the candidate, two digests and a
+  start time. A record of the full schema cannot be built truthfully from
+  that: its argv and policy fields would come from the configuration in
+  force at recovery, and its enforcement, exit, leftover and output fields
+  were never observed. The marker now holds every field the interrupted
+  record copies (D11.2). The record claims no launch, because a crash can
+  come between the marker and the launch, and #170's `started_at` is now
+  `marked_at`.
+- **Every bound is named** (D10.3). #170 recommended three bounds and called
+  the other persisted values bounded. D10.3 gives every variable-size value
+  of every Wave 2B field a bound or a format, says what a writer and the
+  loader do with a value beyond it, and shows that the total fits the state
+  file's bound.
+- **The output tail is cut after escaping** (D10.2), so its bound is the
+  stored length; #170 cut before escaping.
 - **The writer lists trees too** (`ls-tree -r -t`), so an empty subtree is
   exported and proved (D6.2).
 - **The configuration bounds no argv today;** #172 adds the bounds a record
-  needs (D10.1).
+  needs (D10.3).
 - **A legacy entry mode** fails the proof, measured (§1.2, D6.3).
 - **#170 calls a materialization failure inconclusive** without saying
   where the run goes. D10.5 gives it one fresh attempt, then `BLOCKED`, and
@@ -1352,19 +1523,31 @@ fake filter programs, and no paid provider or model call.
 **#172 (definitions, policy, records, persistence):**
 
 - Configuration: the key is empty by default, accepts argv lists only, and
-  refuses more than 16 definitions and an argv beyond the bounds; no
-  configuration can name a scope other than `candidate-tree` (with a scope
-  field, any other value is refused).
+  refuses more than 16 definitions and an argv beyond the bounds (33
+  elements, a 1,025-character element, 4,097 characters in all), in
+  `validation.commands` and `local.validation_commands`; a LOCAL run
+  contract persisted before #172 with an argv beyond them blocks before any
+  marker; no configuration can name a scope other than `candidate-tree`
+  (with a scope field, any other value is refused).
 - Digests: `definition_digest` and `validation_set_digest` are stable
   across processes and change with the argv and the index;
   `policy_digest` is equal for two exports of the same candidate and
   changes with the mode, the template, the allow-list, the timeout,
   `contain_orphans` and the materialization method.
 - Records: round-trip; a digest mismatch, a kind mismatch, a missing
-  referenced record and the other mode's kind are refused on load; bounds
-  (the tail, the record count, eviction oldest first except pinned records).
+  referenced record and the other mode's kind are refused on load; eviction
+  is oldest first except pinned records.
+- Bounds (D10.3): for each bounded value of a record, the marker, the
+  binding, the counter, the watermark and the certificate, a file at the
+  bound loads and a file one past it is refused with `StateError` naming the
+  field, with nothing clipped; a malformed SHA, digest, timestamp or
+  enumeration value is refused; an enforcement text fact longer than its
+  bound is clipped with an ellipsis by the writer; the worst-case total
+  stays under the state file's bound.
 - Output safety: a secret straddling the tail cut is redacted on the full
-  text first; control characters are escaped; invalid UTF-8 is replaced.
+  text first; control characters are escaped before the cut, the stored tail
+  is at most 2,000 characters, and a cut never splits an escape; invalid
+  UTF-8 is replaced.
 - Outcomes: exit 0 is PASS; exits 1, 126 and 127 and a self-inflicted
   signal are FAIL; a timeout is TIMEOUT; a launch or setup failure and a
   preflight refusal leave no record and block after the bounded re-check;
@@ -1376,7 +1559,16 @@ fake filter programs, and no paid provider or model call.
   marker, and a launch or setup failure leaves none behind; load leaves the
   file byte-identical and `status` reports a marker a crash left; resume
   converts it to `INTERRUPTED` and reruns; a third interruption of the
-  same key blocks.
+  same key blocks, and interruptions at or below the override watermark are
+  not counted.
+- The interrupted record (D10.7): with `validation.commands`, the timeout
+  and the allow-list changed between the crash and the resume, the record
+  carries the marker's argv, definition and policy; a crash injected after
+  the marker write and before the launch yields the same record; it holds no
+  enforcement, exit, launch-timing, leftover, output or `end_fingerprint`
+  field; an `INTERRUPTED` record carrying one, or an observed record missing
+  one, is refused on load; it is never reused as evidence, and a binding,
+  certificate or counter naming one is refused on load.
 - LOCAL convergence: a validator that writes a covered file
   deterministically (F0 → F1, then the same bytes again from F1) converges
   after one confirming run, and F1 is bound; one that writes a timestamp
@@ -1484,6 +1676,12 @@ fake filter programs, and no paid provider or model call.
 - **Changing `execution.command_timeout_seconds`, the allow-list or the
   sandbox mode after a clean review** blocks the merge gate until it is
   restored or a new round runs.
+- **A validation command's argv is bounded** (D10.3): a configuration that
+  exceeds the bounds is refused at load, where today any length is
+  accepted.
+- **An interrupted validation is recorded as an interruption, not as a
+  run:** the record says what the controller was about to launch and
+  nothing about what happened (D10.7).
 - **Validation is not hermetic and not reproducible;** a record says where
   and how it ran, and the documentation says what that does not prove.
 - **Documentation follows behaviour** in the implementing children:
