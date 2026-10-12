@@ -385,6 +385,102 @@ truncated result as a failure, the way it treats a timeout; the executor's
 agent stdout is in
 [control-result-protocol.md](control-result-protocol.md).
 
+#### The outer sandbox (ADR 0005, #167)
+
+Both `ExecutionRequest` and `DuplexRequest` take an optional `sandbox`: a
+`LaunchDescription` (`src/autoforge/sandbox.py`) that says what one launch
+can reach. A request without one takes exactly the path it took before.
+The description is typed, immutable and backend-neutral, and it knows no
+workflow, provider or GitHub: a projection is a host path, an access mode
+(read-only or writable) and the path it appears at; then come the masks,
+the overlays, the private home and temp, the environment overrides for the
+path-valued names (`HOME`, `XDG_*`, `TMPDIR`), the network position and
+the `/proc`, `/dev` and `/sys` policy.
+
+The policy compiler (`compile_launch`, same module) is the only way to
+build one from facts. Its input, a `SandboxRequest`, is plain data: the
+controller's facts (the operator's home, its environment for the
+forbidden locations, the denied roots, the engine's projections, masks and
+overlays) and the declared requirements (`Origin.DECLARED` projections, the
+operator configuration roots, keyring logins). It applies ADR 0005's rules
+before anything is spawned:
+
+- D4.2 C1–C7: resolved sources; a controller-owned source that is or passes
+  through a link is refused; directories and regular files only; denied
+  roots masked or refused; carve-outs are the engine's; overlaps refused,
+  except a declared read-only path already visible, which is dropped and
+  recorded in `covered`; relocations only into the private home;
+- D4.3: the forbidden sources (the home and its ancestors, the gh and git
+  configuration and credentials, `~/.ssh`, `~/.gnupg`, keyrings, the
+  password store, `/run`, `$XDG_RUNTIME_DIR`);
+- D7.2: keyring logins, and writable declarations on an operator
+  configuration root.
+
+A refusal is `SandboxPolicyError`, naming the path and the rule, never a
+file's contents. The compiler is pure except for `realpath`, `lstat` and
+`readlink` of the paths it is given and of the fixed system paths. Which
+paths a launch class gets is the engine's (#168), not the compiler's.
+
+The Linux backend is `src/autoforge/sandbox_bwrap.py`, the only module
+that knows a `bwrap` flag (a test pins it). `prepare()` turns a description
+and a command into a `BwrapLaunch`, and the executor spawns that in the
+command's place: the same `start_new_session`, pipes, limits, containment,
+group kill and exit grace. Every launch gets:
+
+- user, mount, PID and IPC namespaces; `--unshare-net` only when the
+  description asks for an isolated network;
+- a new procfs and a minimal `/dev`;
+- an empty tmpfs root with exactly the description's mounts, with masks
+  made read-only after their carve-outs;
+- `--clearenv` and exactly the computed environment, passed with every
+  option through a memory file (`--args`), so no value is on a command
+  line;
+- `--die-with-parent`;
+- in the launch's own process, never in the controller: a new session
+  keyring and a Landlock domain that scopes abstract Unix sockets.
+
+Whether the command ran is read from `--json-status-fd`. A `bwrap` that
+exited by itself without an `exit-code` record is a setup failure, raised
+as `SandboxLaunchRefusedError` (an `ExecutionError`, on the
+failure-to-spawn path) with nothing attributed to the command. A `bwrap`
+ended by a signal the executor did not send is the command's abnormal
+end.
+
+Launches are refused, never run unsandboxed:
+
+- on a platform that is not Linux;
+- without `bwrap` on `PATH`;
+- on a kernel without Landlock ABI 6;
+- on an architecture whose keyring call is unknown.
+
+`probe()` is the minimal launch that proves a host can enforce; its
+operator-facing use is #169's.
+
+What changes for a sandboxed launch (ADR 0002 §4e):
+
+- When the command exits or `bwrap` is killed, the kernel kills
+  everything left in the namespace at once. Inner processes get no grace,
+  and they are never counted.
+- `ExecutionResult.sandbox` / `DuplexResult.sandbox` (`SandboxFacts`)
+  records the outcome, and the run log writes it to `execution.json` and
+  `events.jsonl` (`ExecutionRecord.sandbox`):
+  - whether the sandbox was enforced;
+  - the backend and its version;
+  - the teardown ("removed by namespace teardown, uncounted");
+  - the network position;
+  - the tmpfs bounds;
+  - the unset variable names;
+  - a setup failure's bounded, redacted reason.
+- The thread that spawns a sandboxed launch must outlive it, because
+  `--die-with-parent` fires when that *thread* exits. That thread calls
+  `execute()` and waits, or calls `start_duplex()` and holds the handle
+  until `finish()`.
+
+The executor still owns no policy: it does not decide whether a launch is
+sandboxed, which paths it gets, or what happens when the host cannot
+enforce. That is #168's routing and #169's modes. The facts are for the
+log, and the controller never reads them.
+
 ### GitHub client
 
 Centralize GitHub integration behind a `GitHubClient` or equivalent abstraction.

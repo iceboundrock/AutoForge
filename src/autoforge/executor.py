@@ -63,7 +63,15 @@ Safety properties:
   result says which limit fired (:attr:`ExecutionResult.timeout_limit`) and
   when the child last wrote anything (:attr:`ExecutionResult.last_activity_at`).
   Only the child's output is activity: what the controller writes to it is
-  not, and neither is time spent waiting on anyone else.
+  not, and neither is time spent waiting on anyone else;
+- on request (``sandbox``), the command runs inside the outer sandbox a
+  :class:`~autoforge.sandbox.LaunchDescription` describes (ADR 0005): the
+  Linux backend (:mod:`autoforge.sandbox_bwrap`) is spawned in its place,
+  with the same session, pipes, limits, containment and group kill, and a
+  host that cannot establish the sandbox refuses the launch
+  (:class:`~autoforge.errors.SandboxLaunchRefusedError`) instead of running
+  it without one. A request without a description takes exactly the path
+  it took before (ADR 0002 §4e).
 """
 
 from __future__ import annotations
@@ -83,7 +91,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import IO
 
-from .errors import ExecutionError, ExecutionTimeoutError
+from . import sandbox_bwrap
+from .errors import ExecutionError, ExecutionTimeoutError, SandboxLaunchRefusedError
+from .sandbox import LaunchDescription, SandboxFacts
+from .sandbox_bwrap import BwrapLaunch
 
 _KILL_GRACE_SECONDS = 5.0
 # After the child has exited on its own, how long its pipes may stay open
@@ -205,6 +216,13 @@ class ExecutionRequest:
     # same path and within the same bounds, and the result says ``stopped``.
     # Why the caller stopped it is the caller's; the executor never sets it.
     stop: threading.Event | None = None
+    # Run the command inside the outer sandbox this describes (ADR 0005);
+    # ``None`` runs it as every launch ran before the sandbox existed. A
+    # sandboxed launch is spawned on the calling thread, which waits for it,
+    # as ``bwrap --die-with-parent`` requires (D10.6). A host that cannot
+    # establish the sandbox raises :class:`SandboxLaunchRefusedError`; it never
+    # runs the command without it.
+    sandbox: LaunchDescription | None = None
 
 
 @dataclass
@@ -263,6 +281,9 @@ class ExecutionResult:
     # so the group was killed; ``exit_code`` is then -1. Never set together
     # with ``timed_out``.
     stopped: bool = False
+    # What the outer sandbox recorded for a request that carried a
+    # description (ADR 0005 D10.4); ``None`` for one that did not.
+    sandbox: SandboxFacts | None = None
 
     @property
     def stdout_tail(self) -> str:
@@ -288,6 +309,7 @@ class ExecutionResult:
             orphans_killed=self.orphans_killed,
             orphan_survived_kill=self.orphan_survived_kill,
             orphans_unchecked=self.orphans_unchecked,
+            sandbox_teardown=self.sandbox is not None and self.sandbox.enforced,
         )
 
     @property
@@ -322,12 +344,16 @@ def describe_leftovers(
     orphans_killed: bool = False,
     orphan_survived_kill: bool = False,
     orphans_unchecked: bool = False,
+    sandbox_teardown: bool = False,
 ) -> str:
     """One sentence naming what an invocation left behind; empty when nothing.
 
     The facts are the executor's (see :class:`ExecutionResult`); the
     sentence is for a run log or an error, so an operator is pointed at a
     leftover process rather than at a slow agent or a clean kill.
+    ``sandbox_teardown`` is every enforced sandboxed launch: what it left
+    inside the sandbox was killed with the namespace and never counted, so
+    the sentence says so rather than reporting nothing (ADR 0005 D10.4).
     """
     parts: list[str] = []
     if descendants_killed:
@@ -359,6 +385,11 @@ def describe_leftovers(
         parts.append(
             "processes it may have left outside its process group could not be checked on "
             "this platform (no child subreaper), so one may still be running"
+        )
+    if sandbox_teardown:
+        parts.append(
+            "whatever it left inside the sandbox was killed when the sandbox's namespace was "
+            "torn down, uncounted"
         )
     return "; ".join(parts)
 
@@ -841,9 +872,18 @@ def _group_alive(pgid: int) -> bool:
     return True
 
 
-def _group_gone(pgid: int, deadline: float) -> bool:
-    """Poll until the group has no member left or ``deadline``; True when gone."""
+def _group_gone(pgid: int, deadline: float, contained: _Containment | None = None) -> bool:
+    """Poll until the group has no member left or ``deadline``; True when gone.
+
+    A ``contained`` invocation that adopts its group's dead
+    (:attr:`_Containment.adopts_group`) has them reaped as the poll goes,
+    since a zombie still counts as a member until it is reaped.
+    """
     while _group_alive(pgid):
+        if contained is not None and contained.adopts_group:
+            contained.reap_dead()
+            if not _group_alive(pgid):
+                break
         if time.monotonic() >= deadline:
             return False
         time.sleep(_GROUP_POLL_SECONDS)
@@ -942,9 +982,15 @@ class _Containment:
     reported, not hidden.
     """
 
-    def __init__(self, prctl: Callable[..., int], previous: int) -> None:
+    def __init__(self, prctl: Callable[..., int], previous: int, adopts_group: bool) -> None:
         self._prctl = prctl
         self._previous = previous
+        # A sandboxed launch (ADR 0005): when the backend is killed, its
+        # process inside the PID namespace is re-parented here and dies at
+        # once (the namespace's teardown), a zombie still in the child's
+        # group. The group checks reap it as they poll (:func:`_group_gone`)
+        # instead of waiting out a grace for a member that is already dead.
+        self.adopts_group = adopts_group
         self._before = frozenset(_children())
         self.child: int | None = None
         self.found = False
@@ -956,7 +1002,7 @@ class _Containment:
         )
 
     @classmethod
-    def begin(cls) -> _Containment | None:
+    def begin(cls, *, adopts_group: bool = False) -> _Containment | None:
         """Start containing; None when this platform has no child subreaper.
 
         Raises :class:`ExecutionError` when another contained invocation is
@@ -975,7 +1021,7 @@ class _Containment:
             if prctl(_PR_GET_CHILD_SUBREAPER, ctypes.byref(previous), 0, 0, 0) != 0:
                 _CONTAINMENT_LOCK.release()
                 return None
-            contained = cls(prctl, previous.value)
+            contained = cls(prctl, previous.value, adopts_group)
             if prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
                 _CONTAINMENT_LOCK.release()
                 return None
@@ -1095,6 +1141,10 @@ class _Containment:
     def alive(self) -> bool:
         return bool(self._live())
 
+    def reap_dead(self) -> None:
+        """Reap the dead among the invocation's new children now (:meth:`_live`)."""
+        self._live()
+
     def release(self) -> None:
         """Stop the reaper, reap what has died and restore the previous
         subreaper setting. Idempotent."""
@@ -1162,7 +1212,7 @@ def _terminate_group(
         if (
             _reaped(proc, deadline)
             and _eof(readers, deadline)
-            and _group_gone(pgid, deadline)
+            and _group_gone(pgid, deadline, contained)
             and (contained is None or contained.gone(deadline, sig))
         ):
             return _Termination(group_survived=False, capture_abandoned=False)
@@ -1192,14 +1242,24 @@ def _child_environment(
 
 
 def _spawn(
-    command: list[str], *, cwd: str | None, env: dict[str, str], stdin: int
+    command: list[str],
+    *,
+    cwd: str | None,
+    env: dict[str, str],
+    stdin: int,
+    launch: BwrapLaunch | None = None,
 ) -> subprocess.Popen[bytes]:
     """Start ``command`` in a session of its own with stdout and stderr piped.
 
     ``start_new_session`` makes the child lead a process group the executor
     can reach and kill after the child itself is gone; the terminal is never
-    inherited. A spawn failure is an :class:`ExecutionError`.
+    inherited. A spawn failure is an :class:`ExecutionError`. With
+    ``launch`` the sandbox backend is started in the command's place
+    (:func:`_spawn_sandboxed`) and ``env`` is not used: the launch carries
+    the command's environment.
     """
+    if launch is not None:
+        return _spawn_sandboxed(launch, cwd=cwd, stdin=stdin)
     try:
         return subprocess.Popen(  # noqa: S603 - argv list, no shell
             command,
@@ -1214,6 +1274,63 @@ def _spawn(
         raise ExecutionError(f"executable not found: {command[0]} ({exc})") from exc
     except OSError as exc:
         raise ExecutionError(f"failed to spawn {' '.join(command)}: {exc}") from exc
+
+
+def _spawn_sandboxed(
+    launch: BwrapLaunch, *, cwd: str | None, stdin: int
+) -> subprocess.Popen[bytes]:
+    """Start the sandbox backend in place of the command, as :func:`_spawn` does.
+
+    The same session and pipes, plus the descriptors only ``bwrap`` reads
+    (its options, its status stream) and the launch's own process scope,
+    applied between fork and exec (:class:`BwrapLaunch`). The
+    fork happens on this thread, which is the thread ``--die-with-parent``
+    watches, so the caller must outlive the invocation (ADR 0005 D10.6). A
+    failure of that scope, or a backend gone since it was prepared, is a
+    :class:`SandboxLaunchRefusedError`.
+    """
+    try:
+        return subprocess.Popen(  # noqa: S603 - argv list, no shell
+            launch.argv,
+            cwd=cwd,
+            env=launch.spawn_env,
+            stdin=stdin,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+            pass_fds=launch.pass_fds,
+            preexec_fn=launch.preexec_fn,  # noqa: PLW1509 - prepared foreign calls only
+        )
+    except FileNotFoundError as exc:
+        raise SandboxLaunchRefusedError(
+            f"the sandbox cannot be established: {launch.argv[0]} is gone ({exc})"
+        ) from exc
+    except subprocess.SubprocessError as exc:
+        raise launch.spawn_error(exc) from exc
+    except OSError as exc:
+        raise ExecutionError(f"failed to spawn {' '.join(launch.argv)}: {exc}") from exc
+    finally:
+        launch.spawned()
+
+
+def _prepare_sandbox(
+    description: LaunchDescription,
+    command: list[str],
+    *,
+    cwd: str | None,
+    env_allowlist: tuple[str, ...] | None,
+    env: Mapping[str, str] | None,
+) -> BwrapLaunch:
+    """The backend's launch for ``command`` inside ``description``, or a refusal.
+
+    The command's environment is selected as for any launch
+    (:func:`_child_environment`) and handed to the backend, which applies the
+    description's overrides over it. Done before an invocation's containment
+    begins, since the backend may read its own version first.
+    """
+    return sandbox_bwrap.prepare(
+        description, command, cwd=cwd, env=_child_environment(env_allowlist, env)
+    )
 
 
 def execute(req: ExecutionRequest) -> ExecutionResult:
@@ -1251,18 +1368,43 @@ def execute(req: ExecutionRequest) -> ExecutionResult:
     count as part of what must be gone: they get the exit grace and the kill
     the group gets, within the same bounds. Those that die while the child
     runs are reaped meanwhile.
+
+    With ``sandbox`` the backend runs in the command's place
+    (:func:`_prepare_sandbox`) and everything above applies to it: its group
+    is the command's group, and the kernel removes what is left inside the
+    sandbox when the command or the backend ends. A host that cannot
+    establish the sandbox, before or after the spawn, raises
+    :class:`SandboxLaunchRefusedError`, and nothing the backend wrote is
+    returned as the command's; a backend ended by a signal the executor did
+    not send is the command's abnormal end, as for any command
+    (:meth:`BwrapLaunch.outcome`).
     """
     if not req.command:
         raise ExecutionError("empty command")
     if req.max_output_bytes <= 0:
         raise ExecutionError(f"max_output_bytes must be > 0, got {req.max_output_bytes}")
     check_limit("idle_timeout_seconds", req.idle_timeout_seconds)
-    contained = _Containment.begin() if req.contain_orphans else None
+    launch = None
+    if req.sandbox is not None:
+        launch = _prepare_sandbox(
+            req.sandbox,
+            req.command,
+            cwd=req.cwd,
+            env_allowlist=req.env_allowlist,
+            env=req.env,
+        )
     try:
-        return _execute(req, contained)
+        contained = (
+            _Containment.begin(adopts_group=launch is not None) if req.contain_orphans else None
+        )
+        try:
+            return _execute(req, contained, launch)
+        finally:
+            if contained is not None:
+                contained.release()
     finally:
-        if contained is not None:
-            contained.release()
+        if launch is not None:
+            launch.close()
 
 
 def check_limit(name: str, value: float | None) -> None:
@@ -1276,7 +1418,11 @@ def check_limit(name: str, value: float | None) -> None:
         )
 
 
-def _execute(req: ExecutionRequest, contained: _Containment | None) -> ExecutionResult:
+def _execute(
+    req: ExecutionRequest,
+    contained: _Containment | None,
+    launch: BwrapLaunch | None = None,
+) -> ExecutionResult:
     started = _now()
     ceiling = req.timeout_seconds if req.timeout_seconds > 0 else None
     limits = _Limits(req.idle_timeout_seconds, ceiling)
@@ -1294,8 +1440,9 @@ def _execute(req: ExecutionRequest, contained: _Containment | None) -> Execution
         proc = _spawn(
             req.command,
             cwd=req.cwd,
-            env=_child_environment(req.env_allowlist, req.env),
+            env={} if launch is not None else _child_environment(req.env_allowlist, req.env),
             stdin=subprocess.DEVNULL if feeder is None else feeder.child_end,
+            launch=launch,
         )
     except BaseException:
         if feeder is not None:
@@ -1348,7 +1495,7 @@ def _execute(req: ExecutionRequest, contained: _Containment | None) -> Execution
             # An orphan still alive past the same grace is killed with
             # them, and reported as an orphan, not as a group member.
             grace = time.monotonic() + _EXIT_GRACE_SECONDS
-            group_settled = _eof(readers, grace) and _group_gone(pgid, grace)
+            group_settled = _eof(readers, grace) and _group_gone(pgid, grace, contained)
             if not (group_settled and (contained is None or contained.settled(grace))):
                 descendants_killed = not group_settled
                 left = _terminate_group(pgid, proc, readers, contained)
@@ -1375,6 +1522,14 @@ def _execute(req: ExecutionRequest, contained: _Containment | None) -> Execution
             f"failed to write the stdin of {' '.join(req.command)}: {feeder.error}"
         ) from feeder.error
     out, err = (reader.captured() for reader in readers)
+    facts = None
+    if launch is not None:
+        # The backend has been reaped (or abandoned past SIGKILL), so what it
+        # recorded about the command is complete; a setup failure raises
+        # here, after the teardown, with nothing returned as the command's.
+        facts = launch.outcome(
+            returncode=proc.returncode, ended_by_executor=timed_out or stopped, stderr=err.text
+        )
     return ExecutionResult(
         command=list(req.command),
         cwd=req.cwd,
@@ -1397,4 +1552,5 @@ def _execute(req: ExecutionRequest, contained: _Containment | None) -> Execution
         timeout_limit=timeout_limit,
         last_activity_at=limits.last_activity_at(),
         stopped=stopped,
+        sandbox=facts,
     )

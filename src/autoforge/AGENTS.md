@@ -30,10 +30,16 @@ loop_detect.py      provider-neutral loop detector: action fingerprints, line ke
                     cycle / novelty / repeated-line / retry signals, warnings,
                     verdict and calibration; pure, reads no clock (#194)
 executor.py         subprocess lifecycle, timeouts, a caller's stop, capture, optional
-                    stdin payload (no workflow semantics)
+                    stdin payload, optional outer sandbox (no workflow semantics)
 executor_duplex.py  duplex child handle for RPC transports: stdin records out, LF-framed
                     stdout records in, idle timeout and max runtime, ADR 0002 teardown;
                     bytes only (#130, #193)
+sandbox.py          outer sandbox: the backend-neutral launch description, the policy
+                    compiler (ADR 0005 D4.2, D4.3, D7.2) and the facts; executor layer,
+                    no workflow semantics (#167)
+sandbox_bwrap.py    the Linux backend: the only place that knows a `bwrap` flag; the
+                    launch's keyring and Landlock scope, setup-failure detection, the
+                    capability probe (#167)
 github.py           GitHubClient over `gh`, the only holder of a GitHub credential:
                     verification reads, the reads behind an agent's read context, typed
                     controller writes (never retried on an ambiguous outcome) +
@@ -76,7 +82,9 @@ prompts/            file-based templates ({{VAR}}): common.md (trust boundary), 
 - Keep the boundaries: no CLI flags outside `providers.py`, and no
   provider wire-protocol names outside the provider layer (`providers.py`
   plus the protocol modules it owns, `pi_rpc.py` and `claude_stream.py`);
-  no workflow semantics or JSON in `executor.py` or `executor_duplex.py`;
+  no workflow semantics or JSON in `executor.py` or `executor_duplex.py`,
+  and none in `sandbox.py` or `sandbox_bwrap.py` either; no `bwrap` flag
+  outside `sandbox_bwrap.py`;
   no raw `gh --json` dictionaries crossing out of `github.py`; no large
   prompt text in Python string literals.
 - The outcome of a GitHub write is read back from GitHub, never inferred
@@ -117,6 +125,10 @@ executor_duplex.py,
 prompts/__init__.py                               -> docs/agent-guides/architecture.md
                                                      (+ docs/adr/0003-pi-agent-provider.md and
                                                      docs/pi-policy.md for Pi)
+sandbox.py, sandbox_bwrap.py                      -> docs/agent-guides/architecture.md
+                                                     (Executor) + docs/adr/0005-outer-
+                                                     sandbox-and-host-resource-capability-
+                                                     model.md and ADR 0002 §4e
 result_parser.py, prompts/*.md                    -> docs/agent-guides/control-result-protocol.md
 redaction.py, runlog.py, doctor.py (env rows),
 error messages                                    -> docs/agent-guides/secrets-and-logging.md

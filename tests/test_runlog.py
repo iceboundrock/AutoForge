@@ -12,6 +12,7 @@ import pytest
 
 from autoforge.errors import StateError
 from autoforge.runlog import ExecutionRecord, RunLogger, validate_run_id
+from autoforge.sandbox import SandboxFacts
 
 
 def test_runlog_layout_and_redaction(tmp_path):
@@ -79,6 +80,39 @@ def test_an_agent_record_says_how_it_ended_and_what_the_loop_detector_did(tmp_pa
     other = log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="MERGE"))
     execution = json.loads((other / "execution.json").read_text(encoding="utf-8"))
     assert not {"ended_by", "loop_detection", "loop_warnings", "loop"} & execution.keys()
+
+
+def test_a_sandboxed_launch_records_its_sandbox_facts(tmp_path):
+    """#167: the outer sandbox's facts reach execution.json and the journal,
+    redacted; a launch without a sandbox writes no ``sandbox`` key."""
+    token = "ghp_" + "Q7" * 18
+    facts = SandboxFacts(
+        enforced=False,
+        backend="bubblewrap",
+        backend_version="0.12.0",
+        network="host",
+        tmpfs=(("/tmp", 1 << 20), ("/home/op", None)),
+        unset_env=("XDG_RUNTIME_DIR",),
+        setup_failure=f"bwrap: Can't find source path /x/{token}: No such file or directory",
+    )
+    log = RunLogger(tmp_path / "logs", "run-1")
+    step = log.log_execution(
+        ExecutionRecord(run_id="run-1", seq=0, phase="FIX", sandbox=facts.record())
+    )
+    execution = json.loads((step / "execution.json").read_text(encoding="utf-8"))
+    sandbox = execution["sandbox"]
+    assert sandbox["enforced"] is False and sandbox["backend"] == "bubblewrap"
+    assert sandbox["tmpfs"] == {"/tmp": 1 << 20, "/home/op": "kernel default"}
+    assert sandbox["unset_env"] == ["XDG_RUNTIME_DIR"]
+    assert "Can't find source path" in sandbox["setup_failure"]
+    events = (tmp_path / "logs" / "run-1" / "events.jsonl").read_text(encoding="utf-8")
+    assert json.loads(events.splitlines()[-1])["sandbox"]["backend_version"] == "0.12.0"
+    for path in (tmp_path / "logs").rglob("*"):
+        if path.is_file():
+            assert token not in path.read_text(encoding="utf-8"), path
+
+    other = log.log_execution(ExecutionRecord(run_id="run-1", seq=0, phase="MERGE"))
+    assert "sandbox" not in json.loads((other / "execution.json").read_text(encoding="utf-8"))
 
 
 def test_runlog_recovers_sequence_from_step_names_never_from_the_journal(tmp_path):
