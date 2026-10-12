@@ -603,7 +603,7 @@ def test_e2e_the_default_kills_a_looping_agent_and_leaves_the_phase_unchanged(
         "repeated 8 times over "
     )
     assert "with no new action" in message
-    assert message.endswith("then 'resume'.")
+    assert "\nState unchanged.\n" in message and "\n  resume:    autoforge resume\n" in message
     assert eng.state.phase == Phase.ANALYZE_EXECUTE
 
     shown = [line.split("] ", 1)[1] for line in lines]

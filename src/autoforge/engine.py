@@ -103,6 +103,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 from collections.abc import Callable, Hashable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -136,6 +137,7 @@ from .config import (
     AgentLimits,
     AutoForgeConfig,
     LoopDetectionConfig,
+    ProfileConfig,
     validate_required_profiles,
 )
 from .effect_ops import (
@@ -172,6 +174,7 @@ from .effects import (
     sha256_text,
 )
 from .errors import (
+    AutoForgeError,
     CheckoutDriftError,
     ClaimConflictError,
     ConfigurationError,
@@ -217,6 +220,7 @@ from .local_workspace import (
     LocalWorkspace,
     WorkspaceSnapshot,
     read_feature_spec,
+    uncommitted_paths,
     verify_feature_spec_unchanged,
 )
 from .locking import ControllerLock, repository_lock_path
@@ -503,6 +507,25 @@ def _limit_reached(limits: AgentLimits, result: AgentExecutionResult) -> str:
             return f"reached the {MAX_DEADLINE_SECONDS}s (one week) runtime backstop"
         return f"reached its {limits.max_runtime_seconds}s maximum runtime"
     return f"timed out ({limits.describe()})"
+
+
+def _limit_key(profile: ProfileConfig, limits: AgentLimits, result: AgentExecutionResult) -> str:
+    """The configuration key of the limit a timed-out agent reached (#189), or "".
+
+    The profile's own key when it sets that limit, otherwise the
+    ``execution`` default it inherited, so the operator knows which value to
+    change. "" when no key set it: the one-week backstop, a loop kill, or a
+    timeout the provider did not attribute to either limit.
+    """
+    if result.timeout_limit == LIMIT_IDLE and limits.idle_timeout_seconds is not None:
+        key = "idle_timeout_seconds"
+    elif result.timeout_limit == LIMIT_MAX_RUNTIME and limits.max_runtime_seconds is not None:
+        key = "max_runtime_seconds"
+    else:
+        return ""
+    if getattr(profile, key) is not None:
+        return f"profiles.{profile.name}.{key}"
+    return f"execution.default_{key}"
 
 
 def _loop_killed(result: AgentExecutionResult) -> str:
@@ -830,6 +853,17 @@ class ControllerEngine:
         # real run. ``None`` (a library caller, a test, a dry run) prints
         # nothing; the log is written either way.
         self.progress_output: Callable[[str], None] | None = None
+        # The CLI's global flags as this process was started with them
+        # (``--config``, ``--state-dir``), set by the CLI and repeated by
+        # :meth:`resume_command` (#189). Paths only, never a configuration
+        # value; empty for a library caller.
+        self.cli_global_flags: tuple[str, ...] = ()
+        # The working directory and the step log directory of the latest
+        # launch of the phase being invoked, recorded by :meth:`_invoke_phase`
+        # (#189): an agent failure that leaves the state unchanged names
+        # both, and a relaunch refused because a checkout moved names the log.
+        self._launch_cwd = ""
+        self._launch_log: Path | None = None
 
     # -- the state directory as a held capability --------------------------
     @property
@@ -1226,8 +1260,8 @@ class ControllerEngine:
                         phase,
                         drift,
                         f"Found before a relaunch: attempt {self._require_state().attempt} "
-                        "ended without a usable result (its run log says why), and the phase "
-                        "was neither reconciled nor launched again",
+                        f"ended without a usable result ({self._launch_log_says_why()}), and "
+                        "the phase was neither reconciled nor launched again",
                     )
                 )
             return reconcile()
@@ -2576,6 +2610,13 @@ class ControllerEngine:
             # The operator's checkout moved under the agent (the prompts
             # forbid it; this is the controller enforcing it, as LOCAL does).
             return self._block(previous, plan, str(exc))
+        except (ExecutionError, ControlResultValidationError) as exc:
+            # The agent failed, timed out, could not be run or returned no
+            # usable result, and the phase is as it was: the error says where
+            # to look and how to resume (#189). Added here, after the drift
+            # check, so a BLOCKED reason never quotes it.
+            exc.args = (self._state_unchanged_text(str(exc)),)
+            raise
         if isinstance(invoked, StepOutcome):
             # A relaunch (a correction, or the retry of a transient failure)
             # was pre-empted by the entry reconciliation: the GitHub work of
@@ -2782,7 +2823,8 @@ class ControllerEngine:
                 plan,
                 self._local_anchor_block_reason(
                     f"{drift}, found before a relaunch: attempt {state.attempt} ended without "
-                    "a usable result (its run log says why), and no agent was launched again"
+                    f"a usable result ({self._launch_log_says_why()}), and no agent was "
+                    "launched again"
                 ),
             )
 
@@ -2790,6 +2832,11 @@ class ControllerEngine:
         self._save()
         try:
             invoked = self._invoke_phase(previous, anchored_relaunch)
+        except (ExecutionError, ControlResultValidationError) as exc:
+            # As in REMOTE mode (#189): the checkpoint above is what 'resume'
+            # retries against, and the error says where to look first.
+            exc.args = (self._state_unchanged_text(str(exc)),)
+            raise
         finally:
             self._local_bound_snapshot = None
             self._local_resumed_invocation = False
@@ -7892,6 +7939,11 @@ class ControllerEngine:
         launch that may have left a process running
         (:attr:`AgentExecutionResult.may_have_survivor`): the relaunch would
         race it in the same working directory.
+
+        A launch that times out, fails or cannot be run, and a result that
+        is not corrected, raise with the phase unchanged; the step completes
+        their text (:meth:`_state_unchanged_text`) from the working directory
+        and the step log directory recorded here (#189).
         """
         state = self._require_state()
         profile = profile_for_phase(self.config, phase, state.review_round)
@@ -7902,7 +7954,9 @@ class ControllerEngine:
         # Read once per invocation, before the loop: the agent and the record
         # of it are launched from the same directory, and for a LOCAL run
         # that directory comes from the contract (see :meth:`_execution_cwd`).
+        self._launch_cwd, self._launch_log = "", None
         cwd = self._execution_cwd()
+        self._launch_cwd = cwd
         # Names only, never values: what the agent may inherit from the
         # controller's environment (the provider adds its own CLI's names).
         env_allowlist = self.config.execution.environment_names()
@@ -7989,6 +8043,7 @@ class ControllerEngine:
             # survive a kill. A refusal lands like a crash between the save
             # and the launch: nothing was launched.
             step_log = self._begin_step(logger, phase)
+            self._launch_log = step_log.path
             req = AgentRequest(
                 phase=phase.value,
                 prompt=prompt,
@@ -8069,9 +8124,13 @@ class ControllerEngine:
                 killed = f"was killed: {loop}" if loop else f"{reached} and was killed"
                 record.error = _with_leftovers(reached, result.leftovers)
                 self._record_invocation(logger, record, prompt, stdout, stderr, phase, step_log)
+                # Which value to change, when one set the limit (#189). What
+                # to inspect and how to resume are added where the step ends
+                # (:meth:`_state_unchanged_text`), as for every agent failure.
+                key = _limit_key(profile, limits, result)
                 raise ExecutionTimeoutError(
                     _with_leftovers(f"agent '{profile.name}' {killed}", result.leftovers)
-                    + ". State unchanged — inspect the real Git/GitHub state, then 'resume'."
+                    + (f". The limit is set by {key}" if key else "")
                 )
             if result.provider_failure or result.exit_code != 0:
                 # A run that failed inside the provider's protocol, whatever
@@ -8108,8 +8167,7 @@ class ControllerEngine:
                     ended += f" (transient: {result.transient_failure}; not relaunched: {held})"
                 raise ExecutionError(
                     _with_leftovers(f"agent '{profile.name}' {ended}", result.leftovers)
-                    + f". stderr tail: {stderr[-2000:]} "
-                    "State unchanged — inspect logs, then 'resume'."
+                    + f". stderr tail: {stderr[-2000:]}"
                 )
             try:
                 # Only the tail of a truncated stdout is searched: the block
@@ -8207,6 +8265,69 @@ class ControllerEngine:
             record.parsed_result = payload
             self._record_invocation(logger, record, prompt, stdout, stderr, phase, step_log)
             return payload
+
+    def resume_command(self) -> str:
+        """The ``resume`` command that continues this run, as the operator would type it.
+
+        The CLI has no configuration discovery, so a run started with
+        ``--config`` or ``--state-dir`` has to be resumed with them: without
+        the state directory ``resume`` finds no run, and without the
+        configuration it runs on the built-in defaults (another model, other
+        limits, another worktree). The flags are the ones this process was
+        started with (:attr:`cli_global_flags`), paths as given, quoted for a
+        POSIX shell (#189).
+        """
+        return shlex.join(["autoforge", *self.cli_global_flags, "resume"])
+
+    def _state_unchanged_text(self, failure: str) -> str:
+        """``failure``, then where to look and how to resume (#189). Redacted.
+
+        The one formatter for every agent failure that leaves the phase as
+        it was: a timeout or a loop kill, a failed exit or a provider
+        failure, an agent the executor could not run, a malformed result
+        that is not corrected. The step adds it where the failure leaves
+        :meth:`_invoke_phase`, so the paths cannot drift apart. It names the
+        latest launch's working directory, a REMOTE run's per-issue worktree,
+        with its uncommitted count when that read succeeds (a LOCAL agent
+        works in the operator's checkout, which gets no line), the step's
+        log directory, and :meth:`resume_command`. The paths and the flags
+        are the only values it adds; the text is redacted whole here, at
+        the sink, and again by the CLI where it prints it.
+        """
+        state = self._require_state()
+        remote = state.mode == WorkflowMode.REMOTE
+        lines = [failure.rstrip(), "State unchanged."]
+        if remote and self._launch_cwd:
+            lines.append(
+                f"  worktree:  {self._launch_cwd}{self._uncommitted_note(self._launch_cwd)}"
+            )
+        if self._launch_log is not None:
+            lines.append(f"  logs:      {self._launch_log}/")
+        lines.append(f"  resume:    {self.resume_command()}")
+        where, shown = (
+            ("the real Git/GitHub state", "the profile, limits and worktree")
+            if remote
+            else ("the working tree", "the profile and limits")
+        )
+        lines.append(
+            f"Inspect {where} first; 'resume --dry-run --max-steps 1' with the same flags "
+            f"shows {shown} it will use."
+        )
+        return redact("\n".join(lines))
+
+    def _uncommitted_note(self, worktree: str) -> str:
+        """``"   (N uncommitted paths)"`` for ``worktree``; "" when that read fails, not a guess."""
+        try:
+            count = len(uncommitted_paths(worktree, self._runner))
+        except (AutoForgeError, OSError):
+            return ""
+        return f"   ({count} uncommitted path{'' if count == 1 else 's'})"
+
+    def _launch_log_says_why(self) -> str:
+        """Where the latest launch's run log is, for a relaunch refused because a checkout moved."""
+        if self._launch_log is None:
+            return "its run log says why"
+        return f"its run log, {self._launch_log}/, says why"
 
     def _begin_step(self, logger: RunLogger, phase: Phase) -> StepLog:
         """Publish the launch's step directory and open its ``progress.log``, or refuse."""

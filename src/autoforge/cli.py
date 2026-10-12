@@ -248,10 +248,27 @@ def main(argv: list[str] | None = None) -> int:
 
 
 # -- commands ---------------------------------------------------------------
+def _global_flags(args) -> tuple[str, ...]:
+    """``--config`` and ``--state-dir`` as this process was given them, and nothing else.
+
+    An agent failure's ``resume`` line repeats them (#189): the CLI has no
+    configuration discovery, so a bare ``resume`` would find no run or run on
+    the built-in defaults. They are paths, as typed; no configuration value.
+    """
+    flags: list[str] = []
+    if args.config:
+        flags += ["--config", args.config]
+    if args.state_dir:
+        flags += ["--state-dir", args.state_dir]
+    return tuple(flags)
+
+
 def _engine_for(args, cfg: AutoForgeConfig | None = None) -> ControllerEngine:
     cfg = cfg or _load_cfg(args)
     state_dir = args.state_dir or cfg.state_dir
-    return ControllerEngine(config=cfg, state_dir=state_dir)
+    engine = ControllerEngine(config=cfg, state_dir=state_dir)
+    engine.cli_global_flags = _global_flags(args)
+    return engine
 
 
 def _local_engine_for(args, cfg: AutoForgeConfig | None = None) -> ControllerEngine:

@@ -8752,7 +8752,7 @@ def test_timeout_names_a_group_member_that_survived_the_kill(tmp_state_dir, fake
         eng.step()
     message = str(excinfo.value)
     assert "was killed (its process group still had a member after SIGKILL" in message
-    assert message.endswith("then 'resume'.")
+    assert "\nState unchanged.\n" in message and "\n  resume:    autoforge resume\n" in message
     assert eng.state.phase == Phase.ANALYZE_EXECUTE
     run_dir = eng.paths.logs_dir / eng.state.run_id
     step = next(p for p in run_dir.iterdir() if p.is_dir())
@@ -8777,14 +8777,21 @@ def test_an_idle_timeout_names_the_limit_and_the_last_activity(tmp_state_dir, fa
     eng.state.phase = Phase.ANALYZE_EXECUTE
     with pytest.raises(ExecutionTimeoutError) as excinfo:
         eng.step()
+    _, step = _step_dir(eng)
+    # The limit and the key that set it, then where to look and how to resume (#189).
     assert str(excinfo.value) == (
         "agent 'analyze_execute' made no progress for 900s (last activity 08:31:02 UTC) "
-        "and was killed. State unchanged — inspect the real Git/GitHub state, then 'resume'."
+        "and was killed. The limit is set by execution.default_idle_timeout_seconds\n"
+        "State unchanged.\n"
+        f"  worktree:  {eng.agent_worktree_path()}   (0 uncommitted paths)\n"
+        f"  logs:      {step}/\n"
+        "  resume:    autoforge resume\n"
+        "Inspect the real Git/GitHub state first; 'resume --dry-run --max-steps 1' with the "
+        "same flags shows the profile, limits and worktree it will use."
     )
     (req,) = provider.calls
     assert (req.idle_timeout_seconds, req.max_runtime_seconds) == (900, None)
     assert eng.state.phase == Phase.ANALYZE_EXECUTE
-    _, step = _step_dir(eng)
     execution = json.loads((step / "execution.json").read_text(encoding="utf-8"))
     assert execution["timed_out"] is True and execution["timeout_limit"] == "idle"
     assert execution["idle_timeout_seconds"] == 900 and execution["max_runtime_seconds"] is None
@@ -8809,13 +8816,20 @@ def test_an_idle_timeout_before_any_output_says_so(tmp_state_dir, fake_github):
 
 
 @pytest.mark.parametrize(
-    ("ceiling", "expected"),
+    ("ceiling", "expected", "key"),
     [
-        (3600, "reached its 3600s maximum runtime"),
-        (None, "reached the 604800s (one week) runtime backstop"),
+        (
+            3600,
+            "reached its 3600s maximum runtime",
+            ". The limit is set by execution.default_max_runtime_seconds",
+        ),
+        # No key set the one-week backstop, so none is named.
+        (None, "reached the 604800s (one week) runtime backstop", ""),
     ],
 )
-def test_a_maximum_runtime_timeout_names_the_ceiling(tmp_state_dir, fake_github, ceiling, expected):
+def test_a_maximum_runtime_timeout_names_the_ceiling(
+    tmp_state_dir, fake_github, ceiling, expected, key
+):
     eng = make_engine(tmp_state_dir, [], github=fake_github, origin=True)
     eng.config.execution.default_max_runtime_seconds = ceiling
     eng.config.profile("analyze_execute").idle_timeout_seconds = 120
@@ -8829,7 +8843,9 @@ def test_a_maximum_runtime_timeout_names_the_ceiling(tmp_state_dir, fake_github,
     eng.state.phase = Phase.ANALYZE_EXECUTE
     with pytest.raises(ExecutionTimeoutError) as excinfo:
         eng.step()
-    assert str(excinfo.value).startswith(f"agent 'analyze_execute' {expected} and was killed.")
+    assert str(excinfo.value).startswith(
+        f"agent 'analyze_execute' {expected} and was killed{key}\nState unchanged.\n"
+    )
     (req,) = provider.calls
     assert (req.idle_timeout_seconds, req.max_runtime_seconds) == (120, ceiling)
     _, step = _step_dir(eng)
@@ -8863,7 +8879,7 @@ def test_failed_exit_names_what_the_agent_left_behind(tmp_state_dir, fake_github
     assert message.startswith(
         "agent 'analyze_execute' exited 2 (its output pipes never reached EOF"
     )
-    assert "may still be running). stderr tail: boom State unchanged" in message
+    assert "may still be running). stderr tail: boom\nState unchanged.\n" in message
     assert eng.state.phase == Phase.ANALYZE_EXECUTE
     run_dir = eng.paths.logs_dir / eng.state.run_id
     step = next(p for p in run_dir.iterdir() if p.is_dir())
@@ -8896,8 +8912,10 @@ def test_a_provider_failure_raises_before_the_parser_and_is_journaled(tmp_state_
     with pytest.raises(ExecutionError) as excinfo:
         eng.step()
     message = str(excinfo.value)
-    assert message.startswith(f"agent 'analyze_execute' failed: {reason}. stderr tail: boom")
-    assert message.endswith("then 'resume'.")
+    assert message.startswith(
+        f"agent 'analyze_execute' failed: {reason}. stderr tail: boom\nState unchanged.\n"
+    )
+    assert "\n  resume:    autoforge resume\n" in message
     assert eng.state.phase == Phase.ANALYZE_EXECUTE and len(provider.calls) == 1
     assert load_state(eng.paths.state_file).phase == Phase.ANALYZE_EXECUTE
     run_dir, step = _step_dir(eng)
@@ -8909,6 +8927,159 @@ def test_a_provider_failure_raises_before_the_parser_and_is_journaled(tmp_state_
     assert not (step / "control-result.json").exists()
     event = json.loads((run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()[-1])
     assert event["provider_summary"] == summary
+
+
+# -- what an agent failure that leaves the state unchanged says (#189) -------------
+FLAGS = ("--config", "autoforge.yaml", "--state-dir", ".autoforge/AutoForge-issue-2")
+RESUME = "autoforge --config autoforge.yaml --state-dir .autoforge/AutoForge-issue-2 resume"
+REJECTED = "pi: prompt rejected before acceptance: No API key found for openai."
+LAUNCH_FAILED = "cannot start 'claude': [Errno 2] No such file or directory: 'claude'"
+
+
+class _FailsInItsWorktree(ScriptedProvider):
+    """Leaves three untracked files in its worktree, then fails as ``outcome`` says:
+    a timeout, a failed exit, a provider failure, a launch the executor
+    refused, or a malformed result with or without a process left running."""
+
+    def __init__(self, outcome: str) -> None:
+        super().__init__()
+        self.outcome = outcome
+
+    def execute(self, req):
+        self.calls.append(req)
+        cwd = Path(req.cwd)
+        (cwd / "notes").mkdir()
+        for name in ("draft.py", "notes/plan.md", "notes/todo.md"):
+            (cwd / name).write_text("work in progress\n", encoding="utf-8")
+        if self.outcome == "launch":
+            raise ExecutionError(LAUNCH_FAILED)
+        facts = {
+            "timeout": {"exit_code": -1, "timed_out": True, "timeout_limit": "idle"},
+            "exit": {"exit_code": 3},
+            "provider_failure": {"provider_failure": REJECTED},
+            "survivor": {"stdout": "no block", "group_survived_kill": True},
+            "malformed": {"stdout": "no block"},
+        }[self.outcome]
+        base = {"command": ["x"], "exit_code": 0, "stdout": "", "stderr": "boom"}
+        return AgentExecutionResult(**{**base, **facts}, started_at="t", finished_at="t")
+
+
+@pytest.mark.parametrize(
+    ("outcome", "error", "first"),
+    [
+        (
+            "timeout",
+            ExecutionTimeoutError,
+            "agent 'analyze_execute' made no progress for 900s (no output since launch) and "
+            "was killed. The limit is set by execution.default_idle_timeout_seconds",
+        ),
+        ("exit", ExecutionError, "agent 'analyze_execute' exited 3. stderr tail: boom"),
+        (
+            "provider_failure",
+            ExecutionError,
+            f"agent 'analyze_execute' failed: {REJECTED}. stderr tail: boom",
+        ),
+        ("launch", ExecutionError, LAUNCH_FAILED),
+        (
+            "survivor",
+            ControlResultValidationError,
+            "agent 'analyze_execute' did not return a valid CONTROL_RESULT after 1 attempt(s): ",
+        ),
+        (
+            "malformed",
+            ControlResultValidationError,
+            "agent 'analyze_execute' did not return a valid CONTROL_RESULT after 1 attempt(s): ",
+        ),
+    ],
+)
+def test_an_agent_failure_names_its_worktree_its_log_and_the_resume_command(
+    tmp_state_dir, fake_github, outcome, error, first
+):
+    """#189: every agent failure that leaves the state unchanged says so and
+    names the worktree with what it holds, the step's log directory and the
+    `resume` command with the flags this process was started with, in one
+    shape whichever way the agent failed."""
+    eng = make_engine(tmp_state_dir, [], github=fake_github, origin=True)
+    eng.config.execution.max_correction_attempts = 0
+    eng.cli_global_flags = FLAGS
+    provider = _FailsInItsWorktree(outcome)
+    _install(eng, provider)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    with pytest.raises(error) as excinfo:
+        eng.step()
+    failure, recovery = str(excinfo.value).split("\nState unchanged.\n")
+    assert failure.startswith(first)
+    _, step = _step_dir(eng)
+    assert recovery == (
+        f"  worktree:  {eng.agent_worktree_path()}   (3 uncommitted paths)\n"
+        f"  logs:      {step}/\n"
+        f"  resume:    {RESUME}\n"
+        "Inspect the real Git/GitHub state first; 'resume --dry-run --max-steps 1' with the "
+        "same flags shows the profile, limits and worktree it will use."
+    )
+    assert len(provider.calls) == 1
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.ANALYZE_EXECUTE and s.attempt == 1 and s.current_pr_url == ""
+    assert fake_github.effect_writes == []
+
+
+def test_a_limit_the_profile_sets_is_named_by_the_profile_key(tmp_state_dir, fake_github):
+    eng = make_engine(tmp_state_dir, [], github=fake_github, origin=True)
+    eng.config.profile("analyze_execute").max_runtime_seconds = 1200
+    provider = _LeftoverProvider("", timed_out=True, timeout_limit="max_runtime")
+    _install(eng, provider)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    with pytest.raises(ExecutionTimeoutError) as excinfo:
+        eng.step()
+    assert str(excinfo.value).startswith(
+        "agent 'analyze_execute' reached its 1200s maximum runtime and was killed. "
+        "The limit is set by profiles.analyze_execute.max_runtime_seconds\nState unchanged.\n"
+    )
+
+
+def test_an_unreadable_worktree_status_omits_the_count_rather_than_guessing(
+    tmp_state_dir, fake_github, monkeypatch
+):
+    """#189: the count comes from a read-only `git status`; when that read
+    fails the worktree is still named, and no count is made up."""
+    import autoforge.engine as engine_module
+
+    def unreadable(workdir, runner=None, **kwargs):
+        raise VerificationError(f"`git status` timed out in {workdir}")
+
+    monkeypatch.setattr(engine_module, "uncommitted_paths", unreadable)
+    eng = make_engine(tmp_state_dir, [], github=fake_github, origin=True)
+    _install(eng, _FailsInItsWorktree("exit"))
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    with pytest.raises(ExecutionError) as excinfo:
+        eng.step()
+    message = str(excinfo.value)
+    assert f"\n  worktree:  {eng.agent_worktree_path()}\n  logs:      " in message
+    assert "uncommitted" not in message and "timed out" not in message
+
+
+def test_the_failure_text_never_carries_a_secret_planted_in_the_config(
+    tmp_state_dir, fake_github, tmp_path_factory
+):
+    """#189: the lines the failure text adds hold paths and flags only, and
+    are redacted where they are composed: a token-shaped worktree directory
+    and flag value are redacted, and a secret in a configuration value that
+    is no path never appears at all."""
+    token = "ghp_" + "S" * 36
+    key = "sk-ant-" + "K" * 40
+    cfg = default_config()
+    cfg.execution.worktree_dir = str(tmp_path_factory.mktemp("outside") / f"wt-{token}")
+    cfg.profile("analyze_execute").model = key
+    eng = make_engine(tmp_state_dir, [], github=fake_github, cfg=cfg, origin=True)
+    eng.cli_global_flags = ("--config", f"cfg-{token}.yaml", "--state-dir", ".autoforge")
+    _install(eng, _FailsInItsWorktree("exit"))
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    with pytest.raises(ExecutionError) as excinfo:
+        eng.step()
+    message = str(excinfo.value)
+    assert token not in message and "S" * 36 not in message and "K" * 40 not in message
+    assert "/wt-***REDACTED***/2   (3 uncommitted paths)\n" in message
+    assert "\n  resume:    autoforge --config cfg-***REDACTED***.yaml --state-dir " in message
 
 
 # -- transient provider failures (#164) -----------------------------------------
@@ -9127,9 +9298,18 @@ def test_a_malformed_result_is_not_corrected_while_a_process_its_launch_started_
         finished_at="t",
         **{survivor: True},
     ).leftovers
-    assert leftovers and message.endswith(
-        f". Not re-invoked: a process the launch started may still be running ({leftovers})"
+    assert (
+        leftovers
+        and (
+            f". Not re-invoked: a process the launch started may still be running ({leftovers})"
+            "\nState unchanged.\n"
+        )
+        in message
     )
+    _, step = _step_dir(eng)
+    # Where that process may still be writing, and what to run once it is stopped (#189).
+    assert f"\n  worktree:  {eng.agent_worktree_path()}   (0 uncommitted paths)\n" in message
+    assert f"\n  logs:      {step}/\n  resume:    autoforge resume\n" in message
     state = load_state(eng.paths.state_file)
     assert state.phase == Phase.REVIEW and state.attempt == 1 and state.review_round == 0
     _, step = _step_dir(eng)
@@ -10816,6 +10996,9 @@ def test_drift_left_by_a_launch_blocks_before_any_relaunch(tmp_state_dir, fake_g
     reason = eng.state.block_reason
     assert "moved while ANALYZE_EXECUTE ran" in reason and "HEAD moved from" in reason
     assert "Found before a relaunch: attempt 1 ended without a usable result" in reason
+    # Which run log says why (#189).
+    _, step = _step_dir(eng)
+    assert f"(its run log, {step}/, says why)" in reason
     assert "neither reconciled nor launched again" in reason
     assert reason.count("moved while") == 1  # reported once, not wrapped again
     s = load_state(eng.paths.state_file)
@@ -10874,6 +11057,16 @@ def _to_pi(eng, tmp_path_factory, script):
     return fake
 
 
+def _across_runs(message: str, eng) -> str:
+    """``message`` with the directories of ``eng``'s own run replaced.
+
+    An agent failure names its worktree and its step's log directory (#189),
+    which differ between two runs; the error is otherwise the same.
+    """
+    run_log = str(eng.paths.logs_dir / eng.state.run_id)
+    return message.replace(run_log, "<run log>").replace(os.path.realpath(eng.workdir), "<repo>")
+
+
 @pytest.mark.parametrize("claim", ["pull-request", "reviewed-head"])
 def test_a_pi_claim_github_does_not_back_fails_as_a_scripted_one_does(tmp_path_factory, claim):
     """A Pi CONTROL_RESULT the controller cannot back is refused by the same
@@ -10902,7 +11095,9 @@ def test_a_pi_claim_github_does_not_back_fails_as_a_scripted_one_does(tmp_path_f
         with pytest.raises(error) as excinfo:
             eng.step()
         # Each run's worktree HEAD is its own repository's commit.
-        message = re.sub(r"\b(?!a{40})[0-9a-f]{40}\b", "<HEAD>", str(excinfo.value))
+        message = re.sub(
+            r"\b(?!a{40})[0-9a-f]{40}\b", "<HEAD>", _across_runs(str(excinfo.value), eng)
+        )
         s = load_state(eng.paths.state_file)
         seen.append((message, s.phase, s.current_pr_url, s.review_round, gh.effect_writes))
     assert seen[0] == seen[1]
@@ -10979,7 +11174,7 @@ def test_pi_corrections_are_bounded_as_scripted_ones_are(
         with pytest.raises((ControlResultValidationError,)) as excinfo:
             eng.step()
         launched = len(fake.launches()) if on_pi else len(eng.provider.calls)
-        seen.append((type(excinfo.value), str(excinfo.value), launched))
+        seen.append((type(excinfo.value), _across_runs(str(excinfo.value), eng), launched))
         assert load_state(eng.paths.state_file).phase == Phase.ANALYZE_EXECUTE
     assert seen[0] == seen[1] and seen[1][2] == corrections + 1
 
@@ -11038,7 +11233,7 @@ def test_a_pi_failure_leaves_state_unchanged_and_resume_relaunches(
         eng.step()
     message = str(excinfo.value)
     assert message.startswith(f"agent 'analyze_execute' failed: {reason}")
-    assert "State unchanged" in message and message.endswith("then 'resume'.")
+    assert "\nState unchanged.\n" in message and "\n  resume:    autoforge resume\n" in message
     s = load_state(eng.paths.state_file)
     assert s.phase == Phase.ANALYZE_EXECUTE and s.current_pr_url == "" and s.current_head_sha == ""
     _, step = _step_dir(eng)
@@ -11086,7 +11281,8 @@ def test_a_pi_deadline_is_a_timeout_naming_what_it_left_behind(
         message,
     ), message
     assert "outside its process group" in message
-    assert message.endswith("then 'resume'.")
+    assert ". The limit is set by profiles.analyze_execute.idle_timeout_seconds\n" in message
+    assert "\nState unchanged.\n" in message and "\n  resume:    autoforge resume\n" in message
     assert load_state(eng.paths.state_file).phase == Phase.ANALYZE_EXECUTE
     _, step = _step_dir(eng)
     execution = json.loads((step / "execution.json").read_text(encoding="utf-8"))

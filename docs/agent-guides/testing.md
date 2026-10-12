@@ -72,10 +72,20 @@ High-priority coverage includes:
   `orphan_survived_kill`) is not corrected, in REMOTE and LOCAL mode, and
   the error names the leftover; `orphans_unchecked` alone is still corrected
   (#209)
+- an agent failure that leaves the state unchanged (a timeout, a failed
+  exit, a provider failure, a launch the executor refused, a malformed
+  result not corrected, with or without a survivor) says `State unchanged`
+  and names the worktree with its uncommitted count, the step's log
+  directory and a `resume` command with the `--config` / `--state-dir`
+  given, in REMOTE and LOCAL mode (no worktree line there); the count is
+  left out when the status read fails, a token-shaped value in the
+  configuration never reaches the text, and the CLI prints the command,
+  which then resumes the run (#189)
 - a LOCAL launch that moved the git anchor (a commit in a write phase, a
   branch switch in `REVIEW`) and returned a malformed result is not
-  corrected: the step blocks with the anchor reason, and the refused
-  correction is not charged to `local_pending_attempts` (#209)
+  corrected: the step blocks with the anchor reason, which names the run
+  log of the attempt that ended (#189), and the refused correction is not
+  charged to `local_pending_attempts` (#209)
 - timeout, including a same-group descendant that closed its stdio and
   ignores SIGTERM (escalated to SIGKILL, gone before `execute()` returns),
   a writer outside the group via `setsid` (the capture abandoned after the

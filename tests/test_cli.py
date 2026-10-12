@@ -2,6 +2,7 @@
 
 import json
 import os
+import shlex
 
 import pytest
 
@@ -151,6 +152,38 @@ def test_a_step_shows_progress_and_a_dry_run_shows_none(tmp_path, capsys, monkey
     real = capsys.readouterr()
     assert "ANALYZE_EXECUTE #2] launching analyze_execute" in real.err
     assert "ANALYZE_EXECUTE -> REVIEW" in real.out and "launching" not in real.out
+
+
+@pytest.mark.parametrize(
+    ("flags", "resume"),
+    [
+        ([], "autoforge resume"),
+        (
+            ["--config", "autoforge.json", "--state-dir", "issue state"],
+            "autoforge --config autoforge.json --state-dir 'issue state' resume",
+        ),
+    ],
+)
+def test_an_agent_failure_prints_a_resume_command_with_the_flags_given(
+    tmp_path, capsys, monkeypatch, fakes, flags, resume
+):
+    """#189: the CLI has no configuration discovery, so the `resume` an agent
+    failure suggests repeats the `--config` / `--state-dir` this process was
+    started with, as given and quoted, and nothing else; run as printed, it
+    continues the same run."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "autoforge.json").write_text('{"version": 1}', encoding="utf-8")
+    fakes["provider"].exit_code = 3
+    assert cli.main([*flags, "run", "--epic", EPIC, "--issue", ISSUE]) == 1
+    err = capsys.readouterr().err
+    failed = "autoforge: error: agent 'analyze_execute' exited 3. stderr tail:\nState unchanged.\n"
+    assert failed in err
+    assert "\n  worktree:  " in err and "(0 uncommitted paths)\n  logs:      " in err
+    assert f"\n  resume:    {resume}\n" in err
+    fakes["provider"].exit_code = 0
+    fakes["handler"] = implement
+    assert cli.main([*shlex.split(resume)[1:], "--max-steps", "1"]) == 0
+    assert "ANALYZE_EXECUTE -> REVIEW" in capsys.readouterr().out
 
 
 def test_run_bad_url_rejected(tmp_path, capsys, monkeypatch):

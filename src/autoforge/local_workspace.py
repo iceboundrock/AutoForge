@@ -968,6 +968,28 @@ def _is_within(path: Path, base: Path) -> bool:
     return True
 
 
+def uncommitted_paths(
+    workdir: str | Path,
+    runner: Runner | None = None,
+    *,
+    timeout_seconds: int = GIT_TIMEOUT_SECONDS,
+) -> list[str]:
+    """What ``git status`` reports as changed or untracked in ``workdir``, sorted.
+
+    The one read of "what uncommitted work is here" outside the LOCAL
+    dirty-tree policy (:meth:`LocalWorkspace.dirty_paths`, which it is):
+    a single ``git status --porcelain=v1 -z --untracked-files=all``, with no
+    optional locks, so the index is not refreshed, and with hooks and the
+    file-system monitor off. An agent failure that leaves the state
+    unchanged reports its count for the REMOTE agent worktree (#189). Like
+    the policy, it is the operator's notion of uncommitted work, never an
+    identity. A read that fails, times out or is truncated raises
+    VerificationError; a caller that cannot use the answer omits it rather
+    than guessing.
+    """
+    return LocalWorkspace(workdir, runner=runner, timeout_seconds=timeout_seconds).dirty_paths()
+
+
 # -- feature specifications ---------------------------------------------------
 @dataclass(frozen=True)
 class FeatureSpec:

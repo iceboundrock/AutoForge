@@ -34,6 +34,7 @@ from autoforge.local_workspace import (
     init_feature_file,
     read_feature_spec,
     resolve_feature_spec,
+    uncommitted_paths,
 )
 from autoforge.providers import AgentExecutionResult
 from autoforge.safefs import UnsafePathError
@@ -2267,6 +2268,31 @@ def test_a_review_that_fails_verification_leaves_no_pending_checkpoint(tmp_path)
     assert eng.state.local_pending_phase == ""
 
 
+def test_a_local_agent_failure_names_its_log_and_resume_command_but_no_worktree(tmp_path):
+    """#189: a LOCAL agent works in the operator's checkout, not a per-issue
+    worktree, so its failure names the step's log directory and the `resume`
+    command with the flags given, and prints no worktree line."""
+    root = local_repo(tmp_path)
+    eng = make_local_engine(root, "features/add-filter.md")
+    eng.cli_global_flags = ("--state-dir", "state dir")
+    eng.step()  # INITIALIZING -> ANALYZE_EXECUTE
+    eng.provider.exit_code = 2
+    with pytest.raises(ExecutionError) as excinfo:
+        eng.step()
+    failure, recovery = str(excinfo.value).split("\nState unchanged.\n")
+    assert failure.startswith("agent 'analyze_execute' exited 2. stderr tail:")
+    run_dir = eng.paths.logs_dir / eng.state.run_id
+    (step,) = [p for p in run_dir.iterdir() if p.is_dir()]
+    assert recovery == (
+        f"  logs:      {step}/\n"
+        "  resume:    autoforge --state-dir 'state dir' resume\n"
+        "Inspect the working tree first; 'resume --dry-run --max-steps 1' with the same "
+        "flags shows the profile and limits it will use."
+    )
+    persisted = load_state(eng.paths.state_file)
+    assert persisted.phase is Phase.ANALYZE_EXECUTE and persisted.local_pending_attempts == 1
+
+
 def _leaving(provider, **facts) -> None:
     """Every launch of ``provider`` reports ``facts`` about what it left behind."""
     execute = provider.execute
@@ -2303,8 +2329,13 @@ def test_a_malformed_result_is_not_corrected_while_a_process_its_launch_started_
         finished_at="t",
         **{survivor: True},
     ).leftovers
-    assert leftovers and message.endswith(
-        f". Not re-invoked: a process the launch started may still be running ({leftovers})"
+    assert (
+        leftovers
+        and (
+            f". Not re-invoked: a process the launch started may still be running ({leftovers})"
+            "\nState unchanged.\n"
+        )
+        in message
     )
     persisted = load_state(eng.paths.state_file)
     assert persisted.phase is Phase.ANALYZE_EXECUTE
@@ -2424,6 +2455,10 @@ def test_an_anchor_a_launch_moved_blocks_before_its_correction(tmp_path, phase):
     reason = eng.state.block_reason
     assert "git anchor moved during the run: HEAD moved from" in reason
     assert "found before a relaunch: attempt 1 ended without a usable result" in reason
+    # The run log that says why is named, not only mentioned (#189).
+    run_dir = eng.paths.logs_dir / eng.state.run_id
+    latest = sorted(p for p in run_dir.iterdir() if p.is_dir())[-1]
+    assert f"(its run log, {latest}/, says why)" in reason
     assert "no agent was launched again" in reason and "Nothing was rolled back" in reason
     persisted = load_state(eng.paths.state_file)
     assert persisted.phase is Phase.BLOCKED and persisted.attempt == 1
@@ -2593,6 +2628,37 @@ def test_workspace_git_reads_run_no_fsmonitor_and_hold_no_credential(
         assert req.command[: len(_GIT_READ)] == _GIT_READ
         assert req.env_allowlist == LOCAL_GIT_ENV_ALLOWLIST
         assert (req.env or {})["GIT_NO_REPLACE_OBJECTS"] == "1"
+
+
+def test_uncommitted_paths_is_one_hardened_status_read_and_never_guesses(tmp_path):
+    """#189: the status read shared by the LOCAL dirty-tree policy and an
+    agent failure's worktree line. It reads any working tree (a REMOTE agent
+    worktree is not the controller's checkout), lists untracked files one by
+    one, takes no optional lock, and refuses rather than answers when git
+    cannot read a working tree there."""
+    repo = git_repo(tmp_path / "repo")
+    (repo / "notes").mkdir()
+    for name in ("draft.py", "notes/plan.md", "notes/todo.md"):
+        (repo / name).write_text("work in progress\n", encoding="utf-8")
+    requests = []
+
+    def runner(req):
+        requests.append(req)
+        return execute(req)
+
+    assert uncommitted_paths(repo, runner) == ["draft.py", "notes/plan.md", "notes/todo.md"]
+    (req,) = requests
+    assert req.command == [
+        *_GIT_READ,
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+    ]
+    assert req.cwd == str(repo) and req.env_allowlist == LOCAL_GIT_ENV_ALLOWLIST
+    # Inside a git directory there is no working tree to read.
+    with pytest.raises(VerificationError, match="failed in"):
+        uncommitted_paths(repo / ".git")
 
 
 # -- redaction at the persistence boundary --------------------------------------------

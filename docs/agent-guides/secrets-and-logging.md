@@ -116,6 +116,15 @@ safe path component, not that it is free of secret shapes, so a line that
 names the run is redacted assembled, never with the id interpolated outside
 the pass. The file on disk is never rewritten by that pass.
 
+An agent failure that leaves the state unchanged (#189,
+`ControllerEngine._state_unchanged_text`) adds the agent worktree with its
+uncommitted count, the step's log directory and a `resume` command that
+repeats the `--config` / `--state-dir` the process was started with: paths,
+a count and those flags, never a configuration value. The engine redacts
+the assembled text where it composes it, and the CLI again where it prints
+it. `tests/test_engine.py` puts token-shaped values in the worktree path,
+a flag and a profile's model and checks that none reaches the text.
+
 `redact_obj` / `redact_dict` redact mapping keys as well as values, and a
 mapping never loses an entry to that: two distinct keys that redact to the
 same text (`GITHUB_TOKEN=a`, `GITHUB_TOKEN=b`) are kept apart with a `#2`,
