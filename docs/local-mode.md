@@ -75,7 +75,8 @@ uv run autoforge resume                  # they read the mode from persisted sta
 `autoforge local doctor` runs the local subset of `autoforge doctor` and
 omits the `gh`, `gh auth status`, `origin` and branch-rule checks entirely.
 It keeps the two launch-environment rows, which read only the local git
-configuration and `~/.netrc` (no GitHub call): what an agent's environment
+configuration and `~/.netrc` and run each launch shell once as a login
+shell (no GitHub call): what an agent's environment
 is made of, by name, and whether a setting would still hand it a GitHub or
 git credential. A LOCAL agent and a validation command get the same
 credential-free environment as a REMOTE one

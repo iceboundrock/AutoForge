@@ -66,9 +66,10 @@ runtime state belonging to one operator.
   whole shell, that carries no GitHub or git credential (no credential
   variable can be listed; the controller sets an empty `gh` configuration,
   disables git credential helpers, askpass and the SSH agent, gives curl and
-  wget an empty configuration, keeps the agent CLI's MCP servers, plugins
-  and hooks off, and refuses a launch a repository setting or an OpenCode
-  organization integration would still hand one;
+  wget an empty configuration and its shells none of the operator's zsh
+  startup files, keeps the agent CLI's MCP servers, plugins and hooks off,
+  and refuses a launch a repository setting, a login shell's startup file
+  or an OpenCode organization integration would still hand one;
   `src/autoforge/child_env.py`, `src/autoforge/providers.py`); and the
   controller reads HEAD and branch of its own checkout before and after each
   invocation and enters `BLOCKED` if they moved. A dry run creates no

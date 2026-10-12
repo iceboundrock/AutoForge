@@ -30,26 +30,33 @@ from autoforge.child_env import (
     FORBIDDEN_ENV_NAMES,
     GH_PLACEHOLDER_TOKEN,
     HTTP_CLIENT_CONFIG,
+    POSIX_SHELLS,
+    SHELL_PROBE_MARKER,
     SSH_COMMAND,
     GitConfigEntry,
     LaunchIdentity,
     child_overrides,
+    child_shell,
     forbidden_env_entry,
     git_config_problems,
     isolated_overrides,
+    launch_shells,
     netrc_problems,
     override_names,
     parse_git_config_listing,
     preflight,
+    probe_findings,
     read_git_config,
     render_git_config,
+    shell_probe_script,
+    shell_startup_problems,
     url_has_credential,
 )
-from autoforge.config import DEFAULT_ENV_ALLOWLIST
+from autoforge.config import DEFAULT_ENV_ALLOWLIST, ProfileConfig
 from autoforge.errors import ConfigurationError, ExecutionError
 from autoforge.executor import ExecutionRequest, ExecutionResult, execute, select_environment
 from autoforge.github import GitHubClient
-from autoforge.providers import ClaudeCodeProvider, OpenCodeProvider, PiProvider
+from autoforge.providers import AgentRequest, ClaudeCodeProvider, OpenCodeProvider, PiProvider
 from tests.conftest import git_repo
 
 # Shaped like a classic personal access token, so the redactor would catch
@@ -154,6 +161,16 @@ def polluted_operator(tmp_path, monkeypatch):
         f"machine github.com login x password {FAKE_PASSWORD}\n"
     )
     monkeypatch.setenv("NETRC", str(tmp_path / "operator-netrc"))
+    # Startup files a shell would run before every command, each restoring
+    # the token, and a shell that reads its configuration on every start.
+    startup = tmp_path / "operator-startup"
+    startup.mkdir()
+    for name in ("bash-env", "env", ".zshenv"):
+        (startup / name).write_text(f"export GH_TOKEN={FAKE_TOKEN}\n")
+    monkeypatch.setenv("BASH_ENV", str(startup / "bash-env"))
+    monkeypatch.setenv("ENV", str(startup / "env"))
+    monkeypatch.setenv("ZDOTDIR", str(startup))
+    monkeypatch.setenv("SHELL", "/usr/bin/fish")
     return global_config
 
 
@@ -185,6 +202,12 @@ def test_the_child_environment_carries_no_operator_credential_route(polluted_ope
         assert (Path(env["CURL_HOME"]) / ".curlrc").read_text() == HTTP_CLIENT_CONFIG
         assert env["WGETRC"] == env["WGET2RC"]
         assert Path(env["WGETRC"]).read_text() == HTTP_CLIENT_CONFIG
+        # No shell startup file of the operator's: zsh looks in an empty
+        # directory, BASH_ENV and ENV are gone, and fish is not the shell.
+        zdotdir = Path(env["ZDOTDIR"])
+        assert zdotdir.is_dir() and list(zdotdir.iterdir()) == []
+        assert "BASH_ENV" not in env and "ENV" not in env
+        assert env["SHELL"] == child_shell() and Path(env["SHELL"]).name in POSIX_SHELLS
         root = gh_dir.parent
     # The launch's directory does not outlive it.
     assert not root.exists()
@@ -234,9 +257,10 @@ def test_without_an_operator_identity_none_is_supplied(tmp_path, monkeypatch):
 
 
 def test_the_overrides_are_names_known_in_advance():
-    env = child_overrides("/gh", "/gitconfig", "/curl", "/wgetrc")
+    env = child_overrides("/gh", "/gitconfig", "/curl", "/wgetrc", "/zsh", "/bin/sh")
     assert tuple(sorted(env)) == override_names()
     assert env["CURL_HOME"] == "/curl" and env["WGETRC"] == env["WGET2RC"] == "/wgetrc"
+    assert env["ZDOTDIR"] == "/zsh" and env["SHELL"] == "/bin/sh"
     assert env["GIT_CONFIG_COUNT"] == "4"
     pairs = {env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"] for i in range(4)}
     assert pairs == {
@@ -959,3 +983,317 @@ def test_the_windows_name_is_checked_too(tmp_path):
     (tmp_path / "_netrc").write_text("machine github.com password y\n")
     assert netrc_problems(str(tmp_path)) == ["an entry for GitHub (or a default entry) in ~/_netrc"]
     assert netrc_problems(None) == []
+
+
+# -- shell startup files --------------------------------------------------------
+
+_ZSH = shutil.which("zsh")
+_BASH = shutil.which("bash")
+needs_zsh = pytest.mark.skipif(_ZSH is None, reason="zsh is not installed")
+needs_bash = pytest.mark.skipif(_BASH is None, reason="bash is not installed")
+
+
+def _merges(probes: Probes) -> list[bool]:
+    """Whether each ``gh`` the fakes saw found a token (a merge would land)."""
+    return [e["ok"] for e in probes.entries() if e["tool"] == "gh"]
+
+
+def _startup_home(tmp_path: Path, files: dict[str, str]) -> Path:
+    home = tmp_path / "startup-home"
+    home.mkdir()
+    for name, text in files.items():
+        (home / name).write_text(text)
+    return home
+
+
+@needs_zsh
+def test_a_launchs_zsh_reads_no_startup_file_of_the_operators(probes, tmp_path):
+    """zsh reads ``.zshenv`` on every start, ``zsh -c`` and a script with a
+    zsh shebang included, from ``ZDOTDIR`` or else ``HOME``; an ``export
+    GH_TOKEN`` there replaces the placeholder for everything the shell runs.
+    A launch's zsh finds none of the operator's files in any mode; the same
+    launch environment without the controller's ``ZDOTDIR`` hands ``gh`` the
+    token, which is the route."""
+    home = Path(os.environ["HOME"])
+    assert home.is_relative_to(tmp_path)  # the fixture's, never the developer's
+    for name in (".zshenv", ".zprofile", ".zshrc", ".zlogin"):
+        (home / name).write_text(f"export GH_TOKEN={FAKE_TOKEN}\n")
+    script = tmp_path / "check"
+    script.write_text(f"#!{_ZSH}\ngh pr merge 1 --squash\n")
+    script.chmod(0o755)
+    with isolated_overrides(LaunchIdentity()) as overrides:
+        for mode in (["-c"], ["-l", "-c"], ["-i", "-c"]):
+            command = [_ZSH, *mode, "gh pr merge 1 --squash"]
+            assert _run(command, tmp_path, DEFAULT_ENV_ALLOWLIST, overrides).exit_code != 0, mode
+        assert _run([str(script)], tmp_path, DEFAULT_ENV_ALLOWLIST, overrides).exit_code != 0
+        assert _merges(probes) == [False] * 4
+        without = {k: v for k, v in overrides.items() if k != "ZDOTDIR"}
+        command = [_ZSH, "-c", "gh pr merge 1 --squash"]
+        assert _run(command, tmp_path, DEFAULT_ENV_ALLOWLIST, without).exit_code == 0
+    assert _merges(probes)[-1] is True
+
+
+@needs_bash
+def test_a_launchs_bash_and_sh_run_no_startup_file_of_the_operators_for_a_command(probes, tmp_path):
+    """Run for a command, bash reads only the file ``BASH_ENV`` names and sh
+    none (``ENV`` is an interactive shell's): a launch inherits neither, and
+    no allow-list may name one, so the operator's ``BASH_ENV``, which
+    exports the token, is never run; with it, ``bash -c`` would merge."""
+    shells = [_BASH, shutil.which("sh") or "/bin/sh", child_shell()]
+    with isolated_overrides(LaunchIdentity()) as overrides:
+        for shell in shells:
+            command = [shell, "-c", "gh pr merge 1 --squash"]
+            assert _run(command, tmp_path, DEFAULT_ENV_ALLOWLIST, overrides).exit_code != 0
+        assert _merges(probes) == [False] * len(shells)
+        leaky = {**overrides, "BASH_ENV": os.environ["BASH_ENV"]}
+        command = [_BASH, "-c", "gh pr merge 1 --squash"]
+        assert _run(command, tmp_path, DEFAULT_ENV_ALLOWLIST, leaky).exit_code == 0
+    assert _merges(probes)[-1] is True
+    for name in ("BASH_ENV", "ENV", "ZDOTDIR"):
+        with pytest.raises(ConfigurationError, match=f"'{name}'"):
+            child_env.refuse_forbidden_env([name], "execution.env_allowlist_extra")
+
+
+# OpenCode 2.0.26's shell tool, as read from the build: ``$SHELL`` when it
+# names a shell it accepts (it refuses fish and nu), else the ``bash`` on
+# ``PATH``, else ``/bin/sh``, run as ``<shell> -c <command>`` with nothing
+# that suppresses startup files.
+_SHELL_TOOL_OPENCODE = r"""
+import json, os, shutil, subprocess, sys
+
+sys.stdin.read()
+shell = os.environ.get("SHELL", "")
+if not (os.path.isabs(shell) and os.path.isfile(shell)) or os.path.basename(shell) in (
+    "fish",
+    "nu",
+):
+    shell = shutil.which("bash") or "/bin/sh"
+merge = subprocess.run([shell, "-c", "gh pr merge 1 --squash"])
+print(json.dumps({"shell": shell, "merge_exit": merge.returncode}))
+"""
+
+
+@needs_zsh
+def test_an_opencode_shell_tool_merges_nothing_through_the_operators_zshenv(
+    probes, tmp_path, monkeypatch
+):
+    """R3-F1 as reported: the operator's shell is zsh and their ``~/.zshenv``
+    exports their token. Through the real OpenCode adapter and executor,
+    preflight included, the ``gh pr merge`` the agent's shell tool runs finds
+    the placeholder and is refused; the same launch with zsh finding the
+    operator's ``~/.zshenv`` (no ``ZDOTDIR``) would merge."""
+    monkeypatch.setenv("SHELL", _ZSH)
+    home = Path(os.environ["HOME"])
+    assert home.is_relative_to(tmp_path)  # the fixture's, never the developer's
+    (home / ".zshenv").write_text(f"export GH_TOKEN={FAKE_TOKEN}\n")
+    fake = tmp_path / "opencode"
+    fake.write_text(f"#!{sys.executable}\n{_SHELL_TOOL_OPENCODE}")
+    fake.chmod(0o755)
+    profile = ProfileConfig(
+        name="analyze_execute", provider="opencode", model="openai/x", command=str(fake)
+    )
+    repo = git_repo(tmp_path / "repo")
+    # The preflight probes this home and passes: a launch's zsh reads none of it.
+    identity = preflight(str(repo), home=str(home), env_allowlist=DEFAULT_ENV_ALLOWLIST)
+    with isolated_overrides(identity) as overrides:
+        assert overrides["SHELL"] == _ZSH
+        req = AgentRequest(
+            "ANALYZE_EXECUTE",
+            "p",
+            str(repo),
+            profile,
+            None,
+            60,
+            env_allowlist=DEFAULT_ENV_ALLOWLIST,
+            env=overrides,
+        )
+        result = OpenCodeProvider().execute(req)
+        assert result.exit_code == 0, result.stderr
+        assert json.loads(result.stdout.splitlines()[-1]) == {"shell": _ZSH, "merge_exit": 1}
+        req.env = {k: v for k, v in overrides.items() if k != "ZDOTDIR"}
+        leaked = OpenCodeProvider().execute(req)
+        assert json.loads(leaked.stdout.splitlines()[-1]) == {"shell": _ZSH, "merge_exit": 0}
+    assert _merges(probes) == [False, True]
+
+
+def test_a_launchs_shell_is_one_that_reads_no_startup_file(tmp_path):
+    fallback = shutil.which("bash") or "/bin/sh"
+    not_executable = tmp_path / "zsh"
+    not_executable.write_text("")
+    for operator in (
+        "/usr/bin/fish",
+        "/bin/tcsh",
+        "zsh",
+        str(tmp_path / "missing" / "bash"),
+        str(not_executable),
+        str(tmp_path),
+        "",
+    ):
+        assert child_shell(operator) == fallback, operator
+    sh = shutil.which("sh")
+    assert sh and child_shell(sh) == sh
+    assert os.path.basename(child_shell()) in POSIX_SHELLS
+
+
+def test_the_probe_names_what_changed_and_never_a_value():
+    """The probe compares, in a process the shell starts, the environment it
+    exports with the launch's: a controller-set variable changed, unset or
+    no longer exported, and a withheld name set again, are named; a
+    tolerated one is not; no value is printed."""
+    overrides = child_overrides("/gh", "/g", "/c", "/w", "/z", "/bin/sh")
+    script = shell_probe_script(overrides)
+    names = set(overrides) | set(FORBIDDEN_ENV_NAMES)
+
+    def probe(env, prefix=""):
+        shell = _BASH if prefix else "/bin/sh"
+        out = subprocess.run(
+            [shell, "-c", prefix + script], env=env, capture_output=True, text=True, check=True
+        ).stdout
+        return probe_findings(out, names), out
+
+    clean = {"PATH": os.environ["PATH"], **overrides}
+    assert probe(clean)[0] == []
+    changed = {
+        **clean,
+        "GH_TOKEN": FAKE_TOKEN,
+        "GIT_ASKPASS": "/bin/echo",
+        "BASH_ENV": "/home/x/.bashrc",
+        "SSH_AUTH_SOCK": "/tmp/agent.sock",
+        "XDG_RUNTIME_DIR": "/run/user/1",
+    }
+    del changed["CURL_HOME"]
+    findings, out = probe(changed)
+    assert findings == ["BASH_ENV", "CURL_HOME", "GH_TOKEN", "GIT_ASKPASS"]
+    assert FAKE_TOKEN not in out and "/bin/echo" not in out
+    if _BASH:  # set, but no longer exported: nothing the shell starts gets it
+        assert probe(clean, "export -n GH_TOKEN\n")[0] == ["GH_TOKEN"]
+    # What a startup file prints before the marker is never a finding.
+    out = (
+        f"GITHUB_TOKEN\n\n{SHELL_PROBE_MARKER}\nGH_TOKEN\n\n{SHELL_PROBE_MARKER}\nGIT_SSH\nnoise\n"
+    )
+    assert probe_findings(out, ["GH_TOKEN", "GIT_SSH", "GITHUB_TOKEN"]) == ["GIT_SSH"]
+    assert probe_findings("no marker\nGH_TOKEN\n", ["GH_TOKEN"]) is None
+
+
+def test_a_home_without_startup_files_has_no_startup_problem(tmp_path):
+    home = _startup_home(tmp_path, {})
+    assert shell_startup_problems(str(tmp_path), DEFAULT_ENV_ALLOWLIST, home=str(home)) == []
+
+
+@needs_bash
+def test_a_login_startup_file_that_restores_a_route_is_named_never_its_value(tmp_path, monkeypatch):
+    """``bash -l`` reads ``~/.bash_profile``, ``sh -l`` ``~/.profile``, both
+    through ``HOME``: each change to the launch's isolation is named with
+    its shell, whether it adds a withheld name, unsets a controller-set one
+    or redirects where another shell looks for its startup files."""
+    monkeypatch.setenv("SHELL", _BASH)
+    home = _startup_home(
+        tmp_path,
+        {
+            ".profile": f"export GITHUB_TOKEN={FAKE_TOKEN}\n",
+            ".bash_profile": (
+                'unset GH_TOKEN\nexport GIT_ASKPASS=/bin/echo\nexport ZDOTDIR="$HOME"\n'
+                'export BASH_ENV="$HOME/.bashrc"\n'
+            ),
+        },
+    )
+    problems = shell_startup_problems(str(tmp_path), DEFAULT_ENV_ALLOWLIST, home=str(home))
+    sh = shutil.which("sh")
+    assert f"the startup files of a login sh ({sh}), which change GITHUB_TOKEN" in problems
+    assert (
+        f"the startup files of a login bash ({_BASH}), which change "
+        "BASH_ENV, GH_TOKEN, GIT_ASKPASS, ZDOTDIR"
+    ) in problems
+    assert FAKE_TOKEN not in json.dumps(problems)
+
+
+def test_what_is_withheld_as_defence_in_depth_alone_is_no_startup_problem(tmp_path):
+    """An SSH agent a profile starts, a runtime directory or a session bus it
+    exports, a default host: none gives git or gh a credential while the
+    probed variables stand (``IdentityAgent=none``, the placeholder)."""
+    home = _startup_home(
+        tmp_path,
+        {
+            ".profile": "export SSH_AUTH_SOCK=/tmp/agent.sock XDG_RUNTIME_DIR=/run/user/1 "
+            "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1/bus GH_HOST=github.com\n",
+        },
+    )
+    (home / ".bash_profile").write_text(". ~/.profile\n")
+    assert shell_startup_problems(str(tmp_path), DEFAULT_ENV_ALLOWLIST, home=str(home)) == []
+
+
+@needs_zsh
+def test_zsh_startup_files_in_the_home_are_no_problem(tmp_path, monkeypatch):
+    """A launch's zsh reads its startup files from the controller's empty
+    ``ZDOTDIR``: the operator's are no route, so nothing is refused."""
+    monkeypatch.setenv("SHELL", _ZSH)
+    names = (".zshenv", ".zprofile", ".zshrc", ".zlogin")
+    home = _startup_home(tmp_path, {n: f"export GITHUB_TOKEN={FAKE_TOKEN}\n" for n in names})
+    assert shell_startup_problems(str(tmp_path), DEFAULT_ENV_ALLOWLIST, home=str(home)) == []
+
+
+@needs_bash
+def test_a_startup_file_that_ends_the_shell_could_not_be_checked(tmp_path, monkeypatch):
+    monkeypatch.setenv("SHELL", _BASH)
+    home = _startup_home(tmp_path, {".bash_profile": "exit 3\n"})
+    problems = shell_startup_problems(str(tmp_path), DEFAULT_ENV_ALLOWLIST, home=str(home))
+    assert f"the startup files of a login bash ({_BASH}), which could not be checked (exit 3)" in (
+        problems
+    )
+
+
+def test_the_probe_runs_each_launch_shell_as_a_login_shell_in_the_launch_environment(tmp_path):
+    seen: list[ExecutionRequest] = []
+
+    def runner(req):
+        seen.append(req)
+        return ExecutionResult(
+            req.command, req.cwd, 0, f"motd\n\n{SHELL_PROBE_MARKER}\n", "", "t", "t"
+        )
+
+    problems = shell_startup_problems(str(tmp_path), ("PATH", "HOME"), runner, home="/op/home")
+    assert problems == []
+    assert [req.command[0] for req in seen] == launch_shells(child_shell())
+    for req in seen:
+        assert req.command[1:3] == ["-l", "-c"] and req.cwd == str(tmp_path)
+        assert req.env_allowlist == ("PATH", "HOME") and req.contain_orphans
+        assert req.env["HOME"] == "/op/home" and Path(req.env["ZDOTDIR"]).name == "zsh"
+        overrides = {name: req.env[name] for name in override_names()}
+        assert req.command[3] == shell_probe_script(overrides)
+
+
+def _result(code=0, stdout=f"\n{SHELL_PROBE_MARKER}\n", **kwargs) -> ExecutionResult:
+    return ExecutionResult(["sh"], "/", code, stdout, "", "t", "t", **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("answer", "reason"),
+    [
+        (_result(code=1), "exit 1"),
+        (_result(code=127, stdout=""), "exit 127"),
+        (_result(stdout="motd only\n"), "no result"),
+        (_result(stdout_truncated=True), "no result"),
+        (_result(code=-9, timed_out=True), "timed out after 60s"),
+        (ExecutionError("executable not found"), "ExecutionError"),
+    ],
+)
+def test_a_probe_without_an_answer_could_not_be_checked(tmp_path, answer, reason):
+    def runner(req):
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    problems = shell_startup_problems(str(tmp_path), ("PATH",), runner, home=str(tmp_path))
+    assert problems and all(p.endswith(f"which could not be checked ({reason})") for p in problems)
+
+
+def test_the_preflight_runs_the_shells_only_for_a_launchs_allow_list(tmp_path):
+    repo = git_repo(tmp_path / "repo")
+    home = _startup_home(tmp_path, {".profile": f"export GITHUB_TOKEN={FAKE_TOKEN}\n"})
+    (home / ".bash_profile").write_text(". ~/.profile\n")
+    assert isinstance(preflight(str(repo), home=str(home)), LaunchIdentity)
+    with pytest.raises(ConfigurationError) as caught:
+        preflight(str(repo), home=str(home), env_allowlist=DEFAULT_ENV_ALLOWLIST)
+    message = str(caught.value)
+    assert "refusing to launch" in message and "startup files of a login sh" in message
+    assert "which change GITHUB_TOKEN" in message and FAKE_TOKEN not in message

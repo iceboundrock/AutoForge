@@ -416,7 +416,8 @@ redacted and bounded, into `<state dir>/read-context/<run-id>/`; the prompt
 names that directory. Before every launch the controller refuses to start
 when a setting would still hand over a credential (a credential helper in
 the repository's git configuration, a token in a remote URL, a GitHub entry
-in `~/.netrc`, an organization connected to OpenCode), naming the setting,
+in `~/.netrc`, an `export GH_TOKEN=...` in `~/.bash_profile` or
+`~/.profile`, an organization connected to OpenCode), naming the setting,
 never its value; the run is left untouched, so remove the setting and run
 the same command again.
 `autoforge doctor` runs the same check. What this does not stop (a
@@ -454,7 +455,8 @@ ownership or discard uncommitted user changes.
 - **"refusing to launch: a process AutoForge launches would be handed a
   GitHub or git credential":** the message names the setting (for example
   a credential helper in the repository's git configuration, a remote URL
-  with a token, or a GitHub entry in `~/.netrc`). Nothing was recorded:
+  with a token, a GitHub entry in `~/.netrc`, or the startup files of a
+  login shell that change a variable such as `GH_TOKEN`). Nothing was recorded:
   remove the setting (`autoforge doctor` lists it too) and run the same
   command again. A config that fails to load because `env_allowlist` names
   a credential variable: delete that entry

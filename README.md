@@ -136,10 +136,11 @@ Each line is a summary; the linked document is the precise statement.
   variable can be allow-listed, `gh` finds no login, credential helpers,
   askpass and the SSH agent and keys are switched off where repository
   configuration cannot switch them back on, curl and wget read no
-  configured header, the provider CLIs load no MCP server, plugin or hook,
-  and a launch is refused (by `doctor` too) while a repository setting,
-  `~/.netrc` or an organization connected to OpenCode would still hand one
-  over. The agent reads the GitHub data its
+  configured header, a launch's shells read none of your zsh startup
+  files, the provider CLIs load no MCP server, plugin or hook, and a
+  launch is refused (by `doctor` too) while a repository setting,
+  `~/.netrc`, a login shell's startup file or an organization connected
+  to OpenCode would still hand one over. The agent reads the GitHub data its
   phase needs from files the controller wrote, redacted and bounded. A
   deliberate same-user read of a credential file by absolute path is
   outside this guarantee.

@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from autoforge.child_env import POSIX_SHELLS
 from autoforge.cli import main
 from autoforge.config import default_config
 from autoforge.doctor import Doctor
@@ -42,6 +43,7 @@ from .conftest import (
     block,
     commit_all,
     git_repo,
+    is_shell_probe,
     make_local_engine,
     sample_contract,
     write_feature,
@@ -751,6 +753,8 @@ def test_local_doctor_never_runs_gh(tmp_path):
     seen: list[list[str]] = []
 
     def runner(req):
+        if is_shell_probe(req):  # the launch preflight's shell startup probe: real shells
+            return execute(req)
         seen.append(list(req.command))
         from autoforge.executor import ExecutionResult
 
@@ -832,6 +836,8 @@ def test_local_doctor_checks_only_the_reachable_providers(tmp_path):
     seen: list[list[str]] = []
 
     def runner(req):
+        if is_shell_probe(req):  # the launch preflight's shell startup probe: real shells
+            return execute(req)
         seen.append(list(req.command))
         from autoforge.executor import ExecutionResult
 
@@ -3489,6 +3495,7 @@ def test_local_launches_get_the_same_isolation_and_no_read_context(
         assert_isolated_names(entry["names"])
         assert entry["gh_token_placeholder"] and entry["gh_config_dir_empty"]
         assert entry["http_client_config_empty"]
+        assert entry["zdotdir_empty"] and entry["shell"] in POSIX_SHELLS
     assert not (eng.paths.state_dir / "read-context").exists()
 
 
@@ -3510,6 +3517,33 @@ def test_a_credential_helper_planted_before_validation_leaves_the_phase_unverifi
 
     eng.provider._handler = scripted(eng, root, [(plants, lambda e: impl_result())])
     with pytest.raises(VerificationError, match="validation commands not run.*credential helper"):
+        eng.run(max_steps=3)
+    assert eng.state.phase == Phase.ANALYZE_EXECUTE
+    assert not marker.exists()
+
+
+def test_a_startup_file_planted_before_validation_leaves_the_phase_unverified(tmp_path):
+    """R3-F1: a login shell the validation command starts would run what the
+    operator's ``~/.profile`` exports, which the agent can write; the
+    command's own preflight probes the login shells again and refuses."""
+    from autoforge import child_env
+
+    root = local_repo(tmp_path)
+    cfg = default_config()
+    marker = tmp_path / "ran"
+    cfg.local.validation_commands = [["touch", str(marker)]]
+    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
+    profile = Path(child_env.operator_home()) / ".profile"
+
+    def plants(r):
+        touch_impl(r, "v1\n")
+        profile.write_text("export GITHUB_TOKEN=planted\n")
+
+    eng.provider._handler = scripted(eng, root, [(plants, lambda e: impl_result())])
+    with pytest.raises(
+        VerificationError,
+        match="validation commands not run.*startup files of a login sh .*change GITHUB_TOKEN",
+    ):
         eng.run(max_steps=3)
     assert eng.state.phase == Phase.ANALYZE_EXECUTE
     assert not marker.exists()

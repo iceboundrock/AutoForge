@@ -78,17 +78,19 @@ execution:
   # each provider adapter adds the names its own CLI reads (claude:
   # ANTHROPIC_*, CLAUDE_*; opencode: OPENCODE_*, OPENAI_*, ANTHROPIC_*,
   # GEMINI_*, GOOGLE_*). `env_allowlist` replaces the built-in default list
-  # (PATH, HOME, USER, LOGNAME, SHELL, TERM, TMPDIR, TZ, LANG, LANGUAGE,
+  # (PATH, HOME, USER, LOGNAME, TERM, TMPDIR, TZ, LANG, LANGUAGE,
   # LC_*, XDG_*_HOME, GIT_AUTHOR_* / GIT_COMMITTER_*, the proxy and
   # CA-bundle variables) and must not be empty; `env_allowlist_extra` adds
   # to whichever list is in force. No GitHub or git credential route may be
   # listed in either (GH_TOKEN, GITHUB_TOKEN, GH_HOST, GH_CONFIG_DIR,
-  # SSH_AUTH_SOCK, GIT_SSH*, GIT_ASKPASS, GIT_CONFIG_*, XDG_RUNTIME_DIR and
-  # the like, or a `*` covering one): config load refuses it. The
-  # controller sets an empty gh configuration, a git identity copied from
-  # your global config and a reset of credential helpers on top, and makes
-  # every GitHub write itself; its own `git` / `gh` plumbing keeps the full
-  # environment (docs/configuration.md, "Agent environment").
+  # SSH_AUTH_SOCK, GIT_SSH*, GIT_ASKPASS, GIT_CONFIG_*, XDG_RUNTIME_DIR,
+  # BASH_ENV, ZDOTDIR and the like, or a `*` covering one): config load
+  # refuses it. The controller sets an empty gh configuration, a git
+  # identity copied from your global config, a reset of credential helpers
+  # and a SHELL and zsh startup directory that load none of your startup
+  # files on top, and makes every GitHub write itself; its own `git` / `gh`
+  # plumbing keeps the full environment (docs/configuration.md, "Agent
+  # environment").
   # env_allowlist: [PATH, HOME, LANG, "LC_*"]
   env_allowlist_extra: []
   #  - HTTPS_PROXY

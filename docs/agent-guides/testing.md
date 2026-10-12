@@ -225,6 +225,20 @@ a stated reason it has none. The coverage that must keep working:
   accepts a global helper the child never reads; its message names no
   value; a launch never inherits `NETRC`, whose file the real curl 8.16
   and later reads for the controller (`test_child_env.py`)
+- a launch's shells run no startup file of the operator's to run a
+  command: the real zsh (`-c`, `-l -c`, `-i -c`, a zsh shebang) with the
+  operator's zsh files exporting a token, the real bash and sh with the
+  operator's `BASH_ENV`, and R3-F1's report through the real OpenCode
+  adapter and executor (a fake `opencode` choosing `$SHELL` as 2.0.26
+  does) all leave a fake `gh pr merge` refused, and the same launch
+  without the controller's `ZDOTDIR` or with the operator's `BASH_ENV`
+  merges; `SHELL` is never fish or a csh; the login-shell probe names the
+  shell and variable of a `~/.profile` or `~/.bash_profile` that restores
+  a route, never its value, tolerates an SSH agent or session bus alone,
+  ignores zsh files in the home, and refuses a probe without an answer;
+  an agent, validation or pre-merge launch and `doctor` refuse on it
+  (`test_child_env.py`, `test_engine.py`, `test_local.py`,
+  `test_doctor.py`)
 - an agent preflight refusal, the credential preflight's or the
   adapter's own (`integration_preflight`), leaves the state file byte for
   byte; a

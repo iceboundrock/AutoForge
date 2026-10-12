@@ -83,9 +83,15 @@ read it before adding tests for a listed area.
   return a `PiTurn` to script a failure); `make_pi_engine` / `route_to_pi`
   route profiles to it.
 - Every launch gets no GitHub credential (#165). Autouse fixtures point
-  the preflight's `~/.netrc` and OpenCode's data directory (where the
-  organization check looks) at empty directories, so a test never reads
-  the operator's. `pollute_operator_environment` fills the controller's
+  the preflight's home (its `~/.netrc` and the `HOME` its login-shell probe
+  runs with) and OpenCode's data directory (where the organization check
+  looks) at empty directories, so a test never reads the operator's. The
+  probe runs the real `sh`, `bash` and `zsh`: a fake runner hands a request
+  `is_shell_probe(req)` recognises to the real `execute`, as a fake runner
+  does for nothing else, and a launch without a fake runner reuses the
+  answer of an earlier one with the same home contents and environment
+  (`_one_shell_probe_per_answer`); `tests/test_child_env.py` calls the
+  probe itself. `pollute_operator_environment` fills the controller's
   environment with every credential route; `assert_isolated_launch(eng,
   req)` / `launch_environment` check what a launch would get,
   `env_probe_command` is a validation or pre-merge command that records its

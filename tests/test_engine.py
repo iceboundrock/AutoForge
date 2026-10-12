@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from autoforge import __prompt_version__
+from autoforge.child_env import POSIX_SHELLS
 from autoforge.claims import (
     REVIEW,
     render_follow_up_marker,
@@ -105,6 +106,7 @@ from tests.conftest import (
     git_repo,
     implement,
     implementation_pr_body,
+    is_shell_probe,
     make_engine,
     new_follow_up,
     no_change,
@@ -10618,6 +10620,8 @@ def test_validation_and_premerge_commands_run_under_the_allowlist(tmp_state_dir,
 
     def runner(req):
         seen.append(req)
+        if is_shell_probe(req):
+            return execute(req)
         return ExecutionResult(req.command, req.cwd, 0, "", "", "t", "t")
 
     eng._runner = runner
@@ -10626,6 +10630,9 @@ def test_validation_and_premerge_commands_run_under_the_allowlist(tmp_state_dir,
     names = eng.config.execution.environment_names()
     assert commands and all(r.env_allowlist == names for r in commands)
     assert all("MY_TOOL_*" in r.env_allowlist for r in commands)
+    # The login-shell probe runs in the environment the command gets.
+    probes = [r for r in seen if is_shell_probe(r)]
+    assert probes and all(r.env_allowlist == names for r in probes)
 
 
 def _drift_engine(tmp_state_dir, fake_github, mutate, fail=False):
@@ -11683,6 +11690,35 @@ def test_an_integration_the_provider_cannot_keep_off_refuses_the_launch_and_leav
     assert not (eng.paths.state_dir / "read-context").exists()
 
 
+def test_a_login_shell_startup_file_that_exports_a_credential_refuses_the_launch(
+    tmp_state_dir, fake_github, tmp_path_factory, monkeypatch
+):
+    """``bash -l`` and ``sh -l`` read ``~/.bash_profile`` and ``~/.profile``
+    through ``HOME``, which no variable redirects: the preflight runs them
+    in the launch's environment before anything is charged, saved or
+    launched, and names the shell and the variable, never the value."""
+    import autoforge.child_env as child_env_module
+    from autoforge.errors import ConfigurationError
+
+    token = "ghp_" + "S" * 36
+    home = tmp_path_factory.mktemp("home")
+    (home / ".profile").write_text(f"export GITHUB_TOKEN={token}\n")
+    (home / ".bash_profile").write_text(f"export GH_TOKEN={token}\n")
+    monkeypatch.setattr(child_env_module, "operator_home", lambda: str(home))
+    eng = make_engine(tmp_state_dir, "never", github=fake_github, origin=True)
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    before = eng.paths.state_file.read_bytes()
+    with pytest.raises(ConfigurationError) as caught:
+        eng.step()
+    message = str(caught.value)
+    assert "startup files of a login bash" in message and "change GH_TOKEN" in message
+    assert "startup files of a login sh" in message and "change GITHUB_TOKEN" in message
+    assert token not in message
+    assert eng.provider.calls == []
+    assert eng.paths.state_file.read_bytes() == before
+    assert not (eng.paths.state_dir / "read-context").exists()
+
+
 @pytest.mark.parametrize("phase", ["ANALYZE_EXECUTE", "REVIEW"])
 def test_a_write_through_a_leaked_credential_is_unjournaled_and_blocks(tmp_state_dir, phase):
     """Nothing AutoForge controls hands the agent a credential (asserted while
@@ -11734,6 +11770,28 @@ def test_verification_commands_get_the_launch_isolation(
     assert seen["gh_token_placeholder"] and seen["gh_config_dir_empty"]
     assert seen["http_client_config_empty"]
     assert seen["git_terminal_prompt"] == "0"
+    # The operator's shell is fish: the command's is one that reads no
+    # startup file, and zsh's startup directory is the controller's.
+    assert seen["zdotdir_empty"] and seen["shell"] in POSIX_SHELLS
+
+
+def test_a_shell_startup_file_that_exports_a_credential_blocks_the_premerge_verification(
+    tmp_state_dir, fake_github, tmp_path_factory, monkeypatch
+):
+    import autoforge.child_env as child_env_module
+    from tests.conftest import env_probe_command
+
+    home = tmp_path_factory.mktemp("home")
+    (home / ".profile").write_text("export GIT_SSH_COMMAND='ssh -i ~/.ssh/id_ed25519'\n")
+    monkeypatch.setattr(child_env_module, "operator_home", lambda: str(home))
+    record = tmp_path_factory.mktemp("probe") / "env.jsonl"
+    eng, _ = _in_merge_on_commit(tmp_state_dir, fake_github, [env_probe_command(record)])
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "BLOCKED" and fake_github.merges == []
+    assert "pre-merge verification command not run" in eng.state.block_reason
+    assert "startup files of a login sh" in eng.state.block_reason
+    assert "change GIT_SSH_COMMAND" in eng.state.block_reason
+    assert not record.exists()
 
 
 def test_a_netrc_entry_for_github_blocks_the_premerge_verification(

@@ -177,7 +177,9 @@ MAX_LOOP_REPEATS = 100_000
 # added (``autoforge.child_env.FORBIDDEN_ENV_NAMES``, #165): gh's tokens and
 # configuration location, the SSH agent socket, git's ssh and askpass
 # programs and its environment configuration are refused at load, and the
-# controller sets the gh and git configuration a child sees itself. The API keys
+# controller sets the gh and git configuration a child sees itself, and its
+# ``SHELL`` (a shell that reads no startup file of the operator's,
+# ``autoforge.child_env.child_shell``). The API keys
 # a provider's own CLI reads are contributed by the provider adapter
 # (``AgentProvider.environment_names``), not listed here, so an OpenCode
 # launch never carries an Anthropic key it has no use for. A trailing ``*``
@@ -189,7 +191,6 @@ DEFAULT_ENV_ALLOWLIST: tuple[str, ...] = (
     "HOME",
     "USER",
     "LOGNAME",
-    "SHELL",
     "TERM",
     "TMPDIR",
     "TZ",

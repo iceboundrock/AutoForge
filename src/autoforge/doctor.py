@@ -21,12 +21,14 @@ configuration, which a launch refuses (#165,
 Both report the environment an agent and a repository-defined command are
 launched with, by name only (never a value), and run the launch's own
 credential preflight (#165, :func:`autoforge.child_env.preflight`): one
-local ``git config`` read and ``~/.netrc``; a credential helper in the
-repository's configuration, a URL with an embedded credential, an HTTP
-header for git or a GitHub entry in ``~/.netrc`` fails ``doctor`` exactly
-as it would refuse the launch. ``~/.curlrc`` and wget's configuration need
-no check: a launch's curl and wget read the controller's empty files
-instead. The ``origin`` URL is shown redacted.
+local ``git config`` read, ``~/.netrc`` and one login shell per shell a
+launch may start; a credential helper in the repository's configuration, a
+URL with an embedded credential, an HTTP header for git, a GitHub entry in
+``~/.netrc`` or a shell startup file that changes a launch's variables
+fails ``doctor`` exactly as it would refuse the launch. ``~/.curlrc``,
+wget's configuration and zsh's startup files need no check: a launch's
+curl, wget and zsh read the controller's empty ones instead. The
+``origin`` URL is shown redacted.
 
 ``autoforge local doctor`` runs the LOCAL subset: no `gh`, no `gh auth
 status`, no `origin` remote. A machine with no GitHub CLI and no GitHub
@@ -45,6 +47,7 @@ from pathlib import Path
 
 from .child_env import (
     LaunchIdentity,
+    child_shell,
     describe_overrides,
     forbidden_env_entry,
     isolated_overrides,
@@ -299,8 +302,11 @@ class Doctor:
     def check_launch_credentials(self) -> CheckResult:
         """The launch preflight, run here: no GitHub or git credential reaches a child."""
         name = "no credential reaches a launch"
+        cfg = self.config if self.config is not None else AutoForgeConfig()
         try:
-            identity = preflight(self.cwd, self._runner)
+            identity = preflight(
+                self.cwd, self._runner, env_allowlist=cfg.execution.environment_names()
+            )
         except ConfigurationError as exc:
             return CheckResult(name, False, redact(str(exc)))
         return CheckResult(
@@ -309,6 +315,8 @@ class Doctor:
             "no credential helper, credential-bearing URL or HTTP header in the repository's "
             "git configuration, and no GitHub entry in ~/.netrc; a launch's curl and wget "
             "read an empty configuration of the controller's, never ~/.curlrc or ~/.wgetrc; "
+            f"a launch's shell is {child_shell()} and no login shell's startup files change "
+            "its variables, zsh reading none of yours; "
             f"author identity supplied: {identity.describe()}",
         )
 

@@ -907,9 +907,12 @@ never the boundary.
   session bus a desktop keyring answers on (`XDG_RUNTIME_DIR`,
   `DBUS_SESSION_BUS_ADDRESS`), where curl and wget find the
   configuration file they read on every request (`CURL_HOME`, `WGETRC`,
-  `WGET2RC`), and `NETRC`, the `.netrc` that curl 8.16 and later, Python's
-  `requests` and Go read in place of `~/.netrc`. None is in the default
-  allow-list, and
+  `WGET2RC`), `NETRC`, the `.netrc` that curl 8.16 and later, Python's
+  `requests` and Go read in place of `~/.netrc`, and where a shell finds a
+  startup file it runs before a command (`BASH_ENV`, which every
+  non-interactive bash runs; `ENV`, an interactive sh's; `ZDOTDIR`,
+  zsh's). None is in the default allow-list (`SHELL` no longer is either:
+  the controller sets it), and
   config load refuses any of them, or a `*` prefix covering one, in
   `execution.env_allowlist`, `env_allowlist_extra` or an adapter's
   `environment_names`, naming the variable and the rule and never a value.
@@ -943,10 +946,28 @@ never the boundary.
     `~/.wgetrc` or `~/.config/wget/wget2rc`. Either file can add an
     `Authorization` header to every request, so a plain `curl` or `wget`
     would otherwise send the operator's token; the child keeps `HOME` and
-    `XDG_CONFIG_HOME`, and its curl and wget still read none of them.
+    `XDG_CONFIG_HOME`, and its curl and wget still read none of them;
+  - `ZDOTDIR`: an empty directory. zsh reads `.zshenv` from `ZDOTDIR`,
+    else `HOME`, on every start, `zsh -c` and a zsh shebang included, and
+    `.zprofile`, `.zshrc` and `.zlogin` from there for a login or
+    interactive shell; an `export GH_TOKEN=...` in any of them would
+    replace the placeholder for everything the shell runs. A launch's zsh
+    reads none of the operator's (`/etc/zshenv` and the other system files
+    are the administrator's);
+  - `SHELL`: a shell that runs a command without a startup file of the
+    operator's (`child_env.child_shell`): the operator's own when it is an
+    absolute, executable `sh`, `bash`, `zsh`, `dash`, `ksh` or `mksh`, else
+    the `bash` on `PATH`, else `/bin/sh`. The agent CLIs start their shell
+    tool from it: OpenCode 2.0.26 as `$SHELL -c` (a fish or nu `SHELL` it
+    replaces with `bash`), Claude Code 2.1.296 with `SHELL` when it names
+    bash or zsh. A fish or csh-family shell reads its configuration on
+    every start, and no variable redirects it, so a launch never gets one
+    through `SHELL`.
 - **A preflight before every launch** (`child_env.preflight`): one
   `git config --list --show-scope --includes` in the launch's directory,
-  through the hardened local request, and a read of `~/.netrc` (`_netrc`).
+  through the hardened local request, a read of `~/.netrc` (`_netrc`), and
+  a probe of each shell a launch may start as a login shell
+  (`shell_startup_problems`, below).
   It refuses a credential helper in repository or worktree scope (the
   shared common dir), a remote URL or `insteadOf` base with an embedded
   credential, and an `http.extraHeader` (a URL-specific one beats the
@@ -966,6 +987,32 @@ never the boundary.
   command does. It names the scope and the key's shape, never a value or a
   URL. `autoforge doctor` and `autoforge local doctor` run the same check
   and report the launch environment by name only.
+- **The login-shell probe.** `bash -l` reads `/etc/profile` and the first
+  of `~/.bash_profile`, `~/.bash_login` and `~/.profile`, and `sh -l`
+  `/etc/profile` and `~/.profile`, all through `HOME`, which every child
+  keeps and no variable redirects. So the preflight runs each shell a
+  launch may start (its `SHELL`, and the `sh`, `bash` and `zsh` on `PATH`)
+  once as `<shell> -l -c <probe>`, in the launch's directory and
+  environment (its allow-list, the controller-set variables, the operator's
+  `HOME`), through the executor with orphan containment. Once the startup
+  files have run, the shell `exec`s the controller's own interpreter
+  (`python -I -S`), which reads the environment the shell exports, what
+  everything it starts inherits: it compares every controller-set variable
+  with its value and looks for every withheld name, and prints after a
+  marker only the names that changed, so no value leaves that process and
+  nothing a startup file prints before the marker counts. Withheld names
+  that give nothing while the probed variables stand are tolerated
+  (`STARTUP_TOLERATED`: `SSH_AUTH_SOCK` with `IdentityAgent=none`,
+  `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` with the placeholder
+  token, `GH_HOST`), so a profile that starts an SSH agent refuses nothing.
+  A startup file that exports a token, unsets the placeholder, names an
+  askpass or an SSH command, or points `BASH_ENV` or `ZDOTDIR` back at the
+  operator's files refuses the launch, naming the shell and the variables;
+  so does a probe that cannot answer (it exits, times out or prints no
+  marker). A launch's zsh reads its startup files
+  from the empty `ZDOTDIR`, so the operator's `.zshenv` and the rest are
+  no problem and are not refused. It costs one short process per shell per
+  launch.
 - **Provider integrations.** An MCP server, a plugin or a hook of the
   operator's or the repository's configuration may hold a GitHub token of
   its own, so none runs in a launch; each mechanism was decided from the
@@ -1034,7 +1081,11 @@ named otherwise), or why it has none.
 | OpenCode organization configuration (`.well-known/opencode`: fetched, or cached in OpenCode's database, ahead of every file) | the launch refused while the database it would open lists an organization, `auth.json` has a `"wellknown"` entry, or either cannot be read | the fake `opencode` loads the cached organization configuration from a 2.0.26-shaped database: `test_providers.py::test_an_opencode_launch_is_refused_while_an_organization_is_connected` (cached, not yet cached, legacy `auth.json`, `OPENCODE_DB`), `test_an_opencode_launch_with_no_organization_proceeds`, `test_opencode_data_that_cannot_be_read_refuses_the_launch`; before anything is charged: `test_engine.py::test_an_integration_the_provider_cannot_keep_off_refuses_the_launch_and_leaves_state`; `test_doctor.py::test_doctor_fails_an_opencode_connected_to_an_organization`. The real 2.0.26 was seen starting a cached organization's MCP server under `opencode_isolation_env` and none with `OPENCODE_DB=:memory:` or a database of its own (`providers.py`) |
 | Pi extensions, skills, prompt templates, themes, context files | #132's flags (`--no-extensions` and the rest) | `test_pi_rpc.py`, unchanged |
 | a provider's permission mode or approval | irrelevant by the authority rule: it grants no credential | — |
-| validation and pre-merge commands | the same variables and preflight | `test_local.py::test_local_launches_get_the_same_isolation_and_no_read_context`, `test_engine.py::test_verification_commands_get_the_launch_isolation` |
+| zsh startup files (`.zshenv` on every start, `.zprofile`, `.zshrc`, `.zlogin`), found through `ZDOTDIR` or `HOME` | `ZDOTDIR` names an empty directory of the launch's; `ZDOTDIR` refused at load | the real zsh, `-c`, `-l -c`, `-i -c` and a zsh shebang, with the operator's files exporting a token: `test_a_launchs_zsh_reads_no_startup_file_of_the_operators` (the same launch without `ZDOTDIR` merges); R3-F1's report through the real OpenCode adapter and executor, a fake `opencode` choosing its shell as 2.0.26 does: `test_an_opencode_shell_tool_merges_nothing_through_the_operators_zshenv`; `test_zsh_startup_files_in_the_home_are_no_problem` |
+| `BASH_ENV` (every non-interactive bash) and `ENV` (an interactive sh) | refused at load, never inherited | the real bash and sh: `test_a_launchs_bash_and_sh_run_no_startup_file_of_the_operators_for_a_command` (with the operator's `BASH_ENV`, `bash -c` merges) |
+| the shell an agent CLI starts (`SHELL`): fish and the csh family read their configuration on every start | `SHELL` set to the operator's POSIX shell, else `bash` or `/bin/sh` | `test_a_launchs_shell_is_one_that_reads_no_startup_file`; construction test (a fish `SHELL` becomes `bash`) |
+| login-shell startup files (`/etc/profile`, `~/.bash_profile`, `~/.bash_login`, `~/.profile`, read through `HOME`) | the login-shell probe refuses a launch whose shells' startup files change a probed variable | the real bash and sh: `test_a_login_startup_file_that_restores_a_route_is_named_never_its_value`, `test_what_is_withheld_as_defence_in_depth_alone_is_no_startup_problem`, `test_a_startup_file_that_ends_the_shell_could_not_be_checked`, `test_a_probe_without_an_answer_could_not_be_checked`; `test_engine.py::test_a_login_shell_startup_file_that_exports_a_credential_refuses_the_launch`, `test_a_shell_startup_file_that_exports_a_credential_blocks_the_premerge_verification`; `test_local.py::test_a_startup_file_planted_before_validation_leaves_the_phase_unverified`; `test_doctor.py::test_doctor_refuses_a_login_shell_startup_file_that_exports_a_credential` |
+| validation and pre-merge commands | the same variables and preflight, the login-shell probe included | `test_local.py::test_local_launches_get_the_same_isolation_and_no_read_context`, `test_engine.py::test_verification_commands_get_the_launch_isolation` |
 
 End to end, `tests/test_integration.py` runs the whole REMOTE lifecycle with
 an operator shell holding every route above and checks each launch while it
@@ -1126,6 +1177,19 @@ managed settings an administrator installed (`--safe-mode` leaves policy
 settings in force); the operator cannot change them either, and they are
 not detected. OpenCode's organization configuration is not a residual: a
 launch that would load it is refused (above).
+
+**Residuals of shell startup.** `HOME` is passed, so a shell that reads its
+configuration from `HOME` still does when something starts it that way:
+an interactive `bash` reads `~/.bashrc`, and a `fish` or csh-family shell
+started by name reads its configuration; neither is the `SHELL` of a
+launch, and an agent that starts one deliberately could as well read the
+file. Claude Code 2.1.296 runs `<shell> -c -l` once per session to snapshot
+the functions, aliases and options its Bash tool runs with, sourcing
+`~/.zshrc` or `~/.bashrc` itself; the snapshot keeps `PATH`, functions
+and aliases but not exported variables, so a function defined there that
+hands `gh` a token would still reach the Bash tool, and the login shell it
+starts is one the probe checked. A startup file that changes a variable only under a condition the
+probe does not meet (a terminal, a time of day) is not detected.
 
 **What the agent loses.** The operator's global git configuration beyond
 the identity is not read by an agent: no commit signing (`commit.gpgSign`,

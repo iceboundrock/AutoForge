@@ -514,12 +514,15 @@ included):
 | `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS` | the session bus a desktop keyring answers on |
 | `CURL_HOME`, `WGETRC`, `WGET2RC` | where curl and wget find the configuration file they read on every request, which can add a credential header |
 | `NETRC` | where curl (8.16 and later), Python's `requests` and Go find the `.netrc` they take a password from |
+| `BASH_ENV`, `ENV`, `ZDOTDIR` | where a shell finds a startup file it runs before a command, which can export a credential |
 
 Earlier versions forwarded `XDG_RUNTIME_DIR`, `SSH_AUTH_SOCK`, `GIT_SSH`,
 `GIT_SSH_COMMAND`, `GIT_CONFIG_GLOBAL`, `GH_TOKEN`, `GITHUB_TOKEN`,
 `GH_HOST` and `GH_CONFIG_DIR` by default. A config that copied the old
 default list into `execution.env_allowlist` now fails to load: delete those
-entries (or the whole key, to take the new default).
+entries (or the whole key, to take the new default). `SHELL` has left the
+default list too, because the controller sets it (below); listing it is
+allowed and changes nothing.
 
 **Variables the controller sets** for each launch, from a private directory
 it removes when the launch ends:
@@ -533,6 +536,8 @@ it removes when the launch ends:
 | `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_n`, `GIT_CONFIG_VALUE_n` | `credential.helper=`, `core.askPass=`, `http.extraHeader=`, `core.sshCommand=ssh -F /dev/null -o IdentityFile=none -o IdentitiesOnly=yes -o IdentityAgent=none -o ControlPath=none -o BatchMode=yes` | no credential helper, askpass, extra header, SSH agent or SSH key, whatever any git configuration file says |
 | `CURL_HOME` | a directory holding an empty `.curlrc` | a plain `curl` reads it, not `~/.curlrc` or the `curlrc` (or `.curlrc`) in `$XDG_CONFIG_HOME`, so a header configured there is never sent |
 | `WGETRC`, `WGET2RC` | an empty file | a plain `wget` (1.x or wget2) reads it, not `~/.wgetrc` or `~/.config/wget/wget2rc` |
+| `ZDOTDIR` | an empty directory | every zsh of the launch, `zsh -c` included, reads `.zshenv` (and `.zprofile`, `.zshrc`, `.zlogin`) from it, not from your home, so nothing you export there reaches a launch |
+| `SHELL` | your shell when it is `sh`, `bash`, `zsh`, `dash`, `ksh` or `mksh` (an absolute path to an executable), else `bash`, else `/bin/sh` | the shell the agent CLIs run their shell tool with reads no startup file of yours to run a command; a fish or csh-family shell, which reads its configuration on every start, is never a launch's |
 
 `GIT_AUTHOR_*` and `GIT_COMMITTER_*` stay in the default allow-list and
 still take precedence over the identity file.
@@ -581,7 +586,19 @@ user name or token in it; an `http.extraHeader` in system, repository or
 worktree configuration; an entry for GitHub, or a `default` entry, in
 `~/.netrc`, whatever its quoting, escapes or case (every word is checked,
 comments and `macdef` bodies included, because netrc readers disagree on
-where those end). For an agent the run stops before anything is recorded, so it
+where those end); or a login shell's startup files that change what a
+launch gets. Each shell a launch may start (its `SHELL`, and the `sh`,
+`bash` and `zsh` on `PATH`) is run once as a login shell in the launch's
+environment, so it reads `/etc/profile` and your `~/.profile`,
+`~/.bash_profile` or `~/.bash_login`; it reports, by name only, any
+variable above that its startup files changed and any refused name they
+set (`SSH_AUTH_SOCK`, `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS` and
+`GH_HOST` excepted, which give nothing while the variables above stand).
+An `export GH_TOKEN=...` in `~/.bash_profile` refuses the launch, naming
+`bash` and `GH_TOKEN`; move it where only an interactive shell runs it
+(in `~/.bashrc` after the usual `case $- in *i*) ;; *) return;; esac`).
+A zsh startup file is never a problem: a launch's zsh reads none of yours.
+For an agent the run stops before anything is recorded, so it
 can simply be run again once the setting is removed; for a validation or
 pre-merge command it counts as that command failing. `autoforge doctor` and
 `autoforge local doctor` run the same check (row "no credential reaches a
@@ -594,8 +611,9 @@ filter, no aliases, no `core.excludesFile`. `gh` and `git push` fail for
 lack of a credential, which is expected: the controller performs every
 GitHub write. Tools that need `XDG_RUNTIME_DIR` (a session bus, a Wayland
 socket) do not get it; curl and wget get none of their configured defaults
-(the proxy variables still pass); and the provider integrations above stay
-off. The guarantees and what they do not cover are in
+(the proxy variables still pass); a zsh of the launch runs without your
+zsh startup files, and a fish `SHELL` is replaced with `bash`; and the
+provider integrations above stay off. The guarantees and what they do not cover are in
 [GitHub safety](agent-guides/github-safety.md#agents-hold-no-github-credential).
 
 ## Local mode configuration

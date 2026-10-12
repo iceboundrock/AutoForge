@@ -14,9 +14,10 @@ of launch the same way.
   the programs git and ssh run to obtain a credential, the SSH agent
   socket, git configuration taken from the environment, the session bus a
   desktop keyring answers on, where curl and wget find the
-  configuration file they read on every request, and ``NETRC``, the
+  configuration file they read on every request, ``NETRC``, the
   ``.netrc`` curl (8.16 and later), Python's ``requests`` and Go read
-  instead of ``~/.netrc``.
+  instead of ``~/.netrc``, and where a shell finds a startup file
+  (``BASH_ENV``, ``ENV``, ``ZDOTDIR``).
   :func:`refuse_forbidden_env` refuses an allow-list entry that names one,
   or a ``*`` prefix that covers one, at config load
   (``execution.env_allowlist`` / ``env_allowlist_extra``) and for every
@@ -52,7 +53,19 @@ of launch the same way.
     database, and wget reads the file its variable names instead of
     ``~/.wgetrc`` or ``~/.config/wget/wget2rc``; either file can add an
     ``Authorization`` header to every request, so a plain ``curl`` or
-    ``wget`` of the child's would otherwise send the operator's token.
+    ``wget`` of the child's would otherwise send the operator's token;
+  - ``ZDOTDIR`` names an empty directory, where every zsh of the launch
+    looks for ``.zshenv``, ``.zprofile``, ``.zshrc`` and ``.zlogin``
+    instead of ``HOME``: zsh reads ``.zshenv`` on every start, ``zsh -c``
+    included, and an ``export GH_TOKEN=...`` there would replace the
+    placeholder for everything the shell runs;
+  - ``SHELL`` names a shell that reads no startup file of the operator's to
+    run a command (:func:`child_shell`): the operator's own when it is one
+    of :data:`POSIX_SHELLS`, else ``bash`` (``/bin/sh`` without one). The
+    agent CLIs run their shell tool with it (OpenCode as ``$SHELL -c``,
+    Claude Code when it is bash or zsh), and so do the tools that start
+    ``$SHELL``; fish and the csh family read their configuration on every
+    start.
 
   The directory is removed when the launch ends.
 - **A preflight before every launch** (:func:`preflight`): the git
@@ -60,27 +73,40 @@ of launch the same way.
   scope) must not hold a credential helper in repository or worktree scope
   (the shared common dir), a URL with an embedded credential (a remote, an
   ``insteadOf`` base) or an ``http.extraHeader``, which the command-scope
-  reset cannot reach when it is set for a URL; and ``~/.netrc`` must have no
+  reset cannot reach when it is set for a URL; ``~/.netrc`` must have no
   word that a netrc reader may take for a GitHub machine or a ``default``
-  entry, because git's HTTPS transport reads it through ``HOME``. A
-  refusal is a :class:`ConfigurationError` that names the key and scope,
-  never a value; nothing is launched.
+  entry, because git's HTTPS transport reads it through ``HOME``; and the
+  startup files of a login shell of the launch's must leave its variables
+  alone (:func:`shell_startup_problems`). ``bash -l`` and ``sh -l`` read
+  ``~/.bash_profile``, ``~/.profile`` and ``/etc/profile`` through ``HOME``,
+  which no variable redirects, so each shell a launch may start (its
+  ``SHELL``, ``sh``, ``bash`` and ``zsh``) is run once as a login shell in
+  the launch's environment and reports, by name only, every variable of the
+  isolation its startup files changed. A refusal is a
+  :class:`ConfigurationError` that names the key and scope, the file or the
+  shell and variable, never a value; nothing is launched.
 
 What this does not do (docs/agent-guides/github-safety.md, "Threat
 model"): it hides nothing from a process that deliberately opens a
 credential file, a keychain or a socket by absolute path, or runs ``ssh``
 or a credential helper of its own choosing; that is the outer sandbox's
 (ADR 0005). ``HOME`` is still passed: the agent CLIs keep their own sign-in
-there.
+there. So an interactive ``bash`` still reads ``~/.bashrc``, Claude Code
+still sources ``~/.zshrc`` or ``~/.bashrc`` itself to snapshot the
+functions and aliases (not the variables) its Bash tool runs with, and a
+fish or csh-family shell started by name still reads its configuration;
+none of them is started by a launch through ``SHELL``.
 """
 
 from __future__ import annotations
 
 import os
 import re
+import shlex
 import shutil
+import sys
 import tempfile
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -103,6 +129,9 @@ _HTTP_CONFIG = (
     "which can add a credential header"
 )
 _NETRC = "where an HTTP client finds the .netrc file it takes a password from"
+_SHELL_STARTUP = (
+    "where a shell finds a startup file it runs before a command, which can export a credential"
+)
 
 # Every variable an agent or a repository command must never inherit from
 # the operator's environment, and the rule it falls under. Some of them are
@@ -130,6 +159,9 @@ FORBIDDEN_ENV_NAMES: dict[str, str] = {
     "WGETRC": _HTTP_CONFIG,
     "WGET2RC": _HTTP_CONFIG,
     "NETRC": _NETRC,
+    "BASH_ENV": _SHELL_STARTUP,
+    "ENV": _SHELL_STARTUP,
+    "ZDOTDIR": _SHELL_STARTUP,
 }
 FORBIDDEN_ENV_PREFIXES: dict[str, str] = {
     "GIT_CONFIG_KEY_": _GIT_CONFIG,
@@ -193,6 +225,47 @@ MAX_NETRC_BYTES = 1024 * 1024
 
 PREFLIGHT_TIMEOUT_SECONDS = 60
 
+# The shells a launch keeps as its ``SHELL`` (by file name): POSIX shells
+# that run a command (``-c``, a script) without reading a startup file,
+# given that ``BASH_ENV`` and ``ENV`` never reach them and ``ZDOTDIR`` is the
+# controller's. What their login startup files do is probed instead
+# (:func:`shell_startup_problems`). fish, the csh family and the rest read
+# their configuration on every start, through ``HOME`` or
+# ``XDG_CONFIG_HOME``, which a launch keeps.
+POSIX_SHELLS = ("sh", "bash", "zsh", "dash", "ksh", "mksh")
+# The shells a launch may start by name besides its ``SHELL`` (a
+# repository's script or recipe, ``bash -l`` included), each probed too.
+PROBED_SHELLS = ("sh", "bash", "zsh")
+# Printed by the probe before what it found, so whatever a startup file
+# prints itself is never read as a finding.
+SHELL_PROBE_MARKER = "<<<autoforge-shell-startup>>>"
+# What the probe runs once the shell's startup files have: the controller's
+# own interpreter, isolated (``-I``, no site), reading the environment the
+# shell exports, which is what everything it starts inherits. It prints the
+# marker, then the name of each variable of ``argv`` (a count, that many
+# name and value pairs, then names) that differs or is set; never a value.
+_PROBE_PROGRAM = (
+    "import os, sys\n"
+    "a = sys.argv[1:]\n"
+    "n = int(a[0])\n"
+    "pairs = a[1 : 1 + 2 * n]\n"
+    f"print('\\n' + {SHELL_PROBE_MARKER!r})\n"
+    "for name, value in zip(pairs[::2], pairs[1::2]):\n"
+    "    if os.environ.get(name) != value:\n"
+    "        print(name)\n"
+    "for name in a[1 + 2 * n :]:\n"
+    "    if name in os.environ:\n"
+    "        print(name)\n"
+)
+# Withheld from every launch as defence in depth rather than because a
+# route depends on them, so a startup file that sets one again is not
+# refused: git offers no agent (``IdentityAgent=none`` at command scope,
+# which the probe checks), gh asks no keyring while the placeholder token
+# stands (checked too), and ``GH_HOST`` picks a host, not a token.
+STARTUP_TOLERATED = frozenset(
+    {"GH_HOST", "SSH_AUTH_SOCK", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"}
+)
+
 
 def forbidden_env_entry(entry: str) -> tuple[str, str] | None:
     """The forbidden variable allow-list ``entry`` would pass, and its rule; None if none.
@@ -237,8 +310,28 @@ def refuse_forbidden_env(entries: Iterable[str], where: str) -> None:
         )
 
 
+def child_shell(operator: str | None = None) -> str:
+    """The ``SHELL`` a launch gets: ``operator`` (default: the controller's
+    ``SHELL``) when it is an executable named in :data:`POSIX_SHELLS` by an
+    absolute path, else the ``bash`` on ``PATH``, else ``/bin/sh``."""
+    shell = os.environ.get("SHELL", "") if operator is None else operator
+    if (
+        os.path.isabs(shell)
+        and os.path.basename(shell) in POSIX_SHELLS
+        and os.path.isfile(shell)
+        and os.access(shell, os.X_OK)
+    ):
+        return shell
+    return shutil.which("bash") or "/bin/sh"
+
+
 def child_overrides(
-    gh_config_dir: str, git_config_global: str, curl_home: str, wgetrc: str
+    gh_config_dir: str,
+    git_config_global: str,
+    curl_home: str,
+    wgetrc: str,
+    zdotdir: str,
+    shell: str,
 ) -> dict[str, str]:
     """The variables the controller sets for a child, over the allow-listed ones."""
     env = {
@@ -251,6 +344,8 @@ def child_overrides(
         "CURL_HOME": curl_home,
         "WGETRC": wgetrc,
         "WGET2RC": wgetrc,
+        "ZDOTDIR": zdotdir,
+        "SHELL": shell,
     }
     for index, (key, value) in enumerate(GIT_COMMAND_SCOPE):
         env[f"GIT_CONFIG_KEY_{index}"] = key
@@ -260,7 +355,7 @@ def child_overrides(
 
 def override_names() -> tuple[str, ...]:
     """The names :func:`child_overrides` sets, sorted (values vary by launch)."""
-    return tuple(sorted(child_overrides("", "", "", "")))
+    return tuple(sorted(child_overrides("", "", "", "", "", "")))
 
 
 @dataclass(frozen=True)
@@ -324,11 +419,12 @@ def isolated_overrides(identity: LaunchIdentity) -> Iterator[dict[str, str]]:
     """The child's overrides, backed by a directory that exists for the launch only.
 
     The directory (``mkdtemp``, mode 0700, outside every repository) holds
-    the empty gh configuration directory, the global git configuration, and
-    curl's and wget's configuration files; it is removed when the ``with``
-    block ends, whatever the child wrote into it, so nothing one launch
-    plants reaches the next. A directory that cannot be prepared is an
-    :class:`ExecutionError`, before any launch.
+    the empty gh configuration directory, the global git configuration,
+    curl's and wget's configuration files and zsh's empty startup
+    directory; it is removed when the ``with`` block ends, whatever the
+    child wrote into it, so nothing one launch plants reaches the next. A
+    directory that cannot be prepared is an :class:`ExecutionError`, before
+    any launch.
     """
     try:
         root = tempfile.mkdtemp(prefix="autoforge-child-")
@@ -345,9 +441,11 @@ def isolated_overrides(identity: LaunchIdentity) -> Iterator[dict[str, str]]:
             _write_new(os.path.join(curl_home, ".curlrc"), HTTP_CLIENT_CONFIG)
             wgetrc = os.path.join(root, "wgetrc")
             _write_new(wgetrc, HTTP_CLIENT_CONFIG)
+            zdotdir = os.path.join(root, "zsh")
+            os.mkdir(zdotdir, 0o700)
         except OSError as exc:
             raise ExecutionError(f"cannot prepare a launch's environment: {exc}") from exc
-        yield child_overrides(gh_dir, git_config, curl_home, wgetrc)
+        yield child_overrides(gh_dir, git_config, curl_home, wgetrc, zdotdir, child_shell())
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -547,17 +645,139 @@ def _netrc_names_github(text: str) -> bool:
     return False
 
 
-def preflight(cwd: str, runner: Runner | None = None, *, home: str | None = None) -> LaunchIdentity:
+def shell_probe_script(overrides: Mapping[str, str]) -> str:
+    """A POSIX command that prints :data:`SHELL_PROBE_MARKER`, then the name
+    of every variable of a launch's isolation the shell running it no longer
+    exports as the controller left it.
+
+    Run after the shell's startup files, it names each variable of
+    ``overrides`` that is unset, holds another value or is no longer
+    exported, and each forbidden name the controller withholds (but
+    :data:`STARTUP_TOLERATED`) that is now exported. Values are compared in
+    a process the shell starts and never printed.
+    """
+    pairs = sorted(overrides.items())
+    withheld = sorted(set(FORBIDDEN_ENV_NAMES) - set(overrides) - STARTUP_TOLERATED)
+    argv = [
+        sys.executable or "python3",
+        "-I",
+        "-S",
+        "-c",
+        _PROBE_PROGRAM,
+        str(len(pairs)),
+        *(part for pair in pairs for part in pair),
+        *withheld,
+    ]
+    return "exec " + shlex.join(argv) + "\n"
+
+
+def probe_findings(stdout: str, names: Iterable[str]) -> list[str] | None:
+    """The variables a probe's output names after its last marker, sorted;
+    None when the marker is missing. Only ``names`` are read."""
+    _, marker, findings = stdout.rpartition(f"\n{SHELL_PROBE_MARKER}\n")
+    if not marker:
+        return None
+    known = set(names)
+    return sorted({line for line in findings.splitlines() if line in known})
+
+
+def launch_shells(shell: str) -> list[str]:
+    """``shell`` and each of :data:`PROBED_SHELLS` on ``PATH``, once per name
+    and file (``sh`` is probed apart from the ``bash`` it may be: bash run as
+    ``sh`` reads ``~/.profile``, not ``~/.bash_profile``)."""
+    found: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for path in [shell, *filter(None, (shutil.which(name) for name in PROBED_SHELLS))]:
+        key = (os.path.basename(path), os.path.realpath(path))
+        if key not in seen:
+            seen.add(key)
+            found.append(path)
+    return found
+
+
+def shell_startup_problems(
+    cwd: str,
+    env_allowlist: Iterable[str],
+    runner: Runner | None = None,
+    *,
+    home: str | None = None,
+) -> list[str]:
+    """What the startup files of a launch's shells would change of its isolation.
+
+    Each shell of :func:`launch_shells` runs :func:`shell_probe_script` once
+    as a login shell (``-l -c``, which reads what ``-c`` reads and the login
+    files besides), in ``cwd``, in the environment a launch with
+    ``env_allowlist`` gets (``HOME`` is ``home``, default the operator's)
+    and with its processes contained. zsh reads nothing of the operator's
+    there (``ZDOTDIR``), so what it can find are the system-wide files;
+    ``bash`` and ``sh`` read ``/etc/profile`` and ``~/.bash_profile``,
+    ``~/.bash_login`` or ``~/.profile``. Each problem names the shell and
+    the variables, never a value; a shell whose probe fails, times out or
+    prints no marker could not be checked, which is a problem too.
+    """
+    problems: list[str] = []
+    home = home if home is not None else operator_home()
+    with isolated_overrides(LaunchIdentity()) as overrides:
+        env = dict(overrides)
+        if home:
+            env["HOME"] = home
+        script = shell_probe_script(overrides)
+        names = set(overrides) | set(FORBIDDEN_ENV_NAMES)
+        for shell in launch_shells(overrides["SHELL"]):
+            where = f"the startup files of a login {os.path.basename(shell)} ({shell})"
+            request = ExecutionRequest(
+                command=[shell, "-l", "-c", script],
+                cwd=cwd,
+                timeout_seconds=PREFLIGHT_TIMEOUT_SECONDS,
+                env_allowlist=tuple(env_allowlist),
+                env=env,
+                contain_orphans=True,
+            )
+            try:
+                result = (runner or execute)(request)
+            except (ExecutionError, OSError) as exc:
+                problems.append(f"{where}, which could not be checked ({type(exc).__name__})")
+                continue
+            findings = None
+            if not (result.timed_out or result.exit_code or result.stdout_truncated):
+                findings = probe_findings(result.stdout, names)
+            if findings is None:
+                reason = (
+                    f"timed out after {PREFLIGHT_TIMEOUT_SECONDS}s"
+                    if result.timed_out
+                    else f"exit {result.exit_code}"
+                    if result.exit_code
+                    else "no result"
+                )
+                problems.append(f"{where}, which could not be checked ({reason})")
+            elif findings:
+                problems.append(f"{where}, which change {', '.join(findings)}")
+    return problems
+
+
+def preflight(
+    cwd: str,
+    runner: Runner | None = None,
+    *,
+    home: str | None = None,
+    env_allowlist: Iterable[str] | None = None,
+) -> LaunchIdentity:
     """Refuse a launch in ``cwd`` that would hand the child a credential; else
     the identity to copy into its global git configuration.
 
-    Cheap (one ``git config`` and one file read) and run before anything is
-    spawned. A refusal is a :class:`ConfigurationError`: the operator fixes
-    the configuration, and nothing needs recovering.
+    Run before anything is spawned: one ``git config``, one file read and,
+    with the launch's ``env_allowlist`` (the engine and ``doctor`` always
+    pass it), one login shell per shell a launch may start
+    (:func:`shell_startup_problems`). A refusal is a
+    :class:`ConfigurationError`: the operator fixes the configuration, and
+    nothing needs recovering.
     """
     entries = read_git_config(cwd, runner)
     problems = git_config_problems(entries)
-    problems += netrc_problems(home if home is not None else operator_home())
+    home = home if home is not None else operator_home()
+    problems += netrc_problems(home)
+    if env_allowlist is not None:
+        problems += shell_startup_problems(cwd, env_allowlist, runner, home=home)
     if problems:
         raise ConfigurationError(
             "refusing to launch: a process AutoForge launches would be handed a GitHub or "
@@ -578,19 +798,28 @@ __all__ = [
     "GH_PLACEHOLDER_TOKEN",
     "GIT_COMMAND_SCOPE",
     "HTTP_CLIENT_CONFIG",
+    "POSIX_SHELLS",
+    "PROBED_SHELLS",
+    "SHELL_PROBE_MARKER",
     "SSH_COMMAND",
+    "STARTUP_TOLERATED",
     "GitConfigEntry",
     "LaunchIdentity",
     "child_overrides",
+    "child_shell",
     "forbidden_env_entry",
     "git_config_problems",
     "isolated_overrides",
+    "launch_shells",
     "netrc_problems",
     "operator_identity",
     "override_names",
     "parse_git_config_listing",
     "preflight",
+    "probe_findings",
     "read_git_config",
     "refuse_forbidden_env",
+    "shell_probe_script",
+    "shell_startup_problems",
     "url_has_credential",
 ]

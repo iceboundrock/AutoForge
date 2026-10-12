@@ -3221,7 +3221,9 @@ class ControllerEngine:
             # have changed the repository's configuration since its own
             # launch was checked, so a refusal leaves the phase unverified.
             try:
-                identity = preflight(cwd, self._runner)
+                identity = preflight(
+                    cwd, self._runner, env_allowlist=self.config.execution.environment_names()
+                )
             except ConfigurationError as exc:
                 raise VerificationError(
                     f"validation commands not run: {exc}; {phase.value} is not verified and "
@@ -5203,7 +5205,9 @@ class ControllerEngine:
         # environment, credential preflight and controller-set variables as
         # an agent (#165): they are the PR's code, not the operator's.
         try:
-            identity = preflight(cwd, self._runner)
+            identity = preflight(
+                cwd, self._runner, env_allowlist=self.config.execution.environment_names()
+            )
         except ConfigurationError as exc:
             return (
                 f"pre-merge verification command not run for the reviewed HEAD "
@@ -7915,11 +7919,14 @@ class ControllerEngine:
                 else UpdateEpicRequest.FULL
             )
             # No GitHub or git credential may reach the agent (#165): the
-            # configuration its git would read and ~/.netrc are checked, and
-            # so is an integration its CLI would load that nothing keeps off,
-            # before anything is charged or saved, so a refusal leaves state
-            # as it was, and the identity its commits carry is read here.
-            identity = preflight(cwd, self._runner)
+            # configuration its git would read, ~/.netrc and what its shells
+            # run at startup are checked, and so is an integration its CLI
+            # would load that nothing keeps off, before anything is charged
+            # or saved, so a refusal leaves state as it was, and the
+            # identity its commits carry is read here.
+            identity = preflight(
+                cwd, self._runner, env_allowlist=provider.launch_allowlist(env_allowlist)
+            )
             provider.integration_preflight(env_allowlist)
             # What the agent reads from GitHub, read by the controller (it
             # holds no credential to read it itself) and written before the

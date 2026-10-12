@@ -8,7 +8,7 @@ import pytest
 from autoforge import cli
 from autoforge.engine import ControllerEngine
 from autoforge.errors import GitHubError, LockError
-from autoforge.executor import ExecutionResult
+from autoforge.executor import ExecutionResult, execute
 from autoforge.locking import ControllerLock, repository_lock_path
 from autoforge.providers import ProviderRegistry, ScriptedProvider
 from autoforge.state import AutoForgeState, load_state, quarantine_state_file, save_state
@@ -29,6 +29,7 @@ from tests.conftest import (
     fixer,
     git_repo,
     implement,
+    is_shell_probe,
     review_result,
 )
 
@@ -919,6 +920,8 @@ def test_doctor_reports_an_unreadable_branch_rule_as_skipped(tmp_path, capsys, m
     monkeypatch.chdir(tmp_path)
 
     def runner(req):
+        if is_shell_probe(req):  # the launch preflight's shell startup probe: real shells
+            return execute(req)
         argv = req.command
         if argv[:3] == ["git", "remote", "get-url"]:
             return ExecutionResult(argv, req.cwd, 0, "git@github.com:o/r.git\n", "", "t", "t")

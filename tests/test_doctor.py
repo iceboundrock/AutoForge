@@ -5,7 +5,8 @@ import json
 import pytest
 
 from autoforge.doctor import Doctor
-from autoforge.executor import ExecutionResult
+from autoforge.executor import ExecutionResult, execute
+from tests.conftest import is_shell_probe
 
 RULES_ENDPOINT = "repos/owner/repo/rules/branches/main"
 RULESET_ENDPOINT = "repos/owner/repo/rulesets/22792049"
@@ -93,6 +94,8 @@ def _runner_factory(
     responses.update(github or {})
 
     def runner(req):
+        if is_shell_probe(req):  # the launch preflight's shell startup probe: real shells
+            return execute(req)
         argv = req.command
         if calls is not None:
             calls.append(argv)
@@ -1295,6 +1298,32 @@ def test_doctor_refuses_a_netrc_entry_for_github(tmp_path, monkeypatch, entry):
     row = {r.name: r for r in results}["no credential reaches a launch"]
     assert not row.ok and "~/.netrc" in row.detail
     assert FAKE_TOKEN not in _all_text(results)
+
+
+def test_doctor_refuses_a_login_shell_startup_file_that_exports_a_credential(tmp_path, monkeypatch):
+    """R3-F1: what a launch's login shell runs at startup is part of what
+    reaches it; doctor runs the same probe as a launch and names the shell
+    and the variable, never the value."""
+    import autoforge.child_env as child_env_module
+
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".profile").write_text(f"export GH_TOKEN={FAKE_TOKEN}\n")
+    monkeypatch.setattr(child_env_module, "operator_home", lambda: str(home))
+    results = Doctor(cwd=str(tmp_path), runner=_runner_factory()).run_all()
+    row = {r.name: r for r in results}["no credential reaches a launch"]
+    assert not row.ok and "the startup files of a login sh" in row.detail
+    assert "which change GH_TOKEN" in row.detail
+    assert FAKE_TOKEN not in _all_text(results)
+
+
+def test_doctor_names_the_shell_a_launch_gets(tmp_path):
+    from autoforge.child_env import child_shell
+
+    row = {r.name: r for r in Doctor(cwd=str(tmp_path), runner=_runner_factory()).run_all()}
+    detail = row["no credential reaches a launch"].detail
+    assert f"a launch's shell is {child_shell()}" in detail
+    assert "zsh reading none of yours" in detail
 
 
 def test_doctor_fails_an_opencode_connected_to_an_organization(tmp_path, monkeypatch):
