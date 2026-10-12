@@ -40,6 +40,8 @@ def test_claude_argv_shape():
     assert argv[argv.index("--effort") + 1] == "high"
     assert argv[argv.index("--permission-mode") + 1] == "bypassPermissions"
     assert "--no-session-persistence" in argv
+    # No MCP server of any configuration is started (#165).
+    assert "--strict-mcp-config" in argv and "--mcp-config" not in argv
     assert argv[-2:] == ["--", "do it; rm -rf /"]  # prompt is one literal element
 
 
@@ -49,6 +51,7 @@ def test_claude_text_opt_out_argv_has_no_verbose():
     argv = ClaudeCodeProvider().build_command_for(p, "do it")
     assert argv[2:4] == ["--output-format", "text"]
     assert "--verbose" not in argv
+    assert "--strict-mcp-config" in argv and "--mcp-config" not in argv
     assert argv[-2:] == ["--", "do it"]
 
 
@@ -935,6 +938,29 @@ def test_the_claude_stream_launch_contains_orphans_and_keeps_stdin_closed(tmp_pa
     # The provider's names are added once, never duplicated.
     assert duplex.env_allowlist == ("PATH", "HOME", "CLAUDE_*", "ANTHROPIC_*")
     assert duplex.command == ClaudeCodeProvider().build_command(req)
+    assert duplex.env is None
+
+
+def test_the_controller_set_environment_reaches_the_claude_stream_launch(tmp_path, monkeypatch):
+    from autoforge import providers
+    from tests import claude_fake
+
+    seen = []
+    real = providers.start_duplex
+
+    def spy(req):
+        seen.append(req)
+        return real(req)
+
+    monkeypatch.setattr(providers, "start_duplex", spy)
+    _home, profile = claude_fake.fake_claude(tmp_path, [claude_fake.result("done")])
+    env = {"GH_CONFIG_DIR": str(tmp_path / "gh"), "GIT_TERMINAL_PROMPT": "0"}
+    req = AgentRequest(
+        "FIX", "p", str(tmp_path), profile, 900, 30, env_allowlist=("PATH", "HOME"), env=env
+    )
+    assert ClaudeCodeProvider().execute(req).ok
+    (duplex,) = seen
+    assert duplex.env == env
 
 
 def test_a_progress_sink_that_raises_never_fails_the_claude_run(tmp_path):
@@ -1287,6 +1313,68 @@ def test_provider_environment_names_are_deduplicated_not_repeated():
     got = prov.environment_allowlist(req)
     assert got is not None and len(got) == len(set(got))
     assert got[:2] == ("ANTHROPIC_*", "PATH") and "OPENCODE_*" in got and "OPENAI_*" in got
+
+
+@pytest.mark.parametrize(
+    ("cls", "profile"),
+    [
+        (ClaudeCodeProvider, _text(default_config().profile("fix"))),
+        (OpenCodeProvider, default_config().profile("review_round_1")),
+    ],
+)
+def test_the_controller_set_environment_reaches_a_one_shot_launch(cls, profile):
+    seen: list = []
+    env = {"GH_CONFIG_DIR": "/nowhere/gh", "GIT_TERMINAL_PROMPT": "0"}
+    req = AgentRequest("FIX", "p", "/tmp", profile, None, 7, env_allowlist=("PATH",), env=env)
+    cls(runner=_capture_runner(seen)).execute(req)
+    [launch] = seen
+    assert launch.env == env and launch.env_allowlist[0] == "PATH"
+
+
+def test_the_controller_set_environment_reaches_pis_auth_preflight(tmp_path):
+    seen = []
+    prov = PiProvider(runner=_capture_runner(seen))
+    env = {"GH_CONFIG_DIR": str(tmp_path / "gh")}
+    req = AgentRequest(
+        "REVIEW", "p", str(tmp_path), _pi(command="pi"), None, 7, env_allowlist=("PATH",), env=env
+    )
+    prov.execute(req)
+    [check] = seen
+    assert check.env == env
+
+
+class _LeakyAdapter(ScriptedProvider):
+    """A provider-neutral test adapter whose own names include a credential
+    route (the SDK adapters of #151/#152 are held to the same check)."""
+
+    name = "leaky"
+
+
+@pytest.mark.parametrize(
+    ("names", "variable"),
+    [
+        (("GH_TOKEN",), "GH_TOKEN"),
+        (("GH_*",), "GH_TOKEN"),
+        (("SSH_AUTH_SOCK",), "SSH_AUTH_SOCK"),
+        (("GIT_*",), "GIT_ASKPASS"),
+        (("SDK_KEY", "GIT_CONFIG_KEY_0"), "GIT_CONFIG_KEY_0"),
+    ],
+)
+def test_an_adapter_whose_own_names_carry_a_credential_route_is_refused(names, variable):
+    adapter = _LeakyAdapter([])
+    adapter.environment_names = names
+    profile = ProfileConfig(name="x", provider="leaky", model="m", effort="high")
+    with pytest.raises(ConfigurationError, match=f"provider 'leaky'.*{variable}"):
+        adapter.validate_profile(profile)
+    with pytest.raises(ConfigurationError, match=variable):
+        adapter.launch_allowlist(("PATH",))
+
+
+def test_a_launch_allowlist_with_a_credential_route_is_refused_whatever_its_source():
+    # The engine's list comes through config load, which refuses it first;
+    # the adapter refuses it again for one that did not.
+    with pytest.raises(ConfigurationError, match="GITHUB_TOKEN"):
+        OpenCodeProvider().launch_allowlist(("PATH", "GITHUB_TOKEN"))
 
 
 def test_every_real_provider_declares_only_valid_environment_patterns():

@@ -366,7 +366,8 @@ redacted. What it reads depends on the command:
 - **State and logs:** `.autoforge/` in the working directory by default
   (`--state-dir` or `state_dir` in config): `state.json` plus one log
   directory per run with the redacted prompt, output, and parsed result of
-  every agent invocation. Layout:
+  every agent invocation, and `read-context/<run-id>/`, the GitHub data each
+  REMOTE launch was handed. Layout:
   [State and recovery: runtime artifacts](agent-guides/state-and-recovery.md#runtime-artifacts).
   The directory must be on a filesystem with hard links: run logs are
   published by `link(2)`, so vfat/exFAT and some FUSE, SMB/CIFS and overlay
@@ -387,19 +388,40 @@ Every REMOTE agent runs in that per-issue worktree, so its working directory
 contains neither `.autoforge/`, the lock, nor the operator's uncommitted
 work, and a `git clean -fdx` there cannot reach controller state. It starts
 from an allow-listed environment: `execution.env_allowlist` (a documented
-default of PATH, HOME, locale, temporary directory, XDG directories,
-`SSH_AUTH_SOCK`, git author and SSH settings, `GH_TOKEN` / `GITHUB_TOKEN`
-and the proxy and CA variables) plus `env_allowlist_extra`, plus the names
-the provider adapter declares for its own CLI (`ANTHROPIC_*` and `CLAUDE_*`
-for Claude Code; `OPENCODE_*`, `OPENAI_*`, `ANTHROPIC_*`, `GEMINI_*`,
-`GOOGLE_*` for OpenCode); nothing else in the operator's environment is
-inherited, and the names (never the values) are recorded in the invocation's
-`request.json`. Before and after each invocation, including before every
+default of PATH, HOME, locale, temporary directory, XDG directories, git
+author settings and the proxy and CA variables) plus `env_allowlist_extra`,
+plus the names the provider adapter declares for its own CLI (`ANTHROPIC_*`
+and `CLAUDE_*` for Claude Code; `OPENCODE_*`, `OPENAI_*`, `ANTHROPIC_*`,
+`GEMINI_*`, `GOOGLE_*` for OpenCode); nothing else in the operator's
+environment is inherited, and the names (never the values) are recorded in
+the invocation's `request.json`, with the names the controller sets
+(`env_set`). Before and after each invocation, including before every
 relaunch within a step, the controller reads HEAD and the checked-out branch
 of its own checkout; a change enters `BLOCKED` with the drift in the reason,
 nothing is rolled back, and `unblock` reconciles the agent's GitHub work. This is process and filesystem-level
 separation, not a sandbox: the agent still runs as the operator with network
-access and the allow-listed credentials.
+access.
+
+The agent holds no GitHub or git credential (#165). The controller pushes,
+opens the PR, posts the review comment, creates follow-up issues and
+updates the EPIC itself; the agent writes the text and commits locally. No
+credential variable can be allow-listed, and each launch gets an empty `gh`
+configuration, a placeholder `GH_TOKEN`, a git configuration holding only
+your author identity, and git settings no repository configuration can
+override that disable credential helpers, askpass and the SSH agent and
+keys ([Configuration: agent environment](configuration.md#agent-environment)).
+What the agent needs from GitHub (the issue, the PR and its checks, the
+review comment it acts on, the EPIC) the controller reads first and writes,
+redacted and bounded, into `<state dir>/read-context/<run-id>/`; the prompt
+names that directory. Before every launch the controller refuses to start
+when a setting would still hand over a credential (a credential helper in
+the repository's git configuration, a token in a remote URL, a GitHub entry
+in `~/.netrc`), naming the setting, never its value; the run is left
+untouched, so remove the setting and run the same command again.
+`autoforge doctor` runs the same check. What this does not stop (a
+deliberate read of `~/.config/gh/hosts.yml` by absolute path, for one) is
+in [GitHub safety](agent-guides/github-safety.md#threat-model); ADR 0005's
+outer sandbox is the answer to it.
 
 AutoForge never commits to the default branch, never deletes a worktree it
 created, and never creates or cleans up local branches or any other
@@ -428,6 +450,14 @@ ownership or discard uncommitted user changes.
   [Agent limits](#agent-limits) before raising one.
 - **The run is `BLOCKED`:** read `autoforge status`, fix the cause, then
   `autoforge unblock --reason "..."` and `autoforge resume` (see above).
+- **"refusing to launch: a process AutoForge launches would be handed a
+  GitHub or git credential":** the message names the setting (for example
+  a credential helper in the repository's git configuration, a remote URL
+  with a token, or a GitHub entry in `~/.netrc`). Nothing was recorded:
+  remove the setting (`autoforge doctor` lists it too) and run the same
+  command again. A config that fails to load because `env_allowlist` names
+  a credential variable: delete that entry
+  ([Configuration: agent environment](configuration.md#agent-environment)).
 - **Merge verification keeps saying "inconclusive":** checks still running,
   mergeability unknown or a transient GitHub failure; re-run
   `autoforge resume --allow-merge`. After `merge.max_verification_attempts`

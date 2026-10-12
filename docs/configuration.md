@@ -121,7 +121,7 @@ directory if it is missing and a probe file it creates and removes there.
 | Section | What it controls | Where the behaviour is specified |
 |---|---|---|
 | top level | `version`, `state_dir` (default `.autoforge`), `prompt_version` | [State and recovery](agent-guides/state-and-recovery.md) |
-| `execution` | the default agent limits (`default_idle_timeout_seconds` 900, `default_max_runtime_seconds` unset), loop detection (`loop_detection`, mode `kill`; unset, `warn` on Pi and in `UPDATE_EPIC`), the wall-clock bound on controller-run commands (`command_timeout_seconds` 1800), `max_correction_attempts` (default 1), the agent environment allow-list (`env_allowlist`, `env_allowlist_extra`), the per-issue agent worktree location (`worktree_dir`) | [Architecture](agent-guides/architecture.md), [Running the remote workflow](usage.md) |
+| `execution` | the default agent limits (`default_idle_timeout_seconds` 900, `default_max_runtime_seconds` unset), loop detection (`loop_detection`, mode `kill`; unset, `warn` on Pi and in `UPDATE_EPIC`), the wall-clock bound on controller-run commands (`command_timeout_seconds` 1800), `max_correction_attempts` (default 1), the agent environment allow-list (`env_allowlist`, `env_allowlist_extra`; a GitHub or git credential route is refused, see [Agent environment](#agent-environment)), the per-issue agent worktree location (`worktree_dir`) | [Architecture](agent-guides/architecture.md), [Running the remote workflow](usage.md) |
 | `safety` | the merge gate (`allow_merge`, default `false`), `protected_merge_paths` (default `.github/workflows/`), `required_checks` (default `ci`), `verify_check_definition` (default `true`) | [GitHub safety](agent-guides/github-safety.md#merge-safety) |
 | `merge` | how the controller merges once the gate is open: `method` (default `squash`), `delete_branch`, `max_verification_attempts` (default 5), `verification_commands` (argv lists, empty by default) | [GitHub safety](agent-guides/github-safety.md#merge-safety) |
 | `workflow` | loop bounds: `max_review_rounds` (20), `stagnation_identical_rounds` (2), `stagnation_unchanged_count_rounds` (3), `max_total_steps` (300); `epic_update_every` (1) | [Workflow](agent-guides/workflow.md#loop-bounds) |
@@ -490,6 +490,70 @@ above the checkout. With the default `execution.worktree_dir` that includes
 the operator's own checkout. Pi has no approval layer: run unattended Pi
 phases in a container, a VM or under a dedicated user
 ([Pi policy](pi-policy.md) §7).
+
+## Agent environment
+
+Agents, LOCAL `local.validation_commands` and `merge.verification_commands`
+get no GitHub or git credential (#165): the controller makes every GitHub
+write itself and hands each agent the GitHub data its phase needs as files.
+Each launch's environment is the allow-list in force
+(`execution.env_allowlist` plus `execution.env_allowlist_extra`, plus the
+names a provider adapter adds), with the variables below set on top.
+
+**Names that cannot be allow-listed.** Config load fails, naming the entry
+and the rule and never a value, when either key, or a provider adapter's own
+names, holds one of these or a `*` prefix that covers one (a bare `*`
+included):
+
+| Names | Rule |
+|---|---|
+| `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`, `GH_HOST`, `GH_CONFIG_DIR` | a `gh` token or the location of `gh`'s credentials |
+| `GIT_ASKPASS`, `SSH_ASKPASS`, `GIT_SSH`, `GIT_SSH_COMMAND` | a program git or ssh runs to get a credential or connect |
+| `SSH_AUTH_SOCK` | the SSH agent |
+| `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `GIT_CONFIG_COUNT`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_KEY_*`, `GIT_CONFIG_VALUE_*` | git configuration from the environment, which can name a credential helper |
+| `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS` | the session bus a desktop keyring answers on |
+
+Earlier versions forwarded `XDG_RUNTIME_DIR`, `SSH_AUTH_SOCK`, `GIT_SSH`,
+`GIT_SSH_COMMAND`, `GIT_CONFIG_GLOBAL`, `GH_TOKEN`, `GITHUB_TOKEN`,
+`GH_HOST` and `GH_CONFIG_DIR` by default. A config that copied the old
+default list into `execution.env_allowlist` now fails to load: delete those
+entries (or the whole key, to take the new default).
+
+**Variables the controller sets** for each launch, from a private directory
+it removes when the launch ends:
+
+| Variable | Value | Effect |
+|---|---|---|
+| `GH_CONFIG_DIR` | an empty directory | `gh` finds no `hosts.yml` |
+| `GH_TOKEN`, `GH_ENTERPRISE_TOKEN` | `autoforge-no-github-credential` | `gh` uses this (refused by GitHub) and never asks the keyring |
+| `GIT_CONFIG_GLOBAL` | a file holding only your `user.*`, `author.*` and `committer.*` settings | the agent's commits carry your identity; `~/.gitconfig` and `$XDG_CONFIG_HOME/git/config` are not read |
+| `GIT_TERMINAL_PROMPT` | `0` | git never prompts for a credential |
+| `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_n`, `GIT_CONFIG_VALUE_n` | `credential.helper=`, `core.askPass=`, `http.extraHeader=`, `core.sshCommand=ssh -F /dev/null -o IdentityFile=none -o IdentitiesOnly=yes -o IdentityAgent=none -o ControlPath=none -o BatchMode=yes` | no credential helper, askpass, extra header, SSH agent or SSH key, whatever any git configuration file says |
+
+`GIT_AUTHOR_*` and `GIT_COMMITTER_*` stay in the default allow-list and
+still take precedence over the identity file.
+
+**A preflight before every launch.** The controller refuses to launch an
+agent or run a command when it would still be handed a credential through
+something the variables above cannot override, and names the setting
+without its value: a credential helper in the repository's or a worktree's
+git configuration; a remote URL (or a `url.<base>.insteadOf` base) with a
+user name or token in it; an `http.extraHeader` in system, repository or
+worktree configuration; an entry for GitHub, or a `default` entry, in
+`~/.netrc`. For an agent the run stops before anything is recorded, so it
+can simply be run again once the setting is removed; for a validation or
+pre-merge command it counts as that command failing. `autoforge doctor` and
+`autoforge local doctor` run the same check (row "no credential reaches a
+launch") and list the launch environment by name (row "launch
+environment"), never a value.
+
+**What an agent no longer gets.** Your global git configuration beyond the
+identity: no commit signing (agent commits are unsigned), no global Git LFS
+filter, no aliases, no `core.excludesFile`. `gh` and `git push` fail for
+lack of a credential, which is expected: the controller performs every
+GitHub write. Tools that need `XDG_RUNTIME_DIR` (a session bus, a Wayland
+socket) do not get it. The guarantees and what they do not cover are in
+[GitHub safety](agent-guides/github-safety.md#agents-hold-no-github-credential).
 
 ## Local mode configuration
 

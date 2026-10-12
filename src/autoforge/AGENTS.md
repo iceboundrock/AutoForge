@@ -34,8 +34,16 @@ executor.py         subprocess lifecycle, timeouts, a caller's stop, capture, op
 executor_duplex.py  duplex child handle for RPC transports: stdin records out, LF-framed
                     stdout records in, idle timeout and max runtime, ADR 0002 teardown;
                     bytes only (#130, #193)
-github.py           GitHubClient over `gh`: verification reads, typed controller writes
-                    (never retried on an ambiguous outcome) + controller-owned merge
+github.py           GitHubClient over `gh`, the only holder of a GitHub credential:
+                    verification reads, the reads behind an agent's read context, typed
+                    controller writes (never retried on an ambiguous outcome) +
+                    controller-owned merge
+child_env.py        what every agent and repository-command launch gets instead of a
+                    credential: forbidden env names, per-launch overrides (empty gh
+                    config, identity-only git config, command-scope resets), the
+                    preflight; provider-neutral, no flags (#165)
+read_context.py     an agent's GitHub read context: rendering, redaction and bounds,
+                    no I/O; the engine collects and writes it (ADR 0004 D10, #165)
 effects.py          ADR 0004 effect records: kinds, stages, attempt bound, drive/reconcile,
                     entry observation, UPDATE_EPIC completion context (#160)
 effect_ops.py       per-kind effect operations: identity read, precondition, write (#160)
@@ -92,9 +100,10 @@ engine.py (phase sequencing, resume)             -> docs/agent-guides/workflow.m
 replan_txn.py, engine.py (REPLAN_REEXECUTE),
 prompts/replan_reexecute.md                       -> docs/agent-guides/replan-transaction.md (+ workflow.md)
 github.py, claims.py, validation.py, premerge.py,
-effect_ops.py, git_transport.py,
-engine.py (post-phase verification, merge gate,
-dry-run), prompts/update_epic*.md                 -> docs/agent-guides/github-safety.md
+effect_ops.py, git_transport.py, child_env.py,
+read_context.py, engine.py (post-phase
+verification, merge gate, dry-run, read context),
+prompts/update_epic*.md                           -> docs/agent-guides/github-safety.md
                                                      (+ docs/adr/0004-authority-boundary-and-
                                                      typed-external-effects.md for effects)
 state.py, effects.py, run_contract.py, safefs.py,
@@ -107,5 +116,6 @@ prompts/__init__.py                               -> docs/agent-guides/architect
                                                      (+ docs/adr/0003-pi-agent-provider.md and
                                                      docs/pi-policy.md for Pi)
 result_parser.py, prompts/*.md                    -> docs/agent-guides/control-result-protocol.md
-redaction.py, runlog.py, error messages           -> docs/agent-guides/secrets-and-logging.md
+redaction.py, runlog.py, doctor.py (env rows),
+error messages                                    -> docs/agent-guides/secrets-and-logging.md
 ```

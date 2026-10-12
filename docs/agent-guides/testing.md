@@ -194,6 +194,54 @@ High-priority coverage includes:
   a result to correct is neither reconciled nor relaunched); agent commits
   in its own worktree are not drift
 
+### No GitHub credential in a launch (#165)
+
+Each route in the inventory of
+[github-safety.md](github-safety.md#credential-routes) has its test there or
+a stated reason it has none. The coverage that must keep working:
+
+- config load refuses every forbidden name and every `*` prefix covering
+  one, in `env_allowlist` and `env_allowlist_extra`, naming the entry and
+  the rule and never a value; an adapter's `environment_names` and its
+  launch allow-list are refused the same way; the default list carries no
+  forbidden name (`test_config.py`, `test_child_env.py`,
+  `test_providers.py`)
+- with an operator environment that holds every route (tokens, `gh`
+  configuration, a session bus, an SSH agent, askpass, git configuration
+  from the environment, a global helper), a child gets none of them and
+  every controller-set variable; PATH-injected fake `gh`, `ssh`, `curl` and
+  a credential helper show that an agent finds no route the controller's
+  own process finds, through a repository- or worktree-scope helper and
+  askpass too, and that the controller's `GitHubClient` keeps its
+  credential (`test_child_env.py`)
+- the preflight refuses a repository or worktree helper (also through an
+  include), a credential in a remote URL or an `insteadOf` base, an
+  `http.extraHeader`, a GitHub or `default` netrc entry, and git
+  configuration or output it cannot read; it accepts a global helper the
+  child never reads; its message names no value
+- an agent preflight refusal leaves the state file byte for byte; a
+  validation-command refusal leaves the phase unverified; a pre-merge
+  refusal blocks the merge (`test_engine.py`, `test_local.py`)
+- every launch of a full REMOTE lifecycle, for scripted providers and for
+  an all-Pi run (the RPC child and its auth preflight), runs with the
+  isolation in force and its phase's read context; a LOCAL run's launches
+  get the same isolation and no read context (`test_integration.py`,
+  `test_local.py`)
+- a write through a credential that slipped through anyway is not
+  journaled and blocks (`test_engine.py`)
+- `doctor` refuses a token-bearing origin without printing it, refuses
+  the configuration routes and a netrc entry, lists the launch environment
+  by name only, gives Pi's probes the same overrides, and `local doctor`
+  keeps the environment rows with zero `gh` calls (`test_doctor.py`)
+- Claude Code launches with `--strict-mcp-config`; every adapter passes
+  `AgentRequest.env` to the executor (`test_providers.py`)
+- the read context: redacted, bounded with explicit omission markers,
+  project text fenced so it cannot close its fence; an unreadable item is a
+  file that names the error type and the launch proceeds; a dry run writes
+  none and shows a placeholder (`test_read_context.py`, `test_engine.py`)
+- no REMOTE prompt template tells the agent to read GitHub with `gh`, and
+  each names the read-context files its phase gets (`test_prompts.py`)
+
 ### GitHub verification
 
 - valid PR

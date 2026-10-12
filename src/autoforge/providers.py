@@ -10,7 +10,7 @@ Claude Code (``claude 2.1.x``; the stream run against 2.1.291 to 2.1.293)::
 
     claude -p --output-format stream-json --verbose --model <alias|id>
            --effort <low|medium|high|xhigh|max> --permission-mode <mode>
-           --no-session-persistence [extra_args] -- <prompt>
+           --no-session-persistence --strict-mcp-config [extra_args] -- <prompt>
 
   * ``-p/--print`` = non-interactive. With ``stream-json`` (the default,
     #192) stdout is one JSON record per line while the agent runs
@@ -32,8 +32,13 @@ Claude Code (``claude 2.1.x``; the stream run against 2.1.291 to 2.1.293)::
     printed once, at exit, and the run reports no progress and no activity
     while it runs.
   * ``--permission-mode bypassPermissions`` is required for unattended
-    edits / git / gh calls; ``--permission-prompts none`` would silently
+    edits and local git; ``--permission-prompts none`` would silently
     deny anything that prompts. Configure via profile ``options``.
+  * ``--strict-mcp-config`` with no ``--mcp-config``: no MCP server of the
+    user's, the project's or a plugin's configuration is started, so none
+    can hand the agent a GitHub token of its own (#165). Hooks and the
+    other plugin parts still load; they run as the agent, in its
+    environment.
   * exit code 0 on success; 1 on model/auth errors (message on stdout).
 
 OpenCode (``opencode 2.0.x``, #186; run against 2.0.23)::
@@ -85,6 +90,10 @@ OpenCode (``opencode 2.0.x``, #186; run against 2.0.23)::
   * ``opencode --version`` prints ``opencode v2.0.23``; 1.x printed the
     bare version and rejects this argv, so ``autoforge doctor`` requires
     :data:`OPENCODE_MIN_VERSION`.
+  * no flag disables the MCP servers or plugins of the user's or the
+    project's ``opencode.json`` (2.0.26 has neither ``--pure`` nor an MCP
+    switch); the residual is recorded in docs/agent-guides/github-safety.md
+    ("Threat model").
 
 Pi (``pi 1.0.x``, ADR 0003; read from the v1.0.0 source and docs, not yet
 run against an installed Pi)::
@@ -115,7 +124,10 @@ wall-clock ceiling (:class:`AgentRequest`; #193), and an allow-listed
 environment (see executor.py): the engine passes the configured allow-list
 in :attr:`AgentRequest.env_allowlist` and each adapter adds the variables
 its own CLI reads (:attr:`AgentProvider.environment_names`), so the key of
-one provider is never handed to another.
+one provider is never handed to another. Neither list may name a GitHub or
+git credential route (:func:`autoforge.child_env.refuse_forbidden_env`),
+and the variables the controller sets for the launch
+(:attr:`AgentRequest.env`, #165) reach every process the adapter starts.
 
 Every adapter runs a :class:`~autoforge.loop_detect.LoopMonitor` under
 :attr:`AgentRequest.loop_detection` (#194): Claude's stream and Pi's events
@@ -137,6 +149,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from .child_env import refuse_forbidden_env
 from .claude_stream import ClaudeStream
 from .config import LoopDetectionConfig, ProfileConfig
 from .errors import (
@@ -192,6 +205,13 @@ class AgentRequest:
     # plus ``env_allowlist_extra``); the provider adds its own names. ``None``
     # inherits the whole environment and is never what the engine sends.
     env_allowlist: tuple[str, ...] | None = None
+    # What the controller sets over the allow-listed environment for this
+    # launch (#165, :func:`autoforge.child_env.isolated_overrides`): an empty
+    # gh configuration, a placeholder token, the git configuration that
+    # disables every credential route, the author identity. Every adapter
+    # passes it to every process it starts for the launch, a preflight
+    # included; ``None`` sets nothing.
+    env: dict[str, str] | None = None
     # Where the adapter reports live progress (#192): provider-neutral,
     # already bounded and redacted events, never a raw provider record.
     # ``None`` reports nothing. A sink that raises is dropped for the rest of
@@ -437,8 +457,11 @@ class AgentProvider:
     def validate_profile(self, profile: ProfileConfig) -> None:
         """Raise ConfigurationError for values this CLI cannot accept.
 
-        An override calls this first: it checks the ``options`` keys.
+        An override calls this first: it refuses an environment name that
+        would hand the CLI a GitHub or git credential (#165) and checks the
+        ``options`` keys.
         """
+        refuse_forbidden_env(self.environment_names, f"provider {self.name!r}")
         if self.option_keys is None:
             return
         unknown = sorted(set(profile.options) - set(self.option_keys))
@@ -453,8 +476,15 @@ class AgentProvider:
         return self.build_command_for(req.profile, req.prompt)
 
     def launch_allowlist(self, base: tuple[str, ...]) -> tuple[str, ...]:
-        """``base`` (the configured allow-list) plus this provider's own names."""
-        return tuple(dict.fromkeys([*base, *self.environment_names]))
+        """``base`` (the configured allow-list) plus this provider's own names.
+
+        Neither may name a GitHub or git credential route (#165): config load
+        and :meth:`validate_profile` refuse one first, and this refuses it
+        again for an allow-list that did not come through either.
+        """
+        names = tuple(dict.fromkeys([*base, *self.environment_names]))
+        refuse_forbidden_env(names, f"the {self.name} launch allow-list")
+        return names
 
     def environment_allowlist(self, req: AgentRequest) -> tuple[str, ...] | None:
         """The allow-list the CLI is launched with: the request's plus this provider's."""
@@ -480,6 +510,7 @@ class AgentProvider:
                 timeout_seconds=req.max_runtime_seconds or MAX_DEADLINE_SECONDS,
                 idle_timeout_seconds=req.idle_timeout_seconds,
                 env_allowlist=self.environment_allowlist(req),
+                env=req.env,
                 # Nothing an agent starts outlives its invocation (ADR 0002),
                 # including what it detached from its process group.
                 contain_orphans=True,
@@ -574,6 +605,9 @@ class ClaudeCodeProvider(AgentProvider):
             argv += ["--permission-mode", mode]
         if _truthy(profile.options.get("session_persistence"), default=False) is False:
             argv.append("--no-session-persistence")
+        # No MCP server of the operator's or the repository's configuration
+        # is started (#165): one may hold a GitHub token of its own.
+        argv.append("--strict-mcp-config")
         argv += list(profile.extra_args)
         # ``--`` guarantees the prompt is never parsed as an option.
         argv += ["--", prompt]
@@ -606,6 +640,7 @@ class ClaudeCodeProvider(AgentProvider):
             command=self.build_command(req),
             cwd=req.cwd,
             env_allowlist=self.environment_allowlist(req),
+            env=req.env,
             idle_timeout_seconds=req.idle_timeout_seconds,
             max_runtime_seconds=req.max_runtime_seconds,
             max_record_bytes=CLAUDE_MAX_RECORD_BYTES,
@@ -1080,6 +1115,7 @@ class PiProvider(AgentProvider):
             command=self.build_command(req),
             cwd=req.cwd,
             env_allowlist=allowlist,
+            env=req.env,
             idle_timeout_seconds=req.idle_timeout_seconds,
             max_runtime_seconds=req.max_runtime_seconds,
             # The abort comes after a limit, so the kill waits for it.
@@ -1189,6 +1225,7 @@ class PiProvider(AgentProvider):
                 timeout_seconds=PI_AUTH_CHECK_SECONDS,
                 max_output_bytes=PI_AUTH_CHECK_MAX_OUTPUT_BYTES,
                 env_allowlist=allowlist,
+                env=req.env,
                 contain_orphans=True,
             )
         )

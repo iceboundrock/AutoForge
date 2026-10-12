@@ -42,6 +42,28 @@ must keep it, or raise it together with those bounds and their tests.
 
 Do not log the entire process environment.
 
+## Launch environment and credential checks (#165)
+
+What #165 adds reports names, never values:
+
+- a refused allow-list entry (`refuse_forbidden_env`, at config load and in
+  an adapter's `environment_names`) names the entry and the rule, and the
+  config value it came from is a name, not a secret;
+- the launch preflight names the scope and the key's shape
+  (`remote.<name>.url`, `credential.<url>.helper`, `~/.netrc`), never the
+  value, the URL or the netrc line, so a token in a remote URL never reaches
+  the error, `BLOCKED` reason or log;
+- `doctor`'s "launch environment" row lists variable names only (allowed,
+  set by the controller, withheld from the current shell); the
+  "GitHub remote" row redacts the URL it quotes;
+- each invocation's `request.json` records the names the controller set
+  (`env_set`), never their values; the placeholder token and the temporary
+  directory paths are not logged;
+- the read context (`<state dir>/read-context/`) is project data the
+  controller wrote for an agent: every text in it went through `redact`
+  before its bounds were applied, and an unreadable item names only the
+  error's type, never the `gh` output.
+
 ## What is redacted before it is persisted
 
 `state.json` is stored in the clear, so the engine redacts at the writer,

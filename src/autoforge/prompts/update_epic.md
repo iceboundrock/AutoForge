@@ -43,7 +43,9 @@ roadmap section into the EPIC body, and verifies your selection.
    CONTROL_RESULT as `roadmap_section`. Do NOT include the marker lines;
    the controller writes them. Do NOT include any `<!-- ai-...` marker.
 3. Pick the next open issue in the EPIC. If none remains, return
-   `"next_issue_url": null`.
+   `"next_issue_url": null`. The EPIC's body is `epic.md` of the read
+   context, and `epic-issues.md` lists the state and title of each issue
+   it references, as the controller read them for this launch.
 
 ## You make no GitHub write
 
@@ -98,7 +100,8 @@ issues and rejects it unless ALL of these hold:
 - it is neither the EPIC ({{EPIC_URL}}) nor the just-finished issue
   ({{ISSUE_URL}}).
 
-Verify these with `gh issue view <url> --json url,state` before answering.
+Check these against `epic-issues.md` of the read context before answering;
+the controller reads the issue again itself.
 
 ## CONTROL_RESULT schema (exact)
 

@@ -128,14 +128,26 @@ Each line is a summary; the linked document is the precise statement.
   than hidden
   ([ADR 0002](docs/adr/0002-executor-nothing-outlives-the-invocation.md)).
   The agent still runs as the operator, with network access and the
-  allow-listed credentials.
+  allow-listed provider credentials.
   ([Usage](docs/usage.md#how-agents-are-separated-from-your-checkout))
+- **Agents hold no GitHub credential.** The controller makes every GitHub
+  write itself; agents, validation commands and pre-merge commands get no
+  GitHub or git credential through anything AutoForge controls: no token
+  variable can be allow-listed, `gh` finds no login, credential helpers,
+  askpass and the SSH agent and keys are switched off where repository
+  configuration cannot switch them back on, and a launch is refused (by
+  `doctor` too) while a repository setting or `~/.netrc` would still hand
+  one over. The agent reads the GitHub data its phase needs from files the
+  controller wrote, redacted and bounded. A deliberate same-user read of a
+  credential file by absolute path is outside this guarantee.
+  ([GitHub safety](docs/agent-guides/github-safety.md#agents-hold-no-github-credential))
 - **The controller's local run is GitHub-free by construction, not by
   convention.** Local mode needs no GitHub: a local run never constructs the
   GitHub client, so no authentication is needed and none is consulted. The
-  agent is outside that construction: it is asked not to touch GitHub, and
-  only a moved git anchor (a commit, reset, checkout or branch switch) is
-  detected; a `gh` write or a push from the agent is not
+  agent is outside that construction: it is asked not to touch GitHub and
+  gets no GitHub credential (as above), and only a moved git anchor (a
+  commit, reset, checkout or branch switch) is detected;
+  a `gh` write or a push from the agent is not
   (see [Local mode](#local-mode-no-github)).
 - **Logs and CLI output are redacted.** Tokens, API keys and authorization
   headers are masked (a baseline, with no claim of completeness), and no
@@ -244,8 +256,11 @@ local prompts.
 
 That is a property of the controller, not of the agents it launches. An agent
 is a same-UID subprocess with `gh` on `PATH` and network access; it is
-instructed not to use them, and the controller can neither prevent nor detect
-a `gh` write, a `git push` or a network request made by the agent. What the
+instructed not to use them, and it gets no GitHub or git credential through
+anything AutoForge controls, so a `gh` write or a push fails unless the agent
+finds a credential on its own (by reading the operator's files by absolute
+path, say). Beyond that, the controller can neither prevent nor detect a
+`gh` write, a `git push` or a network request made by the agent. What the
 controller *does* detect is a moved git anchor: HEAD and the checked-out branch
 are compared with the values the run was pinned to before and after every
 phase, so a commit, reset, checkout or branch switch blocks the run. It detects

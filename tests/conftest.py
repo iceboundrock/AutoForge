@@ -1530,6 +1530,20 @@ def _no_network_git_remote(monkeypatch):
     monkeypatch.setattr(engine_module, "GitTransport", OfflineAware)
 
 
+@pytest.fixture(autouse=True)
+def _no_operator_netrc(monkeypatch, tmp_path_factory):
+    """The launch preflight (#165) reads an empty home, not the developer's.
+
+    ``~/.netrc`` with a GitHub entry refuses every launch, so a test run must
+    not depend on whether the machine running it has one. A test of the
+    netrc refusal points ``operator_home`` at a home of its own.
+    """
+    import autoforge.child_env as child_env_module
+
+    home = tmp_path_factory.mktemp("operator-home")
+    monkeypatch.setattr(child_env_module, "operator_home", lambda: str(home))
+
+
 @pytest.fixture
 def offline_fetches() -> list[list[str]]:
     """The fetches of this test's engines that have no origin, in order."""
@@ -1692,3 +1706,94 @@ def make_local_engine(
         eng.new_local_run(feature, allow_dirty=allow_dirty)
     eng.provider = provider  # type: ignore[attr-defined]
     return eng
+
+
+# -- what a launched process sees (#165) ----------------------------------------
+
+# A command that records, from inside the child, what the controller handed
+# it: the names of its environment (never a value) and whether the gh
+# configuration and token are the controller's.
+_ENV_PROBE = (
+    "import json, os, sys; "
+    "d = os.environ.get('GH_CONFIG_DIR', ''); "
+    "open(sys.argv[1], 'a').write(json.dumps({'names': sorted(os.environ), "
+    "'gh_token_placeholder': os.environ.get('GH_TOKEN') == 'autoforge-no-github-credential', "
+    "'gh_config_dir_empty': bool(d) and os.path.isdir(d) and not os.listdir(d), "
+    "'git_terminal_prompt': os.environ.get('GIT_TERMINAL_PROMPT')}) + chr(10))"
+)
+
+
+def env_probe_command(record: Path) -> list[str]:
+    """A validation or verification command that appends what it saw to ``record``."""
+    return [sys.executable, "-c", _ENV_PROBE, str(record)]
+
+
+def env_probe_records(record: Path) -> list[dict]:
+    return [json.loads(line) for line in record.read_text().splitlines() if line]
+
+
+def pollute_operator_environment(monkeypatch, tmp_path: Path) -> None:
+    """Every GitHub or git credential route an operator's shell may hold, with fake values."""
+    token = "ghp_" + "E" * 36
+    for name in ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"):
+        monkeypatch.setenv(name, token)
+    monkeypatch.setenv("GH_HOST", "github.com")
+    monkeypatch.setenv("GH_CONFIG_DIR", str(tmp_path / "operator-gh"))
+    monkeypatch.setenv("SSH_AUTH_SOCK", str(tmp_path / "agent.sock"))
+    monkeypatch.setenv("GIT_ASKPASS", "/bin/false")
+    monkeypatch.setenv("SSH_ASKPASS", "/bin/false")
+    monkeypatch.setenv("GIT_SSH_COMMAND", "ssh -i /operator/key")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", f"unix:path={tmp_path / 'bus'}")
+
+
+def assert_isolated_names(names) -> None:
+    """``names`` (a child's environment) hold no credential route of the
+    operator's: every forbidden name present is one the controller sets."""
+    from autoforge.child_env import forbidden_env_entry, override_names
+
+    held = {name for name in names if forbidden_env_entry(name)}
+    assert held == {name for name in override_names() if forbidden_env_entry(name)}, held
+    for name in ("GITHUB_TOKEN", "GH_HOST", "SSH_AUTH_SOCK", "GIT_ASKPASS", "XDG_RUNTIME_DIR"):
+        assert name not in names, name
+
+
+def launch_environment(eng, req) -> dict[str, str]:
+    """What the executor hands the CLI of ``req``: allow-list plus the controller's overrides."""
+    from autoforge.executor import select_environment
+
+    provider = eng.providers.get(req.profile)
+    env = select_environment(provider.environment_allowlist(req))
+    env.update(req.env or {})
+    return env
+
+
+def assert_isolated_launch(eng, req) -> None:
+    """Called from a scripted agent while it runs: the launch carries no
+    credential route, and the controller's gh and git configuration exist."""
+    from autoforge.child_env import GH_PLACEHOLDER_TOKEN
+
+    env = launch_environment(eng, req)
+    assert_isolated_names(env)
+    assert env["GH_TOKEN"] == env["GH_ENTERPRISE_TOKEN"] == GH_PLACEHOLDER_TOKEN
+    gh_dir = Path(env["GH_CONFIG_DIR"])
+    assert gh_dir.is_dir() and list(gh_dir.iterdir()) == []
+    assert Path(env["GIT_CONFIG_GLOBAL"]).is_file()
+    helpers = subprocess.run(
+        ["git", "config", "--get-all", "credential.helper"],
+        cwd=req.cwd,
+        env=env,
+        capture_output=True,
+        text=True,
+    ).stdout.split("\n")[:-1]
+    assert helpers[-1:] == [""], helpers
+
+
+_READ_CONTEXT_RE = re.compile(r"outside your worktree:\n\n`([^`]+)`")
+
+
+def read_context_of(prompt: str) -> Path:
+    """The read-context directory a REMOTE prompt names (#165)."""
+    match = _READ_CONTEXT_RE.search(prompt)
+    assert match, "the prompt names no read context"
+    return Path(match.group(1))

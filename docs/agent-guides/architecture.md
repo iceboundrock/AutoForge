@@ -186,6 +186,18 @@ allowed is policy: the engine reads it from `execution.env_allowlist` (plus
 `env_allowlist_extra`) and applies it to every agent launch,
 `merge.verification_commands` entry and `local.validation_commands` entry;
 the controller's own `git` / `gh` plumbing inherits the full environment.
+A request's `env` mapping is layered over the selected variables; the
+executor sets it without interpreting it. What goes into it is
+`child_env.py` (#165), provider-neutral and called by the engine for all
+three kinds of launch: the names no allow-list may carry (refused at
+config load and in an adapter's `environment_names`), the per-launch
+variables that leave a child no GitHub or git credential (an empty `gh`
+configuration, a placeholder token, an identity-only global git
+configuration, git command-scope resets), and the preflight that refuses a
+launch a repository setting would still hand a credential. Provider
+adapters pass `AgentRequest.env` through to the executor (Pi's auth
+preflight included) and keep only their own integration flags, such as
+Claude Code's `--strict-mcp-config`; `doctor` calls the same module.
 The engine also owns *where* an agent runs: in REMOTE mode a per-issue
 `git worktree` it creates under `<git common dir>/autoforge/worktrees/<n>`
 (or `execution.worktree_dir`) at the first launch and never deletes, and it
@@ -370,6 +382,13 @@ Centralize GitHub integration behind a `GitHubClient` or equivalent abstraction.
 
 Prefer typed return values rather than passing raw `gh --json` dictionaries throughout business logic.
 
+The client is the only holder of a GitHub credential: everything else
+AutoForge starts has none (#165). It is also the agent's only read path:
+before a REMOTE launch the engine reads, through the client, what the
+phase's prompt names and writes it into a per-launch read-context
+directory; `read_context.py` renders and bounds those files with no I/O
+(ADR 0004 D10, [GitHub safety](github-safety.md#the-agent-read-path)).
+
 The client's verification reads keep their transient retry. Its typed effect
 writes (ADR 0004: `create_issue_comment`, `create_pr_comment`,
 `create_pull_request`, `write_pr_body`, `create_issue`, `write_issue_body`)
@@ -418,6 +437,8 @@ templates must produce is in
 The trust boundary is part of every prompt: `prompts/common.md` declares
 GitHub issues/PRs/comments, source, tests, and logs untrusted data, and
 controller instructions and the repository's `AGENTS.md`/`CLAUDE.md` outrank
-them. LOCAL mode uses `local_common.md` and the `local_*` phase templates, which
+them. It also tells the agent it holds no GitHub credential and names the
+read-context directory (`{{READ_CONTEXT_DIR}}`) that replaces `gh` reads;
+the phase templates name the files in it. LOCAL mode uses `local_common.md` and the `local_*` phase templates, which
 tell the agent the run has no Issue, PR or remote branch and not to use
 GitHub.

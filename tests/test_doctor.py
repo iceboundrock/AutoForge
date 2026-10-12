@@ -72,12 +72,14 @@ def _runner_factory(
     gh_version=GH_VERSION_LINE,
     opencode_version=OPENCODE_VERSION_LINE,
     opencode_code=0,
+    git_config="",
 ):
     """Fake runner. ``github`` maps a `gh api` endpoint to its JSON payload, or to
     an ``(exit_code, stderr)`` pair for a failed read; ``--paginate --slurp``
     listings are wrapped in one page the way `gh` does. ``opencode_version``
     is what an OpenCode command's ``--version`` prints (``None``: the binary
-    is missing), with exit status ``opencode_code``."""
+    is missing), with exit status ``opencode_code``. ``git_config`` is what
+    the launch preflight's ``git config --list --show-scope -z`` prints."""
     responses = dict(HEALTHY_GITHUB)
     responses.update(github or {})
 
@@ -88,6 +90,8 @@ def _runner_factory(
         key = " ".join(argv[:2])
         if any(key.startswith(f) for f in fail):
             return ExecutionResult(argv, req.cwd, 1, "", "boom", "t", "t")
+        if argv[0] == "git" and "config" in argv and "--show-scope" in argv:
+            return ExecutionResult(argv, req.cwd, 0, git_config, "", "t", "t")
         if argv[:3] == ["git", "remote", "get-url"]:
             out = git_remote
         elif argv[:2] == ["git", "rev-parse"]:
@@ -1189,3 +1193,102 @@ def test_a_forwarded_api_key_fails_an_oauth_profile_without_probing(tmp_path, mo
     assert not row.ok and row.required and "OPENAI_API_KEY is set" in row.detail
     assert PLANTED not in row.detail
     assert [r.command[1] for r in requests] == ["--version"]
+
+
+# -- the agent environment and the launch preflight (#165) ----------------------
+
+FAKE_TOKEN = "ghp_" + "D" * 36
+TOKEN_ORIGIN = f"https://x-access-token:{FAKE_TOKEN}@github.com/owner/repo.git"
+
+
+def _all_text(results) -> str:
+    return "\n".join(f"{r.name} {r.detail}" for r in results)
+
+
+def test_doctor_refuses_a_token_bearing_origin_and_never_prints_it(tmp_path):
+    listing = f"local\0remote.origin.url\n{TOKEN_ORIGIN}\0"
+    runner = _runner_factory(git_remote=TOKEN_ORIGIN, git_config=listing)
+    d = Doctor(cwd=str(tmp_path), runner=runner)
+    results = d.run_all()
+    rows = {r.name: r for r in results}
+    row = rows["no credential reaches a launch"]
+    assert not row.ok and row.required and row.label == "FAIL"
+    assert "remote URL with an embedded credential" in row.detail
+    assert "remote.origin.url" in row.detail
+    # The remote row quotes the URL it cannot parse, redacted.
+    assert not rows["GitHub remote"].ok and "REDACTED" in rows["GitHub remote"].detail
+    assert FAKE_TOKEN not in _all_text(results)
+
+
+@pytest.mark.parametrize(
+    ("listing", "needle"),
+    [
+        ("local\0credential.helper\nstore\0", "credential helper in local-scope"),
+        ("worktree\0credential.https://github.com.helper\ncache\0", "(credential.<url>.helper)"),
+        ("system\0http.extraheader\nAuthorization: basic s3cr3t\0", "(http.extraHeader)"),
+    ],
+)
+def test_doctor_refuses_a_credential_route_in_the_git_configuration(tmp_path, listing, needle):
+    d = Doctor(cwd=str(tmp_path), runner=_runner_factory(git_config=listing))
+    row = {r.name: r for r in d.run_all()}["no credential reaches a launch"]
+    assert not row.ok and needle in row.detail
+    assert "s3cr3t" not in row.detail and "store" not in row.detail.split("(")[0][-8:]
+
+
+def test_doctor_refuses_a_netrc_entry_for_github(tmp_path, monkeypatch):
+    import autoforge.child_env as child_env_module
+
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".netrc").write_text(f"machine github.com login x password {FAKE_TOKEN}\n")
+    monkeypatch.setattr(child_env_module, "operator_home", lambda: str(home))
+    results = Doctor(cwd=str(tmp_path), runner=_runner_factory()).run_all()
+    row = {r.name: r for r in results}["no credential reaches a launch"]
+    assert not row.ok and "~/.netrc" in row.detail
+    assert FAKE_TOKEN not in _all_text(results)
+
+
+def test_doctor_reports_the_agent_environment_by_name_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("GH_TOKEN", FAKE_TOKEN)
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/run/user/1000/agent.sock")
+    listing = "global\0user.name\nOperator Name\0global\0user.email\nop@example.invalid\0"
+    results = Doctor(cwd=str(tmp_path), runner=_runner_factory(git_config=listing)).run_all()
+    rows = {r.name: r for r in results}
+    env_row = rows["launch environment"]
+    assert env_row.ok and not env_row.required
+    assert "withheld from this shell: " in env_row.detail
+    withheld = env_row.detail.split("withheld from this shell: ")[1]
+    assert "GH_TOKEN" in withheld and "SSH_AUTH_SOCK" in withheld
+    assert "set by the controller: GH_CONFIG_DIR, GH_ENTERPRISE_TOKEN, GH_TOKEN" in env_row.detail
+    assert "allow-listed: PATH, HOME" in env_row.detail
+    credentials = rows["no credential reaches a launch"]
+    assert credentials.ok and "identity supplied: user.name, user.email" in credentials.detail
+    text = _all_text(results)
+    assert FAKE_TOKEN not in text and "agent.sock" not in text and "Operator Name" not in text
+
+
+def test_local_doctor_runs_the_environment_checks_and_never_gh(tmp_path, monkeypatch):
+    monkeypatch.setenv("GH_TOKEN", FAKE_TOKEN)
+    calls: list[list[str]] = []
+    listing = "local\0credential.helper\nstore\0"
+    d = Doctor(
+        cwd=str(tmp_path),
+        state_dir=str(tmp_path / "state"),
+        runner=_runner_factory(calls=calls, git_config=listing),
+    )
+    rows = {r.name: r for r in d.run_local()}
+    assert rows["launch environment"].ok and "GH_TOKEN" in rows["launch environment"].detail
+    assert not rows["no credential reaches a launch"].ok
+    assert all(argv[0] != "gh" for argv in calls), calls
+    assert "GitHub remote" not in rows and "gh authenticated" not in rows
+
+
+def test_doctors_pi_probes_get_the_launch_environment(tmp_path):
+    from autoforge.child_env import GH_PLACEHOLDER_TOKEN, override_names
+
+    requests: list = []
+    _pi_doctor(tmp_path, requests=requests)
+    assert requests
+    for req in requests:
+        assert tuple(sorted(req.env)) == override_names()
+        assert req.env["GH_TOKEN"] == GH_PLACEHOLDER_TOKEN

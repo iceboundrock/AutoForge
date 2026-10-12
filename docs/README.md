@@ -28,7 +28,7 @@ description of how AutoForge behaves.
 
 | Document | Read it for |
 |---|---|
-| [GitHub safety](agent-guides/github-safety.md) | GitHub as source of truth, per-phase verification of agent claims, dry-run guarantees, the controller-owned merge and its gate, `doctor`'s branch-rule check, EPIC updates |
+| [GitHub safety](agent-guides/github-safety.md) | GitHub as source of truth, per-phase verification of agent claims, dry-run guarantees, agents holding no GitHub credential (the operation classification, credential routes, threat model, read context), the controller-owned merge and its gate, `doctor`'s branch-rule check, EPIC updates |
 | [CONTROL_RESULT protocol](agent-guides/control-result-protocol.md) | the machine-readable result block, per-phase required fields, payload bounds, findings versus observations |
 | [Replan transaction](agent-guides/replan-transaction.md) | the durable `REPLAN_REEXECUTE` transaction: provenance, the checkpointed close, compensation and recovery |
 | [Secrets and logging](agent-guides/secrets-and-logging.md) | what is redacted, and what may never be logged or committed |

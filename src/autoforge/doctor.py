@@ -13,6 +13,14 @@ operator's whole environment) and reported without Pi's raw output, and a
 warning naming the instruction files Pi would load from outside the
 checkout (docs/pi-policy.md §4-5); those are found by path, never read.
 
+Both report the environment an agent and a repository-defined command are
+launched with, by name only (never a value), and run the launch's own
+credential preflight (#165, :func:`autoforge.child_env.preflight`): one
+local ``git config`` read and ``~/.netrc``; a credential helper in the
+repository's configuration, a URL with an embedded credential, an HTTP
+header for git or a GitHub entry in ``~/.netrc`` fails ``doctor`` exactly
+as it would refuse the launch. The ``origin`` URL is shown redacted.
+
 ``autoforge local doctor`` runs the LOCAL subset: no `gh`, no `gh auth
 status`, no `origin` remote. A machine with no GitHub CLI and no GitHub
 credentials must pass it, so the checks it omits are omitted entirely rather
@@ -27,6 +35,13 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from .child_env import (
+    LaunchIdentity,
+    describe_overrides,
+    forbidden_env_entry,
+    isolated_overrides,
+    preflight,
+)
 from .config import AutoForgeConfig, ProfileConfig, load_config_file, validate_required_profiles
 from .errors import (
     ConfigurationError,
@@ -54,6 +69,7 @@ from .providers import (
     parse_opencode_version,
     parse_pi_version,
 )
+from .redaction import redact
 from .safefs import STATE_DIR_NEEDS_HARD_LINKS, HardLinksUnavailable, SafeRoot
 from .validation import parse_remote_repository
 
@@ -242,13 +258,47 @@ class Doctor:
         self.repo = None
         ok, detail = self._run(["git", "remote", "get-url", "origin"])
         if not ok:
-            return CheckResult("GitHub remote", False, f"no 'origin' remote: {detail}")
+            return CheckResult("GitHub remote", False, f"no 'origin' remote: {redact(detail)}")
+        # The URL is shown redacted: one carrying a token is refused by the
+        # credential row, and never printed.
         try:
             repo = parse_remote_repository(detail)
         except Exception as exc:
-            return CheckResult("GitHub remote", False, f"{detail!r}: {exc}")
+            return CheckResult("GitHub remote", False, redact(f"{detail!r}: {exc}"))
         self.repo = repo
-        return CheckResult("GitHub remote", True, f"{repo} ({detail})")
+        return CheckResult("GitHub remote", True, f"{repo} ({redact(detail)})")
+
+    def check_agent_environment(self) -> CheckResult:
+        """What an agent and a repository-defined command inherit, by name only.
+
+        Informational: the configured allow-list (each provider adds its own
+        names on top), the names the controller sets for every launch, and
+        the credential-route names this shell holds that no launch receives.
+        """
+        cfg = self.config if self.config is not None else AutoForgeConfig()
+        names = cfg.execution.environment_names()
+        withheld = sorted(name for name in os.environ if forbidden_env_entry(name))
+        detail = (
+            f"allow-listed: {', '.join(names)} (plus each provider's own names); "
+            f"set by the controller: {describe_overrides()}; "
+            f"withheld from this shell: {', '.join(withheld) or '(none present)'}"
+        )
+        return CheckResult("launch environment", True, detail, required=False)
+
+    def check_launch_credentials(self) -> CheckResult:
+        """The launch preflight, run here: no GitHub or git credential reaches a child."""
+        name = "no credential reaches a launch"
+        try:
+            identity = preflight(self.cwd, self._runner)
+        except ConfigurationError as exc:
+            return CheckResult(name, False, redact(str(exc)))
+        return CheckResult(
+            name,
+            True,
+            "no credential helper, credential-bearing URL or HTTP header in the repository's "
+            "git configuration, and no GitHub entry in ~/.netrc; author identity supplied: "
+            f"{identity.describe()}",
+        )
 
     def check_required_checks(self, gh: str) -> CheckResult:
         """Whether the default branch really *requires* `safety.required_checks`.
@@ -468,6 +518,8 @@ class Doctor:
         cfg = self.config
         results.append(self._version_check("git available", ["git", "--version"]))
         results.append(self.check_git_repo())
+        results.append(self.check_agent_environment())
+        results.append(self.check_launch_credentials())
         results.extend(self._local_agent_checks(cfg))
         results.append(self.check_local_state_dir())
         results.append(self.check_validation_commands())
@@ -617,16 +669,19 @@ class Doctor:
         return PiProvider().launch_allowlist(cfg.execution.environment_names())
 
     def _pi_probe(self, argv: list[str]) -> ExecutionResult | str:
-        """Run one Pi probe under the launch allow-list; the result, or why it did not run."""
+        """Run one Pi probe as the launch would (its allow-list and the variables
+        the controller sets, #165); the result, or why it did not run."""
         try:
-            res = self._runner(
-                ExecutionRequest(
-                    command=argv,
-                    cwd=self.cwd,
-                    timeout_seconds=self.timeout,
-                    env_allowlist=self._pi_allowlist(),
+            with isolated_overrides(LaunchIdentity()) as overrides:
+                res = self._runner(
+                    ExecutionRequest(
+                        command=argv,
+                        cwd=self.cwd,
+                        timeout_seconds=self.timeout,
+                        env_allowlist=self._pi_allowlist(),
+                        env=overrides,
+                    )
                 )
-            )
         except Exception as exc:  # spawn failure / missing binary
             return f"{type(exc).__name__}: {exc}"
         return "timed out" if res.timed_out else res
@@ -844,6 +899,8 @@ class Doctor:
         results.extend(self._remote_agent_checks(cfg))
         results.append(self.check_git_repo())
         results.append(self.check_remote())
+        results.append(self.check_agent_environment())
+        results.append(self.check_launch_credentials())
         results.append(self.check_required_checks(gh))
         results.append(self.check_state_dir())
         return results

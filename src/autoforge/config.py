@@ -42,6 +42,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from . import __prompt_version__
+from .child_env import refuse_forbidden_env
 from .errors import ConfigurationError
 from .executor import MAX_DEADLINE_SECONDS, is_env_pattern
 from .local_workspace import (
@@ -171,8 +172,12 @@ MAX_LOOP_REPEATS = 100_000
 # environment and nothing else (see ``autoforge.executor.select_environment``).
 # What a coding agent needs to find its tools, its home configuration, its
 # locale and its temporary directory; what ``git`` needs to identify the
-# author and reach a remote; what ``gh`` needs to authenticate; and what an
-# HTTPS client needs behind a corporate proxy or a private CA. The API keys
+# author; and what an HTTPS client needs behind a corporate proxy or a
+# private CA. No GitHub or git credential route is here, and none can be
+# added (``autoforge.child_env.FORBIDDEN_ENV_NAMES``, #165): gh's tokens and
+# configuration location, the SSH agent socket, git's ssh and askpass
+# programs and its environment configuration are refused at load, and the
+# controller sets the gh and git configuration a child sees itself. The API keys
 # a provider's own CLI reads are contributed by the provider adapter
 # (``AgentProvider.environment_names``), not listed here, so an OpenCode
 # launch never carries an Anthropic key it has no use for. A trailing ``*``
@@ -195,19 +200,10 @@ DEFAULT_ENV_ALLOWLIST: tuple[str, ...] = (
     "XDG_DATA_HOME",
     "XDG_CACHE_HOME",
     "XDG_STATE_HOME",
-    "XDG_RUNTIME_DIR",
-    "SSH_AUTH_SOCK",
     "GIT_AUTHOR_NAME",
     "GIT_AUTHOR_EMAIL",
     "GIT_COMMITTER_NAME",
     "GIT_COMMITTER_EMAIL",
-    "GIT_SSH",
-    "GIT_SSH_COMMAND",
-    "GIT_CONFIG_GLOBAL",
-    "GH_TOKEN",
-    "GITHUB_TOKEN",
-    "GH_HOST",
-    "GH_CONFIG_DIR",
     "HTTP_PROXY",
     "HTTPS_PROXY",
     "NO_PROXY",
@@ -1079,6 +1075,7 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
                         f"{source}: 'execution.{key}' entry {name!r} is not an environment "
                         "variable name or a name prefix followed by '*'"
                     )
+            refuse_forbidden_env(names, f"{source}: 'execution.{key}'")
             setattr(base.execution, key, names)
     if "env_allowlist" in exe and not base.execution.env_allowlist:
         # An empty environment cannot even find the agent CLI on PATH; the

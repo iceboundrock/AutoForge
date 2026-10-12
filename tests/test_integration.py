@@ -9,6 +9,8 @@ persistence.
 
 import dataclasses
 import json
+import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -24,11 +26,16 @@ from tests.conftest import (
     PR,
     FakeGitHub,
     analyze_payload,
+    assert_isolated_launch,
+    assert_isolated_names,
     block,
     controller_review_comment,
     fix_commit,
     implement,
+    launch_environment,
     make_engine,
+    pollute_operator_environment,
+    read_context_of,
     review_result,
 )
 
@@ -601,3 +608,120 @@ def test_a_mixed_config_routes_each_profile_to_its_own_provider(
     fixed = eng.origin.head("autoforge/2")
     assert gh.merges == [(PR, "squash", fixed, False)]
     assert load_state(eng.paths.state_file).reviewed_head_sha == fixed
+
+
+# -- no credential route, and a read context, for every launch (#165) -----------
+
+EXPECTED_READ_CONTEXT = {
+    "ANALYZE_EXECUTE": {"README.md", "issue.md"},
+    "REVIEW": {"README.md", "issue.md", "pull-request.md", "checks.md", "follow-up-issues.md"},
+    "FIX": {"README.md", "issue.md", "review-comment.md", "follow-up-issues.md"},
+    "UPDATE_EPIC": {"README.md", "epic.md", "epic-issues.md"},
+}
+
+
+def _operator_identity(monkeypatch, tmp_path) -> None:
+    config = tmp_path / "operator-gitconfig"
+    config.write_text(
+        "[user]\n\tname = Operator Name\n\temail = op@example.invalid\n"
+        "[credential]\n\thelper = store\n"
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+
+
+def test_every_remote_launch_gets_no_credential_route_and_its_read_context(
+    tmp_state_dir, tmp_path, monkeypatch
+):
+    """The whole lifecycle with an operator shell holding every credential
+    route: each launch's environment carries none of them (gh isolated,
+    helpers reset, the SSH agent withheld, the operator's identity
+    supplied), and each prompt names a read context the controller wrote
+    under the state directory, outside the worktree, redacted."""
+    pollute_operator_environment(monkeypatch, tmp_path)
+    _operator_identity(monkeypatch, tmp_path)
+    gh = FakeGitHub()
+    gh.issues[ISSUE].body = "Implement the feature. Token: ghp_" + "Q" * 36
+    gh.issues[EPIC].body = "Roadmap: #2 then #3 then https://github.com/owner/repo/issues/9"
+    gh.add_issue("https://github.com/owner/repo/issues/3", "Next thing")
+    inner = _full_lifecycle_agent(gh)
+    seen: list[tuple[str, set[str]]] = []
+
+    def agent(req):
+        assert_isolated_launch(eng, req)
+        identity = subprocess.run(
+            ["git", "config", "user.name"],
+            cwd=req.cwd,
+            env=launch_environment(eng, req),
+            capture_output=True,
+            text=True,
+        )
+        assert identity.stdout.strip() == "Operator Name"
+        context = read_context_of(req.prompt)
+        assert context.is_dir() and context.is_relative_to(eng.paths.state_dir.resolve())
+        assert not context.is_relative_to(Path(req.cwd).resolve())
+        files = {p.name for p in context.iterdir()}
+        seen.append((req.phase, files))
+        text = "".join(p.read_text() for p in context.iterdir())
+        assert "Q" * 36 not in text
+        if req.phase == "ANALYZE_EXECUTE":
+            assert "Implement the feature." in (context / "issue.md").read_text()
+        if req.phase == "UPDATE_EPIC":
+            states = (context / "epic-issues.md").read_text()
+            assert "issues/2: OPEN: Feature" in states and "issues/3: OPEN: Next thing" in states
+            assert "issues/9: (could not be read)" in states
+        return inner(req)
+
+    eng = make_engine(tmp_state_dir, agent, github=gh, origin=True)
+    eng.config.safety.allow_merge = True
+    eng._save()
+    outcomes = eng.run(max_steps=50, allow_merge=True)
+    assert outcomes[-1].next_phase == "DONE", outcomes[-1].message
+    assert [phase for phase, _ in seen] == [
+        "ANALYZE_EXECUTE",
+        "REVIEW",
+        "FIX",
+        "REVIEW",
+        "UPDATE_EPIC",
+    ]
+    for phase, files in seen:
+        assert EXPECTED_READ_CONTEXT[phase] <= files, (phase, files)
+    # Round 2 also reads round 1's comment.
+    assert "previous-review-comment.md" in seen[3][1]
+    # Each launch's record names what the controller set, by name only.
+    run_dir = eng.paths.logs_dir / eng.state.run_id
+    for line in (run_dir / "events.jsonl").read_text().splitlines():
+        event = json.loads(line)
+        if "metadata" in event:
+            assert "GH_TOKEN" in event["metadata"]["env_set"]
+
+
+def test_an_all_pi_run_gets_the_same_isolation_in_every_child(
+    tmp_state_dir, tmp_path_factory, monkeypatch
+):
+    """Provider parity: Pi's RPC child and its auth preflight see exactly what
+    a scripted provider's launch would, checked inside the fake `pi`."""
+    from tests.pi_fake import PiFake, make_pi_engine
+
+    tmp_path = tmp_path_factory.mktemp("operator")
+    pollute_operator_environment(monkeypatch, tmp_path)
+    _operator_identity(monkeypatch, tmp_path)
+    fake = PiFake(tmp_path_factory.mktemp("pi"))
+    gh = FakeGitHub()
+    eng = make_pi_engine(tmp_state_dir, fake, _full_lifecycle_agent(gh), github=gh, origin=True)
+    eng.config.safety.allow_merge = True
+    eng._save()
+    outcomes = eng.run(max_steps=50, allow_merge=True)
+    assert outcomes[-1].next_phase == "DONE", outcomes[-1].message
+    starts = [e for e in fake.entries() if "isolation" in e]
+    assert len(fake.launches()) == 5 and len(starts) == 10  # each launch and its preflight
+    for entry in starts:
+        assert_isolated_names(entry["env"])
+        isolation = entry["isolation"]
+        # The command scope's reset is the last helper git sees.
+        assert isolation.pop("credential_helpers")[-1:] == [""], entry
+        assert isolation == {
+            "gh_token_placeholder": True,
+            "gh_config_dir_empty": True,
+            "git_terminal_prompt": "0",
+            "git_identity": "Operator Name",
+        }, entry

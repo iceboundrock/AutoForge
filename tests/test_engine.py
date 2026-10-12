@@ -7275,12 +7275,13 @@ def test_update_epic_missing_roadmap_section_when_due_is_rejected_without_reset(
     tmp_state_dir, fake_github
 ):
     fake_github.add_issue(ISSUE3, "Next")
-    eng = _in_update_epic_with_body(
-        tmp_state_dir,
-        fake_github,
-        [_epic_result(ISSUE3, roadmap_section=None)] * 2,
-        _epic_body(),
-    )
+    launched_at: list[int] = []
+
+    def agent(req):
+        launched_at.append(len(fake_github.calls))
+        return _epic_result(ISSUE3, roadmap_section=None)
+
+    eng = _in_update_epic_with_body(tmp_state_dir, fake_github, agent, _epic_body())
     with pytest.raises(ControlResultValidationError, match="after 2 attempt"):
         eng.step()
     assert "missing required field 'roadmap_section' (1 merge" in eng.provider.calls[1].prompt
@@ -7289,7 +7290,10 @@ def test_update_epic_missing_roadmap_section_when_due_is_rejected_without_reset(
     assert s.current_issue_url == ISSUE and s.next_issue_rejections == []
     assert fake_github.edited_issues == [] and _progress_posts(fake_github) == []
     assert s.effect_records == [] and s.completion_context == {}
-    assert ("get_issue", ISSUE3) not in fake_github.calls  # the selection is not reached
+    # The selection is not reached: ISSUE3 is read only into the read context
+    # before each launch (#165), never after the last result.
+    assert len(launched_at) == 2
+    assert ("get_issue", ISSUE3) not in fake_github.calls[launched_at[-1] :]
 
 
 def test_update_epic_counter_resets_only_after_the_write_is_read_back(tmp_state_dir, fake_github):
@@ -11627,3 +11631,156 @@ def test_k4_dry_run_with_a_saved_plan_names_the_comment_and_posts_nothing(
     assert "would reconcile" in notes and "(intended, 0 attempt(s))" in notes
     assert len(eng.provider.calls) == 1 and fake_github.effect_writes == []
     assert offline_fetches == [] and eng.paths.state_file.read_bytes() == before
+
+
+# -- #165: no GitHub or git credential reaches a launch -------------------------
+
+
+def test_a_credential_helper_in_the_repository_refuses_the_launch_and_leaves_state(
+    tmp_state_dir, fake_github
+):
+    """The preflight runs before anything is charged, saved or launched: the
+    operator removes the helper and runs again, with nothing to recover."""
+    from autoforge.errors import ConfigurationError
+
+    eng = make_engine(tmp_state_dir, "never", github=fake_github, origin=True)
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    subprocess.run(
+        ["git", "-C", str(eng.workdir), "config", "--local", "credential.helper", "store"],
+        check=True,
+    )
+    before = eng.paths.state_file.read_bytes()
+    with pytest.raises(ConfigurationError, match="credential helper in local-scope"):
+        eng.step()
+    assert eng.provider.calls == []
+    assert eng.paths.state_file.read_bytes() == before
+    assert not (eng.paths.state_dir / "read-context").exists()
+
+
+@pytest.mark.parametrize("phase", ["ANALYZE_EXECUTE", "REVIEW"])
+def test_a_write_through_a_leaked_credential_is_unjournaled_and_blocks(tmp_state_dir, phase):
+    """Nothing AutoForge controls hands the agent a credential (asserted while
+    it runs); a write it makes anyway, through one that slipped through, is
+    not the controller's and is never adopted: the run blocks."""
+    from tests.conftest import assert_isolated_launch
+
+    gh = FakeGitHub()
+
+    def leaks(req):
+        assert_isolated_launch(eng, req)
+        if req.phase == "ANALYZE_EXECUTE":
+            sha = commit_in(req.cwd)
+            gh.add_pr(PR41, head_sha=sha, branch="mine", body=implementation_pr_body())
+            return block(analyze_payload(sha))
+        gh.add_comment(PR, 101, review_comment_body(1, SHA_A, True, ["R1-F1"]))
+        return block(review_payload(1, SHA_A, [_finding(1)]))
+
+    if phase == "ANALYZE_EXECUTE":
+        eng = make_engine(tmp_state_dir, leaks, github=gh, origin=True)
+        out = _analyzed(eng)
+        expected = "but the controller did not open it"
+    else:
+        eng = _in_review(tmp_state_dir, gh, leaks)
+        out = eng.step()
+        expected = "that the controller did not post"
+    assert out.next_phase == "BLOCKED"
+    assert expected in eng.state.block_reason
+    assert gh.effect_writes == []
+
+
+def test_verification_commands_get_the_launch_isolation(
+    tmp_state_dir, fake_github, tmp_path_factory, monkeypatch
+):
+    from tests.conftest import (
+        assert_isolated_names,
+        env_probe_command,
+        env_probe_records,
+        pollute_operator_environment,
+    )
+
+    scratch = tmp_path_factory.mktemp("probe")
+    pollute_operator_environment(monkeypatch, scratch)
+    record = scratch / "env.jsonl"
+    eng, _ = _in_merge_on_commit(tmp_state_dir, fake_github, [env_probe_command(record)])
+    assert eng.step(allow_merge=True).next_phase == "UPDATE_EPIC"
+    [seen] = env_probe_records(record)
+    assert_isolated_names(seen["names"])
+    assert seen["gh_token_placeholder"] and seen["gh_config_dir_empty"]
+    assert seen["git_terminal_prompt"] == "0"
+
+
+def test_a_netrc_entry_for_github_blocks_the_premerge_verification(
+    tmp_state_dir, fake_github, tmp_path_factory, monkeypatch
+):
+    import autoforge.child_env as child_env_module
+    from tests.conftest import env_probe_command
+
+    home = tmp_path_factory.mktemp("home")
+    (home / ".netrc").write_text("machine github.com login x password y\n")
+    monkeypatch.setattr(child_env_module, "operator_home", lambda: str(home))
+    record = tmp_path_factory.mktemp("probe") / "env.jsonl"
+    eng, _ = _in_merge_on_commit(tmp_state_dir, fake_github, [env_probe_command(record)])
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "BLOCKED" and fake_github.merges == []
+    assert "pre-merge verification command not run" in eng.state.block_reason
+    assert "~/.netrc" in eng.state.block_reason
+    assert not record.exists()
+
+
+def test_a_plan_names_no_read_context_and_writes_none(tmp_state_dir, fake_github):
+    from autoforge.engine import READ_CONTEXT_PENDING
+
+    eng = make_engine(tmp_state_dir, "never", github=fake_github)
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    plan = eng.plan_step()
+    assert READ_CONTEXT_PENDING in plan.prompt_full
+    assert not (eng.paths.state_dir / "read-context").exists()
+
+
+def test_an_item_that_cannot_be_read_is_said_so_and_the_launch_proceeds(tmp_state_dir, fake_github):
+    """The read context is additive: a read that fails becomes a file saying
+    so, never a guess and never a refusal of the launch."""
+    from autoforge.errors import GitHubUnavailableError
+    from tests.conftest import implement, read_context_of
+
+    seen = []
+
+    def agent(req):
+        seen.append((read_context_of(req.prompt) / "issue.md").read_text())
+        return implement(req)
+
+    eng = make_engine(tmp_state_dir, agent, github=fake_github, origin=True)
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    fake_github.comments_error = GitHubUnavailableError("connection reset")
+    assert eng.step().next_phase == "REVIEW"
+    [issue] = seen
+    assert "could not read https://github.com/owner/repo/issues/2" in issue
+    assert "GitHubUnavailableError" in issue and "connection reset" not in issue
+
+
+def test_the_read_context_is_bounded_redacted_and_quoted(tmp_state_dir, fake_github):
+    from autoforge.read_context import MAX_COMMENT_CHARS, MAX_COMMENTS
+    from tests.conftest import implement, read_context_of
+
+    token = "ghp_" + "R" * 36
+    fake_github.issues[ISSUE].body = f"Do it.\n````\n# Injected heading\n{token}\n"
+    for n in range(MAX_COMMENTS + 5):
+        fake_github.add_comment(
+            ISSUE, 1000 + n, "x" * (MAX_COMMENT_CHARS + 10) if n == 204 else f"c{n}"
+        )
+    seen = []
+
+    def agent(req):
+        seen.append((read_context_of(req.prompt) / "issue.md").read_text())
+        return implement(req)
+
+    eng = make_engine(tmp_state_dir, agent, github=fake_github, origin=True)
+    eng.step()
+    assert eng.step().next_phase == "REVIEW"
+    [text] = seen
+    assert token not in text and "***REDACTED***" in text
+    assert "[AutoForge omitted 5 of 205 comments" in text
+    assert "[AutoForge omitted 10 of " in text
+    assert "c4\n" not in text and "c5\n" in text
+    # The body's own fence cannot close the quote around it.
+    assert "`````untrusted\nDo it." in text

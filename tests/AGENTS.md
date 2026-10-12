@@ -82,6 +82,17 @@ read it before adding tests for a listed area.
   `PiProvider`, preceded by a `ScriptedProvider`-style handler that may
   return a `PiTurn` to script a failure); `make_pi_engine` / `route_to_pi`
   route profiles to it.
+- Every launch gets no GitHub credential (#165). An autouse fixture points
+  the preflight's `~/.netrc` at an empty directory, so a test never reads
+  the operator's. `pollute_operator_environment` fills the controller's
+  environment with every credential route; `assert_isolated_launch(eng,
+  req)` / `launch_environment` check what a launch would get,
+  `env_probe_command` is a validation or pre-merge command that records its
+  environment (`env_probe_records`), and `read_context_of(prompt)` returns
+  the read-context directory a rendered prompt names. `tests/pi_fake.py`
+  logs an `isolation` record for every Pi start. `tests/test_child_env.py`
+  has PATH-injected fake `gh`, `ssh`, `curl` and credential helper
+  (`Probes`) that succeed only when a credential route reaches them.
 - Recovery tests reload state from disk after each step; a crash-recovery
   test performs the external side effect first and only then interrupts,
   because that is the window the controller must survive.
@@ -105,6 +116,10 @@ executor, lock, redaction, run logs   test_executor.py, test_executor_duplex.py,
                                       test_redaction.py, test_runlog.py
 LOCAL mode                            test_local*.py
 config, CLI, doctor, CI drift guards  test_config.py, test_cli.py, test_doctor.py, test_ci_workflow.py, test_gitignore.py
+launch environment, no credential     test_child_env.py (engine and doctor: test_engine.py,
+                                      test_integration.py, test_local.py, test_doctor.py)
+agent read context                    test_read_context.py (collection: test_engine.py,
+                                      test_integration.py)
 ```
 
 Add a new test next to the behaviour's existing file; create a new file only

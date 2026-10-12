@@ -39,17 +39,17 @@ the run: it is never adopted.
 ## Steps
 
 1. Read the repository's `AGENTS.md` / `CLAUDE.md` if present.
-2. Read the issue (`gh issue view {{ISSUE_URL}} --comments`) to understand the
+2. Read the issue (`issue.md` of the read context) to understand the
    specification and acceptance criteria.
-3. Read the PR description and existing comments
-   (`gh pr view {{PR_URL}} --comments`), including any previous
-   AI review rounds so you can judge whether earlier findings were resolved.
+3. Read the PR description and existing comments (`pull-request.md` of the
+   read context), including any previous AI review rounds (the previous
+   round's comment is also in `previous-review-comment.md` when there is
+   one) so you can judge whether earlier findings were resolved.
 4. Read the FULL diff of the bound revision and the related code around it:
    `git diff {{REVIEWED_MERGE_BASE_SHA}} {{REVIEWED_HEAD_SHA}}` (both commits
-   are already in the local object store; `gh pr diff {{PR_URL}}` shows the
-   same diff while the PR has not moved). Confirm with
-   `gh pr view {{PR_URL}} --json headRefOid,baseRefName` that the PR HEAD is
-   still `{{REVIEWED_HEAD_SHA}}` and its base branch is still
+   are already in the local object store). `pull-request.md` gives the PR's
+   head and base as the controller read them for this launch: check that
+   the head is still `{{REVIEWED_HEAD_SHA}}` and the base branch still
    `{{REVIEWED_BASE_REF}}`. If the HEAD moved, review `{{REVIEWED_HEAD_SHA}}`
    anyway and mention the newer HEAD in `observations`; if the base changed,
    review the diff of `{{REVIEWED_HEAD_SHA}}` against `{{REVIEWED_BASE_REF}}`
@@ -57,7 +57,8 @@ the run: it is never adopted.
    the merge base of the two after the round; if the base branch was
    rewritten under its name meanwhile, the round is stale. Either way the
    controller will schedule another round.
-5. Inspect CI / checks (`gh pr checks {{PR_URL}}`). If checks are missing or
+5. Inspect CI / checks (`checks.md` of the read context: the checks of the
+   PR's head commit when the controller read them). If checks are missing or
    inconclusive and tests are cheap to run, check out the reviewed HEAD in
    this worktree (`git checkout --detach {{REVIEWED_HEAD_SHA}}`) and run the
    relevant test suite yourself.
@@ -107,7 +108,8 @@ A problem an earlier round already deferred to one of the follow-up issues
 listed above is not a finding of this round either: the controller records
 that decision in the issue, and finding ids are round-scoped, so raising
 it again under a new id would have the next fixer create a second issue for
-the same problem. Read those issues (`gh issue view <url>`); mention the
+the same problem. Read those issues (`follow-up-issues.md` of the read
+context); mention the
 problem under `observations` with the issue's URL if it is worth noting.
 Raise it as a finding only when the deferral is wrong for this PR, that is,
 when the problem must be resolved within this PR's lifecycle after all; say

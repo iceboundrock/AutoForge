@@ -933,6 +933,8 @@ def test_doctor_reports_an_unreadable_branch_rule_as_skipped(tmp_path, capsys, m
             )
         if argv == ["opencode", "--version"]:
             return ExecutionResult(argv, req.cwd, 0, "opencode v2.0.23\n", "", "t", "t")
+        if "--show-scope" in argv:  # the launch preflight's config listing: nothing configured
+            return ExecutionResult(argv, req.cwd, 0, "", "", "t", "t")
         return ExecutionResult(argv, req.cwd, 0, "ok 1.0\n", "", "t", "t")
 
     monkeypatch.setattr(cli, "_doctor_runner", lambda: runner)
@@ -1685,7 +1687,8 @@ def test_lock_lives_in_the_git_dir_not_in_the_state_dir(tmp_path, capsys, monkey
     lock = repository_lock_path(tmp_path)
     assert lock == (tmp_path / ".git" / "autoforge" / "controller.lock").resolve()
     assert lock.is_file() and lock.read_text(encoding="utf-8") == f"{os.getpid()}\n"
-    assert sorted(p.name for p in sd.iterdir()) == ["logs", "state.json"]  # no controller.lock
+    # No controller.lock; read-context/ holds what each launch was handed (#165).
+    assert sorted(p.name for p in sd.iterdir()) == ["logs", "read-context", "state.json"]
 
 
 def test_second_controller_with_another_state_dir_is_refused_while_the_first_runs(

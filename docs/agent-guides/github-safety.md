@@ -188,6 +188,11 @@ one, and every probe and read-back reads them through it:
   escaped before they are rendered into a prompt; a marker's text never
   becomes controller or prompt syntax
 
+Then, before each launch (a correction relaunch too), the credential
+preflight runs and the phase's read context is written ("Agents hold no
+GitHub credential" below): a refusal stops the step before anything is
+charged or saved.
+
 ### Before REVIEW
 
 The reviewer makes no GitHub write in this phase (ADR 0004 K4, #162). It
@@ -726,6 +731,8 @@ It must not:
   effects the step would perform and every recorded effect it would
   reconcile first; the `UPDATE_EPIC` plan is computed from persisted state
   alone and reads nothing from GitHub.
+- write an agent's read context: the rendered prompt names a placeholder
+  instead of the per-launch directory.
 
 Never rely only on telling an LLM "do not modify anything".
 
@@ -804,7 +811,9 @@ write or pushes.
   no more authority than the agent. `autoforge doctor` is an operator
   diagnostic outside any run and keeps its own requests: it runs only
   `git --version`, `rev-parse --show-toplevel` and `remote get-url`, none
-  of which starts a hook, the monitor or a filter.
+  of which starts a hook, the monitor or a filter, plus the launch
+  preflight's `git config --list`, which goes through the hardened local
+  request like every controller git process (#165).
 
 ### Published content
 
@@ -837,6 +846,235 @@ from the base to the candidate is read back by the transport and refused
 its message contains a credential class, or a closing keyword naming any
 issue other than the run's own (`#n`, `owner/repo#n` or the issue's URL):
 GitHub would close that issue once the commit reaches the default branch.
+
+## Agents hold no GitHub credential
+
+ADR 0004 moved every externally visible write to the controller; #165
+removes the authority to make one from everything else AutoForge launches.
+Agents and repository-defined commands (LOCAL `local.validation_commands`,
+`merge.verification_commands`) receive no GitHub or git credential through
+anything AutoForge controls, so a prompt-injected agent that tries a write
+fails for lack of a credential, not for lack of an instruction. The
+mechanism is `src/autoforge/child_env.py`, provider-neutral and applied by
+the engine to all three kinds of launch the same way; Pi keeps #132's
+policy (docs/pi-policy.md).
+
+### The operation classification
+
+The classification of ADR 0004 D1.2 names operations, not tools; #148 and
+#149 cite it. Every mutation the workflow makes and every `gh` and `git`
+operation the REMOTE prompts used to name is in one class. LOCAL prompts
+make no GitHub call and are out of scope.
+
+| Operation | Class | Who performs it |
+|---|---|---|
+| push a branch: the implementation, a fix, a replacement | controller-only | the controller, effect K1 |
+| open or adopt the implementation PR, the replacement PR | controller-only | the controller, effects K2, K3, K7 |
+| post a round's review comment | controller-only | the controller, effect K4 |
+| create a follow-up issue, append a follow-up marker | controller-only | the controller, effects K5, K6 |
+| post the EPIC progress comment; splice the EPIC roadmap | controller-only | the controller, effect K8 and the roadmap write |
+| close, reopen or comment on the source PR of a replan | controller-only | the controller's replan transaction |
+| merge; disable auto-merge | controller-only | the controller, behind `safety.allow_merge` |
+| edit a comment in place, close an issue, delete a branch, labels, assignees, milestones, any other REST or GraphQL mutation | controller-only | nobody: there is no kind for it |
+| read an issue, a PR, comments, checks, the EPIC and its issues | read-only external | the controller, into the agent's read context (below) |
+| `git fetch` of the revisions a phase works on | network read | the controller, before the launch (objects only) |
+| read the diff of the bound revision | agent-local | the agent, `git diff` over what the controller fetched |
+| commit on the worktree's detached `HEAD`, `git rev-parse`, `git log` | agent-local | the agent; never load-bearing |
+| create, delete or move a local branch or a worktree | operator-owned local | nobody (the controller's single `worktree add` aside) |
+
+### The authority rule
+
+**A provider interaction approval never grants a controller-only
+operation** (ADR 0004 D1.3). An approval (a provider permission prompt or
+mode, an interaction answer, an SDK permission callback) changes what a
+provider tool may *attempt*; it never changes which credentials the process
+holds. The rule holds by construction: the credential a controller-only
+operation needs is absent from every agent and repository-command runtime.
+Provider permission modes and deny lists are defence in depth at most,
+never the boundary.
+
+### What every launch gets
+
+- **Names never inherited.** `FORBIDDEN_ENV_NAMES` and
+  `FORBIDDEN_ENV_PREFIXES`: gh's tokens and configuration location
+  (`GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`,
+  `GITHUB_ENTERPRISE_TOKEN`, `GH_HOST`, `GH_CONFIG_DIR`), the programs git
+  and ssh run for a credential or a connection (`GIT_ASKPASS`,
+  `SSH_ASKPASS`, `GIT_SSH`, `GIT_SSH_COMMAND`), the SSH agent socket
+  (`SSH_AUTH_SOCK`), git configuration from the environment
+  (`GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `GIT_CONFIG_COUNT`,
+  `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_KEY_*`, `GIT_CONFIG_VALUE_*`) and the
+  session bus a desktop keyring answers on (`XDG_RUNTIME_DIR`,
+  `DBUS_SESSION_BUS_ADDRESS`). None is in the default allow-list, and
+  config load refuses any of them, or a `*` prefix covering one, in
+  `execution.env_allowlist`, `env_allowlist_extra` or an adapter's
+  `environment_names`, naming the variable and the rule and never a value.
+  One check (`refuse_forbidden_env`), with no provider branch in the engine.
+- **Variables the controller sets**, over the allow-listed environment, for
+  one launch, from a directory it creates (`mkdtemp`, mode 0700) and removes
+  when the launch ends:
+  - `GH_CONFIG_DIR`: an empty directory, so `gh` finds no `hosts.yml`;
+  - `GH_TOKEN` and `GH_ENTERPRISE_TOKEN`: the placeholder
+    `autoforge-no-github-credential`. With no token in its environment or
+    configuration `gh` falls back to the keyring, which any same-UID
+    process reaches on macOS; a token in the environment is used first, and
+    GitHub refuses this one;
+  - `GIT_CONFIG_GLOBAL`: a file holding only the author and committer
+    identity (`user.*`, `author.*`, `committer.*`) copied from the
+    operator's global git configuration, so `~/.gitconfig` and
+    `$XDG_CONFIG_HOME/git/config` are not read, and an agent's
+    `git config --global` writes land in that file;
+  - `GIT_TERMINAL_PROMPT=0`, and at git's command scope
+    (`GIT_CONFIG_COUNT`), which git reads after every configuration file and
+    which no file can override: `credential.helper=` (an empty value clears
+    the helper list, URL-specific helpers included), `core.askPass=`,
+    `http.extraHeader=` and `core.sshCommand` set to
+    `ssh -F /dev/null -o IdentityFile=none -o IdentitiesOnly=yes -o IdentityAgent=none -o ControlPath=none -o BatchMode=yes`.
+- **A preflight before every launch** (`child_env.preflight`): one
+  `git config --list --show-scope --includes` in the launch's directory,
+  through the hardened local request, and a read of `~/.netrc` (`_netrc`).
+  It refuses a credential helper in repository or worktree scope (the
+  shared common dir), a remote URL or `insteadOf` base with an embedded
+  credential, and an `http.extraHeader` (a URL-specific one beats the
+  generic reset) in system, repository or worktree scope, and a `.netrc`
+  entry for GitHub or a `default` entry (git's HTTPS transport reads it
+  through `HOME`, which every child keeps). For an agent the refusal is a
+  `ConfigurationError` raised before anything is charged, saved or launched,
+  so state is untouched; for a validation command it leaves the phase
+  unverified, and for a pre-merge command it blocks the merge, as a failing
+  command does. It names the scope and the key's shape, never a value or a
+  URL. `autoforge doctor` and `autoforge local doctor` run the same check
+  and report the launch environment by name only.
+- **Provider integrations**, decided from each CLI's `--help`: Claude Code
+  runs with `--strict-mcp-config` and no `--mcp-config`, so no MCP server
+  of the user's, the project's or a plugin's configuration starts (one may
+  hold a token of its own); OpenCode 2.0.26 has no flag that disables its
+  MCP servers or plugins (see the residuals below); Pi's `--no-extensions`
+  and the rest of #132's policy are unchanged.
+
+### Credential routes
+
+Each route an agent or a repository command could use, how it is closed,
+and the test that shows it (tests in `tests/test_child_env.py` unless
+named otherwise), or why it has none.
+
+| Route | Closed by | Test |
+|---|---|---|
+| gh token in the environment | names refused at load and never inherited; `GH_TOKEN` / `GH_ENTERPRISE_TOKEN` set to the placeholder | `test_config.py` refusals; `test_the_child_environment_carries_no_operator_credential_route`; fake `gh` |
+| gh `hosts.yml` (`GH_CONFIG_DIR`, `$XDG_CONFIG_HOME/gh`, `~/.config/gh`) | `GH_CONFIG_DIR` names an empty per-launch directory | fake `gh` reading `hosts.yml`: `test_an_agent_finds_no_credential_route_the_controller_finds_every_one` |
+| gh keyring: Secret Service over the session bus (Linux), the keychain (macOS) | bus variables withheld; the placeholder token means `gh` never asks the keyring | fake `gh` with a same-UID "keychain": `test_gh_without_the_placeholder_would_reach_the_keychain`. A real keyring is not tested: CI has none, and a test must never touch the operator's |
+| git credential helper in system, global, repository, worktree or included configuration, URL-specific included | global replaced; command-scope `credential.helper=` reset; repository and worktree scope refused by the preflight | `test_an_agent_finds_no_credential_route_the_controller_finds_every_one`, `test_a_helper_in_the_worktree_configuration_is_reset_too`, the preflight tests. System scope is shown through the same command-scope reset: a test cannot write `/etc/gitconfig` |
+| git configuration from the environment (`GIT_CONFIG_*`) | refused at load and never inherited; the controller sets its own | `test_config.py` refusals, construction test |
+| askpass (`GIT_ASKPASS`, `core.askPass`, `SSH_ASKPASS`) and the terminal prompt | names withheld; `core.askPass=` at command scope; `GIT_TERMINAL_PROMPT=0` | an askpass in the common dir never answers: `test_an_agent_finds_no_credential_route_the_controller_finds_every_one` |
+| SSH agent | `SSH_AUTH_SOCK` withheld; `IdentityAgent=none` | fake `ssh` records argv and environment |
+| SSH default keys (`~/.ssh/id_*`, found through the password database, not `HOME`) | `core.sshCommand` at command scope: `-F /dev/null`, `IdentityFile=none`; `GIT_SSH`, `GIT_SSH_COMMAND` withheld | fake `ssh` that succeeds only with a default key or the agent |
+| a credential in a URL (`remote.*.url`, `pushurl`, `url.*.insteadOf`) | global replaced; system, repository and worktree refused by the preflight | `test_the_preflight_refuses_a_credential_in_the_repository_configuration`; doctor: `test_doctor_refuses_a_token_bearing_origin_and_never_prints_it` |
+| `http.extraHeader` | generic reset at command scope; any non-empty one refused by the preflight | preflight tests |
+| `~/.netrc` (libcurl, `curl -n`) | GitHub or `default` entry refused by the preflight | `test_a_netrc_entry_for_github_refuses_the_launch`, `test_engine.py::test_a_netrc_entry_for_github_blocks_the_premerge_verification`, doctor |
+| `~/.git-credentials`, `$XDG_CONFIG_HOME/git/credentials` | read only by the `store` helper, which is reset | covered by the helper tests; a deliberate read is an absolute-path read (not guaranteed) |
+| Claude Code MCP servers (user, project, plugin) | `--strict-mcp-config` | `test_providers.py::test_claude_argv_shape` |
+| OpenCode MCP servers and plugins | none: 2.0.26 has no such flag | none: there is no flag to assert, and a test cannot run a real OpenCode (residual below) |
+| Pi extensions, skills, prompt templates, themes, context files | #132's flags (`--no-extensions` and the rest) | `test_pi_rpc.py`, unchanged |
+| a provider's permission mode or approval | irrelevant by the authority rule: it grants no credential | — |
+| validation and pre-merge commands | the same variables and preflight | `test_local.py::test_local_launches_get_the_same_isolation_and_no_read_context`, `test_engine.py::test_verification_commands_get_the_launch_isolation` |
+
+End to end, `tests/test_integration.py` runs the whole REMOTE lifecycle with
+an operator shell holding every route above and checks each launch while it
+runs, for the scripted providers and for an all-Pi run (the RPC child and
+its auth preflight alike). A write an agent makes anyway, through a
+credential that slipped through, is not journaled and blocks the run
+(`test_engine.py::test_a_write_through_a_leaked_credential_is_unjournaled_and_blocks`).
+
+### The agent read path
+
+An agent with no credential reads GitHub through **controller-supplied read
+context** only (ADR 0004 D10). Before each REMOTE launch the engine reads,
+through the typed client, what that phase's prompt names: the issue and its
+comments (`ANALYZE_EXECUTE`, `REVIEW`, `FIX`, `REPLAN_REEXECUTE`); the PR,
+its comments and the check summary of its head commit (`REVIEW`); the
+previous round's review comment (`REVIEW`) or the verified one (`FIX`); the
+follow-up issues handed over (`REVIEW`, `FIX`); the EPIC and the state and
+title of each issue it references (`UPDATE_EPIC`); the source PR with its
+comments, the issue and the EPIC (`REPLAN_REEXECUTE`). It writes them,
+through the state directory's capability, into
+`<state dir>/read-context/<run id>/<phase>-<attempt>-<token>/`, one
+Markdown file per item and a `README.md` index, and the prompt names the
+directory by absolute path.
+
+- **Bounded and redacted** (`src/autoforge/read_context.py`): a body, a
+  comment, the number of comments (the last 200), each file and the whole
+  directory have bounds; a cut is an explicit `[AutoForge omitted ...]`
+  line with the counts. Every text goes through the run-log redactor and
+  every piece of project text is quoted in a fence nothing inside it can
+  close.
+- **Never authority.** The controller never reads the files back; every
+  decision is still taken on its own reads. An item that cannot be read
+  becomes a file that says so (naming the error type), and the launch
+  proceeds.
+- **The diff** is agent-local `git diff` over the revisions the controller
+  fetched. A dry run writes nothing and the plan shows a placeholder.
+
+### Threat model
+
+**Actors.** Trusted: the operator and the controller. Untrusted: the agent
+(its output, and anything a prompt injection in project data makes it do),
+repository-defined validation and pre-merge commands (the PR's code), and
+humans acting concurrently on GitHub. GitHub is the source of truth.
+
+**Guaranteed** (Wave 1):
+
+1. **No delegated authority.** Agents and repository-defined commands
+   launched by AutoForge receive no GitHub write authority through anything
+   AutoForge controls: the environment; `gh` or git configuration (global,
+   system, repository or worktree); credential helpers and askpass
+   programs; the SSH agent; provider integrations that AutoForge
+   configures.
+2. **No steering of the controller.** Repository state an agent can write
+   (configuration, hooks, `origin`, include directives, replacement refs,
+   grafts, the commit-graph) cannot steer, or run code in, the controller's
+   own git network operations and `gh` calls (D7.3, D7.5).
+3. **Every write is accounted for.** Every Wave 1 externally visible write
+   is a typed controller effect with a durable record; anything else with a
+   Wave 1 identity is detected and blocks, and is never adopted.
+4. **Agent text is bounded data.** It is published only inside controller
+   framing and cannot forge a marker, close or link an issue, mention a
+   user or team, or carry a credential-shaped string.
+
+**Not guaranteed** (the outer sandbox, ADR 0005, owns the first four):
+
+- **Absolute-path reads.** A same-UID process that deliberately reads a
+  credential file, keychain or socket by absolute path
+  (`~/.config/gh/hosts.yml`, `~/.git-credentials`, `~/.ssh/`, a keyring over
+  the session bus), or runs `ssh` or a credential helper of its own choosing.
+- **Absolute-path writes.** A same-UID process that deliberately modifies
+  the operator's own `gh` or git configuration, which the controller's own
+  `gh` reads. An agent's ordinary `gh` and `git config --global` writes
+  land in the controller-supplied locations instead.
+- **Shared local repository state.** An agent can still create, move or
+  delete shared refs and edit the configuration and hooks of the common
+  dir; the preflight refuses the credential carriers among them before the
+  next launch, and D7.3 and D7.5 bound what the rest can do to the
+  controller.
+- **Network egress.** An agent can send whatever it can read.
+- **Exposure outside the boundary.** A credential the operator exposes
+  elsewhere: a token in a worktree file, in a service the agent can reach,
+  or in a variable the operator forwards under a name that is not a
+  recognised route.
+- **The committed tree** is not filtered; `REVIEW` and the merge gate own it.
+- **Integrity of the shared object store** (D7.5, #171).
+
+**Residuals of the provider integrations.** OpenCode 2.0.26 has no flag that
+disables the MCP servers or plugins of the user's or the project's
+`opencode.json`; one configured with its own GitHub token keeps it. Claude
+Code's hooks and the non-MCP parts of its plugins still load; they run as
+the agent, in its environment. Neither is a route AutoForge configures, and
+both are named by `doctor`'s documentation rather than detected.
+
+**What the agent loses.** The operator's global git configuration beyond
+the identity is not read by an agent: no commit signing (`commit.gpgSign`,
+`user.signingKey`, an SSH-agent signer), no global Git LFS filter, no
+aliases or `core.excludesFile`. Tools that need `XDG_RUNTIME_DIR` (a session
+bus, a Wayland socket) do not get it.
 
 ## Merge safety
 
@@ -989,7 +1227,9 @@ Each run is logged like an agent invocation. Dry-run runs nothing and lists
 the commands in the plan; `autoforge doctor` reports what is configured
 without running it. Submodules are not populated in the export, and the
 commands run under the same allow-listed environment as an agent
-(`execution.env_allowlist`), not the operator's whole shell.
+(`execution.env_allowlist`), not the operator's whole shell, with the same
+controller-set variables and preflight ("Agents hold no GitHub credential"
+above): a preflight refusal blocks the merge like a failing command.
 
 ### Post-merge reconciliation
 
