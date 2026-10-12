@@ -25,7 +25,7 @@ Layout::
                               # names, a setup failure) when the launch had one
             stdout.log        # redacted stdout (head + omission marker + tail when truncated)
             stderr.log        # redacted stderr (same)
-            control-result.json   # parsed CONTROL_RESULT when one was accepted
+            control-result.json   # parsed CONTROL_RESULT when one was accepted (redacted)
             error.txt         # controller-side error, when the step failed
 
 Logs never pollute state.json.
@@ -652,8 +652,14 @@ class RunLogger:
         # value. Redacting per call site left the journal -- which serialises
         # the record wholesale -- with the only unredacted copy.
         record.error = redact(record.error)
+        # String by string, like the metadata, never as its serialized text:
+        # redacting the JSON and parsing it back let a pattern consume the
+        # syntax around a value (an empty ``GITHUB_TOKEN=`` took the closing
+        # quote, a value before an escaped quote its backslash), so an
+        # accepted result crashed the controller here, and it missed a secret
+        # right after an escape such as ``\n`` (#206).
         if isinstance(record.parsed_result, dict):
-            record.parsed_result = json.loads(redact(json.dumps(record.parsed_result)))
+            record.parsed_result = redact_dict(record.parsed_result)
         request = {
             "run_id": record.run_id,
             "seq": record.seq,

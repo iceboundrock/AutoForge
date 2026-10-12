@@ -27,6 +27,10 @@ class _Pattern(NamedTuple):
     replacement: str
 
 
+# The OAuth credential fields a quoted key names: the ``oauth-field`` pattern
+# below, and :func:`redact_obj` for a mapping entry under such a key.
+_OAUTH_FIELD_NAMES = r"refresh|access|(?:refresh|access|id)_token|chatgpt[-_]account[-_]id"
+
 # Applied in this order, each to the previous one's output; the order is part
 # of :func:`redact`'s output and of the class :func:`credential_classes`
 # reports. An ``sk-ant-`` key with at least eight characters after ``sk-`` is
@@ -112,8 +116,7 @@ _PATTERNS: tuple[_Pattern, ...] = (
     _Pattern(
         "oauth-field",
         re.compile(
-            r"(?i)(\\{0,7})([\"'])(refresh|access|(?:refresh|access|id)_token|"
-            r"chatgpt[-_]account[-_]id)\1\2(\s*:\s*\\{0,7}[\"'])[^\"'\s\\]+"
+            rf"(?i)(\\{{0,7}})([\"'])({_OAUTH_FIELD_NAMES})\1\2(\s*:\s*\\{{0,7}}[\"'])[^\"'\s\\]+"
         ),
         r"\1\2\3\1\2\4***REDACTED***",
     ),
@@ -140,6 +143,12 @@ _PATTERNS: tuple[_Pattern, ...] = (
 )
 
 _REDACTED = "***REDACTED***"
+
+# A mapping key that names an OAuth credential field, whole (``fullmatch``).
+# ``{"refresh": "..."}`` is the shape ``oauth-field`` finds in a text, but
+# :func:`redact_obj` hands :func:`redact` the key and its value apart, and
+# neither matches on its own; this is how it still sees the shape.
+_OAUTH_FIELD_KEY = re.compile(rf"(?i){_OAUTH_FIELD_NAMES}")
 
 # :func:`redact` never returns more than this many times its input's length.
 # Every pattern replaces a run of at least one character with the 14-character
@@ -211,6 +220,17 @@ def redact_obj(value: object) -> object:
     returned unchanged; anything exotic is stringified through `redact`, which
     never raises.
 
+    Each string is redacted on its own, never as part of a serialized
+    document: a pattern run over JSON text can consume the syntax around a
+    value (an empty ``GITHUB_TOKEN=`` takes the closing quote, #206), and a
+    secret right after an escape (``\\n``, ``\\u00e9``) follows a letter or a
+    digit there and is missed. The one shape that spans a key and its value, a quoted
+    OAuth credential field (``"refresh": "..."``, ``oauth-field``), is
+    recognised by the key instead: a non-empty string under a key that names
+    such a field, whole and in any case, is replaced whole. No key of a
+    parser-bounded field (a finding, a resolution) names one, so the bounds
+    that depend on :data:`MAX_GROWTH_FACTOR` still hold.
+
     A mapping never loses an entry to redaction. Two distinct keys can
     redact to the same text (``GITHUB_TOKEN=a`` and ``GITHUB_TOKEN=b`` both
     become ``GITHUB_TOKEN=***REDACTED***``), and a hand-edited journal or a
@@ -242,7 +262,10 @@ def redact_obj(value: object) -> object:
                     n += 1
                 next_suffix[key] = n + 1
                 key = f"{key}#{n}"
-            result[key] = redact_obj(v)
+            if isinstance(k, str) and isinstance(v, str) and v and _OAUTH_FIELD_KEY.fullmatch(k):
+                result[key] = _REDACTED
+            else:
+                result[key] = redact_obj(v)
         return result
     if isinstance(value, (list, tuple)):
         return [redact_obj(v) for v in value]

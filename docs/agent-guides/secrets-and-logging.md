@@ -126,6 +126,21 @@ per colliding text, so a mapping whose keys all collide is redacted in time
 linear in its size; a change to the allocator must keep that, and
 `tests/test_redaction.py` pins it against a large colliding mapping.
 
+A structure is redacted string by string, never as its serialized text
+(#206). Run over JSON, a pattern can consume the syntax around a value (an
+empty `GITHUB_TOKEN=` takes the closing quote, a value before an escaped
+quote its backslash), so parsing the redacted text back can fail, and a
+secret right after an escape (`\n`, `\uXXXX`) follows a letter or a digit
+there and is missed. The run log's `control-result.json` and the journal's
+`parsed_result` therefore cross `redact_dict` like the metadata. The one
+shape that spans a key and its value, a quoted OAuth credential field
+(`"refresh": "..."`), is recognised by the key: `redact_obj` replaces a
+non-empty string under a key that names such a field (the `oauth-field`
+names, whole, in any case) whole. No parser-bounded field (a finding, a
+resolution) has such a key, so the bounds that depend on
+`MAX_GROWTH_FACTOR` are unaffected; `tests/test_redaction.py` checks that
+the structure covers every `oauth-field` case that is a JSON document.
+
 Live progress (#192) is built to be safe where it is made, not where it is
 printed. A provider adapter maps its protocol to a `ProgressEvent`
 (`progress.py`) whose only strings are a tool name and one allow-listed

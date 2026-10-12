@@ -1046,6 +1046,102 @@ def test_the_event_journal_and_request_never_carry_an_unredacted_metadata_value(
     assert secret not in (step / "execution.json").read_text(encoding="utf-8")
 
 
+# -- #206: the parsed result is redacted string by string ----------------------
+def _log_parsed_result(tmp_path, parsed_result):
+    """Log one accepted result; return the step directory and its journal record."""
+    log = RunLogger(tmp_path / "logs", "run-1")
+    step = log.log_execution(
+        ExecutionRecord(run_id="run-1", seq=0, phase="FIX", parsed_result=parsed_result)
+    )
+    (line,) = log.events_path.read_text(encoding="utf-8").splitlines()
+    return step, json.loads(line)
+
+
+@pytest.mark.parametrize(
+    ("parsed_result", "expected"),
+    [
+        # An assignment with an empty value, at the end of a value, before
+        # another entry, as a key and in a list: redacting the serialized
+        # text took the closing quote and the separator after it.
+        ({"message": "export GITHUB_TOKEN="}, {"message": "export GITHUB_TOKEN="}),
+        (
+            {"message": "set GH_TOKEN=", "status": "success"},
+            {"message": "set GH_TOKEN=", "status": "success"},
+        ),
+        ({"OPENAI_API_KEY=": "unset"}, {"OPENAI_API_KEY=": "unset"}),
+        ({"lines": ["refresh_token=", "id_token:"]}, {"lines": ["refresh_token=", "id_token:"]}),
+        # A value that ends before a quote: its serialized form ends before
+        # ``\"``, and the backslash went with the value.
+        ({"message": 'GITHUB_TOKEN=abc"def'}, {"message": 'GITHUB_TOKEN=***REDACTED***"def'}),
+    ],
+)
+def test_a_parsed_result_whose_serialized_text_redaction_would_break_is_logged(
+    tmp_path, parsed_result, expected
+):
+    """#206: the parsed result was redacted as its JSON text and parsed back.
+
+    A pattern run over the serialized document consumed the JSON around a
+    value, so the parse raised `JSONDecodeError` out of `log_execution` after
+    the controller had accepted the result. Each string is now redacted on
+    its own: the record, `control-result.json` and the journal carry the
+    same document, and the caller's result is left as it was.
+    """
+    original = json.loads(json.dumps(parsed_result))
+    step, journal = _log_parsed_result(tmp_path, parsed_result)
+    assert json.loads((step / "control-result.json").read_text(encoding="utf-8")) == expected
+    assert journal["parsed_result"] == expected
+    assert parsed_result == original
+
+
+def test_a_secret_after_a_json_escape_never_reaches_the_control_result_or_journal(tmp_path):
+    """#206: in the serialized text a newline is ``\\n`` and a non-ASCII
+    character ``\\uXXXX``, so a secret right after one followed a letter or a
+    digit, failed the patterns' word boundary and was logged in the clear."""
+    token = "ghp_" + "c" * 36
+    key = "sk-" + "d" * 24
+    value = "hunter2-not-real"
+    step, journal = _log_parsed_result(
+        tmp_path,
+        {
+            "phase": "FIX",
+            "status": "failure",
+            "message": f"push failed:\n{token}\n\tGH_TOKEN={value}",
+            "resolutions": [{"rationale": f"—{key}"}],
+        },
+    )
+    written = (step / "control-result.json").read_text(encoding="utf-8")
+    for secret in (token, key, value):
+        assert secret not in written
+        assert secret not in json.dumps(journal)
+    assert journal["parsed_result"]["message"] == (
+        "push failed:\n***REDACTED***\n\tGH_TOKEN=***REDACTED***"
+    )
+
+
+def test_an_oauth_credential_field_in_a_parsed_result_is_still_redacted(tmp_path):
+    """#206: the one shape the serialized text caught across a key and its
+    value, a quoted OAuth credential field, stays redacted now that the key
+    and the value are redacted apart. A result keeps unknown keys, so an
+    agent can return one at any depth."""
+    step, journal = _log_parsed_result(
+        tmp_path,
+        {
+            "phase": "FIX",
+            "status": "blocked",
+            "access_token": "at_FAKE-not-real",
+            "escalation": {"Refresh": "rt_FAKE-not-a-real-token", "expires": 1700000000},
+        },
+    )
+    expected = {
+        "phase": "FIX",
+        "status": "blocked",
+        "access_token": "***REDACTED***",
+        "escalation": {"Refresh": "***REDACTED***", "expires": 1700000000},
+    }
+    assert json.loads((step / "control-result.json").read_text(encoding="utf-8")) == expected
+    assert journal["parsed_result"] == expected
+
+
 def test_a_write_never_lands_on_a_hard_link_and_never_truncates_first(tmp_path):
     """PR #44 R4-F1: a hard link is a regular file by every other test.
 
