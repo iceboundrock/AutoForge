@@ -67,6 +67,15 @@ High-priority coverage includes:
   interleaves with corrections, never in LOCAL mode or while a process the
   launch started may still be running, and the exhausted failure keeps its
   stderr tail and leaves the phase unchanged
+- a malformed result from a launch that may have left a process running
+  (each of `group_survived_kill`, `capture_abandoned`,
+  `orphan_survived_kill`) is not corrected, in REMOTE and LOCAL mode, and
+  the error names the leftover; `orphans_unchecked` alone is still corrected
+  (#209)
+- a LOCAL launch that moved the git anchor (a commit in a write phase, a
+  branch switch in `REVIEW`) and returned a malformed result is not
+  corrected: the step blocks with the anchor reason, and the refused
+  correction is not charged to `local_pending_attempts` (#209)
 - timeout, including a same-group descendant that closed its stdio and
   ignores SIGTERM (escalated to SIGKILL, gone before `execute()` returns),
   a writer outside the group via `setsid` (the capture abandoned after the

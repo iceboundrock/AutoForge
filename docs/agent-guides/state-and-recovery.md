@@ -457,7 +457,9 @@ known and the retry path is bounded. Current cases include:
   the corrections, each after the phase-entry reconciliation, and none while
   a process the failed launch started may still be running
 - temporary GitHub/network error
-- malformed CONTROL_RESULT correction attempt
+- malformed CONTROL_RESULT correction attempt, none while a process the
+  launch started may still be running, and in LOCAL mode none after a
+  launch that moved the git anchor
 
 Do not blindly retry semantic or safety failures such as:
 

@@ -9098,6 +9098,57 @@ def test_an_unchecked_platform_does_not_stop_the_transient_retry(tmp_state_dir, 
     assert len(provider.calls) == 1 + MAX_TRANSIENT_RETRIES
 
 
+@pytest.mark.parametrize(
+    "survivor", ["group_survived_kill", "capture_abandoned", "orphan_survived_kill"]
+)
+def test_a_malformed_result_is_not_corrected_while_a_process_its_launch_started_may_run(
+    tmp_state_dir, fake_github, survivor
+):
+    """#209: the transient retry's survivor rule holds for a correction too.
+    The correction would be a second agent in the same worktree beside the
+    process the first one left; the error names that process before 'resume'."""
+    eng = _in_review(tmp_state_dir, fake_github, [])
+    eng.config.execution.max_correction_attempts = 3
+    provider = _LeftoverProvider("not a control result", **{survivor: True})
+    _install(eng, provider)
+    with pytest.raises(ControlResultValidationError) as excinfo:
+        eng.step()
+    assert len(provider.calls) == 1
+    message = str(excinfo.value)
+    assert message.startswith(
+        "agent 'review_round_1' did not return a valid CONTROL_RESULT after 1 attempt(s): "
+    )
+    leftovers = AgentExecutionResult(
+        command=["x"],
+        exit_code=0,
+        stdout="",
+        stderr="",
+        started_at="t",
+        finished_at="t",
+        **{survivor: True},
+    ).leftovers
+    assert leftovers and message.endswith(
+        f". Not re-invoked: a process the launch started may still be running ({leftovers})"
+    )
+    state = load_state(eng.paths.state_file)
+    assert state.phase == Phase.REVIEW and state.attempt == 1 and state.review_round == 0
+    _, step = _step_dir(eng)
+    execution = json.loads((step / "execution.json").read_text(encoding="utf-8"))
+    assert execution[survivor] is True
+    assert execution["error"].startswith("ControlResultError: ")
+    assert fake_github.effect_writes == []
+
+
+def test_an_unchecked_platform_does_not_stop_the_correction(tmp_state_dir, fake_github):
+    """``orphans_unchecked`` alone says nothing about a survivor (#209)."""
+    eng = _in_review(tmp_state_dir, fake_github, [])
+    answers = iter(["not a control result", block(review_payload(1, SHA_A, []))])
+    provider = _LeftoverProvider(lambda req: next(answers), orphans_unchecked=True)
+    _install(eng, provider)
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    assert [req.correction for req in provider.calls] == [False, True]
+
+
 def test_a_timeout_wins_over_a_provider_failure(tmp_state_dir, fake_github):
     eng = make_engine(tmp_state_dir, [], github=fake_github, origin=True)
     provider = _LeftoverProvider("", timed_out=True, provider_failure="pi: exited early")

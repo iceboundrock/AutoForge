@@ -39,7 +39,8 @@ instructed not to use them, and the controller can neither prevent nor detect
 a `gh` write, a `git push` or a network request made by the agent. What the
 controller *does* detect is a moved git anchor: HEAD and the checked-out branch
 are compared with the values the run was pinned to before and after every
-phase, so a commit, reset, checkout or branch switch blocks the run. It detects
+phase, and before every correction relaunch within one, so a commit, reset,
+checkout or branch switch blocks the run before another agent starts. It detects
 nothing else. Real containment is a sandbox, which LOCAL v1 does not provide
 ([ADR 0001](adr/0001-local-mode-workspace-identity-and-filesystem-boundary.md)
 §2.2 and §8.1; isolation is tracked in #10).
@@ -345,7 +346,10 @@ Only a launch is counted: a step that is refused before the agent starts (a
 corrupted event journal, a run log directory the controller cannot publish
 into, an unusable execution profile, a prompt template that cannot be
 rendered) charges nothing, so repairing the cause and resuming does not spend
-the bound.
+the bound. A correction the controller declines to launch charges nothing
+either: one after a launch that moved the git anchor (the step blocks), or
+after a launch that may have left a process running in the tree (the step
+fails, naming it).
 
 The checkpoint belongs to the phase that wrote it: a state file holding one
 under a different live phase is refused at load rather than closed by that

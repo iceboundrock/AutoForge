@@ -267,7 +267,8 @@ path, say). Beyond that, the controller can neither prevent nor detect a
 `gh` write, a `git push` or a network request made by the agent. What the
 controller *does* detect is a moved git anchor: HEAD and the checked-out branch
 are compared with the values the run was pinned to before and after every
-phase, so a commit, reset, checkout or branch switch blocks the run. It detects
+phase, and before every correction relaunch within one, so a commit, reset,
+checkout or branch switch blocks the run before another agent starts. It detects
 nothing else. Real containment is a sandbox, which LOCAL v1 does not provide
 ([ADR 0001](docs/adr/0001-local-mode-workspace-identity-and-filesystem-boundary.md)
 §2.2 and §8.1; isolation is tracked in #10).

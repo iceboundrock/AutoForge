@@ -456,7 +456,17 @@ result block is reconciled with (the PR adopted, the pushed HEAD reviewed,
 the comment handed over) rather than relaunched. In LOCAL mode a correction
 is one more write-capable launch, so it is charged against and checkpointed
 in the same durable per-phase bound (three launches per phase entry) as the
-launch before it; the setting can never multiply that bound. Non-zero exits,
+launch before it; the setting can never multiply that bound. Before it is
+charged, the git anchor is read again (#209): a launch that committed,
+reset or switched branches and then returned a malformed result blocks the
+step with the anchor reason, and the correction is neither launched nor
+charged. In both modes a malformed result is not corrected when the launch
+may have left a process running (`group_survived_kill`, `capture_abandoned`
+or `orphan_survived_kill`; never `orphans_unchecked`, a fact of the
+platform): the correction would race it in the same working directory, so
+the step fails with the malformed-result error, which names the leftover
+process (`Not re-invoked: ...`), and leaves the phase unchanged for
+`resume`. Non-zero exits,
 timeouts, verification failures and a refused run-log write after the agent
 returned (an `events.jsonl` an agent enlarged past its budget, gave a second
 name, replaced or removed) are not retried automatically; they leave the
