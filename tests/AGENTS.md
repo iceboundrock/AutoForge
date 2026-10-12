@@ -75,13 +75,43 @@ read it before adding tests for a listed area.
   a helper holding its stdout after it exits, silent or writing lines on an
   interval; the real
   `ClaudeCodeProvider` launches it, so the stream path is tested end to end
-  without a real agent.
+  without a real agent. `fake_claude_bash_tool` there is a fake `claude`
+  whose Bash tool runs one command the way 2.1.296 does: settings `env` by
+  `--setting-sources`, its choice of shell, the shell snapshot of
+  `~/.bashrc` or `~/.zshrc` (or a login shell without one),
+  `CLAUDE_ENV_FILE` and `CLAUDE_CODE_SHELL_PREFIX`, with the real bash and
+  zsh.
 - `tests/pi_fake.py` holds the engine-level Pi harness: `PiFake` (a fake
   `pi` executable outside the repository that logs every start, argv, cwd,
   environment name and RPC record) and `ScriptedPi` (the real
   `PiProvider`, preceded by a `ScriptedProvider`-style handler that may
   return a `PiTurn` to script a failure); `make_pi_engine` / `route_to_pi`
   route profiles to it.
+- Every launch gets no GitHub credential (#165). Autouse fixtures point
+  the preflight's home (its `~/.netrc` and the `HOME` its login-shell probe
+  runs with), OpenCode's data directory (where the organization check
+  looks) and Claude Code's settings and global configuration (where its
+  configuration check looks) at empty directories, so a test never reads
+  the operator's. The
+  probe runs the real `sh`, `bash` and `zsh`: a fake runner hands a request
+  `is_shell_probe(req)` recognises to the real `execute`, as a fake runner
+  does for nothing else, and a launch without a fake runner reuses the
+  answer of an earlier one with the same home contents and environment
+  (`_one_shell_probe_per_answer`); `tests/test_child_env.py` calls the
+  probe itself. `pollute_operator_environment` fills the controller's
+  environment with every credential route; `assert_isolated_launch(eng,
+  req)` / `launch_environment` check what a launch would get,
+  `env_probe_command` is a validation or pre-merge command that records its
+  environment (`env_probe_records`), and `read_context_of(prompt)` returns
+  the read-context directory a rendered prompt names. `tests/pi_fake.py`
+  logs an `isolation` record for every Pi start. `tests/test_child_env.py`
+  has PATH-injected fake `gh`, `ssh`, `curl`, `wget` and credential helper
+  (`Probes`) that succeed only when a credential route reaches them, and
+  runs the real `curl` and `wget`, where installed, against a loopback
+  server that records the header they send (`--resolve` maps `github.com`
+  to it for a netrc entry). `tests/test_providers.py` has a fake
+  `opencode` that resolves its configuration, organizations cached in a
+  2.0.26-shaped database included, as 2.0.26 does.
 - Recovery tests reload state from disk after each step; a crash-recovery
   test performs the external side effect first and only then interrupts,
   because that is the window the controller must survive.
@@ -105,6 +135,10 @@ executor, lock, redaction, run logs   test_executor.py, test_executor_duplex.py,
                                       test_redaction.py, test_runlog.py
 LOCAL mode                            test_local*.py
 config, CLI, doctor, CI drift guards  test_config.py, test_cli.py, test_doctor.py, test_ci_workflow.py, test_gitignore.py
+launch environment, no credential     test_child_env.py (engine and doctor: test_engine.py,
+                                      test_integration.py, test_local.py, test_doctor.py)
+agent read context                    test_read_context.py (collection: test_engine.py,
+                                      test_integration.py)
 ```
 
 Add a new test next to the behaviour's existing file; create a new file only

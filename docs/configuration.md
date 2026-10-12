@@ -121,7 +121,7 @@ directory if it is missing and a probe file it creates and removes there.
 | Section | What it controls | Where the behaviour is specified |
 |---|---|---|
 | top level | `version`, `state_dir` (default `.autoforge`), `prompt_version` | [State and recovery](agent-guides/state-and-recovery.md) |
-| `execution` | the default agent limits (`default_idle_timeout_seconds` 900, `default_max_runtime_seconds` unset), loop detection (`loop_detection`, mode `kill`; unset, `warn` on Pi and in `UPDATE_EPIC`), the wall-clock bound on controller-run commands (`command_timeout_seconds` 1800), `max_correction_attempts` (default 1), the agent environment allow-list (`env_allowlist`, `env_allowlist_extra`), the per-issue agent worktree location (`worktree_dir`) | [Architecture](agent-guides/architecture.md), [Running the remote workflow](usage.md) |
+| `execution` | the default agent limits (`default_idle_timeout_seconds` 900, `default_max_runtime_seconds` unset), loop detection (`loop_detection`, mode `kill`; unset, `warn` on Pi and in `UPDATE_EPIC`), the wall-clock bound on controller-run commands (`command_timeout_seconds` 1800), `max_correction_attempts` (default 1), the agent environment allow-list (`env_allowlist`, `env_allowlist_extra`; a GitHub or git credential route is refused, see [Agent environment](#agent-environment)), the per-issue agent worktree location (`worktree_dir`) | [Architecture](agent-guides/architecture.md), [Running the remote workflow](usage.md) |
 | `safety` | the merge gate (`allow_merge`, default `false`), `protected_merge_paths` (default `.github/workflows/`), `required_checks` (default `ci`), `verify_check_definition` (default `true`) | [GitHub safety](agent-guides/github-safety.md#merge-safety) |
 | `merge` | how the controller merges once the gate is open: `method` (default `squash`), `delete_branch`, `max_verification_attempts` (default 5), `verification_commands` (argv lists, empty by default) | [GitHub safety](agent-guides/github-safety.md#merge-safety) |
 | `workflow` | loop bounds: `max_review_rounds` (20), `stagnation_identical_rounds` (2), `stagnation_unchanged_count_rounds` (3), `max_total_steps` (300); `epic_update_every` (1) | [Workflow](agent-guides/workflow.md#loop-bounds) |
@@ -490,6 +490,158 @@ above the checkout. With the default `execution.worktree_dir` that includes
 the operator's own checkout. Pi has no approval layer: run unattended Pi
 phases in a container, a VM or under a dedicated user
 ([Pi policy](pi-policy.md) §7).
+
+## Agent environment
+
+Agents, LOCAL `local.validation_commands` and `merge.verification_commands`
+get no GitHub or git credential (#165): the controller makes every GitHub
+write itself and hands each agent the GitHub data its phase needs as files.
+Each launch's environment is the allow-list in force
+(`execution.env_allowlist` plus `execution.env_allowlist_extra`, plus the
+names a provider adapter adds), with the variables below set on top.
+
+**Names that cannot be allow-listed.** Config load fails, naming the entry
+and the rule and never a value, when either key, or a provider adapter's own
+names, holds one of these or a `*` prefix that covers one (a bare `*`
+included):
+
+| Names | Rule |
+|---|---|
+| `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`, `GH_HOST`, `GH_CONFIG_DIR` | a `gh` token or the location of `gh`'s credentials |
+| `GIT_ASKPASS`, `SSH_ASKPASS`, `GIT_SSH`, `GIT_SSH_COMMAND` | a program git or ssh runs to get a credential or connect |
+| `SSH_AUTH_SOCK` | the SSH agent |
+| `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `GIT_CONFIG_COUNT`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_KEY_*`, `GIT_CONFIG_VALUE_*` | git configuration from the environment, which can name a credential helper |
+| `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS` | the session bus a desktop keyring answers on |
+| `CURL_HOME`, `WGETRC`, `WGET2RC` | where curl and wget find the configuration file they read on every request, which can add a credential header |
+| `NETRC` | where curl (8.16 and later), Python's `requests` and Go find the `.netrc` they take a password from |
+| `BASH_ENV`, `ENV`, `ZDOTDIR` | where a shell finds a startup file it runs before a command, which can export a credential |
+
+Earlier versions forwarded `XDG_RUNTIME_DIR`, `SSH_AUTH_SOCK`, `GIT_SSH`,
+`GIT_SSH_COMMAND`, `GIT_CONFIG_GLOBAL`, `GH_TOKEN`, `GITHUB_TOKEN`,
+`GH_HOST` and `GH_CONFIG_DIR` by default. A config that copied the old
+default list into `execution.env_allowlist` now fails to load: delete those
+entries (or the whole key, to take the new default). `SHELL` has left the
+default list too, because the controller sets it (below); listing it is
+allowed and changes nothing.
+
+**Variables the controller sets** for each launch, from a private directory
+it removes when the launch ends:
+
+| Variable | Value | Effect |
+|---|---|---|
+| `GH_CONFIG_DIR` | an empty directory | `gh` finds no `hosts.yml` |
+| `GH_TOKEN`, `GH_ENTERPRISE_TOKEN` | `autoforge-no-github-credential` | `gh` uses this (refused by GitHub) and never asks the keyring |
+| `GIT_CONFIG_GLOBAL` | a file holding only your `user.*`, `author.*` and `committer.*` settings | the agent's commits carry your identity; `~/.gitconfig` and `$XDG_CONFIG_HOME/git/config` are not read |
+| `GIT_TERMINAL_PROMPT` | `0` | git never prompts for a credential |
+| `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_n`, `GIT_CONFIG_VALUE_n` | `credential.helper=`, `core.askPass=`, `http.extraHeader=`, `core.sshCommand=ssh -F /dev/null -o IdentityFile=none -o IdentitiesOnly=yes -o IdentityAgent=none -o ControlPath=none -o BatchMode=yes` | no credential helper, askpass, extra header, SSH agent or SSH key, whatever any git configuration file says |
+| `CURL_HOME` | a directory holding an empty `.curlrc` | a plain `curl` reads it, not `~/.curlrc` or the `curlrc` (or `.curlrc`) in `$XDG_CONFIG_HOME`, so a header configured there is never sent |
+| `WGETRC`, `WGET2RC` | an empty file | a plain `wget` (1.x or wget2) reads it, not `~/.wgetrc` or `~/.config/wget/wget2rc` |
+| `ZDOTDIR` | an empty directory | every zsh of the launch, `zsh -c` included, reads `.zshenv` (and `.zprofile`, `.zshrc`, `.zlogin`) from it, not from your home, so nothing you export there reaches a launch |
+| `SHELL` | your shell when it is `sh`, `bash`, `zsh`, `dash`, `ksh` or `mksh` (an absolute path to an executable), else `bash`, else `/bin/sh` | the shell the agent CLIs run their shell tool with reads no startup file of yours to run a command; a fish or csh-family shell, which reads its configuration on every start, is never a launch's |
+
+`GIT_AUTHOR_*` and `GIT_COMMITTER_*` stay in the default allow-list and
+still take precedence over the identity file.
+
+**Provider integrations stay off.** An MCP server, a plugin or a hook may
+hold a GitHub token of its own, so none of the operator's or the
+repository's runs in a launch:
+
+- Claude Code is launched with `--safe-mode`, `--strict-mcp-config` and
+  `--setting-sources=user`, and a Claude profile's `extra_args` cannot
+  carry `--mcp-config`, `--plugin-dir`, `--plugin-url`, `--settings`,
+  `--setting-sources`, `--agents`, `--chrome` or `--ide` (config load
+  fails, naming the flag, never its value). `autoforge doctor` fails a
+  `claude` whose `--help` lacks one of the three flags (row "agent
+  'claude' keeps integrations off"). Skills, custom agents and commands
+  and CLAUDE.md auto-discovery are off as well, and the repository's
+  `.claude/settings.json` and `.claude/settings.local.json` are not read;
+  managed (administrator) settings still apply.
+- Claude Code's Bash tool runs with none of your shell functions and
+  aliases. Claude Code sources your `~/.bashrc` or `~/.zshrc` itself (and,
+  when that fails, runs commands in a login shell that reads
+  `~/.bash_profile`), so a `gh` function or alias there that passes a token
+  would otherwise reach the agent. Every launch sets `CLAUDE_ENV_FILE` to
+  a file of its own that removes every function and alias before each
+  command, and refuses to run the command if one is left; it also sets
+  `CLAUDE_CODE_SHELL` to a bash or zsh and `CLAUDE_CODE_SHELL_PREFIX` to
+  empty, whatever your shell sets. A command that relies on one of your
+  functions or aliases fails in a launch; put what it needs in a script on
+  `PATH` instead.
+- Claude Code sets the `env` of your user settings (`~/.claude/settings.json`,
+  or `settings.json` in `CLAUDE_CONFIG_DIR`) and of its global
+  configuration (`~/.claude.json`, or the one in `CLAUDE_CONFIG_DIR`) over
+  the environment AutoForge gives a launch. So a Claude launch is refused
+  while that `env` sets a variable AutoForge withholds or sets itself (a
+  GitHub or git credential, `GH_CONFIG_DIR`, `GIT_CONFIG_GLOBAL`, `SHELL`,
+  `ZDOTDIR`, `HOME`, a `BASH_FUNC_*` function, `CLAUDE_ENV_FILE`,
+  `CLAUDE_CODE_SHELL`, `CLAUDE_CODE_SHELL_PREFIX` and the like), or while
+  either file exists and cannot be read; the error and `autoforge doctor`
+  (row "agent 'claude' configuration keeps the launch environment") name
+  the file and the variables, never a value. Remove those entries; a
+  variable Claude Code itself needs can be set in the shell that runs
+  `autoforge` instead and passed with `execution.env_allowlist_extra`
+  (`CLAUDE_*` and `ANTHROPIC_*` pass already).
+- OpenCode is launched with `OPENCODE_CONFIG_DIR` set to an empty directory
+  of its own, project configuration disabled
+  (`OPENCODE_CONFIG_PROJECT_DISABLE`, `OPENCODE_DISABLE_PROJECT_CONFIG`) and
+  `OPENCODE_CONFIG` and `OPENCODE_CONFIG_CONTENT` empty, whatever your shell
+  sets: no `opencode.json(c)` or plugin directory of yours or the
+  repository's is read. Settings kept there (a custom provider, permission
+  rules, agents, instructions) do not apply to an AutoForge launch; the
+  model credentials of `opencode auth login` and the providers' API-key
+  variables do. An organization connected to OpenCode (a
+  `.well-known/opencode` integration) cannot be kept off that way: OpenCode
+  loads its configuration, or the copy it cached, from the database that
+  also holds your model login, ahead of every file. So an OpenCode launch
+  is refused while the database it would open lists one (or the legacy
+  `auth.json` beside it has a `"wellknown"` entry, or either cannot be
+  read); `autoforge doctor` fails the same way (row "agent 'opencode' loads
+  no organization configuration"). `opencode auth logout` does not help
+  (it removes the credential and leaves the cached configuration). Give
+  AutoForge's launches a database of their own instead: set `OPENCODE_DB`,
+  which every OpenCode launch inherits, to a separate file in the shell
+  that runs `autoforge`, and run `opencode auth login` for the model
+  provider with it set; or set it to `:memory:` and use the provider's
+  API-key variable.
+
+**A preflight before every launch.** The controller refuses to launch an
+agent or run a command when it would still be handed a credential through
+something the variables above cannot override, and names the setting
+without its value: a credential helper in the repository's or a worktree's
+git configuration; a remote URL (or a `url.<base>.insteadOf` base) with a
+user name or token in it; an `http.extraHeader` in system, repository or
+worktree configuration; an entry for GitHub, or a `default` entry, in
+`~/.netrc`, whatever its quoting, escapes or case (every word is checked,
+comments and `macdef` bodies included, because netrc readers disagree on
+where those end); or a login shell's startup files that change what a
+launch gets. Each shell a launch may start (its `SHELL`, and the `sh`,
+`bash` and `zsh` on `PATH`) is run once as a login shell in the launch's
+environment, so it reads `/etc/profile` and your `~/.profile`,
+`~/.bash_profile` or `~/.bash_login`; it reports, by name only, any
+variable above that its startup files changed and any refused name they
+set (`SSH_AUTH_SOCK`, `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS` and
+`GH_HOST` excepted, which give nothing while the variables above stand).
+An `export GH_TOKEN=...` in `~/.bash_profile` refuses the launch, naming
+`bash` and `GH_TOKEN`; move it where only an interactive shell runs it
+(in `~/.bashrc` after the usual `case $- in *i*) ;; *) return;; esac`).
+A zsh startup file is never a problem: a launch's zsh reads none of yours.
+For an agent the run stops before anything is recorded, so it
+can simply be run again once the setting is removed; for a validation or
+pre-merge command it counts as that command failing. `autoforge doctor` and
+`autoforge local doctor` run the same check (row "no credential reaches a
+launch") and list the launch environment by name (row "launch
+environment"), never a value.
+
+**What an agent no longer gets.** Your global git configuration beyond the
+identity: no commit signing (agent commits are unsigned), no global Git LFS
+filter, no aliases, no `core.excludesFile`. `gh` and `git push` fail for
+lack of a credential, which is expected: the controller performs every
+GitHub write. Tools that need `XDG_RUNTIME_DIR` (a session bus, a Wayland
+socket) do not get it; curl and wget get none of their configured defaults
+(the proxy variables still pass); a zsh of the launch runs without your
+zsh startup files, and a fish `SHELL` is replaced with `bash`; and the
+provider integrations above stay off. The guarantees and what they do not cover are in
+[GitHub safety](agent-guides/github-safety.md#agents-hold-no-github-credential).
 
 ## Local mode configuration
 

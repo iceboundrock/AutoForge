@@ -8,7 +8,7 @@ import pytest
 from autoforge import cli
 from autoforge.engine import ControllerEngine
 from autoforge.errors import GitHubError, LockError
-from autoforge.executor import ExecutionResult
+from autoforge.executor import ExecutionResult, execute
 from autoforge.locking import ControllerLock, repository_lock_path
 from autoforge.providers import ProviderRegistry, ScriptedProvider
 from autoforge.state import AutoForgeState, load_state, quarantine_state_file, save_state
@@ -29,6 +29,7 @@ from tests.conftest import (
     fixer,
     git_repo,
     implement,
+    is_shell_probe,
     review_result,
 )
 
@@ -919,6 +920,8 @@ def test_doctor_reports_an_unreadable_branch_rule_as_skipped(tmp_path, capsys, m
     monkeypatch.chdir(tmp_path)
 
     def runner(req):
+        if is_shell_probe(req):  # the launch preflight's shell startup probe: real shells
+            return execute(req)
         argv = req.command
         if argv[:3] == ["git", "remote", "get-url"]:
             return ExecutionResult(argv, req.cwd, 0, "git@github.com:o/r.git\n", "", "t", "t")
@@ -933,6 +936,11 @@ def test_doctor_reports_an_unreadable_branch_rule_as_skipped(tmp_path, capsys, m
             )
         if argv == ["opencode", "--version"]:
             return ExecutionResult(argv, req.cwd, 0, "opencode v2.0.23\n", "", "t", "t")
+        if argv == ["claude", "--help"]:  # the flags that keep integrations off (#165)
+            out = "  --safe-mode  ...\n  --setting-sources  ...\n  --strict-mcp-config  ...\n"
+            return ExecutionResult(argv, req.cwd, 0, out, "", "t", "t")
+        if "--show-scope" in argv:  # the launch preflight's config listing: nothing configured
+            return ExecutionResult(argv, req.cwd, 0, "", "", "t", "t")
         return ExecutionResult(argv, req.cwd, 0, "ok 1.0\n", "", "t", "t")
 
     monkeypatch.setattr(cli, "_doctor_runner", lambda: runner)
@@ -1685,7 +1693,8 @@ def test_lock_lives_in_the_git_dir_not_in_the_state_dir(tmp_path, capsys, monkey
     lock = repository_lock_path(tmp_path)
     assert lock == (tmp_path / ".git" / "autoforge" / "controller.lock").resolve()
     assert lock.is_file() and lock.read_text(encoding="utf-8") == f"{os.getpid()}\n"
-    assert sorted(p.name for p in sd.iterdir()) == ["logs", "state.json"]  # no controller.lock
+    # No controller.lock; read-context/ holds what each launch was handed (#165).
+    assert sorted(p.name for p in sd.iterdir()) == ["logs", "read-context", "state.json"]
 
 
 def test_second_controller_with_another_state_dir_is_refused_while_the_first_runs(

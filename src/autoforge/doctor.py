@@ -11,7 +11,26 @@ A Pi profile adds a version floor and a read-only credential probe, run
 under the same environment allow-list as the agent launch (never the
 operator's whole environment) and reported without Pi's raw output, and a
 warning naming the instruction files Pi would load from outside the
-checkout (docs/pi-policy.md §4-5); those are found by path, never read.
+checkout (docs/pi-policy.md §4-5); those are found by path, never read. A
+Claude Code command must list the flags every launch keeps the operator's
+and the repository's integrations off with in its ``--help`` (#165) and
+fails while its settings or global configuration set a variable over a
+launch's isolation, and an OpenCode profile fails while OpenCode would load
+an organization's configuration; a launch refuses either (#165,
+:meth:`autoforge.providers.ClaudeCodeProvider.integration_preflight`,
+:meth:`autoforge.providers.OpenCodeProvider.integration_preflight`).
+
+Both report the environment an agent and a repository-defined command are
+launched with, by name only (never a value), and run the launch's own
+credential preflight (#165, :func:`autoforge.child_env.preflight`): one
+local ``git config`` read, ``~/.netrc`` and one login shell per shell a
+launch may start; a credential helper in the repository's configuration, a
+URL with an embedded credential, an HTTP header for git, a GitHub entry in
+``~/.netrc`` or a shell startup file that changes a launch's variables
+fails ``doctor`` exactly as it would refuse the launch. ``~/.curlrc``,
+wget's configuration and zsh's startup files need no check: a launch's
+curl, wget and zsh read the controller's empty ones instead. The
+``origin`` URL is shown redacted.
 
 ``autoforge local doctor`` runs the LOCAL subset: no `gh`, no `gh auth
 status`, no `origin` remote. A machine with no GitHub CLI and no GitHub
@@ -22,14 +41,24 @@ than reported as warnings.
 from __future__ import annotations
 
 import os
+import re
 import secrets
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from .child_env import (
+    LaunchIdentity,
+    child_shell,
+    describe_overrides,
+    forbidden_env_entry,
+    isolated_overrides,
+    preflight,
+)
 from .config import AutoForgeConfig, ProfileConfig, load_config_file, validate_required_profiles
 from .errors import (
     ConfigurationError,
+    ExecutionError,
     GitHubError,
     GitHubNotFoundError,
     GitHubUnavailableError,
@@ -45,15 +74,19 @@ from .github import (
 from .local_workspace import DEFAULT_MAX_BYTES, DEFAULT_MAX_ENTRIES
 from .profiles import REQUIRED_PROFILES, local_required_profiles
 from .providers import (
+    CLAUDE_ISOLATION_FLAGS,
     OPENCODE_MIN_VERSION,
     PI_CONTEXT_FILES,
     PI_DEFAULT_AGENT_DIR,
     PI_MIN_VERSION,
     PI_SYSTEM_PROMPT_FILES,
+    ClaudeCodeProvider,
+    OpenCodeProvider,
     PiProvider,
     parse_opencode_version,
     parse_pi_version,
 )
+from .redaction import redact
 from .safefs import STATE_DIR_NEEDS_HARD_LINKS, HardLinksUnavailable, SafeRoot
 from .validation import parse_remote_repository
 
@@ -242,13 +275,53 @@ class Doctor:
         self.repo = None
         ok, detail = self._run(["git", "remote", "get-url", "origin"])
         if not ok:
-            return CheckResult("GitHub remote", False, f"no 'origin' remote: {detail}")
+            return CheckResult("GitHub remote", False, f"no 'origin' remote: {redact(detail)}")
+        # The URL is shown redacted: one carrying a token is refused by the
+        # credential row, and never printed.
         try:
             repo = parse_remote_repository(detail)
         except Exception as exc:
-            return CheckResult("GitHub remote", False, f"{detail!r}: {exc}")
+            return CheckResult("GitHub remote", False, redact(f"{detail!r}: {exc}"))
         self.repo = repo
-        return CheckResult("GitHub remote", True, f"{repo} ({detail})")
+        return CheckResult("GitHub remote", True, f"{repo} ({redact(detail)})")
+
+    def check_agent_environment(self) -> CheckResult:
+        """What an agent and a repository-defined command inherit, by name only.
+
+        Informational: the configured allow-list (each provider adds its own
+        names on top), the names the controller sets for every launch, and
+        the credential-route names this shell holds that no launch receives.
+        """
+        cfg = self.config if self.config is not None else AutoForgeConfig()
+        names = cfg.execution.environment_names()
+        withheld = sorted(name for name in os.environ if forbidden_env_entry(name))
+        detail = (
+            f"allow-listed: {', '.join(names)} (plus each provider's own names); "
+            f"set by the controller: {describe_overrides()}; "
+            f"withheld from this shell: {', '.join(withheld) or '(none present)'}"
+        )
+        return CheckResult("launch environment", True, detail, required=False)
+
+    def check_launch_credentials(self) -> CheckResult:
+        """The launch preflight, run here: no GitHub or git credential reaches a child."""
+        name = "no credential reaches a launch"
+        cfg = self.config if self.config is not None else AutoForgeConfig()
+        try:
+            identity = preflight(
+                self.cwd, self._runner, env_allowlist=cfg.execution.environment_names()
+            )
+        except ConfigurationError as exc:
+            return CheckResult(name, False, redact(str(exc)))
+        return CheckResult(
+            name,
+            True,
+            "no credential helper, credential-bearing URL or HTTP header in the repository's "
+            "git configuration, and no GitHub entry in ~/.netrc; a launch's curl and wget "
+            "read an empty configuration of the controller's, never ~/.curlrc or ~/.wgetrc; "
+            f"a launch's shell is {child_shell()} and no login shell's startup files change "
+            "its variables, zsh reading none of yours; "
+            f"author identity supplied: {identity.describe()}",
+        )
 
     def check_required_checks(self, gh: str) -> CheckResult:
         """Whether the default branch really *requires* `safety.required_checks`.
@@ -468,6 +541,8 @@ class Doctor:
         cfg = self.config
         results.append(self._version_check("git available", ["git", "--version"]))
         results.append(self.check_git_repo())
+        results.append(self.check_agent_environment())
+        results.append(self.check_launch_credentials())
         results.extend(self._local_agent_checks(cfg))
         results.append(self.check_local_state_dir())
         results.append(self.check_validation_commands())
@@ -569,8 +644,12 @@ class Doctor:
                 results.extend(self.check_pi_auth(command, profiles, available.ok))
             elif provider == "opencode":
                 results.append(self.check_opencode_version(label, command))
+                results.append(self.check_opencode_isolation(cfg, command, profiles))
             else:
                 results.append(self._version_check(label, [command, "--version"]))
+                if provider == "claude":
+                    results.append(self.check_claude_isolation(command, profiles))
+                    results.append(self.check_claude_configuration(cfg, command, profiles))
         pi_profiles = [p for (_, provider), ps in groups.items() if provider == "pi" for p in ps]
         if pi_profiles:
             results.append(self.check_pi_outside_instructions(pi_profiles))
@@ -617,16 +696,19 @@ class Doctor:
         return PiProvider().launch_allowlist(cfg.execution.environment_names())
 
     def _pi_probe(self, argv: list[str]) -> ExecutionResult | str:
-        """Run one Pi probe under the launch allow-list; the result, or why it did not run."""
+        """Run one Pi probe as the launch would (its allow-list and the variables
+        the controller sets, #165); the result, or why it did not run."""
         try:
-            res = self._runner(
-                ExecutionRequest(
-                    command=argv,
-                    cwd=self.cwd,
-                    timeout_seconds=self.timeout,
-                    env_allowlist=self._pi_allowlist(),
+            with isolated_overrides(LaunchIdentity()) as overrides:
+                res = self._runner(
+                    ExecutionRequest(
+                        command=argv,
+                        cwd=self.cwd,
+                        timeout_seconds=self.timeout,
+                        env_allowlist=self._pi_allowlist(),
+                        env=overrides,
+                    )
                 )
-            )
         except Exception as exc:  # spawn failure / missing binary
             return f"{type(exc).__name__}: {exc}"
         return "timed out" if res.timed_out else res
@@ -669,6 +751,103 @@ class Doctor:
                 "AutoForge relies on, ADR 0003)",
             )
         return CheckResult(name, True, shown)
+
+    def check_claude_isolation(self, command: str, profiles: list[ProfileConfig]) -> CheckResult:
+        """`claude --help` lists every flag a launch keeps integrations off with (#165).
+
+        Every Claude Code launch passes :data:`CLAUDE_ISOLATION_FLAGS` so that
+        no hook, plugin or MCP server of the operator's or the repository's
+        configuration runs and no project or local settings apply; a CLI
+        without one would refuse every launch. The help text is never quoted.
+        """
+        name = f"agent '{command}' keeps integrations off ({', '.join(p.name for p in profiles)})"
+        argv = [command, "--help"]
+        try:
+            res = self._runner(
+                ExecutionRequest(command=argv, cwd=self.cwd, timeout_seconds=self.timeout)
+            )
+        except Exception as exc:  # spawn failure / missing binary
+            return CheckResult(name, False, f"{type(exc).__name__}: {exc}")
+        if res.timed_out:
+            return CheckResult(name, False, "timed out")
+        if res.exit_code != 0:
+            return CheckResult(
+                name,
+                False,
+                f"`{' '.join(argv)}` exited {res.exit_code} (output not shown; run it yourself)",
+            )
+        listed = set(re.findall(r"(?<![\w-])--[a-z][a-z-]*", res.stdout or ""))
+        # A flag is offered by its name; its value (``=user``) is the launch's.
+        flags = [flag.partition("=")[0] for flag in CLAUDE_ISOLATION_FLAGS]
+        missing = [flag for flag in flags if flag not in listed]
+        if missing:
+            return CheckResult(
+                name,
+                False,
+                f"`{' '.join(argv)}` does not list {', '.join(missing)}, which every launch "
+                "passes so that no hook, plugin or MCP server of the operator's or the "
+                "repository's configuration runs and no setting of the repository's "
+                "applies; update Claude Code",
+            )
+        return CheckResult(
+            name,
+            True,
+            f"launched with {' '.join(CLAUDE_ISOLATION_FLAGS)}: no hook, plugin or MCP server "
+            "of the operator's or the repository's configuration runs, and no setting of "
+            "the repository's applies",
+        )
+
+    def check_claude_configuration(
+        self, cfg: AutoForgeConfig, command: str, profiles: list[ProfileConfig]
+    ) -> CheckResult:
+        """The launch's own refusal of Claude Code configuration that sets a
+        variable over its isolation (#165).
+
+        Run under the agent launch's allow-list, so the configuration files
+        looked at are the launch's; only paths and variable names are
+        reported, never a value.
+        """
+        name = (
+            f"agent '{command}' configuration keeps the launch environment "
+            f"({', '.join(p.name for p in profiles)})"
+        )
+        try:
+            ClaudeCodeProvider().integration_preflight(cfg.execution.environment_names())
+        except (ConfigurationError, ExecutionError) as exc:
+            return CheckResult(name, False, redact(str(exc)))
+        return CheckResult(
+            name,
+            True,
+            "no variable of Claude Code's settings or global configuration replaces one "
+            "AutoForge sets; its Bash tool runs no shell startup file's function or alias",
+        )
+
+    def check_opencode_isolation(
+        self, cfg: AutoForgeConfig, command: str, profiles: list[ProfileConfig]
+    ) -> CheckResult:
+        """The launch's own refusal of an organization OpenCode would load (#165).
+
+        Run under the agent launch's allow-list, so the data directory and
+        database looked at are the launch's; only paths and counts are
+        reported, never an origin or a credential.
+        """
+        name = (
+            f"agent '{command}' loads no organization configuration "
+            f"({', '.join(p.name for p in profiles)})"
+        )
+        provider = OpenCodeProvider()
+        allowlist = cfg.execution.environment_names()
+        try:
+            provider.integration_preflight(allowlist)
+            data_dir = provider.data_dir(allowlist)
+        except (ConfigurationError, ExecutionError) as exc:
+            return CheckResult(name, False, redact(str(exc)))
+        return CheckResult(
+            name,
+            True,
+            f"no organization connected to OpenCode (data directory {data_dir}); a launch "
+            "reads no configuration file of the operator's or the repository's",
+        )
 
     def check_opencode_version(self, name: str, command: str) -> CheckResult:
         """`opencode` runs and is at least :data:`OPENCODE_MIN_VERSION` (#186).
@@ -844,6 +1023,8 @@ class Doctor:
         results.extend(self._remote_agent_checks(cfg))
         results.append(self.check_git_repo())
         results.append(self.check_remote())
+        results.append(self.check_agent_environment())
+        results.append(self.check_launch_credentials())
         results.append(self.check_required_checks(gh))
         results.append(self.check_state_dir())
         return results

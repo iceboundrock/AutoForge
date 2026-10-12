@@ -274,8 +274,8 @@ Before proposing a new solution:
 
    * AGENTS.md
    * CLAUDE.md
-2. Read the complete issue
-3. Read relevant EPIC context if applicable
+2. Read the complete issue (`issue.md` of the read context)
+3. Read relevant EPIC context if applicable (`epic.md` of the read context)
 4. Inspect the latest repository default branch
 5. Understand existing architecture around the affected area
 6. Identify tests and contracts relevant to the issue
@@ -288,7 +288,9 @@ Do not intermingle these two analyses prematurely.
 
 # 7. Build a Failure Ledger
 
-Review the entire previous PR lifecycle.
+Review the entire previous PR lifecycle: the historical findings above, and
+`pull-request.md` of the read context (the previous PR, its body and every
+conversation comment, each review round's comment included).
 
 Collect all actionable findings from every review round.
 

@@ -63,7 +63,9 @@ and rejects it unless ALL of these hold:
 - it is neither the EPIC ({{EPIC_URL}}) nor the just-finished issue
   ({{ISSUE_URL}}).
 
-Verify these with `gh issue view <url> --json url,state` before answering,
+Check these against `epic-issues.md` of the read context (the state and
+title of each issue the EPIC references, as the controller read them for
+this launch; the EPIC itself is `epic.md`) before answering,
 and choose differently from a selection the controller rejected.
 
 ## CONTROL_RESULT schema (exact)

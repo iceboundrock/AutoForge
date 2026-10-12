@@ -1530,6 +1530,116 @@ def _no_network_git_remote(monkeypatch):
     monkeypatch.setattr(engine_module, "GitTransport", OfflineAware)
 
 
+@pytest.fixture(autouse=True)
+def _no_operator_netrc(monkeypatch, tmp_path_factory):
+    """The launch preflight (#165) reads an empty home, not the developer's.
+
+    ``~/.netrc`` with a GitHub entry, or a ``~/.profile`` that exports a
+    token, refuses every launch, so a test run must not depend on whether
+    the machine running it has one. A test of either refusal points
+    ``operator_home`` at a home of its own.
+    """
+    import autoforge.child_env as child_env_module
+
+    home = tmp_path_factory.mktemp("operator-home")
+    monkeypatch.setattr(child_env_module, "operator_home", lambda: str(home))
+
+
+# The login-shell probe's answers, by what an answer depends on (below).
+_SHELL_PROBE_ANSWERS: dict[tuple, list[str]] = {}
+
+
+def _home_contents(home: str | None) -> tuple:
+    """Each entry of ``home`` by name, a regular file with a digest of its bytes."""
+    import hashlib
+    import os
+
+    if not home or not os.path.isdir(home):
+        return ()
+    entries = []
+    for entry in sorted(os.scandir(home), key=lambda e: e.name):
+        digest = (
+            hashlib.sha256(Path(entry.path).read_bytes()).hexdigest()
+            if entry.is_file(follow_symlinks=False)
+            else None
+        )
+        entries.append((entry.name, digest))
+    return tuple(entries)
+
+
+@pytest.fixture(autouse=True)
+def _one_shell_probe_per_answer(monkeypatch):
+    """The preflight's login-shell probe (#165 R3-F1) starts the real ``sh``,
+    ``bash`` and ``zsh`` before every launch, about a quarter of a second,
+    which over the engine tests' 1,200-odd launches would add half again to
+    the suite. What it answers depends on the operator's home, the
+    environment a launch gets and the system's startup files, which no test
+    changes; so a launch without a fake runner whose home holds the same
+    files (by content; an empty home whatever its path) and whose
+    environment is the same reuses the answer. A fake runner (it may observe
+    the probe), a startup file a test writes or changes, another
+    environment: the shells run again. ``tests/test_child_env.py`` calls the
+    probe itself, which always runs them.
+    """
+    import autoforge.child_env as child_env_module
+    from autoforge.executor import select_environment
+
+    real = child_env_module.shell_startup_problems
+
+    def probe(cwd, env_allowlist, runner=None, *, home=None):
+        allowlist = tuple(env_allowlist)
+        if runner is not None:
+            return real(cwd, allowlist, runner, home=home)
+        home = home if home is not None else child_env_module.operator_home()
+        contents = _home_contents(home)
+        key = (
+            home if contents else None,
+            contents,
+            allowlist,
+            tuple(sorted(select_environment(allowlist).items())),
+            child_env_module.child_shell(),
+        )
+        if key not in _SHELL_PROBE_ANSWERS:
+            _SHELL_PROBE_ANSWERS[key] = real(cwd, allowlist, home=home)
+        return list(_SHELL_PROBE_ANSWERS[key])
+
+    monkeypatch.setattr(child_env_module, "shell_startup_problems", probe)
+
+
+@pytest.fixture(autouse=True)
+def _no_operator_opencode_data(monkeypatch, tmp_path_factory):
+    """An OpenCode launch's organization check (#165) reads an empty data
+    directory, not the developer's.
+
+    An organization connected to the developer's OpenCode refuses every
+    OpenCode launch, so a test run must not depend on it. A test of the
+    refusal points ``opencode_data_dir`` back at the real resolution (its
+    module imported it before this fixture ran) over a home of its own.
+    """
+    import autoforge.providers as providers_module
+
+    data_dir = tmp_path_factory.mktemp("operator-opencode-data")
+    monkeypatch.setattr(providers_module, "opencode_data_dir", lambda env: data_dir)
+    monkeypatch.delenv("OPENCODE_DB", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_operator_claude_config(monkeypatch, tmp_path_factory):
+    """A Claude Code launch's configuration check (#165) reads files in an
+    empty directory, not the developer's settings and global configuration.
+
+    A variable of the developer's Claude Code configuration that a launch
+    refuses would refuse every Claude launch, so a test run must not depend
+    on it. A test of the refusal points ``claude_config_files`` back at the
+    real resolution (its module imported it before this fixture ran).
+    """
+    import autoforge.providers as providers_module
+
+    config_dir = tmp_path_factory.mktemp("operator-claude-config")
+    files = [config_dir / "settings.json", config_dir / ".claude.json"]
+    monkeypatch.setattr(providers_module, "claude_config_files", lambda env: files)
+
+
 @pytest.fixture
 def offline_fetches() -> list[list[str]]:
     """The fetches of this test's engines that have no origin, in order."""
@@ -1692,3 +1802,145 @@ def make_local_engine(
         eng.new_local_run(feature, allow_dirty=allow_dirty)
     eng.provider = provider  # type: ignore[attr-defined]
     return eng
+
+
+# -- what a launched process sees (#165) ----------------------------------------
+
+# A command that records, from inside the child, what the controller handed
+# it: the names of its environment (never a value), whether the gh
+# configuration and token are the controller's, whether curl and wget
+# find the controller's empty configuration files, whether zsh's startup
+# directory is the controller's empty one, and the shell's name.
+_ENV_PROBE = (
+    "import json, os, sys; "
+    "d = os.environ.get('GH_CONFIG_DIR', ''); "
+    "c = os.path.join(os.environ.get('CURL_HOME', ''), '.curlrc'); "
+    "w = os.environ.get('WGETRC', ''); "
+    "open(sys.argv[1], 'a').write(json.dumps({'names': sorted(os.environ), "
+    "'gh_token_placeholder': os.environ.get('GH_TOKEN') == 'autoforge-no-github-credential', "
+    "'gh_config_dir_empty': bool(d) and os.path.isdir(d) and not os.listdir(d), "
+    "'http_client_config_empty': os.environ.get('WGET2RC') == w and all("
+    "os.path.isfile(f) and 'header' not in open(f).read() for f in (c, w)), "
+    "'git_terminal_prompt': os.environ.get('GIT_TERMINAL_PROMPT'), "
+    "'zdotdir_empty': os.path.isdir(os.environ.get('ZDOTDIR', '')) "
+    "and not os.listdir(os.environ['ZDOTDIR']), "
+    "'shell': os.path.basename(os.environ.get('SHELL', ''))}) + chr(10))"
+)
+
+
+def env_probe_command(record: Path) -> list[str]:
+    """A validation or verification command that appends what it saw to ``record``."""
+    return [sys.executable, "-c", _ENV_PROBE, str(record)]
+
+
+def env_probe_records(record: Path) -> list[dict]:
+    return [json.loads(line) for line in record.read_text().splitlines() if line]
+
+
+def is_shell_probe(req) -> bool:
+    """Whether ``req`` is one of the launch preflight's login shells (#165,
+    ``child_env.shell_startup_problems``). A fake runner hands it to the real
+    executor: it reads the empty operator home of ``_no_operator_netrc``."""
+    from autoforge.child_env import SHELL_PROBE_MARKER
+
+    return list(req.command[1:3]) == ["-l", "-c"] and SHELL_PROBE_MARKER in req.command[-1]
+
+
+def pollute_operator_environment(monkeypatch, tmp_path: Path) -> None:
+    """Every GitHub or git credential route an operator's shell may hold, with fake values."""
+    token = "ghp_" + "E" * 36
+    for name in ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"):
+        monkeypatch.setenv(name, token)
+    monkeypatch.setenv("GH_HOST", "github.com")
+    monkeypatch.setenv("GH_CONFIG_DIR", str(tmp_path / "operator-gh"))
+    monkeypatch.setenv("SSH_AUTH_SOCK", str(tmp_path / "agent.sock"))
+    monkeypatch.setenv("GIT_ASKPASS", "/bin/false")
+    monkeypatch.setenv("SSH_ASKPASS", "/bin/false")
+    monkeypatch.setenv("GIT_SSH_COMMAND", "ssh -i /operator/key")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", f"unix:path={tmp_path / 'bus'}")
+    # curl's and wget's configuration, each adding the token as a header.
+    curl_home = tmp_path / "operator-curl"
+    curl_home.mkdir(exist_ok=True)
+    (curl_home / ".curlrc").write_text(f'header = "Authorization: Bearer {token}"\n')
+    (tmp_path / "operator-wgetrc").write_text(f"header = Authorization: Bearer {token}\n")
+    monkeypatch.setenv("CURL_HOME", str(curl_home))
+    monkeypatch.setenv("WGETRC", str(tmp_path / "operator-wgetrc"))
+    monkeypatch.setenv("WGET2RC", str(tmp_path / "operator-wgetrc"))
+    # A .netrc curl, requests and Go read in place of ~/.netrc.
+    (tmp_path / "operator-netrc").write_text(f"machine github.com login x password {token}\n")
+    monkeypatch.setenv("NETRC", str(tmp_path / "operator-netrc"))
+    # Where a shell finds a startup file, and a shell that reads its
+    # configuration on every start.
+    monkeypatch.setenv("BASH_ENV", str(tmp_path / "operator-bash-env"))
+    monkeypatch.setenv("ENV", str(tmp_path / "operator-env"))
+    monkeypatch.setenv("ZDOTDIR", str(tmp_path / "operator-zsh"))
+    monkeypatch.setenv("SHELL", "/usr/bin/fish")
+
+
+def assert_isolated_names(names) -> None:
+    """``names`` (a child's environment) hold no credential route of the
+    operator's: every forbidden name present is one the controller sets."""
+    from autoforge.child_env import forbidden_env_entry, override_names
+
+    held = {name for name in names if forbidden_env_entry(name)}
+    assert held == {name for name in override_names() if forbidden_env_entry(name)}, held
+    for name in (
+        "GITHUB_TOKEN",
+        "GH_HOST",
+        "SSH_AUTH_SOCK",
+        "GIT_ASKPASS",
+        "XDG_RUNTIME_DIR",
+        "BASH_ENV",
+        "ENV",
+    ):
+        assert name not in names, name
+
+
+def launch_environment(eng, req) -> dict[str, str]:
+    """What the executor hands the CLI of ``req``: allow-list plus the controller's overrides."""
+    from autoforge.executor import select_environment
+
+    provider = eng.providers.get(req.profile)
+    env = select_environment(provider.environment_allowlist(req))
+    env.update(req.env or {})
+    return env
+
+
+def assert_isolated_launch(eng, req) -> None:
+    """Called from a scripted agent while it runs: the launch carries no
+    credential route, and the controller's gh, git, curl and wget
+    configuration exist."""
+    from autoforge.child_env import GH_PLACEHOLDER_TOKEN, HTTP_CLIENT_CONFIG, POSIX_SHELLS
+
+    env = launch_environment(eng, req)
+    assert_isolated_names(env)
+    assert env["GH_TOKEN"] == env["GH_ENTERPRISE_TOKEN"] == GH_PLACEHOLDER_TOKEN
+    gh_dir = Path(env["GH_CONFIG_DIR"])
+    assert gh_dir.is_dir() and list(gh_dir.iterdir()) == []
+    assert Path(env["GIT_CONFIG_GLOBAL"]).is_file()
+    assert (Path(env["CURL_HOME"]) / ".curlrc").read_text() == HTTP_CLIENT_CONFIG
+    assert env["WGET2RC"] == env["WGETRC"]
+    assert Path(env["WGETRC"]).read_text() == HTTP_CLIENT_CONFIG
+    # zsh finds no startup file, and the shell is one that reads none.
+    zdotdir = Path(env["ZDOTDIR"])
+    assert zdotdir.is_dir() and list(zdotdir.iterdir()) == []
+    assert Path(env["SHELL"]).name in POSIX_SHELLS, env["SHELL"]
+    helpers = subprocess.run(
+        ["git", "config", "--get-all", "credential.helper"],
+        cwd=req.cwd,
+        env=env,
+        capture_output=True,
+        text=True,
+    ).stdout.split("\n")[:-1]
+    assert helpers[-1:] == [""], helpers
+
+
+_READ_CONTEXT_RE = re.compile(r"outside your worktree:\n\n`([^`]+)`")
+
+
+def read_context_of(prompt: str) -> Path:
+    """The read-context directory a REMOTE prompt names (#165)."""
+    match = _READ_CONTEXT_RE.search(prompt)
+    assert match, "the prompt names no read context"
+    return Path(match.group(1))

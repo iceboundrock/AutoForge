@@ -380,7 +380,8 @@ requirement named (#120). Same layout either way:
                                            # agent runs (published before the launch; bounded, redacted)
             request.json                   # profile, model, effort, command, limits (idle timeout,
                                            # max runtime; the wall-clock timeout of a command),
-                                           # an agent's loop detection settings
+                                           # an agent's loop detection settings, the names of the
+                                           # variables the controller set (env_set, #165)
             prompt.md                      # rendered prompt (redacted)
             execution.json                 # exit code, timing, timed_out, the limit that fired
                                            # (idle / max_runtime / loop), configured limits, last
@@ -391,7 +392,18 @@ requirement named (#120). Same layout either way:
                                            # the loop_* calibration fields
             stdout.log / stderr.log        # redacted; head + marker + tail past the capture bound
             control-result.json            # parsed CONTROL_RESULT (when valid)
+    read-context/<run-id>/                 # REMOTE only (#165)
+        <phase>-<attempt>-<token>/         # one per launch, written before it: the GitHub data its
+            README.md                      # prompt names (index), issue.md, pull-request.md, ...
+                                           # (redacted, bounded); never read back by the controller
 ```
+
+The read context is the agent's copy of what the controller read from
+GitHub for one launch (ADR 0004 D10; [GitHub safety](github-safety.md#the-agent-read-path)).
+It is written through the state directory's capability like a run log, is
+not state (nothing in `state.json` points at it and recovery never reads
+it), and is kept, as logs are, so an operator can see what an agent was
+handed. A dry run and a LOCAL run write none.
 
 The controller also keeps runtime artifacts inside the repository's git
 directories, which git never tracks: in the git common dir the controller

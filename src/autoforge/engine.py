@@ -111,6 +111,7 @@ from pathlib import Path
 from typing import NoReturn, overload
 
 from . import __prompt_version__
+from .child_env import describe_overrides, isolated_overrides, override_names, preflight
 from .claims import (
     FOLLOW_UP,
     IMPLEMENTATION,
@@ -250,6 +251,17 @@ from .prompts import (
     render_phase,
 )
 from .providers import AgentExecutionResult, AgentRequest, ProviderRegistry
+from .read_context import (
+    MAX_LISTED_ISSUES,
+    ReadContext,
+    render_checks,
+    render_comment,
+    render_issue,
+    render_issue_list,
+    render_issue_states,
+    render_pr,
+    unreadable,
+)
 from .redaction import redact, redact_argv, redact_dict
 from .replan import HistoricalReviewCollector, ReplanDecision, evaluate_replan_policy
 from .replan_txn import (
@@ -396,6 +408,15 @@ MAX_LOCAL_PHASE_ATTEMPTS = 3
 # only: each relaunch follows the phase-entry reconciliation, and LOCAL has
 # none (its write phases are bounded by the durable launch checkpoint).
 MAX_TRANSIENT_RETRIES = 2
+
+# What a prompt names as its read context before the launch writes one (a
+# plan or a dry run, which write nothing).
+READ_CONTEXT_PENDING = "(a per-launch directory the controller writes before the launch)"
+# The issue references of an EPIC body the UPDATE_EPIC read context resolves:
+# `#<n>` or an issue URL of the run's repository.
+_ISSUE_REFERENCE_RE = re.compile(
+    r"(?<![\w/&])#(\d{1,9})\b|https://github\.com/([\w.-]+/[\w.-]+)/issues/(\d{1,9})\b"
+)
 
 
 MERGE_GATE_MESSAGE = (
@@ -791,6 +812,10 @@ class ControllerEngine:
         # already deferred is not raised, and deferred, a second time under a
         # new finding id (PR #89 review F2, #90).
         self._existing_pr_follow_ups: list[tuple[str, str]] = []
+        # The read context of the launch being rendered (#165, ADR 0004
+        # D10.2): the absolute path of its per-launch directory, set only
+        # while `_invoke_phase` renders that launch's prompt.
+        self._read_context_dir: str | None = None
         self.state: AutoForgeState | None = None
         # Set by locked(): the controller lock held for a whole command.
         self._lock: ControllerLock | None = None
@@ -1256,7 +1281,15 @@ class ControllerEngine:
             "worktree of this checkout, one per issue, created at the first agent launch "
             "for the issue and reused afterwards; the controller never deletes it)",
             f"agent environment: {len(names)} allow-listed name(s) from execution.env_allowlist "
-            "plus the provider's own; nothing else is inherited",
+            "plus the provider's own; nothing else is inherited, and no GitHub or git "
+            f"credential route: the controller sets {describe_overrides()} for every launch "
+            "(an empty gh configuration, credential helpers and askpass disabled, an ssh "
+            "without keys or agent, empty curl and wget configuration files, the "
+            "operator's author identity), and the provider keeps its CLI's integrations "
+            "(MCP servers, plugins, hooks) off",
+            "before every launch the git configuration it would read and ~/.netrc are checked "
+            "for a credential (a repository or worktree credential helper, a URL with a "
+            "credential, an HTTP header); one refuses the launch",
             f"HEAD and branch of {Path(self.workdir).resolve()} are read before and after the "
             "invocation; a change enters BLOCKED",
         ]
@@ -1678,6 +1711,7 @@ class ControllerEngine:
             "CURRENT_ROADMAP_SECTION": self._format_current_roadmap_section(),
             "LAST_REVIEW_RESULT": s.last_review_result or "(none)",
             "MAX_PROGRESS_CHARS": MAX_PROGRESS_CHARS,
+            "READ_CONTEXT_DIR": escape_inline(self._read_context_dir or READ_CONTEXT_PENDING),
             **REVIEW_BOUND_VARIABLES,
             **FIX_BOUND_VARIABLES,
         }
@@ -1709,6 +1743,153 @@ class ControllerEngine:
                 }
             )
         return variables
+
+    # -- the agent's read context (#165, ADR 0004 D10.2) -----------------------
+    def _write_read_context(self, phase: Phase, attempt: int) -> str:
+        """Collect this launch's read context and write it; the directory's absolute path.
+
+        Under the state directory, through its capability, in a directory of
+        its own per launch (``read-context/<run>/<phase>-<attempt>-<token>``),
+        outside the agent's worktree and the state file. Nothing is saved and
+        nothing launched yet, so a refusal to write leaves state as it was.
+        The controller never reads it back.
+        """
+        state = self._require_state()
+        context = self._collect_read_context(phase)
+        root = self.state_root()
+        relpath = (
+            f"read-context/{state.run_id}/{phase.value.lower()}-{attempt}-{secrets.token_hex(6)}"
+        )
+        root.ensure_dir(relpath)
+        for name, text in context.rendered().items():
+            root.write_text(f"{relpath}/{name}", text)
+        return str(root.path / relpath)
+
+    def _collect_read_context(self, phase: Phase) -> ReadContext:
+        """What ``phase``'s prompt has the agent read from GitHub, read through the typed client.
+
+        Additive and never authority: an item that cannot be read becomes a
+        file saying so (by error type), and the launch proceeds; every
+        decision the phase makes is still taken on the controller's own
+        reads, never on these files.
+        """
+        s = self._require_state()
+        context = ReadContext()
+        issue_url = s.current_issue_url
+        pr_url = s.current_pr_url
+        if phase == Phase.REPLAN_REEXECUTE:
+            txn = ReplanTransaction.from_dict(s.replan_transaction)
+            pr_url = txn.source_pr_url or pr_url
+        if phase in (Phase.ANALYZE_EXECUTE, Phase.REVIEW, Phase.FIX, Phase.REPLAN_REEXECUTE):
+            if issue_url:
+                context.add(
+                    "issue.md",
+                    "the issue, its body and comments",
+                    self._read_issue_file(issue_url, comments=True, title="Issue"),
+                )
+        if phase in (Phase.REVIEW, Phase.REPLAN_REEXECUTE) and pr_url:
+            title = "Previous pull request" if phase == Phase.REPLAN_REEXECUTE else "Pull request"
+            pr_text, checks = self._read_pr_files(pr_url, title)
+            context.add("pull-request.md", "the pull request, its body and comments", pr_text)
+            if phase == Phase.REVIEW and checks is not None:
+                context.add("checks.md", "the check summary of the PR's head commit", checks)
+        if phase == Phase.REVIEW and s.last_review_comment_url:
+            context.add(
+                "previous-review-comment.md",
+                "the previous round's review comment",
+                self._read_comment_file(s.last_review_comment_url, "Previous review comment"),
+            )
+        if phase == Phase.FIX and s.last_review_comment_url:
+            context.add(
+                "review-comment.md",
+                "the verified review comment of this round",
+                self._read_comment_file(s.last_review_comment_url, "Verified review comment"),
+            )
+        if phase in (Phase.REVIEW, Phase.FIX):
+            urls = list(
+                dict.fromkeys(
+                    [url for _, url in self._existing_pr_follow_ups]
+                    + list(self._existing_follow_ups.values())
+                )
+            )
+            context.add(
+                "follow-up-issues.md",
+                "the follow-up issues already open for this PR",
+                self._read_issue_list(urls, "Follow-up issues"),
+            )
+        if phase in (Phase.UPDATE_EPIC, Phase.REPLAN_REEXECUTE) and s.epic_url:
+            epic_text, epic_body = self._read_epic_file(s.epic_url)
+            context.add("epic.md", "the EPIC and its body", epic_text)
+            if phase == Phase.UPDATE_EPIC:
+                context.add(
+                    "epic-issues.md",
+                    "the state and title of each issue the EPIC references",
+                    self._read_epic_issues(epic_body),
+                )
+        return context
+
+    def _read_issue_file(self, url: str, *, comments: bool, title: str) -> str:
+        try:
+            issue = self.github.get_issue(url)
+            thread = self.github.get_issue_comments(url) if comments else None
+        except GitHubError as exc:
+            return unreadable(title, url, exc)
+        return render_issue(issue, thread, title)
+
+    def _read_pr_files(self, url: str, title: str) -> tuple[str, str | None]:
+        try:
+            pr = self.github.get_pr(url)
+            thread = self.github.get_pr_comments(url)
+        except GitHubError as exc:
+            return unreadable(title, url, exc), None
+        return render_pr(pr, thread, title), render_checks(pr)
+
+    def _read_comment_file(self, url: str, title: str) -> str:
+        try:
+            return render_comment(self.github.get_comment(url), title)
+        except GitHubError as exc:
+            return unreadable(title, url, exc)
+
+    def _read_epic_file(self, url: str) -> tuple[str, str]:
+        try:
+            epic = self.github.get_issue(url)
+        except GitHubError as exc:
+            return unreadable("EPIC", url, exc), ""
+        return render_issue(epic, None, "EPIC"), epic.body
+
+    def _read_issue_list(self, urls: list[str], title: str) -> str:
+        entries: list[IssueInfo | str] = []
+        for url in urls[:MAX_LISTED_ISSUES]:
+            try:
+                entries.append(self.github.get_issue(url))
+            except GitHubError:
+                entries.append(url)
+        return render_issue_list(entries, title, len(urls))
+
+    def _read_epic_issues(self, body: str) -> str:
+        """The issues an EPIC body references (`#n` or an issue URL of this
+        repository), in order of first mention, with state and title."""
+        s = self._require_state()
+        repository = s.repository.lower()
+        numbers: list[int] = []
+        epic_number = parse_issue_url(s.epic_url).number
+        for match in _ISSUE_REFERENCE_RE.finditer(body):
+            if match.group(1):
+                number = int(match.group(1))
+            elif match.group(2).lower() == repository:
+                number = int(match.group(3))
+            else:
+                continue
+            if number != epic_number and number not in numbers:
+                numbers.append(number)
+        entries: list[IssueInfo | str] = []
+        for number in numbers[:MAX_LISTED_ISSUES]:
+            url = f"https://github.com/{s.repository}/issues/{number}"
+            try:
+                entries.append(self.github.get_issue(url))
+            except GitHubError:
+                entries.append(url)
+        return render_issue_states(entries, "Issues the EPIC references", len(numbers))
 
     def _replan_publication_variables(self, txn: ReplanTransaction) -> dict[str, str | int | None]:
         """The replacement's base, branch and PR text bounds (#164).
@@ -3035,15 +3216,29 @@ class ControllerEngine:
         for argv in commands:
             # The commands are the repository's (a Makefile target, a test
             # runner the tree defines): allow-listed environment, as for an
-            # agent, not the operator's whole shell.
-            req = ExecutionRequest(
-                command=list(argv),
-                cwd=cwd,
-                timeout_seconds=self.config.execution.command_timeout_seconds,
-                env_allowlist=self.config.execution.environment_names(),
-                contain_orphans=True,
-            )
-            result = (self._runner or execute)(req)
+            # agent, not the operator's whole shell, and the same credential
+            # preflight and controller-set variables (#165). The agent may
+            # have changed the repository's configuration since its own
+            # launch was checked, so a refusal leaves the phase unverified.
+            try:
+                identity = preflight(
+                    cwd, self._runner, env_allowlist=self.config.execution.environment_names()
+                )
+            except ConfigurationError as exc:
+                raise VerificationError(
+                    f"validation commands not run: {exc}; {phase.value} is not verified and "
+                    f"the run stays in {phase.value}."
+                ) from exc
+            with isolated_overrides(identity) as overrides:
+                req = ExecutionRequest(
+                    command=list(argv),
+                    cwd=cwd,
+                    timeout_seconds=self.config.execution.command_timeout_seconds,
+                    env_allowlist=self.config.execution.environment_names(),
+                    env=overrides,
+                    contain_orphans=True,
+                )
+                result = (self._runner or execute)(req)
             record = ExecutionRecord(
                 run_id=state.run_id,
                 seq=0,
@@ -3067,7 +3262,11 @@ class ControllerEngine:
                 orphans_killed=result.orphans_killed,
                 orphan_survived_kill=result.orphan_survived_kill,
                 orphans_unchecked=result.orphans_unchecked,
-                metadata={"validation_command": list(argv), "feature": state.feature_spec_path},
+                metadata={
+                    "validation_command": list(argv),
+                    "feature": state.feature_spec_path,
+                    "env_set": list(override_names()),
+                },
             )
             if result.timed_out or result.exit_code != 0:
                 record.error = _with_leftovers(
@@ -5003,15 +5202,27 @@ class ControllerEngine:
         """One ``merge.verification_commands`` entry in the exported tree; "" on exit 0."""
         state = self._require_state()
         # Repository-defined commands run under the same allow-listed
-        # environment as an agent: they are the PR's code, not the operator's.
-        req = ExecutionRequest(
-            command=list(argv),
-            cwd=cwd,
-            timeout_seconds=self.config.execution.command_timeout_seconds,
-            env_allowlist=self.config.execution.environment_names(),
-            contain_orphans=True,
-        )
-        result = (self._runner or execute)(req)
+        # environment, credential preflight and controller-set variables as
+        # an agent (#165): they are the PR's code, not the operator's.
+        try:
+            identity = preflight(
+                cwd, self._runner, env_allowlist=self.config.execution.environment_names()
+            )
+        except ConfigurationError as exc:
+            return (
+                f"pre-merge verification command not run for the reviewed HEAD "
+                f"{pr.head_sha[:12]} of PR {pr.url}: {exc}"
+            )
+        with isolated_overrides(identity) as overrides:
+            req = ExecutionRequest(
+                command=list(argv),
+                cwd=cwd,
+                timeout_seconds=self.config.execution.command_timeout_seconds,
+                env_allowlist=self.config.execution.environment_names(),
+                env=overrides,
+                contain_orphans=True,
+            )
+            result = (self._runner or execute)(req)
         record = ExecutionRecord(
             run_id=state.run_id,
             seq=0,
@@ -5039,6 +5250,7 @@ class ControllerEngine:
                 "verification_command": list(argv),
                 "pr_url": pr.url,
                 "head_sha": pr.head_sha,
+                "env_set": list(override_names()),
             },
         )
         if result.timed_out or result.exit_code != 0:
@@ -7706,7 +7918,25 @@ class ControllerEngine:
                 if phase == Phase.UPDATE_EPIC
                 else UpdateEpicRequest.FULL
             )
-            prompt = self.render_prompt_for(phase, correction_error)
+            # No GitHub or git credential may reach the agent (#165): the
+            # configuration its git would read, ~/.netrc and what its shells
+            # run at startup are checked, and so is an integration its CLI
+            # would load that nothing keeps off, before anything is charged
+            # or saved, so a refusal leaves state as it was, and the
+            # identity its commits carry is read here.
+            identity = preflight(
+                cwd, self._runner, env_allowlist=provider.launch_allowlist(env_allowlist)
+            )
+            provider.integration_preflight(env_allowlist)
+            # What the agent reads from GitHub, read by the controller (it
+            # holds no credential to read it itself) and written before the
+            # prompt that names it is rendered; nothing is saved yet.
+            if state.mode == WorkflowMode.REMOTE:
+                self._read_context_dir = self._write_read_context(phase, state.attempt + 1)
+            try:
+                prompt = self.render_prompt_for(phase, correction_error)
+            finally:
+                self._read_context_dir = None
             # The launch is charged to the durable LOCAL bound here, after
             # every step that can refuse without launching and immediately
             # before the one that launches. The first launch of an entry is
@@ -7773,11 +8003,15 @@ class ControllerEngine:
                 metadata={
                     **self._log_metadata(phase),
                     "env_allowlist": list(provider.environment_allowlist(req) or ()),
+                    # The controller's names, then the adapter's own (#165).
+                    "env_set": [*override_names(), *provider.isolation_names],
                 },
             )
             result: AgentExecutionResult | None = None
             try:
-                result = self._launch(provider, req, limits, step_log, phase)
+                with isolated_overrides(identity) as overrides:
+                    req.env = overrides
+                    result = self._launch(provider, req, limits, step_log, phase)
             except ExecutionError as exc:
                 record.error = f"{type(exc).__name__}: {exc}"
                 self._record_invocation(logger, record, prompt, "", "", phase, step_log)

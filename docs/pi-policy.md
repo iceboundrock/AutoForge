@@ -216,8 +216,15 @@ practical option"). This issue implements no sandbox.
 
 **Credential exposure that remains.** Pi, its tools and everything they
 run share the operator's UID. A model-generated command can read
-`$PI_CODING_AGENT_DIR/auth.json` (mode 0600, same user) and any token in
-the environment Pi got (`GH_TOKEN`), as with every agent today. A tool
+`$PI_CODING_AGENT_DIR/auth.json` (mode 0600, same user), which Pi needs for
+its own sign-in. It gets no GitHub or git credential through anything
+AutoForge controls (#165): no `GH_TOKEN` or other credential variable can
+be allow-listed, and Pi and its auth preflight get, like every agent, an
+empty `gh` configuration, a placeholder `GH_TOKEN`, an identity-only git
+configuration and git settings that disable credential helpers, askpass and
+the SSH agent and keys. A deliberate read of the operator's own credential
+files by absolute path is not stopped
+([GitHub safety](agent-guides/github-safety.md#threat-model)). A tool
 command gets Pi's whole environment, with `$PI_CODING_AGENT_DIR/bin`
 prepended to `PATH` and `AI_AGENT=pi` and `PI_CODING_AGENT=true` added. When
 the bash tool is set to expose the session, it also gets `PI_SESSION_ID`,

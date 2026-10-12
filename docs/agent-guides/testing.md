@@ -194,6 +194,97 @@ High-priority coverage includes:
   a result to correct is neither reconciled nor relaunched); agent commits
   in its own worktree are not drift
 
+### No GitHub credential in a launch (#165)
+
+Each route in the inventory of
+[github-safety.md](github-safety.md#credential-routes) has its test there or
+a stated reason it has none. The coverage that must keep working:
+
+- config load refuses every forbidden name and every `*` prefix covering
+  one, in `env_allowlist` and `env_allowlist_extra`, naming the entry and
+  the rule and never a value; an adapter's `environment_names` and its
+  launch allow-list are refused the same way; the default list carries no
+  forbidden name (`test_config.py`, `test_child_env.py`,
+  `test_providers.py`)
+- with an operator environment that holds every route (tokens, `gh`
+  configuration, a session bus, an SSH agent, askpass, git configuration
+  from the environment, a global helper), a child gets none of them and
+  every controller-set variable; PATH-injected fake `gh`, `ssh`, `curl`,
+  `wget` and a credential helper show that an agent finds no route the
+  controller's own process finds, through a repository- or worktree-scope
+  helper and askpass too, and that the controller's `GitHubClient` keeps
+  its credential; the real `curl` and `wget`, where installed, send the
+  header of the operator's configuration file to a loopback server for the
+  controller and none from a launch (`test_child_env.py`)
+- the preflight refuses a repository or worktree helper (also through an
+  include), a credential in a remote URL or an `insteadOf` base, an
+  `http.extraHeader`, a GitHub or `default` netrc entry in any reader's
+  syntax (quoted, escaped, upper-case, a `macdef` given as a login; the
+  real `curl -n` against a loopback server or Python's `netrc` takes each
+  one's credential), and git configuration or output it cannot read; it
+  accepts a global helper the child never reads; its message names no
+  value; a launch never inherits `NETRC`, whose file the real curl 8.16
+  and later reads for the controller (`test_child_env.py`)
+- a launch's shells run no startup file of the operator's to run a
+  command: the real zsh (`-c`, `-l -c`, `-i -c`, a zsh shebang) with the
+  operator's zsh files exporting a token, the real bash and sh with the
+  operator's `BASH_ENV`, and R3-F1's report through the real OpenCode
+  adapter and executor (a fake `opencode` choosing `$SHELL` as 2.0.26
+  does) all leave a fake `gh pr merge` refused, and the same launch
+  without the controller's `ZDOTDIR` or with the operator's `BASH_ENV`
+  merges; `SHELL` is never fish or a csh; the login-shell probe names the
+  shell and variable of a `~/.profile` or `~/.bash_profile` that restores
+  a route, never its value, tolerates an SSH agent or session bus alone,
+  ignores zsh files in the home, and refuses a probe without an answer;
+  an agent, validation or pre-merge launch and `doctor` refuse on it
+  (`test_child_env.py`, `test_engine.py`, `test_local.py`,
+  `test_doctor.py`)
+- an agent preflight refusal, the credential preflight's or the
+  adapter's own (`integration_preflight`), leaves the state file byte for
+  byte; a
+  validation-command refusal leaves the phase unverified; a pre-merge
+  refusal blocks the merge (`test_engine.py`, `test_local.py`)
+- every launch of a full REMOTE lifecycle, for scripted providers and for
+  an all-Pi run (the RPC child and its auth preflight), runs with the
+  isolation in force and its phase's read context; a LOCAL run's launches
+  get the same isolation and no read context (`test_integration.py`,
+  `test_local.py`)
+- a write through a credential that slipped through anyway is not
+  journaled and blocks (`test_engine.py`)
+- `doctor` refuses a token-bearing origin without printing it, refuses
+  the configuration routes, a netrc entry and an OpenCode organization,
+  lists the launch environment
+  by name only, gives Pi's probes the same overrides, and `local doctor`
+  keeps the environment rows with zero `gh` calls (`test_doctor.py`)
+- Claude Code launches with `--safe-mode`, `--strict-mcp-config` and
+  `--setting-sources=user`, and a profile whose `extra_args` would load an
+  integration or settings is refused without its value
+  (`test_providers.py`, `test_config.py`); `doctor` fails a `claude` whose
+  `--help` lacks one of the three (`test_doctor.py`); its Bash tool, in a
+  fake `claude` that snapshots and runs a command as 2.1.296 does with the
+  real bash and zsh, runs none of the operator's shell functions and
+  aliases (snapshot and login shell, a startup file that shadows the
+  cleaner's builtins, an operator's `CLAUDE_CODE_SHELL` or
+  `CLAUDE_CODE_SHELL_PREFIX`, the repository's settings `env`), while the
+  same launch without the adapter's isolation does; a launch whose Claude
+  user settings or global configuration set a variable that would undo
+  its isolation, or cannot be read, is refused before the CLI starts,
+  naming the file and the variable, never the value (`test_providers.py`,
+  `test_doctor.py`); an
+  OpenCode launch, through the real executor, reads no MCP server or
+  plugin of any configuration a fake `opencode` that resolves its
+  configuration as 2.0.26 does would load, and is refused before the
+  CLI starts while OpenCode's database (`OPENCODE_DB` included) lists an
+  organization, cached or not, or its legacy `auth.json` has one, while a
+  launch with no organization proceeds; every adapter passes
+  `AgentRequest.env` to the executor (`test_providers.py`)
+- the read context: redacted, bounded with explicit omission markers,
+  project text fenced so it cannot close its fence; an unreadable item is a
+  file that names the error type and the launch proceeds; a dry run writes
+  none and shows a placeholder (`test_read_context.py`, `test_engine.py`)
+- no REMOTE prompt template tells the agent to read GitHub with `gh`, and
+  each names the read-context files its phase gets (`test_prompts.py`)
+
 ### GitHub verification
 
 - valid PR

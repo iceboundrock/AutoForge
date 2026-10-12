@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from autoforge.child_env import POSIX_SHELLS
 from autoforge.cli import main
 from autoforge.config import default_config
 from autoforge.doctor import Doctor
@@ -42,6 +43,7 @@ from .conftest import (
     block,
     commit_all,
     git_repo,
+    is_shell_probe,
     make_local_engine,
     sample_contract,
     write_feature,
@@ -751,6 +753,8 @@ def test_local_doctor_never_runs_gh(tmp_path):
     seen: list[list[str]] = []
 
     def runner(req):
+        if is_shell_probe(req):  # the launch preflight's shell startup probe: real shells
+            return execute(req)
         seen.append(list(req.command))
         from autoforge.executor import ExecutionResult
 
@@ -776,7 +780,10 @@ def test_local_doctor_never_runs_gh(tmp_path):
     agent_checks = sorted(n for n in names if n.startswith("agent "))
     assert agent_checks == [
         "agent 'claude' available (analyze_execute, fix)",
+        "agent 'claude' configuration keeps the launch environment (analyze_execute, fix)",
+        "agent 'claude' keeps integrations off (analyze_execute, fix)",
         "agent 'opencode' available (review_round_1, review_round_2_5)",
+        "agent 'opencode' loads no organization configuration (review_round_1, review_round_2_5)",
     ], agent_checks
     assert [r for r in results if r.name == "feature specification"][0].ok
 
@@ -830,10 +837,14 @@ def test_local_doctor_checks_only_the_reachable_providers(tmp_path):
     seen: list[list[str]] = []
 
     def runner(req):
+        if is_shell_probe(req):  # the launch preflight's shell startup probe: real shells
+            return execute(req)
         seen.append(list(req.command))
         from autoforge.executor import ExecutionResult
 
         stdout = str(root) if "rev-parse" in req.command else "ok"
+        if "--show-scope" in req.command:
+            stdout = ""  # the launch preflight's config listing: nothing configured
         if req.command == ["oc", "--version"]:
             stdout = "opencode v2.0.23"  # #186: the floor `doctor` enforces
         return ExecutionResult(
@@ -3435,3 +3446,105 @@ def test_a_pi_reviewer_that_writes_into_the_tree_is_refused(tmp_path, tmp_path_f
         eng.run(max_steps=5)
     assert eng.state.phase == Phase.REVIEW
     assert (root / IMPL_FILE).read_text(encoding="utf-8") == "reviewer sneaked this in\n"
+
+
+# -- #165: the same launch isolation as REMOTE, and still zero gh -----------------
+def test_local_launches_get_the_same_isolation_and_no_read_context(
+    tmp_path, tmp_path_factory, monkeypatch
+):
+    """The agent and the validation command of a LOCAL run get the
+    controller-set environment a REMOTE launch gets; no read context is
+    written, and GitHub is never reached (``ExplodingGitHub``)."""
+    from tests.conftest import (
+        assert_isolated_launch,
+        assert_isolated_names,
+        env_probe_command,
+        env_probe_records,
+        pollute_operator_environment,
+    )
+
+    scratch = tmp_path_factory.mktemp("probe")
+    pollute_operator_environment(monkeypatch, scratch)
+    root = local_repo(tmp_path)
+    record = scratch / "env.jsonl"
+    cfg = default_config()
+    cfg.local.validation_commands = [env_probe_command(record)]
+    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
+    steps = scripted(
+        eng,
+        root,
+        [
+            (lambda r: touch_impl(r, "v1\n"), lambda e: impl_result()),
+            (None, lambda e: review_result(e.state.workspace_fingerprint)),
+        ],
+    )
+    launched = []
+
+    def agent(req):
+        assert_isolated_launch(eng, req)
+        assert "read context" not in req.prompt
+        launched.append(req.phase)
+        return steps(req)
+
+    eng.provider._handler = agent
+    eng.run(max_steps=5)
+    assert eng.state.phase == Phase.DONE
+    assert launched == ["ANALYZE_EXECUTE", "REVIEW"]
+    seen = env_probe_records(record)
+    assert seen
+    for entry in seen:
+        assert_isolated_names(entry["names"])
+        assert entry["gh_token_placeholder"] and entry["gh_config_dir_empty"]
+        assert entry["http_client_config_empty"]
+        assert entry["zdotdir_empty"] and entry["shell"] in POSIX_SHELLS
+    assert not (eng.paths.state_dir / "read-context").exists()
+
+
+def test_a_credential_helper_planted_before_validation_leaves_the_phase_unverified(tmp_path):
+    """The agent can write the repository's configuration; the validation
+    command's own preflight refuses what it planted, and the phase stays
+    unverified for ``resume``, as a failing command leaves it."""
+    root = local_repo(tmp_path)
+    cfg = default_config()
+    marker = tmp_path / "ran"
+    cfg.local.validation_commands = [["touch", str(marker)]]
+    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
+
+    def plants(r):
+        touch_impl(r, "v1\n")
+        subprocess.run(
+            ["git", "-C", str(r), "config", "--local", "credential.helper", "store"], check=True
+        )
+
+    eng.provider._handler = scripted(eng, root, [(plants, lambda e: impl_result())])
+    with pytest.raises(VerificationError, match="validation commands not run.*credential helper"):
+        eng.run(max_steps=3)
+    assert eng.state.phase == Phase.ANALYZE_EXECUTE
+    assert not marker.exists()
+
+
+def test_a_startup_file_planted_before_validation_leaves_the_phase_unverified(tmp_path):
+    """R3-F1: a login shell the validation command starts would run what the
+    operator's ``~/.profile`` exports, which the agent can write; the
+    command's own preflight probes the login shells again and refuses."""
+    from autoforge import child_env
+
+    root = local_repo(tmp_path)
+    cfg = default_config()
+    marker = tmp_path / "ran"
+    cfg.local.validation_commands = [["touch", str(marker)]]
+    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
+    profile = Path(child_env.operator_home()) / ".profile"
+
+    def plants(r):
+        touch_impl(r, "v1\n")
+        profile.write_text("export GITHUB_TOKEN=planted\n")
+
+    eng.provider._handler = scripted(eng, root, [(plants, lambda e: impl_result())])
+    with pytest.raises(
+        VerificationError,
+        match="validation commands not run.*startup files of a login sh .*change GITHUB_TOKEN",
+    ):
+        eng.run(max_steps=3)
+    assert eng.state.phase == Phase.ANALYZE_EXECUTE
+    assert not marker.exists()

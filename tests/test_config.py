@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from autoforge import config
+from autoforge.child_env import FORBIDDEN_ENV_NAMES, FORBIDDEN_ENV_PREFIXES, forbidden_env_entry
 from autoforge.config import default_config, load_config_file, validate_required_profiles
 from autoforge.errors import ConfigurationError
 from autoforge.profiles import REQUIRED_PROFILES
@@ -1064,6 +1065,16 @@ def test_claude_text_mode_without_a_ceiling_is_refused():
         validate_required_profiles(cfg, ["fix"])
 
 
+def test_a_claude_profile_whose_extra_args_load_an_integration_is_refused():
+    """#165: an MCP server, a plugin or a settings file may hold a GitHub
+    token of its own; Claude launches with --safe-mode and the profile
+    cannot bring one back."""
+    cfg = default_config()
+    cfg.profile("fix").extra_args = ["--mcp-config", "servers.json"]
+    with pytest.raises(ConfigurationError, match="'fix'.*--mcp-config.*--safe-mode"):
+        validate_required_profiles(cfg, ["fix"])
+
+
 @pytest.mark.parametrize("on_profile", [True, False])
 def test_claude_text_mode_runs_under_its_ceiling_alone(on_profile):
     cfg = default_config()
@@ -1098,10 +1109,75 @@ def test_default_environment_names_are_the_documented_allowlist():
     names = exe.environment_names()
     assert names == tuple(config.DEFAULT_ENV_ALLOWLIST)
     assert len(names) == len(set(names))
-    for required in ("PATH", "HOME", "GH_TOKEN", "GITHUB_TOKEN", "SSH_AUTH_SOCK", "LC_*"):
+    for required in ("PATH", "HOME", "GIT_AUTHOR_NAME", "GIT_COMMITTER_EMAIL", "LC_*"):
         assert required in names, required
     # Provider keys are contributed by the provider, not the controller default.
     assert not any(n.startswith(("ANTHROPIC", "OPENAI", "OPENCODE")) for n in names)
+    # No GitHub or git credential route is in the default (#165).
+    assert [n for n in names if forbidden_env_entry(n)] == []
+    for gone in ("GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR", "SSH_AUTH_SOCK", "XDG_RUNTIME_DIR"):
+        assert gone not in names, gone
+
+
+# Every forbidden name and the prefixes that cover one (#165), with the variable
+# the refusal names.
+FORBIDDEN_ENTRIES = [
+    *((name, name) for name in FORBIDDEN_ENV_NAMES),
+    *((f"{prefix}0", f"{prefix}0") for prefix in FORBIDDEN_ENV_PREFIXES),
+    ("GH_*", "GH_TOKEN"),
+    ("GITHUB_*", "GITHUB_TOKEN"),
+    ("GIT_*", "GIT_ASKPASS"),
+    ("GIT_CONFIG_*", "GIT_CONFIG_GLOBAL"),
+    ("GIT_CONFIG_KEY_*", "GIT_CONFIG_KEY_*"),
+    ("GIT_CONFIG_VALUE_1*", "GIT_CONFIG_VALUE_*"),
+    ("SSH_*", "SSH_ASKPASS"),
+    ("XDG_*", "XDG_RUNTIME_DIR"),
+    ("DBUS_*", "DBUS_SESSION_BUS_ADDRESS"),
+    ("CURL_*", "CURL_HOME"),
+    ("WGET*", "WGETRC"),
+    ("NET*", "NETRC"),
+    ("G*", "GH_TOKEN"),
+]
+
+
+@pytest.mark.parametrize("key", ["env_allowlist", "env_allowlist_extra"])
+@pytest.mark.parametrize(("entry", "variable"), FORBIDDEN_ENTRIES)
+def test_a_github_or_git_credential_route_is_refused_at_load(
+    tmp_path, monkeypatch, key, entry, variable
+):
+    # A value in the operator's environment never reaches the message.
+    monkeypatch.setenv("GH_TOKEN", "ghp_" + "Z" * 36)
+    with pytest.raises(ConfigurationError) as caught:
+        _execution_cfg(tmp_path, {key: ["PATH", entry]})
+    message = str(caught.value)
+    assert f"'execution.{key}'" in message and repr(entry) in message
+    assert variable in message
+    rule = FORBIDDEN_ENV_NAMES.get(variable) or FORBIDDEN_ENV_PREFIXES[variable.rstrip("*0")]
+    assert rule in message
+    assert "Z" * 36 not in message
+
+
+@pytest.mark.parametrize("key", ["env_allowlist", "env_allowlist_extra"])
+def test_a_bare_star_is_refused_as_not_a_name(tmp_path, key):
+    # `*` would cover every forbidden name; the pattern check refuses it first.
+    with pytest.raises(ConfigurationError, match="not an environment variable name"):
+        _execution_cfg(tmp_path, {key: ["*"]})
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_*",
+        "GITLAB_HOST",
+        "SSH_CONNECTION",
+        "XDG_DATA_HOME",
+        "CURL_CA_BUNDLE",
+    ],
+)
+def test_a_name_that_carries_no_credential_route_is_accepted(tmp_path, entry):
+    cfg = _execution_cfg(tmp_path, {"env_allowlist_extra": [entry]})
+    assert entry in cfg.execution.environment_names()
 
 
 def test_env_allowlist_replaces_the_default_and_extra_adds_to_it(tmp_path):

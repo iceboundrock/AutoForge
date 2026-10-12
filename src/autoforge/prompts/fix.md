@@ -82,8 +82,10 @@ tracks.
 ## Steps
 
 1. Read the repository's `AGENTS.md` / `CLAUDE.md` if present.
-2. Read the verified review comment ({{REVIEW_COMMENT_URL}}) for the full
-   text of the findings below, and the issue for context.
+2. Read the verified review comment ({{REVIEW_COMMENT_URL}}), whose text is
+   `review-comment.md` of the read context, for the full text of the
+   findings below; the issue (`issue.md`) for context; and the follow-up
+   issues listed above (`follow-up-issues.md`).
 3. Start from the reviewed HEAD. If `git merge-base --is-ancestor
    {{REVIEWED_HEAD_SHA}} HEAD` succeeds and `git log
    {{REVIEWED_HEAD_SHA}}..HEAD` lists only commits for this round's

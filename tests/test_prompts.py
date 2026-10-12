@@ -727,3 +727,59 @@ def test_prompt_version_is_rendered_and_was_bumped_for_the_prompt_changes(engine
     rendered = engine.render_prompt_for(Phase.ANALYZE_EXECUTE)
     header = f"# AutoForge controller instructions (trusted): {__prompt_version__}"
     assert rendered.startswith(header)
+
+
+REMOTE_TEMPLATES = (
+    "common.md",
+    "analyze_execute.md",
+    "review.md",
+    "fix.md",
+    "replan_reexecute.md",
+    "update_epic.md",
+    "update_epic_rerequest.md",
+    "correction.md",
+)
+LOCAL_TEMPLATES = ("local_common.md", "local_analyze_execute.md", "local_review.md", "local_fix.md")
+
+
+@pytest.mark.parametrize("template", REMOTE_TEMPLATES)
+def test_no_remote_prompt_instructs_a_github_read_or_offers_a_credential(template):
+    """#165 (ADR 0004 D10.2): agents hold no GitHub credential, so no prompt
+    tells one to read GitHub with `gh`; it reads the controller's read context."""
+    text = prompts.load_template(template)
+    for read in ("gh issue view", "gh pr view", "gh pr diff", "gh pr checks", "gh api", "gh CLI"):
+        assert read not in text, (template, read)
+    assert "gh credentials" not in text and "headRefOid" not in text
+
+
+def test_common_prompt_names_the_read_context_and_says_no_credential():
+    common = prompts.load_template("common.md")
+    assert "{{READ_CONTEXT_DIR}}" in common
+    for phrase in ("You hold no GitHub credential", "untrusted project data", "[AutoForge omitted"):
+        assert phrase in common, phrase
+    for template in LOCAL_TEMPLATES:
+        assert "READ_CONTEXT_DIR" not in prompts.load_template(template), template
+
+
+@pytest.mark.parametrize(
+    ("template", "files"),
+    [
+        ("analyze_execute.md", ["issue.md"]),
+        ("review.md", ["issue.md", "pull-request.md", "checks.md", "follow-up-issues.md"]),
+        ("fix.md", ["review-comment.md", "issue.md", "follow-up-issues.md"]),
+        ("update_epic.md", ["epic.md", "epic-issues.md"]),
+        ("update_epic_rerequest.md", ["epic.md", "epic-issues.md"]),
+        ("replan_reexecute.md", ["issue.md", "epic.md", "pull-request.md"]),
+    ],
+)
+def test_each_phase_prompt_names_the_read_context_files_it_needs(template, files):
+    text = prompts.load_template(template)
+    for name in files:
+        assert f"`{name}`" in text, (template, name)
+
+
+def test_an_engine_prompt_names_a_pending_read_context_outside_a_launch(engine):
+    from autoforge.engine import READ_CONTEXT_PENDING
+
+    engine.state.phase = Phase.ANALYZE_EXECUTE
+    assert READ_CONTEXT_PENDING in engine.render_prompt_for(Phase.ANALYZE_EXECUTE)

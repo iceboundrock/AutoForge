@@ -3,15 +3,23 @@
 import dataclasses
 import hashlib
 import json
+import os
+import shutil
+import sqlite3
 import sys
 import time
+from contextlib import closing, contextmanager
+from pathlib import Path
 
 import pytest
 
+from autoforge.child_env import GH_PLACEHOLDER_TOKEN
 from autoforge.config import ProfileConfig, default_config
 from autoforge.errors import ConfigurationError
 from autoforge.executor import MAX_DEADLINE_SECONDS, ExecutionResult
 from autoforge.providers import (
+    CLAUDE_INTEGRATION_FLAGS,
+    CLAUDE_SHELL_CLEANER,
     AgentExecutionResult,
     AgentRequest,
     ClaudeCodeProvider,
@@ -19,6 +27,11 @@ from autoforge.providers import (
     PiProvider,
     ProviderRegistry,
     ScriptedProvider,
+    claude_config_files,
+    claude_isolation_env,
+    claude_shell,
+    opencode_data_dir,
+    opencode_isolation_env,
     provider_for,
 )
 from tests.conftest import DECODER_LIMIT_RECORDS
@@ -40,6 +53,11 @@ def test_claude_argv_shape():
     assert argv[argv.index("--effort") + 1] == "high"
     assert argv[argv.index("--permission-mode") + 1] == "bypassPermissions"
     assert "--no-session-persistence" in argv
+    # No hook, plugin or MCP server of any configuration runs, and no
+    # setting of the repository's applies (#165).
+    assert "--safe-mode" in argv and "--strict-mcp-config" in argv
+    assert "--setting-sources=user" in argv
+    assert "--mcp-config" not in argv
     assert argv[-2:] == ["--", "do it; rm -rf /"]  # prompt is one literal element
 
 
@@ -49,7 +67,46 @@ def test_claude_text_opt_out_argv_has_no_verbose():
     argv = ClaudeCodeProvider().build_command_for(p, "do it")
     assert argv[2:4] == ["--output-format", "text"]
     assert "--verbose" not in argv
+    assert "--safe-mode" in argv and "--strict-mcp-config" in argv
+    assert "--mcp-config" not in argv
     assert argv[-2:] == ["--", "do it"]
+
+
+def test_claude_keeps_integrations_off_before_any_extra_args():
+    p = dataclasses.replace(default_config().profile("fix"), extra_args=["--add-dir", "/elsewhere"])
+    ClaudeCodeProvider().validate_profile(p)
+    argv = ClaudeCodeProvider().build_command_for(p, "x")
+    assert argv.index("--safe-mode") < argv.index("--add-dir")
+    assert argv.index("--strict-mcp-config") < argv.index("--add-dir")
+    assert argv.index("--setting-sources=user") < argv.index("--add-dir")
+
+
+@pytest.mark.parametrize("flag", CLAUDE_INTEGRATION_FLAGS)
+@pytest.mark.parametrize("form", ["separate", "joined"])
+def test_claude_refuses_extra_args_that_load_an_integration(flag, form):
+    """#165: an MCP server, a plugin, settings (hooks), an agent definition,
+    a browser or an IDE connection may hold a GitHub token of its own; the
+    error names the flag and never its value."""
+    secret = "apikey-" + "S" * 20
+    args = [flag, f'{{"apiKeyHelper": "{secret}"}}'] if form == "separate" else [f"{flag}={secret}"]
+    p = dataclasses.replace(default_config().profile("fix"), extra_args=["--add-dir", "/x", *args])
+    with pytest.raises(ConfigurationError, match=f"'fix'.*{flag}.*--safe-mode") as err:
+        ClaudeCodeProvider().validate_profile(p)
+    assert secret not in str(err.value)
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        ["--add-dir", "/x"],
+        ["--no-chrome"],
+        ["--fallback-model", "sonnet"],
+        ["--append-system-prompt", "be brief"],
+    ],
+)
+def test_claude_accepts_extra_args_that_load_no_integration(extra_args):
+    p = dataclasses.replace(default_config().profile("fix"), extra_args=extra_args)
+    ClaudeCodeProvider().validate_profile(p)
 
 
 def test_claude_rejects_an_unknown_output_format():
@@ -935,6 +992,34 @@ def test_the_claude_stream_launch_contains_orphans_and_keeps_stdin_closed(tmp_pa
     # The provider's names are added once, never duplicated.
     assert duplex.env_allowlist == ("PATH", "HOME", "CLAUDE_*", "ANTHROPIC_*")
     assert duplex.command == ClaudeCodeProvider().build_command(req)
+    # Nothing of the controller's to set; the adapter's own still are (#165).
+    assert duplex.env is not None and sorted(duplex.env) == sorted(
+        ClaudeCodeProvider.isolation_names
+    )
+
+
+def test_the_controller_set_environment_reaches_the_claude_stream_launch(tmp_path, monkeypatch):
+    from autoforge import providers
+    from tests import claude_fake
+
+    seen = []
+    real = providers.start_duplex
+
+    def spy(req):
+        seen.append(req)
+        return real(req)
+
+    monkeypatch.setattr(providers, "start_duplex", spy)
+    _home, profile = claude_fake.fake_claude(tmp_path, [claude_fake.result("done")])
+    env = {"GH_CONFIG_DIR": str(tmp_path / "gh"), "GIT_TERMINAL_PROMPT": "0"}
+    req = AgentRequest(
+        "FIX", "p", str(tmp_path), profile, 900, 30, env_allowlist=("PATH", "HOME"), env=env
+    )
+    assert ClaudeCodeProvider().execute(req).ok
+    (duplex,) = seen
+    # The controller's variables, and the adapter's own on top (#165).
+    assert duplex.env is not None and {k: duplex.env[k] for k in env} == env
+    assert sorted(set(duplex.env) - set(env)) == sorted(ClaudeCodeProvider.isolation_names)
 
 
 def test_a_progress_sink_that_raises_never_fails_the_claude_run(tmp_path):
@@ -1287,6 +1372,808 @@ def test_provider_environment_names_are_deduplicated_not_repeated():
     got = prov.environment_allowlist(req)
     assert got is not None and len(got) == len(set(got))
     assert got[:2] == ("ANTHROPIC_*", "PATH") and "OPENCODE_*" in got and "OPENAI_*" in got
+
+
+@pytest.mark.parametrize(
+    ("cls", "profile"),
+    [
+        (ClaudeCodeProvider, _text(default_config().profile("fix"))),
+        (OpenCodeProvider, default_config().profile("review_round_1")),
+    ],
+)
+def test_the_controller_set_environment_reaches_a_one_shot_launch(cls, profile):
+    seen: list = []
+    env = {"GH_CONFIG_DIR": "/nowhere/gh", "GIT_TERMINAL_PROMPT": "0"}
+    req = AgentRequest("FIX", "p", "/tmp", profile, None, 7, env_allowlist=("PATH",), env=env)
+    cls(runner=_capture_runner(seen)).execute(req)
+    [launch] = seen
+    assert launch.env_allowlist[0] == "PATH"
+    # The controller's variables, and the adapter's own on top (#165).
+    assert {k: launch.env[k] for k in env} == env
+    assert sorted(set(launch.env) - set(env)) == sorted(cls.isolation_names)
+
+
+def test_claude_and_opencode_set_variables_of_their_own():
+    """Pi keeps its integrations off with #132's flags; OpenCode has none, so
+    it sets :func:`opencode_isolation_env`, and Claude Code, whose flags keep
+    its integrations off, sets what keeps the functions and aliases of a
+    shell startup file out of its Bash tool (:func:`claude_isolation_env`,
+    #165)."""
+    assert PiProvider.isolation_names == ()
+    assert ClaudeCodeProvider.isolation_names == (
+        "CLAUDE_CODE_SHELL",
+        "CLAUDE_CODE_SHELL_PREFIX",
+        "CLAUDE_ENV_FILE",
+    )
+    assert OpenCodeProvider.isolation_names == tuple(sorted(opencode_isolation_env("")))
+    assert set(OpenCodeProvider.isolation_names) == {
+        "OPENCODE_CONFIG_DIR",
+        "OPENCODE_CONFIG_PROJECT_DISABLE",
+        "OPENCODE_DISABLE_PROJECT_CONFIG",
+        "OPENCODE_CONFIG",
+        "OPENCODE_CONFIG_CONTENT",
+    }
+
+
+# R4-F1: Claude Code's Bash tool and the operator's shell startup files. The
+# operator's wrapper hands ``gh`` a token of its own; the fake ``gh`` says
+# whether one reached it, never which.
+_BASH_PATH = shutil.which("bash")
+_ZSH_PATH = shutil.which("zsh")
+_CLAUDE_SHELLS = [
+    pytest.param(_BASH_PATH, id="bash", marks=pytest.mark.skipif(not _BASH_PATH, reason="no bash")),
+    pytest.param(_ZSH_PATH, id="zsh", marks=pytest.mark.skipif(not _ZSH_PATH, reason="no zsh")),
+]
+_OPERATOR_TOKEN = "operator-test-credential"
+_GH_ACCEPTED = "fake gh: a credential reached gh"
+_GH_REFUSED = "fake gh: no credential"
+_CLEANER_REFUSED = "a function or alias of a shell startup file is still defined"
+
+
+def _wrapper_lines(shell: str, gh: Path, kind: str) -> str:
+    """A ``gh`` function or alias of the operator's that passes ``gh`` a token."""
+    if kind == "function":
+        return f'gh() {{ GH_TOKEN={_OPERATOR_TOKEN} {gh} "$@"; }}\n'
+    aliases = "" if Path(shell).name == "zsh" else "shopt -s expand_aliases\n"
+    return aliases + f"alias gh='GH_TOKEN={_OPERATOR_TOKEN} {gh}'\n"
+
+
+def _bash_tool_run(
+    tmp_path: Path,
+    monkeypatch,
+    shell: str,
+    startup: str,
+    *,
+    isolate: bool = True,
+    snapshot: bool = True,
+    output_format: str = "stream-json",
+    files: dict[str, str] | None = None,
+) -> tuple[str, dict]:
+    """Run ``gh pr merge 1`` in the fake Claude's Bash tool through the real
+    adapter, ``startup`` in every file of the operator's that ``shell``
+    reads for it (its rc file for the snapshot, its login file without one);
+    ``isolate=False`` is the launch without the adapter's isolation, and
+    ``files`` are written in the launch directory first. Return the
+    command's output and the fake's log."""
+    from tests import claude_fake
+
+    tmp_path.mkdir()
+    for name, text in (files or {}).items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text(text)
+    home = tmp_path / "home"
+    home.mkdir()
+    zsh = Path(shell).name == "zsh"
+    for name in (".zshrc", ".zprofile") if zsh else (".bashrc", ".bash_profile"):
+        (home / name).write_text(startup.replace("$GH", str(tmp_path / "bin" / "gh")))
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "gh").write_text(
+        "#!/bin/sh\n"
+        f'if [ -n "${{GH_TOKEN:-}}" ] && [ "$GH_TOKEN" != "{GH_PLACEHOLDER_TOKEN}" ]; then\n'
+        f'  echo "{_GH_ACCEPTED}"; exit 0\n'
+        "fi\n"
+        f'echo "{_GH_REFUSED}"; exit 1\n'
+    )
+    (bin_dir / "gh").chmod(0o755)
+    fake_home, profile = claude_fake.fake_claude_bash_tool(
+        tmp_path, "gh pr merge 1", snapshot=snapshot, output_format=output_format
+    )
+    monkeypatch.setenv("SHELL", shell)
+    if not isolate:
+
+        @contextmanager
+        def nothing(self):
+            yield {}
+
+        monkeypatch.setattr(ClaudeCodeProvider, "integration_isolation", nothing)
+    env = {
+        "HOME": str(home),
+        "SHELL": shell,
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+        "GH_TOKEN": GH_PLACEHOLDER_TOKEN,
+    }
+    req = AgentRequest("FIX", "p", str(tmp_path), profile, 120, 120, env_allowlist=(), env=env)
+    res = ClaudeCodeProvider().execute(req)
+    # The wrapper's token never reaches what the run reports.
+    assert _OPERATOR_TOKEN not in res.stdout + res.stderr
+    assert res.exit_code == 0, res.stderr[-2000:]
+    return res.stdout, claude_fake.log(fake_home)
+
+
+@pytest.fixture
+def _no_operator_claude_shell(monkeypatch):
+    """None of the developer's own Claude Code shell settings reaches the fake."""
+    for name in ClaudeCodeProvider.isolation_names:
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.mark.usefixtures("_no_operator_claude_shell")
+@pytest.mark.parametrize("snapshot", [True, False], ids=["snapshot", "login-shell"])
+@pytest.mark.parametrize("kind", ["function", "alias"])
+@pytest.mark.parametrize("shell", _CLAUDE_SHELLS)
+def test_claudes_bash_tool_runs_no_function_or_alias_of_a_startup_file(
+    tmp_path, monkeypatch, shell, kind, snapshot
+):
+    """R4-F1: Claude Code 2.1.296 sources the operator's ``~/.bashrc`` or
+    ``~/.zshrc`` for its snapshot and runs every Bash tool command after it,
+    or in a login shell without one, so a ``gh`` function or alias there
+    would hand the agent's ``gh`` a token. The launch's ``CLAUDE_ENV_FILE``
+    removes every function and alias first; the same launch without the
+    adapter's isolation is the hole."""
+    startup = _wrapper_lines(shell, Path("$GH"), kind)
+    with monkeypatch.context() as m:
+        hole, log = _bash_tool_run(
+            tmp_path / "control", m, shell, startup, isolate=False, snapshot=snapshot
+        )
+    assert _GH_ACCEPTED in hole and log["snapshot"] is snapshot and log["shell"] == shell
+    out, log = _bash_tool_run(tmp_path / "launch", monkeypatch, shell, startup, snapshot=snapshot)
+    assert log["snapshot"] is snapshot and log["shell"] == shell
+    assert _GH_REFUSED in out and _GH_ACCEPTED not in out
+
+
+@pytest.mark.usefixtures("_no_operator_claude_shell")
+@pytest.mark.parametrize("shell", _CLAUDE_SHELLS)
+def test_claudes_bash_tool_cleaner_works_on_the_one_shot_path(tmp_path, monkeypatch, shell):
+    """``output_format: text`` launches through the shared one-shot path,
+    which sets the same isolation."""
+    startup = _wrapper_lines(shell, Path("$GH"), "function")
+    out, _log = _bash_tool_run(
+        tmp_path / "launch", monkeypatch, shell, startup, output_format="text"
+    )
+    assert _GH_REFUSED in out and _GH_ACCEPTED not in out
+
+
+@pytest.mark.usefixtures("_no_operator_claude_shell")
+@pytest.mark.parametrize("shell", _CLAUDE_SHELLS)
+def test_a_startup_file_that_shadows_the_cleaner_runs_no_command(tmp_path, monkeypatch, shell):
+    """Functions named after the builtins that remove functions and aliases
+    cannot keep the wrapper: bash's POSIX mode puts the special builtin
+    ``unset`` ahead of them, and zsh, which has no such mode, refuses to
+    run the command once its tables still hold one."""
+    zsh = Path(shell).name == "zsh"
+    shadows = ("builtin", "unfunction", "unalias", "unset") if zsh else ("builtin", "unalias")
+    startup = "".join(f"{name}() {{ :; }}\n" for name in shadows)
+    startup += _wrapper_lines(shell, Path("$GH"), "function")
+    with monkeypatch.context() as m:
+        hole, _log = _bash_tool_run(tmp_path / "control", m, shell, startup, isolate=False)
+    assert _GH_ACCEPTED in hole
+    out, _log = _bash_tool_run(tmp_path / "launch", monkeypatch, shell, startup)
+    assert _GH_ACCEPTED not in out
+    if zsh:
+        assert _CLEANER_REFUSED in out and _GH_REFUSED not in out
+    else:
+        assert _GH_REFUSED in out
+
+
+@pytest.mark.usefixtures("_no_operator_claude_shell")
+@pytest.mark.parametrize("name", ["settings.json", "settings.local.json"])
+@pytest.mark.parametrize("shell", _CLAUDE_SHELLS)
+def test_the_repositorys_claude_settings_cannot_undo_the_cleaner(
+    tmp_path, monkeypatch, shell, name
+):
+    """2.1.296 sets the ``env`` of the project's and the local settings,
+    files of the worktree the repository controls, over a launch's under
+    ``--safe-mode`` too: a ``CLAUDE_ENV_FILE`` there would bring the
+    operator's wrapper back. ``--setting-sources=user`` reads neither."""
+    from autoforge import providers
+
+    startup = _wrapper_lines(shell, Path("$GH"), "function")
+    files = {f".claude/{name}": json.dumps({"env": {"CLAUDE_ENV_FILE": "/dev/null"}})}
+    with monkeypatch.context() as m:
+        m.setattr(providers, "CLAUDE_ISOLATION_FLAGS", ("--safe-mode", "--strict-mcp-config"))
+        hole, _log = _bash_tool_run(tmp_path / "control", m, shell, startup, files=files)
+    assert _GH_ACCEPTED in hole
+    out, _log = _bash_tool_run(tmp_path / "launch", monkeypatch, shell, startup, files=files)
+    assert _GH_REFUSED in out and _GH_ACCEPTED not in out
+
+
+@pytest.mark.parametrize("variable", ["CLAUDE_CODE_SHELL_PREFIX", "CLAUDE_CODE_SHELL"])
+@pytest.mark.parametrize("shell", _CLAUDE_SHELLS)
+def test_claudes_bash_tool_runs_in_no_program_of_the_operators(
+    tmp_path, monkeypatch, shell, variable
+):
+    """An operator's ``CLAUDE_CODE_SHELL_PREFIX`` (a program 2.1.296 runs
+    every command through) or ``CLAUDE_CODE_SHELL`` (the shell it starts,
+    any executable whose path names a bash or a zsh) reaches the launch
+    through ``CLAUDE_*``; one that adds a token is replaced."""
+    wrappers = tmp_path / "operator-bash"
+    wrappers.mkdir()
+    program = wrappers / ("prefix" if variable == "CLAUDE_CODE_SHELL_PREFIX" else "bash")
+    run = f'"{shell}" -c "$1"' if variable == "CLAUDE_CODE_SHELL_PREFIX" else f'"{shell}" "$@"'
+    program.write_text(f"#!/bin/sh\nexport GH_TOKEN={_OPERATOR_TOKEN}\nexec {run}\n")
+    program.chmod(0o755)
+    for name in ClaudeCodeProvider.isolation_names:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(variable, str(program))
+    with monkeypatch.context() as m:
+        hole, _log = _bash_tool_run(tmp_path / "control", m, shell, "", isolate=False)
+    assert _GH_ACCEPTED in hole
+    out, log = _bash_tool_run(tmp_path / "launch", monkeypatch, shell, "")
+    assert _GH_REFUSED in out and _GH_ACCEPTED not in out and log["shell"] == shell
+
+
+def test_the_claude_shell_environment_file_lives_as_long_as_the_launch(tmp_path, monkeypatch):
+    """The cleaner is a file of the launch's own (mode 0600 in a 0700
+    directory), there while Claude Code runs and removed after it."""
+    from autoforge import providers
+    from tests import claude_fake
+
+    seen = []
+    real = providers.start_duplex
+
+    def spy(req):
+        path = Path(req.env["CLAUDE_ENV_FILE"])
+        seen.append(
+            (
+                path,
+                path.read_text(),
+                path.stat().st_mode & 0o777,
+                path.parent.stat().st_mode & 0o777,
+            )
+        )
+        return real(req)
+
+    monkeypatch.setattr(providers, "start_duplex", spy)
+    _home, profile = claude_fake.fake_claude(tmp_path, [claude_fake.result("done")])
+    req = AgentRequest("FIX", "p", str(tmp_path), profile, 900, 30, env_allowlist=("PATH",))
+    assert ClaudeCodeProvider().execute(req).ok
+    [(path, text, mode, dir_mode)] = seen
+    assert text == CLAUDE_SHELL_CLEANER and mode == 0o600 and dir_mode == 0o700
+    assert not path.exists() and not path.parent.exists()
+
+
+def test_claudes_bash_tool_runs_in_a_bash_or_a_zsh(monkeypatch):
+    """``CLAUDE_CODE_SHELL`` is the launch's shell when it is a bash or a zsh,
+    else the bash or zsh on ``PATH``: 2.1.296 runs a command in no other."""
+    assert claude_shell("/opt/bin/zsh") == "/opt/bin/zsh"
+    assert claude_shell("/usr/bin/bash") == "/usr/bin/bash"
+    found = {"bash": None, "zsh": "/z/zsh"}
+    monkeypatch.setattr(shutil, "which", lambda name: found.get(name))
+    assert claude_shell("/bin/dash") == "/z/zsh"
+    found["bash"] = "/b/bash"
+    assert claude_shell("/bin/sh") == "/b/bash"
+    found.clear()
+    assert claude_shell("/bin/sh") == ""
+    assert claude_isolation_env("/f", "/b/bash") == {
+        "CLAUDE_ENV_FILE": "/f",
+        "CLAUDE_CODE_SHELL": "/b/bash",
+        "CLAUDE_CODE_SHELL_PREFIX": "",
+    }
+
+
+def test_the_claude_configuration_files_are_the_launchs(tmp_path):
+    """2.1.296: the user settings and the global configuration, by
+    ``CLAUDE_CONFIG_DIR``, ``HOME`` and ``CLAUDE_CODE_CUSTOM_OAUTH_URL``."""
+    home, config = tmp_path / "home", tmp_path / "config"
+    assert claude_config_files({"HOME": str(home)}) == [
+        home / ".claude" / "settings.json",
+        home / ".claude.json",
+    ]
+    assert claude_config_files({"HOME": str(home), "CLAUDE_CONFIG_DIR": str(config)}) == [
+        config / "settings.json",
+        config / ".claude.json",
+    ]
+    assert claude_config_files(
+        {"HOME": str(home), "CLAUDE_CODE_CUSTOM_OAUTH_URL": "https://login.example.invalid"}
+    ) == [home / ".claude" / "settings.json", home / ".claude-custom-oauth.json"]
+    config.mkdir()
+    (config / ".config.json").write_text("{}")
+    assert claude_config_files({"HOME": str(home), "CLAUDE_CONFIG_DIR": str(config)})[1] == (
+        config / ".config.json"
+    )
+
+
+@pytest.fixture
+def operator_claude_config(tmp_path, monkeypatch):
+    """The real configuration resolution over a home of the test's own."""
+    from autoforge import providers
+
+    home = tmp_path / "operator-home"
+    (home / ".claude").mkdir(parents=True)
+    monkeypatch.setattr(providers, "claude_config_files", claude_config_files)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_CUSTOM_OAUTH_URL", raising=False)
+    return home
+
+
+_CLAUDE_REFUSED_NAMES = [
+    "GH_TOKEN",
+    "github_token",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_ASKPASS",
+    "SSH_AUTH_SOCK",
+    "ZDOTDIR",
+    "SHELL",
+    "HOME",
+    "BASH_ENV",
+    "BASH_FUNC_gh%%",
+    "CLAUDE_ENV_FILE",
+    "CLAUDE_CODE_SHELL",
+    "claude_code_shell_prefix",
+]
+
+
+@pytest.mark.parametrize("name", _CLAUDE_REFUSED_NAMES)
+@pytest.mark.parametrize("where", ["settings", "global", "config dir"])
+def test_claude_configuration_that_sets_a_variable_over_the_launch_refuses_it(
+    tmp_path, monkeypatch, operator_claude_config, name, where
+):
+    """R4-F1: 2.1.296 applies the env of the user settings and of the
+    global configuration over the environment it starts with, under
+    ``--safe-mode`` too: a ``GH_TOKEN`` there replaces the placeholder, a
+    ``CLAUDE_ENV_FILE`` the cleaner. The launch is refused before anything
+    starts, naming the file and the variable, never the value."""
+    from tests import claude_fake
+
+    home = operator_claude_config
+    if where == "config dir":
+        config = tmp_path / "claude-config"
+        config.mkdir()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+        path = config / "settings.json"
+    else:
+        path = home / ".claude" / "settings.json" if where == "settings" else home / ".claude.json"
+    value = "operator-test-value"
+    path.write_text(json.dumps({"env": {"HARMLESS_NAME": "1", name: value}, "theme": "dark"}))
+    fake_home, profile = claude_fake.fake_claude(tmp_path, [claude_fake.result("done")])
+    allow = default_config().execution.environment_names()
+    req = AgentRequest("FIX", "p", str(tmp_path), profile, 900, 30, env_allowlist=allow)
+    with pytest.raises(ConfigurationError) as caught:
+        ClaudeCodeProvider().execute(req)
+    message = str(caught.value)
+    assert message.startswith("refusing to launch claude")
+    assert f"{name} in the env of {path}" in message
+    assert value not in message and "HARMLESS_NAME" not in message
+    assert not (fake_home / "log.json").exists()
+
+
+def test_claude_configuration_without_such_a_variable_launches(tmp_path, operator_claude_config):
+    from tests import claude_fake
+
+    home = operator_claude_config
+    (home / ".claude" / "settings.json").write_text(json.dumps({"env": {"FOO": "1"}}))
+    (home / ".claude.json").write_text(json.dumps({"projects": {}, "env": "not a mapping"}))
+    _fake_home, profile = claude_fake.fake_claude(tmp_path, [claude_fake.result("done")])
+    allow = default_config().execution.environment_names()
+    req = AgentRequest("FIX", "p", str(tmp_path), profile, 900, 30, env_allowlist=allow)
+    assert ClaudeCodeProvider().execute(req).ok
+
+
+@pytest.mark.parametrize("kind", ["not json", "fifo", "directory", "too large"])
+def test_claude_configuration_that_cannot_be_checked_refuses_the_launch(
+    tmp_path, monkeypatch, operator_claude_config, kind
+):
+    """A file that exists but cannot be read is not assumed clean; a FIFO is
+    never opened, so it cannot block the launch."""
+    from autoforge import providers
+
+    path = operator_claude_config / ".claude" / "settings.json"
+    if kind == "not json":
+        path.write_text("{ not json")
+    elif kind == "fifo":
+        os.mkfifo(path)
+    elif kind == "directory":
+        path.mkdir()
+    else:
+        monkeypatch.setattr(providers, "CLAUDE_MAX_CONFIG_BYTES", 16)
+        path.write_text(json.dumps({"env": {}, "padding": "x" * 64}))
+    allow = default_config().execution.environment_names()
+    with pytest.raises(ConfigurationError) as caught:
+        ClaudeCodeProvider().integration_preflight(allow)
+    assert str(path) in str(caught.value)
+    assert "not checked" in str(caught.value) or "could not be checked" in str(caught.value)
+
+
+# A fake `opencode` that resolves its configuration the way 2.0.26 does (read
+# from the build; providers.py, `opencode_isolation_env` and
+# `opencode_organization_problems`), reports which MCP servers and plugin
+# directories it would load and what its global configuration directory
+# held, and answers.
+_CONFIG_RESOLVING_OPENCODE = r"""
+import json, os, sqlite3, sys
+from pathlib import Path
+
+sys.stdin.read()
+env = os.environ
+config_dir = Path(env.get("OPENCODE_CONFIG_DIR") or Path(
+    env.get("XDG_CONFIG_HOME") or Path(env["HOME"], ".config"), "opencode"))
+documents, directories = [], []
+
+# Each organization its database lists, ahead of every file: with no
+# credential for it (and no network here), the configuration cached for it.
+data_dir = Path(env.get("XDG_DATA_HOME") or Path(env["HOME"], ".local", "share"), "opencode")
+database = env.get("OPENCODE_DB", "opencode.db")
+if database != ":memory:" and (data_dir / database).is_file():
+    db = sqlite3.connect(data_dir / database)
+    row = db.execute("SELECT value FROM kv WHERE key = 'wellknown:sources'").fetchone()
+    for origin in json.loads(row[0]) if row else []:
+        cached = db.execute(
+            "SELECT value FROM kv WHERE key = ?", ("wellknown:config:" + origin,)
+        ).fetchone()
+        documents.extend(json.loads(cached[0]) if cached else [])
+
+
+def document(path):
+    if path.is_file():
+        documents.append(json.loads(path.read_text()))
+
+
+for name in ("opencode.json", "opencode.jsonc"):
+    document(config_dir / name)
+directories.append(config_dir)
+if env.get("OPENCODE_CONFIG"):
+    document(Path(env["OPENCODE_CONFIG"]))
+disabled = env.get("OPENCODE_CONFIG_PROJECT_DISABLE", env.get("OPENCODE_DISABLE_PROJECT_CONFIG"))
+if disabled not in ("1", "true"):
+    here = Path.cwd()
+    for directory in [here, *here.parents]:
+        for name in ("opencode.jsonc", "opencode.json"):
+            document(directory / name)
+        directories.append(directory / ".opencode")
+if env.get("OPENCODE_CONFIG_CONTENT"):
+    documents.append(json.loads(env["OPENCODE_CONFIG_CONTENT"]))
+servers = sorted({n for d in documents for n in d.get("mcp", {}).get("servers", {})})
+plugins = sorted(
+    str(p) for d in directories for sub in ("plugin", "plugins") for p in (d / sub).glob("*")
+)
+report = {
+    "mcp": servers,
+    "plugins": plugins,
+    "config_dir_was_empty": config_dir.is_dir() and not any(config_dir.iterdir()),
+    "config_dir": str(config_dir),
+}
+Path(sys.argv[sys.argv.index("--report") + 1]).write_text(json.dumps(report))
+print("done")
+"""
+
+
+def _opencode_world(tmp_path, monkeypatch):
+    """An operator's and a repository's OpenCode configuration, each naming
+    an MCP server and a plugin, and the operator's shell pointing at more."""
+    home = tmp_path / "home"
+    global_dir = home / ".config" / "opencode"
+    (global_dir / "plugin").mkdir(parents=True)
+    servers = {"servers": {"global-gh": {"type": "local", "command": ["gh-mcp"]}}}
+    (global_dir / "opencode.json").write_text(json.dumps({"mcp": servers}))
+    (global_dir / "plugin" / "g.js").write_text("export const G = async () => ({})\n")
+    checkout = tmp_path / "checkout"
+    worktree = checkout / ".git" / "autoforge" / "worktrees" / "7"
+    (worktree / ".opencode" / "plugin").mkdir(parents=True)
+    (worktree / ".opencode" / "plugin" / "p.js").write_text("export const P = async () => ({})\n")
+    project = {"servers": {"project-gh": {"type": "local", "command": ["x"]}}}
+    (worktree / "opencode.json").write_text(json.dumps({"mcp": project}))
+    # Above the worktree: the operator's checkout, where the search would
+    # otherwise reach.
+    above = {"servers": {"checkout-gh": {"type": "local", "command": ["x"]}}}
+    (checkout / "opencode.json").write_text(json.dumps({"mcp": above}))
+    explicit = tmp_path / "explicit.json"
+    explicit.write_text(json.dumps({"mcp": {"servers": {"explicit-gh": {}}}}))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.setenv("OPENCODE_CONFIG", str(explicit))
+    monkeypatch.setenv(
+        "OPENCODE_CONFIG_CONTENT", json.dumps({"mcp": {"servers": {"content-gh": {}}}})
+    )
+    monkeypatch.setenv("OPENCODE_CONFIG_PROJECT_DISABLE", "0")
+    fake = tmp_path / "bin" / "opencode"
+    fake.parent.mkdir()
+    fake.write_text(f"#!{sys.executable}\n{_CONFIG_RESOLVING_OPENCODE}")
+    fake.chmod(0o755)
+    return fake, worktree
+
+
+def test_an_opencode_launch_loads_no_mcp_server_or_plugin_of_any_configuration(
+    tmp_path, monkeypatch
+):
+    """#165: the operator's global configuration and plugin directory, the
+    repository's, one above the worktree, and the operator's
+    ``OPENCODE_CONFIG`` / ``OPENCODE_CONFIG_CONTENT`` all name an MCP server
+    or a plugin; the launch, through the real executor, loads none, and the
+    configuration directory it got is empty and gone afterwards."""
+    from autoforge.executor import ExecutionRequest, execute
+
+    fake, worktree = _opencode_world(tmp_path, monkeypatch)
+    report = tmp_path / "report.json"
+    # What the CLI would load without the adapter's variables.
+    execute(
+        ExecutionRequest(
+            command=[str(fake), "--report", str(report)],
+            cwd=str(worktree),
+            timeout_seconds=60,
+            stdin_data=b"p",
+        )
+    )
+    loaded = json.loads(report.read_text())
+    assert loaded["mcp"] == [
+        "checkout-gh",
+        "content-gh",
+        "explicit-gh",
+        "global-gh",
+        "project-gh",
+    ]
+    assert len(loaded["plugins"]) == 2
+
+    profile = ProfileConfig(
+        name="review_round_1",
+        provider="opencode",
+        model="openai/x",
+        command=str(fake),
+        extra_args=["--report", str(report)],
+    )
+    req = AgentRequest(
+        "REVIEW",
+        "p",
+        str(worktree),
+        profile,
+        None,
+        60,
+        env_allowlist=("PATH", "HOME", "XDG_CONFIG_HOME"),
+    )
+    assert OpenCodeProvider().execute(req).exit_code == 0
+    isolated = json.loads(report.read_text())
+    assert isolated["mcp"] == [] and isolated["plugins"] == []
+    assert isolated["config_dir_was_empty"]
+    assert not Path(isolated["config_dir"]).exists()
+
+
+_ORG = "https://org.example.invalid"
+_ORG_CONFIG = [{"mcp": {"servers": {"org-gh": {"type": "local", "command": ["org-mcp"]}}}}]
+
+
+def _opencode_database(path: Path, kv: dict[str, object]) -> Path:
+    """A database laid out as OpenCode 2.0.26's (``kv`` and ``credential``,
+    the tables of a fresh one), holding ``kv`` and a model credential."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(path)) as db:
+        db.execute(
+            "CREATE TABLE kv (key text PRIMARY KEY, value text NOT NULL, "
+            "time_created integer NOT NULL, time_updated integer NOT NULL)"
+        )
+        db.execute(
+            "CREATE TABLE credential (id text PRIMARY KEY, integration_id text, "
+            "label text NOT NULL, value text NOT NULL, connector_id text, method_id text, "
+            "active integer, time_created integer NOT NULL, time_updated integer NOT NULL)"
+        )
+        rows = {"models-dev:catalog": {"body": "{}"}, **kv}
+        db.executemany(
+            "INSERT INTO kv VALUES (?, ?, 0, 0)", [(k, json.dumps(v)) for k, v in rows.items()]
+        )
+        db.execute(
+            "INSERT INTO credential VALUES ('cred_1', 'openai', 'API key', ?, NULL, NULL, 1, 0, 0)",
+            (json.dumps({"type": "key", "key": "model-key-placeholder"}),),
+        )
+        db.commit()
+    return path
+
+
+def _org_request(tmp_path, monkeypatch):
+    """The fake OpenCode of :func:`_opencode_world`, the real resolution of
+    its data directory (``~/.local/share/opencode``), and a request for it."""
+    import autoforge.providers as providers_module
+
+    fake, worktree = _opencode_world(tmp_path, monkeypatch)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    monkeypatch.setattr(providers_module, "opencode_data_dir", opencode_data_dir)
+    report = tmp_path / "report.json"
+    profile = ProfileConfig(
+        name="review_round_1",
+        provider="opencode",
+        model="openai/x",
+        command=str(fake),
+        extra_args=["--report", str(report)],
+    )
+    allowlist = ("PATH", "HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME")
+    req = AgentRequest("REVIEW", "p", str(worktree), profile, None, 60, env_allowlist=allowlist)
+    return fake, report, req, tmp_path / "home" / ".local" / "share" / "opencode"
+
+
+def _loaded_without_the_adapter(fake, report, cwd) -> list[str]:
+    """The MCP servers the CLI loads in the operator's environment."""
+    from autoforge.executor import ExecutionRequest, execute
+
+    execute(
+        ExecutionRequest(
+            command=[str(fake), "--report", str(report)],
+            cwd=cwd,
+            timeout_seconds=60,
+            stdin_data=b"p",
+        )
+    )
+    loaded = json.loads(report.read_text())["mcp"]
+    report.unlink()
+    return loaded
+
+
+@pytest.mark.parametrize(
+    "where",
+    ["cached-configuration", "nothing-cached-yet", "legacy-auth-file", "named-database"],
+)
+def test_an_opencode_launch_is_refused_while_an_organization_is_connected(
+    tmp_path, monkeypatch, where
+):
+    """#165: an organization connected to OpenCode (a ``.well-known/opencode``
+    integration) is loaded ahead of every configuration file, and 2.0.26 has
+    no variable or flag that keeps it off: with no credential for it the
+    cached configuration is (``opencode auth logout`` removes only the
+    credential), and it names an MCP server here. The launch is refused
+    before the CLI starts, naming where and how many, never an origin."""
+    fake, report, req, data_dir = _org_request(tmp_path, monkeypatch)
+    org = {"wellknown:sources": [_ORG]}
+    if where == "cached-configuration":
+        _opencode_database(
+            data_dir / "opencode.db", {**org, f"wellknown:config:{_ORG}": _ORG_CONFIG}
+        )
+        assert "org-gh" in _loaded_without_the_adapter(fake, report, req.cwd)
+        expected = f"1 organization(s) connected to OpenCode in {data_dir / 'opencode.db'}"
+    elif where == "nothing-cached-yet":
+        # A launch would fetch the organization's configuration itself.
+        _opencode_database(data_dir / "opencode.db", org)
+        expected = f"1 organization(s) connected to OpenCode in {data_dir / 'opencode.db'}"
+    elif where == "legacy-auth-file":
+        # Imported as a source into the database a launch creates.
+        data_dir.mkdir(parents=True)
+        (data_dir / "auth.json").write_text(
+            json.dumps({_ORG: {"type": "wellknown", "key": "ORG_TOKEN", "token": "placeholder"}})
+        )
+        expected = f'an organization (a "wellknown" entry) in {data_dir / "auth.json"}'
+    else:
+        named = _opencode_database(
+            tmp_path / "elsewhere.db", {**org, f"wellknown:config:{_ORG}": _ORG_CONFIG}
+        )
+        _opencode_database(data_dir / "opencode.db", {})
+        monkeypatch.setenv("OPENCODE_DB", str(named))
+        assert "org-gh" in _loaded_without_the_adapter(fake, report, req.cwd)
+        expected = f"1 organization(s) connected to OpenCode in {named}"
+    with pytest.raises(ConfigurationError) as caught:
+        OpenCodeProvider().execute(req)
+    message = str(caught.value)
+    assert message.startswith("refusing to launch opencode") and expected in message
+    assert _ORG not in message and "placeholder" not in message
+    assert not report.exists()  # the CLI never started
+
+
+@pytest.mark.parametrize("where", ["model-credentials-only", "memory-database"])
+def test_an_opencode_launch_with_no_organization_proceeds(tmp_path, monkeypatch, where):
+    """Model credentials, an emptied organization list and a legacy
+    ``auth.json`` of API keys refuse nothing; neither does an organization
+    in a database the launch does not open (``OPENCODE_DB=:memory:``, the
+    documented way out)."""
+    fake, report, req, data_dir = _org_request(tmp_path, monkeypatch)
+    if where == "model-credentials-only":
+        _opencode_database(data_dir / "opencode.db", {"wellknown:sources": []})
+        (data_dir / "auth.json").write_text(
+            json.dumps({"openai": {"type": "api", "key": "model-key-placeholder"}})
+        )
+    else:
+        _opencode_database(
+            data_dir / "opencode.db",
+            {"wellknown:sources": [_ORG], f"wellknown:config:{_ORG}": _ORG_CONFIG},
+        )
+        monkeypatch.setenv("OPENCODE_DB", ":memory:")
+    assert OpenCodeProvider().execute(req).exit_code == 0
+    assert json.loads(report.read_text())["mcp"] == []
+
+
+@pytest.mark.parametrize(
+    ("name", "content", "reason"),
+    [
+        ("opencode.db", b"not a database, but not empty either" * 100, "(DatabaseError)"),
+        ("auth.json", b"{not json", "(not JSON)"),
+    ],
+)
+def test_opencode_data_that_cannot_be_read_refuses_the_launch(
+    tmp_path, monkeypatch, name, content, reason
+):
+    fake, report, req, data_dir = _org_request(tmp_path, monkeypatch)
+    data_dir.mkdir(parents=True)
+    (data_dir / name).write_bytes(content)
+    with pytest.raises(ConfigurationError) as caught:
+        OpenCodeProvider().execute(req)
+    assert f"{data_dir / name} could not be checked {reason}" in str(caught.value)
+    assert not report.exists()
+
+
+@pytest.mark.parametrize("name", ["opencode.db", "auth.json"])
+def test_an_opencode_data_file_that_is_a_fifo_refuses_without_blocking(tmp_path, monkeypatch, name):
+    import os
+
+    fake, report, req, data_dir = _org_request(tmp_path, monkeypatch)
+    data_dir.mkdir(parents=True)
+    os.mkfifo(data_dir / name)
+    with pytest.raises(ConfigurationError) as caught:
+        OpenCodeProvider().execute(req)
+    assert f"{data_dir / name} could not be checked (not a regular file)" in str(caught.value)
+
+
+def test_the_opencode_data_directory_is_the_launchs():
+    assert opencode_data_dir({"XDG_DATA_HOME": "/x", "HOME": "/h"}) == Path("/x/opencode")
+    assert opencode_data_dir({"HOME": "/h"}) == Path("/h/.local/share/opencode")
+    assert opencode_data_dir({"XDG_DATA_HOME": "", "HOME": "/h"}) == Path(
+        "/h/.local/share/opencode"
+    )
+
+
+def test_an_opencode_configuration_directory_that_cannot_be_made_launches_nothing(monkeypatch):
+    import autoforge.providers as providers_module
+    from autoforge.errors import ExecutionError
+
+    def refuse(**_kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(providers_module.tempfile, "mkdtemp", refuse)
+    seen: list = []
+    req = AgentRequest("REVIEW", "p", "/tmp", default_config().profile("review_round_1"), None, 7)
+    with pytest.raises(ExecutionError, match="opencode configuration"):
+        OpenCodeProvider(runner=_capture_runner(seen)).execute(req)
+    assert seen == []
+
+
+def test_the_controller_set_environment_reaches_pis_auth_preflight(tmp_path):
+    seen = []
+    prov = PiProvider(runner=_capture_runner(seen))
+    env = {"GH_CONFIG_DIR": str(tmp_path / "gh")}
+    req = AgentRequest(
+        "REVIEW", "p", str(tmp_path), _pi(command="pi"), None, 7, env_allowlist=("PATH",), env=env
+    )
+    prov.execute(req)
+    [check] = seen
+    assert check.env == env
+
+
+class _LeakyAdapter(ScriptedProvider):
+    """A provider-neutral test adapter whose own names include a credential
+    route (the SDK adapters of #151/#152 are held to the same check)."""
+
+    name = "leaky"
+
+
+@pytest.mark.parametrize(
+    ("names", "variable"),
+    [
+        (("GH_TOKEN",), "GH_TOKEN"),
+        (("GH_*",), "GH_TOKEN"),
+        (("SSH_AUTH_SOCK",), "SSH_AUTH_SOCK"),
+        (("GIT_*",), "GIT_ASKPASS"),
+        (("SDK_KEY", "GIT_CONFIG_KEY_0"), "GIT_CONFIG_KEY_0"),
+    ],
+)
+def test_an_adapter_whose_own_names_carry_a_credential_route_is_refused(names, variable):
+    adapter = _LeakyAdapter([])
+    adapter.environment_names = names
+    profile = ProfileConfig(name="x", provider="leaky", model="m", effort="high")
+    with pytest.raises(ConfigurationError, match=f"provider 'leaky'.*{variable}"):
+        adapter.validate_profile(profile)
+    with pytest.raises(ConfigurationError, match=variable):
+        adapter.launch_allowlist(("PATH",))
+
+
+def test_a_launch_allowlist_with_a_credential_route_is_refused_whatever_its_source():
+    # The engine's list comes through config load, which refuses it first;
+    # the adapter refuses it again for one that did not.
+    with pytest.raises(ConfigurationError, match="GITHUB_TOKEN"):
+        OpenCodeProvider().launch_allowlist(("PATH", "GITHUB_TOKEN"))
 
 
 def test_every_real_provider_declares_only_valid_environment_patterns():

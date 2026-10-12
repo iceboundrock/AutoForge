@@ -188,6 +188,11 @@ one, and every probe and read-back reads them through it:
   escaped before they are rendered into a prompt; a marker's text never
   becomes controller or prompt syntax
 
+Then, before each launch (a correction relaunch too), the credential
+preflight runs and the phase's read context is written ("Agents hold no
+GitHub credential" below): a refusal stops the step before anything is
+charged or saved.
+
 ### Before REVIEW
 
 The reviewer makes no GitHub write in this phase (ADR 0004 K4, #162). It
@@ -726,6 +731,8 @@ It must not:
   effects the step would perform and every recorded effect it would
   reconcile first; the `UPDATE_EPIC` plan is computed from persisted state
   alone and reads nothing from GitHub.
+- write an agent's read context: the rendered prompt names a placeholder
+  instead of the per-launch directory.
 
 Never rely only on telling an LLM "do not modify anything".
 
@@ -804,7 +811,9 @@ write or pushes.
   no more authority than the agent. `autoforge doctor` is an operator
   diagnostic outside any run and keeps its own requests: it runs only
   `git --version`, `rev-parse --show-toplevel` and `remote get-url`, none
-  of which starts a hook, the monitor or a filter.
+  of which starts a hook, the monitor or a filter, plus the launch
+  preflight's `git config --list`, which goes through the hardened local
+  request like every controller git process (#165).
 
 ### Published content
 
@@ -837,6 +846,413 @@ from the base to the candidate is read back by the transport and refused
 its message contains a credential class, or a closing keyword naming any
 issue other than the run's own (`#n`, `owner/repo#n` or the issue's URL):
 GitHub would close that issue once the commit reaches the default branch.
+
+## Agents hold no GitHub credential
+
+ADR 0004 moved every externally visible write to the controller; #165
+removes the authority to make one from everything else AutoForge launches.
+Agents and repository-defined commands (LOCAL `local.validation_commands`,
+`merge.verification_commands`) receive no GitHub or git credential through
+anything AutoForge controls, so a prompt-injected agent that tries a write
+fails for lack of a credential, not for lack of an instruction. The
+mechanism is `src/autoforge/child_env.py`, provider-neutral and applied by
+the engine to all three kinds of launch the same way; Pi keeps #132's
+policy (docs/pi-policy.md).
+
+### The operation classification
+
+The classification of ADR 0004 D1.2 names operations, not tools; #148 and
+#149 cite it. Every mutation the workflow makes and every `gh` and `git`
+operation the REMOTE prompts used to name is in one class. LOCAL prompts
+make no GitHub call and are out of scope.
+
+| Operation | Class | Who performs it |
+|---|---|---|
+| push a branch: the implementation, a fix, a replacement | controller-only | the controller, effect K1 |
+| open or adopt the implementation PR, the replacement PR | controller-only | the controller, effects K2, K3, K7 |
+| post a round's review comment | controller-only | the controller, effect K4 |
+| create a follow-up issue, append a follow-up marker | controller-only | the controller, effects K5, K6 |
+| post the EPIC progress comment; splice the EPIC roadmap | controller-only | the controller, effect K8 and the roadmap write |
+| close, reopen or comment on the source PR of a replan | controller-only | the controller's replan transaction |
+| merge; disable auto-merge | controller-only | the controller, behind `safety.allow_merge` |
+| edit a comment in place, close an issue, delete a branch, labels, assignees, milestones, any other REST or GraphQL mutation | controller-only | nobody: there is no kind for it |
+| read an issue, a PR, comments, checks, the EPIC and its issues | read-only external | the controller, into the agent's read context (below) |
+| `git fetch` of the revisions a phase works on | network read | the controller, before the launch (objects only) |
+| read the diff of the bound revision | agent-local | the agent, `git diff` over what the controller fetched |
+| commit on the worktree's detached `HEAD`, `git rev-parse`, `git log` | agent-local | the agent; never load-bearing |
+| create, delete or move a local branch or a worktree | operator-owned local | nobody (the controller's single `worktree add` aside) |
+
+### The authority rule
+
+**A provider interaction approval never grants a controller-only
+operation** (ADR 0004 D1.3). An approval (a provider permission prompt or
+mode, an interaction answer, an SDK permission callback) changes what a
+provider tool may *attempt*; it never changes which credentials the process
+holds. The rule holds by construction: the credential a controller-only
+operation needs is absent from every agent and repository-command runtime.
+Provider permission modes and deny lists are defence in depth at most,
+never the boundary.
+
+### What every launch gets
+
+- **Names never inherited.** `FORBIDDEN_ENV_NAMES` and
+  `FORBIDDEN_ENV_PREFIXES`: gh's tokens and configuration location
+  (`GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`,
+  `GITHUB_ENTERPRISE_TOKEN`, `GH_HOST`, `GH_CONFIG_DIR`), the programs git
+  and ssh run for a credential or a connection (`GIT_ASKPASS`,
+  `SSH_ASKPASS`, `GIT_SSH`, `GIT_SSH_COMMAND`), the SSH agent socket
+  (`SSH_AUTH_SOCK`), git configuration from the environment
+  (`GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `GIT_CONFIG_COUNT`,
+  `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_KEY_*`, `GIT_CONFIG_VALUE_*`), the
+  session bus a desktop keyring answers on (`XDG_RUNTIME_DIR`,
+  `DBUS_SESSION_BUS_ADDRESS`), where curl and wget find the
+  configuration file they read on every request (`CURL_HOME`, `WGETRC`,
+  `WGET2RC`), `NETRC`, the `.netrc` that curl 8.16 and later, Python's
+  `requests` and Go read in place of `~/.netrc`, and where a shell finds a
+  startup file it runs before a command (`BASH_ENV`, which every
+  non-interactive bash runs; `ENV`, an interactive sh's; `ZDOTDIR`,
+  zsh's). None is in the default allow-list (`SHELL` no longer is either:
+  the controller sets it), and
+  config load refuses any of them, or a `*` prefix covering one, in
+  `execution.env_allowlist`, `env_allowlist_extra` or an adapter's
+  `environment_names`, naming the variable and the rule and never a value.
+  One check (`refuse_forbidden_env`), with no provider branch in the engine.
+- **Variables the controller sets**, over the allow-listed environment, for
+  one launch, from a directory it creates (`mkdtemp`, mode 0700) and removes
+  when the launch ends:
+  - `GH_CONFIG_DIR`: an empty directory, so `gh` finds no `hosts.yml`;
+  - `GH_TOKEN` and `GH_ENTERPRISE_TOKEN`: the placeholder
+    `autoforge-no-github-credential`. With no token in its environment or
+    configuration `gh` falls back to the keyring, which any same-UID
+    process reaches on macOS; a token in the environment is used first, and
+    GitHub refuses this one;
+  - `GIT_CONFIG_GLOBAL`: a file holding only the author and committer
+    identity (`user.*`, `author.*`, `committer.*`) copied from the
+    operator's global git configuration, so `~/.gitconfig` and
+    `$XDG_CONFIG_HOME/git/config` are not read, and an agent's
+    `git config --global` writes land in that file;
+  - `GIT_TERMINAL_PROMPT=0`, and at git's command scope
+    (`GIT_CONFIG_COUNT`), which git reads after every configuration file and
+    which no file can override: `credential.helper=` (an empty value clears
+    the helper list, URL-specific helpers included), `core.askPass=`,
+    `http.extraHeader=` and `core.sshCommand` set to
+    `ssh -F /dev/null -o IdentityFile=none -o IdentitiesOnly=yes -o IdentityAgent=none -o ControlPath=none -o BatchMode=yes`;
+  - `CURL_HOME`: a directory holding an empty `.curlrc`, and `WGETRC`
+    (wget 1.x) and `WGET2RC` (wget2): an empty file. curl reads the first
+    default configuration file it finds, `$CURL_HOME/.curlrc` before the
+    one in `$XDG_CONFIG_HOME` (`curlrc` in curl 8.18, `.curlrc` in 8.5),
+    `~/.curlrc` and the password database's home, and wget reads the file
+    its variable names instead of
+    `~/.wgetrc` or `~/.config/wget/wget2rc`. Either file can add an
+    `Authorization` header to every request, so a plain `curl` or `wget`
+    would otherwise send the operator's token; the child keeps `HOME` and
+    `XDG_CONFIG_HOME`, and its curl and wget still read none of them;
+  - `ZDOTDIR`: an empty directory. zsh reads `.zshenv` from `ZDOTDIR`,
+    else `HOME`, on every start, `zsh -c` and a zsh shebang included, and
+    `.zprofile`, `.zshrc` and `.zlogin` from there for a login or
+    interactive shell; an `export GH_TOKEN=...` in any of them would
+    replace the placeholder for everything the shell runs. A launch's zsh
+    reads none of the operator's (`/etc/zshenv` and the other system files
+    are the administrator's);
+  - `SHELL`: a shell that runs a command without a startup file of the
+    operator's (`child_env.child_shell`): the operator's own when it is an
+    absolute, executable `sh`, `bash`, `zsh`, `dash`, `ksh` or `mksh`, else
+    the `bash` on `PATH`, else `/bin/sh`. The agent CLIs start their shell
+    tool from it: OpenCode 2.0.26 as `$SHELL -c` (a fish or nu `SHELL` it
+    replaces with `bash`); Claude Code 2.1.296 starts the bash or zsh its
+    adapter names in `CLAUDE_CODE_SHELL` (below). A fish or csh-family
+    shell reads its configuration on
+    every start, and no variable redirects it, so a launch never gets one
+    through `SHELL`.
+- **A preflight before every launch** (`child_env.preflight`): one
+  `git config --list --show-scope --includes` in the launch's directory,
+  through the hardened local request, a read of `~/.netrc` (`_netrc`), and
+  a probe of each shell a launch may start as a login shell
+  (`shell_startup_problems`, below).
+  It refuses a credential helper in repository or worktree scope (the
+  shared common dir), a remote URL or `insteadOf` base with an embedded
+  credential, and an `http.extraHeader` (a URL-specific one beats the
+  generic reset) in system, repository or worktree scope, and a `.netrc`
+  entry for GitHub or a `default` entry (git's HTTPS transport reads it
+  through `HOME`, which every child keeps). The readers disagree on netrc
+  syntax (curl 7.84 and later and wget quote with `"` and match keywords in
+  any case, Python's `netrc` module, behind `requests`, drops a `\` before
+  any character, and where a `macdef` body or a comment ends differs), so
+  every word is compared, split at whitespace and `"`, without `\` and
+  without regard to case, wherever it stands: a GitHub host or `default` in
+  a password, a comment or a macro body refuses the file too. For an agent
+  the refusal is a
+  `ConfigurationError` raised before anything is charged, saved or launched,
+  so state is untouched; for a validation command it leaves the phase
+  unverified, and for a pre-merge command it blocks the merge, as a failing
+  command does. It names the scope and the key's shape, never a value or a
+  URL. `autoforge doctor` and `autoforge local doctor` run the same check
+  and report the launch environment by name only.
+- **The login-shell probe.** `bash -l` reads `/etc/profile` and the first
+  of `~/.bash_profile`, `~/.bash_login` and `~/.profile`, and `sh -l`
+  `/etc/profile` and `~/.profile`, all through `HOME`, which every child
+  keeps and no variable redirects. So the preflight runs each shell a
+  launch may start (its `SHELL`, and the `sh`, `bash` and `zsh` on `PATH`)
+  once as `<shell> -l -c <probe>`, in the launch's directory and
+  environment (its allow-list, the controller-set variables, the operator's
+  `HOME`), through the executor with orphan containment. Once the startup
+  files have run, the shell `exec`s the controller's own interpreter
+  (`python -I -S`), which reads the environment the shell exports, what
+  everything it starts inherits: it compares every controller-set variable
+  with its value and looks for every withheld name, and prints after a
+  marker only the names that changed, so no value leaves that process and
+  nothing a startup file prints before the marker counts. Withheld names
+  that give nothing while the probed variables stand are tolerated
+  (`STARTUP_TOLERATED`: `SSH_AUTH_SOCK` with `IdentityAgent=none`,
+  `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` with the placeholder
+  token, `GH_HOST`), so a profile that starts an SSH agent refuses nothing.
+  A startup file that exports a token, unsets the placeholder, names an
+  askpass or an SSH command, or points `BASH_ENV` or `ZDOTDIR` back at the
+  operator's files refuses the launch, naming the shell and the variables;
+  so does a probe that cannot answer (it exits, times out or prints no
+  marker). A launch's zsh reads its startup files
+  from the empty `ZDOTDIR`, so the operator's `.zshenv` and the rest are
+  no problem and are not refused. It costs one short process per shell per
+  launch.
+- **Provider integrations.** An MCP server, a plugin or a hook of the
+  operator's or the repository's configuration may hold a GitHub token of
+  its own, so none runs in a launch; each mechanism was decided from the
+  installed CLI's `--help` or build and checked against it
+  (`providers.py` records how):
+  - Claude Code runs with `--safe-mode`, `--strict-mcp-config` and
+    `--setting-sources=user`: no hook, installed plugin or MCP server of
+    the user's or the project's settings, `.mcp.json`, `--settings`,
+    `--plugin-dir` or `--mcp-config` runs, `CLAUDE_CODE_SAFE_MODE=0`
+    notwithstanding, and the project's and the local settings of the
+    worktree (`.claude/settings.json`, `.claude/settings.local.json`),
+    which the repository controls, are not read. A profile's `extra_args`
+    cannot carry a flag that would bring one back (`--mcp-config`,
+    `--plugin-dir`, `--plugin-url`, `--settings`, `--setting-sources`,
+    `--agents`, `--chrome`, `--ide`): config load refuses it, naming the
+    flag and never its value. `doctor` fails a `claude` whose `--help`
+    lacks one of the three, since it would refuse every launch's argv.
+  - Claude Code's Bash tool runs no function or alias of a shell startup
+    file. 2.1.296 runs `<shell> -c -l` once per session, sources
+    `~/.zshrc` or `~/.bashrc` through `HOME` (whatever `ZDOTDIR` says) and
+    writes the functions, aliases and options it then has to a snapshot,
+    which every command sources first; without one (writing it failed) the
+    command runs in a login shell, which reads `~/.bash_profile`. A `gh`
+    function or alias there that passes a token would reach the agent's
+    ordinary `gh`, and no flag or variable turns the snapshot off. What
+    2.1.296 runs next in the same shell, before the command and in both
+    cases, is the text of the file `CLAUDE_ENV_FILE` names, so every launch
+    names a file of its own (mode 0600, removed when the launch ends)
+    holding `providers.CLAUDE_SHELL_CLEANER`. It removes every function and
+    alias, in bash through POSIX mode (an assignment to `POSIXLY_CORRECT`,
+    which no function shadows, puts the special builtin `unset` ahead of
+    any function, `builtin` included) and in zsh with `unfunction -m '*'`
+    and `unalias -a` / `-as`, then checks that none is left (bash's
+    `declare -F` and `alias`, zsh's `$functions` and alias tables) and
+    otherwise ends the shell, so the command does not run. The launch also
+    sets `CLAUDE_CODE_SHELL` to a bash or a zsh (its `SHELL` when it is
+    one, else the one on `PATH`) and `CLAUDE_CODE_SHELL_PREFIX` to empty,
+    over whatever the operator's shell passed through `CLAUDE_*`: either
+    could name a program of the operator's to run every command in or
+    through.
+  - 2.1.296 also sets the `env` of the user's settings (`settings.json` in
+    `CLAUDE_CONFIG_DIR`, else `~/.claude`) and of its global configuration
+    (`.config.json` there when it exists, else `.claude.json` in
+    `CLAUDE_CONFIG_DIR`, else in the home) over the environment it starts
+    with, `--safe-mode` notwithstanding: a `GH_TOKEN` there would replace
+    the placeholder, a `CLAUDE_ENV_FILE` the cleaner. So the launch is
+    refused, before anything is charged
+    (`ClaudeCodeProvider.integration_preflight`, also run by `doctor`),
+    while either sets a variable that would undo the launch's isolation
+    (`child_env.undoes_isolation`: a forbidden name, one the controller
+    sets, `HOME`, a `BASH_FUNC_*` function, or one of the adapter's own),
+    or while either exists and cannot be read. The refusal names the file
+    and the variables, never a value; the way out is to remove the entry (a
+    variable Claude Code itself needs can be set in the environment
+    AutoForge is started from instead).
+  - OpenCode 2.0.26 has no such flag, so every launch sets
+    `OPENCODE_CONFIG_DIR` to an empty directory of its own (removed when
+    the launch ends), `OPENCODE_CONFIG_PROJECT_DISABLE` and
+    `OPENCODE_DISABLE_PROJECT_CONFIG` to `1`, and `OPENCODE_CONFIG` and
+    `OPENCODE_CONFIG_CONTENT` to empty, over whatever the operator's shell
+    passed through `OPENCODE_*`. No `opencode.json(c)` or `plugin(s)/`
+    directory is read, neither the operator's global one nor one in or
+    above the worktree (OpenCode's project search does not stop at the
+    worktree, so it would reach the operator's checkout and home), and no
+    explicit or inline document is. An organization connected to OpenCode
+    (a `.well-known/opencode` integration) is loaded ahead of all of them
+    from OpenCode's database, which also holds the model login a launch
+    needs, and no variable or flag keeps it off: without a credential for
+    it the cached copy is loaded (`opencode auth logout` removes only the
+    credential). So the launch is refused instead, before anything is
+    charged (`OpenCodeProvider.integration_preflight`, also run by
+    `doctor`), while the database the launch would open (`OPENCODE_DB`,
+    else each `opencode*.db` in `$XDG_DATA_HOME/opencode` or
+    `~/.local/share/opencode`) lists an organization, while the legacy
+    `auth.json` there has a `"wellknown"` entry (imported into every
+    database OpenCode creates), or while either cannot be read. The
+    refusal names the file and a count, never an origin; the way out is an
+    `OPENCODE_DB` of AutoForge's own (or `:memory:` with an API-key
+    variable).
+  - Pi's `--no-extensions` and the rest of #132's policy are unchanged.
+
+### Credential routes
+
+Each route an agent or a repository command could use, how it is closed,
+and the test that shows it (tests in `tests/test_child_env.py` unless
+named otherwise), or why it has none.
+
+| Route | Closed by | Test |
+|---|---|---|
+| gh token in the environment | names refused at load and never inherited; `GH_TOKEN` / `GH_ENTERPRISE_TOKEN` set to the placeholder | `test_config.py` refusals; `test_the_child_environment_carries_no_operator_credential_route`; fake `gh` |
+| gh `hosts.yml` (`GH_CONFIG_DIR`, `$XDG_CONFIG_HOME/gh`, `~/.config/gh`) | `GH_CONFIG_DIR` names an empty per-launch directory | fake `gh` reading `hosts.yml`: `test_an_agent_finds_no_credential_route_the_controller_finds_every_one` |
+| gh keyring: Secret Service over the session bus (Linux), the keychain (macOS) | bus variables withheld; the placeholder token means `gh` never asks the keyring | fake `gh` with a same-UID "keychain": `test_gh_without_the_placeholder_would_reach_the_keychain`. A real keyring is not tested: CI has none, and a test must never touch the operator's |
+| git credential helper in system, global, repository, worktree or included configuration, URL-specific included | global replaced; command-scope `credential.helper=` reset; repository and worktree scope refused by the preflight | `test_an_agent_finds_no_credential_route_the_controller_finds_every_one`, `test_a_helper_in_the_worktree_configuration_is_reset_too`, the preflight tests. System scope is shown through the same command-scope reset: a test cannot write `/etc/gitconfig` |
+| git configuration from the environment (`GIT_CONFIG_*`) | refused at load and never inherited; the controller sets its own | `test_config.py` refusals, construction test |
+| askpass (`GIT_ASKPASS`, `core.askPass`, `SSH_ASKPASS`) and the terminal prompt | names withheld; `core.askPass=` at command scope; `GIT_TERMINAL_PROMPT=0` | an askpass in the common dir never answers: `test_an_agent_finds_no_credential_route_the_controller_finds_every_one` |
+| SSH agent | `SSH_AUTH_SOCK` withheld; `IdentityAgent=none` | fake `ssh` records argv and environment |
+| SSH default keys (`~/.ssh/id_*`, found through the password database, not `HOME`) | `core.sshCommand` at command scope: `-F /dev/null`, `IdentityFile=none`; `GIT_SSH`, `GIT_SSH_COMMAND` withheld | fake `ssh` that succeeds only with a default key or the agent |
+| a credential in a URL (`remote.*.url`, `pushurl`, `url.*.insteadOf`) | global replaced; system, repository and worktree refused by the preflight | `test_the_preflight_refuses_a_credential_in_the_repository_configuration`; doctor: `test_doctor_refuses_a_token_bearing_origin_and_never_prints_it` |
+| `http.extraHeader` | generic reset at command scope; any non-empty one refused by the preflight | preflight tests |
+| `~/.netrc` (libcurl, `curl -n`, `requests`) | a word any reader may take for a GitHub machine or `default` refused by the preflight: quoted, escaped or upper-case, in a password, comment or macro body | `test_a_netrc_entry_for_github_refuses_the_launch`, `test_a_netrc_entry_for_github_in_any_readers_syntax_refuses_the_launch`; the real `curl -n` (loopback) and Python's `netrc` take the credential of each disguised entry: `test_the_disguised_netrc_entries_are_ones_a_real_reader_uses`; `test_engine.py::test_a_netrc_entry_for_github_blocks_the_premerge_verification`; `test_doctor.py::test_doctor_refuses_a_netrc_entry_for_github` |
+| `NETRC` (curl 8.16 and later, `requests`, Go) | refused at load, never inherited | `test_config.py` refusals; the real `curl` sends the credential of the operator's `NETRC` file for the controller and none from a launch: `test_a_launchs_curl_reads_no_netrc_the_operators_netrc_variable_names` (curl 8.16 and later) |
+| curl's configuration (`~/.curlrc`, `$XDG_CONFIG_HOME/curlrc` or `.curlrc`, `$CURL_HOME/.curlrc`), read by every plain `curl` | `CURL_HOME` names an empty `.curlrc` of the launch's, found first; `CURL_HOME` refused at load | the real `curl` against a loopback server, header sent for the controller and not from a launch: `test_a_launchs_plain_curl_sends_no_header_of_the_operators_configuration`; fake `curl`: `test_an_agent_finds_no_credential_route_the_controller_finds_every_one` |
+| wget's configuration (`~/.wgetrc`, `~/.config/wget/wget2rc`), read by every plain `wget` | `WGETRC` and `WGET2RC` name an empty file of the launch's; both refused at load | the real `wget` (1.x or wget2) the same way: `test_a_launchs_plain_wget_sends_no_header_of_the_operators_configuration`; fake `wget` |
+| `~/.git-credentials`, `$XDG_CONFIG_HOME/git/credentials` | read only by the `store` helper, which is reset | covered by the helper tests; a deliberate read is an absolute-path read (not guaranteed) |
+| Claude Code hooks, installed plugins and MCP servers (user, project, `.mcp.json`, plugin) | `--safe-mode` and `--strict-mcp-config` (with `--setting-sources=user`, below); integration flags refused in `extra_args`; `doctor` requires all three flags | `test_providers.py::test_claude_argv_shape`, `test_claude_refuses_extra_args_that_load_an_integration`, `test_config.py::test_a_claude_profile_whose_extra_args_load_an_integration_is_refused`, `test_doctor.py::test_doctor_fails_a_claude_without_the_isolation_flags`. A test cannot run a real Claude Code; the flags were checked against 2.1.296 with marker hooks and MCP servers (`providers.py`) |
+| Claude Code's Bash tool: the functions and aliases of `~/.bashrc` or `~/.zshrc` (its shell snapshot) and of the login files of a login shell (without one) | `CLAUDE_ENV_FILE` names the launch's cleaner, run before every command, which removes every function and alias or refuses to run the command; `CLAUDE_CODE_SHELL` a bash or zsh; `CLAUDE_CODE_SHELL_PREFIX` empty | a fake `claude` that writes its snapshot and runs a command as 2.1.296 does, with the real bash and zsh, behind the real adapter and executor; the same launch without the adapter's isolation hands `gh` the wrapper's token: `test_providers.py::test_claudes_bash_tool_runs_no_function_or_alias_of_a_startup_file` (function and alias, snapshot and login shell), `test_claudes_bash_tool_cleaner_works_on_the_one_shot_path`, `test_a_startup_file_that_shadows_the_cleaner_runs_no_command`, `test_claudes_bash_tool_runs_in_no_program_of_the_operators`, `test_the_claude_shell_environment_file_lives_as_long_as_the_launch`. A test cannot run a real Claude Code; the real 2.1.296 was seen, against a loopback API, handing a fake `gh` the token of a `gh` function or alias in `~/.bashrc`, `~/.zshrc` and, without a snapshot, `~/.bash_profile`, and none under the adapter (`providers.py`) |
+| Claude Code settings `env`, set over the launch's environment: the user's settings and the global configuration, and the project's and the local settings of the worktree | `--setting-sources=user`; the launch refused while the user's settings or the global configuration set a variable that would undo its isolation, or cannot be read | `test_providers.py::test_the_repositorys_claude_settings_cannot_undo_the_cleaner`, `test_claude_configuration_that_sets_a_variable_over_the_launch_refuses_it`, `test_claude_configuration_without_such_a_variable_launches`, `test_claude_configuration_that_cannot_be_checked_refuses_the_launch`, `test_the_claude_configuration_files_are_the_launchs`; `test_child_env.py::test_a_variable_set_over_a_launch_that_would_undo_its_isolation`; `test_doctor.py::test_doctor_fails_a_claude_whose_settings_set_a_variable_over_the_launch`. The real 2.1.296 was seen taking `GH_TOKEN` and `CLAUDE_ENV_FILE` from each of these files under `--safe-mode`, and neither from the project's or the local settings with `--setting-sources=user` |
+| OpenCode MCP servers and plugins (global, project and above, `OPENCODE_CONFIG`, `OPENCODE_CONFIG_CONTENT`) | `opencode_isolation_env`: an empty global configuration directory, no project configuration, no explicit or inline document | a fake `opencode` that resolves its configuration as 2.0.26 does, behind the real executor: `test_providers.py::test_an_opencode_launch_loads_no_mcp_server_or_plugin_of_any_configuration`. A test cannot run a real OpenCode; the variables were checked against 2.0.26's resolved configuration (`providers.py`) |
+| OpenCode organization configuration (`.well-known/opencode`: fetched, or cached in OpenCode's database, ahead of every file) | the launch refused while the database it would open lists an organization, `auth.json` has a `"wellknown"` entry, or either cannot be read | the fake `opencode` loads the cached organization configuration from a 2.0.26-shaped database: `test_providers.py::test_an_opencode_launch_is_refused_while_an_organization_is_connected` (cached, not yet cached, legacy `auth.json`, `OPENCODE_DB`), `test_an_opencode_launch_with_no_organization_proceeds`, `test_opencode_data_that_cannot_be_read_refuses_the_launch`; before anything is charged: `test_engine.py::test_an_integration_the_provider_cannot_keep_off_refuses_the_launch_and_leaves_state`; `test_doctor.py::test_doctor_fails_an_opencode_connected_to_an_organization`. The real 2.0.26 was seen starting a cached organization's MCP server under `opencode_isolation_env` and none with `OPENCODE_DB=:memory:` or a database of its own (`providers.py`) |
+| Pi extensions, skills, prompt templates, themes, context files | #132's flags (`--no-extensions` and the rest) | `test_pi_rpc.py`, unchanged |
+| a provider's permission mode or approval | irrelevant by the authority rule: it grants no credential | — |
+| zsh startup files (`.zshenv` on every start, `.zprofile`, `.zshrc`, `.zlogin`), found through `ZDOTDIR` or `HOME` | `ZDOTDIR` names an empty directory of the launch's; `ZDOTDIR` refused at load | the real zsh, `-c`, `-l -c`, `-i -c` and a zsh shebang, with the operator's files exporting a token: `test_a_launchs_zsh_reads_no_startup_file_of_the_operators` (the same launch without `ZDOTDIR` merges); R3-F1's report through the real OpenCode adapter and executor, a fake `opencode` choosing its shell as 2.0.26 does: `test_an_opencode_shell_tool_merges_nothing_through_the_operators_zshenv`; `test_zsh_startup_files_in_the_home_are_no_problem` |
+| `BASH_ENV` (every non-interactive bash) and `ENV` (an interactive sh) | refused at load, never inherited | the real bash and sh: `test_a_launchs_bash_and_sh_run_no_startup_file_of_the_operators_for_a_command` (with the operator's `BASH_ENV`, `bash -c` merges) |
+| the shell an agent CLI starts (`SHELL`): fish and the csh family read their configuration on every start | `SHELL` set to the operator's POSIX shell, else `bash` or `/bin/sh` | `test_a_launchs_shell_is_one_that_reads_no_startup_file`; construction test (a fish `SHELL` becomes `bash`) |
+| login-shell startup files (`/etc/profile`, `~/.bash_profile`, `~/.bash_login`, `~/.profile`, read through `HOME`) | the login-shell probe refuses a launch whose shells' startup files change a probed variable | the real bash and sh: `test_a_login_startup_file_that_restores_a_route_is_named_never_its_value`, `test_what_is_withheld_as_defence_in_depth_alone_is_no_startup_problem`, `test_a_startup_file_that_ends_the_shell_could_not_be_checked`, `test_a_probe_without_an_answer_could_not_be_checked`; `test_engine.py::test_a_login_shell_startup_file_that_exports_a_credential_refuses_the_launch`, `test_a_shell_startup_file_that_exports_a_credential_blocks_the_premerge_verification`; `test_local.py::test_a_startup_file_planted_before_validation_leaves_the_phase_unverified`; `test_doctor.py::test_doctor_refuses_a_login_shell_startup_file_that_exports_a_credential` |
+| validation and pre-merge commands | the same variables and preflight, the login-shell probe included | `test_local.py::test_local_launches_get_the_same_isolation_and_no_read_context`, `test_engine.py::test_verification_commands_get_the_launch_isolation` |
+
+End to end, `tests/test_integration.py` runs the whole REMOTE lifecycle with
+an operator shell holding every route above and checks each launch while it
+runs, for the scripted providers and for an all-Pi run (the RPC child and
+its auth preflight alike). A write an agent makes anyway, through a
+credential that slipped through, is not journaled and blocks the run
+(`test_engine.py::test_a_write_through_a_leaked_credential_is_unjournaled_and_blocks`).
+
+### The agent read path
+
+An agent with no credential reads GitHub through **controller-supplied read
+context** only (ADR 0004 D10). Before each REMOTE launch the engine reads,
+through the typed client, what that phase's prompt names: the issue and its
+comments (`ANALYZE_EXECUTE`, `REVIEW`, `FIX`, `REPLAN_REEXECUTE`); the PR,
+its comments and the check summary of its head commit (`REVIEW`); the
+previous round's review comment (`REVIEW`) or the verified one (`FIX`); the
+follow-up issues handed over (`REVIEW`, `FIX`); the EPIC and the state and
+title of each issue it references (`UPDATE_EPIC`); the source PR with its
+comments, the issue and the EPIC (`REPLAN_REEXECUTE`). It writes them,
+through the state directory's capability, into
+`<state dir>/read-context/<run id>/<phase>-<attempt>-<token>/`, one
+Markdown file per item and a `README.md` index, and the prompt names the
+directory by absolute path.
+
+- **Bounded and redacted** (`src/autoforge/read_context.py`): a body, a
+  comment, the number of comments (the last 200), each file and the whole
+  directory have bounds; a cut is an explicit `[AutoForge omitted ...]`
+  line with the counts. Every text goes through the run-log redactor and
+  every piece of project text is quoted in a fence nothing inside it can
+  close.
+- **Never authority.** The controller never reads the files back; every
+  decision is still taken on its own reads. An item that cannot be read
+  becomes a file that says so (naming the error type), and the launch
+  proceeds.
+- **The diff** is agent-local `git diff` over the revisions the controller
+  fetched. A dry run writes nothing and the plan shows a placeholder.
+
+### Threat model
+
+**Actors.** Trusted: the operator and the controller. Untrusted: the agent
+(its output, and anything a prompt injection in project data makes it do),
+repository-defined validation and pre-merge commands (the PR's code), and
+humans acting concurrently on GitHub. GitHub is the source of truth.
+
+**Guaranteed** (Wave 1):
+
+1. **No delegated authority.** Agents and repository-defined commands
+   launched by AutoForge receive no GitHub write authority through anything
+   AutoForge controls: the environment; `gh` or git configuration (global,
+   system, repository or worktree); credential helpers and askpass
+   programs; the SSH agent; provider integrations that AutoForge
+   configures.
+2. **No steering of the controller.** Repository state an agent can write
+   (configuration, hooks, `origin`, include directives, replacement refs,
+   grafts, the commit-graph) cannot steer, or run code in, the controller's
+   own git network operations and `gh` calls (D7.3, D7.5).
+3. **Every write is accounted for.** Every Wave 1 externally visible write
+   is a typed controller effect with a durable record; anything else with a
+   Wave 1 identity is detected and blocks, and is never adopted.
+4. **Agent text is bounded data.** It is published only inside controller
+   framing and cannot forge a marker, close or link an issue, mention a
+   user or team, or carry a credential-shaped string.
+
+**Not guaranteed** (the outer sandbox, ADR 0005, owns the first four):
+
+- **Absolute-path reads.** A same-UID process that deliberately reads a
+  credential file, keychain or socket by absolute path
+  (`~/.config/gh/hosts.yml`, `~/.git-credentials`, `~/.ssh/`, a keyring over
+  the session bus), or runs `ssh` or a credential helper of its own choosing.
+- **Absolute-path writes.** A same-UID process that deliberately modifies
+  the operator's own `gh` or git configuration, which the controller's own
+  `gh` reads. An agent's ordinary `gh` and `git config --global` writes
+  land in the controller-supplied locations instead.
+- **Shared local repository state.** An agent can still create, move or
+  delete shared refs and edit the configuration and hooks of the common
+  dir; the preflight refuses the credential carriers among them before the
+  next launch, and D7.3 and D7.5 bound what the rest can do to the
+  controller.
+- **Network egress.** An agent can send whatever it can read.
+- **Exposure outside the boundary.** A credential the operator exposes
+  elsewhere: a token in a worktree file, in a service the agent can reach,
+  or in a variable the operator forwards under a name that is not a
+  recognised route.
+- **The committed tree** is not filtered; `REVIEW` and the merge gate own it.
+- **Integrity of the shared object store** (D7.5, #171).
+
+**Residuals of the provider integrations.** Claude Code still applies
+managed settings an administrator installed (`--safe-mode` and
+`--setting-sources` leave policy settings in force, their `env` included);
+the operator cannot change them either, and they are not detected. OpenCode's organization configuration is not a residual: a
+launch that would load it is refused (above).
+
+**Residuals of shell startup.** `HOME` is passed, so a shell that reads its
+configuration from `HOME` still does when something starts it that way:
+an interactive `bash` reads `~/.bashrc`, and a `fish` or csh-family shell
+started by name reads its configuration; neither is the `SHELL` of a
+launch, and an agent that starts one deliberately could as well read the
+file. Claude Code sourcing `~/.zshrc` or `~/.bashrc` itself for its Bash
+tool is not one: no function or alias of them, or of a login shell's
+files, is left when a command runs (above). A startup file that changes a
+variable only under a condition the probe does not meet (a terminal, a
+time of day) is not detected.
+
+**What the agent loses.** The operator's global git configuration beyond
+the identity is not read by an agent: no commit signing (`commit.gpgSign`,
+`user.signingKey`, an SSH-agent signer), no global Git LFS filter, no
+aliases or `core.excludesFile`. Tools that need `XDG_RUNTIME_DIR` (a session
+bus, a Wayland socket) do not get it, and curl and wget get none of their
+configured defaults (a proxy among them; the proxy variables still pass).
+Claude Code runs without the user's or the project's skills, custom agents
+and commands and CLAUDE.md auto-discovery, and without the repository's
+settings (`.claude/settings.json` and `settings.local.json`: their
+permission rules, `env` and model); its Bash tool runs commands without the
+operator's shell functions and aliases and without Claude Code's own (its
+`rg` when ripgrep is not installed, a `pkill` that spares Claude Code, and
+`find` and `grep` where it substitutes them; its Grep tool is unchanged).
+OpenCode runs without the settings in its configuration files (custom
+providers, permission rules, agents, instructions) and without loading
+`AGENTS.md` itself. Every
+phase prompt tells the agent to read the repository's `AGENTS.md` and
+`CLAUDE.md`, and the model credentials (Claude Code's login and API-key
+variables, OpenCode's `opencode auth login` and API-key variables) are
+untouched.
 
 ## Merge safety
 
@@ -989,7 +1405,9 @@ Each run is logged like an agent invocation. Dry-run runs nothing and lists
 the commands in the plan; `autoforge doctor` reports what is configured
 without running it. Submodules are not populated in the export, and the
 commands run under the same allow-listed environment as an agent
-(`execution.env_allowlist`), not the operator's whole shell.
+(`execution.env_allowlist`), not the operator's whole shell, with the same
+controller-set variables and preflight ("Agents hold no GitHub credential"
+above): a preflight refusal blocks the merge like a failing command.
 
 ### Post-merge reconciliation
 

@@ -161,3 +161,178 @@ def holders(home: Path) -> list[int]:
     if not path.exists():
         return []
     return [int(pid) for pid in path.read_text(encoding="utf-8").split()]
+
+
+# A fake ``claude`` whose Bash tool runs one command the way 2.1.296 does
+# (read from the build; ``autoforge.providers``, ``CLAUDE_SHELL_CLEANER``):
+# the ``env`` of the user's, the project's and the local settings, those
+# ``--setting-sources`` names (all three by default), is set over its
+# environment in that order; the shell is ``CLAUDE_CODE_SHELL`` when its
+# path names a bash or a zsh and runs, else ``SHELL`` on the same terms,
+# else the zsh or bash on ``PATH``;
+# the snapshot is written by that shell as ``-c -l``, sourcing
+# ``$HOME/.zshrc`` or ``$HOME/.bashrc`` and dumping its functions (but those
+# named ``_x``), options and aliases with the same commands; the command
+# sources the snapshot, then runs the trimmed text of ``CLAUDE_ENV_FILE``,
+# the extglob reset and ``unsetenv`` removal, then ``eval``s the command, all
+# joined by `` && ``, through ``CLAUDE_CODE_SHELL_PREFIX`` when it is set,
+# and as ``-c -l`` instead without a snapshot. The command's output and
+# status are the run's result text. No real agent runs.
+_BASH_TOOL_SCRIPT = r"""
+import json, os, shlex, shutil, subprocess, sys
+
+home = sys.argv[1]
+with open(os.path.join(home, "script.json"), encoding="utf-8") as f:
+    script = json.load(f)
+env = dict(os.environ)
+q = shlex.quote
+sources = "user,project,local"
+args = sys.argv[2:]
+for index, arg in enumerate(args):
+    if arg == "--":
+        break
+    if arg == "--setting-sources":
+        sources = args[index + 1]
+    elif arg.startswith("--setting-sources="):
+        sources = arg.partition("=")[2]
+config = env.get("CLAUDE_CONFIG_DIR") or os.path.join(env.get("HOME", ""), ".claude")
+settings = {
+    "user": os.path.join(config, "settings.json"),
+    "project": os.path.join(os.getcwd(), ".claude", "settings.json"),
+    "local": os.path.join(os.getcwd(), ".claude", "settings.local.json"),
+}
+for source in ("user", "project", "local"):
+    if source in sources.split(",") and os.path.isfile(settings[source]):
+        with open(settings[source], encoding="utf-8") as f:
+            env.update(json.load(f).get("env", {}))
+
+
+def runs(path):
+    return bool(path) and os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+def pick_shell():
+    override = env.get("CLAUDE_CODE_SHELL", "")
+    if override and ("bash" in override or "zsh" in override) and runs(override):
+        return override
+    shell = env.get("SHELL", "")
+    if shell and ("bash" in shell or "zsh" in shell) and runs(shell):
+        return shell
+    for name in ("bash", "zsh") if "bash" in shell else ("zsh", "bash"):
+        if shutil.which(name):
+            return shutil.which(name)
+    sys.exit("no suitable shell found")
+
+
+shell = pick_shell()
+zsh = "zsh" in shell and "bash" not in shell
+rc = os.path.join(env.get("HOME", ""), ".zshrc" if zsh else ".bashrc")
+snapshot = os.path.join(home, "snapshot.sh")
+dump = [
+    f"SNAPSHOT_FILE={q(snapshot)}",
+    f"source {q(rc)} < /dev/null" if os.path.isfile(rc) else "# No user config file to source",
+    'echo "# Snapshot file" >| "$SNAPSHOT_FILE"',
+    'echo "unalias -a 2>/dev/null || true" >> "$SNAPSHOT_FILE"',
+]
+if zsh:
+    dump += [
+        "typeset -f > /dev/null 2>&1",
+        "typeset +f | grep -vE '^_[^_]' | while read func; do",
+        '  typeset -f "$func" >> "$SNAPSHOT_FILE"',
+        "done",
+        "setopt | sed 's/^/setopt /' | head -n 1000 >> \"$SNAPSHOT_FILE\"",
+    ]
+else:
+    dump += [
+        'shopt -p | head -n 1000 >> "$SNAPSHOT_FILE"',
+        "declare -f > /dev/null 2>&1",
+        "declare -F | cut -d' ' -f3 | grep -vE '^_[^_]' | while read func; do",
+        "  printf 'eval %q > /dev/null 2>&1\\n' \"$(declare -f \"$func\")\" >> \"$SNAPSHOT_FILE\"",
+        "done",
+        "set -o | grep \"on\" | awk '{print \"set -o \" $1}' | head -n 1000 >> \"$SNAPSHOT_FILE\"",
+        'echo "shopt -s expand_aliases" >> "$SNAPSHOT_FILE"',
+    ]
+dump.append(
+    "alias | sed 's/^alias //g' | sed 's/^/alias -- /' | head -n 1000 >> \"$SNAPSHOT_FILE\""
+)
+if script["snapshot"]:
+    subprocess.run(
+        [shell, "-c", "-l", "\n".join(dump)], env=env, stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60,
+    )
+snap = snapshot if os.path.isfile(snapshot) else None
+
+parts = [f"source {q(snap)} 2>/dev/null || true"] if snap else []
+if env.get("CLAUDE_ENV_FILE"):
+    try:
+        with open(env["CLAUDE_ENV_FILE"], encoding="utf-8") as f:
+            text = f.read().strip()
+    except FileNotFoundError:
+        text = ""
+    if text:
+        parts.append(text)
+prefix = env.get("CLAUDE_CODE_SHELL_PREFIX")
+if prefix:
+    parts.append(
+        "{ shopt -u extglob || setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL; } >/dev/null 2>&1 || true"
+    )
+elif zsh:
+    parts.append("setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL 2>/dev/null || true")
+else:
+    parts.append("shopt -u extglob 2>/dev/null || true")
+parts.append(
+    "{ \\builtin unalias -- 'unsetenv'; \\builtin unset -f -- 'unsetenv'; } >/dev/null 2>&1"
+    " || true"
+)
+parts.append(f"eval {q(script['command'])}")
+parts.append(f"pwd -P >| {q(os.path.join(home, 'cwd'))}")
+string = " && ".join(parts)
+if prefix:
+    cut = prefix.rfind(" -")
+    if cut > 0:
+        string = f"{q(prefix[:cut])} {prefix[cut + 1:]} {q(string)}"
+    else:
+        string = f"{q(prefix)} {q(string)}"
+ran = subprocess.run(
+    [shell, "-c", *([] if snap else ["-l"]), string], env=env, stdin=subprocess.DEVNULL,
+    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60,
+)
+with open(os.path.join(home, "log.json"), "w", encoding="utf-8") as f:
+    json.dump({"argv": sys.argv[2:], "shell": shell, "snapshot": snap is not None}, f)
+text = ran.stdout.decode("utf-8", "replace") + f"[exit {ran.returncode}]"
+if "stream-json" in sys.argv[2:]:
+    record = {"type": "result", "subtype": "success", "is_error": False, "result": text}
+    print(json.dumps(record), flush=True)
+else:
+    print(text, flush=True)
+"""
+
+
+def fake_claude_bash_tool(
+    tmp_path: Path, command: str, *, snapshot: bool = True, output_format: str = "stream-json"
+) -> tuple[Path, ProfileConfig]:
+    """Write a fake ``claude`` whose Bash tool runs ``command`` as 2.1.296
+    does (``_BASH_TOOL_SCRIPT``; without a snapshot with ``snapshot=False``,
+    as when writing one fails); return its home and a profile launching it.
+    """
+    home = tmp_path / "fake-claude"
+    home.mkdir()
+    (home / "fake.py").write_text(_BASH_TOOL_SCRIPT, encoding="utf-8")
+    (home / "script.json").write_text(
+        json.dumps({"command": command, "snapshot": snapshot}), encoding="utf-8"
+    )
+    launcher = home / "claude"
+    launcher.write_text(
+        f'#!/bin/sh\nexec "{sys.executable}" -I "{home / "fake.py"}" "{home}" "$@"\n',
+        encoding="utf-8",
+    )
+    launcher.chmod(0o755)
+    profile = ProfileConfig(
+        name="fix",
+        provider="claude",
+        model="fable",
+        effort="high",
+        command=str(launcher),
+        options={"permission_mode": "bypassPermissions", "output_format": output_format},
+    )
+    return home, profile
