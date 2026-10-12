@@ -13,8 +13,10 @@ of launch the same way.
   :data:`FORBIDDEN_ENV_PREFIXES`). gh's tokens and configuration location,
   the programs git and ssh run to obtain a credential, the SSH agent
   socket, git configuration taken from the environment, the session bus a
-  desktop keyring answers on, and where curl and wget find the
-  configuration file they read on every request.
+  desktop keyring answers on, where curl and wget find the
+  configuration file they read on every request, and ``NETRC``, the
+  ``.netrc`` curl (8.16 and later), Python's ``requests`` and Go read
+  instead of ``~/.netrc``.
   :func:`refuse_forbidden_env` refuses an allow-list entry that names one,
   or a ``*`` prefix that covers one, at config load
   (``execution.env_allowlist`` / ``env_allowlist_extra``) and for every
@@ -45,9 +47,10 @@ of launch the same way.
   - ``CURL_HOME`` names a directory holding an empty ``.curlrc``, and
     ``WGETRC`` (wget 1.x) and ``WGET2RC`` (wget2) an empty file. curl reads
     the first default configuration file it finds, ``$CURL_HOME/.curlrc``
-    before ``$XDG_CONFIG_HOME/curlrc``, ``~/.curlrc`` and the home of the
-    password database, and wget reads the file its variable names instead
-    of ``~/.wgetrc`` or ``~/.config/wget/wget2rc``; either file can add an
+    before the one in ``$XDG_CONFIG_HOME`` (``curlrc`` in curl 8.18,
+    ``.curlrc`` in 8.5), ``~/.curlrc`` and the home of the password
+    database, and wget reads the file its variable names instead of
+    ``~/.wgetrc`` or ``~/.config/wget/wget2rc``; either file can add an
     ``Authorization`` header to every request, so a plain ``curl`` or
     ``wget`` of the child's would otherwise send the operator's token.
 
@@ -58,9 +61,10 @@ of launch the same way.
   (the shared common dir), a URL with an embedded credential (a remote, an
   ``insteadOf`` base) or an ``http.extraHeader``, which the command-scope
   reset cannot reach when it is set for a URL; and ``~/.netrc`` must have no
-  entry for GitHub, because git's HTTPS transport reads it through
-  ``HOME``. A refusal is a :class:`ConfigurationError` that names the key
-  and scope, never a value; nothing is launched.
+  word that a netrc reader may take for a GitHub machine or a ``default``
+  entry, because git's HTTPS transport reads it through ``HOME``. A
+  refusal is a :class:`ConfigurationError` that names the key and scope,
+  never a value; nothing is launched.
 
 What this does not do (docs/agent-guides/github-safety.md, "Threat
 model"): it hides nothing from a process that deliberately opens a
@@ -98,6 +102,7 @@ _HTTP_CONFIG = (
     "where an HTTP client finds the configuration file it reads on every request, "
     "which can add a credential header"
 )
+_NETRC = "where an HTTP client finds the .netrc file it takes a password from"
 
 # Every variable an agent or a repository command must never inherit from
 # the operator's environment, and the rule it falls under. Some of them are
@@ -124,6 +129,7 @@ FORBIDDEN_ENV_NAMES: dict[str, str] = {
     "CURL_HOME": _HTTP_CONFIG,
     "WGETRC": _HTTP_CONFIG,
     "WGET2RC": _HTTP_CONFIG,
+    "NETRC": _NETRC,
 }
 FORBIDDEN_ENV_PREFIXES: dict[str, str] = {
     "GIT_CONFIG_KEY_": _GIT_CONFIG,
@@ -176,8 +182,12 @@ CHILD_SCOPES = ("system", "local", "worktree")
 REPOSITORY_SCOPES = ("local", "worktree")
 
 # The machines of a ``.netrc`` entry git's HTTPS transport or ``curl -n``
-# would use for GitHub; ``default`` matches every host.
-_GITHUB_HOST_RE = re.compile(r"(?i)^(?:[a-z0-9-]+\.)*github\.com$")
+# would use for GitHub (a trailing dot is the same host); ``default``
+# matches every host.
+_GITHUB_HOST_RE = re.compile(r"(?i)^(?:[a-z0-9-]+\.)*github\.com\.?$")
+# What separates two words of a ``.netrc`` for some reader: whitespace, and
+# the ``"`` that curl, wget and Python's ``netrc`` quote a word with.
+_NETRC_WORD_BREAK = re.compile(r'[\s"]+')
 NETRC_FILES = (".netrc", "_netrc")
 MAX_NETRC_BYTES = 1024 * 1024
 
@@ -490,9 +500,10 @@ def operator_home() -> str | None:
 def netrc_problems(home: str | None) -> list[str]:
     """A ``.netrc`` in ``home`` with an entry for GitHub, or one that cannot be read.
 
-    git's HTTPS transport (libcurl) and ``curl -n`` read ``$HOME/.netrc``,
-    and ``HOME`` reaches every child, so the file cannot be hidden from it.
-    Only ``machine`` names are read, and only the file name is reported.
+    git's HTTPS transport (libcurl), ``curl -n`` and Python's ``requests``
+    read ``$HOME/.netrc``, and ``HOME`` reaches every child, so the file
+    cannot be hidden from it. Only words are compared
+    (:func:`_netrc_names_github`), and only the file name is reported.
     """
     if not home:
         return []
@@ -515,29 +526,24 @@ def netrc_problems(home: str | None) -> list[str]:
 
 
 def _netrc_names_github(text: str) -> bool:
-    """Whether a netrc text has a ``default`` entry or a GitHub ``machine``.
+    """Whether any word of a netrc text may be read as a GitHub machine or ``default``.
 
-    A ``macdef`` body (up to the next empty line) is skipped, as netrc
-    readers do.
+    The readers disagree on the syntax. curl (7.84 and later) and wget take
+    a ``"``-quoted word with ``\\`` escapes; Python's ``netrc`` module, which
+    ``requests`` reads, drops a ``\\`` before any character, quoted or not;
+    curl matches ``machine`` and ``default`` in any case; and where a
+    ``macdef`` body or a ``#`` comment ends, and whether a keyword counts in
+    a value's position, differs between them (a ``macdef`` given as a login
+    starts a macro for curl and none for Python). So no position, quoting,
+    comment or macro is trusted: every word, split at whitespace and at
+    ``"``, with each ``\\`` dropped, is compared without regard to case, and
+    one that names a GitHub host or is ``default`` refuses the file, though
+    it stands in a password, a comment or a macro body.
     """
-    tokens: list[str] = []
-    in_macro = False
-    for line in text.splitlines():
-        if in_macro:
-            in_macro = bool(line.strip())
-            continue
-        words = line.split()
-        if "macdef" in words:
-            tokens.extend(words[: words.index("macdef")])
-            in_macro = True
-            continue
-        tokens.extend(words)
-    for index, token in enumerate(tokens):
-        if token == "default":
+    for word in _NETRC_WORD_BREAK.split(text):
+        word = word.replace("\\", "").lower()
+        if word == "default" or _GITHUB_HOST_RE.match(word):
             return True
-        if token == "machine" and index + 1 < len(tokens):
-            if _GITHUB_HOST_RE.match(tokens[index + 1]):
-                return True
     return False
 
 

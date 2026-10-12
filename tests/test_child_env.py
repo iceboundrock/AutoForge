@@ -11,9 +11,12 @@ a fixed fake.
 
 from __future__ import annotations
 
+import base64
 import http.server
 import json
+import netrc
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -74,6 +77,7 @@ def test_a_prefix_is_refused_when_it_covers_a_forbidden_name_or_prefix():
     assert forbidden_env_entry("GIT_CONFIG_KEY_*")[0] == "GIT_CONFIG_KEY_*"
     assert forbidden_env_entry("GIT_CONFIG_VALUE_12*")[0] == "GIT_CONFIG_VALUE_*"
     assert forbidden_env_entry("*")[0] == "GH_TOKEN"
+    assert forbidden_env_entry("NET*") == ("NETRC", FORBIDDEN_ENV_NAMES["NETRC"])
     for fine in ("GIT_AUTHOR_*", "LC_*", "GITLAB_TOKEN", "SSH_CONNECTION", "XDG_CACHE_HOME"):
         assert forbidden_env_entry(fine) is None, fine
 
@@ -144,6 +148,12 @@ def polluted_operator(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(home))
     for name in ("XDG_CONFIG_HOME", "CURL_HOME", "WGETRC", "WGET2RC"):
         monkeypatch.delenv(name, raising=False)
+    # A .netrc outside the home, which curl 8.16 and later, requests and Go
+    # read in place of ~/.netrc.
+    (tmp_path / "operator-netrc").write_text(
+        f"machine github.com login x password {FAKE_PASSWORD}\n"
+    )
+    monkeypatch.setenv("NETRC", str(tmp_path / "operator-netrc"))
     return global_config
 
 
@@ -307,9 +317,12 @@ def curl():
     # order (the last is the password database's home, not HOME), unless
     # -q comes first.
     if args[:1] not in (["-q"], ["--disable"]):
+        xdg = env.get("XDG_CONFIG_HOME")
         candidates = [
             env.get("CURL_HOME") and os.path.join(env["CURL_HOME"], ".curlrc"),
-            env.get("XDG_CONFIG_HOME") and os.path.join(env["XDG_CONFIG_HOME"], "curlrc"),
+            # curl 8.18 reads curlrc there, 8.5 .curlrc.
+            xdg and os.path.join(xdg, "curlrc"),
+            xdg and os.path.join(xdg, ".curlrc"),
             env.get("HOME") and os.path.join(env["HOME"], ".curlrc"),
             os.path.join(PASSWD_HOME, ".curlrc"),
         ]
@@ -317,7 +330,8 @@ def curl():
         if found and header(found):
             return True
     if "-n" in args or "--netrc" in args:
-        netrc = Path(env.get("HOME", "/"), ".netrc")
+        # curl 8.16 and later read the file NETRC names before ~/.netrc.
+        netrc = Path(env.get("NETRC") or os.path.join(env.get("HOME", "/"), ".netrc"))
         return netrc.exists() and "github.com" in netrc.read_text()
     return False
 
@@ -612,9 +626,11 @@ def test_a_launchs_plain_curl_sends_no_header_of_the_operators_configuration(
     where, tmp_path, monkeypatch, loopback
 ):
     """A default request of the real curl: the operator's ``~/.curlrc``,
-    ``$XDG_CONFIG_HOME/curlrc`` or ``$CURL_HOME/.curlrc`` adds the header for
-    the controller, and none reaches the server from a launch, although the
-    child keeps ``HOME`` and ``XDG_CONFIG_HOME``."""
+    the one in ``$XDG_CONFIG_HOME`` or ``$CURL_HOME/.curlrc`` adds the header
+    for the controller, and none reaches the server from a launch, although
+    the child keeps ``HOME`` and ``XDG_CONFIG_HOME``. The file in
+    ``$XDG_CONFIG_HOME`` is ``curlrc`` for curl 8.18 and ``.curlrc`` for 8.5
+    (CI's), so both names are written."""
     home, xdg, curl_home = (tmp_path / name for name in ("home", "xdg", "curl-home"))
     for directory in (home, xdg, curl_home):
         directory.mkdir()
@@ -626,6 +642,7 @@ def test_a_launchs_plain_curl_sends_no_header_of_the_operators_configuration(
         (home / ".curlrc").write_text(line)
     elif where == "xdg":
         (xdg / "curlrc").write_text(line)
+        (xdg / ".curlrc").write_text(line)
     else:
         (curl_home / ".curlrc").write_text(line)
         monkeypatch.setenv("CURL_HOME", str(curl_home))
@@ -792,6 +809,7 @@ def test_url_has_credential(url, expected):
         "machine api.github.com\n  login x\n  password s3cr3t\n",
         "machine example.org login a password b\ndefault login x password s3cr3t\n",
         "machine\nGitHub.com login x password s3cr3t\n",
+        "machine github.com. login x password s3cr3t\n",
     ],
 )
 def test_a_netrc_entry_for_github_refuses_the_launch(tmp_path, monkeypatch, text):
@@ -804,13 +822,137 @@ def test_a_netrc_entry_for_github_refuses_the_launch(tmp_path, monkeypatch, text
     assert "~/.netrc" in str(caught.value) and "s3cr3t" not in str(caught.value)
 
 
-def test_a_netrc_without_github_and_a_macro_body_mentioning_it_are_accepted(tmp_path):
+# netrc texts a real reader takes a GitHub credential from although no word
+# of them is a bare ``machine github.com``, and the reader that does: curl
+# (7.84 and later) quotes, unescapes inside quotes and matches keywords in
+# any case; Python's ``netrc`` (``requests``) unescapes everywhere and reads
+# a ``macdef`` given as a login as the login.
+_DISGUISED_NETRC = [
+    pytest.param('machine "github.com" login x password {pw}\n', "curl", id="quoted"),
+    pytest.param('machine "git\\hub.com" login x password {pw}\n', "curl", id="escaped-quoted"),
+    pytest.param("MACHINE github.com LOGIN x PASSWORD {pw}\n", "curl", id="upper-case"),
+    pytest.param(
+        "machine example.org login a password b\nDEFAULT login x password {pw}\n",
+        "curl",
+        id="upper-case-default",
+    ),
+    pytest.param("machine git\\hub.com login x password {pw}\n", "python", id="escaped"),
+    pytest.param(
+        "machine example.org login macdef password b\nmachine github.com login x password {pw}\n",
+        "python",
+        id="macdef-as-a-login",
+    ),
+]
+
+
+@pytest.mark.parametrize(("text", "reader"), _DISGUISED_NETRC)
+def test_a_netrc_entry_for_github_in_any_readers_syntax_refuses_the_launch(
+    tmp_path, monkeypatch, text, reader
+):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".netrc").write_text(text.format(pw=FAKE_PASSWORD))
+    monkeypatch.setattr(child_env, "operator_home", lambda: str(home))
+    with pytest.raises(ConfigurationError) as caught:
+        preflight(str(git_repo(tmp_path / "repo")))
+    message = str(caught.value)
+    assert "an entry for GitHub (or a default entry) in ~/.netrc" in message
+    assert FAKE_PASSWORD not in message
+
+
+def _curl_version() -> tuple[int, ...] | None:
+    found = re.match(
+        r"curl (\d+)\.(\d+)\.(\d+)",
+        subprocess.run(["curl", "--version"], capture_output=True, text=True).stdout,
+    )
+    return tuple(int(part) for part in found.groups()) if found else None
+
+
+def _netrc_header(server, home: Path, env: dict[str, str] | None = None) -> str | None:
+    """The header the real curl sends for ``github.com``, resolved to the
+    loopback server, with ``home`` as ``HOME`` (and ``env`` over it), when it
+    reads a netrc: ``--netrc-optional`` is ``-n`` that still sends the
+    request when there is no file (curl 8.18 refuses ``-n`` without one)."""
+    port = server.server_address[1]
+    argv = [
+        "curl", "-s", "--netrc-optional", "--noproxy", "*", "--max-time", "30",
+        "--resolve", f"github.com:{port}:127.0.0.1", f"http://github.com:{port}/",
+    ]  # fmt: skip
+    result = _run(argv, home, ("PATH",), {"HOME": str(home), **(env or {})})
+    assert result.exit_code == 0, result.stderr
+    return server.seen.pop()
+
+
+@pytest.mark.parametrize(("text", "reader"), _DISGUISED_NETRC)
+def test_the_disguised_netrc_entries_are_ones_a_real_reader_uses(tmp_path, loopback, text, reader):
+    """The texts above are not hypothetical: the real ``curl -n`` sends their
+    credential to ``github.com`` (here the loopback server), or Python's
+    ``netrc`` module returns it, and the preflight refuses each."""
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".netrc").write_text(text.format(pw=FAKE_PASSWORD))
+    expected = ("x", "", FAKE_PASSWORD)
+    if reader == "python":
+        assert netrc.netrc(str(home / ".netrc")).authenticators("github.com") == expected
+    else:
+        version = shutil.which("curl") and _curl_version()
+        if not version or version < (7, 84, 0):
+            pytest.skip("needs curl 7.84 or later, which reads quoted netrc words")
+        basic = base64.b64encode(f"x:{FAKE_PASSWORD}".encode()).decode()
+        assert _netrc_header(loopback, home) == f"Basic {basic}"
+    assert netrc_problems(str(home)) == ["an entry for GitHub (or a default entry) in ~/.netrc"]
+
+
+@pytest.mark.skipif(shutil.which("curl") is None, reason="curl is not installed")
+def test_a_launchs_curl_reads_no_netrc_the_operators_netrc_variable_names(
+    tmp_path, monkeypatch, loopback
+):
+    """curl 8.16 and later read the file ``NETRC`` names instead of
+    ``~/.netrc``: the operator's sends the credential for the controller and
+    the preflight, which reads ``~/.netrc``, finds nothing; a launch never
+    inherits ``NETRC`` (and no allow-list may name it), so its curl sends
+    none. The same holds for requests and Go, which read ``NETRC`` too."""
+    version = _curl_version()
+    if not version or version < (8, 16, 0):
+        pytest.skip("needs curl 8.16 or later, which reads NETRC")
+    home = tmp_path / "home"
+    home.mkdir()
+    alternate = tmp_path / "alternate-netrc"
+    alternate.write_text(f"machine github.com login x password {FAKE_PASSWORD}\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("NETRC", str(alternate))
+    monkeypatch.setattr(child_env, "operator_home", lambda: str(home))
+    basic = base64.b64encode(f"x:{FAKE_PASSWORD}".encode()).decode()
+    assert _netrc_header(loopback, home, {"NETRC": str(alternate)}) == f"Basic {basic}"
+    identity = preflight(str(git_repo(tmp_path / "repo")))
+    with isolated_overrides(identity) as overrides:
+        env = _child_env(overrides)
+        assert "NETRC" not in env
+        assert _netrc_header(loopback, home, env) is None
+    with pytest.raises(ConfigurationError, match="'NETRC'"):
+        child_env.refuse_forbidden_env(["NETRC"], "execution.env_allowlist_extra")
+
+
+def test_a_netrc_without_github_is_accepted(tmp_path):
     (tmp_path / ".netrc").write_text(
         "machine example.org login a password b\n"
-        "macdef init\nmachine github.com login x password y\n\n"
-        "machine gitlab.com login c password d\n"
+        "machine github.example.com login e password f\n"
+        "machine notgithub.com login g password h\n"
+        '# a comment\nmachine "gitlab.com" login c password "d e"\n'
     )
     assert netrc_problems(str(tmp_path)) == []
+
+
+def test_a_macro_body_or_a_comment_naming_github_refuses_too(tmp_path):
+    """Readers disagree on where a ``macdef`` body or a comment ends
+    (``macdef-as-a-login`` above), so neither is skipped: a word naming
+    GitHub there refuses the file, though no reader may use it."""
+    for text in (
+        "macdef init\nmachine github.com login x password y\n\n",
+        "# machine github.com login x password y\n",
+    ):
+        (tmp_path / ".netrc").write_text(text)
+        assert netrc_problems(str(tmp_path)) != [], text
 
 
 def test_the_windows_name_is_checked_too(tmp_path):

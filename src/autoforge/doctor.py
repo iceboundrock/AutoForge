@@ -13,7 +13,10 @@ operator's whole environment) and reported without Pi's raw output, and a
 warning naming the instruction files Pi would load from outside the
 checkout (docs/pi-policy.md §4-5); those are found by path, never read. A
 Claude Code command must list the flags every launch keeps the operator's
-and the repository's integrations off with in its ``--help`` (#165).
+and the repository's integrations off with in its ``--help`` (#165), and an
+OpenCode profile fails while OpenCode would load an organization's
+configuration, which a launch refuses (#165,
+:meth:`autoforge.providers.OpenCodeProvider.integration_preflight`).
 
 Both report the environment an agent and a repository-defined command are
 launched with, by name only (never a value), and run the launch's own
@@ -50,6 +53,7 @@ from .child_env import (
 from .config import AutoForgeConfig, ProfileConfig, load_config_file, validate_required_profiles
 from .errors import (
     ConfigurationError,
+    ExecutionError,
     GitHubError,
     GitHubNotFoundError,
     GitHubUnavailableError,
@@ -71,6 +75,7 @@ from .providers import (
     PI_DEFAULT_AGENT_DIR,
     PI_MIN_VERSION,
     PI_SYSTEM_PROMPT_FILES,
+    OpenCodeProvider,
     PiProvider,
     parse_opencode_version,
     parse_pi_version,
@@ -628,6 +633,7 @@ class Doctor:
                 results.extend(self.check_pi_auth(command, profiles, available.ok))
             elif provider == "opencode":
                 results.append(self.check_opencode_version(label, command))
+                results.append(self.check_opencode_isolation(cfg, command, profiles))
             else:
                 results.append(self._version_check(label, [command, "--version"]))
                 if provider == "claude":
@@ -773,6 +779,33 @@ class Doctor:
             True,
             f"launched with {' '.join(CLAUDE_ISOLATION_FLAGS)}: no hook, plugin or MCP server "
             "of the operator's or the repository's configuration runs",
+        )
+
+    def check_opencode_isolation(
+        self, cfg: AutoForgeConfig, command: str, profiles: list[ProfileConfig]
+    ) -> CheckResult:
+        """The launch's own refusal of an organization OpenCode would load (#165).
+
+        Run under the agent launch's allow-list, so the data directory and
+        database looked at are the launch's; only paths and counts are
+        reported, never an origin or a credential.
+        """
+        name = (
+            f"agent '{command}' loads no organization configuration "
+            f"({', '.join(p.name for p in profiles)})"
+        )
+        provider = OpenCodeProvider()
+        allowlist = cfg.execution.environment_names()
+        try:
+            provider.integration_preflight(allowlist)
+            data_dir = provider.data_dir(allowlist)
+        except (ConfigurationError, ExecutionError) as exc:
+            return CheckResult(name, False, redact(str(exc)))
+        return CheckResult(
+            name,
+            True,
+            f"no organization connected to OpenCode (data directory {data_dir}); a launch "
+            "reads no configuration file of the operator's or the repository's",
         )
 
     def check_opencode_version(self, name: str, command: str) -> CheckResult:

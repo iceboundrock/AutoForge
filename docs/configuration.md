@@ -513,6 +513,7 @@ included):
 | `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `GIT_CONFIG_COUNT`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_KEY_*`, `GIT_CONFIG_VALUE_*` | git configuration from the environment, which can name a credential helper |
 | `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS` | the session bus a desktop keyring answers on |
 | `CURL_HOME`, `WGETRC`, `WGET2RC` | where curl and wget find the configuration file they read on every request, which can add a credential header |
+| `NETRC` | where curl (8.16 and later), Python's `requests` and Go find the `.netrc` they take a password from |
 
 Earlier versions forwarded `XDG_RUNTIME_DIR`, `SSH_AUTH_SOCK`, `GIT_SSH`,
 `GIT_SSH_COMMAND`, `GIT_CONFIG_GLOBAL`, `GH_TOKEN`, `GITHUB_TOKEN`,
@@ -530,7 +531,7 @@ it removes when the launch ends:
 | `GIT_CONFIG_GLOBAL` | a file holding only your `user.*`, `author.*` and `committer.*` settings | the agent's commits carry your identity; `~/.gitconfig` and `$XDG_CONFIG_HOME/git/config` are not read |
 | `GIT_TERMINAL_PROMPT` | `0` | git never prompts for a credential |
 | `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_n`, `GIT_CONFIG_VALUE_n` | `credential.helper=`, `core.askPass=`, `http.extraHeader=`, `core.sshCommand=ssh -F /dev/null -o IdentityFile=none -o IdentitiesOnly=yes -o IdentityAgent=none -o ControlPath=none -o BatchMode=yes` | no credential helper, askpass, extra header, SSH agent or SSH key, whatever any git configuration file says |
-| `CURL_HOME` | a directory holding an empty `.curlrc` | a plain `curl` reads it, not `~/.curlrc` or `$XDG_CONFIG_HOME/curlrc`, so a header configured there is never sent |
+| `CURL_HOME` | a directory holding an empty `.curlrc` | a plain `curl` reads it, not `~/.curlrc` or the `curlrc` (or `.curlrc`) in `$XDG_CONFIG_HOME`, so a header configured there is never sent |
 | `WGETRC`, `WGET2RC` | an empty file | a plain `wget` (1.x or wget2) reads it, not `~/.wgetrc` or `~/.config/wget/wget2rc` |
 
 `GIT_AUTHOR_*` and `GIT_COMMITTER_*` stay in the default allow-list and
@@ -556,7 +557,20 @@ repository's runs in a launch:
   repository's is read. Settings kept there (a custom provider, permission
   rules, agents, instructions) do not apply to an AutoForge launch; the
   model credentials of `opencode auth login` and the providers' API-key
-  variables do.
+  variables do. An organization connected to OpenCode (a
+  `.well-known/opencode` integration) cannot be kept off that way: OpenCode
+  loads its configuration, or the copy it cached, from the database that
+  also holds your model login, ahead of every file. So an OpenCode launch
+  is refused while the database it would open lists one (or the legacy
+  `auth.json` beside it has a `"wellknown"` entry, or either cannot be
+  read); `autoforge doctor` fails the same way (row "agent 'opencode' loads
+  no organization configuration"). `opencode auth logout` does not help
+  (it removes the credential and leaves the cached configuration). Give
+  AutoForge's launches a database of their own instead: set `OPENCODE_DB`,
+  which every OpenCode launch inherits, to a separate file in the shell
+  that runs `autoforge`, and run `opencode auth login` for the model
+  provider with it set; or set it to `:memory:` and use the provider's
+  API-key variable.
 
 **A preflight before every launch.** The controller refuses to launch an
 agent or run a command when it would still be handed a credential through
@@ -565,7 +579,9 @@ without its value: a credential helper in the repository's or a worktree's
 git configuration; a remote URL (or a `url.<base>.insteadOf` base) with a
 user name or token in it; an `http.extraHeader` in system, repository or
 worktree configuration; an entry for GitHub, or a `default` entry, in
-`~/.netrc`. For an agent the run stops before anything is recorded, so it
+`~/.netrc`, whatever its quoting, escapes or case (every word is checked,
+comments and `macdef` bodies included, because netrc readers disagree on
+where those end). For an agent the run stops before anything is recorded, so it
 can simply be run again once the setting is removed; for a validation or
 pre-merge command it counts as that command failing. `autoforge doctor` and
 `autoforge local doctor` run the same check (row "no credential reaches a

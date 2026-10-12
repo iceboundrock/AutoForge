@@ -150,7 +150,9 @@ git credential route (:func:`autoforge.child_env.refuse_forbidden_env`),
 and the variables the controller sets for the launch
 (:attr:`AgentRequest.env`, #165) reach every process the adapter starts,
 with the adapter's own (:meth:`AgentProvider.integration_isolation`) over
-them where its CLI has no flag to keep integrations from loading.
+them where its CLI has no flag to keep integrations from loading. An
+integration neither can keep off refuses the launch before it starts
+(:meth:`AgentProvider.integration_preflight`).
 
 Every adapter runs a :class:`~autoforge.loop_detect.LoopMonitor` under
 :attr:`AgentRequest.loop_detection` (#194): Claude's stream and Pi's events
@@ -166,14 +168,17 @@ from __future__ import annotations
 
 import json
 import os
+import pwd
 import re
 import shutil
+import sqlite3
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from .child_env import refuse_forbidden_env
 from .claude_stream import ClaudeStream
@@ -486,6 +491,24 @@ class AgentProvider:
         """
         yield {}
 
+    def integration_preflight(self, env_allowlist: tuple[str, ...] | None) -> None:
+        """Refuse a launch whose CLI would still load an integration that
+        neither its flags nor :meth:`integration_isolation` keep off (#165).
+
+        ``env_allowlist`` is the configured allow-list (this provider adds
+        its own names, as for the launch). Raises :class:`ConfigurationError`
+        before anything starts: the engine calls this with the credential
+        preflight, before a launch is charged, and :meth:`execute` calls it
+        again before it launches. The base adapter has nothing to refuse.
+        """
+
+    def launch_environment(self, env_allowlist: tuple[str, ...] | None) -> dict[str, str]:
+        """The variables of the controller's environment a launch with
+        ``env_allowlist`` inherits, before any the controller sets."""
+        if env_allowlist is None:
+            return dict(os.environ)
+        return select_environment(self.launch_allowlist(env_allowlist))
+
     def reports_activity(self, profile: ProfileConfig) -> bool:
         """Whether the CLI, launched for ``profile``, writes output while it works.
 
@@ -544,6 +567,7 @@ class AgentProvider:
             if monitor.output(stream, chunk, time.monotonic()) is not None:
                 stop.set()
 
+        self.integration_preflight(req.env_allowlist)
         with self.integration_isolation() as isolation:
             env = {**(req.env or {}), **isolation} if isolation else req.env
             res = self._runner(
@@ -834,7 +858,10 @@ def opencode_isolation_env(config_dir: str) -> dict[str, str]:
       through ``OPENCODE_*``.
 
     The model credentials (``opencode auth login``, kept in the data
-    directory) and the providers' API-key variables are untouched.
+    directory) and the providers' API-key variables are untouched; so is
+    the organization configuration kept with them, which no variable turns
+    off and which refuses the launch instead
+    (:func:`opencode_organization_problems`).
     """
     return {
         "OPENCODE_CONFIG_DIR": config_dir,
@@ -843,6 +870,148 @@ def opencode_isolation_env(config_dir: str) -> dict[str, str]:
         "OPENCODE_CONFIG": "",
         "OPENCODE_CONFIG_CONTENT": "",
     }
+
+
+# Where OpenCode 2.0.26 keeps the organizations connected to it (a
+# ``.well-known/opencode`` integration, read from the build): the ``kv``
+# row ``wellknown:sources`` of its database lists their origins. Every
+# launch, ``Config.load`` fetches each one's manifest and configuration
+# again and, without a usable credential for it (``opencode auth logout``
+# removes only the credential), falls back to the copies cached in the same
+# table; either may name an MCP server or a plugin holding a GitHub
+# credential of its own, and no variable or flag keeps it from loading.
+# ``auth.json``, the credential file of earlier releases, is imported when
+# a database is created: an entry of ``"type": "wellknown"`` there becomes
+# a source.
+OPENCODE_WELLKNOWN_SOURCES = "wellknown:sources"
+OPENCODE_LEGACY_AUTH_FILE = "auth.json"
+OPENCODE_MAX_AUTH_BYTES = 1024 * 1024
+# How long reading the database may wait for an OpenCode writing to it.
+OPENCODE_DATABASE_TIMEOUT_SECONDS = 5
+
+
+def opencode_data_dir(env: Mapping[str, str]) -> Path:
+    """The data directory of an OpenCode launch with ``env``:
+    ``$XDG_DATA_HOME/opencode``, else ``~/.local/share/opencode`` (``HOME``,
+    else the password database's home), where 2.0.26 keeps its database."""
+    base = env.get("XDG_DATA_HOME")
+    if not base:
+        home = env.get("HOME")
+        if not home:
+            try:
+                home = pwd.getpwuid(os.getuid()).pw_dir
+            except KeyError:
+                home = "/"
+        base = os.path.join(home, ".local", "share")
+    return Path(base, "opencode")
+
+
+def opencode_databases(env: Mapping[str, str], data_dir: Path) -> list[Path]:
+    """The databases an OpenCode launch with ``env`` may open: the file
+    ``OPENCODE_DB`` names (relative to ``data_dir``; ``:memory:`` is none),
+    else each ``opencode*.db`` in ``data_dir`` (the name depends on the
+    build's release channel)."""
+    named = env.get("OPENCODE_DB")
+    if named is not None:
+        return [] if named == ":memory:" else [data_dir / named]
+    return sorted(data_dir.glob("opencode*.db"))
+
+
+def _not_a_regular_file(path: Path) -> str | None:
+    """Why ``path``, which exists, is not opened (a FIFO would block the
+    launch forever, a directory has nothing to read); None for a file."""
+    if path.is_file():
+        return None
+    return f"{path} could not be checked (not a regular file)"
+
+
+def _opencode_database_problems(database: Path) -> list[str]:
+    """The organizations ``database`` lists, or that it could not be read.
+
+    Opened read-only (a URI with ``mode=ro``), never created or written;
+    only the sources row is read, and only the number of origins is
+    reported, never one.
+    """
+    if not database.exists():
+        return []
+    refused = _not_a_regular_file(database)
+    if refused:
+        return [refused]
+    try:
+        uri = f"{database.resolve().as_uri()}?mode=ro"
+        with closing(
+            sqlite3.connect(uri, uri=True, timeout=OPENCODE_DATABASE_TIMEOUT_SECONDS)
+        ) as db:
+            tables = db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'kv'")
+            if tables.fetchone() is None:
+                return []
+            row = db.execute(
+                "SELECT value FROM kv WHERE key = ?", (OPENCODE_WELLKNOWN_SOURCES,)
+            ).fetchone()
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        return [f"{database} could not be checked ({type(exc).__name__})"]
+    if row is None:
+        return []
+    try:
+        sources = json.loads(row[0])
+    except (TypeError, ValueError):
+        sources = None
+    if sources == []:
+        return []
+    if not isinstance(sources, list):
+        return [f"{database} could not be checked (an unreadable list of organizations)"]
+    return [f"{len(sources)} organization(s) connected to OpenCode in {database}"]
+
+
+def _opencode_legacy_auth_problems(data_dir: Path) -> list[str]:
+    """An organization in the legacy ``auth.json``, or that it could not be read.
+
+    Parsed in memory only: no value of the file is ever reported.
+    """
+    path = data_dir / OPENCODE_LEGACY_AUTH_FILE
+    if not path.exists():
+        return []
+    refused = _not_a_regular_file(path)
+    if refused:
+        return [refused]
+    try:
+        with path.open("rb") as handle:
+            data = handle.read(OPENCODE_MAX_AUTH_BYTES + 1)
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        return [f"{path} could not be checked ({type(exc).__name__})"]
+    if len(data) > OPENCODE_MAX_AUTH_BYTES:
+        return [f"{path} is larger than {OPENCODE_MAX_AUTH_BYTES} bytes and was not checked"]
+    try:
+        entries = json.loads(data)
+    except ValueError:
+        return [f"{path} could not be checked (not JSON)"]
+    if isinstance(entries, dict) and any(
+        isinstance(entry, dict) and entry.get("type") == "wellknown" for entry in entries.values()
+    ):
+        return [
+            f'an organization (a "wellknown" entry) in {path}, which OpenCode imports '
+            "into every database it creates"
+        ]
+    return []
+
+
+def opencode_organization_problems(env: Mapping[str, str]) -> list[str]:
+    """What, in the data an OpenCode launch with ``env`` reads, would make it
+    load an organization's configuration (empty: nothing would).
+
+    ``env`` is the environment the launch inherits (``HOME``,
+    ``XDG_DATA_HOME`` and ``OPENCODE_DB`` decide where 2.0.26 looks). A
+    database or file that exists but cannot be read is a problem too: a
+    launch is refused rather than assumed clean.
+    """
+    data_dir = opencode_data_dir(env)
+    problems: list[str] = []
+    for database in opencode_databases(env, data_dir):
+        problems += _opencode_database_problems(database)
+    problems += _opencode_legacy_auth_problems(data_dir)
+    return problems
 
 
 class OpenCodeProvider(AgentProvider):
@@ -871,6 +1040,30 @@ class OpenCodeProvider(AgentProvider):
             yield opencode_isolation_env(config_dir)
         finally:
             shutil.rmtree(config_dir, ignore_errors=True)
+
+    def data_dir(self, env_allowlist: tuple[str, ...] | None) -> Path:
+        """The data directory a launch with ``env_allowlist`` uses (:func:`opencode_data_dir`)."""
+        return opencode_data_dir(self.launch_environment(env_allowlist))
+
+    def integration_preflight(self, env_allowlist: tuple[str, ...] | None) -> None:
+        """Refuse a launch while OpenCode would load an organization's
+        configuration (:func:`opencode_organization_problems`): 2.0.26 loads
+        it ahead of every configuration file, and no variable of
+        :func:`opencode_isolation_env` reaches it.
+        """
+        problems = opencode_organization_problems(self.launch_environment(env_allowlist))
+        if problems:
+            raise ConfigurationError(
+                "refusing to launch opencode: it would load the configuration of an "
+                "organization connected to it (a .well-known/opencode integration), which can "
+                "name an MCP server or a plugin holding a GitHub credential of its own, and "
+                f"nothing keeps it from loading: {'; '.join(problems)}. Give AutoForge's "
+                "launches an OpenCode database without one (set OPENCODE_DB, which every "
+                "launch inherits, to a file of their own and log in to the model provider "
+                "with it set, or to ':memory:' with the provider's API-key variable), remove "
+                'a "wellknown" entry from auth.json, or route these profiles to another '
+                "provider (docs/configuration.md, 'Agent environment')"
+            )
 
     def validate_profile(self, profile: ProfileConfig) -> None:
         super().validate_profile(profile)

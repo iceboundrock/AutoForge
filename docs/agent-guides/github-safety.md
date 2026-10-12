@@ -905,9 +905,11 @@ never the boundary.
   (`GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `GIT_CONFIG_COUNT`,
   `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_KEY_*`, `GIT_CONFIG_VALUE_*`), the
   session bus a desktop keyring answers on (`XDG_RUNTIME_DIR`,
-  `DBUS_SESSION_BUS_ADDRESS`), and where curl and wget find the
+  `DBUS_SESSION_BUS_ADDRESS`), where curl and wget find the
   configuration file they read on every request (`CURL_HOME`, `WGETRC`,
-  `WGET2RC`). None is in the default allow-list, and
+  `WGET2RC`), and `NETRC`, the `.netrc` that curl 8.16 and later, Python's
+  `requests` and Go read in place of `~/.netrc`. None is in the default
+  allow-list, and
   config load refuses any of them, or a `*` prefix covering one, in
   `execution.env_allowlist`, `env_allowlist_extra` or an adapter's
   `environment_names`, naming the variable and the rule and never a value.
@@ -934,9 +936,10 @@ never the boundary.
     `ssh -F /dev/null -o IdentityFile=none -o IdentitiesOnly=yes -o IdentityAgent=none -o ControlPath=none -o BatchMode=yes`;
   - `CURL_HOME`: a directory holding an empty `.curlrc`, and `WGETRC`
     (wget 1.x) and `WGET2RC` (wget2): an empty file. curl reads the first
-    default configuration file it finds, `$CURL_HOME/.curlrc` before
-    `$XDG_CONFIG_HOME/curlrc`, `~/.curlrc` and the password database's
-    home, and wget reads the file its variable names instead of
+    default configuration file it finds, `$CURL_HOME/.curlrc` before the
+    one in `$XDG_CONFIG_HOME` (`curlrc` in curl 8.18, `.curlrc` in 8.5),
+    `~/.curlrc` and the password database's home, and wget reads the file
+    its variable names instead of
     `~/.wgetrc` or `~/.config/wget/wget2rc`. Either file can add an
     `Authorization` header to every request, so a plain `curl` or `wget`
     would otherwise send the operator's token; the child keeps `HOME` and
@@ -949,7 +952,14 @@ never the boundary.
   credential, and an `http.extraHeader` (a URL-specific one beats the
   generic reset) in system, repository or worktree scope, and a `.netrc`
   entry for GitHub or a `default` entry (git's HTTPS transport reads it
-  through `HOME`, which every child keeps). For an agent the refusal is a
+  through `HOME`, which every child keeps). The readers disagree on netrc
+  syntax (curl 7.84 and later and wget quote with `"` and match keywords in
+  any case, Python's `netrc` module, behind `requests`, drops a `\` before
+  any character, and where a `macdef` body or a comment ends differs), so
+  every word is compared, split at whitespace and `"`, without `\` and
+  without regard to case, wherever it stands: a GitHub host or `default` in
+  a password, a comment or a macro body refuses the file too. For an agent
+  the refusal is a
   `ConfigurationError` raised before anything is charged, saved or launched,
   so state is untouched; for a validation command it leaves the phase
   unverified, and for a pre-merge command it blocks the merge, as a failing
@@ -979,7 +989,21 @@ never the boundary.
     directory is read, neither the operator's global one nor one in or
     above the worktree (OpenCode's project search does not stop at the
     worktree, so it would reach the operator's checkout and home), and no
-    explicit or inline document is.
+    explicit or inline document is. An organization connected to OpenCode
+    (a `.well-known/opencode` integration) is loaded ahead of all of them
+    from OpenCode's database, which also holds the model login a launch
+    needs, and no variable or flag keeps it off: without a credential for
+    it the cached copy is loaded (`opencode auth logout` removes only the
+    credential). So the launch is refused instead, before anything is
+    charged (`OpenCodeProvider.integration_preflight`, also run by
+    `doctor`), while the database the launch would open (`OPENCODE_DB`,
+    else each `opencode*.db` in `$XDG_DATA_HOME/opencode` or
+    `~/.local/share/opencode`) lists an organization, while the legacy
+    `auth.json` there has a `"wellknown"` entry (imported into every
+    database OpenCode creates), or while either cannot be read. The
+    refusal names the file and a count, never an origin; the way out is an
+    `OPENCODE_DB` of AutoForge's own (or `:memory:` with an API-key
+    variable).
   - Pi's `--no-extensions` and the rest of #132's policy are unchanged.
 
 ### Credential routes
@@ -1000,12 +1024,14 @@ named otherwise), or why it has none.
 | SSH default keys (`~/.ssh/id_*`, found through the password database, not `HOME`) | `core.sshCommand` at command scope: `-F /dev/null`, `IdentityFile=none`; `GIT_SSH`, `GIT_SSH_COMMAND` withheld | fake `ssh` that succeeds only with a default key or the agent |
 | a credential in a URL (`remote.*.url`, `pushurl`, `url.*.insteadOf`) | global replaced; system, repository and worktree refused by the preflight | `test_the_preflight_refuses_a_credential_in_the_repository_configuration`; doctor: `test_doctor_refuses_a_token_bearing_origin_and_never_prints_it` |
 | `http.extraHeader` | generic reset at command scope; any non-empty one refused by the preflight | preflight tests |
-| `~/.netrc` (libcurl, `curl -n`) | GitHub or `default` entry refused by the preflight | `test_a_netrc_entry_for_github_refuses_the_launch`, `test_engine.py::test_a_netrc_entry_for_github_blocks_the_premerge_verification`, doctor |
-| curl's configuration (`~/.curlrc`, `$XDG_CONFIG_HOME/curlrc`, `$CURL_HOME/.curlrc`), read by every plain `curl` | `CURL_HOME` names an empty `.curlrc` of the launch's, found first; `CURL_HOME` refused at load | the real `curl` against a loopback server, header sent for the controller and not from a launch: `test_a_launchs_plain_curl_sends_no_header_of_the_operators_configuration`; fake `curl`: `test_an_agent_finds_no_credential_route_the_controller_finds_every_one` |
+| `~/.netrc` (libcurl, `curl -n`, `requests`) | a word any reader may take for a GitHub machine or `default` refused by the preflight: quoted, escaped or upper-case, in a password, comment or macro body | `test_a_netrc_entry_for_github_refuses_the_launch`, `test_a_netrc_entry_for_github_in_any_readers_syntax_refuses_the_launch`; the real `curl -n` (loopback) and Python's `netrc` take the credential of each disguised entry: `test_the_disguised_netrc_entries_are_ones_a_real_reader_uses`; `test_engine.py::test_a_netrc_entry_for_github_blocks_the_premerge_verification`; `test_doctor.py::test_doctor_refuses_a_netrc_entry_for_github` |
+| `NETRC` (curl 8.16 and later, `requests`, Go) | refused at load, never inherited | `test_config.py` refusals; the real `curl` sends the credential of the operator's `NETRC` file for the controller and none from a launch: `test_a_launchs_curl_reads_no_netrc_the_operators_netrc_variable_names` (curl 8.16 and later) |
+| curl's configuration (`~/.curlrc`, `$XDG_CONFIG_HOME/curlrc` or `.curlrc`, `$CURL_HOME/.curlrc`), read by every plain `curl` | `CURL_HOME` names an empty `.curlrc` of the launch's, found first; `CURL_HOME` refused at load | the real `curl` against a loopback server, header sent for the controller and not from a launch: `test_a_launchs_plain_curl_sends_no_header_of_the_operators_configuration`; fake `curl`: `test_an_agent_finds_no_credential_route_the_controller_finds_every_one` |
 | wget's configuration (`~/.wgetrc`, `~/.config/wget/wget2rc`), read by every plain `wget` | `WGETRC` and `WGET2RC` name an empty file of the launch's; both refused at load | the real `wget` (1.x or wget2) the same way: `test_a_launchs_plain_wget_sends_no_header_of_the_operators_configuration`; fake `wget` |
 | `~/.git-credentials`, `$XDG_CONFIG_HOME/git/credentials` | read only by the `store` helper, which is reset | covered by the helper tests; a deliberate read is an absolute-path read (not guaranteed) |
 | Claude Code hooks, installed plugins and MCP servers (user, project, `.mcp.json`, plugin) | `--safe-mode` and `--strict-mcp-config`; integration flags refused in `extra_args`; `doctor` requires both flags | `test_providers.py::test_claude_argv_shape`, `test_claude_refuses_extra_args_that_load_an_integration`, `test_config.py::test_a_claude_profile_whose_extra_args_load_an_integration_is_refused`, `test_doctor.py::test_doctor_fails_a_claude_without_the_isolation_flags`. A test cannot run a real Claude Code; the flags were checked against 2.1.296 with marker hooks and MCP servers (`providers.py`) |
 | OpenCode MCP servers and plugins (global, project and above, `OPENCODE_CONFIG`, `OPENCODE_CONFIG_CONTENT`) | `opencode_isolation_env`: an empty global configuration directory, no project configuration, no explicit or inline document | a fake `opencode` that resolves its configuration as 2.0.26 does, behind the real executor: `test_providers.py::test_an_opencode_launch_loads_no_mcp_server_or_plugin_of_any_configuration`. A test cannot run a real OpenCode; the variables were checked against 2.0.26's resolved configuration (`providers.py`) |
+| OpenCode organization configuration (`.well-known/opencode`: fetched, or cached in OpenCode's database, ahead of every file) | the launch refused while the database it would open lists an organization, `auth.json` has a `"wellknown"` entry, or either cannot be read | the fake `opencode` loads the cached organization configuration from a 2.0.26-shaped database: `test_providers.py::test_an_opencode_launch_is_refused_while_an_organization_is_connected` (cached, not yet cached, legacy `auth.json`, `OPENCODE_DB`), `test_an_opencode_launch_with_no_organization_proceeds`, `test_opencode_data_that_cannot_be_read_refuses_the_launch`; before anything is charged: `test_engine.py::test_an_integration_the_provider_cannot_keep_off_refuses_the_launch_and_leaves_state`; `test_doctor.py::test_doctor_fails_an_opencode_connected_to_an_organization`. The real 2.0.26 was seen starting a cached organization's MCP server under `opencode_isolation_env` and none with `OPENCODE_DB=:memory:` or a database of its own (`providers.py`) |
 | Pi extensions, skills, prompt templates, themes, context files | #132's flags (`--no-extensions` and the rest) | `test_pi_rpc.py`, unchanged |
 | a provider's permission mode or approval | irrelevant by the authority rule: it grants no credential | — |
 | validation and pre-merge commands | the same variables and preflight | `test_local.py::test_local_launches_get_the_same_isolation_and_no_read_context`, `test_engine.py::test_verification_commands_get_the_launch_isolation` |
@@ -1097,12 +1123,9 @@ humans acting concurrently on GitHub. GitHub is the source of truth.
 
 **Residuals of the provider integrations.** Claude Code still applies
 managed settings an administrator installed (`--safe-mode` leaves policy
-settings in force); the operator cannot change them either. OpenCode still
-loads the configuration of an organization the operator connected with
-`opencode auth login` (a `.well-known/opencode` integration): OpenCode keeps
-it with the model credentials in its data directory, which a launch needs.
-Neither is detected; both are outside the configuration files a launch
-reads.
+settings in force); the operator cannot change them either, and they are
+not detected. OpenCode's organization configuration is not a residual: a
+launch that would load it is refused (above).
 
 **What the agent loses.** The operator's global git configuration beyond
 the identity is not read by an agent: no commit signing (`commit.gpgSign`,

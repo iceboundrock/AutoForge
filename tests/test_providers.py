@@ -3,8 +3,10 @@
 import dataclasses
 import hashlib
 import json
+import sqlite3
 import sys
 import time
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -21,6 +23,7 @@ from autoforge.providers import (
     PiProvider,
     ProviderRegistry,
     ScriptedProvider,
+    opencode_data_dir,
     opencode_isolation_env,
     provider_for,
 )
@@ -1391,11 +1394,12 @@ def test_only_opencode_sets_variables_of_its_own():
 
 
 # A fake `opencode` that resolves its configuration the way 2.0.26 does (read
-# from the build; providers.py, `opencode_isolation_env`), reports which MCP
-# servers and plugin directories it would load and what its global
-# configuration directory held, and answers.
+# from the build; providers.py, `opencode_isolation_env` and
+# `opencode_organization_problems`), reports which MCP servers and plugin
+# directories it would load and what its global configuration directory
+# held, and answers.
 _CONFIG_RESOLVING_OPENCODE = r"""
-import json, os, sys
+import json, os, sqlite3, sys
 from pathlib import Path
 
 sys.stdin.read()
@@ -1403,6 +1407,19 @@ env = os.environ
 config_dir = Path(env.get("OPENCODE_CONFIG_DIR") or Path(
     env.get("XDG_CONFIG_HOME") or Path(env["HOME"], ".config"), "opencode"))
 documents, directories = [], []
+
+# Each organization its database lists, ahead of every file: with no
+# credential for it (and no network here), the configuration cached for it.
+data_dir = Path(env.get("XDG_DATA_HOME") or Path(env["HOME"], ".local", "share"), "opencode")
+database = env.get("OPENCODE_DB", "opencode.db")
+if database != ":memory:" and (data_dir / database).is_file():
+    db = sqlite3.connect(data_dir / database)
+    row = db.execute("SELECT value FROM kv WHERE key = 'wellknown:sources'").fetchone()
+    for origin in json.loads(row[0]) if row else []:
+        cached = db.execute(
+            "SELECT value FROM kv WHERE key = ?", ("wellknown:config:" + origin,)
+        ).fetchone()
+        documents.extend(json.loads(cached[0]) if cached else [])
 
 
 def document(path):
@@ -1526,6 +1543,183 @@ def test_an_opencode_launch_loads_no_mcp_server_or_plugin_of_any_configuration(
     assert isolated["mcp"] == [] and isolated["plugins"] == []
     assert isolated["config_dir_was_empty"]
     assert not Path(isolated["config_dir"]).exists()
+
+
+_ORG = "https://org.example.invalid"
+_ORG_CONFIG = [{"mcp": {"servers": {"org-gh": {"type": "local", "command": ["org-mcp"]}}}}]
+
+
+def _opencode_database(path: Path, kv: dict[str, object]) -> Path:
+    """A database laid out as OpenCode 2.0.26's (``kv`` and ``credential``,
+    the tables of a fresh one), holding ``kv`` and a model credential."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(path)) as db:
+        db.execute(
+            "CREATE TABLE kv (key text PRIMARY KEY, value text NOT NULL, "
+            "time_created integer NOT NULL, time_updated integer NOT NULL)"
+        )
+        db.execute(
+            "CREATE TABLE credential (id text PRIMARY KEY, integration_id text, "
+            "label text NOT NULL, value text NOT NULL, connector_id text, method_id text, "
+            "active integer, time_created integer NOT NULL, time_updated integer NOT NULL)"
+        )
+        rows = {"models-dev:catalog": {"body": "{}"}, **kv}
+        db.executemany(
+            "INSERT INTO kv VALUES (?, ?, 0, 0)", [(k, json.dumps(v)) for k, v in rows.items()]
+        )
+        db.execute(
+            "INSERT INTO credential VALUES ('cred_1', 'openai', 'API key', ?, NULL, NULL, 1, 0, 0)",
+            (json.dumps({"type": "key", "key": "model-key-placeholder"}),),
+        )
+        db.commit()
+    return path
+
+
+def _org_request(tmp_path, monkeypatch):
+    """The fake OpenCode of :func:`_opencode_world`, the real resolution of
+    its data directory (``~/.local/share/opencode``), and a request for it."""
+    import autoforge.providers as providers_module
+
+    fake, worktree = _opencode_world(tmp_path, monkeypatch)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    monkeypatch.setattr(providers_module, "opencode_data_dir", opencode_data_dir)
+    report = tmp_path / "report.json"
+    profile = ProfileConfig(
+        name="review_round_1",
+        provider="opencode",
+        model="openai/x",
+        command=str(fake),
+        extra_args=["--report", str(report)],
+    )
+    allowlist = ("PATH", "HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME")
+    req = AgentRequest("REVIEW", "p", str(worktree), profile, None, 60, env_allowlist=allowlist)
+    return fake, report, req, tmp_path / "home" / ".local" / "share" / "opencode"
+
+
+def _loaded_without_the_adapter(fake, report, cwd) -> list[str]:
+    """The MCP servers the CLI loads in the operator's environment."""
+    from autoforge.executor import ExecutionRequest, execute
+
+    execute(
+        ExecutionRequest(
+            command=[str(fake), "--report", str(report)],
+            cwd=cwd,
+            timeout_seconds=60,
+            stdin_data=b"p",
+        )
+    )
+    loaded = json.loads(report.read_text())["mcp"]
+    report.unlink()
+    return loaded
+
+
+@pytest.mark.parametrize(
+    "where",
+    ["cached-configuration", "nothing-cached-yet", "legacy-auth-file", "named-database"],
+)
+def test_an_opencode_launch_is_refused_while_an_organization_is_connected(
+    tmp_path, monkeypatch, where
+):
+    """#165: an organization connected to OpenCode (a ``.well-known/opencode``
+    integration) is loaded ahead of every configuration file, and 2.0.26 has
+    no variable or flag that keeps it off: with no credential for it the
+    cached configuration is (``opencode auth logout`` removes only the
+    credential), and it names an MCP server here. The launch is refused
+    before the CLI starts, naming where and how many, never an origin."""
+    fake, report, req, data_dir = _org_request(tmp_path, monkeypatch)
+    org = {"wellknown:sources": [_ORG]}
+    if where == "cached-configuration":
+        _opencode_database(
+            data_dir / "opencode.db", {**org, f"wellknown:config:{_ORG}": _ORG_CONFIG}
+        )
+        assert "org-gh" in _loaded_without_the_adapter(fake, report, req.cwd)
+        expected = f"1 organization(s) connected to OpenCode in {data_dir / 'opencode.db'}"
+    elif where == "nothing-cached-yet":
+        # A launch would fetch the organization's configuration itself.
+        _opencode_database(data_dir / "opencode.db", org)
+        expected = f"1 organization(s) connected to OpenCode in {data_dir / 'opencode.db'}"
+    elif where == "legacy-auth-file":
+        # Imported as a source into the database a launch creates.
+        data_dir.mkdir(parents=True)
+        (data_dir / "auth.json").write_text(
+            json.dumps({_ORG: {"type": "wellknown", "key": "ORG_TOKEN", "token": "placeholder"}})
+        )
+        expected = f'an organization (a "wellknown" entry) in {data_dir / "auth.json"}'
+    else:
+        named = _opencode_database(
+            tmp_path / "elsewhere.db", {**org, f"wellknown:config:{_ORG}": _ORG_CONFIG}
+        )
+        _opencode_database(data_dir / "opencode.db", {})
+        monkeypatch.setenv("OPENCODE_DB", str(named))
+        assert "org-gh" in _loaded_without_the_adapter(fake, report, req.cwd)
+        expected = f"1 organization(s) connected to OpenCode in {named}"
+    with pytest.raises(ConfigurationError) as caught:
+        OpenCodeProvider().execute(req)
+    message = str(caught.value)
+    assert message.startswith("refusing to launch opencode") and expected in message
+    assert _ORG not in message and "placeholder" not in message
+    assert not report.exists()  # the CLI never started
+
+
+@pytest.mark.parametrize("where", ["model-credentials-only", "memory-database"])
+def test_an_opencode_launch_with_no_organization_proceeds(tmp_path, monkeypatch, where):
+    """Model credentials, an emptied organization list and a legacy
+    ``auth.json`` of API keys refuse nothing; neither does an organization
+    in a database the launch does not open (``OPENCODE_DB=:memory:``, the
+    documented way out)."""
+    fake, report, req, data_dir = _org_request(tmp_path, monkeypatch)
+    if where == "model-credentials-only":
+        _opencode_database(data_dir / "opencode.db", {"wellknown:sources": []})
+        (data_dir / "auth.json").write_text(
+            json.dumps({"openai": {"type": "api", "key": "model-key-placeholder"}})
+        )
+    else:
+        _opencode_database(
+            data_dir / "opencode.db",
+            {"wellknown:sources": [_ORG], f"wellknown:config:{_ORG}": _ORG_CONFIG},
+        )
+        monkeypatch.setenv("OPENCODE_DB", ":memory:")
+    assert OpenCodeProvider().execute(req).exit_code == 0
+    assert json.loads(report.read_text())["mcp"] == []
+
+
+@pytest.mark.parametrize(
+    ("name", "content", "reason"),
+    [
+        ("opencode.db", b"not a database, but not empty either" * 100, "(DatabaseError)"),
+        ("auth.json", b"{not json", "(not JSON)"),
+    ],
+)
+def test_opencode_data_that_cannot_be_read_refuses_the_launch(
+    tmp_path, monkeypatch, name, content, reason
+):
+    fake, report, req, data_dir = _org_request(tmp_path, monkeypatch)
+    data_dir.mkdir(parents=True)
+    (data_dir / name).write_bytes(content)
+    with pytest.raises(ConfigurationError) as caught:
+        OpenCodeProvider().execute(req)
+    assert f"{data_dir / name} could not be checked {reason}" in str(caught.value)
+    assert not report.exists()
+
+
+@pytest.mark.parametrize("name", ["opencode.db", "auth.json"])
+def test_an_opencode_data_file_that_is_a_fifo_refuses_without_blocking(tmp_path, monkeypatch, name):
+    import os
+
+    fake, report, req, data_dir = _org_request(tmp_path, monkeypatch)
+    data_dir.mkdir(parents=True)
+    os.mkfifo(data_dir / name)
+    with pytest.raises(ConfigurationError) as caught:
+        OpenCodeProvider().execute(req)
+    assert f"{data_dir / name} could not be checked (not a regular file)" in str(caught.value)
+
+
+def test_the_opencode_data_directory_is_the_launchs():
+    assert opencode_data_dir({"XDG_DATA_HOME": "/x", "HOME": "/h"}) == Path("/x/opencode")
+    assert opencode_data_dir({"HOME": "/h"}) == Path("/h/.local/share/opencode")
+    assert opencode_data_dir({"XDG_DATA_HOME": "", "HOME": "/h"}) == Path(
+        "/h/.local/share/opencode"
+    )
 
 
 def test_an_opencode_configuration_directory_that_cannot_be_made_launches_nothing(monkeypatch):

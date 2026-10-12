@@ -416,8 +416,9 @@ redacted and bounded, into `<state dir>/read-context/<run-id>/`; the prompt
 names that directory. Before every launch the controller refuses to start
 when a setting would still hand over a credential (a credential helper in
 the repository's git configuration, a token in a remote URL, a GitHub entry
-in `~/.netrc`), naming the setting, never its value; the run is left
-untouched, so remove the setting and run the same command again.
+in `~/.netrc`, an organization connected to OpenCode), naming the setting,
+never its value; the run is left untouched, so remove the setting and run
+the same command again.
 `autoforge doctor` runs the same check. What this does not stop (a
 deliberate read of `~/.config/gh/hosts.yml` by absolute path, for one) is
 in [GitHub safety](agent-guides/github-safety.md#threat-model); ADR 0005's
@@ -458,6 +459,13 @@ ownership or discard uncommitted user changes.
   command again. A config that fails to load because `env_allowlist` names
   a credential variable: delete that entry
   ([Configuration: agent environment](configuration.md#agent-environment)).
+- **"refusing to launch opencode: it would load the configuration of an
+  organization connected to it":** OpenCode would load an organization's
+  configuration, which may name an MCP server with a GitHub credential of
+  its own, and nothing turns it off. Nothing was recorded: give AutoForge's
+  OpenCode launches a database of their own (`OPENCODE_DB`, see
+  [Configuration: agent environment](configuration.md#agent-environment))
+  and run the same command again.
 - **Merge verification keeps saying "inconclusive":** checks still running,
   mergeability unknown or a transient GitHub failure; re-run
   `autoforge resume --allow-merge`. After `merge.max_verification_attempts`

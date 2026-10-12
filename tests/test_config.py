@@ -1135,6 +1135,7 @@ FORBIDDEN_ENTRIES = [
     ("DBUS_*", "DBUS_SESSION_BUS_ADDRESS"),
     ("CURL_*", "CURL_HOME"),
     ("WGET*", "WGETRC"),
+    ("NET*", "NETRC"),
     ("G*", "GH_TOKEN"),
 ]
 

@@ -67,8 +67,9 @@ runtime state belonging to one operator.
   variable can be listed; the controller sets an empty `gh` configuration,
   disables git credential helpers, askpass and the SSH agent, gives curl and
   wget an empty configuration, keeps the agent CLI's MCP servers, plugins
-  and hooks off, and refuses a launch a repository setting would still hand
-  one; `src/autoforge/child_env.py`, `src/autoforge/providers.py`); and the
+  and hooks off, and refuses a launch a repository setting or an OpenCode
+  organization integration would still hand one;
+  `src/autoforge/child_env.py`, `src/autoforge/providers.py`); and the
   controller reads HEAD and branch of its own checkout before and after each
   invocation and enters `BLOCKED` if they moved. A dry run creates no
   worktree.

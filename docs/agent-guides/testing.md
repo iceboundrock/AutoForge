@@ -218,10 +218,16 @@ a stated reason it has none. The coverage that must keep working:
   controller and none from a launch (`test_child_env.py`)
 - the preflight refuses a repository or worktree helper (also through an
   include), a credential in a remote URL or an `insteadOf` base, an
-  `http.extraHeader`, a GitHub or `default` netrc entry, and git
-  configuration or output it cannot read; it accepts a global helper the
-  child never reads; its message names no value
-- an agent preflight refusal leaves the state file byte for byte; a
+  `http.extraHeader`, a GitHub or `default` netrc entry in any reader's
+  syntax (quoted, escaped, upper-case, a `macdef` given as a login; the
+  real `curl -n` against a loopback server or Python's `netrc` takes each
+  one's credential), and git configuration or output it cannot read; it
+  accepts a global helper the child never reads; its message names no
+  value; a launch never inherits `NETRC`, whose file the real curl 8.16
+  and later reads for the controller (`test_child_env.py`)
+- an agent preflight refusal, the credential preflight's or the
+  adapter's own (`integration_preflight`), leaves the state file byte for
+  byte; a
   validation-command refusal leaves the phase unverified; a pre-merge
   refusal blocks the merge (`test_engine.py`, `test_local.py`)
 - every launch of a full REMOTE lifecycle, for scripted providers and for
@@ -232,7 +238,8 @@ a stated reason it has none. The coverage that must keep working:
 - a write through a credential that slipped through anyway is not
   journaled and blocks (`test_engine.py`)
 - `doctor` refuses a token-bearing origin without printing it, refuses
-  the configuration routes and a netrc entry, lists the launch environment
+  the configuration routes, a netrc entry and an OpenCode organization,
+  lists the launch environment
   by name only, gives Pi's probes the same overrides, and `local doctor`
   keeps the environment rows with zero `gh` calls (`test_doctor.py`)
 - Claude Code launches with `--safe-mode` and `--strict-mcp-config`, and
@@ -241,7 +248,10 @@ a stated reason it has none. The coverage that must keep working:
   fails a `claude` whose `--help` lacks either flag (`test_doctor.py`); an
   OpenCode launch, through the real executor, reads no MCP server or
   plugin of any configuration a fake `opencode` that resolves its
-  configuration as 2.0.26 does would load; every adapter passes
+  configuration as 2.0.26 does would load, and is refused before the
+  CLI starts while OpenCode's database (`OPENCODE_DB` included) lists an
+  organization, cached or not, or its legacy `auth.json` has one, while a
+  launch with no organization proceeds; every adapter passes
   `AgentRequest.env` to the executor (`test_providers.py`)
 - the read context: redacted, bounded with explicit omission markers,
   project text fenced so it cannot close its fence; an unreadable item is a

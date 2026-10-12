@@ -82,8 +82,9 @@ read it before adding tests for a listed area.
   `PiProvider`, preceded by a `ScriptedProvider`-style handler that may
   return a `PiTurn` to script a failure); `make_pi_engine` / `route_to_pi`
   route profiles to it.
-- Every launch gets no GitHub credential (#165). An autouse fixture points
-  the preflight's `~/.netrc` at an empty directory, so a test never reads
+- Every launch gets no GitHub credential (#165). Autouse fixtures point
+  the preflight's `~/.netrc` and OpenCode's data directory (where the
+  organization check looks) at empty directories, so a test never reads
   the operator's. `pollute_operator_environment` fills the controller's
   environment with every credential route; `assert_isolated_launch(eng,
   req)` / `launch_environment` check what a launch would get,
@@ -94,7 +95,10 @@ read it before adding tests for a listed area.
   has PATH-injected fake `gh`, `ssh`, `curl`, `wget` and credential helper
   (`Probes`) that succeed only when a credential route reaches them, and
   runs the real `curl` and `wget`, where installed, against a loopback
-  server that records the header they send.
+  server that records the header they send (`--resolve` maps `github.com`
+  to it for a netrc entry). `tests/test_providers.py` has a fake
+  `opencode` that resolves its configuration, organizations cached in a
+  2.0.26-shaped database included, as 2.0.26 does.
 - Recovery tests reload state from disk after each step; a crash-recovery
   test performs the external side effect first and only then interrupts,
   because that is the window the controller must survive.

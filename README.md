@@ -137,8 +137,9 @@ Each line is a summary; the linked document is the precise statement.
   askpass and the SSH agent and keys are switched off where repository
   configuration cannot switch them back on, curl and wget read no
   configured header, the provider CLIs load no MCP server, plugin or hook,
-  and a launch is refused (by `doctor` too) while a repository setting or
-  `~/.netrc` would still hand one over. The agent reads the GitHub data its
+  and a launch is refused (by `doctor` too) while a repository setting,
+  `~/.netrc` or an organization connected to OpenCode would still hand one
+  over. The agent reads the GitHub data its
   phase needs from files the controller wrote, redacted and bounded. A
   deliberate same-user read of a credential file by absolute path is
   outside this guarantee.

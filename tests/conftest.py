@@ -1544,6 +1544,23 @@ def _no_operator_netrc(monkeypatch, tmp_path_factory):
     monkeypatch.setattr(child_env_module, "operator_home", lambda: str(home))
 
 
+@pytest.fixture(autouse=True)
+def _no_operator_opencode_data(monkeypatch, tmp_path_factory):
+    """An OpenCode launch's organization check (#165) reads an empty data
+    directory, not the developer's.
+
+    An organization connected to the developer's OpenCode refuses every
+    OpenCode launch, so a test run must not depend on it. A test of the
+    refusal points ``opencode_data_dir`` back at the real resolution (its
+    module imported it before this fixture ran) over a home of its own.
+    """
+    import autoforge.providers as providers_module
+
+    data_dir = tmp_path_factory.mktemp("operator-opencode-data")
+    monkeypatch.setattr(providers_module, "opencode_data_dir", lambda env: data_dir)
+    monkeypatch.delenv("OPENCODE_DB", raising=False)
+
+
 @pytest.fixture
 def offline_fetches() -> list[list[str]]:
     """The fetches of this test's engines that have no origin, in order."""
@@ -1758,6 +1775,9 @@ def pollute_operator_environment(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("CURL_HOME", str(curl_home))
     monkeypatch.setenv("WGETRC", str(tmp_path / "operator-wgetrc"))
     monkeypatch.setenv("WGET2RC", str(tmp_path / "operator-wgetrc"))
+    # A .netrc curl, requests and Go read in place of ~/.netrc.
+    (tmp_path / "operator-netrc").write_text(f"machine github.com login x password {token}\n")
+    monkeypatch.setenv("NETRC", str(tmp_path / "operator-netrc"))
 
 
 def assert_isolated_names(names) -> None:

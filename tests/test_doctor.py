@@ -155,6 +155,8 @@ def test_all_checks_pass(tmp_path):
         "agent 'claude' keeps integrations off (analyze_execute, fix)",
         "agent 'opencode' available (review_round_1, review_round_2_5, review_round_6_plus, "
         "replan_reexecute, update_epic)",
+        "agent 'opencode' loads no organization configuration (review_round_1, "
+        "review_round_2_5, review_round_6_plus, replan_reexecute, update_epic)",
         "cwd is a git repository",
         "GitHub remote",
         "default branch requires checks",
@@ -1273,17 +1275,56 @@ def test_doctor_refuses_a_credential_route_in_the_git_configuration(tmp_path, li
     assert "s3cr3t" not in row.detail and "store" not in row.detail.split("(")[0][-8:]
 
 
-def test_doctor_refuses_a_netrc_entry_for_github(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "entry",
+    [
+        f"machine github.com login x password {FAKE_TOKEN}\n",
+        # The syntax curl reads too (#165 R2-F1): quoted, upper-case.
+        f'machine "github.com" login x password {FAKE_TOKEN}\n',
+        f"MACHINE github.com LOGIN x PASSWORD {FAKE_TOKEN}\n",
+    ],
+)
+def test_doctor_refuses_a_netrc_entry_for_github(tmp_path, monkeypatch, entry):
     import autoforge.child_env as child_env_module
 
     home = tmp_path / "home"
     home.mkdir()
-    (home / ".netrc").write_text(f"machine github.com login x password {FAKE_TOKEN}\n")
+    (home / ".netrc").write_text(entry)
     monkeypatch.setattr(child_env_module, "operator_home", lambda: str(home))
     results = Doctor(cwd=str(tmp_path), runner=_runner_factory()).run_all()
     row = {r.name: r for r in results}["no credential reaches a launch"]
     assert not row.ok and "~/.netrc" in row.detail
     assert FAKE_TOKEN not in _all_text(results)
+
+
+def test_doctor_fails_an_opencode_connected_to_an_organization(tmp_path, monkeypatch):
+    """#165: the launch refuses an OpenCode that would load an organization's
+    configuration, and doctor says so exactly; the origin is never shown."""
+    import sqlite3
+    from contextlib import closing
+
+    import autoforge.providers as providers_module
+
+    origin = "https://org.example.invalid"
+    data_dir = tmp_path / "opencode-data"
+    data_dir.mkdir()
+    with closing(sqlite3.connect(data_dir / "opencode.db")) as db:
+        db.execute("CREATE TABLE kv (key text PRIMARY KEY, value text NOT NULL)")
+        db.execute("INSERT INTO kv VALUES ('wellknown:sources', ?)", (json.dumps([origin]),))
+        db.commit()
+    monkeypatch.setattr(providers_module, "opencode_data_dir", lambda env: data_dir)
+    results = Doctor(cwd=str(tmp_path), runner=_runner_factory()).run_all()
+    rows = {r.name: r for r in results}
+    row = rows[
+        "agent 'opencode' loads no organization configuration (review_round_1, "
+        "review_round_2_5, review_round_6_plus, replan_reexecute, update_epic)"
+    ]
+    assert not row.ok and row.detail.startswith("refusing to launch opencode")
+    assert f"1 organization(s) connected to OpenCode in {data_dir / 'opencode.db'}" in row.detail
+    assert origin not in _all_text(results)
+    (data_dir / "opencode.db").unlink()
+    rows = {r.name: r for r in Doctor(cwd=str(tmp_path), runner=_runner_factory()).run_all()}
+    assert rows[row.name].ok and str(data_dir) in rows[row.name].detail
 
 
 def test_doctor_reports_the_agent_environment_by_name_only(tmp_path, monkeypatch):

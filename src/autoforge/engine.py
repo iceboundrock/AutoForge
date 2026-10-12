@@ -7915,10 +7915,12 @@ class ControllerEngine:
                 else UpdateEpicRequest.FULL
             )
             # No GitHub or git credential may reach the agent (#165): the
-            # configuration its git would read and ~/.netrc are checked
+            # configuration its git would read and ~/.netrc are checked, and
+            # so is an integration its CLI would load that nothing keeps off,
             # before anything is charged or saved, so a refusal leaves state
             # as it was, and the identity its commits carry is read here.
             identity = preflight(cwd, self._runner)
+            provider.integration_preflight(env_allowlist)
             # What the agent reads from GitHub, read by the controller (it
             # holds no credential to read it itself) and written before the
             # prompt that names it is rendered; nothing is saved yet.

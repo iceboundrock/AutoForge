@@ -11657,6 +11657,32 @@ def test_a_credential_helper_in_the_repository_refuses_the_launch_and_leaves_sta
     assert not (eng.paths.state_dir / "read-context").exists()
 
 
+def test_an_integration_the_provider_cannot_keep_off_refuses_the_launch_and_leaves_state(
+    tmp_state_dir, fake_github, monkeypatch
+):
+    """The adapter's own refusal (OpenCode's connected organization, #165)
+    runs with the credential preflight, on the launch's allow-list, before
+    anything is charged, saved or launched."""
+    from autoforge.errors import ConfigurationError
+
+    eng = make_engine(tmp_state_dir, "never", github=fake_github, origin=True)
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    asked: list = []
+
+    def refuse(env_allowlist):
+        asked.append(env_allowlist)
+        raise ConfigurationError("refusing to launch opencode: an organization")
+
+    monkeypatch.setattr(eng.provider, "integration_preflight", refuse)
+    before = eng.paths.state_file.read_bytes()
+    with pytest.raises(ConfigurationError, match="refusing to launch opencode"):
+        eng.step()
+    assert asked == [eng.config.execution.environment_names()]
+    assert eng.provider.calls == []
+    assert eng.paths.state_file.read_bytes() == before
+    assert not (eng.paths.state_dir / "read-context").exists()
+
+
 @pytest.mark.parametrize("phase", ["ANALYZE_EXECUTE", "REVIEW"])
 def test_a_write_through_a_leaked_credential_is_unjournaled_and_blocks(tmp_state_dir, phase):
     """Nothing AutoForge controls hands the agent a credential (asserted while

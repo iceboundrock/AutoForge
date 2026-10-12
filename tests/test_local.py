@@ -778,6 +778,7 @@ def test_local_doctor_never_runs_gh(tmp_path):
         "agent 'claude' available (analyze_execute, fix)",
         "agent 'claude' keeps integrations off (analyze_execute, fix)",
         "agent 'opencode' available (review_round_1, review_round_2_5)",
+        "agent 'opencode' loads no organization configuration (review_round_1, review_round_2_5)",
     ], agent_checks
     assert [r for r in results if r.name == "feature specification"][0].ok
 
