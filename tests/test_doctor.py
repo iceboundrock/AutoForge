@@ -61,6 +61,13 @@ GH_VERSION_LINE = "gh version 2.48.0 (2024-04-09)"
 OPENCODE_VERSION_LINE = "opencode v2.0.23"
 # The OpenCode commands the configs below name.
 OPENCODE_COMMANDS = ("opencode", "epic-oc")
+# The row of the Claude isolation check for the default profiles (#165).
+CLAUDE_ISOLATION_ROW = "agent 'claude' keeps integrations off (analyze_execute, fix)"
+# The part of `claude --help` that check reads.
+CLAUDE_HELP = (
+    "  --safe-mode                           Start with all customizations ...\n"
+    "  --strict-mcp-config                   Only use MCP servers from --mcp-config\n"
+)
 
 
 def _runner_factory(
@@ -73,13 +80,15 @@ def _runner_factory(
     opencode_version=OPENCODE_VERSION_LINE,
     opencode_code=0,
     git_config="",
+    claude_help=CLAUDE_HELP,
 ):
     """Fake runner. ``github`` maps a `gh api` endpoint to its JSON payload, or to
     an ``(exit_code, stderr)`` pair for a failed read; ``--paginate --slurp``
     listings are wrapped in one page the way `gh` does. ``opencode_version``
     is what an OpenCode command's ``--version`` prints (``None``: the binary
     is missing), with exit status ``opencode_code``. ``git_config`` is what
-    the launch preflight's ``git config --list --show-scope -z`` prints."""
+    the launch preflight's ``git config --list --show-scope -z`` prints, and
+    ``claude_help`` what ``claude --help`` does."""
     responses = dict(HEALTHY_GITHUB)
     responses.update(github or {})
 
@@ -112,6 +121,8 @@ def _runner_factory(
             out = json.dumps([payload] if paginated else payload)
         elif argv == ["gh", "--version"]:
             out = gh_version + "\nhttps://github.com/cli/cli/releases/tag/v2.48.0"
+        elif argv == ["claude", "--help"]:
+            out = claude_help
         elif argv[0] in OPENCODE_COMMANDS and argv[1:] == ["--version"]:
             if opencode_version is None:
                 raise FileNotFoundError(2, "No such file or directory", argv[0])
@@ -141,6 +152,7 @@ def test_all_checks_pass(tmp_path):
         "gh available",
         "gh authenticated",
         "agent 'claude' available (analyze_execute, fix)",
+        "agent 'claude' keeps integrations off (analyze_execute, fix)",
         "agent 'opencode' available (review_round_1, review_round_2_5, review_round_6_plus, "
         "replan_reexecute, update_epic)",
         "cwd is a git repository",
@@ -153,6 +165,32 @@ def test_all_checks_pass(tmp_path):
     assert "owner/repo" in next(r.detail for r in results if r.name == "GitHub remote")
     assert (tmp_path / ".autoforge").is_dir()
     assert not any(p.name.startswith(".doctor-") for p in (tmp_path / ".autoforge").iterdir())
+
+
+@pytest.mark.parametrize(
+    ("help_text", "missing"),
+    [
+        ("  --strict-mcp-config  Only use MCP servers from --mcp-config\n", "--safe-mode"),
+        # A flag named only inside another's description is not offered.
+        ("  --bare  Minimal mode, unlike --safe-mode-ish\n  --strict-mcp-config\n", "--safe-mode"),
+        ("  --safe-mode  Start with all customizations disabled\n", "--strict-mcp-config"),
+    ],
+)
+def test_doctor_fails_a_claude_without_the_isolation_flags(tmp_path, help_text, missing):
+    """#165: every Claude launch passes --safe-mode and --strict-mcp-config;
+    a CLI without one would refuse every launch, so doctor says so first,
+    without quoting the help."""
+    d = Doctor(cwd=str(tmp_path), runner=_runner_factory(claude_help=help_text))
+    row = {r.name: r for r in d.run_all()}[CLAUDE_ISOLATION_ROW]
+    assert not row.ok and row.required
+    assert missing in row.detail and "update Claude Code" in row.detail
+    assert "Minimal mode" not in row.detail and "customizations" not in row.detail
+
+
+def test_doctor_fails_a_claude_whose_help_fails(tmp_path):
+    d = Doctor(cwd=str(tmp_path), runner=_runner_factory(fail=("claude --help",)))
+    row = {r.name: r for r in d.run_all()}[CLAUDE_ISOLATION_ROW]
+    assert not row.ok and "exited 1" in row.detail and "boom" not in row.detail
 
 
 def test_doctor_reports_the_limits_of_every_reachable_profile(tmp_path):
@@ -1259,7 +1297,10 @@ def test_doctor_reports_the_agent_environment_by_name_only(tmp_path, monkeypatch
     assert "withheld from this shell: " in env_row.detail
     withheld = env_row.detail.split("withheld from this shell: ")[1]
     assert "GH_TOKEN" in withheld and "SSH_AUTH_SOCK" in withheld
-    assert "set by the controller: GH_CONFIG_DIR, GH_ENTERPRISE_TOKEN, GH_TOKEN" in env_row.detail
+    assert (
+        "set by the controller: CURL_HOME, GH_CONFIG_DIR, GH_ENTERPRISE_TOKEN, GH_TOKEN"
+        in env_row.detail
+    )
     assert "allow-listed: PATH, HOME" in env_row.detail
     credentials = rows["no credential reaches a launch"]
     assert credentials.ok and "identity supplied: user.name, user.email" in credentials.detail

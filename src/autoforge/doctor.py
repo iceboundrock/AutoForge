@@ -11,7 +11,9 @@ A Pi profile adds a version floor and a read-only credential probe, run
 under the same environment allow-list as the agent launch (never the
 operator's whole environment) and reported without Pi's raw output, and a
 warning naming the instruction files Pi would load from outside the
-checkout (docs/pi-policy.md §4-5); those are found by path, never read.
+checkout (docs/pi-policy.md §4-5); those are found by path, never read. A
+Claude Code command must list the flags every launch keeps the operator's
+and the repository's integrations off with in its ``--help`` (#165).
 
 Both report the environment an agent and a repository-defined command are
 launched with, by name only (never a value), and run the launch's own
@@ -19,7 +21,9 @@ credential preflight (#165, :func:`autoforge.child_env.preflight`): one
 local ``git config`` read and ``~/.netrc``; a credential helper in the
 repository's configuration, a URL with an embedded credential, an HTTP
 header for git or a GitHub entry in ``~/.netrc`` fails ``doctor`` exactly
-as it would refuse the launch. The ``origin`` URL is shown redacted.
+as it would refuse the launch. ``~/.curlrc`` and wget's configuration need
+no check: a launch's curl and wget read the controller's empty files
+instead. The ``origin`` URL is shown redacted.
 
 ``autoforge local doctor`` runs the LOCAL subset: no `gh`, no `gh auth
 status`, no `origin` remote. A machine with no GitHub CLI and no GitHub
@@ -30,6 +34,7 @@ than reported as warnings.
 from __future__ import annotations
 
 import os
+import re
 import secrets
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -60,6 +65,7 @@ from .github import (
 from .local_workspace import DEFAULT_MAX_BYTES, DEFAULT_MAX_ENTRIES
 from .profiles import REQUIRED_PROFILES, local_required_profiles
 from .providers import (
+    CLAUDE_ISOLATION_FLAGS,
     OPENCODE_MIN_VERSION,
     PI_CONTEXT_FILES,
     PI_DEFAULT_AGENT_DIR,
@@ -296,8 +302,9 @@ class Doctor:
             name,
             True,
             "no credential helper, credential-bearing URL or HTTP header in the repository's "
-            "git configuration, and no GitHub entry in ~/.netrc; author identity supplied: "
-            f"{identity.describe()}",
+            "git configuration, and no GitHub entry in ~/.netrc; a launch's curl and wget "
+            "read an empty configuration of the controller's, never ~/.curlrc or ~/.wgetrc; "
+            f"author identity supplied: {identity.describe()}",
         )
 
     def check_required_checks(self, gh: str) -> CheckResult:
@@ -623,6 +630,8 @@ class Doctor:
                 results.append(self.check_opencode_version(label, command))
             else:
                 results.append(self._version_check(label, [command, "--version"]))
+                if provider == "claude":
+                    results.append(self.check_claude_isolation(command, profiles))
         pi_profiles = [p for (_, provider), ps in groups.items() if provider == "pi" for p in ps]
         if pi_profiles:
             results.append(self.check_pi_outside_instructions(pi_profiles))
@@ -724,6 +733,47 @@ class Doctor:
                 "AutoForge relies on, ADR 0003)",
             )
         return CheckResult(name, True, shown)
+
+    def check_claude_isolation(self, command: str, profiles: list[ProfileConfig]) -> CheckResult:
+        """`claude --help` lists every flag a launch keeps integrations off with (#165).
+
+        Every Claude Code launch passes :data:`CLAUDE_ISOLATION_FLAGS` so that
+        no hook, plugin or MCP server of the operator's or the repository's
+        configuration runs; a CLI without one would refuse every launch. The
+        help text is never quoted.
+        """
+        name = f"agent '{command}' keeps integrations off ({', '.join(p.name for p in profiles)})"
+        argv = [command, "--help"]
+        try:
+            res = self._runner(
+                ExecutionRequest(command=argv, cwd=self.cwd, timeout_seconds=self.timeout)
+            )
+        except Exception as exc:  # spawn failure / missing binary
+            return CheckResult(name, False, f"{type(exc).__name__}: {exc}")
+        if res.timed_out:
+            return CheckResult(name, False, "timed out")
+        if res.exit_code != 0:
+            return CheckResult(
+                name,
+                False,
+                f"`{' '.join(argv)}` exited {res.exit_code} (output not shown; run it yourself)",
+            )
+        listed = set(re.findall(r"(?<![\w-])--[a-z][a-z-]*", res.stdout or ""))
+        missing = [flag for flag in CLAUDE_ISOLATION_FLAGS if flag not in listed]
+        if missing:
+            return CheckResult(
+                name,
+                False,
+                f"`{' '.join(argv)}` does not list {', '.join(missing)}, which every launch "
+                "passes so that no hook, plugin or MCP server of the operator's or the "
+                "repository's configuration runs; update Claude Code",
+            )
+        return CheckResult(
+            name,
+            True,
+            f"launched with {' '.join(CLAUDE_ISOLATION_FLAGS)}: no hook, plugin or MCP server "
+            "of the operator's or the repository's configuration runs",
+        )
 
     def check_opencode_version(self, name: str, command: str) -> CheckResult:
         """`opencode` runs and is at least :data:`OPENCODE_MIN_VERSION` (#186).

@@ -5,6 +5,7 @@ import hashlib
 import json
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -12,6 +13,7 @@ from autoforge.config import ProfileConfig, default_config
 from autoforge.errors import ConfigurationError
 from autoforge.executor import MAX_DEADLINE_SECONDS, ExecutionResult
 from autoforge.providers import (
+    CLAUDE_INTEGRATION_FLAGS,
     AgentExecutionResult,
     AgentRequest,
     ClaudeCodeProvider,
@@ -19,6 +21,7 @@ from autoforge.providers import (
     PiProvider,
     ProviderRegistry,
     ScriptedProvider,
+    opencode_isolation_env,
     provider_for,
 )
 from tests.conftest import DECODER_LIMIT_RECORDS
@@ -40,8 +43,9 @@ def test_claude_argv_shape():
     assert argv[argv.index("--effort") + 1] == "high"
     assert argv[argv.index("--permission-mode") + 1] == "bypassPermissions"
     assert "--no-session-persistence" in argv
-    # No MCP server of any configuration is started (#165).
-    assert "--strict-mcp-config" in argv and "--mcp-config" not in argv
+    # No hook, plugin or MCP server of any configuration runs (#165).
+    assert "--safe-mode" in argv and "--strict-mcp-config" in argv
+    assert "--mcp-config" not in argv
     assert argv[-2:] == ["--", "do it; rm -rf /"]  # prompt is one literal element
 
 
@@ -51,8 +55,46 @@ def test_claude_text_opt_out_argv_has_no_verbose():
     argv = ClaudeCodeProvider().build_command_for(p, "do it")
     assert argv[2:4] == ["--output-format", "text"]
     assert "--verbose" not in argv
-    assert "--strict-mcp-config" in argv and "--mcp-config" not in argv
+    assert "--safe-mode" in argv and "--strict-mcp-config" in argv
+    assert "--mcp-config" not in argv
     assert argv[-2:] == ["--", "do it"]
+
+
+def test_claude_keeps_integrations_off_before_any_extra_args():
+    p = dataclasses.replace(default_config().profile("fix"), extra_args=["--add-dir", "/elsewhere"])
+    ClaudeCodeProvider().validate_profile(p)
+    argv = ClaudeCodeProvider().build_command_for(p, "x")
+    assert argv.index("--safe-mode") < argv.index("--add-dir")
+    assert argv.index("--strict-mcp-config") < argv.index("--add-dir")
+
+
+@pytest.mark.parametrize("flag", CLAUDE_INTEGRATION_FLAGS)
+@pytest.mark.parametrize("form", ["separate", "joined"])
+def test_claude_refuses_extra_args_that_load_an_integration(flag, form):
+    """#165: an MCP server, a plugin, settings (hooks), an agent definition,
+    a browser or an IDE connection may hold a GitHub token of its own; the
+    error names the flag and never its value."""
+    secret = "apikey-" + "S" * 20
+    args = [flag, f'{{"apiKeyHelper": "{secret}"}}'] if form == "separate" else [f"{flag}={secret}"]
+    p = dataclasses.replace(default_config().profile("fix"), extra_args=["--add-dir", "/x", *args])
+    with pytest.raises(ConfigurationError, match=f"'fix'.*{flag}.*--safe-mode") as err:
+        ClaudeCodeProvider().validate_profile(p)
+    assert secret not in str(err.value)
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        ["--add-dir", "/x"],
+        ["--setting-sources", "user"],
+        ["--no-chrome"],
+        ["--fallback-model", "sonnet"],
+        ["--append-system-prompt", "be brief"],
+    ],
+)
+def test_claude_accepts_extra_args_that_load_no_integration(extra_args):
+    p = dataclasses.replace(default_config().profile("fix"), extra_args=extra_args)
+    ClaudeCodeProvider().validate_profile(p)
 
 
 def test_claude_rejects_an_unknown_output_format():
@@ -1328,7 +1370,177 @@ def test_the_controller_set_environment_reaches_a_one_shot_launch(cls, profile):
     req = AgentRequest("FIX", "p", "/tmp", profile, None, 7, env_allowlist=("PATH",), env=env)
     cls(runner=_capture_runner(seen)).execute(req)
     [launch] = seen
-    assert launch.env == env and launch.env_allowlist[0] == "PATH"
+    assert launch.env_allowlist[0] == "PATH"
+    # The controller's variables, and the adapter's own on top (#165).
+    assert {k: launch.env[k] for k in env} == env
+    assert sorted(set(launch.env) - set(env)) == sorted(cls.isolation_names)
+
+
+def test_only_opencode_sets_variables_of_its_own():
+    """Claude keeps its integrations off with flags, Pi with #132's flags;
+    OpenCode has none, so it sets :func:`opencode_isolation_env` (#165)."""
+    assert ClaudeCodeProvider.isolation_names == PiProvider.isolation_names == ()
+    assert OpenCodeProvider.isolation_names == tuple(sorted(opencode_isolation_env("")))
+    assert set(OpenCodeProvider.isolation_names) == {
+        "OPENCODE_CONFIG_DIR",
+        "OPENCODE_CONFIG_PROJECT_DISABLE",
+        "OPENCODE_DISABLE_PROJECT_CONFIG",
+        "OPENCODE_CONFIG",
+        "OPENCODE_CONFIG_CONTENT",
+    }
+
+
+# A fake `opencode` that resolves its configuration the way 2.0.26 does (read
+# from the build; providers.py, `opencode_isolation_env`), reports which MCP
+# servers and plugin directories it would load and what its global
+# configuration directory held, and answers.
+_CONFIG_RESOLVING_OPENCODE = r"""
+import json, os, sys
+from pathlib import Path
+
+sys.stdin.read()
+env = os.environ
+config_dir = Path(env.get("OPENCODE_CONFIG_DIR") or Path(
+    env.get("XDG_CONFIG_HOME") or Path(env["HOME"], ".config"), "opencode"))
+documents, directories = [], []
+
+
+def document(path):
+    if path.is_file():
+        documents.append(json.loads(path.read_text()))
+
+
+for name in ("opencode.json", "opencode.jsonc"):
+    document(config_dir / name)
+directories.append(config_dir)
+if env.get("OPENCODE_CONFIG"):
+    document(Path(env["OPENCODE_CONFIG"]))
+disabled = env.get("OPENCODE_CONFIG_PROJECT_DISABLE", env.get("OPENCODE_DISABLE_PROJECT_CONFIG"))
+if disabled not in ("1", "true"):
+    here = Path.cwd()
+    for directory in [here, *here.parents]:
+        for name in ("opencode.jsonc", "opencode.json"):
+            document(directory / name)
+        directories.append(directory / ".opencode")
+if env.get("OPENCODE_CONFIG_CONTENT"):
+    documents.append(json.loads(env["OPENCODE_CONFIG_CONTENT"]))
+servers = sorted({n for d in documents for n in d.get("mcp", {}).get("servers", {})})
+plugins = sorted(
+    str(p) for d in directories for sub in ("plugin", "plugins") for p in (d / sub).glob("*")
+)
+report = {
+    "mcp": servers,
+    "plugins": plugins,
+    "config_dir_was_empty": config_dir.is_dir() and not any(config_dir.iterdir()),
+    "config_dir": str(config_dir),
+}
+Path(sys.argv[sys.argv.index("--report") + 1]).write_text(json.dumps(report))
+print("done")
+"""
+
+
+def _opencode_world(tmp_path, monkeypatch):
+    """An operator's and a repository's OpenCode configuration, each naming
+    an MCP server and a plugin, and the operator's shell pointing at more."""
+    home = tmp_path / "home"
+    global_dir = home / ".config" / "opencode"
+    (global_dir / "plugin").mkdir(parents=True)
+    servers = {"servers": {"global-gh": {"type": "local", "command": ["gh-mcp"]}}}
+    (global_dir / "opencode.json").write_text(json.dumps({"mcp": servers}))
+    (global_dir / "plugin" / "g.js").write_text("export const G = async () => ({})\n")
+    checkout = tmp_path / "checkout"
+    worktree = checkout / ".git" / "autoforge" / "worktrees" / "7"
+    (worktree / ".opencode" / "plugin").mkdir(parents=True)
+    (worktree / ".opencode" / "plugin" / "p.js").write_text("export const P = async () => ({})\n")
+    project = {"servers": {"project-gh": {"type": "local", "command": ["x"]}}}
+    (worktree / "opencode.json").write_text(json.dumps({"mcp": project}))
+    # Above the worktree: the operator's checkout, where the search would
+    # otherwise reach.
+    above = {"servers": {"checkout-gh": {"type": "local", "command": ["x"]}}}
+    (checkout / "opencode.json").write_text(json.dumps({"mcp": above}))
+    explicit = tmp_path / "explicit.json"
+    explicit.write_text(json.dumps({"mcp": {"servers": {"explicit-gh": {}}}}))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.setenv("OPENCODE_CONFIG", str(explicit))
+    monkeypatch.setenv(
+        "OPENCODE_CONFIG_CONTENT", json.dumps({"mcp": {"servers": {"content-gh": {}}}})
+    )
+    monkeypatch.setenv("OPENCODE_CONFIG_PROJECT_DISABLE", "0")
+    fake = tmp_path / "bin" / "opencode"
+    fake.parent.mkdir()
+    fake.write_text(f"#!{sys.executable}\n{_CONFIG_RESOLVING_OPENCODE}")
+    fake.chmod(0o755)
+    return fake, worktree
+
+
+def test_an_opencode_launch_loads_no_mcp_server_or_plugin_of_any_configuration(
+    tmp_path, monkeypatch
+):
+    """#165: the operator's global configuration and plugin directory, the
+    repository's, one above the worktree, and the operator's
+    ``OPENCODE_CONFIG`` / ``OPENCODE_CONFIG_CONTENT`` all name an MCP server
+    or a plugin; the launch, through the real executor, loads none, and the
+    configuration directory it got is empty and gone afterwards."""
+    from autoforge.executor import ExecutionRequest, execute
+
+    fake, worktree = _opencode_world(tmp_path, monkeypatch)
+    report = tmp_path / "report.json"
+    # What the CLI would load without the adapter's variables.
+    execute(
+        ExecutionRequest(
+            command=[str(fake), "--report", str(report)],
+            cwd=str(worktree),
+            timeout_seconds=60,
+            stdin_data=b"p",
+        )
+    )
+    loaded = json.loads(report.read_text())
+    assert loaded["mcp"] == [
+        "checkout-gh",
+        "content-gh",
+        "explicit-gh",
+        "global-gh",
+        "project-gh",
+    ]
+    assert len(loaded["plugins"]) == 2
+
+    profile = ProfileConfig(
+        name="review_round_1",
+        provider="opencode",
+        model="openai/x",
+        command=str(fake),
+        extra_args=["--report", str(report)],
+    )
+    req = AgentRequest(
+        "REVIEW",
+        "p",
+        str(worktree),
+        profile,
+        None,
+        60,
+        env_allowlist=("PATH", "HOME", "XDG_CONFIG_HOME"),
+    )
+    assert OpenCodeProvider().execute(req).exit_code == 0
+    isolated = json.loads(report.read_text())
+    assert isolated["mcp"] == [] and isolated["plugins"] == []
+    assert isolated["config_dir_was_empty"]
+    assert not Path(isolated["config_dir"]).exists()
+
+
+def test_an_opencode_configuration_directory_that_cannot_be_made_launches_nothing(monkeypatch):
+    import autoforge.providers as providers_module
+    from autoforge.errors import ExecutionError
+
+    def refuse(**_kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(providers_module.tempfile, "mkdtemp", refuse)
+    seen: list = []
+    req = AgentRequest("REVIEW", "p", "/tmp", default_config().profile("review_round_1"), None, 7)
+    with pytest.raises(ExecutionError, match="opencode configuration"):
+        OpenCodeProvider(runner=_capture_runner(seen)).execute(req)
+    assert seen == []
 
 
 def test_the_controller_set_environment_reaches_pis_auth_preflight(tmp_path):

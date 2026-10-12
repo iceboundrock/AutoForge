@@ -1284,7 +1284,9 @@ class ControllerEngine:
             "plus the provider's own; nothing else is inherited, and no GitHub or git "
             f"credential route: the controller sets {describe_overrides()} for every launch "
             "(an empty gh configuration, credential helpers and askpass disabled, an ssh "
-            "without keys or agent, the operator's author identity)",
+            "without keys or agent, empty curl and wget configuration files, the "
+            "operator's author identity), and the provider keeps its CLI's integrations "
+            "(MCP servers, plugins, hooks) off",
             "before every launch the git configuration it would read and ~/.netrc are checked "
             "for a credential (a repository or worktree credential helper, a URL with a "
             "credential, an HTTP header); one refuses the launch",
@@ -7992,7 +7994,8 @@ class ControllerEngine:
                 metadata={
                     **self._log_metadata(phase),
                     "env_allowlist": list(provider.environment_allowlist(req) or ()),
-                    "env_set": list(override_names()),
+                    # The controller's names, then the adapter's own (#165).
+                    "env_set": [*override_names(), *provider.isolation_names],
                 },
             )
             result: AgentExecutionResult | None = None

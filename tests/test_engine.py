@@ -11706,6 +11706,7 @@ def test_verification_commands_get_the_launch_isolation(
     [seen] = env_probe_records(record)
     assert_isolated_names(seen["names"])
     assert seen["gh_token_placeholder"] and seen["gh_config_dir_empty"]
+    assert seen["http_client_config_empty"]
     assert seen["git_terminal_prompt"] == "0"
 
 

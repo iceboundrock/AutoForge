@@ -193,11 +193,15 @@ three kinds of launch: the names no allow-list may carry (refused at
 config load and in an adapter's `environment_names`), the per-launch
 variables that leave a child no GitHub or git credential (an empty `gh`
 configuration, a placeholder token, an identity-only global git
-configuration, git command-scope resets), and the preflight that refuses a
-launch a repository setting would still hand a credential. Provider
-adapters pass `AgentRequest.env` through to the executor (Pi's auth
-preflight included) and keep only their own integration flags, such as
-Claude Code's `--strict-mcp-config`; `doctor` calls the same module.
+configuration, git command-scope resets, empty curl and wget
+configuration), and the preflight that refuses a launch a repository
+setting would still hand a credential. Provider adapters pass
+`AgentRequest.env` through to the executor (Pi's auth preflight included)
+and keep only what keeps their own CLI's integrations off: flags (Claude
+Code's `--safe-mode` and `--strict-mcp-config`, Pi's #132 policy) or, for a
+CLI without one, the variables of `AgentProvider.integration_isolation`
+set over the controller's (OpenCode's empty configuration directory);
+`doctor` calls the same module.
 The engine also owns *where* an agent runs: in REMOTE mode a per-issue
 `git worktree` it creates under `<git common dir>/autoforge/worktrees/<n>`
 (or `execution.worktree_dir`) at the first launch and never deletes, and it

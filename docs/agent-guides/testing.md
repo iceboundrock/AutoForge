@@ -209,11 +209,13 @@ a stated reason it has none. The coverage that must keep working:
 - with an operator environment that holds every route (tokens, `gh`
   configuration, a session bus, an SSH agent, askpass, git configuration
   from the environment, a global helper), a child gets none of them and
-  every controller-set variable; PATH-injected fake `gh`, `ssh`, `curl` and
-  a credential helper show that an agent finds no route the controller's
-  own process finds, through a repository- or worktree-scope helper and
-  askpass too, and that the controller's `GitHubClient` keeps its
-  credential (`test_child_env.py`)
+  every controller-set variable; PATH-injected fake `gh`, `ssh`, `curl`,
+  `wget` and a credential helper show that an agent finds no route the
+  controller's own process finds, through a repository- or worktree-scope
+  helper and askpass too, and that the controller's `GitHubClient` keeps
+  its credential; the real `curl` and `wget`, where installed, send the
+  header of the operator's configuration file to a loopback server for the
+  controller and none from a launch (`test_child_env.py`)
 - the preflight refuses a repository or worktree helper (also through an
   include), a credential in a remote URL or an `insteadOf` base, an
   `http.extraHeader`, a GitHub or `default` netrc entry, and git
@@ -233,7 +235,13 @@ a stated reason it has none. The coverage that must keep working:
   the configuration routes and a netrc entry, lists the launch environment
   by name only, gives Pi's probes the same overrides, and `local doctor`
   keeps the environment rows with zero `gh` calls (`test_doctor.py`)
-- Claude Code launches with `--strict-mcp-config`; every adapter passes
+- Claude Code launches with `--safe-mode` and `--strict-mcp-config`, and
+  a profile whose `extra_args` would load an integration is refused
+  without its value (`test_providers.py`, `test_config.py`); `doctor`
+  fails a `claude` whose `--help` lacks either flag (`test_doctor.py`); an
+  OpenCode launch, through the real executor, reads no MCP server or
+  plugin of any configuration a fake `opencode` that resolves its
+  configuration as 2.0.26 does would load; every adapter passes
   `AgentRequest.env` to the executor (`test_providers.py`)
 - the read context: redacted, bounded with explicit omission markers,
   project text fenced so it cannot close its fence; an unreadable item is a

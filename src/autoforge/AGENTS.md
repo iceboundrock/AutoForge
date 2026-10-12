@@ -40,8 +40,9 @@ github.py           GitHubClient over `gh`, the only holder of a GitHub credenti
                     controller-owned merge
 child_env.py        what every agent and repository-command launch gets instead of a
                     credential: forbidden env names, per-launch overrides (empty gh
-                    config, identity-only git config, command-scope resets), the
-                    preflight; provider-neutral, no flags (#165)
+                    config, identity-only git config, command-scope resets, empty
+                    curl and wget config), the preflight; provider-neutral, no
+                    flags (#165)
 read_context.py     an agent's GitHub read context: rendering, redaction and bounds,
                     no I/O; the engine collects and writes it (ADR 0004 D10, #165)
 effects.py          ADR 0004 effect records: kinds, stages, attempt bound, drive/reconcile,

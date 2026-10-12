@@ -776,6 +776,7 @@ def test_local_doctor_never_runs_gh(tmp_path):
     agent_checks = sorted(n for n in names if n.startswith("agent "))
     assert agent_checks == [
         "agent 'claude' available (analyze_execute, fix)",
+        "agent 'claude' keeps integrations off (analyze_execute, fix)",
         "agent 'opencode' available (review_round_1, review_round_2_5)",
     ], agent_checks
     assert [r for r in results if r.name == "feature specification"][0].ok
@@ -3486,6 +3487,7 @@ def test_local_launches_get_the_same_isolation_and_no_read_context(
     for entry in seen:
         assert_isolated_names(entry["names"])
         assert entry["gh_token_placeholder"] and entry["gh_config_dir_empty"]
+        assert entry["http_client_config_empty"]
     assert not (eng.paths.state_dir / "read-context").exists()
 
 

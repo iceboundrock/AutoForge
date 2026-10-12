@@ -65,11 +65,13 @@ runtime state belonging to one operator.
   allow-listed environment (`execution.env_allowlist`), not the operator's
   whole shell, that carries no GitHub or git credential (no credential
   variable can be listed; the controller sets an empty `gh` configuration,
-  disables git credential helpers, askpass and the SSH agent, and refuses a
-  launch a repository setting would still hand one;
-  `src/autoforge/child_env.py`); and the controller reads HEAD and branch of
-  its own checkout before and after each invocation and enters `BLOCKED` if
-  they moved. A dry run creates no worktree.
+  disables git credential helpers, askpass and the SSH agent, gives curl and
+  wget an empty configuration, keeps the agent CLI's MCP servers, plugins
+  and hooks off, and refuses a launch a repository setting would still hand
+  one; `src/autoforge/child_env.py`, `src/autoforge/providers.py`); and the
+  controller reads HEAD and branch of its own checkout before and after each
+  invocation and enters `BLOCKED` if they moved. A dry run creates no
+  worktree.
 - AutoForge creates that worktree once and never deletes, moves or prunes
   it, and it creates, cleans up or deletes no local branch and no other
   worktree. Leaving local work untouched is safer than inferring ownership

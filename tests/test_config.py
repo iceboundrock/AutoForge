@@ -1065,6 +1065,16 @@ def test_claude_text_mode_without_a_ceiling_is_refused():
         validate_required_profiles(cfg, ["fix"])
 
 
+def test_a_claude_profile_whose_extra_args_load_an_integration_is_refused():
+    """#165: an MCP server, a plugin or a settings file may hold a GitHub
+    token of its own; Claude launches with --safe-mode and the profile
+    cannot bring one back."""
+    cfg = default_config()
+    cfg.profile("fix").extra_args = ["--mcp-config", "servers.json"]
+    with pytest.raises(ConfigurationError, match="'fix'.*--mcp-config.*--safe-mode"):
+        validate_required_profiles(cfg, ["fix"])
+
+
 @pytest.mark.parametrize("on_profile", [True, False])
 def test_claude_text_mode_runs_under_its_ceiling_alone(on_profile):
     cfg = default_config()
@@ -1123,6 +1133,8 @@ FORBIDDEN_ENTRIES = [
     ("SSH_*", "SSH_ASKPASS"),
     ("XDG_*", "XDG_RUNTIME_DIR"),
     ("DBUS_*", "DBUS_SESSION_BUS_ADDRESS"),
+    ("CURL_*", "CURL_HOME"),
+    ("WGET*", "WGETRC"),
     ("G*", "GH_TOKEN"),
 ]
 
@@ -1152,7 +1164,15 @@ def test_a_bare_star_is_refused_as_not_a_name(tmp_path, key):
 
 
 @pytest.mark.parametrize(
-    "entry", ["GIT_AUTHOR_NAME", "GIT_AUTHOR_*", "GITLAB_HOST", "SSH_CONNECTION", "XDG_DATA_HOME"]
+    "entry",
+    [
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_*",
+        "GITLAB_HOST",
+        "SSH_CONNECTION",
+        "XDG_DATA_HOME",
+        "CURL_CA_BUNDLE",
+    ],
 )
 def test_a_name_that_carries_no_credential_route_is_accepted(tmp_path, entry):
     cfg = _execution_cfg(tmp_path, {"env_allowlist_extra": [entry]})

@@ -1,18 +1,23 @@
 """The environment of every process AutoForge launches outside itself (#165).
 
-Real git and the real executor throughout; ``gh``, ``ssh``, ``curl`` and a
-git credential helper are PATH-injected fakes that succeed only when they
-find a credential route, so each test shows the route closed for a child
-and open for the controller's own calls. No network, and no real
-credential: every "token" here is a fixed fake.
+Real git and the real executor throughout; ``gh``, ``ssh``, ``curl``,
+``wget`` and a git credential helper are PATH-injected fakes that succeed
+only when they find a credential route, so each test shows the route closed
+for a child and open for the controller's own calls. The real ``curl`` and
+``wget``, where installed, are run against a server on the loopback
+interface. No other network, and no real credential: every "token" here is
+a fixed fake.
 """
 
 from __future__ import annotations
 
+import http.server
 import json
 import os
+import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -21,6 +26,7 @@ from autoforge import child_env
 from autoforge.child_env import (
     FORBIDDEN_ENV_NAMES,
     GH_PLACEHOLDER_TOKEN,
+    HTTP_CLIENT_CONFIG,
     SSH_COMMAND,
     GitConfigEntry,
     LaunchIdentity,
@@ -129,11 +135,15 @@ def polluted_operator(tmp_path, monkeypatch):
     monkeypatch.setenv("GIT_CONFIG_PARAMETERS", "'credential.helper'='probe'")
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))
     monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", f"unix:path={tmp_path / 'bus'}")
-    # A home of the test's own, so nothing reads the developer's dotfiles.
+    # A home of the test's own, so nothing reads the developer's dotfiles;
+    # its curl and wget configuration add the token to every request.
     home = tmp_path / "home"
     home.mkdir()
+    (home / ".curlrc").write_text(f'header = "Authorization: Bearer {FAKE_TOKEN}"\n')
+    (home / ".wgetrc").write_text(f"header = Authorization: Bearer {FAKE_TOKEN}\n")
     monkeypatch.setenv("HOME", str(home))
-    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    for name in ("XDG_CONFIG_HOME", "CURL_HOME", "WGETRC", "WGET2RC"):
+        monkeypatch.delenv(name, raising=False)
     return global_config
 
 
@@ -161,6 +171,10 @@ def test_the_child_environment_carries_no_operator_credential_route(polluted_ope
         assert gh_dir.is_dir() and list(gh_dir.iterdir()) == []
         assert env["GIT_CONFIG_GLOBAL"] != str(polluted_operator)
         assert env["GIT_TERMINAL_PROMPT"] == "0"
+        # curl and wget find a file of the controller's that sets nothing.
+        assert (Path(env["CURL_HOME"]) / ".curlrc").read_text() == HTTP_CLIENT_CONFIG
+        assert env["WGETRC"] == env["WGET2RC"]
+        assert Path(env["WGETRC"]).read_text() == HTTP_CLIENT_CONFIG
         root = gh_dir.parent
     # The launch's directory does not outlive it.
     assert not root.exists()
@@ -210,8 +224,9 @@ def test_without_an_operator_identity_none_is_supplied(tmp_path, monkeypatch):
 
 
 def test_the_overrides_are_names_known_in_advance():
-    env = child_overrides("/gh", "/gitconfig")
+    env = child_overrides("/gh", "/gitconfig", "/curl", "/wgetrc")
     assert tuple(sorted(env)) == override_names()
+    assert env["CURL_HOME"] == "/curl" and env["WGETRC"] == env["WGET2RC"] == "/wgetrc"
     assert env["GIT_CONFIG_COUNT"] == "4"
     pairs = {env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"] for i in range(4)}
     assert pairs == {
@@ -242,6 +257,7 @@ TOOL = {tool!r}
 LOG = {log!r}
 KEYCHAIN = {keychain!r}
 DEFAULT_KEY = {default_key!r}
+PASSWD_HOME = {passwd_home!r}
 PLACEHOLDER = {placeholder!r}
 args = sys.argv[1:]
 env = os.environ
@@ -280,12 +296,45 @@ def ssh():
     return agent or key
 
 
+def header(path):
+    return "Authorization" in Path(path).read_text()
+
+
 def curl():
     if token("GH_TOKEN", "GITHUB_TOKEN"):
         return True
+    # curl reads the first default configuration file that exists, in this
+    # order (the last is the password database's home, not HOME), unless
+    # -q comes first.
+    if args[:1] not in (["-q"], ["--disable"]):
+        candidates = [
+            env.get("CURL_HOME") and os.path.join(env["CURL_HOME"], ".curlrc"),
+            env.get("XDG_CONFIG_HOME") and os.path.join(env["XDG_CONFIG_HOME"], "curlrc"),
+            env.get("HOME") and os.path.join(env["HOME"], ".curlrc"),
+            os.path.join(PASSWD_HOME, ".curlrc"),
+        ]
+        found = next((c for c in candidates if c and os.path.exists(c)), None)
+        if found and header(found):
+            return True
     if "-n" in args or "--netrc" in args:
         netrc = Path(env.get("HOME", "/"), ".netrc")
         return netrc.exists() and "github.com" in netrc.read_text()
+    return False
+
+
+def wget():
+    # wget 1.x reads the file WGETRC names, else ~/.wgetrc; wget2 the file
+    # WGET2RC names, else its XDG location. Either fake reads one file.
+    for variable, default in (
+        ("WGETRC", os.path.join(env.get("HOME", "/"), ".wgetrc")),
+        ("WGET2RC", os.path.join(
+            env.get("XDG_CONFIG_HOME") or os.path.join(env.get("HOME", "/"), ".config"),
+            "wget", "wget2rc",
+        )),
+    ):
+        path = env.get(variable) or default
+        if os.path.exists(path) and header(path):
+            return True
     return False
 
 
@@ -298,7 +347,7 @@ def helper():
     return True
 
 
-ok = {{"gh": gh, "ssh": ssh, "curl": curl, "git-credential-probe": helper}}[TOOL]()
+ok = {{"gh": gh, "ssh": ssh, "curl": curl, "wget": wget, "git-credential-probe": helper}}[TOOL]()
 with open(LOG, "a", encoding="utf-8") as f:
     f.write(json.dumps({{"tool": TOOL, "argv": args, "ok": ok,
                         "env": sorted(n for n in env if not n.startswith("LC_"))}}) + "\n")
@@ -318,7 +367,7 @@ class Probes:
         self.default_key.parent.mkdir(parents=True)
         self.default_key.write_text("fake key\n")
         self.keychain.write_text("fake keychain\n")
-        for tool in ("gh", "ssh", "curl", "git-credential-probe"):
+        for tool in ("gh", "ssh", "curl", "wget", "git-credential-probe"):
             script = self.bin / tool
             script.write_text(
                 f"#!{sys.executable}\n"
@@ -327,6 +376,7 @@ class Probes:
                     log=str(self.log),
                     keychain=str(self.keychain),
                     default_key=str(self.default_key),
+                    passwd_home=str(self.default_key.parent.parent),
                     placeholder=GH_PLACEHOLDER_TOKEN,
                     password=FAKE_PASSWORD,
                 )
@@ -363,7 +413,8 @@ def _run(command, cwd, env_allowlist=None, env=None, stdin=None) -> ExecutionRes
 
 
 def _routes(cwd: Path, *, env_allowlist=None, env=None) -> dict[str, bool]:
-    """Try each route: gh, a git credential, git over SSH, curl.
+    """Try each route: gh, a git credential, git over SSH, curl with the
+    netrc, and a plain curl and wget (their configuration files).
 
     git over SSH fails either way (the fake ssh speaks no protocol), so
     whether ssh found a credential is read from the probe log instead.
@@ -372,10 +423,14 @@ def _routes(cwd: Path, *, env_allowlist=None, env=None) -> dict[str, bool]:
     fill = _run(["git", "credential", "fill"], cwd, env_allowlist, env, stdin=_CREDENTIAL_QUERY)
     _run(["git", "ls-remote", "ssh://git@github.invalid/owner/repo.git"], cwd, env_allowlist, env)
     curl = _run(["curl", "-n", "https://api.github.com/user"], cwd, env_allowlist, env)
+    plain_curl = _run(["curl", "https://api.github.com/user"], cwd, env_allowlist, env)
+    plain_wget = _run(["wget", "https://api.github.com/user"], cwd, env_allowlist, env)
     return {
         "gh": gh.exit_code == 0,
         "git-credential": fill.exit_code == 0 and FAKE_PASSWORD in fill.stdout,
         "curl": curl.exit_code == 0,
+        "curl-default": plain_curl.exit_code == 0,
+        "wget-default": plain_wget.exit_code == 0,
     }
 
 
@@ -392,7 +447,7 @@ def test_an_agent_finds_no_credential_route_the_controller_finds_every_one(probe
     _git(repo, "config", "--local", "core.sshCommand", "ssh -i /operator/key")
 
     # The controller's own calls run in its whole environment.
-    assert _routes(repo) == {"gh": True, "git-credential": True, "curl": True}
+    assert all(_routes(repo).values())
     assert _ssh_ok(probes) == [True]
 
     helper_calls = [e for e in probes.entries() if e["tool"] == "git-credential-probe"]
@@ -401,7 +456,13 @@ def test_an_agent_finds_no_credential_route_the_controller_finds_every_one(probe
     identity = child_env.operator_identity(read_git_config(str(repo)))
     with isolated_overrides(identity) as overrides:
         agent = _routes(repo, env_allowlist=DEFAULT_ENV_ALLOWLIST, env=overrides)
-    assert agent == {"gh": False, "git-credential": False, "curl": False}
+    assert agent == {
+        "gh": False,
+        "git-credential": False,
+        "curl": False,
+        "curl-default": False,
+        "wget-default": False,
+    }
     assert _ssh_ok(probes) == [True, False]
     ssh_call = [e for e in probes.entries() if e["tool"] == "ssh"][-1]
     for option in ("IdentityFile=none", "IdentityAgent=none", "BatchMode=yes"):
@@ -466,6 +527,8 @@ def test_an_agent_adapter_launch_finds_no_credential_route(probes, tmp_path):
         "  'gh': run(['gh', 'api', 'user']).returncode == 0,\n"
         f"  'git-credential': {FAKE_PASSWORD!r} in fill.stdout,\n"
         "  'curl': run(['curl', '-n', 'https://api.github.com/user']).returncode == 0,\n"
+        "  'curl-default': run(['curl', 'https://api.github.com/user']).returncode == 0,\n"
+        "  'wget-default': run(['wget', 'https://api.github.com/user']).returncode == 0,\n"
         "}\n"
         f"open({str(report)!r}, 'w').write(json.dumps(out))\n"
         "print('done')\n"
@@ -487,7 +550,105 @@ def test_an_agent_adapter_launch_finds_no_credential_route(probes, tmp_path):
             env=overrides,
         )
         assert OpenCodeProvider().execute(req).exit_code == 0
-    assert json.loads(report.read_text()) == {"gh": False, "git-credential": False, "curl": False}
+    assert json.loads(report.read_text()) == {
+        "gh": False,
+        "git-credential": False,
+        "curl": False,
+        "curl-default": False,
+        "wget-default": False,
+    }
+
+
+# -- the real curl and wget, against the loopback interface ----------------------
+
+
+class _HeaderRecorder(http.server.BaseHTTPRequestHandler):
+    """Answers every GET and records the ``Authorization`` header it carried."""
+
+    def do_GET(self) -> None:  # noqa: N802 - the stdlib's name
+        self.server.seen.append(self.headers.get("Authorization"))  # type: ignore[attr-defined]
+        body = b"ok\n"
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args) -> None:
+        pass
+
+
+@pytest.fixture
+def loopback():
+    server = http.server.HTTPServer(("127.0.0.1", 0), _HeaderRecorder)
+    server.seen = []  # type: ignore[attr-defined]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield server
+    server.shutdown()
+    server.server_close()
+
+
+def _seen_header(server, command, tmp_path, *, isolated: bool) -> str | None:
+    """Run ``command`` (``{url}`` is the server's) as the controller would
+    (its whole environment) or as a launch would; the header the server got."""
+    url = f"http://127.0.0.1:{server.server_address[1]}/"
+    argv = [arg.replace("{url}", url) for arg in command]
+    if isolated:
+        with isolated_overrides(LaunchIdentity()) as overrides:
+            result = _run(argv, tmp_path, DEFAULT_ENV_ALLOWLIST, overrides)
+    else:
+        result = _run(argv, tmp_path)
+    assert result.exit_code == 0, result.stderr
+    return server.seen.pop()
+
+
+_REAL_CURL = ["curl", "-s", "--noproxy", "*", "--max-time", "30", "{url}"]
+_REAL_WGET = ["wget", "-q", "-O", "-", "--no-proxy", "--timeout=30", "--tries=1", "{url}"]
+
+
+@pytest.mark.skipif(shutil.which("curl") is None, reason="curl is not installed")
+@pytest.mark.parametrize("where", ["home", "xdg", "curl_home"])
+def test_a_launchs_plain_curl_sends_no_header_of_the_operators_configuration(
+    where, tmp_path, monkeypatch, loopback
+):
+    """A default request of the real curl: the operator's ``~/.curlrc``,
+    ``$XDG_CONFIG_HOME/curlrc`` or ``$CURL_HOME/.curlrc`` adds the header for
+    the controller, and none reaches the server from a launch, although the
+    child keeps ``HOME`` and ``XDG_CONFIG_HOME``."""
+    home, xdg, curl_home = (tmp_path / name for name in ("home", "xdg", "curl-home"))
+    for directory in (home, xdg, curl_home):
+        directory.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    monkeypatch.delenv("CURL_HOME", raising=False)
+    line = f'header = "Authorization: Bearer {FAKE_TOKEN}"\n'
+    if where == "home":
+        (home / ".curlrc").write_text(line)
+    elif where == "xdg":
+        (xdg / "curlrc").write_text(line)
+    else:
+        (curl_home / ".curlrc").write_text(line)
+        monkeypatch.setenv("CURL_HOME", str(curl_home))
+    assert _seen_header(loopback, _REAL_CURL, tmp_path, isolated=False) == f"Bearer {FAKE_TOKEN}"
+    assert _seen_header(loopback, _REAL_CURL, tmp_path, isolated=True) is None
+
+
+@pytest.mark.skipif(shutil.which("wget") is None, reason="wget is not installed")
+def test_a_launchs_plain_wget_sends_no_header_of_the_operators_configuration(
+    tmp_path, monkeypatch, loopback
+):
+    """The same for the real wget, 1.x (``~/.wgetrc``) or wget2
+    (``~/.config/wget/wget2rc``): both files are written, each reads its own."""
+    home = tmp_path / "home"
+    (home / ".config" / "wget").mkdir(parents=True)
+    line = f"header = Authorization: Bearer {FAKE_TOKEN}\n"
+    (home / ".wgetrc").write_text(line)
+    (home / ".config" / "wget" / "wget2rc").write_text(line)
+    monkeypatch.setenv("HOME", str(home))
+    for name in ("XDG_CONFIG_HOME", "WGETRC", "WGET2RC"):
+        monkeypatch.delenv(name, raising=False)
+    assert _seen_header(loopback, _REAL_WGET, tmp_path, isolated=False) == f"Bearer {FAKE_TOKEN}"
+    assert _seen_header(loopback, _REAL_WGET, tmp_path, isolated=True) is None
 
 
 # -- the preflight --------------------------------------------------------------

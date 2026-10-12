@@ -10,7 +10,8 @@ Claude Code (``claude 2.1.x``; the stream run against 2.1.291 to 2.1.293)::
 
     claude -p --output-format stream-json --verbose --model <alias|id>
            --effort <low|medium|high|xhigh|max> --permission-mode <mode>
-           --no-session-persistence --strict-mcp-config [extra_args] -- <prompt>
+           --no-session-persistence --safe-mode --strict-mcp-config
+           [extra_args] -- <prompt>
 
   * ``-p/--print`` = non-interactive. With ``stream-json`` (the default,
     #192) stdout is one JSON record per line while the agent runs
@@ -34,11 +35,21 @@ Claude Code (``claude 2.1.x``; the stream run against 2.1.291 to 2.1.293)::
   * ``--permission-mode bypassPermissions`` is required for unattended
     edits and local git; ``--permission-prompts none`` would silently
     deny anything that prompts. Configure via profile ``options``.
-  * ``--strict-mcp-config`` with no ``--mcp-config``: no MCP server of the
-    user's, the project's or a plugin's configuration is started, so none
-    can hand the agent a GitHub token of its own (#165). Hooks and the
-    other plugin parts still load; they run as the agent, in its
-    environment.
+  * ``--safe-mode`` and ``--strict-mcp-config`` (#165): no hook, installed
+    plugin or MCP server of the user's, the project's or a plugin's
+    configuration runs, so none can hand the agent a GitHub token of its
+    own; skills, custom agents and commands and CLAUDE.md auto-discovery
+    are off too (every phase prompt tells the agent to read ``AGENTS.md`` /
+    ``CLAUDE.md``). Checked against 2.1.296 with marker hooks and MCP
+    servers and no login (they run before the model is asked): user and
+    project settings, ``.mcp.json``, an installed marketplace plugin,
+    ``--settings``, ``--plugin-dir`` and ``--mcp-config`` all ran without
+    the flag and none ran with it, ``CLAUDE_CODE_SAFE_MODE=0`` set or not;
+    a real ``stream-json`` run is unchanged by it (the ``init`` record still
+    names the enabled plugins). Auth, model, tools and permission mode work
+    as before; managed (administrator) settings still apply.
+    :data:`CLAUDE_INTEGRATION_FLAGS` in ``extra_args`` are refused, and
+    ``autoforge doctor`` requires ``--safe-mode`` in ``claude --help``.
   * exit code 0 on success; 1 on model/auth errors (message on stdout).
 
 OpenCode (``opencode 2.0.x``, #186; run against 2.0.23)::
@@ -92,8 +103,18 @@ OpenCode (``opencode 2.0.x``, #186; run against 2.0.23)::
     :data:`OPENCODE_MIN_VERSION`.
   * no flag disables the MCP servers or plugins of the user's or the
     project's ``opencode.json`` (2.0.26 has neither ``--pure`` nor an MCP
-    switch); the residual is recorded in docs/agent-guides/github-safety.md
-    ("Threat model").
+    switch), so every launch sets :func:`opencode_isolation_env` instead
+    (#165): an empty global configuration directory of its own, no project
+    configuration, no explicit file and no inline document. Read from the
+    2.0.26 build and checked against it with ``opencode api --standalone
+    GET /api/config`` (the configuration a launch resolves): without these
+    variables the global document and ``plugin/`` directory, the project's,
+    and an ``opencode.json`` two directories above the worktree were all
+    loaded; with them, only the empty directory, the operator's
+    ``OPENCODE_CONFIG``, ``OPENCODE_CONFIG_CONTENT`` and
+    ``OPENCODE_CONFIG_PROJECT_DISABLE=0`` notwithstanding. The settings in
+    those files (custom providers, permissions, agents, instructions) are
+    therefore not read either; the model credentials are.
 
 Pi (``pi 1.0.x``, ADR 0003; read from the v1.0.0 source and docs, not yet
 run against an installed Pi)::
@@ -127,7 +148,9 @@ its own CLI reads (:attr:`AgentProvider.environment_names`), so the key of
 one provider is never handed to another. Neither list may name a GitHub or
 git credential route (:func:`autoforge.child_env.refuse_forbidden_env`),
 and the variables the controller sets for the launch
-(:attr:`AgentRequest.env`, #165) reach every process the adapter starts.
+(:attr:`AgentRequest.env`, #165) reach every process the adapter starts,
+with the adapter's own (:meth:`AgentProvider.integration_isolation`) over
+them where its CLI has no flag to keep integrations from loading.
 
 Every adapter runs a :class:`~autoforge.loop_detect.LoopMonitor` under
 :attr:`AgentRequest.loop_detection` (#194): Claude's stream and Pi's events
@@ -144,9 +167,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import tempfile
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 from .child_env import refuse_forbidden_env
@@ -433,6 +459,9 @@ class AgentProvider:
     # knob cannot be a silent no-op. ``None`` leaves the keys unchecked; only
     # the scripted test provider, which launches no real CLI, uses it.
     option_keys: tuple[str, ...] | None = None
+    # The variables :meth:`integration_isolation` sets for this CLI, names
+    # only (the run log records them; the values vary by launch).
+    isolation_names: tuple[str, ...] = ()
 
     def __init__(self, runner: Runner | None = None) -> None:
         self._runner: Runner = runner or execute
@@ -444,6 +473,18 @@ class AgentProvider:
     def stdin_payload(self, req: AgentRequest) -> bytes | None:
         """What :meth:`execute` writes to the CLI's stdin; ``None`` is ``/dev/null``."""
         return None
+
+    @contextmanager
+    def integration_isolation(self) -> Iterator[dict[str, str]]:
+        """The variables this CLI needs, for one launch, so that no MCP server,
+        plugin or hook of the operator's or the repository's configuration
+        loads (#165): one may hold a GitHub token of its own.
+
+        Set over the controller's (:attr:`AgentRequest.env`) by
+        :meth:`execute`, whatever the allow-list passed. An adapter whose CLI
+        has a flag for it says so in its argv instead and sets nothing here.
+        """
+        yield {}
 
     def reports_activity(self, profile: ProfileConfig) -> bool:
         """Whether the CLI, launched for ``profile``, writes output while it works.
@@ -503,23 +544,25 @@ class AgentProvider:
             if monitor.output(stream, chunk, time.monotonic()) is not None:
                 stop.set()
 
-        res = self._runner(
-            ExecutionRequest(
-                command=command,
-                cwd=req.cwd,
-                timeout_seconds=req.max_runtime_seconds or MAX_DEADLINE_SECONDS,
-                idle_timeout_seconds=req.idle_timeout_seconds,
-                env_allowlist=self.environment_allowlist(req),
-                env=req.env,
-                # Nothing an agent starts outlives its invocation (ADR 0002),
-                # including what it detached from its process group.
-                contain_orphans=True,
-                stdin_data=self.stdin_payload(req),
-                on_output=_activity_hook(req.progress),
-                on_chunk=on_chunk,
-                stop=stop,
+        with self.integration_isolation() as isolation:
+            env = {**(req.env or {}), **isolation} if isolation else req.env
+            res = self._runner(
+                ExecutionRequest(
+                    command=command,
+                    cwd=req.cwd,
+                    timeout_seconds=req.max_runtime_seconds or MAX_DEADLINE_SECONDS,
+                    idle_timeout_seconds=req.idle_timeout_seconds,
+                    env_allowlist=self.environment_allowlist(req),
+                    env=env,
+                    # Nothing an agent starts outlives its invocation (ADR
+                    # 0002), including what it detached from its process group.
+                    contain_orphans=True,
+                    stdin_data=self.stdin_payload(req),
+                    on_output=_activity_hook(req.progress),
+                    on_chunk=on_chunk,
+                    stop=stop,
+                )
             )
-        )
         result = AgentExecutionResult.from_execution(res, req.profile)
         if res.stdin_unread and res.exit_code == 0 and not res.timed_out and not res.stopped:
             # A clean exit would otherwise be read as an answer to the whole
@@ -550,6 +593,34 @@ CLAUDE_MAX_PENDING_BYTES = 2 * CLAUDE_MAX_RECORD_BYTES
 # stdout keeps EOF away, and this is how late its exit grace (ADR 0002) can
 # start.
 CLAUDE_EXIT_POLL_SECONDS = 0.25
+# What every launch adds so that no integration of the operator's or the
+# repository's configuration runs (#165): one may hold a GitHub token of its
+# own. ``--safe-mode`` keeps hooks, installed plugins, MCP servers, skills,
+# custom agents and commands, and CLAUDE.md from loading, those of
+# ``--settings``, ``--plugin-dir`` and ``--mcp-config`` included, and wins
+# over ``CLAUDE_CODE_SAFE_MODE=0``; ``--strict-mcp-config`` with no
+# ``--mcp-config`` keeps MCP servers off on its own.
+CLAUDE_ISOLATION_FLAGS = ("--safe-mode", "--strict-mcp-config")
+# The flags that would bring an integration back, refused in ``extra_args``:
+# MCP servers, plugins, settings (hooks among them) and agent definitions,
+# and the browser and IDE connections.
+CLAUDE_INTEGRATION_FLAGS = (
+    "--mcp-config",
+    "--plugin-dir",
+    "--plugin-url",
+    "--settings",
+    "--agents",
+    "--chrome",
+    "--ide",
+)
+
+
+def _integration_flag(arg: str) -> str | None:
+    """The integration flag ``arg`` is (``--flag`` or ``--flag=value``); None if none."""
+    for flag in CLAUDE_INTEGRATION_FLAGS:
+        if arg == flag or arg.startswith(flag + "="):
+            return flag
+    return None
 
 
 class ClaudeCodeProvider(AgentProvider):
@@ -580,6 +651,18 @@ class ClaudeCodeProvider(AgentProvider):
             raise ConfigurationError(
                 f"profile {profile.name!r}: unknown claude permission_mode {mode!r}"
             )
+        for arg in profile.extra_args:
+            flag = _integration_flag(arg)
+            if flag is not None:
+                # The flag only, never its value: a settings string may hold a key.
+                raise ConfigurationError(
+                    f"profile {profile.name!r}: claude extra_args cannot carry {flag}: it "
+                    "loads an integration (an MCP server, a plugin, hooks, an agent "
+                    "definition, a browser or IDE connection), which may hold a GitHub "
+                    "token of its own, and AutoForge launches Claude Code with "
+                    f"{' and '.join(CLAUDE_ISOLATION_FLAGS)} so that none runs "
+                    "(docs/configuration.md, 'Agent environment')"
+                )
 
     @staticmethod
     def output_format(profile: ProfileConfig) -> str:
@@ -605,9 +688,9 @@ class ClaudeCodeProvider(AgentProvider):
             argv += ["--permission-mode", mode]
         if _truthy(profile.options.get("session_persistence"), default=False) is False:
             argv.append("--no-session-persistence")
-        # No MCP server of the operator's or the repository's configuration
-        # is started (#165): one may hold a GitHub token of its own.
-        argv.append("--strict-mcp-config")
+        # No hook, plugin or MCP server of the operator's or the repository's
+        # configuration runs (#165): one may hold a GitHub token of its own.
+        argv += CLAUDE_ISOLATION_FLAGS
         argv += list(profile.extra_args)
         # ``--`` guarantees the prompt is never parsed as an option.
         argv += ["--", prompt]
@@ -731,6 +814,37 @@ def _read_claude_stream(
             child.finish()
 
 
+def opencode_isolation_env(config_dir: str) -> dict[str, str]:
+    """What an OpenCode launch sets so that it reads no configuration of the
+    operator's or the repository's (#165): no flag of 2.0.26 disables an MCP
+    server or a plugin, and either may hold a GitHub token of its own.
+
+    - ``OPENCODE_CONFIG_DIR``: the global configuration directory, instead
+      of ``$XDG_CONFIG_HOME/opencode``; ``config_dir`` is empty, so no
+      ``opencode.json(c)`` and no ``plugin(s)/`` directory is read from it.
+    - ``OPENCODE_CONFIG_PROJECT_DISABLE`` and its older name
+      ``OPENCODE_DISABLE_PROJECT_CONFIG``: no ``opencode.json(c)``,
+      ``.opencode/``, ``.claude/`` or ``.agents/`` of the launch directory or
+      of any directory above it (the search does not stop at the worktree, so
+      it would reach the operator's checkout and home). OpenCode reads the
+      first name and falls back to the second, so setting both leaves no
+      value of the operator's for either in force.
+    - ``OPENCODE_CONFIG`` and ``OPENCODE_CONFIG_CONTENT`` empty: no explicit
+      file and no inline document, whatever the operator's shell passed
+      through ``OPENCODE_*``.
+
+    The model credentials (``opencode auth login``, kept in the data
+    directory) and the providers' API-key variables are untouched.
+    """
+    return {
+        "OPENCODE_CONFIG_DIR": config_dir,
+        "OPENCODE_CONFIG_PROJECT_DISABLE": "1",
+        "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
+        "OPENCODE_CONFIG": "",
+        "OPENCODE_CONFIG_CONTENT": "",
+    }
+
+
 class OpenCodeProvider(AgentProvider):
     name = "opencode"
     # OpenCode's own settings plus the API keys of the model providers it
@@ -738,6 +852,25 @@ class OpenCodeProvider(AgentProvider):
     # ``execution.env_allowlist_extra``.
     environment_names = ("OPENCODE_*", "OPENAI_*", "ANTHROPIC_*", "GEMINI_*", "GOOGLE_*")
     option_keys = ("output_format", "auto_approve")
+    isolation_names = tuple(sorted(opencode_isolation_env("")))
+
+    @contextmanager
+    def integration_isolation(self) -> Iterator[dict[str, str]]:
+        """An empty global configuration directory, for this launch only, and
+        no project, explicit or inline configuration (:func:`opencode_isolation_env`).
+
+        The directory (``mkdtemp``, mode 0700) is removed when the launch
+        ends, whatever OpenCode wrote into it; one that cannot be made is an
+        :class:`ExecutionError`, before anything is launched.
+        """
+        try:
+            config_dir = tempfile.mkdtemp(prefix="autoforge-opencode-")
+        except OSError as exc:
+            raise ExecutionError(f"cannot prepare the opencode configuration: {exc}") from exc
+        try:
+            yield opencode_isolation_env(config_dir)
+        finally:
+            shutil.rmtree(config_dir, ignore_errors=True)
 
     def validate_profile(self, profile: ProfileConfig) -> None:
         super().validate_profile(profile)

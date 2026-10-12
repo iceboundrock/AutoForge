@@ -56,9 +56,14 @@ def isolation():
     # child, while it runs: names and checks only, never a value from the
     # operator's environment.
     gh_dir = os.environ.get("GH_CONFIG_DIR", "")
+    curlrc = os.path.join(os.environ.get("CURL_HOME", ""), ".curlrc")
+    wgetrc = os.environ.get("WGETRC", "")
     return {
         "gh_token_placeholder": os.environ.get("GH_TOKEN") == "autoforge-no-github-credential",
         "gh_config_dir_empty": bool(gh_dir) and os.path.isdir(gh_dir) and not os.listdir(gh_dir),
+        "http_client_config_empty": os.environ.get("WGET2RC") == wgetrc and all(
+            os.path.isfile(f) and "header" not in open(f).read() for f in (curlrc, wgetrc)
+        ),
         "git_terminal_prompt": os.environ.get("GIT_TERMINAL_PROMPT"),
         "credential_helpers": subprocess.run(
             ["git", "config", "--get-all", "credential.helper"],

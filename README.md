@@ -135,11 +135,13 @@ Each line is a summary; the linked document is the precise statement.
   GitHub or git credential through anything AutoForge controls: no token
   variable can be allow-listed, `gh` finds no login, credential helpers,
   askpass and the SSH agent and keys are switched off where repository
-  configuration cannot switch them back on, and a launch is refused (by
-  `doctor` too) while a repository setting or `~/.netrc` would still hand
-  one over. The agent reads the GitHub data its phase needs from files the
-  controller wrote, redacted and bounded. A deliberate same-user read of a
-  credential file by absolute path is outside this guarantee.
+  configuration cannot switch them back on, curl and wget read no
+  configured header, the provider CLIs load no MCP server, plugin or hook,
+  and a launch is refused (by `doctor` too) while a repository setting or
+  `~/.netrc` would still hand one over. The agent reads the GitHub data its
+  phase needs from files the controller wrote, redacted and bounded. A
+  deliberate same-user read of a credential file by absolute path is
+  outside this guarantee.
   ([GitHub safety](docs/agent-guides/github-safety.md#agents-hold-no-github-credential))
 - **The controller's local run is GitHub-free by construction, not by
   convention.** Local mode needs no GitHub: a local run never constructs the

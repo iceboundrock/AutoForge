@@ -1711,14 +1711,19 @@ def make_local_engine(
 # -- what a launched process sees (#165) ----------------------------------------
 
 # A command that records, from inside the child, what the controller handed
-# it: the names of its environment (never a value) and whether the gh
-# configuration and token are the controller's.
+# it: the names of its environment (never a value), whether the gh
+# configuration and token are the controller's, and whether curl and wget
+# find the controller's empty configuration files.
 _ENV_PROBE = (
     "import json, os, sys; "
     "d = os.environ.get('GH_CONFIG_DIR', ''); "
+    "c = os.path.join(os.environ.get('CURL_HOME', ''), '.curlrc'); "
+    "w = os.environ.get('WGETRC', ''); "
     "open(sys.argv[1], 'a').write(json.dumps({'names': sorted(os.environ), "
     "'gh_token_placeholder': os.environ.get('GH_TOKEN') == 'autoforge-no-github-credential', "
     "'gh_config_dir_empty': bool(d) and os.path.isdir(d) and not os.listdir(d), "
+    "'http_client_config_empty': os.environ.get('WGET2RC') == w and all("
+    "os.path.isfile(f) and 'header' not in open(f).read() for f in (c, w)), "
     "'git_terminal_prompt': os.environ.get('GIT_TERMINAL_PROMPT')}) + chr(10))"
 )
 
@@ -1745,6 +1750,14 @@ def pollute_operator_environment(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("GIT_SSH_COMMAND", "ssh -i /operator/key")
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))
     monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", f"unix:path={tmp_path / 'bus'}")
+    # curl's and wget's configuration, each adding the token as a header.
+    curl_home = tmp_path / "operator-curl"
+    curl_home.mkdir(exist_ok=True)
+    (curl_home / ".curlrc").write_text(f'header = "Authorization: Bearer {token}"\n')
+    (tmp_path / "operator-wgetrc").write_text(f"header = Authorization: Bearer {token}\n")
+    monkeypatch.setenv("CURL_HOME", str(curl_home))
+    monkeypatch.setenv("WGETRC", str(tmp_path / "operator-wgetrc"))
+    monkeypatch.setenv("WGET2RC", str(tmp_path / "operator-wgetrc"))
 
 
 def assert_isolated_names(names) -> None:
@@ -1770,8 +1783,9 @@ def launch_environment(eng, req) -> dict[str, str]:
 
 def assert_isolated_launch(eng, req) -> None:
     """Called from a scripted agent while it runs: the launch carries no
-    credential route, and the controller's gh and git configuration exist."""
-    from autoforge.child_env import GH_PLACEHOLDER_TOKEN
+    credential route, and the controller's gh, git, curl and wget
+    configuration exist."""
+    from autoforge.child_env import GH_PLACEHOLDER_TOKEN, HTTP_CLIENT_CONFIG
 
     env = launch_environment(eng, req)
     assert_isolated_names(env)
@@ -1779,6 +1793,9 @@ def assert_isolated_launch(eng, req) -> None:
     gh_dir = Path(env["GH_CONFIG_DIR"])
     assert gh_dir.is_dir() and list(gh_dir.iterdir()) == []
     assert Path(env["GIT_CONFIG_GLOBAL"]).is_file()
+    assert (Path(env["CURL_HOME"]) / ".curlrc").read_text() == HTTP_CLIENT_CONFIG
+    assert env["WGET2RC"] == env["WGETRC"]
+    assert Path(env["WGETRC"]).read_text() == HTTP_CLIENT_CONFIG
     helpers = subprocess.run(
         ["git", "config", "--get-all", "credential.helper"],
         cwd=req.cwd,

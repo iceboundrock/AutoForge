@@ -512,6 +512,7 @@ included):
 | `SSH_AUTH_SOCK` | the SSH agent |
 | `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `GIT_CONFIG_COUNT`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_KEY_*`, `GIT_CONFIG_VALUE_*` | git configuration from the environment, which can name a credential helper |
 | `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS` | the session bus a desktop keyring answers on |
+| `CURL_HOME`, `WGETRC`, `WGET2RC` | where curl and wget find the configuration file they read on every request, which can add a credential header |
 
 Earlier versions forwarded `XDG_RUNTIME_DIR`, `SSH_AUTH_SOCK`, `GIT_SSH`,
 `GIT_SSH_COMMAND`, `GIT_CONFIG_GLOBAL`, `GH_TOKEN`, `GITHUB_TOKEN`,
@@ -529,9 +530,33 @@ it removes when the launch ends:
 | `GIT_CONFIG_GLOBAL` | a file holding only your `user.*`, `author.*` and `committer.*` settings | the agent's commits carry your identity; `~/.gitconfig` and `$XDG_CONFIG_HOME/git/config` are not read |
 | `GIT_TERMINAL_PROMPT` | `0` | git never prompts for a credential |
 | `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_n`, `GIT_CONFIG_VALUE_n` | `credential.helper=`, `core.askPass=`, `http.extraHeader=`, `core.sshCommand=ssh -F /dev/null -o IdentityFile=none -o IdentitiesOnly=yes -o IdentityAgent=none -o ControlPath=none -o BatchMode=yes` | no credential helper, askpass, extra header, SSH agent or SSH key, whatever any git configuration file says |
+| `CURL_HOME` | a directory holding an empty `.curlrc` | a plain `curl` reads it, not `~/.curlrc` or `$XDG_CONFIG_HOME/curlrc`, so a header configured there is never sent |
+| `WGETRC`, `WGET2RC` | an empty file | a plain `wget` (1.x or wget2) reads it, not `~/.wgetrc` or `~/.config/wget/wget2rc` |
 
 `GIT_AUTHOR_*` and `GIT_COMMITTER_*` stay in the default allow-list and
 still take precedence over the identity file.
+
+**Provider integrations stay off.** An MCP server, a plugin or a hook may
+hold a GitHub token of its own, so none of the operator's or the
+repository's runs in a launch:
+
+- Claude Code is launched with `--safe-mode` and `--strict-mcp-config`, and
+  a Claude profile's `extra_args` cannot carry `--mcp-config`,
+  `--plugin-dir`, `--plugin-url`, `--settings`, `--agents`, `--chrome` or
+  `--ide` (config load fails, naming the flag, never its value).
+  `autoforge doctor` fails a `claude` whose `--help` lacks either flag
+  (row "agent 'claude' keeps integrations off"). Skills, custom agents and
+  commands and CLAUDE.md auto-discovery are off as well; managed
+  (administrator) settings still apply.
+- OpenCode is launched with `OPENCODE_CONFIG_DIR` set to an empty directory
+  of its own, project configuration disabled
+  (`OPENCODE_CONFIG_PROJECT_DISABLE`, `OPENCODE_DISABLE_PROJECT_CONFIG`) and
+  `OPENCODE_CONFIG` and `OPENCODE_CONFIG_CONTENT` empty, whatever your shell
+  sets: no `opencode.json(c)` or plugin directory of yours or the
+  repository's is read. Settings kept there (a custom provider, permission
+  rules, agents, instructions) do not apply to an AutoForge launch; the
+  model credentials of `opencode auth login` and the providers' API-key
+  variables do.
 
 **A preflight before every launch.** The controller refuses to launch an
 agent or run a command when it would still be handed a credential through
@@ -552,7 +577,9 @@ identity: no commit signing (agent commits are unsigned), no global Git LFS
 filter, no aliases, no `core.excludesFile`. `gh` and `git push` fail for
 lack of a credential, which is expected: the controller performs every
 GitHub write. Tools that need `XDG_RUNTIME_DIR` (a session bus, a Wayland
-socket) do not get it. The guarantees and what they do not cover are in
+socket) do not get it; curl and wget get none of their configured defaults
+(the proxy variables still pass); and the provider integrations above stay
+off. The guarantees and what they do not cover are in
 [GitHub safety](agent-guides/github-safety.md#agents-hold-no-github-credential).
 
 ## Local mode configuration

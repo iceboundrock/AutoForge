@@ -903,9 +903,11 @@ never the boundary.
   `SSH_ASKPASS`, `GIT_SSH`, `GIT_SSH_COMMAND`), the SSH agent socket
   (`SSH_AUTH_SOCK`), git configuration from the environment
   (`GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `GIT_CONFIG_COUNT`,
-  `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_KEY_*`, `GIT_CONFIG_VALUE_*`) and the
+  `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_KEY_*`, `GIT_CONFIG_VALUE_*`), the
   session bus a desktop keyring answers on (`XDG_RUNTIME_DIR`,
-  `DBUS_SESSION_BUS_ADDRESS`). None is in the default allow-list, and
+  `DBUS_SESSION_BUS_ADDRESS`), and where curl and wget find the
+  configuration file they read on every request (`CURL_HOME`, `WGETRC`,
+  `WGET2RC`). None is in the default allow-list, and
   config load refuses any of them, or a `*` prefix covering one, in
   `execution.env_allowlist`, `env_allowlist_extra` or an adapter's
   `environment_names`, naming the variable and the rule and never a value.
@@ -929,7 +931,16 @@ never the boundary.
     which no file can override: `credential.helper=` (an empty value clears
     the helper list, URL-specific helpers included), `core.askPass=`,
     `http.extraHeader=` and `core.sshCommand` set to
-    `ssh -F /dev/null -o IdentityFile=none -o IdentitiesOnly=yes -o IdentityAgent=none -o ControlPath=none -o BatchMode=yes`.
+    `ssh -F /dev/null -o IdentityFile=none -o IdentitiesOnly=yes -o IdentityAgent=none -o ControlPath=none -o BatchMode=yes`;
+  - `CURL_HOME`: a directory holding an empty `.curlrc`, and `WGETRC`
+    (wget 1.x) and `WGET2RC` (wget2): an empty file. curl reads the first
+    default configuration file it finds, `$CURL_HOME/.curlrc` before
+    `$XDG_CONFIG_HOME/curlrc`, `~/.curlrc` and the password database's
+    home, and wget reads the file its variable names instead of
+    `~/.wgetrc` or `~/.config/wget/wget2rc`. Either file can add an
+    `Authorization` header to every request, so a plain `curl` or `wget`
+    would otherwise send the operator's token; the child keeps `HOME` and
+    `XDG_CONFIG_HOME`, and its curl and wget still read none of them.
 - **A preflight before every launch** (`child_env.preflight`): one
   `git config --list --show-scope --includes` in the launch's directory,
   through the hardened local request, and a read of `~/.netrc` (`_netrc`).
@@ -945,12 +956,31 @@ never the boundary.
   command does. It names the scope and the key's shape, never a value or a
   URL. `autoforge doctor` and `autoforge local doctor` run the same check
   and report the launch environment by name only.
-- **Provider integrations**, decided from each CLI's `--help`: Claude Code
-  runs with `--strict-mcp-config` and no `--mcp-config`, so no MCP server
-  of the user's, the project's or a plugin's configuration starts (one may
-  hold a token of its own); OpenCode 2.0.26 has no flag that disables its
-  MCP servers or plugins (see the residuals below); Pi's `--no-extensions`
-  and the rest of #132's policy are unchanged.
+- **Provider integrations.** An MCP server, a plugin or a hook of the
+  operator's or the repository's configuration may hold a GitHub token of
+  its own, so none runs in a launch; each mechanism was decided from the
+  installed CLI's `--help` or build and checked against it
+  (`providers.py` records how):
+  - Claude Code runs with `--safe-mode` and `--strict-mcp-config`: no
+    hook, installed plugin or MCP server of the user's or the project's
+    settings, `.mcp.json`, `--settings`, `--plugin-dir` or `--mcp-config`
+    runs, `CLAUDE_CODE_SAFE_MODE=0` notwithstanding. A profile's
+    `extra_args` cannot carry a flag that would bring one back
+    (`--mcp-config`, `--plugin-dir`, `--plugin-url`, `--settings`,
+    `--agents`, `--chrome`, `--ide`): config load refuses it, naming the
+    flag and never its value. `doctor` fails a `claude` whose `--help`
+    lacks either flag, since it would refuse every launch's argv.
+  - OpenCode 2.0.26 has no such flag, so every launch sets
+    `OPENCODE_CONFIG_DIR` to an empty directory of its own (removed when
+    the launch ends), `OPENCODE_CONFIG_PROJECT_DISABLE` and
+    `OPENCODE_DISABLE_PROJECT_CONFIG` to `1`, and `OPENCODE_CONFIG` and
+    `OPENCODE_CONFIG_CONTENT` to empty, over whatever the operator's shell
+    passed through `OPENCODE_*`. No `opencode.json(c)` or `plugin(s)/`
+    directory is read, neither the operator's global one nor one in or
+    above the worktree (OpenCode's project search does not stop at the
+    worktree, so it would reach the operator's checkout and home), and no
+    explicit or inline document is.
+  - Pi's `--no-extensions` and the rest of #132's policy are unchanged.
 
 ### Credential routes
 
@@ -971,9 +1001,11 @@ named otherwise), or why it has none.
 | a credential in a URL (`remote.*.url`, `pushurl`, `url.*.insteadOf`) | global replaced; system, repository and worktree refused by the preflight | `test_the_preflight_refuses_a_credential_in_the_repository_configuration`; doctor: `test_doctor_refuses_a_token_bearing_origin_and_never_prints_it` |
 | `http.extraHeader` | generic reset at command scope; any non-empty one refused by the preflight | preflight tests |
 | `~/.netrc` (libcurl, `curl -n`) | GitHub or `default` entry refused by the preflight | `test_a_netrc_entry_for_github_refuses_the_launch`, `test_engine.py::test_a_netrc_entry_for_github_blocks_the_premerge_verification`, doctor |
+| curl's configuration (`~/.curlrc`, `$XDG_CONFIG_HOME/curlrc`, `$CURL_HOME/.curlrc`), read by every plain `curl` | `CURL_HOME` names an empty `.curlrc` of the launch's, found first; `CURL_HOME` refused at load | the real `curl` against a loopback server, header sent for the controller and not from a launch: `test_a_launchs_plain_curl_sends_no_header_of_the_operators_configuration`; fake `curl`: `test_an_agent_finds_no_credential_route_the_controller_finds_every_one` |
+| wget's configuration (`~/.wgetrc`, `~/.config/wget/wget2rc`), read by every plain `wget` | `WGETRC` and `WGET2RC` name an empty file of the launch's; both refused at load | the real `wget` (1.x or wget2) the same way: `test_a_launchs_plain_wget_sends_no_header_of_the_operators_configuration`; fake `wget` |
 | `~/.git-credentials`, `$XDG_CONFIG_HOME/git/credentials` | read only by the `store` helper, which is reset | covered by the helper tests; a deliberate read is an absolute-path read (not guaranteed) |
-| Claude Code MCP servers (user, project, plugin) | `--strict-mcp-config` | `test_providers.py::test_claude_argv_shape` |
-| OpenCode MCP servers and plugins | none: 2.0.26 has no such flag | none: there is no flag to assert, and a test cannot run a real OpenCode (residual below) |
+| Claude Code hooks, installed plugins and MCP servers (user, project, `.mcp.json`, plugin) | `--safe-mode` and `--strict-mcp-config`; integration flags refused in `extra_args`; `doctor` requires both flags | `test_providers.py::test_claude_argv_shape`, `test_claude_refuses_extra_args_that_load_an_integration`, `test_config.py::test_a_claude_profile_whose_extra_args_load_an_integration_is_refused`, `test_doctor.py::test_doctor_fails_a_claude_without_the_isolation_flags`. A test cannot run a real Claude Code; the flags were checked against 2.1.296 with marker hooks and MCP servers (`providers.py`) |
+| OpenCode MCP servers and plugins (global, project and above, `OPENCODE_CONFIG`, `OPENCODE_CONFIG_CONTENT`) | `opencode_isolation_env`: an empty global configuration directory, no project configuration, no explicit or inline document | a fake `opencode` that resolves its configuration as 2.0.26 does, behind the real executor: `test_providers.py::test_an_opencode_launch_loads_no_mcp_server_or_plugin_of_any_configuration`. A test cannot run a real OpenCode; the variables were checked against 2.0.26's resolved configuration (`providers.py`) |
 | Pi extensions, skills, prompt templates, themes, context files | #132's flags (`--no-extensions` and the rest) | `test_pi_rpc.py`, unchanged |
 | a provider's permission mode or approval | irrelevant by the authority rule: it grants no credential | — |
 | validation and pre-merge commands | the same variables and preflight | `test_local.py::test_local_launches_get_the_same_isolation_and_no_read_context`, `test_engine.py::test_verification_commands_get_the_launch_isolation` |
@@ -1063,18 +1095,29 @@ humans acting concurrently on GitHub. GitHub is the source of truth.
 - **The committed tree** is not filtered; `REVIEW` and the merge gate own it.
 - **Integrity of the shared object store** (D7.5, #171).
 
-**Residuals of the provider integrations.** OpenCode 2.0.26 has no flag that
-disables the MCP servers or plugins of the user's or the project's
-`opencode.json`; one configured with its own GitHub token keeps it. Claude
-Code's hooks and the non-MCP parts of its plugins still load; they run as
-the agent, in its environment. Neither is a route AutoForge configures, and
-both are named by `doctor`'s documentation rather than detected.
+**Residuals of the provider integrations.** Claude Code still applies
+managed settings an administrator installed (`--safe-mode` leaves policy
+settings in force); the operator cannot change them either. OpenCode still
+loads the configuration of an organization the operator connected with
+`opencode auth login` (a `.well-known/opencode` integration): OpenCode keeps
+it with the model credentials in its data directory, which a launch needs.
+Neither is detected; both are outside the configuration files a launch
+reads.
 
 **What the agent loses.** The operator's global git configuration beyond
 the identity is not read by an agent: no commit signing (`commit.gpgSign`,
 `user.signingKey`, an SSH-agent signer), no global Git LFS filter, no
 aliases or `core.excludesFile`. Tools that need `XDG_RUNTIME_DIR` (a session
-bus, a Wayland socket) do not get it.
+bus, a Wayland socket) do not get it, and curl and wget get none of their
+configured defaults (a proxy among them; the proxy variables still pass).
+Claude Code runs without the user's or the project's skills, custom agents
+and commands and CLAUDE.md auto-discovery; OpenCode without
+the settings in its configuration files (custom providers, permission
+rules, agents, instructions) and without loading `AGENTS.md` itself. Every
+phase prompt tells the agent to read the repository's `AGENTS.md` and
+`CLAUDE.md`, and the model credentials (Claude Code's login and API-key
+variables, OpenCode's `opencode auth login` and API-key variables) are
+untouched.
 
 ## Merge safety
 

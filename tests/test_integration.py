@@ -722,6 +722,7 @@ def test_an_all_pi_run_gets_the_same_isolation_in_every_child(
         assert isolation == {
             "gh_token_placeholder": True,
             "gh_config_dir_empty": True,
+            "http_client_config_empty": True,
             "git_terminal_prompt": "0",
             "git_identity": "Operator Name",
         }, entry

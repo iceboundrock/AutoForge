@@ -91,8 +91,10 @@ read it before adding tests for a listed area.
   environment (`env_probe_records`), and `read_context_of(prompt)` returns
   the read-context directory a rendered prompt names. `tests/pi_fake.py`
   logs an `isolation` record for every Pi start. `tests/test_child_env.py`
-  has PATH-injected fake `gh`, `ssh`, `curl` and credential helper
-  (`Probes`) that succeed only when a credential route reaches them.
+  has PATH-injected fake `gh`, `ssh`, `curl`, `wget` and credential helper
+  (`Probes`) that succeed only when a credential route reaches them, and
+  runs the real `curl` and `wget`, where installed, against a loopback
+  server that records the header they send.
 - Recovery tests reload state from disk after each step; a crash-recovery
   test performs the external side effect first and only then interrupts,
   because that is the window the controller must survive.

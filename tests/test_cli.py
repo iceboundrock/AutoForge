@@ -933,6 +933,9 @@ def test_doctor_reports_an_unreadable_branch_rule_as_skipped(tmp_path, capsys, m
             )
         if argv == ["opencode", "--version"]:
             return ExecutionResult(argv, req.cwd, 0, "opencode v2.0.23\n", "", "t", "t")
+        if argv == ["claude", "--help"]:  # the flags that keep integrations off (#165)
+            out = "  --safe-mode  ...\n  --strict-mcp-config  ...\n"
+            return ExecutionResult(argv, req.cwd, 0, out, "", "t", "t")
         if "--show-scope" in argv:  # the launch preflight's config listing: nothing configured
             return ExecutionResult(argv, req.cwd, 0, "", "", "t", "t")
         return ExecutionResult(argv, req.cwd, 0, "ok 1.0\n", "", "t", "t")

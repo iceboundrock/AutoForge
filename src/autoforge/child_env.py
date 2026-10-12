@@ -12,12 +12,14 @@ of launch the same way.
 - **Names that are never inherited** (:data:`FORBIDDEN_ENV_NAMES`,
   :data:`FORBIDDEN_ENV_PREFIXES`). gh's tokens and configuration location,
   the programs git and ssh run to obtain a credential, the SSH agent
-  socket, git configuration taken from the environment, and the session
-  bus a desktop keyring answers on. :func:`refuse_forbidden_env` refuses an
-  allow-list entry that names one, or a ``*`` prefix that covers one, at
-  config load (``execution.env_allowlist`` / ``env_allowlist_extra``) and
-  for every provider adapter's own names, naming the variable and the
-  rule, never a value.
+  socket, git configuration taken from the environment, the session bus a
+  desktop keyring answers on, and where curl and wget find the
+  configuration file they read on every request.
+  :func:`refuse_forbidden_env` refuses an allow-list entry that names one,
+  or a ``*`` prefix that covers one, at config load
+  (``execution.env_allowlist`` / ``env_allowlist_extra``) and for every
+  provider adapter's own names, naming the variable and the rule, never a
+  value.
 - **What the controller sets instead** (:func:`isolated_overrides`), over
   the allow-listed environment, for one launch:
 
@@ -39,7 +41,15 @@ of launch the same way.
     scope (``GIT_CONFIG_COUNT``), which no configuration file, the
     repository's included, can override; ``GIT_TERMINAL_PROMPT=0``. The
     ``ssh`` reads no configuration file and offers no identity file and no
-    agent, so git over SSH cannot pick up the operator's default keys.
+    agent, so git over SSH cannot pick up the operator's default keys;
+  - ``CURL_HOME`` names a directory holding an empty ``.curlrc``, and
+    ``WGETRC`` (wget 1.x) and ``WGET2RC`` (wget2) an empty file. curl reads
+    the first default configuration file it finds, ``$CURL_HOME/.curlrc``
+    before ``$XDG_CONFIG_HOME/curlrc``, ``~/.curlrc`` and the home of the
+    password database, and wget reads the file its variable names instead
+    of ``~/.wgetrc`` or ``~/.config/wget/wget2rc``; either file can add an
+    ``Authorization`` header to every request, so a plain ``curl`` or
+    ``wget`` of the child's would otherwise send the operator's token.
 
   The directory is removed when the launch ends.
 - **A preflight before every launch** (:func:`preflight`): the git
@@ -84,6 +94,10 @@ _PROGRAM = "a program git or ssh runs to obtain a credential or to connect"
 _SSH_AGENT = "the SSH agent socket"
 _GIT_CONFIG = "git configuration taken from the environment, which can name a credential helper"
 _SESSION_BUS = "the session bus a desktop keyring is reached through"
+_HTTP_CONFIG = (
+    "where an HTTP client finds the configuration file it reads on every request, "
+    "which can add a credential header"
+)
 
 # Every variable an agent or a repository command must never inherit from
 # the operator's environment, and the rule it falls under. Some of them are
@@ -107,6 +121,9 @@ FORBIDDEN_ENV_NAMES: dict[str, str] = {
     "GIT_CONFIG_PARAMETERS": _GIT_CONFIG,
     "XDG_RUNTIME_DIR": _SESSION_BUS,
     "DBUS_SESSION_BUS_ADDRESS": _SESSION_BUS,
+    "CURL_HOME": _HTTP_CONFIG,
+    "WGETRC": _HTTP_CONFIG,
+    "WGET2RC": _HTTP_CONFIG,
 }
 FORBIDDEN_ENV_PREFIXES: dict[str, str] = {
     "GIT_CONFIG_KEY_": _GIT_CONFIG,
@@ -210,7 +227,9 @@ def refuse_forbidden_env(entries: Iterable[str], where: str) -> None:
         )
 
 
-def child_overrides(gh_config_dir: str, git_config_global: str) -> dict[str, str]:
+def child_overrides(
+    gh_config_dir: str, git_config_global: str, curl_home: str, wgetrc: str
+) -> dict[str, str]:
     """The variables the controller sets for a child, over the allow-listed ones."""
     env = {
         "GH_CONFIG_DIR": gh_config_dir,
@@ -219,6 +238,9 @@ def child_overrides(gh_config_dir: str, git_config_global: str) -> dict[str, str
         "GIT_CONFIG_GLOBAL": git_config_global,
         "GIT_TERMINAL_PROMPT": "0",
         "GIT_CONFIG_COUNT": str(len(GIT_COMMAND_SCOPE)),
+        "CURL_HOME": curl_home,
+        "WGETRC": wgetrc,
+        "WGET2RC": wgetrc,
     }
     for index, (key, value) in enumerate(GIT_COMMAND_SCOPE):
         env[f"GIT_CONFIG_KEY_{index}"] = key
@@ -228,7 +250,7 @@ def child_overrides(gh_config_dir: str, git_config_global: str) -> dict[str, str
 
 def override_names() -> tuple[str, ...]:
     """The names :func:`child_overrides` sets, sorted (values vary by launch)."""
-    return tuple(sorted(child_overrides("", "")))
+    return tuple(sorted(child_overrides("", "", "", "")))
 
 
 @dataclass(frozen=True)
@@ -274,15 +296,29 @@ def render_git_config(identity: LaunchIdentity) -> str:
     return "\n".join(lines) + "\n"
 
 
+# What the child's curl and wget find as their configuration file: options
+# neither, so the operator's (``~/.curlrc``, ``~/.wgetrc``, their XDG
+# locations) are never read. Both take ``#`` for a comment.
+HTTP_CLIENT_CONFIG = "# Written by AutoForge for one launch (#165): no default options.\n"
+
+
+def _write_new(path: str, text: str) -> None:
+    """Create ``path`` (mode 0600, never through a link) holding ``text``."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(text)
+
+
 @contextmanager
 def isolated_overrides(identity: LaunchIdentity) -> Iterator[dict[str, str]]:
     """The child's overrides, backed by a directory that exists for the launch only.
 
     The directory (``mkdtemp``, mode 0700, outside every repository) holds
-    the empty gh configuration directory and the global git configuration;
-    it is removed when the ``with`` block ends, whatever the child wrote
-    into it, so nothing one launch plants reaches the next. A directory that
-    cannot be prepared is an :class:`ExecutionError`, before any launch.
+    the empty gh configuration directory, the global git configuration, and
+    curl's and wget's configuration files; it is removed when the ``with``
+    block ends, whatever the child wrote into it, so nothing one launch
+    plants reaches the next. A directory that cannot be prepared is an
+    :class:`ExecutionError`, before any launch.
     """
     try:
         root = tempfile.mkdtemp(prefix="autoforge-child-")
@@ -293,13 +329,15 @@ def isolated_overrides(identity: LaunchIdentity) -> Iterator[dict[str, str]]:
             gh_dir = os.path.join(root, "gh")
             os.mkdir(gh_dir, 0o700)
             git_config = os.path.join(root, "gitconfig")
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
-            fd = os.open(git_config, flags, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(render_git_config(identity))
+            _write_new(git_config, render_git_config(identity))
+            curl_home = os.path.join(root, "curl")
+            os.mkdir(curl_home, 0o700)
+            _write_new(os.path.join(curl_home, ".curlrc"), HTTP_CLIENT_CONFIG)
+            wgetrc = os.path.join(root, "wgetrc")
+            _write_new(wgetrc, HTTP_CLIENT_CONFIG)
         except OSError as exc:
             raise ExecutionError(f"cannot prepare a launch's environment: {exc}") from exc
-        yield child_overrides(gh_dir, git_config)
+        yield child_overrides(gh_dir, git_config, curl_home, wgetrc)
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -533,6 +571,7 @@ __all__ = [
     "FORBIDDEN_ENV_PREFIXES",
     "GH_PLACEHOLDER_TOKEN",
     "GIT_COMMAND_SCOPE",
+    "HTTP_CLIENT_CONFIG",
     "SSH_COMMAND",
     "GitConfigEntry",
     "LaunchIdentity",
