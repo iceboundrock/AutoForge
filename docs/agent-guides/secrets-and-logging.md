@@ -154,6 +154,17 @@ into a looping agent's commands, results and output lines and checks that
 neither it, the raw strings nor the digests reach any line or file the run
 writes.
 
+A sandboxed launch's facts (`sandbox` in `execution.json` and
+`events.jsonl`, #167, ADR 0005 D10.4) carry names, paths, sizes, the backend
+version and, for a setup failure, the last lines of `bwrap`'s own message,
+redacted and bounded. They never carry an environment value. The
+environment the sandboxed command gets is handed to `bwrap` through a
+memory file (`--args`), never on a command line any process could read
+from `/proc/<pid>/cmdline`. `tests/test_sandbox.py` and
+`tests/test_sandbox_bwrap.py` check that a value passed to a sandboxed
+command appears on no command line, and `tests/test_runlog.py` that a
+token in a setup failure's reason reaches no file.
+
 `stdout.log` and `stderr.log` hold what the executor captured, which is
 bounded (`executor.DEFAULT_MAX_OUTPUT_BYTES` per stream): past the bound the
 file is the head of the stream, a `[autoforge: N bytes of stdout omitted; ...]`

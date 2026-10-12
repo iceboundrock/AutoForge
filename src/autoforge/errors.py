@@ -43,6 +43,39 @@ class ChildStdinClosedError(ExecutionError):
     """A duplex child closed its stdin while a record was being written (EPIPE)."""
 
 
+class SandboxPolicyError(AutoForgeError):
+    """A sandbox launch cannot be described as asked (ADR 0005 D4.2, D4.3, D7.2).
+
+    Raised by the policy compiler (``autoforge.sandbox``) before anything is
+    spawned: a relative or missing source, a link in a controller-owned
+    path, a socket or device, a forbidden source, a denied root left
+    visible, an overlap, a keyring login. ``path`` and ``rule`` name what was
+    refused and why; the message never quotes a file's contents.
+    """
+
+    def __init__(self, path: str, rule: str, detail: str) -> None:
+        super().__init__(f"sandbox policy refuses {path}: {rule}: {detail}")
+        self.path = path
+        self.rule = rule
+
+
+class SandboxLaunchRefusedError(ExecutionError):
+    """The outer sandbox could not be established for a launch (ADR 0005 D10.8, D14.2).
+
+    The platform is not Linux, the backend is missing or lacks a capability,
+    or the backend failed to set the sandbox up (a bind source gone, an
+    executable the sandbox cannot run, a namespace refused). It is a launch
+    refusal on the path of a failure to spawn: the command never ran, and
+    nothing it would have written is attributed to it. ``facts`` is the
+    launch's ``autoforge.sandbox.SandboxFacts`` (``enforced`` False, the
+    bounded, redacted reason) when the backend got as far as preparing it.
+    """
+
+    def __init__(self, message: str, facts: object = None) -> None:
+        super().__init__(message)
+        self.facts = facts
+
+
 class ControlResultError(AutoForgeError):
     """CONTROL_RESULT block missing, ambiguous, or not valid JSON."""
 

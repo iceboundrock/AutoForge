@@ -19,7 +19,10 @@ Layout::
                               # whether either stream was truncated at the capture bound
                               # and what the invocation left behind (descendants killed,
                               # a group member that survived SIGKILL, an abandoned capture);
-                              # the provider's own summary (provider_summary) when it gave one
+                              # the provider's own summary (provider_summary) when it gave one;
+                              # the outer sandbox's facts (sandbox: enforced, backend and
+                              # version, teardown, network, tmpfs bounds, unset environment
+                              # names, a setup failure) when the launch had one
             stdout.log        # redacted stdout (head + omission marker + tail when truncated)
             stderr.log        # redacted stderr (same)
             control-result.json   # parsed CONTROL_RESULT when one was accepted
@@ -295,6 +298,11 @@ class ExecutionRecord:
     # A provider's own summary of the run (``AgentExecutionResult.provider_summary``),
     # written to ``execution.json`` only when the provider gave one.
     provider_summary: dict[str, object] = field(default_factory=dict)
+    # What the outer sandbox recorded for a sandboxed launch
+    # (``sandbox.SandboxFacts.record``, ADR 0005 D10.4): names, paths, sizes
+    # and a bounded reason, never an environment value. Written to
+    # ``execution.json`` only when the launch had a sandbox.
+    sandbox: dict[str, object] = field(default_factory=dict)
 
 
 class RunLogger:
@@ -631,6 +639,8 @@ class RunLogger:
         # The adapter bounds and redacts its summary already; it is redacted
         # again here because it is written twice, like the metadata.
         record.provider_summary = redact_dict(record.provider_summary)
+        # Paths and a backend's message; redacted for the same reason.
+        record.sandbox = redact_dict(record.sandbox)
         if record.loop is not None:
             # Built from cleaned tool names and counts; redacted again
             # because it is written twice, like the summary.
@@ -690,6 +700,8 @@ class RunLogger:
         }
         if record.provider_summary:
             execution["provider_summary"] = record.provider_summary
+        if record.sandbox:
+            execution["sandbox"] = record.sandbox
         if record.loop_detection:
             execution["ended_by"] = record.ended_by
             execution["loop_detection"] = record.loop_detection

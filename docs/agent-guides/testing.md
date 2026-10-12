@@ -171,6 +171,67 @@ High-priority coverage includes:
   is built, raised as itself; a contained invocation also releases the
   containment, its reaper thread included
 
+### Outer sandbox (#167, ADR 0005)
+
+Three files, by what they need from the host:
+
+- `tests/test_sandbox.py` runs on any host with Python (the fake-backend
+  part on any Linux). It covers:
+  - the policy compiler on paths under `tmp_path`: every refusal of D4.2,
+    D4.3 and D7.2 names the path and the rule, never quotes a file, and
+    happens with process creation disabled; what compiles is ordered
+    parents first; C4 masks a denied root that is a direct child of a
+    writable projection; C6 records a covered read-only declaration;
+  - the backend's options: the namespaces and `--die-with-parent` always,
+    `--unshare-net` only on request, never `--disable-userns`,
+    `--new-session` or `--as-pid-1`; masks remounted read-only after their
+    carve-outs; `--clearenv` then exactly the environment;
+  - two drift guards: no `bwrap` flag in any other source module, and no
+    workflow import in the sandbox modules;
+  - the executor and duplex wiring against a fake `bwrap` on `PATH`, which
+    reads its options from `--args`, runs the command and writes `bwrap`'s
+    status records, or fails its setup. Here a setup failure is a typed
+    refusal and exit 1 is not; no environment value is on a command line;
+    the facts are recorded; and a refusal leaves no descriptor and no held
+    containment. Also refused: the platforms without a backend, a missing
+    `bwrap`, a backend without overlays, a kernel without Landlock ABI 6,
+    an unknown architecture and a failing process scope.
+- `tests/test_sandbox_bwrap.py` runs real `bwrap`. A session fixture runs
+  `sandbox_bwrap.probe()` once and skips the whole module with the probe's
+  reason when this host cannot enforce. Causes include: no `bwrap`,
+  unprivileged user namespaces refused (Ubuntu's AppArmor restriction), a
+  kernel before Landlock ABI 6 (Linux 6.12), or no `/usr/bin/python3` to
+  run the fake commands inside. It skips rather than fails because
+  capability is a property of the host (ADR 0005 D14.1): a host that
+  cannot enforce refuses every sandboxed launch, which `test_sandbox.py`
+  already covers. Whether hosted CI runs it is #169's. It covers:
+  - forbidden sentinels under a fake operator home, a fake agent socket, a
+    planted symlink and `..`;
+  - read-only, writable, masked, carved-out, pinned and single-file binds
+    (`EROFS`, `EXDEV`, `EBUSY`);
+  - an overlay that leaves its lower layer intact and puts writes and a
+    whiteout in its upper layer;
+  - a bounded temp;
+  - SysV IPC, a session-keyring key made by a helper in a keyring of its
+    own, and a host abstract socket (`EPERM`, while one made inside
+    works);
+  - an isolated network;
+  - a nested namespace that cannot unmask or remount;
+  - ADR 0005 D6.1's git common-dir layout with a linked worktree, for both
+    ref backends git supports;
+  - host processes invisible;
+  - the processes a command leaves behind, gone after exit, timeout and
+    stop, with and without containment;
+  - `kill(0, SIGKILL)` as an abnormal end;
+  - duplex through the backend;
+  - the spawn-thread invariant;
+  - a missing bind source and an exec failure as refusals.
+- `tests/test_runlog.py` checks that the facts reach `execution.json` and
+  `events.jsonl`, redacted, and only for a sandboxed launch.
+
+The existing executor and duplex suites are the no-description regression:
+they run unchanged.
+
 ### Agent isolation (REMOTE)
 
 - the agent's cwd is the per-issue worktree under the git common dir (or

@@ -133,6 +133,9 @@ loop detector (unit and end to end)   test_loop_detect.py (adapters: test_provid
                                       test_pi_rpc.py, test_claude_stream.py)
 executor, lock, redaction, run logs   test_executor.py, test_executor_duplex.py, test_lock.py,
                                       test_redaction.py, test_runlog.py
+outer sandbox: compiler, wiring on a  test_sandbox.py (real bwrap, skipped with the probe's
+fake bwrap; the real backend          reason where the host cannot enforce:
+                                      test_sandbox_bwrap.py)
 LOCAL mode                            test_local*.py
 config, CLI, doctor, CI drift guards  test_config.py, test_cli.py, test_doctor.py, test_ci_workflow.py, test_gitignore.py
 launch environment, no credential     test_child_env.py (engine and doctor: test_engine.py,

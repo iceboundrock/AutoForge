@@ -1,8 +1,11 @@
 # ADR 0005. Outer sandbox: provider-neutral host-resource capability model
 
-- **Status:** accepted. This is a design record; nothing in it is implemented
-  yet. It is implemented by #167 (the launch description, the policy
-  compiler and the Linux `bwrap` backend in the executor layer), #168
+- **Status:** accepted. This is a design record. #167's part is implemented
+  (`src/autoforge/sandbox.py`, `src/autoforge/sandbox_bwrap.py`, the
+  optional description on both executor requests, ADR 0002 §4e); no launch
+  site uses it until #168. It is implemented by #167 (the launch
+  description, the policy compiler and the Linux `bwrap` backend in the
+  executor layer), #168
   (provider declarations, engine facts, the routing of every launch, the git
   surface, `sandbox.mode` with `disabled` and `required`) and #169
   (`preferred`, the pre-launch capability gate, `doctor`, operator

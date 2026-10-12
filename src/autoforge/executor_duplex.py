@@ -69,7 +69,13 @@ Guarantees:
   exit grace plus two kill graces, the bound ``execute()`` has;
 - ``contain_orphans`` catches what left the group exactly as in
   ``execute()`` (the subreaper is held from before the spawn to the end of
-  the teardown), with the same three orphan facts.
+  the teardown), with the same three orphan facts;
+- ``sandbox`` runs the child inside the outer sandbox exactly as in
+  ``execute()`` (ADR 0005): the backend is spawned in the command's place,
+  every guarantee above applies to it, and a sandbox that could not be
+  established raises :class:`~autoforge.errors.SandboxLaunchRefusedError`
+  from :func:`start_duplex` or, for a setup failure the backend reports
+  after the spawn, from :meth:`DuplexChild.finish`.
 
 A server child that takes no input and is not spoken to over stdout (#126)
 uses the same handle with ``stdin_pipe=False`` and
@@ -95,6 +101,9 @@ from .executor import (
     DEFAULT_MAX_OUTPUT_BYTES,
     LIMIT_IDLE,
     MAX_DEADLINE_SECONDS,
+    BwrapLaunch,
+    LaunchDescription,
+    SandboxFacts,
     _BoundedReader,
     _child_environment,
     _Containment,
@@ -103,6 +112,7 @@ from .executor import (
     _Limits,
     _now,
     _PipeDrain,
+    _prepare_sandbox,
     _reaped,
     _spawn,
     _terminate_group,
@@ -203,6 +213,11 @@ class DuplexRequest:
     max_stdout_bytes: int = DEFAULT_MAX_OUTPUT_BYTES
     # As :attr:`autoforge.executor.ExecutionRequest.contain_orphans`.
     contain_orphans: bool = False
+    # As :attr:`autoforge.executor.ExecutionRequest.sandbox`. The thread that
+    # calls :func:`start_duplex` is the one ``bwrap --die-with-parent``
+    # watches: it must outlive the handle (ADR 0005 D10.6), whichever
+    # threads then send, read and finish.
+    sandbox: LaunchDescription | None = None
 
 
 @dataclass
@@ -238,6 +253,8 @@ class DuplexResult:
     # The caller ended the invocation with :meth:`DuplexChild.stop` before
     # the child exited; ``exit_code`` is then -1. Never set with ``timed_out``.
     stopped: bool = False
+    # As in :class:`autoforge.executor.ExecutionResult`.
+    sandbox: SandboxFacts | None = None
 
     @property
     def leftovers(self) -> str:
@@ -249,6 +266,7 @@ class DuplexResult:
             orphans_killed=self.orphans_killed,
             orphan_survived_kill=self.orphan_survived_kill,
             orphans_unchecked=self.orphans_unchecked,
+            sandbox_teardown=self.sandbox is not None and self.sandbox.enforced,
         )
 
 
@@ -439,17 +457,40 @@ def start_duplex(req: DuplexRequest) -> DuplexChild:
     that cannot be spawned, or whose readers cannot be set up, raises
     :class:`ExecutionError`; anything else that fails or interrupts the
     launch after the spawn is raised as itself. Either way the group is
-    killed first.
+    killed first. A sandbox that cannot be established is a
+    :class:`~autoforge.errors.SandboxLaunchRefusedError`, before anything is
+    spawned or taken.
     """
     _validate(req)
+    launch = None
+    if req.sandbox is not None:
+        launch = _prepare_sandbox(
+            req.sandbox,
+            req.command,
+            cwd=req.cwd,
+            env_allowlist=req.env_allowlist,
+            env=req.env,
+        )
+    try:
+        return _start(req, launch)
+    except BaseException:
+        if launch is not None:
+            launch.close()
+        raise
+
+
+def _start(req: DuplexRequest, launch: BwrapLaunch | None) -> DuplexChild:
+    """:func:`start_duplex` once the launch is prepared; the handle owns it
+    from its return, and the caller closes it on a failure."""
     started = _now()
-    contained = _Containment.begin() if req.contain_orphans else None
+    contained = _Containment.begin(adopts_group=launch is not None) if req.contain_orphans else None
     try:
         proc = _spawn(
             req.command,
             cwd=req.cwd,
-            env=_child_environment(req.env_allowlist, req.env),
+            env={} if launch is not None else _child_environment(req.env_allowlist, req.env),
             stdin=subprocess.PIPE if req.stdin_pipe else subprocess.DEVNULL,
+            launch=launch,
         )
     except BaseException:
         if contained is not None:
@@ -467,7 +508,7 @@ def start_duplex(req: DuplexRequest) -> DuplexChild:
     child: DuplexChild | None = None
     try:
         try:
-            child = DuplexChild(req, proc, started, contained)
+            child = DuplexChild(req, proc, started, contained, launch)
             child._start()
         except (OSError, RuntimeError) as exc:
             raise ExecutionError(f"failed to start {' '.join(req.command)}: {exc}") from exc
@@ -518,9 +559,11 @@ class DuplexChild:
         proc: subprocess.Popen[bytes],
         started: str,
         contained: _Containment | None = None,
+        launch: BwrapLaunch | None = None,
     ) -> None:
         self._req = req
         self._contained = contained
+        self._launch = launch
         self._proc = proc
         self._started = started
         ceiling = req.max_runtime_seconds
@@ -756,7 +799,10 @@ class DuplexChild:
         result is ``timed_out``. Once the child has exited on its own, ADR
         0002's exit grace applies exactly as in ``execute()``. After an
         :class:`Overflow` a child still running is killed at once. A second
-        call returns the same result.
+        call returns the same result. A sandboxed child whose backend
+        reports that the sandbox was never set up raises
+        :class:`~autoforge.errors.SandboxLaunchRefusedError` here, after the
+        teardown, as ``execute()`` does.
         """
         if self._result is not None:
             return self._result
@@ -770,6 +816,13 @@ class DuplexChild:
         err = self._stderr.captured()
         out = self._capture.captured() if self._capture is not None else None
         assert self._left is not None
+        facts = None
+        if self._launch is not None:
+            facts = self._launch.outcome(
+                returncode=self._proc.returncode,
+                ended_by_executor=self._timed_out or self._stopped or self._child_killed,
+                stderr=err.text,
+            )
         self._result = DuplexResult(
             command=list(self._req.command),
             cwd=self._req.cwd,
@@ -791,6 +844,7 @@ class DuplexChild:
             timeout_limit=self._timeout_limit,
             last_activity_at=self._limits.last_activity_at(),
             stopped=self._stopped,
+            sandbox=facts,
         )
         return self._result
 
@@ -853,12 +907,20 @@ class DuplexChild:
                 finally:
                     if self._contained is not None:
                         self._contained.release()
+                    if self._launch is not None:
+                        self._launch.collect()
+                        self._launch.close()
                 raise
             if self._closed:
                 return
             self._closed = True
             if self._contained is not None:
                 self._contained.release()
+            if self._launch is not None:
+                # The backend has been reaped or killed: what it recorded is
+                # in the status pipe, read now for :meth:`finish`.
+                self._launch.collect()
+                self._launch.close()
             for reader in self._readers:
                 reader.close()
             assert self._proc.stdout is not None and self._proc.stderr is not None
@@ -891,7 +953,9 @@ class DuplexChild:
                 # killed and the child's own status kept.
                 grace = time.monotonic() + executor._EXIT_GRACE_SECONDS
                 contained = self._contained
-                group_settled = _eof(self._readers, grace) and _group_gone(self._pgid, grace)
+                group_settled = _eof(self._readers, grace) and _group_gone(
+                    self._pgid, grace, contained
+                )
                 if group_settled and (contained is None or contained.settled(grace)):
                     self._left = _Termination(group_survived=False, capture_abandoned=False)
                 else:

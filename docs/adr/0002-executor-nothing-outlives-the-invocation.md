@@ -1,10 +1,11 @@
 # ADR 0002. Executor: nothing an agent starts outlives its invocation
 
-- **Status:** accepted, implemented for #85; amended by #132 (§4b), #193 (§4c) and
-  #194 (§4d)
+- **Status:** accepted, implemented for #85; amended by #132 (§4b), #193 (§4c),
+  #194 (§4d) and #167 (§4e)
 - **Decides:** #85 (follow-up of PR #84's review and #53)
 - **Where:** `src/autoforge/executor.py` (`execute()`, `_terminate_group()`,
   `_Containment`), `src/autoforge/executor_duplex.py`,
+  `src/autoforge/sandbox_bwrap.py` (§4e),
   `docs/agent-guides/architecture.md` (executor section), the common prompt
   templates
 
@@ -368,6 +369,82 @@ after the child's own exit a no-op. `tests/test_providers.py`,
 `tests/test_pi_rpc.py` and `tests/test_loop_detect.py` carry a loop kill
 through the Claude stream, a text profile's output lines, a fake Pi and the
 engine.
+
+## 4e. Amendment: sandboxed launches (#167, 2026-10-12)
+
+The decision above is unchanged for the outer process group, and so is
+every bound. ADR 0005 adds an optional outer sandbox to both requests
+(`ExecutionRequest.sandbox`, `DuplexRequest.sandbox`): the Linux backend,
+`bwrap`, is spawned in the command's place, and it runs the command in
+user, mount, PID and IPC namespaces of its own. A request without one is
+unchanged. For one with a sandbox, this amendment records what changes
+(ADR 0005 D10.1 to D10.8).
+
+- **The outer process is the child.** `bwrap` is spawned exactly as any
+  command is: `start_new_session`, the same pipes, limits, stop and
+  containment, and `_terminate_group` for the group. `--new-session` is
+  never passed, so the command stays in the group the executor signals.
+  There is no new process owner (D10.2).
+- **Teardown inside is the kernel's, and it has no grace (D10.3, D10.5).**
+  When the command exits, the kernel SIGKILLs everything left in its PID
+  namespace at once, a `setsid` daemon included; `bwrap` returns the
+  command's status afterwards. On a timeout or a stop, the group's SIGTERM
+  reaches the outer `bwrap` too, which exits on it, and the namespace goes
+  the same way. Inner processes therefore get neither the exit grace nor a
+  kill grace; the outer group still gets both. The duplex handle still
+  closes stdin and waits for the command to exit before any signal (§4a),
+  so a command that shuts down on end of input still does so cleanly.
+- **Inner leftovers are not counted (D10.4).** There is no moment at which
+  the controller could count them: by the time `bwrap` returns, the kernel
+  has removed them. Every enforced launch's result carries
+  `SandboxFacts.teardown` ("removed by namespace teardown, uncounted"),
+  and `describe_leftovers` says so (`sandbox_teardown`). It never reports
+  them as none. `descendants_killed`, `group_survived_kill`,
+  `capture_abandoned` and the orphan facts keep their meaning for the
+  outer group and the controller's own children.
+- **Containment adopts the backend's dead.** With `contain_orphans`, the
+  controller is a subreaper, so when the outer `bwrap` is killed, its
+  process inside the namespace is re-parented to the controller and dies at
+  once, a zombie still in the group. For a sandboxed launch only
+  (`_Containment.adopts_group`), the group check reaps it while it polls.
+  Otherwise it would wait out a grace for a member that is already dead.
+  Unsandboxed invocations are unchanged. One contained invocation per
+  controller process still holds. Orphans inside the namespace never reach
+  the subreaper: the namespace's own init reaps them.
+- **Controller death kills the sandbox (D10.6).** `--die-with-parent` is
+  `PR_SET_PDEATHSIG`, which fires when the *thread* that spawned `bwrap`
+  exits. A sandboxed launch is therefore spawned only from a thread that
+  outlives it: the thread that calls `execute()` and waits, or that calls
+  `start_duplex()` and holds the handle until `finish()`. This is new: an
+  unsandboxed agent outlives a controller killed with SIGKILL.
+- **A setup failure is a launch refusal (D10.8).** A `bwrap` that exited by
+  itself with no `exit-code` record on its `--json-status-fd` never ran
+  the command. Examples: a bind source gone, an executable the sandbox
+  cannot run, a namespace refused. It is
+  `SandboxLaunchRefusedError` (an `ExecutionError`), raised after the
+  teardown, so nothing is left. Its reason is `bwrap`'s message, bounded
+  and redacted. A `bwrap` ended by a signal the executor did not send is
+  the command's abnormal end, as for any command.
+
+**The bound.** Unchanged: the deadline plus the exit grace plus two kill
+graces. In practice a sandboxed timeout or stop ends within one poll of
+the SIGTERM, since nothing inside can ignore it for long.
+
+Tests for §4e: `tests/test_sandbox_bwrap.py` checks the following on the
+real backend:
+
+- a `setsid` daemon and a background child that ignores SIGTERM are gone
+  after a normal exit, a timeout and a stop, with and without
+  containment, well within one kill grace;
+- a command that kills its own process group is an abnormal end;
+- the duplex round trip, shutdown and deadline work through the backend;
+- a duplex started from a thread that then exits dies with it.
+
+`tests/test_sandbox.py` checks the wiring on a fake `bwrap`: a setup
+failure is a refusal while exit 1 is not, the facts are recorded, and a
+refusal releases the containment and every descriptor.
+`tests/test_runlog.py` checks that the facts reach `execution.json` and
+`events.jsonl`, redacted.
 
 ## 5. Tests
 
