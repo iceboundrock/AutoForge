@@ -108,7 +108,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import NoReturn, overload
+from typing import NoReturn
 
 from . import __prompt_version__
 from .child_env import describe_overrides, isolated_overrides, override_names, preflight
@@ -2767,13 +2767,35 @@ class ControllerEngine:
                         ),
                     )
                 self._local_resumed_invocation = True
+
+        def anchored_relaunch() -> StepOutcome | None:
+            # :meth:`_invoke_phase` calls this before every relaunch (in LOCAL
+            # mode, a correction) and before charging it (#209): an anchor the
+            # launch before it moved blocks here, so no second write-capable
+            # agent starts in the moved checkout, and the refused relaunch is
+            # not charged to the durable bound.
+            drift = self._git_anchor_drift()
+            if not drift:
+                return None
+            return self._block(
+                previous,
+                plan,
+                self._local_anchor_block_reason(
+                    f"{drift}, found before a relaunch: attempt {state.attempt} ended without "
+                    "a usable result (its run log says why), and no agent was launched again"
+                ),
+            )
+
         self._local_bound_snapshot = before
         self._save()
         try:
-            payload = self._invoke_phase(previous)
+            invoked = self._invoke_phase(previous, anchored_relaunch)
         finally:
             self._local_bound_snapshot = None
             self._local_resumed_invocation = False
+        if isinstance(invoked, StepOutcome):
+            return invoked
+        payload = invoked
 
         status = payload.get("status")
         if status in ("failure", "blocked"):
@@ -7847,31 +7869,29 @@ class ControllerEngine:
             return self._replan_log_metadata()
         return {}
 
-    @overload
-    def _invoke_phase(self, phase: Phase) -> dict: ...
-
-    @overload
     def _invoke_phase(
-        self, phase: Phase, reconcile: Callable[[], StepOutcome | None]
-    ) -> dict | StepOutcome: ...
-
-    def _invoke_phase(
-        self, phase: Phase, reconcile: Callable[[], StepOutcome | None] | None = None
+        self, phase: Phase, before_relaunch: Callable[[], StepOutcome | None]
     ) -> dict | StepOutcome:
         """Launch the phase's agent, correcting a malformed result within bound.
 
-        ``reconcile`` is the phase-entry reconciliation (:meth:`_remote_entry`)
-        and is called before every relaunch, a correction or the retry of a
-        failure the adapter recognised as transient (#164): the launch before
-        it may already have done the phase's GitHub work, and the relaunch
-        must see it exactly as ``resume`` would. An outcome from
-        reconciliation resolves the phase without relaunching and is
+        ``before_relaunch`` is called before every relaunch, a correction or
+        the retry of a failure the adapter recognised as transient (#164),
+        and before anything of the relaunch is charged or saved. In REMOTE
+        mode it is the checkout check and then the phase-entry reconciliation
+        (:meth:`_invoke_phase_anchored` over :meth:`_remote_entry`): the
+        launch before it may already have done the phase's GitHub work, and
+        the relaunch must see it exactly as ``resume`` would. In LOCAL mode
+        it is the git-anchor check (:meth:`_local_step_once`, #209). An
+        outcome from it resolves the phase without relaunching and is
         returned in place of a payload; an exception from it (the checkout
         drift :meth:`_invoke_phase_anchored` checks there) propagates
-        without relaunching. A LOCAL run passes none and never
-        retries a transient failure: its write phases are judged against the
-        durable launch checkpoint and its review verification refuses a tree
-        the reviewer changed.
+        without relaunching. A LOCAL run never retries a transient failure:
+        its write phases are judged against the durable launch checkpoint
+        and its review verification refuses a tree the reviewer changed.
+        Neither mode relaunches, for a correction or a transient failure, a
+        launch that may have left a process running
+        (:attr:`AgentExecutionResult.may_have_survivor`): the relaunch would
+        race it in the same working directory.
         """
         state = self._require_state()
         profile = profile_for_phase(self.config, phase, state.review_round)
@@ -7904,11 +7924,11 @@ class ControllerEngine:
         corrections_used = 0
         transient_retries = 0
         while True:
-            if attempt and reconcile is not None:
+            if attempt:
                 # Every launch after the first is a relaunch, and the launch
                 # before it, malformed or failed, may already have done the
-                # phase's GitHub work.
-                resolved = reconcile()
+                # phase's GitHub work or moved the checkout.
+                resolved = before_relaunch()
                 if resolved is not None:
                     return resolved
             # Which UPDATE_EPIC result this launch asks for (ADR 0004 D4.7):
@@ -8073,7 +8093,7 @@ class ControllerEngine:
                     # transient; whether and how often to relaunch is decided
                     # here. Never while a process the failed launch started
                     # may still be running: the relaunch would race it.
-                    if reconcile is None:
+                    if state.mode == WorkflowMode.LOCAL:
                         held = "LOCAL mode never relaunches it"
                     elif result.may_have_survivor:
                         held = "a process the launch started may still be running"
@@ -8160,6 +8180,22 @@ class ControllerEngine:
                     )
                 record.error = f"{type(exc).__name__}: {detail}"
                 self._record_invocation(logger, record, prompt, stdout, stderr, phase, step_log)
+                failed = (
+                    f"agent '{profile.name}' did not return a valid CONTROL_RESULT after "
+                    f"{attempt} attempt(s): {detail}"
+                )
+                if result.may_have_survivor:
+                    # The rule a transient failure follows (#209): a correction
+                    # launched beside a process the launch started that may
+                    # still be running would race it in the same working
+                    # directory. The error names that process, so the
+                    # operator sees it before 'resume'.
+                    raise ControlResultValidationError(
+                        f"{failed}. Not re-invoked: "
+                        + _with_leftovers(
+                            "a process the launch started may still be running", result.leftovers
+                        )
+                    ) from exc
                 if corrections_used < max_corrections:
                     # A correction re-launches the same write-capable agent;
                     # the top of the loop charges it against the same durable
@@ -8167,10 +8203,7 @@ class ControllerEngine:
                     correction_error = f"{type(exc).__name__}: {detail}"
                     corrections_used += 1
                     continue
-                raise ControlResultValidationError(
-                    f"agent '{profile.name}' did not return a valid CONTROL_RESULT after "
-                    f"{attempt} attempt(s): {detail}"
-                ) from exc
+                raise ControlResultValidationError(failed) from exc
             record.parsed_result = payload
             self._record_invocation(logger, record, prompt, stdout, stderr, phase, step_log)
             return payload

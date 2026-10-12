@@ -11,6 +11,7 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -34,6 +35,7 @@ from autoforge.local_workspace import (
     read_feature_spec,
     resolve_feature_spec,
 )
+from autoforge.providers import AgentExecutionResult
 from autoforge.safefs import UnsafePathError
 from autoforge.state import AutoForgeState, StatePaths, load_state, save_state
 from autoforge.transitions import Phase, WorkflowMode, decide_next_phase
@@ -2265,6 +2267,69 @@ def test_a_review_that_fails_verification_leaves_no_pending_checkpoint(tmp_path)
     assert eng.state.local_pending_phase == ""
 
 
+def _leaving(provider, **facts) -> None:
+    """Every launch of ``provider`` reports ``facts`` about what it left behind."""
+    execute = provider.execute
+    provider.execute = lambda req: replace(execute(req), **facts)
+
+
+@pytest.mark.parametrize(
+    "survivor", ["group_survived_kill", "capture_abandoned", "orphan_survived_kill"]
+)
+def test_a_malformed_result_is_not_corrected_while_a_process_its_launch_started_may_run(
+    tmp_path, survivor
+):
+    """#209: a correction would be a second write-capable agent in the tree a
+    process of the first one may still be writing to. It is not launched, so
+    not charged, and the error names that process before 'resume'."""
+    root = local_repo(tmp_path)
+    cfg = default_config()
+    cfg.execution.max_correction_attempts = 5
+    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
+    _run_to(eng, root, Phase.ANALYZE_EXECUTE)
+    eng.provider._handler = lambda req: "no control block\n"
+    _leaving(eng.provider, **{survivor: True})
+    with pytest.raises(ControlResultValidationError) as excinfo:
+        eng.step()
+    assert len(eng.provider.calls) == 1
+    message = str(excinfo.value)
+    assert "did not return a valid CONTROL_RESULT after 1 attempt(s)" in message
+    leftovers = AgentExecutionResult(
+        command=["x"],
+        exit_code=0,
+        stdout="",
+        stderr="",
+        started_at="t",
+        finished_at="t",
+        **{survivor: True},
+    ).leftovers
+    assert leftovers and message.endswith(
+        f". Not re-invoked: a process the launch started may still be running ({leftovers})"
+    )
+    persisted = load_state(eng.paths.state_file)
+    assert persisted.phase is Phase.ANALYZE_EXECUTE
+    assert persisted.local_pending_phase == "ANALYZE_EXECUTE"
+    assert persisted.local_pending_attempts == 1
+
+
+def test_an_unchecked_platform_does_not_stop_a_local_correction(tmp_path):
+    """``orphans_unchecked`` alone says nothing about a survivor (#209)."""
+    root = local_repo(tmp_path)
+    eng = make_local_engine(root, "features/add-filter.md")
+    _run_to(eng, root, Phase.ANALYZE_EXECUTE)
+    eng.provider._handler = scripted(
+        eng,
+        root,
+        [
+            (None, lambda e: "no control block\n"),
+            (lambda r: touch_impl(r, "v1\n"), lambda e: impl_result()),
+        ],
+    )
+    _leaving(eng.provider, orphans_unchecked=True)
+    assert eng.step().next_phase == "REVIEW"
+    assert [req.correction for req in eng.provider.calls] == [False, True]
+
+
 # -- the git anchor ---------------------------------------------------------------
 def test_an_agent_that_commits_blocks_the_run(tmp_path):
     """A LOCAL run is pinned to the HEAD and branch it started from.
@@ -2328,6 +2393,68 @@ def test_a_head_move_before_the_agent_runs_blocks_without_invoking_it(tmp_path):
     assert outcome.next_phase == "BLOCKED"
     assert invoked["n"] == 0, "the agent must not run against a moved anchor"
     assert "HEAD moved" in eng.state.block_reason
+
+
+@pytest.mark.parametrize("phase", [Phase.ANALYZE_EXECUTE, Phase.FIX])
+def test_an_anchor_a_launch_moved_blocks_before_its_correction(tmp_path, phase):
+    """#209: the anchor is read before every relaunch, not only around the step.
+
+    A launch that commits and then returns no valid CONTROL_RESULT is not
+    corrected: the correction would be a second write-capable agent in the
+    moved checkout. The step blocks naming the drift, and the relaunch it
+    refused is not charged to the durable bound, because it never started.
+    """
+    root = local_repo(tmp_path)
+    cfg = default_config()
+    cfg.execution.max_correction_attempts = 5
+    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
+    _run_to(eng, root, phase)
+
+    launches: list[int] = []
+
+    def commits_then_malformed(req):
+        launches.append(load_state(eng.paths.state_file).local_pending_attempts)
+        touch_impl(root, "v2\n")
+        commit_all(root, "the agent committed")
+        return "I committed my work but forgot the control block.\n"
+
+    eng.provider._handler = commits_then_malformed
+    assert eng.step().next_phase == "BLOCKED"
+    assert launches == [1], "the correction never started"
+    reason = eng.state.block_reason
+    assert "git anchor moved during the run: HEAD moved from" in reason
+    assert "found before a relaunch: attempt 1 ended without a usable result" in reason
+    assert "no agent was launched again" in reason and "Nothing was rolled back" in reason
+    persisted = load_state(eng.paths.state_file)
+    assert persisted.phase is Phase.BLOCKED and persisted.attempt == 1
+    assert persisted.local_pending_phase == phase.value
+    assert persisted.local_pending_attempts == 1, "the refused relaunch is not charged"
+
+
+def test_a_reviewer_that_switches_branches_is_not_corrected(tmp_path):
+    """The read-only REVIEW gets the same check before its correction (#209)."""
+    root = local_repo(tmp_path)
+    eng = make_local_engine(root, "features/add-filter.md")
+
+    def switch(r):
+        subprocess.run(["git", "-C", str(r), "checkout", "-q", "-b", "sidetrack"], check=True)
+
+    eng.provider._handler = scripted(
+        eng,
+        root,
+        [
+            (lambda r: touch_impl(r, "v1\n"), lambda e: impl_result()),
+            (switch, lambda e: "no control block\n"),
+            (None, lambda e: review_result(e.state.workspace_fingerprint)),
+        ],
+    )
+    eng.step()  # INITIALIZING -> ANALYZE_EXECUTE
+    eng.step()  # ANALYZE_EXECUTE -> REVIEW
+    assert eng.step().next_phase == "BLOCKED"
+    assert [req.phase for req in eng.provider.calls] == ["ANALYZE_EXECUTE", "REVIEW"]
+    assert "checked-out branch changed" in eng.state.block_reason
+    assert "found before a relaunch" in eng.state.block_reason
+    assert load_state(eng.paths.state_file).local_pending_phase == ""
 
 
 def test_the_git_anchor_is_reported_but_kept_out_of_the_fingerprint(tmp_path):

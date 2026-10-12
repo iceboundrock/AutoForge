@@ -440,7 +440,10 @@ ownership or discard uncommitted user changes.
   [Workflow: re-entering a phase](agent-guides/workflow.md#re-entering-a-phase).
 - **An agent failed, timed out or returned a malformed result:** a malformed
   `CONTROL_RESULT` from an agent that exited 0 is retried with a correction
-  prompt (`execution.max_correction_attempts`, default once). The one failed
+  prompt (`execution.max_correction_attempts`, default once), unless that
+  launch may have left a process running: then the error says so
+  (`Not re-invoked: a process the launch started may still be running`,
+  followed by which one); stop it before `resume`. The one failed
   exit relaunched automatically is a launch its adapter reports as transient
   (today an OpenCode `openai/*` run whose only error is `WebSocket closed
   with code 1000`): a REMOTE run relaunches it at most twice per step, after
