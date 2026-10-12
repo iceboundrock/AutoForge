@@ -75,7 +75,12 @@ read it before adding tests for a listed area.
   a helper holding its stdout after it exits, silent or writing lines on an
   interval; the real
   `ClaudeCodeProvider` launches it, so the stream path is tested end to end
-  without a real agent.
+  without a real agent. `fake_claude_bash_tool` there is a fake `claude`
+  whose Bash tool runs one command the way 2.1.296 does: settings `env` by
+  `--setting-sources`, its choice of shell, the shell snapshot of
+  `~/.bashrc` or `~/.zshrc` (or a login shell without one),
+  `CLAUDE_ENV_FILE` and `CLAUDE_CODE_SHELL_PREFIX`, with the real bash and
+  zsh.
 - `tests/pi_fake.py` holds the engine-level Pi harness: `PiFake` (a fake
   `pi` executable outside the repository that logs every start, argv, cwd,
   environment name and RPC record) and `ScriptedPi` (the real
@@ -84,8 +89,10 @@ read it before adding tests for a listed area.
   route profiles to it.
 - Every launch gets no GitHub credential (#165). Autouse fixtures point
   the preflight's home (its `~/.netrc` and the `HOME` its login-shell probe
-  runs with) and OpenCode's data directory (where the organization check
-  looks) at empty directories, so a test never reads the operator's. The
+  runs with), OpenCode's data directory (where the organization check
+  looks) and Claude Code's settings and global configuration (where its
+  configuration check looks) at empty directories, so a test never reads
+  the operator's. The
   probe runs the real `sh`, `bash` and `zsh`: a fake runner hands a request
   `is_shell_probe(req)` recognises to the real `execute`, as a fake runner
   does for nothing else, and a launch without a fake runner reuses the

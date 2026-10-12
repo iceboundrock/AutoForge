@@ -959,8 +959,9 @@ never the boundary.
     absolute, executable `sh`, `bash`, `zsh`, `dash`, `ksh` or `mksh`, else
     the `bash` on `PATH`, else `/bin/sh`. The agent CLIs start their shell
     tool from it: OpenCode 2.0.26 as `$SHELL -c` (a fish or nu `SHELL` it
-    replaces with `bash`), Claude Code 2.1.296 with `SHELL` when it names
-    bash or zsh. A fish or csh-family shell reads its configuration on
+    replaces with `bash`); Claude Code 2.1.296 starts the bash or zsh its
+    adapter names in `CLAUDE_CODE_SHELL` (below). A fish or csh-family
+    shell reads its configuration on
     every start, and no variable redirects it, so a launch never gets one
     through `SHELL`.
 - **A preflight before every launch** (`child_env.preflight`): one
@@ -1018,15 +1019,56 @@ never the boundary.
   its own, so none runs in a launch; each mechanism was decided from the
   installed CLI's `--help` or build and checked against it
   (`providers.py` records how):
-  - Claude Code runs with `--safe-mode` and `--strict-mcp-config`: no
-    hook, installed plugin or MCP server of the user's or the project's
-    settings, `.mcp.json`, `--settings`, `--plugin-dir` or `--mcp-config`
-    runs, `CLAUDE_CODE_SAFE_MODE=0` notwithstanding. A profile's
-    `extra_args` cannot carry a flag that would bring one back
-    (`--mcp-config`, `--plugin-dir`, `--plugin-url`, `--settings`,
+  - Claude Code runs with `--safe-mode`, `--strict-mcp-config` and
+    `--setting-sources=user`: no hook, installed plugin or MCP server of
+    the user's or the project's settings, `.mcp.json`, `--settings`,
+    `--plugin-dir` or `--mcp-config` runs, `CLAUDE_CODE_SAFE_MODE=0`
+    notwithstanding, and the project's and the local settings of the
+    worktree (`.claude/settings.json`, `.claude/settings.local.json`),
+    which the repository controls, are not read. A profile's `extra_args`
+    cannot carry a flag that would bring one back (`--mcp-config`,
+    `--plugin-dir`, `--plugin-url`, `--settings`, `--setting-sources`,
     `--agents`, `--chrome`, `--ide`): config load refuses it, naming the
     flag and never its value. `doctor` fails a `claude` whose `--help`
-    lacks either flag, since it would refuse every launch's argv.
+    lacks one of the three, since it would refuse every launch's argv.
+  - Claude Code's Bash tool runs no function or alias of a shell startup
+    file. 2.1.296 runs `<shell> -c -l` once per session, sources
+    `~/.zshrc` or `~/.bashrc` through `HOME` (whatever `ZDOTDIR` says) and
+    writes the functions, aliases and options it then has to a snapshot,
+    which every command sources first; without one (writing it failed) the
+    command runs in a login shell, which reads `~/.bash_profile`. A `gh`
+    function or alias there that passes a token would reach the agent's
+    ordinary `gh`, and no flag or variable turns the snapshot off. What
+    2.1.296 runs next in the same shell, before the command and in both
+    cases, is the text of the file `CLAUDE_ENV_FILE` names, so every launch
+    names a file of its own (mode 0600, removed when the launch ends)
+    holding `providers.CLAUDE_SHELL_CLEANER`. It removes every function and
+    alias, in bash through POSIX mode (an assignment to `POSIXLY_CORRECT`,
+    which no function shadows, puts the special builtin `unset` ahead of
+    any function, `builtin` included) and in zsh with `unfunction -m '*'`
+    and `unalias -a` / `-as`, then checks that none is left (bash's
+    `declare -F` and `alias`, zsh's `$functions` and alias tables) and
+    otherwise ends the shell, so the command does not run. The launch also
+    sets `CLAUDE_CODE_SHELL` to a bash or a zsh (its `SHELL` when it is
+    one, else the one on `PATH`) and `CLAUDE_CODE_SHELL_PREFIX` to empty,
+    over whatever the operator's shell passed through `CLAUDE_*`: either
+    could name a program of the operator's to run every command in or
+    through.
+  - 2.1.296 also sets the `env` of the user's settings (`settings.json` in
+    `CLAUDE_CONFIG_DIR`, else `~/.claude`) and of its global configuration
+    (`.config.json` there when it exists, else `.claude.json` in
+    `CLAUDE_CONFIG_DIR`, else in the home) over the environment it starts
+    with, `--safe-mode` notwithstanding: a `GH_TOKEN` there would replace
+    the placeholder, a `CLAUDE_ENV_FILE` the cleaner. So the launch is
+    refused, before anything is charged
+    (`ClaudeCodeProvider.integration_preflight`, also run by `doctor`),
+    while either sets a variable that would undo the launch's isolation
+    (`child_env.undoes_isolation`: a forbidden name, one the controller
+    sets, `HOME`, a `BASH_FUNC_*` function, or one of the adapter's own),
+    or while either exists and cannot be read. The refusal names the file
+    and the variables, never a value; the way out is to remove the entry (a
+    variable Claude Code itself needs can be set in the environment
+    AutoForge is started from instead).
   - OpenCode 2.0.26 has no such flag, so every launch sets
     `OPENCODE_CONFIG_DIR` to an empty directory of its own (removed when
     the launch ends), `OPENCODE_CONFIG_PROJECT_DISABLE` and
@@ -1076,7 +1118,9 @@ named otherwise), or why it has none.
 | curl's configuration (`~/.curlrc`, `$XDG_CONFIG_HOME/curlrc` or `.curlrc`, `$CURL_HOME/.curlrc`), read by every plain `curl` | `CURL_HOME` names an empty `.curlrc` of the launch's, found first; `CURL_HOME` refused at load | the real `curl` against a loopback server, header sent for the controller and not from a launch: `test_a_launchs_plain_curl_sends_no_header_of_the_operators_configuration`; fake `curl`: `test_an_agent_finds_no_credential_route_the_controller_finds_every_one` |
 | wget's configuration (`~/.wgetrc`, `~/.config/wget/wget2rc`), read by every plain `wget` | `WGETRC` and `WGET2RC` name an empty file of the launch's; both refused at load | the real `wget` (1.x or wget2) the same way: `test_a_launchs_plain_wget_sends_no_header_of_the_operators_configuration`; fake `wget` |
 | `~/.git-credentials`, `$XDG_CONFIG_HOME/git/credentials` | read only by the `store` helper, which is reset | covered by the helper tests; a deliberate read is an absolute-path read (not guaranteed) |
-| Claude Code hooks, installed plugins and MCP servers (user, project, `.mcp.json`, plugin) | `--safe-mode` and `--strict-mcp-config`; integration flags refused in `extra_args`; `doctor` requires both flags | `test_providers.py::test_claude_argv_shape`, `test_claude_refuses_extra_args_that_load_an_integration`, `test_config.py::test_a_claude_profile_whose_extra_args_load_an_integration_is_refused`, `test_doctor.py::test_doctor_fails_a_claude_without_the_isolation_flags`. A test cannot run a real Claude Code; the flags were checked against 2.1.296 with marker hooks and MCP servers (`providers.py`) |
+| Claude Code hooks, installed plugins and MCP servers (user, project, `.mcp.json`, plugin) | `--safe-mode` and `--strict-mcp-config` (with `--setting-sources=user`, below); integration flags refused in `extra_args`; `doctor` requires all three flags | `test_providers.py::test_claude_argv_shape`, `test_claude_refuses_extra_args_that_load_an_integration`, `test_config.py::test_a_claude_profile_whose_extra_args_load_an_integration_is_refused`, `test_doctor.py::test_doctor_fails_a_claude_without_the_isolation_flags`. A test cannot run a real Claude Code; the flags were checked against 2.1.296 with marker hooks and MCP servers (`providers.py`) |
+| Claude Code's Bash tool: the functions and aliases of `~/.bashrc` or `~/.zshrc` (its shell snapshot) and of the login files of a login shell (without one) | `CLAUDE_ENV_FILE` names the launch's cleaner, run before every command, which removes every function and alias or refuses to run the command; `CLAUDE_CODE_SHELL` a bash or zsh; `CLAUDE_CODE_SHELL_PREFIX` empty | a fake `claude` that writes its snapshot and runs a command as 2.1.296 does, with the real bash and zsh, behind the real adapter and executor; the same launch without the adapter's isolation hands `gh` the wrapper's token: `test_providers.py::test_claudes_bash_tool_runs_no_function_or_alias_of_a_startup_file` (function and alias, snapshot and login shell), `test_claudes_bash_tool_cleaner_works_on_the_one_shot_path`, `test_a_startup_file_that_shadows_the_cleaner_runs_no_command`, `test_claudes_bash_tool_runs_in_no_program_of_the_operators`, `test_the_claude_shell_environment_file_lives_as_long_as_the_launch`. A test cannot run a real Claude Code; the real 2.1.296 was seen, against a loopback API, handing a fake `gh` the token of a `gh` function or alias in `~/.bashrc`, `~/.zshrc` and, without a snapshot, `~/.bash_profile`, and none under the adapter (`providers.py`) |
+| Claude Code settings `env`, set over the launch's environment: the user's settings and the global configuration, and the project's and the local settings of the worktree | `--setting-sources=user`; the launch refused while the user's settings or the global configuration set a variable that would undo its isolation, or cannot be read | `test_providers.py::test_the_repositorys_claude_settings_cannot_undo_the_cleaner`, `test_claude_configuration_that_sets_a_variable_over_the_launch_refuses_it`, `test_claude_configuration_without_such_a_variable_launches`, `test_claude_configuration_that_cannot_be_checked_refuses_the_launch`, `test_the_claude_configuration_files_are_the_launchs`; `test_child_env.py::test_a_variable_set_over_a_launch_that_would_undo_its_isolation`; `test_doctor.py::test_doctor_fails_a_claude_whose_settings_set_a_variable_over_the_launch`. The real 2.1.296 was seen taking `GH_TOKEN` and `CLAUDE_ENV_FILE` from each of these files under `--safe-mode`, and neither from the project's or the local settings with `--setting-sources=user` |
 | OpenCode MCP servers and plugins (global, project and above, `OPENCODE_CONFIG`, `OPENCODE_CONFIG_CONTENT`) | `opencode_isolation_env`: an empty global configuration directory, no project configuration, no explicit or inline document | a fake `opencode` that resolves its configuration as 2.0.26 does, behind the real executor: `test_providers.py::test_an_opencode_launch_loads_no_mcp_server_or_plugin_of_any_configuration`. A test cannot run a real OpenCode; the variables were checked against 2.0.26's resolved configuration (`providers.py`) |
 | OpenCode organization configuration (`.well-known/opencode`: fetched, or cached in OpenCode's database, ahead of every file) | the launch refused while the database it would open lists an organization, `auth.json` has a `"wellknown"` entry, or either cannot be read | the fake `opencode` loads the cached organization configuration from a 2.0.26-shaped database: `test_providers.py::test_an_opencode_launch_is_refused_while_an_organization_is_connected` (cached, not yet cached, legacy `auth.json`, `OPENCODE_DB`), `test_an_opencode_launch_with_no_organization_proceeds`, `test_opencode_data_that_cannot_be_read_refuses_the_launch`; before anything is charged: `test_engine.py::test_an_integration_the_provider_cannot_keep_off_refuses_the_launch_and_leaves_state`; `test_doctor.py::test_doctor_fails_an_opencode_connected_to_an_organization`. The real 2.0.26 was seen starting a cached organization's MCP server under `opencode_isolation_env` and none with `OPENCODE_DB=:memory:` or a database of its own (`providers.py`) |
 | Pi extensions, skills, prompt templates, themes, context files | #132's flags (`--no-extensions` and the rest) | `test_pi_rpc.py`, unchanged |
@@ -1173,9 +1217,9 @@ humans acting concurrently on GitHub. GitHub is the source of truth.
 - **Integrity of the shared object store** (D7.5, #171).
 
 **Residuals of the provider integrations.** Claude Code still applies
-managed settings an administrator installed (`--safe-mode` leaves policy
-settings in force); the operator cannot change them either, and they are
-not detected. OpenCode's organization configuration is not a residual: a
+managed settings an administrator installed (`--safe-mode` and
+`--setting-sources` leave policy settings in force, their `env` included);
+the operator cannot change them either, and they are not detected. OpenCode's organization configuration is not a residual: a
 launch that would load it is refused (above).
 
 **Residuals of shell startup.** `HOME` is passed, so a shell that reads its
@@ -1183,13 +1227,11 @@ configuration from `HOME` still does when something starts it that way:
 an interactive `bash` reads `~/.bashrc`, and a `fish` or csh-family shell
 started by name reads its configuration; neither is the `SHELL` of a
 launch, and an agent that starts one deliberately could as well read the
-file. Claude Code 2.1.296 runs `<shell> -c -l` once per session to snapshot
-the functions, aliases and options its Bash tool runs with, sourcing
-`~/.zshrc` or `~/.bashrc` itself; the snapshot keeps `PATH`, functions
-and aliases but not exported variables, so a function defined there that
-hands `gh` a token would still reach the Bash tool, and the login shell it
-starts is one the probe checked. A startup file that changes a variable only under a condition the
-probe does not meet (a terminal, a time of day) is not detected.
+file. Claude Code sourcing `~/.zshrc` or `~/.bashrc` itself for its Bash
+tool is not one: no function or alias of them, or of a login shell's
+files, is left when a command runs (above). A startup file that changes a
+variable only under a condition the probe does not meet (a terminal, a
+time of day) is not detected.
 
 **What the agent loses.** The operator's global git configuration beyond
 the identity is not read by an agent: no commit signing (`commit.gpgSign`,
@@ -1198,9 +1240,15 @@ aliases or `core.excludesFile`. Tools that need `XDG_RUNTIME_DIR` (a session
 bus, a Wayland socket) do not get it, and curl and wget get none of their
 configured defaults (a proxy among them; the proxy variables still pass).
 Claude Code runs without the user's or the project's skills, custom agents
-and commands and CLAUDE.md auto-discovery; OpenCode without
-the settings in its configuration files (custom providers, permission
-rules, agents, instructions) and without loading `AGENTS.md` itself. Every
+and commands and CLAUDE.md auto-discovery, and without the repository's
+settings (`.claude/settings.json` and `settings.local.json`: their
+permission rules, `env` and model); its Bash tool runs commands without the
+operator's shell functions and aliases and without Claude Code's own (its
+`rg` when ripgrep is not installed, a `pkill` that spares Claude Code, and
+`find` and `grep` where it substitutes them; its Grep tool is unchanged).
+OpenCode runs without the settings in its configuration files (custom
+providers, permission rules, agents, instructions) and without loading
+`AGENTS.md` itself. Every
 phase prompt tells the agent to read the repository's `AGENTS.md` and
 `CLAUDE.md`, and the model credentials (Claude Code's login and API-key
 variables, OpenCode's `opencode auth login` and API-key variables) are

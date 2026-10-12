@@ -1623,6 +1623,23 @@ def _no_operator_opencode_data(monkeypatch, tmp_path_factory):
     monkeypatch.delenv("OPENCODE_DB", raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _no_operator_claude_config(monkeypatch, tmp_path_factory):
+    """A Claude Code launch's configuration check (#165) reads files in an
+    empty directory, not the developer's settings and global configuration.
+
+    A variable of the developer's Claude Code configuration that a launch
+    refuses would refuse every Claude launch, so a test run must not depend
+    on it. A test of the refusal points ``claude_config_files`` back at the
+    real resolution (its module imported it before this fixture ran).
+    """
+    import autoforge.providers as providers_module
+
+    config_dir = tmp_path_factory.mktemp("operator-claude-config")
+    files = [config_dir / "settings.json", config_dir / ".claude.json"]
+    monkeypatch.setattr(providers_module, "claude_config_files", lambda env: files)
+
+
 @pytest.fixture
 def offline_fetches() -> list[list[str]]:
     """The fetches of this test's engines that have no origin, in order."""

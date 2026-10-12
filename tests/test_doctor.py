@@ -64,9 +64,14 @@ OPENCODE_VERSION_LINE = "opencode v2.0.23"
 OPENCODE_COMMANDS = ("opencode", "epic-oc")
 # The row of the Claude isolation check for the default profiles (#165).
 CLAUDE_ISOLATION_ROW = "agent 'claude' keeps integrations off (analyze_execute, fix)"
+# The row of the Claude configuration check for the default profiles (#165).
+CLAUDE_CONFIGURATION_ROW = (
+    "agent 'claude' configuration keeps the launch environment (analyze_execute, fix)"
+)
 # The part of `claude --help` that check reads.
 CLAUDE_HELP = (
     "  --safe-mode                           Start with all customizations ...\n"
+    "  --setting-sources <sources>           Comma-separated list of setting sources\n"
     "  --strict-mcp-config                   Only use MCP servers from --mcp-config\n"
 )
 
@@ -156,6 +161,7 @@ def test_all_checks_pass(tmp_path):
         "gh authenticated",
         "agent 'claude' available (analyze_execute, fix)",
         "agent 'claude' keeps integrations off (analyze_execute, fix)",
+        CLAUDE_CONFIGURATION_ROW,
         "agent 'opencode' available (review_round_1, review_round_2_5, review_round_6_plus, "
         "replan_reexecute, update_epic)",
         "agent 'opencode' loads no organization configuration (review_round_1, "
@@ -175,16 +181,32 @@ def test_all_checks_pass(tmp_path):
 @pytest.mark.parametrize(
     ("help_text", "missing"),
     [
-        ("  --strict-mcp-config  Only use MCP servers from --mcp-config\n", "--safe-mode"),
+        (
+            "  --strict-mcp-config  Only use MCP servers from --mcp-config\n"
+            "  --setting-sources <sources>\n",
+            "--safe-mode",
+        ),
         # A flag named only inside another's description is not offered.
-        ("  --bare  Minimal mode, unlike --safe-mode-ish\n  --strict-mcp-config\n", "--safe-mode"),
-        ("  --safe-mode  Start with all customizations disabled\n", "--strict-mcp-config"),
+        (
+            "  --bare  Minimal mode, unlike --safe-mode-ish\n  --strict-mcp-config\n"
+            "  --setting-sources <sources>\n",
+            "--safe-mode",
+        ),
+        (
+            "  --safe-mode  Start with all customizations disabled\n"
+            "  --setting-sources <sources>\n",
+            "--strict-mcp-config",
+        ),
+        (
+            "  --safe-mode  Start with all customizations disabled\n  --strict-mcp-config\n",
+            "--setting-sources",
+        ),
     ],
 )
 def test_doctor_fails_a_claude_without_the_isolation_flags(tmp_path, help_text, missing):
-    """#165: every Claude launch passes --safe-mode and --strict-mcp-config;
-    a CLI without one would refuse every launch, so doctor says so first,
-    without quoting the help."""
+    """#165: every Claude launch passes --safe-mode, --strict-mcp-config and
+    --setting-sources=user; a CLI without one would refuse every launch, so
+    doctor says so first, by the flag's name, without quoting the help."""
     d = Doctor(cwd=str(tmp_path), runner=_runner_factory(claude_help=help_text))
     row = {r.name: r for r in d.run_all()}[CLAUDE_ISOLATION_ROW]
     assert not row.ok and row.required
@@ -1354,6 +1376,28 @@ def test_doctor_fails_an_opencode_connected_to_an_organization(tmp_path, monkeyp
     (data_dir / "opencode.db").unlink()
     rows = {r.name: r for r in Doctor(cwd=str(tmp_path), runner=_runner_factory()).run_all()}
     assert rows[row.name].ok and str(data_dir) in rows[row.name].detail
+
+
+def test_doctor_fails_a_claude_whose_settings_set_a_variable_over_the_launch(tmp_path, monkeypatch):
+    """#165 (R4-F1): Claude Code applies the env of its settings over a
+    launch's, so the launch refuses a GH_TOKEN there and doctor says so,
+    naming the file and the variable, never the value."""
+    import autoforge.providers as providers_module
+
+    settings = tmp_path / "claude" / "settings.json"
+    settings.parent.mkdir()
+    settings.write_text(json.dumps({"env": {"GH_TOKEN": FAKE_TOKEN, "FOO": "bar"}}))
+    monkeypatch.setattr(
+        providers_module, "claude_config_files", lambda env: [settings, tmp_path / "none.json"]
+    )
+    results = Doctor(cwd=str(tmp_path), runner=_runner_factory()).run_all()
+    row = {r.name: r for r in results}[CLAUDE_CONFIGURATION_ROW]
+    assert not row.ok and row.required and row.detail.startswith("refusing to launch claude")
+    assert f"GH_TOKEN in the env of {settings}" in row.detail and "FOO" not in row.detail
+    assert FAKE_TOKEN not in _all_text(results)
+    settings.write_text(json.dumps({"env": {"FOO": "bar"}}))
+    rows = {r.name: r for r in Doctor(cwd=str(tmp_path), runner=_runner_factory()).run_all()}
+    assert rows[CLAUDE_CONFIGURATION_ROW].ok
 
 
 def test_doctor_reports_the_agent_environment_by_name_only(tmp_path, monkeypatch):

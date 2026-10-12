@@ -198,13 +198,15 @@ configuration), and the preflight that refuses a launch a repository
 setting would still hand a credential. Provider adapters pass
 `AgentRequest.env` through to the executor (Pi's auth preflight included)
 and keep only what keeps their own CLI's integrations off: flags (Claude
-Code's `--safe-mode` and `--strict-mcp-config`, Pi's #132 policy) or, for a
-CLI without one, the variables of `AgentProvider.integration_isolation`
-set over the controller's (OpenCode's empty configuration directory); an
-integration neither reaches is refused by
-`AgentProvider.integration_preflight`, which the engine calls with the
-credential preflight (OpenCode's connected organization); `doctor` calls
-the same module and hook.
+Code's `--safe-mode`, `--strict-mcp-config` and `--setting-sources=user`,
+Pi's #132 policy) or, where a flag does not reach, the variables of
+`AgentProvider.integration_isolation` set over the controller's
+(OpenCode's empty configuration directory, Claude Code's
+`CLAUDE_ENV_FILE` cleaner and shell); an integration neither reaches is
+refused by `AgentProvider.integration_preflight`, which the engine calls
+with the credential preflight (OpenCode's connected organization, Claude
+Code settings whose `env` would undo the launch's isolation); `doctor`
+calls the same module and hook.
 The engine also owns *where* an agent runs: in REMOTE mode a per-issue
 `git worktree` it creates under `<git common dir>/autoforge/worktrees/<n>`
 (or `execution.worktree_dir`) at the first launch and never deletes, and it

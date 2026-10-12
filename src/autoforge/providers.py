@@ -48,8 +48,18 @@ Claude Code (``claude 2.1.x``; the stream run against 2.1.291 to 2.1.293)::
     a real ``stream-json`` run is unchanged by it (the ``init`` record still
     names the enabled plugins). Auth, model, tools and permission mode work
     as before; managed (administrator) settings still apply.
+    ``--setting-sources=user``: no project or local settings, whose ``env``
+    the repository could use to undo the Bash tool's isolation (below).
     :data:`CLAUDE_INTEGRATION_FLAGS` in ``extra_args`` are refused, and
-    ``autoforge doctor`` requires ``--safe-mode`` in ``claude --help``.
+    ``autoforge doctor`` requires all three in ``claude --help``.
+  * the Bash tool runs no function or alias of a shell startup file (#165):
+    every launch sets ``CLAUDE_ENV_FILE`` to a file of its own holding
+    :data:`CLAUDE_SHELL_CLEANER`, ``CLAUDE_CODE_SHELL`` to a bash or zsh
+    and ``CLAUDE_CODE_SHELL_PREFIX`` to empty
+    (:meth:`ClaudeCodeProvider.integration_isolation`), and is refused while
+    the ``env`` of the user's settings or of the global configuration would
+    set a variable over them or over the controller's
+    (:func:`claude_configuration_problems`).
   * exit code 0 on success; 1 on model/auth errors (message on stdout).
 
 OpenCode (``opencode 2.0.x``, #186; run against 2.0.23)::
@@ -150,8 +160,9 @@ git credential route (:func:`autoforge.child_env.refuse_forbidden_env`),
 and the variables the controller sets for the launch
 (:attr:`AgentRequest.env`, #165) reach every process the adapter starts,
 with the adapter's own (:meth:`AgentProvider.integration_isolation`) over
-them where its CLI has no flag to keep integrations from loading. An
-integration neither can keep off refuses the launch before it starts
+them where its CLI has no flag to keep an integration, or a shell startup
+file's functions and aliases, from loading. An integration or a setting
+neither can keep off refuses the launch before it starts
 (:meth:`AgentProvider.integration_preflight`).
 
 Every adapter runs a :class:`~autoforge.loop_detect.LoopMonitor` under
@@ -180,7 +191,7 @@ from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .child_env import refuse_forbidden_env
+from .child_env import child_shell, refuse_forbidden_env, undoes_isolation
 from .claude_stream import ClaudeStream
 from .config import LoopDetectionConfig, ProfileConfig
 from .errors import (
@@ -212,6 +223,7 @@ from .executor_duplex import (
 from .loop_detect import LIMIT_LOOP, LoopMonitor, LoopReport
 from .pi_rpc import PiConversation, encodable
 from .progress import ProgressEvent, ProgressKind, ProgressSink, guarded
+from .redaction import redact
 
 Runner = Callable[[ExecutionRequest], ExecutionResult]
 
@@ -483,7 +495,8 @@ class AgentProvider:
     def integration_isolation(self) -> Iterator[dict[str, str]]:
         """The variables this CLI needs, for one launch, so that no MCP server,
         plugin or hook of the operator's or the repository's configuration
-        loads (#165): one may hold a GitHub token of its own.
+        loads and no function or alias of a shell startup file runs in its
+        shell tool (#165): one may hold a GitHub token of its own.
 
         Set over the controller's (:attr:`AgentRequest.env`) by
         :meth:`execute`, whatever the allow-list passed. An adapter whose CLI
@@ -623,16 +636,24 @@ CLAUDE_EXIT_POLL_SECONDS = 0.25
 # custom agents and commands, and CLAUDE.md from loading, those of
 # ``--settings``, ``--plugin-dir`` and ``--mcp-config`` included, and wins
 # over ``CLAUDE_CODE_SAFE_MODE=0``; ``--strict-mcp-config`` with no
-# ``--mcp-config`` keeps MCP servers off on its own.
-CLAUDE_ISOLATION_FLAGS = ("--safe-mode", "--strict-mcp-config")
-# The flags that would bring an integration back, refused in ``extra_args``:
-# MCP servers, plugins, settings (hooks among them) and agent definitions,
-# and the browser and IDE connections.
+# ``--mcp-config`` keeps MCP servers off on its own. ``--setting-sources=user``
+# reads no project or local settings (``.claude/settings.json`` and
+# ``settings.local.json`` of the worktree, which the repository controls):
+# 2.1.296 applies their ``env`` over the launch's under ``--safe-mode`` too,
+# so a ``CLAUDE_ENV_FILE`` there would undo :data:`CLAUDE_SHELL_CLEANER`
+# (seen with a loopback API). The user's settings stay, checked instead
+# (:func:`claude_configuration_problems`).
+CLAUDE_ISOLATION_FLAGS = ("--safe-mode", "--strict-mcp-config", "--setting-sources=user")
+# The flags that would bring an integration or the repository's settings
+# back, refused in ``extra_args``: MCP servers, plugins, settings (hooks
+# among them), setting sources and agent definitions, and the browser and
+# IDE connections.
 CLAUDE_INTEGRATION_FLAGS = (
     "--mcp-config",
     "--plugin-dir",
     "--plugin-url",
     "--settings",
+    "--setting-sources",
     "--agents",
     "--chrome",
     "--ide",
@@ -647,6 +668,176 @@ def _integration_flag(arg: str) -> str | None:
     return None
 
 
+# The shell Claude Code's Bash tool runs a command in (#165). 2.1.296 (read
+# from the build, checked against it with a loopback API) starts
+# ``$CLAUDE_CODE_SHELL`` when that names a bash or a zsh, else picks one
+# itself. Once per session it runs that shell as ``<shell> -c -l``, sources
+# ``$HOME/.zshrc`` or ``$HOME/.bashrc`` there (by ``HOME``, whatever
+# ``ZDOTDIR`` says) and writes the functions, aliases and options it then
+# has to a snapshot; every command sources the snapshot first or, without
+# one, runs in a login shell (``-c -l``, which reads ``~/.bash_profile``).
+# A function or alias of the operator's there (``gh() { GH_TOKEN=... command
+# gh "$@"; }``) would hand the agent's ordinary ``gh`` a credential, and no
+# flag or variable turns the snapshot off. What 2.1.296 runs next in the
+# same shell, before the command and in both cases, is the text of the file
+# ``CLAUDE_ENV_FILE`` names, so every launch names a file of its own holding
+# :data:`CLAUDE_SHELL_CLEANER`; it also empties ``CLAUDE_CODE_SHELL_PREFIX``,
+# a program 2.1.296 would run every command through, and sets
+# ``CLAUDE_CODE_SHELL`` itself, which could otherwise name a program of the
+# operator's to start as the shell.
+CLAUDE_SHELLS = ("bash", "zsh")
+CLAUDE_ENV_FILE_NAME = "env.sh"
+# Inlined by 2.1.296 after the snapshot is sourced and before the command
+# (``<snapshot> && <this>\n: && ... && eval <command>``): it removes every
+# function and alias, the operator's and Claude Code's own (its ``rg`` and
+# ``pkill`` wrappers) alike, then checks that none is left and otherwise
+# ends the shell, so the command does not run. The block is one line after
+# the comment, joined to the snapshot line by ``&&``, so it is parsed before
+# the snapshot defines an alias; every command word is ``\``-quoted, so an
+# alias of the login files cannot expand either. In bash, assigning
+# ``POSIXLY_CORRECT`` (no function shadows an assignment) puts the special
+# builtin ``unset`` ahead of any function, which then removes whatever
+# function shadows ``builtin`` or ``read``. zsh has no such mode: whatever
+# ``builtin`` cannot remove, the count of ``$functions`` and the alias
+# tables (parameters, which nothing shadows) refuses. ``${x:?}`` of an
+# empty ``x``, an expansion and no command, ends a non-interactive shell.
+_CLAUDE_CLEANER_LEFT = (
+    "__af_left=; __af_x=${__af_left:?AutoForge: a function or alias of a shell startup "
+    "file is still defined, so this command is not run (#165)}"
+)
+CLAUDE_SHELL_CLEANER = (
+    "# Written by AutoForge for one Claude Code launch (#165): no function or alias of a "
+    "shell startup file runs in a Bash tool command.\n"
+    "{ if [[ -n ${BASH_VERSION-} ]]; then "
+    "case :${SHELLOPTS-}: in (*:posix:*) __af_posix=1 ;; "
+    "(*) __af_posix= ; POSIXLY_CORRECT=y ;; esac; "
+    "\\unset -f builtin command declare read unset unalias alias; "
+    "[[ -n $__af_posix ]] || \\unset POSIXLY_CORRECT; "
+    'while \\builtin read -r __af_f; do \\builtin unset -f -- "${__af_f##* }" || __af_rc=1; '
+    "done < <(\\builtin declare -F); "
+    "\\builtin unalias -a 2>/dev/null || __af_rc=1; "
+    "[[ -z $(\\builtin declare -F) && -z $(\\builtin alias) ]] || { "
+    + _CLAUDE_CLEANER_LEFT
+    + "; }; "
+    "\\builtin unset __af_f __af_posix __af_rc __af_x __af_left; "
+    "elif [[ -n ${ZSH_VERSION-} ]]; then "
+    "\\builtin unfunction -m '*' 2>/dev/null || __af_rc=1; "
+    "\\builtin unalias -a 2>/dev/null || __af_rc=1; "
+    "\\builtin unalias -as 2>/dev/null || __af_rc=1; "
+    "(( ${+functions} && ${+aliases} && ${+galiases} && ${+saliases} "
+    "&& ${#functions} + ${#aliases} + ${#galiases} + ${#saliases} == 0 )) || { "
+    + _CLAUDE_CLEANER_LEFT
+    + "; }; "
+    "\\builtin unset __af_rc __af_x __af_left; "
+    "else __af_left=; __af_x=${__af_left:?AutoForge: this command would run in a shell "
+    "AutoForge cannot clear of shell startup functions and aliases (#165)}; fi; }\n"
+)
+
+
+def claude_shell(shell: str) -> str:
+    """The shell a Claude Code launch's Bash tool runs in (``CLAUDE_CODE_SHELL``):
+    ``shell`` (the launch's ``SHELL``, :func:`autoforge.child_env.child_shell`)
+    when it is a bash or a zsh, else the ``bash`` or ``zsh`` on ``PATH``;
+    empty when there is neither (2.1.296 then looks for one itself, and
+    :data:`CLAUDE_SHELL_CLEANER` clears either)."""
+    if os.path.basename(shell) in CLAUDE_SHELLS:
+        return shell
+    return shutil.which("bash") or shutil.which("zsh") or ""
+
+
+def claude_isolation_env(env_file: str, shell: str) -> dict[str, str]:
+    """What a Claude Code launch sets so that its Bash tool runs no function
+    or alias of a shell startup file and no program of the operator's
+    around a command: ``env_file`` holds :data:`CLAUDE_SHELL_CLEANER`."""
+    return {
+        "CLAUDE_ENV_FILE": env_file,
+        "CLAUDE_CODE_SHELL": shell,
+        "CLAUDE_CODE_SHELL_PREFIX": "",
+    }
+
+
+# Read whole to find its ``env``, and refused past this size: Claude Code's
+# global configuration grows with its project history.
+CLAUDE_MAX_CONFIG_BYTES = 32 * 1024 * 1024
+
+
+def claude_config_files(env: Mapping[str, str]) -> list[Path]:
+    """The operator's files whose ``env`` a Claude Code launch with ``env``
+    sets over its own environment, and so over every command its Bash tool
+    runs, ``--safe-mode`` notwithstanding (2.1.296, read from the build and
+    seen replacing the placeholder ``GH_TOKEN`` and ``CLAUDE_ENV_FILE``): the
+    user settings, ``settings.json`` in the configuration directory
+    (``CLAUDE_CONFIG_DIR``, else ``~/.claude``), and the global
+    configuration, ``.config.json`` there when it exists, else
+    ``.claude.json`` (``.claude-custom-oauth.json`` with
+    ``CLAUDE_CODE_CUSTOM_OAUTH_URL``) in ``CLAUDE_CONFIG_DIR``, else in the
+    home (``HOME``, else the password database's)."""
+    home = env.get("HOME")
+    if not home:
+        try:
+            home = pwd.getpwuid(os.getuid()).pw_dir
+        except KeyError:
+            home = "/"
+    explicit = env.get("CLAUDE_CONFIG_DIR")
+    config_dir = Path(explicit or Path(home, ".claude"))
+    legacy = config_dir / ".config.json"
+    suffix = "-custom-oauth" if env.get("CLAUDE_CODE_CUSTOM_OAUTH_URL") else ""
+    global_config = legacy if legacy.exists() else Path(explicit or home, f".claude{suffix}.json")
+    return [config_dir / "settings.json", global_config]
+
+
+def _claude_config_env_problems(path: Path) -> list[str]:
+    """The names in the ``env`` of ``path`` that would undo a launch's
+    isolation, or that it could not be read; names only, never a value."""
+    if not path.exists():
+        return []
+    refused = _not_a_regular_file(path)
+    if refused:
+        return [refused]
+    try:
+        with path.open("rb") as handle:
+            data = handle.read(CLAUDE_MAX_CONFIG_BYTES + 1)
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        return [f"{path} could not be checked ({type(exc).__name__})"]
+    if len(data) > CLAUDE_MAX_CONFIG_BYTES:
+        return [f"{path} is larger than {CLAUDE_MAX_CONFIG_BYTES} bytes and was not checked"]
+    try:
+        document = json.loads(data)
+    except ValueError:
+        return [f"{path} could not be checked (not JSON)"]
+    env = document.get("env") if isinstance(document, dict) else None
+    if not isinstance(env, dict):
+        return []
+    isolation = {name.upper() for name in ClaudeCodeProvider.isolation_names}
+    hits = sorted(
+        name
+        for name in env
+        if isinstance(name, str) and (undoes_isolation(name) or name.upper() in isolation)
+    )
+    if not hits:
+        return []
+    return [f"{', '.join(redact(name) for name in hits)} in the env of {path}"]
+
+
+def claude_configuration_problems(env: Mapping[str, str]) -> list[str]:
+    """What, in the configuration a Claude Code launch with ``env`` reads,
+    would set a variable over the launch's isolation (empty: nothing would).
+
+    ``env`` is the environment the launch inherits (``HOME``,
+    ``CLAUDE_CONFIG_DIR`` and ``CLAUDE_CODE_CUSTOM_OAUTH_URL`` decide where
+    2.1.296 looks, :func:`claude_config_files`). A file that exists but
+    cannot be read is a problem too: a launch is refused rather than assumed
+    clean. Managed (administrator) settings are not read: the operator can
+    change them no more than a launch can.
+    """
+    problems: list[str] = []
+    for path in claude_config_files(env):
+        problems += _claude_config_env_problems(path)
+    return problems
+
+
 class ClaudeCodeProvider(AgentProvider):
     name = "claude"
     # ``ANTHROPIC_API_KEY`` / ``ANTHROPIC_AUTH_TOKEN`` and the base URL and
@@ -654,6 +845,55 @@ class ClaudeCodeProvider(AgentProvider):
     # ``CLAUDE_CODE_*`` feature switches.
     environment_names = ("ANTHROPIC_*", "CLAUDE_*")
     option_keys = ("permission_mode", "output_format", "session_persistence")
+    isolation_names = tuple(sorted(claude_isolation_env("", "")))
+
+    @contextmanager
+    def integration_isolation(self) -> Iterator[dict[str, str]]:
+        """A :data:`CLAUDE_SHELL_CLEANER` file for this launch's
+        ``CLAUDE_ENV_FILE``, a bash or zsh to run Bash tool commands in and no
+        shell prefix (:func:`claude_isolation_env`): no function or alias of
+        the operator's shell startup files runs in one (#165).
+
+        The directory (``mkdtemp``, mode 0700) is removed when the launch
+        ends; one that cannot be made or written is an
+        :class:`ExecutionError`, before anything is launched.
+        """
+        try:
+            env_dir = tempfile.mkdtemp(prefix="autoforge-claude-")
+        except OSError as exc:
+            raise ExecutionError(f"cannot prepare the claude shell environment: {exc}") from exc
+        try:
+            env_file = os.path.join(env_dir, CLAUDE_ENV_FILE_NAME)
+            try:
+                fd = os.open(env_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(CLAUDE_SHELL_CLEANER)
+            except OSError as exc:
+                raise ExecutionError(f"cannot prepare the claude shell environment: {exc}") from exc
+            yield claude_isolation_env(env_file, claude_shell(child_shell()))
+        finally:
+            shutil.rmtree(env_dir, ignore_errors=True)
+
+    def integration_preflight(self, env_allowlist: tuple[str, ...] | None) -> None:
+        """Refuse a launch while Claude Code's own configuration would set a
+        variable over its isolation (:func:`claude_configuration_problems`):
+        2.1.296 applies the ``env`` of the user settings and of the global
+        configuration over the environment it is started with, under
+        ``--safe-mode`` too, so a ``GH_TOKEN`` there would replace the
+        placeholder and a ``CLAUDE_ENV_FILE`` there the cleaner.
+        """
+        problems = claude_configuration_problems(self.launch_environment(env_allowlist))
+        if problems:
+            raise ConfigurationError(
+                "refusing to launch claude: its own configuration sets variables over the "
+                "environment AutoForge gives a launch, which would hand its commands a GitHub "
+                "or git credential or let a shell startup file's functions and aliases run in "
+                f"them: {'; '.join(problems)}. Remove them from that env (Claude Code reads "
+                "the variables of the environment it is started in; set them there and allow "
+                "them through execution.env_allowlist_extra unless they name a credential), "
+                "or route these profiles to another provider (docs/configuration.md, "
+                "'Agent environment')"
+            )
 
     def validate_profile(self, profile: ProfileConfig) -> None:
         super().validate_profile(profile)
@@ -682,10 +922,10 @@ class ClaudeCodeProvider(AgentProvider):
                 raise ConfigurationError(
                     f"profile {profile.name!r}: claude extra_args cannot carry {flag}: it "
                     "loads an integration (an MCP server, a plugin, hooks, an agent "
-                    "definition, a browser or IDE connection), which may hold a GitHub "
-                    "token of its own, and AutoForge launches Claude Code with "
-                    f"{' and '.join(CLAUDE_ISOLATION_FLAGS)} so that none runs "
-                    "(docs/configuration.md, 'Agent environment')"
+                    "definition, a browser or IDE connection) or settings, which may hold "
+                    "a GitHub token of its own or set variables over the launch's, and "
+                    f"AutoForge launches Claude Code with {', '.join(CLAUDE_ISOLATION_FLAGS)} "
+                    "so that none applies (docs/configuration.md, 'Agent environment')"
                 )
 
     @staticmethod
@@ -743,24 +983,26 @@ class ClaudeCodeProvider(AgentProvider):
         emit = guarded(req.progress)
         monitor = _loop_monitor(req, emit)
         stream = ClaudeStream(cwd=req.cwd, emit=emit, loop=_ClockedLoop(monitor))
-        duplex = DuplexRequest(
-            command=self.build_command(req),
-            cwd=req.cwd,
-            env_allowlist=self.environment_allowlist(req),
-            env=req.env,
-            idle_timeout_seconds=req.idle_timeout_seconds,
-            max_runtime_seconds=req.max_runtime_seconds,
-            max_record_bytes=CLAUDE_MAX_RECORD_BYTES,
-            max_pending_bytes=CLAUDE_MAX_PENDING_BYTES,
-            # The prompt travels in argv; stdin stays /dev/null so the CLI
-            # never waits on it.
-            stdin_pipe=False,
-            # Nothing an agent starts outlives its invocation (ADR 0002).
-            contain_orphans=True,
-        )
-        with start_duplex(duplex) as child:
-            cut_short = _read_claude_stream(child, stream, monitor)
-            res = child.finish()
+        self.integration_preflight(req.env_allowlist)
+        with self.integration_isolation() as isolation:
+            duplex = DuplexRequest(
+                command=self.build_command(req),
+                cwd=req.cwd,
+                env_allowlist=self.environment_allowlist(req),
+                env={**(req.env or {}), **isolation},
+                idle_timeout_seconds=req.idle_timeout_seconds,
+                max_runtime_seconds=req.max_runtime_seconds,
+                max_record_bytes=CLAUDE_MAX_RECORD_BYTES,
+                max_pending_bytes=CLAUDE_MAX_PENDING_BYTES,
+                # The prompt travels in argv; stdin stays /dev/null so the CLI
+                # never waits on it.
+                stdin_pipe=False,
+                # Nothing an agent starts outlives its invocation (ADR 0002).
+                contain_orphans=True,
+            )
+            with start_duplex(duplex) as child:
+                cut_short = _read_claude_stream(child, stream, monitor)
+                res = child.finish()
         timed_out = cut_short or res.timed_out or res.stopped
         failure = stream.failure
         if stream.exited_early:

@@ -546,14 +546,41 @@ still take precedence over the identity file.
 hold a GitHub token of its own, so none of the operator's or the
 repository's runs in a launch:
 
-- Claude Code is launched with `--safe-mode` and `--strict-mcp-config`, and
-  a Claude profile's `extra_args` cannot carry `--mcp-config`,
-  `--plugin-dir`, `--plugin-url`, `--settings`, `--agents`, `--chrome` or
-  `--ide` (config load fails, naming the flag, never its value).
-  `autoforge doctor` fails a `claude` whose `--help` lacks either flag
-  (row "agent 'claude' keeps integrations off"). Skills, custom agents and
-  commands and CLAUDE.md auto-discovery are off as well; managed
-  (administrator) settings still apply.
+- Claude Code is launched with `--safe-mode`, `--strict-mcp-config` and
+  `--setting-sources=user`, and a Claude profile's `extra_args` cannot
+  carry `--mcp-config`, `--plugin-dir`, `--plugin-url`, `--settings`,
+  `--setting-sources`, `--agents`, `--chrome` or `--ide` (config load
+  fails, naming the flag, never its value). `autoforge doctor` fails a
+  `claude` whose `--help` lacks one of the three flags (row "agent
+  'claude' keeps integrations off"). Skills, custom agents and commands
+  and CLAUDE.md auto-discovery are off as well, and the repository's
+  `.claude/settings.json` and `.claude/settings.local.json` are not read;
+  managed (administrator) settings still apply.
+- Claude Code's Bash tool runs with none of your shell functions and
+  aliases. Claude Code sources your `~/.bashrc` or `~/.zshrc` itself (and,
+  when that fails, runs commands in a login shell that reads
+  `~/.bash_profile`), so a `gh` function or alias there that passes a token
+  would otherwise reach the agent. Every launch sets `CLAUDE_ENV_FILE` to
+  a file of its own that removes every function and alias before each
+  command, and refuses to run the command if one is left; it also sets
+  `CLAUDE_CODE_SHELL` to a bash or zsh and `CLAUDE_CODE_SHELL_PREFIX` to
+  empty, whatever your shell sets. A command that relies on one of your
+  functions or aliases fails in a launch; put what it needs in a script on
+  `PATH` instead.
+- Claude Code sets the `env` of your user settings (`~/.claude/settings.json`,
+  or `settings.json` in `CLAUDE_CONFIG_DIR`) and of its global
+  configuration (`~/.claude.json`, or the one in `CLAUDE_CONFIG_DIR`) over
+  the environment AutoForge gives a launch. So a Claude launch is refused
+  while that `env` sets a variable AutoForge withholds or sets itself (a
+  GitHub or git credential, `GH_CONFIG_DIR`, `GIT_CONFIG_GLOBAL`, `SHELL`,
+  `ZDOTDIR`, `HOME`, a `BASH_FUNC_*` function, `CLAUDE_ENV_FILE`,
+  `CLAUDE_CODE_SHELL`, `CLAUDE_CODE_SHELL_PREFIX` and the like), or while
+  either file exists and cannot be read; the error and `autoforge doctor`
+  (row "agent 'claude' configuration keeps the launch environment") name
+  the file and the variables, never a value. Remove those entries; a
+  variable Claude Code itself needs can be set in the shell that runs
+  `autoforge` instead and passed with `execution.env_allowlist_extra`
+  (`CLAUDE_*` and `ANTHROPIC_*` pass already).
 - OpenCode is launched with `OPENCODE_CONFIG_DIR` set to an empty directory
   of its own, project configuration disabled
   (`OPENCODE_CONFIG_PROJECT_DISABLE`, `OPENCODE_DISABLE_PROJECT_CONFIG`) and

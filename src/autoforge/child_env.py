@@ -91,11 +91,14 @@ model"): it hides nothing from a process that deliberately opens a
 credential file, a keychain or a socket by absolute path, or runs ``ssh``
 or a credential helper of its own choosing; that is the outer sandbox's
 (ADR 0005). ``HOME`` is still passed: the agent CLIs keep their own sign-in
-there. So an interactive ``bash`` still reads ``~/.bashrc``, Claude Code
-still sources ``~/.zshrc`` or ``~/.bashrc`` itself to snapshot the
-functions and aliases (not the variables) its Bash tool runs with, and a
-fish or csh-family shell started by name still reads its configuration;
-none of them is started by a launch through ``SHELL``.
+there. So an interactive ``bash`` still reads ``~/.bashrc`` and a fish or
+csh-family shell started by name still reads its configuration; neither is
+started by a launch through ``SHELL``. Claude Code sources ``~/.zshrc`` or
+``~/.bashrc`` itself for the functions and aliases its Bash tool runs
+with; its adapter removes them before every command
+(:class:`autoforge.providers.ClaudeCodeProvider`). An agent CLI that applies
+variables of its own configuration over the launch's refuses the launch
+when one of them would undo this isolation (:func:`undoes_isolation`).
 """
 
 from __future__ import annotations
@@ -356,6 +359,25 @@ def child_overrides(
 def override_names() -> tuple[str, ...]:
     """The names :func:`child_overrides` sets, sorted (values vary by launch)."""
     return tuple(sorted(child_overrides("", "", "", "", "", "")))
+
+
+def undoes_isolation(name: str) -> bool:
+    """Whether variable ``name``, set over a launch's environment after the
+    controller's (an agent CLI applying the variables of its own
+    configuration does that), could hand the launch a credential: a
+    forbidden name, a name the controller sets (:func:`override_names`),
+    ``HOME`` (the ``.netrc`` and login startup files :func:`preflight`
+    checked are the ones there), or an exported bash function
+    (``BASH_FUNC_*``), which every bash the launch starts defines. Compared
+    without regard to case."""
+    upper = name.upper()
+    return (
+        upper in FORBIDDEN_ENV_NAMES
+        or upper.startswith(tuple(FORBIDDEN_ENV_PREFIXES))
+        or upper in override_names()
+        or upper == "HOME"
+        or upper.startswith("BASH_FUNC_")
+    )
 
 
 @dataclass(frozen=True)
@@ -821,5 +843,6 @@ __all__ = [
     "refuse_forbidden_env",
     "shell_probe_script",
     "shell_startup_problems",
+    "undoes_isolation",
     "url_has_credential",
 ]

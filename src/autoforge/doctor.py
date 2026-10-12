@@ -13,9 +13,11 @@ operator's whole environment) and reported without Pi's raw output, and a
 warning naming the instruction files Pi would load from outside the
 checkout (docs/pi-policy.md §4-5); those are found by path, never read. A
 Claude Code command must list the flags every launch keeps the operator's
-and the repository's integrations off with in its ``--help`` (#165), and an
-OpenCode profile fails while OpenCode would load an organization's
-configuration, which a launch refuses (#165,
+and the repository's integrations off with in its ``--help`` (#165) and
+fails while its settings or global configuration set a variable over a
+launch's isolation, and an OpenCode profile fails while OpenCode would load
+an organization's configuration; a launch refuses either (#165,
+:meth:`autoforge.providers.ClaudeCodeProvider.integration_preflight`,
 :meth:`autoforge.providers.OpenCodeProvider.integration_preflight`).
 
 Both report the environment an agent and a repository-defined command are
@@ -78,6 +80,7 @@ from .providers import (
     PI_DEFAULT_AGENT_DIR,
     PI_MIN_VERSION,
     PI_SYSTEM_PROMPT_FILES,
+    ClaudeCodeProvider,
     OpenCodeProvider,
     PiProvider,
     parse_opencode_version,
@@ -646,6 +649,7 @@ class Doctor:
                 results.append(self._version_check(label, [command, "--version"]))
                 if provider == "claude":
                     results.append(self.check_claude_isolation(command, profiles))
+                    results.append(self.check_claude_configuration(cfg, command, profiles))
         pi_profiles = [p for (_, provider), ps in groups.items() if provider == "pi" for p in ps]
         if pi_profiles:
             results.append(self.check_pi_outside_instructions(pi_profiles))
@@ -753,8 +757,8 @@ class Doctor:
 
         Every Claude Code launch passes :data:`CLAUDE_ISOLATION_FLAGS` so that
         no hook, plugin or MCP server of the operator's or the repository's
-        configuration runs; a CLI without one would refuse every launch. The
-        help text is never quoted.
+        configuration runs and no project or local settings apply; a CLI
+        without one would refuse every launch. The help text is never quoted.
         """
         name = f"agent '{command}' keeps integrations off ({', '.join(p.name for p in profiles)})"
         argv = [command, "--help"]
@@ -773,20 +777,49 @@ class Doctor:
                 f"`{' '.join(argv)}` exited {res.exit_code} (output not shown; run it yourself)",
             )
         listed = set(re.findall(r"(?<![\w-])--[a-z][a-z-]*", res.stdout or ""))
-        missing = [flag for flag in CLAUDE_ISOLATION_FLAGS if flag not in listed]
+        # A flag is offered by its name; its value (``=user``) is the launch's.
+        flags = [flag.partition("=")[0] for flag in CLAUDE_ISOLATION_FLAGS]
+        missing = [flag for flag in flags if flag not in listed]
         if missing:
             return CheckResult(
                 name,
                 False,
                 f"`{' '.join(argv)}` does not list {', '.join(missing)}, which every launch "
                 "passes so that no hook, plugin or MCP server of the operator's or the "
-                "repository's configuration runs; update Claude Code",
+                "repository's configuration runs and no setting of the repository's "
+                "applies; update Claude Code",
             )
         return CheckResult(
             name,
             True,
             f"launched with {' '.join(CLAUDE_ISOLATION_FLAGS)}: no hook, plugin or MCP server "
-            "of the operator's or the repository's configuration runs",
+            "of the operator's or the repository's configuration runs, and no setting of "
+            "the repository's applies",
+        )
+
+    def check_claude_configuration(
+        self, cfg: AutoForgeConfig, command: str, profiles: list[ProfileConfig]
+    ) -> CheckResult:
+        """The launch's own refusal of Claude Code configuration that sets a
+        variable over its isolation (#165).
+
+        Run under the agent launch's allow-list, so the configuration files
+        looked at are the launch's; only paths and variable names are
+        reported, never a value.
+        """
+        name = (
+            f"agent '{command}' configuration keeps the launch environment "
+            f"({', '.join(p.name for p in profiles)})"
+        )
+        try:
+            ClaudeCodeProvider().integration_preflight(cfg.execution.environment_names())
+        except (ConfigurationError, ExecutionError) as exc:
+            return CheckResult(name, False, redact(str(exc)))
+        return CheckResult(
+            name,
+            True,
+            "no variable of Claude Code's settings or global configuration replaces one "
+            "AutoForge sets; its Bash tool runs no shell startup file's function or alias",
         )
 
     def check_opencode_isolation(

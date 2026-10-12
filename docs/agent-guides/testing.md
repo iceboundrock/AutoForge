@@ -256,10 +256,21 @@ a stated reason it has none. The coverage that must keep working:
   lists the launch environment
   by name only, gives Pi's probes the same overrides, and `local doctor`
   keeps the environment rows with zero `gh` calls (`test_doctor.py`)
-- Claude Code launches with `--safe-mode` and `--strict-mcp-config`, and
-  a profile whose `extra_args` would load an integration is refused
-  without its value (`test_providers.py`, `test_config.py`); `doctor`
-  fails a `claude` whose `--help` lacks either flag (`test_doctor.py`); an
+- Claude Code launches with `--safe-mode`, `--strict-mcp-config` and
+  `--setting-sources=user`, and a profile whose `extra_args` would load an
+  integration or settings is refused without its value
+  (`test_providers.py`, `test_config.py`); `doctor` fails a `claude` whose
+  `--help` lacks one of the three (`test_doctor.py`); its Bash tool, in a
+  fake `claude` that snapshots and runs a command as 2.1.296 does with the
+  real bash and zsh, runs none of the operator's shell functions and
+  aliases (snapshot and login shell, a startup file that shadows the
+  cleaner's builtins, an operator's `CLAUDE_CODE_SHELL` or
+  `CLAUDE_CODE_SHELL_PREFIX`, the repository's settings `env`), while the
+  same launch without the adapter's isolation does; a launch whose Claude
+  user settings or global configuration set a variable that would undo
+  its isolation, or cannot be read, is refused before the CLI starts,
+  naming the file and the variable, never the value (`test_providers.py`,
+  `test_doctor.py`); an
   OpenCode launch, through the real executor, reads no MCP server or
   plugin of any configuration a fake `opencode` that resolves its
   configuration as 2.0.26 does would load, and is refused before the

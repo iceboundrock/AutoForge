@@ -50,6 +50,7 @@ from autoforge.child_env import (
     render_git_config,
     shell_probe_script,
     shell_startup_problems,
+    undoes_isolation,
     url_has_credential,
 )
 from autoforge.config import DEFAULT_ENV_ALLOWLIST, ProfileConfig
@@ -254,6 +255,39 @@ def test_without_an_operator_identity_none_is_supplied(tmp_path, monkeypatch):
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(empty))
     identity = preflight(str(git_repo(tmp_path / "repo")))
     assert identity == LaunchIdentity() and "none" in identity.describe()
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "GH_TOKEN",
+        "github_token",
+        "GH_CONFIG_DIR",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_KEY_0",
+        "GIT_ASKPASS",
+        "SSH_AUTH_SOCK",
+        "CURL_HOME",
+        "NETRC",
+        "ZDOTDIR",
+        "SHELL",
+        "BASH_ENV",
+        "ENV",
+        "HOME",
+        "BASH_FUNC_gh%%",
+    ],
+)
+def test_a_variable_set_over_a_launch_that_would_undo_its_isolation(name):
+    """R4-F1: an agent CLI that sets the variables of its own configuration
+    over the launch's (Claude Code's settings env) must not replace a
+    forbidden name, one the controller sets, the HOME the preflight checked
+    or a bash function every bash would define."""
+    assert undoes_isolation(name)
+
+
+@pytest.mark.parametrize("name", ["FOO", "PATH", "LANG", "NODE_OPTIONS", "XDG_CACHE_HOME"])
+def test_a_variable_set_over_a_launch_that_leaves_its_isolation(name):
+    assert not undoes_isolation(name)
 
 
 def test_the_overrides_are_names_known_in_advance():
