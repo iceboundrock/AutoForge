@@ -1,5 +1,6 @@
 """Redaction: common token patterns are masked, normal text untouched."""
 
+import json
 import time
 
 import pytest
@@ -305,6 +306,84 @@ def test_redact_obj_suffix_allocation_is_linear_in_the_colliding_keys():
     assert list(out.values()) == list(range(count))
     assert all(key.startswith("GITHUB_TOKEN=***REDACTED***") for key in out)
     assert "secret" not in "".join(out)
+
+
+def test_redact_obj_redacts_each_string_never_the_serialized_document():
+    """#206: a pattern run over a document's JSON text consumes the syntax
+    around a value (an empty assignment takes the closing quote, a value
+    before an escaped quote its backslash) and misses a secret right after an
+    escape, which follows a letter or a digit there. Each string is redacted
+    on its own."""
+    token = "ghp_" + "e" * 36
+    value = {
+        "GH_TOKEN=": ["GITHUB_TOKEN=", "id_token:", 'GITHUB_TOKEN=abc"def'],
+        "after_escape": f"line\n{token}",
+        "after_non_ascii": f"—{token}",
+    }
+    assert redact_obj(value) == {
+        "GH_TOKEN=": ["GITHUB_TOKEN=", "id_token:", 'GITHUB_TOKEN=***REDACTED***"def'],
+        "after_escape": "line\n***REDACTED***",
+        "after_non_ascii": "—***REDACTED***",
+    }
+
+
+_R = "***REDACTED***"
+
+
+@pytest.mark.parametrize(
+    ("document", "expected"),
+    [
+        (
+            {"id_token": "FAKE.ID.TOKEN", "chatgpt-account-id": "fake-account", "expires": 3600},
+            {"id_token": _R, "chatgpt-account-id": _R, "expires": 3600},
+        ),
+        # In any case, at any depth, and the whole value: unlike the text
+        # pattern, the key says where the value ends.
+        (
+            {"auth": {"Access_Token": "FAKE access"}, "tokens": [{"REFRESH": "rt_FAKE"}]},
+            {"auth": {"Access_Token": _R}, "tokens": [{"REFRESH": _R}]},
+        ),
+    ],
+)
+def test_redact_obj_redacts_a_value_under_an_oauth_credential_key(document, expected):
+    """#206: ``"refresh": "..."`` spans a key and its value, so `redact_obj`,
+    which redacts them apart, recognises it by the key: a non-empty string
+    under a key that names an OAuth credential field is replaced whole."""
+    assert redact_obj(document) == expected
+
+
+def _json_object(text):
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"), [case for case in _OAUTH_FIELD_CASES if _json_object(case[0])]
+)
+def test_redact_obj_covers_every_oauth_field_document_redact_covers(text, expected):
+    """#206: the run log redacted a parsed result as its JSON text until the
+    text's syntax broke; it redacts the structure now, which must cover every
+    ``oauth-field`` case that is a JSON document as the text pattern does."""
+    assert redact_obj(json.loads(text)) == json.loads(expected)
+
+
+def test_redact_obj_leaves_other_keys_and_empty_or_scalar_credential_values_alone():
+    """The key must name the field whole: a longer key is ordinary data, as
+    the quoted prose keys are for `redact`. An empty value has nothing to
+    hide, and a number or a boolean is not a credential."""
+    value = {
+        "refreshed": "yes",
+        "accessible": "no",
+        "access_level": "write",
+        "refresh_interval_seconds": "3600",
+        "access": "",
+        "id_token": 7,
+        "refresh": True,
+    }
+    assert redact_obj(value) == value
 
 
 # The shortest text each pattern recognises, with the separator that lets the
