@@ -505,9 +505,20 @@ about the failure reaches the agent.
 - **Non-PASS at REVIEW entry:** this happens only for a candidate no
   producer validated. It is presented to the reviewer (D9.1, D9.2), who
   cannot return a clean result over it (D9.4).
+- **Relaunch:** a reviewer relaunched after a crash (the binding was
+  written and no plan was saved) passes the entry gate again, under the
+  configuration the relaunching process loaded. When the binding's
+  `validation_set_digest` and `policy_digest` (D11.2) equal the ones in
+  force, the binding is reused unchanged and nothing reruns. When either
+  differs, the gate requires evidence under the configuration in force, as
+  for a head no producer validated, and replaces the binding in the save
+  that charges the relaunch. A reviewer is therefore never launched under a
+  binding whose set or policy the launching process does not hold.
 - **Journal-first completion:** a REVIEW that completes from a persisted
   plan (#162) launches no reviewer and validates nothing; its binding was
-  written before the reviewer whose result it completes.
+  written before the reviewer whose result it completes, and the
+  certificate is issued from that binding, never from the configuration in
+  force (D12.2, D12.6).
 
 **D5.6 (#172).** **LOCAL write phases** (`ANALYZE_EXECUTE`, `FIX`):
 validation stays where it is (`_verified_snapshot`), now producing records,
@@ -517,11 +528,12 @@ under the convergence rule (D7.2).
 fingerprint (ADR 0001 §5.10). It requires evidence for the bound
 fingerprint under the run contract's set (an empty set is complete), and
 writes the `review_evidence` binding (D11.2) naming that evidence in the
-save that charges the reviewer's launch, as D5.5 does in REMOTE. The
-binding names records, never a fingerprint, so §5.10's rule holds. A LOCAL
-state with a non-empty set and no evidence, which only a state persisted
-before Wave 2B can be, enters `BLOCKED` with "no validation evidence for
-this LOCAL run; start a new local run", before any launch.
+save that charges the reviewer's launch, as D5.5 does in REMOTE, a
+relaunch included. The binding names records, never a fingerprint, so
+§5.10's rule holds. A LOCAL state with a non-empty set and no evidence,
+which only a state persisted before Wave 2B can be, enters `BLOCKED` with
+"no validation evidence for this LOCAL run; start a new local run", before
+any launch.
 
 **D5.8 (documentation only).** **No `VALIDATE` phase.** Every window is
 modelled by state plus records: a durable attempt marker (D11.2), records
@@ -751,7 +763,8 @@ directory, so two exports of the same candidate would never agree.
 `policy_digest` is SHA-256 over the canonical encoding of these inputs, with
 a version label. Editing the timeout or the allow-list after a clean review
 therefore changes P, and the merge gate refuses until the configuration is
-restored or a new round runs (D14.1).
+restored or a new round runs (D14.1). So does the certificate issuance of a
+round that completes from #162's journal after the edit (D12.6).
 
 **D8.2 (#172).** **Each record stores** `policy_digest`, the mode and the
 timeout, and the **enforcement facts** copied from the in-memory
@@ -963,7 +976,8 @@ lowering one is a protocol change (D15.5).
 *Integers and booleans:* `schema` is 1; a set index is 0 to 15; the timeout
 is 1 to `MAX_DEADLINE_SECONDS` (`execution.command_timeout_seconds`' own
 range); `exit_code` is -128 to 255 (a signal is reported negated); a `seq`,
-the watermark, a review round and an issue number are 1 to `2**31 - 1`; a
+a review round and an issue number are 1 to `2**31 - 1`; the watermark is
+0 to `2**31 - 1`, 0 being an override with no record to override (D14.2); a
 comment id is 1 to `2**53 - 1`, and a byte count 0 to `2**53 - 1`; the
 counter's count is 1 to its bound (3, D5.2). Booleans are JSON booleans,
 never strings or integers.
@@ -988,6 +1002,8 @@ never strings or integers.
   already clips `backend_version` at 64 characters.
 - `validation_records` is evicted to its bound (D11.4) in the write that
   appends.
+- The watermark is written only by D14.2's rule: the highest retained
+  record seq, or 0 when no record is retained.
 
 Nothing else is ever clipped.
 
@@ -1081,6 +1097,10 @@ integrity is checked on load:
 
 - a certificate, binding or counter that names a missing record, or an
   `INTERRUPTED` one (D10.7);
+- a certificate or binding naming a record whose candidate identity (not
+  provenance) or `policy_digest` differs from its own;
+- a watermark above the highest retained record seq, or above 0 when no
+  record is retained (D14.2);
 - a digest mismatch;
 - a record matching neither candidate kind, or the other mode's kind
   (D2.7);
@@ -1113,13 +1133,21 @@ never authority.
     `BLOCKED` write clears it. Only a crash leaves a marker for the resume
     path to find (§2.16).
 - `review_evidence`: an optional binding {review round, candidate, ordered
-  record seqs and digests, `validation_set_digest`}, written before the
-  reviewer launches (D5.5, D5.7).
+  record seqs and digests, `validation_set_digest`, `policy_digest`},
+  written before the reviewer launches (D5.5, D5.7).
+  - `policy_digest` is P as the entry gate computed it for the launch the
+    binding charges (D8.1). It is written for an empty set too, where no
+    record carries it, and every record the binding names has it (D11.1).
+  - The binding is the review's own record of the set and the policy it
+    was presented under. The certificate takes both from it (D12.2), so a
+    configuration changed after the reviewer launched cannot change what a
+    certificate states.
 - `review_certificate`: an optional `ReviewCertificate` (D12.1).
 - `producer_validation_failure`: an optional counter {phase, count,
   candidate commit, last record seq} (D5.2).
 - `validation_override_seq`: an optional integer, the operator's override
-  watermark (D14.2).
+  watermark (D14.2). It is absent until an `unblock` writes it, and 0 when
+  that unblock found no record.
 
 Every field of every addition is bounded by D10.3.
 
@@ -1165,9 +1193,9 @@ certificate, D12.2):
   marker key (`review_round`, `reviewed_head_sha`, `reviewed_base_ref`,
   `reviewed_merge_base_sha`);
 - LOCAL: `reviewed_workspace_fingerprint`;
-- the record seqs and digests of the presented set;
-- `validation_set_digest`;
-- `policy_digest`;
+- the record seqs and digests of the presented set, `validation_set_digest`
+  and `policy_digest`, all three copied from the `review_evidence` binding
+  (D12.2);
 - the clean result (`needs_fix_round: false`, zero actionable findings);
 - `issued_at`.
 
@@ -1175,15 +1203,26 @@ No review prose is included. Every field is bounded by D10.3.
 
 **D12.2 (#174).** **Issuance.**
 
-- The certificate is written in the **same atomic state write** as
-  `REVIEW → READY_FOR_MERGE` (REMOTE) or `REVIEW → DONE` (LOCAL).
+- The certificate is written in the **same atomic state write** that
+  completes the clean round: `REVIEW → READY_FOR_MERGE` (REMOTE) or
+  `REVIEW → DONE` (LOCAL), or `REVIEW → BLOCKED` when the configuration
+  drifted (D12.6).
 - Its inputs are the validated clean result, the persisted
   `review_evidence` binding of this round, the review binding, and for
   REMOTE the comment identity from #162's read-back, or from the K4
   record's observation when the journal completes the round (the K4 record
   is dropped by that same save).
-- Issuance requires every presented record to be PASS and applicable to
-  the reviewed candidate.
+- Its candidate, record seqs and digests, `validation_set_digest` and
+  `policy_digest` are copied from the binding, never computed from the
+  configuration in force at issuance. With an empty set the binding is the
+  only persisted copy of the policy the review was presented under (D11.2).
+- Issuance requires the binding's candidate to be the reviewed one, and the
+  records it names to be PASS, one per definition of its set, in set order:
+  their `definition_digest`s encode to its `validation_set_digest` (D3.5),
+  which for an empty set is the empty list's. D9.4 refuses a clean result
+  over a non-PASS record, and load checks each record's candidate and
+  policy (D11.1), so a failure here is an invariant violation: no
+  certificate, and `BLOCKED` naming the requirement.
 - It is a pure function of persisted, verified inputs, and re-derivable
   after a crash.
 
@@ -1203,9 +1242,49 @@ not of counting one.
 **D12.5 (#174).** **LOCAL `DONE` is never entered without a certificate.**
 GitHub is never consulted for a LOCAL certificate.
 
+**D12.6 (#174).** **Configuration drift at issuance.** In the issuing write,
+the controller compares the binding's `validation_set_digest` and
+`policy_digest` with the ones the configuration in force yields (D3.5,
+D8.1).
+
+- **Equal:** the write enters `READY_FOR_MERGE` (REMOTE) or `DONE` (LOCAL).
+- **Different:** the write still issues the certificate from the binding,
+  and enters `BLOCKED` instead, naming the digest that changed, as the merge
+  gate refuses the same drift (D13.2, D14.1). The certificate states the
+  set and policy the review was presented under, never the ones in force,
+  and it is no permission (D1.2). The operator then either restores the
+  configuration and unblocks, and D12.3 finds the certificate applicable
+  and decides `READY_FOR_MERGE`, or unblocks under the new configuration,
+  and D12.3 finds none and decides `REVIEW`: a fresh round, whose entry gate
+  validates under the new configuration.
+- **When it happens:** only when a REMOTE round completes from #162's
+  journal in a later process than the one that launched the reviewer, and
+  the configuration changed in between (§2.16). The configuration is
+  loaded once per process, and a reviewer is launched only by a process
+  that holds its binding's set and policy (D5.5's relaunch rule). LOCAL has
+  no journal: it applies a review in the process that launched the
+  reviewer, so it compares equal by construction. A LOCAL difference would
+  be an invariant violation and is `BLOCKED` all the same; LOCAL has no
+  unblock, so the remedy is a new run.
+
 *Rationale.* Writing the certificate with the transition leaves no state in
 which the phase moved without one, or one exists for a phase that did not
-move.
+move. Issuing it from the binding keeps issuance a pure function of
+persisted inputs after any crash, empty set included, and routing on the
+difference keeps a certificate from ever standing for a policy no review
+was presented under.
+
+*Rejected.*
+
+- **Issuing from the configuration in force at issuance.** With an empty
+  set no record would contradict it, so recovery would certify a policy no
+  review was presented under, contrary to D8.1 and D14.1.
+- **Issuing no certificate on drift.** A restored configuration would then
+  still cost a review round, while the same drift found at the merge gate
+  is cured by a restore (D14.1). The two are handled alike.
+- **Relaunching the reviewer when a journal-completed round drifted.** The
+  comment is already published; #162 completes a planned round without a
+  reviewer, and a second verdict for the same round could contradict it.
 
 ### 2.13 MERGE: a fresh live gate, never "certificate ⇒ merge" (item 13)
 
@@ -1254,7 +1333,7 @@ are evicted or cleared. They are never rewritten for a new candidate.
 | Base rewritten (the merge base moves) | applicable | inapplicable | existing stale → `REVIEW`; records reused, a new round required |
 | Retarget (the base ref changes) | applicable | inapplicable | existing → `REVIEW` |
 | Base-bound or merge-result-bound definition | n/a in Wave 2B (refused at load) | n/a | future |
-| Definition set changes (configuration) | inapplicable | inapplicable | a producer gate or the REVIEW entry validates under the new set; at the merge gate, `BLOCKED` naming the change, and the operator restores the configuration or unblocks to `REVIEW` (no automatic re-review loop) |
+| Definition set changes (configuration) | inapplicable | inapplicable | a producer gate or the REVIEW entry, a reviewer relaunch included (D5.5), validates under the new set; at certificate issuance (D12.6) or at the merge gate, `BLOCKED` naming the change, and the operator restores the configuration and unblocks (D12.3 decides `READY_FOR_MERGE`) or unblocks under the new one (D12.3 decides `REVIEW`; no automatic re-review loop) |
 | Policy changes (sandbox mode, policy template, allow-list, timeout, materializer) | inapplicable | inapplicable | as for a definition change |
 | Review comment edited, deleted or doubled | n/a | inapplicable | existing #94 re-read → `BLOCKED` |
 | State hand-edited | load-time validation fails, or a digest mismatch | same | loud failure; never coerced |
@@ -1264,9 +1343,19 @@ are evicted or cleared. They are never rewritten for a new candidate.
 | Legacy state (before Wave 2B) in `READY_FOR_MERGE` / `MERGE`, OPEN PR | none | none | `BLOCKED` at the gate, with "unblock to `REVIEW`"; a PR already MERGED is reconciled as today |
 
 **D14.2 (#175).** **Operator override.** An explicit `unblock` (REMOTE) sets
-`validation_override_seq` to the highest record seq, in the unblock's own
-write.
+`validation_override_seq` in the unblock's own write: to the highest
+retained record seq, or to 0 when `validation_records` is empty.
 
+- An empty history is an ordinary case: the default empty set, a legacy
+  state migrated with no records (D15.4), and a run blocked before any
+  record was written (D10.5, an argv beyond its bounds in D10.3). Every seq
+  is at least 1, so 0 makes no record historical; it records that the
+  operator unblocked with nothing to override, and a later record is above
+  it.
+- Each later unblock sets it again by the same rule. The newest record is
+  never evicted (D11.4 evicts oldest first, and pinned records stay below
+  the bound), so the watermark never decreases within an issue and never
+  exceeds the highest retained seq (D11.1).
 - A non-PASS record at or below the watermark is historical, no longer
   terminal, so the next gate re-validates the same candidate. PASS records
   keep their applicability. An `INTERRUPTED` record at or below it no
@@ -1315,8 +1404,8 @@ fold it into #172's migration before that merges or make its own bump.
 | record written, marker not cleared | impossible by construction (one write); a hand-made stale marker is cleared by the resume path, never by load | #172 |
 | producer: PASS records written, no effect intent | ADR 0004 W1: no plan and no completion context were saved, because a phase persists its rendered payload only with its intents (ADR 0004 D8.4), so the agent is relaunched under the existing attempt accounting; its commit is still in the worktree, and the same candidate reuses the records without rerunning them | #173 |
 | producer: a FAIL record written | the record and the counter are one write (in `REPLAN_REEXECUTE`, the record and the rejection, D5.3); terminal for (C, definition, P); the next step relaunches until the bound, then `BLOCKED`; never PASS by recovery | #173 |
-| REVIEW entry: binding written, reviewer not launched | relaunch with the same binding, with no new validation | #173 |
-| comment published (#162), state not saved | #162's journal completes the round; the certificate is issued from the journal-observed identity, with no relaunch and no new comment | #174 |
+| REVIEW entry: binding written, reviewer not launched | relaunch through the entry gate: the same binding, with no new validation, when its set and policy digests equal the ones in force; otherwise evidence under the configuration in force and a replaced binding (D5.5) | #173 |
+| comment published (#162), state not saved | #162's journal completes the round; the certificate is issued from the journal-observed identity and from the binding's set and policy, empty set included, with no relaunch and no new comment; if the configuration in force yields another set or policy digest, the same write enters `BLOCKED` instead of `READY_FOR_MERGE` (D12.6) | #174 |
 | certificate written | it was written atomically with the transition, so there is nothing to reconcile | #174 |
 | candidate moved during validation | the records stay true for C; the pre-launch HEAD check routes to `REVIEW` for the new head | #175 |
 | export directory left behind by a kill | it is not evidence and is never read again; each materialization uses a fresh directory, and a leftover is ordinary temporary-directory debris, as `autoforge-premerge-*` is today | #171 |
@@ -1400,7 +1489,7 @@ the parity work (#155) are consumed, not changed.
 | #171 | D6.1–D6.4, D6.6; §2.16's export row |
 | #172 | D2.1–D2.3, D2.6, D2.7, D3.1, D3.2, D3.5, D3.6, D4.2, D5.6, D7.1, D7.2, D8.1–D8.3, D8.5, D8.6, D10.1–D10.7, D11.1–D11.4, D12.1, D15.1, D15.2, D15.4; §2.16's marker rows |
 | #173 | D2.4, D5.1–D5.5, D5.7, D9.1–D9.5; §2.16's producer and REVIEW-entry rows |
-| #174 | D1.3, D12.2, D12.3, D12.5; §2.16's comment and certificate rows |
+| #174 | D1.3, D12.2, D12.3, D12.5, D12.6; §2.16's comment and certificate rows |
 | #175 | D12.4, D13.1, D13.2, D14.1, D14.2; §2.16's moved-candidate row |
 | documentation only | D1.1, D1.2, D2.5, D3.3, D3.4, D4.1, D5.8, D6.5, D7.3, D8.4, D9.6, D13.3, D15.3, D15.5, D17.1, D17.3, D18.1 |
 | this record | D7.4 (the ADR 0001 note) |
@@ -1446,6 +1535,17 @@ the parity work (#155) are consumed, not changed.
   0005 D8.4), `mkdtemp` until then.
 - **LOCAL REVIEW writes the `review_evidence` binding** (D5.7), which #170
   assigned to REMOTE only, so that a LOCAL certificate has its input.
+- **The `review_evidence` binding records `policy_digest`** (D11.2), which
+  #170's binding lacked, and the certificate copies its set and policy from
+  the binding (D12.2). With an empty set no record carries the policy, so a
+  round completed from #162's journal after a configuration change could
+  otherwise only certify the policy in force, which no review was presented
+  under. Drift at issuance enters `BLOCKED` (D12.6), and a reviewer
+  relaunch passes the entry gate again (D5.5), where #170 relaunched with
+  the same binding unconditionally.
+- **The override watermark is 0 when `unblock` finds no record** (D14.2).
+  #170 set it to the highest record seq, which an empty history does not
+  have, and D10.3's range now starts at 0.
 - **The attempt marker** is written after every check that can refuse a
   launch, and a launch failure leaves none behind (D11.2), so that only a
   crash produces `INTERRUPTED`.
@@ -1544,6 +1644,12 @@ fake filter programs, and no paid provider or model call.
   enumeration value is refused; an enforcement text fact longer than its
   bound is clipped with an ellipsis by the writer; the worst-case total
   stays under the state file's bound.
+- Referential integrity (D11.1): a binding or certificate naming a record
+  whose candidate identity or `policy_digest` differs from its own is
+  refused on load; a binding with no `policy_digest`, for an empty set
+  too, is refused; the watermark loads at 0 with no record and at the
+  highest retained seq, and is refused at -1, above the highest retained
+  seq, and above 0 with no record.
 - Output safety: a secret straddling the tail cut is redacted on the full
   text first; control characters are escaped before the cut, the stored tail
   is at most 2,000 characters, and a cut never splits an escape; invalid
@@ -1591,7 +1697,14 @@ fake filter programs, and no paid provider or model call.
   launch.
 - REVIEW entry: the normal path launches no validator; a human push is
   validated after an objects-only fetch that creates no ref; a non-PASS is
-  presented; journal-first completion validates nothing.
+  presented; journal-first completion validates nothing; the binding
+  carries the policy digest the gate computed, with an empty set too.
+- Reviewer relaunch (a crash after the binding write, before any plan),
+  with a non-empty and with an empty set: under an unchanged configuration
+  the binding is reused byte for byte and no validator launches; with the
+  timeout or the sandbox mode changed, the binding is replaced under the
+  new `policy_digest` in the save that charges the relaunch, and a
+  non-empty set is validated again first.
 - The evidence section: `escape_inline` for argv, `fenced_untrusted_block`
   for tails, provenance only for PASS, the empty-set wording, and a
   hostile tail (marker openers, a fake `CONTROL_RESULT`, fence breakers)
@@ -1610,8 +1723,24 @@ fake filter programs, and no paid provider or model call.
   `REVIEW → DONE`.
 - A round completed by #162's journal issues the certificate from the
   observed identity, with no relaunch and no second comment.
-- Issuance is refused while a presented record is not PASS or not
-  applicable.
+- Empty-set journal recovery (D12.6): with an empty set, a crash injected
+  after the comment is published and before the issuing save, then a
+  resume with `execution.command_timeout_seconds` changed, and again with
+  the sandbox mode changed (the allow-list until #168 adds the mode). The
+  journal completes the round with no relaunch, no second comment and no
+  validator launch; the certificate carries the binding's `policy_digest`,
+  never the one in force; the same write enters `BLOCKED` naming the policy
+  change, not `READY_FOR_MERGE`. `unblock` after restoring the
+  configuration decides `READY_FOR_MERGE`; `unblock` under the changed one
+  decides `REVIEW`. With the configuration unchanged, the same recovery
+  enters `READY_FOR_MERGE`. The same cases with a non-empty set, and with a
+  changed definition set, block alike.
+- The certificate's candidate, record seqs and digests,
+  `validation_set_digest` and `policy_digest` equal the binding's, for an
+  empty set and a non-empty one.
+- Issuance is refused while a named record is not PASS, or the named
+  records do not encode to the binding's `validation_set_digest`, with no
+  certificate.
 - The unblock of an OPEN PR at the clean-reviewed revision with no
   applicable certificate decides `REVIEW`; with one, `READY_FOR_MERGE`.
 - LOCAL `DONE` requires a certificate.
@@ -1633,6 +1762,11 @@ fake filter programs, and no paid provider or model call.
 - The override: set only by `unblock`, shown in `status`; a non-PASS at or
   below the watermark is re-run, a PASS keeps its applicability; automatic
   recovery never sets it.
+- The override with an empty history: with the default empty set, with a
+  legacy state migrated with no records, and after a block before any
+  record (a materialization failure), `unblock` writes 0 and the state
+  loads; the next record gets a seq above 0 and a FAIL in it is terminal; a
+  later `unblock` sets the highest retained seq.
 - `merge.verification_commands` still runs at every gate pass when a
   certificate exists.
 
@@ -1674,8 +1808,9 @@ fake filter programs, and no paid provider or model call.
   that writes covered files nondeterministically now blocks with a remedy
   instead of being bound.
 - **Changing `execution.command_timeout_seconds`, the allow-list or the
-  sandbox mode after a clean review** blocks the merge gate until it is
-  restored or a new round runs.
+  sandbox mode after a clean review** blocks the merge gate, or the
+  certificate issuance of a round that completes from #162's journal
+  (D12.6), until it is restored or a new round runs.
 - **A validation command's argv is bounded** (D10.3): a configuration that
   exceeds the bounds is refused at load, where today any length is
   accepted.
