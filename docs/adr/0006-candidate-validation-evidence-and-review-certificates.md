@@ -507,13 +507,40 @@ about the failure reaches the agent.
   cannot return a clean result over it (D9.4).
 - **Relaunch:** a reviewer relaunched after a crash (the binding was
   written and no plan was saved) passes the entry gate again, under the
-  configuration the relaunching process loaded. When the binding's
-  `validation_set_digest` and `policy_digest` (D11.2) equal the ones in
-  force, the binding is reused unchanged and nothing reruns. When either
-  differs, the gate requires evidence under the configuration in force, as
-  for a head no producer validated, and replaces the binding in the save
-  that charges the relaunch. A reviewer is therefore never launched under a
-  binding whose set or policy the launching process does not hold.
+  configuration the relaunching process loaded, and after
+  `_bind_review_head` has read the PR head again. A push made after the
+  crash has therefore already moved the bound head, while the upcoming
+  round stays the same: only an applied review advances it.
+- **Reusing a persisted binding:** at every entry, a relaunch included,
+  the persisted binding is reused unchanged, and nothing reruns, only when
+  all four match:
+  - its review round is the upcoming round;
+  - its candidate's commit is the head just bound;
+  - its `validation_set_digest` (D11.2) equals the one in force;
+  - its `policy_digest` (D11.2) equals the one in force.
+- **Any mismatch:** the binding is not evidence for this launch. The gate
+  requires evidence for the bound head under the configuration in force,
+  exactly as at a first entry (applicable records are reused, D10.6, and a
+  head no producer validated is validated now), and replaces the binding
+  in the save that charges the launch:
+  - **Head drift, configuration unchanged:** a crash after the binding for
+    C1 was saved, then a human or external push of C2. C1's records are
+    not applicable to C2 (§1.4) and no producer validated C2, so a
+    non-empty set is validated on C2 after an objects-only fetch, and an
+    empty set runs nothing. The new binding names C2 and C2's records,
+    none for an empty set. Reusing C1's binding would present records the
+    evidence section refuses as inapplicable (D9.1), or, with an empty
+    set, where no record contradicts it, carry a binding for C1 into an
+    issuance for C2, which D12.2 blocks as an invariant violation.
+  - **Another round:** a binding an earlier round left, for example after
+    a FIX that pushed nothing, so that the same candidate is reviewed
+    again. Its applicable records are reused with no launch, and the new
+    binding names the upcoming round.
+  - **Configuration drift:** the set or the policy differs. A non-empty
+    set is validated again under the configuration in force.
+- A reviewer is therefore never launched under a binding of another round
+  or another candidate, or of a set or policy the launching process does
+  not hold.
 - **Journal-first completion:** a REVIEW that completes from a persisted
   plan (#162) launches no reviewer and validates nothing; its binding was
   written before the reviewer whose result it completes, and the
@@ -529,11 +556,14 @@ fingerprint (ADR 0001 §5.10). It requires evidence for the bound
 fingerprint under the run contract's set (an empty set is complete), and
 writes the `review_evidence` binding (D11.2) naming that evidence in the
 save that charges the reviewer's launch, as D5.5 does in REMOTE, a
-relaunch included. The binding names records, never a fingerprint, so
-§5.10's rule holds. A LOCAL state with a non-empty set and no evidence,
-which only a state persisted before Wave 2B can be, enters `BLOCKED` with
-"no validation evidence for this LOCAL run; start a new local run", before
-any launch.
+relaunch included. D5.5's reuse rule applies, with the `LocalCandidate` of
+the bound fingerprint (D2.6) compared in place of the PR head; on a
+mismatch the binding is rewritten from the evidence the write phase
+recorded, never by validating. The binding names records, never a
+fingerprint, so §5.10's rule holds. A LOCAL state with a non-empty set and
+no evidence, which only a state persisted before Wave 2B can be, enters
+`BLOCKED` with "no validation evidence for this LOCAL run; start a new
+local run", before any launch.
 
 **D5.8 (documentation only).** **No `VALIDATE` phase.** Every window is
 modelled by state plus records: a durable attempt marker (D11.2), records
@@ -1216,13 +1246,15 @@ No review prose is included. Every field is bounded by D10.3.
   `policy_digest` are copied from the binding, never computed from the
   configuration in force at issuance. With an empty set the binding is the
   only persisted copy of the policy the review was presented under (D11.2).
-- Issuance requires the binding's candidate to be the reviewed one, and the
-  records it names to be PASS, one per definition of its set, in set order:
-  their `definition_digest`s encode to its `validation_set_digest` (D3.5),
-  which for an empty set is the empty list's. D9.4 refuses a clean result
-  over a non-PASS record, and load checks each record's candidate and
-  policy (D11.1), so a failure here is an invariant violation: no
-  certificate, and `BLOCKED` naming the requirement.
+- Issuance requires the binding's review round to be the completed round
+  and its candidate the reviewed one, and the records it names to be PASS,
+  one per definition of its set, in set order: their `definition_digest`s
+  encode to its `validation_set_digest` (D3.5), which for an empty set is
+  the empty list's. D5.5 never launches a reviewer under a binding of
+  another round or candidate, D9.4 refuses a clean result over a non-PASS
+  record, and load checks each record's candidate and policy (D11.1), so a
+  failure here is an invariant violation: no certificate, and `BLOCKED`
+  naming the requirement.
 - It is a pure function of persisted, verified inputs, and re-derivable
   after a crash.
 
@@ -1261,7 +1293,7 @@ D8.1).
   journal in a later process than the one that launched the reviewer, and
   the configuration changed in between (§2.16). The configuration is
   loaded once per process, and a reviewer is launched only by a process
-  that holds its binding's set and policy (D5.5's relaunch rule). LOCAL has
+  that holds its binding's set and policy (D5.5's reuse rule). LOCAL has
   no journal: it applies a review in the process that launched the
   reviewer, so it compares equal by construction. A LOCAL difference would
   be an invariant violation and is `BLOCKED` all the same; LOCAL has no
@@ -1327,7 +1359,7 @@ are evicted or cleared. They are never rewritten for a new candidate.
 
 | Change | `ValidationRecord` (candidate-tree) | `ReviewCertificate` | Routing |
 |---|---|---|---|
-| New commit, force-push, human push to the PR | inapplicable (another commit) | inapplicable | existing drift → `REVIEW`; the REVIEW entry validates the new head |
+| New commit, force-push, human push to the PR | inapplicable (another commit) | inapplicable | existing drift → `REVIEW`; the REVIEW entry, a reviewer relaunch included (D5.5), validates the new head and replaces a binding for the old one |
 | Same tree, another commit | inapplicable (the commit is part of the key) | inapplicable | as above |
 | Base advances, merge base unchanged | applicable | applicable (it binds the merge base, as today) | `BEHIND` is left to the existing readiness check |
 | Base rewritten (the merge base moves) | applicable | inapplicable | existing stale → `REVIEW`; records reused, a new round required |
@@ -1404,7 +1436,7 @@ fold it into #172's migration before that merges or make its own bump.
 | record written, marker not cleared | impossible by construction (one write); a hand-made stale marker is cleared by the resume path, never by load | #172 |
 | producer: PASS records written, no effect intent | ADR 0004 W1: no plan and no completion context were saved, because a phase persists its rendered payload only with its intents (ADR 0004 D8.4), so the agent is relaunched under the existing attempt accounting; its commit is still in the worktree, and the same candidate reuses the records without rerunning them | #173 |
 | producer: a FAIL record written | the record and the counter are one write (in `REPLAN_REEXECUTE`, the record and the rejection, D5.3); terminal for (C, definition, P); the next step relaunches until the bound, then `BLOCKED`; never PASS by recovery | #173 |
-| REVIEW entry: binding written, reviewer not launched | relaunch through the entry gate: the same binding, with no new validation, when its set and policy digests equal the ones in force; otherwise evidence under the configuration in force and a replaced binding (D5.5) | #173 |
+| REVIEW entry: binding written, reviewer not launched | relaunch through the entry gate, after `_bind_review_head` reads the PR head again: the same binding, with no new validation, only when its review round is the upcoming one, its candidate's commit is the head just bound, and its set and policy digests equal the ones in force; otherwise evidence for the bound head under the configuration in force and a replaced binding, in the save that charges the relaunch (D5.5). A push made after the crash (the binding names C1, the head is now C2) is validated under an unchanged configuration too, and the new binding names C2, with no record for an empty set | #173 |
 | comment published (#162), state not saved | #162's journal completes the round; the certificate is issued from the journal-observed identity and from the binding's set and policy, empty set included, with no relaunch and no new comment; if the configuration in force yields another set or policy digest, the same write enters `BLOCKED` instead of `READY_FOR_MERGE` (D12.6) | #174 |
 | certificate written | it was written atomically with the transition, so there is nothing to reconcile | #174 |
 | candidate moved during validation | the records stay true for C; the pre-launch HEAD check routes to `REVIEW` for the new head | #175 |
@@ -1543,6 +1575,12 @@ the parity work (#155) are consumed, not changed.
   under. Drift at issuance enters `BLOCKED` (D12.6), and a reviewer
   relaunch passes the entry gate again (D5.5), where #170 relaunched with
   the same binding unconditionally.
+- **A persisted binding is reused only for its own round and candidate**
+  (D5.5), as well as its own set and policy. #170's crash row reused it
+  whatever the head: a push made while the controller was down would then
+  have had one candidate's evidence presented for another's review, refused
+  as inapplicable, or, with an empty set, blocked at issuance (D12.2). The
+  relaunch validates the new head instead and replaces the binding.
 - **The override watermark is 0 when `unblock` finds no record** (D14.2).
   #170 set it to the highest record seq, which an empty history does not
   have, and D10.3's range now starts at 0.
@@ -1701,10 +1739,25 @@ fake filter programs, and no paid provider or model call.
   carries the policy digest the gate computed, with an empty set too.
 - Reviewer relaunch (a crash after the binding write, before any plan),
   with a non-empty and with an empty set: under an unchanged configuration
-  the binding is reused byte for byte and no validator launches; with the
-  timeout or the sandbox mode changed, the binding is replaced under the
-  new `policy_digest` in the save that charges the relaunch, and a
-  non-empty set is validated again first.
+  and an unchanged PR head the binding is reused byte for byte and no
+  validator launches; with the timeout or the sandbox mode changed, the
+  binding is replaced under the new `policy_digest` in the save that
+  charges the relaunch, and a non-empty set is validated again first.
+- Reviewer relaunch with head drift: a crash after the binding for C1 is
+  written and before any plan, then a human push of C2, with the
+  configuration unchanged, with a non-empty and with an empty set. The
+  entry binds C2 and does not reuse C1's binding. A non-empty set is
+  validated on C2 after an objects-only fetch that creates no ref; an empty
+  set launches nothing. In the save that charges the relaunch, before the
+  reviewer launches, the binding is replaced by one naming the upcoming
+  round, C2 and C2's records (none for an empty set). The evidence section
+  presents C2's records with no applicability refusal, and the binding's
+  candidate is the head the round reviews, as D12.2's issuance requires; a
+  C2 that fails is presented as a non-PASS.
+- A binding an earlier round left (a FIX that pushed nothing, so the next
+  round reviews the same candidate) is not reused: the entry replaces it
+  with one naming the upcoming round, reusing the records with no
+  validator launch.
 - The evidence section: `escape_inline` for argv, `fenced_untrusted_block`
   for tails, provenance only for PASS, the empty-set wording, and a
   hostile tail (marker openers, a fake `CONTROL_RESULT`, fence breakers)
@@ -1738,9 +1791,10 @@ fake filter programs, and no paid provider or model call.
 - The certificate's candidate, record seqs and digests,
   `validation_set_digest` and `policy_digest` equal the binding's, for an
   empty set and a non-empty one.
-- Issuance is refused while a named record is not PASS, or the named
-  records do not encode to the binding's `validation_set_digest`, with no
-  certificate.
+- Issuance is refused while the binding's round is not the completed
+  round or its candidate is not the reviewed one, a named record is not
+  PASS, or the named records do not encode to the binding's
+  `validation_set_digest`, with no certificate.
 - The unblock of an OPEN PR at the clean-reviewed revision with no
   applicable certificate decides `REVIEW`; with one, `READY_FOR_MERGE`.
 - LOCAL `DONE` requires a certificate.
