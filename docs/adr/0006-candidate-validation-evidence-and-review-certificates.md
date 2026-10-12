@@ -503,8 +503,9 @@ about the failure reaches the agent.
   the PR head now, fetching objects only (`fetch_pr_head`,
   `commit_is_local`; no ref is created).
 - **Non-PASS at REVIEW entry:** this happens only for a candidate no
-  producer validated. It is presented to the reviewer (D9.1, D9.2), who
-  cannot return a clean result over it (D9.4).
+  producer validated under the set and policy in force. It is presented to
+  the reviewer (D9.1, D9.2), who cannot return a clean result over it
+  (D9.4).
 - **Relaunch:** a reviewer relaunched after a crash (the binding was
   written and no plan was saved) passes the entry gate again, under the
   configuration the relaunching process loaded, and after
@@ -513,11 +514,14 @@ about the failure reaches the agent.
   round stays the same: only an applied review advances it.
 - **Reusing a persisted binding:** at every entry, a relaunch included,
   the persisted binding is reused unchanged, and nothing reruns, only when
-  all four match:
+  all five hold:
   - its review round is the upcoming round;
   - its candidate's commit is the head just bound;
   - its `validation_set_digest` (D11.2) equals the one in force;
-  - its `policy_digest` (D11.2) equals the one in force.
+  - its `policy_digest` (D11.2) equals the one in force;
+  - no record it names is a `FAIL` or `TIMEOUT` at or below the override
+    watermark `validation_override_seq` (D14.2). A `PASS` record never
+    breaks this condition, since the override leaves a `PASS` applicable.
 - **Any mismatch:** the binding is not evidence for this launch. The gate
   requires evidence for the bound head under the configuration in force,
   exactly as at a first entry (applicable records are reused, D10.6, and a
@@ -538,14 +542,29 @@ about the failure reaches the agent.
     binding names the upcoming round.
   - **Configuration drift:** the set or the policy differs. A non-empty
     set is validated again under the configuration in force.
+  - **Operator override:** an entry presented a `FAIL` or `TIMEOUT` (the
+    non-PASS case above), and the round ended in `BLOCKED` without
+    completing (the reviewer reported `blocked`, for example), so
+    the round, the candidate and the configuration are all unchanged. The
+    operator repairs the environment and unblocks to `REVIEW`, and the
+    unblock's watermark covers the failing record (D14.2). D10.6 then
+    reuses the `PASS` records before the overridden definition with no
+    launch, runs that definition again and continues the set, and the new
+    binding names the upcoming round and those records. Reusing the old
+    binding would run nothing and present the reviewer the failure the
+    operator overrode.
 - A reviewer is therefore never launched under a binding of another round
-  or another candidate, or of a set or policy the launching process does
-  not hold.
+  or another candidate, of a set or policy the launching process does not
+  hold, or naming a failure the operator overrode.
 - **Journal-first completion:** a REVIEW that completes from a persisted
   plan (#162) launches no reviewer and validates nothing; its binding was
   written before the reviewer whose result it completes, and the
   certificate is issued from that binding, never from the configuration in
-  force (D12.2, D12.6).
+  force (D12.2, D12.6). An override written after the plan was saved
+  changes nothing there: the reuse rule above applies only where a
+  reviewer is to launch, the reviewer already gave its verdict on the
+  records the binding names, and a binding naming a non-PASS never yields
+  a certificate (D9.4, D12.2).
 
 **D5.6 (#172).** **LOCAL write phases** (`ANALYZE_EXECUTE`, `FIX`):
 validation stays where it is (`_verified_snapshot`), now producing records,
@@ -557,13 +576,14 @@ fingerprint under the run contract's set (an empty set is complete), and
 writes the `review_evidence` binding (D11.2) naming that evidence in the
 save that charges the reviewer's launch, as D5.5 does in REMOTE, a
 relaunch included. D5.5's reuse rule applies, with the `LocalCandidate` of
-the bound fingerprint (D2.6) compared in place of the PR head; on a
-mismatch the binding is rewritten from the evidence the write phase
-recorded, never by validating. The binding names records, never a
-fingerprint, so §5.10's rule holds. A LOCAL state with a non-empty set and
-no evidence, which only a state persisted before Wave 2B can be, enters
-`BLOCKED` with "no validation evidence for this LOCAL run; start a new
-local run", before any launch.
+the bound fingerprint (D2.6) compared in place of the PR head; its
+override condition always holds, since LOCAL has no unblock and writes no
+watermark (D14.2). On a mismatch the binding is rewritten from the
+evidence the write phase recorded, never by validating. The binding names
+records, never a fingerprint, so §5.10's rule holds. A LOCAL state with a
+non-empty set and no evidence, which only a state persisted before Wave 2B
+can be, enters `BLOCKED` with "no validation evidence for this LOCAL run;
+start a new local run", before any launch.
 
 **D5.8 (documentation only).** **No `VALIDATE` phase.** Every window is
 modelled by state plus records: a durable attempt marker (D11.2), records
@@ -1081,7 +1101,9 @@ recovery; only the operator's override makes them historical (D14.2).
 
 **D10.6 (#172).** **Execution.** Definitions run sequentially in set order.
 For each one, an applicable `PASS` record is reused; an applicable terminal
-record (D10.4) is reused and ends the set; otherwise the definition runs.
+record (D10.4), a `FAIL` or `TIMEOUT` above the override watermark
+(D14.2), is reused and ends the set; otherwise the definition runs, so a
+`FAIL` or `TIMEOUT` the watermark made historical is run again.
 The set stops at the first non-PASS, and the definitions after it get no
 record.
 
@@ -1367,6 +1389,7 @@ are evicted or cleared. They are never rewritten for a new candidate.
 | Base-bound or merge-result-bound definition | n/a in Wave 2B (refused at load) | n/a | future |
 | Definition set changes (configuration) | inapplicable | inapplicable | a producer gate or the REVIEW entry, a reviewer relaunch included (D5.5), validates under the new set; at certificate issuance (D12.6) or at the merge gate, `BLOCKED` naming the change, and the operator restores the configuration and unblocks (D12.3 decides `READY_FOR_MERGE`) or unblocks under the new one (D12.3 decides `REVIEW`; no automatic re-review loop) |
 | Policy changes (sandbox mode, policy template, allow-list, timeout, materializer) | inapplicable | inapplicable | as for a definition change |
+| Operator override (`unblock`, D14.2) | a `FAIL` or `TIMEOUT` at or below the watermark: historical, run again; a `PASS`: applicable | unchanged (it names `PASS` records only) | the next gate runs the overridden definition again (D10.6); at REVIEW entry a binding naming the overridden record is not reused and is replaced before the reviewer launches (D5.5) |
 | Review comment edited, deleted or doubled | n/a | inapplicable | existing #94 re-read → `BLOCKED` |
 | State hand-edited | load-time validation fails, or a digest mismatch | same | loud failure; never coerced |
 | Replan replacement | no transfer: a new commit, new records | the old PR's certificate never matches the replacement PR | the replacement PR needs its own validation and review |
@@ -1392,6 +1415,13 @@ retained record seq, or to 0 when `validation_records` is empty.
   terminal, so the next gate re-validates the same candidate. PASS records
   keep their applicability. An `INTERRUPTED` record at or below it no
   longer counts toward the interruption bound (D10.7).
+- The unblock neither clears nor rewrites the `review_evidence` binding:
+  whether it may be reused is derived at the next REVIEW entry (D14.1). A
+  binding naming a `FAIL` or `TIMEOUT` at or below the watermark is not
+  reused there (D5.5): the entry gate runs that definition again through
+  D10.6, reusing the `PASS` records before it, and replaces the binding
+  before the reviewer launches. The reviewer is presented the new records,
+  never the overridden one.
 - It is a human decision, shown in `status` and the run log. Automatic
   recovery never sets it.
 - LOCAL has no unblock; a new run starts with no records.
@@ -1399,6 +1429,13 @@ retained record seq, or to 0 when `validation_records` is empty.
 *Rationale.* A terminal FAIL protects an unattended run from re-running a
 known failure; a human who fixed the environment (a missing tool, a full
 disk) needs a way to ask for one more run without hand-editing state.
+
+*Rejected.* **Clearing the `review_evidence` binding in the unblock
+write.** The unblock would become a second writer of the binding, and a
+round that the same unblock sends to complete from #162's journal issues
+its certificate from that binding (D12.2). Deriving the answer where the
+binding is reused needs no staleness flag (D14.1), and the entry gate
+already replaces a binding that fails a reuse condition.
 
 ### 2.15 State protocol rule (item 15)
 
@@ -1436,7 +1473,7 @@ fold it into #172's migration before that merges or make its own bump.
 | record written, marker not cleared | impossible by construction (one write); a hand-made stale marker is cleared by the resume path, never by load | #172 |
 | producer: PASS records written, no effect intent | ADR 0004 W1: no plan and no completion context were saved, because a phase persists its rendered payload only with its intents (ADR 0004 D8.4), so the agent is relaunched under the existing attempt accounting; its commit is still in the worktree, and the same candidate reuses the records without rerunning them | #173 |
 | producer: a FAIL record written | the record and the counter are one write (in `REPLAN_REEXECUTE`, the record and the rejection, D5.3); terminal for (C, definition, P); the next step relaunches until the bound, then `BLOCKED`; never PASS by recovery | #173 |
-| REVIEW entry: binding written, reviewer not launched | relaunch through the entry gate, after `_bind_review_head` reads the PR head again: the same binding, with no new validation, only when its review round is the upcoming one, its candidate's commit is the head just bound, and its set and policy digests equal the ones in force; otherwise evidence for the bound head under the configuration in force and a replaced binding, in the save that charges the relaunch (D5.5). A push made after the crash (the binding names C1, the head is now C2) is validated under an unchanged configuration too, and the new binding names C2, with no record for an empty set | #173 |
+| REVIEW entry: binding written, reviewer not launched | relaunch through the entry gate, after `_bind_review_head` reads the PR head again: the same binding, with no new validation, only when its review round is the upcoming one, its candidate's commit is the head just bound, its set and policy digests equal the ones in force, and it names no `FAIL` or `TIMEOUT` at or below the override watermark; otherwise evidence for the bound head under the configuration in force and a replaced binding, in the save that charges the relaunch (D5.5). A push made after the crash (the binding names C1, the head is now C2) is validated under an unchanged configuration too, and the new binding names C2, with no record for an empty set | #173 |
 | comment published (#162), state not saved | #162's journal completes the round; the certificate is issued from the journal-observed identity and from the binding's set and policy, empty set included, with no relaunch and no new comment; if the configuration in force yields another set or policy digest, the same write enters `BLOCKED` instead of `READY_FOR_MERGE` (D12.6) | #174 |
 | certificate written | it was written atomically with the transition, so there is nothing to reconcile | #174 |
 | candidate moved during validation | the records stay true for C; the pre-launch HEAD check routes to `REVIEW` for the new head | #175 |
@@ -1581,6 +1618,13 @@ the parity work (#155) are consumed, not changed.
   have had one candidate's evidence presented for another's review, refused
   as inapplicable, or, with an empty set, blocked at issuance (D12.2). The
   relaunch validates the new head instead and replaces the binding.
+- **A persisted binding naming a failure the operator overrode is not
+  reused** (D5.5, D14.2). #170 made such a record historical but reused the
+  binding regardless. A review whose entry presented a `FAIL`, and which
+  ended in `BLOCKED` without completing, would then, after an unblock to
+  `REVIEW` under the same round, candidate and configuration, run nothing
+  and present the overridden failure again. The entry gate runs the
+  overridden definition again (D10.6) and replaces the binding instead.
 - **The override watermark is 0 when `unblock` finds no record** (D14.2).
   #170 set it to the highest record seq, which an empty history does not
   have, and D10.3's range now starts at 0.
@@ -1758,6 +1802,18 @@ fake filter programs, and no paid provider or model call.
   round reviews the same candidate) is not reused: the entry replaces it
   with one naming the upcoming round, reusing the records with no
   validator launch.
+- A binding naming an overridden failure, for a `FAIL` and again for a
+  `TIMEOUT`: an entry for a candidate no producer validated presents a
+  `PASS` at index 0 and the non-PASS at index 1, and the reviewer reports
+  `blocked`, so the round does not complete. The state then carries the
+  watermark D14.2's unblock writes, with the PR head, the round, the set
+  and the policy unchanged. The next entry does not reuse the binding:
+  index 0's record is reused with no launch, index 1 is validated again,
+  and in the save that charges the launch the binding is replaced by one
+  naming the upcoming round, index 0's record and the new records. The
+  evidence section presents the new records, never the overridden one; a
+  new `FAIL` is presented as a non-PASS, and a reviewer relaunched after a
+  crash past that save reuses the replacement binding byte for byte.
 - The evidence section: `escape_inline` for argv, `fenced_untrusted_block`
   for tails, provenance only for PASS, the empty-set wording, and a
   hostile tail (marker openers, a fake `CONTROL_RESULT`, fence breakers)
@@ -1816,6 +1872,16 @@ fake filter programs, and no paid provider or model call.
 - The override: set only by `unblock`, shown in `status`; a non-PASS at or
   below the watermark is re-run, a PASS keeps its applicability; automatic
   recovery never sets it.
+- The override of an uncompleted review, end to end: a REVIEW entry
+  presents a `FAIL` for a candidate no producer validated, the reviewer
+  reports `blocked`, and the operator repairs the environment and runs
+  `unblock`, which decides `REVIEW` with the candidate and the
+  configuration unchanged. The entry runs the failing definition again,
+  reusing the `PASS` records before it, and replaces the binding before the
+  reviewer launches; the reviewer's prompt presents the replacement
+  records, now `PASS`, and a clean result issues a certificate naming them.
+  An `unblock` that sends a planned round to complete from #162's journal
+  launches no validator and leaves the binding as written.
 - The override with an empty history: with the default empty set, with a
   legacy state migrated with no records, and after a block before any
   record (a materialization failure), `unblock` writes 0 and the state
