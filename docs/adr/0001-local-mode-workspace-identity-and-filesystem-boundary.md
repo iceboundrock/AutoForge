@@ -943,6 +943,21 @@ every configured command a self-inflicted drift. The extra walk happens
 only when commands are configured. The `--dry-run` plan for REVIEW reports
 the block the run would take, so a drifted tree is visible without a launch.
 
+*Amendment (2026-10-12, #170, ADR 0006 D7.2).* The post-validation binding
+becomes a convergence rule: evidence for fingerprint F requires a validation
+run that starts at F and ends at F. Each validation record carries the
+fingerprint its command started at and the one it ended at, and is evidence
+only for its start, only when the two are equal. When a passing run changed
+covered bytes (F0 → F1), the controller performs one confirming run of the
+whole set from F1; if every command passes and every record starts and ends
+at F1, F1 is bound, which is the post-validation binding above. Anything
+else is "validation does not converge": the phase is not verified and
+follows the existing bounded relaunch, then `BLOCKED`, naming
+`local.exclude`, or a validator that does not write covered files, as the
+remedy. A failing or timed-out run is never evidence. REVIEW still never
+binds, and rules S, C, V and G are otherwise unchanged. #172 implements the
+rule; until it lands, the paragraphs above describe the code.
+
 ## 6. Completeness analysis
 
 Every shape a working tree or repository can present, and its state. There is
