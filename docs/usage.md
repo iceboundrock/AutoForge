@@ -279,12 +279,16 @@ profile; see [Configuration: Agent limits](configuration.md#agent-limits).
   resets the timer, and neither will a wait for a human answer once agents
   can ask one (#126).
 
-When a limit fires, the error names it and the agent's last output, for
-example `agent 'analyze_execute' made no progress for 900s (last activity
-08:31:02 UTC) and was killed`, or `... reached its 7200s maximum runtime and
-was killed`. The state is unchanged, nothing is retried automatically, and
-the step's `execution.json` records `timeout_limit` (`idle` or
-`max_runtime`), both configured values and `last_activity_at`.
+When a limit fires, the error names it, the agent's last output and the
+configuration key that set it, for example `agent 'analyze_execute' made no
+progress for 900s (last activity 08:31:02 UTC) and was killed. The limit is
+set by execution.default_idle_timeout_seconds`, or `... reached its 7200s
+maximum runtime and was killed. The limit is set by
+profiles.analyze_execute.max_runtime_seconds`. The state is unchanged,
+nothing is retried automatically, the error says where to look and how to
+resume ([Troubleshooting](#troubleshooting-and-recovery)), and the step's
+`execution.json` records `timeout_limit` (`idle` or `max_runtime`), both
+configured values and `last_activity_at`.
 
 ## Loop detection
 
@@ -310,10 +314,13 @@ the step's `execution.json` records it (`loop`, `loop_warnings`).
   `UPDATE_EPIC`)** the agent is killed at the threshold,
   exactly as on a timeout: its whole process group is ended, the state is
   unchanged and nothing is retried automatically. The error names the
-  pattern:
+  pattern, followed by where to look and how to resume
+  ([Troubleshooting](#troubleshooting-and-recovery)):
 
   ```text
-  agent 'fix' was killed: the same 2-step action cycle (Bash, Read) repeated 8 times over 9m14s with no new action. State unchanged — inspect the real Git/GitHub state, then 'resume'.
+  agent 'fix' was killed: the same 2-step action cycle (Bash, Read) repeated 8 times over 9m14s with no new action
+  State unchanged.
+  ...
   ```
 
   The step's `execution.json` says `ended_by: loop` and `timeout_limit:
@@ -451,10 +458,54 @@ ownership or discard uncommitted user changes.
   ..."). Any other non-zero exit, a timeout or a verification failure is not
   retried automatically and leaves the phase unchanged for `resume`. Inspect
   each invocation under `<state dir>/logs/<run-id>/`; a transient failure's
-  `error.txt` says `(transient: ...)`. A timeout says which limit fired; see
-  [Agent limits](#agent-limits) before raising one.
+  `error.txt` says `(transient: ...)`. A timeout says which limit fired and
+  the key that set it; see [Agent limits](#agent-limits) before raising one.
+
+  Every agent failure that leaves the phase unchanged (a timeout or loop
+  kill, a failed exit or provider failure, an agent that could not be
+  started, a malformed result that is not corrected) ends the same way:
+
+  ```text
+  autoforge: error: agent 'analyze_execute' made no progress for 1800s (last activity 08:31:02 UTC) and was killed. The limit is set by profiles.analyze_execute.idle_timeout_seconds
+  State unchanged.
+    worktree:  /home/me/code/.worktree/159   (3 uncommitted paths)
+    logs:      .autoforge/AutoForge-issue-159/logs/af-20261006T101500Z-3f2a9c/001-analyze_execute-1/
+    resume:    autoforge --config autoforge.yaml --state-dir .autoforge/AutoForge-issue-159 resume
+  Inspect the real Git/GitHub state first; 'resume --dry-run --max-steps 1' with the same flags shows the profile, limits and worktree it will use.
+  ```
+
+  - `worktree` is the issue's agent worktree, with the number of paths
+    `git status` reports there as changed or untracked: what the attempt
+    left behind. The count is left out when that read fails. A LOCAL run
+    prints no `worktree` line: its agent works in your checkout.
+  - `logs` is the failed launch's step directory (its progress, output and
+    error).
+  - `resume` repeats the `--config` and `--state-dir` this command was
+    started with, as you typed them; run it from the same directory. The
+    CLI does not look for a configuration file, so a bare `resume` after a
+    run started with them finds no run (no `--state-dir`) or runs on the
+    built-in defaults (no `--config`): another model, other limits and
+    another worktree. Nothing checks yet that `resume` uses the
+    configuration the run started with, so check the plan of the dry run
+    first.
 - **The run is `BLOCKED`:** read `autoforge status`, fix the cause, then
-  `autoforge unblock --reason "..."` and `autoforge resume` (see above).
+  `autoforge unblock --reason "..."` and `autoforge resume` (see above),
+  with the `--config` / `--state-dir` the run was started with; `unblock`
+  prints that `resume` command. A LOCAL run cannot be unblocked: start a new
+  `local run`. A run blocked because a checkout moved (the checkout the
+  controller is run from, or a LOCAL run's repository: an agent committed,
+  reset or switched branches) ends with where to look and what to run,
+  already carrying those flags:
+
+  ```text
+    checkout:  /home/me/code/AutoForge
+    unblock:   autoforge --config autoforge.yaml --state-dir .autoforge/AutoForge-issue-159 unblock --reason '<what you found>'
+    resume:    autoforge --config autoforge.yaml --state-dir .autoforge/AutoForge-issue-159 resume
+  Inspect the checkout and the agent's GitHub work first: 'unblock' re-inspects GitHub and re-enters a phase, and only then does 'resume' continue the run.
+  ```
+
+  A LOCAL run prints a `new run:` line (`autoforge ... local run <the
+  feature's absolute path>`) instead of `unblock` and `resume`.
 - **"refusing to launch: a process AutoForge launches would be handed a
   GitHub or git credential":** the message names the setting (for example
   a credential helper in the repository's git configuration, a remote URL
