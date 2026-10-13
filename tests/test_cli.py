@@ -22,6 +22,7 @@ from tests.conftest import (
     SHA_A,
     FakeGitHub,
     Origin,
+    acceptance,
     block,
     ci_check,
     comment_url,
@@ -31,6 +32,8 @@ from tests.conftest import (
     git_repo,
     implement,
     is_shell_probe,
+    make_engine,
+    publish_pr_head,
     review_result,
 )
 
@@ -2110,3 +2113,119 @@ def test_dry_run_shows_both_agent_limits(tmp_path, capsys, monkeypatch, fakes):
         "Loops:    loop detection kill (cycles of up to 4 actions x8, no new action for 1800s, "
         "repeated lines x200)"
     )
+
+
+# -- acceptance actions (#211) ---------------------------------------------------------
+def _blocked_on_acceptance(tmp_path, monkeypatch, fakes) -> tuple[str, str, str]:
+    """A run whose FIX plan's acceptance action awaits the operator: (state dir, id, body)."""
+    from autoforge.effects import EffectRecord
+
+    monkeypatch.chdir(tmp_path)
+    sd = tmp_path / ".autoforge"
+    gh = fakes["gh"]
+    eng = make_engine(sd, fixer(acceptance("R1-F1")), github=gh)
+    eng.origin = fakes["origin"]
+    head = publish_pr_head(eng)
+    gh.add_pr(head_sha=head)
+    eng.state.phase = Phase.FIX
+    eng.state.current_pr_url = PR
+    eng.state.current_head_sha = eng.state.reviewed_head_sha = head
+    eng.state.review_round = 1
+    eng.state.last_review_comment_url = comment_url(PR, 100)
+    eng.state.open_findings = [
+        {
+            "id": "R1-F1",
+            "classification": "nit",
+            "title": "post the check results",
+            "location": "src/x.py:1",
+            "required_resolution": "post the results on the issue",
+        }
+    ]
+    assert eng.step().next_phase == "BLOCKED"
+    record = EffectRecord.from_dict(load_state(sd / "state.json").effect_records[0])
+    eng.close()
+    return str(sd), record.action_id, record.body
+
+
+def test_status_shows_the_acceptance_action_awaiting_approval(tmp_path, capsys, monkeypatch, fakes):
+    sd, action, body = _blocked_on_acceptance(tmp_path, monkeypatch, fakes)
+    capsys.readouterr()
+    assert cli.main(["--state-dir", sd, "status"]) == 0
+    out = capsys.readouterr().out
+    assert f"Acceptance action {action} (FIX, review round 1, finding R1-F1)" in out
+    assert f"target:        {ISSUE}" in out
+    assert "finding:       R1-F1 post the check results" in out
+    assert "authorization: operator approval required (safety.acceptance_actions: approve)" in out
+    assert "state:         awaiting approval" in out
+    assert f"payload:       {len(body)} chars, sha256 " in out
+    assert f"--approve-action {action}" in out and f"--decline-action {action}" in out
+    assert cli.main(["--state-dir", sd, "status", "--json"]) == 0
+    [entry] = json.loads(capsys.readouterr().out)["acceptance_actions"]
+    assert entry["action_id"] == action and entry["state"] == "awaiting_approval"
+    assert entry["target"] == ISSUE and entry["pr"] == PR and entry["finding_id"] == "R1-F1"
+    assert entry["authorization"] == "operator" and entry["payload_chars"] == len(body)
+    assert entry["comment_url"] == ""
+
+
+def test_status_action_prints_the_exact_payload_bytes(tmp_path, capsys, monkeypatch, fakes):
+    """What the operator may post instead of approving: the body, nothing else."""
+    sd, action, body = _blocked_on_acceptance(tmp_path, monkeypatch, fakes)
+    capsys.readouterr()
+    assert cli.main(["--state-dir", sd, "status", "--action", action]) == 0
+    assert capsys.readouterr().out == body
+    assert cli.main(["--state-dir", sd, "status", "--action", "A-" + "0" * 16]) == 1
+    assert capsys.readouterr().out == ""
+    with pytest.raises(SystemExit) as e:
+        cli.main(["--state-dir", sd, "status", "--json", "--action", action])
+    assert e.value.code == 2
+
+
+def test_unblock_approve_action_publishes_on_resume(tmp_path, capsys, monkeypatch, fakes):
+    """`unblock --approve-action` records the approval and sends nothing;
+    `resume` publishes the comment, pushes, and status shows it verified."""
+    sd, action, body = _blocked_on_acceptance(tmp_path, monkeypatch, fakes)
+    gh = fakes["gh"]
+    capsys.readouterr()
+    rc = cli.main(["--state-dir", sd, "unblock", "--approve-action", action, "--reason", "ok"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "BLOCKED -> FIX" in out and gh.effect_writes == []
+    assert cli.main(["--state-dir", sd, "status"]) == 0
+    assert f"-> FIX [approved {action}]: ok" in capsys.readouterr().out
+    assert cli.main(["--state-dir", sd, "resume", "--max-steps", "1"]) == 0
+    capsys.readouterr()
+    assert [w[:2] for w in gh.effect_writes] == [("create_issue_comment", ISSUE)]
+    [comment] = gh.comments[ISSUE]
+    assert comment.body == body
+    assert cli.main(["--state-dir", sd, "status", "--json"]) == 0
+    [entry] = json.loads(capsys.readouterr().out)["acceptance_actions"]
+    assert entry["state"] == "verified" and entry["comment_url"] == comment.url
+
+
+@pytest.mark.parametrize(
+    ("argv", "code", "stream", "needle"),
+    [
+        (["--approve-action", "A-123"], 2, "err", "A-<16 hex digits>"),
+        (["--approve-action", "A-" + "0" * 16], 1, "out", "names no acceptance action"),
+        (["--decline-action", "A-" + "0" * 16], 1, "out", "names no acceptance action"),
+    ],
+)
+def test_unblock_acceptance_flags_exit_codes(
+    tmp_path, capsys, monkeypatch, fakes, argv, code, stream, needle
+):
+    sd, _, _ = _blocked_on_acceptance(tmp_path, monkeypatch, fakes)
+    raw = (tmp_path / ".autoforge" / "state.json").read_text()
+    capsys.readouterr()
+    assert cli.main(["--state-dir", sd, "unblock", *argv, "--reason", "x"]) == code
+    assert needle in getattr(capsys.readouterr(), stream)
+    assert (tmp_path / ".autoforge" / "state.json").read_text() == raw
+    assert fakes["gh"].effect_writes == []
+
+
+def test_unblock_takes_one_acceptance_flag(tmp_path, capsys, monkeypatch, fakes):
+    monkeypatch.chdir(tmp_path)
+    flags = ["--approve-action", "A-" + "0" * 16, "--decline-action", "A-" + "1" * 16]
+    with pytest.raises(SystemExit) as e:
+        cli.main(["--state-dir", str(tmp_path / ".autoforge"), "unblock", *flags, "--reason", "x"])
+    assert e.value.code == 2
+    assert "not allowed with argument" in capsys.readouterr().err

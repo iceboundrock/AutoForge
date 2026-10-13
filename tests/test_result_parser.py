@@ -11,11 +11,13 @@ from autoforge.prompts import CONTROL_CHAR_RE, escape_inline
 from autoforge.redaction import MAX_GROWTH_FACTOR, redact_dict
 from autoforge.result_parser import (
     _CLOSING_REFERENCE_RE,
+    ACCEPTANCE_TARGET_KEYS,
     AGENT_MARKER_OPEN_RE,
     BEGIN,
     CONTROLLER_MARKER_OPEN_RE,
     END,
     FINDING_ID_RE,
+    MAX_ACCEPTANCE_BODY_CHARS,
     MAX_CONTROL_RESULT_CHARS,
     MAX_FINDING_ID_CHARS,
     MAX_FINDING_LOCATION_CHARS,
@@ -499,6 +501,130 @@ def test_fix_new_follow_up_text_is_bounded_and_publishable(issue, match):
     }
     with pytest.raises(ControlResultValidationError, match=match):
         FixResult.from_payload(payload)
+
+
+ACCEPTANCE_RATIONALE = "The finding asks for evidence on the issue, not for a code change."
+
+
+def _acceptance(action, rationale: str = ACCEPTANCE_RATIONALE, **extra) -> dict:
+    payload = {
+        "phase": "FIX",
+        "status": "success",
+        "previous_head_sha": SHA_A,
+        "head_sha": SHA_B,
+        "resolutions": [
+            {
+                "finding_id": "R1-F1",
+                "resolution": "acceptance_action",
+                "rationale": rationale,
+                "acceptance_action": action,
+                **extra,
+            }
+        ],
+    }
+    return payload
+
+
+def test_fix_acceptance_action_carries_a_kind_and_a_body_only():
+    """#211: the resolution's object is the closed kind and the agent's text;
+    the parsed resolution keeps the text for the controller and its
+    persisted dict is the other resolutions' shape."""
+    text = "Ran the operator check on the reviewed HEAD.\n\nEvery check passed."
+    res = FixResult.from_payload(_acceptance({"kind": "issue_comment", "body": text}))
+    [r] = res.resolutions
+    assert r.acceptance_action and r.acceptance_body == text
+    assert r.rationale == ACCEPTANCE_RATIONALE
+    assert r.to_dict() == {
+        "finding_id": "R1-F1",
+        "resolution": "acceptance_action",
+        "rationale": ACCEPTANCE_RATIONALE,
+        "follow_up_issue_url": "",
+        "commit_sha": "",
+    }
+
+
+@pytest.mark.parametrize("key", ACCEPTANCE_TARGET_KEYS)
+def test_fix_acceptance_action_refuses_any_target_by_name(key):
+    """No URL, issue, repository, method, path or command: the controller
+    derives the issue from its state, so a target is refused, not ignored."""
+    action = {"kind": "issue_comment", "body": "evidence", key: ISSUE}
+    with pytest.raises(ControlResultValidationError, match=f"carries '{key}'.*names no target"):
+        FixResult.from_payload(_acceptance(action))
+
+
+@pytest.mark.parametrize(
+    ("action", "match"),
+    [
+        pytest.param({"kind": "issue_comment"}, "'body' must be a string", id="no-body"),
+        pytest.param({"kind": "issue_comment", "body": "  "}, "missing required", id="blank"),
+        pytest.param({"body": "b"}, "kind NoneType is not supported", id="no-kind"),
+        pytest.param({"kind": "pr_comment", "body": "b"}, "'pr_comment' is not", id="kind"),
+        pytest.param({"kind": "issue_comment", "body": "b", "x": 1}, "unknown field", id="extra"),
+        pytest.param("post a comment", "must be an object", id="not-an-object"),
+        pytest.param(
+            {"kind": "issue_comment", "body": "b" * (MAX_ACCEPTANCE_BODY_CHARS + 1)},
+            f"at most {MAX_ACCEPTANCE_BODY_CHARS}",
+            id="long",
+        ),
+        pytest.param({"kind": "issue_comment", "body": "Closes #12"}, "closing", id="closing"),
+        pytest.param(
+            {"kind": "issue_comment", "body": "<!-- ai-acceptance: x -->"}, "marker", id="marker"
+        ),
+        pytest.param({"kind": "issue_comment", "body": "ask @octocat"}, "mention", id="mention"),
+        pytest.param(
+            {"kind": "issue_comment", "body": "ok\x07"}, "control character", id="control"
+        ),
+    ],
+)
+def test_fix_acceptance_action_text_is_bounded_and_publishable(action, match):
+    """The text is published as given inside the controller's comment, so it
+    is rejected (never clipped or redacted) when it is missing, blank, too
+    long, or would act on GitHub."""
+    with pytest.raises(ControlResultValidationError, match=match):
+        FixResult.from_payload(_acceptance(action))
+
+
+def test_fix_acceptance_action_needs_a_rationale_and_nothing_else():
+    """Like a no-change resolution it explains itself; it never names a
+    commit or a follow-up, and no other resolution carries the object."""
+    action = {"kind": "issue_comment", "body": "evidence"}
+    with pytest.raises(ControlResultValidationError, match="rationale is missing"):
+        FixResult.from_payload(_acceptance(action, rationale="short"))
+    with pytest.raises(ControlResultValidationError, match="must carry an 'acceptance_action'"):
+        FixResult.from_payload(_acceptance(None))
+    with pytest.raises(ControlResultValidationError, match="only a fixed finding"):
+        FixResult.from_payload(_acceptance(action, commit_sha=SHA_B))
+    with pytest.raises(ControlResultValidationError, match="carries a follow-up issue"):
+        FixResult.from_payload(_acceptance(action, follow_up_issue_url=ISSUE))
+    other = _acceptance(action)
+    other["resolutions"][0]["resolution"] = "no_change_with_rationale"
+    with pytest.raises(ControlResultValidationError, match="carries an acceptance_action"):
+        FixResult.from_payload(other)
+
+
+def test_fix_result_carries_at_most_one_acceptance_action():
+    payload = _acceptance({"kind": "issue_comment", "body": "evidence"})
+    second = dict(payload["resolutions"][0], finding_id="R1-F2")
+    payload["resolutions"].append(second)
+    with pytest.raises(ControlResultValidationError, match="at most 1 per FIX result"):
+        FixResult.from_payload(payload)
+
+
+def test_local_fix_refuses_an_acceptance_action():
+    """LOCAL runs perform no external writes: the resolution is not offered."""
+    text, mode = _fix_with(
+        [
+            {
+                "finding_id": "R1-F1",
+                "resolution": "acceptance_action",
+                "rationale": ACCEPTANCE_RATIONALE,
+                "acceptance_action": {"kind": "issue_comment", "body": "evidence"},
+            }
+        ],
+        "LOCAL",
+    )
+    with pytest.raises(ControlResultValidationError, match="LOCAL runs perform no external"):
+        parse_control_result(text, Phase.FIX, mode)
 
 
 def test_fix_result_reports_its_tests_within_bounds():

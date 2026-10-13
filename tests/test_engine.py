@@ -21,7 +21,7 @@ from autoforge.claims import (
     scan,
 )
 from autoforge.config import default_config
-from autoforge.effects import EffectKind, Stage, compose_append
+from autoforge.effects import EffectKind, Stage, acceptance_comment_body, compose_append
 from autoforge.effects import follow_up_issue_body as controller_follow_up_body
 from autoforge.effects import review_comment_body as render_review_comment
 from autoforge.engine import MAX_TRANSIENT_RETRIES
@@ -69,6 +69,8 @@ from autoforge.result_parser import (
 from autoforge.state import load_state
 from autoforge.transitions import Phase
 from tests.conftest import (
+    ACCEPTANCE_RATIONALE,
+    ACCEPTANCE_TEXT,
     BASE_RUN_ID,
     BRANCH,
     CI_RUN_ID,
@@ -88,6 +90,7 @@ from tests.conftest import (
     SHA_B,
     SHA_C,
     FakeGitHub,
+    acceptance,
     analyze_payload,
     block,
     ci_check,
@@ -1855,14 +1858,14 @@ def test_review_clean_then_ready_for_merge_holds(tmp_state_dir):
 ISSUE43 = "https://github.com/owner/repo/issues/43"  # the first issue an origin-backed run creates
 
 
-def _in_fix(tmp_state_dir, gh: FakeGitHub, script, findings=None, origin: bool = False):
+def _in_fix(tmp_state_dir, gh: FakeGitHub, script, findings=None, origin: bool = False, cfg=None):
     """A run in FIX after review round 1, bound to the PR's HEAD.
 
     With ``origin`` that HEAD is a real commit published to the PR branch of
     the engine's origin, which a fixer commits on and the controller pushes
     to; without, it is ``SHA_A`` and no fixer may reach the push.
     """
-    eng = make_engine(tmp_state_dir, script, github=gh, origin=origin)
+    eng = make_engine(tmp_state_dir, script, github=gh, cfg=cfg, origin=origin)
     head = publish_pr_head(eng) if origin else SHA_A
     gh.add_pr(head_sha=head)
     eng.state.phase = Phase.FIX
@@ -1951,6 +1954,7 @@ def test_fix_the_controller_pushes_the_fixers_commit(tmp_state_dir):
             "rationale": "",
             "follow_up_issue_url": "",
             "commit_sha": "",
+            "acceptance_comment_url": "",
         }
     ]
     assert s.effect_records == [] and s.completion_context == {} and s.entry_observation == {}
@@ -2085,7 +2089,9 @@ def test_fix_entry_with_the_pr_retargeted_goes_to_review_without_a_fixer(tmp_sta
     eng.state.reviewed_base_ref = "main"
     eng.state.current_base_ref = "main"
     eng.state.reviewed_merge_base_sha = MERGE_BASE
-    eng.state.last_fix_resolutions = [{"finding_id": "R0-F1", "resolution": "fixed"}]
+    eng.state.last_fix_resolutions = [
+        {"finding_id": "R0-F1", "resolution": "fixed", "acceptance_comment_url": ""}
+    ]
     gh.prs[PR].base_ref = "release/1.x"
     out = eng.step()
     assert out.next_phase == "REVIEW" and eng.provider.calls == []
@@ -2161,7 +2167,9 @@ def test_fix_entry_with_the_base_rewritten_goes_to_review_without_a_fixer(tmp_st
     eng.state.reviewed_base_ref = "main"
     eng.state.current_base_ref = "main"
     eng.state.reviewed_merge_base_sha = MERGE_BASE
-    eng.state.last_fix_resolutions = [{"finding_id": "R0-F1", "resolution": "fixed"}]
+    eng.state.last_fix_resolutions = [
+        {"finding_id": "R0-F1", "resolution": "fixed", "acceptance_comment_url": ""}
+    ]
     gh.merge_base = MERGE_BASE_B
     out = eng.step()
     assert out.next_phase == "REVIEW" and eng.provider.calls == []
@@ -2594,6 +2602,7 @@ def test_fix_creates_the_follow_up_issue_the_fixer_asks_for(tmp_state_dir):
             "rationale": "",
             "follow_up_issue_url": ISSUE43,
             "commit_sha": "",
+            "acceptance_comment_url": "",
         }
     ]
 
@@ -2671,6 +2680,7 @@ def test_fix_round_mixing_every_resolution_creates_appends_then_pushes(tmp_state
             "rationale": "",
             "follow_up_issue_url": "",
             "commit_sha": new[0],
+            "acceptance_comment_url": "",
         },
         {
             "finding_id": "R2-F2",
@@ -2678,6 +2688,7 @@ def test_fix_round_mixing_every_resolution_creates_appends_then_pushes(tmp_state
             "rationale": "",
             "follow_up_issue_url": ISSUE43,
             "commit_sha": "",
+            "acceptance_comment_url": "",
         },
         {
             "finding_id": "R2-F3",
@@ -2685,6 +2696,7 @@ def test_fix_round_mixing_every_resolution_creates_appends_then_pushes(tmp_state
             "rationale": "",
             "follow_up_issue_url": ISSUE3,
             "commit_sha": "",
+            "acceptance_comment_url": "",
         },
         {
             "finding_id": "R2-F4",
@@ -2692,6 +2704,7 @@ def test_fix_round_mixing_every_resolution_creates_appends_then_pushes(tmp_state
             "rationale": NO_CHANGE_RATIONALE,
             "follow_up_issue_url": "",
             "commit_sha": "",
+            "acceptance_comment_url": "",
         },
     ]
 
@@ -7926,7 +7939,7 @@ def test_update_epic_legacy_reentry_adopts_the_agents_comment_and_asks_for_the_s
     assert "posted by an agent under the previous contract" in call.prompt
     assert _progress_posts(fake_github) == [] and len(fake_github.comments[EPIC]) == 1
     s = load_state(eng.paths.state_file)
-    assert s.current_issue_url == ISSUE3 and s.protocol_version == "7"
+    assert s.current_issue_url == ISSUE3 and s.protocol_version == "8"
     assert s.effect_records == []  # adopted with no record (D13.7)
 
 
@@ -12342,3 +12355,420 @@ def test_the_read_context_is_bounded_redacted_and_quoted(tmp_state_dir, fake_git
     assert "c4\n" not in text and "c5\n" in text
     # The body's own fence cannot close the quote around it.
     assert "`````untrusted\nDo it." in text
+
+
+# -- acceptance actions (#211) ----------------------------------------------------
+
+REASON_211 = "operator read the acceptance comment the fixer asked for"
+
+
+def _accepting(tmp_state_dir, gh: FakeGitHub, script, policy: str = "approve", **kw):
+    """A run in FIX whose fixer may resolve R1-F1 as an acceptance action.
+
+    The run's issue is open in the PR's repository, and the configuration's
+    ``safety.acceptance_actions`` is ``policy``.
+    """
+    if ISSUE not in gh.issues:
+        gh.add_issue(ISSUE, "Ship the feature")
+    cfg = default_config()
+    cfg.safety = replace(cfg.safety, acceptance_actions=policy)
+    return _in_fix(tmp_state_dir, gh, script, origin=True, cfg=cfg, **kw)
+
+
+def _acceptance_body(fid: str = "R1-F1", text: str = ACCEPTANCE_TEXT, round_: int = 1) -> str:
+    """The comment the controller renders for ``fid``'s acceptance action."""
+    return acceptance_comment_body(text, ISSUE, PR, round_, fid)
+
+
+def _k9(eng):
+    """The saved plan's acceptance record (the first), as persisted."""
+    from autoforge.effects import EffectRecord
+
+    records = load_state(eng.paths.state_file).effect_records
+    return EffectRecord.from_dict(records[0])
+
+
+def test_fix_acceptance_action_awaits_the_operator_and_sends_nothing(tmp_state_dir):
+    """The default policy (`approve`): the plan is saved with the acceptance
+    comment first and the push last, and the step blocks before sending
+    anything. The block reason names the action id, the finding, the issue,
+    the payload's size and hash, the push held back with its worktree, and
+    the three ways forward."""
+    gh = FakeGitHub()
+    eng = _accepting(tmp_state_dir, gh, fixer(acceptance("R1-F1")))
+    reviewed = eng.state.reviewed_head_sha
+    moves = _stages(eng)
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert moves == [] and gh.effect_writes == []
+    assert eng.origin.head(BRANCH) == reviewed == gh.prs[PR].head_sha
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.BLOCKED and s.open_findings == [_finding(1)]
+    assert [r["kind"] for r in s.effect_records] == ["acceptance_comment", "push"]
+    record = _k9(eng)
+    assert record.stage is Stage.INTENDED and not record.authorized
+    assert record.precondition == {
+        "absent": True,
+        "authorization": "operator",
+        "approved_action_id": "",
+    }
+    assert record.target == {"issue_url": ISSUE}
+    assert record.body == _acceptance_body()
+    action = record.action_id
+    reason = s.block_reason
+    assert f"awaits operator action {action}" in reason
+    assert "finding R1-F1 ('typo')" in reason and f"issue {ISSUE}" in reason
+    assert f"{len(record.body)} characters, sha256 " in reason
+    assert f"status --action {action}" in reason
+    assert f"--approve-action {action}" in reason and f"--decline-action {action}" in reason
+    assert "is held back until the comment is verified" in reason
+    assert eng.agent_worktree_description() in reason
+    assert ACCEPTANCE_TEXT not in reason
+
+
+def test_fix_acceptance_action_approved_is_published_then_the_fix_pushed(tmp_state_dir):
+    """The operator approves the exact id: unblock records it (and sends
+    nothing), and the next step completes the saved plan without launching
+    the fixer again: the comment is posted and read back, then the commit
+    is pushed. The resolution records the comment's URL and the outcome
+    is `verified`; the next reviewer is handed that URL."""
+    gh = FakeGitHub()
+    seen = []
+
+    def reviewer(req):
+        seen.append(req.prompt)
+        return block(review_payload(2, eng.state.current_head_sha, []))
+
+    eng = _accepting(tmp_state_dir, gh, scripted(fixer(acceptance("R1-F1")), reviewer))
+    reviewed = eng.state.reviewed_head_sha
+    assert eng.step().next_phase == "BLOCKED"
+    action = _k9(eng).action_id
+    done = eng.unblock(REASON_211, approve_action=action)
+    assert done.unblocked and done.phase == "FIX", done.message
+    assert f"action {action} is approved" in done.message
+    assert gh.effect_writes == []
+    s = load_state(eng.paths.state_file)
+    assert s.unblock_history[-1]["action"] == f"approved {action}"
+    assert _k9(eng).authorized and _k9(eng).precondition["authorization"] == "operator"
+    moves = _stages(eng)
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert len(eng.provider.calls) == 1
+    assert moves == [
+        ("acceptance_comment", "attempted"),
+        ("acceptance_comment", "observed"),
+        ("push", "attempted"),
+        ("push", "observed"),
+    ]
+    assert gh.effect_writes == [("create_issue_comment", ISSUE, _acceptance_body())]
+    [comment] = gh.comments[ISSUE]
+    assert comment.body == _acceptance_body()
+    candidate = eng.origin.head(BRANCH)
+    assert candidate != reviewed and gh.prs[PR].head_sha == candidate
+    assert f"acceptance comment {comment.url} verified ({action})" in out.message
+    s = load_state(eng.paths.state_file)
+    assert s.effect_records == [] and s.open_findings == []
+    assert s.last_fix_resolutions == [
+        {
+            "finding_id": "R1-F1",
+            "resolution": "acceptance_action",
+            "rationale": ACCEPTANCE_RATIONALE,
+            "follow_up_issue_url": "",
+            "commit_sha": "",
+            "acceptance_comment_url": comment.url,
+        }
+    ]
+    [outcome] = s.acceptance_outcomes
+    assert outcome["action_id"] == action and outcome["outcome"] == "verified"
+    assert outcome["comment_url"] == comment.url and outcome["finding_id"] == "R1-F1"
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    assert f'"acceptance_comment_url": "{comment.url}"' in seen[0]
+
+
+def test_fix_acceptance_action_under_auto_completes_in_one_step(tmp_state_dir):
+    """`auto`: the record is planned with its own id approved by policy, so
+    the same step publishes the comment, reads it back and pushes."""
+    gh = FakeGitHub()
+    eng = _accepting(tmp_state_dir, gh, fixer(acceptance("R1-F1")), policy="auto")
+    moves = _stages(eng)
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert moves[:2] == [("acceptance_comment", "attempted"), ("acceptance_comment", "observed")]
+    assert moves[-1] == ("push", "observed")
+    assert gh.effect_writes == [("create_issue_comment", ISSUE, _acceptance_body())]
+    s = load_state(eng.paths.state_file)
+    assert s.unblock_history == []
+    [outcome] = s.acceptance_outcomes
+    assert outcome["outcome"] == "verified"
+
+
+def test_fix_acceptance_action_is_refused_while_the_setting_is_off(tmp_state_dir):
+    """`off`: the prompt says the resolution is unavailable, and a result
+    that uses it anyway is a correction, before any write."""
+    from autoforge.engine import ACCEPTANCE_ACTIONS_UNAVAILABLE
+
+    gh = FakeGitHub()
+    eng = _accepting(
+        tmp_state_dir,
+        gh,
+        scripted(fixer(acceptance("R1-F1")), fixer(no_change("R1-F1"), commit=False)),
+        policy="off",
+    )
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    first, second = eng.provider.calls
+    assert ACCEPTANCE_ACTIONS_UNAVAILABLE in first.prompt
+    assert "safety.acceptance_actions: off" in second.prompt
+    assert gh.effect_writes == [] and gh.comments.get(ISSUE, []) == []
+
+
+@pytest.mark.parametrize("state", ["CLOSED", "OPEN-ELSEWHERE"])
+def test_fix_acceptance_action_holds_when_the_issue_no_longer_qualifies(tmp_state_dir, state):
+    """An authorized comment is still held, with nothing sent, while the
+    run's issue is closed or not in the PR's repository."""
+    gh = FakeGitHub()
+    if state == "CLOSED":
+        gh.add_issue(ISSUE, "Ship the feature", state="CLOSED")
+        why = f"issue {ISSUE} is closed, not open"
+    else:
+        info = gh.add_issue(ISSUE, "Ship the feature")
+        gh.issues[ISSUE] = replace(info, repository="other/repo")
+        why = "is not in the run's repository owner/repo"
+    eng = _accepting(tmp_state_dir, gh, fixer(acceptance("R1-F1")), policy="auto")
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert gh.effect_writes == []
+    reason = load_state(eng.paths.state_file).block_reason
+    assert f"cannot publish acceptance action {_k9(eng).action_id}" in reason
+    assert why in reason
+
+
+def test_fix_acceptance_action_payload_the_operator_posted_is_adopted(tmp_state_dir):
+    """Instead of approving, the operator posts exactly the payload (as
+    'status --action' prints it): a plain unblock re-enters FIX, which
+    adopts that comment and sends no comment of its own."""
+    gh = FakeGitHub()
+    eng = _accepting(tmp_state_dir, gh, fixer(acceptance("R1-F1")))
+    assert eng.step().next_phase == "BLOCKED"
+    posted = gh.add_comment(ISSUE, 500, _k9(eng).body)
+    done = eng.unblock(REASON_211)
+    assert done.unblocked and done.phase == "FIX", done.message
+    assert "exact payload" in done.message and posted.url in done.message
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert [w[0] for w in gh.effect_writes] == []
+    assert gh.comments[ISSUE] == [posted]
+    s = load_state(eng.paths.state_file)
+    assert s.last_fix_resolutions[0]["acceptance_comment_url"] == posted.url
+    assert s.acceptance_outcomes[0]["comment_url"] == posted.url
+
+
+def test_fix_acceptance_action_declined_reruns_the_fixer_with_the_decline(tmp_state_dir):
+    """A decline drops the unsent plan and FIX launches the fixer afresh
+    with the decline (id, finding, the operator's reason) in its prompt;
+    requesting the same comment again is a correction, and another
+    resolution completes the round."""
+    gh = FakeGitHub()
+    eng = _accepting(
+        tmp_state_dir,
+        gh,
+        scripted(
+            fixer(acceptance("R1-F1")),
+            fixer(acceptance("R1-F1")),
+            fixer(no_change("R1-F1")),
+        ),
+    )
+    assert eng.step().next_phase == "BLOCKED"
+    action = _k9(eng).action_id
+    done = eng.unblock("the comment overstates the test coverage", decline_action=action)
+    assert done.unblocked and done.phase == "FIX", done.message
+    s = load_state(eng.paths.state_file)
+    assert s.effect_records == [] and s.phase == Phase.FIX
+    assert s.unblock_history[-1]["action"] == f"declined {action}"
+    [outcome] = s.acceptance_outcomes
+    assert outcome["outcome"] == "declined" and outcome["action_id"] == action
+    assert outcome["reason"] == "the comment overstates the test coverage"
+    assert outcome["round"] == 1 and outcome["comment_url"] == ""
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    _, again, corrected = eng.provider.calls
+    assert action in again.prompt and "the comment overstates the test coverage" in again.prompt
+    assert f"is action {action}, which the operator declined" in corrected.prompt
+    assert gh.effect_writes == [] and gh.comments.get(ISSUE, []) == []
+
+
+def test_fix_acceptance_action_goes_stale_when_the_pr_moves(tmp_state_dir):
+    """A push to the PR while the action awaits approval: a plain unblock
+    re-enters FIX, which routes the drift to REVIEW, sends nothing, and
+    records the action `stale`. An approval of it is refused as stale."""
+    gh = FakeGitHub()
+    eng = _accepting(tmp_state_dir, gh, fixer(acceptance("R1-F1")))
+    assert eng.step().next_phase == "BLOCKED"
+    action = _k9(eng).action_id
+    publish_pr_head(eng, parent=eng.state.reviewed_head_sha, message="A human's push (#2)")
+    raw = eng.paths.state_file.read_text()
+    refused = eng.unblock(REASON_211, approve_action=action)
+    assert not refused.unblocked and "refused as stale" in refused.message
+    assert eng.paths.state_file.read_text() == raw
+    done = eng.unblock(REASON_211)
+    assert done.unblocked and done.phase == "FIX", done.message
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert gh.effect_writes == []
+    s = load_state(eng.paths.state_file)
+    assert s.effect_records == []
+    [outcome] = s.acceptance_outcomes
+    assert outcome["outcome"] == "stale" and outcome["action_id"] == action
+
+
+def _refusal_case(eng, gh, case: str) -> dict:
+    """Set up ``case`` on a run blocked on an acceptance action; the unblock kwargs."""
+    record = _k9(eng)
+    action = record.action_id
+    if case == "unknown id":
+        return {"approve_action": "A-" + "0" * 16}
+    if case == "plain without evidence":
+        return {}
+    if case == "decline of a posted payload":
+        gh.add_comment(ISSUE, 500, record.body)
+        return {"decline_action": action}
+    if case == "edited comment":
+        gh.add_comment(ISSUE, 500, record.body.replace("every check", "most checks"))
+        return {"approve_action": action}
+    if case == "edited comment, plain":
+        gh.add_comment(ISSUE, 500, record.body.replace("every check", "most checks"))
+        return {}
+    if case == "two comments":
+        gh.add_comment(ISSUE, 500, record.body)
+        gh.add_comment(ISSUE, 501, record.body)
+        return {"approve_action": action}
+    if case == "closed issue":
+        gh.issues[ISSUE] = replace(gh.issues[ISSUE], state="CLOSED")
+        return {"approve_action": action}
+    if case == "stale decline":
+        publish_pr_head(eng, parent=eng.state.reviewed_head_sha, message="A human's push (#2)")
+        return {"decline_action": action}
+    raise AssertionError(case)
+
+
+@pytest.mark.parametrize(
+    "case, expect",
+    [
+        ("unknown id", "names no acceptance action awaiting the operator"),
+        ("plain without evidence", "an unblock reason is not evidence"),
+        ("decline of a posted payload", "cannot be declined: its exact payload is already on"),
+        ("edited comment", "cannot be approved"),
+        ("edited comment, plain", "Delete that comment, or edit it back"),
+        ("two comments", "cannot be approved"),
+        ("closed issue", "is closed, not open"),
+        ("stale decline", "refused as stale"),
+    ],
+)
+def test_unblock_refuses_an_acceptance_request_and_writes_nothing(tmp_state_dir, case, expect):
+    """Every refusal of an unblock on a waiting acceptance action leaves
+    state byte-identical, sends nothing, and says why."""
+    gh = FakeGitHub()
+    eng = _accepting(tmp_state_dir, gh, fixer(acceptance("R1-F1")))
+    assert eng.step().next_phase == "BLOCKED"
+    kwargs = _refusal_case(eng, gh, case)
+    raw = eng.paths.state_file.read_text()
+    writes = list(gh.effect_writes)
+    dry = eng.unblock(REASON_211, dry_run=True, **kwargs)
+    assert dry.dry_run and "would stay BLOCKED" in dry.message and expect in dry.message
+    out = eng.unblock(REASON_211, **kwargs)
+    assert not out.unblocked and expect in out.message, out.message
+    assert eng.paths.state_file.read_text() == raw
+    assert gh.effect_writes == writes == []
+
+
+def test_unblock_acceptance_flags_are_checked_before_anything_is_read(tmp_state_dir):
+    """Both flags, or a malformed id, are a usage error (nothing read)."""
+    gh = FakeGitHub()
+    eng = _accepting(tmp_state_dir, gh, fixer(acceptance("R1-F1")))
+    assert eng.step().next_phase == "BLOCKED"
+    calls = len(gh.calls)
+    with pytest.raises(ConfigurationError, match="not both"):
+        eng.unblock(REASON_211, approve_action="A-" + "0" * 16, decline_action="A-" + "1" * 16)
+    with pytest.raises(ConfigurationError, match="A-<16 hex digits>"):
+        eng.unblock(REASON_211, approve_action="A-123")
+    assert len(gh.calls) == calls
+
+
+def test_unblock_approval_of_a_run_without_a_waiting_action_is_refused(tmp_state_dir):
+    """An approval names a waiting action or nothing at all: on a FIX row
+    with no saved plan the request is refused, the plain decision quoted."""
+    gh = FakeGitHub()
+    eng = _in_fix(tmp_state_dir, gh, [])
+    eng.state.phase = Phase.BLOCKED
+    eng.state.block_reason = "stuck"
+    eng.state.last_review_result = "needs_fix"
+    eng._save()
+    raw = eng.paths.state_file.read_text()
+    out = eng.unblock(REASON_211, approve_action="A-" + "0" * 16)
+    assert not out.unblocked
+    assert "applies only to a saved FIX plan whose acceptance action" in out.message
+    assert eng.paths.state_file.read_text() == raw
+
+
+def test_unblock_approves_once_then_the_approved_action_is_not_awaiting(tmp_state_dir):
+    """An approved action that blocks again (its issue was closed meanwhile)
+    no longer awaits the operator: approving it again is refused, and once
+    the issue is open again a plain unblock lets FIX publish it."""
+    gh = FakeGitHub()
+    eng = _accepting(tmp_state_dir, gh, fixer(acceptance("R1-F1")))
+    assert eng.step().next_phase == "BLOCKED"
+    action = _k9(eng).action_id
+    assert eng.unblock(REASON_211, approve_action=action).unblocked
+    gh.issues[ISSUE] = replace(gh.issues[ISSUE], state="CLOSED")
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert gh.effect_writes == []
+    again = eng.unblock(REASON_211, approve_action=action)
+    assert not again.unblocked and "(awaiting: none)" in again.message
+    gh.issues[ISSUE] = replace(gh.issues[ISSUE], state="OPEN")
+    assert eng.unblock(REASON_211).unblocked
+    assert eng.step().next_phase == "REVIEW"
+    assert gh.effect_writes == [("create_issue_comment", ISSUE, _acceptance_body())]
+
+
+@pytest.mark.parametrize("saved", [True, False])
+def test_fix_acceptance_comment_survives_a_power_loss_after_the_write(tmp_state_dir, saved):
+    """The process dies after the authorized comment landed (its observation
+    persisted, or lost): the next process reads the issue, adopts the one
+    comment and pushes, without launching the fixer. The comment is never
+    posted twice, and a policy authorization holds whatever the next
+    process's configuration says."""
+    gh = FakeGitHub()
+    eng = _accepting(tmp_state_dir, gh, fixer(acceptance("R1-F1")), policy="auto")
+    _power_loss_at(eng, EffectKind.ACCEPTANCE_COMMENT, Stage.OBSERVED, saved=saved)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    assert len(gh.comments[ISSUE]) == 1
+    eng2 = _resumed(eng, tmp_state_dir, gh, "never")
+    out = eng2.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert eng2.provider.calls == []
+    assert [w[0] for w in gh.effect_writes] == ["create_issue_comment"]
+    [comment] = gh.comments[ISSUE]
+    s = load_state(eng2.paths.state_file)
+    assert s.last_fix_resolutions[0]["acceptance_comment_url"] == comment.url
+
+
+def test_fix_acceptance_comment_write_that_never_landed_is_sent_again(tmp_state_dir):
+    """The comment write fails before reaching GitHub: the step stops for
+    'resume' with the record attempted, and the next process finds no
+    comment and posts it once more (the second of its two attempts)."""
+    gh = FakeGitHub()
+    gh.write_failures.append(
+        ("create_issue_comment", GitHubUnavailableError("gh: HTTP 502"), False)
+    )
+    eng = _accepting(tmp_state_dir, gh, fixer(acceptance("R1-F1")), policy="auto")
+    with pytest.raises(GitHubUnavailableError):
+        eng.step()
+    assert gh.comments.get(ISSUE, []) == []
+    assert _k9(eng).stage is Stage.ATTEMPTED
+    eng2 = _resumed(eng, tmp_state_dir, gh, "never")
+    out = eng2.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert [w[0] for w in gh.effect_writes] == ["create_issue_comment"] * 2
+    assert len(gh.comments[ISSUE]) == 1

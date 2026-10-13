@@ -111,6 +111,17 @@ the file valid.
   config loader rather than silently disabling the rule.
 - `safety.protected_merge_paths: []` disables that gate; leaving the key
   empty (`null`) is a configuration error rather than a silent opt-out.
+- `safety.acceptance_actions` is `off`, `approve` (the default) or `auto`
+  (a bare YAML `off`, read as false, means `off`); anything else is a
+  configuration error. It decides who authorizes the one comment a `FIX`
+  agent may ask the controller to post on the run's issue as acceptance
+  evidence: nobody (`off`: the resolution is refused), the operator per
+  action id (`approve`: the run blocks until `autoforge unblock
+  --approve-action <id>`), or this setting (`auto`: posted during the `FIX`
+  step). The value is recorded with the action when the `FIX` plan is
+  saved, so changing it later never widens an authorization already on
+  disk. See [Running the remote workflow: BLOCKED on an acceptance
+  action](usage.md#blocked-on-an-acceptance-action).
 
 `autoforge doctor` (and `autoforge local doctor`) reports whether the file
 loads and validates. Doctor is read-only apart from creating the state
@@ -122,7 +133,7 @@ directory if it is missing and a probe file it creates and removes there.
 |---|---|---|
 | top level | `version`, `state_dir` (default `.autoforge`), `prompt_version` | [State and recovery](agent-guides/state-and-recovery.md) |
 | `execution` | the default agent limits (`default_idle_timeout_seconds` 900, `default_max_runtime_seconds` unset), loop detection (`loop_detection`, mode `kill`; unset, `warn` on Pi and in `UPDATE_EPIC`), the wall-clock bound on controller-run commands (`command_timeout_seconds` 1800), `max_correction_attempts` (default 1), the agent environment allow-list (`env_allowlist`, `env_allowlist_extra`; a GitHub or git credential route is refused, see [Agent environment](#agent-environment)), the per-issue agent worktree location (`worktree_dir`) | [Architecture](agent-guides/architecture.md), [Running the remote workflow](usage.md) |
-| `safety` | the merge gate (`allow_merge`, default `false`), `protected_merge_paths` (default `.github/workflows/`), `required_checks` (default `ci`), `verify_check_definition` (default `true`) | [GitHub safety](agent-guides/github-safety.md#merge-safety) |
+| `safety` | the merge gate (`allow_merge`, default `false`), `protected_merge_paths` (default `.github/workflows/`), `required_checks` (default `ci`), `verify_check_definition` (default `true`); who authorizes a `FIX` acceptance comment (`acceptance_actions`: `off`, `approve` (default) or `auto`) | [GitHub safety](agent-guides/github-safety.md#merge-safety), [Running the remote workflow](usage.md#blocked-on-an-acceptance-action) |
 | `merge` | how the controller merges once the gate is open: `method` (default `squash`), `delete_branch`, `max_verification_attempts` (default 5), `verification_commands` (argv lists, empty by default) | [GitHub safety](agent-guides/github-safety.md#merge-safety) |
 | `workflow` | loop bounds: `max_review_rounds` (20), `stagnation_identical_rounds` (2), `stagnation_unchanged_count_rounds` (3), `max_total_steps` (300); `epic_update_every` (1) | [Workflow](agent-guides/workflow.md#loop-bounds) |
 | `review.replan` | replan policy: `enabled`, `soft_threshold` (12), `hard_threshold` (20), `stagnation_window` (3), `max_findings_per_round` (2), `max_replans_per_issue` (2) | [Workflow](agent-guides/workflow.md#loop-bounds), [Replan transaction](agent-guides/replan-transaction.md) |

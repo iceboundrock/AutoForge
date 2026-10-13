@@ -22,7 +22,10 @@ uv run autoforge run --epic https://github.com/owner/repo/issues/1 \
 
 uv run autoforge status            # human summary
 uv run autoforge status --json     # machine-readable; `replan_journal` says whether the
-                                   # raw `replan_transaction` beside it is readable
+                                   # raw `replan_transaction` beside it is readable, and
+                                   # `acceptance_actions` lists the acceptance actions
+uv run autoforge status --action A-0123456789abcdef   # the exact payload bytes of
+                                   # an acceptance action (exit 1 for an unknown id)
 
 uv run autoforge step              # exactly one phase step
 uv run autoforge step --dry-run    # preview the next step
@@ -40,6 +43,12 @@ uv run autoforge resume --allow-merge
 # the one phase that inspection supports, or refuses and stays BLOCKED;
 # then `resume`. --dry-run previews the decision without writing anything
 uv run autoforge unblock --reason "reran the flaky check; it is green"
+
+# a FIX acceptance action awaits you (safety.acceptance_actions: approve):
+# approve exactly that action id, or decline it (FIX runs the fixer again);
+# then `resume`. Mutually exclusive; --dry-run works here too
+uv run autoforge unblock --approve-action A-0123456789abcdef --reason "checked the text"
+uv run autoforge unblock --decline-action A-0123456789abcdef --reason "overstates coverage"
 ```
 
 Pass a config file with the global option, before the subcommand:
@@ -189,12 +198,56 @@ head moved to a fork or another branch, after the plan was saved; and a
 write that conflicts after the plan was saved (reopen the follow-up issue
 the controller created, put the issue body back, or leave the PR branch at
 the reviewed HEAD or the planned commit, then `unblock`: the plan
-completes without running the fixer again). A push to the PR branch the controller did not make, before
+completes without running the fixer again). A FIX acceptance action that
+awaits you also blocks the run; see the next section. A push to the PR branch the controller did not make, before
 or after the fixer ran, is not a block: the PR goes back to `REVIEW` of the
 pushed HEAD; so does a PR retargeted to another base, or a base rewritten
 under its name, at any point of the phase. A LOCAL
 run cannot be unblocked. The decision table is in
 [Workflow: leaving BLOCKED](agent-guides/workflow.md#leaving-blocked-the-operators-unblock).
+
+### BLOCKED on an acceptance action
+
+A finding or an acceptance criterion sometimes asks for text to be posted
+on the issue itself (a summary of results, say). The fixer cannot post it:
+it resolves the finding as `acceptance_action` with the comment's text, and
+the controller publishes one comment on the run's issue, with its own header
+line above the text and the finding's `ai-acceptance` marker below it. It
+publishes nothing else of the `FIX` plan first: the follow-up issues and the
+push of the fixer's commit wait for the comment.
+
+With `safety.acceptance_actions: approve` (the default) the step blocks
+before anything is sent. `status` shows an `Acceptance action A-…` block:
+the target issue, the PR, the round and the finding, who authorizes it, its
+state (`awaiting approval`, `approved, not yet published`, `published, not
+yet verified`, `verified: <url>` or `verification failed: …`), the payload's
+size and SHA-256, the push held back and the agent worktree that alone holds
+the unpushed commit (do not reset or remove it), and the next steps. Read the
+exact comment with `autoforge status --action A-…`, then either:
+
+- **approve it:** `autoforge unblock --approve-action A-… --reason "..."`,
+  then `resume`, which posts the comment, reads it back, and pushes;
+- **post it yourself:** post exactly those bytes (marker included) on the
+  issue, then `autoforge unblock --reason "..."` and `resume`, which adopt
+  your comment and send no second one;
+- **decline it:** `autoforge unblock --decline-action A-… --reason "..."`;
+  the unsent plan is dropped and `resume` runs the fixer again with your
+  reason in its prompt. The same comment for the same finding is refused if
+  asked for again.
+
+The id names the exact bytes and the target, so an id of another plan or a
+changed payload never matches. A plain `unblock` with nothing on the issue is
+refused: your reason is not evidence, and a comment without the marker, or
+with other bytes, does not fulfil the action (a marked comment with other
+bytes is a conflict: delete it, or edit it back to the payload). Approving or
+declining is refused, with nothing written, after a push to the PR or a
+change of its base; a plain `unblock` then re-enters `FIX`, which sends
+nothing, records the action `stale` and goes back to `REVIEW`. A closed issue
+holds the comment until it is reopened. With `auto` the controller publishes
+the comment during the `FIX` step without stopping; with `off` the fixer is
+told the resolution is unavailable and a result using it is refused. The
+comment counts only after the controller read it back from GitHub, and the
+next review still judges whether it resolves the finding.
 
 ### DONE and FAILED
 
@@ -366,7 +419,7 @@ redacted. What it reads depends on the command:
   `.autoforge/` or a local one in the git directory; `--state-dir` skips
   that lookup.
 - `unblock --dry-run` does the same lookup, then reads GitHub to report the
-  decision it would make.
+  decision it would make (with `--approve-action` or `--decline-action` too).
 
 ## Where things live
 

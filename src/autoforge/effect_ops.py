@@ -18,11 +18,14 @@ sent again. A create is therefore never re-sent blind, and the attempt bound
 of :data:`~autoforge.effects.MAX_EFFECT_ATTEMPTS` holds across every crash
 window.
 
-Every kind of the closed Wave 1 set (ADR 0004 D5.1) has one operation here:
+Every kind of the closed set (ADR 0004 D5.1) has one operation here:
 :class:`PushOp` (K1), :class:`ImplementationPrOp` (K2), :class:`AdoptPrOp`
 (K3), :class:`ReviewCommentOp` (K4), :class:`FollowUpIssueOp` (K5),
-:class:`FollowUpAppendOp` (K6), :class:`ReplacementPrOp` (K7) and
-:class:`ProgressCommentOp` (K8). Each ``reconcile`` is a complete identity
+:class:`FollowUpAppendOp` (K6), :class:`ReplacementPrOp` (K7),
+:class:`ProgressCommentOp` (K8) and :class:`AcceptanceCommentOp` (K9). A K9
+write may also be *held* (``Action.HOLD``, #211): nothing is sent until the
+operator approves it, and :func:`drive` returns the record unchanged with
+the reason. Each ``reconcile`` is a complete identity
 read (D4.5): an open listing read to its end, or an all-states read bounded
 by a head-branch filter or a number watermark, never the search API. Each
 ``issue`` is exactly one write. What an operation checks is the record's own
@@ -38,7 +41,16 @@ from collections.abc import Callable, Hashable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
-from .claims import FOLLOW_UP, IMPLEMENTATION, PROGRESS, REVIEW, MarkerKind, collect, scan
+from .claims import (
+    ACCEPTANCE,
+    FOLLOW_UP,
+    IMPLEMENTATION,
+    PROGRESS,
+    REVIEW,
+    MarkerKind,
+    collect,
+    scan,
+)
 from .effects import (
     MAX_BODY_CHARS,
     Action,
@@ -47,6 +59,7 @@ from .effects import (
     EffectRecord,
     Found,
     Stage,
+    decide_acceptance,
     decide_append,
     decide_create,
     decide_push,
@@ -86,12 +99,15 @@ class Driven:
 
     record: EffectRecord
     issued: bool  # a write was sent in this call
+    held: str = ""  # K9: why the due write was not sent (the record is unchanged)
 
 
 def drive(record: EffectRecord, op: EffectOperation, persist: Persist) -> Driven:
     """Reconcile ``record`` and issue its write at most once (D4.1-D4.3).
 
-    Returns the record ``observed`` or ``conflict``. Raises, with the record
+    Returns the record ``observed`` or ``conflict``, or (K9) the record
+    unchanged with :attr:`Driven.held` set when its write is due but may
+    not be sent yet: nothing is persisted or sent then. Raises, with the record
     left as persisted, when the outcome cannot be read yet:
     :class:`GitHubUnavailableError` from a reconciliation read (nothing was
     persisted or charged), or :class:`EffectPending` after an issue whose
@@ -101,6 +117,8 @@ def drive(record: EffectRecord, op: EffectOperation, persist: Persist) -> Driven
     decision = op.reconcile(record)
     if decision.action is Action.DONE:
         return Driven(record, issued=False)
+    if decision.action is Action.HOLD:
+        return Driven(record, issued=False, held=decision.reason)
     if decision.action is Action.OBSERVE:
         record = record.observing(decision.observed or {})
         persist(record)
@@ -799,6 +817,71 @@ class ProgressCommentOp:
         self.github.create_issue_comment(record.target["epic_url"], record.body)
 
 
+class AcceptanceCommentOp:
+    """K9: the acceptance comment of one finding on the run's own issue (#211).
+
+    Identity: the ``ai-acceptance`` marker for (issue, PR, round, finding)
+    on the issue. Precondition: no comment of the issue carries it, the
+    issue is open and in the repository of the run's PR, and the write is
+    authorized (an operator approval of the record's action id, or the
+    policy). Payload: the controller's header, the agent's text and the
+    marker. Completion: exactly one comment carries the marker, and its
+    body equals the payload (D4.5: the complete comment listing of the
+    issue, never the search API). Whoever posted it is irrelevant: an
+    operator who posts the exact payload has done the write.
+    """
+
+    def __init__(self, github: GitHubClient) -> None:
+        self.github = github
+
+    def reconcile(self, record: EffectRecord) -> Decision:
+        if record.stage in (Stage.OBSERVED, Stage.CONFLICT):
+            return decide_create(record, ())
+        issue_url = record.target["issue_url"]
+        claim = scan(ACCEPTANCE, record.marker).claims[0]
+        comments = self.github.get_issue_comments(issue_url)
+        claimants = collect(ACCEPTANCE, comments, "comment").claimants(
+            claim.key,
+            f"finding {claim.finding_id} of round {claim.round} of PR {claim.pr.canonical} "
+            f"on issue {issue_url}",
+        )
+        if claimants.defects:
+            return Decision(
+                Action.CONFLICT,
+                reason=(
+                    f"{record.describe()}: the issue's comments cannot be read unambiguously "
+                    f"({'; '.join(claimants.defects)})"
+                ),
+            )
+        found = [
+            Found(
+                url=h.obj.url,
+                in_end_state=h.obj.body == record.body,
+                observed={"url": h.obj.url},
+            )
+            for h in claimants.holders
+        ]
+        problem = ""
+        if not found:
+            problem = self._issue_problem(issue_url, record.owner.pr_url)
+        return decide_acceptance(record, found, issue_problem=problem)
+
+    def _issue_problem(self, issue_url: str, pr_url: str) -> str:
+        """Why the run's issue may not receive the comment now, or ""."""
+        issue = self.github.get_issue(issue_url)
+        repository = parse_pr_url(pr_url).repository
+        if not _same_repository(
+            issue.repository or parse_issue_url(issue_url).repository, repository
+        ):
+            return f"issue {issue_url} is not in the run's repository {repository}"
+        if not issue.is_open:
+            return f"issue {issue_url} is {issue.state.lower() or 'not open'}, not open"
+        return ""
+
+    def issue(self, record: EffectRecord) -> None:
+        self.github.create_issue_comment(record.target["issue_url"], record.body)
+
+
 _GITHUB_OPS: dict[EffectKind, Callable[[GitHubClient], EffectOperation]] = {
     EffectKind.IMPLEMENTATION_PR: ImplementationPrOp,
     EffectKind.ADOPT_PR: AdoptPrOp,
@@ -807,6 +890,7 @@ _GITHUB_OPS: dict[EffectKind, Callable[[GitHubClient], EffectOperation]] = {
     EffectKind.FOLLOW_UP_APPEND: FollowUpAppendOp,
     EffectKind.REPLACEMENT_PR: ReplacementPrOp,
     EffectKind.PROGRESS_COMMENT: ProgressCommentOp,
+    EffectKind.ACCEPTANCE_COMMENT: AcceptanceCommentOp,
 }
 
 
@@ -835,6 +919,7 @@ def operation_for(
 
 
 __all__ = [
+    "AcceptanceCommentOp",
     "AdoptPrOp",
     "Driven",
     "EffectOperation",

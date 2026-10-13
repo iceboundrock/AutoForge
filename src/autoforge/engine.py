@@ -114,6 +114,7 @@ from typing import NoReturn
 from . import __prompt_version__
 from .child_env import describe_overrides, isolated_overrides, override_names, preflight
 from .claims import (
+    ACCEPTANCE,
     FOLLOW_UP,
     IMPLEMENTATION,
     PROGRESS,
@@ -126,6 +127,7 @@ from .claims import (
     ProgressClaim,
     ReviewClaim,
     collect,
+    render_acceptance_marker,
     render_follow_up_marker,
     render_implementation_marker,
     render_progress_marker,
@@ -133,6 +135,8 @@ from .claims import (
     scan,
 )
 from .config import (
+    ACCEPTANCE_ACTIONS_AUTO,
+    ACCEPTANCE_ACTIONS_OFF,
     DEFAULT_STATE_DIR,
     AgentLimits,
     AutoForgeConfig,
@@ -141,6 +145,8 @@ from .config import (
     validate_required_profiles,
 )
 from .effect_ops import (
+    AcceptanceCommentOp,
+    Driven,
     ProgressCommentOp,
     ReviewCommentOp,
     append_problem,
@@ -148,9 +154,13 @@ from .effect_ops import (
     operation_for,
 )
 from .effects import (
+    ACTION_ID_RE,
+    AUTHORIZATION_OPERATOR,
+    AUTHORIZATION_POLICY,
     FOLLOW_UP_SOURCE_ENTRY,
     MAX_BODY_CHARS,
     MAX_EFFECT_STATE_CHARS,
+    Action,
     AnalyzeContext,
     EffectKind,
     EffectOwner,
@@ -161,6 +171,10 @@ from .effects import (
     ReviewContext,
     Stage,
     UpdateEpicContext,
+    acceptance_action_id,
+    acceptance_comment_body,
+    acceptance_comment_problem,
+    bounded_reason,
     compose_append,
     follow_up_issue_body,
     implementation_closing_block,
@@ -294,6 +308,7 @@ from .replan_txn import (
     verify_target_pr,
 )
 from .result_parser import (
+    MAX_ACCEPTANCE_BODY_CHARS,
     MAX_CONTROL_RESULT_CHARS,
     MAX_FINDING_ID_CHARS,
     MAX_FINDING_LOCATION_CHARS,
@@ -338,6 +353,7 @@ from .run_contract import LocalRunContract, validate_local_run_contract
 from .runlog import ExecutionRecord, RunLogger, StepLog
 from .safefs import SafeRoot
 from .state import (
+    MAX_ACCEPTANCE_OUTCOMES,
     STATE_FILENAME,
     AutoForgeState,
     StatePaths,
@@ -393,7 +409,19 @@ FIX_BOUND_VARIABLES: dict[str, str | int | None] = {
     "MIN_RATIONALE_CHARS": MIN_RATIONALE_CHARS,
     "MAX_FOLLOW_UP_TITLE_CHARS": MAX_FOLLOW_UP_TITLE_CHARS,
     "MAX_FOLLOW_UP_BODY_CHARS": MAX_FOLLOW_UP_BODY_CHARS,
+    "MAX_ACCEPTANCE_BODY_CHARS": MAX_ACCEPTANCE_BODY_CHARS,
 }
+# The FIX prompt's description of the ``acceptance_action`` resolution
+# (#211), rendered into ``{{ACCEPTANCE_ACTIONS}}`` when
+# ``safety.acceptance_actions`` offers it; under ``off`` the one sentence
+# below says it is unavailable.
+ACCEPTANCE_ACTIONS_TEMPLATE = "acceptance_actions.md"
+ACCEPTANCE_ACTIONS_UNAVAILABLE = (
+    "The `acceptance_action` resolution is not available in this run "
+    "(`safety.acceptance_actions: off`): the controller refuses it. When a finding "
+    "can only be resolved by publishing text on the issue, report "
+    '`"status": "blocked"` with a `"message"` saying so.'
+)
 
 # How many times one LOCAL phase entry may launch a write-capable agent
 # before the run blocks. Every launch is charged and checkpointed before the
@@ -694,10 +722,29 @@ class UnblockDecision:
     detail: str
     pr: PRInfo | None = None
     carry_findings: bool = False
+    # An acceptance action this unblock decides on (#211): ``action`` is the
+    # audit text (``approved A-...`` / ``declined A-...``), ``approve`` the
+    # K9 record with its approval recorded, ``decline`` the K9 record whose
+    # unsent plan is dropped.
+    action: str = ""
+    approve: EffectRecord | None = None
+    decline: EffectRecord | None = None
 
     @property
     def refused(self) -> bool:
         return self.target is None
+
+
+@dataclass(frozen=True)
+class AcceptanceRequest:
+    """``unblock --approve-action`` or ``--decline-action``: the verb and the action id (#211)."""
+
+    verb: str  # "approve" | "decline"
+    action_id: str
+
+    @property
+    def flag(self) -> str:
+        return f"--{self.verb}-action {self.action_id}"
 
 
 @dataclass(frozen=True)
@@ -1691,10 +1738,81 @@ class ControllerEngine:
         if not s.last_fix_resolutions:
             return "(none)"
         return (
-            "The controller verified these against the commits it pushed and the follow-up "
-            "issues it read back; each rationale is the fixer's text:\n"
+            "The controller verified these against the commits it pushed, the follow-up "
+            "issues it read back and, for an `acceptance_action` resolution, the acceptance "
+            "comment it read back on the issue (`acceptance_comment_url`, #211); each rationale "
+            "is the fixer's text, and so is an acceptance comment's text after its header:\n"
             + fenced_untrusted_block(
                 json.dumps(s.last_fix_resolutions, indent=2, ensure_ascii=False), "json"
+            )
+        )
+
+    def _format_acceptance_actions(self) -> str:
+        """``{{ACCEPTANCE_ACTIONS}}``: the ``acceptance_action`` resolution, per policy (#211)."""
+        policy = self.config.safety.acceptance_actions
+        if policy == ACCEPTANCE_ACTIONS_OFF:
+            return ACCEPTANCE_ACTIONS_UNAVAILABLE
+        if policy == ACCEPTANCE_ACTIONS_AUTO:
+            authorization = (
+                "This run authorizes it by policy (`safety.acceptance_actions: auto`): the "
+                "controller publishes the comment during this FIX step, before it pushes "
+                "your commit."
+            )
+        else:
+            authorization = (
+                "This run publishes it only after the operator approves the exact comment "
+                "(`safety.acceptance_actions: approve`): until then the run waits and sends "
+                "nothing, and your commits stay unpushed in this worktree. The operator may "
+                "also decline it; this phase then runs again with the decline listed below."
+            )
+        s = self._require_state()
+        return render(
+            load_template(ACCEPTANCE_ACTIONS_TEMPLATE),
+            {
+                "ISSUE_URL": s.current_issue_url or "(none)",
+                "ACCEPTANCE_AUTHORIZATION": authorization,
+                **FIX_BOUND_VARIABLES,
+            },
+        )
+
+    def _declined_acceptance_outcomes(self) -> list[dict]:
+        """The acceptance actions the operator declined for the round being fixed (#211)."""
+        s = self._require_state()
+        return [
+            o
+            for o in s.acceptance_outcomes
+            if o.get("outcome") == "declined" and o.get("round") == s.review_round
+        ]
+
+    def _format_declined_acceptance_actions(self) -> str:
+        """``{{DECLINED_ACCEPTANCE_ACTIONS}}``: this round's declines, quoted as data (#211).
+
+        The finding ids and action ids are the controller's; the reason is
+        the operator's text (redacted when it was recorded), so the list is
+        quoted through the unclosable fence.
+        """
+        declined = self._declined_acceptance_outcomes()
+        if not declined:
+            return "(none)"
+        return (
+            "The operator declined these acceptance actions of this round. The controller "
+            "refuses the same comment again (the same text for the same finding has the same "
+            "action id); resolve the finding another way, or change the text only where the "
+            "operator's reason asks for it:\n"
+            + fenced_untrusted_block(
+                json.dumps(
+                    [
+                        {
+                            "action_id": o["action_id"],
+                            "finding_id": o["finding_id"],
+                            "reason": o["reason"],
+                        }
+                        for o in declined
+                    ],
+                    indent=2,
+                    ensure_ascii=False,
+                ),
+                "json",
             )
         )
 
@@ -1804,6 +1922,8 @@ class ControllerEngine:
             "FINDINGS": self._format_findings(s.open_findings),
             "PRIOR_FINDINGS": self._format_prior_findings(),
             "PREVIOUS_FIX_RESOLUTIONS": self._format_previous_fix_resolutions(),
+            "ACCEPTANCE_ACTIONS": self._format_acceptance_actions(),
+            "DECLINED_ACCEPTANCE_ACTIONS": self._format_declined_acceptance_actions(),
             "MERGED_SINCE_EPIC_UPDATE": s.merged_since_epic_update,
             "EPIC_UPDATE_EVERY": self.config.workflow.epic_update_every,
             "MERGED_PRS_SINCE_EPIC_UPDATE": self._format_merged_since_epic_update(s),
@@ -4089,7 +4209,11 @@ class ControllerEngine:
         names an issue the entry handed over (one finding's own follow-up,
         or an earlier round's), compared by identity, so any spelling GitHub
         resolves to it is that issue (PR #205 R4-F1), or asks for a new issue
-        whose composed body passes the credential rule as a whole.
+        whose composed body passes the credential rule as a whole. An
+        ``acceptance_action`` is refused while ``safety.acceptance_actions``
+        is ``off``, when the comment the controller would render from it
+        fails the published-content policy as a whole, and when its action
+        id is one the operator declined for this round (#211).
         The candidate is the worktree's ``HEAD`` as the controller reads it:
         detached, equal to ``head_sha``, and either the reviewed HEAD itself
         (nothing committed, so no finding is ``fixed``) or a descendant of
@@ -4147,6 +4271,9 @@ class ControllerEngine:
                         "or report status 'blocked' if that issue is wrong"
                     )
                 continue
+            if r.acceptance_action:
+                new_chars += self._check_acceptance_action(r)
+                continue
             if r.resolution != "follow_up_created":
                 continue
             if r.new_follow_up:
@@ -4167,9 +4294,9 @@ class ControllerEngine:
                 )
         if new_chars + FixContext.STORED_BOUND > MAX_EFFECT_STATE_CHARS:
             raise ControlResultValidationError(
-                f"FIX: the new follow-up issues hold {new_chars} characters together, more "
-                "than the controller journals for one FIX round; shorten their bodies and "
-                "re-emit the CONTROL_RESULT"
+                f"FIX: the new follow-up issues and the acceptance comment hold {new_chars} "
+                "characters together, more than the controller journals for one FIX round; "
+                "shorten their bodies and re-emit the CONTROL_RESULT"
             )
         attached, _ = self._worktree_git(
             ["symbolic-ref", "-q", "HEAD"], cwd, "whether HEAD is detached"
@@ -4235,8 +4362,99 @@ class ControllerEngine:
         self._fix_candidate = head
         return res
 
+    def _check_acceptance_action(self, r: FindingResolution) -> int:
+        """The controller's half of an ``acceptance_action`` (#211): its rendered size.
+
+        Refused (a correction) while ``safety.acceptance_actions`` is
+        ``off``; when the comment the controller renders from the text (its
+        header, the text, the finding's marker) fails the credential rule as
+        a whole, the mention rule on what precedes the marker or GitHub's
+        comment limit; and when its action id is one the operator declined
+        for this round: the same text for the same finding is the same id,
+        so a relaunched fixer cannot request a declined comment unchanged.
+        """
+        fid = r.finding_id
+        if self.config.safety.acceptance_actions == ACCEPTANCE_ACTIONS_OFF:
+            raise ControlResultValidationError(
+                f"FIX: {fid} is resolved as acceptance_action, which this run does not offer "
+                "(safety.acceptance_actions: off); resolve it another way, or report status "
+                "'blocked' with a message"
+            )
+        record = self._acceptance_plan(0, self._fix_owner(), fid, r.acceptance_body)
+        if isinstance(record, str):
+            raise ControlResultValidationError(f"FIX: {record}")
+        for outcome in self._declined_acceptance_outcomes():
+            if outcome["action_id"] == record.action_id:
+                raise ControlResultValidationError(
+                    f"FIX: the acceptance comment requested for {fid} is action "
+                    f"{record.action_id}, which the operator declined for review round "
+                    f"{outcome['round']}; the controller does not request it again unchanged. "
+                    "Resolve the finding another way, or change the text where the operator's "
+                    "reason (listed in the prompt) asks for it, and re-emit the CONTROL_RESULT"
+                )
+        return len(record.body)
+
+    def _fix_owner(self) -> EffectOwner:
+        """The owner of every record of this FIX entry's plan (ADR 0004 D2.2)."""
+        state = self._require_state()
+        return EffectOwner(
+            run_id=state.run_id,
+            phase=Phase.FIX,
+            issue_url=state.current_issue_url,
+            pr_url=state.current_pr_url,
+            transaction_id="",
+        )
+
+    def _acceptance_plan(
+        self, position: int, owner: EffectOwner, finding_id: str, text: str
+    ) -> EffectRecord | str:
+        """The K9 record publishing ``text`` for ``finding_id``, or why it cannot be (#211).
+
+        The target is the run's issue, derived here and never from the
+        result. The authorization is the policy at plan time, recorded with
+        the record so a later configuration change never widens it: ``auto``
+        is the policy's, with the record's own action id approved; anything
+        else waits for the operator's approval of that id.
+        """
+        state = self._require_state()
+        issue_url = parse_issue_url(state.current_issue_url).canonical
+        pr_url = parse_pr_url(owner.pr_url).canonical
+        body = acceptance_comment_body(text, issue_url, pr_url, state.review_round, finding_id)
+        problem = acceptance_comment_problem(body, finding_id)
+        if problem:
+            return problem
+        identity = {
+            "issue_url": issue_url,
+            "marker": render_acceptance_marker(issue_url, pr_url, state.review_round, finding_id),
+        }
+        target = {"issue_url": issue_url}
+        payload = {"body": body}
+        by_policy = self.config.safety.acceptance_actions == ACCEPTANCE_ACTIONS_AUTO
+        return EffectRecord.plan(
+            position,
+            EffectKind.ACCEPTANCE_COMMENT,
+            owner,
+            identity=identity,
+            target=target,
+            precondition={
+                "absent": True,
+                "authorization": AUTHORIZATION_POLICY if by_policy else AUTHORIZATION_OPERATOR,
+                "approved_action_id": (
+                    acceptance_action_id(owner, identity, target, payload) if by_policy else ""
+                ),
+            },
+            payload=payload,
+        )
+
     # -- operator unblock (issue #5) -------------------------------------------
-    def unblock(self, reason: str, *, dry_run: bool = False) -> UnblockOutcome:
+    def unblock(
+        self,
+        reason: str,
+        *,
+        dry_run: bool = False,
+        approve_action: str = "",
+        decline_action: str = "",
+    ) -> UnblockOutcome:
         """The operator's explicit exit from BLOCKED.
 
         BLOCKED is where the controller stops when it cannot determine the
@@ -4258,6 +4476,15 @@ class ControllerEngine:
         the run log; a refusal only in the run log. The step budget is not
         charged: no agent runs here. ``dry_run`` performs the same GitHub
         reads and reports the decision without writing state or the log.
+
+        ``approve_action`` or ``decline_action`` (never both) names the
+        acceptance action of a saved FIX plan that awaits the operator
+        (#211). An approval records that exact id on the K9 record, and
+        ``resume`` publishes it; a decline drops the unsent plan and FIX
+        launches the fixer afresh with the decline in its prompt. Either is
+        refused, with nothing written, unless the run is BLOCKED on that
+        action, the PR is open at the reviewed HEAD, base and merge base,
+        and the issue's comments allow it (:meth:`_acceptance_unblock`).
         """
         reason = reason.strip()
         if not reason:
@@ -4267,12 +4494,26 @@ class ControllerEngine:
                 f"unblock --reason must be at most {MAX_UNBLOCK_REASON_CHARS} characters "
                 f"({len(reason)} given)"
             )
+        if approve_action and decline_action:
+            raise ConfigurationError("unblock takes --approve-action or --decline-action, not both")
+        request = None
+        if approve_action or decline_action:
+            verb = "approve" if approve_action else "decline"
+            action_id = (approve_action or decline_action).strip()
+            if not ACTION_ID_RE.match(action_id):
+                raise ConfigurationError(
+                    f"unblock --{verb}-action takes an action id of the form A-<16 hex digits>, "
+                    "as 'autoforge status' prints it"
+                )
+            request = AcceptanceRequest(verb, action_id)
         if dry_run:
-            return self._unblock_once(reason, dry_run=True)
+            return self._unblock_once(reason, dry_run=True, request=request)
         with self._execution_lock():
-            return self._unblock_once(reason, dry_run=False)
+            return self._unblock_once(reason, dry_run=False, request=request)
 
-    def _unblock_once(self, reason: str, *, dry_run: bool) -> UnblockOutcome:
+    def _unblock_once(
+        self, reason: str, *, dry_run: bool, request: AcceptanceRequest | None = None
+    ) -> UnblockOutcome:
         state = self._require_state()
         if state.mode == WorkflowMode.LOCAL:
             raise StateTransitionError(
@@ -4284,7 +4525,7 @@ class ControllerEngine:
                 f"run {state.run_id} is in phase {state.phase.value}, not BLOCKED; unblock "
                 "applies only to BLOCKED runs"
             )
-        decision = self._unblock_decision()
+        decision = self._unblock_decision(request)
         if dry_run:
             if decision.target is None:
                 message = f"[dry-run] would stay BLOCKED: {decision.detail}"
@@ -4357,15 +4598,38 @@ class ControllerEngine:
                     f"the stale round {state.review_round} stay carried to that review to "
                     "re-check"
                 )
-        state.unblock_history.append(
-            {
-                "at": utcnow_iso(),
-                "reason": redact(reason),
-                "block_reason": redact(cleared),
-                "phase": target.value,
-                "detail": redact(decision.detail),
-            }
-        )
+        entry = {
+            "at": utcnow_iso(),
+            "reason": redact(reason),
+            "block_reason": redact(cleared),
+            "phase": target.value,
+            "detail": redact(decision.detail),
+        }
+        if decision.action:
+            entry["action"] = decision.action
+        state.unblock_history.append(entry)
+        if decision.approve is not None:
+            # #211: the approval is the record's own recomputed id, saved with
+            # the unblock; 'resume' publishes the comment (K9 first).
+            state.effect_records[decision.approve.position] = decision.approve.to_dict()
+        if decision.decline is not None:
+            # #211: nothing of the plan was sent (the decision read the K9
+            # identity and found nothing), so the plan is dropped and FIX is
+            # entered afresh; the worktree and its commits are untouched.
+            claim = scan(ACCEPTANCE, decision.decline.marker).claims[0]
+            state.drop_phase_effects()
+            state.acceptance_outcomes.append(
+                {
+                    "action_id": decision.decline.action_id,
+                    "round": claim.round,
+                    "finding_id": claim.finding_id,
+                    "outcome": "declined",
+                    "at": entry["at"],
+                    "comment_url": "",
+                    "reason": bounded_reason(reason),
+                }
+            )
+            del state.acceptance_outcomes[:-MAX_ACCEPTANCE_OUTCOMES]
         effects = state.phase_effects()
         if effects.phase == target:
             # D2.4: the records belong to the phase entry the block
@@ -4408,13 +4672,14 @@ class ControllerEngine:
                 "detail": decision.detail,
                 "live_pr_state": decision.pr.state if decision.pr else "",
                 "live_head_sha": decision.pr.head_sha if decision.pr else "",
+                "action": decision.action,
             },
         )
         if decision.refused:
             record.error = f"unblock refused: {decision.detail}"
         self._logger().log_execution(record)
 
-    def _unblock_decision(self) -> UnblockDecision:
+    def _unblock_decision(self, request: AcceptanceRequest | None = None) -> UnblockDecision:
         """Re-run the recovery inspection against live GitHub and choose the phase.
 
         Refuses (``target=None``) whenever the safe phase is not knowable
@@ -4422,8 +4687,21 @@ class ControllerEngine:
         that transaction's only entry), an exhausted step budget (the very
         next step would block again), then per the PR. A transient GitHub
         failure propagates unchanged: nothing is decided on a read that may
-        succeed next time.
+        succeed next time. An approval or a decline (``request``, #211) is
+        decided only by the saved FIX plan's row; any other decision is a
+        refusal of it.
         """
+        decision = self._unblock_decision_for(request)
+        if request is None or decision.refused or decision.action:
+            return decision
+        return UnblockDecision(
+            None,
+            f"unblock {request.flag} applies only to a saved FIX plan whose acceptance action "
+            f"awaits the operator, and this run has none; without the flag: {decision.detail}",
+            pr=decision.pr,
+        )
+
+    def _unblock_decision_for(self, request: AcceptanceRequest | None) -> UnblockDecision:
         state = self._require_state()
         if state.replan_transaction:
             stage = state.replan_transaction.get("stage", "(unknown)")
@@ -4442,7 +4720,7 @@ class ControllerEngine:
             )
         if not state.current_pr_url:
             return self._unblock_without_pr()
-        return self._unblock_with_pr()
+        return self._unblock_with_pr(request)
 
     def _unblock_without_pr(self) -> UnblockDecision:
         """No PR bound: ANALYZE_EXECUTE, once its entry probe is known to succeed."""
@@ -4490,7 +4768,7 @@ class ControllerEngine:
             )
         return UnblockDecision(Phase.ANALYZE_EXECUTE, detail)
 
-    def _unblock_with_pr(self) -> UnblockDecision:
+    def _unblock_with_pr(self, request: AcceptanceRequest | None = None) -> UnblockDecision:
         """A PR is bound: decide from its live state and the review bound to it."""
         state = self._require_state()
         url = state.current_pr_url
@@ -4600,7 +4878,13 @@ class ControllerEngine:
             # The fixer's result was accepted and its writes planned: the
             # re-entry completes them from the journal, and a PR head at the
             # planned candidate is the controller's own push. No fixer is
-            # launched for it again.
+            # launched for it again. An acceptance action that awaits the
+            # operator decides first (#211).
+            waiting = self._awaiting_acceptance(effects.records)
+            if request is not None or waiting is not None:
+                acceptance = self._acceptance_unblock(request, waiting, pr, canonical)
+                if acceptance is not None:
+                    return acceptance
             records = ", ".join(r.describe() for r in effects.records) or "nothing to send"
             return UnblockDecision(
                 Phase.FIX,
@@ -4659,6 +4943,190 @@ class ControllerEngine:
             "binds the actual revision",
             pr=pr,
             carry_findings=not at_reviewed_revision,
+        )
+
+    @staticmethod
+    def _awaiting_acceptance(records: Sequence[EffectRecord]) -> EffectRecord | None:
+        """The FIX plan's acceptance comment while it awaits the operator, or ``None`` (#211)."""
+        for record in records:
+            if (
+                record.kind is EffectKind.ACCEPTANCE_COMMENT
+                and record.stage is Stage.INTENDED
+                and not record.authorized
+            ):
+                return record
+        return None
+
+    def _acceptance_drift(self, pr: PRInfo) -> tuple[str, str]:
+        """``(drift, unreadable)``: how ``pr`` left the findings' binding, or why it is unknown.
+
+        The binding a FIX plan was saved under: the reviewed HEAD, base and
+        merge base (read against the reviewed HEAD, as :meth:`_fix_rebound`
+        reads it). Nothing of a plan whose acceptance action awaits the
+        operator was pushed, so the PR head is the reviewed HEAD while the
+        binding holds. Both empty when it holds.
+        """
+        state = self._require_state()
+        reviewed = state.reviewed_head_sha.lower()
+        if pr.head_sha.lower() != reviewed:
+            return (
+                f"PR HEAD is {pr.head_sha[:12]}, not the reviewed HEAD {reviewed[:12]}",
+                "",
+            )
+        if state.reviewed_base_ref and pr.base_ref != state.reviewed_base_ref:
+            return (
+                f"PR base is {pr.base_ref!r}, not the reviewed base {state.reviewed_base_ref!r}",
+                "",
+            )
+        if not state.reviewed_merge_base_sha:
+            return "", ""
+        try:
+            merge_base = self.github.get_merge_base_sha(state.repository, pr.base_ref, reviewed)
+        except GitHubUnavailableError:
+            raise
+        except GitHubError as exc:
+            return "", (
+                f"the merge base of {pr.base_ref!r} and the reviewed HEAD could not be read: "
+                f"{exc}. This is not a transient GitHub failure; fix the cause first"
+            )
+        if merge_base != state.reviewed_merge_base_sha:
+            return (
+                f"PR merge base is {merge_base[:12]}, not the reviewed merge base "
+                f"{state.reviewed_merge_base_sha[:12]}",
+                "",
+            )
+        return "", ""
+
+    def _acceptance_unblock(
+        self,
+        request: AcceptanceRequest | None,
+        waiting: EffectRecord | None,
+        pr: PRInfo,
+        canonical: str,
+    ) -> UnblockDecision | None:
+        """The unblock of a saved FIX plan whose acceptance action awaits the operator (#211).
+
+        ``None`` lets the plan's ordinary row decide (a plain unblock whose
+        PR moved: the FIX re-entry routes the drift to REVIEW and records
+        the action stale). Otherwise, after re-reading the PR binding and
+        the K9 identity on the issue:
+
+        - a plain unblock re-enters FIX only when the exact payload is on
+          the issue (the re-entry adopts it); with nothing there, or a
+          comment that is not the payload, it is refused;
+        - an approval of the waiting action's exact id re-enters FIX with
+          the id recorded on the record, unless the PR moved, the setting is
+          ``off``, the issue no longer qualifies or a comment conflicts;
+        - a decline of that id drops the unsent plan and re-enters FIX
+          afresh, unless the PR moved or a comment carries the marker.
+        """
+        if request is not None and (waiting is None or waiting.action_id != request.action_id):
+            pending = waiting.action_id if waiting is not None else "none"
+            return UnblockDecision(
+                None,
+                f"unblock {request.flag} names no acceptance action awaiting the operator "
+                f"(awaiting: {pending}); the id is recomputed from the saved record, so an id "
+                "of another record, an older plan or other bytes never matches. Run "
+                "'autoforge status' for the current one",
+                pr=pr,
+            )
+        assert waiting is not None
+        action = waiting.action_id
+        issue = waiting.target["issue_url"]
+        drift, unreadable = self._acceptance_drift(pr)
+        if unreadable:
+            return UnblockDecision(None, unreadable, pr=pr)
+        if drift:
+            if request is None:
+                return None
+            return UnblockDecision(
+                None,
+                f"unblock {request.flag} is refused as stale: {drift}, so the findings action "
+                f"{action} was requested for no longer describe PR {canonical}. Unblock without "
+                "the flag: FIX re-reads the PR and routes the drift to REVIEW, sending nothing",
+                pr=pr,
+            )
+        op = AcceptanceCommentOp(self.github)
+        if request is not None and request.verb == "approve":
+            if self.config.safety.acceptance_actions == ACCEPTANCE_ACTIONS_OFF:
+                return UnblockDecision(
+                    None,
+                    f"action {action} cannot be approved while safety.acceptance_actions is "
+                    "off; decline it, post its payload yourself and unblock, or set the key "
+                    "back to 'approve' first",
+                    pr=pr,
+                )
+            approved = waiting.approving()
+            found = op.reconcile(approved)
+            if found.action in (Action.HOLD, Action.CONFLICT):
+                return UnblockDecision(
+                    None,
+                    f"action {action} cannot be approved: {found.reason}. Repair that first",
+                    pr=pr,
+                )
+            adopted = (
+                f"its exact payload is already on {(found.observed or {}).get('url')}, which "
+                "FIX adopts"
+                if found.action is Action.OBSERVE
+                else f"FIX publishes it on {issue}"
+            )
+            return UnblockDecision(
+                Phase.FIX,
+                f"PR {canonical} is OPEN at the reviewed HEAD, base and merge base and action "
+                f"{action} is approved; {adopted}, then completes the persisted FIX plan "
+                "without launching the fixer",
+                pr=pr,
+                action=f"approved {action}",
+                approve=approved,
+            )
+        found = op.reconcile(waiting)
+        if request is not None:
+            if found.action is not Action.HOLD:
+                what = (
+                    f"its exact payload is already on {(found.observed or {}).get('url')}"
+                    if found.action is Action.OBSERVE
+                    else found.reason
+                )
+                return UnblockDecision(
+                    None,
+                    f"action {action} cannot be declined: {what}. A decline is for an action "
+                    "nothing was sent for; delete the comment first, or unblock without the "
+                    "flag to adopt an exact one",
+                    pr=pr,
+                )
+            return UnblockDecision(
+                Phase.FIX,
+                f"PR {canonical} is OPEN at the reviewed HEAD, base and merge base and action "
+                f"{action} is declined; nothing of the FIX plan was sent, so it is dropped and "
+                "FIX launches the fixer afresh with the decline in its prompt (the worktree "
+                "and its commits are kept)",
+                pr=pr,
+                action=f"declined {action}",
+                decline=waiting,
+            )
+        if found.action is Action.OBSERVE:
+            return UnblockDecision(
+                Phase.FIX,
+                f"PR {canonical} is OPEN at the reviewed HEAD and the exact payload of action "
+                f"{action} is on {(found.observed or {}).get('url')}; FIX adopts it and "
+                "completes the persisted plan without launching the fixer",
+                pr=pr,
+            )
+        if found.action is Action.CONFLICT:
+            return UnblockDecision(
+                None,
+                f"action {action} awaits approval, and {found.reason}. Delete that comment, or "
+                "edit it back to exactly the payload ('autoforge status --action "
+                f"{action}'), then unblock again",
+                pr=pr,
+            )
+        return UnblockDecision(
+            None,
+            f"action {action} awaits approval: no comment on {issue} carries its exact "
+            "payload, and an unblock reason is not evidence. Approve it with "
+            f"'--approve-action {action}', post exactly its payload on the issue yourself, or "
+            f"decline it with '--decline-action {action}'",
+            pr=pr,
         )
 
     def _premerge_plan_notes(self) -> list[str]:
@@ -6095,6 +6563,25 @@ class ControllerEngine:
             "only if GitHub does not already hold it and its attempt bound is left"
             for record in effects.records
         ]
+        for record in effects.records:
+            if record.kind is EffectKind.ACCEPTANCE_COMMENT and record.pending:
+                if record.authorized:
+                    by = (
+                        "safety.acceptance_actions: auto"
+                        if record.precondition["authorization"] == AUTHORIZATION_POLICY
+                        else "the operator's approval"
+                    )
+                    notes.append(
+                        f"acceptance action {record.action_id} is authorized ({by}): would "
+                        "publish it first, before any other write of the plan, unless the "
+                        "issue already holds its exact payload"
+                    )
+                else:
+                    notes.append(
+                        f"acceptance action {record.action_id} awaits the operator's approval: "
+                        "would adopt its exact payload if the issue holds it, and otherwise "
+                        "block before anything is sent"
+                    )
         if isinstance(effects.context, FixContext):
             notes.append(
                 f"would complete FIX of review round {effects.context.round} from the persisted "
@@ -6103,7 +6590,8 @@ class ControllerEngine:
                 "anything is sent (a PR head neither the reviewed HEAD nor the planned "
                 "candidate, or a base or merge base that moved, routes to REVIEW; a head "
                 "branch or follow-up the plan cannot prove, or a deferral to the current "
-                "issue, blocks), then create the follow-up issues, append the markers, read "
+                "issue, blocks), then publish the acceptance comment, if any, create the "
+                "follow-up issues, append the markers, read "
                 "the PR and the open issues again and push last, then read the follow-ups, the "
                 "PR head, base, merge base and head branch back"
             )
@@ -6120,9 +6608,13 @@ class ControllerEngine:
                 "follow-up issues handed over, and its head_sha against the worktree's "
                 "detached HEAD, its ancestry from the reviewed HEAD and every published commit "
                 "message, asking the fixer again on a refusal",
-                "would save the plan (new follow-up issues, marker appends to handed-over "
-                "issues, then the push of that HEAD as a fast-forward over the reviewed HEAD), "
-                "perform it in that order, and read the follow-ups and the PR head back",
+                "would save the plan (an acceptance comment on the issue first, when the fixer "
+                f"requests one and safety.acceptance_actions "
+                f"({self.config.safety.acceptance_actions}) allows it, then new follow-up "
+                "issues, marker appends to handed-over issues, then the push of that HEAD as a "
+                "fast-forward over the reviewed HEAD), perform it in that order (an acceptance "
+                "comment that awaits the operator's approval blocks before anything is sent), "
+                "and read the comment, the follow-ups and the PR head back",
             ]
         )
         return notes
@@ -7983,6 +8475,7 @@ class ControllerEngine:
         state.open_findings = []
         state.prior_findings = []
         state.last_fix_resolutions = []
+        state.acceptance_outcomes = []
         state.last_review_comment_url = ""
         state.last_review_result = ""
         state.last_review_needs_fix = None
@@ -8937,6 +9430,7 @@ class ControllerEngine:
         state.open_findings = []
         state.prior_findings = []
         state.review_history = []
+        state.acceptance_outcomes = []
         state.last_review_result = ""
         state.reviewed_pr_url = ""
         state.reviewed_head_sha = ""
@@ -9427,7 +9921,9 @@ class ControllerEngine:
         push (K1, last: the commit point; none when nothing was committed)
         are planned and saved with the completion context in one save, and
         :meth:`_complete_fix` does the rest from what was saved, as a later
-        entry would.
+        entry would. An acceptance comment (K9, #211) is planned first, so
+        nothing of the plan is sent before the one write that may wait for
+        the operator's approval.
         """
         state = self._require_state()
         reviewed = state.reviewed_head_sha.lower()
@@ -9524,14 +10020,19 @@ class ControllerEngine:
                 f"{exc}. This is not a transient GitHub failure; nothing was created, "
                 "appended or pushed. Fix the cause, then 'unblock'"
             )
-        owner = EffectOwner(
-            run_id=state.run_id,
-            phase=Phase.FIX,
-            issue_url=state.current_issue_url,
-            pr_url=state.current_pr_url,
-            transaction_id="",
-        )
+        owner = self._fix_owner()
         records: list[EffectRecord] = []
+        acceptance: dict[str, int] = {}
+        for r in res.resolutions:
+            if not r.acceptance_action:
+                continue
+            planned = self._acceptance_plan(len(records), owner, r.finding_id, r.acceptance_body)
+            if isinstance(planned, str):
+                raise StateError(
+                    f"a FIX acceptance comment its check accepted is refused: {planned}"
+                )
+            acceptance[r.finding_id] = len(records)
+            records.append(planned)
         sources: dict[str, str | int] = {
             fid: FOLLOW_UP_SOURCE_ENTRY
             for fid in own
@@ -9600,6 +10101,7 @@ class ControllerEngine:
                     "rationale": redact(r.rationale),
                     "commit_sha": r.commit_sha,
                     "follow_up_source": sources.get(r.finding_id),
+                    "acceptance_source": acceptance.get(r.finding_id),
                 }
                 for r in res.resolutions
             ),
@@ -9650,6 +10152,9 @@ class ControllerEngine:
         """
         state = self._require_state()
         state.last_fix_resolutions = []
+        # An acceptance comment the plan held (#211) is stale: it was
+        # requested for findings that no longer describe the PR.
+        self._record_acceptance_outcomes(state.phase_effects().records, "stale", what)
         state.drop_phase_effects()
         nxt, _, carried = self._stale_revision(Phase.FIX, pr)
         return nxt, f"{what}; FIX -> {nxt.value} of the actual revision, no fix recorded{carried}"
@@ -9811,6 +10316,13 @@ class ControllerEngine:
             repair = (
                 "reopen the follow-up issue the controller created, or close or unmark the "
                 "issue(s) named above that it did not create"
+            )
+        elif record.kind is EffectKind.ACCEPTANCE_COMMENT:
+            repair = (
+                f"delete the comment(s) named above, or edit one back to exactly the prepared "
+                f"payload of action {record.action_id} "
+                f"({self.cli_command('status', '--action', record.action_id)}), so that at most "
+                "one comment carries the marker and its body is that payload"
             )
         else:
             repair = (
@@ -10054,6 +10566,11 @@ class ControllerEngine:
                     "not a transient failure (authentication, permissions, or malformed "
                     "data); nothing was sent again. Fix the cause, then 'unblock'"
                 )
+            if driven.held:
+                # K9 (#211): the acceptance comment is due but may not be
+                # sent (no approval yet, or the issue no longer qualifies).
+                # It is first in the plan, so nothing at all was sent.
+                return Phase.BLOCKED, self._acceptance_hold_reason(driven, records)
             records[index] = driven.record
             checked = checked and record.kind is EffectKind.PUSH
             if driven.record.stage == Stage.CONFLICT:
@@ -10106,9 +10623,15 @@ class ControllerEngine:
                     )
                 ),
                 "commit_sha": r["commit_sha"],
+                "acceptance_comment_url": (
+                    ""
+                    if r["acceptance_source"] is None
+                    else str((records[r["acceptance_source"]].observed or {})["url"])
+                ),
             }
             for r in context.resolutions
         ]
+        self._record_acceptance_outcomes(records, "verified", "")
         state.current_head_sha = latest.head_sha
         state.last_review_result = "fixed"
         # The plan is complete, and the save that leaves FIX drops it; the
@@ -10117,6 +10640,11 @@ class ControllerEngine:
         state.open_findings = []
         created = sum(1 for r in records if r.kind is EffectKind.FOLLOW_UP_ISSUE)
         appended = sum(1 for r in records if r.kind is EffectKind.FOLLOW_UP_APPEND)
+        accepted = "".join(
+            f", acceptance comment {(r.observed or {}).get('url')} verified ({r.action_id})"
+            for r in records
+            if r.kind is EffectKind.ACCEPTANCE_COMMENT
+        )
         nxt = self._next_phase(Phase.FIX, {})
         moved = (
             f"pushed {candidate[:12]} over {reviewed[:12]}"
@@ -10125,8 +10653,103 @@ class ControllerEngine:
         )
         return nxt, (
             f"FIX of review round {context.round}: {len(context.resolutions)} resolution(s), "
-            f"{created} follow-up issue(s) created, {appended} marker append(s), {moved}; "
-            f"FIX -> {nxt.value} (round {state.review_round + 1})"
+            f"{created} follow-up issue(s) created, {appended} marker append(s){accepted}, "
+            f"{moved}; FIX -> {nxt.value} (round {state.review_round + 1})"
+        )
+
+    def _record_acceptance_outcomes(
+        self, records: Sequence[EffectRecord], outcome: str, reason: str
+    ) -> None:
+        """Append the outcome of each K9 record of the FIX plan (#211).
+
+        At completion every K9 is ``verified``; when the plan is dropped
+        for drift (:meth:`_fix_drift`) a K9 that was not observed is
+        ``stale`` and one that was is still ``verified``: the comment is on
+        the issue, although the fix it was part of is not recorded. The
+        oldest entries past :data:`MAX_ACCEPTANCE_OUTCOMES` are dropped.
+        """
+        state = self._require_state()
+        for record in records:
+            if record.kind is not EffectKind.ACCEPTANCE_COMMENT:
+                continue
+            claim = scan(ACCEPTANCE, record.marker).claims[0]
+            observed = record.stage is Stage.OBSERVED
+            state.acceptance_outcomes.append(
+                {
+                    "action_id": record.action_id,
+                    "round": claim.round,
+                    "finding_id": claim.finding_id,
+                    "outcome": "verified" if observed else outcome,
+                    "at": utcnow_iso(),
+                    "comment_url": str((record.observed or {}).get("url", "")) if observed else "",
+                    "reason": "" if observed else bounded_reason(reason) if reason else "",
+                }
+            )
+        del state.acceptance_outcomes[:-MAX_ACCEPTANCE_OUTCOMES]
+
+    def _acceptance_hold_reason(self, driven: Driven, records: Sequence[EffectRecord]) -> str:
+        """The BLOCKED reason of a held acceptance comment, rendered by the controller (#211).
+
+        Names the action id, the finding (id and title), the issue, the PR
+        and the round; the payload's size and SHA-256 and the command that
+        prints it; the push held back and the worktree that alone holds the
+        unpushed candidate; and the ways forward. Agent text appears only as
+        the finding's title, which the review result bounded to one line.
+        """
+        state = self._require_state()
+        record = driven.record
+        claim = scan(ACCEPTANCE, record.marker).claims[0]
+        fid = claim.finding_id
+        action = record.action_id
+        title = next(
+            (str(f.get("title", "")) for f in state.open_findings if f.get("id") == fid), ""
+        )
+        issue = record.target["issue_url"]
+        push = records[-1] if records[-1].kind is EffectKind.PUSH else None
+        others = sum(
+            1
+            for r in records
+            if r.kind in (EffectKind.FOLLOW_UP_ISSUE, EffectKind.FOLLOW_UP_APPEND)
+        )
+        if push is not None:
+            branch = str(push.target["ref"]).removeprefix("refs/heads/")
+            held_back = (
+                f"the push of {str(push.payload['sha'])[:12]} to {branch!r} is held back until "
+                "the comment is verified, and that unpushed candidate lives only in the agent "
+                f"worktree {self.agent_worktree_description()}: do not reset or remove it"
+            )
+        else:
+            held_back = "the fixer committed nothing, so nothing is pushed"
+        if others:
+            held_back += f"; {others} follow-up write(s) are held back as well"
+        why = "<why>"
+        approve = f"{self.cli_command('unblock', '--approve-action', action, '--reason')} {why!r}"
+        plain = f"{self.cli_command('unblock', '--reason')} {why!r}"
+        decline = f"{self.cli_command('unblock', '--decline-action', action, '--reason')} {why!r}"
+        resume = self.resume_command()
+        if self.config.safety.acceptance_actions == ACCEPTANCE_ACTIONS_OFF:
+            approval = (
+                "safety.acceptance_actions is now off, so it cannot be approved: post the "
+                f"payload yourself, decline it, or set the key back to 'approve' and run {approve}"
+            )
+        else:
+            approval = f"approve it: {approve}, then {resume}"
+        opening = (
+            f"FIX of review round {state.review_round} cannot publish acceptance action "
+            f"{action}: {driven.held}"
+            if record.authorized
+            else f"FIX of review round {state.review_round} awaits operator action {action} "
+            f"({driven.held})"
+        )
+        return (
+            f"{opening}. The fixer resolved finding {fid} ({title!r}) by asking the controller "
+            f"to publish an acceptance comment on issue {issue} for PR {state.current_pr_url}; "
+            "nothing of the FIX plan was sent. The comment's payload is "
+            f"{len(record.body)} characters, sha256 {sha256_text(record.body)}; print it with "
+            f"{self.cli_command('status', '--action', action)}. Meanwhile {held_back}. Next: "
+            f"{approval}; or post exactly that payload on {issue} yourself (marker included), "
+            f"then {plain} and {resume}; or decline it: {decline} (FIX runs the fixer again, "
+            "with the decline in its prompt)"
         )
 
     def _check_replan_result(self, payload: dict, cwd: str) -> ReplanReexecuteResult:

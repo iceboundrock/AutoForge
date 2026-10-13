@@ -28,6 +28,12 @@ High-priority coverage includes:
   incomplete record fails loudly; LOCAL state carrying effect state is
   refused; a previous-protocol file loads with no effect state, and one
   that carries effect fields is refused
+- acceptance-action state (#211, `tests/test_state.py`): it round-trips
+  under protocol 8; a protocol-7 file loads migrated and is relabelled; a
+  protocol-7 or older file carrying outcomes, an `acceptance_comment_url`,
+  an unblock `action`, a K9 record or an `acceptance_source` is refused,
+  unchanged; each malformed outcome and recorded URL is refused; a LOCAL
+  run carries none; a new issue resets the outcomes
 
 ### Transitions
 
@@ -53,6 +59,11 @@ High-priority coverage includes:
 - the published-content policy on agent text the controller publishes
   (marker openers, credential classes, closing references, mentions), and
   each `UPDATE_EPIC` re-request accepting only its own keys
+- the `acceptance_action` resolution (#211, `tests/test_result_parser.py`):
+  its closed shape, every target key refused by name, an unknown key or
+  kind, the body bounds and the published-content policy, the rationale
+  rule, no commit or follow-up beside it, at most one per result, and the
+  LOCAL refusal
 
 ### Execution
 
@@ -467,6 +478,24 @@ a stated reason it has none. The coverage that must keep working:
   recorded resolutions; Pi reaches the same outcome as the scripted
   provider; a dry run, with or without a saved plan, reads, fetches,
   launches and writes nothing
+- acceptance actions (#211, the "acceptance actions" section of
+  `tests/test_engine.py`, K9 in `tests/test_effects.py`, the status and
+  unblock flags in `tests/test_cli.py`): under `approve` the plan is saved
+  with K9 first and the push last and the step blocks with nothing sent and
+  a reason naming the id, the finding, the payload digest and the held-back
+  push; an approval publishes the comment, reads it back and pushes,
+  without the fixer, and the next reviewer gets its URL; `auto` completes
+  in one step; `off` is a correction; a closed issue, or one outside the
+  repository, holds the comment; the exact payload an operator posts is
+  adopted; a decline drops the unsent plan, relaunches the fixer with the
+  decline in its prompt and refuses the same comment again; a push while
+  it waits refuses an approval as stale and records the action `stale`;
+  every refused unblock (unknown id, no evidence, a posted payload
+  declined, an edited or duplicated comment, a closed issue, a stale
+  decline) leaves the state byte-identical, also as a dry run; the
+  generic per-kind effect tests run for K9, with its hold, approval and
+  load rules; `status`, `status --json` and `status --action` show the
+  action and its exact bytes
 - `REPLAN_REEXECUTE`'s publication (#164, `tests/test_replan.py`, "The
   controller publishes the replacement"): the replan agent commits on the
   base its prompt names and publishes nothing, and the controller pushes
@@ -539,6 +568,12 @@ a stated reason it has none. The coverage that must keep working:
   refuse, or whose body is not the fixer's text followed by the controller's
   reference and marker, is refused on load (the `k5-*` cases of
   `test_a_corrupt_record_fails_loudly` in `tests/test_effects.py`)
+- an acceptance comment (#211) that landed before its observation was
+  saved (or with it saved) is adopted by the next process, which pushes
+  without the fixer and never posts it twice; one whose write never landed
+  is sent once more within the bound; a persisted K9 whose approval names
+  other bytes, or that is `attempted` without one, is refused on load (the
+  `k9-*` cases of `test_a_corrupt_record_fails_loudly`)
 
 ### Integration
 

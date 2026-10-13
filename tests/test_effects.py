@@ -34,11 +34,13 @@ import pytest
 
 from autoforge.claims import (
     REVIEW,
+    render_acceptance_marker,
     render_follow_up_marker,
     render_implementation_marker,
     render_progress_marker,
 )
 from autoforge.effect_ops import (
+    AcceptanceCommentOp,
     AdoptPrOp,
     EffectPending,
     FollowUpAppendOp,
@@ -60,6 +62,7 @@ from autoforge.effects import (
     MAX_EFFECT_STATE_CHARS,
     MAX_EFFECTS_PER_PLAN,
     MAX_TITLE_CHARS,
+    Action,
     AnalyzeContext,
     Binding,
     EffectKind,
@@ -67,9 +70,13 @@ from autoforge.effects import (
     EffectRecord,
     EntryObservation,
     FixContext,
+    Found,
     ReplanContext,
     Stage,
+    acceptance_action_id,
+    acceptance_comment_body,
     compose_append,
+    decide_acceptance,
     follow_up_issue_body,
     implementation_closing_block,
     load_phase_effects,
@@ -304,6 +311,39 @@ def progress_record() -> EffectRecord:
         payload={
             "body": progress_comment_body("Issue #2 is done; PR #42 merged.", PROGRESS_MARKER)
         },
+    )
+
+
+ACCEPTANCE_MARKER = render_acceptance_marker(ISSUE, PR, 1, "R1-F1")
+ACCEPTANCE_TEXT = "Ran the operator check on the reviewed HEAD; every check passed."
+
+
+def acceptance_record(
+    *,
+    authorization: str = "policy",
+    text: str = ACCEPTANCE_TEXT,
+    position: int = 0,
+    by: EffectOwner = FIX_OWNER,
+) -> EffectRecord:
+    """K9 (#211): authorized by policy (its own id approved), or awaiting the operator."""
+    identity = {"issue_url": ISSUE, "marker": ACCEPTANCE_MARKER}
+    target = {"issue_url": ISSUE}
+    payload = {"body": acceptance_comment_body(text, ISSUE, PR, 1, "R1-F1")}
+    approved = (
+        acceptance_action_id(by, identity, target, payload) if authorization == "policy" else ""
+    )
+    return EffectRecord.plan(
+        position,
+        EffectKind.ACCEPTANCE_COMMENT,
+        by,
+        identity=identity,
+        target=target,
+        precondition={
+            "absent": True,
+            "authorization": authorization,
+            "approved_action_id": approved,
+        },
+        payload=payload,
     )
 
 
@@ -614,7 +654,27 @@ class ProgressCommentCase(Case):
         return fake.add_comment(EPIC, 302, f"A copy.\n\n{PROGRESS_MARKER}").url
 
 
-K2, K3, K4, K5, K6, K7, K8 = (
+class AcceptanceCommentCase(Case):
+    name, write, op_type = "K9-acceptance-comment", "create_issue_comment", AcceptanceCommentOp
+
+    def setup(self, fake: FakeGitHub) -> EffectRecord:
+        fake.add_issue(ISSUE, "Ship the feature")
+        return acceptance_record()
+
+    def landed(self, fake: FakeGitHub, record: EffectRecord) -> list[str]:
+        return [c.url for c in fake.comments.get(ISSUE, []) if c.body == record.body]
+
+    def plant(self, fake: FakeGitHub, record: EffectRecord) -> str:
+        return fake.add_comment(ISSUE, 300, record.body).url
+
+    def imposter(self, fake: FakeGitHub, record: EffectRecord) -> str:
+        return fake.add_comment(ISSUE, 301, f"Other evidence.\n\n{ACCEPTANCE_MARKER}").url
+
+    def second_holder(self, fake: FakeGitHub, record: EffectRecord) -> str:
+        return fake.add_comment(ISSUE, 302, f"A copy.\n\n{ACCEPTANCE_MARKER}").url
+
+
+K2, K3, K4, K5, K6, K7, K8, K9 = (
     ImplementationPrCase(),
     AdoptPrCase(),
     ReviewCommentCase(),
@@ -622,9 +682,10 @@ K2, K3, K4, K5, K6, K7, K8 = (
     FollowUpAppendCase(),
     ReplacementPrCase(),
     ProgressCommentCase(),
+    AcceptanceCommentCase(),
 )
-CASES = [K2, K3, K4, K5, K6, K7, K8]
-CREATE_CASES = [K2, K4, K5, K7, K8]
+CASES = [K2, K3, K4, K5, K6, K7, K8, K9]
+CREATE_CASES = [K2, K4, K5, K7, K8, K9]
 APPEND_CASES = [K3, K6]
 CLOSABLE_CASES = [K2, K5, K7]
 by_case = pytest.mark.parametrize("case", CASES, ids=repr)
@@ -646,6 +707,7 @@ OBSERVED: list[tuple[Callable[[], EffectRecord], dict]] = [
     (review_record, {"url": comment_url(PR, 300)}),
     (replacement_record, {"url": PR43, "number": 43}),
     (progress_record, {"url": comment_url(EPIC, 300)}),
+    (acceptance_record, {"url": comment_url(ISSUE, 300)}),
 ]
 
 
@@ -725,7 +787,7 @@ def _dict(build: Callable[[], EffectRecord]) -> Callable[[], dict]:
     return lambda: build().to_dict()
 
 
-IMPL, PUSH, ADOPT, REVIEWED, FOLLOW, APPEND, REPLACE, PROGRESS = (
+IMPL, PUSH, ADOPT, REVIEWED, FOLLOW, APPEND, REPLACE, PROGRESS, ACCEPT = (
     _dict(impl_record),
     _dict(push_record),
     _dict(adopt_record),
@@ -734,7 +796,9 @@ IMPL, PUSH, ADOPT, REVIEWED, FOLLOW, APPEND, REPLACE, PROGRESS = (
     _dict(append_record),
     _dict(replacement_record),
     _dict(progress_record),
+    _dict(acceptance_record),
 )
+WAITING = _dict(lambda: acceptance_record(authorization="operator"))
 PRE_BASE_REVIEW_MARKER = REVIEW.render(
     {k: v for k, v in REVIEW_PAYLOAD.items() if k != "reviewed_base_ref"}
 )
@@ -1303,6 +1367,90 @@ CORRUPTIONS = [
         "observed on another issue than its EPIC",
     ),
     _p("k8-observed-not-a-comment", PROGRESS, observed_as({"url": EPIC}), "of the expected kind"),
+    # K9 (#211).
+    _p("k9-issue-mismatch", ACCEPT, at("identity.issue_url", ISSUE3), "issue that differs"),
+    _p(
+        "k9-another-issue",
+        ACCEPT,
+        both(at("identity.issue_url", ISSUE3), at("target.issue_url", ISSUE3)),
+        "comments on another issue than its owner's",
+    ),
+    _p(
+        "k9-marker-of-another-pr",
+        ACCEPT,
+        at("identity.marker", render_acceptance_marker(ISSUE, PR43, 1, "R1-F1")),
+        "another PR than its owner's",
+    ),
+    _p(
+        "k9-body-not-rendered",
+        ACCEPT,
+        at("payload.body", f"Evidence.\n\n{ACCEPTANCE_MARKER}"),
+        "is not the controller's header, its text and its marker",
+    ),
+    _p(
+        "k9-text-unpublishable",
+        ACCEPT,
+        at(
+            "payload.body",
+            acceptance_comment_body("ask @octocat", ISSUE, PR, 1, "R1-F1"),
+        ),
+        "has an invalid acceptance text",
+    ),
+    _p(
+        "k9-text-not-stripped",
+        ACCEPT,
+        at(
+            "payload.body",
+            acceptance_comment_body(f" {ACCEPTANCE_TEXT}", ISSUE, PR, 1, "R1-F1"),
+        ),
+        "not in the parser's stored form",
+    ),
+    _p(
+        "k9-authorization-unknown",
+        ACCEPT,
+        at("precondition.authorization", "agent"),
+        "must be one of",
+    ),
+    _p(
+        "k9-approval-malformed",
+        ACCEPT,
+        at("precondition.approved_action_id", "A-123"),
+        "must be empty or an action id",
+    ),
+    _p(
+        "k9-approval-of-other-bytes",
+        ACCEPT,
+        at("precondition.approved_action_id", "A-" + "0" * 16),
+        "is not the record's action id",
+    ),
+    _p(
+        "k9-approval-survives-an-edit",
+        ACCEPT,
+        at(
+            "payload.body",
+            acceptance_comment_body(ACCEPTANCE_TEXT + " Twice.", ISSUE, PR, 1, "R1-F1"),
+        ),
+        "is not the record's action id",
+    ),
+    _p(
+        "k9-policy-without-approval",
+        ACCEPT,
+        at("precondition.approved_action_id", ""),
+        "authorized by policy but records no approved action id",
+    ),
+    _p(
+        "k9-attempted-unapproved",
+        WAITING,
+        both(at("stage", "attempted"), at("attempts", 1)),
+        "records an issued attempt without an approval",
+    ),
+    _p("k9-not-absent", ACCEPT, at("precondition.absent", False), "absent"),
+    _p(
+        "k9-observed-elsewhere",
+        ACCEPT,
+        observed_as({"url": comment_url(ISSUE3, 5)}),
+        "observed on another issue than its target",
+    ),
 ]
 
 
@@ -2769,3 +2917,167 @@ def test_push_has_no_operation_without_the_transport_or_the_default_branch(remot
     )
     with pytest.raises(GitTransportError, match="default branch must be named"):
         PushOp(fake, transport, "")
+
+
+# -- K9: the acceptance comment (#211) ---------------------------------------------------
+
+
+def test_the_acceptance_action_id_names_the_owner_the_target_and_the_exact_bytes():
+    """The id is recomputed from the record: the same plan is the same id in
+    any process, and another body, issue, PR, round, finding or run is
+    another id. An approval is never carried to other bytes."""
+    record = acceptance_record(authorization="operator")
+    again = EffectRecord.from_dict(json.loads(json.dumps(record.to_dict())))
+    assert record.action_id == again.action_id
+    assert record.action_id.startswith("A-") and len(record.action_id) == 18
+    others = [
+        acceptance_record(authorization="operator", text=ACCEPTANCE_TEXT + "!"),
+        acceptance_record(authorization="operator", by=owner(Phase.FIX, pr_url=PR, run_id="r2")),
+    ]
+    assert len({record.action_id, *(o.action_id for o in others)}) == 3
+    identity, target, payload = record.identity, record.target, record.payload
+    other_round = {**identity, "marker": render_acceptance_marker(ISSUE, PR, 2, "R2-F1")}
+    other_issue = {"issue_url": ISSUE3}
+    assert acceptance_action_id(FIX_OWNER, identity, target, payload) == record.action_id
+    assert acceptance_action_id(FIX_OWNER, other_round, target, payload) != record.action_id
+    assert acceptance_action_id(FIX_OWNER, identity, other_issue, payload) != record.action_id
+    assert push_record().action_id == ""
+
+
+def test_an_acceptance_comment_awaiting_the_operator_is_held_with_nothing_sent():
+    """Without an approval the write is held: nothing is saved or sent, the
+    record is unchanged, and the reason names the action id. The record
+    itself refuses to become attempted."""
+    fake = FakeGitHub()
+    fake.add_issue(ISSUE, "Ship the feature")
+    record = acceptance_record(authorization="operator")
+    saves = saves_for(fake)
+    driven = drive(record, AcceptanceCommentOp(fake), saves)
+    assert driven.record == record and not driven.issued
+    assert f"action {record.action_id} awaits the operator's approval" in driven.held
+    assert saves.log == [] and fake.effect_writes == []
+    with pytest.raises(StateError, match="is not authorized; not issued"):
+        record.attempting()
+
+
+def test_an_approval_records_the_recomputed_id_while_intended_only():
+    record = acceptance_record(authorization="operator")
+    approved = record.approving()
+    assert approved.authorized and not record.authorized
+    assert approved.precondition == {
+        "absent": True,
+        "authorization": "operator",
+        "approved_action_id": record.action_id,
+    }
+    assert approved.action_id == record.action_id
+    with pytest.raises(StateError, match="cannot be approved"):
+        approved.attempting().approving()
+    with pytest.raises(StateError, match="cannot be approved"):
+        push_record().approving()
+
+
+@pytest.mark.parametrize("state", ["CLOSED", "ELSEWHERE"])
+def test_an_authorized_acceptance_comment_is_held_while_the_issue_does_not_qualify(state):
+    fake = FakeGitHub()
+    info = fake.add_issue(
+        ISSUE, "Ship the feature", state="CLOSED" if state == "CLOSED" else "OPEN"
+    )
+    if state == "ELSEWHERE":
+        fake.issues[ISSUE] = replace(info, repository="other/repo")
+    record = acceptance_record()
+    saves = saves_for(fake)
+    driven = drive(record, AcceptanceCommentOp(fake), saves)
+    assert driven.record == record and saves.log == [] and fake.effect_writes == []
+    assert ("is closed, not open" if state == "CLOSED" else "not in the run's") in driven.held
+
+
+@pytest.mark.parametrize("authorization", ["operator", "policy"])
+def test_an_acceptance_comment_already_on_the_issue_is_adopted_whoever_posted_it(authorization):
+    """The exact payload on the issue is the write, approved or not: an
+    operator may post it instead of approving, and a closed issue does not
+    undo a comment that is there."""
+    fake = FakeGitHub()
+    fake.add_issue(ISSUE, "Ship the feature", state="CLOSED")
+    record = acceptance_record(authorization=authorization)
+    url = fake.add_comment(ISSUE, 300, record.body).url
+    driven = drive(record, AcceptanceCommentOp(fake), saves_for(fake))
+    assert driven.record.stage is Stage.OBSERVED and driven.record.observed == {"url": url}
+    assert fake.effect_writes == []
+
+
+def test_decide_acceptance_holds_only_a_due_write():
+    """D4.2 decides first: an exact holder is adopted, any other holder is a
+    conflict, a spent bound is a conflict; only then is a due write held."""
+    waiting = acceptance_record(authorization="operator")
+    exact = Found(url=comment_url(ISSUE, 1), in_end_state=True, observed={"url": "u"})
+    edited = Found(url=comment_url(ISSUE, 2), in_end_state=False, observed={"url": "v"})
+    assert decide_acceptance(waiting, [exact]).action is Action.OBSERVE
+    assert decide_acceptance(waiting, [edited]).action is Action.CONFLICT
+    assert decide_acceptance(waiting, [exact, edited]).action is Action.CONFLICT
+    assert decide_acceptance(waiting, []).action is Action.HOLD
+    authorized = acceptance_record()
+    assert decide_acceptance(authorized, []).action is Action.ISSUE
+    held = decide_acceptance(authorized, [], issue_problem="issue x is closed, not open")
+    assert held.action is Action.HOLD and "issue x is closed" in held.reason
+    spent = authorized.attempting().attempting()
+    assert decide_acceptance(spent, []).exhausted
+
+
+def _acceptance_context(source: int | None = 0, fid: str = "R1-F1") -> dict:
+    return {
+        **FIX_CONTEXT,
+        "resolutions": [
+            {
+                "finding_id": fid,
+                "resolution": "acceptance_action",
+                "rationale": "The finding asks for evidence on the issue, not for a change.",
+                "commit_sha": "",
+                "follow_up_source": None,
+                "acceptance_source": source,
+            }
+        ],
+    }
+
+
+def test_a_plan_with_an_acceptance_comment_loads_with_it_first_and_alone():
+    """K9 is first in the plan (nothing is sent before the write that may
+    wait) and there is at most one; the context names it from exactly the
+    finding it resolves."""
+    plan = [acceptance_record().to_dict(), push_record(position=1).to_dict()]
+    binding = replace(FIX_BINDING, open_finding_ids=("R1-F1",))
+    loaded = load_phase_effects(plan, {}, _acceptance_context(), binding)
+    assert [r.kind for r in loaded.records] == [EffectKind.ACCEPTANCE_COMMENT, EffectKind.PUSH]
+    with pytest.raises(StateError, match="plans an acceptance comment after another effect"):
+        load_records(
+            [push_record().to_dict(), acceptance_record(position=1).to_dict()], FIX_BINDING
+        )
+    with pytest.raises(StateError, match="plans more than one acceptance comment"):
+        load_records(
+            [acceptance_record().to_dict(), acceptance_record(position=1).to_dict()],
+            FIX_BINDING,
+        )
+    with pytest.raises(StateError, match="no resolution of the context names"):
+        load_phase_effects(plan, {}, FIX_CONTEXT, FIX_BINDING)
+    with pytest.raises(StateError, match="which is not an acceptance comment"):
+        load_phase_effects(plan, {}, _acceptance_context(1), binding)
+    with pytest.raises(StateError, match="another finding's or round's"):
+        load_phase_effects(
+            plan,
+            {},
+            _acceptance_context(0, "R1-F2"),
+            replace(FIX_BINDING, open_finding_ids=("R1-F2",)),
+        )
+    with pytest.raises(StateError, match="is set exactly when"):
+        load_phase_effects(plan, {}, _acceptance_context(None), binding)
+
+
+def test_the_largest_plan_with_an_acceptance_comment_loads():
+    """One acceptance comment, one follow-up per other finding and the push
+    still fit the record bound."""
+    records = [acceptance_record()]
+    records += [
+        follow_up_record(finding_id=f"R1-F{i}", position=i - 1)
+        for i in range(2, MAX_EFFECTS_PER_PLAN)
+    ]
+    records.append(push_record(position=MAX_EFFECTS_PER_PLAN - 1))
+    assert len(load_records([r.to_dict() for r in records], FIX_BINDING)) == MAX_EFFECTS_PER_PLAN

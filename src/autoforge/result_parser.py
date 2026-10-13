@@ -57,7 +57,11 @@ the controller handed over or carries the title and body of a new follow-up
 issue the controller creates, under that policy and bounded
 (``MAX_FOLLOW_UP_TITLE_CHARS``, ``MAX_FOLLOW_UP_BODY_CHARS``), and
 ``previous_head_sha`` and ``head_sha`` are cross-checks; it names no push
-target and creates nothing (#163). An UPDATE_EPIC result is validated
+target and creates nothing (#163). One of its resolutions may instead ask
+the controller to publish an acceptance comment on the run's own issue: a
+closed ``kind`` and a bounded body under the same policy
+(``MAX_ACCEPTANCE_BODY_CHARS``, ``MAX_ACCEPTANCE_ACTIONS_PER_FIX``), never
+a target, URL, method, path or command (#211). An UPDATE_EPIC result is validated
 against the schema of the request that launched the agent
 (:class:`UpdateEpicRequest`, D4.7): a re-request after publication carries
 only what it asks for.
@@ -101,7 +105,7 @@ _FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
 
 ALLOWED_STATUSES = ("success", "failure", "blocked")
 FINDING_CLASSIFICATIONS = ("blocked", "non-blocked", "nit")
-FIX_RESOLUTIONS = ("fixed", "follow_up_created", "no_change_with_rationale")
+FIX_RESOLUTIONS = ("fixed", "follow_up_created", "no_change_with_rationale", "acceptance_action")
 # LOCAL mode has no GitHub, so a finding cannot be deferred to a follow-up
 # Issue. "unresolved" is the honest local disposition: the fixer could not
 # resolve it and says why. The controller treats it as a remaining finding.
@@ -207,6 +211,19 @@ REVIEW_PROSE_SECTIONS: tuple[tuple[str, int], ...] = (
 # title bound. Rejected, never clipped, like every other published field.
 MAX_FOLLOW_UP_TITLE_CHARS = 256
 MAX_FOLLOW_UP_BODY_CHARS = 60000
+# An ``acceptance_action`` resolution (#211): the one kind of external action
+# a fixer may request, a comment on the run's own issue whose text is the
+# evidence a finding asks for. The kind is a closed set and the request
+# names no target: the controller derives the issue from its state (ADR 0004
+# D8.1), so any key that looks like one is refused rather than ignored. The
+# body is the agent's part of the comment the controller renders (its
+# header, the body, its marker), bounded like a follow-up issue body.
+# Rejected, never clipped, like every other published field.
+ACCEPTANCE_ACTION_KINDS = ("issue_comment",)
+ACCEPTANCE_ACTION_KEYS = ("kind", "body")
+ACCEPTANCE_TARGET_KEYS = ("url", "issue", "repository", "target", "method", "path", "command")
+MAX_ACCEPTANCE_BODY_CHARS = 60000
+MAX_ACCEPTANCE_ACTIONS_PER_FIX = 1
 # Bounds on the ``tests`` list: names of what the agent ran, recorded with
 # the result and never published.
 MAX_TESTS_REPORTED = 50
@@ -1190,6 +1207,56 @@ def validate_follow_up_body(text: object, subject: str = "follow_up_issue") -> s
     return _fix_text(text, subject, "body", MAX_FOLLOW_UP_BODY_CHARS, one_line=False)
 
 
+def validate_acceptance_body(text: object, subject: str = "acceptance_action") -> str:
+    """``text`` as the agent's part of an acceptance comment (#211), or a rejection.
+
+    Non-blank, at most :data:`MAX_ACCEPTANCE_BODY_CHARS`, multi-line text
+    with no other control character, and publishable: the controller puts
+    its own header before it and the finding's ``ai-acceptance`` marker
+    after it. The checks :meth:`FindingResolution.from_payload` applies, so
+    the agent's part of a persisted K9 body can be re-validated.
+    """
+    return _fix_text(text, subject, "body", MAX_ACCEPTANCE_BODY_CHARS, one_line=False)
+
+
+def _acceptance_body(raw: object, fid: str) -> str:
+    """The body of ``fid``'s ``acceptance_action`` object, or a rejection.
+
+    The object is a closed schema: ``kind`` (one of
+    :data:`ACCEPTANCE_ACTION_KINDS`) and ``body``. A key that would name a
+    target is refused by name, any other unknown key as unknown; nothing is
+    ignored, because an ignored ``url`` would read as a target the
+    controller honoured.
+    """
+    ph = "FIX"
+    if not isinstance(raw, dict):
+        raise ControlResultValidationError(
+            f"{ph}: {fid} field 'acceptance_action' must be an object with kind and body"
+        )
+    targets = sorted(k for k in raw if k in ACCEPTANCE_TARGET_KEYS)
+    if targets:
+        raise ControlResultValidationError(
+            f"{ph}: {fid} acceptance_action carries {', '.join(repr(k) for k in targets)}; an "
+            "acceptance action names no target, URL, method, path or command: the controller "
+            "comments on the run's own issue. Remove the field and re-emit the CONTROL_RESULT."
+        )
+    unknown = sorted(str(k) for k in raw if k not in ACCEPTANCE_ACTION_KEYS)
+    if unknown:
+        raise ControlResultValidationError(
+            f"{ph}: {fid} acceptance_action has unknown field(s) "
+            f"{', '.join(repr(k[:MAX_FINDING_ID_CHARS]) for k in unknown)}; it carries "
+            "exactly 'kind' and 'body'"
+        )
+    kind = raw.get("kind")
+    if kind not in ACCEPTANCE_ACTION_KINDS:
+        shown = repr(kind[:MAX_FINDING_ID_CHARS]) if isinstance(kind, str) else type(kind).__name__
+        raise ControlResultValidationError(
+            f"{ph}: {fid} acceptance_action kind {shown} is not supported; the one supported "
+            f"kind is {ACCEPTANCE_ACTION_KINDS[0]!r} (a comment on the run's own issue)"
+        )
+    return validate_acceptance_body(raw.get("body"), f"acceptance_action of {fid}")
+
+
 @dataclass
 class FindingResolution:
     """One open finding's resolution, as a REMOTE fixer reports it (#163).
@@ -1198,8 +1265,12 @@ class FindingResolution:
     handed over (``follow_up_issue_url``) or carries the title and body of a
     new follow-up issue the controller creates (``follow_up_title``,
     ``follow_up_body``; the payload's ``follow_up_issue`` object), never
-    both. ``commit_sha`` is allowed on ``fixed`` only. ``to_dict`` keeps the
-    persisted shape of ``state.last_fix_resolutions``.
+    both. An ``acceptance_action`` resolution carries the body of the
+    comment the controller publishes on the run's issue
+    (``acceptance_body``; the payload's ``acceptance_action`` object, #211)
+    and the rationale a ``no_change_with_rationale`` needs. ``commit_sha``
+    is allowed on ``fixed`` only. ``to_dict`` keeps the persisted shape of
+    ``state.last_fix_resolutions``.
     """
 
     finding_id: str
@@ -1209,11 +1280,17 @@ class FindingResolution:
     commit_sha: str = ""
     follow_up_title: str = ""
     follow_up_body: str = ""
+    acceptance_body: str = ""
 
     @property
     def new_follow_up(self) -> bool:
         """A follow-up issue the controller creates for this finding."""
         return bool(self.follow_up_title)
+
+    @property
+    def acceptance_action(self) -> bool:
+        """An acceptance comment the controller publishes for this finding (#211)."""
+        return self.resolution == "acceptance_action"
 
     @classmethod
     def from_payload(cls, raw: object, index: int) -> FindingResolution:
@@ -1240,12 +1317,17 @@ class FindingResolution:
         follow_up = _opt_url(raw, "follow_up_issue_url", ph, "issue")
         new_issue = raw.get("follow_up_issue")
         commit_sha = _opt_sha(raw, "commit_sha", ph)
-        if res == "no_change_with_rationale":
+        action = raw.get("acceptance_action")
+        if res in ("no_change_with_rationale", "acceptance_action"):
             if len(rationale) < MIN_RATIONALE_CHARS:
                 raise ControlResultValidationError(
-                    f"{ph}: {fid} uses no_change_with_rationale but the rationale is missing "
+                    f"{ph}: {fid} uses {res} but the rationale is missing "
                     f"or too short (>= {MIN_RATIONALE_CHARS} chars of actual reasoning required)"
                 )
+        if res != "acceptance_action" and action is not None:
+            raise ControlResultValidationError(
+                f"{ph}: {fid} carries an acceptance_action but resolution is {res!r}"
+            )
         if res != "follow_up_created":
             if follow_up or new_issue is not None:
                 raise ControlResultValidationError(
@@ -1271,6 +1353,14 @@ class FindingResolution:
             what = f"follow_up_issue of {fid}"
             title = validate_follow_up_title(new_issue.get("title"), what)
             body = validate_follow_up_body(new_issue.get("body"), what)
+        acceptance = ""
+        if res == "acceptance_action":
+            if action is None:
+                raise ControlResultValidationError(
+                    f"{ph}: {fid} uses acceptance_action and must carry an 'acceptance_action' "
+                    "object with kind and body"
+                )
+            acceptance = _acceptance_body(action, fid)
         return cls(
             finding_id=fid,
             resolution=res,
@@ -1279,6 +1369,7 @@ class FindingResolution:
             commit_sha=commit_sha,
             follow_up_title=title,
             follow_up_body=body,
+            acceptance_body=acceptance,
         )
 
     def to_dict(self) -> dict:
@@ -1317,6 +1408,14 @@ class FixResult:
         ids = [r.finding_id for r in resolutions]
         if len(set(ids)) != len(ids):
             raise ControlResultValidationError(f"duplicate resolution finding_ids: {ids}")
+        actions = [r.finding_id for r in resolutions if r.acceptance_action]
+        if len(actions) > MAX_ACCEPTANCE_ACTIONS_PER_FIX:
+            raise ControlResultValidationError(
+                f"{ph}: {len(actions)} resolutions use acceptance_action "
+                f"({', '.join(actions)}); the controller accepts at most "
+                f"{MAX_ACCEPTANCE_ACTIONS_PER_FIX} per FIX result. Resolve the others another "
+                "way and re-emit the CONTROL_RESULT."
+            )
         tests = _opt_str_list(p, "tests", ph)
         if len(tests) > MAX_TESTS_REPORTED:
             raise ControlResultValidationError(
@@ -1696,6 +1795,9 @@ class LocalFindingResolution:
                     " — local runs have no GitHub, so a finding cannot be deferred to a "
                     "follow-up Issue; use 'unresolved' with a rationale instead"
                     if res == "follow_up_created"
+                    else " — LOCAL runs perform no external writes; resolve as `unresolved` "
+                    "with a rationale instead"
+                    if res == "acceptance_action"
                     else ""
                 )
             )

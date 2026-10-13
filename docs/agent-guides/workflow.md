@@ -534,7 +534,8 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   revision its marker binds, without launching the reviewer. `OPEN` with a
   persisted `FIX` plan (a fixer's result accepted and its writes planned,
   #163) -> `FIX`, which completes the plan from the journal without
-  launching the fixer. `OPEN` at the
+  launching the fixer, unless its acceptance action awaits the operator
+  (below). `OPEN` at the
   reviewed HEAD and base with a
   clean review -> `READY_FOR_MERGE` (the merge gate re-verifies from there);
   at the reviewed HEAD and base with open findings -> `FIX` with the findings
@@ -556,6 +557,36 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   reimplement is the operator's decision). A PR that another PR answers
   for, or that cannot be read conclusively, refuses; a transient GitHub
   failure propagates and decides nothing.
+- **An acceptance action awaiting the operator** (#211). A `FIX` plan's
+  acceptance comment (K9, first in the plan) that is unapproved under
+  `safety.acceptance_actions: approve` blocks the run with nothing sent.
+  `--approve-action <id>` and `--decline-action <id>` (mutually exclusive;
+  a malformed id is a usage error) name that action; the id is recomputed
+  from the saved record, so another record's, an older plan's or other
+  bytes' id refuses. Both re-read the PR and refuse as stale unless it is
+  `OPEN` at the reviewed HEAD, base and merge base; both read the issue's
+  comments for the action's marker:
+  - **approve** -> `FIX`, with the approval recorded on the record and
+    `approved <id>` as the history entry's `action`; `resume` posts the
+    comment (or adopts the exact payload already there), then completes the
+    plan without launching the fixer. Refused under `off`, while the issue
+    is closed or outside the PR's repository, or when a marked comment with
+    other bytes (or two) is there.
+  - **decline** -> `FIX` afresh: the unsent plan and its context are
+    dropped, `acceptance_outcomes` records `declined` with the redacted
+    reason, the history entry's `action` is `declined <id>`, and `resume`
+    launches the fixer with the decline in its prompt (the worktree and its
+    commits are kept). Refused once the marker is on the issue.
+  - **no flag** -> `FIX` only when the exact payload is on the issue (posted
+    by the operator; `FIX` adopts it). With nothing there the reason is not
+    evidence and the unblock refuses; a marked comment with other bytes
+    refuses, naming it. When the PR moved, the plain unblock re-enters `FIX`,
+    whose plan completion routes the drift to `REVIEW`, sends nothing and
+    records the action `stale`.
+
+  A flag on a run with no waiting action refuses, quoting the decision a
+  plain unblock would make. After an approval the record is authorized, so
+  a later block (a closed issue, say) is left with a plain unblock.
 - **Refusal.** A refusal leaves the state file byte-identical: the run stays
   `BLOCKED` with its reason, and only the run log records the attempt
   (`<run_id>/NNN-blocked-unblock-1/`, with the operator's reason, the block
@@ -569,7 +600,7 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   `current_merge_base_sha` is cleared for the next `REVIEW` entry to read;
   the review binding (`reviewed_*`) is never rewritten by this path. The action is
   appended to `unblock_history` (timestamp, reason, cleared block reason,
-  phase, detail) and to the run log, `block_reason` is cleared and `attempt`
+  phase, detail, and `action` for an approval or a decline) and to the run log, `block_reason` is cleared and `attempt`
   reset. No agent runs and no step is charged: the operator reviews the
   outcome and runs `resume`, whose entry probe for that phase runs again.
 - **Dry-run** reads GitHub, reports the phase it would re-enter or the

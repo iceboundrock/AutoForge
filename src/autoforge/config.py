@@ -322,6 +322,7 @@ DEFAULT_PROTECTED_MERGE_PATHS = (".github/workflows/",)
 # them carry loop bounds or merge behaviour, where a misspelled key keeps a
 # looser built-in bound than the operator wrote.
 SAFETY_KEYS = (
+    "acceptance_actions",
     "allow_merge",
     "protected_merge_paths",
     "required_checks",
@@ -334,6 +335,21 @@ DEFAULT_REQUIRED_CHECKS = ("ci",)
 
 # `safety.allow_merge` when no config file sets it.
 DEFAULT_ALLOW_MERGE_SOURCE = "built-in default"
+
+# `safety.acceptance_actions` (#211): whether a REMOTE fixer may resolve a
+# finding by asking the controller to publish an acceptance comment on the
+# run's own issue, and who authorizes that one write. `off` refuses the
+# resolution; `approve` (the default) publishes it only after the operator
+# approves its action id (`autoforge unblock --approve-action`); `auto`
+# publishes it during the FIX step with no human.
+ACCEPTANCE_ACTIONS_OFF = "off"
+ACCEPTANCE_ACTIONS_APPROVE = "approve"
+ACCEPTANCE_ACTIONS_AUTO = "auto"
+ACCEPTANCE_ACTION_POLICIES = (
+    ACCEPTANCE_ACTIONS_OFF,
+    ACCEPTANCE_ACTIONS_APPROVE,
+    ACCEPTANCE_ACTIONS_AUTO,
+)
 
 
 @dataclass
@@ -385,6 +401,12 @@ class SafetyConfig:
     # the PR's file list instead of GitHub's run record); neither proves what
     # the tests in the PR assert (see `merge.verification_commands`).
     verify_check_definition: bool = True
+    # Who may authorize the one external action a fixer can request, an
+    # acceptance comment on the run's own issue (#211): nobody (`off`), the
+    # operator per action id (`approve`) or this setting (`auto`). The
+    # value is recorded into the action when the FIX plan is saved, so a
+    # later change never widens an authorization already persisted.
+    acceptance_actions: str = ACCEPTANCE_ACTIONS_APPROVE
 
     def protects(self, path: str) -> bool:
         """Whether ``path`` (a POSIX repo-relative path) is protected."""
@@ -1112,6 +1134,18 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
         base.safety.verify_check_definition = _as_bool(
             safety["verify_check_definition"], source, "safety.verify_check_definition"
         )
+    if "acceptance_actions" in safety:
+        policy = safety["acceptance_actions"]
+        # YAML 1.1 (and this parser, for parity) reads a bare `off` as false.
+        # That is the one boolean the key accepts: `true` names no policy.
+        if policy is False:
+            policy = ACCEPTANCE_ACTIONS_OFF
+        if not isinstance(policy, str) or policy not in ACCEPTANCE_ACTION_POLICIES:
+            raise ConfigurationError(
+                f"{source}: 'safety.acceptance_actions' must be one of "
+                f"{ACCEPTANCE_ACTION_POLICIES}, got {policy!r}"
+            )
+        base.safety.acceptance_actions = policy
     gh = _section(data, "github", source, GITHUB_KEYS)
     if "command" in gh:
         base.github.command = str(gh["command"])

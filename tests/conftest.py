@@ -1416,6 +1416,28 @@ def no_change(finding_id: str, rationale: str = NO_CHANGE_RATIONALE) -> dict:
     }
 
 
+ACCEPTANCE_TEXT = (
+    "Ran `autoforge doctor` against the reviewed HEAD on a clean host; every check passed, "
+    "which is the evidence the finding asks for."
+)
+ACCEPTANCE_RATIONALE = (
+    "The finding asks for evidence on the issue that the operator check passed, not for a "
+    "code change."
+)
+
+
+def acceptance(
+    finding_id: str, text: str = ACCEPTANCE_TEXT, rationale: str = ACCEPTANCE_RATIONALE
+) -> dict:
+    """An acceptance action (#211): the controller comments ``text`` on the run's issue."""
+    return {
+        "finding_id": finding_id,
+        "resolution": "acceptance_action",
+        "rationale": rationale,
+        "acceptance_action": {"kind": "issue_comment", "body": text},
+    }
+
+
 def analyze_payload(head_sha: str, **overrides) -> dict:
     """An ANALYZE_EXECUTE success result reporting ``head_sha`` (#161 schema)."""
     return {

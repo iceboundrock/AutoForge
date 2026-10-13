@@ -508,7 +508,8 @@ The effect layer sits between the engine and the GitHub client (ADR 0004):
 - `effects.py` owns the persisted records, completion contexts and entry
   observations, their validation on load and their bounds, and the pure
   reconciliation decisions. No I/O.
-- `effect_ops.py` owns one operation per Wave 1 effect kind (the identity
+- `effect_ops.py` owns one operation per effect kind, the Wave 1 set and
+  #211's acceptance comment (the identity
   read, the precondition, the single write, the completion read-back) and
   `drive`, the reconcile-before-re-issue lifecycle. Each operation uses the
   typed client methods or the git transport; nothing else.
