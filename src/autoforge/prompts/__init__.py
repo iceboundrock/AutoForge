@@ -34,6 +34,9 @@ TEMPLATE_FILES = (
     # input a later controller step rejected (ADR 0004 D4.7, D13.7).
     "update_epic_rerequest.md",
     "correction.md",
+    # What a write phase's worktree holds uncommitted (#187), rendered into
+    # the phase template's {{WORKTREE_STATE}} only when there is something.
+    "worktree_state.md",
     # LOCAL mode: separate templates rather than the GitHub ones fed fake
     # Issue/PR values. Nothing here may mention gh, PRs or merging.
     "local_common.md",

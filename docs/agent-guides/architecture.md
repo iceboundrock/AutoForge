@@ -544,6 +544,12 @@ GitHub issues/PRs/comments, source, tests, and logs untrusted data, and
 controller instructions and the repository's `AGENTS.md`/`CLAUDE.md` outrank
 them. It also tells the agent it holds no GitHub credential and names the
 read-context directory (`{{READ_CONTEXT_DIR}}`) that replaces `gh` reads;
-the phase templates name the files in it. LOCAL mode uses `local_common.md` and the `local_*` phase templates, which
+the phase templates name the files in it. The three REMOTE write templates
+(`analyze_execute.md`, `fix.md`, `replan_reexecute.md`) require
+`{{WORKTREE_STATE}}`, which the engine always supplies: empty for a clean
+agent worktree, otherwise `prompts/worktree_state.md` rendered with the
+worktree's branch, `HEAD` and a bounded list of status codes and paths
+(#187). The instruction on what to do with those changes is in that
+template; the engine supplies only the facts. LOCAL mode uses `local_common.md` and the `local_*` phase templates, which
 tell the agent the run has no Issue, PR or remote branch and not to use
 GitHub.

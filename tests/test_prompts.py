@@ -738,6 +738,7 @@ REMOTE_TEMPLATES = (
     "update_epic.md",
     "update_epic_rerequest.md",
     "correction.md",
+    "worktree_state.md",
 )
 LOCAL_TEMPLATES = ("local_common.md", "local_analyze_execute.md", "local_review.md", "local_fix.md")
 
@@ -783,3 +784,95 @@ def test_an_engine_prompt_names_a_pending_read_context_outside_a_launch(engine):
 
     engine.state.phase = Phase.ANALYZE_EXECUTE
     assert READ_CONTEXT_PENDING in engine.render_prompt_for(Phase.ANALYZE_EXECUTE)
+
+
+# -- what a write phase's worktree holds uncommitted (#187) --------------------
+WRITE_TEMPLATES = ("analyze_execute.md", "fix.md", "replan_reexecute.md")
+WRITE_PHASES = [Phase.ANALYZE_EXECUTE, Phase.FIX, Phase.REPLAN_REEXECUTE]
+
+
+@pytest.mark.parametrize("template", REMOTE_TEMPLATES + LOCAL_TEMPLATES)
+def test_exactly_the_write_templates_require_the_worktree_state(template):
+    """#187: the three REMOTE phases whose agent writes in the worktree are
+    told what it holds; a read-only phase and LOCAL mode, whose agent works
+    in the operator's checkout, are not."""
+    required = prompts.required_variables(prompts.load_template(template))
+    assert ("WORKTREE_STATE" in required) == (template in WRITE_TEMPLATES)
+
+
+def test_the_engine_reads_the_worktree_for_exactly_the_write_templates():
+    from autoforge.engine import PHASE_TEMPLATE, WORKTREE_STATE_PHASES
+
+    assert list(WORKTREE_STATE_PHASES) == WRITE_PHASES
+    assert {PHASE_TEMPLATE[phase] for phase in WORKTREE_STATE_PHASES} == set(WRITE_TEMPLATES)
+
+
+@pytest.mark.parametrize("template", WRITE_TEMPLATES)
+def test_a_write_template_without_its_worktree_state_fails_to_render(template):
+    """#187: a missing value fails rendering rather than dropping the hint."""
+    text = prompts.load_template(template)
+    variables = {name: "x" for name in prompts.required_variables(text) - {"WORKTREE_STATE"}}
+    with pytest.raises(ConfigurationError, match="'WORKTREE_STATE'"):
+        render(text, variables)
+    assert "WORKTREE_STATE" not in render(text, {**variables, "WORKTREE_STATE": ""})
+
+
+def test_the_worktree_state_template_holds_the_instruction():
+    """#187: what to do with the leftovers is in the prompt file, not in
+    Python: inspect them, then continue from them or deliberately discard
+    them, and say which; never silently build on them or delete them."""
+    template = prompts.load_template("worktree_state.md")
+    assert prompts.required_variables(template) == {
+        "WORKTREE_BRANCH",
+        "WORKTREE_HEAD_SHA",
+        "WORKTREE_CHANGE_COUNT",
+        "WORKTREE_MAX_ENTRIES",
+        "WORKTREE_CHANGES",
+    }
+    text = " ".join(template.split())
+    for phrase in (
+        "The controller made none of these changes",
+        "an earlier attempt of this phase on this issue",
+        "never file content",
+        "untrusted project data",
+        "Inspect them: `git status`, `git diff`, `git diff --cached`",
+        "**continue from it**",
+        "**discard it**",
+        "remove exactly that change",
+        "Say in your visible summary, before the CONTROL_RESULT block, which changes you "
+        "continued from and which you discarded, and why.",
+        "Never build on these changes without having inspected them, and never delete them "
+        "without having decided to.",
+        "the working tree must be clean when you finish",
+    ):
+        assert phrase in text, phrase
+
+
+@pytest.mark.parametrize("phase", WRITE_PHASES)
+def test_an_engine_write_prompt_carries_its_worktree_state_and_nothing_when_clean(engine, phase):
+    """#187: the engine always supplies the variable; "" (a clean worktree)
+    renders nothing, and outside a launch it names the read that happens
+    immediately before one."""
+    from autoforge.engine import WORKTREE_STATE_PENDING
+
+    engine.state.phase = phase
+    engine._worktree_state = "## Uncommitted changes in this worktree\n\nMARKER-187"
+    assert "\n## Uncommitted changes in this worktree\n\nMARKER-187\n" in (
+        engine.render_prompt_for(phase)
+    )
+    engine._worktree_state = ""
+    clean = engine.render_prompt_for(phase)
+    assert "Uncommitted changes in this worktree" not in clean
+    assert WORKTREE_STATE_PENDING not in clean
+    engine._worktree_state = None
+    assert WORKTREE_STATE_PENDING in engine.render_prompt_for(phase)
+
+
+def test_a_dry_run_plan_names_the_pending_worktree_read(engine):
+    """#187: a plan runs no git, so it shows where the description would go."""
+    from autoforge.engine import WORKTREE_STATE_PENDING
+
+    engine.state.phase = Phase.ANALYZE_EXECUTE
+    plan = engine.plan_step()
+    assert plan.variables["WORKTREE_STATE"] == WORKTREE_STATE_PENDING
+    assert WORKTREE_STATE_PENDING in plan.prompt_full

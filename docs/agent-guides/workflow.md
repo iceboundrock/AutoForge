@@ -322,6 +322,23 @@ not relaunched. Exhausting the budget fails the step like any other failed
 exit, with the phase unchanged for `resume`. LOCAL runs never relaunch a
 transient failure.
 
+The reconciliation covers GitHub, not the agent worktree, which every launch
+of the issue reuses as the last one left it (#187). So before each launch of
+a REMOTE write phase (`ANALYZE_EXECUTE`, `FIX`, `REPLAN_REEXECUTE`), a
+relaunch included, the controller reads the worktree's `git status`
+(`LocalWorkspace.status_entries`, the read #189's failure text counts) and,
+when it lists anything, renders the branch, `HEAD` and a bounded list of
+status codes and paths, never file content, into the prompt
+(`{{WORKTREE_STATE}}`, from `prompts/worktree_state.md`, which also holds
+the instruction to inspect the changes and then continue from them or
+discard them deliberately). It does so whenever the worktree is dirty, not
+only on a re-entry: changes before a first attempt were left by an earlier
+phase or a person, which the agent needs to know just as much. The hint is
+information only: it changes no state, a clean worktree renders nothing, a
+status read that fails renders nothing and the run log's `request.json`
+says why (`metadata.worktree_state`), and the verification after the phase
+is unchanged. A plan or a dry run runs no git and shows a placeholder.
+
 Every probe below and the read-back after the agent consume one identity
 model, `src/autoforge/claims.py`: one exact-schema decoder per marker kind,
 one renderer, one scan that classifies *every* marker it meets, and

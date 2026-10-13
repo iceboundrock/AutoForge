@@ -79,6 +79,8 @@ issue. An issue carrying two markers is the follow-up of both findings. Do
 not ask for a second issue for a problem one of these issues already
 tracks.
 
+{{WORKTREE_STATE}}
+
 ## Steps
 
 1. Read the repository's `AGENTS.md` / `CLAUDE.md` if present.

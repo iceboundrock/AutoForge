@@ -1754,6 +1754,29 @@ def test_prompt_carries_the_transaction_id_the_derived_branch_and_the_base(tmp_s
     assert f"<!-- {MARKER_NAME}" not in prompt and "<!-- ai-implementation" not in prompt
 
 
+def test_prompt_describes_what_the_worktree_holds_uncommitted(tmp_state_dir):
+    """#187: REPLAN_REEXECUTE writes in the issue's worktree too, so what an
+    earlier launch left there uncommitted (here a fix that was never
+    committed) is described under "inspect current truth", paths only, and
+    the replacement is published as before."""
+    gh = FakeGitHub()
+    seen = {}
+    eng = _park_at_hard_threshold(
+        tmp_state_dir, gh, _replan_agent(gh, during=lambda req: seen.update(prompt=req.prompt))
+    )
+    eng.step()
+    (eng.agent_worktree_path() / "half_fix.py").write_text("an uncommitted fix\n", "utf-8")
+    eng.step()
+    assert eng.state.superseded_prs, "the replacement was not published"
+    prompt = seen["prompt"]
+    start = prompt.index("## Uncommitted changes in this worktree")
+    assert prompt.index("# 6. First: inspect current truth") < start
+    hint = prompt[start : prompt.index("# 7. Build a Failure Ledger")]
+    assert "- Uncommitted changes: 1\n" in hint
+    assert "```untrusted\n?? half_fix.py\n```\n" in hint
+    assert "an uncommitted fix" not in prompt
+
+
 # =============================================================================
 # I3 source checkpoint integrity
 # =============================================================================

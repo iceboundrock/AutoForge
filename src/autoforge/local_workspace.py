@@ -325,6 +325,21 @@ def _refuse(path: str, what: str, remedy: str) -> VerificationError:
     )
 
 
+@dataclass(frozen=True)
+class StatusEntry:
+    """One record of ``git status --porcelain=v1 -z``.
+
+    ``code`` is git's two-letter status (``" M"``, ``"A "``, ``"??"``, ...),
+    ``path`` the path the record names and ``orig_path`` the path a rename or
+    copy came from (``""`` for every other record). Paths are as git prints
+    them, relative to the working tree's root, and are not verified to exist.
+    """
+
+    code: str
+    path: str
+    orig_path: str = ""
+
+
 class LocalWorkspace:
     """Read-only view of the git working tree a LOCAL run operates on."""
 
@@ -533,10 +548,25 @@ class LocalWorkspace:
         operator's mental model of their uncommitted work — and it is exactly
         wrong for identity, which is why the two are separate methods.
         """
+        paths: list[str] = []
+        for entry in self.status_entries():
+            if entry.orig_path:
+                paths.append(entry.orig_path)
+            paths.append(entry.path)
+        return sorted(dict.fromkeys(paths))
+
+    def status_entries(self) -> list[StatusEntry]:
+        """The records behind :meth:`dirty_paths`, in git's order, with their codes.
+
+        The same single ``git status`` read, kept as git reports it rather
+        than reduced to a set of paths, for a caller that has to say *how*
+        each path is uncommitted (#187). It is the operator's notion of
+        uncommitted work, never an identity.
+        """
         res = self._git(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
         out = res.stdout or ""
         fields = out.split("\0")
-        paths: list[str] = []
+        entries: list[StatusEntry] = []
         index = 0
         while index < len(fields):
             record = fields[index]
@@ -545,17 +575,17 @@ class LocalWorkspace:
                 continue
             if len(record) < 4:
                 raise VerificationError(f"cannot parse `git status` record {record!r}")
-            code, path = record[:2], record[3:]
-            if code[0] == "R" or code[1] == "R":
-                # A rename is two NUL-separated fields: "<code> <new>\0<old>".
+            code, path, old = record[:2], record[3:], ""
+            if code[0] in "RC" or code[1] in "RC":
+                # A rename or a copy (`status.renames=copies`) is two
+                # NUL-separated fields: "<code> <new>\0<old>". Read as a
+                # record of its own, the source path would be cut into a
+                # made-up code and path.
                 if index < len(fields):
                     old = fields[index]
                     index += 1
-                    if old:
-                        paths.append(old)
-            if path:
-                paths.append(path)
-        return sorted(dict.fromkeys(paths))
+            entries.append(StatusEntry(code=code, path=path, orig_path=old))
+        return entries
 
     # -- state directory --------------------------------------------------
     def check_state_dir_location(self, state_dir: str | Path) -> None:
@@ -981,11 +1011,12 @@ def uncommitted_paths(
     a single ``git status --porcelain=v1 -z --untracked-files=all``, with no
     optional locks, so the index is not refreshed, and with hooks and the
     file-system monitor off. An agent failure that leaves the state
-    unchanged reports its count for the REMOTE agent worktree (#189). Like
-    the policy, it is the operator's notion of uncommitted work, never an
-    identity. A read that fails, times out or is truncated raises
-    VerificationError; a caller that cannot use the answer omits it rather
-    than guessing.
+    unchanged reports its count for the REMOTE agent worktree (#189), and a
+    write phase's prompt lists the same read's records, codes included
+    (:meth:`LocalWorkspace.status_entries`, #187). Like the policy, it is
+    the operator's notion of uncommitted work, never an identity. A read
+    that fails, times out or is truncated raises VerificationError; a
+    caller that cannot use the answer omits it rather than guessing.
     """
     return LocalWorkspace(workdir, runner=runner, timeout_seconds=timeout_seconds).dirty_paths()
 

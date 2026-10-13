@@ -70,8 +70,8 @@ redaction.py        secret redaction for anything that reaches logs
 runlog.py           per-invocation run logs, redacted
 errors.py           typed error taxonomy
 prompts/            file-based templates ({{VAR}}): common.md (trust boundary), phase
-                    templates, update_epic_rerequest.md, local_*.md, correction.md;
-                    renderer in prompts/__init__.py
+                    templates, update_epic_rerequest.md, local_*.md, correction.md,
+                    worktree_state.md (#187); renderer in prompts/__init__.py
 ```
 
 ## Rules for production code
