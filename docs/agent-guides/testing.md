@@ -486,7 +486,9 @@ a stated reason it has none. The coverage that must keep working:
   push; an approval publishes the comment, reads it back and pushes,
   without the fixer, and the next reviewer gets its URL; `auto` completes
   in one step; `off` is a correction; a closed issue, or one outside the
-  repository, holds the comment; the exact payload an operator posts is
+  repository, holds the comment, and the exact payload already there, a
+  landed `attempted` one included, until it qualifies again, with no
+  later write of the plan sent; the exact payload an operator posts is
   adopted; a decline drops the unsent plan, relaunches the fixer with the
   decline in its prompt and refuses the same comment again; a push while
   it waits refuses an approval as stale and records the action `stale`;

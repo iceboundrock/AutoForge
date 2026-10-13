@@ -243,11 +243,12 @@ bytes is a conflict: delete it, or edit it back to the payload). Approving or
 declining is refused, with nothing written, after a push to the PR or a
 change of its base; a plain `unblock` then re-enters `FIX`, which sends
 nothing, records the action `stale` and goes back to `REVIEW`. A closed issue
-holds the comment until it is reopened. With `auto` the controller publishes
-the comment during the `FIX` step without stopping; with `off` the fixer is
-told the resolution is unavailable and a result using it is refused. The
-comment counts only after the controller read it back from GitHub, and the
-next review still judges whether it resolves the finding.
+holds the comment until it is reopened, and so does the exact payload already
+posted on it: nothing else of the fix is published until then. With `auto` the
+controller publishes the comment during the `FIX` step without stopping; with
+`off` the fixer is told the resolution is unavailable and a result using it is
+refused. The comment counts only after the controller read it back from
+GitHub, and the next review still judges whether it resolves the finding.
 
 ### DONE and FAILED
 

@@ -1034,7 +1034,9 @@ controller's. Its write also needs an authorization (D5.6).
   is open and in the repository of the run's PR; and the record's
   authorization holds (D5.6). A precondition that fails with nothing found
   *holds* the write: nothing is sent, the record is unchanged, and `FIX`
-  blocks with a controller-rendered reason.
+  blocks with a controller-rendered reason. The issue's eligibility is
+  read with every reconciliation of a pending record, so it also holds the
+  adoption below (PR #221 R1-F2).
 - **Payload:** the controller's header line (naming the PR, the round and
   the finding, and saying the text below is the FIX agent's), a blank line,
   the agent's validated text, a blank line and the marker. Rendered once and
@@ -1043,7 +1045,11 @@ controller's. Its write also needs an authorization (D5.6).
 - **Completion read-back:** the complete comment listing of the issue holds
   exactly one comment carrying the marker, and its body equals the payload
   byte for byte. Whoever posted it is irrelevant (D9.3): an operator who
-  posts the exact payload has done the write, and it is adopted.
+  posts the exact payload has done the write, and it is adopted. It is
+  adopted only while the issue is open and in the run's repository: the
+  exact payload on an issue that was closed or left it is held like a due
+  write, unchanged and naming the comment, so nothing later in the plan is
+  sent; once the issue qualifies again, `unblock` and `resume` adopt it.
 - **Plan order:** K9 is first in the `FIX` plan, before K5, K6 and the K1
   push. Nothing of the plan is sent while K9 waits, so a decline (D5.7)
   voids a plan that sent nothing, and the push stays the commit point. At
@@ -2372,7 +2378,8 @@ In addition:
     the marker and the payload;
   - the exact payload posted by anyone is adopted; an edited body or two
     comments are a conflict; a closed issue or one outside the run's
-    repository holds the write;
+    repository holds the write, and the adoption of an exact payload
+    already there, in every pending stage;
   - the plan holds at most one K9, first, named by exactly one resolution;
   - approve, decline and plain unblock: each precondition, each refusal
     leaving the state byte-identical, dry runs writing nothing; drift makes

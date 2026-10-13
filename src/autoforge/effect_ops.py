@@ -24,8 +24,9 @@ Every kind of the closed set (ADR 0004 D5.1) has one operation here:
 :class:`FollowUpAppendOp` (K6), :class:`ReplacementPrOp` (K7),
 :class:`ProgressCommentOp` (K8) and :class:`AcceptanceCommentOp` (K9). A K9
 write may also be *held* (``Action.HOLD``, #211): nothing is sent until the
-operator approves it, and :func:`drive` returns the record unchanged with
-the reason. Each ``reconcile`` is a complete identity
+operator approves it, nothing is sent or adopted while the run's issue does
+not qualify, and :func:`drive` returns the record unchanged with the
+reason. Each ``reconcile`` is a complete identity
 read (D4.5): an open listing read to its end, or an all-states read bounded
 by a head-branch filter or a number watermark, never the search API. Each
 ``issue`` is exactly one write. What an operation checks is the record's own
@@ -100,6 +101,7 @@ class Driven:
     record: EffectRecord
     issued: bool  # a write was sent in this call
     held: str = ""  # K9: why the due write was not sent (the record is unchanged)
+    held_url: str = ""  # K9: the exact comment a hold did not adopt, "" when none
 
 
 def drive(record: EffectRecord, op: EffectOperation, persist: Persist) -> Driven:
@@ -118,7 +120,8 @@ def drive(record: EffectRecord, op: EffectOperation, persist: Persist) -> Driven
     if decision.action is Action.DONE:
         return Driven(record, issued=False)
     if decision.action is Action.HOLD:
-        return Driven(record, issued=False, held=decision.reason)
+        url = str((decision.observed or {}).get("url", ""))
+        return Driven(record, issued=False, held=decision.reason, held_url=url)
     if decision.action is Action.OBSERVE:
         record = record.observing(decision.observed or {})
         persist(record)
@@ -828,7 +831,9 @@ class AcceptanceCommentOp:
     marker. Completion: exactly one comment carries the marker, and its
     body equals the payload (D4.5: the complete comment listing of the
     issue, never the search API). Whoever posted it is irrelevant: an
-    operator who posts the exact payload has done the write.
+    operator who posts the exact payload has done the write. It is adopted
+    only while the issue still qualifies (PR #221 R1-F2): on an issue that
+    was closed or left the run's repository it is held, as the write is.
     """
 
     def __init__(self, github: GitHubClient) -> None:
@@ -861,9 +866,7 @@ class AcceptanceCommentOp:
             )
             for h in claimants.holders
         ]
-        problem = ""
-        if not found:
-            problem = self._issue_problem(issue_url, record.owner.pr_url)
+        problem = self._issue_problem(issue_url, record.owner.pr_url)
         return decide_acceptance(record, found, issue_problem=problem)
 
     def _issue_problem(self, issue_url: str, pr_url: str) -> str:

@@ -578,11 +578,12 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
     launches the fixer with the decline in its prompt (the worktree and its
     commits are kept). Refused once the marker is on the issue.
   - **no flag** -> `FIX` only when the exact payload is on the issue (posted
-    by the operator; `FIX` adopts it). With nothing there the reason is not
-    evidence and the unblock refuses; a marked comment with other bytes
-    refuses, naming it. When the PR moved, the plain unblock re-enters `FIX`,
-    whose plan completion routes the drift to `REVIEW`, sends nothing and
-    records the action `stale`.
+    by the operator; `FIX` adopts it) and the issue is open in the PR's
+    repository; while it is not, the unblock refuses, naming the comment.
+    With nothing there the reason is not evidence and the unblock refuses;
+    a marked comment with other bytes refuses, naming it. When the PR
+    moved, the plain unblock re-enters `FIX`, whose plan completion routes
+    the drift to `REVIEW`, sends nothing and records the action `stale`.
 
   A flag on a run with no waiting action refuses, quoting the decision a
   plain unblock would make. After an approval the record is authorized, so

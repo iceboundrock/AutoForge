@@ -522,10 +522,11 @@ Then, in order, all from one persisted plan:
    first: it is posted only once authorized and while the run's issue is
    open in the PR's repository, and read back from the issue's complete
    comment listing as exactly one comment with its marker and its exact
-   bytes (whoever posted it). Until then it is held: nothing at all is
-   sent and the step blocks with a reason the controller renders (the
-   action id, the finding, the payload's size and SHA-256, the push held
-   back and the worktree holding it, and the ways forward; see
+   bytes (whoever posted it), adopted only while the issue is still open
+   in the PR's repository (PR #221 R1-F2). Until then it is held: nothing
+   at all is sent and the step blocks with a reason the controller renders
+   (the action id, the finding, the payload's size and SHA-256, the push
+   held back and the worktree holding it, and the ways forward; see
    [Workflow: leaving BLOCKED](workflow.md#leaving-blocked-the-operators-unblock)).
    A marked comment with other bytes, or two, is a conflict. Then the push, the commit point, is
    issued only after every follow-up is on GitHub, and, after any

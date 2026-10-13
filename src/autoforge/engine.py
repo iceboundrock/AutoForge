@@ -5012,8 +5012,10 @@ class ControllerEngine:
         the K9 identity on the issue:
 
         - a plain unblock re-enters FIX only when the exact payload is on
-          the issue (the re-entry adopts it); with nothing there, or a
-          comment that is not the payload, it is refused;
+          the issue and the issue still qualifies (the re-entry adopts it);
+          with nothing there, a comment that is not the payload, or the
+          payload on an issue closed or outside the run's repository, it is
+          refused;
         - an approval of the waiting action's exact id re-enters FIX with
           the id recorded on the record, unless the PR moved, the setting is
           ``off``, the issue no longer qualifies or a comment conflicts;
@@ -5080,13 +5082,12 @@ class ControllerEngine:
                 approve=approved,
             )
         found = op.reconcile(waiting)
+        # The exact payload on the issue: adopted (OBSERVE), or held because
+        # the issue no longer qualifies (HOLD, PR #221 R1-F2).
+        posted = (found.observed or {}).get("url", "")
         if request is not None:
-            if found.action is not Action.HOLD:
-                what = (
-                    f"its exact payload is already on {(found.observed or {}).get('url')}"
-                    if found.action is Action.OBSERVE
-                    else found.reason
-                )
+            if found.action is not Action.HOLD or posted:
+                what = f"its exact payload is already on {posted}" if posted else found.reason
                 return UnblockDecision(
                     None,
                     f"action {action} cannot be declined: {what}. A decline is for an action "
@@ -5118,6 +5119,14 @@ class ControllerEngine:
                 f"action {action} awaits approval, and {found.reason}. Delete that comment, or "
                 "edit it back to exactly the payload ('autoforge status --action "
                 f"{action}'), then unblock again",
+                pr=pr,
+            )
+        if posted:
+            repository = self._require_state().repository
+            return UnblockDecision(
+                None,
+                f"action {action} awaits approval, and {found.reason}. Once {issue} is open in "
+                f"{repository} again, unblock again: FIX adopts the comment",
                 pr=pr,
             )
         return UnblockDecision(
@@ -6574,13 +6583,15 @@ class ControllerEngine:
                     notes.append(
                         f"acceptance action {record.action_id} is authorized ({by}): would "
                         "publish it first, before any other write of the plan, unless the "
-                        "issue already holds its exact payload"
+                        "issue already holds its exact payload, and block before anything "
+                        "is sent or adopted while the issue is closed or outside the run's "
+                        "repository"
                     )
                 else:
                     notes.append(
                         f"acceptance action {record.action_id} awaits the operator's approval: "
-                        "would adopt its exact payload if the issue holds it, and otherwise "
-                        "block before anything is sent"
+                        "would adopt its exact payload if the issue holds it and is open in "
+                        "the run's repository, and otherwise block before anything is sent"
                     )
         if isinstance(effects.context, FixContext):
             notes.append(
@@ -10727,6 +10738,20 @@ class ControllerEngine:
         plain = f"{self.cli_command('unblock', '--reason')} {why!r}"
         decline = f"{self.cli_command('unblock', '--decline-action', action, '--reason')} {why!r}"
         resume = self.resume_command()
+        if driven.held_url:
+            # The exact payload is there, on an issue that no longer
+            # qualifies: it is adopted once the issue does again, and
+            # nothing else of the plan goes out before (PR #221 R1-F2).
+            return (
+                f"FIX of review round {state.review_round} cannot adopt acceptance action "
+                f"{action}: {driven.held}. The fixer resolved finding {fid} ({title!r}) by "
+                f"asking the controller to publish an acceptance comment on issue {issue} for "
+                f"PR {state.current_pr_url}; the controller adopts that comment only while the "
+                f"issue is open in {state.repository}, so nothing more of the FIX plan was "
+                f"sent. Meanwhile {held_back}. Next: once {issue} is open in "
+                f"{state.repository} again, run {plain} and {resume}: FIX adopts the comment "
+                "and completes the plan"
+            )
         if self.config.safety.acceptance_actions == ACCEPTANCE_ACTIONS_OFF:
             approval = (
                 "safety.acceptance_actions is now off, so it cannot be approved: post the "

@@ -2387,7 +2387,9 @@ class Action(StrEnum):
 @dataclass(frozen=True)
 class Decision:
     action: Action
-    observed: dict | None = None  # OBSERVE: the observed result
+    # OBSERVE: the observed result; HOLD (K9): the exact comment found but not
+    # adopted, because the run's issue no longer qualifies (PR #221 R1-F2).
+    observed: dict | None = None
     reason: str = ""  # CONFLICT, HOLD: names the objects and the rule, never a payload
     rebase_body: str = ""  # REBASE: the body read now, the new base
     # CONFLICT only because the bound is spent and the write is still absent:
@@ -2469,12 +2471,24 @@ def decide_acceptance(
 
     The exact payload already on the issue is adopted whoever posted it
     (an operator may post it instead of approving), and every conflict is
-    decide_create's. Only when the write is due is it held: while no
-    approval of this record's action id is recorded, and then while the
-    run's issue no longer qualifies (``issue_problem``: closed, or not in
-    the run's repository). A hold sends nothing and changes nothing.
+    decide_create's. ``issue_problem`` (the run's issue is closed, or not in
+    the run's repository) holds an adoption as it holds a write (PR #221
+    R1-F2): the exact payload on such an issue is not adopted, its URL is
+    the hold's ``observed``, and the plan's later writes wait with it. A
+    due write is also held while no approval of this record's action id is
+    recorded. A hold sends nothing and changes nothing.
     """
     decision = decide_create(record, found)
+    if decision.action is Action.OBSERVE and issue_problem:
+        url = (decision.observed or {}).get("url", "")
+        return Decision(
+            Action.HOLD,
+            observed=decision.observed,
+            reason=(
+                f"{record.describe()}: its exact payload is on {url}, but {issue_problem}; it "
+                "is not adopted while the issue does not qualify, and nothing more was sent"
+            ),
+        )
     if decision.action is not Action.ISSUE:
         return decision
     if not record.authorized:

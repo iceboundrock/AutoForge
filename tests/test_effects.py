@@ -2994,15 +2994,44 @@ def test_an_authorized_acceptance_comment_is_held_while_the_issue_does_not_quali
 @pytest.mark.parametrize("authorization", ["operator", "policy"])
 def test_an_acceptance_comment_already_on_the_issue_is_adopted_whoever_posted_it(authorization):
     """The exact payload on the issue is the write, approved or not: an
-    operator may post it instead of approving, and a closed issue does not
-    undo a comment that is there."""
+    operator may post it instead of approving."""
     fake = FakeGitHub()
-    fake.add_issue(ISSUE, "Ship the feature", state="CLOSED")
+    fake.add_issue(ISSUE, "Ship the feature")
     record = acceptance_record(authorization=authorization)
     url = fake.add_comment(ISSUE, 300, record.body).url
     driven = drive(record, AcceptanceCommentOp(fake), saves_for(fake))
     assert driven.record.stage is Stage.OBSERVED and driven.record.observed == {"url": url}
-    assert fake.effect_writes == []
+    assert not driven.held and fake.effect_writes == []
+
+
+@pytest.mark.parametrize("state", ["CLOSED", "ELSEWHERE"])
+@pytest.mark.parametrize("stage", ["awaiting", "by policy", "attempted"])
+def test_an_exact_acceptance_comment_is_not_adopted_while_the_issue_does_not_qualify(state, stage):
+    """PR #221 R1-F2: the issue's eligibility holds an adoption as it holds
+    a write. The exact payload on a closed issue, or on one no longer in the
+    run's repository, is not adopted, whoever posted it and whatever the
+    record's stage: the record is held unchanged, nothing is saved or sent,
+    and the hold names the comment, so the plan's later writes wait too."""
+    fake = FakeGitHub()
+    info = fake.add_issue(
+        ISSUE, "Ship the feature", state="CLOSED" if state == "CLOSED" else "OPEN"
+    )
+    if state == "ELSEWHERE":
+        fake.issues[ISSUE] = replace(info, repository="other/repo")
+    if stage == "awaiting":
+        record = acceptance_record(authorization="operator")
+    elif stage == "by policy":
+        record = acceptance_record()
+    else:
+        record = acceptance_record().attempting()
+    url = fake.add_comment(ISSUE, 300, record.body).url
+    saves = saves_for(fake)
+    driven = drive(record, AcceptanceCommentOp(fake), saves)
+    assert driven.record == record and not driven.issued
+    assert saves.log == [] and fake.effect_writes == []
+    assert driven.held_url == url and f"its exact payload is on {url}" in driven.held
+    assert ("is closed, not open" if state == "CLOSED" else "not in the run's") in driven.held
+    assert "is not adopted while the issue does not qualify" in driven.held
 
 
 def test_decide_acceptance_holds_only_a_due_write():
@@ -3019,8 +3048,17 @@ def test_decide_acceptance_holds_only_a_due_write():
     assert decide_acceptance(authorized, []).action is Action.ISSUE
     held = decide_acceptance(authorized, [], issue_problem="issue x is closed, not open")
     assert held.action is Action.HOLD and "issue x is closed" in held.reason
+    assert held.observed is None
     spent = authorized.attempting().attempting()
     assert decide_acceptance(spent, []).exhausted
+    # PR #221 R1-F2: an exact holder is adopted only while the issue qualifies;
+    # otherwise the hold carries it. A conflict stays a conflict.
+    for record in (waiting, authorized, spent):
+        kept = decide_acceptance(record, [exact], issue_problem="issue x is closed, not open")
+        assert kept.action is Action.HOLD and kept.observed == {"url": "u"}
+        assert "its exact payload is on u, but issue x is closed" in kept.reason
+    closed = decide_acceptance(waiting, [edited], issue_problem="issue x is closed, not open")
+    assert closed.action is Action.CONFLICT
 
 
 def _acceptance_context(source: int | None = 0, fid: str = "R1-F1") -> dict:

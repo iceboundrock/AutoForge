@@ -12569,6 +12569,101 @@ def test_fix_acceptance_action_payload_the_operator_posted_is_adopted(tmp_state_
     assert s.acceptance_outcomes[0]["comment_url"] == posted.url
 
 
+def _disqualify(gh: FakeGitHub, how: str) -> str:
+    """Close the run's issue, or move it out of the PR's repository; the block's words."""
+    if how == "CLOSED":
+        gh.issues[ISSUE] = replace(gh.issues[ISSUE], state="CLOSED")
+        return f"issue {ISSUE} is closed, not open"
+    gh.issues[ISSUE] = replace(gh.issues[ISSUE], repository="other/repo")
+    return "is not in the run's repository owner/repo"
+
+
+@pytest.mark.parametrize("policy", ["approve", "auto"])
+@pytest.mark.parametrize("how", ["CLOSED", "OPEN-ELSEWHERE"])
+def test_fix_acceptance_payload_on_an_issue_that_no_longer_qualifies_is_not_adopted(
+    tmp_state_dir, policy, how
+):
+    """PR #221 R1-F2: the exact prepared payload is already on the run's
+    issue, but the issue is closed or no longer in the PR's repository. The
+    comment is not adopted, so the plan stays blocked: no follow-up issue
+    is created and nothing is pushed. Once the issue qualifies again a
+    plain unblock lets FIX adopt the comment, send no comment of its own,
+    and complete the rest of the plan."""
+    gh = FakeGitHub()
+    gh.add_issue(ISSUE, "Ship the feature")
+    posted = gh.add_comment(ISSUE, 500, _acceptance_body())
+    why = _disqualify(gh, how)
+    eng = _accepting(
+        tmp_state_dir,
+        gh,
+        fixer(acceptance("R1-F1"), new_follow_up("R1-F2")),
+        policy=policy,
+        findings=[_finding(1), _finding(1, 2)],
+    )
+    reviewed = eng.state.reviewed_head_sha
+    moves = _stages(eng)
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert moves == [] and gh.effect_writes == []
+    assert eng.origin.head(BRANCH) == reviewed == gh.prs[PR].head_sha
+    s = load_state(eng.paths.state_file)
+    assert [r["kind"] for r in s.effect_records] == [
+        "acceptance_comment",
+        "follow_up_issue",
+        "push",
+    ]
+    assert all(r["stage"] == "intended" for r in s.effect_records)
+    action = _k9(eng).action_id
+    reason = s.block_reason
+    assert f"cannot adopt acceptance action {action}" in reason
+    assert f"its exact payload is on {posted.url}" in reason and why in reason
+    assert "1 follow-up write(s) are held back as well" in reason
+    assert f"once {ISSUE} is open in owner/repo again" in reason
+    gh.issues[ISSUE] = replace(gh.issues[ISSUE], state="OPEN", repository="owner/repo")
+    done = eng.unblock(REASON_211)
+    assert done.unblocked and done.phase == "FIX", done.message
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert [w[0] for w in gh.effect_writes] == ["create_issue"]
+    assert gh.comments[ISSUE] == [posted]
+    assert eng.origin.head(BRANCH) != reviewed
+    s = load_state(eng.paths.state_file)
+    assert s.last_fix_resolutions[0]["acceptance_comment_url"] == posted.url
+
+
+def test_fix_acceptance_comment_that_landed_is_not_adopted_once_the_issue_closed(
+    tmp_state_dir,
+):
+    """PR #221 R1-F2, for a record already `attempted`: the controller's
+    own comment landed, the process died before its `observed` save, and
+    the issue was closed before the next process. That process does not
+    adopt the comment, sends nothing and pushes nothing; reopened, the
+    issue lets a plain unblock complete the plan with the one comment."""
+    gh = FakeGitHub()
+    eng = _accepting(tmp_state_dir, gh, fixer(acceptance("R1-F1")), policy="auto")
+    reviewed = eng.state.reviewed_head_sha
+    _power_loss_at(eng, EffectKind.ACCEPTANCE_COMMENT, Stage.OBSERVED, saved=False)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    [comment] = gh.comments[ISSUE]
+    gh.issues[ISSUE] = replace(gh.issues[ISSUE], state="CLOSED")
+    eng2 = _resumed(eng, tmp_state_dir, gh, "never")
+    out = eng2.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert eng2.provider.calls == []
+    assert [w[0] for w in gh.effect_writes] == ["create_issue_comment"]
+    assert eng2.origin.head(BRANCH) == reviewed
+    assert _k9(eng2).stage is Stage.ATTEMPTED
+    reason = load_state(eng2.paths.state_file).block_reason
+    assert f"its exact payload is on {comment.url}" in reason and "is closed, not open" in reason
+    gh.issues[ISSUE] = replace(gh.issues[ISSUE], state="OPEN")
+    assert eng2.unblock(REASON_211).unblocked
+    out = eng2.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert [w[0] for w in gh.effect_writes] == ["create_issue_comment"]
+    assert gh.comments[ISSUE] == [comment] and eng2.origin.head(BRANCH) != reviewed
+
+
 def test_fix_acceptance_action_declined_reruns_the_fixer_with_the_decline(tmp_state_dir):
     """A decline drops the unsent plan and FIX launches the fixer afresh
     with the decline (id, finding, the operator's reason) in its prompt;
@@ -12651,6 +12746,14 @@ def _refusal_case(eng, gh, case: str) -> dict:
     if case == "closed issue":
         gh.issues[ISSUE] = replace(gh.issues[ISSUE], state="CLOSED")
         return {"approve_action": action}
+    if case.startswith("posted payload, closed issue"):
+        gh.add_comment(ISSUE, 500, record.body)
+        gh.issues[ISSUE] = replace(gh.issues[ISSUE], state="CLOSED")
+        return {
+            "posted payload, closed issue, plain": {},
+            "posted payload, closed issue, approve": {"approve_action": action},
+            "posted payload, closed issue, decline": {"decline_action": action},
+        }[case]
     if case == "stale decline":
         publish_pr_head(eng, parent=eng.state.reviewed_head_sha, message="A human's push (#2)")
         return {"decline_action": action}
@@ -12667,6 +12770,9 @@ def _refusal_case(eng, gh, case: str) -> dict:
         ("edited comment, plain", "Delete that comment, or edit it back"),
         ("two comments", "cannot be approved"),
         ("closed issue", "is closed, not open"),
+        ("posted payload, closed issue, plain", f"Once {ISSUE} is open in owner/repo again"),
+        ("posted payload, closed issue, approve", "is not adopted while the issue does not"),
+        ("posted payload, closed issue, decline", "cannot be declined: its exact payload is"),
         ("stale decline", "refused as stale"),
     ],
 )
