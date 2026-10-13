@@ -1929,7 +1929,9 @@ def test_unblock_reenters_a_phase_and_resume_continues(tmp_path, capsys, monkeyp
     rc = cli.main(["--state-dir", sd, "unblock", "--reason", "spec clarified in issue #2"])
     out = capsys.readouterr().out
     assert rc == 0
-    assert "BLOCKED -> ANALYZE_EXECUTE" in out and "run 'autoforge resume' to continue" in out
+    assert "BLOCKED -> ANALYZE_EXECUTE" in out
+    # With the flags `unblock` was given, so it continues this run (#189).
+    assert f"continue with: {shlex.join(['autoforge', '--state-dir', sd, 'resume'])}\n" in out
     assert len(fakes["provider"].calls) == n_calls  # no agent ran
     state = load_state(tmp_path / ".autoforge" / "state.json")
     assert state.phase == Phase.ANALYZE_EXECUTE and state.block_reason == ""

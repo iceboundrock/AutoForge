@@ -10978,6 +10978,7 @@ def test_drift_left_by_a_launch_blocks_before_any_relaunch(tmp_state_dir, fake_g
     _commit(repo, "a.txt", "1", "base")
     eng = make_engine(tmp_state_dir, [], github=fake_github, origin=True)
     eng.config.execution.max_correction_attempts = 1
+    eng.cli_global_flags = ("--config", "autoforge.yaml", "--state-dir", "issue state")
     eng.step()
     provider = _MovesTheCheckoutFirst(repo, **first)
     _install(eng, provider)
@@ -11001,6 +11002,17 @@ def test_drift_left_by_a_launch_blocks_before_any_relaunch(tmp_state_dir, fake_g
     assert f"(its run log, {step}/, says why)" in reason
     assert "neither reconciled nor launched again" in reason
     assert reason.count("moved while") == 1  # reported once, not wrapped again
+    # Where to look, and the commands that leave BLOCKED and continue, with
+    # the flags the run was started with: a bare 'resume' refuses BLOCKED (#189).
+    flags = "autoforge --config autoforge.yaml --state-dir 'issue state'"
+    assert reason.endswith(
+        f"neither reconciled nor launched again.\n"
+        f"  checkout:  {Path(eng.workdir).resolve()}\n"
+        f"  unblock:   {flags} unblock --reason '<what you found>'\n"
+        f"  resume:    {flags} resume\n"
+        "Inspect the checkout and the agent's GitHub work first: 'unblock' re-inspects "
+        "GitHub and re-enters a phase, and only then does 'resume' continue the run."
+    )
     s = load_state(eng.paths.state_file)
     assert s.phase is Phase.BLOCKED and s.attempt == 1 and s.current_pr_url == ""
     assert fake_github.effect_writes == [] and eng.origin.head("autoforge/2") is None

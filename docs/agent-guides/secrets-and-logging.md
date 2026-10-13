@@ -123,7 +123,11 @@ repeats the `--config` / `--state-dir` the process was started with: paths,
 a count and those flags, never a configuration value. The engine redacts
 the assembled text where it composes it, and the CLI again where it prints
 it. `tests/test_engine.py` puts token-shaped values in the worktree path,
-a flag and a profile's model and checks that none reaches the text.
+a flag and a profile's model and checks that none reaches the text. A block
+reason for a checkout that moved
+(`ControllerEngine._moved_checkout_recovery`) adds the same kind of values
+only: the checkout path, the feature specification's path and commands
+with those flags. `_block` redacts it like every block reason.
 
 `redact_obj` / `redact_dict` redact mapping keys as well as values, and a
 mapping never loses an entry to that: two distinct keys that redact to the

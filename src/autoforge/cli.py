@@ -658,7 +658,9 @@ def cmd_unblock(args) -> int:
     print_unblock_outcome(outcome)
     if not outcome.unblocked:
         return 1
-    print("run 'autoforge resume' to continue")
+    # With the flags this command was given, as a block reason's 'resume'
+    # line does (#189): a bare 'resume' would find no run or other defaults.
+    print(redact(f"continue with: {engine.resume_command()}"))
     return 0
 
 

@@ -84,8 +84,13 @@ High-priority coverage includes:
 - a LOCAL launch that moved the git anchor (a commit in a write phase, a
   branch switch in `REVIEW`) and returned a malformed result is not
   corrected: the step blocks with the anchor reason, which names the run
-  log of the attempt that ended (#189), and the refused correction is not
-  charged to `local_pending_attempts` (#209)
+  log of the attempt that ended, the checkout and the `local run` command
+  that continues with the `--config` / `--state-dir` given, which the CLI
+  prints and which then starts the next run while `resume` and `unblock`
+  refuse (#189), and the refused correction is not charged to
+  `local_pending_attempts` (#209); a REMOTE checkout that moved blocks
+  with the checkout and the `unblock` and `resume` commands with those
+  flags, and `unblock` prints the `resume` command with them (#189)
 - timeout, including a same-group descendant that closed its stdio and
   ignores SIGTERM (escalated to SIGKILL, gone before `execute()` returns),
   a writer outside the group via `setsid` (the capture abandoned after the

@@ -40,7 +40,10 @@ a `gh` write, a `git push` or a network request made by the agent. What the
 controller *does* detect is a moved git anchor: HEAD and the checked-out branch
 are compared with the values the run was pinned to before and after every
 phase, and before every correction relaunch within one, so a commit, reset,
-checkout or branch switch blocks the run before another agent starts. It detects
+checkout or branch switch blocks the run before another agent starts. The
+block reason ends with the repository to inspect and the `local run` command
+that starts the next run of the same feature, with the `--config` /
+`--state-dir` this one was started with. It detects
 nothing else. Real containment is a sandbox, which LOCAL v1 does not provide
 ([ADR 0001](adr/0001-local-mode-workspace-identity-and-filesystem-boundary.md)
 §2.2 and §8.1; isolation is tracked in #10).

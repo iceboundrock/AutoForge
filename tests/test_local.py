@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 from dataclasses import replace
@@ -43,6 +44,7 @@ from autoforge.transitions import Phase, WorkflowMode, decide_next_phase
 
 from .conftest import (
     FEATURE_MD,
+    ExplodingGitHub,
     block,
     commit_all,
     git_repo,
@@ -2439,6 +2441,7 @@ def test_an_anchor_a_launch_moved_blocks_before_its_correction(tmp_path, phase):
     cfg = default_config()
     cfg.execution.max_correction_attempts = 5
     eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
+    eng.cli_global_flags = ("--state-dir", "state dir")
     _run_to(eng, root, phase)
 
     launches: list[int] = []
@@ -2460,10 +2463,80 @@ def test_an_anchor_a_launch_moved_blocks_before_its_correction(tmp_path, phase):
     latest = sorted(p for p in run_dir.iterdir() if p.is_dir())[-1]
     assert f"(its run log, {latest}/, says why)" in reason
     assert "no agent was launched again" in reason and "Nothing was rolled back" in reason
+    # So is the checkout, and the command that continues: a BLOCKED local
+    # run cannot be unblocked or resumed, so it is a new run of the same
+    # feature, with the flags this one was started with (#189).
+    checkout = eng.state.local_contract().repository_root
+    assert reason.endswith(
+        "start a new run.\n"
+        f"  checkout:  {checkout}\n"
+        "  new run:   autoforge --state-dir 'state dir' local run "
+        f"{Path(checkout) / 'features' / 'add-filter.md'}\n"
+        "Inspect the checkout first ('git log' and 'git status' there show what moved and "
+        "what was left); a BLOCKED local run is neither unblocked nor resumed ('unblock' "
+        "applies to GitHub runs only), so it continues as a new run of the same feature."
+    )
     persisted = load_state(eng.paths.state_file)
     assert persisted.phase is Phase.BLOCKED and persisted.attempt == 1
     assert persisted.local_pending_phase == phase.value
     assert persisted.local_pending_attempts == 1, "the refused relaunch is not charged"
+
+
+def test_the_new_run_an_anchor_refusal_prints_continues_with_the_flags_given(
+    tmp_path, monkeypatch, capsys
+):
+    """#189: the CLI prints the anchor refusal with the `--config` and
+    `--state-dir` the run was started with, and its `new run` line, run as
+    printed from the same directory, starts the next run of the same feature
+    there; the bare `resume` and the `unblock` it replaces both refuse."""
+    from autoforge.engine import ControllerEngine
+    from autoforge.providers import ProviderRegistry, ScriptedProvider
+
+    root = local_repo(tmp_path / "repo")
+    monkeypatch.chdir(root)
+    (tmp_path / "autoforge.json").write_text('{"version": 1}', encoding="utf-8")
+    state_dir = tmp_path / "state dir"
+    flags = ["--config", "../autoforge.json", "--state-dir", str(state_dir)]
+
+    def commits_then_malformed(req):
+        touch_impl(root, "v2\n")
+        commit_all(root, "the agent committed")
+        return "I committed my work but forgot the control block.\n"
+
+    provider = ScriptedProvider(commits_then_malformed)
+    real = ControllerEngine.__init__
+
+    def patched(self, *a, **k):
+        k.setdefault("github", ExplodingGitHub())
+        k.setdefault(
+            "providers", ProviderRegistry(overrides={"claude": provider, "opencode": provider})
+        )
+        real(self, *a, **k)
+
+    monkeypatch.setattr(ControllerEngine, "__init__", patched)
+    assert main([*flags, "local", "run", "features/add-filter.md"]) == 1
+    out = capsys.readouterr().out
+    blocked = load_state(state_dir / "state.json")
+    assert blocked.phase is Phase.BLOCKED and "found before a relaunch" in blocked.block_reason
+    checkout = blocked.local_contract().repository_root
+    assert f"\n  checkout:  {checkout}\n" in out
+    (command,) = {
+        line.removeprefix("  new run:   ")
+        for line in out.splitlines()
+        if line.startswith("  new run:   ")
+    }
+    spec = str(Path(checkout) / "features" / "add-filter.md")
+    assert command == shlex.join(["autoforge", *flags, "local", "run", spec])
+
+    assert main([*flags, "resume"]) == 1
+    assert main([*flags, "unblock", "--reason", "inspected"]) == 2
+    assert "applies to GitHub runs only" in capsys.readouterr().err
+    provider._handler = lambda req: pytest.fail("one step starts the run; no agent runs")
+    assert main([*shlex.split(command)[1:], "--max-steps", "1"]) == 0
+    fresh = load_state(state_dir / "state.json")
+    assert fresh.run_id != blocked.run_id and fresh.phase is Phase.ANALYZE_EXECUTE
+    assert fresh.feature_spec_path == blocked.feature_spec_path
+    assert fresh.base_head_sha != blocked.base_head_sha, "anchored where the agent left it"
 
 
 def test_a_reviewer_that_switches_branches_is_not_corrected(tmp_path):

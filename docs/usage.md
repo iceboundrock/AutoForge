@@ -489,7 +489,23 @@ ownership or discard uncommitted user changes.
     configuration the run started with, so check the plan of the dry run
     first.
 - **The run is `BLOCKED`:** read `autoforge status`, fix the cause, then
-  `autoforge unblock --reason "..."` and `autoforge resume` (see above).
+  `autoforge unblock --reason "..."` and `autoforge resume` (see above),
+  with the `--config` / `--state-dir` the run was started with; `unblock`
+  prints that `resume` command. A LOCAL run cannot be unblocked: start a new
+  `local run`. A run blocked because a checkout moved (the checkout the
+  controller is run from, or a LOCAL run's repository: an agent committed,
+  reset or switched branches) ends with where to look and what to run,
+  already carrying those flags:
+
+  ```text
+    checkout:  /home/me/code/AutoForge
+    unblock:   autoforge --config autoforge.yaml --state-dir .autoforge/AutoForge-issue-159 unblock --reason '<what you found>'
+    resume:    autoforge --config autoforge.yaml --state-dir .autoforge/AutoForge-issue-159 resume
+  Inspect the checkout and the agent's GitHub work first: 'unblock' re-inspects GitHub and re-enters a phase, and only then does 'resume' continue the run.
+  ```
+
+  A LOCAL run prints a `new run:` line (`autoforge ... local run <the
+  feature's absolute path>`) instead of `unblock` and `resume`.
 - **"refusing to launch: a process AutoForge launches would be handed a
   GitHub or git credential":** the message names the setting (for example
   a credential helper in the repository's git configuration, a remote URL

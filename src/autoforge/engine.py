@@ -1293,15 +1293,15 @@ class ControllerEngine:
         return result
 
     def _checkout_drift_reason(self, phase: Phase, drift: str, outcome: str) -> str:
+        checkout = str(Path(self.workdir).resolve())
         return (
-            f"the checkout the controller is run from ({Path(self.workdir).resolve()}) moved "
+            f"the checkout the controller is run from ({checkout}) moved "
             f"while {phase.value} ran: {drift}. Agents work only in the per-issue worktree "
             f"({self.agent_worktree_description()}); the controller never commits to, checks out, "
             "resets or switches branches in the checkout it is run from and requires the "
             "same of the agents it launches, because it cannot tell an agent's commit from "
             f"an operator's. Nothing was rolled back -- the controller never undoes a git "
-            f"operation it did not perform. {outcome}. Inspect the checkout and the agent's "
-            "GitHub work, then 'unblock'"
+            f"operation it did not perform. {outcome}." + self._moved_checkout_recovery(checkout)
         )
 
     def _isolation_plan_notes(self) -> list[str]:
@@ -2969,6 +2969,7 @@ class ControllerEngine:
         return " and ".join(drift)
 
     def _local_anchor_block_reason(self, drift: str) -> str:
+        root = self._require_state().local_contract().repository_root
         return self._local_block_reason(
             f"the repository's git anchor moved during the run: {drift}. A local run never "
             "commits, resets, checks out or switches branches, and it requires the same to "
@@ -2976,7 +2977,7 @@ class ControllerEngine:
             "specification describe the working tree as it was anchored, and the controller "
             "cannot tell an agent's commit from an operator's. Nothing was rolled back — "
             "the controller never undoes a git operation it did not perform"
-        )
+        ) + self._moved_checkout_recovery(root)
 
     def _local_unverified_tree_block_reason(self, now: WorkspaceSnapshot) -> str:
         state = self._require_state()
@@ -8277,7 +8278,48 @@ class ControllerEngine:
         started with (:attr:`cli_global_flags`), paths as given, quoted for a
         POSIX shell (#189).
         """
-        return shlex.join(["autoforge", *self.cli_global_flags, "resume"])
+        return self.cli_command("resume")
+
+    def cli_command(self, *words: str) -> str:
+        """``autoforge``, the global flags of this process, then ``words``, quoted for a shell.
+
+        Every command the controller tells the operator to run next goes
+        through here, for the reason :meth:`resume_command` gives (#189).
+        """
+        return shlex.join(["autoforge", *self.cli_global_flags, *words])
+
+    def _moved_checkout_recovery(self, checkout: str) -> str:
+        """Lines that end a block reason for a checkout that moved: where to look, what to run.
+
+        A BLOCKED run is not resumed (``resume`` refuses a terminal phase),
+        so "inspect, then 'resume'" would be wrong here (#189). A REMOTE run
+        leaves BLOCKED through ``unblock``, which re-inspects GitHub and
+        re-enters a phase, and then resumes. A LOCAL run cannot be unblocked
+        (it has no GitHub state to re-inspect; :meth:`_unblock_once`): it is
+        continued by a new run of the same feature specification, which
+        ``checkout``, the run's repository root, locates. Both repeat the
+        flags this process was started with, as typed (:meth:`cli_command`).
+        """
+        state = self._require_state()
+        lines = ["", f"  checkout:  {checkout}"]
+        if state.mode == WorkflowMode.LOCAL:
+            spec = str(Path(checkout) / state.feature_spec_path)
+            lines += [
+                f"  new run:   {self.cli_command('local', 'run', spec)}",
+                "Inspect the checkout first ('git log' and 'git status' there show what moved "
+                "and what was left); a BLOCKED local run is neither unblocked nor resumed "
+                "('unblock' applies to GitHub runs only), so it continues as a new run of the "
+                "same feature.",
+            ]
+        else:
+            unblock = self.cli_command("unblock", "--reason", "<what you found>")
+            lines += [
+                f"  unblock:   {unblock}",
+                f"  resume:    {self.resume_command()}",
+                "Inspect the checkout and the agent's GitHub work first: 'unblock' re-inspects "
+                "GitHub and re-enters a phase, and only then does 'resume' continue the run.",
+            ]
+        return "\n".join(lines)
 
     def _state_unchanged_text(self, failure: str) -> str:
         """``failure``, then where to look and how to resume (#189). Redacted.
