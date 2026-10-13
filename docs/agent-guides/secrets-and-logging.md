@@ -129,6 +129,14 @@ reason for a checkout that moved
 only: the checkout path, the feature specification's path and commands
 with those flags. `_block` redacts it like every block reason.
 
+A write phase's prompt describes what the agent worktree holds uncommitted
+(#187): its branch, `HEAD` and each entry's status code and path, escaped
+and fenced as untrusted data, never a file's content. The prompt is
+redacted where it is logged (`prompt.md`), and the note the run log keeps
+of that read (`metadata.worktree_state` in `request.json`), which quotes a
+failed read's last git output line, crosses `redact_dict` with the rest of
+the metadata.
+
 `redact_obj` / `redact_dict` redact mapping keys as well as values, and a
 mapping never loses an entry to that: two distinct keys that redact to the
 same text (`GITHUB_TOKEN=a`, `GITHUB_TOKEN=b`) are kept apart with a `#2`,

@@ -28,10 +28,11 @@ from autoforge.errors import (
     StateError,
     VerificationError,
 )
-from autoforge.executor import execute
+from autoforge.executor import ExecutionResult, execute
 from autoforge.git_transport import LOCAL_GIT_ENV_ALLOWLIST, LOCAL_GIT_SWITCHES
 from autoforge.local_workspace import (
     LocalWorkspace,
+    StatusEntry,
     init_feature_file,
     read_feature_spec,
     resolve_feature_spec,
@@ -2732,6 +2733,49 @@ def test_uncommitted_paths_is_one_hardened_status_read_and_never_guesses(tmp_pat
     # Inside a git directory there is no working tree to read.
     with pytest.raises(VerificationError, match="failed in"):
         uncommitted_paths(repo / ".git")
+
+
+def test_status_entries_keep_each_code_and_read_a_rename_or_a_copy_as_one_record(tmp_path):
+    """#187: the same read, kept as git's records for a prompt that has to say
+    how each path is uncommitted. A rename and a copy (`status.renames=copies`)
+    carry their source in a second field, which is never read as a record of
+    its own; the dirty-tree policy's paths come from the same records."""
+    listing = (
+        " M src/app.py\0"
+        "?? notes/new file.md\0"
+        "R  src/new.py\0src/old.py\0"
+        "C  src/copy.py\0src/app.py\0"
+        "A  added.py\0"
+    )
+    requests = []
+
+    def fake_git(req):
+        requests.append(req)
+        return ExecutionResult(req.command, req.cwd, 0, listing, "", "t", "t")
+
+    ws = LocalWorkspace(workdir=tmp_path, runner=fake_git)
+    assert ws.status_entries() == [
+        StatusEntry(" M", "src/app.py"),
+        StatusEntry("??", "notes/new file.md"),
+        StatusEntry("R ", "src/new.py", "src/old.py"),
+        StatusEntry("C ", "src/copy.py", "src/app.py"),
+        StatusEntry("A ", "added.py"),
+    ]
+    assert requests[0].command == [
+        *_GIT_READ,
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+    ]
+    assert ws.dirty_paths() == [
+        "added.py",
+        "notes/new file.md",
+        "src/app.py",
+        "src/copy.py",
+        "src/new.py",
+        "src/old.py",
+    ]
 
 
 # -- redaction at the persistence boundary --------------------------------------------

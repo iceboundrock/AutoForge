@@ -218,6 +218,7 @@ from .local_workspace import (
     GIT_TIMEOUT_SECONDS,
     FeatureSpec,
     LocalWorkspace,
+    StatusEntry,
     WorkspaceSnapshot,
     read_feature_spec,
     uncommitted_paths,
@@ -321,6 +322,7 @@ from .result_parser import (
     UpdateEpicRequest,
     UpdateEpicResult,
     commit_message_problem,
+    markdown_code_span,
     parse_control_result,
     published_payload_problem,
 )
@@ -416,6 +418,21 @@ MAX_TRANSIENT_RETRIES = 2
 # What a prompt names as its read context before the launch writes one (a
 # plan or a dry run, which write nothing).
 READ_CONTEXT_PENDING = "(a per-launch directory the controller writes before the launch)"
+# The REMOTE phases whose agent writes in the per-issue worktree, and which
+# are therefore told what an earlier launch left uncommitted there (#187).
+# Each of their templates requires ``{{WORKTREE_STATE}}``.
+WORKTREE_STATE_PHASES = (Phase.ANALYZE_EXECUTE, Phase.FIX, Phase.REPLAN_REEXECUTE)
+WORKTREE_STATE_TEMPLATE = "worktree_state.md"
+# How much of the worktree's `git status` such a prompt quotes: the first
+# entries, each path cut to a bound, then how many more there are.
+MAX_WORKTREE_STATE_ENTRIES = 50
+MAX_WORKTREE_STATE_PATH_CHARS = 300
+# What ``{{WORKTREE_STATE}}`` holds outside a launch (a plan or a dry run,
+# which run no git): the read happens only immediately before the agent starts.
+WORKTREE_STATE_PENDING = (
+    "(Read immediately before the launch: the worktree's uncommitted changes, "
+    "when it has any, are described here.)"
+)
 # The issue references of an EPIC body the UPDATE_EPIC read context resolves:
 # `#<n>` or an issue URL of the run's repository.
 _ISSUE_REFERENCE_RE = re.compile(
@@ -533,6 +550,53 @@ def _loop_killed(result: AgentExecutionResult) -> str:
     if result.timeout_limit != LIMIT_LOOP:
         return ""
     return result.loop.describe() if result.loop is not None else "it repeated itself"
+
+
+def render_worktree_state(entries: Sequence[StatusEntry], head_sha: str, branch: str) -> str:
+    """``{{WORKTREE_STATE}}`` for a worktree whose ``git status`` lists ``entries`` (#187).
+
+    Empty for a clean worktree. Otherwise ``worktree_state.md``, which holds
+    the instruction, rendered with the branch, ``HEAD`` and a bounded list
+    of each entry's status code and path(s), as ``git status --short``
+    shows them: the first :data:`MAX_WORKTREE_STATE_ENTRIES` entries in
+    git's order, each path cut at :data:`MAX_WORKTREE_STATE_PATH_CHARS`,
+    then how many more there are. Never a file's content. The paths are
+    whatever wrote the files chose, so each is escaped onto one line and
+    the list is fenced as untrusted data. The branch name is just as
+    untrusted: it is escaped onto one line and quoted in a code span that
+    no backtick in it can close.
+    """
+    if not entries:
+        return ""
+
+    def shown(path: str) -> str:
+        text = escape_inline(path)
+        if len(text) <= MAX_WORKTREE_STATE_PATH_CHARS:
+            return text
+        cut = len(text) - MAX_WORKTREE_STATE_PATH_CHARS
+        return f"{text[:MAX_WORKTREE_STATE_PATH_CHARS]}[... {cut} more characters]"
+
+    lines = [
+        f"{entry.code} {shown(entry.orig_path)} -> {shown(entry.path)}"
+        if entry.orig_path
+        else f"{entry.code} {shown(entry.path)}"
+        for entry in entries[:MAX_WORKTREE_STATE_ENTRIES]
+    ]
+    more = len(entries) - MAX_WORKTREE_STATE_ENTRIES
+    if more > 0:
+        lines.append(f"... and {more} more")
+    return render(
+        load_template(WORKTREE_STATE_TEMPLATE),
+        {
+            "WORKTREE_BRANCH": (
+                markdown_code_span(escape_inline(branch)) if branch else "none (`HEAD` is detached)"
+            ),
+            "WORKTREE_HEAD_SHA": f"`{head_sha}`" if head_sha else "none (no commit yet)",
+            "WORKTREE_CHANGE_COUNT": len(entries),
+            "WORKTREE_MAX_ENTRIES": MAX_WORKTREE_STATE_ENTRIES,
+            "WORKTREE_CHANGES": fenced_untrusted_block("\n".join(lines), "untrusted"),
+        },
+    )
 
 
 def generate_run_id() -> str:
@@ -839,6 +903,11 @@ class ControllerEngine:
         # D10.2): the absolute path of its per-launch directory, set only
         # while `_invoke_phase` renders that launch's prompt.
         self._read_context_dir: str | None = None
+        # The ``{{WORKTREE_STATE}}`` of the write-phase launch being rendered
+        # (#187): what the worktree holds uncommitted, "" when it is clean or
+        # could not be read, set only while `_invoke_phase` renders that
+        # launch's prompt.
+        self._worktree_state: str | None = None
         self.state: AutoForgeState | None = None
         # Set by locked(): the controller lock held for a whole command.
         self._lock: ControllerLock | None = None
@@ -1746,6 +1815,11 @@ class ControllerEngine:
             "LAST_REVIEW_RESULT": s.last_review_result or "(none)",
             "MAX_PROGRESS_CHARS": MAX_PROGRESS_CHARS,
             "READ_CONTEXT_DIR": escape_inline(self._read_context_dir or READ_CONTEXT_PENDING),
+            # Always supplied, "" for a clean worktree, so a write template
+            # that requires it never renders without it (#187).
+            "WORKTREE_STATE": (
+                WORKTREE_STATE_PENDING if self._worktree_state is None else self._worktree_state
+            ),
             **REVIEW_BOUND_VARIABLES,
             **FIX_BOUND_VARIABLES,
         }
@@ -1777,6 +1851,30 @@ class ControllerEngine:
                 }
             )
         return variables
+
+    # -- what the worktree holds uncommitted (#187) ---------------------------
+    def _read_worktree_state(self, cwd: str) -> tuple[str, str]:
+        """``{{WORKTREE_STATE}}`` for a write phase's launch in ``cwd``, and the run log's note.
+
+        One hardened, read-only ``git status`` of the agent worktree (the
+        read #189's failure text counts), then, only when it lists anything,
+        its ``HEAD`` and branch. Information, never a decision: the hint
+        changes no state and no verification after the phase. A read that
+        fails renders no hint, never a guess, and the note says why; the
+        launch goes ahead as it would have before the hint existed.
+        """
+        workspace = LocalWorkspace(cwd, runner=self._runner)
+        try:
+            entries = workspace.status_entries()
+            if not entries:
+                return "", "clean"
+            head_sha, branch = workspace.head_sha(), workspace.branch()
+        except (AutoForgeError, OSError) as exc:
+            return "", f"not read, so the prompt describes none: {type(exc).__name__}: {exc}"
+        return (
+            render_worktree_state(entries, head_sha, branch),
+            f"{len(entries)} uncommitted change(s), described in the prompt",
+        )
 
     # -- the agent's read context (#165, ADR 0004 D10.2) -----------------------
     def _write_read_context(self, phase: Phase, attempt: int) -> str:
@@ -8008,10 +8106,16 @@ class ControllerEngine:
             # prompt that names it is rendered; nothing is saved yet.
             if state.mode == WorkflowMode.REMOTE:
                 self._read_context_dir = self._write_read_context(phase, state.attempt + 1)
+            # What an earlier launch left uncommitted in the worktree, read
+            # for every launch of a write phase, a relaunch included (#187).
+            worktree_note: str | None = None
+            if state.mode == WorkflowMode.REMOTE and phase in WORKTREE_STATE_PHASES:
+                self._worktree_state, worktree_note = self._read_worktree_state(cwd)
             try:
                 prompt = self.render_prompt_for(phase, correction_error)
             finally:
                 self._read_context_dir = None
+                self._worktree_state = None
             # The launch is charged to the durable LOCAL bound here, after
             # every step that can refuse without launching and immediately
             # before the one that launches. The first launch of an entry is
@@ -8083,6 +8187,8 @@ class ControllerEngine:
                     "env_set": [*override_names(), *provider.isolation_names],
                 },
             )
+            if worktree_note is not None:
+                record.metadata["worktree_state"] = worktree_note
             result: AgentExecutionResult | None = None
             try:
                 with isolated_overrides(identity) as overrides:

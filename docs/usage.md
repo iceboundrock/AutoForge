@@ -477,7 +477,15 @@ ownership or discard uncommitted user changes.
   - `worktree` is the issue's agent worktree, with the number of paths
     `git status` reports there as changed or untracked: what the attempt
     left behind. The count is left out when that read fails. A LOCAL run
-    prints no `worktree` line: its agent works in your checkout.
+    prints no `worktree` line: its agent works in your checkout. AutoForge
+    leaves those changes where they are, and the next launch of a phase
+    that writes (`ANALYZE_EXECUTE`, `FIX`, `REPLAN_REEXECUTE`) is told
+    about them: its prompt names the worktree's branch and `HEAD` and lists
+    each change's status code and path (at most 50, never file content),
+    and asks the agent to inspect them and then continue from them or
+    discard them deliberately, saying which. The invocation's
+    `request.json` records what was found (`metadata.worktree_state`), or
+    why the read failed, in which case the prompt describes nothing.
   - `logs` is the failed launch's step directory (its progress, output and
     error).
   - `resume` repeats the `--config` and `--state-dir` this command was

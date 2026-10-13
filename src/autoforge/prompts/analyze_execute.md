@@ -36,6 +36,8 @@ the object store this worktree shares. A branch or a marker-bearing PR for this
 issue that the controller did not journal stops the run: it is never adopted
 silently.
 
+{{WORKTREE_STATE}}
+
 ## Steps
 
 1. Read the repository's `AGENTS.md` and `CLAUDE.md` if they exist. Their

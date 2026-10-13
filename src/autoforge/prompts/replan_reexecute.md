@@ -284,6 +284,8 @@ Then inspect the historical PR separately.
 
 Do not intermingle these two analyses prematurely.
 
+{{WORKTREE_STATE}}
+
 ---
 
 # 7. Build a Failure Ledger
