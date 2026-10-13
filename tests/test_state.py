@@ -379,6 +379,7 @@ def test_protocol_1_is_migrated_only_without_a_replan_in_flight(tmp_path):
     path = tmp_path / "state.json"
     base = make_state().to_dict()
     assert base["protocol_version"] == "8"
+    del base["acceptance_outcomes"]  # protocol 8's own field (#211)
     for journal in ({}, {"stage": "rejected", "rejection_reason": "refused by verification"}):
         data = dict(base, protocol_version="1", replan_transaction=journal)
         path.write_text(json.dumps(data), encoding="utf-8")
@@ -482,6 +483,7 @@ def test_protocol_2_is_relabelled_outside_the_merge_phases(tmp_path, phase):
         "current_base_ref",
         "reviewed_merge_base_sha",
         "current_merge_base_sha",
+        "acceptance_outcomes",
     ):
         del data[missing]
     path.write_text(json.dumps(data), encoding="utf-8")
@@ -543,7 +545,7 @@ def test_protocol_3_is_relabelled_outside_the_merge_phases(tmp_path, phase):
     for journal in ({}, rejected):
         data = _clean_review_state(phase=phase, replan_transaction=journal).to_dict()
         data["protocol_version"] = "3"
-        for missing in ("reviewed_merge_base_sha", "current_merge_base_sha"):
+        for missing in ("reviewed_merge_base_sha", "current_merge_base_sha", "acceptance_outcomes"):
             del data[missing]
         path.write_text(json.dumps(data), encoding="utf-8")
         loaded = load_state(path)
@@ -630,6 +632,7 @@ def test_protocol_4_is_relabelled_in_every_phase_without_a_replan_past_the_write
         data = _clean_review_state(phase=phase, replan_transaction=journal).to_dict()
         data["protocol_version"] = "4"
         data["controller_version"] = "0.4.0"
+        del data["acceptance_outcomes"]  # protocol 8's own field (#211)
         path.write_text(json.dumps(data), encoding="utf-8")
         loaded = load_state(path)
         assert loaded.protocol_version == "8" and loaded.phase == phase
@@ -3594,6 +3597,7 @@ def test_a_protocol_7_file_loads_migrated_and_is_relabelled_8_on_save(tmp_path):
     ("plant", "named"),
     [
         (lambda d: d.update(acceptance_outcomes=[_outcome()]), "'acceptance_outcomes'"),
+        (lambda d: d.update(acceptance_outcomes=[]), "'acceptance_outcomes'"),
         (lambda d: d.update(unblock_history=[dict(UNBLOCK_ENTRY)]), "an 'action' in"),
         (
             lambda d: d.update(last_fix_resolutions=[dict(ACCEPTED_ENTRY)]),
@@ -3606,7 +3610,9 @@ def test_an_older_file_carrying_acceptance_state_is_refused_and_left_unchanged(
 ):
     """No controller before protocol 8 wrote acceptance-action state, so an
     older label carrying any is a hand edit or a foreign file: refused, never
-    merged, and the file is not rewritten."""
+    merged, and the file is not rewritten. The label decides, not the value:
+    ``acceptance_outcomes`` is refused even as the empty list a protocol-8
+    save writes (PR #221 R1-F3)."""
     if protocol == "7":
         d = make_state(phase=Phase.REVIEW, current_pr_url=PR42).to_dict()
         d["protocol_version"] = "7"

@@ -7911,7 +7911,13 @@ def _as_protocol_5(eng, *, attempt: int) -> None:
     data = json.loads(eng.paths.state_file.read_text())
     data["protocol_version"] = "5"
     data["attempt"] = attempt
-    for key in ("effect_records", "entry_observation", "completion_context", "launch_label"):
+    for key in (
+        "effect_records",
+        "entry_observation",
+        "completion_context",
+        "launch_label",
+        "acceptance_outcomes",
+    ):
         data.pop(key, None)
     eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
 

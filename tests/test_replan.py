@@ -5790,6 +5790,7 @@ def _protocol_1_state_file(eng, journal: dict, *, protocol: str = "1") -> dict:
     """Rewrite the engine's state file as the ``protocol`` controller left it."""
     data = json.loads(eng.paths.state_file.read_text(encoding="utf-8"))
     data["protocol_version"] = protocol
+    data.pop("acceptance_outcomes", None)  # protocol 8's own field (#211)
     data["phase"] = Phase.REPLAN_REEXECUTE.value
     data["current_issue_url"] = ISSUE
     data["current_pr_url"] = PR
@@ -6091,7 +6092,7 @@ def test_r7f1_a_legacy_state_without_a_replan_in_flight_loads_as_current(tmp_sta
     # case: no replan in flight.
     data = json.loads(eng.paths.state_file.read_text())
     data["protocol_version"] = protocol
-    del data["replan_transaction"]
+    del data["replan_transaction"], data["acceptance_outcomes"]
     eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
     assert eng.load().replan_transaction == {}
 
@@ -6134,6 +6135,7 @@ def test_r7f1_the_version_label_decides_not_the_journal_shape(tmp_state_dir):
     # field, whichever protocol step introduced it.
     data = json.loads(eng.paths.state_file.read_text())
     data["protocol_version"] = "8"
+    data["acceptance_outcomes"] = []
     data["phase"] = Phase.REPLAN_REEXECUTE.value
     data["block_reason"] = ""
     for missing in (

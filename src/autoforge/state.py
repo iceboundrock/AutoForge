@@ -702,10 +702,11 @@ class AutoForgeState:
             )
             if refusal:
                 raise StateError(refusal)
-            # The label decides, not the shape: a field a later protocol
-            # added may sit in a legacy file at its empty value, but effect
-            # state the labelled controller could never have written is a
-            # hand edit or a foreign file, and is refused rather than merged.
+            # The label decides, not the shape: a protocol-7 effect field
+            # may sit in a legacy file at its empty value, but effect state
+            # the labelled controller could never have written is a hand
+            # edit or a foreign file, and is refused rather than merged.
+            # Protocol 8's acceptance state is refused whatever its value.
             planted = sorted(
                 name for name in _EFFECT_FIELDS if data.get(name, "") not in ([], {}, "")
             )
@@ -1084,9 +1085,14 @@ def _require_fields(data: dict, protocol: object, names: tuple[str, ...], what: 
 
 
 def _acceptance_state_in(data: dict) -> list[str]:
-    """What of protocol 8's acceptance-action state (#211) ``data`` carries, named."""
+    """What of protocol 8's acceptance-action state (#211) ``data`` carries, named.
+
+    The label decides, not the value: ``acceptance_outcomes`` is protocol
+    8's own field, so an older file that carries it at all, even empty, was
+    not written by the controller its label names.
+    """
     found: list[str] = []
-    if data.get("acceptance_outcomes", []) != []:
+    if "acceptance_outcomes" in data:
         found.append("'acceptance_outcomes'")
     records = data.get("effect_records")
     if isinstance(records, list) and any(
