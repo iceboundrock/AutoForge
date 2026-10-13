@@ -268,12 +268,13 @@ they run unchanged.
   its branch, `HEAD` and each entry's status code and path, never file
   content; the list is cut after `MAX_WORKTREE_STATE_ENTRIES` with how many
   more, each path escaped onto one line and bounded, inside a fence no path
-  can close; a status read that fails renders nothing and the run log says
-  why, and the launch proceeds; the three write templates (and no other)
-  require the variable, so a missing value fails rendering, and the
-  instruction is in `worktree_state.md` (`test_engine.py`, `test_replan.py`,
-  `test_prompts.py`; the parsed status codes, renames and copies:
-  `test_local.py`) (#187)
+  can close, and the branch name escaped and inside a code span no
+  backtick in it can close; a status read that fails renders nothing and
+  the run log says why, and the launch proceeds; the three write templates
+  (and no other) require the variable, so a missing value fails rendering,
+  and the instruction is in `worktree_state.md` (`test_engine.py`,
+  `test_replan.py`, `test_prompts.py`; the parsed status codes, renames and
+  copies: `test_local.py`) (#187)
 - a path that exists but is not a worktree root of this repository, or a
   location inside the operator's working tree, is refused, not adopted
 - a dry run creates no worktree and runs no git

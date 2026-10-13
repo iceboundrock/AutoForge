@@ -322,6 +322,7 @@ from .result_parser import (
     UpdateEpicRequest,
     UpdateEpicResult,
     commit_message_problem,
+    markdown_code_span,
     parse_control_result,
     published_payload_problem,
 )
@@ -561,7 +562,9 @@ def render_worktree_state(entries: Sequence[StatusEntry], head_sha: str, branch:
     git's order, each path cut at :data:`MAX_WORKTREE_STATE_PATH_CHARS`,
     then how many more there are. Never a file's content. The paths are
     whatever wrote the files chose, so each is escaped onto one line and
-    the list is fenced as untrusted data; so is the branch name.
+    the list is fenced as untrusted data. The branch name is just as
+    untrusted: it is escaped onto one line and quoted in a code span that
+    no backtick in it can close.
     """
     if not entries:
         return ""
@@ -586,7 +589,7 @@ def render_worktree_state(entries: Sequence[StatusEntry], head_sha: str, branch:
         load_template(WORKTREE_STATE_TEMPLATE),
         {
             "WORKTREE_BRANCH": (
-                f"`{escape_inline(branch)}`" if branch else "none (`HEAD` is detached)"
+                markdown_code_span(escape_inline(branch)) if branch else "none (`HEAD` is detached)"
             ),
             "WORKTREE_HEAD_SHA": f"`{head_sha}`" if head_sha else "none (no commit yet)",
             "WORKTREE_CHANGE_COUNT": len(entries),
