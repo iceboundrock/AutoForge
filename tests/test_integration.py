@@ -40,7 +40,17 @@ from tests.conftest import (
 )
 
 
-def test_full_loop_to_ready_for_merge(tmp_state_dir):
+def _sandboxed_as_configured(eng, mode: str) -> None:
+    """#168: under ``required`` every launch carried the engine's facts and its
+    description compiled; under ``disabled`` none did (ADR 0005 D15.2)."""
+    calls = eng.provider.calls
+    assert calls
+    assert all((req.sandbox is not None) is (mode == "required") for req in calls)
+    assert len(eng.provider.descriptions) == (len(calls) if mode == "required" else 0)
+
+
+@pytest.mark.parametrize("sandbox_mode", ["disabled", "required"])
+def test_full_loop_to_ready_for_merge(tmp_state_dir, sandbox_mode):
     gh = FakeGitHub()
     phases_seen = []
     fixed: list[str] = []
@@ -79,6 +89,7 @@ def test_full_loop_to_ready_for_merge(tmp_state_dir):
         raise AssertionError(f"unexpected call {req.phase}")
 
     eng = make_engine(tmp_state_dir, agent, github=gh, origin=True)
+    eng.config.sandbox.mode = sandbox_mode
     eng._save()
     expected = ["ANALYZE_EXECUTE", "REVIEW", "FIX", "REVIEW", "READY_FOR_MERGE"]
     for exp in expected:
@@ -110,6 +121,7 @@ def test_full_loop_to_ready_for_merge(tmp_state_dir):
     assert [
         json.loads(line)["phase"] for line in (run_dir / "events.jsonl").read_text().splitlines()
     ] == ["ANALYZE_EXECUTE", "REVIEW", "FIX", "REVIEW"]
+    _sandboxed_as_configured(eng, sandbox_mode)
 
 
 def test_each_fix_round_receives_its_own_verified_review_comment(tmp_state_dir):
@@ -195,7 +207,8 @@ def test_run_loops_until_ready_for_merge(tmp_state_dir):
     assert eng.state.phase == Phase.READY_FOR_MERGE
 
 
-def test_gate_open_loop_merges_via_controller_then_update_epic_to_done(tmp_state_dir):
+@pytest.mark.parametrize("sandbox_mode", ["disabled", "required"])
+def test_gate_open_loop_merges_via_controller_then_update_epic_to_done(tmp_state_dir, sandbox_mode):
     """READY_FOR_MERGE -> MERGE (controller merges) -> UPDATE_EPIC (agent) -> DONE.
 
     No agent is invoked for MERGE; the fake records the exact `gh pr merge`
@@ -228,6 +241,7 @@ def test_gate_open_loop_merges_via_controller_then_update_epic_to_done(tmp_state
 
     eng = make_engine(tmp_state_dir, agent, github=gh, origin=True)
     eng.config.safety.allow_merge = True
+    eng.config.sandbox.mode = sandbox_mode
     eng._save()
     # CLI flag alone does not open the gate: run() holds at READY_FOR_MERGE
     outcomes = eng.run(max_steps=50)
@@ -249,6 +263,7 @@ def test_gate_open_loop_merges_via_controller_then_update_epic_to_done(tmp_state
     s = load_state(eng.paths.state_file)
     assert s.counted_merged_prs == [PR] and s.merged_since_epic_update == 0  # reset by UPDATE_EPIC
     assert s.phase == Phase.DONE
+    _sandboxed_as_configured(eng, sandbox_mode)
 
 
 def test_runaway_review_fix_loop_is_bounded(tmp_state_dir):

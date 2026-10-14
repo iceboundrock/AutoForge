@@ -76,8 +76,8 @@ install the extra.
 ## Validation: every key must be one the controller reads
 
 An unknown key, whether at the top level, in any section (`execution`,
-`safety`, `github`, `merge`, `review`, `review.replan`, `workflow`, `local`)
-or in a profile mapping, is a configuration error naming the section, the
+`safety`, `github`, `merge`, `review`, `review.replan`, `workflow`, `local`,
+`sandbox`) or in a profile mapping, is a configuration error naming the section, the
 offending key and the keys that section knows, e.g.
 `unknown key(s) under 'workflow': max_review_round (known: max_review_rounds, ...)`.
 A typo cannot be a silent no-op that leaves the built-in default in force:
@@ -140,6 +140,7 @@ directory if it is missing and a probe file it creates and removes there.
 | `profiles` | provider, model, effort, command, idle timeout, maximum runtime and provider options per logical profile | [Profiles](#profiles) below |
 | `github` | the `gh` binary and its timeout | [GitHub safety](agent-guides/github-safety.md) |
 | `local` | Local Mode: `feature_dir`, `max_fix_rounds`, `validation_commands`, `exclude`, `max_workspace_entries`, `max_workspace_bytes` | [Local mode configuration](#local-mode-configuration) below |
+| `sandbox` | the outer sandbox (#168): `mode` (`disabled`, the default, or `required`), `validation_network` and `premerge_network` (`host`, the default, or `isolated`) | [Outer sandbox](#outer-sandbox) below, [Architecture](agent-guides/architecture.md#launch-routing-adr-0005-168) |
 
 ## Profiles
 
@@ -653,6 +654,152 @@ socket) do not get it; curl and wget get none of their configured defaults
 zsh startup files, and a fish `SHELL` is replaced with `bash`; and the
 provider integrations above stay off. The guarantees and what they do not cover are in
 [GitHub safety](agent-guides/github-safety.md#agents-hold-no-github-credential).
+
+## Outer sandbox
+
+`sandbox:` (#168,
+[ADR 0005](adr/0005-outer-sandbox-and-host-resource-capability-model.md))
+decides whether what AutoForge launches also runs inside an OS-enforced
+filesystem, process and IPC boundary, on top of the logical isolation
+above:
+
+```yaml
+sandbox:
+  mode: disabled              # disabled | required
+  validation_network: host    # host | isolated: LOCAL validation commands
+  premerge_network: host      # host | isolated: merge.verification_commands
+```
+
+- **`mode: disabled`** (the default) launches as before: logical isolation
+  only, so an agent can still read and write by absolute path whatever your
+  UID can. The controller's git hardening (binding the issue worktree
+  through the registry, reading its `HEAD` through the git common dir, the
+  strict object import; ADR 0005 D6.3–D6.5) applies in this mode too
+  ([GitHub safety](agent-guides/github-safety.md#threat-model)).
+- **`mode: required`** runs every agent launch of every provider (Pi's
+  per-launch auth preflight included), every `local.validation_commands`
+  entry and every `merge.verification_commands` entry inside the outer
+  sandbox, or refuses it before it runs; nothing falls back to running
+  without one (D12.1). It needs Linux, `bwrap` on `PATH`, unprivileged user
+  namespaces and overlay mounts, and Landlock ABI 6 (Linux 6.12 or later).
+  There is no pre-launch capability check and no `doctor` row for it yet
+  (#169), so a host that cannot enforce refuses at the first launch, with
+  the reason. Where a refusal lands:
+  - an agent: `SandboxLaunchRefusedError`, an `ExecutionError` handled like
+    an executable that cannot be spawned. Nothing ran, the phase is
+    unchanged and `resume` launches it again; the attempt counter (and a
+    LOCAL write phase's launch charge) was already saved, as for that spawn
+    failure, until #169's gate moves the refusal before both;
+  - a LOCAL validation command: not run, so the phase is not verified and
+    the run stays in it, as for a failing command;
+  - a pre-merge verification command: not run, so the merge gate blocks
+    (`BLOCKED`, "Nothing was merged or counted"), as for a failing command.
+- **`validation_network` and `premerge_network: isolated`** run that kind
+  of command in a network namespace of its own: the host's loopback
+  services, its abstract sockets and every download are unreachable, which
+  is why it is opt-in (D9.2). Agents always share the host network. Both
+  keys are read only under `required`.
+
+Any other value, `preferred` included (#169's, ADR 0005 D12.2), is a load
+error. The dry-run plan names the mode in a note (`outer sandbox: disabled
+(sandbox.mode); ...`, or `required` with both network positions); `status`
+and `doctor` do not report it yet (#169).
+The mode is not part of a LOCAL run's contract (D12.3), and no state
+records it, so a run started under one mode resumes under the other
+(D15.3).
+
+**What a sandboxed launch sees.** An empty root, then only what ADR 0005
+§2.5 grants its launch class
+([Architecture](agent-guides/architecture.md#launch-routing-adr-0005-168)):
+the system runtime (`/usr`, `/etc`, `/bin`, `/lib`, `/lib64`, `/sbin`,
+DNS); an empty private home at your home's path and a private `/tmp`, both
+discarded when the launch ends; the launch's workspace; the read-only
+directory holding the per-launch `gh`, git and shell configuration
+([Agent environment](#agent-environment)); and, for an agent, its provider
+CLI's install root and what the provider declares (below). Everything else
+is absent: the rest of your home (`~/.config/gh`, `~/.ssh`, keyrings and
+every credential file), `/run` and `$XDG_RUNTIME_DIR`, `/opt`, `/var`,
+other repositories, the state directory, the run logs, the lock, the other
+worktrees and, from a REMOTE agent, your checkout.
+
+- **Workspaces.** A REMOTE agent writes its issue worktree; the
+  repository's shared git metadata (references, configuration, hooks,
+  existing objects) is read-only, and its commits land in the issue's
+  private object directory, which the controller imports
+  ([State and recovery](agent-guides/state-and-recovery.md#runtime-artifacts)).
+  A LOCAL agent and a LOCAL validation command write the repository root
+  with the git directory read-only, so a commit, stash or branch fails
+  outright. A pre-merge command sees the exported tree and nothing else of
+  the repository.
+- **Caches.** `~/.cache` inside is a persistent, controller-owned cache for
+  the launches that produce a change (`ANALYZE_EXECUTE`, `FIX`,
+  `REPLAN_REEXECUTE`, REMOTE per issue, LOCAL per checkout) and for LOCAL
+  validation commands. Every other agent launch (`REVIEW`, `UPDATE_EPIC`)
+  and a pre-merge command get only the one in their private home, so a
+  reviewer never loads what an implementer left there. Your own `~/.cache`
+  is never visible.
+- **Toolchains.** A tool installed under your home (`~/.local/bin`, a
+  version manager) or in `/opt` is not visible to an agent's tools or to a
+  repository command, and `PATH` loses those entries: only the provider
+  CLI's install root and, for a script, its interpreter's are projected.
+  Operator-declared read-only paths are #169's (D15.4) and not available
+  yet, so under `required` a validation or pre-merge command must find
+  what it runs under `/usr` or in the workspace.
+- **Environment.** A path-valued variable AutoForge knows (the CA-bundle
+  names, the per-launch configuration it sets, the provider's own) is unset
+  when what it names is not visible inside, and `PATH` keeps only its
+  visible entries (D8.2); the run log names each unset variable.
+
+**What it does not change.** The launch still runs as your UID. An agent
+shares the host network: loopback services that act on request (a
+debugger port, a container daemon on TCP, a development server) are an
+escape, not only an exposure (ADR 0005 §2.2). Every tool in the sandbox can
+read the model credential the provider is given (D7.4). The repository and
+your unpushed work in the shared git directory (unpushed branches' objects,
+reflogs, `refs/stash`) stay readable (D6.7).
+
+### Provider credentials under `required`
+
+The private home starts empty, so a provider finds only the credential its
+adapter declares (ADR 0005 D7.1); AutoForge never reads, copies or logs its
+contents. A writable credential directory may never be the CLI's own
+configuration root, where a sandboxed agent could plant what your next
+unsandboxed session runs (D7.2): the launch is refused, naming the path and
+the rule. A login kept only in a keyring cannot be projected, and the
+policy refuses one declared (D7.2); none of the three adapters declares
+one.
+
+- **Claude Code.** `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and
+  `CLAUDE_CODE_OAUTH_TOKEN` pass as variables. With an absolute
+  `CLAUDE_CONFIG_DIR`, that directory is writable at its own path and the
+  CLI keeps and refreshes its login there; one that is, contains or lies
+  inside `~/.claude` is refused. Without it, only
+  `~/.claude/.credentials.json` and `~/.claude/settings.json` are projected,
+  read-only, when present: the CLI cannot write a refreshed subscription
+  token back, and nothing else of `~/.claude` or `~/.claude.json` is
+  visible. For unattended runs under `required`, give AutoForge a
+  dedicated `CLAUDE_CONFIG_DIR` (log in once with it set) or a token
+  variable (`claude setup-token` prints one for `CLAUDE_CODE_OAUTH_TOKEN`).
+- **OpenCode.** Its per-launch empty `OPENCODE_CONFIG_DIR` is writable, and
+  the `*_API_KEY` variables the allow-list passes reach it. With an
+  absolute `OPENCODE_DB` (the database of its own that
+  [Agent environment](#agent-environment) recommends), the database's
+  directory is writable at its own path, so the login made with it set
+  (`opencode auth login`) is visible; a directory that is, contains or lies
+  inside OpenCode's own configuration, data or cache directory
+  (`~/.config/opencode`, `~/.local/share/opencode`, `~/.cache/opencode`) is
+  refused. Without it, the login in your data directory is not visible, and
+  a relative or `:memory:` database lives in the private home: use the
+  provider's API-key variable.
+- **Pi.** An absolute `PI_CODING_AGENT_DIR` is writable at its own path,
+  where Pi rewrites `auth.json` and `models-store.json` at startup; one
+  that is, contains or lies inside `~/.pi/agent` is refused. Without it Pi
+  finds no sign-in inside, and with `require_oauth` (the default) its auth
+  preflight, run in the same sandbox, refuses the launch
+  ([Pi policy](pi-policy.md) §8).
+
+A writable credential directory is shared by every launch that projects
+it, across issues and roles, so dedicate it to AutoForge's launches.
 
 ## Local mode configuration
 

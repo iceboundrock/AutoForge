@@ -267,6 +267,78 @@ Three files, by what they need from the host:
 The existing executor and duplex suites are the no-description regression:
 they run unchanged.
 
+### Launch routing and the agent worktree's git surface (#168, ADR 0005)
+
+Four more files, the same split by what they need from the host:
+
+- `tests/test_sandbox_policy.py` launches nothing: each test compiles a
+  description from real paths under `tmp_path` and reads it. It covers:
+  - the §2.5 mapping per launch class: a REMOTE agent's writable worktree,
+    read-only `.git`, writable admin dir, read-only common dir, the masks
+    and the overlay over the shared object store; no persistent cache for
+    a REVIEW; a LOCAL launch's read-only git dir with its state masked; a
+    LOCAL validation command that may run without a network and an agent
+    that never does; an export command that sees only its tree;
+  - the D8.2 rewrite: a path-valued name passes only when what it names is
+    visible;
+  - the D7.2 refusals, each naming the path and the rule: a declared
+    writable directory on an operator root, a keyring login, a declared
+    path inside a denied root; an auth directory named by its variable;
+  - install roots (the package or the directory, a prefix with its `lib`,
+    never the home) and a script's interpreter;
+  - each adapter's declaration: Claude Code's login, settings and shell
+    file, its own `CLAUDE_CONFIG_DIR` writable and the operator's refused;
+    OpenCode's own database and configuration directory; Pi's
+    `PI_CODING_AGENT_DIR`, never the operator's.
+- `tests/test_agent_worktree.py` runs real git on real repositories. It
+  covers:
+  - the D6.4 binding: a registry entry binds the worktree, with relative
+    pointers too; a rewritten `.git` file (refused naming
+    `git worktree repair`), a `.git` directory, two entries naming the
+    worktree and an unregistered worktree are refused;
+  - the D6.3 candidate read: the detached HEAD, an attached HEAD reported,
+    a HEAD that is a link not read, pointer rewrites that do not move the
+    candidate, a HEAD naming no commit read as none;
+  - the D6.5 import: an empty private directory imports nothing, an
+    agent's commit reaches the shared store, a corrupt object does not,
+    and `info/alternates`, `info/http-alternates`, a link or a FIFO is
+    tampering.
+- `tests/test_engine_sandbox.py` drives the engine with the scripted
+  provider, which records the description each launch compiles and
+  launches nothing. It covers: `disabled` launching without one and
+  recording the mode in `request.json`; a `required` REMOTE agent's
+  worktree, overlay and cache, with the checkout, state directory and
+  run logs absent; a REVIEW without a cache; a refused launch (a link
+  where the sandbox directories go) recorded, with nothing run and the
+  phase unchanged; an alternates file in the private store entering
+  `BLOCKED` with nothing pushed; a `.git` pointed at a decoy repository,
+  whose HEAD is never the candidate and whose next launch is refused
+  naming the repair; a refusal on the spawn path; and the dry-run note.
+- `tests/test_sandbox_routing.py` runs real `bwrap` and skips its whole
+  module with the probe's reason when this host cannot enforce, as
+  `test_sandbox_bwrap.py` does (also off Linux and without
+  `/usr/bin/python3`). It covers: a REMOTE agent, for each of Claude
+  Code's text and `stream-json` paths and OpenCode, that reaches its read
+  context, cache and temp (and Claude alone its login file), finds no SSH
+  key or agent socket, checkout, state directory, neighbouring worktree or
+  its admin dir, gets `EROFS` writing the common dir's HEAD, a branch ref,
+  the configuration, a hook, its `.git` or `commondir`, leaves no process
+  behind, and commits through the overlay into the private directory,
+  where the candidate names no commit until the strict import ran; an
+  alternates file written through the overlay as tampering; a
+  LOCAL validation command that gets `EROFS` on the git directory; an
+  export command that sees its tree and no network when isolated; a
+  `required` LOCAL run that reaches `DONE`; a `required` pre-merge command
+  that sees only the export; and an all-Pi run sandboxed in every child,
+  the auth preflight included.
+
+`test_integration.py`'s full loops and `test_replan.py`'s hard-threshold
+replan run in both modes, and every launch under `required` carries a
+description. `test_config.py` pins the section (`disabled` by default,
+both formats read, `preferred` and anything else refused) and the example
+file; `test_prompts.py` pins the narrowed-view wording both common
+prompts carry in every mode.
+
 ### Agent isolation (REMOTE)
 
 - the agent's cwd is the per-issue worktree under the git common dir (or

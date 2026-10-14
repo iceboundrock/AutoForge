@@ -65,6 +65,9 @@ Provider adapters own:
 - the names of the environment variables its CLI reads
   (`AgentProvider.environment_names`, added to the engine's allow-list so a
   provider's key is never handed to another provider's CLI)
+- what its CLI needs from the host inside the outer sandbox, as data
+  (`AgentProvider.sandbox_requirements`, ADR 0005 D13.1; see
+  [Launch routing](#launch-routing-adr-0005-168))
 
 Every invocation is an argv list: there is no `os.system` / `shell=True`
 anywhere, so shell metacharacters in issue text cannot be interpreted. The
@@ -478,8 +481,156 @@ What changes for a sandboxed launch (ADR 0002 §4e):
 
 The executor still owns no policy: it does not decide whether a launch is
 sandboxed, which paths it gets, or what happens when the host cannot
-enforce. That is #168's routing and #169's modes. The facts are for the
-log, and the controller never reads them.
+enforce. That is the engine's routing (#168, below) and the configured
+mode (`disabled` and `required` are #168's; `preferred` and the pre-launch
+capability gate are #169's and do not exist yet). The facts are for the
+log, and the controller never reads them (D16.1).
+
+#### Launch routing (ADR 0005, #168)
+
+Under `sandbox.mode: required` every launch AutoForge makes outside itself
+carries a description (D3.1): every process of every agent provider
+(Claude Code one-shot and stream-json, OpenCode, Pi RPC and Pi's
+per-launch auth preflight), every LOCAL validation command and every
+pre-merge verification command. The controller's own `git` and `gh`
+plumbing stays outside. Under `disabled` no request carries one, and every
+launch takes the path it took before #167. Each party contributes what it
+alone knows, as data (D13.1, D13.2):
+
+- **The engine** supplies `LaunchFacts` (`src/autoforge/sandbox_policy.py`):
+  the launch class, the workspace, its `.git` entry, its git dir and the
+  common dir, the issue's private object directory and overlay work
+  directory, the cache, the read context, the directory the #165 overrides
+  live in (`child_env.overrides_directory`), the network position and the
+  denied roots. `ControllerEngine._remote_facts` and `_local_facts` derive
+  them from the git directories, `_denied_roots` lists what no launch may
+  see, and `_sandbox_dirs` creates the controller-owned directories through
+  `SafeRoot` at the first enforced launch that needs them (a link in their
+  path refuses the launch, D8.4). For an agent, `_agent_sandbox` wraps the
+  facts in a `SandboxPlan` on `AgentRequest.sandbox` (`None` under
+  `disabled`); for a repository command, `_command_sandbox` compiles the
+  description itself and puts it on `ExecutionRequest.sandbox`.
+- **A provider** declares what its CLI needs as `ProviderRequirements`
+  (`AgentProvider.sandbox_requirements`): the executable resolved on the
+  launch's `PATH` as the spawn would resolve it; its install root (the
+  package directory under `node_modules`; else the `<prefix>` of
+  `<prefix>/bin/<file>` when it has a `lib` directory, as an interpreter's
+  standard library needs, unless that prefix is the home, an ancestor of it
+  or `~/.local`; else its directory; never all of the home) and, for a
+  script, its interpreter's root, whose directory goes first on `PATH`;
+  configuration files (read-only) and state directories the adapter made
+  for the launch (writable); auth items (`AuthItem`:
+  `env`, `file-ro`, `dir-rw` or `keyring`, D7.1); its operator
+  configuration roots (D7.2); and its path-valued variable names
+  (`path_names`, D8.2). Claude Code, OpenCode and Pi each override it; what
+  they declare is in
+  [Configuration](../configuration.md#provider-credentials-under-required).
+  `AgentProvider.sandboxed()` is the one place a declaration meets the
+  plan: it builds the declaration from the process's environment, compiles
+  through `SandboxPlan.describe` and names the executable by its resolved
+  host path, which the description shows read-only. Every adapter calls it
+  for every process it starts (the base one-shot `execute`, Claude's
+  stream-json duplex, Pi's RPC duplex and Pi's auth preflight, which must
+  find the credential exactly where Pi will). A provider never emits a
+  mount, and no provider name appears in `sandbox_policy.py`.
+- **`sandbox_policy.py`** is the engine-layer mapping of ADR 0005 §2.5:
+  `sandbox_request` turns the facts and a declaration into the compiler's
+  `SandboxRequest` by launch class alone (a repository command gets no
+  provider resource whatever is passed), and `describe_launch` compiles it
+  and rewrites the environment. It runs no subprocess and creates nothing;
+  it is pure apart from the compiler's `realpath` and `lstat`, `realpath`
+  of environment values and the first line of an executable. A compiler
+  refusal becomes `SandboxLaunchRefusedError` naming the path and the rule
+  (`policy_refusal`), before anything is spawned.
+
+The launch classes (D5.1, D6.1, D6.6; ADR 0005 §2.5 is the full table):
+
+| Launch class | Writable | Read-only | Masked |
+|---|---|---|---|
+| REMOTE agent | the issue worktree; its admin dir `<common>/worktrees/<id>`; an overlay at `<common>/objects` whose upper layer is the issue's private object directory | the worktree's `.git` file and the admin dir's `commondir` and `gitdir` (pinned); the git common dir; the phase's read context | `<common>/autoforge`, `<common>/worktrees`, `<common>/modules`, with the worktree (at its default location) and its admin dir carved out |
+| LOCAL agent, LOCAL validation command | the repository root | the root's `.git`, the git dir (a linked checkout's admin dir) and the common dir | `<git dir>/autoforge`, `<common>/autoforge`, `<common>/worktrees` |
+| export command (pre-merge) | the exported tree | | |
+
+Every class also gets the system runtime, a private home and `/tmp`, the
+#165 overrides directory read-only, and the engine's denied roots (D13.2):
+the state directory and its run logs wherever they resolve, the lock,
+`<common>/autoforge`, every other registered worktree, for REMOTE the
+controller's checkout, and for LOCAL `<git dir>/autoforge` and the default
+REMOTE state directory `<root>/.autoforge`. A persistent cache is mounted
+at `~/.cache` only for the launches that produce a change
+(`ANALYZE_EXECUTE`, `FIX`, `REPLAN_REEXECUTE`: per issue in REMOTE, per
+checkout in LOCAL) and for LOCAL validation; every other agent launch and
+an export command get the one in their private home. An agent always
+shares the host network; a repository command gets
+`sandbox.validation_network` or `sandbox.premerge_network` (D9.2).
+
+The environment is rewritten (D8.2, `rewrite_environment`): a path-valued
+name AutoForge knows (the CA-bundle names of `DEFAULT_ENV_ALLOWLIST`,
+`child_env.OVERRIDE_PATH_NAMES`, the provider's `path_names`) whose
+absolute value is not visible inside (`LaunchDescription.inside_path`) is
+unset; a value that is not an absolute path passes unchanged; `PATH` keeps
+only its visible entries, after the provider's interpreter directories,
+and is unset when none is left. The launch's facts record every unset
+name.
+
+**The git surface, in every mode** (`src/autoforge/agent_worktree.py`,
+D6.3–D6.5). The redirect these close needs no sandbox, only a writable
+`.git` file, so the engine applies them to a REMOTE issue worktree whatever
+the mode. Every git process is the controller's own `local_git_request`
+(ADR 0004 D7.3, D7.5), run through the executor.
+
+- **Binding (D6.4).** `bound_admin_dir` finds the worktree's admin dir
+  through the registry: exactly one `<common>/worktrees/<id>/gitdir` names
+  `<worktree>/.git`, and that `.git` is a regular file naming the entry
+  (absolute or relative). `_ensure_agent_worktree` binds a worktree it
+  creates and one it reuses; otherwise the refusal (a `VerificationError`)
+  names the inconsistency and `git worktree repair`. A worktree created
+  before #168 is reused once it binds, never refused for its age (D15.2).
+- **Candidate (D6.3).** `read_candidate` reads `worktrees/<id>/HEAD` with
+  `git --git-dir=<common>`, after `lstat` found a regular file there, never
+  through the worktree's `.git`, the admin dir's `commondir` or `gitdir`, or
+  `git -C <worktree>`. `_read_candidate` serves the `ANALYZE_EXECUTE`,
+  `FIX` and `REPLAN_REEXECUTE` result checks, so a `.git` rewritten to a
+  decoy repository cannot move the candidate.
+- **Strict import (D6.5).** `import_private_objects` copies the objects the
+  candidate reaches that the shared store lacks out of the issue's private
+  object directory: `rev-list --objects` and `pack-objects` with the
+  directory named through `GIT_ALTERNATE_OBJECT_DIRECTORIES` (never added
+  to the shared store's alternates), then `index-pack --stdin --fix-thin
+  --strict` into the shared store. `private_objects_problem` walks the
+  directory first without following a link; an `info/alternates` or
+  `info/http-alternates` file, or an entry that is neither a directory, a
+  regular file nor an overlay whiteout, is `SandboxTamperError`. The engine
+  imports before every REMOTE launch (`_import_before_launch`: a failed
+  import refuses the launch with `SandboxLaunchRefusedError`, before
+  anything is saved) and after every launch that exited cleanly, before
+  its result is parsed (`_import_after_launch`: a failure is not retried,
+  and the candidate read refuses the candidate with it, a correction). The
+  directory holds anything only after an enforced launch, so under
+  `disabled` with no earlier `required` launch both are no-ops.
+
+**Refusal paths.** Nothing sandboxed ever runs unsandboxed:
+
+- an agent: a compiler refusal, a sandbox directory that cannot be
+  prepared or a backend setup failure is `SandboxLaunchRefusedError`, an
+  `ExecutionError` on the failure-to-spawn path: recorded, then raised with
+  the phase unchanged and #189's "State unchanged." text;
+- a LOCAL validation command: the refusal is logged and raised as a
+  `VerificationError`; the phase is not verified;
+- a pre-merge verification command: the refusal is logged and returned as
+  the gate's problem, so the step enters `BLOCKED`;
+- tampering with the private object directory: `SandboxTamperError`, a
+  `VerificationError` that `_step_once` turns into `BLOCKED`, naming the
+  entry.
+
+`request.json` records `sandbox_mode` for every agent, validation and
+pre-merge launch; `execution.json` records the `sandbox` facts of a launch
+that carried a description, and of a refused one whose error carries them
+(`enforced: false` and the redacted reason). The prompts say what a
+narrowed view means (prompt version `v10`): `common.md` that the
+operator's checkout, other worktrees, the controller's state and the home's
+files may be absent and the shared git metadata read-only, and
+`local_common.md` that the git directory may be read-only.
 
 ### GitHub client
 

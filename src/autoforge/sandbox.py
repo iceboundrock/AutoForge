@@ -265,6 +265,26 @@ class LaunchDescription:
             if isinstance(mount, PrivateTmpfs)
         )
 
+    def inside_path(self, host_path: str) -> str | None:
+        """Where the resolved host path ``host_path`` is visible inside, or ``None``.
+
+        Through the bind or overlay that shows it, unless a deeper entry (a
+        mask, a private mount, another bind) covers it there. For the
+        engine's environment rewrite (ADR 0005 D8.2): a path-valued variable
+        passes only when what it names is visible.
+        """
+        entries = list(self.mounts)
+        for mount in entries:
+            if isinstance(mount, Bind) and _inside(host_path, mount.source):
+                inner = _rebase(host_path, mount.source, mount.target)
+            elif isinstance(mount, Overlay) and _inside(host_path, mount.lower):
+                inner = host_path
+            else:
+                continue
+            if _innermost(entries, inner) is mount:
+                return inner
+        return None
+
 
 TEARDOWN_UNCOUNTED = "removed by namespace teardown, uncounted"
 

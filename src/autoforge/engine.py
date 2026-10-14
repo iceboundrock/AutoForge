@@ -104,7 +104,7 @@ import os
 import re
 import secrets
 import shlex
-from collections.abc import Callable, Hashable, Iterator, Sequence
+from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -112,7 +112,21 @@ from pathlib import Path
 from typing import NoReturn
 
 from . import __prompt_version__
-from .child_env import describe_overrides, isolated_overrides, override_names, preflight
+from .agent_worktree import (
+    Candidate,
+    ObjectImportError,
+    bound_admin_dir,
+    holds_objects,
+    import_private_objects,
+    read_candidate,
+)
+from .child_env import (
+    describe_overrides,
+    isolated_overrides,
+    override_names,
+    overrides_directory,
+    preflight,
+)
 from .claims import (
     ACCEPTANCE,
     FOLLOW_UP,
@@ -201,6 +215,8 @@ from .errors import (
     GitHubUnavailableError,
     GitTransportError,
     LockError,
+    SandboxLaunchRefusedError,
+    SandboxTamperError,
     StateError,
     StateTransitionError,
     VerificationError,
@@ -212,6 +228,7 @@ from .executor import (
     MAX_DEADLINE_SECONDS,
     ExecutionRequest,
     execute,
+    select_environment,
 )
 from .git_transport import (
     GitRemote,
@@ -352,6 +369,18 @@ from .roadmap import (
 from .run_contract import LocalRunContract, validate_local_run_contract
 from .runlog import ExecutionRecord, RunLogger, StepLog
 from .safefs import SafeRoot
+from .sandbox import LaunchDescription, NetworkPosition, SandboxFacts
+from .sandbox_policy import (
+    CACHE,
+    LOCAL_SANDBOX_KEY,
+    OVERLAY_WORK,
+    PRIVATE_OBJECTS,
+    SANDBOX_DIR,
+    LaunchClass,
+    LaunchFacts,
+    SandboxPlan,
+    describe_launch,
+)
 from .state import (
     MAX_DECLINES_PER_ROUND,
     STATE_FILENAME,
@@ -865,6 +894,18 @@ _REMOTE_REENTRY_RECONCILIATION: dict[Phase, str] = {
 }
 
 
+def _operator_home() -> str:
+    """The operator's home, as the private home is mounted at it (ADR 0005 D8.1)."""
+    home = os.environ.get("HOME") or os.path.expanduser("~")
+    return os.path.normpath(home)
+
+
+def _refusal_facts(exc: BaseException) -> dict[str, object]:
+    """What a refused sandboxed launch recorded, for the run log; {} for none."""
+    facts = getattr(exc, "facts", None)
+    return facts.record() if isinstance(facts, SandboxFacts) else {}
+
+
 class ControllerEngine:
     def __init__(
         self,
@@ -910,6 +951,14 @@ class ControllerEngine:
         # The per-issue agent worktree paths already derived (a git read
         # each), keyed by the worktree's name; see :meth:`agent_worktree_path`.
         self._agent_worktrees: dict[str, Path] = {}
+        # The admin dir the registry binds each agent worktree to (ADR 0005
+        # D6.4), found when the worktree is created or reused; every
+        # candidate read addresses the worktree's HEAD through it.
+        self._agent_admin_dirs: dict[Path, Path] = {}
+        # Why the strict import after the latest launch failed (ADR 0005
+        # D6.5), "" when it did not: the candidate read refuses the candidate
+        # with it rather than importing again.
+        self._import_problem = ""
         # The workspace snapshot bound immediately before a LOCAL agent
         # phase. The prompt is rendered from it, so the fingerprint the
         # reviewer is told to report is exactly the one persisted in state.
@@ -1226,7 +1275,10 @@ class ControllerEngine:
         symbolic link at the path, whatever it points to, decided on the
         entry itself before anything follows it; and reuse requires the
         directory to be registered in this repository's worktree list, not
-        merely to answer git as some worktree. Nor is one
+        merely to answer git as some worktree, and the registry must bind it
+        to its admin dir (:func:`~autoforge.agent_worktree.bound_admin_dir`,
+        ADR 0005 D6.4): the worktree's agent-writable ``.git`` file is checked
+        against the registry, never followed. Nor is one
         created inside the operator's working tree (the git directory,
         which git never walks as content, excepted), where it would sit in
         their ``git status`` and the agent's tree would contain the
@@ -1253,23 +1305,21 @@ class ControllerEngine:
                 "the link or configure execution.worktree_dir elsewhere"
             )
         if path.exists():
-            found = self._worktree_identity(path)
             real = Path(os.path.realpath(path))
             if real != path:
                 # `path` is not a link, so a component above it is: the base was
                 # resolved when the path was derived and has changed since.
                 what = f"reached through a symbolic link ({real})"
-            elif found is None:
-                what = "not a git worktree"
-            elif found[1] != common:
-                what = f"part of the repository at {found[1]}"
-            elif found[0] != path:
-                what = f"inside the worktree rooted at {found[0]}, not a worktree of its own"
             elif path == ws.root():
                 what = "the checkout the controller is run from"
             elif path not in self._registered_worktree_roots():
+                # A stale directory, a worktree of another repository and a
+                # subdirectory of some tree are all absent from the registry.
                 what = "not registered in the repository's worktree list"
             else:
+                # Registered, so the registry decides which admin dir is its
+                # own; an inconsistent binding refuses naming the repair.
+                self._agent_admin_dirs[path] = bound_admin_dir(common, path)
                 return path
             raise VerificationError(
                 f"the agent worktree path {path} exists but is not a worktree of the "
@@ -1323,7 +1373,237 @@ class ControllerEngine:
                 f"{'timed out' if res.timed_out else f'exited {res.exit_code}'}"
                 f"{f' ({detail[-1]})' if detail else ''}"
             )
+        self._agent_admin_dirs[path] = bound_admin_dir(common, path)
         return path
+
+    def _agent_admin_dir(self, worktree: Path) -> Path:
+        """The admin dir the registry binds ``worktree`` to (ADR 0005 D6.4).
+
+        Found by :meth:`_ensure_agent_worktree` before the launch; derived
+        again here only for a worktree it has not seen in this engine.
+        """
+        admin = self._agent_admin_dirs.get(worktree)
+        if admin is None:
+            admin = bound_admin_dir(self.workspace().git_dirs()[-1], worktree)
+            self._agent_admin_dirs[worktree] = admin
+        return admin
+
+    def _private_objects(self) -> Path:
+        """The issue's private object directory (ADR 0005 D6.1, D8.4); it may not exist."""
+        common = self.workspace().git_dirs()[-1]
+        return common / SANDBOX_DIR / self._agent_worktree_name() / PRIVATE_OBJECTS
+
+    def _import_agent_objects(self, worktree: Path, exclude: tuple[str, ...] = ()) -> str:
+        """The strict import of the issue's private objects (ADR 0005 D6.5).
+
+        In every mode, whenever the directory holds anything; a no-op
+        otherwise. Tampering raises :class:`SandboxTamperError`; an import
+        that fails raises :class:`~autoforge.agent_worktree.ObjectImportError`.
+        Returns the ``HEAD`` it covered, "" for none.
+        """
+        private = self._private_objects()
+        if not holds_objects(private):
+            return ""
+        return import_private_objects(
+            self.workspace().git_dirs()[-1],
+            self._agent_admin_dir(worktree),
+            private,
+            self._runner,
+            exclude=tuple(sha for sha in exclude if sha),
+        )
+
+    def _import_exclusions(self) -> tuple[str, ...]:
+        """Commits the shared store holds that the agent's work descends from:
+        the recorded base, the branch head and the reviewed HEAD, so the
+        import's walk stops there (ADR 0005 D6.5)."""
+        state = self._require_state()
+        shas = [state.reviewed_head_sha]
+        for entry in (self._analyze_entry, self._replan_entry):
+            if entry is not None:
+                shas += [entry.base_sha, getattr(entry, "remote_head", None) or ""]
+        return tuple(sha for sha in shas if sha)
+
+    def _import_before_launch(self, worktree: Path) -> None:
+        """D6.5 before a launch: a failed import refuses the launch (typed)."""
+        try:
+            self._import_agent_objects(worktree, self._import_exclusions())
+        except ObjectImportError as exc:
+            raise SandboxLaunchRefusedError(
+                f"the agent was not launched: {exc}. The issue's private object directory "
+                f"{self._private_objects()} holds objects the controller cannot import; "
+                "inspect it before resuming"
+            ) from exc
+
+    def _import_after_launch(self, worktree: Path) -> str:
+        """D6.5 after a launch, before its result is checked: "" or why the import failed.
+
+        A failure is not retried: the candidate read refuses the candidate
+        with it. Tampering (:class:`SandboxTamperError`) propagates.
+        """
+        try:
+            self._import_agent_objects(worktree, self._import_exclusions())
+        except ObjectImportError as exc:
+            return str(exc)
+        return ""
+
+    # -- the outer sandbox's facts (ADR 0005 D13.2, #168) ---------------------
+    def _agent_sandbox(
+        self, phase: Phase, cwd: str, overrides: Mapping[str, str], read_context: str
+    ) -> SandboxPlan | None:
+        """The engine's facts for one agent launch; ``None`` unless ``sandbox.mode: required``.
+
+        The sandbox directories are created here, through the controller's
+        filesystem boundary, at the first enforced launch that needs them. A
+        directory that cannot be prepared refuses the launch.
+        """
+        if not self.config.sandbox.required:
+            return None
+        change = phase in WORKTREE_STATE_PHASES
+        if self.mode is WorkflowMode.LOCAL:
+            facts = self._local_facts(LaunchClass.LOCAL_AGENT, cwd, overrides, cache=change)
+        else:
+            facts = self._remote_facts(cwd, overrides, read_context, cache=change)
+        return SandboxPlan(facts)
+
+    def _command_sandbox(
+        self, launch_class: LaunchClass, cwd: str, overrides: Mapping[str, str], network: str
+    ) -> LaunchDescription | None:
+        """The description a repository-defined command runs in; ``None`` when disabled.
+
+        LOCAL validation shares the checkout's cache; an export command gets
+        none (ADR 0005 §2.5). ``network`` is the operator's opt-in (D9.2).
+        A refusal is :class:`SandboxLaunchRefusedError`, before anything runs.
+        """
+        if not self.config.sandbox.required:
+            return None
+        position = NetworkPosition(network)
+        if launch_class is LaunchClass.LOCAL_VALIDATION:
+            facts = self._local_facts(launch_class, cwd, overrides, cache=True, network=position)
+        else:
+            facts = LaunchFacts(
+                launch_class=launch_class,
+                workspace=cwd,
+                home=_operator_home(),
+                controller_env=dict(os.environ),
+                controller_config=overrides_directory(overrides),
+                denied_roots=self._denied_roots(Path(cwd)),
+                network=position,
+            )
+        env = {**select_environment(self.config.execution.environment_names()), **overrides}
+        return describe_launch(facts, None, env)
+
+    def _remote_facts(
+        self, cwd: str, overrides: Mapping[str, str], read_context: str, *, cache: bool
+    ) -> LaunchFacts:
+        """A REMOTE agent's facts: the issue worktree, its admin dir, the overlay."""
+        worktree = Path(cwd)
+        common = self.workspace().git_dirs()[-1]
+        admin = self._agent_admin_dir(worktree)
+        base = self._sandbox_dirs(
+            common,
+            f"{SANDBOX_DIR}/{self._agent_worktree_name()}",
+            (PRIVATE_OBJECTS, OVERLAY_WORK, *((CACHE,) if cache else ())),
+        )
+        return LaunchFacts(
+            launch_class=LaunchClass.REMOTE_AGENT,
+            workspace=str(worktree),
+            home=_operator_home(),
+            controller_env=dict(os.environ),
+            git_entry=str(worktree / ".git"),
+            git_dir=str(admin),
+            common_dir=str(common),
+            private_objects=str(base / PRIVATE_OBJECTS),
+            overlay_work=str(base / OVERLAY_WORK),
+            cache=str(base / CACHE) if cache else "",
+            read_context=os.path.realpath(read_context) if read_context else "",
+            controller_config=overrides_directory(overrides),
+            denied_roots=self._denied_roots(worktree),
+        )
+
+    def _local_facts(
+        self,
+        launch_class: LaunchClass,
+        cwd: str,
+        overrides: Mapping[str, str],
+        *,
+        cache: bool,
+        network: NetworkPosition = NetworkPosition.HOST,
+    ) -> LaunchFacts:
+        """A LOCAL launch's facts: the repository root and its git directories."""
+        root = Path(cwd)
+        dirs = self.workspace().git_dirs()
+        git_dir, common = str(dirs[0]), str(dirs[-1])
+        entry = str(root / ".git")
+        if os.path.realpath(entry) == git_dir:
+            # The root's `.git` is the git directory itself (not a linked worktree).
+            git_dir = entry
+        if common == str(dirs[0]):
+            common = git_dir
+        base = Path(git_dir) / SANDBOX_DIR / LOCAL_SANDBOX_KEY
+        if cache:
+            self._sandbox_dirs(Path(git_dir), f"{SANDBOX_DIR}/{LOCAL_SANDBOX_KEY}", (CACHE,))
+        return LaunchFacts(
+            launch_class=launch_class,
+            workspace=str(root),
+            home=_operator_home(),
+            controller_env=dict(os.environ),
+            git_entry=entry,
+            git_dir=git_dir,
+            common_dir=common,
+            cache=str(base / CACHE) if cache else "",
+            controller_config=overrides_directory(overrides),
+            denied_roots=self._denied_roots(root),
+            network=network,
+        )
+
+    def _denied_roots(self, workspace: Path) -> tuple[str, ...]:
+        """What no launch may see (ADR 0005 D13.2): the state directory and its run
+        logs, the lock, ``<git common dir>/autoforge``, every other registered
+        worktree, and for REMOTE the controller's checkout, for LOCAL the
+        default REMOTE state directory inside the root and the LOCAL state."""
+        ws = self.workspace()
+        dirs = ws.git_dirs()
+        roots = [
+            os.path.abspath(self.paths.state_dir),
+            os.path.abspath(self.paths.logs_dir),
+            str(self.lock_path()),
+            str(dirs[-1] / "autoforge"),
+        ]
+        if self.mode is WorkflowMode.LOCAL:
+            roots += [str(dirs[0] / "autoforge"), str(workspace / DEFAULT_STATE_DIR)]
+        else:
+            roots.append(str(ws.root()))
+        roots += sorted(str(r) for r in self._registered_worktree_roots() if r != workspace)
+        return tuple(dict.fromkeys(roots))
+
+    def _sandbox_dirs(self, anchor: Path, relbase: str, names: tuple[str, ...]) -> Path:
+        """Create ``<anchor>/<relbase>/<name>`` for each name, refusing a link anywhere
+        below ``anchor`` (ADR 0005 D8.4); AutoForge never deletes them."""
+        try:
+            with SafeRoot.open(anchor) as root:
+                for name in names:
+                    root.ensure_dir(f"{relbase}/{name}")
+        except (AutoForgeError, OSError) as exc:
+            raise SandboxLaunchRefusedError(
+                f"the sandbox cannot be established: its directory {anchor / relbase} cannot "
+                f"be prepared ({type(exc).__name__}: {exc})"
+            ) from exc
+        return anchor / relbase
+
+    def _read_candidate(self, cwd: str) -> Candidate:
+        """The worktree's ``HEAD`` as the controller reads it (ADR 0005 D6.3).
+
+        Addressed through the common dir, never through the worktree; the
+        strict import after the launch already ran (:meth:`_invoke_phase`),
+        and when it failed, there is no candidate: its reason is the
+        refusal, under the phase's existing rule for an unreadable ``HEAD``.
+        """
+        if self._import_problem:
+            return Candidate(False, "", self._import_problem)
+        worktree = Path(cwd)
+        return read_candidate(
+            self.workspace().git_dirs()[-1], self._agent_admin_dir(worktree), cwd, self._runner
+        )
 
     def _checkout_anchor(self) -> tuple[str, str]:
         """HEAD and branch of the checkout the controller is run from."""
@@ -1442,7 +1722,22 @@ class ControllerEngine:
             "credential, an HTTP header); one refuses the launch",
             f"HEAD and branch of {Path(self.workdir).resolve()} are read before and after the "
             "invocation; a change enters BLOCKED",
+            self._sandbox_plan_note(),
         ]
+
+    def _sandbox_plan_note(self) -> str:
+        """``sandbox.mode`` as a plan note: what it routes, and that nothing falls back."""
+        if not self.config.sandbox.required:
+            return (
+                "outer sandbox: disabled (sandbox.mode); agents and repository-defined "
+                "commands run as the operator, without one (ADR 0005)"
+            )
+        return (
+            "outer sandbox: required (sandbox.mode); every agent launch and every "
+            "repository-defined command runs inside it or is refused, never without it; "
+            f"validation network {self.config.sandbox.validation_network}, pre-merge network "
+            f"{self.config.sandbox.premerge_network}"
+        )
 
     def bind_local_state_dir(self, explicit: str | Path | None = None) -> None:
         """Point :attr:`paths` at where this LOCAL run keeps its runtime state.
@@ -2520,6 +2815,7 @@ class ControllerEngine:
             "the agent and the validation commands run from the run's repository root "
             f"{contract.repository_root} (frozen; never the invocation's cwd)"
         )
+        notes.append(self._sandbox_plan_note())
         return StepPlan(
             phase=s.phase.value,
             profile_name=profile.name,
@@ -2837,6 +3133,11 @@ class ControllerEngine:
         except CheckoutDriftError as exc:
             # The operator's checkout moved under the agent (the prompts
             # forbid it; this is the controller enforcing it, as LOCAL does).
+            return self._block(previous, plan, str(exc))
+        except SandboxTamperError as exc:
+            # The issue's private object directory names another object
+            # store or holds what no store does (ADR 0005 D6.5): nothing was
+            # read from it, and a human decides.
             return self._block(previous, plan, str(exc))
         except (ExecutionError, ControlResultValidationError) as exc:
             # The agent failed, timed out, could not be run or returned no
@@ -3527,6 +3828,7 @@ class ControllerEngine:
                     f"validation commands not run: {exc}; {phase.value} is not verified and "
                     f"the run stays in {phase.value}."
                 ) from exc
+            refused: SandboxLaunchRefusedError | None = None
             with isolated_overrides(identity) as overrides:
                 req = ExecutionRequest(
                     command=list(argv),
@@ -3536,7 +3838,32 @@ class ControllerEngine:
                     env=overrides,
                     contain_orphans=True,
                 )
-                result = (self._runner or execute)(req)
+                try:
+                    # The change's own code (ADR 0005 D3.1): sandboxed under
+                    # `required` like the agent that wrote it, or not run.
+                    req.sandbox = self._command_sandbox(
+                        LaunchClass.LOCAL_VALIDATION,
+                        cwd,
+                        overrides,
+                        self.config.sandbox.validation_network,
+                    )
+                    result = (self._runner or execute)(req)
+                except SandboxLaunchRefusedError as exc:
+                    refused = exc
+            if refused is not None:
+                self._log_refused_command(
+                    f"{phase.value}-validation",
+                    "(controller validation command)",
+                    list(argv),
+                    cwd,
+                    refused,
+                    {"validation_command": list(argv), "feature": state.feature_spec_path},
+                )
+                raise VerificationError(
+                    f"validation command {' '.join(redact_argv(list(argv)))!r} not run: "
+                    f"{refused}; {phase.value} is not verified and the run stays in "
+                    f"{phase.value}."
+                ) from refused
             record = ExecutionRecord(
                 run_id=state.run_id,
                 seq=0,
@@ -3564,8 +3891,11 @@ class ControllerEngine:
                     "validation_command": list(argv),
                     "feature": state.feature_spec_path,
                     "env_set": list(override_names()),
+                    "sandbox_mode": self.config.sandbox.mode,
                 },
             )
+            if result.sandbox is not None:
+                record.sandbox = result.sandbox.record()
             if result.timed_out or result.exit_code != 0:
                 record.error = _with_leftovers(
                     f"timed out after {req.timeout_seconds}s"
@@ -4094,32 +4424,14 @@ class ControllerEngine:
         """``Closes #n`` and the issue's implementation marker, as the controller writes them."""
         return implementation_closing_block(self._require_state().current_issue_url)
 
-    def _worktree_git(self, args: list[str], cwd: str, what: str) -> tuple[int, str]:
-        """One local git read in the agent's worktree: ``(exit code, stdout)``.
-
-        A timeout, a truncated capture or an exit other than 0 or 1 is
-        inconclusive (:class:`VerificationError`): the controller cannot say
-        what the worktree holds, and never guesses.
-        """
-        res = (self._runner or execute)(
-            local_git_request(["-C", cwd, *args], timeout_seconds=GIT_TIMEOUT_SECONDS)
-        )
-        if res.timed_out or res.truncated or res.exit_code not in (0, 1):
-            detail = (res.stderr or res.stdout).strip().splitlines()
-            raise VerificationError(
-                f"cannot read {what} in the agent worktree {cwd} (`git {' '.join(args)}` "
-                f"{'timed out' if res.timed_out else f'exited {res.exit_code}'}"
-                f"{f': {redact(detail[-1])[:200]}' if detail else ''}); nothing was pushed. "
-                "'resume' reads it again"
-            )
-        return res.exit_code, res.stdout.strip()
-
     def _check_analyze_result(self, payload: dict, cwd: str) -> AnalyzeExecuteResult:
         """The controller's half of the ANALYZE_EXECUTE schema: the candidate (#161).
 
         Checked before the result is accepted, so a refusal is corrected
         (the agent is asked again) before anything is pushed or created.
-        The candidate is the worktree's ``HEAD`` as the controller reads it:
+        The candidate is the worktree's ``HEAD`` as the controller reads it,
+        through the common dir after the strict import of the issue's private
+        objects (ADR 0005 D6.3, D6.5; :meth:`_read_candidate`):
         detached, equal to the reported ``head_sha``, different from the
         recorded base, descending from it and from the branch head the
         entry recorded (so the push is a fast-forward), with every commit of
@@ -4143,22 +4455,19 @@ class ControllerEngine:
         problem = published_payload_problem("PR body", self._analyze_pr_body(res.pr_body))
         if problem:
             raise ControlResultValidationError(f"ANALYZE_EXECUTE: {problem}")
-        attached, _ = self._worktree_git(
-            ["symbolic-ref", "-q", "HEAD"], cwd, "whether HEAD is detached"
-        )
-        if attached == 0:
+        candidate = self._read_candidate(cwd)
+        if candidate.attached:
             raise ControlResultValidationError(
                 "ANALYZE_EXECUTE: the worktree's HEAD is attached to a local branch; the "
                 "controller publishes a detached HEAD only. Run `git checkout --detach`, keep "
                 "your commits, and re-emit the CONTROL_RESULT"
             )
-        found, head = self._worktree_git(
-            ["rev-parse", "--verify", "-q", "HEAD^{commit}"], cwd, "the HEAD commit"
-        )
-        if found != 0 or not re.fullmatch(r"[0-9a-f]{40}", head):
+        head = candidate.head
+        if not re.fullmatch(r"[0-9a-f]{40}", head):
             raise ControlResultValidationError(
-                "ANALYZE_EXECUTE: the worktree has no HEAD commit the controller can read; "
-                "commit your work and re-emit the CONTROL_RESULT"
+                "ANALYZE_EXECUTE: the worktree has no HEAD commit the controller can read"
+                + (f" ({candidate.problem})" if candidate.problem else "")
+                + "; commit your work and re-emit the CONTROL_RESULT"
             )
         if head != res.head_sha:
             raise ControlResultValidationError(
@@ -4225,7 +4534,8 @@ class ControllerEngine:
         fails the published-content policy as a whole, and when its action
         id is one the operator declined for this round, or the round holds
         the most declines the controller records (#211).
-        The candidate is the worktree's ``HEAD`` as the controller reads it:
+        The candidate is the worktree's ``HEAD`` as the controller reads it
+        (ADR 0005 D6.3, D6.5; :meth:`_read_candidate`):
         detached, equal to ``head_sha``, and either the reviewed HEAD itself
         (nothing committed, so no finding is ``fixed``) or a descendant of
         it whose every published commit passes the commit-message policy,
@@ -4309,22 +4619,19 @@ class ControllerEngine:
                 "characters together, more than the controller journals for one FIX round; "
                 "shorten their bodies and re-emit the CONTROL_RESULT"
             )
-        attached, _ = self._worktree_git(
-            ["symbolic-ref", "-q", "HEAD"], cwd, "whether HEAD is detached"
-        )
-        if attached == 0:
+        candidate = self._read_candidate(cwd)
+        if candidate.attached:
             raise ControlResultValidationError(
                 "FIX: the worktree's HEAD is attached to a local branch; the controller "
                 "publishes a detached HEAD only. Run `git checkout --detach`, keep your "
                 "commits, and re-emit the CONTROL_RESULT"
             )
-        found, head = self._worktree_git(
-            ["rev-parse", "--verify", "-q", "HEAD^{commit}"], cwd, "the HEAD commit"
-        )
-        if found != 0 or not re.fullmatch(r"[0-9a-f]{40}", head):
+        head = candidate.head
+        if not re.fullmatch(r"[0-9a-f]{40}", head):
             raise ControlResultValidationError(
-                "FIX: the worktree has no HEAD commit the controller can read; check out "
-                f"{reviewed} (or your commits on it) and re-emit the CONTROL_RESULT"
+                "FIX: the worktree has no HEAD commit the controller can read"
+                + (f" ({candidate.problem})" if candidate.problem else "")
+                + f"; check out {reviewed} (or your commits on it) and re-emit the CONTROL_RESULT"
             )
         if head != res.head_sha:
             raise ControlResultValidationError(
@@ -5893,6 +6200,7 @@ class ControllerEngine:
                 f"pre-merge verification command not run for the reviewed HEAD "
                 f"{pr.head_sha[:12]} of PR {pr.url}: {exc}"
             )
+        refused: SandboxLaunchRefusedError | None = None
         with isolated_overrides(identity) as overrides:
             req = ExecutionRequest(
                 command=list(argv),
@@ -5902,7 +6210,27 @@ class ControllerEngine:
                 env=overrides,
                 contain_orphans=True,
             )
-            result = (self._runner or execute)(req)
+            try:
+                # The PR's own code, in the exported tree only (ADR 0005 D3.1).
+                req.sandbox = self._command_sandbox(
+                    LaunchClass.EXPORT_COMMAND, cwd, overrides, self.config.sandbox.premerge_network
+                )
+                result = (self._runner or execute)(req)
+            except SandboxLaunchRefusedError as exc:
+                refused = exc
+        if refused is not None:
+            self._log_refused_command(
+                f"{phase.value}-premerge-verification",
+                "(controller pre-merge verification command)",
+                argv,
+                cwd,
+                refused,
+                {"verification_command": list(argv), "pr_url": pr.url, "head_sha": pr.head_sha},
+            )
+            return (
+                f"pre-merge verification command {' '.join(redact_argv(list(argv)))!r} not run "
+                f"for the reviewed HEAD {pr.head_sha[:12]} of PR {pr.url}: {refused}"
+            )
         record = ExecutionRecord(
             run_id=state.run_id,
             seq=0,
@@ -5931,8 +6259,11 @@ class ControllerEngine:
                 "pr_url": pr.url,
                 "head_sha": pr.head_sha,
                 "env_set": list(override_names()),
+                "sandbox_mode": self.config.sandbox.mode,
             },
         )
+        if result.sandbox is not None:
+            record.sandbox = result.sandbox.record()
         if result.timed_out or result.exit_code != 0:
             record.error = _with_leftovers(
                 f"timed out after {req.timeout_seconds}s"
@@ -5963,6 +6294,34 @@ class ControllerEngine:
                 + f". Output tail: {tail}"
             )
         return ""
+
+    def _log_refused_command(
+        self,
+        phase: str,
+        profile: str,
+        argv: list[str],
+        cwd: str,
+        exc: SandboxLaunchRefusedError,
+        metadata: dict,
+    ) -> None:
+        """The run-log record of a repository-defined command the sandbox refused."""
+        state = self._require_state()
+        record = ExecutionRecord(
+            run_id=state.run_id,
+            seq=0,
+            phase=phase,
+            attempt=state.attempt,
+            review_round=state.review_round,
+            profile=profile,
+            prompt_version=state.prompt_version,
+            command=list(argv),
+            cwd=cwd,
+            timeout_seconds=self.config.execution.command_timeout_seconds,
+            metadata={**metadata, "sandbox_mode": self.config.sandbox.mode},
+        )
+        record.error = f"{type(exc).__name__}: {exc}"
+        record.sandbox = _refusal_facts(exc)
+        self._logger().log_execution(record, "", "", "")
 
     def _revision_drift_to_review(
         self,
@@ -8630,6 +8989,13 @@ class ControllerEngine:
                 if phase == Phase.UPDATE_EPIC
                 else UpdateEpicRequest.FULL
             )
+            if state.mode == WorkflowMode.REMOTE:
+                # ADR 0005 D6.5, in every mode: what an earlier launch left in
+                # the issue's private object directory (a crash before its
+                # import, a change of mode) is imported strictly before the
+                # agent starts again. A failure refuses the launch here, before
+                # anything is charged or saved; tampering blocks the run.
+                self._import_before_launch(Path(cwd))
             # No GitHub or git credential may reach the agent (#165): the
             # configuration its git would read, ~/.netrc and what its shells
             # run at startup are checked, and so is an integration its CLI
@@ -8643,8 +9009,10 @@ class ControllerEngine:
             # What the agent reads from GitHub, read by the controller (it
             # holds no credential to read it itself) and written before the
             # prompt that names it is rendered; nothing is saved yet.
+            read_context = ""
             if state.mode == WorkflowMode.REMOTE:
-                self._read_context_dir = self._write_read_context(phase, state.attempt + 1)
+                read_context = self._write_read_context(phase, state.attempt + 1)
+                self._read_context_dir = read_context
             # What an earlier launch left uncommitted in the worktree, read
             # for every launch of a write phase, a relaunch included (#187).
             worktree_note: str | None = None
@@ -8724,19 +9092,28 @@ class ControllerEngine:
                     "env_allowlist": list(provider.environment_allowlist(req) or ()),
                     # The controller's names, then the adapter's own (#165).
                     "env_set": [*override_names(), *provider.isolation_names],
+                    "sandbox_mode": self.config.sandbox.mode,
                 },
             )
             if worktree_note is not None:
                 record.metadata["worktree_state"] = worktree_note
             result: AgentExecutionResult | None = None
+            self._import_problem = ""
             try:
                 with isolated_overrides(identity) as overrides:
                     req.env = overrides
+                    # ADR 0005: under `sandbox.mode: required` every process
+                    # of the launch runs inside the outer sandbox, or is
+                    # refused here or at the spawn; it never runs without it.
+                    req.sandbox = self._agent_sandbox(phase, cwd, overrides, read_context)
                     result = self._launch(provider, req, limits, step_log, phase)
             except ExecutionError as exc:
                 record.error = f"{type(exc).__name__}: {exc}"
+                record.sandbox = _refusal_facts(exc)
                 self._record_invocation(logger, record, prompt, "", "", phase, step_log)
                 raise
+            if result.sandbox is not None:
+                record.sandbox = result.sandbox.record()
             record.started_at = result.started_at
             record.finished_at = result.finished_at
             record.exit_code = result.exit_code
@@ -8816,6 +9193,11 @@ class ControllerEngine:
                     + f". stderr tail: {stderr[-2000:]}"
                 )
             try:
+                if state.mode == WorkflowMode.REMOTE:
+                    # ADR 0005 D6.5: the agent's new objects are imported
+                    # strictly before its result is checked; tampering is
+                    # recorded here and blocks the run.
+                    self._import_problem = self._import_after_launch(Path(cwd))
                 # Only the tail of a truncated stdout is searched: the block
                 # is the last thing the agent writes, so the kept tail holds
                 # a whole one; a block before the cut is stale or spans it.
@@ -10868,22 +11250,19 @@ class ControllerEngine:
         )
         if problem:
             raise ControlResultValidationError(f"REPLAN_REEXECUTE: {problem}")
-        attached, _ = self._worktree_git(
-            ["symbolic-ref", "-q", "HEAD"], cwd, "whether HEAD is detached"
-        )
-        if attached == 0:
+        candidate = self._read_candidate(cwd)
+        if candidate.attached:
             raise ControlResultValidationError(
                 "REPLAN_REEXECUTE: the worktree's HEAD is attached to a local branch; the "
                 "controller publishes a detached HEAD only. Run `git checkout --detach`, keep "
                 "your commits, and re-emit the CONTROL_RESULT"
             )
-        found, head = self._worktree_git(
-            ["rev-parse", "--verify", "-q", "HEAD^{commit}"], cwd, "the HEAD commit"
-        )
-        if found != 0 or not re.fullmatch(r"[0-9a-f]{40}", head):
+        head = candidate.head
+        if not re.fullmatch(r"[0-9a-f]{40}", head):
             raise ControlResultValidationError(
-                "REPLAN_REEXECUTE: the worktree has no HEAD commit the controller can read; "
-                "commit your work and re-emit the CONTROL_RESULT"
+                "REPLAN_REEXECUTE: the worktree has no HEAD commit the controller can read"
+                + (f" ({candidate.problem})" if candidate.problem else "")
+                + "; commit your work and re-emit the CONTROL_RESULT"
             )
         if head != res.head_sha:
             self._replan_rejection = (

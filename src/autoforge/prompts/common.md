@@ -62,12 +62,19 @@ Concretely:
   an empty configuration, and git runs with credential helpers, askpass and
   SSH keys disabled. Do not try to recover other variables, and do not look
   for a credential anywhere else.
+- Your view of the file system may be narrowed to what this phase needs:
+  the operator's checkout, other worktrees, the controller's state and the
+  files of your home directory may be absent, and the repository's shared
+  git metadata (its references, configuration and existing objects) may be
+  read-only, so that `git branch`, `git tag` or `git config` fails there.
+  That is deliberate. Commit in this worktree as usual; do not try to work
+  around a missing or read-only path.
 - Nothing you start outlives your invocation: once you exit, every process
   still in your process group (a dev server, a watcher, anything started
-  with `&`) is terminated by the controller after a short grace, whether or
-  not it still holds your stdout/stderr, and the run log records that it
-  had to be. Stop what you start before you exit, and never rely on a
-  background process for a later phase.
+  with `&`) is terminated by the controller, at once or after a short
+  grace, whether or not it still holds your stdout/stderr, and the run log
+  records that it had to be. Stop what you start before you exit, and
+  never rely on a background process for a later phase.
 - Do not modify AutoForge controller state (`.autoforge/`), and do not commit it.
 - Every GitHub write of this phase (a push, a pull request, a comment, an
   issue) is the controller's, made after you exit from what you report.

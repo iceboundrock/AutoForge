@@ -691,9 +691,23 @@ def test_common_prompts_state_that_nothing_outlives_the_invocation():
     exits, so a server it meant to leave for a later phase is a mistake it
     was warned about, not a surprise in the run log."""
     for template in ("common.md", "local_common.md"):
-        text = prompts.load_template(template)
+        text = " ".join(prompts.load_template(template).split())
         assert "Nothing you start outlives your invocation" in text, template
-        assert "never rely on a\n  background process for a later phase" in text, template
+        assert "terminated by the controller, at once or after a short grace" in text, template
+        assert "never rely on a background process for a later phase" in text, template
+
+
+def test_common_prompts_warn_of_a_narrowed_view_in_every_mode():
+    """#168: under ``sandbox.mode: required`` a REMOTE agent sees its worktree and
+    the shared git metadata read-only, a LOCAL one its git directory read-only;
+    the wording holds in every mode, so the prompts need no mode variable."""
+    remote = " ".join(prompts.load_template("common.md").split())
+    assert "Your view of the file system may be narrowed" in remote
+    assert "shared git metadata" in remote and "may be read-only" in remote
+    assert "do not try to work around a missing or read-only path" in remote
+    local = " ".join(prompts.load_template("local_common.md").split())
+    assert "git directory may also be read-only to you" in local
+    assert "forbidden all the same, whether or not one fails" in local
 
 
 def test_common_prompt_states_the_worktree_and_environment_isolation():

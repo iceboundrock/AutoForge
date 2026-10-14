@@ -119,17 +119,25 @@ Each line is a summary; the linked document is the precise statement.
   (linked worktrees share it; independent clones are not coordinated). Review rounds, stagnation and a
   cumulative step budget bound every run, so it cannot loop forever.
   ([State and recovery](docs/agent-guides/state-and-recovery.md))
-- **Agents are separated from your checkout and shell, not sandboxed.** A
-  remote agent runs in a per-issue `git worktree` the controller creates,
-  with an allow-listed environment rather than the operator's whole shell,
-  and the controller blocks if its own checkout's HEAD or branch moved while
-  the agent ran. Whatever an agent leaves running is killed when its
+- **Agents are separated from your checkout and shell; sandboxing is
+  opt-in.** A remote agent runs in a per-issue `git worktree` the
+  controller creates, with an allow-listed environment rather than the
+  operator's whole shell, and the controller blocks if its own checkout's
+  HEAD or branch moved while the agent ran. Whatever an agent leaves running is killed when its
   invocation ends, and what the kill could not remove is reported rather
   than hidden
   ([ADR 0002](docs/adr/0002-executor-nothing-outlives-the-invocation.md)).
-  The agent still runs as the operator, with network access and the
-  allow-listed provider credentials.
+  By default the agent is not sandboxed: it runs as the operator, with
+  network access and the allow-listed provider credentials.
   ([Usage](docs/usage.md#how-agents-are-separated-from-your-checkout))
+  `sandbox.mode: required` (Linux, `bwrap`) runs every agent, LOCAL
+  validation command and pre-merge command inside an outer sandbox, or
+  refuses it: an empty root with only the system runtime, the workspace,
+  read-only git metadata, a private home and what the provider declares, so
+  controller state, other worktrees and your credential files are out of
+  reach. It still runs as your UID, and agents keep the host network
+  ([ADR 0005](docs/adr/0005-outer-sandbox-and-host-resource-capability-model.md),
+  [Configuration](docs/configuration.md#outer-sandbox)).
 - **Agents hold no GitHub credential.** The controller makes every GitHub
   write itself; agents, validation commands and pre-merge commands get no
   GitHub or git credential through anything AutoForge controls: no token
@@ -273,8 +281,13 @@ are compared with the values the run was pinned to before and after every
 phase, and before every correction relaunch within one, so a commit, reset,
 checkout or branch switch blocks the run before another agent starts. It detects
 nothing else. Real containment is a sandbox, which LOCAL v1 does not provide
+under the default `sandbox.mode: disabled`
 ([ADR 0001](docs/adr/0001-local-mode-workspace-identity-and-filesystem-boundary.md)
-§2.2 and §8.1; isolation is tracked in #10).
+§2.2 and §8.1; isolation is tracked in #10). With `sandbox.mode: required`
+every LOCAL agent and validation command runs inside ADR 0005's outer
+sandbox, where the git directory is read-only, so a commit, stash or branch
+switch fails outright; the agent still runs as your UID on the host
+network ([Local mode](docs/local-mode.md#what-the-controller-does-and-does-not-do)).
 
 ```bash
 uv run autoforge local doctor                    # config, git, agent CLIs; never gh

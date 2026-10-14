@@ -388,6 +388,35 @@ github:
   command: gh
   timeout_seconds: 120
 
+sandbox:
+  # The outer sandbox (ADR 0005, #168): an OS-enforced filesystem, process
+  # and IPC boundary around what AutoForge launches, on top of the logical
+  # isolation of `execution.env_allowlist` (docs/configuration.md, "Outer
+  # sandbox").
+  #   disabled -- (the default) launches run as your UID with logical
+  #               isolation only;
+  #   required -- every agent launch (Pi's auth preflight included), every
+  #               `local.validation_commands` entry and every
+  #               `merge.verification_commands` entry runs inside the sandbox
+  #               or is refused before it runs; never without it. Linux only:
+  #               `bwrap` on PATH, unprivileged user namespaces, Landlock ABI 6.
+  #               No pre-launch check exists yet, so a host that cannot
+  #               enforce refuses at the first launch. Launches see the system
+  #               runtime, a private home and /tmp, their workspace and what
+  #               their provider declares; a toolchain under your home or in
+  #               /opt is not visible. A Claude subscription login cannot be
+  #               refreshed inside: use a dedicated CLAUDE_CONFIG_DIR or a
+  #               token variable; Pi needs a PI_CODING_AGENT_DIR of its own.
+  # Whatever the mode, the controller reads an issue worktree's HEAD through
+  # the git common dir and imports the agent's objects strictly.
+  mode: disabled
+  # `isolated`: LOCAL validation commands / pre-merge verification commands
+  # run in a network namespace of their own (no host loopback service, no
+  # download). Agents always share the host network. Read only under
+  # `required`.
+  validation_network: host    # host | isolated
+  premerge_network: host      # host | isolated
+
 # ---------------------------------------------------------------------------
 # LOCAL mode (`autoforge local init|run|doctor`).
 #

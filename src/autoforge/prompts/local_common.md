@@ -68,8 +68,10 @@ controller never rolls any of it back, so someone has to clean it up by hand.
 The GitHub items (`gh`, Issues, pull requests, `git push`) and a discard that
 leaves HEAD in place (`git stash`, `git checkout -- <path>`) are policy the
 controller cannot check: none of them moves HEAD or the branch, and the
-controller does not observe your commands or your network use. They are
-forbidden all the same. Do not read "not detected" as "allowed".
+controller does not observe your commands or your network use. The
+repository's git directory may also be read-only to you, so that a git
+command writing to it fails outright. They are forbidden all the same,
+whether or not one fails. Do not read "not detected" as "allowed".
 
 Leave your work as **changes in the working tree** on the current checkout.
 New files may stay untracked; the controller sees them. The human operator
@@ -81,10 +83,10 @@ owns committing, branching and history.
 - Use `git` for read-only inspection (`git status`, `git diff`, `git log`).
 - Nothing you start outlives your invocation: once you exit, every process
   still in your process group (a dev server, a watcher, anything started
-  with `&`) is terminated by the controller after a short grace, whether or
-  not it still holds your stdout/stderr, and the run log records that it
-  had to be. Stop what you start before you exit, and never rely on a
-  background process for a later phase.
+  with `&`) is terminated by the controller, at once or after a short
+  grace, whether or not it still holds your stdout/stderr, and the run log
+  records that it had to be. Stop what you start before you exit, and
+  never rely on a background process for a later phase.
 - Do not modify AutoForge controller state (`.autoforge/`), and do not commit it.
 - Read `AGENTS.md` / `CLAUDE.md` first when they exist; their build, test,
   style and workflow rules outrank the feature specification's wording on

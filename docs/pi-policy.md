@@ -19,9 +19,10 @@ Pi has **no approval, permission or sandbox layer**. Its security guide says
 it "does not ask for approval before every tool call", and that watching the
 transcript or project trust "do not create a security boundary". AutoForge
 therefore treats a Pi profile like every other agent: untrusted, same UID,
-unconfined (ADR 0001 §2). The policy below decides what Pi may *load*, which
-tools it gets, and what it may see. It does not confine what an agent does
-with the tools it has.
+and unconfined unless `sandbox.mode: required` puts it in ADR 0005's outer
+sandbox (§7). The policy below decides what Pi may *load*, which tools it
+gets, and what it may see. It does not confine what an agent does with the
+tools it has.
 
 ## 1. Project trust: always `--no-approve`
 
@@ -174,10 +175,20 @@ declared `read, bash`.
 ## 7. Approvals and sandboxing
 
 Pi has no approval layer. A Pi profile is therefore equivalent to Claude
-Code under `--permission-mode bypassPermissions`. Run unattended Pi phases
-in a container, a VM or under a dedicated UID (ADR 0001 §2; Pi's
-`docs/containerization.md` calls a container "usually the strongest
-practical option"). This issue implements no sandbox.
+Code under `--permission-mode bypassPermissions`. Under the default
+`sandbox.mode: disabled`, run unattended Pi phases in a container, a VM or
+under a dedicated UID (ADR 0001 §2; Pi's `docs/containerization.md` calls a
+container "usually the strongest practical option"). #132 implemented no
+sandbox; `sandbox.mode: required` (#168,
+[ADR 0005](adr/0005-outer-sandbox-and-host-resource-capability-model.md))
+now runs Pi's RPC child and its per-launch auth preflight inside the outer
+sandbox, with the same declaration (§8), like every other provider: a
+model-generated command sees the system runtime, a private home and
+`/tmp`, its workspace with the repository's git metadata read-only, a
+REMOTE launch's read context and what Pi declares; the rest of the
+operator's home and files is absent. It still runs as the operator's UID
+on the host network
+([Configuration: outer sandbox](configuration.md#outer-sandbox)).
 
 ## 8. Environment and credentials
 
@@ -213,6 +224,18 @@ practical option"). This issue implements no sandbox.
   the check's four fields and never its output, and Pi is never started.
   The check is read-only and cheap, and it catches a sign-in that lapsed
   after `doctor` ran.
+- **Under `sandbox.mode: required`** (#168, ADR 0005 D7.1, D7.2), Pi
+  declares an absolute `PI_CODING_AGENT_DIR` as a directory writable at its
+  own path, since Pi rewrites `auth.json` and `models-store.json` there by
+  rename at startup, which a single-file bind refuses; `OPENAI_API_KEY` is
+  a variable, when it passes at all. A `PI_CODING_AGENT_DIR` that is,
+  contains or lies inside `~/.pi/agent` is refused, because a sandboxed
+  agent could then plant what the operator's next unsandboxed `pi` loads.
+  Without one, the private home holds no sign-in, and with `require_oauth`
+  the auth preflight, run in the same sandbox, refuses every launch. So
+  give AutoForge a directory of its own: set `PI_CODING_AGENT_DIR` to its
+  absolute path in the shell that runs `autoforge`, and run `pi` and
+  `/login openai` there once with it set.
 
 **Credential exposure that remains.** Pi, its tools and everything they
 run share the operator's UID. A model-generated command can read
@@ -230,6 +253,13 @@ prepended to `PATH` and `AI_AGENT=pi` and `PI_CODING_AGENT=true` added. When
 the bash tool is set to expose the session, it also gets `PI_SESSION_ID`,
 `PI_PROVIDER`, `PI_MODEL` and `PI_REASONING_LEVEL`. Pi writes `auth.json` and `models-store.json`
 into the agent directory at startup.
+
+Under `sandbox.mode: required` the operator's own files are out of reach,
+but `$PI_CODING_AGENT_DIR/auth.json` stays readable by every command Pi runs
+(ADR 0005 D7.4), and the directory stays writable by every Pi launch that
+projects it, across issues and roles: a launch can leave there what a later
+one loads (`SYSTEM.md`, `APPEND_SYSTEM.md`, the agent directory's context
+file, §4-5), which `doctor`'s §5 row reports.
 
 **Evidence.** `docs/environment-variables.md`, `utils/shell.js:115-126`,
 `core/tools/bash.js:135-157`, `rpc-entry.js:6-7`,
@@ -299,6 +329,8 @@ Pi use on such platforms. The prompt rule in `common.md` /
 - **Context files** from the main checkout and from directories above it
   load by default (§4).
 - **Same UID.** Everything in §8 under "Credential exposure that remains".
+  `sandbox.mode: required` narrows it to the sign-in in the agent
+  directory (§7, §8).
 
 ## Tests
 
