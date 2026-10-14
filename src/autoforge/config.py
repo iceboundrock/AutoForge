@@ -611,6 +611,42 @@ class LocalConfig:
         return self.max_fix_rounds + 1
 
 
+SANDBOX_DISABLED = "disabled"
+SANDBOX_REQUIRED = "required"
+# `preferred` and the pre-launch gate are #169's (ADR 0005 D12.2).
+SANDBOX_MODES = (SANDBOX_DISABLED, SANDBOX_REQUIRED)
+SANDBOX_NETWORKS = ("host", "isolated")
+SANDBOX_KEYS = ("mode", "validation_network", "premerge_network")
+
+
+@dataclass
+class SandboxConfig:
+    """The outer sandbox (``sandbox:`` in the config file; ADR 0005 D12.1, D9.2).
+
+    ``mode`` is ``disabled`` (the default: logical isolation only, #165) or
+    ``required``: every agent launch, LOCAL validation command and pre-merge
+    verification command runs inside the outer sandbox, or is refused; it
+    never runs without it. Not part of LOCAL's run contract (D12.3): it
+    decides how a launch is contained, not what the run is, so a run
+    resumes under another mode. The candidate read and the strict import of
+    an issue's private objects (D6.3-D6.5) apply in both modes.
+
+    ``validation_network`` and ``premerge_network`` are ``host`` (the
+    default) or ``isolated``: a LOCAL validation command, or a pre-merge
+    verification command, then runs with no network at all (no loopback, no
+    abstract socket, no download). Agents always share the host network.
+    Read only under ``required``.
+    """
+
+    mode: str = SANDBOX_DISABLED
+    validation_network: str = "host"
+    premerge_network: str = "host"
+
+    @property
+    def required(self) -> bool:
+        return self.mode == SANDBOX_REQUIRED
+
+
 # The keys a config file may contain at top level: the scalars read directly
 # below plus one entry per section. There is no `repository` key: the
 # repository comes from the issue URLs on the command line.
@@ -625,6 +661,7 @@ TOP_LEVEL_KEYS = (
     "review",
     "workflow",
     "local",
+    "sandbox",
     "profiles",
 )
 
@@ -666,6 +703,7 @@ class AutoForgeConfig:
     review: ReviewConfig = field(default_factory=ReviewConfig)
     workflow: WorkflowConfig = field(default_factory=WorkflowConfig)
     local: LocalConfig = field(default_factory=LocalConfig)
+    sandbox: SandboxConfig = field(default_factory=SandboxConfig)
     profiles: dict[str, ProfileConfig] = field(default_factory=dict)
 
     def profile(self, name: str) -> ProfileConfig:
@@ -1270,6 +1308,19 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
                     f"{source}: 'local.{name}' must be >= {minimum}, got {value}"
                 )
             setattr(base.local, attr, value)
+    sandbox = _section(data, "sandbox", source, SANDBOX_KEYS)
+    for key, allowed in (
+        ("mode", SANDBOX_MODES),
+        ("validation_network", SANDBOX_NETWORKS),
+        ("premerge_network", SANDBOX_NETWORKS),
+    ):
+        if key in sandbox:
+            value = sandbox[key]
+            if not isinstance(value, str) or value not in allowed:
+                raise ConfigurationError(
+                    f"{source}: 'sandbox.{key}' must be one of {', '.join(allowed)}, got {value!r}"
+                )
+            setattr(base.sandbox, key, value)
     # Keyed by profile *name*, so the closed key set applies to each profile
     # mapping rather than to the section.
     profiles = _section(data, "profiles", source, known=None)

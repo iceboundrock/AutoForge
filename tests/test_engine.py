@@ -10791,7 +10791,9 @@ def test_worktree_creation_runs_no_repository_hook_and_holds_no_credential(
     run = [r.command[1 + len(LOCAL_GIT_SWITCHES) :] for r in requests if r.command[0] == "git"]
     assert ["worktree", "add", "--detach", str(expected), "HEAD"] in run
     assert ["worktree", "list", "--porcelain"] in run
-    assert ["-C", str(expected), "rev-parse", "--show-toplevel", "--git-common-dir"] in run
+    # ADR 0005 D6.4: the reuse is bound through the registry, never by asking
+    # git inside the worktree (which follows its agent-writable `.git` file).
+    assert not any(cmd[:2] == ["-C", str(expected)] for cmd in run)
     network = []
     for req in requests:
         if req.command[0] != "git":
@@ -10861,7 +10863,7 @@ def test_a_path_that_is_not_a_worktree_of_this_repository_is_refused_not_adopted
     (stale / "leftover.txt").unlink()
     stale.rmdir()
     _git(other, "worktree", "add", "-q", "--detach", str(stale), "HEAD")
-    with pytest.raises(VerificationError, match="part of the repository at"):
+    with pytest.raises(VerificationError, match="not registered in the repository"):
         eng.step()
     assert eng.provider.calls == []
 
@@ -10878,7 +10880,7 @@ def test_a_subdirectory_of_an_existing_tree_is_not_adopted_as_a_worktree(
     (repo / "agents" / "2").mkdir(parents=True)
     eng = make_engine(tmp_state_dir, [], github=fake_github, cfg=cfg, origin=True)
     eng.step()
-    with pytest.raises(VerificationError, match="inside the worktree rooted at"):
+    with pytest.raises(VerificationError, match="not registered in the repository"):
         eng.step()
     (repo / "agents" / "2").rmdir()
     with pytest.raises(VerificationError, match="inside the checkout's working tree"):

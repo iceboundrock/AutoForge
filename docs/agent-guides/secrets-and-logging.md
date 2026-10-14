@@ -64,6 +64,43 @@ What #165 adds reports names, never values:
   before its bounds were applied, and an unreadable item names only the
   error's type, never the `gh` output.
 
+## The outer sandbox and credentials (ADR 0005 D7.4)
+
+Under `sandbox.mode: required` (#168) a launch starts from an empty root
+and a private, empty home, so the only credential material it can see is
+what its provider adapter declares (D7.1;
+[Configuration](../configuration.md#provider-credentials-under-required)):
+
+- variables the allow-list passes anyway (`ANTHROPIC_API_KEY`,
+  `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, an OpenCode
+  `*_API_KEY`, Pi's `OPENAI_API_KEY` when `require_oauth: false` and
+  `execution.env_allowlist_extra` forwards it);
+- one login file, read-only at that path, wherever it resolves: Claude
+  Code's `~/.claude/.credentials.json` when no `CLAUDE_CONFIG_DIR` is set;
+- one dedicated directory, writable where it resolves, the variable naming
+  it there: `CLAUDE_CONFIG_DIR`, the directory of an absolute
+  `OPENCODE_DB`, `PI_CODING_AGENT_DIR`.
+
+Every tool in the same sandbox (the agent's shell commands, the test suite
+it runs) can read that credential, and that exposure is accepted: it is a
+model credential, never a GitHub mutation credential, and the sandbox
+exists to keep everything else out of reach. A repository-defined command
+gets no declared item, only the variables the allow-list passes. A
+writable credential directory persists across launches and is shared by
+every launch that projects it, issues and roles alike, so it is dedicated
+to AutoForge and never the provider's own configuration root (D7.2).
+
+AutoForge never reads, copies or logs a credential's contents: the policy
+compiler looks at a declared path with `lstat` and `realpath` only, and a
+refusal names the path and the rule, redacted (`policy_refusal`). The
+environment rewrite (D8.2) unsets a known path-valued variable whose value
+names nothing visible inside, trims `PATH`, and spells a kept value where
+it is inside (computed from the description and the paths' links, never
+from a file's contents); the launch's facts list the
+unset variables by name (`unset_env` in `execution.json`'s `sandbox`),
+never a value, and `request.json` adds only the configured mode
+(`sandbox_mode`).
+
 ## What is redacted before it is persisted
 
 `state.json` is stored in the clear, so the engine redacts at the writer,
@@ -191,7 +228,8 @@ neither it, the raw strings nor the digests reach any line or file the run
 writes.
 
 A sandboxed launch's facts (`sandbox` in `execution.json` and
-`events.jsonl`, #167, ADR 0005 D10.4) carry names, paths, sizes, the backend
+`events.jsonl`, #167, ADR 0005 D10.4; since #168 also for a launch the
+policy refused) carry names, paths, sizes, the backend
 version and, for a setup failure, the last lines of `bwrap`'s own message,
 redacted and bounded. They never carry an environment value. The
 environment the sandboxed command gets is handed to `bwrap` through a

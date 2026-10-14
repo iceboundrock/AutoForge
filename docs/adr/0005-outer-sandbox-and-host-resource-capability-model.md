@@ -2,8 +2,11 @@
 
 - **Status:** accepted. This is a design record. #167's part is implemented
   (`src/autoforge/sandbox.py`, `src/autoforge/sandbox_bwrap.py`, the
-  optional description on both executor requests, ADR 0002 §4e); no launch
-  site uses it until #168. It is implemented by #167 (the launch
+  optional description on both executor requests, ADR 0002 §4e), and so
+  is #168's (`src/autoforge/sandbox_policy.py`,
+  `src/autoforge/agent_worktree.py`, each adapter's
+  `sandbox_requirements`, the engine's routing and the `sandbox:` config
+  section); #169's is not yet. It is implemented by #167 (the launch
   description, the policy compiler and the Linux `bwrap` backend in the
   executor layer), #168
   (provider declarations, engine facts, the routing of every launch, the git

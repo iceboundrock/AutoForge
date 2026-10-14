@@ -40,6 +40,15 @@ sandbox.py          outer sandbox: the backend-neutral launch description, the p
 sandbox_bwrap.py    the Linux backend: the only place that knows a `bwrap` flag; the
                     launch's keyring and Landlock scope, setup-failure detection, the
                     capability probe (#167)
+sandbox_policy.py   which host resources a launch gets by launch class (ADR 0005 §2.5):
+                    LaunchFacts from the engine, ProviderRequirements from an adapter,
+                    the SandboxPlan, the path-valued environment rewrite (D8.2),
+                    executable and install-root resolution; no provider branch, no
+                    workflow decision, launches nothing (#168)
+agent_worktree.py   the agent worktree's git surface in every sandbox.mode: registry
+                    binding (D6.4), candidate read through the common dir (D6.3),
+                    strict import of private objects (D6.5); git only through the
+                    executor's hardened local request (#168)
 github.py           GitHubClient over `gh`, the only holder of a GitHub credential:
                     verification reads, the reads behind an agent's read context, typed
                     controller writes (never retried on an ambiguous outcome) +
@@ -84,7 +93,12 @@ prompts/            file-based templates ({{VAR}}): common.md (trust boundary), 
   plus the protocol modules it owns, `pi_rpc.py` and `claude_stream.py`);
   no workflow semantics or JSON in `executor.py` or `executor_duplex.py`,
   and none in `sandbox.py` or `sandbox_bwrap.py` either; no `bwrap` flag
-  outside `sandbox_bwrap.py`;
+  outside `sandbox_bwrap.py`; no provider branch or process in
+  `sandbox_policy.py` (an adapter declares `sandbox_requirements` as data
+  and never emits a mount, and `sandboxed()` is the one place an
+  adapter's launch is described); a REMOTE agent's candidate (what the controller verifies,
+  pushes or publishes) is read only through `agent_worktree.py`, never
+  through the worktree's agent-writable `.git` file;
   no raw `gh --json` dictionaries crossing out of `github.py`; no large
   prompt text in Python string literals.
 - The outcome of a GitHub write is read back from GitHub, never inferred
@@ -129,6 +143,15 @@ sandbox.py, sandbox_bwrap.py                      -> docs/agent-guides/architect
                                                      (Executor) + docs/adr/0005-outer-
                                                      sandbox-and-host-resource-capability-
                                                      model.md and ADR 0002 §4e
+sandbox_policy.py, providers.py
+(sandbox_requirements), engine.py (launch
+routing, sandbox directories)                     -> docs/agent-guides/architecture.md
+                                                     (Launch routing) + ADR 0005 and
+                                                     docs/configuration.md (Outer sandbox)
+agent_worktree.py, engine.py (strict import,
+candidate read)                                   -> docs/agent-guides/github-safety.md
+                                                     and state-and-recovery.md + ADR 0005
+                                                     D6
 result_parser.py, prompts/*.md                    -> docs/agent-guides/control-result-protocol.md
 redaction.py, runlog.py, doctor.py (env rows),
 error messages                                    -> docs/agent-guides/secrets-and-logging.md

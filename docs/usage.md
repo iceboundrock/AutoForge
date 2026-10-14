@@ -444,6 +444,14 @@ redacted. What it reads depends on the command:
   first time an agent is launched for the issue and reused by every later
   phase of that issue. AutoForge never deletes it: remove it with
   `git worktree remove` once the issue is done.
+- **Sandbox directories** (`sandbox.mode: required` only):
+  `<repo>/.git/autoforge/sandbox/<issue-number>/` holds the issue's private
+  object directory (`objects/`, where an agent's commits land until the
+  controller imports them), the overlay's work directory and the cache its
+  `ANALYZE_EXECUTE`, `FIX` and `REPLAN_REEXECUTE` launches share. They are
+  created at the issue's first enforced launch and never deleted: remove
+  them with the worktree
+  ([State and recovery: runtime artifacts](agent-guides/state-and-recovery.md#runtime-artifacts)).
 
 ### How agents are separated from your checkout
 
@@ -461,9 +469,17 @@ the invocation's `request.json`, with the names the controller sets
 (`env_set`). Before and after each invocation, including before every
 relaunch within a step, the controller reads HEAD and the checked-out branch
 of its own checkout; a change enters `BLOCKED` with the drift in the reason,
-nothing is rolled back, and `unblock` reconciles the agent's GitHub work. This is process and filesystem-level
+nothing is rolled back, and `unblock` reconciles the agent's GitHub work. Under
+the default `sandbox.mode: disabled` this is process and filesystem-level
 separation, not a sandbox: the agent still runs as the operator with network
-access.
+access. `sandbox.mode: required` adds ADR 0005's outer sandbox to every
+launch: the agent sees the system runtime, a private home and `/tmp`, its
+worktree, the repository's git metadata read-only, its read context and
+what its provider declares; your checkout, the state directory, the lock,
+other worktrees and the rest of your home are absent. It still runs as your
+UID on the host network, and a host that cannot enforce refuses the launch
+rather than running it without the sandbox
+([Configuration: outer sandbox](configuration.md#outer-sandbox)).
 
 The agent holds no GitHub or git credential (#165). The controller pushes,
 opens the PR, posts the review comment, creates follow-up issues and
@@ -486,7 +502,8 @@ the same command again.
 `autoforge doctor` runs the same check. What this does not stop (a
 deliberate read of `~/.config/gh/hosts.yml` by absolute path, for one) is
 in [GitHub safety](agent-guides/github-safety.md#threat-model); ADR 0005's
-outer sandbox is the answer to it.
+outer sandbox, `sandbox.mode: required`, closes it for every enforced launch
+([GitHub safety: outer sandbox threat model](agent-guides/github-safety.md#outer-sandbox-threat-model-adr-0005)).
 
 AutoForge never commits to the default branch, never deletes a worktree it
 created, and never creates or cleans up local branches or any other
@@ -586,6 +603,38 @@ ownership or discard uncommitted user changes.
   OpenCode launches a database of their own (`OPENCODE_DB`, see
   [Configuration: agent environment](configuration.md#agent-environment))
   and run the same command again.
+- **"the sandbox cannot be established ..."** (`SandboxLaunchRefusedError`,
+  `sandbox.mode: required`): the launch did not run, and nothing ran
+  without the sandbox. The message names the cause: a host that cannot
+  enforce (not Linux, no `bwrap`, user namespaces refused, a kernel without
+  Landlock ABI 6), a sandbox directory that is a link, or a path and the
+  policy rule it breaks ("sandbox policy refuses <path>: <rule>"), such as
+  a `CLAUDE_CONFIG_DIR`, `OPENCODE_DB` directory or `PI_CODING_AGENT_DIR`
+  inside the provider's own configuration directory
+  ([Configuration: provider credentials](configuration.md#provider-credentials-under-required)).
+  For an agent the phase is unchanged: fix the cause, or set
+  `sandbox.mode: disabled`, and `resume`. A refused validation command
+  leaves the phase unverified; a refused pre-merge command blocks the merge
+  like a failing one. "the agent was not launched: the strict import ...
+  failed" is the same refusal, in either mode, for objects an earlier
+  enforced launch left in the issue's private object directory that the
+  controller cannot import; inspect the directory before resuming.
+- **"the agent worktree ... is not bound to the repository":** the
+  worktree's `.git` file and the repository's worktree registry disagree
+  (the worktree or the repository was moved, or something rewrote the
+  pointer). The controller reads a worktree only through the registry entry
+  that names it, so nothing was launched. Run `git worktree repair` in the
+  repository (or `git worktree repair <worktree>`), then `resume`.
+- **`BLOCKED`: "the private object directory ... has been tampered with":**
+  an `info/alternates` file, a link or another entry no object store holds
+  appeared in `<repo>/.git/autoforge/sandbox/<n>/objects`, or that
+  directory, or one above it up to `<repo>/.git`, is not a real directory
+  (a link, say) or cannot be checked. Nothing was read
+  from it and nothing was published. Inspect it, remove what does not
+  belong there, then `unblock` and `resume`. To look at an agent's commits
+  while they are still only in that directory, read them through it
+  without writing anything:
+  `GIT_ALTERNATE_OBJECT_DIRECTORIES=<repo>/.git/autoforge/sandbox/<n>/objects git -C <worktree> log`.
 - **Merge verification keeps saying "inconclusive":** checks still running,
   mergeability unknown or a transient GitHub failure; re-run
   `autoforge resume --allow-merge`. After `merge.max_verification_attempts`

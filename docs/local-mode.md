@@ -45,8 +45,25 @@ block reason ends with the repository to inspect and the `local run` command
 that starts the next run of the same feature, with the `--config` /
 `--state-dir` this one was started with. It detects
 nothing else. Real containment is a sandbox, which LOCAL v1 does not provide
+under the default `sandbox.mode: disabled`
 ([ADR 0001](adr/0001-local-mode-workspace-identity-and-filesystem-boundary.md)
 §2.2 and §8.1; isolation is tracked in #10).
+
+`sandbox.mode: required` (#168,
+[ADR 0005](adr/0005-outer-sandbox-and-host-resource-capability-model.md))
+runs every LOCAL agent and validation command inside an outer sandbox, or
+refuses it: the repository root is writable and its git directory
+read-only, so a commit, stash or branch switch fails outright instead of
+being detected afterwards, and the LOCAL state, the lock, other worktrees
+and the rest of your home are absent. The agent still runs as your UID on
+the host network, so a network request is still neither prevented nor
+detected ([Configuration: outer sandbox](configuration.md#outer-sandbox)).
+A LOCAL launch also masks the REMOTE default state directory
+`<root>/.autoforge`, but it cannot know a REMOTE state directory configured
+elsewhere inside the root (ADR 0005 D13.2): if you run REMOTE runs from the
+same checkout, keep their state directory at its default or outside the
+repository root. The mode is not part of the run contract, so a run may be
+resumed under the other one.
 
 **No commit is ever required and HEAD never has to move.** The implementation
 and its fixes live in the working tree; AutoForge never commits, stages,
@@ -287,7 +304,13 @@ would refuse. They run under the same allow-listed environment as an agent
 variables the controller sets and the same preflight: a command gets no
 GitHub or git credential, and a refused preflight (a credential helper in
 the repository's git configuration, say) leaves the phase unverified like a
-failing command.
+failing command. Under `sandbox.mode: required` they run inside the outer
+sandbox like the agent whose tree they check, sharing the checkout's
+persistent cache at `~/.cache`, on the host network unless
+`sandbox.validation_network: isolated`. What they run must then be
+visible inside, under `/usr` or in the repository (a tool installed
+elsewhere under your home or in `/opt` is not), and a command the sandbox
+refuses is not run and leaves the phase unverified too.
 
 ## Dry run
 

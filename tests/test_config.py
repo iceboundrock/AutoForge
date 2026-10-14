@@ -187,6 +187,53 @@ def test_acceptance_actions_rejects_anything_else(tmp_path, value):
         load_config_file(p)
 
 
+# -- #168: the outer sandbox --------------------------------------------------
+def test_the_sandbox_is_disabled_by_default(tmp_path):
+    cfg = default_config().sandbox
+    assert (cfg.mode, cfg.validation_network, cfg.premerge_network) == ("disabled", "host", "host")
+    assert not cfg.required
+
+
+@pytest.mark.parametrize(
+    ("name", "text"),
+    [
+        (
+            "cfg.json",
+            '{"version": 1, "sandbox": {"mode": "required", "validation_network": "isolated",'
+            ' "premerge_network": "isolated"}}',
+        ),
+        (
+            "cfg.yaml",
+            "version: 1\nsandbox:\n  mode: required\n  validation_network: isolated\n"
+            "  premerge_network: isolated\n",
+        ),
+    ],
+)
+def test_the_sandbox_section_is_read(tmp_path, name, text):
+    p = tmp_path / name
+    p.write_text(text, encoding="utf-8")
+    cfg = load_config_file(p).sandbox
+    assert cfg.required
+    assert (cfg.validation_network, cfg.premerge_network) == ("isolated", "isolated")
+
+
+@pytest.mark.parametrize(
+    ("body", "error"),
+    [
+        ('{"mode": "preferred"}', "'sandbox.mode' must be one of disabled, required"),
+        ('{"mode": true}', "'sandbox.mode' must be one of"),
+        ('{"validation_network": "none"}', "'sandbox.validation_network' must be one of"),
+        ('{"premerge_network": null}', "'sandbox.premerge_network' must be one of"),
+        ('{"network": "host"}', "network"),
+    ],
+)
+def test_the_sandbox_section_rejects_anything_else(tmp_path, body, error):
+    p = tmp_path / "cfg.json"
+    p.write_text(f'{{"version": 1, "sandbox": {body}}}', encoding="utf-8")
+    with pytest.raises(ConfigurationError, match=error):
+        load_config_file(p)
+
+
 def test_safety_gate_opens_from_safety_allow_merge_only(tmp_path):
     p = tmp_path / "cfg.json"
     p.write_text('{"version": 1, "safety": {"allow_merge": true}}', encoding="utf-8")

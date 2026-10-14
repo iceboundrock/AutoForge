@@ -408,7 +408,8 @@ requirement named (#120). Same layout either way:
             request.json                   # profile, model, effort, command, limits (idle timeout,
                                            # max runtime; the wall-clock timeout of a command),
                                            # an agent's loop detection settings, the names of the
-                                           # variables the controller set (env_set, #165)
+                                           # variables the controller set (env_set, #165), the
+                                           # configured sandbox.mode (sandbox_mode, #168)
             prompt.md                      # rendered prompt (redacted)
             execution.json                 # exit code, timing, timed_out, the limit that fired
                                            # (idle / max_runtime / loop), configured limits, last
@@ -416,7 +417,9 @@ requirement named (#120). Same layout either way:
                                            # also ended_by (exit / idle / max_runtime / loop), loop
                                            # detection settings, loop warnings and the loop report
                                            # (names, counts and times only), provider_summary with
-                                           # the loop_* calibration fields
+                                           # the loop_* calibration fields; the outer sandbox's
+                                           # facts (sandbox) for a launch that carried one, a
+                                           # refused one included (enforced: false, the reason)
             stdout.log / stderr.log        # redacted; head + marker + tail past the capture bound
             control-result.json            # parsed CONTROL_RESULT (when valid)
     read-context/<run-id>/                 # REMOTE only (#165)
@@ -449,7 +452,65 @@ worktree would otherwise answer git as that tree), a directory is
 reused only when `git worktree list` registers it as a worktree root, and a
 path reached through a symbolic link above it (`.git/autoforge/worktrees`
 linked into the working tree, say) is refused before anything is created,
-so a worktree only ever appears at the literal derived path.
+so a worktree only ever appears at the literal derived path. Reuse also
+requires the registry to bind the worktree to its admin dir, in every
+`sandbox.mode` (ADR 0005 D6.4): exactly one `<common>/worktrees/<id>/gitdir`
+names `<worktree>/.git`, and the worktree's `.git` is a regular file naming
+that entry. A worktree or repository moved by hand breaks the binding for
+git too; the step then refuses with a `VerificationError` naming the
+inconsistency and `git worktree repair` (run from the repository, or
+`git worktree repair <worktree>`) before anything is launched, so repair
+it and `resume`. An agent that rewrites its own `.git` can only make
+this check refuse, never make it name another worktree. A worktree created
+before #168, possibly by unsandboxed agents, is reused once it binds
+(D15.2).
+
+Under `sandbox.mode: required` the controller keeps the outer sandbox's
+directories beside them (ADR 0005 D8.4):
+
+```text
+<git common dir>/autoforge/sandbox/<key>/     # REMOTE; <key> is the worktree's name (<n>, epic-<n>)
+    objects/          # the issue's private object directory: the upper layer of the agent's
+                      # overlay over <common>/objects, where the objects it writes land
+    overlay-work/     # the overlay's work directory; never read
+    cache/            # ~/.cache of ANALYZE_EXECUTE, FIX and REPLAN_REEXECUTE launches
+<git dir>/autoforge/sandbox/local/
+    cache/            # ~/.cache of LOCAL launches that produce a change, and of validation
+```
+
+They are created through `SafeRoot` at the first enforced launch that needs
+them (a link anywhere in their path refuses that launch), lie there
+whatever `execution.worktree_dir` says, and are never deleted, moved or
+pruned by AutoForge: remove an issue's with its worktree. Nothing in
+`state.json` names them; they are derived from the git directory and the
+worktree name (D17.1), so a run resumes under either mode with no
+migration (D15.3).
+
+What an agent commits under enforcement stays in `objects/` until the
+controller imports it strictly into the shared store (D6.5), which it does
+in every mode before every REMOTE launch and after every launch that
+exited cleanly, so a crash between a launch and its import, or a switch
+back to `disabled`, leaves no commit unreadable. Until then the operator's
+own `git -C <worktree> log` cannot read those commits; inspect them
+read-only with
+`GIT_ALTERNATE_OBJECT_DIRECTORIES=<git common dir>/autoforge/sandbox/<n>/objects git -C <worktree> log`,
+and never add the directory to the shared store's `objects/info/alternates`.
+The import walks the directory first without following a link: a
+directory that is not a real one reached from the common dir through real
+directories (a link, another file type, one that cannot be checked, never
+taken for an empty store), an `info/alternates` or `info/http-alternates`
+file, or an entry that is neither a directory, a regular file nor an
+overlay whiteout, is tampering (`SandboxTamperError`), and the step enters `BLOCKED` naming the entry,
+with nothing read from the directory and nothing published. The import
+reads the commit `HEAD` holds itself, after `lstat` found a regular file
+there: a `HEAD` the agent replaced with a link fails the import before any
+git process runs, nothing is packed or imported, and the candidate is
+refused with it. Inspect it,
+remove what does not belong there, then `unblock`. An import that fails
+otherwise (a corrupt object, say) is never retried and publishes nothing:
+before a launch it refuses the launch (`SandboxLaunchRefusedError`, before
+anything is saved), after one it refuses the candidate, which the agent is
+asked to correct.
 
 ---
 
@@ -499,6 +560,20 @@ Do not blindly retry semantic or safety failures such as:
 - controller invariant violation
 
 Those should become a clear failure or `BLOCKED` state.
+
+The outer sandbox (ADR 0005, #168) adds two. `SandboxLaunchRefusedError` is
+an `ExecutionError`: under `sandbox.mode: required` a launch the sandbox
+could not be established for (a policy refusal naming the path and the
+rule, a sandbox directory that cannot be prepared, a backend setup failure,
+a host that cannot enforce) never ran, is never retried without the
+sandbox and is never attributed to the agent. For an agent the phase is
+unchanged and `resume` tries again; until #169's pre-launch gate exists the
+attempt counter (and a LOCAL write phase's launch charge) is already saved
+by then, as for an executable that cannot be spawned. A refused LOCAL
+validation command leaves the phase unverified; a refused pre-merge
+verification command blocks the merge gate (`BLOCKED`). `SandboxTamperError`
+is a `VerificationError` for a private object directory that holds what no
+object store does (above); the step enters `BLOCKED`.
 
 ---
 

@@ -579,9 +579,11 @@ def test_replan_result_schema_requires_a_complete_verification_object(verificati
 # =============================================================================
 
 
-def test_hard_threshold_replaces_pr_and_starts_fresh_review(tmp_state_dir):
+@pytest.mark.parametrize("sandbox_mode", ["disabled", "required"])
+def test_hard_threshold_replaces_pr_and_starts_fresh_review(tmp_state_dir, sandbox_mode):
     gh = FakeGitHub()
     eng = _park_at_hard_threshold(tmp_state_dir, gh, _replan_agent(gh))
+    eng.config.sandbox.mode = sandbox_mode
     assert eng.step().next_phase == "REPLAN_REEXECUTE"
     assert _txn(eng).stage is ReplanStage.PENDING
     assert _txn(eng).transaction_id == ""  # the id is created by the replan step
@@ -628,6 +630,10 @@ def test_hard_threshold_replaces_pr_and_starts_fresh_review(tmp_state_dir):
     assert superseded["replacement_pr_url"] == REPLACEMENT_PR
     assert eng.provider.calls[-1].profile.name == "replan_reexecute"
     assert eng.provider.calls[-1].profile.model == "openai/gpt-5.6-terra"
+    # #168: the replan agent ran with the engine's facts exactly when required.
+    assert (eng.provider.calls[-1].sandbox is not None) is (sandbox_mode == "required")
+    sandboxed = [req for req in eng.provider.calls if req.sandbox is not None]
+    assert len(eng.provider.descriptions) == len(sandboxed)
 
 
 def test_default_stagnation_routes_to_replan_through_engine(tmp_state_dir):

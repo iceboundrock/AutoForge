@@ -177,6 +177,7 @@ calibration figures join ``provider_summary`` in every mode.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import pwd
@@ -224,6 +225,14 @@ from .loop_detect import LIMIT_LOOP, LoopMonitor, LoopReport
 from .pi_rpc import PiConversation, encodable
 from .progress import ProgressEvent, ProgressKind, ProgressSink, guarded
 from .redaction import redact
+from .sandbox import LaunchDescription, SandboxFacts
+from .sandbox_policy import (
+    AuthItem,
+    AuthMode,
+    ProviderRequirements,
+    SandboxPlan,
+    executable_requirements,
+)
 
 Runner = Callable[[ExecutionRequest], ExecutionResult]
 
@@ -265,6 +274,11 @@ class AgentRequest:
     # passes ``execution.loop_detection``, and the request keeps it with the
     # mode its own provider and phase run under (#199).
     loop_detection: LoopDetectionConfig = field(default_factory=LoopDetectionConfig)
+    # The outer sandbox every process of the launch runs in (ADR 0005, #168):
+    # the engine's facts, to which the adapter adds its CLI's declaration
+    # (:meth:`AgentProvider.sandbox_requirements`). ``None`` launches as
+    # before the sandbox existed (``sandbox.mode: disabled``).
+    sandbox: SandboxPlan | None = None
 
     def __post_init__(self) -> None:
         self.loop_detection = self.loop_detection.for_invocation(self.profile.provider, self.phase)
@@ -322,6 +336,9 @@ class AgentExecutionResult:
     # What the loop detector found (#194): the finding it killed for, or the
     # strongest it warned about; ``None`` when neither. Names and counts only.
     loop: LoopReport | None = None
+    # What the outer sandbox recorded for a sandboxed launch (ADR 0005
+    # D10.4), for the run log; ``None`` without one. Never read for a decision.
+    sandbox: SandboxFacts | None = None
 
     @property
     def stdout_tail(self) -> str:
@@ -388,6 +405,7 @@ class AgentExecutionResult:
             effort=profile.effort,
             timeout_limit=res.timeout_limit,
             last_activity_at=res.last_activity_at,
+            sandbox=res.sandbox,
         )
 
 
@@ -479,6 +497,9 @@ class AgentProvider:
     # The variables :meth:`integration_isolation` sets for this CLI, names
     # only (the run log records them; the values vary by launch).
     isolation_names: tuple[str, ...] = ()
+    # The variables this CLI reads that name a path (ADR 0005 D8.2): a
+    # sandboxed launch keeps one only when what it names is visible inside.
+    path_names: tuple[str, ...] = ()
 
     def __init__(self, runner: Runner | None = None) -> None:
         self._runner: Runner = runner or execute
@@ -548,9 +569,54 @@ class AgentProvider:
                 f"{', '.join(unknown)} (accepted: {', '.join(self.option_keys) or 'none'})"
             )
 
+    def sandbox_requirements(
+        self, profile: ProfileConfig, command: list[str], env: Mapping[str, str], home: str
+    ) -> ProviderRequirements:
+        """What a sandboxed launch of ``command`` needs from the host, as data (ADR 0005 D13.1).
+
+        ``env`` is the launch's environment (the allow-listed variables, the
+        controller's overrides and :meth:`integration_isolation`'s) and
+        ``home`` the operator's home. The base declaration is the executable,
+        resolved on the launch's ``PATH`` as the spawn would resolve it, its
+        install root and its interpreter's, and :attr:`path_names`; an
+        adapter adds its configuration, credential and state items. Names
+        and paths only: no file is read but an executable's first line.
+        """
+        executable, roots, path_dirs = executable_requirements(
+            command[0], home=home, search_path=env.get("PATH")
+        )
+        return ProviderRequirements(
+            executable=executable,
+            install_roots=roots,
+            path_dirs=path_dirs,
+            path_names=self.path_names,
+        )
+
     # -- shared behaviour -------------------------------------------------
     def build_command(self, req: AgentRequest) -> list[str]:
         return self.build_command_for(req.profile, req.prompt)
+
+    def sandboxed(
+        self, req: AgentRequest, command: list[str], env: Mapping[str, str] | None
+    ) -> tuple[list[str], LaunchDescription | None]:
+        """``command`` as it runs inside the request's sandbox, and its description.
+
+        Unchanged, and ``None``, without :attr:`AgentRequest.sandbox`. Inside,
+        the executable is named by its resolved host path, which the
+        description shows read-only (D13.1). ``env`` is what the adapter sets
+        over the allow-listed environment for this process. A launch the
+        policy refuses raises
+        :class:`~autoforge.errors.SandboxLaunchRefusedError` before anything
+        is spawned.
+        """
+        if req.sandbox is None:
+            return command, None
+        launch_env = {**self.launch_environment(req.env_allowlist), **(env or {})}
+        needs = self.sandbox_requirements(req.profile, command, launch_env, req.sandbox.facts.home)
+        description = req.sandbox.describe(needs, launch_env)
+        if needs.executable:
+            command = [needs.executable, *command[1:]]
+        return command, description
 
     def launch_allowlist(self, base: tuple[str, ...]) -> tuple[str, ...]:
         """``base`` (the configured allow-list) plus this provider's own names.
@@ -583,6 +649,7 @@ class AgentProvider:
         self.integration_preflight(req.env_allowlist)
         with self.integration_isolation() as isolation:
             env = {**(req.env or {}), **isolation} if isolation else req.env
+            command, description = self.sandboxed(req, command, env)
             res = self._runner(
                 ExecutionRequest(
                     command=command,
@@ -598,6 +665,7 @@ class AgentProvider:
                     on_output=_activity_hook(req.progress),
                     on_chunk=on_chunk,
                     stop=stop,
+                    sandbox=description,
                 )
             )
         result = AgentExecutionResult.from_execution(res, req.profile)
@@ -846,6 +914,64 @@ class ClaudeCodeProvider(AgentProvider):
     environment_names = ("ANTHROPIC_*", "CLAUDE_*")
     option_keys = ("permission_mode", "output_format", "session_persistence")
     isolation_names = tuple(sorted(claude_isolation_env("", "")))
+    path_names = ("CLAUDE_ENV_FILE", "CLAUDE_CODE_SHELL", "CLAUDE_CONFIG_DIR")
+
+    def sandbox_requirements(
+        self, profile: ProfileConfig, command: list[str], env: Mapping[str, str], home: str
+    ) -> ProviderRequirements:
+        """Claude Code's declaration (ADR 0005 D7.1, D13.1).
+
+        The launch's ``CLAUDE_ENV_FILE`` read-only. With ``CLAUDE_CONFIG_DIR``
+        set to an absolute path, that directory writable where it resolves
+        (``dir-rw``: the CLI rewrites its login there; the variable names it
+        there inside), refused when it is or lies in ``~/.claude`` (D7.2).
+        Without it, the login file ``~/.claude/.credentials.json`` read-only
+        (``file-ro``; a token the CLI must refresh cannot be written back)
+        and the user settings ``~/.claude/settings.json`` read-only, both
+        when present, each at that path in the private home, where the CLI
+        looks for it, even when the host path is a link to a file elsewhere.
+        A key in ``ANTHROPIC_*`` or ``CLAUDE_CODE_OAUTH_TOKEN`` is an ``env``
+        item. ``~/.claude`` and ``~/.claude.json`` are the operator
+        configuration roots.
+        """
+        needs = super().sandbox_requirements(profile, command, env, home)
+        root = os.path.join(home, ".claude")
+        config: list[str] = []
+        home_config: list[str] = []
+        auth = [
+            AuthItem(AuthMode.ENV, name)
+            for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
+            if env.get(name)
+        ]
+        env_file = env.get("CLAUDE_ENV_FILE", "")
+        if env_file.startswith("/"):
+            config.append(env_file)
+        explicit = env.get("CLAUDE_CONFIG_DIR", "")
+        if explicit.startswith("/"):
+            auth.append(
+                AuthItem(
+                    AuthMode.DIR_RW,
+                    "the Claude Code configuration directory ($CLAUDE_CONFIG_DIR)",
+                    explicit,
+                    env_name="CLAUDE_CONFIG_DIR",
+                )
+            )
+        else:
+            login = os.path.join(root, ".credentials.json")
+            if os.path.isfile(login):
+                auth.append(
+                    AuthItem(AuthMode.FILE_RO, "the Claude Code login", login, target=login)
+                )
+            settings = os.path.join(root, "settings.json")
+            if os.path.isfile(settings):
+                home_config.append(settings)
+        return dataclasses.replace(
+            needs,
+            config=(*needs.config, *config),
+            home_config=(*needs.home_config, *home_config),
+            auth=tuple(auth),
+            operator_config_roots=(root, os.path.join(home, ".claude.json")),
+        )
 
     @contextmanager
     def integration_isolation(self) -> Iterator[dict[str, str]]:
@@ -985,11 +1111,13 @@ class ClaudeCodeProvider(AgentProvider):
         stream = ClaudeStream(cwd=req.cwd, emit=emit, loop=_ClockedLoop(monitor))
         self.integration_preflight(req.env_allowlist)
         with self.integration_isolation() as isolation:
+            env = {**(req.env or {}), **isolation}
+            command, description = self.sandboxed(req, self.build_command(req), env)
             duplex = DuplexRequest(
-                command=self.build_command(req),
+                command=command,
                 cwd=req.cwd,
                 env_allowlist=self.environment_allowlist(req),
-                env={**(req.env or {}), **isolation},
+                env=env,
                 idle_timeout_seconds=req.idle_timeout_seconds,
                 max_runtime_seconds=req.max_runtime_seconds,
                 max_record_bytes=CLAUDE_MAX_RECORD_BYTES,
@@ -999,6 +1127,7 @@ class ClaudeCodeProvider(AgentProvider):
                 stdin_pipe=False,
                 # Nothing an agent starts outlives its invocation (ADR 0002).
                 contain_orphans=True,
+                sandbox=description,
             )
             with start_duplex(duplex) as child:
                 cut_short = _read_claude_stream(child, stream, monitor)
@@ -1037,6 +1166,7 @@ class ClaudeCodeProvider(AgentProvider):
             provider_summary=summary,
             timeout_limit=res.timeout_limit,
             last_activity_at=res.last_activity_at,
+            sandbox=res.sandbox,
         )
         return _finish_loop(result, monitor, killed=res.stopped)
 
@@ -1264,6 +1394,51 @@ class OpenCodeProvider(AgentProvider):
     environment_names = ("OPENCODE_*", "OPENAI_*", "ANTHROPIC_*", "GEMINI_*", "GOOGLE_*")
     option_keys = ("output_format", "auto_approve")
     isolation_names = tuple(sorted(opencode_isolation_env("")))
+    path_names = ("OPENCODE_CONFIG_DIR", "OPENCODE_DB")
+
+    def sandbox_requirements(
+        self, profile: ProfileConfig, command: list[str], env: Mapping[str, str], home: str
+    ) -> ProviderRequirements:
+        """OpenCode's declaration (ADR 0005 D7.1, D13.1).
+
+        The launch's empty ``OPENCODE_CONFIG_DIR`` writable (it is the
+        launch's own, removed afterwards). An absolute ``OPENCODE_DB``: its
+        directory writable at its own path (``dir-rw``: the database holds
+        the login and is rewritten), refused when it is or lies in the
+        operator's data directory (D7.2). A relative or ``:memory:`` one
+        names a database inside the private home. The providers' API keys
+        are ``env`` items. The configuration, data and cache directories
+        OpenCode loads settings, organizations and code from are the
+        operator configuration roots.
+        """
+        needs = super().sandbox_requirements(profile, command, env, home)
+        state: list[str] = []
+        auth = [AuthItem(AuthMode.ENV, name) for name in env if name.endswith("_API_KEY")]
+        config_dir = env.get("OPENCODE_CONFIG_DIR", "")
+        if config_dir.startswith("/"):
+            state.append(config_dir)
+        database = env.get("OPENCODE_DB", "")
+        if database.startswith("/"):
+            auth.append(
+                AuthItem(
+                    AuthMode.DIR_RW,
+                    "the OpenCode database directory ($OPENCODE_DB)",
+                    os.path.dirname(database),
+                )
+            )
+        config_home = env.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
+        cache_home = env.get("XDG_CACHE_HOME") or os.path.join(home, ".cache")
+        roots = (
+            os.path.join(config_home, "opencode"),
+            str(opencode_data_dir({**env, "HOME": home})),
+            os.path.join(cache_home, "opencode"),
+        )
+        return dataclasses.replace(
+            needs,
+            state=(*needs.state, *state),
+            auth=tuple(auth),
+            operator_config_roots=roots,
+        )
 
     @contextmanager
     def integration_isolation(self) -> Iterator[dict[str, str]]:
@@ -1562,6 +1737,34 @@ class PiProvider(AgentProvider):
         "PI_TELEMETRY",
     )
     option_keys = ("require_oauth", "tools", "context_files")
+    path_names = ("PI_CODING_AGENT_DIR",)
+
+    def sandbox_requirements(
+        self, profile: ProfileConfig, command: list[str], env: Mapping[str, str], home: str
+    ) -> ProviderRequirements:
+        """Pi's declaration (ADR 0005 D7.1, D13.1; docs/pi-policy.md §8).
+
+        An absolute ``PI_CODING_AGENT_DIR``: that directory writable at its
+        own path (``dir-rw``: Pi writes ``auth.json`` and
+        ``models-store.json`` there by rename at startup), refused when it is
+        or lies in ``~/.pi/agent``, the operator configuration root (D7.2).
+        Without one, Pi finds no login inside, and its auth preflight says
+        so. A provider key is an ``env`` item.
+        """
+        needs = super().sandbox_requirements(profile, command, env, home)
+        auth = [AuthItem(AuthMode.ENV, name) for name in PI_API_KEY_NAMES if env.get(name)]
+        agent_dir = env.get("PI_CODING_AGENT_DIR", "")
+        if agent_dir.startswith("/"):
+            auth.append(
+                AuthItem(
+                    AuthMode.DIR_RW,
+                    "Pi's agent directory ($PI_CODING_AGENT_DIR)",
+                    agent_dir,
+                    env_name="PI_CODING_AGENT_DIR",
+                )
+            )
+        default = os.path.join(home, PI_DEFAULT_AGENT_DIR.removeprefix("~/"))
+        return dataclasses.replace(needs, auth=tuple(auth), operator_config_roots=(default,))
 
     def validate_profile(self, profile: ProfileConfig) -> None:
         super().validate_profile(profile)
@@ -1679,8 +1882,9 @@ class PiProvider(AgentProvider):
             cwd=req.cwd,
             loop=monitor,
         )
+        command, description = self.sandboxed(req, self.build_command(req), req.env)
         duplex = DuplexRequest(
-            command=self.build_command(req),
+            command=command,
             cwd=req.cwd,
             env_allowlist=allowlist,
             env=req.env,
@@ -1692,6 +1896,7 @@ class PiProvider(AgentProvider):
             max_pending_bytes=PI_MAX_PENDING_BYTES,
             # Pi's bash tool starts every command detached (ADR 0003 §6).
             contain_orphans=True,
+            sandbox=description,
         )
         with start_duplex(duplex) as child:
             cut_short = self._converse(child, conversation, monitor)
@@ -1743,6 +1948,7 @@ class PiProvider(AgentProvider):
             provider_summary=summary,
             timeout_limit=(res.timeout_limit or cut_limit) if timed_out else "",
             last_activity_at=res.last_activity_at,
+            sandbox=res.sandbox,
         )
         return _finish_loop(result, monitor, killed=res.stopped)
 
@@ -1786,15 +1992,19 @@ class PiProvider(AgentProvider):
         result whose ``provider_failure`` quotes only the check's fields;
         its output is never kept.
         """
+        # In the launch's own sandbox, with the same declaration: the check
+        # must find the credential exactly where Pi will (ADR 0005 D3.1).
+        command, description = self.sandboxed(req, self.auth_check_command(req.profile), req.env)
         res = self._runner(
             ExecutionRequest(
-                command=self.auth_check_command(req.profile),
+                command=command,
                 cwd=req.cwd,
                 timeout_seconds=PI_AUTH_CHECK_SECONDS,
                 max_output_bytes=PI_AUTH_CHECK_MAX_OUTPUT_BYTES,
                 env_allowlist=allowlist,
                 env=req.env,
                 contain_orphans=True,
+                sandbox=description,
             )
         )
         if res.timed_out:
@@ -1823,6 +2033,7 @@ class PiProvider(AgentProvider):
             orphans_unchecked=res.orphans_unchecked,
             provider_failure=f"pi: the auth preflight refused the launch: {detail}",
             provider_summary={"auth_preflight": "refused"},
+            sandbox=res.sandbox,
         )
 
     @staticmethod
@@ -2085,12 +2296,17 @@ class ScriptedProvider(AgentProvider):
         self.exit_code = exit_code
         self.stderr = stderr
         self.calls: list[AgentRequest] = []
+        # The description each sandboxed request compiled to: the engine's
+        # facts alone, since a scripted agent declares nothing (ADR 0005).
+        self.descriptions: list[LaunchDescription] = []
 
     def build_command_for(self, profile: ProfileConfig, prompt: str) -> list[str]:
         return ["scripted-agent", f"--profile={profile.name}", "--", prompt]
 
     def execute(self, req: AgentRequest) -> AgentExecutionResult:
         self.calls.append(req)
+        if req.sandbox is not None:
+            self.descriptions.append(req.sandbox.describe(ProviderRequirements(), req.env or {}))
         if self._handler is not None:
             stdout = self._handler(req)
         elif self._queue:

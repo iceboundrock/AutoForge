@@ -361,6 +361,29 @@ def override_names() -> tuple[str, ...]:
     return tuple(sorted(child_overrides("", "", "", "", "", "")))
 
 
+# The names of :func:`child_overrides` whose value is a path: a sandboxed
+# launch keeps one only when what it names is visible inside (ADR 0005 D8.2).
+OVERRIDE_PATH_NAMES = (
+    "GH_CONFIG_DIR",
+    "GIT_CONFIG_GLOBAL",
+    "CURL_HOME",
+    "WGETRC",
+    "WGET2RC",
+    "ZDOTDIR",
+    "SHELL",
+)
+
+
+def overrides_directory(overrides: Mapping[str, str]) -> str:
+    """The directory :func:`isolated_overrides` made for ``overrides``, "" for none.
+
+    A sandboxed launch sees it read-only (ADR 0005 D8.3), so that the
+    configuration it names is the one the child reads.
+    """
+    config = overrides.get("GIT_CONFIG_GLOBAL", "")
+    return os.path.dirname(config) if config.startswith("/") else ""
+
+
 def undoes_isolation(name: str) -> bool:
     """Whether variable ``name``, set over a launch's environment after the
     controller's (an agent CLI applying the variables of its own

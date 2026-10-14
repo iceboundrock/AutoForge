@@ -85,7 +85,11 @@ propagate (nothing was launched; `resume` reads again).
 
 The candidate is checked before the result is accepted, so a refusal is an
 ordinary correction retry with nothing pushed or created. The controller
-reads the worktree itself, never the agent's word for it: `HEAD` is
+reads the worktree itself, never the agent's word for it, and never
+through a pointer the agent can rewrite: `HEAD` is read through the git
+common dir after the strict import of the issue's private objects, in
+every `sandbox.mode` ([Outer sandbox threat
+model](#outer-sandbox-threat-model-adr-0005)). `HEAD` is
 detached (a `HEAD` attached to a local branch is refused), equal to the
 reported `head_sha`, different from the recorded base, descending from it
 and from the branch head the entry recorded (so the push is a
@@ -1229,7 +1233,11 @@ humans acting concurrently on GitHub. GitHub is the source of truth.
    framing and cannot forge a marker, close or link an issue, mention a
    user or team, or carry a credential-shaped string.
 
-**Not guaranteed** (the outer sandbox, ADR 0005, owns the first four):
+**Not guaranteed** under the default `sandbox.mode: disabled`. ADR 0005's
+outer sandbox owns the first four; under `sandbox.mode: required` it closes
+the first three for every enforced launch, and a sandboxed agent's objects
+reach the shared store only through the strict import, with the residuals
+of the [Outer sandbox threat model](#outer-sandbox-threat-model-adr-0005):
 
 - **Absolute-path reads.** A same-UID process that deliberately reads a
   credential file, keychain or socket by absolute path
@@ -1267,7 +1275,9 @@ file. Claude Code sourcing `~/.zshrc` or `~/.bashrc` itself for its Bash
 tool is not one: no function or alias of them, or of a login shell's
 files, is left when a command runs (above). A startup file that changes a
 variable only under a condition the probe does not meet (a terminal, a
-time of day) is not detected.
+time of day) is not detected. Under `sandbox.mode: required` the home a
+launch sees is a private, empty one (ADR 0005 D8.1), so none of the
+operator's startup files exists inside.
 
 **What the agent loses.** The operator's global git configuration beyond
 the identity is not read by an agent: no commit signing (`commit.gpgSign`,
@@ -1289,6 +1299,105 @@ phase prompt tells the agent to read the repository's `AGENTS.md` and
 `CLAUDE.md`, and the model credentials (Claude Code's login and API-key
 variables, OpenCode's `opencode auth login` and API-key variables) are
 untouched.
+
+### Outer sandbox threat model (ADR 0005)
+
+ADR 0005 D2.1, as #168 implements it. The actors are those above;
+repository-defined validation and pre-merge commands are the change's own
+code and are untrusted like the agent.
+
+**Guaranteed in every mode** (D6.3–D6.5, `src/autoforge/agent_worktree.py`).
+The redirect these close needs no sandbox, only the `.git` file every agent
+can write, so they hold under `sandbox.mode: disabled` too:
+
+- **The candidate is addressed through the common dir.** The controller
+  reads an issue worktree's `HEAD` as `worktrees/<id>/HEAD` with
+  `git --git-dir=<git common dir>`, after `lstat` found a regular file
+  there (git would follow a link to a file the agent named outside the
+  store), and never through the worktree's `.git` file, the admin dir's
+  `commondir` or `gitdir`, or `git -C <worktree>`. A `.git` rewritten to
+  name a decoy repository cannot move the candidate: the decoy's commit,
+  reported as `head_sha`, is refused as not the worktree's `HEAD`
+  (`test_engine_sandbox.py::test_the_candidate_is_read_through_the_registry_not_the_worktrees_git_file`).
+- **The worktree is bound through the registry.** It is used only while
+  exactly one registry entry's `gitdir` names `<worktree>/.git` and that
+  `.git` is a regular file naming the entry; otherwise the step refuses,
+  naming `git worktree repair`. Rewriting the pointers can make the check
+  refuse, never make it name another worktree.
+- **The agent's objects are imported strictly.** Before every REMOTE
+  launch and after every one that exited cleanly, the objects the
+  candidate reaches that the shared store lacks are copied out of the
+  issue's private object directory: `rev-list --objects` and
+  `pack-objects` read it through `GIT_ALTERNATE_OBJECT_DIRECTORIES`, for
+  those two processes only, and `index-pack --stdin --fix-thin --strict`
+  writes each object under the id it computes from its bytes. The commit
+  is the object id `HEAD` holds, read by the controller after the same
+  `lstat` as the candidate read: a `HEAD` that is a link is refused before
+  any git process runs, so nothing is packed or imported and the
+  candidate is refused with it, and an attached `HEAD` imports nothing
+  (`test_sandbox_routing.py::test_a_head_link_written_inside_is_never_followed_by_the_import`).
+  The directory is walked first without following a link; a directory that is
+  not a real one reached from the common dir through real directories (a
+  link, another file type, one that cannot be checked), an alternates file,
+  or an entry that is neither a directory, a regular file nor an overlay
+  whiteout, blocks the run, naming it, with nothing read. Under `disabled`
+  agents write the shared store directly, so ADR 0004 D7.5's re-hash of
+  every commit a decision reads stays required in both modes.
+
+**Guaranteed for an enforced launch** (`sandbox.mode: required`: every
+agent process, LOCAL validation command and pre-merge command runs inside
+the sandbox or is refused):
+
+1. **G1. Nothing of the controller is reachable.** The state directory,
+   the run logs, the lock, the REMOTE controller checkout and every other
+   registered worktree are absent; the read context is read-only.
+2. **G2. No credential the boundary hides is reachable by path or by local
+   IPC.** The operator's home is a private, empty one, so the gh and git
+   credential files, `~/.ssh` and file keyrings are absent, and so are the
+   SSH agent socket, the session bus and every path-named socket under
+   `/run` and `$XDG_RUNTIME_DIR`; no host abstract socket can be
+   connected, and neither the operator's SysV IPC objects nor the session
+   keyring are reachable. Symlinks and `..` resolve inside the sandbox's
+   own mount tree, and a new hard link to a file outside fails.
+3. **G3. No host process is visible,** and none is signallable but the
+   launch's own outer `bwrap`.
+4. **G4. Writes land only in the launch's writable projections and private
+   mounts:** the issue worktree, its admin dir, the private object
+   directory and the cache; the LOCAL repository root; the exported tree.
+5. **G5. Shared repository state is read-only.** No shared ref,
+   configuration, hook, alternates file or shared object can be written; a
+   REMOTE agent's new objects reach the shared store only through the
+   strict import, and a LOCAL agent's git directory is read-only.
+6. **G6. Nothing outlives the invocation,** inside the namespace included.
+
+**Not protected by an enforced launch:**
+
+- the model credential the provider is given, readable by every tool in
+  the same sandbox (D7.4,
+  [Secrets and logging](secrets-and-logging.md#the-outer-sandbox-and-credentials-adr-0005-d74));
+- the repository, and the operator's unpushed work in the shared git
+  directory: unpushed and unreachable objects, the main worktree's
+  `index`, `refs/stash`, the reflogs, in-progress operation state (D6.7);
+- the network an agent shares with the host: loopback TCP services, the
+  local DNS stub and general egress. A loopback service that acts on
+  request (a debugger or container-daemon port, a development server with
+  an execute endpoint) is an escape, not only an exposure.
+  `sandbox.validation_network` and `premerge_network: isolated` take it
+  away from repository commands, never from agents (D9.2);
+- pre-existing hard links in a writable workspace (D4.4);
+- credential-shaped values in repository configuration that #165's
+  preflight does not refuse, since the common dir is read-only as a whole;
+- a writable provider credential directory (`dir-rw`): a persistent write
+  channel shared by every launch that projects it, never the provider's
+  own configuration root (D7.2).
+
+**Out of scope:** kernel or `bwrap` exploits, a malicious operator, network
+egress, resource exhaustion beyond ADR 0002 and the tmpfs bounds, side
+channels, credentials the operator deliberately projects, the operator's
+own unsandboxed tools, and every launch under `disabled`. **Not yet**
+(#169): `preferred`, the capability gate before anything is saved, and
+`doctor`'s capability, hard-link, sandbox-directory and loopback-listener
+reports.
 
 ## Merge safety
 
@@ -1444,6 +1553,11 @@ commands run under the same allow-listed environment as an agent
 (`execution.env_allowlist`), not the operator's whole shell, with the same
 controller-set variables and preflight ("Agents hold no GitHub credential"
 above): a preflight refusal blocks the merge like a failing command.
+Under `sandbox.mode: required` each command runs in the outer sandbox with
+the exported tree as the only part of the repository it sees, no
+persistent cache, and the host network unless `sandbox.premerge_network:
+isolated` (ADR 0005 §2.5, D9.2); a command the sandbox refuses is not run
+and blocks the merge like a failing one.
 
 ### Post-merge reconciliation
 
