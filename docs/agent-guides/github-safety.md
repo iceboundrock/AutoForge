@@ -1313,7 +1313,8 @@ can write, so they hold under `sandbox.mode: disabled` too:
 - **The candidate is addressed through the common dir.** The controller
   reads an issue worktree's `HEAD` as `worktrees/<id>/HEAD` with
   `git --git-dir=<git common dir>`, after `lstat` found a regular file
-  there, and never through the worktree's `.git` file, the admin dir's
+  there (git would follow a link to a file the agent named outside the
+  store), and never through the worktree's `.git` file, the admin dir's
   `commondir` or `gitdir`, or `git -C <worktree>`. A `.git` rewritten to
   name a decoy repository cannot move the candidate: the decoy's commit,
   reported as `head_sha`, is refused as not the worktree's `HEAD`
@@ -1329,8 +1330,13 @@ can write, so they hold under `sandbox.mode: disabled` too:
   issue's private object directory: `rev-list --objects` and
   `pack-objects` read it through `GIT_ALTERNATE_OBJECT_DIRECTORIES`, for
   those two processes only, and `index-pack --stdin --fix-thin --strict`
-  writes each object under the id it computes from its bytes. The
-  directory is walked first without following a link; a directory that is
+  writes each object under the id it computes from its bytes. The commit
+  is the object id `HEAD` holds, read by the controller after the same
+  `lstat` as the candidate read: a `HEAD` that is a link is refused before
+  any git process runs, so nothing is packed or imported and the
+  candidate is refused with it, and an attached `HEAD` imports nothing
+  (`test_sandbox_routing.py::test_a_head_link_written_inside_is_never_followed_by_the_import`).
+  The directory is walked first without following a link; a directory that is
   not a real one reached from the common dir through real directories (a
   link, another file type, one that cannot be checked), an alternates file,
   or an entry that is neither a directory, a regular file nor an overlay

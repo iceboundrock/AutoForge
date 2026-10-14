@@ -33,13 +33,16 @@ the operator asks for it (D9.2).
 :func:`describe_launch` compiles the request and rewrites the launch's
 path-valued environment (D8.2): a name AutoForge knows to be a path passes
 only when what it names is visible inside, ``PATH`` keeps only its visible
-entries, and every unset name is recorded. A refusal of the compiler becomes
-a launch refusal (:class:`~autoforge.errors.SandboxLaunchRefusedError`), on
-the path a failure to spawn takes.
+entries, each is spelled where it is inside (a link on its host path the
+sandbox does not recreate, a relocated projection), and every unset name is
+recorded. A refusal of the compiler becomes a launch refusal
+(:class:`~autoforge.errors.SandboxLaunchRefusedError`), on the path a
+failure to spawn takes.
 
 Pure except for the compiler's ``realpath`` and ``lstat``, ``realpath`` of
-the environment's path values, and the first line of an executable read for
-its interpreter; nothing is created or launched here.
+the environment's path values and ``lstat`` and ``readlink`` on their way,
+and the first line of an executable read for its interpreter; nothing is
+created or launched here.
 """
 
 from __future__ import annotations
@@ -141,17 +144,21 @@ class ProviderRequirements:
 
     ``executable`` is the resolved host path the launch names (empty: the
     command is left as it is); ``install_roots`` and ``config`` are
-    projected read-only, ``state`` (directories the adapter made for this
-    launch) writable; ``path_dirs`` are put first on ``PATH``;
-    ``path_names`` are the provider's path-valued variables (D8.2).
-    ``operator_config_roots`` are where the CLI loads the operator's own
-    settings, hooks and extensions from (D7.2).
+    projected read-only where their host paths resolve, ``home_config``
+    (files in the operator's home the CLI finds by that path) read-only at
+    that path in the private home, wherever it resolves on the host (C7,
+    D8.3), ``state`` (directories the adapter made for this launch)
+    writable; ``path_dirs`` are put first on ``PATH``; ``path_names`` are
+    the provider's path-valued variables (D8.2). ``operator_config_roots``
+    are where the CLI loads the operator's own settings, hooks and
+    extensions from (D7.2).
     """
 
     executable: str = ""
     install_roots: tuple[str, ...] = ()
     path_dirs: tuple[str, ...] = ()
     config: tuple[str, ...] = ()
+    home_config: tuple[str, ...] = ()
     state: tuple[str, ...] = ()
     auth: tuple[AuthItem, ...] = ()
     operator_config_roots: tuple[str, ...] = ()
@@ -301,6 +308,12 @@ def sandbox_request(
             projections.append(
                 ProjectionRequest(path, read_only, Origin.DECLARED, label=f"{path} (provider)")
             )
+        for path in needs.home_config:
+            projections.append(
+                ProjectionRequest(
+                    path, read_only, Origin.DECLARED, target=path, label=f"{path} (provider)"
+                )
+            )
         for path in needs.state:
             projections.append(
                 ProjectionRequest(path, writable, Origin.DECLARED, label=f"{path} (provider)")
@@ -370,8 +383,34 @@ def policy_refusal(exc: SandboxPolicyError, facts: LaunchFacts) -> SandboxLaunch
     )
 
 
-def _shows(description: LaunchDescription, value: str) -> bool:
-    return value.startswith("/") and description.inside_path(os.path.realpath(value)) is not None
+def inside_spelling(description: LaunchDescription, value: str) -> str | None:
+    """The absolute host path ``value`` as a launch must spell it inside (D8.2).
+
+    ``None`` when nothing of the description shows what it names. Its own
+    spelling when that leads inside to where its host target is shown;
+    else that place: a link on its host path that the sandbox does not
+    recreate (a link in the private home, or anywhere the root is empty),
+    or a projection that appears elsewhere than at its host path (the cache).
+    """
+    if not value.startswith("/"):
+        return None
+    inner = description.inside_path(os.path.realpath(value))
+    if inner is None or description.resolve_inside(value) == inner:
+        return None if inner is None else value
+    return inner
+
+
+def _auth_variables(needs: ProviderRequirements | None) -> dict[str, str]:
+    """The variables naming a projected auth item at its host path: name to host path."""
+    if needs is None:
+        return {}
+    return {
+        item.env_name: item.source
+        for item in needs.auth
+        if item.env_name
+        and item.target is None
+        and item.mode in (AuthMode.FILE_RO, AuthMode.DIR_RW)
+    }
 
 
 def rewrite_environment(
@@ -383,35 +422,48 @@ def rewrite_environment(
 
     A name AutoForge knows to be a path (the CA-bundle names, #165's
     overrides, the provider's ``path_names``) whose absolute value names
-    nothing visible inside is unset; a value that is not an absolute path
-    (``OPENCODE_DB=:memory:``, a name relative to the provider's own data
-    directory) passes unchanged, as any other variable does. ``PATH`` keeps
-    its visible absolute entries, after the provider's ``path_dirs``, and is
-    unset when none is left. The names the compiler sets are its own.
+    nothing visible inside is unset, and one whose spelling leads elsewhere
+    inside is set to where what it names is (:func:`inside_spelling`); a
+    value that is not an absolute path (``OPENCODE_DB=:memory:``, a name
+    relative to the provider's own data directory) passes unchanged, as any
+    other variable does. ``PATH`` keeps its visible absolute entries, each so
+    spelled, after the provider's ``path_dirs``, and is unset when none is
+    left. The compiler's own names (``HOME``, ``XDG_*``, ``TMPDIR``) are
+    left alone; the variable an auth item names (``PI_CODING_AGENT_DIR``)
+    is set by the compiler to the item's host path and spelled here too.
     """
-    owned = {name for name, _ in description.env_set} | set(description.env_unset)
+    compiled = dict(description.env_set)
+    auth = {name: path for name, path in _auth_variables(needs).items() if name in compiled}
+    owned = (set(compiled) | set(description.env_unset)) - set(auth)
     names = [*CA_BUNDLE_NAMES, *OVERRIDE_PATH_NAMES, *(needs.path_names if needs else ())]
+    values = {name: env.get(name, "") for name in dict.fromkeys(names)}
+    values.update(auth)
+    moved: dict[str, str] = {}
     unset: set[str] = set()
-    for name in dict.fromkeys(names):
-        value = env.get(name, "")
+    for name, value in values.items():
         if name in owned or not value.startswith("/"):
             continue
-        if not _shows(description, value):
+        spelled = inside_spelling(description, value)
+        if spelled is None:
             unset.add(name)
-    extra: list[tuple[str, str]] = []
+        elif spelled != value:
+            moved[name] = spelled
     if "PATH" not in owned and ("PATH" in env or (needs and needs.path_dirs)):
         entries = [*(needs.path_dirs if needs else ()), *env.get("PATH", "").split(":")]
-        kept = [entry for entry in dict.fromkeys(entries) if _shows(description, entry)]
+        spelled_entries = (inside_spelling(description, entry) for entry in entries)
+        kept = list(dict.fromkeys(entry for entry in spelled_entries if entry))
         if kept:
             if ":".join(kept) != env.get("PATH"):
-                extra.append(("PATH", ":".join(kept)))
+                moved["PATH"] = ":".join(kept)
         elif "PATH" in env:
             unset.add("PATH")
-    if not unset and not extra:
+    if not unset and not moved:
         return description
+    env_set = {name: value for name, value in compiled.items() if name not in unset}
+    env_set.update(moved)
     return dataclasses.replace(
         description,
-        env_set=tuple(sorted([*description.env_set, *extra])),
+        env_set=tuple(sorted(env_set.items())),
         env_unset=tuple(sorted(set(description.env_unset) | unset)),
     )
 

@@ -75,10 +75,11 @@ what its provider adapter declares (D7.1;
   `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, an OpenCode
   `*_API_KEY`, Pi's `OPENAI_API_KEY` when `require_oauth: false` and
   `execution.env_allowlist_extra` forwards it);
-- one login file, read-only at its own path: Claude Code's
-  `~/.claude/.credentials.json` when no `CLAUDE_CONFIG_DIR` is set;
-- one dedicated directory, writable at its own path: `CLAUDE_CONFIG_DIR`,
-  the directory of an absolute `OPENCODE_DB`, `PI_CODING_AGENT_DIR`.
+- one login file, read-only at that path, wherever it resolves: Claude
+  Code's `~/.claude/.credentials.json` when no `CLAUDE_CONFIG_DIR` is set;
+- one dedicated directory, writable where it resolves, the variable naming
+  it there: `CLAUDE_CONFIG_DIR`, the directory of an absolute
+  `OPENCODE_DB`, `PI_CODING_AGENT_DIR`.
 
 Every tool in the same sandbox (the agent's shell commands, the test suite
 it runs) can read that credential, and that exposure is accepted: it is a
@@ -93,7 +94,9 @@ AutoForge never reads, copies or logs a credential's contents: the policy
 compiler looks at a declared path with `lstat` and `realpath` only, and a
 refusal names the path and the rule, redacted (`policy_refusal`). The
 environment rewrite (D8.2) unsets a known path-valued variable whose value
-names nothing visible inside and trims `PATH`; the launch's facts list the
+names nothing visible inside, trims `PATH`, and spells a kept value where
+it is inside (computed from the description and the paths' links, never
+from a file's contents); the launch's facts list the
 unset variables by name (`unset_env` in `execution.json`'s `sandbox`),
 never a value, and `request.json` adds only the configured mode
 (`sandbox_mode`).

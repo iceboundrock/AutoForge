@@ -287,6 +287,124 @@ def test_an_auth_directory_is_named_by_its_variable_inside(tmp_path):
     assert dict(description.env_set)["PI_CODING_AGENT_DIR"] == str(agent_dir)
 
 
+def _linked(link: Path, target: Path) -> Path:
+    """``link``, a symbolic link to the directory or file ``target``."""
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(target)
+    return link
+
+
+def _bound_at(description: LaunchDescription) -> set[str]:
+    return {m.target for m in description.mounts if isinstance(m, Bind)}
+
+
+@pytest.mark.parametrize("where", ["home", "elsewhere"])
+def test_a_linked_auth_directory_is_named_where_it_is_projected(tmp_path, where):
+    """A link to the dedicated directory: the compiler projects what it
+    resolves to, so the variable names that, not the link, which is absent
+    inside (in the private home, or where the root is empty) (D8.2)."""
+    paths = _layout(tmp_path)
+    real = paths["base"] / "pi-autoforge"
+    real.mkdir()
+    parent = paths["home"] if where == "home" else paths["base"] / "links"
+    alias = _linked(parent / "pi-agent", real)
+    env = {"PI_CODING_AGENT_DIR": str(alias)}
+    needs = PiProvider().sandbox_requirements(_profile("pi"), ["pi"], env, str(paths["home"]))
+    description = describe_launch(_remote(paths), needs, env)
+    assert _mount(description, str(real)).access is Access.WRITABLE
+    assert dict(description.env_set)["PI_CODING_AGENT_DIR"] == str(real)
+    assert description.resolve_inside(str(alias)) != str(real)
+    # Nothing more of the host is shown: not the link, not its directory.
+    assert str(alias) not in _bound_at(description)
+    assert description.inside_path(str(parent)) is None
+
+
+def test_linked_provider_paths_are_named_where_they_are_projected(tmp_path):
+    """``CLAUDE_CONFIG_DIR`` (an auth item's variable), ``OPENCODE_DB`` and
+    ``OPENCODE_CONFIG_DIR`` (declared path names) through links in the home."""
+    paths = _layout(tmp_path)
+    home = paths["home"]
+    claude_real = paths["base"] / "claude-autoforge"
+    db_real = paths["base"] / "opencode-autoforge"
+    config_real = paths["base"] / "autoforge-opencode-1"
+    for directory in (claude_real, db_real, config_real):
+        directory.mkdir()
+    claude_env = {"CLAUDE_CONFIG_DIR": str(_linked(home / ".claude-autoforge", claude_real))}
+    needs = ClaudeCodeProvider().sandbox_requirements(
+        _profile("claude"), ["claude"], claude_env, str(home)
+    )
+    description = describe_launch(_remote(paths), needs, claude_env)
+    assert dict(description.env_set)["CLAUDE_CONFIG_DIR"] == str(claude_real)
+    opencode_env = {
+        "OPENCODE_DB": str(_linked(home / ".opencode-autoforge", db_real) / "af.db"),
+        "OPENCODE_CONFIG_DIR": str(_linked(home / "opencode-config", config_real)),
+    }
+    needs = OpenCodeProvider().sandbox_requirements(
+        _profile("opencode"), ["opencode"], opencode_env, str(home)
+    )
+    description = describe_launch(_remote(paths), needs, opencode_env)
+    env_set = dict(description.env_set)
+    assert env_set["OPENCODE_DB"] == str(db_real / "af.db")
+    assert env_set["OPENCODE_CONFIG_DIR"] == str(config_real)
+    assert _mount(description, str(db_real)).access is Access.WRITABLE
+    for alias in (home / ".opencode-autoforge", home / "opencode-config"):
+        assert str(alias) not in _bound_at(description)
+
+
+def test_a_path_in_a_relocated_projection_is_named_where_it_appears(tmp_path):
+    """The cache is projected at ``~/.cache``: a value or a ``PATH`` entry
+    naming its host directory is visible there, and is set to that."""
+    paths = _layout(tmp_path)
+    cache = paths["sandbox"] / "cache"
+    (cache / "bin").mkdir()
+    env = {"TOOL_CACHE": str(cache / "tool"), "PATH": f"{cache / 'bin'}:/usr/bin"}
+    needs = ProviderRequirements(path_names=("TOOL_CACHE",))
+    description = describe_launch(_remote(paths), needs, env)
+    env_set = dict(description.env_set)
+    inside = paths["home"] / ".cache"
+    assert env_set["TOOL_CACHE"] == str(inside / "tool")
+    assert env_set["PATH"] == f"{inside / 'bin'}:/usr/bin"
+
+
+def test_linked_path_entries_are_named_where_they_are_projected(tmp_path):
+    """A ``PATH`` entry through a link the sandbox does not recreate is the
+    projected directory; one through a link it recreates keeps its spelling."""
+    paths = _layout(tmp_path)
+    tools = paths["base"] / "tools" / "bin"
+    tools.mkdir(parents=True)
+    alias = _linked(paths["home"] / ".local" / "bin", tools)
+    needs = ProviderRequirements(install_roots=(str(tools),))
+    env = {"PATH": f"{alias}:/usr/bin:/bin:{tools}"}
+    description = describe_launch(_remote(paths), needs, env)
+    # ``/bin`` stays as spelled: where it is a link, the sandbox recreates it.
+    assert dict(description.env_set)["PATH"] == f"{tools}:/usr/bin:/bin"
+
+
+def test_claudes_linked_default_files_are_projected_where_it_looks(tmp_path):
+    """``~/.claude/.credentials.json`` and ``~/.claude/settings.json`` as
+    links into a dotfiles directory: each appears at its own path in the
+    private home, read-only, and the dotfiles directory is not shown."""
+    paths = _layout(tmp_path)
+    home = paths["home"]
+    dotfiles = home / "dotfiles"
+    dotfiles.mkdir()
+    (dotfiles / "claude-login.json").write_text("{}")
+    (dotfiles / "claude-settings.json").write_text("{}")
+    claude = home / ".claude"
+    login = _linked(claude / ".credentials.json", dotfiles / "claude-login.json")
+    settings = _linked(claude / "settings.json", dotfiles / "claude-settings.json")
+    needs = ClaudeCodeProvider().sandbox_requirements(_profile("claude"), ["claude"], {}, str(home))
+    description = describe_launch(_remote(paths), needs, {})
+    for path, real in ((login, "claude-login.json"), (settings, "claude-settings.json")):
+        mount = _mount(description, str(path))
+        assert isinstance(mount, Bind) and mount.access is Access.READ_ONLY
+        assert mount.source == str(dotfiles / real) and not mount.is_dir
+        assert description.resolve_inside(str(path)) == str(path)
+    assert description.resolve_inside(str(dotfiles)) == str(dotfiles)  # absent: kept as spelled
+    assert str(dotfiles) not in _bound_at(description)
+    assert description.inside_path(str(dotfiles)) is None
+
+
 # ------------------------------------------------- executables and install roots
 
 
@@ -368,7 +486,11 @@ def test_claude_declares_its_login_settings_and_shell_file(tmp_path):
     modes = {(i.mode, i.source or i.label) for i in needs.auth}
     assert (AuthMode.FILE_RO, str(claude / ".credentials.json")) in modes
     assert (AuthMode.ENV, "ANTHROPIC_API_KEY") in modes
-    assert str(claude / "settings.json") in needs.config and str(env_file) in needs.config
+    # Where the CLI looks for them, in the private home.
+    login = next(i for i in needs.auth if i.mode is AuthMode.FILE_RO)
+    assert login.target == str(claude / ".credentials.json")
+    assert needs.home_config == (str(claude / "settings.json"),)
+    assert needs.config == (str(env_file),)
     assert str(claude) in needs.operator_config_roots
     assert "CLAUDE_CONFIG_DIR" in needs.path_names
 

@@ -922,19 +922,22 @@ class ClaudeCodeProvider(AgentProvider):
         """Claude Code's declaration (ADR 0005 D7.1, D13.1).
 
         The launch's ``CLAUDE_ENV_FILE`` read-only. With ``CLAUDE_CONFIG_DIR``
-        set to an absolute path, that directory writable at its own path
-        (``dir-rw``: the CLI rewrites its login there), refused when it is or
-        lies in ``~/.claude`` (D7.2). Without it, the login file
-        ``~/.claude/.credentials.json`` read-only (``file-ro``; a token the
-        CLI must refresh cannot be written back) and the user settings
-        ``~/.claude/settings.json`` read-only, both when present. A key in
-        ``ANTHROPIC_*`` or ``CLAUDE_CODE_OAUTH_TOKEN`` is an ``env`` item.
-        ``~/.claude`` and ``~/.claude.json`` are the operator configuration
-        roots.
+        set to an absolute path, that directory writable where it resolves
+        (``dir-rw``: the CLI rewrites its login there; the variable names it
+        there inside), refused when it is or lies in ``~/.claude`` (D7.2).
+        Without it, the login file ``~/.claude/.credentials.json`` read-only
+        (``file-ro``; a token the CLI must refresh cannot be written back)
+        and the user settings ``~/.claude/settings.json`` read-only, both
+        when present, each at that path in the private home, where the CLI
+        looks for it, even when the host path is a link to a file elsewhere.
+        A key in ``ANTHROPIC_*`` or ``CLAUDE_CODE_OAUTH_TOKEN`` is an ``env``
+        item. ``~/.claude`` and ``~/.claude.json`` are the operator
+        configuration roots.
         """
         needs = super().sandbox_requirements(profile, command, env, home)
         root = os.path.join(home, ".claude")
         config: list[str] = []
+        home_config: list[str] = []
         auth = [
             AuthItem(AuthMode.ENV, name)
             for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
@@ -956,13 +959,16 @@ class ClaudeCodeProvider(AgentProvider):
         else:
             login = os.path.join(root, ".credentials.json")
             if os.path.isfile(login):
-                auth.append(AuthItem(AuthMode.FILE_RO, "the Claude Code login", login))
+                auth.append(
+                    AuthItem(AuthMode.FILE_RO, "the Claude Code login", login, target=login)
+                )
             settings = os.path.join(root, "settings.json")
             if os.path.isfile(settings):
-                config.append(settings)
+                home_config.append(settings)
         return dataclasses.replace(
             needs,
             config=(*needs.config, *config),
+            home_config=(*needs.home_config, *home_config),
             auth=tuple(auth),
             operator_config_roots=(root, os.path.join(home, ".claude.json")),
         )

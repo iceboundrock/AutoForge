@@ -748,7 +748,10 @@ worktrees and, from a REMOTE agent, your checkout.
 - **Environment.** A path-valued variable AutoForge knows (the CA-bundle
   names, the per-launch configuration it sets, the provider's own) is unset
   when what it names is not visible inside, and `PATH` keeps only its
-  visible entries (D8.2); the run log names each unset variable.
+  visible entries (D8.2); the run log names each unset variable. A value,
+  or a `PATH` entry, that reaches what it names through a link the sandbox
+  does not show (one in your home, say) is set to where that is inside,
+  and so is one naming the cache directory, which appears at `~/.cache`.
 
 **What it does not change.** The launch still runs as your UID. An agent
 shares the host network: loopback services that act on request (a
@@ -771,28 +774,32 @@ one.
 
 - **Claude Code.** `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and
   `CLAUDE_CODE_OAUTH_TOKEN` pass as variables. With an absolute
-  `CLAUDE_CONFIG_DIR`, that directory is writable at its own path and the
+  `CLAUDE_CONFIG_DIR`, that directory is writable where it resolves (the
+  variable names it there inside, also when you set it to a link) and the
   CLI keeps and refreshes its login there; one that is, contains or lies
   inside `~/.claude` is refused. Without it, only
   `~/.claude/.credentials.json` and `~/.claude/settings.json` are projected,
-  read-only, when present: the CLI cannot write a refreshed subscription
-  token back, and nothing else of `~/.claude` or `~/.claude.json` is
-  visible. For unattended runs under `required`, give AutoForge a
+  read-only, when present, at those paths, also when they are links to
+  files elsewhere (a dotfiles directory, which stays hidden): the CLI
+  cannot write a refreshed subscription token back, and nothing else of
+  `~/.claude` or `~/.claude.json` is visible. For unattended runs under `required`, give AutoForge a
   dedicated `CLAUDE_CONFIG_DIR` (log in once with it set) or a token
   variable (`claude setup-token` prints one for `CLAUDE_CODE_OAUTH_TOKEN`).
 - **OpenCode.** Its per-launch empty `OPENCODE_CONFIG_DIR` is writable, and
   the `*_API_KEY` variables the allow-list passes reach it. With an
   absolute `OPENCODE_DB` (the database of its own that
   [Agent environment](#agent-environment) recommends), the database's
-  directory is writable at its own path, so the login made with it set
+  directory is writable where it resolves (`OPENCODE_DB` names the
+  database there inside), so the login made with it set
   (`opencode auth login`) is visible; a directory that is, contains or lies
   inside OpenCode's own configuration, data or cache directory
   (`~/.config/opencode`, `~/.local/share/opencode`, `~/.cache/opencode`) is
   refused. Without it, the login in your data directory is not visible, and
   a relative or `:memory:` database lives in the private home: use the
   provider's API-key variable.
-- **Pi.** An absolute `PI_CODING_AGENT_DIR` is writable at its own path,
-  where Pi rewrites `auth.json` and `models-store.json` at startup; one
+- **Pi.** An absolute `PI_CODING_AGENT_DIR` is writable where it resolves,
+  and the variable names it there inside, also when you set it to a link;
+  Pi rewrites `auth.json` and `models-store.json` at startup; one
   that is, contains or lies inside `~/.pi/agent` is refused. Without it Pi
   finds no sign-in inside, and with `require_oauth` (the default) its auth
   preflight, run in the same sandbox, refuses the launch

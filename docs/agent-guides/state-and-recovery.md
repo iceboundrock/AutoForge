@@ -501,7 +501,11 @@ directories (a link, another file type, one that cannot be checked, never
 taken for an empty store), an `info/alternates` or `info/http-alternates`
 file, or an entry that is neither a directory, a regular file nor an
 overlay whiteout, is tampering (`SandboxTamperError`), and the step enters `BLOCKED` naming the entry,
-with nothing read from the directory and nothing published. Inspect it,
+with nothing read from the directory and nothing published. The import
+reads the commit `HEAD` holds itself, after `lstat` found a regular file
+there: a `HEAD` the agent replaced with a link fails the import before any
+git process runs, nothing is packed or imported, and the candidate is
+refused with it. Inspect it,
 remove what does not belong there, then `unblock`. An import that fails
 otherwise (a corrupt object, say) is never retried and publishes nothing:
 before a launch it refuses the launch (`SandboxLaunchRefusedError`, before

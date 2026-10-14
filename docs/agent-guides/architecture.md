@@ -570,8 +570,18 @@ name AutoForge knows (the CA-bundle names of `DEFAULT_ENV_ALLOWLIST`,
 absolute value is not visible inside (`LaunchDescription.inside_path`) is
 unset; a value that is not an absolute path passes unchanged; `PATH` keeps
 only its visible entries, after the provider's interpreter directories,
-and is unset when none is left. The launch's facts record every unset
-name.
+and is unset when none is left. A kept value, a kept `PATH` entry and the
+variable an auth item names (`PI_CODING_AGENT_DIR`, `CLAUDE_CONFIG_DIR`)
+are spelled where they are inside (`inside_spelling`): as given when that
+spelling leads there inside (`LaunchDescription.resolve_inside` looks each
+component up in the description, following the links it recreates and
+those it shows), else where the compiler projected what they name: a link
+in the private home or where the root is empty is absent inside, and the
+cache appears at `~/.cache`. The launch's facts record every unset name.
+A file the CLI finds by its path in the home (Claude Code's
+`~/.claude/.credentials.json` and `~/.claude/settings.json`) is declared
+at that path (an auth item's `target`, `home_config`), so it appears
+there even when its host path is a link to a file elsewhere (C7).
 
 **The git surface, in every mode** (`src/autoforge/agent_worktree.py`,
 D6.3–D6.5). The redirect these close needs no sandbox, only a writable
@@ -587,17 +597,23 @@ the mode. Every git process is the controller's own `local_git_request`
   names the inconsistency and `git worktree repair`. A worktree created
   before #168 is reused once it binds, never refused for its age (D15.2).
 - **Candidate (D6.3).** `read_candidate` reads `worktrees/<id>/HEAD` with
-  `git --git-dir=<common>`, after `lstat` found a regular file there, never
-  through the worktree's `.git`, the admin dir's `commondir` or `gitdir`, or
-  `git -C <worktree>`. `_read_candidate` serves the `ANALYZE_EXECUTE`,
-  `FIX` and `REPLAN_REEXECUTE` result checks, so a `.git` rewritten to a
-  decoy repository cannot move the candidate.
+  `git --git-dir=<common>`, after `lstat` found a regular file there
+  (`head_problem`), never through the worktree's `.git`, the admin dir's
+  `commondir` or `gitdir`, or `git -C <worktree>`; an attached `HEAD` is
+  reported without resolving the reference it names. `_read_candidate`
+  serves the `ANALYZE_EXECUTE`, `FIX` and `REPLAN_REEXECUTE` result
+  checks, so a `.git` rewritten to a decoy repository cannot move the
+  candidate.
 - **Strict import (D6.5).** `import_private_objects` copies the objects the
   candidate reaches that the shared store lacks out of the issue's private
   object directory: `rev-list --objects` and `pack-objects` with the
   directory named through `GIT_ALTERNATE_OBJECT_DIRECTORIES` (never added
   to the shared store's alternates), then `index-pack --stdin --fix-thin
-  --strict` into the shared store. `private_objects_problem` walks the
+  --strict` into the shared store. The commit is the object id `HEAD`
+  holds, read by the controller itself after the same `lstat`: a `HEAD`
+  that is not a regular file is an `ObjectImportError` before any git
+  process runs (nothing packed or imported), and an attached one imports
+  nothing. `private_objects_problem` walks the
   directory first without following a link: the directory itself, and each
   one between the common dir and it, must be a real directory (`lstat`), so
   a link, another file type or one that cannot be checked is

@@ -225,10 +225,12 @@ on the host network
   The check is read-only and cheap, and it catches a sign-in that lapsed
   after `doctor` ran.
 - **Under `sandbox.mode: required`** (#168, ADR 0005 D7.1, D7.2), Pi
-  declares an absolute `PI_CODING_AGENT_DIR` as a directory writable at its
-  own path, since Pi rewrites `auth.json` and `models-store.json` there by
-  rename at startup, which a single-file bind refuses; `OPENAI_API_KEY` is
-  a variable, when it passes at all. A `PI_CODING_AGENT_DIR` that is,
+  declares an absolute `PI_CODING_AGENT_DIR` as a directory writable where
+  it resolves, the variable naming it there inside (a link to it, which
+  the sandbox does not show, is replaced by the directory), since Pi
+  rewrites `auth.json` and `models-store.json` there by rename at startup,
+  which a single-file bind refuses; `OPENAI_API_KEY` is a variable, when it
+  passes at all. A `PI_CODING_AGENT_DIR` that is,
   contains or lies inside `~/.pi/agent` is refused, because a sandboxed
   agent could then plant what the operator's next unsandboxed `pi` loads.
   Without one, the private home holds no sign-in, and with `require_oauth`

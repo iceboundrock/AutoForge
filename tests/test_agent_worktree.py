@@ -23,6 +23,7 @@ from autoforge.agent_worktree import (
     read_candidate,
 )
 from autoforge.errors import SandboxTamperError, VerificationError
+from autoforge.executor import ExecutionRequest, execute
 
 from .conftest import GIT_IDENT
 
@@ -195,6 +196,59 @@ def test_the_agents_commit_is_imported_into_the_shared_store(repo):
     assert read_candidate(repo["common"], repo["admin"], "w", None).head == head
     # Idempotent: a second import finds everything already there.
     assert import_private_objects(repo["common"], repo["admin"], repo["private"], None) == head
+
+
+def _recording(seen: list[ExecutionRequest]):
+    def runner(request: ExecutionRequest):
+        seen.append(request)
+        return execute(request)
+
+    return runner
+
+
+@pytest.mark.parametrize("kind", ["link", "dangling link"])
+def test_a_head_link_is_never_followed_by_the_import(repo, kind):
+    """The agent's commit is in the private directory and its ``HEAD`` is a
+    link to a file outside the store naming it (one the agent could not see
+    inside, or none yet): the import refuses before any git process reads
+    ``HEAD``, and nothing reaches the shared store (D6.3, D6.5)."""
+    head = _commit_privately(repo)
+    head_file = repo["admin"] / "HEAD"
+    outside = repo["base"] / "outside-HEAD"
+    if kind == "link":
+        outside.write_text(head + "\n")
+    head_file.unlink()
+    head_file.symlink_to(outside)
+    seen: list[ExecutionRequest] = []
+    with pytest.raises(ObjectImportError, match="is not a regular file") as caught:
+        import_private_objects(repo["common"], repo["admin"], repo["private"], _recording(seen))
+    assert "nothing was read or published" in str(caught.value)
+    assert seen == [] and not _shared_has(repo, head)
+    candidate = read_candidate(repo["common"], repo["admin"], "w", None)
+    assert candidate.head == "" and "is not a regular file" in candidate.problem
+
+
+def test_an_attached_head_imports_nothing_and_resolves_no_agent_reference(repo):
+    """``HEAD`` a regular file naming a per-worktree reference that is a link
+    to a file outside naming the agent's commit: the import reads the
+    object id ``HEAD`` holds itself and finds none, so git resolves nothing
+    the agent wrote; the candidate is attached and names no commit."""
+    head = _commit_privately(repo)
+    outside = repo["base"] / "outside-ref"
+    outside.write_text(head + "\n")
+    refs = repo["admin"] / "refs" / "worktree"
+    refs.mkdir(parents=True)
+    (refs / "agent").symlink_to(outside)
+    (repo["admin"] / "HEAD").write_text("ref: refs/worktree/agent\n")
+    seen: list[ExecutionRequest] = []
+    assert (
+        import_private_objects(repo["common"], repo["admin"], repo["private"], _recording(seen))
+        == ""
+    )
+    assert seen == [] and not _shared_has(repo, head)
+    candidate = read_candidate(repo["common"], repo["admin"], "w", _recording(seen))
+    assert candidate.attached is True and candidate.head == ""
+    assert [r.command[-1] for r in seen] == ["worktrees/2/HEAD"]  # symbolic-ref alone
 
 
 def test_a_corrupt_private_object_is_not_imported(repo):

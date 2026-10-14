@@ -280,14 +280,20 @@ Four more files, the same split by what they need from the host:
     LOCAL validation command that may run without a network and an agent
     that never does; an export command that sees only its tree;
   - the D8.2 rewrite: a path-valued name passes only when what it names is
-    visible;
+    visible; a value, a `PATH` entry or an auth item's variable reached
+    through a link the sandbox does not show (in the private home or
+    where the root is empty), or naming the relocated cache, is set to
+    where it is inside, with no further host path shown; one through a
+    link the sandbox recreates (`/bin`) keeps its spelling;
   - the D7.2 refusals, each naming the path and the rule: a declared
     writable directory on an operator root, a keyring login, a declared
     path inside a denied root; an auth directory named by its variable;
   - install roots (the package or the directory, a prefix with its `lib`,
     never the home) and a script's interpreter;
   - each adapter's declaration: Claude Code's login, settings and shell
-    file, its own `CLAUDE_CONFIG_DIR` writable and the operator's refused;
+    file, its login and settings at their home paths when they are links
+    into a dotfiles directory, its own `CLAUDE_CONFIG_DIR` writable and the
+    operator's refused;
     OpenCode's own database and configuration directory; Pi's
     `PI_CODING_AGENT_DIR`, never the operator's.
 - `tests/test_agent_worktree.py` runs real git on real repositories. It
@@ -299,6 +305,11 @@ Four more files, the same split by what they need from the host:
   - the D6.3 candidate read: the detached HEAD, an attached HEAD reported,
     a HEAD that is a link not read, pointer rewrites that do not move the
     candidate, a HEAD naming no commit read as none;
+  - a `HEAD` that is a link (to a file outside naming the agent's commit,
+    or dangling): the import fails before any git process runs and
+    nothing reaches the shared store; an attached `HEAD` whose
+    per-worktree reference is such a link imports nothing, and neither
+    the import nor the candidate read resolves it;
   - the D6.5 import: an empty or absent private directory imports
     nothing, an agent's commit reaches the shared store, a corrupt object
     does not, and `info/alternates`, `info/http-alternates`, a link or a
@@ -332,8 +343,15 @@ Four more files, the same split by what they need from the host:
   LOCAL validation command that gets `EROFS` on the git directory; an
   export command that sees its tree and no network when isolated; a
   `required` LOCAL run that reaches `DONE`; a `required` pre-merge command
-  that sees only the export; and an all-Pi run sandboxed in every child,
-  the auth preflight included.
+  that sees only the export; an all-Pi run sandboxed in every child,
+  the auth preflight included; a `HEAD` an agent replaced with a link to a
+  file invisible inside, which the import refuses before git reads it,
+  leaving the commit out of the shared store; and the linked provider
+  paths found inside: Pi's auth preflight (a fake that is ready only when
+  it reads `$PI_CODING_AGENT_DIR/auth.json`) with the directory or a link
+  to it, a fake Claude Code reading and writing through a linked
+  `CLAUDE_CONFIG_DIR` and reading linked default login and settings files,
+  and a fake OpenCode creating its database through a linked directory.
 
 `test_integration.py`'s full loops and `test_replan.py`'s hard-threshold
 replan run in both modes, and every launch under `required` carries a

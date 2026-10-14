@@ -23,11 +23,11 @@ from pathlib import Path
 import pytest
 
 from autoforge import sandbox_bwrap
-from autoforge.agent_worktree import import_private_objects, read_candidate
+from autoforge.agent_worktree import ObjectImportError, import_private_objects, read_candidate
 from autoforge.config import ProfileConfig, default_config
 from autoforge.errors import SandboxTamperError
 from autoforge.executor import ExecutionRequest, execute
-from autoforge.providers import AgentRequest, ClaudeCodeProvider, OpenCodeProvider
+from autoforge.providers import AgentRequest, ClaudeCodeProvider, OpenCodeProvider, PiProvider
 from autoforge.sandbox import NetworkPosition
 from autoforge.sandbox_policy import LaunchClass, LaunchFacts, SandboxPlan, describe_launch
 from autoforge.transitions import Phase
@@ -312,6 +312,191 @@ def test_an_alternates_file_written_through_the_overlay_is_tampering(backend, la
     assert (private / "info" / "alternates").exists()
     with pytest.raises(SandboxTamperError, match="info/alternates"):
         import_private_objects(paths["common"], paths["admin"], private, None)
+
+
+def test_a_head_link_written_inside_is_never_followed_by_the_import(backend, layout):
+    """An agent commits, then replaces its writable ``HEAD`` with a link to
+    a file outside, invisible inside, which names that commit on the host.
+    The import refuses the link before git reads anything: the commit never
+    reaches the shared store (ADR 0005 D6.3, D6.5)."""
+    paths = layout
+    common, admin = paths["common"], paths["admin"]
+    head_file, outside = admin / "HEAD", paths["base"] / "outside-HEAD"
+    code = (
+        "git = ['git', '-c', 'user.name=Agent', '-c', 'user.email=agent@example.invalid',"
+        " '-c', 'gc.auto=0']\n"
+        "write('inside.txt', 'made inside\\n')\n"
+        "subprocess.run(git + ['add', 'inside.txt'], check=True)\n"
+        "subprocess.run(git + ['commit', '-q', '-m', 'inside (#7)'], check=True)\n"
+        "head = subprocess.run(git + ['rev-parse', 'HEAD'], check=True,"
+        " capture_output=True, text=True).stdout.strip()\n"
+        f"os.unlink({str(head_file)!r})\n"
+        f"os.symlink({str(outside)!r}, {str(head_file)!r})\n"
+        f"report = {{'head': head, 'outside': attempt(lambda: read({str(outside)!r}))}}\n"
+        "print(json.dumps(report))\n"
+    )
+    report = _probe(describe_launch(_remote_facts(paths), None, {}), paths["worktree"], code)
+    assert report["outside"] == "ENOENT" and head_file.is_symlink()
+    outside.write_text(report["head"] + "\n")
+    seen: list[ExecutionRequest] = []
+
+    def runner(request: ExecutionRequest):
+        seen.append(request)
+        return execute(request)
+
+    with pytest.raises(ObjectImportError, match="is not a regular file"):
+        import_private_objects(common, admin, paths["sandbox"] / "objects", runner)
+    assert seen == []  # not a single git process: nothing was packed or imported
+    missing = subprocess.run(
+        ["git", "--git-dir", str(common), "cat-file", "-e", f"{report['head']}^{{commit}}"],
+        capture_output=True,
+    )
+    assert missing.returncode != 0
+    assert "is not a regular file" in read_candidate(common, admin, "w", None).problem
+
+
+def _reporting_cli(paths, name: str, probes: dict[str, str]) -> Path:
+    """A fake CLI that prints, as its last line, the outcome of each probe
+    run inside (``ok`` or the errno's name)."""
+    body = "\n".join(f"report[{k!r}] = attempt(lambda: {v})" for k, v in probes.items())
+    script = f"#!{PY}\n{_PROBE}\nreport = {{}}\n{body}\nprint(json.dumps(report))\n"
+    tool = _sentinel(paths["base"] / "tools" / name / "bin" / name, script)
+    tool.chmod(0o755)
+    return tool
+
+
+def _linked(link: Path, target: Path) -> Path:
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(target)
+    return link
+
+
+def _agent_request(paths, provider: str, command: Path, **options: str) -> AgentRequest:
+    return AgentRequest(
+        phase="ANALYZE_EXECUTE",
+        prompt="implement",
+        cwd=str(paths["worktree"]),
+        profile=ProfileConfig(
+            name="analyze_execute",
+            provider=provider,
+            model="openai/gpt-x",
+            effort="high",
+            command=str(command),
+            options=options,
+        ),
+        idle_timeout_seconds=None,
+        max_runtime_seconds=60,
+        env_allowlist=default_config().execution.environment_names(),
+        env={"GIT_CONFIG_GLOBAL": str(paths["config"] / "gitconfig")},
+        sandbox=SandboxPlan(_remote_facts(paths)),
+    )
+
+
+def _report(result) -> dict:
+    assert result.exit_code == 0, result.stderr
+    assert result.sandbox is not None and result.sandbox.enforced
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+@pytest.mark.parametrize("where", ["real", "home", "elsewhere"])
+def test_pis_auth_preflight_finds_a_linked_agent_directory(backend, layout, monkeypatch, where):
+    """A fake ``pi auth check`` that is ready only when it can read
+    ``$PI_CODING_AGENT_DIR/auth.json`` inside: the directory itself, or a
+    link to it in the private home or where the root is empty (D8.2)."""
+    paths = layout
+    real = _sentinel(paths["base"] / "pi-autoforge" / "auth.json", "{}\n").parent
+    agent_dir = {
+        "real": real,
+        "home": paths["home"] / ".pi-autoforge",
+        "elsewhere": paths["base"] / "links" / "pi-agent",
+    }[where]
+    if agent_dir != real:
+        _linked(agent_dir, real)
+    script = (
+        f"#!{PY}\nimport json, os, sys\n"
+        "provider = sys.argv[sys.argv.index('--model') + 1].split('/', 1)[0]\n"
+        "auth = os.path.join(os.environ.get('PI_CODING_AGENT_DIR', ''), 'auth.json')\n"
+        "if os.path.isfile(auth):\n"
+        "    print(json.dumps({'status': 'ready', 'provider': provider, 'authType': 'oauth'}))\n"
+        "    sys.exit(0)\n"
+        "print(json.dumps({'status': 'not_ready', 'provider': provider,"
+        " 'reason': 'credentials_not_configured'}))\n"
+        "sys.exit(1)\n"
+    )
+    fake = _sentinel(paths["base"] / "tools" / "pi" / "bin" / "pi", script)
+    fake.chmod(0o755)
+    monkeypatch.setenv("HOME", str(paths["home"]))
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(agent_dir))
+    provider = PiProvider()
+    req = _agent_request(paths, "pi", fake)
+    assert provider._auth_preflight(req, provider.environment_allowlist(req)) is None
+
+
+def test_claude_finds_a_linked_configuration_directory(backend, layout, monkeypatch):
+    """``CLAUDE_CONFIG_DIR`` through a link in the home: the fake reads its
+    login and writes a refreshed one where the variable leads inside."""
+    paths = layout
+    real = _sentinel(paths["base"] / "claude-autoforge" / ".credentials.json", "{}\n").parent
+    alias = _linked(paths["home"] / ".claude-autoforge", real)
+    fake = _reporting_cli(
+        paths,
+        "claude",
+        {
+            "login": "read(os.environ['CLAUDE_CONFIG_DIR'] + '/.credentials.json')",
+            "refresh": "write(os.environ['CLAUDE_CONFIG_DIR'] + '/refreshed.json')",
+        },
+    )
+    monkeypatch.setenv("HOME", str(paths["home"]))
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(alias))
+    req = _agent_request(paths, "claude", fake, output_format="text")
+    assert _report(ClaudeCodeProvider().execute(req)) == {"login": "ok", "refresh": "ok"}
+    assert (real / "refreshed.json").exists()
+
+
+def test_claudes_linked_default_files_are_found_where_it_looks(backend, layout, monkeypatch):
+    """``~/.claude/.credentials.json`` and ``~/.claude/settings.json`` as
+    links into a dotfiles directory: the fake reads both at their home
+    paths, and the dotfiles directory itself is absent inside."""
+    paths = layout
+    home = paths["home"]
+    dotfiles = home / "dotfiles"
+    login = home / ".claude" / ".credentials.json"
+    login.unlink()
+    _linked(login, _sentinel(dotfiles / "claude-login.json", "{}\n"))
+    _linked(home / ".claude" / "settings.json", _sentinel(dotfiles / "claude-settings.json", "{}"))
+    fake = _reporting_cli(
+        paths,
+        "claude",
+        {
+            "login": "read(os.path.expanduser('~/.claude/.credentials.json'))",
+            "settings": "read(os.path.expanduser('~/.claude/settings.json'))",
+            "dotfiles": f"read({str(dotfiles / 'claude-login.json')!r})",
+        },
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    req = _agent_request(paths, "claude", fake, output_format="text")
+    report = _report(ClaudeCodeProvider().execute(req))
+    assert report == {"login": "ok", "settings": "ok", "dotfiles": "ENOENT"}
+
+
+def test_opencode_finds_a_database_through_a_linked_directory(backend, layout, monkeypatch):
+    """``OPENCODE_DB`` in a directory reached through a link in the home: the
+    fake creates the database where the variable leads inside, which is the
+    dedicated directory on the host."""
+    paths = layout
+    real = paths["base"] / "opencode-autoforge"
+    real.mkdir()
+    alias = _linked(paths["home"] / ".opencode-autoforge", real)
+    fake = _reporting_cli(paths, "opencode", {"database": "write(os.environ['OPENCODE_DB'])"})
+    monkeypatch.setenv("HOME", str(paths["home"]))
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setenv("OPENCODE_DB", str(alias / "af.db"))
+    req = _agent_request(paths, "opencode", fake)
+    assert _report(OpenCodeProvider().execute(req)) == {"database": "ok"}
+    assert (real / "af.db").exists()
 
 
 def _local_facts(paths, network=NetworkPosition.HOST) -> LaunchFacts:

@@ -13,18 +13,21 @@ REMOTE run's issue worktree, whatever ``sandbox.mode`` says (#168).
   ``.git`` file.
 - **Candidate (D6.3).** :func:`read_candidate` reads the worktree's
   ``HEAD`` as ``worktrees/<id>/HEAD`` with ``--git-dir=<git common dir>``,
-  after ``lstat`` found a regular file there: never through the worktree's
-  ``.git`` file, the admin dir's ``commondir`` or ``gitdir``, or ``git -C
-  <worktree>``.
+  after ``lstat`` found a regular file there (:func:`head_problem`): never
+  through the worktree's ``.git`` file, the admin dir's ``commondir`` or
+  ``gitdir``, or ``git -C <worktree>``.
 - **Strict import (D6.5).** :func:`import_private_objects` copies the
   objects reachable from that ``HEAD`` which the shared store lacks out of
   the issue's private object directory (an enforced launch's overlay upper
   layer), through ``index-pack --strict``, which writes each object under
-  the id it computes from its bytes. :func:`private_objects_problem` walks
-  the directory first without following a link: a root that is not a real
-  directory reached from the common dir through real directories, an
-  alternates file, or an entry that is neither a directory, a regular file
-  nor an overlay whiteout, is tampering
+  the id it computes from its bytes. It reads the commit ``HEAD`` holds
+  itself, after the candidate read's ``lstat``: a link there fails the
+  import before anything is read through it, and an attached ``HEAD``
+  imports nothing. :func:`private_objects_problem` walks the directory
+  first without following a link: a root that is not a real directory
+  reached from the common dir through real directories, an alternates
+  file, or an entry that is neither a directory, a regular file nor an
+  overlay whiteout, is tampering
   (:class:`~autoforge.errors.SandboxTamperError`).
 
 Every git process is the controller's own hardened local request
@@ -157,8 +160,9 @@ class Candidate:
     """The worktree's ``HEAD`` as the controller reads it (D6.3).
 
     ``attached``: ``HEAD`` is a symbolic reference. ``head``: the commit it
-    names, "" when it names none the shared store holds. ``problem``: why
-    there is no ``HEAD`` to read at all (not a regular file), else "".
+    names, "" when it is attached or names none the shared store holds.
+    ``problem``: why there is no ``HEAD`` to read at all (not a regular
+    file), else "".
     """
 
     attached: bool
@@ -181,22 +185,40 @@ def _admin_git(
     return res.exit_code, res.stdout.strip()
 
 
-def read_candidate(common: Path, admin: Path, worktree: str, runner: Runner | None) -> Candidate:
-    """The candidate: ``worktrees/<id>/HEAD`` addressed through the common dir (D6.3).
+def head_problem(admin: Path) -> str | None:
+    """Why git may not read the admin dir's ``HEAD``, or ``None`` (D6.3).
 
-    An inconclusive git read is a :class:`VerificationError`, never a guess.
+    ``lstat``, no link followed: anything but a regular file is named,
+    since git follows a link there (to a file the agent wrote outside the
+    store, invisible inside) and reads the commit it names. Checked before
+    ``HEAD`` is read at all, by the candidate read and by the import.
     """
     head_file = admin / "HEAD"
     try:
         mode = os.lstat(head_file).st_mode
     except OSError as exc:
-        return Candidate(False, "", f"{head_file} cannot be read ({exc.strerror})")
+        return f"{head_file} cannot be read ({exc.strerror})"
     if not stat.S_ISREG(mode):
-        return Candidate(False, "", f"{head_file} is not a regular file")
+        return f"{head_file} is not a regular file"
+    return None
+
+
+def read_candidate(common: Path, admin: Path, worktree: str, runner: Runner | None) -> Candidate:
+    """The candidate: ``worktrees/<id>/HEAD`` addressed through the common dir (D6.3).
+
+    An inconclusive git read is a :class:`VerificationError`, never a guess.
+    """
+    problem = head_problem(admin)
+    if problem:
+        return Candidate(False, "", problem)
     ref = f"worktrees/{admin.name}/HEAD"
     attached, _ = _admin_git(
         common, ["symbolic-ref", "-q", ref], runner, "whether HEAD is detached", worktree
     )
+    if attached == 0:
+        # Never a candidate: the reference it names (one the agent may have
+        # written in its admin dir) is not resolved.
+        return Candidate(True, "")
     found, head = _admin_git(
         common,
         ["rev-parse", "--verify", "-q", f"{ref}^{{commit}}"],
@@ -206,7 +228,7 @@ def read_candidate(common: Path, admin: Path, worktree: str, runner: Runner | No
     )
     if found != 0 or not _SHA_RE.fullmatch(head):
         head = ""
-    return Candidate(attached == 0, head)
+    return Candidate(False, head)
 
 
 def _root_problem(common: Path, private: Path) -> str | None:
@@ -320,13 +342,19 @@ def import_private_objects(
     Returns the ``HEAD`` commit the import covered ("" when the directory
     holds nothing, or ``HEAD`` names no commit even with it). The walk of
     :func:`private_objects_problem` comes first: tampering is a
-    :class:`SandboxTamperError`. Then ``rev-list --objects <head> --not
-    --branches --tags --remotes <exclude>`` with the private directory as an
-    alternate, the objects the shared store does not hold, ``pack-objects``
-    of exactly those, and ``index-pack --stdin --fix-thin --strict`` into the
-    shared store. Idempotent; a failure is :class:`ObjectImportError` and is not
-    retried here. ``exclude`` are commits the shared store holds (the
-    phase's recorded base), so the walk stops there.
+    :class:`SandboxTamperError`. A ``HEAD`` that is not a regular file
+    (:func:`head_problem`, the check :func:`read_candidate` makes) is an
+    :class:`ObjectImportError` before git reads anything: nothing is packed
+    or imported, and the candidate read refuses the candidate with it. The
+    commit is the object id ``HEAD`` holds, read without following a link;
+    an attached ``HEAD`` imports nothing (it is never a candidate). Then
+    ``rev-list --objects <head> --not --branches --tags --remotes
+    <exclude>`` with the private directory as an alternate, the objects the
+    shared store does not hold, ``pack-objects`` of exactly those, and
+    ``index-pack --stdin --fix-thin --strict`` into the shared store.
+    Idempotent; a failure is :class:`ObjectImportError` and is not retried
+    here. ``exclude`` are commits the shared store holds (the phase's
+    recorded base), so the walk stops there.
     """
     if not holds_objects(private):
         return ""
@@ -336,6 +364,12 @@ def import_private_objects(
             f"the private object directory {private} of the agent worktree has been "
             f"tampered with: {problem}. Nothing was read from it and nothing was published; "
             "inspect it, and remove what does not belong there before unblocking the run"
+        )
+    problem = head_problem(admin)
+    if problem:
+        raise ObjectImportError(
+            f"the strict import of the agent's commits from {private} did not start: "
+            f"{problem}, and git would follow it; nothing was read or published"
         )
     alternate = {"GIT_ALTERNATE_OBJECT_DIRECTORIES": str(private)}
     git_dir = ["--git-dir", str(common)]
@@ -360,8 +394,18 @@ def import_private_objects(
             )
         return res
 
-    ref = f"worktrees/{admin.name}/HEAD^{{commit}}"
-    found = git(["rev-parse", "--verify", "-q", ref], "reading HEAD", env=alternate, allow=(0, 1))
+    detached = _read_pointer(admin / "HEAD")
+    if detached is None or not _SHA_RE.fullmatch(detached):
+        # Attached (``ref: ...``), or no object id: no candidate to cover,
+        # and no reference the agent wrote is resolved. The candidate read
+        # says why there is none.
+        return ""
+    found = git(
+        ["rev-parse", "--verify", "-q", f"{detached}^{{commit}}"],
+        "reading HEAD",
+        env=alternate,
+        allow=(0, 1),
+    )
     head = found.stdout.strip()
     if found.exit_code != 0 or not _SHA_RE.fullmatch(head):
         return ""

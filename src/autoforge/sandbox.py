@@ -285,6 +285,70 @@ class LaunchDescription:
                 return inner
         return None
 
+    def resolve_inside(self, path: str) -> str | None:
+        """Where the absolute ``path``, as spelled, leads inside: ``realpath`` there.
+
+        Each component is looked up in the description as the kernel would
+        look it up inside: a recreated link is followed; below a bind or an
+        overlay, the host entry it shows is read (``lstat``, ``readlink``)
+        and a link there is followed inside; a mount target, or a directory
+        on the way to one, is a directory; anything else is absent. From the
+        first absent component on, the rest is kept as spelled, as
+        ``realpath`` does; ``None`` for a loop of links. For the engine's
+        environment rewrite (ADR 0005 D8.2): a value whose spelling does not
+        lead to :meth:`inside_path` of its host target is replaced by it.
+        """
+        entries = list(self.mounts)
+        pending = [part for part in path.split("/") if part]
+        current = "/"
+        followed = 0
+        while pending:
+            part = pending.pop(0)
+            if part == ".":
+                continue
+            if part == "..":
+                current = posixpath.dirname(current)
+                continue
+            candidate = posixpath.join(current, part)
+            exists, link = _lookup(entries, candidate)
+            if not exists:
+                return posixpath.normpath(posixpath.join(candidate, *pending))
+            if link is None:
+                current = candidate
+                continue
+            followed += 1
+            if followed > _MAX_LINKS:
+                return None
+            if link.startswith("/"):
+                current = "/"
+            pending = [p for p in link.split("/") if p] + pending
+        return current
+
+
+# As many links as one lookup follows before it is a loop (the kernel's 40).
+_MAX_LINKS = 40
+
+
+def _lookup(entries: list[Mount], path: str) -> tuple[bool, str | None]:
+    """Whether ``path`` (its parent resolved inside) exists inside, and the link it is."""
+    covering = _innermost(entries, path)
+    if isinstance(covering, Link):
+        return (True, covering.points_to) if covering.target == path else (False, None)
+    if any(_inside(entry.target, path) for entry in entries):
+        # A mount target, or a directory the backend makes on the way to one:
+        # none of them is a link (C1, C2).
+        return True, None
+    if isinstance(covering, Bind | Overlay):
+        source = covering.source if isinstance(covering, Bind) else covering.lower
+        host = _rebase(path, covering.target, source)
+        try:
+            if stat.S_ISLNK(os.lstat(host).st_mode):
+                return True, os.readlink(host)
+        except OSError:
+            return False, None
+        return True, None
+    return False, None  # in a mask, a private mount or the empty root
+
 
 TEARDOWN_UNCOUNTED = "removed by namespace teardown, uncounted"
 
