@@ -196,11 +196,14 @@ merge:
   # own code, so it cannot tell whether the PR weakened what its tests
   # assert; these commands are the controller's own evidence, run only after
   # every GitHub-side fact above has passed. The reviewed commit is exported
-  # into a fresh temporary directory (`git read-tree` + `checkout-index`; no
-  # worktree, no branch, no `.git`, submodules not populated) which is the
-  # commands' cwd -- a command that needs git metadata (`git describe`,
-  # `setuptools-scm` version stamping) or a submodule fails there, so keep
-  # such steps out of this list. If the commit is not local yet,
+  # into a fresh temporary directory which is the commands' cwd: its
+  # committed bytes, written from git's object store and proven to hash back
+  # to the commit's tree (no worktree, no branch, no `.git`, submodules not
+  # populated; no eol conversion, `ident` or filter driver applied, so LFS
+  # pointers stay pointers). A command that needs git metadata (`git
+  # describe`, `setuptools-scm` version stamping), a submodule, LFS content
+  # or converted line endings fails there, so keep such steps out of this
+  # list. If the commit is not local yet,
   # `refs/pull/<n>/head` is fetched from `origin` (objects only, no local
   # ref). A non-zero exit or a timeout (`execution.command_timeout_seconds`)
   # is BLOCKED with the output tail; an unfetchable or unexportable commit is

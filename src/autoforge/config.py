@@ -449,11 +449,12 @@ class MergeConfig:
     # without touching any protected path; nothing GitHub reports can tell
     # that apart from a real pass. These argv arrays (never shell strings)
     # are the controller's own evidence: once every GitHub-side check has
-    # passed, the exact reviewed commit is exported -- `git read-tree` +
-    # `git checkout-index` into a private temporary directory, never the
-    # operator's checkout, never a worktree or branch -- and each command
-    # runs there in order, under `execution.command_timeout_seconds`. Any
-    # non-zero exit or timeout BLOCKS the merge for a human. A pass is
+    # passed, the exact reviewed commit is exported -- its committed bytes,
+    # proven against the commit's tree (`materialize.py`), into a private
+    # temporary directory, never the operator's checkout, never a worktree
+    # or branch -- and each command runs there in order, under
+    # `execution.command_timeout_seconds`. Any non-zero exit or timeout
+    # BLOCKS the merge for a human. A pass is
     # persisted against the HEAD and the command list, so MERGE does not
     # repeat it for the same commit. An empty list disables this
     # verification: the commands are the project's own (`pytest`, `make

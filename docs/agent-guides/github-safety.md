@@ -846,8 +846,10 @@ URL, target, method, path or command in its request is refused.
   `LOCAL_GIT_ENV_ALLOWLIST`, with no token and no `GIT_*` variable of the
   operator's shell, so nothing a hook, monitor or `GIT_CONFIG_*` planted in
   the shared repository or the shell could start runs with the controller's
-  credential. A filter driver still runs during a checkout or export, with
-  no more authority than the agent. `autoforge doctor` is an operator
+  credential. A filter driver still runs during a checkout (the per-issue
+  worktree's), with no more authority than the agent; the pre-merge export
+  reads objects only and runs none ("Controller-run verification commands"
+  below). `autoforge doctor` is an operator
   diagnostic outside any run and keeps its own requests: it runs only
   `git --version`, `rev-parse --show-toplevel` and `remote get-url`, none
   of which starts a hook, the monitor or a filter, plus the launch
@@ -1532,15 +1534,46 @@ name stayed the same while its command changed passes. Setting the key to
 
 `merge.verification_commands` (argv lists, empty by default) run on the
 operator's machine after every GitHub-side fact above has passed, in a fresh
-temporary export of the reviewed HEAD: `git read-tree` +
-`git checkout-index` into `autoforge-premerge-*`, so no worktree or branch is
-created, the operator's checkout is untouched and there is no `.git` for a
-command to reach; the export is deleted afterwards. That also means a command
-that needs git metadata (`git describe`, `setuptools-scm` and other version
-stamping) or populated submodules fails in the export, so keep those out of
-the list or make them tolerate a plain tree. A commit that is not local yet
-is fetched from `origin` as `refs/pull/<n>/head`, objects only, without
-creating a local ref. A non-zero exit or a timeout
+temporary export of the reviewed HEAD (`autoforge-premerge-*` in the system
+temporary directory, mode `0700`), so no worktree or branch is created, the
+operator's checkout is untouched and there is no `.git` for a command to
+reach; the export is deleted afterwards.
+
+The export is byte-exact (`src/autoforge/materialize.py`, ADR 0006 D6, #171).
+The commit and every blob it names must be in the shared object store. Its
+tree is listed with `git ls-tree -r -t -z --full-tree` and every blob is
+streamed with `git cat-file --batch` and written as its committed bytes:
+regular files `0644`, executables `0755`, symlinks as their link text (never
+followed), gitlinks as empty directories, every entry created exclusively
+below the directory made for its parent. No index, `checkout-index`,
+attribute, eol conversion, `ident`, filter driver, `core.autocrlf`,
+`info/attributes` or `core.attributesFile` takes part, whether the candidate
+or the operator configured it, so no host filter program runs on candidate
+content. An entry named `.`, `..` or `.git` (any case), or a name holding
+`/`, is refused before anything is written. Before any command runs, the
+controller's own walk re-hashes the directory without following a link:
+blob ids from the bytes and modes on disk, tree ids bottom up in the
+repository's object format, each gitlink an empty directory standing for the
+commit the tree records, and the root must be the commit's tree with no
+entry extra or missing. A mismatch (a case-folding filesystem, a full disk,
+a legacy `100664` mode, which `ls-tree` reports as `100644`) is a
+materialization failure, inconclusive like any other unexportable commit.
+
+The commands therefore see the committed bytes:
+
+- checkout-time eol conversion, `ident` expansion and filter drivers are
+  not applied;
+- LFS pointers stay pointers;
+- git metadata and submodules are absent.
+
+A command that needs git metadata (`git describe`, `setuptools-scm` and
+other version stamping), populated submodules, LFS content or converted
+line endings fails in the export, so keep those out of the list or make
+them tolerate a plain tree.
+
+A commit that is not local yet is fetched from `origin` as
+`refs/pull/<n>/head`, objects only, without creating a local ref. A non-zero
+exit or a timeout
 (`execution.command_timeout_seconds`, wall clock) is `BLOCKED` with the redacted output
 tail; an unfetchable or unexportable commit is inconclusive and re-checked by
 `resume --allow-merge`. A pass is persisted with the HEAD and the command
@@ -1548,9 +1581,9 @@ list, so a resume at the same HEAD does not rerun it and a changed command
 list or a new HEAD does; it is cleared when the run moves to the next issue.
 Each run is logged like an agent invocation. Dry-run runs nothing and lists
 the commands in the plan; `autoforge doctor` reports what is configured
-without running it. Submodules are not populated in the export, and the
-commands run under the same allow-listed environment as an agent
-(`execution.env_allowlist`), not the operator's whole shell, with the same
+without running it. The commands run under the same allow-listed
+environment as an agent (`execution.env_allowlist`), not the operator's
+whole shell, with the same
 controller-set variables and preflight ("Agents hold no GitHub credential"
 above): a preflight refusal blocks the merge like a failing command.
 Under `sandbox.mode: required` each command runs in the outer sandbox with

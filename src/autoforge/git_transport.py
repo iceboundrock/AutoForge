@@ -113,8 +113,8 @@ LOCAL_GIT_SWITCHES: tuple[str, ...] = (
 # temporary files, and ``HOME`` / ``XDG_CONFIG_HOME`` so a process in the
 # operator's repository still reads the operator's global configuration
 # (``safe.directory`` lives there). No ``GIT_*`` variable and no token: what
-# such a process runs (a filter driver during the export) has no more
-# authority than the agent.
+# such a process runs (a filter driver during a worktree's checkout) has no
+# more authority than the agent.
 LOCAL_GIT_ENV_ALLOWLIST: tuple[str, ...] = (
     "PATH",
     "LANG",

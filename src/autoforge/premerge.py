@@ -14,7 +14,9 @@ merge gate adds on top of the hosted check:
 - :func:`export_commit_tree` materialises the exact reviewed commit into a
   private temporary directory -- no worktree, no branch, no ``.git`` -- so
   ``merge.verification_commands`` can run the reviewed code on the
-  operator's machine without touching the operator's checkout.
+  operator's machine without touching the operator's checkout. The bytes
+  are the committed bytes, proven by hashing them back to the commit's tree
+  (:mod:`autoforge.materialize`, #171).
 
 Both are pure with respect to workflow state; the engine decides what a
 difference or a failing command means for the phase.
@@ -26,8 +28,9 @@ and the commit-graph are off, so a ``refs/replace/*`` entry or a forged
 ``objects/info/commit-graph`` can neither make a missing commit present nor
 swap the tree the export writes. Hooks and the file-system monitor are off
 too (D7.3), and each process starts from an allow-listed environment that
-holds no credential and no operator ``GIT_*`` variable, so what git runs on
-the repository's behalf (a filter driver during the export) gets no token.
+holds no credential and no operator ``GIT_*`` variable. The export reads
+objects only (``ls-tree`` and ``cat-file``), so no attribute, filter driver
+or eol conversion the operator or the candidate configured takes part.
 Fetching the reviewed commit is not done here: it is the controller's own
 network operation, :meth:`autoforge.git_transport.GitTransport.fetch`, which
 reads no repository configuration at all (D7.1).
@@ -35,8 +38,6 @@ reads no repository configuration at all (D7.1).
 
 from __future__ import annotations
 
-import shutil
-import tempfile
 from collections import Counter
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -47,21 +48,23 @@ from .errors import GitTransportError, VerificationError
 from .executor import ExecutionRequest, ExecutionResult
 from .git_transport import GitTransport, local_git_request
 from .github import WorkflowRunJobs
-from .redaction import redact
+from .materialize import materialize, read_object_format
 
 Runner = Callable[[ExecutionRequest], ExecutionResult]
 
-# The export is plumbing, never a checkout: a private index file is filled
-# from the commit's tree and written out with a path prefix. The operator's
-# index, HEAD, working tree and stash are not read or written.
+# The export is plumbing, never a checkout: objects are read by id and
+# written out by the controller. The operator's index, HEAD, working tree
+# and stash are not read or written.
 _GIT_TIMEOUT_SECONDS = 600
 
+# Where the merge gate's export is created, under the system temporary
+# directory (ADR 0006 D6.2).
+EXPORT_PREFIX = "autoforge-premerge-"
 
-def _local_request(
-    repo: str, args: list[str], env: dict[str, str] | None = None
-) -> ExecutionRequest:
+
+def _local_request(repo: str, args: list[str]) -> ExecutionRequest:
     """One hardened git process in the operator's repository ``repo``."""
-    return local_git_request(["-C", repo, *args], env=env, timeout_seconds=_GIT_TIMEOUT_SECONDS)
+    return local_git_request(["-C", repo, *args], timeout_seconds=_GIT_TIMEOUT_SECONDS)
 
 
 def describe_definition_difference(pr_jobs: WorkflowRunJobs, base_jobs: WorkflowRunJobs) -> str:
@@ -126,20 +129,6 @@ class ExportedTree:
     root: Path
 
 
-def _git(runner: Runner, repo: str, args: list[str], env: dict[str, str] | None = None) -> str:
-    """Run one git plumbing command against ``repo``; non-zero exit is a failure."""
-    res = runner(_local_request(repo, args, env))
-    shown = " ".join(["git", *args])
-    if res.timed_out:
-        raise VerificationError(f"`{shown}` timed out after {_GIT_TIMEOUT_SECONDS}s")
-    if res.exit_code != 0:
-        tail = redact((res.stderr or res.stdout or "").strip()[-500:])
-        raise VerificationError(f"`{shown}` failed (exit {res.exit_code}): {tail}")
-    if res.truncated:
-        raise VerificationError(f"`{shown}` output was truncated at the executor's capture bound")
-    return res.stdout or ""
-
-
 def commit_is_local(runner: Runner, repo: str, sha: str) -> bool:
     """Whether ``repo``'s object store holds a commit named ``sha``.
 
@@ -169,26 +158,24 @@ def fetch_pr_head(transport: GitTransport, pr_number: int) -> None:
 def export_commit_tree(runner: Runner, repo: str, sha: str) -> Iterator[ExportedTree]:
     """Write the tree of ``sha`` into a fresh temporary directory, then delete it.
 
-    ``git read-tree`` into a private index (``GIT_INDEX_FILE``) followed by
-    ``git checkout-index --prefix`` exports every tracked file of exactly
-    that commit and nothing else: no ``.git`` (the exported code cannot
-    reach the repository through git), no attribute filtering (unlike
-    ``git archive``, whose ``export-ignore`` would silently drop files), no
-    worktree or branch (nothing for the operator to clean up, nothing that
-    collides with their checkout). Submodules are not populated.
+    The byte-exact materializer (:func:`autoforge.materialize.materialize`)
+    writes every blob of exactly that commit as its committed bytes and
+    proves the directory hashes back to the commit's tree before the body
+    runs: no ``.git`` (the exported code cannot reach the repository through
+    git), no attribute, eol conversion, ``ident`` or filter driver (unlike a
+    checkout, whose bytes depend on the operator's git configuration and
+    which runs the filter programs it names), nothing dropped (unlike ``git
+    archive``'s ``export-ignore``), no worktree or branch (nothing for the
+    operator to clean up, nothing that collides with their checkout).
+    Submodules are not populated: a gitlink is an empty directory. The
+    directory is ``EXPORT_PREFIX`` + a random suffix in the system temporary
+    directory, and is deleted when the context exits.
 
-    Raises VerificationError when the commit cannot be materialised; the
-    caller decides whether that is inconclusive or conclusive.
+    Raises VerificationError (a :class:`~autoforge.errors.MaterializationError`
+    or :class:`~autoforge.errors.CandidateNotMaterializableError` among them)
+    when the commit cannot be materialised; the caller decides whether that
+    is inconclusive or conclusive.
     """
-    root = Path(tempfile.mkdtemp(prefix="autoforge-premerge-"))
-    try:
-        index = root / "index"
-        tree = root / "tree"
-        tree.mkdir()
-        env = {"GIT_INDEX_FILE": str(index)}
-        _git(runner, repo, ["read-tree", f"{sha}^{{tree}}"], env)
-        # The trailing separator is what makes --prefix a directory.
-        _git(runner, repo, ["checkout-index", "-a", "-f", f"--prefix={tree}/"], env)
-        yield ExportedTree(sha=sha, root=tree)
-    finally:
-        shutil.rmtree(root, ignore_errors=True)
+    object_format = read_object_format(runner, repo)
+    with materialize(runner, repo, sha, object_format, prefix=EXPORT_PREFIX) as tree:
+        yield ExportedTree(sha=sha, root=tree.root)

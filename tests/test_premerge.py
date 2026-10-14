@@ -10,12 +10,13 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import tempfile
 import zlib
 from pathlib import Path
 
 import pytest
 
-from autoforge.errors import VerificationError
+from autoforge.errors import CandidateNotMaterializableError, VerificationError
 from autoforge.executor import ExecutionRequest, ExecutionResult, execute
 from autoforge.git_transport import (
     LOCAL_GIT_ENV_ALLOWLIST,
@@ -210,14 +211,16 @@ def test_export_cleans_up_when_the_body_raises(tmp_path):
     assert not root.exists()
 
 
-def test_export_of_an_unknown_commit_is_a_verification_error(tmp_path):
+def test_export_of_an_unknown_commit_is_a_verification_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     repo = git_repo(tmp_path / "repo")
     _commit_file(repo, "a.txt", "x", "c")
     missing = "f" * 40
     assert not commit_is_local(execute, str(repo), missing)
-    with pytest.raises(VerificationError, match="read-tree"):
+    with pytest.raises(CandidateNotMaterializableError, match="not in the shared object store"):
         with export_commit_tree(execute, str(repo), missing):
             pytest.fail("the body must not run")
+    assert issubclass(CandidateNotMaterializableError, VerificationError)  # still inconclusive
     assert not list(Path(tmp_path).glob("autoforge-premerge-*"))
 
 
@@ -345,7 +348,13 @@ def test_the_export_writes_the_named_commits_own_tree(tmp_path, mechanism):
         assert (exported.root / "a.txt").read_text() == "named\n"
 
 
-def test_premerge_git_is_hardened_and_runs_filters_without_credentials(tmp_path, monkeypatch):
+def test_premerge_git_is_hardened_and_runs_no_filter(tmp_path, monkeypatch):
+    """The export reads objects only (#171): an operator's filter driver never runs.
+
+    Before #171 the export was a ``checkout-index``, which ran the filter
+    without credentials; now it runs nothing at all, and every git process
+    is still hardened.
+    """
     repo = git_repo(tmp_path / "repo")
     sha = _commit_file(repo, "a.txt", "content\n", "c")
     decoy = git_repo(tmp_path / "decoy")
@@ -374,13 +383,16 @@ def test_premerge_git_is_hardened_and_runs_filters_without_credentials(tmp_path,
     with export_commit_tree(runner, str(repo), sha) as exported:
         assert (exported.root / "a.txt").read_text() == "content\n"
 
-    assert dump.exists()  # the filter ran, and saw no credential and no planted GIT_*
-    seen = dump.read_text()
-    assert "ghp_controllertokenvalue" not in seen
-    assert str(decoy) not in seen and "GIT_CONFIG_COUNT" not in seen
+    assert not dump.exists()  # the filter program never ran on the commit's content
     assert not sentinel.exists()
-    assert len(requests) == 3
+    subcommands = [request.command[1 + len(LOCAL_GIT_SWITCHES) + 2] for request in requests]
+    assert "checkout-index" not in subcommands and "read-tree" not in subcommands
+    assert set(subcommands) == {"cat-file", "rev-parse", "ls-tree"}
     for request in requests:
+        assert request.command[1 + len(LOCAL_GIT_SWITCHES) : 3 + len(LOCAL_GIT_SWITCHES)] == [
+            "-C",
+            str(repo),
+        ]
         assert request.command[: 1 + len(LOCAL_GIT_SWITCHES)] == ["git", *LOCAL_GIT_SWITCHES]
         assert request.env_allowlist == LOCAL_GIT_ENV_ALLOWLIST
         assert not any(name.startswith("GIT_") for name in request.env_allowlist)

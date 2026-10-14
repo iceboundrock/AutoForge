@@ -5708,6 +5708,53 @@ def test_failing_verification_command_blocks_the_merge(tmp_state_dir, fake_githu
     assert eng.state.premerge_verified_head_sha == ""
 
 
+def test_verification_commands_see_the_committed_bytes(tmp_state_dir, fake_github):
+    """#171: the export holds the reviewed commit's bytes whatever the operator's git
+    configuration says: no eol conversion, no ``ident``, and no filter program runs."""
+    exact = (
+        "import pathlib, sys; "
+        "sys.exit(0 if pathlib.Path('proof.txt').read_bytes() == b'v1 $Id$\\n' else 3)"
+    )
+    eng, sha = _in_merge_on_commit(
+        tmp_state_dir, fake_github, [["python3", "-c", exact]], content="v1 $Id$\n"
+    )
+    repo = tmp_state_dir.parent
+    sentinel = repo / "smudge-ran"
+    (repo / ".git" / "info").mkdir(exist_ok=True)
+    (repo / ".git" / "info" / "attributes").write_text("* text eol=crlf ident filter=x\n")
+    _git(repo, "config", "core.autocrlf", "true")
+    _git(repo, "config", "filter.x.smudge", f"touch {sentinel}; cat")
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "UPDATE_EPIC" and len(fake_github.merges) == 1
+    assert not sentinel.exists()
+    assert eng.state.premerge_verified_head_sha == sha
+
+
+def test_an_unexportable_reviewed_head_is_inconclusive_not_blocked(tmp_state_dir, fake_github):
+    """#171: a local commit the materializer refuses (a tree holding a ``.git`` entry) is
+    inconclusive, like an unfetchable one: no command runs, nothing is cached or merged."""
+    repo = git_repo(tmp_state_dir.parent)
+
+    def plumbing(*args: str, data: bytes) -> str:
+        return subprocess.run(
+            ["git", "-C", str(repo), *args], input=data, capture_output=True, check=True
+        ).stdout.decode()
+
+    blob = plumbing("hash-object", "-w", "--stdin", data=b"[core]\n\thooksPath = /tmp\n").strip()
+    tree = plumbing("mktree", data=f"100644 blob {blob}\t.git\n".encode()).strip()
+    sha = _git(repo, "-c", "user.name=t", "-c", "user.email=t@x", "commit-tree", "-m", "x", tree)
+    fake_github.add_pr(head_sha=sha)
+    eng = _in_merge(tmp_state_dir, fake_github, reviewed=sha)
+    marker = tmp_state_dir.parent / "cwd.txt"
+    eng.config.merge.verification_commands = [_record_cwd(marker)]
+    with pytest.raises(VerificationError, match="could not be exported") as info:
+        eng.step(allow_merge=True)
+    assert "the entry .git is refused" in str(info.value)
+    assert eng.state.phase == Phase.MERGE and eng.state.attempt == 1
+    assert fake_github.merges == [] and not marker.exists()
+    assert eng.state.premerge_verified_head_sha == ""
+
+
 def test_verification_command_timeout_blocks_the_merge(tmp_state_dir, fake_github):
     commands = [["python3", "-c", "import time; time.sleep(30)"]]
     eng, _ = _in_merge_on_commit(tmp_state_dir, fake_github, commands)
@@ -11078,15 +11125,15 @@ def test_agent_launch_carries_the_configured_environment_allowlist(tmp_state_dir
 
 def test_validation_and_premerge_commands_run_under_the_allowlist(tmp_state_dir, fake_github):
     """Repository-defined commands get the agent's environment, not the operator's shell."""
-    fake_github.add_pr()
-    eng = _in_merge(tmp_state_dir, fake_github)
+    eng, _ = _in_merge_on_commit(tmp_state_dir, fake_github, [["true"]])
     eng.config.execution.env_allowlist_extra = ["MY_TOOL_*"]
-    eng.config.merge.verification_commands = [["true"]]
     seen = []
 
     def runner(req):
         seen.append(req)
-        if is_shell_probe(req):
+        # The export's git plumbing runs for real: the export is proven to
+        # be the reviewed commit, which an empty answer is not (#171).
+        if is_shell_probe(req) or req.command[0] == "git":
             return execute(req)
         return ExecutionResult(req.command, req.cwd, 0, "", "", "t", "t")
 
