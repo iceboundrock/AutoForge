@@ -8,6 +8,10 @@
   removal and the agent read path). The number is assigned when the record
   merges: if another ADR merges first, this record takes the next free
   number, and its index entries move with it.
+- **Amended by #211:** effect kind K9 (the acceptance comment on the run's
+  own issue), its authorization precondition (D5.6), the decline of an
+  unsent acceptance action (D5.7), its D1.2 row and its own protocol bump
+  (D13.9).
 - **Decides:** #159, for EPIC #158 (Wave 1).
 - **Where:** placement is decided in §2.12. Existing code this record
   builds on: `src/autoforge/github.py`, `claims.py`, `result_parser.py`,
@@ -227,6 +231,7 @@ prompts make no GitHub call and are out of scope.
 | optional resolution reply on the PR | `fix.md` :91 | controller-only | dropped (D5.3) | #163 |
 | replacement branch publication and `gh pr create` | `replan_reexecute.md` §15, §20 :679, :699, :730 | controller-only | effects K1 and K7 | #164 |
 | `gh issue comment` (progress) | `update_epic.md` :22 | controller-only | effect K8 | #160 |
+| comment on the run's own issue as acceptance evidence (a finding or acceptance criterion asks for text posted on the issue) | no prompt before #211; `fix.md` "Acceptance actions" (the `acceptance_action` resolution) | controller-only | effect K9, authorized per D5.6 | #211 |
 | edit the progress comment in place | `update_epic.md` :35–37 | controller-only | removed (D5.2) | #160 |
 | `gh issue edit` on the EPIC | `update_epic.md` :62 (forbidden to agents) | controller-only | unchanged: the controller's roadmap splice | — |
 | source PR close, receipt, compensating reopen | `github.py` :1602, :1619, :1630 | controller-only | unchanged mechanism (D5.4) | — |
@@ -772,6 +777,12 @@ implements a typed operation for each one, and the phase children own the
 wiring. Adding a kind later changes the persisted schema, so it is a
 protocol bump; this is why the set is closed now.
 
+**Amended (#211).** A ninth kind, K9 (the acceptance comment), is added
+under that rule: one kind, one target class (the run's own issue), its own
+protocol bump (D13.9). It is not a generic write kind: the agent requests
+only bounded text, and the kind, target, identity and marker are the
+controller's. Its write also needs an authorization (D5.6).
+
 #### K1. Push an exact candidate (the Git publication layer, §2.6)
 
 - **Consumers:** #161 (the implementation branch), #163 (the fix push),
@@ -1008,6 +1019,53 @@ protocol bump; this is why the set is closed now.
   A rejected selection or roadmap section is re-requested (D4.7). The
   `observed` comment is never posted again.
 
+#### K9. Create the acceptance comment on the run's issue (#211)
+
+- **Consumer:** #211 (`FIX`). A REMOTE fixer may resolve at most one open
+  finding per result as `acceptance_action`, with
+  `{"kind": "issue_comment", "body": "<Markdown>"}`. The request names no
+  target: a `url`, `issue`, `repository`, `target`, `method`, `path` or
+  `command` key is refused, as is any other kind (D8.1).
+- **Identity:** the `ai-acceptance` marker for (issue, PR, review round,
+  finding id), on the run's issue. One marker per comment.
+- **Target:** the comments of the run's `current_issue_url`, which must be
+  the owner's issue. The controller derives it from state.
+- **Precondition:** no comment of the issue carries the marker; the issue
+  is open and in the repository of the run's PR; and the record's
+  authorization holds (D5.6). A precondition that fails with nothing found
+  *holds* the write: nothing is sent, the record is unchanged, and `FIX`
+  blocks with a controller-rendered reason. The issue's eligibility is
+  read with every reconciliation of a pending record, so it also holds the
+  adoption below (PR #221 R1-F2).
+- **Payload:** the controller's header line (naming the PR, the round and
+  the finding, and saying the text below is the FIX agent's), a blank line,
+  the agent's validated text, a blank line and the marker. Rendered once and
+  persisted (D8.4); the text passes D8.2 and D8.3 at validation and again
+  when the record loads.
+- **Completion read-back:** the complete comment listing of the issue holds
+  exactly one comment carrying the marker, and its body equals the payload
+  byte for byte. Whoever posted it is irrelevant (D9.3): an operator who
+  posts the exact payload has done the write, and it is adopted. It is
+  adopted only while the issue is open and in the run's repository: the
+  exact payload on an issue that was closed or left it is held like a due
+  write, unchanged and naming the comment, so nothing later in the plan is
+  sent; once the issue qualifies again, `unblock` and `resume` adopt it.
+- **Plan order:** K9 is first in the `FIX` plan, before K5, K6 and the K1
+  push. Nothing of the plan is sent while K9 waits, so a decline (D5.7)
+  voids a plan that sent nothing, and the push stays the commit point. At
+  most one K9 per plan; the plan still fits `MAX_EFFECTS_PER_PLAN`, because
+  the finding K9 resolves is not deferred.
+- **Windows:** the generic ones, plus the hold. An issue that stops
+  qualifying between the write and its read-back holds the record too, as
+  the conclusive answer it is rather than a write not visible yet: it stays
+  `attempted`, `FIX` blocks with the issue's reason and says the comment
+  was sent, and nothing later in the plan is sent; a write GitHub refused
+  meanwhile is still a conflict (PR #221 R2-F1). A comment with the marker
+  and other bytes, or two comments, is W5 (`conflict`, naming them); it is
+  never declined (D5.7). A comment without the marker is not evidence. The
+  observed comment is never posted again, and the next `REVIEW` receives its
+  URL as data and still judges the round.
+
 **D5.2 (#160).** **Correcting a controller-authored object in place is not a
 kind.** Every payload is rendered from persisted bytes (D8.4), so the
 controller has nothing to correct. A remote object that differs from its
@@ -1175,6 +1233,69 @@ For body appends (D5.5):
   refusal would refuse every base that carries an earlier round's marker,
   which K6 must keep. The closing-keyword rule would refuse a human's PR
   body that already says `Closes #n`, which K3 adopts as it is.
+
+**D5.6 (#211).** **K9's write needs an authorization, recorded with the
+record.** `safety.acceptance_actions` is `off`, `approve` (the default) or
+`auto`, and its value at plan time is recorded in K9's precondition:
+
+- `auto` records `authorization: policy` with the record's own action id
+  approved. The comment is published during the `FIX` step, with no human.
+  This matches K5's exposure (agent text published on the run's
+  repository), so it is configuration only, with no per-invocation flag.
+- `approve` records `authorization: operator` and no approval. The step
+  blocks before sending anything; `unblock --approve-action <id>` records
+  the approval and `resume` publishes.
+- `off` refuses the resolution through the correction path.
+
+The **action id** is `A-` and the first 16 hex digits of the SHA-256 of a
+canonical encoding of the record's owner, identity, target and payload. It
+is recomputed from the record wherever it is shown or used, and never
+stored as authority. An approval stores the id it approved, and a record
+whose stored id is not its recomputed id fails to load: an approval cannot
+outlive a change to the bytes or the target it approved. An `attempted`
+record without a matching approval fails to load too. A persisted
+authorization is never widened by a later configuration change; an
+unapproved record under `off` still blocks, naming the setting.
+
+An approval authorizes exactly one K9 write of the persisted bytes to the
+run's issue. It grants no agent any capability, credential or tool
+permission, and it is not an interaction approval (D1.3, §4).
+
+**D5.7 (#211).** **Declining an unsent acceptance action.** `unblock
+--decline-action <id>` is allowed only while K9 is `intended`, unapproved,
+and its identity read finds nothing, and only while the PR is still at the
+reviewed HEAD, base and merge base. Nothing of the plan was sent then, so
+the plan and its context are dropped and `FIX` is entered afresh: the fixer
+is relaunched at `resume`, under the existing attempt accounting, with the
+declined id, finding and the operator's reason in its prompt. The same text
+for the same finding is the same id, so a result that requests it again is
+refused through the correction path. A decline does not advance the review
+round, so the round's declines are kept for as long as the round is: the
+bounded outcome history drops earlier rounds' entries, never one of them
+(PR #221 R3-F1). They are bounded per round instead, below the history's
+bound: once a round holds `MAX_DECLINES_PER_ROUND` (16) declines, a result
+requesting any acceptance action of that round is refused the same way, so
+the run fails closed (no comment, the finding resolved another way) rather
+than forgetting a decline.
+
+*Rationale.* This is not a D4.7 re-request: nothing was published, so no
+`observed` record is kept and no void input is re-asked for; it is the
+fresh entry the existing "OPEN with a persisted `FIX` plan" unblock row
+would make if the plan had never been saved. D4.6 is untouched: a plan with
+anything sent is completed from its context or blocks. Hence a decline is
+refused once the marker is on the issue (adopt it, or remove it first) and
+a `conflict` is repaired, never declined.
+
+*Rejected.*
+
+- **A new waiting phase or status.** `BLOCKED` already means "the safe
+  next step needs a human", keeps the saved plan and has the one operator
+  exit that completes `FIX` from the journal. A waiting phase would
+  duplicate those edges and blur §4's split between effect and interaction
+  records.
+- **Treating the operator's reason as evidence.** A plain `unblock` with an
+  action waiting re-enters `FIX` only when the exact payload is on the
+  issue; otherwise it is refused and the state is left byte-identical.
 
 ### 2.6 The Git publication layer (item 6)
 
@@ -1985,6 +2106,23 @@ is.
   findings and the new result could disagree, and the marker's cardinality
   forbids a second comment.
 
+**D13.9 (#211).** **K9 is its own protocol bump.** Under D13.1's rule a
+field added after #160 is its own bump, made alone. The implementation
+labels it `8`: never 6 (reserved for #126), and not combined with #126's
+or #172's bump. The number is settled on #23 and #158 before it merges, and
+the label moves with that decision. The migration rule follows D13.2, by
+label and never by shape:
+
+- a protocol-7 file loads in every phase and is relabelled on its next
+  save: no acceptance outcomes, `acceptance_source: null` on each `FIX`
+  context resolution and `acceptance_comment_url: ""` on each recorded
+  resolution, because no earlier controller published an acceptance
+  comment;
+- a protocol-7 (or older) file carrying any of the new fields, a K9
+  record or an unblock `action` is refused, unchanged, as a hand edit or a
+  foreign file;
+- LOCAL state carrying any of them is refused as corrupt.
+
 ## 3. What does not change
 
 - **`CONTROL_RESULT` stays untrusted, and read-back stays authoritative.** The
@@ -2037,6 +2175,11 @@ is.
   - An interaction answer reaches a payload only through a validated
     `CONTROL_RESULT`.
   - An approval never creates an intent or widens a kind (D1.3).
+  - An acceptance-action approval (#211, D5.6) is the other way round: it
+    is an effect precondition, recorded on an existing K9 record after a
+    validated `CONTROL_RESULT` planned it, with no provider session
+    involved. It shares no field, verb, exit code or protocol number with
+    #126, and nothing is ever delivered back to an agent.
 - **#147–#149 (SDK).** SDK adapters inherit the boundary with no engine
   branch. #149 owns SDK tool and permission policy, and may map D1.2 into
   deny rules as defence in depth.
@@ -2064,6 +2207,7 @@ mechanisms are unchanged and has no child.
 | #163 | D5.3, D9.5, D13.6; the K1, K5 and K6 wiring; the D1.2 rows it owns |
 | #164 | D9.8, D12.7, D13.8; the K1 and K7 wiring; the D1.2 rows it owns |
 | #165 | D1.1, D1.2 (the guide entry and the rows it owns), D1.3, D10.1, D10.2, D11.1, D12.6 |
+| #211 | the D5.1 amendment, K9, D5.6, D5.7, D13.9; the K9 wiring; its D1.2 row |
 
 ## 6. Tests the implementing children must add
 
@@ -2235,6 +2379,26 @@ In addition:
     is refused;
   - a previous-protocol file loads under D13.2;
   - each legacy re-entry outcome is tested, by its owner (D13.4–D13.8).
+- **K9 (#211):**
+  - the generic per-kind tests above, for an authorized record;
+  - an unauthorized record is held with nothing saved or sent, refuses to
+    become `attempted`, and fails to load as `attempted`;
+  - an approval of other bytes, a malformed authorization, a policy record
+    without an approval and a body that is not the controller's rendering
+    fail to load;
+  - the action id is deterministic and changes with the owner, the target,
+    the marker and the payload;
+  - the exact payload posted by anyone is adopted; an edited body or two
+    comments are a conflict; a closed issue or one outside the run's
+    repository holds the write, and the adoption of an exact payload
+    already there, in every pending stage, also when it stops qualifying
+    between the write and its read-back;
+  - the plan holds at most one K9, first, named by exactly one resolution;
+  - approve, decline and plain unblock: each precondition, each refusal
+    leaving the state byte-identical, dry runs writing nothing; drift makes
+    the action `stale`; a declined id is a correction;
+  - a protocol-7 file migrates under D13.9, and one carrying the new fields
+    is refused.
 
 ### 6.2 The EPIC #158 test-matrix ownership
 

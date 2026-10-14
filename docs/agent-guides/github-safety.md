@@ -341,9 +341,12 @@ turn ordinary concurrent work on the PR into a human decision.
 
 The fixer publishes nothing (#163, ADR 0004): it commits on the
 worktree's detached `HEAD` and returns one resolution per open finding.
-The controller creates the follow-up issues, appends the deferral markers
-and pushes the commit itself, from a plan it journals before anything is
-sent ("After FIX" below).
+The controller posts the acceptance comment the fixer asks for (#211),
+creates the follow-up issues, appends the deferral markers and pushes the
+commit itself, from a plan it journals before anything is sent ("After
+FIX" below). The prompt offers the `acceptance_action` resolution as
+`safety.acceptance_actions` allows (not at all under `off`) and lists the
+actions the operator declined for the round.
 
 The journal is read first. A persisted completion context means the
 fixer's result was already accepted and its plan saved: the phase is
@@ -433,7 +436,15 @@ for it:
 
 - `previous_head_sha` is the reviewed HEAD the findings are bound to
 - the resolutions cover exactly the open finding IDs, one each, as
-  `fixed`, `follow_up_created` or `no_change_with_rationale`
+  `fixed`, `follow_up_created`, `no_change_with_rationale` or (#211)
+  `acceptance_action`
+- an `acceptance_action` (at most one per result) is refused under
+  `safety.acceptance_actions: off`, when the comment the controller renders
+  from it (its header, the text, the finding's marker) fails the credential
+  rule as a whole, the mention rule or GitHub's comment limit, when its
+  action id is one the operator declined for this round, and once the
+  operator declined `MAX_DECLINES_PER_ROUND` (16) actions of the round,
+  the most its history keeps (PR #221 R3-F1)
 - a finding whose follow-up issue the entry found is resolved as
   `follow_up_created` with exactly that issue
 - any other deferral either names an issue the entry handed over (a
@@ -464,7 +475,10 @@ Then, in order, all from one persisted plan:
    entry recorded; each issue a deferral names must be open in this
    repository, with a body the marker block can be appended to (the
    credential rule on the composed body). Anything else blocks with
-   nothing planned or sent. Otherwise the `follow_up_issue` records (K5,
+   nothing planned or sent. Otherwise the `acceptance_comment` record
+   (K9, first; its target the run's issue, derived from state, and its
+   authorization the setting now: `policy` with its own id approved under
+   `auto`, `operator` with none under `approve`), the `follow_up_issue` records (K5,
    in result order, against a watermark read now), the `follow_up_append`
    records (K6, one per handed-over issue, its findings' markers in result
    order, against the digest of the body read now) and the `push` record
@@ -506,7 +520,20 @@ Then, in order, all from one persisted plan:
      or recreates follow-up issues. A record issued but not read back yet
      is left to its own reconciliation, which reads the same marker before
      anything is sent again.
-3. The records are driven in plan order, so the push, the commit point, is
+3. The records are driven in plan order. The acceptance comment comes
+   first: it is posted only once authorized and while the run's issue is
+   open in the PR's repository, and read back from the issue's complete
+   comment listing as exactly one comment with its marker and its exact
+   bytes (whoever posted it), adopted only while the issue is still open
+   in the PR's repository (PR #221 R1-F2). Until then it is held: nothing
+   at all is sent (an issue that stops qualifying between the comment's
+   write and its read-back holds it the same way, the record `attempted`
+   and the reason saying the comment was sent, PR #221 R2-F1) and the
+   step blocks with a reason the controller renders
+   (the action id, the finding, the payload's size and SHA-256, the push
+   held back and the worktree holding it, and the ways forward; see
+   [Workflow: leaving BLOCKED](workflow.md#leaving-blocked-the-operators-unblock)).
+   A marked comment with other bytes, or two, is a conflict. Then the push, the commit point, is
    issued only after every follow-up is on GitHub, and, after any
    follow-up write, only once the PR is read again and held to step 2's
    rules (open, head, base and merge base, push target) and the open
@@ -533,7 +560,9 @@ Then, in order, all from one persisted plan:
    already holds (PR #205 R3-F2). A head still at the
    reviewed HEAD after the push is GitHub catching up (transient); any
    other head is drift. Only then are the resolutions recorded
-   (`last_fix_resolutions`, each deferral with the URL GitHub returned),
+   (`last_fix_resolutions`, each deferral with the URL GitHub returned, and
+   an acceptance action with its verified comment's `acceptance_comment_url`;
+   `acceptance_outcomes` records it `verified`),
    the open findings cleared and the phase advanced to `REVIEW`, whose
    prompt renders those resolutions as `PREVIOUS_FIX_RESOLUTIONS`: data
    for the reviewer to check, never a reply posted on the PR.
@@ -750,7 +779,13 @@ deferral markers it appends and the push of the fixer's commit, last);
 #164 wires `REPLAN_REEXECUTE` (the push of the replan agent's commit to the
 derived replacement branch, then the replacement PR). Every phase that
 publishes now does so through the controller; no agent makes a GitHub
-write or pushes.
+write or pushes. #211 adds one kind, K9: the acceptance comment a fixer
+may ask for on the run's own issue, which also needs an authorization
+(`safety.acceptance_actions`: the policy, or the operator's approval of its
+action id, a hash of its owner, target, marker and exact bytes that is
+recomputed from the record, so an approval never carries over to other
+bytes). There is no generic write: the agent supplies only the text, and a
+URL, target, method, path or command in its request is refused.
 
 - **Typed writes, never retried blind.** `GitHubClient` has one method per
   write the effects need (`create_issue_comment`, `create_pr_comment`,
@@ -820,7 +855,8 @@ write or pushes.
 Agent text the controller publishes under the operator's identity
 (`progress`, `roadmap_section`, `pr_title`, `pr_body`, a review's prose
 sections and its findings' titles, locations and required resolutions, a
-new follow-up issue's title and body, and the payloads of later kinds) is
+new follow-up issue's title and body, an acceptance comment's body, and
+the payloads of later kinds) is
 refused by
 `result_parser.published_text_problem`, and the agent is asked to correct
 it, when it contains:

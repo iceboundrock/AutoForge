@@ -153,6 +153,40 @@ def test_claude_command_shape():
 
 
 # -- AF-SEC-001: exactly one key opens the merge gate ------------------------
+# -- #211: who authorizes an acceptance action ---------------------------------
+def test_acceptance_actions_default_to_operator_approval(tmp_path):
+    assert default_config().safety.acceptance_actions == "approve"
+    p = tmp_path / "cfg.json"
+    p.write_text('{"version": 1}', encoding="utf-8")
+    assert load_config_file(p).safety.acceptance_actions == "approve"
+
+
+@pytest.mark.parametrize(
+    ("name", "text", "policy"),
+    [
+        ("cfg.json", '{"version": 1, "safety": {"acceptance_actions": "auto"}}', "auto"),
+        ("cfg.json", '{"version": 1, "safety": {"acceptance_actions": "off"}}', "off"),
+        ("cfg.json", '{"version": 1, "safety": {"acceptance_actions": false}}', "off"),
+        ("cfg.yaml", "version: 1\nsafety:\n  acceptance_actions: approve\n", "approve"),
+        ("cfg.yaml", "version: 1\nsafety:\n  acceptance_actions: off\n", "off"),
+        ("cfg.yaml", 'version: 1\nsafety:\n  acceptance_actions: "off"\n', "off"),
+    ],
+)
+def test_acceptance_actions_accepts_its_three_policies(tmp_path, name, text, policy):
+    """A bare YAML `off` reads as false; it is the one boolean the key takes."""
+    p = tmp_path / name
+    p.write_text(text, encoding="utf-8")
+    assert load_config_file(p).safety.acceptance_actions == policy
+
+
+@pytest.mark.parametrize("value", ['"yes"', "true", '"Auto"', "1", "null", '["auto"]'])
+def test_acceptance_actions_rejects_anything_else(tmp_path, value):
+    p = tmp_path / "cfg.json"
+    p.write_text(f'{{"version": 1, "safety": {{"acceptance_actions": {value}}}}}', encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="'safety.acceptance_actions' must be one of"):
+        load_config_file(p)
+
+
 def test_safety_gate_opens_from_safety_allow_merge_only(tmp_path):
     p = tmp_path / "cfg.json"
     p.write_text('{"version": 1, "safety": {"allow_merge": true}}', encoding="utf-8")

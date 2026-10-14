@@ -8,8 +8,11 @@ Commands:
   resume  continue a persisted run until a stop phase / max-steps
   unblock the operator's explicit exit from BLOCKED: the controller re-inspects
           live GitHub state, re-enters a phase through validate_transition or
-          refuses and stays BLOCKED; the reason is recorded in state and the log
-  status  show the persisted run summary (--json for machine output)
+          refuses and stays BLOCKED; the reason is recorded in state and the log.
+          --approve-action / --decline-action decide on an acceptance action
+          a FIX plan awaits (#211)
+  status  show the persisted run summary (--json for machine output; --action
+          prints an acceptance action's exact payload)
   local   LOCAL mode: feature Markdown -> implement -> review -> fix -> DONE,
           with no GitHub involved at any point (init / run / doctor)
 """
@@ -24,6 +27,14 @@ import sys
 from . import __version__
 from .config import AutoForgeConfig, load_config_file
 from .doctor import CheckResult, run_doctor, run_local_doctor
+from .effects import (
+    AUTHORIZATION_POLICY,
+    MAX_EFFECT_ATTEMPTS,
+    EffectKind,
+    EffectRecord,
+    Stage,
+    sha256_text,
+)
 from .engine import ControllerEngine, StepOutcome, StepPlan, UnblockOutcome
 from .errors import (
     AutoForgeError,
@@ -137,9 +148,38 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="read GitHub and report the decision without writing state or the log",
     )
+    action = ub.add_mutually_exclusive_group()
+    action.add_argument(
+        "--approve-action",
+        default="",
+        metavar="ACTION_ID",
+        help=(
+            "approve the acceptance action a FIX plan awaits (its id from 'autoforge status'); "
+            "'resume' then publishes exactly its payload on the run's issue"
+        ),
+    )
+    action.add_argument(
+        "--decline-action",
+        default="",
+        metavar="ACTION_ID",
+        help=(
+            "decline the acceptance action a FIX plan awaits: the unsent plan is dropped and "
+            "FIX launches the fixer again with the decline in its prompt"
+        ),
+    )
 
     st = sub.add_parser("status", help="show persisted run status")
-    st.add_argument("--json", action="store_true", dest="as_json")
+    shown = st.add_mutually_exclusive_group()
+    shown.add_argument("--json", action="store_true", dest="as_json")
+    shown.add_argument(
+        "--action",
+        default="",
+        metavar="ACTION_ID",
+        help=(
+            "print the exact payload of a pending acceptance action and nothing else "
+            "(exit 1 when no such action is persisted)"
+        ),
+    )
 
     _add_local_parser(sub)
     return p
@@ -645,16 +685,20 @@ def cmd_unblock(args) -> int:
     engine = _engine_for(args)
     if not args.state_dir:
         _bind_existing_run(engine)
+    approve = str(getattr(args, "approve_action", "") or "")
+    decline = str(getattr(args, "decline_action", "") or "")
     if args.dry_run:
         # Reads GitHub; writes nothing (no state, no run log, no lock).
         engine.load()
-        outcome = engine.unblock(args.reason, dry_run=True)
+        outcome = engine.unblock(
+            args.reason, dry_run=True, approve_action=approve, decline_action=decline
+        )
         print_unblock_outcome(outcome)
         return 0
     # Load, decide and write under one lock, like `step`.
     with engine.locked():
         engine.load()
-        outcome = engine.unblock(args.reason)
+        outcome = engine.unblock(args.reason, approve_action=approve, decline_action=decline)
     print_unblock_outcome(outcome)
     if not outcome.unblocked:
         return 1
@@ -740,6 +784,8 @@ def cmd_status(args) -> int:
     if not args.state_dir:
         _bind_existing_run(engine)
     state = engine.load()  # StateError when missing/corrupt
+    if getattr(args, "action", ""):
+        return _print_action_payload(state, args.action)
     # One load of the journal feeds every output mode, so what `--json`
     # derives and what the human summary prints cannot disagree.
     txn = _load_replan_journal(state)
@@ -748,16 +794,199 @@ def cmd_status(args) -> int:
     # both output modes cross the same redaction boundary as the run log.
     if args.as_json:
         # to_dict() already carries "mode" plus the local fields, so the JSON
-        # shape stays additive for remote consumers; `replan_journal` is
-        # derived beside the raw journal, never merged into it.
-        document = {**state.to_dict(), "replan_journal": _replan_journal_summary(txn)}
+        # shape stays additive for remote consumers; `replan_journal` and
+        # `acceptance_actions` are derived beside the raw fields, never
+        # merged into them.
+        document = {
+            **state.to_dict(),
+            "replan_journal": _replan_journal_summary(txn),
+            "acceptance_actions": _acceptance_actions(state),
+        }
         print(json.dumps(redact_dict(document), indent=2, sort_keys=True))
         return 0
     if state.mode == WorkflowMode.LOCAL:
         print(redact(_render_local_status(state, txn)))
         return 0
-    print(redact(_render_status(state, txn)))
+    print(redact(_render_status(state, txn, _render_acceptance_actions(state, engine))))
     return 0
+
+
+def _acceptance_records(state: AutoForgeState) -> list[EffectRecord]:
+    """The persisted K9 records of the current plan (#211); none for a LOCAL run."""
+    if state.mode == WorkflowMode.LOCAL:
+        return []
+    return [r for r in state.phase_effects().records if r.kind is EffectKind.ACCEPTANCE_COMMENT]
+
+
+def _print_action_payload(state: AutoForgeState, action_id: str) -> int:
+    """``status --action``: the exact payload bytes of a persisted acceptance action (#211).
+
+    Exactly the body the controller would publish (and an operator may post
+    instead), with nothing before or after it; it is redaction-invariant by
+    the record's validation, so nothing is rewritten here. An id no
+    persisted record has (a declined or stale action keeps no payload), or a
+    LOCAL run, exits 1 and prints nothing.
+    """
+    for record in _acceptance_records(state):
+        if record.action_id == action_id.strip():
+            sys.stdout.write(record.body)
+            sys.stdout.flush()
+            return 0
+    return 1
+
+
+def _acceptance_label(record: EffectRecord) -> tuple[str, str]:
+    """``(state, label)`` of a persisted K9 record, as ``status`` names it (#211)."""
+    if record.stage is Stage.OBSERVED:
+        return "verified", f"verified: {(record.observed or {}).get('url', '-')}"
+    if record.stage is Stage.CONFLICT:
+        return "verification_failed", f"verification failed: {record.reason}"
+    if record.stage is Stage.ATTEMPTED:
+        return (
+            "published_unverified",
+            f"published, not yet verified ({record.attempts}/{MAX_EFFECT_ATTEMPTS})",
+        )
+    if not record.authorized:
+        return "awaiting_approval", "awaiting approval"
+    if record.precondition["authorization"] == AUTHORIZATION_POLICY:
+        return "authorized_by_policy", "authorized by policy, not yet published"
+    return "approved", "approved, not yet published"
+
+
+def _acceptance_actions(state: AutoForgeState) -> list[dict]:
+    """The derived ``acceptance_actions`` of ``status --json`` (#211).
+
+    One entry per persisted K9 record of the current plan, then one per
+    ``acceptance_outcomes`` entry (declined, stale or verified actions whose
+    plan is gone), each with its ``state``: awaiting_approval, approved,
+    authorized_by_policy, published_unverified, verified,
+    verification_failed, declined or stale. ``verified`` comes only from an
+    observed record or a recorded outcome, never from an acknowledgement.
+    """
+    from .claims import ACCEPTANCE, scan
+
+    out: list[dict] = []
+    for record in _acceptance_records(state):
+        claim = scan(ACCEPTANCE, record.marker).claims[0]
+        status, label = _acceptance_label(record)
+        out.append(
+            {
+                "action_id": record.action_id,
+                "kind": "issue_comment",
+                "target": record.target["issue_url"],
+                "pr": record.owner.pr_url,
+                "round": claim.round,
+                "finding_id": claim.finding_id,
+                "authorization": record.precondition["authorization"],
+                "state": status,
+                "label": label,
+                "payload_chars": len(record.body),
+                "payload_sha256": sha256_text(record.body),
+                "comment_url": str((record.observed or {}).get("url", "")),
+            }
+        )
+    for outcome in state.acceptance_outcomes:
+        out.append(
+            {
+                "action_id": outcome["action_id"],
+                "kind": "issue_comment",
+                "target": state.current_issue_url,
+                "pr": state.current_pr_url,
+                "round": outcome["round"],
+                "finding_id": outcome["finding_id"],
+                "state": outcome["outcome"],
+                "label": (
+                    f"verified: {outcome['comment_url']}"
+                    if outcome["outcome"] == "verified"
+                    else outcome["outcome"]
+                ),
+                "comment_url": outcome["comment_url"],
+                "reason": outcome["reason"],
+                "at": outcome["at"],
+            }
+        )
+    return out
+
+
+def _render_acceptance_actions(state: AutoForgeState, engine: ControllerEngine) -> list[str]:
+    """The human ``Acceptance action`` blocks of ``status`` (#211); none without one."""
+    from .claims import ACCEPTANCE, scan
+
+    lines: list[str] = []
+    records = state.phase_effects().records if state.mode != WorkflowMode.LOCAL else ()
+    push = next((r for r in records if r.kind is EffectKind.PUSH), None)
+    for record in _acceptance_records(state):
+        claim = scan(ACCEPTANCE, record.marker).claims[0]
+        action = record.action_id
+        _, label = _acceptance_label(record)
+        title = next(
+            (
+                str(f.get("title", ""))
+                for f in state.open_findings
+                if f.get("id") == claim.finding_id
+            ),
+            "",
+        )
+        if record.precondition["authorization"] == AUTHORIZATION_POLICY:
+            authorization = "authorized by policy (safety.acceptance_actions: auto)"
+        else:
+            authorization = (
+                "operator approval required (safety.acceptance_actions: "
+                f"{engine.config.safety.acceptance_actions})"
+            )
+        lines += [
+            f"Acceptance action {action} (FIX, review round {claim.round}, finding "
+            f"{claim.finding_id})",
+            "  kind:          issue_comment",
+            f"  target:        {record.target['issue_url']}",
+            f"  PR:            {record.owner.pr_url}",
+            f"  finding:       {claim.finding_id} {title}".rstrip(),
+            f"  authorization: {authorization}",
+            f"  state:         {label}",
+            f"  payload:       {len(record.body)} chars, sha256 "
+            f"{sha256_text(record.body)}  ({engine.cli_command('status', '--action', action)})",
+        ]
+        if record.stage is Stage.OBSERVED:
+            continue
+        if push is not None and push.stage is not Stage.OBSERVED:
+            branch = str(push.target["ref"]).removeprefix("refs/heads/")
+            lines += [
+                f"  held back:     push of {str(push.payload['sha'])[:12]} to {branch}, after "
+                "the action is verified",
+                f"  worktree:      {engine.agent_worktree_description()} holds the unpushed "
+                "candidate; do not reset it",
+            ]
+        if record.stage is Stage.INTENDED and not record.authorized:
+            why = '"..."'
+            lines += [
+                f"  next:          approve:  "
+                f"{engine.cli_command('unblock', '--approve-action', action, '--reason')} {why}"
+                f" ; {engine.resume_command()}",
+                "                 or post exactly that payload yourself, then: "
+                f"{engine.cli_command('unblock', '--reason')} {why} ; {engine.resume_command()}",
+                "                 or decline: "
+                f"{engine.cli_command('unblock', '--decline-action', action, '--reason')} {why}"
+                " (FIX runs again)",
+            ]
+        elif record.stage is Stage.CONFLICT:
+            lines.append(
+                "  next:          repair or remove the comment(s) named above, then "
+                f'{engine.cli_command("unblock", "--reason")} "..."'
+            )
+        else:
+            lines.append(f"  next:          {engine.resume_command()}")
+    for outcome in state.acceptance_outcomes if state.mode != WorkflowMode.LOCAL else ():
+        label = (
+            f"verified: {outcome['comment_url']}"
+            if outcome["outcome"] == "verified"
+            else outcome["outcome"]
+        )
+        reason = f" ({outcome['reason']})" if outcome["reason"] else ""
+        lines.append(
+            f"Acceptance action {outcome['action_id']} (review round {outcome['round']}, finding "
+            f"{outcome['finding_id']}): {label}{reason}"
+        )
+    return lines
 
 
 def _render_replan_journal(txn: ReplanTransaction | None) -> list[str]:
@@ -786,7 +1015,9 @@ def _render_replan_journal(txn: ReplanTransaction | None) -> list[str]:
     return lines
 
 
-def _render_status(state: AutoForgeState, txn: ReplanTransaction | None) -> str:
+def _render_status(
+    state: AutoForgeState, txn: ReplanTransaction | None, acceptance: list[str] | None = None
+) -> str:
     """Human status for a GitHub run (unredacted; the caller redacts)."""
 
     def _num(url: str) -> str:
@@ -825,11 +1056,13 @@ def _render_status(state: AutoForgeState, txn: ReplanTransaction | None) -> str:
     lines += _render_replan_journal(txn)
     if state.block_reason:
         lines.append(f"Reason:     {state.block_reason}")
+    lines += acceptance or []
     if state.unblock_history:
         last = state.unblock_history[-1]
+        action = f" [{last['action']}]" if last.get("action") else ""
         lines.append(
             f"Unblocked:  {len(state.unblock_history)} time(s); last at {last.get('at', '-')} "
-            f"-> {last.get('phase', '-')}: {last.get('reason', '-')}"
+            f"-> {last.get('phase', '-')}{action}: {last.get('reason', '-')}"
         )
     lines += [
         "",

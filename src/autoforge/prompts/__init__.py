@@ -37,6 +37,9 @@ TEMPLATE_FILES = (
     # What a write phase's worktree holds uncommitted (#187), rendered into
     # the phase template's {{WORKTREE_STATE}} only when there is something.
     "worktree_state.md",
+    # The FIX prompt's acceptance_action resolution (#211), rendered into
+    # fix.md's {{ACCEPTANCE_ACTIONS}} when safety.acceptance_actions offers it.
+    "acceptance_actions.md",
     # LOCAL mode: separate templates rather than the GitHub ones fed fake
     # Issue/PR values. Nothing here may mention gh, PRs or merging.
     "local_common.md",

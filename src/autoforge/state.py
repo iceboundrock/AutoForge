@@ -41,11 +41,14 @@ from pathlib import Path
 
 from . import __prompt_version__, __protocol_version__, __version__
 from .effects import (
+    ACTION_ID_RE,
     LABEL_AGENT_PUBLISHES,
     LABEL_NONE,
     LAUNCH_LABELS,
+    MAX_CONFLICT_REASON_CHARS,
     PUBLISHING_PHASES,
     Binding,
+    EffectKind,
     PhaseEffects,
     load_phase_effects,
 )
@@ -57,7 +60,7 @@ from .run_contract import LocalRunContract
 from .runlog import validate_run_id
 from .safefs import HardLinksUnavailable, ReadLimitExceeded, SafeRoot, entry_kind
 from .transitions import LOCAL_PHASES, LOCAL_WRITE_PHASES, Phase, WorkflowMode
-from .validation import parse_pr_url
+from .validation import parse_comment_url, parse_issue_url, parse_pr_url
 
 STATE_FILENAME = "state.json"
 LOGS_DIRNAME = "logs"
@@ -261,11 +264,44 @@ def _validate_local_pending(state: AutoForgeState) -> None:
 # (ADR 0004 D13.1, #160): it is the immediate predecessor of protocol 7 (6 is
 # reserved for #126) and is loaded under D13.2.
 _LEGACY_PROTOCOLS = LEGACY_JOURNAL_PROTOCOLS | {"5"}
+# The label before the controller could publish an acceptance comment
+# (#211). A protocol-7 file is this protocol's shape without the acceptance
+# state: it carries the effect fields and is loaded with them, in every
+# phase, and relabelled.
+_PREVIOUS_PROTOCOL = "7"
 # The fields protocol 7 added (#160): the effect records, the entry
 # observation and the completion context of the current phase entry, and the
 # launch label. A legacy file never carries one; one that does is a hand edit
 # or a foreign file, not an older controller's state.
 _EFFECT_FIELDS = ("effect_records", "entry_observation", "completion_context", "launch_label")
+# The field protocol 8 added (#211): the outcomes of this PR's acceptance
+# actions. Protocol 8 also added a K9 effect kind, an ``acceptance_source``
+# to each FIX context resolution, an ``acceptance_comment_url`` to each
+# REMOTE ``last_fix_resolutions`` entry and an optional ``action`` to an
+# ``unblock_history`` entry (:func:`_acceptance_state_in`).
+_ACCEPTANCE_FIELDS = ("acceptance_outcomes",)
+# ``acceptance_outcomes`` (#211): what became of each acceptance action of
+# the current PR. Bounded: at most one action is requested per FIX result,
+# and the writer drops the oldest entries past the bound
+# (:meth:`AutoForgeState.bound_acceptance_outcomes`), but never a decline of
+# the round being fixed. That decline is what refuses the same action again,
+# and a decline re-enters FIX without advancing the round, so dropping one
+# would let the action through unchanged (PR #221 R3-F1). The round's
+# declines are bounded instead, below the history's bound: once a round
+# holds MAX_DECLINES_PER_ROUND, FIX refuses any further acceptance action of
+# that round, so there is never one more to decline.
+ACCEPTANCE_OUTCOMES = ("verified", "declined", "stale")
+MAX_ACCEPTANCE_OUTCOMES = 64
+MAX_DECLINES_PER_ROUND = 16
+_ACCEPTANCE_OUTCOME_KEYS = (
+    "action_id",
+    "round",
+    "finding_id",
+    "outcome",
+    "at",
+    "comment_url",
+    "reason",
+)
 # The phases in which the persisted clean review is consumed by the merge
 # gate, and so the phases a state without the review's full binding cannot
 # be loaded in.
@@ -394,7 +430,18 @@ class AutoForgeState:
     # by the next completed round of the actual revision, and per PR.
     prior_findings: list[dict] = field(default_factory=list)
     # Resolutions reported by the last FIX round (verified by the controller).
+    # A REMOTE entry also carries ``acceptance_comment_url``: the comment
+    # the controller verified for an ``acceptance_action`` resolution, else
+    # "" (#211).
     last_fix_resolutions: list[dict] = field(default_factory=list)
+    # The outcomes of the current PR's acceptance actions (#211), oldest
+    # first: ``action_id``, ``round``, ``finding_id``, ``outcome``
+    # (verified | declined | stale), ``at``, ``comment_url`` (the verified
+    # comment, else "") and ``reason`` (the operator's, redacted, for a
+    # decline; the drift for a stale action). Read by ``status``, by the FIX
+    # prompt and by the FIX result check (a declined action is not
+    # requested again in its round). Per PR, REMOTE only.
+    acceptance_outcomes: list[dict] = field(default_factory=list)
     # One entry per completed review round of the current PR (see
     # loop_guard.review_record): round, reviewed_head_sha, result
     # (needs_fix | clean | stale), finding_count, fingerprint (digest of the
@@ -637,6 +684,14 @@ class AutoForgeState:
         #   adopt an agent-posted object once (D13.3, D13.7). A legacy file
         #   that carries a non-empty value in any of the new fields is
         #   refused, never merged.
+        # - 7 -> 8: a FIX may publish one acceptance comment on the run's
+        #   issue (K9, #211), recorded in ``acceptance_outcomes``, a FIX
+        #   context resolution's ``acceptance_source``, a REMOTE
+        #   ``last_fix_resolutions`` entry's ``acceptance_comment_url`` and
+        #   an unblock entry's ``action``. An older file carries none of them
+        #   and is loaded in every phase with none: ``acceptance_source``
+        #   null and ``acceptance_comment_url`` "" (nothing was published).
+        #   An older file that carries any of them is refused, never merged.
         raw_protocol = data.get("protocol_version", __protocol_version__)
         written_by = str(data.get("controller_version", ""))
         legacy = isinstance(raw_protocol, str) and raw_protocol in _LEGACY_PROTOCOLS
@@ -654,10 +709,11 @@ class AutoForgeState:
             )
             if refusal:
                 raise StateError(refusal)
-            # The label decides, not the shape: a field a later protocol
-            # added may sit in a legacy file at its empty value, but effect
-            # state the labelled controller could never have written is a
-            # hand edit or a foreign file, and is refused rather than merged.
+            # The label decides, not the shape: a protocol-7 effect field
+            # may sit in a legacy file at its empty value, but effect state
+            # the labelled controller could never have written is a hand
+            # edit or a foreign file, and is refused rather than merged.
+            # Protocol 8's acceptance state is refused whatever its value.
             planted = sorted(
                 name for name in _EFFECT_FIELDS if data.get(name, "") not in ([], {}, "")
             )
@@ -668,6 +724,14 @@ class AutoForgeState:
                     "legacy file that carries protocol-7 effect state -- it is a hand edit "
                     "or a foreign file, not an older controller's state"
                 )
+            _refuse_acceptance_state(data, str(raw_protocol))
+        elif raw_protocol == _PREVIOUS_PROTOCOL:
+            # 7 -> 8 (#211): the same shape without the acceptance-action
+            # state. Every protocol-7 save wrote the effect fields, exactly
+            # as a protocol-8 one does; the acceptance state it never wrote
+            # is refused, never merged.
+            _require_fields(data, raw_protocol, _EFFECT_FIELDS, "effect state")
+            _refuse_acceptance_state(data, raw_protocol)
         elif raw_protocol != __protocol_version__:
             raise StateError(
                 f"unsupported protocol_version {raw_protocol!r} "
@@ -680,19 +744,7 @@ class AutoForgeState:
             # missing ``effect_records`` read as the empty default would let
             # the phase complete from its context with a pending effect never
             # performed.
-            missing = [name for name in _EFFECT_FIELDS if name not in data]
-            if missing:
-                label = (
-                    f"is labelled protocol_version {raw_protocol!r}"
-                    if "protocol_version" in data
-                    else f"has no protocol_version label (read as {raw_protocol!r})"
-                )
-                raise StateError(
-                    f"state file {label} but is missing "
-                    f"required field(s) {', '.join(repr(n) for n in missing)}; refusing to "
-                    "load -- every save of this protocol writes the effect state, so an absent "
-                    "field is corruption, not an empty plan"
-                )
+            _require_fields(data, raw_protocol, _EFFECT_FIELDS + _ACCEPTANCE_FIELDS, "effect state")
         # A LOCAL state written before the run contract existed has no
         # persisted definition of what it reviewed under. It is not migrated:
         # the only source a migration could fill the contract from is the
@@ -711,6 +763,8 @@ class AutoForgeState:
         kwargs["phase"] = phase
         kwargs["mode"] = mode
         kwargs["protocol_version"] = __protocol_version__
+        if raw_protocol != __protocol_version__ and mode == WorkflowMode.REMOTE:
+            kwargs.update(_acceptance_migration(data))
         if legacy and mode == WorkflowMode.REMOTE:
             attempt = data.get("attempt", 0)
             if isinstance(attempt, int) and not isinstance(attempt, bool) and attempt >= 1:
@@ -839,6 +893,8 @@ class AutoForgeState:
         if not isinstance(state.replan_transaction, dict):
             raise StateError("state field 'replan_transaction' must be an object")
         _validate_unblock_history(state.unblock_history)
+        # After the shapes it reads (last_fix_resolutions, unblock_history).
+        _validate_acceptance_state(state)
         for name in _MINIMUM_ONE_FIELDS:
             if getattr(state, name) < 1:
                 raise StateError(f"state field {name!r} must be a valid integer")
@@ -920,6 +976,25 @@ class AutoForgeState:
             self.effect_binding(),
         )
 
+    def bound_acceptance_outcomes(self) -> None:
+        """Drop the oldest ``acceptance_outcomes`` past the bound, never an active decline.
+
+        A decline of the round being fixed refuses its action again for as
+        long as the round lasts, so it is kept (PR #221 R3-F1); the entries
+        dropped are earlier rounds' and the round's verified or stale ones.
+        The round's declines are at most :data:`MAX_DECLINES_PER_ROUND`,
+        below :data:`MAX_ACCEPTANCE_OUTCOMES`, so the bound always holds.
+        """
+        excess = len(self.acceptance_outcomes) - MAX_ACCEPTANCE_OUTCOMES
+        kept: list[dict] = []
+        for outcome in self.acceptance_outcomes:
+            active = outcome["outcome"] == "declined" and outcome["round"] == self.review_round
+            if excess > 0 and not active:
+                excess -= 1
+                continue
+            kept.append(outcome)
+        self.acceptance_outcomes = kept
+
     def drop_phase_effects(self) -> None:
         """Forget the current entry's effect state: the save that commits the phase (D2.4)."""
         self.effect_records = []
@@ -996,6 +1071,7 @@ class AutoForgeState:
         self.open_findings = []
         self.prior_findings = []
         self.last_fix_resolutions = []
+        self.acceptance_outcomes = []
         self.review_history = []
         self.verification_failures = []
         self.premerge_verified_head_sha = ""
@@ -1014,6 +1090,195 @@ class AutoForgeState:
 
 
 _UNBLOCK_ENTRY_FIELDS = ("at", "reason", "block_reason", "phase", "detail")
+
+
+def _require_fields(data: dict, protocol: object, names: tuple[str, ...], what: str) -> None:
+    """Refuse a file of ``protocol`` that lacks a field every save of it writes."""
+    missing = [name for name in names if name not in data]
+    if not missing:
+        return
+    label = (
+        f"is labelled protocol_version {protocol!r}"
+        if "protocol_version" in data
+        else f"has no protocol_version label (read as {protocol!r})"
+    )
+    raise StateError(
+        f"state file {label} but is missing "
+        f"required field(s) {', '.join(repr(n) for n in missing)}; refusing to "
+        f"load -- every save of this protocol writes the {what}, so an absent "
+        "field is corruption, not an empty plan"
+    )
+
+
+def _acceptance_state_in(data: dict) -> list[str]:
+    """What of protocol 8's acceptance-action state (#211) ``data`` carries, named.
+
+    The label decides, not the value: ``acceptance_outcomes`` is protocol
+    8's own field, so an older file that carries it at all, even empty, was
+    not written by the controller its label names.
+    """
+    found: list[str] = []
+    if "acceptance_outcomes" in data:
+        found.append("'acceptance_outcomes'")
+    records = data.get("effect_records")
+    if isinstance(records, list) and any(
+        isinstance(r, dict) and r.get("kind") == EffectKind.ACCEPTANCE_COMMENT.value
+        for r in records
+    ):
+        found.append("an 'acceptance_comment' effect record")
+    context = data.get("completion_context")
+    resolutions = context.get("resolutions") if isinstance(context, dict) else None
+    if isinstance(resolutions, list) and any(
+        isinstance(r, dict) and "acceptance_source" in r for r in resolutions
+    ):
+        found.append("'acceptance_source' in 'completion_context'")
+    last = data.get("last_fix_resolutions")
+    if isinstance(last, list) and any(
+        isinstance(r, dict) and "acceptance_comment_url" in r for r in last
+    ):
+        found.append("'acceptance_comment_url' in 'last_fix_resolutions'")
+    history = data.get("unblock_history")
+    if isinstance(history, list) and any(isinstance(e, dict) and "action" in e for e in history):
+        found.append("an 'action' in 'unblock_history'")
+    return found
+
+
+def _refuse_acceptance_state(data: dict, protocol: str) -> None:
+    """A file labelled before protocol 8 never wrote acceptance-action state (#211)."""
+    planted = _acceptance_state_in(data)
+    if planted:
+        raise StateError(
+            f"state file is labelled protocol_version {protocol!r}, which never wrote "
+            f"{', '.join(planted)}; refusing to load a file that carries protocol-8 "
+            "acceptance-action state -- it is a hand edit or a foreign file, not an older "
+            "controller's state"
+        )
+
+
+def _acceptance_migration(data: dict) -> dict:
+    """The fields of an older REMOTE file as protocol 8 writes them (#211).
+
+    A FIX context resolution gains ``acceptance_source: null`` and a
+    ``last_fix_resolutions`` entry ``acceptance_comment_url: ""``: an older
+    controller never published an acceptance comment. Malformed values are
+    passed through for validation to refuse.
+    """
+    out: dict = {}
+    last = data.get("last_fix_resolutions")
+    if isinstance(last, list):
+        out["last_fix_resolutions"] = [
+            {**r, "acceptance_comment_url": ""} if isinstance(r, dict) else r for r in last
+        ]
+    context = data.get("completion_context")
+    if isinstance(context, dict) and isinstance(context.get("resolutions"), list):
+        out["completion_context"] = {
+            **context,
+            "resolutions": [
+                {**r, "acceptance_source": None} if isinstance(r, dict) else r
+                for r in context["resolutions"]
+            ],
+        }
+    return out
+
+
+def _validate_acceptance_state(state: AutoForgeState) -> None:
+    """``acceptance_outcomes`` and ``acceptance_comment_url`` (#211), strictly.
+
+    A LOCAL run publishes nothing, so it carries neither, nor an unblock
+    ``action``. A REMOTE ``last_fix_resolutions`` entry carries the URL of
+    the comment the controller verified for an ``acceptance_action``
+    resolution, and "" for any other.
+    """
+    outcomes = state.acceptance_outcomes
+    if not isinstance(outcomes, list) or not all(isinstance(o, dict) for o in outcomes):
+        raise StateError("state field 'acceptance_outcomes' must be a list of objects")
+    if state.mode == WorkflowMode.LOCAL:
+        if outcomes:
+            raise StateError(
+                "state field 'acceptance_outcomes' is set on a LOCAL run, which publishes "
+                "nothing; refusing to load"
+            )
+        if any("acceptance_comment_url" in r for r in state.last_fix_resolutions):
+            raise StateError(
+                "state field 'last_fix_resolutions' carries 'acceptance_comment_url' on a "
+                "LOCAL run, which publishes nothing; refusing to load"
+            )
+        if any(isinstance(e, dict) and "action" in e for e in state.unblock_history):
+            raise StateError(
+                "state field 'unblock_history' carries an acceptance 'action' on a LOCAL run, "
+                "which has no acceptance actions; refusing to load"
+            )
+        return
+    if len(outcomes) > MAX_ACCEPTANCE_OUTCOMES:
+        raise StateError(
+            f"state field 'acceptance_outcomes' holds {len(outcomes)} entries, over "
+            f"{MAX_ACCEPTANCE_OUTCOMES}"
+        )
+    declines: dict[int, int] = {}
+    for i, entry in enumerate(outcomes):
+        what = f"state field 'acceptance_outcomes'[{i}]"
+        if sorted(entry) != sorted(_ACCEPTANCE_OUTCOME_KEYS):
+            raise StateError(f"{what} must hold exactly {', '.join(_ACCEPTANCE_OUTCOME_KEYS)}")
+        if not isinstance(entry["action_id"], str) or not ACTION_ID_RE.match(entry["action_id"]):
+            raise StateError(f"{what}.action_id must be an action id of the form A-<16 hex>")
+        round_ = entry["round"]
+        if not isinstance(round_, int) or isinstance(round_, bool) or round_ < 1:
+            raise StateError(f"{what}.round must be an integer >= 1")
+        fid = entry["finding_id"]
+        match = (
+            FINDING_ID_RE.match(fid)
+            if isinstance(fid, str) and len(fid) <= MAX_FINDING_ID_CHARS
+            else None
+        )
+        if match is None or int(match.group("round")) != round_:
+            raise StateError(f"{what}.finding_id must be a finding id of its round")
+        if entry["outcome"] not in ACCEPTANCE_OUTCOMES:
+            raise StateError(f"{what}.outcome must be one of {ACCEPTANCE_OUTCOMES}")
+        if not isinstance(entry["at"], str) or not entry["at"]:
+            raise StateError(f"{what}.at must be a non-empty timestamp")
+        reason = entry["reason"]
+        if not isinstance(reason, str) or len(reason) > MAX_CONFLICT_REASON_CHARS:
+            raise StateError(
+                f"{what}.reason must be a string of at most {MAX_CONFLICT_REASON_CHARS} characters"
+            )
+        _comment_url_field(
+            state, entry["comment_url"], f"{what}.comment_url", entry["outcome"] == "verified"
+        )
+        if entry["outcome"] == "declined":
+            declines[round_] = declines.get(round_, 0) + 1
+    for round_, count in declines.items():
+        if count > MAX_DECLINES_PER_ROUND:
+            raise StateError(
+                f"state field 'acceptance_outcomes' holds {count} declines of review round "
+                f"{round_}, over {MAX_DECLINES_PER_ROUND}, the most one round records"
+            )
+    for i, entry in enumerate(state.last_fix_resolutions):
+        what = f"state field 'last_fix_resolutions'[{i}].acceptance_comment_url"
+        if "acceptance_comment_url" not in entry:
+            raise StateError(f"{what} is missing")
+        _comment_url_field(
+            state,
+            entry["acceptance_comment_url"],
+            what,
+            entry.get("resolution") == "acceptance_action",
+        )
+
+
+def _comment_url_field(state: AutoForgeState, value: object, what: str, required: bool) -> None:
+    """``value`` is a comment URL on the current issue when ``required``, else ""."""
+    if not isinstance(value, str):
+        raise StateError(f"{what} must be a string")
+    if not required:
+        if value:
+            raise StateError(f"{what} must be empty: no acceptance comment was verified")
+        return
+    try:
+        comment = parse_comment_url(value)
+        issue = parse_issue_url(state.current_issue_url)
+    except ConfigurationError as exc:
+        raise StateError(f"{what}: {exc}") from None
+    if not comment.on(issue):
+        raise StateError(f"{what} is not a comment on the current issue")
 
 
 def _validate_unblock_history(history: object) -> None:
@@ -1035,6 +1300,9 @@ def _validate_unblock_history(history: object) -> None:
                 )
         if not entry["at"] or not entry["phase"]:
             raise StateError("state field 'unblock_history': 'at' and 'phase' must be non-empty")
+        if "action" in entry and (not isinstance(entry["action"], str) or not entry["action"]):
+            # #211: the acceptance action an unblock approved or declined.
+            raise StateError("state field 'unblock_history': 'action' must be a non-empty string")
         try:
             Phase(entry["phase"])
         except ValueError:

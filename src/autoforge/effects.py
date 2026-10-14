@@ -45,6 +45,7 @@ repaired from GitHub.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -52,11 +53,13 @@ from enum import StrEnum
 from typing import Any, NoReturn
 
 from .claims import (
+    ACCEPTANCE,
     FOLLOW_UP,
     IMPLEMENTATION,
     PROGRESS,
     REVIEW,
     MarkerKind,
+    render_acceptance_marker,
     render_follow_up_marker,
     render_implementation_marker,
     render_progress_marker,
@@ -70,6 +73,7 @@ from .replan_txn import TRANSACTION_ID_RE, scan_replan_markers
 from .result_parser import (
     FINDING_ID_RE,
     FIX_RESOLUTIONS,
+    MAX_ACCEPTANCE_ACTIONS_PER_FIX,
     MAX_FINDING_ID_CHARS,
     MAX_FINDINGS_PER_REVIEW,
     MAX_FIX_RATIONALE_CHARS,
@@ -83,6 +87,7 @@ from .result_parser import (
     markdown_code_span,
     published_markdown_problem,
     published_payload_problem,
+    validate_acceptance_body,
     validate_follow_up_body,
     validate_follow_up_title,
     validate_pr_body,
@@ -277,11 +282,58 @@ def follow_up_issue_body(text: str, pr_url: str, finding_id: str) -> str:
     )
 
 
+def acceptance_comment_header(issue_url: str, pr_url: str, round_: int, finding_id: str) -> str:
+    """The controller's line that opens an acceptance comment (#211).
+
+    It names the issue, the PR, the review round and the finding, and says
+    whose the text below it is: the FIX agent's, published by the
+    controller (or posted by the operator) as the evidence the finding asks
+    for, never as the controller's own statement.
+    """
+    return (
+        f"**AutoForge acceptance evidence** for finding `{finding_id}` of review round "
+        f"{round_} of {parse_pr_url(pr_url).canonical}, on "
+        f"{parse_issue_url(issue_url).canonical}. The text below is the FIX agent's."
+    )
+
+
+def acceptance_comment_body(
+    text: str, issue_url: str, pr_url: str, round_: int, finding_id: str
+) -> str:
+    """K9's payload: the controller's header, the agent's text, then the finding's marker (#211)."""
+    return (
+        f"{acceptance_comment_header(issue_url, pr_url, round_, finding_id)}"
+        f"{APPEND_SEPARATOR}{text}{APPEND_SEPARATOR}"
+        f"{render_acceptance_marker(issue_url, pr_url, round_, finding_id)}"
+    )
+
+
+def acceptance_comment_problem(body: str, finding_id: str) -> str | None:
+    """Why the rendered acceptance comment of ``finding_id`` may not be published, or ``None``.
+
+    The parser judged the agent's text alone; this judges the comment the
+    controller composes from it (ADR 0004 D8.2, D8.3, D8.6): the credential
+    rule on the whole payload, the mention rule on everything before the
+    marker, and GitHub's comment limit. Names the payload, never the text.
+    """
+    subject = f"acceptance comment of {finding_id}"
+    if len(body) > MAX_BODY_CHARS:
+        return (
+            f"the rendered {subject!r} is {len(body)} characters, over GitHub's comment limit "
+            f"of {MAX_BODY_CHARS}; shorten the acceptance_action body and re-emit the "
+            "CONTROL_RESULT"
+        )
+    marker_at = body.rfind(APPEND_SEPARATOR)
+    return published_payload_problem(subject, body) or published_markdown_problem(
+        subject, body[:marker_at] if marker_at >= 0 else body
+    )
+
+
 # -- closed sets -------------------------------------------------------------------
 
 
 class EffectKind(StrEnum):
-    """The closed Wave 1 effect-kind set (D5.1). Adding one is a protocol bump."""
+    """The closed effect-kind set (D5.1). Adding one is a protocol bump."""
 
     PUSH = "push"  # K1
     IMPLEMENTATION_PR = "implementation_pr"  # K2
@@ -291,6 +343,7 @@ class EffectKind(StrEnum):
     FOLLOW_UP_APPEND = "follow_up_append"  # K6
     REPLACEMENT_PR = "replacement_pr"  # K7
     PROGRESS_COMMENT = "progress_comment"  # K8
+    ACCEPTANCE_COMMENT = "acceptance_comment"  # K9 (#211)
 
 
 class Stage(StrEnum):
@@ -321,6 +374,7 @@ KIND_PHASES: Mapping[EffectKind, frozenset[Phase]] = {
     EffectKind.FOLLOW_UP_APPEND: frozenset({Phase.FIX}),
     EffectKind.REPLACEMENT_PR: frozenset({Phase.REPLAN_REEXECUTE}),
     EffectKind.PROGRESS_COMMENT: frozenset({Phase.UPDATE_EPIC}),
+    EffectKind.ACCEPTANCE_COMMENT: frozenset({Phase.FIX}),
 }
 
 # D13.3: the contract a launch ran under, recorded in every pre-launch save of
@@ -535,6 +589,28 @@ def _absent(value: object, what: str) -> None:
         _fail(what, "must be true: a create's precondition is that no object has the identity")
 
 
+# K9's authorization (#211): who allowed the one write. ``operator`` is an
+# ``unblock --approve-action`` of the record's action id (none yet while the
+# id is ""); ``policy`` is ``safety.acceptance_actions: auto``, which
+# records the id when the plan is saved. Persisted with the plan, so a
+# later configuration change never widens it.
+AUTHORIZATION_OPERATOR = "operator"
+AUTHORIZATION_POLICY = "policy"
+AUTHORIZATIONS = (AUTHORIZATION_OPERATOR, AUTHORIZATION_POLICY)
+ACTION_ID_RE = re.compile(r"^A-[0-9a-f]{16}\Z")
+
+
+def _authorization(value: object, what: str) -> None:
+    if value not in AUTHORIZATIONS:
+        _fail(what, f"must be one of {AUTHORIZATIONS}")
+
+
+def _approved_action_id(value: object, what: str) -> None:
+    text = _str(value, what, 32)
+    if text and not ACTION_ID_RE.match(text):
+        _fail(what, "must be empty or an action id of the form A-<16 hex>")
+
+
 def _watermark(value: object, what: str) -> None:
     _int(value, what)
 
@@ -634,6 +710,18 @@ KIND_SPECS: Mapping[EffectKind, _KindSpec] = {
         payload={"body": _BODY},
         observed={"url": _comment_url},
         completion="progress_comment_exactly_one_body_equals_payload",
+    ),
+    EffectKind.ACCEPTANCE_COMMENT: _KindSpec(
+        identity={"issue_url": _issue_url, "marker": _marker_of(ACCEPTANCE)},
+        target={"issue_url": _issue_url},
+        precondition={
+            "absent": _absent,
+            "authorization": _authorization,
+            "approved_action_id": _approved_action_id,
+        },
+        payload={"body": _BODY},
+        observed={"url": _comment_url},
+        completion="acceptance_comment_exactly_one_body_equals_payload",
     ),
 }
 
@@ -896,6 +984,10 @@ class EffectRecord:
             raise StateError(f"effect record {self.position} is {self.stage.value}; not issued")
         if not self.bound_left:
             raise StateError(f"effect record {self.position} has used its {MAX_EFFECT_ATTEMPTS}")
+        if self.kind == EffectKind.ACCEPTANCE_COMMENT and not self.authorized:
+            # The one write K9 makes needs its approval first (#211); the
+            # cross-check refuses the attempted record on load as well.
+            raise StateError(f"effect record {self.position} is not authorized; not issued")
         return replace(self, stage=Stage.ATTEMPTED, attempts=self.attempts + 1)
 
     def rebasing(self, body: str) -> EffectRecord:
@@ -941,6 +1033,28 @@ class EffectRecord:
     @property
     def marker(self) -> str:
         return str(self.identity.get("marker", ""))
+
+    @property
+    def action_id(self) -> str:
+        """K9's action id (#211), recomputed from the record; "" for every other kind."""
+        if self.kind != EffectKind.ACCEPTANCE_COMMENT:
+            return ""
+        return acceptance_action_id(self.owner, self.identity, self.target, self.payload)
+
+    @property
+    def authorized(self) -> bool:
+        """K9: an approval of exactly this record's action id is recorded (#211)."""
+        approved = self.precondition.get("approved_action_id", "")
+        return bool(approved) and approved == self.action_id
+
+    def approving(self) -> EffectRecord:
+        """K9 approved by the operator: its recomputed action id recorded (#211)."""
+        if self.kind != EffectKind.ACCEPTANCE_COMMENT or self.stage != Stage.INTENDED:
+            raise StateError(f"effect record {self.position} cannot be approved")
+        record = replace(
+            self, precondition={**self.precondition, "approved_action_id": self.action_id}
+        )
+        return EffectRecord.from_dict(record.to_dict())
 
     def describe(self) -> str:
         """``<kind> effect <position> on <target>``: names the object, never the payload."""
@@ -1216,6 +1330,80 @@ def _cross_progress_comment(record: EffectRecord, what: str) -> None:
         _fail(what, "is observed on another issue than its EPIC")
 
 
+def acceptance_action_id(owner: EffectOwner, identity: dict, target: dict, payload: dict) -> str:
+    """The id of one acceptance action (#211): ``A-`` and 16 hex digits.
+
+    The SHA-256 of a canonical encoding of the record's owner, identity,
+    target and payload, so it names exactly one write of exactly these
+    bytes to exactly this issue, for this run's FIX of this PR. It is
+    recomputed whenever it is shown or used, never read as authority: an
+    approval stores the id it approved, and a record whose stored approval
+    is not its recomputed id fails to load.
+    """
+    canonical = json.dumps(
+        {
+            "owner": owner.to_dict(),
+            "identity": identity,
+            "target": target,
+            "payload": payload,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return "A-" + hashlib.sha256(canonical.encode("ascii")).hexdigest()[:16]
+
+
+def _cross_acceptance_comment(record: EffectRecord, what: str) -> None:
+    _same(record, what, (record.identity["issue_url"], record.target["issue_url"], "issue"))
+    if not _same_url(record.target["issue_url"], record.owner.issue_url, parse_issue_url):
+        _fail(what, "comments on another issue than its owner's; K9 targets the run's issue")
+    _check_owner_issue_marker(record, ACCEPTANCE, what)
+    claim = _marker_claim(ACCEPTANCE, record.identity["marker"])
+    # The payload is the controller's header, the text the parser accepted
+    # and the marker (``acceptance_comment_body``); the text gets the
+    # parser's rules again, because a resumed write publishes it with no
+    # agent result in between.
+    head = (
+        acceptance_comment_header(
+            record.owner.issue_url, record.owner.pr_url, claim.round, claim.finding_id
+        )
+        + APPEND_SEPARATOR
+    )
+    tail = APPEND_SEPARATOR + record.identity["marker"]
+    body = record.body
+    if not body.startswith(head) or not body.endswith(tail) or len(body) < len(head) + len(tail):
+        _fail(
+            what,
+            "has a payload body that is not the controller's header, its text and its marker",
+        )
+    text = body[len(head) : len(body) - len(tail)]
+    if text != text.strip():
+        _fail(what, "has an acceptance text that is not in the parser's stored form")
+    try:
+        validate_acceptance_body(text)
+    except ControlResultValidationError as exc:
+        _fail(what, f"has an invalid acceptance text: {exc}")
+    if body != acceptance_comment_body(
+        text, record.owner.issue_url, record.owner.pr_url, claim.round, claim.finding_id
+    ):
+        _fail(what, "has a payload body that is not the controller's rendering of its text")
+    authorization = record.precondition["authorization"]
+    approved = record.precondition["approved_action_id"]
+    if approved and approved != record.action_id:
+        # An approval names the bytes and the target it approved: one that
+        # is not this record's id approved something else.
+        _fail(f"{what}.precondition.approved_action_id", "is not the record's action id")
+    if authorization == AUTHORIZATION_POLICY and not approved:
+        _fail(what, "is authorized by policy but records no approved action id")
+    if record.attempts and not approved:
+        _fail(what, "records an issued attempt without an approval of its action id")
+    if record.observed is not None and not parse_comment_url(record.observed["url"]).on(
+        parse_issue_url(record.target["issue_url"])
+    ):
+        _fail(what, "is observed on another issue than its target")
+
+
 _CROSS_CHECKS: Mapping[EffectKind, Callable[[EffectRecord, str], None]] = {
     EffectKind.PUSH: _cross_push,
     EffectKind.IMPLEMENTATION_PR: _cross_implementation_pr,
@@ -1225,6 +1413,7 @@ _CROSS_CHECKS: Mapping[EffectKind, Callable[[EffectRecord, str], None]] = {
     EffectKind.FOLLOW_UP_APPEND: _cross_follow_up_append,
     EffectKind.REPLACEMENT_PR: _cross_replacement_pr,
     EffectKind.PROGRESS_COMMENT: _cross_progress_comment,
+    EffectKind.ACCEPTANCE_COMMENT: _cross_acceptance_comment,
 }
 
 
@@ -1250,6 +1439,13 @@ def load_records(raw: object, binding: Binding) -> tuple[EffectRecord, ...]:
         record.owner.check(binding, f"effect_records[{i}]")
     if sum(1 for r in records if r.kind == EffectKind.PUSH) > 1:
         _fail("effect_records", "plans more than one push")
+    acceptance = [r.position for r in records if r.kind == EffectKind.ACCEPTANCE_COMMENT]
+    if len(acceptance) > MAX_ACCEPTANCE_ACTIONS_PER_FIX:
+        _fail("effect_records", "plans more than one acceptance comment")
+    if acceptance and acceptance[0] != 0:
+        # K9 first (#211): nothing else of the plan is sent before the one
+        # write that may wait for an operator.
+        _fail("effect_records", "plans an acceptance comment after another effect")
     return records
 
 
@@ -1617,7 +1813,13 @@ MAX_STORED_RATIONALE_CHARS = MAX_FIX_RATIONALE_CHARS * MAX_GROWTH_FACTOR
 
 @dataclass(frozen=True)
 class FixContext:
-    """``FIX``: one resolution per open finding, rationales in their redacted form."""
+    """``FIX``: one resolution per open finding, rationales in their redacted form.
+
+    ``follow_up_source`` names where a deferred finding's follow-up comes
+    from (D4.6) and ``acceptance_source`` the plan position of the K9 record
+    that publishes an ``acceptance_action`` finding's comment (#211); each
+    is set exactly on the resolutions of its kind.
+    """
 
     issue_url: str
     pr_url: str
@@ -1625,9 +1827,16 @@ class FixContext:
     resolutions: tuple[dict, ...]
 
     PHASE = Phase.FIX
-    _RESOLUTION_KEYS = ("finding_id", "resolution", "rationale", "commit_sha", "follow_up_source")
+    _RESOLUTION_KEYS = (
+        "finding_id",
+        "resolution",
+        "rationale",
+        "commit_sha",
+        "follow_up_source",
+        "acceptance_source",
+    )
     _RESOLUTION_BOUND = (
-        MAX_STORED_RATIONALE_CHARS + MAX_FINDING_ID_CHARS + 40 + 32 + 16 + (5 * _KEY_OVERHEAD)
+        MAX_STORED_RATIONALE_CHARS + MAX_FINDING_ID_CHARS + 40 + 32 + 16 + 16 + (6 * _KEY_OVERHEAD)
     )
     STORED_BOUND = (
         2 * MAX_URL_CHARS + MAX_RESOLUTIONS_PER_FIX * _RESOLUTION_BOUND + (5 * _KEY_OVERHEAD)
@@ -1669,6 +1878,7 @@ class FixContext:
         if sorted(ids) != sorted(binding.open_finding_ids):
             _fail(f"{what}.resolutions", "must resolve exactly the open findings")
         cls._check_sources(resolutions, data["pr_url"], records, observation, what)
+        cls._check_acceptance(resolutions, data["issue_url"], data["pr_url"], round_, records, what)
         return cls(data["issue_url"], data["pr_url"], round_, tuple(resolutions))
 
     @classmethod
@@ -1691,7 +1901,51 @@ class FixContext:
             _int(source, f"{what}.follow_up_source", 0, MAX_EFFECTS_PER_PLAN - 1)
         if (resolution == "follow_up_created") != (source is not None):
             _fail(f"{what}.follow_up_source", "is set exactly when the finding is deferred")
+        acceptance = data["acceptance_source"]
+        if acceptance is not None:
+            _int(acceptance, f"{what}.acceptance_source", 0, MAX_EFFECTS_PER_PLAN - 1)
+        if (resolution == "acceptance_action") != (acceptance is not None):
+            _fail(
+                f"{what}.acceptance_source",
+                "is set exactly when the finding is resolved by an acceptance action",
+            )
         return dict(data)
+
+    @staticmethod
+    def _check_acceptance(
+        resolutions: Sequence[dict],
+        issue_url: str,
+        pr_url: str,
+        round_: int,
+        records: Sequence[EffectRecord],
+        what: str,
+    ) -> None:
+        """#211: each ``acceptance_action`` names its K9 record, and each K9 one finding."""
+        named: set[int] = set()
+        for resolution in resolutions:
+            source = resolution["acceptance_source"]
+            if source is None:
+                continue
+            fid = resolution["finding_id"]
+            label = f"{what} resolution for {fid}"
+            if source >= len(records):
+                _fail(label, f"names plan position {source}, which the plan does not hold")
+            record = records[source]
+            if record.kind != EffectKind.ACCEPTANCE_COMMENT:
+                _fail(label, f"names effect {source}, which is not an acceptance comment")
+            marker = render_acceptance_marker(issue_url, pr_url, round_, fid)
+            if record.identity["marker"] != marker:
+                _fail(
+                    label,
+                    f"names acceptance effect {source}, which is another finding's or round's",
+                )
+            named.add(source)
+        for record in records:
+            if record.kind == EffectKind.ACCEPTANCE_COMMENT and record.position not in named:
+                _fail(
+                    f"effect_records[{record.position}]",
+                    "is an acceptance comment no resolution of the context names",
+                )
 
     @staticmethod
     def _check_sources(
@@ -2124,13 +2378,19 @@ class Action(StrEnum):
     REBASE = "rebase"  # D5.5: save the rebased payload as attempted, then issue it
     CONFLICT = "conflict"  # BLOCKED, naming the object
     DONE = "done"  # already observed: terminal, nothing to do
+    # K9 (#211): the write is due but may not be sent yet (no authorization,
+    # or the run's issue no longer qualifies). Nothing is sent and the
+    # record is unchanged; the phase blocks with the reason.
+    HOLD = "hold"
 
 
 @dataclass(frozen=True)
 class Decision:
     action: Action
-    observed: dict | None = None  # OBSERVE: the observed result
-    reason: str = ""  # CONFLICT: names the objects and the rule, never a payload
+    # OBSERVE: the observed result; HOLD (K9): the exact comment found but not
+    # adopted, because the run's issue no longer qualifies (PR #221 R1-F2).
+    observed: dict | None = None
+    reason: str = ""  # CONFLICT, HOLD: names the objects and the rule, never a payload
     rebase_body: str = ""  # REBASE: the body read now, the new base
     # CONFLICT only because the bound is spent and the write is still absent:
     # right after an issue that is "not visible yet", not yet a conflict.
@@ -2202,6 +2462,55 @@ def decide_create(record: EffectRecord, found: Sequence[Found]) -> Decision:
         Action.CONFLICT,
         reason=f"{record.describe()}: {len(found)} objects carry its identity ({urls})",
     )
+
+
+def decide_acceptance(
+    record: EffectRecord, found: Sequence[Found], *, issue_problem: str = ""
+) -> Decision:
+    """K9 (#211): :func:`decide_create`, except that a due write may be held.
+
+    The exact payload already on the issue is adopted whoever posted it
+    (an operator may post it instead of approving), and every conflict is
+    decide_create's. ``issue_problem`` (the run's issue is closed, or not in
+    the run's repository) holds an adoption as it holds a write (PR #221
+    R1-F2): the exact payload on such an issue is not adopted, its URL is
+    the hold's ``observed``, and the plan's later writes wait with it. A
+    due write is also held while no approval of this record's action id is
+    recorded. A hold sends nothing and changes nothing; for an ``attempted``
+    record its reason says the earlier write was sent (PR #221 R2-F1).
+    """
+    decision = decide_create(record, found)
+    if decision.action is Action.OBSERVE and issue_problem:
+        url = (decision.observed or {}).get("url", "")
+        return Decision(
+            Action.HOLD,
+            observed=decision.observed,
+            reason=(
+                f"{record.describe()}: its exact payload is on {url}, but {issue_problem}; it "
+                "is not adopted while the issue does not qualify, and nothing more was sent"
+            ),
+        )
+    if decision.action is not Action.ISSUE:
+        return decision
+    if not record.authorized:
+        return Decision(
+            Action.HOLD,
+            reason=(
+                f"{record.describe()}: action {record.action_id} awaits the operator's "
+                "approval; nothing was sent"
+            ),
+        )
+    if issue_problem:
+        # An attempted record's write was sent (PR #221 R2-F1): its comment
+        # is not on the issue, or not visible yet, and is not sent again.
+        sent = (
+            f"the comment of attempt {record.attempts} is not on the issue, and nothing more "
+            "is sent while the issue does not qualify"
+            if record.stage == Stage.ATTEMPTED
+            else "nothing was sent"
+        )
+        return Decision(Action.HOLD, reason=f"{record.describe()}: {issue_problem}; {sent}")
+    return decision
 
 
 def decide_append(

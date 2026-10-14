@@ -16,10 +16,12 @@ from dataclasses import dataclass
 import pytest
 
 from autoforge.claims import (
+    ACCEPTANCE,
     FOLLOW_UP,
     IMPLEMENTATION,
     PROGRESS,
     REVIEW,
+    AcceptanceClaim,
     Claimants,
     FollowUpClaim,
     ImplementationClaim,
@@ -28,6 +30,7 @@ from autoforge.claims import (
     ReviewClaim,
     collect,
     marker_json,
+    render_acceptance_marker,
     render_follow_up_marker,
     render_implementation_marker,
     render_progress_marker,
@@ -68,8 +71,9 @@ VALID = {
     REVIEW.name: {"round": 1, "reviewed_head_sha": SHA_A, "needs_fix_round": False},
     PROGRESS.name: {"issue": ISSUE, "pr": PR},
     FOLLOW_UP.name: {"finding_id": "R1-F1", "pr": PR},
+    ACCEPTANCE.name: {"finding_id": "R2-F1", "issue": ISSUE, "pr": PR, "round": 2},
 }
-KINDS = [IMPLEMENTATION, REVIEW, PROGRESS, FOLLOW_UP]
+KINDS = [IMPLEMENTATION, REVIEW, PROGRESS, FOLLOW_UP, ACCEPTANCE]
 
 
 def _valid(kind):
@@ -89,6 +93,11 @@ def test_each_kind_decodes_its_documented_payload_to_a_typed_claim():
     )
     assert scan(FOLLOW_UP, marker("ai-follow-up", _valid(FOLLOW_UP))).claims == (
         FollowUpClaim(pr=parse_pr_url(PR), finding_id="R1-F1"),
+    )
+    assert scan(ACCEPTANCE, marker("ai-acceptance", _valid(ACCEPTANCE))).claims == (
+        AcceptanceClaim(
+            issue=parse_issue_url(ISSUE), pr=parse_pr_url(PR), round=2, finding_id="R2-F1"
+        ),
     )
     for kind in KINDS:
         assert scan(kind, marker(kind.name, _valid(kind))).defects == ()
@@ -264,6 +273,16 @@ def _cases():
     yield FOLLOW_UP, {**f, "finding_id": "R1-F" + "1" * MAX_FINDING_ID_CHARS}, "longer than"
     yield FOLLOW_UP, {**f, "pr": PR + "/files"}, "pr is not a GitHub pull request URL"
     yield FOLLOW_UP, {**f, "pr": "https://github.com/owner/repo/pulls/42"}, "not a GitHub pull"
+    a = _valid(ACCEPTANCE)
+    yield ACCEPTANCE, {k: v for k, v in a.items() if k != "round"}, "missing key(s) round"
+    yield ACCEPTANCE, {**a, "url": ISSUE}, "unknown key(s) url"
+    yield ACCEPTANCE, {**a, "round": 0}, "round must be a JSON integer >= 1"
+    yield ACCEPTANCE, {**a, "round": True}, "round must be a JSON integer >= 1"
+    yield ACCEPTANCE, {**a, "round": "2"}, "round must be a JSON integer >= 1"
+    yield ACCEPTANCE, {**a, "finding_id": "R1-F1"}, "does not belong to round 2"
+    yield ACCEPTANCE, {**a, "finding_id": "R2-F1 "}, "not a finding id"
+    yield ACCEPTANCE, {**a, "issue": PR}, "issue is not a GitHub issue URL"
+    yield ACCEPTANCE, {**a, "pr": ISSUE}, "pr is not a GitHub pull request URL"
 
 
 @pytest.mark.parametrize(
@@ -542,6 +561,17 @@ def test_renderers_emit_canonical_urls_and_round_trip_through_the_decoders():
     fu = render_follow_up_marker(PR, "R2-F3")
     assert fu == f'<!-- ai-follow-up: {{"finding_id": "R2-F3", "pr": "{PR}"}} -->'
     assert scan(FOLLOW_UP, fu).claims[0].key == (parse_pr_url(PR).identity, "R2-F3")
+    acc = render_acceptance_marker(ISSUE, PR + "/", 2, "R2-F3")
+    assert acc == (
+        f'<!-- ai-acceptance: {{"finding_id": "R2-F3", "issue": "{ISSUE}", "pr": "{PR}", '
+        '"round": 2} -->'
+    )
+    assert scan(ACCEPTANCE, acc).claims[0].key == (
+        parse_issue_url(ISSUE).identity,
+        parse_pr_url(PR).identity,
+        2,
+        "R2-F3",
+    )
 
 
 # Valid git branch names that contain an HTML comment delimiter (or would

@@ -159,6 +159,22 @@ safety:
   # are not compared, and a check that is not an Actions run cannot be
   # verified and is BLOCKED. Set to false to trust the check name alone.
   verify_check_definition: true
+  # Acceptance actions (#211): a FIX agent may resolve a finding by asking the
+  # controller to publish one comment on the run's own issue (the evidence an
+  # acceptance criterion asks to have posted there). The agent gives only the
+  # text; the controller derives the target, adds its header and marker, and
+  # reads the comment back. Who authorizes that write:
+  #   approve -- the run BLOCKs with nothing sent; `autoforge status` shows
+  #              the action id and payload hash, and the operator approves
+  #              (`unblock --approve-action <id>`), posts the exact payload
+  #              (`status --action <id>`) themselves, or declines it
+  #              (`unblock --decline-action <id>`);
+  #   auto    -- the controller publishes it during the FIX step;
+  #   off     -- the resolution is refused (a bare `off`, which YAML reads as
+  #              false, means the same).
+  # The policy is recorded with the action when the FIX plan is saved, so a
+  # later change never widens an authorization already persisted.
+  acceptance_actions: approve
 
 merge:
   # How the CONTROLLER merges once the gate above is open. Agents never merge:

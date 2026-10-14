@@ -233,7 +233,10 @@ controller verify the PR on GitHub and merge it itself.
 
 A run in `BLOCKED` stays there until you fix the cause and run
 `autoforge unblock --reason "..."`, which re-inspects GitHub and either
-re-enters the one phase that inspection supports or refuses. Every command,
+re-enters the one phase that inspection supports or refuses. When a fixer
+asked the controller to post an acceptance comment on the issue, the run
+waits for you to approve or decline that exact comment
+(`unblock --approve-action` / `--decline-action`). Every command,
 where a run stops, and how to recover are in
 [Running the remote workflow](docs/usage.md).
 

@@ -211,6 +211,8 @@ never the text; the count is checked before any element is parsed):
 MAX_RESOLUTIONS_PER_FIX         resolutions per FIX (== MAX_FINDINGS_PER_REVIEW)
 MAX_FIX_RATIONALE_CHARS         rationale length (after stripping), both modes
 MAX_URL_CHARS                   any URL field, checked before the URL is parsed
+MAX_ACCEPTANCE_BODY_CHARS       an acceptance action's body (60000), REMOTE only
+MAX_ACCEPTANCE_ACTIONS_PER_FIX  acceptance actions per FIX result (1), REMOTE only
 ```
 
 The resolution count is equal to the finding count by construction: the
@@ -282,11 +284,12 @@ not a key of this phase any more.
 | `previous_head_sha` | required SHA; a cross-check only: the engine refuses a value other than the reviewed HEAD the open findings are bound to |
 | `head_sha` | required SHA; a cross-check only: the engine reads the worktree's `HEAD` itself and refuses a value that differs from it |
 | `resolutions` | required list, at most `MAX_RESOLUTIONS_PER_FIX`, distinct `finding_id`s; the engine refuses any set other than exactly the open findings |
-| `resolutions[].resolution` | `fixed`, `follow_up_created` or `no_change_with_rationale` |
+| `resolutions[].resolution` | `fixed`, `follow_up_created`, `no_change_with_rationale` or `acceptance_action` (#211) |
 | `resolutions[].commit_sha` | optional SHA, on `fixed` only; the engine refuses one outside the commits after the reviewed HEAD up to `head_sha` |
 | `resolutions[].follow_up_issue_url` | on `follow_up_created` only, exclusive with `follow_up_issue`: an issue URL bounded by `MAX_URL_CHARS`; the engine refuses one it did not hand over and the current issue |
 | `resolutions[].follow_up_issue` | on `follow_up_created` only, exclusive with `follow_up_issue_url`: an object with `title` (one line, at most `MAX_FOLLOW_UP_TITLE_CHARS`, 256) and `body` (multi-line, at most `MAX_FOLLOW_UP_BODY_CHARS`, 60000), both non-blank |
-| `resolutions[].rationale` | at most `MAX_FIX_RATIONALE_CHARS`; at least `MIN_RATIONALE_CHARS` on `no_change_with_rationale` |
+| `resolutions[].acceptance_action` | on `acceptance_action` only, and required there: exactly `{"kind": "issue_comment", "body": "<Markdown>"}`; `body` multi-line, non-blank, at most `MAX_ACCEPTANCE_BODY_CHARS` (60000); a `url`, `issue`, `repository`, `target`, `method`, `path` or `command` key is refused by name, any other key as unknown, any other kind as unsupported; at most `MAX_ACCEPTANCE_ACTIONS_PER_FIX` (1) per result |
+| `resolutions[].rationale` | at most `MAX_FIX_RATIONALE_CHARS`; at least `MIN_RATIONALE_CHARS` on `no_change_with_rationale` and `acceptance_action` |
 | `tests` | optional list of one-line strings, at most `MAX_TESTS_REPORTED` (50) entries of `MAX_TEST_CHARS` (500); recorded, never published |
 
 A new follow-up issue's `title` and `body` pass the published-content
@@ -301,8 +304,27 @@ issue a deferral names. Each refusal is an ordinary correction with nothing
 created, appended or pushed ([github-safety.md](github-safety.md), "After
 FIX"). The persisted `last_fix_resolutions` keeps its shape: a deferral is
 recorded with the URL of the issue GitHub read back, whichever form asked
-for it. LOCAL `FIX` is unchanged: it has no follow-ups and its own
-resolutions (`LOCAL_FIX_RESOLUTIONS`).
+for it.
+
+An `acceptance_action` (#211) asks the controller to publish one comment on
+the run's own issue: the evidence a finding or acceptance criterion asks to
+have posted there. Its `body` passes the published-content policy like a
+follow-up's; the controller derives the target from state, puts its own
+header above the text and the finding's `ai-acceptance` marker below it,
+and judges that rendered comment as a whole (`published_payload_problem`,
+`published_markdown_problem` on what precedes the marker, and the comment
+limit). The engine also refuses it under `safety.acceptance_actions: off`,
+when its action id is one the operator declined for the round, and once the
+round holds `MAX_DECLINES_PER_ROUND` (16) declines (PR #221 R3-F1). It
+never names a commit or a follow-up, it is never a deferral, and it claims
+no other external change: work that needs a secret, a repository setting,
+hardware or a manual check stays `"status": "blocked"`. The recorded
+resolution carries the verified comment's URL as `acceptance_comment_url`
+(`""` for every other resolution), and the next reviewer receives it as
+data. LOCAL `FIX` is unchanged: it has no follow-ups and no acceptance
+actions, and its own resolutions (`LOCAL_FIX_RESOLUTIONS`); a LOCAL
+`acceptance_action` is refused with "LOCAL runs perform no external
+writes".
 
 ### REPLAN_REEXECUTE fields
 
