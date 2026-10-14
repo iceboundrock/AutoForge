@@ -75,9 +75,15 @@ actions once their plan is gone: one entry per action (`action_id`,
 `round`, `finding_id`, `outcome` `verified`, `declined` or `stale`, `at`,
 `comment_url` for a verified one, and the redacted, bounded operator
 `reason` of a decline), at most `MAX_ACCEPTANCE_OUTCOMES` (64, oldest
-dropped), validated on load and reset with the other per-PR fields (a new
-issue, an activated replacement PR, a newly bound PR). The FIX prompt lists
-the round's declines, and the controller refuses a declined id again. A
+dropped, but never a decline of the round being fixed: a decline re-enters
+`FIX` without advancing the round, and a dropped one would let its action
+through again, PR #221 R3-F1), validated on load and reset with the other
+per-PR fields (a new issue, an activated replacement PR, a newly bound PR).
+A round holds at most `MAX_DECLINES_PER_ROUND` (16) declines, below the
+history's bound: once it holds that many, `FIX` refuses any further
+acceptance action of the round, and a file with more in any round is
+refused. The FIX prompt lists the round's declines, and the controller
+refuses a declined id again. A
 LOCAL run carries none of this. A
 REMOTE run also records its replan history: `execution_attempt` (initial
 implementation is 1),

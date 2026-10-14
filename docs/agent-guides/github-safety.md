@@ -441,8 +441,10 @@ for it:
 - an `acceptance_action` (at most one per result) is refused under
   `safety.acceptance_actions: off`, when the comment the controller renders
   from it (its header, the text, the finding's marker) fails the credential
-  rule as a whole, the mention rule or GitHub's comment limit, and when its
-  action id is one the operator declined for this round
+  rule as a whole, the mention rule or GitHub's comment limit, when its
+  action id is one the operator declined for this round, and once the
+  operator declined `MAX_DECLINES_PER_ROUND` (16) actions of the round,
+  the most its history keeps (PR #221 R3-F1)
 - a finding whose follow-up issue the entry found is resolved as
   `follow_up_created` with exactly that issue
 - any other deferral either names an issue the entry handed over (a

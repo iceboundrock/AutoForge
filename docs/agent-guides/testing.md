@@ -495,8 +495,11 @@ a stated reason it has none. The coverage that must keep working:
   the one comment is adopted (PR #221 R2-F1); the exact payload an
   operator posts is adopted; a decline drops the unsent plan, relaunches
   the fixer with the decline in its prompt and refuses the same comment
-  again; a push while it waits refuses an approval as stale and records
-  the action `stale`;
+  again; repeated declines past the outcome history's bound keep every
+  decline of the round, and once the round holds the most declines any
+  further acceptance action of it is refused (PR #221 R3-F1); a push
+  while it waits refuses an approval as stale and records the action
+  `stale`;
   every refused unblock (unknown id, no evidence, a posted payload
   declined, an edited or duplicated comment, a closed issue, a stale
   decline) leaves the state byte-identical, also as a dry run; the

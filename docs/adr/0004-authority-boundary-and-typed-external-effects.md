@@ -1269,7 +1269,14 @@ the plan and its context are dropped and `FIX` is entered afresh: the fixer
 is relaunched at `resume`, under the existing attempt accounting, with the
 declined id, finding and the operator's reason in its prompt. The same text
 for the same finding is the same id, so a result that requests it again is
-refused through the correction path.
+refused through the correction path. A decline does not advance the review
+round, so the round's declines are kept for as long as the round is: the
+bounded outcome history drops earlier rounds' entries, never one of them
+(PR #221 R3-F1). They are bounded per round instead, below the history's
+bound: once a round holds `MAX_DECLINES_PER_ROUND` (16) declines, a result
+requesting any acceptance action of that round is refused the same way, so
+the run fails closed (no comment, the finding resolved another way) rather
+than forgetting a decline.
 
 *Rationale.* This is not a D4.7 re-request: nothing was published, so no
 `observed` record is kept and no void input is re-asked for; it is the

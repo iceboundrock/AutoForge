@@ -39,6 +39,7 @@ from autoforge.replan_txn import ReplanAttestation, render_marker
 from autoforge.result_parser import Finding, ReviewResult
 from autoforge.state import (
     MAX_ACCEPTANCE_OUTCOMES,
+    MAX_DECLINES_PER_ROUND,
     AutoForgeState,
     StatePaths,
     load_state,
@@ -3662,6 +3663,10 @@ def test_a_protocol_7_plan_carrying_an_acceptance_comment_is_refused(tmp_path, p
         ),
         ([_outcome(comment_url=ACCEPTANCE_COMMENT_URL)], "must be empty"),
         ([_outcome()] * (MAX_ACCEPTANCE_OUTCOMES + 1), "over"),
+        (
+            [_outcome()] * (MAX_DECLINES_PER_ROUND + 1),
+            f"holds {MAX_DECLINES_PER_ROUND + 1} declines of review round 1, over",
+        ),
         (["declined"], "must be a list of objects"),
     ],
 )
@@ -3670,6 +3675,47 @@ def test_a_malformed_acceptance_outcome_is_refused(tmp_path, entries, match):
     d["acceptance_outcomes"] = entries
     with pytest.raises(StateError, match=match):
         load_state(_write(tmp_path / "state.json", d))
+
+
+def test_a_round_holding_the_most_declines_loads(tmp_path):
+    d = make_state(phase=Phase.REVIEW, current_pr_url=PR42, review_round=2).to_dict()
+    d["acceptance_outcomes"] = [_outcome()] * MAX_DECLINES_PER_ROUND + [
+        _outcome(round=2, finding_id="R2-F1")
+    ] * MAX_DECLINES_PER_ROUND
+    assert len(load_state(_write(tmp_path / "state.json", d)).acceptance_outcomes) == 32
+
+
+def _declined(round_: int, n: int) -> dict:
+    """The ``n``-th distinct decline of ``round_``."""
+    return _outcome(round=round_, finding_id=f"R{round_}-F1", action_id=f"A-{round_:08x}{n:08x}")
+
+
+def test_the_outcome_bound_drops_earlier_rounds_never_a_decline_of_the_round_being_fixed():
+    """PR #221 R3-F1: a decline re-enters FIX without advancing the round,
+    so one round's declines run past the bound. The oldest entries go, an
+    earlier round's declines among them, but never one of the current
+    round, wherever it stands: it still refuses its action."""
+    older = [_declined(1, n) for n in range(MAX_ACCEPTANCE_OUTCOMES)]
+    s = make_state(phase=Phase.FIX, current_pr_url=PR42, review_round=2)
+    s.acceptance_outcomes = list(older)
+    active: list[dict] = []
+    for n in range(MAX_DECLINES_PER_ROUND):
+        active.append(_declined(2, n))
+        s.acceptance_outcomes.append(active[-1])
+        s.bound_acceptance_outcomes()
+        assert len(s.acceptance_outcomes) == MAX_ACCEPTANCE_OUTCOMES
+        assert s.acceptance_outcomes == older[n + 1 :] + active
+    # The round's declines stay even as the oldest entries of the list.
+    s.acceptance_outcomes = active + older
+    s.acceptance_outcomes.append(_outcome(round=2, finding_id="R2-F1", outcome="stale"))
+    s.bound_acceptance_outcomes()
+    assert s.acceptance_outcomes[:MAX_DECLINES_PER_ROUND] == active
+    assert s.acceptance_outcomes[MAX_DECLINES_PER_ROUND:-1] == older[MAX_DECLINES_PER_ROUND + 1 :]
+    assert s.acceptance_outcomes[-1]["outcome"] == "stale"
+    # Within the bound nothing is dropped.
+    s.acceptance_outcomes = older[:3]
+    s.bound_acceptance_outcomes()
+    assert s.acceptance_outcomes == older[:3]
 
 
 @pytest.mark.parametrize(

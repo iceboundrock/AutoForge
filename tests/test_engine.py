@@ -66,7 +66,7 @@ from autoforge.result_parser import (
     ReviewResult,
     published_markdown_problem,
 )
-from autoforge.state import load_state
+from autoforge.state import MAX_ACCEPTANCE_OUTCOMES, MAX_DECLINES_PER_ROUND, load_state
 from autoforge.transitions import Phase
 from tests.conftest import (
     ACCEPTANCE_RATIONALE,
@@ -12794,6 +12794,68 @@ def test_fix_acceptance_action_declined_reruns_the_fixer_with_the_decline(tmp_st
     assert gh.effect_writes == [] and gh.comments.get(ISSUE, []) == []
 
 
+def _round_1_outcome(n: int) -> dict:
+    """An earlier round's (1) stale acceptance outcome, the ``n``-th distinct one."""
+    return {
+        "action_id": f"A-{n:016x}",
+        "round": 1,
+        "finding_id": "R1-F1",
+        "outcome": "stale",
+        "at": "2026-01-01T00:00:00+00:00",
+        "comment_url": "",
+        "reason": "",
+    }
+
+
+def test_fix_acceptance_declines_of_the_round_outlive_the_history_bound(tmp_state_dir):
+    """PR #221 R3-F1: a decline re-enters FIX without advancing the round, so
+    repeated declines in one round run past the history's bound. With the
+    history already full of round 1's outcomes, each decline of round 2
+    drops round 1's oldest and keeps every decline of round 2. Once the
+    round holds MAX_DECLINES_PER_ROUND, the fixer's prompt says so and FIX
+    refuses any further acceptance action of the round, the first declined
+    one included: no decline is forgotten, and nothing is ever published."""
+    gh = FakeGitHub()
+    texts = [f"{ACCEPTANCE_TEXT} Attempt {n}." for n in range(MAX_DECLINES_PER_ROUND)]
+    eng = _accepting(
+        tmp_state_dir,
+        gh,
+        scripted(
+            *(fixer(acceptance("R2-F1", text), commit=False) for text in texts),
+            fixer(acceptance("R2-F1", texts[0]), commit=False),
+            fixer(no_change("R2-F1"), commit=False),
+        ),
+        findings=[_finding(2)],
+    )
+    eng.state.review_round = 2
+    older = [_round_1_outcome(n) for n in range(MAX_ACCEPTANCE_OUTCOMES)]
+    eng.state.acceptance_outcomes = list(older)
+    declined: list[str] = []
+    for n in range(MAX_DECLINES_PER_ROUND):
+        assert eng.step().next_phase == "BLOCKED"
+        declined.append(_k9(eng).action_id)
+        done = eng.unblock(f"decline {n}", decline_action=declined[-1])
+        assert done.unblocked and done.phase == "FIX", done.message
+        s = load_state(eng.paths.state_file)
+        assert len(s.acceptance_outcomes) == MAX_ACCEPTANCE_OUTCOMES
+        assert s.acceptance_outcomes[: -n - 1] == older[n + 1 :]
+        assert [o["action_id"] for o in s.acceptance_outcomes[-n - 1 :]] == declined
+    assert len(set(declined)) == MAX_DECLINES_PER_ROUND
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    *_, last, again, corrected = eng.provider.calls
+    assert "the most it records for one round" not in last.prompt
+    assert all(action in again.prompt for action in declined)
+    assert f"these {MAX_DECLINES_PER_ROUND} declines are the most it records" in again.prompt
+    assert (
+        f"the operator declined {MAX_DECLINES_PER_ROUND} acceptance actions of review round 2, "
+        "the most the controller records for one round"
+    ) in corrected.prompt
+    assert gh.effect_writes == [] and gh.comments.get(ISSUE, []) == []
+    s = load_state(eng.paths.state_file)
+    assert [o["action_id"] for o in s.acceptance_outcomes if o["round"] == 2] == declined
+
+
 def test_fix_acceptance_action_goes_stale_when_the_pr_moves(tmp_state_dir):
     """A push to the PR while the action awaits approval: a plain unblock
     re-enters FIX, which routes the drift to REVIEW, sends nothing, and
@@ -12853,6 +12915,13 @@ def _refusal_case(eng, gh, case: str) -> dict:
     if case == "stale decline":
         publish_pr_head(eng, parent=eng.state.reviewed_head_sha, message="A human's push (#2)")
         return {"decline_action": action}
+    if case == "decline at the round's bound":
+        # Planted: FIX plans no action once the round holds the most declines.
+        eng.state.acceptance_outcomes = [
+            {**_round_1_outcome(n), "outcome": "declined"} for n in range(MAX_DECLINES_PER_ROUND)
+        ]
+        eng._save()
+        return {"decline_action": action}
     raise AssertionError(case)
 
 
@@ -12870,6 +12939,10 @@ def _refusal_case(eng, gh, case: str) -> dict:
         ("posted payload, closed issue, approve", "is not adopted while the issue does not"),
         ("posted payload, closed issue, decline", "cannot be declined: its exact payload is"),
         ("stale decline", "refused as stale"),
+        (
+            "decline at the round's bound",
+            f"already records {MAX_DECLINES_PER_ROUND} declined acceptance actions",
+        ),
     ],
 )
 def test_unblock_refuses_an_acceptance_request_and_writes_nothing(tmp_state_dir, case, expect):

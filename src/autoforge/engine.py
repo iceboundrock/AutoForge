@@ -353,7 +353,7 @@ from .run_contract import LocalRunContract, validate_local_run_contract
 from .runlog import ExecutionRecord, RunLogger, StepLog
 from .safefs import SafeRoot
 from .state import (
-    MAX_ACCEPTANCE_OUTCOMES,
+    MAX_DECLINES_PER_ROUND,
     STATE_FILENAME,
     AutoForgeState,
     StatePaths,
@@ -1794,11 +1794,21 @@ class ControllerEngine:
         declined = self._declined_acceptance_outcomes()
         if not declined:
             return "(none)"
+        if len(declined) >= MAX_DECLINES_PER_ROUND:
+            ask = (
+                f"and these {len(declined)} declines are the most it records for one round, so "
+                "it refuses any further `acceptance_action` in this round: resolve each finding "
+                "another way"
+            )
+        else:
+            ask = (
+                "resolve the finding another way, or change the text only where the operator's "
+                "reason asks for it"
+            )
         return (
             "The operator declined these acceptance actions of this round. The controller "
             "refuses the same comment again (the same text for the same finding has the same "
-            "action id); resolve the finding another way, or change the text only where the "
-            "operator's reason asks for it:\n"
+            f"action id); {ask}:\n"
             + fenced_untrusted_block(
                 json.dumps(
                     [
@@ -4213,7 +4223,8 @@ class ControllerEngine:
         ``acceptance_action`` is refused while ``safety.acceptance_actions``
         is ``off``, when the comment the controller would render from it
         fails the published-content policy as a whole, and when its action
-        id is one the operator declined for this round (#211).
+        id is one the operator declined for this round, or the round holds
+        the most declines the controller records (#211).
         The candidate is the worktree's ``HEAD`` as the controller reads it:
         detached, equal to ``head_sha``, and either the reviewed HEAD itself
         (nothing committed, so no finding is ``fixed``) or a descendant of
@@ -4366,9 +4377,11 @@ class ControllerEngine:
         """The controller's half of an ``acceptance_action`` (#211): its rendered size.
 
         Refused (a correction) while ``safety.acceptance_actions`` is
-        ``off``; when the comment the controller renders from the text (its
-        header, the text, the finding's marker) fails the credential rule as
-        a whole, the mention rule on what precedes the marker or GitHub's
+        ``off``; once the operator declined :data:`MAX_DECLINES_PER_ROUND`
+        actions of this round, the most its history keeps (PR #221 R3-F1);
+        when the comment the controller renders from the text (its header,
+        the text, the finding's marker) fails the credential rule as a
+        whole, the mention rule on what precedes the marker or GitHub's
         comment limit; and when its action id is one the operator declined
         for this round: the same text for the same finding is the same id,
         so a relaunched fixer cannot request a declined comment unchanged.
@@ -4380,10 +4393,19 @@ class ControllerEngine:
                 "(safety.acceptance_actions: off); resolve it another way, or report status "
                 "'blocked' with a message"
             )
+        declined = self._declined_acceptance_outcomes()
+        if len(declined) >= MAX_DECLINES_PER_ROUND:
+            raise ControlResultValidationError(
+                f"FIX: {fid} is resolved as acceptance_action, but the operator declined "
+                f"{len(declined)} acceptance actions of review round "
+                f"{self._require_state().review_round}, the most the controller records for "
+                "one round, so it requests no further one in this round; resolve the finding "
+                "another way, or report status 'blocked' with a message"
+            )
         record = self._acceptance_plan(0, self._fix_owner(), fid, r.acceptance_body)
         if isinstance(record, str):
             raise ControlResultValidationError(f"FIX: {record}")
-        for outcome in self._declined_acceptance_outcomes():
+        for outcome in declined:
             if outcome["action_id"] == record.action_id:
                 raise ControlResultValidationError(
                     f"FIX: the acceptance comment requested for {fid} is action "
@@ -4629,7 +4651,7 @@ class ControllerEngine:
                     "reason": bounded_reason(reason),
                 }
             )
-            del state.acceptance_outcomes[:-MAX_ACCEPTANCE_OUTCOMES]
+            state.bound_acceptance_outcomes()
         effects = state.phase_effects()
         if effects.phase == target:
             # D2.4: the records belong to the phase entry the block
@@ -5093,6 +5115,19 @@ class ControllerEngine:
                     f"action {action} cannot be declined: {what}. A decline is for an action "
                     "nothing was sent for; delete the comment first, or unblock without the "
                     "flag to adopt an exact one",
+                    pr=pr,
+                )
+            declined = len(self._declined_acceptance_outcomes())
+            if declined >= MAX_DECLINES_PER_ROUND:
+                # Unreachable from the controller's own state (FIX plans no
+                # action at the bound), refused rather than recorded: the
+                # round would hold more declines than a state file may.
+                return UnblockDecision(
+                    None,
+                    f"action {action} cannot be declined: review round "
+                    f"{self._require_state().review_round} already records {declined} declined "
+                    "acceptance actions, the most the controller keeps for one round. Approve "
+                    "it, or post exactly its payload on the issue yourself and unblock",
                     pr=pr,
                 )
             return UnblockDecision(
@@ -10678,7 +10713,8 @@ class ControllerEngine:
         for drift (:meth:`_fix_drift`) a K9 that was not observed is
         ``stale`` and one that was is still ``verified``: the comment is on
         the issue, although the fix it was part of is not recorded. The
-        oldest entries past :data:`MAX_ACCEPTANCE_OUTCOMES` are dropped.
+        oldest entries past the bound are dropped, never a decline of the
+        round (:meth:`AutoForgeState.bound_acceptance_outcomes`).
         """
         state = self._require_state()
         for record in records:
@@ -10697,7 +10733,7 @@ class ControllerEngine:
                     "reason": "" if observed else bounded_reason(reason) if reason else "",
                 }
             )
-        del state.acceptance_outcomes[:-MAX_ACCEPTANCE_OUTCOMES]
+        state.bound_acceptance_outcomes()
 
     def _acceptance_hold_reason(self, driven: Driven, records: Sequence[EffectRecord]) -> str:
         """The BLOCKED reason of a held acceptance comment, rendered by the controller (#211).

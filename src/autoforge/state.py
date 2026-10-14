@@ -282,10 +282,17 @@ _EFFECT_FIELDS = ("effect_records", "entry_observation", "completion_context", "
 _ACCEPTANCE_FIELDS = ("acceptance_outcomes",)
 # ``acceptance_outcomes`` (#211): what became of each acceptance action of
 # the current PR. Bounded: at most one action is requested per FIX result,
-# and the writer drops the oldest entries past the bound, which are earlier
-# rounds' (a decline is refused again within its own round only).
+# and the writer drops the oldest entries past the bound
+# (:meth:`AutoForgeState.bound_acceptance_outcomes`), but never a decline of
+# the round being fixed. That decline is what refuses the same action again,
+# and a decline re-enters FIX without advancing the round, so dropping one
+# would let the action through unchanged (PR #221 R3-F1). The round's
+# declines are bounded instead, below the history's bound: once a round
+# holds MAX_DECLINES_PER_ROUND, FIX refuses any further acceptance action of
+# that round, so there is never one more to decline.
 ACCEPTANCE_OUTCOMES = ("verified", "declined", "stale")
 MAX_ACCEPTANCE_OUTCOMES = 64
+MAX_DECLINES_PER_ROUND = 16
 _ACCEPTANCE_OUTCOME_KEYS = (
     "action_id",
     "round",
@@ -969,6 +976,25 @@ class AutoForgeState:
             self.effect_binding(),
         )
 
+    def bound_acceptance_outcomes(self) -> None:
+        """Drop the oldest ``acceptance_outcomes`` past the bound, never an active decline.
+
+        A decline of the round being fixed refuses its action again for as
+        long as the round lasts, so it is kept (PR #221 R3-F1); the entries
+        dropped are earlier rounds' and the round's verified or stale ones.
+        The round's declines are at most :data:`MAX_DECLINES_PER_ROUND`,
+        below :data:`MAX_ACCEPTANCE_OUTCOMES`, so the bound always holds.
+        """
+        excess = len(self.acceptance_outcomes) - MAX_ACCEPTANCE_OUTCOMES
+        kept: list[dict] = []
+        for outcome in self.acceptance_outcomes:
+            active = outcome["outcome"] == "declined" and outcome["round"] == self.review_round
+            if excess > 0 and not active:
+                excess -= 1
+                continue
+            kept.append(outcome)
+        self.acceptance_outcomes = kept
+
     def drop_phase_effects(self) -> None:
         """Forget the current entry's effect state: the save that commits the phase (D2.4)."""
         self.effect_records = []
@@ -1188,6 +1214,7 @@ def _validate_acceptance_state(state: AutoForgeState) -> None:
             f"state field 'acceptance_outcomes' holds {len(outcomes)} entries, over "
             f"{MAX_ACCEPTANCE_OUTCOMES}"
         )
+    declines: dict[int, int] = {}
     for i, entry in enumerate(outcomes):
         what = f"state field 'acceptance_outcomes'[{i}]"
         if sorted(entry) != sorted(_ACCEPTANCE_OUTCOME_KEYS):
@@ -1217,6 +1244,14 @@ def _validate_acceptance_state(state: AutoForgeState) -> None:
         _comment_url_field(
             state, entry["comment_url"], f"{what}.comment_url", entry["outcome"] == "verified"
         )
+        if entry["outcome"] == "declined":
+            declines[round_] = declines.get(round_, 0) + 1
+    for round_, count in declines.items():
+        if count > MAX_DECLINES_PER_ROUND:
+            raise StateError(
+                f"state field 'acceptance_outcomes' holds {count} declines of review round "
+                f"{round_}, over {MAX_DECLINES_PER_ROUND}, the most one round records"
+            )
     for i, entry in enumerate(state.last_fix_resolutions):
         what = f"state field 'last_fix_resolutions'[{i}].acceptance_comment_url"
         if "acceptance_comment_url" not in entry:

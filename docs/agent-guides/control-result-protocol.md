@@ -313,8 +313,9 @@ follow-up's; the controller derives the target from state, puts its own
 header above the text and the finding's `ai-acceptance` marker below it,
 and judges that rendered comment as a whole (`published_payload_problem`,
 `published_markdown_problem` on what precedes the marker, and the comment
-limit). The engine also refuses it under `safety.acceptance_actions: off`
-and when its action id is one the operator declined for the round. It
+limit). The engine also refuses it under `safety.acceptance_actions: off`,
+when its action id is one the operator declined for the round, and once the
+round holds `MAX_DECLINES_PER_ROUND` (16) declines (PR #221 R3-F1). It
 never names a commit or a follow-up, it is never a deferral, and it claims
 no other external change: work that needs a secret, a repository setting,
 hardware or a manual check stays `"status": "blocked"`. The recorded

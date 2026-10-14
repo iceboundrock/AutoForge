@@ -233,7 +233,9 @@ exact comment with `autoforge status --action A-…`, then either:
 - **decline it:** `autoforge unblock --decline-action A-… --reason "..."`;
   the unsent plan is dropped and `resume` runs the fixer again with your
   reason in its prompt. The same comment for the same finding is refused if
-  asked for again.
+  asked for again. After 16 declines in one review round the controller
+  requests no further acceptance comment in that round: the fixer resolves
+  the finding another way.
 
 The id names the exact bytes and the target, so an id of another plan or a
 changed payload never matches. A plain `unblock` with nothing on the issue is

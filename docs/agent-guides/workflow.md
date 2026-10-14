@@ -576,7 +576,11 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
     dropped, `acceptance_outcomes` records `declined` with the redacted
     reason, the history entry's `action` is `declined <id>`, and `resume`
     launches the fixer with the decline in its prompt (the worktree and its
-    commits are kept). Refused once the marker is on the issue.
+    commits are kept). Refused once the marker is on the issue. The round's
+    declines stay in the history for as long as the round does, and a round
+    holds at most `MAX_DECLINES_PER_ROUND` (16): at that many, `FIX` refuses
+    any further acceptance action of the round, so the fixer resolves the
+    finding another way (PR #221 R3-F1).
   - **no flag** -> `FIX` only when the exact payload is on the issue (posted
     by the operator; `FIX` adopts it) and the issue is open in the PR's
     repository; while it is not, the unblock refuses, naming the comment.
