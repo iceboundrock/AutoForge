@@ -524,7 +524,10 @@ Then, in order, all from one persisted plan:
    comment listing as exactly one comment with its marker and its exact
    bytes (whoever posted it), adopted only while the issue is still open
    in the PR's repository (PR #221 R1-F2). Until then it is held: nothing
-   at all is sent and the step blocks with a reason the controller renders
+   at all is sent (an issue that stops qualifying between the comment's
+   write and its read-back holds it the same way, the record `attempted`
+   and the reason saying the comment was sent, PR #221 R2-F1) and the
+   step blocks with a reason the controller renders
    (the action id, the finding, the payload's size and SHA-256, the push
    held back and the worktree holding it, and the ways forward; see
    [Workflow: leaving BLOCKED](workflow.md#leaving-blocked-the-operators-unblock)).

@@ -353,6 +353,9 @@ class FakeGitHub:
         # The replan's post-close receipt is the interesting one -- it lands
         # between the controller's post-close read and its confirmation.
         self.comment_race = None
+        # Called once, then cleared, as create_issue_comment returns or raises:
+        # a change between the write and its read-back (PR #221 R2-F1).
+        self.after_issue_comment: Callable[[], None] | None = None
         self.commented_prs: list[tuple[str, str]] = []
         self.get_pr_failures: int = 0  # next N get_pr calls raise GitHubUnavailableError
         self.get_pr_error: GitHubError | None = None  # every get_pr call raises this
@@ -997,7 +1000,12 @@ class FakeGitHub:
             self._stored_issue(canonical)  # a 404 on an unknown issue, like GitHub
             return self._new_comment(canonical, body)
 
-        return self._effect_write("create_issue_comment", canonical, body, perform)
+        try:
+            return self._effect_write("create_issue_comment", canonical, body, perform)
+        finally:
+            after, self.after_issue_comment = self.after_issue_comment, None
+            if after is not None:
+                after()
 
     def create_pr_comment(self, pr_url: str, body: str) -> CreatedObject:
         from autoforge.validation import parse_pr_url

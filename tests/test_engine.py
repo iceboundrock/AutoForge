@@ -12546,7 +12546,10 @@ def test_fix_acceptance_action_holds_when_the_issue_no_longer_qualifies(tmp_stat
     assert gh.effect_writes == []
     reason = load_state(eng.paths.state_file).block_reason
     assert f"cannot publish acceptance action {_k9(eng).action_id}" in reason
-    assert why in reason
+    assert why in reason and "nothing of the FIX plan was sent" in reason
+    # Authorized, it is held by the issue alone: no approval or decline is offered.
+    assert f"once {ISSUE} is open in owner/repo again" in reason
+    assert "--approve-action" not in reason and "--decline-action" not in reason
 
 
 def test_fix_acceptance_action_payload_the_operator_posted_is_adopted(tmp_state_dir):
@@ -12662,6 +12665,99 @@ def test_fix_acceptance_comment_that_landed_is_not_adopted_once_the_issue_closed
     assert out.next_phase == "REVIEW", out.message
     assert [w[0] for w in gh.effect_writes] == ["create_issue_comment"]
     assert gh.comments[ISSUE] == [comment] and eng2.origin.head(BRANCH) != reviewed
+
+
+@pytest.mark.parametrize("how", ["CLOSED", "OPEN-ELSEWHERE"])
+def test_fix_acceptance_issue_that_stops_qualifying_right_after_the_comment_blocks(
+    tmp_state_dir, how
+):
+    """PR #221 R2-F1: the controller's comment lands, and the run's issue is
+    closed or leaves the PR's repository before the read-back. That is the
+    eligibility hold, not a write still propagating: the same step blocks
+    with the actual reason, saying the comment was sent, and the record
+    stays `attempted`. No follow-up is created and nothing is pushed while
+    the issue does not qualify, also in a new process after an unblock;
+    once it does again, FIX adopts the one comment and completes the plan."""
+    gh = FakeGitHub()
+    eng = _accepting(
+        tmp_state_dir,
+        gh,
+        fixer(acceptance("R1-F1"), new_follow_up("R1-F2")),
+        policy="auto",
+        findings=[_finding(1), _finding(1, 2)],
+    )
+    why: list[str] = []
+    gh.after_issue_comment = lambda: why.append(_disqualify(gh, how))
+    reviewed = eng.state.reviewed_head_sha
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    [comment] = gh.comments[ISSUE]
+    assert [w[0] for w in gh.effect_writes] == ["create_issue_comment"]
+    assert eng.origin.head(BRANCH) == reviewed == gh.prs[PR].head_sha
+    s = load_state(eng.paths.state_file)
+    assert [(r["kind"], r["stage"]) for r in s.effect_records] == [
+        ("acceptance_comment", "attempted"),
+        ("follow_up_issue", "intended"),
+        ("push", "intended"),
+    ]
+    action = _k9(eng).action_id
+    reason = s.block_reason
+    assert f"cannot adopt acceptance action {action}" in reason
+    assert f"its exact payload is on {comment.url}" in reason and why[0] in reason
+    assert "the controller sent it (attempt 1) and adopts that comment only while" in reason
+    assert "nothing was sent" not in reason and "nothing of the FIX plan" not in reason
+    assert "1 follow-up write(s) are held back as well" in reason
+    eng2 = _resumed(eng, tmp_state_dir, gh, "never")
+    done = eng2.unblock(REASON_211)
+    assert done.unblocked and done.phase == "FIX", done.message
+    out = eng2.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert eng2.provider.calls == [] and _k9(eng2).stage is Stage.ATTEMPTED
+    assert [w[0] for w in gh.effect_writes] == ["create_issue_comment"]
+    assert eng2.origin.head(BRANCH) == reviewed
+    assert why[0] in load_state(eng2.paths.state_file).block_reason
+    gh.issues[ISSUE] = replace(gh.issues[ISSUE], state="OPEN", repository="owner/repo")
+    assert eng2.unblock(REASON_211).unblocked
+    out = eng2.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert [w[0] for w in gh.effect_writes] == ["create_issue_comment", "create_issue"]
+    assert gh.comments[ISSUE] == [comment] and eng2.origin.head(BRANCH) != reviewed
+    s = load_state(eng2.paths.state_file)
+    assert s.last_fix_resolutions[0]["acceptance_comment_url"] == comment.url
+    assert [o["outcome"] for o in s.acceptance_outcomes] == ["verified"]
+
+
+def test_fix_acceptance_write_not_read_back_on_an_issue_that_closed_blocks(tmp_state_dir):
+    """PR #221 R2-F1, with the comment not on the issue: the write's reply is
+    lost, nothing landed, and the issue is closed before the read-back. FIX
+    blocks with the eligibility reason, which says attempt 1 was sent and
+    asks for no approval; reopened, the issue gets the comment from the
+    second attempt of the bound, and the plan completes."""
+    gh = FakeGitHub()
+    eng = _accepting(tmp_state_dir, gh, fixer(acceptance("R1-F1")), policy="auto")
+    gh.write_failures.append(("create_issue_comment", GitHubUnavailableError("timed out"), False))
+    gh.after_issue_comment = lambda: _disqualify(gh, "CLOSED")
+    reviewed = eng.state.reviewed_head_sha
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert gh.comments.get(ISSUE, []) == [] and len(gh.effect_writes) == 1
+    assert eng.origin.head(BRANCH) == reviewed and _k9(eng).stage is Stage.ATTEMPTED
+    action = _k9(eng).action_id
+    reason = load_state(eng.paths.state_file).block_reason
+    assert f"cannot publish acceptance action {action}" in reason
+    assert f"issue {ISSUE} is closed, not open" in reason
+    assert "the comment of attempt 1 is not on the issue" in reason
+    assert "the controller sent it (attempt 1) and publishes or adopts that comment" in reason
+    assert "nothing more of the FIX plan was sent" in reason
+    assert "nothing was sent" not in reason and "--approve-action" not in reason
+    assert f"once {ISSUE} is open in owner/repo again" in reason
+    gh.issues[ISSUE] = replace(gh.issues[ISSUE], state="OPEN")
+    assert eng.unblock(REASON_211).unblocked
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert [w[0] for w in gh.effect_writes] == ["create_issue_comment"] * 2
+    [comment] = gh.comments[ISSUE]
+    assert comment.body == _acceptance_body() and eng.origin.head(BRANCH) != reviewed
 
 
 def test_fix_acceptance_action_declined_reruns_the_fixer_with_the_decline(tmp_state_dir):

@@ -1055,7 +1055,12 @@ controller's. Its write also needs an authorization (D5.6).
   voids a plan that sent nothing, and the push stays the commit point. At
   most one K9 per plan; the plan still fits `MAX_EFFECTS_PER_PLAN`, because
   the finding K9 resolves is not deferred.
-- **Windows:** the generic ones, plus the hold. A comment with the marker
+- **Windows:** the generic ones, plus the hold. An issue that stops
+  qualifying between the write and its read-back holds the record too, as
+  the conclusive answer it is rather than a write not visible yet: it stays
+  `attempted`, `FIX` blocks with the issue's reason and says the comment
+  was sent, and nothing later in the plan is sent; a write GitHub refused
+  meanwhile is still a conflict (PR #221 R2-F1). A comment with the marker
   and other bytes, or two comments, is W5 (`conflict`, naming them); it is
   never declined (D5.7). A comment without the marker is not evidence. The
   observed comment is never posted again, and the next `REVIEW` receives its
@@ -2379,7 +2384,8 @@ In addition:
   - the exact payload posted by anyone is adopted; an edited body or two
     comments are a conflict; a closed issue or one outside the run's
     repository holds the write, and the adoption of an exact payload
-    already there, in every pending stage;
+    already there, in every pending stage, also when it stops qualifying
+    between the write and its read-back;
   - the plan holds at most one K9, first, named by exactly one resolution;
   - approve, decline and plain unblock: each precondition, each refusal
     leaving the state byte-identical, dry runs writing nothing; drift makes

@@ -10579,8 +10579,9 @@ class ControllerEngine:
                 )
             if driven.held:
                 # K9 (#211): the acceptance comment is due but may not be
-                # sent (no approval yet, or the issue no longer qualifies).
-                # It is first in the plan, so nothing at all was sent.
+                # sent (no approval yet, or the issue no longer qualifies),
+                # or the issue stopped qualifying after it was sent (PR #221
+                # R2-F1). It is first in the plan, so nothing else was sent.
                 return Phase.BLOCKED, self._acceptance_hold_reason(driven, records)
             records[index] = driven.record
             checked = checked and record.kind is EffectKind.PUSH
@@ -10704,8 +10705,11 @@ class ControllerEngine:
         Names the action id, the finding (id and title), the issue, the PR
         and the round; the payload's size and SHA-256 and the command that
         prints it; the push held back and the worktree that alone holds the
-        unpushed candidate; and the ways forward. Agent text appears only as
-        the finding's title, which the review result bounded to one line.
+        unpushed candidate; and the ways forward. An authorized record is
+        held only by the issue's eligibility, so it asks for no approval, and
+        an ``attempted`` one says its comment was sent (PR #221 R2-F1). Agent
+        text appears only as the finding's title, which the review result
+        bounded to one line.
         """
         state = self._require_state()
         record = driven.record
@@ -10738,6 +10742,15 @@ class ControllerEngine:
         plain = f"{self.cli_command('unblock', '--reason')} {why!r}"
         decline = f"{self.cli_command('unblock', '--decline-action', action, '--reason')} {why!r}"
         resume = self.resume_command()
+        payload = (
+            f"The comment's payload is {len(record.body)} characters, sha256 "
+            f"{sha256_text(record.body)}; print it with "
+            f"{self.cli_command('status', '--action', action)}"
+        )
+        # An attempted record's comment was sent, in this step or an earlier
+        # one, before the issue stopped qualifying (PR #221 R2-F1).
+        attempted = record.stage is Stage.ATTEMPTED
+        sent = f"sent it (attempt {record.attempts}) and " if attempted else ""
         if driven.held_url:
             # The exact payload is there, on an issue that no longer
             # qualifies: it is adopted once the issue does again, and
@@ -10746,11 +10759,27 @@ class ControllerEngine:
                 f"FIX of review round {state.review_round} cannot adopt acceptance action "
                 f"{action}: {driven.held}. The fixer resolved finding {fid} ({title!r}) by "
                 f"asking the controller to publish an acceptance comment on issue {issue} for "
-                f"PR {state.current_pr_url}; the controller adopts that comment only while the "
-                f"issue is open in {state.repository}, so nothing more of the FIX plan was "
-                f"sent. Meanwhile {held_back}. Next: once {issue} is open in "
+                f"PR {state.current_pr_url}; the controller {sent}adopts that comment only "
+                f"while the issue is open in {state.repository}, so nothing more of the FIX "
+                f"plan was sent. Meanwhile {held_back}. Next: once {issue} is open in "
                 f"{state.repository} again, run {plain} and {resume}: FIX adopts the comment "
                 "and completes the plan"
+            )
+        if record.authorized:
+            # Authorized, so held only because the issue no longer
+            # qualifies: there is nothing to approve or decline. An attempted
+            # record's comment is not on the issue (or not visible yet).
+            return (
+                f"FIX of review round {state.review_round} cannot publish acceptance action "
+                f"{action}: {driven.held}. The fixer resolved finding {fid} ({title!r}) by "
+                f"asking the controller to publish an acceptance comment on issue {issue} for "
+                f"PR {state.current_pr_url}; the controller {sent}publishes or adopts that "
+                f"comment only while the issue is open in {state.repository}, so nothing "
+                f"{'more ' if attempted else ''}of the FIX plan was sent. {payload}. Meanwhile "
+                f"{held_back}. Next: once {issue} is open in {state.repository} again, run "
+                f"{plain} and {resume}: FIX adopts the comment if the issue holds its exact "
+                "payload, and otherwise publishes it within its attempt bound, then completes "
+                "the plan"
             )
         if self.config.safety.acceptance_actions == ACCEPTANCE_ACTIONS_OFF:
             approval = (
@@ -10759,22 +10788,14 @@ class ControllerEngine:
             )
         else:
             approval = f"approve it: {approve}, then {resume}"
-        opening = (
-            f"FIX of review round {state.review_round} cannot publish acceptance action "
-            f"{action}: {driven.held}"
-            if record.authorized
-            else f"FIX of review round {state.review_round} awaits operator action {action} "
-            f"({driven.held})"
-        )
         return (
-            f"{opening}. The fixer resolved finding {fid} ({title!r}) by asking the controller "
-            f"to publish an acceptance comment on issue {issue} for PR {state.current_pr_url}; "
-            "nothing of the FIX plan was sent. The comment's payload is "
-            f"{len(record.body)} characters, sha256 {sha256_text(record.body)}; print it with "
-            f"{self.cli_command('status', '--action', action)}. Meanwhile {held_back}. Next: "
-            f"{approval}; or post exactly that payload on {issue} yourself (marker included), "
-            f"then {plain} and {resume}; or decline it: {decline} (FIX runs the fixer again, "
-            "with the decline in its prompt)"
+            f"FIX of review round {state.review_round} awaits operator action {action} "
+            f"({driven.held}). The fixer resolved finding {fid} ({title!r}) by asking the "
+            f"controller to publish an acceptance comment on issue {issue} for PR "
+            f"{state.current_pr_url}; nothing of the FIX plan was sent. {payload}. Meanwhile "
+            f"{held_back}. Next: {approval}; or post exactly that payload on {issue} yourself "
+            f"(marker included), then {plain} and {resume}; or decline it: {decline} (FIX "
+            "runs the fixer again, with the decline in its prompt)"
         )
 
     def _check_replan_result(self, payload: dict, cwd: str) -> ReplanReexecuteResult:

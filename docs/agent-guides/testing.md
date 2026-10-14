@@ -488,10 +488,15 @@ a stated reason it has none. The coverage that must keep working:
   in one step; `off` is a correction; a closed issue, or one outside the
   repository, holds the comment, and the exact payload already there, a
   landed `attempted` one included, until it qualifies again, with no
-  later write of the plan sent; the exact payload an operator posts is
-  adopted; a decline drops the unsent plan, relaunches the fixer with the
-  decline in its prompt and refuses the same comment again; a push while
-  it waits refuses an approval as stale and records the action `stale`;
+  later write of the plan sent; an issue that stops qualifying between the
+  comment's write and its read-back blocks the same step with that reason,
+  the record `attempted` and the reason saying the comment was sent, and
+  an unblock while it still does not qualify sends nothing; once it does,
+  the one comment is adopted (PR #221 R2-F1); the exact payload an
+  operator posts is adopted; a decline drops the unsent plan, relaunches
+  the fixer with the decline in its prompt and refuses the same comment
+  again; a push while it waits refuses an approval as stale and records
+  the action `stale`;
   every refused unblock (unknown id, no evidence, a posted payload
   declined, an edited or duplicated comment, a closed issue, a stale
   decline) leaves the state byte-identical, also as a dry run; the
@@ -575,7 +580,10 @@ a stated reason it has none. The coverage that must keep working:
   without the fixer and never posts it twice; one whose write never landed
   is sent once more within the bound; a persisted K9 whose approval names
   other bytes, or that is `attempted` without one, is refused on load (the
-  `k9-*` cases of `test_a_corrupt_record_fails_loudly`)
+  `k9-*` cases of `test_a_corrupt_record_fails_loudly`); a write whose issue
+  stops qualifying before its read-back is held, never `EffectPending`,
+  with or without its comment on the issue, and a refused one is a
+  `conflict` naming the issue (PR #221 R2-F1)
 
 ### Integration
 

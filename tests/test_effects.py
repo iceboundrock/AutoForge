@@ -3034,6 +3034,89 @@ def test_an_exact_acceptance_comment_is_not_adopted_while_the_issue_does_not_qua
     assert "is not adopted while the issue does not qualify" in driven.held
 
 
+def _stop_qualifying_after_the_comment(fake: FakeGitHub, state: str) -> None:
+    """The run's issue is closed, or leaves the run's repository, as the comment
+    write returns, before its read-back (PR #221 R2-F1)."""
+
+    def after() -> None:
+        info = fake.issues[ISSUE]
+        fake.issues[ISSUE] = (
+            replace(info, state="CLOSED")
+            if state == "CLOSED"
+            else replace(info, repository="other/repo")
+        )
+
+    fake.after_issue_comment = after
+
+
+@pytest.mark.parametrize("state", ["CLOSED", "ELSEWHERE"])
+def test_an_acceptance_comment_whose_issue_stops_qualifying_before_the_read_back_is_held(state):
+    """PR #221 R2-F1: the comment lands, and the issue is closed or leaves the
+    run's repository before the read-back. That is a conclusive hold, not a
+    write still propagating: drive returns it with the comment, marked
+    issued, and the record stays `attempted` as saved before the write. The
+    next drive sends nothing while the issue does not qualify, and adopts
+    the one comment once it does again."""
+    fake = FakeGitHub()
+    fake.add_issue(ISSUE, "Ship the feature")
+    _stop_qualifying_after_the_comment(fake, state)
+    record = acceptance_record()
+    saves = saves_for(fake)
+    driven = drive(record, AcceptanceCommentOp(fake), saves)
+    [comment] = fake.comments[ISSUE]
+    assert driven.issued and driven.held_url == comment.url
+    assert driven.record == record.attempting()
+    assert saves.stages == [(Stage.ATTEMPTED, 1, 0)] and len(fake.effect_writes) == 1
+    assert f"its exact payload is on {comment.url}" in driven.held
+    assert ("is closed, not open" if state == "CLOSED" else "not in the run's") in driven.held
+    again = drive(driven.record, AcceptanceCommentOp(fake), saves)
+    assert again.held == driven.held and not again.issued and again.record == driven.record
+    assert len(saves.log) == 1 and len(fake.effect_writes) == 1
+    fake.issues[ISSUE] = replace(fake.issues[ISSUE], state="OPEN", repository="owner/repo")
+    adopted = drive(driven.record, AcceptanceCommentOp(fake), saves)
+    assert adopted.record.stage is Stage.OBSERVED and adopted.record.observed == {
+        "url": comment.url
+    }
+    assert not adopted.issued and len(fake.effect_writes) == 1
+    assert fake.comments[ISSUE] == [comment]
+
+
+@pytest.mark.parametrize("state", ["CLOSED", "ELSEWHERE"])
+def test_an_acceptance_write_not_read_back_on_an_issue_that_stopped_qualifying_is_held(state):
+    """PR #221 R2-F1: the write's reply is lost and its comment is not on the
+    issue (it never landed, or is not visible yet) when the issue stops
+    qualifying. Held, `attempted` and marked issued, with a reason that says
+    the attempt was sent rather than that nothing was."""
+    fake = FakeGitHub()
+    fake.add_issue(ISSUE, "Ship the feature")
+    fake.write_failures.append(("create_issue_comment", GitHubUnavailableError("timed out"), False))
+    _stop_qualifying_after_the_comment(fake, state)
+    record = acceptance_record()
+    saves = saves_for(fake)
+    driven = drive(record, AcceptanceCommentOp(fake), saves)
+    assert driven.issued and driven.held_url == "" and fake.comments.get(ISSUE, []) == []
+    assert driven.record == record.attempting()
+    assert saves.stages == [(Stage.ATTEMPTED, 1, 0)] and len(fake.effect_writes) == 1
+    assert ("is closed, not open" if state == "CLOSED" else "not in the run's") in driven.held
+    assert "the comment of attempt 1 is not on the issue" in driven.held
+    assert "nothing was sent" not in driven.held
+
+
+def test_a_refused_acceptance_write_on_an_issue_that_stopped_qualifying_is_a_conflict():
+    """A write GitHub refused is never retried, also when the issue stopped
+    qualifying meanwhile: a conflict that names the refusal and the issue."""
+    fake = FakeGitHub()
+    fake.add_issue(ISSUE, "Ship the feature")
+    fake.write_failures.append(("create_issue_comment", GitHubError("HTTP 403: locked"), False))
+    _stop_qualifying_after_the_comment(fake, "CLOSED")
+    saves = saves_for(fake)
+    driven = drive(acceptance_record(), AcceptanceCommentOp(fake), saves)
+    assert driven.issued and not driven.held and driven.record.stage is Stage.CONFLICT
+    assert "GitHub refused the write" in driven.record.reason
+    assert f"issue {ISSUE} is closed, not open" in driven.record.reason
+    assert saves.stages == [(Stage.ATTEMPTED, 1, 0), (Stage.CONFLICT, 1, 1)]
+
+
 def test_decide_acceptance_holds_only_a_due_write():
     """D4.2 decides first: an exact holder is adopted, any other holder is a
     conflict, a spent bound is a conflict; only then is a due write held."""
@@ -3048,7 +3131,15 @@ def test_decide_acceptance_holds_only_a_due_write():
     assert decide_acceptance(authorized, []).action is Action.ISSUE
     held = decide_acceptance(authorized, [], issue_problem="issue x is closed, not open")
     assert held.action is Action.HOLD and "issue x is closed" in held.reason
-    assert held.observed is None
+    assert held.observed is None and "nothing was sent" in held.reason
+    # PR #221 R2-F1: an attempted record's write was sent, and its hold says so.
+    sent = decide_acceptance(
+        authorized.attempting(), [], issue_problem="issue x is closed, not open"
+    )
+    assert sent.action is Action.HOLD and "nothing was sent" not in sent.reason
+    assert "issue x is closed, not open; the comment of attempt 1 is not on the issue" in (
+        sent.reason
+    )
     spent = authorized.attempting().attempting()
     assert decide_acceptance(spent, []).exhausted
     # PR #221 R1-F2: an exact holder is adopted only while the issue qualifies;

@@ -26,7 +26,8 @@ Every kind of the closed set (ADR 0004 D5.1) has one operation here:
 write may also be *held* (``Action.HOLD``, #211): nothing is sent until the
 operator approves it, nothing is sent or adopted while the run's issue does
 not qualify, and :func:`drive` returns the record unchanged with the
-reason. Each ``reconcile`` is a complete identity
+reason, also when the issue stopped qualifying between the write and its
+read-back. Each ``reconcile`` is a complete identity
 read (D4.5): an open listing read to its end, or an all-states read bounded
 by a head-branch filter or a number watermark, never the search API. Each
 ``issue`` is exactly one write. What an operation checks is the record's own
@@ -100,7 +101,9 @@ class Driven:
 
     record: EffectRecord
     issued: bool  # a write was sent in this call
-    held: str = ""  # K9: why the due write was not sent (the record is unchanged)
+    # K9: why the due write was not sent, or its comment not adopted (the
+    # record is unchanged from its last save)
+    held: str = ""
     held_url: str = ""  # K9: the exact comment a hold did not adopt, "" when none
 
 
@@ -109,7 +112,10 @@ def drive(record: EffectRecord, op: EffectOperation, persist: Persist) -> Driven
 
     Returns the record ``observed`` or ``conflict``, or (K9) the record
     unchanged with :attr:`Driven.held` set when its write is due but may
-    not be sent yet: nothing is persisted or sent then. Raises, with the record
+    not be sent yet: nothing is persisted or sent then. A K9 whose issue
+    stops qualifying between the write and its read-back is held the same
+    way, ``attempted`` as persisted before the write and with
+    :attr:`Driven.issued` set (PR #221 R2-F1). Raises, with the record
     left as persisted, when the outcome cannot be read yet:
     :class:`GitHubUnavailableError` from a reconciliation read (nothing was
     persisted or charged), or :class:`EffectPending` after an issue whose
@@ -156,11 +162,20 @@ def drive(record: EffectRecord, op: EffectOperation, persist: Persist) -> Driven
         record = record.observing(after.observed or {})
         persist(record)
         return Driven(record, issued=True)
+    held_url = str((after.observed or {}).get("url", ""))
+    if after.action is Action.HOLD and (held_url or refused is None):
+        # K9 (PR #221 R2-F1): the run's issue stopped qualifying between the
+        # write and its read-back. That is conclusive, not a write still
+        # propagating: the record stays attempted (it was sent) and the
+        # hold, naming the comment if it is there, goes to the caller.
+        return Driven(record, issued=True, held=after.reason, held_url=held_url)
     if refused is not None:
-        # The read-back's own conflict names the object the write collided with.
+        # The read-back's own conflict, or hold, names the object the write
+        # collided with or why its target no longer qualifies.
         found = (
             after.reason
-            if after.action is Action.CONFLICT and not after.exhausted
+            if after.action is Action.HOLD
+            or (after.action is Action.CONFLICT and not after.exhausted)
             else "the target does not hold it"
         )
         record = record.conflicting(

@@ -2476,7 +2476,8 @@ def decide_acceptance(
     R1-F2): the exact payload on such an issue is not adopted, its URL is
     the hold's ``observed``, and the plan's later writes wait with it. A
     due write is also held while no approval of this record's action id is
-    recorded. A hold sends nothing and changes nothing.
+    recorded. A hold sends nothing and changes nothing; for an ``attempted``
+    record its reason says the earlier write was sent (PR #221 R2-F1).
     """
     decision = decide_create(record, found)
     if decision.action is Action.OBSERVE and issue_problem:
@@ -2500,9 +2501,15 @@ def decide_acceptance(
             ),
         )
     if issue_problem:
-        return Decision(
-            Action.HOLD, reason=f"{record.describe()}: {issue_problem}; nothing was sent"
+        # An attempted record's write was sent (PR #221 R2-F1): its comment
+        # is not on the issue, or not visible yet, and is not sent again.
+        sent = (
+            f"the comment of attempt {record.attempts} is not on the issue, and nothing more "
+            "is sent while the issue does not qualify"
+            if record.stage == Stage.ATTEMPTED
+            else "nothing was sent"
         )
+        return Decision(Action.HOLD, reason=f"{record.describe()}: {issue_problem}; {sent}")
     return decision
 
 
