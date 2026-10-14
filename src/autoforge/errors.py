@@ -143,11 +143,13 @@ class CheckoutDriftError(VerificationError):
 class SandboxTamperError(VerificationError):
     """An issue's private object directory holds what no git object store does.
 
-    An ``info/alternates`` or ``info/http-alternates`` file, or an entry
-    that is neither a directory, a regular file nor an overlay whiteout
-    (ADR 0005 D6.5): git would read another repository's objects with the
-    operator's authority. Raised before anything is read from it; the step
-    enters BLOCKED with the message, which names the entry.
+    A directory that is not a real one reached from the common dir through
+    real directories (a link, another file type, one that cannot be
+    checked), an ``info/alternates`` or ``info/http-alternates`` file, or an
+    entry that is neither a directory, a regular file nor an overlay
+    whiteout (ADR 0005 D6.5): git would read another repository's objects
+    with the operator's authority. Raised before anything is read from it;
+    the step enters BLOCKED with the message, which names the entry.
     """
 
 

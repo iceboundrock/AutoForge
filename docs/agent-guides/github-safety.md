@@ -1330,7 +1330,9 @@ can write, so they hold under `sandbox.mode: disabled` too:
   `pack-objects` read it through `GIT_ALTERNATE_OBJECT_DIRECTORIES`, for
   those two processes only, and `index-pack --stdin --fix-thin --strict`
   writes each object under the id it computes from its bytes. The
-  directory is walked first without following a link; an alternates file,
+  directory is walked first without following a link; a directory that is
+  not a real one reached from the common dir through real directories (a
+  link, another file type, one that cannot be checked), an alternates file,
   or an entry that is neither a directory, a regular file nor an overlay
   whiteout, blocks the run, naming it, with nothing read. Under `disabled`
   agents write the shared store directly, so ADR 0004 D7.5's re-hash of

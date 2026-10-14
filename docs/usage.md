@@ -627,7 +627,9 @@ ownership or discard uncommitted user changes.
   repository (or `git worktree repair <worktree>`), then `resume`.
 - **`BLOCKED`: "the private object directory ... has been tampered with":**
   an `info/alternates` file, a link or another entry no object store holds
-  appeared in `<repo>/.git/autoforge/sandbox/<n>/objects`. Nothing was read
+  appeared in `<repo>/.git/autoforge/sandbox/<n>/objects`, or that
+  directory, or one above it up to `<repo>/.git`, is not a real directory
+  (a link, say) or cannot be checked. Nothing was read
   from it and nothing was published. Inspect it, remove what does not
   belong there, then `unblock` and `resume`. To look at an agent's commits
   while they are still only in that directory, read them through it

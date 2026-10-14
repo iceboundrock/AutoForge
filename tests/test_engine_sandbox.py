@@ -151,6 +151,27 @@ def test_an_alternates_file_in_the_private_store_blocks_the_run(tmp_state_dir, f
     assert eng.origin.head("autoforge/2") is None
 
 
+def test_a_private_store_replaced_by_a_link_blocks_the_run(tmp_state_dir, fake_github, tmp_path):
+    """In every mode: a link where the issue's private object directory goes
+    is never read through, nor taken for an empty store (D6.5)."""
+    decoy = tmp_path / "decoy"
+    git_out("init", "-q", "-b", "main", str(decoy))
+
+    def links(req) -> str:
+        head = commit_in(req.cwd)
+        private = Path(os.path.realpath(req.cwd)).parents[1] / "sandbox" / "2" / "objects"
+        private.parent.mkdir(parents=True)
+        private.symlink_to(decoy / ".git" / "objects")
+        return block(analyze_payload(head))
+
+    eng = make_engine(tmp_state_dir, links, github=fake_github, origin=True)
+    out = _analyzed(eng)
+    assert out.next_phase == "BLOCKED"
+    assert "objects is a link" in out.message and "tampered" in out.message
+    assert fake_github.effect_writes == []
+    assert eng.origin.head("autoforge/2") is None
+
+
 def test_the_candidate_is_read_through_the_registry_not_the_worktrees_git_file(
     tmp_state_dir, fake_github, tmp_path
 ):

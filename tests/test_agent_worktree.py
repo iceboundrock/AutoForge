@@ -8,6 +8,7 @@ an agent's commit out of a private object directory into the shared store.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -211,7 +212,7 @@ def test_an_alternates_file_is_tampering(repo, name):
     _commit_privately(repo)
     (repo["private"] / "info").mkdir(exist_ok=True)
     (repo["private"] / name).write_text("/somewhere/else/objects\n")
-    assert name in (private_objects_problem(repo["private"]) or "")
+    assert name in (private_objects_problem(repo["common"], repo["private"]) or "")
     with pytest.raises(SandboxTamperError, match="tampered"):
         import_private_objects(repo["common"], repo["admin"], repo["private"], None)
 
@@ -219,9 +220,81 @@ def test_an_alternates_file_is_tampering(repo, name):
 def test_a_link_or_a_fifo_is_tampering(repo):
     (repo["private"] / "pack").mkdir()
     (repo["private"] / "pack" / "x.pack").symlink_to("/etc/hostname")
-    assert "x.pack" in (private_objects_problem(repo["private"]) or "")
+    assert "x.pack" in (private_objects_problem(repo["common"], repo["private"]) or "")
     (repo["private"] / "pack" / "x.pack").unlink()
     os.mkfifo(repo["private"] / "pack" / "fifo")
-    assert "fifo" in (private_objects_problem(repo["private"]) or "")
+    assert "fifo" in (private_objects_problem(repo["common"], repo["private"]) or "")
     (repo["private"] / "pack" / "fifo").unlink()
-    assert private_objects_problem(repo["private"]) is None
+    assert private_objects_problem(repo["common"], repo["private"]) is None
+
+
+def _replace_with_link(directory: Path, target: Path) -> None:
+    """Move ``directory`` to ``target`` and leave a link to it in its place."""
+    directory.rename(target)
+    directory.symlink_to(target)
+
+
+@pytest.mark.parametrize("kind", ["link", "dangling link", "file"])
+def test_a_private_root_that_is_not_a_real_directory_is_tampering(repo, kind):
+    """The root itself is checked without following a link: never read
+    through, and never taken for an empty store."""
+    head = _commit_privately(repo)
+    private = repo["private"]
+    elsewhere = repo["base"] / "elsewhere-objects"
+    if kind == "link":
+        _replace_with_link(private, elsewhere)
+    elif kind == "dangling link":
+        _replace_with_link(private, elsewhere)
+        shutil.rmtree(elsewhere)
+    else:
+        shutil.rmtree(private)
+        private.write_text("not an object store\n")
+    assert holds_objects(private)
+    problem = private_objects_problem(repo["common"], private) or ""
+    assert str(private) in problem
+    assert ("is a link" if kind != "file" else "is not a directory") in problem
+    with pytest.raises(SandboxTamperError, match="tampered"):
+        import_private_objects(repo["common"], repo["admin"], private, None)
+    assert not _shared_has(repo, head)
+
+
+def test_a_link_above_the_private_root_is_tampering(repo):
+    """A real directory reached through a link is outside the store too."""
+    head = _commit_privately(repo)
+    issue_dir = repo["private"].parent
+    _replace_with_link(issue_dir, repo["base"] / "elsewhere")
+    assert holds_objects(repo["private"])
+    problem = private_objects_problem(repo["common"], repo["private"]) or ""
+    assert f"{issue_dir} is a link" in problem
+    with pytest.raises(SandboxTamperError, match="tampered"):
+        import_private_objects(repo["common"], repo["admin"], repo["private"], None)
+    assert not _shared_has(repo, head)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a directory without permission")
+def test_a_private_root_that_cannot_be_listed_is_tampering(repo):
+    head = _commit_privately(repo)
+    repo["private"].chmod(0)
+    try:
+        assert holds_objects(repo["private"])
+        assert "cannot be" in (private_objects_problem(repo["common"], repo["private"]) or "")
+        with pytest.raises(SandboxTamperError, match="tampered"):
+            import_private_objects(repo["common"], repo["admin"], repo["private"], None)
+    finally:
+        repo["private"].chmod(0o700)
+    assert not _shared_has(repo, head)
+
+
+def test_an_absent_private_root_imports_nothing(repo):
+    repo["private"].rmdir()
+    assert not holds_objects(repo["private"])
+    assert import_private_objects(repo["common"], repo["admin"], repo["private"], None) == ""
+    assert "cannot be checked" in (private_objects_problem(repo["common"], repo["private"]) or "")
+
+
+def test_a_private_root_outside_the_common_dir_is_refused(repo):
+    stray = repo["base"] / "objects"
+    stray.mkdir()
+    assert "not a directory below" in (private_objects_problem(repo["common"], stray) or "")
+    dotdot = repo["common"] / "autoforge" / ".." / "objects"
+    assert "not a directory below" in (private_objects_problem(repo["common"], dotdot) or "")

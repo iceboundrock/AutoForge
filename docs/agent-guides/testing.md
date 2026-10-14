@@ -299,10 +299,12 @@ Four more files, the same split by what they need from the host:
   - the D6.3 candidate read: the detached HEAD, an attached HEAD reported,
     a HEAD that is a link not read, pointer rewrites that do not move the
     candidate, a HEAD naming no commit read as none;
-  - the D6.5 import: an empty private directory imports nothing, an
-    agent's commit reaches the shared store, a corrupt object does not,
-    and `info/alternates`, `info/http-alternates`, a link or a FIFO is
-    tampering.
+  - the D6.5 import: an empty or absent private directory imports
+    nothing, an agent's commit reaches the shared store, a corrupt object
+    does not, and `info/alternates`, `info/http-alternates`, a link or a
+    FIFO is tampering; so is a root that is a link (dangling or not), a
+    regular file, a directory reached through a link, one that cannot be
+    listed, or one outside the common dir, none taken for an empty store.
 - `tests/test_engine_sandbox.py` drives the engine with the scripted
   provider, which records the description each launch compiles and
   launches nothing. It covers: `disabled` launching without one and
@@ -310,8 +312,9 @@ Four more files, the same split by what they need from the host:
   worktree, overlay and cache, with the checkout, state directory and
   run logs absent; a REVIEW without a cache; a refused launch (a link
   where the sandbox directories go) recorded, with nothing run and the
-  phase unchanged; an alternates file in the private store entering
-  `BLOCKED` with nothing pushed; a `.git` pointed at a decoy repository,
+  phase unchanged; an alternates file in the private store, or the store
+  replaced by a link under `disabled`, entering `BLOCKED` with nothing
+  pushed; a `.git` pointed at a decoy repository,
   whose HEAD is never the candidate and whose next launch is refused
   naming the repair; a refusal on the spawn path; and the dry-run note.
 - `tests/test_sandbox_routing.py` runs real `bwrap` and skips its whole

@@ -21,9 +21,11 @@ REMOTE run's issue worktree, whatever ``sandbox.mode`` says (#168).
   the issue's private object directory (an enforced launch's overlay upper
   layer), through ``index-pack --strict``, which writes each object under
   the id it computes from its bytes. :func:`private_objects_problem` walks
-  the directory first without following a link: an alternates file, or an
-  entry that is neither a directory, a regular file nor an overlay
-  whiteout, is tampering (:class:`~autoforge.errors.SandboxTamperError`).
+  the directory first without following a link: a root that is not a real
+  directory reached from the common dir through real directories, an
+  alternates file, or an entry that is neither a directory, a regular file
+  nor an overlay whiteout, is tampering
+  (:class:`~autoforge.errors.SandboxTamperError`).
 
 Every git process is the controller's own hardened local request
 (:func:`~autoforge.git_transport.local_git_request`, ADR 0004 D7.3, D7.5);
@@ -207,13 +209,46 @@ def read_candidate(common: Path, admin: Path, worktree: str, runner: Runner | No
     return Candidate(attached == 0, head)
 
 
-def private_objects_problem(private: Path) -> str | None:
+def _root_problem(common: Path, private: Path) -> str | None:
+    """Why ``private`` is not a real directory below ``common``, or ``None``.
+
+    Every component from ``common`` down to ``private`` is ``lstat``-ed: one
+    that is a link, not a directory, or cannot be checked is named, so
+    nothing is read through it.
+    """
+    try:
+        parts = private.relative_to(common).parts
+    except ValueError:
+        parts = ()
+    if not parts or ".." in parts:
+        return f"{private} is not a directory below the git common dir {common}"
+    path = common
+    for part in parts:
+        path = path / part
+        try:
+            mode = os.lstat(path).st_mode
+        except OSError as exc:
+            return f"{path} cannot be checked ({exc.strerror})"
+        if stat.S_ISLNK(mode):
+            return f"{path} is a link: git would read the object store it names"
+        if not stat.S_ISDIR(mode):
+            return f"{path} is not a directory"
+    return None
+
+
+def private_objects_problem(common: Path, private: Path) -> str | None:
     """Why the private object directory may not be read, or ``None`` (D6.5).
 
-    Walked without following a link. An alternates file, a link, a socket,
-    a FIFO, a block device or a character device other than an overlay
-    whiteout (0:0, skipped) is named; nothing is opened.
+    Walked without following a link. The directory itself, and each one
+    between the git common dir ``common`` and it, must be a real directory:
+    a link, another file type or one that cannot be checked is named, never
+    taken for an empty store. Inside it, an alternates file, a link, a
+    socket, a FIFO, a block device or a character device other than an
+    overlay whiteout (0:0, skipped) is named; nothing is opened.
     """
+    problem = _root_problem(common, private)
+    if problem:
+        return problem
     for name in ALTERNATES_FILES:
         try:
             os.lstat(private / name)
@@ -249,12 +284,23 @@ def private_objects_problem(private: Path) -> str | None:
 
 
 def holds_objects(private: Path) -> bool:
-    """Whether the private object directory has any entry at all."""
+    """Whether the private object directory has anything to import or refuse.
+
+    ``False`` only when it is absent, or a real directory (``lstat``, no
+    link followed) without an entry. A link, another file type, or a
+    directory that cannot be checked or listed is ``True``, so that the
+    import's walk (:func:`private_objects_problem`) refuses it rather than
+    taking it for an empty store.
+    """
     try:
+        if not stat.S_ISDIR(os.lstat(private).st_mode):
+            return True
         with os.scandir(private) as entries:
             return any(True for _ in entries)
-    except OSError:
+    except FileNotFoundError:
         return False
+    except OSError:
+        return True
 
 
 class ObjectImportError(VerificationError):
@@ -284,7 +330,7 @@ def import_private_objects(
     """
     if not holds_objects(private):
         return ""
-    problem = private_objects_problem(private)
+    problem = private_objects_problem(common, private)
     if problem:
         raise SandboxTamperError(
             f"the private object directory {private} of the agent worktree has been "

@@ -598,9 +598,14 @@ the mode. Every git process is the controller's own `local_git_request`
   directory named through `GIT_ALTERNATE_OBJECT_DIRECTORIES` (never added
   to the shared store's alternates), then `index-pack --stdin --fix-thin
   --strict` into the shared store. `private_objects_problem` walks the
-  directory first without following a link; an `info/alternates` or
-  `info/http-alternates` file, or an entry that is neither a directory, a
-  regular file nor an overlay whiteout, is `SandboxTamperError`. The engine
+  directory first without following a link: the directory itself, and each
+  one between the common dir and it, must be a real directory (`lstat`), so
+  a link, another file type or one that cannot be checked is
+  `SandboxTamperError`, never an empty store (`holds_objects` is false only
+  for an absent directory or an empty real one); inside it, an
+  `info/alternates` or `info/http-alternates` file, or an entry that is
+  neither a directory, a regular file nor an overlay whiteout, is
+  `SandboxTamperError` too. The engine
   imports before every REMOTE launch (`_import_before_launch`: a failed
   import refuses the launch with `SandboxLaunchRefusedError`, before
   anything is saved) and after every launch that exited cleanly, before

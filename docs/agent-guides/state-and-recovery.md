@@ -495,10 +495,12 @@ own `git -C <worktree> log` cannot read those commits; inspect them
 read-only with
 `GIT_ALTERNATE_OBJECT_DIRECTORIES=<git common dir>/autoforge/sandbox/<n>/objects git -C <worktree> log`,
 and never add the directory to the shared store's `objects/info/alternates`.
-The import walks the directory first without following a link: an
-`info/alternates` or `info/http-alternates` file, or an entry that is
-neither a directory, a regular file nor an overlay whiteout, is tampering
-(`SandboxTamperError`), and the step enters `BLOCKED` naming the entry,
+The import walks the directory first without following a link: a
+directory that is not a real one reached from the common dir through real
+directories (a link, another file type, one that cannot be checked, never
+taken for an empty store), an `info/alternates` or `info/http-alternates`
+file, or an entry that is neither a directory, a regular file nor an
+overlay whiteout, is tampering (`SandboxTamperError`), and the step enters `BLOCKED` naming the entry,
 with nothing read from the directory and nothing published. Inspect it,
 remove what does not belong there, then `unblock`. An import that fails
 otherwise (a corrupt object, say) is never retried and publishes nothing:
