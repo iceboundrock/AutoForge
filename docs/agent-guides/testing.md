@@ -510,6 +510,26 @@ a stated reason it has none. The coverage that must keep working:
   branch, a non-fast-forward and a lease mismatch are refused, and a
   `pushurl`, `insteadOf`, `core.sshCommand`, `core.hooksPath` or `pre-push`
   hook planted in the shared repository neither redirects a push nor runs
+- the byte-exact export (#171, `tests/test_materialize.py`, in sha1 and
+  sha256 repositories): every exported blob equals `git cat-file blob` under
+  a candidate `.gitattributes` with `eol=crlf`, `ident` and a filter, the
+  repository's `info/attributes`, `core.attributesFile`, `core.autocrlf`
+  and an operator smudge program, which never runs; modes `0644` and
+  `0755`, symlinks as link text (relative, absolute, `..`-escaping,
+  dangling), a gitlink as an empty, counted directory whose commit is
+  absent, an empty subtree, names and contents that are not UTF-8, a blob
+  past every capture bound and any chunking of the stream; the proof
+  refuses each tamper class (a byte, an added or removed entry, a flipped
+  executable bit, a retargeted link, a link replaced by a file and back, a
+  non-empty or replaced gitlink, a FIFO), a legacy `100664` mode and a
+  simulated case-folding collision; `.`, `..` and `.git` in any case, and
+  names holding `/`, are refused before anything is written; a commit or a
+  blob missing from the shared store, a commit only in a private object
+  directory before the strict import (it exports after it), and anything
+  but a full commit id are not materializable; a replacement object changes
+  nothing; the directory is removed after a pass, a failure and an
+  exception. The merge gate's commands see the committed bytes, and an
+  unexportable reviewed HEAD stays inconclusive (`tests/test_engine.py`)
 - `ANALYZE_EXECUTE`'s publication (#161, `tests/test_engine.py`, engine
   built with `origin=True`): the controller pushes the agent's commit and
   opens the PR (or adopts the open unmarked PR on the branch) and reads it

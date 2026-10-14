@@ -69,6 +69,8 @@ git_transport.py    controller git push: sanitized config, explicit URL, lease, 
 claims.py           durable GitHub claims: marker schemas, renderers, scan, cardinality
 validation.py       typed GitHub URL parsing and run-argument validation
 premerge.py         controller-produced pre-merge evidence (check definitions, tree export)
+materialize.py      byte-exact export of a candidate commit from the shared object store
+                    and its hash-back proof; the pre-merge export's writer (ADR 0006 D6, #171)
 result_parser.py    CONTROL_RESULT extraction and strict per-phase validation
 state.py            persisted controller state, atomic writes, schema/protocol checks
 run_contract.py     the durable contract of a LOCAL run
@@ -124,8 +126,8 @@ engine.py (phase sequencing, resume)             -> docs/agent-guides/workflow.m
 replan_txn.py, engine.py (REPLAN_REEXECUTE),
 prompts/replan_reexecute.md                       -> docs/agent-guides/replan-transaction.md (+ workflow.md)
 github.py, claims.py, validation.py, premerge.py,
-effect_ops.py, git_transport.py, child_env.py,
-read_context.py, engine.py (post-phase
+materialize.py, effect_ops.py, git_transport.py,
+child_env.py, read_context.py, engine.py (post-phase
 verification, merge gate, dry-run, read context),
 prompts/update_epic*.md                           -> docs/agent-guides/github-safety.md
                                                      (+ docs/adr/0004-authority-boundary-and-

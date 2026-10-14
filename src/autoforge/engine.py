@@ -6095,11 +6095,12 @@ class ControllerEngine:
         The hosted check ran the PR's own code, so nothing GitHub reports can
         tell a weakened test suite from a passing one. These commands are the
         controller's own evidence: the exact reviewed commit (``pr.head_sha``,
-        already proven equal to ``reviewed_head_sha``) is written out with
-        ``git read-tree`` + ``git checkout-index`` into a fresh temporary
-        directory -- never the operator's checkout, no worktree, no branch,
-        no ``.git`` inside -- and every command runs there in order, through
-        the normal executor (argv only, never a shell), under
+        already proven equal to ``reviewed_head_sha``) is written out as its
+        committed bytes, proven to hash back to its tree
+        (:func:`~autoforge.premerge.export_commit_tree`), into a fresh
+        temporary directory -- never the operator's checkout, no worktree, no
+        branch, no ``.git`` inside -- and every command runs there in order,
+        through the normal executor (argv only, never a shell), under
         ``execution.command_timeout_seconds``. The directory is deleted
         afterwards whatever happened.
 
@@ -6107,7 +6108,8 @@ class ControllerEngine:
         caller BLOCKS: re-running would not change the code). Raises
         VerificationError when the commit cannot be materialised (not local
         and not fetchable as ``refs/pull/<n>/head``, or the export itself
-        failed): that is inconclusive, and the caller bounds the re-checks.
+        failed or failed its proof): that is inconclusive, and the caller
+        bounds the re-checks.
         A pass is persisted against the HEAD and the command list so MERGE
         does not repeat what READY_FOR_MERGE already proved for the same
         commit; a different HEAD or a different command list runs again.

@@ -153,6 +153,29 @@ class SandboxTamperError(VerificationError):
     """
 
 
+class CandidateNotMaterializableError(VerificationError):
+    """A candidate's objects are not in the operator's shared object store.
+
+    The commit, or a blob its tree names, is missing from the store the
+    controller's own git reads (ADR 0006 D6.1): a candidate still only in a
+    private object directory, before the strict import, is one. Raised by
+    :mod:`autoforge.materialize` before anything is written for a missing
+    commit; a refusal of that candidate, not a reason to materialize it again.
+    """
+
+
+class MaterializationError(VerificationError):
+    """A candidate's tree was not written out, or not proven to be what was written.
+
+    Raised by :mod:`autoforge.materialize` (ADR 0006 D6.2, D6.3) for a
+    listing it refuses (an entry name that is ``.``, ``..`` or ``.git``, a
+    name holding ``/``, an unknown mode), a write that failed (a full disk,
+    a name the filesystem merged with another) or a directory whose bytes
+    and modes do not hash back to the commit's tree. Inconclusive: no
+    evidence, and the message names the commit and the failing entry.
+    """
+
+
 class GitTransportError(AutoForgeError):
     """A controller git operation could not establish what it needs (fails closed).
 

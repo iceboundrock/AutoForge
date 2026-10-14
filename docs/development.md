@@ -72,8 +72,9 @@ code the check runs, both come from the PR. Four things bound that.
   paths do not cover is refused too.
 - With `merge.verification_commands` set, the controller runs the
   repository's own checks (`pytest`, `ruff`, `mypy`, …) on an export of the
-  reviewed commit before it merges: evidence it produced itself, not a check
-  name it read.
+  reviewed commit before it merges (its committed bytes, proven to hash back
+  to the commit's tree): evidence it produced itself, not a check name it
+  read.
 - A PR that weakens what its tests assert still has to pass the review
   phase, whose findings are what the loop bounds act on.
 
