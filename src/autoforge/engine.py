@@ -267,6 +267,7 @@ from .executor import (
     select_environment,
 )
 from .git_transport import (
+    CommitRecord,
     GitRemote,
     GitTransport,
     local_git_request,
@@ -506,8 +507,9 @@ MAX_LOCAL_PHASE_ATTEMPTS = 3
 # Launches of one REMOTE validation definition after a launch or setup
 # failure the executor or the sandbox backend reported, or #165's preflight
 # refusing it (ADR 0006 D10.5): the bounded in-process re-check. A
-# materialization failure, or failing to read the store's object format,
-# gets one fresh attempt of its own.
+# materialization failure, or failing to find the shared store, read its
+# object format or read the candidate's commit there, gets one fresh
+# attempt of its own.
 MAX_VALIDATION_LAUNCH_ATTEMPTS = 2
 MAX_VALIDATION_MATERIALIZATIONS = 2
 # What setting a REMOTE candidate's export up can raise besides a missing
@@ -515,6 +517,13 @@ MAX_VALIDATION_MATERIALIZATIONS = 2
 # writing the directory, an ``ExecutionError`` launching its git plumbing.
 # Each is a materialization failure (ADR 0006 D10.5), never a record.
 _EXPORT_SETUP_FAILURES = (MaterializationError, ExecutionError, OSError)
+# What reading a REMOTE candidate from the shared store can raise besides
+# the store not holding it: an ``ExecutionError`` launching the git process
+# that finds the store, a ``VerificationError`` when no transport is set up
+# from its answer (it timed out, say), a ``GitTransportError`` reading the
+# commit's bytes. Each is a setup failure of the candidate (ADR 0006 D10.5),
+# never a record.
+_CANDIDATE_READ_FAILURES = (ExecutionError, VerificationError, GitTransportError)
 # Where a REMOTE candidate's export is written for validation (ADR 0006 D6.2):
 # a fresh private directory per definition launch, beside the pre-merge one.
 VALIDATION_EXPORT_PREFIX = "autoforge-validate-"
@@ -1001,12 +1010,14 @@ class _ValidatorNotLaunched(Exception):
     (ADR 0006 D10.5): no record, and the caller re-checks within its bound."""
 
 
-def _export_setup_failure(exc: Exception) -> str:
-    """Why a REMOTE candidate's export was not set up, redacted, for the message."""
+def _setup_failure(exc: Exception) -> str:
+    """Why a REMOTE candidate was not read or its export not set up, redacted, for the message."""
     if isinstance(exc, MaterializationError):
         return str(exc)
     if isinstance(exc, ExecutionError):
         return f"a git process could not be run: {redact(str(exc))}"
+    if isinstance(exc, (VerificationError, GitTransportError)):
+        return redact(str(exc))
     return f"a file system operation failed: {redact(str(exc))}"
 
 
@@ -4477,10 +4488,10 @@ class ControllerEngine:
         re-checked once in-process and is then
         :class:`~autoforge.errors.ValidationInconclusiveError`; a
         materialization failure (an ``OSError`` or a git process that could
-        not be run among them), or failing to read the store's object
-        format, gets one fresh attempt, then the same. Neither writes a
-        record. A sandbox refusal at the gate is logged and re-raised with
-        nothing written.
+        not be run among them), or failing to find the shared store, read
+        its object format or read the candidate's commit there, gets one
+        fresh attempt, then the same. Neither writes a record. A sandbox
+        refusal at the gate is logged and re-raised with nothing written.
         """
         state = self._require_state()
         if state.mode == WorkflowMode.LOCAL:
@@ -4517,7 +4528,28 @@ class ControllerEngine:
                     raise ValidationInconclusiveError(
                         f"candidate {commit[:12]} cannot be validated: the object format of "
                         f"its store could not be read ({failures} attempts): "
-                        f"{_export_setup_failure(exc)}"
+                        f"{_setup_failure(exc)}"
+                    ) from exc
+
+    def _read_validation_candidate(self, commit: str) -> CommitRecord | None:
+        """``commit`` from the shared store, found and read again once on a failure (D10.5).
+
+        Finding the store (one git process in the checkout) and reading the
+        commit's bytes there both set the candidate up, so a failure of
+        either is :data:`_CANDIDATE_READ_FAILURES`: one fresh attempt, then
+        :class:`~autoforge.errors.ValidationInconclusiveError`. A commit the
+        store does not hold is ``None`` at once, never read again.
+        """
+        failures = 0
+        while True:
+            try:
+                return self._git_transport().read_local_commit(commit)
+            except _CANDIDATE_READ_FAILURES as exc:
+                failures += 1
+                if failures >= MAX_VALIDATION_MATERIALIZATIONS:
+                    raise ValidationInconclusiveError(
+                        f"candidate {commit[:12]} cannot be read from the shared object store "
+                        f"({failures} attempts): {_setup_failure(exc)}"
                     ) from exc
 
     def _remote_candidate(
@@ -4525,12 +4557,7 @@ class ControllerEngine:
     ) -> RemoteCandidate:
         """D2.1, D2.2: the identity, its tree read from the store's own bytes."""
         state = self._require_state()
-        try:
-            found = self._git_transport().read_local_commit(commit)
-        except GitTransportError as exc:
-            raise ValidationInconclusiveError(
-                f"candidate {commit[:12]} cannot be read from the shared object store: {exc}"
-            ) from exc
+        found = self._read_validation_candidate(commit)
         if found is None:
             raise CandidateNotMaterializableError(
                 f"commit {commit} is not in the shared object store of {self.workdir}; a "
@@ -4603,7 +4630,7 @@ class ControllerEngine:
                 raise ValidationInconclusiveError(
                     f"candidate {candidate.describe()} could not be materialized for "
                     f"validation definition [{definition.index}] after "
-                    f"{materialization_failures} attempts: {_export_setup_failure(failure)}"
+                    f"{materialization_failures} attempts: {_setup_failure(failure)}"
                 ) from failure
 
     def _run_remote_validator(

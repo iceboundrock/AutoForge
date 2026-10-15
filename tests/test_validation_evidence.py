@@ -11,6 +11,7 @@ now leaves a record for every command it runs. The pure value checks are in
 
 from __future__ import annotations
 
+import dataclasses
 import errno
 import hashlib
 import json
@@ -24,6 +25,7 @@ import pytest
 
 from autoforge import cli
 from autoforge import engine as engine_module
+from autoforge import git_transport as git_transport_module
 from autoforge import materialize as materialize_module
 from autoforge.config import default_config
 from autoforge.errors import (
@@ -164,10 +166,11 @@ def test_a_validator_that_cannot_be_launched_is_inconclusive_with_no_record(tmp_
     assert state.validation_records == [] and state.validation_attempt == {}
 
 
-def unlaunchable_git(monkeypatch, word: str, failures: int | None):
+def unlaunchable_git(monkeypatch, word: str, failures: int | None, *, module=engine_module):
     """The controller's git process naming ``word`` cannot be launched, ``failures`` times
-    (always when None), as the executor reports it; returns the refused argvs."""
-    real = engine_module.execute
+    (always when None), as the executor reports it; returns the refused argvs. ``module``
+    is whose executor: the engine's (the materializer's too), or the git transport's."""
+    real = module.execute
     refused: list[list[str]] = []
 
     def runner(req):
@@ -176,8 +179,25 @@ def unlaunchable_git(monkeypatch, word: str, failures: int | None):
             raise ExecutionError(f"failed to spawn git: [Errno 24] Too many open files ({SECRET})")
         return real(req)
 
-    monkeypatch.setattr(engine_module, "execute", runner)
+    monkeypatch.setattr(module, "execute", runner)
     return refused
+
+
+def unanswered_git(monkeypatch, word: str, failures: int | None):
+    """The engine's git process naming ``word`` times out, ``failures`` times (always
+    when None), as the executor reports it; returns the argvs that timed out."""
+    real = engine_module.execute
+    timed_out: list[list[str]] = []
+
+    def runner(req):
+        result = real(req)
+        if word in req.command and (failures is None or len(timed_out) < failures):
+            timed_out.append(list(req.command))
+            return dataclasses.replace(result, exit_code=-9, stdout="", timed_out=True)
+        return result
+
+    monkeypatch.setattr(engine_module, "execute", runner)
+    return timed_out
 
 
 def unwritable_export(monkeypatch, failures: int | None):
@@ -198,10 +218,24 @@ def unwritable_export(monkeypatch, failures: int | None):
     return refused
 
 
-# Each way setting the export up fails besides a missing candidate (D10.5):
-# the object-format read and the materializer's git plumbing not launched,
-# the export directory not created; what the message names.
+# Each way setting the candidate up fails besides a missing candidate (D10.5):
+# finding the shared store (its git process not launched, or timing out) and
+# reading the candidate's commit there, the object-format read and the
+# materializer's git plumbing not launched, the export directory not created;
+# what the message names.
 SETUP_FAILURES = {
+    "store-discovery": (
+        lambda mp, n: unlaunchable_git(mp, "--show-toplevel", n),
+        "cannot be read from the shared object store",
+    ),
+    "store-discovery-timeout": (
+        lambda mp, n: unanswered_git(mp, "--show-toplevel", n),
+        "cannot be read from the shared object store",
+    ),
+    "commit-read": (
+        lambda mp, n: unlaunchable_git(mp, "--batch", n, module=git_transport_module),
+        "cannot be read from the shared object store",
+    ),
     "object-format": (
         lambda mp, n: unlaunchable_git(mp, "--show-object-format", n),
         "object format of its store could not be read",
@@ -225,9 +259,10 @@ SETUP_FAILURES = {
 def test_a_setup_failure_is_rechecked_once_then_inconclusive_with_no_record(
     tmp_path, monkeypatch, how
 ):
-    """An ``OSError`` or a git process the executor could not launch is a
-    materialization failure: one fresh attempt, then the typed inconclusive
-    error, with nothing launched and nothing written."""
+    """An ``OSError``, a git process the executor could not launch, or the
+    store not found or its commit not read, is a setup failure of the
+    candidate: one fresh attempt, then the typed inconclusive error, with
+    nothing launched and nothing written."""
     ran = tmp_path / "ran"
     eng, commit = remote_engine(tmp_path, [py(f"open({str(ran)!r}, 'w')")])
     eng.save()
@@ -267,6 +302,19 @@ def counted_exports(monkeypatch) -> list[str]:
     return exports
 
 
+def counted_store_reads(monkeypatch) -> list[str]:
+    """The commit of every read of a candidate from the shared store, in order."""
+    real = git_transport_module.GitTransport.read_local_commit
+    reads: list[str] = []
+
+    def counted(self, sha):
+        reads.append(sha)
+        return real(self, sha)
+
+    monkeypatch.setattr(git_transport_module.GitTransport, "read_local_commit", counted)
+    return reads
+
+
 def stdin_git(repo: str, *args: str, data: bytes) -> str:
     """``git -C repo`` with ``args`` and ``data`` on stdin; its stdout, stripped."""
     res = subprocess.run(["git", "-C", repo, *args], input=data, capture_output=True, check=True)
@@ -300,9 +348,10 @@ def test_a_sandbox_refusal_is_not_a_materialization_failure(tmp_path, monkeypatc
         raise SandboxLaunchRefusedError("bwrap is not installed")
 
     monkeypatch.setattr(eng, "_command_sandbox", refuse)
+    reads = counted_store_reads(monkeypatch)
     with pytest.raises(SandboxLaunchRefusedError, match="bwrap is not installed"):
         eng.validate_remote_candidate(commit, PROVENANCE)
-    assert exports == [commit]
+    assert reads == [commit] and exports == [commit]
     assert eng.state.validation_records == [] and eng.state.validation_attempt == {}
 
 
@@ -312,11 +361,16 @@ def test_a_timeout_is_a_timeout_record(tmp_path):
     assert record["outcome"] == "TIMEOUT" and record["exit_code"] is None
 
 
-def test_a_commit_not_in_the_store_is_refused_before_any_launch(tmp_path):
+def test_a_commit_not_in_the_store_is_refused_before_any_launch(tmp_path, monkeypatch):
+    """Read once, never again and never exported (D10.5): a candidate the store
+    does not hold is refused, not a setup failure."""
     ran = tmp_path / "ran"
     eng, _ = remote_engine(tmp_path, [py(f"open({str(ran)!r}, 'w')")])
+    reads = counted_store_reads(monkeypatch)
+    exports = counted_exports(monkeypatch)
     with pytest.raises(CandidateNotMaterializableError, match="not in the shared object store"):
         eng.validate_remote_candidate("0123456789" * 4, PROVENANCE)
+    assert reads == ["0123456789" * 4] and exports == []
     assert not ran.exists()
     assert eng.state.validation_records == [] and eng.state.validation_attempt == {}
     assert not eng.paths.state_file.exists()  # nothing was saved

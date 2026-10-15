@@ -75,14 +75,15 @@ High-priority coverage includes:
   definition a fresh export (a mutating validator leaves the next one and
   the repository byte-identical), refuses a commit not in the store before
   any launch, and redacts a secret-shaped argv and output in state,
-  `status` and the run log; a setup failure of the export (the
+  `status` and the run log; a setup failure of the candidate (finding the
+  shared store, launched or timing out, reading its commit, the
   object-format read or a git process the executor could not launch, an
   `OSError` creating the directory) gets one fresh attempt and is then
-  inconclusive with nothing written, while a blob missing from the store
-  is refused without one; a sandbox refusal under `required` leaves the
-  state byte-identical and is not retried as a materialization failure;
-  an interrupt leaves the marker, `status` and the dry run report it
-  without writing, and the next step records it;
+  inconclusive with nothing written, while a commit or a blob missing
+  from the store is refused without one; a sandbox refusal under
+  `required` leaves the state byte-identical and is not retried as a
+  materialization failure; an interrupt leaves the marker, `status` and
+  the dry run report it without writing, and the next step records it;
   LOCAL validation records start and end fingerprints and a contract
   beyond the bounds blocks before the agent; protocol-9 and older files
   load in every phase with none of the six fields, an older file carrying
