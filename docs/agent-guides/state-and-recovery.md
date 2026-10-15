@@ -320,6 +320,9 @@ binding, certificate or counter names; a named record is never evicted.
 **Read-only load** (D11.3): loading reports a pending marker
 (`status` shows it as "Pending attempt", the dry-run plan as a note) and
 converts nothing, so `status` and `--dry-run` leave the file byte-identical.
+A real step converts it under the lock before it plans anything: a plan can
+refuse (a LOCAL working tree the interrupted validator left a FIFO in), and
+a refusal must not leave the marker pending for every resume after it.
 
 State keeps compact finding summaries and review comment URLs, rather than
 copying unbounded PR discussion bodies. Those summaries are bounded

@@ -3397,19 +3397,24 @@ class ControllerEngine:
                 return self._outcome(previous, dry_run, message="workflow already DONE")
             raise StateTransitionError(f"cannot step from terminal phase {previous.value}")
 
-        plan = self.plan_step()
         if dry_run:
+            plan = self.plan_step()
             return self._outcome(
                 previous,
                 dry_run=True,
                 plan=plan,
                 message=f"[dry-run] would execute {previous.value} via profile {plan.profile_name}",
             )
-        # Under the lock, before anything else of the step (ADR 0006 D11.3):
-        # a validation marker a crash left becomes its INTERRUPTED record.
-        recovered = self._recover_validation_attempt(previous, plan)
+        # Under the lock, before anything else of the step, the plan included
+        # (ADR 0006 D11.3): a validation marker a crash left becomes its
+        # INTERRUPTED record. Planning can refuse -- a LOCAL plan snapshots
+        # the working tree, where the interrupted validator may have left a
+        # FIFO or an over-budget tree -- and a refusal must not strand the
+        # marker for every resume after it.
+        recovered = self._recover_validation_attempt(previous)
         if recovered is not None:
             return recovered
+        plan = self.plan_step()
 
         if state.mode == WorkflowMode.LOCAL:
             # A LOCAL run's step budget is part of its contract, so it is
@@ -4644,7 +4649,7 @@ class ControllerEngine:
         )
         return record
 
-    def _recover_validation_attempt(self, previous: Phase, plan: StepPlan) -> StepOutcome | None:
+    def _recover_validation_attempt(self, previous: Phase) -> StepOutcome | None:
         """Record a marker a crash left, under the lock, in one save (ADR 0006 D10.7, D11.3).
 
         The marker becomes an ``INTERRUPTED`` record built from it alone,
@@ -4652,6 +4657,7 @@ class ControllerEngine:
         does. A marker whose record exists (a hand edit: the record and the
         clear are one write) is only cleared. The third interruption of one
         candidate, definition and policy enters ``BLOCKED`` in the same save.
+        It runs before the step is planned, so that outcome carries no plan.
         """
         state = self._require_state()
         if not state.validation_attempt:
@@ -4670,7 +4676,7 @@ class ControllerEngine:
         except ValidationInterruptedError as exc:
             state.validation_records = exc.records
             state.validation_attempt = {}
-            return self._block(previous, plan, str(exc))
+            return self._block(previous, None, str(exc))
         state.validation_records = records
         state.validation_attempt = {}
         self._save()

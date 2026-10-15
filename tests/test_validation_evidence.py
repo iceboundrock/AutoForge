@@ -394,8 +394,7 @@ def test_a_duplicate_resume_appends_nothing(tmp_path, monkeypatch):
     eng.step()
     after = eng.paths.state_file.read_bytes()
     eng.load()
-    plan = eng.plan_step()
-    assert eng._recover_validation_attempt(eng.state.phase, plan) is None
+    assert eng._recover_validation_attempt(eng.state.phase) is None
     assert eng.paths.state_file.read_bytes() == after
 
 
@@ -593,6 +592,76 @@ def test_an_interrupted_local_validation_is_recorded_on_resume_and_rerun(tmp_pat
     assert [r["outcome"] for r in state.validation_records] == ["INTERRUPTED", "PASS"]
     assert state.validation_attempt == {} and state.phase == Phase.REVIEW
     assert "end_fingerprint" not in state.validation_records[0]
+
+
+def _leave_fifo(root: Path) -> None:
+    os.mkfifo(root / "leftover.pipe")
+
+
+def _leave_too_many_entries(root: Path) -> None:
+    junk = root / "junk"
+    junk.mkdir()
+    for i in range(100):
+        (junk / str(i)).write_text("x", encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("leave", "refusal"),
+    [
+        (_leave_fifo, "leftover.pipe"),
+        (_leave_too_many_entries, "refusing to fingerprint the working tree"),
+    ],
+    ids=["fifo", "over-budget"],
+)
+def test_a_marker_is_recorded_before_a_plan_that_refuses_the_working_tree(
+    tmp_path, monkeypatch, leave, refusal
+):
+    """R2-F1: the interrupted validator left a tree the LOCAL plan's snapshot
+    refuses. The dry run stays read-only and leaves the marker pending; the
+    real step records it INTERRUPTED under the lock before it plans, so the
+    refusal is persisted with the record, and a second resume appends nothing."""
+    root = local_repo(tmp_path)
+    cfg = default_config()
+    cfg.local.max_workspace_entries = 40
+    cfg.local.validation_commands = [py("pass", TAG)]
+    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
+    eng.provider._handler = scripted(
+        eng,
+        root,
+        [
+            (lambda r: touch_impl(r, "v1\n"), lambda e: impl_result()),
+            (None, lambda e: impl_result(changed=False)),
+        ],
+    )
+    interrupting(monkeypatch)
+    with pytest.raises(KeyboardInterrupt):
+        eng.run(max_steps=2)
+    monkeypatch.undo()
+    marker = saved(eng).validation_attempt
+    assert marker
+    leave(root)
+    calls = len(eng.provider.calls)
+
+    eng.load()
+    before = eng.paths.state_file.read_bytes()
+    with pytest.raises(VerificationError, match=refusal):
+        eng.step(dry_run=True)
+    assert eng.paths.state_file.read_bytes() == before
+
+    with pytest.raises(VerificationError, match=refusal):
+        eng.step()
+    state = saved(eng)
+    assert state.validation_attempt == {} and state.phase == Phase.ANALYZE_EXECUTE
+    [interrupted] = state.validation_records
+    assert interrupted["outcome"] == "INTERRUPTED"
+    assert interrupted["marked_at"] == marker["marked_at"]
+    after = eng.paths.state_file.read_bytes()
+
+    eng.load()
+    with pytest.raises(VerificationError, match=refusal):
+        eng.step()
+    assert eng.paths.state_file.read_bytes() == after
+    assert len(eng.provider.calls) == calls
 
 
 def test_a_changed_local_validation_command_is_refused_before_anything_runs(tmp_path):
