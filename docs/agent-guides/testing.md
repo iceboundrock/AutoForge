@@ -39,7 +39,10 @@ High-priority coverage includes:
   key and the worktree root is compared and named, and no other key is; a
   REMOTE run records it at creation; `step`, `resume` and `unblock` refuse
   a difference (a `resume` without the run's `--config`, a changed model, a
-  changed worktree root) before any launch, GitHub call or write;
+  changed worktree root) before any launch, GitHub call or write, and the
+  command they print to restore the recorded configuration names the state
+  directory that found the run by its absolute path, also when it came from
+  the configuration's `state_dir`, and continues that run;
   `--accept-config-change` logs the change before recording it; a dry run
   writes nothing; a protocol-8 file loads, resumes and records one; a
   protocol-8 or older file carrying the field, or a protocol-9 file missing

@@ -702,14 +702,17 @@ on:
 autoforge: error: run af-20261006T101500Z-3f2a9c was recorded under --config /home/me/code/AutoForge/autoforge.yaml (created 2026-10-06T10:15:00.512837+00:00), and this command's configuration differs from it, so 'resume' refuses before any phase executes; nothing was written. Changed (recorded -> this command):
   profiles.analyze_execute.model: "opus" -> "fable"
   agent worktree root (execution.worktree_dir): "/home/me/code/.worktree" -> "/home/me/code/AutoForge/.git/autoforge/worktrees"
-To continue under the recorded configuration: autoforge --config /home/me/code/AutoForge/autoforge.yaml --state-dir .autoforge/AutoForge-issue-159 resume
+To continue under the recorded configuration: autoforge --config /home/me/code/AutoForge/autoforge.yaml --state-dir /home/me/code/AutoForge/.autoforge/AutoForge-issue-159 resume
 To continue under this command's configuration instead, repeat it with --accept-config-change: the change is written to the run log and becomes the run's configuration.
 ```
 
 - **To keep the run's configuration**, run the command the message prints.
-  It names the recorded `--config` file by its absolute path, with this
-  command's `--state-dir`; a run recorded from the built-in defaults gets
-  no `--config`. Sometimes this command already loads the recorded file.
+  It names the recorded `--config` file and the state directory that found
+  the run, both by their absolute paths. The state directory is named even
+  when this command took it from its configuration's `state_dir` rather
+  than from `--state-dir`: the recorded configuration may name another one.
+  A run recorded from the built-in defaults gets no `--config`. Sometimes
+  this command already loads the recorded file.
   Then the message says that the file was edited since, or that the
   command runs from another directory or repository than the run's. A
   relative `execution.worktree_dir` and the default worktree location are

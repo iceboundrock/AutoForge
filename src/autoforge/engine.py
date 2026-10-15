@@ -1321,17 +1321,18 @@ class ControllerEngine:
         )
 
     def _restore_command(self, recorded: RecordedConfiguration, words: Sequence[str]) -> str:
-        """``words`` with the recorded ``--config`` and this process's ``--state-dir``.
+        """``words`` with the recorded ``--config`` and the ``--state-dir`` that found this run.
 
-        The state directory is the one that found this run; the configuration
-        file is the one the run was recorded from, absolute (#189 repeats
-        flags as typed, but this one was typed by another invocation).
+        Both are absolute (#189 repeats flags as typed, but the configuration
+        file was typed by another invocation). The state directory is always
+        named, even when this invocation took it from its own configuration's
+        ``state_dir`` rather than from a flag: the command swaps that
+        configuration for the recorded one, whose ``state_dir`` (or the
+        default ``.autoforge``) may be another directory, with no run or
+        another run in it.
         """
         flags: list[str] = ["--config", recorded.config_file] if recorded.config_file else []
-        given = list(self.cli_global_flags)
-        for flag, value in zip(given[::2], given[1::2], strict=False):
-            if flag == "--state-dir":
-                flags += [flag, value]
+        flags += ["--state-dir", os.path.abspath(self.paths.state_dir)]
         return shlex.join(["autoforge", *flags, *words])
 
     def _log_config_change(

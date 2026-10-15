@@ -14,6 +14,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import shlex
 from collections.abc import Callable
 from pathlib import Path
 
@@ -364,9 +365,16 @@ def _invocation(
         providers=ProviderRegistry(overrides={"claude": provider, "opencode": provider}),
     )
     later.config_file = config_file
-    later.cli_global_flags = ("--state-dir", "sd")
+    # No --state-dir: this command found the run through its configuration's
+    # state_dir, and the restore command still names the directory.
+    later.cli_global_flags = ()
     later.load()
     return later
+
+
+def _sd(eng: ControllerEngine) -> str:
+    """``eng``'s state directory as a restore command names it: absolute."""
+    return os.path.abspath(eng.paths.state_dir)
 
 
 def _events(eng: ControllerEngine) -> list[dict]:
@@ -409,8 +417,10 @@ def test_a_changed_profile_key_refuses_and_writes_nothing(tmp_path, key):
     message = str(exc.value)
     assert f"\n  profiles.review_round_2_5.{key}: " in message
     assert "refuses before any phase executes; nothing was written" in message
-    assert "To continue under the recorded configuration: autoforge --config " in message
-    assert "/home/me/autoforge.yaml --state-dir sd resume\n" in message
+    restore = shlex.join(
+        ["autoforge", "--config", "/home/me/autoforge.yaml", "--state-dir", _sd(eng), "resume"]
+    )
+    assert f"To continue under the recorded configuration: {restore}\n" in message
     assert "repeat it with --accept-config-change" in message
     assert eng.paths.state_file.read_bytes() == before
     assert _events(later) == []
@@ -456,9 +466,8 @@ def test_a_run_recorded_from_the_built_in_defaults_is_restored_without_config(tm
         later.check_run_configuration(("resume",))
     message = str(exc.value)
     assert "was recorded under the built-in defaults (created " in message
-    assert "To continue under the recorded configuration: autoforge --state-dir sd resume\n" in (
-        message
-    )
+    restore = shlex.join(["autoforge", "--state-dir", _sd(eng), "resume"])
+    assert f"To continue under the recorded configuration: {restore}\n" in message
 
 
 def test_accepting_a_change_logs_it_then_records_it(tmp_path):

@@ -2363,6 +2363,46 @@ def test_a_changed_worktree_root_refuses_and_a_run_on_the_defaults_restores_with
     assert _files(sd) == before and fakes["provider"].calls == []
 
 
+def test_the_restore_command_names_a_state_dir_this_command_took_from_its_configuration(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """A command that found the run through its configuration's `state_dir`,
+    not a flag, gets a restore command that still names that directory,
+    absolute: the recorded configuration (here the built-in defaults) would
+    look in `.autoforge`, where there is no run."""
+    monkeypatch.chdir(tmp_path)
+    assert cli.main(["--state-dir", "custom-state", "run", "--epic", EPIC, "--issue", ISSUE,
+                     "--max-steps", "1"]) == 0  # fmt: skip
+    cfg = _config(
+        tmp_path / "autoforge.json",
+        state_dir="custom-state",
+        profiles={"analyze_execute": {"model": "opus"}},
+    )
+    sd = os.path.abspath("custom-state")
+    capsys.readouterr()
+    before = _files(sd)
+    assert cli.main(["--config", cfg, "resume"]) == 2
+    err = capsys.readouterr().err
+    assert '\n  profiles.analyze_execute.model: "fable" -> "opus"\n' in err
+    assert "was recorded under the built-in defaults (created " in err
+    restore = shlex.join(["autoforge", "--state-dir", sd, "resume"])
+    assert f"To continue under the recorded configuration: {restore}\n" in err
+    assert _files(sd) == before and fakes["provider"].calls == []
+    # Without the directory, the defaults find no run.
+    assert cli.main(["resume"]) == 2
+    assert "no state" in capsys.readouterr().err.lower()
+    assert not (tmp_path / ".autoforge").exists()
+
+    # Run as printed, the command continues the original run on its configuration.
+    fakes["handler"] = implement
+    assert cli.main([*shlex.split(restore)[1:], "--max-steps", "1"]) == 0
+    assert "ANALYZE_EXECUTE -> REVIEW" in capsys.readouterr().out
+    [call] = fakes["provider"].calls
+    assert call.profile.model == "fable"
+    assert load_state(os.path.join(sd, "state.json")).phase == Phase.REVIEW
+    assert not (tmp_path / ".autoforge").exists()
+
+
 def test_accept_config_change_records_the_change_in_the_run_log_and_continues(
     tmp_path, capsys, monkeypatch, fakes
 ):
