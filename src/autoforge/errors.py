@@ -15,6 +15,16 @@ class ConfigurationError(AutoForgeError):
     """Invalid CLI args, config file, profile, or URL."""
 
 
+class ConfigurationDriftError(ConfigurationError):
+    """A REMOTE run's configuration differs from the one it was recorded under (#219).
+
+    Raised by ``resume``, ``step`` and ``unblock`` before any phase executes,
+    with nothing written; the message names each changed key, the command
+    that restores the recorded configuration, and the opt-in that accepts
+    the change.
+    """
+
+
 class StateError(AutoForgeError):
     """State file missing, unreadable, corrupted, or schema-invalid.
 

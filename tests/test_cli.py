@@ -2229,3 +2229,285 @@ def test_unblock_takes_one_acceptance_flag(tmp_path, capsys, monkeypatch, fakes)
         cli.main(["--state-dir", str(tmp_path / ".autoforge"), "unblock", *flags, "--reason", "x"])
     assert e.value.code == 2
     assert "not allowed with argument" in capsys.readouterr().err
+
+
+# -- the recorded configuration (#219) ------------------------------------------------
+def _config(path, **sections) -> str:
+    """Write a JSON config file at ``path``; its absolute path, as the run records it."""
+    path.write_text(json.dumps({"version": 1, **sections}), encoding="utf-8")
+    return os.path.abspath(path)
+
+
+def _files(sd) -> dict[str, bytes]:
+    """Every file under the state directory, with its bytes."""
+    root = os.path.abspath(sd)
+    out = {}
+    for base, _, names in os.walk(root):
+        for name in names:
+            path = os.path.join(base, name)
+            with open(path, "rb") as handle:
+                out[os.path.relpath(path, root)] = handle.read()
+    return out
+
+
+def _events(sd) -> list[dict]:
+    state = load_state(os.path.join(sd, "state.json"))
+    path = os.path.join(sd, "logs", state.run_id, "events.jsonl")
+    with open(path, encoding="utf-8") as handle:
+        return [json.loads(line) for line in handle]
+
+
+def _default_worktree_root(tmp_path) -> str:
+    return os.path.join(os.path.realpath(tmp_path / ".git"), "autoforge", "worktrees")
+
+
+def test_resume_without_the_config_a_run_started_with_refuses_before_anything_runs(
+    tmp_path, tmp_path_factory, capsys, monkeypatch, fakes
+):
+    """#219: the CLI has no configuration discovery, so a `resume` without the
+    `--config` a run was started with would run another model in another,
+    empty worktree. The run recorded its configuration when it was created;
+    the resume names each change and the command that restores it, and
+    refuses before any agent launch, GitHub read or write, or state write."""
+    monkeypatch.chdir(tmp_path)
+    worktrees = tmp_path_factory.mktemp("worktrees")
+    cfg = _config(
+        tmp_path / "autoforge.json",
+        profiles={"analyze_execute": {"model": "opus"}},
+        execution={"worktree_dir": str(worktrees)},
+    )
+    sd = str(tmp_path / ".autoforge")
+    run = ["--config", "autoforge.json", "--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE]
+    assert cli.main([*run, "--max-steps", "1"]) == 0
+    recorded = load_state(os.path.join(sd, "state.json")).config_fingerprint
+    assert recorded["source"] == "created" and recorded["config_file"] == cfg
+    assert recorded["worktree_root"] == os.path.realpath(worktrees)
+    assert recorded["profiles"]["analyze_execute"]["model"] == "opus"
+    capsys.readouterr()
+    before, gh_calls = _files(sd), len(fakes["gh"].calls)
+
+    assert cli.main(["--state-dir", sd, "resume"]) == 2
+    err = capsys.readouterr().err
+    assert '\n  profiles.analyze_execute.model: "opus" -> "fable"\n' in err
+    root = _default_worktree_root(tmp_path)
+    assert (
+        f'\n  agent worktree root (execution.worktree_dir): "{os.path.realpath(worktrees)}" '
+        f'-> "{root}"\n'
+    ) in err
+    assert "'resume' refuses before any phase executes; nothing was written" in err
+    restore = shlex.join(["autoforge", "--config", cfg, "--state-dir", sd, "resume"])
+    assert f"To continue under the recorded configuration: {restore}\n" in err
+    assert "repeat it with --accept-config-change" in err
+    assert _files(sd) == before
+    assert fakes["provider"].calls == [] and len(fakes["gh"].calls) == gh_calls
+    assert fakes["gh"].effect_writes == []
+
+    # Run as printed, the command continues the run on its configuration.
+    fakes["handler"] = implement
+    assert cli.main([*shlex.split(restore)[1:], "--max-steps", "1"]) == 0
+    assert "ANALYZE_EXECUTE -> REVIEW" in capsys.readouterr().out
+    [call] = fakes["provider"].calls
+    assert call.profile.model == "opus"
+    assert os.path.dirname(call.cwd) == os.path.realpath(worktrees)
+
+
+def test_a_changed_model_refuses_step_naming_the_key_and_the_file_that_restores_it(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    monkeypatch.chdir(tmp_path)
+    a = _config(tmp_path / "a.json")
+    b = _config(tmp_path / "b.json", profiles={"review_round_1": {"model": "openai/gpt-5.6-sol"}})
+    sd = str(tmp_path / ".autoforge")
+    assert cli.main(["--config", a, "--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE,
+                     "--max-steps", "1"]) == 0  # fmt: skip
+    capsys.readouterr()
+    before = _files(sd)
+    assert cli.main(["--config", b, "--state-dir", sd, "step"]) == 2
+    err = capsys.readouterr().err
+    changed = [line for line in err.splitlines() if line.startswith("  ")]
+    assert changed == [
+        '  profiles.review_round_1.model: "openai/gpt-5.6-luna" -> "openai/gpt-5.6-sol"'
+    ]
+    assert f"was recorded under --config {a} (created " in err
+    restore = shlex.join(["autoforge", "--config", a, "--state-dir", sd, "step"])
+    assert f"To continue under the recorded configuration: {restore}\n" in err
+    # The file the run was recorded from, edited since: no other file to name.
+    (tmp_path / "a.json").write_text((tmp_path / "b.json").read_text(), encoding="utf-8")
+    assert cli.main(["--config", a, "--state-dir", sd, "step"]) == 2
+    err = capsys.readouterr().err
+    assert f"This command loads the same file, {a}: it was edited since" in err
+    assert _files(sd) == before and fakes["provider"].calls == []
+
+
+def test_a_changed_worktree_root_refuses_and_a_run_on_the_defaults_restores_without_config(
+    tmp_path, tmp_path_factory, capsys, monkeypatch, fakes
+):
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    assert cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE,
+                     "--max-steps", "1"]) == 0  # fmt: skip
+    capsys.readouterr()
+    worktrees = tmp_path_factory.mktemp("worktrees")
+    cfg = _config(tmp_path / "autoforge.json", execution={"worktree_dir": str(worktrees)})
+    before = _files(sd)
+    assert cli.main(["--config", cfg, "--state-dir", sd, "resume"]) == 2
+    err = capsys.readouterr().err
+    changed = [line for line in err.splitlines() if line.startswith("  ")]
+    assert changed == [
+        f'  agent worktree root (execution.worktree_dir): "{_default_worktree_root(tmp_path)}" '
+        f'-> "{os.path.realpath(worktrees)}"'
+    ]
+    assert "was recorded under the built-in defaults (created " in err
+    restore = shlex.join(["autoforge", "--state-dir", sd, "resume"])
+    assert f"To continue under the recorded configuration: {restore}\n" in err
+    assert _files(sd) == before and fakes["provider"].calls == []
+
+
+def test_accept_config_change_records_the_change_in_the_run_log_and_continues(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """Raising a limit after a timeout is a normal reason to resume on a changed
+    configuration: the opt-in lets it through, and it is recorded."""
+    monkeypatch.chdir(tmp_path)
+    a = _config(tmp_path / "a.json")
+    raised = _config(
+        tmp_path / "raised.json", profiles={"analyze_execute": {"idle_timeout_seconds": 3600}}
+    )
+    sd = str(tmp_path / ".autoforge")
+    assert cli.main(["--config", a, "--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE,
+                     "--max-steps", "1"]) == 0  # fmt: skip
+    capsys.readouterr()
+    assert cli.main(["--config", raised, "--state-dir", sd, "resume"]) == 2
+    assert "profiles.analyze_execute.idle_timeout_seconds: 900 -> 3600" in capsys.readouterr().err
+
+    fakes["handler"] = implement
+    argv = ["--config", raised, "--state-dir", sd, "resume", "--accept-config-change"]
+    assert cli.main([*argv, "--max-steps", "1"]) == 0
+    out = capsys.readouterr()
+    assert "autoforge: accepted the configuration change of run " in out.err
+    assert f"--config {raised} is the run's configuration from now on:" in out.err
+    assert "\n  profiles.analyze_execute.idle_timeout_seconds: 900 -> 3600" in out.err
+    assert "ANALYZE_EXECUTE -> REVIEW" in out.out
+    [call] = fakes["provider"].calls
+    assert call.idle_timeout_seconds == 3600
+    recorded = load_state(os.path.join(sd, "state.json")).config_fingerprint
+    assert recorded["source"] == "accepted" and recorded["config_file"] == raised
+    assert recorded["profiles"]["analyze_execute"]["idle_timeout_seconds"] == 3600
+    [change] = [e for e in _events(sd) if e["phase"].endswith("-config-change")]
+    assert change["phase"] == "ANALYZE_EXECUTE-config-change"
+    assert change["metadata"]["command"] == "resume"
+    assert change["metadata"]["changes"] == [
+        {
+            "key": "profiles.analyze_execute.idle_timeout_seconds",
+            "recorded": "900",
+            "current": "3600",
+        }
+    ]
+    assert change["metadata"]["recorded_config_file"] == a
+    # From now on the run's configuration is the accepted one.
+    assert cli.main(["--config", raised, "--state-dir", sd, "resume", "--dry-run"]) == 0
+    capsys.readouterr()
+    assert cli.main(["--config", a, "--state-dir", sd, "resume", "--dry-run"]) == 2
+    assert "profiles.analyze_execute.idle_timeout_seconds: 3600 -> 900" in capsys.readouterr().err
+
+
+def test_resume_dry_run_reports_a_mismatch_and_writes_nothing(tmp_path, capsys, monkeypatch, fakes):
+    monkeypatch.chdir(tmp_path)
+    cfg = _config(tmp_path / "autoforge.json", profiles={"fix": {"effort": "medium"}})
+    sd = str(tmp_path / ".autoforge")
+    assert cli.main(["--config", cfg, "--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE,
+                     "--max-steps", "1"]) == 0  # fmt: skip
+    capsys.readouterr()
+    before = _files(sd)
+    for command in ("resume", "step"):
+        assert cli.main(["--state-dir", sd, command, "--dry-run"]) == 2
+        err = capsys.readouterr().err
+        assert '\n  profiles.fix.effort: "medium" -> "high"\n' in err
+        assert f"'{command}' refuses before any phase executes" in err
+        assert cli.main(["--state-dir", sd, command, "--dry-run", "--accept-config-change"]) == 0
+        out = capsys.readouterr()
+        assert "autoforge: [dry-run] would accept the configuration change of run " in out.err
+        assert "ANALYZE_EXECUTE" in out.out and "analyze_execute.md" in out.out
+    assert _files(sd) == before
+    assert fakes["provider"].calls == [] and fakes["gh"].effect_writes == []
+
+
+def test_an_old_state_file_without_a_recorded_configuration_loads_and_resumes(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """A protocol-8 file has no recorded configuration: it is not checked, and
+    the resume records the one it runs on, which later commands are held to."""
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    assert cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE,
+                     "--max-steps", "1"]) == 0  # fmt: skip
+    state_file = os.path.join(sd, "state.json")
+    with open(state_file, encoding="utf-8") as handle:
+        data = json.load(handle)
+    del data["config_fingerprint"]
+    data["protocol_version"] = "8"
+    with open(state_file, "w", encoding="utf-8") as handle:
+        json.dump(data, handle)
+    cfg = _config(tmp_path / "autoforge.json", profiles={"analyze_execute": {"model": "opus"}})
+    capsys.readouterr()
+    assert cli.main(["--state-dir", sd, "status"]) == 0
+    assert "Config:     not recorded (state from before #219; the next step" in (
+        capsys.readouterr().out
+    )
+
+    fakes["handler"] = implement
+    assert cli.main(["--config", cfg, "--state-dir", sd, "resume", "--max-steps", "1"]) == 0
+    out = capsys.readouterr()
+    assert "had no recorded configuration (its state file predates #219)" in out.err
+    assert f"--config {cfg} is recorded as the run's" in out.err
+    assert "ANALYZE_EXECUTE -> REVIEW" in out.out
+    saved = load_state(state_file)
+    assert saved.protocol_version == "9"
+    assert saved.config_fingerprint["source"] == "upgraded"
+    assert saved.config_fingerprint["profiles"]["analyze_execute"]["model"] == "opus"
+    assert cli.main(["--state-dir", sd, "status"]) == 0
+    assert f"Config:     --config {cfg} (upgraded " in capsys.readouterr().out
+    assert cli.main(["--state-dir", sd, "resume"]) == 2
+    assert 'profiles.analyze_execute.model: "opus" -> "fable"' in capsys.readouterr().err
+
+
+def test_unblock_refuses_another_configuration_and_records_an_accepted_one(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    monkeypatch.chdir(tmp_path)
+    cfg = _config(tmp_path / "autoforge.json", profiles={"fix": {"model": "opus"}})
+    sd = str(tmp_path / ".autoforge")
+    fakes["handler"] = lambda req: block(
+        {"phase": "ANALYZE_EXECUTE", "status": "blocked", "message": "spec unclear"}
+    )
+    assert (
+        cli.main(["--config", cfg, "--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE]) == 1
+    )
+    fakes["handler"] = lambda req: ""
+    capsys.readouterr()
+    before = _files(sd)
+    for dry in ([], ["--dry-run"]):
+        assert cli.main(["--state-dir", sd, "unblock", "--reason", "clarified", *dry]) == 2
+        err = capsys.readouterr().err
+        assert '\n  profiles.fix.model: "opus" -> "fable"\n' in err
+        restore = shlex.join(
+            ["autoforge", "--config", cfg, "--state-dir", sd, "unblock", "--reason", "<why>"]
+        )
+        assert f"To continue under the recorded configuration: {restore}\n" in err
+    assert _files(sd) == before and fakes["gh"].effect_writes == []
+
+    argv = ["--state-dir", sd, "unblock", "--reason", "clarified", "--accept-config-change"]
+    assert cli.main(argv) == 0
+    out = capsys.readouterr()
+    assert "autoforge: accepted the configuration change of run " in out.err
+    assert "BLOCKED -> ANALYZE_EXECUTE" in out.out
+    assert f"continue with: {shlex.join(['autoforge', '--state-dir', sd, 'resume'])}" in out.out
+    state = load_state(os.path.join(sd, "state.json"))
+    assert state.phase == Phase.ANALYZE_EXECUTE
+    assert state.config_fingerprint["source"] == "accepted"
+    assert state.config_fingerprint["config_file"] == ""
+    assert len(state.unblock_history) == 1
+    phases = [e["phase"] for e in _events(sd)]
+    assert phases.index("BLOCKED-config-change") < phases.index("BLOCKED-unblock")
+    assert len(fakes["provider"].calls) == 1  # the run's launch; unblock launches nothing
+    assert fakes["gh"].effect_writes == []

@@ -74,6 +74,8 @@ materialize.py      byte-exact export of a candidate commit from the shared obje
 result_parser.py    CONTROL_RESULT extraction and strict per-phase validation
 state.py            persisted controller state, atomic writes, schema/protocol checks
 run_contract.py     the durable contract of a LOCAL run
+config_fingerprint.py  the recorded configuration of a REMOTE run (profile routing,
+                    agent worktree root) that step/resume/unblock compare (#219)
 local_workspace.py  LOCAL mode working-tree verification
 safefs.py           filesystem capability boundary for every controller write
 locking.py          repository lock keyed by the git common dir
@@ -133,8 +135,8 @@ prompts/update_epic*.md                           -> docs/agent-guides/github-sa
                                                      (+ docs/adr/0004-authority-boundary-and-
                                                      typed-external-effects.md for effects)
 state.py, effects.py, run_contract.py, safefs.py,
-locking.py, errors.py, engine.py (recovery,
-retry)                                            -> docs/agent-guides/state-and-recovery.md
+config_fingerprint.py, locking.py, errors.py,
+engine.py (recovery, retry)                       -> docs/agent-guides/state-and-recovery.md
 providers.py, pi_rpc.py, claude_stream.py,
 progress.py, loop_detect.py, executor.py,
 executor_duplex.py,

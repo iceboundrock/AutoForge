@@ -34,6 +34,11 @@ uv run autoforge resume            # continue until a stop phase / --max-steps
 # --max-steps bounds one invocation; workflow.max_total_steps (config) bounds
 # the whole run and is not reset by resume
 
+# step, resume and unblock refuse a configuration whose profile routing or
+# agent worktree root differs from the one the run was recorded under; to
+# change it deliberately (recorded in the run log):
+uv run autoforge --config autoforge.yaml resume --accept-config-change
+
 # only with safety.allow_merge: true in config — the controller verifies on
 # GitHub and merges itself (agents never merge); re-run to re-check
 # inconclusive GitHub data (bounded by merge.max_verification_attempts)
@@ -564,11 +569,13 @@ ownership or discard uncommitted user changes.
   - `resume` repeats the `--config` and `--state-dir` this command was
     started with, as you typed them; run it from the same directory. The
     CLI does not look for a configuration file, so a bare `resume` after a
-    run started with them finds no run (no `--state-dir`) or runs on the
-    built-in defaults (no `--config`): another model, other limits and
-    another worktree. Nothing checks yet that `resume` uses the
-    configuration the run started with, so check the plan of the dry run
-    first.
+    run started with them finds no run (no `--state-dir`) or would run on
+    the built-in defaults (no `--config`): another model, other limits and
+    another worktree. A REMOTE run refuses that: see
+    [the configuration a run was recorded under](#the-configuration-a-run-was-recorded-under).
+- **"run ... was recorded under ..., and this command's configuration
+  differs from it"** (exit 2): see
+  [the configuration a run was recorded under](#the-configuration-a-run-was-recorded-under).
 - **The run is `BLOCKED`:** read `autoforge status`, fix the cause, then
   `autoforge unblock --reason "..."` and `autoforge resume` (see above),
   with the `--config` / `--state-dir` the run was started with; `unblock`
@@ -665,6 +672,67 @@ ownership or discard uncommitted user changes.
   Its `ANALYZE_EXECUTE` adopts the one open PR carrying the issue's
   `ai-implementation` marker and blocks on two, so close the PR you do not
   keep. See [Replan transaction](agent-guides/replan-transaction.md).
+
+### The configuration a run was recorded under
+
+When `run` creates a REMOTE run it records the configuration the run is on.
+That covers every profile it routes to (the six required ones and
+`update_epic`): the provider, the model, the effort, and the idle and
+maximum-runtime limits the agent runs under (the profile's own, else the
+`execution` default). It also covers the resolved agent worktree root:
+`execution.worktree_dir`, or `<git common dir>/autoforge/worktrees`.
+
+Before any phase executes, `step`, `resume` and `unblock` (from `BLOCKED`)
+compare this command's configuration with the recorded one. On any
+difference the command exits 2. It has launched nothing and written nothing
+to the state, the run log or GitHub, and it says what changed and how to go
+on:
+
+```text
+autoforge: error: run af-20261006T101500Z-3f2a9c was recorded under --config /home/me/code/AutoForge/autoforge.yaml (created 2026-10-06T10:15:00.512837+00:00), and this command's configuration differs from it, so 'resume' refuses before any phase executes; nothing was written. Changed (recorded -> this command):
+  profiles.analyze_execute.model: "opus" -> "fable"
+  agent worktree root (execution.worktree_dir): "/home/me/code/.worktree" -> "/home/me/code/AutoForge/.git/autoforge/worktrees"
+To continue under the recorded configuration: autoforge --config /home/me/code/AutoForge/autoforge.yaml --state-dir .autoforge/AutoForge-issue-159 resume
+To continue under this command's configuration instead, repeat it with --accept-config-change: the change is written to the run log and becomes the run's configuration.
+```
+
+- **To keep the run's configuration**, run the command the message prints.
+  It names the recorded `--config` file by its absolute path, with this
+  command's `--state-dir`; a run recorded from the built-in defaults gets
+  no `--config`. Sometimes this command already loads the recorded file.
+  Then the message says that the file was edited since, or that the
+  command runs from another directory or repository than the run's. A
+  relative `execution.worktree_dir` and the default worktree location are
+  resolved from where the command runs. Undo the edit, or run the command
+  from the run's directory.
+- **To change it deliberately**, repeat the command with
+  `--accept-config-change`. Typical reasons are a limit raised after a
+  timeout ([Agent limits](#agent-limits)) or another model for the
+  remaining reviews. The change is written to the run log first: a
+  `<PHASE>-config-change` record in `logs/<run-id>/events.jsonl` with each
+  changed key, the recorded file and this one. Only then does this
+  configuration become the run's, and later commands are checked against
+  it. An `unblock` that goes on to refuse keeps the accepted configuration.
+  A new worktree root moves the issue's agent to another, empty worktree.
+  The old worktree keeps whatever the agent left there.
+
+Everything else in the configuration may change between commands without a
+refusal: the loop bounds and step budget, the merge gate, `env_allowlist`,
+`sandbox.mode`, and a profile's `command`, `extra_args` and `options`. The
+record holds none of them, and no value that could carry a secret.
+
+`--dry-run` makes the same comparison and writes nothing. It refuses as the
+command would, or, with `--accept-config-change`, says what it would accept.
+Outside a git checkout it cannot resolve the default worktree root, so it
+compares the routing only and says so.
+
+`autoforge status` shows the configuration the run is on, for example
+`Config:     --config /home/me/code/AutoForge/autoforge.yaml (created 2026-10-06T10:15:00.512837+00:00)`.
+A state file written before this check (protocol 8) has no recorded
+configuration. It loads and resumes unchecked, and the first `step`,
+`resume` or `unblock` records the configuration it runs on (`upgraded`). A
+LOCAL run is not checked this way: its
+[run contract](local-mode.md#the-run-contract) defines it.
 
 ## Logging and redaction
 

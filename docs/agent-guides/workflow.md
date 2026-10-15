@@ -292,10 +292,17 @@ pushes alone repeat a round without the cap ever counting it.
 
 ### Re-entering a phase
 
-`resume` re-enters the persisted phase, and the engine cannot tell a first
-entry from a re-entry after an interrupted step (timeout, non-zero exit,
-malformed result, verification failure, refused run-log write, crash). In
-every one of those the agent may already have done its GitHub work. GitHub
+`resume` re-enters the persisted phase. Before it does, `step`, `resume`
+and `unblock` hold a REMOTE run to the configuration it was recorded under:
+its profile routing and its agent worktree root (#219,
+[state-and-recovery.md](state-and-recovery.md#persistent-state)). A
+re-entry under another model or in another, empty worktree is not the same
+phase continued, so a difference refuses before anything runs, unless the
+operator accepts it with `--accept-config-change`, which the run log
+records. The engine cannot tell a first entry from a re-entry after an
+interrupted step (timeout, non-zero exit, malformed result, verification
+failure, refused run-log write, crash). In every one of those the agent
+may already have done its GitHub work. GitHub
 is the source of truth, so every REMOTE phase that launches an agent reads
 GitHub before launching anyone, in one place (`_remote_entry`), exactly as
 `ANALYZE_EXECUTE` reads its journal and the issue's PRs first. The
