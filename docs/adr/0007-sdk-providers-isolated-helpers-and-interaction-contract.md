@@ -580,13 +580,60 @@ controller as output, so the idle timeout keeps its meaning (ADR 0002 §4c).
 - The password is never written to a record, a log or an argv.
 - Reason: the loopback port is in the shared network namespace (ADR 0005
   D9.1), so any local process can reach it.
-- A tool the server runs inherits the server's environment unless the
-  runtime removes the password, and the source read here does not say
-  whether it does. If a tool can see the password, the agent can answer its
-  own asks over HTTP. That breaks no authority boundary, because an
-  approval never carries a credential (ADR 0004 D1.3), but OpenCode asks
-  would then be advisory. Gate G-O11 decides this. Until it passes, #149's
-  policy relies on no OpenCode ask as a control.
+- **A tool that obtains the password can answer its own asks.** The
+  password opens every route of the server, not only those D3.5 lets the
+  bridge call. A tool holding it can therefore reply `once` or `always` to
+  a pending ask, before the bridge's reject arrives or while a paused ask
+  waits for the stop (D9.6). That breaks no authority boundary, because an
+  approval never carries a credential (ADR 0004 D1.3). But the operator's
+  decision is then not the one the server applies. A tool has two ways to
+  the password that the source read here leaves open:
+  - its own environment. It inherits the server's unless the runtime
+    removes the password, and the source does not say whether it does;
+  - the server's process, or any other process that started with the
+    server's environment. `/proc/<pid>/environ` holds "the initial
+    environment that was set when the currently executing program was
+    started", whatever the program later removes, behind a
+    `PTRACE_MODE_READ_FSCREDS` check (proc_pid_environ(5)). A same-user
+    process passes that check unless the target is not dumpable or a
+    security module refuses: Yama restricts only `PTRACE_MODE_ATTACH`
+    (ptrace(2)). The outer sandbox does not separate a tool from those
+    processes, because the bridge, the server and its tools share one
+    sandbox and its PID namespace (D3.2; ADR 0005 D10.7).
+
+  Nothing read here closes the second way, so the first release plans for
+  the advisory outcome below.
+- **An OpenCode permission decision is an enforcement control only after
+  gate G-O11 passes** on the pinned pair (§3). The gate passes when a probe
+  tool, under #149's policy and the sandbox, cannot obtain the password by
+  any of these routes:
+  - its environment;
+  - `/proc/<pid>/environ`, `cmdline` and `mem` of every other process of
+    the invocation: the bridge, the server and what the server starts,
+    which inherits the server's environment;
+  - any file it can read.
+
+  A route that is open under any host setting AutoForge supports, such as
+  Yama's `ptrace_scope` for `mem`, counts as open.
+- **Until G-O11 passes, and for good if it fails, OpenCode permission asks
+  are advisory and unavailable as controls.**
+  - `live_permissions` is false for `opencode-sdk`, whatever G-O4 shows.
+    So is the pause capability for a permission ask, whatever G-O6 shows
+    (D5.3).
+  - With neither true, the broker has no live answer and no pause to
+    give. It answers every OpenCode permission ask `Fail`, under every
+    policy (D7.1, D7.4). The bridge rejects the ask, and the invocation is
+    a provider failure (D7.6).
+  - That reject is not what keeps the action from running, since a tool
+    may have approved the ask first. #149's policy relies on no OpenCode
+    permission ask as a control. What an OpenCode tool must never do is
+    kept from it by logical isolation and the outer sandbox, which bound
+    what a child reaches when it deliberately tries (ADR 0005 D1.1; ADR
+    0004 D1.3). OpenCode's own permission rules are at most defence in
+    depth (D10.1).
+- **Questions are not gated by G-O11.** An answer changes what the agent
+  was told, never what a tool may do, so no policy treats a question as a
+  control.
 
 **D3.5 (#152).** **The bridge calls a fixed set of routes and no other**:
 session create, prompt or admission, abort or interrupt, message history,
@@ -776,7 +823,8 @@ types, no I/O, no provider name and no SDK type.
 passes.**
 
 - An adapter declares `Capabilities` per pair. A value is true only when
-  its §3 gate passed on that pair.
+  every §3 gate of its row passed on that pair. OpenCode's permission rows
+  need G-O11 besides their own gate (D3.4).
 - Everything else is false, and the broker treats false as unavailable.
 - `offers` is derived from the capabilities.
 
@@ -958,7 +1006,8 @@ a continuation (D8.4). The deferred tool did not run.
   today.
 - There is no correction and no transient relaunch: a relaunch would ask
   again.
-- The ask itself is denied, or rejected, so the action never runs.
+- The ask itself is denied, or rejected. That keeps the action from
+  running only under D10.4's conditions.
 
 **D7.7 (#134).** **Ctrl-C and a denial with guidance are neither of them a
 deferral.**
@@ -1160,8 +1209,10 @@ outlive the server, so recovery is an explicit continuation message.**
   and patterns with the tool's message and call ids, or the questions; and
   its digest). The adapter closes the bridge's stdin, and the bridge stops
   the server (D3.3). An orderly stop runs the finalizer, which fails the
-  ask, so the tool does not run. What the history then shows for the call,
-  and what a server killed by SIGKILL leaves, is part of gate G-O6.
+  ask, so the tool does not run, unless a tool holding the server password
+  approved the ask before the stop. That is why a permission ask's pause
+  also needs G-O11 (D3.4). What the history then shows for the call, and
+  what a server killed by SIGKILL leaves, is part of gate G-O6.
 - **Continuation.**
   - A new server starts on the same data directory, with the same session
     id.
@@ -1286,8 +1337,18 @@ outcome or interaction fails closed.**
 - An unknown outcome fails closed: an unknown result subtype, stop reason,
   terminal reason or session status.
 - So does an unknown interaction: a kind or field the broker cannot
-  render. The ask is denied or rejected, so the action never runs, and the
-  invocation is a provider failure.
+  render. The ask is denied or rejected, and the invocation is a provider
+  failure.
+- Fail-closed means the controller never approves, and the invocation
+  fails. Whether the action then never runs depends on two things:
+  - the provider honours the deny or reject (G-C4, G-O4);
+  - no other client answered the ask first. For OpenCode that is G-O11.
+    Until it passes, a reject keeps nothing from running, because a tool
+    holding the server password may have approved the ask already (D3.4).
+
+  Under every provider, what a tool must never do is kept from it by
+  logical isolation and the outer sandbox, never by an interaction reply
+  (ADR 0005 D1.1).
 - Two Python SDK facts limit what the helper can see. The exact pin (D4.1)
   and the probes (§3) are the mitigation:
   - it skips an unknown top-level message type silently (MP :391-395);
@@ -1358,26 +1419,32 @@ in an adapter only after its gate passes on the pinned pair (D5.3).
 | live single question | `question.asked` with `QuestionInfo {question, header, options, multiple?, custom?}` (VT :532-547, :5968); `POST /question/{id}/reply {answers: string[][]}` and `/reject` (VT :7797-7864); on by default while `OPENCODE_CLIENT` is `cli` (`tool/registry.ts` :207, `runtime-flags.ts` :41, :56) | not run | candidate | G-O3 |
 | live multiple questions | `questions[]`, `multiple?` | not run | candidate | G-O3 |
 | custom answer | `custom?` | not run | candidate | G-O3 |
-| once approval | `reply: "once"` (VT :7906) | not run | candidate | G-O4 |
-| session approval | classic `reply: "always"`, kept in memory (`approved: []`); an `/api` "always" to an ask with a `save` list persists to SQL (`core/permission.ts` :250-256) | not run | candidate, in-memory `always` only; never to an ask with a `save` list | G-O4: an `always` dies with the server |
+| once approval | `reply: "once"` (VT :7906) | not run | candidate, as a control only once G-O11 passes (D3.4) | G-O4 and G-O11 |
+| session approval | classic `reply: "always"`, kept in memory (`approved: []`); an `/api` "always" to an ask with a `save` list persists to SQL (`core/permission.ts` :250-256) | not run | candidate, in-memory `always` only; never to an ask with a `save` list; as a control only once G-O11 passes (D3.4) | G-O4: an `always` dies with the server; and G-O11 |
 | modified input | no reply carries one (VT :7906, :10891) | — | unsupported | — |
-| deny guidance | `reject` with `message` becomes `CorrectedError({feedback})` (`permission/index.ts` :121-127); it rejects the session's other pending asks (:129-138) | not run | candidate | G-O4, including how the sibling rejections surface |
+| deny guidance | `reject` with `message` becomes `CorrectedError({feedback})` (`permission/index.ts` :121-127); it rejects the session's other pending asks (:129-138) | not run | candidate, as a control only once G-O11 passes (D3.4) | G-O4, including how the sibling rejections surface; and G-O11 |
 | graceful cancellation | `POST /session/{id}/abort`; `/api/.../interrupt` "Idle interruption is a no-op" (VS :1743) | not run | candidate | G-O5 |
-| deferred or request replay after restart | pending asks are in-memory `Deferred`s, rejected at shutdown (D9.6) | not run | unsupported as replay; recovery by continuation message (D9.6) | G-O6: a new server on the same data directory continues the same session from its history, and an exact reissue is answered once; and what the history shows for the failed ask after an orderly stop and after SIGKILL |
+| deferred or request replay after restart | pending asks are in-memory `Deferred`s, rejected at shutdown (D9.6) | not run | unsupported as replay; recovery by continuation message (D9.6) | G-O6: a new server on the same data directory continues the same session from its history, and an exact reissue is answered once; and what the history shows for the failed ask after an orderly stop and after SIGKILL; for a permission ask, also G-O11 (D3.4, D9.6) |
 | delivered-before-crash recovery | history `GET /session/{id}/message` (VT :8327) with each tool part's state | not run | candidate | G-O7: after a crash, a part's state tells ran, not run or unknown |
 | final-result recovery | durable history | not run | candidate | G-O8 |
 | subagent attribution | child sessions carry `parentID` (GT `Session` :465-469; VT `Session` :64-71, `SessionV2Info` :3186); asks carry `sessionID` | not run | candidate | G-O9: a child session's ask is attributed to the root logical invocation, or the invocation fails closed |
 | cleanup | the bridge owns the server (D3.1); the group kill; whether the runtime stops its language servers, MCP servers and shells on SIGTERM is not determinable from source | not run | candidate | G-O10: after a normal end, a timeout, a stop, Ctrl-C and a bridge crash the group is empty |
-| server authentication and no self-answer | Basic authentication from `OPENCODE_SERVER_PASSWORD` (`server/auth.ts` :17-34); whether tools see the variable is not determinable | not run | candidate | G-O11: a tool's environment has no password, or OpenCode asks are advisory (D3.4) |
+| server authentication and no self-answer | Basic authentication from `OPENCODE_SERVER_PASSWORD` (`server/auth.ts` :17-34); whether tools see the variable is not determinable | not run | candidate | G-O11: a probe tool cannot obtain the password from its environment, from `/proc/<pid>/environ`, `cmdline` or `mem` of any other process of the invocation, or from a file it can read. Until it passes, OpenCode permission asks are advisory, and every permission row is false (D3.4) |
 | assigned port | `--port=0` binds 4096 when free, otherwise any free port (`server/server.ts` :117-122); the readiness line reports the bound port (`serve.ts` :20) | not run | candidate | G-O12: the readiness line names the bound port, also when 4096 is taken |
 | runtime version read-back | the health routes (VS) | not run | candidate | G-O13 |
 
 **Rules.**
 
-- A row whose gate has not passed is false in `Capabilities`, whatever its
-  source column says.
+- A row whose gates have not all passed is false in `Capabilities`,
+  whatever its source column says.
 - A pause capability needs every gate of its provider's "… replay after
   restart" row, plus #126.
+- G-O11 is a prerequisite of every OpenCode permission row: once approval,
+  session approval, deny guidance, and a permission ask's pause. A pass of
+  G-O4 or G-O6 alone never makes one true. If G-O11 fails, the amendment
+  turns those rows *unsupported* as controls: an OpenCode permission ask
+  stays advisory and fails the invocation (D3.4). The question rows do not
+  need G-O11.
 - A gate that fails turns its row into *unsupported* by amendment. The
   implementing child comments on #148 and on the affected issue (D4.6).
 
@@ -1605,8 +1672,12 @@ amends this record and comments on #148 and on the affected issues.
   backed by probes, never a silent upgrade.
 - **OpenCode interactions have limits.** They carry no modified input. A
   pending ask dies with its server, so continuing is a message, not a
-  replay. A tool that can read the server password can answer its own asks
-  until G-O11 shows otherwise.
+  replay. A tool may be able to read the server password and answer its
+  own asks, so OpenCode permission asks are advisory and unavailable as
+  controls until G-O11 proves no tool can obtain it. Until then, an OpenCode
+  permission ask fails the invocation under every policy, and only logical
+  isolation and the outer sandbox keep an action from running (D3.4).
+  Questions are unaffected.
 - **Claude's pause rests on two facts not yet observed.** `defer` must be
   honoured under the SDK's argv (G-C6), and a resume must work without a
   prompt (G-C7). Until both are proved, a Claude wait under `prompt` that
