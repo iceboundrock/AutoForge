@@ -173,7 +173,10 @@ command that restores the recorded one. `--accept-config-change` makes the
 new values the run's, and the change is recorded in the run log. Every
 other key (a profile's `command`, `extra_args` and `options`, the loop
 bounds, the merge gate, the agent environment, `sandbox.mode`) may change
-between commands. See
+between commands. A run refuses, before any state is written, a
+configuration the record could not hold: a `provider`, `model` or `effort`
+over 512 characters, or an `update_epic` limit that is not a positive
+integer (`doctor` reports it). See
 [Running the remote workflow](usage.md#the-configuration-a-run-was-recorded-under).
 
 ### Overriding a profile

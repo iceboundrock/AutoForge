@@ -682,6 +682,16 @@ maximum-runtime limits the agent runs under (the profile's own, else the
 `execution` default). It also covers the resolved agent worktree root:
 `execution.worktree_dir`, or `<git common dir>/autoforge/worktrees`.
 
+The state file holds the record only within bounds it checks on every
+load: a provider, model or effort of at most 512 characters, limits that
+are positive integers, and paths of at most 4096 characters. A
+configuration outside them is refused, naming the key, before anything is
+written. `run` exits 2 before it creates the run, and `run --dry-run` and
+`doctor` already refuse a profile outside them, `update_epic` included
+(otherwise checked only when the run reaches it). `step`, `resume` and
+`unblock` likewise refuse to record such a configuration, or to accept it
+with `--accept-config-change`.
+
 Before any phase executes, `step`, `resume` and `unblock` (from `BLOCKED`)
 compare this command's configuration with the recorded one. On any
 difference the command exits 2. It has launched nothing and written nothing

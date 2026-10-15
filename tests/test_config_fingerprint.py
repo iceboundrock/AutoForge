@@ -31,6 +31,7 @@ from autoforge.config_fingerprint import (
     ConfigFingerprint,
     ProfileRouting,
     RecordedConfiguration,
+    fingerprint_routing,
 )
 from autoforge.engine import ControllerEngine
 from autoforge.errors import (
@@ -101,8 +102,9 @@ def test_limits_are_recorded_as_the_values_the_agent_runs_under():
 
 
 def test_a_profile_that_could_not_run_is_still_recorded():
-    """Recording refuses nothing: Claude's text output without a ceiling is a
-    configuration error at launch (``agent_limits``), not at record time."""
+    """Recording refuses only what its record could not hold (below): Claude's
+    text output without a ceiling is a configuration error at launch
+    (``agent_limits``), not at record time."""
     cfg = default_config()
     cfg.profiles["update_epic"] = ProfileConfig(
         name="update_epic", provider="claude", model="fable", options={"output_format": "text"}
@@ -246,6 +248,94 @@ def test_a_malformed_record_is_refused(record, needle):
     with pytest.raises(StateError) as exc:
         RecordedConfiguration.from_dict(record)
     assert needle in str(exc.value)
+
+
+# -- what can be recorded: what the record reads back (R1-F1) ---------------------
+
+# Values the configuration accepts and the record's parser does not: recorded
+# as they are, the run's state file would never load again. ``update_epic``
+# is no required profile, so ``validate_required_profiles`` checks nothing of
+# it before the run reaches it.
+UNRECORDABLE: dict[str, tuple[Callable[[AutoForgeConfig], None], str]] = {
+    "a model over the bound": (
+        lambda c: setattr(c.profiles["fix"], "model", "m" * 513),
+        "profiles.fix.model must be a string of at most 512 characters",
+    ),
+    "an effort over the bound": (
+        lambda c: setattr(c.profiles["review_round_1"], "effort", "e" * 513),
+        "profiles.review_round_1.effort must be a string of at most 512 characters",
+    ),
+    "an empty update_epic provider": (
+        lambda c: setattr(c.profiles["update_epic"], "provider", ""),
+        "profiles.update_epic.provider must be a non-empty string",
+    ),
+    "a zero update_epic idle limit": (
+        lambda c: setattr(c.profiles["update_epic"], "idle_timeout_seconds", 0),
+        "profiles.update_epic.idle_timeout_seconds must be a positive integer",
+    ),
+    "a negative update_epic ceiling": (
+        lambda c: setattr(c.profiles["update_epic"], "max_runtime_seconds", -1),
+        "profiles.update_epic.max_runtime_seconds must be a positive integer or null",
+    ),
+}
+
+
+def _unrecordable(case: str) -> AutoForgeConfig:
+    cfg = default_config()
+    UNRECORDABLE[case][0](cfg)
+    return cfg
+
+
+@pytest.mark.parametrize("case", sorted(UNRECORDABLE))
+def test_a_value_the_record_could_not_hold_is_refused_by_name(case):
+    cfg = _unrecordable(case)
+    for build in (lambda: _fingerprint(cfg), lambda: fingerprint_routing(cfg)):
+        with pytest.raises(ConfigurationError) as exc:
+            build()
+        message = str(exc.value)
+        assert message.startswith(UNRECORDABLE[case][1])
+        assert message.endswith(
+            ": a REMOTE run records it in its state file, which could not be loaded again "
+            "otherwise (#219)"
+        )
+        assert "m" * 513 not in message and "e" * 513 not in message  # the key, never the value
+
+
+def test_a_model_at_the_bound_is_recorded_and_reads_back():
+    cfg = default_config()
+    cfg.profiles["fix"].model = "m" * 512
+    record = RecordedConfiguration(
+        fingerprint=_fingerprint(cfg),
+        config_file="/home/me/autoforge.yaml",
+        source=SOURCE_CREATED,
+        recorded_at="2026-10-14T00:00:00+00:00",
+    )
+    parsed = RecordedConfiguration.from_dict(copy.deepcopy(record.persisted()))
+    assert parsed.fingerprint.profiles["fix"].model == "m" * 512
+    assert parsed == record
+
+
+def test_a_worktree_root_the_record_could_not_hold_is_refused():
+    with pytest.raises(ConfigurationError, match="must be a non-empty string of at most 4096"):
+        _fingerprint(root="/" + "w" * 4096)
+
+
+@pytest.mark.parametrize(
+    ("config_file", "needle"),
+    [
+        ("autoforge.yaml", "config_file must be an absolute path"),
+        ("/" + "c" * 4096, "config_file must be a string of at most 4096 characters"),
+    ],
+)
+def test_a_record_is_persisted_only_when_it_reads_back(config_file, needle):
+    record = RecordedConfiguration(
+        fingerprint=_fingerprint(),
+        config_file=config_file,
+        source=SOURCE_CREATED,
+        recorded_at="2026-10-14T00:00:00+00:00",
+    )
+    with pytest.raises(ConfigurationError, match=needle):
+        record.persisted()
 
 
 # -- the gate: an engine per invocation, on the same run ---------------------------
@@ -478,6 +568,73 @@ def test_a_run_without_a_recorded_configuration_is_not_checked_and_records_one(t
     assert recorded.fingerprint.profiles["fix"].model == "opus"
     with pytest.raises(ConfigurationDriftError):
         _invocation(eng, default_config()).check_run_configuration(("resume",))
+
+
+@pytest.mark.parametrize("case", sorted(UNRECORDABLE))
+def test_a_run_refuses_a_configuration_it_could_not_record_before_any_state(tmp_path, case):
+    """``run`` validates the configuration before it creates the run, and
+    recording it refuses too: no state file is written that could not load."""
+    eng = make_engine(tmp_path / ".autoforge", cfg=_unrecordable(case))
+    with pytest.raises(ConfigurationError, match=UNRECORDABLE[case][1]):
+        eng.validate_config()
+    with pytest.raises(ConfigurationError, match=UNRECORDABLE[case][1]):
+        eng.record_run_configuration()
+    assert eng.state.config_fingerprint == {}
+    assert not eng.paths.state_file.exists()
+
+
+def test_a_local_run_does_not_hold_its_routing_to_the_record(tmp_path):
+    """A LOCAL run records no configuration, so nothing about it is bounded here."""
+    repo = local_repo(tmp_path)
+    eng = make_local_engine(repo, write_feature(repo))
+    eng.config.profiles["fix"].model = "m" * 513
+    eng.validate_config()
+
+
+def test_a_model_at_the_bound_is_recorded_and_the_run_loads_again(tmp_path):
+    cfg = default_config()
+    cfg.profiles["fix"].model = "m" * 512
+    eng = _created(tmp_path, cfg)
+    saved = load_state(eng.paths.state_file)
+    assert saved.config_fingerprint["profiles"]["fix"]["model"] == "m" * 512
+    assert _invocation(eng, cfg).check_run_configuration(("resume",)) == ""
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_an_upgrade_refuses_a_configuration_it_could_not_record(tmp_path, dry_run):
+    """A run from before #219 is not checked, but the configuration its next
+    command would record must read back: refused, with nothing recorded."""
+    eng = make_engine(tmp_path / ".autoforge")
+    eng.save()
+    before = eng.paths.state_file.read_bytes()
+    later = _invocation(eng, _unrecordable("a model over the bound"))
+    with pytest.raises(ConfigurationError, match="profiles.fix.model must be a string"):
+        later.check_run_configuration(("resume",), dry_run=dry_run)
+    assert later.state.config_fingerprint == {}
+    assert eng.paths.state_file.read_bytes() == before
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_an_accepted_change_the_record_could_not_hold_is_refused_unlogged(tmp_path, dry_run):
+    eng = _created(tmp_path)
+    before = eng.paths.state_file.read_bytes()
+    later = _invocation(eng, _unrecordable("a model over the bound"))
+    with pytest.raises(ConfigurationError, match="profiles.fix.model must be a string"):
+        later.check_run_configuration(("resume",), accept_change=True, dry_run=dry_run)
+    assert eng.paths.state_file.read_bytes() == before
+    assert _events(later) == []
+
+
+def test_an_accepted_change_whose_config_path_could_not_be_recorded_logs_nothing(tmp_path):
+    eng = _created(tmp_path)
+    before = eng.paths.state_file.read_bytes()
+    cfg = default_config()
+    cfg.profiles["fix"].model = "opus"
+    later = _invocation(eng, cfg, config_file="/" + "c" * 4096)
+    with pytest.raises(ConfigurationError, match="config_file must be a string of at most 4096"):
+        later.check_run_configuration(("resume",), accept_change=True)
+    assert eng.paths.state_file.read_bytes() == before
+    assert _events(later) == []
 
 
 def test_a_local_run_records_and_checks_nothing(tmp_path):

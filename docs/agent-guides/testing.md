@@ -43,7 +43,12 @@ High-priority coverage includes:
   `--accept-config-change` logs the change before recording it; a dry run
   writes nothing; a protocol-8 file loads, resumes and records one; a
   protocol-8 or older file carrying the field, or a protocol-9 file missing
-  it, is refused; a LOCAL run carries none
+  it, is refused; a LOCAL run carries none; a configuration the record could
+  not hold (a model or effort over 512 characters, an `update_epic` provider
+  or limit out of bounds, a path over 4096 characters) is refused by `run`,
+  its dry run and `doctor` before any state is written, and by an upgrade or
+  an accepted change before anything is recorded or logged, while a model
+  at the bound is recorded and the run loads again
 
 ### Transitions
 

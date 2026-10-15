@@ -57,17 +57,33 @@ A state file written before this field existed has none: it loads, is not
 checked, and the first ``resume``, ``step`` or ``unblock`` records the
 configuration it runs on (source ``upgraded``), saved with that command's
 next save.
+
+What can be recorded
+--------------------
+
+What the record's parser (:meth:`RecordedConfiguration.from_dict`) reads
+back, and nothing else: it runs on every load of the state file, so a
+record it refuses would make the run unloadable. The configuration bounds
+less than the parser does (a model of any length; an ``update_epic``
+profile, which no command validates before the run reaches it, with an
+empty provider or a zero limit), so the parser is also run on what is
+about to be recorded, and a value it refuses is a :class:`ConfigurationError`
+before anything is written. ``run`` refuses a routing at config validation
+(:func:`fingerprint_routing`; its dry run and ``doctor`` too) and a path
+when it records the run (:meth:`RecordedConfiguration.persisted`), and
+``resume``, ``step`` and ``unblock`` refuse to record or accept either.
 """
 
 from __future__ import annotations
 
 import json
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .errors import StateError
+from .errors import ConfigurationError, StateError
 from .profiles import REQUIRED_PROFILES
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -131,6 +147,22 @@ def _keys(data: Any, keys: tuple[str, ...], where: str) -> dict:
     return data
 
 
+def _recordable(parse: Callable[[], object]) -> None:
+    """Refuse (ConfigurationError) what is about to be recorded unless ``parse`` reads it back.
+
+    ``parse`` is the record's own parser run on it, the one definition of
+    what a state file may hold here; its refusal names the key, never the
+    value.
+    """
+    try:
+        parse()
+    except StateError as exc:
+        raise ConfigurationError(
+            f"{exc}: a REMOTE run records it in its state file, which could not be loaded "
+            "again otherwise (#219)"
+        ) from None
+
+
 @dataclass(frozen=True)
 class ProfileRouting:
     """What one profile decides about the agent it launches."""
@@ -148,11 +180,13 @@ class ProfileRouting:
         Resolved here rather than through ``AutoForgeConfig.agent_limits``,
         which also refuses a provider that cannot report activity: recording
         is not the place to refuse a profile, and the configured values are
-        what an operator changes.
+        what an operator changes. The one refusal is a routing its record
+        could not be read back with (ConfigurationError, see "What can be
+        recorded" above).
         """
         idle = profile.idle_timeout_seconds
         ceiling = profile.max_runtime_seconds
-        return cls(
+        routing = cls(
             provider=profile.provider,
             model=profile.model,
             effort=profile.effort,
@@ -163,6 +197,8 @@ class ProfileRouting:
                 ceiling if ceiling is not None else cfg.execution.default_max_runtime_seconds
             ),
         )
+        _recordable(lambda: cls.from_dict(routing.to_dict(), f"profiles.{profile.name}"))
+        return routing
 
     def to_dict(self) -> dict:
         return {key: getattr(self, key) for key in _PROFILE_KEYS}
@@ -198,6 +234,19 @@ class ConfigChange:
         return {"key": self.key, "recorded": self.recorded, "current": self.current}
 
 
+def fingerprint_routing(cfg: AutoForgeConfig) -> dict[str, ProfileRouting | None]:
+    """The routing of every profile in :data:`FINGERPRINT_PROFILES`, ``None`` when not configured.
+
+    ConfigurationError when one could not be recorded. A REMOTE run's
+    ``validate_config`` calls it, so ``run`` refuses such a configuration
+    before the run is created, its dry run included.
+    """
+    return {
+        name: ProfileRouting.from_config(cfg, cfg.profiles[name]) if name in cfg.profiles else None
+        for name in FINGERPRINT_PROFILES
+    }
+
+
 def _shown(value: Any) -> str:
     """A recorded value as a refusal prints it (JSON, so "" and null are visible)."""
     return json.dumps(value)
@@ -216,15 +265,11 @@ class ConfigFingerprint:
 
     @classmethod
     def from_config(cls, cfg: AutoForgeConfig, worktree_root: str | Path) -> ConfigFingerprint:
-        profiles = {
-            name: (
-                ProfileRouting.from_config(cfg, cfg.profiles[name])
-                if name in cfg.profiles
-                else None
-            )
-            for name in FINGERPRINT_PROFILES
-        }
-        return cls(profiles=profiles, worktree_root=str(worktree_root))
+        """ConfigurationError when a routing or the root could not be recorded."""
+        root = str(worktree_root)
+        profiles = fingerprint_routing(cfg)
+        _recordable(lambda: _path(root, WORKTREE_ROOT_KEY))
+        return cls(profiles=profiles, worktree_root=root)
 
     def changes(self, current: ConfigFingerprint) -> list[ConfigChange]:
         """Each key ``current`` would change, in a stable order; empty when none."""
@@ -277,6 +322,13 @@ class RecordedConfiguration:
             "source": self.source,
             "recorded_at": self.recorded_at,
         }
+
+    def persisted(self) -> dict:
+        """:meth:`to_dict`, for the state file: ConfigurationError unless :meth:`from_dict`
+        reads it back, so no record that would make the run unloadable is written."""
+        data = self.to_dict()
+        _recordable(lambda: RecordedConfiguration.from_dict(data))
+        return data
 
     @classmethod
     def from_dict(cls, data: Any) -> RecordedConfiguration:

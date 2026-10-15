@@ -2511,3 +2511,35 @@ def test_unblock_refuses_another_configuration_and_records_an_accepted_one(
     assert phases.index("BLOCKED-config-change") < phases.index("BLOCKED-unblock")
     assert len(fakes["provider"].calls) == 1  # the run's launch; unblock launches nothing
     assert fakes["gh"].effect_writes == []
+
+
+def test_run_refuses_a_model_its_recorded_configuration_could_not_hold_before_any_state(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """R1-F1: the configuration bounds no model, the recorded configuration
+    of a run's state file does. `run` and its dry run refuse a model over the
+    bound before the run is created, so no state file is written that could
+    not be loaded again; at the bound the run records it, and loads again."""
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    run = ["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"]
+    over = _config(tmp_path / "over.json", profiles={"fix": {"model": "m" * 513}})
+    for dry in ([], ["--dry-run"]):
+        assert cli.main(["--config", over, *run, *dry]) == 2
+        err = capsys.readouterr().err
+        assert (
+            "autoforge: error: profiles.fix.model must be a string of at most 512 characters: "
+            "a REMOTE run records it in its state file"
+        ) in err
+        assert "m" * 513 not in err
+    assert _files(sd) == {}
+    assert fakes["provider"].calls == [] and fakes["gh"].effect_writes == []
+
+    at = _config(tmp_path / "at.json", profiles={"fix": {"model": "m" * 512}})
+    assert cli.main(["--config", at, *run]) == 0
+    recorded = load_state(os.path.join(sd, "state.json")).config_fingerprint
+    assert recorded["profiles"]["fix"]["model"] == "m" * 512
+    capsys.readouterr()
+    assert cli.main(["--config", at, "--state-dir", sd, "status"]) == 0
+    assert f"Config:     --config {at} (created " in capsys.readouterr().out
+    assert cli.main(["--config", at, "--state-dir", sd, "resume", "--dry-run"]) == 0

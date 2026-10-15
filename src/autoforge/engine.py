@@ -165,6 +165,7 @@ from .config_fingerprint import (
     ConfigChange,
     ConfigFingerprint,
     RecordedConfiguration,
+    fingerprint_routing,
 )
 from .effect_ops import (
     AcceptanceCommentOp,
@@ -1174,7 +1175,9 @@ class ControllerEngine:
         """Record this invocation's configuration as the run's, in memory.
 
         ``run`` calls it on the run it creates, before its first save. A
-        LOCAL run records none: its run contract defines it.
+        LOCAL run records none: its run contract defines it. A configuration
+        the record could not be read back with is refused
+        (ConfigurationError), and nothing is recorded.
         """
         state = self._require_state()
         if state.is_local:
@@ -1184,7 +1187,7 @@ class ControllerEngine:
             config_file=self.config_file,
             source=source,
             recorded_at=utcnow_iso(),
-        ).to_dict()
+        ).persisted()
 
     def check_run_configuration(
         self, words: Sequence[str], *, accept_change: bool = False, dry_run: bool = False
@@ -1208,12 +1211,17 @@ class ControllerEngine:
         A dry run records, logs and saves nothing; it refuses as the command
         would, or says what it would record or accept. Outside a git checkout
         it compares the routing only, and says so.
+
+        A configuration that could not be recorded (one its state file could
+        not be loaded again with) is refused with ConfigurationError, in a
+        dry run too, before anything is recorded or logged.
         """
         state = self._require_state()
         if state.is_local:
             return ""
         if not state.config_fingerprint:
             if dry_run:
+                fingerprint_routing(self.config)  # refused as the command would refuse it
                 return (
                     f"[dry-run] run {state.run_id} has no recorded configuration (its state "
                     "file predates #219), so it is not checked; without --dry-run this "
@@ -1247,6 +1255,14 @@ class ControllerEngine:
             refusal = self._config_drift_refusal(recorded, changes, words)
             raise ConfigurationDriftError(f"{refusal}\n{unresolved}" if unresolved else refusal)
         listed = "".join(f"\n  {change.line()}" for change in changes)
+        # Built first: a record that could not be read back is refused, in a
+        # dry run too, with nothing logged.
+        record = RecordedConfiguration(
+            fingerprint=current,
+            config_file=self.config_file,
+            source=SOURCE_ACCEPTED,
+            recorded_at=utcnow_iso(),
+        ).persisted()
         if dry_run:
             accepted = (
                 f"[dry-run] would accept the configuration change of run {state.run_id} and "
@@ -1257,12 +1273,7 @@ class ControllerEngine:
         # on its recorded configuration, and an accepted change is never on
         # disk without its record.
         self._log_config_change(words, recorded, changes)
-        state.config_fingerprint = RecordedConfiguration(
-            fingerprint=current,
-            config_file=self.config_file,
-            source=SOURCE_ACCEPTED,
-            recorded_at=utcnow_iso(),
-        ).to_dict()
+        state.config_fingerprint = record
         self.save()
         return (
             f"accepted the configuration change of run {state.run_id} "
@@ -2144,13 +2155,16 @@ class ControllerEngine:
         not require those profiles to be configured. Which reviewer profiles it
         does require follows from `local.max_fix_rounds`, because local review
         rounds are routed exactly like remote ones.
+
+        A REMOTE run also refuses a configuration whose routing its recorded
+        configuration could not hold (#219): the state file would not load
+        again (:func:`autoforge.config_fingerprint.fingerprint_routing`).
         """
-        required = (
-            local_required_profiles(self.config)
-            if self.mode == WorkflowMode.LOCAL
-            else REQUIRED_PROFILES
-        )
-        validate_required_profiles(self.config, required)
+        if self.mode == WorkflowMode.LOCAL:
+            validate_required_profiles(self.config, local_required_profiles(self.config))
+            return
+        validate_required_profiles(self.config, REQUIRED_PROFILES)
+        fingerprint_routing(self.config)
 
     # -- prompt context ---------------------------------------------------
     @staticmethod

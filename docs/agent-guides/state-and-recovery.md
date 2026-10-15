@@ -71,7 +71,11 @@ Expected state includes data such as:
   log (`<PHASE>-config-change`) before the state save. The record holds no
   `command`, `extra_args`, `options` or anything else that could carry a
   secret, and it is validated on load (`config_fingerprint.py`, an exact
-  key set per schema 1). It is `{}` for a LOCAL run, whose run contract
+  key set per schema 1). That parser also runs on every record before it
+  is written: a configuration it would refuse (a model over 512
+  characters, an `update_epic` limit of 0) is a configuration error at
+  `run`, `doctor`, an upgrade or an accepted change, so no state file is
+  written that could not load again. It is `{}` for a LOCAL run, whose run contract
   defines it ([The run contract](../local-mode.md#the-run-contract)), and
   for a run loaded from a protocol-8 file until its next command records it
 - timestamps
