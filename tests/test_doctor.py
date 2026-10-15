@@ -1463,3 +1463,30 @@ def test_doctors_pi_probes_get_the_launch_environment(tmp_path):
     for req in requests:
         assert tuple(sorted(req.env)) == override_names()
         assert req.env["GH_TOKEN"] == GH_PLACEHOLDER_TOKEN
+
+
+def test_candidate_validation_is_listed_redacted_and_never_run(tmp_path):
+    """#172: doctor names validation.commands and the mode its records are
+    made under, without launching any of them."""
+    d = Doctor(cwd=str(tmp_path), runner=_runner_factory())
+    check = {r.name: r for r in d.run_all()}["candidate validation (validation.commands)"]
+    assert check.ok and not check.required
+    assert "(none configured: an empty set)" in check.detail
+    assert "unsandboxed as the operator's UID" in check.detail
+
+    secret = "gh" + "p_" + "s3cretvalue123456"
+    cfg = tmp_path / "c.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "validation": {"commands": [["false"], ["make", "check", f"TOKEN={secret}"]]},
+            }
+        )
+    )
+    calls: list = []
+    d = Doctor(config_path=str(cfg), cwd=str(tmp_path), runner=_runner_factory(calls=calls))
+    check = {r.name: r for r in d.run_all()}["candidate validation (validation.commands)"]
+    assert check.detail.startswith("2 definition(s): false; make check TOKEN=")
+    assert secret not in check.detail
+    assert not any(argv[:1] in (["false"], ["make"]) for argv in calls)

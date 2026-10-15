@@ -218,6 +218,27 @@ merge:
   #  - ["uv", "run", "ruff", "check", "src", "tests"]
   #  - ["uv", "run", "mypy", "src"]
 
+# Candidate validation (#172, ADR 0006): commands the CONTROLLER runs against
+# one exact REMOTE candidate, a commit already in the shared object store and
+# the tree it names. Each command, in order, runs in a fresh byte-exact export
+# of that tree (no `.git`, no worktree, nothing fetched), under the
+# allow-listed environment, `execution.command_timeout_seconds` and, with
+# `sandbox.mode: required`, the outer sandbox; the set stops at the first
+# command that does not exit 0. Each run leaves a ValidationRecord in the
+# state file. No REMOTE phase runs these yet (#173); `doctor` and the dry run
+# list them and run none of them. Separate from `merge.verification_commands`.
+validation:
+  # The only scope there is: what is validated is the candidate's own tree.
+  scope: candidate-tree
+  # At most 16 argv ARRAYS, each at most 32 non-blank elements of at most
+  # 1,024 characters and 4,096 in all. Argv is stored and shown redacted but
+  # digested as written: never put a secret in it (pass one through
+  # `execution.env_allowlist_extra`). Changing a command, the timeout, the
+  # allow-list or `sandbox.mode` makes earlier records not apply.
+  commands: []
+  #  - ["uv", "run", "--frozen", "pytest", "-q"]
+  #  - ["make", "lint"]
+
 workflow:
   # Loop bounds enforced by the controller (never by a prompt). Each one ends
   # the run in BLOCKED with the reason in `block_reason` / `status`, unless an
@@ -399,8 +420,8 @@ sandbox:
   #   disabled -- (the default) launches run as your UID with logical
   #               isolation only;
   #   required -- every agent launch (Pi's auth preflight included), every
-  #               `local.validation_commands` entry and every
-  #               `merge.verification_commands` entry runs inside the sandbox
+  #               `local.validation_commands` and `validation.commands` entry
+  #               and every `merge.verification_commands` entry runs inside the sandbox
   #               or is refused before it runs; never without it. Linux only:
   #               `bwrap` on PATH, unprivileged user namespaces, Landlock ABI 6.
   #               No pre-launch check exists yet, so a host that cannot
@@ -413,7 +434,7 @@ sandbox:
   # Whatever the mode, the controller reads an issue worktree's HEAD through
   # the git common dir and imports the agent's objects strictly.
   mode: disabled
-  # `isolated`: LOCAL validation commands / pre-merge verification commands
+  # `isolated`: validation commands (LOCAL and REMOTE) / pre-merge verification commands
   # run in a network namespace of their own (no host loopback service, no
   # download). Agents always share the host network. Read only under
   # `required`.
@@ -463,7 +484,9 @@ local:
   # means the phase is not
   # verified and the run stops with the phase unchanged for `resume`.
   # `--dry-run` lists them and runs none of them. Nothing is auto-detected;
-  # if this list is empty, the controller runs no checks of its own.
+  # if this list is empty, the controller runs no checks of its own. Each
+  # command that runs leaves a ValidationRecord in the state file (#172), and
+  # the same bounds as `validation.commands` apply.
   validation_commands: []
     # - ["uv", "run", "pytest", "-q"]
     # - ["./gradlew", "test"]

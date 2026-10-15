@@ -129,6 +129,8 @@ effect operations, git transport      test_effects.py, test_git_transport.py
 state, contract, filesystem boundary  test_state.py, test_durable_run_contract.py, test_safefs.py
 REMOTE run's recorded configuration   test_config_fingerprint.py (CLI: test_cli.py; load and
                                       protocol: test_state.py)
+candidate validation evidence         test_evidence.py (pure), test_validation_evidence.py
+                                      (engine, REMOTE and LOCAL; load and protocol: test_state.py)
 CONTROL_RESULT, prompts, providers    test_result_parser.py, test_prompts.py, test_providers.py
 Pi RPC reducer and adapter (fake pi)  test_pi_rpc.py
 Claude stream-json reducer            test_claude_stream.py (adapter on the fake: test_providers.py)

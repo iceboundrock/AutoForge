@@ -47,6 +47,7 @@ from .errors import (
     StateError,
     StateTransitionError,
 )
+from .evidence import LocalCandidate, Outcome, RemoteCandidate, parse_marker, record_summary
 from .local_workspace import init_feature_file
 from .redaction import redact, redact_argv, redact_dict
 from .replan_txn import ReplanTransaction
@@ -854,11 +855,92 @@ def cmd_status(args) -> int:
         }
         print(json.dumps(redact_dict(document), indent=2, sort_keys=True))
         return 0
+    evidence = _render_validation_evidence(state, engine.config)
     if state.mode == WorkflowMode.LOCAL:
-        print(redact(_render_local_status(state, txn)))
+        print(redact(_render_local_status(state, txn, evidence)))
         return 0
-    print(redact(_render_status(state, txn, _render_acceptance_actions(state, engine))))
+    print(redact(_render_status(state, txn, _render_acceptance_actions(state, engine), evidence)))
     return 0
+
+
+# How many records of the current candidate ``status`` lists, newest last.
+_STATUS_RECORDS = 16
+_STATUS_TAIL_CHARS = 200
+
+
+def _render_validation_evidence(state: AutoForgeState, config: AutoForgeConfig) -> list[str]:
+    """Candidate validation evidence for ``status`` (ADR 0006 D8.6; the caller redacts).
+
+    The evidence policy (the configured set's size and the mode records are
+    made under, and under ``disabled`` that validators run unsandboxed), a
+    pending attempt marker, the override watermark, whether a binding or a
+    certificate is held, and the records of the current candidate: the
+    REMOTE current HEAD's or the LOCAL bound workspace's, else the newest
+    record's. Read-only: a marker is reported, never converted.
+    """
+    local = state.mode == WorkflowMode.LOCAL
+    if local:
+        key = "local.validation_commands (the run contract)"
+        count = len(state.local_contract().validation_commands)
+    else:
+        key = "validation.commands"
+        count = len(config.validation.commands)
+    mode = config.sandbox.mode
+    policy = f"{count} definition(s) in {key}; records are made under sandbox.mode {mode}"
+    if not config.sandbox.required:
+        policy += (
+            ", so validators run unsandboxed as the operator's UID and their records say "
+            "enforced: false"
+        )
+    lines = ["", "Validation evidence:", f"  Policy:  {policy}"]
+    records = state.validation_evidence()
+    if state.validation_attempt:
+        marker = parse_marker(state.validation_attempt)
+        lines.append(
+            f"  Pending attempt: definition [{marker.index}] {' '.join(marker.argv)!r} for "
+            f"{marker.candidate.describe()}, marked {state.validation_attempt['marked_at']} "
+            "(the next step or resume records it INTERRUPTED and runs it again)"
+        )
+    if state.validation_override_seq is not None:
+        lines.append(f"  Override watermark: seq {state.validation_override_seq}")
+    if state.review_evidence:
+        lines.append(
+            f"  REVIEW evidence: round {state.review_evidence['review_round']}, "
+            f"{len(state.review_evidence['records'])} record(s)"
+        )
+    if state.review_certificate:
+        lines.append(
+            f"  Review certificate: round {state.review_certificate['review_round']}, issued "
+            f"{state.review_certificate['issued_at']}"
+        )
+    if not records:
+        lines.append("  Records: none")
+        return lines
+    current = records[-1].candidate
+    for view in reversed(records):
+        candidate = view.candidate
+        if (
+            isinstance(candidate, RemoteCandidate) and candidate.commit == state.current_head_sha
+        ) or (
+            isinstance(candidate, LocalCandidate)
+            and candidate.fingerprint == state.workspace_fingerprint
+        ):
+            current = candidate
+            break
+    mine = [r for r in records if r.candidate.identity == current.identity]
+    shown = mine[-_STATUS_RECORDS:]
+    lines.append(
+        f"  Records for {current.describe()}: {len(mine)} of {len(records)} retained"
+        + (f" (the newest {len(shown)} shown)" if len(shown) < len(mine) else "")
+    )
+    for view in shown:
+        lines.append(f"    {record_summary(view)}")
+        if view.outcome in (Outcome.FAIL, Outcome.TIMEOUT):
+            output = view.raw["output"]
+            tail = " ".join((output["stderr_tail"] or output["stdout_tail"]).split())
+            if tail:
+                lines.append(f"      output tail: {tail[-_STATUS_TAIL_CHARS:]}")
+    return lines
 
 
 def _acceptance_records(state: AutoForgeState) -> list[EffectRecord]:
@@ -1066,7 +1148,10 @@ def _render_replan_journal(txn: ReplanTransaction | None) -> list[str]:
 
 
 def _render_status(
-    state: AutoForgeState, txn: ReplanTransaction | None, acceptance: list[str] | None = None
+    state: AutoForgeState,
+    txn: ReplanTransaction | None,
+    acceptance: list[str] | None = None,
+    evidence: list[str] | None = None,
 ) -> str:
     """Human status for a GitHub run (unredacted; the caller redacts)."""
 
@@ -1115,6 +1200,7 @@ def _render_status(
             f"Unblocked:  {len(state.unblock_history)} time(s); last at {last.get('at', '-')} "
             f"-> {last.get('phase', '-')}{action}: {last.get('reason', '-')}"
         )
+    lines += evidence or []
     lines += [
         "",
         f"Steps executed: {state.step_count}",
@@ -1134,7 +1220,9 @@ def _recorded_configuration(state: AutoForgeState) -> str:
     return f"{recorded.origin()} ({recorded.source} {recorded.recorded_at})"
 
 
-def _render_local_status(state: AutoForgeState, txn: ReplanTransaction | None) -> str:
+def _render_local_status(
+    state: AutoForgeState, txn: ReplanTransaction | None, evidence: list[str] | None = None
+) -> str:
     """Human status for a LOCAL run (unredacted; the caller redacts).
 
     Deliberately omits Issue/PR/branch/merge fields: a local run has none, and
@@ -1177,6 +1265,7 @@ def _render_local_status(state: AutoForgeState, txn: ReplanTransaction | None) -
     lines += _render_replan_journal(txn)
     if state.block_reason:
         lines.append(f"Reason:     {state.block_reason}")
+    lines += evidence or []
     lines += [
         "",
         f"Steps executed: {state.step_count}",

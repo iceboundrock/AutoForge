@@ -78,6 +78,10 @@ Expected state includes data such as:
   written that could not load again. It is `{}` for a LOCAL run, whose run contract
   defines it ([The run contract](../local-mode.md#the-run-contract)), and
   for a run loaded from a protocol-8 file until its next command records it
+- candidate validation evidence (#172, [below](#validation-evidence)):
+  `validation_records`, `validation_attempt`, `review_evidence`,
+  `review_certificate`, `producer_validation_failure` and
+  `validation_override_seq`
 - timestamps
 
 Besides these, the state records the review loop: `review_round`,
@@ -241,6 +245,80 @@ the append checks. A stored value the result path would have refused is a
 state carrying any of them is refused as corrupt: a LOCAL run performs no
 external effect.
 
+### Validation evidence
+
+Candidate validation (#172, ADR 0006; `src/autoforge/evidence.py`) adds
+six fields, in REMOTE and LOCAL state alike:
+
+- `validation_records`: one `ValidationRecord` per validator the
+  controller launched, oldest first, each with a `seq` that increases
+  strictly and is never reused. A record holds the candidate (REMOTE:
+  `kind: remote`, repository, object format, commit and the tree read
+  from the commit's authenticated bytes, plus a provenance that is
+  displayed and never compared; LOCAL: `kind: local`, the workspace
+  fingerprint, the workspace-policy digest and the run id), the
+  definition (its index, its argv redacted, its `definition_digest` over
+  the argv as configured, its scope), policy P (`policy_digest`, mode,
+  timeout), the outcome and the `run_log` step directory. An observed
+  record (`PASS`, `FAIL`, `TIMEOUT`) adds the enforcement facts the
+  executor returned (`enforced`, backend, version, network, teardown;
+  `enforced: false` under `sandbox.mode: disabled`), the exit code (`null`
+  for a timeout), the start and finish times, ADR 0002's leftovers and the
+  output: a tail of each stream of at most 2,000 characters, redacted
+  over the whole capture before it is cut (a secret straddling the cut is
+  not half-kept), every control character but newline and tab escaped
+  (`\x1b`, `\u2028`), cut on whole escapes, with the stream's byte count
+  and whether the capture or the cut dropped anything. A LOCAL record adds
+  `start_fingerprint` (its candidate's) and `end_fingerprint` (the walk
+  after the command; the next command's start). An `INTERRUPTED` record
+  is built from a marker alone: the marker's fields and `recovered_at`,
+  no enforcement, exit code or output. It claims no launch and is never
+  evidence. A launch, setup or materialization failure leaves no record.
+- `validation_attempt`: the attempt marker, saved immediately before a
+  launch (after the preflight, the sandbox gate and the materialization,
+  so a refusal by one of them writes none), and cleared in the same save
+  that appends the launch's record, or in the save after a launch
+  failure. `{}` when none is pending.
+- `review_evidence`, `review_certificate`, `producer_validation_failure`
+  and `validation_override_seq`: the review binding, the review
+  certificate, the producer failure counter and the operator's override
+  watermark. #173 writes them; #172 validates them on load and keeps the
+  records they name.
+
+**Bounds** (D10.3, `evidence.py`'s constants, part of the protocol): at
+most 64 records; at most 16 definitions per set and so 16 records per
+binding or certificate; an argv of at most 32 elements, stored redacted at
+most 3,072 characters an element and 12,288 in all (the configured 1,024
+and 4,096 times redaction's growth factor); a seq at most 2^31-1; a byte
+count at most 2^53-1; an exit code in [-128, 255]; timestamps ISO 8601 UTC
+of at most 32 characters; repositories, refs, run logs, backends and
+teardown text each bounded. A writer builds every value through
+`evidence.py` and checks it with the loader's parser before it is saved,
+so no value is written that would not load.
+
+**Integrity** (D11.1), checked on every load with the rest of the state:
+each record's exact key set for its outcome and kind, every field against
+its bound and format, and its `digest` (SHA-256 over the canonical JSON of
+every other field), so a record edited by hand fails the load. A record
+of the other mode's kind, another repository, another run, or a run log
+outside this run's directory is refused, as are a mixed candidate and a
+seq out of order. The binding and the certificate name records by
+`(seq, digest)`: each must be retained, under that digest, not
+`INTERRUPTED`, for the same candidate identity and policy, and at its
+definition's index; a certificate's records must be `PASS`, its set digest
+theirs, its comment canonical, on the reviewed PR and keyed by the
+certificate's own round, head, base and merge base, and its own digest
+must match. The counter names a retained `FAIL` or `TIMEOUT` of its
+commit. The watermark lies in `[0, highest seq]`; LOCAL has none. Anything
+else is a `StateError`: never clipped, defaulted or repaired.
+
+**Retention** (D11.4): a record past the 64th evicts the oldest one no
+binding, certificate or counter names; a named record is never evicted.
+
+**Read-only load** (D11.3): loading reports a pending marker
+(`status` shows it as "Pending attempt", the dry-run plan as a note) and
+converts nothing, so `status` and `--dry-run` leave the file byte-identical.
+
 State keeps compact finding summaries and review comment URLs, rather than
 copying unbounded PR discussion bodies. Those summaries are bounded
 (`loop_guard.MAX_PERSISTED_FINDINGS_PER_ROUND`, 100 findings per round,
@@ -299,6 +377,8 @@ Protocol 7 → 8 (#211) added the acceptance-action state: `acceptance_outcomes`
 
 Protocol 8 → 9 (#219) added the recorded configuration of a REMOTE run (`config_fingerprint`). Every protocol-9 save writes it, `{}` included, so a protocol-9 file missing it is refused: read as absent, it would turn the check off for the rest of the run. A protocol-8 file loads in every phase with none and is relabelled on its next save. Its acceptance state is kept as written: the protocol 7 → 8 migration above does not apply to it. The first `step`, `resume` or `unblock` records the configuration that command runs on as `upgraded` and saves it with that command's next save, and later commands are checked against it. A protocol-8 (or older) file that carries the field, `{}` included, is a hand edit or a foreign file and is refused, unchanged. The record has its own `schema` (1). Another schema is refused, never migrated, so a change to what is fingerprinted bumps both. The number is the implementation's; it is settled on #23 and #158 before the change merges.
 
+Protocol 9 → 10 (#172) added the [validation evidence](#validation-evidence) above: `validation_records`, `validation_attempt`, `review_evidence`, `review_certificate`, `producer_validation_failure` and `validation_override_seq`. Every protocol-10 save writes all six, so a protocol-10 file missing one is refused: an absent marker read as "none" would hide the crash the resume path must record. A protocol-9 file, and every older file its own rules load, loads in every phase with all six at their empty values (no record, no marker, no binding, no certificate, no counter, `null` watermark), fabricating nothing, and is relabelled on its next save. A protocol-9 (or older) file that carries any of the six, even empty, is a hand edit or a foreign file and is refused, unchanged. The records have their own `schema` (1). The number is the implementation's; it is settled on #23 and #158 before the change merges.
+
 Protocol 5 → 7 (#160) added the effect state above (`effect_records`, `entry_observation`, `completion_context`, `launch_label`). Protocol 6 is skipped: #23 reserves it for #126, and the number this bump takes must be settled on #23 before it merges. State persisted under protocol 5, or under any older protocol that its own rules load, carries no effect state and loads as none; a legacy file that does carry one of these fields is a hand edit or a foreign file and is refused. A legacy REMOTE file with `attempt >= 1` gets the launch label `agent_publishes` for a phase whose agent published under the previous contract, so that the first entry of this version knows an agent may already have published (D13.3). `UPDATE_EPIC` is the one such phase whose publication this version performs itself: its one-shot legacy re-entry adopts the progress comment that agent posted, with no record, and asks for the selection only (D13.7; [github-safety.md](github-safety.md), "Before UPDATE_EPIC"). LOCAL state, whatever its protocol, carries no effect state.
 
 ---
@@ -317,6 +397,8 @@ Examples:
 Resume logic must inspect actual Git/GitHub state before repeating destructive or duplicative actions.
 
 A controller effect (ADR 0004) is resumed from its record and never re-sent blind. Every crash window has one answer: a crash before the intent is saved means nothing happened and the step re-runs; an `intended` or `attempted` record is reconciled by its identity before anything is sent, so a write that landed before the save is adopted as `observed` (no second write) and one that did not is issued again within the attempt bound; an object that a human created or changed between the intent and the write, a conflicting identity, or two marker-bearing objects make the record `conflict` (`BLOCKED`, naming the object); an exhausted bound is `BLOCKED` naming the record and the manual step; and a transient GitHub failure during reconciliation leaves the state unchanged for `resume`. A phase whose effect landed finishes from its completion context without relaunching its agent. `FIX` (#163) is the case with the most windows, and each has one outcome: a crash before the plan is saved sent nothing, so `resume` launches the fixer again, against the entry observation saved before the first launch (a follow-up issue found later that it does not explain blocks); a crash after the plan is saved, at any stage of any create, append or push, completes the plan from the journal without relaunching the fixer, each record adopted or issued at most once in plan order; a PR head at the planned candidate is the controller's own push and never takes a `REVIEW` detour; and a head that is neither the reviewed HEAD nor the candidate is someone else's push (`FIX -> REVIEW`, the plan dropped, no fix recorded). An acceptance comment (#211) adds its own: a crash after the plan save, before the `BLOCKED` save, re-reads the issue at `resume` and blocks again with nothing sent and no launch; an approval saved by `unblock` is published by the next `resume` (`attempted` saved first); a comment that landed before its `observed` save is adopted, never posted twice, as is the exact payload an operator posted; a marked comment with other bytes, or two, is a `conflict`; a comment without the marker is not evidence and the action keeps waiting; a second approval, or one with a stale or mismatched id, is refused with the state byte-identical; a push to the PR while it waits refuses an approval or a decline as stale, and a plain `unblock` routes the drift to `REVIEW`, recording the action `stale`; a closed issue, or one outside the run's repository, holds the comment and the adoption of an exact one, landed or posted, with nothing later in the plan sent (PR #221 R1-F2), also when the issue stops qualifying between the comment's write and its read-back: that step blocks with the eligibility reason, the record stays `attempted` and the reason says the comment was sent (PR #221 R2-F1); and a K9 already `observed` is never sent again while the rest of the plan completes. `REPLAN_REEXECUTE` (#164) has the same split: a crash before its push and PR plan is saved sent nothing, so `resume` launches the replan agent again on the base the entry observation recorded (a replacement branch, or a PR carrying the transaction's marker, found later is not the controller's and rejects the transaction); a crash after it, before the push, between the push and the PR or after the PR was created, completes the plan without relaunching the agent, and the PR is created only while the derived branch still holds the pushed candidate. The journal never stands in for GitHub on replay: before the completion sends anything it re-reads the PR's base and merge base (moved: the same `REVIEW` route, findings carried), its head repository and branch (no longer the plan's target: `BLOCKED`), and the open issues against every resolution, including follow-ups already journaled as `observed` (closed, unmarked, duplicated, or a marker the controller did not write: `BLOCKED`). The run log's `events.jsonl` is never read by any recovery path.
+
+A validator (#172, ADR 0006 D10.7, §2.16) has its own windows. A crash before the attempt marker is saved recorded nothing, and the caller runs the definition again. A crash with the marker saved, the validator running or already exited, leaves the marker: the next `step` or `resume`, under the lock and before anything else of the step, appends an `INTERRUPTED` record built from the marker alone and clears the marker in the same save, and the definition runs again when its phase does. An exit 0 the controller did not record is therefore never a `PASS`. The record and the marker clear are one save, so a crash between them is impossible; a marker whose record exists (only a hand edit makes one) is cleared and nothing is appended, which also makes a duplicate resume idempotent. More than two `INTERRUPTED` records for one candidate, definition and policy (those at or below the operator's override watermark not counted) enters `BLOCKED` in the save that writes the third, naming the candidate and the definition. A launch or setup failure clears the marker in the next save and writes no record.
 
 If recovery cannot determine the safe state with sufficient confidence, enter `BLOCKED` rather than guessing.
 

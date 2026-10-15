@@ -242,6 +242,10 @@ class ExecutionResult:
     # Index into ``stdout`` where the contiguous-to-EOF tail begins (0 when
     # nothing was omitted, so ``stdout_tail`` is then the whole stream).
     stdout_tail_offset: int = 0
+    # How many bytes the child wrote on each stream, the omitted ones
+    # included: the capture keeps at most ``max_output_bytes`` of them.
+    stdout_bytes: int = 0
+    stderr_bytes: int = 0
     # The child exited on its own but left processes behind (its pipes were
     # still open or its group still had a member past the exit grace), so
     # the group was killed; ``exit_code`` and the streams are the child's own.
@@ -399,6 +403,8 @@ class _Captured:
     text: str
     truncated: bool
     tail_offset: int
+    # Every byte the stream carried, kept or not.
+    total: int = 0
 
 
 class _BoundedBuffer:
@@ -470,7 +476,9 @@ class _BoundedBuffer:
             # Nothing was dropped, so the split between head and tail is an
             # internal detail: decode the stream whole, or a multi-byte
             # character that straddles it would come out as replacements.
-            return _Captured((self._head + tail).decode("utf-8", errors="replace"), False, 0)
+            return _Captured(
+                (self._head + tail).decode("utf-8", errors="replace"), False, 0, self._total
+            )
         # Past the bound the head and the tail are separate pieces of the
         # stream; a character cut by the bound decodes to replacements on
         # either side of the marker, which is what was captured.
@@ -481,7 +489,9 @@ class _BoundedBuffer:
             f"{self._limit} bytes, the first {len(self._head)} and last {len(tail)} "
             "bytes were kept]\n"
         )
-        return _Captured(head_text + marker + tail_text, True, len(head_text) + len(marker))
+        return _Captured(
+            head_text + marker + tail_text, True, len(head_text) + len(marker), self._total
+        )
 
 
 class _Limits:
@@ -1542,6 +1552,8 @@ def _execute(
         stdout_truncated=out.truncated,
         stderr_truncated=err.truncated,
         stdout_tail_offset=out.tail_offset,
+        stdout_bytes=out.total,
+        stderr_bytes=err.total,
         descendants_killed=descendants_killed,
         group_survived_kill=left.group_survived,
         capture_abandoned=left.capture_abandoned,

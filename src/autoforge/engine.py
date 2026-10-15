@@ -212,6 +212,7 @@ from .effects import (
 )
 from .errors import (
     AutoForgeError,
+    CandidateNotMaterializableError,
     CheckoutDriftError,
     ClaimConflictError,
     ConfigurationDriftError,
@@ -225,11 +226,35 @@ from .errors import (
     GitHubUnavailableError,
     GitTransportError,
     LockError,
+    MaterializationError,
     SandboxLaunchRefusedError,
     SandboxTamperError,
     StateError,
     StateTransitionError,
+    ValidationInconclusiveError,
+    ValidationInterruptedError,
     VerificationError,
+)
+from .evidence import (
+    METHOD_IN_PLACE,
+    NO_SANDBOX_TEMPLATE,
+    Definition,
+    LocalCandidate,
+    Policy,
+    Provenance,
+    RemoteCandidate,
+    ValidationRun,
+    appended,
+    attempt_marker,
+    definition_problem,
+    definitions,
+    next_seq,
+    observed_record,
+    parse_candidate,
+    parse_marker,
+    pinned_seqs,
+    recover_attempt,
+    validation_set_digest,
 )
 from .executor import (
     DEFAULT_MAX_OUTPUT_BYTES,
@@ -237,6 +262,7 @@ from .executor import (
     LIMIT_MAX_RUNTIME,
     MAX_DEADLINE_SECONDS,
     ExecutionRequest,
+    ExecutionResult,
     execute,
     select_environment,
 )
@@ -278,6 +304,8 @@ from .loop_guard import (
     step_budget_reason,
     truncated_evidence_rounds,
 )
+from .materialize import METHOD as MATERIALIZATION_METHOD
+from .materialize import materialize, read_object_format
 from .premerge import (
     commit_is_local,
     describe_definition_difference,
@@ -390,6 +418,8 @@ from .sandbox_policy import (
     LaunchFacts,
     SandboxPlan,
     describe_launch,
+    launch_template,
+    template_facts,
 )
 from .state import (
     MAX_DECLINES_PER_ROUND,
@@ -472,6 +502,18 @@ ACCEPTANCE_ACTIONS_UNAVAILABLE = (
 # Without it, a phase that can never be verified would be re-invoked by every
 # ``resume`` forever.
 MAX_LOCAL_PHASE_ATTEMPTS = 3
+
+# Launches of one REMOTE validation definition after a launch or setup
+# failure the executor or the sandbox backend reported, or #165's preflight
+# refusing it (ADR 0006 D10.5): the bounded in-process re-check. A
+# materialization failure gets one fresh materialization of its own.
+MAX_VALIDATION_LAUNCH_ATTEMPTS = 2
+MAX_VALIDATION_MATERIALIZATIONS = 2
+# Where a REMOTE candidate's export is written for validation (ADR 0006 D6.2):
+# a fresh private directory per definition launch, beside the pre-merge one.
+VALIDATION_EXPORT_PREFIX = "autoforge-validate-"
+LOCAL_VALIDATION_PROFILE = "(controller validation command)"
+REMOTE_VALIDATION_PROFILE = "(controller candidate validation command)"
 
 # Relaunches of one step after a failure its adapter recognised as transient
 # (``AgentExecutionResult.transient_failure``, #164). Counted apart from the
@@ -914,6 +956,43 @@ def _refusal_facts(exc: BaseException) -> dict[str, object]:
     """What a refused sandboxed launch recorded, for the run log; {} for none."""
     facts = getattr(exc, "facts", None)
     return facts.record() if isinstance(facts, SandboxFacts) else {}
+
+
+def _validation_failure(
+    definition: Definition, req: ExecutionRequest, result: ExecutionResult, phase: Phase
+) -> VerificationError | None:
+    """The error a LOCAL validation command that did not pass raises, or ``None``.
+
+    Both the command line and its output can carry a secret into
+    `state.verification_failures` (plain `state.json`) through the raised
+    message, so both are redacted here and not only on the run-log path.
+    Baseline protection: `redaction` claims no completeness.
+    """
+    shown = definition.shown
+    if result.timed_out:
+        return VerificationError(
+            _with_leftovers(
+                f"validation command {shown!r} timed out after {req.timeout_seconds}s",
+                result.leftovers,
+            )
+            + f"; {phase.value} is not verified."
+        )
+    if result.exit_code != 0:
+        tail = redact((result.stderr or result.stdout or "").strip())[-2000:]
+        return VerificationError(
+            _with_leftovers(
+                f"validation command {shown!r} failed with exit {result.exit_code}",
+                result.leftovers,
+            )
+            + f"; {phase.value} is not verified and the run stays in "
+            f"{phase.value}. Output tail: {tail}"
+        )
+    return None
+
+
+class _ValidatorNotLaunched(Exception):
+    """A REMOTE validator's launch or setup failed, or the preflight refused it
+    (ADR 0006 D10.5): no record, and the caller re-checks within its bound."""
 
 
 class ControllerEngine:
@@ -2835,6 +2914,14 @@ class ControllerEngine:
             raise StateTransitionError(f"phase {s.phase.value} is terminal — nothing to execute")
         if s.mode == WorkflowMode.LOCAL:
             return self._plan_local_step(s)
+        plan = self._plan_remote_step(s)
+        # In every phase: each REMOTE step converts a pending marker first.
+        plan.notes.extend(
+            self._validation_plan_notes(LaunchClass.EXPORT_COMMAND, self.config.validation.commands)
+        )
+        return plan
+
+    def _plan_remote_step(self, s: AutoForgeState) -> StepPlan:
         if s.phase == Phase.INITIALIZING:
             return self._deterministic_plan(
                 s,
@@ -3037,6 +3124,8 @@ class ControllerEngine:
             "validation commands that would run after this phase: "
             + ("; ".join(" ".join(argv) for argv in cmds) if cmds else "(none configured)")
         )
+        if s.phase in LOCAL_WRITE_PHASES:
+            notes.extend(self._validation_plan_notes(LaunchClass.LOCAL_VALIDATION, cmds))
         notes.append(
             "the agent and the validation commands run from the run's repository root "
             f"{contract.repository_root} (frozen; never the invocation's cwd)"
@@ -3316,6 +3405,11 @@ class ControllerEngine:
                 plan=plan,
                 message=f"[dry-run] would execute {previous.value} via profile {plan.profile_name}",
             )
+        # Under the lock, before anything else of the step (ADR 0006 D11.3):
+        # a validation marker a crash left becomes its INTERRUPTED record.
+        recovered = self._recover_validation_attempt(previous, plan)
+        if recovered is not None:
+            return recovered
 
         if state.mode == WorkflowMode.LOCAL:
             # A LOCAL run's step budget is part of its contract, so it is
@@ -3484,6 +3578,13 @@ class ControllerEngine:
             return self._initialize_local(plan)
         if previous not in (Phase.ANALYZE_EXECUTE, Phase.REVIEW, Phase.FIX):
             raise StateTransitionError(f"phase {previous.value} is not part of the LOCAL workflow")
+        if previous in LOCAL_WRITE_PHASES:
+            # A contract persisted before the bounds existed (ADR 0006 D10.3)
+            # is refused before the agent and before any marker: a record
+            # never truncates an argv, and re-checking cannot change it.
+            problem = definition_problem(contract.validation_commands)
+            if problem:
+                return self._block(previous, plan, self._local_definition_block_reason(problem))
         if previous == Phase.REVIEW:
             cap = contract.max_review_rounds
             if state.review_round >= cap:
@@ -3780,6 +3881,18 @@ class ControllerEngine:
             ),
         )
 
+    def _local_definition_block_reason(self, problem: str) -> str:
+        state = self._require_state()
+        return (
+            "this run's contract holds local.validation_commands beyond the bounds a "
+            f"validation record can hold: {problem} (at most 16 definitions, each at most 32 "
+            "non-blank argv elements of at most 1,024 characters and 4,096 in all). The "
+            "contract was written by an older controller and cannot change within the run, so "
+            "no agent or validation command was launched and nothing was recorded. The run "
+            f"stays on feature {state.feature_spec_path}; start a new run with commands within "
+            "the bounds"
+        )
+
     def _local_block_reason(self, reason: str) -> str:
         state = self._require_state()
         return (
@@ -3869,11 +3982,10 @@ class ControllerEngine:
         controller's verification left it, and REVIEW refuses any other. When
         no command is configured nothing controller-side touched the tree
         and ``after`` is that fingerprint already; a second walk would only
-        re-derive it.
+        re-derive it. With commands, it is the walk after the last one.
         """
-        if not self._run_validation_commands(phase):
-            return after
-        return self.workspace().snapshot()
+        verified = self._run_validation_commands(phase, after)
+        return after if verified is None else verified
 
     def _apply_local_review(self, res: LocalReviewResult) -> tuple[Phase, str]:
         state = self._require_state()
@@ -4018,27 +4130,47 @@ class ControllerEngine:
             f"resolution(s){note}; FIX -> {nxt.value} (round {state.review_round + 1})"
         )
 
-    def _run_validation_commands(self, phase: Phase) -> bool:
-        """Run ``local.validation_commands`` and require every one to exit 0.
+    def _run_validation_commands(
+        self, phase: Phase, start: WorkspaceSnapshot
+    ) -> WorkspaceSnapshot | None:
+        """Run ``local.validation_commands``, record each run, require every one to exit 0.
 
         Controller-owned verification, not something an agent reports: the
         commands come from configuration as argv arrays and are executed
         through the normal executor, never through a shell. A non-zero exit
         means the phase is not verified, so the run stays in this phase for
-        ``resume`` rather than advancing on an agent's word. Returns whether
-        any command ran (``False`` when none is configured).
+        ``resume`` rather than advancing on an agent's word.
+
+        Each command that runs leaves a ``ValidationRecord`` in the state
+        file (ADR 0006 D10.1): its definition, policy P, the outcome, the
+        bounded output, and the fingerprints the walks before and after it
+        read (D7.2). ``start`` is the walk before the first command (the tree
+        the agent produced, walked just before); the walk after each command
+        is the next one's start. The attempt marker is saved immediately
+        before each launch and cleared in the save that appends its record.
+        Returns the last walk, the tree the commands left behind, or
+        ``None`` when none is configured.
         """
         state = self._require_state()
         # From the contract, not the configuration: what verifies this run
         # was decided when the run was created.
-        commands = self.local_contract().validation_commands
+        contract = self.local_contract()
+        commands = contract.validation_commands
         if not commands:
-            return False
+            return None
+        # The step entry refused a contract beyond the bounds (D10.3).
+        defs = definitions(commands)
         # Likewise the directory they run *from*: an argv is only a program
         # relative to one (see :meth:`_execution_cwd`).
         cwd = self._execution_cwd()
+        policy = self._validation_policy(LaunchClass.LOCAL_VALIDATION)
+        workspace_policy = contract.workspace_policy.digest()
+        label = f"{phase.value}-validation"
         logger = self._logger()
-        for argv in commands:
+        snapshot = start
+        for definition in defs:
+            argv = list(definition.argv)
+            metadata = {"validation_command": argv, "feature": state.feature_spec_path}
             # The commands are the repository's (a Makefile target, a test
             # runner the tree defines): allow-listed environment, as for an
             # agent, not the operator's whole shell, and the same credential
@@ -4054,10 +4186,12 @@ class ControllerEngine:
                     f"validation commands not run: {exc}; {phase.value} is not verified and "
                     f"the run stays in {phase.value}."
                 ) from exc
+            candidate = LocalCandidate(snapshot.fingerprint, workspace_policy, state.run_id)
             refused: SandboxLaunchRefusedError | None = None
+            logged = False
             with isolated_overrides(identity) as overrides:
                 req = ExecutionRequest(
-                    command=list(argv),
+                    command=argv,
                     cwd=cwd,
                     timeout_seconds=self.config.execution.command_timeout_seconds,
                     env_allowlist=self.config.execution.environment_names(),
@@ -4073,88 +4207,520 @@ class ControllerEngine:
                         overrides,
                         self.config.sandbox.validation_network,
                     )
-                    result = (self._runner or execute)(req)
                 except SandboxLaunchRefusedError as exc:
                     refused = exc
+                else:
+                    try:
+                        result, step_log, run_log = self._launch_validator(
+                            logger,
+                            label,
+                            LOCAL_VALIDATION_PROFILE,
+                            req,
+                            candidate,
+                            definition,
+                            policy,
+                            metadata,
+                        )
+                    except SandboxLaunchRefusedError as exc:
+                        refused, logged = exc, True
             if refused is not None:
-                self._log_refused_command(
-                    f"{phase.value}-validation",
-                    "(controller validation command)",
-                    list(argv),
-                    cwd,
-                    refused,
-                    {"validation_command": list(argv), "feature": state.feature_spec_path},
-                )
+                # No record (ADR 0006 D8.5): the command never ran.
+                if not logged:
+                    self._log_refused_command(
+                        label, LOCAL_VALIDATION_PROFILE, argv, cwd, refused, metadata
+                    )
                 raise VerificationError(
-                    f"validation command {' '.join(redact_argv(list(argv)))!r} not run: "
+                    f"validation command {definition.shown!r} not run: "
                     f"{refused}; {phase.value} is not verified and the run stays in "
                     f"{phase.value}."
                 ) from refused
-            record = ExecutionRecord(
-                run_id=state.run_id,
-                seq=0,
-                phase=f"{phase.value}-validation",
-                attempt=state.attempt,
-                review_round=state.review_round,
-                profile="(controller validation command)",
-                prompt_version=state.prompt_version,
-                command=list(argv),
-                cwd=cwd,
-                timeout_seconds=req.timeout_seconds,
-                started_at=result.started_at,
-                finished_at=result.finished_at,
-                exit_code=result.exit_code,
-                timed_out=result.timed_out,
-                stdout_truncated=result.stdout_truncated,
-                stderr_truncated=result.stderr_truncated,
-                descendants_killed=result.descendants_killed,
-                group_survived_kill=result.group_survived_kill,
-                capture_abandoned=result.capture_abandoned,
-                orphans_killed=result.orphans_killed,
-                orphan_survived_kill=result.orphan_survived_kill,
-                orphans_unchecked=result.orphans_unchecked,
-                metadata={
-                    "validation_command": list(argv),
-                    "feature": state.feature_spec_path,
-                    "env_set": list(override_names()),
-                    "sandbox_mode": self.config.sandbox.mode,
-                },
+            try:
+                after = self.workspace().snapshot()
+            except Exception as exc:
+                # A walk that is refused is the existing refusal, and the
+                # command leaves no record (D7.2); the marker goes with it.
+                # The launch is still logged, and a command that failed is
+                # still reported as the failure it was.
+                state.validation_attempt = {}
+                self._save()
+                logger.log_execution(
+                    self._validation_execution_record(
+                        label, LOCAL_VALIDATION_PROFILE, req, result, metadata, None
+                    ),
+                    "",
+                    result.stdout or "",
+                    result.stderr or "",
+                    step_log=step_log,
+                )
+                failure = _validation_failure(definition, req, result, phase)
+                if failure is not None:
+                    raise failure from exc
+                raise
+            record = observed_record(
+                seq=next_seq(state.validation_records),
+                candidate=candidate,
+                definition=definition,
+                policy=policy,
+                result=result,
+                run_log=run_log,
+                end_fingerprint=after.fingerprint,
             )
-            if result.sandbox is not None:
-                record.sandbox = result.sandbox.record()
-            if result.timed_out or result.exit_code != 0:
-                record.error = _with_leftovers(
-                    f"timed out after {req.timeout_seconds}s"
-                    if result.timed_out
-                    else f"exit {result.exit_code}",
-                    result.leftovers,
+            self._append_validation_record(record)
+            logger.log_execution(
+                self._validation_execution_record(
+                    label, LOCAL_VALIDATION_PROFILE, req, result, metadata, record
+                ),
+                "",
+                result.stdout or "",
+                result.stderr or "",
+                step_log=step_log,
+            )
+            snapshot = after
+            failure = _validation_failure(definition, req, result, phase)
+            if failure is not None:
+                raise failure
+        return snapshot
+
+    # -- candidate validation evidence (ADR 0006, #172) -------------------------
+    def _validation_policy(self, launch_class: LaunchClass) -> Policy:
+        """Policy P for a validation set run as ``launch_class`` (ADR 0006 D8.1).
+
+        From controller configuration only, and path-independent: under
+        ``required`` the template is §2.5's request for the launch class with
+        every path a role name (:func:`template_facts`), under ``disabled``
+        the fixed "no outer sandbox" template, since nothing contains the
+        validator. REMOTE reads no git here, so a dry run plans it anywhere.
+        """
+        cfg = self.config
+        local = launch_class is LaunchClass.LOCAL_VALIDATION
+        template: Mapping[str, object] = NO_SANDBOX_TEMPLATE
+        if cfg.sandbox.required:
+            position = NetworkPosition(cfg.sandbox.validation_network)
+            if local:
+                separate, linked = self._local_git_layout()
+                facts = template_facts(
+                    launch_class, position, separate_git_dir=separate, linked=linked
                 )
-            logger.log_execution(record, "", result.stdout or "", result.stderr or "")
-            # Both the command line and its output can carry a secret into
-            # `state.verification_failures` (plain `state.json`) through the
-            # raised message, so both are redacted here and not only on the
-            # run-log path. Baseline protection: `redaction` claims no
-            # completeness.
-            shown = " ".join(redact_argv(list(argv)))
-            if result.timed_out:
-                raise VerificationError(
-                    _with_leftovers(
-                        f"validation command {shown!r} timed out after {req.timeout_seconds}s",
-                        result.leftovers,
+            else:
+                facts = template_facts(launch_class, position)
+            template = launch_template(facts)
+        return Policy(
+            mode=cfg.sandbox.mode,
+            template=template,
+            env_names=cfg.execution.environment_names(),
+            timeout_seconds=cfg.execution.command_timeout_seconds,
+            contain_orphans=True,
+            method=METHOD_IN_PLACE if local else MATERIALIZATION_METHOD,
+        )
+
+    def _local_git_layout(self) -> tuple[bool, bool]:
+        """Whether the LOCAL root's ``.git`` names a git directory elsewhere, and
+        whether the checkout is a linked worktree: the layout :meth:`_local_facts`
+        projects, with no path in it."""
+        root = Path(self._execution_cwd())
+        dirs = self.workspace().git_dirs()
+        separate = os.path.realpath(root / ".git") != str(dirs[0])
+        return separate, str(dirs[-1]) != str(dirs[0])
+
+    def _launch_validator(
+        self,
+        logger: RunLogger,
+        label: str,
+        profile: str,
+        req: ExecutionRequest,
+        candidate: LocalCandidate | RemoteCandidate,
+        definition: Definition,
+        policy: Policy,
+        metadata: dict,
+    ) -> tuple[ExecutionResult, StepLog, str]:
+        """Save the attempt marker, then launch the validator (ADR 0006 D11.2).
+
+        The step's run-log directory is published first, so that the marker
+        names it. Called after the preflight, the sandbox gate and any
+        materialization, so a refusal by one of them writes no marker. A
+        launch or setup failure the executor reports is no record (D10.5):
+        the marker is cleared in the next save, made here, and the failure is
+        logged in the step before it is re-raised. An interrupt leaves the
+        marker for the resume path (:meth:`_recover_validation_attempt`).
+        """
+        state = self._require_state()
+        step_log = logger.begin_step(label, state.attempt)
+        run_log = f"{state.run_id}/{step_log.name}"
+        try:
+            state.validation_attempt = attempt_marker(
+                candidate=candidate,
+                definition=definition,
+                policy=policy,
+                run_log=run_log,
+                marked_at=utcnow_iso(),
+            )
+            self._save()
+        except BaseException:
+            state.validation_attempt = {}
+            step_log.close()
+            raise
+        try:
+            result = (self._runner or execute)(req)
+        except ExecutionError as exc:
+            state.validation_attempt = {}
+            self._save()
+            self._log_refused_command(
+                label, profile, list(definition.argv), req.cwd or "", exc, metadata, step_log
+            )
+            raise
+        return result, step_log, run_log
+
+    def _append_validation_record(self, record: dict) -> None:
+        """Append ``record`` and clear the marker in one save (ADR 0006 D11.2, D11.4)."""
+        state = self._require_state()
+        pinned = pinned_seqs(
+            state.review_evidence, state.review_certificate, state.producer_validation_failure
+        )
+        state.validation_records = appended(state.validation_records, record, pinned)
+        state.validation_attempt = {}
+        self._save()
+
+    def _validation_execution_record(
+        self,
+        label: str,
+        profile: str,
+        req: ExecutionRequest,
+        result: ExecutionResult,
+        metadata: dict,
+        record: dict | None,
+    ) -> ExecutionRecord:
+        """The run-log record of one validator launch; informational, never authority.
+
+        ``record`` is the launch's ``ValidationRecord``, or ``None`` when it
+        left none (a LOCAL walk after it was refused).
+        """
+        state = self._require_state()
+        execution = ExecutionRecord(
+            run_id=state.run_id,
+            seq=0,
+            phase=label,
+            attempt=state.attempt,
+            review_round=state.review_round,
+            profile=profile,
+            prompt_version=state.prompt_version,
+            command=list(req.command),
+            cwd=req.cwd or "",
+            timeout_seconds=req.timeout_seconds,
+            started_at=result.started_at,
+            finished_at=result.finished_at,
+            exit_code=result.exit_code,
+            timed_out=result.timed_out,
+            stdout_truncated=result.stdout_truncated,
+            stderr_truncated=result.stderr_truncated,
+            descendants_killed=result.descendants_killed,
+            group_survived_kill=result.group_survived_kill,
+            capture_abandoned=result.capture_abandoned,
+            orphans_killed=result.orphans_killed,
+            orphan_survived_kill=result.orphan_survived_kill,
+            orphans_unchecked=result.orphans_unchecked,
+            metadata={
+                **metadata,
+                "env_set": list(override_names()),
+                "sandbox_mode": self.config.sandbox.mode,
+                "validation_record_seq": record["seq"] if record else None,
+                "validation_outcome": record["outcome"] if record else None,
+            },
+        )
+        if result.sandbox is not None:
+            execution.sandbox = result.sandbox.record()
+        if result.timed_out or result.exit_code != 0:
+            execution.error = _with_leftovers(
+                f"timed out after {req.timeout_seconds}s"
+                if result.timed_out
+                else f"exit {result.exit_code}",
+                result.leftovers,
+            )
+        return execution
+
+    def validate_remote_candidate(self, commit: str, provenance: Provenance) -> ValidationRun:
+        """Run ``validation.commands`` against one exact REMOTE candidate (ADR 0006 §2.6, D10.6).
+
+        The entry point the REMOTE phase gates use; no phase calls it yet.
+        ``commit`` must already be in the shared object store: its tree is
+        read from the authenticated commit bytes there, nothing is fetched,
+        and a commit that is not there is
+        :class:`~autoforge.errors.CandidateNotMaterializableError` before
+        anything is launched. Each definition, in set order, runs in a fresh
+        byte-exact export proved against that tree (prefix
+        ``autoforge-validate-``), routed as the pre-merge export is (the
+        export writable, no git dir, no controller state, no other worktree,
+        no cache, ``contain_orphans``, the allow-listed environment), and
+        leaves one record; the set stops at the first non-PASS, and each
+        export is discarded.
+
+        A launch or setup failure, or the preflight refusing a launch, is
+        re-checked once in-process and is then
+        :class:`~autoforge.errors.ValidationInconclusiveError`; a
+        materialization failure gets one fresh materialization, then the
+        same. Neither writes a record. A sandbox refusal at the gate is
+        logged and re-raised with nothing written.
+        """
+        state = self._require_state()
+        if state.mode == WorkflowMode.LOCAL:
+            raise StateError("a LOCAL run validates in place, after its write phases")
+        defs = definitions(self.config.validation.commands)
+        policy = self._validation_policy(LaunchClass.EXPORT_COMMAND)
+        runner = self._runner or execute
+        repo = str(self.workdir)
+        try:
+            object_format = read_object_format(runner, repo)
+        except MaterializationError as exc:
+            raise ValidationInconclusiveError(
+                f"candidate {commit[:12]} cannot be validated: {exc}"
+            ) from exc
+        candidate = self._remote_candidate(commit, object_format, provenance)
+        records: list[dict] = []
+        for definition in defs:
+            record = self._validate_in_export(runner, repo, candidate, definition, policy)
+            records.append(record)
+            if record["outcome"] != "PASS":
+                break
+        return ValidationRun(
+            candidate=candidate,
+            validation_set_digest=validation_set_digest(defs),
+            policy=policy,
+            records=tuple(records),
+            definitions=len(defs),
+        )
+
+    def _remote_candidate(
+        self, commit: str, object_format: str, provenance: Provenance
+    ) -> RemoteCandidate:
+        """D2.1, D2.2: the identity, its tree read from the store's own bytes."""
+        state = self._require_state()
+        try:
+            found = self._git_transport().read_local_commit(commit)
+        except GitTransportError as exc:
+            raise ValidationInconclusiveError(
+                f"candidate {commit[:12]} cannot be read from the shared object store: {exc}"
+            ) from exc
+        if found is None:
+            raise CandidateNotMaterializableError(
+                f"commit {commit} is not in the shared object store of {self.workdir}; a "
+                "candidate is validated only once its objects are there, and it is not fetched"
+            )
+        candidate = RemoteCandidate(
+            repository=state.repository,
+            object_format=object_format,
+            commit=commit,
+            tree=found.tree,
+            provenance=provenance,
+        )
+        try:
+            parse_candidate(candidate.to_dict())
+        except StateError as exc:
+            raise VerificationError(f"candidate refused before validation: {exc}") from None
+        return candidate
+
+    def _validate_in_export(
+        self,
+        runner,
+        repo: str,
+        candidate: RemoteCandidate,
+        definition: Definition,
+        policy: Policy,
+    ) -> dict:
+        """One definition in a fresh, proved export of ``candidate``: its record (D10.5)."""
+        launch_failures = 0
+        materialization_failures = 0
+        while True:
+            try:
+                with materialize(
+                    runner,
+                    repo,
+                    candidate.commit,
+                    candidate.object_format,
+                    prefix=VALIDATION_EXPORT_PREFIX,
+                ) as tree:
+                    if tree.tree != candidate.tree:
+                        raise MaterializationError(
+                            f"the export of {candidate.commit} holds tree {tree.tree}, not the "
+                            f"candidate's tree {candidate.tree}"
+                        )
+                    return self._run_remote_validator(candidate, definition, policy, str(tree.root))
+            except CandidateNotMaterializableError:
+                raise
+            except MaterializationError as exc:
+                materialization_failures += 1
+                if materialization_failures >= MAX_VALIDATION_MATERIALIZATIONS:
+                    raise ValidationInconclusiveError(
+                        f"candidate {candidate.describe()} could not be materialized for "
+                        f"validation definition [{definition.index}] after "
+                        f"{materialization_failures} attempts: {exc}"
+                    ) from exc
+            except _ValidatorNotLaunched as exc:
+                launch_failures += 1
+                if launch_failures >= MAX_VALIDATION_LAUNCH_ATTEMPTS:
+                    raise ValidationInconclusiveError(
+                        f"validation command {definition.shown!r} could not be launched for "
+                        f"{candidate.describe()} ({launch_failures} attempts): {exc}"
+                    ) from exc
+
+    def _run_remote_validator(
+        self,
+        candidate: RemoteCandidate,
+        definition: Definition,
+        policy: Policy,
+        cwd: str,
+    ) -> dict:
+        """Launch one definition in the export ``cwd`` and append its record."""
+        state = self._require_state()
+        argv = list(definition.argv)
+        label = f"{state.phase.value}-candidate-validation"
+        metadata = {"validation_command": argv, "candidate_commit": candidate.commit}
+        # The candidate's own code: the allow-listed environment, the
+        # credential preflight and the controller-set variables (#165), and
+        # under `required` the export alone (ADR 0005 D3.1), as the pre-merge
+        # export runs.
+        try:
+            identity = preflight(
+                cwd, self._runner, env_allowlist=self.config.execution.environment_names()
+            )
+        except ConfigurationError as exc:
+            raise _ValidatorNotLaunched(f"the launch was refused: {exc}") from exc
+        refused: SandboxLaunchRefusedError | None = None
+        logger = self._logger()
+        try:
+            with isolated_overrides(identity) as overrides:
+                req = ExecutionRequest(
+                    command=argv,
+                    cwd=cwd,
+                    timeout_seconds=self.config.execution.command_timeout_seconds,
+                    env_allowlist=self.config.execution.environment_names(),
+                    env=overrides,
+                    contain_orphans=True,
+                )
+                try:
+                    req.sandbox = self._command_sandbox(
+                        LaunchClass.EXPORT_COMMAND,
+                        cwd,
+                        overrides,
+                        self.config.sandbox.validation_network,
                     )
-                    + f"; {phase.value} is not verified."
-                )
-            if result.exit_code != 0:
-                tail = redact((result.stderr or result.stdout or "").strip())[-2000:]
-                raise VerificationError(
-                    _with_leftovers(
-                        f"validation command {shown!r} failed with exit {result.exit_code}",
-                        result.leftovers,
+                except SandboxLaunchRefusedError as exc:
+                    refused = exc
+                else:
+                    result, step_log, run_log = self._launch_validator(
+                        logger,
+                        label,
+                        REMOTE_VALIDATION_PROFILE,
+                        req,
+                        candidate,
+                        definition,
+                        policy,
+                        metadata,
                     )
-                    + f"; {phase.value} is not verified and the run stays in "
-                    f"{phase.value}. Output tail: {tail}"
+        except ExecutionError as exc:
+            raise _ValidatorNotLaunched(redact(str(exc))) from exc
+        if refused is not None:
+            # The gate refused it before anything ran: no marker, no record
+            # (ADR 0006 D8.5), and nothing to re-check.
+            self._log_refused_command(
+                label, REMOTE_VALIDATION_PROFILE, argv, cwd, refused, metadata
+            )
+            raise refused
+        record = observed_record(
+            seq=next_seq(state.validation_records),
+            candidate=candidate,
+            definition=definition,
+            policy=policy,
+            result=result,
+            run_log=run_log,
+        )
+        self._append_validation_record(record)
+        logger.log_execution(
+            self._validation_execution_record(
+                label, REMOTE_VALIDATION_PROFILE, req, result, metadata, record
+            ),
+            "",
+            result.stdout or "",
+            result.stderr or "",
+            step_log=step_log,
+        )
+        return record
+
+    def _recover_validation_attempt(self, previous: Phase, plan: StepPlan) -> StepOutcome | None:
+        """Record a marker a crash left, under the lock, in one save (ADR 0006 D10.7, D11.3).
+
+        The marker becomes an ``INTERRUPTED`` record built from it alone,
+        claiming no launch, and the definition runs again when the phase
+        does. A marker whose record exists (a hand edit: the record and the
+        clear are one write) is only cleared. The third interruption of one
+        candidate, definition and policy enters ``BLOCKED`` in the same save.
+        """
+        state = self._require_state()
+        if not state.validation_attempt:
+            return None
+        pinned = pinned_seqs(
+            state.review_evidence, state.review_certificate, state.producer_validation_failure
+        )
+        try:
+            records = recover_attempt(
+                state.validation_records,
+                state.validation_attempt,
+                watermark=state.validation_override_seq,
+                pinned=pinned,
+                recovered_at=utcnow_iso(),
+            )
+        except ValidationInterruptedError as exc:
+            state.validation_records = exc.records
+            state.validation_attempt = {}
+            return self._block(previous, plan, str(exc))
+        state.validation_records = records
+        state.validation_attempt = {}
+        self._save()
+        return None
+
+    def _validation_plan_notes(
+        self, launch_class: LaunchClass, commands: Sequence[Sequence[str]]
+    ) -> list[str]:
+        """The validation set and policy P, for the plan and the dry run; runs nothing."""
+        state = self._require_state()
+        local = launch_class is LaunchClass.LOCAL_VALIDATION
+        key = "local.validation_commands" if local else "validation.commands"
+        notes: list[str] = []
+        problem = definition_problem(commands)
+        if problem:
+            notes.append(
+                f"{key} is beyond the bounds a validation record can hold ({problem}); the "
+                "step would enter BLOCKED before launching anything"
+            )
+        else:
+            defs = definitions(commands)
+            policy = self._validation_policy(launch_class)
+            unsandboxed = (
+                "; under sandbox.mode disabled every validator runs unsandboxed as the "
+                "operator's UID, and its record says enforced: false"
+                if not self.config.sandbox.required
+                else ""
+            )
+            notes.append(
+                f"candidate validation ({key}): {len(defs)} definition(s), set digest "
+                f"{validation_set_digest(defs)[:16]}...; policy {policy.describe()}" + unsandboxed
+            )
+            notes.extend(
+                f"validation definition [{d.index}]: {d.shown!r} (digest {d.digest[:16]}...)"
+                for d in defs
+            )
+            if not local:
+                notes.append(
+                    "no REMOTE phase runs validation.commands yet; a record names the exact "
+                    "commit and tree it ran against"
                 )
-        return True
+        if state.validation_attempt:
+            marker = parse_marker(state.validation_attempt)
+            notes.append(
+                f"a validation attempt marker is pending: definition [{marker.index}] "
+                f"{redact(' '.join(marker.argv))!r} for {marker.candidate.describe()}, marked "
+                f"{state.validation_attempt.get('marked_at', '')}; the next step records it "
+                "INTERRUPTED, claiming no launch, and the definition runs again"
+            )
+        return notes
 
     # -- deterministic steps ---------------------------------------------------
     def _initialize(self, plan: StepPlan) -> StepOutcome:
@@ -6529,10 +7095,16 @@ class ControllerEngine:
         profile: str,
         argv: list[str],
         cwd: str,
-        exc: SandboxLaunchRefusedError,
+        exc: ExecutionError,
         metadata: dict,
+        step_log: StepLog | None = None,
     ) -> None:
-        """The run-log record of a repository-defined command the sandbox refused."""
+        """The run-log record of a repository-defined command that was not launched.
+
+        The sandbox refused it, or the executor reported a launch failure.
+        ``step_log`` is the step a validator's attempt marker named, when the
+        failure came after the marker.
+        """
         state = self._require_state()
         record = ExecutionRecord(
             run_id=state.run_id,
@@ -6549,7 +7121,7 @@ class ControllerEngine:
         )
         record.error = f"{type(exc).__name__}: {exc}"
         record.sandbox = _refusal_facts(exc)
-        self._logger().log_execution(record, "", "", "")
+        self._logger().log_execution(record, "", "", "", step_log=step_log)
 
     def _revision_drift_to_review(
         self,

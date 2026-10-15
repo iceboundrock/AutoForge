@@ -412,7 +412,7 @@ runs (#199,
 
 ## Dry run
 
-A dry run invokes no agent, runs no verification command, writes nothing to
+A dry run invokes no agent, runs no verification or validation command, writes nothing to
 GitHub, git or the state directory (no state, no log), takes no lock and
 creates no agent worktree. It prints the plan (phase, provider,
 model/effort, agent limits, loop detection, round, template, variables,
@@ -746,6 +746,31 @@ configuration. It loads and resumes unchecked, and the first `step`,
 `resume` or `unblock` records the configuration it runs on (`upgraded`). A
 LOCAL run is not checked this way: its
 [run contract](local-mode.md#the-run-contract) defines it.
+
+### Candidate validation evidence
+
+`validation.commands` ([Configuration](configuration.md#candidate-validation))
+are run by the controller against one exact commit, each in a fresh export
+of its tree, and each run leaves a record in the state file
+([State and recovery](agent-guides/state-and-recovery.md#validation-evidence)).
+No REMOTE phase runs them yet: the phase gates are #173's. Until then:
+
+- `autoforge doctor` lists the definitions, redacted, and the sandbox mode
+  their records are made under (`candidate validation (validation.commands)`,
+  informational), and runs none of them;
+- the dry-run plan lists the set's digest, policy P and each definition,
+  and says that under `sandbox.mode: disabled` every validator runs
+  unsandboxed as your UID; it runs none of them;
+- `autoforge status` shows a `Validation evidence:` block: the policy line,
+  a pending attempt marker if a crash left one, and the records of the
+  current candidate (`#<seq> [<index>] '<argv>': <outcome> (...)`, with the
+  output tail of a `FAIL` or `TIMEOUT`). A pending marker is reported,
+  never converted: the next `step` or `resume` records it `INTERRUPTED`
+  and runs the definition again, and the third interruption of one
+  definition blocks the run.
+
+LOCAL runs show the same block for their `local.validation_commands`
+records ([Local mode](local-mode.md#validation-commands)).
 
 ## Logging and redaction
 

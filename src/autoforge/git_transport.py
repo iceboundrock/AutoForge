@@ -317,6 +317,9 @@ class CommitRecord:
     parents: tuple[str, ...]
     # Decoded from the authenticated bytes (UTF-8, invalid bytes replaced).
     message: str
+    # The tree the authenticated bytes name: a content address, so the
+    # store itself proves the commit and the tree correspond (ADR 0006 D2.2).
+    tree: str = ""
 
 
 @dataclass(frozen=True)
@@ -646,6 +649,15 @@ class GitTransport:
             )
         return _parse_commit(sha, raw)
 
+    def read_local_commit(self, sha: str) -> CommitRecord | None:
+        """``sha`` as its own bytes when the shared store holds it; never fetched.
+
+        For a candidate the controller validates (ADR 0006 D2.2, D10.5): one
+        that is not in the store is refused, not fetched by this read.
+        """
+        _object_format(sha)
+        return self._read_once(sha)
+
     def read_commit(self, sha: str) -> CommitRecord:
         """Read ``sha`` as its own bytes: re-hashed, parsed, never substituted.
 
@@ -866,6 +878,13 @@ def _parse_commit(sha: str, raw: bytes) -> CommitRecord:
     width = len(sha)
     if not lines[0].startswith(b"tree ") or len(lines[0]) != 5 + width:
         raise GitTransportError(f"commit {sha} does not start with a tree line")
+    tree = lines[0][5:].decode("ascii", errors="replace")
+    try:
+        same_format = _object_format(tree) == _object_format(sha)
+    except GitTransportError:
+        same_format = False
+    if not same_format:
+        raise GitTransportError(f"commit {sha} names a malformed tree")
     parents: list[str] = []
     index = 1
     while index < len(lines) and lines[index].startswith(b"parent "):
@@ -880,6 +899,7 @@ def _parse_commit(sha: str, raw: bytes) -> CommitRecord:
         sha=sha,
         parents=tuple(parents),
         message=message.decode("utf-8", errors="replace"),
+        tree=tree,
     )
 
 

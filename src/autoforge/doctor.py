@@ -87,7 +87,7 @@ from .providers import (
     parse_opencode_version,
     parse_pi_version,
 )
-from .redaction import redact
+from .redaction import redact, redact_argv
 from .safefs import STATE_DIR_NEEDS_HARD_LINKS, HardLinksUnavailable, SafeRoot
 from .validation import parse_remote_repository
 
@@ -260,6 +260,30 @@ class Doctor:
                 "what the PR's tests assert; consider merge.verification_commands"
             )
         return CheckResult(name, True, detail, required=False)
+
+    def check_candidate_validation(self) -> CheckResult:
+        """List ``validation.commands`` (informational; runs nothing, ADR 0006 D3.1).
+
+        The definitions REMOTE candidate validation runs in a candidate's
+        byte-exact export, redacted, and the mode their records are made
+        under; none is launched here.
+        """
+        name = "candidate validation (validation.commands)"
+        cfg = self.config
+        if cfg is None:
+            return CheckResult(name, False, "(config check failed)", required=False)
+        commands = cfg.validation.commands
+        mode = f"records made under sandbox.mode {cfg.sandbox.mode}"
+        if not cfg.sandbox.required:
+            mode += " (validators run unsandboxed as the operator's UID: unenforced evidence)"
+        if not commands:
+            return CheckResult(
+                name, True, f"(none configured: an empty set); {mode}", required=False
+            )
+        listed = "; ".join(" ".join(redact_argv(list(argv))) for argv in commands)
+        return CheckResult(
+            name, True, f"{len(commands)} definition(s): {listed}; {mode}", required=False
+        )
 
     def check_state_dir(self) -> CheckResult:
         d = self.state_dir or (self.config.state_dir if self.config else ".autoforge")
@@ -1018,7 +1042,12 @@ class Doctor:
         ]
 
     def run_all(self) -> list[CheckResult]:
-        results = [self.check_config(), self.check_merge_gate(), self.check_premerge_verification()]
+        results = [
+            self.check_config(),
+            self.check_merge_gate(),
+            self.check_premerge_verification(),
+            self.check_candidate_validation(),
+        ]
         cfg = self.config
         gh = cfg.github.command if cfg else "gh"
         results.append(self._version_check("git available", ["git", "--version"]))

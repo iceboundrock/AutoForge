@@ -43,7 +43,8 @@ from pathlib import Path
 
 from . import __prompt_version__
 from .child_env import refuse_forbidden_env
-from .errors import ConfigurationError
+from .errors import ConfigurationError, ValidationDefinitionError
+from .evidence import SCOPE, check_definitions, check_scope
 from .executor import MAX_DEADLINE_SECONDS, is_env_pattern
 from .local_workspace import (
     DEFAULT_MAX_BYTES,
@@ -462,6 +463,34 @@ class MergeConfig:
     verification_commands: list[list[str]] = field(default_factory=list)
 
 
+VALIDATION_KEYS = ("commands", "scope")
+
+
+@dataclass
+class ValidationConfig:
+    """REMOTE candidate validation (``validation:`` in the config file; ADR 0006 D3.1).
+
+    ``commands`` are trusted argv arrays (never shell strings), empty by
+    default: the controller runs each one, in order, in a byte-exact export
+    of one exact candidate commit, under ``execution.command_timeout_seconds``
+    and ``execution.env_allowlist``, and records what it observed in a
+    ``ValidationRecord`` in the state file. They are read from this
+    configuration only, never from the candidate tree, an agent result or
+    issue text. At most 16 definitions; an argv holds at most 32 elements,
+    each non-blank and at most 1,024 characters, and 4,096 in all (D10.3).
+
+    ``scope`` is ``candidate-tree``, the only scope there is (D4.2): a
+    definition depends on the candidate's bytes alone. Any other value is
+    refused.
+
+    Separate from ``merge.verification_commands``, which keeps running at
+    every merge gate pass; the same commands may be configured in both.
+    """
+
+    commands: list[list[str]] = field(default_factory=list)
+    scope: str = SCOPE
+
+
 REPLAN_KEYS = (
     "enabled",
     "soft_threshold",
@@ -633,7 +662,8 @@ class SandboxConfig:
     an issue's private objects (D6.3-D6.5) apply in both modes.
 
     ``validation_network`` and ``premerge_network`` are ``host`` (the
-    default) or ``isolated``: a LOCAL validation command, or a pre-merge
+    default) or ``isolated``: a validation command (LOCAL, or REMOTE
+    ``validation.commands`` in a candidate's export), or a pre-merge
     verification command, then runs with no network at all (no loopback, no
     abstract socket, no download). Agents always share the host network.
     Read only under ``required``.
@@ -663,6 +693,7 @@ TOP_LEVEL_KEYS = (
     "workflow",
     "local",
     "sandbox",
+    "validation",
     "profiles",
 )
 
@@ -705,6 +736,7 @@ class AutoForgeConfig:
     workflow: WorkflowConfig = field(default_factory=WorkflowConfig)
     local: LocalConfig = field(default_factory=LocalConfig)
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
+    validation: ValidationConfig = field(default_factory=ValidationConfig)
     profiles: dict[str, ProfileConfig] = field(default_factory=dict)
 
     def profile(self, name: str) -> ProfileConfig:
@@ -965,6 +997,20 @@ def _as_argv_list(raw: object, source: str, key: str) -> list[list[str]]:
             argv.append(item)
         out.append(argv)
     return out
+
+
+def _as_definitions(raw: object, source: str, key: str) -> list[list[str]]:
+    """A validation set: argv arrays within the bounds a record can hold (ADR 0006 D10.3).
+
+    ``merge.verification_commands`` is copied into no record and is not
+    bounded by this.
+    """
+    commands = _as_argv_list(raw, source, key)
+    try:
+        check_definitions(commands)
+    except ValidationDefinitionError as exc:
+        raise ConfigurationError(f"{source}: {key}: {exc}") from None
+    return commands
 
 
 def _as_bool(raw: object, source: str, key: str) -> bool:
@@ -1276,7 +1322,7 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
             raise ConfigurationError(f"{source}: 'local.feature_dir' must not be empty")
         base.local.feature_dir = feature_dir
     if "validation_commands" in local:
-        base.local.validation_commands = _as_argv_list(
+        base.local.validation_commands = _as_definitions(
             local["validation_commands"], source, "local.validation_commands"
         )
     if "max_fix_rounds" in local:
@@ -1322,6 +1368,17 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
                     f"{source}: 'sandbox.{key}' must be one of {', '.join(allowed)}, got {value!r}"
                 )
             setattr(base.sandbox, key, value)
+    validation = _section(data, "validation", source, VALIDATION_KEYS)
+    if "commands" in validation:
+        base.validation.commands = _as_definitions(
+            validation["commands"], source, "validation.commands"
+        )
+    if "scope" in validation:
+        try:
+            check_scope(validation["scope"])
+        except ConfigurationError as exc:
+            raise ConfigurationError(f"{source}: {exc}") from None
+        base.validation.scope = SCOPE
     # Keyed by profile *name*, so the closed key set applies to each profile
     # mapping rather than to the section.
     profiles = _section(data, "profiles", source, known=None)

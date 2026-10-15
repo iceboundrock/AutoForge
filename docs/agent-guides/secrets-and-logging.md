@@ -129,6 +129,15 @@ has to remember to. The writers that redact before persistence are:
   `review_history` or `last_fix_resolutions`.
 - the LOCAL validation and pre-merge verification paths: the output tail of
   a command they quote.
+- the validation-record writers (`evidence.py`, #172): a record's or a
+  marker's argv (element by element, `redact_argv`) and each stream's
+  output tail. The tail is redacted over the whole captured stream before
+  it is cut to 2,000 characters, so a secret straddling the cut is not
+  half-kept, then control characters are escaped; the enforcement facts
+  are redacted and clipped. A definition's digest is over the argv as
+  configured, a one-way SHA-256 that stores no argv, which is also why a
+  secret belongs in the allow-listed environment and never in a validation
+  argv ([Configuration](../configuration.md#candidate-validation)).
 
 `GitHubClient._run_gh` additionally redacts the `gh` stderr tail where it
 builds a `GitHubError` / `GitHubNotFoundError` / `GitHubUnavailableError`
