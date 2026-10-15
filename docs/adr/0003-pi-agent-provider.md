@@ -9,7 +9,8 @@
   unattended resource and tool-loading policy, `docs/pi-policy.md`, and
   orphan containment, ADR 0002 §4b) is implemented.
   #131 re-verified the Pi-dependent decisions against an installed Pi
-  1.0.1 and amended two of them (§1.1). Decided
+  1.0.1 and amended two of them (§1.1). §2.9 is amended by ADR 0007
+  (#148). Decided
   in #128 for EPIC #127. Implemented by #129 (config, doctor), #130
   (duplex child primitive), #131 (adapter), #132 (resource policy).
 - **Where:** `src/autoforge/providers.py` (`PiProvider`),
@@ -636,6 +637,31 @@ in #131 (§1.1). Its
 trust and resource flags, `pi auth check` preflight and `PI_*` names are
 only assigned here; #129 and #132 decide them and verify them against an
 installed Pi.
+
+**Amendment (2026-10-14, #148, ADR 0007 D6.1).** The split above is
+superseded for the OpenCode-specific row and the generic session row, as
+follows. In the options row, #149 adds `interaction_policy` instead of
+#126. The Pi, executor and failure-channel rows stand. The ADR 0002 row
+is settled: #132 wrote §4b, and an SDK helper with the server it starts
+needs no further amendment (ADR 0007 §6).
+
+- The provider-neutral interaction contract and its broker, the `prompt`
+  and `fail` policies and their limits, the lock rule for a live writer and
+  the terminal resolver are #134 part 1, which #126 consumes.
+- The OpenCode version pin, read back from the running server (which
+  replaces the `/doc` probe), and question delivery, including whether
+  `OPENCODE_ENABLE_QUESTION_TOOL` is needed, are #152's (ADR 0007 D4.2,
+  D9.6, gate G-O3). Rulesets and permission pre-authorization are #149's
+  SDK policy (D10.1).
+- #126 keeps the one state bump, numbered when it merges and settled on
+  #23 first (no longer "5→6": label 6 stays skipped). It also keeps the
+  pending-interaction record, `pause` with exit status 3, the operator
+  commands, crash and receipt recovery, and OpenCode's recovery.
+- The OpenCode server, its HTTP client and its server password are #152's
+  bridge over `@opencode-ai/sdk`, which #126 uses as its OpenCode transport.
+- Pi's adoption is #134 part 2, post-MVP, which depends on #126. That is
+  all that remains of #134 waiting for #126; #126 now depends on #134
+  part 1.
 
 ### 2.10 Why an ADR
 

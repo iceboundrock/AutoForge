@@ -192,7 +192,8 @@ docs/adr/                              accepted design records (LOCAL mode works
                                        executor: nothing an agent starts outlives its invocation,
                                        Pi provider, authority boundary and typed external effects,
                                        outer sandbox and host-resource capability model,
-                                       candidate validation evidence and review certificates)
+                                       candidate validation evidence and review certificates,
+                                       SDK providers: isolated helpers, interaction contract)
 docs/README.md                         human-oriented documentation index, by intent
 docs/usage.md                          operator guide: remote commands, stop phases, unblock, recovery
 docs/local-mode.md                     operator guide: LOCAL mode (no GitHub)
@@ -226,6 +227,11 @@ matches none of them needs only this file and the scoped `AGENTS.md`.
 - If moving responsibilities between the engine, a provider adapter, the
   executor, the GitHub client or the prompt system, or adding a provider,
   read `docs/agent-guides/architecture.md`.
+- If adding an SDK-backed provider or a helper program, or anything that
+  lets an agent run ask a human (the interaction contract, its broker or
+  resolver, `interaction_policy`, `pause` and continuation), read
+  `docs/adr/0007-sdk-providers-isolated-helpers-and-interaction-contract.md`
+  in addition to `architecture.md`.
 - If changing `src/autoforge/result_parser.py`, a prompt template, the
   per-phase required result fields, or how the engine consumes a parsed
   result, read `docs/agent-guides/control-result-protocol.md`.
