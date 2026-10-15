@@ -889,6 +889,27 @@ def test_a_certificate_names_pass_records_of_its_set_and_its_comment():
         check([one], review_certificate=_certificate([one], clean=clean))
 
 
+@pytest.mark.parametrize(
+    ("review_round", "stored", "kind"),
+    [(2, "2.0", "float"), (1, "true", "bool"), (2, '"2"', "str"), (2, "null", "NoneType")],
+)
+def test_a_certificate_marker_key_round_must_be_an_integer(review_round, stored, kind):
+    """R2-F2: JSON ``2.0`` equals the certificate's round 2, and ``true``
+    round 1, so the key's round is parsed by type, not only compared. The
+    state is read back from JSON text and the digest is recomputed: the
+    type alone is what fails the load."""
+    one = record(1)
+    cert = _certificate([one], review_round=review_round)
+    text = json.dumps(cert).replace(
+        '"marker_key": {"review_round": 2,', f'"marker_key": {{"review_round": {stored},'
+    )
+    cert = json.loads(text)
+    assert type(cert["comment"]["marker_key"]["review_round"]).__name__ == kind
+    cert["digest"] = ev.certificate_digest(cert)
+    with pytest.raises(StateError, match=f"marker_key.review_round must be an integer, got {kind}"):
+        check([one], review_certificate=cert)
+
+
 def test_a_local_certificate_names_the_reviewed_fingerprint():
     one = record(1, candidate=local())
     cert = {

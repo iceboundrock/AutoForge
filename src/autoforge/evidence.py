@@ -1115,7 +1115,13 @@ def _check_certificate(
             _fail(f"{what}.comment.url", "is not on the reviewed pull request")
         if _int(comment["id"], f"{what}.comment.id", 1, MAX_COMMENT_ID) != ref.comment_id:
             _fail(f"{what}.comment.id", "differs from the comment URL's id")
-        key = _exact(comment["marker_key"], _MARKER_KEY_KEYS, f"{what}.comment.marker_key")
+        key_what = f"{what}.comment.marker_key"
+        key = _exact(comment["marker_key"], _MARKER_KEY_KEYS, key_what)
+        # The round is parsed strictly first: equality alone takes JSON 2.0
+        # (or true) for the integer it equals. The other three are compared
+        # with strings the certificate's own fields were parsed into, which
+        # only an equal string equals.
+        _int(key["review_round"], f"{key_what}.review_round", 1, MAX_SEQ)
         expected = {
             "review_round": review_round,
             "reviewed_head_sha": head,
@@ -1123,8 +1129,8 @@ def _check_certificate(
             "reviewed_merge_base_sha": merge_base,
         }
         for name, value in expected.items():
-            if key[name] != value or isinstance(key[name], bool):
-                _fail(f"{what}.comment.marker_key.{name}", "differs from the certificate's")
+            if key[name] != value:
+                _fail(f"{key_what}.{name}", "differs from the certificate's")
     if certificate_digest(raw) != digest:
         _fail(f"{what}.digest", "does not match the certificate: it was edited or corrupted")
 
